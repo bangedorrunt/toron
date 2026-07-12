@@ -1,0 +1,11 @@
+// Build artifacts
+/target
+/.direnv
+.env
+.DS_Store
+*.swp
+*.swo
+*~
+
+// Git internals — prevents sync conflicts from independent git ops
+/.git
