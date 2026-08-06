@@ -222,6 +222,14 @@ impl Bus for InProcessBus {
             return Err(BusError::Publish("author not allowlisted".into()));
         }
 
+        // 3. Ephemeral kinds (20000–29999, e.g. presence 20001) are broadcast
+        //    but NOT stored — they are never projected to SQLite/Git, and a
+        //    missed event just means stale state until the next one.
+        if crate::bus::is_ephemeral_kind(event.kind) {
+            self.stage_log(Stage::Dedup, &event, "ephemeral kind, not stored");
+            return self.fanout(event, false).await;
+        }
+
         // 3. Dedup: store by event id (ON CONFLICT DO NOTHING).
         let stored = self.store.insert(&event).await.map_err(|e| {
             self.stage_log(Stage::Dedup, &event, &format!("store failure: {e}"));
@@ -235,37 +243,7 @@ impl Bus for InProcessBus {
             });
         }
 
-        // 4. Access-gated fanout to live subscribers.
-        let subs: Vec<Arc<Subscriber>> = {
-            let guard = self.subs.read();
-            guard.values().cloned().collect()
-        };
-        let mut fanned = 0usize;
-        for sub in &subs {
-            if sub.filter.match_event(&event, Default::default()) && self.access_gate(sub, &event) {
-                self.fanout_to(sub, &event);
-                fanned += 1;
-            }
-        }
-        if fanned == 0 {
-            self.stage_log(Stage::Fanout, &event, "no matching subscriber");
-        }
-
-        // 5-7. Hooks: search / audit / workflow-trigger are wired by the
-        // projection + workflow layers (bd-led.3.3 / bd-led.3.7). InProcessBus
-        // records the hook stage boundary for observability.
-        self.stage_log(Stage::SearchHook, &event, "search hook boundary (no-op)");
-        self.stage_log(Stage::AuditHook, &event, "audit hook boundary (no-op)");
-        self.stage_log(
-            Stage::WorkflowHook,
-            &event,
-            "workflow hook boundary (no-op)",
-        );
-
-        Ok(PublishOk {
-            event_id: event.id,
-            stored: true,
-        })
+        self.fanout(event, true).await
     }
 
     async fn subscribe(&self, filter: Filter) -> Result<Subscription, BusError> {
@@ -349,6 +327,42 @@ impl InProcessBus {
     /// Count of currently registered subscriptions (diagnostics).
     pub fn subscriber_count(&self) -> usize {
         self.subs.read().len()
+    }
+
+    /// Access-gated fanout to live subscribers (shared by stored + ephemeral
+    /// publish paths).
+    async fn fanout(&self, event: Event, stored: bool) -> Result<PublishOk, BusError> {
+        // 4. Access-gated fanout to live subscribers.
+        let subs: Vec<Arc<Subscriber>> = {
+            let guard = self.subs.read();
+            guard.values().cloned().collect()
+        };
+        let mut fanned = 0usize;
+        for sub in &subs {
+            if sub.filter.match_event(&event, Default::default()) && self.access_gate(sub, &event) {
+                self.fanout_to(sub, &event);
+                fanned += 1;
+            }
+        }
+        if fanned == 0 {
+            self.stage_log(Stage::Fanout, &event, "no matching subscriber");
+        }
+
+        // 5-7. Hooks: search / audit / workflow-trigger are wired by the
+        // projection + workflow layers (bd-led.3.3 / bd-led.3.7). InProcessBus
+        // records the hook stage boundary for observability.
+        self.stage_log(Stage::SearchHook, &event, "search hook boundary (no-op)");
+        self.stage_log(Stage::AuditHook, &event, "audit hook boundary (no-op)");
+        self.stage_log(
+            Stage::WorkflowHook,
+            &event,
+            "workflow hook boundary (no-op)",
+        );
+
+        Ok(PublishOk {
+            event_id: event.id,
+            stored,
+        })
     }
 }
 
@@ -651,6 +665,47 @@ mod tests {
         let h = bus.health().await.expect("health");
         assert!(h.ok);
         assert!(h.message.contains('1'), "message: {}", h.message);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Ephemeral kinds (presence 20001) are fanned out live but NEVER stored.
+    #[tokio::test]
+    async fn test_ephemeral_presence_not_stored() {
+        let (bus, path) = temp_bus().await;
+        let keys = Keys::generate();
+        let mut sub = bus
+            .subscribe(
+                crate::bus::Filter::new().kinds([crate::nostr::kinds::toron_kind(
+                    crate::nostr::kinds::PRESENCE,
+                )]),
+            )
+            .await
+            .expect("sub");
+
+        // Build a presence event (no #t scoping → global sub receives it).
+        let payload = crate::nostr::presence::PresencePayload {
+            state: crate::nostr::presence::PresenceState::Working,
+            status: None,
+            ts: 1_700_000_000,
+        };
+        let ev = crate::nostr::presence::build_presence_event(&keys, &payload, Timestamp::now())
+            .expect("presence event");
+        let ok = bus.publish(ev.clone()).await.expect("publish");
+        assert!(!ok.stored, "ephemeral presence must not be stored");
+        assert_eq!(
+            bus.store.count().await.expect("count"),
+            0,
+            "store must stay empty"
+        );
+
+        // Live delivery still works.
+        let items = drain(&mut sub, 4, Duration::from_millis(200)).await;
+        assert!(
+            items
+                .iter()
+                .any(|it| matches!(it, SubscriptionEvent::Event(e) if e.id == ev.id)),
+            "ephemeral presence must be delivered live, got {items:?}"
+        );
         let _ = std::fs::remove_file(&path);
     }
 

@@ -15,6 +15,7 @@ pub mod http_guard;
 pub mod in_process;
 #[cfg(test)]
 mod mock_relay;
+pub mod presence;
 pub mod reconcile;
 pub mod relay_bus;
 pub mod scoping;
@@ -33,7 +34,9 @@ pub use filter::{
 pub use http_guard::{clamp_feed_limit, is_private_ip, FEED_MAX_LIMIT};
 pub use in_process::InProcessBus;
 pub use relay_bus::{RelayBus, RelayBusConfig, RelayConfig, RelayRole};
-pub use scoping::{is_metadata_hiding_kind, project_scoping_tags, with_project_scoping};
+pub use scoping::{
+    is_ephemeral_kind, is_metadata_hiding_kind, project_scoping_tags, with_project_scoping,
+};
 pub use subscription::{Subscription, SubscriptionEvent, SubscriptionId};
 pub use ttl::{EnvelopeTtl, DEFAULT_ENVELOPE_TTL_SECS};
 
