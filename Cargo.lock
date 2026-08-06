@@ -3421,6 +3421,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "nostr-sdk",
+ "serde_json",
  "sqlx",
  "tokio",
  "toron-core",
