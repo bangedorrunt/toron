@@ -35,7 +35,7 @@ fn run(cli: &Cli) -> anyhow::Result<()> {
     match &cli.command {
         Command::Serve(args) => run_serve(args, format, color),
         Command::Status => run_status(&cfg, format),
-        Command::Config => run_config(&cfg, format),
+        Command::Config(args) => run_config(&cfg, args, format),
     }
 }
 
@@ -89,7 +89,12 @@ fn run_status(cfg: &Config, format: OutputFormat) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn run_config(cfg: &Config, format: OutputFormat) -> anyhow::Result<()> {
+fn run_config(cfg: &Config, args: &cli::ConfigArgs, format: OutputFormat) -> anyhow::Result<()> {
+    if args.sample {
+        // stdout = data: the annotated sample config (see examples/toron.sample.toml).
+        println!("{}", include_str!("../examples/toron.sample.toml"));
+        return Ok(());
+    }
     let value = serde_json::json!({
         "data_dir": cfg.data_dir.as_ref().map(|p| p.display().to_string()),
         "backend": cfg.effective_backend(),

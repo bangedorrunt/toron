@@ -1,0 +1,47 @@
+# governed-by: ADR-0003
+# Sample toron configuration (./.toron.toml).
+#
+# Precedence: CLI flags > env (TORON_*) > this file (project) >
+# ~/.config/toron/config.toml (user) > /etc/toron/config.toml (system).
+#
+# All values here are defaults/annotated; remove what you don't override.
+
+# Data directory (SQLite index + Git archive root).
+# data_dir = "~/.local/share/toron"
+
+# Default backend: herdr (default) | tmux (on hold).
+backend = "herdr"
+
+# Operator key path (NIP-49 ncryptsec, 0600). Never the secret itself.
+# operator_key = "~/.config/toron/operator_nsec"
+
+# Federation relays — EMPTY by default = zero network egress (opt-in).
+# relays = ["wss://relay.example.com"]
+
+# Bus envelope TTL (NIP-40 expiration), days. Default 90 (open Q #1).
+envelope_ttl_days = 90
+
+# Per-project envelope TTL override (open Q #1: global default + override).
+# [[project_ttl_days]]
+# project = "demo"
+# days = 14
+
+# Proof gate (kind-30012 attestation). Default off; scheme schnorr.
+# proof_gate_enabled = true
+# proof_scheme = "schnorr"          # or "ed25519" (legacy escape hatch)
+# proof_trusted_keys = ["npub1..."]
+
+# git2 override binary (AM-Rust TORON_GIT_BINARY parity).
+# git_binary = "/usr/local/bin/git"
+
+# Federation hardening (A4) — all default OFF; never silently enabled.
+# federation_auth = true            # NIP-42 AUTH membership gate
+# federation_pow = 20               # NIP-13 POW difficulty
+# federation_allowlist = ["wss://trusted-relay.example.com"]
+
+# --- Keyring priority (open Q #2, resolved as recommended) ---
+# Key material is unlocked in this order at process start:
+#   1. macOS Keychain
+#   2. Linux Secret Service (libsecret)
+#   3. passphrase file (fallback; passphrase never in flags/env)
+# toron never writes nsec to config, logs, the bus, or Git.

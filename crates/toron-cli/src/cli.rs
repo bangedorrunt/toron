@@ -75,7 +75,14 @@ pub enum Command {
     Status,
 
     /// Show the effective configuration (flags > env > project > user > system).
-    Config,
+    Config(ConfigArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct ConfigArgs {
+    /// Print the annotated sample configuration to stdout.
+    #[arg(long)]
+    pub sample: bool,
 }
 
 #[derive(Debug, Args)]
