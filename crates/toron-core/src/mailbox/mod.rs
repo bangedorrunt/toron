@@ -24,6 +24,7 @@ pub mod contacts;
 pub mod guard;
 pub mod identity;
 pub mod infra;
+pub mod macros;
 pub mod messaging;
 pub mod product;
 pub mod reservations;
@@ -37,6 +38,9 @@ pub use guard::{
 };
 pub use identity::{ListAgentsOptions, RegisteredAgent, WhoIs};
 pub use infra::{HealthComponent, HealthReport, ProjectState};
+pub use macros::{
+    ContactHandshakeResult, PrepareThreadResult, ReservationCycleResult, StartSessionResult,
+};
 pub use messaging::{
     Delivery, DeliveryPayload, FetchInbox, InboxMessage, ReceiptResult, RecipientRole, SendMessage,
     SendResult,
