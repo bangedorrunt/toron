@@ -30,10 +30,12 @@ CREATE TABLE IF NOT EXISTS bus_events (
     created_at INTEGER NOT NULL,
     kind       INTEGER NOT NULL,
     author     TEXT NOT NULL,
+    d_tag      TEXT,
     expires_at INTEGER
 );
 CREATE INDEX IF NOT EXISTS bus_events_created_at ON bus_events (created_at);
 CREATE INDEX IF NOT EXISTS bus_events_kind ON bus_events (kind);
+CREATE INDEX IF NOT EXISTS bus_events_addressable ON bus_events (kind, author, d_tag);
 ";
 
 /// SQLite event store for the in-process bus.
@@ -55,9 +57,10 @@ impl BusEventStore {
     /// existed (duplicate — do not fan out).
     pub async fn insert(&self, event: &Event) -> anyhow::Result<bool> {
         let expires = event.tags.expiration().map(|t| t.as_secs() as i64);
+        let d_tag = crate::bus::AddressableKey::from_event(event).map(|k| k.d);
         let result = sqlx::query(
-            "INSERT INTO bus_events (event_id, raw_json, created_at, kind, author, expires_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            "INSERT INTO bus_events (event_id, raw_json, created_at, kind, author, d_tag, expires_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT (event_id) DO NOTHING",
         )
         .bind(event.id.to_hex())
@@ -65,12 +68,34 @@ impl BusEventStore {
         .bind(event.created_at.as_secs() as i64)
         .bind(event.kind.as_u16() as i64)
         .bind(event.pubkey.to_hex())
+        .bind(d_tag)
         .bind(expires)
         .execute(&self.pool)
         .await?;
 
         // ON CONFLICT DO NOTHING reports 0 affected rows for duplicates.
         Ok(result.rows_affected() == 1)
+    }
+
+    /// Insert an addressable (parameterized-replaceable, NIP-33) event with
+    /// author isolation: the same author's prior event with the same
+    /// `(kind, d)` is superseded (the bus keeps current state per author,
+    /// ADR-0003 G13). A different author's event with the same `d` is kept —
+    /// NIP-33 never supersedes across authors.
+    ///
+    /// Returns `true` when the event was stored (new or superseding).
+    pub async fn insert_addressable(&self, event: &Event) -> anyhow::Result<bool> {
+        use crate::bus::AddressableKey;
+        if let Some(key) = AddressableKey::from_event(event) {
+            // Delete the author's prior event at the same coordinate.
+            sqlx::query("DELETE FROM bus_events WHERE kind = ?1 AND author = ?2 AND d_tag = ?3")
+                .bind(key.kind as i64)
+                .bind(&key.pubkey)
+                .bind(&key.d)
+                .execute(&self.pool)
+                .await?;
+        }
+        self.insert(event).await
     }
 
     /// Replay stored events ordered by `(created_at, event_id)` ascending
@@ -268,6 +293,67 @@ mod tests {
         let all = store.all_events().await.expect("all");
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].id, live.id, "only the live envelope survives GC");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// NIP-33 author isolation at the store: the same author's replaceable
+    /// event supersedes its own prior one; a different author's event with
+    /// the same d survives (kept for the projection resolver).
+    #[tokio::test]
+    async fn test_addressable_supersede_by_author() {
+        use crate::bus::{is_revocation, resolve_coordinate};
+        let (store, _pool, path) = temp_store().await;
+        let agent = Keys::generate();
+        let operator = Keys::generate();
+
+        let lease_v1 = build_event(
+            &agent,
+            crate::nostr::kinds::toron_kind(crate::nostr::kinds::FILE_RESERVATION),
+            "lease v1",
+            vec![Tag::parse(["d", "proj:src/**"]).expect("d")],
+            Timestamp::from(1_700_000_000_u64),
+        )
+        .expect("build");
+        let lease_v2 = build_event(
+            &agent,
+            crate::nostr::kinds::toron_kind(crate::nostr::kinds::FILE_RESERVATION),
+            "lease v2",
+            vec![Tag::parse(["d", "proj:src/**"]).expect("d")],
+            Timestamp::from(1_700_000_001_u64),
+        )
+        .expect("build");
+        // Operator revocation for the same coordinate.
+        let revoke = build_event(
+            &operator,
+            crate::nostr::kinds::toron_kind(crate::nostr::kinds::FILE_RESERVATION),
+            r#"{"status":"revoked"}"#,
+            vec![Tag::parse(["d", "proj:src/**"]).expect("d")],
+            Timestamp::from(1_700_000_002_u64),
+        )
+        .expect("build");
+
+        assert!(store.insert_addressable(&lease_v1).await.expect("v1"));
+        assert!(store
+            .insert_addressable(&lease_v2)
+            .await
+            .expect("v2 supersedes"));
+        // Same author's v1 is gone (author isolation); v2 remains.
+        assert_eq!(store.count().await.expect("count"), 1);
+        assert_eq!(store.all_events().await.expect("all")[0].id, lease_v2.id);
+
+        // Operator revoke lands (different author) — both co-exist in the
+        // store (raw relay view), projection resolves operator>agent.
+        assert!(store.insert_addressable(&revoke).await.expect("revoke"));
+        assert_eq!(store.count().await.expect("count after revoke"), 2);
+
+        let all = store.all_events().await.expect("all");
+        assert!(all.iter().any(|e| e.id == lease_v2.id));
+        assert!(all.iter().any(|e| e.id == revoke.id && is_revocation(e)));
+
+        // Projection: operator revocation wins over the agent lease (A1).
+        let resolved =
+            resolve_coordinate(all.iter(), Some(&operator.public_key())).expect("resolved");
+        assert_eq!(resolved.id, revoke.id);
         let _ = std::fs::remove_file(&path);
     }
 }
