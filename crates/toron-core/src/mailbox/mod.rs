@@ -29,6 +29,7 @@ pub mod invariants;
 pub mod macros;
 pub mod matrix;
 pub mod messaging;
+pub mod metrics;
 pub mod product;
 pub mod reservations;
 pub mod search;
@@ -49,6 +50,7 @@ pub use messaging::{
     Delivery, DeliveryPayload, FetchInbox, InboxMessage, ReceiptResult, RecipientRole, SendMessage,
     SendResult,
 };
+pub use metrics::{BenchCase, BenchReport, BenchTimer, MailboxMetrics, MetricsSnapshot};
 pub use product::ProductInfo;
 pub use reservations::{
     overlaps, AcquireResult, ConflictReport, GrantedReservation, PathConflict, ReleaseResult,
