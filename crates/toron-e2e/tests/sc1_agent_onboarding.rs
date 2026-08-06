@@ -60,6 +60,7 @@ async fn sc1_agent_onboarding() {
         program: Some("pi".into()),
         model: None,
         task_description: None,
+        persona: None,
     };
     let first = mailbox
         .register_agent("demo", &profile)
