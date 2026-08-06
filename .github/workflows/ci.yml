@@ -38,3 +38,14 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: cargo fmt --check
         run: cargo fmt --check
+
+  e2e-p1:
+    name: toron-e2e P1 gate (v1)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo test -p toron-e2e --features p1
+        run: cargo test -p toron-e2e --features p1
