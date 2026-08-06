@@ -8,6 +8,7 @@
 pub mod error;
 pub mod herdr;
 pub mod mock;
+pub mod tmux;
 pub mod types;
 
 pub use error::{BackendError, BackendErrorCode};
