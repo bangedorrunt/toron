@@ -73,6 +73,11 @@ struct Subscriber {
     tx: mpsc::Sender<SubscriptionEvent>,
     /// True when this subscription is global (no project scoping).
     global: bool,
+    /// Event ids captured in the subscribe-time snapshot (replayed by the
+    /// background task). Live fanout skips these until `replay_done`.
+    snapshot: Arc<std::collections::HashSet<String>>,
+    /// Set to true once the replay task has pushed history + EOSE.
+    replay_done: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Configuration for [`InProcessBus`].
@@ -158,6 +163,14 @@ impl InProcessBus {
     }
 
     fn fanout_to(&self, sub: &Subscriber, event: &Event) {
+        // Skip events the subscribe-time snapshot already covers until the
+        // replay task has pushed history + EOSE (exactly-once delivery: the
+        // replay task delivers snapshot members, live fanout delivers the rest).
+        if !sub.replay_done.load(std::sync::atomic::Ordering::Acquire)
+            && sub.snapshot.contains(&event.id.to_hex())
+        {
+            return;
+        }
         // Lossless: if the channel is full we drop publisher-side with a
         // warning (the event remains in the store for cursor-based replay).
         match sub.tx.try_send(SubscriptionEvent::Event(event.clone())) {
@@ -263,18 +276,6 @@ impl Bus for InProcessBus {
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
         ));
 
-        // Replay stored history matching the filter (expired excluded), then
-        // emit EOSE so the subscriber knows live streaming has begun.
-        let replayed = self
-            .store
-            .replay(&filter)
-            .await
-            .map_err(|e| BusError::Subscription(format!("replay failure: {e}")))?;
-        for ev in replayed {
-            let _ = tx.send(SubscriptionEvent::Event(ev)).await;
-        }
-        let _ = tx.send(SubscriptionEvent::Eose).await;
-
         // Global = filter has no project scoping (#t via hashtags or #l label).
         use nostr_sdk::nostr::{Alphabet, SingleLetterTag};
         let t_tag = SingleLetterTag::lowercase(Alphabet::T);
@@ -282,11 +283,47 @@ impl Bus for InProcessBus {
         let global =
             !filter.generic_tags.contains_key(&t_tag) && !filter.generic_tags.contains_key(&l_tag);
 
+        // Take the history snapshot synchronously (fast DB read) so the
+        // exactly-once boundary is stable: snapshot members are replayed by
+        // the background task; anything published after subscribe() returns is
+        // delivered live.
+        let snapshot = self
+            .store
+            .replay(&filter)
+            .await
+            .map_err(|e| BusError::Subscription(format!("replay failure: {e}")))?;
+        let snapshot_ids: Arc<std::collections::HashSet<String>> =
+            Arc::new(snapshot.iter().map(|ev| ev.id.to_hex()).collect());
+        let replay_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        // Push the snapshot + EOSE in a background task so `subscribe` never
+        // blocks on a small channel (lossless backpressure inside the task).
+        let replay_tx = tx.clone();
+        let snapshot_clone = snapshot;
+        let replay_done_clone = replay_done.clone();
+        let global_clone = global;
+        tokio::spawn(async move {
+            for ev in snapshot_clone {
+                // Access gate applies to replay too: a global subscription
+                // never receives project-scoped history.
+                if global_clone && Self::project_slug(&ev).is_some() {
+                    continue;
+                }
+                if replay_tx.send(SubscriptionEvent::Event(ev)).await.is_err() {
+                    return;
+                }
+            }
+            let _ = replay_tx.send(SubscriptionEvent::Eose).await;
+            replay_done_clone.store(true, std::sync::atomic::Ordering::Release);
+        });
+
         let sub = Arc::new(Subscriber {
             id: id.clone(),
             filter,
             tx,
             global,
+            snapshot: snapshot_ids,
+            replay_done,
         });
         self.subs.write().insert(id.clone(), sub);
 
@@ -352,6 +389,21 @@ mod tests {
             }
         }
         out
+    }
+
+    /// Failure-detail: dump event id/kind/tags + received stream to the panic
+    /// message so a pipeline failure is self-diagnosing.
+    #[track_caller]
+    fn dump_failure(ev: &Event, stage: &str, received: &[SubscriptionEvent]) -> String {
+        format!(
+            "pipeline stage [{stage}] failed\n  event id:   {}\n  event kind: {}\n  event tags: {:?}\n  received:   {received:?}",
+            ev.id,
+            ev.kind.as_u16(),
+            ev.tags
+                .iter()
+                .map(|t| t.as_slice().join(","))
+                .collect::<Vec<_>>(),
+        )
     }
 
     fn signed(keys: &Keys, kind: u16, content: &str, slug: &str) -> Event {
@@ -616,5 +668,219 @@ mod tests {
         let _ =
             EventId::from_hex("b32828720d7e8a80dd5165a6cd31b2c70e8d25b83c387209cb138e77d7e7e05b")
                 .expect("id");
+    }
+
+    /// Concurrent subscribers: every subscriber that matches receives the
+    /// live event (independent per-subscriber channels, no cross-talk).
+    #[tokio::test]
+    async fn test_concurrent_subscribers_all_receive() {
+        let (bus, path) = temp_bus().await;
+        let keys = Keys::generate();
+        let ev = signed(&keys, PROJECT_MANIFEST, "fanout", "demo");
+
+        // Three concurrent subscribers on the same project filter.
+        let mut subs = Vec::new();
+        for _ in 0..3 {
+            let sub = bus
+                .subscribe(crate::bus::project_filter("demo"))
+                .await
+                .expect("sub");
+            subs.push(sub);
+        }
+
+        bus.publish(ev.clone()).await.expect("publish");
+
+        for (i, sub) in subs.iter_mut().enumerate() {
+            let items = drain(sub, 8, Duration::from_millis(200)).await;
+            let got = items
+                .iter()
+                .any(|it| matches!(it, SubscriptionEvent::Event(e) if e.id == ev.id));
+            assert!(
+                got,
+                "{}",
+                dump_failure(&ev, "concurrent fanout", &items)
+                    + &format!(" (subscriber {i} missed the event)")
+            );
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Fanout isolation: a full channel never blocks the bus publish path
+    /// (per-subscriber try_send, publisher-side drop). The event stays in the
+    /// store, so a later subscription replays it (lossless cursor recovery).
+    #[tokio::test]
+    async fn test_slow_subscriber_does_not_block_others() {
+        let (bus, path) = temp_bus_with(InProcessBusConfig {
+            channel_capacity: 2,
+            ..Default::default()
+        })
+        .await;
+        let keys = Keys::generate();
+
+        // A subscriber that never drains → its channel fills at capacity 2.
+        let _overflowed_sub = bus
+            .subscribe(crate::bus::project_filter("demo"))
+            .await
+            .expect("overflow sub");
+
+        // Publish 6 events; publish must NEVER block despite the full channel.
+        let mut ev_ids = Vec::new();
+        for i in 0..6 {
+            let ev = signed(&keys, PROJECT_MANIFEST, &format!("burst {i}"), "demo");
+            let ok = bus.publish(ev.clone()).await.expect("publish never blocks");
+            assert!(ok.stored, "event {i} stored");
+            ev_ids.push(ev.id);
+        }
+
+        // A new subscriber replays ALL 6 from the store (nothing lost).
+        let mut fresh = bus
+            .subscribe(crate::bus::project_filter("demo"))
+            .await
+            .expect("fresh sub");
+        let items = drain(&mut fresh, 12, Duration::from_millis(300)).await;
+        let got: Vec<_> = items
+            .iter()
+            .filter_map(|it| match it {
+                SubscriptionEvent::Event(e) => Some(e.id),
+                _ => None,
+            })
+            .collect();
+        for id in &ev_ids {
+            assert!(
+                got.contains(id),
+                "event {id} must be recoverable via replay, got {items:?}"
+            );
+        }
+        assert_eq!(got.len(), 6, "all 6 events recovered, got {items:?}");
+
+        // Bus still healthy.
+        let h = bus.health().await.expect("health");
+        assert!(h.ok);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Integration: a kind-30013 published through the bus carries the
+    /// dual-emit scoping tags (#t + NIP-32) because the caller applied them;
+    /// a kind-1059 gift wrap carries NO project tags.
+    #[tokio::test]
+    async fn test_dual_tag_presence_absence_through_bus() {
+        use crate::bus::scoping::{is_metadata_hiding_kind, with_project_scoping};
+        let (bus, path) = temp_bus().await;
+        let keys = Keys::generate();
+
+        // 30013 with scoping tags applied by the caller (identity flow).
+        let tags = with_project_scoping(
+            crate::nostr::kinds::toron_kind(AGENT_PROFILE),
+            vec![Tag::parse(["d", "demo:BlueLake"]).expect("d")],
+            Some("demo"),
+        );
+        let profile_ev = build_event(
+            &keys,
+            crate::nostr::kinds::toron_kind(AGENT_PROFILE),
+            "{}",
+            tags,
+            Timestamp::now(),
+        )
+        .expect("build");
+        assert!(!is_metadata_hiding_kind(profile_ev.kind));
+        bus.publish(profile_ev.clone())
+            .await
+            .expect("publish 30013");
+
+        // Recover from store replay and assert dual tags survived the bus.
+        let mut sub = bus
+            .subscribe(crate::bus::project_filter("demo"))
+            .await
+            .expect("sub");
+        let items = drain(&mut sub, 8, Duration::from_millis(200)).await;
+        let replayed = items
+            .iter()
+            .find_map(|it| match it {
+                SubscriptionEvent::Event(e) if e.id == profile_ev.id => Some(e),
+                _ => None,
+            })
+            .expect("profile event replayed");
+        assert!(
+            replayed
+                .tags
+                .iter()
+                .any(|t| t.as_slice() == ["t".to_string(), "demo".to_string()]),
+            "{}",
+            dump_failure(replayed, "dual-tag #t", &items)
+        );
+        assert!(
+            replayed
+                .tags
+                .iter()
+                .any(|t| t.as_slice() == ["l".to_string(), "demo".to_string(), "toron".to_string()]),
+            "{}",
+            dump_failure(replayed, "dual-tag NIP-32 l", &items)
+        );
+
+        // Kind-1059 gift wrap: no project tags on the envelope.
+        let sender = Keys::generate();
+        let recipient = Keys::generate();
+        let rumor = crate::nostr::gift_wrap::build_rumor(
+            sender.public_key(),
+            Timestamp::now(),
+            nostr_sdk::nostr::Kind::PrivateDirectMessage,
+            vec![Tag::parse(["p", &recipient.public_key().to_hex()]).expect("p")],
+            "secret",
+        );
+        let wrapped = crate::nostr::gift_wrap::gift_wrap(&sender, &recipient.public_key(), rumor)
+            .await
+            .expect("wrap");
+        // Wrap is metadata-hiding → no scoping tags applied by the helper.
+        assert!(is_metadata_hiding_kind(wrapped.kind));
+        let scoped_wrap_tags =
+            with_project_scoping(wrapped.kind, wrapped.tags.clone(), Some("demo"));
+        let has_t = scoped_wrap_tags.iter().any(|t| t.as_slice()[0] == "t");
+        let has_l = scoped_wrap_tags.iter().any(|t| {
+            t.as_slice()
+                .starts_with(&["l".to_string(), "demo".to_string()])
+        });
+        assert!(!has_t, "wrap must not gain a #t tag");
+        assert!(!has_l, "wrap must not gain a NIP-32 label");
+
+        // And the raw envelope (as produced by gift_wrap) has only the p tag.
+        let visible: Vec<Vec<String>> = wrapped
+            .tags
+            .iter()
+            .map(|t| t.as_slice().iter().map(|s| s.to_string()).collect())
+            .collect();
+        assert_eq!(
+            visible.len(),
+            1,
+            "wrap envelope carries only the p tag, got {visible:?}"
+        );
+        assert!(visible[0][0] == "p");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Failure-detail logging: forge rejection reports the stage.
+    #[tokio::test]
+    async fn test_forge_rejection_dumps_stage() {
+        let (bus, path) = temp_bus().await;
+        let keys = Keys::generate();
+        let ev = signed(&keys, PROJECT_MANIFEST, "original", "demo");
+        let forged = Event::new(
+            ev.id,
+            ev.pubkey,
+            ev.created_at,
+            ev.kind,
+            ev.tags.clone(),
+            "MUTATED",
+            ev.sig,
+        );
+        let err = match bus.publish(forged).await {
+            Err(e) => e,
+            Ok(_) => panic!("forged event must be rejected"),
+        };
+        // Stage detail must be in the error (self-diagnosing).
+        assert!(
+            err.to_string().contains("verify") || err.to_string().contains("id"),
+            "error must identify the failing stage, got: {err}"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 }
