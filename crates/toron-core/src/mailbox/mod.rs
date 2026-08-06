@@ -20,12 +20,14 @@ use nostr_sdk::nostr::{Event, Keys};
 use crate::bus::{Bus, BusError, Filter, SubscriptionEvent};
 
 pub mod guard;
+pub mod identity;
 pub mod infra;
 pub mod unwrap;
 
 pub use guard::{
     guard_blocked_paths, install_precommit_guard, uninstall_precommit_guard, Reservation,
 };
+pub use identity::{ListAgentsOptions, RegisteredAgent, WhoIs};
 pub use infra::{HealthComponent, HealthReport, ProjectState};
 pub use unwrap::{
     order_by_rumor_time, AckCache, AutoPolicy, ContactPolicy, DedupKey, FixedPolicy,
@@ -40,6 +42,7 @@ pub struct Mailbox {
     bus: Arc<dyn Bus>,
     data_dir: PathBuf,
     operator: Option<Keys>,
+    agent_passphrase: Option<String>,
 }
 
 impl std::fmt::Debug for Mailbox {
@@ -47,6 +50,7 @@ impl std::fmt::Debug for Mailbox {
         f.debug_struct("Mailbox")
             .field("data_dir", &self.data_dir)
             .field("operator", &self.operator.is_some())
+            .field("has_agent_passphrase", &self.agent_passphrase.is_some())
             .finish()
     }
 }
@@ -59,7 +63,14 @@ impl Mailbox {
             bus,
             data_dir,
             operator,
+            agent_passphrase: None,
         }
+    }
+
+    /// Set the agent-key passphrase (G1: unlocks ncryptsec at process start).
+    pub fn with_agent_passphrase(mut self, passphrase: impl Into<String>) -> Self {
+        self.agent_passphrase = Some(passphrase.into());
+        self
     }
 
     /// The bus backing this mailbox.
