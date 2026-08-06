@@ -1,7 +1,19 @@
 # ADR-0001: Project Foundation and Core Stack
 
 ## Status
-Accepted
+**Superseded** by [ADR-0003: Pivot to a Nostr-Native Multi-Backend Agent Mailbox](0003-nostr-mailbox-fabric.md).
+
+> **Revision 2 (2026-08-04):** the asupersync runtime discipline (no Tokio)
+> is **also dropped** per captain override (RULE 0); toron uses Tokio.
+> Retained into ADR-0003: `#![forbid(unsafe_code)]` workspace-wide, Resonate
+> durable execution, i64-µs timestamps.
+> Removed: asupersync + asupersync-macros + asupersync-tokio-compat; mDNS
+> discovery; PSK security; the WebSocket/QUIC hub with active-passive
+> failover — all replaced by the Nostr `Bus` (in-process tokio broadcast by
+> default, NIP-01 relay for daemon/federation) and NIP-17 crypto-native
+> messaging.
+
+Accepted (historical)
 
 ## Context
 AI agents (Gemini, OpenCode, Pi, Codex, etc.) need a reliable, decentralized, and durable way to communicate over specific topics. Existing solutions are either too rigid or lack the durability required for long-running agentic workflows.
