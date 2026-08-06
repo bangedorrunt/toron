@@ -97,6 +97,29 @@ pub enum Command {
     /// Pre-commit guard: install/uninstall.
     #[command(subcommand)]
     Guard(GuardCommand),
+
+    // --- operator surface (bd-led.8.2): daemon-persona commands.
+    /// Deep health checks (herdr/git/keys/resonate). --check exits 3 on any failure.
+    Doctor(DoctorArgs),
+
+    /// In-process operator counters (tool calls, errors, latency).
+    Metrics,
+
+    /// NIP-49 key management: generate + inspect (never prints the nsec).
+    #[command(subcommand)]
+    Key(KeyCommand),
+
+    /// Project lifecycle: ensure (idempotent manifest) + list.
+    #[command(subcommand)]
+    Project(ProjectCommand),
+
+    /// Relay federation config: list/add/remove/info (config-backed).
+    #[command(subcommand)]
+    Relay(RelayCommand),
+
+    /// Backend selection: list/status/default.
+    #[command(subcommand)]
+    Backend(BackendCommand),
 }
 
 #[derive(Debug, Args)]
@@ -555,4 +578,114 @@ pub struct GuardRepoArgs {
     /// Git repository path.
     #[arg(long, required = true)]
     pub repo: PathBuf,
+}
+
+// ---------------------------------------------------------------------------
+// Operator surface (bd-led.8.2): doctor/metrics/key/project/relay/backend.
+// Passphrases NEVER arrive via flags — env `TORON_KEY_PASSPHRASE` only (dev
+// default "toron"; production must set the env var).
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Args)]
+pub struct DoctorArgs {
+    /// CI-friendly: exit 3 if any check fails (0 if all pass).
+    #[arg(long)]
+    pub check: bool,
+}
+
+/// Keypair role selector (drives the default output path suffix).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum RoleArg {
+    Operator,
+    Agent,
+    Anchor,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum KeyCommand {
+    /// Generate a keypair, write ncryptsec (0600), print the npub + path.
+    Generate(KeyGenerateArgs),
+    /// Load a key file and print ONLY the public key (never the nsec).
+    Inspect(KeyInspectArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct KeyGenerateArgs {
+    /// operator|agent|anchor.
+    #[arg(long, value_enum, default_value_t = RoleArg::Operator)]
+    pub role: RoleArg,
+    /// Output path (default: operator_key or ~/.config/toron/<role>_nsec).
+    #[arg(long)]
+    pub out: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+pub struct KeyInspectArgs {
+    /// Key file path (default: operator_key).
+    pub path: Option<PathBuf>,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ProjectCommand {
+    /// Idempotent project bootstrap (kind-30010 manifest via the operator key).
+    Ensure(ProjectEnsureArgs),
+    /// List known projects (demo data dir; registry query not wired).
+    List,
+}
+
+#[derive(Debug, Args)]
+pub struct ProjectEnsureArgs {
+    /// Project slug.
+    pub slug: String,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum RelayCommand {
+    /// Print the configured federation relays.
+    List,
+    /// Propose appending a relay URL (in-memory; no config write-back).
+    Add(RelayUrlArg),
+    /// Propose removing a relay URL (in-memory; no config write-back).
+    Remove(RelayUrlArg),
+    /// Relay metadata lookup (NIP-11; network — not wired yet).
+    Info(RelayUrlArg),
+}
+
+#[derive(Debug, Args)]
+pub struct RelayUrlArg {
+    /// Relay URL (e.g. wss://relay.example.com).
+    pub url: String,
+}
+
+/// Backend selector (herdr | tmux).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum BackendArg {
+    Herdr,
+    Tmux,
+}
+
+impl BackendArg {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            BackendArg::Herdr => "herdr",
+            BackendArg::Tmux => "tmux",
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
+pub enum BackendCommand {
+    /// Probe backend availability (herdr socket connect; tmux held).
+    List,
+    /// Print the effective backend from config.
+    Status,
+    /// Choose the default backend (confirmation only; no persistence).
+    Default(BackendDefaultArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct BackendDefaultArgs {
+    /// herdr|tmux.
+    #[arg(value_enum)]
+    pub backend: BackendArg,
 }
