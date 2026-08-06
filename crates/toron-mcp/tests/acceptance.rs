@@ -4,12 +4,67 @@
 //! bd-led.7.1 acceptance: an rmcp client completes `initialize` over both
 //! transports and the negotiated protocol is 2026-07-28.
 
-use rmcp::model::{ClientCapabilities, ClientInfo, Implementation, ProtocolVersion};
+use rmcp::model::{
+    ClientCapabilities, ClientInfo, Implementation, ProtocolVersion, ReadResourceRequestParams,
+};
 use rmcp::transport::streamable_http_client::{
     StreamableHttpClientTransport, StreamableHttpClientTransportConfig,
 };
 use rmcp::ClientServiceExt;
 use rmcp::ServiceExt;
+
+#[tokio::test]
+async fn http_resources_list_and_read() -> anyhow::Result<()> {
+    let router = toron_mcp::router();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let server = tokio::spawn(async move { axum::serve(listener, router).await });
+
+    let transport = StreamableHttpClientTransport::from_config(
+        StreamableHttpClientTransportConfig::with_uri(format!("http://{addr}/mcp")),
+    );
+    let client_info = ClientInfo::new(
+        ClientCapabilities::default(),
+        Implementation::from_build_env(),
+    );
+    let mut client = client_info
+        .serve_with_lifecycle(
+            transport,
+            rmcp::ClientLifecycleMode::Discover {
+                preferred_versions: vec![
+                    ProtocolVersion::V_2026_07_28,
+                    ProtocolVersion::V_2025_11_25,
+                ],
+            },
+        )
+        .await?;
+
+    // 25 parity resources listed.
+    let resources = client.list_all_resources().await?;
+    assert_eq!(resources.len(), 25, "AM-Rust parity requires 25 resources");
+
+    // Templates expand (any resource with a {param}).
+    let templates = client.list_resource_templates(None).await?;
+    assert!(!templates.resource_templates.is_empty());
+
+    // Static resource reads succeed.
+    let env = client
+        .read_resource(ReadResourceRequestParams::new("toron://config/environment"))
+        .await?;
+    assert_eq!(env.contents.len(), 1);
+
+    // Unknown resource is rejected with invalid params.
+    let missing = client
+        .read_resource(ReadResourceRequestParams::new(
+            "toron://nope/does-not-exist",
+        ))
+        .await;
+    assert!(missing.is_err(), "unknown resource must be rejected");
+
+    client.close().await?;
+    server.abort();
+    Ok(())
+}
 
 #[tokio::test]
 async fn http_initialize_negotiates_2026_07_28() -> anyhow::Result<()> {
