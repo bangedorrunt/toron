@@ -254,8 +254,11 @@ pub async fn demo_mailbox() -> anyhow::Result<Mailbox> {
 /// Load the operator key for the MCP server from env, if configured.
 ///
 /// Honors `TORON_OPERATOR_KEY` (a **path**, never a secret on the
-/// command line — CLI design) + `TORON_OPERATOR_PASSPHRASE`. Without an
-/// operator the parity-privileged ops (`ensure_project`, `macro_start_session`,
+/// command line — CLI design) + `TORON_KEY_PASSPHRASE` (the SAME env var
+/// `toron key generate` uses via `key_password()` in toron-cli/src/operator.rs,
+/// default "toron") — they MUST agree, or a freshly-generated operator key
+/// will not decrypt at serve time (aead::Error on passphrase mismatch).
+/// Without an operator the parity-privileged ops (`ensure_project`, `macro_start_session`,
 /// product ops, force-release) fail with "no operator key configured", which
 /// the real-e2e parity test (bd-e2e / opencode agent probe) surfaced as a
 /// blocking defect. daemon hosts MUST set these so the full 38-tool surface
@@ -271,7 +274,7 @@ pub(crate) fn operator_keys() -> anyhow::Result<Option<toron_core::keys::Keys>> 
             path.display()
         );
     }
-    let pass = std::env::var("TORON_OPERATOR_PASSPHRASE").unwrap_or_else(|_| "toron".to_string());
+    let pass = std::env::var("TORON_KEY_PASSPHRASE").unwrap_or_else(|_| "toron".to_string());
     toron_core::keys::load_encrypted_key(&path, &pass)
         .map(Some)
         .map_err(|e| anyhow::anyhow!("failed to load operator key from {}: {e}", path.display()))
