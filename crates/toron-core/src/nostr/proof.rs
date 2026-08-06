@@ -353,7 +353,6 @@ pub fn attestation_event_id(event: &Event) -> EventId {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::index::schema;
 
     async fn temp_pool() -> (sqlx::SqlitePool, std::path::PathBuf) {
         let path =

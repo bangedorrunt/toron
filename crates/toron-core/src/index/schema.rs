@@ -152,13 +152,12 @@ mod tests {
             ("run", 1, "porter stem running->run"),
             ("build", 1, "porter stem builds->build"),
         ] {
-            let n: i64 = sqlx::query_scalar(&format!(
-                "SELECT count(*) FROM messages_fts WHERE messages_fts MATCH ?"
-            ))
-            .bind(term)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+            let n: i64 =
+                sqlx::query_scalar("SELECT count(*) FROM messages_fts WHERE messages_fts MATCH ?")
+                    .bind(term)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
             assert_eq!(n, expect, "{note}: MATCH {term}");
         }
 
@@ -173,13 +172,12 @@ mod tests {
 
         // remove_diacritics 2: 'café' indexed as 'cafe', 'résumé' as 'resume'.
         for (term, expect) in [("cafe", 1), ("resume", 1)] {
-            let n: i64 = sqlx::query_scalar(&format!(
-                "SELECT count(*) FROM messages_fts WHERE messages_fts MATCH ?"
-            ))
-            .bind(term)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+            let n: i64 =
+                sqlx::query_scalar("SELECT count(*) FROM messages_fts WHERE messages_fts MATCH ?")
+                    .bind(term)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
             assert_eq!(n, expect, "remove_diacritics: MATCH {term}");
         }
 
@@ -190,13 +188,12 @@ mod tests {
             ("br*", 1, "2-char prefix br* -> brown"),
             ("zzz*", 0, "no match"),
         ] {
-            let n: i64 = sqlx::query_scalar(&format!(
-                "SELECT count(*) FROM messages_fts WHERE messages_fts MATCH ?"
-            ))
-            .bind(term)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+            let n: i64 =
+                sqlx::query_scalar("SELECT count(*) FROM messages_fts WHERE messages_fts MATCH ?")
+                    .bind(term)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
             assert_eq!(n, expect, "{note}: MATCH {term}");
         }
 
@@ -234,9 +231,9 @@ mod tests {
             )
             .await;
             for term in *expected {
-                let n: i64 = sqlx::query_scalar(&format!(
-                    "SELECT count(*) FROM messages_fts WHERE messages_fts MATCH ?"
-                ))
+                let n: i64 = sqlx::query_scalar(
+                    "SELECT count(*) FROM messages_fts WHERE messages_fts MATCH ?",
+                )
                 .bind(term)
                 .fetch_one(&pool)
                 .await

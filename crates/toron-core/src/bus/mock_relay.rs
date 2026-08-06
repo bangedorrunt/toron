@@ -50,19 +50,14 @@ impl MockRelay {
             let state = state.clone();
             let live_tx = live_tx.clone();
             async move {
-                loop {
-                    match listener.accept().await {
-                        Ok((stream, _)) => {
-                            let state = state.clone();
-                            let live_tx = live_tx.clone();
-                            tokio::spawn(async move {
-                                if let Err(e) = handle_conn(stream, state, live_tx).await {
-                                    eprintln!("mock relay conn error: {e}");
-                                }
-                            });
+                while let Ok((stream, _)) = listener.accept().await {
+                    let state = state.clone();
+                    let live_tx = live_tx.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = handle_conn(stream, state, live_tx).await {
+                            eprintln!("mock relay conn error: {e}");
                         }
-                        Err(_) => break,
-                    }
+                    });
                 }
             }
         });

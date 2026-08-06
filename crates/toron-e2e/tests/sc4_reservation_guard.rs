@@ -90,14 +90,22 @@ async fn sc4_reservation_conflict_and_guard() {
         pattern: "src/**".into(),
         exclusive: true,
     };
-    let blocked = guard_blocked_paths("OCBeta", &["src/lib.rs".into()], &[other.clone()]);
+    let blocked = guard_blocked_paths(
+        "OCBeta",
+        &["src/lib.rs".into()],
+        std::slice::from_ref(&other),
+    );
     assert_eq!(
         blocked,
         vec!["src/lib.rs".to_string()],
         "cross-agent blocked"
     );
 
-    let own = guard_blocked_paths("PiAlpha", &["src/lib.rs".into()], &[other.clone()]);
+    let own = guard_blocked_paths(
+        "PiAlpha",
+        &["src/lib.rs".into()],
+        std::slice::from_ref(&other),
+    );
     assert!(own.is_empty(), "own reservation never blocks");
 
     // --- Symmetric: OCBeta holding src/lib.rs ALSO conflicts with src/** ---

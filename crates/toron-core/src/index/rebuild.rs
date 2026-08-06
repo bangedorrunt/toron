@@ -297,8 +297,8 @@ mod tests {
     fn calendar_ym_matches_layout() {
         // 2026-08-06 ~ 2026-08 epoch days.
         let (y, m) = calendar_ym(1_752_825_600_000_000);
-        assert!(y >= 2025 && y <= 2027, "year in range: {y}");
-        assert!(m >= 1 && m <= 12, "month in range: {m}");
+        assert!((2025..=2027).contains(&y), "year in range: {y}");
+        assert!((1..=12).contains(&m), "month in range: {m}");
         // Deterministic: same input → same output.
         assert_eq!(calendar_ym(1_752_825_600_000_000), (y, m));
     }

@@ -263,10 +263,10 @@ mod tests {
         let msg = layout::message(&root, 2026, 8, "evt-1");
         let outbox = layout::agent_mail(&root, "PiAlpha", true, "evt-1");
         archive
-            .stage_file(&msg.strip_prefix(&root).unwrap(), br#"{"kind":14}"#)
+            .stage_file(msg.strip_prefix(&root).unwrap(), br#"{"kind":14}"#)
             .expect("stage msg");
         archive
-            .stage_file(&outbox.strip_prefix(&root).unwrap(), br#"{"kind":14}"#)
+            .stage_file(outbox.strip_prefix(&root).unwrap(), br#"{"kind":14}"#)
             .expect("stage outbox");
         archive.commit("send evt-1").expect("commit");
 
@@ -285,10 +285,10 @@ mod tests {
         let res = layout::reservation(&root, "r-1");
         let slot = layout::build_slot(&root, "ci");
         archive
-            .stage_file(&res.strip_prefix(&root).unwrap(), b"{}")
+            .stage_file(res.strip_prefix(&root).unwrap(), b"{}")
             .unwrap();
         archive
-            .stage_file(&slot.strip_prefix(&root).unwrap(), b"{}")
+            .stage_file(slot.strip_prefix(&root).unwrap(), b"{}")
             .unwrap();
         archive.commit("reserve").unwrap();
         assert!(res.exists());
@@ -306,7 +306,7 @@ mod tests {
         for i in 0..10 {
             let p = layout::reservation(&root, &format!("r-{i}"));
             archive
-                .stage_file(&p.strip_prefix(&root).unwrap(), b"{}")
+                .stage_file(p.strip_prefix(&root).unwrap(), b"{}")
                 .expect("stage");
         }
         archive
@@ -342,7 +342,7 @@ mod tests {
             let p = layout::build_slot(&root, &format!("s-{i}"));
             archive
                 .lock()
-                .stage_file(&p.strip_prefix(&root).unwrap(), b"{}")
+                .stage_file(p.strip_prefix(&root).unwrap(), b"{}")
                 .unwrap();
             coalescer.ping();
             tokio::time::sleep(std::time::Duration::from_millis(2)).await;
