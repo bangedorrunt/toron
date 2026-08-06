@@ -98,10 +98,9 @@ async fn sc8_proof_gate_fail_closed_and_nonce_persists() {
         r#"{"scheme":"schnorr","agent_npub":"f0f0","project":"demo","scope":"x","nonce":"y"}"#
             .into();
     assert!(
-        matches!(
-            gate.verify_schnorr(&forged, &claim, &mut store, now).await,
-            Err(_)
-        ),
+        gate.verify_schnorr(&forged, &claim, &mut store, now)
+            .await
+            .is_err(),
         "forged rejected"
     );
 

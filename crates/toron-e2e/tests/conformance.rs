@@ -20,7 +20,6 @@
 use std::path::Path;
 
 use serde_json::Value;
-use sqlx::Row;
 
 const FIXTURES: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),

@@ -26,9 +26,7 @@ use toron_core::nostr::identity::AgentProfile;
 /// A mailbox on its own project root + a shared bus, with an index pool.
 struct MailboxFixture {
     mailbox: Mailbox,
-    bus: InProcessBus,
     data_dir: std::path::PathBuf,
-    pool: sqlx::SqlitePool,
 }
 
 async fn fixture(
@@ -43,9 +41,7 @@ async fn fixture(
         .with_index_pool(pool.clone());
     Ok(MailboxFixture {
         mailbox,
-        bus,
         data_dir: dir,
-        pool,
     })
 }
 
