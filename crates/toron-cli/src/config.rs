@@ -18,6 +18,12 @@ pub const DEFAULT_ENVELOPE_TTL_DAYS: u64 = 90;
 ///   - system: `/etc/toron/config.toml`
 ///   - user:   `$XDG_CONFIG_HOME/toron/config.toml` (default `~/.config/toron/config.toml`)
 ///   - project: `./.toron.toml` (`TORON_CONFIG` overrides the project path)
+///
+/// Operational defaults (ADR-0003 open Q resolved): bus envelope TTL global
+/// 90 days + per-project override; federation relays empty (zero egress);
+/// proof gate off (schnorr); federation hardening (AUTH/POW/allowlist) off.
+/// Keyring unlock priority: macOS Keychain → Linux Secret Service →
+/// passphrase file. See `examples/toron.sample.toml`.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
