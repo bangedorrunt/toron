@@ -490,7 +490,8 @@ impl ToolServer {
     /// `ensure_project`: idempotent project initialization.
     #[tool(
         name = "ensure_project",
-        description = "Idempotent project initialization (kind-30010 manifest)."
+        description = "Idempotent project initialization (kind-30010 manifest).",
+        annotations(title = "Ensure project", destructive_hint = true)
     )]
     async fn ensure_project(&self, Parameters(args): Parameters<EnsureProjectArgs>) -> ToolOutput {
         ToolOutput::result(self.mailbox.ensure_project(&args.human_key).await)
@@ -519,7 +520,8 @@ impl ToolServer {
     /// user hook).
     #[tool(
         name = "uninstall_precommit_guard",
-        description = "Remove the toron pre-commit hook (never clobbers a user hook)."
+        description = "Remove the toron pre-commit hook (never clobbers a user hook).",
+        annotations(title = "Uninstall pre-commit guard", destructive_hint = true)
     )]
     async fn uninstall_precommit_guard(
         &self,
@@ -538,7 +540,8 @@ impl ToolServer {
     /// `register_agent`: upsert on the existing agent key (or create).
     #[tool(
         name = "register_agent",
-        description = "Upsert an agent identity on its existing key (or create if absent)."
+        description = "Upsert an agent identity on its existing key (or create if absent).",
+        annotations(title = "Register agent", destructive_hint = true)
     )]
     async fn register_agent(&self, Parameters(args): Parameters<RegisterAgentArgs>) -> ToolOutput {
         let name = args.name.clone().unwrap_or_else(generate_agent_name);
@@ -559,7 +562,8 @@ impl ToolServer {
     /// `create_agent_identity`: ALWAYS mint a fresh keypair.
     #[tool(
         name = "create_agent_identity",
-        description = "Mint a fresh agent keypair (ncryptsec) and publish the kind-30013 profile."
+        description = "Mint a fresh agent keypair (ncryptsec) and publish the kind-30013 profile.",
+        annotations(title = "Create agent identity", destructive_hint = true)
     )]
     async fn create_agent_identity(
         &self,
@@ -597,7 +601,8 @@ impl ToolServer {
     /// `resolve_pane_identity`: herdr pane_id → agent name (G9).
     #[tool(
         name = "resolve_pane_identity",
-        description = "Resolve a herdr pane_id to the agent name (G9)."
+        description = "Resolve a herdr pane_id to the agent name (G9).",
+        annotations(title = "Resolve pane identity", read_only_hint = true)
     )]
     async fn resolve_pane_identity(
         &self,
@@ -620,7 +625,8 @@ impl ToolServer {
     /// `cleanup_pane_identities`: prune identities whose herdr panes are gone.
     #[tool(
         name = "cleanup_pane_identities",
-        description = "Prune identities whose herdr panes are absent from the live pane list."
+        description = "Prune identities whose herdr panes are absent from the live pane list.",
+        annotations(title = "Cleanup pane identities", destructive_hint = true)
     )]
     async fn cleanup_pane_identities(
         &self,
@@ -654,7 +660,8 @@ impl ToolServer {
     /// `send_message`: NIP-17 gift-wrapped fan-out.
     #[tool(
         name = "send_message",
-        description = "Send a NIP-17 gift-wrapped message to one or more recipients."
+        description = "Send a NIP-17 gift-wrapped message to one or more recipients.",
+        annotations(title = "Send message", destructive_hint = true)
     )]
     async fn send_message(&self, Parameters(args): Parameters<SendMessageArgs>) -> ToolOutput {
         if args.broadcast == Some(true) {
@@ -679,7 +686,8 @@ impl ToolServer {
     /// `reply_message`: reply within a thread (NIP-10 `e` reference).
     #[tool(
         name = "reply_message",
-        description = "Reply to a message within its thread (NIP-10 reply reference)."
+        description = "Reply to a message within its thread (NIP-10 reply reference).",
+        annotations(title = "Reply message", destructive_hint = true)
     )]
     async fn reply_message(&self, Parameters(args): Parameters<ReplyMessageArgs>) -> ToolOutput {
         let msg = SendMessage {
@@ -718,7 +726,8 @@ impl ToolServer {
     /// `acknowledge_message`: private idempotent ack to the original sender.
     #[tool(
         name = "acknowledge_message",
-        description = "Acknowledge a message (private NIP-17 ack, idempotent)."
+        description = "Acknowledge a message (private NIP-17 ack, idempotent).",
+        annotations(title = "Acknowledge message", read_only_hint = true)
     )]
     async fn acknowledge_message(
         &self,
@@ -738,7 +747,8 @@ impl ToolServer {
     /// `mark_message_read`: private idempotent read receipt.
     #[tool(
         name = "mark_message_read",
-        description = "Mark a message read (private NIP-17 read receipt, idempotent)."
+        description = "Mark a message read (private NIP-17 read receipt, idempotent).",
+        annotations(title = "Mark message read", read_only_hint = true)
     )]
     async fn mark_message_read(
         &self,
@@ -762,7 +772,8 @@ impl ToolServer {
     /// `request_contact`: request a contact link (AgentLink, G14).
     #[tool(
         name = "request_contact",
-        description = "Request contact with another agent (AgentLink + NIP-17 control message)."
+        description = "Request contact with another agent (AgentLink + NIP-17 control message).",
+        annotations(title = "Request contact", destructive_hint = true)
     )]
     async fn request_contact(
         &self,
@@ -781,7 +792,8 @@ impl ToolServer {
     /// `respond_contact`: approve or deny a contact request.
     #[tool(
         name = "respond_contact",
-        description = "Approve or deny a pending contact request."
+        description = "Approve or deny a pending contact request.",
+        annotations(title = "Respond contact", destructive_hint = true)
     )]
     async fn respond_contact(
         &self,
@@ -800,7 +812,8 @@ impl ToolServer {
     /// `list_contacts`: an agent's contact links.
     #[tool(
         name = "list_contacts",
-        description = "List an agent's contact links (AgentLink rows)."
+        description = "List an agent's contact links (AgentLink rows).",
+        annotations(title = "List contacts", read_only_hint = true)
     )]
     async fn list_contacts(&self, Parameters(args): Parameters<ListContactsArgs>) -> ToolOutput {
         ToolOutput::result(
@@ -813,7 +826,8 @@ impl ToolServer {
     /// `set_contact_policy`: the agent's inbound contact policy (kind-30014).
     #[tool(
         name = "set_contact_policy",
-        description = "Set the agent's inbound contact policy (open|auto|contacts_only|block_all)."
+        description = "Set the agent's inbound contact policy (open|auto|contacts_only|block_all).",
+        annotations(title = "Set contact policy", destructive_hint = true)
     )]
     async fn set_contact_policy(
         &self,
@@ -875,7 +889,8 @@ impl ToolServer {
     /// `renew_file_reservations`: extend the holder's active lease TTLs.
     #[tool(
         name = "renew_file_reservations",
-        description = "Extend the TTLs of the holder's active file reservations."
+        description = "Extend the TTLs of the holder's active file reservations.",
+        annotations(title = "Renew file reservations", destructive_hint = true)
     )]
     async fn renew_file_reservations(
         &self,
@@ -896,7 +911,8 @@ impl ToolServer {
     /// `release_file_reservations`: release the holder's leases.
     #[tool(
         name = "release_file_reservations",
-        description = "Release the holder's active file reservations (idempotent)."
+        description = "Release the holder's active file reservations (idempotent).",
+        annotations(title = "Release file reservations", destructive_hint = true)
     )]
     async fn release_file_reservations(
         &self,
@@ -998,7 +1014,8 @@ impl ToolServer {
     /// `macro_start_session`: ensure_project + register + reserve + inbox.
     #[tool(
         name = "macro_start_session",
-        description = "Batch: ensure_project + register agent + optional file reservation + inbox snapshot."
+        description = "Batch: ensure_project + register agent + optional file reservation + inbox snapshot.",
+        annotations(title = "Macro start session", destructive_hint = true)
     )]
     async fn macro_start_session(
         &self,
@@ -1025,7 +1042,8 @@ impl ToolServer {
     /// `macro_prepare_thread`: registration + thread summary + inbox context.
     #[tool(
         name = "macro_prepare_thread",
-        description = "Batch: ensure registration + thread summary + recent inbox context."
+        description = "Batch: ensure registration + thread summary + recent inbox context.",
+        annotations(title = "Macro prepare thread", read_only_hint = true)
     )]
     async fn macro_prepare_thread(
         &self,
@@ -1052,7 +1070,8 @@ impl ToolServer {
     /// `macro_contact_handshake`: request + auto-accept + welcome.
     #[tool(
         name = "macro_contact_handshake",
-        description = "Batch: request contact + optional auto-accept + welcome message."
+        description = "Batch: request contact + optional auto-accept + welcome message.",
+        annotations(title = "Macro contact handshake", destructive_hint = true)
     )]
     async fn macro_contact_handshake(
         &self,
@@ -1086,7 +1105,8 @@ impl ToolServer {
     /// `macro_file_reservation_cycle`: reserve paths, optionally release.
     #[tool(
         name = "macro_file_reservation_cycle",
-        description = "Batch: reserve a set of path globs, optionally release them at the end."
+        description = "Batch: reserve a set of path globs, optionally release them at the end.",
+        annotations(title = "Macro file reservation cycle", destructive_hint = true)
     )]
     async fn macro_file_reservation_cycle(
         &self,
@@ -1114,7 +1134,8 @@ impl ToolServer {
     /// `ensure_product`: idempotent product manifest (kind-30011).
     #[tool(
         name = "ensure_product",
-        description = "Idempotent product manifest (kind-30011) for a product key."
+        description = "Idempotent product manifest (kind-30011) for a product key.",
+        annotations(title = "Ensure product", destructive_hint = true)
     )]
     async fn ensure_product(&self, Parameters(args): Parameters<EnsureProductArgs>) -> ToolOutput {
         let key = args
@@ -1129,7 +1150,8 @@ impl ToolServer {
     /// `products_link`: link a project into a product (idempotent).
     #[tool(
         name = "products_link",
-        description = "Link a project into a product (idempotent; kind-30011 a-tag)."
+        description = "Link a project into a product (idempotent; kind-30011 a-tag).",
+        annotations(title = "Products link", destructive_hint = true)
     )]
     async fn products_link(&self, Parameters(args): Parameters<ProductsLinkArgs>) -> ToolOutput {
         ToolOutput::result(
@@ -1142,7 +1164,8 @@ impl ToolServer {
     /// `search_messages_product`: fan search across member projects.
     #[tool(
         name = "search_messages_product",
-        description = "Fan an FTS5 search across a product's member projects."
+        description = "Fan an FTS5 search across a product's member projects.",
+        annotations(title = "Search messages (product)", read_only_hint = true)
     )]
     async fn search_messages_product(
         &self,
@@ -1163,7 +1186,8 @@ impl ToolServer {
     /// `fetch_inbox_product`: fan inbox fetch across member projects.
     #[tool(
         name = "fetch_inbox_product",
-        description = "Fan an inbox fetch across a product's member projects."
+        description = "Fan an inbox fetch across a product's member projects.",
+        annotations(title = "Fetch inbox (product)", read_only_hint = true)
     )]
     async fn fetch_inbox_product(
         &self,
@@ -1179,7 +1203,8 @@ impl ToolServer {
     /// `summarize_thread_product`: summarize across member projects.
     #[tool(
         name = "summarize_thread_product",
-        description = "Summarize a thread across a product's member projects."
+        description = "Summarize a thread across a product's member projects.",
+        annotations(title = "Summarize thread (product)", read_only_hint = true)
     )]
     async fn summarize_thread_product(
         &self,
@@ -1226,7 +1251,8 @@ impl ToolServer {
     /// `renew_build_slot`: extend an active slot lease's TTL.
     #[tool(
         name = "renew_build_slot",
-        description = "Extend an active build-slot lease's TTL (no-op when missing)."
+        description = "Extend an active build-slot lease's TTL (no-op when missing).",
+        annotations(title = "Renew build slot", destructive_hint = true)
     )]
     async fn renew_build_slot(
         &self,
@@ -1247,7 +1273,8 @@ impl ToolServer {
     /// `release_build_slot`: release an active slot lease.
     #[tool(
         name = "release_build_slot",
-        description = "Release an active build-slot lease (non-destructive)."
+        description = "Release an active build-slot lease (non-destructive).",
+        annotations(title = "Release build slot", destructive_hint = true)
     )]
     async fn release_build_slot(
         &self,
