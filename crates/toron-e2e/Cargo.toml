@@ -4,6 +4,18 @@ name = "toron-e2e"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+# v1 gate: SC-1..SC-8 + SC-14a
+p1 = []
+# Phase-2 gate: SC-9..SC-13
+p2 = []
+
 [dependencies]
 toron-core = { path = "../toron-core" }
 tokio = { version = "1", features = ["full"] }
+nostr-sdk = { version = "0.44", features = ["nip44", "nip59"] }
+uuid = { version = "1", features = ["v4"] }
+anyhow = "1"
+
+[dev-dependencies]
+nostr-sdk = { version = "0.44", features = ["nip44", "nip59"] }
