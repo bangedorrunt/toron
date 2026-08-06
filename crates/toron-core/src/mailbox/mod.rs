@@ -21,11 +21,16 @@ use crate::bus::{Bus, BusError, Filter, SubscriptionEvent};
 
 pub mod guard;
 pub mod infra;
+pub mod unwrap;
 
 pub use guard::{
     guard_blocked_paths, install_precommit_guard, uninstall_precommit_guard, Reservation,
 };
 pub use infra::{HealthComponent, HealthReport, ProjectState};
+pub use unwrap::{
+    order_by_rumor_time, AckCache, AutoPolicy, ContactPolicy, DedupKey, FixedPolicy,
+    GitProjectionSink, PolicySource, ProjectOutcome, ProjectionSink, UnwrapPipeline, UnwrappedMail,
+};
 
 /// Mailbox context: the bus every tool publishes to + the on-disk project
 /// root layout. The operator key signs privileged events (kind-30010 project
