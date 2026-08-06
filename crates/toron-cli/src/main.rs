@@ -3,6 +3,7 @@
 
 mod cli;
 mod config;
+mod operator;
 mod output;
 mod robot;
 
@@ -15,10 +16,11 @@ use crate::config::Config;
 use crate::output::{render_json, stdout_is_tty, ColorChoice, OutputFormat};
 
 fn main() -> ExitCode {
-    // Exit codes (clig.dev, ADR-0003): 0 ok · 1 runtime · 2 usage (clap handles 2).
+    // Exit codes (clig.dev, ADR-0003): 0 ok · 1 runtime · 2 usage (clap
+    // handles 2) · 3 doctor --check fails-closed.
     let cli = Cli::parse();
     match run(&cli) {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(code) => code,
         Err(e) => {
             eprintln!("toron: error: {e:#}");
             ExitCode::FAILURE
@@ -26,23 +28,57 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(cli: &Cli) -> anyhow::Result<()> {
+fn run(cli: &Cli) -> anyhow::Result<ExitCode> {
     // Config precedence: --config flag > project ./.toron.toml > user config > system.
     // Env vars layer above files (see Config::load).
     let cfg = Config::load(cli.globals.config.as_deref());
     let format = OutputFormat::from_globals(&cli.globals);
     let color = ColorChoice::from_globals(&cli.globals, stdout_is_tty());
 
-    match &cli.command {
-        Command::Serve(args) => run_serve(args, format, color),
-        Command::Status => run_status(&cfg, format),
-        Command::Config(args) => run_config(&cfg, args, format),
+    let code = match &cli.command {
+        Command::Serve(args) => {
+            run_serve(args, format, color)?;
+            ExitCode::SUCCESS
+        }
+        Command::Status => {
+            run_status(&cfg, format)?;
+            ExitCode::SUCCESS
+        }
+        Command::Config(args) => {
+            run_config(&cfg, args, format)?;
+            ExitCode::SUCCESS
+        }
+        Command::Doctor(args) => operator::run_doctor(&cfg, args, format)?,
+        Command::Metrics => {
+            operator::run_metrics()?;
+            ExitCode::SUCCESS
+        }
+        Command::Key(cmd) => {
+            operator::run_key(&cfg, cmd)?;
+            ExitCode::SUCCESS
+        }
+        Command::Project(cmd) => {
+            operator::run_project(cmd)?;
+            ExitCode::SUCCESS
+        }
+        Command::Relay(cmd) => {
+            operator::run_relay(&cfg, cmd)?;
+            ExitCode::SUCCESS
+        }
+        Command::Backend(cmd) => {
+            operator::run_backend(&cfg, cmd)?;
+            ExitCode::SUCCESS
+        }
         Command::Mail(_)
         | Command::Reserve(_)
         | Command::Slot(_)
         | Command::Contact(_)
-        | Command::Guard(_) => run_robot(&cli.command),
-    }
+        | Command::Guard(_) => {
+            run_robot(&cli.command)?;
+            ExitCode::SUCCESS
+        }
+    };
+    Ok(code)
 }
 
 #[tokio::main]
@@ -70,17 +106,31 @@ async fn run_serve(
 
 /// Robot parity surface (bd-led.8.3): build the demo mailbox ONCE (the same
 /// one the MCP server uses), call the matching mailbox method, and print its
-/// `ToJson` shape. Robot commands always emit JSON on stdout.
+/// `ToJson` shape. Robot commands always emit JSON on stdout. Each dispatch is
+/// instrumented into the operator metrics (bd-led.8.2): tool name + duration on
+/// success, an error counter on failure.
 #[tokio::main]
 async fn run_robot(command: &Command) -> anyhow::Result<()> {
     let mailbox = toron_mcp::demo_mailbox().await?;
-    match command {
+    let tool_name = operator::robot_tool_name(command);
+    let start = std::time::Instant::now();
+    let result = match command {
         Command::Mail(cmd) => robot::run_mail(&mailbox, cmd).await,
         Command::Reserve(cmd) => robot::run_reserve(&mailbox, cmd).await,
         Command::Slot(cmd) => robot::run_slot(&mailbox, cmd).await,
         Command::Contact(cmd) => robot::run_contact(&mailbox, cmd).await,
         Command::Guard(cmd) => robot::run_guard(&mailbox, cmd).await,
         _ => anyhow::bail!("not a robot command"),
+    };
+    match result {
+        Ok(()) => {
+            operator::record_tool_call(tool_name, start.elapsed());
+            Ok(())
+        }
+        Err(e) => {
+            operator::record_tool_error(tool_name, start.elapsed());
+            Err(e)
+        }
     }
 }
 
