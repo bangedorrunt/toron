@@ -232,14 +232,18 @@ impl Mailbox {
             let mut tags =
                 with_project_scoping(toron_kind(FILE_RESERVATION), base, Some(project_slug));
             let created = Timestamp::now();
+            // Renewal: the new lease must expire at the OLD absolute expiry PLUS
+            // the extension, in absolute epoch seconds — not re-derived from
+            // `now`. Treating `expires_ts_us` (absolute epoch µs) as a relative
+            // duration and re-adding to `now` double-counts the elapsed time
+            // and produced a 2x expiry (parity bug bd-XXX).
+            let old_expiry_secs = res.expires_ts_us.map(|t| (t / 1_000_000) as u64);
+            let new_expiry_secs = old_expiry_secs
+                .map(|abs| abs.saturating_add(extend_secs))
+                // no old expiry (permanent lease): default to now+extend.
+                .unwrap_or_else(|| created.as_secs().saturating_add(extend_secs));
             let ttl = EnvelopeTtl {
-                secs: Some(
-                    res.expires_ts_us
-                        .map(|t| (t / 1_000_000) as u64)
-                        .unwrap_or_default()
-                        .saturating_add(extend_secs)
-                        .max(extend_secs),
-                ),
+                secs: Some(new_expiry_secs.saturating_sub(created.as_secs())),
             };
             if let Some(exp) = ttl.expiration_tag(created) {
                 tags.push(exp);

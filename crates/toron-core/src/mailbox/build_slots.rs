@@ -112,8 +112,13 @@ impl Mailbox {
         let npub = agent_keys.public_key().to_hex();
         let pool = self.index_pool_required()?;
 
+        // Extension must be relative to the EXISTING lease expiry, not `now`.
+        // Recomputing from `now` collapses a long-lived lease to now+extend
+        // (parity bug bd-XXX: reported under-extension to ~10s).
         let now_us = crate::index::writer::Clock::now_us(&crate::index::writer::SystemClock);
-        let new_expiry = now_us + extend_secs as i64 * 1_000_000;
+        let existing = active_slot(pool, project_slug, slot).await;
+        let base_abs_us = existing.and_then(|s| s.expires_ts_us).unwrap_or(now_us);
+        let new_expiry = base_abs_us.saturating_add(extend_secs as i64 * 1_000_000);
         let renewed = slots::renew_slot(pool, project_slug, slot, &npub, new_expiry).await?;
         if !renewed {
             return Ok(None);

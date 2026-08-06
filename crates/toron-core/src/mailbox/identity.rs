@@ -65,13 +65,24 @@ pub struct ListAgentsOptions {
 }
 
 impl Mailbox {
-    /// `create_agent_identity`: ALWAYS mint a fresh keypair, persist it
-    /// ncryptsec-encrypted (0600), and publish the kind-30013 profile (G1).
+    /// `create_agent_identity`: ALWAYS mint a fresh keypair (AM-Rust parity:
+    /// a NEW identity, never a collision). Fails closed if a key for this
+    /// name already exists — otherwise we'd publish a profile signed by the
+    /// fresh key while the on-disk ncryptsec (used by whois/read paths) still
+    /// holds the OLD key, and whois npub would disagree with list_agents npub
+    /// (real-e2e parity bug bd-XXX). Use `register_agent` to upsert.
     pub async fn create_agent_identity(
         &self,
         project_slug: &str,
         profile: &AgentProfile,
     ) -> anyhow::Result<RegisteredAgent> {
+        let key_path = self.agent_key_path(project_slug, &profile.name);
+        if key_path.exists() {
+            anyhow::bail!(
+                "create_agent_identity refused: an identity for '{name}' already exists in project '{project_slug}' (use register_agent to upsert)",
+                name = profile.name,
+            );
+        }
         let result = ident::create_agent_identity(project_slug, profile, Timestamp::now())?;
         let created = self
             .persist_and_publish(project_slug, profile, result)
@@ -357,17 +368,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_create_always_different_npub() {
+    async fn test_create_always_different_npub_or_refuses_collision() {
         let (mailbox, db_path, data_dir) = test_mailbox("fresh").await;
+        // AM-Rust parity: create_agent_identity with an unavailable name must
+        // FAIL (a name_hint collision is refused), not mint a colliding key.
         let a = mailbox
             .create_agent_identity("demo", &profile("A"))
             .await
             .expect("create a");
-        let b = mailbox
+        let err = mailbox
             .create_agent_identity("demo", &profile("A"))
             .await
-            .expect("create b");
-        assert_ne!(a.npub, b.npub, "create_agent_identity always fresh key");
+            .expect_err("second create for same name must be refused");
+        assert!(
+            err.to_string().contains("already exists"),
+            "collision refused: {err}"
+        );
+        // The original identity is untouched (whois still resolves to `a.npub`).
+        let w = mailbox.whois("demo", "A").await.expect("whois after");
+        assert_eq!(w.npub, a.npub, "collision must not rotate the npub");
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_dir_all(&data_dir);
     }

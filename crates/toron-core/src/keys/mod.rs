@@ -14,7 +14,7 @@ use std::path::Path;
 use nostr_sdk::nips::nip19::{FromBech32, ToBech32};
 use nostr_sdk::nips::nip49::{EncryptedSecretKey, KeySecurity};
 use nostr_sdk::nostr::nips::nip49::Error as Nip49Error;
-use nostr_sdk::nostr::{Keys, SecretKey};
+use nostr_sdk::nostr::SecretKey;
 
 /// Default argon2 log-n rounds for production (slow, ~1s).
 pub const DEFAULT_LOG_N: u8 = 16;
@@ -91,6 +91,11 @@ fn set_0600(_path: &Path) -> Result<(), std::io::Error> {
 
 // Convenience re-export for callers that only need key generation + storage.
 pub use nostr_sdk::nostr::NostrSigner;
+
+/// The signing keypair type used by the mailbox operator + agents.
+/// Re-exported so downstream crates (toron-mcp) can name it without a direct
+/// nostr-sdk dependency.
+pub use nostr_sdk::nostr::Keys;
 
 #[cfg(test)]
 mod tests {

@@ -248,7 +248,33 @@ pub async fn demo_mailbox() -> anyhow::Result<Mailbox> {
     toron_core::index::schema::migrate(&pool).await?;
     let bus = toron_core::bus::InProcessBus::open(pool.clone(), Default::default()).await?;
     let data_dir = std::env::temp_dir().join("toron-mcp-demo");
-    Ok(Mailbox::new(Arc::new(bus), data_dir, None).with_index_pool(pool))
+    Ok(Mailbox::new(Arc::new(bus), data_dir, operator_keys()?).with_index_pool(pool))
+}
+
+/// Load the operator key for the MCP server from env, if configured.
+///
+/// Honors `TORON_OPERATOR_KEY` (a **path**, never a secret on the
+/// command line — CLI design) + `TORON_OPERATOR_PASSPHRASE`. Without an
+/// operator the parity-privileged ops (`ensure_project`, `macro_start_session`,
+/// product ops, force-release) fail with "no operator key configured", which
+/// the real-e2e parity test (bd-e2e / opencode agent probe) surfaced as a
+/// blocking defect. daemon hosts MUST set these so the full 38-tool surface
+/// is exercisable.*/
+pub(crate) fn operator_keys() -> anyhow::Result<Option<toron_core::keys::Keys>> {
+    let Some(key_os) = std::env::var_os("TORON_OPERATOR_KEY") else {
+        return Ok(None);
+    };
+    let path = std::path::PathBuf::from(key_os);
+    if !path.is_file() {
+        anyhow::bail!(
+            "TORON_OPERATOR_KEY={} is not a file (operator ncryptsec)",
+            path.display()
+        );
+    }
+    let pass = std::env::var("TORON_OPERATOR_PASSPHRASE").unwrap_or_else(|_| "toron".to_string());
+    toron_core::keys::load_encrypted_key(&path, &pass)
+        .map(Some)
+        .map_err(|e| anyhow::anyhow!("failed to load operator key from {}: {e}", path.display()))
 }
 
 /// Serve the toron MCP server over stdio (transport `transport-io`).
