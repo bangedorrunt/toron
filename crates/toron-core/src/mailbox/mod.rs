@@ -25,17 +25,23 @@ pub mod guard;
 pub mod identity;
 pub mod infra;
 pub mod messaging;
+pub mod reservations;
 pub mod unwrap;
 
 pub use contacts::{BusPolicySource, ContactLink, LinkStatus, RequestContact, RespondContact};
 pub use guard::{
-    guard_blocked_paths, install_precommit_guard, uninstall_precommit_guard, Reservation,
+    guard_blocked_paths, install_precommit_guard, uninstall_precommit_guard,
+    Reservation as GuardReservation,
 };
 pub use identity::{ListAgentsOptions, RegisteredAgent, WhoIs};
 pub use infra::{HealthComponent, HealthReport, ProjectState};
 pub use messaging::{
     Delivery, DeliveryPayload, FetchInbox, InboxMessage, ReceiptResult, RecipientRole, SendMessage,
     SendResult,
+};
+pub use reservations::{
+    overlaps, AcquireResult, ConflictReport, GrantedReservation, PathConflict, ReleaseResult,
+    RenewResult, Reservation,
 };
 pub use unwrap::{
     order_by_rumor_time, AckCache, AutoPolicy, ContactPolicy, DedupKey, FixedPolicy,
