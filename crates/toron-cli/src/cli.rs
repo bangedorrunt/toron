@@ -76,6 +76,27 @@ pub enum Command {
 
     /// Show the effective configuration (flags > env > project > user > system).
     Config(ConfigArgs),
+
+    // --- robot parity surface (bd-led.8.3): the MCP tools as shell-out commands.
+    /// Mail: send/reply/inbox/ack/read/search/thread-summarize (MCP parity JSON).
+    #[command(subcommand)]
+    Mail(MailCommand),
+
+    /// File reservations: acquire/conflicts/renew/release/force-release.
+    #[command(subcommand)]
+    Reserve(ReserveCommand),
+
+    /// Build slots: acquire/renew/release.
+    #[command(subcommand)]
+    Slot(SlotCommand),
+
+    /// Contacts: request/respond/list/policy.
+    #[command(subcommand)]
+    Contact(ContactCommand),
+
+    /// Pre-commit guard: install/uninstall.
+    #[command(subcommand)]
+    Guard(GuardCommand),
 }
 
 #[derive(Debug, Args)]
@@ -94,4 +115,444 @@ pub struct ServeArgs {
     /// Serve the MCP endpoint over Streamable HTTP at this address (e.g. 127.0.0.1:8000).
     #[arg(long)]
     pub mcp_http: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Robot parity surface (bd-led.8.3): the MCP tools as shell-out commands.
+// Noun-verb per ADR. Every command prints the exact `ToJson` shape the
+// matching MCP tool returns (see `robot.rs`).
+// ---------------------------------------------------------------------------
+
+/// Default project for robot commands whose `--project` is optional (the
+/// demo mailbox's canonical project).
+pub const DEFAULT_PROJECT: &str = "demo";
+
+/// Contact policy selector (parity: open|auto|contacts_only|block_all).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum PolicyArg {
+    Open,
+    Auto,
+    #[value(name = "contacts_only")]
+    ContactsOnly,
+    BlockAll,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum MailCommand {
+    /// Send a NIP-17 gift-wrapped message to one or more recipients.
+    Send(MailSendArgs),
+    /// Reply within a thread (requires --thread).
+    Reply(MailReplyArgs),
+    /// Project the agent's inbox (rumor-time order).
+    Inbox(MailInboxArgs),
+    /// Acknowledge a message (private, idempotent).
+    Ack(MailReceiptArgs),
+    /// Mark a message read (private, idempotent).
+    Read(MailReceiptArgs),
+    /// FTS5 search over a project's indexed messages.
+    Search(MailSearchArgs),
+    /// Deterministic digest of a thread.
+    ThreadSummarize(MailThreadSummarizeArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct MailSendArgs {
+    /// Sender agent name (must have a local key in the project).
+    #[arg(long, default_value = "agent")]
+    pub from: String,
+    /// Recipients (comma-separated).
+    #[arg(long, value_delimiter = ',', required = true)]
+    pub to: Vec<String>,
+    /// Message subject (NIP-14).
+    #[arg(long, required = true)]
+    pub subject: String,
+    /// Message body (markdown).
+    #[arg(long, required = true)]
+    pub body: String,
+    /// Copy recipients (comma-separated).
+    #[arg(long, value_delimiter = ',')]
+    pub cc: Vec<String>,
+    /// Blind-copy recipients (comma-separated).
+    #[arg(long, value_delimiter = ',')]
+    pub bcc: Vec<String>,
+    /// Project slug.
+    #[arg(long, default_value = DEFAULT_PROJECT)]
+    pub project: String,
+    /// Importance tag (e.g. normal|high|urgent).
+    #[arg(long)]
+    pub importance: Option<String>,
+    /// Request an acknowledgement from recipients.
+    #[arg(long)]
+    pub ack: bool,
+    /// Reply within this thread (original message id).
+    #[arg(long)]
+    pub thread: Option<String>,
+    /// Sender token (verification).
+    #[arg(long)]
+    pub sender_token: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct MailReplyArgs {
+    /// Sender agent name (must have a local key in the project).
+    #[arg(long, default_value = "agent")]
+    pub from: String,
+    /// Recipients (comma-separated).
+    #[arg(long, value_delimiter = ',', required = true)]
+    pub to: Vec<String>,
+    /// Message subject (NIP-14).
+    #[arg(long, required = true)]
+    pub subject: String,
+    /// Message body (markdown).
+    #[arg(long, required = true)]
+    pub body: String,
+    /// Copy recipients (comma-separated).
+    #[arg(long, value_delimiter = ',')]
+    pub cc: Vec<String>,
+    /// Blind-copy recipients (comma-separated).
+    #[arg(long, value_delimiter = ',')]
+    pub bcc: Vec<String>,
+    /// Project slug.
+    #[arg(long, default_value = DEFAULT_PROJECT)]
+    pub project: String,
+    /// Importance tag (e.g. normal|high|urgent).
+    #[arg(long)]
+    pub importance: Option<String>,
+    /// Request an acknowledgement from recipients.
+    #[arg(long)]
+    pub ack: bool,
+    /// Thread to reply within (original message id; required).
+    #[arg(long, required = true)]
+    pub thread: String,
+    /// Sender token (verification).
+    #[arg(long)]
+    pub sender_token: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct MailInboxArgs {
+    /// Agent whose inbox to project.
+    #[arg(long, required = true)]
+    pub agent: String,
+    /// Project slug.
+    #[arg(long, default_value = DEFAULT_PROJECT)]
+    pub project: String,
+    /// Unread messages only.
+    #[arg(long)]
+    pub unread: bool,
+    /// Maximum messages to return.
+    #[arg(long)]
+    pub limit: Option<usize>,
+    /// Include message bodies.
+    #[arg(long)]
+    pub bodies: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct MailReceiptArgs {
+    /// Project slug.
+    #[arg(long, required = true)]
+    pub project: String,
+    /// Agent sending the receipt.
+    #[arg(long, required = true)]
+    pub agent: String,
+    /// Message id.
+    #[arg(long, required = true)]
+    pub id: String,
+}
+
+#[derive(Debug, Args)]
+pub struct MailSearchArgs {
+    /// FTS5 MATCH query (porter/unicode61/prefix).
+    #[arg(long, required = true)]
+    pub query: String,
+    /// Project slug.
+    #[arg(long, default_value = DEFAULT_PROJECT)]
+    pub project: String,
+    /// Maximum results (default 100, capped 1000).
+    #[arg(long)]
+    pub limit: Option<usize>,
+    /// Ranking: relevance (bm25) or recency.
+    #[arg(long)]
+    pub ranking: Option<String>,
+    /// Filter by sender name.
+    #[arg(long)]
+    pub sender: Option<String>,
+    /// Filter by importance.
+    #[arg(long)]
+    pub importance: Option<String>,
+    /// Filter by thread id.
+    #[arg(long)]
+    pub thread: Option<String>,
+    /// Include messages created at/after this µs timestamp.
+    #[arg(long)]
+    pub since: Option<i64>,
+    /// Include messages created at/before this µs timestamp.
+    #[arg(long)]
+    pub until: Option<i64>,
+    /// Include message bodies.
+    #[arg(long)]
+    pub bodies: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct MailThreadSummarizeArgs {
+    /// Project slug.
+    #[arg(long, required = true)]
+    pub project: String,
+    /// Thread id.
+    #[arg(long, required = true)]
+    pub thread: String,
+    /// Include example messages (LLM summary).
+    #[arg(long)]
+    pub examples: bool,
+    /// Use the LLM digest mode.
+    #[arg(long)]
+    pub llm_mode: bool,
+    /// LLM model id (llm_mode only).
+    #[arg(long)]
+    pub llm_model: Option<String>,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ReserveCommand {
+    /// Acquire exclusive/shared leases on path globs.
+    Acquire(ReserveAcquireArgs),
+    /// Symmetric-glob conflict report for paths vs other agents' reservations.
+    Conflicts(ReserveConflictsArgs),
+    /// Extend the TTLs of the holder's active file reservations.
+    Renew(ReserveRenewArgs),
+    /// Release the holder's active file reservations (idempotent).
+    Release(ReserveReleaseArgs),
+    /// Operator force-release of a stale reservation.
+    ForceRelease(ReserveForceReleaseArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct ReserveAcquireArgs {
+    /// Path globs to reserve (comma-separated; e.g. 'src/**').
+    #[arg(long, value_delimiter = ',', required = true)]
+    pub paths: Vec<String>,
+    /// Project slug.
+    #[arg(long, default_value = DEFAULT_PROJECT)]
+    pub project: String,
+    /// Agent acquiring the leases.
+    #[arg(long, required = true)]
+    pub agent: String,
+    /// Lease TTL in seconds (default envelope TTL).
+    #[arg(long)]
+    pub ttl_secs: Option<u64>,
+    /// Exclusive leases block other agents.
+    #[arg(long)]
+    pub exclusive: bool,
+    /// Lease reason.
+    #[arg(long)]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct ReserveConflictsArgs {
+    /// Path globs to check (comma-separated).
+    #[arg(long, value_delimiter = ',', required = true)]
+    pub paths: Vec<String>,
+    /// Project slug.
+    #[arg(long, default_value = DEFAULT_PROJECT)]
+    pub project: String,
+    /// Agent performing the check.
+    #[arg(long, required = true)]
+    pub agent: String,
+}
+
+#[derive(Debug, Args)]
+pub struct ReserveRenewArgs {
+    /// Path globs to renew (comma-separated; empty = renew all of the agent's).
+    #[arg(long, value_delimiter = ',')]
+    pub paths: Vec<String>,
+    /// Project slug.
+    #[arg(long, default_value = DEFAULT_PROJECT)]
+    pub project: String,
+    /// Agent holding the leases.
+    #[arg(long, required = true)]
+    pub agent: String,
+    /// Seconds to extend each lease's TTL.
+    #[arg(long, required = true)]
+    pub extend_secs: u64,
+}
+
+#[derive(Debug, Args)]
+pub struct ReserveReleaseArgs {
+    /// Path globs to release (comma-separated; empty = release all of the agent's).
+    #[arg(long, value_delimiter = ',')]
+    pub paths: Vec<String>,
+    /// Project slug.
+    #[arg(long, default_value = DEFAULT_PROJECT)]
+    pub project: String,
+    /// Agent holding the leases.
+    #[arg(long, required = true)]
+    pub agent: String,
+}
+
+#[derive(Debug, Args)]
+pub struct ReserveForceReleaseArgs {
+    /// Reservation id (the lease event id).
+    #[arg(long, required = true)]
+    pub id: String,
+    /// Project slug.
+    #[arg(long, default_value = DEFAULT_PROJECT)]
+    pub project: String,
+    /// Requestor agent (the operator's tool user).
+    #[arg(long, required = true)]
+    pub agent: String,
+    /// Note attached to the revocation.
+    #[arg(long)]
+    pub note: Option<String>,
+    /// Notify the previous holder via NIP-17.
+    #[arg(long)]
+    pub notify_previous: bool,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SlotCommand {
+    /// Acquire an advisory build-slot lease, optionally exclusive.
+    Acquire(SlotAcquireArgs),
+    /// Extend an active build-slot lease's TTL.
+    Renew(SlotRenewArgs),
+    /// Release an active build-slot lease.
+    Release(SlotReleaseArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct SlotAcquireArgs {
+    /// Slot name (e.g. ci).
+    #[arg(long, required = true)]
+    pub slot: String,
+    /// Project slug.
+    #[arg(long, default_value = DEFAULT_PROJECT)]
+    pub project: String,
+    /// Agent acquiring the slot.
+    #[arg(long, required = true)]
+    pub agent: String,
+    /// Lease TTL in seconds (default envelope TTL).
+    #[arg(long)]
+    pub ttl_secs: Option<u64>,
+    /// Exclusive lease (serializes against any holder).
+    #[arg(long)]
+    pub exclusive: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct SlotRenewArgs {
+    /// Slot name (e.g. ci).
+    #[arg(long, required = true)]
+    pub slot: String,
+    /// Seconds to extend the lease's TTL.
+    #[arg(long, required = true)]
+    pub extend_secs: u64,
+    /// Project slug.
+    #[arg(long, default_value = DEFAULT_PROJECT)]
+    pub project: String,
+    /// Agent holding the slot.
+    #[arg(long, required = true)]
+    pub agent: String,
+}
+
+#[derive(Debug, Args)]
+pub struct SlotReleaseArgs {
+    /// Slot name (e.g. ci).
+    #[arg(long, required = true)]
+    pub slot: String,
+    /// Project slug.
+    #[arg(long, default_value = DEFAULT_PROJECT)]
+    pub project: String,
+    /// Agent holding the slot.
+    #[arg(long, required = true)]
+    pub agent: String,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ContactCommand {
+    /// Request a contact link with another agent.
+    Request(ContactRequestArgs),
+    /// Approve or deny a pending contact request.
+    Respond(ContactRespondArgs),
+    /// List an agent's contact links.
+    List(ContactListArgs),
+    /// Set the agent's inbound contact policy.
+    Policy(ContactPolicyArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct ContactRequestArgs {
+    /// Peer agent name.
+    #[arg(long, required = true)]
+    pub to: String,
+    /// Requesting agent name.
+    #[arg(long, default_value = "agent")]
+    pub from: String,
+    /// Project slug.
+    #[arg(long, default_value = DEFAULT_PROJECT)]
+    pub project: String,
+    /// Request reason.
+    #[arg(long)]
+    pub reason: Option<String>,
+    /// Peer's project (defaults to --project).
+    #[arg(long)]
+    pub to_project: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct ContactRespondArgs {
+    /// Requesting agent name.
+    #[arg(long, required = true)]
+    pub from: String,
+    /// Responding agent name.
+    #[arg(long, required = true)]
+    pub to: String,
+    /// Approve (true) or deny (false) the request.
+    #[arg(long, required = true)]
+    pub accept: bool,
+    /// Project slug.
+    #[arg(long, default_value = DEFAULT_PROJECT)]
+    pub project: String,
+    /// Requester's project (defaults to --project).
+    #[arg(long)]
+    pub from_project: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct ContactListArgs {
+    /// Agent whose contact links to list.
+    #[arg(long, required = true)]
+    pub agent: String,
+    /// Project slug.
+    #[arg(long, default_value = DEFAULT_PROJECT)]
+    pub project: String,
+}
+
+#[derive(Debug, Args)]
+pub struct ContactPolicyArgs {
+    /// Agent whose inbound policy to set.
+    #[arg(long, required = true)]
+    pub agent: String,
+    /// open|auto|contacts_only|block_all.
+    #[arg(long, value_enum, required = true)]
+    pub policy: PolicyArg,
+    /// Project slug.
+    #[arg(long, default_value = DEFAULT_PROJECT)]
+    pub project: String,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum GuardCommand {
+    /// Install the toron pre-commit hook in a git repository.
+    Install(GuardRepoArgs),
+    /// Remove the toron-installed pre-commit hook (never clobbers a user hook).
+    Uninstall(GuardRepoArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct GuardRepoArgs {
+    /// Git repository path.
+    #[arg(long, required = true)]
+    pub repo: PathBuf,
 }

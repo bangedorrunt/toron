@@ -4,6 +4,7 @@
 mod cli;
 mod config;
 mod output;
+mod robot;
 
 use std::process::ExitCode;
 
@@ -36,6 +37,11 @@ fn run(cli: &Cli) -> anyhow::Result<()> {
         Command::Serve(args) => run_serve(args, format, color),
         Command::Status => run_status(&cfg, format),
         Command::Config(args) => run_config(&cfg, args, format),
+        Command::Mail(_)
+        | Command::Reserve(_)
+        | Command::Slot(_)
+        | Command::Contact(_)
+        | Command::Guard(_) => run_robot(&cli.command),
     }
 }
 
@@ -59,6 +65,22 @@ async fn run_serve(
         toron_mcp::serve_http(addr).await
     } else {
         anyhow::bail!("serve requires --mcp-stdio or --mcp-http <addr>")
+    }
+}
+
+/// Robot parity surface (bd-led.8.3): build the demo mailbox ONCE (the same
+/// one the MCP server uses), call the matching mailbox method, and print its
+/// `ToJson` shape. Robot commands always emit JSON on stdout.
+#[tokio::main]
+async fn run_robot(command: &Command) -> anyhow::Result<()> {
+    let mailbox = toron_mcp::demo_mailbox().await?;
+    match command {
+        Command::Mail(cmd) => robot::run_mail(&mailbox, cmd).await,
+        Command::Reserve(cmd) => robot::run_reserve(&mailbox, cmd).await,
+        Command::Slot(cmd) => robot::run_slot(&mailbox, cmd).await,
+        Command::Contact(cmd) => robot::run_contact(&mailbox, cmd).await,
+        Command::Guard(cmd) => robot::run_guard(&mailbox, cmd).await,
+        _ => anyhow::bail!("not a robot command"),
     }
 }
 

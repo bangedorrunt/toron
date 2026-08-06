@@ -236,9 +236,11 @@ impl ServerHandler for ToronServer {
     }
 }
 
-/// Build the demo mailbox backing the tool surface for `router`/`serve_stdio`:
-/// an in-process bus over a per-call SQLite index in the system temp dir.
-async fn demo_mailbox() -> anyhow::Result<Mailbox> {
+/// Build the demo mailbox backing the tool surface for `router`/`serve_stdio`
+/// and the robot CLI: an in-process bus over a per-call SQLite index in the
+/// system temp dir. Public so `toron-cli` robot commands construct the exact
+/// same mailbox + `ToJson` shapes the MCP tools use (JSON parity, bd-led.8.3).
+pub async fn demo_mailbox() -> anyhow::Result<Mailbox> {
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let db = std::env::temp_dir().join(format!("toron-mcp-{}-{}.sqlite", std::process::id(), seq));
