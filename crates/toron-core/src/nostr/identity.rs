@@ -1,0 +1,306 @@
+// governed-by: ADR-0003
+#![forbid(unsafe_code)]
+
+//! Identity ops — `create_agent_identity` vs `register_agent` (G1/G2).
+//!
+//! Pure (no I/O): constructs + signs the addressable kind-30013 agent profile
+//! event whose `d` tag is `project-slug:name`. The profile is the name→npub
+//! source of truth for project-scoped identity (G2). Key storage (ncryptsec)
+//! and bus publishing are the caller's concern (mailbox layer).
+
+use nostr_sdk::nostr::event::builder::Error as BuilderError;
+use nostr_sdk::nostr::{Event, JsonUtil, Keys, PublicKey, Tag, Timestamp};
+
+use crate::bus::scoping::with_project_scoping;
+use crate::nostr::event::build_event;
+use crate::nostr::kinds::{toron_kind, AGENT_PROFILE};
+
+/// Agent profile metadata carried in the kind-30013 `content` (JSON).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AgentProfile {
+    /// Display name (project-scoped).
+    pub name: String,
+    /// Agent program (pi / opencode / grok).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub program: Option<String>,
+    /// Model id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Short task description.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_description: Option<String>,
+}
+
+impl AgentProfile {
+    /// New profile with the required name.
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            program: None,
+            model: None,
+            task_description: None,
+        }
+    }
+}
+
+/// Identity op result: the fresh-or-existing keys + the signed profile event.
+#[derive(Debug)]
+pub struct IdentityResult {
+    /// The agent's keys (fresh for create, existing-or-fresh for register).
+    pub keys: Keys,
+    /// The signed kind-30013 profile event.
+    pub event: Event,
+}
+
+/// Build the addressable `d` tag value `project-slug:name` (G2).
+pub fn profile_d_tag(project_slug: &str, name: &str) -> String {
+    format!("{project_slug}:{name}")
+}
+
+/// Build + sign the kind-30013 agent profile event (with dual-emit scoping).
+///
+/// The event's author pubkey IS the agent's npub. Project scoping tags
+/// (`#t` + NIP-32 labels) are applied since kind-30013 is not metadata-hiding.
+pub fn build_profile_event(
+    keys: &Keys,
+    project_slug: &str,
+    profile: &AgentProfile,
+    created_at: Timestamp,
+) -> Result<Event, BuilderError> {
+    let content = serde_json::to_string(profile).expect("profile serializes");
+    let base_tags =
+        vec![Tag::parse(["d", &profile_d_tag(project_slug, &profile.name)]).expect("d tag")];
+    let tags = with_project_scoping(toron_kind(AGENT_PROFILE), base_tags, Some(project_slug));
+    build_event(keys, toron_kind(AGENT_PROFILE), content, tags, created_at)
+}
+
+/// `create_agent_identity`: ALWAYS generate a fresh keypair + publish the
+/// kind-30013 profile (ADR-0003 G1).
+pub fn create_agent_identity(
+    project_slug: &str,
+    profile: &AgentProfile,
+    created_at: Timestamp,
+) -> Result<IdentityResult, BuilderError> {
+    let keys = crate::keys::generate();
+    let event = build_profile_event(&keys, project_slug, profile, created_at)?;
+    Ok(IdentityResult { keys, event })
+}
+
+/// `register_agent`: upsert the profile on the EXISTING agent key, or create a
+/// fresh keypair if absent (ADR-0003 G1).
+pub fn register_agent(
+    project_slug: &str,
+    profile: &AgentProfile,
+    existing: Option<&Keys>,
+    created_at: Timestamp,
+) -> Result<IdentityResult, BuilderError> {
+    let keys = match existing {
+        Some(k) => k.clone(),
+        None => crate::keys::generate(),
+    };
+    let event = build_profile_event(&keys, project_slug, profile, created_at)?;
+    Ok(IdentityResult { keys, event })
+}
+
+/// Extract the agent name from a kind-30013 `d` tag (`project-slug:name`).
+pub fn profile_name_from_d_tag(d: &str) -> Option<&str> {
+    d.split_once(':').map(|(_slug, name)| name)
+}
+
+/// Extract the agent's npub (the event author) from a kind-30013 profile.
+pub fn profile_npub(event: &Event) -> PublicKey {
+    event.pubkey
+}
+
+/// Resolve a name to an npub from a project's kind-30013 profile events (G2).
+///
+/// Names are **project-scoped**: only profiles whose `d` tag is exactly
+/// `<project_slug>:<name>` match. Unknown names return `None` (caller fails
+/// fast, AM-Rust parity).
+pub fn resolve_name<'a>(
+    project_slug: &str,
+    profiles: impl IntoIterator<Item = &'a Event>,
+    name: &str,
+) -> Option<PublicKey> {
+    let want = profile_d_tag(project_slug, name);
+    for ev in profiles {
+        if ev.kind.as_u16() != AGENT_PROFILE {
+            continue;
+        }
+        let d = ev.tags.iter().find_map(|t| {
+            if t.kind() == nostr_sdk::nostr::TagKind::d() {
+                t.content()
+            } else {
+                None
+            }
+        });
+        if d == Some(want.as_str()) {
+            return Some(profile_npub(ev));
+        }
+    }
+    None
+}
+
+/// Parse the profile content from a kind-30013 event.
+pub fn parse_profile(event: &Event) -> Option<AgentProfile> {
+    serde_json::from_str(&event.content).ok()
+}
+
+/// The kind-30013 profile event as JSON (wire-identical, relay-acceptable).
+pub fn profile_json(event: &Event) -> String {
+    event.as_json()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bus::scoping::is_metadata_hiding_kind;
+    use crate::nostr::kinds::AGENT_PROFILE;
+
+    const TS: u64 = 1_700_000_000;
+
+    fn ts() -> Timestamp {
+        Timestamp::from(TS)
+    }
+
+    fn sample_profile() -> AgentProfile {
+        AgentProfile {
+            name: "BlueLake".into(),
+            program: Some("opencode".into()),
+            model: Some("opencode".into()),
+            task_description: Some("mailbox agent".into()),
+        }
+    }
+
+    #[test]
+    fn test_d_tag_format() {
+        assert_eq!(profile_d_tag("demo", "BlueLake"), "demo:BlueLake");
+        assert_eq!(profile_name_from_d_tag("demo:BlueLake"), Some("BlueLake"));
+        assert_eq!(profile_name_from_d_tag("no-colon"), None);
+    }
+
+    #[test]
+    fn test_create_agent_identity_always_different_npub() {
+        let p = sample_profile();
+        let a = create_agent_identity("demo", &p, ts()).expect("create a");
+        let b = create_agent_identity("demo", &p, ts()).expect("create b");
+        assert_ne!(
+            a.keys.public_key(),
+            b.keys.public_key(),
+            "create_agent_identity must always mint a fresh keypair"
+        );
+        assert_ne!(a.event.pubkey, b.event.pubkey);
+        assert_eq!(a.event.kind.as_u16(), AGENT_PROFILE);
+    }
+
+    #[test]
+    fn test_register_agent_same_name_same_npub() {
+        let p = sample_profile();
+        let existing = crate::keys::generate();
+        let a = register_agent("demo", &p, Some(&existing), ts()).expect("register a");
+        let b = register_agent("demo", &p, Some(&existing), ts()).expect("register b");
+        assert_eq!(a.keys.public_key(), existing.public_key());
+        assert_eq!(a.event.pubkey, b.event.pubkey, "upsert keeps the same npub");
+    }
+
+    #[test]
+    fn test_register_agent_creates_when_absent() {
+        let p = sample_profile();
+        let a = register_agent("demo", &p, None, ts()).expect("register absent");
+        let b = register_agent("demo", &p, None, ts()).expect("register absent 2");
+        assert_ne!(
+            a.keys.public_key(),
+            b.keys.public_key(),
+            "absent → fresh keys"
+        );
+    }
+
+    #[test]
+    fn test_profile_event_has_d_tag_and_scoping() {
+        let p = sample_profile();
+        let r = create_agent_identity("demo", &p, ts()).expect("create");
+        let ev = &r.event;
+
+        // d-tag = project-slug:name
+        assert!(ev
+            .tags
+            .iter()
+            .any(|t| { t.as_slice() == ["d".to_string(), "demo:BlueLake".to_string(),] }));
+
+        // Dual-emit scoping: #t + NIP-32 label (kind-30013 is not hiding).
+        assert!(ev
+            .tags
+            .iter()
+            .any(|t| t.as_slice() == ["t".to_string(), "demo".to_string()]));
+        assert!(ev
+            .tags
+            .iter()
+            .any(|t| t.as_slice() == ["l".to_string(), "demo".to_string(), "toron".to_string()]));
+        assert!(ev
+            .tags
+            .iter()
+            .any(|t| t.as_slice() == ["L".to_string(), "toron".to_string()]));
+
+        assert!(!is_metadata_hiding_kind(ev.kind));
+    }
+
+    #[test]
+    fn test_profile_roundtrip_content() {
+        let p = sample_profile();
+        let r = create_agent_identity("demo", &p, ts()).expect("create");
+        let parsed = parse_profile(&r.event).expect("parse");
+        assert_eq!(parsed, p);
+    }
+
+    #[test]
+    fn test_resolve_name_to_npub() {
+        let p = sample_profile();
+        let blue = create_agent_identity("demo", &p, ts()).expect("create blue");
+        let red = create_agent_identity("demo", &sample_profile_with_name("RoseDune"), ts())
+            .expect("create red");
+
+        let profiles = [&blue.event, &red.event];
+        assert_eq!(
+            resolve_name("demo", profiles.iter().copied(), "BlueLake"),
+            Some(blue.event.pubkey)
+        );
+        assert_eq!(
+            resolve_name("demo", profiles.iter().copied(), "RoseDune"),
+            Some(red.event.pubkey)
+        );
+        assert_eq!(
+            resolve_name("demo", profiles.iter().copied(), "Ghost"),
+            None
+        );
+        // Wrong project d-tag does not match.
+        let other = create_agent_identity("other", &p, ts()).expect("create other");
+        assert_eq!(
+            resolve_name("demo", [&other.event].into_iter(), "BlueLake"),
+            None,
+            "project-scoped name must not leak across projects"
+        );
+        assert_eq!(
+            resolve_name("other", [&other.event].into_iter(), "BlueLake"),
+            Some(other.event.pubkey),
+            "name resolves inside its own project"
+        );
+    }
+
+    #[test]
+    fn test_profile_json_wire_identical() {
+        let p = sample_profile();
+        let r = create_agent_identity("demo", &p, ts()).expect("create");
+        let json = profile_json(&r.event);
+        let parsed = Event::from_json(json).expect("parse");
+        assert_eq!(parsed, r.event);
+    }
+
+    fn sample_profile_with_name(name: &str) -> AgentProfile {
+        AgentProfile {
+            name: name.into(),
+            program: None,
+            model: None,
+            task_description: None,
+        }
+    }
+}

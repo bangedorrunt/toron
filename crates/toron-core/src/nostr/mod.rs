@@ -7,4 +7,5 @@
 
 pub mod event;
 pub mod gift_wrap;
+pub mod identity;
 pub mod kinds;
