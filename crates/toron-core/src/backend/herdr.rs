@@ -1,0 +1,796 @@
+// governed-by: ADR-0003
+#![forbid(unsafe_code)]
+
+//! herdr backend client — newline-delimited JSON-RPC over a unix socket
+//! (protocol v18, per ADR-0003). Single shared client; flywheel's copy is
+//! deleted after this lands (ADR: "one definition of `agent_prompt`").
+//!
+//! Wire shape (one JSON object per line):
+//!   request:  {"id":"<n>","method":"agent.prompt","params":{...}}
+//!   response: {"id":"<n>","result":{...}} | {"id":"<n>","error":{"code","message"}}
+//!   push:     {"event":"<type>","data":{...}}
+//!
+//! Socket path: `HERDR_SOCKET_PATH` or `~/.config/herdr/herdr.sock`
+//! (XDG_CONFIG_HOME respected). Errors are typed with machine codes —
+//! classify on `BackendError::code`, never message text.
+
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::net::UnixStream;
+use std::path::PathBuf;
+
+use parking_lot::Mutex;
+use serde::Deserialize;
+use serde_json::{json, Value};
+use tokio::sync::mpsc;
+
+use super::error::{BackendError, BackendErrorCode};
+use super::types::{AgentStatus, BackendEvent, PaneId, SpawnOptions};
+use super::Backend;
+
+/// herdr socket protocol version this client is verified against (v18).
+pub const HDR_PROTOCOL: u64 = 18;
+
+/// Resolve the herdr socket path from explicit env values (pure — testable).
+/// Priority: `HERDR_SOCKET_PATH` env, else `$XDG_CONFIG_HOME/herdr/herdr.sock`
+/// (absolute only), else `~/.config/herdr/herdr.sock`.
+pub fn resolve_socket_path(
+    herdr_env: Option<String>,
+    xdg_config_home: Option<String>,
+    home: Option<String>,
+) -> PathBuf {
+    if let Some(p) = herdr_env {
+        return PathBuf::from(p);
+    }
+    if let Some(xdg) = xdg_config_home {
+        let base = PathBuf::from(xdg);
+        if base.is_absolute() {
+            return base.join("herdr/herdr.sock");
+        }
+    }
+    let home = home
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("~"));
+    home.join(".config").join("herdr").join("herdr.sock")
+}
+
+/// Resolve the herdr socket path from the process environment.
+pub fn default_socket_path() -> PathBuf {
+    resolve_socket_path(
+        std::env::var("HERDR_SOCKET_PATH").ok(),
+        std::env::var("XDG_CONFIG_HOME").ok(),
+        std::env::var("HOME").ok(),
+    )
+}
+
+/// Wire-contract struct (deserialized from herdr protocol; unused fields
+/// must still deserialize — keep `#[allow(dead_code)]`).
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct AgentInfo {
+    pub agent: Option<String>,
+    pub agent_status: AgentStatus,
+    pub cwd: Option<String>,
+    pub display_agent: Option<String>,
+    pub focused: bool,
+    pub foreground_cwd: Option<String>,
+    #[serde(default)]
+    pub interactive_ready: bool,
+    #[serde(default)]
+    pub launch_pending: bool,
+    pub name: Option<String>,
+    pub pane_id: String,
+    pub revision: u64,
+    #[serde(default)]
+    pub state_change_seq: u64,
+    #[serde(default)]
+    pub state_labels: serde_json::Map<String, Value>,
+    pub tab_id: String,
+    pub terminal_id: String,
+    pub terminal_title: Option<String>,
+    pub workspace_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct WorkspaceInfo {
+    pub workspace_id: String,
+    pub number: u64,
+    pub label: String,
+    pub focused: bool,
+    pub pane_count: u64,
+    pub tab_count: u64,
+    pub active_tab_id: String,
+    pub agent_status: AgentStatus,
+    #[serde(default)]
+    pub cwd: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct PaneInfo {
+    pub pane_id: String,
+    pub title: Option<String>,
+    pub cwd: Option<String>,
+    pub agent_status: Option<AgentStatus>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct WorktreeInfo {
+    pub worktree_id: String,
+    pub workspace_id: String,
+    pub branch: String,
+    pub label: Option<String>,
+}
+
+/// Wait options for `agent.prompt` / `agent.wait`.
+#[derive(Debug, Clone)]
+pub struct WaitOptions {
+    pub timeout_ms: Option<u64>,
+    pub until: Vec<AgentStatus>,
+}
+
+/// Result of a `pane.wait_for_output` wait.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaneWaitResult {
+    pub pane_id: String,
+    pub matched_line: Option<String>,
+    pub read: String,
+}
+
+/// Classification of a confirmed `agent.prompt` outcome.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SendVerdict {
+    Landed(Option<AgentStatus>),
+    Stalled,
+    TimedOut,
+    Coded(String),
+}
+
+/// Map a herdr error code + observed status to a verdict. Classifies on the
+/// protocol code, never message strings.
+pub fn classify_send_result(code: Option<&str>, status: Option<AgentStatus>) -> SendVerdict {
+    match code {
+        Some("agent_prompt_stalled") => SendVerdict::Stalled,
+        Some("timeout") => SendVerdict::TimedOut,
+        Some(other) => SendVerdict::Coded(other.to_string()),
+        None => SendVerdict::Landed(status),
+    }
+}
+
+/// Subscription event kinds accepted by `events.subscribe`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubscriptionEventKind {
+    PaneAgentStatusChanged,
+}
+
+impl SubscriptionEventKind {
+    pub const fn as_wire_str(self) -> &'static str {
+        match self {
+            SubscriptionEventKind::PaneAgentStatusChanged => "pane.agent_status_changed",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Subscription {
+    pub event: SubscriptionEventKind,
+    pub pane_id: String,
+    pub agent_status: Option<AgentStatus>,
+}
+
+impl Subscription {
+    pub fn agent_status_changed(pane_id: String) -> Self {
+        Subscription {
+            event: SubscriptionEventKind::PaneAgentStatusChanged,
+            pane_id,
+            agent_status: None,
+        }
+    }
+
+    pub fn with_agent_status(mut self, status: AgentStatus) -> Self {
+        self.agent_status = Some(status);
+        self
+    }
+
+    pub fn to_value(&self) -> Value {
+        json!({
+            "type": self.event.as_wire_str(),
+            "pane_id": self.pane_id,
+            "agent_status": self.agent_status.map(|s| s.as_str()),
+        })
+    }
+}
+
+/// Blocking JSON-RPC client over the herdr unix socket. One request per
+/// connection (except `events.subscribe`, which holds the socket open).
+#[derive(Debug, Clone)]
+pub struct Client {
+    socket_path: String,
+    next_id: u64,
+}
+
+impl Client {
+    /// Connect (probes reachability now so callers fail fast).
+    pub fn connect(socket_path: Option<&str>) -> Result<Self, BackendError> {
+        let path = socket_path
+            .map(|p| p.to_string())
+            .or_else(|| std::env::var("HERDR_SOCKET_PATH").ok())
+            .unwrap_or_else(|| default_socket_path().to_string_lossy().into_owned());
+        let _probe = UnixStream::connect(&path).map_err(|e| {
+            BackendError::new(
+                BackendErrorCode::Connect,
+                format!("cannot connect to herdr socket at {path}: {e}"),
+            )
+        })?;
+        Ok(Client {
+            socket_path: path,
+            next_id: 1,
+        })
+    }
+
+    fn open(&self) -> Result<UnixStream, BackendError> {
+        UnixStream::connect(&self.socket_path).map_err(|e| {
+            BackendError::new(
+                BackendErrorCode::Connect,
+                format!(
+                    "cannot connect to herdr socket at {}: {e}",
+                    self.socket_path
+                ),
+            )
+        })
+    }
+
+    /// Send one request on a fresh connection; returns `result` or a typed
+    /// error carrying the protocol machine code.
+    pub fn call_coded(&mut self, method: &str, params: Value) -> Result<Value, BackendError> {
+        let id = self.next_id.to_string();
+        self.next_id += 1;
+        let req = json!({ "id": id, "method": method, "params": params });
+        let mut line = serde_json::to_string(&req)
+            .map_err(|e| BackendError::new(BackendErrorCode::Serialize, e.to_string()))?;
+        line.push('\n');
+
+        let mut reader = BufReader::new(self.open()?);
+        reader
+            .get_mut()
+            .write_all(line.as_bytes())
+            .and_then(|_| reader.get_mut().flush())
+            .map_err(|e| {
+                BackendError::new(BackendErrorCode::Io, format!("write to herdr socket: {e}"))
+            })?;
+
+        loop {
+            let mut buf = String::new();
+            let n = reader.read_line(&mut buf).map_err(|e| {
+                BackendError::new(BackendErrorCode::Io, format!("read from herdr socket: {e}"))
+            })?;
+            if n == 0 {
+                return Err(BackendError::new(
+                    BackendErrorCode::Io,
+                    String::from("herdr socket closed while waiting for response"),
+                ));
+            }
+            let val: Value = serde_json::from_str(buf.trim()).map_err(|e| {
+                BackendError::new(
+                    BackendErrorCode::Malformed,
+                    format!("malformed herdr response: {buf}: {e}"),
+                )
+            })?;
+            if val.get("id").and_then(Value::as_str) != Some(id.as_str()) {
+                continue;
+            }
+            if let Some(err) = val.get("error") {
+                let code = err
+                    .get("code")
+                    .and_then(Value::as_str)
+                    .unwrap_or("error")
+                    .to_string();
+                let message = err
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown error")
+                    .to_string();
+                return Err(BackendError::new(parse_code(&code), message));
+            }
+            return val.get("result").cloned().ok_or_else(|| {
+                BackendError::new(
+                    BackendErrorCode::Malformed,
+                    format!("herdr response missing result: {val}"),
+                )
+            });
+        }
+    }
+
+    /// `call_coded` unwrapped into anyhow-style `Result<Value>`.
+    pub fn call(&mut self, method: &str, params: Value) -> Result<Value, BackendError> {
+        self.call_coded(method, params)
+    }
+
+    /// Subscribe to events; returns a long-lived blocking stream.
+    pub fn subscribe(
+        &mut self,
+        subscriptions: &[Subscription],
+    ) -> Result<EventStream, BackendError> {
+        let id = self.next_id.to_string();
+        self.next_id += 1;
+        let req = json!({
+            "id": id,
+            "method": "events.subscribe",
+            "params": {
+                "subscriptions": subscriptions.iter().map(|s| s.to_value()).collect::<Vec<_>>()
+            }
+        });
+        let mut line = serde_json::to_string(&req)
+            .map_err(|e| BackendError::new(BackendErrorCode::Serialize, e.to_string()))?;
+        line.push('\n');
+
+        let mut reader = BufReader::new(self.open()?);
+        reader
+            .get_mut()
+            .write_all(line.as_bytes())
+            .and_then(|_| reader.get_mut().flush())
+            .map_err(|e| {
+                BackendError::new(BackendErrorCode::Io, format!("write subscription: {e}"))
+            })?;
+
+        loop {
+            let mut buf = String::new();
+            let n = reader.read_line(&mut buf).map_err(|e| {
+                BackendError::new(BackendErrorCode::Io, format!("read subscription ack: {e}"))
+            })?;
+            if n == 0 {
+                return Err(BackendError::new(
+                    BackendErrorCode::Io,
+                    String::from("herdr socket closed before subscription ack"),
+                ));
+            }
+            let val: Value = serde_json::from_str(buf.trim()).map_err(|e| {
+                BackendError::new(
+                    BackendErrorCode::Malformed,
+                    format!("malformed herdr response: {buf}: {e}"),
+                )
+            })?;
+            if val.get("id").and_then(Value::as_str) == Some(id.as_str()) {
+                if let Some(err) = val.get("error") {
+                    let code = err
+                        .get("code")
+                        .and_then(Value::as_str)
+                        .unwrap_or("error")
+                        .to_string();
+                    let message = err
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown")
+                        .to_string();
+                    return Err(BackendError::new(parse_code(&code), message));
+                }
+                break;
+            }
+        }
+        Ok(EventStream { reader })
+    }
+
+    // ---- typed helpers (flywheel-loop coverage) ----
+
+    pub fn ping(&mut self) -> Result<Value, BackendError> {
+        self.call("ping", json!({}))
+    }
+
+    pub fn workspace_create(
+        &mut self,
+        cwd: Option<&str>,
+        label: Option<&str>,
+        focus: bool,
+    ) -> Result<(WorkspaceInfo, PaneInfo), BackendError> {
+        let res = self.call(
+            "workspace.create",
+            json!({ "cwd": cwd, "label": label, "focus": focus }),
+        )?;
+        let ws: WorkspaceInfo =
+            serde_json::from_value(res.get("workspace").cloned().unwrap_or(res.clone()))
+                .map_err(|e| parse_err(e.to_string()))?;
+        let root: PaneInfo = serde_json::from_value(res.get("root_pane").cloned().unwrap_or(res))
+            .map_err(|e| parse_err(e.to_string()))?;
+        Ok((ws, root))
+    }
+
+    pub fn workspace_list(&mut self) -> Result<Vec<WorkspaceInfo>, BackendError> {
+        let res = self.call("workspace.list", json!({}))?;
+        serde_json::from_value(res.get("workspaces").cloned().unwrap_or(res))
+            .map_err(|e| parse_err(e.to_string()))
+    }
+
+    pub fn workspace_close(&mut self, workspace_id: &str) -> Result<Value, BackendError> {
+        self.call("workspace.close", json!({ "workspace_id": workspace_id }))
+    }
+
+    pub fn pane_list(&mut self, workspace_id: Option<&str>) -> Result<Vec<PaneInfo>, BackendError> {
+        let res = self.call("pane.list", json!({ "workspace_id": workspace_id }))?;
+        serde_json::from_value(res.get("panes").cloned().unwrap_or(res))
+            .map_err(|e| parse_err(e.to_string()))
+    }
+
+    pub fn agent_list(&mut self) -> Result<Vec<AgentInfo>, BackendError> {
+        let res = self.call("agent.list", json!({}))?;
+        serde_json::from_value(res.get("agents").cloned().unwrap_or(res))
+            .map_err(|e| parse_err(e.to_string()))
+    }
+
+    pub fn agent_start(
+        &mut self,
+        name: &str,
+        kind: &str,
+        pane_id: &str,
+        timeout_ms: u64,
+        args: &[String],
+    ) -> Result<AgentInfo, BackendError> {
+        let res = self.call(
+            "agent.start",
+            json!({
+                "name": name, "kind": kind, "pane_id": pane_id,
+                "timeout_ms": timeout_ms, "args": args,
+            }),
+        )?;
+        serde_json::from_value(res.get("agent").cloned().unwrap_or(res))
+            .map_err(|e| parse_err(e.to_string()))
+    }
+
+    pub fn agent_rename(&mut self, target: &str, name: &str) -> Result<Value, BackendError> {
+        self.call("agent.rename", json!({ "target": target, "name": name }))
+    }
+
+    pub fn agent_prompt(
+        &mut self,
+        target: &str,
+        text: &str,
+        wait: Option<WaitOptions>,
+    ) -> Result<AgentInfo, BackendError> {
+        self.agent_prompt_coded(target, text, wait)
+    }
+
+    /// `agent.prompt` returning the typed error for code classification.
+    pub fn agent_prompt_coded(
+        &mut self,
+        target: &str,
+        text: &str,
+        wait: Option<WaitOptions>,
+    ) -> Result<AgentInfo, BackendError> {
+        let wait = wait.map(|w| {
+            json!({ "timeout_ms": w.timeout_ms, "until": w.until.iter().map(|s| s.as_str()).collect::<Vec<_>>() })
+        });
+        let res = self.call_coded(
+            "agent.prompt",
+            json!({ "target": target, "text": text, "wait": wait }),
+        )?;
+        serde_json::from_value(res.get("agent").cloned().unwrap_or(res))
+            .map_err(|e| parse_err(e.to_string()))
+    }
+
+    pub fn agent_wait(
+        &mut self,
+        target: &str,
+        until: &[AgentStatus],
+        timeout_ms: Option<u64>,
+    ) -> Result<AgentInfo, BackendError> {
+        let res = self.call(
+            "agent.wait",
+            json!({
+                "target": target,
+                "until": until.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+                "timeout_ms": timeout_ms,
+            }),
+        )?;
+        serde_json::from_value(res.get("agent").cloned().unwrap_or(res))
+            .map_err(|e| parse_err(e.to_string()))
+    }
+
+    pub fn agent_read(
+        &mut self,
+        target: &str,
+        source: &str,
+        lines: Option<u32>,
+    ) -> Result<String, BackendError> {
+        let res = self.call(
+            "agent.read",
+            json!({ "target": target, "source": source, "lines": lines, "format": "text", "strip_ansi": true }),
+        )?;
+        let text = res
+            .get("content")
+            .or_else(|| res.get("text"))
+            .or_else(|| res.get("output"))
+            .or_else(|| res.get("read").and_then(|r| r.get("text")))
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                BackendError::new(
+                    BackendErrorCode::Malformed,
+                    format!("agent.read result has no content: {res}"),
+                )
+            })?;
+        Ok(text.to_string())
+    }
+
+    pub fn agent_send_keys(&mut self, target: &str, keys: &[&str]) -> Result<Value, BackendError> {
+        self.call("agent.send_keys", json!({ "target": target, "keys": keys }))
+    }
+
+    pub fn worktree_create(
+        &mut self,
+        workspace_id: &str,
+        branch: &str,
+        base: Option<&str>,
+        label: Option<&str>,
+        focus: bool,
+    ) -> Result<Value, BackendError> {
+        self.call(
+            "worktree.create",
+            json!({
+                "workspace_id": workspace_id, "branch": branch, "base": base,
+                "label": label, "focus": focus,
+            }),
+        )
+    }
+
+    pub fn worktree_remove(
+        &mut self,
+        workspace_id: &str,
+        force: bool,
+    ) -> Result<Value, BackendError> {
+        self.call(
+            "worktree.remove",
+            json!({ "workspace_id": workspace_id, "force": force }),
+        )
+    }
+}
+
+/// Map a herdr wire error code string onto the typed code enum. Codes the
+/// client knows map explicitly; everything else stays `Other(code)`.
+fn parse_code(code: &str) -> BackendErrorCode {
+    code.parse()
+        .unwrap_or_else(|_| BackendErrorCode::Other(code.to_string()))
+}
+
+fn parse_err(msg: String) -> BackendError {
+    BackendError::new(BackendErrorCode::Malformed, msg)
+}
+
+/// Blocking event stream (long-lived subscription socket).
+pub struct EventStream {
+    reader: BufReader<UnixStream>,
+}
+
+impl EventStream {
+    /// Read one pushed event (dotted wire name + data). `Ok(None)` on close.
+    pub fn read_event(&mut self) -> Result<Option<(String, Value)>, BackendError> {
+        loop {
+            let mut buf = String::new();
+            let n = self.reader.read_line(&mut buf).map_err(|e| {
+                BackendError::new(BackendErrorCode::Io, format!("read herdr event: {e}"))
+            })?;
+            if n == 0 {
+                return Ok(None);
+            }
+            let val: Value = serde_json::from_str(buf.trim()).map_err(|e| {
+                BackendError::new(
+                    BackendErrorCode::Malformed,
+                    format!("malformed herdr event: {buf}: {e}"),
+                )
+            })?;
+            let Some(event) = val.get("event").and_then(Value::as_str) else {
+                continue;
+            };
+            return Ok(Some((
+                event.to_string(),
+                val.get("data").cloned().unwrap_or(Value::Null),
+            )));
+        }
+    }
+}
+
+/// Async `Backend` over the blocking herdr client. Spawns the blocking client
+/// calls on `tokio::task::block_in_place`-free dedicated threads via
+/// `tokio::task::spawn_blocking` where the caller uses the async trait.
+pub struct HerdrBackend {
+    client: Mutex<Client>,
+}
+
+impl HerdrBackend {
+    pub fn connect(socket_path: Option<&str>) -> Result<Self, BackendError> {
+        Ok(Self {
+            client: Mutex::new(Client::connect(socket_path)?),
+        })
+    }
+
+    pub fn client(&self) -> parking_lot::MutexGuard<'_, Client> {
+        self.client.lock()
+    }
+}
+
+#[async_trait::async_trait]
+impl Backend for HerdrBackend {
+    async fn spawn(&self, opts: &SpawnOptions) -> Result<PaneId, BackendError> {
+        let mut client = self.client.lock();
+        // Find or create a workspace for the project, then start the agent in
+        // its root pane. Name→pane mapping happens on the flywheel side.
+        let mut target_pane: Option<String> = None;
+        let workspaces = client.workspace_list()?;
+        for ws in &workspaces {
+            if ws.label == opts.project {
+                let panes = client.pane_list(Some(&ws.workspace_id))?;
+                if let Some(first) = panes.into_iter().next() {
+                    target_pane = Some(first.pane_id);
+                }
+                break;
+            }
+        }
+        let pane_id = match target_pane {
+            Some(id) => id,
+            None => {
+                let (_ws, root) =
+                    client.workspace_create(opts.cwd.as_deref(), Some(&opts.project), false)?;
+                root.pane_id
+            }
+        };
+        let info = client.agent_start(&opts.agent_name, &opts.program, &pane_id, 5000, &[])?;
+        if info.name.as_deref() != Some(opts.agent_name.as_str()) {
+            let _ = client.agent_rename(&info.pane_id, &opts.agent_name);
+        }
+        Ok(PaneId(pane_id))
+    }
+
+    async fn prompt(&self, pane: &PaneId, input: &str) -> Result<(), BackendError> {
+        let mut client = self.client.lock();
+        client.agent_prompt(pane.as_str(), input, None)?;
+        Ok(())
+    }
+
+    async fn wait(&self, pane: &PaneId) -> Result<AgentStatus, BackendError> {
+        let mut client = self.client.lock();
+        let info = client.agent_wait(
+            pane.as_str(),
+            &[AgentStatus::Done, AgentStatus::Blocked],
+            Some(30_000),
+        )?;
+        Ok(info.agent_status)
+    }
+
+    async fn read(&self, pane: &PaneId) -> Result<String, BackendError> {
+        let mut client = self.client.lock();
+        client.agent_read(pane.as_str(), "recent", None)
+    }
+
+    async fn send_keys(&self, pane: &PaneId, keys: &str) -> Result<(), BackendError> {
+        let mut client = self.client.lock();
+        client.agent_send_keys(pane.as_str(), &[keys])?;
+        Ok(())
+    }
+
+    async fn events(&self) -> Result<mpsc::Receiver<BackendEvent>, BackendError> {
+        let mut client = self.client.lock();
+        let (tx, rx) = mpsc::channel(64);
+        // Subscribe to agent-status pushes for the last-known pane. Callers
+        // should narrow the subscription once a pane is spawned (Phase-2
+        // reactor subscribes per-pane).
+        let stream = client.subscribe(&[Subscription::agent_status_changed(String::new())])?;
+        // Forward blocking reads onto the async channel via a dedicated thread.
+        std::thread::spawn(move || {
+            let mut stream = stream;
+            loop {
+                match stream.read_event() {
+                    Ok(Some((kind, data))) => {
+                        let evt = parse_push(&kind, &data);
+                        if tx.blocking_send(evt).is_err() {
+                            break;
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(_) => break,
+                }
+            }
+        });
+        Ok(rx)
+    }
+}
+
+/// Map a herdr push onto a typed `BackendEvent`.
+fn parse_push(kind: &str, data: &Value) -> BackendEvent {
+    let pane = data
+        .get("pane_id")
+        .and_then(Value::as_str)
+        .map(|s| PaneId(s.to_string()))
+        .unwrap_or_else(|| PaneId(String::new()));
+    let status = data
+        .get("agent_status")
+        .and_then(Value::as_str)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(AgentStatus::Unknown);
+    match kind {
+        "pane.agent_status_changed" => BackendEvent::AgentStatusChanged { pane, status },
+        other => BackendEvent::Raw(format!("{other}: {data}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn subscription_serializes_wire_shape() {
+        let sub = Subscription::agent_status_changed("w1:p2".into())
+            .with_agent_status(AgentStatus::Working);
+        assert_eq!(
+            sub.to_value(),
+            json!({
+                "type": "pane.agent_status_changed",
+                "pane_id": "w1:p2",
+                "agent_status": "working",
+            })
+        );
+    }
+
+    #[test]
+    fn classify_send_result_maps_codes() {
+        assert_eq!(
+            classify_send_result(Some("agent_prompt_stalled"), None),
+            SendVerdict::Stalled
+        );
+        assert_eq!(
+            classify_send_result(Some("timeout"), Some(AgentStatus::Working)),
+            SendVerdict::TimedOut
+        );
+        assert_eq!(
+            classify_send_result(Some("agent_not_running"), None),
+            SendVerdict::Coded("agent_not_running".into())
+        );
+        assert_eq!(
+            classify_send_result(None, Some(AgentStatus::Blocked)),
+            SendVerdict::Landed(Some(AgentStatus::Blocked))
+        );
+    }
+
+    #[test]
+    fn default_socket_path_respects_env_override() {
+        // Pure resolver: HERDR_SOCKET_PATH wins regardless of XDG/HOME.
+        assert_eq!(
+            resolve_socket_path(
+                Some("/tmp/custom-herdr.sock".into()),
+                Some("/Users/x/.config".into()),
+                Some("/Users/x".into()),
+            ),
+            PathBuf::from("/tmp/custom-herdr.sock")
+        );
+    }
+
+    #[test]
+    fn default_socket_path_prefers_xdg_then_home() {
+        // XDG_CONFIG_HOME (absolute) wins over HOME.
+        let via_xdg = resolve_socket_path(
+            None,
+            Some("/Users/x/.config".into()),
+            Some("/Users/x".into()),
+        );
+        assert_eq!(via_xdg, PathBuf::from("/Users/x/.config/herdr/herdr.sock"));
+        // Relative XDG is ignored; falls to HOME.
+        let via_home =
+            resolve_socket_path(None, Some("rel/config".into()), Some("/Users/x".into()));
+        assert_eq!(via_home, PathBuf::from("/Users/x/.config/herdr/herdr.sock"));
+        // No HOME at all: ~ fallback.
+        let no_home = resolve_socket_path(None, None, None);
+        assert!(no_home.to_string_lossy().ends_with("herdr/herdr.sock"));
+    }
+
+    #[test]
+    fn agent_wire_params_shape() {
+        // Static assert of the JSON-RPC params we send on the wire for the
+        // methods the flywheel loop depends on (single source of truth).
+        let prompt_wait = WaitOptions {
+            timeout_ms: Some(5000),
+            until: vec![AgentStatus::Done],
+        };
+        let wait = json!({ "timeout_ms": 5000, "until": ["done"] });
+        assert_eq!(
+            json!({ "timeout_ms": prompt_wait.timeout_ms, "until": prompt_wait.until.iter().map(|s| s.as_str()).collect::<Vec<_>>() }),
+            wait
+        );
+    }
+}

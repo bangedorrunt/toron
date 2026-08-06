@@ -6,6 +6,7 @@
 // Unsupported until un-held (ADR-0003 G9).
 
 pub mod error;
+pub mod herdr;
 pub mod mock;
 pub mod types;
 
