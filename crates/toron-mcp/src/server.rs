@@ -4,32 +4,38 @@
 use std::sync::Arc;
 
 use rmcp::model::{
-    ErrorData, Implementation, InitializeResult, ListResourceTemplatesResult, ListResourcesResult,
-    PaginatedRequestParams, ProtocolVersion, ReadResourceRequestParams, ReadResourceResponse,
-    ReadResourceResult, Resource, ResourceContents, ResourceTemplate, ResourceUpdatedNotification,
-    ResourceUpdatedNotificationParam, ServerCapabilities, ServerInfo, SubscriptionFilter,
+    CallToolRequestParams, CallToolResponse, ErrorData, Implementation, InitializeResult,
+    ListResourceTemplatesResult, ListResourcesResult, ListToolsResult, PaginatedRequestParams,
+    ProtocolVersion, ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult, Resource,
+    ResourceContents, ResourceTemplate, ResourceUpdatedNotification,
+    ResourceUpdatedNotificationParam, ServerCapabilities, ServerInfo, SubscriptionFilter, Tool,
 };
 use rmcp::service::{RequestContext, RoleServer, SubscriptionContext};
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use rmcp::{ServerHandler, ServiceExt};
 use toron_core::bus::Bus;
+use toron_core::mailbox::Mailbox;
 
 use crate::resources::{read_resource_value, RESOURCES};
+use crate::tools::ToolServer;
 
 /// MCP server for toron.
 ///
 /// Holds an `Arc<dyn Bus>` (toron-core) that backs data resources and the
-/// SEP-2575 subscription push. `bd-led.7.2` adds `#[tool]` methods.
+/// SEP-2575 subscription push, plus the [`ToolServer`] exposing the 38
+/// AM-Rust parity tools (bd-led.7.2).
 #[derive(Clone, Default)]
 pub struct ToronServer {
     bus: Option<Arc<dyn Bus>>,
+    tools: Option<ToolServer>,
 }
 
 impl std::fmt::Debug for ToronServer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ToronServer")
             .field("bus", &self.bus.is_some())
+            .field("tools", &self.tools.is_some())
             .finish()
     }
 }
@@ -41,14 +47,31 @@ impl ToronServer {
     }
 
     /// Attach the in-process bus used to back data resources + subscriptions.
+    /// Also wires a mailbox over the same bus so the 38 tools are served.
     pub fn with_bus(mut self, bus: Arc<dyn Bus>) -> Self {
+        let data_dir = std::env::temp_dir().join("toron-mcp-demo");
+        let mailbox = Mailbox::new(bus.clone(), data_dir, None);
         self.bus = Some(bus);
+        self.tools = Some(ToolServer::new(Arc::new(mailbox)));
+        self
+    }
+
+    /// Attach a fully-wired mailbox (bus + index pool) backing the tool
+    /// surface. The bus is shared so resource/subscription features work too.
+    pub fn with_mailbox(mut self, mailbox: Mailbox) -> Self {
+        self.bus = Some(mailbox.bus().clone());
+        self.tools = Some(ToolServer::new(Arc::new(mailbox)));
         self
     }
 
     /// The attached bus, if any.
     pub fn bus(&self) -> Option<&Arc<dyn Bus>> {
         self.bus.as_ref()
+    }
+
+    /// The attached tool surface, if any.
+    pub fn tools(&self) -> Option<&ToolServer> {
+        self.tools.as_ref()
     }
 
     /// Server capabilities advertised via `initialize`/`discover`.
@@ -70,6 +93,37 @@ impl ServerHandler for ToronServer {
         InitializeResult::new(Self::capabilities())
             .with_protocol_version(ProtocolVersion::V_2026_07_28)
             .with_server_info(Implementation::new("toron", env!("CARGO_PKG_VERSION")))
+    }
+
+    /// The 38 AM-Rust parity tools (bd-led.7.2), delegated to `ToolServer`.
+    async fn list_tools(
+        &self,
+        request: Option<PaginatedRequestParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<ListToolsResult, ErrorData> {
+        match &self.tools {
+            Some(tools) => tools.list_tools(request, context).await,
+            None => Ok(ListToolsResult::default()),
+        }
+    }
+
+    /// Tool dispatch, delegated to `ToolServer`.
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, ErrorData> {
+        match &self.tools {
+            Some(tools) => tools.call_tool(request, context).await,
+            None => Err(ErrorData::method_not_found::<
+                rmcp::model::CallToolRequestMethod,
+            >()),
+        }
+    }
+
+    /// Tool definition lookup, delegated to `ToolServer`.
+    fn get_tool(&self, name: &str) -> Option<Tool> {
+        self.tools.as_ref().and_then(|tools| tools.get_tool(name))
     }
 
     async fn list_resources(
@@ -182,11 +236,24 @@ impl ServerHandler for ToronServer {
     }
 }
 
+/// Build the demo mailbox backing the tool surface for `router`/`serve_stdio`:
+/// an in-process bus over a per-call SQLite index in the system temp dir.
+async fn demo_mailbox() -> anyhow::Result<Mailbox> {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let db = std::env::temp_dir().join(format!("toron-mcp-{}-{}.sqlite", std::process::id(), seq));
+    let pool = toron_core::index::schema::connect(db.to_str().unwrap()).await?;
+    toron_core::index::schema::migrate(&pool).await?;
+    let bus = toron_core::bus::InProcessBus::open(pool.clone(), Default::default()).await?;
+    let data_dir = std::env::temp_dir().join("toron-mcp-demo");
+    Ok(Mailbox::new(Arc::new(bus), data_dir, None).with_index_pool(pool))
+}
+
 /// Serve the toron MCP server over stdio (transport `transport-io`).
 ///
 /// Blocks until the stdio connection closes.
 pub async fn serve_stdio() -> anyhow::Result<()> {
-    let server = ToronServer::new();
+    let server = ToronServer::new().with_mailbox(demo_mailbox().await?);
     let running = server.serve(rmcp::transport::stdio()).await?;
     running.waiting().await?;
     Ok(())
@@ -196,10 +263,12 @@ pub async fn serve_stdio() -> anyhow::Result<()> {
 ///
 /// SEP-2567 stateless mode is enabled (`legacy_session_mode(false)`) so the
 /// daemon/federation path is horizontally scalable with no session affinity.
-pub fn router() -> axum::Router {
+/// The served handler carries the 38 AM-Rust parity tools (bd-led.7.2).
+pub async fn router() -> anyhow::Result<axum::Router> {
+    let server = ToronServer::new().with_mailbox(demo_mailbox().await?);
     let service: StreamableHttpService<ToronServer, LocalSessionManager> =
         StreamableHttpService::new(
-            || Ok(ToronServer::new()),
+            move || Ok(server.clone()),
             Arc::new(LocalSessionManager::default()),
             StreamableHttpServerConfig::default()
                 // 2026-07-28 clients are served statelessly per SEP-2567
@@ -207,7 +276,7 @@ pub fn router() -> axum::Router {
                 // pre-2026-07-28 clients still complete a session lifecycle.
                 .with_json_response(true),
         );
-    axum::Router::new().nest_service("/mcp", service)
+    Ok(axum::Router::new().nest_service("/mcp", service))
 }
 
 /// Serve the toron MCP server over Streamable HTTP on `bind_addr`
@@ -215,7 +284,7 @@ pub fn router() -> axum::Router {
 pub async fn serve_http(bind_addr: &str) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
     tracing::info!(%bind_addr, "toron MCP Streamable HTTP listening at /mcp");
-    axum::serve(listener, router()).await?;
+    axum::serve(listener, router().await?).await?;
     Ok(())
 }
 
