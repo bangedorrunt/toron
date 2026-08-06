@@ -7,6 +7,7 @@
 //! (channels) vs `RelayBus` (WS) without tool changes. Events are
 //! wire-identical across both.
 
+pub mod addressable;
 pub mod event_store;
 pub mod federation;
 pub mod filter;
@@ -19,6 +20,9 @@ pub mod scoping;
 pub mod subscription;
 pub mod ttl;
 
+pub use addressable::{
+    is_addressable, is_revocation, resolve_coordinate, AddressableKey, KeyPriority,
+};
 pub use event_store::BusEventStore;
 pub use federation::{FederationIssue, FederationMode, FederationPolicy, PowDifficulty};
 pub use filter::{project_filter, Filter, LabelValue};
