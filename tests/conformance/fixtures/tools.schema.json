@@ -1,0 +1,1336 @@
+{
+ "$schema": "https://json-schema.org/draft/2020-12/schema",
+ "kind": "tools-input-schemas",
+ "note": "First-party fixture derived from rmcp/schemars JSON Schema 2020-12 output (list_tools snapshot). No AM-Rust test code vendored (LicenseRef-MIT-Rider).",
+ "tools": [
+  {
+   "name": "acknowledge_message",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "project_key": {
+      "type": "string"
+     },
+     "agent_name": {
+      "type": "string"
+     },
+     "message_id": {
+      "type": "integer"
+     }
+    },
+    "required": [
+     "project_key",
+     "agent_name",
+     "message_id"
+    ],
+    "additionalProperties": false
+   },
+   "description": "Acknowledge a message addressed to an agent (and mark as read)."
+  },
+  {
+   "name": "acquire_build_slot",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "project_key": {
+      "type": "string"
+     },
+     "agent_name": {
+      "type": "string"
+     },
+     "slot": {
+      "type": "string"
+     },
+     "ttl_seconds": {
+      "type": "integer"
+     },
+     "exclusive": {
+      "type": "boolean"
+     }
+    },
+    "required": [
+     "project_key",
+     "agent_name",
+     "slot"
+    ],
+    "additionalProperties": false
+   },
+   "description": "Acquire a build slot (advisory), optionally exclusive. Returns conflicts when another holder is active."
+  },
+  {
+   "name": "check_file_reservation_conflicts",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "project_key": {
+      "type": "string"
+     },
+     "agent_name": {
+      "type": "string"
+     },
+     "paths": {
+      "type": "array",
+      "items": {
+       "type": "string"
+      }
+     }
+    },
+    "required": [
+     "project_key",
+     "agent_name",
+     "paths"
+    ],
+    "additionalProperties": false
+   },
+   "description": "Check project-relative paths against authoritative active exclusive file reservations without mutating Agent Mail."
+  },
+  {
+   "name": "cleanup_pane_identities",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "project_key": {
+      "type": "string"
+     }
+    },
+    "required": [],
+    "additionalProperties": false
+   },
+   "description": "Remove stale per-pane identity files for tmux panes that no longer exist."
+  },
+  {
+   "name": "create_agent_identity",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "project_key": {
+      "type": "string"
+     },
+     "program": {
+      "type": "string"
+     },
+     "model": {
+      "type": "string"
+     },
+     "name_hint": {
+      "type": "string"
+     },
+     "task_description": {
+      "type": "string"
+     },
+     "attachments_policy": {
+      "type": "string"
+     },
+     "pane_id": {
+      "type": "string"
+     },
+     "registration_proof": {
+      "type": "string"
+     }
+    },
+    "required": [
+     "project_key",
+     "program",
+     "model"
+    ],
+    "additionalProperties": false
+   },
+   "description": "Create a new, unique agent identity and persist its profile to Git."
+  },
+  {
+   "name": "ensure_product",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "product_key": {
+      "type": "string"
+     },
+     "name": {
+      "type": "string"
+     }
+    },
+    "required": [],
+    "additionalProperties": false
+   },
+   "description": "Ensure a Product exists. If not, create one."
+  },
+  {
+   "name": "ensure_project",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "human_key": {
+      "type": "string"
+     },
+     "identity_mode": {
+      "type": "string"
+     }
+    },
+    "required": [
+     "human_key"
+    ],
+    "additionalProperties": false
+   },
+   "description": "Idempotently create or ensure a project exists for the given human key."
+  },
+  {
+   "name": "fetch_inbox",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "project_key": {
+      "type": "string"
+     },
+     "agent_name": {
+      "type": "string"
+     },
+     "urgent_only": {
+      "type": "boolean"
+     },
+     "since_ts": {
+      "type": "string"
+     },
+     "limit": {
+      "type": "integer"
+     },
+     "include_bodies": {
+      "type": "boolean"
+     },
+     "unread_only": {
+      "type": "boolean"
+     },
+     "ack_overdue_only": {
+      "type": "boolean"
+     },
+     "topic": {
+      "type": "string"
+     },
+     "mark_read": {
+      "type": "boolean"
+     }
+    },
+    "required": [
+     "project_key",
+     "agent_name"
+    ],
+    "additionalProperties": false
+   },
+   "description": "Retrieve recent messages for an agent and mark returned messages read."
+  },
+  {
+   "name": "fetch_inbox_product",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "product_key": {
+      "type": "string"
+     },
+     "agent_name": {
+      "type": "string"
+     },
+     "limit": {
+      "type": "integer"
+     },
+     "urgent_only": {
+      "type": "boolean"
+     },
+     "include_bodies": {
+      "type": "boolean"
+     },
+     "since_ts": {
+      "type": "string"
+     }
+    },
+    "required": [
+     "product_key",
+     "agent_name"
+    ],
+    "additionalProperties": false
+   },
+   "description": "Retrieve recent messages for an agent across all projects linked to a product (non-mutating)."
+  },
+  {
+   "name": "file_reservation_paths",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "project_key": {
+      "type": "string"
+     },
+     "agent_name": {
+      "type": "string"
+     },
+     "paths": {
+      "type": "array",
+      "items": {
+       "type": "string"
+      }
+     },
+     "ttl_seconds": {
+      "type": "integer"
+     },
+     "exclusive": {
+      "type": "boolean"
+     },
+     "reason": {
+      "type": "string"
+     }
+    },
+    "required": [
+     "project_key",
+     "agent_name",
+     "paths"
+    ],
+    "additionalProperties": false
+   },
+   "description": "Request advisory file reservations (leases) on project-relative paths/globs."
+  },
+  {
+   "name": "force_release_file_reservation",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "project_key": {
+      "type": "string"
+     },
+     "agent_name": {
+      "type": "string"
+     },
+     "file_reservation_id": {
+      "type": "integer"
+     },
+     "note": {
+      "type": "string"
+     },
+     "notify_previous": {
+      "type": "boolean"
+     }
+    },
+    "required": [
+     "project_key",
+     "agent_name",
+     "file_reservation_id"
+    ],
+    "additionalProperties": false
+   },
+   "description": "Force-release a stale file reservation held by another agent after inactivity heuristics."
+  },
+  {
+   "name": "health_check",
+   "inputSchema": {
+    "type": "object",
+    "properties": {},
+    "required": [],
+    "additionalProperties": false
+   },
+   "description": "Return basic readiness information for the Agent Mail server."
+  },
+  {
+   "name": "install_precommit_guard",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "project_key": {
+      "type": "string"
+     },
+     "code_repo_path": {
+      "type": "string"
+     }
+    },
+    "required": [
+     "project_key",
+     "code_repo_path"
+    ],
+    "additionalProperties": false
+   },
+   "description": ""
+  },
+  {
+   "name": "list_agents",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "project_key": {
+      "type": "string"
+     },
+     "limit": {
+      "type": "integer"
+     },
+     "active_within_days": {
+      "type": "integer"
+     }
+    },
+    "required": [
+     "project_key"
+    ],
+    "additionalProperties": false
+   },
+   "description": "List registered agents in a project, most-recently-active first."
+  },
+  {
+   "name": "list_contacts",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "project_key": {
+      "type": "string"
+     },
+     "agent_name": {
+      "type": "string"
+     }
+    },
+    "required": [
+     "project_key",
+     "agent_name"
+    ],
+    "additionalProperties": false
+   },
+   "description": "List contact links for an agent in a project."
+  },
+  {
+   "name": "macro_contact_handshake",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "project_key": {
+      "type": "string"
+     },
+     "requester": {
+      "type": "string"
+     },
+     "target": {
+      "type": "string"
+     },
+     "agent_name": {
+      "type": "string"
+     },
+     "to_agent": {
+      "type": "string"
+     },
+     "to_project": {
+      "type": "string"
+     },
+     "reason": {
+      "type": "string"
+     },
+     "auto_accept": {
+      "type": "boolean"
+     },
+     "ttl_seconds": {
+      "type": "integer"
+     },
+     "welcome_subject": {
+      "type": "string"
+     },
+     "welcome_body": {
+      "type": "string"
+     },
+     "thread_id": {
+      "type": "string"
+     },
+     "register_if_missing": {
+      "type": "boolean"
+     },
+     "program": {
+      "type": "string"
+     },
+     "model": {
+      "type": "string"
+     },
+     "task_description": {
+      "type": "string"
+     }
+    },
+    "required": [
+     "project_key"
+    ],
+    "additionalProperties": false
+   },
+   "description": "Request contact permissions and optionally auto-approve plus send a welcome message."
+  },
+  {
+   "name": "macro_file_reservation_cycle",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "project_key": {
+      "type": "string"
+     },
+     "agent_name": {
+      "type": "string"
+     },
+     "paths": {
+      "type": "array",
+      "items": {
+       "type": "string"
+      }
+     },
+     "ttl_seconds": {
+      "type": "integer"
+     },
+     "exclusive": {
+      "type": "boolean"
+     },
+     "reason": {
+      "type": "string"
+     },
+     "auto_release": {
+      "type": "boolean"
+     }
+    },
+    "required": [
+     "project_key",
+     "agent_name",
+     "paths"
+    ],
+    "additionalProperties": false
+   },
+   "description": "Reserve a set of file paths and optionally release them at the end of the workflow."
+  },
+  {
+   "name": "macro_prepare_thread",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "project_key": {
+      "type": "string"
+     },
+     "thread_id": {
+      "type": "string"
+     },
+     "program": {
+      "type": "string"
+     },
+     "model": {
+      "type": "string"
+     },
+     "agent_name": {
+      "type": "string"
+     },
+     "task_description": {
+      "type": "string"
+     },
+     "register_if_missing": {
+      "type": "boolean"
+     },
+     "include_examples": {
+      "type": "boolean"
+     },
+     "include_inbox_bodies": {
+      "type": "boolean"
+     },
+     "llm_mode": {
+      "type": "boolean"
+     },
+     "llm_model": {
+      "type": "string"
+     },
+     "inbox_limit": {
+      "type": "integer"
+     },
+     "registration_proof": {
+      "type": "string"
+     }
+    },
+    "required": [
+     "project_key",
+     "thread_id",
+     "program",
+     "model"
+    ],
+    "additionalProperties": false
+   },
+   "description": "Macro helper that aligns an agent with an existing thread by ensuring registration,\nsummarising the thread, and fetching recent inbox context."
+  },
+  {
+   "name": "macro_start_session",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "human_key": {
+      "type": "string"
+     },
+     "program": {
+      "type": "string"
+     },
+     "model": {
+      "type": "string"
+     },
+     "agent_name": {
+      "type": "string"
+     },
+     "task_description": {
+      "type": "string"
+     },
+     "file_reservation_paths": {
+      "type": "array",
+      "items": {
+       "type": "string"
+      }
+     },
+     "file_reservation_reason": {
+      "type": "string"
+     },
+     "file_reservation_ttl_seconds": {
+      "type": "integer"
+     },
+     "inbox_limit": {
+      "type": "integer"
+     },
+     "reaper_exempt": {
+      "type": "boolean"
+     },
+     "pane_id": {
+      "type": "string"
+     },
+     "registration_proof": {
+      "type": "string"
+     }
+    },
+    "required": [
+     "human_key",
+     "program",
+     "model"
+    ],
+    "additionalProperties": false
+   },
+   "description": "Macro helper that boots a project session: ensure project, register agent,\noptionally file_reservation paths, and fetch the latest inbox snapshot."
+  },
+  {
+   "name": "mark_message_read",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "project_key": {
+      "type": "string"
+     },
+     "agent_name": {
+      "type": "string"
+     },
+     "message_id": {
+      "type": "integer"
+     }
+    },
+    "required": [
+     "project_key",
+     "agent_name",
+     "message_id"
+    ],
+    "additionalProperties": false
+   },
+   "description": "Mark a specific message as read for the given agent."
+  },
+  {
+   "name": "products_link",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "product_key": {
+      "type": "string"
+     },
+     "project_key": {
+      "type": "string"
+     }
+    },
+    "required": [
+     "product_key",
+     "project_key"
+    ],
+    "additionalProperties": false
+   },
+   "description": "Link a project into a product (idempotent)."
+  },
+  {
+   "name": "register_agent",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "project_key": {
+      "type": "string"
+     },
+     "program": {
+      "type": "string"
+     },
+     "model": {
+      "type": "string"
+     },
+     "name": {
+      "type": "string"
+     },
+     "task_description": {
+      "type": "string"
+     },
+     "attachments_policy": {
+      "type": "string"
+     },
+     "reaper_exempt": {
+      "type": "boolean"
+     },
+     "pane_id": {
+      "type": "string"
+     },
+     "registration_proof": {
+      "type": "string"
+     }
+    },
+    "required": [
+     "project_key",
+     "program",
+     "model"
+    ],
+    "additionalProperties": false
+   },
+   "description": "Create or update an agent identity within a project and persist its profile to Git."
+  },
+  {
+   "name": "release_build_slot",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "project_key": {
+      "type": "string"
+     },
+     "agent_name": {
+      "type": "string"
+     },
+     "slot": {
+      "type": "string"
+     }
+    },
+    "required": [
+     "project_key",
+     "agent_name",
+     "slot"
+    ],
+    "additionalProperties": false
+   },
+   "description": "Mark an active slot lease as released (non-destructive; keeps JSON with released_ts)."
+  },
+  {
+   "name": "release_file_reservations",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "project_key": {
+      "type": "string"
+     },
+     "agent_name": {
+      "type": "string"
+     },
+     "paths": {
+      "type": "array",
+      "items": {
+       "type": "string"
+      }
+     },
+     "file_reservation_ids": {
+      "type": "array",
+      "items": {
+       "type": "integer"
+      }
+     }
+    },
+    "required": [
+     "project_key",
+     "agent_name"
+    ],
+    "additionalProperties": false
+   },
+   "description": "Release active file reservations held by an agent."
+  },
+  {
+   "name": "renew_build_slot",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "project_key": {
+      "type": "string"
+     },
+     "agent_name": {
+      "type": "string"
+     },
+     "slot": {
+      "type": "string"
+     },
+     "extend_seconds": {
+      "type": "integer"
+     }
+    },
+    "required": [
+     "project_key",
+     "agent_name",
+     "slot"
+    ],
+    "additionalProperties": false
+   },
+   "description": "Extend expiry for an existing build slot lease. No-op if missing."
+  },
+  {
+   "name": "renew_file_reservations",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "project_key": {
+      "type": "string"
+     },
+     "agent_name": {
+      "type": "string"
+     },
+     "extend_seconds": {
+      "type": "integer"
+     },
+     "paths": {
+      "type": "array",
+      "items": {
+       "type": "string"
+      }
+     },
+     "file_reservation_ids": {
+      "type": "array",
+      "items": {
+       "type": "integer"
+      }
+     }
+    },
+    "required": [
+     "project_key",
+     "agent_name"
+    ],
+    "additionalProperties": false
+   },
+   "description": "Extend expiry for active file reservations held by an agent without reissuing them."
+  },
+  {
+   "name": "reply_message",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "project_key": {
+      "type": "string"
+     },
+     "message_id": {
+      "type": "integer"
+     },
+     "sender_name": {
+      "type": "string"
+     },
+     "body_md": {
+      "type": "string"
+     },
+     "to": {
+      "type": "array",
+      "items": {
+       "type": "string"
+      }
+     },
+     "cc": {
+      "type": "array",
+      "items": {
+       "type": "string"
+      }
+     },
+     "bcc": {
+      "type": "array",
+      "items": {
+       "type": "string"
+      }
+     },
+     "subject_prefix": {
+      "type": "string"
+     },
+     "importance": {
+      "type": "string"
+     },
+     "ack_required": {
+      "type": "boolean"
+     },
+     "attachment_paths": {
+      "type": "array",
+      "items": {
+       "type": "string"
+      }
+     },
+     "convert_images": {
+      "type": "boolean"
+     },
+     "sender_token": {
+      "type": "string"
+     }
+    },
+    "required": [
+     "project_key",
+     "message_id",
+     "sender_name",
+     "body_md"
+    ],
+    "additionalProperties": false
+   },
+   "description": "Reply to an existing message, preserving or establishing a thread."
+  },
+  {
+   "name": "request_contact",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "project_key": {
+      "type": "string"
+     },
+     "from_agent": {
+      "type": "string"
+     },
+     "to_agent": {
+      "type": "string"
+     },
+     "to_project": {
+      "type": "string"
+     },
+     "reason": {
+      "type": "string"
+     },
+     "ttl_seconds": {
+      "type": "integer"
+     },
+     "register_if_missing": {
+      "type": "boolean"
+     },
+     "program": {
+      "type": "string"
+     },
+     "model": {
+      "type": "string"
+     },
+     "task_description": {
+      "type": "string"
+     }
+    },
+    "required": [
+     "project_key",
+     "from_agent",
+     "to_agent"
+    ],
+    "additionalProperties": false
+   },
+   "description": "Request contact approval to message another agent."
+  },
+  {
+   "name": "resolve_pane_identity",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "project_key": {
+      "type": "string"
+     },
+     "pane_id": {
+      "type": "string"
+     }
+    },
+    "required": [
+     "project_key"
+    ],
+    "additionalProperties": false
+   },
+   "description": "Resolve the agent name for a tmux pane from the canonical per-pane identity file."
+  },
+  {
+   "name": "respond_contact",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "project_key": {
+      "type": "string"
+     },
+     "to_agent": {
+      "type": "string"
+     },
+     "from_agent": {
+      "type": "string"
+     },
+     "from_project": {
+      "type": "string"
+     },
+     "accept": {
+      "type": "boolean"
+     },
+     "ttl_seconds": {
+      "type": "integer"
+     }
+    },
+    "required": [
+     "project_key",
+     "to_agent",
+     "from_agent",
+     "accept"
+    ],
+    "additionalProperties": false
+   },
+   "description": "Approve or deny a contact request."
+  },
+  {
+   "name": "search_messages",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "project_key": {
+      "type": "string"
+     },
+     "query": {
+      "type": "string"
+     },
+     "limit": {
+      "type": "integer"
+     },
+     "offset": {
+      "type": "integer"
+     },
+     "cursor": {
+      "type": "string"
+     },
+     "ranking": {
+      "type": "string"
+     },
+     "sender": {
+      "type": "string"
+     },
+     "from_agent": {
+      "type": "string"
+     },
+     "sender_name": {
+      "type": "string"
+     },
+     "importance": {
+      "type": "string"
+     },
+     "thread_id": {
+      "type": "string"
+     },
+     "date_start": {
+      "type": "string"
+     },
+     "date_end": {
+      "type": "string"
+     },
+     "date_from": {
+      "type": "string"
+     },
+     "date_to": {
+      "type": "string"
+     },
+     "after": {
+      "type": "string"
+     },
+     "before": {
+      "type": "string"
+     },
+     "since": {
+      "type": "string"
+     },
+     "until": {
+      "type": "string"
+     },
+     "explain": {
+      "type": "boolean"
+     },
+     "include_body_md": {
+      "type": "boolean"
+     }
+    },
+    "required": [
+     "project_key",
+     "query"
+    ],
+    "additionalProperties": false
+   },
+   "description": "Search over subject and body for a project using the unified Search V3 service."
+  },
+  {
+   "name": "search_messages_product",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "product_key": {
+      "type": "string"
+     },
+     "query": {
+      "type": "string"
+     },
+     "limit": {
+      "type": "integer"
+     },
+     "cursor": {
+      "type": "string"
+     },
+     "project": {
+      "type": "string"
+     },
+     "project_key_filter": {
+      "type": "string"
+     },
+     "project_slug": {
+      "type": "string"
+     },
+     "proj": {
+      "type": "string"
+     },
+     "sender": {
+      "type": "string"
+     },
+     "from_agent": {
+      "type": "string"
+     },
+     "sender_name": {
+      "type": "string"
+     },
+     "importance": {
+      "type": "string"
+     },
+     "thread_id": {
+      "type": "string"
+     },
+     "ranking": {
+      "type": "string"
+     },
+     "date_start": {
+      "type": "string"
+     },
+     "date_end": {
+      "type": "string"
+     },
+     "date_from": {
+      "type": "string"
+     },
+     "date_to": {
+      "type": "string"
+     },
+     "after": {
+      "type": "string"
+     },
+     "before": {
+      "type": "string"
+     },
+     "since": {
+      "type": "string"
+     },
+     "until": {
+      "type": "string"
+     },
+     "include_body_md": {
+      "type": "boolean"
+     }
+    },
+    "required": [
+     "product_key",
+     "query"
+    ],
+    "additionalProperties": false
+   },
+   "description": "Search across all projects linked to a product using the unified Search V3 service."
+  },
+  {
+   "name": "send_message",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "project_key": {
+      "type": "string"
+     },
+     "sender_name": {
+      "type": "string"
+     },
+     "to": {
+      "type": "array",
+      "items": {
+       "type": "string"
+      }
+     },
+     "subject": {
+      "type": "string"
+     },
+     "body_md": {
+      "type": "string"
+     },
+     "cc": {
+      "type": "array",
+      "items": {
+       "type": "string"
+      }
+     },
+     "bcc": {
+      "type": "array",
+      "items": {
+       "type": "string"
+      }
+     },
+     "attachment_paths": {
+      "type": "array",
+      "items": {
+       "type": "string"
+      }
+     },
+     "convert_images": {
+      "type": "boolean"
+     },
+     "importance": {
+      "type": "string"
+     },
+     "ack_required": {
+      "type": "boolean"
+     },
+     "thread_id": {
+      "type": "string"
+     },
+     "topic": {
+      "type": "string"
+     },
+     "broadcast": {
+      "type": "boolean"
+     },
+     "auto_contact_if_blocked": {
+      "type": "boolean"
+     },
+     "sender_token": {
+      "type": "string"
+     }
+    },
+    "required": [
+     "project_key",
+     "sender_name",
+     "to",
+     "subject",
+     "body_md"
+    ],
+    "additionalProperties": false
+   },
+   "description": "Send a Markdown message to one or more recipients and persist canonical and mailbox copies to Git."
+  },
+  {
+   "name": "set_contact_policy",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "project_key": {
+      "type": "string"
+     },
+     "agent_name": {
+      "type": "string"
+     },
+     "policy": {
+      "type": "string"
+     }
+    },
+    "required": [
+     "project_key",
+     "agent_name",
+     "policy"
+    ],
+    "additionalProperties": false
+   },
+   "description": "Set contact policy for an agent: open | auto | contacts_only | block_all."
+  },
+  {
+   "name": "summarize_thread",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "project_key": {
+      "type": "string"
+     },
+     "thread_id": {
+      "type": "string"
+     },
+     "include_examples": {
+      "type": "boolean"
+     },
+     "llm_mode": {
+      "type": "boolean"
+     },
+     "llm_model": {
+      "type": "string"
+     },
+     "per_thread_limit": {
+      "type": "integer"
+     }
+    },
+    "required": [
+     "project_key",
+     "thread_id"
+    ],
+    "additionalProperties": false
+   },
+   "description": "Extract participants, key points, and action items for one or more threads."
+  },
+  {
+   "name": "summarize_thread_product",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "product_key": {
+      "type": "string"
+     },
+     "thread_id": {
+      "type": "string"
+     },
+     "include_examples": {
+      "type": "boolean"
+     },
+     "llm_mode": {
+      "type": "boolean"
+     },
+     "llm_model": {
+      "type": "string"
+     },
+     "per_thread_limit": {
+      "type": "integer"
+     }
+    },
+    "required": [
+     "product_key",
+     "thread_id"
+    ],
+    "additionalProperties": false
+   },
+   "description": "Summarize a thread (by id or thread key) across all projects linked to a product."
+  },
+  {
+   "name": "uninstall_precommit_guard",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "code_repo_path": {
+      "type": "string"
+     }
+    },
+    "required": [
+     "code_repo_path"
+    ],
+    "additionalProperties": false
+   },
+   "description": ""
+  },
+  {
+   "name": "whois",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "project_key": {
+      "type": "string"
+     },
+     "agent_name": {
+      "type": "string"
+     },
+     "include_recent_commits": {
+      "type": "boolean"
+     },
+     "commit_limit": {
+      "type": "integer"
+     }
+    },
+    "required": [
+     "project_key",
+     "agent_name"
+    ],
+    "additionalProperties": false
+   },
+   "description": "Return enriched profile details for an agent, optionally including recent archive commits."
+  }
+ ]
+}
