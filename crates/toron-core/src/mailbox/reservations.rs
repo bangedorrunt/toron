@@ -410,7 +410,10 @@ impl Mailbox {
 
     /// Active (non-revoked, non-expired) reservations in a project, resolved
     /// with operator priority (bd-toh).
-    async fn active_reservations(&self, project_slug: &str) -> anyhow::Result<Vec<Reservation>> {
+    pub(crate) async fn active_reservations(
+        &self,
+        project_slug: &str,
+    ) -> anyhow::Result<Vec<Reservation>> {
         let filter = kind_project_filter(toron_kind(FILE_RESERVATION), project_slug);
         let events = collect_replay(self.bus.as_ref(), filter).await?;
         let operator = self.operator.as_ref().map(|k| k.public_key());
