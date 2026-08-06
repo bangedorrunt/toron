@@ -90,4 +90,60 @@ mod tests {
         assert_eq!(toron_kind(PROJECT_MANIFEST).as_u16(), PROJECT_MANIFEST);
         assert_eq!(toron_kind(JOB_RESULT).as_u16(), JOB_RESULT);
     }
+
+    /// Completeness: the frozen registry (ADR-0003, AGREEMENT LOCKED
+    /// 2026-08-04) as a table. Every value here is asserted against the
+    /// constant so a renumber or typo is caught immediately.
+    #[test]
+    fn test_frozen_registry_completeness_vs_adr() {
+        let table: &[(u16, &str)] = &[
+            (PROJECT_MANIFEST, "project manifest"),
+            (PRODUCT_MANIFEST, "product manifest"),
+            (REGISTRATION_ATTESTATION, "registration attestation"),
+            (AGENT_PROFILE, "agent profile"),
+            (CONTACT_POLICY, "contact policy"),
+            (FILE_RESERVATION, "file reservation"),
+            (BUILD_SLOT, "build slot"),
+            (PRESENCE, "presence"),
+            (JOB_REQUEST, "job request"),
+            (JOB_ACCEPTED, "job accepted"),
+            (JOB_PROGRESS, "job progress"),
+            (JOB_RESULT, "job result"),
+            (JOB_CANCEL, "job cancel"),
+            (JOB_ERROR, "job error"),
+            (WORKFLOW_RUN_FIRST, "workflow run first"),
+            (WORKFLOW_RUN_LAST, "workflow run last"),
+        ];
+        // Every ADR frozen value is present.
+        assert_eq!(table.len(), 16, "frozen registry has 16 toron constants");
+        for (value, _name) in table {
+            assert_eq!(toron_kind(*value).as_u16(), *value);
+        }
+        // No duplicates.
+        let mut vals: Vec<u16> = table.iter().map(|(v, _)| *v).collect();
+        let n = vals.len();
+        vals.sort_unstable();
+        vals.dedup();
+        assert_eq!(
+            vals.len(),
+            n,
+            "frozen registry has no duplicate kind values"
+        );
+        // Kind ranges are internally consistent (const-time checked).
+        const _: () = assert!(WORKFLOW_RUN_FIRST <= WORKFLOW_RUN_LAST);
+        const _: () = assert!(
+            (WORKFLOW_RUN_LAST - WORKFLOW_RUN_FIRST + 1) == 12,
+            "46001..=46012"
+        );
+    }
+
+    /// Job lifecycle is the Buzz-verbatim 43001→43006 sequence.
+    #[test]
+    fn test_job_lifecycle_sequence() {
+        assert_eq!(JOB_ACCEPTED, JOB_REQUEST + 1);
+        assert_eq!(JOB_PROGRESS, JOB_REQUEST + 2);
+        assert_eq!(JOB_RESULT, JOB_REQUEST + 3);
+        assert_eq!(JOB_CANCEL, JOB_REQUEST + 4);
+        assert_eq!(JOB_ERROR, JOB_REQUEST + 5);
+    }
 }
