@@ -7,10 +7,14 @@
 //! (channels) vs `RelayBus` (WS) without tool changes. Events are
 //! wire-identical across both.
 
+pub mod event_store;
 pub mod filter;
+pub mod in_process;
 pub mod subscription;
 
+pub use event_store::BusEventStore;
 pub use filter::{project_filter, Filter, LabelValue};
+pub use in_process::InProcessBus;
 pub use subscription::{Subscription, SubscriptionEvent, SubscriptionId};
 
 use nostr_sdk::nostr::Event;
