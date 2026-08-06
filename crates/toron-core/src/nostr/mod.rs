@@ -6,4 +6,5 @@
 //! Pure — no I/O. Every bus publish goes through [`event::build_event`].
 
 pub mod event;
+pub mod gift_wrap;
 pub mod kinds;

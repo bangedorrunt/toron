@@ -58,7 +58,10 @@ pub fn verify_event(event: &Event) -> Result<(), VerifyError> {
 }
 
 /// Verify an event against an expected author, rejecting any other pubkey.
-pub fn verify_event_author(event: &Event, expected: &nostr_sdk::nostr::PublicKey) -> Result<(), VerifyError> {
+pub fn verify_event_author(
+    event: &Event,
+    expected: &nostr_sdk::nostr::PublicKey,
+) -> Result<(), VerifyError> {
     verify_event(event)?;
     if &event.pubkey != expected {
         return Err(VerifyError::BadSignature);
@@ -78,18 +81,20 @@ mod tests {
 
     // Fixed test keypair: secret key 0x01 → known pubkey (NIP-19-style hex).
     fn test_keys() -> Keys {
-        let sk = SecretKey::from_hex(
-            "0000000000000000000000000000000000000000000000000000000000000001",
-        )
-        .expect("valid secret key");
+        let sk =
+            SecretKey::from_hex("0000000000000000000000000000000000000000000000000000000000000001")
+                .expect("valid secret key");
         Keys::new(sk)
     }
 
     fn sample_tags() -> Vec<Tag> {
         vec![
             Tag::parse(["t", "demo"]).expect("valid tag"),
-            Tag::parse(["p", "f86c44a2de95d9149b51c6a29afeabba264c18e2fa7c49de93424a0c56947785"])
-                .expect("valid tag"),
+            Tag::parse([
+                "p",
+                "f86c44a2de95d9149b51c6a29afeabba264c18e2fa7c49de93424a0c56947785",
+            ])
+            .expect("valid tag"),
         ]
     }
 
@@ -147,8 +152,10 @@ mod tests {
         .expect("build ok");
         // Same inputs → same canonical id (sig is randomized by BIP-340 aux-rand).
         assert_eq!(event.id, event2.id);
-        assert_eq!(event.as_json()[..event.as_json().rfind(r#","sig":"#).unwrap()],
-                   event2.as_json()[..event2.as_json().rfind(r#","sig":"#).unwrap()]);
+        assert_eq!(
+            event.as_json()[..event.as_json().rfind(r#","sig":"#).unwrap()],
+            event2.as_json()[..event2.as_json().rfind(r#","sig":"#).unwrap()]
+        );
     }
 
     #[test]
@@ -228,8 +235,8 @@ mod tests {
         // Flip a byte in the signature (keep id + rest intact).
         let mut sig_bytes = event.sig.serialize();
         sig_bytes[0] ^= 0xFF;
-        let bad_sig = nostr_sdk::secp256k1::schnorr::Signature::from_slice(&sig_bytes)
-            .expect("sig parse");
+        let bad_sig =
+            nostr_sdk::secp256k1::schnorr::Signature::from_slice(&sig_bytes).expect("sig parse");
 
         let forged = Event::new(
             event.id,
