@@ -615,6 +615,7 @@ mod tests {
             name: name.into(),
             program: Some("opencode".into()),
             model: None,
+            persona: None,
             task_description: None,
         }
     }

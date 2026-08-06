@@ -317,6 +317,7 @@ mod tests {
             program: Some("opencode".into()),
             model: Some("deepseek-v4".into()),
             task_description: Some("lane test agent".into()),
+            persona: None,
         }
     }
 
