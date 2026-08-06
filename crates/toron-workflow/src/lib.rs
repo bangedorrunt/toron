@@ -14,6 +14,7 @@
 //! this crate is deliberately engine-free.
 
 pub mod channels;
+pub mod coalesce;
 pub mod dispatch;
 pub mod engine;
 pub mod jobs;
@@ -26,6 +27,10 @@ pub use channels::{
     REACTION,
 };
 
+pub use coalesce::{
+    CoalesceDecision, Coalesced, FlushOutcome, InboundMention, MentionCoalescer,
+    DEFAULT_MAX_BUFFER, DEFAULT_SUBWINDOW, DEFAULT_WINDOW, subwindow_from_env, window_from_env,
+};
 pub use dispatch::{DispatchConfig, DispatchPermit, DispatchPool, QueuedJob};
 pub use engine::{run_workflow, ActionRunner, Decision, RunInput, WorkflowEngine};
 pub use jobs::{
