@@ -10,12 +10,16 @@
 pub mod event_store;
 pub mod filter;
 pub mod in_process;
+#[cfg(test)]
+mod mock_relay;
+pub mod relay_bus;
 pub mod scoping;
 pub mod subscription;
 
 pub use event_store::BusEventStore;
 pub use filter::{project_filter, Filter, LabelValue};
 pub use in_process::InProcessBus;
+pub use relay_bus::{RelayBus, RelayBusConfig, RelayConfig, RelayRole};
 pub use scoping::{is_metadata_hiding_kind, project_scoping_tags, with_project_scoping};
 pub use subscription::{Subscription, SubscriptionEvent, SubscriptionId};
 

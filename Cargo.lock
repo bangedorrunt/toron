@@ -3321,6 +3321,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum",
+ "futures-util",
  "git2",
  "nostr-sdk",
  "parking_lot",
