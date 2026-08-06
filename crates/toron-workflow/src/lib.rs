@@ -13,10 +13,20 @@
 //! Resonate durability (the Buzz WF-08 crash-resume fix) is wired by bd-oge;
 //! this crate is deliberately engine-free.
 
+pub mod dispatch;
+pub mod jobs;
 pub mod lint;
+pub mod mention;
 pub mod schema;
 
+pub use dispatch::{DispatchConfig, DispatchPermit, DispatchPool, QueuedJob};
+pub use jobs::{
+    build_and_serialize, build_job_cancel, build_job_claim, build_job_error, build_job_progress,
+    build_job_request, build_job_result, first_claimer, job_parent, job_request_json, job_state,
+    JobError, JobRequest, JobResult, JobState,
+};
 pub use lint::{lint_workflow, lint_yaml, Level, LintIssue, LintReport};
+pub use mention::{content_mentions, is_mention, parse_mentions, Mention};
 pub use schema::{
     parse_workflow, parse_workflows, Action, Step, TemplateContext, Trigger, Workflow,
 };

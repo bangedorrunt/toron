@@ -1,0 +1,434 @@
+// governed-by: ADR-0003
+#![forbid(unsafe_code)]
+
+//! Job lifecycle 43001–43006 (bd-yt2), Buzz-verbatim.
+//!
+//! kind-as-dispatch: a job is `43001` request → `43002` accepted/claim (signed
+//! by the claiming agent, **first-claimer wins**) → `43003` progress (optional)
+//! → `43004` result; `43005` cancel; `43006` error. The `kind` is the only
+//! switch — new lifecycle states never renumber existing kinds (ADR-0003
+//! frozen registry).
+//!
+//! Claim resolution on the InProcessBus is a **total order** — the first
+//! observed `43002` for a `(job-id, e)` wins. Federated claim races (two
+//! agents claim on different relays simultaneously) are a P2.2 problem when
+//! RelayBus lands; this module documents that boundary.
+
+use serde::{Deserialize, Serialize};
+
+use nostr_sdk::nostr::{Event, EventId, JsonUtil, Kind, Tag, Timestamp};
+
+use toron_core::nostr::event::build_event;
+use toron_core::nostr::kinds::{
+    toron_kind, JOB_ACCEPTED, JOB_CANCEL, JOB_ERROR, JOB_PROGRESS, JOB_REQUEST, JOB_RESULT,
+};
+
+/// A job request payload (kind-43001 `content`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobRequest {
+    /// The job title/summary.
+    pub title: String,
+    /// Free-form job spec (JSON — e.g. `{"task": "fix flaky test"}`).
+    #[serde(default)]
+    pub spec: serde_json::Value,
+    /// Assigned agent name (optional; when set the request targets that agent).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assignee: Option<String>,
+}
+
+impl JobRequest {
+    /// New request.
+    pub fn new(title: impl Into<String>, spec: serde_json::Value) -> Self {
+        Self {
+            title: title.into(),
+            spec,
+            assignee: None,
+        }
+    }
+}
+
+/// A job result payload (kind-43004).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobResult {
+    /// Terminal status.
+    pub status: String,
+    /// Outcome body.
+    #[serde(default)]
+    pub body: String,
+}
+
+/// A job error payload (kind-43006).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobError {
+    /// Error message.
+    pub message: String,
+}
+
+/// Build a job request (kind-43001) with `["e", <parent>]` linking to the
+/// triggering message (per beads-review: channel-agnostic; the parent may be a
+/// kind-14 DM or kind-9 channel message).
+pub fn build_job_request(
+    requester: &nostr_sdk::nostr::Keys,
+    parent: EventId,
+    payload: &JobRequest,
+    created_at: Timestamp,
+) -> Result<Event, nostr_sdk::nostr::event::builder::Error> {
+    let mut tags = vec![Tag::event(parent)];
+    if let Some(assignee) = &payload.assignee {
+        tags.push(Tag::parse(["t", assignee]).expect("assignee tag"));
+    }
+    build_event(
+        requester,
+        toron_kind(JOB_REQUEST),
+        serde_json::to_string(payload).expect("job request serializes"),
+        tags,
+        created_at,
+    )
+}
+
+/// Build a job claim (kind-43002) referencing the job request via `e`.
+pub fn build_job_claim(
+    claimer: &nostr_sdk::nostr::Keys,
+    job_request: EventId,
+    created_at: Timestamp,
+) -> Result<Event, nostr_sdk::nostr::event::builder::Error> {
+    build_event(
+        claimer,
+        toron_kind(JOB_ACCEPTED),
+        r#"{"claimed":true}"#,
+        vec![Tag::event(job_request)],
+        created_at,
+    )
+}
+
+/// Build a job progress update (kind-43003, optional).
+pub fn build_job_progress(
+    agent: &nostr_sdk::nostr::Keys,
+    job_request: EventId,
+    note: &str,
+    created_at: Timestamp,
+) -> Result<Event, nostr_sdk::nostr::event::builder::Error> {
+    build_event(
+        agent,
+        toron_kind(JOB_PROGRESS),
+        note.to_string(),
+        vec![Tag::event(job_request)],
+        created_at,
+    )
+}
+
+/// Build a job result (kind-43004) closing the lifecycle.
+pub fn build_job_result(
+    agent: &nostr_sdk::nostr::Keys,
+    job_request: EventId,
+    result: &JobResult,
+    created_at: Timestamp,
+) -> Result<Event, nostr_sdk::nostr::event::builder::Error> {
+    build_event(
+        agent,
+        toron_kind(JOB_RESULT),
+        serde_json::to_string(result).expect("job result serializes"),
+        vec![Tag::event(job_request)],
+        created_at,
+    )
+}
+
+/// Build a job cancel (kind-43005).
+pub fn build_job_cancel(
+    canceller: &nostr_sdk::nostr::Keys,
+    job_request: EventId,
+    reason: &str,
+    created_at: Timestamp,
+) -> Result<Event, nostr_sdk::nostr::event::builder::Error> {
+    build_event(
+        canceller,
+        toron_kind(JOB_CANCEL),
+        reason.to_string(),
+        vec![Tag::event(job_request)],
+        created_at,
+    )
+}
+
+/// Build a job error (kind-43006) — failed-with-error terminal state.
+pub fn build_job_error(
+    agent: &nostr_sdk::nostr::Keys,
+    job_request: EventId,
+    error: &JobError,
+    created_at: Timestamp,
+) -> Result<Event, nostr_sdk::nostr::event::builder::Error> {
+    build_event(
+        agent,
+        toron_kind(JOB_ERROR),
+        serde_json::to_string(error).expect("job error serializes"),
+        vec![Tag::event(job_request)],
+        created_at,
+    )
+}
+
+/// The parent (job) event id a job-lifecycle event references (`e` tag).
+pub fn job_parent(event: &Event) -> Option<EventId> {
+    event
+        .tags
+        .iter()
+        .find(|t| t.as_slice().first().map(String::as_str) == Some("e"))
+        .and_then(|t| t.as_slice().get(1))
+        .and_then(|s| EventId::from_hex(s).ok())
+}
+
+/// Resolve the claiming agent for a job: the author of the FIRST observed
+/// kind-43002 referencing the job (InProcessBus total order → deterministic).
+///
+/// Returns `None` when no claim is present. A subsequent 43002 by another
+/// agent is ignored (first-claimer wins); the function returns the first.
+pub fn first_claimer(job: EventId, claims: &[Event]) -> Option<String> {
+    claims
+        .iter()
+        .filter(|e| e.kind == toron_kind(JOB_ACCEPTED) && job_parent(e) == Some(job))
+        .min_by_key(|e| (e.created_at.as_secs(), e.id.to_hex()))
+        .map(|e| e.pubkey.to_hex())
+}
+
+/// The job's current state given the full event stream (request..result).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JobState {
+    Open,
+    Claimed(String),
+    InProgress(String),
+    Done(String),
+    Cancelled,
+    Failed(String),
+}
+
+/// Compute a job's state from the events referencing it. The lifecycle is:
+/// request → (claim → progress*) → result|cancel|error. Terminal states win.
+pub fn job_state(job: EventId, events: &[Event]) -> JobState {
+    let job_events: Vec<&Event> = events
+        .iter()
+        .filter(|e| job_parent(e) == Some(job))
+        .collect();
+
+    // Terminal states take priority (result, error, cancel).
+    for ev in job_events.iter() {
+        match ev.kind.as_u16() {
+            JOB_RESULT => {
+                let r: JobResult = serde_json::from_str(&ev.content).unwrap_or(JobResult {
+                    status: "done".into(),
+                    body: ev.content.clone(),
+                });
+                return JobState::Done(r.status);
+            }
+            JOB_ERROR => {
+                let e: JobError = serde_json::from_str(&ev.content).unwrap_or(JobError {
+                    message: "error".into(),
+                });
+                return JobState::Failed(e.message);
+            }
+            JOB_CANCEL => return JobState::Cancelled,
+            _ => {}
+        }
+    }
+
+    // Non-terminal: claim (and optional progress) drive the state.
+    let job_events_owned: Vec<Event> = job_events.iter().map(|e| (*e).clone()).collect();
+    if let Some(claimer) = first_claimer(job, &job_events_owned) {
+        let has_progress = job_events.iter().any(|e| e.kind.as_u16() == JOB_PROGRESS);
+        if has_progress {
+            JobState::InProgress(claimer)
+        } else {
+            JobState::Claimed(claimer)
+        }
+    } else {
+        JobState::Open
+    }
+}
+
+/// The kind-43001 request as JSON (wire-identical, relay-acceptable).
+pub fn job_request_json(event: &Event) -> String {
+    event.as_json()
+}
+
+/// Convenience: build a job request event and serialize (round-trip helper).
+pub fn build_and_serialize(
+    requester: &nostr_sdk::nostr::Keys,
+    parent: EventId,
+    payload: &JobRequest,
+    created_at: Timestamp,
+) -> Result<String, nostr_sdk::nostr::event::builder::Error> {
+    build_job_request(requester, parent, payload, created_at).map(|e| e.as_json())
+}
+
+// Keep Kind import used for the trait-bound docs.
+#[allow(unused_imports)]
+use Kind as _Kind;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nostr_sdk::nostr::{Keys, Timestamp};
+
+    const TS: u64 = 1_700_000_000;
+
+    fn keys() -> Keys {
+        Keys::generate()
+    }
+
+    #[test]
+    fn job_request_roundtrip_wire_identical() {
+        let requester = keys();
+        let parent =
+            EventId::from_hex("b32828720d7e8a80dd5165a6cd31b2c70e8d25b83c387209cb138e77d7e7e05b")
+                .expect("id");
+        let payload = JobRequest::new("fix flaky", serde_json::json!({"task": "triage"}));
+        let ev =
+            build_job_request(&requester, parent, &payload, Timestamp::from(TS)).expect("build");
+        assert_eq!(ev.kind.as_u16(), JOB_REQUEST);
+        assert_eq!(job_parent(&ev), Some(parent), "e tag links parent");
+        let parsed = Event::from_json(ev.as_json()).expect("parse");
+        assert_eq!(parsed, ev, "wire-identical roundtrip");
+        assert!(
+            toron_core::nostr::event::verify_event(&ev).is_ok(),
+            "signed"
+        );
+    }
+
+    #[test]
+    fn claim_first_wins_on_total_order() {
+        let job =
+            EventId::from_hex("b32828720d7e8a80dd5165a6cd31b2c70e8d25b83c387209cb138e77d7e7e05b")
+                .expect("job id");
+        let a = keys();
+        let b = keys();
+        let claim_a = build_job_claim(&a, job, Timestamp::from(TS)).expect("claim a");
+        let claim_b = build_job_claim(&b, job, Timestamp::from(TS + 1)).expect("claim b");
+
+        // First observed claim (a) wins, regardless of insertion order.
+        let winner = first_claimer(job, &[claim_b.clone(), claim_a.clone()]);
+        assert_eq!(winner, Some(a.public_key().to_hex()));
+        assert_eq!(
+            first_claimer(job, &[claim_a, claim_b]),
+            Some(a.public_key().to_hex())
+        );
+    }
+
+    #[test]
+    fn no_claim_means_open() {
+        let job =
+            EventId::from_hex("b32828720d7e8a80dd5165a6cd31b2c70e8d25b83c387209cb138e77d7e7e05b")
+                .expect("job id");
+        let requester = keys();
+        let req = build_job_request(
+            &requester,
+            job,
+            &JobRequest::new("x", serde_json::json!({})),
+            Timestamp::from(TS),
+        )
+        .expect("req");
+        assert_eq!(job_state(job, &[req]), JobState::Open);
+    }
+
+    #[test]
+    fn lifecycle_reaches_result() {
+        let job =
+            EventId::from_hex("b32828720d7e8a80dd5165a6cd31b2c70e8d25b83c387209cb138e77d7e7e05b")
+                .expect("job id");
+        let requester = keys();
+        let claimer = keys();
+        let req = build_job_request(
+            &requester,
+            job,
+            &JobRequest::new("x", serde_json::json!({})),
+            Timestamp::from(TS),
+        )
+        .expect("req");
+        let claim = build_job_claim(&claimer, job, Timestamp::from(TS + 1)).expect("claim");
+        let progress = build_job_progress(&claimer, job, "working", Timestamp::from(TS + 2))
+            .expect("progress");
+        let result = build_job_result(
+            &claimer,
+            job,
+            &JobResult {
+                status: "ok".into(),
+                body: "done".into(),
+            },
+            Timestamp::from(TS + 3),
+        )
+        .expect("result");
+
+        let events = vec![req, claim, progress, result];
+        assert_eq!(job_state(job, &events), JobState::Done("ok".into()));
+    }
+
+    #[test]
+    fn error_is_terminal() {
+        let job =
+            EventId::from_hex("b32828720d7e8a80dd5165a6cd31b2c70e8d25b83c387209cb138e77d7e7e05b")
+                .expect("job id");
+        let requester = keys();
+        let claimer = keys();
+        let req = build_job_request(
+            &requester,
+            job,
+            &JobRequest::new("x", serde_json::json!({})),
+            Timestamp::from(TS),
+        )
+        .expect("req");
+        let claim = build_job_claim(&claimer, job, Timestamp::from(TS + 1)).expect("claim");
+        let err = build_job_error(
+            &claimer,
+            job,
+            &JobError {
+                message: "boom".into(),
+            },
+            Timestamp::from(TS + 2),
+        )
+        .expect("err");
+        let events = vec![req, claim, err];
+        assert_eq!(job_state(job, &events), JobState::Failed("boom".into()));
+    }
+
+    #[test]
+    fn cancel_is_terminal() {
+        let job =
+            EventId::from_hex("b32828720d7e8a80dd5165a6cd31b2c70e8d25b83c387209cb138e77d7e7e05b")
+                .expect("job id");
+        let requester = keys();
+        let req = build_job_request(
+            &requester,
+            job,
+            &JobRequest::new("x", serde_json::json!({})),
+            Timestamp::from(TS),
+        )
+        .expect("req");
+        let cancel = build_job_cancel(&requester, job, "not needed", Timestamp::from(TS + 1))
+            .expect("cancel");
+        let events = vec![req, cancel];
+        assert_eq!(job_state(job, &events), JobState::Cancelled);
+    }
+
+    #[test]
+    fn claimed_and_in_progress_states() {
+        let job =
+            EventId::from_hex("b32828720d7e8a80dd5165a6cd31b2c70e8d25b83c387209cb138e77d7e7e05b")
+                .expect("job id");
+        let requester = keys();
+        let claimer = keys();
+        let req = build_job_request(
+            &requester,
+            job,
+            &JobRequest::new("x", serde_json::json!({})),
+            Timestamp::from(TS),
+        )
+        .expect("req");
+        let claim = build_job_claim(&claimer, job, Timestamp::from(TS + 1)).expect("claim");
+        assert_eq!(
+            job_state(job, &[req.clone(), claim.clone()]),
+            JobState::Claimed(claimer.public_key().to_hex())
+        );
+        let progress = build_job_progress(&claimer, job, "working", Timestamp::from(TS + 2))
+            .expect("progress");
+        assert_eq!(
+            job_state(job, &[req, claim, progress]),
+            JobState::InProgress(claimer.public_key().to_hex())
+        );
+    }
+}
