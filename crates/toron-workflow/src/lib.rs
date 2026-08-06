@@ -13,12 +13,18 @@
 //! Resonate durability (the Buzz WF-08 crash-resume fix) is wired by bd-oge;
 //! this crate is deliberately engine-free.
 
+pub mod channels;
 pub mod dispatch;
 pub mod engine;
 pub mod jobs;
 pub mod lint;
 pub mod mention;
 pub mod schema;
+
+pub use channels::{
+    Channel, ChannelEvent, ChannelStore, CHANNEL_CREATE, CHANNEL_MESSAGE, CHANNEL_METADATA,
+    REACTION,
+};
 
 pub use dispatch::{DispatchConfig, DispatchPermit, DispatchPool, QueuedJob};
 pub use engine::{run_workflow, ActionRunner, Decision, RunInput, WorkflowEngine};
