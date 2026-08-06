@@ -17,13 +17,13 @@ use clap::{Args, Parser, Subcommand};
 ///   toron status
 ///   toron status --json
 #[derive(Debug, Parser)]
-#[command(name = "toron", version, about, arg_required_else_help = true)]
+#[command(name = "toron", version, about)]
 pub struct Cli {
     #[command(flatten)]
     pub globals: Globals,
 
     #[command(subcommand)]
-    pub command: Command,
+    pub command: Option<Command>,
 }
 
 /// Global flags (clig.dev: flags > env > project config > user config > system).
@@ -64,6 +64,19 @@ pub struct Globals {
     /// Output to file (commands that write artifacts).
     #[arg(short, long, global = true)]
     pub output: Option<PathBuf>,
+
+    // --- robot mode (bd-led.8.4): agent-driver global flags (ADR-0003).
+    /// Emit a full robot state snapshot (JSON) and exit.
+    #[arg(long, global = true)]
+    pub robot_snapshot: bool,
+
+    /// Emit a minimal robot status (JSON) and exit.
+    #[arg(long, global = true)]
+    pub robot_status: bool,
+
+    /// Emit the robot capability/role map (JSON) and exit.
+    #[arg(long, global = true)]
+    pub robot_capabilities: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -120,6 +133,9 @@ pub enum Command {
     /// Backend selection: list/status/default.
     #[command(subcommand)]
     Backend(BackendCommand),
+
+    /// Bench a mailbox scenario (startup/inbox/send/search/threads). AM-Rust parity.
+    Bench(BenchArgs),
 }
 
 #[derive(Debug, Args)]
@@ -688,4 +704,33 @@ pub struct BackendDefaultArgs {
     /// herdr|tmux.
     #[arg(value_enum)]
     pub backend: BackendArg,
+}
+
+#[derive(Debug, Args)]
+pub struct BenchArgs {
+    /// Scenario: startup|inbox|send|search|threads.
+    #[arg(value_enum)]
+    pub case: BenchCaseArg,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum BenchCaseArg {
+    Startup,
+    Inbox,
+    Send,
+    Search,
+    Threads,
+}
+
+impl BenchCaseArg {
+    /// The AM-Rust parity case name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Startup => "startup",
+            Self::Inbox => "inbox",
+            Self::Send => "send",
+            Self::Search => "search",
+            Self::Threads => "threads",
+        }
+    }
 }
