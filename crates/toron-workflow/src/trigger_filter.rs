@@ -158,7 +158,7 @@ pub fn should_evaluate_trigger_kind(kind: u16) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nostr_sdk::nostr::{Event, EventId, JsonUtil, Keys, Kind, Tag, Timestamp};
+    use nostr_sdk::nostr::{Event, JsonUtil, Keys, Kind, Tag};
 
     /// Build a minimal signed event of `kind` with optional extra tags, for
     /// filter tests. Content is irrelevant to the filter.

@@ -17,6 +17,7 @@ pub mod channels;
 pub mod coalesce;
 pub mod dispatch;
 pub mod engine;
+pub mod guard;
 pub mod jobs;
 pub mod lint;
 pub mod mention;
@@ -34,6 +35,10 @@ pub use coalesce::{
 };
 pub use dispatch::{DispatchConfig, DispatchPermit, DispatchPool, QueuedJob};
 pub use engine::{run_workflow, ActionRunner, Decision, RunInput, WorkflowEngine};
+pub use guard::{
+    evaluate_guard, evaluate_guard_default, inject_buzz_functions, timeout_from_env, GuardOutcome,
+    DEFAULT_TIMEOUT_MS,
+};
 pub use jobs::{
     build_and_serialize, build_job_cancel, build_job_claim, build_job_error, build_job_progress,
     build_job_request, build_job_result, first_claimer, job_parent, job_request_json, job_state,
