@@ -78,6 +78,7 @@ impl Mailbox {
             program: Some(program.to_string()),
             model: Some(model.to_string()),
             task_description: task_description.map(str::to_string),
+            persona: None,
         };
         let agent = self.register_agent(project_key, &profile).await?;
 
@@ -139,6 +140,7 @@ impl Mailbox {
                 program: Some(program.to_string()),
                 model: Some(model.to_string()),
                 task_description: task_description.map(str::to_string),
+                persona: None,
             };
             let agent = self.register_agent(project_key, &profile).await?;
             let _ = agent;

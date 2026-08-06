@@ -8,3 +8,5 @@ edition = "2021"
 toron-core = { path = "../toron-core" }
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
+evalexpr = "13.1.0"
+serde_json = "1.0.151"
