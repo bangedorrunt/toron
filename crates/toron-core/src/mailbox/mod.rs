@@ -24,6 +24,7 @@ pub mod contacts;
 pub mod guard;
 pub mod identity;
 pub mod infra;
+pub mod invariants;
 pub mod macros;
 pub mod messaging;
 pub mod product;
