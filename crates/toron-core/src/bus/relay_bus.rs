@@ -169,50 +169,43 @@ impl RelayBus {
         let sub_id_clone = sub_id.clone();
         tokio::spawn(async move {
             loop {
-                match notify_rx.recv().await {
+                let item: Option<SubscriptionEvent> = match notify_rx.recv().await {
                     Ok(RelayPoolNotification::Event {
                         subscription_id,
                         event,
                         ..
                     }) if subscription_id == sub_id_clone => {
-                        if tx.send(SubscriptionEvent::Event(*event)).await.is_err() {
-                            return;
-                        }
+                        Some(SubscriptionEvent::Event(*event))
                     }
                     Ok(RelayPoolNotification::Message { message, .. }) => match message {
                         nostr_sdk::nostr::RelayMessage::Event {
                             subscription_id,
                             event,
                         } if subscription_id.as_ref() == &sub_id_clone => {
-                            if tx
-                                .send(SubscriptionEvent::Event(event.into_owned()))
-                                .await
-                                .is_err()
-                            {
-                                return;
-                            }
+                            Some(SubscriptionEvent::Event(event.into_owned()))
                         }
                         nostr_sdk::nostr::RelayMessage::EndOfStoredEvents(id)
                             if id.as_ref() == &sub_id_clone =>
                         {
-                            if tx.send(SubscriptionEvent::Eose).await.is_err() {
-                                return;
-                            }
+                            Some(SubscriptionEvent::Eose)
                         }
-                        _ => {}
+                        _ => None,
                     },
-                    Ok(RelayPoolNotification::Shutdown) => {
-                        let _ = tx
-                            .send(SubscriptionEvent::Closed("relay bus shutdown".into()))
-                            .await;
-                        return;
-                    }
-                    Ok(_) => {}
+                    Ok(RelayPoolNotification::Shutdown) => Some(
+                        SubscriptionEvent::Closed("relay bus shutdown".into()),
+                    ),
+                    Ok(_) => None,
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                         let _ = tx
                             .send(SubscriptionEvent::Closed("relay bus closed".into()))
                             .await;
+                        return;
+                    }
+                };
+                if let Some(item) = item {
+                    // Subscriber dropped its receiver → stop this task.
+                    if tx.send(item).await.is_err() {
                         return;
                     }
                 }

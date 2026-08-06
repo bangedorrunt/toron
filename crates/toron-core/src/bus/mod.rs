@@ -26,7 +26,10 @@ pub use addressable::{
 };
 pub use event_store::BusEventStore;
 pub use federation::{FederationIssue, FederationMode, FederationPolicy, PowDifficulty};
-pub use filter::{project_filter, Filter, LabelValue};
+pub use filter::{
+    authors_project_filter, kind_project_filter, project_filter, project_label_filter, Filter,
+    LabelValue,
+};
 pub use http_guard::{clamp_feed_limit, is_private_ip, FEED_MAX_LIMIT};
 pub use in_process::InProcessBus;
 pub use relay_bus::{RelayBus, RelayBusConfig, RelayConfig, RelayRole};
