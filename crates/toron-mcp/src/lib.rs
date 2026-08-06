@@ -12,6 +12,8 @@
 
 pub mod resources;
 pub mod server;
+pub mod tools;
 
 pub use resources::RESOURCES;
 pub use server::{router, serve_http, serve_stdio, ToronServer};
+pub use tools::ToolServer;
