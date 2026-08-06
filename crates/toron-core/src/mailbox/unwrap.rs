@@ -331,6 +331,93 @@ fn civil_from_secs(secs: u64) -> (u32, u32) {
     ((if m <= 2 { y + 1 } else { y }) as u32, m as u32)
 }
 
+/// A [`ProjectionSink`] that writes unwrapped mail into the SQLite `messages`
+/// table (the search/query index; oc-b's FTS5 triggers keep `messages_fts`
+/// synced). Idempotent on the message `event_id` (`UNIQUE` constraint).
+pub struct SqliteProjectionSink {
+    pool: sqlx::SqlitePool,
+    projected: Mutex<HashSet<String>>,
+}
+
+impl SqliteProjectionSink {
+    /// New sink over the index pool.
+    pub fn new(pool: sqlx::SqlitePool) -> Self {
+        Self {
+            pool,
+            projected: Mutex::new(HashSet::new()),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl ProjectionSink for SqliteProjectionSink {
+    async fn is_projected(&self, key: &DedupKey) -> anyhow::Result<bool> {
+        if self.projected.lock().contains(&key.rumor_id) {
+            return Ok(true);
+        }
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE event_id = ?1")
+            .bind(&key.rumor_id)
+            .fetch_one(&self.pool)
+            .await
+            .unwrap_or(0);
+        Ok(n > 0)
+    }
+
+    async fn write(&self, mail: &UnwrappedMail, local_seq: u64) -> anyhow::Result<bool> {
+        let id = mail.rumor_id.to_hex();
+        if self.projected.lock().contains(&id) {
+            return Ok(false);
+        }
+        let subject = tag_text(&mail.rumor, "subject").unwrap_or_default();
+        let importance = tag_text(&mail.rumor, "importance").unwrap_or("normal");
+        let ack_required = mail
+            .rumor
+            .tags
+            .iter()
+            .any(|t| t.as_slice().first().map(|s| s.as_str()) == Some("ack-required"));
+        let thread_id = tag_text(&mail.rumor, "e").map(|s| s.to_string());
+
+        // project slug is not carried on gift wraps (metadata hiding) — the
+        // pipeline scopes by recipient; store a placeholder resolved by the
+        // caller's project context. Search filters on it at query time.
+        let project_slug = String::new();
+        let inserted = sqlx::query(
+            "INSERT INTO messages \
+             (event_id, project_slug, sender, sender_pubkey, subject, body, \
+              importance, ack_required, thread_id, created_ts_us, local_seq) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
+             ON CONFLICT (event_id) DO NOTHING",
+        )
+        .bind(&id)
+        .bind(project_slug)
+        .bind(mail.sender.to_hex())
+        .bind(mail.sender.to_hex())
+        .bind(subject)
+        .bind(mail.rumor.content.clone())
+        .bind(importance)
+        .bind(ack_required)
+        .bind(thread_id)
+        .bind(mail.ts_us())
+        .bind(local_seq as i64)
+        .execute(&self.pool)
+        .await?;
+        if inserted.rows_affected() == 0 {
+            return Ok(false);
+        }
+        self.projected.lock().insert(id);
+        Ok(true)
+    }
+}
+
+/// First value of a single-letter tag (e.g. `subject`, `e`).
+fn tag_text<'a>(rumor: &'a UnsignedEvent, name: &str) -> Option<&'a str> {
+    rumor.tags.iter().find_map(|t| {
+        let parts = t.as_slice();
+        (parts.first().map(|s| s.as_str()) == Some(name))
+            .then(|| parts.get(1).map(|s| s.as_str()))?
+    })
+}
+
 /// The unwrap pipeline: bus events → unwrap with local keys → policy gate →
 /// G7 order → idempotent sink write.
 pub struct UnwrapPipeline {

@@ -26,6 +26,7 @@ pub mod identity;
 pub mod infra;
 pub mod messaging;
 pub mod reservations;
+pub mod search;
 pub mod unwrap;
 
 pub use contacts::{BusPolicySource, ContactLink, LinkStatus, RequestContact, RespondContact};
@@ -43,9 +44,11 @@ pub use reservations::{
     overlaps, AcquireResult, ConflictReport, GrantedReservation, PathConflict, ReleaseResult,
     RenewResult, Reservation,
 };
+pub use search::{SearchMessage, SearchMessages, ThreadSummary};
 pub use unwrap::{
     order_by_rumor_time, AckCache, AutoPolicy, ContactPolicy, DedupKey, FixedPolicy,
-    GitProjectionSink, PolicySource, ProjectOutcome, ProjectionSink, UnwrapPipeline, UnwrappedMail,
+    GitProjectionSink, PolicySource, ProjectOutcome, ProjectionSink, SqliteProjectionSink,
+    UnwrapPipeline, UnwrappedMail,
 };
 
 /// Mailbox context: the bus every tool publishes to + the on-disk project
