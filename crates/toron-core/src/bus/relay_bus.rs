@@ -174,9 +174,7 @@ impl RelayBus {
                         subscription_id,
                         event,
                         ..
-                    }) if subscription_id == sub_id_clone => {
-                        Some(SubscriptionEvent::Event(*event))
-                    }
+                    }) if subscription_id == sub_id_clone => Some(SubscriptionEvent::Event(*event)),
                     Ok(RelayPoolNotification::Message { message, .. }) => match message {
                         nostr_sdk::nostr::RelayMessage::Event {
                             subscription_id,
@@ -191,9 +189,9 @@ impl RelayBus {
                         }
                         _ => None,
                     },
-                    Ok(RelayPoolNotification::Shutdown) => Some(
-                        SubscriptionEvent::Closed("relay bus shutdown".into()),
-                    ),
+                    Ok(RelayPoolNotification::Shutdown) => {
+                        Some(SubscriptionEvent::Closed("relay bus shutdown".into()))
+                    }
                     Ok(_) => None,
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {
