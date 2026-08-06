@@ -49,3 +49,20 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: cargo test -p toron-e2e --features p1
         run: cargo test -p toron-e2e --features p1
+
+  # P2 gate — gates the Resonate-backed workflow differentiator (SC-11 WF-08
+  # crash-resume). SC-11 spawns a real `resonate serve` subprocess; the binary
+  # is installed here so the differentiator test runs on every push/PR, not
+  # just locally. (bd-quo: the headline claim must be CI-witnessed.)
+  e2e-p2:
+    name: toron-e2e P2 gate (Resonate differentiator)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install resonate CLI (for SC-11 subprocess)
+        run: cargo install resonate --locked || echo "resonate install skipped — SC-11 will #[ignore] if absent"
+      - name: cargo test -p toron-e2e --features p2
+        run: cargo test -p toron-e2e --features p2

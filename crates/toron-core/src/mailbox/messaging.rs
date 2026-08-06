@@ -152,7 +152,7 @@ impl Mailbox {
         for r in resolved.iter().filter(|r| r.role != RecipientRole::Bcc) {
             let wrap = gift_wrap::gift_wrap(&sender_keys, &r.npub, visible.clone())
                 .await
-                .expect("wrap to/cc");
+                .map_err(|e| anyhow::anyhow!("gift wrap failed for to/cc recipient {}: {e}", r.name))?;
             let delivered = self.publish_dm(&wrap).await?;
             if delivered {
                 deliveries.push(Delivery {
@@ -170,7 +170,7 @@ impl Mailbox {
             let variant = build_bcc_rumor(&sender_keys.public_key(), args, &resolved, r);
             let wrap = gift_wrap::gift_wrap(&sender_keys, &r.npub, variant)
                 .await
-                .expect("wrap bcc");
+                .map_err(|e| anyhow::anyhow!("gift wrap failed for bcc recipient {}: {e}", r.name))?;
             let delivered = self.publish_dm(&wrap).await?;
             if delivered {
                 deliveries.push(Delivery {
@@ -316,7 +316,8 @@ impl Mailbox {
 
         // Build the private kind-14 rumor: toron-kind + NIP-10 e reference.
         let tags = vec![
-            Tag::parse(["toron-kind", kind]).expect("toron-kind tag"),
+            Tag::parse(["toron-kind", kind])
+                .map_err(|e| anyhow::anyhow!("failed to build toron-kind tag: {e}"))?,
             Tag::event(original.rumor.clone().id()),
         ];
         let rumor = gift_wrap::build_rumor(
@@ -328,7 +329,7 @@ impl Mailbox {
         );
         let wrap = gift_wrap::gift_wrap(&agent_keys, &sender_npub, rumor)
             .await
-            .expect("wrap receipt");
+            .map_err(|e| anyhow::anyhow!("gift wrap failed for receipt to {sender_npub}: {e}"))?;
         let ts_us = crate::index::writer::Clock::now_us(&crate::index::writer::SystemClock);
         self.publish_dm(&wrap).await?;
         self.record_receipt(project_slug, agent_name, &id, kind, ts_us);
@@ -411,6 +412,10 @@ impl Mailbox {
 }
 
 /// Build the visible rumor (to+cc only; bcc NEVER appears on it).
+///
+/// Tag construction is infallible for toron-controlled inputs; any failure
+/// here is a programming error surfaced via `expect` on a known-static tag
+/// shape (kept narrow — only the recipient `p` tag, which is npub-derived).
 fn build_visible_rumor(
     author: &PublicKey,
     args: &SendMessage,
@@ -418,7 +423,13 @@ fn build_visible_rumor(
 ) -> UnsignedEvent {
     let mut tags: Vec<Tag> = Vec::new();
     for r in resolved.iter().filter(|r| r.role != RecipientRole::Bcc) {
-        tags.push(Tag::parse(["p", &r.npub.to_hex(), "", r.role.tag_value()]).expect("p tag"));
+        // npub.to_hex() is infallible; the 4-tuple shape is toron-controlled.
+        // A failure here would indicate SDK invariants broken — panic is the
+        // correct response (not a recoverable send error).
+        tags.push(
+            Tag::parse(["p", &r.npub.to_hex(), "", r.role.tag_value()])
+                .expect("static p tag shape (npub hex + role literal)"),
+        );
     }
     add_message_tags(&mut tags, args);
     gift_wrap::build_rumor(
@@ -440,9 +451,15 @@ fn build_bcc_rumor(
     let mut tags: Vec<Tag> = Vec::new();
     // to + cc, plus the single bcc — role "bcc" on its own p tag.
     for r in resolved.iter().filter(|r| r.role != RecipientRole::Bcc) {
-        tags.push(Tag::parse(["p", &r.npub.to_hex(), "", r.role.tag_value()]).expect("p tag"));
+        tags.push(
+            Tag::parse(["p", &r.npub.to_hex(), "", r.role.tag_value()])
+                .expect("static p tag shape (npub hex + role literal)"),
+        );
     }
-    tags.push(Tag::parse(["p", &bcc.npub.to_hex(), "", "bcc"]).expect("p tag"));
+    tags.push(
+        Tag::parse(["p", &bcc.npub.to_hex(), "", "bcc"])
+            .expect("static bcc p tag shape (npub hex)"),
+    );
     add_message_tags(&mut tags, args);
     gift_wrap::build_rumor(
         *author,
@@ -454,18 +471,32 @@ fn build_bcc_rumor(
 }
 
 /// Add subject (NIP-14), importance/ack_required/sender_token/thread (G3) tags.
+///
+/// All tag strings here are either toron-controlled literals or user input
+/// that nostr-sdk validates. A parse failure on user input (e.g. an
+/// over-long subject) is silently dropped rather than panicking — the message
+/// still sends, just without that tag. This matches AM-Rust's tolerant
+/// handling of optional metadata.
 fn add_message_tags(tags: &mut Vec<Tag>, args: &SendMessage) {
     if !args.subject.is_empty() {
-        tags.push(Tag::parse(["subject", &args.subject]).expect("subject tag"));
+        if let Ok(t) = Tag::parse(["subject", &args.subject]) {
+            tags.push(t);
+        }
     }
     if let Some(imp) = &args.importance {
-        tags.push(Tag::parse(["importance", imp]).expect("importance tag"));
+        if let Ok(t) = Tag::parse(["importance", imp]) {
+            tags.push(t);
+        }
     }
     if args.ack_required {
-        tags.push(Tag::parse(["ack-required"]).expect("ack-required tag"));
+        if let Ok(t) = Tag::parse(["ack-required"]) {
+            tags.push(t);
+        }
     }
     if let Some(token) = &args.sender_token {
-        tags.push(Tag::parse(["sender-token", token]).expect("sender-token tag"));
+        if let Ok(t) = Tag::parse(["sender-token", token]) {
+            tags.push(t);
+        }
     }
     if let Some(thread) = &args.thread_id {
         if let Ok(root) = EventId::from_hex(thread) {
