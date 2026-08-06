@@ -70,19 +70,19 @@ pub struct BackendError {
 }
 
 impl BackendError {
-    pub fn new(code: BackendErrorCode, message: impl Into<String>) -> Self {
+    pub fn new(code: BackendErrorCode, message: impl AsRef<str>) -> Self {
         Self {
             code,
-            message: message.into(),
+            message: message.as_ref().to_string(),
         }
     }
 
-    pub fn unsupported(what: impl Into<String>) -> Self {
-        Self::new(BackendErrorCode::Unsupported, what.into())
+    pub fn unsupported(what: impl AsRef<str>) -> Self {
+        Self::new(BackendErrorCode::Unsupported, what.as_ref())
     }
 
-    pub fn timeout(message: impl Into<String>) -> Self {
-        Self::new(BackendErrorCode::Timeout, message.into())
+    pub fn timeout(message: impl AsRef<str>) -> Self {
+        Self::new(BackendErrorCode::Timeout, message.as_ref())
     }
 
     pub fn code(&self) -> &BackendErrorCode {
