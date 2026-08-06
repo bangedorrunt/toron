@@ -1,0 +1,7 @@
+# governed-by: ADR-0003
+[package]
+name = "toron-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
