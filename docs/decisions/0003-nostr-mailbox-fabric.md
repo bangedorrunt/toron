@@ -852,7 +852,7 @@ toron/                          # Cargo workspace
 - [ ] **Federation:** with a relay configured, a message published on instance A is received on B (`#[ignore]`, two processes).
 - [ ] **DR (G11):** delete SQLite ⇒ rebuild from Git; delete Git ⇒ rebuild from bus replay; both converge.
 - [ ] **Integrated mode:** one flywheel process serves agents via MCP AND runs the loop; agent↔agent mail + flywheel dispatch both work, no second process.
-- [ ] **No asupersync:** `rg -n asupersync .` zero hits (toron + flywheel); `rg -n tokio crates/` confirms runtime. CI gate.
+- [ ] **No asupersync:** `rg -n asupersync .` zero hits (toron + flywheel); `rg -n tokio crates/` confirms runtime. CI gate (`scripts/verify-gates.sh`, scoped to live code + Cargo: `crates/**` + root `Cargo.toml` + `Cargo.lock`; historical ADR/beads text and dead legacy files excluded). Same gate enforces zero `fastmcp` and `#![forbid(unsafe_code)]` in every crate root.
 - [ ] **Single herdr client:** `flywheel/src/herdr.rs` deleted; `rg -n 'fn agent_prompt' .` hits exactly one definition (in toron-core).
 - [ ] **Robot CLI + metrics (G10):** `toron --robot-*` flags + `--json` parity; metrics endpoint exposes call/error/latency.
 - [ ] **`#![forbid(unsafe_code)]`** in every crate root. CI gate.
