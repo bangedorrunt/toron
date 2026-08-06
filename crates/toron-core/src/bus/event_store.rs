@@ -39,7 +39,7 @@ CREATE INDEX IF NOT EXISTS bus_events_kind ON bus_events (kind);
 /// SQLite event store for the in-process bus.
 #[derive(Clone)]
 pub struct BusEventStore {
-    pool: SqlitePool,
+    pub(crate) pool: SqlitePool,
 }
 
 impl BusEventStore {

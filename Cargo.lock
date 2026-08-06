@@ -3323,6 +3323,8 @@ dependencies = [
  "axum",
  "futures-util",
  "git2",
+ "hex",
+ "negentropy",
  "nostr-sdk",
  "parking_lot",
  "proptest",
