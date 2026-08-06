@@ -10,11 +10,13 @@
 pub mod event_store;
 pub mod filter;
 pub mod in_process;
+pub mod scoping;
 pub mod subscription;
 
 pub use event_store::BusEventStore;
 pub use filter::{project_filter, Filter, LabelValue};
 pub use in_process::InProcessBus;
+pub use scoping::{is_metadata_hiding_kind, project_scoping_tags, with_project_scoping};
 pub use subscription::{Subscription, SubscriptionEvent, SubscriptionId};
 
 use nostr_sdk::nostr::Event;
