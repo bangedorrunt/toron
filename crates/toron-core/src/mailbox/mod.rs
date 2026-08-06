@@ -26,6 +26,7 @@ pub mod identity;
 pub mod infra;
 pub mod invariants;
 pub mod macros;
+pub mod matrix;
 pub mod messaging;
 pub mod product;
 pub mod reservations;
