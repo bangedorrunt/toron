@@ -136,6 +136,9 @@ pub enum Command {
 
     /// Bench a mailbox scenario (startup/inbox/send/search/threads). AM-Rust parity.
     Bench(BenchArgs),
+
+    /// Interactive operator dashboard (ratatui; standalone-daemon TUI).
+    Tui(TuiArgs),
 }
 
 #[derive(Debug, Args)]
@@ -711,6 +714,13 @@ pub struct BenchArgs {
     /// Scenario: startup|inbox|send|search|threads.
     #[arg(value_enum)]
     pub case: BenchCaseArg,
+}
+
+#[derive(Debug, Args)]
+pub struct TuiArgs {
+    /// Poll/refresh interval in milliseconds.
+    #[arg(long, default_value_t = 1000)]
+    pub refresh_ms: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
