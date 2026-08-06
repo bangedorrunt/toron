@@ -2,5 +2,6 @@
 #![forbid(unsafe_code)]
 
 pub mod projection;
+pub mod rebuild;
 pub mod schema;
 pub mod writer;

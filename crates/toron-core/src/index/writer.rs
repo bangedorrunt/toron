@@ -168,6 +168,12 @@ impl IndexWriter {
         Ok(Some(value))
     }
 
+    /// Run a full-row read on the read pool (never blocks the writer).
+    pub async fn fetch_rows(&self, sql: &str) -> anyhow::Result<Vec<sqlx::sqlite::SqliteRow>> {
+        let rows = sqlx::query(sql).fetch_all(&self.read_pool).await?;
+        Ok(rows)
+    }
+
     /// The dedicated write pool (callers that need raw access, e.g.
     /// migrations, must also run on the writer path).
     pub fn write_pool(&self) -> &SqlitePool {
