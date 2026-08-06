@@ -132,7 +132,7 @@ impl Mailbox {
 
     /// Absolute path of an agent's ncryptsec key file
     /// (`{data_dir}/{project}/agents/{name}/key.ncryptsec`).
-    fn agent_key_path(&self, project_slug: &str, name: &str) -> PathBuf {
+    pub(crate) fn agent_key_path(&self, project_slug: &str, name: &str) -> PathBuf {
         self.data_dir
             .join(project_slug)
             .join("agents")
@@ -141,7 +141,7 @@ impl Mailbox {
     }
 
     /// Load an agent key from disk (passphrase decrypt). `None` if absent.
-    fn load_agent_key(&self, path: &std::path::Path) -> Option<Keys> {
+    pub(crate) fn load_agent_key(&self, path: &std::path::Path) -> Option<Keys> {
         if !path.exists() {
             return None;
         }
@@ -151,7 +151,7 @@ impl Mailbox {
     /// The passphrase used to encrypt/decrypt agent keys (G1: passphrase
     /// unlocks ncryptsec at process start). Defaults to `TORON_KEY_PASSPHRASE`
     /// or a dev placeholder; production deployments must set it.
-    fn agent_passphrase(&self) -> &str {
+    pub(crate) fn agent_passphrase(&self) -> &str {
         self.agent_passphrase.as_deref().unwrap_or("toron-dev")
     }
 
@@ -234,7 +234,7 @@ impl Mailbox {
     }
 
     /// All kind-30013 profile events for a project (project-scoped `#t`).
-    async fn project_profiles(
+    pub(crate) async fn project_profiles(
         &self,
         project_slug: &str,
     ) -> anyhow::Result<Vec<nostr_sdk::nostr::Event>> {

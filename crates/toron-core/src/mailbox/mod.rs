@@ -12,6 +12,7 @@
 //! install/uninstall_precommit_guard). Subsequent `.5.x` beads add the other
 //! clusters in-place.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -22,6 +23,7 @@ use crate::bus::{Bus, BusError, Filter, SubscriptionEvent};
 pub mod guard;
 pub mod identity;
 pub mod infra;
+pub mod messaging;
 pub mod unwrap;
 
 pub use guard::{
@@ -29,6 +31,10 @@ pub use guard::{
 };
 pub use identity::{ListAgentsOptions, RegisteredAgent, WhoIs};
 pub use infra::{HealthComponent, HealthReport, ProjectState};
+pub use messaging::{
+    Delivery, DeliveryPayload, FetchInbox, InboxMessage, ReceiptResult, RecipientRole, SendMessage,
+    SendResult,
+};
 pub use unwrap::{
     order_by_rumor_time, AckCache, AutoPolicy, ContactPolicy, DedupKey, FixedPolicy,
     GitProjectionSink, PolicySource, ProjectOutcome, ProjectionSink, UnwrapPipeline, UnwrappedMail,
@@ -43,6 +49,7 @@ pub struct Mailbox {
     data_dir: PathBuf,
     operator: Option<Keys>,
     agent_passphrase: Option<String>,
+    receipt_cache: Arc<parking_lot::Mutex<HashMap<String, i64>>>,
 }
 
 impl std::fmt::Debug for Mailbox {
@@ -64,6 +71,7 @@ impl Mailbox {
             data_dir,
             operator,
             agent_passphrase: None,
+            receipt_cache: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         }
     }
 
