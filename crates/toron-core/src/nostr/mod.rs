@@ -1,4 +1,9 @@
 // governed-by: ADR-0003
 #![forbid(unsafe_code)]
 
-// TODO(bd-led.2.1): Nostr layer — event build/sign/verify + frozen kind constants.
+//! Nostr layer: event build/sign/verify + frozen kind registry.
+//!
+//! Pure — no I/O. Every bus publish goes through [`event::build_event`].
+
+pub mod event;
+pub mod kinds;
