@@ -21,6 +21,7 @@ pub mod jobs;
 pub mod lint;
 pub mod mention;
 pub mod schema;
+pub mod trigger_filter;
 
 pub use channels::{
     Channel, ChannelEvent, ChannelStore, CHANNEL_CREATE, CHANNEL_MESSAGE, CHANNEL_METADATA,
@@ -42,6 +43,11 @@ pub use lint::{lint_workflow, lint_yaml, Level, LintIssue, LintReport};
 pub use mention::{content_mentions, is_mention, parse_mentions, Mention};
 pub use schema::{
     parse_workflow, parse_workflows, Action, Step, TemplateContext, Trigger, Workflow,
+};
+pub use trigger_filter::{
+    has_workflow_emitted_tag, is_workflow_emitted_kind, job_kind, should_evaluate_trigger_event,
+    should_evaluate_trigger_kind, workflow_run_kind, GIFT_WRAP, JOB_EMITS_KINDS,
+    WORKFLOW_EMITTED_TAG,
 };
 
 /// The canonical example workflow (lints clean — asserted in tests).
