@@ -332,7 +332,7 @@ impl Mailbox {
         Ok(())
     }
 
-    fn index_pool_required(&self) -> anyhow::Result<&sqlx::SqlitePool> {
+    pub(crate) fn index_pool_required(&self) -> anyhow::Result<&sqlx::SqlitePool> {
         self.index_pool
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("no index pool attached (Mailbox::with_index_pool)"))
