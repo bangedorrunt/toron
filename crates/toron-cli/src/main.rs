@@ -35,6 +35,7 @@ fn run(cli: &Cli) -> anyhow::Result<()> {
     match &cli.command {
         Command::Serve(args) => run_serve(args, format, color),
         Command::Status => run_status(&cfg, format),
+        Command::Config => run_config(&cfg, format),
     }
 }
 
@@ -64,10 +65,12 @@ async fn run_serve(
 fn run_status(cfg: &Config, format: OutputFormat) -> anyhow::Result<()> {
     let value = serde_json::json!({
         "data_dir": cfg.data_dir.as_ref().map(|p| p.display().to_string()),
-        "backend": cfg.backend,
+        "backend": cfg.effective_backend(),
         "operator_key": cfg.operator_key.as_ref().map(|p| p.display().to_string()),
         "relays": cfg.relays,
-        "envelope_ttl_days": cfg.envelope_ttl_days.unwrap_or(90),
+        "envelope_ttl_days": cfg.envelope_ttl_days(None),
+        "proof_gate_enabled": cfg.proof_gate_enabled(),
+        "proof_scheme": cfg.effective_proof_scheme(),
     });
     match format {
         OutputFormat::Json => render_json(&value, format),
@@ -78,6 +81,37 @@ fn run_status(cfg: &Config, format: OutputFormat) -> anyhow::Result<()> {
         }
         OutputFormat::Human => {
             println!("toron status");
+            for (k, v) in value.as_object().unwrap() {
+                println!("  {k}: {v}");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn run_config(cfg: &Config, format: OutputFormat) -> anyhow::Result<()> {
+    let value = serde_json::json!({
+        "data_dir": cfg.data_dir.as_ref().map(|p| p.display().to_string()),
+        "backend": cfg.effective_backend(),
+        "operator_key": cfg.operator_key.as_ref().map(|p| p.display().to_string()),
+        "relays": cfg.relays,
+        "envelope_ttl_days": cfg.envelope_ttl_days(None),
+        "project_ttl_days": cfg.project_ttl_days.iter().map(|pt| serde_json::json!({
+            "project": pt.project,
+            "days": pt.days,
+        })).collect::<Vec<_>>(),
+        "proof_gate_enabled": cfg.proof_gate_enabled(),
+        "proof_trusted_keys": cfg.proof_trusted_keys,
+        "proof_scheme": cfg.effective_proof_scheme(),
+        "git_binary": cfg.git_binary.as_ref().map(|p| p.display().to_string()),
+        "federation_auth": cfg.federation_auth.unwrap_or(false),
+        "federation_pow": cfg.federation_pow.unwrap_or(0),
+        "federation_allowlist": cfg.federation_allowlist,
+    });
+    match format {
+        OutputFormat::Json | OutputFormat::Plain => render_json(&value, format),
+        OutputFormat::Human => {
+            println!("toron config (effective)");
             for (k, v) in value.as_object().unwrap() {
                 println!("  {k}: {v}");
             }
