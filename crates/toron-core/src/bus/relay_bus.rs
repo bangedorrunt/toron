@@ -55,6 +55,8 @@ pub struct RelayBusConfig {
     /// Phase-1 federation policy: when true (default), ONLY gift-wrapped
     /// NIP-17 traffic is published to external relays.
     pub federation_policy_enabled: bool,
+    /// Federation hardening policy (A4): mode, AUTH, POW, allowlist.
+    pub federation: crate::bus::FederationPolicy,
 }
 
 impl Default for RelayBusConfig {
@@ -63,6 +65,7 @@ impl Default for RelayBusConfig {
             relays: Vec::new(),
             keys: Keys::generate(),
             federation_policy_enabled: true,
+            federation: crate::bus::FederationPolicy::default(),
         }
     }
 }
@@ -80,6 +83,14 @@ pub struct RelayBus {
 impl RelayBus {
     /// Open a RelayBus: build the nostr-sdk client, add relays, connect.
     pub async fn open(config: RelayBusConfig) -> Result<Self, BusError> {
+        // Doctor gate: misconfigured public federation (public mode without
+        // AUTH / relays / POW floor) fails at construction, never silently.
+        let issues = config.federation.doctor();
+        if !issues.is_empty() {
+            return Err(BusError::Publish(format!(
+                "federation doctor failed: {issues:?}"
+            )));
+        }
         let client = Client::new(config.keys.clone());
         for relay in &config.relays {
             let _ = client
@@ -292,6 +303,7 @@ mod tests {
             relays: vec![],
             keys: keys.clone(),
             federation_policy_enabled: true,
+            ..Default::default()
         };
         // Build the struct without network: use a helper that only needs
         // the config (policy check is pure).
@@ -307,6 +319,35 @@ mod tests {
         assert!(!is_metadata_hiding_kind(crate::nostr::kinds::toron_kind(
             PROJECT_MANIFEST
         )));
+    }
+
+    /// Misconfigured public federation (no AUTH) fails the doctor gate at
+    /// open() — never silently enabled (A4).
+    #[tokio::test]
+    async fn test_public_without_auth_fails_open() {
+        use crate::bus::{FederationMode, FederationPolicy};
+        let config = RelayBusConfig {
+            relays: vec![RelayConfig {
+                url: "wss://relay.example.com".into(),
+                role: RelayRole::ReadWrite,
+            }],
+            keys: Keys::generate(),
+            federation_policy_enabled: true,
+            federation: FederationPolicy {
+                mode: FederationMode::Public,
+                relays: vec!["wss://relay.example.com".into()],
+                auth_required: false,
+                ..Default::default()
+            },
+        };
+        let err = match RelayBus::open(config).await {
+            Ok(_) => panic!("doctor must reject misconfigured public federation"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("federation doctor"),
+            "error must cite the doctor check, got: {err}"
+        );
     }
 
     /// Verify events still pass the publish verify gate (pure).
@@ -344,6 +385,7 @@ mod tests {
             relays: vec![],
             keys: Keys::generate(),
             federation_policy_enabled: true,
+            ..Default::default()
         };
         // open() with zero relays: add_relay loop is a no-op, connect() is a
         // no-op with no relays. Health reports "no relays configured".
@@ -370,6 +412,7 @@ mod tests {
             }],
             keys: Keys::generate(),
             federation_policy_enabled: true,
+            ..Default::default()
         })
         .await
         .expect("open subscriber");
@@ -380,6 +423,7 @@ mod tests {
             }],
             keys: Keys::generate(),
             federation_policy_enabled: true,
+            ..Default::default()
         })
         .await
         .expect("open publisher");
@@ -444,6 +488,7 @@ mod tests {
             }],
             keys: Keys::generate(),
             federation_policy_enabled: true,
+            ..Default::default()
         })
         .await
         .expect("open publisher");
@@ -472,6 +517,7 @@ mod tests {
             }],
             keys: Keys::generate(),
             federation_policy_enabled: true,
+            ..Default::default()
         })
         .await
         .expect("open subscriber");
@@ -514,6 +560,7 @@ mod tests {
             }],
             keys: Keys::generate(),
             federation_policy_enabled: true,
+            ..Default::default()
         })
         .await
         .expect("open");

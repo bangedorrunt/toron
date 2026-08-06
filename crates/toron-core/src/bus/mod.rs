@@ -8,6 +8,7 @@
 //! wire-identical across both.
 
 pub mod event_store;
+pub mod federation;
 pub mod filter;
 pub mod in_process;
 #[cfg(test)]
@@ -17,6 +18,7 @@ pub mod scoping;
 pub mod subscription;
 
 pub use event_store::BusEventStore;
+pub use federation::{FederationIssue, FederationMode, FederationPolicy, PowDifficulty};
 pub use filter::{project_filter, Filter, LabelValue};
 pub use in_process::InProcessBus;
 pub use relay_bus::{RelayBus, RelayBusConfig, RelayConfig, RelayRole};
