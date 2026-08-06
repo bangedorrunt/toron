@@ -10,6 +10,8 @@
 //! Protocol: 2026-07-28 preferred, 2025-11-25 fallback (rmcp auto-negotiates).
 //! `bd-led.7.2` wires the 38 AM-Rust tools; `bd-led.7.3` exposes the 25 resources.
 
+pub mod resources;
 pub mod server;
 
+pub use resources::RESOURCES;
 pub use server::{router, serve_http, serve_stdio, ToronServer};
