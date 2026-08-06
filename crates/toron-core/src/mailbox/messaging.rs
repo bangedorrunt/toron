@@ -341,7 +341,7 @@ impl Mailbox {
     }
 
     /// Publish a DM wrap (metadata-hiding: never adds project scoping tags).
-    async fn publish_dm(&self, wrap: &Event) -> anyhow::Result<bool> {
+    pub(crate) async fn publish_dm(&self, wrap: &Event) -> anyhow::Result<bool> {
         debug_assert!(
             is_metadata_hiding_kind(wrap.kind),
             "gift wraps must be metadata-hiding"
@@ -382,7 +382,7 @@ impl Mailbox {
     }
 
     /// Load the sender/agent's keypair from its ncryptsec file (G1).
-    fn agent_keys_for(&self, project_slug: &str, name: &str) -> anyhow::Result<Keys> {
+    pub(crate) fn agent_keys_for(&self, project_slug: &str, name: &str) -> anyhow::Result<Keys> {
         let path = self.agent_key_path(project_slug, name);
         self.load_agent_key(&path).ok_or_else(|| {
             anyhow::anyhow!(

@@ -20,12 +20,14 @@ use nostr_sdk::nostr::{Event, Keys};
 
 use crate::bus::{Bus, BusError, Filter, SubscriptionEvent};
 
+pub mod contacts;
 pub mod guard;
 pub mod identity;
 pub mod infra;
 pub mod messaging;
 pub mod unwrap;
 
+pub use contacts::{BusPolicySource, ContactLink, LinkStatus, RequestContact, RespondContact};
 pub use guard::{
     guard_blocked_paths, install_precommit_guard, uninstall_precommit_guard, Reservation,
 };
@@ -50,6 +52,7 @@ pub struct Mailbox {
     operator: Option<Keys>,
     agent_passphrase: Option<String>,
     receipt_cache: Arc<parking_lot::Mutex<HashMap<String, i64>>>,
+    index_pool: Option<sqlx::SqlitePool>,
 }
 
 impl std::fmt::Debug for Mailbox {
@@ -58,6 +61,7 @@ impl std::fmt::Debug for Mailbox {
             .field("data_dir", &self.data_dir)
             .field("operator", &self.operator.is_some())
             .field("has_agent_passphrase", &self.agent_passphrase.is_some())
+            .field("has_index_pool", &self.index_pool.is_some())
             .finish()
     }
 }
@@ -72,6 +76,7 @@ impl Mailbox {
             operator,
             agent_passphrase: None,
             receipt_cache: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            index_pool: None,
         }
     }
 
@@ -79,6 +84,18 @@ impl Mailbox {
     pub fn with_agent_passphrase(mut self, passphrase: impl Into<String>) -> Self {
         self.agent_passphrase = Some(passphrase.into());
         self
+    }
+
+    /// Attach the SQLite index pool (contacts/agent links etc.). Without it,
+    /// index-backed tools return a "no index pool" error.
+    pub fn with_index_pool(mut self, pool: sqlx::SqlitePool) -> Self {
+        self.index_pool = Some(pool);
+        self
+    }
+
+    /// The SQLite index pool, if attached.
+    pub fn index_pool(&self) -> Option<&sqlx::SqlitePool> {
+        self.index_pool.as_ref()
     }
 
     /// The bus backing this mailbox.
