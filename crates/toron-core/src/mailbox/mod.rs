@@ -25,6 +25,7 @@ pub mod guard;
 pub mod identity;
 pub mod infra;
 pub mod messaging;
+pub mod product;
 pub mod reservations;
 pub mod search;
 pub mod unwrap;
@@ -40,6 +41,7 @@ pub use messaging::{
     Delivery, DeliveryPayload, FetchInbox, InboxMessage, ReceiptResult, RecipientRole, SendMessage,
     SendResult,
 };
+pub use product::ProductInfo;
 pub use reservations::{
     overlaps, AcquireResult, ConflictReport, GrantedReservation, PathConflict, ReleaseResult,
     RenewResult, Reservation,
