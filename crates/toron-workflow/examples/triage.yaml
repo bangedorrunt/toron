@@ -1,0 +1,34 @@
+# governed-by: ADR-0003
+# Example toron workflow (bd-osp): inbound message triage.
+#
+# Trigger: a message is posted to #support. Guard: only messages carrying an
+# `urgent` importance fire it. Steps: acknowledge the sender (DM), dispatch a
+# triage job to the support agent, then approve the assignment with a human.
+#
+# Lints clean: `cargo test -p toron-workflow` asserts this file passes lint.
+name: triage
+description: Triage inbound support messages to the support agent
+
+trigger:
+  type: message_posted
+  channel: "#support"
+
+guard: "trigger.importance == 'urgent'"
+
+steps:
+  - name: ack
+    action: send_dm
+    to: "{{trigger.sender}}"
+    body: "Received: {{trigger.subject}}"
+
+  - name: dispatch
+    guard: "{{trigger.importance}} == 'urgent'"
+    action: dispatch_job
+    assignee: "oc-beta"
+    spec:
+      task: "triage {{trigger.id}}"
+      channel: "#support"
+
+  - name: approve
+    action: request_approval
+    message: "Approve dispatching {{trigger.subject}} to oc-beta?"
