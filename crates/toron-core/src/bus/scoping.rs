@@ -38,6 +38,15 @@ pub fn is_metadata_hiding_kind(kind: Kind) -> bool {
     matches!(kind.as_u16(), 13 | 14 | 15 | 1059)
 }
 
+/// True when a kind is in the **ephemeral class** (20000–29999, ADR-0003):
+/// presence (20001), typing, agent working-state. Ephemeral events are
+/// broadcast on the bus but NEVER stored in SQLite or written to Git — a
+/// missed event just means stale state until the next one.
+pub fn is_ephemeral_kind(kind: Kind) -> bool {
+    let n = kind.as_u16();
+    (20000..=29999).contains(&n)
+}
+
 /// Append project-scoping tags to an event tag list **unless** the kind is
 /// metadata-hiding. Used by the bus publish path so callers get the A3 rule
 /// for free.
@@ -208,6 +217,23 @@ mod tests {
         assert!(!is_metadata_hiding_kind(crate::nostr::kinds::toron_kind(
             PROJECT_MANIFEST
         )));
+    }
+
+    #[test]
+    fn test_ephemeral_kinds_identified() {
+        // Ephemeral class 20000-29999: presence 20001 is ephemeral; a
+        // profile (30013) and a gift wrap (1059) are not.
+        assert!(is_ephemeral_kind(crate::nostr::kinds::toron_kind(
+            crate::nostr::kinds::PRESENCE
+        )));
+        assert!(is_ephemeral_kind(Kind::from_u16(20001)));
+        assert!(is_ephemeral_kind(Kind::from_u16(29999)));
+        assert!(!is_ephemeral_kind(Kind::from_u16(19999)));
+        assert!(!is_ephemeral_kind(Kind::from_u16(30000)));
+        assert!(!is_ephemeral_kind(crate::nostr::kinds::toron_kind(
+            AGENT_PROFILE
+        )));
+        assert!(!is_ephemeral_kind(Kind::GiftWrap));
     }
 
     #[test]

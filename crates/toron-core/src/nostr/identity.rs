@@ -15,6 +15,19 @@ use crate::bus::scoping::with_project_scoping;
 use crate::nostr::event::build_event;
 use crate::nostr::kinds::{toron_kind, AGENT_PROFILE};
 
+/// Versioned persona / system-prompt pack (ADR-0003 "persona packs extend the
+/// agent profile", Buzz `buzz-persona` analogue). Reproducible, swappable
+/// agent behavior.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PersonaPack {
+    /// Semver-style persona version (e.g. `"1.0.0"`).
+    pub version: String,
+    /// Persona name (e.g. `"researcher"`).
+    pub name: String,
+    /// The system prompt that defines this persona.
+    pub system_prompt: String,
+}
+
 /// Agent profile metadata carried in the kind-30013 `content` (JSON).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AgentProfile {
@@ -29,6 +42,9 @@ pub struct AgentProfile {
     /// Short task description.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_description: Option<String>,
+    /// Versioned persona / system-prompt pack (Phase 2.3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persona: Option<PersonaPack>,
 }
 
 impl AgentProfile {
@@ -39,6 +55,7 @@ impl AgentProfile {
             program: None,
             model: None,
             task_description: None,
+            persona: None,
         }
     }
 }
@@ -169,6 +186,7 @@ mod tests {
             program: Some("opencode".into()),
             model: Some("opencode".into()),
             task_description: Some("mailbox agent".into()),
+            persona: None,
         }
     }
 
@@ -252,6 +270,36 @@ mod tests {
         assert_eq!(parsed, p);
     }
 
+    /// Persona pack fields round-trip through the kind-30013 profile.
+    #[test]
+    fn test_persona_pack_roundtrip() {
+        let mut p = sample_profile();
+        p.persona = Some(PersonaPack {
+            version: "1.0.0".into(),
+            name: "researcher".into(),
+            system_prompt: "You are a rigorous researcher. Verify before claiming.".into(),
+        });
+        let r = create_agent_identity("demo", &p, ts()).expect("create");
+        let parsed = parse_profile(&r.event).expect("parse");
+        assert_eq!(parsed, p);
+        let persona = parsed.persona.expect("persona present");
+        assert_eq!(persona.version, "1.0.0");
+        assert_eq!(persona.name, "researcher");
+        assert!(persona.system_prompt.contains("rigorous researcher"));
+        // The signed profile still verifies.
+        assert!(crate::nostr::event::verify_event(&r.event).is_ok());
+    }
+
+    /// Backward-compatible parse: a profile without persona fields loads fine.
+    #[test]
+    fn test_persona_optional_absent() {
+        let p = sample_profile(); // persona: None
+        assert!(p.persona.is_none());
+        let r = create_agent_identity("demo", &p, ts()).expect("create");
+        let parsed = parse_profile(&r.event).expect("parse");
+        assert!(parsed.persona.is_none());
+    }
+
     #[test]
     fn test_resolve_name_to_npub() {
         let p = sample_profile();
@@ -301,6 +349,7 @@ mod tests {
             program: None,
             model: None,
             task_description: None,
+            persona: None,
         }
     }
 }

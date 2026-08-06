@@ -547,6 +547,7 @@ impl ToolServer {
             program: Some(args.program.clone()),
             model: Some(args.model.clone()),
             task_description: args.task_description.clone(),
+            persona: None,
         };
         ToolOutput::result(
             self.mailbox
@@ -570,6 +571,7 @@ impl ToolServer {
             program: Some(args.program.clone()),
             model: Some(args.model.clone()),
             task_description: args.task_description.clone(),
+            persona: None,
         };
         ToolOutput::result(
             self.mailbox
