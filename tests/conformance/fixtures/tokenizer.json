@@ -1,0 +1,52 @@
+{
+ "kind": "fts5-tokenizer-contract",
+ "note": "AM-Rust tokenizer contract (per ADR-0003 parity): porter unicode61 remove_diacritics 2, prefix='2 3'.",
+ "config": "porter unicode61 remove_diacritics 2",
+ "prefix": "2 3",
+ "cases": [
+  {
+   "input": "reviewing the migration plan",
+   "tokens": [
+    "review",
+    "migrat",
+    "plan"
+   ]
+  },
+  {
+   "input": "agents collaborate via encrypted mail",
+   "tokens": [
+    "agent",
+    "collabor",
+    "encrypt",
+    "mail"
+   ]
+  },
+  {
+   "input": "force-release reservation conflict",
+   "tokens": [
+    "forc",
+    "releas",
+    "reserv",
+    "conflict"
+   ]
+  },
+  {
+   "input": "caf\u00e9 r\u00e9sum\u00e9 d\u00e9j\u00e0 vu",
+   "tokens": [
+    "cafe",
+    "resume",
+    "deja",
+    "vu"
+   ]
+  },
+  {
+   "input": "thread TKT-123 ack overdue",
+   "tokens": [
+    "thread",
+    "tkt",
+    "ack",
+    "overdu"
+   ]
+  }
+ ]
+}

@@ -1,0 +1,65 @@
+{
+ "kind": "request-response-samples",
+ "note": "Representative schema-validation samples (first-party).",
+ "samples": [
+  {
+   "tool": "send_message",
+   "request": {
+    "project_key": "/abs/path",
+    "sender_name": "GreenCastle",
+    "to": [
+     "BlueLake"
+    ],
+    "subject": "review",
+    "body_md": "please review"
+   },
+   "response": {
+    "deliveries": [
+     {
+      "project": "/abs/path",
+      "payload": {
+       "id": 1
+      }
+     }
+    ],
+    "count": 1,
+    "verified_sender": true
+   }
+  },
+  {
+   "tool": "register_agent",
+   "request": {
+    "project_key": "/abs/path",
+    "program": "claude-code",
+    "model": "opus-4.6"
+   },
+   "response": {
+    "id": 1,
+    "name": "GreenCastle",
+    "program": "claude-code",
+    "model": "opus-4.6"
+   }
+  },
+  {
+   "tool": "file_reservation_paths",
+   "request": {
+    "project_key": "/abs/path",
+    "agent_name": "GreenCastle",
+    "paths": [
+     "src/**"
+    ],
+    "ttl_seconds": 3600,
+    "exclusive": true
+   },
+   "response": {
+    "granted": [
+     {
+      "id": 1,
+      "path_pattern": "src/**",
+      "exclusive": true
+     }
+    ]
+   }
+  }
+ ]
+}

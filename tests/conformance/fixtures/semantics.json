@@ -1,0 +1,31 @@
+{
+ "kind": "semantic-cases",
+ "note": "Filter/importance/thread/date semantic cases for conformance (relevance-compatible, recency ties exact).",
+ "cases": {
+  "importance_levels": [
+   "low",
+   "normal",
+   "high",
+   "urgent"
+  ],
+  "date_filters": [
+   "since_ts",
+   "until_ts",
+   "date_start",
+   "date_end",
+   "after",
+   "before"
+  ],
+  "thread_seed": [
+   "thread key (e.g. FEAT-123)",
+   "numeric message id (seed)"
+  ],
+  "recency_tie_rule": "same created_ts -> ordered by descending message id",
+  "filter_semantics": {
+   "urgent_only": "importance in {high, urgent}",
+   "unread_only": "read_ts is null",
+   "ack_overdue_only": "ack_required and ack_ts older than ttl_minutes",
+   "sender_exact": "sender name exact match (case-insensitive normalized)"
+  }
+ }
+}

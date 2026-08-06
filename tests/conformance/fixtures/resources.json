@@ -1,0 +1,108 @@
+{
+ "$schema": "https://json-schema.org/draft/2020-12/schema",
+ "kind": "resources-list",
+ "note": "First-party catalog of the 25 MCP resource URIs (source: docs/parity/am-rust-tool-catalog.md).",
+ "count": 25,
+ "resources": [
+  {
+   "uri": "resource://agents/{project_key}",
+   "scope": "project"
+  },
+  {
+   "uri": "resource://config/environment",
+   "scope": "global"
+  },
+  {
+   "uri": "resource://file_reservations/{slug}",
+   "scope": "project"
+  },
+  {
+   "uri": "resource://identity/{project}",
+   "scope": "project"
+  },
+  {
+   "uri": "resource://inbox/{agent}",
+   "scope": "project(q)"
+  },
+  {
+   "uri": "resource://mailbox-with-commits/{agent}",
+   "scope": "project(q)"
+  },
+  {
+   "uri": "resource://mailbox/{agent}",
+   "scope": "project(q)"
+  },
+  {
+   "uri": "resource://message/{message_id}",
+   "scope": "project(q)"
+  },
+  {
+   "uri": "resource://outbox/{agent}",
+   "scope": "project(q)"
+  },
+  {
+   "uri": "resource://product/{key}",
+   "scope": "global"
+  },
+  {
+   "uri": "resource://project/{slug}",
+   "scope": "project"
+  },
+  {
+   "uri": "resource://projects",
+   "scope": "global"
+  },
+  {
+   "uri": "resource://thread/{thread_id}",
+   "scope": "project(q)"
+  },
+  {
+   "uri": "resource://tooling/capabilities/{agent}",
+   "scope": "project(q)"
+  },
+  {
+   "uri": "resource://tooling/diagnostics",
+   "scope": "global"
+  },
+  {
+   "uri": "resource://tooling/directory",
+   "scope": "global"
+  },
+  {
+   "uri": "resource://tooling/locks",
+   "scope": "global"
+  },
+  {
+   "uri": "resource://tooling/metrics",
+   "scope": "global"
+  },
+  {
+   "uri": "resource://tooling/metrics_core",
+   "scope": "global"
+  },
+  {
+   "uri": "resource://tooling/recent/{window_seconds}",
+   "scope": "global"
+  },
+  {
+   "uri": "resource://tooling/schemas",
+   "scope": "global"
+  },
+  {
+   "uri": "resource://views/ack-overdue/{agent}",
+   "scope": "project(q)"
+  },
+  {
+   "uri": "resource://views/ack-required/{agent}",
+   "scope": "project(q)"
+  },
+  {
+   "uri": "resource://views/acks-stale/{agent}",
+   "scope": "project(q)"
+  },
+  {
+   "uri": "resource://views/urgent-unread/{agent}",
+   "scope": "project(q)"
+  }
+ ]
+}
