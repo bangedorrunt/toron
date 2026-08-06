@@ -16,6 +16,7 @@ tokio = { version = "1", features = ["full"] }
 nostr-sdk = { version = "0.44", features = ["nip44", "nip59"] }
 uuid = { version = "1", features = ["v4"] }
 anyhow = "1"
+sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio"] }
 
 [dev-dependencies]
 nostr-sdk = { version = "0.44", features = ["nip44", "nip59"] }
