@@ -13,3 +13,6 @@ serde_json = "1.0.151"
 tokio = { version = "1.53.1", features = ["full"] }
 parking_lot = "0.12.5"
 nostr-sdk = { version = "0.44", features = ["nip44", "nip59"] }
+resonate-sdk = "0.4"
+resonate-sdk-macros = "0.1"
+anyhow = "1.0.104"
