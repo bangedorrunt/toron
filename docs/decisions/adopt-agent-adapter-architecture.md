@@ -1,10 +1,16 @@
 ---
-status: accepted
+status: partially superseded
 date: 2026-05-17
 decision-makers: Gemini CLI
 ---
 
 # Adopt Agent Adapter Architecture
+
+> **Partially superseded by [ADR-0003](0003-nostr-mailbox-fabric.md).** The
+> **MCP Adapter** is retained (it becomes toron's Tool Surface exposing the
+> 38 AM-Rust-parity tools). The **Sidecar Adapter** is removed — process
+> supervision of pi/opencode/grok now flows through the `Backend` trait
+> (herdr default, tmux on hold), reusing flywheel's herdr client.
 
 ## Context and Problem Statement
 Existing coding agents (Gemini CLI, OpenCode, Pi, etc.) already possess sophisticated reasoning and tool-use capabilities. Rather than building custom agents from scratch, `toron` needs a way to bridge these existing agents into its durable, multi-protocol P2P fabric. This will allow specialized agents to collaborate seamlessly while leveraging `toron` for durability, discovery, and secure transport.

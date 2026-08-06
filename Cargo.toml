@@ -24,5 +24,5 @@ asupersync-tokio-compat = { version = "0.3.1", features = ["full"] }
 tokio = { version = "1", features = ["full"] }
 
 [governance]
-adr = "0001"
-# governed-by: ADR-0001
+adr = "0003"
+# governed-by: ADR-0003

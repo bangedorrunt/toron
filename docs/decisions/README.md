@@ -4,7 +4,8 @@ This directory contains records of the major architectural decisions made for th
 
 | ID | Title | Status |
 | :--- | :--- | :--- |
-| [0001](0001-project-foundation.md) | Project Foundation and Core Stack | Accepted |
-| [0002](adopt-agent-adapter-architecture.md) | Adopt Agent Adapter Architecture | Accepted |
+| [0001](0001-project-foundation.md) | Project Foundation and Core Stack | **Superseded** by [ADR-0003](0003-nostr-mailbox-fabric.md) |
+| [0002](adopt-agent-adapter-architecture.md) | Adopt Agent Adapter Architecture | **Partially superseded** by [ADR-0003](0003-nostr-mailbox-fabric.md) (MCP adapter retained; Sidecar → `Backend` trait) |
+| [0003](0003-nostr-mailbox-fabric.md) | Pivot to a Nostr-Native Multi-Backend Agent Mailbox | **Accepted** |
 
-// governed-by: ADR-0001
+// governed-by: ADR-0003
