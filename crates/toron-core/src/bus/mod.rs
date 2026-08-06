@@ -13,6 +13,7 @@ pub mod filter;
 pub mod in_process;
 #[cfg(test)]
 mod mock_relay;
+pub mod reconcile;
 pub mod relay_bus;
 pub mod scoping;
 pub mod subscription;
