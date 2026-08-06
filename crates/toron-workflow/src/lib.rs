@@ -14,12 +14,14 @@
 //! this crate is deliberately engine-free.
 
 pub mod dispatch;
+pub mod engine;
 pub mod jobs;
 pub mod lint;
 pub mod mention;
 pub mod schema;
 
 pub use dispatch::{DispatchConfig, DispatchPermit, DispatchPool, QueuedJob};
+pub use engine::{run_workflow, ActionRunner, Decision, RunInput, WorkflowEngine};
 pub use jobs::{
     build_and_serialize, build_job_cancel, build_job_claim, build_job_error, build_job_progress,
     build_job_request, build_job_result, first_claimer, job_parent, job_request_json, job_state,
