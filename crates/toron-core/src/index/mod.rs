@@ -1,5 +1,6 @@
 // governed-by: ADR-0003
 #![forbid(unsafe_code)]
 
+pub mod projection;
 pub mod schema;
 pub mod writer;
