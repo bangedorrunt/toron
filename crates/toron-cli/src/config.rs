@@ -5,6 +5,10 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+/// Default bus envelope TTL in days (NIP-40 `expiration`; open Q #1 resolved
+/// as recommended: global default + per-project override).
+pub const DEFAULT_ENVELOPE_TTL_DAYS: u64 = 90;
+
 /// toron configuration.
 ///
 /// Precedence (low → high): system config → user config → project config →
@@ -13,21 +17,47 @@ use serde::Deserialize;
 /// File paths:
 ///   - system: `/etc/toron/config.toml`
 ///   - user:   `$XDG_CONFIG_HOME/toron/config.toml` (default `~/.config/toron/config.toml`)
-///   - project: `./.toron.toml`
+///   - project: `./.toron.toml` (`TORON_CONFIG` overrides the project path)
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     /// Data directory (SQLite index + Git archive root).
     pub data_dir: Option<PathBuf>,
-    /// Default backend (`herdr` | `tmux`).
+    /// Default backend (`herdr` | `tmux`). Defaults to `herdr`.
     pub backend: Option<String>,
-    /// Operator key path (ncryptsec; never the secret itself).
+    /// Operator key path (ncryptsec; 0600; never the secret itself).
     pub operator_key: Option<PathBuf>,
     /// Federation relays (empty default = no network egress; opt-in).
     #[serde(default)]
     pub relays: Vec<String>,
     /// Bus envelope TTL in days (NIP-40 `expiration`; default 90).
     pub envelope_ttl_days: Option<u64>,
+    /// Per-project envelope TTL override map (project slug → days).
+    #[serde(default)]
+    pub project_ttl_days: Vec<ProjectTtl>,
+    /// Proof-gate toggle. Default off.
+    pub proof_gate_enabled: Option<bool>,
+    /// Trusted anchor npubs for proof-gate attestation (kind-30012).
+    #[serde(default)]
+    pub proof_trusted_keys: Vec<String>,
+    /// Proof scheme: `schnorr` (default) | `ed25519` (legacy escape hatch).
+    pub proof_scheme: Option<String>,
+    /// `git2` override binary path (AM-Rust `TORON_GIT_BINARY` parity).
+    pub git_binary: Option<PathBuf>,
+    /// Federation hardening: NIP-42 AUTH membership gate. Default off.
+    pub federation_auth: Option<bool>,
+    /// Federation hardening: NIP-13 POW difficulty. Default off.
+    pub federation_pow: Option<u8>,
+    /// Federation hardening: relay allowlist. Default empty (reject all).
+    #[serde(default)]
+    pub federation_allowlist: Vec<String>,
+}
+
+/// A per-project envelope TTL override (`{ project = "demo", days = 14 }`).
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProjectTtl {
+    pub project: String,
+    pub days: u64,
 }
 
 impl Config {
@@ -43,6 +73,31 @@ impl Config {
         }
         cfg.merge_env();
         cfg
+    }
+
+    /// Effective envelope TTL for a project (per-project override or global default).
+    pub fn envelope_ttl_days(&self, project: Option<&str>) -> u64 {
+        if let Some(slug) = project {
+            if let Some(pt) = self.project_ttl_days.iter().find(|pt| pt.project == slug) {
+                return pt.days;
+            }
+        }
+        self.envelope_ttl_days.unwrap_or(DEFAULT_ENVELOPE_TTL_DAYS)
+    }
+
+    /// Effective backend (defaults to `herdr`).
+    pub fn effective_backend(&self) -> &str {
+        self.backend.as_deref().unwrap_or("herdr")
+    }
+
+    /// Effective proof scheme (defaults to `schnorr`).
+    pub fn effective_proof_scheme(&self) -> &str {
+        self.proof_scheme.as_deref().unwrap_or("schnorr")
+    }
+
+    /// True if proof gate is enabled.
+    pub fn proof_gate_enabled(&self) -> bool {
+        self.proof_gate_enabled.unwrap_or(false)
     }
 
     fn merge_file(&mut self, path: &Path) {
@@ -78,9 +133,39 @@ impl Config {
         if other.envelope_ttl_days.is_some() {
             self.envelope_ttl_days = other.envelope_ttl_days;
         }
+        if !other.project_ttl_days.is_empty() {
+            self.project_ttl_days = other.project_ttl_days;
+        }
+        if other.proof_gate_enabled.is_some() {
+            self.proof_gate_enabled = other.proof_gate_enabled;
+        }
+        if !other.proof_trusted_keys.is_empty() {
+            self.proof_trusted_keys = other.proof_trusted_keys;
+        }
+        if other.proof_scheme.is_some() {
+            self.proof_scheme = other.proof_scheme;
+        }
+        if other.git_binary.is_some() {
+            self.git_binary = other.git_binary;
+        }
+        if other.federation_auth.is_some() {
+            self.federation_auth = other.federation_auth;
+        }
+        if other.federation_pow.is_some() {
+            self.federation_pow = other.federation_pow;
+        }
+        if !other.federation_allowlist.is_empty() {
+            self.federation_allowlist = other.federation_allowlist;
+        }
     }
 
     fn merge_env(&mut self) {
+        // No secrets in env values — only paths/booleans (ADR CLI design).
+        if let Ok(v) = env::var("TORON_CONFIG") {
+            if !v.is_empty() {
+                self.merge_file(Path::new(&v));
+            }
+        }
         if let Ok(v) = env::var("TORON_DATA_DIR") {
             if !v.is_empty() {
                 self.data_dir = Some(PathBuf::from(v));
@@ -99,6 +184,21 @@ impl Config {
         if let Ok(v) = env::var("TORON_ENVELOPE_TTL_DAYS") {
             if let Ok(days) = v.parse::<u64>() {
                 self.envelope_ttl_days = Some(days);
+            }
+        }
+        if let Ok(v) = env::var("TORON_PROOF_GATE_ENABLED") {
+            if let Ok(b) = v.parse::<bool>() {
+                self.proof_gate_enabled = Some(b);
+            }
+        }
+        if let Ok(v) = env::var("TORON_PROOF_SCHEME") {
+            if !v.is_empty() {
+                self.proof_scheme = Some(v);
+            }
+        }
+        if let Ok(v) = env::var("TORON_GIT_BINARY") {
+            if !v.is_empty() {
+                self.git_binary = Some(PathBuf::from(v));
             }
         }
     }
@@ -162,7 +262,6 @@ mod tests {
         let dir = scratch("flag");
         let _project = write_config(&dir, ".toron.toml", "backend = \"tmux\"\n");
         let flag = write_config(&dir, "override.toml", "backend = \"herdr\"\n");
-        // A --config flag replaces the project file in the chain.
         let cfg = Config::load(Some(&flag));
         assert_eq!(cfg.backend.as_deref(), Some("herdr"));
     }
@@ -171,5 +270,49 @@ mod tests {
     fn relays_default_to_empty() {
         let cfg = Config::load(None);
         assert!(cfg.relays.is_empty(), "federation must be opt-in");
+    }
+
+    #[test]
+    fn envelope_ttl_defaults_to_90_days() {
+        let cfg = Config::load(None);
+        assert_eq!(cfg.envelope_ttl_days(None), 90);
+    }
+
+    #[test]
+    fn per_project_ttl_overrides_global() {
+        let dir = scratch("ttl");
+        let cfg_path = write_config(
+            &dir,
+            ".toron.toml",
+            "envelope_ttl_days = 90\n[[project_ttl_days]]\nproject = \"demo\"\ndays = 14\n",
+        );
+        let cfg = Config::load(Some(&cfg_path));
+        assert_eq!(cfg.envelope_ttl_days(None), 90);
+        assert_eq!(cfg.envelope_ttl_days(Some("demo")), 14);
+        assert_eq!(cfg.envelope_ttl_days(Some("other")), 90);
+    }
+
+    #[test]
+    fn backend_defaults_to_herdr() {
+        let cfg = Config::load(None);
+        assert_eq!(cfg.effective_backend(), "herdr");
+    }
+
+    #[test]
+    fn federation_hardening_defaults_off() {
+        let cfg = Config::load(None);
+        assert_ne!(cfg.federation_auth, Some(true), "AUTH must default off");
+        assert_ne!(cfg.federation_pow, Some(0), "POW must default off");
+        assert!(
+            cfg.federation_allowlist.is_empty(),
+            "allowlist defaults empty"
+        );
+    }
+
+    #[test]
+    fn proof_gate_defaults_off_schnorr() {
+        let cfg = Config::load(None);
+        assert!(!cfg.proof_gate_enabled());
+        assert_eq!(cfg.effective_proof_scheme(), "schnorr");
     }
 }

@@ -81,3 +81,20 @@ fn env_config_overrides_project_file() {
         serde_json::from_slice(&out.stdout).expect("status --json must parse");
     assert_eq!(value["backend"], serde_json::json!("herdr"));
 }
+
+#[test]
+fn config_show_emits_effective_defaults() {
+    let out = run(&["config", "--json"]);
+    assert!(out.status.success());
+    let value: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("config --json must parse");
+    assert_eq!(
+        value["relays"],
+        serde_json::json!([]),
+        "zero egress by default"
+    );
+    assert_eq!(value["envelope_ttl_days"], serde_json::json!(90));
+    assert_eq!(value["backend"], serde_json::json!("herdr"));
+    assert_eq!(value["federation_auth"], serde_json::json!(false));
+    assert_eq!(value["proof_scheme"], serde_json::json!("schnorr"));
+}

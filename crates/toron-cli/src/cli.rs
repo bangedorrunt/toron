@@ -73,6 +73,9 @@ pub enum Command {
 
     /// Quick health/config overview (human by default, --json for machines).
     Status,
+
+    /// Show the effective configuration (flags > env > project > user > system).
+    Config,
 }
 
 #[derive(Debug, Args)]
