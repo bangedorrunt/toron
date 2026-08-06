@@ -35,7 +35,21 @@ fn run(cli: &Cli) -> anyhow::Result<ExitCode> {
     let format = OutputFormat::from_globals(&cli.globals);
     let color = ColorChoice::from_globals(&cli.globals, stdout_is_tty());
 
-    let code = match &cli.command {
+    // Robot mode global flags (bd-led.8.4): emit a JSON snapshot and exit.
+    // These short-circuit before the command dispatch so an agent driver can
+    // poll state without knowing the subcommand surface (ADR-0003).
+    if cli.globals.robot_snapshot || cli.globals.robot_status || cli.globals.robot_capabilities {
+        return run_robot_flag(&cli.globals, format);
+    }
+
+    // A subcommand is required unless a robot flag short-circuited above.
+    let Some(command) = &cli.command else {
+        let mut cmd = <cli::Cli as clap::CommandFactory>::command();
+        let _ = cmd.print_help();
+        return Ok(ExitCode::from(2));
+    };
+
+    let code = match command {
         Command::Serve(args) => {
             run_serve(args, format, color)?;
             ExitCode::SUCCESS
@@ -69,16 +83,122 @@ fn run(cli: &Cli) -> anyhow::Result<ExitCode> {
             operator::run_backend(&cfg, cmd)?;
             ExitCode::SUCCESS
         }
+        Command::Bench(args) => {
+            run_bench(args, format)?;
+            ExitCode::SUCCESS
+        }
         Command::Mail(_)
         | Command::Reserve(_)
         | Command::Slot(_)
         | Command::Contact(_)
         | Command::Guard(_) => {
-            run_robot(&cli.command)?;
+            run_robot(command)?;
             ExitCode::SUCCESS
         }
     };
     Ok(code)
+}
+
+/// Robot-mode global flag dispatch (bd-led.8.4): snapshot / status /
+/// capabilities as JSON on stdout. Backed by the shared
+/// [`toron_core::mailbox::MailboxMetrics`] core.
+fn run_robot_flag(globals: &cli::Globals, format: OutputFormat) -> anyhow::Result<ExitCode> {
+    let metrics = toron_core::mailbox::MailboxMetrics::new();
+    let value = if globals.robot_capabilities {
+        metrics.robot_capabilities()
+    } else if globals.robot_status {
+        metrics.robot_status()
+    } else {
+        metrics.robot_snapshot()
+    };
+    match format {
+        OutputFormat::Json | OutputFormat::Plain => render_json(&value, format),
+        OutputFormat::Human => println!("{value}"),
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `toron bench <case>` (bd-led.8.4, AM-Rust parity): measure a mailbox
+/// scenario's latency against a live in-process bus and emit a percentile
+/// report (startup/inbox/send/search/threads).
+#[tokio::main]
+async fn run_bench(args: &cli::BenchArgs, format: OutputFormat) -> anyhow::Result<ExitCode> {
+    use toron_core::mailbox::{BenchReport, FetchInbox, SearchMessages, SendMessage};
+
+    const ITERATIONS: u64 = 20;
+    let mut latencies = Vec::with_capacity(ITERATIONS as usize);
+
+    for _ in 0..ITERATIONS {
+        let start = std::time::Instant::now();
+        // Each case measures the mailbox primitive's latency. Success/failure
+        // is irrelevant to the timing benchmark (a missing agent key or empty
+        // index still exercises the full dispatch path), so errors are
+        // swallowed — the report reflects the operation's cost.
+        let _ = match args.case {
+            cli::BenchCaseArg::Startup => {
+                // Mailbox construction (bus + SQLite) + health probe.
+                let _mb = toron_mcp::demo_mailbox().await;
+                Ok(())
+            }
+            cli::BenchCaseArg::Inbox => {
+                let mb = toron_mcp::demo_mailbox().await?;
+                mb.fetch_inbox(&FetchInbox {
+                    project_slug: "demo".into(),
+                    agent_name: "bench".into(),
+                    ..Default::default()
+                })
+                .await
+                .map(|_| ())
+            }
+            cli::BenchCaseArg::Send => {
+                let mb = toron_mcp::demo_mailbox().await?;
+                mb.send_message(&SendMessage {
+                    project_slug: "demo".into(),
+                    sender_name: "bench".into(),
+                    subject: "s".into(),
+                    body_md: "b".into(),
+                    ..Default::default()
+                })
+                .await
+                .map(|_| ())
+            }
+            cli::BenchCaseArg::Search => {
+                let mb = toron_mcp::demo_mailbox().await?;
+                mb.search_messages(&SearchMessages {
+                    project_key: "demo".into(),
+                    query: "bench".into(),
+                    ..Default::default()
+                })
+                .await
+                .map(|_| ())
+            }
+            cli::BenchCaseArg::Threads => {
+                let mb = toron_mcp::demo_mailbox().await?;
+                mb.summarize_thread("demo", "bench-thread", false, false, None)
+                    .await
+                    .map(|_| ())
+            }
+        };
+        latencies.push(start.elapsed().as_micros() as u64);
+    }
+
+    let report = BenchReport {
+        scenarios: vec![BenchReport::case(args.case.as_str(), &latencies)],
+    };
+    match format {
+        OutputFormat::Json | OutputFormat::Plain => {
+            render_json(&serde_json::to_value(&report)?, format)
+        }
+        OutputFormat::Human => println!(
+            "bench {}: {} iterations, avg {}us, p50 {}us, p95 {}us",
+            args.case.as_str(),
+            report.scenarios[0].iterations,
+            report.scenarios[0].avg_us,
+            report.scenarios[0].p50_us,
+            report.scenarios[0].p95_us,
+        ),
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 #[tokio::main]
