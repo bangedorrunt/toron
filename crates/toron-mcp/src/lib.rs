@@ -15,5 +15,5 @@ pub mod server;
 pub mod tools;
 
 pub use resources::RESOURCES;
-pub use server::{router, serve_http, serve_stdio, ToronServer};
-pub use tools::ToolServer;
+pub use server::{demo_mailbox, router, serve_http, serve_stdio, ToronServer};
+pub use tools::{ToJson, ToolServer};
