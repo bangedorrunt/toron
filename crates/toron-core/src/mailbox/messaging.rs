@@ -152,7 +152,9 @@ impl Mailbox {
         for r in resolved.iter().filter(|r| r.role != RecipientRole::Bcc) {
             let wrap = gift_wrap::gift_wrap(&sender_keys, &r.npub, visible.clone())
                 .await
-                .map_err(|e| anyhow::anyhow!("gift wrap failed for to/cc recipient {}: {e}", r.name))?;
+                .map_err(|e| {
+                    anyhow::anyhow!("gift wrap failed for to/cc recipient {}: {e}", r.name)
+                })?;
             let delivered = self.publish_dm(&wrap).await?;
             if delivered {
                 deliveries.push(Delivery {
@@ -170,7 +172,9 @@ impl Mailbox {
             let variant = build_bcc_rumor(&sender_keys.public_key(), args, &resolved, r);
             let wrap = gift_wrap::gift_wrap(&sender_keys, &r.npub, variant)
                 .await
-                .map_err(|e| anyhow::anyhow!("gift wrap failed for bcc recipient {}: {e}", r.name))?;
+                .map_err(|e| {
+                    anyhow::anyhow!("gift wrap failed for bcc recipient {}: {e}", r.name)
+                })?;
             let delivered = self.publish_dm(&wrap).await?;
             if delivered {
                 deliveries.push(Delivery {
