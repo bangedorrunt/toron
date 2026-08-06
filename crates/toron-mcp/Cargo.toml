@@ -5,3 +5,6 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+rmcp = { version = "3.1.1", features = ["server", "transport-io", "transport-streamable-http-server", "transport-worker", "client"] }
+schemars = "0.8"
+toron-core = { path = "../toron-core" }
