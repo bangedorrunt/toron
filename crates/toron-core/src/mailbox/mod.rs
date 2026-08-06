@@ -20,6 +20,7 @@ use nostr_sdk::nostr::{Event, Keys};
 
 use crate::bus::{Bus, BusError, Filter, SubscriptionEvent};
 
+pub mod build_slots;
 pub mod contacts;
 pub mod guard;
 pub mod identity;
@@ -33,6 +34,7 @@ pub mod reservations;
 pub mod search;
 pub mod unwrap;
 
+pub use build_slots::AcquireBuildSlotResult;
 pub use contacts::{BusPolicySource, ContactLink, LinkStatus, RequestContact, RespondContact};
 pub use guard::{
     guard_blocked_paths, install_precommit_guard, uninstall_precommit_guard,
