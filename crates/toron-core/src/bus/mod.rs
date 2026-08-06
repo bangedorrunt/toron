@@ -17,6 +17,7 @@ pub mod reconcile;
 pub mod relay_bus;
 pub mod scoping;
 pub mod subscription;
+pub mod ttl;
 
 pub use event_store::BusEventStore;
 pub use federation::{FederationIssue, FederationMode, FederationPolicy, PowDifficulty};
@@ -25,6 +26,7 @@ pub use in_process::InProcessBus;
 pub use relay_bus::{RelayBus, RelayBusConfig, RelayConfig, RelayRole};
 pub use scoping::{is_metadata_hiding_kind, project_scoping_tags, with_project_scoping};
 pub use subscription::{Subscription, SubscriptionEvent, SubscriptionId};
+pub use ttl::{EnvelopeTtl, DEFAULT_ENVELOPE_TTL_SECS};
 
 use nostr_sdk::nostr::Event;
 
