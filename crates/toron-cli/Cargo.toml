@@ -19,3 +19,5 @@ serde_json = "1"
 toml = "0.8"
 toron-core = { path = "../toron-core" }
 toron-mcp = { path = "../toron-mcp" }
+ratatui = "0.29"
+crossterm = "0.28"

@@ -6,6 +6,7 @@ mod config;
 mod operator;
 mod output;
 mod robot;
+mod tui;
 
 use std::process::ExitCode;
 
@@ -85,6 +86,10 @@ fn run(cli: &Cli) -> anyhow::Result<ExitCode> {
         }
         Command::Bench(args) => {
             run_bench(args, format)?;
+            ExitCode::SUCCESS
+        }
+        Command::Tui(args) => {
+            tui::run_tui(args)?;
             ExitCode::SUCCESS
         }
         Command::Mail(_)
