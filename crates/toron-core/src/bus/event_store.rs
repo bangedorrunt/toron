@@ -236,4 +236,38 @@ mod tests {
         assert_eq!(replayed[0].as_json(), ev.as_json());
         let _ = std::fs::remove_file(&path);
     }
+
+    /// GC: prune removes expired envelopes but keeps live ones (bounded bus,
+    /// NIP-40 TTL — ADR-0003 superiority row).
+    #[tokio::test]
+    async fn test_prune_gc_removes_expired_keeps_live() {
+        let (store, _pool, path) = temp_store().await;
+        let keys = Keys::generate();
+
+        // Expired envelope (past expiration) + live envelope (no expiration).
+        let expired = build_event(
+            &keys,
+            crate::nostr::kinds::toron_kind(PROJECT_MANIFEST),
+            "expired",
+            vec![
+                Tag::parse(["t", "demo"]).expect("t"),
+                Tag::expiration(Timestamp::from(1_500_000_000_u64)),
+            ],
+            Timestamp::from(1_400_000_000_u64),
+        )
+        .expect("build");
+        store.insert(&expired).await.expect("insert expired");
+
+        let live = sample_event(&keys, "live");
+        store.insert(&live).await.expect("insert live");
+        assert_eq!(store.count().await.expect("count"), 2);
+
+        store.prune().await.expect("prune");
+
+        assert_eq!(store.count().await.expect("count after prune"), 1);
+        let all = store.all_events().await.expect("all");
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].id, live.id, "only the live envelope survives GC");
+        let _ = std::fs::remove_file(&path);
+    }
 }
