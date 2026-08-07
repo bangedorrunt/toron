@@ -1,4 +1,5 @@
 // governed-by: ADR-0003
+// governed-by: ADR-0004 (MailCommand::Overseer — Ship 5)
 
 //! Robot parity surface (bd-led.8.3): the MCP tools as shell-out commands.
 //!
@@ -46,6 +47,33 @@ pub async fn run_mail(mailbox: &Mailbox, cmd: &MailCommand) -> anyhow::Result<()
                 ack_required: args.ack,
                 thread_id: args.thread.clone(),
                 sender_token: args.sender_token.clone(),
+                overseer: false,
+            };
+            emit(mailbox.send_message(&msg).await?)
+        }
+        MailCommand::Overseer(args) => {
+            // ADR-0004 Ship 5: operator Overseer override. Signs with the
+            // operator key (sender_name is ignored), importance=high, tagged
+            // toron:overseer, body carries the override preamble.
+            let msg = SendMessage {
+                project_slug: args.project.clone(),
+                sender_name: String::new(), // overseer signs with the operator key
+                to: args.to.clone(),
+                subject: args
+                    .subject
+                    .clone()
+                    .unwrap_or_else(|| "Operator override".to_string()),
+                body_md: format!(
+                    "Operator override. Pause current work, handle this, then resume.\n\n{}",
+                    args.body
+                ),
+                cc: vec![],
+                bcc: vec![],
+                importance: Some("high".to_string()),
+                ack_required: false,
+                thread_id: None,
+                sender_token: None,
+                overseer: true,
             };
             emit(mailbox.send_message(&msg).await?)
         }
@@ -62,6 +90,7 @@ pub async fn run_mail(mailbox: &Mailbox, cmd: &MailCommand) -> anyhow::Result<()
                 ack_required: args.ack,
                 thread_id: Some(args.thread.clone()),
                 sender_token: args.sender_token.clone(),
+                overseer: false,
             };
             emit(mailbox.reply_message(&msg).await?)
         }

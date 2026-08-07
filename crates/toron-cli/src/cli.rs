@@ -1,4 +1,5 @@
 // governed-by: ADR-0003
+// governed-by: ADR-0004 (MailOverseerArgs — Ship 5)
 
 use std::path::PathBuf;
 
@@ -183,6 +184,11 @@ pub enum PolicyArg {
 pub enum MailCommand {
     /// Send a NIP-17 gift-wrapped message to one or more recipients.
     Send(MailSendArgs),
+    /// Operator Overseer override (ADR-0004 Ship 5): signs with the operator
+    /// key, sets importance=high, tags `toron:overseer`, and SKIPS contact-
+    /// policy enforcement at the projection (block_all cannot block the
+    /// operator). Requires an operator key.
+    Overseer(MailOverseerArgs),
     /// Reply within a thread (requires --thread).
     Reply(MailReplyArgs),
     /// Project the agent's inbox (rumor-time order).
@@ -232,6 +238,23 @@ pub struct MailSendArgs {
     /// Sender token (verification).
     #[arg(long)]
     pub sender_token: Option<String>,
+}
+
+/// Operator Overseer override args (ADR-0004 Ship 5).
+#[derive(Debug, Args)]
+pub struct MailOverseerArgs {
+    /// Recipients (comma-separated agent names).
+    #[arg(long, value_delimiter = ',', required = true)]
+    pub to: Vec<String>,
+    /// Message body (markdown). The operator preamble is prepended.
+    #[arg(long, required = true)]
+    pub body: String,
+    /// Message subject (NIP-14). Default: an operator-override marker.
+    #[arg(long)]
+    pub subject: Option<String>,
+    /// Project slug.
+    #[arg(long, default_value = DEFAULT_PROJECT)]
+    pub project: String,
 }
 
 #[derive(Debug, Args)]

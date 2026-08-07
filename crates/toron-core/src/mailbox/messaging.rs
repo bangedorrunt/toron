@@ -1,4 +1,5 @@
 // governed-by: ADR-0003
+// governed-by: ADR-0004 (SendMessage.overseer, operator signing — Ship 5)
 #![forbid(unsafe_code)]
 
 //! Messaging cluster (bd-led.5.3): send_message, reply_message, fetch_inbox,
@@ -26,7 +27,7 @@ use nostr_sdk::nostr::{Event, EventId, Keys, PublicKey, Tag, Timestamp};
 
 use crate::bus::filter::ToronFilter;
 use crate::bus::scoping::is_metadata_hiding_kind;
-use crate::mailbox::unwrap::{order_by_rumor_time, UnwrappedMail};
+use crate::mailbox::unwrap::{order_by_rumor_time, OVERSEER_TAG, UnwrappedMail};
 use crate::nostr::gift_wrap::{self, UnwrappedGift};
 use crate::nostr::identity as nident;
 
@@ -72,6 +73,12 @@ pub struct SendMessage {
     pub ack_required: bool,
     pub thread_id: Option<String>,
     pub sender_token: Option<String>,
+    /// ADR-0004 Ship 5: operator Overseer override. When true, the message is
+    /// signed with the OPERATOR key (not an agent key), gains the
+    /// `['t', 'toron:overseer']` tag, and SKIPS contact-policy enforcement at
+    /// the projection (`block_all` cannot block the operator). Requires the
+    /// mailbox to hold an operator key.
+    pub overseer: bool,
 }
 
 /// Delivery record returned by `send_message` (parity shape).
@@ -143,7 +150,17 @@ impl Mailbox {
             anyhow::bail!("no recipients (to/cc/bcc all empty)");
         }
 
-        let sender_keys = self.agent_keys_for(&args.project_slug, &args.sender_name)?;
+        let sender_keys = if args.overseer {
+            // ADR-0004 Ship 5: the Overseer signs with the OPERATOR key, so
+            // the projection can verify the sender npub against it.
+            self.operator().cloned().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "overseer send requires an operator key (set operator_key / TORON_OPERATOR_KEY)"
+                )
+            })?
+        } else {
+            self.agent_keys_for(&args.project_slug, &args.sender_name)?
+        };
 
         let visible = build_visible_rumor(&sender_keys.public_key(), args, &resolved);
         let mut deliveries: Vec<Delivery> = Vec::new();
@@ -502,6 +519,13 @@ fn add_message_tags(tags: &mut Vec<Tag>, args: &SendMessage) {
             tags.push(t);
         }
     }
+    if args.overseer {
+        // ADR-0004 Ship 5: mark the override so the projection can recognize
+        // it (key-scoped + tag-scoped defense in depth).
+        if let Ok(t) = Tag::parse(["t", OVERSEER_TAG]) {
+            tags.push(t);
+        }
+    }
     if let Some(thread) = &args.thread_id {
         if let Ok(root) = EventId::from_hex(thread) {
             tags.push(Tag::event(root)); // NIP-10 e = root, reply role
@@ -662,6 +686,54 @@ mod tests {
         assert_eq!(rumor_a.content, "please review");
         assert_eq!(rumor_b.content, "please review");
         assert_eq!(rumor_a.kind, nostr_sdk::nostr::Kind::PrivateDirectMessage);
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn overseer_send_signs_with_operator_and_tags() {
+        // ADR-0004 Ship 5: `overseer: true` signs with the OPERATOR key (not
+        // an agent key), sets importance=high, and tags toron:overseer — the
+        // projection-recognizable override envelope.
+        let (mailbox, db_path, data_dir) = test_mailbox("overseer").await;
+        let (recv, npub) = register(&mailbox, "demo", "BlueLake").await;
+        let operator_npub = mailbox.operator().expect("operator").public_key();
+
+        let args = SendMessage {
+            project_slug: "demo".into(),
+            sender_name: String::new(), // overseer ignores sender_name
+            to: vec!["BlueLake".into()],
+            subject: "Operator override".into(),
+            body_md: "handle this".into(),
+            importance: Some("high".into()),
+            overseer: true,
+            ..Default::default()
+        };
+        let result = mailbox.send_message(&args).await.expect("overseer send");
+        assert_eq!(result.count, 1, "delivered to the recipient");
+
+        let wraps = wraps_to(&mailbox, &npub, 2).await;
+        assert_eq!(wraps.len(), 1, "one wrap for the recipient");
+        let rumor = unwrap_for_recipient(&recv, &wraps[0])
+            .expect("unwrap")
+            .rumor;
+        // Signed by the operator key, not an agent.
+        assert_eq!(
+            rumor.pubkey, operator_npub,
+            "overseer rumor is signed by the operator key"
+        );
+        // Carries the override marker + high importance.
+        let has_overseer = rumor.tags.iter().any(|t| {
+            t.as_slice().first().map(String::as_str) == Some("t")
+                && t.as_slice().get(1).map(String::as_str) == Some(OVERSEER_TAG)
+        });
+        assert!(has_overseer, "rumor carries the toron:overseer tag");
+        let has_high = rumor.tags.iter().any(|t| {
+            t.as_slice().first().map(String::as_str) == Some("importance")
+                && t.as_slice().get(1).map(String::as_str) == Some("high")
+        });
+        assert!(has_high, "rumor carries importance=high");
 
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_dir_all(&data_dir);

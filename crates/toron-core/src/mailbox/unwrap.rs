@@ -1,4 +1,5 @@
 // governed-by: ADR-0003
+// governed-by: ADR-0004 (OVERSEER_TAG, is_overseer_bypass, with_operator — Ship 5)
 #![forbid(unsafe_code)]
 
 //! Unwrap pipeline + mail-timeline ordering (G7) + contact-policy drop (G14).
@@ -108,6 +109,45 @@ impl UnwrappedMail {
             self.created_at.as_secs() as i64 * 1_000_000
         }
     }
+}
+
+/// The `t`-tag value marking an operator Overseer override message (ADR-0004
+/// Ship 5). Rides on kind-14 as a topic tag `['t', 'toron:overseer']` —
+/// consistent with the `toron:workflow-emitted` marker (Ship 2).
+pub const OVERSEER_TAG: &str = "toron:overseer";
+
+/// Operator-bypass (Overseer) predicate (ADR-0004 Ship 5, G14 carve-out).
+///
+/// Returns `true` iff ALL hold (key-scoped, not name-scoped — strictly
+/// stronger than AM-Rust's spoofable `HumanOverseer`):
+/// 1. an operator key is configured (`operator.is_some()`),
+/// 2. the mail's seal signer (`mail.sender`) IS that operator key,
+/// 3. the rumor carries a `['t', OVERSEER_TAG]` tag (intentional override),
+/// 4. the rumor carries an `importance` tag of `high` or `urgent`.
+///
+/// When true, the projection SKIPS contact-policy enforcement (a `block_all`
+/// recipient still receives + indexes + archives the operator's override).
+/// Pure + sync + O(tags).
+pub fn is_overseer_bypass(mail: &UnwrappedMail, operator: Option<&PublicKey>) -> bool {
+    let Some(op) = operator else {
+        return false;
+    };
+    if &mail.sender != op {
+        return false;
+    }
+    let tags = &mail.rumor.tags;
+    let has_overseer = tags.iter().any(|t| {
+        let p = t.as_slice();
+        p.first().map(String::as_str) == Some("t") && p.get(1).map(String::as_str) == Some(OVERSEER_TAG)
+    });
+    if !has_overseer {
+        return false;
+    }
+    tags.iter().any(|t| {
+        let p = t.as_slice();
+        p.first().map(String::as_str) == Some("importance")
+            && matches!(p.get(1).map(String::as_str), Some("high") | Some("urgent"))
+    })
 }
 
 /// Read the optional `["ts_ms", <µs>]` tag (µs precision, G7).
@@ -426,6 +466,9 @@ pub struct UnwrapPipeline {
     sink: Arc<dyn ProjectionSink>,
     acks: AckCache,
     seen_wraps: Mutex<HashSet<String>>,
+    /// The operator npub for the Overseer bypass (ADR-0004 Ship 5). `None`
+    /// disables the bypass (no operator key configured → policy is absolute).
+    operator: Option<PublicKey>,
 }
 
 impl UnwrapPipeline {
@@ -441,7 +484,15 @@ impl UnwrapPipeline {
             sink,
             acks: AckCache::default(),
             seen_wraps: Mutex::new(HashSet::new()),
+            operator: None,
         }
+    }
+
+    /// Set the operator npub for the Overseer bypass (ADR-0004 Ship 5).
+    /// Without this, the policy gate is absolute (no override path).
+    pub fn with_operator(mut self, operator: PublicKey) -> Self {
+        self.operator = Some(operator);
+        self
     }
 
     /// The ack/read-receipt cache (observable for tests + mailbox queries).
@@ -488,11 +539,16 @@ impl UnwrapPipeline {
 
         // G14: policy gate BEFORE any write. block_all / non-approved
         // contacts_only mail is dropped pre-index, never reaches Git.
+        // ADR-0004 Ship 5 carve-out: an operator-signed Overseer override
+        // (toron:overseer tag + high/urgent importance) SKIPS the gate.
         let policy = self.policy.policy_for(&mail.recipient);
-        if !policy.allows(
-            self.policy
-                .is_approved_contact(&mail.recipient, &mail.sender),
-        ) {
+        let bypass = is_overseer_bypass(&mail, self.operator.as_ref());
+        if !bypass
+            && !policy.allows(
+                self.policy
+                    .is_approved_contact(&mail.recipient, &mail.sender),
+            )
+        {
             return ProjectOutcome::Dropped(policy);
         }
 
@@ -803,6 +859,107 @@ mod tests {
             !root_now.join(".projected").exists(),
             "no dedup marker for blocked mail"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Build a gift-wrap whose rumor carries the Overseer marker tags
+    /// (ADR-0004 Ship 5): `['t', OVERSEER_TAG]` + `['importance', 'high']`.
+    async fn wrap_overseer_for(sender: &Keys, recipient: &Keys, created_at: u64) -> Event {
+        let rumor = build_rumor(
+            sender.public_key(),
+            Timestamp::from(created_at),
+            Kind::PrivateDirectMessage,
+            vec![
+                Tag::parse(["p", &recipient.public_key().to_hex()]).expect("p"),
+                Tag::parse(["t", OVERSEER_TAG]).expect("overseer tag"),
+                Tag::parse(["importance", "high"]).expect("importance"),
+            ],
+            "operator override: pause and handle",
+        );
+        gift_wrap::gift_wrap(sender, &recipient.public_key(), rumor)
+            .await
+            .expect("wrap")
+    }
+
+    #[tokio::test]
+    async fn overseer_bypasses_block_all() {
+        // ADR-0004 Ship 5 acceptance: operator-signed overseer msg to a
+        // block_all agent → DELIVERED (not dropped at projection).
+        let operator = keys();
+        let recipient = keys();
+        let wrap = wrap_overseer_for(&operator, &recipient, 1_700_000_000).await;
+
+        let root = temp_archive("overseer-bypass");
+        let sink = Arc::new(GitProjectionSink::open(&root).expect("open"));
+        let policy = Arc::new(FixedPolicy(ContactPolicy::BlockAll));
+        let pipeline =
+            UnwrapPipeline::new(vec![recipient], policy, sink.clone()).with_operator(operator.public_key());
+
+        let outcome = pipeline.project(&wrap).await;
+        assert_eq!(outcome, ProjectOutcome::Projected, "overseer bypasses block_all");
+        let archive = sink.archive.lock();
+        assert_eq!(
+            archive.commit_count().expect("count"),
+            1,
+            "overseer mail is archived (not dropped)"
+        );
+        drop(archive);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn non_overseer_blocked() {
+        // ADR-0004 Ship 5 acceptance: an AGENT (non-operator key) sending to a
+        // block_all agent → still dropped. No bypass for non-operator keys.
+        let agent = keys();
+        let recipient = keys();
+        let wrap = wrap_overseer_for(&agent, &recipient, 1_700_000_000).await;
+
+        let root = temp_archive("non-overseer");
+        let sink = Arc::new(GitProjectionSink::open(&root).expect("open"));
+        let policy = Arc::new(FixedPolicy(ContactPolicy::BlockAll));
+        // The operator is a DIFFERENT key than the sender.
+        let operator = keys();
+        let pipeline =
+            UnwrapPipeline::new(vec![recipient], policy, sink.clone()).with_operator(operator.public_key());
+
+        let outcome = pipeline.project(&wrap).await;
+        assert_eq!(
+            outcome,
+            ProjectOutcome::Dropped(ContactPolicy::BlockAll),
+            "agent-signed mail stays blocked even with overseer tags"
+        );
+        let archive = sink.archive.lock();
+        assert_eq!(archive.commit_count().expect("count"), 0);
+        drop(archive);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn overseer_requires_tag() {
+        // ADR-0004 Ship 5 acceptance: operator-signed msg WITHOUT the
+        // toron:overseer tag → normal policy applies, no bypass. The operator
+        // key alone is not a blanket bypass.
+        let operator = keys();
+        let recipient = keys();
+        // Same sender, same importance, but NO overseer tag (plain wrap).
+        let wrap = wrap_for(&operator, &recipient, 1_700_000_000).await;
+
+        let root = temp_archive("overseer-no-tag");
+        let sink = Arc::new(GitProjectionSink::open(&root).expect("open"));
+        let policy = Arc::new(FixedPolicy(ContactPolicy::BlockAll));
+        let pipeline =
+            UnwrapPipeline::new(vec![recipient], policy, sink.clone()).with_operator(operator.public_key());
+
+        let outcome = pipeline.project(&wrap).await;
+        assert_eq!(
+            outcome,
+            ProjectOutcome::Dropped(ContactPolicy::BlockAll),
+            "operator without the overseer tag is still policy-gated"
+        );
+        let archive = sink.archive.lock();
+        assert_eq!(archive.commit_count().expect("count"), 0);
+        drop(archive);
         let _ = std::fs::remove_dir_all(&root);
     }
 
