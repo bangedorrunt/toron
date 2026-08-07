@@ -636,6 +636,14 @@ already exceeds.
 - **Forge** — branch = channel = PR + CI dashboard + thread; push (`30618`) →
   CI-passed (`1630`) → approval (`46011`) → merge (`1631`); repo = `30617`,
   project = `30621` (groups repos via `a`).
+  > **CORRECTION (2026-08-07, bd-9o9 research):** canonical NIP-34 assigns these
+  > kinds differently. `30618` = repository STATE (branch/tag refs), not "push";
+  > `30621` = git commit, not "project"; `1630`/`1631` = Status Open / Status
+  > Applied-Merged (generic PR/issue status), not "CI-passed"/"merge". There is no
+  > NIP-34 CI-passed kind. The build must follow canonical NIP-34 (patches `1617`,
+  > PRs `1618`, PR-updates `1619`, issues `1621`, status `1630`–`1633`); only `46011`
+  > (approval) is toron-custom and already reserved. Full analysis:
+  > `docs/notes/2026-08-07-forge-nip34-research.md`.
 - **Ephemeral class (20000–29999)** — presence (`20001`), typing: not stored,
   not audited.
 - **buzz-audit** — SHA-256 hash-chain, canonical JSON, `pg_advisory_lock`
