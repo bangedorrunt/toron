@@ -22,7 +22,7 @@
 #![cfg(feature = "p2")]
 
 use nostr_sdk::prelude::*;
-use toron_workflow::channels::{ChannelStore, CHANNEL_CREATE, CHANNEL_MESSAGE, REACTION};
+use toron_workflow::channels::{CHANNEL_CREATE, CHANNEL_MESSAGE, ChannelStore, REACTION};
 
 /// Named actors with fixed keys for a readable scenario trace.
 fn actors() -> (Keys, Keys, Keys, Keys) {

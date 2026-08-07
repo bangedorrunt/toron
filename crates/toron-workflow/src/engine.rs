@@ -274,7 +274,7 @@ pub async fn run_workflow(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{parse_workflow, Action, Workflow};
+    use crate::schema::{Action, Workflow, parse_workflow};
 
     /// A workflow with a `request_approval` step (the WF-08 path) + a delay.
     fn approval_workflow() -> Workflow {

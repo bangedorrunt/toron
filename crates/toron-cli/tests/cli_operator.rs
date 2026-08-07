@@ -98,7 +98,7 @@ fn key_generate_writes_0600_ncryptsec_without_nsec() {
 fn key_inspect_prints_npub_not_nsec() {
     let dir = unique_dir("keyinspect");
     let key_path = dir.join("agent.ncryptsec");
-    let gen = run(&[
+    let generated = run(&[
         "key",
         "generate",
         "--role",
@@ -108,11 +108,14 @@ fn key_inspect_prints_npub_not_nsec() {
         "--json",
     ]);
     assert!(
-        gen.status.success(),
+        generated.status.success(),
         "stderr: {}",
-        String::from_utf8_lossy(&gen.stderr)
+        String::from_utf8_lossy(&generated.stderr)
     );
-    let npub = parse(&gen.stdout)["npub"].as_str().unwrap().to_string();
+    let npub = parse(&generated.stdout)["npub"]
+        .as_str()
+        .unwrap()
+        .to_string();
 
     let out = run(&["key", "inspect", key_path.to_str().unwrap(), "--json"]);
     assert!(

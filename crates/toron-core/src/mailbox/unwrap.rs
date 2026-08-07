@@ -138,7 +138,8 @@ pub fn is_overseer_bypass(mail: &UnwrappedMail, operator: Option<&PublicKey>) ->
     let tags = &mail.rumor.tags;
     let has_overseer = tags.iter().any(|t| {
         let p = t.as_slice();
-        p.first().map(String::as_str) == Some("t") && p.get(1).map(String::as_str) == Some(OVERSEER_TAG)
+        p.first().map(String::as_str) == Some("t")
+            && p.get(1).map(String::as_str) == Some(OVERSEER_TAG)
     });
     if !has_overseer {
         return false;
@@ -573,12 +574,11 @@ impl UnwrapPipeline {
     pub async fn run(&self, mut sub: crate::bus::Subscription) -> anyhow::Result<usize> {
         let mut projected = 0usize;
         while let Some(ev) = sub.next().await {
-            if let crate::bus::SubscriptionEvent::Event(event) = ev {
-                if event.kind == nostr_sdk::nostr::Kind::GiftWrap
-                    && self.project(&event).await == ProjectOutcome::Projected
-                {
-                    projected += 1;
-                }
+            if let crate::bus::SubscriptionEvent::Event(event) = ev
+                && event.kind == nostr_sdk::nostr::Kind::GiftWrap
+                && self.project(&event).await == ProjectOutcome::Projected
+            {
+                projected += 1;
             }
         }
         Ok(projected)
@@ -892,11 +892,15 @@ mod tests {
         let root = temp_archive("overseer-bypass");
         let sink = Arc::new(GitProjectionSink::open(&root).expect("open"));
         let policy = Arc::new(FixedPolicy(ContactPolicy::BlockAll));
-        let pipeline =
-            UnwrapPipeline::new(vec![recipient], policy, sink.clone()).with_operator(operator.public_key());
+        let pipeline = UnwrapPipeline::new(vec![recipient], policy, sink.clone())
+            .with_operator(operator.public_key());
 
         let outcome = pipeline.project(&wrap).await;
-        assert_eq!(outcome, ProjectOutcome::Projected, "overseer bypasses block_all");
+        assert_eq!(
+            outcome,
+            ProjectOutcome::Projected,
+            "overseer bypasses block_all"
+        );
         let archive = sink.archive.lock();
         assert_eq!(
             archive.commit_count().expect("count"),
@@ -920,8 +924,8 @@ mod tests {
         let policy = Arc::new(FixedPolicy(ContactPolicy::BlockAll));
         // The operator is a DIFFERENT key than the sender.
         let operator = keys();
-        let pipeline =
-            UnwrapPipeline::new(vec![recipient], policy, sink.clone()).with_operator(operator.public_key());
+        let pipeline = UnwrapPipeline::new(vec![recipient], policy, sink.clone())
+            .with_operator(operator.public_key());
 
         let outcome = pipeline.project(&wrap).await;
         assert_eq!(
@@ -948,8 +952,8 @@ mod tests {
         let root = temp_archive("overseer-no-tag");
         let sink = Arc::new(GitProjectionSink::open(&root).expect("open"));
         let policy = Arc::new(FixedPolicy(ContactPolicy::BlockAll));
-        let pipeline =
-            UnwrapPipeline::new(vec![recipient], policy, sink.clone()).with_operator(operator.public_key());
+        let pipeline = UnwrapPipeline::new(vec![recipient], policy, sink.clone())
+            .with_operator(operator.public_key());
 
         let outcome = pipeline.project(&wrap).await;
         assert_eq!(

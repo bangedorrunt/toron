@@ -15,7 +15,7 @@ mod tests {
 
     use crate::nostr::event::{build_event, verify_event};
     use crate::nostr::gift_wrap;
-    use crate::nostr::kinds::{toron_kind, AGENT_PROFILE, PROJECT_MANIFEST};
+    use crate::nostr::kinds::{AGENT_PROFILE, PROJECT_MANIFEST, toron_kind};
 
     /// Arbitrary non-empty string content.
     fn any_content() -> impl Strategy<Value = String> {

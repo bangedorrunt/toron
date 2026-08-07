@@ -20,7 +20,7 @@ use nostr_sdk::nostr::{Event, EventId, JsonUtil, Kind, Tag, Timestamp};
 
 use toron_core::nostr::event::build_event;
 use toron_core::nostr::kinds::{
-    toron_kind, JOB_ACCEPTED, JOB_CANCEL, JOB_ERROR, JOB_PROGRESS, JOB_REQUEST, JOB_RESULT,
+    JOB_ACCEPTED, JOB_CANCEL, JOB_ERROR, JOB_PROGRESS, JOB_REQUEST, JOB_RESULT, toron_kind,
 };
 
 /// A job request payload (kind-43001 `content`).

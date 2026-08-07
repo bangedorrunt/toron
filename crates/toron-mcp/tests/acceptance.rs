@@ -4,14 +4,14 @@
 //! bd-led.7.1 acceptance: an rmcp client completes `initialize` over both
 //! transports and the negotiated protocol is 2026-07-28.
 
+use rmcp::ClientServiceExt;
+use rmcp::ServiceExt;
 use rmcp::model::{
     ClientCapabilities, ClientInfo, Implementation, ProtocolVersion, ReadResourceRequestParams,
 };
 use rmcp::transport::streamable_http_client::{
     StreamableHttpClientTransport, StreamableHttpClientTransportConfig,
 };
-use rmcp::ClientServiceExt;
-use rmcp::ServiceExt;
 
 /// The 38 AM-Rust parity tool names (bd-led.7.2).
 const AM_RUST_TOOLS: [&str; 38] = [

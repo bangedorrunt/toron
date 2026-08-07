@@ -25,34 +25,34 @@ pub mod schema;
 pub mod trigger_filter;
 
 pub use channels::{
-    Channel, ChannelEvent, ChannelStore, CHANNEL_CREATE, CHANNEL_MESSAGE, CHANNEL_METADATA,
+    CHANNEL_CREATE, CHANNEL_MESSAGE, CHANNEL_METADATA, Channel, ChannelEvent, ChannelStore,
     REACTION,
 };
 
 pub use coalesce::{
-    CoalesceDecision, Coalesced, FlushOutcome, InboundMention, MentionCoalescer,
-    DEFAULT_MAX_BUFFER, DEFAULT_SUBWINDOW, DEFAULT_WINDOW, subwindow_from_env, window_from_env,
+    CoalesceDecision, Coalesced, DEFAULT_MAX_BUFFER, DEFAULT_SUBWINDOW, DEFAULT_WINDOW,
+    FlushOutcome, InboundMention, MentionCoalescer, subwindow_from_env, window_from_env,
 };
 pub use dispatch::{DispatchConfig, DispatchPermit, DispatchPool, QueuedJob};
-pub use engine::{run_workflow, ActionRunner, Decision, RunInput, WorkflowEngine};
+pub use engine::{ActionRunner, Decision, RunInput, WorkflowEngine, run_workflow};
 pub use guard::{
-    evaluate_guard, evaluate_guard_default, inject_buzz_functions, timeout_from_env, GuardOutcome,
-    DEFAULT_TIMEOUT_MS,
+    DEFAULT_TIMEOUT_MS, GuardOutcome, evaluate_guard, evaluate_guard_default,
+    inject_buzz_functions, timeout_from_env,
 };
 pub use jobs::{
-    build_and_serialize, build_job_cancel, build_job_claim, build_job_error, build_job_progress,
-    build_job_request, build_job_result, first_claimer, job_parent, job_request_json, job_state,
-    JobError, JobRequest, JobResult, JobState,
+    JobError, JobRequest, JobResult, JobState, build_and_serialize, build_job_cancel,
+    build_job_claim, build_job_error, build_job_progress, build_job_request, build_job_result,
+    first_claimer, job_parent, job_request_json, job_state,
 };
-pub use lint::{lint_workflow, lint_yaml, Level, LintIssue, LintReport};
-pub use mention::{content_mentions, is_mention, parse_mentions, Mention};
+pub use lint::{Level, LintIssue, LintReport, lint_workflow, lint_yaml};
+pub use mention::{Mention, content_mentions, is_mention, parse_mentions};
 pub use schema::{
-    parse_workflow, parse_workflows, Action, Step, TemplateContext, Trigger, Workflow,
+    Action, Step, TemplateContext, Trigger, Workflow, parse_workflow, parse_workflows,
 };
 pub use trigger_filter::{
-    has_workflow_emitted_tag, is_workflow_emitted_kind, job_kind, should_evaluate_trigger_event,
-    should_evaluate_trigger_kind, workflow_run_kind, GIFT_WRAP, JOB_EMITS_KINDS,
-    WORKFLOW_EMITTED_TAG,
+    GIFT_WRAP, JOB_EMITS_KINDS, WORKFLOW_EMITTED_TAG, has_workflow_emitted_tag,
+    is_workflow_emitted_kind, job_kind, should_evaluate_trigger_event,
+    should_evaluate_trigger_kind, workflow_run_kind,
 };
 
 /// The canonical example workflow (lints clean — asserted in tests).

@@ -15,8 +15,8 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 use tokio::net::{TcpListener, TcpStream};
-use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tokio_tungstenite::WebSocketStream;
+use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use futures_util::{SinkExt, StreamExt};
 

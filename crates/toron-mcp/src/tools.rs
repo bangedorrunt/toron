@@ -11,8 +11,8 @@
 //! `get_info` can mirror `ToronServer` (name "toron", 2026-07-28).
 
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::tool::IntoCallToolResult;
@@ -21,10 +21,10 @@ use rmcp::model::{
     CallToolResponse, CallToolResult, ContentBlock, Implementation, InitializeResult,
     ProtocolVersion, ServerCapabilities, ServerInfo,
 };
-use rmcp::{schemars, tool, tool_handler, tool_router, ServerHandler};
+use rmcp::{ServerHandler, schemars, tool, tool_handler, tool_router};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use toron_core::backend::herdr::HerdrBackend;
 use toron_core::index::slots::{BuildSlot, GrantedSlot, SlotConflict, SlotStatus};

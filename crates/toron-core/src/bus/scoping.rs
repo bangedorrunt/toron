@@ -56,10 +56,10 @@ pub fn with_project_scoping(
     slug: Option<&str>,
 ) -> Vec<Tag> {
     let mut tags: Vec<Tag> = base_tags.into_iter().collect();
-    if let Some(slug) = slug {
-        if !is_metadata_hiding_kind(kind) {
-            tags.extend(project_scoping_tags(slug));
-        }
+    if let Some(slug) = slug
+        && !is_metadata_hiding_kind(kind)
+    {
+        tags.extend(project_scoping_tags(slug));
     }
     tags
 }

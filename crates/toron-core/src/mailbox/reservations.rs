@@ -24,13 +24,13 @@ use nostr_sdk::nostr::{Event, EventId, Keys, PublicKey, Tag, Timestamp};
 use crate::bus::addressable::is_revocation;
 use crate::bus::filter::kind_project_filter;
 use crate::bus::scoping::with_project_scoping;
-use crate::bus::{resolve_coordinate, EnvelopeTtl};
+use crate::bus::{EnvelopeTtl, resolve_coordinate};
 use crate::mailbox::guard::pattern_matches;
 use crate::nostr::event::build_event;
-use crate::nostr::kinds::{toron_kind, FILE_RESERVATION};
+use crate::nostr::kinds::{FILE_RESERVATION, toron_kind};
 
-use super::collect_replay;
 use super::Mailbox;
+use super::collect_replay;
 
 /// Default staleness threshold for force-release (holder inactive this long
 /// counts as stale). Matches the AM-Rust inactivity heuristic spirit (30 min).
@@ -449,10 +449,10 @@ impl Mailbox {
                 continue;
             }
             // TTL expiry clears the lease.
-            if let Some(exp) = winning.tags.expiration() {
-                if (exp.as_secs() as i64) < now_secs {
-                    continue;
-                }
+            if let Some(exp) = winning.tags.expiration()
+                && (exp.as_secs() as i64) < now_secs
+            {
+                continue;
             }
             let (_, path) = d.split_once(':').unwrap_or(("", &d));
             let exclusive = winning.content.contains("\"exclusive\":true")

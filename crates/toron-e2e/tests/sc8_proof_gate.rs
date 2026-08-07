@@ -18,7 +18,7 @@
 use nostr_sdk::prelude::*;
 use toron_core::index::schema;
 use toron_core::nostr::proof::{
-    build_attestation_event, Attestation, NonceStore, ProofClaim, ProofError, ProofGate,
+    Attestation, NonceStore, ProofClaim, ProofError, ProofGate, build_attestation_event,
 };
 
 #[tokio::test]

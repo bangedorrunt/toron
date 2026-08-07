@@ -37,10 +37,10 @@ async fn all_entries(store: &BusEventStore) -> anyhow::Result<Vec<(u64, negentro
     for row in rows {
         let id_hex: String = sqlx::Row::get(&row, 0);
         let created_at: i64 = sqlx::Row::get(&row, 1);
-        if let Ok(id_bytes) = hex::decode(&id_hex) {
-            if let Ok(id) = negentropy::Id::from_slice(&id_bytes) {
-                out.push((created_at.max(0) as u64, id));
-            }
+        if let Ok(id_bytes) = hex::decode(&id_hex)
+            && let Ok(id) = negentropy::Id::from_slice(&id_bytes)
+        {
+            out.push((created_at.max(0) as u64, id));
         }
     }
     Ok(out)

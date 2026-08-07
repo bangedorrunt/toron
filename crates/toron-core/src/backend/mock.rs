@@ -8,9 +8,9 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
 
+use super::Backend;
 use super::error::BackendError;
 use super::types::{AgentStatus, BackendEvent, PaneId, SpawnOptions};
-use super::Backend;
 
 #[derive(Debug, Clone, Default)]
 struct MockState {

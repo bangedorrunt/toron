@@ -14,7 +14,7 @@ use clap::Parser;
 
 use crate::cli::{Cli, Command};
 use crate::config::Config;
-use crate::output::{render_json, stdout_is_tty, ColorChoice, OutputFormat};
+use crate::output::{ColorChoice, OutputFormat, render_json, stdout_is_tty};
 
 fn main() -> ExitCode {
     // Exit codes (clig.dev, ADR-0003): 0 ok · 1 runtime · 2 usage (clap

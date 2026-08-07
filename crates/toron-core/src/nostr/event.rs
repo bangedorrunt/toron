@@ -8,8 +8,8 @@
 //! relay's expectations. Verification rejects forged/mutated events (wrong id
 //! or sig).
 
-use nostr_sdk::nostr::event::builder::Error as BuilderError;
 use nostr_sdk::nostr::event::Error as EventError;
+use nostr_sdk::nostr::event::builder::Error as BuilderError;
 use nostr_sdk::nostr::{Event, EventBuilder, JsonUtil, Keys, Kind, Tag, Timestamp};
 
 /// Error returned by verification.

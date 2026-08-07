@@ -83,10 +83,10 @@ impl Config {
 
     /// Effective envelope TTL for a project (per-project override or global default).
     pub fn envelope_ttl_days(&self, project: Option<&str>) -> u64 {
-        if let Some(slug) = project {
-            if let Some(pt) = self.project_ttl_days.iter().find(|pt| pt.project == slug) {
-                return pt.days;
-            }
+        if let Some(slug) = project
+            && let Some(pt) = self.project_ttl_days.iter().find(|pt| pt.project == slug)
+        {
+            return pt.days;
         }
         self.envelope_ttl_days.unwrap_or(DEFAULT_ENVELOPE_TTL_DAYS)
     }
@@ -167,45 +167,45 @@ impl Config {
 
     fn merge_env(&mut self) {
         // No secrets in env values — only paths/booleans (ADR CLI design).
-        if let Ok(v) = env::var("TORON_CONFIG") {
-            if !v.is_empty() {
-                self.merge_file(Path::new(&v));
-            }
+        if let Ok(v) = env::var("TORON_CONFIG")
+            && !v.is_empty()
+        {
+            self.merge_file(Path::new(&v));
         }
-        if let Ok(v) = env::var("TORON_DATA_DIR") {
-            if !v.is_empty() {
-                self.data_dir = Some(PathBuf::from(v));
-            }
+        if let Ok(v) = env::var("TORON_DATA_DIR")
+            && !v.is_empty()
+        {
+            self.data_dir = Some(PathBuf::from(v));
         }
-        if let Ok(v) = env::var("TORON_BACKEND") {
-            if !v.is_empty() {
-                self.backend = Some(v);
-            }
+        if let Ok(v) = env::var("TORON_BACKEND")
+            && !v.is_empty()
+        {
+            self.backend = Some(v);
         }
-        if let Ok(v) = env::var("TORON_OPERATOR_KEY") {
-            if !v.is_empty() {
-                self.operator_key = Some(PathBuf::from(v));
-            }
+        if let Ok(v) = env::var("TORON_OPERATOR_KEY")
+            && !v.is_empty()
+        {
+            self.operator_key = Some(PathBuf::from(v));
         }
-        if let Ok(v) = env::var("TORON_ENVELOPE_TTL_DAYS") {
-            if let Ok(days) = v.parse::<u64>() {
-                self.envelope_ttl_days = Some(days);
-            }
+        if let Ok(v) = env::var("TORON_ENVELOPE_TTL_DAYS")
+            && let Ok(days) = v.parse::<u64>()
+        {
+            self.envelope_ttl_days = Some(days);
         }
-        if let Ok(v) = env::var("TORON_PROOF_GATE_ENABLED") {
-            if let Ok(b) = v.parse::<bool>() {
-                self.proof_gate_enabled = Some(b);
-            }
+        if let Ok(v) = env::var("TORON_PROOF_GATE_ENABLED")
+            && let Ok(b) = v.parse::<bool>()
+        {
+            self.proof_gate_enabled = Some(b);
         }
-        if let Ok(v) = env::var("TORON_PROOF_SCHEME") {
-            if !v.is_empty() {
-                self.proof_scheme = Some(v);
-            }
+        if let Ok(v) = env::var("TORON_PROOF_SCHEME")
+            && !v.is_empty()
+        {
+            self.proof_scheme = Some(v);
         }
-        if let Ok(v) = env::var("TORON_GIT_BINARY") {
-            if !v.is_empty() {
-                self.git_binary = Some(PathBuf::from(v));
-            }
+        if let Ok(v) = env::var("TORON_GIT_BINARY")
+            && !v.is_empty()
+        {
+            self.git_binary = Some(PathBuf::from(v));
         }
     }
 }

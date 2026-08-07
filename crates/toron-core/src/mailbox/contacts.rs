@@ -24,10 +24,10 @@ use sqlx::Row;
 use crate::bus::filter::kind_project_filter;
 use crate::bus::scoping::with_project_scoping;
 use crate::mailbox::unwrap::ContactPolicy;
-use crate::nostr::kinds::{toron_kind, AGENT_PROFILE, CONTACT_POLICY};
+use crate::nostr::kinds::{AGENT_PROFILE, CONTACT_POLICY, toron_kind};
 
-use super::collect_replay;
 use super::Mailbox;
+use super::collect_replay;
 /// Status of an AgentLink.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LinkStatus {
@@ -436,10 +436,10 @@ impl Mailbox {
         for entry in entries.flatten() {
             let slug = entry.file_name().to_string_lossy().to_string();
             let filter = kind_project_filter(toron_kind(AGENT_PROFILE), &slug);
-            if let Ok(events) = collect_replay(self.bus.as_ref(), filter).await {
-                if events.iter().any(|e| e.pubkey == *npub) {
-                    return slug;
-                }
+            if let Ok(events) = collect_replay(self.bus.as_ref(), filter).await
+                && events.iter().any(|e| e.pubkey == *npub)
+            {
+                return slug;
             }
         }
         String::new()
@@ -451,8 +451,8 @@ mod tests {
     use super::*;
     use crate::bus::in_process::{InProcessBus, InProcessBusConfig};
     use crate::index::schema;
-    use crate::mailbox::unwrap::PolicySource;
     use crate::mailbox::Mailbox;
+    use crate::mailbox::unwrap::PolicySource;
     use crate::nostr::identity::AgentProfile;
     use std::sync::Arc;
 
@@ -518,10 +518,12 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].kind.as_u16(), CONTACT_POLICY);
         assert_eq!(events[0].content, "block_all");
-        assert!(events[0]
-            .tags
-            .iter()
-            .any(|t| t.as_slice() == ["t".to_string(), "demo".to_string()]));
+        assert!(
+            events[0]
+                .tags
+                .iter()
+                .any(|t| t.as_slice() == ["t".to_string(), "demo".to_string()])
+        );
         assert!(events[0]
             .tags
             .iter()

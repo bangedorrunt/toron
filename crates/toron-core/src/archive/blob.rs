@@ -186,10 +186,11 @@ mod tests {
 
         // Tag set carries the hash + file type.
         let tags = file_ref.tags();
-        assert!(tags
-            .iter()
-            .any(|t| t.as_slice().first().map(String::as_str) == Some("x")
-                && t.as_slice().get(1).map(String::as_str) == Some(&hash)));
+        assert!(
+            tags.iter()
+                .any(|t| t.as_slice().first().map(String::as_str) == Some("x")
+                    && t.as_slice().get(1).map(String::as_str) == Some(&hash))
+        );
 
         // Recipient fetches by hash and recovers the exact bytes.
         assert_eq!(store.get(&hash).expect("fetch").len(), payload.len());

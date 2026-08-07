@@ -31,7 +31,7 @@ use toron_core::index::schema;
 use toron_core::mailbox::Mailbox;
 use toron_core::nostr::identity::AgentProfile;
 use toron_workflow::dispatch::{DispatchConfig, DispatchPool, QueuedJob};
-use toron_workflow::jobs::{build_job_claim, build_job_request, first_claimer, JobRequest};
+use toron_workflow::jobs::{JobRequest, build_job_claim, build_job_request, first_claimer};
 use toron_workflow::schema::Trigger;
 
 async fn boot(dir: &std::path::Path) -> (Mailbox, InProcessBus) {

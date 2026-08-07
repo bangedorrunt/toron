@@ -176,14 +176,13 @@ pub async fn inspect_index(db_path: &Path) -> anyhow::Result<(bool, bool, Option
         Err(_) => return Ok((true, false, None)),
     };
     // integrity_check returns one row whose first column is "ok" on success.
-    let integrity_ok =
-        match sqlx::query_scalar::<_, String>("PRAGMA integrity_check")
-            .fetch_optional(&pool)
-            .await
-        {
-            Ok(Some(s)) => s.trim().eq_ignore_ascii_case("ok"),
-            _ => false,
-        };
+    let integrity_ok = match sqlx::query_scalar::<_, String>("PRAGMA integrity_check")
+        .fetch_optional(&pool)
+        .await
+    {
+        Ok(Some(s)) => s.trim().eq_ignore_ascii_case("ok"),
+        _ => false,
+    };
     let rows = sqlx::query_scalar::<_, i64>("SELECT count(*) FROM messages")
         .fetch_optional(&pool)
         .await
@@ -220,10 +219,9 @@ pub async fn build_fresh_index(
 
     // Single connection: checkpoint + verify the main file is authoritative.
     let mut conn = crate::index::schema::connect_single(db_path).await?;
-    let (busy, _log, _ckpt): (i64, i64, i64) =
-        sqlx::query_as("PRAGMA wal_checkpoint(TRUNCATE)")
-            .fetch_one(&mut conn)
-            .await?;
+    let (busy, _log, _ckpt): (i64, i64, i64) = sqlx::query_as("PRAGMA wal_checkpoint(TRUNCATE)")
+        .fetch_one(&mut conn)
+        .await?;
     if busy != 0 {
         anyhow::bail!(
             "wal_checkpoint busy={busy}; refusing to seal a fresh index that may still have uncheckpointed WAL frames"

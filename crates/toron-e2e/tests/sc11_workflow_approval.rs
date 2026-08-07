@@ -29,7 +29,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use toron_workflow::engine::{ActionRunner, Decision, RunInput, WorkflowEngine};
-use toron_workflow::schema::{parse_workflow, Action, Workflow};
+use toron_workflow::schema::{Action, Workflow, parse_workflow};
 
 /// A `deploy` workflow that hits `request_approval` after one step.
 fn deploy_workflow() -> Workflow {

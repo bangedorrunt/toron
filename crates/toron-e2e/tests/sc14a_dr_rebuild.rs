@@ -13,7 +13,7 @@
 
 use sqlx::Row;
 use toron_core::archive::git::GitArchive;
-use toron_core::index::rebuild::{rebuild_index_from_git, MailRecord};
+use toron_core::index::rebuild::{MailRecord, rebuild_index_from_git};
 use toron_core::index::schema;
 use toron_core::index::writer::IndexWriter;
 

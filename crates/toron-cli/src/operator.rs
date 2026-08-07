@@ -21,7 +21,7 @@ use crate::cli::{
     ProjectEnsureArgs, RelayCommand, RelayUrlArg, ReserveCommand, SlotCommand,
 };
 use crate::config::Config;
-use crate::output::{render_json, OutputFormat};
+use crate::output::{OutputFormat, render_json};
 use toron_mcp::ToJson;
 
 /// argon2 log-n for operator keys (spec: 12 — dev-speed, still strong).
@@ -198,11 +198,14 @@ fn enumerate_projects(data_dir: &Path, filter: Option<&str>) -> Vec<PathBuf> {
         if !path.is_dir() {
             continue;
         }
-        let slug = path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-        if let Some(f) = filter {
-            if f != slug {
-                continue;
-            }
+        let slug = path
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if let Some(f) = filter
+            && f != slug
+        {
+            continue;
         }
         // Archive signature: a `messages/` dir (the rebuild path reads it).
         if path.join("messages").is_dir() {
@@ -292,7 +295,12 @@ async fn reconstruct_project(root: &Path, dry_run: bool) -> anyhow::Result<Recon
             rebuilt_rows: None,
             quarantine: None,
             status: "would_rebuild".into(),
-            reason: Some(reason_needs_rebuild(db_exists, integrity_ok, index_rows, archive_messages)),
+            reason: Some(reason_needs_rebuild(
+                db_exists,
+                integrity_ok,
+                index_rows,
+                archive_messages,
+            )),
         });
     }
 
@@ -327,21 +335,22 @@ async fn reconstruct_project(root: &Path, dry_run: bool) -> anyhow::Result<Recon
     let new_db = root.join("index.sqlite.new");
     let _ = std::fs::remove_file(&new_db); // clear any stale .new
     let new_db_str = new_db.to_string_lossy().to_string();
-    let (rebuilt, rows) = match toron_core::index::rebuild::build_fresh_index(&new_db_str, root).await {
-        Ok(pair) => pair,
-        Err(e) => {
-            let _ = std::fs::remove_file(&new_db);
-            return Ok(ReconstructReport {
-                slug,
-                archive_messages,
-                index_rows_before: index_rows,
-                rebuilt_rows: None,
-                quarantine,
-                status: "failed".into(),
-                reason: Some(format!("rebuild failed: {e}")),
-            });
-        }
-    };
+    let (rebuilt, rows) =
+        match toron_core::index::rebuild::build_fresh_index(&new_db_str, root).await {
+            Ok(pair) => pair,
+            Err(e) => {
+                let _ = std::fs::remove_file(&new_db);
+                return Ok(ReconstructReport {
+                    slug,
+                    archive_messages,
+                    index_rows_before: index_rows,
+                    rebuilt_rows: None,
+                    quarantine,
+                    status: "failed".into(),
+                    reason: Some(format!("rebuild failed: {e}")),
+                });
+            }
+        };
 
     // Convergence verify: fresh rows == rebuilt == archive count.
     if rows != rebuilt || rebuilt != archive_messages {
@@ -407,7 +416,11 @@ enum ReconstructExit {
 
 /// Pure decision over the reconstruct results (ADR-0004 Ship 3 exit-code
 /// discipline: 0 ok · 1 failed · 3 diagnostic).
-fn classify_exit(reports: &[ReconstructReport], resolved: bool, project_count: usize) -> ReconstructExit {
+fn classify_exit(
+    reports: &[ReconstructReport],
+    resolved: bool,
+    project_count: usize,
+) -> ReconstructExit {
     if !resolved || project_count == 0 {
         return ReconstructExit::Diagnostic;
     }
@@ -468,20 +481,42 @@ pub fn run_doctor_reconstruct(
                 let detail = if !resolved {
                     "no data dir located".to_string()
                 } else {
-                    format!("no project archives under {}", data_dir.as_ref().unwrap().display())
+                    format!(
+                        "no project archives under {}",
+                        data_dir.as_ref().unwrap().display()
+                    )
                 };
                 println!("toron doctor reconstruct — diagnostic: {detail}");
             } else {
-                println!("toron doctor reconstruct{}", if args.dry_run { " (dry-run)" } else { "" });
+                println!(
+                    "toron doctor reconstruct{}",
+                    if args.dry_run { " (dry-run)" } else { "" }
+                );
                 for r in &reports {
                     let detail = match r.status.as_str() {
-                        "healthy" => format!("{} archived, {} rows — no action", r.archive_messages, r.index_rows_before.unwrap_or(-1)),
-                        "would_rebuild" => format!("would rebuild {} archived ({})", r.archive_messages, r.reason.as_deref().unwrap_or("")),
-                        "rebuilt" => format!("rebuilt {} rows from {} archived", r.rebuilt_rows.unwrap_or(0), r.archive_messages),
+                        "healthy" => format!(
+                            "{} archived, {} rows — no action",
+                            r.archive_messages,
+                            r.index_rows_before.unwrap_or(-1)
+                        ),
+                        "would_rebuild" => format!(
+                            "would rebuild {} archived ({})",
+                            r.archive_messages,
+                            r.reason.as_deref().unwrap_or("")
+                        ),
+                        "rebuilt" => format!(
+                            "rebuilt {} rows from {} archived",
+                            r.rebuilt_rows.unwrap_or(0),
+                            r.archive_messages
+                        ),
                         "failed" => format!("FAILED: {}", r.reason.as_deref().unwrap_or("unknown")),
                         _ => r.status.clone(),
                     };
-                    let q = r.quarantine.as_deref().map(|p| format!("  forensic: {p}")).unwrap_or_default();
+                    let q = r
+                        .quarantine
+                        .as_deref()
+                        .map(|p| format!("  forensic: {p}"))
+                        .unwrap_or_default();
                     println!("  [{:>12}] {} — {}{}", r.status, r.slug, detail, q);
                 }
             }
@@ -540,10 +575,10 @@ fn metrics_file_path() -> PathBuf {
 fn state() -> &'static Mutex<MetricsState> {
     STATE.get_or_init(|| {
         let mut loaded = MetricsState::default();
-        if let Ok(raw) = std::fs::read_to_string(metrics_file_path()) {
-            if let Ok(parsed) = serde_json::from_str::<MetricsState>(&raw) {
-                loaded = parsed;
-            }
+        if let Ok(raw) = std::fs::read_to_string(metrics_file_path())
+            && let Ok(parsed) = serde_json::from_str::<MetricsState>(&raw)
+        {
+            loaded = parsed;
         }
         Mutex::new(loaded)
     })
@@ -796,7 +831,9 @@ mod reconstruct_tests {
     //! proof). Tests call the internal async fns directly (no subprocess).
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
-    use toron_core::index::rebuild::{build_fresh_index, inspect_index as core_inspect, MailRecord};
+    use toron_core::index::rebuild::{
+        MailRecord, build_fresh_index, inspect_index as core_inspect,
+    };
 
     static SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -850,7 +887,9 @@ mod reconstruct_tests {
 
     async fn build_index(root: &Path) {
         let db = root.join("index.sqlite");
-        build_fresh_index(db.to_str().unwrap(), root).await.expect("build index");
+        build_fresh_index(db.to_str().unwrap(), root)
+            .await
+            .expect("build index");
     }
 
     #[tokio::test]
@@ -865,7 +904,10 @@ mod reconstruct_tests {
         let report = reconstruct_project(&root, false).await.unwrap();
         assert_eq!(report.status, "rebuilt");
         assert_eq!(report.rebuilt_rows, Some(2));
-        assert!(report.quarantine.is_none(), "no quarantine when db was absent");
+        assert!(
+            report.quarantine.is_none(),
+            "no quarantine when db was absent"
+        );
 
         let (exists, ok, rows) = core_inspect(&root.join("index.sqlite")).await.unwrap();
         assert!(exists && ok, "rebuilt db is present + integral");
@@ -886,10 +928,11 @@ mod reconstruct_tests {
         assert_eq!(report.status, "healthy");
         assert!(report.quarantine.is_none());
         // No forensic bundle created.
-        let no_forensic = std::fs::read_dir(&root)
-            .unwrap()
-            .flatten()
-            .all(|e| !e.file_name().to_string_lossy().starts_with("doctor-forensic"));
+        let no_forensic = std::fs::read_dir(&root).unwrap().flatten().all(|e| {
+            !e.file_name()
+                .to_string_lossy()
+                .starts_with("doctor-forensic")
+        });
         assert!(no_forensic, "healthy index must not be mutated");
 
         let _ = std::fs::remove_dir_all(dir);
@@ -926,9 +969,15 @@ mod reconstruct_tests {
         let report = reconstruct_project(&root, false).await.unwrap();
         assert_eq!(report.status, "rebuilt");
         assert_eq!(report.rebuilt_rows, Some(3));
-        let q = report.quarantine.as_ref().expect("db existed → quarantined");
+        let q = report
+            .quarantine
+            .as_ref()
+            .expect("db existed → quarantined");
         let qpath = PathBuf::from(q);
-        assert!(qpath.join("index.sqlite.orig").exists(), "original db preserved in bundle");
+        assert!(
+            qpath.join("index.sqlite.orig").exists(),
+            "original db preserved in bundle"
+        );
         assert!(qpath.join("manifest.json").exists(), "manifest written");
 
         let (_, _, rows) = core_inspect(&root.join("index.sqlite")).await.unwrap();
@@ -949,7 +998,10 @@ mod reconstruct_tests {
         let report = reconstruct_project(&root, true).await.unwrap();
         assert_eq!(report.status, "would_rebuild");
         assert!(report.quarantine.is_none(), "dry-run must not quarantine");
-        assert!(!root.join("index.sqlite").exists(), "dry-run must not build");
+        assert!(
+            !root.join("index.sqlite").exists(),
+            "dry-run must not build"
+        );
         assert!(report.reason.is_some(), "dry-run explains why");
 
         let _ = std::fs::remove_dir_all(dir);
@@ -962,28 +1014,61 @@ mod reconstruct_tests {
         assert_eq!(classify_exit(&[], true, 0), ReconstructExit::Diagnostic);
         // Ok when all healthy/rebuilt.
         let ok = vec![ReconstructReport {
-            slug: "a".into(), archive_messages: 1, index_rows_before: Some(1),
-            rebuilt_rows: None, quarantine: None, status: "healthy".into(), reason: None,
+            slug: "a".into(),
+            archive_messages: 1,
+            index_rows_before: Some(1),
+            rebuilt_rows: None,
+            quarantine: None,
+            status: "healthy".into(),
+            reason: None,
         }];
         assert_eq!(classify_exit(&ok, true, 1), ReconstructExit::Ok);
         // Failed when any project failed (quarantine preserved).
         let mut mixed = ok.clone();
         mixed.push(ReconstructReport {
-            slug: "b".into(), archive_messages: 1, index_rows_before: None,
-            rebuilt_rows: None, quarantine: Some("x".into()), status: "failed".into(),
+            slug: "b".into(),
+            archive_messages: 1,
+            index_rows_before: None,
+            rebuilt_rows: None,
+            quarantine: Some("x".into()),
+            status: "failed".into(),
             reason: Some("verify mismatch".into()),
         });
         assert_eq!(classify_exit(&mixed, true, 2), ReconstructExit::Failed);
     }
 
     #[test]
-    fn run_doctor_reconstruct_no_data_dir_exits_diagnostic() {
-        // No --data-dir, no env, no config → Diagnostic (exit 3).
-        std::env::remove_var("TORON_DATA_DIR");
+    fn run_doctor_reconstruct_missing_data_dir_exits_diagnostic() {
+        // Env-independent Diagnostic path: an explicitly-passed data dir that
+        // does not exist resolves to `resolved=false` → exit 3. (The env
+        // fallback branch is not testable here without `set_var`, which is
+        // unsafe in edition 2024 and toron forbids unsafe; the precedence
+        // rules are covered by `resolve_data_dir_prefers_explicit`.)
         let cfg = Config::default();
-        let args = DoctorReconstructArgs { dry_run: false, project: None, data_dir: None };
+        let args = DoctorReconstructArgs {
+            dry_run: false,
+            project: None,
+            data_dir: Some(PathBuf::from("/nonexistent/definitely-missing-toron-data")),
+        };
         let code = run_doctor_reconstruct(&cfg, &args, OutputFormat::Json).unwrap();
         assert_eq!(code, ExitCode::from(3));
+    }
+
+    #[test]
+    fn resolve_data_dir_prefers_explicit_override() {
+        // --data-dir beats env + config, independent of ambient env state.
+        let cfg = Config::default();
+        let explicit = PathBuf::from("/explicit/path");
+        assert_eq!(
+            resolve_data_dir(&cfg, Some(&explicit)),
+            Some(explicit.clone())
+        );
+        // With no override and no config, env is consulted; without any of
+        // them → None (Diagnostic).
+        assert_eq!(
+            resolve_data_dir(&cfg, None),
+            std::env::var_os("TORON_DATA_DIR").map(PathBuf::from)
+        );
     }
 
     #[test]
@@ -997,7 +1082,6 @@ mod reconstruct_tests {
             rec.archive_to(&root).unwrap();
         }
         // No index yet → reconstruct will build it.
-        std::env::remove_var("TORON_DATA_DIR");
         let cfg = Config::default();
         let args = DoctorReconstructArgs {
             dry_run: false,

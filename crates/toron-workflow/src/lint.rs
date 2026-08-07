@@ -150,16 +150,16 @@ pub fn lint_workflow(wf: &Workflow) -> LintReport {
     }
     let mut step_names: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for step in &wf.steps {
-        if let Some(name) = &step.name {
-            if !step_names.insert(name) {
-                report.issues.push(LintIssue {
-                    level: Level::Error,
-                    message: format!(
-                        "duplicate step name {name:?} — {{{{steps.{name}}}}} is ambiguous"
-                    ),
-                    line: None,
-                });
-            }
+        if let Some(name) = &step.name
+            && !step_names.insert(name)
+        {
+            report.issues.push(LintIssue {
+                level: Level::Error,
+                message: format!(
+                    "duplicate step name {name:?} — {{{{steps.{name}}}}} is ambiguous"
+                ),
+                line: None,
+            });
         }
         if let Some(guard) = &step.guard {
             check_guard(&mut report, guard, "step guard");

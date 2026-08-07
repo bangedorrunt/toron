@@ -17,11 +17,11 @@
 
 use std::sync::Arc;
 
-use toron_core::bus::in_process::{AuthPolicy, InProcessBusConfig};
 use toron_core::bus::InProcessBus;
+use toron_core::bus::in_process::{AuthPolicy, InProcessBusConfig};
 use toron_core::index::schema;
-use toron_core::mailbox::guard::{guard_blocked_paths, Reservation};
 use toron_core::mailbox::Mailbox;
+use toron_core::mailbox::guard::{Reservation, guard_blocked_paths};
 use toron_core::nostr::identity::AgentProfile;
 
 async fn boot(dir: &std::path::Path) -> (Mailbox, InProcessBus) {

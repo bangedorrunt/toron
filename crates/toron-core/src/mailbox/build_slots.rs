@@ -16,7 +16,7 @@ use crate::bus::scoping::with_project_scoping;
 use crate::index::slots;
 use crate::mailbox::Mailbox;
 use crate::nostr::event::build_event;
-use crate::nostr::kinds::{toron_kind, BUILD_SLOT};
+use crate::nostr::kinds::{BUILD_SLOT, toron_kind};
 
 /// Acquire result (parity shape).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

@@ -66,14 +66,24 @@ pub const MAX_PAREN_DEPTH: usize = 64;
 /// size.
 pub const MAX_PARENS: usize = 64;
 
+/// Parse a `TORON_GUARD_TIMEOUT_MS`-style value: a positive integer number of
+/// milliseconds → `Some`, anything else (empty, zero, garbage) → `None`
+/// (caller falls back to the default). Pure — tests exercise it without env
+/// access.
+pub fn parse_timeout_ms(s: &str) -> Option<Duration> {
+    s.trim()
+        .parse::<u64>()
+        .ok()
+        .filter(|&ms| ms > 0)
+        .map(Duration::from_millis)
+}
+
 /// Read the guard timeout from `TORON_GUARD_TIMEOUT_MS`, falling back to
 /// [`DEFAULT_TIMEOUT_MS`]. Unset/empty/unparseable/zero → default.
 pub fn timeout_from_env() -> Duration {
     std::env::var("TORON_GUARD_TIMEOUT_MS")
         .ok()
-        .and_then(|s| s.trim().parse::<u64>().ok())
-        .filter(|&ms| ms > 0)
-        .map(Duration::from_millis)
+        .and_then(|s| parse_timeout_ms(&s))
         .unwrap_or_else(|| Duration::from_millis(DEFAULT_TIMEOUT_MS))
 }
 
@@ -109,10 +119,7 @@ impl GuardOutcome {
     /// Whether the step should PROCEED (guard true or unset). Convenience for
     /// the engine.
     pub fn proceeds(&self) -> bool {
-        matches!(
-            self,
-            Self::Bool(true) | Self::Unset
-        )
+        matches!(self, Self::Bool(true) | Self::Unset)
     }
 }
 
@@ -199,21 +206,30 @@ pub fn inject_buzz_functions(ctx: &mut HashMapContext<DefaultNumericTypes>) {
         let args = argument.as_fixed_len_tuple(2)?;
         match (&args[0], &args[1]) {
             (Value::String(h), Value::String(n)) => Ok(Value::from(h.contains(n.as_str()))),
-            _ => Err(EvalexprError::type_error(args[0].clone(), vec![ValueType::String])),
+            _ => Err(EvalexprError::type_error(
+                args[0].clone(),
+                vec![ValueType::String],
+            )),
         }
     });
     let str_starts_with = Function::new(|argument| {
         let args = argument.as_fixed_len_tuple(2)?;
         match (&args[0], &args[1]) {
             (Value::String(s), Value::String(p)) => Ok(Value::from(s.starts_with(p.as_str()))),
-            _ => Err(EvalexprError::type_error(args[0].clone(), vec![ValueType::String])),
+            _ => Err(EvalexprError::type_error(
+                args[0].clone(),
+                vec![ValueType::String],
+            )),
         }
     });
     let str_ends_with = Function::new(|argument| {
         let args = argument.as_fixed_len_tuple(2)?;
         match (&args[0], &args[1]) {
             (Value::String(s), Value::String(suf)) => Ok(Value::from(s.ends_with(suf.as_str()))),
-            _ => Err(EvalexprError::type_error(args[0].clone(), vec![ValueType::String])),
+            _ => Err(EvalexprError::type_error(
+                args[0].clone(),
+                vec![ValueType::String],
+            )),
         }
     });
     let str_len = Function::new(|argument| {
@@ -237,9 +253,9 @@ pub fn complexity_violation(expr: &str) -> Option<String> {
             "expression is {len} chars, exceeds {MAX_GUARD_CHARS} limit"
         ));
     }
-    let mut depth = 0usize;      // paren nesting (calls/subexpressions)
-    let mut parens = 0usize;     // total `(` count (tree size)
-    let mut bracket = 0usize;    // `[` nesting (evalexpr array/tuple literals)
+    let mut depth = 0usize; // paren nesting (calls/subexpressions)
+    let mut parens = 0usize; // total `(` count (tree size)
+    let mut bracket = 0usize; // `[` nesting (evalexpr array/tuple literals)
     let mut in_string = false;
     let mut escaped = false;
     for c in expr.chars() {
@@ -342,9 +358,12 @@ mod tests {
         let v = vars(&[("trigger_channel", "#forge")]);
         // evalexpr identifiers can't contain '.', so tests use underscores;
         // the engine substitutes {{trigger.channel}} → a valid identifier.
-        let out =
-            evaluate_guard(Some("trigger_channel == \"#forge\""), &v, Duration::from_millis(100))
-                .await;
+        let out = evaluate_guard(
+            Some("trigger_channel == \"#forge\""),
+            &v,
+            Duration::from_millis(100),
+        )
+        .await;
         assert_eq!(out, GuardOutcome::Bool(true));
     }
 
@@ -364,11 +383,21 @@ mod tests {
     async fn str_starts_with_custom_fn() {
         let v = vars(&[("trigger_text", "P1 crash")]);
         assert_eq!(
-            evaluate_guard(Some("str_starts_with(trigger_text, \"P1\")"), &v, Duration::from_millis(100)).await,
+            evaluate_guard(
+                Some("str_starts_with(trigger_text, \"P1\")"),
+                &v,
+                Duration::from_millis(100)
+            )
+            .await,
             GuardOutcome::Bool(true)
         );
         assert_eq!(
-            evaluate_guard(Some("str_starts_with(trigger_text, \"P2\")"), &v, Duration::from_millis(100)).await,
+            evaluate_guard(
+                Some("str_starts_with(trigger_text, \"P2\")"),
+                &v,
+                Duration::from_millis(100)
+            )
+            .await,
             GuardOutcome::Bool(false)
         );
     }
@@ -377,7 +406,12 @@ mod tests {
     async fn str_ends_with_custom_fn() {
         let v = vars(&[("trigger_text", "deploy.log")]);
         assert_eq!(
-            evaluate_guard(Some("str_ends_with(trigger_text, \".log\")"), &v, Duration::from_millis(100)).await,
+            evaluate_guard(
+                Some("str_ends_with(trigger_text, \".log\")"),
+                &v,
+                Duration::from_millis(100)
+            )
+            .await,
             GuardOutcome::Bool(true)
         );
     }
@@ -386,7 +420,12 @@ mod tests {
     async fn str_len_custom_fn() {
         let v = vars(&[("trigger_text", "hello")]);
         assert_eq!(
-            evaluate_guard(Some("str_len(trigger_text) > 3"), &v, Duration::from_millis(100)).await,
+            evaluate_guard(
+                Some("str_len(trigger_text) > 3"),
+                &v,
+                Duration::from_millis(100)
+            )
+            .await,
             GuardOutcome::Bool(true)
         );
     }
@@ -428,8 +467,12 @@ mod tests {
         // 8MB haystack; values live in the context, so the EXPRESSION stays
         // short and passes the pre-scan.
         m.insert("text".into(), Value::from("x".repeat(8_000_000)));
-        let out =
-            evaluate_guard(Some("str_contains(text, \"zzzz\")"), &m, Duration::from_millis(1)).await;
+        let out = evaluate_guard(
+            Some("str_contains(text, \"zzzz\")"),
+            &m,
+            Duration::from_millis(1),
+        )
+        .await;
         match out {
             GuardOutcome::TimedOut { .. } => { /* expected: 1ms deadline vs ms-scale scan */ }
             GuardOutcome::Bool(false) => { /* occasionally finishes <1ms — also fine */ }
@@ -443,8 +486,7 @@ mod tests {
         // 200-deep nested ( ... ) — over MAX_PAREN_DEPTH=64, under the char
         // cap. Parens here are real grouping, not string literals.
         let expr = "(".repeat(200) + "true" + &")".repeat(200);
-        let out =
-            evaluate_guard(Some(&expr), &HashMap::new(), Duration::from_millis(100)).await;
+        let out = evaluate_guard(Some(&expr), &HashMap::new(), Duration::from_millis(100)).await;
         assert!(
             matches!(out, GuardOutcome::TooComplex { .. }),
             "expected TooComplex for 200-deep nesting, got {out:?}"
@@ -473,8 +515,7 @@ mod tests {
         // 200-deep `[[[[...]]]]` wrapping a scalar — under the char cap, over
         // MAX_PAREN_DEPTH=64 bracket depth.
         let expr = "[".repeat(200) + "true" + &"]".repeat(200);
-        let out =
-            evaluate_guard(Some(&expr), &HashMap::new(), Duration::from_millis(100)).await;
+        let out = evaluate_guard(Some(&expr), &HashMap::new(), Duration::from_millis(100)).await;
         assert!(
             matches!(out, GuardOutcome::TooComplex { .. }),
             "expected TooComplex for 200-deep bracket nesting, got {out:?}"
@@ -484,8 +525,12 @@ mod tests {
     /// A non-boolean result is a TypeError (fail-stop, invariant 7).
     #[tokio::test]
     async fn non_boolean_is_type_error() {
-        let out =
-            evaluate_guard(Some("\"a string\""), &HashMap::new(), Duration::from_millis(100)).await;
+        let out = evaluate_guard(
+            Some("\"a string\""),
+            &HashMap::new(),
+            Duration::from_millis(100),
+        )
+        .await;
         assert!(matches!(out, GuardOutcome::TypeError { .. }));
         assert!(!out.proceeds(), "type error must NOT proceed");
     }
@@ -507,26 +552,16 @@ mod tests {
         assert!(!out.proceeds());
     }
 
-    /// Env override reads through; zero/garbage fall back to default.
+    /// Pure parse of the env value (no env mutation — `set_var` is unsafe in
+    /// edition 2024 and toron forbids unsafe; the env-dependent override is
+    /// covered by the integration test `tests/guard_env.rs`).
     #[test]
-    fn env_timeout_override() {
-        std::env::set_var("TORON_GUARD_TIMEOUT_MS", "42");
-        assert_eq!(timeout_from_env(), Duration::from_millis(42));
-        std::env::set_var("TORON_GUARD_TIMEOUT_MS", "0");
-        assert_eq!(timeout_from_env(), Duration::from_millis(DEFAULT_TIMEOUT_MS));
-        std::env::set_var("TORON_GUARD_TIMEOUT_MS", "garbage");
-        assert_eq!(timeout_from_env(), Duration::from_millis(DEFAULT_TIMEOUT_MS));
-        std::env::remove_var("TORON_GUARD_TIMEOUT_MS");
-        assert_eq!(timeout_from_env(), Duration::from_millis(DEFAULT_TIMEOUT_MS));
-    }
-
-    /// `evaluate_guard_default` uses the env timeout.
-    #[tokio::test]
-    async fn default_uses_env_timeout() {
-        std::env::set_var("TORON_GUARD_TIMEOUT_MS", "200");
-        let out = evaluate_guard_default(Some("true"), &HashMap::new()).await;
-        assert_eq!(out, GuardOutcome::Bool(true));
-        std::env::remove_var("TORON_GUARD_TIMEOUT_MS");
+    fn parse_timeout_ms_cases() {
+        assert_eq!(parse_timeout_ms("42"), Some(Duration::from_millis(42)));
+        assert_eq!(parse_timeout_ms(" 42 "), Some(Duration::from_millis(42)));
+        assert_eq!(parse_timeout_ms("0"), None, "zero falls back to default");
+        assert_eq!(parse_timeout_ms("garbage"), None);
+        assert_eq!(parse_timeout_ms(""), None);
     }
 
     /// A built context with the 4 fns evaluates each correctly (smoke for

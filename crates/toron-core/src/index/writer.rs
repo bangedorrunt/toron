@@ -8,12 +8,12 @@
 //   behind an injectable clock so hot-path updates batch instead of spamming.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
 
 use parking_lot::Mutex;
-use sqlx::sqlite::SqlitePool;
 use sqlx::Row;
+use sqlx::sqlite::SqlitePool;
 use tokio::sync::Mutex as AsyncMutex;
 
 /// Monotone-ish wall clock in i64 microseconds (ADR G7: i64-µs timestamps).

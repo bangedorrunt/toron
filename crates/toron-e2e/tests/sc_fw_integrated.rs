@@ -30,8 +30,8 @@ use nostr_sdk::prelude::*;
 use toron_core::bus::in_process::{AuthPolicy, InProcessBusConfig};
 use toron_core::bus::{Bus, Filter, InProcessBus, SubscriptionEvent};
 use toron_core::index::schema;
-use toron_core::mailbox::messaging::{FetchInbox, SendMessage};
 use toron_core::mailbox::Mailbox;
+use toron_core::mailbox::messaging::{FetchInbox, SendMessage};
 use toron_core::nostr::identity::AgentProfile;
 
 /// Boot the integrated-mode process: one mailbox + one in-process bus, exactly

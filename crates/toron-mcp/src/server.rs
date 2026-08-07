@@ -17,7 +17,7 @@ use rmcp::{ServerHandler, ServiceExt};
 use toron_core::bus::Bus;
 use toron_core::mailbox::Mailbox;
 
-use crate::resources::{read_resource_value, RESOURCES};
+use crate::resources::{RESOURCES, read_resource_value};
 use crate::tools::ToolServer;
 
 /// MCP server for toron.

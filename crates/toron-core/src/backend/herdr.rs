@@ -20,12 +20,12 @@ use std::path::PathBuf;
 
 use parking_lot::Mutex;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
+use super::Backend;
 use super::error::{BackendError, BackendErrorCode};
 use super::types::{AgentStatus, BackendEvent, PaneId, SpawnOptions};
-use super::Backend;
 
 /// herdr socket protocol version this client is verified against (v18).
 pub const HDR_PROTOCOL: u64 = 18;

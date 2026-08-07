@@ -51,9 +51,9 @@ mod tests {
     use crate::mailbox::contacts::{RequestContact, RespondContact};
     use crate::mailbox::messaging::{FetchInbox, SendMessage};
     use crate::mailbox::unwrap::ContactPolicy;
-    use crate::mailbox::{overlaps, Mailbox, ProjectOutcome};
+    use crate::mailbox::{Mailbox, ProjectOutcome, overlaps};
     use crate::nostr::identity::AgentProfile;
-    use crate::nostr::kinds::{toron_kind, PROJECT_MANIFEST};
+    use crate::nostr::kinds::{PROJECT_MANIFEST, toron_kind};
     use std::sync::Arc;
 
     const PASSPHRASE: &str = "invariants-test-pass";

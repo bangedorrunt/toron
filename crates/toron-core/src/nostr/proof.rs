@@ -18,7 +18,7 @@ use nostr_sdk::nostr::{Event, EventId, Keys, PublicKey, Tag, Timestamp};
 
 use crate::bus::scoping::with_project_scoping;
 use crate::nostr::event::build_event;
-use crate::nostr::kinds::{toron_kind, REGISTRATION_ATTESTATION};
+use crate::nostr::kinds::{REGISTRATION_ATTESTATION, toron_kind};
 
 /// Proof scheme.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -239,10 +239,10 @@ impl ProofGate {
         if att.scope != claim.scope {
             return Err(ProofError::Mismatch("scope does not match claim".into()));
         }
-        if let Some(exp) = att.expires_at {
-            if exp < now.as_secs() {
-                return Err(ProofError::Expired);
-            }
+        if let Some(exp) = att.expires_at
+            && exp < now.as_secs()
+        {
+            return Err(ProofError::Expired);
         }
         Ok(())
     }
@@ -578,10 +578,11 @@ mod tests {
             scheme: ProofScheme::Schnorr,
         };
         let claim = ProofClaim::new(agent.public_key(), "demo", "project:collaborator");
-        assert!(gate
-            .verify_schnorr(&forged, &claim, &mut store, now())
-            .await
-            .is_err());
+        assert!(
+            gate.verify_schnorr(&forged, &claim, &mut store, now())
+                .await
+                .is_err()
+        );
         let _ = std::fs::remove_file(&path);
     }
 
