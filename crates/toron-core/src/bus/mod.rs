@@ -80,6 +80,12 @@ pub enum BusError {
 /// Implementations run the same validation pipeline (verify → dedup →
 /// fanout → search/audit/workflow hooks, per ADR-0003 Buzz adoption) and emit
 /// events that a real relay would accept unchanged.
+///
+/// `#[async_trait]` is DELIBERATELY retained here: `Bus` is used as
+/// `Arc<dyn Bus>` (16 call sites) and native `async fn`-in-trait / RPITIT
+/// traits are NOT dyn-compatible (measured on nightly 1.97: both forms give
+/// E0038). Boxed futures (async-trait) are the correct tool for a dyn async
+/// trait; `Backend` (never dyn-used) uses native AFIT instead.
 #[async_trait::async_trait]
 pub trait Bus: Send + Sync + 'static {
     /// Publish a signed event. Deduplicates on `(kind, pubkey, id)`.

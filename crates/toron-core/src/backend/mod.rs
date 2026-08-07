@@ -22,7 +22,18 @@ pub type EventStream = mpsc::Receiver<BackendEvent>;
 /// Supervisor backend: spawn/prompt/wait/read/send_keys/events.
 /// Errors are typed with machine codes — classify on `BackendError::code`,
 /// never message text.
-#[async_trait::async_trait]
+///
+/// Native AFIT (NOT `async_trait`): `Backend` is never used as a trait
+/// object (consumers call the concrete `HerdrBackend`/`MockBackend`), so the
+/// boxing async-trait adds would be pure overhead. Futures are Send by
+/// construction: `Self: Send + Sync` makes the `&self` capture Send, all args
+/// are Send, and no impl holds a non-Send guard across an await point. No
+/// caller requires a nameable Send bound on these futures (they are awaited
+/// inline, never spawned cross-thread).
+#[expect(
+    async_fn_in_trait,
+    reason = "Backend futures are Send by construction (Self: Send+Sync, Send args, no non-Send guard across await); no dyn usage; no caller needs a nameable auto-trait bound."
+)]
 pub trait Backend: Send + Sync {
     /// Spawn an agent pane in the backend and return its pane id.
     async fn spawn(&self, opts: &SpawnOptions) -> Result<PaneId, BackendError>;

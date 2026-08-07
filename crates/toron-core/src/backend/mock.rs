@@ -61,7 +61,6 @@ impl MockBackend {
     }
 }
 
-#[async_trait::async_trait]
 impl Backend for MockBackend {
     async fn spawn(&self, opts: &SpawnOptions) -> Result<PaneId, BackendError> {
         let pane = PaneId(format!("pane-{}", self.state.lock().spawned.len()));
@@ -109,16 +108,27 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn trait_object_compilable_and_spawns() {
-        let backend: Box<dyn Backend> = Box::new(MockBackend::new());
+    async fn trait_generic_compilable_and_spawns() {
+        // Native-AFIT proof: Backend methods are callable through a generic
+        // bound (static dispatch). Trait-object dispatch is intentionally not
+        // asserted — AFIT traits are not dyn-compatible (measured, nightly
+        // 1.97); `Bus`/`ProjectionSink` keep async-trait for their `dyn` uses.
+        async fn drive<B: Backend>(backend: &B, opts: &SpawnOptions) -> String {
+            backend
+                .spawn(opts)
+                .await
+                .expect("spawn")
+                .as_str()
+                .to_string()
+        }
+        let backend = MockBackend::new();
         let opts = SpawnOptions {
             project: "demo".into(),
             agent_name: "PiAlpha".into(),
             program: "pi".into(),
             cwd: None,
         };
-        let pane = backend.spawn(&opts).await.expect("spawn");
-        assert_eq!(pane.as_str(), "pane-0");
+        assert_eq!(drive(&backend, &opts).await, "pane-0");
     }
 
     #[tokio::test]
