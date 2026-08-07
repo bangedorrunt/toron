@@ -300,4 +300,11 @@ The path to "better, more efficient, robust, especially agent automation + workf
 long bets (ATC vs Forge) based on whether the priority is *smarter agents* (ATC) or
 *federated code-collab* (Forge).
 
+**Research notes filed (2026-08-07, lane OC-C):**
+- ATC learning loop (item 11, bd-nyg): `docs/notes/2026-08-07-atc-learning-loop.md`
+  (experience-row schema + two-phase outcome + calibration tick; hachiko analogue).
+- Forge NIP-34 (item 12, bd-9o9): `docs/notes/2026-08-07-forge-nip34-research.md`
+  (**kind-map correction** — canonical NIP-34 assigns `30621`=git commit not
+  "project", `1630`=Open-status not "CI-passed"; only `46011` is toron-custom).
+
 // governed-by: ADR-0003
