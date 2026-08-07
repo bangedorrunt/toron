@@ -362,13 +362,17 @@ later. Each will need its own ADR if/when pursued.
   enforcement point).
 - **Pattern**: at the projection contact-policy enforcement (G14), before
   dropping an inbound gift-wrap from a policy-violating key, check whether
-  the event is signed by the **operator key** (config `operator_nsec` / env
-  `TORON_OPERATOR_NSEC`). If so, AND the event carries a `toron:overseer`
-  tag, AND importance is `high`/`urgent`, **skip the drop** (deliver + index +
-  archive). CLI: `toron mail overseer --to <agent> --body <...>` signs with
-  the operator key, sets importance=high, adds the `toron:overseer` tag, and
-  injects the preamble ("Operator override. Pause current work, handle this,
-  then resume.").
+  the event is signed by the **operator key** (config `operator_key` / env
+  `TORON_OPERATOR_KEY` — a **path** to the encrypted ncryptsec, matching the
+  existing `toron key generate` + daemon load path; the ADR's original
+  `TORON_OPERATOR_NSEC` raw-secret-in-env form was deliberately NOT adopted:
+  toron never places a raw nsec in env). If so, AND the event carries a
+  `toron:overseer` tag (a `t` tag, consistent with the Ship-2
+  `toron:workflow-emitted` marker), AND importance is `high`/`urgent`,
+  **skip the drop** (deliver + index + archive). CLI: `toron mail overseer
+  --to <agent> --body <...>` signs with the operator key, sets
+  importance=high, adds the `toron:overseer` tag, and injects the preamble
+  ("Operator override. Pause current work, handle this, then resume.").
 - **Avoid**: name-based bypass (AM-Rust's `HumanOverseer` agent name is
   spoofable; toron's is npub-scoped — strictly stronger); bypass for
   non-operator keys (agents cannot unlock this); bypass without the

@@ -679,6 +679,7 @@ impl ToolServer {
             ack_required: args.ack_required.unwrap_or(false),
             thread_id: args.thread_id.clone(),
             sender_token: args.sender_token.clone(),
+            overseer: false,
         };
         ToolOutput::result(self.mailbox.send_message(&msg).await)
     }
@@ -702,6 +703,7 @@ impl ToolServer {
             ack_required: args.ack_required.unwrap_or(false),
             thread_id: args.thread_id.clone(),
             sender_token: args.sender_token.clone(),
+            overseer: false,
         };
         ToolOutput::result(self.mailbox.reply_message(&msg).await)
     }
