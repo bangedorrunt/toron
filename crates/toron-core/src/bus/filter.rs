@@ -223,8 +223,10 @@ mod tests {
         assert!(
             authors_project_filter([k.public_key()], "demo").match_event(&ev, Default::default())
         );
-        assert!(!authors_project_filter([other.public_key()], "demo")
-            .match_event(&ev, Default::default()));
+        assert!(
+            !authors_project_filter([other.public_key()], "demo")
+                .match_event(&ev, Default::default())
+        );
     }
 
     #[test]

@@ -15,7 +15,7 @@ use nostr_sdk::nostr::event::builder::Error as BuilderError;
 use nostr_sdk::nostr::{Event, EventId, Keys, PublicKey, Tag, Timestamp};
 
 use crate::nostr::event::build_event;
-use crate::nostr::kinds::{toron_kind, PRESENCE};
+use crate::nostr::kinds::{PRESENCE, toron_kind};
 
 /// Agent working state (mirrors the herdr `AgentStatus` vocabulary so presence
 /// can replace herdr-polling — ADR-0003 "replaces herdr-polling for presence").

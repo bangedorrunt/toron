@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **Edition 2021 → 2024** across all 5 workspace crates. Unlocks `let_chains`
+  / `if_let_guard` (stable, edition-2024-gated); applied to 10 non-test
+  sites + the test suite (nested `if let` collapses, clippy
+  `collapsible_if`-driven). `std::env::set_var`/`remove_var` are `unsafe` in
+  edition 2024 — the env-dependent test cases moved from unit tests to
+  integration tests (`tests/{guard_env,coalesce_env,git_binary_env}.rs`),
+  env parsing extracted to pure fns (`parse_timeout_ms`, `parse_millis`).
+  `gen` reserved-keyword collision in a CLI test identifier renamed.
+
+### Notes
+
+- Bed bd-3wc: remaining steps are async-trait crate → native AFIT (via
+  `trait-variant` for dyn-compatible traits), then drop the nightly pin.
+
 ## [1.1.0] - 2026-08-07
 
 ADR-0004 Operational Hardening & Agent-Automation Efficiency (all 5 ships

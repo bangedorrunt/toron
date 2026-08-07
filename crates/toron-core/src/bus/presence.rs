@@ -24,7 +24,7 @@ use nostr_sdk::nostr::PublicKey;
 
 use crate::bus::Bus;
 use crate::nostr::kinds::PRESENCE;
-use crate::nostr::presence::{parse_presence, PresenceState};
+use crate::nostr::presence::{PresenceState, parse_presence};
 
 /// Default presence TTL: how long a heartbeat is considered live after its
 /// `ts` before the agent is marked stale / offline.
@@ -157,7 +157,7 @@ mod tests {
     use super::*;
     use crate::bus::InProcessBus;
     use crate::index::schema;
-    use crate::nostr::presence::{build_presence_event, PresencePayload};
+    use crate::nostr::presence::{PresencePayload, build_presence_event};
     use nostr_sdk::nostr::{Event, Keys, Timestamp};
 
     async fn temp_bus() -> (InProcessBus, std::path::PathBuf) {

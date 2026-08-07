@@ -8,9 +8,9 @@
 
 use tokio::sync::mpsc;
 
+use super::Backend;
 use super::error::BackendError;
 use super::types::{AgentStatus, BackendEvent, PaneId, SpawnOptions};
-use super::Backend;
 
 /// tmux backend — Unsupported until un-held (ADR-0003 G9).
 ///

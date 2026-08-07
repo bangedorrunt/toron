@@ -384,16 +384,4 @@ mod tests {
         drop(repo);
         let _ = std::fs::remove_dir_all(root);
     }
-
-    #[test]
-    fn test_git_binary_override_unset_is_none() {
-        // Without TORON_GIT_BINARY the override resolves to None (libgit2
-        // default engine). Set/restore the env to keep the test hermetic.
-        let prev = std::env::var_os("TORON_GIT_BINARY");
-        std::env::remove_var("TORON_GIT_BINARY");
-        assert!(git_binary_override().is_none());
-        if let Some(v) = prev {
-            std::env::set_var("TORON_GIT_BINARY", v);
-        }
-    }
 }

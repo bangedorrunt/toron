@@ -21,10 +21,10 @@ use nostr_sdk::nostr::{Keys, Timestamp};
 use crate::backend::herdr::HerdrBackend;
 use crate::bus::filter::kind_project_filter;
 use crate::nostr::identity::{self as ident, AgentProfile, IdentityResult};
-use crate::nostr::kinds::{toron_kind, AGENT_PROFILE};
+use crate::nostr::kinds::{AGENT_PROFILE, toron_kind};
 
-use super::collect_replay;
 use super::Mailbox;
+use super::collect_replay;
 
 /// Result of register/create: the agent's identity + where its key lives.
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -28,8 +28,8 @@ use toron_core::index::schema;
 use toron_core::mailbox::Mailbox;
 use toron_core::nostr::identity::AgentProfile;
 use toron_workflow::jobs::{
-    build_job_claim, build_job_request, build_job_result, first_claimer, job_parent, job_state,
-    JobRequest, JobResult, JobState,
+    JobRequest, JobResult, JobState, build_job_claim, build_job_request, build_job_result,
+    first_claimer, job_parent, job_state,
 };
 
 async fn boot(dir: &std::path::Path) -> (Mailbox, InProcessBus) {

@@ -81,12 +81,22 @@ pub fn subwindow_from_env() -> Duration {
     env_millis("TORON_COALESCE_SUBWINDOW_MS", DEFAULT_SUBWINDOW)
 }
 
+/// Parse a `TORON_*_MS`-style value: positive integer millis → that duration,
+/// else `default`. Pure — tests exercise it without env access (`set_var` is
+/// unsafe in edition 2024; env-dependent cases live in `tests/coalesce_env.rs`).
+fn parse_millis(s: &str, default: Duration) -> Duration {
+    s.trim()
+        .parse::<u64>()
+        .ok()
+        .filter(|&ms| ms > 0)
+        .map(Duration::from_millis)
+        .unwrap_or(default)
+}
+
 fn env_millis(var: &str, default: Duration) -> Duration {
     std::env::var(var)
         .ok()
-        .and_then(|s| s.trim().parse::<u64>().ok())
-        .filter(|&ms| ms > 0)
-        .map(Duration::from_millis)
+        .map(|s| parse_millis(&s, default))
         .unwrap_or(default)
 }
 
@@ -283,11 +293,14 @@ impl MentionCoalescer {
         if buf.mentions.is_empty() {
             return FlushOutcome::NotReady;
         }
-        let window_elapsed = now_ms.saturating_sub(buf.first_arrival_ms) >= self.window.as_millis() as u64;
+        let window_elapsed =
+            now_ms.saturating_sub(buf.first_arrival_ms) >= self.window.as_millis() as u64;
         let subwindow_elapsed =
             now_ms.saturating_sub(buf.last_arrival_ms) >= self.subwindow.as_millis() as u64;
         if window_elapsed || subwindow_elapsed {
-            let coalesced = self.take_buffer(assignee).expect("non-empty buffer checked above");
+            let coalesced = self
+                .take_buffer(assignee)
+                .expect("non-empty buffer checked above");
             FlushOutcome::Flushed(coalesced)
         } else {
             FlushOutcome::NotReady
@@ -306,8 +319,8 @@ impl MentionCoalescer {
                 }
                 let window_elapsed =
                     now_ms.saturating_sub(buf.first_arrival_ms) >= self.window.as_millis() as u64;
-                let subwindow_elapsed = now_ms.saturating_sub(buf.last_arrival_ms)
-                    >= self.subwindow.as_millis() as u64;
+                let subwindow_elapsed =
+                    now_ms.saturating_sub(buf.last_arrival_ms) >= self.subwindow.as_millis() as u64;
                 if window_elapsed || subwindow_elapsed {
                     ready.push(a.clone());
                 }
@@ -346,7 +359,10 @@ impl MentionCoalescer {
 
     /// Number of assignees with an open (non-empty) buffer.
     pub fn open_buffers(&self) -> usize {
-        self.buffers.values().filter(|b| !b.mentions.is_empty()).count()
+        self.buffers
+            .values()
+            .filter(|b| !b.mentions.is_empty())
+            .count()
     }
 
     /// Drain + coalesce one assignee's buffer.
@@ -414,7 +430,8 @@ mod tests {
     /// sub-window, NOT at full window. (Common case pays no 2s latency.)
     #[test]
     fn lone_mention_flushes_at_subwindow_not_full_window() {
-        let mut c = MentionCoalescer::new(Duration::from_millis(2_000), Duration::from_millis(500), 64);
+        let mut c =
+            MentionCoalescer::new(Duration::from_millis(2_000), Duration::from_millis(500), 64);
         // Single mention arrives at t=0.
         c.submit(m("oc", "e1", "hi"), 0);
         // Before sub-window (t=400): not ready.
@@ -431,7 +448,8 @@ mod tests {
     /// sub-window fast path resets on each new mention).
     #[test]
     fn ongoing_burst_stays_buffered_until_full_window() {
-        let mut c = MentionCoalescer::new(Duration::from_millis(2_000), Duration::from_millis(500), 64);
+        let mut c =
+            MentionCoalescer::new(Duration::from_millis(2_000), Duration::from_millis(500), 64);
         // Mentions arrive every 300ms — faster than the 500ms sub-window, so
         // the burst is "ongoing" and must NOT flush early.
         for i in 0..5 {
@@ -517,7 +535,8 @@ mod tests {
     /// `tick()` flushes all ready assignees in one call (caller-driven timer).
     #[test]
     fn tick_flushes_all_ready() {
-        let mut c = MentionCoalescer::new(Duration::from_millis(1_000), Duration::from_millis(500), 64);
+        let mut c =
+            MentionCoalescer::new(Duration::from_millis(1_000), Duration::from_millis(500), 64);
         c.submit(m("oc", "e1", "a"), 0);
         c.submit(m("gk", "e2", "b"), 0);
         // At t=500 both sub-window-flush.
@@ -542,18 +561,25 @@ mod tests {
         assert_eq!(spec["mentions"].as_array().unwrap().len(), 2);
     }
 
-    /// Env override: TORON_COALESCE_WINDOW_MS reads through.
+    /// Pure parse of the env value (no env mutation — `set_var` is unsafe in
+    /// edition 2024; the env-override path is covered by `tests/coalesce_env.rs`).
     #[test]
-    fn env_window_override() {
-        std::env::set_var("TORON_COALESCE_WINDOW_MS", "123");
-        assert_eq!(window_from_env(), Duration::from_millis(123));
-        std::env::set_var("TORON_COALESCE_WINDOW_MS", "0");
-        // Zero/negative → default fallback (no panic).
-        assert_eq!(window_from_env(), DEFAULT_WINDOW);
-        std::env::set_var("TORON_COALESCE_WINDOW_MS", "garbage");
-        assert_eq!(window_from_env(), DEFAULT_WINDOW);
-        std::env::remove_var("TORON_COALESCE_WINDOW_MS");
-        assert_eq!(window_from_env(), DEFAULT_WINDOW);
+    fn parse_millis_cases() {
+        assert_eq!(
+            parse_millis("123", DEFAULT_WINDOW),
+            Duration::from_millis(123)
+        );
+        assert_eq!(
+            parse_millis(" 123 ", DEFAULT_WINDOW),
+            Duration::from_millis(123)
+        );
+        assert_eq!(
+            parse_millis("0", DEFAULT_WINDOW),
+            DEFAULT_WINDOW,
+            "zero falls back"
+        );
+        assert_eq!(parse_millis("garbage", DEFAULT_WINDOW), DEFAULT_WINDOW);
+        assert_eq!(parse_millis("", DEFAULT_WINDOW), DEFAULT_WINDOW);
     }
 
     /// open_buffers counts only non-empty buffers.

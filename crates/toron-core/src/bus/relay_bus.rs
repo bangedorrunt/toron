@@ -222,7 +222,7 @@ impl Bus for RelayBus {
             Ok(()) => {}
             Err(VerifyError::BadId) => return Err(BusError::InvalidEvent("id mismatch".into())),
             Err(VerifyError::BadSignature) => {
-                return Err(BusError::InvalidEvent("signature mismatch".into()))
+                return Err(BusError::InvalidEvent("signature mismatch".into()));
             }
             Err(e) => return Err(BusError::InvalidEvent(e.to_string())),
         }

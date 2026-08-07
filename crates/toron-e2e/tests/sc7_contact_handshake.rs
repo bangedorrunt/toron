@@ -16,8 +16,8 @@
 #![cfg(feature = "p1")]
 
 use nostr_sdk::prelude::*;
-use toron_core::bus::in_process::{AuthPolicy, InProcessBusConfig};
 use toron_core::bus::InProcessBus;
+use toron_core::bus::in_process::{AuthPolicy, InProcessBusConfig};
 use toron_core::index::schema;
 use toron_core::mailbox::contacts::{RequestContact, RespondContact};
 use toron_core::mailbox::{ContactPolicy, LinkStatus, Mailbox, RegisteredAgent};

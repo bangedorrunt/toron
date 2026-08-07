@@ -118,10 +118,10 @@ pub async fn active_slots(pool: &SqlitePool, project_slug: &str) -> anyhow::Resu
         .filter_map(|r| {
             let expires: Option<i64> = r.get("expires_ts_us");
             // Expired → not active.
-            if let Some(exp) = expires {
-                if exp <= now {
-                    return None;
-                }
+            if let Some(exp) = expires
+                && exp <= now
+            {
+                return None;
             }
             Some(BuildSlot {
                 slot: r.get("slot"),
@@ -334,9 +334,11 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(renew_slot(&p, "demo", "ci", "aaa", t0 + 600_000_000)
-            .await
-            .unwrap());
+        assert!(
+            renew_slot(&p, "demo", "ci", "aaa", t0 + 600_000_000)
+                .await
+                .unwrap()
+        );
         let active = active_slots(&p, "demo").await.unwrap();
         assert_eq!(active[0].expires_ts_us, Some(t0 + 600_000_000), "renewed");
         let _ = std::fs::remove_dir_all(dir);

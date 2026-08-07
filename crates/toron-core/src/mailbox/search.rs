@@ -492,9 +492,11 @@ mod tests {
             .expect("summary");
         assert_eq!(summary.message_count, 3);
         assert!(summary.participants.contains(&"PiAlpha".to_string()));
-        assert!(summary
-            .key_points
-            .contains(&"Fix the flaky test".to_string()));
+        assert!(
+            summary
+                .key_points
+                .contains(&"Fix the flaky test".to_string())
+        );
         assert!(summary.key_points.contains(&"Ship it".to_string()));
 
         let _ = std::fs::remove_file(&db_path);

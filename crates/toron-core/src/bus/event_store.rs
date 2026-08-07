@@ -117,10 +117,10 @@ impl BusEventStore {
         let mut out = Vec::with_capacity(rows.len());
         for row in rows {
             let raw: String = Row::get(&row, 0);
-            if let Ok(ev) = Event::from_json(&raw) {
-                if filter.match_event(&ev, Default::default()) {
-                    out.push(ev);
-                }
+            if let Ok(ev) = Event::from_json(&raw)
+                && filter.match_event(&ev, Default::default())
+            {
+                out.push(ev);
             }
         }
         Ok(out)
@@ -333,10 +333,12 @@ mod tests {
         .expect("build");
 
         assert!(store.insert_addressable(&lease_v1).await.expect("v1"));
-        assert!(store
-            .insert_addressable(&lease_v2)
-            .await
-            .expect("v2 supersedes"));
+        assert!(
+            store
+                .insert_addressable(&lease_v2)
+                .await
+                .expect("v2 supersedes")
+        );
         // Same author's v1 is gone (author isolation); v2 remains.
         assert_eq!(store.count().await.expect("count"), 1);
         assert_eq!(store.all_events().await.expect("all")[0].id, lease_v2.id);

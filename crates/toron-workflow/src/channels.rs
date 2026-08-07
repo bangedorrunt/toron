@@ -310,9 +310,11 @@ mod tests {
         assert!(store.post(&alice, "auth-refactor", "hello", &[]).is_ok());
         assert!(store.post(&bob, "auth-refactor", "hi bob", &[]).is_ok());
         // Mallory (non-member) is gated at the store boundary.
-        assert!(store
-            .post(&mallory, "auth-refactor", "intrude", &[])
-            .is_err());
+        assert!(
+            store
+                .post(&mallory, "auth-refactor", "intrude", &[])
+                .is_err()
+        );
 
         // Membership gate: non-member cannot read private channel history.
         assert!(store.can_read("auth-refactor", &alice.public_key()));
@@ -336,9 +338,11 @@ mod tests {
         let post = store.post(&alice, "c1", "hello", &[]).expect("post");
 
         assert!(store.react(&alice, "c1", &post.id.to_hex(), "+1").is_ok());
-        assert!(store
-            .react(&mallory, "c1", &post.id.to_hex(), "+1")
-            .is_err());
+        assert!(
+            store
+                .react(&mallory, "c1", &post.id.to_hex(), "+1")
+                .is_err()
+        );
     }
 
     #[test]

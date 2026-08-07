@@ -19,7 +19,7 @@ use toron_core::bus::in_process::{AuthPolicy, InProcessBusConfig};
 use toron_core::bus::presence::PresenceBroker;
 use toron_core::bus::{Bus, InProcessBus};
 use toron_core::index::schema;
-use toron_core::nostr::presence::{build_presence_event, PresencePayload, PresenceState};
+use toron_core::nostr::presence::{PresencePayload, PresenceState, build_presence_event};
 
 async fn boot(dir: &std::path::Path) -> (InProcessBus, sqlx::SqlitePool) {
     let db = dir.join("index.sqlite");

@@ -20,10 +20,10 @@ use crate::bus::filter::ToronFilter;
 use crate::bus::scoping::with_project_scoping;
 use crate::mailbox::search::{SearchMessage, SearchMessages, ThreadSummary};
 use crate::nostr::event::build_event;
-use crate::nostr::kinds::{toron_kind, PRODUCT_MANIFEST};
+use crate::nostr::kinds::{PRODUCT_MANIFEST, toron_kind};
 
-use super::collect_replay;
 use super::Mailbox;
+use super::collect_replay;
 
 /// `ensure_product` / `products_link` result.
 #[derive(Debug, Clone, PartialEq, Eq)]

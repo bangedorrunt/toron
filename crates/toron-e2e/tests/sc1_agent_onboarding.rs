@@ -21,8 +21,8 @@
 
 use std::sync::Arc;
 
-use toron_core::bus::in_process::{AuthPolicy, InProcessBusConfig};
 use toron_core::bus::InProcessBus;
+use toron_core::bus::in_process::{AuthPolicy, InProcessBusConfig};
 use toron_core::index::schema;
 use toron_core::mailbox::{FetchInbox, ListAgentsOptions, Mailbox, WhoIs};
 use toron_core::nostr::identity::AgentProfile;

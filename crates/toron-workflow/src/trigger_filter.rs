@@ -70,8 +70,8 @@
 use nostr_sdk::nostr::Event;
 
 use toron_core::nostr::kinds::{
-    JOB_ACCEPTED, JOB_CANCEL, JOB_ERROR, JOB_PROGRESS, JOB_REQUEST, JOB_RESULT,
-    WORKFLOW_RUN_FIRST, WORKFLOW_RUN_LAST,
+    JOB_ACCEPTED, JOB_CANCEL, JOB_ERROR, JOB_PROGRESS, JOB_REQUEST, JOB_RESULT, WORKFLOW_RUN_FIRST,
+    WORKFLOW_RUN_LAST,
 };
 
 /// NIP-59 gift wrap kind. A send_message emits these; triggering on them
@@ -99,6 +99,9 @@ pub const JOB_EMITS_KINDS: &[u16] = &[
 
 /// Workflow-run kinds 46001–46012 (the run/step/approval event stream).
 /// Sourced from the registry range.
+pub const JOB_RUN_FIRST: u16 = JOB_REQUEST; // 43001
+pub const JOB_RUN_LAST: u16 = JOB_ERROR; // 43006
+
 pub fn workflow_run_kind(kind: u16) -> bool {
     (WORKFLOW_RUN_FIRST..=WORKFLOW_RUN_LAST).contains(&kind)
 }
@@ -119,11 +122,10 @@ pub fn is_workflow_emitted_kind(kind: u16) -> bool {
 /// Defense-in-depth: rejects workflow-emitted kind-14/15/7 events that would
 /// otherwise pass the kind check.
 pub fn has_workflow_emitted_tag(event: &Event) -> bool {
-    event
-        .tags
-        .iter()
-        .any(|t| t.as_slice().first().map(String::as_str) == Some("t")
-            && t.as_slice().get(1).map(String::as_str) == Some(WORKFLOW_EMITTED_TAG))
+    event.tags.iter().any(|t| {
+        t.as_slice().first().map(String::as_str) == Some("t")
+            && t.as_slice().get(1).map(String::as_str) == Some(WORKFLOW_EMITTED_TAG)
+    })
 }
 
 /// The loop-prevention predicate. The embedding calls this BEFORE evaluating a
@@ -158,7 +160,7 @@ pub fn should_evaluate_trigger_kind(kind: u16) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nostr_sdk::nostr::{Event, JsonUtil, Keys, Kind, Tag};
+    use nostr_sdk::nostr::{Event, EventBuilder, JsonUtil, Keys, Kind, Tag};
 
     /// Build a minimal signed event of `kind` with optional extra tags, for
     /// filter tests. Content is irrelevant to the filter.
@@ -258,11 +260,7 @@ mod tests {
         let workflow_keys = Keys::generate();
         // The workflow's send_message action emits this kind-14, stamped with
         // the workflow-emitted tag by the action runner.
-        let emitted = ev(
-            14,
-            vec![tag_t(WORKFLOW_EMITTED_TAG)],
-            &workflow_keys,
-        );
+        let emitted = ev(14, vec![tag_t(WORKFLOW_EMITTED_TAG)], &workflow_keys);
         // The ingress filter MUST reject it.
         assert!(
             !should_evaluate_trigger_event(&emitted),
@@ -295,7 +293,12 @@ mod tests {
     /// kind-rejected events (no false sense of safety from the tag check).
     #[test]
     fn kind_predicate_consistent_with_event_predicate_for_kinds() {
-        for k in [JOB_REQUEST, WORKFLOW_RUN_FIRST, WORKFLOW_RUN_LAST, GIFT_WRAP] {
+        for k in [
+            JOB_REQUEST,
+            WORKFLOW_RUN_FIRST,
+            WORKFLOW_RUN_LAST,
+            GIFT_WRAP,
+        ] {
             assert!(
                 !should_evaluate_trigger_kind(k),
                 "kind {k}: kind-predicate must agree"
@@ -337,13 +340,3 @@ mod tests {
         assert!(!should_evaluate_trigger_event(&parsed));
     }
 }
-
-// Local imports kept for the test block (rust-nostr's EventBuilder lives here).
-#[cfg(test)]
-use nostr_sdk::nostr::EventBuilder;
-
-// The job range is derived locally from the individual JOB_* constants (the
-// registry is frozen per ADR-0003; only WORKFLOW_RUN has a range pair). Keep
-// this at the top so the helpers above see it.
-const JOB_RUN_FIRST: u16 = JOB_REQUEST; // 43001
-const JOB_RUN_LAST: u16 = JOB_ERROR; // 43006

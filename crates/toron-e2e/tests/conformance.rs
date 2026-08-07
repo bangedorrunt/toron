@@ -315,13 +315,14 @@ fn validate_against_schema(value: &Value, schema: &Value) -> Result<(), String> 
         }
     }
 
-    if value.is_object() && schema.get("type").and_then(Value::as_str) == Some("object") {
-        if let Some(required) = schema.get("required").and_then(Value::as_array) {
-            for r in required {
-                let Some(name) = r.as_str() else { continue };
-                if value.get(name).is_none() {
-                    return Err(format!("missing required field: {name}"));
-                }
+    if value.is_object()
+        && schema.get("type").and_then(Value::as_str) == Some("object")
+        && let Some(required) = schema.get("required").and_then(Value::as_array)
+    {
+        for r in required {
+            let Some(name) = r.as_str() else { continue };
+            if value.get(name).is_none() {
+                return Err(format!("missing required field: {name}"));
             }
         }
     }

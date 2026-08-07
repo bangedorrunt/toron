@@ -13,7 +13,7 @@ use nostr_sdk::nostr::{Event, JsonUtil, Keys, PublicKey, Tag, Timestamp};
 
 use crate::bus::scoping::with_project_scoping;
 use crate::nostr::event::build_event;
-use crate::nostr::kinds::{toron_kind, AGENT_PROFILE};
+use crate::nostr::kinds::{AGENT_PROFILE, toron_kind};
 
 /// Versioned persona / system-prompt pack (ADR-0003 "persona packs extend the
 /// agent profile", Buzz `buzz-persona` analogue). Reproducible, swappable
@@ -240,24 +240,27 @@ mod tests {
         let ev = &r.event;
 
         // d-tag = project-slug:name
-        assert!(ev
-            .tags
-            .iter()
-            .any(|t| { t.as_slice() == ["d".to_string(), "demo:BlueLake".to_string(),] }));
+        assert!(
+            ev.tags
+                .iter()
+                .any(|t| { t.as_slice() == ["d".to_string(), "demo:BlueLake".to_string(),] })
+        );
 
         // Dual-emit scoping: #t + NIP-32 label (kind-30013 is not hiding).
-        assert!(ev
-            .tags
-            .iter()
-            .any(|t| t.as_slice() == ["t".to_string(), "demo".to_string()]));
+        assert!(
+            ev.tags
+                .iter()
+                .any(|t| t.as_slice() == ["t".to_string(), "demo".to_string()])
+        );
         assert!(ev
             .tags
             .iter()
             .any(|t| t.as_slice() == ["l".to_string(), "demo".to_string(), "toron".to_string()]));
-        assert!(ev
-            .tags
-            .iter()
-            .any(|t| t.as_slice() == ["L".to_string(), "toron".to_string()]));
+        assert!(
+            ev.tags
+                .iter()
+                .any(|t| t.as_slice() == ["L".to_string(), "toron".to_string()])
+        );
 
         assert!(!is_metadata_hiding_kind(ev.kind));
     }

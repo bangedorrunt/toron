@@ -27,7 +27,7 @@ use nostr_sdk::nostr::{Event, EventId, Keys, PublicKey, Tag, Timestamp};
 
 use crate::bus::filter::ToronFilter;
 use crate::bus::scoping::is_metadata_hiding_kind;
-use crate::mailbox::unwrap::{order_by_rumor_time, OVERSEER_TAG, UnwrappedMail};
+use crate::mailbox::unwrap::{OVERSEER_TAG, UnwrappedMail, order_by_rumor_time};
 use crate::nostr::gift_wrap::{self, UnwrappedGift};
 use crate::nostr::identity as nident;
 
@@ -499,25 +499,25 @@ fn build_bcc_rumor(
 /// still sends, just without that tag. This matches AM-Rust's tolerant
 /// handling of optional metadata.
 fn add_message_tags(tags: &mut Vec<Tag>, args: &SendMessage) {
-    if !args.subject.is_empty() {
-        if let Ok(t) = Tag::parse(["subject", &args.subject]) {
-            tags.push(t);
-        }
+    if !args.subject.is_empty()
+        && let Ok(t) = Tag::parse(["subject", &args.subject])
+    {
+        tags.push(t);
     }
-    if let Some(imp) = &args.importance {
-        if let Ok(t) = Tag::parse(["importance", imp]) {
-            tags.push(t);
-        }
+    if let Some(imp) = &args.importance
+        && let Ok(t) = Tag::parse(["importance", imp])
+    {
+        tags.push(t);
     }
-    if args.ack_required {
-        if let Ok(t) = Tag::parse(["ack-required"]) {
-            tags.push(t);
-        }
+    if args.ack_required
+        && let Ok(t) = Tag::parse(["ack-required"])
+    {
+        tags.push(t);
     }
-    if let Some(token) = &args.sender_token {
-        if let Ok(t) = Tag::parse(["sender-token", token]) {
-            tags.push(t);
-        }
+    if let Some(token) = &args.sender_token
+        && let Ok(t) = Tag::parse(["sender-token", token])
+    {
+        tags.push(t);
     }
     if args.overseer {
         // ADR-0004 Ship 5: mark the override so the projection can recognize
@@ -526,10 +526,10 @@ fn add_message_tags(tags: &mut Vec<Tag>, args: &SendMessage) {
             tags.push(t);
         }
     }
-    if let Some(thread) = &args.thread_id {
-        if let Ok(root) = EventId::from_hex(thread) {
-            tags.push(Tag::event(root)); // NIP-10 e = root, reply role
-        }
+    if let Some(thread) = &args.thread_id
+        && let Ok(root) = EventId::from_hex(thread)
+    {
+        tags.push(Tag::event(root)); // NIP-10 e = root, reply role
     }
 }
 
@@ -874,9 +874,11 @@ mod tests {
         assert_eq!(inbox.len(), 2);
         assert!(inbox.iter().any(|m| m.subject == "first"));
         assert!(inbox.iter().any(|m| m.subject == "second"));
-        assert!(inbox
-            .iter()
-            .all(|m| m.sender == sender.public_key().to_hex()));
+        assert!(
+            inbox
+                .iter()
+                .all(|m| m.sender == sender.public_key().to_hex())
+        );
 
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_dir_all(&data_dir);

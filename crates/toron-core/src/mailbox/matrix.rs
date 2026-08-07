@@ -11,10 +11,10 @@
 //! oc-a `nostr::proof`) — and exposes a coverage pointer so conformance can
 //! grep the full surface.
 
-use crate::nostr::kinds::{toron_kind, REGISTRATION_ATTESTATION};
+use crate::nostr::kinds::{REGISTRATION_ATTESTATION, toron_kind};
 use crate::nostr::proof::{
-    build_attestation_event, Attestation, NonceStore, ProofClaim, ProofError, ProofGate,
-    ProofScheme,
+    Attestation, NonceStore, ProofClaim, ProofError, ProofGate, ProofScheme,
+    build_attestation_event,
 };
 use nostr_sdk::nostr::{Keys, Timestamp};
 use sqlx::SqlitePool;
@@ -218,10 +218,11 @@ pub async fn run_proof_matrix(pool: SqlitePool) -> Vec<String> {
     let replayed = build_attestation_event(&anchor, &att, "demo", "PiAlpha", Timestamp::now())
         .expect("replay");
     let mut store = NonceStore::new(pool.clone());
-    assert!(gate
-        .verify_schnorr(&replayed, &claim, &mut store, Timestamp::now())
-        .await
-        .is_ok());
+    assert!(
+        gate.verify_schnorr(&replayed, &claim, &mut store, Timestamp::now())
+            .await
+            .is_ok()
+    );
     match gate
         .verify_schnorr(&replayed, &claim, &mut store, Timestamp::now())
         .await

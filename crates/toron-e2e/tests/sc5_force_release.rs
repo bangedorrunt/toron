@@ -24,15 +24,15 @@
 use std::sync::Arc;
 
 use nostr_sdk::prelude::*;
+use toron_core::bus::InProcessBus;
 use toron_core::bus::addressable::is_revocation;
 use toron_core::bus::in_process::{AuthPolicy, InProcessBusConfig};
-use toron_core::bus::InProcessBus;
 use toron_core::index::schema;
-use toron_core::mailbox::reservations::STALE_AFTER_SECS;
 use toron_core::mailbox::Mailbox;
+use toron_core::mailbox::reservations::STALE_AFTER_SECS;
 use toron_core::nostr::event::build_event;
 use toron_core::nostr::identity::AgentProfile;
-use toron_core::nostr::kinds::{toron_kind, FILE_RESERVATION};
+use toron_core::nostr::kinds::{FILE_RESERVATION, toron_kind};
 
 #[tokio::test]
 async fn sc5_force_release_staleness_gate_and_revocation() {

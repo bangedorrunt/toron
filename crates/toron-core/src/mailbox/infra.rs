@@ -19,9 +19,9 @@ use nostr_sdk::nostr::{Tag, Timestamp};
 use crate::bus::filter::kind_project_filter;
 use crate::bus::scoping::with_project_scoping;
 use crate::nostr::event::build_event;
-use crate::nostr::kinds::{toron_kind, PROJECT_MANIFEST};
+use crate::nostr::kinds::{PROJECT_MANIFEST, toron_kind};
 
-use super::{collect_replay, Mailbox};
+use super::{Mailbox, collect_replay};
 
 /// Health report — the stable JSON shape of the `health_check` tool.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -162,8 +162,8 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    use crate::bus::in_process::{InProcessBus, InProcessBusConfig};
     use crate::bus::SubscriptionEvent;
+    use crate::bus::in_process::{InProcessBus, InProcessBusConfig};
     use crate::index::schema;
     use crate::keys;
     use nostr_sdk::nostr::{Keys, SubscriptionId, Timestamp};
@@ -250,10 +250,11 @@ mod tests {
         assert_eq!(events.len(), 1);
         let ev = &events[0];
         assert_eq!(ev.kind.as_u16(), PROJECT_MANIFEST);
-        assert!(ev
-            .tags
-            .iter()
-            .any(|t| t.as_slice() == ["t".to_string(), "demo".to_string()]));
+        assert!(
+            ev.tags
+                .iter()
+                .any(|t| t.as_slice() == ["t".to_string(), "demo".to_string()])
+        );
         assert!(ev
             .tags
             .iter()

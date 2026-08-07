@@ -38,8 +38,8 @@ pub mod unwrap;
 pub use build_slots::AcquireBuildSlotResult;
 pub use contacts::{BusPolicySource, ContactLink, LinkStatus, RequestContact, RespondContact};
 pub use guard::{
-    guard_blocked_paths, install_precommit_guard, uninstall_precommit_guard,
-    Reservation as GuardReservation,
+    Reservation as GuardReservation, guard_blocked_paths, install_precommit_guard,
+    uninstall_precommit_guard,
 };
 pub use identity::{ListAgentsOptions, RegisteredAgent, WhoIs};
 pub use infra::{HealthComponent, HealthReport, ProjectState};
@@ -53,14 +53,14 @@ pub use messaging::{
 pub use metrics::{BenchCase, BenchReport, BenchTimer, MailboxMetrics, MetricsSnapshot};
 pub use product::ProductInfo;
 pub use reservations::{
-    overlaps, AcquireResult, ConflictReport, GrantedReservation, PathConflict, ReleaseResult,
-    RenewResult, Reservation,
+    AcquireResult, ConflictReport, GrantedReservation, PathConflict, ReleaseResult, RenewResult,
+    Reservation, overlaps,
 };
 pub use search::{SearchMessage, SearchMessages, ThreadSummary};
 pub use unwrap::{
-    order_by_rumor_time, AckCache, AutoPolicy, ContactPolicy, DedupKey, FixedPolicy,
-    GitProjectionSink, PolicySource, ProjectOutcome, ProjectionSink, SqliteProjectionSink,
-    UnwrapPipeline, UnwrappedMail,
+    AckCache, AutoPolicy, ContactPolicy, DedupKey, FixedPolicy, GitProjectionSink, PolicySource,
+    ProjectOutcome, ProjectionSink, SqliteProjectionSink, UnwrapPipeline, UnwrappedMail,
+    order_by_rumor_time,
 };
 
 /// Mailbox context: the bus every tool publishes to + the on-disk project
