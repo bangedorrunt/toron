@@ -64,23 +64,34 @@ Concrete rewrite targets (nested `if let` → `if let … && let …`):
   `mention.rs`, `jobs.rs` — the `if let Some(x) = … &&` patterns
 - `toron-cli/src/operator.rs`, `config.rs` — nested option handling
 
-### 2. Replace `async-trait` crate with native AFIT (stable)
-8 files use `#[async_trait::async_trait]`. Caveat: `Bus`, `PolicySource`,
-`ProjectionSink` are used as `dyn` — native AFIT traits are **not**
-dyn-compatible (E0038). Official migration: the `trait-variant` crate
-(same author) generates the Send + dyn variants. Removes the crate dep +
-the `Box<dyn Future>` boxing/allocation per call. Medium effort, careful
-trait-by-trait.
+### 2. Replace `async-trait` crate with native AFIT (stable) — DONE, with a correction
 
-### 3. Drop the nightly pin → stable
-After (1)+(2) nothing needs nightly. `rust-toolchain.toml`:
-`channel = "stable"` (or pin a stable version). Removes nightly-only
-build risk entirely. Keep a note that re-pinning nightly is a 1-line
-change if a future feature (gen blocks, etc.) becomes worth it.
+Measured correction (probe, nightly 1.97): **both** native AFIT and RPITIT
+(`-> impl Future + Send`) traits are **non-dyn-compatible** (E0038) —
+`trait-variant`'s Send-variant adds Send bounds, NOT dyn-compat. So the
+plan's mechanism was wrong for the dyn traits.
+
+Shipped (commit 2a617a5):
+- `Backend` (never dyn-used) → native AFIT. Removed async_trait from the
+  trait + 3 impls (herdr/tmux/mock) + the Box<dyn Future> boxing.
+  `#[expect(async_fn_in_trait)]` justified (futures Send by construction;
+  no caller spawns cross-thread). MockBackend's trait-object test converted
+  to a generic static-dispatch proof.
+- `Bus` (Arc<dyn Bus>, 16 sites) + `ProjectionSink` → **keep async-trait**
+  (dyn-compat requires boxed futures); rationale documented on the trait.
+- async_trait annotation sites 10 → 6; dep retained for the dyn traits.
+
+### 3. Drop the nightly pin → stable — DONE
+`rust-toolchain.toml` now `channel = "stable"` (resolves to rustup stable
+1.97.1). Verified on stable: 37 workspace test binaries green, clippy
+--workspace --all-targets -D warnings clean, release build green, gates
+pass. Note: the local shell's nix-profile `cargo-clippy` (nightly driver)
+shadows rustup's on PATH — use `cargo +stable clippy` or the rustup binary
+path; CI (rustup-based) is unaffected.
 
 ## Recommendation
 
 Do (1) now — edition 2024 + a let-chains/if-let-guard pass — then (2)
 AFIT, then (3) drop to stable. The user-visible payoff of "nightly
 features" for toron is real but it is delivered by **stable, modern
-Rust + edition 2024**, not by `#![feature]` gates. Filed as bead (bd-…).
+Rust + edition 2024**, not by `#![feature]` gates. Filed as bead (bd-3wc).
