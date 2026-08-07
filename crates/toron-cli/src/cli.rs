@@ -610,6 +610,38 @@ pub struct DoctorArgs {
     /// CI-friendly: exit 3 if any check fails (0 if all pass).
     #[arg(long)]
     pub check: bool,
+
+    /// Disaster-recovery subcommands.
+    #[command(subcommand)]
+    pub command: Option<DoctorCmd>,
+}
+
+/// Disaster-recovery subcommands for `toron doctor`.
+#[derive(Debug, Subcommand)]
+#[command(arg_required_else_help = false)]
+pub enum DoctorCmd {
+    /// Rebuild the SQLite index from the Git archive (disaster recovery,
+    /// AM `am doctor reconstruct` parity). Forensic bundle + quarantine +
+    /// atomic rebuild. Exit codes: 0 ok · 1 rebuild failed (quarantine
+    /// preserved) · 3 diagnostic (nothing to do / cannot locate data).
+    Reconstruct(DoctorReconstructArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct DoctorReconstructArgs {
+    /// Preview only; make no changes. Reports what WOULD happen.
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// Reconstruct only this project slug (default: all projects under the
+    /// data dir that have an archive).
+    #[arg(long)]
+    pub project: Option<String>,
+
+    /// Override the data directory (default: `TORON_DATA_DIR` env, then
+    /// config `data_dir`).
+    #[arg(long)]
+    pub data_dir: Option<PathBuf>,
 }
 
 /// Keypair role selector (drives the default output path suffix).
