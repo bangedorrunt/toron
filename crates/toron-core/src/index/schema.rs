@@ -5,7 +5,7 @@
 use std::time::Duration;
 
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
-use sqlx::SqlitePool;
+use sqlx::{Connection, SqliteConnection, SqlitePool};
 
 /// AM-Rust FTS5 tokenizer string (schema.rs parity).
 pub const FTS5_TOKENIZER: &str = "porter unicode61 remove_diacritics 2";
@@ -28,6 +28,19 @@ pub async fn connect(db_path: &str) -> anyhow::Result<SqlitePool> {
         .connect_with(opts)
         .await?;
     Ok(pool)
+}
+
+/// Open a SINGLE SQLite connection (WAL + busy timeout). Used by the
+/// disaster-recovery seal path (`build_fresh_index`) where exactly one
+/// connection must exist so `wal_checkpoint(TRUNCATE)` is guaranteed
+/// busy-free (a pool's idle connections could otherwise hold it busy).
+pub async fn connect_single(db_path: &str) -> anyhow::Result<SqliteConnection> {
+    let opts = SqliteConnectOptions::new()
+        .filename(db_path)
+        .create_if_missing(true)
+        .journal_mode(SqliteJournalMode::Wal)
+        .busy_timeout(Duration::from_secs(5));
+    Ok(SqliteConnection::connect_with(&opts).await?)
 }
 
 /// Apply all embedded migrations.

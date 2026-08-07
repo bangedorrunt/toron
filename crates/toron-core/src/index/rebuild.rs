@@ -194,10 +194,15 @@ pub async fn inspect_index(db_path: &Path) -> anyhow::Result<(bool, bool, Option
 
 /// Build a fresh index db at `db_path` (must not exist), migrate, and rebuild
 /// from the archive (bd-jwa, ADR-0004 Ship 3). Returns `(records_rebuilt,
-/// rows_in_index)` for convergence verification. The db is sealed (WAL
-/// checkpointed + switched to rollback-journal mode) so the caller can
-/// atomically rename the main file without orphaning a `-wal` sibling
-/// (a renamed main file without its WAL reads as malformed).
+/// rows_in_index)` for convergence verification.
+///
+/// The db is SEALED for an atomic rename: all pool connections are closed
+/// (`close().await` — deterministic, unlike `drop` which can leave background
+/// connections), then a SINGLE connection runs `wal_checkpoint(TRUNCATE)`
+/// with an explicit busy check and re-counts rows from the main file. If the
+/// checkpoint is busy or the main-file count diverges from the rebuild count,
+/// we FAIL LOUD rather than let the caller rename a main file that would
+/// orphan uncheckpointed WAL frames (silent data loss).
 pub async fn build_fresh_index(
     db_path: &str,
     archive_root: &Path,
@@ -207,19 +212,34 @@ pub async fn build_fresh_index(
     let rp = crate::index::schema::connect(db_path).await?;
     let writer = IndexWriter::new(wp.clone(), rp.clone());
     let rebuilt = rebuild_index_from_git(&writer, archive_root).await?;
-    let rows = sqlx::query_scalar::<_, i64>("SELECT count(*) FROM messages")
-        .fetch_one(&wp)
-        .await? as usize;
-    // Seal for atomic rename: flush all WAL frames into the main file so the
-    // caller can rename the main db without losing uncheckpointed rows. The
-    // caller then deletes the now-empty -wal/-shm siblings. (We deliberately
-    // do NOT switch journal_mode=DELETE — that needs exclusive access across
-    // the whole pool and deadlocks; checkpoint(TRUNCATE) tolerates readers.)
-    let _ = sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)").execute(&wp).await;
     drop(writer);
-    drop(rp);
-    drop(wp);
-    Ok((rebuilt, rows))
+    // Deterministically close ALL pool connections before sealing (a lingering
+    // idle connection could hold the checkpoint busy).
+    rp.close().await;
+    wp.close().await;
+
+    // Single connection: checkpoint + verify the main file is authoritative.
+    let mut conn = crate::index::schema::connect_single(db_path).await?;
+    let (busy, _log, _ckpt): (i64, i64, i64) =
+        sqlx::query_as("PRAGMA wal_checkpoint(TRUNCATE)")
+            .fetch_one(&mut conn)
+            .await?;
+    if busy != 0 {
+        anyhow::bail!(
+            "wal_checkpoint busy={busy}; refusing to seal a fresh index that may still have uncheckpointed WAL frames"
+        );
+    }
+    // Post-checkpoint count: the WAL is truncated, so this reads the MAIN
+    // file — the file the caller will rename into place.
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM messages")
+        .fetch_one(&mut conn)
+        .await?;
+    if rows as usize != rebuilt {
+        anyhow::bail!(
+            "post-checkpoint count mismatch: main file has {rows} rows, rebuild produced {rebuilt}; refusing to rename"
+        );
+    }
+    Ok((rebuilt, rows as usize))
 }
 
 #[cfg(test)]

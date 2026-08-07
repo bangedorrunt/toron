@@ -10,7 +10,9 @@ use crate::schema::{Action, Trigger, Workflow};
 
 /// The Buzz-derived guard evaluation timeout (ms). Lint enforces that guards
 /// are simple expressions; the engine applies the timeout at eval time.
-pub const GUARD_TIMEOUT_MS: u64 = 100;
+/// Single source of truth: `guard::DEFAULT_TIMEOUT_MS` (the runtime
+/// evaluator's constant) — the lint advisory must never drift from it.
+pub const GUARD_TIMEOUT_MS: u64 = crate::guard::DEFAULT_TIMEOUT_MS;
 
 /// The in-process `delay` action cap (Buzz: 270s; Resonate unbounded later).
 pub const DELAY_CAP_SECS: u64 = 270;
