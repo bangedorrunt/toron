@@ -219,7 +219,7 @@ pub trait ProjectionSink: Send + Sync {
 
 /// Contact-policy source for the pipeline (G14). Injected so the projection
 /// stays decoupled from the contacts store; the kind-30014-backed impl lands
-/// with bd-led.5.4.
+/// with bd-led.5.4. (Sync — the projection gate is a non-async decision.)
 pub trait PolicySource: Send + Sync {
     /// The policy the recipient applies to inbound mail.
     fn policy_for(&self, recipient: &PublicKey) -> ContactPolicy;

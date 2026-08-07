@@ -29,7 +29,6 @@ impl TmuxBackend {
     }
 }
 
-#[async_trait::async_trait]
 impl Backend for TmuxBackend {
     async fn spawn(&self, _opts: &SpawnOptions) -> Result<PaneId, BackendError> {
         Err(Self::unsupported("spawn"))

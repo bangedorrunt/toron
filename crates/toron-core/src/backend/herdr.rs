@@ -606,7 +606,6 @@ impl HerdrBackend {
     }
 }
 
-#[async_trait::async_trait]
 impl Backend for HerdrBackend {
     async fn spawn(&self, opts: &SpawnOptions) -> Result<PaneId, BackendError> {
         let mut client = self.client.lock();
