@@ -237,8 +237,9 @@ pub fn complexity_violation(expr: &str) -> Option<String> {
             "expression is {len} chars, exceeds {MAX_GUARD_CHARS} limit"
         ));
     }
-    let mut depth = 0usize;
-    let mut parens = 0usize;
+    let mut depth = 0usize;      // paren nesting (calls/subexpressions)
+    let mut parens = 0usize;     // total `(` count (tree size)
+    let mut bracket = 0usize;    // `[` nesting (evalexpr array/tuple literals)
     let mut in_string = false;
     let mut escaped = false;
     for c in expr.chars() {
@@ -254,6 +255,15 @@ pub fn complexity_violation(expr: &str) -> Option<String> {
         }
         match c {
             '"' => in_string = true,
+            '[' => {
+                bracket += 1;
+                if bracket > MAX_PAREN_DEPTH {
+                    return Some(format!(
+                        "expression nests {bracket} brackets deep, exceeds {MAX_PAREN_DEPTH} limit"
+                    ));
+                }
+            }
+            ']' => bracket = bracket.saturating_sub(1),
             '(' => {
                 depth += 1;
                 parens += 1;
@@ -453,6 +463,22 @@ mod tests {
         )
         .await;
         assert_eq!(out, GuardOutcome::Bool(true));
+    }
+
+    /// Deep `[` array-literal nesting is bounded too (evalexpr's tree builder
+    /// recurses on array literals; ~1000-deep fits in the char cap, so the
+    /// bracket scan is the only defense).
+    #[tokio::test]
+    async fn bracket_nesting_rejected_not_hung() {
+        // 200-deep `[[[[...]]]]` wrapping a scalar — under the char cap, over
+        // MAX_PAREN_DEPTH=64 bracket depth.
+        let expr = "[".repeat(200) + "true" + &"]".repeat(200);
+        let out =
+            evaluate_guard(Some(&expr), &HashMap::new(), Duration::from_millis(100)).await;
+        assert!(
+            matches!(out, GuardOutcome::TooComplex { .. }),
+            "expected TooComplex for 200-deep bracket nesting, got {out:?}"
+        );
     }
 
     /// A non-boolean result is a TypeError (fail-stop, invariant 7).
