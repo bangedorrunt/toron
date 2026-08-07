@@ -71,6 +71,12 @@ shipped via beads, each governed-by ADR-0004). No MCP-surface change: the
   runtime `guard::DEFAULT_TIMEOUT_MS` (single source of truth).
 - **Guard complexity pre-scan** extended to `[`/`]` bracket depth (evalexpr
   array-literal nesting recursion surface).
+- **Release builds on macOS arm64** (`cargo install`, `--release`): cargo's
+  1.9x default `strip = "debuginfo"` corrupted the LINKEDIT segment of
+  large proc-macro dylibs (`sqlx_macros` ≈ 8.8MB) — dyld rejected them at
+  load with "mis-aligned LINKEDIT string pool", breaking
+  `cargo install --locked --path` / any release build. Fixed with an
+  explicit `[profile.release] strip = "none"` in the workspace manifest.
 - **Leftover unused imports** in `trigger_filter.rs` test module removed.
 
 ### Security
