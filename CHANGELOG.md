@@ -17,11 +17,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   integration tests (`tests/{guard_env,coalesce_env,git_binary_env}.rs`),
   env parsing extracted to pure fns (`parse_timeout_ms`, `parse_millis`).
   `gen` reserved-keyword collision in a CLI test identifier renamed.
+- **`Backend` trait → native async-fn-in-trait (AFIT)** — removed the
+  `async-trait` macro from the trait + herdr/tmux/mock impls and the
+  per-call `Box<dyn Future>` boxing. `Bus` + `ProjectionSink` deliberately
+  keep `async-trait` (they are used as `dyn`; AFIT/RPITIT traits are not
+  dyn-compatible — measured). async_trait sites 10 → 6.
+- **Toolchain: nightly → stable** (`rust-toolchain.toml`). The workspace
+  uses zero `#![feature]` gates; edition 2024, let-chains, and AFIT are all
+  stable. Removes nightly-only build risk. Note: this shell's nix-profile
+  `cargo-clippy` (nightly driver) shadows rustup's — use `cargo +stable
+  clippy` or the rustup binary; CI (rustup-based) unaffected.
 
 ### Notes
 
-- Bed bd-3wc: remaining steps are async-trait crate → native AFIT (via
-  `trait-variant` for dyn-compatible traits), then drop the nightly pin.
+- Bead bd-3wc closed: the "nightly features" payoff for toron is delivered
+  by stable modern Rust + edition 2024, not `#![feature]` gates.
 
 ## [1.1.0] - 2026-08-07
 
