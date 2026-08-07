@@ -32,6 +32,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Bead bd-3wc closed: the "nightly features" payoff for toron is delivered
   by stable modern Rust + edition 2024, not `#![feature]` gates.
+- **Parity shape catalog** (bd-96a/bd-3mp): `docs/parity/known-divergences.md`
+  documents the intentional toron-vs-AM-Rust response-shape divergences (npub
+  vs integer id, `*_ts_us` vs ISO, event-id returns, nested-vs-flat
+  summaries). Cross-checked against `toron-mcp` `ToJson` impls + `toron-core`
+  mailbox. Companion to `docs/parity/am-rust-tool-catalog.md` (the frozen
+  38-tool surface). Unblocks bd-jgd (outputSchema).
+- **Research epics filed as notes** (bd-nyg, bd-9o9): ATC learning-loop
+  framework (`docs/notes/2026-08-07-atc-learning-loop.md`) and the Forge
+  NIP-34 plan (`docs/notes/2026-08-07-forge-nip34-research.md`) — the latter
+  carries a kind-map CORRECTION vs the ADR-0003 §Forge draft (canonical
+  NIP-34 assigns `30621`=git commit, `1630`=Open status; only `46011` is
+  toron-custom).
 
 ## [1.1.0] - 2026-08-07
 
