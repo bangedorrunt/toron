@@ -1,4 +1,5 @@
 // governed-by: ADR-0003
+// governed-by: ADR-0004 (inspect_index, build_fresh_index — Ship 3)
 #![forbid(unsafe_code)]
 
 //! Disaster-recovery rebuild paths (ADR G11).
@@ -159,6 +160,66 @@ pub async fn replay_sink(writer: &IndexWriter, records: &[MailRecord]) -> anyhow
         insert_record(writer, rec).await?;
     }
     Ok(records.len())
+}
+
+/// Inspect an existing index db without rebuilding (bd-jwa, ADR-0004 Ship 3).
+/// Returns `(db_exists, integrity_ok, row_count)`. An absent db is
+/// `(false, false, None)`; an existing-but-corrupt/unreadable db collapses to
+/// `(true, false, None)` so the caller can decide to rebuild.
+pub async fn inspect_index(db_path: &Path) -> anyhow::Result<(bool, bool, Option<i64>)> {
+    if !db_path.exists() {
+        return Ok((false, false, None));
+    }
+    let path_str = db_path.to_string_lossy().to_string();
+    let pool = match crate::index::schema::connect(&path_str).await {
+        Ok(p) => p,
+        Err(_) => return Ok((true, false, None)),
+    };
+    // integrity_check returns one row whose first column is "ok" on success.
+    let integrity_ok =
+        match sqlx::query_scalar::<_, String>("PRAGMA integrity_check")
+            .fetch_optional(&pool)
+            .await
+        {
+            Ok(Some(s)) => s.trim().eq_ignore_ascii_case("ok"),
+            _ => false,
+        };
+    let rows = sqlx::query_scalar::<_, i64>("SELECT count(*) FROM messages")
+        .fetch_optional(&pool)
+        .await
+        .ok()
+        .flatten();
+    Ok((true, integrity_ok, rows))
+}
+
+/// Build a fresh index db at `db_path` (must not exist), migrate, and rebuild
+/// from the archive (bd-jwa, ADR-0004 Ship 3). Returns `(records_rebuilt,
+/// rows_in_index)` for convergence verification. The db is sealed (WAL
+/// checkpointed + switched to rollback-journal mode) so the caller can
+/// atomically rename the main file without orphaning a `-wal` sibling
+/// (a renamed main file without its WAL reads as malformed).
+pub async fn build_fresh_index(
+    db_path: &str,
+    archive_root: &Path,
+) -> anyhow::Result<(usize, usize)> {
+    let wp = crate::index::schema::connect(db_path).await?;
+    crate::index::schema::migrate(&wp).await?;
+    let rp = crate::index::schema::connect(db_path).await?;
+    let writer = IndexWriter::new(wp.clone(), rp.clone());
+    let rebuilt = rebuild_index_from_git(&writer, archive_root).await?;
+    let rows = sqlx::query_scalar::<_, i64>("SELECT count(*) FROM messages")
+        .fetch_one(&wp)
+        .await? as usize;
+    // Seal for atomic rename: flush all WAL frames into the main file so the
+    // caller can rename the main db without losing uncheckpointed rows. The
+    // caller then deletes the now-empty -wal/-shm siblings. (We deliberately
+    // do NOT switch journal_mode=DELETE — that needs exclusive access across
+    // the whole pool and deadlocks; checkpoint(TRUNCATE) tolerates readers.)
+    let _ = sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)").execute(&wp).await;
+    drop(writer);
+    drop(rp);
+    drop(wp);
+    Ok((rebuilt, rows))
 }
 
 #[cfg(test)]
