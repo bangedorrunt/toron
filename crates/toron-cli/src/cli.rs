@@ -708,7 +708,7 @@ pub struct DoctorReconstructArgs {
     pub project: Option<String>,
 
     /// Override the data directory (default: `TORON_DATA_DIR` env, then
-    /// config `data_dir`).
+    /// config `data_dir`, then the durable XDG root — ADR-0007 D3).
     #[arg(long)]
     pub data_dir: Option<PathBuf>,
 }

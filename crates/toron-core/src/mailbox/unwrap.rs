@@ -217,6 +217,43 @@ pub trait ProjectionSink: Send + Sync {
     async fn write(&self, mail: &UnwrappedMail, local_seq: u64) -> anyhow::Result<bool>;
 }
 
+/// ADR-0007 R3 / C6: fan out projected mail to a workflow trigger channel
+/// while still writing through an inner sink (Git/SQLite).
+///
+/// This is the narrow TriggerIngress plane — post-unwrap, not raw gift wraps.
+/// The host consumes [`UnwrappedMail`] and evaluates `message_posted` without
+/// putting plaintext kind-14 on the bus.
+pub struct TriggerNotifySink {
+    inner: Arc<dyn ProjectionSink>,
+    tx: tokio::sync::mpsc::UnboundedSender<UnwrappedMail>,
+}
+
+impl TriggerNotifySink {
+    /// Wrap an existing sink; every successful `write` also notifies `tx`.
+    pub fn new(
+        inner: Arc<dyn ProjectionSink>,
+        tx: tokio::sync::mpsc::UnboundedSender<UnwrappedMail>,
+    ) -> Self {
+        Self { inner, tx }
+    }
+}
+
+#[async_trait::async_trait]
+impl ProjectionSink for TriggerNotifySink {
+    async fn is_projected(&self, key: &DedupKey) -> anyhow::Result<bool> {
+        self.inner.is_projected(key).await
+    }
+
+    async fn write(&self, mail: &UnwrappedMail, local_seq: u64) -> anyhow::Result<bool> {
+        let written = self.inner.write(mail, local_seq).await?;
+        if written {
+            // Best-effort notify; a dropped receiver must not fail projection.
+            let _ = self.tx.send(mail.clone());
+        }
+        Ok(written)
+    }
+}
+
 /// Contact-policy source for the pipeline (G14). Injected so the projection
 /// stays decoupled from the contacts store; the kind-30014-backed impl lands
 /// with bd-led.5.4. (Sync — the projection gate is a non-async decision.)

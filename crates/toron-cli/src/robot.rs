@@ -48,6 +48,7 @@ pub async fn run_mail(mailbox: &Mailbox, cmd: &MailCommand) -> anyhow::Result<()
                 thread_id: args.thread.clone(),
                 sender_token: args.sender_token.clone(),
                 overseer: false,
+                extra_tags: Vec::new(),
             };
             emit(mailbox.send_message(&msg).await?)
         }
@@ -74,6 +75,7 @@ pub async fn run_mail(mailbox: &Mailbox, cmd: &MailCommand) -> anyhow::Result<()
                 thread_id: None,
                 sender_token: None,
                 overseer: true,
+                extra_tags: Vec::new(),
             };
             emit(mailbox.send_message(&msg).await?)
         }
@@ -91,6 +93,7 @@ pub async fn run_mail(mailbox: &Mailbox, cmd: &MailCommand) -> anyhow::Result<()
                 thread_id: Some(args.thread.clone()),
                 sender_token: args.sender_token.clone(),
                 overseer: false,
+                extra_tags: Vec::new(),
             };
             emit(mailbox.reply_message(&msg).await?)
         }

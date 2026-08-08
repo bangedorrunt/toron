@@ -236,47 +236,51 @@ impl ServerHandler for ToronServer {
     }
 }
 
-/// Build the demo mailbox backing the tool surface for `router`/`serve_stdio`
-/// and the robot CLI: an in-process bus over a per-call SQLite index in the
-/// system temp dir. Public so `toron-cli` robot commands construct the exact
-/// same mailbox + `ToJson` shapes the MCP tools use (JSON parity, bd-led.8.3).
+/// Build the mailbox for MCP serve / robot CLI (ADR-0007 R2).
+///
+/// **Production (default):** durable root from [`toron_core::config::ToronPaths`]
+/// (`TORON_DATA_DIR` → `TORON_MCP_DATA_DIR` → `$XDG_DATA_HOME/toron`).
+/// Index SQLite lives at `{root}/index.sqlite`; project roots under
+/// `{root}/projects/<slug>/`; operator key `{root}/operator/operator.ncryptsec`,
+/// mode 0600 when present (ADR-0007 D3).
+///
+/// **Demo / test isolation:** set `TORON_DEMO=1` for a unique temp dir per
+/// call (bounds KDF scan; cli_robot cross-process tests set `TORON_MCP_DATA_DIR`
+/// to a shared path instead).
+///
+/// R2.0 KDF cache still bounds warm rebuilds inside a process.
 pub async fn demo_mailbox() -> anyhow::Result<Mailbox> {
-    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let stamp = format!("{}-{}", std::process::id(), seq);
-    let db = std::env::temp_dir().join(format!("toron-mcp-{stamp}.sqlite"));
+    use toron_core::config::ToronPaths;
+
+    let (data_dir, db, operator) = if ToronPaths::demo_mode() {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let stamp = format!("{}-{}", std::process::id(), seq);
+        let data_dir = std::env::temp_dir().join(format!("toron-mcp-demo-{stamp}"));
+        std::fs::create_dir_all(&data_dir)?;
+        let db = std::env::temp_dir().join(format!("toron-mcp-{stamp}.sqlite"));
+        (data_dir, db, operator_keys()?)
+    } else {
+        // R2 (ADR-0007 D3): production default is the DURABLE root
+        // ($XDG_DATA_HOME/toron or TORON_DATA_DIR) — per-pid temp roots are
+        // dead as the default. Operator key: explicit TORON_OPERATOR_KEY, or
+        // the stable durable key (generated 0600 on first run; the next
+        // process on the same root loads the SAME key).
+        let paths = ToronPaths::resolve();
+        paths.ensure_layout()?;
+        let _ = paths.ensure_operator_key_mode();
+        let operator = match std::env::var_os("TORON_OPERATOR_KEY") {
+            Some(_) => operator_keys()?,
+            None => Some(paths.ensure_operator_key(&toron_core::config::operator_passphrase())?),
+        };
+        (paths.projects_dir(), paths.index_path(), operator)
+    };
+
     let pool = toron_core::index::schema::connect(db.to_str().unwrap()).await?;
     toron_core::index::schema::migrate(&pool).await?;
     let bus = toron_core::bus::InProcessBus::open(pool.clone(), Default::default()).await?;
-    // Per-invocation data_dir by default: the unwrap loop scans this dir for
-    // agent keys and runs the argon2 KDF (~1s/key) on every rebuild. A fixed
-    // dir accumulates keys across runs until the loop stalls for minutes on
-    // dozens of keys. A unique dir isolates each daemon and bounds the
-    // rebuild cost to just that daemon's own agents.
-    //
-    // R2.0 (C2 / F2.KDF): the pipeline rebuild is additionally bounded
-    // in-process by Mailbox's content-keyed unlock cache — warm rebuilds
-    // re-derive ONLY added/changed key files, never a full re-KDF of every
-    // key (cold = N × ~1s/key; warm = O(Δkeys); gate test
-    // `unwrap_loop_kdf_cached_between_rebuilds_many_keys`, 50-key fixture).
-    //
-    // `TORON_MCP_DATA_DIR` overrides: tests that need a data_dir to persist
-    // ACROSS processes (cli_robot registers in-process then shells out to the
-    // built binary, which constructs its own demo_mailbox) set it to a shared
-    // per-run dir so both sides see the same agent keys.
-    let data_dir = match std::env::var_os("TORON_MCP_DATA_DIR") {
-        Some(dir) => {
-            let d = std::path::PathBuf::from(dir);
-            std::fs::create_dir_all(&d)?;
-            d
-        }
-        None => std::env::temp_dir().join(format!("toron-mcp-demo-{stamp}")),
-    };
-    let mailbox = Mailbox::new(Arc::new(bus), data_dir, operator_keys()?).with_index_pool(pool);
-    // ADR-0004 inbound unwrap loop (bd-pkc): make the G14 contact-policy gate,
-    // the operator Overseer bypass, and the idempotent projection LIVE in the
-    // daemon. Agent keys are created on-disk at register/create_agent_identity,
-    // so the loop discovers them at runtime and rebuilds on change.
+    let mailbox = Mailbox::new(Arc::new(bus), data_dir, operator).with_index_pool(pool);
+    // ADR-0004 inbound unwrap loop (bd-pkc): G14 + Overseer + projection LIVE.
     mailbox.spawn_unwrap_loop();
     Ok(mailbox)
 }
