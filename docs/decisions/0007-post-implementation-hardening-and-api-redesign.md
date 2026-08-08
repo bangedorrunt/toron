@@ -699,7 +699,7 @@ this toron residual epic.
 - [x] F1 path: TriggerNotifySink + spawn_mail_trigger_loop (gift-wrap required): **gift-wrapped** send triggers `message_posted` once; no self-loop; raw-bus tests labeled non-NIP-17 (C7) — **CHECKED 2026-08-08 (F1 re-check)**: production wire landed in bead **bd-adr7-residual-vxnv.1** (commit 85e28e8): `server.rs::demo_mailbox_with_trigger()` + `build_mailbox(Some(tx))` → `Mailbox::with_trigger_tx` (server.rs:312, 468) on the serve paths, `spawn_mail_trigger_host()` → `WorkflowHost::spawn_mail_trigger_loop` (server.rs:326–338, invoked from `serve_stdio`/`router`); gift-wrap e2e `server.rs::serve_wire_gift_wrap_fires_message_posted_once` green (28/28 `cargo test -p toron-mcp --lib`, 2026-08-08) — user gift-wrap fires `message_posted` exactly once, stamped workflow reply does not re-trigger (no self-loop), both mails projected; no nested `block_on` in the wire.
 - [x] F2 durable XDG ToronPaths + demo_mailbox production default (2026-08-08): two processes, same data_dir, mail visible — re-verified: `server.rs::demo_mailbox()` production branch (271–285) uses `ToronPaths::resolve` + durable root; `cli_robot.rs` shares one `TORON_MCP_DATA_DIR` across in-process mailbox + shelled binary; config tests `env_override_beats_xdg` / `xdg_data_home_wins_over_home_fallback`
 - [x] **F2.KDF / R2.0** content-keyed unlock cache + many-keys gate test (many-keys fixture bound) — re-verified: `mailbox/mod.rs::unwrap_loop_kdf_cached_between_rebuilds_many_keys`
-- [x] F3 MessageId + MailSurface; honest AM edge: inbox id → ack/reply on toron (hex) **and** agentmail (decimal); **no silent 0** — re-verified: `message_id` String-native (`tools.rs`); `am_parity_e2e`; flywheel `bd-adr7-mail-adapt-se2.2` **closed** (honest MessageId, no `unwrap_or(0)`); se2.3 MailSurface consume still open (out of toron residual)
+- [x] F3 MessageId + MailSurface; honest AM edge: inbox id → ack/reply on toron (hex) **and** agentmail (decimal); **no silent 0** — re-verified: `message_id` String-native (`tools.rs`); `am_parity_e2e`; flywheel `bd-adr7-mail-adapt-se2.2` **closed** (honest MessageId, no `unwrap_or(0)`); **se2.3 MailSurface consume CLOSED 2026-08-09**: flywheel-local `MailBackend` DELETED (D2, not dual-lived); `ToronMailBackend` + `AgentMailBackend` implement `toron_core::mailbox::surface::MailSurface` (async, `&self`, `MessageId` string ids, machine-coded `MailError`); toron-core surface extended to the full AM-intent superset (register_agent, reservations ×5, slots ×3, products ×5, summarize_thread(+product), pane identity ×4, `name`/`agent_name`, `urgent_only`/`since_ts` inbox filters, `to_project` contacts, thread-seeded `SendMail`, `inbox_product` limit) with serde-derived shared DTOs; **D8.2 id-usability fix**: send/reply receipts now carry the RUMOR id (same id the projection shows — never the wrap id); projection self-threads head messages so `summarize_thread(head_id)` works (AM parity). Verified: toron core 316 / mcp 28 / workflow 124 / acceptance 5 green, gates pass; flywheel 350 green, clippy clean. Commits: toron `76ce391`, flywheel `891bbaa` (+ bead closes `27cd518`). Pre-existing flake (not se2.3): `am_parity_e2e::cluster_messaging_round_trip` search-timing failure also fails on clean HEAD.
 - [x] F4 foreach {{item}} (9f147ee): foreach bodies use items — re-verified: commit 9f147ee + foreach injection tests
 - [x] F5 call_workflow nested (WorkflowResolver): call_workflow nested success + fail_run — re-verified: `engine.rs::call_workflow_nested_subrun_returns_child_output` + `on_error_fail_run_fails_the_run_durably`
 - [x] F6 stamp production path (c86ea0c): stamped public event rejected by trigger filter — re-verified: commit c86ea0c + `workflow_host.rs::workflow_sends_stamp_rumor_and_are_filtered`
@@ -736,8 +736,10 @@ epic `bd-adr7-residual-vxnv` CLOSED 2026-08-08** after captain gate
 re-checked green (mcp 28/28, core 306, workflow 124, gates pass; `flywheel backend`
 mail=toron healthy; daemon `com.flywheel.toron` running).
 
-Flywheel residual (separate repo, not this epic): se2.1/se2.2 closed; **se2.3** WAIT
-MailSurface consume; **c3b.1** shared runtime still open.
+Flywheel residual (separate repo, not this epic): **CLOSED 2026-08-09** — se2.1
+(shared runtime + durable env root) + se2.2 (honest AM edge) + **se2.3
+(MailSurface consume)** all closed; epic `bd-adr7-mail-adapt-se2` fully closed.
+c3b.1/2/4/7 closed; c3b.3 filters in progress, c3b.5/c3b.6 open (c3b epic).
 
 Historical (pre-implementation / pre-residual):
 
@@ -760,6 +762,9 @@ Historical (pre-implementation / pre-residual):
 4. **Mux Backend unification succeeded;** mail trait unification was deferred
    and is now the binding constraint — this ADR proposes finishing it as
    Nostr-native MailSurface, with agent-mail as adapter (superset orientation).
+   **RESOLVED 2026-08-09 (se2.3):** `MailSurface` consumed by flywheel — the
+   local `MailBackend` is deleted, agent-mail is an adapter on the unified
+   trait, and the superset (D8.1) is fully typed end-to-end.
 5. **Next captain decision:** accept D1–D8 (or amend), then cut R0–R5 beads;
    do not open parallel feature work that deepens the u64/AM-shaped trait.
 
