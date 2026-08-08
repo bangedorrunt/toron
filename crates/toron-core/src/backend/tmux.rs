@@ -30,8 +30,7 @@ impl Backend for TmuxBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::error::BackendErrorCode;
-
+    use crate::backend::error::{BackendError, BackendErrorCode};
     #[test]
     fn every_method_yields_stable_unsupported_code() {
         let backend = TmuxBackend;

@@ -283,6 +283,7 @@ impl super::EventStream for MockEventStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::error::BackendErrorCode;
     use crate::backend::Backend;
 
     #[test]
