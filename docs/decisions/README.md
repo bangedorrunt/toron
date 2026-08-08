@@ -30,10 +30,13 @@ epics close.
 | **P1** | Backend trait unification (ONE trait, call-site migration) | **Complete** (bd-p1-* epics closed) |
 | **P2** | Profiles + built-in library (6 roles, 30013 content-map, `Profile::resolve`) | **Complete** (bd-p2-* epics closed) |
 | **P3** | Unified workflow engine (one vocab, one engine, stages, auto-crew, workflow CLI) | **Complete** (bd-p3-* epics closed) |
-| **P4** | Smart cron (self-reporting + defined fixer; durable-sleep manager) | **In progress** (bd-p4-* epics open) |
+| **P4** | Smart cron (self-reporting + defined fixer; durable-sleep manager) | **In progress** (P4.1 schedule-ext closed; P4.2 engine chain landed; P4.3/P4.4/P4.5/P4.6 open; P4.7 tests SC rows green) |
 | **P5** | Engine flexibility (graph DAG, control-flow, lint-graph) | **Complete** (bd-p5-* epics closed; spike GATE passed) |
 | **P6** | Squads + observability (squad/recipe unify, runs view + per-run cost, robot-snapshot runs) | **Complete** (bd-p6-squads-observability-61td closed) |
 
-P4 (smart cron) is the remaining open phase under ADR-0005.
+P4 (smart cron) is the remaining open phase under ADR-0005. **Open cross-phase
+regression:** `request_approval` suspend broke in the resonate-sdk 0.6 migration
+(a1fe947) — sc11 + engine approval unit tests red (see CHANGELOG Notes). Tracked
+against P4.2's close.
 
 // governed-by: ADR-0003

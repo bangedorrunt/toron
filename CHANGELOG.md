@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **P4.7 P4 Behavior Test Matrix rows (ADR-0005, `bd-p4-tests-4cl7`, toron-e2e)**
+  — SC rows landed: `sc19_spawn_await_resume` (spawn+await SUSPENDS, resumes on
+  kind-43004 resolve, run completes with the job result) and
+  `sc20_spawn_await_failure` (kind-43006 reject → step fails, NOT a decision).
+  Both green against BlueOak's P4.2 engine chain. `sc18_spawn_no_claim_timeout`
+  (UT row) green. Run: `cargo test -p toron-e2e --features p5`.
+- **P4.1 schedule trigger extension (ADR-0005 Spec 3, `bd-p4-schedule-ext-5v2s`,
+  closed)** — trigger owner/scope + workflow cron policy landed (toron 2bc9840,
+  flywheel 68fcc84). P4.1 closure was previously unrecorded in this changelog.
+- **P4.2 spawn action + promise↔job binding (ADR-0005 Spec 4a,
+  `bd-p4-spawn-await-pxw6`, engine chain)** — `spawn` action, `ProfileResolver`
+  DI seam, `spawn_sink` side-channel, `resolve_spawn`/`reject_spawn` bridges,
+  and the resonate-sdk 0.6 engine migration (a1fe947). The 43001 emit carries
+  the promise_id in its `spec`; 43004/43006 resolve/reject the parked promise.
 - **Squads (ADR-0005 P6.1/P6.2, flywheel)** — `Squad` (named group of profile
   counts) + `Squad::from_recipe` mapping the legacy `Recipe{oc,pi,gk,extra}`
   onto profiles; `flywheel squad {list,show,spawn}` (spawn resolves members
@@ -75,6 +89,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Notes
 
+- **REGRESSION (tracked in bd-adr5 umbrella): `request_approval` no longer
+  parks after the resonate-sdk 0.6 migration (a1fe947)** — `sc11_workflow_approval`
+  (ADR-0004 suite row `approval_suspends`/`approval_rejection`) and both engine
+  unit approval tests fail: the run hangs at the approval action (approval_sink
+  never fills, handle never completes). Server stderr silent. Isolated to the
+  `request_approval` → `ctx.promise::<Decision>().data(...).create()` path —
+  `spawn`-await parks fine (sc18/19/20 green, including a timeout-less control).
+  Reported to BlueOak (P4.2 lane, thread bd-p4-spawn-await-pxw6). The approval
+  rows are "exists"-matrix rows that were green pre-migration — must be re-green
+  before the P4 phase gate closes.
 - Bead bd-3wc closed: the "nightly features" payoff for toron is delivered
   by stable modern Rust + edition 2024, not `#![feature]` gates.
 - **Parity shape catalog** (bd-96a/bd-3mp): `docs/parity/known-divergences.md`
