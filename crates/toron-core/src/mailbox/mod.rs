@@ -174,10 +174,10 @@ impl Mailbox {
     /// unchanged keys within this process.
     fn cached_load_agent_key(&self, path: &std::path::Path) -> Option<Keys> {
         let content = std::fs::read_to_string(path).ok()?;
-        if let Some(cached) = self.key_cache.lock().get(path) {
-            if cached.content == content {
-                return Some(cached.keys.clone());
-            }
+        if let Some(cached) = self.key_cache.lock().get(path)
+            && cached.content == content
+        {
+            return Some(cached.keys.clone());
         }
         let keys = crate::keys::decrypt(&content, self.agent_passphrase()).ok()?;
         self.kdf_loads.fetch_add(1, Ordering::Relaxed);

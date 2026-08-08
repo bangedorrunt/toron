@@ -207,6 +207,7 @@ impl ToJson for InboxMessage {
             "ack_required": self.ack_required,
             "thread_id": self.thread_id,
             "created_ts_us": self.created_ts_us,
+            "read_ts_us": self.read_ts_us,
         })
     }
 }

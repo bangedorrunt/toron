@@ -112,6 +112,7 @@ mod tests {
             "products",
             "product_projects",
             "proof_nonces",
+            "message_reads",
         ] {
             let n: i64 = sqlx::query_scalar(
                 "SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?",

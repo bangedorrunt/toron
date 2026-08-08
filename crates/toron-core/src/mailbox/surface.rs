@@ -321,10 +321,10 @@ fn filter_inbox_messages(items: Vec<InboxMessage>, q: &InboxQuery) -> Result<Vec
             if q.urgent_only && !matches!(m.importance.as_str(), "high" | "urgent") {
                 return false;
             }
-            if let Some(s) = since_us {
-                if m.created_ts_us <= s {
-                    return false;
-                }
+            if let Some(s) = since_us
+                && m.created_ts_us <= s
+            {
+                return false;
             }
             true
         })
@@ -1093,7 +1093,7 @@ mod tests {
         // agents never need to know npubs.
         assert_eq!(item.sender, "GreenCastle");
         assert_eq!(item.body_md, "please review");
-        assert_eq!(item.ack_required, true);
+        assert!(item.ack_required, "ack_required flag projected");
         assert!(!item.id.as_str().is_empty(), "typed message id present");
 
         // Ack (idempotent receipt).

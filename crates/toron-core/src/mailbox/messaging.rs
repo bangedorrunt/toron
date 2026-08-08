@@ -19,6 +19,13 @@
 //! Acks/reads (G8): private NIP-17 gift-wrapped kind-14 to the original sender
 //! only, tagged `toron-kind`=`ack`|`read` + a NIP-10 `e` reference. Idempotent
 //! (second call returns the stored timestamp). NEVER public replaceable events.
+//!
+//! Read state (bd-5icg): `mark_message_read`/`acknowledge_message` ALSO write a
+//! per-recipient `read_ts` into the `message_reads` SQLite projection (never
+//! into Nostr events), and `fetch_inbox(unread_only: true)` filters on it.
+//! `fetch_inbox` itself stays READ-ONLY — only the explicit receipt tools mark
+//! read (keeps the flywheel digest honest; matches the tool's `read_only_hint`).
+//! Read receipts are lost on an index rebuild (projection-only, documented).
 
 use std::collections::HashMap;
 
@@ -120,6 +127,10 @@ pub struct InboxMessage {
     pub ack_required: bool,
     pub thread_id: Option<String>,
     pub created_ts_us: i64,
+    /// i64-µs read timestamp from the `message_reads` projection (bd-5icg);
+    /// `None` when the recipient never marked this message read (unread), or
+    /// when no index pool is attached (read state cannot be known).
+    pub read_ts_us: Option<i64>,
 }
 
 /// `fetch_inbox` options.
@@ -265,16 +276,34 @@ impl Mailbox {
 
         // G7: order by rumor time (+ts_ms) + local_seq; never envelope time.
         let ordered = order_by_rumor_time(mails);
-        let messages: Vec<InboxMessage> =
+        let mut messages: Vec<InboxMessage> =
             ordered.into_iter().map(|(m, _seq)| inbox_from(m)).collect();
 
-        let messages = if args.unread_only {
-            // Unread-only filtering needs the projection read-state; the
-            // pipeline-level dedup treats everything as fresh on first read.
-            messages
-        } else {
-            messages
-        };
+        // bd-5icg: read state is a projection concern (never event state).
+        // Populate `read_ts_us` from the `message_reads` table and, when the
+        // caller asks for unread-only, keep only messages with NO read row for
+        // this recipient. Without an index pool the read state cannot be
+        // known — the filter degrades to no filtering (same as pre-bd-5icg)
+        // and every row reports `read_ts_us: None`.
+        let mut read_ts: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+        if let Some(pool) = self.index_pool.as_ref() {
+            let rows: Vec<(String, i64)> = sqlx::query_as(
+                "SELECT message_id, read_ts_us FROM message_reads \
+                 WHERE recipient = ?1 AND project_slug = ?2",
+            )
+            .bind(npub.to_hex())
+            .bind(&args.project_slug)
+            .fetch_all(pool)
+            .await
+            .unwrap_or_default();
+            read_ts.extend(rows);
+        }
+        for m in messages.iter_mut() {
+            m.read_ts_us = read_ts.get(&m.id).copied();
+        }
+        if args.unread_only {
+            messages.retain(|m| m.read_ts_us.is_none());
+        }
 
         // Parity: AM `fetch_inbox` names the sender (the display name, not the
         // raw pubkey). toron's gift-wrap unwrap yields only the sender npub;
@@ -413,6 +442,7 @@ impl Mailbox {
         let ts_us = crate::index::writer::Clock::now_us(&crate::index::writer::SystemClock);
         self.publish_dm(&wrap).await?;
         self.record_receipt(project_slug, agent_name, &id, kind, ts_us);
+        self.record_read_state(project_slug, npub, &id, ts_us).await;
 
         Ok(ReceiptResult {
             message_id: message_id.to_string(),
@@ -484,6 +514,38 @@ impl Mailbox {
         self.receipts()
             .lock()
             .insert(receipt_key(project, agent, id, kind), ts_us);
+    }
+
+    /// bd-5icg: write the per-recipient read receipt into the `message_reads`
+    /// projection (both `mark_message_read` and `acknowledge_message` land
+    /// here — an ack implies the message was read). Projection state only:
+    /// never written into Nostr events; lost on index rebuild (documented).
+    /// Best-effort: with no index pool attached the write is skipped (the
+    /// NIP-17 receipt + in-memory idempotency cache still work).
+    async fn record_read_state(
+        &self,
+        project_slug: &str,
+        recipient_npub: PublicKey,
+        message_id: &EventId,
+        ts_us: i64,
+    ) {
+        let Some(pool) = self.index_pool.as_ref() else {
+            return; // no index — read state cannot be persisted (degrade)
+        };
+        if let Err(e) = sqlx::query(
+            "INSERT INTO message_reads (project_slug, message_id, recipient, read_ts_us) \
+             VALUES (?1, ?2, ?3, ?4) \
+             ON CONFLICT (message_id, recipient) DO NOTHING",
+        )
+        .bind(project_slug)
+        .bind(message_id.to_hex())
+        .bind(recipient_npub.to_hex())
+        .bind(ts_us)
+        .execute(pool)
+        .await
+        {
+            tracing::warn!("read-state write failed (degrade): {e}");
+        }
     }
 
     fn receipts(&self) -> &parking_lot::Mutex<HashMap<String, i64>> {
@@ -632,6 +694,7 @@ fn inbox_from(mail: UnwrappedMail) -> InboxMessage {
         ack_required,
         thread_id,
         created_ts_us: mail.ts_us(),
+        read_ts_us: None, // filled by fetch_inbox from the message_reads projection
     }
 }
 
@@ -1024,5 +1087,255 @@ mod tests {
                 .expect("id");
         let k = receipt_key("demo", "BlueLake", &id, "ack");
         assert_eq!(k, format!("demo:BlueLake:ack:{id}"));
+    }
+
+    /// bd-5icg core round trip: mark-read → unread-only fetch excludes it;
+    /// the non-unread path is unchanged; read_ts_us is exposed on the row.
+    #[tokio::test]
+    async fn test_mark_read_excludes_from_unread_only_fetch() {
+        let (mailbox, db_path, data_dir) = test_mailbox("unread").await;
+        let pool = schema::connect(db_path.to_str().unwrap())
+            .await
+            .expect("connect");
+        schema::migrate(&pool).await.expect("migrate");
+        let mailbox = mailbox.with_index_pool(pool);
+        let (_sender, _) = register(&mailbox, "demo", "GreenCastle").await;
+        let (recv, npub) = register(&mailbox, "demo", "BlueLake").await;
+
+        for subject in ["first", "second"] {
+            let args = SendMessage {
+                project_slug: "demo".into(),
+                sender_name: "GreenCastle".into(),
+                to: vec!["BlueLake".into()],
+                subject: subject.into(),
+                body_md: format!("body {subject}"),
+                ..Default::default()
+            };
+            mailbox.send_message(&args).await.expect("send");
+        }
+
+        // Before any mark-read: everything is unread.
+        let unread = mailbox
+            .fetch_inbox(&FetchInbox {
+                project_slug: "demo".into(),
+                agent_name: "BlueLake".into(),
+                unread_only: true,
+                ..Default::default()
+            })
+            .await
+            .expect("fetch unread");
+        assert_eq!(unread.len(), 2, "both fresh");
+        assert!(unread.iter().all(|m| m.read_ts_us.is_none()));
+
+        // Mark ONE message read (explicit mark_message_read — fetch never marks).
+        let wrap = &wraps_to(&mailbox, &npub, 4).await[0];
+        let gift = unwrap_for_recipient(&recv, wrap).expect("unwrap");
+        let message_id = gift.rumor.clone().id().to_hex();
+        let first_read = mailbox
+            .mark_message_read("demo", "BlueLake", &message_id)
+            .await
+            .expect("mark read");
+        assert_eq!(first_read.message_id, message_id);
+
+        // Unread-only now excludes exactly the read message.
+        let unread = mailbox
+            .fetch_inbox(&FetchInbox {
+                project_slug: "demo".into(),
+                agent_name: "BlueLake".into(),
+                unread_only: true,
+                ..Default::default()
+            })
+            .await
+            .expect("fetch unread 2");
+        assert_eq!(unread.len(), 1, "read message filtered out");
+        assert!(
+            !unread.iter().any(|m| m.id == message_id),
+            "mark-read message absent from unread-only"
+        );
+
+        // Non-unread path unchanged: both messages still listed, read_ts set.
+        let all = mailbox
+            .fetch_inbox(&FetchInbox {
+                project_slug: "demo".into(),
+                agent_name: "BlueLake".into(),
+                ..Default::default()
+            })
+            .await
+            .expect("fetch all");
+        assert_eq!(all.len(), 2, "non-unread path returns everything");
+        let read_row = all.iter().find(|m| m.id == message_id).expect("read row");
+        assert!(
+            read_row.read_ts_us.is_some(),
+            "read_ts_us exposed on the read row"
+        );
+        assert!(
+            all.iter().filter(|m| m.id != message_id).all(|m| m.read_ts_us.is_none()),
+            "other rows stay unread"
+        );
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// bd-5icg: read state survives a process restart — reopen the SQLite
+    /// projection + bus on the same db/data dir; unread-only still excludes
+    /// the previously-read message.
+    #[tokio::test]
+    async fn test_read_state_survives_restart() {
+        let (mailbox, db_path, data_dir) = test_mailbox("restart").await;
+        let pool = schema::connect(db_path.to_str().unwrap())
+            .await
+            .expect("connect");
+        schema::migrate(&pool).await.expect("migrate");
+        let mailbox = mailbox.with_index_pool(pool.clone());
+        let (_sender, _) = register(&mailbox, "demo", "GreenCastle").await;
+        let (recv, npub) = register(&mailbox, "demo", "BlueLake").await;
+
+        for subject in ["first", "second"] {
+            let args = SendMessage {
+                project_slug: "demo".into(),
+                sender_name: "GreenCastle".into(),
+                to: vec!["BlueLake".into()],
+                subject: subject.into(),
+                body_md: format!("body {subject}"),
+                ..Default::default()
+            };
+            mailbox.send_message(&args).await.expect("send");
+        }
+        let wrap = &wraps_to(&mailbox, &npub, 4).await[0];
+        let gift = unwrap_for_recipient(&recv, wrap).expect("unwrap");
+        let message_id = gift.rumor.clone().id().to_hex();
+        mailbox
+            .mark_message_read("demo", "BlueLake", &message_id)
+            .await
+            .expect("mark read");
+
+        drop(mailbox);
+
+        // "Restart": fresh bus + fresh mailbox over the SAME db + key dir.
+        let pool2 = schema::connect(db_path.to_str().unwrap())
+            .await
+            .expect("reconnect");
+        let bus2 = InProcessBus::open(pool2.clone(), InProcessBusConfig::default())
+            .await
+            .expect("bus reopen");
+        let operator2 = crate::keys::generate();
+        let mailbox2 = Mailbox::new(Arc::new(bus2), data_dir.clone(), Some(operator2))
+            .with_agent_passphrase(PASSPHRASE)
+            .with_index_pool(pool2);
+
+        let unread = mailbox2
+            .fetch_inbox(&FetchInbox {
+                project_slug: "demo".into(),
+                agent_name: "BlueLake".into(),
+                unread_only: true,
+                ..Default::default()
+            })
+            .await
+            .expect("fetch after restart");
+        assert_eq!(unread.len(), 1, "read state persisted across restart");
+        assert!(
+            !unread.iter().any(|m| m.id == message_id),
+            "previously-read message stays excluded after restart"
+        );
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// bd-5icg: acknowledge_message also marks the message read (an ack
+    /// implies it was read), and unread-only excludes it.
+    #[tokio::test]
+    async fn test_acknowledge_also_marks_read() {
+        let (mailbox, db_path, data_dir) = test_mailbox("ackread").await;
+        let pool = schema::connect(db_path.to_str().unwrap())
+            .await
+            .expect("connect");
+        schema::migrate(&pool).await.expect("migrate");
+        let mailbox = mailbox.with_index_pool(pool);
+        let (_sender, _) = register(&mailbox, "demo", "GreenCastle").await;
+        let (recv, npub) = register(&mailbox, "demo", "BlueLake").await;
+
+        let args = SendMessage {
+            project_slug: "demo".into(),
+            sender_name: "GreenCastle".into(),
+            to: vec!["BlueLake".into()],
+            subject: "ack me".into(),
+            body_md: "please".into(),
+            ack_required: true,
+            ..Default::default()
+        };
+        mailbox.send_message(&args).await.expect("send");
+
+        let wrap = &wraps_to(&mailbox, &npub, 4).await[0];
+        let gift = unwrap_for_recipient(&recv, wrap).expect("unwrap");
+        let message_id = gift.rumor.clone().id().to_hex();
+        mailbox
+            .acknowledge_message("demo", "BlueLake", &message_id)
+            .await
+            .expect("ack");
+
+        let unread = mailbox
+            .fetch_inbox(&FetchInbox {
+                project_slug: "demo".into(),
+                agent_name: "BlueLake".into(),
+                unread_only: true,
+                ..Default::default()
+            })
+            .await
+            .expect("fetch unread");
+        assert!(
+            unread.is_empty(),
+            "acked message counts as read for unread-only"
+        );
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// bd-5icg honest degrade: without an index pool the read state cannot be
+    /// known — unread_only returns everything (pre-bd-5icg behavior) and every
+    /// row reports read_ts_us None. The receipt path still works.
+    #[tokio::test]
+    async fn test_unread_only_without_pool_degrades_to_all() {
+        let (mailbox, db_path, data_dir) = test_mailbox("nopool").await;
+        let (_sender, _) = register(&mailbox, "demo", "GreenCastle").await;
+        let (recv, npub) = register(&mailbox, "demo", "BlueLake").await;
+
+        let args = SendMessage {
+            project_slug: "demo".into(),
+            sender_name: "GreenCastle".into(),
+            to: vec!["BlueLake".into()],
+            subject: "x".into(),
+            body_md: "y".into(),
+            ..Default::default()
+        };
+        mailbox.send_message(&args).await.expect("send");
+
+        let wrap = &wraps_to(&mailbox, &npub, 4).await[0];
+        let gift = unwrap_for_recipient(&recv, wrap).expect("unwrap");
+        let message_id = gift.rumor.clone().id().to_hex();
+        mailbox
+            .mark_message_read("demo", "BlueLake", &message_id)
+            .await
+            .expect("mark read (no pool: NIP-17 receipt still works)");
+
+        let unread = mailbox
+            .fetch_inbox(&FetchInbox {
+                project_slug: "demo".into(),
+                agent_name: "BlueLake".into(),
+                unread_only: true,
+                ..Default::default()
+            })
+            .await
+            .expect("fetch");
+        assert_eq!(unread.len(), 1, "no pool → cannot filter → everything");
+        assert!(
+            unread.iter().all(|m| m.read_ts_us.is_none()),
+            "no pool → read_ts_us unknown (None)"
+        );
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
     }
 }

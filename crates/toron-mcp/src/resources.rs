@@ -267,10 +267,10 @@ fn project_slugs(mailbox: &Mailbox) -> Vec<String> {
     };
     let mut out = Vec::new();
     for entry in entries.flatten() {
-        if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-            if let Some(name) = entry.file_name().to_str() {
-                out.push(name.to_string());
-            }
+        if entry.file_type().map(|t| t.is_dir()).unwrap_or(false)
+            && let Some(name) = entry.file_name().to_str()
+        {
+            out.push(name.to_string());
         }
     }
     out
@@ -352,6 +352,7 @@ fn inbox_json(m: &toron_core::mailbox::InboxMessage) -> serde_json::Value {
         "ack_required": m.ack_required,
         "thread_id": m.thread_id,
         "created_ts_us": m.created_ts_us,
+        "read_ts_us": m.read_ts_us,
     })
 }
 

@@ -122,6 +122,9 @@ pub struct InboxMessageOut {
     pub ack_required: bool,
     pub thread_id: Option<String>,
     pub created_ts_us: i64,
+    /// Read receipt timestamp (i64-µs) from the `message_reads` projection;
+    /// `null` = unread (bd-5icg).
+    pub read_ts_us: Option<i64>,
 }
 
 /// `acknowledge_message` / `mark_message_read`.
