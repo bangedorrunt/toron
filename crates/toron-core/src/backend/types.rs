@@ -72,15 +72,40 @@ impl FromStr for AgentStatus {
     }
 }
 
-/// Push event emitted by a backend's `events` stream.
+/// Push event emitted by a backend's `subscribe` stream (unified in toron-core
+/// by ADR-0005 P1 — flywheel's `__poll_events` leaf consumes this shape).
+///
+/// Variants carry the fields the orchestration loop routes on: pane id, agent
+/// name (herdr's `PaneAgentStatusChanged`/`PaneAgentDetected`), and status.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BackendEvent {
     AgentStatusChanged {
         pane: PaneId,
+        agent: Option<String>,
         status: AgentStatus,
+    },
+    AgentDetected {
+        pane: PaneId,
+        agent: Option<String>,
+        status: AgentStatus,
+    },
+    PaneExited {
+        pane: PaneId,
     },
     /// Unmapped push payload (forwarded verbatim, never classified).
     Raw(String),
+}
+
+/// Landing data for a coded `agent.prompt` (ADR-0002, review-fix F6; unified
+/// in toron-core by ADR-0005 P1).
+///
+/// Exactly one of the two is populated on the herdr backend (landed →
+/// `status`, protocol error → `code`); other backends define their own
+/// contract.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PromptLanding {
+    pub status: Option<AgentStatus>,
+    pub code: Option<String>,
 }
 
 /// Options for spawning a new agent pane.

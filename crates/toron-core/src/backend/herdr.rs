@@ -21,11 +21,9 @@ use std::path::PathBuf;
 use parking_lot::Mutex;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::sync::mpsc;
 
-use super::Backend;
 use super::error::{BackendError, BackendErrorCode};
-use super::types::{AgentStatus, BackendEvent, PaneId, SpawnOptions};
+use super::types::{AgentStatus, BackendEvent, PaneId, PromptLanding};
 
 /// herdr socket protocol version this client is verified against (v18).
 pub const HDR_PROTOCOL: u64 = 18;
@@ -587,9 +585,9 @@ impl EventStream {
     }
 }
 
-/// Async `Backend` over the blocking herdr client. Spawns the blocking client
-/// calls on `tokio::task::block_in_place`-free dedicated threads via
-/// `tokio::task::spawn_blocking` where the caller uses the async trait.
+/// Sync `Backend` over the blocking herdr client (ADR-0005 P1 unified trait).
+/// The blocking client calls run inline (they are short unix-socket reads);
+/// statefulness lives behind the `Mutex<Client>`, so `&self` is enough.
 pub struct HerdrBackend {
     client: Mutex<Client>,
 }
@@ -606,105 +604,202 @@ impl HerdrBackend {
     }
 }
 
-impl Backend for HerdrBackend {
-    async fn spawn(&self, opts: &SpawnOptions) -> Result<PaneId, BackendError> {
-        let mut client = self.client.lock();
-        // Find or create a workspace for the project, then start the agent in
-        // its root pane. Name→pane mapping happens on the flywheel side.
-        let mut target_pane: Option<String> = None;
-        let workspaces = client.workspace_list()?;
-        for ws in &workspaces {
-            if ws.label == opts.project {
-                let panes = client.pane_list(Some(&ws.workspace_id))?;
-                if let Some(first) = panes.into_iter().next() {
-                    target_pane = Some(first.pane_id);
-                }
-                break;
-            }
-        }
-        let pane_id = match target_pane {
-            Some(id) => id,
-            None => {
-                let (_ws, root) =
-                    client.workspace_create(opts.cwd.as_deref(), Some(&opts.project), false)?;
-                root.pane_id
-            }
-        };
-        let info = client.agent_start(&opts.agent_name, &opts.program, &pane_id, 5000, &[])?;
-        if info.name.as_deref() != Some(opts.agent_name.as_str()) {
-            let _ = client.agent_rename(&info.pane_id, &opts.agent_name);
-        }
-        Ok(PaneId(pane_id))
+impl super::Backend for HerdrBackend {
+    fn name(&self) -> &'static str {
+        "herdr"
     }
 
-    async fn prompt(&self, pane: &PaneId, input: &str) -> Result<(), BackendError> {
+    fn workspace_list(&self) -> Result<Vec<WorkspaceInfo>, BackendError> {
+        self.client.lock().workspace_list()
+    }
+
+    fn workspace_create(&self, label: Option<&str>) -> Result<WorkspaceInfo, BackendError> {
         let mut client = self.client.lock();
-        client.agent_prompt(pane.as_str(), input, None)?;
+        let (ws, _root) = client.workspace_create(None, label, false)?;
+        Ok(ws)
+    }
+
+    fn workspace_close(&self, workspace_id: &str) -> Result<(), BackendError> {
+        self.client.lock().workspace_close(workspace_id)?;
         Ok(())
     }
 
-    async fn wait(&self, pane: &PaneId) -> Result<AgentStatus, BackendError> {
+    fn pane_split(
+        &self,
+        parent_pane_id: &str,
+        direction: &str,
+        cwd: Option<&str>,
+    ) -> Result<PaneInfo, BackendError> {
         let mut client = self.client.lock();
-        let info = client.agent_wait(
-            pane.as_str(),
-            &[AgentStatus::Done, AgentStatus::Blocked],
-            Some(30_000),
+        let res = client.call(
+            "pane.split",
+            json!({ "target_pane_id": parent_pane_id, "direction": direction, "cwd": cwd }),
         )?;
-        Ok(info.agent_status)
+        serde_json::from_value(res.get("pane").cloned().unwrap_or(res))
+            .map_err(|e| BackendError::new(BackendErrorCode::Malformed, e.to_string()))
     }
 
-    async fn read(&self, pane: &PaneId) -> Result<String, BackendError> {
-        let mut client = self.client.lock();
-        client.agent_read(pane.as_str(), "recent", None)
+    fn pane_list(&self, workspace_id: Option<&str>) -> Result<Vec<PaneInfo>, BackendError> {
+        self.client.lock().pane_list(workspace_id)
     }
 
-    async fn send_keys(&self, pane: &PaneId, keys: &str) -> Result<(), BackendError> {
-        let mut client = self.client.lock();
-        client.agent_send_keys(pane.as_str(), &[keys])?;
+    fn pane_close(&self, pane_id: &str) -> Result<(), BackendError> {
+        self.client.lock().call("pane.close", json!({ "pane_id": pane_id }))?;
         Ok(())
     }
 
-    async fn events(&self) -> Result<mpsc::Receiver<BackendEvent>, BackendError> {
+    fn pane_run(&self, _pane_id: &str, _command: &str) -> Result<(), BackendError> {
+        Err(BackendError::unsupported(
+            "herdr does not implement pane_run (no typed Client helper)",
+        ))
+    }
+
+    fn pane_wait_output(
+        &self,
+        pane_id: &str,
+        needle: &str,
+        timeout_ms: u64,
+    ) -> Result<serde_json::Value, BackendError> {
         let mut client = self.client.lock();
-        let (tx, rx) = mpsc::channel(64);
-        // Subscribe to agent-status pushes for the last-known pane. Callers
-        // should narrow the subscription once a pane is spawned (Phase-2
-        // reactor subscribes per-pane).
-        let stream = client.subscribe(&[Subscription::agent_status_changed(String::new())])?;
-        // Forward blocking reads onto the async channel via a dedicated thread.
-        std::thread::spawn(move || {
-            let mut stream = stream;
-            loop {
-                match stream.read_event() {
-                    Ok(Some((kind, data))) => {
-                        let evt = parse_push(&kind, &data);
-                        if tx.blocking_send(evt).is_err() {
-                            break;
-                        }
-                    }
-                    Ok(None) => break,
-                    Err(_) => break,
-                }
-            }
-        });
-        Ok(rx)
+        let res = client.call_coded(
+            "pane.wait_for_output",
+            json!({
+                "pane_id": pane_id,
+                "mode": "match",
+                "pattern": needle,
+                "timeout_ms": timeout_ms,
+            }),
+        )?;
+        Ok(res)
+    }
+
+    fn agent_list(&self) -> Result<Vec<AgentInfo>, BackendError> {
+        self.client.lock().agent_list()
+    }
+
+    fn agent_start(
+        &self,
+        name: &str,
+        kind: &str,
+        pane_id: &str,
+        args: &[String],
+    ) -> Result<AgentInfo, BackendError> {
+        self.client
+            .lock()
+            .agent_start(name, kind, pane_id, 30_000, args)
+    }
+
+    fn agent_rename(&self, target: &str, new_name: Option<&str>) -> Result<(), BackendError> {
+        let name = new_name.ok_or_else(|| {
+            BackendError::unsupported("herdr agent_rename cannot clear a name (None)")
+        })?;
+        self.client.lock().agent_rename(target, name)?;
+        Ok(())
+    }
+
+    fn prompt(
+        &self,
+        target: &str,
+        text: &str,
+        wait: Option<&WaitOptions>,
+    ) -> Result<serde_json::Value, BackendError> {
+        let mut client = self.client.lock();
+        let info = client.agent_prompt(target, text, wait.cloned())?;
+        let status = Some(info.agent_status.as_str().to_string());
+        Ok(json!({
+            "agent": info.agent.clone().unwrap_or_default(),
+            "pane_id": info.pane_id,
+            "status": status,
+        }))
+    }
+
+    fn prompt_coded(
+        &self,
+        target: &str,
+        text: &str,
+        wait: Option<&WaitOptions>,
+    ) -> Result<PromptLanding, BackendError> {
+        let mut client = self.client.lock();
+        match client.agent_prompt_coded(target, text, wait.cloned()) {
+            Ok(info) => Ok(PromptLanding {
+                status: Some(info.agent_status),
+                code: None,
+            }),
+            Err(e) => Ok(PromptLanding {
+                status: None,
+                code: Some(e.code().as_str().to_string()),
+            }),
+        }
+    }
+
+    fn agent_wait(
+        &self,
+        target: &str,
+        until: &[AgentStatus],
+        timeout_ms: Option<u64>,
+    ) -> Result<AgentInfo, BackendError> {
+        self.client.lock().agent_wait(target, until, timeout_ms)
+    }
+
+    fn agent_read(&self, target: &str, source: &str, lines: u32) -> Result<serde_json::Value, BackendError> {
+        let text = self.client.lock().agent_read(target, source, Some(lines))?;
+        Ok(json!({ "text": text }))
+    }
+
+    fn agent_send_keys(&self, target: &str, keys: &[&str]) -> Result<(), BackendError> {
+        self.client.lock().agent_send_keys(target, keys)?;
+        Ok(())
+    }
+
+    fn subscribe(
+        &self,
+        filters: &[Subscription],
+    ) -> Result<Box<dyn super::EventStream>, BackendError> {
+        let mut client = self.client.lock();
+        let stream = client.subscribe(filters)?;
+        Ok(Box::new(HerdrEventStreamAdapter(stream)))
     }
 }
 
-/// Map a herdr push onto a typed `BackendEvent`.
+/// Adapter: raw herdr blocking stream → unified [`super::EventStream`] that
+/// yields typed [`BackendEvent`]s. Forwards to `parse_push`.
+struct HerdrEventStreamAdapter(EventStream);
+
+impl super::EventStream for HerdrEventStreamAdapter {
+    fn read_event(&mut self) -> Result<Option<BackendEvent>, BackendError> {
+        Ok(self
+            .0
+            .read_event()?
+            .map(|(kind, data)| parse_push(&kind, &data)))
+    }
+}
+
+/// Map a herdr push onto a typed `BackendEvent` (ADR-0005 P1 unified shape).
+///
+/// `pane.agent_status_changed` → [`BackendEvent::AgentStatusChanged`];
+/// `pane.agent_detected` → [`BackendEvent::AgentDetected`];
+/// `pane.exited` → [`BackendEvent::PaneExited`]; everything else → [`BackendEvent::Raw`].
 fn parse_push(kind: &str, data: &Value) -> BackendEvent {
     let pane = data
         .get("pane_id")
         .and_then(Value::as_str)
         .map(|s| PaneId(s.to_string()))
         .unwrap_or_else(|| PaneId(String::new()));
+    let agent = data
+        .get("agent")
+        .and_then(Value::as_str)
+        .or_else(|| data.get("display_agent").and_then(Value::as_str))
+        .map(|s| s.to_string());
     let status = data
         .get("agent_status")
+        .or_else(|| data.get("final_status"))
         .and_then(Value::as_str)
         .and_then(|s| s.parse().ok())
         .unwrap_or(AgentStatus::Unknown);
     match kind {
-        "pane.agent_status_changed" => BackendEvent::AgentStatusChanged { pane, status },
+        "pane.agent_status_changed" => BackendEvent::AgentStatusChanged { pane, agent, status },
+        "pane.agent_detected" => BackendEvent::AgentDetected { pane, agent, status },
+        "pane.exited" => BackendEvent::PaneExited { pane },
         other => BackendEvent::Raw(format!("{other}: {data}")),
     }
 }
