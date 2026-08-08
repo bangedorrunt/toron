@@ -55,6 +55,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **P4.2 spawn-await CLOSED (ADR-0005 Spec 4a, `bd-p4-spawn-await-pxw6`)** —
   spawn action + promise↔job binding + no_claim_timeout landed and closed by
   BlueOak; approval/spawn sink TypeId fix (see Fixed) shipped in the same bead.
+- **P4.7 ALL P4 Behavior Test Matrix rows GREEN (ADR-0005, `bd-p4-tests-4cl7`,
+  toron-e2e)** — harness fixtures (`tests/common/mod.rs`) + scenario IMPLS for
+  every P4 row, against the landed P4.3/P4.4 code: `sc18` spawn_no_claim_timeout,
+  `sc19` spawn_await_resume, `sc20` spawn_await_failure, `sc21` cron_success +
+  cron_restart (BlueOak, hardened), `sc22` cron_failure_bead (FAILED run →
+  PolicySink Bead event with full FailureBundle; human-in-loop when no fixer),
+  `sc23` cron_escalate (repeat_failure ≥ threshold → Escalate event, streak ≥
+  threshold), `sc24` cron_catchup (`latest_due_at_or_before` selects the latest
+  missed tick — one, not a burst; manager wake fires a single tick). Full suite
+  `cargo test -p toron-e2e --features p1,p2,p4` = 39/39 green; toron-workflow
+  lib 123/123. The `p4` feature gate (p4 = p5). sc22/sc23 assert the policy
+  DECISIONS (sink events); flywheel's `br create` / kind-14 DM execution is the
+  embedding's wiring.
 - **P4.7 P4 behavior-test HARNESS (ADR-0005, `bd-p4-tests-4cl7`, toron-e2e)** —
   shared cron fixtures (`tests/common/mod.rs`: `boot_server`/`wait_ready`,
   `cron_registry`/`fixture_registration`, `housekeeper_workflow`,

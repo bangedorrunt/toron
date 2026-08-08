@@ -30,21 +30,21 @@ epics close.
 | **P1** | Backend trait unification (ONE trait, call-site migration) | **Complete** (bd-p1-* epics closed) |
 | **P2** | Profiles + built-in library (6 roles, 30013 content-map, `Profile::resolve`) | **Complete** (bd-p2-* epics closed) |
 | **P3** | Unified workflow engine (one vocab, one engine, stages, auto-crew, workflow CLI) | **Complete** (bd-p3-* epics closed) |
-| **P4** | Smart cron (self-reporting + defined fixer; durable-sleep manager) | **In progress** (P4.1 schedule-ext ✅; P4.2 spawn-await + promise↔job binding ✅; P4.3 cron-mgr ✅ (BlueOak); P4.4 bead-on-fail ✅ decision layer (BlueOak) — flywheel side-effect wiring open; P4.5 sagas open; P4.6 cron CLI ✅ (EmeraldSwan); P4.7 tests: SC rows ✅ green, FW rows blocked on P4.4 wiring) |
+| **P4** | Smart cron (self-reporting + defined fixer; durable-sleep manager) | **In progress** (P4.1 schedule-ext ✅; P4.2 spawn-await + promise↔job binding ✅; P4.3 cron-mgr ✅ (BlueOak); P4.4 bead-on-fail ✅ decision layer (BlueOak) — flywheel side-effect wiring open; P4.5 sagas open; P4.6 cron CLI ✅ (EmeraldSwan); P4.7 tests ✅ ALL P4 rows green — spawn_* + cron_success/restart/failure_bead/escalate/catchup) |
 | **P5** | Engine flexibility (graph DAG, control-flow, lint-graph) | **Complete** (bd-p5-* epics closed; spike GATE passed) |
 | **P6** | Squads + observability (squad/recipe unify, runs view + per-run cost, robot-snapshot runs) | **Complete** (bd-p6-squads-observability-61td closed) |
 
 P4 (smart cron) is the remaining open phase under ADR-0005. Cross-phase
 verification (mine, 2026-08-08): ADR-0003 `verify-gates.sh` passes; toron-workflow
-lib suite 110/110 green; ADR-0004 e2e suite (p1/p2) fully green — the
+lib suite 123/123 green; ADR-0004 e2e suite (p1/p2) fully green — the
 `request_approval` suspend regression from the 0.6 migration is fixed
-(ApprovalSink/SpawnSink TypeId collision, BlueOak P4.2 lane). P4.7 SC rows green.
-**P4.7 harness (2026-08-08):** shared cron fixtures (`tests/common/mod.rs`) +
-scenario skeletons for the remaining P4 rows landed — `sc22_cron_failure_bead`,
-`sc23_cron_escalate`, `sc24_cron_catchup` are now GREEN (P4.4 decision layer +
-P4.3 catch-up, BlueOak). `sc21_cron_durable_loop` (BlueOak) covers
-`cron_success` + `cron_restart`. sc22/sc23 assert the POLICY DECISIONS (sink
-events); the flywheel side-effect execution (`br create` / kind-14 DM) is the
-embedding's wiring.
+(ApprovalSink/SpawnSink TypeId collision, BlueOak P4.2 lane).
+**P4.7 ALL P4 Behavior Test Matrix rows GREEN (2026-08-08):** shared cron
+fixtures (`tests/common/mod.rs`) + impls — `sc18` spawn_no_claim_timeout,
+`sc19` spawn_await_resume, `sc20` spawn_await_failure, `sc21`
+cron_success+cron_restart, `sc22` cron_failure_bead, `sc23` cron_escalate,
+`sc24` cron_catchup. toron-e2e p1,p2,p4 suite 39/39. sc22/sc23 assert the
+POLICY DECISIONS (sink events); the flywheel side-effect execution (`br create`
+/ kind-14 DM) is the embedding's wiring.
 
 // governed-by: ADR-0003
