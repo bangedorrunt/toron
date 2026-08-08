@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Squads (ADR-0005 P6.1/P6.2, flywheel)** — `Squad` (named group of profile
+  counts) + `Squad::from_recipe` mapping the legacy `Recipe{oc,pi,gk,extra}`
+  onto profiles; `flywheel squad {list,show,spawn}` (spawn resolves members
+  via `Profile::resolve`); `recipes list` stays an alias. P6.1/P6.2.
+- **Runs dashboard (ADR-0005 P6.3/P6.4, flywheel)** — `flywheel runs
+  {list,show,pending,digest}` reads the per-project JSONL logs into a run list
+  with state + owner + advisory per-run cost; `digest --since N[smhd]`
+  reports failures/parked/broken>N; `--robot-snapshot` now carries a `runs`
+  array for agent drivers.
 - **ADR-0004 primitives LIVE in the daemon** (bd-pkc part 1): the MCP
   daemon's inbound path now runs the `UnwrapPipeline` projection loop
   (`Mailbox::spawn_unwrap_loop`) — inbound gift-wraps are unwrapped with the
