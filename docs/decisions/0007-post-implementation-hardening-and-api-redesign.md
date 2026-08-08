@@ -690,21 +690,26 @@ Env precedence: flags > `TORON_DATA_DIR` / `FLYWHEEL_BACKEND` / `FLYWHEEL_MAIL` 
 
 ## Verification (acceptance for this ADR)
 
-- [x] F1 path: TriggerNotifySink + spawn_mail_trigger_loop (gift-wrap required; 2026-08-08): **gift-wrapped** send triggers `message_posted` once; no self-loop; raw-bus tests labeled non-NIP-17 (C7)
-- [x] F2 durable XDG ToronPaths + demo_mailbox production default (2026-08-08): two processes, same data_dir, mail visible
-- [x] **F2.KDF / R2.0** content-keyed unlock cache + many-keys gate test (many-keys fixture bound)
-- [x] F3 MessageId + MailSurface; honest AM edge beads open in flywheel se2.2: inbox id → ack/reply on toron (hex) **and** agentmail (decimal); **no silent 0**
-- [x] F4 foreach {{item}} (9f147ee): foreach bodies use items
-- [x] F5 call_workflow nested (WorkflowResolver): call_workflow nested success + fail_run
-- [x] F6 stamp production path (c86ea0c): stamped public event rejected by trigger filter
-- [x] F7 coalesce 43001 (c86ea0c): N mentions → one 43001
-- [x] F8 block_on_async + concurrent_workflow_sends_no_hang: no deadlock under concurrent workflow sends
-- [ ] `scripts/verify-gates.sh` green (run in review)
-- [ ] No `u64` message/reservation ids in **shared** request/response types
-- [ ] Superlogical still Unsupported-only stub
-- [ ] README residual register points at this ADR
-- [ ] Driver 5 exception noted in known-divergences for any arg-type breaks
-- [ ] Operator key file mode 0600 on durable root (C4)
+Status refreshed 2026-08-08 by **bd-adr7-residual-vxnv.3** (R-verify, honest re-audit; crew
+residual epic **`bd-adr7-residual-vxnv`** open — `.1` R-wire in_progress, `.2` R-res open,
+`.3` R-verify in_progress). Items below are checked ONLY when the production-path evidence
+was re-verified against the 2026-08-08 tree.
+
+- [ ] F1 path: TriggerNotifySink + spawn_mail_trigger_loop (gift-wrap required): **gift-wrapped** send triggers `message_posted` once; no self-loop; raw-bus tests labeled non-NIP-17 (C7) — **UNCHECKED 2026-08-08 (R-verify)**: `server.rs::demo_mailbox()` (line 290) does NOT wire `with_trigger_tx` / `spawn_mail_trigger_loop` on the production serve path; loop unit tests exist (`workflow_host.rs::trigger_loop_invokes_matching_workflow`) but the production wire is bead **bd-adr7-residual-vxnv.1** (in_progress). Re-check only when .1 closes with gift-wrap proof.
+- [x] F2 durable XDG ToronPaths + demo_mailbox production default (2026-08-08): two processes, same data_dir, mail visible — re-verified: `server.rs::demo_mailbox()` production branch (271–285) uses `ToronPaths::resolve` + durable root; `cli_robot.rs` shares one `TORON_MCP_DATA_DIR` across in-process mailbox + shelled binary; config tests `env_override_beats_xdg` / `xdg_data_home_wins_over_home_fallback`
+- [x] **F2.KDF / R2.0** content-keyed unlock cache + many-keys gate test (many-keys fixture bound) — re-verified: `mailbox/mod.rs::unwrap_loop_kdf_cached_between_rebuilds_many_keys`
+- [x] F3 MessageId + MailSurface; honest AM edge beads open in flywheel se2.2: inbox id → ack/reply on toron (hex) **and** agentmail (decimal); **no silent 0** — re-verified: `message_id` String-native (`tools.rs`); `am_parity_e2e`; flywheel `bd-adr7-mail-adapt-se2.2` (in_progress) + se2 epic open
+- [x] F4 foreach {{item}} (9f147ee): foreach bodies use items — re-verified: commit 9f147ee + foreach injection tests
+- [x] F5 call_workflow nested (WorkflowResolver): call_workflow nested success + fail_run — re-verified: `engine.rs::call_workflow_nested_subrun_returns_child_output` + `on_error_fail_run_fails_the_run_durably`
+- [x] F6 stamp production path (c86ea0c): stamped public event rejected by trigger filter — re-verified: commit c86ea0c + `workflow_host.rs::workflow_sends_stamp_rumor_and_are_filtered`
+- [x] F7 coalesce 43001 (c86ea0c): N mentions → one 43001 — re-verified: commit c86ea0c + `workflow_host.rs::coalesced_burst_publishes_one_stamped_43001`
+- [x] F8 block_on_async + concurrent_workflow_sends_no_hang: no deadlock under concurrent workflow sends — re-verified: `workflow_host.rs::concurrent_workflow_sends_no_hang`
+- [x] `scripts/verify-gates.sh` green — **GREEN 2026-08-08 (R-verify run)**: `ok: no asupersync`, `ok: no fastmcp`, `ok: all crate roots forbid unsafe_code`, `gates pass` (exit 0)
+- [x] No `u64` message/reservation ids in **shared** request/response types — literal claim verified (all `u64` gone; `message_id`/`file_reservation_id` are String). **Residual noted:** `renew_file_reservations` / `release_file_reservations` args still carry `file_reservation_ids: Option<Vec<i64>>` which the handlers **accept and silently ignore** (only `paths` is passed through) — an F11-class honesty gap, tracked with F11.
+- [x] Superlogical still Unsupported-only stub — re-verified: no `superlogical.rs`; `backend/mod.rs` Unsupported-open defaults; superlogical is an identifier string only
+- [x] README residual register points at this ADR — re-verified: `docs/decisions/README.md` lines 46–49 point at ADR-0007 residual register
+- [x] Driver 5 exception noted in known-divergences for any arg-type breaks — re-verified: `docs/parity/known-divergences.md` §2b documents the hex-vs-u64 arg-type fix (Driver 5 / C3 cited)
+- [x] Operator key file mode 0600 on durable root (C4) — re-verified: `config/mod.rs::operator_key_created_0600_and_idempotent_across_openers` + `keys/mod.rs` 0600 assert + `ensure_operator_key_mode`
 
 ---
 
@@ -724,9 +729,13 @@ Env precedence: flags > `TORON_DATA_DIR` / `FLYWHEEL_BACKEND` / `FLYWHEEL_MAIL` 
 
 ## Fixed-Point Judgment
 
-**Implementation closed 2026-08-08** (epic bd-adr7-post-impl-e23b). Residual:
-flywheel se2.* adapter beads (honest AM id edge, Phase B XDG on flywheel side)
-and full gift-wrap F1 e2e still recommended. Core toron Change Agenda items landed.
+**Implementation closed 2026-08-08** (epic bd-adr7-post-impl-e23b). **Residual epic
+`bd-adr7-residual-vxnv` OPEN (crew-owned):** `.1` R-wire (production trigger_tx +
+spawn_mail_trigger_loop) in_progress, `.2` R-res (MCP live resource projections) open,
+`.3` R-verify (this honest checklist) in_progress. Flywheel side: se2 epic
+`bd-adr7-mail-adapt-se2` open (`.1` Phase A data_dir, `.2` honest AM id edge in_progress,
+`.3` WAIT MailSurface). **F1 production-path gift-wrap proof NOT yet green** — do not
+claim "NIP-17 trigger live in production" until `.1` closes.
 
 Historical (pre-implementation):
 
@@ -746,6 +755,7 @@ unfinished features out of the "complete" table with residual register.
 2. **Do not trust `message_posted` workflows for DMs** until TriggerIngress
    exists; current filter+matcher+wire triple is inconsistent by construction.
 3. **Treat ADR-0005 P5 control-flow as partial:** foreach bug, call_workflow stub.
+   (F4/F5 fixes verified 2026-08-08 — see Verification above.)
 4. **Mux Backend unification succeeded;** mail trait unification was deferred
    and is now the binding constraint — this ADR proposes finishing it as
    Nostr-native MailSurface, with agent-mail as adapter (superset orientation).
