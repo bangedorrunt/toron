@@ -67,12 +67,23 @@ Every identity op differs in response shape. toron is crypto-native per ADR-0003
 
 ## 5. Open thread
 
-- bd-jgd (outputSchema on the 38 MCP tools) should derive schemars structs from the
+- ~~bd-jgd (outputSchema on the 38 MCP tools) should derive schemars structs from the
   toron shapes above and REPLACE this file's free-text notes as the schema-level source
-  of truth. This catalog stays the human-readable divergence record.
+  of truth. This catalog stays the human-readable divergence record.~~
+- **DONE (bd-jgd, 2026-08-08):** every one of the 38 tools now carries a schemars-derived
+  `outputSchema` on its definition (and over the MCP wire). Schema structs live in
+  `crates/toron-mcp/src/responses.rs`, mirroring the toron-side shapes in section 2
+  (e.g. `WhoIsOut` = `{name, npub, program, model, task_description, last_active_ts_us}`,
+  `SendResultOut.deliveries[].payload = {recipient, event_id}`, `ReleaseResultOut = {released}`).
+  The schemas are the machine-readable source of truth for response shapes; this catalog
+  stays the human-readable divergence record. Divergence notes above remain accurate —
+  they are what the structs encode.
+- Acceptance gate: `all_tools_declare_output_schema` (lib test) + wire-level
+  `output_schema.is_some()` check in `crates/toron-mcp/tests/acceptance.rs`.
 
 ---
 
 *Maintained by lane OC-C (BlackMarsh). Created 2026-08-07 from the bd-96a real-e2e probe
 + source cross-check. Updated per code changes; re-verify toron shapes on any response
-change (ADR-0004: "changes a response shape" gates on this catalog).*
+change (ADR-0004: "changes a response shape" gates on this catalog). outputSchema
+structs: `crates/toron-mcp/src/responses.rs` (bd-jgd).*
