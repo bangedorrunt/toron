@@ -14,6 +14,7 @@ pub mod resources;
 pub mod responses;
 pub mod server;
 pub mod tools;
+pub mod workflow_host;
 
 pub use resources::RESOURCES;
 pub use server::{ToronServer, demo_mailbox, router, serve_http, serve_stdio};

@@ -15,6 +15,7 @@ rmcp = { version = "3.1.1", features = [
 ] }
 schemars = "0.8"
 toron-core = { path = "../toron-core" }
+toron-workflow = { path = "../toron-workflow" }
 axum = "0.7"
 tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"
@@ -22,6 +23,9 @@ tracing = "0.1"
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+evalexpr = "13.1.0"
+nostr-sdk = { version = "0.44", features = ["nip44", "nip49", "nip59"] }
 
 [dev-dependencies]
 tower = "0.5"
+uuid = { version = "1", features = ["v4"] }
