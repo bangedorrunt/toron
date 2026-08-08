@@ -303,6 +303,55 @@ pub async fn run_workflow(
     Ok(serde_json::Value::Object(step_outputs))
 }
 
+/// Build the kind-46012 workflow-run terminal event (ADR-0005 Spec 0, P0.3).
+///
+/// Maps the durable function's outcome Value to the wire `status` field —
+/// additive content only (the kind is frozen; its content is toron-owned; old
+/// readers ignore the new `status`/`run_id`/`error`/`failed_step` fields):
+///
+/// - outcome `{status:"failed", error, failed_step}` → 46012 `status:"failed"`.
+/// - normal completion (no `status` key) → 46012 `status:"succeeded"`.
+///
+/// The full outcome is preserved under `output` so downstream readers (smart
+/// cron's `on_failure`, `flywheel runs`) see step outputs on success and the
+/// failure bundle on failure.
+///
+/// The event is addressable by run id (`d` = run_id), matching the
+/// WORKFLOW_RUN_FIRST..=LAST registry contract.
+pub fn build_workflow_run_terminal(
+    keys: &nostr_sdk::prelude::Keys,
+    run_id: &str,
+    outcome: &serde_json::Value,
+) -> anyhow::Result<nostr_sdk::prelude::Event> {
+    use nostr_sdk::prelude::{Tag, Timestamp};
+    use toron_core::nostr::event::build_event;
+    use toron_core::nostr::kinds::{WORKFLOW_RUN_LAST, toron_kind};
+
+    let status = match outcome.get("status").and_then(serde_json::Value::as_str) {
+        Some("failed") => "failed",
+        _ => "succeeded",
+    };
+    let mut terminal = serde_json::Map::new();
+    terminal.insert("status".into(), serde_json::Value::String(status.into()));
+    if let Some(err) = outcome.get("error") {
+        terminal.insert("error".into(), err.clone());
+    }
+    if let Some(failed_step) = outcome.get("failed_step") {
+        terminal.insert("failed_step".into(), failed_step.clone());
+    }
+    terminal.insert("run_id".into(), serde_json::Value::String(run_id.into()));
+    terminal.insert("output".into(), outcome.clone());
+
+    build_event(
+        keys,
+        toron_kind(WORKFLOW_RUN_LAST),
+        serde_json::Value::Object(terminal).to_string(),
+        vec![Tag::identifier(run_id)],
+        Timestamp::now(),
+    )
+    .map_err(|e| anyhow::anyhow!("build kind-46012 terminal: {e}"))
+}
+
 /// Substitute `{{trigger.<path>}}` / `{{steps.<name>.<path>}}` templates in an
 /// action's string fields before the runner sees them (ADR-0005 Spec 0:
 /// value-returning actions flow into `steps.<name>` for downstream templates).
@@ -680,6 +729,51 @@ steps:
             output.get("after").is_some(),
             "later steps still ran: {output}"
         );
+    }
+
+    /// P0.3 (ADR-0005 Spec 0): the kind-46012 terminal emitter maps the run's
+    /// outcome Value to the wire `status` field — additive content only.
+    /// A failed outcome produces `status:"failed"` + error; normal completion
+    /// produces `status:"succeeded"`.
+    #[test]
+    fn workflow_run_terminal_maps_status() {
+        use nostr_sdk::prelude::Keys;
+        use toron_core::nostr::kinds::{WORKFLOW_RUN_LAST, toron_kind};
+
+        let keys = Keys::generate();
+
+        // Failed outcome → status:"failed" + error.
+        let failed = serde_json::json!({
+            "status": "failed",
+            "error": "boom",
+            "failed_step": "upgrade",
+        });
+        let ev = build_workflow_run_terminal(&keys, "run-1", &failed).expect("build failed terminal");
+        assert_eq!(ev.kind, toron_kind(WORKFLOW_RUN_LAST), "kind-46012");
+        let content: serde_json::Value =
+            serde_json::from_str(&ev.content).expect("content parses");
+        assert_eq!(content["status"], "failed");
+        assert_eq!(content["error"], "boom");
+        assert_eq!(content["failed_step"], "upgrade");
+        assert_eq!(content["run_id"], "run-1");
+        // Addressable by run id (d tag).
+        assert!(
+            ev.tags.iter().any(|t| t.as_slice().get(0) == Some(&"d".to_string())
+                && t.as_slice().get(1) == Some(&"run-1".to_string())),
+            "d tag = run id"
+        );
+
+        // Normal completion → status:"succeeded" + the step outputs.
+        let ok = serde_json::json!({ "foo": { "n": 42 } });
+        let ev = build_workflow_run_terminal(&keys, "run-2", &ok).expect("build ok terminal");
+        let content: serde_json::Value =
+            serde_json::from_str(&ev.content).expect("content parses");
+        assert_eq!(content["status"], "succeeded");
+        assert_eq!(
+            content["output"]["foo"]["n"], 42,
+            "step outputs preserved on the wire under `output`"
+        );
+        assert!(content.get("error").is_none(), "no error on success");
     }
 
     /// A workflow whose first step's action returns `{"n":42}`; the second
