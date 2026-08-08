@@ -81,6 +81,18 @@ impl LiveDaemon {
         unsafe {
             std::env::set_var("TORON_OPERATOR_KEY", key_path.to_str().unwrap());
             std::env::set_var("TORON_KEY_PASSPHRASE", pass);
+            // Per-invocation mailbox root (R2 / ADR-0007 D3): WITHOUT this the
+            // daemon falls back to the DURABLE XDG root
+            // (`~/.local/share/toron`), which accumulates agent keys across
+            // test runs. The unwrap-loop pipeline rebuild KDF-loads EVERY key
+            // in the root (~1s/key, cold) — after a few runs the projection
+            // (search/summarize/product fan) stalls for minutes while the
+            // per-agent inbox (single-key load) stays fast. The parity suite
+            // was green at 56s only while per-pid temp roots were the default;
+            // the durable default re-introduced the stall (F2.KDF class). This
+            // env restores per-invocation isolation for the tests; production
+            // keeps the durable root.
+            std::env::set_var("TORON_MCP_DATA_DIR", dir.join("mailbox"));
         }
 
         // 4. boot the router (reads the env above) on a kernel-chosen port.
@@ -410,21 +422,35 @@ async fn cluster_messaging_round_trip() -> anyhow::Result<()> {
     );
 
     // search_messages: the message body is FTS-indexed (porter + unicode61).
-    let search = d
-        .call(
-            "search_messages",
-            serde_json::json!({
-                "project_key": proj,
-                "query": "parity",
-                "limit": 10,
-            }),
-        )
-        .await;
-    let hits = search
-        .get("result")
-        .and_then(|r| r.as_array())
-        .unwrap_or_else(|| panic!("search returns result[]: {search}"));
-    assert!(!hits.is_empty(), "search finds the parity message");
+    // The projection is ASYNC (unwrap loop → sqlite sink), so poll until the
+    // FTS index catches up (bounded 20s) — an immediate single search races
+    // the sink and flakes (the am-parity "projection never lands" class).
+    let mut search_hits: Vec<Value> = Vec::new();
+    for _ in 0..40 {
+        let search = d
+            .call(
+                "search_messages",
+                serde_json::json!({
+                    "project_key": proj,
+                    "query": "parity",
+                    "limit": 10,
+                }),
+            )
+            .await;
+        search_hits = search
+            .get("result")
+            .and_then(|r| r.as_array())
+            .cloned()
+            .unwrap_or_default();
+        if !search_hits.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    assert!(
+        !search_hits.is_empty(),
+        "search finds the parity message (projection caught up)"
+    );
 
     // summarize_thread: participants include both agents, message_count >= 2.
     let summary = d
