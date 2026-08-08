@@ -9,7 +9,7 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 use serde_json::{json, Value};
 
-use super::error::{BackendError, BackendErrorCode};
+use super::error::BackendError;
 use super::herdr::{AgentInfo, PaneInfo, Subscription, WaitOptions, WorkspaceInfo};
 use super::types::{AgentStatus, BackendEvent, PaneId, PromptLanding, SpawnOptions};
 
@@ -151,7 +151,7 @@ impl super::Backend for MockBackend {
         name: &str,
         kind: &str,
         pane_id: &str,
-        args: &[String],
+        _args: &[String],
     ) -> Result<AgentInfo, BackendError> {
         self.state.lock().spawned.push((
             SpawnOptions {

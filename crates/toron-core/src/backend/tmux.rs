@@ -9,7 +9,6 @@
 // only override; every other method inherits the Unsupported-open default.
 
 use super::Backend;
-use super::error::BackendError;
 
 /// tmux backend — Unsupported until un-held (ADR-0003 G9).
 ///
