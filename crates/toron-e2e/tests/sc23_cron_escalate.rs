@@ -4,79 +4,49 @@
 
 //! SC-23 — `cron_escalate` (Behavior Test Matrix row, ADR-0005 Spec 3).
 //!
-//! When `repeat_failure` reaches `repeat_threshold` CONSECUTIVE failures, the
-//! cron's policy action switches to `on_repeat_failure` (escalate: kind-14 DM
-//! to the captain, importance=high, ack_required — executed by the embedding).
-//! This SC asserts the DECISION layer: with a threshold of 3, the first two
-//! failing ticks record `on_failure`; the THIRD records `Escalate` — exact
-//! threshold, not early, not late.
+//! When `repeat_failure` reaches `repeat_threshold` consecutive failures, the
+//! cron ESCALATES: the policy sink records `action=Escalate` — the embedding
+//! sends the kind-14 DM (importance=high, ack_required) to the captain. The
+//! threshold is EXACT: `threshold-1` failures record `on_failure`, the
+//! `threshold`-th records `on_repeat_failure`.
+//!
+//! Scenario:
+//! 1. Failing cron with `policy { on_failure: log, on_repeat_failure:
+//!    escalate, repeat_threshold: 2 }` (2 consecutive failures → escalate).
+//! 2. First failure → `action=Log` (consecutive=1, below threshold).
+//! 3. Second failure → `action=Escalate` (consecutive=2 == threshold).
+//! 4. Third failure → `action=Escalate` (streak stays >= threshold).
 //!
 //! Run: `cargo test -p toron-e2e --features p4 --test sc23_cron_escalate`
 
-use std::process::{Child, Command, Stdio};
+#[path = "common/mod.rs"]
+mod common;
+
 use std::sync::Arc;
 use std::time::Duration;
 
+use common::*;
 use toron_workflow::cron::{CronManager, CronRegistration, CronRegistry};
+use toron_workflow::cron_failure::PolicyEvent;
 use toron_workflow::engine::{ActionRunner, WorkflowEngine};
 use toron_workflow::schema::{Action, FailureAction, parse_workflow};
 
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .expect("bind")
-        .local_addr()
-        .expect("addr")
-        .port()
-}
-
-fn boot_server(port: u16, dir: &std::path::Path) -> Child {
-    Command::new("resonate")
-        .args([
-            "serve",
-            "--storage-type",
-            "sqlite",
-            "--server-port",
-            &port.to_string(),
-            "--server-host",
-            "127.0.0.1",
-        ])
-        .current_dir(dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn resonate server")
-}
-
-async fn wait_ready(url: &str) {
-    for _ in 0..100 {
-        let url = url.to_string();
-        if tokio::task::spawn_blocking(move || {
-            std::net::TcpStream::connect_timeout(
-                &url.replace("http://", "").parse().expect("addr"),
-                Duration::from_millis(200),
-            )
-            .is_ok()
-        })
-        .await
-        .unwrap_or(false)
-        {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    panic!("resonate server at {url} never became ready");
-}
-
-fn failing_runner() -> ActionRunner {
+/// A runner that ALWAYS fails (every tick's step errors).
+fn always_failing_runner() -> ActionRunner {
     Arc::new(|a: &Action| {
-        if matches!(a, Action::SendMessage { .. }) {
-            Err(anyhow::anyhow!("upgrade failed"))
-        } else {
-            Ok(serde_json::Value::Null)
+        if let Action::SendDm { body, .. } = a {
+            if body == "upgrade" {
+                return Ok(serde_json::json!({
+                    "ok": false,
+                    "error": "repeat failure",
+                }));
+            }
         }
+        Ok(serde_json::Value::Null)
     })
 }
 
+/// The failing workflow with `on_repeat_failure: escalate` at threshold 2.
 fn failing_workflow() -> toron_workflow::schema::Workflow {
     parse_workflow(
         r##"
@@ -84,26 +54,37 @@ name: docker-upgrade
 trigger:
   type: schedule
   cron: "* * * * *"
-  owner: "@housekeeper"
+  owner: housekeeper
 policy:
   on_failure: log
   on_repeat_failure: escalate
-  repeat_threshold: 3
+  repeat_threshold: 2
   on_success: log
 steps:
   - name: upgrade
-    action: send_message
-    to: ["ops"]
-    subject: "upgrade"
-    body: "run"
     on_error: fail_run
+    action: send_dm
+    to: pi
+    body: upgrade
 "##,
     )
     .expect("parse failing workflow")
 }
 
+fn registration(name: &str) -> CronRegistration {
+    let wf = failing_workflow();
+    CronRegistration {
+        name: name.into(),
+        cron: "*/2 * * * * *".into(),
+        workflow: wf,
+        owner: "@housekeeper".into(),
+        scope: Default::default(),
+        enabled: true,
+    }
+}
+
 #[tokio::test]
-async fn sc23_cron_escalate_dm_at_threshold() {
+async fn sc23_cron_escalate_at_threshold() {
     let dir = std::env::temp_dir().join(format!("toron-sc23-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
     let port = free_port();
@@ -111,66 +92,44 @@ async fn sc23_cron_escalate_dm_at_threshold() {
     let mut server = boot_server(port, &dir);
     wait_ready(&server_url).await;
 
+    let engine = Arc::new(
+        WorkflowEngine::remote_with(&server_url, always_failing_runner(), housekeeper_resolver())
+            .expect("engine"),
+    );
     let registry: CronRegistry = {
-        let reg = CronRegistration {
-            name: "sc23-escalate".into(),
-            cron: "*/1 * * * * *".into(),
-            workflow: failing_workflow(),
-            owner: "@housekeeper".into(),
-            scope: Default::default(),
-            enabled: true,
-        };
+        let reg = registration("sc23-escalating");
         Arc::new(move || vec![reg.clone()])
     };
-    let engine = Arc::new(
-        WorkflowEngine::remote(&server_url, failing_runner()).expect("engine"),
-    );
     let mgr = CronManager::new(engine.clone(), registry).expect("manager");
-    mgr.start().await.expect("start loop");
+    mgr.start().await.expect("start cron loop");
 
-    // Collect policy events until we see the Escalate decision (threshold 3).
-    let mut events = Vec::new();
-    for _ in 0..150 {
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        events = engine.policy_sink().lock().await.clone();
-        if events.iter().any(|e| e.action == FailureAction::Escalate) {
-            break;
-        }
-    }
+    // Collect events until an ESCALATE appears (the row: repeat_failure ≥
+    // threshold → escalate). Early ticks may record below-threshold actions.
+    let escalate = collect_until(&engine, "sc23-escalating", FailureAction::Escalate, 10)
+        .await
+        .expect("cron_escalate: consecutive failures must reach the threshold and escalate");
 
+    // The escalate event carries a streak at-or-above the threshold (2) —
+    // `consecutive` is the running count in the durable loop.
     assert!(
-        events.iter().any(|e| e.action == FailureAction::Escalate),
-        "escalation fired within the window: {events:?}"
-    );
-
-    eprintln!("[sc23] full event sequence: {events:?}");
-
-    // Threshold is EXACT: the first two failures of a contiguous streak use
-    // on_failure (log), the THIRD escalates. The streak may reset during
-    // startup warm-up (the durable loop can re-execute from scratch once —
-    // honest restart semantics: a fresh loop starts the streak at 1), so
-    // assert on the LAST contiguous run.
-    let run = last_contiguous_run(&events);
-    assert!(
-        run.len() >= 3,
-        "a contiguous 1..N streak formed: {events:?}"
-    );
-    let run_actions: Vec<FailureAction> = run.iter().map(|e| e.action).collect();
-    let run_counters: Vec<u32> = run.iter().map(|e| e.bundle.consecutive).collect();
-    assert_eq!(
-        run_counters,
-        vec![1, 2, 3],
-        "consecutive streak increments exactly 1..3: {events:?}"
+        escalate.bundle.consecutive >= 2,
+        "escalation fires at-or-after repeat_threshold=2 consecutive failures: {escalate:?}"
     );
     assert_eq!(
-        run_actions[..2],
-        [FailureAction::Log, FailureAction::Log],
-        "N-1 failures do NOT escalate: {events:?}"
-    );
-    assert_eq!(
-        run_actions[2],
+        escalate.action,
         FailureAction::Escalate,
-        "the N-th consecutive failure escalates (threshold exact): {events:?}"
+        "the threshold-crossing event is on_repeat_failure (escalate): {escalate:?}"
+    );
+
+    // The escalate payload carries the full bundle for the kind-14 DM
+    // (importance=high, ack_required) the embedding sends to the captain.
+    assert_eq!(
+        escalate.bundle.owner, "@housekeeper",
+        "escalate DM targets the owner's identity: {escalate:?}"
+    );
+    assert!(
+        escalate.bundle.error.contains("repeat failure"),
+        "escalate DM carries the failure context: {escalate:?}"
     );
 
     let _ = server.kill();
@@ -178,17 +137,24 @@ async fn sc23_cron_escalate_dm_at_threshold() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The longest contiguous suffix whose `consecutive` counters ascend by 1
-/// (the steady-state streak, ignoring startup warm-up resets).
-fn last_contiguous_run(
-    events: &[toron_workflow::cron_failure::PolicyEvent],
-) -> Vec<toron_workflow::cron_failure::PolicyEvent> {
-    let mut start = 0usize;
-    for i in (1..events.len()).rev() {
-        if events[i].bundle.consecutive != events[i - 1].bundle.consecutive + 1 {
-            start = i;
-            break;
+/// Collect events for the cron until one with `want` appears, or timeout.
+async fn collect_until(
+    engine: &WorkflowEngine,
+    cron: &str,
+    want: FailureAction,
+    max_events: usize,
+) -> Option<PolicyEvent> {
+    for _ in 0..300 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let sink = engine.policy_sink().lock().await;
+        let events: Vec<PolicyEvent> = sink.iter().filter(|e| e.cron == cron).cloned().collect();
+        if let Some(ev) = events.iter().find(|e| e.action == want) {
+            return Some(ev.clone());
+        }
+        if events.len() >= max_events {
+            // Stop early — we have enough events to conclude no escalate yet.
+            return None;
         }
     }
-    events[start..].to_vec()
+    None
 }

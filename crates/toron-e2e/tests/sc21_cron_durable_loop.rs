@@ -139,7 +139,7 @@ async fn sc21_cron_durable_loop_fires_and_resumes_after_restart() {
     // Wait for the loop to fire at least ONE tick (cron_success): the tick
     // workflow's `send_dm` action lands in the runner.
     let mut ticks_a = 0usize;
-    for _ in 0..100 {
+    for _ in 0..300 {
         tokio::time::sleep(Duration::from_millis(100)).await;
         ticks_a = seen_a.lock().unwrap().len();
         if ticks_a >= 1 {
@@ -167,8 +167,11 @@ async fn sc21_cron_durable_loop_fires_and_resumes_after_restart() {
     mgr_b.start().await.expect("start loop B");
 
     // Wait for the resumed loop to fire a tick through engine B (cron_restart).
+    // The Resonate server reclaims the task from the dropped worker A only
+    // after its lease expires — the reclaim latency is variable (seconds), so
+    // the poll window is generous (30s).
     let mut ticks_b = 0usize;
-    for _ in 0..100 {
+    for _ in 0..300 {
         tokio::time::sleep(Duration::from_millis(100)).await;
         ticks_b = seen_b.lock().unwrap().len();
         if ticks_b >= 1 {
