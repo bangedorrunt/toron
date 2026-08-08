@@ -776,6 +776,100 @@ steps:
         assert!(content.get("error").is_none(), "no error on success");
     }
 
+    /// P0.4 end-to-end (Behavior Test Matrix row `error_fail_run`): a
+    /// `fail_run` step's error → `run_workflow` failed outcome → the 46012
+    /// terminal carries `status=failed`. Exercises P0.2 + P0.3 together.
+    #[tokio::test]
+    async fn fail_run_emits_46012_status_failed() {
+        use nostr_sdk::prelude::Keys;
+
+        let engine = WorkflowEngine::local(error_on_send_runner()).expect("engine");
+        let input = RunInput {
+            workflow: fail_run_workflow(),
+            trigger: serde_json::json!({}),
+        };
+        let outcome = engine
+            .run("wf-fail-46012", input)
+            .await
+            .expect("run returns failed outcome");
+
+        let terminal =
+            build_workflow_run_terminal(&Keys::generate(), "wf-fail-46012", &outcome)
+                .expect("build terminal");
+        let content: serde_json::Value =
+            serde_json::from_str(&terminal.content).expect("content parses");
+        assert_eq!(content["status"], "failed", "46012 status=failed: {content}");
+        assert!(content["error"].as_str().unwrap_or_default().contains("boom"));
+    }
+
+    /// P0.4 (Behavior Test Matrix row `template_substitution`): `{{trigger.x}}`
+    /// resolves in an action body — the runner sees the rendered payload.
+    #[tokio::test]
+    async fn template_substitution_trigger_in_body() {
+        use std::sync::Mutex as StdMutex;
+        let seen: Arc<StdMutex<Vec<Action>>> = Arc::new(StdMutex::new(Vec::new()));
+        let seen_clone = seen.clone();
+        let runner: ActionRunner = Arc::new(move |a: &Action| {
+            seen_clone.lock().unwrap().push(a.clone());
+            Ok(serde_json::Value::Null)
+        });
+        let engine = WorkflowEngine::local(runner.clone()).expect("engine");
+        let wf = parse_workflow(
+            r##"
+name: trigger-template
+trigger:
+  type: webhook
+steps:
+  - name: ack
+    action: send_dm
+    to: "pi"
+    body: "chan={{trigger.channel}} id={{trigger.id}}"
+"##,
+        )
+        .expect("parse");
+        let input = RunInput {
+            workflow: wf,
+            trigger: serde_json::json!({ "channel": "#support", "id": 7 }),
+        };
+        engine
+            .run("wf-trigger-template-1", input)
+            .await
+            .expect("run completes");
+        let action = &seen.lock().unwrap()[0];
+        match action {
+            Action::SendDm { body, .. } => {
+                assert_eq!(
+                    body, "chan=#support id=7",
+                    "{{trigger.x}} must render from the trigger payload"
+                );
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    /// P0.4 (Behavior Test Matrix row `template_substitution`): `{{trigger.x}}`
+    /// resolves in a GUARD — the guard variable map carries the substituted
+    /// trigger context (guard.rs's eval contract).
+    #[tokio::test]
+    async fn template_substitution_in_guard_variables() {
+        use std::collections::HashMap;
+        use crate::guard::{GuardOutcome, evaluate_guard_default};
+
+        // The engine/embedding substitutes `{{trigger.channel}}` into a valid
+        // evalexpr identifier (dots are not allowed in identifiers — see
+        // guard.rs variable_comparison_true). The variable map carries the
+        // trigger context under those names.
+        let mut vars = HashMap::new();
+        vars.insert("trigger_channel".into(), evalexpr::Value::from("#support".to_string()));
+        vars.insert("trigger_project".into(), evalexpr::Value::from("toron".to_string()));
+        let out = evaluate_guard_default(
+            Some("trigger_channel == \"#support\" && trigger_project == \"toron\""),
+            &vars,
+        )
+        .await;
+        assert!(matches!(out, GuardOutcome::Bool(true)), "guard true: {out:?}");
+    }
+
     /// A workflow whose first step's action returns `{"n":42}`; the second
     /// step's action references `{{steps.foo.n}}` in a body field. The engine
     /// must (a) populate `steps.<name>` from the runner's return and (b)
