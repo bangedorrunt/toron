@@ -1368,7 +1368,7 @@ steps:
             if name == "@housekeeper" {
                 Some(serde_json::json!({
                     "npub": "npub1housekeeper",
-                    "spec": { "harness": "pi", "model": "claude-sonnet-4", "backend": "herdr" },
+                    "spec": { "harness": "pi", "model": "opencode-go/deepseek-v4-flash", "backend": "herdr" },
                 }))
             } else {
                 None

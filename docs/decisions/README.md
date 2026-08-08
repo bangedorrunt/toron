@@ -10,6 +10,7 @@ This directory contains records of the major architectural decisions made for th
 | [0004](0004-operational-hardening.md) | Operational Hardening & Agent-Automation Efficiency (Post-Parity) | **Accepted** |
 | [0005](0005-orchestration-layer.md) | Orchestration Tier — Profiles, Workflows, Stages, Smart Cron, and a Flexible Workflow Engine | **Accepted** (2-round adversarial review + 3 captain amendments) |
 | [0006](0006-blossom-blob-federation.md) | Blossom / NIP-B7 Federated Blob Serving | **Accepted** (bd-esh.5) |
+| [0007](0007-post-implementation-hardening-and-api-redesign.md) | Post-Implementation Hardening, Bug Ledger, and Backend/API Redesign | **Accepted** (Rev 2 — captain locked D1–D8; R0–R5 + flywheel c3b adapt) |
 
 ## Parity catalogs
 
@@ -34,17 +35,17 @@ epics close.
 | **P5** | Engine flexibility (graph DAG, control-flow, lint-graph) | **Complete** (bd-p5-* epics closed; spike GATE passed) |
 | **P6** | Squads + observability (squad/recipe unify, runs view + per-run cost, robot-snapshot runs) | **Complete** (bd-p6-squads-observability-61td closed) |
 
-**ADR-0005 is FULLY COMPLETE** — P0–P6 all closed, umbrella rollup 37/37
-descendants closed. Cross-phase verification (mine, 2026-08-08): ADR-0003
-`verify-gates.sh` passes; toron-workflow lib suite 123/123 green; toron-e2e
-p1,p2,p4 suite 39/39 — the `request_approval` suspend regression from the 0.6
-migration is fixed (ApprovalSink/SpawnSink TypeId collision, BlueOak P4.2 lane).
-**P4.7 ALL P4 Behavior Test Matrix rows GREEN (2026-08-08):** shared cron
-fixtures (`tests/common/mod.rs`) + impls — `sc18` spawn_no_claim_timeout,
-`sc19` spawn_await_resume, `sc20` spawn_await_failure, `sc21`
-cron_success+cron_restart, `sc22` cron_failure_bead, `sc23` cron_escalate,
-`sc24` cron_catchup. sc22/sc23 assert the POLICY DECISIONS (sink events); the
-flywheel side-effect execution (`br create` / kind-14 DM) is the embedding's
-wiring.
+**ADR-0005 beads P0–P6 closed** (umbrella rollup 37/37 descendants). Unit/
+scenario suites for those beads are green (`verify-gates.sh`; workflow lib;
+e2e p1/p2/p4 matrix sc18–sc24). **However:** a full-scope post-implementation
+review (2026-08-08) found **material integration gaps** that overclaim
+"production complete" — NIP-17 `message_posted` trigger path closed by
+construction, flywheel mail trait still AM-shaped (`u64` ids), per-pid
+ephemeral in-process mailbox, `foreach` item drop, `call_workflow` stub,
+workflow-emitted stamp not applied in production, coalescer flush no-op.
+See **[ADR-0007](0007-post-implementation-hardening-and-api-redesign.md)**
+(proposed) for the bug ledger, soundness ledger, and redesign (MailSurface +
+MessageId + TriggerIngress + durable roots). Do not treat P0–P6 bead closure
+as fixed-point until ADR-0007 Change Agenda is green or features are demoted.
 
-// governed-by: ADR-0003
+// governed-by: ADR-0003, ADR-0007 (proposed)
