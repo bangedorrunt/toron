@@ -149,6 +149,34 @@ product bus (session, reservation cycle, contact handshake, product link fan-out
 
 Run: `cargo test -p toron-mcp --test am_parity_e2e`.
 
+## 9. Unified MailSurface consumption (NEW 2026-08-09, ADR-0007 se2.3)
+
+flywheel's local `MailBackend` trait is DELETED; both backends implement
+`toron_core::mailbox::surface::MailSurface` (async, `&self`, `MessageId` string ids,
+`MailError` machine codes). Consequences for the parity catalog:
+
+- **Send receipts carry the RUMOR id (D8.2 fix).** `send_message`/`reply_message`
+  `deliveries[].payload.event_id` is now the rumor id — the SAME id the projection
+  stores and `fetch_inbox`/`search` rows show — never the transport-internal gift-wrap
+  id. A receipt id is usable for ack/mark_read/summarize on the toron path.
+- **Projection self-threads head messages.** A message with no `thread`/`e` tag gets
+  `thread_id = own rumor id` in the `messages` table, so `summarize_thread(head_id)`
+  finds the head (AM parity: every message belongs to a thread, the head IS its own).
+- **AM adapter fills Nostr-only fields with `""`** (`npub`, `key_path`,
+  `profile_event_id`, `manifest_event_id`, `from_pubkey`, `to_pubkey`,
+  `agent_pubkey`): agent-mail has no Schnorr identity. Name-based ops (whois, list,
+  contact handshake) are unaffected (G2); the fields are documented-empty, never
+  fabricated.
+- **`MailItem.sender` accepts both `sender` (toron) and `from` (agent-mail)** via a
+  serde alias — one typed row shape for both backends.
+- **Pane write/clear are `Unsupported` on toron** (no per-pane identity files; live
+  herdr mapping, G9); agent-mail writes/clears the identity files it serves.
+- **AM message ids are decimal strings** on the typed surface (`MessageId("42")`);
+  a non-decimal id on the AM edge is a parse ERROR (se2.2), never `unwrap_or(0)`.
+- The `renew_file_reservations`/`release_file_reservations` `file_reservation_ids`
+  accepted-and-ignored gap (F11 residual) is GONE from the shared surface — the
+  superset trait is paths-only; ids were never honored on either backend.
+
 ---
 
 *Maintained by lane OC-C (BlackMarsh). Created 2026-08-07 from the bd-96a real-e2e probe
