@@ -83,16 +83,29 @@ pub struct RunInput {
 /// valid "no output" action.
 pub type ActionRunner = Arc<dyn Fn(&Action) -> anyhow::Result<serde_json::Value> + Send + Sync>;
 
+/// The `spawn` profile resolver DI seam (ADR-0005 Spec 4a). Resolves a
+/// profile name (`@housekeeper`) to the (npub, spawn spec) the embedding
+/// spawns. The ENGINE never imports flywheel — this seam is injected, same
+/// idiom as `ActionRunner`. `None` → unknown profile (fail the step).
+pub type ProfileResolver =
+    Arc<dyn Fn(&str) -> Option<serde_json::Value> + Send + Sync>;
+
 /// Optional side-channel for approval promise-ids (embedding/test hook). When
 /// a run parks on `request_approval`, its promise_id is pushed here so the
 /// embedding can publish the kind-46011 pending event.
 pub type ApprovalSink = Arc<tokio::sync::Mutex<Vec<String>>>;
+
+/// Side-channel for `spawn` promise-ids (ADR-0005 Spec 4a). When a run parks
+/// on a spawn-await, its promise_id is pushed here so the embedding can emit
+/// the kind-43001 job carrying it in the `spec`.
+pub type SpawnSink = Arc<tokio::sync::Mutex<Vec<String>>>;
 
 /// The workflow engine: owns the Resonate runtime + registers the durable
 /// function + the approval resolution bridge.
 pub struct WorkflowEngine {
     resonate: Arc<Resonate>,
     approval_sink: ApprovalSink,
+    spawn_sink: SpawnSink,
 }
 
 impl std::fmt::Debug for WorkflowEngine {
@@ -103,6 +116,10 @@ impl std::fmt::Debug for WorkflowEngine {
                 "approval_sink_len",
                 &self.approval_sink.try_lock().map(|g| g.len()).unwrap_or(0),
             )
+            .field(
+                "spawn_sink_len",
+                &self.spawn_sink.try_lock().map(|g| g.len()).unwrap_or(0),
+            )
             .finish()
     }
 }
@@ -111,10 +128,22 @@ impl WorkflowEngine {
     /// New engine over an in-process Resonate runtime (`Resonate::local`),
     /// with the shared action runner + an approval sink injected.
     pub fn local(action_runner: ActionRunner) -> anyhow::Result<Self> {
+        Self::local_with(action_runner, Self::default_resolver())
+    }
+
+    /// Like [`Self::local`] with a `ProfileResolver` for the `spawn` action
+    /// (ADR-0005 Spec 4a DI seam).
+    pub fn local_with(
+        action_runner: ActionRunner,
+        profile_resolver: ProfileResolver,
+    ) -> anyhow::Result<Self> {
         let sink: ApprovalSink = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let spawn_sink: SpawnSink = Arc::new(tokio::sync::Mutex::new(Vec::new()));
         let resonate = Resonate::local()
             .with_dependency(action_runner)
-            .with_dependency(sink.clone());
+            .with_dependency(profile_resolver)
+            .with_dependency(sink.clone())
+            .with_dependency(spawn_sink.clone());
         resonate
             .register(run_workflow)
             .map_err(|e| anyhow::anyhow!("register workflow function: {e}"))?;
@@ -127,20 +156,33 @@ impl WorkflowEngine {
         Ok(Self {
             resonate: Arc::new(resonate),
             approval_sink: sink,
+            spawn_sink,
         })
     }
 
     /// New engine over a remote Resonate server (`ResonateConfig.url`),
     /// enabling cross-process crash survival (SC-11 uses a real server).
     pub fn remote(url: impl Into<String>, action_runner: ActionRunner) -> anyhow::Result<Self> {
+        Self::remote_with(url, action_runner, Self::default_resolver())
+    }
+
+    /// Like [`Self::remote`] with a `ProfileResolver` for the `spawn` action.
+    pub fn remote_with(
+        url: impl Into<String>,
+        action_runner: ActionRunner,
+        profile_resolver: ProfileResolver,
+    ) -> anyhow::Result<Self> {
         let sink: ApprovalSink = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let spawn_sink: SpawnSink = Arc::new(tokio::sync::Mutex::new(Vec::new()));
         let config = ResonateConfig {
             url: Some(url.into()),
             ..Default::default()
         };
         let resonate = Resonate::new(config)
             .with_dependency(action_runner)
-            .with_dependency(sink.clone());
+            .with_dependency(profile_resolver)
+            .with_dependency(sink.clone())
+            .with_dependency(spawn_sink.clone());
         resonate
             .register(run_workflow)
             .map_err(|e| anyhow::anyhow!("register workflow function: {e}"))?;
@@ -153,7 +195,14 @@ impl WorkflowEngine {
         Ok(Self {
             resonate: Arc::new(resonate),
             approval_sink: sink,
+            spawn_sink,
         })
+    }
+
+    /// The default `ProfileResolver`: every profile is unknown (the embedding
+    /// must inject a real one for `spawn` to succeed).
+    fn default_resolver() -> ProfileResolver {
+        Arc::new(|_name: &str| None)
     }
 
     /// The Resonate runtime (for the approval listener to resolve promises).
@@ -164,6 +213,12 @@ impl WorkflowEngine {
     /// The approval side-channel: promise-ids of parked approvals.
     pub fn approval_sink(&self) -> &ApprovalSink {
         &self.approval_sink
+    }
+
+    /// The spawn side-channel: promise-ids of parked spawn-awaits (the
+    /// embedding reads these to emit the kind-43001 job carrying them).
+    pub fn spawn_sink(&self) -> &SpawnSink {
+        &self.spawn_sink
     }
 
     /// Start a workflow run, idempotent on `run_id` (a redelivered trigger
@@ -232,6 +287,36 @@ impl WorkflowEngine {
             .reject(promise_id, value)
             .await
             .map_err(|e| anyhow::anyhow!("reject promise {promise_id}: {e}"))?;
+        Ok(())
+    }
+
+    /// Resolve a spawn-await promise (the bus subscriber calls this on
+    /// kind-43004 result — ADR-0005 Spec 4a).
+    pub async fn resolve_spawn(
+        &self,
+        promise_id: &str,
+        value: serde_json::Value,
+    ) -> anyhow::Result<()> {
+        let v = Value::from_serializable(value)
+            .map_err(|e| anyhow::anyhow!("serialize spawn result: {e}"))?;
+        self.resonate
+            .promises
+            .resolve(promise_id, v)
+            .await
+            .map_err(|e| anyhow::anyhow!("resolve spawn promise {promise_id}: {e}"))?;
+        Ok(())
+    }
+
+    /// Reject a spawn-await promise (the bus subscriber calls this on
+    /// kind-43006 error — the job FAILED, so the run fails via Spec 0).
+    pub async fn reject_spawn(&self, promise_id: &str, error: &str) -> anyhow::Result<()> {
+        let value = Value::from_serializable(serde_json::json!({ "error": error }))
+            .map_err(|e| anyhow::anyhow!("serialize spawn error: {e}"))?;
+        self.resonate
+            .promises
+            .reject(promise_id, value)
+            .await
+            .map_err(|e| anyhow::anyhow!("reject spawn promise {promise_id}: {e}"))?;
         Ok(())
     }
 }
@@ -313,10 +398,13 @@ fn run_step<'a>(
             serde_json::Value::Null
         }
         Action::RequestApproval { message } => {
-            // Create the promise; its id is the approval key.
+            // Create the promise; its id is the approval key. The 0.6 SDK's
+            // PromiseTask is created eagerly (.create()); the handle's id()
+            // confirms server-side creation.
             let pending = ctx
                 .promise::<Decision>()
-                .data(&serde_json::json!({ "message": message }))?;
+                .data(&serde_json::json!({ "message": message }))?
+                .create()?;
             let promise_id = pending.id().await?;
             // The binding: the embedding publishes kind-46011 with this
             // promise_id; the operator's approval/rejection resolves it.
@@ -341,8 +429,16 @@ fn run_step<'a>(
             // Resolve OR rejection both complete the run — a rejected
             // approval is a DECISION, never a run failure (the WF-08 fix:
             // Buzz marks it failed; toron records the rejection).
+            //
+            // 0.6 semantics: awaiting a PENDING promise returns
+            // `Err(Error::Suspended)`, which must PROPAGATE so the runtime
+            // parks the run. A REJECTED promise (operator `promises.reject`)
+            // returns `Err(Error::Application)` — that is the decision.
             let decision: Decision = match pending.await {
                 Ok(d) => d,
+                Err(resonate_sdk::error::Error::Suspended) => {
+                    return Err(resonate_sdk::error::Error::Suspended)
+                }
                 Err(e) => Decision::rejected(format!("rejected: {e}")),
             };
             let decision = serde_json::to_value(&decision)?;
@@ -382,6 +478,12 @@ fn run_step<'a>(
         Action::CallWorkflow { workflow, inputs } => {
             run_call_workflow(ctx, runner, workflow, inputs, step_outputs).await?
         }
+        Action::Spawn {
+            profile,
+            workflow,
+            await_,
+            no_claim_timeout,
+        } => run_spawn(ctx, profile, workflow.as_deref(), *await_, *no_claim_timeout).await?,
     };
 
     // P0.2 (ADR-0005 Spec 0): `on_error: fail_run` converts a step failure
@@ -523,8 +625,7 @@ async fn run_parallel(
                     trigger,
                 },
             )
-            .spawn()
-            .await?;
+            .spawn()?;
         futures.push(future);
     }
     let mut collected = Vec::new();
@@ -572,6 +673,81 @@ async fn run_call_workflow(
         "ok": false,
         "error": "call_workflow sub-runs land in the P5.3 wiring step",
     }))
+}
+
+/// Run a `spawn` action (ADR-0005 Spec 4a).
+///
+/// 1. Resolve `profile` via the injected `ProfileResolver` DI seam.
+/// 2. Create a promise; its id is the job's promise↔job binding key. The
+///    embedding emits kind-43001 carrying the promise_id in its `spec`.
+/// 3. `await: true` → PARK on the promise until a terminal job event
+///    (43004/43006) resolves it — a FAILURE, not a decision. `no_claim_timeout`
+///    rejects an unclaimed job with `timeout` → the step fails → Spec 0
+///    propagates.
+///
+/// 0.6 semantics: awaiting a pending promise returns `Err(Error::Suspended)`,
+/// which must PROPAGATE so the runtime parks the run.
+async fn run_spawn(
+    ctx: &Context,
+    profile: &str,
+    workflow: Option<&str>,
+    await_: bool,
+    no_claim_timeout: u64,
+) -> resonate_sdk::prelude::Result<serde_json::Value> {
+    // 1. Resolve the profile (DI seam).
+    let resolver = ctx.get_dependency::<ProfileResolver>();
+    let resolved = match (resolver)(profile) {
+        Some(v) => v,
+        None => {
+            return Ok(serde_json::json!({
+                "ok": false,
+                "error": format!("spawn: unknown profile {profile:?} (ProfileResolver returned None)"),
+            }))
+        }
+    };
+
+    // 2. Create the promise — the job's binding key.
+    let spec = serde_json::json!({
+        "profile": profile,
+        "workflow": workflow,
+        "resolved": resolved,
+    });
+    let task = ctx.promise::<serde_json::Value>().data(&spec)?;
+    let task = if await_ && no_claim_timeout > 0 {
+        task.timeout(Duration::from_secs(no_claim_timeout))
+    } else {
+        task
+    };
+    let pending = task.create()?;
+    let promise_id = pending.id().await?;
+
+    // Side-channel the promise_id (embedding emits kind-43001 with it in spec).
+    ctx.get_dependency::<SpawnSink>()
+        .lock()
+        .await
+        .push(promise_id.clone());
+
+    // 3. No await → fire the job and return immediately (no park).
+    if !await_ {
+        return Ok(serde_json::json!({
+            "ok": true,
+            "promise_id": promise_id,
+            "spawned": true,
+        }));
+    }
+
+    match pending.await {
+        Ok(value) => Ok(serde_json::json!({
+            "ok": true,
+            "promise_id": promise_id,
+            "result": value,
+        })),
+        Err(resonate_sdk::error::Error::Suspended) => Err(resonate_sdk::error::Error::Suspended),
+        Err(e) => {
+            let msg = format!("spawn-await {promise_id}: {e}");
+            Ok(serde_json::json!({ "ok": false, "error": msg }))
+        }
+    }
 }
 
 /// Resolve a template reference (`{{steps.x}}` or a literal path) to a JSON
@@ -660,8 +836,7 @@ async fn run_graph(
             };
             let future = ctx
                 .run(run_graph_node, GraphNodeInput { action: rendered })
-                .spawn()
-                .await?;
+                .spawn()?;
             futures.push(((*name).clone(), future));
         }
 
@@ -968,9 +1143,101 @@ steps:
         Arc::new(|_a: &Action| Ok(serde_json::Value::Null))
     }
 
+    /// Boot a real `resonate serve` + a remote engine (the 0.6 SDK's
+    /// promise-park needs a server-side worker loop; `Resonate::local` cannot
+    /// drive the background promise-creation task). Returns (server, engine);
+    /// the caller keeps the server alive for the test's duration.
+    async fn remote_engine(action_runner: ActionRunner) -> (std::process::Child, WorkflowEngine) {
+        use std::process::{Command, Stdio};
+        let dir = std::env::temp_dir().join(format!("wf-rsrv-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let port = {
+            std::net::TcpListener::bind("127.0.0.1:0")
+                .unwrap()
+                .local_addr()
+                .unwrap()
+                .port()
+        };
+        let url = format!("http://127.0.0.1:{port}");
+        let server = Command::new("resonate")
+            .args([
+                "serve",
+                "--storage-type",
+                "sqlite",
+                "--server-port",
+                &port.to_string(),
+                "--server-host",
+                "127.0.0.1",
+            ])
+            .current_dir(&dir)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn resonate server");
+        for _ in 0..100 {
+            if std::net::TcpStream::connect_timeout(
+                &format!("127.0.0.1:{port}").parse().expect("addr"),
+                Duration::from_millis(200),
+            )
+            .is_ok()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let engine = WorkflowEngine::remote(&url, action_runner).expect("remote engine");
+        (server, engine)
+    }
+
+    /// Like [`remote_engine`] with a `ProfileResolver` for the `spawn` action.
+    async fn remote_engine_with(
+        profile_resolver: ProfileResolver,
+    ) -> (std::process::Child, WorkflowEngine) {
+        use std::process::{Command, Stdio};
+        let dir = std::env::temp_dir().join(format!("wf-rsrv-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let port = {
+            std::net::TcpListener::bind("127.0.0.1:0")
+                .unwrap()
+                .local_addr()
+                .unwrap()
+                .port()
+        };
+        let url = format!("http://127.0.0.1:{port}");
+        let server = Command::new("resonate")
+            .args([
+                "serve",
+                "--storage-type",
+                "sqlite",
+                "--server-port",
+                &port.to_string(),
+                "--server-host",
+                "127.0.0.1",
+            ])
+            .current_dir(&dir)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn resonate server");
+        for _ in 0..100 {
+            if std::net::TcpStream::connect_timeout(
+                &format!("127.0.0.1:{port}").parse().expect("addr"),
+                Duration::from_millis(200),
+            )
+            .is_ok()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let engine =
+            WorkflowEngine::remote_with(&url, noop_runner(), profile_resolver).expect("remote engine");
+        (server, engine)
+    }
+
     /// Poll the approval side-channel for a parked run's promise_id.
     async fn poll_promise_id(engine: &WorkflowEngine) -> String {
-        for _ in 0..100 {
+        for _ in 0..400 {
             tokio::time::sleep(Duration::from_millis(10)).await;
             let mut sink = engine.approval_sink().lock().await;
             if let Some(id) = sink.pop() {
@@ -982,10 +1249,13 @@ steps:
 
     /// WF-08 core: a run hitting `request_approval` SUSPENDS (parks), then
     /// RESUMES when the promise resolves — not marked failed.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn approval_suspends_and_resumes() {
-        let runner = noop_runner();
-        let engine = WorkflowEngine::local(runner.clone()).expect("engine");
+        // Uses a REAL `resonate serve`: the 0.6 SDK's `Resonate::local`
+        // cannot drive the background promise-creation task while the run
+        // blocks on the promise id (a local-runtime limitation; sc11 covers
+        // the same contract end-to-end).
+        let (_srv, engine) = remote_engine(noop_runner()).await;
 
         let input = RunInput {
             workflow: approval_workflow(),
@@ -997,7 +1267,6 @@ steps:
             .spawn()
             .await
             .expect("spawn");
-
         // The run parks on the approval promise. Give the runtime a moment to
         // create it, then read the promise_id from the side-channel.
         let promise_id = poll_promise_id(&engine).await;
@@ -1024,10 +1293,9 @@ steps:
 
     /// A run hitting `request_approval` and REJECTED completes with the
     /// rejection recorded (not failed — the rejection is a decision).
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn approval_rejection_is_a_decision_not_a_failure() {
-        let runner = noop_runner();
-        let engine = WorkflowEngine::local(runner.clone()).expect("engine");
+        let (_srv, engine) = remote_engine(noop_runner()).await;
         let input = RunInput {
             workflow: approval_workflow(),
             trigger: serde_json::json!({}),
@@ -1048,6 +1316,122 @@ steps:
 
         let output = handle.result().await.expect("completes after rejection");
         assert_eq!(output["decision"]["outcome"], "rejected");
+    }
+
+    /// A `ProfileResolver` that resolves `@housekeeper` to a spawn spec.
+    fn test_profile_resolver() -> ProfileResolver {
+        Arc::new(|name: &str| {
+            if name == "@housekeeper" {
+                Some(serde_json::json!({
+                    "npub": "npub1housekeeper",
+                    "spec": { "harness": "pi", "model": "claude-sonnet-4", "backend": "herdr" },
+                }))
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Poll the spawn side-channel for a parked spawn-await's promise_id.
+    async fn poll_spawn(engine: &WorkflowEngine) -> String {
+        for _ in 0..400 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            let mut sink = engine.spawn_sink().lock().await;
+            if let Some(id) = sink.pop() {
+                return id;
+            }
+        }
+        panic!("spawn never parked on a job promise");
+    }
+
+    /// P4.2 (ADR-0005 Spec 4a): a `spawn` with `await: true` SUSPENDS, then
+    /// RESUMES when the job resolves (the bus subscriber's resolve_spawn).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn spawn_await_resumes_on_job_result() {
+        let (_srv, engine) = remote_engine_with(test_profile_resolver()).await;
+        let wf = parse_workflow(
+            r##"
+name: spawn-demo
+trigger:
+  type: webhook
+steps:
+  - name: build
+    action: spawn
+    profile: "@housekeeper"
+    workflow: docker-upgrade
+    await: true
+"##,
+        )
+        .expect("parse spawn workflow");
+        let input = RunInput {
+            workflow: wf,
+            trigger: serde_json::json!({}),
+        };
+        let handle = engine
+            .resonate()
+            .run("wf-spawn-1", run_workflow, input)
+            .spawn()
+            .await
+            .expect("spawn run");
+
+        let promise_id = poll_spawn(&engine).await;
+        assert!(
+            !handle.done().await.expect("done"),
+            "spawn-await must SUSPEND until the job resolves"
+        );
+
+        engine
+            .resolve_spawn(&promise_id, serde_json::json!({ "status": "ok", "id": 7 }))
+            .await
+            .expect("resolve spawn");
+
+        let output = handle.result().await.expect("resumes after job result");
+        assert_eq!(output["build"]["ok"], true, "spawn step succeeded: {output}");
+        assert_eq!(output["build"]["result"]["id"], 7, "job result captured");
+    }
+
+    /// P4.2: a kind-43006 job error REJECTS the promise → the spawn step
+    /// fails (a FAILURE, not a decision — distinct from approval).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn spawn_await_failure_fails_the_step() {
+        let (_srv, engine) = remote_engine_with(test_profile_resolver()).await;
+        let wf = parse_workflow(
+            r##"
+name: spawn-fail
+trigger:
+  type: webhook
+steps:
+  - name: build
+    action: spawn
+    profile: "@housekeeper"
+    await: true
+"##,
+        )
+        .expect("parse");
+        let input = RunInput {
+            workflow: wf,
+            trigger: serde_json::json!({}),
+        };
+        let handle = engine
+            .resonate()
+            .run("wf-spawn-fail-1", run_workflow, input)
+            .spawn()
+            .await
+            .expect("spawn run");
+
+        let promise_id = poll_spawn(&engine).await;
+        engine
+            .reject_spawn(&promise_id, "job failed: docker upgrade broke")
+            .await
+            .expect("reject spawn");
+
+        let output = handle.result().await.expect("run returns after failure");
+        assert_eq!(
+            output["build"]["ok"], false,
+            "spawn failure is a FAILURE not a decision: {output}"
+        );
+        let err = output["build"]["error"].as_str().unwrap_or_default();
+        assert!(err.contains("job failed"), "error surfaced: {err}");
     }
 
     /// Durable delay: a `delay` action runs and the run completes.

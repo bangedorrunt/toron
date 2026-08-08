@@ -511,6 +511,15 @@ fn check_action(report: &mut LintReport, action: &Action) {
                 });
             }
         }
+        Action::Spawn { profile, .. } => {
+            if profile.trim().is_empty() {
+                report.issues.push(LintIssue {
+                    level: Level::Error,
+                    message: "spawn requires a non-empty `profile`".into(),
+                    line: None,
+                });
+            }
+        }
     }
 }
 
