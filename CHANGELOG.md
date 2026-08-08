@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **P4.4 cron failure policy (ADR-0005 Spec 3, `bd-p4-bead-on-fail-0uaf`,
+  toron-workflow)** — the DECISION layer of bead-on-failure + repeat-failure
+  escalate. `cron_failure.rs`: pure `evaluate` (on_failure / on_repeat_failure
+  at the exact `repeat_threshold` / on_success resets the streak), `is_failed`
+  (kind-46012 `status=failed` shape), `failure_details`, `FailureBundle`, and
+  a distinct-newtype `PolicySink` (TypeId-safe). The cron loop now captures
+  each tick's child output and records a `PolicyEvent` on the sink; the
+  embedding (flywheel) performs the side effects (`br create` bead / kind-14
+  escalate DM). The consecutive streak is a durable loop local — a fresh loop
+  (e.g. after restart) starts at 1, never double-counts. `PolicySink` is
+  registered on the engine like the approval/spawn sinks. Rows green:
+  `cron_failure_bead` (sc22) + `cron_escalate` (sc23, threshold exact);
+  6 cron_failure unit tests; 123 toron-workflow tests; full e2e suite green.
 - **P4.3 cron manager (ADR-0005 Spec 3, `bd-p4-cron-mgr-ur33`, toron-workflow)**
   — a Resonate **durable-sleep loop** drives each registered cron: the
   manager registers a `cron_loop` durable function; per cron, `cron:{name}`
