@@ -89,16 +89,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Notes
 
-- **REGRESSION (tracked in bd-adr5 umbrella): `request_approval` no longer
-  parks after the resonate-sdk 0.6 migration (a1fe947)** — `sc11_workflow_approval`
-  (ADR-0004 suite row `approval_suspends`/`approval_rejection`) and both engine
-  unit approval tests fail: the run hangs at the approval action (approval_sink
-  never fills, handle never completes). Server stderr silent. Isolated to the
-  `request_approval` → `ctx.promise::<Decision>().data(...).create()` path —
-  `spawn`-await parks fine (sc18/19/20 green, including a timeout-less control).
-  Reported to BlueOak (P4.2 lane, thread bd-p4-spawn-await-pxw6). The approval
-  rows are "exists"-matrix rows that were green pre-migration — must be re-green
-  before the P4 phase gate closes.
+- **RESOLVED (working tree, BlueOak P4.2 lane): `request_approval` suspend
+  regression** — root cause was a TypeId collision in the Resonate dependency
+  map: `ApprovalSink` and `SpawnSink` were both `Arc<Mutex<Vec<String>>>` type
+  aliases, so `get_dependency` resolved both to the last-registered sink after
+  the resonate-sdk 0.6 migration (a1fe947). Fix: distinct newtypes (unique
+  `TypeId`), `Deref` preserves call sites. sc11 (ADR-0004 suite) + engine
+  approval unit tests green again. Full p1/p2 e2e suite green.
 - Bead bd-3wc closed: the "nightly features" payoff for toron is delivered
   by stable modern Rust + edition 2024, not `#![feature]` gates.
 - **Parity shape catalog** (bd-96a/bd-3mp): `docs/parity/known-divergences.md`
