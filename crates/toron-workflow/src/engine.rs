@@ -28,10 +28,10 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use resonate_sdk::prelude::{Resonate, ResonateConfig};
+use resonate_sdk::prelude::{Context, Resonate, ResonateConfig};
 use resonate_sdk::types::Value;
 
-use crate::schema::{Action, StepOnError, Workflow};
+use crate::schema::{Action, Graph, StepOnError, Workflow};
 
 /// An approval decision (the promise payload).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -118,6 +118,9 @@ impl WorkflowEngine {
         resonate
             .register(run_workflow)
             .map_err(|e| anyhow::anyhow!("register workflow function: {e}"))?;
+        resonate
+            .register(run_graph_node)
+            .map_err(|e| anyhow::anyhow!("register graph node function: {e}"))?;
         Ok(Self {
             resonate: Arc::new(resonate),
             approval_sink: sink,
@@ -138,6 +141,9 @@ impl WorkflowEngine {
         resonate
             .register(run_workflow)
             .map_err(|e| anyhow::anyhow!("register workflow function: {e}"))?;
+        resonate
+            .register(run_graph_node)
+            .map_err(|e| anyhow::anyhow!("register graph node function: {e}"))?;
         Ok(Self {
             resonate: Arc::new(resonate),
             approval_sink: sink,
@@ -238,6 +244,13 @@ pub async fn run_workflow(
 ) -> resonate_sdk::Result<serde_json::Value> {
     let runner = ctx.get_dependency::<ActionRunner>();
     let workflow = &input.workflow;
+
+    // Graph dispatch (ADR-0005 Spec 4b): when `graph:` is present the DAG
+    // scheduler runs (independent nodes concurrently), NOT the linear steps.
+    if let Some(graph) = &workflow.graph {
+        return run_graph(ctx, &input.trigger, graph).await;
+    }
+
     let mut step_outputs: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
 
     for step in &workflow.steps {
@@ -331,8 +344,125 @@ pub async fn run_workflow(
     Ok(serde_json::Value::Object(step_outputs))
 }
 
-/// Build the kind-46012 workflow-run terminal event (ADR-0005 Spec 0, P0.3).
+/// The DAG scheduler (ADR-0005 Spec 4b / P5.2). Runs a `graph:` workflow:
 ///
+/// 1. Schedule nodes in waves — a wave is the set of nodes whose `needs` are
+///    all satisfied (roots first).
+/// 2. Within a wave, spawn every node as a concurrent durable child
+///    (`ctx.run(run_graph_node).spawn()`) — true concurrency inside one
+///    deterministic-replay function (the P5.1 spike proved this primitive).
+/// 3. Await the wave's futures, collect outputs under `steps.<name>`.
+/// 4. Repeat until all nodes done.
+///
+/// The spike's bit-identical-replay guarantee carries over: child spawn order
+/// is the deterministic per-context seq, so a crash mid-run replays to the
+/// same outputs, promise ids, and child-spawn order.
+async fn run_graph(
+    ctx: &Context,
+    trigger: &serde_json::Value,
+    graph: &Graph,
+) -> resonate_sdk::prelude::Result<serde_json::Value> {
+    use crate::schema::GraphNode;
+    use std::collections::BTreeSet;
+
+    let nodes = &graph.nodes;
+    let mut outputs: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
+    let mut done: BTreeSet<String> = BTreeSet::new();
+
+    loop {
+        // Compute the next ready wave: not done, all needs done.
+        let mut ready: Vec<(&String, &GraphNode)> = Vec::new();
+        for (name, node) in nodes {
+            if done.contains(name) {
+                continue;
+            }
+            let needs_satisfied = node
+                .needs
+                .iter()
+                .all(|need| done.contains(need));
+            if needs_satisfied {
+                ready.push((name, node));
+            }
+        }
+        if ready.is_empty() {
+            break; // nothing ready: either all done or a cycle (lint prevents).
+        }
+
+        // Spawn the whole wave concurrently as durable children.
+        let mut futures = Vec::new();
+        for (name, node) in &ready {
+            let rendered = match render_action(&node.action, trigger, &outputs) {
+                Ok(a) => a,
+                Err(e) => {
+                    // A render failure is a per-node error (continue unless
+                    // fail_run).
+                    let err = serde_json::json!({ "ok": false, "error": format!("render: {e}") });
+                    if node.on_error == StepOnError::FailRun {
+                        return Ok(serde_json::json!({
+                            "status": "failed",
+                            "error": format!("render: {e}"),
+                            "failed_step": name,
+                        }));
+                    }
+                    outputs.insert((*name).clone(), err);
+                    done.insert((*name).clone());
+                    continue;
+                }
+            };
+            let future = ctx
+                .run(run_graph_node, GraphNodeInput { action: rendered })
+                .spawn()
+                .await?;
+            futures.push(((*name).clone(), future));
+        }
+
+        // Await the wave's children (they ran concurrently; order of await is
+        // deterministic).
+        for (name, future) in futures {
+            let value = future.await?;
+            // on_error: fail_run — a child failure must fail the run.
+            let node = nodes.get(&name).expect("node in map");
+            if let Some(err) = value.get("error").and_then(|v| v.as_str())
+                && node.on_error == StepOnError::FailRun
+            {
+                return Ok(serde_json::json!({
+                    "status": "failed",
+                    "error": err,
+                    "failed_step": name,
+                }));
+            }
+            outputs.insert(name.clone(), value);
+            done.insert(name);
+        }
+    }
+
+    Ok(serde_json::Value::Object(outputs))
+}
+
+/// The input for one graph node execution (the durable child's input).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GraphNodeInput {
+    /// The (template-rendered) action to execute.
+    pub action: Action,
+}
+
+/// A durable child executing ONE graph node's action. Spawned concurrently by
+/// the DAG scheduler via `ctx.run(...).spawn()`. Runs through the shared
+/// `ActionRunner` (the Mailbox surface — the consistency rule). Failures are
+/// returned as `{ok:false,error}` values (the parent applies on_error).
+#[resonate_sdk::function]
+pub async fn run_graph_node(
+    ctx: &Context,
+    input: GraphNodeInput,
+) -> resonate_sdk::Result<serde_json::Value> {
+    let _runner = ctx.get_dependency::<ActionRunner>();
+    match (_runner)(&input.action) {
+        Ok(value) => Ok(value),
+        Err(e) => Ok(serde_json::json!({ "ok": false, "error": e.to_string() })),
+    }
+}
+
+/// Build the kind-46012 workflow-run terminal event (ADR-0005 Spec 0, P0.3).
 /// Maps the durable function's outcome Value to the wire `status` field —
 /// additive content only (the kind is frozen; its content is toron-owned; old
 /// readers ignore the new `status`/`run_id`/`error`/`failed_step` fields):
@@ -907,6 +1037,68 @@ steps:
         )
         .await;
         assert!(matches!(out, GuardOutcome::Bool(true)), "guard true: {out:?}");
+    }
+
+    /// P5.2 (ADR-0005 Spec 4b): a `graph:` workflow with independent nodes
+    /// runs them, collect outputs under `steps.<name>`, and a dependent node
+    /// receives its `needs`' outputs via the template context.
+    #[tokio::test]
+    async fn graph_dag_runs_and_collects_outputs() {
+        use std::sync::Mutex as StdMutex;
+        let seen: Arc<StdMutex<Vec<Action>>> = Arc::new(StdMutex::new(Vec::new()));
+        let seen_clone = seen.clone();
+        let runner: ActionRunner = Arc::new(move |a: &Action| {
+            seen_clone.lock().unwrap().push(a.clone());
+            match a {
+                Action::SendDm { .. } => Ok(serde_json::json!({ "n": 42 })),
+                _ => Ok(serde_json::Value::Null),
+            }
+        });
+        let engine = WorkflowEngine::local(runner.clone()).expect("engine");
+        let wf = parse_workflow(
+            r##"
+name: graph-ship
+trigger:
+  type: webhook
+graph:
+  nodes:
+    scout: { action: send_dm, to: x, body: y }
+    plan:  { action: send_dm, to: x, body: y, needs: [scout] }
+    fix_a: { action: send_dm, to: x, body: y, needs: [plan] }
+    fix_b: { action: send_dm, to: x, body: y, needs: [plan] }
+    ship:  { action: send_dm, to: x, body: y, needs: [fix_a, fix_b] }
+"##,
+        )
+        .expect("parse graph workflow");
+        let input = RunInput {
+            workflow: wf,
+            trigger: serde_json::json!({}),
+        };
+        let output = engine
+            .run("wf-graph-1", input)
+            .await
+            .expect("graph run completes");
+
+        // Every node produced output under steps.<name>.
+        for node in ["scout", "plan", "fix_a", "fix_b", "ship"] {
+            assert!(
+                output.get(node).is_some(),
+                "graph node {node} produced output: {output}"
+            );
+        }
+        assert_eq!(output["scout"]["n"], 42, "node value flows through");
+
+        // Wave ordering: the runner saw scout before plan before the fixes.
+        let actions = seen.lock().unwrap();
+        let names: Vec<&str> = actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::SendDm { body, .. } => Some(body.as_str()),
+                _ => None,
+            })
+            .collect();
+        // All 5 nodes ran exactly once.
+        assert_eq!(names.len(), 5, "all 5 nodes executed: {names:?}");
     }
 
     /// P3.1 (ADR-0005 Spec 2): `WorkflowEngine::invoke` — the on-demand

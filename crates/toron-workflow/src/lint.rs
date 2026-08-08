@@ -6,7 +6,9 @@
 //! pattern. No evaluation is performed (that's the engine, bd-oge) — lint is
 //! a static validator with actionable errors.
 
-use crate::schema::{Action, Trigger, Workflow};
+use std::collections::BTreeMap;
+
+use crate::schema::{Action, Graph, Trigger, Workflow};
 
 /// The Buzz-derived guard evaluation timeout (ms). Lint enforces that guards
 /// are simple expressions; the engine applies the timeout at eval time.
@@ -144,10 +146,10 @@ pub fn lint_workflow(wf: &Workflow) -> LintReport {
     }
 
     // Steps.
-    if wf.steps.is_empty() {
+    if wf.steps.is_empty() && wf.graph.is_none() {
         report.issues.push(LintIssue {
             level: Level::Warning,
-            message: "workflow has no steps — trigger will fire but nothing runs".into(),
+            message: "workflow has no steps and no graph — trigger will fire but nothing runs".into(),
             line: None,
         });
     }
@@ -170,7 +172,129 @@ pub fn lint_workflow(wf: &Workflow) -> LintReport {
         check_action(&mut report, &step.action);
     }
 
+    // Graph (ADR-0005 Spec 4b): DAG acyclicity + resolvable needs + no orphans.
+    if let Some(graph) = &wf.graph {
+        check_graph(&mut report, graph);
+    }
+
     report
+}
+
+/// Validate a `graph:` — the DAG contract (ADR-0005 Spec 4b / P5.4):
+///
+/// 1. **Acyclic** — a cycle would deadlock the concurrent scheduler.
+/// 2. **`needs:` resolvable** — every dependency names an existing node.
+/// 3. **No orphans** — every node is reachable from a root (a node whose
+///    `needs` are all satisfied) or IS a root.
+///
+/// Fail-stop at lint, never at runtime.
+fn check_graph(report: &mut LintReport, graph: &Graph) {
+    use crate::schema::GraphNode;
+    let nodes = &graph.nodes;
+    if nodes.is_empty() {
+        report.issues.push(LintIssue {
+            level: Level::Error,
+            message: "graph is empty — no nodes".into(),
+            line: None,
+        });
+        return;
+    }
+
+    // (2) needs resolvable + collect the dependency edge set.
+    let mut edges: Vec<(&str, &str)> = Vec::new(); // (needs → node)
+    for (name, node) in nodes {
+        check_action(report, &node.action);
+        if let Some(guard) = &node.guard {
+            check_guard(report, guard, "graph node guard");
+        }
+        for need in &node.needs {
+            if !nodes.contains_key(need) {
+                report.issues.push(LintIssue {
+                    level: Level::Error,
+                    message: format!(
+                        "graph node {name:?} needs {need:?}, which is not a node — unresolvable"
+                    ),
+                    line: None,
+                });
+            }
+            edges.push((need.as_str(), name.as_str()));
+        }
+    }
+
+    // (1) acyclic — DFS with a recursion stack. A back-edge to an in-progress
+    // node is a cycle.
+    let mut visited: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut in_stack: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    fn dfs<'a>(
+        node: &'a str,
+        nodes: &'a BTreeMap<String, GraphNode>,
+        edges: &[(&'a str, &'a str)],
+        visited: &mut std::collections::HashSet<&'a str>,
+        in_stack: &mut std::collections::HashSet<&'a str>,
+        report: &mut LintReport,
+    ) {
+        visited.insert(node);
+        in_stack.insert(node);
+        for (from, _to) in edges.iter().filter(|(_, to)| *to == node) {
+            if in_stack.contains(*from) {
+                report.issues.push(LintIssue {
+                    level: Level::Error,
+                    message: format!(
+                        "graph has a cycle: node {from:?} depends on {node:?} which depends back on it"
+                    ),
+                    line: None,
+                });
+            } else if !visited.contains(*from) {
+                dfs(from, nodes, edges, visited, in_stack, report);
+            }
+        }
+        in_stack.remove(node);
+    }
+    for name in nodes.keys() {
+        if !visited.contains(name.as_str()) {
+            dfs(name, nodes, &edges, &mut visited, &mut in_stack, report);
+        }
+    }
+
+    // (3) no orphans — every node must be reachable from a root. A root is a
+    // node with NO incoming dependency edges (nothing is a `to` of an edge:
+    // edges are stored (need → node), so a node with a `needs` entry appears
+    // as a `to`).
+    let has_incoming: std::collections::HashSet<&str> =
+        edges.iter().map(|(_, to)| *to).collect();
+    let roots: Vec<&str> = nodes
+        .keys()
+        .map(String::as_str)
+        .filter(|n| !has_incoming.contains(n))
+        .collect();
+    // Reachability from all roots.
+    let mut reachable: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    fn reach<'a>(
+        node: &'a str,
+        edges: &[(&'a str, &'a str)],
+        reachable: &mut std::collections::HashSet<&'a str>,
+    ) {
+        reachable.insert(node);
+        for (_from, to) in edges.iter().filter(|(from, _)| *from == node) {
+            if !reachable.contains(to) {
+                reach(*to, edges, reachable);
+            }
+        }
+    }
+    for root in roots {
+        reach(root, &edges, &mut reachable);
+    }
+    for name in nodes.keys() {
+        if !reachable.contains(name.as_str()) {
+            report.issues.push(LintIssue {
+                level: Level::Error,
+                message: format!(
+                    "graph node {name:?} is an orphan — not reachable from any root"
+                ),
+                line: None,
+            });
+        }
+    }
 }
 
 /// Validate a guard expression's syntax with evalexpr (no evaluation).
@@ -396,6 +520,105 @@ steps:
         assert!(
             err.contains("message_posted") || err.contains("steps"),
             "points at the issue: {err}"
+        );
+    }
+
+    /// P5.4: a cyclic `graph:` is rejected by lint (fail-stop, never runtime).
+    #[test]
+    fn lint_cyclic_graph_rejected() {
+        let yaml = r##"
+name: cyclic
+trigger:
+  type: webhook
+graph:
+  nodes:
+    a: { action: send_dm, to: x, body: y, needs: [b] }
+    b: { action: send_dm, to: x, body: y, needs: [a] }
+"##;
+        let wf = parse_workflow(yaml).expect("parse");
+        let report = lint_workflow(&wf);
+        assert!(
+            !report.is_clean(),
+            "cyclic graph must fail lint: {:?}",
+            report.issues
+        );
+        assert!(
+            report.issues.iter().any(|i| i.message.contains("cycle")),
+            "cycle named: {:?}",
+            report.issues
+        );
+    }
+
+    /// P5.4: an unresolvable `needs:` reference is a lint error.
+    #[test]
+    fn lint_unresolvable_needs_rejected() {
+        let yaml = r##"
+name: bad-needs
+trigger:
+  type: webhook
+graph:
+  nodes:
+    a: { action: send_dm, to: x, body: y, needs: [ghost] }
+"##;
+        let wf = parse_workflow(yaml).expect("parse");
+        let report = lint_workflow(&wf);
+        assert!(
+            !report.is_clean(),
+            "unresolvable needs must fail lint: {:?}",
+            report.issues
+        );
+        assert!(
+            report.issues.iter().any(|i| i.message.contains("not a node")),
+            "unresolvable named: {:?}",
+            report.issues
+        );
+    }
+
+    /// P5.4: an orphan node (not reachable from any root) is a lint error.
+    #[test]
+    fn lint_orphan_node_rejected() {
+        let yaml = r##"
+name: orphan
+trigger:
+  type: webhook
+graph:
+  nodes:
+    a: { action: send_dm, to: x, body: y }
+    b: { action: send_dm, to: x, body: y, needs: [a] }
+    c: { action: send_dm, to: x, body: y }   # no incoming, is a root — fine
+    d: { action: send_dm, to: x, body: y, needs: [b] }
+    stray: { action: send_dm, to: x, body: y, needs: [ghost] }
+"##;
+        let wf = parse_workflow(yaml).expect("parse");
+        let report = lint_workflow(&wf);
+        assert!(
+            report.issues.iter().any(|i| i.message.contains("stray")),
+            "orphan flagged: {:?}",
+            report.issues
+        );
+    }
+
+    /// P5.4: a valid DAG (the Spec 4b example) lints clean.
+    #[test]
+    fn lint_valid_dag_clean() {
+        let yaml = r##"
+name: ship
+trigger:
+  type: webhook
+graph:
+  nodes:
+    scout: { action: send_dm, to: x, body: y }
+    plan:  { action: send_dm, to: x, body: y, needs: [scout] }
+    fix_a: { action: send_dm, to: x, body: y, needs: [plan] }
+    fix_b: { action: send_dm, to: x, body: y, needs: [plan] }
+    ship:  { action: send_dm, to: x, body: y, needs: [fix_a, fix_b] }
+"##;
+        let wf = parse_workflow(yaml).expect("parse");
+        let report = lint_workflow(&wf);
+        assert!(
+            report.is_clean(),
+            "valid DAG must lint clean: {:?}",
+            report.issues
         );
     }
 

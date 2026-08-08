@@ -31,6 +31,12 @@ pub struct Workflow {
     /// Steps executed when the trigger fires (ordered).
     #[serde(default)]
     pub steps: Vec<Step>,
+    /// Opt-in DAG (`graph:`) — the general case; `steps:` is the linear
+    /// special case (ADR-0005 Spec 4b). When present, the engine runs the
+    /// graph instead of `steps`. Edges are DERIVED from `needs:` (single
+    /// encoding; `edges:` was dropped as redundant).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graph: Option<Graph>,
     /// Named inputs for the on-demand invoke path (ADR-0005 Spec 2). On
     /// invoke, the engine synthesizes a `trigger.*` template context from the
     /// provided inputs so `{{inputs.x}}` / `{{trigger.x}}` resolve.
@@ -43,6 +49,33 @@ pub struct Workflow {
 pub struct InputDecl {
     /// Input name (referenced as `{{inputs.<name>}}`).
     pub name: String,
+}
+
+/// A workflow DAG (`graph:` — ADR-0005 Spec 4b). Edges are derived from each
+/// node's `needs:` (a node runs when ALL its `needs` have produced output);
+/// independent nodes run concurrently within the one Resonate run.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Graph {
+    /// node name → node definition.
+    pub nodes: BTreeMap<String, GraphNode>,
+}
+
+/// One DAG node: an action plus its dependencies.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GraphNode {
+    /// The node's action (the 7 existing actions; control-flow actions land
+    /// in P5.3).
+    #[serde(flatten)]
+    pub action: Action,
+    /// Node names that must complete first (edges derived from this).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub needs: Vec<String>,
+    /// Optional evalexpr guard (100ms timeout).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guard: Option<String>,
+    /// Failure policy for this node (ADR-0005 Spec 0).
+    #[serde(default, skip_serializing_if = "StepOnError::is_continue")]
+    pub on_error: StepOnError,
 }
 
 /// A workflow trigger (one of the ADR Phase-2 set).
