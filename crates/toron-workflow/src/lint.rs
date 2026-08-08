@@ -87,52 +87,55 @@ pub fn lint_workflow(wf: &Workflow) -> LintReport {
     }
 
     // Trigger type is validated by serde (unknown `type` fails parse); the
-    // remaining trigger-specific checks:
-    match &wf.trigger {
-        Trigger::MessagePosted { channel, project } => {
-            if channel.is_none() && project.is_none() {
-                report.issues.push(LintIssue {
-                    level: Level::Warning,
-                    message: "message_posted trigger has neither channel nor project — will match all messages".into(),
-                    line: None,
-                });
+    // remaining trigger-specific checks. `None` trigger = invoke-only
+    // (ADR-0005 Spec 2) — no reactive checks apply.
+    if let Some(trigger) = &wf.trigger {
+        match trigger {
+            Trigger::MessagePosted { channel, project } => {
+                if channel.is_none() && project.is_none() {
+                    report.issues.push(LintIssue {
+                        level: Level::Warning,
+                        message: "message_posted trigger has neither channel nor project — will match all messages".into(),
+                        line: None,
+                    });
+                }
             }
-        }
-        Trigger::Schedule { cron } => {
-            // Validate the 5/6-field cron shape crudely (non-empty, 5+ fields).
-            let fields: Vec<&str> = cron.split_whitespace().collect();
-            if fields.len() < 5 || fields.len() > 6 {
-                report.issues.push(LintIssue {
-                    level: Level::Error,
-                    message: format!(
-                        "schedule cron {:?} must have 5-6 fields, got {}",
-                        cron,
-                        fields.len()
-                    ),
-                    line: None,
-                });
+            Trigger::Schedule { cron } => {
+                // Validate the 5/6-field cron shape crudely (non-empty, 5+ fields).
+                let fields: Vec<&str> = cron.split_whitespace().collect();
+                if fields.len() < 5 || fields.len() > 6 {
+                    report.issues.push(LintIssue {
+                        level: Level::Error,
+                        message: format!(
+                            "schedule cron {:?} must have 5-6 fields, got {}",
+                            cron,
+                            fields.len()
+                        ),
+                        line: None,
+                    });
+                }
             }
-        }
-        Trigger::ReservationAcquired { project, .. }
-        | Trigger::ReservationReleased { project, .. } => {
-            if project.trim().is_empty() {
-                report.issues.push(LintIssue {
-                    level: Level::Error,
-                    message: "reservation trigger requires a non-empty `project`".into(),
-                    line: None,
-                });
+            Trigger::ReservationAcquired { project, .. }
+            | Trigger::ReservationReleased { project, .. } => {
+                if project.trim().is_empty() {
+                    report.issues.push(LintIssue {
+                        level: Level::Error,
+                        message: "reservation trigger requires a non-empty `project`".into(),
+                        line: None,
+                    });
+                }
             }
-        }
-        Trigger::AgentStateChanged { agent, .. } => {
-            if agent.trim().is_empty() {
-                report.issues.push(LintIssue {
-                    level: Level::Error,
-                    message: "agent_state_changed trigger requires a non-empty `agent`".into(),
-                    line: None,
-                });
+            Trigger::AgentStateChanged { agent, .. } => {
+                if agent.trim().is_empty() {
+                    report.issues.push(LintIssue {
+                        level: Level::Error,
+                        message: "agent_state_changed trigger requires a non-empty `agent`".into(),
+                        line: None,
+                    });
+                }
             }
+            Trigger::ReactionAdded { .. } | Trigger::Webhook { .. } => {}
         }
-        Trigger::ReactionAdded { .. } | Trigger::Webhook { .. } => {}
     }
 
     // Workflow-level guard.

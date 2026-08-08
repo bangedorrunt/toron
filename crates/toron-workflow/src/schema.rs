@@ -20,8 +20,11 @@ pub struct Workflow {
     /// Human description (optional).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
-    /// The trigger that fires this workflow.
-    pub trigger: Trigger,
+    /// The trigger that fires this workflow. `None` → invoke-only (ADR-0005
+    /// Spec 2: cannot fire reactively, only via `WorkflowEngine::invoke`).
+    /// `Some` → reactive AND invocable.
+    #[serde(default)]
+    pub trigger: Option<Trigger>,
     /// Optional evalexpr guard over the trigger payload (100ms timeout).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guard: Option<String>,
@@ -271,7 +274,10 @@ steps:
 "##;
         let wf = parse_workflow(yaml).expect("parse");
         assert_eq!(wf.name, "triage");
-        assert_eq!(wf.trigger.type_name(), "message_posted");
+        assert_eq!(
+            wf.trigger.as_ref().map(Trigger::type_name),
+            Some("message_posted")
+        );
         assert_eq!(wf.guard.as_deref(), Some("trigger.channel == '#support'"));
         assert_eq!(wf.steps.len(), 2);
         assert_eq!(wf.steps[0].name.as_deref(), Some("ack"));
@@ -302,8 +308,27 @@ steps:
         for (expect, yaml) in cases {
             let wf = parse_workflow(&format!("name: t\ntrigger:\n  {yaml}"))
                 .unwrap_or_else(|e| panic!("{expect}: {e}"));
-            assert_eq!(wf.trigger.type_name(), *expect);
+            assert_eq!(
+                wf.trigger.as_ref().map(Trigger::type_name),
+                Some(*expect)
+            );
         }
+    }
+
+    #[test]
+    fn triggerless_workflow_is_invoke_only() {
+        // No `trigger:` key → None (invoke-only, ADR-0005 Spec 2). The old
+        // required-trigger schema would reject this; now it parses and cannot
+        // auto-fire (the engine only runs it via invoke).
+        let yaml = "name: invoke-only\ninputs:\n  - name: goal\nsteps:\n  - name: a\n    action: send_dm\n    to: x\n    body: y\n";
+        let wf = parse_workflow(yaml).expect("trigger-less workflow parses");
+        assert!(wf.trigger.is_none(), "no trigger -> invoke-only");
+        assert_eq!(wf.inputs.len(), 1);
+
+        // Backward compat: a workflow WITH a trigger still parses as Some.
+        let yaml = "name: reactive\ntrigger:\n  type: webhook\nsteps:\n  - name: a\n    action: send_dm\n    to: x\n    body: y\n";
+        let wf = parse_workflow(yaml).expect("triggered workflow parses");
+        assert!(wf.trigger.is_some(), "triggered workflow -> Some");
     }
 
     #[test]
