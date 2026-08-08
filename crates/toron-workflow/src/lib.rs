@@ -34,7 +34,9 @@ pub use coalesce::{
     FlushOutcome, InboundMention, MentionCoalescer, subwindow_from_env, window_from_env,
 };
 pub use dispatch::{DispatchConfig, DispatchPermit, DispatchPool, QueuedJob};
-pub use engine::{ActionRunner, Decision, RunInput, WorkflowEngine, run_workflow};
+pub use engine::{
+    ActionRunner, Decision, RunInput, WorkflowEngine, build_workflow_run_terminal, run_workflow,
+};
 pub use guard::{
     DEFAULT_TIMEOUT_MS, GuardOutcome, evaluate_guard, evaluate_guard_default,
     inject_buzz_functions, timeout_from_env,
