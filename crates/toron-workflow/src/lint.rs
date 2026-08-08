@@ -462,6 +462,55 @@ fn check_action(report: &mut LintReport, action: &Action) {
                 });
             }
         }
+        Action::Retry {
+            max_attempts,
+            step,
+            ..
+        } => {
+            if *max_attempts == 0 {
+                report.issues.push(LintIssue {
+                    level: Level::Error,
+                    message: "retry requires max_attempts >= 1".into(),
+                    line: None,
+                });
+            }
+            check_action(report, &step.action);
+        }
+        Action::Branch { if_guard, then, else_steps } => {
+            check_guard(report, if_guard, "branch guard");
+            for s in then.iter().chain(else_steps.iter()) {
+                check_action(report, &s.action);
+            }
+        }
+        Action::Foreach { over, each } => {
+            if over.trim().is_empty() {
+                report.issues.push(LintIssue {
+                    level: Level::Error,
+                    message: "foreach requires a non-empty `over`".into(),
+                    line: None,
+                });
+            }
+            check_action(report, &each.action);
+        }
+        Action::Parallel { over, each } => {
+            if over.trim().is_empty() {
+                report.issues.push(LintIssue {
+                    level: Level::Error,
+                    message: "parallel requires a non-empty `over`".into(),
+                    line: None,
+                });
+            }
+            check_action(report, &each.action);
+        }
+        Action::CallWorkflow { workflow, .. } => {
+            if workflow.trim().is_empty() {
+                report.issues.push(LintIssue {
+                    level: Level::Error,
+                    message: "call_workflow requires a non-empty `workflow` name".into(),
+                    line: None,
+                });
+            }
+        }
     }
 }
 

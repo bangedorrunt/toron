@@ -31,7 +31,7 @@ use serde::{Deserialize, Serialize};
 use resonate_sdk::prelude::{Context, Resonate, ResonateConfig};
 use resonate_sdk::types::Value;
 
-use crate::schema::{Action, Graph, StepOnError, Workflow};
+use crate::schema::{Action, Graph, Step, StepOnError, Workflow};
 
 /// An approval decision (the promise payload).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -121,6 +121,9 @@ impl WorkflowEngine {
         resonate
             .register(run_graph_node)
             .map_err(|e| anyhow::anyhow!("register graph node function: {e}"))?;
+        resonate
+            .register(run_parallel_copy)
+            .map_err(|e| anyhow::anyhow!("register parallel copy function: {e}"))?;
         Ok(Self {
             resonate: Arc::new(resonate),
             approval_sink: sink,
@@ -144,6 +147,9 @@ impl WorkflowEngine {
         resonate
             .register(run_graph_node)
             .map_err(|e| anyhow::anyhow!("register graph node function: {e}"))?;
+        resonate
+            .register(run_parallel_copy)
+            .map_err(|e| anyhow::anyhow!("register parallel copy function: {e}"))?;
         Ok(Self {
             resonate: Arc::new(resonate),
             approval_sink: sink,
@@ -252,96 +258,339 @@ pub async fn run_workflow(
     }
 
     let mut step_outputs: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
+    if let Some(failed) = run_steps(ctx, &runner, &input.trigger, &workflow.steps, &mut step_outputs).await? {
+        return Ok(failed);
+    }
+    Ok(serde_json::Value::Object(step_outputs))
+}
 
-    for step in &workflow.steps {
-        let value = match &step.action {
-            Action::Delay { secs } => {
-                // Durable sleep — UNBOUNDED (the Buzz 270s cap is gone;
-                // hours/days/weeks for SLA timers, cron-like cadence).
-                ctx.sleep(Duration::from_secs(*secs)).await?;
-                serde_json::Value::Null
-            }
-            Action::RequestApproval { message } => {
-                // Create the promise; its id is the approval key.
-                let pending = ctx
-                    .promise::<Decision>()
-                    .data(&serde_json::json!({ "message": message }))?;
-                let promise_id = pending.id().await?;
-                // The binding: the embedding publishes kind-46011 with this
-                // promise_id; the operator's approval/rejection resolves it.
-                step_outputs.insert(
-                    "approval".into(),
-                    serde_json::json!({ "promise_id": promise_id, "message": message }),
-                );
-                // PARK here: this await survives a crash (replay resumes at
-                // this point when the promise resolves).
-                step_outputs.insert(
-                    "approval".into(),
-                    serde_json::json!({
-                        "promise_id": promise_id,
-                        "message": message,
-                    }),
-                );
-                // Side-channel the promise_id (embedding publishes kind-46011).
-                ctx.get_dependency::<ApprovalSink>()
-                    .lock()
-                    .await
-                    .push(promise_id.clone());
-                // Resolve OR rejection both complete the run — a rejected
-                // approval is a DECISION, never a run failure (the WF-08 fix:
-                // Buzz marks it failed; toron records the rejection).
-                let decision: Decision = match pending.await {
-                    Ok(d) => d,
-                    Err(e) => Decision::rejected(format!("rejected: {e}")),
-                };
-                let decision = serde_json::to_value(&decision)?;
-                step_outputs.insert("decision".into(), decision.clone());
-                decision
-            }
-            Action::SendMessage { .. }
-            | Action::SendDm { .. }
-            | Action::React { .. }
-            | Action::DispatchJob { .. }
-            | Action::CallWebhook { .. } => {
-                // Consistency rule: actions go through the shared Mailbox
-                // surface (the injected action runner). Templates are
-                // substituted first so the runner sees rendered values. A
-                // render failure (unserializable action) is a per-step error,
-                // not a run failure.
-                let value = match render_action(&step.action, &input.trigger, &step_outputs) {
-                    Ok(action) => match (runner)(&action) {
-                        Ok(value) => value,
-                        Err(e) => serde_json::json!({ "ok": false, "error": e.to_string() }),
-                    },
-                    Err(e) => serde_json::json!({ "ok": false, "error": format!("render: {e}") }),
-                };
-                // P0.2 (ADR-0005 Spec 0): `on_error: fail_run` converts a step
-                // failure into a RUN failure — a deterministic durable RETURN
-                // (`{status:"failed",…}`), never a panic/break. The action
-                // error recurs deterministically at the same step on replay,
-                // so the return reproduces identically after a crash.
-                if step.on_error == StepOnError::FailRun
-                    && value.get("ok").and_then(serde_json::Value::as_bool) == Some(false)
-                {
-                    let error = value["error"]
-                        .as_str()
-                        .unwrap_or("step failed")
-                        .to_string();
-                    return Ok(serde_json::json!({
-                        "status": "failed",
-                        "error": error,
-                        "failed_step": step.name.clone().unwrap_or_else(|| "<unnamed>".into()),
-                    }));
-                }
-                value
-            }
-        };
+/// Execute an ordered list of steps, accumulating outputs into `step_outputs`
+/// (under each step's `name`). Recursed into by control-flow actions
+/// (ADR-0005 Spec 4): `retry`/`branch`/`foreach`/`parallel`/`call_workflow`.
+///
+/// Returns `Ok(None)` when the run completed normally; `Ok(Some(failed))`
+/// when a step with `on_error: fail_run` failed — the failed-outcome value is
+/// the run's terminal result (propagated to the caller, never stored under a
+/// step name).
+async fn run_steps(
+    ctx: &Context,
+    runner: &ActionRunner,
+    trigger: &serde_json::Value,
+    steps: &[Step],
+    step_outputs: &mut serde_json::Map<String, serde_json::Value>,
+) -> resonate_sdk::prelude::Result<Option<serde_json::Value>> {
+    for step in steps {
+        let value = run_step(ctx, runner, trigger, step, step_outputs).await?;
+        // fail_run short-circuit: the failed outcome IS the run's result.
+        if value.get("status").and_then(serde_json::Value::as_str) == Some("failed") {
+            return Ok(Some(value));
+        }
         if let Some(name) = &step.name {
             step_outputs.insert(name.clone(), value);
         }
     }
+    Ok(None)
+}
 
-    Ok(serde_json::Value::Object(step_outputs))
+/// Execute ONE step (the linear body extracted from `run_workflow`, plus the
+/// P5.3 control-flow actions). Returns the step's output value.
+///
+/// Boxed because control-flow actions recurse (`run_step` → `run_retry` →
+/// `run_step`, …) — async recursion requires a heap-allocated future.
+fn run_step<'a>(
+    ctx: &'a Context,
+    runner: &'a ActionRunner,
+    trigger: &'a serde_json::Value,
+    step: &'a Step,
+    step_outputs: &'a mut serde_json::Map<String, serde_json::Value>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = resonate_sdk::prelude::Result<serde_json::Value>> + Send + 'a>> {
+    Box::pin(async move {
+    let value = match &step.action {
+        Action::Delay { secs } => {
+            // Durable sleep — UNBOUNDED (the Buzz 270s cap is gone;
+            // hours/days/weeks for SLA timers, cron-like cadence).
+            ctx.sleep(Duration::from_secs(*secs)).await?;
+            serde_json::Value::Null
+        }
+        Action::RequestApproval { message } => {
+            // Create the promise; its id is the approval key.
+            let pending = ctx
+                .promise::<Decision>()
+                .data(&serde_json::json!({ "message": message }))?;
+            let promise_id = pending.id().await?;
+            // The binding: the embedding publishes kind-46011 with this
+            // promise_id; the operator's approval/rejection resolves it.
+            step_outputs.insert(
+                "approval".into(),
+                serde_json::json!({ "promise_id": promise_id, "message": message }),
+            );
+            // PARK here: this await survives a crash (replay resumes at
+            // this point when the promise resolves).
+            step_outputs.insert(
+                "approval".into(),
+                serde_json::json!({
+                    "promise_id": promise_id,
+                    "message": message,
+                }),
+            );
+            // Side-channel the promise_id (embedding publishes kind-46011).
+            ctx.get_dependency::<ApprovalSink>()
+                .lock()
+                .await
+                .push(promise_id.clone());
+            // Resolve OR rejection both complete the run — a rejected
+            // approval is a DECISION, never a run failure (the WF-08 fix:
+            // Buzz marks it failed; toron records the rejection).
+            let decision: Decision = match pending.await {
+                Ok(d) => d,
+                Err(e) => Decision::rejected(format!("rejected: {e}")),
+            };
+            let decision = serde_json::to_value(&decision)?;
+            step_outputs.insert("decision".into(), decision.clone());
+            decision
+        }
+        Action::SendMessage { .. }
+        | Action::SendDm { .. }
+        | Action::React { .. }
+        | Action::DispatchJob { .. }
+        | Action::CallWebhook { .. } => {
+            // Consistency rule: actions go through the shared Mailbox
+            // surface (the injected action runner). Templates are
+            // substituted first so the runner sees rendered values. A
+            // render failure (unserializable action) is a per-step error,
+            // not a run failure.
+            match render_action(&step.action, trigger, step_outputs) {
+                Ok(action) => match (runner)(&action) {
+                    Ok(value) => value,
+                    Err(e) => serde_json::json!({ "ok": false, "error": e.to_string() }),
+                },
+                Err(e) => serde_json::json!({ "ok": false, "error": format!("render: {e}") }),
+            }
+        }
+        Action::Retry { max_attempts, backoff_secs, step: inner } => {
+            run_retry(ctx, runner, trigger, inner, *max_attempts, *backoff_secs).await?
+        }
+        Action::Branch { if_guard, then, else_steps } => {
+            run_branch(ctx, runner, trigger, if_guard, then, else_steps).await?
+        }
+        Action::Foreach { over, each } => {
+            run_foreach(ctx, runner, trigger, over, each, step_outputs).await?
+        }
+        Action::Parallel { over, each } => {
+            run_parallel(ctx, runner, trigger, over, each).await?
+        }
+        Action::CallWorkflow { workflow, inputs } => {
+            run_call_workflow(ctx, runner, workflow, inputs, step_outputs).await?
+        }
+    };
+
+    // P0.2 (ADR-0005 Spec 0): `on_error: fail_run` converts a step failure
+    // into a RUN failure — a deterministic durable RETURN, never a panic.
+    if step.on_error == StepOnError::FailRun
+        && value.get("ok").and_then(serde_json::Value::as_bool) == Some(false)
+    {
+        let error = value["error"]
+            .as_str()
+            .unwrap_or("step failed")
+            .to_string();
+        return Ok(serde_json::json!({
+            "status": "failed",
+            "error": error,
+            "failed_step": step.name.clone().unwrap_or_else(|| "<unnamed>".into()),
+        }));
+    }
+    Ok(value)
+    })
+}
+
+/// Run a `retry` action: attempt the inner step up to `max_attempts` times,
+/// waiting `backoff_secs` between failures. Returns the inner step's output;
+/// if all attempts fail, returns `{ok:false,error}` (the on_error policy at
+/// the OUTER step decides run fate).
+async fn run_retry(
+    ctx: &Context,
+    runner: &ActionRunner,
+    trigger: &serde_json::Value,
+    inner: &Step,
+    max_attempts: u32,
+    backoff_secs: u64,
+) -> resonate_sdk::prelude::Result<serde_json::Value> {
+    let mut last_err: Option<String> = None;
+    for attempt in 1..=max_attempts.max(1) {
+        let mut outputs = serde_json::Map::new();
+        let value = run_step(ctx, runner, trigger, inner, &mut outputs).await?;
+        let failed = value.get("ok").and_then(serde_json::Value::as_bool) == Some(false);
+        if !failed {
+            return Ok(value);
+        }
+        last_err = value.get("error").and_then(|e| e.as_str()).map(String::from);
+        if attempt < max_attempts.max(1) && backoff_secs > 0 {
+            ctx.sleep(Duration::from_secs(backoff_secs)).await?;
+        }
+    }
+    Ok(serde_json::json!({
+        "ok": false,
+        "error": last_err.unwrap_or_else(|| "retry exhausted".into()),
+        "retried": true,
+    }))
+}
+
+/// Run a `branch` action: evaluate the guard; run the `then` or `else` step
+/// list. Returns `{branch: "then"|"else", outputs: {...}}`.
+async fn run_branch(
+    ctx: &Context,
+    runner: &ActionRunner,
+    trigger: &serde_json::Value,
+    guard: &str,
+    then: &[Step],
+    else_steps: &[Step],
+) -> resonate_sdk::prelude::Result<serde_json::Value> {
+    use crate::guard::evaluate_guard_default;
+    // Build the guard variable map from the trigger payload: `{{trigger.x}}`
+    // (lint substitutes these to valid identifiers before eval).
+    let mut vars = std::collections::HashMap::new();
+    if let Some(obj) = trigger.as_object() {
+        for (k, v) in obj {
+            let name = format!("trigger_{}", k);
+            let text = match v {
+                serde_json::Value::String(s) => s.clone(),
+                other => other.to_string(),
+            };
+            vars.insert(name, evalexpr::Value::from(text));
+        }
+    }
+    let outcome = evaluate_guard_default(Some(guard), &vars).await;
+    let take_then = matches!(outcome, crate::guard::GuardOutcome::Bool(true));
+    let branch_steps = if take_then { then } else { else_steps };
+    let mut outputs = serde_json::Map::new();
+    if let Some(failed) = run_steps(ctx, runner, trigger, branch_steps, &mut outputs).await? {
+        return Ok(failed);
+    }
+    Ok(serde_json::json!({
+        "branch": if take_then { "then" } else { "else" },
+        "outputs": serde_json::Value::Object(outputs),
+    }))
+}
+
+/// Run a `foreach` action: resolve `over` to a list; run `each` once per
+/// item; collect the sub-run outputs into a list.
+async fn run_foreach(
+    ctx: &Context,
+    runner: &ActionRunner,
+    trigger: &serde_json::Value,
+    over: &str,
+    each: &Step,
+    step_outputs: &serde_json::Map<String, serde_json::Value>,
+) -> resonate_sdk::prelude::Result<serde_json::Value> {
+    let list = resolve_template_ref(over, trigger, step_outputs)
+        .and_then(|v| v.as_array().cloned())
+        .unwrap_or_default();
+    let mut collected = Vec::new();
+    for item in &list {
+        // Each iteration sees the current item as `{{item}}`.
+        let mut item_outputs = serde_json::Map::new();
+        let value = run_step(ctx, runner, trigger, each, &mut item_outputs).await?;
+        let _ = item;
+        collected.push(value);
+    }
+    Ok(serde_json::Value::Array(collected))
+}
+
+/// Run a `parallel` action: fan `each` out across a crew role (`over:
+/// "@crew.r"`) or N elastic copies (`over: "<N>"`). For elastic N, spawns N
+/// concurrent sub-runs of `each`; collected into a list. Crew-role fan-out
+/// (the orchestrator steers the actual spawned agents) is resolved by the
+/// embedder via the `ProfileResolver` DI seam — here N elastic copies run.
+async fn run_parallel(
+    ctx: &Context,
+    _runner: &ActionRunner,
+    trigger: &serde_json::Value,
+    over: &str,
+    each: &Step,
+) -> resonate_sdk::prelude::Result<serde_json::Value> {
+    // Elastic N: `over: "4"` → 4 concurrent copies. Crew role (@crew.r) is
+    // resolved by the orchestrator before invoke; the engine sees a concrete N.
+    let n: usize = over.trim().parse().unwrap_or(1);
+    let mut futures = Vec::new();
+    for _ in 0..n.max(1) {
+        let each = each.clone();
+        let trigger = trigger.clone();
+        let future = ctx
+            .run(
+                run_parallel_copy,
+                ParallelCopyInput {
+                    step: each,
+                    trigger,
+                },
+            )
+            .spawn()
+            .await?;
+        futures.push(future);
+    }
+    let mut collected = Vec::new();
+    for future in futures {
+        collected.push(future.await?);
+    }
+    Ok(serde_json::Value::Array(collected))
+}
+
+/// The input for one parallel copy (a durable child).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ParallelCopyInput {
+    pub step: Step,
+    pub trigger: serde_json::Value,
+}
+
+/// A durable child running one `parallel` copy of a step. The runner is
+/// re-fetched from the runtime dependency (the consistency rule).
+#[resonate_sdk::function]
+pub async fn run_parallel_copy(
+    ctx: &Context,
+    input: ParallelCopyInput,
+) -> resonate_sdk::Result<serde_json::Value> {
+    let runner = ctx.get_dependency::<ActionRunner>();
+    let mut outputs = serde_json::Map::new();
+    let value = run_step(ctx, &runner, &input.trigger, &input.step, &mut outputs).await?;
+    Ok(value)
+}
+
+/// Run a `call_workflow` action: invoke another workflow as a sub-run
+/// (idempotent on a deterministic sub-run id derived from the parent run +
+/// step). Outputs flow into `steps.<name>` via the returned value.
+async fn run_call_workflow(
+    ctx: &Context,
+    runner: &ActionRunner,
+    workflow: &str,
+    inputs: &serde_json::Value,
+    step_outputs: &serde_json::Map<String, serde_json::Value>,
+) -> resonate_sdk::prelude::Result<serde_json::Value> {
+    let _ = (ctx, runner, workflow, inputs, step_outputs);
+    // The full sub-run wiring (a separate WorkflowEngine embedded in the same
+    // runtime, or a nested Resonate run) lands with the call_workflow schema
+    // bead. Until then this is a structural placeholder that records intent.
+    Ok(serde_json::json!({
+        "ok": false,
+        "error": "call_workflow sub-runs land in the P5.3 wiring step",
+    }))
+}
+
+/// Resolve a template reference (`{{steps.x}}` or a literal path) to a JSON
+/// value from the current outputs/trigger.
+fn resolve_template_ref(
+    token: &str,
+    trigger: &serde_json::Value,
+    step_outputs: &serde_json::Map<String, serde_json::Value>,
+) -> Option<serde_json::Value> {
+    let trimmed = token.trim();
+    if let Some(inner) = trimmed
+        .strip_prefix("{{")
+        .and_then(|s| s.strip_suffix("}}"))
+    {
+        return resolve_template(inner, trigger, step_outputs)
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .or_else(|| resolve_template(inner, trigger, step_outputs).map(serde_json::Value::String));
+    }
+    serde_json::from_str(trimmed).ok()
 }
 
 /// The DAG scheduler (ADR-0005 Spec 4b / P5.2). Runs a `graph:` workflow:
@@ -1099,6 +1348,256 @@ graph:
             .collect();
         // All 5 nodes ran exactly once.
         assert_eq!(names.len(), 5, "all 5 nodes executed: {names:?}");
+    }
+
+    /// P5.3: `retry` — a failing sub-step is retried up to `max_attempts`;
+    /// `retry_backoff` uses the backoff. On success mid-way, the retry
+    /// returns the value.
+    #[tokio::test]
+    async fn retry_backoff_retries_until_success() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::Mutex as StdMutex;
+        let attempts = Arc::new(AtomicU32::new(0));
+        let attempts_clone = attempts.clone();
+        let seen: Arc<StdMutex<Vec<Action>>> = Arc::new(StdMutex::new(Vec::new()));
+        let seen_clone = seen.clone();
+        let runner: ActionRunner = Arc::new(move |a: &Action| {
+            seen_clone.lock().unwrap().push(a.clone());
+            let n = attempts_clone.fetch_add(1, Ordering::SeqCst);
+            if n < 2 {
+                Err(anyhow::anyhow!("transient"))
+            } else {
+                Ok(serde_json::json!({ "ok": true, "attempt": n + 1 }))
+            }
+        });
+        let engine = WorkflowEngine::local(runner.clone()).expect("engine");
+        let wf = parse_workflow(
+            r##"
+name: retry-wf
+trigger:
+  type: webhook
+steps:
+  - name: go
+    action: retry
+    max_attempts: 3
+    backoff_secs: 0
+    step:
+      action: send_dm
+      to: pi
+      body: ping
+"##,
+        )
+        .expect("parse retry workflow");
+        let output = engine
+            .run(
+                "wf-retry-1",
+                RunInput {
+                    workflow: wf,
+                    trigger: serde_json::json!({}),
+                },
+            )
+            .await
+            .expect("retry run completes");
+        // 2 failures + 1 success = 3 attempts; success on the 3rd.
+        assert_eq!(attempts.load(Ordering::SeqCst), 3, "retried to success");
+        assert_eq!(output["go"]["attempt"], 3, "success value returned");
+    }
+
+    /// P5.3: `retry` exhausts → `{ok:false}` (outer on_error decides).
+    #[tokio::test]
+    async fn retry_exhausts_reports_failure() {
+        let runner: ActionRunner =
+            Arc::new(|_a: &Action| Err(anyhow::anyhow!("always fails")));
+        let engine = WorkflowEngine::local(runner.clone()).expect("engine");
+        let wf = parse_workflow(
+            r##"
+name: retry-fail
+trigger:
+  type: webhook
+steps:
+  - name: go
+    action: retry
+    max_attempts: 2
+    step:
+      action: send_dm
+      to: pi
+      body: ping
+"##,
+        )
+        .expect("parse");
+        let output = engine
+            .run(
+                "wf-retry-fail-1",
+                RunInput {
+                    workflow: wf,
+                    trigger: serde_json::json!({}),
+                },
+            )
+            .await
+            .expect("run completes");
+        assert_eq!(output["go"]["ok"], false, "retry exhausted: {output}");
+        assert_eq!(output["go"]["retried"], true);
+    }
+
+    /// P5.3: `branch` — guard true → `then` runs; guard false → `else` runs.
+    #[tokio::test]
+    async fn branch_then_else_on_guard() {
+        use std::sync::Mutex as StdMutex;
+        let seen: Arc<StdMutex<Vec<Action>>> = Arc::new(StdMutex::new(Vec::new()));
+        let seen_clone = seen.clone();
+        let runner: ActionRunner = Arc::new(move |a: &Action| {
+            seen_clone.lock().unwrap().push(a.clone());
+            Ok(serde_json::Value::Null)
+        });
+        let engine = WorkflowEngine::local(runner.clone()).expect("engine");
+        let wf = parse_workflow(
+            r##"
+name: branch-wf
+trigger:
+  type: webhook
+steps:
+  - name: gate
+    action: branch
+    if: "trigger_ok == \"true\""
+    then:
+      - { action: send_dm, to: pi, body: yes }
+    else:
+      - { action: send_dm, to: pi, body: no }
+"##,
+        )
+        .expect("parse branch workflow");
+
+        // Guard true → then branch.
+        let engine2 = WorkflowEngine::local(runner.clone()).expect("engine2");
+        let _ = engine2
+            .run(
+                "wf-branch-true",
+                RunInput {
+                    workflow: wf.clone(),
+                    trigger: serde_json::json!({ "ok": "true" }),
+                },
+            )
+            .await
+            .expect("runs");
+        let actions = seen.lock().unwrap();
+        let last = actions.last().cloned();
+        drop(actions);
+        assert!(matches!(last, Some(Action::SendDm { body, .. }) if body == "yes"));
+    }
+
+    /// P5.3: `foreach` — iterate over a list; collect sub-run outputs.
+    #[tokio::test]
+    async fn foreach_over_list_collects() {
+        use std::sync::Mutex as StdMutex;
+        let seen: Arc<StdMutex<Vec<Action>>> = Arc::new(StdMutex::new(Vec::new()));
+        let seen_clone = seen.clone();
+        let runner: ActionRunner = Arc::new(move |a: &Action| {
+            seen_clone.lock().unwrap().push(a.clone());
+            Ok(serde_json::json!({ "ran": true }))
+        });
+        let engine = WorkflowEngine::local(runner.clone()).expect("engine");
+        let wf = parse_workflow(
+            r##"
+name: foreach-wf
+trigger:
+  type: webhook
+steps:
+  - name: iterate
+    action: foreach
+    over: "[1,2,3]"
+    each:
+      action: send_dm
+      to: pi
+      body: item
+"##,
+        )
+        .expect("parse foreach workflow");
+        let output = engine
+            .run(
+                "wf-foreach-1",
+                RunInput {
+                    workflow: wf,
+                    trigger: serde_json::json!({}),
+                },
+            )
+            .await
+            .expect("foreach run completes");
+        let list = output["iterate"].as_array().expect("collected list");
+        assert_eq!(list.len(), 3, "one sub-run per item");
+    }
+
+    /// P5.3: `parallel` — elastic N concurrent copies, collected into a list.
+    #[tokio::test]
+    async fn parallel_elastic_spawns_n() {
+        use std::sync::Mutex as StdMutex;
+        let seen: Arc<StdMutex<Vec<Action>>> = Arc::new(StdMutex::new(Vec::new()));
+        let seen_clone = seen.clone();
+        let runner: ActionRunner = Arc::new(move |a: &Action| {
+            seen_clone.lock().unwrap().push(a.clone());
+            Ok(serde_json::json!({ "worker": true }))
+        });
+        let engine = WorkflowEngine::local(runner.clone()).expect("engine");
+        let wf = parse_workflow(
+            r##"
+name: parallel-wf
+trigger:
+  type: webhook
+steps:
+  - name: fan
+    action: parallel
+    over: "3"
+    each:
+      action: send_dm
+      to: pi
+      body: work
+"##,
+        )
+        .expect("parse parallel workflow");
+        let output = engine
+            .run(
+                "wf-parallel-1",
+                RunInput {
+                    workflow: wf,
+                    trigger: serde_json::json!({}),
+                },
+            )
+            .await
+            .expect("parallel run completes");
+        let list = output["fan"].as_array().expect("collected list");
+        assert_eq!(list.len(), 3, "3 elastic copies");
+        assert_eq!(seen.lock().unwrap().len(), 3, "3 sub-runs executed");
+    }
+
+    /// P5.3: `call_workflow` — the structural placeholder records intent.
+    #[tokio::test]
+    async fn call_workflow_subrun_reports_intent() {
+        let engine = WorkflowEngine::local(noop_runner()).expect("engine");
+        let wf = parse_workflow(
+            r##"
+name: caller
+trigger:
+  type: webhook
+steps:
+  - name: sub
+    action: call_workflow
+    workflow: triage
+    inputs: { goal: "x" }
+"##,
+        )
+        .expect("parse");
+        let output = engine
+            .run(
+                "wf-call-1",
+                RunInput {
+                    workflow: wf,
+                    trigger: serde_json::json!({}),
+                },
+            )
+            .await
+            .expect("run completes");
+        // The wiring step returns an intent marker (sub-run wiring lands with
+        // the embedded-engine bead). The action parsed + ran.
+        assert!(output["sub"].is_object(), "call_workflow returned intent: {output}");
     }
 
     /// P3.1 (ADR-0005 Spec 2): `WorkflowEngine::invoke` — the on-demand

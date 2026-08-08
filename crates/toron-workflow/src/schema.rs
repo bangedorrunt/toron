@@ -220,6 +220,50 @@ pub enum Action {
     RequestApproval { message: String },
     /// Wait (in-process cap 270s per Buzz; Resonate unbounded in bd-oge).
     Delay { secs: u64 },
+    /// Retry a sub-step with max attempts + backoff (ADR-0005 Spec 4).
+    Retry {
+        #[serde(default = "default_max_attempts")]
+        max_attempts: u32,
+        #[serde(default)]
+        backoff_secs: u64,
+        step: Box<Step>,
+    },
+    /// Branch: evaluate a guard; run the `then` or `else` step list
+    /// (ADR-0005 Spec 4). The guard is `if:` (renamed from `if_guard` to
+    /// avoid the step-level `guard` field collision under `#[serde(flatten)]`).
+    Branch {
+        #[serde(rename = "if")]
+        if_guard: String,
+        then: Vec<Step>,
+        #[serde(default, rename = "else")]
+        else_steps: Vec<Step>,
+    },
+    /// Iterate over a list value (`over` = template ref to a list); one
+    /// sub-run per item; outputs collected under `steps.<name>` (ADR-0005
+    /// Spec 4).
+    Foreach {
+        over: String,
+        each: Box<Step>,
+    },
+    /// Fan out `each` across a crew role (`over: "@crew.r"`) or N elastic
+    /// copies (`over: <N>`); collected into a list under `steps.<name>`
+    /// (ADR-0005 Spec 4c).
+    Parallel {
+        over: String,
+        each: Box<Step>,
+    },
+    /// Invoke another workflow as a sub-run; outputs under `steps.<name>`
+    /// (ADR-0005 Spec 2; idempotent on sub-run-id).
+    CallWorkflow {
+        workflow: String,
+        #[serde(default)]
+        inputs: serde_json::Value,
+    },
+}
+
+/// Default retry attempts (used by `Action::Retry` serde default).
+fn default_max_attempts() -> u32 {
+    3
 }
 
 impl Action {
@@ -233,6 +277,11 @@ impl Action {
             Self::CallWebhook { .. } => "call_webhook",
             Self::RequestApproval { .. } => "request_approval",
             Self::Delay { .. } => "delay",
+            Self::Retry { .. } => "retry",
+            Self::Branch { .. } => "branch",
+            Self::Foreach { .. } => "foreach",
+            Self::Parallel { .. } => "parallel",
+            Self::CallWorkflow { .. } => "call_workflow",
         }
     }
 }
@@ -269,6 +318,16 @@ pub const ACTION_TYPES: [&str; 7] = [
     "call_webhook",
     "request_approval",
     "delay",
+];
+
+/// The P5.3 control-flow action types (ADR-0005 Spec 4) added on top of the
+/// original 7.
+pub const CONTROL_FLOW_ACTION_TYPES: [&str; 5] = [
+    "retry",
+    "branch",
+    "foreach",
+    "parallel",
+    "call_workflow",
 ];
 
 /// Template-payload access for `{{trigger.<field>}}` / `{{steps.<name>}}`.
@@ -404,6 +463,41 @@ steps:
         assert!(matches!(
             step("action: delay\nsecs: 5"),
             Action::Delay { .. }
+        ));
+    }
+
+    /// P5.3: the five control-flow actions parse (ADR-0005 Spec 4).
+    #[test]
+    fn parse_control_flow_actions() {
+        let step = |action_yaml: &str| {
+            let indented = action_yaml.replace('\n', "\n    ");
+            parse_workflow(&format!(
+                "name: t\ntrigger:\n  type: webhook\nsteps:\n  - {indented}"
+            ))
+            .expect("parse")
+            .steps
+            .remove(0)
+            .action
+        };
+        assert!(matches!(
+            step("action: retry\nmax_attempts: 3\nstep:\n  action: send_dm\n  to: a\n  body: b"),
+            Action::Retry { .. }
+        ));
+        assert!(matches!(
+            step("action: branch\nif: \"true\"\nthen:\n  - action: send_dm\n    to: a\n    body: b"),
+            Action::Branch { .. }
+        ));
+        assert!(matches!(
+            step("action: foreach\nover: \"[1]\"\neach:\n  action: send_dm\n  to: a\n  body: b"),
+            Action::Foreach { .. }
+        ));
+        assert!(matches!(
+            step("action: parallel\nover: \"2\"\neach:\n  action: send_dm\n  to: a\n  body: b"),
+            Action::Parallel { .. }
+        ));
+        assert!(matches!(
+            step("action: call_workflow\nworkflow: triage\ninputs: {}"),
+            Action::CallWorkflow { .. }
         ));
     }
 
