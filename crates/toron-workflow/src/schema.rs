@@ -384,6 +384,24 @@ pub enum Action {
         #[serde(default)]
         inputs: serde_json::Value,
     },
+    /// Spawn an agent and optionally await its job result (ADR-0005 Spec 4a).
+    /// The profile is resolved via the injected `ProfileResolver` DI seam; the
+    /// embedding emits kind-43001 carrying the promise_id in its spec. With
+    /// `await: true` the run SUSPENDS on the job's terminal (43004/43006);
+    /// `no_claim_timeout` aborts an unclaimed job (a FAILURE, not a decision).
+    Spawn {
+        /// Profile name (`@housekeeper`) to spawn.
+        profile: String,
+        /// Optional sub-workflow the spawned agent runs.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        workflow: Option<String>,
+        /// `await: true` → suspend until the job's terminal event.
+        #[serde(default, rename = "await")]
+        await_: bool,
+        /// Abort an unclaimed spawn-await after N seconds (default 600).
+        #[serde(default)]
+        no_claim_timeout: u64,
+    },
 }
 
 /// Default retry attempts (used by `Action::Retry` serde default).
@@ -407,6 +425,7 @@ impl Action {
             Self::Foreach { .. } => "foreach",
             Self::Parallel { .. } => "parallel",
             Self::CallWorkflow { .. } => "call_workflow",
+            Self::Spawn { .. } => "spawn",
         }
     }
 }
@@ -623,6 +642,31 @@ steps:
         assert!(matches!(
             step("action: call_workflow\nworkflow: triage\ninputs: {}"),
             Action::CallWorkflow { .. }
+        ));
+    }
+
+    /// P4.2 (ADR-0005 Spec 4a): the `spawn` action parses with await +
+    /// no_claim_timeout.
+    #[test]
+    fn parse_spawn_action() {
+        let step = |action_yaml: &str| {
+            let indented = action_yaml.replace('\n', "\n    ");
+            parse_workflow(&format!(
+                "name: t\ntrigger:\n  type: webhook\nsteps:\n  - {indented}"
+            ))
+            .expect("parse")
+            .steps
+            .remove(0)
+            .action
+        };
+        assert!(matches!(
+            step("action: spawn\nprofile: \"@housekeeper\"\nworkflow: docker-upgrade\nawait: true\nno_claim_timeout: 600"),
+            Action::Spawn { .. }
+        ));
+        // Bare spawn (no await) parses with defaults.
+        assert!(matches!(
+            step("action: spawn\nprofile: \"@scout\""),
+            Action::Spawn { .. }
         ));
     }
 
