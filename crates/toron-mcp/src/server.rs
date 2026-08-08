@@ -248,7 +248,13 @@ pub async fn demo_mailbox() -> anyhow::Result<Mailbox> {
     toron_core::index::schema::migrate(&pool).await?;
     let bus = toron_core::bus::InProcessBus::open(pool.clone(), Default::default()).await?;
     let data_dir = std::env::temp_dir().join("toron-mcp-demo");
-    Ok(Mailbox::new(Arc::new(bus), data_dir, operator_keys()?).with_index_pool(pool))
+    let mailbox = Mailbox::new(Arc::new(bus), data_dir, operator_keys()?).with_index_pool(pool);
+    // ADR-0004 inbound unwrap loop (bd-pkc): make the G14 contact-policy gate,
+    // the operator Overseer bypass, and the idempotent projection LIVE in the
+    // daemon. Agent keys are created on-disk at register/create_agent_identity,
+    // so the loop discovers them at runtime and rebuilds on change.
+    mailbox.spawn_unwrap_loop();
+    Ok(mailbox)
 }
 
 /// Load the operator key for the MCP server from env, if configured.

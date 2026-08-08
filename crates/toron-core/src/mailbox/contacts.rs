@@ -377,27 +377,40 @@ impl BusPolicySource {
     /// Load the policy snapshot for `npub` from the mailbox (kind-30014 on the
     /// bus + approved AgentLinks in the index).
     pub async fn load(mailbox: &Mailbox, npub: &PublicKey) -> Self {
+        Self::load_many(mailbox, &[npub]).await
+    }
+
+    /// Load the policy snapshot for **multiple** recipients in one pass (the
+    /// daemon inbound unwrap loop serves every local agent key with a single
+    /// [`UnwrapPipeline`]). `load` is a specialization for one npub.
+    pub async fn load_many(mailbox: &Mailbox, npubs: &[&PublicKey]) -> Self {
         let source = Self::default();
-        let project = mailbox.project_for_npub(npub).await;
-        if !project.is_empty() {
-            let policy = mailbox.contact_policy_for(&project, npub).await;
-            source.policies.write().insert(npub.to_hex(), policy);
+        // Per-npub policy from kind-30014 on the bus.
+        for npub in npubs {
+            let project = mailbox.project_for_npub(npub).await;
+            if !project.is_empty() {
+                let policy = mailbox.contact_policy_for(&project, npub).await;
+                source.policies.write().insert(npub.to_hex(), policy);
+            }
         }
-        // Approved links touching npub.
+        // Approved links touching any of the recipients (one query per npub,
+        // unioned into the shared approved set).
         if let Some(pool) = mailbox.index_pool() {
-            let rows = sqlx::query(
-                "SELECT from_pubkey, to_pubkey FROM contacts \
-                 WHERE status = 'approved' AND (from_pubkey = ?1 OR to_pubkey = ?1)",
-            )
-            .bind(npub.to_hex())
-            .fetch_all(pool)
-            .await;
-            if let Ok(rows) = rows {
-                let mut approved = source.approved.write();
-                for row in rows {
-                    let a: String = row.get("from_pubkey");
-                    let b: String = row.get("to_pubkey");
-                    approved.insert((a.clone(), b.clone()));
+            for npub in npubs {
+                let rows = sqlx::query(
+                    "SELECT from_pubkey, to_pubkey FROM contacts \
+                     WHERE status = 'approved' AND (from_pubkey = ?1 OR to_pubkey = ?1)",
+                )
+                .bind(npub.to_hex())
+                .fetch_all(pool)
+                .await;
+                if let Ok(rows) = rows {
+                    let mut approved = source.approved.write();
+                    for row in rows {
+                        let a: String = row.get("from_pubkey");
+                        let b: String = row.get("to_pubkey");
+                        approved.insert((a.clone(), b.clone()));
+                    }
                 }
             }
         }
