@@ -481,10 +481,16 @@ impl ProjectionSink for SqliteProjectionSink {
             .iter()
             .any(|t| t.as_slice().first().map(|s| s.as_str()) == Some("ack-required"));
         // Prefer the literal `thread` tag (free-form AM-style ids); fall
-        // back to the NIP-10 `e` root tag (event-id threads).
-        let thread_id = tag_text(&mail.rumor, "thread")
-            .or_else(|| tag_text(&mail.rumor, "e"))
-            .map(|s| s.to_string());
+        // back to the NIP-10 `e` root tag (event-id threads); a HEAD message
+        // (no thread refs) is its own thread — self-thread with its rumor id
+        // so `summarize_thread(head_id)` finds it (AM parity: every message
+        // belongs to a thread, the head IS its own).
+        let thread_id = Some(
+            tag_text(&mail.rumor, "thread")
+                .or_else(|| tag_text(&mail.rumor, "e"))
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| id.clone()),
+        );
 
         // The wrap hides the project (metadata hiding) — resolve it via the
         // recipient key from the agents-table map built at pipeline time.

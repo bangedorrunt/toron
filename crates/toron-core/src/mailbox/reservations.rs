@@ -37,7 +37,7 @@ use super::collect_replay;
 pub const STALE_AFTER_SECS: u64 = 30 * 60;
 
 /// A resolved active reservation (projection view).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Reservation {
     /// The reservation id (the kind-30031 event id of the current lease).
     pub id: String,
@@ -56,13 +56,13 @@ pub struct Reservation {
 }
 
 /// Result of `file_reservation_paths` (parity shape).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AcquireResult {
     pub granted: Vec<GrantedReservation>,
     pub conflicts: Vec<PathConflict>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct GrantedReservation {
     pub id: String,
     pub path_pattern: String,
@@ -71,14 +71,14 @@ pub struct GrantedReservation {
     pub expires_ts_us: Option<i64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PathConflict {
     pub path: String,
     pub holders: Vec<String>,
 }
 
 /// Result of `check_file_reservation_conflicts` (parity shape).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ConflictReport {
     pub conflict_free: bool,
     pub conflicts: Vec<PathConflict>,
@@ -88,14 +88,14 @@ pub struct ConflictReport {
 }
 
 /// Result of `renew_file_reservations`.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RenewResult {
     pub renewed: usize,
     pub reservations: Vec<GrantedReservation>,
 }
 
 /// Result of `release_file_reservations`.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ReleaseResult {
     pub released: usize,
 }

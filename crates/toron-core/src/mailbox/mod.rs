@@ -45,6 +45,7 @@ pub use guard::{
     uninstall_precommit_guard,
 };
 pub use identity::{ListAgentsOptions, RegisteredAgent, WhoIs};
+pub use crate::nostr::identity::AgentProfile;
 pub use infra::{HealthComponent, HealthReport, ProjectState};
 pub use macros::{
     ContactHandshakeResult, PrepareThreadResult, ReservationCycleResult, StartSessionResult,

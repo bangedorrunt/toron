@@ -168,6 +168,11 @@ impl Mailbox {
         };
 
         let visible = build_visible_rumor(&sender_keys.public_key(), args, &resolved);
+        // Canonical id = the RUMOR id (G7 / D1), the SAME id the projection
+        // shows in inbox/search rows — never the transport-internal wrap id.
+        // Send → inbox → ack/summarize round-trips must work on one id world
+        // (ADR-0007 D8.2 per-backend usability).
+        let visible_id = visible.clone().id().to_hex();
         let mut deliveries: Vec<Delivery> = Vec::new();
 
         // to+cc: one gift wrap per recipient, same visible rumor.
@@ -183,7 +188,7 @@ impl Mailbox {
                     project: args.project_slug.clone(),
                     payload: DeliveryPayload {
                         recipient: r.name.clone(),
-                        event_id: wrap.id.to_hex(),
+                        event_id: visible_id.clone(),
                     },
                 });
             }
@@ -192,6 +197,7 @@ impl Mailbox {
         // bcc: variant rumor per bcc listing to+cc+that bcc only.
         for r in resolved.iter().filter(|r| r.role == RecipientRole::Bcc) {
             let variant = build_bcc_rumor(&sender_keys.public_key(), args, &resolved, r);
+            let variant_id = variant.clone().id().to_hex();
             let wrap = gift_wrap::gift_wrap(&sender_keys, &r.npub, variant)
                 .await
                 .map_err(|e| {
@@ -203,7 +209,7 @@ impl Mailbox {
                     project: args.project_slug.clone(),
                     payload: DeliveryPayload {
                         recipient: r.name.clone(),
-                        event_id: wrap.id.to_hex(),
+                        event_id: variant_id,
                     },
                 });
             }

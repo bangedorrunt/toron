@@ -41,7 +41,7 @@ pub struct SearchMessages {
 }
 
 /// `summarize_thread` result (deterministic digest; LLM mode optional no-op).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ThreadSummary {
     pub thread_id: String,
     pub participants: Vec<String>,

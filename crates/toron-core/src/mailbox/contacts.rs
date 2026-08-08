@@ -29,7 +29,7 @@ use crate::nostr::kinds::{AGENT_PROFILE, CONTACT_POLICY, toron_kind};
 use super::Mailbox;
 use super::collect_replay;
 /// Status of an AgentLink.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum LinkStatus {
     Pending,
     Approved,
@@ -55,7 +55,7 @@ impl LinkStatus {
 }
 
 /// A contact link (AgentLink) between two agents.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ContactLink {
     pub project_slug: String,
     pub from_name: String,

@@ -26,7 +26,7 @@ use super::Mailbox;
 use super::collect_replay;
 
 /// `ensure_product` / `products_link` result.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ProductInfo {
     pub product_key: String,
     pub name: String,
