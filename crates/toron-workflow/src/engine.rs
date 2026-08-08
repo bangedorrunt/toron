@@ -77,7 +77,11 @@ pub struct RunInput {
 
 /// The shared action-execution surface (the Mailbox). Run by the workflow
 /// function via a Resonate dependency (consistency rule).
-pub type ActionRunner = Arc<dyn Fn(&Action) -> anyhow::Result<()> + Send + Sync>;
+///
+/// Every action returns a [`serde_json::Value`] (ADR-0005 Spec 0): the value
+/// flows into `steps.<name>` for downstream templates/guards. `Null` is a
+/// valid "no output" action.
+pub type ActionRunner = Arc<dyn Fn(&Action) -> anyhow::Result<serde_json::Value> + Send + Sync>;
 
 /// Optional side-channel for approval promise-ids (embedding/test hook). When
 /// a run parks on `request_approval`, its promise_id is pushed here so the
@@ -197,7 +201,8 @@ impl WorkflowEngine {
 ///
 /// Action failures are captured per-step (`{"ok":false,"error":…}`) rather
 /// than aborting the run — the run completes so durable state stays
-/// consistent; the error is observable in the kind-46012 output.
+/// consistent; the error is observable in the kind-46012 output. (ADR-0005
+/// Spec 0 adds an opt-in `on_error: fail_run` in a later phase.)
 #[resonate_sdk::function]
 pub async fn run_workflow(
     ctx: &Context,
@@ -208,11 +213,12 @@ pub async fn run_workflow(
     let mut step_outputs: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
 
     for step in &workflow.steps {
-        match &step.action {
+        let value = match &step.action {
             Action::Delay { secs } => {
                 // Durable sleep — UNBOUNDED (the Buzz 270s cap is gone;
                 // hours/days/weeks for SLA timers, cron-like cadence).
                 ctx.sleep(Duration::from_secs(*secs)).await?;
+                serde_json::Value::Null
             }
             Action::RequestApproval { message } => {
                 // Create the promise; its id is the approval key.
@@ -247,7 +253,9 @@ pub async fn run_workflow(
                     Ok(d) => d,
                     Err(e) => Decision::rejected(format!("rejected: {e}")),
                 };
-                step_outputs.insert("decision".into(), serde_json::to_value(&decision)?);
+                let decision = serde_json::to_value(&decision)?;
+                step_outputs.insert("decision".into(), decision.clone());
+                decision
             }
             Action::SendMessage { .. }
             | Action::SendDm { .. }
@@ -255,20 +263,153 @@ pub async fn run_workflow(
             | Action::DispatchJob { .. }
             | Action::CallWebhook { .. } => {
                 // Consistency rule: actions go through the shared Mailbox
-                // surface (the injected action runner). Failures are recorded
-                // per-step, not fatal to the run.
-                let outcome = match (runner)(&step.action) {
-                    Ok(()) => serde_json::json!({ "ok": true }),
-                    Err(e) => serde_json::json!({ "ok": false, "error": e.to_string() }),
+                // surface (the injected action runner). Templates are
+                // substituted first so the runner sees rendered values. A
+                // render failure (unserializable action) is a per-step error,
+                // not a run failure.
+                let value = match render_action(&step.action, &input.trigger, &step_outputs) {
+                    Ok(action) => match (runner)(&action) {
+                        Ok(value) => value,
+                        Err(e) => serde_json::json!({ "ok": false, "error": e.to_string() }),
+                    },
+                    Err(e) => serde_json::json!({ "ok": false, "error": format!("render: {e}") }),
                 };
-                if let Some(name) = &step.name {
-                    step_outputs.insert(name.clone(), outcome);
-                }
+                value
             }
+        };
+        if let Some(name) = &step.name {
+            step_outputs.insert(name.clone(), value);
         }
     }
 
     Ok(serde_json::Value::Object(step_outputs))
+}
+
+/// Substitute `{{trigger.<path>}}` / `{{steps.<name>.<path>}}` templates in an
+/// action's string fields before the runner sees them (ADR-0005 Spec 0:
+/// value-returning actions flow into `steps.<name>` for downstream templates).
+///
+/// Unresolvable tokens stay verbatim (backward-compatible — a body that
+/// references a step that didn't produce output keeps its literal text).
+fn render_action(
+    action: &Action,
+    trigger: &serde_json::Value,
+    step_outputs: &serde_json::Map<String, serde_json::Value>,
+) -> anyhow::Result<Action> {
+    let mut value = serde_json::to_value(action)?;
+    render_json_value(&mut value, trigger, step_outputs);
+    serde_json::from_value(value)
+        .map_err(|e| anyhow::anyhow!("re-deserialize rendered action: {e}"))
+}
+
+/// Recursively render template tokens in every string leaf of a JSON value.
+fn render_json_value(
+    value: &mut serde_json::Value,
+    trigger: &serde_json::Value,
+    step_outputs: &serde_json::Map<String, serde_json::Value>,
+) {
+    match value {
+        serde_json::Value::String(s) => {
+            *s = render_template(s, trigger, step_outputs);
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                render_json_value(item, trigger, step_outputs);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for item in map.values_mut() {
+                render_json_value(item, trigger, step_outputs);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Replace every `{{...}}` token in `s` with the value it names
+/// (`steps.<name>.<path>` or `trigger.<path>`), rendered as JSON text.
+/// Unresolvable tokens are left verbatim.
+fn render_template(
+    s: &str,
+    trigger: &serde_json::Value,
+    step_outputs: &serde_json::Map<String, serde_json::Value>,
+) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(start) = rest.find("{{") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        match after.find("}}") {
+            Some(end) => {
+                let token = &after[..end];
+                if let Some(replaced) = resolve_template(token.trim(), trigger, step_outputs) {
+                    out.push_str(&replaced);
+                } else {
+                    // Unresolvable — keep the literal token.
+                    out.push_str(&format!("{{{{{token}}}}}"));
+                }
+                rest = &after[end + 2..];
+            }
+            None => {
+                out.push_str(&rest[start..]);
+                break;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Resolve one template token to a rendered string, or `None` when the path
+/// does not resolve (caller keeps the literal).
+fn resolve_template(
+    token: &str,
+    trigger: &serde_json::Value,
+    step_outputs: &serde_json::Map<String, serde_json::Value>,
+) -> Option<String> {
+    let (root, path) = token.split_once('.')?;
+    let value = match root {
+        "trigger" => trigger,
+        "steps" => return resolve_steps(&path, step_outputs),
+        _ => return None,
+    };
+    descend(value, path.split('.')).map(|v| render_scalar(v))
+}
+
+/// Resolve `steps.<name>.<path>…` (the whole object when no `<path>`).
+fn resolve_steps(
+    path: &str,
+    step_outputs: &serde_json::Map<String, serde_json::Value>,
+) -> Option<String> {
+    let (name, rest) = match path.split_once('.') {
+        Some((name, rest)) => (name, rest),
+        None => (path, ""),
+    };
+    let value = step_outputs.get(name)?;
+    if rest.is_empty() {
+        return Some(render_scalar(value));
+    }
+    descend(value, rest.split('.')).map(render_scalar)
+}
+
+/// Walk a dotted path through a JSON value.
+fn descend<'a>(
+    mut value: &'a serde_json::Value,
+    mut path: std::str::Split<'_, char>,
+) -> Option<&'a serde_json::Value> {
+    while let Some(part) = path.next() {
+        value = value.get(part)?;
+    }
+    Some(value)
+}
+
+/// Render a resolved value as template text: scalars verbatim, structures as
+/// compact JSON.
+fn render_scalar(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -315,7 +456,7 @@ steps:
     }
 
     fn noop_runner() -> ActionRunner {
-        Arc::new(|_a: &Action| Ok(()))
+        Arc::new(|_a: &Action| Ok(serde_json::Value::Null))
     }
 
     /// Poll the approval side-channel for a parked run's promise_id.
@@ -414,5 +555,77 @@ steps:
             .await
             .expect("delay run completes");
         assert!(output.is_object(), "delay run returns object output");
+    }
+
+    /// A workflow whose first step's action returns `{"n":42}`; the second
+    /// step's action references `{{steps.foo.n}}` in a body field. The engine
+    /// must (a) populate `steps.<name>` from the runner's return and (b)
+    /// substitute it into the downstream step's templates before the runner
+    /// sees them.
+    #[tokio::test]
+    async fn value_returning_action_flows_into_downstream_template() {
+        use std::sync::Mutex as StdMutex;
+        let seen: Arc<StdMutex<Vec<Action>>> = Arc::new(StdMutex::new(Vec::new()));
+        let seen_clone = seen.clone();
+        let runner: ActionRunner = Arc::new(move |a: &Action| {
+            // Record what the runner received (post-substitution).
+            seen_clone.lock().unwrap().push(a.clone());
+            match a {
+                Action::SendMessage { .. } => Ok(serde_json::json!({ "ok": true })),
+                Action::SendDm { .. } => Ok(serde_json::json!({ "n": 42 })),
+                other => Ok(serde_json::json!({ "action": other.type_name() })),
+            }
+        });
+        let engine = WorkflowEngine::local(runner.clone()).expect("engine");
+
+        let wf = parse_workflow(
+            r##"
+name: value-flow
+trigger:
+  type: webhook
+steps:
+  - name: foo
+    action: send_dm
+    to: "pi"
+    body: "compute"
+  - name: bar
+    action: send_message
+    to: ["ops"]
+    subject: "result"
+    body: "n={{steps.foo.n}}"
+"##,
+        )
+        .expect("parse value-flow workflow");
+        let input = RunInput {
+            workflow: wf,
+            trigger: serde_json::json!({}),
+        };
+        let output = engine
+            .run("wf-value-flow-1", input)
+            .await
+            .expect("run completes");
+
+        // (a) The runner's return for step `foo` populated `steps.foo`.
+        assert_eq!(
+            output["foo"]["n"], 42,
+            "ActionRunner return must populate steps.foo: {output}"
+        );
+
+        // (b) The downstream step's `{{steps.foo.n}}` was substituted with the
+        //     value BEFORE the runner saw the action.
+        let seen_actions = seen.lock().unwrap();
+        let bar = seen_actions
+            .iter()
+            .find(|a| matches!(a, Action::SendMessage { .. }))
+            .expect("bar action reached the runner");
+        match bar {
+            Action::SendMessage { body, .. } => {
+                assert_eq!(
+                    body, "n=42",
+                    "downstream template must render steps.foo.n into the body"
+                );
+            }
+            _ => unreachable!(),
+        }
     }
 }
