@@ -265,11 +265,59 @@ impl Mailbox {
             messages
         };
 
-        let messages = match args.limit {
+        // Parity: AM `fetch_inbox` names the sender (the display name, not the
+        // raw pubkey). toron's gift-wrap unwrap yields only the sender npub;
+        // reverse-resolve npub→name from the agents index so the inbox is
+        // human-readable without a per-message `whois`. Falls back to the hex
+        // npub when no pool is attached or the sender never registered locally.
+        let mut messages = match args.limit {
             Some(n) => messages.into_iter().take(n).collect(),
             None => messages,
         };
+        self.resolve_sender_names(&mut messages).await;
         Ok(messages)
+    }
+
+    /// Best-effort batch npub→name resolution for inbox entries. Mutates
+    /// `sender` in place; unknown pubkeys keep their hex value. One query per
+    /// fetch (parameterized over the unique-sender set).
+    async fn resolve_sender_names(&self, messages: &mut [InboxMessage]) {
+        let Some(pool) = self.index_pool.as_ref() else {
+            return; // no index — leave hex npubs (downgrade, not a failure)
+        };
+        let mut pubkeys: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for m in messages.iter() {
+            if m.sender.chars().all(|c| c.is_ascii_hexdigit()) && !m.sender.is_empty() {
+                pubkeys.insert(m.sender.clone());
+            }
+        }
+        if pubkeys.is_empty() {
+            return;
+        }
+        // Build `WHERE pubkey IN (?, ?, ...)` with one placeholder per unique
+        // sender (sqlx has no first-class `IN Vec` on the macro-free path).
+        let placeholders = std::iter::repeat_n("?", pubkeys.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT pubkey, name FROM agents WHERE pubkey IN ({placeholders}) GROUP BY pubkey"
+        );
+        let mut q = sqlx::query_as::<_, (String, String)>(&sql);
+        for pk in &pubkeys {
+            q = q.bind(pk);
+        }
+        let map: std::collections::HashMap<String, String> = match q.fetch_all(pool).await {
+            Ok(rows) => rows.into_iter().collect(),
+            Err(e) => {
+                tracing::debug!("sender-name resolve failed (degrade to hex): {e}");
+                return;
+            }
+        };
+        for m in messages.iter_mut() {
+            if let Some(name) = map.get(&m.sender) {
+                m.sender = name.clone();
+            }
+        }
     }
 
     /// `acknowledge_message`: private NIP-17 kind-14 to the original sender
@@ -526,10 +574,18 @@ fn add_message_tags(tags: &mut Vec<Tag>, args: &SendMessage) {
             tags.push(t);
         }
     }
-    if let Some(thread) = &args.thread_id
-        && let Ok(root) = EventId::from_hex(thread)
-    {
-        tags.push(Tag::event(root)); // NIP-10 e = root, reply role
+    if let Some(thread) = &args.thread_id {
+        // Free-form thread ids ("br-123", "deploy-xyz") are the AM norm — they
+        // are NOT valid NIP-10 event ids. Emit the literal id as a `thread`
+        // tag so it survives the round-trip (inbox_from + the unwrap
+        // projection both read it back). When the id IS a hex event id, also
+        // emit the NIP-10 `e` root tag so strict reply-chain clients resolve.
+        if let Ok(t) = Tag::parse(["thread", thread]) {
+            tags.push(t);
+        }
+        if let Ok(root) = EventId::from_hex(thread) {
+            tags.push(Tag::event(root)); // NIP-10 e = root, reply role
+        }
     }
 }
 
@@ -541,14 +597,18 @@ fn inbox_from(mail: UnwrappedMail) -> InboxMessage {
         .unwrap_or("normal")
         .to_string();
     let ack_required = tag_has_flag(tags, "ack-required");
-    let thread_id = tags
-        .iter()
-        .find_map(|t| {
-            let parts = t.as_slice();
-            (parts.first().map(|s| s.as_str()) == Some("e"))
-                .then(|| parts.get(1).map(|s| s.to_string()))
-        })
-        .flatten();
+    // thread_id: prefer the literal `thread` tag (free-form AM-style ids);
+    // fall back to the NIP-10 `e` root tag (event-id threads).
+    let thread_id = tag_value(tags, "thread")
+        .map(|s| s.to_string())
+        .or_else(|| {
+            tags.iter().find_map(|t| {
+                let parts = t.as_slice();
+                (parts.first().map(|s| s.as_str()) == Some("e"))
+                    .then(|| parts.get(1).map(|s| s.to_string()))
+                    .flatten()
+            })
+        });
     InboxMessage {
         id: mail.rumor_id.to_hex(),
         sender: mail.sender.to_hex(),

@@ -243,11 +243,29 @@ impl ServerHandler for ToronServer {
 pub async fn demo_mailbox() -> anyhow::Result<Mailbox> {
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let db = std::env::temp_dir().join(format!("toron-mcp-{}-{}.sqlite", std::process::id(), seq));
+    let stamp = format!("{}-{}", std::process::id(), seq);
+    let db = std::env::temp_dir().join(format!("toron-mcp-{stamp}.sqlite"));
     let pool = toron_core::index::schema::connect(db.to_str().unwrap()).await?;
     toron_core::index::schema::migrate(&pool).await?;
     let bus = toron_core::bus::InProcessBus::open(pool.clone(), Default::default()).await?;
-    let data_dir = std::env::temp_dir().join("toron-mcp-demo");
+    // Per-invocation data_dir by default: the unwrap loop scans this dir for
+    // agent keys and runs the argon2 KDF (~1s/key) on every rebuild. A fixed
+    // dir accumulates keys across runs until the loop stalls for minutes on
+    // dozens of keys. A unique dir isolates each daemon and bounds the
+    // rebuild cost to just that daemon's own agents.
+    //
+    // `TORON_MCP_DATA_DIR` overrides: tests that need a data_dir to persist
+    // ACROSS processes (cli_robot registers in-process then shells out to the
+    // built binary, which constructs its own demo_mailbox) set it to a shared
+    // per-run dir so both sides see the same agent keys.
+    let data_dir = match std::env::var_os("TORON_MCP_DATA_DIR") {
+        Some(dir) => {
+            let d = std::path::PathBuf::from(dir);
+            std::fs::create_dir_all(&d)?;
+            d
+        }
+        None => std::env::temp_dir().join(format!("toron-mcp-demo-{stamp}")),
+    };
     let mailbox = Mailbox::new(Arc::new(bus), data_dir, operator_keys()?).with_index_pool(pool);
     // ADR-0004 inbound unwrap loop (bd-pkc): make the G14 contact-policy gate,
     // the operator Overseer bypass, and the idempotent projection LIVE in the

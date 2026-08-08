@@ -384,6 +384,11 @@ pub struct SqliteProjectionSink {
     /// registration stores the VERBATIM slug, so absolute and relative slugs
     /// both round-trip exactly).
     projects: std::collections::HashMap<String, String>,
+    /// npub (hex) → display name. AM-parity: `messages.sender` should read as
+    /// the sender's NAME, not the raw pubkey (the wrap only yields the pubkey).
+    /// Populated from the `agents` table at build time; hex fallback when the
+    /// sender never registered locally (cross-project / external senders).
+    names: std::collections::HashMap<String, String>,
 }
 
 impl SqliteProjectionSink {
@@ -393,12 +398,21 @@ impl SqliteProjectionSink {
             pool,
             projected: Mutex::new(HashSet::new()),
             projects: std::collections::HashMap::new(),
+            names: std::collections::HashMap::new(),
         }
     }
 
     /// Attach the recipient-npub → project-slug resolution map.
     pub fn with_projects(mut self, projects: std::collections::HashMap<String, String>) -> Self {
         self.projects = projects;
+        self
+    }
+
+    /// Attach the sender-npub → display-name resolution map (AM-parity
+    /// sender naming). Built alongside [`Self::with_projects`] from the same
+    /// `agents` table read.
+    pub fn with_names(mut self, names: std::collections::HashMap<String, String>) -> Self {
+        self.names = names;
         self
     }
 }
@@ -429,7 +443,11 @@ impl ProjectionSink for SqliteProjectionSink {
             .tags
             .iter()
             .any(|t| t.as_slice().first().map(|s| s.as_str()) == Some("ack-required"));
-        let thread_id = tag_text(&mail.rumor, "e").map(|s| s.to_string());
+        // Prefer the literal `thread` tag (free-form AM-style ids); fall
+        // back to the NIP-10 `e` root tag (event-id threads).
+        let thread_id = tag_text(&mail.rumor, "thread")
+            .or_else(|| tag_text(&mail.rumor, "e"))
+            .map(|s| s.to_string());
 
         // The wrap hides the project (metadata hiding) — resolve it via the
         // recipient key from the agents-table map built at pipeline time.
@@ -438,6 +456,15 @@ impl ProjectionSink for SqliteProjectionSink {
             .get(&mail.recipient.to_hex())
             .cloned()
             .unwrap_or_default();
+        // AM-parity sender naming: resolve the sender pubkey → display name
+        // (hex fallback for unregistered/external senders). `sender_pubkey`
+        // stays the raw hex so sender-filtered search keeps working.
+        let sender_pubkey = mail.sender.to_hex();
+        let sender_name = self
+            .names
+            .get(&sender_pubkey)
+            .cloned()
+            .unwrap_or_else(|| sender_pubkey.clone());
         let inserted = sqlx::query(
             "INSERT INTO messages \
              (event_id, project_slug, sender, sender_pubkey, subject, body, \
@@ -447,8 +474,8 @@ impl ProjectionSink for SqliteProjectionSink {
         )
         .bind(&id)
         .bind(project_slug)
-        .bind(mail.sender.to_hex())
-        .bind(mail.sender.to_hex())
+        .bind(sender_name)
+        .bind(sender_pubkey)
         .bind(subject)
         .bind(mail.rumor.content.clone())
         .bind(importance)
