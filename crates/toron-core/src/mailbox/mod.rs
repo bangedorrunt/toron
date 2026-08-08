@@ -15,6 +15,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use nostr_sdk::nostr::{Event, Keys};
 
@@ -22,10 +23,11 @@ use crate::bus::{Bus, BusError, Filter, SubscriptionEvent};
 
 pub mod build_slots;
 pub mod contacts;
+pub mod error;
 pub mod guard;
+pub mod ids;
 pub mod identity;
 pub mod infra;
-pub mod invariants;
 pub mod macros;
 pub mod matrix;
 pub mod messaging;
@@ -33,6 +35,7 @@ pub mod metrics;
 pub mod product;
 pub mod reservations;
 pub mod search;
+pub mod surface;
 pub mod unwrap;
 
 pub use build_slots::AcquireBuildSlotResult;
@@ -74,6 +77,21 @@ pub struct Mailbox {
     agent_passphrase: Option<String>,
     receipt_cache: Arc<parking_lot::Mutex<HashMap<String, i64>>>,
     index_pool: Option<sqlx::SqlitePool>,
+    /// R2.0 (C2 / F2.KDF): decrypted agent keys cached by file CONTENT, so an
+    /// unwrap-pipeline rebuild re-runs the argon2 KDF ONLY for key files that
+    /// actually changed — never a full re-scan of every key (~1s/key at
+    /// log-n 16). Keyed by content string (cheap — ncryptsec files are ~300B).
+    key_cache: Arc<parking_lot::Mutex<HashMap<PathBuf, CachedAgentKey>>>,
+    /// Total argon2 KDF invocations this process has performed (test
+    /// observable; the many-keys gate asserts the warm-rebuild bound).
+    kdf_loads: Arc<AtomicU64>,
+}
+
+/// A decrypted agent key plus the exact ncryptsec content it was derived
+/// from. Cache hits compare content strings — unchanged files never re-KDF.
+struct CachedAgentKey {
+    content: String,
+    keys: Keys,
 }
 
 impl std::fmt::Debug for Mailbox {
@@ -98,6 +116,8 @@ impl Mailbox {
             agent_passphrase: None,
             receipt_cache: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             index_pool: None,
+            key_cache: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            kdf_loads: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -132,6 +152,34 @@ impl Mailbox {
     /// The operator key (if configured).
     pub fn operator(&self) -> Option<&Keys> {
         self.operator.as_ref()
+    }
+    /// Load a local agent key with the content-keyed KDF cache (R2.0 C2):
+    /// a rebuild only re-runs argon2 for key files whose CONTENT changed.
+    /// Cache hits are pure memory — the ~1s/key KDF never re-runs for
+    /// unchanged keys within this process.
+    fn cached_load_agent_key(&self, path: &std::path::Path) -> Option<Keys> {
+        let content = std::fs::read_to_string(path).ok()?;
+        if let Some(cached) = self.key_cache.lock().get(path) {
+            if cached.content == content {
+                return Some(cached.keys.clone());
+            }
+        }
+        let keys = crate::keys::decrypt(&content, self.agent_passphrase()).ok()?;
+        self.kdf_loads.fetch_add(1, Ordering::Relaxed);
+        self.key_cache.lock().insert(
+            path.to_path_buf(),
+            CachedAgentKey {
+                content,
+                keys: keys.clone(),
+            },
+        );
+        Some(keys)
+    }
+
+    /// Total argon2 KDF invocations this process has performed (the R2.0
+    /// many-keys gate asserts warm rebuilds stay O(new/changed keys)).
+    pub fn kdf_load_count(&self) -> u64 {
+        self.kdf_loads.load(Ordering::Relaxed)
     }
 }
 
@@ -245,6 +293,11 @@ impl Mailbox {
     /// skips projection until a pool is available). Called only when the
     /// agent-key signature changes, so the argon2 KDF (≈1s/key) runs at most
     /// once per agent registration — never per inbound wrap.
+    ///
+    /// **R2.0 bound (C2 / F2.KDF):** keys are loaded through the content-keyed
+    /// cache, so a rebuild re-derives ONLY the added/changed key files —
+    /// O(Δkeys) per rebuild, never O(N). Cold cost is N × per-key KDF
+    /// (~1s/key at log-n 16); warm rebuilds are pure file reads + cache hits.
     async fn build_unwrap_pipeline(&self) -> Option<UnwrapPipeline> {
         let paths = self.local_agent_key_paths();
         if paths.is_empty() {
@@ -253,7 +306,7 @@ impl Mailbox {
         let pool = self.index_pool.as_ref()?;
         let mut keys = Vec::with_capacity(paths.len());
         for p in &paths {
-            if let Some(k) = self.load_agent_key(p) {
+            if let Some(k) = self.cached_load_agent_key(p) {
                 keys.push(k);
             }
         }
@@ -454,6 +507,95 @@ mod tests {
         );
 
         handle.abort();
+        let _ = std::fs::remove_dir_all(&data_dir);
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// R2.0 (C2 / F2.KDF): the argon2 key-scan cost on unwrap-pipeline rebuild
+    /// is BOUNDED — cached unlocks keep warm rebuilds to exactly the keys
+    /// whose file CONTENT changed (never a full re-KDF of every key). Fixture
+    /// ≥50 keys; the KDF-call counter asserts the progressive bound.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unwrap_loop_kdf_cached_between_rebuilds_many_keys() {
+        use crate::nostr::gift_wrap::{build_rumor, gift_wrap};
+        use nostr_sdk::nostr::{Kind, Tag, Timestamp};
+
+        let (mailbox, db, data_dir) = loop_mailbox("kdf-bound").await;
+        let pass = "loop-test-pass";
+        let agent_dir = data_dir.join("proj").join("agents");
+
+        // Fixture: 50 agent keys on disk (TEST_LOG_N — ~ms each, CI-safe).
+        for i in 0..50usize {
+            let p = agent_dir.join(format!("agent-{i}")).join("key.ncryptsec");
+            crate::keys::write_encrypted_key(
+                &p,
+                &crate::keys::generate(),
+                pass,
+                crate::keys::TEST_LOG_N,
+            )
+            .expect("write key");
+        }
+
+        // Cold build: every key is unlocked exactly once.
+        let _cold = mailbox.build_unwrap_pipeline().await.expect("cold build");
+        assert_eq!(
+            mailbox.kdf_load_count(),
+            50,
+            "cold path unlocks every key exactly once"
+        );
+
+        // Warm rebuild after ONE new key: KDF runs only for the added key —
+        // the 50 cached unlocks are served from cache, never re-derived.
+        let new_keys = crate::keys::generate();
+        let p51 = agent_dir.join("agent-50").join("key.ncryptsec");
+        crate::keys::write_encrypted_key(&p51, &new_keys, pass, crate::keys::TEST_LOG_N)
+            .expect("write new key");
+        let warm = mailbox.build_unwrap_pipeline().await.expect("warm build");
+        assert_eq!(
+            mailbox.kdf_load_count(),
+            51,
+            "warm rebuild KDFs ONLY the added key (progressive bound)"
+        );
+
+        // No-op rebuild (same signature, same contents): zero KDF.
+        let _noop = mailbox.build_unwrap_pipeline().await.expect("no-op build");
+        assert_eq!(
+            mailbox.kdf_load_count(),
+            51,
+            "unchanged rebuild is cache-only, no KDF"
+        );
+
+        // A key whose CONTENT changed is re-KDF'd exactly once.
+        let p0 = agent_dir.join("agent-0").join("key.ncryptsec");
+        crate::keys::write_encrypted_key(&p0, &crate::keys::generate(), pass, crate::keys::TEST_LOG_N)
+            .expect("rewrite key");
+        let _changed = mailbox.build_unwrap_pipeline().await.expect("changed build");
+        assert_eq!(
+            mailbox.kdf_load_count(),
+            52,
+            "changed key re-KDFs exactly once"
+        );
+
+        // The newly added key is LIVE in the rebuilt pipeline (a wrap to it
+        // projects end-to-end, so the cache did not skip loading it).
+        let sender = crate::keys::generate();
+        let rumor = build_rumor(
+            sender.public_key(),
+            Timestamp::from(1_700_000_000u64),
+            Kind::PrivateDirectMessage,
+            vec![Tag::parse(["p", &new_keys.public_key().to_hex()]).expect("p")],
+            "hello",
+        );
+        let wrap = gift_wrap(&sender, &new_keys.public_key(), rumor)
+            .await
+            .expect("wrap");
+        let outcome = warm.project(&wrap).await;
+        assert_eq!(
+            outcome,
+            ProjectOutcome::Projected,
+            "added key participates in unwrap after cached rebuild"
+        );
+
         let _ = std::fs::remove_dir_all(&data_dir);
         let _ = std::fs::remove_file(&db);
     }

@@ -254,6 +254,12 @@ pub async fn demo_mailbox() -> anyhow::Result<Mailbox> {
     // dozens of keys. A unique dir isolates each daemon and bounds the
     // rebuild cost to just that daemon's own agents.
     //
+    // R2.0 (C2 / F2.KDF): the pipeline rebuild is additionally bounded
+    // in-process by Mailbox's content-keyed unlock cache — warm rebuilds
+    // re-derive ONLY added/changed key files, never a full re-KDF of every
+    // key (cold = N × ~1s/key; warm = O(Δkeys); gate test
+    // `unwrap_loop_kdf_cached_between_rebuilds_many_keys`, 50-key fixture).
+    //
     // `TORON_MCP_DATA_DIR` overrides: tests that need a data_dir to persist
     // ACROSS processes (cli_robot registers in-process then shells out to the
     // built binary, which constructs its own demo_mailbox) set it to a shared
