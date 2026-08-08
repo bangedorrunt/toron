@@ -22,6 +22,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **P4.2 spawn-await CLOSED (ADR-0005 Spec 4a, `bd-p4-spawn-await-pxw6`)** —
+  spawn action + promise↔job binding + no_claim_timeout landed and closed by
+  BlueOak; approval/spawn sink TypeId fix (see Fixed) shipped in the same bead.
+- **P4.7 P4 behavior-test HARNESS (ADR-0005, `bd-p4-tests-4cl7`, toron-e2e)** —
+  shared cron fixtures (`tests/common/mod.rs`: `boot_server`/`wait_ready`,
+  `cron_registry`/`fixture_registration`, `housekeeper_workflow`,
+  `noop_runner`/`housekeeper_resolver`, `next_tick`) + scenario skeletons for
+  the remaining FW rows — `sc22_cron_failure_bead` (P4.4: FAILED run → br bead
+  with full failure bundle, human-in-loop when no fixer), `sc23_cron_escalate`
+  (P4.4: repeat_failure ≥ threshold → kind-14 DM, importance=high/ack_required),
+  `sc24_cron_catchup` (P4.3: missed tick → `latest` catch-up, no burst). All
+  `#[ignore]`d until their P4.3/P4.4 dependencies land; the `p4` feature gate
+  (p4 = p5) added. `sc21_cron_durable_loop` (BlueOak) covers `cron_success` +
+  `cron_restart`. Run: `cargo test -p toron-e2e --features p4`.
 - **P4.7 P4 Behavior Test Matrix rows (ADR-0005, `bd-p4-tests-4cl7`, toron-e2e)**
   — SC rows landed: `sc19_spawn_await_resume` (spawn+await SUSPENDS, resumes on
   kind-43004 resolve, run completes with the job result) and

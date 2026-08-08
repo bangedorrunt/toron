@@ -30,7 +30,7 @@ epics close.
 | **P1** | Backend trait unification (ONE trait, call-site migration) | **Complete** (bd-p1-* epics closed) |
 | **P2** | Profiles + built-in library (6 roles, 30013 content-map, `Profile::resolve`) | **Complete** (bd-p2-* epics closed) |
 | **P3** | Unified workflow engine (one vocab, one engine, stages, auto-crew, workflow CLI) | **Complete** (bd-p3-* epics closed) |
-| **P4** | Smart cron (self-reporting + defined fixer; durable-sleep manager) | **In progress** (P4.1 schedule-ext closed; P4.2 engine chain landed + approval regression fixed; P4.3/P4.4/P4.5 open; P4.6 CLI closed; P4.7 tests SC rows green, FW rows blocked) |
+| **P4** | Smart cron (self-reporting + defined fixer; durable-sleep manager) | **In progress** (P4.1 schedule-ext ✅; P4.2 spawn-await + promise↔job binding ✅; P4.3 cron-mgr **in progress** (BlueOak); P4.4 bead-on-fail / P4.5 sagas open; P4.6 cron CLI ✅ (EmeraldSwan); P4.7 tests: SC rows ✅ green, FW-row harness scaffolded, rows blocked on P4.3/P4.4) |
 | **P5** | Engine flexibility (graph DAG, control-flow, lint-graph) | **Complete** (bd-p5-* epics closed; spike GATE passed) |
 | **P6** | Squads + observability (squad/recipe unify, runs view + per-run cost, robot-snapshot runs) | **Complete** (bd-p6-squads-observability-61td closed) |
 
@@ -39,5 +39,9 @@ verification (mine, 2026-08-08): ADR-0003 `verify-gates.sh` passes; toron-workfl
 lib suite 110/110 green; ADR-0004 e2e suite (p1/p2) fully green — the
 `request_approval` suspend regression from the 0.6 migration is fixed
 (ApprovalSink/SpawnSink TypeId collision, BlueOak P4.2 lane). P4.7 SC rows green.
+**P4.7 harness (2026-08-08):** shared cron fixtures (`tests/common/mod.rs`) +
+scenario skeletons for the remaining P4 rows landed — `sc22_cron_failure_bead`,
+`sc23_cron_escalate`, `sc24_cron_catchup` (`#[ignore]`d until P4.4/P4.3 land).
+`sc21_cron_durable_loop` (BlueOak) covers `cron_success` + `cron_restart`.
 
 // governed-by: ADR-0003
