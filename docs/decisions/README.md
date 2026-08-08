@@ -10,7 +10,7 @@ This directory contains records of the major architectural decisions made for th
 | [0004](0004-operational-hardening.md) | Operational Hardening & Agent-Automation Efficiency (Post-Parity) | **Accepted** |
 | [0005](0005-orchestration-layer.md) | Orchestration Tier — Profiles, Workflows, Stages, Smart Cron, and a Flexible Workflow Engine | **Accepted** (2-round adversarial review + 3 captain amendments) |
 | [0006](0006-blossom-blob-federation.md) | Blossom / NIP-B7 Federated Blob Serving | **Accepted** (bd-esh.5) |
-| [0007](0007-post-implementation-hardening-and-api-redesign.md) | Post-Implementation Hardening, Bug Ledger, and Backend/API Redesign | **Accepted** (Rev 3; implementation closed 2026-08-08 — epic e23b children closed) |
+| [0007](0007-post-implementation-hardening-and-api-redesign.md) | Post-Implementation Hardening, Bug Ledger, and Backend/API Redesign | **Accepted** (Rev 3; impl e23b closed 2026-08-08 — **residual epic `bd-adr7-residual-vxnv` OPEN**: R-wire/R-res/R-verify, see [Verification](0007-post-implementation-hardening-and-api-redesign.md#verification-acceptance-for-this-adr)) |
 
 ## Parity catalogs
 

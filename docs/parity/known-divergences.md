@@ -49,12 +49,20 @@ Every identity op differs in response shape. toron is crypto-native per ADR-0003
 
 ## 2b. Id-type args (toron hex vs AM u64) — FIXED 2026-08-08
 
+> **Driver 5 / C3 exception (ADR-0007):** tool **names** are frozen, but arg types may
+> break pre-1.0 — recorded here per the dual-accept + divergence-note posture.
+
 `acknowledge_message` / `mark_message_read` `message_id` and `force_release_file_reservation`
 `file_reservation_id` were typed `i64` (copied from AM's integer-id model), but toron's ids are
 hex event ids (the `id` field `fetch_inbox` / `file_reservation_paths` return). An agent could
 NOT acknowledge/read/force-release over the MCP wire — the schema rejected the hex string.
 All three args are now `String`, matching toron's own id model (the mailbox layer always
 matched by hex; only the MCP arg type was wrong). Verified by `am_parity_e2e`.
+
+**Residual (F11-class, tracked with F11):** `renew_file_reservations` / `release_file_reservations`
+still accept `file_reservation_ids: Option<Vec<i64>>`, which the handlers silently ignore
+(only `paths` is honored). No silent-0 corruption on the id itself (ids are never parsed to
+`i64`), but accepted-and-ignored args are an honesty gap to close.
 
 ## 3. AM-side behaviors (NOT toron faults)
 
