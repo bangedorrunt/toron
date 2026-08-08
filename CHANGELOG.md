@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **P4.3 cron manager (ADR-0005 Spec 3, `bd-p4-cron-mgr-ur33`, toron-workflow)**
+  — a Resonate **durable-sleep loop** drives each registered cron: the
+  manager registers a `cron_loop` durable function; per cron, `cron:{name}`
+  loops `ctx.sleep(until next tick)` → fires the owning workflow as a durable
+  child → advances the durable checkpoint. Restart survival + no-double-fire
+  fall out of Resonate replay (deterministic child ids, `cron:{name}`
+  re-invocation resumes the same loop). Missed-tick policy = **`latest`**
+  (`latest_due_at_or_before` picks the most-recent due tick at-or-before now —
+  one run on wake, never a burst). Cron-expression parsing (`next_due`,
+  5-field vixie → 6-field crate) lives in toron (ADR-0003 3A: no flywheel
+  import); flywheel's `crons.toml` registry bridges via the `CronRegistry` DI
+  seam. `cron` + `chrono` deps added. Rows: `cron_success` + `cron_restart`
+  (sc21) + `cron_catchup` (sc24) green; 7 cron unit tests; 117 toron-workflow
+  tests.
+
 ### Fixed
 
 - **Approval/spawn promise-park regression (ADR-0005, `bd-p4-spawn-await-pxw6`)** —

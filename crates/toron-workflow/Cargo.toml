@@ -16,6 +16,8 @@ nostr-sdk = { version = "0.44", features = ["nip44", "nip59"] }
 resonate-sdk = "0.6"
 resonate-sdk-macros = "0.1"
 anyhow = "1.0.104"
+cron = "0.17.0"
+chrono = "0.4"
 
 [dev-dependencies]
 uuid = { version = "1", features = ["v4"] }
