@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Approval/spawn promise-park regression (ADR-0005, `bd-p4-spawn-await-pxw6`)** —
+  `ApprovalSink` and `SpawnSink` were the SAME concrete type
+  (`Arc<Mutex<Vec<String>>>`); the Resonate dependency map keys by `TypeId`, so
+  the second registration silently shadowed the first and every
+  `get_dependency::<Sink>` resolved to the spawn sink. Approval runs parked
+  their promise_id into the wrong channel — the embedding never saw it and
+  `request_approval` appeared to hang (sc11/unit red post 0.6 migration).
+  Both sinks are now distinct newtypes with `Deref` (unique `TypeId`, call
+  sites unchanged). Approval + spawn + sc11 + sc18/sc19/sc20 all green;
+  branch `then/else` test also now exercises the else arm.
+
 ### Added
 
 - **P4.7 P4 Behavior Test Matrix rows (ADR-0005, `bd-p4-tests-4cl7`, toron-e2e)**
