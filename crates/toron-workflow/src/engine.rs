@@ -31,7 +31,7 @@ use serde::{Deserialize, Serialize};
 use resonate_sdk::prelude::{Resonate, ResonateConfig};
 use resonate_sdk::types::Value;
 
-use crate::schema::{Action, Workflow};
+use crate::schema::{Action, StepOnError, Workflow};
 
 /// An approval decision (the promise payload).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -274,6 +274,24 @@ pub async fn run_workflow(
                     },
                     Err(e) => serde_json::json!({ "ok": false, "error": format!("render: {e}") }),
                 };
+                // P0.2 (ADR-0005 Spec 0): `on_error: fail_run` converts a step
+                // failure into a RUN failure — a deterministic durable RETURN
+                // (`{status:"failed",…}`), never a panic/break. The action
+                // error recurs deterministically at the same step on replay,
+                // so the return reproduces identically after a crash.
+                if step.on_error == StepOnError::FailRun
+                    && value.get("ok").and_then(serde_json::Value::as_bool) == Some(false)
+                {
+                    let error = value["error"]
+                        .as_str()
+                        .unwrap_or("step failed")
+                        .to_string();
+                    return Ok(serde_json::json!({
+                        "status": "failed",
+                        "error": error,
+                        "failed_step": step.name.clone().unwrap_or_else(|| "<unnamed>".into()),
+                    }));
+                }
                 value
             }
         };
@@ -555,6 +573,113 @@ steps:
             .await
             .expect("delay run completes");
         assert!(output.is_object(), "delay run returns object output");
+    }
+
+    /// A runner that errors on `send_message` actions (the "upgrade" step
+    /// below), succeeds on everything else.
+    fn error_on_send_runner() -> ActionRunner {
+        Arc::new(|a: &Action| {
+            if matches!(a, Action::SendMessage { .. }) {
+                Err(anyhow::anyhow!("boom"))
+            } else {
+                Ok(serde_json::Value::Null)
+            }
+        })
+    }
+
+    /// A workflow whose `upgrade` step errors and carries `on_error: fail_run`.
+    fn fail_run_workflow() -> Workflow {
+        parse_workflow(
+            r##"
+name: upgrade-wf
+trigger:
+  type: webhook
+steps:
+  - name: upgrade
+    action: send_message
+    to: ["ops"]
+    subject: "upgrade"
+    body: "go"
+    on_error: fail_run
+"##,
+        )
+        .expect("parse fail_run workflow")
+    }
+
+    /// A workflow whose erroring step has NO on_error (default continue).
+    fn continue_workflow() -> Workflow {
+        parse_workflow(
+            r##"
+name: continue-wf
+trigger:
+  type: webhook
+steps:
+  - name: upgrade
+    action: send_message
+    to: ["ops"]
+    subject: "upgrade"
+    body: "go"
+  - name: after
+    action: send_dm
+    to: "pi"
+    body: "still running"
+"##,
+        )
+        .expect("parse continue workflow")
+    }
+
+    /// P0.2 (ADR-0005 Spec 0): `on_error: fail_run` on an erroring step → the
+    /// run FAILS — `run_workflow` RETURNS `{status:"failed", error, failed_step}`
+    /// (a durable deterministic return, NOT a panic/abort).
+    #[tokio::test]
+    async fn on_error_fail_run_fails_the_run_durably() {
+        let engine = WorkflowEngine::local(error_on_send_runner()).expect("engine");
+        let input = RunInput {
+            workflow: fail_run_workflow(),
+            trigger: serde_json::json!({}),
+        };
+        let output = engine
+            .run("wf-fail-run-1", input)
+            .await
+            .expect("run returns (a value, not a panic)");
+        assert_eq!(
+            output["status"], "failed",
+            "fail_run step must fail the run: {output}"
+        );
+        assert_eq!(
+            output["failed_step"], "upgrade",
+            "failed step named: {output}"
+        );
+        let err = output["error"].as_str().expect("error string");
+        assert!(err.contains("boom"), "error surfaced: {output}");
+    }
+
+    /// P0.2 backward compat: no `on_error` (default `continue`) on an erroring
+    /// step → run completes; step output `{ok:false}`; later steps still run.
+    #[tokio::test]
+    async fn on_error_default_continue_completes_the_run() {
+        let engine = WorkflowEngine::local(error_on_send_runner()).expect("engine");
+        let input = RunInput {
+            workflow: continue_workflow(),
+            trigger: serde_json::json!({}),
+        };
+        let output = engine
+            .run("wf-continue-1", input)
+            .await
+            .expect("run completes (continue default)");
+        assert!(
+            output.get("status").is_none() || output["status"] != "failed",
+            "run must NOT fail under default continue: {output}"
+        );
+        assert_eq!(
+            output["upgrade"]["ok"], false,
+            "erroring step captured as {{ok:false}}: {output}"
+        );
+        // The step AFTER the error still ran (run completed, not aborted).
+        assert!(
+            output.get("after").is_some(),
+            "later steps still ran: {output}"
+        );
     }
 
     /// A workflow whose first step's action returns `{"n":42}`; the second

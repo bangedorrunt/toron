@@ -99,9 +99,37 @@ pub struct Step {
     /// Optional evalexpr guard (100ms timeout).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guard: Option<String>,
+    /// Failure policy for this step (ADR-0005 Spec 0). Defaults to
+    /// [`StepOnError::Continue`] — the pre-P0 behavior (errors captured
+    /// per-step, run completes). Opt-in `fail_run` aborts the run with a
+    /// deterministic failed outcome.
+    #[serde(default, skip_serializing_if = "StepOnError::is_continue")]
+    pub on_error: StepOnError,
     /// The action to run.
     #[serde(flatten)]
     pub action: Action,
+}
+
+/// A step's failure policy (ADR-0005 Spec 0).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum StepOnError {
+    /// Capture the error per-step (`{"ok":false,"error":…}`) and continue the
+    /// run — the pre-P0 behavior (backward compat).
+    #[default]
+    Continue,
+    /// Fail the run: `run_workflow` RETURNS a failed-outcome value
+    /// (`{"status":"failed","error":…,"failed_step":…}`) — a deterministic
+    /// durable return, never a panic. (The embedding maps that value to the
+    /// kind-46012 terminal `status=failed`.)
+    FailRun,
+}
+
+impl StepOnError {
+    /// True for the default `Continue` (drives serde skip).
+    pub fn is_continue(&self) -> bool {
+        matches!(self, Self::Continue)
+    }
 }
 
 /// A workflow action (one of the ADR Phase-2 set).
@@ -313,6 +341,34 @@ steps:
     fn invalid_yaml_fails() {
         assert!(parse_workflow("name: [broken").is_err());
         assert!(parse_workflow("").is_err());
+    }
+
+    #[test]
+    fn on_error_typo_is_rejected() {
+        // The strict enum is the fail-stop: any spelling other than
+        // continue/fail_run fails to parse (ADR-0005 Spec 0 lint contract).
+        let yaml = "name: t\ntrigger:\n  type: webhook\nsteps:\n  - action: delay\n    secs: 1\n    on_error: failrun\n";
+        let err = parse_workflow(yaml).expect_err("typo must fail parse");
+        assert!(
+            err.to_string().contains("unknown variant") || err.to_string().contains("on_error"),
+            "typo fail-stop: {err}"
+        );
+    }
+
+    #[test]
+    fn on_error_parse_roundtrip() {
+        let yaml = "name: t\ntrigger:\n  type: webhook\nsteps:\n  - name: a\n    action: send_dm\n    to: x\n    body: y\n    on_error: fail_run\n";
+        let wf = parse_workflow(yaml).expect("fail_run parses");
+        assert_eq!(wf.steps[0].on_error, StepOnError::FailRun);
+
+        let yaml = "name: t\ntrigger:\n  type: webhook\nsteps:\n  - name: a\n    action: send_dm\n    to: x\n    body: y\n    on_error: continue\n";
+        let wf = parse_workflow(yaml).expect("continue parses");
+        assert_eq!(wf.steps[0].on_error, StepOnError::Continue);
+
+        // Default (omitted) = Continue.
+        let yaml = "name: t\ntrigger:\n  type: webhook\nsteps:\n  - name: a\n    action: send_dm\n    to: x\n    body: y\n";
+        let wf = parse_workflow(yaml).expect("omitted parses");
+        assert_eq!(wf.steps[0].on_error, StepOnError::Continue);
     }
 
     #[test]
