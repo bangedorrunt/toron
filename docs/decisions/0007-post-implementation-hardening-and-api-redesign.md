@@ -283,6 +283,13 @@ Every finding: id, defect, evidence, remedy, confidence, minimum test, posture.
 - **confidence:** Medium (depends on Resonate worker threading; hazard is real).
 - **minimum_acceptable_test:** stress: N concurrent workflow sends no hang.
 - **remediation_posture:** Design fix (async seam preferred).
+- **status (R4.2 green 2026-08-08):** `workflow_host::block_on_async` runs
+  every runner mailbox call on a dedicated OS thread with its OWN
+  current-thread runtime; `publish_coalesced_job` publishes via a scoped
+  thread + isolated runtime. No `block_on` on any shared/ambient Tokio
+  handle remains. Stress test `concurrent_workflow_sends_no_hang`: 8
+  concurrent runner sends through a barrier → all deliver, no hang/panic,
+  8 stamped wraps on the bus.
 
 ### F9 — MEDIUM: dual error types + dual mail traits
 

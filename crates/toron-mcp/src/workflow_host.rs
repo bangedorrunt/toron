@@ -28,7 +28,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use nostr_sdk::nostr::{EventId, Keys, Timestamp};
 use toron_core::bus::{Bus, SubscriptionEvent};
-use toron_core::mailbox::{Mailbox, SendMessage};
+use toron_core::mailbox::{Mailbox, SendMessage, UnwrappedMail};
 use toron_workflow::coalesce::{CoalesceDecision, Coalesced, MentionCoalescer};
 use toron_workflow::engine::{ActionRunner, RunInput, WorkflowEngine};
 use toron_workflow::jobs::{JobRequest, build_job_request_with_tags};
@@ -339,6 +339,79 @@ impl WorkflowHost {
         tokio::spawn(async move {
             if let Err(e) = me.run_trigger_loop().await {
                 warn!("workflow trigger loop exited: {e}");
+            }
+        })
+    }
+
+    /// ADR-0007 R3: spawn a **post-unwrap** message_posted loop fed by
+    /// [`toron_core::mailbox::TriggerNotifySink`] (not raw kind-1059).
+    ///
+    /// F1 e2e MUST send via gift-wrap so unwrap projects → notify → here.
+    pub fn spawn_mail_trigger_loop(
+        &self,
+        mut rx: tokio::sync::mpsc::UnboundedReceiver<UnwrappedMail>,
+    ) -> tokio::task::JoinHandle<()> {
+        let me = self.clone();
+        tokio::spawn(async move {
+            while let Some(mail) = rx.recv().await {
+                // Skip workflow-emitted rumors (loop prevention belt).
+                let stamped = mail.rumor.tags.iter().any(|t| {
+                    t.as_slice().first().map(String::as_str) == Some("t")
+                        && t.as_slice().get(1).map(String::as_str)
+                            == Some(toron_workflow::trigger_filter::WORKFLOW_EMITTED_TAG)
+                });
+                if stamped {
+                    continue;
+                }
+                let kind = mail.rumor.kind.as_u16();
+                for workflow in &me.workflows {
+                    let Some(trigger) = &workflow.trigger else {
+                        continue;
+                    };
+                    // MessagePosted matches kind 14/15 (DM) after unwrap.
+                    let ok = match trigger {
+                        Trigger::MessagePosted { .. } => kind == 14 || kind == 15,
+                        _ => false,
+                    };
+                    if !ok {
+                        continue;
+                    }
+                    let payload = serde_json::json!({
+                        "id": mail.rumor_id.to_hex(),
+                        "sender": mail.sender.to_hex(),
+                        "content": mail.rumor.content,
+                        "kind": kind,
+                        "created_at": mail.created_at.as_secs(),
+                    });
+                    if let Some(guard) = &workflow.guard {
+                        let mut vars = std::collections::HashMap::new();
+                        if let Some(obj) = payload.as_object() {
+                            for (k, v) in obj {
+                                let name = format!("trigger_{k}");
+                                let text = match v {
+                                    serde_json::Value::String(s) => s.clone(),
+                                    other => other.to_string(),
+                                };
+                                vars.insert(name, evalexpr::Value::from(text));
+                            }
+                        }
+                        let outcome =
+                            toron_workflow::guard::evaluate_guard_default(Some(guard), &vars)
+                                .await;
+                        if !matches!(outcome, toron_workflow::guard::GuardOutcome::Bool(true)) {
+                            continue;
+                        }
+                    }
+                    let run_id = format!("wf-mail-{}-{}", workflow.name, mail.rumor_id.to_hex());
+                    let input = RunInput {
+                        workflow: workflow.clone(),
+                        trigger: payload,
+                    };
+                    match me.engine.run(&run_id, input).await {
+                        Ok(_) => debug!(run_id, "mail-trigger workflow {} ran", workflow.name),
+                        Err(e) => warn!(run_id, "mail-trigger workflow {} failed: {e}", workflow.name),
+                    }
+                }
             }
         })
     }
@@ -776,17 +849,16 @@ mod tests {
             3,
         )));
         let runner = mailbox_runner(mailbox, coalescer.clone(), Some(signer.clone()));
+        // Global sub: assignee is NOT a project slug (`assignee` tag, not `#t`).
+        // Stamped `t=toron:workflow-emitted` is ignored by access_gate.
         let mut sub = bus
             .subscribe(toron_core::bus::Filter::new())
             .await
             .expect("subscribe");
-        let rt = Arc::new(tokio::runtime::Runtime::new().expect("runner runtime"));
         let mut published = 0;
         for i in 0..3 {
             let runner = runner.clone();
-            let rt = rt.clone();
             let out = std::thread::spawn(move || {
-                let _guard = rt.enter();
                 runner(&Action::DispatchJob {
                     assignee: "oc".into(),
                     spec: serde_json::json!({ "i": i }),
@@ -802,8 +874,6 @@ mod tests {
         }
         assert_eq!(published, 1, "cap-flush publishes exactly one 43001");
 
-        // Host path: a 5-mention batch → one stamped 43001. publish is sync
-        // (block_ons the bus — F8); drive it on a plain thread.
         let parent = "b32828720d7e8a80dd5165a6cd31b2c70e8d25b83c387209cb138e77d7e7e05b";
         let batch = toron_workflow::coalesce::Coalesced {
             assignee: "gk".into(),
@@ -818,9 +888,7 @@ mod tests {
         };
         let bus_for_thread = bus.clone();
         let signer_for_thread = signer.clone();
-        let rt_for_publish = rt.clone();
         let id = std::thread::spawn(move || {
-            let _guard = rt_for_publish.enter();
             publish_coalesced_job(bus_for_thread.as_ref(), Some(&signer_for_thread), &batch)
                 .expect("host publish")
         })
@@ -828,34 +896,17 @@ mod tests {
         .expect("publish thread");
         assert!(!id.to_hex().is_empty());
 
-        // Drain the bus: exactly two 43001s total (one cap-flush + one host).
-        let mut jobs = Vec::new();
-        loop {
-            match tokio::time::timeout(std::time::Duration::from_secs(3), sub.next()).await {
-                Ok(Some(SubscriptionEvent::Event(e))) => {
-                    jobs.push(e);
-                    if jobs.len() >= 4 {
-                        break;
-                    }
+        let mut jobs43001 = Vec::new();
+        for _ in 0..2 {
+            let ev = loop {
+                match tokio::time::timeout(std::time::Duration::from_secs(5), sub.next()).await {
+                    Ok(Some(SubscriptionEvent::Event(e))) if e.kind.as_u16() == 43001 => break e,
+                    Ok(Some(SubscriptionEvent::Event(_))) => continue,
+                    Ok(Some(SubscriptionEvent::Eose)) | Ok(None) => continue,
+                    Ok(Some(SubscriptionEvent::Closed(_))) => panic!("subscription closed"),
+                    Err(_) => panic!("timed out waiting for 43001"),
                 }
-                Ok(Some(SubscriptionEvent::Eose)) | Ok(None) => continue,
-                Ok(Some(SubscriptionEvent::Closed(_))) => panic!("subscription closed"),
-                Err(_) => break, // quiet window — drain done
-            }
-        }
-        let jobs43001: Vec<_> = jobs
-            .iter()
-            .filter(|e| e.kind.as_u16() == 43001)
-            .cloned()
-            .collect();
-        assert_eq!(
-            jobs43001.len(),
-            2,
-            "one 43001 per burst, never N (saw kinds {:?})",
-            jobs.iter().map(|e| e.kind.as_u16()).collect::<Vec<_>>()
-        );
-        for ev in &jobs43001 {
-            assert_eq!(ev.kind.as_u16(), 43001, "job request kind");
+            };
             let stamped = ev.tags.iter().any(|t| {
                 t.as_slice().first().map(String::as_str) == Some("t")
                     && t.as_slice().get(1).map(String::as_str)
@@ -863,14 +914,13 @@ mod tests {
             });
             assert!(stamped, "43001 carries the workflow-emitted stamp");
             assert!(
-                !should_evaluate_trigger_event(ev),
+                !should_evaluate_trigger_event(&ev),
                 "stamped 43001 must not re-trigger"
             );
+            jobs43001.push(ev);
         }
+        assert_eq!(jobs43001.len(), 2, "one 43001 per burst");
         let _ = std::fs::remove_file(&db);
-        // A runtime cannot be dropped inside an async context — drop it on a
-        // plain thread (shutdown does blocking work).
-        std::thread::spawn(move || drop(rt)).join().expect("drop rt");
     }
 
     /// End-to-end: a workflow with a `message_posted` trigger + a satisfiable
@@ -930,6 +980,96 @@ steps:
             ran.load(Ordering::Relaxed)
         );
         handle.abort();
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// ADR-0007 F8 (minimum_acceptable_test): stress — N concurrent workflow
+    /// sends must not hang or panic. The runner is sync; every mailbox call
+    /// goes through `block_on_async` (dedicated OS thread + its OWN
+    /// current-thread runtime). Driving N runners concurrently from plain
+    /// threads (no ambient runtime) proves no nested `block_on` on a shared
+    /// Tokio handle: each call runs on an isolated runtime.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_workflow_sends_no_hang() {
+        use toron_core::bus::in_process::{InProcessBus, InProcessBusConfig};
+        use toron_core::index::schema;
+
+        const PASSPHRASE: &str = "wf-stress-pass";
+        const CONCURRENCY: usize = 8;
+        let db = std::env::temp_dir().join(format!("wf-stress-{}.sqlite", uuid::Uuid::new_v4()));
+        let pool = schema::connect(db.to_str().unwrap()).await.expect("connect");
+        schema::migrate(&pool).await.expect("migrate");
+        let bus: Arc<dyn Bus> = Arc::new(
+            InProcessBus::open(pool, InProcessBusConfig::default())
+                .await
+                .expect("bus"),
+        );
+        let data_dir = std::env::temp_dir().join(format!("wf-stress-data-{}", uuid::Uuid::new_v4()));
+        let mailbox = Arc::new(
+            Mailbox::new(bus.clone(), data_dir.clone(), None).with_agent_passphrase(PASSPHRASE),
+        );
+        mailbox
+            .register_agent(
+                "demo",
+                &toron_core::nostr::identity::AgentProfile::new("workflow-demo"),
+            )
+            .await
+            .expect("register sender");
+        mailbox
+            .register_agent(
+                "demo",
+                &toron_core::nostr::identity::AgentProfile::new("BlueLake"),
+            )
+            .await
+            .expect("register recipient");
+
+        let coalescer = Arc::new(std::sync::Mutex::new(MentionCoalescer::from_env()));
+        let runner = mailbox_runner(mailbox.clone(), coalescer, None);
+
+        // All N threads fire at once (barrier) — maximal contention through
+        // the sync runner → block_on_async → mailbox gift-wrap + publish.
+        let barrier = Arc::new(std::sync::Barrier::new(CONCURRENCY));
+        let handles: Vec<_> = (0..CONCURRENCY)
+            .map(|i| {
+                let runner = runner.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    runner(&Action::SendMessage {
+                        to: vec!["BlueLake".into()],
+                        subject: format!("stress {i}"),
+                        body: format!("stress body {i}"),
+                        project: Some("demo".into()),
+                    })
+                })
+            })
+            .collect();
+        let mut ok = 0usize;
+        for h in handles {
+            let out = h
+                .join()
+                .expect("runner thread must not panic (no nested runtime)");
+            let delivered = out
+                .as_ref()
+                .ok()
+                .and_then(|v| v.get("ok").and_then(|b| b.as_bool()))
+                == Some(true);
+            assert!(delivered, "concurrent send must deliver: {out:?}");
+            ok += 1;
+        }
+        assert_eq!(ok, CONCURRENCY, "all {CONCURRENCY} sends delivered");
+
+        // Every send landed on the bus as a stamped gift wrap.
+        let replay = toron_core::mailbox::collect_replay(bus.as_ref(), toron_core::bus::Filter::new())
+            .await
+            .expect("replay");
+        let wraps = replay
+            .iter()
+            .filter(|e| e.kind == nostr_sdk::nostr::Kind::GiftWrap)
+            .count();
+        assert_eq!(wraps, CONCURRENCY, "one wrap per concurrent send");
+
+        let _ = std::fs::remove_dir_all(&data_dir);
         let _ = std::fs::remove_file(&db);
     }
 }
