@@ -73,10 +73,30 @@ pub fn build_job_request(
     payload: &JobRequest,
     created_at: Timestamp,
 ) -> Result<Event, nostr_sdk::nostr::event::builder::Error> {
-    let mut tags = vec![Tag::event(parent)];
-    if let Some(assignee) = &payload.assignee {
-        tags.push(Tag::parse(["t", assignee]).expect("assignee tag"));
+    build_job_request_with_tags(requester, Some(parent), payload, created_at, Vec::new())
+}
+
+/// Build a job request with CALLER-supplied extra tags (ADR-0007 F6/F7: the
+/// workflow host stamps coalesced 43001s with `toron:workflow-emitted`).
+/// `parent` is optional — coalesced bursts may lack a parseable parent id.
+pub fn build_job_request_with_tags(
+    requester: &nostr_sdk::nostr::Keys,
+    parent: Option<EventId>,
+    payload: &JobRequest,
+    created_at: Timestamp,
+    extra_tags: Vec<Tag>,
+) -> Result<Event, nostr_sdk::nostr::event::builder::Error> {
+    let mut tags: Vec<Tag> = Vec::new();
+    if let Some(parent) = parent {
+        tags.push(Tag::event(parent));
     }
+    if let Some(assignee) = &payload.assignee {
+        // Do NOT use `t` — ADR-0003 A3/G6 reserves `#t` for project scoping.
+        // A `t=assignee-name` tag makes global bus subscribers drop the job
+        // (InProcessBus access_gate). Use a free-form `assignee` tag instead.
+        tags.push(Tag::parse(["assignee", assignee]).expect("assignee tag"));
+    }
+    tags.extend(extra_tags);
     build_event(
         requester,
         toron_kind(JOB_REQUEST),

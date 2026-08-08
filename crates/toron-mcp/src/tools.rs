@@ -695,6 +695,7 @@ impl ToolServer {
             thread_id: args.thread_id.clone(),
             sender_token: args.sender_token.clone(),
             overseer: false,
+            extra_tags: Vec::new(),
         };
         ToolOutput::result(self.mailbox.send_message(&msg).await)
     }
@@ -720,6 +721,7 @@ impl ToolServer {
             thread_id: args.thread_id.clone(),
             sender_token: args.sender_token.clone(),
             overseer: false,
+            extra_tags: Vec::new(),
         };
         ToolOutput::result(self.mailbox.reply_message(&msg).await)
     }
