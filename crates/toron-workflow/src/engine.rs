@@ -93,12 +93,38 @@ pub type ProfileResolver =
 /// Optional side-channel for approval promise-ids (embedding/test hook). When
 /// a run parks on `request_approval`, its promise_id is pushed here so the
 /// embedding can publish the kind-46011 pending event.
-pub type ApprovalSink = Arc<tokio::sync::Mutex<Vec<String>>>;
+///
+/// Distinct newtype (not a `type` alias): the Resonate dependency map keys by
+/// `TypeId` of the value type, so two `Arc<Mutex<Vec<String>>>` aliases would
+/// collide and `get_dependency` would resolve both sinks to the LAST
+/// registered — a real 0.6-migration regression (a1fe947). The newtype gives
+/// each sink a unique `TypeId`; `Deref` keeps the `.lock().await` call sites
+/// unchanged.
+#[derive(Clone, Default)]
+pub struct ApprovalSink(Arc<tokio::sync::Mutex<Vec<String>>>);
+
+impl std::ops::Deref for ApprovalSink {
+    type Target = tokio::sync::Mutex<Vec<String>>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
 
 /// Side-channel for `spawn` promise-ids (ADR-0005 Spec 4a). When a run parks
 /// on a spawn-await, its promise_id is pushed here so the embedding can emit
 /// the kind-43001 job carrying it in the `spec`.
-pub type SpawnSink = Arc<tokio::sync::Mutex<Vec<String>>>;
+///
+/// Distinct newtype — see [`ApprovalSink`] for why (TypeId collision in the
+/// Resonate dependency map).
+#[derive(Clone, Default)]
+pub struct SpawnSink(Arc<tokio::sync::Mutex<Vec<String>>>);
+
+impl std::ops::Deref for SpawnSink {
+    type Target = tokio::sync::Mutex<Vec<String>>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
 
 /// The workflow engine: owns the Resonate runtime + registers the durable
 /// function + the approval resolution bridge.
@@ -137,8 +163,8 @@ impl WorkflowEngine {
         action_runner: ActionRunner,
         profile_resolver: ProfileResolver,
     ) -> anyhow::Result<Self> {
-        let sink: ApprovalSink = Arc::new(tokio::sync::Mutex::new(Vec::new()));
-        let spawn_sink: SpawnSink = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let sink = ApprovalSink::default();
+        let spawn_sink = SpawnSink::default();
         let resonate = Resonate::local()
             .with_dependency(action_runner)
             .with_dependency(profile_resolver)
@@ -172,8 +198,8 @@ impl WorkflowEngine {
         action_runner: ActionRunner,
         profile_resolver: ProfileResolver,
     ) -> anyhow::Result<Self> {
-        let sink: ApprovalSink = Arc::new(tokio::sync::Mutex::new(Vec::new()));
-        let spawn_sink: SpawnSink = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let sink = ApprovalSink::default();
+        let spawn_sink = SpawnSink::default();
         let config = ResonateConfig {
             url: Some(url.into()),
             ..Default::default()
@@ -1907,10 +1933,22 @@ steps:
             )
             .await
             .expect("runs");
-        let actions = seen.lock().unwrap();
-        let last = actions.last().cloned();
-        drop(actions);
+        let last = { let actions = seen.lock().unwrap(); actions.last().cloned() };
         assert!(matches!(last, Some(Action::SendDm { body, .. }) if body == "yes"));
+
+        // Guard false → else branch.
+        let _ = engine
+            .run(
+                "wf-branch-false",
+                RunInput {
+                    workflow: wf,
+                    trigger: serde_json::json!({ "ok": "false" }),
+                },
+            )
+            .await
+            .expect("else-branch run completes");
+        let last = { let actions = seen.lock().unwrap(); actions.last().cloned() };
+        assert!(matches!(last, Some(Action::SendDm { body, .. }) if body == "no"));
     }
 
     /// P5.3: `foreach` — iterate over a list; collect sub-run outputs.
