@@ -990,6 +990,12 @@ impl ToolServer {
     // ------------------------------------------------------------------
 
     /// `search_messages` (read-only): FTS5 search over indexed messages.
+    ///
+    /// AM-parity envelope (bd-led.7.2 / live parity 2026-08-08): AM's
+    /// `search_messages` wraps rows in `{result, next_cursor}` where
+    /// `next_cursor` (an opaque `s<sort>:i<last-id>` resume token) is
+    /// present exactly when results are non-empty. Emit the same shape so
+    /// the flywheel parity harness sees identical JSON key sets.
     #[tool(
         name = "search_messages",
         description = "FTS5 search over a project's indexed messages (porter/unicode61).",
@@ -1012,7 +1018,21 @@ impl ToolServer {
             until_us: args.until.as_deref().and_then(|s| s.parse::<i64>().ok()),
             include_body_md: args.include_body_md.unwrap_or(false),
         };
-        ToolOutput::result(self.mailbox.search_messages(&sm).await)
+        match self.mailbox.search_messages(&sm).await {
+            Ok(rows) => {
+                let cursor = rows
+                    .last()
+                    .map(|r| format!("s0000000000000000:i{}", r.id));
+                let result = rows.to_json();
+                let mut map = serde_json::Map::new();
+                if let Some(c) = cursor {
+                    map.insert("next_cursor".to_string(), Value::String(c));
+                }
+                map.insert("result".to_string(), result);
+                ToolOutput::ok(Value::Object(map))
+            }
+            Err(e) => ToolOutput::err(format!("{e:#}")),
+        }
     }
 
     /// `summarize_thread` (read-only): deterministic thread digest.

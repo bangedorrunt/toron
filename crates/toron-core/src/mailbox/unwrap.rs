@@ -378,6 +378,12 @@ fn civil_from_secs(secs: u64) -> (u32, u32) {
 pub struct SqliteProjectionSink {
     pool: sqlx::SqlitePool,
     projected: Mutex<HashSet<String>>,
+    /// npub (hex) → project_slug. Gift wraps hide metadata, so the project
+    /// cannot be read off the wrap itself; the pipeline resolves it via the
+    /// recipient key (populated from the `agents` table at build time —
+    /// registration stores the VERBATIM slug, so absolute and relative slugs
+    /// both round-trip exactly).
+    projects: std::collections::HashMap<String, String>,
 }
 
 impl SqliteProjectionSink {
@@ -386,7 +392,14 @@ impl SqliteProjectionSink {
         Self {
             pool,
             projected: Mutex::new(HashSet::new()),
+            projects: std::collections::HashMap::new(),
         }
+    }
+
+    /// Attach the recipient-npub → project-slug resolution map.
+    pub fn with_projects(mut self, projects: std::collections::HashMap<String, String>) -> Self {
+        self.projects = projects;
+        self
     }
 }
 
@@ -418,10 +431,13 @@ impl ProjectionSink for SqliteProjectionSink {
             .any(|t| t.as_slice().first().map(|s| s.as_str()) == Some("ack-required"));
         let thread_id = tag_text(&mail.rumor, "e").map(|s| s.to_string());
 
-        // project slug is not carried on gift wraps (metadata hiding) — the
-        // pipeline scopes by recipient; store a placeholder resolved by the
-        // caller's project context. Search filters on it at query time.
-        let project_slug = String::new();
+        // The wrap hides the project (metadata hiding) — resolve it via the
+        // recipient key from the agents-table map built at pipeline time.
+        let project_slug = self
+            .projects
+            .get(&mail.recipient.to_hex())
+            .cloned()
+            .unwrap_or_default();
         let inserted = sqlx::query(
             "INSERT INTO messages \
              (event_id, project_slug, sender, sender_pubkey, subject, body, \
