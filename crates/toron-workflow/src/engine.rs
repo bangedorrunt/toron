@@ -163,6 +163,34 @@ impl WorkflowEngine {
             .map_err(|e| anyhow::anyhow!("resonate run {run_id}: {e}"))
     }
 
+    /// On-demand invoke (ADR-0005 Spec 2, P3): run a workflow with NO trigger
+    /// event. The engine synthesizes a `trigger.*` template context from the
+    /// provided `inputs` so `{{inputs.x}}` / `{{trigger.x}}` resolve on the
+    /// invoke path — the SAME durable function as the trigger path, two entry
+    /// doors.
+    pub async fn invoke(
+        &self,
+        run_id: &str,
+        workflow: Workflow,
+        inputs: serde_json::Value,
+    ) -> anyhow::Result<serde_json::Value> {
+        // Synthesized trigger payload: the inputs are visible both as
+        // `{{inputs.<name>}}` (under `inputs`) and `{{trigger.<name>}}`
+        // (flattened at the top level).
+        let mut trigger = serde_json::Map::new();
+        if let Some(obj) = inputs.as_object() {
+            for (k, v) in obj {
+                trigger.insert(k.clone(), v.clone());
+            }
+        }
+        trigger.insert("inputs".into(), inputs.clone());
+        let input = RunInput {
+            workflow,
+            trigger: serde_json::Value::Object(trigger),
+        };
+        self.run(run_id, input).await
+    }
+
     /// Resolve an approval promise (the kind-46011 listener calls this).
     pub async fn resolve_approval(
         &self,
@@ -437,6 +465,17 @@ fn resolve_template(
     let (root, path) = token.split_once('.')?;
     let value = match root {
         "trigger" => trigger,
+        // `{{inputs.x}}`: the invoke path embeds the caller's inputs under
+        // `trigger.inputs` (invoke synthesizes the trigger payload from them).
+        // Resolve the bare `inputs` root too — `{{inputs.goal}}` ==
+        // `{{trigger.inputs.goal}}` on the invoke path.
+        "inputs" => {
+            let inputs = trigger.get("inputs")?;
+            if path.is_empty() {
+                return Some(render_scalar(inputs));
+            }
+            return descend(inputs, path.split('.')).map(render_scalar);
+        }
         "steps" => return resolve_steps(&path, step_outputs),
         _ => return None,
     };
@@ -868,6 +907,57 @@ steps:
         )
         .await;
         assert!(matches!(out, GuardOutcome::Bool(true)), "guard true: {out:?}");
+    }
+
+    /// P3.1 (ADR-0005 Spec 2): `WorkflowEngine::invoke` — the on-demand
+    /// entrypoint. A workflow invoked with no trigger still gets a `trigger.*`
+    /// template context synthesized from `inputs`, so `{{inputs.goal}}` and
+    /// `{{trigger.*}}` both resolve on the invoke path. Trigger path + invoke
+    /// path use the SAME durable function (`run_workflow`).
+    #[tokio::test]
+    async fn invoke_runs_workflow_with_synthesized_inputs_trigger() {
+        use std::sync::Mutex as StdMutex;
+        let seen: Arc<StdMutex<Vec<Action>>> = Arc::new(StdMutex::new(Vec::new()));
+        let seen_clone = seen.clone();
+        let runner: ActionRunner = Arc::new(move |a: &Action| {
+            seen_clone.lock().unwrap().push(a.clone());
+            Ok(serde_json::Value::Null)
+        });
+        let engine = WorkflowEngine::local(runner.clone()).expect("engine");
+        let wf = parse_workflow(
+            r##"
+name: invoke-me
+trigger:
+  type: webhook
+inputs:
+  - name: goal
+steps:
+  - name: plan
+    action: send_dm
+    to: "pi"
+    body: "goal={{inputs.goal}} trigger_goal={{trigger.goal}}"
+"##,
+        )
+        .expect("parse invoke workflow");
+
+        let output = engine
+            .invoke("wf-invoke-1", wf.clone(), serde_json::json!({ "goal": "ship-it" }))
+            .await
+            .expect("invoke returns run output");
+
+        // The invoke path ran through the SAME durable function: the step
+        // outputs are present, and the runner saw both template forms resolved.
+        assert!(output.get("plan").is_some(), "step ran: {output}");
+        let action = &seen.lock().unwrap()[0];
+        match action {
+            Action::SendDm { body, .. } => {
+                assert_eq!(
+                    body, "goal=ship-it trigger_goal=ship-it",
+                    "{{inputs.goal}} AND {{trigger.goal}} resolve on invoke: {body}"
+                );
+            }
+            _ => unreachable!(),
+        }
     }
 
     /// A workflow whose first step's action returns `{"n":42}`; the second
