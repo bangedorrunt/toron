@@ -481,6 +481,7 @@ impl ToolServer {
     #[tool(
         name = "health_check",
         description = "Bus liveness + archive health for a project (AM-Rust parity).",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<crate::responses::HealthReportOut>(),
         annotations(title = "Health check", read_only_hint = true)
     )]
     async fn health_check(&self, Parameters(_args): Parameters<HealthCheckArgs>) -> ToolOutput {
@@ -491,6 +492,7 @@ impl ToolServer {
     #[tool(
         name = "ensure_project",
         description = "Idempotent project initialization (kind-30010 manifest).",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<crate::responses::ProjectStateOut>(),
         annotations(title = "Ensure project", destructive_hint = true)
     )]
     async fn ensure_project(&self, Parameters(args): Parameters<EnsureProjectArgs>) -> ToolOutput {
@@ -501,6 +503,7 @@ impl ToolServer {
     #[tool(
         name = "install_precommit_guard",
         description = "Install the toron pre-commit hook in a git repository.",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<crate::responses::HookPathOut>(),
         annotations(title = "Install pre-commit guard", destructive_hint = true)
     )]
     async fn install_precommit_guard(
@@ -521,6 +524,7 @@ impl ToolServer {
     #[tool(
         name = "uninstall_precommit_guard",
         description = "Remove the toron pre-commit hook (never clobbers a user hook).",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<bool>(),
         annotations(title = "Uninstall pre-commit guard", destructive_hint = true)
     )]
     async fn uninstall_precommit_guard(
@@ -541,6 +545,7 @@ impl ToolServer {
     #[tool(
         name = "register_agent",
         description = "Upsert an agent identity on its existing key (or create if absent).",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<crate::responses::RegisteredAgentOut>(),
         annotations(title = "Register agent", destructive_hint = true)
     )]
     async fn register_agent(&self, Parameters(args): Parameters<RegisterAgentArgs>) -> ToolOutput {
@@ -565,6 +570,7 @@ impl ToolServer {
     #[tool(
         name = "create_agent_identity",
         description = "Mint a fresh agent keypair (ncryptsec) and publish the kind-30013 profile.",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<crate::responses::RegisteredAgentOut>(),
         annotations(title = "Create agent identity", destructive_hint = true)
     )]
     async fn create_agent_identity(
@@ -592,6 +598,7 @@ impl ToolServer {
     #[tool(
         name = "whois",
         description = "Resolve an agent name to npub + profile fields (fail-fast on unknown).",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<crate::responses::WhoIsOut>(),
         annotations(title = "Whois", read_only_hint = true)
     )]
     async fn whois(&self, Parameters(args): Parameters<WhoisArgs>) -> ToolOutput {
@@ -606,6 +613,7 @@ impl ToolServer {
     #[tool(
         name = "resolve_pane_identity",
         description = "Resolve a herdr pane_id to the agent name (G9).",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<crate::responses::PaneIdentityOut>(),
         annotations(title = "Resolve pane identity", read_only_hint = true)
     )]
     async fn resolve_pane_identity(
@@ -630,6 +638,7 @@ impl ToolServer {
     #[tool(
         name = "cleanup_pane_identities",
         description = "Prune identities whose herdr panes are absent from the live pane list.",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<crate::responses::CleanupPaneIdentitiesOut>(),
         annotations(title = "Cleanup pane identities", destructive_hint = true)
     )]
     async fn cleanup_pane_identities(
@@ -648,6 +657,7 @@ impl ToolServer {
     #[tool(
         name = "list_agents",
         description = "List a project's agents with npub + last-active provenance.",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<Vec<crate::responses::RegisteredAgentOut>>(),
         annotations(title = "List agents", read_only_hint = true)
     )]
     async fn list_agents(&self, Parameters(args): Parameters<ListAgentsArgs>) -> ToolOutput {
@@ -665,6 +675,7 @@ impl ToolServer {
     #[tool(
         name = "send_message",
         description = "Send a NIP-17 gift-wrapped message to one or more recipients.",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<crate::responses::SendResultOut>(),
         annotations(title = "Send message", destructive_hint = true)
     )]
     async fn send_message(&self, Parameters(args): Parameters<SendMessageArgs>) -> ToolOutput {
@@ -692,6 +703,7 @@ impl ToolServer {
     #[tool(
         name = "reply_message",
         description = "Reply to a message within its thread (NIP-10 reply reference).",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<crate::responses::SendResultOut>(),
         annotations(title = "Reply message", destructive_hint = true)
     )]
     async fn reply_message(&self, Parameters(args): Parameters<ReplyMessageArgs>) -> ToolOutput {
@@ -716,6 +728,7 @@ impl ToolServer {
     #[tool(
         name = "fetch_inbox",
         description = "Project the agent's inbox (rumor-time order, G7).",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<Vec<crate::responses::InboxMessageOut>>(),
         annotations(title = "Fetch inbox", read_only_hint = true)
     )]
     async fn fetch_inbox(&self, Parameters(args): Parameters<FetchInboxArgs>) -> ToolOutput {
@@ -733,6 +746,7 @@ impl ToolServer {
     #[tool(
         name = "acknowledge_message",
         description = "Acknowledge a message (private NIP-17 ack, idempotent).",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<crate::responses::ReceiptResultOut>(),
         annotations(title = "Acknowledge message", read_only_hint = true)
     )]
     async fn acknowledge_message(
@@ -754,6 +768,7 @@ impl ToolServer {
     #[tool(
         name = "mark_message_read",
         description = "Mark a message read (private NIP-17 read receipt, idempotent).",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<crate::responses::ReceiptResultOut>(),
         annotations(title = "Mark message read", read_only_hint = true)
     )]
     async fn mark_message_read(
@@ -779,6 +794,7 @@ impl ToolServer {
     #[tool(
         name = "request_contact",
         description = "Request contact with another agent (AgentLink + NIP-17 control message).",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<crate::responses::ContactLinkOut>(),
         annotations(title = "Request contact", destructive_hint = true)
     )]
     async fn request_contact(
@@ -799,6 +815,7 @@ impl ToolServer {
     #[tool(
         name = "respond_contact",
         description = "Approve or deny a pending contact request.",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<crate::responses::ContactLinkOut>(),
         annotations(title = "Respond contact", destructive_hint = true)
     )]
     async fn respond_contact(
@@ -819,6 +836,7 @@ impl ToolServer {
     #[tool(
         name = "list_contacts",
         description = "List an agent's contact links (AgentLink rows).",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<Vec<crate::responses::ContactLinkOut>>(),
         annotations(title = "List contacts", read_only_hint = true)
     )]
     async fn list_contacts(&self, Parameters(args): Parameters<ListContactsArgs>) -> ToolOutput {
@@ -833,6 +851,7 @@ impl ToolServer {
     #[tool(
         name = "set_contact_policy",
         description = "Set the agent's inbound contact policy (open|auto|contacts_only|block_all).",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<String>(),
         annotations(title = "Set contact policy", destructive_hint = true)
     )]
     async fn set_contact_policy(
@@ -855,6 +874,7 @@ impl ToolServer {
     #[tool(
         name = "check_file_reservation_conflicts",
         description = "Symmetric-glob conflict report for paths vs other agents' reservations.",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<crate::responses::ConflictReportOut>(),
         annotations(title = "Check file reservation conflicts", read_only_hint = true)
     )]
     async fn check_file_reservation_conflicts(
@@ -872,6 +892,7 @@ impl ToolServer {
     #[tool(
         name = "file_reservation_paths",
         description = "Acquire exclusive/shared leases on path globs (kind-30031).",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<crate::responses::AcquireResultOut>(),
         annotations(title = "File reservation paths", destructive_hint = true)
     )]
     async fn file_reservation_paths(
@@ -896,6 +917,7 @@ impl ToolServer {
     #[tool(
         name = "renew_file_reservations",
         description = "Extend the TTLs of the holder's active file reservations.",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<crate::responses::RenewResultOut>(),
         annotations(title = "Renew file reservations", destructive_hint = true)
     )]
     async fn renew_file_reservations(
@@ -918,6 +940,7 @@ impl ToolServer {
     #[tool(
         name = "release_file_reservations",
         description = "Release the holder's active file reservations (idempotent).",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<crate::responses::ReleaseResultOut>(),
         annotations(title = "Release file reservations", destructive_hint = true)
     )]
     async fn release_file_reservations(
@@ -939,6 +962,7 @@ impl ToolServer {
     #[tool(
         name = "force_release_file_reservation",
         description = "Operator force-release of a stale reservation (staleness heuristic + revocation).",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<crate::responses::OkOut>(),
         annotations(title = "Force release file reservation", destructive_hint = true)
     )]
     async fn force_release_file_reservation(
@@ -969,6 +993,7 @@ impl ToolServer {
     #[tool(
         name = "search_messages",
         description = "FTS5 search over a project's indexed messages (porter/unicode61).",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<Vec<crate::responses::SearchMessageOut>>(),
         annotations(title = "Search messages", read_only_hint = true)
     )]
     async fn search_messages(
@@ -994,6 +1019,7 @@ impl ToolServer {
     #[tool(
         name = "summarize_thread",
         description = "Deterministic digest of a thread (participants, key points, actions).",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<crate::responses::ThreadSummaryOut>(),
         annotations(title = "Summarize thread", read_only_hint = true)
     )]
     async fn summarize_thread(
@@ -1021,6 +1047,7 @@ impl ToolServer {
     #[tool(
         name = "macro_start_session",
         description = "Batch: ensure_project + register agent + optional file reservation + inbox snapshot.",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<crate::responses::StartSessionResultOut>(),
         annotations(title = "Macro start session", destructive_hint = true)
     )]
     async fn macro_start_session(
@@ -1049,6 +1076,7 @@ impl ToolServer {
     #[tool(
         name = "macro_prepare_thread",
         description = "Batch: ensure registration + thread summary + recent inbox context.",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<crate::responses::PrepareThreadResultOut>(),
         annotations(title = "Macro prepare thread", read_only_hint = true)
     )]
     async fn macro_prepare_thread(
@@ -1077,6 +1105,7 @@ impl ToolServer {
     #[tool(
         name = "macro_contact_handshake",
         description = "Batch: request contact + optional auto-accept + welcome message.",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<crate::responses::ContactHandshakeResultOut>(),
         annotations(title = "Macro contact handshake", destructive_hint = true)
     )]
     async fn macro_contact_handshake(
@@ -1112,6 +1141,7 @@ impl ToolServer {
     #[tool(
         name = "macro_file_reservation_cycle",
         description = "Batch: reserve a set of path globs, optionally release them at the end.",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<crate::responses::ReservationCycleResultOut>(),
         annotations(title = "Macro file reservation cycle", destructive_hint = true)
     )]
     async fn macro_file_reservation_cycle(
@@ -1141,6 +1171,7 @@ impl ToolServer {
     #[tool(
         name = "ensure_product",
         description = "Idempotent product manifest (kind-30011) for a product key.",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<crate::responses::ProductInfoOut>(),
         annotations(title = "Ensure product", destructive_hint = true)
     )]
     async fn ensure_product(&self, Parameters(args): Parameters<EnsureProductArgs>) -> ToolOutput {
@@ -1157,6 +1188,7 @@ impl ToolServer {
     #[tool(
         name = "products_link",
         description = "Link a project into a product (idempotent; kind-30011 a-tag).",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<crate::responses::ProductInfoOut>(),
         annotations(title = "Products link", destructive_hint = true)
     )]
     async fn products_link(&self, Parameters(args): Parameters<ProductsLinkArgs>) -> ToolOutput {
@@ -1171,6 +1203,7 @@ impl ToolServer {
     #[tool(
         name = "search_messages_product",
         description = "Fan an FTS5 search across a product's member projects.",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<Vec<crate::responses::ProjectSearchMessageOut>>(),
         annotations(title = "Search messages (product)", read_only_hint = true)
     )]
     async fn search_messages_product(
@@ -1193,6 +1226,7 @@ impl ToolServer {
     #[tool(
         name = "fetch_inbox_product",
         description = "Fan an inbox fetch across a product's member projects.",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<Vec<crate::responses::ProjectInboxMessageOut>>(),
         annotations(title = "Fetch inbox (product)", read_only_hint = true)
     )]
     async fn fetch_inbox_product(
@@ -1210,6 +1244,7 @@ impl ToolServer {
     #[tool(
         name = "summarize_thread_product",
         description = "Summarize a thread across a product's member projects.",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<crate::responses::ThreadSummaryOut>(),
         annotations(title = "Summarize thread (product)", read_only_hint = true)
     )]
     async fn summarize_thread_product(
@@ -1235,6 +1270,7 @@ impl ToolServer {
     #[tool(
         name = "acquire_build_slot",
         description = "Acquire an advisory build-slot lease (kind-30032), optionally exclusive.",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<crate::responses::AcquireBuildSlotResultOut>(),
         annotations(title = "Acquire build slot", destructive_hint = true)
     )]
     async fn acquire_build_slot(
@@ -1258,6 +1294,7 @@ impl ToolServer {
     #[tool(
         name = "renew_build_slot",
         description = "Extend an active build-slot lease's TTL (no-op when missing).",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<Option<crate::responses::BuildSlotOut>>(),
         annotations(title = "Renew build slot", destructive_hint = true)
     )]
     async fn renew_build_slot(
@@ -1280,6 +1317,7 @@ impl ToolServer {
     #[tool(
         name = "release_build_slot",
         description = "Release an active build-slot lease (non-destructive).",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<bool>(),
         annotations(title = "Release build slot", destructive_hint = true)
     )]
     async fn release_build_slot(
@@ -1727,5 +1765,97 @@ mod tests {
         let b = generate_agent_name();
         assert_ne!(a, b, "sequential names differ");
         assert!(a.chars().count() > 3);
+    }
+
+    /// Every tool must declare an outputSchema (ADR-0003 rev7 SEP-2106).
+    /// This is the acceptance gate for bd-jgd: 38/38 tools carry a
+    /// schemars-derived `output_schema` on their tool definition.
+    #[test]
+    fn all_tools_declare_output_schema() {
+        let tools = ToolServer::tool_router().list_all();
+        assert!(!tools.is_empty(), "router must enumerate the 38 tools");
+        let missing: Vec<String> = tools
+            .iter()
+            .filter(|t| t.output_schema.is_none())
+            .map(|t| t.name.to_string())
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "tools missing outputSchema ({}): {}",
+            missing.len(),
+            missing.join(", ")
+        );
+        assert_eq!(tools.len(), 38, "tool count must stay at the AM-Rust parity 38");
+    }
+
+    /// Spot-check the schemas encode the toron-side shapes (bd-96a section 2),
+    /// not a generic `{}` — the schema must name the divergence-critical fields.
+    #[test]
+    fn output_schemas_encode_toron_shapes() {
+        let tools = ToolServer::tool_router().list_all();
+        let by = |n: &str| {
+            tools
+                .iter()
+                .find(|t| t.name == n)
+                .unwrap_or_else(|| panic!("tool {n}"))
+        };
+        let props = |n: &str| {
+            by(n)
+                .output_schema
+                .as_ref()
+                .expect("outputSchema")
+                .get("properties")
+                .and_then(|v| v.as_object())
+                .expect("schema properties")
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        // whois → npub (not integer id), *_ts_us microsecond timestamp.
+        assert!(
+            props("whois").contains(&"npub".to_string()),
+            "whois schema must expose npub"
+        );
+        assert!(
+            props("whois").contains(&"last_active_ts_us".to_string()),
+            "whois schema must expose *_ts_us timestamp"
+        );
+        // send_message → deliveries[].payload {recipient, event_id}.
+        // schemars emits nested types as $ref into $defs — resolve through it.
+        let schema_obj = by("send_message")
+            .output_schema
+            .as_ref()
+            .expect("outputSchema");
+        let deliveries = schema_obj
+            .get("properties")
+            .and_then(|v| v.get("deliveries"))
+            .and_then(|v| v.get("items"))
+            .and_then(|v| v.get("$ref"))
+            .and_then(|v| v.as_str())
+            .and_then(|r| r.strip_prefix("#/$defs/"))
+            .and_then(|name| schema_obj.get("$defs").and_then(|d| d.get(name)))
+            .and_then(|d| d.get("properties"))
+            .and_then(|v| v.get("payload"))
+            .and_then(|v| v.get("$ref"))
+            .and_then(|v| v.as_str())
+            .and_then(|r| r.strip_prefix("#/$defs/"))
+            .and_then(|name| schema_obj.get("$defs").and_then(|d| d.get(name)))
+            .and_then(|d| d.get("properties"))
+            .and_then(|v| v.as_object())
+            .expect("deliveries payload props");
+        assert!(deliveries.contains_key("recipient"), "send payload recipient");
+        assert!(deliveries.contains_key("event_id"), "send payload event_id");
+        // release_file_reservations → {released} (no released_at).
+        assert_eq!(
+            props("release_file_reservations"),
+            vec!["released".to_string()],
+            "release schema = {{released}}"
+        );
+        // set_contact_policy → bare kind-30014 event-id string.
+        assert_eq!(
+            by("set_contact_policy").output_schema.as_ref().unwrap()["type"],
+            "string",
+            "set_contact_policy is a bare string schema"
+        );
     }
 }

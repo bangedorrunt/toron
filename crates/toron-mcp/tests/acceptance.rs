@@ -244,6 +244,21 @@ async fn http_lists_exactly_38_am_rust_tools() -> anyhow::Result<()> {
         "install_precommit_guard destructive"
     );
 
+    // SEP-2106 structured outputs (bd-jgd): every tool carries an outputSchema
+    // over the wire, not just inputSchema.
+    let no_output: Vec<&str> = tools
+        .tools
+        .iter()
+        .filter(|t| t.output_schema.is_none())
+        .map(|t| t.name.as_ref())
+        .collect();
+    assert!(
+        no_output.is_empty(),
+        "tools missing outputSchema on the wire ({}): {}",
+        no_output.len(),
+        no_output.join(", ")
+    );
+
     client.close().await?;
     server.abort();
     Ok(())
