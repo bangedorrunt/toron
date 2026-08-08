@@ -28,6 +28,18 @@ pub struct Workflow {
     /// Steps executed when the trigger fires (ordered).
     #[serde(default)]
     pub steps: Vec<Step>,
+    /// Named inputs for the on-demand invoke path (ADR-0005 Spec 2). On
+    /// invoke, the engine synthesizes a `trigger.*` template context from the
+    /// provided inputs so `{{inputs.x}}` / `{{trigger.x}}` resolve.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inputs: Vec<InputDecl>,
+}
+
+/// A named workflow input declaration (ADR-0005 Spec 2).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InputDecl {
+    /// Input name (referenced as `{{inputs.<name>}}`).
+    pub name: String,
 }
 
 /// A workflow trigger (one of the ADR Phase-2 set).

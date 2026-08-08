@@ -49,7 +49,8 @@ pub use jobs::{
 pub use lint::{Level, LintIssue, LintReport, lint_workflow, lint_yaml};
 pub use mention::{Mention, content_mentions, is_mention, parse_mentions};
 pub use schema::{
-    Action, Step, StepOnError, TemplateContext, Trigger, Workflow, parse_workflow, parse_workflows,
+    Action, InputDecl, Step, StepOnError, TemplateContext, Trigger, Workflow, parse_workflow,
+    parse_workflows,
 };
 pub use trigger_filter::{
     GIFT_WRAP, JOB_EMITS_KINDS, WORKFLOW_EMITTED_TAG, has_workflow_emitted_tag,
