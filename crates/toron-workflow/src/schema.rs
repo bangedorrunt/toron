@@ -42,6 +42,58 @@ pub struct Workflow {
     /// provided inputs so `{{inputs.x}}` / `{{trigger.x}}` resolve.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub inputs: Vec<InputDecl>,
+    /// Auto-crew (ADR-0005 Spec 4c). `Some(Auto)` → the orchestrator infers
+    /// the crew from the workflow's own `profile:` refs. `Some(Explicit(map))`
+    /// → role:count squad spawned once. `None` → no crew (each spawn is
+    /// standalone). The ENGINE does not spawn — the orchestrator (flywheel)
+    /// resolves the crew via the injected `ProfileResolver` DI seam; the
+    /// engine only consumes `@crew.<role>` fan-out counts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub crew: Option<CrewSpec>,
+}
+
+/// Auto-crew declaration (ADR-0005 Spec 4c). Deserializes both `crew: auto`
+/// (the bare string) and `crew: { role: count }` (a map).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
+pub enum CrewSpec {
+    /// `crew: auto` — infer members from the workflow's `profile:` refs
+    /// (count = max parallelism the graph demands). Zero-config.
+    Auto,
+    /// `crew: { role: count }` — spawn this squad once, bind `@crew.<role>`.
+    Explicit(BTreeMap<String, u32>),
+}
+
+impl<'de> serde::Deserialize<'de> for CrewSpec {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Debug, Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            Auto(String),
+            Explicit(BTreeMap<String, u32>),
+        }
+        match Repr::deserialize(deserializer)? {
+            Repr::Auto(s) if s == "auto" => Ok(Self::Auto),
+            Repr::Explicit(map) => Ok(Self::Explicit(map)),
+            other => Err(serde::de::Error::custom(format!(
+                "crew must be `auto` or a {{role: count}} map, got {other:?}"
+            ))),
+        }
+    }
+}
+
+impl CrewSpec {
+    /// The crew role names this spec declares (explicit map keys; auto is
+    /// resolved by the orchestrator).
+    pub fn roles(&self) -> Vec<String> {
+        match self {
+            Self::Auto => Vec::new(),
+            Self::Explicit(map) => map.keys().cloned().collect(),
+        }
+    }
 }
 
 /// A named workflow input declaration (ADR-0005 Spec 2).
@@ -499,6 +551,32 @@ steps:
             step("action: call_workflow\nworkflow: triage\ninputs: {}"),
             Action::CallWorkflow { .. }
         ));
+    }
+
+    /// P3.6: the `crew:` field parses — auto and explicit (ADR-0005 Spec 4c).
+    #[test]
+    fn parse_crew_auto_and_explicit() {
+        // crew: auto
+        let yaml = "name: debate\ntrigger:\n  type: webhook\ncrew: auto\nsteps:\n  - name: a\n    action: send_dm\n    to: x\n    body: y\n";
+        let wf = parse_workflow(yaml).expect("crew auto parses");
+        assert_eq!(wf.crew, Some(CrewSpec::Auto));
+
+        // crew: { role: count }
+        let yaml = "name: ship\ntrigger:\n  type: webhook\ncrew:\n  planner: 1\n  coder: 2\nsteps:\n  - name: a\n    action: send_dm\n    to: x\n    body: y\n";
+        let wf = parse_workflow(yaml).expect("crew explicit parses");
+        assert_eq!(
+            wf.crew,
+            Some(CrewSpec::Explicit(BTreeMap::from([
+                ("planner".to_string(), 1),
+                ("coder".to_string(), 2),
+            ])))
+        );
+        assert_eq!(wf.crew.unwrap().roles().len(), 2);
+
+        // omitted → None
+        let yaml = "name: plain\ntrigger:\n  type: webhook\nsteps:\n  - name: a\n    action: send_dm\n    to: x\n    body: y\n";
+        let wf = parse_workflow(yaml).expect("no crew parses");
+        assert_eq!(wf.crew, None);
     }
 
     #[test]
