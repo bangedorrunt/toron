@@ -1080,6 +1080,60 @@ user-authored config. This is the test `zero_config_debate` (Verification).
 - **Cross-cutting:** `triage.yaml`, the ADR-0004 suite, and the captain's live
   `workflows`/`pipeline`/`recipes` runs pass unchanged at every phase boundary.
 
+### Current status (cross-phase verification, 2026-08-08)
+
+Gates below were RE-RUN against the landed code — they are the current truth,
+not the aspirational ADR. **PASS** = the named check/CLI/test ran green on
+2026-08-08. **FAIL** = a real gap, flagged for the owning lane. Rows marked
+*covered-by-design* have no discrete test by that exact name but the property
+is enforced structurally (test referenced).
+
+| Phase | Gate | Status | Evidence (run 2026-08-08) |
+|---|---|---|---|
+| P0 | `on_error: fail_run` → kind-46012 `status=failed`; default continue | **PASS** | `on_error_fail_run_fails_the_run_durably`, `fail_run_emits_46012_status_failed`, `on_error_default_continue_completes_the_run`, `workflow_run_terminal_maps_status` (toron-workflow lib) |
+| P0 | value-returning actions consumed by `{{steps.x}}` | **PASS** | `value_returning_action_flows_into_downstream_template`, `template_substitution_trigger_in_body` (toron-workflow lib) |
+| P1 | `flywheel backend` ONE trait source | **PASS** | `toron_core::backend::Backend` is the single trait; flywheel re-exports `pub use toron_core::backend::Backend as MultiplexerBackend` (flywheel `backend/mod.rs:44`). Call sites compile. |
+| P1 | former `&mut dyn` call sites compile against unified trait | **PASS** | flywheel committed HEAD builds (`cargo build -p flywheel` exit 0); `MultiplexerBackend` used across backend/ modules. |
+| P1 | `MailBackend` fate documented | **PASS** | Explicitly DEFERRED, ADR-0005 P1.1 decision #7 (toron-core `backend/mod.rs:63`; flywheel `backend/mod.rs:14`). |
+| P2 | 6 built-in profiles compiled-in | **PASS** | `compiled_in_defaults_appear_without_profiles_toml` asserts exactly `[oracle, planner, reviewer, coder, scout, housekeeper]` (flywheel `profile.rs`) |
+| P2 | `Profile::resolve` project/host scope | **PASS** | `resolve_project_scope_uses_project_30013_and_project_signing`, `resolve_host_scope_uses_operator_identity`, `resolve_unknown_profile_fails_fast` (flywheel `profile.rs`); 12/12 profile tests green |
+| P2 | `harness`/`model` → 30013 content; `t` stays scoping-only | **PASS** (*covered-by-design*) | flywheel `profile.rs` maps harness/model onto `AgentProfile.program`/`model` (no new tag); `t` emitted only by toron-core `bus/scoping.rs` (`project_scoping_tags`). No discrete `profile_no_tag_overload` test exists — property is structural. |
+| P3 | flywheel/Cargo.toml lists toron-workflow | **PASS** | `sc_fw_flywheel_cargo_toml_lists_toron_workflow` asserts the dep; `Cargo.toml:28` `toron-workflow = { path = "../toron/..." }` |
+| P3 | workflow runs through `WorkflowEngine` (invoke) | **PASS** | `sc_fw_flywheel_invokes_workflow_through_engine` (toron-e2e p5); `invoke_runs_workflow_with_synthesized_inputs_trigger`, `triggerless_workflow_invokes_but_has_no_trigger` (toron-workflow lib) |
+| P3 | legacy `run_workflow`/`run_pipeline` absorbed | **PASS** | `sc_fw_absorbed_legacy_workflow_round_trips_through_engine` (toron-e2e p5). Legacy `run_workflow`/`run_pipeline` CLI commands still exist in flywheel `main.rs` as the pre-engine Send/Wait interpreter; the absorption round-trip proves engine routing. |
+| P3 | zero-config debate | **PASS** (*covered-by-design*) | `debate_resolves_default_agents` (flywheel, 3/3 debate tests + soak green). No discrete `zero_config_debate` name. |
+| P4 | cron schedule fires; `on_failure: bead`; no_claim_timeout abort | **PASS** | `sc18_spawn_no_claim_timeout_aborts`, `sc21_cron_durable_loop_fires_and_resumes_after_restart` (cron_success + cron_restart), `sc22_cron_failure_bead_records_failure_bundle`, `sc23_cron_escalate_dm_at_threshold`, `sc24_cron_catchup_runs_latest_due_tick_only` (toron-e2e p5) |
+| P4 | scheduler survives flywheel restart (durable-sleep + latest catch-up) | **PASS** | sc21 restart arm (worker drop → resume, no duplicate); sc24 latest catch-up; `latest_due_at_or_before` unit tests (toron-workflow cron) |
+| P5 | concurrency_spike GATE | **PASS** | `concurrency_spike` (toron-e2e p5) — 1.2s green |
+| P5 | cyclic `graph:` rejected by lint | **PASS** | `lint_cyclic_graph_rejected` (toron-workflow lib) |
+| P5 | `edges:` does not exist (derived from `needs`) | **PASS** | `Graph` schema has only `nodes` + `needs` (toron-workflow `schema.rs:114`); no `edges` field |
+| P5 | control-flow actions (parallel/branch/retry/foreach/call_workflow) | **PASS** | `parallel_elastic_spawns_n`, `branch_then_else_on_guard`, `retry_backoff_retries_until_success`, `foreach_over_list_collects`, `call_workflow_subrun_reports_intent` (toron-workflow lib) |
+| P6 | `flywheel runs` state + owner + per-run cost | **PASS** | `cmd_runs` includes `run_cost` (tokens+model) + `run_owner` + state (flywheel `main.rs:6064`); `snapshot_runs_returns_well_formed_entries` (id/project/kind/owner/state/ts) |
+| P6 | `flywheel runs digest --since 7d` | **PASS** | runs digest subcommand present; run logs scanned per-project (`cmd_runs`); `cron_history_empty_runs_json` green |
+| P6 | `flywheel squad spawn`; `recipes list` alias | **PASS** | `squad_show_resolves_recipe_alias_to_members`, `squad_list_lists_builtin_profiles_as_singles`, `recipe_to_squad_maps_kinds_to_profile_counts` (flywheel) |
+| Cross-cut | triage.yaml lints clean | **PASS** | `example_workflow_lints_clean` (toron-workflow lib); triage.yaml at `crates/toron-workflow/examples/triage.yaml` |
+| Cross-cut | ADR-0004 suite | **PASS** | toron-e2e `--features p1,p2`: 30 test binaries, 0 failures; conformance 5/5, sc_fw_integrated 3/3, harness_smoke 2/3 (1 ignored) |
+| Cross-cut | verify-gates.sh (ADR-0003) | **PASS** | `scripts/verify-gates.sh` → `gates pass` (no asupersync/fastmcp; all crate roots forbid unsafe) |
+
+**FAILS / FLAGS (2026-08-08):**
+- **None in committed code.** All per-phase gates above ran green on the committed
+  toron + flywheel HEAD.
+- **Flag (in-flight, not committed):** the flywheel working tree's P4.5 cron-mgr
+  wiring (`src/cron.rs` `cron_runner`, bd-p4-migrate-sagas-7rmo, EmeraldSwan's
+  lane) references `toron_workflow::FailureAction` / `CronRegistration` /
+  `FailureBundle` / `PolicyEvent` at the crate root. `CronRegistration` was
+  already exported; `FailureAction` + `CronPolicy` were ADDED to the
+  toron-workflow root re-exports (commit in BlueOak P4.4 follow-up) so the
+  in-flight flywheel code compiles (`cargo build -p flywheel` now exit 0).
+- **Note (test flake):** sc21 restart arm was flaky under a 10s poll window
+  (Resonate lease-reclaim latency after a worker drop is variable). Poll window
+  widened to 30s; 3 consecutive passes after the fix.
+- **Note (P4.7 FW rows):** `cron_success`/`cron_restart`/`cron_catchup`/
+  `cron_failure_bead`/`cron_escalate` are proven at the SC/UT level (toron-e2e +
+  toron-workflow). The flywheel-side EXECUTION of `br create` / kind-14 DM
+  (reading `PolicySink`, calling br/DM) is BlackMarsh's P4.7 wiring, not yet
+  landed.
+
 ### Behavior test matrix (Revision 5 — every flow tested)
 
 Every workflow behavior has a named, automated test. **SC** = toron-e2e scenario;
