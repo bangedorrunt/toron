@@ -25,6 +25,10 @@ pub struct Workflow {
     /// `Some` → reactive AND invocable.
     #[serde(default)]
     pub trigger: Option<Trigger>,
+    /// Cron failure/success policy (ADR-0005 Spec 3). Only meaningful for a
+    /// `schedule` trigger; the cron manager + smart cron consume it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<CronPolicy>,
     /// Optional evalexpr guard over the trigger payload (100ms timeout).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guard: Option<String>,
@@ -166,13 +170,82 @@ pub enum Trigger {
         #[serde(default)]
         to_state: Option<String>,
     },
-    /// A cron schedule.
-    Schedule { cron: String },
+    /// A cron schedule (ADR-0005 Spec 3). The owning profile + signing scope
+    /// live here; the failure/success `policy` is a workflow-level field (the
+    /// cron manager + smart cron consume both).
+    Schedule {
+        cron: String,
+        /// The profile that OWNS this cron (Spec 3): the fixer's identity.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner: Option<String>,
+        /// Signing scope (Spec 1 scope rule): host = operator identity;
+        /// project = a project-scoped agent.
+        #[serde(default)]
+        scope: CronScope,
+    },
     /// An external webhook fired.
     Webhook {
         #[serde(default)]
         event: Option<String>,
     },
+}
+
+/// The signing scope for a `schedule` trigger (ADR-0005 Spec 3 / Spec 1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CronScope {
+    /// Host scope: the operator identity signs (cross-project maintenance).
+    #[default]
+    Host,
+    /// Project scope: a project-scoped agent signs.
+    Project,
+}
+
+/// What to do on a cron run's failure/success (ADR-0005 Spec 3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureAction {
+    /// Log the failure (no external effect).
+    #[default]
+    Log,
+    /// Open a `br` bead with the failure bundle.
+    Bead,
+    /// Escalate (kind-14 DM to the captain, importance=high).
+    Escalate,
+}
+
+/// The cron policy block (ADR-0005 Spec 3): how a schedule run's outcome is
+/// handled by smart cron.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CronPolicy {
+    /// `on_failure` — the first-failure action.
+    #[serde(default)]
+    pub on_failure: FailureAction,
+    /// `on_repeat_failure` — after `repeat_threshold` consecutive failures.
+    #[serde(default)]
+    pub on_repeat_failure: FailureAction,
+    /// Consecutive failures before `on_repeat_failure` triggers.
+    #[serde(default = "default_repeat_threshold")]
+    pub repeat_threshold: u32,
+    /// `on_success` — the success action.
+    #[serde(default)]
+    pub on_success: FailureAction,
+    /// In-run retries before declaring failure.
+    #[serde(default)]
+    pub max_retries: u32,
+    /// Abort a spawn-await after N seconds unclaimed (default 600s).
+    #[serde(default = "default_no_claim_timeout")]
+    pub no_claim_timeout: u64,
+}
+
+/// Default repeat threshold (3 consecutive failures).
+fn default_repeat_threshold() -> u32 {
+    3
+}
+
+/// Default spawn-await claim timeout (600s = 10m).
+fn default_no_claim_timeout() -> u64 {
+    600
 }
 
 impl Trigger {
@@ -577,6 +650,86 @@ steps:
         let yaml = "name: plain\ntrigger:\n  type: webhook\nsteps:\n  - name: a\n    action: send_dm\n    to: x\n    body: y\n";
         let wf = parse_workflow(yaml).expect("no crew parses");
         assert_eq!(wf.crew, None);
+    }
+
+    /// P4.1 (ADR-0005 Spec 3): the schedule trigger extension parses —
+    /// owner/scope/policy. Backward-compatible: bare `cron` still parses.
+    #[test]
+    fn parse_schedule_trigger_extension() {
+        let yaml = r##"
+name: weekly-upgrade
+trigger:
+  type: schedule
+  cron: "30 3 * * 0"
+  owner: housekeeper
+  scope: host
+policy:
+  on_failure: bead
+  on_repeat_failure: escalate
+  repeat_threshold: 3
+  on_success: log
+  max_retries: 1
+  no_claim_timeout: 600
+steps:
+  - name: upgrade
+    action: send_dm
+    to: pi
+    body: go
+"##;
+        let wf = parse_workflow(yaml).expect("extended schedule parses");
+        match &wf.trigger {
+            Some(Trigger::Schedule { cron, owner, scope, .. }) => {
+                assert_eq!(cron, "30 3 * * 0");
+                assert_eq!(owner.as_deref(), Some("housekeeper"));
+                assert_eq!(*scope, CronScope::Host);
+            }
+            other => panic!("expected Schedule trigger, got {other:?}"),
+        }
+        let p = wf.policy.as_ref().expect("policy present");
+        assert_eq!(p.on_failure, FailureAction::Bead);
+        assert_eq!(p.on_repeat_failure, FailureAction::Escalate);
+        assert_eq!(p.repeat_threshold, 3);
+        assert_eq!(p.on_success, FailureAction::Log);
+        assert_eq!(p.max_retries, 1);
+        assert_eq!(p.no_claim_timeout, 600);
+    }
+
+    /// P4.1: `scope: project` parses; defaults apply when omitted.
+    #[test]
+    fn parse_schedule_scope_project_and_defaults() {
+        let yaml = r##"
+name: project-cron
+trigger:
+  type: schedule
+  cron: "* * * * *"
+  scope: project
+steps:
+  - name: a
+    action: send_dm
+    to: pi
+    body: x
+"##;
+        let wf = parse_workflow(yaml).expect("project scope parses");
+        match &wf.trigger {
+            Some(Trigger::Schedule { scope, .. }) => {
+                assert_eq!(*scope, CronScope::Project);
+            }
+            other => panic!("expected Schedule trigger, got {other:?}"),
+        }
+        // Omitted policy → None (cron manager uses defaults).
+        assert!(wf.policy.is_none());
+
+        // Backward compat: bare cron (no owner/scope/policy) → defaults.
+        let yaml = "name: bare\ntrigger:\n  type: schedule\n  cron: '* * * * *'\nsteps:\n  - name: a\n    action: send_dm\n    to: pi\n    body: x\n";
+        let wf = parse_workflow(yaml).expect("bare cron parses");
+        match &wf.trigger {
+            Some(Trigger::Schedule { scope, owner, .. }) => {
+                assert_eq!(*scope, CronScope::Host, "default scope = host");
+                assert!(owner.is_none());
+            }
+            other => panic!("expected Schedule trigger, got {other:?}"),
+        }
+        assert!(wf.policy.is_none());
     }
 
     #[test]

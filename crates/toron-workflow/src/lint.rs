@@ -102,7 +102,7 @@ pub fn lint_workflow(wf: &Workflow) -> LintReport {
                     });
                 }
             }
-            Trigger::Schedule { cron } => {
+            Trigger::Schedule { cron, .. } => {
                 // Validate the 5/6-field cron shape crudely (non-empty, 5+ fields).
                 let fields: Vec<&str> = cron.split_whitespace().collect();
                 if fields.len() < 5 || fields.len() > 6 {
@@ -678,6 +678,62 @@ graph:
         assert!(
             err.contains("no_such_trigger"),
             "names the unknown type: {err}"
+        );
+    }
+
+    /// P4.1: the extended schedule trigger (owner/scope/policy) lints clean —
+    /// valid cron + valid policy enums.
+    #[test]
+    fn lint_extended_schedule_clean() {
+        let yaml = r##"
+name: weekly-upgrade
+trigger:
+  type: schedule
+  cron: "30 3 * * 0"
+  owner: housekeeper
+  scope: host
+policy:
+  on_failure: bead
+  on_repeat_failure: escalate
+  repeat_threshold: 3
+  on_success: log
+  max_retries: 1
+  no_claim_timeout: 600
+steps:
+  - name: upgrade
+    action: send_dm
+    to: pi
+    body: go
+"##;
+        let report = lint_yaml(yaml).expect("parses");
+        assert!(
+            report.is_clean(),
+            "extended schedule must lint clean: {:?}",
+            report.issues
+        );
+    }
+
+    /// P4.1: an invalid policy enum value is a parse error (fail-stop).
+    #[test]
+    fn lint_invalid_policy_enum_fails() {
+        let yaml = r##"
+name: bad-cron
+trigger:
+  type: schedule
+  cron: "* * * * *"
+  owner: housekeeper
+policy:
+  on_failure: explode
+steps:
+  - name: a
+    action: send_dm
+    to: pi
+    body: x
+"##;
+        let err = lint_yaml(yaml).expect_err("bad policy enum fails parse");
+        assert!(
+            err.contains("on_failure") || err.contains("unknown variant"),
+            "names the bad policy value: {err}"
         );
     }
 
