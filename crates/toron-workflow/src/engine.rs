@@ -960,6 +960,40 @@ steps:
         }
     }
 
+    /// P3.4 (ADR-0005 Spec 2): a workflow with NO trigger (`trigger:` omitted)
+    /// is invoke-only — it runs via `WorkflowEngine::invoke` but has no
+    /// reactive trigger to auto-fire.
+    #[tokio::test]
+    async fn triggerless_workflow_invokes_but_has_no_trigger() {
+        let engine = WorkflowEngine::local(noop_runner()).expect("engine");
+        let wf = parse_workflow(
+            r##"
+name: invoke-only
+inputs:
+  - name: goal
+steps:
+  - name: plan
+    action: send_dm
+    to: "pi"
+    body: "planning {{inputs.goal}}"
+"##,
+        )
+        .expect("trigger-less workflow parses");
+
+        // The workflow carries no reactive trigger.
+        assert!(
+            wf.trigger.is_none(),
+            "invoke-only workflow must not auto-fire (no trigger)"
+        );
+
+        // It runs via invoke, and {{inputs.x}} resolves.
+        let output = engine
+            .invoke("wf-invoke-only-1", wf, serde_json::json!({ "goal": "go" }))
+            .await
+            .expect("invoke-only workflow runs");
+        assert!(output.get("plan").is_some(), "invoke-only ran: {output}");
+    }
+
     /// A workflow whose first step's action returns `{"n":42}`; the second
     /// step's action references `{{steps.foo.n}}` in a body field. The engine
     /// must (a) populate `steps.<name>` from the runner's return and (b)
