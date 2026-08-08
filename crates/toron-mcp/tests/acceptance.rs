@@ -300,3 +300,60 @@ async fn stdio_initialize_completes() -> anyhow::Result<()> {
         Err(e) => Err(anyhow::anyhow!("stdio initialize failed: {e}")),
     }
 }
+
+/// ADR-0006 (bd-esh.5): the daemon router serves the Blossom surface at
+/// `/.blossom` alongside the `/mcp` MCP transport — a PUT upload then a GET
+/// retrieval round-trip over live HTTP.
+#[tokio::test]
+async fn blossom_route_serves_upload_and_retrieval() -> anyhow::Result<()> {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode, header};
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    let router = toron_mcp::router().await?;
+    // Directly exercise the merged router (no socket needed for the contract).
+    let payload = b"blossom round-trip payload";
+
+    // PUT /upload
+    let put = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/.blossom/upload")
+                .header(header::CONTENT_TYPE, "text/plain")
+                .body(Body::from(payload.to_vec()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        put.status() == StatusCode::CREATED || put.status() == StatusCode::OK,
+        "upload accepted (BUD-02: 201 new or 200 existing), got {}",
+        put.status()
+    );
+    let descriptor: serde_json::Value =
+        serde_json::from_slice(&put.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let hash = descriptor["sha256"].as_str().unwrap().to_string();
+
+    // GET /<hash>
+    let get = router
+        .oneshot(
+            Request::builder()
+                .uri(format!("/.blossom/{hash}.txt"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(get.status(), StatusCode::OK, "retrieval ok");
+    assert_eq!(
+        get.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN],
+        "*",
+        "BUD-01 CORS"
+    );
+    let got = get.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(got.as_ref(), payload, "retrieved bytes match");
+    Ok(())
+}
