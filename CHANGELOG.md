@@ -18,6 +18,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with state + owner + advisory per-run cost; `digest --since N[smhd]`
   reports failures/parked/broken>N; `--robot-snapshot` now carries a `runs`
   array for agent drivers.
+- **P6 — Squads + observability COMPLETE** (ADR-0005, epic
+  `bd-p6-squads-observability-61td`): squad/recipe unification, squad CLI +
+  recipes alias, runs dashboard, robot-snapshot runs section, and the P6
+  Behavior Test Matrix rows (`recipe_to_squad`, `runs_view`, squad CLI,
+  `snapshot_runs`) all green. P6 is the last closed phase before P4 (smart
+  cron) under the ADR-0005 orchestration tier.
 - **ADR-0004 primitives LIVE in the daemon** (bd-pkc part 1): the MCP
   daemon's inbound path now runs the `UnwrapPipeline` projection loop
   (`Mailbox::spawn_unwrap_loop`) — inbound gift-wraps are unwrapped with the
