@@ -56,6 +56,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `cargo-clippy` (nightly driver) shadows rustup's — use `cargo +stable
   clippy` or the rustup binary; CI (rustup-based) unaffected.
 
+### Fixed
+
+- **Inbound gift-wraps attributed to their project** (2026-08-08) — the
+  unwrap-loop projection stored an empty `project_slug` (the wrap hides
+  metadata), so project-filtered search always returned `[]`. Registration now
+  indexes the `agents` table with the verbatim project slug, and the pipeline
+  resolves `project_slug` from the recipient key at projection time; absolute
+  project keys round-trip exactly (leading separator preserved).
+- **Absolute project keys no longer escape `data_dir`** — `agent_key_path`
+  strips the leading separator (was: `PathBuf::join` discarded the prefix, so
+  keys landed in the slug's own tree and the unwrap-loop key scan never found
+  them → projection never ran); the local-key scan is a bounded recursive walk
+  (MAX_DEPTH 16, symlink-safe).
+- **`search_messages` envelope parity with agent-mail** — returns
+  `{result, next_cursor}` (`s<sort>:i<last-id>`) when rows are non-empty,
+  matching the AM contract so the flywheel parity harness can compare shapes.
+
 ### Notes
 
 - Bead bd-3wc closed: the "nightly features" payoff for toron is delivered
