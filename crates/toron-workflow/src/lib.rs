@@ -37,6 +37,7 @@ pub use dispatch::{DispatchConfig, DispatchPermit, DispatchPool, QueuedJob};
 pub use engine::{
     ActionRunner, Decision, GraphNodeInput, ParallelCopyInput, RunInput, WorkflowEngine,
     build_workflow_run_terminal, run_graph_node, run_parallel_copy, run_workflow,
+    stamp_workflow_emitted,
 };
 pub use guard::{
     DEFAULT_TIMEOUT_MS, GuardOutcome, evaluate_guard, evaluate_guard_default,

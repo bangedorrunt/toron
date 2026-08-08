@@ -711,6 +711,30 @@ pub async fn run_graph_node(
     }
 }
 
+/// The `toron:workflow-emitted` stamp (ADR-0004 Ship 2 / bd-pkc part 3).
+///
+/// The ActionRunner's embedding applies this single-`t` tag to every event a
+/// workflow action emits, so the trigger-ingress filter
+/// ([`crate::trigger_filter::should_evaluate_trigger_event`]) rejects
+/// workflow-emitted events by tag — loop-prevention defense-in-depth
+/// (workflow emits never re-trigger the same workflow).
+///
+/// The stamp is a pure builder: given a tags vector, returns a new vector
+/// with the marker `t`-tag appended (idempotent — never double-stamps).
+pub fn stamp_workflow_emitted(tags: Vec<nostr_sdk::prelude::Tag>) -> Vec<nostr_sdk::prelude::Tag> {
+    use crate::trigger_filter::WORKFLOW_EMITTED_TAG;
+    if tags
+        .iter()
+        .any(|t| t.as_slice().get(0).map(String::as_str) == Some("t")
+            && t.as_slice().get(1).map(String::as_str) == Some(WORKFLOW_EMITTED_TAG))
+    {
+        return tags;
+    }
+    let mut out = tags;
+    out.push(nostr_sdk::prelude::Tag::parse(["t", WORKFLOW_EMITTED_TAG]).expect("stamp tag"));
+    out
+}
+
 /// Build the kind-46012 workflow-run terminal event (ADR-0005 Spec 0, P0.3).
 /// Maps the durable function's outcome Value to the wire `status` field —
 /// additive content only (the kind is frozen; its content is toron-owned; old
@@ -1192,6 +1216,26 @@ steps:
             "step outputs preserved on the wire under `output`"
         );
         assert!(content.get("error").is_none(), "no error on success");
+    }
+
+    /// bd-pkc part 3: the `toron:workflow-emitted` stamp appends the marker
+    /// `t`-tag once (idempotent) — the loop-prevention belt.
+    #[test]
+    fn workflow_emitted_stamp_is_idempotent() {
+        use nostr_sdk::prelude::Tag;
+        let plain = vec![Tag::parse(["e", "abc"]).expect("e tag")];
+        let stamped = stamp_workflow_emitted(plain);
+        assert_eq!(stamped.len(), 2, "marker appended");
+        assert!(
+            stamped.iter().any(|t| t.as_slice().get(0).map(String::as_str) == Some("t")
+                && t.as_slice().get(1).map(String::as_str)
+                    == Some(crate::trigger_filter::WORKFLOW_EMITTED_TAG)),
+            "toron:workflow-emitted t-tag present"
+        );
+        // Idempotent: re-stamping adds nothing.
+        let re = stamp_workflow_emitted(stamped.clone());
+        assert_eq!(re.len(), 2, "no double stamp");
+        assert_eq!(re, stamped);
     }
 
     /// P0.4 end-to-end (Behavior Test Matrix row `error_fail_run`): a
