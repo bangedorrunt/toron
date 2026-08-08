@@ -140,6 +140,52 @@ pub enum Command {
 
     /// Interactive operator dashboard (ratatui; standalone-daemon TUI).
     Tui(TuiArgs),
+
+    /// Workflow (ADR-0005 Spec 5): lint/validate/run/invoke/dry-run a single
+    /// workflow file — the fabric (standalone) surface. Orchestration
+    /// (catalogs/cron/crews) lives in flywheel.
+    #[command(subcommand)]
+    Workflow(WorkflowCommand),
+}
+
+/// toron workflow (fabric) subcommands (ADR-0005 Spec 5).
+#[derive(Debug, clap::Subcommand)]
+pub enum WorkflowCommand {
+    /// Static validation: schema + guard syntax + template refs + graph
+    /// acyclicity. Exit 0 clean, 1 on any blocking issue, 2 on parse failure.
+    Lint {
+        /// Workflow YAML file.
+        file: std::path::PathBuf,
+    },
+    /// Alias for `workflow lint`.
+    Validate {
+        /// Workflow YAML file.
+        file: std::path::PathBuf,
+    },
+    /// Run a workflow from a trigger event payload.
+    Run {
+        /// Workflow YAML file.
+        file: std::path::PathBuf,
+        /// Trigger payload JSON (the `{{trigger.*}}` context).
+        #[arg(long, default_value = "{}")]
+        trigger: String,
+    },
+    /// Invoke a workflow on-demand with inputs (no trigger event).
+    Invoke {
+        /// Workflow YAML file.
+        file: std::path::PathBuf,
+        /// Inputs JSON (the `{{inputs.x}}` context).
+        #[arg(long, default_value = "{}")]
+        inputs: String,
+    },
+    /// Lint + show what would run without executing.
+    DryRun {
+        /// Workflow YAML file.
+        file: std::path::PathBuf,
+        /// Trigger payload JSON.
+        #[arg(long, default_value = "{}")]
+        trigger: String,
+    },
 }
 
 #[derive(Debug, Args)]

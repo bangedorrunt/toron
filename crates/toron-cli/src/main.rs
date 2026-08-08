@@ -7,6 +7,7 @@ mod operator;
 mod output;
 mod robot;
 mod tui;
+mod workflow;
 
 use std::process::ExitCode;
 
@@ -91,6 +92,17 @@ fn run(cli: &Cli) -> anyhow::Result<ExitCode> {
         Command::Tui(args) => {
             tui::run_tui(args)?;
             ExitCode::SUCCESS
+        }
+        Command::Workflow(cmd) => {
+            use crate::cli::WorkflowCommand;
+            let code = match cmd {
+                WorkflowCommand::Lint { file } => workflow::lint(file)?,
+                WorkflowCommand::Validate { file } => workflow::lint(file)?,
+                WorkflowCommand::Run { file, trigger } => workflow::run(file, trigger)?,
+                WorkflowCommand::Invoke { file, inputs } => workflow::invoke(file, inputs)?,
+                WorkflowCommand::DryRun { file, trigger } => workflow::dry_run(file, trigger)?,
+            };
+            ExitCode::from(code as u8)
         }
         Command::Mail(_)
         | Command::Reserve(_)
