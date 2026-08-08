@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **ADR-0004 primitives LIVE in the daemon** (bd-pkc part 1): the MCP
+  daemon's inbound path now runs the `UnwrapPipeline` projection loop
+  (`Mailbox::spawn_unwrap_loop`) — inbound gift-wraps are unwrapped with the
+  local agent keys, gated by the G14 contact policy, operator-Overseer-bypass
+  aware, and written idempotently to the index. Wired in `demo_mailbox()`.
+  The pipeline rebuilds when the on-disk agent-key set changes (runtime
+  registration). Agent-key signature is now file-path based (no argon2 KDF in
+  the async loop — the ≈1s/key decrypt runs once per registration, not per
+  wrap). `BusPolicySource::load_many` added for multi-recipient policy
+  snapshots.
+
 ### Changed
 
 - **Edition 2021 → 2024** across all 5 workspace crates. Unlocks `let_chains`
