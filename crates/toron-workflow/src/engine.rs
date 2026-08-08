@@ -633,10 +633,16 @@ async fn run_foreach(
         .unwrap_or_default();
     let mut collected = Vec::new();
     for item in &list {
-        // Each iteration sees the current item as `{{item}}`.
+        // Each iteration sees the current item as `{{item}}` (ADR-0007 F4):
+        // inject it into the iteration's trigger copy so the template
+        // renderer can resolve it.
+        let mut iter_trigger = serde_json::Value::Object(serde_json::Map::new());
+        if let Some(obj) = trigger.as_object() {
+            iter_trigger = serde_json::Value::Object(obj.clone());
+        }
+        iter_trigger["item"] = item.clone();
         let mut item_outputs = serde_json::Map::new();
-        let value = run_step(ctx, runner, trigger, each, &mut item_outputs).await?;
-        let _ = item;
+        let value = run_step(ctx, runner, &iter_trigger, each, &mut item_outputs).await?;
         collected.push(value);
     }
     Ok(serde_json::Value::Array(collected))
@@ -1084,9 +1090,23 @@ fn resolve_template(
     trigger: &serde_json::Value,
     step_outputs: &serde_json::Map<String, serde_json::Value>,
 ) -> Option<String> {
-    let (root, path) = token.split_once('.')?;
+    let (root, path) = match token.split_once('.') {
+        Some((root, path)) => (root, path),
+        // Bare `{{item}}` — the current foreach iteration's value (injected
+        // into the iteration trigger by run_foreach).
+        None if token == "item" => ("item", ""),
+        None => return None,
+    };
     let value = match root {
         "trigger" => trigger,
+        // `{{item}}` / `{{item.<path>}}` — the current foreach iteration value.
+        "item" => {
+            let item = trigger.get("item")?;
+            if path.is_empty() {
+                return Some(render_scalar(item));
+            }
+            return descend(item, path.split('.')).map(render_scalar);
+        }
         // `{{inputs.x}}`: the invoke path embeds the caller's inputs under
         // `trigger.inputs` (invoke synthesizes the trigger payload from them).
         // Resolve the bare `inputs` root too — `{{inputs.goal}}` ==
@@ -1969,7 +1989,10 @@ steps:
         assert!(matches!(last, Some(Action::SendDm { body, .. }) if body == "no"));
     }
 
-    /// P5.3: `foreach` — iterate over a list; collect sub-run outputs.
+    /// P5.3 + ADR-0007 F4: `foreach` — iterate over a list; collect sub-run
+    /// outputs. Each iteration injects the current item as `{{item}}`, so the
+    /// sub-action's rendered body is the element itself (a/b/c), not a
+    /// literal template.
     #[tokio::test]
     async fn foreach_over_list_collects() {
         use std::sync::Mutex as StdMutex;
@@ -1988,11 +2011,11 @@ trigger:
 steps:
   - name: iterate
     action: foreach
-    over: "[1,2,3]"
+    over: '["a","b","c"]'
     each:
       action: send_dm
       to: pi
-      body: item
+      body: "{{item}}"
 "##,
         )
         .expect("parse foreach workflow");
@@ -2008,6 +2031,18 @@ steps:
             .expect("foreach run completes");
         let list = output["iterate"].as_array().expect("collected list");
         assert_eq!(list.len(), 3, "one sub-run per item");
+        // ADR-0007 F4: the three sub-runs must carry bodies a/b/c — the
+        // current item injected into the per-iteration template context.
+        let bodies: Vec<String> = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|a| match a {
+                Action::SendDm { body, .. } => body.clone(),
+                other => panic!("expected send_dm action, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(bodies, vec!["a", "b", "c"]);
     }
 
     /// P5.3: `parallel` — elastic N concurrent copies, collected into a list.
