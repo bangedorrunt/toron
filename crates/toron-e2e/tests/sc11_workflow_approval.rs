@@ -61,7 +61,7 @@ fn noop_runner() -> ActionRunner {
     Arc::new(|a: &Action| {
         // Record step actions for the "step events emitted throughout" assert.
         eprintln!("[sc11] action: {}", a.type_name());
-        Ok(())
+        Ok(serde_json::Value::Null)
     })
 }
 
