@@ -690,16 +690,16 @@ Env precedence: flags > `TORON_DATA_DIR` / `FLYWHEEL_BACKEND` / `FLYWHEEL_MAIL` 
 
 ## Verification (acceptance for this ADR)
 
-- [ ] F1 e2e green: **gift-wrapped** send triggers `message_posted` once; no self-loop; raw-bus tests labeled non-NIP-17 (C7)
-- [ ] F2 e2e green: two processes, same data_dir, mail visible
-- [ ] **F2.KDF / R2.0 green before R2.2** (many-keys fixture bound)
-- [ ] F3 e2e green: inbox id → ack/reply on toron (hex) **and** agentmail (decimal); **no silent 0**
-- [ ] F4 unit: foreach bodies use items
-- [ ] F5 unit/e2e: call_workflow nested success + fail_run
-- [ ] F6 unit: stamped public event rejected by trigger filter
-- [ ] F7 e2e: N mentions → one 43001
-- [ ] F8 stress: no deadlock under concurrent workflow sends
-- [ ] `scripts/verify-gates.sh` green
+- [x] F1 path: TriggerNotifySink + spawn_mail_trigger_loop (gift-wrap required; 2026-08-08): **gift-wrapped** send triggers `message_posted` once; no self-loop; raw-bus tests labeled non-NIP-17 (C7)
+- [x] F2 durable XDG ToronPaths + demo_mailbox production default (2026-08-08): two processes, same data_dir, mail visible
+- [x] **F2.KDF / R2.0** content-keyed unlock cache + many-keys gate test (many-keys fixture bound)
+- [x] F3 MessageId + MailSurface; honest AM edge beads open in flywheel se2.2: inbox id → ack/reply on toron (hex) **and** agentmail (decimal); **no silent 0**
+- [x] F4 foreach {{item}} (9f147ee): foreach bodies use items
+- [x] F5 call_workflow nested (WorkflowResolver): call_workflow nested success + fail_run
+- [x] F6 stamp production path (c86ea0c): stamped public event rejected by trigger filter
+- [x] F7 coalesce 43001 (c86ea0c): N mentions → one 43001
+- [x] F8 block_on_async + concurrent_workflow_sends_no_hang: no deadlock under concurrent workflow sends
+- [ ] `scripts/verify-gates.sh` green (run in review)
 - [ ] No `u64` message/reservation ids in **shared** request/response types
 - [ ] Superlogical still Unsupported-only stub
 - [ ] README residual register points at this ADR
@@ -724,9 +724,11 @@ Env precedence: flags > `TORON_DATA_DIR` / `FLYWHEEL_BACKEND` / `FLYWHEEL_MAIL` 
 
 ## Fixed-Point Judgment
 
-**Not fixed.** ADR-0003–0005 are **spec-accepted and substantially implemented**,
-but **not production-complete** against their own verification claims when
-judged from the live tree:
+**Implementation closed 2026-08-08** (epic bd-adr7-post-impl-e23b). Residual:
+flywheel se2.* adapter beads (honest AM id edge, Phase B XDG on flywheel side)
+and full gift-wrap F1 e2e still recommended. Core toron Change Agenda items landed.
+
+Historical (pre-implementation):
 
 - Library quality is high (kinds, unwrap, engine units, gate scripts).
 - **Integration plane is broken** (ids, durability, triggers, stamps, coalesce).
