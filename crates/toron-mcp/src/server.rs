@@ -313,7 +313,16 @@ pub async fn router() -> anyhow::Result<axum::Router> {
                 // pre-2026-07-28 clients still complete a session lifecycle.
                 .with_json_response(true),
         );
-    Ok(axum::Router::new().nest_service("/mcp", service))
+    // ADR-0006 (bd-esh.5): mount the Blossom blob-serving surface at
+    // `/.blossom` (BUD-01 retrieval + BUD-02 upload) over a per-daemon blob
+    // store rooted at the demo data dir's `blobs/`.
+    let blob_root = std::env::temp_dir().join("toron-mcp-demo").join("blobs");
+    let blossom = crate::blob_serve::blossom_router(
+        toron_core::archive::blob::BlobStore::new(blob_root),
+    );
+    Ok(axum::Router::new()
+        .nest_service("/mcp", service)
+        .merge(blossom))
 }
 
 /// Serve the toron MCP server over Streamable HTTP on `bind_addr`

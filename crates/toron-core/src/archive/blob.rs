@@ -89,6 +89,14 @@ impl BlobStore {
 
     /// Store a blob; returns its sha256. Idempotent by content addressing.
     pub fn put(&self, data: &[u8]) -> std::io::Result<String> {
+        self.put_with_type(data, None)
+    }
+
+    /// Store a blob with an optional MIME-type hint (ADR-0006 / BUD-02
+    /// descriptor `type`). Idempotent by content addressing. When a `type` is
+    /// given and not already recorded, it is persisted as a `<hash>.type`
+    /// sidecar so a later `get_type` is accurate.
+    pub fn put_with_type(&self, data: &[u8], mime: Option<&str>) -> std::io::Result<String> {
         let hash = sha256_hex(data);
         let path = blob_path(&self.project_root, &hash);
         if !path.exists() {
@@ -97,6 +105,12 @@ impl BlobStore {
             }
             std::fs::write(&path, data)?;
         }
+        if let Some(mime) = mime {
+            let sidecar = self.type_sidecar_path(&hash);
+            if !sidecar.exists() {
+                std::fs::write(sidecar, mime)?;
+            }
+        }
         Ok(hash)
     }
 
@@ -104,6 +118,28 @@ impl BlobStore {
     pub fn get(&self, hash: &str) -> std::io::Result<Vec<u8>> {
         let path = blob_path(&self.project_root, hash);
         std::fs::read(path)
+    }
+
+    /// True if a blob with `hash` exists on disk.
+    pub fn exists(&self, hash: &str) -> bool {
+        blob_path(&self.project_root, hash).is_file()
+    }
+
+    /// The recorded MIME-type hint for `hash` (from the `<hash>.type`
+    /// sidecar), if any. The caller decides the `application/octet-stream`
+    /// default (BUD-01/BUD-02).
+    pub fn get_type(&self, hash: &str) -> Option<String> {
+        std::fs::read_to_string(self.type_sidecar_path(hash))
+            .ok()
+            .map(|s| s.trim().to_string())
+    }
+
+    fn type_sidecar_path(&self, hash: &str) -> PathBuf {
+        let mut p = blob_path(&self.project_root, hash);
+        let mut name = p.file_name().unwrap_or_default().to_os_string();
+        name.push(".type");
+        p.set_file_name(name);
+        p
     }
 
     pub fn path(&self, hash: &str) -> PathBuf {
@@ -204,5 +240,35 @@ mod tests {
         assert!(tags.iter().any(|t| t.as_slice().first().map(String::as_str)
             == Some("decryption-key")
             && t.as_slice().get(1).map(String::as_str) == Some("k-42")));
+    }
+
+    /// ADR-0006: MIME-type hint persists as a sidecar and `exists` reflects
+    /// content-addressed presence.
+    #[test]
+    fn put_with_type_records_sidecar_and_exists() {
+        let root = temp_root("mime");
+        let store = BlobStore::new(root.clone());
+
+        let hash = store
+            .put_with_type(b"<svg>hi</svg>", Some("image/svg+xml"))
+            .expect("put with type");
+        assert_eq!(store.get_type(&hash).as_deref(), Some("image/svg+xml"));
+        assert!(store.exists(&hash));
+        assert!(!store.exists("0".repeat(64).as_str()));
+
+        // Default put keeps no sidecar.
+        let plain = store.put(b"plain").expect("put");
+        assert_eq!(store.get_type(&plain), None);
+
+        // Sidecar is not overwritten once recorded (first type wins).
+        store
+            .put_with_type(b"<svg>hi</svg>", Some("text/plain"))
+            .expect("put again");
+        assert_eq!(
+            store.get_type(&hash).as_deref(),
+            Some("image/svg+xml"),
+            "first recorded type wins"
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 }
