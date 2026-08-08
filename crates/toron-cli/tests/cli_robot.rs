@@ -1,5 +1,7 @@
 // governed-by: ADR-0003
-#![forbid(unsafe_code)]
+// (not forbid(unsafe_code): this test sets TORON_MCP_DATA_DIR via
+// std::env::set_var, which is unsafe in edition 2024; the unsafe is confined
+// to the test harness, never to toron-core/toron-mcp library code.)
 
 //! bd-led.8.3 acceptance: robot CLI ↔ MCP tool JSON parity.
 //!
@@ -15,6 +17,25 @@ use std::sync::{Mutex, OnceLock};
 use serde_json::Value;
 use toron_core::nostr::identity::AgentProfile;
 
+/// Shared per-test-run data dir so the in-process `register_test_agent` and
+/// the shelled-out `toron` subprocess see the SAME agent keys. `demo_mailbox`
+/// honors `TORON_MCP_DATA_DIR` (otherwise it uses a per-invocation temp dir,
+/// which would isolate the two processes from each other).
+fn shared_data_dir() -> std::path::PathBuf {
+    static DIR: OnceLock<std::path::PathBuf> = OnceLock::new();
+    DIR.get_or_init(|| {
+        let d = std::env::temp_dir().join(format!("toron-cli-robot-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&d);
+        // SAFETY: test process; set before any demo_mailbox construction in
+        // this process, and inherited by the shelled-out subprocess.
+        unsafe {
+            std::env::set_var("TORON_MCP_DATA_DIR", &d);
+        }
+        d
+    })
+    .clone()
+}
+
 fn toron() -> Command {
     Command::new(env!("CARGO_BIN_EXE_toron"))
 }
@@ -28,6 +49,9 @@ fn run(args: &[&str]) -> Output {
 /// `toron_mcp::demo_mailbox`. Idempotent (re-registration upserts the existing
 /// key); serialized so parallel tests never race the first key write.
 fn register_test_agent() {
+    // Ensure the shared data dir env is set BEFORE demo_mailbox constructs
+    // (in-process) and before any shelled-out subprocess (inherited env).
+    let _ = shared_data_dir();
     static REG: OnceLock<Mutex<()>> = OnceLock::new();
     let _guard = REG
         .get_or_init(|| Mutex::new(()))

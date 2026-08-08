@@ -177,7 +177,7 @@ impl Mailbox {
                 None => true,
             };
             if rebuild {
-                current = self.build_unwrap_pipeline().await.map(|p| (sig, p));
+                current = self.build_unwrap_pipeline().await.map(|p| (sig.clone(), p));
             }
             if let Some((_, pipeline)) = &current {
                 let out = pipeline.project(&event).await;
@@ -278,8 +278,19 @@ impl Mailbox {
                 .collect()
         })
         .unwrap_or_default();
+        // Sender-npub → display name (AM-parity sender naming on the
+        // projected `messages.sender` column; search + summarize read it).
+        let npub_to_name: std::collections::HashMap<String, String> = sqlx::query_as(
+            "SELECT pubkey, name FROM agents",
+        )
+        .fetch_all(pool)
+        .await
+        .map(|rows| rows.into_iter().collect())
+        .unwrap_or_default();
         let sink: Arc<dyn ProjectionSink> = Arc::new(
-            SqliteProjectionSink::new(pool.clone()).with_projects(npub_to_project),
+            SqliteProjectionSink::new(pool.clone())
+                .with_projects(npub_to_project)
+                .with_names(npub_to_name),
         );
         let mut pipeline = UnwrapPipeline::new(keys, source, sink);
         if let Some(op) = &self.operator {

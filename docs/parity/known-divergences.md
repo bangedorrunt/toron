@@ -39,13 +39,22 @@ Every identity op differs in response shape. toron is crypto-native per ADR-0003
 | `cleanup_pane_identities` | `[]` (bare list) | `{removed_count, removed_paths}` | shape differs |
 | `request_contact` | stores `reason` as a NIP-17 tag on the control message; response `ContactLink` has no `reason`/`expires_ts` | stores + returns `reason`; has `expires_ts` | reason IS persisted on toron (tag), just not surfaced in the response; `expires_ts` absent |
 | `set_contact_policy` | returns bare kind-30014 **event-id hex string** | returns `{agent, policy}` | policy invisible after set (no read API surfaces it on toron) |
-| `summarize_thread` | flat `message_count` at top level | nested `summary.total_messages` | nesting differs |
+| `summarize_thread` | flat `message_count` at top level; `participants` are NAMES (AM-parity) | nested `summary.total_messages` | nesting differs |
 | `release_file_reservations` | `{released: N}` | `{released: N, released_at}` | no timestamp on toron |
 | `send_message` | `deliveries[].payload = {recipient, event_id}` (wrap-id/Nostr event) | numeric delivery id | field names differ |
-| `fetch_inbox` | entries lack AM's `read_ts`/`kind` shape | has `read_ts?`, `kind` | read-receipt shape differs |
-| `reply_message` | `subject` REQUIRED | `subject_prefix` optional | arg semantics differ |
+| `fetch_inbox` | `sender` = the sender's display NAME (resolved from the agents index; hex npub fallback for unregistered senders); entries lack AM's `read_ts`/`kind` shape | `sender` = display name; has `read_ts?`, `kind` | read-receipt shape differs; sender NAME is now AM-parity (fixed 2026-08-08) |
+| `reply_message` | `subject` REQUIRED; `message_id` NOT taken — replies via `thread_id` (the NIP-10/`thread`-tag anchor) | `message_id` REQUIRED (anchors the reply-to chain); `subject_prefix` optional | arg semantics differ (toron: thread-anchored; AM: message-anchored) |
 | `search_messages` | params `since`/`until` | params `date_start`/`date_end` | alias both directions in tests |
-| `health_check` | 2-field `{archive, bus}` | deep `{status, health_level, verdicts, queues, disk}` | toron is minimal |
+| `health_check` | 2-field `{archive, bus}`; **no required args** (project_key optional, ignored — fixed 2026-08-08) | deep `{status, health_level, verdicts, queues, disk}`; no required args | toron is minimal |
+
+## 2b. Id-type args (toron hex vs AM u64) — FIXED 2026-08-08
+
+`acknowledge_message` / `mark_message_read` `message_id` and `force_release_file_reservation`
+`file_reservation_id` were typed `i64` (copied from AM's integer-id model), but toron's ids are
+hex event ids (the `id` field `fetch_inbox` / `file_reservation_paths` return). An agent could
+NOT acknowledge/read/force-release over the MCP wire — the schema rejected the hex string.
+All three args are now `String`, matching toron's own id model (the mailbox layer always
+matched by hex; only the MCP arg type was wrong). Verified by `am_parity_e2e`.
 
 ## 3. AM-side behaviors (NOT toron faults)
 
@@ -80,6 +89,42 @@ Every identity op differs in response shape. toron is crypto-native per ADR-0003
   they are what the structs encode.
 - Acceptance gate: `all_tools_declare_output_schema` (lib test) + wire-level
   `output_schema.is_some()` check in `crates/toron-mcp/tests/acceptance.rs`.
+
+## 6. Free-form thread ids (FIXED 2026-08-08)
+
+AM thread ids are free-form strings (`"br-123"`, `"deploy-xyz"`). toron previously
+encoded `thread_id` ONLY as a NIP-10 `e` tag, which requires a valid hex event id — so
+any free-form thread id was silently dropped (inbox `thread_id` came back `null`).
+`build_visible_rumor` now emits a literal `thread` tag for ALL thread ids (and an `e`
+root tag too when the id IS a hex event id, for strict NIP-10 clients). Both
+`inbox_from` (live fetch_inbox) and the unwrap projection (`messages.thread_id` column,
+which search/summarize read) prefer the `thread` tag with `e` fallback. Verified by
+`am_parity_e2e` (send with `thread_id="parity-thread-1"` → inbox + summarize round-trip).
+
+## 7. Daemon data-dir isolation (FIXED 2026-08-08)
+
+`demo_mailbox` used a FIXED data dir (`toron-mcp-demo`), so every server boot
+accumulated agent keys there. The unwrap loop runs the argon2 KDF (~1s/key) over ALL
+keys on every pipeline rebuild — after dozens of boots the rebuild stalls for minutes
+(observed: 80+ keys, search projection never lands within test timeouts). The data dir
+is now per-invocation (`toron-mcp-demo-<pid>-<seq>`); `TORON_MCP_DATA_DIR` overrides
+for tests that need a data dir to persist ACROSS processes (cli_robot registers
+in-process then shells out). Verified: `am_parity_e2e` dropped from 400s+ (with search
+failing) to 56s green.
+
+## 8. AM-parity e2e (NEW 2026-08-08)
+
+`crates/toron-mcp/tests/am_parity_e2e.rs` boots the REAL daemon (axum router on a live
+TCP socket + operator key) and drives all 38 tools over the Streamable HTTP wire as a
+real agent would. This is the "is toron a trustworthy agent-mail replacement" gate: it
+INVOKES tools (sibling `acceptance.rs` only lists them). Cluster assertions:
+infra/identity (health, ensure_project idempotency, register upsert, whois), messaging
+(send → inbox → ack → read → reply → search → summarize round-trip), contacts
+(policy → request → respond → list), reservations (acquire → conflict → renew → release
+→ force-release staleness gate), build slots (acquire → renew → release), macros +
+product bus (session, reservation cycle, contact handshake, product link fan-out).
+
+Run: `cargo test -p toron-mcp --test am_parity_e2e`.
 
 ---
 

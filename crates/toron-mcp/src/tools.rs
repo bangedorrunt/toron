@@ -758,7 +758,7 @@ impl ToolServer {
                 .acknowledge_message(
                     &args.project_key,
                     &args.agent_name,
-                    &args.message_id.to_string(),
+                    &args.message_id,
                 )
                 .await,
         )
@@ -780,7 +780,7 @@ impl ToolServer {
                 .mark_message_read(
                     &args.project_key,
                     &args.agent_name,
-                    &args.message_id.to_string(),
+                    &args.message_id,
                 )
                 .await,
         )
@@ -974,7 +974,7 @@ impl ToolServer {
             .force_release_file_reservation(
                 &args.project_key,
                 &args.agent_name,
-                &args.file_reservation_id.to_string(),
+                &args.file_reservation_id,
                 args.note.as_deref(),
                 args.notify_previous.unwrap_or(false),
             )
@@ -1367,7 +1367,12 @@ impl ServerHandler for ToolServer {
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone)]
 pub struct HealthCheckArgs {
-    pub project_key: String,
+    /// AM parity: `health_check` takes no required args. The field is kept
+    /// optional (default empty) so clients that mirror the project-scoped
+    /// convention still parse, but it is NOT required and NOT used — the
+    /// daemon reports process-global bus + archive health.
+    #[serde(default)]
+    pub project_key: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone)]
@@ -1504,14 +1509,19 @@ pub struct FetchInboxArgs {
 pub struct AcknowledgeMessageArgs {
     pub project_key: String,
     pub agent_name: String,
-    pub message_id: i64,
+    /// toron message id = the rumor's content-addressed hex EventId (NOT an
+    /// AM-style integer sequence). The arg is a string to match toron's own
+    /// id model — `fetch_inbox` returns `id` as hex; this accepts it verbatim.
+    /// (known-divergences §1: id-type differs by design per ADR-0003.)
+    pub message_id: String,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone)]
 pub struct MarkMessageReadArgs {
     pub project_key: String,
     pub agent_name: String,
-    pub message_id: i64,
+    /// See [`AcknowledgeMessageArgs::message_id`] — hex event id, not an int.
+    pub message_id: String,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone)]
@@ -1589,7 +1599,9 @@ pub struct ReleaseFileReservationsArgs {
 pub struct ForceReleaseFileReservationArgs {
     pub project_key: String,
     pub agent_name: String,
-    pub file_reservation_id: i64,
+    /// Reservation id = the kind-30031 event id (hex string). Matches the
+    /// `id` field `file_reservation_paths` returns in `granted[]`.
+    pub file_reservation_id: String,
     pub note: Option<String>,
     pub notify_previous: Option<bool>,
 }

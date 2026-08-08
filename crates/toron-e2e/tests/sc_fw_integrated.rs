@@ -140,7 +140,10 @@ async fn sc_fw_one_process_peer_mail_via_bus() {
         .expect("fetch");
     assert_eq!(inbox.len(), 1, "one message in OC inbox");
     assert_eq!(inbox[0].body_md, "hello via bus");
-    assert_eq!(inbox[0].sender, pi.to_hex(), "from Pi-α");
+    // Parity: inbox `sender` is the resolved display name (AM-style), not the
+    // raw pubkey — the sender-name resolution rewrites hex npubs for locally
+    // registered agents.
+    assert_eq!(inbox[0].sender, "PiAlpha", "from Pi-α (resolved name)");
 
     // flywheel's loop "dispatch" is a direct call here — no HTTP round trip.
     // (The health check + a dispatch-equivalent direct call both succeed.)
