@@ -16,6 +16,7 @@
 pub mod channels;
 pub mod coalesce;
 pub mod cron;
+pub mod cron_failure;
 pub mod dispatch;
 pub mod engine;
 pub mod guard;
@@ -32,6 +33,7 @@ pub use channels::{
 pub use cron::{
     CronManager, CronRegistration, CronRegistry, latest_due_at_or_before, next_due,
 };
+pub use cron_failure::{FailureBundle, PolicyEvent, PolicySink, evaluate, failure_details, is_failed};
 
 pub use coalesce::{
     CoalesceDecision, Coalesced, DEFAULT_MAX_BUFFER, DEFAULT_SUBWINDOW, DEFAULT_WINDOW,

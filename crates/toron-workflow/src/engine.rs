@@ -132,6 +132,7 @@ pub struct WorkflowEngine {
     resonate: Arc<Resonate>,
     approval_sink: ApprovalSink,
     spawn_sink: SpawnSink,
+    policy_sink: crate::cron_failure::PolicySink,
 }
 
 impl std::fmt::Debug for WorkflowEngine {
@@ -145,6 +146,10 @@ impl std::fmt::Debug for WorkflowEngine {
             .field(
                 "spawn_sink_len",
                 &self.spawn_sink.try_lock().map(|g| g.len()).unwrap_or(0),
+            )
+            .field(
+                "policy_sink_len",
+                &self.policy_sink.try_lock().map(|g| g.len()).unwrap_or(0),
             )
             .finish()
     }
@@ -165,11 +170,13 @@ impl WorkflowEngine {
     ) -> anyhow::Result<Self> {
         let sink = ApprovalSink::default();
         let spawn_sink = SpawnSink::default();
+        let policy_sink = crate::cron_failure::PolicySink::new();
         let resonate = Resonate::local()
             .with_dependency(action_runner)
             .with_dependency(profile_resolver)
             .with_dependency(sink.clone())
-            .with_dependency(spawn_sink.clone());
+            .with_dependency(spawn_sink.clone())
+            .with_dependency(policy_sink.clone());
         resonate
             .register(run_workflow)
             .map_err(|e| anyhow::anyhow!("register workflow function: {e}"))?;
@@ -183,6 +190,7 @@ impl WorkflowEngine {
             resonate: Arc::new(resonate),
             approval_sink: sink,
             spawn_sink,
+            policy_sink,
         })
     }
 
@@ -200,6 +208,7 @@ impl WorkflowEngine {
     ) -> anyhow::Result<Self> {
         let sink = ApprovalSink::default();
         let spawn_sink = SpawnSink::default();
+        let policy_sink = crate::cron_failure::PolicySink::new();
         let config = ResonateConfig {
             url: Some(url.into()),
             ..Default::default()
@@ -208,7 +217,8 @@ impl WorkflowEngine {
             .with_dependency(action_runner)
             .with_dependency(profile_resolver)
             .with_dependency(sink.clone())
-            .with_dependency(spawn_sink.clone());
+            .with_dependency(spawn_sink.clone())
+            .with_dependency(policy_sink.clone());
         resonate
             .register(run_workflow)
             .map_err(|e| anyhow::anyhow!("register workflow function: {e}"))?;
@@ -222,6 +232,7 @@ impl WorkflowEngine {
             resonate: Arc::new(resonate),
             approval_sink: sink,
             spawn_sink,
+            policy_sink,
         })
     }
 
@@ -245,6 +256,13 @@ impl WorkflowEngine {
     /// embedding reads these to emit the kind-43001 job carrying them).
     pub fn spawn_sink(&self) -> &SpawnSink {
         &self.spawn_sink
+    }
+
+    /// The cron failure-policy side-channel (ADR-0005 Spec 3, P4.4): policy
+    /// decisions recorded by the cron loop, executed by the embedding (bead /
+    /// escalate DM).
+    pub fn policy_sink(&self) -> &crate::cron_failure::PolicySink {
+        &self.policy_sink
     }
 
     /// Start a workflow run, idempotent on `run_id` (a redelivered trigger

@@ -27,8 +27,11 @@ use anyhow::{Context, Result};
 use chrono::DateTime;
 use serde::{Deserialize, Serialize};
 
+use crate::cron_failure::{
+    PolicyEvent, PolicySink, evaluate as evaluate_policy, failure_details, is_failed,
+};
 use crate::engine::{run_workflow, RunInput};
-use crate::schema::{CronScope, Workflow};
+use crate::schema::{CronScope, FailureAction, Workflow};
 
 /// One registered cron the manager drives (Spec 3). The embedding resolves
 /// the workflow template + owner profile; the manager only needs the plan.
@@ -94,6 +97,13 @@ async fn cron_loop(
     // replayed as a burst.
     let mut last_fired: i64 = unix_now();
 
+    // Consecutive-failure streak (Spec 3 repeat policy). Durable local: replay
+    // re-derives it, so a crash mid-run never double-counts.
+    let mut consecutive: u32 = 0;
+    // The policy (Spec 3). None → no failure side effects (log-only).
+    let policy = input.workflow.policy.clone();
+    let policy_sink = ctx.get_dependency::<PolicySink>();
+
     loop {
         let now = unix_now();
 
@@ -129,8 +139,8 @@ async fn cron_loop(
         });
         // A failed tick must NOT kill the scheduler: the child's output (or
         // error) is recorded; the loop moves on to the next tick. Failure
-        // policy (bead/escalate) is P4.4's concern.
-        let _ = ctx
+        // policy (bead/escalate) is applied via the policy sink below.
+        let tick_output: serde_json::Value = match ctx
             .run(
                 run_workflow,
                 RunInput {
@@ -138,7 +148,41 @@ async fn cron_loop(
                     trigger,
                 },
             )
-            .await;
+            .await
+        {
+            Ok(out) => out,
+            Err(_e) => serde_json::json!({
+                "status": "failed",
+                "error": format!("cron tick {tick_ts} run errored"),
+            }),
+        };
+
+        // Spec 3 failure policy: on a failed tick, record the decision on the
+        // policy sink for the embedding to execute (br create / escalate DM).
+        // Log-only when no policy is declared.
+        if let Some(policy) = &policy {
+            let failed = is_failed(&tick_output);
+            let (action, next) = evaluate_policy(policy, failed, consecutive);
+            consecutive = next;
+            let (error, failed_step) = failure_details(&tick_output);
+            policy_sink
+                .lock()
+                .await
+                .push(PolicyEvent {
+                    cron: input.name.clone(),
+                    tick: tick_ts,
+                    action,
+                    bundle: crate::cron_failure::FailureBundle {
+                        run_id: format!("cron:{}:{}", input.name, tick_ts),
+                        workflow: input.workflow.name.clone(),
+                        owner: input.owner.clone(),
+                        error,
+                        failed_step,
+                        consecutive,
+                    },
+                });
+            let _ = FailureAction::Log; // actions are the embedding's to perform
+        }
 
         // Advance the durable checkpoint (replay resumes here next).
         last_fired = tick_ts;
