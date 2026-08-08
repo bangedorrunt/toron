@@ -1,0 +1,44 @@
+# Weekly agent-reach CLI upgrade + verify
+# (saga replacement — ADR-0005 Spec 3, bd-p4-migrate-sagas-7rmo)
+#
+# Replaces the systemd agent-reach-upgrade timer (Sun 03:45). Deploy: copy to
+# ~/.config/flywheel/workflows/.
+name: agent-reach-upgrade
+description: "Weekly agent-reach CLI upgrade + verify (saga replacement, ADR-0005 Spec 3)."
+trigger:
+  type: schedule
+  cron: "45 3 * * 0"
+  owner: housekeeper
+  scope: host
+policy:
+  on_failure: bead
+  on_repeat_failure: escalate
+  repeat_threshold: 3
+  on_success: log
+  max_retries: 1
+  no_claim_timeout: 600
+steps:
+  - name: upgrade
+    action: spawn
+    profile: "@housekeeper"
+    workflow: housekeeper-reach-upgrade
+    await: true
+    no_claim_timeout: 600
+    on_error: fail_run
+  - name: verify
+    action: branch
+    if: "{{steps.upgrade.verified}} == true"
+    then:
+      - name: notify-ok
+        action: send_dm
+        to: housekeeper
+        body: "agent-reach-upgrade OK"
+    else:
+      - name: notify-fail
+        action: send_dm
+        to: housekeeper
+        body: "agent-reach-upgrade FAILED — verify step did not pass"
+      - name: fail-closed
+        action: call_webhook
+        url: "http://127.0.0.1:9/none"
+        on_error: fail_run

@@ -1,0 +1,35 @@
+# The defined fixer (ADR-0005 Spec 3, bd-p4-migrate-sagas-7rmo)
+#
+# On a failure bead (on_failure: bead), the smart-cron loop invokes this
+# workflow: housekeeper reads the failure bundle (run-id, workflow, owner,
+# error, last-known-good, retry history) and proposes a patch (fix-bead / PR /
+# config edit). If no diagnosis workflow is registered for the owner, the loop
+# is explicitly HUMAN-IN-THE-LOOP (the bead waits for `flywheel work ready`).
+# Deploy: copy to ~/.config/flywheel/workflows/.
+name: housekeeper-diagnose
+description: "Defined fixer (ADR-0005 Spec 3): reads a failure bead bundle and proposes a patch."
+trigger:
+  type: webhook
+inputs:
+  - name: bundle
+steps:
+  - name: triage
+    action: spawn
+    profile: "@housekeeper"
+    workflow: housekeeper-diagnose-run
+    await: true
+    no_claim_timeout: 600
+    on_error: fail_run
+  - name: propose
+    action: branch
+    if: "{{steps.triage.patch}} != null"
+    then:
+      - name: fix-bead
+        action: dispatch_job
+        assignee: housekeeper
+        spec: { profile: "@housekeeper", task: "apply patch: {{steps.triage.patch}}", run_id: "{{inputs.bundle.run_id}}" }
+    else:
+      - name: escalate
+        action: send_dm
+        to: housekeeper
+        body: "housekeeper-diagnose could not propose a patch for {{inputs.bundle.workflow}} — human-in-the-loop"
