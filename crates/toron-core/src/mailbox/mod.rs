@@ -62,8 +62,8 @@ pub use reservations::{
 pub use search::{SearchMessage, SearchMessages, ThreadSummary};
 pub use unwrap::{
     AckCache, AutoPolicy, ContactPolicy, DedupKey, FixedPolicy, GitProjectionSink, PolicySource,
-    ProjectOutcome, ProjectionSink, SqliteProjectionSink, UnwrapPipeline, UnwrappedMail,
-    order_by_rumor_time,
+    ProjectOutcome, ProjectionSink, SqliteProjectionSink, TriggerNotifySink, UnwrapPipeline,
+    UnwrappedMail, order_by_rumor_time,
 };
 
 /// Mailbox context: the bus every tool publishes to + the on-disk project
@@ -85,6 +85,10 @@ pub struct Mailbox {
     /// Total argon2 KDF invocations this process has performed (test
     /// observable; the many-keys gate asserts the warm-rebuild bound).
     kdf_loads: Arc<AtomicU64>,
+    /// ADR-0007 R3: optional side-channel for post-unwrap mail (workflow
+    /// `message_posted` triggers). When set, [`TriggerNotifySink`] wraps the
+    /// projection sink.
+    trigger_tx: Option<tokio::sync::mpsc::UnboundedSender<UnwrappedMail>>,
 }
 
 /// A decrypted agent key plus the exact ncryptsec content it was derived
@@ -118,7 +122,17 @@ impl Mailbox {
             index_pool: None,
             key_cache: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             kdf_loads: Arc::new(AtomicU64::new(0)),
+            trigger_tx: None,
         }
+    }
+
+    /// Attach a post-unwrap trigger notify channel (ADR-0007 R3).
+    pub fn with_trigger_tx(
+        mut self,
+        tx: tokio::sync::mpsc::UnboundedSender<UnwrappedMail>,
+    ) -> Self {
+        self.trigger_tx = Some(tx);
+        self
     }
 
     /// Set the agent-key passphrase (G1: unlocks ncryptsec at process start).
@@ -340,11 +354,17 @@ impl Mailbox {
         .await
         .map(|rows| rows.into_iter().collect())
         .unwrap_or_default();
-        let sink: Arc<dyn ProjectionSink> = Arc::new(
+        let sqlite: Arc<dyn ProjectionSink> = Arc::new(
             SqliteProjectionSink::new(pool.clone())
                 .with_projects(npub_to_project)
                 .with_names(npub_to_name),
         );
+        // ADR-0007 R3: wrap with TriggerNotifySink when the host subscribed
+        // a post-unwrap channel (message_posted workflows).
+        let sink: Arc<dyn ProjectionSink> = match &self.trigger_tx {
+            Some(tx) => Arc::new(TriggerNotifySink::new(sqlite, tx.clone())),
+            None => sqlite,
+        };
         let mut pipeline = UnwrapPipeline::new(keys, source, sink);
         if let Some(op) = &self.operator {
             pipeline = pipeline.with_operator(op.public_key());

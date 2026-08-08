@@ -90,6 +90,11 @@ pub type ActionRunner = Arc<dyn Fn(&Action) -> anyhow::Result<serde_json::Value>
 pub type ProfileResolver =
     Arc<dyn Fn(&str) -> Option<serde_json::Value> + Send + Sync>;
 
+/// ADR-0007 R4.1: resolve a workflow **name** to a full [`Workflow`] for
+/// `call_workflow` nested runs. Injected DI (engine never imports flywheel
+/// catalogs). `None` → unknown workflow → step fails with `{ok:false}`.
+pub type WorkflowResolver = Arc<dyn Fn(&str) -> Option<Workflow> + Send + Sync>;
+
 /// Optional side-channel for approval promise-ids (embedding/test hook). When
 /// a run parks on `request_approval`, its promise_id is pushed here so the
 /// embedding can publish the kind-46011 pending event.
@@ -168,12 +173,27 @@ impl WorkflowEngine {
         action_runner: ActionRunner,
         profile_resolver: ProfileResolver,
     ) -> anyhow::Result<Self> {
+        Self::local_with_resolvers(
+            action_runner,
+            profile_resolver,
+            Self::default_workflow_resolver(),
+        )
+    }
+
+    /// Like [`Self::local_with`] with an explicit [`WorkflowResolver`] for
+    /// `call_workflow` (ADR-0007 R4.1).
+    pub fn local_with_resolvers(
+        action_runner: ActionRunner,
+        profile_resolver: ProfileResolver,
+        workflow_resolver: WorkflowResolver,
+    ) -> anyhow::Result<Self> {
         let sink = ApprovalSink::default();
         let spawn_sink = SpawnSink::default();
         let policy_sink = crate::cron_failure::PolicySink::new();
         let resonate = Resonate::local()
             .with_dependency(action_runner)
             .with_dependency(profile_resolver)
+            .with_dependency(workflow_resolver)
             .with_dependency(sink.clone())
             .with_dependency(spawn_sink.clone())
             .with_dependency(policy_sink.clone());
@@ -216,6 +236,7 @@ impl WorkflowEngine {
         let resonate = Resonate::new(config)
             .with_dependency(action_runner)
             .with_dependency(profile_resolver)
+            .with_dependency(Self::default_workflow_resolver())
             .with_dependency(sink.clone())
             .with_dependency(spawn_sink.clone())
             .with_dependency(policy_sink.clone());
@@ -239,6 +260,12 @@ impl WorkflowEngine {
     /// The default `ProfileResolver`: every profile is unknown (the embedding
     /// must inject a real one for `spawn` to succeed).
     fn default_resolver() -> ProfileResolver {
+        Arc::new(|_name: &str| None)
+    }
+
+    /// The default `WorkflowResolver`: no named workflows (call_workflow fails
+    /// until the embedding injects a catalog).
+    fn default_workflow_resolver() -> WorkflowResolver {
         Arc::new(|_name: &str| None)
     }
 
@@ -710,19 +737,36 @@ pub async fn run_parallel_copy(
 /// step). Outputs flow into `steps.<name>` via the returned value.
 async fn run_call_workflow(
     ctx: &Context,
-    runner: &ActionRunner,
+    _runner: &ActionRunner,
     workflow: &str,
     inputs: &serde_json::Value,
     step_outputs: &serde_json::Map<String, serde_json::Value>,
 ) -> resonate_sdk::prelude::Result<serde_json::Value> {
-    let _ = (ctx, runner, workflow, inputs, step_outputs);
-    // The full sub-run wiring (a separate WorkflowEngine embedded in the same
-    // runtime, or a nested Resonate run) lands with the call_workflow schema
-    // bead. Until then this is a structural placeholder that records intent.
-    Ok(serde_json::json!({
-        "ok": false,
-        "error": "call_workflow sub-runs land in the P5.3 wiring step",
-    }))
+    // ADR-0007 R4.1: nested durable run via WorkflowResolver DI + ctx.run.
+    let resolver = ctx.get_dependency::<WorkflowResolver>();
+    let Some(child_wf) = (resolver)(workflow) else {
+        return Ok(serde_json::json!({
+            "ok": false,
+            "error": format!("unknown workflow: {workflow}"),
+        }));
+    };
+    // Child trigger = rendered inputs object (templates already expanded in
+    // the Action by the parent step path when present); fall back to raw
+    // inputs + expose parent step_outputs under `parent_steps` for templates.
+    let mut trigger = inputs.clone();
+    if let Some(obj) = trigger.as_object_mut() {
+        obj.insert(
+            "parent_steps".into(),
+            serde_json::Value::Object(step_outputs.clone()),
+        );
+    }
+    let input = RunInput {
+        workflow: child_wf,
+        trigger,
+    };
+    let future = ctx.run(run_workflow, input).spawn()?;
+    let out = future.await?;
+    Ok(out)
 }
 
 /// Run a `spawn` action (ADR-0005 Spec 4a).
@@ -2087,10 +2131,45 @@ steps:
         assert_eq!(seen.lock().unwrap().len(), 3, "3 sub-runs executed");
     }
 
-    /// P5.3: `call_workflow` — the structural placeholder records intent.
+    /// ADR-0007 R4.1: `call_workflow` nests a durable child via WorkflowResolver.
     #[tokio::test]
-    async fn call_workflow_subrun_reports_intent() {
-        let engine = WorkflowEngine::local(noop_runner()).expect("engine");
+    async fn call_workflow_nested_subrun_returns_child_output() {
+        use std::sync::Mutex as StdMutex;
+        let seen: Arc<StdMutex<Vec<Action>>> = Arc::new(StdMutex::new(Vec::new()));
+        let seen_c = seen.clone();
+        let runner: ActionRunner = Arc::new(move |a: &Action| {
+            seen_c.lock().unwrap().push(a.clone());
+            Ok(serde_json::json!({ "ran": true }))
+        });
+        let child = parse_workflow(
+            r##"
+name: triage
+trigger:
+  type: webhook
+steps:
+  - name: do
+    action: send_dm
+    to: pi
+    body: from-child
+"##,
+        )
+        .expect("child");
+        let resolver: WorkflowResolver = {
+            let child = child.clone();
+            Arc::new(move |name: &str| {
+                if name == "triage" {
+                    Some(child.clone())
+                } else {
+                    None
+                }
+            })
+        };
+        let engine = WorkflowEngine::local_with_resolvers(
+            runner,
+            Arc::new(|_: &str| None),
+            resolver,
+        )
+        .expect("engine");
         let wf = parse_workflow(
             r##"
 name: caller
@@ -2114,9 +2193,53 @@ steps:
             )
             .await
             .expect("run completes");
-        // The wiring step returns an intent marker (sub-run wiring lands with
-        // the embedded-engine bead). The action parsed + ran.
-        assert!(output["sub"].is_object(), "call_workflow returned intent: {output}");
+        // Child step output is nested under the parent's `sub` value.
+        assert!(
+            output["sub"].is_object() || output["sub"]["do"]["ran"] == true,
+            "call_workflow returned child output: {output}"
+        );
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            1,
+            "child action executed once"
+        );
+    }
+
+    /// Unknown workflow name → honest {ok:false}, not a hang.
+    #[tokio::test]
+    async fn call_workflow_unknown_reports_error() {
+        let engine = WorkflowEngine::local(noop_runner()).expect("engine");
+        let wf = parse_workflow(
+            r##"
+name: caller
+trigger:
+  type: webhook
+steps:
+  - name: sub
+    action: call_workflow
+    workflow: does-not-exist
+    inputs: {}
+"##,
+        )
+        .expect("parse");
+        let output = engine
+            .run(
+                "wf-call-unknown",
+                RunInput {
+                    workflow: wf,
+                    trigger: serde_json::json!({}),
+                },
+            )
+            .await
+            .expect("run completes");
+        assert_eq!(output["sub"]["ok"], false, "{output}");
+        assert!(
+            output["sub"]["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("unknown"),
+            "{output}"
+        );
     }
 
     /// P3.1 (ADR-0005 Spec 2): `WorkflowEngine::invoke` — the on-demand

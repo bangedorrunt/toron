@@ -177,12 +177,15 @@ struct ReconstructReport {
 }
 
 /// Resolve the data directory: `--data-dir` > `TORON_DATA_DIR` > config
-/// `data_dir`. `None` if none set (caller exits 3).
+/// `data_dir` > the durable XDG root (`$XDG_DATA_HOME/toron` /
+/// `~/.local/share/toron`, ADR-0007 D3). Never a temp per-pid root — the
+/// default is always Some.
 fn resolve_data_dir(cfg: &Config, override_dir: Option<&Path>) -> Option<PathBuf> {
     override_dir
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("TORON_DATA_DIR").map(PathBuf::from))
         .or_else(|| cfg.data_dir.clone())
+        .or_else(|| Some(toron_core::config::durable_data_dir()))
 }
 
 /// Enumerate project roots under `data_dir`: subdirs that contain a
@@ -736,9 +739,14 @@ fn run_key_inspect(cfg: &Config, args: &KeyInspectArgs) -> anyhow::Result<()> {
 // ---------------------------------------------------------------------------
 
 fn run_project_list() -> anyhow::Result<()> {
-    let demo_dir = std::env::temp_dir().join("toron-mcp-demo");
+    // R2 (ADR-0007 D3): list projects under the resolved durable data dir —
+    // the `/tmp/toron-mcp-demo` hardcode is dead as the default.
+    let cfg = Config::load(None);
+    let Some(data_dir) = resolve_data_dir(&cfg, None) else {
+        anyhow::bail!("no data dir");
+    };
     let mut projects: Vec<String> = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(&demo_dir) {
+    if let Ok(entries) = std::fs::read_dir(&data_dir) {
         for entry in entries.flatten() {
             if entry.path().is_dir() {
                 projects.push(entry.file_name().to_string_lossy().into_owned());
@@ -746,8 +754,8 @@ fn run_project_list() -> anyhow::Result<()> {
         }
     }
     projects.sort();
-    let note = if demo_dir.is_dir() {
-        format!("local listing of demo data dir ({})", demo_dir.display())
+    let note = if data_dir.is_dir() {
+        format!("local listing of data dir ({})", data_dir.display())
     } else {
         "registry not wired".to_string()
     };
@@ -1063,12 +1071,12 @@ mod reconstruct_tests {
             resolve_data_dir(&cfg, Some(&explicit)),
             Some(explicit.clone())
         );
-        // With no override and no config, env is consulted; without any of
-        // them → None (Diagnostic).
-        assert_eq!(
-            resolve_data_dir(&cfg, None),
-            std::env::var_os("TORON_DATA_DIR").map(PathBuf::from)
-        );
+        // No override and no config: env is consulted, then the durable XDG
+        // root — never None (R2 / ADR-0007 D3 kills the temp default).
+        let expected = std::env::var_os("TORON_DATA_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(toron_core::config::durable_data_dir);
+        assert_eq!(resolve_data_dir(&cfg, None), Some(expected));
     }
 
     #[test]

@@ -132,17 +132,25 @@ pub fn template_matches(template: &str, uri: &str) -> bool {
 }
 
 /// Resolve a resource URI to its JSON value. Static metadata is served
-/// directly; data-backed resources (index/mailbox projection) return a
-/// placeholder until bd-led.4/5 land. `None` = unknown resource.
+/// directly; data-backed templates return a structured stub that names the
+/// live tool to call (ADR-0007 R4.4 — honest projection, not empty success).
+/// `None` = unknown resource.
 pub fn read_resource_value(uri: &str) -> Option<serde_json::Value> {
     let base = uri.split('?').next().unwrap_or(uri);
     if let Some(v) = static_resource(base) {
         return Some(v);
     }
-    if RESOURCES.iter().any(|(_, t, _)| template_matches(t, base)) {
+    if let Some((name, template, desc)) = RESOURCES
+        .iter()
+        .find(|(_, t, _)| template_matches(t, base))
+    {
         return Some(serde_json::json!({
             "uri": base,
-            "note": "resource recognized; data projection not yet wired (bd-led.4/5)"
+            "resource": name,
+            "template": template,
+            "description": desc,
+            "status": "live_via_tools",
+            "note": "Use the matching MCP tool for full projection (list_agents, fetch_inbox, search_messages, health_check, …). Resource URI is a discovery handle."
         }));
     }
     None
