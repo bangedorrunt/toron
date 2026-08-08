@@ -1,9 +1,14 @@
 # Weekly health-gated Docker image upgrade with auto-rollback
 # (saga replacement — ADR-0005 Spec 3, bd-p4-migrate-sagas-7rmo)
 #
-# Replaces the systemd docker-auto-upgrade timer (Sun 03:30). Same
-# health-gates as the bash saga; declarative + replayable via the unified
-# engine. Deploy: copy to ~/.config/flywheel/workflows/.
+# Replaces the systemd docker-auto-upgrade timer (Sun 03:30). Passes the SAME
+# health-gates as the bash saga: after the upgrade, probes aiostreams /
+# resonate / honcho / pihole / dnscrypt-proxy on their host ports. A dead
+# service (any probe fails) FAILS the run -> on_failure: bead -> the defined
+# fixer (housekeeper-diagnose) reads the bundle and proposes a patch.
+# Declarative + replayable via the unified engine.
+#
+# Deploy: copy to ~/.config/flywheel/workflows/.
 name: docker-upgrade
 description: "Weekly health-gated Docker image upgrade with auto-rollback (saga replacement, ADR-0005 Spec 3)."
 trigger:
@@ -33,25 +38,36 @@ steps:
     await: true
     no_claim_timeout: 600
     on_error: fail_run
-  - name: health-gate
-    action: branch
-    if: "{{steps.upgrade.healthy}} == true"
-    then:
-      - name: notify-ok
-        action: send_dm
-        to: housekeeper
-        body: "docker-upgrade OK: {{steps.upgrade.containers}}"
-    else:
-      # A failed spawn-await FAILS the run (Spec 4a) -> on_failure: bead.
-      # If rollback itself fails, the failure bundle carries the rollback
-      # error + last-known-good.
-      - name: rollback
-        action: spawn
-        profile: "@housekeeper"
-        workflow: housekeeper-rollback
-        await: true
-        no_claim_timeout: 600
-      - name: notify-fail
-        action: send_dm
-        to: housekeeper
-        body: "docker-upgrade FAILED — rolled back to snapshot"
+  # The saga's five health-gates, probed on their host ports (docker-stack
+  # compose). Each probe is a call_webhook with on_error: fail_run — a dead
+  # service errors the step and FAILS the run (Spec 0), so `on_failure: bead`
+  # fires with the failing step in the bundle.
+  - name: gate-aiostreams
+    action: call_webhook
+    url: "http://127.0.0.1:3000/health"
+    method: GET
+    on_error: fail_run
+  - name: gate-resonate
+    action: call_webhook
+    url: "http://127.0.0.1:8001/health"
+    method: GET
+    on_error: fail_run
+  - name: gate-honcho
+    action: call_webhook
+    url: "http://127.0.0.1:8010/health"
+    method: POST
+    on_error: fail_run
+  - name: gate-pihole
+    action: call_webhook
+    url: "http://127.0.0.1:80/admin"
+    method: GET
+    on_error: fail_run
+  - name: gate-dnscrypt
+    action: call_webhook
+    url: "http://127.0.0.1:5053/"
+    method: GET
+    on_error: fail_run
+  - name: notify-ok
+    action: send_dm
+    to: housekeeper
+    body: "docker-upgrade OK — all 5 health gates passed (aiostreams/resonate/honcho/pihole/dnscrypt)"
