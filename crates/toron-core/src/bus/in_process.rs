@@ -138,10 +138,18 @@ impl InProcessBus {
     }
 
     /// Does the event carry a project-scoping `#t` tag? (ADR-0003 G6/A3)
+    ///
+    /// Toron-internal markers also ride on `t` (e.g. `toron:workflow-emitted`,
+    /// `toron:overseer`). Those are **not** project slugs — treating them as
+    /// such would make global subscribers drop stamped workflow jobs (F6/F7).
     fn project_slug(event: &Event) -> Option<&str> {
         event.tags.iter().find_map(|t| {
             if t.kind() == nostr_sdk::nostr::TagKind::t() {
-                t.content()
+                let c = t.content()?;
+                if c.starts_with("toron:") {
+                    return None;
+                }
+                Some(c)
             } else {
                 None
             }

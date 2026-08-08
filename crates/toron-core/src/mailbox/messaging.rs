@@ -79,6 +79,11 @@ pub struct SendMessage {
     /// the projection (`block_all` cannot block the operator). Requires the
     /// mailbox to hold an operator key.
     pub overseer: bool,
+    /// ADR-0007 F6: extra RUMOR tags appended pre-wrap (e.g. the
+    /// `toron:workflow-emitted` stamp from the workflow ActionRunner). Gift
+    /// wraps stay metadata-hiding — these tags live INSIDE the rumor, never
+    /// on the kind-1059 envelope.
+    pub extra_tags: Vec<Tag>,
 }
 
 /// Delivery record returned by `send_message` (parity shape).
@@ -574,6 +579,9 @@ fn add_message_tags(tags: &mut Vec<Tag>, args: &SendMessage) {
             tags.push(t);
         }
     }
+    // ADR-0007 F6: caller-supplied rumor tags (the workflow-emitted stamp
+    // from the ActionRunner). Tags are already-built — extend is infallible.
+    tags.extend(args.extra_tags.iter().cloned());
     if let Some(thread) = &args.thread_id {
         // Free-form thread ids ("br-123", "deploy-xyz") are the AM norm — they
         // are NOT valid NIP-10 event ids. Emit the literal id as a `thread`
