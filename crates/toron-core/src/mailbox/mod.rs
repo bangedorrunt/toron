@@ -163,11 +163,11 @@ impl Mailbox {
             .subscribe(Filter::new().kinds([nostr_sdk::nostr::Kind::GiftWrap]))
             .await
             .map_err(|e| anyhow::anyhow!("bus subscribe: {e}"))?;
-        // Cache: (agent-set signature, live pipeline). Rebuilt only when the
-        // set of local agent keys changes (registered agents grow at runtime).
         let mut current: Option<(String, UnwrapPipeline)> = None;
+        let mut seen = 0usize;
         while let Some(ev) = sub.next().await {
             let SubscriptionEvent::Event(event) = ev else { continue };
+            seen += 1;
             if event.kind != nostr_sdk::nostr::Kind::GiftWrap {
                 continue;
             }
@@ -180,26 +180,30 @@ impl Mailbox {
                 current = self.build_unwrap_pipeline().await.map(|p| (sig, p));
             }
             if let Some((_, pipeline)) = &current {
-                let _ = pipeline.project(&event).await;
+                let out = pipeline.project(&event).await;
+                tracing::debug!(out = ?out, "unwrap loop projected {seen}");
             }
         }
         Ok(())
     }
 
-    /// Signature of the current local agent-key set (sorted npubs). Cheap;
-    /// recomputed per inbound wrap to detect runtime agent registration.
+    /// Signature of the current local agent-key set (sorted key-file paths).
+    /// Cheap — lists the data dir, does NOT touch the KDF, so it can run per
+    /// inbound wrap without stalling the daemon.
     fn local_agent_signature(&self) -> String {
-        let mut npubs: Vec<String> = self
-            .local_agent_keys()
+        let mut paths: Vec<String> = self
+            .local_agent_key_paths()
             .iter()
-            .map(|k| k.public_key().to_hex())
+            .map(|p| p.display().to_string())
             .collect();
-        npubs.sort();
-        npubs.join(",")
+        paths.sort();
+        paths.join(",")
     }
 
-    /// All local agent keys on disk (`{data_dir}/{project}/agents/{name}/key.ncryptsec`).
-    fn local_agent_keys(&self) -> Vec<Keys> {
+    /// All local agent key files on disk (`{data_dir}/{project}/agents/{name}/key.ncryptsec`).
+    /// Listing only — never decrypts. Callers load keys on demand (the argon2
+    /// KDF is ~1s per key and must NOT run inside the async daemon loop).
+    fn local_agent_key_paths(&self) -> Vec<std::path::PathBuf> {
         let Ok(projects) = std::fs::read_dir(&self.data_dir) else {
             return Vec::new();
         };
@@ -211,8 +215,8 @@ impl Mailbox {
             };
             for agent in agents.flatten() {
                 let key_path = agent.path().join("key.ncryptsec");
-                if let Some(k) = self.load_agent_key(&key_path) {
-                    out.push(k);
+                if key_path.is_file() {
+                    out.push(key_path);
                 }
             }
         }
@@ -221,13 +225,24 @@ impl Mailbox {
 
     /// Build the unwrap pipeline over the current local agent keys. `None`
     /// when no index pool is attached (nothing to sink into — the loop
-    /// skips projection until a pool is available).
+    /// skips projection until a pool is available). Called only when the
+    /// agent-key signature changes, so the argon2 KDF (≈1s/key) runs at most
+    /// once per agent registration — never per inbound wrap.
     async fn build_unwrap_pipeline(&self) -> Option<UnwrapPipeline> {
-        let keys = self.local_agent_keys();
-        if keys.is_empty() {
+        let paths = self.local_agent_key_paths();
+        if paths.is_empty() {
             return None;
         }
         let pool = self.index_pool.as_ref()?;
+        let mut keys = Vec::with_capacity(paths.len());
+        for p in &paths {
+            if let Some(k) = self.load_agent_key(p) {
+                keys.push(k);
+            }
+        }
+        if keys.is_empty() {
+            return None;
+        }
         let npubs: Vec<nostr_sdk::nostr::PublicKey> =
             keys.iter().map(|k| k.public_key()).collect();
         let refs: Vec<&nostr_sdk::nostr::PublicKey> = npubs.iter().collect();
@@ -319,7 +334,7 @@ mod tests {
 
         // Spawn the daemon inbound loop and let it discover the agent key.
         let handle = mailbox.spawn_unwrap_loop();
-        tokio::time::sleep(std::time::Duration::from_millis(2_000)).await;
+        tokio::time::sleep(std::time::Duration::from_secs(8)).await;
 
         // The wrap was projected into the messages table via the loop's sink.
         let pool = mailbox.index_pool().unwrap();
