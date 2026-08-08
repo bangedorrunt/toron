@@ -131,6 +131,31 @@ impl Mailbox {
         if !ok.stored {
             anyhow::bail!("profile event rejected by bus");
         }
+        // Index the registration (search-scoped identity table). Stores the
+        // VERBATIM project slug so the unwrap-loop projection can attribute
+        // inbound wraps to a project exactly (leading-separator forms
+        // round-trip — path archaeology cannot).
+        if let Some(pool) = &self.index_pool {
+            let now_us = result.event.created_at.as_secs() as i64 * 1_000_000;
+            sqlx::query(
+                "INSERT INTO agents (project_slug, name, pubkey, program, model, \
+                 task_description, created_ts_us) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+                 ON CONFLICT (project_slug, name) DO UPDATE SET \
+                 pubkey = excluded.pubkey, program = excluded.program, \
+                 model = excluded.model, task_description = excluded.task_description, \
+                 last_active_ts_us = excluded.created_ts_us",
+            )
+            .bind(project_slug)
+            .bind(&profile.name)
+            .bind(result.keys.public_key().to_hex())
+            .bind(profile.program.clone().unwrap_or_default())
+            .bind(profile.model.clone().unwrap_or_default())
+            .bind(profile.task_description.clone().unwrap_or_default())
+            .bind(now_us)
+            .execute(pool)
+            .await?;
+        }
         Ok(RegisteredAgent {
             name: profile.name.clone(),
             project_slug: project_slug.to_string(),
@@ -143,9 +168,15 @@ impl Mailbox {
 
     /// Absolute path of an agent's ncryptsec key file
     /// (`{data_dir}/{project}/agents/{name}/key.ncryptsec`).
+    ///
+    /// MCP clients pass absolute project keys (AM parity), and
+    /// `PathBuf::join` with an absolute path DISCARDS the data_dir prefix —
+    /// keys would escape into the slug's own tree and the unwrap-loop key
+    /// scan could never find them (projection never ran → search empty).
+    /// Strip the leading separator so keys always land under data_dir.
     pub(crate) fn agent_key_path(&self, project_slug: &str, name: &str) -> PathBuf {
         self.data_dir
-            .join(project_slug)
+            .join(project_slug.trim_start_matches('/'))
             .join("agents")
             .join(name)
             .join("key.ncryptsec")

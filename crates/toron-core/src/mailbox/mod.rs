@@ -203,20 +203,37 @@ impl Mailbox {
     /// All local agent key files on disk (`{data_dir}/{project}/agents/{name}/key.ncryptsec`).
     /// Listing only — never decrypts. Callers load keys on demand (the argon2
     /// KDF is ~1s per key and must NOT run inside the async daemon loop).
+    ///
+    /// Bounded recursive walk: absolute project slugs (AM parity) nest to
+    /// arbitrary depth under data_dir (`{data_dir}/tmp/proj/agents/...`), so
+    /// a single-level scan would miss them and the projection would never
+    /// run. Symlinks are not followed (the scan must not escape data_dir).
     fn local_agent_key_paths(&self) -> Vec<std::path::PathBuf> {
-        let Ok(projects) = std::fs::read_dir(&self.data_dir) else {
-            return Vec::new();
-        };
+        const MAX_DEPTH: usize = 16;
         let mut out = Vec::new();
-        for project in projects.flatten() {
-            let agents = project.path().join("agents");
-            let Ok(agents) = std::fs::read_dir(&agents) else {
+        let mut stack = vec![(self.data_dir.clone(), 0usize)];
+        while let Some((dir, depth)) = stack.pop() {
+            if depth >= MAX_DEPTH {
+                continue;
+            }
+            let Ok(entries) = std::fs::read_dir(&dir) else {
                 continue;
             };
-            for agent in agents.flatten() {
-                let key_path = agent.path().join("key.ncryptsec");
-                if key_path.is_file() {
-                    out.push(key_path);
+            for entry in entries.flatten() {
+                let Ok(ft) = entry.file_type() else { continue };
+                let path = entry.path();
+                if ft.is_dir() {
+                    stack.push((path, depth + 1));
+                } else if ft.is_file()
+                    && path.file_name().and_then(|n| n.to_str()) == Some("key.ncryptsec")
+                    && path
+                        .parent()
+                        .and_then(|p| p.parent())
+                        .and_then(|p| p.file_name())
+                        .and_then(|n| n.to_str())
+                        == Some("agents")
+                {
+                    out.push(path);
                 }
             }
         }
@@ -247,7 +264,23 @@ impl Mailbox {
             keys.iter().map(|k| k.public_key()).collect();
         let refs: Vec<&nostr_sdk::nostr::PublicKey> = npubs.iter().collect();
         let source = Arc::new(BusPolicySource::load_many(self, &refs).await);
-        let sink: Arc<dyn ProjectionSink> = Arc::new(SqliteProjectionSink::new(pool.clone()));
+        // Recipient-npub → verbatim project slug, from the registration-time
+        // `agents` index (gift wraps hide the project; the sink cannot read
+        // it off the wrap). Last-write-wins: one key per project in practice.
+        let npub_to_project: std::collections::HashMap<String, String> = sqlx::query_as(
+            "SELECT project_slug, pubkey FROM agents",
+        )
+        .fetch_all(pool)
+        .await
+        .map(|rows| {
+            rows.into_iter()
+                .map(|(slug, npub)| (npub, slug))
+                .collect()
+        })
+        .unwrap_or_default();
+        let sink: Arc<dyn ProjectionSink> = Arc::new(
+            SqliteProjectionSink::new(pool.clone()).with_projects(npub_to_project),
+        );
         let mut pipeline = UnwrapPipeline::new(keys, source, sink);
         if let Some(op) = &self.operator {
             pipeline = pipeline.with_operator(op.public_key());
@@ -343,6 +376,71 @@ mod tests {
             .await
             .expect("count");
         assert_eq!(count, 1, "inbound wrap must be projected by the unwrap loop");
+
+        handle.abort();
+        let _ = std::fs::remove_dir_all(&data_dir);
+        let _ = std::fs::remove_file(&db);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unwrap_loop_projects_inbound_gift_wrap_absolute_slug() {
+        // MCP clients pass absolute project keys (AM parity). The agent key
+        // MUST stay discoverable under the mailbox data_dir regardless of
+        // slug depth (regression: PathBuf::join discarded the data_dir prefix
+        // on absolute slugs, so the unwrap-loop key scan never found the key
+        // and search never projected — live-parity failure 2026-08-08).
+        let (mailbox, db, data_dir) = loop_mailbox("project").await;
+        let slug = format!("/tmp/toron-abs-slug-{}", uuid::Uuid::new_v4());
+        mailbox
+            .register_agent(&slug, &AgentProfile {
+                name: "RoseDune".into(),
+                program: Some("opencode".into()),
+                model: None,
+                persona: None,
+                task_description: None,
+            })
+            .await
+            .expect("register");
+        let sender = Keys::generate();
+
+        let path = mailbox.agent_key_path(&slug, "RoseDune");
+        let agent_keys = mailbox.load_agent_key(&path).expect("disk key");
+        let rumor = crate::nostr::gift_wrap::build_rumor(
+            sender.public_key(),
+            nostr_sdk::nostr::Timestamp::now(),
+            nostr_sdk::nostr::Kind::PrivateDirectMessage,
+            vec![nostr_sdk::nostr::Tag::parse(["p", &agent_keys.public_key().to_hex()]).expect("p")],
+            "hello via daemon loop (absolute slug)",
+        );
+        let wrap = crate::nostr::gift_wrap::gift_wrap(&sender, &agent_keys.public_key(), rumor)
+            .await
+            .expect("wrap");
+        let stored = mailbox.bus.publish(wrap).await.expect("publish");
+        assert!(stored.stored, "wrap must be stored on the bus");
+
+        let handle = mailbox.spawn_unwrap_loop();
+        tokio::time::sleep(std::time::Duration::from_secs(8)).await;
+
+        let pool = mailbox.index_pool().unwrap();
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages")
+            .fetch_one(pool)
+            .await
+            .expect("count");
+        assert_eq!(
+            count, 1,
+            "inbound wrap under an absolute project slug must be projected"
+        );
+        // The projected row must carry the VERBATIM registration slug — the
+        // search project filter matches exactly what the client passes.
+        let projected_slug: String =
+            sqlx::query_scalar("SELECT project_slug FROM messages")
+                .fetch_one(pool)
+                .await
+                .expect("project_slug");
+        assert_eq!(
+            projected_slug, slug,
+            "project_slug must round-trip verbatim (leading separator preserved)"
+        );
 
         handle.abort();
         let _ = std::fs::remove_dir_all(&data_dir);
