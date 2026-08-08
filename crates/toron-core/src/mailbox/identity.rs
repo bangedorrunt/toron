@@ -27,7 +27,7 @@ use super::Mailbox;
 use super::collect_replay;
 
 /// Result of register/create: the agent's identity + where its key lives.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RegisteredAgent {
     /// Agent name (project-scoped).
     pub name: String,
@@ -44,7 +44,7 @@ pub struct RegisteredAgent {
 }
 
 /// `whois` result: npub + profile fields + last-active provenance.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct WhoIs {
     /// Agent name.
     pub name: String,

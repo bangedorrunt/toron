@@ -15,7 +15,7 @@ use sqlx::Row;
 use sqlx::SqlitePool;
 
 /// A build slot lease (projection view).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BuildSlot {
     pub slot: String,
     pub agent_name: String,
@@ -25,7 +25,7 @@ pub struct BuildSlot {
     pub expires_ts_us: Option<i64>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SlotStatus {
     Active,
     Released,
@@ -49,14 +49,14 @@ pub struct AcquireSlotResult {
     pub conflicts: Vec<SlotConflict>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct GrantedSlot {
     pub slot: String,
     pub exclusive: bool,
     pub expires_ts_us: Option<i64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SlotConflict {
     pub slot: String,
     pub holders: Vec<String>,

@@ -19,7 +19,7 @@ use crate::nostr::event::build_event;
 use crate::nostr::kinds::{BUILD_SLOT, toron_kind};
 
 /// Acquire result (parity shape).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AcquireBuildSlotResult {
     pub granted: Vec<slots::GrantedSlot>,
     pub conflicts: Vec<slots::SlotConflict>,
