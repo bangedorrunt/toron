@@ -52,6 +52,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **P4 — Smart cron COMPLETE (ADR-0005, epic `bd-p4-smart-cron-xvbj` closed)** —
+  self-reporting + defined-fixer cron fully landed: schedule trigger extension
+  (P4.1), spawn-await + promise↔job binding (P4.2), Resonate durable-sleep
+  cron manager with `latest` catch-up + restart survival (P4.3), failure policy
+  with bead/escalate decisions (P4.4), sagas→workflow migration (P4.5), cron
+  CLI (P4.6), and the full P4 Behavior Test Matrix (P4.7). **ADR-0005 now FULLY
+  COMPLETE (P0–P6).** Final verification (BlackMarsh): verify-gates.sh PASS,
+  toron-workflow lib 123/123, toron-e2e p1,p2,p4 39/39.
 - **P4.2 spawn-await CLOSED (ADR-0005 Spec 4a, `bd-p4-spawn-await-pxw6`)** —
   spawn action + promise↔job binding + no_claim_timeout landed and closed by
   BlueOak; approval/spawn sink TypeId fix (see Fixed) shipped in the same bead.
