@@ -547,8 +547,10 @@ impl ToolServer {
         let name = args.name.clone().unwrap_or_else(generate_agent_name);
         let profile = AgentProfile {
             name: name.clone(),
-            program: Some(args.program.clone()),
-            model: Some(args.model.clone()),
+            // ADR-0005 P2.2: optional args map into 30013 content fields
+            // (None when the caller omits them — additive).
+            program: args.program.clone(),
+            model: args.model.clone(),
             task_description: args.task_description.clone(),
             persona: None,
         };
@@ -572,8 +574,10 @@ impl ToolServer {
         let name = args.name_hint.clone().unwrap_or_else(generate_agent_name);
         let profile = AgentProfile {
             name: name.clone(),
-            program: Some(args.program.clone()),
-            model: Some(args.model.clone()),
+            // ADR-0005 P2.2: optional args map into 30013 content fields
+            // (None when the caller omits them — additive).
+            program: args.program.clone(),
+            model: args.model.clone(),
             task_description: args.task_description.clone(),
             persona: None,
         };
@@ -1328,8 +1332,12 @@ pub struct UninstallPrecommitGuardArgs {
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone)]
 pub struct RegisterAgentArgs {
     pub project_key: String,
-    pub program: String,
-    pub model: String,
+    /// Harness / program (maps to 30013 content `program`). Optional for
+    /// backward compat — old callers omit it (ADR-0005 P2.2 content-map).
+    pub program: Option<String>,
+    /// Model (maps to 30013 content `model`). Optional for backward compat
+    /// (ADR-0005 P2.2 content-map).
+    pub model: Option<String>,
     pub name: Option<String>,
     pub task_description: Option<String>,
     pub attachments_policy: Option<String>,
@@ -1341,8 +1349,12 @@ pub struct RegisterAgentArgs {
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone)]
 pub struct CreateAgentIdentityArgs {
     pub project_key: String,
-    pub program: String,
-    pub model: String,
+    /// Harness / program (maps to 30013 content `program`). Optional for
+    /// backward compat — old callers omit it (ADR-0005 P2.2 content-map).
+    pub program: Option<String>,
+    /// Model (maps to 30013 content `model`). Optional for backward compat
+    /// (ADR-0005 P2.2 content-map).
+    pub model: Option<String>,
     pub name_hint: Option<String>,
     pub task_description: Option<String>,
     pub attachments_policy: Option<String>,

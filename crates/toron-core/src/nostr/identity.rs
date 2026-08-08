@@ -273,6 +273,56 @@ mod tests {
         assert_eq!(parsed, p);
     }
 
+    /// ADR-0005 P2.2 protocol guard (Review Log round 6 — the audit fix):
+    /// harness/model live in 30013 CONTENT (`program`/`model`), NEVER as `t`
+    /// tags. The ONLY `t` tag on a profile event is the project slug (project
+    /// scoping, scoping.rs). Overloading `t` with harness/model/role would
+    /// collide with project filters (false matches). This test is the
+    /// forever-guard.
+    #[test]
+    fn profile_no_tag_overload() {
+        let p = AgentProfile {
+            name: "BlueLake".into(),
+            program: Some("pi".into()),
+            model: Some("claude-sonnet-4".into()),
+            task_description: Some("profile catalog spawn".into()),
+            persona: None,
+        };
+        let r = create_agent_identity("demo", &p, ts()).expect("create");
+        let ev = &r.event;
+
+        // 1. harness/model present in CONTENT (the content-map target).
+        let parsed = parse_profile(ev).expect("parse profile content");
+        assert_eq!(parsed.program.as_deref(), Some("pi"));
+        assert_eq!(parsed.model.as_deref(), Some("claude-sonnet-4"));
+
+        // 2. The ONLY `t` tag is the project slug. NO `t` tag carries
+        // harness/model/role values (pi, claude-sonnet-4, oracle, ...).
+        let t_tags: Vec<Vec<String>> = ev
+            .tags
+            .iter()
+            .filter(|t| t.kind() == nostr_sdk::nostr::TagKind::t())
+            .map(|t| t.as_slice().iter().map(|s| s.to_string()).collect())
+            .collect();
+        assert_eq!(
+            t_tags,
+            vec![vec!["t".to_string(), "demo".to_string()]],
+            "t tag must be project-slug-only; harness/model must NOT overload it"
+        );
+
+        // 3. Nothing resembling harness/model/role leaks into ANY tag value.
+        for tag in ev.tags.iter() {
+            for part in tag.as_slice() {
+                let s = part.as_str();
+                assert!(
+                    !["pi", "claude-sonnet-4", "oracle", "planner", "reviewer", "coder", "scout", "housekeeper"]
+                        .contains(&s),
+                    "tag value {s:?} overloads profile fields onto the bus"
+                );
+            }
+        }
+    }
+
     /// Persona pack fields round-trip through the kind-30013 profile.
     #[test]
     fn test_persona_pack_roundtrip() {
