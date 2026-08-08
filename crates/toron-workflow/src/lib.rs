@@ -15,6 +15,7 @@
 
 pub mod channels;
 pub mod coalesce;
+pub mod cron;
 pub mod dispatch;
 pub mod engine;
 pub mod guard;
@@ -27,6 +28,9 @@ pub mod trigger_filter;
 pub use channels::{
     CHANNEL_CREATE, CHANNEL_MESSAGE, CHANNEL_METADATA, Channel, ChannelEvent, ChannelStore,
     REACTION,
+};
+pub use cron::{
+    CronManager, CronRegistration, CronRegistry, latest_due_at_or_before, next_due,
 };
 
 pub use coalesce::{
