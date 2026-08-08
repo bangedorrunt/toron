@@ -3581,6 +3581,7 @@ dependencies = [
  "toml",
  "toron-core",
  "toron-mcp",
+ "toron-workflow",
  "tracing",
  "tracing-subscriber",
 ]
