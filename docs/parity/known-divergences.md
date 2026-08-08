@@ -149,6 +149,20 @@ product bus (session, reservation cycle, contact handshake, product link fan-out
 
 Run: `cargo test -p toron-mcp --test am_parity_e2e`.
 
+**Flake root cause + fix (2026-08-09):** the harness never isolated the daemon's
+mailbox root. After the R2 durable default (ADR-0007 D3) replaced per-pid temp roots,
+`build_mailbox` fell back to the DURABLE XDG root (`~/.local/share/toron`), which
+accumulates agent keys across every test run. The unwrap-loop pipeline rebuild
+KDF-loads EVERY key in the root (~1s/key cold) — after a few runs the projection
+(search/summarize/product fan) stalled for minutes while the per-agent inbox
+(single-key load) stayed fast, so `cluster_messaging_round_trip` +
+`cluster_macros_and_product_bus` failed on search. Fixes: (a) `LiveDaemon::boot` sets
+`TORON_MCP_DATA_DIR` to a per-invocation temp dir (restores the "56s green" isolation
+that per-pid roots used to provide); (b) the messaging cluster now polls the search
+until the projection catches up (bounded 20s) instead of one immediate racy search —
+the projection is async by design, so the test must await it (the product cluster
+already polled). Suite green 6/6 in ~58s.
+
 ## 9. Unified MailSurface consumption (NEW 2026-08-09, ADR-0007 se2.3)
 
 flywheel's local `MailBackend` trait is DELETED; both backends implement
