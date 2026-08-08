@@ -50,6 +50,28 @@ pub struct ThreadSummary {
     pub message_count: usize,
 }
 
+/// Quote hyphenated FTS tokens so MATCH does not treat them as `column:term`.
+/// Leaves already-quoted tokens and boolean operators (AND/OR/NOT) alone.
+pub(crate) fn sanitize_fts_query(q: &str) -> String {
+    q.split_whitespace()
+        .map(|tok| {
+            let upper = tok.to_ascii_uppercase();
+            if upper == "AND" || upper == "OR" || upper == "NOT" {
+                return tok.to_string();
+            }
+            if tok.starts_with('"') {
+                return tok.to_string();
+            }
+            if tok.contains('-') {
+                let esc = tok.replace('"', "\"\"");
+                return format!("\"{esc}\"");
+            }
+            tok.to_string()
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 impl Mailbox {
     /// `search_messages`: FTS5 MATCH over the indexed messages for a project.
     ///
@@ -76,7 +98,9 @@ impl Mailbox {
         let mut bind_id = 3i32;
 
         // Build the parameter values as owned strings (sent as text).
-        let query = args.query.clone();
+        // Sanitize: FTS5 treats `foo-bar` as column `foo` term `bar` → "no such
+        // column". Quote hyphenated tokens (bd-mail-actor / bead ids).
+        let query = sanitize_fts_query(&args.query);
         let project = args.project_key.clone();
         let since: Option<i64> = args.since_us;
         let until: Option<i64> = args.until_us;
@@ -268,6 +292,46 @@ mod tests {
         .execute(pool)
         .await
         .expect("seed");
+    }
+
+    #[test]
+    fn sanitize_fts_quotes_hyphenated_tokens() {
+        assert_eq!(
+            sanitize_fts_query("bd-adr7-residual starting"),
+            "\"bd-adr7-residual\" starting"
+        );
+        assert_eq!(sanitize_fts_query("foo AND bar"), "foo AND bar");
+        assert_eq!(sanitize_fts_query("\"already-quoted\""), "\"already-quoted\"");
+    }
+
+    #[tokio::test]
+    async fn test_search_hyphenated_bead_id_does_not_error() {
+        let (mailbox, db_path, data_dir) = test_mailbox("hyphen-fts").await;
+        seed(
+            &mailbox,
+            "demo",
+            "e-hyphen",
+            "[bd-adr7-residual-vxnv.1] starting",
+            "wire trigger_tx",
+            "normal",
+            Some("bd-adr7-residual-vxnv.1"),
+            1_700_000_000_000_100,
+        )
+        .await;
+        let hits = mailbox
+            .search_messages(&SearchMessages {
+                project_key: "demo".into(),
+                query: "bd-adr7-residual-vxnv.1".into(),
+                limit: Some(10),
+                ..Default::default()
+            })
+            .await
+            .expect("hyphen query must not SQL-error");
+        assert!(
+            hits.iter().any(|h| h.subject.contains("bd-adr7")),
+            "expected subject hit, got {hits:?}"
+        );
+        let _ = (db_path, data_dir);
     }
 
     #[tokio::test]
