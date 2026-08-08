@@ -2,9 +2,9 @@
 status: accepted
 date: 2026-08-08
 accepted: 2026-08-08
-revision: 2
+revision: 3
 decision-makers: bangedorrunt (captain)
-consulted: architect agent (multi-pass review of ADR-0003/0004/0005 implementation)
+consulted: architect agent (multi-pass review of ADR-0003/0004/0005 implementation); opencode adversarial counter (Round 1)
 informed: ""
 supersedes: []
 extends: [ADR-0003, ADR-0004, ADR-0005]
@@ -23,10 +23,10 @@ related: [flywheel, herdr, superlogical, mcp_agent_mail_rust, nostr, bd-review-h
 > multiplexer) + Nostr mail (default) integrate cleanly with flywheel/workflow,
 > with agent-mail as fallback and superlogical as stub.
 >
-> **Status: ACCEPTED (Revision 2, 2026-08-08).** Captain locked D1–D8 answers
-> (see §Captain Decisions). Implementation proceeds via R0–R5 beads in **toron**
-> and adapted children under flywheel epic
-> `bd-review-hardening-mail-backend-c3b` (+ new ADR-0007 children).
+> **Status: ACCEPTED (Revision 3, 2026-08-08).** Captain locked D1–D8; opencode
+> Round-1 counter **AGREE-WITH-CHANGES** verified against live tree; all C1–C7
+> accepted into the body (see §Counter Round 1 + §Round-2 architect resolution).
+> **Gate:** R2 durable root **must not ship** without R2.KDF startup-cost bound (C2).
 >
 > **Scope of audit (2026-08-08):**
 > - `toron` workspace: `toron-core`, `toron-workflow`, `toron-mcp`, `toron-cli`, `toron-e2e`
@@ -47,7 +47,7 @@ related: [flywheel, herdr, superlogical, mcp_agent_mail_rust, nostr, bd-review-h
 |-----|-------------------------------|------------------------------|
 | **0003** | AM-Rust 38 tools / 25 resources; Nostr bus; NIP-17; Backend trait; flywheel embeds toron | Tools present (`#[tool(` × ~39); resources templates exist but **data projection mostly stub**; NIP-17 send/unwrap real; Backend trait **unified sync** in toron-core; flywheel has real `toron-core`/`toron-mcp`/`toron-workflow` cargo edges |
 | **0004** | 5 ships: coalesce, loop-prevention, doctor reconstruct, guard bound, overseer | Library primitives + tests exist; **production stamp of `toron:workflow-emitted` never applied on send path**; coalescer flush in host **does not emit jobs**; overseer path in unwrap is real |
-| **0005** | P0–P6 complete; one engine; failure path; profiles; smart cron; DAG | Engine large + many unit tests; **`call_workflow` is a structural stub**; **`foreach` never injects `{{item}}`**; MessagePosted trigger **cannot fire on NIP-17 mail**; MailBackend still flywheel-local AM-shaped (`u64` ids) |
+| **0005** | P0–P6 complete; one engine; failure path; profiles; smart cron; DAG | Engine large + many unit tests; **`call_workflow` is a structural stub**; **`foreach` never injects `{{item}}`**; MessagePosted trigger **cannot fire on NIP-17 mail**; MailBackend request path already `&str` (c3b partial); residual = **response/AM edge coercion to u64** + flywheel-local trait (not toron-core MailSurface) |
 
 ### The captain's integration requirements (this review's north star)
 
@@ -81,11 +81,19 @@ related: [flywheel, herdr, superlogical, mcp_agent_mail_rust, nostr, bd-review-h
 3. **Integrated mode primary** (ADR-0003 §3A). Flywheel leaf subprocesses and
    the durable loop must not each invent a fresh empty mailbox.
 4. **One-way deps:** `flywheel → toron-workflow → toron-core`. No reverse.
-5. **Frozen surfaces:** kind registry; 38 MCP tools (additive optional args OK).
+5. **Frozen surfaces (Rev 3):** kind **names/numbers** and the **38 tool names**
+   are frozen. **Arg types may break pre-1.0** when Nostr correctness requires
+   it, **only** with (a) a dual-accept migration window where practical
+   (`String | i64` via `#[serde(untagged)]` for one release) and (b) an entry
+   in `docs/parity/known-divergences.md`. Type changes are **not** "additive
+   optional args" — C3 forbids that lie.
 6. **Failure observability.** Stubs that return `{ok:false}` are honest; stubs
    that **silently no-op** or **claim success while doing nothing** are defects.
 7. **Simplification.** Prefer fewer traits, one message-id type, one error
    taxonomy, one durable mailbox root per project — not more adapters.
+8. **Durable root must not re-introduce KDF stall** (Rev 3 / C2). Stable
+   `data_dir` is required for integrated mode, but Mailbox startup must bound
+   argon2 key-scan cost (one scan, incremental, or cached unlocks).
 
 ---
 
@@ -134,10 +142,11 @@ Every finding: id, defect, evidence, remedy, confidence, minimum test, posture.
 
 ### F1 — CRITICAL: `message_posted` cannot fire on NIP-17 mail
 
-- **recommended_change:** Introduce a **projection trigger bus** (or re-publish
-  unwrapped rumors as *internal* non-wire trigger envelopes) so
-  `message_posted` sees kind-14 rumor content **after** unwrap, with
-  `toron:workflow-emitted` stamps on workflow-originated rumors.
+- **recommended_change (Rev 3 / C6):** Add a **`ProjectionSink` impl** on the
+  existing UnwrapPipeline seam (`unwrap.rs` — same shape as
+  `SqliteProjectionSink` / `GitProjectionSink`) that notifies WorkflowHost
+  for `message_posted`. **Not** a free-standing TriggerIngress subsystem.
+  Stamp workflow-originated rumors before the sink observes them (F6).
 - **evidence_of_defect:**
   - `messaging.rs` publishes gift wraps only (`Kind::GiftWrap`).
   - `trigger_filter.rs` **rejects** kind 1059 (correct for loop prevention).
@@ -145,45 +154,75 @@ Every finding: id, defect, evidence, remedy, confidence, minimum test, posture.
   - Docs in `trigger_filter` admit: "unwrapped rumor kind-14 … is not a
     workflow-trigger path" — i.e. the product path is undefined.
 - **evidence_of_remedy:** Channel messages (kind-9) can still trigger; DMs
-  never will until a post-unwrap ingress exists.
+  never will until a post-unwrap sink path exists.
 - **confidence:** High (code-path closed by construction).
-- **minimum_acceptable_fix:** e2e: agent A sends NIP-17 DM → workflow with
-  `trigger: message_posted` runs exactly once; workflow's own `send_message`
-  does **not** re-trigger.
+- **minimum_acceptable_test (Rev 3 / C7):** MUST use `Mailbox::send_message`
+  (gift-wrapped). **Raw `bus.publish(kind-14)` is non-NIP-17 and MUST NOT
+  count as F1 green** (current `workflow_host.rs:513` e2e is that trap).
+  Assert workflow runs once; workflow's own send does not re-trigger.
 - **do_not_broaden_into:** Do not put plaintext kind-14 on public relays.
-- **remediation_posture:** Structural (narrow fix insufficient: filter+matcher
-  contradict NIP-17 wire).
+- **remediation_posture:** Narrow-structural (new sink on existing pipeline).
 
 ### F2 — CRITICAL: flywheel in-process mailbox is per-process ephemeral
 
-- **recommended_change:** Durable project-scoped mailbox root
-  (`$XDG_DATA_HOME/flywheel/mail/<project>/` or config path), shared by all
-  leaves of one host; operator key stable; document remote-daemon mode for
-  multi-host.
+- **recommended_change:** Durable host root `$XDG_DATA_HOME/toron/` (D3);
+  shared by all leaves; stable operator key with **`0600` perms** (C4).
+  **Gate (C2):** R2.0 / F2.KDF — bound argon2 key-scan cost before durable
+  root ships. Temp-per-pid was accidental isolation — document the security
+  delta when removing it.
 - **evidence_of_defect:** `mail_shim.rs` `build_mailbox`:
   `temp_dir()/flywheel-mail-{pid}.sqlite` + random operator key each process.
   Comments document the limitation; durable loop **depends** on mail across
   leaves.
 - **confidence:** High.
 - **minimum_acceptable_test:** leaf A `send` → leaf B (new process, same
-  config) `inbox` sees message.
-- **remediation_posture:** Structural (config + path + key lifecycle).
+  data_dir) `inbox` sees message; **and** many-keys fixture under R2.0 bound.
+- **remediation_posture:** Structural (config + path + key lifecycle + KDF).
 
-### F3 — HIGH: MailBackend message ids are `u64` (AM model); toron ids are hex event ids
+### F2.KDF — HIGH (Rev 3 / C2): durable root re-introduces Mailbox startup stall
 
-- **recommended_change:** Canonical id type = **`String` (Nostr event id hex
-  or content-addressed rumor id)**. Agent-mail backend accepts decimal strings
-  or maps u64→string at the AM adapter boundary only.
-- **evidence_of_defect:**
-  - `MailBackend::ack/mark_read/reply(..., message_id: u64)`.
-  - toron core: `message_id: &str`, rumor id hex.
-  - flywheel shim: `message_id.to_string()` / `as i64` for remote — **cannot
-    round-trip a real toron inbox id** (hex is not a decimal u64).
+- **recommended_change:** Before or with R2.2: cached unlocks, incremental
+  KDF (only new key files), or one host-level unlock. Gate: ≥50-key fixture
+  meets documented bound. Align with `known-divergences §7` + `server.rs`
+  (`TORON_MCP_DATA_DIR` per-invocation was the tree's escape from this stall).
+- **evidence_of_defect:** Unwrap loop argon2 ~1s/key over all keys in
+  data_dir on rebuild; observed 80+ keys → minutes. D3's stable XDG root
+  **accumulates** keys across leaves — each new herdr pane process pays full
+  scan unless bounded.
 - **confidence:** High.
-- **minimum_acceptable_test:** send → fetch_inbox → ack(inbox[0].id) succeeds
-  on `FLYWHEEL_MAIL=toron`; same test on agentmail with numeric ids.
-- **remediation_posture:** Structural API redesign of `MailBackend` (this ADR's
-  core API decision).
+- **minimum_acceptable_test:** fixture ≥50 agent keys; cold start meets bound
+  or fails the gate (no ship of R2.2).
+- **remediation_posture:** Structural-small; **blocks R2.2**.
+- **status (R2.0 green 2026-08-08):** content-keyed unlock cache on `Mailbox`
+  (`cached_load_agent_key`); warm rebuild KDFs ONLY added/changed key files —
+  O(Δkeys) per rebuild, never O(N). Cold = N × ~1s (each key unlocked once).
+  Gate test `unwrap_loop_kdf_cached_between_rebuilds_many_keys` (50-key
+  fixture; KDF counts 50 → 51 → 51 → 52). Bound also in
+  `docs/parity/known-divergences.md §7`.
+
+### F3 — HIGH: Id model still broken at **response / AM edge** (request path partially fixed)
+
+> **Rev 3 (C1):** Original audit cited `MailBackend` request args as `u64`.
+> Live tree (2026-08-08): trait already `message_id: &str` (c3b migration).
+> Defect **stands in spirit**; evidence **re-pointed**.
+
+- **recommended_change:** Canonical id = **`MessageId` / `String`** end-to-end
+  (request **and** response). AM adapter: decimal parse → `Err` on failure
+  (**never** `unwrap_or(0)`). Reservation rows: `id: String` (or MessageId), not
+  `as_u64().unwrap_or(0)`.
+- **evidence_of_defect (live residual):**
+  - Request path: `backend/mod.rs` ack/mark_read/reply take `&str` ✓ (stale to
+    claim u64 trait).
+  - Response / wire: `mail_shim.rs:361,380` + `agentmail.rs:146,172`
+    `parse::<u64>().unwrap_or(0)` on ack/mark_read remote JSON.
+  - Response rows: `mail_shim.rs:1352` `RenewedReservation { id: u64 }` +
+    `:1370` `as_u64().unwrap_or(0)` — hex becomes **0**.
+  - MCP tools: `message_id`/`file_reservation_id` already `String` in
+    `tools.rs` (pre-1.0 break — see Driver 5 / C3).
+- **confidence:** High.
+- **minimum_acceptable_test:** send → fetch_inbox → ack(inbox[0].id) on toron
+  (hex); agentmail path with decimal string; assert **no silent 0**.
+- **remediation_posture:** Narrow (kill coercions) + R1 typed contracts.
 
 ### F4 — HIGH: `foreach` drops the item (false comment + weak test)
 
@@ -406,23 +445,26 @@ Move a **`MailSurface`** (name TBD) trait into `toron-core` (or
 
 * Bad: loses typed orchestration; reintroduces schema drift; slower leaves.
 
-### Option E — Trigger plane: post-unwrap internal events (CHOSEN with C)
+### Option E — Trigger plane: post-unwrap via ProjectionSink (CHOSEN with C; Rev 3 de-scope)
 
 Do **not** publish plaintext kind-14 to external relays.
 
-Add `TriggerIngress` fed by `UnwrapPipeline` outcomes (and channel kind-9/1/7
-from the bus). Workflow host subscribes to TriggerIngress, not raw gift wraps.
-Workflow-originated projections carry `toron:workflow-emitted` **before**
-ingress sees them.
+**Rev 3 (C6):** Prefer a **`ProjectionSink`** implementation on the existing
+UnwrapPipeline (`unwrap.rs:213+`) over a named free-standing TriggerIngress
+crate/module. Channel kind-9/1/7 still come from the bus subscription path.
+Workflow-originated projections carry `toron:workflow-emitted` **before** the
+sink/host evaluates triggers. Naming "TriggerIngress" may remain as the
+logical plane; blast radius = one sink + host wiring.
 
 ---
 
-## Decision Outcome (proposed)
+## Decision Outcome (accepted; Rev 3 amendments)
 
 ### D1 — Canonical message identity
 
 **`MessageId = String`** (hex event/rumor id on toron; decimal string on AM).
-Never `u64` in shared traits. CLI/MCP already mostly stringly; align flywheel.
+Never `u64` in **shared** request/response types. Request path may already be
+`&str`; finish **response** + reservation rows (F3 residual).
 
 ### D2 — MailSurface trait lives next to Mailbox (toron-core)
 
@@ -432,19 +474,26 @@ Never `u64` in shared traits. CLI/MCP already mostly stringly; align flywheel.
 - Fate of flywheel-local `MailBackend`: **deleted** after migration (not dual-lived).
 - Errors: shared machine codes (`NotFound`, `PolicyDenied`, `Unsupported`, …).
 
-### D3 — Durable mailbox root for integrated mode
+### D3 — Durable mailbox root for integrated mode (Rev 3 + C2 + C4)
 
-- Default path: `$XDG_DATA_HOME/toron/projects/<slug>/` (or flywheel config
-  `mail.toron.data_dir`), **not** `/tmp/...pid...`.
-- Operator key: stable file (`operator.ncryptsec` / config), not random per boot.
-- Document: leaf subprocesses **must** use the same data_dir; remote daemon
-  remains the multi-host option.
+- Default path: `$XDG_DATA_HOME/toron/` + `projects/<slug>/` (env
+  `TORON_DATA_DIR`), **not** `/tmp/...pid...`.
+- Operator key: stable `operator/operator.ncryptsec`, mode **`0600`**, owned
+  by the operator user. Threat note: temp-per-pid random keys were accidental
+  isolation; shared root means **any leaf on the host can read the same
+  mailbox state** — acceptable for single-operator local-first, document it.
+- **Hard gate:** R2.0 (F2.KDF) green before R2.2 durable root lands in
+  production paths. Demo/tests may still use per-invocation dirs
+  (`TORON_MCP_DATA_DIR` / pid dirs) for isolation.
+- Leaf subprocesses of one host **must** share the same data_dir; remote
+  daemon remains multi-host option.
 
-### D4 — Trigger plane separate from NIP-17 wire plane
+### D4 — Trigger plane via ProjectionSink (Rev 3 / C6)
 
 - Wire: gift wraps only for DMs (unchanged).
-- Triggers: UnwrapPipeline → TriggerIngress → workflow host.
-- Loop prevention: stamp on rumors + filter on ingress (F6+F1 together).
+- Triggers: UnwrapPipeline → **`ProjectionSink` (trigger notify)** → WorkflowHost.
+- Loop prevention: stamp on rumors + filter on public bus events (F6+F1).
+- F1 e2e: gift-wrapped send only (C7).
 
 ### D5 — Engine completeness gates (honesty)
 
@@ -474,14 +523,17 @@ Choose one (implementation plan picks after spike):
 | Mail | `toron` (Nostr) | `agentmail` compiled opt-in |
 | Bus | InProcessBus | RelayBus for daemon/federation |
 
-### D8 — Superset contract (normative)
+### D8 — Superset contract (normative; Rev 3 / C5)
 
 toron MUST:
 
 1. Support every AM **intent** flywheel uses (register, send, reply, inbox,
    ack, mark_read, reserve/release/renew/force, search, contacts, products,
    slots, pane identity helpers).
-2. Return **usable** ids (string) that round-trip.
+2. Return **usable** ids **per backend**: an id returned by backend X is
+   usable on backend X for subsequent ops. **Cross-backend id portability
+   is not required** (hex is not an AM integer; forcing it invites Option A
+   downcasts forbidden by Driver 1).
 3. Preserve Nostr properties: signed events, E2E DMs, true BCC, operator
    key-scoped overseer, addressable reservations.
 4. Document intentional shape diffs only in `docs/parity/known-divergences.md`.
@@ -504,13 +556,15 @@ AM backend MUST remain a working fallback for captains mid-migration.
 ### Negative
 
 - MailBackend migration touches ~all flywheel mail call sites (real surgery).
-- TriggerIngress is a new subsystem (small, but must be designed carefully).
+- ProjectionSink trigger path needs careful stamp ordering (small surface).
 - Some AM-only conveniences (integer ids in JSON) need adapter mapping.
+- Durable root + multi-agent keys requires KDF engineering (C2) — not free.
 
 ### Neutral
 
-- 38 MCP tools stay frozen; optional args already used for program/model.
-- Kind registry untouched.
+- 38 **tool names** + kinds frozen; **arg types** may break pre-1.0 with
+  dual-accept + divergence note (Driver 5 Rev 3 / C3).
+- Kind registry untouched for new custom numbers.
 - herdr Backend trait unchanged by mail redesign.
 
 ---
@@ -538,22 +592,23 @@ AM backend MUST remain a working fallback for captains mid-migration.
 | R1.5 | Delete flywheel `MailBackend`; migrate call sites | `flywheel/src/backend/*`, main.rs |
 | R1.6 | Parity e2e: send→inbox→ack→reply on both backends | `toron-mcp/tests`, flywheel tests |
 
-### Phase R2 — Durable integrated mode
+### Phase R2 — Durable integrated mode (**R2.0 gates R2.2**)
 
 | Bead | Work |
 |------|------|
-| R2.1 | Config: data_dir, operator key path, mail backend selection (complete `config/mod.rs`) |
-| R2.2 | Durable root layout + migration from temp (dev wipe OK — early product) |
+| **R2.0** | **KDF/startup bound (C2 / F2.KDF): cached unlocks or incremental scan; many-keys fixture gate. BLOCKS R2.2.** |
+| R2.1 | Config: data_dir, operator key path (`0600`), mail backend selection (complete `config/mod.rs`) |
+| R2.2 | Durable root layout + migration from temp (dev wipe OK — early product) — **only after R2.0** |
 | R2.3 | SC: leaf subprocess sees prior leaf's mail |
 | R2.4 | sc_fw_integrated uses durable root, not only temp demo |
 
-### Phase R3 — Trigger plane
+### Phase R3 — Trigger plane (ProjectionSink; Rev 3)
 
 | Bead | Work |
 |------|------|
-| R3.1 | `TriggerIngress` channel/bus fed by UnwrapPipeline |
-| R3.2 | WorkflowHost subscribes to ingress; MessagePosted matches unwrapped mail |
-| R3.3 | e2e F1 test; stamp prevents loop |
+| R3.1 | `TriggerNotifySink: ProjectionSink` on UnwrapPipeline |
+| R3.2 | WorkflowHost evaluates MessagePosted from sink (not raw 1059) |
+| R3.3 | e2e F1 via **gift-wrapped** `send_message`; stamp prevents loop; label raw-bus tests non-NIP-17 |
 | R3.4 | Channel kind-9 path still works (regression) |
 
 ### Phase R4 — Engine completeness
@@ -584,12 +639,13 @@ AM backend MUST remain a working fallback for captains mid-migration.
 
 ### Patterns to avoid
 
-- Casting Nostr ids to u64.
-- Per-pid temp mailboxes in production paths.
+- Casting Nostr ids to u64 / `unwrap_or(0)` on parse.
+- Shipping durable XDG root **without** KDF bound (C2).
 - Nested `block_on` on the workflow worker runtime.
 - Publishing unwrapped kind-14 to public relays for "easy triggers."
+- Counting raw-bus kind-14 e2e as NIP-17 `message_posted` proof (C7).
 - Silent success when a feature is stubbed.
-- New MCP tools or new kinds (frozen).
+- New tool **names** or new custom kind **numbers** without ADR (Driver 5).
 
 ### Configuration (target) — XDG locked (captain Q2)
 
@@ -627,49 +683,35 @@ Env precedence: flags > `TORON_DATA_DIR` / `FLYWHEEL_BACKEND` / `FLYWHEEL_MAIL` 
 
 ## Verification (acceptance for this ADR)
 
-- [ ] F1 e2e green: NIP-17 send triggers `message_posted` once; no self-loop
+- [ ] F1 e2e green: **gift-wrapped** send triggers `message_posted` once; no self-loop; raw-bus tests labeled non-NIP-17 (C7)
 - [ ] F2 e2e green: two processes, same data_dir, mail visible
-- [ ] F3 e2e green: inbox id → ack/reply on toron **and** agentmail
+- [ ] **F2.KDF / R2.0 green before R2.2** (many-keys fixture bound)
+- [ ] F3 e2e green: inbox id → ack/reply on toron (hex) **and** agentmail (decimal); **no silent 0**
 - [ ] F4 unit: foreach bodies use items
 - [ ] F5 unit/e2e: call_workflow nested success + fail_run
 - [ ] F6 unit: stamped public event rejected by trigger filter
 - [ ] F7 e2e: N mentions → one 43001
 - [ ] F8 stress: no deadlock under concurrent workflow sends
 - [ ] `scripts/verify-gates.sh` green
-- [ ] No `message_id: u64` in shared mail traits
+- [ ] No `u64` message/reservation ids in **shared** request/response types
 - [ ] Superlogical still Unsupported-only stub
-- [ ] README phase table no longer claims "FULLY COMPLETE" without residual register
-- [ ] `docs/parity/known-divergences.md` updated for MessageId if needed
+- [ ] README residual register points at this ADR
+- [ ] Driver 5 exception noted in known-divergences for any arg-type breaks
+- [ ] Operator key file mode 0600 on durable root (C4)
 
 ---
 
-## Change Agenda (ordered low → high leverage; last = strongest next move)
+## Change Agenda (implementation; low → high leverage; Rev 3)
 
-1. **change:** Fix foreach item injection  
-   **why:** Silent wrong control-flow  
-   **posture:** narrow  
-
-2. **change:** Shared Runtime + durable data_dir for mail_shim  
-   **why:** F2/F13 destroy integrated-mode truth  
-   **posture:** structural-small  
-
-3. **change:** Stamp + coalescer publish  
-   **why:** ADR-0004 ships incomplete in production  
-   **posture:** wire existing libs  
-
-4. **change:** TriggerIngress post-unwrap  
-   **why:** F1 makes message workflows fiction under NIP-17  
-   **posture:** structural  
-
-5. **change:** Implement or demote call_workflow  
-   **why:** Pipeline story depends on it  
-   **posture:** complete or honest  
-
-6. **change:** **MailSurface + MessageId redesign (D1–D3)**  
-   **why:** Single highest-leverage move — unblocks superset claim, flywheel
-   seamless use of Nostr mail, and ends AM-shaped footguns  
-   **posture:** structural API redesign  
-   **minimum_acceptable_test:** dual-backend send→inbox→ack→reply matrix  
+1. **change:** Fix foreach item injection (F4) — narrow  
+2. **change:** Shared Runtime (c3b.1 / R0.3) + kill `unwrap_or(0)` response coercion (F3 residual) — narrow  
+3. **change:** Stamp + coalescer publish (F6/F7) — wire existing libs  
+4. **change:** ProjectionSink trigger notify + gift-wrapped F1 e2e (F1/C6/C7) — narrow-structural  
+5. **change:** **R2.0 KDF bound (F2.KDF/C2)** — structural-small; **blocks durable root**  
+6. **change:** Durable XDG root + 0600 operator key (F2/D3/C4) — only after #5  
+7. **change:** Implement call_workflow nested run (F5) — after R0–R3  
+8. **change:** **MailSurface + MessageId end-to-end (D1–D2)** — structural API  
+   **minimum_acceptable_test:** per-backend send→inbox→ack→reply (D8.2 scoped)  
 
 ---
 
@@ -922,6 +964,31 @@ is safe to proceed after the doc-level corrections.
 
 ---
 
+## Round-2 architect resolution (2026-08-08) — counters accepted
+
+Live-tree re-verification of C1–C7: **all stand**. Body amendments applied in
+this Rev 3 (F1, F2/F2.KDF, F3, Driver 5, D3, D4, D8, R2.0 gate, Verification,
+Change Agenda).
+
+| Counter | Verdict | Body delta |
+|---------|---------|------------|
+| **C1** F3 evidence stale | **ACCEPT** | F3 re-pointed to response/AM edge + reservation `as_u64` |
+| **C2** KDF vs durable root | **ACCEPT (hardest)** | F2.KDF + R2.0 **blocks R2.2** |
+| **C3** frozen tool surface | **ACCEPT** | Driver 5: names frozen; arg types may break pre-1.0 with dual-accept + divergence note |
+| **C4** security delta | **ACCEPT** | D3: `0600` keys + single-operator threat note |
+| **C5** D8.2 overclaim | **ACCEPT** | D8.2 per-backend only |
+| **C6** TriggerIngress overbuilt | **ACCEPT** | D4/Option E = ProjectionSink on existing pipeline |
+| **C7** F1 e2e trap | **ACCEPT** | Verification + F1 min test = gift-wrapped only |
+
+**Disagree? None material.** Minor: ProjectionSink line numbers in the counter
+may drift; seam existence is what matters.
+
+**Proceed order (updated):** R0 (foreach/stamp/coalesce/id-coercion) + c3b
+parallel → **R2.0 KDF** → R2 durable → R3 sink → R4 call_workflow → R1
+MailSurface finish. **Do not** land durable XDG in production paths before R2.0.
+
+---
+
 ## More Information
 
 ### Audit method
@@ -956,4 +1023,4 @@ is safe to proceed after the doc-level corrections.
 - [ADR-0005](0005-orchestration-layer.md) — orchestration tier
 - [ADR-0006](0006-blossom-blob-federation.md) — orthogonal blobs
 
-// governed-by: ADR-0007 (proposed)
+// governed-by: ADR-0007 (accepted, rev 3)

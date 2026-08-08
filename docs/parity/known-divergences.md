@@ -112,6 +112,21 @@ for tests that need a data dir to persist ACROSS processes (cli_robot registers
 in-process then shells out). Verified: `am_parity_e2e` dropped from 400s+ (with search
 failing) to 56s green.
 
+### KDF scan bound (R2.0 / F2.KDF, 2026-08-08 — gates durable root)
+
+The unwrap-loop pipeline rebuild no longer re-derives every key. `Mailbox` keeps a
+content-keyed unlock cache (`crates/toron-core/src/mailbox/mod.rs`, `key_cache` +
+`cached_load_agent_key`): rebuilds re-run the argon2 KDF ONLY for key files whose
+ncryptsec CONTENT changed — O(Δkeys) per rebuild, never O(N).
+
+- **Cold path bound:** N × per-key KDF (~1s/key at log-n 16), each key unlocked
+  exactly once per process.
+- **Warm rebuild bound:** KDF = number of added/changed key files; unchanged keys
+  are memory cache hits (pure file reads, no argon2).
+- **Machine-checked by** `unwrap_loop_kdf_cached_between_rebuilds_many_keys`
+  (fixture: 50 keys + 1 added + 1 changed; asserts KDF counts 50 → 51 → 51 → 52).
+- Durable XDG root (R2.2) may land only with this gate green.
+
 ## 8. AM-parity e2e (NEW 2026-08-08)
 
 `crates/toron-mcp/tests/am_parity_e2e.rs` boots the REAL daemon (axum router on a live
