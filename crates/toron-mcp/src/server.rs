@@ -15,10 +15,11 @@ use rmcp::transport::streamable_http_server::session::local::LocalSessionManager
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use rmcp::{ServerHandler, ServiceExt};
 use toron_core::bus::Bus;
-use toron_core::mailbox::Mailbox;
+use toron_core::mailbox::{Mailbox, UnwrappedMail};
 
 use crate::resources::{RESOURCES, read_resource_value};
 use crate::tools::ToolServer;
+use crate::workflow_host::WorkflowHost;
 
 /// MCP server for toron.
 ///
@@ -244,12 +245,31 @@ impl ServerHandler for ToronServer {
 /// `{root}/projects/<slug>/`; operator key `{root}/operator/operator.ncryptsec`,
 /// mode 0600 when present (ADR-0007 D3).
 ///
-/// **Demo / test isolation:** set `TORON_DEMO=1` for a unique temp dir per
-/// call (bounds KDF scan; cli_robot cross-process tests set `TORON_MCP_DATA_DIR`
-/// to a shared path instead).
+/// **Demo / test isolation:** `TORON_DEMO=1` → unique temp dir per call
+/// (bounds KDF scan); `TORON_MCP_DATA_DIR` → a caller-provided shared dir
+/// (cli_robot cross-process tests set it so both processes see one root).
 ///
 /// R2.0 KDF cache still bounds warm rebuilds inside a process.
 pub async fn demo_mailbox() -> anyhow::Result<Mailbox> {
+    build_mailbox(None).await
+}
+
+/// [`demo_mailbox`] plus the ADR-0007 R3 post-unwrap trigger channel.
+///
+/// The serve paths use this variant: the `tx` half is attached via
+/// [`Mailbox::with_trigger_tx`] so every successfully-projected gift-wrap
+/// notifies the channel; the `rx` half feeds
+/// [`WorkflowHost::spawn_mail_trigger_loop`] (F1 `message_posted`).
+pub async fn demo_mailbox_with_trigger(
+) -> anyhow::Result<(Mailbox, tokio::sync::mpsc::UnboundedReceiver<UnwrappedMail>)> {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mailbox = build_mailbox(Some(tx)).await?;
+    Ok((mailbox, rx))
+}
+
+async fn build_mailbox(
+    trigger_tx: Option<tokio::sync::mpsc::UnboundedSender<UnwrappedMail>>,
+) -> anyhow::Result<Mailbox> {
     use toron_core::config::ToronPaths;
 
     let (data_dir, db, operator) = if ToronPaths::demo_mode() {
@@ -260,6 +280,14 @@ pub async fn demo_mailbox() -> anyhow::Result<Mailbox> {
         std::fs::create_dir_all(&data_dir)?;
         let db = std::env::temp_dir().join(format!("toron-mcp-{stamp}.sqlite"));
         (data_dir, db, operator_keys()?)
+    } else if let Some(dir) = std::env::var_os("TORON_MCP_DATA_DIR") {
+        // Cross-process test isolation: a caller-provided shared dir
+        // (cli_robot registers in-process, then shells out to the built
+        // binary — both sides MUST see the same root).
+        let d = std::path::PathBuf::from(dir);
+        std::fs::create_dir_all(&d)?;
+        let db = d.join("index.sqlite");
+        (d, db, operator_keys()?)
     } else {
         // R2 (ADR-0007 D3): production default is the DURABLE root
         // ($XDG_DATA_HOME/toron or TORON_DATA_DIR) — per-pid temp roots are
@@ -279,10 +307,34 @@ pub async fn demo_mailbox() -> anyhow::Result<Mailbox> {
     let pool = toron_core::index::schema::connect(db.to_str().unwrap()).await?;
     toron_core::index::schema::migrate(&pool).await?;
     let bus = toron_core::bus::InProcessBus::open(pool.clone(), Default::default()).await?;
-    let mailbox = Mailbox::new(Arc::new(bus), data_dir, operator).with_index_pool(pool);
+    let mut mailbox = Mailbox::new(Arc::new(bus), data_dir, operator).with_index_pool(pool);
+    if let Some(tx) = trigger_tx {
+        mailbox = mailbox.with_trigger_tx(tx);
+    }
     // ADR-0004 inbound unwrap loop (bd-pkc): G14 + Overseer + projection LIVE.
     mailbox.spawn_unwrap_loop();
     Ok(mailbox)
+}
+
+/// ADR-0007 R3 serve wire: construct the workflow host over the serve mailbox
+/// and spawn the post-unwrap `message_posted` trigger loop (F1). Gift-wrapped
+/// inbound mail fires `message_posted` once; workflow-emitted rumors carry the
+/// `toron:workflow-emitted` stamp and are skipped by the loop (no self-loop).
+///
+/// Embedders register workflows via [`WorkflowHost::add_workflow`]; the serve
+/// binary arms the loop so triggers are LIVE the moment a workflow exists.
+fn spawn_mail_trigger_host(
+    mailbox: Mailbox,
+    trigger_rx: tokio::sync::mpsc::UnboundedReceiver<UnwrappedMail>,
+) {
+    match WorkflowHost::new(Arc::new(mailbox), Vec::new()) {
+        Ok(host) => {
+            host.spawn_mail_trigger_loop(trigger_rx);
+        }
+        Err(e) => tracing::warn!(
+            "workflow host unavailable; message_posted triggers disabled: {e:#}"
+        ),
+    }
 }
 
 /// Load the operator key for the MCP server from env, if configured.
@@ -318,7 +370,9 @@ pub(crate) fn operator_keys() -> anyhow::Result<Option<toron_core::keys::Keys>> 
 ///
 /// Blocks until the stdio connection closes.
 pub async fn serve_stdio() -> anyhow::Result<()> {
-    let server = ToronServer::new().with_mailbox(demo_mailbox().await?);
+    let (mailbox, trigger_rx) = demo_mailbox_with_trigger().await?;
+    spawn_mail_trigger_host(mailbox.clone(), trigger_rx);
+    let server = ToronServer::new().with_mailbox(mailbox);
     let running = server.serve(rmcp::transport::stdio()).await?;
     running.waiting().await?;
     Ok(())
@@ -330,7 +384,9 @@ pub async fn serve_stdio() -> anyhow::Result<()> {
 /// daemon/federation path is horizontally scalable with no session affinity.
 /// The served handler carries the 38 AM-Rust parity tools (bd-led.7.2).
 pub async fn router() -> anyhow::Result<axum::Router> {
-    let server = ToronServer::new().with_mailbox(demo_mailbox().await?);
+    let (mailbox, trigger_rx) = demo_mailbox_with_trigger().await?;
+    spawn_mail_trigger_host(mailbox.clone(), trigger_rx);
+    let server = ToronServer::new().with_mailbox(mailbox);
     let service: StreamableHttpService<ToronServer, LocalSessionManager> =
         StreamableHttpService::new(
             move || Ok(server.clone()),
@@ -379,5 +435,173 @@ mod tests {
     #[test]
     fn resource_surface_matches_fixture_count() {
         assert_eq!(RESOURCES.len(), 25);
+    }
+
+    /// ADR-0007 R3/F1 serve wire e2e: with the trigger channel attached
+    /// (`with_trigger_tx`) and `spawn_mail_trigger_loop` running, a
+    /// GIFT-WRAPPED `send_message` fires the `message_posted` workflow exactly
+    /// ONCE, and the workflow's own stamped reply does not re-trigger
+    /// (no self-loop).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn serve_wire_gift_wrap_fires_message_posted_once() {
+        use toron_core::bus::in_process::{InProcessBus, InProcessBusConfig};
+        use toron_core::index::schema;
+        use toron_core::nostr::identity::AgentProfile;
+        use toron_workflow::schema::parse_workflow;
+
+        let db = std::env::temp_dir().join(format!("serve-wire-{}.sqlite", uuid::Uuid::new_v4()));
+        let data_dir =
+            std::env::temp_dir().join(format!("serve-wire-data-{}", uuid::Uuid::new_v4()));
+        let pool = schema::connect(db.to_str().unwrap()).await.expect("connect");
+        schema::migrate(&pool).await.expect("migrate");
+        let bus: Arc<dyn Bus> = Arc::new(
+            InProcessBus::open(pool.clone(), InProcessBusConfig::default())
+                .await
+                .expect("bus"),
+        );
+
+        // The serve wire: channel → with_trigger_tx → host loop.
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<UnwrappedMail>();
+        let mailbox = Arc::new(
+            Mailbox::new(bus.clone(), data_dir.clone(), None)
+                .with_agent_passphrase("serve-wire-pass")
+                .with_trigger_tx(tx)
+                .with_index_pool(pool.clone()),
+        );
+        mailbox
+            .register_agent(
+                "demo",
+                &AgentProfile::new("demo-user"),
+            )
+            .await
+            .expect("register sender");
+        mailbox
+            .register_agent(
+                "demo",
+                &AgentProfile::new("BlueLake"),
+            )
+            .await
+            .expect("register recipient");
+        // The workflow ActionRunner sends as `workflow-<project>` (F6 stamp).
+        mailbox
+            .register_agent(
+                "demo",
+                &AgentProfile::new("workflow-demo"),
+            )
+            .await
+            .expect("register workflow sender");
+        mailbox.spawn_unwrap_loop();
+
+        let wf = parse_workflow(
+            r##"
+name: serve-wire-triage
+trigger:
+  type: message_posted
+guard: "trigger_kind == \"14\""
+steps:
+  - name: ack
+    action: send_dm
+    to: "BlueLake"
+    body: "workflow ack"
+    project: "demo"
+"##,
+        )
+        .expect("parse workflow");
+        let host = WorkflowHost::new(mailbox.clone(), vec![wf]).expect("host");
+        let host_handle = host.spawn_mail_trigger_loop(rx);
+
+        // Count kind-1059 gift wraps on the bus: exactly the user send + the
+        // stamped workflow ack — never a third (self-loop would add more).
+        let mut sub = bus
+            .subscribe(toron_core::bus::Filter::new().kinds([nostr_sdk::nostr::Kind::GiftWrap]))
+            .await
+            .expect("subscribe");
+        let mut wraps = 0u32;
+        let mut ack_body_seen = false;
+        // KDFs serialize (~4.4s/key × 3 keys + margins) — 45s is honest.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(45);
+        // The user gift-wrapped send — the F1 trigger source.
+        mailbox
+            .send_message(&toron_core::mailbox::SendMessage {
+                project_slug: "demo".into(),
+                sender_name: "demo-user".into(),
+                to: vec!["BlueLake".into()],
+                subject: "trigger me".into(),
+                body_md: "hello via serve wire".into(),
+                ..Default::default()
+            })
+            .await
+            .expect("send");
+        while wraps < 2 && tokio::time::Instant::now() < deadline {
+            let ev = match tokio::time::timeout_at(deadline, sub.next()).await {
+                Ok(Some(toron_core::bus::SubscriptionEvent::Event(e))) => e,
+                _ => continue,
+            };
+            if ev.kind.as_u16() == 1059 {
+                wraps += 1;
+                if wraps == 2 {
+                    // Second wrap = the workflow reply; verify its body and
+                    // the workflow-emitted stamp by unwrapping it with the
+                    // recipient key (same key material the loop uses).
+                    let key_path = data_dir
+                        .join("demo")
+                        .join("agents")
+                        .join("BlueLake")
+                        .join("key.ncryptsec");
+                    let recipient =
+                        toron_core::keys::load_encrypted_key(&key_path, "serve-wire-pass")
+                            .expect("disk key");
+                    if let Ok(unwrapped) =
+                        toron_core::nostr::gift_wrap::unwrap(&recipient, &ev)
+                    {
+                        ack_body_seen = unwrapped.rumor.content.contains("workflow ack");
+                        let stamped = unwrapped.rumor.tags.iter().any(|t| {
+                            t.as_slice().first().map(String::as_str) == Some("t")
+                                && t.as_slice().get(1).map(String::as_str)
+                                    == Some(
+                                        toron_workflow::trigger_filter::WORKFLOW_EMITTED_TAG,
+                                    )
+                        });
+                        assert!(stamped, "workflow reply must carry the workflow-emitted stamp");
+                    }
+                }
+            }
+        }
+        assert_eq!(wraps, 2, "user send + one workflow ack (ran exactly once)");
+        assert!(ack_body_seen, "workflow reply delivered with expected body");
+
+        // Grace: drain the subscription — a self-loop would add a third wrap.
+        let grace = tokio::time::Instant::now() + std::time::Duration::from_secs(4);
+        loop {
+            let ev = match tokio::time::timeout_at(grace, sub.next()).await {
+                Ok(Some(toron_core::bus::SubscriptionEvent::Event(e))) => e,
+                _ => break,
+            };
+            assert_ne!(
+                ev.kind.as_u16(),
+                1059,
+                "no self-loop: workflow reply must not re-trigger message_posted"
+            );
+        }
+        assert_eq!(
+            wraps, 2,
+            "no self-loop: exactly user send + workflow ack observed"
+        );
+
+        // Both mails visible to the recipient (projection + trigger path live:
+        // the sink only notifies after a successful projection write).
+        let inbox = mailbox
+            .fetch_inbox(&toron_core::mailbox::FetchInbox {
+                project_slug: "demo".into(),
+                agent_name: "BlueLake".into(),
+                ..Default::default()
+            })
+            .await
+            .expect("fetch inbox");
+        assert_eq!(inbox.len(), 2, "user mail + workflow ack both projected");
+
+        host_handle.abort();
+        let _ = std::fs::remove_dir_all(&data_dir);
+        let _ = std::fs::remove_file(&db);
     }
 }
