@@ -1,0 +1,57 @@
+# Weekly health-gated Docker image upgrade with auto-rollback
+# (saga replacement — ADR-0005 Spec 3, bd-p4-migrate-sagas-7rmo)
+#
+# Replaces the systemd docker-auto-upgrade timer (Sun 03:30). Same
+# health-gates as the bash saga; declarative + replayable via the unified
+# engine. Deploy: copy to ~/.config/flywheel/workflows/.
+name: docker-upgrade
+description: "Weekly health-gated Docker image upgrade with auto-rollback (saga replacement, ADR-0005 Spec 3)."
+trigger:
+  type: schedule
+  cron: "30 3 * * 0"
+  owner: housekeeper
+  scope: host
+policy:
+  on_failure: bead
+  on_repeat_failure: escalate
+  repeat_threshold: 3
+  on_success: log
+  max_retries: 1
+  no_claim_timeout: 600
+steps:
+  - name: snapshot
+    action: spawn
+    profile: "@housekeeper"
+    workflow: housekeeper-snapshot
+    await: true
+    no_claim_timeout: 600
+    on_error: fail_run
+  - name: upgrade
+    action: spawn
+    profile: "@housekeeper"
+    workflow: housekeeper-docker-upgrade
+    await: true
+    no_claim_timeout: 600
+    on_error: fail_run
+  - name: health-gate
+    action: branch
+    if: "{{steps.upgrade.healthy}} == true"
+    then:
+      - name: notify-ok
+        action: send_dm
+        to: housekeeper
+        body: "docker-upgrade OK: {{steps.upgrade.containers}}"
+    else:
+      # A failed spawn-await FAILS the run (Spec 4a) -> on_failure: bead.
+      # If rollback itself fails, the failure bundle carries the rollback
+      # error + last-known-good.
+      - name: rollback
+        action: spawn
+        profile: "@housekeeper"
+        workflow: housekeeper-rollback
+        await: true
+        no_claim_timeout: 600
+      - name: notify-fail
+        action: send_dm
+        to: housekeeper
+        body: "docker-upgrade FAILED — rolled back to snapshot"
