@@ -318,6 +318,34 @@ am_parity_e2e tests the Nostr surface the agent-mail backend would integrate
 with; there is no agent-mail impl in `crates/toron-core/src/backend/`
 (herdr/tmux/mock/error/types only). Documented, no action.
 
+## P0 Soundness Ledger — FINAL VERDICT (bd-p0-soundness-ledger-52w3, 2026-08-09)
+
+All ADR-0007 ledger claims verified in code; every leaf of the P0 epic closed.
+
+| Claim | Verdict | Evidence (file:line / gate) | Where recorded |
+|-------|---------|------------------------------|----------------|
+| S1 NIP-17 → message_posted | **GREEN** | `serve_wire_gift_wrap_fires_message_posted_once` (server.rs:446) — gift-wrap e2e, ran GREEN | this file §S1-re-verification |
+| S2 no self-loop | **GREEN** | `trigger_filter.rs` 11/11 + engine/schema/lint/cron; full toron-workflow lib 124/124 | this file §S2-re-verification |
+| S3 shared durable mail state | **GREEN** | `cli_robot.rs::cross_process_mail_content_shares_durable_root` (in-process send → subprocess inbox contains it) | ADR-0007 ledger cell (reworded) + F2 checklist |
+| S4 String ids round-trip | **GREEN** | tools.rs:1512/1519/1523/1527/1607 all String; F11 dead `Vec<i64>` selectors noted | this file §S4-re-verification |
+| S5 foreach binds item | **GREEN** | `foreach_over_list_collects` (engine.rs:2041) | this file §S5-re-verification |
+| S6 call_workflow composes | **GREEN** | `call_workflow_nested_subrun_returns_child_output` (engine.rs:2136) | this file §S6-re-verification |
+| S7 burst → one 43001 | **GREEN** | `coalesced_burst_publishes_one_stamped_43001` (workflow_host.rs:824) | this file §S7-re-verification |
+| S8 25 resources readable | **GREEN** | S8 honest-stub gate tightened; 25-URI coverage test (bd-p0-s8-resources-stub-gate-rrfz) | ADR-0007 verification + that bead |
+| S9 AM-superset at flywheel trait | **GREEN** | se2.3: MailBackend deleted, MailSurface (String ids) consumed; no u64 at edge | known-divergences.md §9b |
+| F2.KDF many-keys bound | **GREEN** | `unwrap_loop_kdf_cached_between_rebuilds_many_keys` (mailbox/mod.rs:540), 7.9s | this file §F2.KDF-re-verification |
+| bd-XXX ×3 parity fixes | **GREEN** | regression pins: build_slots renew absolute-expiry, reservations renew no-2x, identity collision (bd-p0-bdxxx-regression-tests-tz2y) | that bead + mailbox module tests |
+| F2.NIP40 (new P0, oc A1.10) | **RED → FIXED** | expired wrap rejected pre-projection; `expired_gift_wrap_rejected_on_unwrap` RED→GREEN (bd-p3-nip40-expiration-fix-6ezx) | this file §F2.NIP40 |
+
+**Remaining open RED in the tree: F3.COALESCER-LOCK** (std-Mutex guard held
+across blocking publish, P1) — fix wired into `bd-batch-fix-pass-mip4`
+(batch consumes ALL findings; single governed RED→GREEN pass).
+
+**P0 epic closure:** all 6 leaves closed (nip40-probe, bdxxx-regression,
+s8-resources-gate, s3-shared-state, verify-green-claims, s9-boundary-doc);
+"Fully implemented 0003-0007" SURVIVES with the NIP-40 + envelope-verify
+hardening folded in.
+
 ## S1/S2/S4/S5/S6/S7/F2.KDF — Re-verification GREEN (bd-p0-verify-green-claims-8z3p)
 
 **Probe:** 2026-08-09, live tree (no code modifications). All 7 claims re-verified GREEN
