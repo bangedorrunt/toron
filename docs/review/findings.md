@@ -1432,3 +1432,40 @@ output clean on live tree (matches the F22.GOVERNED-BY enumeration: 0 gaps).
   repo root via `../../..`.
 - The AGENTS.md mandate ("verified by docs/decisions/_scripts/verify-adr-links.sh")
   is now real and CI-enforced.
+
+## BASELINE RE-RUN (PRE-BATCH) — R8, bd-baseline-rerun-zqtm (2026-08-09, HEAD 0f84cb8e)
+
+**Gates bd-batch-fix-pass-mip4.** Re-ran the 5 cheap greps on the CURRENT tree
+with the charter's methodology (`rg -n` line counts across crates/src; LOC =
+total `.rs` lines under crates/, src+tests). All deltas are attributable to
+P0-P6 bead work landing since the 2026-08-09 Measured Baseline (no unrelated
+drift).
+
+### Delta table
+
+| Metric | Baseline (2026-08-09) | Current (R8) | Δ | Attribution |
+|--------|----------------------|--------------|---|-------------|
+| Total LOC (src+tests) | 45,609 | 48,105 | **+2,496** | core +1,647 · mcp +666 · cli +172 · e2e +11 · workflow 0 — P0-P6 tests+fixes (dual-sink 8971aa4, NIP-40, proptests, resources gate, perf baseline, etc.) |
+| `unwrap()` in src | 219 | 228 | +9 | P0-P6 additions (mostly test-region); prod count re-audited at 14 (bd-p2-unwrap-expect-classify-brlh) |
+| `expect()` in src | 984 | 1,098 | +114 | same — new tests + fix code; prod re-audited at 69 (same bead) |
+| `.lock()` sites | 122 | 135 | +13 | new sync sinks/locks in P0-P6 code (all tokio/parking_lot RAII) |
+| `.await` sites | 1,324 | 1,432 | +108 | new async paths (dual-sink, triggers, e2e) |
+
+Per-crate LOC: core 23,799 · mcp 7,240 · workflow 7,618 · cli 4,512 · e2e 4,936.
+
+### Cite-drift check
+
+- All file:line cites in findings.md re-verified at P6 (ledger reconciliation
+  bead bd-p6-soundness-ledger-update-lajq). Key cites still valid:
+  `unwrap.rs:776` (NIP-40), `unwrap.rs:763` (verify-before-project),
+  `mailbox/mod.rs:358-372` (dual sink wiring), `keys/mod.rs:20` (log_n=16),
+  `config/mod.rs:319-335` (operator KDF pin), `tools.rs` arg structs
+  (post-F4.ID-TYPE lines shift by +49 — the no_integer_id test moved them;
+  all verified current in §F4.ID-TYPE).
+- No stale cites found that would make the batch fix target a moved line.
+
+### Note for the batch
+
+The batch-fix pass runs against THIS tree state (0f84cb8e, 48,105 LOC). Any
+count-conservation assertion (bd-p2-count-conservation-v3ey) must use the R8
+numbers (228/1,098), not the charter's 219/984.
