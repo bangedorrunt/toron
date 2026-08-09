@@ -630,6 +630,33 @@ All 7 P3 leaves closed. Aggregate:
 author check + filters). Verify note: toron-core suite currently 345/2 —
 only the batch-deferred REDs fail (F3.COALESCER-LOCK, F19.NIP09).
 
+## F20.DEADCODE-FIXTURES — dead-code reclassification proposal (P4, PROPOSAL ONLY)
+
+**Probe:** `bd-p4-deadcode-reclassify-fixtures-xa36` (2026-08-09). No edits —
+this is the exact reclassification spec for the batch-fix pass (captain
+review before application). **Removal FORBIDDEN** (all are live fixtures).
+
+### Verified reference map + per-fixture proposal
+
+| Fixture | Defined | Live references (verified) | Clippy flag (features-off) | Proposal (exact) | Blast radius |
+|---------|---------|----------------------------|----------------------------|------------------|--------------|
+| `noop_runner` | toron-cli/src/workflow.rs:31 | **LIVE PROD**: `toron workflow run` + `invoke` CLI commands use it | none (prod-used) | **NO CHANGE** — not dead | none |
+| `noop_runner` | toron-workflow/src/engine.rs:1250 (test module) | in-module tests + e2e define their own | none | NO CHANGE — test-local | none |
+| `next_tick` | toron-e2e/tests/common/mod.rs:151 | sc21/sc24 catch-up tests (p1-gated) | yes (common/mod.rs:151) | **`#![allow(dead_code)]` at top of common/mod.rs** (test-support module; lint fires only when the referencing p1-gated tests are compiled out) | none — test-support module only, no lib code |
+| `housekeeper_workflow` | common/mod.rs:103 | sc18-20 via `housekeeper_resolver` (p1-gated) | yes (:103) | same allow | none |
+| `cron_registry` | common/mod.rs:123 | sc18-20 cron setups | yes (:123) | same allow | none |
+| `fixture_registration` | common/mod.rs:130 | sc24_cron_catchup | yes (:130) | same allow | none |
+| `next_tick` (already above) | — | — | — | — | — |
+
+### Application spec (batch-fix-pass)
+
+1. Add `#![allow(dead_code)]` as the FIRST line of `crates/toron-e2e/tests/common/mod.rs`
+   (covers all 5 fixtures; the module is test-support by definition).
+2. Verify: `cargo clippy -p toron-e2e --tests` → 0 dead-code warnings;
+   `cargo test -p toron-e2e --features p1 --test sc11..sc24` suite still green.
+3. NO item moves, NO cfg-gates added (the `allow` is simpler and the module
+   is already e2e-only); `noop_runner` CLI helper untouched (prod-live).
+
 ## S1/S2/S4/S5/S6/S7/F2.KDF — Re-verification GREEN (bd-p0-verify-green-claims-8z3p)
 
 **Probe:** 2026-08-09, live tree (no code modifications). All 7 claims re-verified GREEN
