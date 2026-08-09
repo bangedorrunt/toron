@@ -760,6 +760,23 @@ error. Net −12 duplicated lines, zero behavior change (messages identical).
 Application at batch-fix-pass or as a standalone mini-refactor with the bus
 test suites green (`in_process` 18 + `relay_bus` 8 tests).
 
+## P4 Mega-File Refactor Candidates — EPIC VERDICT (bd-p4-refactor-has5, 2026-08-09)
+
+All 5 P4 leaves closed — **all proposal-only** (P4 track contract: NO edits;
+each proposal awaits captain approval, application at batch-fix-pass).
+
+| Leaf | Verdict | Proposal (findings ref) | Application |
+|------|---------|--------------------------|-------------|
+| engine.rs split (2401 LOC) | map + move-only split | F21.ENGINE-SPLIT: engine/{mod,control_flow,template,sinks,tests}.rs, pub-use re-exports, zero external edits | batch, captain-gated |
+| tools.rs split (1896 LOC) | 38-tool inventory + 7-module layout | F21.TOOLS-SPLIT | batch, captain-gated |
+| surface/messaging overlap | clean layering; 1 minor dup | F22.SURFACE-MESSAGING: single `tag_value` helper | batch (or mini-refactor) |
+| in_process/relay_bus dedup | near-clean; 1 dup block | F23.BUS-DEDUP: `bus/common.rs::verify_publish_event` | batch (or mini-refactor) |
+| dead-code fixtures | 5 flagged = live fixtures | F20.DEADCODE-FIXTURES: `#![allow(dead_code)]` on e2e common/mod.rs; removal FORBIDDEN | batch |
+
+**Key risk note (captain decision):** all proposals are behavior-preserving
+move-only; F20 is the highest-risk to APPLY (a misread breaks sc11/18-24) —
+its application spec is explicit (allow + clippy/suite verification).
+
 ## S1/S2/S4/S5/S6/S7/F2.KDF — Re-verification GREEN (bd-p0-verify-green-claims-8z3p)
 
 **Probe:** 2026-08-09, live tree (no code modifications). All 7 claims re-verified GREEN
