@@ -51,6 +51,13 @@ if [ "$missing" -eq 0 ]; then
     echo "ok: all crate roots forbid unsafe_code"
 fi
 
+# 4. ADR <-> code linkage (bd-p6-verify-adr-links-script-xhi2): every
+#    governed-by marker references an existing ADR; every forbid(unsafe_code)
+#    file (ADR-0003 constraint) carries a marker.
+if ! bash docs/decisions/_scripts/verify-adr-links.sh; then
+    fail=1
+fi
+
 if [ "$fail" -ne 0 ]; then
     echo "GATE FAILED" >&2
     exit 1
