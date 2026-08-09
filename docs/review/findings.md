@@ -7,6 +7,7 @@ reviewed and the captain approves.**
 | ID | Track | Site (file:line) | Invariant | Verified | Risk | Fix-class |
 |----|-------|------------------|-----------|----------|------|-----------|
 | F2.NIP40 | P0 crypto | `crates/toron-core/src/mailbox/unwrap.rs:602-656` (`UnwrapPipeline::project`) | NIP-40 `expiration` honored on unwrap ingest — expired gift wrap rejected BEFORE sqlite/git projection | **RED** — no TTL check exists | **P0 crypto** — expired-but-never-seen gift wrap is ACCEPTED + projected, voiding ADR-0003 "Parity Superiority" replay/expiry claim | TTL check in unwrap pipeline (parse `expiration` tag, reject-if-past pre-write). RED test `expired_gift_wrap_rejected_on_unwrap` first (see `bd-p3-nip40-expiration-fix-6ezx`) |
+| F3.COALESCER-LOCK | P1 concurrency | `crates/toron-mcp/src/workflow_host.rs:156-165` (runner FlushNow arm) + `:441-461` (trigger-loop tick flush) | std-Mutex guard on `MentionCoalescer` NOT held across the blocking publish (`publish_coalesced_job` → `thread::scope` + `rt.block_on(bus.publish)`) | **RED** — guard IS held across the publish; concurrent flush stalls for the publish duration (measured 498ms stall on 600ms publish) | **P1 stall** — any slow publish (relay latency/backpressure) freezes every other coalescer accessor (all `dispatch_job` actions + tick flushes) for the publish duration; poison risk (`expect`) covered by p1-poison-on-panic-audit | Drop the guard before publishing: clone the `Coalesced` under the lock, release, then publish. RED test `coalescer_lock_not_held_across_blocking_publish` authored + failing today |
 
 ## F2.NIP40 — NIP-40 expiration NOT honored on unwrap ingest path (P0)
 
@@ -45,6 +46,42 @@ live ingest path.
 2. GREEN: TTL check in unwrap pipeline before `sink.write` (parse `expiration` tag,
    compare vs now, reject-if-past).
 3. REFACTOR: extract named helper.
+
+## F3.COALESCER-LOCK — std-Mutex guard held across blocking publish (P1)
+
+**Probe:** `bd-p1-std-guard-across-blockon-gwnt` (2026-08-09). Verdict: **RED**.
+
+### Evidence (audit sweep: `lock()` sites within ±10 lines of `block_on`/`thread::scope`/`spawn_blocking`/`.await` across all crates)
+
+1. **Runner FlushNow arm** — crates/toron-mcp/src/workflow_host.rs:156-165
+   (`mailbox_runner`): `coalescer.lock().expect("coalescer lock")` held while
+   `publish_coalesced_job` runs — that fn (workflow_host.rs:190-221) blocks on
+   `std::thread::scope` + `rt.block_on(bus.publish)`.
+2. **Trigger-loop tick flush** — crates/toron-mcp/src/workflow_host.rs:441-461
+   (`run_trigger_loop`): `self.coalescer.lock().expect("coalescer lock")` held
+   across the same blocking publish, once per flushed assignee.
+3. **Siblings classified SAFE (not this class):** `cron.rs:169`,
+   `engine.rs:497/820`, `index/writer.rs:145/152` = tokio (async) Mutex —
+   safe across `.await`. `unwrap.rs:460/473/534/649`, `archive/git.rs:80/99` =
+   short-lived sync guard, never held across an await/block. `mock_relay.rs:137`
+   + engine `seen.lock().unwrap()` sites = test code.
+
+### Consequence (classification: STALL, not cancel)
+
+Every other coalescer accessor (`dispatch_job` actions + tick flushes on other
+assignees, other host tasks) blocks for the full publish duration. Measured in
+RED test: a concurrent flush stalled 498ms behind a 600ms publish. With relay
+latency/timeouts the stall scales with the publish — the trigger loop itself
+freezes mid-batch (per-event event processing halts).
+
+### Fix (deferred to the ADR-0008 batch-fix pass)
+
+1. RED: `coalescer_lock_not_held_across_blocking_publish`
+   (crates/toron-mcp/src/workflow_host.rs, test module) — authored, confirmed
+   FAILING today (498ms stall > 300ms bound).
+2. GREEN: clone each `Coalesced` out of the guard, drop the guard, then
+   `publish_coalesced_job` (both sites).
+3. REFACTOR: extract a `flush_and_publish` helper with the lock scope explicit.
 
 ## S1/S2/S4/S5/S6/S7/F2.KDF — Re-verification GREEN (bd-p0-verify-green-claims-8z3p)
 

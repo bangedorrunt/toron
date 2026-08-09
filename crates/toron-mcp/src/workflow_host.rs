@@ -1072,5 +1072,118 @@ steps:
         let _ = std::fs::remove_dir_all(&data_dir);
         let _ = std::fs::remove_file(&db);
     }
+
+    /// A [`Bus`] whose `publish` sleeps before delegating — models relay
+    /// latency / backpressure on the real publish path.
+    struct SlowBus {
+        inner: Arc<toron_core::bus::InProcessBus>,
+        sleep: std::time::Duration,
+    }
+
+    #[async_trait::async_trait]
+    impl Bus for SlowBus {
+        async fn publish(
+            &self,
+            event: nostr_sdk::nostr::Event,
+        ) -> Result<toron_core::bus::PublishOk, toron_core::bus::BusError> {
+            tokio::time::sleep(self.sleep).await;
+            self.inner.publish(event).await
+        }
+
+        async fn subscribe(
+            &self,
+            filter: toron_core::bus::Filter,
+        ) -> Result<toron_core::bus::Subscription, toron_core::bus::BusError> {
+            self.inner.subscribe(filter).await
+        }
+
+        async fn health(&self) -> Result<toron_core::bus::Health, toron_core::bus::BusError> {
+            self.inner.health().await
+        }
+    }
+
+    /// P1 (bd-p1-std-guard-across-blockon-gwnt, oc A1.6): the coalescer
+    /// std-Mutex guard must NOT be held across `publish_coalesced_job`'s
+    /// blocking publish (thread::scope + rt.block_on).
+    ///
+    /// RED today: the guard IS held across the publish at the runner's
+    /// FlushNow arm (mailbox_runner, :156-165) and the trigger-loop tick
+    /// flush (:441-461) — a concurrent flush for an unrelated assignee
+    /// stalls for the full publish duration. After the batch fix (clone the
+    /// coalesced job under the lock, release, THEN publish) the concurrent
+    /// flush proceeds immediately.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn coalescer_lock_not_held_across_blocking_publish() {
+        use toron_core::bus::in_process::{InProcessBus, InProcessBusConfig};
+        use toron_core::index::schema;
+
+        const PUBLISH_MS: u64 = 600;
+        let db = std::env::temp_dir()
+            .join(format!("wf-coalesce-lock-{}.sqlite", uuid::Uuid::new_v4()));
+        let pool = schema::connect(db.to_str().unwrap()).await.expect("connect");
+        schema::migrate(&pool).await.expect("migrate");
+        let inner = Arc::new(
+            InProcessBus::open(pool, InProcessBusConfig::default())
+                .await
+                .expect("bus"),
+        );
+        let slow: Arc<dyn Bus> = Arc::new(SlowBus {
+            inner,
+            sleep: std::time::Duration::from_millis(PUBLISH_MS),
+        });
+
+        let data_dir = std::env::temp_dir()
+            .join(format!("wf-coalesce-lock-data-{}", uuid::Uuid::new_v4()));
+        let mailbox = Arc::new(
+            Mailbox::new(slow.clone(), data_dir.clone(), None)
+                .with_agent_passphrase("coalesce-lock-pass"),
+        );
+
+        // cap=3 → the THIRD mention to an assignee flushes NOW (publish path).
+        let coalescer = Arc::new(std::sync::Mutex::new(MentionCoalescer::new(
+            std::time::Duration::from_millis(2_000),
+            std::time::Duration::from_millis(500),
+            3,
+        )));
+        let runner = mailbox_runner(
+            mailbox.clone(),
+            coalescer.clone(),
+            Some(nostr_sdk::nostr::Keys::generate()),
+        );
+
+        let dispatch = |runner: &ActionRunner, assignee: &str, text: &str| {
+            runner(&Action::DispatchJob {
+                assignee: assignee.into(),
+                spec: serde_json::json!({ "text": text }),
+                channel: None,
+            })
+        };
+
+        // Prime oc's buffer (two mentions buffered, no flush).
+        let _ = dispatch(&runner, "oc", "e1");
+        let _ = dispatch(&runner, "oc", "e2");
+
+        // A: third oc mention → cap flush → publish_coalesced_job BLOCKS on
+        // the slow bus (while the coalescer guard is held today).
+        let runner_a = runner.clone();
+        let a = std::thread::spawn(move || dispatch(&runner_a, "oc", "e3"));
+
+        // B: an unrelated flush must NOT wait for A's slow publish.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let runner_b = runner.clone();
+        let t0 = std::time::Instant::now();
+        let b = std::thread::spawn(move || dispatch(&runner_b, "gk", "e4"));
+        let _ = b.join().expect("runner B no panic");
+        let b_elapsed = t0.elapsed();
+        let _ = a.join().expect("runner A no panic");
+
+        assert!(
+            b_elapsed < std::time::Duration::from_millis(300),
+            "concurrent flush stalled {b_elapsed:?} behind a blocking publish — coalescer guard held across publish_coalesced_job"
+        );
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+        let _ = std::fs::remove_file(&db);
+    }
 }
 
