@@ -546,6 +546,39 @@ coverage audited.
 No new defect. cli_robot 7/7 green; workflow_host 10/11 (only the
 batch-deferred F3.COALESCER-LOCK RED fails); clippy clean.
 
+## F18.SC-FW-IGNORE — #[ignore] sc_fw_integrated resolution (P5)
+
+**Probe:** `bd-p5-sc-fw-integrated-resolution-8m5d` (2026-08-09). Verdict:
+**RESOLVED — blocker landed; decision = keep live sub-case ignored with a
+documented reason (flywheel CI scope).**
+
+### What was ignored
+
+`sc_fw_flywheel_binary_live` (crates/toron-e2e/tests/sc_fw_integrated.rs): the
+cross-repo live sub-case — rg across flywheel+toron for a single
+`fn agent_prompt` + boots `flywheel toron status`. `#[ignore]` reason was
+"requires bd-o8j.2 (flywheel herdr.rs/mail.rs removal) + flywheel repo
+checkout".
+
+### Resolution
+
+1. **Blocker LANDED**: bd-o8j.2 closed (flywheel `MailBackend`/old herdr.rs/
+   mail.rs deleted, se2.3) — the test **PASSES** on this machine (verified:
+   rg single-def count + `flywheel toron status` exit 0).
+2. **Decision** (captain decision 3 = toron only): the live sub-case boots a
+   DIFFERENT repo's binary and rg's `~/workspace/flywheel/src` — a cross-repo
+   e2e, **flywheel CI scope**. Keep `#[ignore]`d with the reason updated to
+   "cross-repo e2e: requires flywheel binary + checkout (flywheel CI scope);
+   verified passing 2026-08-09".
+3. **Toron-only invariant now runs ALWAYS**: the single-`fn agent_prompt`
+   definition in toron-core is asserted by the run-always
+   `sc_fw_single_agent_prompt_definition_in_core` (herdr.rs:490 canonical;
+   `agent_prompt_coded` :500 is a distinct helper, correctly excluded by the
+   `fn agent_prompt(` predicate).
+
+Result: 2/2 run-always tests pass (single-def + one-process peer mail);
+1 documented ignore; no silent-ignored test without a reason. Clippy clean.
+
 ## S1/S2/S4/S5/S6/S7/F2.KDF — Re-verification GREEN (bd-p0-verify-green-claims-8z3p)
 
 **Probe:** 2026-08-09, live tree (no code modifications). All 7 claims re-verified GREEN
