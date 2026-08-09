@@ -180,7 +180,20 @@ impl RelayBus {
                             subscription_id,
                             event,
                         } if subscription_id.as_ref() == &sub_id_clone => {
-                            Some(SubscriptionEvent::Event(event.into_owned()))
+                            // P3 (bd-p3-schnorr-verify-every-ingest-q0wo):
+                            // defense-in-depth — nostr-sdk verifies relay
+                            // events before notification (Client::new default,
+                            // no skip_verification), but the bus must never
+                            // forward an unverified event downstream.
+                            let event = event.into_owned();
+                            if crate::nostr::event::verify_event(&event).is_err() {
+                                tracing::warn!(
+                                    event_id = %event.id,
+                                    "relay event failed Schnorr verification; dropped at ingest"
+                                );
+                                continue;
+                            }
+                            Some(SubscriptionEvent::Event(event))
                         }
                         nostr_sdk::nostr::RelayMessage::EndOfStoredEvents(id)
                             if id.as_ref() == &sub_id_clone =>
