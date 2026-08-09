@@ -384,6 +384,45 @@ All 6 P1 leaves closed. Aggregate:
 F1.LAG-SWALLOW (both have authored RED tests: `coalescer_lock_not_held_across_blocking_publish`,
 `test_broadcast_lag_is_surfaced_not_swallowed`).
 
+## F12.ERROR-DISCIPLINE — thiserror enum + message quality audit (P2) — GREEN
+
+**Probe:** `bd-p2-error-enum-discipline-tsxv` (2026-08-09). Verdict: **GREEN —
+disciplined.** thiserror consistent where enums are used; machine-code
+architecture intentional (ADR-0007 D2/R1); zero ad-hoc `Box<dyn Error>`; no
+opaque messages. Polish notes only.
+
+### Error-enum inventory
+
+| Type | Location | Form | Message quality |
+|------|----------|------|-----------------|
+| `BusError` | toron-core/src/bus/mod.rs:65 | thiserror enum (6 variants) | descriptive + `{0}` source chaining |
+| `KeyStoreError` | toron-core/src/keys/mod.rs:26 | thiserror enum (4) | descriptive + `{0}` |
+| `VerifyError` | toron-core/src/nostr/event.rs:17 | thiserror enum (3) | descriptive ("event id is not canonical (mutated content/tags?)") |
+| `ProofError` | toron-core/src/nostr/proof.rs:92 | thiserror enum (8) | descriptive ("proof expired", "proof nonce replayed") |
+| `GiftWrapError` | toron-core/src/nostr/gift_wrap.rs:21 | thiserror enum (5) | descriptive + `{0}` |
+| `MessageIdError` | toron-core/src/mailbox/ids.rs:74 | hand-rolled `Display`+`Error` (no thiserror) | descriptive — **polish: convert to thiserror for consistency** |
+| `MailError` + `MailErrorCode` | toron-core/src/mailbox/error.rs:13,66 | machine code + message struct (ADR-0007 D2) | classify on `code`, never `message` ✓ |
+| `BackendError` + `BackendErrorCode` | toron-core/src/backend/error.rs:13,67 | machine code + message struct (bd-led.6.1) | same discipline ✓ |
+| `JobError` | toron-workflow/src/jobs.rs:62 | serde payload struct (job result content, not an error type) | n/a |
+| `StepOnError` | toron-workflow/src/schema.rs:289 | workflow YAML policy enum (not an error type) | n/a |
+
+### Ad-hoc error check
+
+- `Box<dyn Error>`: **ZERO** sites.
+- `Result<_, String>`: **2 sites** — `lint_yaml`/`lint_file` (toron-workflow lint API,
+  `"yaml parse error: {e}"` prefixed). Display-oriented CLI contract; acceptable —
+  polish note: a `LintError` enum would be stricter but the String is the CLI output.
+- Opaque messages (`"error"`, `"failed"`, `""`, `.context("error")`): **ZERO** sites.
+- `?` propagation discipline (unwrap/expect-on-Result classification) is the
+  sibling bead `bd-p2-unwrap-expect-classify-brlh` (in progress) — hand-off noted.
+
+### Verdict
+
+No defect. toron-core uses thiserror consistently; the coordination fabric's
+machine-code errors are intentional per ADR-0007 (classify on code). Two
+polish notes (MessageIdError → thiserror; lint String → optional enum) — no
+bead filed (polish class, captain decision: batch collects only REDs).
+
 ## S1/S2/S4/S5/S6/S7/F2.KDF — Re-verification GREEN (bd-p0-verify-green-claims-8z3p)
 
 **Probe:** 2026-08-09, live tree (no code modifications). All 7 claims re-verified GREEN
@@ -612,8 +651,8 @@ unwrap/expect sites are invariant-true by construction.
 |---|---|---|---|
 | `unwrap()` occurrences in src | 219 | 227 (regex) / 206 (ast-grep) | P0-P3 fixes landed since baseline (F5.POISON `unwrap_or_else` swaps, NIP-40 fix, S8 gate) + multiline-site counting |
 | `expect()` occurrences in src | 984 | 1053 | same; new tests + P0-P3 additions |
-| prod (non-cfg(test)) unwrap | — (not split at baseline) | 15 code sites + 1 doc-comment false positive (blob_serve.rs:87, excluded) | — |
-| prod (non-cfg(test)) expect | — | 74 | — |
+| prod (non-cfg(test)) unwrap | — (not split at baseline) | 14 code sites + 1 doc-comment false positive (blob_serve.rs:87, excluded); harness.rs sites are test-harness lib | — |
+| prod (non-cfg(test)) expect | — | 69 (74 − event.rs:86/92/97 test-mod + mock_relay.rs:43/44 `#![cfg(test)]` file) | — |
 | test-region unwrap / expect | — | 211 / 979 | excluded from prod classification per bead scope |
 
 > Baseline re-run is owned by bd-baseline-rerun-zqtm (R8, pre-batch). This bead
@@ -640,15 +679,16 @@ unwrap/expect sites are invariant-true by construction.
 
 | Class | Sites | Count | Rationale |
 |-------|-------|-------|-----------|
-| `Tag::parse([...])` non-empty literal/known-good first element | blob.rs:64,69,73 · build_slots.rs:62,133,165,166 · channels.rs:202,242 · contacts.rs:111,112,114,156,157,158,161,187 · engine.rs:1003 · event.rs:92,97 · infra.rs:111 · jobs.rs:97 · messaging.rs:573,598,603 · product.rs:59,128,133 · proof.rs:333 · reservations.rs:134,135,149,229,230,295,296,358,359,365,370,394,395,396,397 · scoping.rs:26,27,28 | ~46 | `Tag::parse` fails ONLY on empty tag (nostr-0.44.8 tag/mod.rs:106-119); every site passes a non-empty array — first element is a literal |
-| `serde_json::to_string` of plain structs (no floats) | identity.rs:87 · presence.rs:64 · jobs.rs:103,150,182 · proof.rs:332 · matrix.rs:71,90,104,127,145,160,175,191,205,219 | ~14 | structs are String/u64-only; serialization cannot fail |
+| `Tag::parse([...])` non-empty literal/known-good first element | blob.rs:64,69,73 · build_slots.rs:62,133,165,166 · channels.rs:202,242 · contacts.rs:111,112,114,156,157,158,161,187 · engine.rs:1003 · identity.rs:89 · infra.rs:111 · product.rs:59,128,133 · proof.rs:333 · reservations.rs:134,135,149,229,230,295,296,358,359,365,370,394,395,396,397 · scoping.rs:26,27,28 | 42 | `Tag::parse` fails ONLY on empty tag (nostr-0.44.8 tag/mod.rs:106-119); every site passes a non-empty array — first element is a literal |
+| `serde_json::to_string` of plain structs (no floats) | identity.rs:87 · presence.rs:64 · jobs.rs:103,150,182 · proof.rs:332 · matrix.rs:71,90,104,127,145,160,175,191,205,219 | 16 | structs are String/u64-only; serialization cannot fail |
 | state-guarded map/buffer access | coalesce.rs:275 ("just-inserted buffer") · coalesce.rs:303 ("non-empty buffer checked above") · engine.rs:942 ("node in map", futures built from nodes keys in same loop) | 3 | guard checked immediately above |
 | `strip_prefix` of root-built path | unwrap.rs:389 ("inside root") | 1 | `layout::message` = `root.join(...)` — prefix always present |
-| crypto/key invariants | event.rs:86 (SecretKey::from_hex of all-0x01 literal) · reservations.rs:409 ("wrap notify") + contacts.rs:330 ("wrap control") — gift_wrap of internally-built rumor with registry keys · reservations.rs:353 ("id" — EventId::from_hex fallback of fixed 64-hex literal) | 4 | valid fixed key / keys fetched from registry |
-| test-infra binds | mock_relay.rs:43,44 (bind 127.0.0.1:0) | 2 | mock relay, test-only usage |
+| crypto/key invariants | reservations.rs:409 ("wrap notify") + contacts.rs:330 ("wrap control") — gift_wrap of internally-built rumor with registry keys · reservations.rs:353 ("id" — EventId::from_hex fallback of fixed 64-hex literal) | 3 | keys fetched from registry; fixed hex literal |
 | `Tag::parse` free-form value with literal kind | jobs.rs:97 ("assignee tag") · messaging.rs:573,598,603 | 4 | first element literal; free-form value cannot make parse fail (empty check only) |
 
-**TOTAL: 15 unwrap + 74 expect = 89 prod sites, all invariant-true. 0 real-risk.**
+**TOTAL: 14 unwrap + 69 expect = 83 prod sites, all invariant-true. 0 real-risk.**
+(Test-module sites excluded: event.rs:86/92/97 inside `mod tests` at :77; mock_relay.rs:43/44
+in the `#![cfg(test)]`-only file; harness.rs:61/117 are test-harness library.)
 ### expect() message audit
 
 All 74 messages are on invariant paths (confident messages on guaranteed-by-construction
