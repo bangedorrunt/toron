@@ -696,6 +696,43 @@ Max file after split: 1194 (tests) / 590 (control_flow) — no >1000-LOC prod fi
 - Verification at application: `cargo test -p toron-workflow` (124) + `-p toron-mcp` (33/34) + `-p toron-e2e --features p1` sc11/sc18-24 green; clippy clean.
 - NOT in scope: any reshape (API changes) — requires separate captain approval (decision 5).
 
+## F22.SURFACE-MESSAGING — surface.rs/messaging.rs overlap audit (P4)
+
+**Probe:** `bd-p4-surface-messaging-dedup-1g8m` (2026-08-09). Verdict:
+**clean layering — no business-logic duplication**; one minor helper
+duplication (tag lookup ×2), extraction proposal below.
+
+### Responsibility map
+
+| Module | LOC | Responsibility |
+|--------|-----|----------------|
+| `surface.rs` (1561) | trait + adapter | `MailSurface` trait (ADR-0007 D2, 40 ops: messaging/search/contacts/agents/reservations/slots/products/panes) + `ToronMailSurface` (delegates EVERY op to `Mailbox` with `MailError` mapping) + DTO `From` conversions (8) + `parse_rfc3339_us` + `filter_inbox_messages` (AM-edge filter) |
+| `messaging.rs` (1341) | concrete business logic | `impl Mailbox`: `send_message`/`reply_message` (gift-wrap + bus), `fetch_inbox` (bus replay → unwrap → G7 order → read-state → sender names → limit), `acknowledge_message`/`mark_message_read`, types + `unwrap_for_recipient` + `tag_value` |
+
+### Overlap findings
+
+1. **Delegation, not duplication**: `ToronMailSurface::send/inbox/ack/...` call
+   `Mailbox::send_message/fetch_inbox/...` (verified surface.rs:593-680) — no
+   re-implemented gift-wrap/bus/replay logic in surface.rs.
+2. **Filters are complementary, not duplicated**: `fetch_inbox` filters
+   `unread_only` + `limit` (messaging.rs:312-325); `filter_inbox_messages`
+   filters `urgent_only` + `since_ts` (surface.rs:316-330) — the AM query
+   shape's extra dimensions, applied at the adapter edge by design.
+3. **Minor duplication — tag-by-name lookup ×2**: `tag_text` (unwrap.rs:695)
+   and `tag_value` (messaging.rs:702) implement the same "find tag by name →
+   value" logic on different receivers.
+4. `ts_ms_tag` (unwrap.rs:156) + `civil_from_secs` (:553) are unwrap-only — no
+   duplicate.
+
+### Proposal (move-only, low blast radius)
+
+Extract `tag_value(tags: &Tags, name: &str) -> Option<&str>` once (unwrap.rs,
+already the tag helper home); `messaging.rs:702` deletes its copy and
+`unwrap.rs tag_text` becomes a one-line delegate (`tag_value(&rumor.tags, name)`).
+Net −1 duplicate; zero behavior change. Application at batch-fix-pass (or as
+a standalone mini-refactor with the P4 suite green). No further churn
+proposed — the trait/adapter split is the intended ADR-0007 D1/D2 boundary.
+
 ## S1/S2/S4/S5/S6/S7/F2.KDF — Re-verification GREEN (bd-p0-verify-green-claims-8z3p)
 
 **Probe:** 2026-08-09, live tree (no code modifications). All 7 claims re-verified GREEN
@@ -1076,3 +1113,102 @@ x verified x risk.)
 
 **Epic verdict: "Parity Superiority" claims hold on every ingest path except NIP-09
 deletion, which is a documented P0 RED wired into the batch-fix pass.**
+
+## F21.TOOLS-SPLIT — tools.rs 1960 LOC domain split PROPOSAL (P4, bd-p4-tools-domain-split-d6mi)
+
+**Probe:** 2026-08-09. Proposal only — NO edits (per bead scope). 38 frozen tool
+names (ADR-0007 C3) — the split is internal organization; the MCP surface must
+not change.
+
+### Current state
+
+`crates/toron-mcp/src/tools.rs` = 1960 lines: imports (1-45) · `ToolOutput` (47)
+· `ToolServer` struct (442) · `impl ToolServer` (447) · `#[tool_router]` impl with
+all 38 tool fns (475-1357) · `#[tool_handler]` (1358) · 38 `*Args` structs
+(1372-1770) · tests (1799+). Already grouped by the 9 AM-Rust catalog clusters via
+section comments, but in ONE file.
+
+### Domain inventory (38 tools, verified)
+
+| # | Tool (frozen name) | Current cluster | Proposed module |
+|---|--------------------|-----------------|-----------------|
+| 1 | `health_check` | Infrastructure | system.rs |
+| 2 | `ensure_project` | Infrastructure | system.rs |
+| 3 | `install_precommit_guard` | Infrastructure | system.rs |
+| 4 | `uninstall_precommit_guard` | Infrastructure | system.rs |
+| 5 | `register_agent` | Identity | system.rs |
+| 6 | `create_agent_identity` | Identity | system.rs |
+| 7 | `whois` | Identity | system.rs |
+| 8 | `resolve_pane_identity` | Identity | system.rs |
+| 9 | `cleanup_pane_identities` | Identity | system.rs |
+| 10 | `list_agents` | Identity | system.rs |
+| 11 | `send_message` | Messaging | mail.rs |
+| 12 | `reply_message` | Messaging | mail.rs |
+| 13 | `fetch_inbox` | Messaging | mail.rs |
+| 14 | `acknowledge_message` | Messaging | mail.rs |
+| 15 | `mark_message_read` | Messaging | mail.rs |
+| 16 | `request_contact` | Contacts | contact.rs |
+| 17 | `respond_contact` | Contacts | contact.rs |
+| 18 | `list_contacts` | Contacts | contact.rs |
+| 19 | `set_contact_policy` | Contacts | contact.rs |
+| 20 | `check_file_reservation_conflicts` | File Reservations | reservation.rs |
+| 21 | `file_reservation_paths` | File Reservations | reservation.rs |
+| 22 | `renew_file_reservations` | File Reservations | reservation.rs |
+| 23 | `release_file_reservations` | File Reservations | reservation.rs |
+| 24 | `force_release_file_reservation` | File Reservations | reservation.rs |
+| 25 | `search_messages` | Search | mail.rs |
+| 26 | `summarize_thread` | Search | mail.rs |
+| 27 | `macro_start_session` | Macros | workflow.rs |
+| 28 | `macro_prepare_thread` | Macros | workflow.rs |
+| 29 | `macro_contact_handshake` | Macros | workflow.rs |
+| 30 | `macro_file_reservation_cycle` | Macros | workflow.rs |
+| 31 | `ensure_product` | Product Bus | product.rs |
+| 32 | `products_link` | Product Bus | product.rs |
+| 33 | `search_messages_product` | Product Bus | product.rs |
+| 34 | `fetch_inbox_product` | Product Bus | product.rs |
+| 35 | `summarize_thread_product` | Product Bus | product.rs |
+| 36 | `acquire_build_slot` | Build Slots | slot.rs |
+| 37 | `renew_build_slot` | Build Slots | slot.rs |
+| 38 | `release_build_slot` | Build Slots | slot.rs |
+
+### Proposed layout
+
+```
+crates/toron-mcp/src/tools/
+  mod.rs          — ToolServer struct + #[tool_handler] + router assembly
+  system.rs       — 10 tools (infrastructure + identity)
+  mail.rs         — 7 tools (messaging + search)
+  reservation.rs  — 5 tools
+  product.rs      — 5 tools
+  contact.rs      — 4 tools
+  slot.rs         — 3 tools
+  workflow.rs     — 4 tools (macros)
+```
+
+### Mechanism (verified feasible)
+
+- `ToolRouter<S>` implements `std::ops::Add` / `AddAssign` (rmcp-3.1.1
+  router/tool.rs:604-621) → each module exposes `pub fn router() -> ToolRouter<ToolServer>`
+  (its own `#[tool_router]` impl block), `tools/mod.rs` assembles
+  `system::router() + mail::router() + ...` into the single `ToolServer::tool_router()`.
+- Each module carries its `*Args` structs + its `#[tool( name = "...", ... )]` fns.
+  The `#[tool_router]` macro generates per-module routers; `Add` merges them —
+  all 38 frozen names preserved byte-for-byte.
+- `#[tool_handler(router = self.tool_router)]` + `ToolServer` stay in mod.rs.
+- `ToolOutput`, `ToolServer` fields, shared imports stay in mod.rs; per-module
+  imports move with their fns.
+
+### Behavior preservation
+
+- Tool names/args/returns: ZERO change (frozen C3; only file organization).
+- `am_parity_e2e` + acceptance + conformance suites must stay green — the router
+  merge yields the identical 38-tool surface.
+- `all_tools_declare_output_schema` (asserts 38 tools) is the regression gate.
+
+### Recommendation
+
+**Defer to batch-fix-pass** (captain decision 4 — no code edits until the full
+P0-P6 findings table is reviewed). Low risk, mechanical, high readability payoff
+(1960 → 7 files × 250-400 LOC). Naming: `workflow.rs` covers the 4 `macro_*`
+session tools (macro = workflow-automation plane per ADR-0005); the name
+`macros.rs` is avoided to prevent confusion with Rust macro definitions.
