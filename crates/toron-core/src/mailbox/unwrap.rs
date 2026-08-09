@@ -1105,6 +1105,88 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// Build a gift wrap whose OUTER event carries a NIP-40 `expiration` tag
+    /// (the wire-level event relays/peers enforce — NIP-17 randomized inner
+    /// timestamps are irrelevant to NIP-40, which reads the wrap itself).
+    async fn wrap_with_expiration(sender: &Keys, recipient: &Keys, expires_at: Timestamp) -> Event {
+        let rumor = build_rumor(
+            sender.public_key(),
+            Timestamp::from(1_700_000_000),
+            Kind::PrivateDirectMessage,
+            vec![Tag::parse(["p", &recipient.public_key().to_hex()]).expect("p")],
+            "expiring hello",
+        );
+        nostr_sdk::nostr::EventBuilder::gift_wrap(
+            sender,
+            &recipient.public_key(),
+            rumor,
+            [Tag::expiration(expires_at)],
+        )
+        .await
+        .expect("wrap with expiration")
+    }
+
+    /// P0 finding (bd-p0-nip40-ingest-probe-oyaa): a gift wrap whose NIP-40
+    /// expiration is already in the past must be REJECTED on the unwrap
+    /// ingest path — never projected to SQLite/Git. The ADR-0003
+    /// "Parity Superiority" replay/expiry claim requires expired envelopes
+    /// to be dropped BEFORE projection.
+    ///
+    /// RED: currently fails — `UnwrapPipeline::project` has no TTL check and
+    /// the live bus fanout delivers the expired wrap.
+    #[tokio::test]
+    async fn expired_gift_wrap_rejected_on_unwrap() {
+        let sender = keys();
+        let recipient = keys();
+        let past = Timestamp::from(Timestamp::now().as_secs().saturating_sub(60));
+        let expired = wrap_with_expiration(&sender, &recipient, past).await;
+
+        let root = temp_archive("nip40-expired");
+        let sink = Arc::new(GitProjectionSink::open(&root).expect("open"));
+        let pipeline =
+            UnwrapPipeline::new(vec![recipient], Arc::new(AutoPolicy), sink.clone());
+
+        let outcome = pipeline.project(&expired).await;
+        assert_ne!(
+            outcome,
+            ProjectOutcome::Projected,
+            "expired gift wrap must not be projected"
+        );
+        let archive = sink.archive.lock();
+        assert_eq!(
+            archive.commit_count().expect("count"),
+            0,
+            "expired mail must not reach the Git archive"
+        );
+        drop(archive);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Regression: NIP-40 expiration in the FUTURE must not block delivery.
+    #[tokio::test]
+    async fn future_expiration_gift_wrap_accepted_on_unwrap() {
+        let sender = keys();
+        let recipient = keys();
+        let future = Timestamp::from(Timestamp::now().as_secs() + 86_400);
+        let wrap = wrap_with_expiration(&sender, &recipient, future).await;
+
+        let root = temp_archive("nip40-future");
+        let sink = Arc::new(GitProjectionSink::open(&root).expect("open"));
+        let pipeline =
+            UnwrapPipeline::new(vec![recipient], Arc::new(AutoPolicy), sink.clone());
+
+        let outcome = pipeline.project(&wrap).await;
+        assert_eq!(outcome, ProjectOutcome::Projected);
+        let archive = sink.archive.lock();
+        assert_eq!(
+            archive.commit_count().expect("count"),
+            1,
+            "future-expiring mail projects normally"
+        );
+        drop(archive);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn test_civil_date_layout() {
         // 2026-01-01T00:00:00Z -> (2026, 1); a mid-year date -> (2026, 8).
