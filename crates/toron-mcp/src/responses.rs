@@ -162,9 +162,6 @@ pub struct ConflictReportOut {
     pub clear_paths: Vec<String>,
     pub checked_paths: usize,
     pub total_conflicting_reservations: usize,
-    /// ADR-0011 Spec 4: additive soft tier (in-TTL intents).
-    pub soft_conflicts: Vec<PathConflictOut>,
-    pub has_soft_conflicts: bool,
 }
 
 /// `file_reservation_paths`.
@@ -181,8 +178,6 @@ pub struct GrantedReservationOut {
 pub struct AcquireResultOut {
     pub granted: Vec<GrantedReservationOut>,
     pub conflicts: Vec<PathConflictOut>,
-    /// ADR-0011 Spec 4: additive soft tier (frozen-acquire paths).
-    pub soft_conflicts: Vec<PathConflictOut>,
 }
 
 /// `renew_file_reservations`.
