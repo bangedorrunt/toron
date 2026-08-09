@@ -57,8 +57,10 @@ pub use messaging::{
 pub use metrics::{BenchCase, BenchReport, BenchTimer, MailboxMetrics, MetricsSnapshot};
 pub use product::ProductInfo;
 pub use reservations::{
-    AcquireResult, ConflictReport, GrantedReservation, PathConflict, ReleaseResult, RenewResult,
-    Reservation, overlaps,
+    AcquireResult, ConflictReport, GrantedReservation, IntentReservation, IntentResult,
+    PathConflict, ReleaseAsk, ReleaseDecision, ReleaseResponse, ReleaseResult, RenewResult,
+    RequestRelease, RequestReleaseResult, RequestReleaseStatus, Reservation, ReservationStatus,
+    overlaps,
 };
 pub use search::{SearchMessage, SearchMessages, ThreadSummary};
 pub use unwrap::{
