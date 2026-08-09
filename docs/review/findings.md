@@ -346,6 +346,27 @@ s8-resources-gate, s3-shared-state, verify-green-claims, s9-boundary-doc);
 "Fully implemented 0003-0007" SURVIVES with the NIP-40 + envelope-verify
 hardening folded in.
 
+## F11.PERF-BASELINE — performance/backpressure measured baseline (P1)
+
+**Probe:** `bd-p1-backpressure-baseline-6gmq` (2026-08-09). Verdict: **no
+pathological numbers** (projection p99 ≈ 0.9ms ≪ 100ms bound). Baseline feeds
+the ADR-0009 SLO proposal. Probe: `crates/toron-core/tests/perf_baseline.rs`
+(`#[ignore]`d; run `--ignored --nocapture`).
+
+### Baseline table (metric × measured × proposed-SLO)
+
+| Metric | Measured (3 runs, 2026-08-09, M-series Mac) | Proposed SLO (ADR-0009) |
+|--------|-----------------------------------------------|--------------------------|
+| Bus publish throughput (in-process, 2000 gift wraps, publish-only) | **1183–1207 ev/s** (publish_total ~1.66s; wrap NIP-44 build separate ~5.0s = ~2.5ms/event) | ≥1000 ev/s sustained |
+| Bus subscriber lag ceiling (burst 2000) | p50 **0.80ms**, p95 **1.05–1.11ms**, p99 **1.9–2.3ms**, max **6.3–7.9ms** | p99 < 50ms |
+| Backpressure losslessness | 2000/2000 live delivered; **2000/2000 recovered from store** on replay (channel-full drops are store-recoverable by design) | zero loss (store recovery) |
+| SQLite projection latency (1000 writes) | p50 **203–220µs**, p95 **437–557µs**, p99 **694–880µs** | p99 < 100ms (pathological bound) |
+| Search landing (FTS MATCH, 500-message index) | p50 **62–123µs**, p95 **188–255µs**, p99 **188–255µs** | p95 < 100ms |
+| KDF cold-start (single agent key via fetch_inbox) | **4.73–4.78s** (F2.KDF 50-key gate = 7.9s, consistent ~0.1s/key amortized) | 50-key cold rebuild < 15s (F2.KDF gate, already enforced) |
+
+No perf bead filed — every measured number is well inside the proposed SLO
+and the pathological bound.
+
 ## S1/S2/S4/S5/S6/S7/F2.KDF — Re-verification GREEN (bd-p0-verify-green-claims-8z3p)
 
 **Probe:** 2026-08-09, live tree (no code modifications). All 7 claims re-verified GREEN
