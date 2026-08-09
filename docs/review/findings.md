@@ -158,6 +158,37 @@ was the `MentionCoalescer`; recovered via `PoisonError::into_inner`.
 - Workflow host module: 9/10 green (only the batch-deferred F3.COALESCER-LOCK
   RED test fails); clippy clean.
 
+## F6.TOKIO-GUARD — tokio guard held across `.await` audit (P1) — GREEN
+
+**Probe:** `bd-p1-await-while-locked-9a2v` (2026-08-09). Verdict: **GREEN — all
+sites intentional or temporary; no deadlock/contention defect.**
+
+### Per-site classification (every `.lock().await` / `.read()`/`.write().await`
+site + every tokio Mutex/RwLock instantiation, multiline-aware scan)
+
+| Site (file:line) | Lock | Held across await? | Classification | Contention / cancel-safety |
+|------------------|------|--------------------|----------------|----------------------------|
+| `index/writer.rs:145` (`execute`) | `IndexWriter.gate` (tokio `Mutex<()>`) | YES — across the sqlx write | **INTENTIONAL** — single dedicated write conn; reads ride the read pool, never block the writer | Serialized writers by design; RAII guard drops on cancel (tx rolled back by sqlx) |
+| `index/writer.rs:152` (`execute_many`) | same gate | YES — across begin/query/commit | **INTENTIONAL** — atomic batch serialization | Same as above |
+| `cron.rs:169` (`policy_sink`) | `PolicySink` (tokio `Mutex<Vec<PolicyEvent>>`) | NO — sync `push` after acquire; guard drops at statement end | temporary | None |
+| `engine.rs:497` (`approval_sink`) | `ApprovalSink` (tokio `Mutex<Vec<String>>`) | NO — sync `push` | temporary | None |
+| `engine.rs:820` (`spawn_sink`) | `SpawnSink` (tokio `Mutex<Vec<String>>`) | NO — sync `push` | temporary | None |
+| `engine.rs:1350,1447` (`poll_promise_id`/`poll_spawn`, test helpers) | ApprovalSink/SpawnSink | NO — guard dropped right after `pop`; sleep happens BEFORE the lock | temporary | None |
+
+### Deadlock / reentrancy
+
+No nested acquisition anywhere (sinks never accessed inside a sink-guarded
+section; `execute_many` never calls `execute`; the gate is the only writer
+lock). No reverse-order pair → no cycle. All tokio guards are RAII —
+cancellation mid-await drops the guard cleanly (unlike a hypothetical leaked
+guard, none exists).
+
+### Regression pin (GREEN — no defect existed)
+
+`concurrent_writers_serialize_no_deadlock` (crates/toron-core/src/index/writer.rs):
+8 tasks × 50 writes through the gate under a 30s bound + row-count assertion
+(400 landed). Green 3/3; writer module 5/5; clippy clean.
+
 ## S1/S2/S4/S5/S6/S7/F2.KDF — Re-verification GREEN (bd-p0-verify-green-claims-8z3p)
 
 **Probe:** 2026-08-09, live tree (no code modifications). All 7 claims re-verified GREEN

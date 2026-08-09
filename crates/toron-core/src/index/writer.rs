@@ -313,4 +313,52 @@ mod tests {
         drop((w, r, writer));
         let _ = std::fs::remove_file(path);
     }
+
+    /// P1 (bd-p1-await-while-locked-9a2v): the writer `gate` tokio-Mutex guard
+    /// is held across sqlx awaits BY DESIGN (single dedicated write conn;
+    /// reads ride the read pool). Concurrent writers must serialize through
+    /// the gate — never deadlock — and every write must land. Bounded: a gate
+    /// deadlock trips the 30s timeout.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_writers_serialize_no_deadlock() {
+        use std::sync::Arc;
+
+        let (w, r, path) = pools().await;
+        let writer = Arc::new(IndexWriter::new(w, r));
+
+        writer
+            .execute("CREATE TABLE IF NOT EXISTS writer_pin (n INTEGER)")
+            .await
+            .expect("ddl");
+
+        let mut handles = Vec::new();
+        for i in 0..8 {
+            let w = writer.clone();
+            handles.push(tokio::spawn(async move {
+                for k in 0..50 {
+                    w.execute(&format!("INSERT INTO writer_pin VALUES ({})", i * 1000 + k))
+                        .await
+                        .expect("write");
+                }
+            }));
+        }
+        let all = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            for h in handles {
+                h.await.expect("writer task");
+            }
+        })
+        .await;
+        assert!(
+            all.is_ok(),
+            "concurrent gate writers must not deadlock (guard held across await)"
+        );
+
+        let count: Option<i64> = writer
+            .query_scalar("SELECT COUNT(*) FROM writer_pin")
+            .await
+            .expect("count");
+        assert_eq!(count, Some(400), "all 8x50 writes landed");
+
+        let _ = std::fs::remove_file(&path);
+    }
 }
