@@ -355,7 +355,7 @@ at execution time. Actual output lines below.
 |-------|------------------|-----------------------------|---------|
 | S1 | `serve_wire_gift_wrap_fires_message_posted_once` (crates/toron-mcp/src/server.rs:446) | `test server::tests::serve_wire_gift_wrap_fires_message_posted_once ... ok` — `1 passed; 0 failed` (51.14s) | GREEN |
 | S2 | `trigger_filter` module (crates/toron-workflow/src/trigger_filter.rs:161) + trigger/filter tests across toron-workflow | `trigger_filter::tests` 11/11 ok (`all_job_kinds_excluded`, `all_workflow_run_kinds_excluded`, `workflow_emitted_tag_rejects_kind_14`, `dispatch_job_output_cannot_loop`, `self_send_message_workflow_cannot_loop`, `tag_check_is_specific`, `gift_wrap_excluded`, `filter_operates_on_wire_events`, `kind_predicate_consistent_with_event_predicate_for_kinds`, `range_helpers_correct`, `legitimate_user_kinds_pass`); plus engine/schema/lint/cron trigger tests — toron-workflow lib `124 passed; 0 failed` | GREEN |
-| S4 | id args all String — `AcknowledgeMessageArgs.message_id` (tools.rs:1512/1519), `MarkMessageReadArgs.message_id` (tools.rs:1523/1527), `ForceReleaseFileReservationArgs.file_reservation_id` (tools.rs:1607) | Audit: all three `String`, no i64/u64. **Note:** `RenewFileReservationsArgs.file_reservation_ids: Option<Vec<i64>>` (tools.rs:1590) + `ReleaseFileReservationsArgs` (:1598) are dead AM-parity selectors — documented as NOT part of the toron surface and ignored (crates/toron-core/src/mailbox/surface.rs:427, F11 honesty gap; paths-only is the truthful superset). S4 substance holds. | GREEN (note) |
+| S4 | id args all String — `AcknowledgeMessageArgs.message_id` (tools.rs:1519), `MarkMessageReadArgs.message_id` (tools.rs:1527), `ForceReleaseFileReservationArgs.file_reservation_id` (tools.rs:1607) | Audit: all three `String`, no i64/u64. **F11 residual CLOSED (bd-p2-id-type-end-to-end-v9dy):** the dead `file_reservation_ids: Option<Vec<i64>>` selectors on `RenewFileReservationsArgs`/`ReleaseFileReservationsArgs` were removed + all-String surface enforced by `no_integer_id_fields_in_tool_surface` (see §F4.ID-TYPE) | this file §S4-re-verification + §F4.ID-TYPE | GREEN |
 | S5 | `foreach_over_list_collects` (crates/toron-workflow/src/engine.rs:2041) | `test engine::tests::foreach_over_list_collects ... ok` — `1 passed; 0 failed` | GREEN |
 | S6 | `call_workflow_nested_subrun_returns_child_output` (crates/toron-workflow/src/engine.rs:2136) | `test engine::tests::call_workflow_nested_subrun_returns_child_output ... ok` — `1 passed; 0 failed` | GREEN |
 | S7 | `coalesced_burst_publishes_one_stamped_43001` (crates/toron-mcp/src/workflow_host.rs:824) | `test workflow_host::tests::coalesced_burst_publishes_one_stamped_43001 ... ok` — `1 passed; 0 failed` | GREEN |
@@ -503,3 +503,62 @@ added (fresh-key + tampered-seal). Property round-trip already existed.
 - E2E privacy claim holds: federated relay/bus observers see only the one-time-key
   pubkey + NIP-44 ciphertext; sender identity, recipient, and rumor are hidden.
 - No production code changed — invariants were already correct; additions are pins.
+
+## F4.ID-TYPE — Id-type discipline hex<->u64<->String end-to-end trace (P2, bd-p2-id-type-end-to-end-v9dy)
+
+**Probe:** 2026-08-09. Verdict: **GREEN after fix** — toron surface now all-String;
+the one i64 leak (documented F11 residual) was removed.
+
+### End-to-end id trace (MCP -> core -> projection sinks)
+
+| Layer | Id-bearing type | Type | Evidence |
+|-------|-----------------|------|----------|
+| MCP args | `AcknowledgeMessageArgs.message_id` | `String` | tools.rs:1519 |
+| MCP args | `MarkMessageReadArgs.message_id` | `String` (hex rumor id, not int — doc comment) | tools.rs:1527 |
+| MCP args | `ForceReleaseFileReservationArgs.file_reservation_id` | `String` (kind-30031 hex event id) | tools.rs:1607 |
+| MCP args | `thread_id` (12 tools) | `String` / `Option<String>` | tools.rs:1470,1490,1622,1632,1658,1685,1724,1742 |
+| MCP args | `since_ts` / `since` / `until` | `String` (opaque; parsed internally) | tools.rs:1736, 1618, 1624 |
+| MCP args | ~~`RenewFileReservationsArgs.file_reservation_ids`~~ | ~~`Option<Vec<i64>>`~~ **REMOVED** | tools.rs:1590 (deleted) |
+| MCP args | ~~`ReleaseFileReservationsArgs.file_reservation_ids`~~ | ~~`Option<Vec<i64>>`~~ **REMOVED** | tools.rs:1598 (deleted) |
+| MCP responses | `SearchMessageOut.id`, `ProjectSearchMessageOut.id`, `ProjectInboxMessageOut.id` | `String` | responses.rs:199,213,227 |
+| MCP responses | `message_id` (inbox rows), `thread_id`, `event_id`, `manifest_event_id`, `profile_event_id` | `String` | responses.rs:117-263 |
+| MCP responses | `*_ts_us`, `expires_ts_us`, `created_ts_us` | `i64` — microsecond **timestamps, not ids** | responses.rs:76-323 |
+| Core newtype | `MessageId(String)` — FromStr rejects empty/whitespace | `String` | mailbox/ids.rs:17-44 |
+| Core surface | `MailSurface::force_release(reservation_id: &str)` | `&str` | surface.rs:446-453 |
+| Core surface | `MailSurface::renew/release_reservations(paths)` | paths-only (no ids selector) | surface.rs:427-443 |
+| Core search | `SearchMessage.id` | `String` (hex) | mailbox/search.rs:17-18 |
+| Core search | `SearchMessages.since_us/until_us` | `Option<i64>` — timestamps | mailbox/search.rs:38-39 |
+| Projection sink | `search_messages` cursor `s…:i{id}` | `String` (formats the String id) | tools.rs:1028 |
+| Flywheel boundary | MailBackend u64 ids | out of scope (S9, documented in known-divergences.md §9b, NOT edited) | — |
+
+### The leak: dead AM-parity `file_reservation_ids: Option<Vec<i64>>`
+
+- Documented residual (ADR-0007:709; known-divergences.md §2b; surface.rs:427-429 —
+  "NOT part of the shared surface… an F11 honesty gap; paths-only is the truthful
+  superset"). Handlers accepted and **silently ignored** the field (tools.rs:926-962
+  pass only `paths`).
+- S4 substance held (all message/reservation ids String) but the MCP surface itself
+  advertised `array of integer` for two tools — a u64/i64 leak in the toron surface.
+
+### Fix (TDD, RED -> GREEN)
+
+1. **RED** `no_integer_id_fields_in_tool_surface` (tools.rs tests): walks every live
+   tool's `inputSchema`; asserts no property whose name contains `id` is integer/number
+   typed (direct or array items). Failed pre-fix:
+   `found 2: release_file_reservations.file_reservation_ids: array of integer,
+   renew_file_reservations.file_reservation_ids: array of integer`.
+2. **GREEN** removed the dead `file_reservation_ids` field from both args structs
+   (tools.rs) + regenerated the golden fixture `tests/conformance/fixtures/
+   tools.schema.json` (derive-and-snapshot; 12 lines deleted). No behavior change:
+   handlers never read the field.
+3. Verify: `toron-mcp` lib 34/34 green (excluding pre-existing flaky
+   `coalescer_lock_not_held_across_blocking_publish` — fails on clean tree too),
+   conformance 5/5, acceptance 5/5, am_parity_e2e 7/7, clippy clean for tools.rs.
+   Sibling flake: `unwrap_loop_projects_inbound*` in toron-core fails on clean tree
+   (KDF timing) — unrelated.
+
+### Result
+
+Toron MCP surface id-bearing fields: **all String**. The F11 residual is closed on
+toron's own surface; flywheel boundary (u64) remains documented-only per captain
+decision 3 (ADR-0009 candidate).

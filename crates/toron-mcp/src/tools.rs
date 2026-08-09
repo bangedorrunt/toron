@@ -1587,7 +1587,6 @@ pub struct RenewFileReservationsArgs {
     pub agent_name: String,
     pub extend_seconds: Option<i64>,
     pub paths: Option<Vec<String>>,
-    pub file_reservation_ids: Option<Vec<i64>>,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone)]
@@ -1595,7 +1594,6 @@ pub struct ReleaseFileReservationsArgs {
     pub project_key: String,
     pub agent_name: String,
     pub paths: Option<Vec<String>>,
-    pub file_reservation_ids: Option<Vec<i64>>,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone)]
@@ -1840,6 +1838,53 @@ mod tests {
             missing.join(", ")
         );
         assert_eq!(tools.len(), 38, "tool count must stay at the AM-Rust parity 38");
+    }
+
+    /// S4 / bd-p2-id-type-end-to-end-v9dy: the toron MCP surface must be
+    /// all-String for id-bearing fields (hex event ids; ADR-0007 D1 — never
+    /// u64 in shared request/response types). Walk every tool's live
+    /// inputSchema and reject any property whose name mentions `id` that is
+    /// integer/number typed (directly or as array items). RED today:
+    /// `renew_file_reservations` / `release_file_reservations` still carry
+    /// the dead AM-parity `file_reservation_ids: Option<Vec<i64>>` selector.
+    #[test]
+    fn no_integer_id_fields_in_tool_surface() {
+        let tools = ToolServer::tool_router().list_all();
+        let mut violations: Vec<String> = Vec::new();
+        for tool in tools.iter() {
+            let Some(props) = tool
+                .input_schema
+                .get("properties")
+                .and_then(|v| v.as_object())
+            else {
+                continue;
+            };
+            for (name, prop) in props {
+                if !name.contains("id") {
+                    continue;
+                }
+                if let Some(t) = prop.get("type").and_then(|v| v.as_str()) {
+                    if t == "integer" || t == "number" {
+                        violations.push(format!("{}.{}: {t}", tool.name, name));
+                    }
+                }
+                if let Some(items) = prop
+                    .get("items")
+                    .and_then(|v| v.get("type"))
+                    .and_then(|v| v.as_str())
+                {
+                    if items == "integer" || items == "number" {
+                        violations.push(format!("{}.{}: array of {items}", tool.name, name));
+                    }
+                }
+            }
+        }
+        assert!(
+            violations.is_empty(),
+            "id-bearing tool surface fields must be String (ADR-0007 D1); found {}: {}",
+            violations.len(),
+            violations.join(", ")
+        );
     }
 
     /// Spot-check the schemas encode the toron-side shapes (bd-96a section 2),

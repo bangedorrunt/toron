@@ -722,12 +722,6 @@
       "items": {
        "type": "string"
       }
-     },
-     "file_reservation_ids": {
-      "type": "array",
-      "items": {
-       "type": "integer"
-      }
      }
     },
     "required": [
@@ -783,12 +777,6 @@
       "type": "array",
       "items": {
        "type": "string"
-      }
-     },
-     "file_reservation_ids": {
-      "type": "array",
-      "items": {
-       "type": "integer"
       }
      }
     },
