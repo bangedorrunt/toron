@@ -182,9 +182,72 @@ impl ToronPaths {
     }
 }
 
-/// The operator key passphrase: `TORON_KEY_PASSPHRASE` or the default.
+/// The operator key passphrase: `TORON_KEY_PASSPHRASE` env > passphrase file
+/// > the dev default. The passphrase file keeps the secret OUT of launchd/
+/// systemd unit files (`toron daemon install` writes
+/// `~/.config/toron/passphrase`, mode 0600, and the unit references only the
+/// key path). Resolution order:
+/// 1. `TORON_KEY_PASSPHRASE` (explicit env — dev/CI).
+/// 2. `TORON_KEY_PASSPHRASE_FILE` — a path; its trimmed content is used.
+/// 3. First existing `$XDG_CONFIG_HOME/toron/passphrase` /
+///    `~/.config/toron/passphrase` (daemon installs).
+/// 4. `"toron"` (dev default; MUST agree with `key generate`'s fallback).
 pub fn operator_passphrase() -> String {
-    std::env::var("TORON_KEY_PASSPHRASE").unwrap_or_else(|_| "toron".to_string())
+    resolve_passphrase(
+        std::env::var("TORON_KEY_PASSPHRASE").ok().as_deref(),
+        std::env::var_os("TORON_KEY_PASSPHRASE_FILE")
+            .map(std::path::PathBuf::from)
+            .as_deref(),
+        &passphrase_file_candidates(
+            env_non_empty("XDG_CONFIG_HOME").as_deref(),
+            env_non_empty("HOME").as_deref(),
+        ),
+    )
+}
+
+/// Config-home passphrase file candidates in priority order (pure).
+pub fn passphrase_file_candidates(
+    xdg_config_home: Option<&std::path::Path>,
+    home: Option<&std::path::Path>,
+) -> Vec<PathBuf> {
+    let mut v = Vec::new();
+    if let Some(x) = xdg_config_home {
+        v.push(x.join("toron").join("passphrase"));
+    }
+    if let Some(h) = home {
+        v.push(h.join(".config").join("toron").join("passphrase"));
+    }
+    v
+}
+
+/// Pure passphrase resolution (env inputs passed in — unit-testable).
+pub fn resolve_passphrase(
+    env_value: Option<&str>,
+    file_env: Option<&std::path::Path>,
+    candidates: &[PathBuf],
+) -> String {
+    if let Some(p) = env_value {
+        if !p.is_empty() {
+            return p.to_string();
+        }
+    }
+    if let Some(f) = file_env {
+        if let Ok(s) = std::fs::read_to_string(f) {
+            let t = s.trim();
+            if !t.is_empty() {
+                return t.to_string();
+            }
+        }
+    }
+    for c in candidates {
+        if let Ok(s) = std::fs::read_to_string(c) {
+            let t = s.trim();
+            if !t.is_empty() {
+                return t.to_string();
+            }
+        }
+    }
+    "toron".to_string()
 }
 
 #[cfg(test)]
@@ -200,8 +263,7 @@ mod tests {
     }
 
     #[test]
-    fn env_override_beats_xdg() {
-        let env = DataRootEnv {
+    fn env_override_beats_xdg() {        let env = DataRootEnv {
             toron_data_dir: Some(PathBuf::from("/env/root")),
             xdg_data_home: Some(PathBuf::from("/xdg")),
             home: Some(PathBuf::from("/home")),
@@ -332,5 +394,36 @@ mod tests {
             "agent-key scrypt log_n must stay NIP-49 spec-standard (>= 16), got {}",
             crate::keys::DEFAULT_LOG_N
         );
+    }
+
+    #[test]
+    fn passphrase_env_beats_file_beats_default() {
+        let d = scratch("pp");
+        std::fs::create_dir_all(d.join("xdg").join("toron")).unwrap();
+        std::fs::write(d.join("xdg").join("toron").join("passphrase"), "  from-xdg\n").unwrap();
+        let file = d.join("override.pass");
+        std::fs::write(&file, "from-file-env\n").unwrap();
+        let candidates = passphrase_file_candidates(Some(&d.join("xdg")), None);
+        assert_eq!(resolve_passphrase(Some("env-secret"), Some(&file), &candidates), "env-secret");
+        assert_eq!(resolve_passphrase(None, Some(&file), &candidates), "from-file-env");
+        assert_eq!(resolve_passphrase(None, None, &candidates), "from-xdg");
+        assert_eq!(resolve_passphrase(None, None, &[]), "toron");
+    }
+
+    #[test]
+    fn passphrase_env_file_missing_or_empty_falls_through() {
+        let d = scratch("pp2");
+        let candidates = passphrase_file_candidates(None, Some(&d.join("home")));
+        assert_eq!(resolve_passphrase(None, Some(&d.join("missing.pass")), &candidates), "toron");
+        std::fs::create_dir_all(d.join("home").join(".config").join("toron")).unwrap();
+        std::fs::write(d.join("home").join(".config").join("toron").join("passphrase"), "   \n").unwrap();
+        assert_eq!(resolve_passphrase(None, None, &candidates), "toron", "whitespace-only file is ignored");
+    }
+
+    #[test]
+    fn passphrase_candidates_prefer_xdg_then_home() {
+        let v = passphrase_file_candidates(Some(&PathBuf::from("/xdg")), Some(&PathBuf::from("/home")));
+        assert_eq!(v[0], PathBuf::from("/xdg/toron/passphrase"));
+        assert_eq!(v[1], PathBuf::from("/home/.config/toron/passphrase"));
     }
 }

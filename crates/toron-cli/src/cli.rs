@@ -85,6 +85,9 @@ pub enum Command {
     /// Run the toron daemon (mailbox + MCP server).
     Serve(ServeArgs),
 
+    /// Daemon lifecycle: start/stop/restart/status/install/uninstall.
+    Daemon(DaemonArgs),
+
     /// Quick health/config overview (human by default, --json for machines).
     Status,
 
@@ -204,6 +207,49 @@ pub struct ServeArgs {
     /// Serve the MCP endpoint over Streamable HTTP at this address (e.g. 127.0.0.1:8000).
     #[arg(long)]
     pub mcp_http: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Daemon lifecycle (ops): launchd on macOS, systemd on Linux, pidfile+spawn
+// fallback. `install` writes the autostart unit + the 0600 passphrase file so
+// the secret never lands in the unit file.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Subcommand)]
+pub enum DaemonCommand {
+    /// Report daemon state (running/stopped + detection source).
+    Status,
+    /// Start the daemon (installs the autostart unit first if absent).
+    Start,
+    /// Stop the daemon.
+    Stop,
+    /// Restart the daemon (stop, then start).
+    Restart,
+    /// Install the launchd (macOS) / systemd (Linux) autostart unit +
+    /// passphrase file, and load the unit.
+    Install,
+    /// Stop the daemon and remove the autostart unit.
+    Uninstall,
+}
+
+#[derive(Debug, Args)]
+pub struct DaemonArgs {
+    /// MCP-over-HTTP listen address for the daemon (defaults to the
+    /// flywheel `[mail.toron]` address).
+    #[arg(long, default_value = "127.0.0.1:18080")]
+    pub addr: String,
+
+    /// launchd/systemd unit label.
+    #[arg(long, default_value = "com.toron.serve")]
+    pub label: String,
+
+    /// State dir for the pidfile + logs (default: `$XDG_STATE_HOME/toron`,
+    /// fallback `~/.local/state/toron`).
+    #[arg(long)]
+    pub state_dir: Option<PathBuf>,
+
+    #[command(subcommand)]
+    pub cmd: DaemonCommand,
 }
 
 // ---------------------------------------------------------------------------

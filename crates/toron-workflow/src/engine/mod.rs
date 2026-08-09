@@ -1,4 +1,4 @@
-// governed-by: ADR-0003
+// governed-by: ADR-0003, ADR-0009
 #![forbid(unsafe_code)]
 
 //! Resonate-backed workflow engine (bd-oge) — the Buzz WF-08 fix.
@@ -43,6 +43,78 @@ use resonate_sdk::prelude::{Resonate, ResonateConfig};
 use resonate_sdk::types::Value;
 
 use crate::schema::Action;
+
+// ---------------------------------------------------------------------------
+// Resonate server selection: remote Tailscale default, local fallback.
+// ---------------------------------------------------------------------------
+
+/// Default (primary) Resonate server: the Tailscale node running the durable
+/// promise store (`resonate serve` behind tailscale-serve).
+pub const REMOTE_RESONATE_URL: &str = "https://resonate.example-tailnet.ts.net";
+/// Local fallback server (the launchd `com.flywheel.resonate` service).
+pub const LOCAL_RESONATE_URL: &str = "http://localhost:8001";
+/// Explicit pin env — beats the probe dance entirely.
+pub const RESONATE_URL_ENV: &str = "RESONATE_URL";
+
+/// Resolve the Resonate server URL once per process: `RESONATE_URL` pin >
+/// remote default (TCP-probed) > local fallback (TCP-probed) > `None`
+/// (embedded local mode). The probe budget is 2s per candidate and the result
+/// is cached — daemon startup pays it once.
+pub fn resonate_server_url() -> Option<String> {
+    static CACHE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    CACHE
+        .get_or_init(|| resonate_server_url_with(probe_candidate))
+        .clone()
+}
+
+/// Pure resolution core (testable with a fake probe).
+pub fn resonate_server_url_with(probe: impl Fn(&str) -> bool) -> Option<String> {
+    if let Ok(pin) = std::env::var(RESONATE_URL_ENV) {
+        if !pin.trim().is_empty() {
+            return Some(pin);
+        }
+    }
+    if probe(REMOTE_RESONATE_URL) {
+        return Some(REMOTE_RESONATE_URL.to_string());
+    }
+    if probe(LOCAL_RESONATE_URL) {
+        return Some(LOCAL_RESONATE_URL.to_string());
+    }
+    None
+}
+
+/// TCP liveness probe for a resonate server URL (2s budget). Parses
+/// `https?://host[:port]`; https implies 443, http implies 80.
+pub fn probe_candidate(url: &str) -> bool {
+    let Some((host, port)) = host_port(url) else {
+        return false;
+    };
+    use std::net::{TcpStream, ToSocketAddrs};
+    let Some(addr) = (host.as_str(), port).to_socket_addrs().ok().and_then(|mut it| it.next()) else {
+        return false;
+    };
+    TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(2000)).is_ok()
+}
+
+/// Parse `https?://host[:port]` into `(host, port)` (pure).
+pub fn host_port(url: &str) -> Option<(String, u16)> {
+    let rest = url.strip_prefix("https://").or_else(|| url.strip_prefix("http://"))?;
+    let (host, port) = match rest.split_once(':') {
+        Some((h, p)) => (h.to_string(), p.parse::<u16>().ok()?),
+        None => (rest.to_string(), 0),
+    };
+    if host.is_empty() {
+        return None;
+    }
+    let port = if port != 0 {
+        port
+    } else if url.starts_with("https://") {
+        443
+    } else {
+        80
+    };
+    Some((host, port))
+}
 
 // Re-export the split-out surface exactly as the former single file exposed it
 // (lib.rs + toron-mcp/cli/e2e import via `engine::*` — zero external edits).

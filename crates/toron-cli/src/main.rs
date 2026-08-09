@@ -3,6 +3,7 @@
 
 mod cli;
 mod config;
+mod daemon;
 mod operator;
 mod output;
 mod robot;
@@ -62,6 +63,10 @@ fn run(cli: &Cli) -> anyhow::Result<ExitCode> {
         }
         Command::Config(args) => {
             run_config(&cfg, args, format)?;
+            ExitCode::SUCCESS
+        }
+        Command::Daemon(args) => {
+            daemon::run_dispatch(args)?;
             ExitCode::SUCCESS
         }
         Command::Doctor(args) => operator::run_doctor(&cfg, args, format)?,
