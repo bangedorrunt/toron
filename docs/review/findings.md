@@ -997,3 +997,43 @@ mail permanently" (rebuild.rs:9-11) had no producer.
   unregistered recipient has no project root by definition).
 - Existing `projection_differential_bus_git_sqlite_agree` (P5) still passes — the
   three projections agree bar-for-bar.
+
+## P3 CRYPTO — NIP-17 / Gift-Wrap / Parity-Superiority CONSOLIDATED VERDICT (epic bd-p3-crypto-giftwrap-cfho, 2026-08-09)
+
+**Epic closure.** All 7 leaves closed; every probe re-verified in code at closure time.
+Verdict: **GREEN with 1 open RED (NIP-09, batch-fix wired)**.
+(Leaf-level aggregate lives in the §P3 EPIC VERDICT table above; this table is the
+claim-level crypto invariant audit per the epic closure criterion — path x invariant
+x verified x risk.)
+
+### The 4 ADR-0003 Parity-Superiority claims
+
+| Claim | Invariant | Verified | Evidence (file:line) | Risk |
+|-------|-----------|----------|----------------------|------|
+| Unforgeable identity | every ingest path verifies Schnorr id+sig before use | GREEN (F8.VERIFY-INGEST + this re-check) | bus publish `verify_event` (in_process.rs:205/221); unwrap project head `verify_event(wrap)` (unwrap.rs:763); seal verify (gift_wrap.rs:100); relay ingest defense-in-depth (relay_bus.rs:189, sdk default + explicit) | none |
+| E2E DMs | NIP-17 gift-wrap: outer decrypt → seal verify → inner decrypt → rumor-author==seal-signer | GREEN (F3.GIFTWRAP + pins) | gift_wrap.rs:88-118 (`SenderMismatch` at :112); fresh one-time key + tamper pins (bd-p3-gift-wrap-metadata-leak-cs0a) | none |
+| Federatable threads | NIP-10 `e` tag threads; head self-threads; NIP-77 negentropy delta sync | GREEN | thread_id resolution (unwrap.rs sqlite write); reconcile.rs negentropy (bus/reconcile.rs:76-130); sc14b negentropy rejoin e2e | none |
+| Non-repudiable acks | G8 ack/read receipts signed by the RECIPIENT's key, NIP-17 to sender | GREEN | `send_receipt` → `gift_wrap(&agent_keys, &sender_npub, ...)` (messaging.rs:414-442); idempotent receipt cache | none |
+
+### The 6 probes
+
+| # | Probe | Verdict | Evidence (file:line) | Notes |
+|---|-------|---------|----------------------|-------|
+| 1 | verify-before-project per ingest path | **GREEN** (1 gap fixed + 1 hardening in leaf) | unwrap.rs:763; gift_wrap.rs:100; in_process.rs:205/221; relay_bus.rs:183-194; proof.rs:167; jobs.rs:309 | bd-p3-schnorr-verify-every-ingest-q0wo closed |
+| 2 | NIP-40 expiration honored on unwrap | **GREEN with RED->GREEN test** | unwrap.rs:776 `wrap.is_expired()` → `ProjectOutcome::Expired` BEFORE unwrap/write; `expired_gift_wrap_rejected_on_unwrap` + `future_expiration_gift_wrap_accepted_on_unwrap` pass | bd-p3-nip40-expiration-fix-6ezx closed; F2.NIP40 in this file |
+| 3 | replay dedup per sink (sqlite + git) | **GREEN** (F9.REPLAY-DEDUP) | sqlite: `projected` set + `ON CONFLICT (event_id) DO NOTHING` + COUNT query (unwrap.rs:453-470, 536); git: `.projected/{id}.marker` on disk, restart-safe (unwrap.rs:363-371, 377-384); per-project markers (ProjectGitProjectionSink :453-466); pins `sqlite_sink_double_write_si…` | bd-p3-replay-dedup-per-sink-nve6 closed |
+| 4 | Argon2/KDF DoS-bound | **GREEN** (F14.KDF-DOS; 1 weakness fixed inline) | NIP-49 scrypt `DEFAULT_LOG_N=16` spec-standard (keys/mod.rs:20); SDK decrypt caps at `MAX_LOG_N=18` ~256MiB (nostr-0.44.8 nip49.rs:202); content-keyed cache + many-keys gate bound scans (mailbox/mod.rs:171-193); operator key 12→14 enforced by `operator_key_kdf_not_weak` (config/mod.rs:319-335) | bd-p3-argon2-kdf-dos-bound-7sbu closed |
+| 5 | Projection sink ordering + atomicity | **RED → FIXED** (F4.G11, this epic's sibling) | DualProjectionSink git-FIRST (unwrap.rs), wired in build_unwrap_pipeline (mailbox/mod.rs:358-372); commit 8971aa4 | bd-p3-projection-atomicity-rtjz closed |
+| 6 | NIP-09 deletion on projection sinks | **RED (open, batch-fix wired)** | `nip09_delete_tombstones_projected_message` RED test authored (unwrap.rs:1420-1471) — fails: no kind-5 path, no `deleted` column; deleted mail stays readable | bd-p3-nip09-deletion-projection-uzgy closed RED; fix → bd-batch-fix-pass-mip4 |
+
+### Residual risk
+
+- **NIP-09 (probe 6)** is the single open crypto finding: a kind-5 deletion does not
+  tombstone projected mail on either sink. P0-class data-hygiene gap (deleted mail
+  remains readable + re-deliverable). Batch-fix adds the `deleted` column + kind-5
+  ingest marking the target row.
+- NIP-17 privacy posture holds end-to-end: relay/bus observers see only one-time-key
+  pubkey + NIP-44 ciphertext; sender/recipient/rumor hidden (F3.GIFTWRAP).
+
+**Epic verdict: "Parity Superiority" claims hold on every ingest path except NIP-09
+deletion, which is a documented P0 RED wired into the batch-fix pass.**
