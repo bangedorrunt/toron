@@ -302,6 +302,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn renew_extends_from_absolute_expiry_not_now() {
+        // Regression pin (parity bug bd-XXX): renewal must extend the OLD
+        // absolute lease expiry by the extend amount — NOT recompute from
+        // `now`. Recomputing from now collapses a long-lived lease to
+        // now+extend (reported under-extension to ~10s). A lease acquired
+        // with TTL 3600 then renewed +7200 must expire at old+7200, which is
+        // ~3600s later than the buggy now+7200.
+        let (mailbox, db_path, data_dir) = test_mailbox("renew-abs").await;
+        register(&mailbox, "BlueLake").await;
+
+        let acq = mailbox
+            .acquire_build_slot("demo", "BlueLake", "ci", Some(3600), true)
+            .await
+            .expect("acquire");
+        let old_expiry_us = acq.granted[0]
+            .expires_ts_us
+            .expect("acquired lease has expiry");
+
+        let renewed = mailbox
+            .renew_build_slot("demo", "BlueLake", "ci", 7200)
+            .await
+            .expect("renew");
+        let renewed = renewed.expect("renew extends active lease");
+        let expected_us = old_expiry_us + 7_200_000_000;
+        assert_eq!(
+            renewed.expires_ts_us,
+            Some(expected_us),
+            "renewed expiry must be OLD absolute expiry + extend, not now+extend (bd-XXX regression); old={old_expiry_us} got={:?}",
+            renewed.expires_ts_us,
+        );
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[tokio::test]
     async fn renew_missing_slot_is_noop() {
         let (mailbox, db_path, data_dir) = test_mailbox("noop").await;
         register(&mailbox, "BlueLake").await;
