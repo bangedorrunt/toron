@@ -423,6 +423,29 @@ machine-code errors are intentional per ADR-0007 (classify on code). Two
 polish notes (MessageIdError → thiserror; lint String → optional enum) — no
 bead filed (polish class, captain decision: batch collects only REDs).
 
+## F13.COUNT-CONSERVATION — P2 gate (classified = audited = baseline)
+
+**Probe:** `bd-p2-count-conservation-v3ey` (2026-08-09). Verdict: **GATE
+PASSES — all three populations reconcile; no unclassified prod site.**
+
+### Conservation row
+
+| Population | Charter baseline | Audited (classification) | Current tree | Reconciliation |
+|------------|------------------|---------------------------|--------------|----------------|
+| `unwrap_or(0)`/`unwrap_or_default()` | **67** | **67/67** classified (F7.ZERO-COERCION: 65 benign + 2 hazards) | **66** | 67 − 1 removed BY the F7 fix itself (`index_scan` `unwrap_or_default()` → `?` propagation); remaining sites line-shifted by later beads (verified site-for-site) |
+| `unwrap()` in src | **219** | prod **14**/14 invariant-true (F5.UNWRAP-EXPECT) + e2e harness 2 (test lib) + 1 doc-comment (non-code) + test-region ~211 | **249** | delta = P0–P3 fixes (F5.POISON swaps, NIP-40 fix, S8 gate, envelope-verify) + new test modules (F8/F9/F10/pins); re-verified TODAY: 6 apparent new prod sites are all `gift_wrap::unwrap(` fn-name false positives — **no unclassified prod site** |
+| `expect()` in src | **984** | prod **69**/69 invariant-true (F5.UNWRAP-EXPECT, by class: Tag::parse 42, serde 16, state-guarded 3, strip_prefix 1, crypto/key 3, free-form 4) + mock_relay 2 (file-level cfg(test)) + test-region ~979 | **1052** | same delta attribution; prod classification complete (re-verified today) |
+
+### Gate conclusion
+
+- Prod (non-test) unwrap/expect: **0 unclassified, 0 real-risk** — every site
+  invariant-true by construction (F5 table).
+- unwrap_or population: **conservation exact** (67 → 66 with the −1 attributable
+  to the F7 fix itself).
+- The charter-vs-current delta (219→249, 984→1052) is fully attributable to
+  landed fixes + new tests; the R8 baseline re-run (`bd-baseline-rerun-zqtm`)
+  re-baselines pre-batch. P2 leaves certified complete.
+
 ## S1/S2/S4/S5/S6/S7/F2.KDF — Re-verification GREEN (bd-p0-verify-green-claims-8z3p)
 
 **Probe:** 2026-08-09, live tree (no code modifications). All 7 claims re-verified GREEN
