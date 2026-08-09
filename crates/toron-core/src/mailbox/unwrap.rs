@@ -203,6 +203,9 @@ pub enum ProjectOutcome {
     Duplicate,
     /// Dropped by the recipient's contact policy BEFORE any write.
     Dropped(ContactPolicy),
+    /// NIP-40: the wrap's `expiration` tag is in the past — rejected before
+    /// any write (ADR-0003 rev6 replay/expiry parity, bd-p3-nip40-expiration-fix).
+    Expired,
     /// Projected + written to the archive/index.
     Projected,
 }
@@ -603,6 +606,14 @@ impl UnwrapPipeline {
         // Idempotency guard 1: the wrap event id itself.
         if !self.seen_wraps.lock().insert(wrap.id.to_hex()) {
             return ProjectOutcome::Duplicate;
+        }
+
+        // NIP-40 (ADR-0003 rev6): an expired gift wrap is rejected BEFORE any
+        // unwrap cost or write — never projected to SQLite/Git. The bus
+        // replay filter is not enough: live-published expired wraps bypass it
+        // (probe bd-p0-nip40-ingest-probe-oyaa verdict RED, F2.NIP40).
+        if wrap.is_expired() {
+            return ProjectOutcome::Expired;
         }
 
         let Some((recipient, gift)) = self.try_unwrap(wrap) else {

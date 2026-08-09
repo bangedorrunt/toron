@@ -6,14 +6,15 @@ reviewed and the captain approves.**
 
 | ID | Track | Site (file:line) | Invariant | Verified | Risk | Fix-class |
 |----|-------|------------------|-----------|----------|------|-----------|
-| F2.NIP40 | P0 crypto | `crates/toron-core/src/mailbox/unwrap.rs:602-656` (`UnwrapPipeline::project`) | NIP-40 `expiration` honored on unwrap ingest — expired gift wrap rejected BEFORE sqlite/git projection | **RED** — no TTL check exists | **P0 crypto** — expired-but-never-seen gift wrap is ACCEPTED + projected, voiding ADR-0003 "Parity Superiority" replay/expiry claim | TTL check in unwrap pipeline (parse `expiration` tag, reject-if-past pre-write). RED test `expired_gift_wrap_rejected_on_unwrap` first (see `bd-p3-nip40-expiration-fix-6ezx`) |
+| F2.NIP40 | P0 crypto | `crates/toron-core/src/mailbox/unwrap.rs` (`UnwrapPipeline::project`) | NIP-40 `expiration` honored on unwrap ingest — expired gift wrap rejected BEFORE sqlite/git projection | **FIXED (GREEN)** — `wrap.is_expired()` check at project() head → `ProjectOutcome::Expired`; RED test `expired_gift_wrap_rejected_on_unwrap` + regression `future_expiration_gift_wrap_accepted_on_unwrap` pass (bd-p3-nip40-expiration-fix-6ezx, 2026-08-09) | P0 crypto (fixed) | `ProjectOutcome::Expired` variant + `is_expired()` guard before unwrap/write |
 | F3.COALESCER-LOCK | P1 concurrency | `crates/toron-mcp/src/workflow_host.rs:156-165` (runner FlushNow arm) + `:441-461` (trigger-loop tick flush) | std-Mutex guard on `MentionCoalescer` NOT held across the blocking publish (`publish_coalesced_job` → `thread::scope` + `rt.block_on(bus.publish)`) | **RED** — guard IS held across the publish; concurrent flush stalls for the publish duration (measured 498ms stall on 600ms publish) | **P1 stall** — any slow publish (relay latency/backpressure) freezes every other coalescer accessor (all `dispatch_job` actions + tick flushes) for the publish duration; poison risk (`expect`) covered by p1-poison-on-panic-audit | Drop the guard before publishing: clone the `Coalesced` under the lock, release, then publish. RED test `coalescer_lock_not_held_across_blocking_publish` authored + failing today |
 | F4.S8 | P0 gate | `crates/toron-mcp/src/resources.rs:163-186` (`static_resource`) | S8 honest-stub gate: every placeholder field names a live tool via `status`; all 25 resource URIs resolve to non-empty JSON | **FIXED** — Rev-1 gate tightened + enforced by tests (metrics_core + schemas placeholders lacked `status` → added) | low (honesty/documentation) | Gate now mechanical: placeholder ⇒ `status` required; 25-URI coverage tests (`static_stubs_name_live_tool`, `all_25_resources_resolve_to_non_empty_json`) |
 | F5.POISON | P1 recovery | `crates/toron-mcp/src/workflow_host.rs:153-159,441-454` (coalescer) | ADR-0007 D7: a panic inside a std-Mutex guard must not brick the service (poison recovered, not propagated) | **FIXED** — both production `.lock().expect("coalescer lock")` sites → `unwrap_or_else(\|e\| e.into_inner())`; 0 poison-propagating prod sites remain | P1 (was: panic-in-panic = dead service) | RED→GREEN `poisoned_coalescer_survives`; per-site table in F5.POISON section |
 
-## F2.NIP40 — NIP-40 expiration NOT honored on unwrap ingest path (P0)
+## F2.NIP40 — NIP-40 expiration honored on unwrap ingest path (FIXED, bd-p3-nip40-expiration-fix-6ezx)
 
-**Probe:** `bd-p0-nip40-ingest-probe-oyaa` (2026-08-09). Verdict: **RED**.
+**Probe:** `bd-p0-nip40-ingest-probe-oyaa` (2026-08-09). Initial verdict: **RED**.
+**Fix landed 2026-08-09 by `bd-p3-nip40-expiration-fix-6ezx` → GREEN.**
 
 ### Evidence (every ingest layer traced, no TTL check found)
 
@@ -41,13 +42,16 @@ delivered → unwrapped → projected to SQLite + Git. ADR-0003 rev6's "NIP-40 e
 TTL honored" (replay/expiry Parity Superiority row) holds for replay but not for the
 live ingest path.
 
-### Fix (deferred to `bd-p3-nip40-expiration-fix-6ezx`)
+### Fix (landed in `bd-p3-nip40-expiration-fix-6ezx`)
 
 1. RED: `expired_gift_wrap_rejected_on_unwrap` — gift wrap with `expiration` tag in the
-   past → pipeline rejects (no sqlite/git write). Confirmed to fail today.
-2. GREEN: TTL check in unwrap pipeline before `sink.write` (parse `expiration` tag,
-   compare vs now, reject-if-past).
-3. REFACTOR: extract named helper.
+   past → pipeline rejects (no sqlite/git write). Confirmed failing before the fix.
+2. GREEN: `UnwrapPipeline::project` head now guards `wrap.is_expired()` (nostr-sdk NIP-40,
+   `tags.expiration() < now`) BEFORE unwrap cost and any sink write → returns new
+   `ProjectOutcome::Expired`. Regression `future_expiration_gift_wrap_accepted_on_unwrap`
+   (expiration +1 day) still projects.
+3. REFACTOR: named variant `ProjectOutcome::Expired` (no exhaustive matches elsewhere);
+   check lives in one place at project() head. 112/112 mailbox tests + clippy clean.
 
 ## F3.COALESCER-LOCK — std-Mutex guard held across blocking publish (P1)
 
