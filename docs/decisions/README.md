@@ -11,6 +11,7 @@ This directory contains records of the major architectural decisions made for th
 | [0005](0005-orchestration-layer.md) | Orchestration Tier — Profiles, Workflows, Stages, Smart Cron, and a Flexible Workflow Engine | **Accepted** (2-round adversarial review + 3 captain amendments) |
 | [0006](0006-blossom-blob-federation.md) | Blossom / NIP-B7 Federated Blob Serving | **Accepted** (bd-esh.5) |
 | [0007](0007-post-implementation-hardening-and-api-redesign.md) | Post-Implementation Hardening, Bug Ledger, and Backend/API Redesign | **Accepted** (Rev 3; impl e23b + residual epic `bd-adr7-residual-vxnv` closed 2026-08-08 — captain gate `.4`; flywheel se2.3/c3b.1 remain out-of-epic; see [Verification](0007-post-implementation-hardening-and-api-redesign.md#verification-acceptance-for-this-adr)) |
+| [0008](0008-comprehensive-codebase-review-charter.md) | Comprehensive Codebase Review Charter — Tracks, Verification Gates, and Debate Protocol | **Accepted** (Rev 1, 2026-08-09; opencode debate crew AGREE-WITH-CHANGES — both counters in `docs/review/0008-debate-round1.md`; captain resolution `docs/review/0008-captain-resolution.md`; 20 items resolved 19-ACCEPT/1-REJECT; all 11 Soundness Ledger gates ran GREEN; NIP-40 ingest probe added as P0-candidate) |
 
 ## Parity catalogs
 

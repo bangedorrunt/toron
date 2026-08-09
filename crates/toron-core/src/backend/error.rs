@@ -1,6 +1,6 @@
 // governed-by: ADR-0003
 // bd-led.6.1: typed backend errors with machine codes.
-// Classification MUST use `code`, never `message` text (herdr protocol v18
+// Classification MUST use `code`, never `message` text (herdr protocol v19
 // discipline — ADR-0003 "classify on code, never message text").
 
 use std::str::FromStr;
