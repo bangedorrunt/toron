@@ -123,6 +123,40 @@ None today. If a future change adds a second lock to a multi-lock fn, it MUST
 acquire in the documented order above (projected→archive, policies→approved,
 per_tool→latency_hist) or the graph cycle check re-runs.
 
+## F5.POISON — poison-on-panic survivability audit (P1) — FIXED GREEN
+
+**Probe:** `bd-p1-poison-on-panic-audit-jwpd` (2026-08-09). Verdict: **RED →
+GREEN (fixed inline)**. The only poison-propagating std Mutex in production
+was the `MentionCoalescer`; recovered via `PoisonError::into_inner`.
+
+### Per-site verdict table (all 122 `.lock()` sites enumerated; std-Mutex subset)
+
+| Site (file:line) | Lock type | Guard recovery (pre-fix) | Verdict | Disposition |
+|------------------|-----------|--------------------------|---------|-------------|
+| `workflow_host.rs:156` (runner FlushNow arm) | `std::sync::Mutex<MentionCoalescer>` | `.expect("coalescer lock")` → **propagate** | **RED** (shared state, poison bricks every flush) | **FIXED** — `unwrap_or_else(\|e\| e.into_inner())` |
+| `workflow_host.rs:441` (trigger-loop tick flush) | same | `.expect("coalescer lock")` → **propagate** | **RED** (shared state) | **FIXED** — same recovery |
+| `workflow_host.rs:686` (test `coalesced_burst...`) | same | `.expect("lock")` | test code, same pattern | **FIXED** for uniformity |
+| `unwrap.rs` projected/seen_wraps/archive (all) | `parking_lot::Mutex` | n/a (parking_lot never poisons) | SAFE | — |
+| `git.rs` archive/committed | `parking_lot::Mutex` | n/a | SAFE | — |
+| `contacts.rs` policies/approved | `parking_lot::RwLock` | n/a | SAFE | — |
+| `metrics.rs` per_tool/latency_hist | `parking_lot::Mutex` | n/a | SAFE | — |
+| `bus/in_process.rs` subs | `parking_lot::RwLock` | n/a | SAFE | — |
+| `engine.rs` approval/spawn sinks | `tokio::sync::Mutex` | n/a (tokio never poisons) | SAFE | — |
+| engine.rs `seen`/`seen_clone` (test) | std (test `Mutex<Vec>` in engine tests) | `.unwrap()` | test code — a panic there fails the test, not the service | — |
+
+### RED test + fix
+
+- RED: `poisoned_coalescer_survives` (crates/toron-mcp/src/workflow_host.rs) —
+  poisons the coalescer (panic inside the guard via catch_unwind), then runs
+  the REAL runner DispatchJob arm; pre-fix the `.expect()` panicked
+  (panic-in-panic = dead service) — confirmed failing. Post-fix: recovers,
+  test GREEN.
+- Fix: `unwrap_or_else(|e| e.into_inner())` at all 3 coalescer lock sites
+  (ADR-0007 D7 recovery posture; parking_lot switch rejected — bigger dep
+  change for the same result, captain decision 5 allows either).
+- Workflow host module: 9/10 green (only the batch-deferred F3.COALESCER-LOCK
+  RED test fails); clippy clean.
+
 ## S1/S2/S4/S5/S6/S7/F2.KDF — Re-verification GREEN (bd-p0-verify-green-claims-8z3p)
 
 **Probe:** 2026-08-09, live tree (no code modifications). All 7 claims re-verified GREEN
