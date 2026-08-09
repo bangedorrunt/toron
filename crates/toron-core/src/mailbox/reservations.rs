@@ -407,7 +407,14 @@ impl Mailbox {
             let wrap = crate::nostr::gift_wrap::gift_wrap(&holder_keys, &holder_npub, rumor)
                 .await
                 .expect("wrap notify");
-            let _ = self.publish_dm(&wrap).await;
+            // F2.SILENT-DROP (batch-fix): a failed force-release notification
+            // DM must be loud — the force-released holder is entitled to know.
+            if let Err(e) = self.publish_dm(&wrap).await {
+                tracing::warn!(
+                    d,
+                    "force-release notification DM to {holder_npub} failed: {e}"
+                );
+            }
         }
         Ok(())
     }
@@ -571,8 +578,15 @@ impl Mailbox {
                 r#"{{"d":"{d}","status":"{status}","event_id":"{event_id}","ts_us":{}}}"#,
                 crate::index::writer::Clock::now_us(&crate::index::writer::SystemClock)
             );
-            let _ = archive.stage_file(&rel, content.as_bytes());
-            let _ = archive.commit(&format!("reservation {status} {d}"));
+            // F2.SILENT-DROP (batch-fix): the G13 audit-history write must not
+            // fail silently — an unwritable archive loses the
+            // acquire/release/revoked record with no signal.
+            if let Err(e) = archive.stage_file(&rel, content.as_bytes()) {
+                tracing::warn!("reservation audit stage_file failed ({status} {d}): {e}");
+            }
+            if let Err(e) = archive.commit(&format!("reservation {status} {d}")) {
+                tracing::warn!("reservation audit commit failed ({status} {d}): {e}");
+            }
         }
     }
 }
