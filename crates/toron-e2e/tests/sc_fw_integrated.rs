@@ -192,14 +192,21 @@ fn sc_fw_single_agent_prompt_definition_in_core() {
     );
 }
 
-/// SC-FW live flywheel sub-case: with bd-o8j.2 landed, `rg 'fn agent_prompt'`
-/// across flywheel+toron is exactly one, and the flywheel binary boots the
-/// in-process mailbox. `#[ignore]`d until the flywheel repo edits (bd-o8j.2)
-/// are closed — the harness-based cases above run always.
+/// SC-FW live flywheel sub-case (RESOLVED 2026-08-09, bd-p5-sc-fw-integrated-
+/// resolution-8m5d): bd-o8j.2 landed (flywheel MailBackend deleted; toron-core
+/// herdr.rs is the single client) and the test PASSES on machines with the
+/// flywheel binary + checkout. Kept `#[ignore]`d: it boots a DIFFERENT repo's
+/// binary (`flywheel toron status`) and rg's `~/workspace/flywheel/src` — a
+/// cross-repo e2e, flywheel CI scope per captain decision 3 (toron only).
+/// The toron-core single-definition invariant is asserted run-always by
+/// `sc_fw_single_agent_prompt_definition_in_core` above.
+/// Run locally: `cargo test -p toron-e2e --features p1 --test sc_fw_integrated
+/// sc_fw_flywheel_binary_live -- --ignored`.
 #[tokio::test]
-#[ignore = "requires bd-o8j.2 (flywheel herdr.rs/mail.rs removal) + flywheel repo checkout"]
+#[ignore = "cross-repo e2e: requires flywheel binary + ~/workspace/flywheel checkout (flywheel CI scope, captain decision 3); verified passing 2026-08-09"]
 async fn sc_fw_flywheel_binary_live() {
-    // Static: exactly one agent_prompt across both repos.
+    // Static: exactly one agent_prompt across both repos (flywheel's old
+    // herdr.rs/mail.rs deleted by bd-o8j.2).
     let out = std::process::Command::new("rg")
         .arg("-n")
         .arg("fn agent_prompt")
