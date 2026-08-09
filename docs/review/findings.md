@@ -579,6 +579,39 @@ checkout".
 Result: 2/2 run-always tests pass (single-def + one-process peer mail);
 1 documented ignore; no silent-ignored test without a reason. Clippy clean.
 
+## F19.NIP09 — NIP-09 deletion handling on projection sinks (P3 probe #6) — RED
+
+**Probe:** `bd-p3-nip09-deletion-projection-uzgy` (2026-08-09). Verdict:
+**RED — NIP-09 entirely unhandled; deleted mail stays fully readable on both
+sinks (P0, voids ADR-0003 "federatable threads" deletion claim).**
+
+### Findings table (sink x NIP-09 handling x line x verdict)
+
+| Sink | NIP-09 handling | Line | Verdict |
+|------|-----------------|------|---------|
+| Unwrap pipeline / ingest | NONE — no kind-5/62 constant, no delete path; unwrap loop filters `event.kind != GiftWrap` (mailbox/mod.rs:234) | mod.rs:234, unwrap.rs `project()` | **RED** — kind-5 dropped as not-for-us |
+| SqliteProjectionSink | NONE — no `deleted` column (0001_schema.sql:19-36), no tombstone write | schema + write() | **RED** — deleted message remains readable in inbox/search |
+| GitProjectionSink | NONE — archive is append-only by design (permanent audit); no deletion marker | unwrap.rs:380-396 | **RED (readability: sqlite is the read path; git = permanent audit record, tombstone marker optional there)** |
+| Bus | stores any kind (kind-5 events DO land in bus_events) | in_process.rs:203 | raw delete events stored, never acted on |
+
+### RED test
+
+`nip09_delete_tombstones_projected_message` (unwrap.rs tests): project a mail
+(author-signed kind-5 with `e`-tag → rumor id driven through the pipeline)
+and assert the message row is tombstoned. **Confirmed failing**: `no such
+column: deleted` — the tombstone schema + kind-5 ingest do not exist.
+
+### Fix (deferred to `bd-batch-fix-pass-mip4`)
+
+1. Migration: `deleted INTEGER NOT NULL DEFAULT 0` on `messages` (+ optional
+   `deleted_ts_us`).
+2. Kind-5 ingest: the unwrap loop watches kind-5 (author-signed via
+   `verify_event` + sender == message sender_pubkey, `e`-tag target) →
+   tombstone the target row; search/inbox filter `deleted = 0`.
+3. Kind-62 undelete (replay-safe: same author, target must exist).
+4. Git: document permanent-audit posture (no content removal from the
+   archive; optional tombstone marker file).
+
 ## S1/S2/S4/S5/S6/S7/F2.KDF — Re-verification GREEN (bd-p0-verify-green-claims-8z3p)
 
 **Probe:** 2026-08-09, live tree (no code modifications). All 7 claims re-verified GREEN
