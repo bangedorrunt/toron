@@ -1522,3 +1522,53 @@ dedicated beads so each gets its own review + test cycle.
 - toron-mcp lib: **36/36 GREEN** (coalescer-lock now deterministic)
 - toron-e2e p1+p2: all GREEN (incl. sc21 — previously flaky under load)
 - workspace check clean; clippy clean (no new warnings); verify-gates pass (incl. adr-links)
+
+## ADR-0008 REVIEW — UMBRELLA CLOSURE (epic bd-adr8-review-umbrella-zik7, 2026-08-09)
+
+**The comprehensive codebase review is COMPLETE.** All 7 tracks (P0-P6) +
+cross-cutting batch-fix-pass + baseline-rerun are closed; every finding is
+fixed (GREEN), filed as follow-on (rationale), or accepted.
+
+### What the review proved (P0, soundness ledger)
+
+"Fully implemented 0003-0007" **SURVIVES** — all 11 Soundness Ledger claims
+(S1-S9 + F2.KDF + bd-XXX ×3) verified GREEN in code with named gate tests +
+live runs; the ADR-0007 ledger was reconciled to the verdicts
+(bd-p6-soundness-ledger-update-lajq). 4 Parity-Superiority claims hold on
+every ingest path: unforgeable identity, E2E DMs, federatable threads,
+non-repudiable acks (bd-p3-crypto-giftwrap-cfho).
+
+### What the review FOUND and FIXED (highlights)
+
+| Track | Material findings → disposition |
+|-------|---------------------------------|
+| P0 | NIP-40 expiration was NOT checked on unwrap ingest (expired wraps projected) → FIXED (unwrap.rs:776) + RED→GREEN tests |
+| P1 | F3.COALESCER-LOCK: std-Mutex guard held across blocking publish (498ms stall) → FIXED in batch; F1.LAG-SWALLOW: relay lag silently dropped → FIXED (health surfacing); F5.POISON → FIXED (into_inner) |
+| P2 | F19-class id discipline: dead i64 selectors removed, all-String surface enforced by test; 83 prod unwrap/expect sites classified all invariant-true; 4 silent-drop sites surfaced |
+| P3 | F4.G11 **RED**: "either alone rebuilds" was PAPER (production mail never reached the Git archive; bus_events shared index.sqlite) → FIXED (DualProjectionSink git-first + ProjectGitProjectionSink, 8971aa4); F19.NIP09 kind-5 tombstone → FIXED in batch; gift-wrap/Schnorr/KDF all verified |
+| P4 | 5 proposal-only refactor candidates → 3 low-risk applied in batch (F20/F22/F23), 2 large splits filed as captain-gated follow-ons |
+| P5 | oc2 A2.6 corrected: sc16-24 were NEVER gated (doc drift); p1/p2 silent-skip confirmed (CI must use --features p1,p2); sc21 load-flake noted |
+| P6 | Ledger reconciled; 138 governed-by markers enumerated (0 dangling, 0 missing); verify-adr-links.sh authored + CI-wired |
+
+### Batch fix pass (bd-batch-fix-pass-mip4)
+
+7 findings fixed in 6 logical commits: F3.COALESCER-LOCK, F1.LAG-SWALLOW,
+F19.NIP09, F2.SILENT-DROP, F20.DEADCODE-FIXTURES, F22.SURFACE-MESSAGING,
+F23.BUS-DEDUP. Final suite: toron-core 347/347, toron-mcp 36/36, e2e p1+p2
+GREEN, clippy clean, verify-gates (incl. adr-links) pass.
+
+### Remaining (documented, not forgotten)
+
+1. **bd-p4-refactor-has5.1 / .2** (engine.rs + tools.rs splits) — captain-gated
+   move-only reorganizations; await captain approval to execute.
+2. **ADR-0009 candidates** (from findings): flywheel integration seam (S9
+   boundary), SLOs from the perf baseline, NIP-34 forge status.
+3. **sc_fw_flywheel_binary_live** stays `#[ignore]`d (cross-repo, flywheel CI
+   scope, captain decision 3).
+
+### Final verdict
+
+ADR-0008 charter executed end-to-end: **19/20 Change Agenda items ACCEPTED +
+executed; the 1 REJECT documented; every RED finding is now GREEN or
+captain-gated; the ADR-0007 ledger is honest; the ADR-0003 Parity-Superiority
+posture holds in code, not paper.**
