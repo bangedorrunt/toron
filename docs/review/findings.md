@@ -367,6 +367,23 @@ the ADR-0009 SLO proposal. Probe: `crates/toron-core/tests/perf_baseline.rs`
 No perf bead filed — every measured number is well inside the proposed SLO
 and the pathological bound.
 
+## P1 Concurrency Correctness — EPIC VERDICT (bd-p1-concurrency-60wh, 2026-08-09)
+
+All 6 P1 leaves closed. Aggregate:
+
+| Leaf | Verdict | Finding | Disposition |
+|------|---------|---------|-------------|
+| std-guard-across-blockon (F3) | **RED** | coalescer std-Mutex guard held across `rt.block_on(bus.publish)` (runner arm + tick flush) — concurrent flush stalls for publish duration (498ms measured) | fix deferred to `bd-batch-fix-pass-mip4` |
+| broadcast-lag-handling (F1) | **RED** | relay ingest `Lagged => continue` silently swallows (relay_bus.rs:209); RED test authored + confirmed failing; fix = surface (warn + AtomicU64 + health) | fix deferred to `bd-batch-fix-pass-mip4` |
+| poison-on-panic (F5) | **RED→GREEN** | coalescer `.lock().expect()` propagated PoisonError — panic-in-panic; FIXED inline (`into_inner` recovery at 3 sites) | fixed |
+| lock-ordering (F4) | **GREEN** | lock-order graph documented (projected→archive, policies→approved, per_tool→latency_hist); no cycle; deadlock pin added | verified |
+| await-while-locked (F6) | **GREEN** | all tokio guards intentional (writer gate serialization) or temporary; RAII cancel-safe; contention pin added | verified |
+| backpressure-baseline (F11) | **GREEN** | measured baseline (bus 1200 ev/s, lag p99 2ms, projection p99 0.9ms, zero-loss); SLOs proposed for ADR-0009 | verified |
+
+**Open REDs wired into `bd-batch-fix-pass-mip4`:** F3.COALESCER-LOCK +
+F1.LAG-SWALLOW (both have authored RED tests: `coalescer_lock_not_held_across_blocking_publish`,
+`test_broadcast_lag_is_surfaced_not_swallowed`).
+
 ## S1/S2/S4/S5/S6/S7/F2.KDF — Re-verification GREEN (bd-p0-verify-green-claims-8z3p)
 
 **Probe:** 2026-08-09, live tree (no code modifications). All 7 claims re-verified GREEN
@@ -583,3 +600,66 @@ the one i64 leak (documented F11 residual) was removed.
 Toron MCP surface id-bearing fields: **all String**. The F11 residual is closed on
 toron's own surface; flywheel boundary (u64) remains documented-only per captain
 decision 3 (ADR-0009 candidate).
+
+## F5.UNWRAP-EXPECT — 219 unwrap + 984 expect classification (P2, bd-p2-unwrap-expect-classify-brlh)
+
+**Probe:** 2026-08-09. Verdict: **GREEN — 0 real-risk sites in prod src.** All prod
+unwrap/expect sites are invariant-true by construction.
+
+### Count conservation (feeds bd-p2-count-conservation-v3ey)
+
+| Population | Charter baseline (2026-08-09) | Current tree (this probe) | Delta cause |
+|---|---|---|---|
+| `unwrap()` occurrences in src | 219 | 227 (regex) / 206 (ast-grep) | P0-P3 fixes landed since baseline (F5.POISON `unwrap_or_else` swaps, NIP-40 fix, S8 gate) + multiline-site counting |
+| `expect()` occurrences in src | 984 | 1053 | same; new tests + P0-P3 additions |
+| prod (non-cfg(test)) unwrap | — (not split at baseline) | 15 code sites + 1 doc-comment false positive (blob_serve.rs:87, excluded) | — |
+| prod (non-cfg(test)) expect | — | 74 | — |
+| test-region unwrap / expect | — | 211 / 979 | excluded from prod classification per bead scope |
+
+> Baseline re-run is owned by bd-baseline-rerun-zqtm (R8, pre-batch). This bead
+> classifies the CURRENT tree population; count-conservation gate reconciles
+> against the R8 re-run numbers.
+
+### Prod unwrap — 15 sites, ALL invariant-true
+
+| Site | Code | Class | Rationale |
+|------|------|-------|-----------|
+| cli/main.rs:287,293,329 | `value.as_object().unwrap()` | INVARIANT | `value` is always `serde_json::json!({...})` object literal (run_status/run_config) |
+| cli/operator.rs:446,489 | `data_dir.as_ref().unwrap()` | INVARIANT | gated by `resolved = data_dir.as_ref().map(\|d\| d.is_dir())` — unwrap only when Some |
+| cli/output.rs:62,65 | `serde_json::to_string_pretty(value).unwrap()` | INVARIANT | Value serialization fails only on non-finite floats; values are json! literals/config |
+| core/mailbox/matrix.rs:86 | `serde_json::to_string(&att).unwrap()` | INVARIANT | plain struct (String/u64 fields), compiled-in proof-matrix runner |
+| e2e/harness.rs:61 | `db_path.to_str().unwrap()` | INVARIANT | tempdir path, test harness |
+| e2e/harness.rs:117 | `self.db_path.parent().unwrap()` | INVARIANT | path built via `dir.join(...)` — parent exists |
+| mcp/blob_serve.rs:181 | `DEFAULT_MIME.parse().unwrap()` | INVARIANT | constant literal |
+| mcp/blob_serve.rs:183 | `.len().to_string().parse().unwrap()` | INVARIANT | usize→String→parse round-trip |
+| mcp/blob_serve.rs:269,274 | `"*".parse().unwrap()` | INVARIANT | literal header value |
+| mcp/server.rs:307 | `db.to_str().unwrap()` | INVARIANT | path from ToronPaths (String-typed config) |
+| mcp/blob_serve.rs:87 | `url.unwrap()` in `///` doc comment | NOT CODE | excluded (ast-grep does not match it) |
+
+### Prod expect — 74 sites, ALL invariant-true (by class)
+
+| Class | Sites | Count | Rationale |
+|-------|-------|-------|-----------|
+| `Tag::parse([...])` non-empty literal/known-good first element | blob.rs:64,69,73 · build_slots.rs:62,133,165,166 · channels.rs:202,242 · contacts.rs:111,112,114,156,157,158,161,187 · engine.rs:1003 · event.rs:92,97 · infra.rs:111 · jobs.rs:97 · messaging.rs:573,598,603 · product.rs:59,128,133 · proof.rs:333 · reservations.rs:134,135,149,229,230,295,296,358,359,365,370,394,395,396,397 · scoping.rs:26,27,28 | ~46 | `Tag::parse` fails ONLY on empty tag (nostr-0.44.8 tag/mod.rs:106-119); every site passes a non-empty array — first element is a literal |
+| `serde_json::to_string` of plain structs (no floats) | identity.rs:87 · presence.rs:64 · jobs.rs:103,150,182 · proof.rs:332 · matrix.rs:71,90,104,127,145,160,175,191,205,219 | ~14 | structs are String/u64-only; serialization cannot fail |
+| state-guarded map/buffer access | coalesce.rs:275 ("just-inserted buffer") · coalesce.rs:303 ("non-empty buffer checked above") · engine.rs:942 ("node in map", futures built from nodes keys in same loop) | 3 | guard checked immediately above |
+| `strip_prefix` of root-built path | unwrap.rs:389 ("inside root") | 1 | `layout::message` = `root.join(...)` — prefix always present |
+| crypto/key invariants | event.rs:86 (SecretKey::from_hex of all-0x01 literal) · reservations.rs:409 ("wrap notify") + contacts.rs:330 ("wrap control") — gift_wrap of internally-built rumor with registry keys · reservations.rs:353 ("id" — EventId::from_hex fallback of fixed 64-hex literal) | 4 | valid fixed key / keys fetched from registry |
+| test-infra binds | mock_relay.rs:43,44 (bind 127.0.0.1:0) | 2 | mock relay, test-only usage |
+| `Tag::parse` free-form value with literal kind | jobs.rs:97 ("assignee tag") · messaging.rs:573,598,603 | 4 | first element literal; free-form value cannot make parse fail (empty check only) |
+
+**TOTAL: 15 unwrap + 74 expect = 89 prod sites, all invariant-true. 0 real-risk.**
+### expect() message audit
+
+All 74 messages are on invariant paths (confident messages on guaranteed-by-construction
+values — e.g. "valid tag", "node in map", "inside root"). **No silent-masking via a
+confident message on an I/O/external-input path found.** The F5.POISON class (`.lock()
+.expect("coalescer lock")` on shared state) was already fixed by bd-p1-poison-on-panic
+(unwrap_or_else into_inner), so poison-propagating prod expects are gone.
+
+### Notes
+
+- 211 unwrap + 979 expect in test regions excluded per bead scope (tests SHOULD panic on
+  failure — that is the assertion mechanism).
+- Known sibling findings touched: F3.COALESCER-LOCK (batch-fix), F5.POISON (fixed),
+  F7.ZERO-COERCION (fixed). No new risk sites surfaced by this classification.
