@@ -222,6 +222,45 @@ hazards fixed; 65 benign; id-path (F3 residual) already clean.**
    thread/overdue views log + return None on DB failure (resource not served)
    instead of fabricating "0 messages" while the index is down.
 
+## F8.VERIFY-INGEST — Schnorr verify-before-project per ingest (P3) — GREEN + 1 hardening
+
+**Probe:** `bd-p3-schnorr-verify-every-ingest-q0wo` (2026-08-09). Verdict:
+**GREEN** — every ingest path verifies; ONE gap found + fixed (unwrap envelope
+verify), plus relay-ingest defense-in-depth.
+
+### Findings table (ingest-path x verify-fn x line)
+
+| Ingest path | Verify fn | Location | Status |
+|-------------|-----------|----------|--------|
+| InProcessBus publish (all local events) | `verify_event` | `bus/in_process.rs:205` (pipeline stage 1, BEFORE store + fanout) | GREEN |
+| RelayBus publish (outbound federation) | `verify_event` | `bus/relay_bus.rs:221` (before federation gate + send) | GREEN |
+| RelayBus subscribe (relay ingest) | nostr-sdk RelayPool default (Client::new, no skip_verification) + **NEW** explicit `verify_event` | `bus/relay_bus.rs:181` (subscription task, before forwarding) | **GREEN (hardened)** |
+| Unwrap pipeline input | **NEW** `verify_event` on the wrap ENVELOPE | `mailbox/unwrap.rs:602` (`project()`, before unwrap) | **GAP → FIXED** (see below) |
+| Gift-wrap seal | `verify_event` on the kind-13 seal + seal-pubkey == rumor-pubkey | `nostr/gift_wrap.rs:100,110` | GREEN |
+| Proof gate (operator/registration) | `verify_event` | `nostr/proof.rs:167` | GREEN |
+| Job-request build self-check | `verify_event` | `toron-workflow/src/jobs.rs:309` | GREEN |
+| Workflow trigger ingress | bus-verified upstream (no raw ingest) | `workflow_host.rs` `run_trigger_loop` | GREEN (relies on bus) |
+
+### Gap found + fixed (RED→GREEN)
+
+`UnwrapPipeline::project()` (unwrap.rs:602) never verified the WRAP envelope's
+own id+sig before projection — `gift_wrap::unwrap` verifies only the SEAL
+(decrypt ignores the envelope sig). A direct `project()` call (or a partial
+relay replay) could hand the pipeline a wrap whose content decrypts while its
+envelope sig is invalid → the non-canonical event was PROJECTED to sqlite+git.
+
+- RED test `forged_wrap_signature_rejected_on_unwrap` (sig-corrupted wrap →
+  must not project) — confirmed failing (outcome=Projected, archive commit made).
+- Fix: `verify_event(wrap)` gate at the top of `project()` → invalid envelope =
+  `NotForUs`. GREEN; unwrap module 17/17 (incl. NIP-40 tests now green).
+
+### Relay-ingest note
+
+nostr-sdk verifies relay events before `RelayPoolNotification` fires
+(Client::new default; no skip_verification anywhere). Added an explicit
+`verify_event` in the relay subscription task as defense-in-depth so toron
+never forwards an unverified event even if the sdk default changes.
+
 ## S1/S2/S4/S5/S6/S7/F2.KDF — Re-verification GREEN (bd-p0-verify-green-claims-8z3p)
 
 **Probe:** 2026-08-09, live tree (no code modifications). All 7 claims re-verified GREEN

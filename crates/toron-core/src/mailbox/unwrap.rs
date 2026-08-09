@@ -603,6 +603,15 @@ impl UnwrapPipeline {
     /// Project a single wrap event. Returns the outcome (never panics on a
     /// bad/unrelated event — it's a `NotForUs`).
     pub async fn project(&self, wrap: &Event) -> ProjectOutcome {
+        // P3 (bd-p3-schnorr-verify-every-ingest-q0wo): verify the ENVELOPE's
+        // id+signature BEFORE unwrap/projection. The bus verifies on publish,
+        // but direct callers (and partial relay replays) can hand the
+        // pipeline a wrap whose content decrypts while its sig is invalid —
+        // projecting it would archive a non-canonical event.
+        if crate::nostr::event::verify_event(wrap).is_err() {
+            return ProjectOutcome::NotForUs;
+        }
+
         // Idempotency guard 1: the wrap event id itself.
         if !self.seen_wraps.lock().insert(wrap.id.to_hex()) {
             return ProjectOutcome::Duplicate;
@@ -1193,6 +1202,57 @@ mod tests {
             archive.commit_count().expect("count"),
             1,
             "future-expiring mail projects normally"
+        );
+        drop(archive);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// P3 (bd-p3-schnorr-verify-every-ingest-q0wo): the unwrap pipeline must
+    /// verify the WRAP envelope's own id+signature BEFORE projection — the
+    /// bus verifies on publish, but a direct `project()` call (or a partial
+    /// relay replay) can hand the pipeline a wrap whose CONTENT is valid
+    /// (seal decrypts) while its ENVELOPE sig is invalid. Projecting it
+    /// would archive a non-canonical event.
+    ///
+    /// RED today: `project()` never verifies the wrap — decrypt ignores the
+    /// sig, so a sig-corrupted wrap is accepted and committed.
+    #[tokio::test]
+    async fn forged_wrap_signature_rejected_on_unwrap() {
+        let sender = keys();
+        let recipient = keys();
+        let wrap = wrap_for(&sender, &recipient, 1_700_000_000).await;
+        // Corrupt ONLY the wrap's signature (content untouched → decrypt
+        // still succeeds today).
+        let forged = nostr_sdk::nostr::Event::new(
+            wrap.id,
+            wrap.pubkey,
+            wrap.created_at,
+            wrap.kind,
+            wrap.tags.clone(),
+            wrap.content.clone(),
+            nostr_sdk::nostr::prelude::Signature::from_slice(&[0u8; 64]).expect("sig"),
+        );
+        assert!(
+            crate::nostr::event::verify_event(&forged).is_err(),
+            "precondition: forged wrap has an invalid signature"
+        );
+
+        let root = temp_archive("forge-sig");
+        let sink = Arc::new(GitProjectionSink::open(&root).expect("open"));
+        let pipeline =
+            UnwrapPipeline::new(vec![recipient.clone()], Arc::new(AutoPolicy), sink.clone());
+
+        let outcome = pipeline.project(&forged).await;
+        assert_ne!(
+            outcome,
+            ProjectOutcome::Projected,
+            "forged (invalid-signature) wrap must NOT be projected"
+        );
+        let archive = sink.archive.lock();
+        assert_eq!(
+            archive.commit_count().expect("count"),
+            0,
+            "forged wrap must not reach the archive"
         );
         drop(archive);
         let _ = std::fs::remove_dir_all(&root);
