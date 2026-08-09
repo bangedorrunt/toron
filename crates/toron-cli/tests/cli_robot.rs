@@ -93,6 +93,75 @@ fn inbox_parity_emits_valid_json() {
     );
 }
 
+/// P5 (bd-p5-concurrency-stress-tests-9q8l): MULTI-PROCESS durable root —
+/// TWO shelled-out toron binaries on the shared TORON_MCP_DATA_DIR: binary A
+/// sends, binary B reads its inbox and sees the message (S3 at the
+/// binary-to-binary level, no in-process side at all).
+#[test]
+fn cross_process_binary_send_binary_receive() {
+    register_test_agent();
+
+    let marker = format!("bin2bin-{}", std::process::id());
+    let sent = run(&[
+        "mail",
+        "send",
+        "--from",
+        "TestAgent",
+        "--to",
+        "TestAgent",
+        "--subject",
+        &marker,
+        "--body",
+        "binary-to-binary send",
+        "--project",
+        "demo",
+        "--json",
+    ]);
+    assert!(
+        sent.status.success(),
+        "binary A send must exit 0, stderr: {}",
+        String::from_utf8_lossy(&sent.stderr)
+    );
+
+    // Binary B polls its inbox until the projection lands (the sender's own
+    // unwrap loop projects into the shared root; bounded poll).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        let out = run(&[
+            "mail",
+            "inbox",
+            "--agent",
+            "TestAgent",
+            "--project",
+            "demo",
+            "--json",
+        ]);
+        assert!(
+            out.status.success(),
+            "binary B inbox must exit 0, stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let value: Value =
+            serde_json::from_slice(&out.stdout).expect("inbox must emit valid JSON");
+        let found = value
+            .as_array()
+            .map(|arr| {
+                arr.iter().any(|m| {
+                    m.get("subject").and_then(|s| s.as_str()) == Some(marker.as_str())
+                })
+            })
+            .unwrap_or(false);
+        if found {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "binary B never saw binary A's message (multi-process durable root): {value}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+}
+
 /// S3 (ADR-0007 Soundness Ledger) — cross-process MAIL-CONTENT sharing over
 /// the durable root (bd-p0-s3-shared-state-reword-mujh).
 ///
