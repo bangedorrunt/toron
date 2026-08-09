@@ -1264,4 +1264,93 @@ mod tests {
         assert_eq!(civil_from_secs(1_767_225_600), (2026, 1));
         assert_eq!(civil_from_secs(1_700_000_000), (2023, 11));
     }
+
+    /// P3 (bd-p3-replay-dedup-per-sink-nve6): the SQLite sink is idempotent —
+    /// the same mail written twice produces ONE row (in-mem set + UNIQUE
+    /// event_id + `rows_affected()==0` backstop).
+    #[tokio::test]
+    async fn sqlite_sink_double_write_single_row() {
+        let path =
+            std::env::temp_dir().join(format!("toron-sqlite-dedup-{}.sqlite", uuid::Uuid::new_v4()));
+        let pool = crate::index::schema::connect(path.to_str().unwrap())
+            .await
+            .expect("pool");
+        crate::index::schema::migrate(&pool).await.expect("migrate");
+
+        let sender = keys();
+        let recipient = keys();
+        let wrap = wrap_for(&sender, &recipient, 1_700_000_000).await;
+        let mail = UnwrappedMail {
+            recipient: recipient.public_key(),
+            sender: sender.public_key(),
+            rumor: gift_wrap::unwrap(&recipient, &wrap).expect("unwrap").rumor,
+            rumor_id: wrap.id,
+            wrap_event_id: wrap.id,
+            created_at: Timestamp::from(1_700_000_000),
+        };
+
+        let sink = SqliteProjectionSink::new(pool.clone());
+        let first = sink.write(&mail, 1).await.expect("first write");
+        assert!(first, "first projection lands");
+        let second = sink.write(&mail, 2).await.expect("second write");
+        assert!(!second, "replay must be a no-op");
+
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages")
+            .fetch_one(&pool)
+            .await
+            .expect("count");
+        assert_eq!(n, 1, "double write -> one row");
+
+        // is_projected agrees (fresh lookups hit the in-mem set).
+        let key = DedupKey::of(&recipient.public_key(), &wrap.id);
+        assert!(sink.is_projected(&key).await.expect("is_projected"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// P3 (bd-p3-replay-dedup-per-sink-nve6): the git sink's dedup SURVIVES a
+    /// process restart — a NEW sink instance on the same archive root must
+    /// not re-project (marker file on disk), so federation replay after a
+    /// crash cannot duplicate commits.
+    #[tokio::test]
+    async fn git_sink_restart_persists_dedup() {
+        let sender = keys();
+        let recipient = keys();
+        let wrap = wrap_for(&sender, &recipient, 1_700_000_000).await;
+        let rumor = gift_wrap::unwrap(&recipient, &wrap).expect("unwrap").rumor;
+        let mail = UnwrappedMail {
+            recipient: recipient.public_key(),
+            sender: sender.public_key(),
+            rumor: rumor.clone(),
+            rumor_id: rumor.clone().id(),
+            wrap_event_id: wrap.id,
+            created_at: Timestamp::from(1_700_000_000),
+        };
+
+        let root = temp_archive("restart-dedup");
+        let sink_a = GitProjectionSink::open(&root).expect("open");
+        assert!(sink_a.write(&mail, 1).await.expect("write"), "first lands");
+        assert_eq!(sink_a.projected_count(), 1);
+
+        // "Restart": a brand-new sink instance over the same archive root.
+        drop(sink_a);
+        let sink_b = GitProjectionSink::open(&root).expect("reopen");
+        assert_eq!(sink_b.projected_count(), 0, "fresh in-mem set");
+        let key = DedupKey::of(&recipient.public_key(), &rumor.clone().id());
+        assert!(
+            sink_b.is_projected(&key).await.expect("is_projected"),
+            "marker on disk survives restart"
+        );
+        assert!(
+            !sink_b.write(&mail, 2).await.expect("replay write"),
+            "replayed mail after restart is a no-op"
+        );
+        let archive = sink_b.archive.lock();
+        assert_eq!(
+            archive.commit_count().expect("count"),
+            1,
+            "restart replay must not add commits"
+        );
+        drop(archive);
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

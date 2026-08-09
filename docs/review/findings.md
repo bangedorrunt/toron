@@ -261,6 +261,30 @@ nostr-sdk verifies relay events before `RelayPoolNotification` fires
 `verify_event` in the relay subscription task as defense-in-depth so toron
 never forwards an unverified event even if the sdk default changes.
 
+## F9.REPLAY-DEDUP — replay dedup per projection sink (P3) — GREEN
+
+**Probe:** `bd-p3-replay-dedup-per-sink-nve6` (2026-08-09). Verdict: **GREEN —
+both sinks dedup at write + is_projected; replay contract pinned with new
+tests (sqlite double-write + git restart persistence).**
+
+### Findings table (sink x dedup-mechanism x line)
+
+| Sink | Dedup mechanism | is_projected | Restart-safe | Tests |
+|------|-----------------|--------------|--------------|-------|
+| GitProjectionSink | in-mem `projected` set + on-disk `.projected/{id}.marker` staged with the message commit (unwrap.rs:380-396); `write` re-checks both before staging | unwrap.rs:376-378 (set OR marker) | YES — marker file survives restarts | `test_delivered_twice_is_single_write` (same instance) + **NEW `git_sink_restart_persists_dedup`** (fresh instance, same root: is_projected true, write no-op, commit count 1) |
+| SqliteProjectionSink | in-mem set + `INSERT ... ON CONFLICT (event_id) DO NOTHING` + `rows_affected()==0` backstop (unwrap.rs:514-536) | unwrap.rs:462-472 (set OR `SELECT COUNT(*) FROM messages`) | YES — table query survives restarts | **NEW `sqlite_sink_double_write_single_row`** (write twice → 1 row, second no-op, is_projected true) |
+| Pipeline-level | `seen_wraps` wrap-id guard + `sink.is_projected` pre-write (unwrap.rs:602-656) | — | partial (sink-level covers it) | `test_delivered_twice_is_single_write` |
+
+NIP-40 cross-ref: expired-event rejection pre-projection now lives at the
+pipeline gate (F2.NIP40 fixed by `bd-p3-nip40-expiration-fix-6ezx`); replay
+of an expired wrap additionally hits `is_projected` (no duplicate either way).
+
+### Verdict
+
+No defect found. Replay protection holds on BOTH sinks at write AND
+is_projected, and survives process restart (git marker + sqlite UNIQUE/table
+query). Unwrap module 19/19 green; clippy clean.
+
 ## S1/S2/S4/S5/S6/S7/F2.KDF — Re-verification GREEN (bd-p0-verify-green-claims-8z3p)
 
 **Probe:** 2026-08-09, live tree (no code modifications). All 7 claims re-verified GREEN
