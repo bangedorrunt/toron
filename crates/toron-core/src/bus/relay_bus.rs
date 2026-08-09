@@ -23,7 +23,6 @@ use crate::bus::scoping::is_metadata_hiding_kind;
 use crate::bus::{
     Bus, BusError, Filter, Health, PublishOk, Subscription, SubscriptionEvent, SubscriptionId,
 };
-use crate::nostr::event::VerifyError;
 
 /// Read/write role for a relay in the bus config.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,6 +77,11 @@ pub struct RelayBus {
     /// Broadcast of relay notifications, fed by `handle_notifications` and
     /// consumed by per-subscription filter tasks.
     notify_tx: tokio::sync::broadcast::Sender<RelayPoolNotification>,
+    /// F1.LAG-SWALLOW (batch-fix): total `RecvError::Lagged` skips observed by
+    /// the per-subscription bridge tasks. A non-zero value means the broadcast
+    /// out-ran a subscriber (mpsc filled) and events were dropped — surfaced
+    /// on the health surface so the gap is never silent.
+    lag_skips: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl RelayBus {
@@ -109,7 +113,10 @@ impl RelayBus {
         tokio::spawn(async move {
             // IMPORTANT: return Ok(false) — Ok(true) makes handle_notifications
             // EXIT after the first notification (drops all subsequent frames).
-            let _ = client_for_task
+            // F2.SILENT-DROP (batch-fix): the notification PUMP result is no
+            // longer silently dropped — if the pump errors/exits, every relay
+            // subscription goes dead; that must be loud, not silent.
+            if let Err(e) = client_for_task
                 .handle_notifications(move |notification| {
                     let tx = notify_tx_for_task.clone();
                     async move {
@@ -117,13 +124,17 @@ impl RelayBus {
                         Ok(false)
                     }
                 })
-                .await;
+                .await
+            {
+                tracing::warn!("relay notification pump exited with error: {e}");
+            }
         });
 
         Ok(Self {
             client,
             config: Arc::new(config),
             notify_tx,
+            lag_skips: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
     }
 
@@ -167,6 +178,7 @@ impl RelayBus {
         // Background task: broadcast notifications → mpsc. Filters match
         // against the original filter; EOSE maps to SubscriptionEvent::Eose.
         let sub_id_clone = sub_id.clone();
+        let lag_counter = self.lag_skips.clone();
         tokio::spawn(async move {
             loop {
                 let item: Option<SubscriptionEvent> = match notify_rx.recv().await {
@@ -206,7 +218,18 @@ impl RelayBus {
                         Some(SubscriptionEvent::Closed("relay bus shutdown".into()))
                     }
                     Ok(_) => None,
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    // F1.LAG-SWALLOW (batch-fix): surface, never swallow. The
+                    // broadcast out-ran this subscriber (mpsc 256 filled while
+                    // the producer kept publishing); the skipped events are
+                    // gone, but the operator must SEE the gap on health.
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        lag_counter.fetch_add(skipped, std::sync::atomic::Ordering::Relaxed);
+                        tracing::warn!(
+                            skipped,
+                            "relay notification broadcast lagged — events dropped for subscription {sub_id_clone}"
+                        );
+                        continue;
+                    }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                         let _ = tx
                             .send(SubscriptionEvent::Closed("relay bus closed".into()))
@@ -230,15 +253,9 @@ impl RelayBus {
 #[async_trait::async_trait]
 impl Bus for RelayBus {
     async fn publish(&self, event: Event) -> Result<PublishOk, BusError> {
-        // Verify (reject forged/mutated).
-        match crate::nostr::event::verify_event(&event) {
-            Ok(()) => {}
-            Err(VerifyError::BadId) => return Err(BusError::InvalidEvent("id mismatch".into())),
-            Err(VerifyError::BadSignature) => {
-                return Err(BusError::InvalidEvent("signature mismatch".into()));
-            }
-            Err(e) => return Err(BusError::InvalidEvent(e.to_string())),
-        }
+        // Verify (reject forged/mutated). F23.BUS-DEDUP (batch-fix): shared
+        // canonical mapping in bus/common.rs.
+        crate::bus::common::verify_publish_event(&event)?;
 
         // Phase-1 federation policy gate.
         if !self.federation_policy_allows(&event) {
@@ -271,15 +288,25 @@ impl Bus for RelayBus {
     async fn health(&self) -> Result<Health, BusError> {
         // nostr-sdk Client tracks connected relays; we count configured relays.
         let configured = self.config.relays.len();
+        let lag = self
+            .lag_skips
+            .load(std::sync::atomic::Ordering::Relaxed);
         if configured == 0 {
             return Ok(Health {
                 ok: true,
                 message: "relay bus: no relays configured (federation off)".into(),
             });
         }
+        let mut message = format!("relay bus: {configured} relay(s) configured");
+        if lag > 0 {
+            // F1.LAG-SWALLOW: a non-zero count is an observable gap — dropped
+            // relay notifications (workflow triggers / mailbox events). Never
+            // silent.
+            message.push_str(&format!("; {lag} notification(s) dropped to broadcast lag"));
+        }
         Ok(Health {
             ok: true,
-            message: format!("relay bus: {configured} relay(s) configured"),
+            message,
         })
     }
 }
