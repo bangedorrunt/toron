@@ -22,7 +22,8 @@
 //! Git write. The policy source is injected (default `Auto`); the kind-30014
 //! bus-backed resolver lands with the contacts tools (bd-led.5.4).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -393,6 +394,157 @@ impl ProjectionSink for GitProjectionSink {
         archive.commit(&format!("project message {id}"))?;
         self.projected.lock().insert(id);
         Ok(true)
+    }
+}
+
+/// Per-project Git archive routing (G11 / bd-p3-projection-atomicity-rtjz):
+/// the production mailbox spans many projects, each with its OWN archive root
+/// at `{data_dir}/{project_slug}` (ADR-0003 per-project layout; the operator
+/// `doctor reconstruct` rebuilds per-project from that root). A single-root
+/// sink cannot serve the mailbox — this variant resolves the archive per
+/// recipient via the same npub→slug map the SQLite sink uses.
+///
+/// Dedup markers stay per-project (`.projected/{id}.marker` under the project
+/// root), so `is_projected` is project-scoped like the archive itself.
+pub struct ProjectGitProjectionSink {
+    data_dir: PathBuf,
+    projects: HashMap<String, String>,
+    /// slug → open archive (opened lazily per project on first write).
+    archives: Mutex<HashMap<String, Arc<parking_lot::Mutex<crate::archive::git::GitArchive>>>>,
+    projected: Mutex<HashSet<String>>,
+}
+
+impl ProjectGitProjectionSink {
+    /// Open a per-project routing sink over `data_dir` (project roots hang
+    /// off it: `{data_dir}/{slug}`) with the recipient-npub → slug map.
+    pub fn for_mailbox(data_dir: PathBuf, projects: HashMap<String, String>) -> Self {
+        Self {
+            data_dir,
+            projects,
+            archives: Mutex::new(HashMap::new()),
+            projected: Mutex::new(HashSet::new()),
+        }
+    }
+
+    /// The archive for a project slug (opened + cached on first touch).
+    fn archive_for(
+        &self,
+        slug: &str,
+    ) -> anyhow::Result<Arc<parking_lot::Mutex<crate::archive::git::GitArchive>>> {
+        if let Some(a) = self.archives.lock().get(slug).cloned() {
+            return Ok(a);
+        }
+        let root = self.data_dir.join(slug);
+        let archive = Arc::new(parking_lot::Mutex::new(
+            crate::archive::git::GitArchive::open_or_init(&root)?,
+        ));
+        self.archives.lock().insert(slug.to_string(), archive.clone());
+        Ok(archive)
+    }
+
+    /// The project slug for a recipient npub ("" when unregistered).
+    fn slug_for(&self, recipient: &str) -> String {
+        self.projects.get(recipient).cloned().unwrap_or_default()
+    }
+}
+
+#[async_trait::async_trait]
+impl ProjectionSink for ProjectGitProjectionSink {
+    async fn is_projected(&self, key: &DedupKey) -> anyhow::Result<bool> {
+        if self.projected.lock().contains(&key.rumor_id) {
+            return Ok(true);
+        }
+        let slug = self.slug_for(&key.recipient);
+        if slug.is_empty() {
+            return Ok(false);
+        }
+        let archive = self.archive_for(&slug)?;
+        let marker = archive
+            .lock()
+            .project_root()
+            .join(GitProjectionSink::marker_rel(&key.rumor_id));
+        Ok(marker.exists())
+    }
+
+    async fn write(&self, mail: &UnwrappedMail, _local_seq: u64) -> anyhow::Result<bool> {
+        let id = mail.rumor_id.to_hex();
+        if self.projected.lock().contains(&id) {
+            return Ok(false);
+        }
+        let slug = self.slug_for(&mail.recipient.to_hex());
+        if slug.is_empty() {
+            // Unregistered recipient — no project archive to write to. The
+            // SQLite leg (composite sink) still indexes it; the archive gap
+            // is healed by `doctor reconstruct` (G11 path 1 needs a project
+            // root, and an unregistered recipient has none by definition).
+            return Ok(false);
+        }
+        let archive = self.archive_for(&slug)?;
+        let (yyyy, mm) = civil_from_secs(mail.created_at.as_secs());
+        let guard = archive.lock();
+        let root = guard.project_root().to_path_buf();
+        let rel = crate::archive::git::layout::message(&root, yyyy, mm, &id);
+        let rel = rel.strip_prefix(&root).expect("inside root").to_path_buf();
+        let json = mail.rumor.as_json();
+        guard.stage_file(&rel, json.as_bytes())?;
+        guard.stage_file(&GitProjectionSink::marker_rel(&id), b"projected")?;
+        guard.commit(&format!("project message {id}"))?;
+        drop(guard);
+        self.projected.lock().insert(id);
+        Ok(true)
+    }
+}
+
+/// G11 / bd-p3-projection-atomicity-rtjz: write ONE message through TWO
+/// recovery stores — the Git archive (canonical system of record, per-project)
+/// FIRST, then the SQLite index. Ordering + failure semantics:
+///
+/// - **Git fails** → the whole write fails (`Err` propagates). Nothing is
+///   marked projected; the wrap stays on the bus and is re-projected on the
+///   next delivery/restart. The system of record never diverges from a
+///   "projected" claim.
+/// - **Git ok, SQLite fails** → the canonical mail IS durably archived
+///   (rebuild-from-Git can restore the index, G11 path 1); the write still
+///   counts as projected (archive is the source of truth) with a warn log.
+///   `is_projected` is the AND of both stores, so a later re-delivery of the
+///   same wrap re-runs the SQLite leg (git write idempotently returns false)
+///   and the index heals itself; `doctor reconstruct` is the operator backstop.
+pub struct DualProjectionSink {
+    git: Arc<dyn ProjectionSink>,
+    sqlite: Arc<dyn ProjectionSink>,
+}
+
+impl DualProjectionSink {
+    /// Chain `git` (canonical) then `sqlite` (index).
+    pub fn new(git: Arc<dyn ProjectionSink>, sqlite: Arc<dyn ProjectionSink>) -> Self {
+        Self { git, sqlite }
+    }
+}
+
+#[async_trait::async_trait]
+impl ProjectionSink for DualProjectionSink {
+    async fn is_projected(&self, key: &DedupKey) -> anyhow::Result<bool> {
+        // AND: "projected" means BOTH stores have it. A mail that is in the
+        // archive but missing from the index (sqlite write failed earlier) is
+        // NOT yet projected — a re-delivery re-runs the sqlite leg (git write
+        // is idempotent) and heals the lag.
+        Ok(self.git.is_projected(key).await? && self.sqlite.is_projected(key).await?)
+    }
+
+    async fn write(&self, mail: &UnwrappedMail, local_seq: u64) -> anyhow::Result<bool> {
+        // Canonical store first: a git failure must NOT leave a "projected"
+        // claim in SQLite while the archive (rebuild source) misses the mail.
+        let git_written = self.git.write(mail, local_seq).await?;
+        match self.sqlite.write(mail, local_seq).await {
+            Ok(w) => Ok(git_written || w),
+            Err(e) => {
+                tracing::warn!(
+                    rumor_id = %mail.rumor_id,
+                    "SQLite projection failed after Git archive write — index lag heals via re-delivery or doctor reconstruct (G11 path 1): {e}"
+                );
+                Ok(git_written)
+            }
+        }
     }
 }
 
@@ -1263,6 +1415,74 @@ mod tests {
         // 2026-01-01T00:00:00Z -> (2026, 1); a mid-year date -> (2026, 8).
         assert_eq!(civil_from_secs(1_767_225_600), (2026, 1));
         assert_eq!(civil_from_secs(1_700_000_000), (2023, 11));
+    }
+
+    /// P3 probe #6 (bd-p3-nip09-deletion-projection-uzgy): a NIP-09 kind-5
+    /// deletion (author-signed, `e`-tag → message) must TOMBSTONE the
+    /// projected message — deleted mail must not stay readable on either
+    /// projection.
+    ///
+    /// RED today: NO kind-5/62 handling exists anywhere (no `deleted` column,
+    /// no delete path in either sink, the unwrap loop only watches gift
+    /// wraps) — a deleted message lingers fully readable. The batch fix adds
+    /// the tombstone column + a kind-5 ingest that marks the target row.
+    #[tokio::test]
+    async fn nip09_delete_tombstones_projected_message() {
+        use crate::index::schema;
+
+        let path = std::env::temp_dir()
+            .join(format!("nip09-{}.sqlite", uuid::Uuid::new_v4()));
+        let pool = schema::connect(path.to_str().unwrap()).await.expect("pool");
+        schema::migrate(&pool).await.expect("migrate");
+
+        let sender = keys();
+        let recipient = keys();
+        let wrap = wrap_for(&sender, &recipient, 1_700_000_000).await;
+        let rumor = gift_wrap::unwrap(&recipient, &wrap).expect("unwrap").rumor;
+        let rumor_id = rumor.clone().id();
+        let mail = UnwrappedMail {
+            recipient: recipient.public_key(),
+            sender: sender.public_key(),
+            rumor: rumor.clone(),
+            rumor_id: rumor_id.clone(),
+            wrap_event_id: wrap.id,
+            created_at: Timestamp::from(1_700_000_000),
+        };
+
+        let sink = SqliteProjectionSink::new(pool.clone());
+        let pipeline = UnwrapPipeline::new(
+            vec![recipient.clone()],
+            Arc::new(AutoPolicy),
+            Arc::new(sink),
+        );
+        assert_eq!(pipeline.project(&wrap).await, ProjectOutcome::Projected);
+
+        // NIP-09: the AUTHOR signs a kind-5 deletion referencing the message.
+        let delete = nostr_sdk::nostr::EventBuilder::new(
+            nostr_sdk::nostr::Kind::EventDeletion,
+            "",
+        )
+        .tags([nostr_sdk::nostr::Tag::event(rumor_id.clone())])
+        .sign_with_keys(&sender)
+        .expect("sign kind-5");
+        pipeline.project(&delete).await;
+
+        // Contract: the message must be tombstoned (deleted flag), NOT
+        // readable. Pre-fix: the `deleted` column does not exist -> the query
+        // errors -> RED.
+        let deleted: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM messages WHERE event_id = ?1 AND deleted = 1",
+        )
+        .bind(rumor_id.to_hex())
+        .fetch_one(&pool)
+        .await
+        .expect("deleted column must exist (NIP-09 tombstone support)");
+        assert_eq!(
+            deleted, 1,
+            "author kind-5 deletion must tombstone the projected message"
+        );
+
+        let _ = std::fs::remove_file(&path);
     }
 
     /// P5 (bd-p5-projection-differential-tests-vhz9): the three projections of
