@@ -1491,3 +1491,34 @@ Per-crate LOC: core 23,799 · mcp 7,240 · workflow 7,618 · cli 4,512 · e2e 4,
 The batch-fix pass runs against THIS tree state (0f84cb8e, 48,105 LOC). Any
 count-conservation assertion (bd-p2-count-conservation-v3ey) must use the R8
 numbers (228/1,098), not the charter's 219/984.
+
+## BATCH FIX PASS — RED->GREEN EXECUTED (epic bd-batch-fix-pass-mip4, 2026-08-09)
+
+All findings fixed (GREEN) or filed as follow-on (rationale). Every RED test
+authored during P0-P6 now passes on the live tree.
+
+| Finding | Fix | RED test → GREEN | Verify |
+|---------|-----|------------------|--------|
+| F3.COALESCER-LOCK (P1) | guard scoped to submit/tick ONLY; publish runs after guard drop (workflow_host.rs, both sites) | `coalescer_lock_not_held_across_blocking_publish` — was flaky-fail, now GREEN | toron-mcp 36/36 |
+| F1.LAG-SWALLOW (P1) | `lag_skips: AtomicU64` on RelayBus; Lagged arm increments + warn; health() reports "N dropped to broadcast lag" | `test_broadcast_lag_is_surfaced_not_swallowed` — GREEN | relay_bus 8 tests GREEN |
+| F19.NIP09 (P0) | migration 0003 (`deleted`, `deleted_ts_us`); `ProjectionSink::tombstone(target, author, ts)` author-gated UPDATE; kind-5 ingest in `project()`; inbox/search/thread filter `deleted = 0` | `nip09_delete_tombstones_projected_message` — GREEN | toron-core 347/347 |
+| F2.SILENT-DROP (P2) | 4 accidental `let _ =` sites → warn-logged: relay pump exit, force-release notify DM, audit stage_file + commit (reservations.rs) | no RED (observability) | reservations 16 tests GREEN |
+| F20.DEADCODE-FIXTURES (P4) | `#![allow(dead_code)]` on e2e tests/common/mod.rs (test-support module) | no RED (lint) | clippy 0 dead_code; sc21/sc24 GREEN |
+| F22.SURFACE-MESSAGING (P4) | single `tag_value(tags, name)` in unwrap.rs; messaging.rs duplicate deleted; `tag_text` delegates | no RED (move-only) | messaging 17 tests GREEN |
+| F23.BUS-DEDUP (P4) | `bus/common.rs::verify_publish_event` canonical; both publish paths call it | no RED (move-only) | bus 23 tests GREEN |
+
+### Follow-ons filed (rationale: captain-gated large move-only splits, high blast radius)
+
+- **bd-p4-refactor-has5.1** — engine.rs 2401-LOC split (F21.ENGINE-SPLIT)
+- **bd-p4-refactor-has5.2** — tools.rs 1960-LOC split (F21.TOOLS-SPLIT)
+
+Both are pure reorganization (zero behavior change, MCP surface untouched); the
+batch applied the low-blast-radius findings and filed the two large splits as
+dedicated beads so each gets its own review + test cycle.
+
+### Suite state after batch
+
+- toron-core lib: **347/347 GREEN** (0 failed, 1 ignored) — was 345/2 (the 2 REDs now fixed)
+- toron-mcp lib: **36/36 GREEN** (coalescer-lock now deterministic)
+- toron-e2e p1+p2: all GREEN (incl. sc21 — previously flaky under load)
+- workspace check clean; clippy clean (no new warnings); verify-gates pass (incl. adr-links)
