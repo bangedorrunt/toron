@@ -572,4 +572,107 @@ mod tests {
         );
         relay.shutdown();
     }
+
+    /// RED regression pin (oc A1.6, parity bug bd-XXX): broadcast lag on the
+    /// federation bus must be SURFACED (warn log + ops metric), never silently
+    /// swallowed. relay_bus.rs:196 `Err(RecvError::Lagged(_)) => continue`
+    /// drops lag notifications with no signal.
+    ///
+    /// Recipe: two subscriptions on one RelayBus. Sub A is drained (keeps the
+    /// producer flowing); Sub B is NOT drained (its mpsc fills at 256 → the
+    /// bridge task blocks → the broadcast receiver falls behind → `Lagged`
+    /// fires deterministically). The batch fix must expose the lag on the
+    /// existing health surface so operators/agents can observe the gap.
+    #[tokio::test]
+    async fn test_broadcast_lag_is_surfaced_not_swallowed() {
+        let relay = crate::bus::mock_relay::MockRelay::start().await;
+        let url = relay.url().to_string();
+        let bus = RelayBus::open(RelayBusConfig {
+            relays: vec![RelayConfig {
+                url: url.clone(),
+                role: RelayRole::ReadWrite,
+            }],
+            keys: Keys::generate(),
+            federation_policy_enabled: true,
+            ..Default::default()
+        })
+        .await
+        .expect("open subscriber");
+        let publisher = RelayBus::open(RelayBusConfig {
+            relays: vec![RelayConfig {
+                url,
+                role: RelayRole::ReadWrite,
+            }],
+            keys: Keys::generate(),
+            federation_policy_enabled: true,
+            ..Default::default()
+        })
+        .await
+        .expect("open publisher");
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        // Sub A: drained by a background task → the broadcast producer never
+        // blocks. Sub B: held undrained → bridge blocks on its mpsc (256 cap).
+        let mut sub_a = bus
+            .subscribe(crate::bus::Filter::new())
+            .await
+            .expect("subscribe a");
+        let mut sub_b = bus
+            .subscribe(crate::bus::Filter::new())
+            .await
+            .expect("subscribe b");
+        let drain_a = tokio::spawn(async move {
+            while let Some(_) = sub_a.next().await {}
+        });
+
+        // Burst: 1500 gift-wraps > 256 (mpsc) + 1024 (broadcast) + margin, so
+        // sub_b's bridge MUST lag once the mpsc fills.
+        let sender = Keys::generate();
+        let recipient = Keys::generate();
+        let mut published = 0usize;
+        for i in 0..1500 {
+            let rumor = crate::nostr::gift_wrap::build_rumor(
+                sender.public_key(),
+                Timestamp::from(1_700_000_000_u64 + i as u64),
+                Kind::PrivateDirectMessage,
+                vec![Tag::parse(["p", &recipient.public_key().to_hex()]).expect("p")],
+                "lag burst",
+            );
+            let wrapped =
+                crate::nostr::gift_wrap::gift_wrap(&sender, &recipient.public_key(), rumor)
+                    .await
+                    .expect("wrap");
+            publisher.publish(wrapped).await.expect("publish");
+            published += 1;
+        }
+
+        // Now drain sub_b: the bridge unblocks, recv() returns Lagged, and —
+        // post-fix — the lag must be observable. Give the relay forward loop
+        // time to flush before draining.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let mut received_b = 0usize;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(std::time::Duration::from_millis(300), sub_b.next()).await {
+                Ok(Some(SubscriptionEvent::Event(_))) => received_b += 1,
+                Ok(Some(_)) => {}
+                _ => break,
+            }
+        }
+        drain_a.abort();
+
+        // Diagnostic: lag MUST have occurred (silent loss today).
+        assert!(
+            received_b < published,
+            "test setup broken: sub_b received all {published} events — no lag was forced"
+        );
+
+        // RED contract: the lag must be surfaced on the health surface.
+        let h = bus.health().await.expect("health");
+        assert!(
+            h.message.to_lowercase().contains("lag"),
+            "broadcast lag silently swallowed: health reports {h:?} (expected lag surfaced; relay_bus.rs:196 `Lagged => continue`)"
+        );
+        relay.shutdown();
+    }
 }
