@@ -219,6 +219,35 @@ follow-on charter, **out of scope for ADR-0008** — this repo is toron-only
 soundness note: the contract is per-backend round-trip (C5) — toron's own
 surface is correct on its own terms (S4 GREEN, all String).
 
+## 10. ADR-0008 review updates (NEW 2026-08-09)
+
+Shapes/behavior changed by the ADR-0008 review findings (findings catalog:
+`docs/review/findings.md`). Re-verify parity assertions against these:
+
+- **NIP-40 expiration (F2.NIP40)**: the unwrap pipeline now REJECTS gift
+  wraps whose `expiration` tag is in the past BEFORE projection (parse +
+  reject-if-past at the `project()` gate). Replay of an expired envelope is
+  additionally filtered by the bus store. A delete/expired event never
+  becomes a mail row.
+- **Envelope signature gate (F8.VERIFY-INGEST)**: `UnwrapPipeline::project()`
+  verifies the wrap envelope's own id+sig before unwrap (a sig-corrupted wrap
+  is `NotForUs`, never projected); the relay-ingest subscription task also
+  verifies explicitly (defense-in-depth over nostr-sdk's default).
+- **Dual projection (F4.G11)**: production now projects to BOTH Git (canonical,
+  git-first) and SQLite (index) via `DualProjectionSink` — a Git failure
+  blocks the projection (nothing written), a SQLite failure after Git logs a
+  warning and heals via re-delivery. Parity note: the git archive remains the
+  permanent audit record; the sqlite index is the read/search path.
+- **Operator key KDF (F14.KDF-DOS)**: operator ncryptsec scrypt log_n raised
+  12 → 14 (matches toron-cli `KEY_LOG_N`); agent keys stay NIP-49 log_n=16.
+  Decrypt reads log_n from the payload — old log_n=12 keys still load.
+- **Coalescer poison recovery (F5.POISON)**: `MentionCoalescer` lock sites
+  recover `PoisonError` (`into_inner`) — a panic inside the guard no longer
+  bricks subsequent flushes.
+- **TTL coercion (F7.ZERO-COERCION)**: negative i64 TTL/extend args are
+  treated as `None` (default TTL / no-op extension) — never wrapped to an
+  astronomical u64 lease.
+
 ---
 
 *Maintained by lane OC-C (BlackMarsh). Created 2026-08-07 from the bd-96a real-e2e probe

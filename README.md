@@ -13,7 +13,7 @@ with no orchestrator in the hot path.
 ```
    ┌─────────────────── toron-core (embedded in flywheel) ───────────────────┐
    │                                                                         │
-   │   Mailbox (38 AM-Rust tools) ──▶ Nostr events ──▶ Bus                    │
+   │   Mailbox (38 tools, 25 resources) ──▶ Nostr events ──▶ Bus            │
    │   Workflow engine (Resonate) ──▶ triggers/actions │                      │
    │   Backend trait ──▶ herdr (default) / tmux (hold)  ▼                      │
    │                                      InProcessBus (tokio broadcast+SQLite)│
@@ -271,9 +271,10 @@ write nothing. Consumed nonces persist across restarts.
 toron/                           # Cargo workspace (governed-by ADR-0003)
 ├── crates/
 │   ├── toron-core/              # lib: nostr, bus, index, archive, mailbox, backend, keys
-│   ├── toron-mcp/               # lib: MCP server (stdio+HTTP/axum), 38 tools
+│   ├── toron-mcp/               # lib: MCP server (stdio+HTTP/axum), 38 tools + 25 resources
 │   ├── toron-cli/               # bin: daemon + CLI (robot mode, metrics; TUI Phase 2)
-│   └── toron-workflow/          # Phase 2: Resonate-backed YAML automation
+│   ├── toron-workflow/          # Phase 2: Resonate-backed YAML automation
+│   └── toron-e2e/              # scenario suite (SC-1..SC-25, feature-gated gates)
 ├── examples/
 ├── tests/                       # AM-Rust conformance + integration
 └── docs/decisions/              # ADRs (0003 is the current constitution)
@@ -288,7 +289,8 @@ directly; the search layer never calls the archive; etc.
 ## Roadmap
 
 - **Phase 1 (v1)** — AM-Rust parity + integrated mode + core kind vocabulary.
-  Ships the 38 tools, in-process bus, Git+SQLite projection, herdr backend,
+  Ships the 38 tools + 25 resources, in-process bus, Git+SQLite projection (dual-sink,
+  git-first per G11), herdr backend,
   flywheel embedding.
 - **Phase 2** (ordered: workflow+@mention → channels → persona/presence) —
   `toron-workflow` (Resonate) + @mention dispatch + job lifecycle (`43001`→`43002`→`43003`→`43004`),
