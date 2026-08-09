@@ -110,9 +110,18 @@ impl Mailbox {
         let mut filter_sql = String::new();
         let mut params: Vec<String> = vec![query, project];
         if let Some(s) = args.sender_name.clone() {
-            filter_sql.push_str(&format!(" AND m.sender_pubkey = ?{}", bind_id));
+            // The filter takes a NAME but the column stores the hex pubkey —
+            // resolve through the agents table (per project). An unknown
+            // name matches nothing (subquery → NULL), which is the correct
+            // filter semantics.
+            filter_sql.push_str(&format!(
+                " AND m.sender_pubkey = (SELECT pubkey FROM agents WHERE project_slug = ?{} AND name = ?{})",
+                bind_id,
+                bind_id + 1
+            ));
+            params.push(args.project_key.clone());
             params.push(s);
-            bind_id += 1;
+            bind_id += 2;
         }
         if let Some(i) = args.importance.clone() {
             filter_sql.push_str(&format!(" AND m.importance = ?{}", bind_id));
