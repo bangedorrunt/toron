@@ -24,8 +24,11 @@ use crate::config::Config;
 use crate::output::{OutputFormat, render_json};
 use toron_mcp::ToJson;
 
-/// argon2 log-n for operator keys (spec: 12 — dev-speed, still strong).
-const KEY_LOG_N: u8 = 12;
+/// scrypt log-n for operator keys (P3 bd-p3-argon2-kdf-dos-bound-7sbu:
+/// raised 12 -> 14 — matches toron-core OPERATOR_KEY_LOG_N; 12 was 16x
+/// weaker than agent keys (NIP-49 log_n=16). Decrypt reads log_n from the
+/// payload, so existing keys keep working).
+const KEY_LOG_N: u8 = 14;
 
 /// Dev-default passphrase when `TORON_KEY_PASSPHRASE` is unset. Production
 /// MUST set the env var; the flag form is intentionally rejected.

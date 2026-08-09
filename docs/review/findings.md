@@ -463,6 +463,27 @@ All 6 P2 leaves closed. Aggregate:
 ACCIDENTAL silent-drops (F2) alongside the P1 REDs (F3.COALESCER-LOCK,
 F1.LAG-SWALLOW).
 
+## F14.KDF-DOS — Argon2/KDF params DoS-bound audit (P3) — FIXED
+
+**Probe:** `bd-p3-argon2-kdf-dos-bound-7sbu` (2026-08-09). Verdict: agent-key
+params spec-standard; **operator-key KDF weakness FIXED inline (12 → 14)**.
+
+### Findings table (params x assessment)
+
+| Key | Params (NIP-49 scrypt) | Assessment | Disposition |
+|-----|------------------------|------------|-------------|
+| Agent keys (`keys/mod.rs` DEFAULT_LOG_N) | log_n=**16**, r=8, p=1 → N=65536, ~64 MiB, ~158ms/key (50-key gate 7.9s) | **SPEC-STANDARD** (NIP-49 default; same as damus et al.) — not argon2 (NIP-49 mandates scrypt; OWASP argon2 reference N/A) | verified + pinned (`DEFAULT_LOG_N >= 16` guard in `operator_key_kdf_not_weak`) |
+| Operator key (`config/mod.rs` OPERATOR_KEY_LOG_N + `cli/operator.rs` KEY_LOG_N) | log_n=**12** (pre-fix) → N=4096, 4 MiB, ~10-20ms — **16× weaker than agent keys** | **WEAK** — the most privileged key (Overseer bypass, manifests, force-release) with the weakest KDF (boot-speed tradeoff) | **FIXED → 14** (16 MiB, ~50-100ms, within F2.KDF per-key budget); RED test `operator_key_kdf_not_weak` RED→GREEN; decrypt is payload-driven → existing log_n=12 keys still load |
+| Decrypt of untrusted ncryptsec | `MAX_LOG_N = 18` cap (nostr-0.44.8 nip49.rs:202, ~256 MiB) | **DoS-bound** — attacker-supplied payloads cannot request unbounded memory | verified |
+| Re-scan exposure | F2.KDF content-keyed cache + `kdf_load_count` + 50-key gate (7.9s) | **bounded** — cold scan = N × ~158ms; cache makes warm scans O(new/changed) | verified (F2.KDF gate) |
+
+### Verdict
+
+No unbounded DoS: decrypt caps untrusted payloads at 256 MiB; the cache
+bounds re-scans; the 50-key gate bounds cold scans. The one weakness (operator
+key log_n=12) fixed inline to 14. Config tests 9/9 green; CLI check clean;
+clippy clean.
+
 ## S1/S2/S4/S5/S6/S7/F2.KDF — Re-verification GREEN (bd-p0-verify-green-claims-8z3p)
 
 **Probe:** 2026-08-09, live tree (no code modifications). All 7 claims re-verified GREEN
