@@ -45,3 +45,25 @@ live ingest path.
 2. GREEN: TTL check in unwrap pipeline before `sink.write` (parse `expiration` tag,
    compare vs now, reject-if-past).
 3. REFACTOR: extract named helper.
+
+## S1/S2/S4/S5/S6/S7/F2.KDF — Re-verification GREEN (bd-p0-verify-green-claims-8z3p)
+
+**Probe:** 2026-08-09, live tree (no code modifications). All 7 claims re-verified GREEN
+at execution time. Actual output lines below.
+
+| Claim | Test (file:line) | Actual output (2026-08-09) | Verdict |
+|-------|------------------|-----------------------------|---------|
+| S1 | `serve_wire_gift_wrap_fires_message_posted_once` (crates/toron-mcp/src/server.rs:446) | `test server::tests::serve_wire_gift_wrap_fires_message_posted_once ... ok` — `1 passed; 0 failed` (51.14s) | GREEN |
+| S2 | `trigger_filter` module (crates/toron-workflow/src/trigger_filter.rs:161) + trigger/filter tests across toron-workflow | `trigger_filter::tests` 11/11 ok (`all_job_kinds_excluded`, `all_workflow_run_kinds_excluded`, `workflow_emitted_tag_rejects_kind_14`, `dispatch_job_output_cannot_loop`, `self_send_message_workflow_cannot_loop`, `tag_check_is_specific`, `gift_wrap_excluded`, `filter_operates_on_wire_events`, `kind_predicate_consistent_with_event_predicate_for_kinds`, `range_helpers_correct`, `legitimate_user_kinds_pass`); plus engine/schema/lint/cron trigger tests — toron-workflow lib `124 passed; 0 failed` | GREEN |
+| S4 | id args all String — `AcknowledgeMessageArgs.message_id` (tools.rs:1512/1519), `MarkMessageReadArgs.message_id` (tools.rs:1523/1527), `ForceReleaseFileReservationArgs.file_reservation_id` (tools.rs:1607) | Audit: all three `String`, no i64/u64. **Note:** `RenewFileReservationsArgs.file_reservation_ids: Option<Vec<i64>>` (tools.rs:1590) + `ReleaseFileReservationsArgs` (:1598) are dead AM-parity selectors — documented as NOT part of the toron surface and ignored (crates/toron-core/src/mailbox/surface.rs:427, F11 honesty gap; paths-only is the truthful superset). S4 substance holds. | GREEN (note) |
+| S5 | `foreach_over_list_collects` (crates/toron-workflow/src/engine.rs:2041) | `test engine::tests::foreach_over_list_collects ... ok` — `1 passed; 0 failed` | GREEN |
+| S6 | `call_workflow_nested_subrun_returns_child_output` (crates/toron-workflow/src/engine.rs:2136) | `test engine::tests::call_workflow_nested_subrun_returns_child_output ... ok` — `1 passed; 0 failed` | GREEN |
+| S7 | `coalesced_burst_publishes_one_stamped_43001` (crates/toron-mcp/src/workflow_host.rs:824) | `test workflow_host::tests::coalesced_burst_publishes_one_stamped_43001 ... ok` — `1 passed; 0 failed` | GREEN |
+| F2.KDF | `unwrap_loop_kdf_cached_between_rebuilds_many_keys` (crates/toron-core/src/mailbox/mod.rs:540) | `test mailbox::tests::unwrap_loop_kdf_cached_between_rebuilds_many_keys ... ok` — `1 passed; 0 failed` (7.88s) | GREEN |
+
+No regression on any gate. Note: the S2 "19/19" figure from debate time is not a literal
+module count — `trigger_filter.rs` has 11 tests plus ~8 trigger/filter tests in
+engine/schema/lint/cron modules; the full toron-workflow lib suite (124 tests) is green.
+S4's dead `Vec<i64>` reservation-id selectors are tracked for the batch-fix pass (surface
+doc says ignored; candidates for removal or honest schema amendment), but they do not
+violate the S4 claim (the claim's three named args are String).
