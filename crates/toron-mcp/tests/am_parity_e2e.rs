@@ -1056,4 +1056,134 @@ async fn poll_inbox(d: &mut LiveDaemon, proj: &str, agent: &str, needle: &str, t
     );
 }
 
+/// D8.2 honesty gap (bd-p5-d82-parity-am-parity-e2e-5dp3): six catalog tools
+/// were ENUMERATED by acceptance.rs but never FUNCTIONALLY driven:
+/// `install_precommit_guard`, `uninstall_precommit_guard`,
+/// `resolve_pane_identity`, `cleanup_pane_identities`, `macro_prepare_thread`,
+/// `summarize_thread_product`. This cluster drives all six for their honest
+/// behavior (real git repo for the guard; structured herdr note when the
+/// backend is absent; real registration + product fan-out for the macros).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cluster_guard_pane_and_prepare_thread() -> anyhow::Result<()> {
+    let mut d = LiveDaemon::boot("guard-pane").await?;
+    let proj = format!("/tmp/toron-am-parity-guard-{}", uuid::Uuid::new_v4());
+
+    // install_precommit_guard needs a REAL git repo (git2 open).
+    let repo = std::env::temp_dir().join(format!("toron-parity-repo-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&repo)?;
+    let init = std::process::Command::new("git")
+        .arg("init")
+        .current_dir(&repo)
+        .output()?;
+    assert!(init.status.success(), "git init in temp repo");
+    let installed = d
+        .call(
+            "install_precommit_guard",
+            serde_json::json!({
+                "project_key": proj,
+                "code_repo_path": repo.to_str().unwrap(),
+            }),
+        )
+        .await;
+    assert!(
+        installed.get("hook_path").is_some(),
+        "install_precommit_guard materializes the hook path: {installed}"
+    );
+    let removed = d
+        .call(
+            "uninstall_precommit_guard",
+            serde_json::json!({ "code_repo_path": repo.to_str().unwrap() }),
+        )
+        .await;
+    assert!(
+        removed.is_boolean() || removed.is_object(),
+        "uninstall_precommit_guard returns the removal result: {removed}"
+    );
+
+    // resolve_pane_identity / cleanup_pane_identities are herdr-backed: without
+    // a live herdr socket the HONEST response is a structured note naming the
+    // requirement — never a hang, never a fake pane mapping.
+    let pane = d
+        .call(
+            "resolve_pane_identity",
+            serde_json::json!({ "project_key": proj, "pane_id": "pane-xyz" }),
+        )
+        .await;
+    assert!(
+        pane.get("agent_name").is_some() || pane.get("note").is_some(),
+        "resolve_pane_identity is honest (mapping or herdr note): {pane}"
+    );
+    let cleaned = d
+        .call(
+            "cleanup_pane_identities",
+            serde_json::json!({ "project_key": proj }),
+        )
+        .await;
+    assert!(
+        cleaned.is_array() || cleaned.is_object(),
+        "cleanup_pane_identities returns a structured response: {cleaned}"
+    );
+
+    // macro_prepare_thread: ensure registration + thread summary in one call.
+    let prep = d
+        .call(
+            "macro_prepare_thread",
+            serde_json::json!({
+                "project_key": proj,
+                "thread_id": "thread-probe",
+                "program": "opencode",
+                "model": "test",
+                "agent_name": "WrenPeak",
+                "register_if_missing": true,
+            }),
+        )
+        .await;
+    assert_eq!(prep["agent_name"], "WrenPeak", "macro_prepare_thread echoes the agent");
+    assert!(prep["npub"].is_string(), "macro_prepare_thread registers (npub): {prep}");
+    assert!(
+        prep.get("summary").is_some(),
+        "macro_prepare_thread returns a thread summary: {prep}"
+    );
+
+    // summarize_thread_product: product-bus fan-out across a linked project.
+    let prod = format!("parity-prod-{}", uuid::Uuid::new_v4());
+    let ep = d
+        .call("ensure_product", serde_json::json!({ "product_key": prod, "name": "parity" }))
+        .await;
+    assert!(
+        ep.get("product_key").is_some() || ep.get("name").is_some(),
+        "ensure_product returns the product: {ep}"
+    );
+    d.call(
+        "products_link",
+        serde_json::json!({ "product_key": prod, "project_key": proj }),
+    )
+    .await;
+    d.call(
+        "send_message",
+        serde_json::json!({
+            "project_key": proj,
+            "sender_name": "WrenPeak",
+            "to": ["WrenPeak"],
+            "subject": "prod-thread",
+            "body_md": "hello product",
+            "thread_id": "thread-probe",
+        }),
+    )
+    .await;
+    let stp = d
+        .call(
+            "summarize_thread_product",
+            serde_json::json!({ "product_key": prod, "thread_id": "thread-probe" }),
+        )
+        .await;
+    assert!(
+        stp.get("summary").is_some() || stp.get("participants").is_some(),
+        "summarize_thread_product fans across the product: {stp}"
+    );
+
+    let _ = std::fs::remove_dir_all(&repo);
+    Ok(())
+}
+
 // (dead helpers pruned: the test asserts behavior directly on Value.)

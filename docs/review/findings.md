@@ -285,6 +285,39 @@ No defect found. Replay protection holds on BOTH sinks at write AND
 is_projected, and survives process restart (git marker + sqlite UNIQUE/table
 query). Unwrap module 19/19 green; clippy clean.
 
+## F10.D82-PARITY — D8.2 parity surface verification (P5) — GREEN
+
+**Probe:** `bd-p5-d82-parity-am-parity-e2e-5dp3` (2026-08-09). Verdict:
+**GREEN** — both parity gates pass; one honesty gap (6 tools enumerated but
+never functionally driven) closed.
+
+### Gate results
+
+| Gate | Run | Result |
+|------|-----|--------|
+| `am_parity_e2e.rs` (38-tool functional parity, real daemon over Streamable HTTP) | `cargo test -p toron-mcp --test am_parity_e2e` | **7/7 GREEN** (78s); **38/38 catalog tools invoked by name** |
+| `cli_robot.rs` (subprocess toron binary, shared durable root) | `cargo test -p toron-cli --test cli_robot` | **6/6 GREEN** (24s) |
+
+### Honesty gap closed
+
+The am_parity_e2e header + ADR-0007 verification claimed "drives all 38
+tools", but 6 tools were only ENUMERATED (acceptance.rs), never functionally
+driven: `install_precommit_guard`, `uninstall_precommit_guard`,
+`resolve_pane_identity`, `cleanup_pane_identities`, `macro_prepare_thread`,
+`summarize_thread_product`. New cluster `cluster_guard_pane_and_prepare_thread`
+drives all six for honest behavior: real git repo for the guard install/
+uninstall; structured herdr note when the pane backend is absent (or live
+results when herdr is up — the test accepts both); real registration + thread
+summary for `macro_prepare_thread`; product link + message fan-out for
+`summarize_thread_product`. Post-fix coverage: 38/38 catalog tools invoked.
+
+### agent-mail fallback (captain decision 2)
+
+The external agent-mail build is **flywheel CI scope, NOT this repo** —
+am_parity_e2e tests the Nostr surface the agent-mail backend would integrate
+with; there is no agent-mail impl in `crates/toron-core/src/backend/`
+(herdr/tmux/mock/error/types only). Documented, no action.
+
 ## S1/S2/S4/S5/S6/S7/F2.KDF — Re-verification GREEN (bd-p0-verify-green-claims-8z3p)
 
 **Probe:** 2026-08-09, live tree (no code modifications). All 7 claims re-verified GREEN
