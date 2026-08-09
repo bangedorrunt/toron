@@ -87,28 +87,46 @@ impl Mailbox {
             .index_pool()
             .ok_or_else(|| anyhow::anyhow!("no index pool attached (Mailbox::with_index_pool)"))?;
 
-        let mut sql = String::from(
-            "SELECT m.event_id, m.subject, m.sender, m.created_ts_us, m.importance, \
-                    m.ack_required, m.thread_id, m.body \
-             FROM messages m \
-             JOIN messages_fts f ON f.rowid = m.id \
-             WHERE messages_fts MATCH ?1 \
-               AND m.project_slug = ?2 \
-               AND m.deleted = 0",
-        );
-        let mut bind_id = 3i32;
-
-        // Build the parameter values as owned strings (sent as text).
-        // Sanitize: FTS5 treats `foo-bar` as column `foo` term `bar` → "no such
-        // column". Quote hyphenated tokens (bd-mail-actor / bead ids).
-        let query = sanitize_fts_query(&args.query);
-        let project = args.project_key.clone();
+        // An EMPTY query is invalid FTS5 ("syntax error near \"\"") and a bare
+        // `*` is not a valid match-all — skip the FTS join entirely when there
+        // is no text filter (thread-only / digest searches). Relevance ranking
+        // degrades to recency (nothing to score).
+        let empty_query = args.query.trim().is_empty();
+        let (mut sql, mut bind_id, mut params) = if empty_query {
+            (
+                String::from(
+                    "SELECT m.event_id, m.subject, m.sender, m.created_ts_us, m.importance, \
+                            m.ack_required, m.thread_id, m.body \
+                     FROM messages m \
+                     WHERE m.project_slug = ?1 \
+                       AND m.deleted = 0",
+                ),
+                2i32,
+                vec![args.project_key.clone()],
+            )
+        } else {
+            // Sanitize: FTS5 treats `foo-bar` as column `foo` term `bar` → "no such
+            // column". Quote hyphenated tokens (bd-mail-actor / bead ids).
+            let query = sanitize_fts_query(&args.query);
+            (
+                String::from(
+                    "SELECT m.event_id, m.subject, m.sender, m.created_ts_us, m.importance, \
+                            m.ack_required, m.thread_id, m.body \
+                     FROM messages m \
+                     JOIN messages_fts f ON f.rowid = m.id \
+                     WHERE messages_fts MATCH ?1 \
+                       AND m.project_slug = ?2 \
+                       AND m.deleted = 0",
+                ),
+                3i32,
+                vec![query, args.project_key.clone()],
+            )
+        };
         let since: Option<i64> = args.since_us;
         let until: Option<i64> = args.until_us;
 
         // Build a WHERE clause with placeholders and bind each in order.
         let mut filter_sql = String::new();
-        let mut params: Vec<String> = vec![query, project];
         if let Some(s) = args.sender_name.clone() {
             // The filter takes a NAME but the column stores the hex pubkey —
             // resolve through the agents table (per project). An unknown
@@ -147,6 +165,7 @@ impl Mailbox {
         sql.push_str(&filter_sql);
         match args.ranking.as_deref().unwrap_or("relevance") {
             "recency" => sql.push_str(" ORDER BY m.created_ts_us DESC, m.event_id ASC"),
+            _ if empty_query => sql.push_str(" ORDER BY m.created_ts_us DESC, m.event_id ASC"),
             _ => sql.push_str(" ORDER BY bm25(messages_fts), m.created_ts_us DESC"),
         }
         let limit = args.limit.unwrap_or(100).min(1000);
@@ -313,6 +332,54 @@ mod tests {
         );
         assert_eq!(sanitize_fts_query("foo AND bar"), "foo AND bar");
         assert_eq!(sanitize_fts_query("\"already-quoted\""), "\"already-quoted\"");
+    }
+
+    /// Regression: an EMPTY query is invalid FTS5 ("syntax error near """)
+    /// — thread-only / digest searches pass `query: ""` and must skip the
+    /// FTS join, not error. Recency ranking still applies.
+    #[tokio::test]
+    async fn test_search_empty_query_returns_thread_without_error() {
+        let (mailbox, db_path, data_dir) = test_mailbox("empty-fts").await;
+        seed(
+            &mailbox,
+            "demo",
+            "e-q1",
+            "question one",
+            "ask",
+            "urgent",
+            Some("collab-t1"),
+            1_700_000_000_000_200,
+        )
+        .await;
+        seed(
+            &mailbox,
+            "demo",
+            "e-r1",
+            "Re: question one",
+            "reply",
+            "normal",
+            Some("collab-t1"),
+            1_700_000_000_000_300,
+        )
+        .await;
+        let hits = mailbox
+            .search_messages(&SearchMessages {
+                project_key: "demo".into(),
+                query: String::new(), // thread-only search
+                thread_id: Some("collab-t1".into()),
+                ranking: Some("recency".into()),
+                limit: Some(10),
+                ..Default::default()
+            })
+            .await
+            .expect("empty query must not SQL-error");
+        assert_eq!(hits.len(), 2, "both thread messages returned");
+        assert_eq!(
+            hits[0].id, "e-r1",
+            "recency ranking: newest first (empty query, no FTS score)"
+        );
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
     }
 
     #[tokio::test]
