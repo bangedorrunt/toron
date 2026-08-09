@@ -191,6 +191,27 @@ flywheel's local `MailBackend` trait is DELETED; both backends implement
   accepted-and-ignored gap (F11 residual) is GONE from the shared surface — the
   superset trait is paths-only; ids were never honored on either backend.
 
+### 9b. S9 flywheel boundary — historical FAIL → RESOLVED (ADR-0007 se2.3, 2026-08-09)
+
+ADR-0007 ledger S9 ("Nostr is AM superset at the flywheel trait") recorded
+**FAIL (AM-shaped trait)** at round-1: flywheel's local `MailBackend` was
+AM-shaped (`u64` ids at the boundary), forcing toron into the u64 world.
+
+**RESOLVED 2026-08-09 (se2.3):** the flywheel-local `MailBackend` trait is
+**DELETED** (D2, not dual-lived); `ToronMailBackend` + `AgentMailBackend` both
+implement `toron_core::mailbox::surface::MailSurface` (async, `&self`,
+`MessageId` **String** ids, machine-coded `MailError`). The superset (D8.1) is
+typed end-to-end; there is no u64 id coercion at the flywheel mail edge today
+(verified: no id-related `u64`/`as u64` in flywheel `backend/factory.rs` +
+`backend/toron.rs`; `MessageId` is String-native on both backends).
+
+**Residual integration seam (ADR-0009 candidate):** any future coercion at the
+flywheel edge (e.g. re-introducing numeric ids for AM-legacy interop) is a
+follow-on charter, **out of scope for ADR-0008** — this repo is toron-only
+(captain decision 3: flywheel boundary documented, NOT edited). Per the S9
+soundness note: the contract is per-backend round-trip (C5) — toron's own
+surface is correct on its own terms (S4 GREEN, all String).
+
 ---
 
 *Maintained by lane OC-C (BlackMarsh). Created 2026-08-07 from the bd-96a real-e2e probe
