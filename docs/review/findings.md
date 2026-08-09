@@ -83,6 +83,45 @@ freezes mid-batch (per-event event processing halts).
    `publish_coalesced_job` (both sites).
 3. REFACTOR: extract a `flush_and_publish` helper with the lock scope explicit.
 
+## F4.LOCK-ORDER — multi-lock deadlock ordering audit (P1) — GREEN
+
+**Probe:** `bd-p1-lock-ordering-deadlock-71po` (2026-08-09). Verdict: **GREEN — no
+deadlock cycle.** Lock-order graph documented below (bead deliverable; also the
+regression baseline for future multi-lock additions).
+
+### Method
+
+Brace-matched per-function scan of all `crates/*/src` (`fn` blocks ×
+`.lock()`/`.read()`/`.write()` sites) → 12 fns acquiring ≥2 distinct locks
+(7 test-code, 5 real). Lock-order edges built per fn; DFS cycle check over the
+graph. Result: **no cycle**.
+
+### Lock-order graph (documented order)
+
+| Lock pair | Sites (fn : line) | Acquisition pattern | Cycle risk |
+|-----------|-------------------|---------------------|------------|
+| `projected` → `archive` (GitProjectionSink) | `unwrap.rs::write` :379,383,391 | `projected` guards are temporaries (condition exprs / `insert` stmt); `archive` guard held across stage+commit; NEVER simultaneous | none (no reverse path exists) |
+| `policies` → `approved` (BusPolicySource) | `contacts.rs::load_many` :393,408; `contacts.rs::fmt` :361-362 | sequential write guards; `fmt` holds READ+READ simultaneously (shared+shared — never blocks) | none |
+| `per_tool` → `latency_hist` (MetricsRegistry) | `metrics.rs::snapshot` :109,121 | NESTED hold: `per_tool` guard held across loop, per-metric `latency_hist` temporary inside | none (only site acquiring both; `record()` :51 acquires `latency_hist` alone) |
+
+### Bead suspects disposition
+
+- mailbox holding bus + index lock: **absent** — bus publish is async (no lock);
+  index access is sqlx (no mutex). No multi-lock fn in `mailbox/mod.rs`.
+- workflow_host coalescer + bus: `coalescer` is acquired alone at both sites
+  (runner arm :156, tick flush :441) — never nested with another lock; the
+  blocking-publish hazard is the separate finding F3.COALESCER-LOCK.
+- reservations map + expiry: **single lock** — no ≥2-lock fn in
+  `reservations.rs` / `build_slots.rs`.
+- Siblings (engine.rs `seen_clone`/`seen`, git.rs test, unwrap.rs test
+  `archive` guards): test code, sequential/temporary — no production hazard.
+
+### Fix required
+
+None today. If a future change adds a second lock to a multi-lock fn, it MUST
+acquire in the documented order above (projected→archive, policies→approved,
+per_tool→latency_hist) or the graph cycle check re-runs.
+
 ## S1/S2/S4/S5/S6/S7/F2.KDF — Re-verification GREEN (bd-p0-verify-green-claims-8z3p)
 
 **Probe:** 2026-08-09, live tree (no code modifications). All 7 claims re-verified GREEN
