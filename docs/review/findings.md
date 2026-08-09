@@ -1394,3 +1394,41 @@ The script should automate, per crate, at CI:
 
 - Markers are comment-only (no compile-time enforcement) — the script closes
   the drift gap. No batch-fix candidates surfaced: the marker hygiene is clean.
+
+## F23.ADR-LINKS-SCRIPT — verify-adr-links.sh authored + wired (P6, bd-p6-verify-adr-links-script-xhi2)
+
+**Probe:** 2026-08-09. Verdict: **GREEN** — script exists, executable, wired,
+output clean on live tree (matches the F22.GOVERNED-BY enumeration: 0 gaps).
+
+### Deliverables
+
+1. `docs/decisions/_scripts/verify-adr-links.sh` (executable):
+   - **dangling check:** every `governed-by: ADR-XXXX` marker resolves to an
+     existing `docs/decisions/000N-*.md` (exit 1 on non-existent ADR).
+   - **missing-marker check:** every file with `#![forbid(unsafe_code)]`
+     (ADR-0003 constraint) must carry a `governed-by:` marker (exit 1 if not).
+   - **report-only:** files mentioning `ADR-000N` without a marker are listed
+     (informational; a future rule can tighten to fail).
+2. Wired into `scripts/verify-gates.sh` (step 4) — CI already runs that via
+   `.github/workflows/ci.yml:21` (`Verify ADR-0003 gates`), so the ADR-link
+   gate is now CI-enforced with zero new CI plumbing.
+3. Pre-commit option documented (repo uses `.sample` hooks only; CI is the
+   enforcement point — a pre-commit copy can be installed via the toron
+   `guard install` surface if operators want local enforcement).
+
+### TDD verification (RED → GREEN)
+
+- **RED:** injected `// governed-by: ADR-9999` fixture → script FAILED
+  ("references non-existent ADR-9999", exit 1). Injected marker-less
+  `#![forbid(unsafe_code)]` file → FAILED ("no governed-by marker"). Both
+  fixtures removed → GREEN.
+- **GREEN (live tree):** `bash scripts/verify-gates.sh` → `adr-links pass` +
+  `gates pass`, exit 0; all 138 markers valid (per F22 enumeration), 0
+  forbid-files unmarked, 0 ADR-mention files unmarked.
+
+### Notes
+
+- Root-path resolution: script sits at `docs/decisions/_scripts/`, resolves
+  repo root via `../../..`.
+- The AGENTS.md mandate ("verified by docs/decisions/_scripts/verify-adr-links.sh")
+  is now real and CI-enforced.
