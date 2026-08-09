@@ -908,7 +908,7 @@ impl ToolServer {
                     &args.project_key,
                     &args.agent_name,
                     &args.paths,
-                    args.ttl_seconds.map(|t| t as u64),
+                    nonneg_secs(args.ttl_seconds),
                     args.exclusive.unwrap_or(false),
                     args.reason.as_deref(),
                 )
@@ -933,7 +933,7 @@ impl ToolServer {
                     &args.project_key,
                     &args.agent_name,
                     &args.paths.clone().unwrap_or_default(),
-                    args.extend_seconds.unwrap_or(0) as u64,
+                    nonneg_secs(args.extend_seconds).unwrap_or(0),
                 )
                 .await,
         )
@@ -1087,7 +1087,7 @@ impl ToolServer {
                     &args.model,
                     args.task_description.as_deref(),
                     args.file_reservation_paths.as_deref(),
-                    args.file_reservation_ttl_seconds.map(|t| t as u64),
+                    nonneg_secs(args.file_reservation_ttl_seconds),
                     args.file_reservation_reason.as_deref(),
                     args.inbox_limit.map(|l| l as usize),
                 )
@@ -1177,7 +1177,7 @@ impl ToolServer {
                     &args.project_key,
                     &args.agent_name,
                     &args.paths,
-                    args.ttl_seconds.map(|t| t as u64),
+                    nonneg_secs(args.ttl_seconds),
                     args.exclusive.unwrap_or(false),
                     args.reason.as_deref(),
                     args.auto_release.unwrap_or(false),
@@ -1306,7 +1306,7 @@ impl ToolServer {
                     &args.project_key,
                     &args.agent_name,
                     &args.slot,
-                    args.ttl_seconds.map(|t| t as u64),
+                    nonneg_secs(args.ttl_seconds),
                     args.exclusive.unwrap_or(false),
                 )
                 .await,
@@ -1330,7 +1330,7 @@ impl ToolServer {
                     &args.project_key,
                     &args.agent_name,
                     &args.slot,
-                    args.extend_seconds.unwrap_or(0) as u64,
+                    nonneg_secs(args.extend_seconds).unwrap_or(0),
                 )
                 .await,
         )
@@ -1790,9 +1790,28 @@ fn generate_agent_name() -> String {
     )
 }
 
+/// Coerce an i64 AM-parity arg to u64 WITHOUT negative wrap (P2
+/// bd-p2-unwrap-or-zero-coercion-5ac3): `-1 as u64` = ~1.8e19 seconds — an
+/// astronomical lease/extend. Negative → `None` (default TTL / no extension).
+fn nonneg_secs(v: Option<i64>) -> Option<u64> {
+    v.and_then(|s| u64::try_from(s).ok())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nonneg_secs_rejects_negative_wrap() {
+        // P2 (bd-p2-unwrap-or-zero-coercion-5ac3): a negative i64 TTL/extend
+        // coerced with `as u64` wraps to ~1.8e19 seconds — an astronomical
+        // lease. Negative must become None (default TTL / no extension).
+        assert_eq!(nonneg_secs(Some(-1)), None);
+        assert_eq!(nonneg_secs(Some(-86_400)), None);
+        assert_eq!(nonneg_secs(None), None);
+        assert_eq!(nonneg_secs(Some(0)), Some(0));
+        assert_eq!(nonneg_secs(Some(3_600)), Some(3_600));
+    }
 
     #[test]
     fn generated_agent_name_is_adjective_noun() {

@@ -362,7 +362,7 @@ fn inbox_json(m: &toron_core::mailbox::InboxMessage) -> serde_json::Value {
 
 /// Messages sent by an agent (index scan by sender display name).
 async fn outbox_view(mailbox: &Mailbox, name: &str) -> Option<serde_json::Value> {
-    let hits = index_scan(
+    let hits = match index_scan(
         mailbox,
         "SELECT event_id, subject, sender, created_ts_us, importance, ack_required, thread_id, body \
          FROM messages WHERE sender = ?1 ORDER BY created_ts_us DESC, event_id ASC",
@@ -370,7 +370,14 @@ async fn outbox_view(mailbox: &Mailbox, name: &str) -> Option<serde_json::Value>
         50,
         false,
     )
-    .await;
+    .await
+    {
+        Ok(h) => h,
+        Err(e) => {
+            tracing::warn!(error = %e, "outbox_view index scan failed; resource not served");
+            return None;
+        }
+    };
     Some(serde_json::json!({ "agent": name, "messages": hits.into_iter().map(search_json).collect::<Vec<_>>() }))
 }
 
@@ -404,28 +411,34 @@ fn indexed_row(row: &sqlx::sqlite::SqliteRow, include_body: bool) -> toron_core:
 
 /// Direct `messages`-table scan (FTS5 MATCH has no match-all query, so the
 /// id/sender/thread/across-project projections bypass the FTS join).
+///
+/// Returns `Err` on a DB failure — a broken index must surface, not mask as
+/// an empty result set (P2 bd-p2-unwrap-or-zero-coercion-5ac3).
 async fn index_scan(
     mailbox: &Mailbox,
     sql: &str,
     params: &[&str],
     limit: usize,
     include_body: bool,
-) -> Vec<toron_core::mailbox::SearchMessage> {
+) -> Result<Vec<toron_core::mailbox::SearchMessage>, sqlx::Error> {
     let Some(pool) = mailbox.index_pool() else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
     let sql = format!("{sql} LIMIT {limit}");
     let mut q = sqlx::query(&sql);
     for p in params {
         q = q.bind(*p);
     }
-    let rows = q.fetch_all(pool).await.unwrap_or_default();
-    rows.iter().map(|r| indexed_row(r, include_body)).collect()
+    let rows = q.fetch_all(pool).await?;
+    Ok(rows
+        .iter()
+        .map(|r| indexed_row(r, include_body))
+        .collect())
 }
 
 /// One message by exact event id (index lookup; ids are globally unique).
 async fn message_view(mailbox: &Mailbox, id: &str) -> Option<serde_json::Value> {
-    let hits = index_scan(
+    let hits = match index_scan(
         mailbox,
         "SELECT event_id, subject, sender, created_ts_us, importance, ack_required, thread_id, body \
          FROM messages WHERE event_id = ?1 ORDER BY created_ts_us DESC",
@@ -433,13 +446,20 @@ async fn message_view(mailbox: &Mailbox, id: &str) -> Option<serde_json::Value> 
         1,
         true,
     )
-    .await;
+    .await
+    {
+        Ok(h) => h,
+        Err(e) => {
+            tracing::warn!(error = %e, "message_view index scan failed; resource not served");
+            return None;
+        }
+    };
     hits.into_iter().next().map(search_json)
 }
 
 /// Thread members by thread id (index lookup, chronological).
 async fn thread_view(mailbox: &Mailbox, id: &str) -> Option<serde_json::Value> {
-    let hits = index_scan(
+    let hits = match index_scan(
         mailbox,
         "SELECT event_id, subject, sender, created_ts_us, importance, ack_required, thread_id, body \
          FROM messages WHERE thread_id = ?1 ORDER BY created_ts_us ASC, local_seq ASC",
@@ -447,7 +467,14 @@ async fn thread_view(mailbox: &Mailbox, id: &str) -> Option<serde_json::Value> {
         200,
         false,
     )
-    .await;
+    .await
+    {
+        Ok(h) => h,
+        Err(e) => {
+            tracing::warn!(error = %e, "thread_view index scan failed; resource not served");
+            return None;
+        }
+    };
     if hits.is_empty() {
         return None;
     }
@@ -457,7 +484,7 @@ async fn thread_view(mailbox: &Mailbox, id: &str) -> Option<serde_json::Value> {
 /// Ack-required mail sent by an agent (index scan on `ack_required` +
 /// sender display name — the index stores senders, not recipients).
 async fn overdue_view(mailbox: &Mailbox, agent: &str) -> Option<serde_json::Value> {
-    let hits = index_scan(
+    let hits = match index_scan(
         mailbox,
         "SELECT event_id, subject, sender, created_ts_us, importance, ack_required, thread_id, body \
          FROM messages WHERE ack_required = 1 AND sender = ?1 ORDER BY created_ts_us DESC, event_id ASC",
@@ -465,7 +492,14 @@ async fn overdue_view(mailbox: &Mailbox, agent: &str) -> Option<serde_json::Valu
         500,
         false,
     )
-    .await;
+    .await
+    {
+        Ok(h) => h,
+        Err(e) => {
+            tracing::warn!(error = %e, "overdue_view index scan failed; resource not served");
+            return None;
+        }
+    };
     Some(serde_json::json!({ "agent": agent, "messages": hits.into_iter().map(search_json).collect::<Vec<_>>() }))
 }
 
@@ -897,6 +931,44 @@ mod tests {
 
         handle.abort();
         let _ = std::fs::remove_dir_all(&data_dir);
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// P2 (bd-p2-unwrap-or-zero-coercion-5ac3): a DB error in the index scan
+    /// must PROPAGATE, not mask as an empty result set (an operator seeing
+    /// "0 messages" while the DB is down is a silent-failure mask).
+    #[tokio::test]
+    async fn index_scan_db_error_propagates_not_masked() {
+        use toron_core::bus::in_process::{InProcessBus, InProcessBusConfig};
+        use toron_core::index::schema;
+        use std::sync::Arc;
+
+        let db = std::env::temp_dir().join(format!("res-index-scan-{}.sqlite", uuid::Uuid::new_v4()));
+        let pool = schema::connect(db.to_str().unwrap()).await.expect("pool");
+        schema::migrate(&pool).await.expect("migrate");
+        let bus = Arc::new(
+            InProcessBus::open(pool.clone(), InProcessBusConfig::default())
+                .await
+                .expect("bus"),
+        );
+        let data_dir = std::env::temp_dir().join(format!("res-index-scan-data-{}", uuid::Uuid::new_v4()));
+        let mailbox = toron_core::mailbox::Mailbox::new(bus, data_dir, None).with_index_pool(pool.clone());
+
+        pool.close().await; // break the index pool
+
+        let res = index_scan(
+            &mailbox,
+            "SELECT event_id, subject, sender, created_ts_us, importance, ack_required, thread_id, body \
+             FROM messages WHERE sender = ?1 ORDER BY created_ts_us DESC",
+            &["nobody"],
+            10,
+            false,
+        )
+        .await;
+        assert!(
+            res.is_err(),
+            "index scan DB error must propagate (not mask as empty): {res:?}"
+        );
         let _ = std::fs::remove_file(&db);
     }
 }
