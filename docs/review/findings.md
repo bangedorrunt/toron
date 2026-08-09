@@ -189,6 +189,35 @@ guard, none exists).
 8 tasks × 50 writes through the gate under a 30s bound + row-count assertion
 (400 landed). Green 3/3; writer module 5/5; clippy clean.
 
+## F7.ZERO-COERCION — unwrap_or(0) coercion audit (P2) — FIXED
+
+**Probe:** `bd-p2-unwrap-or-zero-coercion-5ac3` (2026-08-09). Verdict: **2 real
+hazards fixed; 65 benign; id-path (F3 residual) already clean.**
+
+### Count-conservation (67 sites audited = 67 classified)
+
+| Class | Count | Verdict |
+|-------|-------|---------|
+| Clock fallbacks (SystemTime pre-epoch, unreachable) — `now_us`/`now_ms`/`unix_now` (slots.rs:221, writer.rs:34, proof.rs:298, cron.rs:197, workflow_host.rs:242, index/projection.rs:90 ts_ms) | 6 | benign invariant |
+| Counter/lookup defaults (empty list/count = absent state) — dispatch.rs:117/128, coalesce.rs:357, engine.rs:149-157, channels.rs:176, engine.rs:660, unwrap.rs:467, resources.rs:584 | 10 | benign invariant |
+| Display/metadata fallbacks (Option<String> → "") — identity.rs:152-154/315, messaging.rs:298/671, mod.rs:348/357, unwrap.rs:476/501, surface.rs:183, herdr.rs:759, reservations.rs:404/468/545/882, blob.rs:67/139, product.rs:64/142, operator.rs:207/272/522/688, workflow.rs:84/108, main.rs:322, tools.rs:624/692/693/718/719/935/958, workflow_host.rs:92/121, guard.rs:161, infra.rs:97, blob_serve.rs:162, mock_relay.rs:135, channels.rs:176 | 30 | benign (serialization of String is infallible; absent tags = legit state) |
+| Test code | 5 | engine.rs:1541/1756 asserts, resources.rs:422 pin, proof.rs:383/630 fixtures | benign |
+| **Negative i64→u64 TTL wrap** — tools.rs:911/936/1090/1180/1309/1333 (`ttl_seconds`/`extend_seconds`/`file_reservation_ttl_seconds`) | 6 | **HAZARD — FIXED** via `nonneg_secs` helper (negative → None → default TTL / no-op extension); RED unit test `nonneg_secs_rejects_negative_wrap` |
+| **SQL error mask** — resources.rs:422 `index_scan` | 1 | **HAZARD — FIXED** (`Result` propagation + 4 views log + return None instead of fabricating empty); RED test `index_scan_db_error_propagates_not_masked` (closed-pool) |
+| id-path parse→0 (F3 residual) | 0 | already clean — no hex-id `parse().unwrap_or(0)` anywhere (F3/D8.2 landed) |
+| proof.rs:84 `expires_at.unwrap_or(0)` binding input | 1 | benign — None and Some(0) hash identically, but Some(0) is rejected at the expiry check (:242); no exploit path |
+| **Total** | **67** | 65 benign + 2 fixed |
+
+### Fixes
+
+1. `nonneg_secs(Option<i64>) -> Option<u64>` (tools.rs): `-1 as u64` ≈ 1.8e19 s
+   previously produced astronomical leases/extensions on renew+acquire
+   (reservations + build slots + file-reservation TTL). Negative → None →
+   default TTL (90d) or no-op extension.
+2. `index_scan` → `Result<Vec<SearchMessage>, sqlx::Error>`; outbox/message/
+   thread/overdue views log + return None on DB failure (resource not served)
+   instead of fabricating "0 messages" while the index is down.
+
 ## S1/S2/S4/S5/S6/S7/F2.KDF — Re-verification GREEN (bd-p0-verify-green-claims-8z3p)
 
 **Probe:** 2026-08-09, live tree (no code modifications). All 7 claims re-verified GREEN
