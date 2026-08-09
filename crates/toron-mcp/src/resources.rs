@@ -175,10 +175,14 @@ fn static_resource(uri: &str) -> Option<serde_json::Value> {
         "toron://tooling/metrics" => Some(serde_json::json!({"tools_called": 0, "errors": 0})),
         "toron://tooling/metrics_core" => Some(serde_json::json!({
             "http": "not started", "database": "not wired", "storage": "not wired",
+            // S8 honest-stub gate (Rev 1): placeholder fields MUST name the
+            // live tool that serves the real value (bd-p0-s8-resources-stub-gate-rrfz).
+            "status": "live via health_check / diagnostics tools",
         })),
-        "toron://tooling/schemas" => {
-            Some(serde_json::json!({"note": "see tools.schema.json fixtures"}))
-        }
+        "toron://tooling/schemas" => Some(serde_json::json!({
+            "note": "see tools.schema.json fixtures",
+            "status": "live via MCP tools/list schema introspection",
+        })),
         "toron://tooling/locks" => Some(serde_json::json!({"locks": []})),
         "toron://tooling/diagnostics" => Some(serde_json::json!({"health": "ok", "checks": []})),
         _ => None,
@@ -621,10 +625,101 @@ mod tests {
         ));
     }
 
+    /// The 7 static (non-template) tooling URIs served by [`static_resource`].
+    const STATIC_RESOURCE_URIS: &[&str] = &[
+        "toron://config/environment",
+        "toron://tooling/directory",
+        "toron://tooling/metrics",
+        "toron://tooling/metrics_core",
+        "toron://tooling/schemas",
+        "toron://tooling/locks",
+        "toron://tooling/diagnostics",
+    ];
+
     #[test]
     fn static_resources_serve_json() {
-        assert!(read_resource_value("toron://config/environment").is_some());
+        for uri in STATIC_RESOURCE_URIS {
+            assert!(
+                read_resource_value(uri).is_some(),
+                "static URI must serve non-None JSON: {uri}"
+            );
+        }
         assert!(read_resource_value("toron://bogus/uri").is_none());
+    }
+
+    /// S8 honest-stub gate (Rev 1 wording, bd-p0-s8-resources-stub-gate-rrfz):
+    /// EVERY static tooling stub whose fields are placeholders ("not wired",
+    /// "not started", "see …", "…") MUST carry a `status` field naming the
+    /// live tool that serves the real value. Placeholder strings without a
+    /// `status` field = RED.
+    #[test]
+    fn static_stubs_name_live_tool() {
+        let placeholder_marker = |s: &str| {
+            let l = s.to_ascii_lowercase();
+            l.contains("not wired")
+                || l.contains("not started")
+                || l.contains("see ")
+                || l.contains("tbd")
+                || l.contains("todo")
+                || l.contains("placeholder")
+        };
+        for uri in STATIC_RESOURCE_URIS {
+            let v = read_resource_value(uri)
+                .unwrap_or_else(|| panic!("static URI must resolve: {uri}"));
+            let obj = v.as_object().expect("static value is an object");
+            let has_placeholder = obj.values().any(|val| {
+                val.as_str().map(placeholder_marker).unwrap_or(false)
+            });
+            if has_placeholder {
+                let status = obj
+                    .get("status")
+                    .and_then(|s| s.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty());
+                assert!(
+                    status.is_some(),
+                    "S8 gate RED: {uri} has placeholder fields but no `status` naming the live tool: {obj:?}"
+                );
+            }
+        }
+    }
+
+    /// S8 gate (Rev 1): all 25 resource templates resolve to NON-EMPTY JSON —
+    /// either real static data or an honest discovery stub that names the
+    /// live tool. `{param}` slots are substituted with a sample value.
+    #[test]
+    fn all_25_resources_resolve_to_non_empty_json() {
+        fn concrete(template: &str) -> String {
+            // Substitute the first {param} with a sample value; remaining
+            // params get "demo" (all templates have ≤2 params).
+            let mut out = template.to_string();
+            for p in ["slug", "project", "key", "name", "id", "slot", "agent", "window_seconds"] {
+                out = out.replace(&format!("{{{p}}}"), "demo");
+            }
+            out.replace("{", "demo").replace("}", "")
+        }
+        assert_eq!(RESOURCES.len(), 25);
+        for (name, template, _) in RESOURCES {
+            let uri = concrete(template);
+            let v = read_resource_value(&uri)
+                .unwrap_or_else(|| panic!("{name}: {uri} must resolve"));
+            let non_empty = match &v {
+                serde_json::Value::Object(o) => !o.is_empty(),
+                serde_json::Value::Array(a) => !a.is_empty(),
+                _ => true,
+            };
+            assert!(non_empty, "{name}: {uri} resolves to empty JSON");
+            // Stub entries (not real static data) must name the live tool.
+            let obj = v.as_object().expect("object");
+            let is_stub = obj.get("status").is_some();
+            if is_stub {
+                let status = obj["status"].as_str().unwrap_or("").trim();
+                assert!(
+                    !status.is_empty(),
+                    "{name}: stub `status` must name the live tool"
+                );
+            }
+        }
     }
 
     /// ADR-0007 F10 / R4.4: data-backed resource URIs project LIVE mailbox +
@@ -748,6 +843,48 @@ mod tests {
             .await
             .expect("project projection");
         assert_eq!(project["slug"].as_str(), Some("demo"));
+
+        // reservations/{project} → project-scoped kind-30031 events (empty ok).
+        let reservations = project_resource_value(&mailbox, "toron://reservations/demo")
+            .await
+            .expect("reservations projection");
+        assert_eq!(
+            reservations["count"].as_u64(),
+            Some(0),
+            "no reservations registered"
+        );
+
+        // slots/{project} → project-scoped kind-30032 events (empty ok).
+        let slots = project_resource_value(&mailbox, "toron://slots/demo")
+            .await
+            .expect("slots projection");
+        assert_eq!(slots["count"].as_u64(), Some(0), "no slots leased");
+
+        // identity/{project} → the registered agents.
+        let identity = project_resource_value(&mailbox, "toron://identity/demo")
+            .await
+            .expect("identity projection");
+        assert_eq!(
+            identity.as_array().map(|a| a.len()),
+            Some(2),
+            "identity lists both registered agents"
+        );
+
+        // agents/{name}/outbox → the sent message (sender-side index scan).
+        let outbox = project_resource_value(&mailbox, "toron://agents/workflow-demo/outbox")
+            .await
+            .expect("outbox projection");
+        assert!(
+            outbox["messages"].as_array().map(|a| !a.is_empty()) == Some(true),
+            "outbox has the sent message"
+        );
+
+        // mailbox/{name} → health + inbox summary.
+        let mbx = project_resource_value(&mailbox, "toron://mailbox/BlueLake")
+            .await
+            .expect("mailbox projection");
+        assert_eq!(mbx["agent"].as_str(), Some("BlueLake"));
+        assert!(mbx["health"].is_object(), "health object present");
 
         // Static tooling URIs keep serving (no mailbox needed).
         assert!(

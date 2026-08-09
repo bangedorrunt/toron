@@ -8,6 +8,7 @@ reviewed and the captain approves.**
 |----|-------|------------------|-----------|----------|------|-----------|
 | F2.NIP40 | P0 crypto | `crates/toron-core/src/mailbox/unwrap.rs:602-656` (`UnwrapPipeline::project`) | NIP-40 `expiration` honored on unwrap ingest — expired gift wrap rejected BEFORE sqlite/git projection | **RED** — no TTL check exists | **P0 crypto** — expired-but-never-seen gift wrap is ACCEPTED + projected, voiding ADR-0003 "Parity Superiority" replay/expiry claim | TTL check in unwrap pipeline (parse `expiration` tag, reject-if-past pre-write). RED test `expired_gift_wrap_rejected_on_unwrap` first (see `bd-p3-nip40-expiration-fix-6ezx`) |
 | F3.COALESCER-LOCK | P1 concurrency | `crates/toron-mcp/src/workflow_host.rs:156-165` (runner FlushNow arm) + `:441-461` (trigger-loop tick flush) | std-Mutex guard on `MentionCoalescer` NOT held across the blocking publish (`publish_coalesced_job` → `thread::scope` + `rt.block_on(bus.publish)`) | **RED** — guard IS held across the publish; concurrent flush stalls for the publish duration (measured 498ms stall on 600ms publish) | **P1 stall** — any slow publish (relay latency/backpressure) freezes every other coalescer accessor (all `dispatch_job` actions + tick flushes) for the publish duration; poison risk (`expect`) covered by p1-poison-on-panic-audit | Drop the guard before publishing: clone the `Coalesced` under the lock, release, then publish. RED test `coalescer_lock_not_held_across_blocking_publish` authored + failing today |
+| F4.S8 | P0 gate | `crates/toron-mcp/src/resources.rs:163-186` (`static_resource`) | S8 honest-stub gate: every placeholder field names a live tool via `status`; all 25 resource URIs resolve to non-empty JSON | **FIXED** — Rev-1 gate tightened + enforced by tests (metrics_core + schemas placeholders lacked `status` → added) | low (honesty/documentation) | Gate now mechanical: placeholder ⇒ `status` required; 25-URI coverage tests (`static_stubs_name_live_tool`, `all_25_resources_resolve_to_non_empty_json`) |
 
 ## F2.NIP40 — NIP-40 expiration NOT honored on unwrap ingest path (P0)
 
@@ -143,3 +144,35 @@ engine/schema/lint/cron modules; the full toron-workflow lib suite (124 tests) i
 S4's dead `Vec<i64>` reservation-id selectors are tracked for the batch-fix pass (surface
 doc says ignored; candidates for removal or honest schema amendment), but they do not
 violate the S4 claim (the claim's three named args are String).
+
+## F4.S8 — S8 honest-stub gate tightened + 25-URI coverage (bd-p0-s8-resources-stub-gate-rrfz)
+
+**Probe:** 2026-08-09. Verdict: **FIXED in bead** (gate ambiguity resolved; 2 placeholders
+lacking `status` found and repaired).
+
+### Evidence (Rev-1 gate wording applied to resources.rs)
+
+1. **`static_resource` (resources.rs:163-186)** serves 7 static tooling URIs.
+   - `metrics_core` (`toron://tooling/metrics_core`): fields `"http": "not started"`,
+     `"database": "not wired"`, `"storage": "not wired"` — honest values BUT **no `status`
+     field naming the live tool** → RED under the Rev-1 gate (the charter's old
+     "honest structured stub" wording let it pass without a rule).
+   - `schemas` (`toron://tooling/schemas`): `{"note": "see tools.schema.json fixtures"}`
+     — placeholder pointer **without `status`** → RED under the Rev-1 gate.
+2. Data-backed templates (18) + discovery stubs already carry `status: live_via_tools`
+   naming the live tools (`list_agents`, `fetch_inbox`, `search_messages`,
+   `health_check`, …) → compliant.
+
+### Fix (in this bead)
+
+- `metrics_core` → `"status": "live via health_check / diagnostics tools"` (honest: the
+  values stay "not wired" — the stub names the live path, per oc A1.2 honesty-over-cosmetics).
+- `schemas` → `"status": "live via MCP tools/list schema introspection"`.
+- Gate enforced by tests: `static_stubs_name_live_tool` (placeholder ⇒ `status` required),
+  `all_25_resources_resolve_to_non_empty_json` (all 25 templates → non-empty JSON, stubs
+  name the live tool), `static_resources_serve_json` extended to all 7 static URIs,
+  `data_backed_resources_project_mailbox_data` extended to reservations/slots/identity/
+  outbox/mailbox projections.
+- Result: 8/8 resources tests green; toron-mcp acceptance 5/5 green (245s; first run had a
+  flaky failure, clean re-run).
+- No remaining placeholder without a `status` field; nothing faked to look real.
