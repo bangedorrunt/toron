@@ -8,6 +8,7 @@
 //! wire-identical across both.
 
 pub mod addressable;
+pub mod common;
 pub mod event_store;
 pub mod federation;
 pub mod filter;
