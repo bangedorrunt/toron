@@ -1343,3 +1343,54 @@ closure time. Verdict: **GREEN — coverage proves the ADR claims; 1 doc-drift g
 **Epic verdict: GREEN — the suite proves the ADR-0003/0005 claims. Residuals:
 oc2 A2.6 doc-drift (stale gate comments on sc16-24) + sc21 load-flake — both
 non-blocking, tracked (bd-p6-doc-drift, batch).**
+
+## F22.GOVERNED-BY — governed-by marker enumeration (P6, bd-p6-governed-by-enumeration-lsym)
+
+**Probe:** 2026-08-09. Hand-run enumeration seeding `p6-verify-adr-links-script`.
+Verdict: **GREEN** — 138 markers / 129 files, all referencing existing ADRs; no
+missing markers on ADR-implementing src files; the script's automation baseline.
+
+### Marker inventory (by ADR × crate)
+
+| ADR | Total markers | Files | By crate (files) |
+|-----|---------------|-------|------------------|
+| ADR-0003 | 106 | 105 | toron-core 56 · toron-e2e 22 · toron-cli 12 · toron-workflow 8 · toron-mcp 7 |
+| ADR-0004 | 13 | 12 | toron-workflow 5 · toron-core 3 · toron-cli 3 · toron-mcp 1 |
+| ADR-0005 | 13 | 13 | toron-e2e 10 · toron-workflow 2 · toron-cli 1 |
+| ADR-0006 | 2 | 1 | toron-mcp 1 |
+| ADR-0007 | 4 | 4 | toron-core 4 |
+| ADR-0001 | 0 | 0 | (project foundation — crate code is governed by later ADRs) |
+| ADR-0002 | 0 | 0 | (backend trait design — superseded by ADR-0005 P1 unification) |
+| ADR-0008 | 0 | 0 | (review charter — governs the review, not shipped code) |
+
+### Checks (per bead method)
+
+1. **grep `// governed-by: ADR-` across crates/*/src + crates/*/tests** — 138
+   markers in 129 files. Distribution: ADR-0003 dominates (106) as the mailbox
+   fabric spec; 0004/0005/0006/0007 cover hardening + orchestration + blob +
+   post-impl layers.
+2. **Every ADR-implementing file has a marker?** — 0 src files mention `ADR-`
+   without a `governed-by` marker (89 src files scanned); all 5 crate roots
+   (lib.rs/main.rs) carry markers; 0 files with `#![forbid(unsafe_code)]`
+   (ADR-0003 requirement) lack a marker. No missing markers found in src.
+   Test files: 129/138 markers include tests — coverage consistent.
+3. **Every marker references an existing ADR?** — 0 dangling refs (all markers
+   ∈ {0003..0007}; nothing references non-existent ADR-0009+). ADR-0001/0002
+   legitimately marker-free (foundation/superseded), ADR-0008 is the charter.
+
+### Script-seeding data (for bd-p6-verify-adr-links-script-xhi2)
+
+The script should automate, per crate, at CI:
+- `rg -c "governed-by: ADR-"` per file → 0 on any file that mentions `ADR-` in a
+  `// governed-by:`-relevant position (or per ADR-0003 rule: any file with
+  `#![forbid(unsafe_code)]` must carry a marker).
+- Dangling check: `rg -o "governed-by: ADR-\d+"` → every number must resolve to
+  `docs/decisions/000N-*.md` existing.
+- The verify script itself is `docs/decisions/_scripts/verify-adr-links.sh` per
+  ADR-0008 (see that ADR's Implementation Blueprint); this bead seeds its
+  expected inventory.
+
+### Notes
+
+- Markers are comment-only (no compile-time enforcement) — the script closes
+  the drift gap. No batch-fix candidates surfaced: the marker hygiene is clean.
