@@ -446,6 +446,23 @@ PASSES — all three populations reconcile; no unclassified prod site.**
   landed fixes + new tests; the R8 baseline re-run (`bd-baseline-rerun-zqtm`)
   re-baselines pre-batch. P2 leaves certified complete.
 
+## P2 Error-Handling + Id Discipline — EPIC VERDICT (bd-p2-error-id-zp3o, 2026-08-09)
+
+All 6 P2 leaves closed. Aggregate:
+
+| Leaf | Verdict | Finding | Disposition |
+|------|---------|---------|-------------|
+| unwrap-or-zero-coercion (F7) | **2 hazards FIXED inline** | negative i64→u64 TTL wrap at 6 tools.rs sites → `nonneg_secs`; `index_scan` SQL-error mask → Result propagation | fixed |
+| silent-result-drop (F2) | **31/31 classified; 4 ACCIDENTAL** | `let _ =` silent-failure sites: relay_bus.rs:111, reservations.rs:409/573/574 | 4 sites → fix in `bd-batch-fix-pass-mip4` |
+| unwrap-expect-classify (F5) | **GREEN** | prod 14 unwrap + 69 expect all invariant-true by class; 0 batch candidates | verified |
+| id-type-end-to-end (F4) | **GREEN after fix** | all MCP args/responses String/hex; dead `file_reservation_ids: Vec<i64>` selectors REMOVED (08b642d); 2 regression pins | fixed + pinned |
+| error-enum-discipline (F12) | **GREEN** | thiserror consistent (5 enums); machine-code errors intentional; 0 Box<dyn Error>; polish notes only | verified |
+| count-conservation (F13) | **GATE PASSES** | 219/984/67 populations reconcile; 0 unclassified prod site; R8 re-baseline owned by bd-baseline-rerun-zqtm | certified |
+
+**Batch-fix candidates wired into `bd-batch-fix-pass-mip4`:** the 4
+ACCIDENTAL silent-drops (F2) alongside the P1 REDs (F3.COALESCER-LOCK,
+F1.LAG-SWALLOW).
+
 ## S1/S2/S4/S5/S6/S7/F2.KDF — Re-verification GREEN (bd-p0-verify-green-claims-8z3p)
 
 **Probe:** 2026-08-09, live tree (no code modifications). All 7 claims re-verified GREEN
