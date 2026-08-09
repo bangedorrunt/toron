@@ -1691,4 +1691,161 @@ mod tests {
         drop(archive);
         let _ = std::fs::remove_dir_all(&root);
     }
+
+    /// G11 / bd-p3-projection-atomicity-rtjz: the per-project routing sink
+    /// writes each mail under `{data_dir}/{project_slug}/messages/...`, and
+    /// `is_projected` is project-scoped (recipient → slug via the map).
+    #[tokio::test]
+    async fn project_git_sink_routes_by_project_and_dedups() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "toron-projgit-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let recipient = keys();
+        let slug = "demo";
+        let projects: HashMap<String, String> =
+            [(recipient.public_key().to_hex(), slug.to_string())]
+                .into_iter()
+                .collect();
+        let sink = ProjectGitProjectionSink::for_mailbox(data_dir.clone(), projects);
+        let pipeline = UnwrapPipeline::new(vec![recipient.clone()], Arc::new(AutoPolicy), Arc::new(sink));
+
+        let sender = keys();
+        let wrap = wrap_for(&sender, &recipient, 1_700_000_000).await;
+        let outcome = pipeline.project(&wrap).await;
+        assert_eq!(outcome, ProjectOutcome::Projected, "mail projected");
+
+        // Archive root is per-project: {data_dir}/demo/messages/{YYYY}/{MM}/*.json
+        let messages_root = data_dir.join(slug).join("messages");
+        let json_files = walk_json(&messages_root);
+        assert_eq!(
+            json_files.len(),
+            1,
+            "exactly one canonical file under {}",
+            messages_root.display()
+        );
+
+        // Dedup: same mail → Duplicate (marker on disk under the project root).
+        let outcome2 = pipeline.project(&wrap).await;
+        assert_eq!(
+            outcome2,
+            ProjectOutcome::Duplicate,
+            "per-project marker dedups re-delivery"
+        );
+        assert_eq!(
+            walk_json(&messages_root).len(),
+            1,
+            "no second canonical file on re-delivery"
+        );
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// G11 / bd-p3-projection-atomicity-rtjz: dual-sink ordering — git FIRST.
+    /// A failing git leg fails the whole write (nothing marked projected); a
+    /// failing sqlite leg after a successful git write still counts as
+    /// projected (archive = canonical) and `is_projected` stays false so a
+    /// re-delivery heals the index.
+    #[tokio::test]
+    async fn dual_sink_git_failure_blocks_and_sqlite_failure_heals() {
+        use crate::index::schema;
+
+        let recipient = keys();
+        let sender = keys();
+        let wrap = wrap_for(&sender, &recipient, 1_700_000_000).await;
+        let mail = UnwrappedMail {
+            recipient: recipient.public_key(),
+            sender: sender.public_key(),
+            rumor: gift_wrap::unwrap(&recipient, &wrap).expect("unwrap").rumor,
+            rumor_id: wrap.id,
+            wrap_event_id: wrap.id,
+            created_at: wrap.created_at,
+        };
+        let key = DedupKey::of(&recipient.public_key(), &mail.rumor_id);
+
+        // ---- case 1: git leg fails -> write Err, nothing projected ----
+        let failing_git = FailSink::new();
+        let db = std::env::temp_dir().join(format!("dual-sink-{}.sqlite", uuid::Uuid::new_v4()));
+        let pool = schema::connect(db.to_str().unwrap()).await.expect("pool");
+        schema::migrate(&pool).await.expect("migrate");
+        let sqlite: Arc<dyn ProjectionSink> = Arc::new(SqliteProjectionSink::new(pool.clone()));
+        let dual = DualProjectionSink::new(
+            Arc::new(FailSink::new()),
+            sqlite.clone(),
+        );
+        let res = dual.write(&mail, 1).await;
+        assert!(res.is_err(), "git failure must fail the whole write");
+
+        // ---- case 2: sqlite leg fails after git ok -> Ok(true), healable ----
+        let git_root = temp_archive("dual-git-ok");
+        let git_ok: Arc<dyn ProjectionSink> =
+            Arc::new(GitProjectionSink::open(&git_root).expect("git sink"));
+        let failing_sqlite: Arc<dyn ProjectionSink> = Arc::new(FailSink::new());
+        let dual2 = DualProjectionSink::new(git_ok.clone(), failing_sqlite.clone());
+        let written = dual2.write(&mail, 1).await.expect("write");
+        assert!(written, "archive write counts as projected despite index failure");
+        // is_projected = AND: git has it, sqlite (failing) reports not-projected
+        // -> composite reports NOT projected, so a re-delivery heals.
+        assert!(
+            !dual2.is_projected(&key).await.expect("is_projected"),
+            "partial (git-only) projection must read as not-yet-projected"
+        );
+        // Heal: swap in the real sqlite sink; re-write; now fully projected.
+        let dual3 = DualProjectionSink::new(git_ok.clone(), sqlite.clone());
+        let healed = dual3.write(&mail, 1).await.expect("heal write");
+        assert!(
+            healed,
+            "heal write: git leg idempotent (false) OR sqlite leg inserted (true)"
+        );
+        assert!(
+            dual3.is_projected(&key).await.expect("is_projected"),
+            "after heal, both stores have it -> projected"
+        );
+
+        let _ = std::fs::remove_dir_all(&git_root);
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// A sink that always fails — for dual-sink failure-semantics tests.
+    struct FailSink;
+
+    impl FailSink {
+        fn new() -> Self {
+            FailSink
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ProjectionSink for FailSink {
+        async fn is_projected(&self, _key: &DedupKey) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+
+        async fn write(&self, _mail: &UnwrappedMail, _local_seq: u64) -> anyhow::Result<bool> {
+            Err(anyhow::anyhow!("fail sink"))
+        }
+    }
+
+    /// Collect every `*.json` under `messages/` (recursive).
+    fn walk_json(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut out = Vec::new();
+        let Ok(years) = std::fs::read_dir(root) else {
+            return out;
+        };
+        for year in years.flatten() {
+            let Ok(months) = std::fs::read_dir(year.path()) else {
+                continue;
+            };
+            for month in months.flatten() {
+                let Ok(entries) = std::fs::read_dir(month.path()) else {
+                    continue;
+                };
+                for e in entries.flatten() {
+                    if e.path().extension().map(|x| x == "json") == Some(true) {
+                        out.push(e.path());
+                    }
+                }
+            }
+        }
+        out
+    }
 }

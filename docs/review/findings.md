@@ -892,3 +892,63 @@ confident message on an I/O/external-input path found.** The F5.POISON class (`.
   failure — that is the assertion mechanism).
 - Known sibling findings touched: F3.COALESCER-LOCK (batch-fix), F5.POISON (fixed),
   F7.ZERO-COERCION (fixed). No new risk sites surfaced by this classification.
+
+## F4.G11 — Projection sink ordering + atomicity (P3, bd-p3-projection-atomicity-rtjz)
+
+**Probe:** 2026-08-09. Verdict: **RED → FIXED** — production mail never reached the
+Git archive; the ADR-0003 G11 "either alone rebuilds" posture was paper.
+
+### Findings table (ordering + failure semantics)
+
+| Question | Answer (pre-fix) | Evidence |
+|----------|------------------|----------|
+| Sink invocation order (sqlite vs git) | **SQLite ONLY** — `GitProjectionSink` never constructed outside tests; all 9 constructions in unwrap.rs `mod tests` (944-1336) | mailbox/mod.rs:358-368 `build_unwrap_pipeline` → `SqliteProjectionSink` (+ optional `TriggerNotifySink`) |
+| Production git-archive mail writes | **ZERO** — `MailRecord::archive_to` called only from tests (rebuild.rs:317, operator.rs:895/1093, sc14a e2e); `record_transition` (reservations.rs:560-577) writes `.audit/` reservation transitions only, fire-and-forget `let _ =` | grep of all `archive_to`/`stage_file` call sites |
+| bus_events vs messages | **SAME FILE** — `InProcessBus::open(pool.clone())` + `with_index_pool(pool)` on one index.sqlite (server.rs:307-310) | server.rs + index/schema.rs (both tables in one db) |
+| sqlite-ok + git-fail | Not reachable pre-fix (no git leg); post-fix: git-first so the write FAILS wholesale — nothing marked projected, re-delivered on restart | `DualProjectionSink::write` git leg `?` |
+| git-ok + sqlite-fail | Post-fix: canonical mail IS durably archived; `Ok(true)` + warn; `is_projected` = AND → re-delivery heals the sqlite leg | `DualProjectionSink` is_projected/write |
+| "Either alone rebuilds" (G11) | **FALSE pre-fix**: SQLite loss = total mail loss (git archive empty; bus_events in the same file) | rebuild.rs:9-17 claim vs live wiring |
+
+### Root cause
+
+`build_unwrap_pipeline` (mailbox/mod.rs:358-368) was written SQLite-only since the
+unwrap loop landed (git history: no `GitProjectionSink` in mod.rs ever, only exports).
+`GitProjectionSink` (bd-led.4.4, 65d0964) was built + unit-tested but never wired into
+the production sink chain. The DR claim "Git archive holds the unwrapped canonical
+mail permanently" (rebuild.rs:9-11) had no producer.
+
+### Fix (TDD, RED → GREEN)
+
+1. **RED** `unwrap_loop_projects_mail_to_both_sqlite_and_git_archive` (mailbox/mod.rs
+   tests): production loop → assert sqlite `messages` count == 1 AND
+   `{data_dir}/demo/messages/{YYYY}/{MM}/*.json` exists. Failed pre-fix (0 files).
+2. **GREEN**:
+   - `ProjectGitProjectionSink` (unwrap.rs): per-project archive routing
+     (`{data_dir}/{slug}` via the npub→slug map the sqlite sink already uses);
+     project-scoped `.projected/{id}.marker` dedup; lazy per-project archive cache.
+   - `DualProjectionSink` (unwrap.rs): git FIRST (canonical), then sqlite (index).
+     Git failure → Err (nothing projected, re-delivered on restart). Sqlite failure
+     after git → Ok(true) + warn (archive = source of truth; index heals via
+     re-delivery or `doctor reconstruct`). `is_projected` = AND of both stores.
+   - Wired in `build_unwrap_pipeline` (mailbox/mod.rs:358-372).
+3. Unit tests: `project_git_sink_routes_by_project_and_dedups` (per-project root +
+   marker dedup), `dual_sink_git_failure_blocks_and_sqlite_failure_heals` (both
+   failure arms + heal).
+
+### Verify
+
+- toron-core lib 345 passed / 2 failed — both pre-existing on clean tree
+  (`test_broadcast_lag_is_surfaced_not_swallowed` F3.COALESCER-LOCK batch-deferred;
+  `nip09_delete_tombstones_projected_message` F19.NIP09, concurrent bead's RED).
+- New tests: `unwrap_loop_projects_mail_to_both_sqlite_and_git_archive` GREEN,
+  `project_git_sink_*` + `dual_sink_*` GREEN.
+- conformance 5/5, sc14a DR rebuild GREEN (rebuild-from-git now has a producer),
+  sc2 direct mail GREEN, workspace check clean, clippy clean for the new code.
+
+### Notes
+
+- Unregistered recipients (no slug in the npub→slug map) skip the git leg; the
+  sqlite leg still indexes, and `doctor reconstruct` is the backstop (an
+  unregistered recipient has no project root by definition).
+- Existing `projection_differential_bus_git_sqlite_agree` (P5) still passes — the
+  three projections agree bar-for-bar.

@@ -62,9 +62,9 @@ pub use reservations::{
 };
 pub use search::{SearchMessage, SearchMessages, ThreadSummary};
 pub use unwrap::{
-    AckCache, AutoPolicy, ContactPolicy, DedupKey, FixedPolicy, GitProjectionSink, PolicySource,
-    ProjectOutcome, ProjectionSink, SqliteProjectionSink, TriggerNotifySink, UnwrapPipeline,
-    UnwrappedMail, order_by_rumor_time,
+    AckCache, AutoPolicy, ContactPolicy, DedupKey, DualProjectionSink, FixedPolicy,
+    GitProjectionSink, PolicySource, ProjectGitProjectionSink, ProjectOutcome, ProjectionSink,
+    SqliteProjectionSink, TriggerNotifySink, UnwrapPipeline, UnwrappedMail, order_by_rumor_time,
 };
 
 /// Mailbox context: the bus every tool publishes to + the on-disk project
@@ -357,14 +357,25 @@ impl Mailbox {
         .unwrap_or_default();
         let sqlite: Arc<dyn ProjectionSink> = Arc::new(
             SqliteProjectionSink::new(pool.clone())
-                .with_projects(npub_to_project)
+                .with_projects(npub_to_project.clone())
                 .with_names(npub_to_name),
         );
+        // G11 (bd-p3-projection-atomicity-rtjz): the production projection
+        // writes BOTH recovery stores — the per-project Git archive (canonical
+        // system of record; `doctor reconstruct` rebuilds from it) AND the
+        // SQLite index. Git first: a git failure fails the whole write so the
+        // archive never diverges from a "projected" claim; sqlite failure
+        // after git success heals via re-delivery/rebuild.
+        let git: Arc<dyn ProjectionSink> = Arc::new(ProjectGitProjectionSink::for_mailbox(
+            self.data_dir.clone(),
+            npub_to_project,
+        ));
+        let dual: Arc<dyn ProjectionSink> = Arc::new(DualProjectionSink::new(git, sqlite));
         // ADR-0007 R3: wrap with TriggerNotifySink when the host subscribed
         // a post-unwrap channel (message_posted workflows).
         let sink: Arc<dyn ProjectionSink> = match &self.trigger_tx {
-            Some(tx) => Arc::new(TriggerNotifySink::new(sqlite, tx.clone())),
-            None => sqlite,
+            Some(tx) => Arc::new(TriggerNotifySink::new(dual, tx.clone())),
+            None => dual,
         };
         let mut pipeline = UnwrapPipeline::new(keys, source, sink);
         if let Some(op) = &self.operator {
@@ -396,8 +407,38 @@ mod tests {
     use crate::index::schema;
     use crate::nostr::identity::AgentProfile;
 
-    async fn loop_mailbox(tag: &str) -> (Mailbox, std::path::PathBuf, std::path::PathBuf) {
-        let db = std::env::temp_dir().join(format!(
+    /// Recursively collect `*.json` files under `root` (the Git archive's
+    /// `messages/{YYYY}/{MM}/` tree) — the G11 path-1 rebuild source.
+    fn collect_message_files(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut out = Vec::new();
+        let Ok(years) = std::fs::read_dir(root) else {
+            return out;
+        };
+        for year in years.flatten() {
+            if !year.path().is_dir() {
+                continue;
+            }
+            let Ok(months) = std::fs::read_dir(year.path()) else {
+                continue;
+            };
+            for month in months.flatten() {
+                if !month.path().is_dir() {
+                    continue;
+                }
+                let Ok(entries) = std::fs::read_dir(month.path()) else {
+                    continue;
+                };
+                for e in entries.flatten() {
+                    if e.path().extension().map(|x| x == "json") == Some(true) {
+                        out.push(e.path());
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    async fn loop_mailbox(tag: &str) -> (Mailbox, std::path::PathBuf, std::path::PathBuf) {        let db = std::env::temp_dir().join(format!(
             "toron-unwrap-loop-{tag}-{}.sqlite",
             uuid::Uuid::new_v4()
         ));
@@ -461,6 +502,75 @@ mod tests {
             .await
             .expect("count");
         assert_eq!(count, 1, "inbound wrap must be projected by the unwrap loop");
+
+        handle.abort();
+        let _ = std::fs::remove_dir_all(&data_dir);
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// G11 / bd-p3-projection-atomicity-rtjz: the PRODUCTION unwrap loop must
+    /// land mail in BOTH recovery stores — the SQLite index AND the per-project
+    /// Git archive (`{data_dir}/{slug}/messages/{YYYY}/{MM}/{rumor_id}.json`).
+    /// ADR-0003's "either alone rebuilds" posture requires the archive to hold
+    /// the unwrapped canonical mail; a loop that writes only SQLite makes
+    /// `rebuild_index_from_git` a no-op (and `bus_events` shares the same
+    /// index.sqlite file, so losing that file loses both). RED today: the
+    /// production sink chain is SQLite-only (mailbox/mod.rs build_unwrap_pipeline).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unwrap_loop_projects_mail_to_both_sqlite_and_git_archive() {
+        let (mailbox, db, data_dir) = loop_mailbox("both-stores").await;
+        mailbox
+            .register_agent("demo", &AgentProfile {
+                name: "RoseDune".into(),
+                program: Some("opencode".into()),
+                model: None,
+                persona: None,
+                task_description: None,
+            })
+            .await
+            .expect("register");
+        let sender = Keys::generate();
+
+        let path = mailbox.agent_key_path("demo", "RoseDune");
+        let agent_keys = mailbox.load_agent_key(&path).expect("disk key");
+        let rumor = crate::nostr::gift_wrap::build_rumor(
+            sender.public_key(),
+            nostr_sdk::nostr::Timestamp::now(),
+            nostr_sdk::nostr::Kind::PrivateDirectMessage,
+            vec![nostr_sdk::nostr::Tag::parse(["p", &agent_keys.public_key().to_hex()]).expect("p")],
+            "mail must reach the git archive too",
+        );
+        let wrap = crate::nostr::gift_wrap::gift_wrap(&sender, &agent_keys.public_key(), rumor)
+            .await
+            .expect("wrap");
+        mailbox.bus.publish(wrap).await.expect("publish");
+
+        let handle = mailbox.spawn_unwrap_loop();
+        tokio::time::sleep(std::time::Duration::from_secs(8)).await;
+
+        // 1. SQLite index has it (existing behaviour).
+        let pool = mailbox.index_pool().unwrap();
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages")
+            .fetch_one(pool)
+            .await
+            .expect("count");
+        assert_eq!(count, 1, "mail must be projected into the SQLite index");
+
+        // 2. The per-project Git archive holds the canonical unwrapped mail:
+        //    {data_dir}/demo/messages/{YYYY}/{MM}/{rumor_id}.json. This is the
+        //    G11 path-1 rebuild source — without it, "either alone rebuilds"
+        //    is false and SQLite loss = total mail loss.
+        let archive_root = data_dir.join("demo");
+        let messages_root = archive_root.join("messages");
+        let json_files = collect_message_files(&messages_root);
+        assert_eq!(
+            json_files.len(),
+            1,
+            "unwrap loop must write the canonical mail into the Git archive \
+             (found {} message files under {})",
+            json_files.len(),
+            messages_root.display()
+        );
 
         handle.abort();
         let _ = std::fs::remove_dir_all(&data_dir);
