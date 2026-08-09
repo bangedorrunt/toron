@@ -657,6 +657,45 @@ review before application). **Removal FORBIDDEN** (all are live fixtures).
 3. NO item moves, NO cfg-gates added (the `allow` is simpler and the module
    is already e2e-only); `noop_runner` CLI helper untouched (prod-live).
 
+## F21.ENGINE-SPLIT — engine.rs responsibility map + split proposal (P4, PROPOSAL ONLY)
+
+**Probe:** `bd-p4-engine-responsibility-map-ksfw` (2026-08-09). No edits —
+behavior-preserving move-only proposal for captain approval.
+
+### Responsibility map (2401 LOC total: 1207 prod + 1194 tests)
+
+| Range | Concern | LOC | Contents |
+|-------|---------|-----|----------|
+| 38-107 | Core types | ~70 | `Decision`, `RunInput` |
+| 109-134 | DI sink wrappers | ~26 | `ApprovalSink`, `SpawnSink` (tokio Mutex Deref) |
+| 136-162 | Engine struct | ~27 | `WorkflowEngine` + Debug |
+| 163-401 | Engine impl (dispatch) | ~239 | constructors (local/remote/resolvers), `run`/`invoke`, approval/spawn resolve+reject |
+| 403-716 | Durable generator | ~314 | `run_workflow` (`#[resonate_sdk::function]`): step dispatch + foreach/branch/call_workflow inline + template substitution + `on_error` |
+| 717-961 | Parallel control-flow | ~245 | `run_parallel_copy`, `ParallelCopyInput` |
+| 962-992 | DAG control-flow | ~31 | `run_graph_node`, `GraphNodeInput` |
+| 993-1020 | Emission helpers | ~28 | `stamp_workflow_emitted`, `build_workflow_run_terminal` |
+| 1172-1207 | Template interpolation | ~36 | `resolve_steps`, `descend`, `render_scalar` |
+| 1208-2401 | Tests | 1194 | engine test module (49.7% of the file) |
+
+### Split proposal (move-only, behavior-preserving)
+
+| New file | Moves | LOC |
+|----------|-------|-----|
+| `engine/mod.rs` | types + WorkflowEngine impl + `pub use` re-exports (Decision, RunInput, ApprovalSink, SpawnSink, WorkflowEngine, ActionRunner re-export, run_workflow, run_parallel_copy, run_graph_node, stamp_workflow_emitted, build_workflow_run_terminal) | ~340 |
+| `engine/control_flow.rs` | `run_workflow` + `run_parallel_copy` + `run_graph_node` + inputs | ~590 |
+| `engine/template.rs` | `resolve_steps`, `descend`, `render_scalar` | ~36 |
+| `engine/sinks.rs` | ApprovalSink, SpawnSink | ~26 |
+| `engine/tests.rs` | the 1194-line test module (`#[cfg(test)] mod tests;` → `#[path = "tests.rs"] mod tests;` — no content change) | 1194 |
+
+Max file after split: 1194 (tests) / 590 (control_flow) — no >1000-LOC prod files remain.
+
+### Blast radius
+
+- **Zero external edits**: every pub item is re-exported from `engine/mod.rs`; external callers (toron-mcp `workflow_host.rs`, toron-cli `workflow.rs`, e2e sc11/18-24) import via `toron_workflow::engine::*` unchanged.
+- The `#[resonate_sdk::function]` attribute travels with `run_workflow` (item-level) — no semantic change.
+- Verification at application: `cargo test -p toron-workflow` (124) + `-p toron-mcp` (33/34) + `-p toron-e2e --features p1` sc11/sc18-24 green; clippy clean.
+- NOT in scope: any reshape (API changes) — requires separate captain approval (decision 5).
+
 ## S1/S2/S4/S5/S6/S7/F2.KDF — Re-verification GREEN (bd-p0-verify-green-claims-8z3p)
 
 **Probe:** 2026-08-09, live tree (no code modifications). All 7 claims re-verified GREEN
