@@ -69,6 +69,7 @@
 
 use nostr_sdk::nostr::Event;
 
+use toron_core::bus::addressable::is_revocation;
 use toron_core::nostr::kinds::{
     JOB_ACCEPTED, JOB_CANCEL, JOB_ERROR, JOB_PROGRESS, JOB_REQUEST, JOB_RESULT, WORKFLOW_RUN_FIRST,
     WORKFLOW_RUN_LAST,
@@ -155,6 +156,184 @@ pub fn should_evaluate_trigger_event(event: &Event) -> bool {
 /// for the full check once the event is materialized.
 pub fn should_evaluate_trigger_kind(kind: u16) -> bool {
     !is_workflow_emitted_kind(kind) && kind != GIFT_WRAP
+}
+
+// ---------------------------------------------------------------------------
+// Trigger-spec evaluation (P11.1 reactive ingress — the wiring layer)
+//
+// The embedding (toron-mcp serve host, flywheel, any bus subscriber) runs:
+//
+//   should_evaluate_trigger_event(&event)?   // loop prevention (above)
+//     → matches_trigger(trigger, &event)?    // this layer
+//     → engine.run(trigger_run_id(...), RunInput { workflow, trigger: trigger_payload(&event) })
+//
+// Kind-level matching + the reservation acquired/released DISAMBIGUATION
+// (both are kind-30031; a release marker must fire `reservation_released`,
+// never `reservation_acquired`) + the Trigger's own project/path/channel/
+// emoji scoping fields. The loop-prevention filter stays the layer above —
+// it never consults trigger specs.
+// ---------------------------------------------------------------------------
+
+use serde_json::{Value, json};
+
+use crate::schema::Trigger;
+
+/// Kind of a file reservation (30031) — the reservation_acquired/released
+/// trigger source.
+pub const FILE_RESERVATION_KIND: u16 = 30031;
+
+/// True when a 30031 event terminates a lease: a holder-released marker
+/// (content `status:released` / JSON `"status":"released"` / a
+/// `["status", "released"]` tag) OR an operator revocation (A1 force-release —
+/// the lease is gone either way). Such events match `reservation_released`,
+/// never `reservation_acquired`.
+pub fn is_reservation_released_marker(event: &Event) -> bool {
+    if is_revocation(event) {
+        return true;
+    }
+    event.content.contains("released")
+        || event.tags.iter().any(|t| {
+            t.as_slice().first().map(String::as_str) == Some("status")
+                && t.as_slice().get(1).map(String::as_str) == Some("released")
+        })
+}
+
+/// Match a workflow's trigger spec against an inbound event (kind-level +
+/// the trigger's own scoping fields). The caller has already applied
+/// [`should_evaluate_trigger_event`] (loop prevention).
+///
+/// Scoping semantics:
+/// - reservation triggers carry a REQUIRED `project` (+ optional `path`
+///   glob): the event must carry the project `t`-tag, and (when `path` is
+///   set) the `d`-tag path must overlap it symmetrically;
+/// - message/reaction `project`/`channel`/`emoji` are optional constraints
+///   (absent = unconstrained);
+/// - `agent_state_changed` matches kind-20001 (content schema is
+///   presence-specific; kind-level only);
+/// - `schedule` / `webhook` are not event-driven (cron/external) — never
+///   match a bus event.
+pub fn matches_trigger(trigger: &Trigger, event: &Event) -> bool {
+    let kind = event.kind.as_u16();
+    match trigger {
+        Trigger::MessagePosted { channel, project } => {
+            (kind == 14 || kind == 9 || kind == 1)
+                && scoped_tag_match(project.as_deref(), event, "t")
+                && scoped_tag_match(channel.as_deref(), event, "h")
+        }
+        Trigger::ReactionAdded { channel, emoji } => {
+            kind == 7
+                && emoji
+                    .as_ref()
+                    .map(|e| event.content == *e)
+                    .unwrap_or(true)
+                && scoped_tag_match(channel.as_deref(), event, "h")
+        }
+        Trigger::ReservationAcquired { project, path } => {
+            kind == FILE_RESERVATION_KIND
+                && !is_reservation_released_marker(event)
+                && tag_match(event, "t") == Some(project.as_str())
+                && path_scoped_match(path.as_deref(), event)
+        }
+        Trigger::ReservationReleased { project, path } => {
+            kind == FILE_RESERVATION_KIND
+                && is_reservation_released_marker(event)
+                && tag_match(event, "t") == Some(project.as_str())
+                && path_scoped_match(path.as_deref(), event)
+        }
+        Trigger::AgentStateChanged { .. } => kind == 20001,
+        Trigger::Schedule { .. } => false, // cron-managed, not event-driven
+        Trigger::Webhook { .. } => false,  // external, not a bus event
+    }
+}
+
+/// First value of a `["<name>", <value>, ...]` tag (pair form).
+pub fn tag_match<'a>(event: &'a Event, name: &str) -> Option<&'a str> {
+    event.tags.iter().find_map(|t| {
+        (t.as_slice().first().map(String::as_str) == Some(name))
+            .then(|| t.as_slice().get(1).map(String::as_str))
+            .flatten()
+    })
+}
+
+/// Optional scoping: `None` = unconstrained; `Some(want)` = the event's
+/// `<tag>` must equal `want`.
+fn scoped_tag_match(want: Option<&str>, event: &Event, tag: &str) -> bool {
+    match want {
+        None => true,
+        Some(w) => tag_match(event, tag) == Some(w),
+    }
+}
+
+/// Optional reservation-path glob: `None` = unconstrained; `Some(glob)` =
+/// symmetric overlap with the `d`-tag path (`project:path-glob`).
+fn path_scoped_match(glob: Option<&str>, event: &Event) -> bool {
+    let Some(glob) = glob else {
+        return true;
+    };
+    let Some(d) = tag_match(event, "d") else {
+        return false;
+    };
+    let Some((_, path)) = d.split_once(':') else {
+        return false;
+    };
+    toron_core::mailbox::overlaps(glob, path)
+}
+
+/// The `{{trigger.*}}` payload for an inbound event: id/sender/content/kind/
+/// created_at + the `tags` array + `t`/`h`/`importance` tag surfaces (project/
+/// channel/importance). Reservation events gain a `status` field
+/// (`acquired` | `released`) so guards can discriminate the two 30031 paths.
+pub fn trigger_payload(event: &Event) -> Value {
+    let mut m = serde_json::Map::new();
+    m.insert("id".into(), json!(event.id.to_hex()));
+    m.insert("sender".into(), json!(event.pubkey.to_hex()));
+    m.insert("content".into(), json!(event.content));
+    m.insert("kind".into(), json!(event.kind.as_u16()));
+    m.insert("created_at".into(), json!(event.created_at.as_secs()));
+    let mut project: Option<String> = None;
+    let mut channel: Option<String> = None;
+    let mut importance: Option<String> = None;
+    let mut tags: Vec<Value> = Vec::new();
+    for t in event.tags.iter() {
+        let p = t.as_slice();
+        tags.push(json!(p));
+        if p.first().map(String::as_str) == Some("t") && project.is_none() {
+            project = p.get(1).cloned();
+        }
+        if p.first().map(String::as_str) == Some("h") && channel.is_none() {
+            channel = p.get(1).cloned();
+        }
+        if p.first().map(String::as_str) == Some("importance") && importance.is_none() {
+            importance = p.get(1).cloned();
+        }
+    }
+    m.insert("tags".into(), Value::Array(tags));
+    if let Some(p) = project {
+        m.insert("project".into(), json!(p));
+    }
+    if let Some(c) = channel {
+        m.insert("channel".into(), json!(c));
+    }
+    if let Some(i) = importance {
+        m.insert("importance".into(), json!(i));
+    }
+    if event.kind.as_u16() == FILE_RESERVATION_KIND {
+        m.insert(
+            "status".into(),
+            json!(if is_reservation_released_marker(event) {
+                "released"
+            } else {
+                "acquired"
+            }),
+        );
+    }
+    Value::Object(m)
+}
+
+/// Deterministic per-(workflow, event) run id — the engine's idempotency key:
+/// a redelivered event reuses the same run (never double-fires).
+pub fn trigger_run_id(workflow_name: &str, event: &Event) -> String {
+    format!("wf-{workflow_name}-{}", event.id.to_hex())
 }
 
 #[cfg(test)]
@@ -338,5 +517,312 @@ mod tests {
         let parsed = Event::from_json(e.as_json()).expect("parse");
         assert_eq!(parsed, e);
         assert!(!should_evaluate_trigger_event(&parsed));
+    }
+
+    // ------------------------------------------------------------------
+    // P11.1 trigger-spec evaluation
+    // ------------------------------------------------------------------
+
+    use crate::schema::Trigger;
+
+    /// A kind-30031 event with project scoping + optional status marker.
+    fn reservation(content: &str, tags: Vec<Tag>, keys: &Keys) -> Event {
+        EventBuilder::new(Kind::from_u16(FILE_RESERVATION_KIND), content)
+            .tags(tags)
+            .sign_with_keys(keys)
+            .expect("sign")
+    }
+
+    fn tag_d(project: &str, path: &str) -> Tag {
+        Tag::parse(["d", &format!("{project}:{path}")]).expect("d")
+    }
+
+    #[test]
+    fn reservation_acquired_vs_released_disambiguation() {
+        let keys = Keys::generate();
+        // Plain acquire (status-less content) → acquired only.
+        let acquired = reservation(
+            r#"{"exclusive":true}"#,
+            vec![tag_d("demo", "src/**"), tag_t("demo")],
+            &keys,
+        );
+        assert!(matches_trigger(
+            &Trigger::ReservationAcquired {
+                project: "demo".into(),
+                path: None,
+            },
+            &acquired
+        ));
+        assert!(
+            !matches_trigger(
+                &Trigger::ReservationReleased {
+                    project: "demo".into(),
+                    path: None,
+                },
+                &acquired
+            ),
+            "an acquire must NOT fire reservation_released"
+        );
+
+        // Released marker in content → released only.
+        let released = reservation(
+            r#"{"status":"released"}"#,
+            vec![tag_d("demo", "src/**"), tag_t("demo")],
+            &keys,
+        );
+        assert!(matches_trigger(
+            &Trigger::ReservationReleased {
+                project: "demo".into(),
+                path: None,
+            },
+            &released
+        ));
+        assert!(
+            !matches_trigger(
+                &Trigger::ReservationAcquired {
+                    project: "demo".into(),
+                    path: None,
+                },
+                &released
+            ),
+            "a release must NOT fire reservation_acquired"
+        );
+
+        // Released via the `["status", "released"]` tag form (release path).
+        let tagged = reservation(
+            r#"{"exclusive":true}"#,
+            vec![
+                tag_d("demo", "src/**"),
+                tag_t("demo"),
+                Tag::parse(["status", "released"]).expect("status"),
+            ],
+            &keys,
+        );
+        assert!(matches_trigger(
+            &Trigger::ReservationReleased {
+                project: "demo".into(),
+                path: None,
+            },
+            &tagged
+        ));
+
+        // Operator revocation (force-release) → released (lease terminated).
+        let revoked = reservation(
+            r#"{"status":"revoked","heuristic":"stale-holder"}"#,
+            vec![
+                tag_d("demo", "src/**"),
+                tag_t("demo"),
+                Tag::parse(["status", "revoked"]).expect("status"),
+            ],
+            &keys,
+        );
+        assert!(
+            is_reservation_released_marker(&revoked),
+            "revocation terminates the lease"
+        );
+        assert!(matches_trigger(
+            &Trigger::ReservationReleased {
+                project: "demo".into(),
+                path: None,
+            },
+            &revoked
+        ));
+    }
+
+    #[test]
+    fn reservation_project_and_path_scoping() {
+        let keys = Keys::generate();
+        let acquired = reservation(
+            r#"{"exclusive":true}"#,
+            vec![tag_d("demo", "src/lib.rs"), tag_t("demo")],
+            &keys,
+        );
+        // Wrong project → no match.
+        assert!(!matches_trigger(
+            &Trigger::ReservationAcquired {
+                project: "other".into(),
+                path: None,
+            },
+            &acquired
+        ));
+        // No project t-tag at all → no match (required scoping).
+        let unscoped = reservation(r#"{"exclusive":true}"#, vec![tag_d("demo", "src/lib.rs")], &keys);
+        assert!(!matches_trigger(
+            &Trigger::ReservationAcquired {
+                project: "demo".into(),
+                path: None,
+            },
+            &unscoped
+        ));
+        // Path glob: symmetric overlap (trigger glob vs d-tag path).
+        assert!(matches_trigger(
+            &Trigger::ReservationAcquired {
+                project: "demo".into(),
+                path: Some("src/**".into()),
+            },
+            &acquired
+        ));
+        assert!(matches_trigger(
+            &Trigger::ReservationAcquired {
+                project: "demo".into(),
+                path: Some("src/lib.rs".into()),
+            },
+            &acquired
+        ));
+        assert!(!matches_trigger(
+            &Trigger::ReservationAcquired {
+                project: "demo".into(),
+                path: Some("docs/**".into()),
+            },
+            &acquired
+        ));
+    }
+
+    #[test]
+    fn reaction_added_kind_emoji_and_channel() {
+        let keys = Keys::generate();
+        let thumbs = EventBuilder::new(Kind::from_u16(7), "+")
+            .tags(vec![Tag::parse(["h", "room"]).expect("h")])
+            .sign_with_keys(&keys)
+            .expect("sign");
+        assert!(matches_trigger(
+            &Trigger::ReactionAdded {
+                channel: None,
+                emoji: None,
+            },
+            &thumbs
+        ));
+        // Emoji constraint matches the NIP-25 content.
+        assert!(matches_trigger(
+            &Trigger::ReactionAdded {
+                channel: None,
+                emoji: Some("+".into()),
+            },
+            &thumbs
+        ));
+        assert!(!matches_trigger(
+            &Trigger::ReactionAdded {
+                channel: None,
+                emoji: Some(":fire:".into()),
+            },
+            &thumbs
+        ));
+        assert!(matches_trigger(
+            &Trigger::ReactionAdded {
+                channel: Some("room".into()),
+                emoji: None,
+            },
+            &thumbs
+        ));
+        assert!(!matches_trigger(
+            &Trigger::ReactionAdded {
+                channel: Some("other".into()),
+                emoji: None,
+            },
+            &thumbs
+        ));
+        // A kind-7 is NOT a message_posted trigger.
+        assert!(!matches_trigger(
+            &Trigger::MessagePosted {
+                channel: None,
+                project: None,
+            },
+            &thumbs
+        ));
+    }
+
+    #[test]
+    fn message_posted_kind_project_and_channel_scoping() {
+        let keys = Keys::generate();
+        let dm = EventBuilder::new(
+            Kind::from_u16(14),
+            "hello",
+        )
+        .tags(vec![tag_t("demo"), Tag::parse(["h", "room"]).expect("h")])
+        .sign_with_keys(&keys)
+        .expect("sign");
+        assert!(matches_trigger(
+            &Trigger::MessagePosted {
+                channel: None,
+                project: None,
+            },
+            &dm
+        ));
+        assert!(matches_trigger(
+            &Trigger::MessagePosted {
+                channel: None,
+                project: Some("demo".into()),
+            },
+            &dm
+        ));
+        assert!(!matches_trigger(
+            &Trigger::MessagePosted {
+                channel: None,
+                project: Some("other".into()),
+            },
+            &dm
+        ));
+        assert!(matches_trigger(
+            &Trigger::MessagePosted {
+                channel: Some("room".into()),
+                project: None,
+            },
+            &dm
+        ));
+        assert!(!matches_trigger(
+            &Trigger::MessagePosted {
+                channel: Some("nope".into()),
+                project: None,
+            },
+            &dm
+        ));
+        // Schedule/webhook never match bus events.
+        assert!(!matches_trigger(
+            &Trigger::Schedule {
+                cron: "* * * * *".into(),
+                owner: None,
+                scope: Default::default(),
+            },
+            &dm
+        ));
+    }
+
+    #[test]
+    fn trigger_payload_shapes_and_run_id() {
+        let keys = Keys::generate();
+        let acquired = reservation(
+            r#"{"exclusive":true}"#,
+            vec![tag_d("demo", "src/lib.rs"), tag_t("demo")],
+            &keys,
+        );
+        let payload = trigger_payload(&acquired);
+        assert_eq!(payload["kind"], json!(30031));
+        assert_eq!(payload["project"], json!("demo"));
+        assert_eq!(payload["status"], json!("acquired"));
+        assert!(payload["tags"].is_array());
+        let released = reservation(
+            r#"{"status":"released"}"#,
+            vec![tag_d("demo", "src/lib.rs"), tag_t("demo")],
+            &keys,
+        );
+        assert_eq!(trigger_payload(&released)["status"], json!("released"));
+        // A non-reservation payload has no status field.
+        let dm = EventBuilder::new(Kind::from_u16(14), "hi")
+            .sign_with_keys(&keys)
+            .expect("sign");
+        assert!(trigger_payload(&dm).get("status").is_none());
+        // Deterministic run ids: stable per (workflow, event), distinct per event.
+        assert_eq!(
+            trigger_run_id("wf-a", &acquired),
+            trigger_run_id("wf-a", &acquired)
+        );
+        assert_ne!(
+            trigger_run_id("wf-a", &acquired),
+            trigger_run_id("wf-b", &acquired)
+        );
+        assert_ne!(
+            trigger_run_id("wf-a", &acquired),
+            trigger_run_id("wf-a", &released)
+        );
     }
 }

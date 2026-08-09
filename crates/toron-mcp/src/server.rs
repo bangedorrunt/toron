@@ -317,12 +317,15 @@ async fn build_mailbox(
 }
 
 /// ADR-0007 R3 serve wire: construct the workflow host over the serve mailbox
-/// and spawn the post-unwrap `message_posted` trigger loop (F1). Gift-wrapped
-/// inbound mail fires `message_posted` once; workflow-emitted rumors carry the
-/// `toron:workflow-emitted` stamp and are skipped by the loop (no self-loop).
+/// and spawn BOTH trigger loops (F1 + P11.1):
+/// - the post-unwrap `message_posted` loop (gift-wrapped inbound mail fires
+///   `message_posted` once; workflow-emitted rumors are stamped + skipped);
+/// - the raw-bus reactive loop (reservation_acquired / reservation_released /
+///   reaction_added / message_posted-over-raw-kinds) via the trusted ingress
+///   subscription (A3 gate bypass — P11.1 bd-foh8.1).
 ///
 /// Embedders register workflows via [`WorkflowHost::add_workflow`]; the serve
-/// binary arms the loop so triggers are LIVE the moment a workflow exists.
+/// binary arms the loops so triggers are LIVE the moment a workflow exists.
 fn spawn_mail_trigger_host(
     mailbox: Mailbox,
     trigger_rx: tokio::sync::mpsc::UnboundedReceiver<UnwrappedMail>,
@@ -330,6 +333,7 @@ fn spawn_mail_trigger_host(
     match WorkflowHost::new(Arc::new(mailbox), Vec::new()) {
         Ok(host) => {
             host.spawn_mail_trigger_loop(trigger_rx);
+            host.spawn_trigger_loop();
         }
         Err(e) => tracing::warn!(
             "workflow host unavailable; message_posted triggers disabled: {e:#}"

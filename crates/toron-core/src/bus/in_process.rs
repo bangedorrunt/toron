@@ -195,6 +195,78 @@ impl InProcessBus {
             }
         }
     }
+
+    /// Shared subscription construction (trait helper): `trusted` forces the
+    /// subscriber to be treated as project-scoped (A3 gate off) regardless of
+    /// the filter's `#t`/`#l` scoping — the mailbox's own internal consumers
+    /// see every scoped event (P11.1 reactive ingress).
+    async fn subscribe_with_gate(
+        &self,
+        filter: Filter,
+        trusted: bool,
+    ) -> Result<Subscription, BusError> {
+        let (tx, rx) = mpsc::channel(self.config.channel_capacity);
+        let id = SubscriptionId::new(format!(
+            "sub-{}",
+            self.next_id
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        ));
+
+        // Global = filter has no project scoping (#t via hashtags or #l label)
+        // AND not trusted. A trusted subscriber is always project-scoped.
+        use nostr_sdk::nostr::{Alphabet, SingleLetterTag};
+        let t_tag = SingleLetterTag::lowercase(Alphabet::T);
+        let l_tag = SingleLetterTag::lowercase(Alphabet::L);
+        let global = !trusted
+            && !filter.generic_tags.contains_key(&t_tag)
+            && !filter.generic_tags.contains_key(&l_tag);
+
+        // Take the history snapshot synchronously (fast DB read) so the
+        // exactly-once boundary is stable: snapshot members are replayed by
+        // the background task; anything published after subscribe() returns is
+        // delivered live.
+        let snapshot = self
+            .store
+            .replay(&filter)
+            .await
+            .map_err(|e| BusError::Subscription(format!("replay failure: {e}")))?;
+        let snapshot_ids: Arc<std::collections::HashSet<String>> =
+            Arc::new(snapshot.iter().map(|ev| ev.id.to_hex()).collect());
+        let replay_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        // Push the snapshot + EOSE in a background task so `subscribe` never
+        // blocks on a small channel (lossless backpressure inside the task).
+        let replay_tx = tx.clone();
+        let snapshot_clone = snapshot;
+        let replay_done_clone = replay_done.clone();
+        let global_clone = global;
+        tokio::spawn(async move {
+            for ev in snapshot_clone {
+                // Access gate applies to replay too: a global subscription
+                // never receives project-scoped history.
+                if global_clone && Self::project_slug(&ev).is_some() {
+                    continue;
+                }
+                if replay_tx.send(SubscriptionEvent::Event(ev)).await.is_err() {
+                    return;
+                }
+            }
+            let _ = replay_tx.send(SubscriptionEvent::Eose).await;
+            replay_done_clone.store(true, std::sync::atomic::Ordering::Release);
+        });
+
+        let sub = Arc::new(Subscriber {
+            id: id.clone(),
+            filter,
+            tx,
+            global,
+            snapshot: snapshot_ids,
+            replay_done,
+        });
+        self.subs.write().insert(id.clone(), sub);
+
+        Ok(Subscription::new(id, rx))
+    }
 }
 
 #[async_trait::async_trait]
@@ -244,65 +316,12 @@ impl Bus for InProcessBus {
     }
 
     async fn subscribe(&self, filter: Filter) -> Result<Subscription, BusError> {
-        let (tx, rx) = mpsc::channel(self.config.channel_capacity);
-        let id = SubscriptionId::new(format!(
-            "sub-{}",
-            self.next_id
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-        ));
+        self.subscribe_with_gate(filter, false).await
+    }
 
-        // Global = filter has no project scoping (#t via hashtags or #l label).
-        use nostr_sdk::nostr::{Alphabet, SingleLetterTag};
-        let t_tag = SingleLetterTag::lowercase(Alphabet::T);
-        let l_tag = SingleLetterTag::lowercase(Alphabet::L);
-        let global =
-            !filter.generic_tags.contains_key(&t_tag) && !filter.generic_tags.contains_key(&l_tag);
-
-        // Take the history snapshot synchronously (fast DB read) so the
-        // exactly-once boundary is stable: snapshot members are replayed by
-        // the background task; anything published after subscribe() returns is
-        // delivered live.
-        let snapshot = self
-            .store
-            .replay(&filter)
-            .await
-            .map_err(|e| BusError::Subscription(format!("replay failure: {e}")))?;
-        let snapshot_ids: Arc<std::collections::HashSet<String>> =
-            Arc::new(snapshot.iter().map(|ev| ev.id.to_hex()).collect());
-        let replay_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
-
-        // Push the snapshot + EOSE in a background task so `subscribe` never
-        // blocks on a small channel (lossless backpressure inside the task).
-        let replay_tx = tx.clone();
-        let snapshot_clone = snapshot;
-        let replay_done_clone = replay_done.clone();
-        let global_clone = global;
-        tokio::spawn(async move {
-            for ev in snapshot_clone {
-                // Access gate applies to replay too: a global subscription
-                // never receives project-scoped history.
-                if global_clone && Self::project_slug(&ev).is_some() {
-                    continue;
-                }
-                if replay_tx.send(SubscriptionEvent::Event(ev)).await.is_err() {
-                    return;
-                }
-            }
-            let _ = replay_tx.send(SubscriptionEvent::Eose).await;
-            replay_done_clone.store(true, std::sync::atomic::Ordering::Release);
-        });
-
-        let sub = Arc::new(Subscriber {
-            id: id.clone(),
-            filter,
-            tx,
-            global,
-            snapshot: snapshot_ids,
-            replay_done,
-        });
-        self.subs.write().insert(id.clone(), sub);
-
-        Ok(Subscription::new(id, rx))
+    /// Trusted ingress: A3 global-gate bypassed (see [`Bus::subscribe_trusted`]).
+    async fn subscribe_trusted(&self, filter: Filter) -> Result<Subscription, BusError> {
+        self.subscribe_with_gate(filter, true).await
     }
 
     async fn health(&self) -> Result<Health, BusError> {
@@ -317,6 +336,7 @@ impl Bus for InProcessBus {
             }),
         }
     }
+
 }
 
 // Allow constructing a bus for tests without exposing internals.
@@ -622,6 +642,30 @@ mod tests {
         assert!(
             !global_leaked,
             "global sub received project-scoped event: {global_items:?}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// P11.1 (bd-foh8.1): a TRUSTED subscription receives project-scoped
+    /// events even with an unscoped filter — the reactive-ingress bypass.
+    #[tokio::test]
+    async fn test_trusted_sub_receives_project_scoped() {
+        let (bus, path) = temp_bus().await;
+        let keys = Keys::generate();
+
+        // Trusted ingress: empty filter, no scoping — must still see scoped
+        // events (the workflow-trigger loop's subscription shape).
+        let mut trusted = bus.subscribe_trusted(Filter::new()).await.expect("trusted sub");
+
+        let ev = signed(&keys, PROJECT_MANIFEST, "scoped secret", "demo");
+        bus.publish(ev.clone()).await.expect("publish");
+
+        let items = drain(&mut trusted, 8, Duration::from_millis(200)).await;
+        assert!(
+            items
+                .iter()
+                .any(|it| matches!(it, SubscriptionEvent::Event(e) if e.id == ev.id)),
+            "trusted sub must receive project-scoped event, got {items:?}"
         );
         let _ = std::fs::remove_file(&path);
     }
