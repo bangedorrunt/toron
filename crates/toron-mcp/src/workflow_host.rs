@@ -153,7 +153,10 @@ pub fn mailbox_runner(
                     spec: spec.clone(),
                 };
                 let now = now_ms();
-                let mut c = coalescer.lock().expect("coalescer lock");
+                // P1 (bd-p1-poison-on-panic-audit-jwpd): recover the std
+                // Mutex poison — a panic inside the guard must not brick
+                // every subsequent flush (panic-in-panic = dead service).
+                let mut c = coalescer.lock().unwrap_or_else(|e| e.into_inner());
                 match c.submit(mention, now) {
                     // Hard-cap flush: publish the coalesced 43001 NOW (the
                     // host's tick cannot — the buffer is already drained).
@@ -438,7 +441,13 @@ impl WorkflowHost {
             // window elapsed, and PUBLISH one kind-43001 per flushed batch
             // (ADR-0007 F7 — N mentions in a window → exactly one job).
             {
-                let mut c = self.coalescer.lock().expect("coalescer lock");
+                // P1 (bd-p1-poison-on-panic-audit-jwpd): recover the std
+                // Mutex poison — a panic inside the guard must not brick
+                // every subsequent tick flush.
+                let mut c = self
+                    .coalescer
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
                 let flushed = c.tick(now_ms());
                 if !flushed.is_empty() {
                     debug!("coalescer flushed {} assignee(s)", flushed.len());
@@ -683,7 +692,7 @@ mod tests {
         }
         // All five @mentions are buffered in the coalescer (window open),
         // NOT emitted as five separate jobs — one buffered batch.
-        let c = coalescer.lock().expect("lock");
+        let c = coalescer.lock().unwrap_or_else(|e| e.into_inner());
         assert!(
             c.buffered_for("oc-beta") == 5,
             "all mentions buffered for oc-beta, got {}",
@@ -1183,6 +1192,72 @@ steps:
         );
 
         let _ = std::fs::remove_dir_all(&data_dir);
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// P1 (bd-p1-poison-on-panic-audit-jwpd): a panic while holding the
+    /// coalescer std-Mutex guard must NOT brick the service — the next flush
+    /// recovers from the poison instead of panicking (ADR-0007 D7 recovery
+    /// posture).
+    ///
+    /// RED today: `.lock().expect("coalescer lock")` at the runner arm +
+    /// tick flush propagates PoisonError as a panic — one panic inside the
+    /// guard permanently kills every subsequent flush (panic-in-panic =
+    /// dead service).
+    #[test]
+    fn poisoned_coalescer_survives() {
+        use toron_core::bus::in_process::{InProcessBus, InProcessBusConfig};
+        use toron_core::index::schema;
+
+        let db = std::env::temp_dir().join(format!("wf-poison-{}.sqlite", uuid::Uuid::new_v4()));
+        let (runner, coalescer) = tokio::runtime::Runtime::new()
+            .expect("rt")
+            .block_on(async {
+                let pool = schema::connect(db.to_str().unwrap()).await.expect("connect");
+                schema::migrate(&pool).await.expect("migrate");
+                let bus: Arc<dyn Bus> = Arc::new(
+                    InProcessBus::open(pool, InProcessBusConfig::default())
+                        .await
+                        .expect("bus"),
+                );
+                let data_dir = std::env::temp_dir()
+                    .join(format!("wf-poison-data-{}", uuid::Uuid::new_v4()));
+                let mailbox = Arc::new(
+                    Mailbox::new(bus, data_dir, None).with_agent_passphrase("poison-pass"),
+                );
+                let coalescer = Arc::new(std::sync::Mutex::new(MentionCoalescer::from_env()));
+                let runner = mailbox_runner(
+                    mailbox.clone(),
+                    coalescer.clone(),
+                    Some(nostr_sdk::nostr::Keys::generate()),
+                );
+                (runner, coalescer)
+            });
+
+        // Poison the coalescer: panic while holding the guard (std Mutex
+        // poisoning semantics — the guard's Drop during unwind poisons).
+        let c2 = coalescer.clone();
+        let panicked = std::panic::catch_unwind(move || {
+            let _g = c2.lock().expect("pre-poison lock");
+            panic!("simulated panic inside the coalescer guard");
+        });
+        assert!(panicked.is_err(), "precondition: simulated panic unwound");
+        assert!(coalescer.is_poisoned(), "precondition: std Mutex is poisoned");
+
+        // Survivability: a subsequent flush through the REAL runner arm must
+        // not panic (recover the poison, keep serving).
+        let runner = runner.clone();
+        let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            runner(&Action::DispatchJob {
+                assignee: "oc".into(),
+                spec: serde_json::json!({ "text": "after-poison" }),
+                channel: None,
+            })
+        }));
+        assert!(
+            out.is_ok(),
+            "poisoned coalescer must survive — subsequent flush panicked: {out:?}"
+        );
         let _ = std::fs::remove_file(&db);
     }
 }
