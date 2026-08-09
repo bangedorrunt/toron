@@ -9,6 +9,7 @@ reviewed and the captain approves.**
 | F2.NIP40 | P0 crypto | `crates/toron-core/src/mailbox/unwrap.rs:602-656` (`UnwrapPipeline::project`) | NIP-40 `expiration` honored on unwrap ingest — expired gift wrap rejected BEFORE sqlite/git projection | **RED** — no TTL check exists | **P0 crypto** — expired-but-never-seen gift wrap is ACCEPTED + projected, voiding ADR-0003 "Parity Superiority" replay/expiry claim | TTL check in unwrap pipeline (parse `expiration` tag, reject-if-past pre-write). RED test `expired_gift_wrap_rejected_on_unwrap` first (see `bd-p3-nip40-expiration-fix-6ezx`) |
 | F3.COALESCER-LOCK | P1 concurrency | `crates/toron-mcp/src/workflow_host.rs:156-165` (runner FlushNow arm) + `:441-461` (trigger-loop tick flush) | std-Mutex guard on `MentionCoalescer` NOT held across the blocking publish (`publish_coalesced_job` → `thread::scope` + `rt.block_on(bus.publish)`) | **RED** — guard IS held across the publish; concurrent flush stalls for the publish duration (measured 498ms stall on 600ms publish) | **P1 stall** — any slow publish (relay latency/backpressure) freezes every other coalescer accessor (all `dispatch_job` actions + tick flushes) for the publish duration; poison risk (`expect`) covered by p1-poison-on-panic-audit | Drop the guard before publishing: clone the `Coalesced` under the lock, release, then publish. RED test `coalescer_lock_not_held_across_blocking_publish` authored + failing today |
 | F4.S8 | P0 gate | `crates/toron-mcp/src/resources.rs:163-186` (`static_resource`) | S8 honest-stub gate: every placeholder field names a live tool via `status`; all 25 resource URIs resolve to non-empty JSON | **FIXED** — Rev-1 gate tightened + enforced by tests (metrics_core + schemas placeholders lacked `status` → added) | low (honesty/documentation) | Gate now mechanical: placeholder ⇒ `status` required; 25-URI coverage tests (`static_stubs_name_live_tool`, `all_25_resources_resolve_to_non_empty_json`) |
+| F5.POISON | P1 recovery | `crates/toron-mcp/src/workflow_host.rs:153-159,441-454` (coalescer) | ADR-0007 D7: a panic inside a std-Mutex guard must not brick the service (poison recovered, not propagated) | **FIXED** — both production `.lock().expect("coalescer lock")` sites → `unwrap_or_else(\|e\| e.into_inner())`; 0 poison-propagating prod sites remain | P1 (was: panic-in-panic = dead service) | RED→GREEN `poisoned_coalescer_survives`; per-site table in F5.POISON section |
 
 ## F2.NIP40 — NIP-40 expiration NOT honored on unwrap ingest path (P0)
 
@@ -210,3 +211,77 @@ lacking `status` found and repaired).
 - Result: 8/8 resources tests green; toron-mcp acceptance 5/5 green (245s; first run had a
   flaky failure, clean re-run).
 - No remaining placeholder without a `status` field; nothing faked to look real.
+
+## F5.POISON — Poison-on-panic survivability audit (bd-p1-poison-on-panic-audit-jwpd)
+
+**Probe:** 2026-08-09. Verdict: **FIXED** — 2 production poison-propagating std-Mutex sites
+repaired; 0 remaining.
+
+### Per-site verdict table (all std::sync::Mutex/RwLock — the only poisoning types)
+
+| Site | Lock | Acquisition | Verdict |
+|------|------|------------|---------|
+| `toron-mcp/src/workflow_host.rs:153-159` (runner arm) | std `Mutex<MentionCoalescer>` | `.lock().expect("coalescer lock")` → **FIXED**: `.lock().unwrap_or_else(\|e\| e.into_inner())` | RECOVERED (poison re-init) |
+| `toron-mcp/src/workflow_host.rs:441-454` (tick flush) | std `Mutex<MentionCoalescer>` | `.lock().expect("coalescer lock")` → **FIXED**: `.lock().unwrap_or_else(\|e\| e.into_inner())` | RECOVERED (poison re-init) |
+| `toron-cli/src/operator.rs:592-630` (4 sites) | std `Mutex` (state) | `match state().lock() { Err(p) => p.into_inner() }` | RECOVERED (pre-existing) |
+| parking_lot Mutex/RwLock — 12 files (unwrap.rs, in_process.rs, git.rs, writer.rs, herdr.rs, mock.rs, mock_relay.rs, presence.rs, contacts.rs, dispatch.rs, mailbox/mod.rs, +1) | non-poisoning | — | SAFE by construction (no PoisonError exists) |
+| tokio::sync::Mutex (sc16 SpikeSink) | non-poisoning | — | SAFE by construction |
+| engine.rs test module (9 std Mutex, 17 `.lock().unwrap()` sites, `StdMutex` alias, lines 1763-2386) | std | unwrap | TEST-ONLY — panic = test failure, not service death |
+| e2e tests sc21 (3), sc24 (4), cli_robot/cli_tui (1 each), cli_operator OnceLock<Mutex<()>> | std | unwrap | TEST-ONLY scaffolding |
+| guard.rs:379 `index.write().expect(...)` | git2 Index (NOT a lock) | — | FALSE POSITIVE (repo.index().write(), test) |
+
+### RED→GREEN
+
+- RED mechanism: std Mutex poison → `.lock().expect()` panics with PoisonError on every
+  subsequent access (panic-in-panic = dead service). The charter S7 flag (coalescer
+  `.expect`) was the only production instance.
+- GREEN test `poisoned_coalescer_survives` (workflow_host.rs:1207): poisons the coalescer
+  via `catch_unwind` panic inside the guard, asserts `is_poisoned()`, then runs a REAL
+  `DispatchJob` through the runner arm — must not panic. **Passes** (0.01s).
+- 3/4 coalescer-group tests green; the 1 failure is `coalescer_lock_not_held_across_blocking_publish`
+  — F3.COALESCER-LOCK's intentional RED test (owned by bd-p1-std-guard-across-blockon-gwnt).
+
+### Notes
+
+- `PoisonError`-recovery (`unwrap_or_else(|e| e.into_inner())`) chosen over parking_lot
+  migration — 2 sites, no dep-tree change, honest re-init (captain decision 5 weighing).
+- The guard-hold-across-publish stall (F3) is tracked separately; the poison recovery here
+  removes the *brick* risk on top of it.
+
+## F1.LAG-SWALLOW — RelayBus broadcast lag silently dropped (P1, bd-p1-broadcast-lag-handling-6wm8)
+
+**Probe:** 2026-08-09. Verdict: **RED** (swallow confirmed) → **decision: SURFACE**.
+
+### Evidence
+
+`crates/toron-core/src/bus/relay_bus.rs:196`:
+`Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue` — the per-subscription
+bridge task drops lag notifications with no log, no metric, no signal to the subscriber.
+
+- The default in-process bus is per-subscriber mpsc (`in_process.rs:13`), so lag is
+  impossible there; `RelayBus` (nostr-sdk Client over WS, broadcast channel cap 1024) is
+  the ONLY lossy path and the production federation surface (captain decision 2).
+- A dropped notification can be a workflow trigger / mailbox event; silent loss violates
+  the ADR-0003 parity/durability posture ("agent-automation context budget is scarce" —
+  ADR-0004 driver: a missed trigger is worse than a loud log).
+
+### Decision
+
+**Surface** — warn log with skipped count + ops metric (AtomicU64 counter on `RelayBus`,
+exposed via `health()` message). Re-sync (auto re-subscribe) NOT added: sustained lag +
+auto-re-REQ could storm relays; operator acts on the metric. Documented best-effort on the
+federation path.
+
+### RED test (authored, confirmed failing — fix in batch per captain decision 4)
+
+`test_broadcast_lag_is_surfaced_not_swallowed` (relay_bus.rs tests): two subscriptions on
+one RelayBus; sub A drained (keeps producer flowing), sub B undrained (mpsc 256 fills →
+bridge blocks → broadcast receiver falls behind → `Lagged` fires deterministically);
+1500-event burst > 256+1024 margin. Assertions:
+1. Diagnostic: `received_b < published` (lag actually occurred) — PASSES today.
+2. Contract: `health().message` contains "lag" — **FAILS today** (silently swallowed).
+
+Verified: test RED on live tree; GREEN-shape confirmed by temporary wiring (counter field +
+`Lagged(skipped)` increment + health surfacing) → test passes. Fix restores the metric;
+implementation deferred to the batch-fix pass (charter: no code edits until full P0–P6
+findings table is reviewed and captain approves).
