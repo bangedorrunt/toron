@@ -64,6 +64,13 @@ still accept `file_reservation_ids: Option<Vec<i64>>`, which the handlers silent
 (only `paths` is honored). No silent-0 corruption on the id itself (ids are never parsed to
 `i64`), but accepted-and-ignored args are an honesty gap to close.
 
+> **CLOSED 2026-08-09 (bd-p2-id-type-end-to-end-v9dy):** the dead `file_reservation_ids`
+> selectors were removed from both MCP arg structs (tools.rs) + the golden fixture
+> `tests/conformance/fixtures/tools.schema.json`. The toron MCP surface is now all-String
+> for id-bearing fields, enforced by `no_integer_id_fields_in_tool_surface` (tools.rs
+> tests). The AM-side ids selector was never part of the toron surface (surface.rs:427 —
+> paths-only is the truthful superset); removal closes the honesty gap, no behavior change.
+
 ## 3. AM-side behaviors (NOT toron faults)
 
 - `acquire_build_slot` / `renew_build_slot` / `release_build_slot`: AM disabled in the
