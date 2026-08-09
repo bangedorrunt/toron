@@ -351,16 +351,19 @@ Every finding: id, defect, evidence, remedy, confidence, minimum test, posture.
 
 | claim_id | claim_or_obligation | kind | witness_required | witness_status | preservation | progress | inhabitance | evidence |
 |----------|---------------------|------|------------------|----------------|--------------|----------|-------------|----------|
-| S1 | NIP-17 DMs can trigger `message_posted` workflows | protocol+product | e2e SC | **GREEN** (85e28e8, gift-wrap e2e) | fixed | — | — | F1 |
-| S2 | Workflow cannot re-trigger itself | safety | stamp on every emit + filter | **PARTIAL** (filter yes, stamp no) | partial | — | unstamped kind-14/9 can loop | F6 |
-| S3 | Integrated mode shares durable mail state — agent state (identity/keys) AND mail content across processes | ADR-0003 3A | cross-process inbox | **GREEN** (`crates/toron-cli/tests/cli_robot.rs::cross_process_mail_content_shares_durable_root`, bd-p0-s3-shared-state-reword-mujh) | fixed | — | — | F2 |
-| S4 | toron mail ids round-trip through flywheel | integration | ack after inbox | **FAIL** (u64) | broken | — | hex not inhabit u64 | F3 |
-| S5 | `foreach` binds loop variable | engine | body uses item | **FAIL** | broken | — | item discarded | F4 |
-| S6 | `call_workflow` composes workflows | ADR-0005 Spec | nested run | **FAIL** (stub) | n/a | stuck | always failed value | F5 |
-| S7 | Mention burst → one job | ADR-0004 Ship 1 | one 43001 | **FAIL** at host | library only | stuck | flush no-ops | F7 |
-| S8 | 25 resources readable | ADR-0003 | resource read | **PARTIAL** | stubs | — | "not yet wired" | F10 |
-| S9 | Nostr is AM superset at flywheel trait | captain mandate | same intents, both backends | **FAIL** (AM-shaped trait) | — | — | toron forced into u64 world | F3/F9 |
+| S1 | NIP-17 DMs can trigger `message_posted` workflows | protocol+product | e2e SC | **GREEN** (`serve_wire_gift_wrap_fires_message_posted_once`, server.rs:446, ran 2026-08-09) | fixed | — | — | F1; ADR-0008 §S1-re-verification |
+| S2 | Workflow cannot re-trigger itself | safety | stamp on every emit + filter | **GREEN** (`trigger_filter.rs` 11/11 + engine/schema/lint/cron; toron-workflow lib 124/124, 2026-08-09) | fixed | — | — | F6; ADR-0008 §S2-re-verification |
+| S3 | Integrated mode shares durable mail state — agent state (identity/keys) AND mail content across processes | ADR-0003 3A | cross-process inbox | **GREEN** (`crates/toron-cli/tests/cli_robot.rs::cross_process_mail_content_shares_durable_root`, bd-p0-s3-shared-state-reword-mujh) | fixed | — | — | F2; ADR-0008 P0 final |
+| S4 | toron mail ids round-trip through flywheel | integration | ack after inbox | **GREEN** (MessageId(String) + MailSurface; flywheel MailBackend DELETED, se2.3 — no u64 at edge; MCP surface all-String enforced by `no_integer_id_fields_in_tool_surface`) | fixed | — | — | F3; ADR-0008 §S4 + §F4.ID-TYPE |
+| S5 | `foreach` binds loop variable | engine | body uses item | **GREEN** (`foreach_over_list_collects`, engine.rs:2041, 2026-08-09) | fixed | — | — | F4; ADR-0008 §S5-re-verification |
+| S6 | `call_workflow` composes workflows | ADR-0005 Spec | nested run | **GREEN** (`call_workflow_nested_subrun_returns_child_output`, engine.rs:2136, 2026-08-09) | fixed | — | — | F5; ADR-0008 §S6-re-verification |
+| S7 | Mention burst → one job | ADR-0004 Ship 1 | one 43001 | **GREEN** at host (`coalesced_burst_publishes_one_stamped_43001`, workflow_host.rs:824, 2026-08-09) | fixed | — | — | F7; ADR-0008 §S7-re-verification |
+| S8 | 25 resources readable | ADR-0003 | resource read | **GREEN** (honest-stub gate tightened; `all_25_resources_resolve_to_non_empty_json` + 25-URI coverage, bd-p0-s8-resources-stub-gate-rrfz) | fixed | — | — | F10; ADR-0008 §F4.S8 |
+| S9 | Nostr is AM superset at flywheel trait | captain mandate | same intents, both backends | **GREEN** (se2.3: MailBackend deleted, MailSurface String ids consumed by both backends; no u64 at edge) | fixed | — | — | F3/F9; known-divergences.md §9b |
 | S10 | Superlogical is honest stub | ADR | Unsupported | **PASS** | preserved | — | no silent fallback | superlogical.rs |
+| F2.KDF | Durable root Mailbox startup bounded (many-keys) | hardening | 50-key gate | **GREEN** (`unwrap_loop_kdf_cached_between_rebuilds_many_keys`, mailbox/mod.rs:540, 7.9s) | fixed | — | — | C2/F2.KDF; ADR-0008 §F2.KDF-re-verification |
+| bd-XXX ×3 | Renewal semantics regression pins | parity | named tests | **GREEN** (pins: build_slots renew absolute-expiry, reservations renew no-2x, identity collision — bd-p0-bdxxx-regression-tests-tz2y) | fixed | — | — | ADR-0008 P0 final |
+| F2.NIP40 | NIP-40 expiration honored on unwrap ingest (ADR-0008 probe) | crypto | RED→GREEN test | **GREEN** (`expired_gift_wrap_rejected_on_unwrap` + `future_expiration_gift_wrap_accepted_on_unwrap`; `wrap.is_expired()` at unwrap.rs:776 pre-write) | fixed | — | — | ADR-0008 §F2.NIP40 + §P3 CRYPTO probe 2 |
 
 ---
 
@@ -1049,3 +1052,25 @@ MailSurface finish. **Do not** land durable XDG in production paths before R2.0.
 - [ADR-0006](0006-blossom-blob-federation.md) — orthogonal blobs
 
 // governed-by: ADR-0007 (accepted, rev 3)
+
+---
+
+## Soundness Ledger — ADR-0008 Reconciliation (2026-08-09, bd-p6-soundness-ledger-update-lajq)
+
+The ledger above was updated from ADR-0008's de novo review verdicts (P0 final
+verdict table in `docs/review/findings.md`). Reconciliation notes:
+
+- **S1-S9 all GREEN** — the round-1 FAIL/PARTIAL/stuck cells (S2, S4-S9) were
+  verified resolved in code by the P0 epic (each with a named gate test + live
+  run 2026-08-09). No FAIL/stuck cell remains that the review proved GREEN.
+- **S4 detail:** the F11 dead `Vec<i64>` selectors (renamed `file_reservation_ids`
+  on renew/release) were REMOVED by bd-p2-id-type-end-to-end-v9dy — the MCP
+  surface is all-String, enforced by `no_integer_id_fields_in_tool_surface`.
+- **F2.KDF row added** (was prose only): 50-key gate GREEN, 7.9s.
+- **bd-XXX ×3 row added:** regression pins landed (build_slots renew
+  absolute-expiry, reservations renew no-2x, identity collision).
+- **F2.NIP40 row added:** the ADR-0008 probe was RED (expired wraps accepted) →
+  fix merged (unwrap.rs:776 `is_expired()` pre-write) → RED→GREEN tests.
+- **Remaining open REDs (NOT ledger lies, tracked):** F3.COALESCER-LOCK (P1,
+  wired to bd-batch-fix-pass-mip4) and F19.NIP09 deletion (P0, wired to the same
+  batch). Ledger cells above do not claim those; they are batch-pass items.
