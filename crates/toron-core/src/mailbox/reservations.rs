@@ -1,5 +1,4 @@
 // governed-by: ADR-0003
-// governed-by: ADR-0011 (Spec 2/4/6 — intents, soft-conflict, request-release)
 #![forbid(unsafe_code)]
 
 //! File reservation cluster (bd-led.5.5): file_reservation_paths (acquire),
@@ -19,170 +18,23 @@
 //! 4. NIP-09 is never the correctness mechanism (author-only);
 //! 5. previous holder notified via NIP-17 with the heuristic summary;
 //! 6. Git archive records the acquire → revoked transition (G13 history).
-//!
-//! **Intents + soft conflicts (ADR-0011 Spec 2/4):** a 30031 may carry a
-//! `status:intent` marker — a declared plan to edit a path set BEFORE
-//! acquiring. Status-less 30031s = held (backward compat, unchanged). The
-//! conflict view splits TWO tiers over the SAME atomic projection:
-//! - an acquire against someone's **held** exclusive lease → HARD conflict →
-//!   blocked (the corruption-prevention floor, NEVER removed);
-//! - an acquire against someone's in-TTL **intent** → SOFT conflict → the
-//!   acquirer is frozen (not granted, classified soft — a hard block would
-//!   collapse the intent layer into request-release).
-//!
-//! Intents auto-expire after [`INTENT_TTL_SECS`] unless they convert to held
-//!   (the same author acquiring the same `(kind,d)` coordinate supersedes the
-//!   intent — must-convert, anti-griefing).
-//!
-//! **Request-release negotiation (ADR-0011 Spec 6):** replaces the binary
-//! voluntary-release | force-release with a ladder: a typed kind-14 DM asks
-//! the holder to release/defer (toron-kind=request-release), the holder
-//! answers (request-release-response), and a request unanswered within
-//! [`REQUEST_RELEASE_TIER_WINDOW_SECS`] escalates to a kind-14 DM to the
-//! captain (the operator key). Force-release stays the operator last resort.
 
-use nostr_sdk::nostr::{Event, EventId, Keys, Kind, PublicKey, Tag, Timestamp};
+use nostr_sdk::nostr::{Event, EventId, Keys, PublicKey, Tag, Timestamp};
 
 use crate::bus::addressable::is_revocation;
-use crate::bus::filter::{ToronFilter, kind_project_filter};
+use crate::bus::filter::kind_project_filter;
 use crate::bus::scoping::with_project_scoping;
 use crate::bus::{EnvelopeTtl, resolve_coordinate};
 use crate::mailbox::guard::pattern_matches;
 use crate::nostr::event::build_event;
-use crate::nostr::gift_wrap;
 use crate::nostr::kinds::{FILE_RESERVATION, toron_kind};
 
 use super::Mailbox;
 use super::collect_replay;
-use super::messaging::{SendMessage, SendResult};
 
 /// Default staleness threshold for force-release (holder inactive this long
 /// counts as stale). Matches the AM-Rust inactivity heuristic spirit (30 min).
 pub const STALE_AFTER_SECS: u64 = 30 * 60;
-
-/// Intent TTL (ADR-0011 Spec 2): an intent auto-expires this long after
-/// declaration UNLESS it converts to a held reservation (must-convert). A
-/// speculative intent cannot freeze peers indefinitely. Tunable per
-/// declaration via `declare_intent(ttl_secs)`.
-pub const INTENT_TTL_SECS: u64 = 5 * 60;
-
-/// Request-release escalation tier (ADR-0011 Spec 6): a request unanswered
-/// within this window escalates to a captain DM (kind-14, importance high).
-pub const REQUEST_RELEASE_TIER_WINDOW_SECS: u64 = 15 * 60;
-
-/// The 30031 status state machine (ADR-0011 Spec 2). Status-less 30031s are
-/// `Held` (backward compat — existing reservations are byte-identical).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum ReservationStatus {
-    /// A live exclusive/shared lease (default for status-less 30031s).
-    Held,
-    /// A declared plan to edit a path set (soft-conflict tier, TTL-bounded).
-    Intent,
-    /// Holder-released marker (terminal).
-    Released,
-    /// Operator revocation (A1, terminal).
-    Revoked,
-}
-
-/// The typed ask in a request-release message (ADR-0011 Spec 6).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum ReleaseAsk {
-    /// Release the reservation now.
-    Release,
-    /// Defer the reservation for `defer_secs`.
-    Defer { defer_secs: u64 },
-}
-
-/// The holder's decision in a request-release response (ADR-0011 Spec 6).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum ReleaseDecision {
-    /// Released (or will release) the reservation.
-    Agreed,
-    /// Refused.
-    Denied,
-    /// Released for `defer_secs`; will re-hold afterwards.
-    Deferred { defer_secs: u64 },
-}
-
-/// Result of `declare_intent` (ADR-0011 Spec 2).
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct IntentResult {
-    pub declared: Vec<GrantedReservation>,
-}
-
-/// An active intent (projection view, in-TTL only).
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct IntentReservation {
-    /// The intent event id (the kind-30031 event id of the current intent).
-    pub id: String,
-    /// Agent name (declarer).
-    pub agent_name: String,
-    /// Declarer npub (hex).
-    pub agent_pubkey: String,
-    /// Declared path glob (`project:path-glob` d-tag, project part stripped).
-    pub path_pattern: String,
-    /// Optional reason.
-    pub reason: String,
-    /// Declaration time (epoch secs).
-    pub declared_at_secs: i64,
-    /// Intent expiry (NIP-40 or `declared_at + ttl`, epoch µs).
-    pub expires_ts_us: Option<i64>,
-    /// The TTL the intent was declared with.
-    pub ttl_secs: u64,
-}
-
-/// `request_release` (ADR-0011 Spec 6): Crew A asks holder B to release or
-/// defer a held reservation via a typed kind-14 DM.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct RequestRelease {
-    pub project_slug: String,
-    /// The requesting agent (crew A).
-    pub sender_name: String,
-    /// The holder being asked (crew B).
-    pub target_agent: String,
-    /// Reservation id = the kind-30031 event id of the held lease.
-    pub reservation_id: String,
-    pub ask: ReleaseAsk,
-    pub note: Option<String>,
-}
-
-/// Result of `request_release`.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct RequestReleaseResult {
-    /// The request message id (the kind-14 rumor id).
-    pub message_id: String,
-    pub delivered: bool,
-    /// The contested path pattern.
-    pub path_pattern: String,
-    /// The holder asked (crew B).
-    pub holder: String,
-}
-
-/// `respond_request_release` (ADR-0011 Spec 6): the holder answers the
-/// request; the response carries a `decision` tag back to the requester.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct ReleaseResponse {
-    pub project_slug: String,
-    /// The responding holder (crew B).
-    pub sender_name: String,
-    /// The request's message id (the kind-14 rumor id from `request_release`).
-    pub request_message_id: String,
-    pub decision: ReleaseDecision,
-    pub note: Option<String>,
-}
-
-/// Resolution of a request-release negotiation (ADR-0011 Spec 6).
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum RequestReleaseStatus {
-    /// Request sent, no response yet, escalation window not elapsed.
-    Pending { sent_at_secs: i64, window_secs: u64 },
-    /// The holder responded with a decision.
-    Responded { decision: ReleaseDecision },
-    /// Request unanswered past the tier window → escalate (captain DM).
-    EscalationDue { sent_at_secs: i64, window_secs: u64 },
-    /// Request message not found (or not authored by the caller).
-    Unknown,
-}
 
 /// A resolved active reservation (projection view).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -201,9 +53,6 @@ pub struct Reservation {
     pub reason: String,
     /// NIP-40 expiration (µs); `None` = no expiry.
     pub expires_ts_us: Option<i64>,
-    /// 30031 status state (ADR-0011 Spec 2). `active_reservations` returns
-    /// only `Held`; intents live in [`Mailbox::active_intents`].
-    pub status: ReservationStatus,
 }
 
 /// Result of `file_reservation_paths` (parity shape).
@@ -211,10 +60,6 @@ pub struct Reservation {
 pub struct AcquireResult {
     pub granted: Vec<GrantedReservation>,
     pub conflicts: Vec<PathConflict>,
-    /// Paths NOT granted because an other agent's in-TTL intent overlaps
-    /// (ADR-0011 Spec 4 — SOFT conflict: freeze + propose, NOT a hard block).
-    /// Absent in AM-Rust (additive; the held tier is unchanged).
-    pub soft_conflicts: Vec<PathConflict>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -235,18 +80,11 @@ pub struct PathConflict {
 /// Result of `check_file_reservation_conflicts` (parity shape).
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ConflictReport {
-    /// True when no HARD conflicts (held-tier). SOFT conflicts (intents) do
-    /// not block — see `has_soft_conflicts`.
     pub conflict_free: bool,
-    /// Hard conflicts (other agents' held exclusive leases).
     pub conflicts: Vec<PathConflict>,
     pub clear_paths: Vec<String>,
     pub checked_paths: usize,
     pub total_conflicting_reservations: usize,
-    /// Soft conflicts (other agents' in-TTL intents) — ADR-0011 Spec 4.
-    pub soft_conflicts: Vec<PathConflict>,
-    /// True when any path has a soft conflict.
-    pub has_soft_conflicts: bool,
 }
 
 /// Result of `renew_file_reservations`.
@@ -265,14 +103,7 @@ pub struct ReleaseResult {
 impl Mailbox {
     /// `file_reservation_paths` (acquire): request leases on `paths`. Conflict
     /// is checked symmetrically against OTHER agents' active reservations; own
-    /// never conflicts. Two tiers (ADR-0011 Spec 4):
-    /// - other's held exclusive lease → HARD conflict → blocked (as before);
-    /// - other's in-TTL intent → SOFT conflict → frozen (not granted, listed
-    ///   in `soft_conflicts`, NOT a hard block).
-    ///
-    /// Granted leases are published as kind-30031 events. An acquire on the
-    ///   acquirer's OWN intent converts it to held (same `(kind,d)` coordinate,
-    ///   same author → NIP-33 supersession — must-convert, Spec 2).
+    /// never conflicts. Granted leases are published as kind-30031 events.
     pub async fn file_reservation_paths(
         &self,
         project_slug: &str,
@@ -287,32 +118,13 @@ impl Mailbox {
 
         for path in paths {
             let d = format!("{project_slug}:{path}");
-            let hits = self
-                .conflict_view(&agent_keys.public_key(), project_slug, path)
+            let conflicts = self
+                .conflicts_for(&agent_keys.public_key(), project_slug, path)
                 .await;
-            let hard: Vec<String> = hits
-                .iter()
-                .filter(|h| h.status == ReservationStatus::Held)
-                .map(|h| h.agent_name.clone())
-                .collect();
-            let soft: Vec<String> = hits
-                .iter()
-                .filter(|h| h.status == ReservationStatus::Intent)
-                .map(|h| h.agent_name.clone())
-                .collect();
-            if !hard.is_empty() {
+            if !conflicts.is_empty() {
                 result.conflicts.push(PathConflict {
                     path: path.clone(),
-                    holders: hard,
-                });
-                continue;
-            }
-            if !soft.is_empty() {
-                // Freeze + propose (Spec 4): not a hard block, not granted.
-                // The proposer/detector consumer (P11.3b) fires on this.
-                result.soft_conflicts.push(PathConflict {
-                    path: path.clone(),
-                    holders: soft,
+                    holders: conflicts,
                 });
                 continue;
             }
@@ -360,71 +172,8 @@ impl Mailbox {
         Ok(result)
     }
 
-    /// `declare_intent` (ADR-0011 Spec 2): publish a `status:intent` 30031 for
-    /// each path — a declared plan to edit it BEFORE acquiring. Intents are
-    /// advisory + TTL-bounded (auto-expire after `ttl_secs`, default
-    /// [`INTENT_TTL_SECS`]) unless converted to held by the declarer's own
-    /// acquire. Declaring against a held lease is allowed (request-release
-    /// exists exactly for that path).
-    pub async fn declare_intent(
-        &self,
-        project_slug: &str,
-        agent_name: &str,
-        paths: &[String],
-        reason: Option<&str>,
-        ttl_secs: Option<u64>,
-    ) -> anyhow::Result<IntentResult> {
-        let agent_keys = self.agent_keys_for(project_slug, agent_name)?;
-        let mut result = IntentResult::default();
-        for path in paths {
-            let d = format!("{project_slug}:{path}");
-            let ttl = ttl_secs.unwrap_or(INTENT_TTL_SECS);
-            let mut tags = with_project_scoping(
-                toron_kind(FILE_RESERVATION),
-                vec![
-                    Tag::parse(["d", &d]).expect("d"),
-                    Tag::parse(["status", "intent"]).expect("status"),
-                    Tag::parse(["reason", reason.unwrap_or("")]).expect("reason"),
-                ],
-                Some(project_slug),
-            );
-            let created = Timestamp::now();
-            if let Some(exp) = (EnvelopeTtl { secs: Some(ttl) }).expiration_tag(created) {
-                tags.push(exp);
-            }
-            let content = format!(
-                r#"{{"status":"intent","exclusive":true,"reason":{}}}"#,
-                serde_json::to_string(reason.unwrap_or("")).expect("reason json")
-            );
-            let event = build_event(
-                &agent_keys,
-                toron_kind(FILE_RESERVATION),
-                content,
-                tags,
-                created,
-            )?;
-            let ok = self.bus.publish(event.clone()).await?;
-            if !ok.stored {
-                anyhow::bail!("intent event rejected by bus");
-            }
-            result.declared.push(GrantedReservation {
-                id: event.id.to_hex(),
-                path_pattern: path.clone(),
-                exclusive: true,
-                reason: reason.unwrap_or("").to_string(),
-                expires_ts_us: (EnvelopeTtl { secs: Some(ttl) })
-                    .expiration_at(created)
-                    .map(|t| t.as_secs() as i64 * 1_000_000),
-            });
-        }
-        Ok(result)
-    }
-
     /// `check_file_reservation_conflicts`: symmetric-glob conflict report for
-    /// paths vs OTHER agents' active reservations, split into hard (held) and
-    /// soft (in-TTL intent) tiers (ADR-0011 Spec 4). `conflict_free` keeps its
-    /// contract = no HARD conflicts; `has_soft_conflicts` reports the advisory
-    /// tier (soft conflicts never hard-block).
+    /// paths vs OTHER agents' active reservations.
     pub async fn check_file_reservation_conflicts(
         &self,
         project_slug: &str,
@@ -437,38 +186,19 @@ impl Mailbox {
             ..Default::default()
         };
         for path in paths {
-            let hits = self
-                .conflict_view(&agent_keys.public_key(), project_slug, path)
+            let holders = self
+                .conflicts_for(&agent_keys.public_key(), project_slug, path)
                 .await;
-            let hard: Vec<String> = hits
-                .iter()
-                .filter(|h| h.status == ReservationStatus::Held)
-                .map(|h| h.agent_name.clone())
-                .collect();
-            let soft: Vec<String> = hits
-                .iter()
-                .filter(|h| h.status == ReservationStatus::Intent)
-                .map(|h| h.agent_name.clone())
-                .collect();
-            if hard.is_empty() && soft.is_empty() {
+            if holders.is_empty() {
                 report.clear_paths.push(path.clone());
             } else {
-                if !hard.is_empty() {
-                    report.conflicts.push(PathConflict {
-                        path: path.clone(),
-                        holders: hard,
-                    });
-                }
-                if !soft.is_empty() {
-                    report.soft_conflicts.push(PathConflict {
-                        path: path.clone(),
-                        holders: soft,
-                    });
-                }
+                report.conflicts.push(PathConflict {
+                    path: path.clone(),
+                    holders,
+                });
             }
         }
         report.conflict_free = report.conflicts.is_empty();
-        report.has_soft_conflicts = !report.soft_conflicts.is_empty();
         report.total_conflicting_reservations =
             report.conflicts.iter().map(|c| c.holders.len()).sum();
         Ok(report)
@@ -689,14 +419,12 @@ impl Mailbox {
         Ok(())
     }
 
-    /// Active (non-revoked, non-released, non-expired) kind-30031 events in a
-    /// project, resolved with operator priority (bd-toh) and classified by
-    /// status. Both held leases and intents flow through here — the single
-    /// replay feeds every consumer (held view, intent board, conflict view).
-    pub(crate) async fn resolved_leases(
+    /// Active (non-revoked, non-expired) reservations in a project, resolved
+    /// with operator priority (bd-toh).
+    pub(crate) async fn active_reservations(
         &self,
         project_slug: &str,
-    ) -> anyhow::Result<Vec<ResolvedLease>> {
+    ) -> anyhow::Result<Vec<Reservation>> {
         let filter = kind_project_filter(toron_kind(FILE_RESERVATION), project_slug);
         let events = collect_replay(self.bus.as_ref(), filter).await?;
         let operator = self.operator.as_ref().map(|k| k.public_key());
@@ -720,11 +448,14 @@ impl Mailbox {
             let Some(winning) = resolve_coordinate(evs.iter().copied(), operator.as_ref()) else {
                 continue;
             };
-            let status = lease_status(&winning);
-            if status == ReservationStatus::Revoked || status == ReservationStatus::Released {
+            if is_revocation(&winning) {
                 continue;
             }
-            // TTL expiry clears the lease (NIP-40, held and intent alike).
+            // Released marker → skip.
+            if winning.content.contains("released") {
+                continue;
+            }
+            // TTL expiry clears the lease.
             if let Some(exp) = winning.tags.expiration()
                 && (exp.as_secs() as i64) < now_secs
             {
@@ -742,8 +473,9 @@ impl Mailbox {
                 })
                 .flatten()
                 .unwrap_or_default();
-            out.push(ResolvedLease {
+            out.push(Reservation {
                 id: winning.id.to_hex(),
+                agent_name: String::new(), // resolved via profile below
                 agent_pubkey: winning.pubkey.to_hex(),
                 path_pattern: path.to_string(),
                 exclusive,
@@ -752,116 +484,30 @@ impl Mailbox {
                     .tags
                     .expiration()
                     .map(|t| t.as_secs() as i64 * 1_000_000),
-                status,
-                created_at_secs: winning.created_at.as_secs() as i64,
             });
         }
-        Ok(out)
-    }
-
-    /// Active (non-revoked, non-expired) HELD reservations in a project —
-    /// the pre-intent view, byte-compatible with the old
-    /// `active_reservations` (status-less 30031s = held).
-    pub(crate) async fn active_reservations(
-        &self,
-        project_slug: &str,
-    ) -> anyhow::Result<Vec<Reservation>> {
-        let mut out: Vec<Reservation> = self
-            .resolved_leases(project_slug)
-            .await?
-            .into_iter()
-            .filter(|l| l.status == ReservationStatus::Held)
-            .map(|l| Reservation {
-                id: l.id,
-                agent_name: String::new(), // resolved via profile below
-                agent_pubkey: l.agent_pubkey,
-                path_pattern: l.path_pattern,
-                exclusive: l.exclusive,
-                reason: l.reason,
-                expires_ts_us: l.expires_ts_us,
-                status: ReservationStatus::Held,
-            })
-            .collect();
         // Fill agent names from profiles (best-effort).
         self.fill_agent_names(project_slug, &mut out).await;
         Ok(out)
     }
 
-    /// Active (in-TTL, non-expired) intents in a project (ADR-0011 Spec 2):
-    /// the intent board. An intent auto-expires `INTENT_TTL_SECS` after
-    /// declaration unless converted to held (must-convert).
-    pub async fn active_intents(
-        &self,
-        project_slug: &str,
-    ) -> anyhow::Result<Vec<IntentReservation>> {
-        let leases = self.resolved_leases(project_slug).await?;
-        let now_secs = Timestamp::now().as_secs() as i64;
-        let mut intents: Vec<IntentReservation> = leases
-            .into_iter()
-            .filter(|l| l.status == ReservationStatus::Intent)
-            .filter(|l| l.created_at_secs.saturating_add(INTENT_TTL_SECS as i64) >= now_secs)
-            .map(|l| {
-                let ttl_end_us = (l.created_at_secs.saturating_add(INTENT_TTL_SECS as i64))
-                    * 1_000_000;
-                IntentReservation {
-                    id: l.id,
-                    agent_name: String::new(), // filled below
-                    agent_pubkey: l.agent_pubkey,
-                    path_pattern: l.path_pattern,
-                    reason: l.reason,
-                    declared_at_secs: l.created_at_secs,
-                    expires_ts_us: Some(l.expires_ts_us.unwrap_or(ttl_end_us).min(ttl_end_us)),
-                    ttl_secs: INTENT_TTL_SECS,
-                }
-            })
-            .collect();
-        let names = self.agent_name_map(project_slug).await;
-        for i in intents.iter_mut() {
-            i.agent_name = names
-                .get(&i.agent_pubkey)
-                .cloned()
-                .unwrap_or_else(|| i.agent_pubkey.chars().take(8).collect());
-        }
-        Ok(intents)
-    }
-
-    /// Symmetric-glob conflict view against OTHER agents' active leases:
-    /// held exclusive leases = HARD (`Held` hits), in-TTL intents = SOFT
-    /// (`Intent` hits). Own leases never conflict; shared leases never block.
-    /// One replay serves both tiers (ADR-0011 Spec 4).
-    async fn conflict_view(
+    /// Symmetric-glob conflict: holders of OTHER active reservations whose
+    /// glob overlaps `path` either way.
+    async fn conflicts_for(
         &self,
         own_npub: &PublicKey,
         project_slug: &str,
         path: &str,
-    ) -> Vec<ConflictHit> {
-        let leases = match self.resolved_leases(project_slug).await {
-            Ok(l) => l,
+    ) -> Vec<String> {
+        let res = match self.active_reservations(project_slug).await {
+            Ok(r) => r,
             Err(_) => return Vec::new(),
         };
-        let now_secs = Timestamp::now().as_secs() as i64;
-        let names = self.agent_name_map(project_slug).await;
-        leases
-            .into_iter()
-            .filter(|l| l.agent_pubkey != own_npub.to_hex())
-            .filter(|l| l.exclusive)
-            .filter(|l| overlaps(&l.path_pattern, path))
-            .filter(|l| match l.status {
-                ReservationStatus::Held => true,
-                ReservationStatus::Intent => {
-                    l.created_at_secs.saturating_add(INTENT_TTL_SECS as i64) >= now_secs
-                }
-                _ => false,
-            })
-            .map(|l| ConflictHit {
-                agent_name: names
-                    .get(&l.agent_pubkey)
-                    .cloned()
-                    .unwrap_or_else(|| l.agent_pubkey.chars().take(8).collect()),
-                reservation_id: l.id,
-                path_pattern: l.path_pattern,
-                status: l.status,
-            })
+        res.into_iter()
+            .filter(|r| r.agent_pubkey != own_npub.to_hex())
+            .filter(|r| r.exclusive)
+            .filter(|r| overlaps(&r.path_pattern, path))
+            .map(|r| r.agent_name)
             .collect()
     }
 
@@ -889,14 +535,14 @@ impl Mailbox {
         }
     }
 
-    /// Best-effort pubkey → agent-name map from kind-30013 profiles.
-    async fn agent_name_map(&self, project_slug: &str) -> std::collections::HashMap<String, String> {
+    /// Best-effort: fill `agent_name` from kind-30013 profiles.
+    async fn fill_agent_names(&self, project_slug: &str, reservations: &mut [Reservation]) {
         let filter =
             kind_project_filter(toron_kind(crate::nostr::kinds::AGENT_PROFILE), project_slug);
         let Ok(events) = collect_replay(self.bus.as_ref(), filter).await else {
-            return std::collections::HashMap::new();
+            return;
         };
-        events
+        let name_by_pubkey: std::collections::HashMap<String, String> = events
             .iter()
             .map(|e| {
                 (
@@ -906,12 +552,7 @@ impl Mailbox {
                         .unwrap_or_default(),
                 )
             })
-            .collect()
-    }
-
-    /// Best-effort: fill `agent_name` from kind-30013 profiles.
-    async fn fill_agent_names(&self, project_slug: &str, reservations: &mut [Reservation]) {
-        let name_by_pubkey = self.agent_name_map(project_slug).await;
+            .collect();
         for r in reservations.iter_mut() {
             if let Some(name) = name_by_pubkey.get(&r.agent_pubkey) {
                 r.agent_name = name.clone();
@@ -919,353 +560,6 @@ impl Mailbox {
                 r.agent_name = r.agent_pubkey.chars().take(8).collect();
             }
         }
-    }
-
-    /// `request_release` (ADR-0011 Spec 6): Crew A asks holder B to release
-    /// or defer a held reservation via a typed kind-14 DM (toron-kind=
-    /// `request-release`, importance high, ack-required). Validates that the
-    /// reservation exists, is HELD, and is held by `target_agent`.
-    pub async fn request_release(
-        &self,
-        args: &RequestRelease,
-    ) -> anyhow::Result<RequestReleaseResult> {
-        if args.sender_name == args.target_agent {
-            anyhow::bail!(
-                "request-release to self is a no-op — {} already holds it",
-                args.target_agent
-            );
-        }
-        let lease = self
-            .active_reservations(&args.project_slug)
-            .await?
-            .into_iter()
-            .find(|r| r.id == args.reservation_id)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "no active held reservation with id {}",
-                    args.reservation_id
-                )
-            })?;
-        if lease.status != ReservationStatus::Held {
-            anyhow::bail!(
-                "reservation {} is not held (status {:?})",
-                args.reservation_id,
-                lease.status
-            );
-        }
-        if lease.agent_name != args.target_agent {
-            anyhow::bail!(
-                "reservation {} is held by {} (not {})",
-                args.reservation_id,
-                lease.agent_name,
-                args.target_agent
-            );
-        }
-        let ask_tag = ask_to_tag(&args.ask);
-        let mut extra = vec![
-            Tag::parse(["toron-kind", "request-release"]).expect("kind"),
-            Tag::parse(["ask", &ask_tag]).expect("ask"),
-            Tag::parse(["reservation-id", &args.reservation_id]).expect("res"),
-        ];
-        if let Ok(lease_id) = EventId::from_hex(&args.reservation_id) {
-            // NIP-10 e-reference to the held lease event.
-            extra.push(Tag::event(lease_id));
-        }
-        let send = SendMessage {
-            project_slug: args.project_slug.clone(),
-            sender_name: args.sender_name.clone(),
-            to: vec![args.target_agent.clone()],
-            subject: format!("[request-release] {}", lease.path_pattern),
-            body_md: format!(
-                "{} asks you to {} reservation {} ({}){}\nReply with a request-release-response: agreed | denied | deferred:<secs>.",
-                args.sender_name,
-                ask_tag,
-                args.reservation_id,
-                lease.path_pattern,
-                args.note
-                    .as_ref()
-                    .map(|n| format!(" — {n}"))
-                    .unwrap_or_default()
-            ),
-            importance: Some("high".into()),
-            ack_required: true,
-            extra_tags: extra,
-            ..Default::default()
-        };
-        let res = self.send_message(&send).await?;
-        let message_id = res
-            .deliveries
-            .iter()
-            .find(|d| d.payload.recipient == args.target_agent)
-            .map(|d| d.payload.event_id.clone())
-            .unwrap_or_default();
-        Ok(RequestReleaseResult {
-            delivered: !message_id.is_empty(),
-            message_id,
-            path_pattern: lease.path_pattern,
-            holder: lease.agent_name,
-        })
-    }
-
-    /// `respond_request_release` (ADR-0011 Spec 6): the holder answers the
-    ///   request with a typed kind-14 DM (toron-kind=`request-release-response`
-    ///   plus a `decision` tag and a NIP-10 reply ref to the request).
-    ///
-    /// Only the request's recipient can respond (the wrap is sealed for
-    ///   them); the reply goes back to the requester.
-    pub async fn respond_request_release(
-        &self,
-        args: &ReleaseResponse,
-    ) -> anyhow::Result<SendResult> {
-        let request = self
-            .find_request_by_id(&args.project_slug, &args.sender_name, &args.request_message_id)
-            .await?;
-        // The requester = the request rumor's author → name via profiles.
-        let profiles = self.project_profiles(&args.project_slug).await?;
-        let requester_name = profiles
-            .iter()
-            .find_map(|ev| {
-                (ev.pubkey == request.author_pubkey)
-                    .then(|| crate::nostr::identity::parse_profile(ev))
-                    .flatten()
-                    .map(|p| p.name)
-            })
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "requester {} has no registered profile in project {}",
-                    request.author_pubkey.to_hex().chars().take(8).collect::<String>(),
-                    args.project_slug
-                )
-            })?;
-        let decision_tag = decision_to_tag(&args.decision);
-        let mut extra = vec![
-            Tag::parse(["toron-kind", "request-release-response"]).expect("kind"),
-            Tag::parse(["decision", &decision_tag]).expect("decision"),
-            Tag::parse(["reservation-id", &request.reservation_id]).expect("res"),
-        ];
-        if let Ok(req_id) = EventId::from_hex(&args.request_message_id) {
-            // NIP-10 reply ref to the request rumor.
-            extra.push(Tag::event(req_id));
-        }
-        let send = SendMessage {
-            project_slug: args.project_slug.clone(),
-            sender_name: args.sender_name.clone(),
-            to: vec![requester_name],
-            subject: format!("[request-release-response] {decision_tag}"),
-            body_md: format!(
-                "decision: {decision_tag}{}",
-                args.note
-                    .as_ref()
-                    .map(|n| format!(" — {n}"))
-                    .unwrap_or_default()
-            ),
-            importance: Some("high".into()),
-            ack_required: true,
-            extra_tags: extra,
-            ..Default::default()
-        };
-        self.send_message(&send).await
-    }
-
-    /// `request_release_status` (ADR-0011 Spec 6): resolve a negotiation by
-    /// its request message id: `Pending` (window not elapsed), `Responded`
-    /// (holder answered), `EscalationDue` (window elapsed, no response — the
-    /// caller fires [`Mailbox::escalate_request_release`]), or `Unknown`
-    /// (message missing or not authored by the caller).
-    pub async fn request_release_status(
-        &self,
-        project_slug: &str,
-        requestor_name: &str,
-        request_message_id: &str,
-        window_secs: Option<u64>,
-    ) -> RequestReleaseStatus {
-        let window = window_secs.unwrap_or(REQUEST_RELEASE_TIER_WINDOW_SECS);
-        let Ok(keys) = self.agent_keys_for(project_slug, requestor_name) else {
-            return RequestReleaseStatus::Unknown;
-        };
-        let mut rumors = self.project_rumors(project_slug).await;
-        let now_secs = Timestamp::now().as_secs() as i64;
-        let Some(request) = rumors.iter_mut().find(|r| {
-            r.kind == Kind::PrivateDirectMessage
-                && r.pubkey == keys.public_key()
-                && (**r).clone().id().to_hex() == request_message_id
-                && r.tags.iter().any(|t| {
-                    t.as_slice() == ["toron-kind".to_string(), "request-release".to_string()]
-                })
-        }) else {
-            return RequestReleaseStatus::Unknown;
-        };
-        let sent_at = request.created_at.as_secs() as i64;
-        // A typed response to THIS request (e-ref matches) with a parseable
-        // decision settles the negotiation; anything else is not a response.
-        // Multiple responses → the LATEST decision wins (projection rule).
-        let decided = rumors
-            .iter_mut()
-            .filter_map(|r| {
-                (r.kind == Kind::PrivateDirectMessage
-                    && r.tags.iter().any(|t| {
-                        t.as_slice()
-                            == ["toron-kind".to_string(), "request-release-response".to_string()]
-                    })
-                    && r.tags.iter().any(|t| {
-                        t.as_slice().first().map(|s| s == "e").unwrap_or(false)
-                            && t.as_slice().get(1).map(|s| s == request_message_id).unwrap_or(false)
-                    }))
-                .then(|| decision_from_tags(&r.tags))
-                .flatten()
-                .map(|d| (r.created_at.as_secs() as i64, d))
-            })
-            .max_by_key(|(ts, _)| *ts)
-            .map(|(_, d)| d);
-        if let Some(decision) = decided {
-            return RequestReleaseStatus::Responded { decision };
-        }
-        if now_secs.saturating_sub(sent_at) > window as i64 {
-            return RequestReleaseStatus::EscalationDue {
-                sent_at_secs: sent_at,
-                window_secs: window,
-            };
-        }
-        RequestReleaseStatus::Pending {
-            sent_at_secs: sent_at,
-            window_secs: window,
-        }
-    }
-
-    /// `escalate_request_release` (ADR-0011 Spec 6): a request unanswered past
-    /// the tier window escalates to a kind-14 DM to the captain (the operator
-    /// key — the project manifest authority), importance high. Idempotency is
-    /// the caller's job (the DM carries the request id so the captain can
-    /// dedupe). Force-release remains the operator's last resort.
-    pub async fn escalate_request_release(
-        &self,
-        project_slug: &str,
-        requestor_name: &str,
-        request_message_id: &str,
-        note: Option<&str>,
-    ) -> anyhow::Result<()> {
-        let operator = self.operator.as_ref().ok_or_else(|| {
-            anyhow::anyhow!("no operator key configured; cannot escalate to captain")
-        })?;
-        let request = self
-            .find_request_by_id(project_slug, requestor_name, request_message_id)
-            .await?;
-        let keys = self.agent_keys_for(project_slug, requestor_name)?;
-        if request.author_pubkey != keys.public_key() {
-            anyhow::bail!("message {request_message_id} is not your request-release");
-        }
-        let operator_npub = operator.public_key();
-        // Best-effort path label for the DM body (the lease may be gone).
-        let path_label = match self
-            .active_reservations(project_slug)
-            .await
-            .ok()
-            .and_then(|res| res.into_iter().find(|r| r.id == request.reservation_id))
-        {
-            Some(r) => r.path_pattern,
-            None => format!("reservation {}", request.reservation_id),
-        };
-        let rumor = gift_wrap::build_rumor(
-            keys.public_key(),
-            Timestamp::now(),
-            Kind::PrivateDirectMessage,
-            vec![
-                Tag::parse(["toron-kind", "request-release-escalation"]).expect("kind"),
-                Tag::parse(["p", &operator_npub.to_hex()]).expect("p"),
-                Tag::parse(["importance", "high"]).expect("importance"),
-                Tag::parse([
-                    "subject",
-                    &format!("[request-release-escalation] {path_label}"),
-                ])
-                .expect("subject"),
-                Tag::parse(["reservation-id", &request.reservation_id]).expect("res"),
-                Tag::event(EventId::from_hex(request_message_id).expect("request id")),
-            ],
-            format!(
-                "request-release from {requestor_name} for {path_label} (message {request_message_id}) unanswered past the tier window{}.",
-                note.map(|n| format!(" — {n}")).unwrap_or_default()
-            ),
-        );
-        let wrap = gift_wrap::gift_wrap(&keys, &operator_npub, rumor).await?;
-        self.publish_dm(&wrap).await?;
-        Ok(())
-    }
-
-    /// Locate a `request-release` rumor by its message id and confirm the
-    /// reader is involved (author or addressed via the rumor's `p` tags).
-    /// Gift-wrap seals hide recipients — the involvement check runs on the
-    /// unwrapped rumor (authentic: the rumor is signed by the requester).
-    async fn find_request_by_id(
-        &self,
-        project_slug: &str,
-        reader_name: &str,
-        request_message_id: &str,
-    ) -> anyhow::Result<RequestInfo> {
-        let keys = self.agent_keys_for(project_slug, reader_name)?;
-        let reader_pk = keys.public_key();
-        let rumors = self.project_rumors(project_slug).await;
-        let rumor = rumors
-            .iter()
-            .find(|r| {
-                r.kind == Kind::PrivateDirectMessage
-                    && (**r).clone().id().to_hex() == request_message_id
-                    && r.tags.iter().any(|t| {
-                        t.as_slice() == ["toron-kind".to_string(), "request-release".to_string()]
-                    })
-                    && (r.pubkey == reader_pk || rumor_addresses(r, &reader_pk.to_hex()))
-            })
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "no request-release message with id {request_message_id} addressed to {reader_name}"
-                )
-            })?;
-        Ok(RequestInfo {
-            author_pubkey: rumor.pubkey,
-            sent_at_secs: rumor.created_at.as_secs() as i64,
-            reservation_id: lease_tag_value(&rumor.tags, "reservation-id").unwrap_or_default(),
-        })
-    }
-
-    /// Collect kind-1059 wraps readable by ANY registered agent key in the
-    /// project, deduped by rumor id. Mirrors the projection's per-key unwrap
-    /// (G14): a sender cannot unwrap its own wrap (sealed for the recipient),
-    /// so status/escalation lookups must scan the recipient side too.
-    async fn project_rumors(&self, project_slug: &str) -> Vec<nostr_sdk::nostr::UnsignedEvent> {
-        let filter = ToronFilter::new().kinds([Kind::GiftWrap]).build();
-        let Ok(wraps) = collect_replay(self.bus.as_ref(), filter).await else {
-            return Vec::new();
-        };
-        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let mut out = Vec::new();
-        for name in self.registered_agent_names(project_slug).await {
-            let Some(keys) = self.load_agent_key(&self.agent_key_path(project_slug, &name))
-            else {
-                continue;
-            };
-            for w in &wraps {
-                let Ok(g) = gift_wrap::unwrap(&keys, w) else {
-                    continue;
-                };
-                let mut rumor = g.rumor;
-                let id = rumor.id().to_hex();
-                if seen.insert(id) {
-                    out.push(rumor);
-                }
-            }
-        }
-        out
-    }
-
-    /// Names of all registered agents in a project (kind-30013 profiles).
-    async fn registered_agent_names(&self, project_slug: &str) -> Vec<String> {
-        let Ok(profiles) = self.project_profiles(project_slug).await else {
-            return Vec::new();
-        };
-        profiles
-            .iter()
-            .filter_map(crate::nostr::identity::parse_profile)
-            .map(|p| p.name)
-            .collect()
     }
 
     /// Append an acquire/release/revoked transition record to the Git archive
@@ -1301,106 +595,6 @@ impl Mailbox {
 /// ways — AM-Rust parity).
 pub fn overlaps(a: &str, b: &str) -> bool {
     pattern_matches(a, b) || pattern_matches(b, a)
-}
-
-/// A located `request-release` rumor (author + metadata).
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct RequestInfo {
-    author_pubkey: PublicKey,
-    sent_at_secs: i64,
-    reservation_id: String,
-}
-
-/// One coordinate-resolved kind-30031 lease (held or intent), before
-/// agent-name filling. `status` classifies the winning event (Spec 2).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ResolvedLease {
-    pub id: String,
-    pub agent_pubkey: String,
-    pub path_pattern: String,
-    pub exclusive: bool,
-    pub reason: String,
-    pub expires_ts_us: Option<i64>,
-    pub status: ReservationStatus,
-    pub created_at_secs: i64,
-}
-
-/// One conflicting other-agent lease hit for a path.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ConflictHit {
-    pub agent_name: String,
-    pub reservation_id: String,
-    pub path_pattern: String,
-    pub status: ReservationStatus,
-}
-
-/// Classify a coordinate-winning 30031 event's status (ADR-0011 Spec 2).
-/// Status-less = `Held` (backward compat); `status:intent` = `Intent`;
-/// released/revoked markers are terminal. Recognized released forms: plain
-/// `status:released` in content, JSON `"status":"released"`, or a
-/// `["status", "released"]` tag.
-pub fn lease_status(winning: &Event) -> ReservationStatus {
-    if is_revocation(winning) {
-        return ReservationStatus::Revoked;
-    }
-    let status_tag = winning
-        .tags
-        .iter()
-        .find(|t| t.as_slice().first().map(|s| s == "status").unwrap_or(false))
-        .and_then(|t| t.as_slice().get(1).map(|s| s.to_string()));
-    match status_tag.as_deref() {
-        Some("intent") => ReservationStatus::Intent,
-        Some("released") => ReservationStatus::Released,
-        _ if winning.content.contains("released") => ReservationStatus::Released,
-        _ => ReservationStatus::Held,
-    }
-}
-
-/// First value of a `["<name>", <value>, ...]` tag (pair form only).
-fn lease_tag_value(tags: &nostr_sdk::nostr::Tags, name: &str) -> Option<String> {
-    tags.iter().find_map(|t| {
-        (t.as_slice().first().map(|s| s == name).unwrap_or(false))
-            .then(|| t.as_slice().get(1).map(|s| s.to_string()))
-            .flatten()
-    })
-}
-
-/// True when a rumor's `p` tags address `npub_hex` (kind-14 recipient list).
-fn rumor_addresses(rumor: &nostr_sdk::nostr::UnsignedEvent, npub_hex: &str) -> bool {
-    rumor.tags.iter().any(|t| {
-        t.as_slice().first().map(|s| s == "p").unwrap_or(false)
-            && t.as_slice().get(1).map(|s| s == npub_hex).unwrap_or(false)
-    })
-}
-
-/// Wire encoding of a request ask.
-fn ask_to_tag(ask: &ReleaseAsk) -> String {
-    match ask {
-        ReleaseAsk::Release => "release".to_string(),
-        ReleaseAsk::Defer { defer_secs } => format!("defer:{defer_secs}"),
-    }
-}
-
-/// Wire encoding of a response decision.
-fn decision_to_tag(decision: &ReleaseDecision) -> String {
-    match decision {
-        ReleaseDecision::Agreed => "agreed".to_string(),
-        ReleaseDecision::Denied => "denied".to_string(),
-        ReleaseDecision::Deferred { defer_secs } => format!("deferred:{defer_secs}"),
-    }
-}
-
-/// Decode a response `decision` tag. Unparseable → `None` (not a response).
-fn decision_from_tags(tags: &nostr_sdk::nostr::Tags) -> Option<ReleaseDecision> {
-    let v = lease_tag_value(tags, "decision")?;
-    match v.as_str() {
-        "agreed" => Some(ReleaseDecision::Agreed),
-        "denied" => Some(ReleaseDecision::Denied),
-        _ => v
-            .strip_prefix("deferred:")
-            .and_then(|s| s.parse::<u64>().ok())
-            .map(|defer_secs| ReleaseDecision::Deferred { defer_secs }),
-    }
 }
 
 #[cfg(test)]
@@ -1767,675 +961,6 @@ mod tests {
         let res = mailbox.active_reservations("demo").await.expect("active");
         assert!(res.is_empty(), "expired lease must not be active");
         let _ = (blue,);
-        let _ = std::fs::remove_file(&db_path);
-        let _ = std::fs::remove_dir_all(&data_dir);
-    }
-
-    #[tokio::test]
-    async fn test_declare_intent_publishes_status_intent_and_boards() {
-        let (mailbox, db_path, data_dir) = test_mailbox("intent-declare").await;
-        register(&mailbox, "demo", "BlueLake").await;
-
-        let intent = mailbox
-            .declare_intent(
-                "demo",
-                "BlueLake",
-                &["src/**".into()],
-                Some("auth rewrite"),
-                None,
-            )
-            .await
-            .expect("declare");
-        assert_eq!(intent.declared.len(), 1);
-        let ev_id = intent.declared[0].id.clone();
-
-        // Bus event carries the status:intent tag.
-        let events = collect_replay(
-            mailbox.bus.as_ref(),
-            kind_project_filter(toron_kind(FILE_RESERVATION), "demo"),
-        )
-        .await
-        .expect("collect");
-        let ev = events
-            .iter()
-            .find(|e| e.id.to_hex() == ev_id)
-            .expect("intent event on bus");
-        assert_eq!(
-            lease_status(ev),
-            ReservationStatus::Intent,
-            "status tag classifies as intent"
-        );
-
-        // Intent board shows it (in-TTL), agent named.
-        let intents = mailbox.active_intents("demo").await.expect("intents");
-        assert_eq!(intents.len(), 1);
-        assert_eq!(intents[0].agent_name, "BlueLake");
-        assert_eq!(intents[0].path_pattern, "src/**");
-        assert_eq!(intents[0].ttl_secs, INTENT_TTL_SECS);
-
-        // The intent is NOT a held reservation.
-        let held = mailbox.active_reservations("demo").await.expect("held");
-        assert!(held.is_empty(), "intent must not appear as held");
-
-        let _ = std::fs::remove_file(&db_path);
-        let _ = std::fs::remove_dir_all(&data_dir);
-    }
-
-    #[tokio::test]
-    async fn test_acquire_against_intent_is_soft_not_hard() {
-        let (mailbox, db_path, data_dir) = test_mailbox("soft-acquire").await;
-        register(&mailbox, "demo", "BlueLake").await;
-        register(&mailbox, "demo", "RoseDune").await;
-
-        // BlueLake declares an intent on src/**.
-        mailbox
-            .declare_intent("demo", "BlueLake", &["src/**".into()], None, None)
-            .await
-            .expect("declare");
-
-        // RoseDune acquires src/lib.rs → SOFT conflict (frozen), NOT a hard block.
-        let acq = mailbox
-            .file_reservation_paths(
-                "demo",
-                "RoseDune",
-                &["src/lib.rs".into()],
-                Some(3600),
-                true,
-                None,
-            )
-            .await
-            .expect("acquire");
-        assert!(acq.granted.is_empty(), "soft conflict freezes the acquire");
-        assert!(acq.conflicts.is_empty(), "NOT a hard block");
-        assert_eq!(acq.soft_conflicts.len(), 1, "soft conflict reported");
-        assert_eq!(acq.soft_conflicts[0].path, "src/lib.rs");
-        assert!(acq.soft_conflicts[0].holders.iter().any(|h| h == "BlueLake"));
-
-        // No lease was published for RoseDune (freeze, not grant).
-        let held = mailbox.active_reservations("demo").await.expect("held");
-        assert!(
-            held.iter().all(|r| r.agent_name != "RoseDune"),
-            "frozen acquirer holds nothing"
-        );
-
-        let _ = std::fs::remove_file(&db_path);
-        let _ = std::fs::remove_dir_all(&data_dir);
-    }
-
-    #[tokio::test]
-    async fn test_acquire_against_held_reservation_hard_blocks_unchanged() {
-        let (mailbox, db_path, data_dir) = test_mailbox("hard-acquire").await;
-        register(&mailbox, "demo", "BlueLake").await;
-        register(&mailbox, "demo", "RoseDune").await;
-
-        mailbox
-            .file_reservation_paths(
-                "demo",
-                "BlueLake",
-                &["src/**".into()],
-                Some(3600),
-                true,
-                None,
-            )
-            .await
-            .expect("hold");
-
-        let acq = mailbox
-            .file_reservation_paths(
-                "demo",
-                "RoseDune",
-                &["src/lib.rs".into()],
-                Some(3600),
-                true,
-                None,
-            )
-            .await
-            .expect("acquire");
-        assert!(acq.granted.is_empty());
-        assert_eq!(acq.conflicts.len(), 1, "held lease hard-blocks");
-        assert!(acq.soft_conflicts.is_empty(), "no soft tier involved");
-
-        let _ = std::fs::remove_file(&db_path);
-        let _ = std::fs::remove_dir_all(&data_dir);
-    }
-
-    #[tokio::test]
-    async fn test_clear_acquire_succeeds_immediately() {
-        let (mailbox, db_path, data_dir) = test_mailbox("clear-acquire").await;
-        register(&mailbox, "demo", "BlueLake").await;
-
-        // No leases, no intents → immediate grant.
-        let acq = mailbox
-            .file_reservation_paths(
-                "demo",
-                "BlueLake",
-                &["docs/x.md".into()],
-                Some(3600),
-                true,
-                None,
-            )
-            .await
-            .expect("acquire");
-        assert_eq!(acq.granted.len(), 1);
-        assert!(acq.conflicts.is_empty());
-        assert!(acq.soft_conflicts.is_empty());
-
-        let _ = std::fs::remove_file(&db_path);
-        let _ = std::fs::remove_dir_all(&data_dir);
-    }
-
-    #[tokio::test]
-    async fn test_intent_expires_after_ttl_and_unblocks_acquire() {
-        let (mailbox, db_path, data_dir) = test_mailbox("intent-ttl").await;
-        let blue = register(&mailbox, "demo", "BlueLake").await;
-        register(&mailbox, "demo", "RoseDune").await;
-
-        // Publish an intent DECLARED past the TTL (created_at old enough that
-        // declared + INTENT_TTL_SECS < now).
-        let d = "demo:src/**";
-        let now = Timestamp::now().as_secs() as i64;
-        let tags = with_project_scoping(
-            toron_kind(FILE_RESERVATION),
-            vec![
-                Tag::parse(["d", d]).expect("d"),
-                Tag::parse(["status", "intent"]).expect("status"),
-            ],
-            Some("demo"),
-        );
-        let old_intent = build_event(
-            &nostr_sdk::nostr::Keys::new(
-                nostr_sdk::nostr::SecretKey::from_hex(
-                    "6b911fd37cdf5c81d4c0adb1ab7fa822ed253ab0ad9aa18d77257c88b29b718e",
-                )
-                .expect("sk"),
-            ),
-            toron_kind(FILE_RESERVATION),
-            r#"{"status":"intent","exclusive":true}"#,
-            tags,
-            Timestamp::from((now - INTENT_TTL_SECS as i64 - 60) as u64),
-        )
-        .expect("build");
-        mailbox.bus.publish(old_intent).await.expect("publish");
-        let _ = blue;
-
-        // Expired intent is not on the board...
-        let intents = mailbox.active_intents("demo").await.expect("intents");
-        assert!(intents.is_empty(), "expired intent must auto-expire");
-
-        // ...and no longer soft-conflicts: RoseDune's acquire succeeds.
-        let acq = mailbox
-            .file_reservation_paths(
-                "demo",
-                "RoseDune",
-                &["src/lib.rs".into()],
-                Some(3600),
-                true,
-                None,
-            )
-            .await
-            .expect("acquire");
-        assert_eq!(acq.granted.len(), 1, "expired intent does not freeze");
-        assert!(acq.soft_conflicts.is_empty());
-
-        let _ = std::fs::remove_file(&db_path);
-        let _ = std::fs::remove_dir_all(&data_dir);
-    }
-
-    #[tokio::test]
-    async fn test_own_acquire_converts_intent_to_held() {
-        // Must-convert (Spec 2): the declarer's own acquire at the same
-        // coordinate supersedes the intent (NIP-33) and holds.
-        let (mailbox, db_path, data_dir) = test_mailbox("must-convert").await;
-        register(&mailbox, "demo", "BlueLake").await;
-
-        mailbox
-            .declare_intent("demo", "BlueLake", &["src/**".into()], None, None)
-            .await
-            .expect("declare");
-        assert_eq!(
-            mailbox.active_intents("demo").await.expect("intents").len(),
-            1
-        );
-
-        let acq = mailbox
-            .file_reservation_paths(
-                "demo",
-                "BlueLake",
-                &["src/**".into()],
-                Some(3600),
-                true,
-                Some("converting"),
-            )
-            .await
-            .expect("acquire");
-        assert_eq!(acq.granted.len(), 1, "own intent never freezes own acquire");
-
-        let intents = mailbox.active_intents("demo").await.expect("intents");
-        assert!(intents.is_empty(), "intent converted to held");
-        let held = mailbox.active_reservations("demo").await.expect("held");
-        assert_eq!(held.len(), 1, "held view shows the converted lease");
-        assert_eq!(held[0].agent_name, "BlueLake");
-        assert_eq!(held[0].path_pattern, "src/**");
-
-        let _ = std::fs::remove_file(&db_path);
-        let _ = std::fs::remove_dir_all(&data_dir);
-    }
-
-    #[tokio::test]
-    async fn test_check_report_classifies_soft_and_hard_tiers() {
-        let (mailbox, db_path, data_dir) = test_mailbox("tier-report").await;
-        register(&mailbox, "demo", "BlueLake").await;
-        register(&mailbox, "demo", "RoseDune").await;
-        register(&mailbox, "demo", "GaleSummit").await;
-
-        // RoseDune holds held/**, BlueLake intents intent/**.
-        mailbox
-            .file_reservation_paths(
-                "demo",
-                "RoseDune",
-                &["held/**".into()],
-                Some(3600),
-                true,
-                None,
-            )
-            .await
-            .expect("hold");
-        mailbox
-            .declare_intent("demo", "BlueLake", &["intent/**".into()], None, None)
-            .await
-            .expect("intent");
-
-        let report = mailbox
-            .check_file_reservation_conflicts(
-                "demo",
-                "GaleSummit",
-                &["held/a.rs".into(), "intent/b.rs".into(), "clear/c.md".into()],
-            )
-            .await
-            .expect("check");
-        assert!(!report.conflict_free, "hard conflict present");
-        assert_eq!(report.conflicts.len(), 1, "held tier hard");
-        assert_eq!(report.conflicts[0].path, "held/a.rs");
-        assert!(report.conflicts[0].holders.iter().any(|h| h == "RoseDune"));
-        assert!(report.has_soft_conflicts, "soft tier flagged");
-        assert_eq!(report.soft_conflicts.len(), 1, "intent tier soft");
-        assert_eq!(report.soft_conflicts[0].path, "intent/b.rs");
-        assert!(report.soft_conflicts[0].holders.iter().any(|h| h == "BlueLake"));
-        assert!(report.clear_paths.contains(&"clear/c.md".to_string()));
-        assert_eq!(report.total_conflicting_reservations, 1, "hard count only");
-
-        let _ = std::fs::remove_file(&db_path);
-        let _ = std::fs::remove_dir_all(&data_dir);
-    }
-
-    #[tokio::test]
-    async fn test_request_release_roundtrip_and_validation() {
-        let (mailbox, db_path, data_dir) = test_mailbox("request-release").await;
-        register(&mailbox, "demo", "BlueLake").await;
-        register(&mailbox, "demo", "RoseDune").await;
-        register(&mailbox, "demo", "GaleSummit").await;
-
-        let held = mailbox
-            .file_reservation_paths(
-                "demo",
-                "BlueLake",
-                &["src/**".into()],
-                Some(3600),
-                true,
-                None,
-            )
-            .await
-            .expect("hold");
-        let lease_id = held.granted[0].id.clone();
-
-        // Validation: self-request is a no-op.
-        let err = mailbox
-            .request_release(&RequestRelease {
-                project_slug: "demo".into(),
-                sender_name: "BlueLake".into(),
-                target_agent: "BlueLake".into(),
-                reservation_id: lease_id.clone(),
-                ask: ReleaseAsk::Release,
-                note: None,
-            })
-            .await
-            .expect_err("self-request");
-        assert!(err.to_string().contains("self"), "{err}");
-
-        // Validation: unknown reservation id.
-        let err = mailbox
-            .request_release(&RequestRelease {
-                project_slug: "demo".into(),
-                sender_name: "RoseDune".into(),
-                target_agent: "BlueLake".into(),
-                reservation_id: "f".repeat(64),
-                ask: ReleaseAsk::Release,
-                note: None,
-            })
-            .await
-            .expect_err("unknown id");
-        assert!(err.to_string().contains("no active held reservation"), "{err}");
-
-        // Validation: GaleSummit (not the holder) asks for BlueLake's lease
-        // targeting RoseDune — holder mismatch.
-        let err = mailbox
-            .request_release(&RequestRelease {
-                project_slug: "demo".into(),
-                sender_name: "GaleSummit".into(),
-                target_agent: "RoseDune".into(),
-                reservation_id: lease_id.clone(),
-                ask: ReleaseAsk::Release,
-                note: None,
-            })
-            .await
-            .expect_err("wrong holder");
-        assert!(err.to_string().contains("held by BlueLake"), "{err}");
-
-        // Happy path: RoseDune asks BlueLake to defer src/** by 600s.
-        let req = mailbox
-            .request_release(&RequestRelease {
-                project_slug: "demo".into(),
-                sender_name: "RoseDune".into(),
-                target_agent: "BlueLake".into(),
-                reservation_id: lease_id.clone(),
-                ask: ReleaseAsk::Defer { defer_secs: 600 },
-                note: Some("need the dir".to_string()),
-            })
-            .await
-            .expect("request");
-        assert!(req.delivered);
-        assert_eq!(req.holder, "BlueLake");
-        assert_eq!(req.path_pattern, "src/**");
-        assert!(!req.message_id.is_empty());
-
-        // The typed rumor is readable by the holder (toron-kind + refs).
-        let rumors = mailbox.project_rumors("demo").await;
-        let rumor = rumors
-            .iter()
-            .find(|r| (**r).clone().id().to_hex() == req.message_id)
-            .expect("request rumor");
-        assert!(
-            rumor
-                .tags
-                .iter()
-                .any(|t| t.as_slice() == ["toron-kind".to_string(), "request-release".to_string()]),
-            "typed toron-kind tag"
-        );
-        assert!(
-            rumor
-                .tags
-                .iter()
-                .any(|t| t.as_slice() == ["ask".to_string(), "defer:600".to_string()]),
-            "ask encoded"
-        );
-
-        let _ = std::fs::remove_file(&db_path);
-        let _ = std::fs::remove_dir_all(&data_dir);
-    }
-
-    #[tokio::test]
-    async fn test_request_release_status_and_escalation_to_captain() {
-        let (mailbox, db_path, data_dir) = test_mailbox("request-escalate").await;
-        register(&mailbox, "demo", "BlueLake").await;
-        let rose = register(&mailbox, "demo", "RoseDune").await;
-
-        let held = mailbox
-            .file_reservation_paths(
-                "demo",
-                "BlueLake",
-                &["src/**".into()],
-                Some(3600),
-                true,
-                None,
-            )
-            .await
-            .expect("hold");
-        let lease_id = held.granted[0].id.clone();
-
-        // Fresh request → Pending (window not elapsed).
-        let req = mailbox
-            .request_release(&RequestRelease {
-                project_slug: "demo".into(),
-                sender_name: "RoseDune".into(),
-                target_agent: "BlueLake".into(),
-                reservation_id: lease_id.clone(),
-                ask: ReleaseAsk::Release,
-                note: None,
-            })
-            .await
-            .expect("request");
-        let status = mailbox
-            .request_release_status("demo", "RoseDune", &req.message_id, None)
-            .await;
-        assert!(
-            matches!(status, RequestReleaseStatus::Pending { .. }),
-            "fresh request pending, got {status:?}"
-        );
-
-        // Backdated request (declared past the tier window) → EscalationDue.
-        let old_ts = Timestamp::from(
-            (Timestamp::now().as_secs() as i64
-                - REQUEST_RELEASE_TIER_WINDOW_SECS as i64
-                - 60) as u64,
-        );
-        let rose_keys = mailbox.agent_keys_for("demo", "RoseDune").expect("rose keys");
-        let blue_pk = mailbox
-            .agent_keys_for("demo", "BlueLake")
-            .expect("blue keys")
-            .public_key();
-        let backdated = gift_wrap::build_rumor(
-            rose_keys.public_key(),
-            old_ts,
-            Kind::PrivateDirectMessage,
-            vec![
-                Tag::parse(["p", &blue_pk.to_hex()]).expect("p"),
-                Tag::parse(["toron-kind", "request-release"]).expect("kind"),
-                Tag::parse(["ask", "release"]).expect("ask"),
-                Tag::parse(["reservation-id", &lease_id]).expect("res"),
-                Tag::parse(["subject", "[request-release] src/**"]).expect("subj"),
-                Tag::parse(["importance", "high"]).expect("imp"),
-            ],
-            "backdated request".to_string(),
-        );
-        let backdated_id = backdated.clone().id().to_hex();
-        let wrap = gift_wrap::gift_wrap(&rose_keys, &blue_pk, backdated)
-            .await
-            .expect("wrap");
-        mailbox.bus.publish(wrap).await.expect("publish");
-
-        let status = mailbox
-            .request_release_status("demo", "RoseDune", &backdated_id, None)
-            .await;
-        assert!(
-            matches!(status, RequestReleaseStatus::EscalationDue { .. }),
-            "unanswered past window escalates, got {status:?}"
-        );
-
-        // Escalate → kind-14 DM to the captain (operator key).
-        mailbox
-            .escalate_request_release("demo", "RoseDune", &backdated_id, Some("need it now"))
-            .await
-            .expect("escalate");
-        let operator = mailbox.operator().expect("operator").public_key();
-        let wraps = collect_replay(
-            mailbox.bus.as_ref(),
-            ToronFilter::new()
-                .kinds([Kind::GiftWrap])
-                .pubkey(operator)
-                .build(),
-        )
-        .await
-        .expect("wraps");
-        assert!(
-            wraps.iter().any(|w| {
-                crate::nostr::gift_wrap::unwrap(&mailbox.operator().expect("op"), w)
-                    .map(|g| {
-                        g.rumor.tags.iter().any(|t| {
-                            t.as_slice()
-                                == ["toron-kind".to_string(), "request-release-escalation".to_string()]
-                        }) && g.rumor.tags.iter().any(|t| {
-                            t.as_slice().first().map(|s| s == "e").unwrap_or(false)
-                                && t.as_slice().get(1).map(|s| s == &backdated_id).unwrap_or(false)
-                        })
-                    })
-                    .unwrap_or(false)
-            }),
-            "escalation DM delivered to captain with request e-ref"
-        );
-        let _ = rose;
-        let _ = std::fs::remove_file(&db_path);
-        let _ = std::fs::remove_dir_all(&data_dir);
-    }
-
-    #[tokio::test]
-    async fn test_request_release_response_resolves_status() {
-        let (mailbox, db_path, data_dir) = test_mailbox("request-respond").await;
-        register(&mailbox, "demo", "BlueLake").await;
-        register(&mailbox, "demo", "RoseDune").await;
-
-        let held = mailbox
-            .file_reservation_paths(
-                "demo",
-                "BlueLake",
-                &["src/**".into()],
-                Some(3600),
-                true,
-                None,
-            )
-            .await
-            .expect("hold");
-        let lease_id = held.granted[0].id.clone();
-
-        let req = mailbox
-            .request_release(&RequestRelease {
-                project_slug: "demo".into(),
-                sender_name: "RoseDune".into(),
-                target_agent: "BlueLake".into(),
-                reservation_id: lease_id.clone(),
-                ask: ReleaseAsk::Release,
-                note: None,
-            })
-            .await
-            .expect("request");
-
-        // A third party cannot respond (cannot read the request).
-        register(&mailbox, "demo", "GaleSummit").await;
-        let err = mailbox
-            .respond_request_release(&ReleaseResponse {
-                project_slug: "demo".into(),
-                sender_name: "GaleSummit".into(),
-                request_message_id: req.message_id.clone(),
-                decision: ReleaseDecision::Agreed,
-                note: None,
-            })
-            .await
-            .expect_err("non-target cannot respond");
-        assert!(err.to_string().contains("no request-release message"), "{err}");
-
-        // The holder responds: Agreed → status resolves.
-        let send = mailbox
-            .respond_request_release(&ReleaseResponse {
-                project_slug: "demo".into(),
-                sender_name: "BlueLake".into(),
-                request_message_id: req.message_id.clone(),
-                decision: ReleaseDecision::Agreed,
-                note: Some("on it".to_string()),
-            })
-            .await
-            .expect("respond");
-        assert_eq!(send.count, 1);
-        let status = mailbox
-            .request_release_status("demo", "RoseDune", &req.message_id, None)
-            .await;
-        assert_eq!(
-            status,
-            RequestReleaseStatus::Responded {
-                decision: ReleaseDecision::Agreed
-            },
-            "response resolves the negotiation"
-        );
-
-        // A deferred decision round-trips through the wire encoding too.
-        let send2 = mailbox
-            .respond_request_release(&ReleaseResponse {
-                project_slug: "demo".into(),
-                sender_name: "BlueLake".into(),
-                request_message_id: req.message_id.clone(),
-                decision: ReleaseDecision::Deferred { defer_secs: 300 },
-                note: None,
-            })
-            .await
-            .expect("respond 2");
-        assert_eq!(send2.count, 1);
-        let status2 = mailbox
-            .request_release_status("demo", "RoseDune", &req.message_id, None)
-            .await;
-        assert_eq!(
-            status2,
-            RequestReleaseStatus::Responded {
-                decision: ReleaseDecision::Deferred { defer_secs: 300 }
-            },
-            "deferred decision round-trips"
-        );
-
-        let _ = std::fs::remove_file(&db_path);
-        let _ = std::fs::remove_dir_all(&data_dir);
-    }
-
-    #[tokio::test]
-    async fn test_escalation_requires_operator_key() {
-        // No operator key → escalation (captain DM) must fail loudly.
-        let db_path =
-            std::env::temp_dir().join(format!("toron-res-noop-{}.sqlite", uuid::Uuid::new_v4()));
-        let pool = schema::connect(db_path.to_str().unwrap())
-            .await
-            .expect("connect");
-        schema::migrate(&pool).await.expect("migrate");
-        let bus = InProcessBus::open(pool.clone(), InProcessBusConfig::default())
-            .await
-            .expect("bus");
-        let data_dir = std::env::temp_dir().join(format!(
-            "toron-res-data-noop-{}",
-            uuid::Uuid::new_v4()
-        ));
-        let mailbox = Mailbox::new(Arc::new(bus), data_dir.clone(), None)
-            .with_agent_passphrase(PASSPHRASE)
-            .with_index_pool(pool);
-        register(&mailbox, "demo", "BlueLake").await;
-
-        let held = mailbox
-            .file_reservation_paths(
-                "demo",
-                "BlueLake",
-                &["src/**".into()],
-                Some(3600),
-                true,
-                None,
-            )
-            .await
-            .expect("hold");
-        let lease_id = held.granted[0].id.clone();
-        register(&mailbox, "demo", "RoseDune").await;
-        let req = mailbox
-            .request_release(&RequestRelease {
-                project_slug: "demo".into(),
-                sender_name: "RoseDune".into(),
-                target_agent: "BlueLake".into(),
-                reservation_id: lease_id,
-                ask: ReleaseAsk::Release,
-                note: None,
-            })
-            .await
-            .expect("request");
-        let err = mailbox
-            .escalate_request_release("demo", "RoseDune", &req.message_id, None)
-            .await
-            .expect_err("no operator");
-        assert!(
-            err.to_string().contains("no operator key"),
-            "escalation gated on operator: {err}"
-        );
-
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_dir_all(&data_dir);
     }

@@ -254,8 +254,6 @@ impl ToJson for AcquireResult {
         json!({
             "granted": self.granted.to_json(),
             "conflicts": self.conflicts.to_json(),
-            // ADR-0011 Spec 4: additive soft tier (frozen-acquire paths).
-            "soft_conflicts": self.soft_conflicts.to_json(),
         })
     }
 }
@@ -268,9 +266,6 @@ impl ToJson for ConflictReport {
             "clear_paths": self.clear_paths,
             "checked_paths": self.checked_paths,
             "total_conflicting_reservations": self.total_conflicting_reservations,
-            // ADR-0011 Spec 4: additive soft tier (in-TTL intents).
-            "soft_conflicts": self.soft_conflicts.to_json(),
-            "has_soft_conflicts": self.has_soft_conflicts,
         })
     }
 }
