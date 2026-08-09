@@ -1256,3 +1256,90 @@ P0-P6 findings table is reviewed). Low risk, mechanical, high readability payoff
 (1960 → 7 files × 250-400 LOC). Naming: `workflow.rs` covers the 4 `macro_*`
 session tools (macro = workflow-automation plane per ADR-0005); the name
 `macros.rs` is avoided to prevent confusion with Rust macro definitions.
+
+## F20.MATRIX — Full workspace test matrix (P5, bd-p5-all-features-test-run-zohs)
+
+**Probe:** 2026-08-09. `cargo test --workspace --all-features` run. Baseline health check
+(sc1-25, feature-gated). toron-e2e has NO default feature — bare `cargo test --workspace`
+silently skips sc9-25; `--all-features` is the honest matrix.
+
+### Fixes applied during the run (real failures, not flakes)
+
+1. **sc2_direct_mail.rs compile error** — `SendMessage` struct gained `extra_tags` field
+   (ADR-0007 F6) but sc2 built the struct literally without `..Default::default()` → E0063
+   missing field. Fixed: `extra_tags: vec![]`. The whole e2e crate would NOT COMPILE under
+   all-features without this.
+2. **sc10_reservation_dispatch.rs stale assertion** — test asserted job kind-43001 carries
+   `t:OCBeta` tag; code deliberately uses `assignee:OCBeta` (jobs.rs:93-98: `#t` is reserved
+   for project scoping under ADR-0003 A3/G6 — a `t=assignee` tag would make global bus
+   subscribers drop the job at the access_gate). Test was stale vs the deliberate design;
+   assertion updated + comment cites jobs.rs.
+
+### Full sc1-sc25 status (toron-e2e --all-features)
+
+All 25 scenario gates GREEN (EXIT 0) after the 2 fixes: sc1 onboarding, sc2 direct mail,
+sc3 bcc privacy, sc4 reservation guard, sc5 force release, sc6 build slot, sc7 contact
+handshake, sc8 proof gate, sc9 mention job, sc10 reservation dispatch, sc11 workflow
+approval, sc12 backpressure, sc13 channel membership, sc14a dr rebuild, sc14b negentropy
+rejoin, sc15 presence, sc16 concurrency spike, sc17 graph dag, sc18 spawn no-claim
+timeout, sc19 spawn await resume, sc20 spawn await failure, sc21 cron durable loop,
+sc22 cron failure bead, sc23 cron escalate, sc24 cron catchup + fw_integrated (2 pass,
+1 ignored) + conformance (5) + harness_smoke (3).
+
+### Other crates (--all-features)
+
+| Crate | Result |
+|-------|--------|
+| toron-workflow | 124/124 GREEN |
+| toron-core | 340 pass / 5 fail: 2 pre-existing INTENTIONAL RED (F1.LAG-SWALLOW `test_broadcast_lag_is_surfaced_not_swallowed`, F19.NIP09 `nip09_delete_tombstones_projected_message`) + 3 load-sensitive timing flakes (`unwrap_loop_projects_*`, 8s fixed-sleep + argon2 KDF; all pass in isolation) |
+| toron-mcp | 35 pass / 1 fail: pre-existing INTENTIONAL RED (F3.COALESCER-LOCK `coalescer_lock_not_held_across_blocking_publish`, batch-deferred) |
+| toron-cli | bench-dominated lib tests (key_generate ~494s, bench_all_cases ~500s+); robot-mode suites GREEN in partial run |
+
+### Classification
+
+- 2 real failures found + fixed (compile break + stale assertion) — both test-side.
+- 4 remaining failures are documented intentional RED tests awaiting batch-fix pass.
+- 3 timing flakes in unwrap_loop (load-sensitive, pass isolated) — noted for P5 stress
+  track (bd-p5-concurrency-stress-tests-9q8l); fixed sleeps are the suspect.
+
+## P5 TEST COVERAGE — CONSOLIDATED EPIC VERDICT (bd-p5-test-coverage-rabg, 2026-08-09)
+
+**Epic closure.** All 5 leaves closed GREEN; sc1-25 feature-matrix re-verified at
+closure time. Verdict: **GREEN — coverage proves the ADR claims; 1 doc-drift gap
+(oc2 A2.6 stale) + 1 flake observation (sc21 under parallel load) noted.**
+
+### Test-coverage findings table (ADR-claim x existing-test x verdict x gap)
+
+| ADR claim | Existing test(s) | Pass | Gap / note |
+|-----------|------------------|------|------------|
+| 38-tool parity surface (D8.2) | `am_parity_e2e` 7/7 + `cli_robot` 6/6 (F10.D82-PARITY leaf); 38/38 catalog tools invoked after `cluster_guard_pane_and_prepare_thread` | GREEN | none |
+| sc1-sc25 scenario coverage | sc1-8 + sc14a (p1) · sc9-13 + sc14b + sc15 (p2) · sc16-24 UNGATED · sc_fw (p1, 1 `#[ignore]`d) | GREEN | **sc21 flaked once in a full parallel batch** (passed standalone + small parallel); dynamic ports → not static collision; timing under load. Re-run clean |
+| Feature-gate silent skip (oc2 A2.6) | bare `cargo test -p toron-e2e` compiles all sc binaries, runs **0 tests** from p1/p2-gated files | CONFIRMED | **A2.6 partially STALE**: claim says sc16-25 gated (p5/p4); verified sc16-24 have NO cfg gates (doc comments say `--features p5/p4` but code is unconditional) — they run on bare. p1 (sc1-8, sc14a, sc_fw) + p2 (sc9-13, sc14b, sc15) DO silently skip. Doc-drift bead (bd-p6-doc-drift-8s0t) should align doc comments or add gates |
+| `#[ignore]` sc_fw_integrated | `sc_fw_flywheel_binary_live` `#[ignore]`d (sc_fw_integrated.rs:206) | RESOLVED | cross-repo e2e (boots flywheel binary + ~/workspace/flywheel checkout) — flywheel CI scope, captain decision 3; verified passing 2026-08-09; `sc_fw_single_agent_prompt_definition_in_core` runs always |
+| Crypto property tests | 3 new proptests (seal round-trip, wrong-recipient, sender-mismatch) + 3 pre-existing (F15.CRYPTO-PROPTESTS leaf) | GREEN | 10/10 green, clippy clean |
+| Differential projection (bus/git/sqlite) | `projection_differential_bus_git_sqlite_agree` (N=10, F16.PROJ-DIFFERENTIAL leaf) | GREEN | bar-for-bar agreement: rumor ids, G7 order, count |
+| Concurrency stress | 100-mention burst → bounded jobs; two-binary multi-process send/receive (F17.CONCURRENCY-STRESS leaf) | GREEN | no race/deadlock/durability gap |
+
+### sc1-25 feature matrix (verified live, 2026-08-09)
+
+| Gate | Files | Status |
+|------|-------|--------|
+| p1 | sc1-8, sc14a, sc_fw_integrated | all GREEN (p1+p2 run) |
+| p2 | sc9-13, sc14b, sc15 | all GREEN (p1+p2 run) |
+| UNGATED (bare run executes) | sc16-24 | all GREEN (standalone + parallel spot checks) |
+| `#[ignore]` | sc_fw_flywheel_binary_live (cross-repo, flywheel CI scope) | documented, verified passing locally |
+
+### Notes
+
+- Bare `cargo test -p toron-e2e` is a **false-green**: p1/p2 files compile but 0
+  tests execute. CI must use `--features p1,p2` (or `--all-features`). This is the
+  oc2 A2.6 gap — still real for p1/p2, stale for sc16-24 (never had gates).
+- sc21 `cron_durable_loop` failed once under full parallel batch (33.85s run) then
+  passed standalone (11s) + in a 3-test parallel run — timing flake under load, not
+  a code defect; classify flaky, not real.
+- No missing tests warrant RED-first addition: every ADR claim in scope has a
+  passing witness; the two nits (stale doc comments, sc21 flake) are doc/batch items.
+
+**Epic verdict: GREEN — the suite proves the ADR-0003/0005 claims. Residuals:
+oc2 A2.6 doc-drift (stale gate comments on sc16-24) + sc21 load-flake — both
+non-blocking, tracked (bd-p6-doc-drift, batch).**
