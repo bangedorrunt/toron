@@ -2,7 +2,7 @@
 #![forbid(unsafe_code)]
 
 //! herdr backend client — newline-delimited JSON-RPC over a unix socket
-//! (protocol v18, per ADR-0003). Single shared client; flywheel's copy is
+//! (protocol v19, per ADR-0003). Single shared client; flywheel's copy is
 //! deleted after this lands (ADR: "one definition of `agent_prompt`").
 //!
 //! Wire shape (one JSON object per line):
@@ -25,8 +25,8 @@ use serde_json::{Value, json};
 use super::error::{BackendError, BackendErrorCode};
 use super::types::{AgentStatus, BackendEvent, PaneId, PromptLanding};
 
-/// herdr socket protocol version this client is verified against (v18).
-pub const HDR_PROTOCOL: u64 = 18;
+/// herdr socket protocol version this client is verified against (v19).
+pub const HDR_PROTOCOL: u64 = 19;
 
 /// Resolve the herdr socket path from explicit env values (pure — testable).
 /// Priority: `HERDR_SOCKET_PATH` env, else `$XDG_CONFIG_HOME/herdr/herdr.sock`
@@ -107,18 +107,67 @@ pub struct WorkspaceInfo {
 #[allow(dead_code)]
 pub struct PaneInfo {
     pub pane_id: String,
+    pub terminal_id: String,
+    pub workspace_id: String,
+    pub tab_id: String,
+    pub focused: bool,
+    pub agent_status: AgentStatus,
+    pub revision: u64,
     pub title: Option<String>,
     pub cwd: Option<String>,
-    pub agent_status: Option<AgentStatus>,
+    pub agent: Option<String>,
+    pub agent_session: Option<AgentSessionInfo>,
+    pub display_agent: Option<String>,
+    pub foreground_cwd: Option<String>,
+    pub label: Option<String>,
+    pub scroll: Option<PaneScrollInfo>,
+    #[serde(default)]
+    pub state_labels: serde_json::Map<String, Value>,
+    pub terminal_title: Option<String>,
+    pub terminal_title_stripped: Option<String>,
+    #[serde(default)]
+    pub tokens: serde_json::Map<String, Value>,
+}
+
+/// herdr agent-session reference (`agent_session` on AgentInfo/PaneInfo).
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct AgentSessionInfo {
+    pub source: String,
+    pub agent: String,
+    pub kind: AgentSessionRefKind,
+    pub value: String,
+}
+
+/// herdr agent-session reference kind (`id` | `path`).
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentSessionRefKind {
+    Id,
+    Path,
+}
+
+/// herdr pane scroll state (`scroll` on PaneInfo).
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct PaneScrollInfo {
+    pub offset_from_bottom: u64,
+    pub max_offset_from_bottom: u64,
+    pub viewport_rows: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[allow(dead_code)]
 pub struct WorktreeInfo {
-    pub worktree_id: String,
-    pub workspace_id: String,
-    pub branch: String,
-    pub label: Option<String>,
+    pub path: String,
+    pub is_bare: bool,
+    pub is_detached: bool,
+    pub is_prunable: bool,
+    pub is_linked_worktree: bool,
+    pub label: String,
+    pub branch: Option<String>,
+    pub open_workspace_id: Option<String>,
 }
 
 /// Wait options for `agent.prompt` / `agent.wait`.
@@ -772,6 +821,22 @@ impl super::EventStream for HerdrEventStreamAdapter {
             .read_event()?
             .map(|(kind, data)| parse_push(&kind, &data)))
     }
+
+    /// Bounds each blocking read — without this the trait default is a
+    /// no-op and `read_event()` blocks forever when no events arrive
+    /// (flywheel's deadline-based poll_events hangs). Applied to the
+    /// underlying unix socket so `BufReader::read_line` returns
+    /// WouldBlock/TimedOut once the deadline passes.
+    fn set_read_timeout(
+        &mut self,
+        timeout: Option<std::time::Duration>,
+    ) -> Result<(), BackendError> {
+        self.0
+            .reader
+            .get_ref()
+            .set_read_timeout(timeout)
+            .map_err(|e| BackendError::new(BackendErrorCode::Io, e.to_string()))
+    }
 }
 
 /// Map a herdr push onto a typed `BackendEvent` (ADR-0005 P1 unified shape).
@@ -871,6 +936,150 @@ mod tests {
         // No HOME at all: ~ fallback.
         let no_home = resolve_socket_path(None, None, None);
         assert!(no_home.to_string_lossy().ends_with("herdr/herdr.sock"));
+    }
+
+    /// Trimmed live v19 schema snapshot + real payload samples (captured from
+    /// the running herdr daemon, 2026-08-08; see bead bd-4eze).
+    const V19_FIXTURE: &str = include_str!("../../tests/fixtures/herdr-schema-v19.json");
+
+    fn fixture() -> Value {
+        serde_json::from_str(V19_FIXTURE).expect("v19 fixture parses")
+    }
+
+    #[test]
+    fn protocol_pin_matches_live_v19_fixture() {
+        let f = fixture();
+        assert_eq!(HDR_PROTOCOL, 19);
+        assert_eq!(f["protocol"].as_u64(), Some(HDR_PROTOCOL));
+    }
+
+    #[test]
+    fn pane_info_parses_live_v19_payload() {
+        let f = fixture();
+        let pane: PaneInfo = serde_json::from_value(f["samples"]["pane"].clone()).expect("pane");
+        assert_eq!(pane.pane_id, "wT:p2");
+        assert_eq!(pane.terminal_id, "term_6583b54d13a1b9");
+        assert_eq!(pane.workspace_id, "wT");
+        assert_eq!(pane.tab_id, "wT:t2");
+        assert_eq!(pane.focused, false);
+        assert_eq!(pane.agent_status, AgentStatus::Idle);
+        assert_eq!(pane.revision, 557);
+        assert_eq!(pane.agent.as_deref(), Some("opencode"));
+        assert_eq!(pane.cwd.as_deref(), Some("/Users/bangedorrunt/workspace/flywheel"));
+        assert!(pane.scroll.is_some());
+        assert_eq!(
+            pane.terminal_title.as_deref(),
+            Some("OC | Implementing remaining beads with fly...")
+        );
+    }
+
+    #[test]
+    fn worktree_info_parses_live_v19_payloads() {
+        let f = fixture();
+        let wts: Vec<WorktreeInfo> =
+            serde_json::from_value(f["samples"]["worktrees"].clone()).expect("worktrees");
+        assert_eq!(wts.len(), 2);
+        let linked = &wts[0];
+        assert_eq!(linked.path, "/Users/bangedorrunt/workspace/toron");
+        assert_eq!(linked.label, "toron");
+        assert!(!linked.is_bare);
+        assert!(!linked.is_detached);
+        assert!(!linked.is_linked_worktree);
+        assert!(!linked.is_prunable);
+        assert_eq!(linked.branch.as_deref(), Some("main"));
+        assert_eq!(linked.open_workspace_id.as_deref(), Some("w17"));
+        let detached = &wts[1];
+        assert!(detached.is_detached);
+        assert!(detached.is_linked_worktree);
+        assert_eq!(detached.branch, None);
+        assert_eq!(detached.open_workspace_id, None);
+    }
+
+    #[test]
+    fn agent_info_parses_live_v19_payload() {
+        let f = fixture();
+        let agent: AgentInfo = serde_json::from_value(f["samples"]["agent"].clone()).expect("agent");
+        assert_eq!(agent.agent_status, AgentStatus::Idle);
+        assert_eq!(agent.terminal_id, "term_6583b54d13a1b9");
+        assert_eq!(agent.workspace_id, "wT");
+        assert_eq!(agent.tab_id, "wT:t2");
+        assert_eq!(agent.pane_id, "wT:p2");
+        assert_eq!(agent.focused, false);
+        assert_eq!(agent.revision, 557);
+    }
+
+    #[test]
+    fn workspace_info_parses_live_v19_payload() {
+        let f = fixture();
+        let ws: WorkspaceInfo =
+            serde_json::from_value(f["samples"]["workspace"].clone()).expect("workspace");
+        assert_eq!(ws.workspace_id, "wD");
+        assert_eq!(ws.number, 1);
+        assert_eq!(ws.label, "chiebukuro");
+        assert!(!ws.focused);
+        assert_eq!(ws.pane_count, 3);
+        assert_eq!(ws.tab_count, 3);
+        assert_eq!(ws.active_tab_id, "wD:t6");
+        assert_eq!(ws.agent_status, AgentStatus::Unknown);
+    }
+
+    #[test]
+    fn v19_schema_requires_pane_v19_fields() {
+        // Field-for-field conformance guard: the fixture schema is the live
+        // daemon's; if it starts requiring something PaneInfo/WorktreeInfo
+        // lack, this test fails before the socket round-trip ever does.
+        let f = fixture();
+        let pane_schema = &f["schemas"]["success_response"]["$defs"]["PaneInfo"];
+        let pane_required: Vec<&str> = pane_schema["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        for field in ["pane_id", "terminal_id", "workspace_id", "tab_id", "focused", "agent_status", "revision"] {
+            assert!(pane_required.contains(&field), "PaneInfo missing required {field}");
+        }
+        let wt_schema = &f["schemas"]["success_response"]["$defs"]["WorktreeInfo"];
+        let wt_props = wt_schema["properties"].as_object().unwrap();
+        for field in ["open_workspace_id", "is_bare", "is_detached", "is_linked_worktree", "is_prunable", "path", "label"] {
+            assert!(wt_props.contains_key(field), "WorktreeInfo missing {field}");
+        }
+        let wt_required: Vec<&str> = wt_schema["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        for field in ["path", "is_bare", "is_detached", "is_prunable", "is_linked_worktree", "label"] {
+            assert!(wt_required.contains(&field), "WorktreeInfo missing required {field}");
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a live herdr daemon on the socket"]
+    fn live_round_trip_v19() {
+        // bd-4eze: prove the typed client parses live v19 responses for the
+        // methods the flywheel loop depends on. List-only — no side effects.
+        let mut c = Client::connect(None).expect("connect to live herdr socket");
+        c.ping().expect("ping");
+        let ws = c.workspace_list().expect("workspace.list");
+        assert!(!ws.is_empty(), "live herdr has no workspaces");
+        let agents = c.agent_list().expect("agent.list");
+        assert!(!agents.is_empty(), "live herdr has no agents");
+        let panes = c.pane_list(None).expect("pane.list");
+        assert!(!panes.is_empty(), "live herdr has no panes");
+        for w in &ws {
+            assert!(!w.active_tab_id.is_empty());
+        }
+        for a in &agents {
+            assert!(!a.terminal_id.is_empty(), "agent missing terminal_id");
+            assert!(!a.pane_id.is_empty());
+        }
+        for p in &panes {
+            assert!(!p.terminal_id.is_empty(), "pane missing terminal_id");
+            assert!(!p.tab_id.is_empty());
+            assert!(!p.workspace_id.is_empty());
+        }
     }
 
     #[test]

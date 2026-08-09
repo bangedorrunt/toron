@@ -120,9 +120,24 @@ impl super::Backend for MockBackend {
     ) -> Result<PaneInfo, BackendError> {
         Ok(PaneInfo {
             pane_id: format!("{parent_pane_id}-{direction}"),
+            terminal_id: String::new(),
+            workspace_id: String::new(),
+            tab_id: String::new(),
+            focused: false,
+            agent_status: AgentStatus::Unknown,
+            revision: 0,
             title: None,
             cwd: None,
-            agent_status: None,
+            agent: None,
+            agent_session: None,
+            display_agent: None,
+            foreground_cwd: None,
+            label: None,
+            scroll: None,
+            state_labels: serde_json::Map::new(),
+            terminal_title: None,
+            terminal_title_stripped: None,
+            tokens: serde_json::Map::new(),
         })
     }
 
