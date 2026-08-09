@@ -1265,6 +1265,124 @@ mod tests {
         assert_eq!(civil_from_secs(1_700_000_000), (2023, 11));
     }
 
+    /// P5 (bd-p5-projection-differential-tests-vhz9): the three projections of
+    /// the SAME input must agree bar-for-bar — bus (envelope replay → unwrap),
+    /// git archive (messages/{YYYY}/{MM}/{id}.json), sqlite (messages table).
+    /// Same rumor-id set, same G7 order (rumor created_at), same count.
+    #[tokio::test]
+    async fn projection_differential_bus_git_sqlite_agree() {
+        use crate::bus::in_process::{InProcessBus, InProcessBusConfig};
+        use crate::bus::Filter;
+        use crate::index::schema;
+
+        const N: usize = 10;
+        let db = std::env::temp_dir().join(format!("proj-diff-{}.sqlite", uuid::Uuid::new_v4()));
+        let pool = schema::connect(db.to_str().unwrap()).await.expect("pool");
+        schema::migrate(&pool).await.expect("migrate");
+        let bus = InProcessBus::open(pool.clone(), InProcessBusConfig::default())
+            .await
+            .expect("bus");
+
+        let sender = keys();
+        let recipient = keys();
+        let bus: std::sync::Arc<dyn crate::bus::Bus> = std::sync::Arc::new(bus);
+        let mut wraps = Vec::with_capacity(N);
+        for i in 0..N {
+            let wrap = wrap_for(&sender, &recipient, 1_700_000_000 + i as u64 * 100).await;
+            bus.publish(wrap.clone()).await.expect("publish to bus");
+            wraps.push(wrap);
+        }
+
+        // Same wraps → git sink pipeline.
+        let git_root = temp_archive("proj-diff-git");
+        let git_sink = Arc::new(GitProjectionSink::open(&git_root).expect("git sink"));
+        let git_pipeline =
+            UnwrapPipeline::new(vec![recipient.clone()], Arc::new(AutoPolicy), git_sink.clone());
+        // Same wraps → sqlite sink pipeline.
+        let sqlite_sink = SqliteProjectionSink::new(pool.clone());
+        let sqlite_pipeline = UnwrapPipeline::new(
+            vec![recipient.clone()],
+            Arc::new(AutoPolicy),
+            Arc::new(sqlite_sink),
+        );
+        for wrap in &wraps {
+            assert_eq!(
+                git_pipeline.project(wrap).await,
+                ProjectOutcome::Projected,
+                "git projection lands"
+            );
+            assert_eq!(
+                sqlite_pipeline.project(wrap).await,
+                ProjectOutcome::Projected,
+                "sqlite projection lands"
+            );
+        }
+
+        // Projection 1 — bus: replay envelopes, unwrap, order by rumor time.
+        let replayed = crate::mailbox::collect_replay(
+            bus.as_ref(),
+            Filter::new().kinds([nostr_sdk::nostr::Kind::GiftWrap]),
+        )
+        .await
+        .expect("bus replay");
+        assert_eq!(replayed.len(), N, "bus holds all N envelopes");
+        let mut bus_rumors: Vec<(String, u64)> = replayed
+            .iter()
+            .filter_map(|w| {
+                gift_wrap::unwrap(&recipient, w)
+                    .ok()
+                    .map(|g| (g.rumor.clone().id().to_hex(), g.rumor.created_at.as_secs()))
+            })
+            .collect();
+        bus_rumors.sort_by_key(|(_, ts)| *ts);
+
+        // Projection 2 — git: walk messages/{YYYY}/{MM}/*.json.
+        let mut git_rumors: Vec<(String, u64)> = Vec::new();
+        let messages = git_root.join("messages");
+        let mut stack = vec![messages.clone()];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+            for e in entries.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else if p.extension().and_then(|s| s.to_str()) == Some("json") {
+                    let rumor = nostr_sdk::nostr::event::unsigned::UnsignedEvent::from_json(
+                        std::fs::read_to_string(&p).expect("read"),
+                    )
+                    .expect("rumor json");
+                    git_rumors.push((rumor.clone().id().to_hex(), rumor.created_at.as_secs()));
+                }
+            }
+        }
+        git_rumors.sort_by_key(|(_, ts)| *ts);
+
+        // Projection 3 — sqlite: event_id + created_ts_us in G7 order.
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT event_id, created_ts_us FROM messages ORDER BY created_ts_us, local_seq",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("sqlite rows");
+        assert_eq!(rows.len(), N, "sqlite projects all N");
+
+        let sqlite_ids: Vec<String> = rows.into_iter().map(|(id, _)| id).collect();
+        let bus_ids: Vec<String> = bus_rumors.iter().map(|(id, _)| id.clone()).collect();
+        let git_ids: Vec<String> = git_rumors.iter().map(|(id, _)| id.clone()).collect();
+
+        assert_eq!(
+            bus_ids, git_ids,
+            "bus + git projections agree bar-for-bar (same rumor ids, G7 order)"
+        );
+        assert_eq!(
+            git_ids, sqlite_ids,
+            "git + sqlite projections agree bar-for-bar (same rumor ids, G7 order)"
+        );
+
+        let _ = std::fs::remove_dir_all(&git_root);
+        let _ = std::fs::remove_file(&db);
+    }
+
     /// P3 (bd-p3-replay-dedup-per-sink-nve6): the SQLite sink is idempotent —
     /// the same mail written twice produces ONE row (in-mem set + UNIQUE
     /// event_id + `rows_affected()==0` backstop).

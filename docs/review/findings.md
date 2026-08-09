@@ -501,6 +501,31 @@ F3.GIFTWRAP + F8.VERIFY-INGEST). File: `crates/toron-core/src/nostr/proptests.rs
 10/10 proptests pass; clippy clean. No defect — properties pin the NIP-59
 seal/wrap invariants against future refactors.
 
+## F16.PROJ-DIFFERENTIAL — differential projection tests (P5) — GREEN
+
+**Probe:** `bd-p5-projection-differential-tests-vhz9` (2026-08-09). Verdict:
+**GREEN — no disagreement.** Same input, three projections, bar-for-bar
+agreement.
+
+### Test
+
+`projection_differential_bus_git_sqlite_agree` (crates/toron-core/src/mailbox/unwrap.rs):
+N=10 wraps published to the bus, then projected through two independent
+pipelines (git sink + sqlite sink). Projections compared:
+
+| Projection | Source | Comparison key |
+|------------|--------|----------------|
+| Bus | envelope replay → unwrap | rumor id set, ordered by rumor created_at (G7) |
+| Git | `messages/{YYYY}/{MM}/{id}.json` walk | rumor id set, ordered by created_at |
+| SQLite | `messages` table (`event_id, created_ts_us ORDER BY created_ts_us, local_seq`) | id sequence |
+
+Assertions: bus == git (ids + G7 order), git == sqlite (ids + order), count
+N across all three. **PASSES** — projections agree bar-for-bar. No P0
+projection-inconsistency finding. Unwrap module 20/20 green; clippy clean.
+
+Companion: bd-p3-projection-atomicity-rtjz covers the failure-semantics
+question (in progress).
+
 ## S1/S2/S4/S5/S6/S7/F2.KDF — Re-verification GREEN (bd-p0-verify-green-claims-8z3p)
 
 **Probe:** 2026-08-09, live tree (no code modifications). All 7 claims re-verified GREEN
