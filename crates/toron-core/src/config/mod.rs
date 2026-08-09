@@ -36,9 +36,11 @@ pub const OPERATOR_KEY_RELATIVE: &str = "operator/operator.ncryptsec";
 pub const PROJECTS_RELATIVE: &str = "projects";
 /// Index pool file name at the data root (shared across projects).
 pub const INDEX_SQLITE: &str = "index.sqlite";
-/// argon2 log-n for the durable operator key (matches the CLI operator
-/// key convention, `KEY_LOG_N = 12` in toron-cli).
-pub const OPERATOR_KEY_LOG_N: u8 = 12;
+/// scrypt log-n for the durable operator key (P3 bd-p3-argon2-kdf-dos-bound-7sbu:
+/// raised 12 -> 14 — 16x weaker than agent keys at 12 was a boot-speed tradeoff
+/// rejected for the most privileged key; decrypt is payload-driven so existing
+/// log_n=12 keys keep working).
+pub const OPERATOR_KEY_LOG_N: u8 = 14;
 
 /// Ambient environment inputs to data-root resolution. Pure struct so
 /// resolution is unit-testable without mutating the process-global env.
@@ -309,5 +311,26 @@ mod tests {
         let p1 = ToronPaths { root: PathBuf::from("/root") }.index_path();
         let p2 = ToronPaths { root: PathBuf::from("/root") }.index_path();
         assert_eq!(p1, p2, "stable path, no pid suffix");
+    }
+
+    /// P3 (bd-p3-argon2-kdf-dos-bound-7sbu): the OPERATOR key is the most
+    /// privileged key (Overseer bypass, manifests, force-release) — its KDF
+    /// must not be materially weaker than the agent-key standard. Agent keys
+    /// use NIP-49 scrypt log_n=16; the operator key must stay within one
+    /// order of magnitude (>= 14; 12 = 16x weaker, boot-speed tradeoff
+    /// rejected). Decrypt is payload-driven, so existing log_n=12 keys keep
+    /// working after the bump.
+    #[test]
+    #[allow(clippy::assertions_on_constants)] // guard against future KDF weakening
+    fn operator_key_kdf_not_weak() {
+        assert!(
+            OPERATOR_KEY_LOG_N >= 14,
+            "operator key scrypt log_n={OPERATOR_KEY_LOG_N} is 16x weaker than agent keys (16); must be >= 14"
+        );
+        assert!(
+            crate::keys::DEFAULT_LOG_N >= 16,
+            "agent-key scrypt log_n must stay NIP-49 spec-standard (>= 16), got {}",
+            crate::keys::DEFAULT_LOG_N
+        );
     }
 }
