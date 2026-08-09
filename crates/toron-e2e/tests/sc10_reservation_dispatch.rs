@@ -158,13 +158,16 @@ async fn sc10_reservation_released_dispatches_job_on_bus_event() {
     });
     assert_eq!(depth, 1, "job queued");
 
-    // kind-43001 for OC-β: assignee t-tag present.
+    // kind-43001 for OC-β: assignee tag present (ADR-0003 A3/G6: the `t` tag
+    // is RESERVED for project scoping — using it for the assignee would make
+    // global bus subscribers drop the job at the access_gate, so the job uses
+    // a free-form `assignee` tag; jobs.rs:93-98).
     assert_eq!(job_req.kind.as_u16(), 43001, "kind-43001");
     assert!(
         job_req
             .tags
             .iter()
-            .any(|t| t.as_slice().first().map(String::as_str) == Some("t")
+            .any(|t| t.as_slice().first().map(String::as_str) == Some("assignee")
                 && t.as_slice().get(1).map(String::as_str) == Some("OCBeta")),
         "job targeted at OC-β"
     );

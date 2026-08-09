@@ -88,6 +88,7 @@ async fn sc2_direct_mail_thread_and_ack() {
             thread_id: None,
             sender_token: None,
             overseer: false,
+            extra_tags: vec![],
         })
         .await
         .expect("send_message");
