@@ -28,7 +28,6 @@ use crate::bus::event_store::BusEventStore;
 use crate::bus::{
     Bus, BusError, Filter, Health, PublishOk, Subscription, SubscriptionEvent, SubscriptionId,
 };
-use crate::nostr::event::VerifyError;
 
 /// Pipeline stage names (for stage logging on rejection).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -202,20 +201,10 @@ impl InProcessBus {
 impl Bus for InProcessBus {
     async fn publish(&self, event: Event) -> Result<PublishOk, BusError> {
         // 1. Verify: reject forged/mutated events (wrong id or sig).
-        match crate::nostr::event::verify_event(&event) {
-            Ok(()) => {}
-            Err(VerifyError::BadId) => {
-                self.stage_log(Stage::Verify, &event, "id mismatch");
-                return Err(BusError::InvalidEvent("id mismatch".into()));
-            }
-            Err(VerifyError::BadSignature) => {
-                self.stage_log(Stage::Verify, &event, "signature mismatch");
-                return Err(BusError::InvalidEvent("signature mismatch".into()));
-            }
-            Err(e) => {
-                self.stage_log(Stage::Verify, &event, &format!("{e}"));
-                return Err(BusError::InvalidEvent(e.to_string()));
-            }
+        //    F23.BUS-DEDUP (batch-fix): shared canonical mapping in bus/common.rs.
+        if let Err(e) = crate::bus::common::verify_publish_event(&event) {
+            self.stage_log(Stage::Verify, &event, &e.to_string());
+            return Err(e);
         }
 
         // 2. Auth: reject non-allowlisted authors if policy requires.
