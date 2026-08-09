@@ -156,8 +156,15 @@ pub fn mailbox_runner(
                 // P1 (bd-p1-poison-on-panic-audit-jwpd): recover the std
                 // Mutex poison — a panic inside the guard must not brick
                 // every subsequent flush (panic-in-panic = dead service).
-                let mut c = coalescer.lock().unwrap_or_else(|e| e.into_inner());
-                match c.submit(mention, now) {
+                // P1 (F3.COALESCER-LOCK, batch-fix): the guard is scoped to
+                // submit ONLY — the coalesced job is owned, the guard drops,
+                // THEN the blocking publish runs (no lock held across
+                // publish_coalesced_job's rt.block_on).
+                let decision = {
+                    let mut c = coalescer.lock().unwrap_or_else(|e| e.into_inner());
+                    c.submit(mention, now)
+                };
+                match decision {
                     // Hard-cap flush: publish the coalesced 43001 NOW (the
                     // host's tick cannot — the buffer is already drained).
                     CoalesceDecision::FlushNow(coalesced) => {
@@ -444,11 +451,16 @@ impl WorkflowHost {
                 // P1 (bd-p1-poison-on-panic-audit-jwpd): recover the std
                 // Mutex poison — a panic inside the guard must not brick
                 // every subsequent tick flush.
-                let mut c = self
-                    .coalescer
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
-                let flushed = c.tick(now_ms());
+                // P1 (F3.COALESCER-LOCK, batch-fix): the guard is scoped to
+                // tick() ONLY — the flushed Coalesced values are owned, the
+                // guard drops, THEN each blocking publish runs.
+                let flushed = {
+                    let mut c = self
+                        .coalescer
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    c.tick(now_ms())
+                };
                 if !flushed.is_empty() {
                     debug!("coalescer flushed {} assignee(s)", flushed.len());
                 }
