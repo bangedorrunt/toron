@@ -93,7 +93,8 @@ impl Mailbox {
              FROM messages m \
              JOIN messages_fts f ON f.rowid = m.id \
              WHERE messages_fts MATCH ?1 \
-               AND m.project_slug = ?2",
+               AND m.project_slug = ?2 \
+               AND m.deleted = 0",
         );
         let mut bind_id = 3i32;
 
@@ -189,6 +190,7 @@ impl Mailbox {
         let rows = sqlx::query(
             "SELECT event_id, subject, sender, importance, ack_required, body \
              FROM messages WHERE project_slug = ?1 AND thread_id = ?2 \
+             AND deleted = 0 \
              ORDER BY created_ts_us ASC, local_seq ASC",
         )
         .bind(project_key)

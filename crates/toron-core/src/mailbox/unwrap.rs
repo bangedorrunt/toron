@@ -219,6 +219,16 @@ pub trait ProjectionSink: Send + Sync {
     async fn is_projected(&self, key: &DedupKey) -> anyhow::Result<bool>;
     /// Persist one projected message. Must be idempotent on `key`.
     async fn write(&self, mail: &UnwrappedMail, local_seq: u64) -> anyhow::Result<bool>;
+    /// NIP-09 (F19.NIP09, batch-fix): tombstone the projected message with
+    /// `event_id == target` (author-signed kind-5; `author` = the kind-5
+    /// signer's hex pubkey — enforced so only the original sender can
+    /// tombstone). Default: no-op — sinks that cannot tombstone
+    /// (append-only) leave the row readable; the SQLite index sink
+    /// implements the real tombstone.
+    async fn tombstone(&self, target: &str, author: &str, ts_us: i64) -> anyhow::Result<()> {
+        let _ = (target, author, ts_us);
+        Ok(())
+    }
 }
 
 /// ADR-0007 R3 / C6: fan out projected mail to a workflow trigger channel
@@ -255,6 +265,10 @@ impl ProjectionSink for TriggerNotifySink {
             let _ = self.tx.send(mail.clone());
         }
         Ok(written)
+    }
+
+    async fn tombstone(&self, target: &str, author: &str, ts_us: i64) -> anyhow::Result<()> {
+        self.inner.tombstone(target, author, ts_us).await
     }
 }
 
@@ -546,6 +560,13 @@ impl ProjectionSink for DualProjectionSink {
             }
         }
     }
+
+    /// F19.NIP09 (batch-fix): tombstone the SQLite index leg; the git archive
+    /// leg is append-only by design (no-op — DR rebuild re-reads the archive,
+    /// and the tombstone is re-applied by the kind-5 event on the bus).
+    async fn tombstone(&self, target: &str, author: &str, ts_us: i64) -> anyhow::Result<()> {
+        self.sqlite.tombstone(target, author, ts_us).await
+    }
 }
 
 /// (year, month) from a unix-seconds timestamp (UTC), for the AM-Rust
@@ -689,15 +710,42 @@ impl ProjectionSink for SqliteProjectionSink {
         self.projected.lock().insert(id);
         Ok(true)
     }
+
+    /// F19.NIP09 (batch-fix): mark the target message `deleted = 1` — the
+    /// message is tombstoned, not removed (search/inbox/thread filters hide
+    /// it; the row stays for audit/DR). Author gate: `author` (the kind-5
+    /// signer) must equal the target message's `sender_pubkey` — a foreign
+    /// signer's delete is a no-op (NIP-09 author-only deletion).
+    async fn tombstone(&self, target: &str, author: &str, ts_us: i64) -> anyhow::Result<()> {
+        sqlx::query(
+            "UPDATE messages SET deleted = 1, deleted_ts_us = ?3 \
+             WHERE event_id = ?1 AND sender_pubkey = ?2",
+        )
+        .bind(target)
+        .bind(author)
+        .bind(ts_us)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
 }
 
-/// First value of a single-letter tag (e.g. `subject`, `e`).
-fn tag_text<'a>(rumor: &'a UnsignedEvent, name: &str) -> Option<&'a str> {
-    rumor.tags.iter().find_map(|t| {
+
+/// First value of a single-letter tag (e.g. `subject`, `e`). The canonical
+/// tag-value helper (F22.SURFACE-MESSAGING, batch-fix): messaging.rs's
+/// duplicate was deleted; callers pass `&rumor.tags` directly.
+pub fn tag_value<'a>(tags: &'a nostr_sdk::nostr::Tags, name: &str) -> Option<&'a str> {
+    tags.iter().find_map(|t| {
         let parts = t.as_slice();
         (parts.first().map(|s| s.as_str()) == Some(name))
             .then(|| parts.get(1).map(|s| s.as_str()))?
     })
+}
+
+/// First value of a single-letter tag on an unsigned rumor (delegates to
+/// [`tag_value`]).
+fn tag_text<'a>(rumor: &'a UnsignedEvent, name: &str) -> Option<&'a str> {
+    tag_value(&rumor.tags, name)
 }
 
 /// The unwrap pipeline: bus events → unwrap with local keys → policy gate →
@@ -775,6 +823,31 @@ impl UnwrapPipeline {
         // (probe bd-p0-nip40-ingest-probe-oyaa verdict RED, F2.NIP40).
         if wrap.is_expired() {
             return ProjectOutcome::Expired;
+        }
+
+        // F19.NIP09 (batch-fix): NIP-09 kind-5 deletion — the AUTHOR signs a
+        // deletion referencing the target message by `e`-tag. Tombstone the
+        // target row on the index (author-gated: the signer must be the
+        // message's sender_pubkey — enforced inside the sink's tombstone).
+        // Verified canonical above (id+sig).
+        if wrap.kind == nostr_sdk::nostr::Kind::EventDeletion {
+            let Some(target) = wrap
+                .tags
+                .iter()
+                .find(|t| t.as_slice().first().map(|s| s.as_str()) == Some("e"))
+                .and_then(|t| t.as_slice().get(1).map(|s| s.to_string()))
+            else {
+                return ProjectOutcome::NotForUs;
+            };
+            let ts_us = crate::index::writer::Clock::now_us(&crate::index::writer::SystemClock);
+            let author = wrap.pubkey.to_hex();
+            match self.sink.tombstone(&target, &author, ts_us).await {
+                Ok(()) => return ProjectOutcome::Projected,
+                Err(e) => {
+                    tracing::warn!(%target, "kind-5 tombstone write failed: {e}");
+                    return ProjectOutcome::NotForUs;
+                }
+            }
         }
 
         let Some((recipient, gift)) = self.try_unwrap(wrap) else {

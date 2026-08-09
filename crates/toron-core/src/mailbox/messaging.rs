@@ -31,10 +31,11 @@ use std::collections::HashMap;
 
 use nostr_sdk::nostr::event::unsigned::UnsignedEvent;
 use nostr_sdk::nostr::{Event, EventId, Keys, PublicKey, Tag, Timestamp};
+use sqlx::Row;
 
 use crate::bus::filter::ToronFilter;
 use crate::bus::scoping::is_metadata_hiding_kind;
-use crate::mailbox::unwrap::{OVERSEER_TAG, UnwrappedMail, order_by_rumor_time};
+use crate::mailbox::unwrap::{OVERSEER_TAG, UnwrappedMail, order_by_rumor_time, tag_value};
 use crate::nostr::gift_wrap::{self, UnwrappedGift};
 use crate::nostr::identity as nident;
 
@@ -300,6 +301,36 @@ impl Mailbox {
         }
         for m in messages.iter_mut() {
             m.read_ts_us = read_ts.get(&m.id).copied();
+        }
+        // F19.NIP09 (batch-fix): a NIP-09-tombstoned message must not appear
+        // in the inbox — drop ids marked `deleted` in the index (no index
+        // pool → the filter degrades to no filtering, same as read state).
+        if let Some(pool) = self.index_pool.as_ref() {
+            let ids: Vec<String> = messages.iter().map(|m| m.id.clone()).collect();
+            if !ids.is_empty() {
+                let placeholders = std::iter::repeat_n("?", ids.len())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let sql = format!(
+                    "SELECT event_id FROM messages WHERE deleted = 1 AND event_id IN ({placeholders})"
+                );
+                let mut q = sqlx::query(&sql);
+                for id in &ids {
+                    q = q.bind(id);
+                }
+                let deleted: Vec<String> = q
+                    .fetch_all(pool)
+                    .await
+                    .map(|rows| {
+                        rows.into_iter()
+                            .filter_map(|r| r.try_get::<String, _>(0).ok())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if !deleted.is_empty() {
+                    messages.retain(|m| !deleted.contains(&m.id));
+                }
+            }
         }
         if args.unread_only {
             messages.retain(|m| m.read_ts_us.is_none());
@@ -696,15 +727,6 @@ fn inbox_from(mail: UnwrappedMail) -> InboxMessage {
         created_ts_us: mail.ts_us(),
         read_ts_us: None, // filled by fetch_inbox from the message_reads projection
     }
-}
-
-/// First value of a single-letter tag (e.g. `subject`).
-fn tag_value<'a>(tags: &'a nostr_sdk::nostr::Tags, name: &str) -> Option<&'a str> {
-    tags.iter().find_map(|t| {
-        let parts = t.as_slice();
-        (parts.first().map(|s| s.as_str()) == Some(name))
-            .then(|| parts.get(1).map(|s| s.as_str()))?
-    })
 }
 
 /// True when a flag tag (no value) is present, e.g. `["ack-required"]`.
