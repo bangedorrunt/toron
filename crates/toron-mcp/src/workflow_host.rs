@@ -280,7 +280,11 @@ impl WorkflowHost {
         let coalescer = Arc::new(std::sync::Mutex::new(MentionCoalescer::from_env()));
         let job_signer = mailbox.operator().cloned();
         let runner = mailbox_runner(mailbox.clone(), coalescer.clone(), job_signer.clone());
-        let engine = WorkflowEngine::local(runner).context("workflow engine")?;
+        let engine = match toron_workflow::engine::resonate_server_url() {
+            Some(url) => WorkflowEngine::remote(url, runner)
+                .context("workflow engine (remote resonate server)")?,
+            None => WorkflowEngine::local(runner).context("workflow engine")?,
+        };
         let bus = mailbox.bus().clone();
         Ok(Self {
             engine: Arc::new(engine),

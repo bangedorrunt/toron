@@ -199,9 +199,18 @@ flywheel's `[agent_mail]` config points at toron (in-process). No HTTP hop.
 ### Standalone daemon mode (pure peer collaboration, no orchestrator)
 
 ```bash
-toron serve                       # in-process bus, MCP server on stdio+HTTP
-toron --robot-status --json       # robot CLI parity
+toron daemon install && toron daemon start   # launchd (macOS) / systemd (Linux) autostart
+toron daemon status | stop | restart | uninstall
+toron serve                                  # in-process bus, MCP server on stdio+HTTP (manual)
+toron --robot-status --json                  # robot CLI parity
 ```
+
+The daemon lifecycle is managed by `toron daemon` (ADR-0009): launchd on
+macOS, systemd user units on Linux, pidfile+spawn fallback elsewhere. The
+passphrase lives in `~/.config/toron/passphrase` (0600) — unit files never
+carry the secret. The workflow engine defaults to the remote Resonate server
+(`https://resonate.alpine-tilapia.ts.net`), falls back to
+`http://localhost:8001`, then embedded local mode; pin with `RESONATE_URL`.
 
 Agents connect to toron's MCP endpoint and collaborate peer-to-peer.
 

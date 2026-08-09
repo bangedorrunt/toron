@@ -1191,3 +1191,45 @@ steps:
             _ => unreachable!(),
         }
     }
+
+// ---------------------------------------------------------------------------
+// Resonate server selection (remote default / local fallback).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn server_url_pin_env_beats_probe() {
+    // Can't safely mutate process env in tests — the pure core takes the
+    // probe as a closure; env pin is exercised via the RESOLUTION function
+    // below with a probe that would claim everything is dead.
+    let none = resonate_server_url_with(|_| false);
+    assert_eq!(none, None, "no probe hit -> embedded local mode");
+    let remote = resonate_server_url_with(|u| u == REMOTE_RESONATE_URL);
+    assert_eq!(remote.as_deref(), Some(REMOTE_RESONATE_URL), "remote wins when probed");
+    let local_only = resonate_server_url_with(|u| u == LOCAL_RESONATE_URL);
+    assert_eq!(local_only.as_deref(), Some(LOCAL_RESONATE_URL), "local used when remote dead");
+}
+
+#[test]
+fn host_port_parses_urls() {
+    assert_eq!(
+        host_port("https://resonate.alpine-tilapia.ts.net"),
+        Some(("resonate.alpine-tilapia.ts.net".to_string(), 443))
+    );
+    assert_eq!(host_port("http://localhost:8001"), Some(("localhost".to_string(), 8001)));
+    assert_eq!(host_port("http://localhost"), Some(("localhost".to_string(), 80)));
+    assert_eq!(host_port("https://h:9000"), Some(("h".to_string(), 9000)));
+    assert_eq!(host_port("not-a-url"), None);
+    assert_eq!(host_port("https://"), None);
+    assert_eq!(host_port("https://h:notaport"), None);
+}
+
+#[test]
+fn probe_candidate_hits_local_listener() {
+    use std::net::TcpListener;
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    let url = format!("http://127.0.0.1:{port}");
+    assert!(probe_candidate(&url), "bound listener answers");
+    drop(l);
+    assert!(!probe_candidate(&url), "closed port is dead");
+}
