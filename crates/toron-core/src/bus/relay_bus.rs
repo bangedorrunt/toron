@@ -285,6 +285,12 @@ impl Bus for RelayBus {
         ))
     }
 
+    /// The relay bus has no local A3 gate (the relay filters what it sends);
+    /// trusted ingress is identical to [`Self::subscribe`].
+    async fn subscribe_trusted(&self, filter: Filter) -> Result<Subscription, BusError> {
+        self.subscribe(filter).await
+    }
+
     async fn health(&self) -> Result<Health, BusError> {
         // nostr-sdk Client tracks connected relays; we count configured relays.
         let configured = self.config.relays.len();

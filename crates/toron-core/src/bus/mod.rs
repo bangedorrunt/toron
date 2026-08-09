@@ -98,6 +98,17 @@ pub trait Bus: Send + Sync + 'static {
     /// emits an EOSE-equivalent marker, then streams live events.
     async fn subscribe(&self, filter: Filter) -> Result<Subscription, BusError>;
 
+    /// Open a TRUSTED subscription: identical to [`Self::subscribe`] but the
+    /// A3 global-gate is bypassed — project-scoped events ARE delivered to a
+    /// filter with no `#t`/`#l` scoping (P11.1 reactive ingress: the
+    /// workflow-trigger host is the mailbox's own internal consumer and must
+    /// see reservation/reaction events across all projects; a plain global
+    /// `subscribe(Filter::new())` would be gated from every scoped event).
+    ///
+    /// Only embedders that hold the bus by construction (the mailbox host,
+    /// the daemon) may use this — never a relay-facing subscription.
+    async fn subscribe_trusted(&self, filter: Filter) -> Result<Subscription, BusError>;
+
     /// Liveness probe.
     async fn health(&self) -> Result<Health, BusError>;
 }

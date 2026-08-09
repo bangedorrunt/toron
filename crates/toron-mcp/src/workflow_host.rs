@@ -33,7 +33,9 @@ use toron_workflow::coalesce::{CoalesceDecision, Coalesced, MentionCoalescer};
 use toron_workflow::engine::{ActionRunner, RunInput, WorkflowEngine};
 use toron_workflow::jobs::{JobRequest, build_job_request_with_tags};
 use toron_workflow::schema::{Action, Trigger, Workflow};
-use toron_workflow::trigger_filter::should_evaluate_trigger_event;
+use toron_workflow::trigger_filter::{
+    matches_trigger, should_evaluate_trigger_event, trigger_payload, trigger_run_id,
+};
 use toron_workflow::stamp_workflow_emitted;
 use tracing::{debug, warn};
 
@@ -432,11 +434,15 @@ impl WorkflowHost {
 
     /// Drive the trigger loop to completion (until the subscription closes).
     pub async fn run_trigger_loop(&self) -> Result<()> {
+        // TRUSTED ingress (P11.1): a plain global `subscribe` would be gated
+        // from every project-scoped event (A3: global subs never see `#t`
+        // scoped events) — reservations (30031) and reactions (7) carry
+        // project scoping, so the reactive ingress MUST bypass the gate.
         let mut sub = self
             .bus
-            .subscribe(toron_core::bus::Filter::new())
+            .subscribe_trusted(toron_core::bus::Filter::new())
             .await
-            .map_err(|e| anyhow::anyhow!("bus subscribe: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("bus subscribe_trusted: {e}"))?;
         while let Some(ev) = sub.next().await {
             let SubscriptionEvent::Event(event) = ev else {
                 continue;
@@ -519,7 +525,7 @@ impl WorkflowHost {
                         continue;
                     }
                 }
-                let run_id = format!("wf-{}-{}", workflow.name, event.id.to_hex());
+                let run_id = trigger_run_id(&workflow.name, &event);
                 let input = RunInput {
                     workflow: workflow.clone(),
                     trigger: trigger_payload(&event),
@@ -532,62 +538,6 @@ impl WorkflowHost {
         }
         Ok(())
     }
-}
-
-/// Match a trigger spec against an inbound event (kind-level).
-fn matches_trigger(trigger: &Trigger, event: &nostr_sdk::nostr::Event) -> bool {
-    // The trigger filter has already excluded workflow/job/gift-wrap kinds.
-    // Match the ADR trigger kinds against the event kind.
-    let kind = event.kind.as_u16();
-    match trigger {
-        Trigger::MessagePosted { .. } => kind == 14 || kind == 9 || kind == 1,
-        Trigger::ReactionAdded { .. } => kind == 7,
-        Trigger::ReservationAcquired { .. } => kind == 30031,
-        Trigger::ReservationReleased { .. } => kind == 30031,
-        Trigger::AgentStateChanged { .. } => kind == 20001,
-        Trigger::Schedule { .. } => false, // cron-managed, not event-driven
-        Trigger::Webhook { .. } => false,  // external, not a bus event
-    }
-}
-
-/// Build the `{{trigger.*}}` payload from an event.
-fn trigger_payload(event: &nostr_sdk::nostr::Event) -> serde_json::Value {
-    use serde_json::json;
-    let mut m = serde_json::Map::new();
-    m.insert("id".into(), json!(event.id.to_hex()));
-    m.insert("sender".into(), json!(event.pubkey.to_hex()));
-    m.insert("content".into(), json!(event.content));
-    m.insert("kind".into(), json!(event.kind.as_u16()));
-    m.insert("created_at".into(), json!(event.created_at.as_secs()));
-    // `t`/`h`/`importance` tag surfaces for project/channel matching.
-    let mut project: Option<String> = None;
-    let mut channel: Option<String> = None;
-    let mut importance: Option<String> = None;
-    let mut tags: Vec<serde_json::Value> = Vec::new();
-    for t in event.tags.iter() {
-        let p = t.as_slice();
-        tags.push(json!(p));
-        if p.first().map(String::as_str) == Some("t") && project.is_none() {
-            project = p.get(1).cloned();
-        }
-        if p.first().map(String::as_str) == Some("h") && channel.is_none() {
-            channel = p.get(1).cloned();
-        }
-        if p.first().map(String::as_str) == Some("importance") && importance.is_none() {
-            importance = p.get(1).cloned();
-        }
-    }
-    m.insert("tags".into(), serde_json::Value::Array(tags));
-    if let Some(p) = project {
-        m.insert("project".into(), json!(p));
-    }
-    if let Some(c) = channel {
-        m.insert("channel".into(), json!(c));
-    }
-    if let Some(i) = importance {
-        m.insert("importance".into(), json!(i));
-    }
-    serde_json::Value::Object(m)
 }
 
 #[cfg(test)]
@@ -672,6 +622,221 @@ mod tests {
         ));
         // A schedule trigger is never event-driven.
         assert!(!matches_trigger(&Trigger::Schedule { cron: "* * * * *".into(), owner: None, scope: Default::default() }, &msg));
+    }
+
+    /// P11.1 gate (bd-foh8.1): the raw-bus trigger loop fires
+    /// reservation_acquired / reservation_released (with acquired-vs-released
+    /// DISAMBIGUATION) and reaction_added triggers; message_posted fires on a
+    /// user-authored kind-14 but NOT on a workflow-emitted (stamped) one —
+    /// loop prevention holds end-to-end through the live loop.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bus_trigger_loop_fires_reservation_and_reaction_triggers() {
+        use std::time::Duration;
+
+        use toron_core::bus::in_process::{InProcessBus, InProcessBusConfig};
+        use toron_core::index::schema;
+        use toron_workflow::schema::{Action, Step, StepOnError, Trigger, Workflow};
+
+        let db = std::env::temp_dir().join(format!("wf-host-{}.sqlite", uuid::Uuid::new_v4()));
+        let pool = schema::connect(db.to_str().unwrap()).await.expect("connect");
+        schema::migrate(&pool).await.expect("migrate");
+        let bus: Arc<dyn Bus> = Arc::new(
+            InProcessBus::open(pool.clone(), InProcessBusConfig::default())
+                .await
+                .expect("bus"),
+        );
+
+        // Recording runner: each dispatched action records the workflow name.
+        let fired: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let fired2 = fired.clone();
+        let runner: ActionRunner = Arc::new(move |a: &Action| {
+            fired2
+                .lock()
+                .unwrap()
+                .push(format!("action:{}", a.type_name()));
+            Ok(serde_json::json!({ "action": a.type_name() }))
+        });
+
+        fn wf(name: &str, trigger: Trigger) -> Workflow {
+            Workflow {
+                name: name.into(),
+                description: None,
+                trigger: Some(trigger),
+                policy: None,
+                guard: None,
+                steps: vec![Step {
+                    name: Some("rec".into()),
+                    guard: None,
+                    on_error: StepOnError::Continue,
+                    action: Action::SendMessage {
+                        to: vec!["nobody".into()],
+                        subject: name.into(),
+                        body: "triggered".into(),
+                        project: Some("demo".into()),
+                    },
+                }],
+                graph: None,
+                inputs: vec![],
+                crew: None,
+            }
+        }
+
+        let workflows = vec![
+            wf(
+                "on-acquire",
+                Trigger::ReservationAcquired {
+                    project: "demo".into(),
+                    path: None,
+                },
+            ),
+            wf(
+                "on-release",
+                Trigger::ReservationReleased {
+                    project: "demo".into(),
+                    path: None,
+                },
+            ),
+            wf(
+                "on-react",
+                Trigger::ReactionAdded {
+                    channel: None,
+                    emoji: None,
+                },
+            ),
+            wf(
+                "on-msg",
+                Trigger::MessagePosted {
+                    channel: None,
+                    project: Some("demo".into()),
+                },
+            ),
+        ];
+        let host = WorkflowHost::over_bus(bus.clone(), runner, workflows).expect("host");
+        let _handle = host.spawn_trigger_loop();
+
+        async fn wait_for(
+            fired: &Arc<std::sync::Mutex<Vec<String>>>,
+            want: &str,
+            timeout: Duration,
+        ) -> bool {
+            let deadline = tokio::time::Instant::now() + timeout;
+            loop {
+                if fired.lock().unwrap().iter().any(|f| f == want) {
+                    return true;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    return false;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+
+        async fn absent_for(
+            fired: &Arc<std::sync::Mutex<Vec<String>>>,
+            want: &str,
+            window: Duration,
+        ) -> bool {
+            tokio::time::sleep(window).await;
+            !fired.lock().unwrap().iter().any(|f| f == want)
+        }
+
+        let keys = nostr_sdk::nostr::Keys::generate();
+        let t_demo = nostr_sdk::nostr::Tag::parse(["t", "demo"]).expect("t");
+
+        // 1. A plain acquire (status-less content) → on-acquire only.
+        let acquire = nostr_sdk::nostr::EventBuilder::new(
+            nostr_sdk::nostr::Kind::from_u16(30031),
+            r#"{"exclusive":true}"#,
+        )
+        .tags(vec![
+            nostr_sdk::nostr::Tag::parse(["d", "demo:src/**"]).expect("d"),
+            t_demo.clone(),
+        ])
+        .sign_with_keys(&keys)
+        .expect("sign");
+        bus.publish(acquire).await.expect("publish acquire");
+        assert!(
+            wait_for(&fired, "action:send_message", Duration::from_secs(10)).await,
+            "acquire fired the reservation_acquired workflow: {fired:?}"
+        );
+        // Disambiguation: the acquire must NOT have fired on-release.
+        assert!(
+            fired.lock().unwrap().iter().filter(|f| f.as_str() == "action:send_message").count() == 1,
+            "exactly one workflow fired on acquire: {fired:?}"
+        );
+
+        // 2. A release marker (status:released content) → on-release fires,
+        //    and does NOT re-fire on-acquire.
+        fired.lock().unwrap().clear();
+        let release = nostr_sdk::nostr::EventBuilder::new(
+            nostr_sdk::nostr::Kind::from_u16(30031),
+            r#"{"status":"released"}"#,
+        )
+        .tags(vec![
+            nostr_sdk::nostr::Tag::parse(["d", "demo:src/**"]).expect("d"),
+            t_demo.clone(),
+        ])
+        .sign_with_keys(&keys)
+        .expect("sign");
+        bus.publish(release).await.expect("publish release");
+        assert!(
+            wait_for(&fired, "action:send_message", Duration::from_secs(10)).await,
+            "release fired the reservation_released workflow: {fired:?}"
+        );
+        assert_eq!(
+            fired.lock().unwrap().len(),
+            1,
+            "release fires ONLY reservation_released (no acquired): {fired:?}"
+        );
+
+        // 3. A kind-7 reaction → reaction_added fires.
+        fired.lock().unwrap().clear();
+        let react = nostr_sdk::nostr::EventBuilder::new(nostr_sdk::nostr::Kind::from_u16(7), "+")
+            .sign_with_keys(&keys)
+            .expect("sign");
+        bus.publish(react).await.expect("publish reaction");
+        assert!(
+            wait_for(&fired, "action:send_message", Duration::from_secs(10)).await,
+            "reaction fired the reaction_added workflow: {fired:?}"
+        );
+
+        // 4. Loop prevention end-to-end: a WORKFLOW-EMITTED (stamped) kind-14
+        //    does NOT fire message_posted; a user kind-14 does.
+        fired.lock().unwrap().clear();
+        let stamped = nostr_sdk::nostr::EventBuilder::new(
+            nostr_sdk::nostr::Kind::from_u16(14),
+            "workflow ack",
+        )
+        .tags(vec![
+            t_demo.clone(),
+            nostr_sdk::nostr::Tag::parse([
+                "t",
+                toron_workflow::trigger_filter::WORKFLOW_EMITTED_TAG,
+            ])
+            .expect("stamp"),
+        ])
+        .sign_with_keys(&keys)
+        .expect("sign");
+        bus.publish(stamped).await.expect("publish stamped");
+        assert!(
+            absent_for(&fired, "action:send_message", Duration::from_millis(800)).await,
+            "stamped workflow-emitted message must NOT re-trigger: {fired:?}"
+        );
+
+        let user_msg = nostr_sdk::nostr::EventBuilder::new(
+            nostr_sdk::nostr::Kind::from_u16(14),
+            "user hello",
+        )
+        .tags(vec![t_demo])
+        .sign_with_keys(&keys)
+        .expect("sign");
+        bus.publish(user_msg).await.expect("publish user msg");
+        assert!(
+            wait_for(&fired, "action:send_message", Duration::from_secs(10)).await,
+            "user-authored kind-14 fired message_posted: {fired:?}"
+        );
+
+        let _ = std::fs::remove_file(&db);
     }
 
     /// bd-pkc part 2 + part 3: the mailbox runner coalesces DispatchJob @mentions
@@ -1195,6 +1360,13 @@ steps:
             filter: toron_core::bus::Filter,
         ) -> Result<toron_core::bus::Subscription, toron_core::bus::BusError> {
             self.inner.subscribe(filter).await
+        }
+
+        async fn subscribe_trusted(
+            &self,
+            filter: toron_core::bus::Filter,
+        ) -> Result<toron_core::bus::Subscription, toron_core::bus::BusError> {
+            self.inner.subscribe_trusted(filter).await
         }
 
         async fn health(&self) -> Result<toron_core::bus::Health, toron_core::bus::BusError> {
