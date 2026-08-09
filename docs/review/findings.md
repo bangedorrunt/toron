@@ -612,6 +612,24 @@ column: deleted` — the tombstone schema + kind-5 ingest do not exist.
 4. Git: document permanent-audit posture (no content removal from the
    archive; optional tombstone marker file).
 
+## P3 Crypto / NIP-17 / Gift-Wrap Soundness — EPIC VERDICT (bd-p3-crypto-giftwrap-cfho, 2026-08-09)
+
+All 7 P3 leaves closed. Aggregate:
+
+| Leaf | Verdict | Finding | Disposition |
+|------|---------|---------|-------------|
+| NIP-40 expiration (F2.NIP40) | **RED→FIXED** | expired gift wrap was accepted + projected; TTL gate added in `project()` | fix landed (bd-p3-nip40-expiration-fix-6ezx) |
+| Gift-wrap invariants (F3.GIFTWRAP) | **GREEN** | fresh one-time key per wrap, seal signed, sender-mismatch enforced; 2 new regression pins | verified |
+| Schnorr verify-per-ingest (F8) | **GREEN + gap fixed** | unwrap envelope sig was unverified → `verify_event` gate; relay-ingest defense-in-depth | fixed |
+| Replay dedup per sink (F9) | **GREEN** | both sinks dedup at write + is_projected, restart-safe; 2 pins | verified |
+| Argon2/KDF DoS bound (F14) | **FIXED** | operator key log_n 12→14 (was 16× weaker than agent keys); decrypt DoS-capped | fixed |
+| Projection atomicity (F4.G11) | **RED→FIXED** | G11 was paper: production pipeline was sqlite-only; `DualProjectionSink` (git-FIRST canonical + sqlite index, heal semantics) wired into `build_unwrap_pipeline`; RED test RED→GREEN; DR rebuild GREEN | fixed |
+| NIP-09 deletion (F19.NIP09) | **RED (P0)** | no kind-5 path, no tombstone — deleted mail stays readable; RED test `nip09_delete_tombstones_projected_message` failing | fix wired to `bd-batch-fix-pass-mip4` |
+
+**Batch-fix candidates from P3:** F19.NIP09 (migration + kind-5 ingest +
+author check + filters). Verify note: toron-core suite currently 345/2 —
+only the batch-deferred REDs fail (F3.COALESCER-LOCK, F19.NIP09).
+
 ## S1/S2/S4/S5/S6/S7/F2.KDF — Re-verification GREEN (bd-p0-verify-green-claims-8z3p)
 
 **Probe:** 2026-08-09, live tree (no code modifications). All 7 claims re-verified GREEN
