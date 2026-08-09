@@ -733,6 +733,33 @@ Net −1 duplicate; zero behavior change. Application at batch-fix-pass (or as
 a standalone mini-refactor with the P4 suite green). No further churn
 proposed — the trait/adapter split is the intended ADR-0007 D1/D2 boundary.
 
+## F23.BUS-DEDUP — in_process/relay_bus dedup audit (P4)
+
+**Probe:** `bd-p4-bus-impl-dedup-koxg` (2026-08-09). Verdict: **near-clean —
+ONE duplicated block** (publish-time verify); everything else is
+transport-specific by design.
+
+### Shared-logic map
+
+| Concern | in_process.rs (949) | relay_bus.rs (691) | Duplicated? |
+|---------|----------------------|--------------------|-------------|
+| Event verify at publish | :205-219 (match arms + stage_log) | :234-241 (same match arms, no stage_log) | **YES — copy-paste match block (only real dup)** |
+| Filter matching (`match_event`) | :168, :350 (subscriber registry fanout) | none — nostr-sdk matches server-side (documented design) | no |
+| Subscription management | registry + snapshot replay + EOSE | nostr-sdk `client.subscribe` + notification broadcast | no (transport-specific) |
+| Access gate / project slug | :145, :161-171 | none (relay-side filtering) | no |
+| Health | store count | relay count | no |
+| Ingest verify | at publish (stage 1) | nostr-sdk default + explicit relay-task verify (:189, F8 hardening) | no (different layers) |
+| Federation policy | none | :133 | n/a |
+
+### Proposal (move-only, low blast radius)
+
+Extract `pub fn verify_publish_event(event: &Event) -> Result<(), BusError>`
+into `bus/common.rs` (the canonical VerifyError→BusError mapping); both
+`publish` paths call it; in_process keeps its `stage_log` on the returned
+error. Net −12 duplicated lines, zero behavior change (messages identical).
+Application at batch-fix-pass or as a standalone mini-refactor with the bus
+test suites green (`in_process` 18 + `relay_bus` 8 tests).
+
 ## S1/S2/S4/S5/S6/S7/F2.KDF — Re-verification GREEN (bd-p0-verify-green-claims-8z3p)
 
 **Probe:** 2026-08-09, live tree (no code modifications). All 7 claims re-verified GREEN
