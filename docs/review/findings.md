@@ -777,6 +777,28 @@ each proposal awaits captain approval, application at batch-fix-pass).
 move-only; F20 is the highest-risk to APPLY (a misread breaks sc11/18-24) —
 its application spec is explicit (allow + clippy/suite verification).
 
+## Baseline Re-run (pre-batch, R8 — bd-baseline-rerun-zqtm, 2026-08-09)
+
+The 5 cheap greps re-run immediately before the batch-fix pass, per the
+charter's R8 staleness gate (ADR-0007 :851-855 precedent). Deltas vs the
+2026-08-09 Measured Baseline are annotated; all growth is attributable to
+P0-P6 work + new tests landed between baseline and batch.
+
+| Metric | Baseline (2026-08-09) | Re-run (pre-batch) | Delta | Attribution |
+|--------|----------------------|--------------------|-------|-------------|
+| LOC (5 crates, src+tests) | 45,609 (core 22,152 / mcp 6,574 / wf 7,618 / cli 4,340 / e2e 4,925) | **48,105** (core 23,799 / mcp 7,240 / wf 7,618 / cli 4,512 / e2e 4,936) | +2,496 (+1,647 core) | F4.G11 dual-projection sink, NIP-40/poison/verify fixes + tests, F9/F16/F17 pins, perf probe, proptests, S8 gate |
+| `unwrap(` in src | 219 | **261** | +42 | new test modules (F8/F9/F15/F16/F17/NIP-40) — prod unwrap unchanged at 14 invariant-true sites (F13) |
+| `expect(` in src | 984 | **1,098** | +114 | same — prod 69 invariant-true sites unchanged (F13); test additions |
+| Mutex/RwLock mentions | 102 (52 real instantiations) | **118** (41 `*::new` sites — counting method differs: `Mutex::new|RwLock::new|AsyncMutex::new`) | +16 | F4.G11 sink structs, perf probe |
+| `.lock()` sites | 122 | **135** | +13 | F4.G11 + tests |
+| `.await` sites | 1,324 | **1,432** | +108 | new async tests + G11 dual-sink |
+| (context) `panic!` | 35 (all test) | 36 | +1 | new test guard |
+| (context) `clone(` | 548 | 606 | +58 | test code |
+
+**Cite-drift check:** every file:line cite in findings.md was re-verified at
+P6 (doc-drift leaves) — no stale citations flagged. Batch-fix-pass may now
+run against a tree whose numbers it can compare to this table.
+
 ## S1/S2/S4/S5/S6/S7/F2.KDF — Re-verification GREEN (bd-p0-verify-green-claims-8z3p)
 
 **Probe:** 2026-08-09, live tree (no code modifications). All 7 claims re-verified GREEN
