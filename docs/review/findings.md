@@ -243,42 +243,6 @@ lacking `status` found and repaired).
   flaky failure, clean re-run).
 - No remaining placeholder without a `status` field; nothing faked to look real.
 
-## F5.POISON — Poison-on-panic survivability audit (bd-p1-poison-on-panic-audit-jwpd)
-
-**Probe:** 2026-08-09. Verdict: **FIXED** — 2 production poison-propagating std-Mutex sites
-repaired; 0 remaining.
-
-### Per-site verdict table (all std::sync::Mutex/RwLock — the only poisoning types)
-
-| Site | Lock | Acquisition | Verdict |
-|------|------|------------|---------|
-| `toron-mcp/src/workflow_host.rs:153-159` (runner arm) | std `Mutex<MentionCoalescer>` | `.lock().expect("coalescer lock")` → **FIXED**: `.lock().unwrap_or_else(\|e\| e.into_inner())` | RECOVERED (poison re-init) |
-| `toron-mcp/src/workflow_host.rs:441-454` (tick flush) | std `Mutex<MentionCoalescer>` | `.lock().expect("coalescer lock")` → **FIXED**: `.lock().unwrap_or_else(\|e\| e.into_inner())` | RECOVERED (poison re-init) |
-| `toron-cli/src/operator.rs:592-630` (4 sites) | std `Mutex` (state) | `match state().lock() { Err(p) => p.into_inner() }` | RECOVERED (pre-existing) |
-| parking_lot Mutex/RwLock — 12 files (unwrap.rs, in_process.rs, git.rs, writer.rs, herdr.rs, mock.rs, mock_relay.rs, presence.rs, contacts.rs, dispatch.rs, mailbox/mod.rs, +1) | non-poisoning | — | SAFE by construction (no PoisonError exists) |
-| tokio::sync::Mutex (sc16 SpikeSink) | non-poisoning | — | SAFE by construction |
-| engine.rs test module (9 std Mutex, 17 `.lock().unwrap()` sites, `StdMutex` alias, lines 1763-2386) | std | unwrap | TEST-ONLY — panic = test failure, not service death |
-| e2e tests sc21 (3), sc24 (4), cli_robot/cli_tui (1 each), cli_operator OnceLock<Mutex<()>> | std | unwrap | TEST-ONLY scaffolding |
-| guard.rs:379 `index.write().expect(...)` | git2 Index (NOT a lock) | — | FALSE POSITIVE (repo.index().write(), test) |
-
-### RED→GREEN
-
-- RED mechanism: std Mutex poison → `.lock().expect()` panics with PoisonError on every
-  subsequent access (panic-in-panic = dead service). The charter S7 flag (coalescer
-  `.expect`) was the only production instance.
-- GREEN test `poisoned_coalescer_survives` (workflow_host.rs:1207): poisons the coalescer
-  via `catch_unwind` panic inside the guard, asserts `is_poisoned()`, then runs a REAL
-  `DispatchJob` through the runner arm — must not panic. **Passes** (0.01s).
-- 3/4 coalescer-group tests green; the 1 failure is `coalescer_lock_not_held_across_blocking_publish`
-  — F3.COALESCER-LOCK's intentional RED test (owned by bd-p1-std-guard-across-blockon-gwnt).
-
-### Notes
-
-- `PoisonError`-recovery (`unwrap_or_else(|e| e.into_inner())`) chosen over parking_lot
-  migration — 2 sites, no dep-tree change, honest re-init (captain decision 5 weighing).
-- The guard-hold-across-publish stall (F3) is tracked separately; the poison recovery here
-  removes the *brick* risk on top of it.
-
 ## F1.LAG-SWALLOW — RelayBus broadcast lag silently dropped (P1, bd-p1-broadcast-lag-handling-6wm8)
 
 **Probe:** 2026-08-09. Verdict: **RED** (swallow confirmed) → **decision: SURFACE**.
@@ -316,3 +280,44 @@ Verified: test RED on live tree; GREEN-shape confirmed by temporary wiring (coun
 `Lagged(skipped)` increment + health surfacing) → test passes. Fix restores the metric;
 implementation deferred to the batch-fix pass (charter: no code edits until full P0–P6
 findings table is reviewed and captain approves).
+
+## F2.SILENT-DROP — Silent Result/Option drop audit (P2, bd-p2-silent-result-drop-99rr)
+
+**Probe:** 2026-08-09. ast-grep `let _ = $X;` (306 raw matches) + `.ok();` (1) + bare-call
+check, filtered to non-test src. **31 real src sites classified, all enumerated below.**
+Count-conservation: 306 raw = 275 test-module + 31 src (feeds bd-p2-count-conservation-v3ey).
+
+### Classification (31/31, exact)
+
+| Class | Count | Sites (file:line) | Rationale |
+|-------|-------|-------------------|-----------|
+| **DELIBERATE** — best-effort bus send (receiver-optional) | 6 | unwrap.rs:250 (documented trigger notify), relay_bus.rs:115, relay_bus.rs:197, presence.rs:97, mock.rs:73, in_process.rs:301 (EOSE) | Drop-on-full is the designed lossy path for these channels; unwrap.rs:251 has an explicit reason comment |
+| **DELIBERATE** — error propagates via `?`, only Ok value dropped | 3 | relay_bus.rs:95, reconcile.rs:112, product.rs:351 | `let _ = ...?` surfaces errors; value genuinely unused |
+| **DELIBERATE** — documented fire-and-forget | 3 | cron.rs:324 (comment cites durable-run terminal events), main.rs:153 (bench, comment cites timing-only semantics), operator.rs:597 (metrics persist — snapshot loss acceptable) | Explicit reasons in code |
+| **DELIBERATE** — stale temp cleanup | 5 | operator.rs:338, 344, 359, 376, 377 | Best-effort file cleanup |
+| **DELIBERATE** — suppress-unused in flow | 2 | product.rs:80, macros.rs:145 | Side effect already executed; silences unused-var |
+| **DELIBERATE** — enum/unit discard | 1 | cron.rs:183 (`FailureAction::Log` — actions are the embedding's to perform) | Comment explains |
+| **DELIBERATE** — builder/void-io | 7 | main.rs:49 (print_help), server.rs:298 (ensure_operator_key_mode), guard.rs:158, 239-242 (rhai ctx set_value/set_function) | Builder setup; missing binding degrades the sandbox only |
+| **ACCIDENTAL** — silent failure (fix in batch) | 4 | relay_bus.rs:111, reservations.rs:409, reservations.rs:573, reservations.rs:574 | See below |
+
+### ACCIDENTAL sites (fix in batch per captain decision 4)
+
+1. **relay_bus.rs:111** — `let _ = client_for_task.handle_notifications(...).await` — the
+   federation notification PUMP result is dropped. If the pump errors/exits, every relay
+   subscription goes dead SILENTLY (no log, no health signal). Fix: log error + surface in
+   health.
+2. **reservations.rs:573-574** — `record_transition` drops `archive.stage_file` +
+   `archive.commit` — the G13 audit-history write can silently fail (unwritable archive,
+   git error), losing the acquire/release/revoked record with no signal. Fix: log warn on
+   error (fn stays fire-and-forget but not silent).
+3. **reservations.rs:409** — `let _ = self.publish_dm(&wrap).await` — force-release holder
+   NOTIFICATION DM result dropped. If the DM fails, the force-released holder is never told.
+   Fix: log warn on error.
+
+### Notes
+
+- No bare `fn_call();` returning Result/Option exists in src (cargo check clean → must_use
+  would flag them); the silent class is exactly the explicit `let _ =` sites above.
+- `.ok();` in src: 1 site (rebuild.rs:319) — test-module only, not counted.
+- All 4 accidental fixes are log-or-surface changes (no control-flow reshuffle); no RED
+  test authored — behavior unchanged, observability added. Batch-fix candidates.
