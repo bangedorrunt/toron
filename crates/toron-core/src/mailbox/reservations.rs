@@ -732,6 +732,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn renew_extends_from_absolute_expiry_not_double_counting() {
+        // Regression pin (parity bug bd-XXX): renewal must set the new expiry
+        // to the OLD absolute expiry PLUS the extension — treating
+        // `expires_ts_us` as a relative duration and re-adding to `now`
+        // double-counts elapsed time (2x expiry). Acquire TTL 3600, renew
+        // +7200: the renewed lease must expire at old+7200, NOT ~2x-old.
+        let (mailbox, db_path, data_dir) = test_mailbox("renew-abs").await;
+        register(&mailbox, "demo", "BlueLake").await;
+
+        let acq = mailbox
+            .file_reservation_paths(
+                "demo",
+                "BlueLake",
+                &["src/**".into()],
+                Some(3600),
+                true,
+                None,
+            )
+            .await
+            .expect("acquire");
+        let old_expiry_us = acq.granted[0]
+            .expires_ts_us
+            .expect("acquired lease has expiry");
+
+        let renew = mailbox
+            .renew_file_reservations("demo", "BlueLake", &["src/**".into()], 7200)
+            .await
+            .expect("renew");
+        assert_eq!(renew.renewed, 1);
+        assert_eq!(renew.reservations.len(), 1);
+        let expected_us = old_expiry_us + 7_200_000_000;
+        assert_eq!(
+            renew.reservations[0].expires_ts_us,
+            Some(expected_us),
+            "renewed expiry must be OLD absolute expiry + extend, not now+extend or 2x (bd-XXX regression); old={old_expiry_us} got={:?}",
+            renew.reservations[0].expires_ts_us,
+        );
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[tokio::test]
     async fn test_renew_and_release() {
         let (mailbox, db_path, data_dir) = test_mailbox("renew").await;
         register(&mailbox, "demo", "BlueLake").await;
