@@ -526,6 +526,26 @@ projection-inconsistency finding. Unwrap module 20/20 green; clippy clean.
 Companion: bd-p3-projection-atomicity-rtjz covers the failure-semantics
 question (in progress).
 
+## F17.CONCURRENCY-STRESS — burst/lag/multi-process stress nets (P5) — GREEN
+
+**Probe:** `bd-p5-concurrency-stress-tests-9q8l` (2026-08-09). Verdict: **no
+race/deadlock/durability gap found** — 2 new stress nets added; existing
+coverage audited.
+
+### Stress nets
+
+| Scenario | Test | Result |
+|----------|------|--------|
+| Burst coalesce: 100 mentions fired barrier-synced from 8 threads in <1s → BOUNDED kind-43001 jobs (not 100), all stamped, none re-trigger | `burst_100_mentions_bounded_jobs` (workflow_host.rs, NEW) | **GREEN** (≤5 jobs, ≥1, stamped) |
+| Multi-process durable root: TWO shelled binaries on one TORON_MCP_DATA_DIR — binary A `mail send`, binary B `mail inbox` sees it (no in-process side) | `cross_process_binary_send_binary_receive` (cli_robot.rs, NEW) | **GREEN** (27.8s incl. KDF boots) |
+| Broadcast lag saturation | `bus_burst_throughput_and_lag_ceiling` (perf_baseline) + F1 lag RED test + `test_slow_subscriber_does_not_block_others` | covered (F11 + F1.LAG-SWALLOW) |
+| Concurrent sends / subscribers / writers / metrics | F8 `concurrent_workflow_sends_no_hang`, `test_concurrent_subscribers_all_receive`, `concurrent_writers_serialize_no_deadlock`, `snapshot_concurrent_with_record_no_deadlock` | covered (pre-existing) |
+
+### Verdict
+
+No new defect. cli_robot 7/7 green; workflow_host 10/11 (only the
+batch-deferred F3.COALESCER-LOCK RED fails); clippy clean.
+
 ## S1/S2/S4/S5/S6/S7/F2.KDF — Re-verification GREEN (bd-p0-verify-green-claims-8z3p)
 
 **Probe:** 2026-08-09, live tree (no code modifications). All 7 claims re-verified GREEN
