@@ -301,4 +301,47 @@ mod tests {
         assert_eq!(case.p95_us, 950);
         assert_eq!(case.avg_us, 495);
     }
+
+    /// F4.LOCK-ORDER pin (bd-p1-lock-ordering-deadlock-71po): the ONLY nested
+    /// multi-lock hold in the tree is `snapshot()` (per_tool → latency_hist).
+    /// Hammer it concurrently with `record()` (latency_hist alone) under a
+    /// bounded wall-clock — a lock-order inversion (a future change acquiring
+    /// latency_hist → per_tool) would deadlock and trip the bound.
+    #[test]
+    fn snapshot_concurrent_with_record_no_deadlock() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let m = Arc::new(MailboxMetrics::new());
+        let done = Arc::new(AtomicBool::new(false));
+        let done_work = done.clone();
+        let worker = std::thread::spawn(move || {
+            let mut handles = Vec::new();
+            for i in 0..8 {
+                let m = m.clone();
+                handles.push(std::thread::spawn(move || {
+                    for k in 0..500 {
+                        m.record(&format!("tool-{i}"), true, k);
+                        let _ = m.snapshot();
+                    }
+                }));
+            }
+            for h in handles {
+                h.join().expect("metrics worker no panic");
+            }
+            done_work.store(true, Ordering::Relaxed);
+        });
+
+        // Bounded deadlock detector: snapshot() holds per_tool while taking
+        // latency_hist; record() takes latency_hist. Inversion would hang.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !done.load(Ordering::Relaxed) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "metrics snapshot/record deadlock (F4.LOCK-ORDER per_tool -> latency_hist)"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        worker.join().expect("metrics stress thread no panic");
+    }
 }
