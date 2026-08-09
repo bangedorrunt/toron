@@ -93,6 +93,106 @@ fn inbox_parity_emits_valid_json() {
     );
 }
 
+/// S3 (ADR-0007 Soundness Ledger) — cross-process MAIL-CONTENT sharing over
+/// the durable root (bd-p0-s3-shared-state-reword-mujh).
+///
+/// The pre-existing cli_robot tests prove IDENTITY sharing only (the shelled
+/// binary finds TestAgent's key). This test proves MAIL CONTENT sharing:
+/// a message sent in-process must be visible to a shelled-out `toron`
+/// subprocess on the same `TORON_MCP_DATA_DIR`.
+///
+/// RED→GREEN contract: if the subprocess CANNOT see the in-process-sent
+/// message, that is a genuine S3 gap (re-opens the "fully implemented"
+/// claim for S3) — file as P0 finding. If it passes, the durable root
+/// shares projected mail and this test pins the S3 claim.
+#[test]
+fn cross_process_mail_content_shares_durable_root() {
+    register_test_agent();
+
+    // 1. In-process: send a marker message (self-addressed, gift-wrapped).
+    let marker = format!("s3-shared-{}", std::process::id());
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    rt.block_on(async {
+        let mailbox = toron_mcp::demo_mailbox().await.expect("demo mailbox");
+        let sent = mailbox
+            .send_message(&toron_core::mailbox::messaging::SendMessage {
+                project_slug: "demo".into(),
+                sender_name: "TestAgent".into(),
+                to: vec!["TestAgent".into()],
+                subject: marker.clone(),
+                body_md: "cross-process mail-content sharing probe".into(),
+                cc: vec![],
+                bcc: vec![],
+                importance: None,
+                ack_required: false,
+                thread_id: None,
+                sender_token: None,
+                overseer: false,
+                extra_tags: Vec::new(),
+            })
+            .await
+            .expect("in-process send_message");
+        assert_eq!(sent.count, 1, "one delivery");
+
+        // 2. Wait for the projection/bus store to catch up (async unwrap
+        //    loop) before shelling out — bounded, then fail with context.
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let inbox = mailbox
+                .fetch_inbox(&toron_core::mailbox::messaging::FetchInbox {
+                    project_slug: "demo".into(),
+                    agent_name: "TestAgent".into(),
+                    unread_only: false,
+                    limit: None,
+                    include_bodies: true,
+                })
+                .await
+                .expect("in-process inbox");
+            if inbox.iter().any(|m| m.subject == marker) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "in-process projection of the marker message timed out"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    });
+
+    // 3. Shell out on the SAME TORON_MCP_DATA_DIR (inherited env).
+    let out = run(&[
+        "mail",
+        "inbox",
+        "--agent",
+        "TestAgent",
+        "--project",
+        "demo",
+        "--json",
+    ]);
+    assert!(
+        out.status.success(),
+        "subprocess inbox must exit 0, stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: Value =
+        serde_json::from_slice(&out.stdout).expect("subprocess inbox must emit valid JSON");
+
+    // 4. Content assertion: the subprocess inbox CONTAINS the marker.
+    let found = value
+        .as_array()
+        .map(|arr| {
+            arr.iter().any(|m| {
+                m.get("subject").and_then(|s| s.as_str()) == Some(marker.as_str())
+            })
+        })
+        .unwrap_or(false);
+    assert!(
+        found,
+        "subprocess inbox must contain the in-process-sent mail (S3 mail-content sharing), got {value}"
+    );
+}
+
 #[test]
 fn send_parity_shape_or_clean_failure() {
     register_test_agent();
