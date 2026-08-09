@@ -484,6 +484,23 @@ bounds re-scans; the 50-key gate bounds cold scans. The one weakness (operator
 key log_n=12) fixed inline to 14. Config tests 9/9 green; CLI check clean;
 clippy clean.
 
+## F15.CRYPTO-PROPTESTS — seal/gift-wrap property tests (P5) — GREEN
+
+**Probe:** `bd-p5-crypto-property-tests-2qvs` (2026-08-09). Verdict: **GREEN —
+all 4 properties covered; 3 new proptests added** (regression nets for
+F3.GIFTWRAP + F8.VERIFY-INGEST). File: `crates/toron-core/src/nostr/proptests.rs`.
+
+| Property | Test | Status |
+|----------|------|--------|
+| gift-wrap round-trip (wrap → unwrap == rumor, arbitrary content) | `gift_wrap_roundtrip_preserves_rumor` | pre-existing, GREEN |
+| **seal (kind-13) round-trip** (sender signs → recipient decrypts → exact rumor) | `seal_roundtrip_preserves_rumor` | **NEW**, GREEN |
+| **wrong-recipient unwrap fails** (arbitrary content) | `unwrap_wrong_recipient_fails` | **NEW**, GREEN |
+| **seal sender-mismatch → `SenderMismatch`** (seal signed by Y, rumor authored by X) | `seal_sender_mismatch_rejected` | **NEW**, GREEN |
+| tampered content fails verify / NIP-44 wrong-key fails | `mutated_content_fails_verify`, `nip44_wrong_key_fails` | pre-existing, GREEN |
+
+10/10 proptests pass; clippy clean. No defect — properties pin the NIP-59
+seal/wrap invariants against future refactors.
+
 ## S1/S2/S4/S5/S6/S7/F2.KDF — Re-verification GREEN (bd-p0-verify-green-claims-8z3p)
 
 **Probe:** 2026-08-09, live tree (no code modifications). All 7 claims re-verified GREEN
