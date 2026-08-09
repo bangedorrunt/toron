@@ -393,3 +393,28 @@ Count-conservation: 306 raw = 275 test-module + 31 src (feeds bd-p2-count-conser
 - `.ok();` in src: 1 site (rebuild.rs:319) — test-module only, not counted.
 - All 4 accidental fixes are log-or-surface changes (no control-flow reshuffle); no RED
   test authored — behavior unchanged, observability added. Batch-fix candidates.
+
+## F3.GIFTWRAP — NIP-59 gift-wrap invariants verified (P3, bd-p3-gift-wrap-metadata-leak-cs0a)
+
+**Probe:** 2026-08-09. Verdict: **GREEN** — all 3 invariants hold in code; 2 regression pins
+added (fresh-key + tampered-seal). Property round-trip already existed.
+
+| Invariant | Evidence (fn:line) | Verdict |
+|-----------|--------------------|---------|
+| Fresh one-time key per wrap (no sender identity leak via wrap pubkey) | `gift_wrap` → `EventBuilder::gift_wrap` (gift_wrap.rs:75-81); SDK `gift_wrap_from_seal` generates `Keys::generate()` per wrap (nostr-0.44.8 builder.rs:1488). **NEW pin** `test_wrap_uses_fresh_one_time_key_per_wrap`: w1.pubkey != w2.pubkey != sender.pubkey | GREEN — RED verified under identity-key regression simulation |
+| Seal (kind-13) sender-SIGNED (not just encrypted) | `unwrap` verifies seal id+sig via `verify_event(&seal)` (gift_wrap.rs:100) before decrypting rumor; `EventBuilder::seal` signs with sender (SDK nip59::make_seal). **NEW pin** `test_tampered_seal_rejected`: tampered seal → `Err(Verify)` | GREEN — RED verified with verify removed |
+| SenderMismatch detection (NIP-59) | seal.pubkey == rumor.pubkey enforced (gift_wrap.rs:109-112); existing `test_sender_mismatch_rejected` (rumor lies about author) | GREEN — pre-existing test |
+
+### Property tests (proptests.rs)
+
+- `gift_wrap_roundtrip_preserves_rumor` (proptests.rs:110) — arbitrary plaintext →
+  wrap (envelope content != plaintext) → unwrap recovers exact rumor. Existed, passes.
+- Tampered-seal rejection pinned as unit test (async, not proptest-compatible); property
+  coverage via `mutated_content_fails_verify` (proptests.rs:69) for the underlying
+  verify_event invariant.
+
+### Notes
+
+- E2E privacy claim holds: federated relay/bus observers see only the one-time-key
+  pubkey + NIP-44 ciphertext; sender identity, recipient, and rumor are hidden.
+- No production code changed — invariants were already correct; additions are pins.

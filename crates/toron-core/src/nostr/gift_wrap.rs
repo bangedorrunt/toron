@@ -287,6 +287,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_wrap_uses_fresh_one_time_key_per_wrap() {
+        // NIP-59 metadata hiding: the wrap's pubkey MUST NOT be the sender's
+        // identity key (a relay observer would learn the sender), and two
+        // wraps from the same sender MUST use different one-time keys
+        // (unlinkability — adr-0003 "one-time random key per wrap" claim).
+        let sender = sender_keys();
+        let recipient = recipient_keys();
+        let rumor = sample_rumor(sender.public_key());
+        let w1 = gift_wrap(&sender, &recipient.public_key(), rumor.clone())
+            .await
+            .expect("wrap1");
+        let w2 = gift_wrap(&sender, &recipient.public_key(), rumor)
+            .await
+            .expect("wrap2");
+
+        assert_ne!(
+            w1.pubkey,
+            sender.public_key(),
+            "wrap pubkey must not leak the sender identity"
+        );
+        assert_ne!(
+            w2.pubkey,
+            sender.public_key(),
+            "wrap pubkey must not leak the sender identity"
+        );
+        assert_ne!(
+            w1.pubkey, w2.pubkey,
+            "each wrap uses a FRESH one-time key (unlinkable wraps)"
+        );
+        // The seal inside is sender-signed; unwrap recovers the true sender.
+        let u = unwrap(&recipient, &w1).expect("unwrap");
+        assert_eq!(u.sender, sender.public_key());
+    }
+
+    #[tokio::test]
+    async fn test_tampered_seal_rejected() {
+        // The seal (kind-13) is sender-SIGNED, not just encrypted. Tampering
+        // the seal's content invalidates its id/sig; unwrap must reject it at
+        // verify_event (gift_wrap.rs:100), never deliver a forged rumor.
+        let sender = sender_keys();
+        let recipient = recipient_keys();
+        let rumor = sample_rumor(sender.public_key());
+
+        // Build the honest seal, then tamper with its content.
+        let seal = EventBuilder::seal(&sender, &recipient.public_key(), rumor.clone())
+            .await
+            .expect("seal")
+            .sign_with_keys(&sender)
+            .expect("sign seal");
+        let tampered = Event::new(
+            seal.id,
+            seal.pubkey,
+            seal.created_at,
+            seal.kind,
+            seal.tags.clone(),
+            "TAMPERED",
+            seal.sig,
+        );
+        // Wrap the tampered seal as a valid-looking gift wrap.
+        let wrapped = EventBuilder::gift_wrap_from_seal(
+            &recipient.public_key(),
+            &tampered,
+            Vec::<Tag>::new(),
+        )
+        .expect("wrap tampered seal");
+        match unwrap(&recipient, &wrapped) {
+            Err(GiftWrapError::Verify(_)) => {}
+            other => panic!("tampered seal must fail verify, got {:?}", other.map(|_| ())),
+        }
+    }
+
+    #[tokio::test]
     async fn test_rumor_content_not_visible_in_wrap() {
         let sender = sender_keys();
         let recipient = recipient_keys();
