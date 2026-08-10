@@ -182,13 +182,11 @@ impl ToronPaths {
     }
 }
 
-/// The operator key passphrase — resolved in priority order (see below). The
-/// passphrase file keeps the secret OUT of launchd/systemd unit files:
-/// `toron daemon install` writes the passphrase file at
-/// `~/.config/toron/passphrase` (mode 0600) and the unit references only the
-/// key path.
-///
-/// Resolution order:
+/// The operator key passphrase: `TORON_KEY_PASSPHRASE` env > passphrase file
+/// > the dev default. The passphrase file keeps the secret OUT of launchd/
+/// systemd unit files (`toron daemon install` writes
+/// `~/.config/toron/passphrase`, mode 0600, and the unit references only the
+/// key path). Resolution order:
 /// 1. `TORON_KEY_PASSPHRASE` (explicit env — dev/CI).
 /// 2. `TORON_KEY_PASSPHRASE_FILE` — a path; its trimmed content is used.
 /// 3. First existing `$XDG_CONFIG_HOME/toron/passphrase` /
@@ -228,14 +226,18 @@ pub fn resolve_passphrase(
     file_env: Option<&std::path::Path>,
     candidates: &[PathBuf],
 ) -> String {
-    if let Some(p) = env_value.filter(|p| !p.is_empty()) {
-        return p.to_string();
+    if let Some(p) = env_value {
+        if !p.is_empty() {
+            return p.to_string();
+        }
     }
-    if let Some(f) = file_env
-        && let Ok(s) = std::fs::read_to_string(f)
-        && !s.trim().is_empty()
-    {
-        return s.trim().to_string();
+    if let Some(f) = file_env {
+        if let Ok(s) = std::fs::read_to_string(f) {
+            let t = s.trim();
+            if !t.is_empty() {
+                return t.to_string();
+            }
+        }
     }
     for c in candidates {
         if let Ok(s) = std::fs::read_to_string(c) {
