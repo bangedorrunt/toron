@@ -1559,6 +1559,81 @@ mod tests {
         let _ = std::fs::remove_dir_all(&data_dir);
     }
 
+    /// P0 regression (bd-1pzd): TWO DISTINCT agents on the SAME exclusive
+    /// path — the corruption-prevention floor. The second acquire MUST be
+    /// hard-blocked (conflicts, granted 0); the conflict check MUST see the
+    /// first holder. NIP-33 dedup is per-(kind, pubkey, d): two authors on
+    /// one d are TWO coordinates, both leases survive the projection.
+    #[tokio::test]
+    async fn test_two_agents_same_exclusive_path_hard_blocks() {
+        let (mailbox, db_path, data_dir) = test_mailbox("p0two").await;
+        register(&mailbox, "demo", "BlueLake").await;
+        register(&mailbox, "demo", "RoseDune").await;
+
+        // A acquires the exclusive path.
+        let acq = mailbox
+            .file_reservation_paths(
+                "demo",
+                "BlueLake",
+                &["src/shared/*".into()],
+                Some(3600),
+                true,
+                Some("a"),
+            )
+            .await
+            .expect("A acquire");
+        assert_eq!(acq.granted.len(), 1);
+        assert!(acq.conflicts.is_empty());
+
+        // B's acquire of the SAME path → HARD block.
+        let acq2 = mailbox
+            .file_reservation_paths(
+                "demo",
+                "RoseDune",
+                &["src/shared/*".into()],
+                Some(3600),
+                true,
+                None,
+            )
+            .await
+            .expect("B acquire");
+        assert!(
+            acq2.granted.is_empty(),
+            "B must NOT be granted the same exclusive path: {acq2:?}"
+        );
+        assert_eq!(acq2.conflicts.len(), 1, "{acq2:?}");
+        assert_eq!(acq2.conflicts[0].path, "src/shared/*");
+        assert!(
+            acq2.conflicts[0].holders.iter().any(|h| h == "BlueLake"),
+            "holder must be A: {:?}",
+            acq2.conflicts[0].holders
+        );
+
+        // A third party's conflict check sees A's hold.
+        register(&mailbox, "demo", "MistyDesert").await;
+        let report = mailbox
+            .check_file_reservation_conflicts("demo", "MistyDesert", &["src/shared/*".into()])
+            .await
+            .expect("third-party conflicts");
+        assert!(!report.conflict_free);
+        assert_eq!(report.conflicts.len(), 1);
+        assert!(
+            report.conflicts[0].holders.iter().any(|h| h == "BlueLake"),
+            "{:?}",
+            report.conflicts[0].holders
+        );
+
+        // A's OWN re-check stays clear (own lease never self-conflicts).
+        let own = mailbox
+            .check_file_reservation_conflicts("demo", "BlueLake", &["src/shared/*".into()])
+            .await
+            .expect("own conflicts");
+        assert!(own.conflict_free);
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
     #[tokio::test]
     async fn renew_extends_from_absolute_expiry_not_double_counting() {
         // Regression pin (parity bug bd-XXX): renewal must set the new expiry

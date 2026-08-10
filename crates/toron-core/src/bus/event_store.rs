@@ -101,26 +101,60 @@ impl BusEventStore {
     /// Replay stored events ordered by `(created_at, event_id)` ascending
     /// (ADR-0003 G7 envelope order), filtering expired envelopes and
     /// respecting the filter's `limit` when set.
+    ///
+    /// The kind filter is pushed into SQL (`WHERE kind IN (…)`) — the
+    /// scan never truncates BEFORE matching. This is the P0 fix (bd-1pzd):
+    /// with the old `LIMIT ?` applied to the raw scan, the NEWEST events
+    /// (recent reservations/intents) fell outside the replay window on a
+    /// busy bus, so the conflict check saw no holders and granted the same
+    /// exclusive path to two agents. The `limit` is now applied to the
+    /// MATCHED output, so a mailbox query always sees the events it asks
+    /// for — up to the filter limit.
     pub async fn replay(&self, filter: &crate::bus::Filter) -> anyhow::Result<Vec<Event>> {
         let limit = filter.limit.unwrap_or(1000).min(MAX_STORED_EVENTS as usize);
-        let rows = sqlx::query(
-            "SELECT raw_json FROM bus_events
-             WHERE (expires_at IS NULL OR expires_at > ?1)
-             ORDER BY created_at ASC, event_id ASC
-             LIMIT ?2",
-        )
-        .bind(Timestamp::now().as_secs() as i64)
-        .bind(limit as i64)
-        .fetch_all(&self.pool)
-        .await?;
+        // SQL kind pushdown: `filter.kinds` is a public field on the nostr
+        // Filter; when set, only those kinds are scanned (cheap + correct).
+        let (sql, binds): (String, Vec<i64>) = match &filter.kinds {
+            Some(kinds) if !kinds.is_empty() => {
+                let kinds_vec: Vec<i64> = kinds.iter().map(|k| k.as_u16() as i64).collect();
+                let placeholders: Vec<String> = (2..=kinds_vec.len() + 1)
+                    .map(|i| format!("?{i}"))
+                    .collect();
+                (
+                    format!(
+                        "SELECT raw_json FROM bus_events
+                         WHERE (expires_at IS NULL OR expires_at > ?1)
+                           AND kind IN ({})
+                         ORDER BY created_at ASC, event_id ASC",
+                        placeholders.join(",")
+                    ),
+                    kinds_vec,
+                )
+            }
+            _ => (
+                "SELECT raw_json FROM bus_events
+                 WHERE (expires_at IS NULL OR expires_at > ?1)
+                 ORDER BY created_at ASC, event_id ASC"
+                    .to_string(),
+                Vec::new(),
+            ),
+        };
+        let mut q = sqlx::query(&sql).bind(Timestamp::now().as_secs() as i64);
+        for b in binds {
+            q = q.bind(b);
+        }
+        let rows = q.fetch_all(&self.pool).await?;
 
-        let mut out = Vec::with_capacity(rows.len());
+        let mut out: Vec<Event> = Vec::with_capacity(rows.len().min(limit));
         for row in rows {
             let raw: String = Row::get(&row, 0);
             if let Ok(ev) = Event::from_json(&raw)
                 && filter.match_event(&ev, Default::default())
             {
                 out.push(ev);
+                if out.len() >= limit {
+                    break;
+                }
             }
         }
         Ok(out)
@@ -293,6 +327,38 @@ mod tests {
         let all = store.all_events().await.expect("all");
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].id, live.id, "only the live envelope survives GC");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// bd-1pzd regression: the replay window must NOT truncate before the
+    /// filter matches. Two DISTINCT authors' 30031s on the same path both
+    /// replay (the corruption-prevention floor: the conflict check must see
+    /// every holder). The old SQL `LIMIT` applied to the raw scan dropped
+    /// the newest events on a busy bus.
+    #[tokio::test]
+    async fn test_replay_kind_pushdown_returns_all_30031() {
+        use crate::nostr::kinds::FILE_RESERVATION;
+        let (store, _pool, path) = temp_store().await;
+        let a = Keys::generate();
+        let b = Keys::generate();
+        for (keys, d) in [(a.clone(), "proj:src/shared/*"), (b.clone(), "proj:src/shared/*")] {
+            let ev = build_event(
+                &keys,
+                crate::nostr::kinds::toron_kind(FILE_RESERVATION),
+                r#"{"exclusive":true}"#,
+                vec![Tag::parse(["d", d]).expect("d"), Tag::parse(["t", "proj"]).expect("t")],
+                Timestamp::now(),
+            )
+            .expect("build");
+            assert!(store.insert(&ev).await.expect("insert"));
+        }
+        let filter = crate::bus::filter::kind_project_filter(
+            crate::nostr::kinds::toron_kind(FILE_RESERVATION),
+            "proj",
+        );
+        let replayed = store.replay(&filter).await.expect("replay");
+        assert_eq!(replayed.len(), 2, "both authors' 30031s replayed");
+        assert_ne!(replayed[0].pubkey, replayed[1].pubkey, "distinct authors");
         let _ = std::fs::remove_file(&path);
     }
 
