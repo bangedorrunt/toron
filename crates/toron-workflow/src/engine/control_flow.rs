@@ -557,13 +557,7 @@ pub(crate) async fn run_graph(
                 }
             };
             let future = ctx
-                .run(
-                    run_graph_node,
-                    GraphNodeInput {
-                        action: rendered,
-                        trigger: trigger.clone(),
-                    },
-                )
+                .run(run_graph_node, GraphNodeInput { action: rendered })
                 .spawn()?;
             futures.push(((*name).clone(), future));
         }
@@ -596,10 +590,6 @@ pub(crate) async fn run_graph(
 pub struct GraphNodeInput {
     /// The (template-rendered) action to execute.
     pub action: Action,
-    /// The trigger payload (bd-m7ac): control-flow nodes (parallel/foreach/
-    /// branch) need it to render their inner steps — the raw runner path did
-    /// not. Serialized with the action so the child is self-contained.
-    pub trigger: serde_json::Value,
 }
 
 /// A durable child executing ONE graph node's action. Spawned concurrently by
@@ -611,33 +601,8 @@ pub async fn run_graph_node(
     ctx: &Context,
     input: GraphNodeInput,
 ) -> resonate_sdk::Result<serde_json::Value> {
-    // bd-m7ac: graph nodes must route CONTROL-FLOW actions through the same
-    // expansion as linear steps. A graph `parallel` node (the weekly-review
-    // scout fan-out) needs `run_parallel` to spawn its copies — dispatching
-    // the raw action to the runner would record `{action:"parallel"}` and
-    // never fan out. Leaf actions keep the direct runner path (rendered
-    // before the node ran, so no re-render).
-    let runner = ctx.get_dependency::<ActionRunner>();
-    use crate::schema::Step;
-    let is_control_flow = matches!(
-        input.action,
-        Action::Parallel { .. }
-            | Action::Foreach { .. }
-            | Action::Branch { .. }
-            | Action::Retry { .. }
-            | Action::CallWorkflow { .. }
-    );
-    if is_control_flow {
-        let mut step_outputs = serde_json::Map::new();
-        let step = Step {
-            name: None,
-            guard: None,
-            on_error: crate::schema::StepOnError::Continue,
-            action: input.action,
-        };
-        return run_step(ctx, &runner, &input.trigger, &step, &mut step_outputs).await;
-    }
-    match (runner)(&input.action) {
+    let _runner = ctx.get_dependency::<ActionRunner>();
+    match (_runner)(&input.action) {
         Ok(value) => Ok(value),
         Err(e) => Ok(serde_json::json!({ "ok": false, "error": e.to_string() })),
     }

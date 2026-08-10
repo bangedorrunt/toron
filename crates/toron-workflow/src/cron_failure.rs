@@ -54,13 +54,6 @@ pub struct PolicyEvent {
     pub action: FailureAction,
     /// The failure bundle (log actions still carry it for observability).
     pub bundle: FailureBundle,
-    /// The tick's full workflow run output (bd-m7ac weekly-review): present
-    /// when the workflow ran to a terminal state. The embedding reads it for
-    /// success side-effects (e.g. the weekly review bead from the oracle
-    /// step's synthesis). Additive — absent in AM-Rust and for log-only
-    /// consumers.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub output: Option<serde_json::Value>,
 }
 
 /// Side-channel for policy decisions (distinct newtype — the Resonate
@@ -200,40 +193,5 @@ mod tests {
         let (action, streak) = evaluate(&p, true, 0);
         assert_eq!(action, FailureAction::Escalate, "threshold 0 clamps to 1");
         assert_eq!(streak, 1);
-    }
-
-    /// bd-m7ac: a weekly-review tick's output flows to the embedding through
-    /// the PolicyEvent (additive field, default-absent for log-only crons).
-    #[test]
-    fn policy_event_carries_tick_output() {
-        let out = serde_json::json!({
-            "oracle": { "idea": { "title": "t", "what": "w" } }
-        });
-        let ev = PolicyEvent {
-            cron: "weekly-review".into(),
-            tick: 1720000000,
-            action: FailureAction::Log,
-            bundle: FailureBundle {
-                run_id: "cron:weekly-review:1720000000".into(),
-                workflow: "weekly-review".into(),
-                owner: "oracle".into(),
-                error: String::new(),
-                failed_step: None,
-                consecutive: 0,
-            },
-            output: Some(out.clone()),
-        };
-        assert_eq!(ev.output.as_ref().unwrap(), &out);
-        // Round-trips through serde (the sink's wire format).
-        let s = serde_json::to_string(&ev).expect("serializes");
-        let back: PolicyEvent = serde_json::from_str(&s).expect("deserializes");
-        assert_eq!(back.output.as_ref().unwrap(), &out);
-        // Absent output round-trips as None (backward compat).
-        let mut ev2 = ev.clone();
-        ev2.output = None;
-        let s2 = serde_json::to_string(&ev2).expect("serializes");
-        assert!(!s2.contains("\"output\""), "None output is skipped");
-        let back2: PolicyEvent = serde_json::from_str(&s2).expect("deserializes");
-        assert!(back2.output.is_none());
     }
 }
