@@ -13,8 +13,6 @@ This directory contains records of the major architectural decisions made for th
 | [0007](0007-post-implementation-hardening-and-api-redesign.md) | Post-Implementation Hardening, Bug Ledger, and Backend/API Redesign | **Accepted** (Rev 3; impl e23b + residual epic `bd-adr7-residual-vxnv` closed 2026-08-08 — captain gate `.4`; flywheel se2.3/c3b.1 remain out-of-epic; see [Verification](0007-post-implementation-hardening-and-api-redesign.md#verification-acceptance-for-this-adr)) |
 | [0008](0008-comprehensive-codebase-review-charter.md) | Comprehensive Codebase Review Charter — Tracks, Verification Gates, and Debate Protocol | **Accepted** (Rev 1, 2026-08-09; opencode debate crew AGREE-WITH-CHANGES — both counters in `docs/review/0008-debate-round1.md`; captain resolution `docs/review/0008-captain-resolution.md`; 20 items resolved 19-ACCEPT/1-REJECT; all 11 Soundness Ledger gates ran GREEN; NIP-40 ingest probe added as P0-candidate) |
 | [0009](0009-daemon-lifecycle-and-resonate-selection.md) | Daemon Lifecycle, Autostart, and Resonate Server Selection | **Accepted** (2026-08-09; `toron daemon` subcommand group; passphrase-file secret handling; remote→local→embedded Resonate selection; supersedes ad-hoc `com.flywheel.toron`) |
-| [0010](0010-execution-wiring-model-registry-headless.md) | Execution Wiring, Model Registry, Role Conditioning, and Headless Mode | **Proposed** (6-round grilling 2026-08-09; wires ADR-0005's scaffold to real execution + models + headless cron) |
-| [0011](0011-coalition-orchestration.md) | Coalition Orchestration — Steer + Collab as Layers, Intent-Based Coordination | **Proposed** (6-round grilling 2026-08-09; coalitions = channel+run, intents = 30031 status, soft-conflict check; no new kind) |
 
 ## Parity catalogs
 
