@@ -180,6 +180,10 @@ async fn cron_loop(
                         failed_step,
                         consecutive,
                     },
+                    // bd-m7ac: the full tick output (the oracle step's
+                    // synthesis for weekly-review) rides along so the
+                    // embedding can perform success side-effects.
+                    output: Some(tick_output),
                 });
             let _ = FailureAction::Log; // actions are the embedding's to perform
         }
