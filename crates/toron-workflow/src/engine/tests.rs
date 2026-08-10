@@ -485,7 +485,7 @@ steps:
         assert_eq!(content["run_id"], "run-1");
         // Addressable by run id (d tag).
         assert!(
-            ev.tags.iter().any(|t| t.as_slice().first() == Some(&"d".to_string())
+            ev.tags.iter().any(|t| t.as_slice().get(0) == Some(&"d".to_string())
                 && t.as_slice().get(1) == Some(&"run-1".to_string())),
             "d tag = run id"
         );
@@ -512,7 +512,7 @@ steps:
         let stamped = stamp_workflow_emitted(plain);
         assert_eq!(stamped.len(), 2, "marker appended");
         assert!(
-            stamped.iter().any(|t| t.as_slice().first().map(String::as_str) == Some("t")
+            stamped.iter().any(|t| t.as_slice().get(0).map(String::as_str) == Some("t")
                 && t.as_slice().get(1).map(String::as_str)
                     == Some(crate::trigger_filter::WORKFLOW_EMITTED_TAG)),
             "toron:workflow-emitted t-tag present"
