@@ -335,12 +335,6 @@ Version bumps derive from commit types: `feat` → minor, `fix`/`perf` → patch
 | [0001](docs/decisions/0001-project-foundation.md) | Project Foundation and Core Stack | Superseded by ADR-0003 |
 | [0002](docs/decisions/adopt-agent-adapter-architecture.md) | Adopt Agent Adapter Architecture | Partially superseded by ADR-0003 |
 | [0003](docs/decisions/0003-nostr-mailbox-fabric.md) | Nostr-Native, Tokio-Based Multi-Backend Agent Mailbox | **Accepted (constitution)** |
-| [0005](docs/decisions/0005-orchestration-layer.md) | Orchestration Tier — Profiles, Workflows, Stages, Smart Cron, Engine | **Accepted** |
-| [0010](docs/decisions/0010-execution-wiring-model-registry-headless.md) | Execution Wiring, Model Registry, Role Conditioning, Headless Mode | **Proposed** |
-| [0011](docs/decisions/0011-coalition-orchestration.md) | Coalition Orchestration — Steer + Collab Layers, Intent-Based Coordination | **Proposed** |
-
-> Full index (0001–0011, parity catalogs, ADR-0005 phase status): **[docs/decisions/README.md](docs/decisions/README.md)**.
-> Orchestration vocabulary (profiles/crews/workflows/cron) lives in [`flywheel`](../flywheel); see [`flywheel/docs/workflow-authoring.md`](../flywheel/docs/workflow-authoring.md).
 
 ## References
 
