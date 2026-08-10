@@ -6,8 +6,6 @@
 //! pattern. No evaluation is performed (that's the engine, bd-oge) — lint is
 //! a static validator with actionable errors.
 
-use std::collections::BTreeMap;
-
 use crate::schema::{Action, Graph, Trigger, Workflow};
 
 /// The Buzz-derived guard evaluation timeout (ms). Lint enforces that guards
@@ -189,7 +187,6 @@ pub fn lint_workflow(wf: &Workflow) -> LintReport {
 ///
 /// Fail-stop at lint, never at runtime.
 fn check_graph(report: &mut LintReport, graph: &Graph) {
-    use crate::schema::GraphNode;
     let nodes = &graph.nodes;
     if nodes.is_empty() {
         report.issues.push(LintIssue {
@@ -227,7 +224,6 @@ fn check_graph(report: &mut LintReport, graph: &Graph) {
     let mut in_stack: std::collections::HashSet<&str> = std::collections::HashSet::new();
     fn dfs<'a>(
         node: &'a str,
-        nodes: &'a BTreeMap<String, GraphNode>,
         edges: &[(&'a str, &'a str)],
         visited: &mut std::collections::HashSet<&'a str>,
         in_stack: &mut std::collections::HashSet<&'a str>,
@@ -245,14 +241,14 @@ fn check_graph(report: &mut LintReport, graph: &Graph) {
                     line: None,
                 });
             } else if !visited.contains(*from) {
-                dfs(from, nodes, edges, visited, in_stack, report);
+                dfs(from, edges, visited, in_stack, report);
             }
         }
         in_stack.remove(node);
     }
     for name in nodes.keys() {
         if !visited.contains(name.as_str()) {
-            dfs(name, nodes, &edges, &mut visited, &mut in_stack, report);
+            dfs(name, &edges, &mut visited, &mut in_stack, report);
         }
     }
 
@@ -277,7 +273,7 @@ fn check_graph(report: &mut LintReport, graph: &Graph) {
         reachable.insert(node);
         for (_from, to) in edges.iter().filter(|(from, _)| *from == node) {
             if !reachable.contains(to) {
-                reach(*to, edges, reachable);
+                reach(to, edges, reachable);
             }
         }
     }

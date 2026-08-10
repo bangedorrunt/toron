@@ -69,10 +69,10 @@ pub fn resonate_server_url() -> Option<String> {
 
 /// Pure resolution core (testable with a fake probe).
 pub fn resonate_server_url_with(probe: impl Fn(&str) -> bool) -> Option<String> {
-    if let Ok(pin) = std::env::var(RESONATE_URL_ENV) {
-        if !pin.trim().is_empty() {
-            return Some(pin);
-        }
+    if let Ok(pin) = std::env::var(RESONATE_URL_ENV)
+        && !pin.trim().is_empty()
+    {
+        return Some(pin);
     }
     if probe(REMOTE_RESONATE_URL) {
         return Some(REMOTE_RESONATE_URL.to_string());
