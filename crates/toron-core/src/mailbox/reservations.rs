@@ -215,6 +215,12 @@ pub struct AcquireResult {
     /// (ADR-0011 Spec 4 — SOFT conflict: freeze + propose, NOT a hard block).
     /// Absent in AM-Rust (additive; the held tier is unchanged).
     pub soft_conflicts: Vec<PathConflict>,
+    /// Detector proposal attached on a soft-conflict FREEZE (P11.3b,
+    /// bd-foh8.4): the tiered rule-split for the frozen paths. Opaque JSON —
+    /// the caller (flywheel coalition.rs) serializes its own proposal type.
+    /// `None` when no freeze fired or no rule applied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proposal: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
