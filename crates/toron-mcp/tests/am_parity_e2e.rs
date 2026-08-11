@@ -684,14 +684,13 @@ async fn cluster_file_reservations() -> anyhow::Result<()> {
             }),
         )
         .await;
-    let force_id = re_acq["granted"][0]["id"].as_str().unwrap().to_string();
     let forced_raw = d
         .call_raw(
             "force_release_file_reservation",
             serde_json::json!({
                 "project_key": proj,
                 "agent_name": "HillCrest",
-                "file_reservation_id": force_id,
+                "path": "docs/**",
                 "note": "parity force-release",
                 "notify_previous": false,
             }),

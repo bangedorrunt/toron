@@ -75,11 +75,10 @@ async fn sc5_force_release_staleness_gate_and_revocation() {
         .await
         .expect("PiAlpha reserve");
     assert_eq!(acquire.granted.len(), 1);
-    let res_id = acquire.granted[0].id.clone();
 
     // --- Staleness gate: fresh holder → force-release DENIED ---
     let denied = mailbox
-        .force_release_file_reservation("demo", "OCBeta", &res_id, Some("test"), false)
+        .force_release_file_reservation("demo", "OCBeta", "src/**", None, Some("test"), false)
         .await;
     assert!(
         denied.is_err(),

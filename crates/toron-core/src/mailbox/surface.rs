@@ -447,7 +447,8 @@ pub trait MailSurface: Send + Sync {
         &self,
         project: &str,
         requestor: &str,
-        reservation_id: &str,
+        path: &str,
+        holder: Option<&str>,
         note: Option<&str>,
         notify_previous: bool,
     ) -> Result<(), MailError>;
@@ -823,12 +824,13 @@ impl MailSurface for ToronMailSurface {
         &self,
         project: &str,
         requestor: &str,
-        reservation_id: &str,
+        path: &str,
+        holder: Option<&str>,
         note: Option<&str>,
         notify_previous: bool,
     ) -> Result<(), MailError> {
         self.mailbox
-            .force_release_file_reservation(project, requestor, reservation_id, note, notify_previous)
+            .force_release_file_reservation(project, requestor, path, holder, note, notify_previous)
             .await
             .map_mail_error()
     }
@@ -1266,9 +1268,8 @@ mod tests {
             .reserve("demo", "GreenCastle", &["src/**".to_string()], Some(3600), true, None)
             .await
             .expect("reserve");
-        let id = &ok.granted[0].id;
         let err = surface
-            .force_release("demo", "BlueLake", id, Some("nope"), false)
+            .force_release("demo", "BlueLake", "src/**", None, Some("nope"), false)
             .await
             .expect_err("active holder → denied");
         assert!(

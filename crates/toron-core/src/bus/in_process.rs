@@ -299,8 +299,18 @@ impl Bus for InProcessBus {
             return self.fanout(event, false).await;
         }
 
-        // 3. Dedup: store by event id (ON CONFLICT DO NOTHING).
-        let stored = self.store.insert(&event).await.map_err(|e| {
+        // 3. Dedup: store by event id (ON CONFLICT DO NOTHING). Addressable
+        //    kinds (NIP-33 parameterized-replaceable, e.g. kind-30031 file
+        //    reservations) additionally collapse to the latest event per
+        //    (kind, author, d_tag) — without this a renewal storm accumulates
+        //    hundreds of superseded events on one coordinate, which overflows
+        //    replay's window and hides the newest state (bd-cumj).
+        let stored = if crate::bus::is_addressable(event.kind) {
+            self.store.insert_addressable(&event).await
+        } else {
+            self.store.insert(&event).await
+        }
+        .map_err(|e| {
             self.stage_log(Stage::Dedup, &event, &format!("store failure: {e}"));
             BusError::Publish(format!("event store failure: {e}"))
         })?;

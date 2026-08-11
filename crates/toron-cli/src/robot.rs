@@ -180,7 +180,8 @@ pub async fn run_reserve(mailbox: &Mailbox, cmd: &ReserveCommand) -> anyhow::Res
                 .force_release_file_reservation(
                     &args.project,
                     &args.agent,
-                    &args.id,
+                    &args.path,
+                    args.holder.as_deref(),
                     args.note.as_deref(),
                     args.notify_previous,
                 )

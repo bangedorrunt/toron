@@ -482,6 +482,19 @@ impl Mailbox {
 
     /// `renew_file_reservations`: republish the holder's active leases with an
     /// extended TTL (same `(kind,d)` coordinate → supersedes per author).
+    ///
+    /// bd-evqs renewal cap: a lease whose remaining TTL is ALREADY ≥
+    /// `extend_secs` is NOT republished. The durable loop heartbeat renews
+    /// every tick; without the cap it re-publishes every lease each tick —
+    /// a single d-tag accumulated 1218 renewal events over ~10h (the
+    /// reservation renewal storm, holder inactive, owning bead closed).
+    /// Renewing a lease that will outlive the extension adds nothing (the
+    /// TTL ratchets: renew only when remaining < extend_secs, keeping the
+    /// lease healthy in [extend, 2×extend) forever) — the cap collapses the
+    /// churn to ~1 event per extend window per lease, and lets a concurrent
+    /// release/revocation win the coordinate instead of racing a same-second
+    /// renew. Permanent leases (no expiry) are never renewed (they never
+    /// lapse).
     pub async fn renew_file_reservations(
         &self,
         project_slug: &str,
@@ -490,6 +503,7 @@ impl Mailbox {
         extend_secs: u64,
     ) -> anyhow::Result<RenewResult> {
         let agent_keys = self.agent_keys_for(project_slug, agent_name)?;
+        let now_secs = Timestamp::now().as_secs() as i64;
         let mine = self
             .active_reservations(project_slug)
             .await?
@@ -501,6 +515,15 @@ impl Mailbox {
         let mut result = RenewResult::default();
         for res in mine {
             let d = format!("{project_slug}:{}", res.path_pattern);
+            // bd-evqs cap: skip when the lease still has ≥ extend_secs of TTL
+            // left (or is permanent). No event is published — the loop's
+            // every-tick heartbeat stops churning the bus.
+            let old_expiry_secs = res.expires_ts_us.map(|t| (t / 1_000_000) as i64);
+            match old_expiry_secs {
+                None => continue, // permanent lease — nothing to renew
+                Some(abs) if abs.saturating_sub(now_secs) >= extend_secs as i64 => continue,
+                Some(_) => {}
+            }
             let base = vec![
                 Tag::parse(["d", &d]).expect("d"),
                 Tag::parse(["reason", &res.reason]).expect("reason"),
@@ -513,10 +536,8 @@ impl Mailbox {
             // `now`. Treating `expires_ts_us` (absolute epoch µs) as a relative
             // duration and re-adding to `now` double-counts the elapsed time
             // and produced a 2x expiry (parity bug bd-XXX).
-            let old_expiry_secs = res.expires_ts_us.map(|t| (t / 1_000_000) as u64);
             let new_expiry_secs = old_expiry_secs
-                .map(|abs| abs.saturating_add(extend_secs))
-                // no old expiry (permanent lease): default to now+extend.
+                .map(|abs| (abs as u64).saturating_add(extend_secs))
                 .unwrap_or_else(|| created.as_secs().saturating_add(extend_secs));
             let ttl = EnvelopeTtl {
                 secs: Some(new_expiry_secs.saturating_sub(created.as_secs())),
@@ -590,11 +611,20 @@ impl Mailbox {
     /// `force_release_file_reservation` (G5 A1): staleness heuristic → the
     /// OPERATOR signs a kind-30031 `status:revoked` at the target coordinate +
     /// `e`/`a` refs. Projection key-priority resolves it; no NIP-09.
+    ///
+    /// The target is resolved by **path** (+ optional `holder` name) via the
+    /// SAME `active_reservations` view `check_file_reservation_conflicts` uses
+    /// (bd-cumj). An operator force-releasing a stale lock held by ANOTHER
+    /// agent cannot know that holder's event id (only the holder received it on
+    /// acquire), and the daemon's resolved winner id is the source of truth —
+    /// not a caller-supplied id that may diverge from the resolved one. So the
+    /// revocation always uses the daemon's own resolved lease id.
     pub async fn force_release_file_reservation(
         &self,
         project_slug: &str,
         requestor_name: &str,
-        file_reservation_id: &str,
+        path: &str,
+        holder: Option<&str>,
         note: Option<&str>,
         notify_previous: bool,
     ) -> anyhow::Result<()> {
@@ -603,22 +633,32 @@ impl Mailbox {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("no operator key configured"))?;
 
-        // Locate the lease by id (current event id).
+        // Locate the lease by path (+ optional holder) through the same view
+        // conflict-check reads — never a caller-supplied event id.
         let lease = self
             .active_reservations(project_slug)
             .await?
             .into_iter()
-            .find(|r| r.id == file_reservation_id)
+            .filter(|r| overlaps(&r.path_pattern, path))
+            .find(|r| match holder {
+                Some(h) => r.agent_name == h,
+                None => true,
+            })
             .ok_or_else(|| {
-                anyhow::anyhow!("no active reservation with id {file_reservation_id}")
+                let where_ = holder
+                    .map(|h| format!(" held by {h}"))
+                    .unwrap_or_default();
+                anyhow::anyhow!("no active reservation on {path}{where_}")
             })?;
 
         // 1. Staleness heuristic.
         let stale = self.is_holder_stale(project_slug, &lease).await;
         if !stale {
             anyhow::bail!(
-                "reservation {} not stale (holder active) — force-release denied",
-                file_reservation_id
+                "reservation on {} ({} by {}) not stale (holder active) — force-release denied",
+                lease.path_pattern,
+                lease.id,
+                lease.agent_name
             );
         }
 
@@ -1751,7 +1791,8 @@ mod tests {
             .force_release_file_reservation(
                 "demo",
                 "RoseDune",
-                &lease.id.to_hex(),
+                "src/**",
+                None,
                 Some("gone"),
                 true,
             )
@@ -2545,7 +2586,7 @@ mod tests {
 
         // Fresh holder → not stale → force-release denied.
         let err = mailbox
-            .force_release_file_reservation("demo", "RoseDune", &lease_id, Some("gone"), true)
+            .force_release_file_reservation("demo", "RoseDune", "src/**", None, Some("gone"), true)
             .await
             .expect_err("not stale");
         assert!(err.to_string().contains("not stale"), "{err}");
