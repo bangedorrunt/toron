@@ -517,12 +517,24 @@ impl Mailbox {
             let d = format!("{project_slug}:{}", res.path_pattern);
             // bd-evqs cap: skip when the lease still has ≥ extend_secs of TTL
             // left (or is permanent). No event is published — the loop's
-            // every-tick heartbeat stops churning the bus.
+            // every-tick heartbeat stops churning the bus. The lease is still
+            // REPORTED (unrenewed) so the embedding's closed-bead sweep can
+            // see + release it: a reservation whose owning bead closed is
+            // stale even while its TTL is healthy.
             let old_expiry_secs = res.expires_ts_us.map(|t| (t / 1_000_000) as i64);
-            match old_expiry_secs {
-                None => continue, // permanent lease — nothing to renew
-                Some(abs) if abs.saturating_sub(now_secs) >= extend_secs as i64 => continue,
-                Some(_) => {}
+            let skip = match old_expiry_secs {
+                None => true, // permanent lease — nothing to renew
+                Some(abs) => abs.saturating_sub(now_secs) >= extend_secs as i64,
+            };
+            if skip {
+                result.reservations.push(GrantedReservation {
+                    id: res.id.clone(),
+                    path_pattern: res.path_pattern.clone(),
+                    exclusive: res.exclusive,
+                    reason: res.reason.clone(),
+                    expires_ts_us: res.expires_ts_us,
+                });
+                continue;
             }
             let base = vec![
                 Tag::parse(["d", &d]).expect("d"),
