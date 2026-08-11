@@ -118,10 +118,10 @@ pub(crate) fn resolve_template(
             }
             return descend(inputs, path.split('.')).map(render_scalar);
         }
-        "steps" => return resolve_steps(path, step_outputs),
+        "steps" => return resolve_steps(&path, step_outputs),
         _ => return None,
     };
-    descend(value, path.split('.')).map(render_scalar)
+    descend(value, path.split('.')).map(|v| render_scalar(v))
 }
 
 /// Resolve `steps.<name>.<path>…` (the whole object when no `<path>`).
@@ -143,9 +143,9 @@ pub(crate) fn resolve_steps(
 /// Walk a dotted path through a JSON value.
 pub(crate) fn descend<'a>(
     mut value: &'a serde_json::Value,
-    path: std::str::Split<'_, char>,
+    mut path: std::str::Split<'_, char>,
 ) -> Option<&'a serde_json::Value> {
-    for part in path {
+    while let Some(part) = path.next() {
         value = value.get(part)?;
     }
     Some(value)
