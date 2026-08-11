@@ -520,12 +520,6 @@ pub struct CronSpec {
     /// Run mode: headless (default) or pane.
     #[serde(default)]
     pub mode: CronMode,
-    /// Pause/resume toggle (ADR-0012 Spec 4, P12.3): `false` PAUSES the cron
-    /// but preserves the definition — pause/resume never drops registration
-    /// state. Only a paused cron carries the field on disk (the default
-    /// `true` is not serialized).
-    #[serde(default = "default_cron_enabled", skip_serializing_if = "cron_enabled_default")]
-    pub enabled: bool,
     /// Failure/success + catch-up policy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy: Option<CronSpecPolicy>,
@@ -541,14 +535,6 @@ pub struct CronSpec {
 /// Parse a cron from YAML text (ADR-0012).
 pub fn parse_cron(yaml: &str) -> Result<CronSpec, serde_yaml::Error> {
     serde_yaml::from_str(yaml)
-}
-
-fn default_cron_enabled() -> bool {
-    true
-}
-
-fn cron_enabled_default(enabled: &bool) -> bool {
-    *enabled
 }
 
 /// The 7 ADR Phase-2 trigger types (validated against `Trigger::type_name`).
@@ -1004,28 +990,6 @@ steps:
         let spec = parse_cron(yaml).expect("variants parse");
         assert_eq!(spec.scope, CronScope::Project);
         assert_eq!(spec.mode, CronMode::Pane);
-    }
-
-    /// `enabled` defaults true (ADR-0012 Spec 4 pause/resume: only a paused
-    /// cron carries the field) and round-trips through serialization.
-    #[test]
-    fn parse_cron_enabled_defaults_and_roundtrips() {
-        let yaml = "name: p\nschedule: '* * * * *'\nowner: o\nsteps: []\n";
-        let spec = parse_cron(yaml).expect("cron parses");
-        assert!(spec.enabled, "default enabled = true");
-        let out = serde_yaml::to_string(&spec).expect("serializes");
-        assert!(
-            !out.contains("enabled"),
-            "enabled: true is not serialized (default): {out}"
-        );
-
-        let paused = "name: p\nschedule: '* * * * *'\nowner: o\nenabled: false\nsteps: []\n";
-        let spec = parse_cron(paused).expect("paused cron parses");
-        assert!(!spec.enabled, "enabled: false honored");
-        let out = serde_yaml::to_string(&spec).expect("serializes");
-        assert!(out.contains("enabled: false"), "paused state persists: {out}");
-        let spec2 = parse_cron(&out).expect("round-trips");
-        assert!(!spec2.enabled);
     }
 
     /// A cron is NOT a workflow: top-level `trigger:` is meaningless in a

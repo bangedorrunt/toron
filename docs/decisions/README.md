@@ -15,7 +15,6 @@ This directory contains records of the major architectural decisions made for th
 | [0009](0009-daemon-lifecycle-and-resonate-selection.md) | Daemon Lifecycle, Autostart, and Resonate Server Selection | **Accepted** (2026-08-09; `toron daemon` subcommand group; passphrase-file secret handling; remote→local→embedded Resonate selection; supersedes ad-hoc `com.flywheel.toron`) |
 | [0010](0010-execution-wiring-model-registry-headless.md) | Execution Wiring, Model Registry, Role Conditioning, and Headless Mode | **Proposed** (6-round grilling 2026-08-09; wires ADR-0005's scaffold to real execution + models + headless cron) |
 | [0011](0011-coalition-orchestration.md) | Coalition Orchestration — Steer + Collab as Layers, Intent-Based Coordination | **Proposed** (6-round grilling 2026-08-09; coalitions = channel+run, intents = 30031 status, soft-conflict check; no new kind) |
-| [0012](0012-standalone-cron-type.md) | Standalone Cron Type — a scheduled primitive distinct from workflow | **Proposed** (grilling 2026-08-11; cron = distinct YAML type with a body composing workflows; shared engine; Resonate-native; amends ADR-0005 Spec 3) |
 
 ## Parity catalogs
 
