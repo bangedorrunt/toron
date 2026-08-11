@@ -622,7 +622,7 @@ pub fn stamp_workflow_emitted(tags: Vec<nostr_sdk::prelude::Tag>) -> Vec<nostr_s
     use crate::trigger_filter::WORKFLOW_EMITTED_TAG;
     if tags
         .iter()
-        .any(|t| t.as_slice().first().map(String::as_str) == Some("t")
+        .any(|t| t.as_slice().get(0).map(String::as_str) == Some("t")
             && t.as_slice().get(1).map(String::as_str) == Some(WORKFLOW_EMITTED_TAG))
     {
         return tags;
