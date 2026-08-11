@@ -6,9 +6,7 @@
 //! pattern. No evaluation is performed (that's the engine, bd-oge) — lint is
 //! a static validator with actionable errors.
 
-use std::collections::BTreeMap;
-
-use crate::schema::{Action, Graph, Trigger, Workflow};
+use crate::schema::{Action, CronSpec, CronSpecPolicy, Graph, Step, Trigger, Workflow};
 
 /// The Buzz-derived guard evaluation timeout (ms). Lint enforces that guards
 /// are simple expressions; the engine applies the timeout at eval time.
@@ -66,27 +64,7 @@ impl LintReport {
 pub fn lint_workflow(wf: &Workflow) -> LintReport {
     let mut report = LintReport::default();
 
-    // Name is required and must be a valid identifier.
-    if wf.name.trim().is_empty() {
-        report.issues.push(LintIssue {
-            level: Level::Error,
-            message: "workflow `name` must not be empty".into(),
-            line: None,
-        });
-    } else if !wf
-        .name
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
-    {
-        report.issues.push(LintIssue {
-            level: Level::Error,
-            message: format!(
-                "workflow name {:?} contains invalid characters (alnum/_/-/.)",
-                wf.name
-            ),
-            line: None,
-        });
-    }
+    check_name(&mut report, &wf.name, "workflow");
 
     // Trigger type is validated by serde (unknown `type` fails parse); the
     // remaining trigger-specific checks. `None` trigger = invoke-only
@@ -153,8 +131,44 @@ pub fn lint_workflow(wf: &Workflow) -> LintReport {
             line: None,
         });
     }
+    check_steps(&mut report, &wf.steps);
+
+    // Graph (ADR-0005 Spec 4b): DAG acyclicity + resolvable needs + no orphans.
+    if let Some(graph) = &wf.graph {
+        check_graph(&mut report, graph);
+    }
+
+    report
+}
+
+/// The shared name contract for both input types (workflow + cron): required
+/// and identifier-safe (alnum/_/-/.).
+fn check_name(report: &mut LintReport, name: &str, kind: &str) {
+    if name.trim().is_empty() {
+        report.issues.push(LintIssue {
+            level: Level::Error,
+            message: format!("{kind} `name` must not be empty"),
+            line: None,
+        });
+    } else if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+    {
+        report.issues.push(LintIssue {
+            level: Level::Error,
+            message: format!(
+                "{kind} name {name:?} contains invalid characters (alnum/_/-/.)"
+            ),
+            line: None,
+        });
+    }
+}
+
+/// The shared step-body checks (duplicate names, guards, actions) for both
+/// input types.
+fn check_steps(report: &mut LintReport, steps: &[Step]) {
     let mut step_names: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    for step in &wf.steps {
+    for step in steps {
         if let Some(name) = &step.name
             && !step_names.insert(name)
         {
@@ -167,17 +181,10 @@ pub fn lint_workflow(wf: &Workflow) -> LintReport {
             });
         }
         if let Some(guard) = &step.guard {
-            check_guard(&mut report, guard, "step guard");
+            check_guard(report, guard, "step guard");
         }
-        check_action(&mut report, &step.action);
+        check_action(report, &step.action);
     }
-
-    // Graph (ADR-0005 Spec 4b): DAG acyclicity + resolvable needs + no orphans.
-    if let Some(graph) = &wf.graph {
-        check_graph(&mut report, graph);
-    }
-
-    report
 }
 
 /// Validate a `graph:` — the DAG contract (ADR-0005 Spec 4b / P5.4):
@@ -189,7 +196,6 @@ pub fn lint_workflow(wf: &Workflow) -> LintReport {
 ///
 /// Fail-stop at lint, never at runtime.
 fn check_graph(report: &mut LintReport, graph: &Graph) {
-    use crate::schema::GraphNode;
     let nodes = &graph.nodes;
     if nodes.is_empty() {
         report.issues.push(LintIssue {
@@ -227,7 +233,6 @@ fn check_graph(report: &mut LintReport, graph: &Graph) {
     let mut in_stack: std::collections::HashSet<&str> = std::collections::HashSet::new();
     fn dfs<'a>(
         node: &'a str,
-        nodes: &'a BTreeMap<String, GraphNode>,
         edges: &[(&'a str, &'a str)],
         visited: &mut std::collections::HashSet<&'a str>,
         in_stack: &mut std::collections::HashSet<&'a str>,
@@ -245,14 +250,14 @@ fn check_graph(report: &mut LintReport, graph: &Graph) {
                     line: None,
                 });
             } else if !visited.contains(*from) {
-                dfs(from, nodes, edges, visited, in_stack, report);
+                dfs(from, edges, visited, in_stack, report);
             }
         }
         in_stack.remove(node);
     }
     for name in nodes.keys() {
         if !visited.contains(name.as_str()) {
-            dfs(name, nodes, &edges, &mut visited, &mut in_stack, report);
+            dfs(name, &edges, &mut visited, &mut in_stack, report);
         }
     }
 
@@ -277,7 +282,7 @@ fn check_graph(report: &mut LintReport, graph: &Graph) {
         reachable.insert(node);
         for (_from, to) in edges.iter().filter(|(from, _)| *from == node) {
             if !reachable.contains(to) {
-                reach(*to, edges, reachable);
+                reach(to, edges, reachable);
             }
         }
     }
@@ -525,8 +530,142 @@ fn check_action(report: &mut LintReport, action: &Action) {
 
 /// The complete lint entrypoint: parse YAML then lint.
 pub fn lint_yaml(yaml: &str) -> Result<LintReport, String> {
+    // ADR-0012: cron is a DISTINCT type. A cron-YAML carries top-level
+    // `schedule`/`owner`; it is NOT a workflow — reject it here so the two
+    // types stay distinct at lint (the cron lint path is its validator).
+    if is_cron_yaml(yaml) {
+        return Ok(LintReport {
+            issues: vec![LintIssue {
+                level: Level::Error,
+                message: "this is a cron YAML (top-level `schedule`/`owner`) — cron is a distinct type (ADR-0012); lint it with the cron lint path, not workflow lint"
+                    .into(),
+                line: None,
+            }],
+        });
+    }
     let wf = crate::schema::parse_workflow(yaml).map_err(|e| format!("yaml parse error: {e}"))?;
     Ok(lint_workflow(&wf))
+}
+
+/// True when the YAML document has top-level `schedule` or `owner` keys —
+/// the cron-type markers (ADR-0012). Malformed YAML → false (the parse
+/// error path reports it properly).
+fn is_cron_yaml(yaml: &str) -> bool {
+    let Ok(v) = serde_yaml::from_str::<serde_yaml::Value>(yaml) else {
+        return false;
+    };
+    match v {
+        serde_yaml::Value::Mapping(m) => {
+            m.contains_key(serde_yaml::Value::String("schedule".into()))
+                || m.contains_key(serde_yaml::Value::String("owner".into()))
+        }
+        _ => false,
+    }
+}
+
+/// Lint a parsed cron (ADR-0012: cron is a distinct type — schedule + owner +
+/// scope + mode + policy + steps body). Errors block, warnings advise.
+pub fn lint_cron(spec: &CronSpec) -> LintReport {
+    let mut report = LintReport::default();
+
+    check_name(&mut report, &spec.name, "cron");
+    check_cron_schedule(&mut report, &spec.schedule);
+
+    // Owner profile (the fixer's identity). Profile RESOLUTION against the
+    // flywheel-tier catalog is deferred to the CLI (bd-25g7.1 scope); lint
+    // checks the field is present + identifier-safe.
+    if spec.owner.trim().is_empty() {
+        report.issues.push(LintIssue {
+            level: Level::Error,
+            message: "cron `owner` (owning profile) must not be empty".into(),
+            line: None,
+        });
+    } else if !spec
+        .owner
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+    {
+        report.issues.push(LintIssue {
+            level: Level::Error,
+            message: format!(
+                "cron owner {:?} contains invalid characters (alnum/_/-/.)",
+                spec.owner
+            ),
+            line: None,
+        });
+    }
+
+    if let Some(policy) = &spec.policy {
+        check_cron_policy(&mut report, policy);
+    }
+
+    if spec.steps.is_empty() && spec.graph.is_none() {
+        report.issues.push(LintIssue {
+            level: Level::Warning,
+            message: "cron has no steps and no graph — the tick will fire but nothing runs".into(),
+            line: None,
+        });
+    }
+    check_steps(&mut report, &spec.steps);
+
+    if let Some(graph) = &spec.graph {
+        check_graph(&mut report, graph);
+    }
+
+    report
+}
+
+/// The cron schedule contract (ADR-0012 Spec 3): exactly 5 Vixie fields,
+/// parseable by the cron engine (via the shared vixie normalization).
+fn check_cron_schedule(report: &mut LintReport, schedule: &str) {
+    let fields: Vec<&str> = schedule.split_whitespace().collect();
+    if fields.len() != 5 {
+        report.issues.push(LintIssue {
+            level: Level::Error,
+            message: format!(
+                "schedule {schedule:?} must be a 5-field Vixie cron expression, got {} fields",
+                fields.len()
+            ),
+            line: None,
+        });
+        return;
+    }
+    if crate::cron::normalize_cron(schedule)
+        .parse::<cron::Schedule>()
+        .is_err()
+    {
+        report.issues.push(LintIssue {
+            level: Level::Error,
+            message: format!("schedule {schedule:?} is not a valid cron expression"),
+            line: None,
+        });
+    }
+}
+
+/// Cron policy sanity (ADR-0012): degenerate values are config bugs.
+fn check_cron_policy(report: &mut LintReport, policy: &CronSpecPolicy) {
+    if policy.repeat_threshold == 0 {
+        report.issues.push(LintIssue {
+            level: Level::Error,
+            message: "policy repeat_threshold must be >= 1 (0 escalates on the FIRST failure)"
+                .into(),
+            line: None,
+        });
+    }
+    if policy.no_claim_timeout == 0 {
+        report.issues.push(LintIssue {
+            level: Level::Error,
+            message: "policy no_claim_timeout must be > 0 (0 aborts every spawn-await instantly)"
+                .into(),
+            line: None,
+        });
+    }
+}
+
+/// Parse a cron YAML then lint it (the cron lint entrypoint, ADR-0012).
+pub fn cron_lint_yaml(yaml: &str) -> Result<LintReport, String> {
+    let spec = crate::schema::parse_cron(yaml).map_err(|e| format!("yaml parse error: {e}"))?;
+    Ok(lint_cron(&spec))
 }
 
 /// Render the lint report as human lines (for `toron workflow lint`).
@@ -825,5 +964,164 @@ steps:
         assert_eq!(substitute_templates("{{steps.a.out}} > 0"), "0 > 0");
         // Valid evalexpr after substitution.
         assert!(evalexpr::build_operator_tree::<evalexpr::DefaultNumericTypes>("0 == 'x'").is_ok());
+    }
+
+    // ---- ADR-0012: cron lint is DISTINCT from workflow lint (bd-25g7.1) ----
+
+    const ADR_CRON_YAML: &str = r##"
+name: weekly-upgrade
+schedule: "30 3 * * 0"
+owner: housekeeper
+scope: host
+mode: headless
+policy:
+  on_failure: bead
+  on_repeat_failure: escalate
+  repeat_threshold: 3
+  on_success: log
+  max_retries: 1
+  no_claim_timeout: 600
+  catchup: latest
+steps:
+  - { name: probe,  action: call_workflow, workflow: health-check }
+  - { name: upgrade, action: call_workflow, workflow: docker-upgrade, if: "{{steps.probe.healthy}}" }
+  - { name: verify, action: call_workflow, workflow: health-check }
+"##;
+
+    /// Gate: the ADR-0012 example lints CLEAN via the cron lint path.
+    #[test]
+    fn cron_lint_adr_example_clean() {
+        let report = cron_lint_yaml(ADR_CRON_YAML).expect("cron parses");
+        assert!(
+            report.is_clean(),
+            "ADR example must lint clean: {:?}",
+            report.issues
+        );
+    }
+
+    /// Gate: a workflow lint REJECTS a cron-YAML (the two types are distinct
+    /// at lint, ADR-0012).
+    #[test]
+    fn workflow_lint_rejects_cron_yaml() {
+        let report = lint_yaml(ADR_CRON_YAML).expect("cron yaml parses as yaml");
+        assert!(!report.is_clean(), "workflow lint must reject cron yaml");
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|i| i.message.to_lowercase().contains("cron")),
+            "names cron as the reason: {:?}",
+            report.issues
+        );
+    }
+
+    #[test]
+    fn cron_lint_bad_schedule_rejected() {
+        // 4 fields — not 5-field vixie.
+        let yaml = "name: c\nschedule: '30 3 * *'\nowner: o\nsteps: []\n";
+        let report = cron_lint_yaml(yaml).expect("parses");
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|i| i.level == Level::Error && i.message.contains("5-field")),
+            "field-count error: {:?}",
+            report.issues
+        );
+
+        // Minute 99 — invalid cron expression.
+        let yaml = "name: c\nschedule: '99 3 * * 0'\nowner: o\nsteps: []\n";
+        let report = cron_lint_yaml(yaml).expect("parses");
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|i| i.level == Level::Error && i.message.contains("cron expression")),
+            "cron-expr error: {:?}",
+            report.issues
+        );
+    }
+
+    #[test]
+    fn cron_lint_owner_required() {
+        let yaml = "name: c\nschedule: '* * * * *'\nowner: ''\nsteps: []\n";
+        let report = cron_lint_yaml(yaml).expect("parses");
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|i| i.level == Level::Error && i.message.contains("owner")),
+            "empty owner flagged: {:?}",
+            report.issues
+        );
+    }
+
+    #[test]
+    fn cron_lint_bad_policy_rejected() {
+        // repeat_threshold 0 — degenerate (escalates on the FIRST failure).
+        let yaml = "name: c\nschedule: '* * * * *'\nowner: o\npolicy:\n  repeat_threshold: 0\nsteps: []\n";
+        let report = cron_lint_yaml(yaml).expect("parses");
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|i| i.level == Level::Error && i.message.contains("repeat_threshold")),
+            "threshold-0 flagged: {:?}",
+            report.issues
+        );
+
+        // no_claim_timeout 0 — abort immediately, never wait.
+        let yaml = "name: c\nschedule: '* * * * *'\nowner: o\npolicy:\n  no_claim_timeout: 0\nsteps: []\n";
+        let report = cron_lint_yaml(yaml).expect("parses");
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|i| i.level == Level::Error && i.message.contains("no_claim_timeout")),
+            "timeout-0 flagged: {:?}",
+            report.issues
+        );
+    }
+
+    #[test]
+    fn cron_lint_duplicate_steps_rejected() {
+        let yaml = "name: c\nschedule: '* * * * *'\nowner: o\nsteps:\n  - { name: a, action: delay, secs: 1 }\n  - { name: a, action: delay, secs: 2 }\n";
+        let report = cron_lint_yaml(yaml).expect("parses");
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|i| i.level == Level::Error && i.message.contains("duplicate step name")),
+            "duplicate step flagged: {:?}",
+            report.issues
+        );
+    }
+
+    #[test]
+    fn cron_lint_cyclic_graph_rejected() {
+        let yaml = r##"
+name: c
+schedule: "* * * * *"
+owner: o
+graph:
+  nodes:
+    a: { action: delay, secs: 1, needs: [b] }
+    b: { action: delay, secs: 1, needs: [a] }
+"##;
+        let report = cron_lint_yaml(yaml).expect("parses");
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|i| i.level == Level::Error && i.message.contains("cycle")),
+            "cycle flagged: {:?}",
+            report.issues
+        );
+    }
+
+    #[test]
+    fn cron_lint_yaml_parse_error_actionable() {
+        let err = cron_lint_yaml("name: [broken").expect_err("invalid yaml fails");
+        assert!(err.contains("yaml parse error"), "actionable: {err}");
     }
 }
