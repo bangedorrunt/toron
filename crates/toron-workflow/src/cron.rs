@@ -252,8 +252,10 @@ async fn run_cron_tick(ctx: &resonate_sdk::prelude::Context, input: CronTickInpu
 /// The tick body for a spec-driven loop: a [`Workflow`] built from the
 /// CronSpec's steps/graph/policy — the SAME shape the shared engine runs
 /// (one engine, two input types; `call_workflow` composes workflows).
-/// No trigger: the loop synthesizes the schedule trigger per tick.
-fn spec_tick_workflow(spec: &CronSpec) -> Workflow {
+/// No trigger: the loop synthesizes the schedule trigger per tick. Public so
+/// the embedding (flywheel `cron run`/lint — P12.3) drives the same tick body
+/// the loop fires.
+pub fn spec_tick_workflow(spec: &CronSpec) -> Workflow {
     Workflow {
         name: spec.name.clone(),
         description: spec.description.clone(),
