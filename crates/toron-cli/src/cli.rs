@@ -551,9 +551,13 @@ pub struct ReserveReleaseArgs {
 
 #[derive(Debug, Args)]
 pub struct ReserveForceReleaseArgs {
-    /// Reservation id (the lease event id).
+    /// Path (or glob) of the stale reservation to revoke. The daemon resolves
+    /// the active lease on this path itself (bd-cumj).
     #[arg(long, required = true)]
-    pub id: String,
+    pub path: String,
+    /// Holder agent name to disambiguate (optional).
+    #[arg(long)]
+    pub holder: Option<String>,
     /// Project slug.
     #[arg(long, default_value = DEFAULT_PROJECT)]
     pub project: String,

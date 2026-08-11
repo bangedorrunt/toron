@@ -128,7 +128,8 @@ impl ToolServer {
             .force_release_file_reservation(
                 &args.project_key,
                 &args.agent_name,
-                &args.file_reservation_id,
+                &args.path,
+                args.holder.as_deref(),
                 args.note.as_deref(),
                 args.notify_previous.unwrap_or(false),
             )
@@ -180,9 +181,13 @@ pub struct ReleaseFileReservationsArgs {
 pub struct ForceReleaseFileReservationArgs {
     pub project_key: String,
     pub agent_name: String,
-    /// Reservation id = the kind-30031 event id (hex string). Matches the
-    /// `id` field `file_reservation_paths` returns in `granted[]`.
-    pub file_reservation_id: String,
+    /// Path (or glob) of the stale reservation to revoke. The daemon resolves
+    /// the active lease on this path itself (bd-cumj) — the caller does NOT
+    /// need the holder's event id.
+    pub path: String,
+    /// Optional holder name to disambiguate when multiple holders match the
+    /// path. Omit to revoke the (single) matching lease.
+    pub holder: Option<String>,
     pub note: Option<String>,
     pub notify_previous: Option<bool>,
 }

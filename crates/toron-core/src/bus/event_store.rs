@@ -145,17 +145,24 @@ impl BusEventStore {
         }
         let rows = q.fetch_all(&self.pool).await?;
 
-        let mut out: Vec<Event> = Vec::with_capacity(rows.len().min(limit));
+        let mut out: Vec<Event> = Vec::with_capacity(rows.len());
         for row in rows {
             let raw: String = Row::get(&row, 0);
             if let Ok(ev) = Event::from_json(&raw)
                 && filter.match_event(&ev, Default::default())
             {
                 out.push(ev);
-                if out.len() >= limit {
-                    break;
-                }
             }
+        }
+        // bd-cumj: the SQL yields ASC (envelope) order; when the matched set
+        // exceeds the limit, keep the NEWEST `limit` (the tail) — dropping the
+        // OLDEST superseded events, NEVER the latest state. The prior
+        // oldest-first break silently dropped the newest events when a
+        // coordinate accumulated >1000 events (a renewal storm), making a
+        // fresh operator revocation invisible to projection resolution and
+        // leaving stale locks reported as live.
+        if out.len() > limit {
+            out.drain(0..out.len() - limit);
         }
         Ok(out)
     }
@@ -281,6 +288,44 @@ mod tests {
         }
         let filter = crate::bus::project_filter("demo").limit(2);
         assert_eq!(store.replay(&filter).await.expect("replay").len(), 2);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// bd-cumj regression: when the matched set exceeds the limit, replay
+    /// must keep the NEWEST events (the tail in ASC order), never the oldest.
+    /// A renewal storm of >limit events on one coordinate previously made the
+    /// newest revocation/state invisible to projection resolution.
+    #[tokio::test]
+    async fn test_replay_keeps_newest_when_over_limit() {
+        let (store, _pool, path) = temp_store().await;
+        let keys = Keys::generate();
+        // Distinct ascending created_at so the newest are well-defined.
+        for i in 0..5u64 {
+            let ev = build_event(
+                &keys,
+                crate::nostr::kinds::toron_kind(PROJECT_MANIFEST),
+                &format!("msg {i}"),
+                vec![Tag::parse(["t", "demo"]).expect("t")],
+                Timestamp::from(1_700_000_000_u64 + i),
+            )
+            .expect("build");
+            store.insert(&ev).await.expect("insert");
+        }
+        let replayed = store
+            .replay(&crate::bus::project_filter("demo").limit(2))
+            .await
+            .expect("replay");
+        assert_eq!(replayed.len(), 2, "limit respected");
+        // The two newest (i=3, i=4) are kept; the oldest three are dropped.
+        let contents: Vec<String> = replayed
+            .iter()
+            .map(|e| e.content.clone())
+            .collect();
+        assert_eq!(
+            contents,
+            vec!["msg 3".to_string(), "msg 4".to_string()],
+            "replay keeps the NEWEST events (ASC tail), not the oldest: {contents:?}"
+        );
         let _ = std::fs::remove_file(&path);
     }
 
