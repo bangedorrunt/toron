@@ -1243,7 +1243,19 @@ mod tests {
             )
             .await
             .expect("renew");
-        assert_eq!(renewed.renewed, 1);
+        // bd-evqs renewal cap: a fresh lease (remaining TTL ≈ 3600s) is NOT
+        // republished for a 60s extension — renewing it adds nothing and
+        // churns the bus (the 1218-event storm). The cap keeps `renewed` at 0
+        // for healthy leases; near-expiry leases DO renew (below).
+        assert_eq!(renewed.renewed, 0, "fresh lease skipped by the renewal cap");
+        let still_active = surface
+            .check_conflicts("demo", "BlueLake", &["src/lib.rs".to_string()])
+            .await
+            .expect("conflicts after capped renew");
+        assert!(
+            !still_active.conflict_free,
+            "skipped renewal leaves the lease active (not released)"
+        );
 
         // Release all.
         let released = surface
@@ -1256,6 +1268,49 @@ mod tests {
             .await
             .expect("conflicts after release");
         assert!(report.conflict_free, "released leases no longer conflict");
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// bd-evqs: the renewal cap renews a lease ONLY when it is near expiry
+    /// (remaining TTL < the extension) — the durable-loop heartbeat then
+    /// re-publishes at most ~1 event per extend window per lease instead of
+    /// every tick.
+    #[tokio::test]
+    async fn renew_near_expiry_lease_is_extended() {
+        let (surface, db_path, data_dir) = test_surface("resv-near").await;
+        register_agent(&surface, "demo", "GreenCastle").await;
+        let ok = surface
+            .reserve(
+                "demo",
+                "GreenCastle",
+                &["src/**".to_string()],
+                Some(60), // near expiry relative to the 300s extension
+                true,
+                Some("near-expiry"),
+            )
+            .await
+            .expect("reserve");
+        assert_eq!(ok.granted.len(), 1);
+
+        let renewed = surface
+            .renew_reservations("demo", "GreenCastle", &[], 300)
+            .await
+            .expect("renew");
+        assert_eq!(renewed.renewed, 1, "near-expiry lease IS renewed");
+        // The extension ratchets from the OLD absolute expiry + extend.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let new_exp = renewed.reservations[0]
+            .expires_ts_us
+            .map(|t| t / 1_000_000)
+            .unwrap_or(0);
+        assert!(
+            new_exp > now + 250,
+            "expiry extended past now+250s (got {new_exp} vs now {now})"
+        );
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_dir_all(&data_dir);
     }
