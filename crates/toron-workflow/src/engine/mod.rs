@@ -69,10 +69,10 @@ pub fn resonate_server_url() -> Option<String> {
 
 /// Pure resolution core (testable with a fake probe).
 pub fn resonate_server_url_with(probe: impl Fn(&str) -> bool) -> Option<String> {
-    if let Ok(pin) = std::env::var(RESONATE_URL_ENV)
-        && !pin.trim().is_empty()
-    {
-        return Some(pin);
+    if let Ok(pin) = std::env::var(RESONATE_URL_ENV) {
+        if !pin.trim().is_empty() {
+            return Some(pin);
+        }
     }
     if probe(REMOTE_RESONATE_URL) {
         return Some(REMOTE_RESONATE_URL.to_string());
@@ -309,45 +309,6 @@ impl WorkflowEngine {
             .with_dependency(action_runner)
             .with_dependency(profile_resolver)
             .with_dependency(Self::default_workflow_resolver())
-            .with_dependency(sink.clone())
-            .with_dependency(spawn_sink.clone())
-            .with_dependency(policy_sink.clone());
-        resonate
-            .register(run_workflow)
-            .map_err(|e| anyhow::anyhow!("register workflow function: {e}"))?;
-        resonate
-            .register(run_graph_node)
-            .map_err(|e| anyhow::anyhow!("register graph node function: {e}"))?;
-        resonate
-            .register(run_parallel_copy)
-            .map_err(|e| anyhow::anyhow!("register parallel copy function: {e}"))?;
-        Ok(Self {
-            resonate: Arc::new(resonate),
-            approval_sink: sink,
-            spawn_sink,
-            policy_sink,
-        })
-    }
-
-    /// Like [`Self::remote_with`] with an explicit [`WorkflowResolver`] for
-    /// `call_workflow` (ADR-0007 R4.1; mirrors `local_with_resolvers`).
-    pub fn remote_with_resolvers(
-        url: impl Into<String>,
-        action_runner: ActionRunner,
-        profile_resolver: ProfileResolver,
-        workflow_resolver: WorkflowResolver,
-    ) -> anyhow::Result<Self> {
-        let sink = ApprovalSink::default();
-        let spawn_sink = SpawnSink::default();
-        let policy_sink = crate::cron_failure::PolicySink::new();
-        let config = ResonateConfig {
-            url: Some(url.into()),
-            ..Default::default()
-        };
-        let resonate = Resonate::new(config)
-            .with_dependency(action_runner)
-            .with_dependency(profile_resolver)
-            .with_dependency(workflow_resolver)
             .with_dependency(sink.clone())
             .with_dependency(spawn_sink.clone())
             .with_dependency(policy_sink.clone());

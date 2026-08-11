@@ -338,9 +338,8 @@ Version bumps derive from commit types: `feat` → minor, `fix`/`perf` → patch
 | [0005](docs/decisions/0005-orchestration-layer.md) | Orchestration Tier — Profiles, Workflows, Stages, Smart Cron, Engine | **Accepted** |
 | [0010](docs/decisions/0010-execution-wiring-model-registry-headless.md) | Execution Wiring, Model Registry, Role Conditioning, Headless Mode | **Proposed** |
 | [0011](docs/decisions/0011-coalition-orchestration.md) | Coalition Orchestration — Steer + Collab Layers, Intent-Based Coordination | **Proposed** |
-| [0012](docs/decisions/0012-standalone-cron-type.md) | Standalone Cron Type — Scheduled Primitive, Distinct from Workflow | **Proposed** |
 
-> Full index (0001–0012, parity catalogs, ADR-0005 phase status): **[docs/decisions/README.md](docs/decisions/README.md)**.
+> Full index (0001–0011, parity catalogs, ADR-0005 phase status): **[docs/decisions/README.md](docs/decisions/README.md)**.
 > Orchestration vocabulary (profiles/crews/workflows/cron) lives in [`flywheel`](../flywheel); see [`flywheel/docs/workflow-authoring.md`](../flywheel/docs/workflow-authoring.md).
 
 ## References
