@@ -442,6 +442,101 @@ pub fn parse_workflows(yaml: &str) -> Result<Vec<Workflow>, serde_yaml::Error> {
         .collect()
 }
 
+// ---------------------------------------------------------------------------
+// ADR-0012: cron is a DISTINCT type (not a workflow). CronSpec carries a
+// schedule + owner + scope + mode + policy + steps body; the steps use the
+// SAME Step/Action DSL as Workflow (one engine, two input types).
+// ---------------------------------------------------------------------------
+
+/// The cron run mode (ADR-0012 Spec 3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CronMode {
+    /// Headless (default; no churn).
+    #[default]
+    Headless,
+    /// Pane mode (visible workspace churn).
+    Pane,
+}
+
+/// Missed-tick catch-up policy on wake (ADR-0012 Spec 3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CronCatchup {
+    /// Run the most-recent due tick on wake (never a burst).
+    #[default]
+    Latest,
+    /// Skip missed ticks entirely.
+    Skip,
+}
+
+/// The cron policy block (ADR-0012 Spec 3). Cron-specific — deliberately a
+/// distinct type from the workflow-level [`CronPolicy`]: a cron policy carries
+/// `catchup`, which does not belong on a plain workflow (a workflow is
+/// invoke/reactive; only a cron owns a schedule + catch-up).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CronSpecPolicy {
+    /// `on_failure` — the first-failure action.
+    #[serde(default)]
+    pub on_failure: FailureAction,
+    /// `on_repeat_failure` — after `repeat_threshold` consecutive failures.
+    #[serde(default)]
+    pub on_repeat_failure: FailureAction,
+    /// Consecutive failures before `on_repeat_failure` triggers.
+    #[serde(default = "default_repeat_threshold")]
+    pub repeat_threshold: u32,
+    /// `on_success` — the success action.
+    #[serde(default)]
+    pub on_success: FailureAction,
+    /// In-run retries before declaring failure.
+    #[serde(default)]
+    pub max_retries: u32,
+    /// Abort a spawn-await after N seconds unclaimed (default 600s).
+    #[serde(default = "default_no_claim_timeout")]
+    pub no_claim_timeout: u64,
+    /// Missed-tick catch-up policy (`latest` | `skip`).
+    #[serde(default)]
+    pub catchup: CronCatchup,
+}
+
+/// A complete cron definition (ADR-0012 — one YAML document). Distinct from
+/// [`Workflow`]: a cron has `schedule` + `owner` + policy; a workflow has a
+/// trigger. The `steps` body shares the Step/Action DSL with workflows.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CronSpec {
+    /// Cron name (identifier used in logs, runs, ticks).
+    pub name: String,
+    /// Human description (optional).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// 5-field Vixie cron expression (`"30 3 * * 0"`).
+    pub schedule: String,
+    /// The owning profile (the fixer's identity).
+    pub owner: String,
+    /// Signing scope: host = operator identity; project = project-scoped
+    /// agent.
+    #[serde(default)]
+    pub scope: CronScope,
+    /// Run mode: headless (default) or pane.
+    #[serde(default)]
+    pub mode: CronMode,
+    /// Failure/success + catch-up policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<CronSpecPolicy>,
+    /// The body — the SAME step DSL as Workflow (shared engine; composes
+    /// workflows via `call_workflow`).
+    #[serde(default)]
+    pub steps: Vec<Step>,
+    /// Opt-in DAG (same contract as [`Workflow::graph`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graph: Option<Graph>,
+}
+
+/// Parse a cron from YAML text (ADR-0012).
+pub fn parse_cron(yaml: &str) -> Result<CronSpec, serde_yaml::Error> {
+    serde_yaml::from_str(yaml)
+}
+
 /// The 7 ADR Phase-2 trigger types (validated against `Trigger::type_name`).
 pub const TRIGGER_TYPES: [&str; 7] = [
     "message_posted",
@@ -817,5 +912,103 @@ steps:
         assert_eq!(wfs.len(), 2);
         assert_eq!(wfs[0].name, "a");
         assert_eq!(wfs[1].name, "b");
+    }
+
+    // ---- ADR-0012: CronSpec is a DISTINCT type (bd-25g7.1) ----
+
+    /// The ADR-0012 Spec 3 example (weekly-upgrade) parses verbatim —
+    /// schedule + owner + scope + mode + policy (incl. catchup) + steps body.
+    #[test]
+    fn parse_adr_example_cron() {
+        let yaml = r##"
+name: weekly-upgrade
+schedule: "30 3 * * 0"
+owner: housekeeper
+scope: host
+mode: headless
+policy:
+  on_failure: bead
+  on_repeat_failure: escalate
+  repeat_threshold: 3
+  on_success: log
+  max_retries: 1
+  no_claim_timeout: 600
+  catchup: latest
+steps:
+  - { name: probe,  action: call_workflow, workflow: health-check }
+  - { name: upgrade, action: call_workflow, workflow: docker-upgrade, if: "{{steps.probe.healthy}}" }
+  - { name: verify, action: call_workflow, workflow: health-check }
+"##;
+        let spec = parse_cron(yaml).expect("ADR example parses");
+        assert_eq!(spec.name, "weekly-upgrade");
+        assert_eq!(spec.schedule, "30 3 * * 0");
+        assert_eq!(spec.owner, "housekeeper");
+        assert_eq!(spec.scope, CronScope::Host);
+        assert_eq!(spec.mode, CronMode::Headless);
+        let p = spec.policy.as_ref().expect("policy present");
+        assert_eq!(p.on_failure, FailureAction::Bead);
+        assert_eq!(p.on_repeat_failure, FailureAction::Escalate);
+        assert_eq!(p.repeat_threshold, 3);
+        assert_eq!(p.on_success, FailureAction::Log);
+        assert_eq!(p.max_retries, 1);
+        assert_eq!(p.no_claim_timeout, 600);
+        assert_eq!(p.catchup, CronCatchup::Latest);
+        assert_eq!(spec.steps.len(), 3);
+        assert_eq!(spec.steps[0].name.as_deref(), Some("probe"));
+        assert!(matches!(spec.steps[0].action, Action::CallWorkflow { .. }));
+        assert_eq!(spec.steps[1].name.as_deref(), Some("upgrade"));
+    }
+
+    /// Minimal cron YAML: defaults apply (scope host, mode headless, policy
+    /// None).
+    #[test]
+    fn parse_cron_defaults() {
+        let yaml = "name: ping\nschedule: '* * * * *'\nowner: scout\nsteps:\n  - action: send_dm\n    to: pi\n    body: x\n";
+        let spec = parse_cron(yaml).expect("minimal cron parses");
+        assert_eq!(spec.scope, CronScope::Host, "default scope = host");
+        assert_eq!(spec.mode, CronMode::Headless, "default mode = headless");
+        assert!(spec.policy.is_none(), "omitted policy -> None");
+    }
+
+    /// Policy defaults: a partial policy block applies per-field defaults
+    /// (catchup included).
+    #[test]
+    fn parse_cron_policy_defaults() {
+        let yaml = "name: p\nschedule: '* * * * *'\nowner: o\npolicy:\n  catchup: skip\nsteps: []\n";
+        let spec = parse_cron(yaml).expect("partial policy parses");
+        let p = spec.policy.as_ref().expect("policy present");
+        assert_eq!(p.on_failure, FailureAction::Log, "default on_failure");
+        assert_eq!(p.repeat_threshold, 3, "default repeat_threshold");
+        assert_eq!(p.no_claim_timeout, 600, "default no_claim_timeout");
+        assert_eq!(p.catchup, CronCatchup::Skip);
+    }
+
+    /// scope/mode variants parse (project + pane).
+    #[test]
+    fn parse_cron_scope_and_mode_variants() {
+        let yaml = "name: p\nschedule: '* * * * *'\nowner: o\nscope: project\nmode: pane\nsteps: []\n";
+        let spec = parse_cron(yaml).expect("variants parse");
+        assert_eq!(spec.scope, CronScope::Project);
+        assert_eq!(spec.mode, CronMode::Pane);
+    }
+
+    /// A cron is NOT a workflow: top-level `trigger:` is meaningless in a
+    /// cron YAML and must not sneak in via the workflow schema.
+    #[test]
+    fn cron_yaml_has_no_trigger() {
+        let yaml = "name: p\nschedule: '* * * * *'\nowner: o\nsteps: []\n";
+        let spec = parse_cron(yaml).expect("cron parses");
+        assert_eq!(spec.steps.len(), 0);
+        // The cron YAML does not carry a workflow trigger — no trigger field
+        // exists on CronSpec (distinct type, ADR-0012).
+        let _ = spec;
+    }
+
+    #[test]
+    fn invalid_cron_yaml_fails() {
+        assert!(parse_cron("name: [broken").is_err());
+        assert!(parse_cron("").is_err());
+        // Missing required schedule/owner -> parse error (required fields).
+        assert!(parse_cron("name: p\nsteps: []\n").is_err());
     }
 }
