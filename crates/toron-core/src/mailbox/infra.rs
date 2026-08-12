@@ -145,9 +145,14 @@ impl Mailbox {
 
     /// `install_precommit_guard`: install the toron pre-commit hook (libgit2
     /// path). Blocked commits = staged paths under ANOTHER agent's exclusive
-    /// reservation.
-    pub fn install_precommit_guard(&self, repo: &Path) -> anyhow::Result<std::path::PathBuf> {
-        crate::mailbox::guard::install_precommit_guard(repo)
+    /// reservation. The project slug is baked into the hook script so the
+    /// guard evaluates the right project's reservations.
+    pub fn install_precommit_guard(
+        &self,
+        repo: &Path,
+        project: &str,
+    ) -> anyhow::Result<std::path::PathBuf> {
+        crate::mailbox::guard::install_precommit_guard(repo, project)
     }
 
     /// `uninstall_precommit_guard`: remove the toron hook (idempotent; never
@@ -294,7 +299,7 @@ mod tests {
         let _repo = git2::Repository::init(&repo_root).expect("init");
 
         let hook = mailbox
-            .install_precommit_guard(&repo_root)
+            .install_precommit_guard(&repo_root, "demo")
             .expect("install");
         assert!(hook.exists());
 
