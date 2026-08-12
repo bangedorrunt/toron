@@ -625,15 +625,29 @@ async fn cluster_file_reservations() -> anyhow::Result<()> {
         conflicts["total_conflicting_reservations"].as_u64().unwrap_or(0) >= 1,
         "conflict count is non-zero: {conflicts}"
     );
+    // bd-dsu1: the conflict report carries the conflicting lease's event id —
+    // the operator lock board needs it for diagnostics without DB access.
+    let ids = conflicts["conflicts"][0]["reservation_ids"]
+        .as_array()
+        .unwrap_or_else(|| panic!("conflict carries reservation_ids: {conflicts}"));
+    assert_eq!(ids.len(), 1, "one conflicting lease, one id: {conflicts}");
+    assert_eq!(
+        ids[0].as_str().unwrap_or(""),
+        res_id.as_str(),
+        "reservation id matches the granted lease's id: {conflicts}"
+    );
 
     // GaleSummit renews → expiry extends (absolute, not recomputed from now).
+    // bd-evqs cap: a lease whose remaining TTL is ALREADY >= extend_secs is
+    // NOT republished — so the extension must exceed the remaining TTL
+    // (acquire used 3600s; 7200s > remaining) to actually renew.
     let renew = d
         .call(
             "renew_file_reservations",
             serde_json::json!({
                 "project_key": proj,
                 "agent_name": "GaleSummit",
-                "extend_seconds": 1800,
+                "extend_seconds": 7200,
             }),
         )
         .await;
