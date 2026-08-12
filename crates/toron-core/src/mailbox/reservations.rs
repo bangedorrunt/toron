@@ -980,6 +980,28 @@ impl Mailbox {
         Ok(out)
     }
 
+    /// bd-f5tt: active HELD reservations across every slug alias of
+    /// `project_slug` (CLI absolute-path key + MCP short key). A lease is
+    /// tagged with the slug as-written at acquire time; the guard check
+    /// queries all aliases so a reservation acquired under one surface
+    /// blocks a commit checked under the other. Deduplicated by id.
+    pub async fn active_reservations_all_aliases(
+        &self,
+        project_slug: &str,
+    ) -> anyhow::Result<Vec<Reservation>> {
+        let aliases = self.project_slug_aliases(project_slug);
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut out: Vec<Reservation> = Vec::new();
+        for slug in aliases {
+            for r in self.active_reservations(&slug).await? {
+                if seen.insert(r.id.clone()) {
+                    out.push(r);
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// Active (in-TTL, non-expired) intents in a project (ADR-0011 Spec 2):
     /// the intent board. An intent auto-expires `INTENT_TTL_SECS` after
     /// declaration unless converted to held (must-convert).
