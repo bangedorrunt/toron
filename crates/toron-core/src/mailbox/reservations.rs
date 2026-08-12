@@ -236,6 +236,13 @@ pub struct GrantedReservation {
 pub struct PathConflict {
     pub path: String,
     pub holders: Vec<String>,
+    /// The kind-30031 event id of each conflicting lease (bd-dsu1): the
+    /// operator lock board needs the reservation id for diagnostics
+    /// (force-release, request-release, replay) without DB access. Parallel
+    /// to `holders` — index-safe, one id per holder. Omitted from JSON when
+    /// empty (additive, never breaks old consumers).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reservation_ids: Vec<String>,
 }
 
 /// Result of `check_file_reservation_conflicts` (parity shape).
@@ -301,15 +308,26 @@ impl Mailbox {
                 .filter(|h| h.status == ReservationStatus::Held)
                 .map(|h| h.agent_name.clone())
                 .collect();
+            let hard_ids: Vec<String> = hits
+                .iter()
+                .filter(|h| h.status == ReservationStatus::Held)
+                .map(|h| h.reservation_id.clone())
+                .collect();
             let soft: Vec<String> = hits
                 .iter()
                 .filter(|h| h.status == ReservationStatus::Intent)
                 .map(|h| h.agent_name.clone())
                 .collect();
+            let soft_ids: Vec<String> = hits
+                .iter()
+                .filter(|h| h.status == ReservationStatus::Intent)
+                .map(|h| h.reservation_id.clone())
+                .collect();
             if !hard.is_empty() {
                 result.conflicts.push(PathConflict {
                     path: path.clone(),
                     holders: hard,
+                    reservation_ids: hard_ids,
                 });
                 continue;
             }
@@ -319,6 +337,7 @@ impl Mailbox {
                 result.soft_conflicts.push(PathConflict {
                     path: path.clone(),
                     holders: soft,
+                    reservation_ids: soft_ids,
                 });
                 continue;
             }
@@ -451,10 +470,20 @@ impl Mailbox {
                 .filter(|h| h.status == ReservationStatus::Held)
                 .map(|h| h.agent_name.clone())
                 .collect();
+            let hard_ids: Vec<String> = hits
+                .iter()
+                .filter(|h| h.status == ReservationStatus::Held)
+                .map(|h| h.reservation_id.clone())
+                .collect();
             let soft: Vec<String> = hits
                 .iter()
                 .filter(|h| h.status == ReservationStatus::Intent)
                 .map(|h| h.agent_name.clone())
+                .collect();
+            let soft_ids: Vec<String> = hits
+                .iter()
+                .filter(|h| h.status == ReservationStatus::Intent)
+                .map(|h| h.reservation_id.clone())
                 .collect();
             if hard.is_empty() && soft.is_empty() {
                 report.clear_paths.push(path.clone());
@@ -463,12 +492,14 @@ impl Mailbox {
                     report.conflicts.push(PathConflict {
                         path: path.clone(),
                         holders: hard,
+                        reservation_ids: hard_ids,
                     });
                 }
                 if !soft.is_empty() {
                     report.soft_conflicts.push(PathConflict {
                         path: path.clone(),
                         holders: soft,
+                        reservation_ids: soft_ids,
                     });
                 }
             }
@@ -745,6 +776,108 @@ impl Mailbox {
             }
         }
         Ok(())
+    }
+
+    /// `release_by_reason` (bd-h3oj): operator-signed revocation of every
+    /// live lease whose `reason` tag equals the bead id. Flywheel's
+    /// after-close hook calls this the moment a watched bead closes, so its
+    /// file reservations never linger to TTL.
+    ///
+    /// Unlike `force_release_file_reservation` there is NO staleness
+    /// heuristic: the bead closing IS the evidence the guarded work is done,
+    /// and the holder may still be active on another bead. The revocations
+    /// reuse the force-release mechanics (kind-30031 `status:revoked` at the
+    /// same `(kind, d)` coordinate + `e`/`a` refs, operator priority wins,
+    /// NIP-09 never the mechanism). `released == 0` is a clean no-op, never
+    /// an error — the loop hook is idempotent.
+    pub async fn release_by_reason(
+        &self,
+        project_slug: &str,
+        requestor_name: &str,
+        bead_id: &str,
+        notify_previous: bool,
+    ) -> anyhow::Result<ReleaseResult> {
+        let operator = self
+            .operator
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("no operator key configured"))?;
+        let leases: Vec<Reservation> = self
+            .active_reservations(project_slug)
+            .await?
+            .into_iter()
+            .filter(|r| r.reason == bead_id)
+            .collect();
+
+        let mut released = 0usize;
+        for lease in leases {
+            let d = format!("{project_slug}:{}", lease.path_pattern);
+            let target = EventId::from_hex(&lease.id).unwrap_or_else(|_| {
+                EventId::from_hex("b32828720d7e8a80dd5165a6cd31b2c70e8d25b83c387209cb138e77d7e7e05b")
+                    .expect("id")
+            });
+            let tags = with_project_scoping(
+                toron_kind(FILE_RESERVATION),
+                vec![
+                    Tag::parse(["d", &d]).expect("d"),
+                    Tag::parse(["status", "revoked"]).expect("status"),
+                    Tag::event(target),
+                    Tag::parse([
+                        "a",
+                        &format!("30031:{}:{d}", operator.public_key().to_hex()),
+                    ])
+                    .expect("a"),
+                    Tag::parse(["note", &format!("bead-closed:{bead_id}")]).expect("note"),
+                ],
+                Some(project_slug),
+            );
+            let revoke = build_event(
+                operator,
+                toron_kind(FILE_RESERVATION),
+                r#"{"status":"revoked","heuristic":"bead-closed"}"#,
+                tags,
+                Timestamp::now(),
+            )?;
+            assert!(is_revocation(&revoke), "revocation must be detectable");
+            self.bus.publish(revoke.clone()).await?;
+            self.record_transition(project_slug, &d, "revoked", &revoke.id)
+                .await;
+            released += 1;
+
+            // Notify the previous holder via NIP-17 (the lease was revoked
+            // by bead close, not by them).
+            if notify_previous {
+                let holder_keys = Keys::generate(); // sender key for the wrap
+                let holder_npub = PublicKey::from_hex(&lease.agent_pubkey)
+                    .map_err(|_| anyhow::anyhow!("bad holder npub"))?;
+                let rumor = crate::nostr::gift_wrap::build_rumor(
+                    holder_keys.public_key(),
+                    Timestamp::now(),
+                    nostr_sdk::nostr::Kind::PrivateDirectMessage,
+                    vec![
+                        Tag::parse(["toron-kind", "reservation-revoked"]).expect("kind"),
+                        Tag::parse(["p", &lease.agent_pubkey]).expect("p"),
+                        Tag::parse(["reason", bead_id]).expect("reason"),
+                        Tag::parse(["reservation-id", &lease.id]).expect("res"),
+                    ],
+                    format!(
+                        "reservation {} ({} by {}) released because bead {} closed",
+                        lease.path_pattern, lease.agent_name, requestor_name, bead_id
+                    ),
+                );
+                let wrap = crate::nostr::gift_wrap::gift_wrap(&holder_keys, &holder_npub, rumor)
+                    .await
+                    .expect("wrap notify");
+                // F2.SILENT-DROP: a failed release notification DM must be
+                // loud — the released holder is entitled to know.
+                if let Err(e) = self.publish_dm(&wrap).await {
+                    tracing::warn!(
+                        d,
+                        "release-by-reason notification DM to {holder_npub} failed: {e}"
+                    );
+                }
+            }
+        }
+        Ok(ReleaseResult { released })
     }
 
     /// Active (non-revoked, non-released, non-expired) kind-30031 events in a
@@ -1986,6 +2119,11 @@ mod tests {
         assert_eq!(acq.soft_conflicts.len(), 1, "soft conflict reported");
         assert_eq!(acq.soft_conflicts[0].path, "src/lib.rs");
         assert!(acq.soft_conflicts[0].holders.iter().any(|h| h == "BlueLake"));
+        assert_eq!(
+            acq.soft_conflicts[0].reservation_ids.len(),
+            1,
+            "soft conflict carries the intent's reservation id"
+        );
 
         // No lease was published for RoseDune (freeze, not grant).
         let held = mailbox.active_reservations("demo").await.expect("held");
@@ -2004,7 +2142,7 @@ mod tests {
         register(&mailbox, "demo", "BlueLake").await;
         register(&mailbox, "demo", "RoseDune").await;
 
-        mailbox
+        let held = mailbox
             .file_reservation_paths(
                 "demo",
                 "BlueLake",
@@ -2015,6 +2153,7 @@ mod tests {
             )
             .await
             .expect("hold");
+        let held_id = held.granted[0].id.clone();
 
         let acq = mailbox
             .file_reservation_paths(
@@ -2030,6 +2169,66 @@ mod tests {
         assert!(acq.granted.is_empty());
         assert_eq!(acq.conflicts.len(), 1, "held lease hard-blocks");
         assert!(acq.soft_conflicts.is_empty(), "no soft tier involved");
+        assert!(
+            acq.conflicts[0].reservation_ids.iter().any(|i| i == &held_id),
+            "hard conflict carries the held lease's reservation id: {:?}",
+            acq.conflicts[0].reservation_ids
+        );
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// bd-dsu1: `check_file_reservation_conflicts` must surface the
+    /// reservation ids behind every conflict — the operator lock board needs
+    /// the event id for diagnostics (force-release, request-release, replay).
+    #[tokio::test]
+    async fn test_conflict_report_carries_reservation_ids() {
+        let (mailbox, db_path, data_dir) = test_mailbox("conflict-ids").await;
+        register(&mailbox, "demo", "BlueLake").await;
+        register(&mailbox, "demo", "RoseDune").await;
+
+        let held = mailbox
+            .file_reservation_paths(
+                "demo",
+                "BlueLake",
+                &["src/**".into()],
+                Some(3600),
+                true,
+                None,
+            )
+            .await
+            .expect("hold");
+        assert_eq!(held.granted.len(), 1);
+        let held_id = held.granted[0].id.clone();
+
+        // Hard tier: RoseDune checks a path BlueLake holds.
+        let report = mailbox
+            .check_file_reservation_conflicts("demo", "RoseDune", &["src/lib.rs".into()])
+            .await
+            .expect("report");
+        assert_eq!(report.conflicts.len(), 1, "hard conflict reported");
+        assert_eq!(report.conflicts[0].path, "src/lib.rs");
+        assert!(report.conflicts[0].holders.iter().any(|h| h == "BlueLake"));
+        assert!(
+            report.conflicts[0].reservation_ids.iter().any(|i| i == &held_id),
+            "hard conflict carries the lease's id: {:?}",
+            report.conflicts[0].reservation_ids
+        );
+        assert!(report.soft_conflicts.is_empty(), "no soft tier involved");
+
+        // Soft tier: BlueLake checks a path RoseDune holds an intent on.
+        mailbox
+            .declare_intent("demo", "RoseDune", &["docs/**".into()], None, None)
+            .await
+            .expect("intent");
+        let report2 = mailbox
+            .check_file_reservation_conflicts("demo", "BlueLake", &["docs/guide.md".into()])
+            .await
+            .expect("report2");
+        assert_eq!(report2.soft_conflicts.len(), 1, "soft conflict reported");
+        assert_eq!(report2.soft_conflicts[0].reservation_ids.len(), 1, "soft conflict carries the intent id");
+        assert!(report2.soft_conflicts[0].holders.iter().any(|h| h == "RoseDune"));
 
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_dir_all(&data_dir);
@@ -2668,6 +2867,136 @@ mod tests {
         // Active view excludes the lease.
         let active = mailbox.active_reservations("demo").await.expect("active");
         assert!(active.is_empty(), "revoked lease not active");
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// bd-h3oj: release_by_reason revokes ONLY the leases whose reason
+    /// equals the bead id — other reasons stay live, and the released path
+    /// is immediately conflict-free (no TTL wait).
+    #[tokio::test]
+    async fn test_release_by_reason_revokes_only_matching_reason() {
+        let (mailbox, db_path, data_dir) = test_mailbox("h3oj-reason").await;
+        register(&mailbox, "demo", "BlueLake").await;
+
+        mailbox
+            .file_reservation_paths(
+                "demo",
+                "BlueLake",
+                &["src/x.rs".into()],
+                Some(3600),
+                true,
+                Some("bd-XX"),
+            )
+            .await
+            .expect("acquire x");
+        mailbox
+            .file_reservation_paths(
+                "demo",
+                "BlueLake",
+                &["src/y.rs".into()],
+                Some(3600),
+                true,
+                Some("bd-YY"),
+            )
+            .await
+            .expect("acquire y");
+
+        let r = mailbox
+            .release_by_reason("demo", "operator", "bd-XX", false)
+            .await
+            .expect("release by reason");
+        assert_eq!(r.released, 1, "exactly the bd-XX lease released");
+
+        let active = mailbox.active_reservations("demo").await.expect("active");
+        assert_eq!(active.len(), 1, "only the bd-YY lease stays");
+        assert_eq!(active[0].path_pattern, "src/y.rs");
+
+        // The released path is conflict-free immediately (no TTL wait).
+        let rep = mailbox
+            .check_file_reservation_conflicts("demo", "BlueLake", &["src/x.rs".into()])
+            .await
+            .expect("conflict check");
+        assert!(rep.conflict_free, "src/x.rs released without waiting TTL");
+        assert!(rep.conflicts.is_empty(), "{:?}", rep.conflicts);
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// bd-h3oj: a bead id with no matching leases is a clean no-op
+    /// (released = 0, never an error — the loop hook is idempotent).
+    #[tokio::test]
+    async fn test_release_by_reason_no_match_is_noop() {
+        let (mailbox, db_path, data_dir) = test_mailbox("h3oj-nomatch").await;
+        register(&mailbox, "demo", "BlueLake").await;
+        mailbox
+            .file_reservation_paths(
+                "demo",
+                "BlueLake",
+                &["src/x.rs".into()],
+                Some(3600),
+                true,
+                Some("bd-XX"),
+            )
+            .await
+            .expect("acquire");
+
+        let r = mailbox
+            .release_by_reason("demo", "operator", "bd-ZZ", false)
+            .await
+            .expect("no-match is not an error");
+        assert_eq!(r.released, 0);
+        assert_eq!(
+            mailbox.active_reservations("demo").await.expect("active").len(),
+            1,
+            "bd-XX lease untouched"
+        );
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// bd-h3oj: the operator signs the revocation — no operator key, no
+    /// release (mirrors force_release's gate).
+    #[tokio::test]
+    async fn test_release_by_reason_gated_on_operator() {
+        let db_path = std::env::temp_dir()
+            .join(format!("toron-res-h3oj-op-{}.sqlite", uuid::Uuid::new_v4()));
+        let pool = schema::connect(db_path.to_str().unwrap())
+            .await
+            .expect("connect");
+        schema::migrate(&pool).await.expect("migrate");
+        let bus = InProcessBus::open(pool.clone(), InProcessBusConfig::default())
+            .await
+            .expect("bus");
+        let data_dir = std::env::temp_dir()
+            .join(format!("toron-res-data-h3oj-op-{}", uuid::Uuid::new_v4()));
+        let mailbox = Mailbox::new(Arc::new(bus), data_dir.clone(), None)
+            .with_agent_passphrase(PASSPHRASE)
+            .with_index_pool(pool);
+        register(&mailbox, "demo", "BlueLake").await;
+        mailbox
+            .file_reservation_paths(
+                "demo",
+                "BlueLake",
+                &["src/x.rs".into()],
+                Some(3600),
+                true,
+                Some("bd-XX"),
+            )
+            .await
+            .expect("acquire");
+
+        let err = mailbox
+            .release_by_reason("demo", "operator", "bd-XX", false)
+            .await
+            .expect_err("operator required");
+        assert!(
+            err.to_string().contains("no operator key"),
+            "release_by_reason gated on operator: {err}"
+        );
 
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_dir_all(&data_dir);

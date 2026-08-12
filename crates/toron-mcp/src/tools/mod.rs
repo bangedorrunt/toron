@@ -245,7 +245,13 @@ impl ToJson for GrantedReservation {
 
 impl ToJson for PathConflict {
     fn to_json(&self) -> Value {
-        json!({ "path": self.path, "holders": self.holders })
+        json!({
+            "path": self.path,
+            "holders": self.holders,
+            // bd-dsu1: the reservation ids ride through every conflict
+            // surface (acquire + report) for operator diagnostics.
+            "reservation_ids": self.reservation_ids,
+        })
     }
 }
 
@@ -563,12 +569,15 @@ mod tests {
     }
 
     /// Every tool must declare an outputSchema (ADR-0003 rev7 SEP-2106).
-    /// This is the acceptance gate for bd-jgd: 38/38 tools carry a
-    /// schemars-derived `output_schema` on their tool definition.
+    /// This is the acceptance gate for bd-jgd: 38/38 parity tools carry a
+    /// schemars-derived `output_schema` on their tool definition. The count
+    /// is 39 since bd-h3oj: 38 AM-Rust parity tools + the additive
+    /// `release_file_reservations_by_reason` (release-on-bead-close) — the
+    /// parity names/args/returns stay byte-identical (ADR-0007 C3).
     #[test]
     fn all_tools_declare_output_schema() {
         let tools = ToolServer::tool_router().list_all();
-        assert!(!tools.is_empty(), "router must enumerate the 38 tools");
+        assert!(!tools.is_empty(), "router must enumerate the tools");
         let missing: Vec<String> = tools
             .iter()
             .filter(|t| t.output_schema.is_none())
@@ -580,7 +589,11 @@ mod tests {
             missing.len(),
             missing.join(", ")
         );
-        assert_eq!(tools.len(), 38, "tool count must stay at the AM-Rust parity 38");
+        assert_eq!(
+            tools.len(),
+            39,
+            "38 AM-Rust parity tools + release_file_reservations_by_reason (bd-h3oj)"
+        );
     }
 
     /// S4 / bd-p2-id-type-end-to-end-v9dy: the toron MCP surface must be

@@ -83,6 +83,17 @@ async fn sc4_reservation_conflict_and_guard() {
     assert!(!report.conflict_free, "OCBeta blocked by PiAlpha's src/**");
     assert_eq!(report.conflicts.len(), 1);
     assert!(!report.conflicts[0].holders.is_empty());
+    // bd-dsu1: the report carries the conflicting lease's event id.
+    assert_eq!(
+        report.conflicts[0].reservation_ids.len(),
+        acquire.granted.len(),
+        "conflict ids parallel the holder list"
+    );
+    assert_eq!(
+        report.conflicts[0].reservation_ids[0],
+        acquire.granted[0].id,
+        "conflict id equals PiAlpha's lease event id"
+    );
 
     // --- Guard: OCBeta's staged src/lib.rs blocked; PiAlpha's own not ---
     let other = Reservation {

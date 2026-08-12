@@ -153,6 +153,10 @@ pub struct ContactLinkOut {
 pub struct PathConflictOut {
     pub path: String,
     pub holders: Vec<String>,
+    /// Kind-30031 event id of each conflicting lease (bd-dsu1) — parallel to
+    /// `holders`, one id per holder. The operator lock board surfaces these
+    /// for diagnostics (force-release, request-release, replay).
+    pub reservation_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, JsonSchema)]
