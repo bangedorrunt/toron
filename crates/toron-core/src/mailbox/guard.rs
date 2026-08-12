@@ -33,6 +33,29 @@ pub struct Reservation {
 /// - Own reservations never block (holder == agent).
 /// - A path is blocked iff some other agent holds an active exclusive
 ///   reservation whose pattern matches it (symmetric fnmatch).
+///
+/// `agent` is `Option` for the CLI path: an unattributed commit (no agent
+/// resolvable from `--as` / `TORON_AGENT` / `FLYWHEEL_MAIL_AS`) cannot be
+/// told apart from the holder, so it FAILS OPEN (empty result) — the guard
+/// only blocks when attribution is available. This keeps human/operator
+/// commits (which carry no agent env) unblocked.
+pub fn guard_check_blocked(
+    agent: Option<&str>,
+    staged: &[String],
+    reservations: &[Reservation],
+) -> Vec<String> {
+    match agent {
+        None => Vec::new(),
+        Some(agent) => guard_blocked_paths(agent, staged, reservations),
+    }
+}
+
+/// Check whether a commit's staged paths violate any OTHER agent's exclusive
+/// reservation. Returns the offending paths (empty = commit allowed).
+///
+/// - Own reservations never block (holder == agent).
+/// - A path is blocked iff some other agent holds an active exclusive
+///   reservation whose pattern matches it (symmetric fnmatch).
 pub fn guard_blocked_paths(
     agent: &str,
     staged: &[String],
@@ -147,9 +170,11 @@ fn class_contains(pat: &[char], lo: usize, hi: usize, c: char) -> bool {
 /// Install the toron pre-commit guard into a git repository's hooks directory.
 ///
 /// Uses libgit2 to locate `.git/hooks/pre-commit`. The script delegates to the
-/// `toron` CLI's `guard check` subcommand (wired in toron-cli); `TORON_GIT_BINARY`
-/// is exported for the subprocess so the archive commit path honors the override.
-pub fn install_precommit_guard(repo_path: &Path) -> anyhow::Result<PathBuf> {
+/// `toron` CLI's `guard check` subcommand (wired in toron-cli); the project
+/// slug is baked into the invocation so the guard evaluates the right
+/// project's reservations. `TORON_GIT_BINARY` is exported for the subprocess
+/// so the archive commit path honors the override.
+pub fn install_precommit_guard(repo_path: &Path, project: &str) -> anyhow::Result<PathBuf> {
     use std::io::Write;
 
     let repo = git2::Repository::open(repo_path)?;
@@ -171,7 +196,7 @@ pub fn install_precommit_guard(repo_path: &Path) -> anyhow::Result<PathBuf> {
          # Blocks commits that stage paths exclusively reserved by another agent.\n\
          {export}\
          if command -v toron >/dev/null 2>&1; then\n\
-         \texec toron guard check --repo \"$PWD\"\n\
+         \texec toron guard check --repo \"$PWD\" --project {project}\n\
          fi\n\
          exit 0\n"
     );
@@ -220,20 +245,45 @@ fn set_executable(_path: &Path) -> Result<(), std::io::Error> {
 
 /// The staged-file set for a repo: paths the guard evaluates. Reads the git
 /// index (libgit2) and returns unique staged paths relative to the repo root.
+///
+/// Only paths whose index entry differs from HEAD (or is newly added with no
+/// HEAD yet) count as staged — a clean tracked file must never block a commit
+/// that merely stages an unrelated path (bd-f5tt live-gate finding).
 pub fn staged_paths(repo: &git2::Repository) -> Vec<String> {
     let Ok(index) = repo.index() else {
         return Vec::new();
     };
+    let head_tree = repo
+        .head()
+        .ok()
+        .and_then(|h| h.peel_to_tree().ok());
     let mut out = Vec::new();
-    for entry in index.iter() {
-        if let Ok(p) = std::str::from_utf8(&entry.path) {
-            let p = p.to_string();
-            if !out.contains(&p) {
-                out.push(p);
+    let diff = repo
+        .diff_tree_to_index(head_tree.as_ref(), Some(&index), None)
+        .ok();
+    let Some(diff) = diff else {
+        return out;
+    };
+    for delta in diff.deltas() {
+        if let Some(p) = delta.new_file().path().or_else(|| delta.old_file().path()) {
+            if let Some(p) = p.to_str() {
+                let p = p.to_string();
+                if !out.contains(&p) {
+                    out.push(p);
+                }
             }
         }
     }
     out
+}
+
+/// Open a repository at `repo_path` and return its staged paths (empty on
+/// open/index errors — the guard never fails a commit on unreadable state).
+pub fn staged_paths_in(repo_path: &Path) -> Vec<String> {
+    match git2::Repository::open(repo_path) {
+        Ok(repo) => staged_paths(&repo),
+        Err(_) => Vec::new(),
+    }
 }
 
 use super::*;
@@ -256,6 +306,53 @@ mod tests {
         let reservations = vec![res("me", "src/**", true)];
         let blocked = guard_blocked_paths("me", &staged, &reservations);
         assert!(blocked.is_empty(), "own reservation must not block");
+    }
+
+    #[test]
+    fn test_guard_check_blocked_unattributed_fails_open() {
+        let staged = vec!["src/lib.rs".to_string()];
+        let reservations = vec![res("other", "src/**", true)];
+        let blocked = guard_check_blocked(None, &staged, &reservations);
+        assert!(
+            blocked.is_empty(),
+            "unattributed commit must fail open (no agent to attribute)"
+        );
+    }
+
+    #[test]
+    fn test_guard_check_blocked_attributed_blocks_foreign() {
+        let staged = vec!["src/lib.rs".to_string(), "README.md".to_string()];
+        let reservations = vec![res("other", "src/**", true)];
+        let blocked = guard_check_blocked(Some("me"), &staged, &reservations);
+        assert_eq!(blocked, vec!["src/lib.rs".to_string()]);
+    }
+
+    #[test]
+    fn test_guard_check_blocked_own_reservation_clear() {
+        let staged = vec!["src/lib.rs".to_string()];
+        let reservations = vec![res("me", "src/**", true)];
+        let blocked = guard_check_blocked(Some("me"), &staged, &reservations);
+        assert!(blocked.is_empty(), "own reservation must not block");
+    }
+
+    #[test]
+    fn test_install_bakes_project_flag() {
+        let root = std::env::temp_dir().join(format!(
+            "toron-guard-proj-{}-{}.git",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).expect("create repo dir");
+        let repo = git2::Repository::init(&root).expect("init repo");
+
+        let hook = install_precommit_guard(&root, "toron").expect("install");
+        let contents = std::fs::read_to_string(&hook).expect("read hook");
+        assert!(
+            contents.contains("guard check --repo \"$PWD\" --project toron"),
+            "hook must bake the project slug into the guard check invocation"
+        );
+        drop(repo);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -324,7 +421,7 @@ mod tests {
         std::fs::create_dir_all(&root).expect("create repo dir");
         let repo = git2::Repository::init(&root).expect("init repo");
 
-        let hook = install_precommit_guard(&root).expect("install");
+        let hook = install_precommit_guard(&root, "demo").expect("install");
         assert!(hook.exists(), "hook script must exist");
         let contents = std::fs::read_to_string(&hook).expect("read hook");
         assert!(contents.contains("installed by toron"));
@@ -381,6 +478,47 @@ mod tests {
         let staged = staged_paths(&repo);
         assert!(staged.contains(&"src/lib.rs".to_string()));
         assert!(staged.contains(&"Cargo.toml".to_string()));
+        drop(repo);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn test_staged_paths_excludes_clean_tracked_files() {
+        let root = std::env::temp_dir().join(format!(
+            "toron-staged-clean-{}-{}.git",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(root.join("src")).expect("src dir");
+        let repo = git2::Repository::init(&root).expect("init repo");
+        let sig = git2::Signature::now("t", "t@t").expect("sig");
+        std::fs::write(root.join("src/lib.rs"), "pub fn x() {}\n").expect("write");
+        std::fs::write(root.join("README.md"), "# r\n").expect("write");
+        {
+            let mut index = repo.index().expect("index");
+            index.add_path(Path::new("src/lib.rs")).expect("add");
+            index.add_path(Path::new("README.md")).expect("add");
+            index.write().expect("write index");
+            let tree_id = index.write_tree().expect("tree");
+            let tree = repo.find_tree(tree_id).expect("find tree");
+            repo.commit(Some("HEAD"), &sig, &sig, "base", &tree, &[]).expect("commit");
+        }
+
+        // Now stage a NEW file only; lib.rs/README.md stay clean in the index.
+        std::fs::create_dir_all(root.join("docs")).expect("docs dir");
+        std::fs::write(root.join("docs/plan.md"), "plan\n").expect("write");
+        {
+            let mut index = repo.index().expect("index");
+            index.add_path(Path::new("docs/plan.md")).expect("add");
+            index.write().expect("write index");
+        }
+
+        let staged = staged_paths(&repo);
+        assert_eq!(
+            staged,
+            vec!["docs/plan.md".to_string()],
+            "clean tracked files must NOT appear as staged"
+        );
         drop(repo);
         let _ = std::fs::remove_dir_all(root);
     }

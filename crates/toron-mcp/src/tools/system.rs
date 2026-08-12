@@ -64,7 +64,7 @@ impl ToolServer {
     ) -> ToolOutput {
         match self
             .mailbox
-            .install_precommit_guard(Path::new(&args.code_repo_path))
+            .install_precommit_guard(Path::new(&args.code_repo_path), &args.project_key)
         {
             Ok(path) => ToolOutput::ok(json!({ "hook_path": path.display().to_string() })),
             Err(e) => ToolOutput::err(e),

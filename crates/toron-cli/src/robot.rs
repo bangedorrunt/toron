@@ -261,11 +261,54 @@ pub async fn run_contact(mailbox: &Mailbox, cmd: &ContactCommand) -> anyhow::Res
 pub async fn run_guard(mailbox: &Mailbox, cmd: &GuardCommand) -> anyhow::Result<()> {
     match cmd {
         GuardCommand::Install(args) => {
-            let hook_path = mailbox.install_precommit_guard(Path::new(&args.repo))?;
+            let hook_path =
+                mailbox.install_precommit_guard(Path::new(&args.repo), &args.project)?;
             print_json(&json!({ "hook_path": hook_path.display().to_string() }))
         }
         GuardCommand::Uninstall(args) => {
             emit(mailbox.uninstall_precommit_guard(Path::new(&args.repo))?)
+        }
+        GuardCommand::Check(args) => {
+            let agent = args
+                .as_agent
+                .clone()
+                .or_else(|| std::env::var("TORON_AGENT").ok())
+                .or_else(|| std::env::var("FLYWHEEL_MAIL_AS").ok());
+            let staged = toron_core::mailbox::guard::staged_paths_in(&args.repo);
+            let reservations = mailbox
+                .active_reservations(&args.project)
+                .await?
+                .into_iter()
+                .map(|r| toron_core::mailbox::guard::Reservation {
+                    holder: r.agent_name,
+                    pattern: r.path_pattern,
+                    exclusive: r.exclusive,
+                })
+                .collect::<Vec<_>>();
+            let blocked = toron_core::mailbox::guard::guard_check_blocked(
+                agent.as_deref(),
+                &staged,
+                &reservations,
+            );
+            let out = json!({
+                "blocked": blocked,
+                "agent": agent,
+                "project": args.project,
+            });
+            print_json(&out)?;
+            // Explicit exit both ways: the demo mailbox keeps a background
+            // thread alive after the tokio runtime shuts down, which would
+            // HANG a pre-commit hook. A hook must terminate with the exit
+            // code of the check, never dangle.
+            std::process::exit(if out["blocked"]
+                .as_array()
+                .map(|a| a.is_empty())
+                .unwrap_or(true)
+            {
+                0
+            } else {
+                1
+            })
         }
     }
 }
