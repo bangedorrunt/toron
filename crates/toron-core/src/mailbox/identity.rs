@@ -190,6 +190,54 @@ impl Mailbox {
         crate::keys::load_encrypted_key(path, self.agent_passphrase()).ok()
     }
 
+    /// bd-cmgu: find an agent key under an ALTERNATE project root whose slug
+    /// basename matches the primary slug's basename (MCP short key vs CLI
+    /// absolute-path key — either identifier must resolve to the same key).
+    ///
+    /// Walks `data_dir` at arbitrary depth (path-slug roots are nested, the
+    /// leading `/` stripped by `agent_key_path`), collecting project roots
+    /// (dirs containing `agents/`). Deterministic: candidates are visited in
+    /// sorted slug order; the FIRST one holding the key wins. Symlinks are
+    /// never followed (the walk cannot escape `data_dir`). Best-effort: any
+    /// walk error yields `None` — the caller reports the original miss.
+    pub(crate) fn alt_agent_key(&self, project_slug: &str, name: &str) -> Option<Keys> {
+        let want = std::path::Path::new(project_slug).file_name()?.to_str()?.to_string();
+        let mut candidates: Vec<String> = Vec::new();
+        let mut stack = vec![self.data_dir.clone()];
+        while let Some(dir) = stack.pop() {
+            let entries = std::fs::read_dir(&dir).ok()?;
+            for e in entries.flatten() {
+                let p = e.path();
+                if !e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                    continue;
+                }
+                let slug = p.strip_prefix(&self.data_dir).ok()?.to_string_lossy().to_string();
+                if slug == project_slug {
+                    continue;
+                }
+                if p.join("agents").is_dir() {
+                    if std::path::Path::new(&slug)
+                        .file_name()
+                        .map(|f| f.to_str())
+                        .flatten()
+                        == Some(want.as_str())
+                    {
+                        candidates.push(slug);
+                    }
+                } else {
+                    stack.push(p);
+                }
+            }
+        }
+        candidates.sort();
+        for slug in candidates {
+            if let Some(k) = self.load_agent_key(&self.agent_key_path(&slug, name)) {
+                return Some(k);
+            }
+        }
+        None
+    }
+
     /// The passphrase used to encrypt/decrypt agent keys (G1: passphrase
     /// unlocks ncryptsec at process start). Defaults to `TORON_KEY_PASSPHRASE`
     /// or a dev placeholder; production deployments must set it.
@@ -534,5 +582,86 @@ mod tests {
     fn test_list_agents_options_default() {
         let o = ListAgentsOptions::default();
         assert!(o.active_within_days.is_none());
+    }
+
+    // ---- bd-cmgu: MCP vs CLI project-key unification ----
+    //
+    // The flywheel CLI keys projects by ABSOLUTE PATH slug
+    // ("/Users/.../workspace/toron"), the MCP surface by the short key
+    // ("toron") — two roots under one data dir. An agent registered via one
+    // surface was invisible to the other ("no local key"). The fallback must
+    // resolve either identifier to the same key.
+
+    /// Incident shape (CLI-registered -> MCP lookup): register under the
+    /// PATH-style slug, look the key up via the SHORT slug.
+    #[tokio::test]
+    async fn test_agent_keys_for_short_key_finds_path_slug_registered_agent() {
+        let (mailbox, db_path, data_dir) = test_mailbox("cmgu-short").await;
+        let path_slug = "tmp/x/workspace/demo"; // relative path form (leading / stripped)
+        let agent = mailbox
+            .register_agent(path_slug, &profile("RustHeron"))
+            .await
+            .expect("register under path slug");
+        // Primary lookup under the SHORT key must miss (that was the bug)...
+        let short_path = mailbox.agent_key_path("demo", "RustHeron");
+        assert!(!short_path.exists(), "primary short-slug key absent by design");
+        // ...and the fallback must find the path-slug key.
+        let keys = mailbox
+            .agent_keys_for("demo", "RustHeron")
+            .expect("fallback via basename");
+        assert_eq!(keys.public_key().to_hex(), agent.npub, "same key");
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// Reverse direction (MCP-registered -> CLI lookup): register under the
+    /// SHORT slug, look the key up via the PATH-style slug.
+    #[tokio::test]
+    async fn test_agent_keys_for_path_slug_finds_short_slug_registered_agent() {
+        let (mailbox, db_path, data_dir) = test_mailbox("cmgu-path").await;
+        let agent = mailbox
+            .register_agent("demo", &profile("BlueLake"))
+            .await
+            .expect("register under short slug");
+        let path_slug = "tmp/x/workspace/demo";
+        assert!(
+            !mailbox.agent_key_path(path_slug, "BlueLake").exists(),
+            "primary path-slug key absent by design"
+        );
+        let keys = mailbox
+            .agent_keys_for(path_slug, "BlueLake")
+            .expect("fallback via basename");
+        assert_eq!(keys.public_key().to_hex(), agent.npub, "same key");
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// The exact-slug lookup still wins when both roots hold the name, and an
+    /// unknown name still fails with the original error.
+    #[tokio::test]
+    async fn test_agent_keys_for_exact_slug_wins_and_unknown_still_errors() {
+        let (mailbox, db_path, data_dir) = test_mailbox("cmgu-exact").await;
+        let agent = mailbox
+            .register_agent("demo", &profile("BlueLake"))
+            .await
+            .expect("register");
+        // Register the SAME name under a basename-colliding path slug — the
+        // exact-slug key must win (deterministic, no cross-root shadowing).
+        let other = mailbox
+            .register_agent("tmp/x/workspace/demo", &profile("BlueLake"))
+            .await
+            .expect("register alt root");
+        let keys = mailbox.agent_keys_for("demo", "BlueLake").expect("exact wins");
+        assert_eq!(keys.public_key().to_hex(), agent.npub, "exact-slug key");
+        assert_ne!(agent.npub, other.npub, "distinct keys per root");
+        let err = mailbox
+            .agent_keys_for("demo", "NoSuchAgent")
+            .expect_err("still fails for unknown names");
+        assert!(
+            err.to_string().contains("has no local key in project demo"),
+            "original error shape: {err}"
+        );
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
     }
 }

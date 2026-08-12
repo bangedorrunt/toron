@@ -524,13 +524,24 @@ impl Mailbox {
     }
 
     /// Load the sender/agent's keypair from its ncryptsec file (G1).
+    ///
+    /// bd-cmgu: the flywheel CLI keys projects by their ABSOLUTE PATH slug
+    /// (`/Users/.../workspace/toron`) while the MCP surface uses the short
+    /// key (`toron`) — two roots under one data dir. On a primary miss the
+    /// lookup falls back to the basename-matched alternate root (both
+    /// directions), so an agent registered via one surface is usable from
+    /// the other with either project identifier.
     pub(crate) fn agent_keys_for(&self, project_slug: &str, name: &str) -> anyhow::Result<Keys> {
         let path = self.agent_key_path(project_slug, name);
-        self.load_agent_key(&path).ok_or_else(|| {
-            anyhow::anyhow!(
-                "agent {name} has no local key in project {project_slug} (create_agent_identity or register first)"
-            )
-        })
+        if let Some(k) = self.load_agent_key(&path) {
+            return Ok(k);
+        }
+        if let Some(k) = self.alt_agent_key(project_slug, name) {
+            return Ok(k);
+        }
+        Err(anyhow::anyhow!(
+            "agent {name} has no local key in project {project_slug} (create_agent_identity or register first)"
+        ))
     }
 
     /// Per-message receipt timestamp cache (idempotency, in-memory).
