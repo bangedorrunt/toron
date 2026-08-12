@@ -19,7 +19,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
 async-trait = "0.1"
 thiserror = "1"
-resonate-sdk = "0.4"
 uuid = { version = "1", features = ["v4", "serde"] }
 nostr-sdk = { version = "0.44", features = ["nip44", "nip49", "nip59"] }
 negentropy = "0.5"
