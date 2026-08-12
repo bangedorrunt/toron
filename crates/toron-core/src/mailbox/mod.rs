@@ -41,8 +41,8 @@ pub mod unwrap;
 pub use build_slots::AcquireBuildSlotResult;
 pub use contacts::{BusPolicySource, ContactLink, LinkStatus, RequestContact, RespondContact};
 pub use guard::{
-    Reservation as GuardReservation, guard_blocked_paths, guard_check_blocked,
-    install_precommit_guard, staged_paths_in, uninstall_precommit_guard,
+    Reservation as GuardReservation, guard_blocked_paths, install_precommit_guard,
+    uninstall_precommit_guard,
 };
 pub use identity::{ListAgentsOptions, RegisteredAgent, WhoIs};
 pub use crate::nostr::identity::AgentProfile;
