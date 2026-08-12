@@ -452,6 +452,16 @@ pub trait MailSurface: Send + Sync {
         note: Option<&str>,
         notify_previous: bool,
     ) -> Result<(), MailError>;
+    /// Operator-signed revocation of every live lease whose reason is the
+    /// bead id (bd-h3oj release-on-bead-close). No staleness heuristic — the
+    /// bead closing is the evidence; `released == 0` is a clean no-op.
+    async fn release_by_reason(
+        &self,
+        project: &str,
+        requestor: &str,
+        bead_id: &str,
+        notify_previous: bool,
+    ) -> Result<ReleaseResult, MailError>;
 
     // --- build slots ---
     /// Acquire an advisory build-slot lease (kind-30032).
@@ -831,6 +841,19 @@ impl MailSurface for ToronMailSurface {
     ) -> Result<(), MailError> {
         self.mailbox
             .force_release_file_reservation(project, requestor, path, holder, note, notify_previous)
+            .await
+            .map_mail_error()
+    }
+
+    async fn release_by_reason(
+        &self,
+        project: &str,
+        requestor: &str,
+        bead_id: &str,
+        notify_previous: bool,
+    ) -> Result<ReleaseResult, MailError> {
+        self.mailbox
+            .release_by_reason(project, requestor, bead_id, notify_previous)
             .await
             .map_mail_error()
     }

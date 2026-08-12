@@ -139,6 +139,33 @@ impl ToolServer {
             Err(e) => ToolOutput::err(e),
         }
     }
+
+    /// `release_file_reservations_by_reason` (additive, bd-h3oj — NOT part
+    /// of the AM-Rust parity 38): operator-signed revocation of every live
+    /// lease whose reason tag is the bead id. The flywheel after-close hook
+    /// calls this so a closed bead's locks never linger to TTL. `released
+    /// == 0` is a clean no-op.
+    #[tool(
+        name = "release_file_reservations_by_reason",
+        description = "Release all file reservations whose reason is the given bead id (operator-signed; release-on-bead-close).",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<crate::responses::ReleaseResultOut>(),
+        annotations(title = "Release reservations by reason", destructive_hint = true)
+    )]
+    async fn release_file_reservations_by_reason(
+        &self,
+        Parameters(args): Parameters<ReleaseFileReservationsByReasonArgs>,
+    ) -> ToolOutput {
+        ToolOutput::result(
+            self.mailbox
+                .release_by_reason(
+                    &args.project_key,
+                    &args.agent_name,
+                    &args.bead_id,
+                    args.notify_previous.unwrap_or(true),
+                )
+                .await,
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -189,5 +216,15 @@ pub struct ForceReleaseFileReservationArgs {
     /// path. Omit to revoke the (single) matching lease.
     pub holder: Option<String>,
     pub note: Option<String>,
+    pub notify_previous: Option<bool>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone)]
+pub struct ReleaseFileReservationsByReasonArgs {
+    pub project_key: String,
+    /// Requestor (operator-facing name; used in the holder notification DM).
+    pub agent_name: String,
+    /// Bead id whose matching (reason == bead id) leases get revoked.
+    pub bead_id: String,
     pub notify_previous: Option<bool>,
 }
