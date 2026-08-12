@@ -709,6 +709,11 @@ pub enum GuardCommand {
     Install(GuardRepoArgs),
     /// Remove the toron-installed pre-commit hook (never clobbers a user hook).
     Uninstall(GuardRepoArgs),
+    /// Check a commit's staged paths against active reservations. Exit 1
+    /// (blocked) when a staged path is exclusively reserved by ANOTHER agent;
+    /// exit 0 (allow) otherwise. Attribution: --as, else TORON_AGENT, else
+    /// FLYWHEEL_MAIL_AS; an unattributed commit fails open (exit 0).
+    Check(GuardCheckArgs),
 }
 
 #[derive(Debug, Args)]
@@ -716,6 +721,22 @@ pub struct GuardRepoArgs {
     /// Git repository path.
     #[arg(long, required = true)]
     pub repo: PathBuf,
+    /// Project slug whose reservations the guard evaluates (baked into the hook).
+    #[arg(long, default_value = DEFAULT_PROJECT)]
+    pub project: String,
+}
+
+#[derive(Debug, Args)]
+pub struct GuardCheckArgs {
+    /// Git repository path.
+    #[arg(long, required = true)]
+    pub repo: PathBuf,
+    /// Project slug whose reservations are evaluated.
+    #[arg(long, default_value = DEFAULT_PROJECT)]
+    pub project: String,
+    /// Committing agent name (overrides TORON_AGENT / FLYWHEEL_MAIL_AS).
+    #[arg(long)]
+    pub as_agent: Option<String>,
 }
 
 // ---------------------------------------------------------------------------

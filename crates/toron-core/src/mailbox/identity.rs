@@ -200,8 +200,16 @@ impl Mailbox {
     /// sorted slug order; the FIRST one holding the key wins. Symlinks are
     /// never followed (the walk cannot escape `data_dir`). Best-effort: any
     /// walk error yields `None` — the caller reports the original miss.
+    ///
+    /// bd-f5tt: the walk descends INTO project roots too — a root may nest
+    /// deeper path-slug roots (`<data>/Users/.../workspace` holding `agents/`
+    /// while `<data>/Users/.../workspace/toron` is the real project). A
+    /// non-descending walk would shadow the nested root.
     pub(crate) fn alt_agent_key(&self, project_slug: &str, name: &str) -> Option<Keys> {
-        let want = std::path::Path::new(project_slug).file_name()?.to_str()?.to_string();
+        let want = std::path::Path::new(project_slug)
+            .file_name()?
+            .to_str()?
+            .to_string();
         let mut candidates: Vec<String> = Vec::new();
         let mut stack = vec![self.data_dir.clone()];
         while let Some(dir) = stack.pop() {
@@ -211,7 +219,11 @@ impl Mailbox {
                 if !e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                     continue;
                 }
-                let slug = p.strip_prefix(&self.data_dir).ok()?.to_string_lossy().to_string();
+                let slug = p
+                    .strip_prefix(&self.data_dir)
+                    .ok()?
+                    .to_string_lossy()
+                    .to_string();
                 if slug == project_slug {
                     continue;
                 }
@@ -224,9 +236,9 @@ impl Mailbox {
                     {
                         candidates.push(slug);
                     }
-                } else {
-                    stack.push(p);
                 }
+                // Descend regardless: a project root may nest deeper roots.
+                stack.push(p);
             }
         }
         candidates.sort();
@@ -236,6 +248,59 @@ impl Mailbox {
             }
         }
         None
+    }
+
+    /// bd-f5tt: the project-root slug aliases for `project_slug` — the slug
+    /// itself plus every data-dir project root whose basename matches (CLI
+    /// absolute-path key vs MCP short key; the guard check queries
+    /// reservations under ALL aliases because a lease is tagged with the slug
+    /// as-written at acquire time). Both spellings of a path slug are
+    /// included (leading `/` stripped by the walk, but acquire tags the raw
+    /// slug verbatim) so queries match leases written under either form.
+    pub(crate) fn project_slug_aliases(&self, project_slug: &str) -> Vec<String> {
+        let mut out = vec![project_slug.to_string()];
+        if let Some(stripped) = project_slug.strip_prefix('/') {
+            out.push(stripped.to_string());
+        }
+        let want = std::path::Path::new(project_slug)
+            .file_name()
+            .and_then(|f| f.to_str())
+            .unwrap_or(project_slug)
+            .to_string();
+        let mut stack = vec![self.data_dir.clone()];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for e in entries.flatten() {
+                let p = e.path();
+                if !e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                    continue;
+                }
+                let slug = p
+                    .strip_prefix(&self.data_dir)
+                    .ok()
+                    .map(|s| s.to_string_lossy().to_string());
+                let Some(slug) = slug else { continue };
+                if slug == project_slug {
+                    continue;
+                }
+                if p.join("agents").is_dir()
+                    && std::path::Path::new(&slug)
+                        .file_name()
+                        .map(|f| f.to_str())
+                        .flatten()
+                        == Some(want.as_str())
+                {
+                    out.push(slug.clone());
+                    out.push(format!("/{slug}"));
+                }
+                stack.push(p);
+            }
+        }
+        out.sort();
+        out.dedup();
+        out
     }
 
     /// The passphrase used to encrypt/decrypt agent keys (G1: passphrase
@@ -604,7 +669,10 @@ mod tests {
             .expect("register under path slug");
         // Primary lookup under the SHORT key must miss (that was the bug)...
         let short_path = mailbox.agent_key_path("demo", "RustHeron");
-        assert!(!short_path.exists(), "primary short-slug key absent by design");
+        assert!(
+            !short_path.exists(),
+            "primary short-slug key absent by design"
+        );
         // ...and the fallback must find the path-slug key.
         let keys = mailbox
             .agent_keys_for("demo", "RustHeron")
@@ -651,7 +719,9 @@ mod tests {
             .register_agent("tmp/x/workspace/demo", &profile("BlueLake"))
             .await
             .expect("register alt root");
-        let keys = mailbox.agent_keys_for("demo", "BlueLake").expect("exact wins");
+        let keys = mailbox
+            .agent_keys_for("demo", "BlueLake")
+            .expect("exact wins");
         assert_eq!(keys.public_key().to_hex(), agent.npub, "exact-slug key");
         assert_ne!(agent.npub, other.npub, "distinct keys per root");
         let err = mailbox
@@ -660,6 +730,65 @@ mod tests {
         assert!(
             err.to_string().contains("has no local key in project demo"),
             "original error shape: {err}"
+        );
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// bd-f5tt: a project root nested under ANOTHER project root is still
+    /// found — the walk must descend into roots, not shadow them
+    /// (`<data>/tmp/x/workspace` holds `agents/` while
+    /// `<data>/tmp/x/workspace/demo` is the real project).
+    #[tokio::test]
+    async fn test_alt_agent_key_descends_into_shadowing_root() {
+        let (mailbox, db_path, data_dir) = test_mailbox("f5tt-shadow").await;
+        // Register under the NESTED path slug.
+        let nested = "tmp/x/workspace/demo";
+        let agent = mailbox
+            .register_agent(nested, &profile("DustyWren"))
+            .await
+            .expect("register nested root");
+        // Create the SHADOWING root: a project root at the PARENT path
+        // (has agents/) whose basename is NOT the wanted one. Under the
+        // non-descending walk this hid the nested root.
+        mailbox
+            .register_agent("tmp/x/workspace", &profile("ShadowRoot"))
+            .await
+            .expect("register shadowing parent root");
+        let keys = mailbox
+            .agent_keys_for("demo", "DustyWren")
+            .expect("fallback finds the nested root through the shadow");
+        assert_eq!(keys.public_key().to_hex(), agent.npub, "same key");
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// bd-f5tt: `project_slug_aliases` returns the given slug plus every
+    /// basename-colliding project root, both spellings of a path slug.
+    #[tokio::test]
+    async fn test_project_slug_aliases_covers_both_spellings() {
+        let (mailbox, db_path, data_dir) = test_mailbox("f5tt-alias").await;
+        mailbox
+            .register_agent("tmp/x/workspace/demo", &profile("AliasA"))
+            .await
+            .expect("register path root");
+        mailbox
+            .register_agent("demo", &profile("AliasB"))
+            .await
+            .expect("register short root");
+        let aliases = mailbox.project_slug_aliases("demo");
+        assert!(
+            aliases.contains(&"demo".to_string()),
+            "the given slug is always an alias: {aliases:?}"
+        );
+        assert!(
+            aliases.contains(&"tmp/x/workspace/demo".to_string()),
+            "path-slug root found via basename: {aliases:?}"
+        );
+        let rev = mailbox.project_slug_aliases("tmp/x/workspace/demo");
+        assert!(
+            rev.contains(&"demo".to_string()),
+            "reverse direction: {rev:?}"
         );
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_dir_all(&data_dir);
