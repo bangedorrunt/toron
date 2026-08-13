@@ -6,7 +6,7 @@
 coordination layer: a mailbox with 100% parity to
 [`mcp_agent_mail_rust`](https://github.com/Dicklesworthstone/mcp_agent_mail_rust),
 rebuilt on the **Nostr** protocol — plus a Buzz-grade collaboration & automation
-layer (channels, workflows, @mention dispatch) on top. Agents discover each other,
+layer (channels, workflows, standalone cron, coalitions, @mention dispatch) on top. Agents discover each other,
 exchange encrypted mail, reserve files, claim work, and run automation — peer-to-peer,
 with no orchestrator in the hot path.
 
@@ -103,6 +103,19 @@ human-auditable archive; two-source disaster recovery (Git + relay replay).
   receives it via subscription push. Job lifecycle = `43001` request → `43002`
   claim (signed) → `43004` result (`43003` progress optional; `43005` cancel;
   `43006` error). Federated, auditable, first-claimable.
+- **Standalone cron (ADR-0012)** — a FIRST-CLASS scheduled primitive DISTINCT
+  from workflow (not "a workflow with a schedule trigger"). A `CronSpec`
+  (schedule + owner + scope + policy + a steps body composing workflows via
+  `call_workflow`) runs on the SHARED engine as a Resonate `ctx.sleep`
+  durable-sleep function (`CronManager` + `run_cron_tick`, `catchup: latest`
+  on wake). One engine, two input types (workflow YAML + cron YAML). The
+  flywheel CLI drives user-dir cron YAMLs (`cron lint/run/list/...`).
+- **Coalitions (ADR-0011)** — ephemeral per-goal crews with intent-based
+  coordination. toron-core substrate: file reservations gain `status:
+  intent→held→released` (30031 state machine); the conflict check splits HARD
+  (held → block) vs SOFT (in-TTL intent → freeze+propose); `declare_intent` +
+  intent TTL + must-convert; request-release negotiation + escalation. The
+  atomic conflict-check floor is NEVER removed.
 - **Ephemeral presence** — agents broadcast working-state (`20001`) on the bus;
   real-time, uniform, not herdr-polling.
 - **Persona packs** — versioned system-prompt/persona on the agent profile →
@@ -336,10 +349,12 @@ Version bumps derive from commit types: `feat` → minor, `fix`/`perf` → patch
 | [0002](docs/decisions/adopt-agent-adapter-architecture.md) | Adopt Agent Adapter Architecture | Partially superseded by ADR-0003 |
 | [0003](docs/decisions/0003-nostr-mailbox-fabric.md) | Nostr-Native, Tokio-Based Multi-Backend Agent Mailbox | **Accepted (constitution)** |
 | [0005](docs/decisions/0005-orchestration-layer.md) | Orchestration Tier — Profiles, Workflows, Stages, Smart Cron, Engine | **Accepted** |
-| [0010](docs/decisions/0010-execution-wiring-model-registry-headless.md) | Execution Wiring, Model Registry, Role Conditioning, Headless Mode | **Proposed** |
-| [0011](docs/decisions/0011-coalition-orchestration.md) | Coalition Orchestration — Steer + Collab Layers, Intent-Based Coordination | **Proposed** |
+| [0010](docs/decisions/0010-execution-wiring-model-registry-headless.md) | Execution Wiring, Model Registry, Role Conditioning, Headless Mode | **Accepted** |
+| [0011](docs/decisions/0011-coalition-orchestration.md) | Coalition Orchestration — Steer + Collab Layers, Intent-Based Coordination | **Accepted** |
+| [0012](docs/decisions/0012-standalone-cron-type.md) | Standalone Cron Type — Scheduled Primitive, Distinct from Workflow | **Accepted** |
+| [0013](docs/decisions/0013-website-architecture-and-feature-presentation.md) | toron.dev Website Architecture and Feature Presentation | **Accepted** |
 
-> Full index (0001–0011, parity catalogs, ADR-0005 phase status): **[docs/decisions/README.md](docs/decisions/README.md)**.
+> Full index (0001–0013, parity catalogs, ADR-0005 phase status): **[docs/decisions/README.md](docs/decisions/README.md)**.
 > Orchestration vocabulary (profiles/crews/workflows/cron) lives in [`flywheel`](../flywheel); see [`flywheel/docs/workflow-authoring.md`](../flywheel/docs/workflow-authoring.md).
 
 ## References
