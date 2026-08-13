@@ -433,6 +433,10 @@ pub(crate) async fn run_spawn(
         "profile": profile,
         "workflow": workflow,
         "resolved": resolved,
+        // bd-omwg: the embedding's drainer must know whether the run parks on
+        // this job (resolve on completion) or fired it detached (fire-and-
+        // forget, never resolve).
+        "await": await_,
     });
     let task = ctx.promise::<serde_json::Value>().data(&spec)?;
     let task = if await_ && no_claim_timeout > 0 {
