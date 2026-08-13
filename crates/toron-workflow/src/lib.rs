@@ -31,7 +31,8 @@ pub use channels::{
     REACTION,
 };
 pub use cron::{
-    CronManager, CronRegistration, CronRegistry, latest_due_at_or_before, next_due,
+    CronManager, CronRegistration, CronRegistry, CronSpecRegistration, CronSpecRegistry,
+    latest_due_at_or_before, next_due,
 };
 pub use cron_failure::{FailureBundle, PolicyEvent, PolicySink, evaluate, failure_details, is_failed};
 
