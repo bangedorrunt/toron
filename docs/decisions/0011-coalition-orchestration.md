@@ -1,6 +1,6 @@
 # ADR-0011: Coalition Orchestration — Steer + Collab as Layers, Intent-Based Coordination
 
-**Status:** Proposed (6-round grilling session 2026-08-09; captain review pending)
+**Status:** Accepted (2026-08-13; implemented + live; captain audit flipped Proposed → Accepted)
 **Date:** 2026-08-09
 **Decision-makers:** Captain (bangedorrunt) — grilling session
 **Extends:** [ADR-0005](0005-orchestration-layer.md) (orchestration tier), [ADR-0010](0010-execution-wiring-model-registry-headless.md) (execution wiring — coalitions need the real runner + ingress).
