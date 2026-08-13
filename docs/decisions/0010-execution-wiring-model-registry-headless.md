@@ -1,6 +1,6 @@
 # ADR-0010: Execution Wiring, Model Registry, Role Conditioning, and Headless Mode
 
-**Status:** Proposed (6-round grilling session 2026-08-09; captain review pending)
+**Status:** Accepted (2026-08-13; implemented + live; captain audit flipped Proposed → Accepted)
 **Date:** 2026-08-09
 **Decision-makers:** Captain (bangedorrunt) — grilling session; implementation via beads
 **Extends:** [ADR-0005](0005-orchestration-layer.md) (the orchestration tier this wires to real execution).
