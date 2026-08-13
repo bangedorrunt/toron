@@ -1,0 +1,97 @@
+# toron
+
+Nostr-native agent mailbox. 38 MCP tools + 25 resources on Schnorr identity,
+NIP-17 gift-wrap, NIP-29 channels. Flywheel embeds this; never the reverse.
+
+**Generated:** 2026-08-13
+**Commit:** 33f8276
+**Branch:** main
+
+## OVERVIEW
+
+One `toron` binary (daemon + MCP + robot CLI). Workflows run on Resonate
+through `toron-workflow`. Peer mail never goes through flywheel.
+
+## STRUCTURE
+
+```
+toron/
+├── crates/toron-core/       # mailbox, bus, nostr, archive, index
+├── crates/toron-workflow/   # YAML engine, cron, spawn/dispatch
+├── crates/toron-mcp/        # rmcp server (stdio + HTTP /mcp)
+├── crates/toron-cli/        # bin `toron`
+├── crates/toron-e2e/        # SC-* scenarios (feature-gated)
+├── docs/decisions/          # ADRs (read before structural change)
+├── workflows/               # product YAML (not GitHub Actions)
+└── scripts/verify-gates.sh  # ADR-0003 CI policy
+```
+
+Child maps: [toron-core](crates/toron-core/AGENTS.md) ·
+[toron-workflow](crates/toron-workflow/AGENTS.md) ·
+[toron-mcp](crates/toron-mcp/AGENTS.md)
+
+## WHERE TO LOOK
+
+| Task | Location |
+|------|----------|
+| Mail send/inbox/ack | `crates/toron-core/src/mailbox/` (`MailSurface`, `MessageId`) |
+| Gift-wrap / kinds | `crates/toron-core/src/nostr/` |
+| Bus / federation | `crates/toron-core/src/bus/` |
+| Git archive | `crates/toron-core/src/archive/git.rs` |
+| Workflow YAML / engine | `crates/toron-workflow/src/{schema,engine}/` |
+| Cron (distinct type) | `crates/toron-workflow/src/cron.rs` (ADR-0012) |
+| MCP tools | `crates/toron-mcp/src/tools/` |
+| CLI / daemon | `crates/toron-cli/src/{cli,daemon,main}.rs` |
+| ADRs | `docs/decisions/` |
+
+## CONVENTIONS
+
+- Edition 2024. `#![forbid(unsafe_code)]` on every crate root.
+- New/changed ADR-constrained files: `// governed-by: ADR-XXXX` at top.
+- Deps one-way: **flywheel → toron-workflow → toron-core**. Never reverse.
+- Frozen: 38 tool names, 25 resources, kind registry. No new kinds/tools without an ADR.
+- `MessageId` is String/hex. Never `u64` in shared request/response types.
+- `t` tag = project slug only. Never harness/model/job tags.
+- TDD for new features and bug fixes. No benches in this repo.
+- Beads: `br` CLI + `--json`. No beads MCP. Binary is `br`, never `bd`.
+- `std::env::set_var` only in integration tests that omit `forbid(unsafe_code)`.
+
+## ANTI-PATTERNS (THIS PROJECT)
+
+- `asupersync` / `fastmcp` (CI fails). MCP is `rmcp` + Tokio.
+- Cross-key NIP-09 delete. Force-release = operator `status:revoked`.
+- Nested `block_on`. Compat shims. Silent-success stubs.
+- `GitArchive::commit` writing the live libgit2 index (reverts source HEAD).
+- Per-pid temp mailbox roots. Durable root is XDG (`$XDG_DATA_HOME/toron`).
+- Removing the atomic reservation conflict-check.
+- Headless faking pane 43001/43004 lifecycle.
+- Treating cron as `trigger: schedule` (cron is a distinct YAML type).
+- Editing `docs/decisions/0001-*` as live policy (superseded; Tokio is required).
+
+## COMMANDS
+
+```bash
+bash scripts/verify-gates.sh
+cargo test --workspace
+cargo test -p toron-e2e --features p1          # SC-1..8
+cargo test -p toron-e2e --features p2          # needs resonate on PATH
+cargo test -p toron-e2e --features p4          # SC-18..25 (implies p5)
+cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --check
+cargo test --workspace --all-features          # honest full matrix; CI build does not
+```
+
+`cargo test --exclude-ignored` is invalid. Ignored tests: `-- --ignored`.
+
+Release profile: `strip = "none"` (macOS arm64 LINKEDIT / sqlx_macros).
+
+## NOTES
+
+- `toron serve` requires `--mcp-stdio` or `--mcp-http`. No-flag serve bails.
+- Daemon label `com.toron.serve`, HTTP `127.0.0.1:18080`. Passphrase file
+  `~/.config/toron/passphrase` (0600), never in plist/env flags.
+- Bare `cargo test --workspace` compiles e2e and runs 0 p1/p2 tests (feature
+  gates). sc16–sc24 currently run un-gated.
+- Root `tests/` and `examples/agent_ping_pong.rs` are ADR-0001 leftovers —
+  not workspace members.
+- Sibling orchestrator: `../flywheel` (herdr). Map: `../flywheel/AGENTS.md`.
