@@ -31,7 +31,10 @@ pub fn default_state_dir() -> PathBuf {
     }
     if let Ok(home) = std::env::var("HOME") {
         if !home.is_empty() {
-            return PathBuf::from(home).join(".local").join("state").join("toron");
+            return PathBuf::from(home)
+                .join(".local")
+                .join("state")
+                .join("toron");
         }
     }
     PathBuf::from("toron-state")
@@ -40,7 +43,10 @@ pub fn default_state_dir() -> PathBuf {
 /// The daemon passphrase file: first config-home candidate.
 pub fn passphrase_file() -> PathBuf {
     let candidates = toron_core::config::passphrase_file_candidates(
-        std::env::var("XDG_CONFIG_HOME").ok().map(PathBuf::from).as_deref(),
+        std::env::var("XDG_CONFIG_HOME")
+            .ok()
+            .map(PathBuf::from)
+            .as_deref(),
         std::env::var("HOME").ok().map(PathBuf::from).as_deref(),
     );
     candidates
@@ -219,9 +225,7 @@ pub fn process_alive(pid: u32) -> bool {
     if pid == 0 {
         return false;
     }
-    let out = Command::new("kill")
-        .args(["-0", &pid.to_string()])
-        .output();
+    let out = Command::new("kill").args(["-0", &pid.to_string()]).output();
     matches!(out, Ok(o) if o.status.success())
 }
 
@@ -265,10 +269,7 @@ fn set_mode_0600(_path: &Path) -> anyhow::Result<()> {
 /// bootstrap / systemctl daemon-reload + enable + start). Idempotent.
 pub fn install(args: &super::cli::DaemonArgs) -> anyhow::Result<()> {
     let binary = std::env::current_exe()?;
-    let state = args
-        .state_dir
-        .clone()
-        .unwrap_or_else(default_state_dir);
+    let state = args.state_dir.clone().unwrap_or_else(default_state_dir);
     std::fs::create_dir_all(&state)?;
     let pass = ensure_passphrase_file()?;
     let key_path = toron_core::config::ToronPaths::resolve().operator_key_path();
@@ -290,7 +291,11 @@ pub fn install(args: &super::cli::DaemonArgs) -> anyhow::Result<()> {
             .output();
         let _ = out; // absent unit is fine
         let out = Command::new("launchctl")
-            .args(["bootstrap", &format!("gui/{uid}"), plist_path.to_str().unwrap_or_default()])
+            .args([
+                "bootstrap",
+                &format!("gui/{uid}"),
+                plist_path.to_str().unwrap_or_default(),
+            ])
             .output()?;
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr);
@@ -317,7 +322,10 @@ pub fn install(args: &super::cli::DaemonArgs) -> anyhow::Result<()> {
                 String::from_utf8_lossy(&out.stderr)
             );
         }
-        println!("installed + started {label} (plist {})", plist_path.display());
+        println!(
+            "installed + started {label} (plist {})",
+            plist_path.display()
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -369,15 +377,15 @@ fn home_systemd_user() -> anyhow::Result<PathBuf> {
     }
     let home = std::env::var("HOME")
         .map_err(|_| anyhow::anyhow!("HOME unset; cannot locate systemd user units"))?;
-    Ok(PathBuf::from(home).join(".config").join("systemd").join("user"))
+    Ok(PathBuf::from(home)
+        .join(".config")
+        .join("systemd")
+        .join("user"))
 }
 
 /// `uninstall`: stop + remove the unit (idempotent).
 pub fn uninstall(args: &super::cli::DaemonArgs) -> anyhow::Result<()> {
-    let state = args
-        .state_dir
-        .clone()
-        .unwrap_or_else(default_state_dir);
+    let state = args.state_dir.clone().unwrap_or_else(default_state_dir);
     let label = args.label.clone();
     #[cfg(target_os = "macos")]
     {
@@ -429,10 +437,7 @@ pub fn uninstall(args: &super::cli::DaemonArgs) -> anyhow::Result<()> {
 /// `start`: install-if-absent, then ensure running (launchctl kickstart /
 /// systemctl start / pidfile spawn).
 pub fn start(args: &super::cli::DaemonArgs) -> anyhow::Result<()> {
-    let state = args
-        .state_dir
-        .clone()
-        .unwrap_or_else(default_state_dir);
+    let state = args.state_dir.clone().unwrap_or_else(default_state_dir);
     let pidfile = state.join("toron.pid");
     let label = args.label.clone();
 
@@ -480,11 +485,15 @@ pub fn start(args: &super::cli::DaemonArgs) -> anyhow::Result<()> {
     }
     #[cfg(target_os = "linux")]
     {
-        let out = Command::new("systemctl").args(["--user", "start", &label]).output()?;
+        let out = Command::new("systemctl")
+            .args(["--user", "start", &label])
+            .output()?;
         if !out.status.success() {
             install(args)?;
         }
-        let out = Command::new("systemctl").args(["--user", "start", &label]).output()?;
+        let out = Command::new("systemctl")
+            .args(["--user", "start", &label])
+            .output()?;
         if !out.status.success() {
             anyhow::bail!(
                 "systemctl start failed: {}",
@@ -521,10 +530,7 @@ fn spawn_pidfile(state: &Path, addr: &str) -> anyhow::Result<()> {
 
 /// `stop`: bootout/systemctl stop/pidfile SIGTERM. Idempotent.
 pub fn stop(args: &super::cli::DaemonArgs) -> anyhow::Result<()> {
-    let state = args
-        .state_dir
-        .clone()
-        .unwrap_or_else(default_state_dir);
+    let state = args.state_dir.clone().unwrap_or_else(default_state_dir);
     let pidfile = state.join("toron.pid");
     let label = args.label.clone();
     #[cfg(target_os = "macos")]
@@ -557,7 +563,9 @@ pub fn stop(args: &super::cli::DaemonArgs) -> anyhow::Result<()> {
     }
     #[cfg(target_os = "linux")]
     {
-        let out = Command::new("systemctl").args(["--user", "stop", &label]).output()?;
+        let out = Command::new("systemctl")
+            .args(["--user", "stop", &label])
+            .output()?;
         if !out.status.success() {
             anyhow::bail!(
                 "systemctl stop failed: {}",
@@ -583,10 +591,7 @@ pub fn stop(args: &super::cli::DaemonArgs) -> anyhow::Result<()> {
 
 /// `status`: print the detection result.
 pub fn status(args: &super::cli::DaemonArgs) -> anyhow::Result<()> {
-    let state = args
-        .state_dir
-        .clone()
-        .unwrap_or_else(default_state_dir);
+    let state = args.state_dir.clone().unwrap_or_else(default_state_dir);
     let pidfile = state.join("toron.pid");
     match detect_state(&args.label, &pidfile, &args.addr) {
         DaemonState::RunningLaunchd => println!("running (launchd {})", args.label),
@@ -636,7 +641,10 @@ mod tests {
         assert!(xml.contains("<string>127.0.0.1:18080</string>"), "addr");
         assert!(xml.contains("<key>KeepAlive</key>"), "autostart semantics");
         assert!(xml.contains("<key>RunAtLoad</key>"), "run at load");
-        assert!(xml.contains("TORON_KEY_PASSPHRASE_FILE"), "file-based secret");
+        assert!(
+            xml.contains("TORON_KEY_PASSPHRASE_FILE"),
+            "file-based secret"
+        );
         assert!(
             !xml.contains("TORON_KEY_PASSPHRASE</key>"),
             "no inline passphrase env"
@@ -657,7 +665,9 @@ mod tests {
             Path::new("/home/x/.config/toron/passphrase"),
             Path::new("/home/x/.local/state/toron"),
         );
-        assert!(unit.contains("ExecStart=/usr/local/bin/toron serve --mcp-http 127.0.0.1:18080 --no-color"));
+        assert!(unit.contains(
+            "ExecStart=/usr/local/bin/toron serve --mcp-http 127.0.0.1:18080 --no-color"
+        ));
         assert!(unit.contains("TORON_KEY_PASSPHRASE_FILE=/home/x/.config/toron/passphrase"));
         assert!(!unit.contains("TORON_KEY_PASSPHRASE="), "no inline secret");
         assert!(unit.contains("Restart=always"));
