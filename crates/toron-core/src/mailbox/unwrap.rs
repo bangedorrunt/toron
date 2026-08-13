@@ -452,7 +452,9 @@ impl ProjectGitProjectionSink {
         let archive = Arc::new(parking_lot::Mutex::new(
             crate::archive::git::GitArchive::open_or_init(&root)?,
         ));
-        self.archives.lock().insert(slug.to_string(), archive.clone());
+        self.archives
+            .lock()
+            .insert(slug.to_string(), archive.clone());
         Ok(archive)
     }
 
@@ -729,7 +731,6 @@ impl ProjectionSink for SqliteProjectionSink {
         Ok(())
     }
 }
-
 
 /// First value of a single-letter tag (e.g. `subject`, `e`). The canonical
 /// tag-value helper (F22.SURFACE-MESSAGING, batch-fix): messaging.rs's
@@ -1388,8 +1389,7 @@ mod tests {
 
         let root = temp_archive("nip40-expired");
         let sink = Arc::new(GitProjectionSink::open(&root).expect("open"));
-        let pipeline =
-            UnwrapPipeline::new(vec![recipient], Arc::new(AutoPolicy), sink.clone());
+        let pipeline = UnwrapPipeline::new(vec![recipient], Arc::new(AutoPolicy), sink.clone());
 
         let outcome = pipeline.project(&expired).await;
         assert_ne!(
@@ -1417,8 +1417,7 @@ mod tests {
 
         let root = temp_archive("nip40-future");
         let sink = Arc::new(GitProjectionSink::open(&root).expect("open"));
-        let pipeline =
-            UnwrapPipeline::new(vec![recipient], Arc::new(AutoPolicy), sink.clone());
+        let pipeline = UnwrapPipeline::new(vec![recipient], Arc::new(AutoPolicy), sink.clone());
 
         let outcome = pipeline.project(&wrap).await;
         assert_eq!(outcome, ProjectOutcome::Projected);
@@ -1503,8 +1502,7 @@ mod tests {
     async fn nip09_delete_tombstones_projected_message() {
         use crate::index::schema;
 
-        let path = std::env::temp_dir()
-            .join(format!("nip09-{}.sqlite", uuid::Uuid::new_v4()));
+        let path = std::env::temp_dir().join(format!("nip09-{}.sqlite", uuid::Uuid::new_v4()));
         let pool = schema::connect(path.to_str().unwrap()).await.expect("pool");
         schema::migrate(&pool).await.expect("migrate");
 
@@ -1531,25 +1529,21 @@ mod tests {
         assert_eq!(pipeline.project(&wrap).await, ProjectOutcome::Projected);
 
         // NIP-09: the AUTHOR signs a kind-5 deletion referencing the message.
-        let delete = nostr_sdk::nostr::EventBuilder::new(
-            nostr_sdk::nostr::Kind::EventDeletion,
-            "",
-        )
-        .tags([nostr_sdk::nostr::Tag::event(rumor_id.clone())])
-        .sign_with_keys(&sender)
-        .expect("sign kind-5");
+        let delete = nostr_sdk::nostr::EventBuilder::new(nostr_sdk::nostr::Kind::EventDeletion, "")
+            .tags([nostr_sdk::nostr::Tag::event(rumor_id.clone())])
+            .sign_with_keys(&sender)
+            .expect("sign kind-5");
         pipeline.project(&delete).await;
 
         // Contract: the message must be tombstoned (deleted flag), NOT
         // readable. Pre-fix: the `deleted` column does not exist -> the query
         // errors -> RED.
-        let deleted: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM messages WHERE event_id = ?1 AND deleted = 1",
-        )
-        .bind(rumor_id.to_hex())
-        .fetch_one(&pool)
-        .await
-        .expect("deleted column must exist (NIP-09 tombstone support)");
+        let deleted: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE event_id = ?1 AND deleted = 1")
+                .bind(rumor_id.to_hex())
+                .fetch_one(&pool)
+                .await
+                .expect("deleted column must exist (NIP-09 tombstone support)");
         assert_eq!(
             deleted, 1,
             "author kind-5 deletion must tombstone the projected message"
@@ -1564,8 +1558,8 @@ mod tests {
     /// Same rumor-id set, same G7 order (rumor created_at), same count.
     #[tokio::test]
     async fn projection_differential_bus_git_sqlite_agree() {
-        use crate::bus::in_process::{InProcessBus, InProcessBusConfig};
         use crate::bus::Filter;
+        use crate::bus::in_process::{InProcessBus, InProcessBusConfig};
         use crate::index::schema;
 
         const N: usize = 10;
@@ -1589,8 +1583,11 @@ mod tests {
         // Same wraps → git sink pipeline.
         let git_root = temp_archive("proj-diff-git");
         let git_sink = Arc::new(GitProjectionSink::open(&git_root).expect("git sink"));
-        let git_pipeline =
-            UnwrapPipeline::new(vec![recipient.clone()], Arc::new(AutoPolicy), git_sink.clone());
+        let git_pipeline = UnwrapPipeline::new(
+            vec![recipient.clone()],
+            Arc::new(AutoPolicy),
+            git_sink.clone(),
+        );
         // Same wraps → sqlite sink pipeline.
         let sqlite_sink = SqliteProjectionSink::new(pool.clone());
         let sqlite_pipeline = UnwrapPipeline::new(
@@ -1634,7 +1631,9 @@ mod tests {
         let messages = git_root.join("messages");
         let mut stack = vec![messages.clone()];
         while let Some(dir) = stack.pop() {
-            let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
             for e in entries.flatten() {
                 let p = e.path();
                 if p.is_dir() {
@@ -1681,8 +1680,10 @@ mod tests {
     /// event_id + `rows_affected()==0` backstop).
     #[tokio::test]
     async fn sqlite_sink_double_write_single_row() {
-        let path =
-            std::env::temp_dir().join(format!("toron-sqlite-dedup-{}.sqlite", uuid::Uuid::new_v4()));
+        let path = std::env::temp_dir().join(format!(
+            "toron-sqlite-dedup-{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
         let pool = crate::index::schema::connect(path.to_str().unwrap())
             .await
             .expect("pool");
@@ -1770,10 +1771,7 @@ mod tests {
     /// `is_projected` is project-scoped (recipient → slug via the map).
     #[tokio::test]
     async fn project_git_sink_routes_by_project_and_dedups() {
-        let data_dir = std::env::temp_dir().join(format!(
-            "toron-projgit-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let data_dir = std::env::temp_dir().join(format!("toron-projgit-{}", uuid::Uuid::new_v4()));
         let recipient = keys();
         let slug = "demo";
         let projects: HashMap<String, String> =
@@ -1781,7 +1779,11 @@ mod tests {
                 .into_iter()
                 .collect();
         let sink = ProjectGitProjectionSink::for_mailbox(data_dir.clone(), projects);
-        let pipeline = UnwrapPipeline::new(vec![recipient.clone()], Arc::new(AutoPolicy), Arc::new(sink));
+        let pipeline = UnwrapPipeline::new(
+            vec![recipient.clone()],
+            Arc::new(AutoPolicy),
+            Arc::new(sink),
+        );
 
         let sender = keys();
         let wrap = wrap_for(&sender, &recipient, 1_700_000_000).await;
@@ -1841,10 +1843,7 @@ mod tests {
         let pool = schema::connect(db.to_str().unwrap()).await.expect("pool");
         schema::migrate(&pool).await.expect("migrate");
         let sqlite: Arc<dyn ProjectionSink> = Arc::new(SqliteProjectionSink::new(pool.clone()));
-        let dual = DualProjectionSink::new(
-            Arc::new(FailSink::new()),
-            sqlite.clone(),
-        );
+        let dual = DualProjectionSink::new(Arc::new(FailSink::new()), sqlite.clone());
         let res = dual.write(&mail, 1).await;
         assert!(res.is_err(), "git failure must fail the whole write");
 
@@ -1855,7 +1854,10 @@ mod tests {
         let failing_sqlite: Arc<dyn ProjectionSink> = Arc::new(FailSink::new());
         let dual2 = DualProjectionSink::new(git_ok.clone(), failing_sqlite.clone());
         let written = dual2.write(&mail, 1).await.expect("write");
-        assert!(written, "archive write counts as projected despite index failure");
+        assert!(
+            written,
+            "archive write counts as projected despite index failure"
+        );
         // is_projected = AND: git has it, sqlite (failing) reports not-projected
         // -> composite reports NOT projected, so a re-delivery heals.
         assert!(

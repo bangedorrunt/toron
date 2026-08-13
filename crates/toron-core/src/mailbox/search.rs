@@ -331,7 +331,10 @@ mod tests {
             "\"bd-adr7-residual\" starting"
         );
         assert_eq!(sanitize_fts_query("foo AND bar"), "foo AND bar");
-        assert_eq!(sanitize_fts_query("\"already-quoted\""), "\"already-quoted\"");
+        assert_eq!(
+            sanitize_fts_query("\"already-quoted\""),
+            "\"already-quoted\""
+        );
     }
 
     /// Regression: an EMPTY query is invalid FTS5 ("syntax error near """)

@@ -309,8 +309,8 @@ mod tests {
     /// latency_hist → per_tool) would deadlock and trip the bound.
     #[test]
     fn snapshot_concurrent_with_record_no_deadlock() {
-        use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
 
         let m = Arc::new(MailboxMetrics::new());
         let done = Arc::new(AtomicBool::new(false));

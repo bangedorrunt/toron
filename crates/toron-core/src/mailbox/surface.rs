@@ -10,18 +10,18 @@
 
 use async_trait::async_trait;
 
+use super::Mailbox;
 use super::build_slots::AcquireBuildSlotResult;
 use super::contacts::{ContactLink, RequestContact, RespondContact};
 use super::error::{MailError, MailErrorCode, MailSurfaceResult};
-use super::ids::MessageId;
 use super::identity::{ListAgentsOptions, RegisteredAgent, WhoIs};
+use super::ids::MessageId;
 use super::infra::{HealthReport, ProjectState};
 use super::messaging::{FetchInbox, InboxMessage, SendMessage};
 use super::product::ProductInfo;
 use super::reservations::{AcquireResult, ConflictReport, ReleaseResult, RenewResult};
 use super::search::{SearchMessage, SearchMessages, ThreadSummary};
 use super::unwrap::ContactPolicy;
-use super::Mailbox;
 use crate::index::slots::BuildSlot;
 use crate::nostr::identity::AgentProfile;
 
@@ -313,7 +313,10 @@ fn parse_rfc3339_us(ts: &str) -> Result<i64, MailError> {
 
 /// `inbox` post-projection filters (urgent / since) the mailbox's
 /// `FetchInbox` does not express (F11 / c3b.3).
-fn filter_inbox_messages(items: Vec<InboxMessage>, q: &InboxQuery) -> Result<Vec<InboxMessage>, MailError> {
+fn filter_inbox_messages(
+    items: Vec<InboxMessage>,
+    q: &InboxQuery,
+) -> Result<Vec<InboxMessage>, MailError> {
     let since_us = q.since_ts.as_deref().map(parse_rfc3339_us).transpose()?;
     Ok(items
         .into_iter()
@@ -371,8 +374,11 @@ pub trait MailSurface: Send + Sync {
     /// Approve or deny a pending contact request.
     async fn respond_contact(&self, req: &ContactResponse) -> Result<ContactLink, MailError>;
     /// List an agent's contact links.
-    async fn list_contacts(&self, project: &str, agent: &str)
-        -> Result<Vec<ContactLink>, MailError>;
+    async fn list_contacts(
+        &self,
+        project: &str,
+        agent: &str,
+    ) -> Result<Vec<ContactLink>, MailError>;
     /// Set an agent's inbound contact policy.
     async fn set_contact_policy(
         &self,
@@ -484,15 +490,12 @@ pub trait MailSurface: Send + Sync {
     /// Mark an active lease released (non-destructive). `Ok(false)` when the
     /// caller held no active lease.
     async fn slot_release(&self, project: &str, agent: &str, slot: &str)
-        -> Result<bool, MailError>;
+    -> Result<bool, MailError>;
 
     // --- products (G6) ---
     /// Idempotent product manifest (kind-30011).
-    async fn ensure_product(
-        &self,
-        product_key: &str,
-        name: &str,
-    ) -> Result<ProductInfo, MailError>;
+    async fn ensure_product(&self, product_key: &str, name: &str)
+    -> Result<ProductInfo, MailError>;
     /// Link a project into a product (idempotent).
     async fn products_link(
         &self,
@@ -691,7 +694,11 @@ impl MailSurface for ToronMailSurface {
 
     async fn search(&self, req: &SearchQuery) -> Result<Vec<MailItem>, MailError> {
         let mut inner = SearchMessages::from(req);
-        inner.since_us = req.date_start.as_deref().map(parse_rfc3339_us).transpose()?;
+        inner.since_us = req
+            .date_start
+            .as_deref()
+            .map(parse_rfc3339_us)
+            .transpose()?;
         inner.until_us = req.date_end.as_deref().map(parse_rfc3339_us).transpose()?;
         Ok(self
             .mailbox
@@ -753,10 +760,7 @@ impl MailSurface for ToronMailSurface {
     }
 
     async fn whois(&self, project: &str, agent: &str) -> Result<WhoIs, MailError> {
-        self.mailbox
-            .whois(project, agent)
-            .await
-            .map_mail_error()
+        self.mailbox.whois(project, agent).await.map_mail_error()
     }
 
     async fn health(&self) -> Result<HealthReport, MailError> {
@@ -775,7 +779,10 @@ impl MailSurface for ToronMailSurface {
         project: &str,
         profile: &AgentProfile,
     ) -> Result<RegisteredAgent, MailError> {
-        self.mailbox.register_agent(project, profile).await.map_mail_error()
+        self.mailbox
+            .register_agent(project, profile)
+            .await
+            .map_mail_error()
     }
 
     async fn reserve(
@@ -885,7 +892,12 @@ impl MailSurface for ToronMailSurface {
             .map_mail_error()
     }
 
-    async fn slot_release(&self, project: &str, agent: &str, slot: &str) -> Result<bool, MailError> {
+    async fn slot_release(
+        &self,
+        project: &str,
+        agent: &str,
+        slot: &str,
+    ) -> Result<bool, MailError> {
         self.mailbox
             .release_build_slot(project, agent, slot)
             .await
@@ -897,7 +909,10 @@ impl MailSurface for ToronMailSurface {
         product_key: &str,
         name: &str,
     ) -> Result<ProductInfo, MailError> {
-        self.mailbox.ensure_product(product_key, name).await.map_mail_error()
+        self.mailbox
+            .ensure_product(product_key, name)
+            .await
+            .map_mail_error()
     }
 
     async fn products_link(
@@ -905,7 +920,10 @@ impl MailSurface for ToronMailSurface {
         product_key: &str,
         project: &str,
     ) -> Result<ProductInfo, MailError> {
-        self.mailbox.products_link(product_key, project).await.map_mail_error()
+        self.mailbox
+            .products_link(product_key, project)
+            .await
+            .map_mail_error()
     }
 
     async fn search_product(
@@ -1025,8 +1043,10 @@ mod tests {
     const PASSPHRASE: &str = "surface-test-pass";
 
     async fn test_surface(tag: &str) -> (ToronMailSurface, std::path::PathBuf, std::path::PathBuf) {
-        let db_path =
-            std::env::temp_dir().join(format!("toron-surface-{tag}-{}.sqlite", uuid::Uuid::new_v4()));
+        let db_path = std::env::temp_dir().join(format!(
+            "toron-surface-{tag}-{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
         let pool = schema::connect(db_path.to_str().unwrap())
             .await
             .expect("connect");
@@ -1034,8 +1054,8 @@ mod tests {
         let bus = InProcessBus::open(pool.clone(), InProcessBusConfig::default())
             .await
             .expect("bus");
-        let data_dir = std::env::temp_dir()
-            .join(format!("toron-surface-data-{tag}-{}", uuid::Uuid::new_v4()));
+        let data_dir =
+            std::env::temp_dir().join(format!("toron-surface-data-{tag}-{}", uuid::Uuid::new_v4()));
         let operator = crate::keys::generate();
         let mailbox = Mailbox::new(Arc::new(bus), data_dir.clone(), Some(operator))
             .with_agent_passphrase(PASSPHRASE)
@@ -1258,12 +1278,7 @@ mod tests {
 
         // Renew: only the docs lease.
         let renewed = surface
-            .renew_reservations(
-                "demo",
-                "GreenCastle",
-                &["docs/*.md".to_string()],
-                60,
-            )
+            .renew_reservations("demo", "GreenCastle", &["docs/*.md".to_string()], 60)
             .await
             .expect("renew");
         // bd-evqs renewal cap: a fresh lease (remaining TTL ≈ 3600s) is NOT
@@ -1343,7 +1358,14 @@ mod tests {
         let (surface, db_path, data_dir) = test_surface("frc").await;
         register_agent(&surface, "demo", "GreenCastle").await;
         let ok = surface
-            .reserve("demo", "GreenCastle", &["src/**".to_string()], Some(3600), true, None)
+            .reserve(
+                "demo",
+                "GreenCastle",
+                &["src/**".to_string()],
+                Some(3600),
+                true,
+                None,
+            )
             .await
             .expect("reserve");
         let err = surface
@@ -1404,7 +1426,10 @@ mod tests {
             .products_link("acme", "alpha")
             .await
             .expect("link alpha");
-        let _ = surface.products_link("acme", "beta").await.expect("link beta");
+        let _ = surface
+            .products_link("acme", "beta")
+            .await
+            .expect("link beta");
         assert_eq!(linked.member_projects.len(), 1);
 
         surface

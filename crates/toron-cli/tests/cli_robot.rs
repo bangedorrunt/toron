@@ -141,14 +141,12 @@ fn cross_process_binary_send_binary_receive() {
             "binary B inbox must exit 0, stderr: {}",
             String::from_utf8_lossy(&out.stderr)
         );
-        let value: Value =
-            serde_json::from_slice(&out.stdout).expect("inbox must emit valid JSON");
+        let value: Value = serde_json::from_slice(&out.stdout).expect("inbox must emit valid JSON");
         let found = value
             .as_array()
             .map(|arr| {
-                arr.iter().any(|m| {
-                    m.get("subject").and_then(|s| s.as_str()) == Some(marker.as_str())
-                })
+                arr.iter()
+                    .any(|m| m.get("subject").and_then(|s| s.as_str()) == Some(marker.as_str()))
             })
             .unwrap_or(false);
         if found {
@@ -205,8 +203,7 @@ fn cross_process_mail_content_shares_durable_root() {
 
         // 2. Wait for the projection/bus store to catch up (async unwrap
         //    loop) before shelling out — bounded, then fail with context.
-        let deadline =
-            std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
             let inbox = mailbox
                 .fetch_inbox(&toron_core::mailbox::messaging::FetchInbox {
@@ -251,9 +248,8 @@ fn cross_process_mail_content_shares_durable_root() {
     let found = value
         .as_array()
         .map(|arr| {
-            arr.iter().any(|m| {
-                m.get("subject").and_then(|s| s.as_str()) == Some(marker.as_str())
-            })
+            arr.iter()
+                .any(|m| m.get("subject").and_then(|s| s.as_str()) == Some(marker.as_str()))
         })
         .unwrap_or(false);
     assert!(

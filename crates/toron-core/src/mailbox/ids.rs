@@ -98,7 +98,10 @@ mod tests {
         let id: MessageId = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
             .parse()
             .expect("hex id parses");
-        assert_eq!(id.as_str(), "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789");
+        assert_eq!(
+            id.as_str(),
+            "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+        );
     }
 
     #[test]

@@ -78,12 +78,21 @@ pub fn run(file: &PathBuf, trigger: &str) -> Result<i32> {
         .context("build runtime")?;
     let output = rt.block_on(async {
         let engine = WorkflowEngine::local(runner.clone()).context("engine")?;
-        let run_id = format!("cli-{}", std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0));
+        let run_id = format!(
+            "cli-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
         engine
-            .run(&run_id, RunInput { workflow, trigger: trigger_value })
+            .run(
+                &run_id,
+                RunInput {
+                    workflow,
+                    trigger: trigger_value,
+                },
+            )
             .await
     })?;
     print_json(&output);
@@ -102,10 +111,13 @@ pub fn invoke(file: &PathBuf, inputs: &str) -> Result<i32> {
         .context("build runtime")?;
     let output = rt.block_on(async {
         let engine = WorkflowEngine::local(runner.clone()).context("engine")?;
-        let run_id = format!("cli-invoke-{}", std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0));
+        let run_id = format!(
+            "cli-invoke-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
         engine.invoke(&run_id, workflow, inputs_value).await
     })?;
     print_json(&output);
@@ -133,7 +145,8 @@ pub fn dry_run(file: &PathBuf, _trigger: &str) -> Result<i32> {
 /// Load + lint a workflow file (the gate before any run).
 fn load(file: &PathBuf) -> Result<toron_workflow::schema::Workflow> {
     let yaml = fs::read_to_string(file).with_context(|| format!("read {}", file.display()))?;
-    let report = toron_workflow::lint_yaml(&yaml).map_err(|e| anyhow::anyhow!("parse error: {e}"))?;
+    let report =
+        toron_workflow::lint_yaml(&yaml).map_err(|e| anyhow::anyhow!("parse error: {e}"))?;
     if report
         .issues
         .iter()
@@ -146,5 +159,8 @@ fn load(file: &PathBuf) -> Result<toron_workflow::schema::Workflow> {
 
 /// Print a JSON value to stdout (respecting `--json` conventions).
 fn print_json(value: &serde_json::Value) {
-    println!("{}", serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string()));
+    println!(
+        "{}",
+        serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
+    );
 }

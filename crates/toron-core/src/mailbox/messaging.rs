@@ -1202,7 +1202,9 @@ mod tests {
             "read_ts_us exposed on the read row"
         );
         assert!(
-            all.iter().filter(|m| m.id != message_id).all(|m| m.read_ts_us.is_none()),
+            all.iter()
+                .filter(|m| m.id != message_id)
+                .all(|m| m.read_ts_us.is_none()),
             "other rows stay unread"
         );
 
