@@ -9,6 +9,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **ADR-0012 — Standalone Cron Type (`bd-25g7`, 2026-08-11)** — cron is a FIRST-CLASS
+  scheduled primitive DISTINCT from workflow (NOT a workflow-with-schedule-trigger). `CronSpec`
+  (schedule + owner + scope + mode + `CronSpecPolicy` + a steps body composing workflows via
+  `call_workflow`), `parse_cron`, `lint_cron`/`cron_lint_yaml` (distinct from workflow lint), and
+  the engine cron path: a `CronManager` over `CronSpecRegistration`s, each a Resonate
+  `ctx.sleep` durable-sleep loop firing the body as a durable child (`run_cron_tick`), with
+  `catchup: latest` on wake. One engine, two input types (workflow + cron). Amends ADR-0005
+  Spec 3.
+- **ADR-0011 — Coalition Orchestration (toron-core substrate, `bd-foh8`, 2026-08-10)** — file
+  reservations gain a `status: intent→held→released` tier (30031 state machine; status-less =
+  held backward-compat). The conflict check splits HARD (held → block) vs SOFT (in-TTL intent →
+  freeze+propose, NOT a hard block); `declare_intent` + intent TTL + must-convert (anti-griefing).
+  Request-release negotiation + escalation. The atomic conflict-check floor is NEVER removed.
+  Substrate for flywheel coalitions (NIP-29 channel + goal run).
+- **ADR-0010 — Execution Wiring (engine surface, 2026-08-09/10)** — value-returning actions +
+  `on_error: fail_run` (kind-46012 `status=failed`), the real-runner subprocess-reuse dispatch,
+  headless (`harness -p --mode=json` + `runs/<run_id>.jsonl`) vs pane execution modes,
+  `--execute`, the model registry (`models.toml` + per-harness injection + retry-on-429
+  fallback), and per-step harness override.
+
+### Fixed
+
+- **Reservation replay-window truncation (P0, commit bd97afb, 2026-08-10)** — `BusEventStore`
+  applied the SQL LIMIT (default 1000, ASC) to the raw scan BEFORE the kind filter, so with
+  >1000 events the newest reservations were invisible to the conflict check → two distinct
+  agents could hold the same exclusive path. Kind filter pushed into SQL. Verified live: a
+  cross-agent acquire of a held path now hard-blocks.
+
 - **P4.4 cron failure policy (ADR-0005 Spec 3, `bd-p4-bead-on-fail-0uaf`,
   toron-workflow)** — the DECISION layer of bead-on-failure + repeat-failure
   escalate. `cron_failure.rs`: pure `evaluate` (on_failure / on_repeat_failure
