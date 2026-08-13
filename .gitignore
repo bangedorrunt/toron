@@ -4,3 +4,9 @@
 .bv/
 proptest-regressions/
 /.archive.lock
+
+# Resonate / projection noise — durable store is XDG, not this repo
+resonate.db
+resonate.db-shm
+resonate.db-wal
+.audit/

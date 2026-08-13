@@ -1,4 +1,4 @@
-// governed-by: ADR-0003
+// governed-by: ADR-0003, ADR-0007
 #![forbid(unsafe_code)]
 
 // bd-led.4.3: Git archive projection (AM-Rust layout), async commit
@@ -106,6 +106,61 @@ impl CommitCoalescer {
     }
 }
 
+/// Paths the archive is allowed to put in a commit. Anything else is a
+/// source-tree path — committing it from a long-lived daemon handle is how
+/// `c9dd670` reverted ADR-0012 (stale libgit2 index written as HEAD).
+fn is_archive_rel(rel: &Path) -> bool {
+    let s = rel.to_string_lossy().replace('\\', "/");
+    const PREFIXES: &[&str] = &[
+        "messages/",
+        ".projected/",
+        ".audit/",
+        "agents/",
+        "file_reservations/",
+        "build_slots/",
+        "blobs/",
+    ];
+    PREFIXES
+        .iter()
+        .any(|p| s == p.trim_end_matches('/') || s.starts_with(p))
+}
+
+/// Build a tree = current HEAD (fresh peel, not a cached index) + `files`.
+/// Uses an in-memory index so the on-disk `.git/index` is never overwritten.
+fn tree_from_head_plus(
+    repo: &git2::Repository,
+    files: &[(PathBuf, Vec<u8>)],
+) -> anyhow::Result<git2::Oid> {
+    let mut index = git2::Index::new()?;
+    if let Ok(head) = repo.head() {
+        if let Ok(commit) = head.peel_to_commit() {
+            index.read_tree(&commit.tree()?)?;
+        }
+    }
+    for (rel, content) in files {
+        let blob = repo.blob(content)?;
+        let path = rel.to_string_lossy().replace('\\', "/");
+        let path_bytes = path.into_bytes();
+        let flags = u16::try_from(path_bytes.len().min(0xFFF)).unwrap_or(0xFFF);
+        let entry = git2::IndexEntry {
+            ctime: git2::IndexTime::new(0, 0),
+            mtime: git2::IndexTime::new(0, 0),
+            dev: 0,
+            ino: 0,
+            mode: 0o100_644,
+            uid: 0,
+            gid: 0,
+            file_size: u32::try_from(content.len()).unwrap_or(u32::MAX),
+            id: blob,
+            flags,
+            flags_extended: 0,
+            path: path_bytes,
+        };
+        index.add(&entry)?;
+    }
+    Ok(index.write_tree_to(repo)?)
+}
+
 /// libgit2-backed archive for one project. All writes are file-staged then
 /// committed; callers batch stages and let the coalescer emit one commit.
 pub struct GitArchive {
@@ -114,6 +169,9 @@ pub struct GitArchive {
     /// Process-level writer gate (mirrors `.archive.lock` single-writer).
     _writer: Mutex<()>,
     git_binary: Option<PathBuf>,
+    /// Files staged since the last successful commit. Never the repo index —
+    /// that index goes stale when a human commits on another handle.
+    pending: Mutex<Vec<(PathBuf, Vec<u8>)>>,
 }
 
 impl GitArchive {
@@ -143,6 +201,7 @@ impl GitArchive {
             project_root: root.to_path_buf(),
             _writer: Mutex::new(()),
             git_binary,
+            pending: Mutex::new(Vec::new()),
         })
     }
     pub fn project_root(&self) -> &Path {
@@ -153,43 +212,59 @@ impl GitArchive {
         self.git_binary.as_deref()
     }
 
-    /// Stage a file into the archive index. The file is written first so the
-    /// worktree is the source of truth for audits; the index records intent.
+    /// Stage a file for the next archive commit. The file is written first so
+    /// the worktree is the source of truth for audits. The repo index is NOT
+    /// touched — a long-lived daemon's index is stale after external commits.
     pub fn stage_file(&self, rel: &Path, content: &[u8]) -> anyhow::Result<()> {
+        if !is_archive_rel(rel) {
+            anyhow::bail!(
+                "archive refuses to stage non-archive path {}",
+                rel.display()
+            );
+        }
         let abs = self.project_root.join(rel);
         if let Some(parent) = abs.parent() {
             std::fs::create_dir_all(parent)?;
         }
         std::fs::write(&abs, content)?;
-
-        let mut index = self.repo.index()?;
-        index.add_path(rel)?;
-        index.write()?;
+        self.pending.lock().push((rel.to_path_buf(), content.to_vec()));
         Ok(())
     }
 
-    /// Commit every staged change with one commit. Returns the new commit id.
+    /// Commit pending archive files onto current HEAD. Never writes the
+    /// on-disk index; the new tree is HEAD + pending paths only.
     pub fn commit(&self, message: &str) -> anyhow::Result<git2::Oid> {
-        let mut index = self.repo.index()?;
-        if index.is_empty() {
-            // Nothing staged — skip (no-op) so coalescer idles quietly.
+        let files = std::mem::take(&mut *self.pending.lock());
+        if files.is_empty() {
             return Err(anyhow::anyhow!("no staged changes"));
         }
-        let tree_id = index.write_tree()?;
+        match self.commit_pending(message, &files) {
+            Ok(oid) => Ok(oid),
+            Err(e) => {
+                self.pending.lock().splice(0..0, files);
+                Err(e)
+            }
+        }
+    }
+
+    fn commit_pending(
+        &self,
+        message: &str,
+        files: &[(PathBuf, Vec<u8>)],
+    ) -> anyhow::Result<git2::Oid> {
+        let tree_id = tree_from_head_plus(&self.repo, files)?;
         let tree = self.repo.find_tree(tree_id)?;
         let sig = self.repo.signature()?;
-
         let parent = self.repo.head().ok().and_then(|h| h.peel_to_commit().ok());
         let parent_refs: Vec<&git2::Commit> = parent.iter().collect();
-        let oid = self.repo.commit(
+        Ok(self.repo.commit(
             Some("HEAD"),
             &sig,
             &sig,
             message,
             &tree,
             parent_refs.as_slice(),
-        )?;
-        Ok(oid)
+        )?)
     }
 
     /// Commit via the configured git binary (subprocess path; honored when
@@ -356,6 +431,68 @@ mod tests {
         );
 
         handle.abort();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn commit_tree(
+        repo: &git2::Repository,
+        message: &str,
+        paths: &[&str],
+        parents: &[&git2::Commit<'_>],
+    ) -> git2::Oid {
+        let mut index = repo.index().unwrap();
+        for p in paths {
+            index.add_path(Path::new(p)).unwrap();
+        }
+        index.write().unwrap();
+        let tree_id = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        let sig = repo.signature().unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, message, &tree, parents)
+            .unwrap()
+    }
+
+    #[test]
+    fn archive_commit_must_not_revert_external_source_commits() {
+        // Daemon holds one GitArchive for process life. After it has committed
+        // once (index cached), a human commits source on another handle.
+        // Next archive commit MUST keep that source (c9dd670 class).
+        let root = temp_root("stale-idx");
+        let archive = GitArchive::open_or_init(&root).expect("init");
+        std::fs::write(root.join("cron.rs"), b"v1").unwrap();
+        {
+            let repo = git2::Repository::open(&root).unwrap();
+            commit_tree(&repo, "source v1", &["cron.rs"], &[]);
+        }
+
+        archive
+            .stage_file(Path::new("messages/2026/08/evt0.json"), br#"{"k":0}"#)
+            .unwrap();
+        archive.commit("project message evt0").unwrap();
+
+        std::fs::write(root.join("cron.rs"), b"v2-human").unwrap();
+        {
+            let repo = git2::Repository::open(&root).unwrap();
+            let parent = repo.head().unwrap().peel_to_commit().unwrap();
+            commit_tree(&repo, "source v2", &["cron.rs"], &[&parent]);
+        }
+
+        archive
+            .stage_file(Path::new("messages/2026/08/evt.json"), br#"{"k":1}"#)
+            .unwrap();
+        archive.commit("project message evt").unwrap();
+
+        let repo = git2::Repository::open(&root).unwrap();
+        let tree = repo.head().unwrap().peel_to_tree().unwrap();
+        let cron = tree.get_path(Path::new("cron.rs")).unwrap();
+        let blob = repo.find_blob(cron.id()).unwrap();
+        assert_eq!(
+            blob.content(),
+            b"v2-human",
+            "archive commit must not revert an external source commit"
+        );
+        tree.get_path(Path::new("messages/2026/08/evt.json"))
+            .expect("archive file in HEAD");
         let _ = std::fs::remove_dir_all(root);
     }
 
