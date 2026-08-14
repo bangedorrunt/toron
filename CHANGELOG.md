@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **ADR-0014 — Kind Registry Specification (2026-08-14)** — formalizes all 12 custom
+  Nostr kinds (fields, d-tag semantics, lifecycle states, `status:` field on 30031,
+  @mention `p` tag convention, job lifecycle 43001-43006, approval kinds 46011/46012).
+  Documents the process for adding/deprecating kinds. Amends ADR-0003.
+- **ADR-0015 — Flywheel ↔ Toron Integration Contract (2026-08-14)** — formalizes the
+  boundary: flywheel guarantees (one-way dep, single mail surface, `MessageId` String,
+  single herdr client), toron guarantees (`MailSurface` superset, atomic reservations,
+  crash-survivable workflows, durable root, addressable dedup, bounded @mention), what
+  each side must NOT assume, and the versioning process.
+- **Skill updates (2026-08-14)** — tool count 38→39 (38 AM-Rust parity + 1 toron additive
+  `release_file_reservations_by_reason`). Skill version 0.2.0→0.3.0. Added 3 reference docs
+  (mcp-surface, workflow-engine, daemon-ops). Added CLI table entries for `workflow`, `status`,
+  `config`, `metrics`, `tui`, `doctor reconstruct`.
 ### Added
 
 - **ADR-0012 — Standalone Cron Type (`bd-25g7`, 2026-08-11)** — cron is a FIRST-CLASS

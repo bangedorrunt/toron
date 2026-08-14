@@ -1,6 +1,6 @@
 # toron
 
-Nostr-native agent mailbox. 38 MCP tools + 25 resources on Schnorr identity,
+Nostr-native agent mailbox. 39 MCP tools + 25 resources on Schnorr identity,
 NIP-17 gift-wrap, NIP-29 channels. Flywheel embeds this; never the reverse.
 
 **Generated:** 2026-08-13
@@ -49,12 +49,24 @@ Child maps: [toron-core](crates/toron-core/AGENTS.md) ·
 - Edition 2024. `#![forbid(unsafe_code)]` on every crate root.
 - New/changed ADR-constrained files: `// governed-by: ADR-XXXX` at top.
 - Deps one-way: **flywheel → toron-workflow → toron-core**. Never reverse.
-- Frozen: 38 tool names, 25 resources, kind registry. No new kinds/tools without an ADR.
+- Frozen: 39 tool names (38 AM-Rust parity + 1 toron additive), 25 resources, kind registry. No new kinds/tools without an ADR.
 - `MessageId` is String/hex. Never `u64` in shared request/response types.
 - `t` tag = project slug only. Never harness/model/job tags.
 - TDD for new features and bug fixes. No benches in this repo.
 - Beads: `br` CLI + `--json`. No beads MCP. Binary is `br`, never `bd`.
 - `std::env::set_var` only in integration tests that omit `forbid(unsafe_code)`.
+
+## Skill Sync Contract
+
+When you add/remove/rename a CLI command or MCP tool, update ALL of:
+1. The `Command` enum (`crates/toron-cli/src/cli.rs`) — ground truth (compiles).
+2. The tool `#[tool(name = "...")]` in `crates/toron-mcp/src/tools/` — MCP surface.
+3. This AGENTS.md (STRUCTURE + CONVENTIONS sections).
+4. The skill: `~/.agents/skills/toron/SKILL.md` CLI Surface + MCP Parity Surface.
+5. The tool-count constant (AGENTS.md header + SKILL.md frontmatter).
+
+The skill files are the canonical agent-facing reference. A command/tool not in
+the skill is invisible to any agent that triggers the skill.
 
 ## ANTI-PATTERNS (THIS PROJECT)
 
