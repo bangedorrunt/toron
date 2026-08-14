@@ -125,6 +125,9 @@ pub struct InboxMessageOut {
     /// Read receipt timestamp (i64-µs) from the `message_reads` projection;
     /// `null` = unread (bd-5icg).
     pub read_ts_us: Option<i64>,
+    /// S5 (bd-dup-assign-collapse-ws21): the first id of the duplicate group
+    /// this row survives for; `null` = standalone message.
+    pub duplicate_of: Option<String>,
 }
 
 /// `acknowledge_message` / `mark_message_read`.

@@ -96,7 +96,7 @@
       "name": "workflow"
     }
   ],
-  "generated_at": "2026-08-14T21:17:20Z",
+  "generated_at": "2026-08-14T21:27:45Z",
   "resources": [
     {
       "description": "List projects known to toron.",
@@ -1185,6 +1185,13 @@
               "created_ts_us": {
                 "format": "int64",
                 "type": "integer"
+              },
+              "duplicate_of": {
+                "description": "S5 (bd-dup-assign-collapse-ws21): the first id of the duplicate group\nthis row survives for; `null` = standalone message.",
+                "type": [
+                  "string",
+                  "null"
+                ]
               },
               "id": {
                 "type": "string"

@@ -15,6 +15,30 @@ pub const FTS5_PREFIX: &str = "2 3";
 /// Embedded migrations, relative to toron-core CARGO_MANIFEST_DIR.
 pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
+/// The `created_ts_us` unit contract (S3 / bd-ts-unit-audit-pmn5): every
+/// `*_ts_us` column is int-microseconds (ADR G7). Values below 1e12 µs
+/// (≈ 2001-09-09) are implausible for post-2001 mail and are treated as
+/// seconds-scale — the audit normalizes them to µs.
+///
+/// Mirrors migration 0005; kept as a runtime hook so the audit test can
+/// exercise the scale fix without re-running the embedded migration.
+pub const TS_US_SCALE_SECONDS_THRESHOLD: i64 = 1_000_000_000_000; // 1e12 µs
+
+/// Normalize any `messages.created_ts_us` rows whose scale is implausible
+/// (seconds in a µs field, per [`TS_US_SCALE_SECONDS_THRESHOLD`]). Idempotent.
+/// Returns the number of rows scaled.
+pub async fn normalize_created_ts_scale(pool: &SqlitePool) -> anyhow::Result<u64> {
+    let res = sqlx::query(
+        "UPDATE messages \
+         SET created_ts_us = created_ts_us * 1000000 \
+         WHERE created_ts_us > 0 AND created_ts_us < ?",
+    )
+    .bind(TS_US_SCALE_SECONDS_THRESHOLD)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected())
+}
+
 /// Open a SQLite pool with WAL + busy timeout (ADR: dedicated write conn,
 /// WAL pragmas; small read pool).
 pub async fn connect(db_path: &str) -> anyhow::Result<SqlitePool> {
@@ -274,6 +298,56 @@ mod tests {
         .unwrap();
         let names: Vec<String> = cols.iter().map(|r| r.get::<String, _>("name")).collect();
         assert_eq!(names, ["created_ts_us", "local_seq"]);
+
+        drop(pool);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// S3 audit (bd-ts-unit-audit-pmn5): old-era rows may carry SECONDS in
+    /// the µs `created_ts_us` field (e.g. 1786508238 instead of
+    /// 1786508238000000). The audit normalizes any value below 1e12 µs
+    /// (≈ 2001-09-09 — implausible for post-2001 mail) to µs scale, and the
+    /// migration does the same at upgrade time.
+    #[tokio::test]
+    async fn created_ts_us_scale_audit_normalizes_seconds_rows() {
+        let (pool, path) = temp_pool("scale").await;
+        migrate(&pool).await.expect("migrations apply");
+
+        // Seconds-scale row (the reported 2026-08 era value).
+        insert_msg(&pool, "e_sec", "old", "seconds scale", 1_786_508_238, 1).await;
+        // Already-correct µs row must be untouched.
+        insert_msg(&pool, "e_us", "new", "us scale", 1_786_509_672_000_000, 2).await;
+
+        // Audit query: flag rows whose scale is implausible (< 1e12).
+        let bad: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM messages WHERE created_ts_us > 0 AND created_ts_us < ?",
+        )
+        .bind(TS_US_SCALE_SECONDS_THRESHOLD)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(bad, 1, "exactly the seconds-scale row is flagged");
+
+        // Migration path (also exercised at upgrade): normalize in place.
+        let scaled = normalize_created_ts_scale(&pool).await.expect("normalize");
+        assert_eq!(scaled, 1, "one row scaled");
+
+        let ts: i64 = sqlx::query_scalar("SELECT created_ts_us FROM messages WHERE event_id = ?")
+            .bind("e_sec")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(ts, 1_786_508_238_000_000, "seconds scaled to µs");
+        let ts2: i64 = sqlx::query_scalar("SELECT created_ts_us FROM messages WHERE event_id = ?")
+            .bind("e_us")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(ts2, 1_786_509_672_000_000, "µs row untouched");
+
+        // Idempotent: second run scales nothing.
+        let again = normalize_created_ts_scale(&pool).await.expect("normalize again");
+        assert_eq!(again, 0, "idempotent");
 
         drop(pool);
         let _ = std::fs::remove_file(path);

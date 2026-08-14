@@ -23,6 +23,7 @@
 |---|---|---|
 | Agent identity | `npub` (Schnorr pubkey hex) + `key_path` + `profile_event_id` | integer `id` + `registration_token` (no npub) |
 | Timestamps | `*_ts_us` (int microseconds) or `created` (epoch) | ISO-8601 strings (`inception_ts`, `last_active_ts`, `created_at`) |
+| Timestamp unit (pinned) | `created_ts_us` is int-**microseconds** (ADR G7, `rumor.created_at*1e6 + ts_ms`). `since_ts`/`date_start` take RFC3339 strings parsed to µs; malformed = hard `Malformed` error, never silent. Seconds-scale legacy rows are normalized by migration 0004 + `normalize_created_ts_scale` (S3, bd-ts-unit-audit-pmn5). | ISO-8601; AM has no unit ambiguity | DO NOT change: `since_ts` semantics pinned by `inbox_since_ts_rfc3339_conformance`; scale pinned by `created_ts_us_scale_audit_normalizes_seconds_rows` |
 | Profile event | kind-30013 on the bus (crypto-signed) | sqlite `agents` row |
 | Naming policy | arbitrary names accepted (MORE permissive) | enforces adjective+noun (rejects `PiAmA`) |
 

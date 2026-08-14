@@ -1675,6 +1675,131 @@ mod tests {
         let _ = std::fs::remove_file(&db);
     }
 
+    /// S4 (bd-indexer-coverage-dp9t): every production write path to
+    /// `messages` must be FTS-findable. Write-path inventory:
+    ///
+    /// 1. live projection — unwrap loop → SqliteProjectionSink
+    ///    (`INSERT INTO messages`, unwrap.rs:690)
+    /// 2. recovery/replay — `rebuild::insert_record` (Git rebuild G11 path 1
+    ///    + bus-replay sink G11 path 2, `INSERT OR IGNORE`)
+    ///
+    /// `messages_fts` is an external-content FTS5 table kept in sync by
+    /// AFTER INSERT triggers (0001_schema.sql), so every `messages` insert is
+    /// index-visible — this test pins that per path with a unique token.
+    #[tokio::test]
+    async fn every_write_path_is_fts_visible() {
+        use crate::bus::in_process::{InProcessBus, InProcessBusConfig};
+        use crate::index::schema;
+        use crate::index::writer::IndexWriter;
+        use crate::index::rebuild::{insert_record, MailRecord};
+        use crate::mailbox::Mailbox;
+
+        let db = std::env::temp_dir().join(format!("fts-coverage-{}.sqlite", uuid::Uuid::new_v4()));
+        let pool = schema::connect(db.to_str().unwrap()).await.expect("pool");
+        schema::migrate(&pool).await.expect("migrate");
+        let bus = InProcessBus::open(pool.clone(), InProcessBusConfig::default())
+            .await
+            .expect("bus");
+        let data_dir = std::env::temp_dir().join(format!(
+            "fts-coverage-data-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let operator = crate::keys::generate();
+        let mailbox = Mailbox::new(Arc::new(bus), data_dir.clone(), Some(operator))
+            .with_index_pool(pool.clone())
+            .with_agent_passphrase("fts-coverage-pass");
+        mailbox.spawn_unwrap_loop();
+
+        // Path 1 — live projection: a real send through the bus + unwrap
+        // loop lands in messages and the FTS index.
+        mailbox
+            .register_agent(
+                "demo",
+                &crate::nostr::identity::AgentProfile {
+                    name: "GreenCastle".into(),
+                    program: Some("opencode".into()),
+                    model: None,
+                    persona: None,
+                    task_description: None,
+                },
+            )
+            .await
+            .expect("register sender");
+        mailbox
+            .register_agent(
+                "demo",
+                &crate::nostr::identity::AgentProfile {
+                    name: "BlueLake".into(),
+                    program: Some("opencode".into()),
+                    model: None,
+                    persona: None,
+                    task_description: None,
+                },
+            )
+            .await
+            .expect("register recipient");
+        mailbox
+            .send_message(&crate::mailbox::SendMessage {
+                project_slug: "demo".into(),
+                sender_name: "GreenCastle".into(),
+                to: vec!["BlueLake".into()],
+                subject: "live-path".into(),
+                body_md: "fts-coverage-token-live".into(),
+                ..Default::default()
+            })
+            .await
+            .expect("send live");
+
+        // Path 2 — recovery/replay: insert_record (shared by Git rebuild +
+        // bus replay) with its own unique token.
+        let writer = IndexWriter::new(pool.clone(), pool.clone());
+        insert_record(
+            &writer,
+            &MailRecord {
+                event_id: "replay-evt-1".into(),
+                project_slug: "demo".into(),
+                sender: "ReplaySender".into(),
+                sender_pubkey: "replaypubkey".into(),
+                subject: "replay-path".into(),
+                body: "fts-coverage-token-replay".into(),
+                importance: "normal".into(),
+                ack_required: false,
+                thread_id: None,
+                reply_to: None,
+                to_list: vec!["BlueLake".into()],
+                cc_list: vec![],
+                created_ts_us: 1_700_000_000_500_000,
+                local_seq: 7,
+            },
+        )
+        .await
+        .expect("insert_record");
+
+        // Both tokens must be findable through the real search surface.
+        for token in ["fts-coverage-token-live", "fts-coverage-token-replay"] {
+            let mut found = false;
+            for _ in 0..200 {
+                let hits = mailbox
+                    .search_messages(&crate::mailbox::SearchMessages {
+                        project_key: "demo".into(),
+                        query: token.into(),
+                        ..Default::default()
+                    })
+                    .await
+                    .expect("search");
+                if !hits.is_empty() {
+                    found = true;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+            assert!(found, "token {token} must be FTS-findable");
+        }
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+        let _ = std::fs::remove_file(&db);
+    }
+
     /// P3 (bd-p3-replay-dedup-per-sink-nve6): the SQLite sink is idempotent —
     /// the same mail written twice produces ONE row (in-mem set + UNIQUE
     /// event_id + `rows_affected()==0` backstop).
