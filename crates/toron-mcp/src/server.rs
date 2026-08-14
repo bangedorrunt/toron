@@ -1,4 +1,5 @@
 // governed-by: ADR-0003
+// governed-by: ADR-0017 (project-root canonicalization)
 #![forbid(unsafe_code)]
 
 use std::sync::Arc;
@@ -306,6 +307,10 @@ async fn build_mailbox(
 
     let pool = toron_core::index::schema::connect(db.to_str().unwrap()).await?;
     toron_core::index::schema::migrate(&pool).await?;
+    // ADR-0017 (toron.dev ADR-0017 D3): fold pre-existing path-slug project
+    // roots into the alias table on open — legacy rows stay visible
+    // read-only through every spelling of the project key.
+    toron_core::mailbox::aliases::reconcile_aliases(&pool, &data_dir).await?;
     let bus = toron_core::bus::InProcessBus::open(pool.clone(), Default::default()).await?;
     let mut mailbox = Mailbox::new(Arc::new(bus), data_dir, operator).with_index_pool(pool);
     if let Some(tx) = trigger_tx {

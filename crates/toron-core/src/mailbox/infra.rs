@@ -1,4 +1,5 @@
 // governed-by: ADR-0003
+// governed-by: ADR-0017 (project-root canonicalization)
 #![forbid(unsafe_code)]
 
 //! Infrastructure cluster (bd-led.5.1): `health_check`, `ensure_project`,
@@ -87,7 +88,13 @@ impl Mailbox {
     /// (manifest already present) it is a no-op: it re-reads the stored
     /// manifest and returns `created: false` — AM-Rust "idempotent
     /// bootstrapping" parity (ADR-0003 Invariants).
+    ///
+    /// ADR-0017: the key is canonicalized first — a path-form key
+    /// (`/Users/.../workspace/toron`) resolves to the canonical short slug
+    /// (`toron`) and persists an alias row, so every spelling of a project
+    /// lands in ONE root (dir, manifest `d`-tag, scoping tags).
     pub async fn ensure_project(&self, slug: &str) -> anyhow::Result<ProjectState> {
+        let slug = &self.canonical_project(slug).await; // ADR-0017: one root per project
         std::fs::create_dir_all(self.data_dir.join(slug))?;
 
         let existing = self

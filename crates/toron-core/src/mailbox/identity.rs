@@ -1,4 +1,5 @@
 // governed-by: ADR-0003
+// governed-by: ADR-0017 (project-root canonicalization)
 #![forbid(unsafe_code)]
 
 //! Identity cluster (bd-led.5.2): register_agent, create_agent_identity,
@@ -76,7 +77,8 @@ impl Mailbox {
         project_slug: &str,
         profile: &AgentProfile,
     ) -> anyhow::Result<RegisteredAgent> {
-        let key_path = self.agent_key_path(project_slug, &profile.name);
+        let project_slug = &self.canonical_project(project_slug).await; // ADR-0017
+        let key_path = self.agent_key_path(&project_slug, &profile.name);
         if key_path.exists() {
             anyhow::bail!(
                 "create_agent_identity refused: an identity for '{name}' already exists in project '{project_slug}' (use register_agent to upsert)",
@@ -93,14 +95,24 @@ impl Mailbox {
     /// `register_agent`: upsert on the EXISTING agent key (G1), or create a
     /// fresh keypair if absent. Idempotent — re-registering returns the same
     /// npub with a new profile event.
+    ///
+    /// ADR-0017: the project key is canonicalized first, so registering via
+    /// any spelling of the project (short slug or path form) upserts the ONE
+    /// canonical row — no duplicate agent rows, one key file.
     pub async fn register_agent(
         &self,
         project_slug: &str,
         profile: &AgentProfile,
     ) -> anyhow::Result<RegisteredAgent> {
+        let project_slug = &self.canonical_project(project_slug).await; // ADR-0017
         // Existing local key? (ncryptsec at agents/{name}/key.ncryptsec)
-        let key_path = self.agent_key_path(project_slug, &profile.name);
-        let existing = self.load_agent_key(&key_path);
+        // ADR-0017 migration: a pre-canonicalization key under an alternate
+        // (path-slug) root is adopted — re-registering under the canonical
+        // slug REUSES the legacy identity instead of minting a second one.
+        let key_path = self.agent_key_path(&project_slug, &profile.name);
+        let existing = self
+            .load_agent_key(&key_path)
+            .or_else(|| self.alt_agent_key(&project_slug, &profile.name));
         let created = existing.is_none();
         let result =
             ident::register_agent(project_slug, profile, existing.as_ref(), Timestamp::now())?;
@@ -112,13 +124,18 @@ impl Mailbox {
     }
 
     /// Persist the key (ncryptsec 0600) + publish the signed profile event.
+    ///
+    /// ADR-0017: writes the canonical project slug everywhere (key path,
+    /// profile event tags, agents-index row), so registration state spans
+    /// every spelling of the project key.
     async fn persist_and_publish(
         &self,
         project_slug: &str,
         profile: &AgentProfile,
         result: IdentityResult,
     ) -> anyhow::Result<RegisteredAgent> {
-        let key_path = self.agent_key_path(project_slug, &profile.name);
+        let project_slug = &self.canonical_project(project_slug).await; // ADR-0017
+        let key_path = self.agent_key_path(&project_slug, &profile.name);
         if !key_path.exists() {
             crate::keys::write_encrypted_key(
                 &key_path,
@@ -173,10 +190,16 @@ impl Mailbox {
     /// `PathBuf::join` with an absolute path DISCARDS the data_dir prefix —
     /// keys would escape into the slug's own tree and the unwrap-loop key
     /// scan could never find them (projection never ran → search empty).
-    /// Strip the leading separator so keys always land under data_dir.
+    ///
+    /// ADR-0017: the key path always resolves through the canonical short
+    /// slug (basename of the key, path form or not), so every spelling of a
+    /// project reads and writes the ONE key file under the canonical root.
+    /// The `alt_agent_key` walk below remains as the legacy read fallback
+    /// for pre-ADR-0017 roots.
     pub(crate) fn agent_key_path(&self, project_slug: &str, name: &str) -> PathBuf {
+        let slug = super::aliases::short_slug(project_slug).unwrap_or_else(|| project_slug.to_string());
         self.data_dir
-            .join(project_slug.trim_start_matches('/'))
+            .join(slug)
             .join("agents")
             .join(name)
             .join("key.ncryptsec")
@@ -243,7 +266,17 @@ impl Mailbox {
         }
         candidates.sort();
         for slug in candidates {
-            if let Some(k) = self.load_agent_key(&self.agent_key_path(&slug, name)) {
+            // Verbatim nested path, NOT agent_key_path: the legacy key lives
+            // under its own path-slug tree (`{data}/srv/legacy/toron/...`);
+            // agent_key_path canonicalizes to the basename root and would
+            // miss it (ADR-0017 migration read path).
+            let legacy = self
+                .data_dir
+                .join(slug)
+                .join("agents")
+                .join(name)
+                .join("key.ncryptsec");
+            if let Some(k) = self.load_agent_key(&legacy) {
                 return Some(k);
             }
         }
@@ -312,9 +345,24 @@ impl Mailbox {
 
     /// `whois`: name → npub via the project's kind-30013 profiles (G2).
     /// Unknown name fails fast (AM-Rust parity).
+    ///
+    /// ADR-0017: resolves against the project's full alias set — profile
+    /// `d` tags are slug-scoped (`<slug>:<name>`), so a legacy profile
+    /// registered under a path-form slug only matches when resolved under
+    /// that spelling. Every spelling is tried.
     pub async fn whois(&self, project_slug: &str, name: &str) -> anyhow::Result<WhoIs> {
-        let profiles = self.project_profiles(project_slug).await?;
-        let npub = ident::resolve_name(project_slug, profiles.iter(), name)
+        let set = self.project_read_set(project_slug).await;
+        let mut npub: Option<nostr_sdk::nostr::PublicKey> = None;
+        let mut profiles: Vec<nostr_sdk::nostr::Event> = Vec::new();
+        for slug in &set {
+            let filter = kind_project_filter(toron_kind(AGENT_PROFILE), slug);
+            let events = collect_replay(self.bus.as_ref(), filter).await?;
+            if npub.is_none() {
+                npub = ident::resolve_name(slug, events.iter(), name);
+            }
+            profiles.extend(events);
+        }
+        let npub = npub
             .ok_or_else(|| anyhow::anyhow!("unknown agent name: {name} (register first)"))?;
 
         // Profile fields + last-active provenance (latest signed profile event).
@@ -389,12 +437,28 @@ impl Mailbox {
     }
 
     /// All kind-30013 profile events for a project (project-scoped `#t`).
+    ///
+    /// ADR-0017: replays under the project's full alias set (canonical +
+    /// every stored alias), so agents registered under ANY spelling of the
+    /// project are visible from every other spelling. Events are deduplicated
+    /// by id.
     pub(crate) async fn project_profiles(
         &self,
         project_slug: &str,
     ) -> anyhow::Result<Vec<nostr_sdk::nostr::Event>> {
-        let filter = kind_project_filter(toron_kind(AGENT_PROFILE), project_slug);
-        Ok(collect_replay(self.bus.as_ref(), filter).await?)
+        let set = self.project_read_set(project_slug).await;
+        let mut out: Vec<nostr_sdk::nostr::Event> = Vec::new();
+        let mut seen: std::collections::HashSet<nostr_sdk::nostr::EventId> =
+            std::collections::HashSet::new();
+        for slug in &set {
+            let filter = kind_project_filter(toron_kind(AGENT_PROFILE), slug);
+            for ev in collect_replay(self.bus.as_ref(), filter).await? {
+                if seen.insert(ev.id) {
+                    out.push(ev);
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// `resolve_pane_identity`: herdr pane_id → agent name (G9). `None` when
@@ -649,16 +713,18 @@ mod tests {
         assert!(o.active_within_days.is_none());
     }
 
-    // ---- bd-cmgu: MCP vs CLI project-key unification ----
+    // ---- bd-cmgu → ADR-0017: MCP vs CLI project-key unification ----
     //
     // The flywheel CLI keys projects by ABSOLUTE PATH slug
     // ("/Users/.../workspace/toron"), the MCP surface by the short key
     // ("toron") — two roots under one data dir. An agent registered via one
-    // surface was invisible to the other ("no local key"). The fallback must
-    // resolve either identifier to the same key.
+    // surface was invisible to the other ("no local key"). ADR-0017 makes the
+    // canonical short slug the ONE root: every spelling resolves to the same
+    // key file under `{data_dir}/{canonical}/agents/`.
 
     /// Incident shape (CLI-registered -> MCP lookup): register under the
-    /// PATH-style slug, look the key up via the SHORT slug.
+    /// PATH-style slug, look the key up via the SHORT slug — the key lands
+    /// in the canonical root and both spellings resolve it.
     #[tokio::test]
     async fn test_agent_keys_for_short_key_finds_path_slug_registered_agent() {
         let (mailbox, db_path, data_dir) = test_mailbox("cmgu-short").await;
@@ -667,16 +733,13 @@ mod tests {
             .register_agent(path_slug, &profile("RustHeron"))
             .await
             .expect("register under path slug");
-        // Primary lookup under the SHORT key must miss (that was the bug)...
+        assert_eq!(agent.project_slug, "demo", "canonical root, ADR-0017");
+        // ADR-0017: the key lands in the CANONICAL root — no split.
         let short_path = mailbox.agent_key_path("demo", "RustHeron");
-        assert!(
-            !short_path.exists(),
-            "primary short-slug key absent by design"
-        );
-        // ...and the fallback must find the path-slug key.
+        assert!(short_path.exists(), "canonical-root key exists");
         let keys = mailbox
             .agent_keys_for("demo", "RustHeron")
-            .expect("fallback via basename");
+            .expect("resolve via short slug");
         assert_eq!(keys.public_key().to_hex(), agent.npub, "same key");
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_dir_all(&data_dir);
@@ -692,20 +755,24 @@ mod tests {
             .await
             .expect("register under short slug");
         let path_slug = "tmp/x/workspace/demo";
-        assert!(
-            !mailbox.agent_key_path(path_slug, "BlueLake").exists(),
-            "primary path-slug key absent by design"
+        // ADR-0017: the path-form spelling resolves to the canonical root —
+        // the key path IS the short-slug path (no separate root exists).
+        assert_eq!(
+            mailbox.agent_key_path(path_slug, "BlueLake"),
+            mailbox.agent_key_path("demo", "BlueLake"),
+            "both spellings, one key path"
         );
         let keys = mailbox
             .agent_keys_for(path_slug, "BlueLake")
-            .expect("fallback via basename");
+            .expect("resolve via path slug");
         assert_eq!(keys.public_key().to_hex(), agent.npub, "same key");
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_dir_all(&data_dir);
     }
 
-    /// The exact-slug lookup still wins when both roots hold the name, and an
-    /// unknown name still fails with the original error.
+    /// ADR-0017: both spellings resolve to the SAME canonical identity (no
+    /// cross-root shadowing — there is only one root), and an unknown name
+    /// still fails with the original error.
     #[tokio::test]
     async fn test_agent_keys_for_exact_slug_wins_and_unknown_still_errors() {
         let (mailbox, db_path, data_dir) = test_mailbox("cmgu-exact").await;
@@ -713,17 +780,17 @@ mod tests {
             .register_agent("demo", &profile("BlueLake"))
             .await
             .expect("register");
-        // Register the SAME name under a basename-colliding path slug — the
-        // exact-slug key must win (deterministic, no cross-root shadowing).
+        // Re-registering via a basename-colliding path slug UPSERTS the same
+        // canonical identity — never a second keypair.
         let other = mailbox
             .register_agent("tmp/x/workspace/demo", &profile("BlueLake"))
             .await
-            .expect("register alt root");
+            .expect("register alt spelling");
+        assert_eq!(other.npub, agent.npub, "one identity per name");
         let keys = mailbox
             .agent_keys_for("demo", "BlueLake")
             .expect("exact wins");
-        assert_eq!(keys.public_key().to_hex(), agent.npub, "exact-slug key");
-        assert_ne!(agent.npub, other.npub, "distinct keys per root");
+        assert_eq!(keys.public_key().to_hex(), agent.npub, "canonical key");
         let err = mailbox
             .agent_keys_for("demo", "NoSuchAgent")
             .expect_err("still fails for unknown names");
@@ -768,6 +835,8 @@ mod tests {
     #[tokio::test]
     async fn test_project_slug_aliases_covers_both_spellings() {
         let (mailbox, db_path, data_dir) = test_mailbox("f5tt-alias").await;
+        // ADR-0017: fresh registrations land in the canonical root only — a
+        // path-form registration creates NO split root on disk.
         mailbox
             .register_agent("tmp/x/workspace/demo", &profile("AliasA"))
             .await
@@ -776,19 +845,24 @@ mod tests {
             .register_agent("demo", &profile("AliasB"))
             .await
             .expect("register short root");
+        // The walk-based alias still folds a LEGACY path-slug root left by a
+        // pre-ADR-0017 daemon (the migration read path).
+        let legacy = mailbox.data_dir().join("tmp/legacy/workspace/demo");
+        std::fs::create_dir_all(legacy.join("agents")).unwrap();
         let aliases = mailbox.project_slug_aliases("demo");
         assert!(
             aliases.contains(&"demo".to_string()),
             "the given slug is always an alias: {aliases:?}"
         );
         assert!(
-            aliases.contains(&"tmp/x/workspace/demo".to_string()),
-            "path-slug root found via basename: {aliases:?}"
+            aliases.contains(&"tmp/legacy/workspace/demo".to_string()),
+            "legacy path-slug root found via basename: {aliases:?}"
         );
-        let rev = mailbox.project_slug_aliases("tmp/x/workspace/demo");
+        // The fresh path-form spelling exists only as the canonical root.
+        let fresh = mailbox.project_slug_aliases("tmp/x/workspace/demo");
         assert!(
-            rev.contains(&"demo".to_string()),
-            "reverse direction: {rev:?}"
+            fresh.contains(&"demo".to_string()),
+            "reverse direction: {fresh:?}"
         );
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_dir_all(&data_dir);

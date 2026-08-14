@@ -1,5 +1,6 @@
 // governed-by: ADR-0003
 // governed-by: ADR-0011 (Spec 2/4/6 — intents, soft-conflict, request-release)
+// governed-by: ADR-0017 (project-root canonicalization)
 #![forbid(unsafe_code)]
 
 //! File reservation cluster (bd-led.5.5): file_reservation_paths (acquire),
@@ -307,6 +308,7 @@ impl Mailbox {
         exclusive: bool,
         reason: Option<&str>,
     ) -> anyhow::Result<AcquireResult> {
+        let project_slug = &self.canonical_project(project_slug).await; // ADR-0017
         let agent_keys = self.agent_keys_for(project_slug, agent_name)?;
         let mut result = AcquireResult::default();
 
@@ -411,6 +413,7 @@ impl Mailbox {
         reason: Option<&str>,
         ttl_secs: Option<u64>,
     ) -> anyhow::Result<IntentResult> {
+        let project_slug = &self.canonical_project(project_slug).await; // ADR-0017
         let agent_keys = self.agent_keys_for(project_slug, agent_name)?;
         let mut result = IntentResult::default();
         for path in paths {
@@ -468,6 +471,7 @@ impl Mailbox {
         agent_name: &str,
         paths: &[String],
     ) -> anyhow::Result<ConflictReport> {
+        let project_slug = &self.canonical_project(project_slug).await; // ADR-0017
         let agent_keys = self.agent_keys_for(project_slug, agent_name)?;
         let mut report = ConflictReport {
             checked_paths: paths.len(),
@@ -545,6 +549,7 @@ impl Mailbox {
         paths: &[String],
         extend_secs: u64,
     ) -> anyhow::Result<RenewResult> {
+        let project_slug = &self.canonical_project(project_slug).await; // ADR-0017
         let agent_keys = self.agent_keys_for(project_slug, agent_name)?;
         let now_secs = Timestamp::now().as_secs() as i64;
         let mine = self
@@ -631,6 +636,7 @@ impl Mailbox {
         agent_name: &str,
         paths: &[String],
     ) -> anyhow::Result<ReleaseResult> {
+        let project_slug = &self.canonical_project(project_slug).await; // ADR-0017
         let agent_keys = self.agent_keys_for(project_slug, agent_name)?;
         let mine: Vec<Reservation> = self
             .active_reservations(project_slug)
@@ -690,6 +696,7 @@ impl Mailbox {
         note: Option<&str>,
         notify_previous: bool,
     ) -> anyhow::Result<()> {
+        let project_slug = &self.canonical_project(project_slug).await; // ADR-0017
         let operator = self
             .operator
             .as_ref()
@@ -816,6 +823,7 @@ impl Mailbox {
         bead_id: &str,
         notify_previous: bool,
     ) -> anyhow::Result<ReleaseResult> {
+        let project_slug = &self.canonical_project(project_slug).await; // ADR-0017
         let operator = self
             .operator
             .as_ref()
@@ -984,6 +992,7 @@ impl Mailbox {
         &self,
         project_slug: &str,
     ) -> anyhow::Result<Vec<Reservation>> {
+        let project_slug = &self.canonical_project(project_slug).await; // ADR-0017
         let mut out: Vec<Reservation> = self
             .resolved_leases(project_slug)
             .await?
@@ -1014,6 +1023,7 @@ impl Mailbox {
         &self,
         project_slug: &str,
     ) -> anyhow::Result<Vec<Reservation>> {
+        let project_slug = &self.canonical_project(project_slug).await; // ADR-0017
         let aliases = self.project_slug_aliases(project_slug);
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut out: Vec<Reservation> = Vec::new();
@@ -1034,6 +1044,7 @@ impl Mailbox {
         &self,
         project_slug: &str,
     ) -> anyhow::Result<Vec<IntentReservation>> {
+        let project_slug = &self.canonical_project(project_slug).await; // ADR-0017
         let leases = self.resolved_leases(project_slug).await?;
         let now_secs = Timestamp::now().as_secs() as i64;
         let mut intents: Vec<IntentReservation> = leases
@@ -1169,6 +1180,8 @@ impl Mailbox {
         &self,
         args: &RequestRelease,
     ) -> anyhow::Result<RequestReleaseResult> {
+        let mut args = args.clone();
+        args.project_slug = self.canonical_project(&args.project_slug).await; // ADR-0017
         if args.sender_name == args.target_agent {
             anyhow::bail!(
                 "request-release to self is a no-op — {} already holds it",
@@ -1257,6 +1270,8 @@ impl Mailbox {
         &self,
         args: &ReleaseResponse,
     ) -> anyhow::Result<SendResult> {
+        let mut args = args.clone();
+        args.project_slug = self.canonical_project(&args.project_slug).await; // ADR-0017
         let request = self
             .find_request_by_id(&args.project_slug, &args.sender_name, &args.request_message_id)
             .await?;
@@ -1319,6 +1334,7 @@ impl Mailbox {
         request_message_id: &str,
         window_secs: Option<u64>,
     ) -> RequestReleaseStatus {
+        let project_slug = &self.canonical_project(project_slug).await; // ADR-0017
         let window = window_secs.unwrap_or(REQUEST_RELEASE_TIER_WINDOW_SECS);
         let Ok(keys) = self.agent_keys_for(project_slug, requestor_name) else {
             return RequestReleaseStatus::Unknown;
@@ -1384,6 +1400,7 @@ impl Mailbox {
         request_message_id: &str,
         note: Option<&str>,
     ) -> anyhow::Result<()> {
+        let project_slug = &self.canonical_project(project_slug).await; // ADR-0017
         let operator = self.operator.as_ref().ok_or_else(|| {
             anyhow::anyhow!("no operator key configured; cannot escalate to captain")
         })?;

@@ -1,4 +1,5 @@
 // governed-by: ADR-0003
+// governed-by: ADR-0017 (project-root canonicalization)
 #![forbid(unsafe_code)]
 
 //! Mailbox core — the 38-tool AM-Rust parity surface mapped onto the Nostr
@@ -37,6 +38,7 @@ pub mod reservations;
 pub mod search;
 pub mod surface;
 pub mod unwrap;
+pub mod aliases;
 
 pub use build_slots::AcquireBuildSlotResult;
 pub use contacts::{BusPolicySource, ContactLink, LinkStatus, RequestContact, RespondContact};
@@ -164,6 +166,30 @@ impl Mailbox {
     /// The on-disk directory under which project roots live.
     pub fn data_dir(&self) -> &PathBuf {
         &self.data_dir
+    }
+
+    /// ADR-0017: resolve any project key to its canonical short slug (the
+    /// alias table in the archive DB maps path-derived keys to the canonical
+    /// root; pure basename derivation when no pool is attached).
+    pub async fn canonical_project(&self, slug: &str) -> String {
+        aliases::canonicalize(self.index_pool.as_ref(), slug).await
+    }
+
+    /// ADR-0017: the read-side alias expansion of `slug` — the caller's own
+    /// spelling, the canonical root, and every stored alias of that root.
+    /// Queries over this set see rows written under any spelling (legacy
+    /// path-slug rows included, aliased read-only).
+    pub async fn project_read_set(&self, slug: &str) -> Vec<String> {
+        aliases::alias_read_set(self.index_pool.as_ref(), slug).await
+    }
+
+    /// ADR-0017: fold pre-existing data-dir path-slug roots into the alias
+    /// table (daemon open migration; best-effort no-op without a pool).
+    pub async fn reconcile_project_aliases(&self) -> anyhow::Result<usize> {
+        match self.index_pool.as_ref() {
+            Some(pool) => aliases::reconcile_aliases(pool, &self.data_dir).await,
+            None => Ok(0),
+        }
     }
 
     /// The operator key (if configured).
@@ -627,16 +653,22 @@ mod tests {
             count, 1,
             "inbound wrap under an absolute project slug must be projected"
         );
-        // The projected row must carry the VERBATIM registration slug — the
-        // search project filter matches exactly what the client passes.
+        // ADR-0017: the projected row carries the CANONICAL slug — the
+        // absolute path form resolves to its basename at registration, so
+        // search (which canonicalizes the client's key the same way) matches
+        // exactly what the client passes.
         let projected_slug: String =
             sqlx::query_scalar("SELECT project_slug FROM messages")
                 .fetch_one(pool)
                 .await
                 .expect("project_slug");
+        let canonical = std::path::Path::new(&slug)
+            .file_name()
+            .and_then(|f| f.to_str())
+            .expect("basename");
         assert_eq!(
-            projected_slug, slug,
-            "project_slug must round-trip verbatim (leading separator preserved)"
+            projected_slug, canonical,
+            "project_slug is the canonical short slug (ADR-0017)"
         );
 
         handle.abort();
