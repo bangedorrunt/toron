@@ -357,6 +357,7 @@ fn inbox_json(m: &toron_core::mailbox::InboxMessage) -> serde_json::Value {
         "thread_id": m.thread_id,
         "created_ts_us": m.created_ts_us,
         "read_ts_us": m.read_ts_us,
+        "duplicate_of": m.duplicate_of,
     })
 }
 

@@ -217,6 +217,8 @@ impl ToJson for InboxMessage {
             "thread_id": self.thread_id,
             "created_ts_us": self.created_ts_us,
             "read_ts_us": self.read_ts_us,
+            // S5 (bd-dup-assign-collapse-ws21): duplicate-group first id.
+            "duplicate_of": self.duplicate_of,
         })
     }
 }
@@ -707,11 +709,12 @@ mod tests {
             .expect("deliveries payload props");
         assert!(deliveries.contains_key("recipient"), "send payload recipient");
         assert!(deliveries.contains_key("event_id"), "send payload event_id");
-        // release_file_reservations → {released} (no released_at).
+        // release_file_reservations → {released, leases} (bd-release-breakdown-xom3
+        // added the per-path breakdown; released count unchanged).
         assert_eq!(
             props("release_file_reservations"),
-            vec!["released".to_string()],
-            "release schema = {{released}}"
+            vec!["leases".to_string(), "released".to_string()],
+            "release schema = {{released, leases}}"
         );
         // set_contact_policy → bare kind-30014 event-id string.
         assert_eq!(
