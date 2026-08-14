@@ -1,4 +1,5 @@
 // governed-by: ADR-0003
+// governed-by: ADR-0017 (project-root canonicalization)
 #![forbid(unsafe_code)]
 
 //! Search cluster (bd-led.5.6): search_messages, summarize_thread.
@@ -90,39 +91,53 @@ impl Mailbox {
             .index_pool()
             .ok_or_else(|| anyhow::anyhow!("no index pool attached (Mailbox::with_index_pool)"))?;
 
+        // ADR-0017: expand the project key to its full alias set (canonical +
+        // every stored alias), so rows written under ANY spelling of the
+        // project are searchable from every other spelling.
+        let set = self.project_read_set(&args.project_key).await;
+
         // An EMPTY query is invalid FTS5 ("syntax error near \"\"") and a bare
         // `*` is not a valid match-all — skip the FTS join entirely when there
         // is no text filter (thread-only / digest searches). Relevance ranking
         // degrades to recency (nothing to score).
         let empty_query = args.query.trim().is_empty();
-        let (mut sql, mut bind_id, mut params) = if empty_query {
+        // Placeholder layout: the MATCH query is ?1 when present, so project
+        // params start at ?2 (empty-query searches start at ?1). The two must
+        // never share an index — FTS5 `MATCH ?1` collides with `IN (?1)`.
+        let (proj_ph, mut params, mut bind_id) = if empty_query {
             (
-                String::from(
-                    "SELECT m.event_id, m.subject, m.sender, m.created_ts_us, m.importance, \
-                            m.ack_required, m.thread_id, m.body \
-                     FROM messages m \
-                     WHERE m.project_slug = ?1 \
-                       AND m.deleted = 0",
-                ),
-                2i32,
-                vec![args.project_key.clone()],
+                (1..=set.len()).map(|i| format!("?{i}")).collect::<Vec<_>>(),
+                set.clone(),
+                set.len() as i32 + 1,
             )
         } else {
-            // Sanitize: FTS5 treats `foo-bar` as column `foo` term `bar` → "no such
-            // column". Quote hyphenated tokens (bd-mail-actor / bead ids).
             let query = sanitize_fts_query(&args.query);
+            let mut params = vec![query];
+            params.extend(set.clone());
             (
-                String::from(
-                    "SELECT m.event_id, m.subject, m.sender, m.created_ts_us, m.importance, \
-                            m.ack_required, m.thread_id, m.body \
-                     FROM messages m \
-                     JOIN messages_fts f ON f.rowid = m.id \
-                     WHERE messages_fts MATCH ?1 \
-                       AND m.project_slug = ?2 \
-                       AND m.deleted = 0",
-                ),
-                3i32,
-                vec![query, args.project_key.clone()],
+                (2..=set.len() + 1).map(|i| format!("?{i}")).collect::<Vec<_>>(),
+                params,
+                set.len() as i32 + 2,
+            )
+        };
+        let proj_in = format!("m.project_slug IN ({})", proj_ph.join(", "));
+        let mut sql = if empty_query {
+            format!(
+                "SELECT m.event_id, m.subject, m.sender, m.created_ts_us, m.importance, \
+                        m.ack_required, m.thread_id, m.body \
+                 FROM messages m \
+                 WHERE {proj_in} \
+                   AND m.deleted = 0",
+            )
+        } else {
+            format!(
+                "SELECT m.event_id, m.subject, m.sender, m.created_ts_us, m.importance, \
+                        m.ack_required, m.thread_id, m.body \
+                 FROM messages m \
+                 JOIN messages_fts f ON f.rowid = m.id \
+                 WHERE messages_fts MATCH ?1 \
+                   AND {proj_in} \
+                   AND m.deleted = 0",
             )
         };
         let since: Option<i64> = args.since_us;
@@ -135,14 +150,18 @@ impl Mailbox {
             // resolve through the agents table (per project). An unknown
             // name matches nothing (subquery → NULL), which is the correct
             // filter semantics.
+            let sub_ph: Vec<String> =
+                (bind_id..bind_id + set.len() as i32).map(|i| format!("?{i}")).collect();
             filter_sql.push_str(&format!(
-                " AND m.sender_pubkey = (SELECT pubkey FROM agents WHERE project_slug = ?{} AND name = ?{})",
-                bind_id,
-                bind_id + 1
+                " AND m.sender_pubkey = (SELECT pubkey FROM agents WHERE project_slug IN ({}) AND name = ?{})",
+                sub_ph.join(", "),
+                bind_id + set.len() as i32
             ));
-            params.push(args.project_key.clone());
+            for s in &set {
+                params.push(s.clone());
+            }
             params.push(s);
-            bind_id += 2;
+            bind_id += set.len() as i32 + 1;
         }
         if let Some(i) = args.importance.clone() {
             filter_sql.push_str(&format!(" AND m.importance = ?{}", bind_id));
@@ -218,16 +237,23 @@ impl Mailbox {
         let pool = self
             .index_pool()
             .ok_or_else(|| anyhow::anyhow!("no index pool attached (Mailbox::with_index_pool)"))?;
-        let rows = sqlx::query(
+        // ADR-0017: expand the project key to its alias set (legacy
+        // path-slug thread rows stay visible from every spelling).
+        let set = self.project_read_set(project_key).await;
+        let ph: Vec<String> = (1..=set.len()).map(|i| format!("?{i}")).collect();
+        let sql = format!(
             "SELECT event_id, subject, sender, importance, ack_required, body \
-             FROM messages WHERE project_slug = ?1 AND thread_id = ?2 \
+             FROM messages WHERE project_slug IN ({}) AND thread_id = ?{} \
              AND deleted = 0 \
              ORDER BY created_ts_us ASC, local_seq ASC",
-        )
-        .bind(project_key)
-        .bind(thread_id)
-        .fetch_all(pool)
-        .await?;
+            ph.join(", "),
+            set.len() + 1
+        );
+        let mut q = sqlx::query(&sql);
+        for s in &set {
+            q = q.bind(s);
+        }
+        let rows = q.bind(thread_id).fetch_all(pool).await?;
 
         let mut participants: Vec<String> = Vec::new();
         let mut subjects: Vec<String> = Vec::new();
