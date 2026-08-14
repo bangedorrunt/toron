@@ -25,7 +25,7 @@ cd "$ROOT"
 fail=0
 
 # Existing ADR files, as "0003" "0004" ... (numeric prefix only).
-mapfile -t ADR_FILES < <(ls docs/decisions/ | sed -n 's/^\(000[0-9]\)\-.*/\1/p' | sort -u)
+mapfile -t ADR_FILES < <(ls docs/decisions/ | sed -n 's/^\([0-9]\{4\}\)\-.*/\1/p' | sort -u)
 
 if [ "${#ADR_FILES[@]}" -eq 0 ]; then
     echo "FAIL: no ADR files found under docs/decisions/" >&2
@@ -70,7 +70,7 @@ if [ "$missing" -eq 0 ]; then
 fi
 
 # --- 3. report-only: ADR mention without marker -------------------------
-unmarked=$(rg -l 'ADR-000[0-9]' crates/ -g '*.rs' 2>/dev/null \
+unmarked=$(rg -l 'ADR-[0-9]{4}' crates/ -g '*.rs' 2>/dev/null \
     | while read -r f; do rg -q 'governed-by: ADR-' "$f" || echo "$f"; done || true)
 if [ -n "$unmarked" ]; then
     echo "info: files mentioning ADR- but lacking a governed-by marker (report-only):"
