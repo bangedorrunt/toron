@@ -50,8 +50,11 @@ pub struct ThreadSummary {
     pub message_count: usize,
 }
 
-/// Quote hyphenated FTS tokens so MATCH does not treat them as `column:term`.
-/// Leaves already-quoted tokens and boolean operators (AND/OR/NOT) alone.
+/// Quote FTS tokens containing characters outside `[A-Za-z0-9_*"]` so MATCH
+/// does not read them as `column:term` (re:) or syntax (toron.dev, @npub).
+/// Leaves boolean operators (AND/OR/NOT), already-quoted tokens, and
+/// trailing-star prefix queries (`word*`) alone. Embedded quotes are escaped
+/// by doubling.
 pub(crate) fn sanitize_fts_query(q: &str) -> String {
     q.split_whitespace()
         .map(|tok| {
@@ -59,14 +62,14 @@ pub(crate) fn sanitize_fts_query(q: &str) -> String {
             if upper == "AND" || upper == "OR" || upper == "NOT" {
                 return tok.to_string();
             }
-            if tok.starts_with('"') {
+            if tok.starts_with('"') || tok.ends_with('"') {
                 return tok.to_string();
             }
-            if tok.contains('-') {
-                let esc = tok.replace('"', "\"\"");
-                return format!("\"{esc}\"");
+            if tok.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'*') {
+                return tok.to_string();
             }
-            tok.to_string()
+            let esc = tok.replace('"', "\"\"");
+            format!("\"{esc}\"")
         })
         .collect::<Vec<_>>()
         .join(" ")
@@ -335,6 +338,113 @@ mod tests {
             sanitize_fts_query("\"already-quoted\""),
             "\"already-quoted\""
         );
+    }
+
+    /// Acceptance (S1): any token with characters outside [A-Za-z0-9_*"]
+    /// gets quoted — colon, dot, @, unicode forms. Operators, quoted
+    /// phrases and trailing-star prefix queries stay bare.
+    #[test]
+    fn sanitize_fts_quotes_special_char_tokens() {
+        assert_eq!(sanitize_fts_query("re:"), "\"re:\"");
+        assert_eq!(sanitize_fts_query("toron.dev"), "\"toron.dev\"");
+        assert_eq!(sanitize_fts_query("@npub1abc"), "\"@npub1abc\"");
+        assert_eq!(sanitize_fts_query("@npub1abc\u{2026}"), "\"@npub1abc\u{2026}\"");
+        assert_eq!(sanitize_fts_query("a-b: c.d"), "\"a-b:\" \"c.d\"");
+        assert_eq!(sanitize_fts_query("word*"), "word*");
+        assert_eq!(sanitize_fts_query("hello_world foo"), "hello_world foo");
+        assert_eq!(
+            sanitize_fts_query("\"already quoted\" AND foo"),
+            "\"already quoted\" AND foo"
+        );
+        assert_eq!(sanitize_fts_query("say\"hi-there"), "\"say\"\"hi-there\"");
+    }
+
+    /// Round-trip: search_messages must return hits (not SQL errors) for
+    /// the real-world forms that broke MATCH — re:, toron.dev, @npub.
+    #[tokio::test]
+    async fn test_search_special_char_tokens_roundtrip() {
+        let (mailbox, db_path, data_dir) = test_mailbox("special-fts").await;
+        seed(
+            &mailbox,
+            "demo",
+            "e-dom",
+            "Site",
+            "ping toron.dev for the catalog",
+            "normal",
+            None,
+            1_700_000_000_000_100,
+        )
+        .await;
+        seed(
+            &mailbox,
+            "demo",
+            "e-npub",
+            "Keys",
+            "message @npub1abc\u{2026}hello sealed",
+            "normal",
+            None,
+            1_700_000_000_000_200,
+        )
+        .await;
+        seed(
+            &mailbox,
+            "demo",
+            "e-re",
+            "Re: question one",
+            "answer",
+            "normal",
+            None,
+            1_700_000_000_000_300,
+        )
+        .await;
+
+        let dom = mailbox
+            .search_messages(&SearchMessages {
+                project_key: "demo".into(),
+                query: "toron.dev".into(),
+                limit: Some(10),
+                ..Default::default()
+            })
+            .await
+            .expect("toron.dev must not SQL-error");
+        assert!(
+            dom.iter().any(|m| m.id == "e-dom"),
+            "toron.dev hit, got {:?}",
+            dom.iter().map(|m| m.id.clone()).collect::<Vec<_>>()
+        );
+
+        let npub = mailbox
+            .search_messages(&SearchMessages {
+                project_key: "demo".into(),
+                query: "@npub1abc".into(),
+                limit: Some(10),
+                ..Default::default()
+            })
+            .await
+            .expect("@npub1abc must not SQL-error");
+        assert!(
+            npub.iter().any(|m| m.id == "e-npub"),
+            "@npub hit, got {:?}",
+            npub.iter().map(|m| m.id.clone()).collect::<Vec<_>>()
+        );
+
+        let re = mailbox
+            .search_messages(&SearchMessages {
+                project_key: "demo".into(),
+                query: "re:".into(),
+                limit: Some(10),
+                ..Default::default()
+            })
+            .await
+            .expect("re: must not SQL-error");
+        assert!(
+            re.iter().any(|m| m.id == "e-re"),
+            "re: hit, got {:?}",
+            re.iter().map(|m| m.id.clone()).collect::<Vec<_>>()
+        );
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
     }
 
     /// Regression: an EMPTY query is invalid FTS5 ("syntax error near """)
