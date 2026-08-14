@@ -20,6 +20,7 @@ This directory contains records of the major architectural decisions made for th
 | [0014](0014-kind-registry-specification.md) | Kind Registry Specification — formal spec of every custom Nostr kind | **Accepted** (2026-08-14; amends ADR-0003) |
 | [0015](0015-flywheel-toron-integration-contract.md) | Flywheel ↔ Toron Integration Contract — the boundary guarantees | **Accepted** (2026-08-14) |
 | [0016](https://github.com/bangedorrunt/toron.dev/blob/main/docs/decisions/0002-site-repo-spec-sync-and-hosting.md) | toron.dev Site Repository, Spec-Sync Pipeline, and Hosting Tier | **Moved** (2026-08-14) to the toron.dev repo, renumbered **ADR-0002** (catalog sync pipeline + Vercel Hobby→Pro triggers govern the `toron catalog` extractor) |
+| [0017](0017-project-root-canonicalization.md) | Project Root Canonicalization and Identity Resolution | **Accepted** (2026-08-15; S2 keystone — canonical short slug + alias table, one root per project, aliased read-only migration, ack authorization via pane binding / thread participant; supersedes the bd-cmgu key-basename fallback as the primary mechanism) |
 
 ## Parity catalogs
 

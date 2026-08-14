@@ -1,5 +1,6 @@
 // governed-by: ADR-0003
 // governed-by: ADR-0007 (C3 frozen tool names — byte-identical surface)
+// governed-by: ADR-0017 (project-root canonicalization)
 
 //! System + identity tools (F21.TOOLS-SPLIT domain module).
 //!
@@ -62,9 +63,11 @@ impl ToolServer {
         &self,
         Parameters(args): Parameters<InstallPrecommitGuardArgs>,
     ) -> ToolOutput {
+        // ADR-0017: canonical project key baked into the hook script.
+        let project = self.mailbox.canonical_project(&args.project_key).await;
         match self
             .mailbox
-            .install_precommit_guard(Path::new(&args.code_repo_path), &args.project_key)
+            .install_precommit_guard(Path::new(&args.code_repo_path), &project)
         {
             Ok(path) => ToolOutput::ok(json!({ "hook_path": path.display().to_string() })),
             Err(e) => ToolOutput::err(e),
