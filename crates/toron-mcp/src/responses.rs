@@ -136,6 +136,11 @@ pub struct ReceiptResultOut {
 }
 
 /// `request_contact` / `respond_contact` / `list_contacts` rows.
+///
+/// Link rows describe the SOCIAL GRAPH — they do not gate mail. Inbound
+/// delivery is gated by the recipient's contact policy (kind-30014, default
+/// `auto`): a `pending` link still receives mail unless the recipient's
+/// policy blocks it.
 #[derive(Debug, Clone, JsonSchema)]
 pub struct ContactLinkOut {
     pub project_slug: String,
@@ -144,6 +149,7 @@ pub struct ContactLinkOut {
     pub to_name: String,
     pub to_pubkey: String,
     pub to_project: Option<String>,
+    /// pending | approved | denied — social graph state, not a delivery gate.
     pub status: String,
     pub created_ts_us: i64,
 }
@@ -196,10 +202,19 @@ pub struct RenewResultOut {
     pub reservations: Vec<GrantedReservationOut>,
 }
 
+/// `release_file_reservations` per-lease breakdown (S6).
+#[derive(Debug, Clone, JsonSchema)]
+pub struct ReleasedLeaseOut {
+    pub path: String,
+    pub mode: String,
+    pub holder: String,
+}
+
 /// `release_file_reservations`.
 #[derive(Debug, Clone, JsonSchema)]
 pub struct ReleaseResultOut {
     pub released: usize,
+    pub leases: Vec<ReleasedLeaseOut>,
 }
 
 /// `search_messages` rows.

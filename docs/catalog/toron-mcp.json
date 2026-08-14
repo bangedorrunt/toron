@@ -96,7 +96,7 @@
       "name": "workflow"
     }
   ],
-  "generated_at": "2026-08-14T11:19:57Z",
+  "generated_at": "2026-08-14T21:17:20Z",
   "resources": [
     {
       "description": "List projects known to toron.",
@@ -1439,6 +1439,7 @@
             "type": "string"
           },
           "status": {
+            "description": "pending | approved | denied — social graph state, not a delivery gate.",
             "type": "string"
           },
           "to_name": {
@@ -1533,6 +1534,7 @@
             "type": "string"
           },
           "status": {
+            "description": "pending | approved | denied — social graph state, not a delivery gate.",
             "type": "string"
           },
           "to_name": {
@@ -1562,7 +1564,7 @@
       "parity": "AM-Rust 38-tool surface"
     },
     {
-      "description": "List an agent's contact links (AgentLink rows).",
+      "description": "List an agent's contact links (AgentLink rows). Link status is the social graph (pending|approved|denied) — it does NOT gate mail. Delivery is gated by the RECIPIENT's contact policy (kind-30014, see set_contact_policy, default auto): a pending link still receives mail unless the recipient's policy blocks it.",
       "example": {
         "agent_name": "<string>",
         "project_key": "<string>"
@@ -1588,7 +1590,7 @@
       "output_schema": {
         "$defs": {
           "ContactLinkOut": {
-            "description": "`request_contact` / `respond_contact` / `list_contacts` rows.",
+            "description": "`request_contact` / `respond_contact` / `list_contacts` rows.\n\nLink rows describe the SOCIAL GRAPH — they do not gate mail. Inbound\ndelivery is gated by the recipient's contact policy (kind-30014, default\n`auto`): a `pending` link still receives mail unless the recipient's\npolicy blocks it.",
             "properties": {
               "created_ts_us": {
                 "format": "int64",
@@ -1604,6 +1606,7 @@
                 "type": "string"
               },
               "status": {
+                "description": "pending | approved | denied — social graph state, not a delivery gate.",
                 "type": "string"
               },
               "to_name": {
@@ -2070,8 +2073,36 @@
       },
       "name": "release_file_reservations",
       "output_schema": {
+        "$defs": {
+          "ReleasedLeaseOut": {
+            "description": "`release_file_reservations` per-lease breakdown (S6).",
+            "properties": {
+              "holder": {
+                "type": "string"
+              },
+              "mode": {
+                "type": "string"
+              },
+              "path": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "path",
+              "mode",
+              "holder"
+            ],
+            "type": "object"
+          }
+        },
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "properties": {
+          "leases": {
+            "items": {
+              "$ref": "#/$defs/ReleasedLeaseOut"
+            },
+            "type": "array"
+          },
           "released": {
             "format": "uint",
             "minimum": 0,
@@ -2079,7 +2110,8 @@
           }
         },
         "required": [
-          "released"
+          "released",
+          "leases"
         ],
         "type": "object"
       },
@@ -2872,7 +2904,7 @@
       "output_schema": {
         "$defs": {
           "ContactLinkOut": {
-            "description": "`request_contact` / `respond_contact` / `list_contacts` rows.",
+            "description": "`request_contact` / `respond_contact` / `list_contacts` rows.\n\nLink rows describe the SOCIAL GRAPH — they do not gate mail. Inbound\ndelivery is gated by the recipient's contact policy (kind-30014, default\n`auto`): a `pending` link still receives mail unless the recipient's\npolicy blocks it.",
             "properties": {
               "created_ts_us": {
                 "format": "int64",
@@ -2888,6 +2920,7 @@
                 "type": "string"
               },
               "status": {
+                "description": "pending | approved | denied — social graph state, not a delivery gate.",
                 "type": "string"
               },
               "to_name": {

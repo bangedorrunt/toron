@@ -269,10 +269,22 @@ pub struct RenewResult {
     pub reservations: Vec<GrantedReservation>,
 }
 
-/// Result of `release_file_reservations`.
+/// Result of `release_file_reservations` (S6: per-path breakdown).
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ReleaseResult {
     pub released: usize,
+    pub leases: Vec<ReleasedLease>,
+}
+
+/// A single released lease (S6, bd-release-breakdown-xom3).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ReleasedLease {
+    /// Path glob of the released lease.
+    pub path: String,
+    /// "exclusive" | "shared".
+    pub mode: String,
+    /// Agent name of the holder (the releaser).
+    pub holder: String,
 }
 
 impl Mailbox {
@@ -611,7 +623,8 @@ impl Mailbox {
     }
 
     /// `release_file_reservations`: the holder releases own leases (publishes
-    /// a `status:released` marker; same-author NIP-33 supersession).
+    /// a `status:released` marker; same-author NIP-33 supersession). Response
+    /// carries the per-path breakdown (S6).
     pub async fn release_file_reservations(
         &self,
         project_slug: &str,
@@ -629,6 +642,7 @@ impl Mailbox {
             })
             .collect();
         let mut released = 0usize;
+        let mut leases = Vec::new();
         for res in mine {
             let d = format!("{project_slug}:{}", res.path_pattern);
             let base = vec![
@@ -646,9 +660,14 @@ impl Mailbox {
             self.bus.publish(event.clone()).await?;
             self.record_transition(project_slug, &d, "released", &event.id)
                 .await;
+            leases.push(ReleasedLease {
+                path: res.path_pattern.clone(),
+                mode: if res.exclusive { "exclusive" } else { "shared" }.into(),
+                holder: res.agent_name.clone(),
+            });
             released += 1;
         }
-        Ok(ReleaseResult { released })
+        Ok(ReleaseResult { released, leases })
     }
 
     /// `force_release_file_reservation` (G5 A1): staleness heuristic → the
@@ -809,6 +828,7 @@ impl Mailbox {
             .collect();
 
         let mut released = 0usize;
+        let mut released_leases = Vec::new();
         for lease in leases {
             let d = format!("{project_slug}:{}", lease.path_pattern);
             let target = EventId::from_hex(&lease.id).unwrap_or_else(|_| {
@@ -876,8 +896,13 @@ impl Mailbox {
                     );
                 }
             }
+            released_leases.push(ReleasedLease {
+                path: lease.path_pattern.clone(),
+                mode: if lease.exclusive { "exclusive" } else { "shared" }.into(),
+                holder: lease.agent_name.clone(),
+            });
         }
-        Ok(ReleaseResult { released })
+        Ok(ReleaseResult { released, leases: released_leases })
     }
 
     /// Active (non-revoked, non-released, non-expired) kind-30031 events in a
@@ -1920,6 +1945,58 @@ mod tests {
             res.iter().all(|r| r.path_pattern != "src/**"),
             "released lease must not appear active, got {res:?}"
         );
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// S6 (bd-release-breakdown-xom3): the release response lists each
+    /// released lease — path, mode, holder — so callers need not re-run
+    /// `check_file_reservation_conflicts` to see what was released.
+    #[tokio::test]
+    async fn test_release_reports_per_path_breakdown() {
+        let (mailbox, db_path, data_dir) = test_mailbox("release-breakdown").await;
+        register(&mailbox, "demo", "BlueLake").await;
+
+        mailbox
+            .file_reservation_paths(
+                "demo",
+                "BlueLake",
+                &["src/**".into(), "tests/**".into()],
+                Some(3600),
+                true,
+                None,
+            )
+            .await
+            .expect("acquire exclusive");
+        mailbox
+            .file_reservation_paths(
+                "demo",
+                "BlueLake",
+                &["docs/**".into()],
+                Some(3600),
+                false,
+                None,
+            )
+            .await
+            .expect("acquire shared");
+
+        let release = mailbox
+            .release_file_reservations("demo", "BlueLake", &[])
+            .await
+            .expect("release all");
+        assert_eq!(release.released, 3);
+        assert_eq!(release.leases.len(), 3);
+        let by_path: std::collections::BTreeMap<&str, &ReleasedLease> = release
+            .leases
+            .iter()
+            .map(|l| (l.path.as_str(), l))
+            .collect();
+        assert_eq!(by_path["src/**"].mode, "exclusive");
+        assert_eq!(by_path["tests/**"].mode, "exclusive");
+        assert_eq!(by_path["docs/**"].mode, "shared");
+        assert_eq!(by_path["src/**"].holder, "BlueLake");
+        assert_eq!(by_path["docs/**"].holder, "BlueLake");
 
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_dir_all(&data_dir);
