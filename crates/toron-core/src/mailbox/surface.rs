@@ -1,4 +1,5 @@
 // governed-by: ADR-0007
+// governed-by: ADR-0017 (project-root canonicalization)
 // R1 / D2 (ADR-0007): `MailSurface` — the coordination-fabric trait living
 // next to `Mailbox`. Operation-shaped (send → inbox → ack → reply, contacts,
 // agents, infra) — NOT the raw 38-tool surface. `&self` receivers, string ids
@@ -157,6 +158,9 @@ pub struct MailItem {
     pub ack_required: bool,
     pub thread_id: Option<MessageId>,
     pub created_ts_us: i64,
+    /// S5 (bd-dup-assign-collapse-ws21): the first id of the duplicate group
+    /// this row survives for; `None` = standalone (see `collapse_duplicates`).
+    pub duplicate_of: Option<MessageId>,
 }
 
 impl From<InboxMessage> for MailItem {
@@ -170,6 +174,7 @@ impl From<InboxMessage> for MailItem {
             ack_required: m.ack_required,
             thread_id: m.thread_id.map(MessageId::from),
             created_ts_us: m.created_ts_us,
+            duplicate_of: m.duplicate_of.map(MessageId::from),
         }
     }
 }
@@ -185,6 +190,7 @@ impl From<SearchMessage> for MailItem {
             ack_required: m.ack_required,
             thread_id: m.thread_id.map(MessageId::from),
             created_ts_us: m.created_ts_us,
+            duplicate_of: None,
         }
     }
 }
@@ -1181,14 +1187,66 @@ mod tests {
         let _ = std::fs::remove_dir_all(&data_dir);
     }
 
+    /// S3 conformance (bd-ts-unit-audit-pmn5): `since_ts` is an RFC3339
+    /// string compared against `created_ts_us` (i64-µs, ADR G7). A future
+    /// bound yields an empty inbox; a past bound yields the message. A
+    /// malformed bound is a hard `MailError::Malformed` — never silent.
+    #[tokio::test]
+    async fn inbox_since_ts_rfc3339_conformance() {
+        let (surface, db_path, data_dir) = test_surface("since").await;
+        let _green_npub = register_agent(&surface, "demo", "GreenCastle").await;
+        let _ = register_agent(&surface, "demo", "BlueLake").await;
+
+        let now = chrono::Utc::now();
+        let sent = surface
+            .send(&SendMail {
+                project: "demo".into(),
+                sender: "GreenCastle".into(),
+                to: vec!["BlueLake".into()],
+                subject: "since-conformance".into(),
+                body_md: "bound me".into(),
+                ..Default::default()
+            })
+            .await
+            .expect("send");
+        assert_eq!(sent.count, 1);
+
+        let query = |since: Option<String>| InboxQuery {
+            project: "demo".into(),
+            agent: "BlueLake".into(),
+            include_bodies: true,
+            since_ts: since,
+            ..Default::default()
+        };
+
+        // Future bound (now + 1h): the just-sent message is older → empty.
+        let future = (now + chrono::Duration::hours(1)).to_rfc3339();
+        let future_inbox = surface.inbox(&query(Some(future))).await.expect("future inbox");
+        assert_eq!(future_inbox.len(), 0, "future since_ts must exclude the message");
+
+        // Past bound (now − 1h): the message is newer → present.
+        let past = (now - chrono::Duration::hours(1)).to_rfc3339();
+        let past_inbox = surface.inbox(&query(Some(past))).await.expect("past inbox");
+        assert_eq!(past_inbox.len(), 1, "past since_ts must include the message");
+        assert_eq!(past_inbox[0].subject, "since-conformance");
+
+        // Malformed bound → Malformed error, never a silent ignore.
+        let err = surface.inbox(&query(Some("not-a-timestamp".into()))).await;
+        assert!(matches!(err, Err(MailError { code: MailErrorCode::Malformed, .. })));
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
     #[tokio::test]
     async fn ensure_project_and_health_are_operation_shaped() {
         let (surface, db_path, data_dir) = test_surface("infra").await;
+        // ADR-0017: a path-form key resolves to its canonical short slug.
         let state = surface
             .ensure_project("some/human/key")
             .await
             .expect("ensure project");
-        assert_eq!(state.slug, "some/human/key");
+        assert_eq!(state.slug, "key", "canonical short slug");
         let report = surface.health().await.expect("health");
         assert!(
             report.bus.ok && report.archive.ok,

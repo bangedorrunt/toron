@@ -1,5 +1,6 @@
 // governed-by: ADR-0003
 // governed-by: ADR-0004 (SendMessage.overseer, operator signing — Ship 5)
+// governed-by: ADR-0017 (project-root canonicalization)
 #![forbid(unsafe_code)]
 
 //! Messaging cluster (bd-led.5.3): send_message, reply_message, fetch_inbox,
@@ -35,9 +36,12 @@ use sqlx::Row;
 
 use crate::bus::filter::ToronFilter;
 use crate::bus::scoping::is_metadata_hiding_kind;
+use crate::mailbox::identity::ListAgentsOptions;
 use crate::mailbox::unwrap::{OVERSEER_TAG, UnwrappedMail, order_by_rumor_time, tag_value};
 use crate::nostr::gift_wrap::{self, UnwrappedGift};
 use crate::nostr::identity as nident;
+use crate::backend::herdr::HerdrBackend;
+use sha2::Digest;
 
 use super::Mailbox;
 
@@ -132,7 +136,19 @@ pub struct InboxMessage {
     /// `None` when the recipient never marked this message read (unread), or
     /// when no index pool is attached (read state cannot be known).
     pub read_ts_us: Option<i64>,
+    /// S5 (bd-dup-assign-collapse-ws21): when this row is the surviving
+    /// representative of a collapsed duplicate group (identical sender +
+    /// subject + body-hash within the collapse window), this holds the id of
+    /// the group's FIRST occurrence. `None` = standalone message (or the
+    /// group's first — survivors are the latest copy, marked with the
+    /// original's id). Wake-side staleness is flywheel's concern (S8); toron
+    /// only stops double-delivering.
+    pub duplicate_of: Option<String>,
 }
+
+/// S5 collapse window: identical (sender, subject, body-hash) messages
+/// within this window collapse to one inbox row (i64-µs, 1h default).
+pub const DUP_COLLAPSE_WINDOW_US: i64 = 3_600_000_000;
 
 /// `fetch_inbox` options.
 #[derive(Debug, Clone, Default)]
@@ -161,8 +177,12 @@ impl Mailbox {
     /// same kind-14 rumor (to/cc) or the bcc-variant rumor. Gift wraps are
     /// metadata-hiding: they carry NO project tags (A3).
     pub async fn send_message(&self, args: &SendMessage) -> anyhow::Result<SendResult> {
+        // ADR-0017: the project key is canonicalized first — every spelling
+        // of the project sends under the ONE canonical root.
+        let mut args = args.clone();
+        args.project_slug = self.canonical_project(&args.project_slug).await;
         // G3: resolve ALL recipients pre-wrap; unknown aborts the whole send.
-        let resolved = self.resolve_recipients(args).await?;
+        let resolved = self.resolve_recipients(&args).await?;
         if resolved.is_empty() {
             anyhow::bail!("no recipients (to/cc/bcc all empty)");
         }
@@ -179,7 +199,7 @@ impl Mailbox {
             self.agent_keys_for(&args.project_slug, &args.sender_name)?
         };
 
-        let visible = build_visible_rumor(&sender_keys.public_key(), args, &resolved);
+        let visible = build_visible_rumor(&sender_keys.public_key(), &args, &resolved);
         // Canonical id = the RUMOR id (G7 / D1), the SAME id the projection
         // shows in inbox/search rows — never the transport-internal wrap id.
         // Send → inbox → ack/summarize round-trips must work on one id world
@@ -208,7 +228,7 @@ impl Mailbox {
 
         // bcc: variant rumor per bcc listing to+cc+that bcc only.
         for r in resolved.iter().filter(|r| r.role == RecipientRole::Bcc) {
-            let variant = build_bcc_rumor(&sender_keys.public_key(), args, &resolved, r);
+            let variant = build_bcc_rumor(&sender_keys.public_key(), &args, &resolved, r);
             let variant_id = variant.clone().id().to_hex();
             let wrap = gift_wrap::gift_wrap(&sender_keys, &r.npub, variant)
                 .await
@@ -238,6 +258,9 @@ impl Mailbox {
     /// `["e", root, relay, "reply"]` tag on the rumor. Recipients default to
     /// the original message's sender when `to` is empty.
     pub async fn reply_message(&self, args: &SendMessage) -> anyhow::Result<SendResult> {
+        // ADR-0017: canonical root before thread root resolution.
+        let mut args = args.clone();
+        args.project_slug = self.canonical_project(&args.project_slug).await;
         let root = args
             .thread_id
             .clone()
@@ -250,6 +273,10 @@ impl Mailbox {
     /// `fetch_inbox`: project + agent projection of unwrapped kind-1059 mail to
     /// the agent's local key, ordered by rumor time (G7), never envelope time.
     pub async fn fetch_inbox(&self, args: &FetchInbox) -> anyhow::Result<Vec<InboxMessage>> {
+        // ADR-0017: canonical root (read state, receipts) for every spelling
+        // of the project key.
+        let mut args = args.clone();
+        args.project_slug = self.canonical_project(&args.project_slug).await;
         let agent_keys = self.agent_keys_for(&args.project_slug, &args.agent_name)?;
         let npub = agent_keys.public_key();
 
@@ -280,6 +307,12 @@ impl Mailbox {
         let mut messages: Vec<InboxMessage> =
             ordered.into_iter().map(|(m, _seq)| inbox_from(m)).collect();
 
+        // S5 (bd-dup-assign-collapse-ws21): collapse identical
+        // (sender, subject, body-hash) within the window into one row
+        // carrying `duplicate_of: <first-id>` — toron stops double-delivering
+        // duplicate assigns/re-sends; staleness is flywheel's wake concern.
+        messages = collapse_duplicates(messages);
+
         // bd-5icg: read state is a projection concern (never event state).
         // Populate `read_ts_us` from the `message_reads` table and, when the
         // caller asks for unread-only, keep only messages with NO read row for
@@ -288,15 +321,25 @@ impl Mailbox {
         // and every row reports `read_ts_us: None`.
         let mut read_ts: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
         if let Some(pool) = self.index_pool.as_ref() {
-            let rows: Vec<(String, i64)> = sqlx::query_as(
+            // ADR-0017: expand the project to its alias set so legacy read
+            // rows written under a path-form slug stay visible.
+            let set = self.project_read_set(&args.project_slug).await;
+            let ph: Vec<String> = (1..=set.len()).map(|i| format!("?{i}")).collect();
+            let sql = format!(
                 "SELECT message_id, read_ts_us FROM message_reads \
-                 WHERE recipient = ?1 AND project_slug = ?2",
-            )
-            .bind(npub.to_hex())
-            .bind(&args.project_slug)
-            .fetch_all(pool)
-            .await
-            .unwrap_or_default();
+                 WHERE recipient = ?{} AND project_slug IN ({})",
+                set.len() + 1,
+                ph.join(", ")
+            );
+            let mut q = sqlx::query_as::<_, (String, i64)>(&sql);
+            for s in &set {
+                q = q.bind(s);
+            }
+            let rows: Vec<(String, i64)> = q
+                .bind(npub.to_hex())
+                .fetch_all(pool)
+                .await
+                .unwrap_or_default();
             read_ts.extend(rows);
         }
         for m in messages.iter_mut() {
@@ -417,6 +460,18 @@ impl Mailbox {
     }
 
     /// Shared ack/read path (G8).
+    ///
+    /// ADR-0017 D5 — ack authorization + identity-drift repair:
+    /// 1. The wrap is looked up with the ACKER's own keys first (recipient
+    ///    identity, authorization case (a)).
+    /// 2. On a miss (identity drift: the message was addressed to a
+    ///    different identity — the 2026-08-14 split-root repro), the actual
+    ///    recipient is discovered across the project's agents (alias-set
+    ///    expanded), then the acker must be authorized as
+    ///    (b) bound to the same pane as the recipient (herdr, best-effort),
+    ///    or (c) a participant of the message's thread (sender of any thread
+    ///    message, or able to unwrap any wrap in the same thread).
+    ///    Otherwise the ack is REFUSED — "not authorized".
     async fn send_receipt(
         &self,
         project_slug: &str,
@@ -425,28 +480,33 @@ impl Mailbox {
         kind: &str,
         acknowledged: bool,
     ) -> anyhow::Result<ReceiptResult> {
-        // Find the original message (the wrap addressed to this agent) to learn
-        // the sender npub; the ack goes to them ONLY.
-        let agent_keys = self.agent_keys_for(project_slug, agent_name)?;
+        let project_slug = &self.canonical_project(project_slug).await; // ADR-0017
+        let agent_keys = self.agent_keys_for(&project_slug, agent_name)?;
         let npub = agent_keys.public_key();
 
-        let filter = ToronFilter::new()
-            .kinds([nostr_sdk::nostr::Kind::GiftWrap])
-            .pubkey(npub)
-            .build();
-        let events = super::collect_replay(self.bus.as_ref(), filter).await?;
-        let original = events.iter().find_map(|wrap| {
-            let gift = gift_wrap::unwrap(&agent_keys, wrap).ok()?;
-            (gift.rumor.clone().id().to_hex() == message_id).then_some(gift)
-        });
-        let Some(original) = original else {
-            anyhow::bail!("message not found for agent {agent_name}: {message_id}");
+        // Case (a): the wrap addressed to THIS agent (the recipient).
+        let original = match self.find_message_for_keys(&agent_keys, message_id).await? {
+            Some(gift) => gift,
+            None => {
+                // Identity drift: the message exists but was addressed to a
+                // different identity. Discover the actual recipient across
+                // the project's agents (alias-set expanded), then authorize.
+                let (gift, recipient_name) = self
+                    .find_message_across_agents(&project_slug, message_id)
+                    .await?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("message not found for agent {agent_name}: {message_id}")
+                    })?;
+                self.authorize_ack(&project_slug, agent_name, &recipient_name, &gift)
+                    .await?;
+                gift
+            }
         };
         let sender_npub = original.sender;
 
         // Idempotency: already acked/read → return stored receipt.
         let id = EventId::from_hex(message_id).unwrap_or_else(|_| original.rumor.clone().id());
-        if let Some(ts) = self.receipt_time(project_slug, agent_name, &id, kind) {
+        if let Some(ts) = self.receipt_time(&project_slug, agent_name, &id, kind) {
             return Ok(ReceiptResult {
                 message_id: message_id.to_string(),
                 acknowledged,
@@ -472,13 +532,133 @@ impl Mailbox {
             .map_err(|e| anyhow::anyhow!("gift wrap failed for receipt to {sender_npub}: {e}"))?;
         let ts_us = crate::index::writer::Clock::now_us(&crate::index::writer::SystemClock);
         self.publish_dm(&wrap).await?;
-        self.record_receipt(project_slug, agent_name, &id, kind, ts_us);
-        self.record_read_state(project_slug, npub, &id, ts_us).await;
+        self.record_receipt(&project_slug, agent_name, &id, kind, ts_us);
+        self.record_read_state(&project_slug, npub, &id, ts_us).await;
 
         Ok(ReceiptResult {
             message_id: message_id.to_string(),
             acknowledged,
             acknowledged_at_us: Some(ts_us),
+        })
+    }
+
+    /// Find the unwrapped gift for `message_id` addressed to `keys`
+    /// (replay the recipient's wraps, match the rumor id). `None` when this
+    /// identity was not the recipient.
+    async fn find_message_for_keys(
+        &self,
+        keys: &Keys,
+        message_id: &str,
+    ) -> anyhow::Result<Option<UnwrappedGift>> {
+        let npub = keys.public_key();
+        let filter = ToronFilter::new()
+            .kinds([nostr_sdk::nostr::Kind::GiftWrap])
+            .pubkey(npub)
+            .build();
+        let events = super::collect_replay(self.bus.as_ref(), filter).await?;
+        Ok(events.iter().find_map(|wrap| {
+            let gift = gift_wrap::unwrap(keys, wrap).ok()?;
+            (gift.rumor.clone().id().to_hex() == message_id).then_some(gift)
+        }))
+    }
+
+    /// Identity-drift repair (ADR-0017 D5): discover the actual recipient of
+    /// `message_id` across the project's agents (alias-set expanded). Tries
+    /// every agent's local key until the wrap unwraps.
+    async fn find_message_across_agents(
+        &self,
+        project_slug: &str,
+        message_id: &str,
+    ) -> anyhow::Result<Option<(UnwrappedGift, String)>> {
+        let agents = self.list_agents(project_slug, ListAgentsOptions::default()).await?;
+        for agent in agents {
+            let Ok(keys) = self.agent_keys_for(project_slug, &agent.name) else {
+                continue; // no local key for this identity — skip
+            };
+            if let Some(gift) = self.find_message_for_keys(&keys, message_id).await? {
+                return Ok(Some((gift, agent.name)));
+            }
+        }
+        Ok(None)
+    }
+
+    /// ADR-0017 D5 authorization: the acker (whose own keys did NOT unwrap
+    /// the wrap — otherwise case (a) already applied) must be
+    /// (b) bound to the same pane as the recipient (herdr, best-effort), or
+    /// (c) a participant of the message's thread — the sender of the
+    /// message, or able to unwrap ANY wrap in the same thread.
+    async fn authorize_ack(
+        &self,
+        project_slug: &str,
+        acker_name: &str,
+        recipient_name: &str,
+        gift: &UnwrappedGift,
+    ) -> anyhow::Result<()> {
+        // (c.1) The message's own sender is a thread participant.
+        let acker_keys = self.agent_keys_for(project_slug, acker_name)?;
+        if acker_keys.public_key() == gift.sender {
+            return Ok(());
+        }
+
+        // (b) Same herdr pane as the recipient (best-effort: no herdr
+        // backend wired → the check degrades to (c) only).
+        if let Ok(backend) = HerdrBackend::connect(None) {
+            let mut client = backend.client();
+            if let Ok(agents) = client.agent_list() {
+                let pane_of = |name: &str| {
+                    agents
+                        .iter()
+                        .find(|a| a.name.as_deref() == Some(name))
+                        .map(|a| a.pane_id.clone())
+                        .unwrap_or_default()
+                };
+                let (acker_pane, recipient_pane) = (pane_of(acker_name), pane_of(recipient_name));
+                if !acker_pane.is_empty() && acker_pane == recipient_pane {
+                    return Ok(());
+                }
+            }
+        }
+
+        // (c.2) The acker can unwrap ANY wrap in the same thread — including
+        // the thread ROOT itself: a head message is its own thread (the
+        // projection's attribution rule), so holding the root is membership.
+        if let Some(thread_id) = Self::rumor_thread_id(&gift.rumor) {
+            let acker_npub = acker_keys.public_key();
+            let filter = ToronFilter::new()
+                .kinds([nostr_sdk::nostr::Kind::GiftWrap])
+                .pubkey(acker_npub)
+                .build();
+            let events = super::collect_replay(self.bus.as_ref(), filter).await?;
+            let in_thread = events.iter().any(|wrap| {
+                gift_wrap::unwrap(&acker_keys, wrap)
+                    .ok()
+                    .map(|g| {
+                        let rumor_id = g.rumor.clone().id().to_hex();
+                        rumor_id == thread_id
+                            || Self::rumor_thread_id(&g.rumor).as_ref() == Some(&thread_id)
+                    })
+                    .unwrap_or(false)
+            });
+            if in_thread {
+                return Ok(());
+            }
+        }
+
+        anyhow::bail!(
+            "agent {acker_name} is not authorized to ack message {} (not the recipient, not pane-bound, not a thread participant)",
+            gift.rumor.clone().id().to_hex()
+        )
+    }
+
+    /// The thread id of a rumor: the literal `thread` tag, else the NIP-10
+    /// `e` root tag (mirrors the projection's thread attribution).
+    fn rumor_thread_id(rumor: &nostr_sdk::nostr::UnsignedEvent) -> Option<String> {
+        rumor.tags.iter().find_map(|t| {
+            let s = t.as_slice();
+            match s.first().map(|x| x.as_str()) {
+                Some("thread") | Some("e") if s.len() > 1 => Some(s[1].to_string()),
+                _ => None,
+            }
         })
     }
 
@@ -737,7 +917,49 @@ fn inbox_from(mail: UnwrappedMail) -> InboxMessage {
         thread_id,
         created_ts_us: mail.ts_us(),
         read_ts_us: None, // filled by fetch_inbox from the message_reads projection
+        duplicate_of: None,
     }
+}
+
+/// S5 (bd-dup-assign-collapse-ws21): projection-level duplicate collapse.
+///
+/// Messages with the same (sender, subject, body-hash) within the collapse
+/// window collapse into ONE inbox row. The surviving row is the LATEST copy,
+/// marked `duplicate_of: Some(<first-id>)`; earlier identical copies are
+/// dropped from the projection (they still exist in the archive/event
+/// stream — this is projection-only, honest for E2E gift-wrap where a
+/// re-sent wrap is a genuinely new event).
+///
+/// The window is measured from the FIRST occurrence: an identical message
+/// arriving 4 days later is NOT collapsed (it is a fresh, not a duplicate —
+/// staleness handling is flywheel's wake-side concern, S8).
+pub fn collapse_duplicates(messages: Vec<InboxMessage>) -> Vec<InboxMessage> {
+    use std::collections::HashMap;
+    // key = (sender, subject, body-hash) -> (first_id, first_ts_us, out_index)
+    let mut groups: HashMap<(String, String, String), (String, i64, usize)> = HashMap::new();
+    let mut out: Vec<InboxMessage> = Vec::with_capacity(messages.len());
+    for m in messages {
+        let body_hash = sha2::Sha256::digest(m.body_md.as_bytes());
+        let hash_hex = format!("{body_hash:x}");
+        let key = (m.sender.clone(), m.subject.clone(), hash_hex);
+        match groups.get(&key) {
+            Some((first_id, first_ts, idx))
+                if m.created_ts_us - first_ts <= DUP_COLLAPSE_WINDOW_US =>
+            {
+                // Duplicate within window: the LATEST copy survives at the
+                // group's row slot, marked with the first id.
+                let mut survivor = m;
+                survivor.duplicate_of = Some(first_id.clone());
+                out[*idx] = survivor;
+            }
+            _ => {
+                // First occurrence (or outside window → new group).
+                out.push(m.clone());
+                groups.insert(key, (m.id, m.created_ts_us, out.len() - 1));
+            }
+        }
+    }
+    out
 }
 
 /// True when a flag tag (no value) is present, e.g. `["ack-required"]`.
@@ -821,6 +1043,102 @@ mod tests {
             .await
             .expect("collect");
         events.into_iter().take(limit).collect()
+    }
+
+    /// S5 (bd-dup-assign-collapse-ws21): projection-level duplicate collapse.
+    /// Identical (sender, subject, body-hash) within the window collapse into
+    /// one row carrying `duplicate_of: <first-id>`; outside the window they
+    /// stay separate.
+    #[test]
+    fn collapse_duplicates_within_window_marks_duplicate_of() {
+        let mk = |id: &str, sender: &str, subject: &str, body: &str, ts: i64| InboxMessage {
+            id: id.into(),
+            sender: sender.into(),
+            subject: subject.into(),
+            body_md: body.into(),
+            importance: "normal".into(),
+            ack_required: true,
+            thread_id: None,
+            created_ts_us: ts,
+            read_ts_us: None,
+            duplicate_of: None,
+        };
+
+        // Two identical assigns (same sender+subject+body) 10s apart → one
+        // row, the LATEST copy, marked duplicate_of = first id.
+        let first = mk("first", "PiAlpha", "assign", "build it", 1_700_000_000_000_000);
+        let dup = mk("dup", "PiAlpha", "assign", "build it", 1_700_000_000_010_000);
+        let collapsed = collapse_duplicates(vec![first.clone(), dup]);
+        assert_eq!(collapsed.len(), 1, "duplicates collapse to one row");
+        assert_eq!(collapsed[0].id, "dup", "latest copy survives");
+        assert_eq!(
+            collapsed[0].duplicate_of.as_deref(),
+            Some("first"),
+            "survivor carries duplicate_of = first id"
+        );
+
+        // Outside the window (2h later) → NOT collapsed.
+        let old = mk("old", "PiAlpha", "assign", "build it", 1_700_000_000_000_000);
+        let late = mk("late", "PiAlpha", "assign", "build it", 1_700_007_200_000_000);
+        let kept = collapse_duplicates(vec![old, late]);
+        assert_eq!(kept.len(), 2, "outside window stays separate");
+        assert!(kept.iter().all(|m| m.duplicate_of.is_none()));
+
+        // Different body → no collapse.
+        let a = mk("a", "PiAlpha", "assign", "build it", 1_700_000_000_000_000);
+        let b = mk("b", "PiAlpha", "assign", "build other", 1_700_000_000_010_000);
+        let kept2 = collapse_duplicates(vec![a, b]);
+        assert_eq!(kept2.len(), 2, "different body is not a duplicate");
+
+        // Different sender → no collapse.
+        let c = mk("c", "Beta", "assign", "build it", 1_700_000_000_000_000);
+        let kept3 = collapse_duplicates(vec![first, c]);
+        assert_eq!(kept3.len(), 2, "different sender is not a duplicate");
+    }
+
+    /// S5 integration: two identical sends land as ONE inbox row with
+    /// `duplicate_of`; a third with different body stays separate.
+    #[tokio::test]
+    async fn fetch_inbox_collapses_duplicate_assigns() {
+        let (mailbox, db_path, data_dir) = test_mailbox("dup").await;
+        let (_sender, _) = register(&mailbox, "demo", "GreenCastle").await;
+        let (_recv, _npub) = register(&mailbox, "demo", "BlueLake").await;
+
+        let send = |body: &str| SendMessage {
+            project_slug: "demo".into(),
+            sender_name: "GreenCastle".into(),
+            to: vec!["BlueLake".into()],
+            subject: "assign".into(),
+            body_md: body.into(),
+            ..Default::default()
+        };
+
+        mailbox.send_message(&send("build it")).await.expect("send 1");
+        mailbox.send_message(&send("build it")).await.expect("send 2 (dup)");
+        mailbox.send_message(&send("build other")).await.expect("send 3 (distinct)");
+
+        let inbox = mailbox
+            .fetch_inbox(&FetchInbox {
+                project_slug: "demo".into(),
+                agent_name: "BlueLake".into(),
+                include_bodies: true,
+                ..Default::default()
+            })
+            .await
+            .expect("inbox");
+        assert_eq!(inbox.len(), 2, "duplicate collapses to one row");
+        let dupes: Vec<&InboxMessage> = inbox
+            .iter()
+            .filter(|m| m.subject == "assign" && m.body_md == "build it")
+            .collect();
+        assert_eq!(dupes.len(), 1, "identical assigns collapsed");
+        assert!(
+            dupes[0].duplicate_of.is_some(),
+            "survivor marked with duplicate_of = first id"
+        );
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
     }
 
     #[tokio::test]
@@ -1107,6 +1425,105 @@ mod tests {
                     .unwrap_or(false)
             }),
             "sender received a private ack wrap"
+        );
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    // ---- ADR-0017 D5: ack authorization ----
+    //
+    // acknowledge_message may be performed by (a) the addressed recipient,
+    // (b) any identity bound to the same pane (herdr, not testable here), or
+    // (c) any thread participant. Identity drift (the split-root repro) is
+    // repaired by discovering the actual recipient across the project's
+    // agents before the authorization gate.
+
+    #[tokio::test]
+    async fn test_ack_by_thread_participant_authorized() {
+        let (mailbox, db_path, data_dir) = test_mailbox("ack-thread").await;
+        let (gc, gc_npub) = register(&mailbox, "demo", "GreenCastle").await;
+        let (bl, bl_npub) = register(&mailbox, "demo", "BlueLake").await;
+        let (_rd, _) = register(&mailbox, "demo", "RedDune").await;
+
+        // msg1: GreenCastle → BlueLake (thread T = msg1 id). BlueLake's one
+        // and only thread membership.
+        let args = SendMessage {
+            project_slug: "demo".into(),
+            sender_name: "GreenCastle".into(),
+            to: vec!["BlueLake".into()],
+            subject: "root".into(),
+            body_md: "thread root".into(),
+            ..Default::default()
+        };
+        mailbox.send_message(&args).await.expect("send msg1");
+        let wrap1 = &wraps_to(&mailbox, &bl_npub, 2).await[0];
+        let msg1 = unwrap_for_recipient(&bl, wrap1).expect("unwrap msg1");
+        let thread_id = msg1.rumor.clone().id().to_hex();
+
+        // msg2: RedDune replies in the SAME thread, addressed to GreenCastle.
+        // BlueLake is neither recipient nor sender of msg2 — a participant.
+        let reply = SendMessage {
+            project_slug: "demo".into(),
+            sender_name: "RedDune".into(),
+            to: vec!["GreenCastle".into()],
+            subject: "reply".into(),
+            body_md: "in thread".into(),
+            thread_id: Some(thread_id.clone()),
+            ..Default::default()
+        };
+        mailbox.reply_message(&reply).await.expect("reply msg2");
+        let msg2_id = wraps_to(&mailbox, &gc_npub, 4)
+            .await
+            .iter()
+            .find_map(|w| gift_wrap::unwrap(&gc, w).ok().map(|g| g.rumor.clone().id().to_hex()))
+            .expect("msg2 id");
+
+        // BlueLake acks msg2 — its own keys cannot unwrap it (addressed to
+        // GreenCastle), so the drift path discovers the recipient and the
+        // thread-participant gate authorizes.
+        let res = mailbox
+            .acknowledge_message("demo", "BlueLake", &msg2_id)
+            .await
+            .expect("participant ack accepted");
+        assert!(res.acknowledged, "thread participant may ack");
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn test_ack_by_unrelated_agent_refused() {
+        let (mailbox, db_path, data_dir) = test_mailbox("ack-refused").await;
+        let (_gc, _) = register(&mailbox, "demo", "GreenCastle").await;
+        let (bl, bl_npub) = register(&mailbox, "demo", "BlueLake").await;
+        let (_df, _) = register(&mailbox, "demo", "DarkForest").await;
+
+        // GreenCastle → BlueLake; DarkForest has NO membership in the thread.
+        let args = SendMessage {
+            project_slug: "demo".into(),
+            sender_name: "GreenCastle".into(),
+            to: vec!["BlueLake".into()],
+            subject: "private".into(),
+            body_md: "only bl".into(),
+            ..Default::default()
+        };
+        mailbox.send_message(&args).await.expect("send");
+        let wrap = &wraps_to(&mailbox, &bl_npub, 2).await[0];
+        let message_id = unwrap_for_recipient(&bl, wrap)
+            .expect("unwrap")
+            .rumor
+            .clone()
+            .id()
+            .to_hex();
+
+        let err = mailbox
+            .acknowledge_message("demo", "DarkForest", &message_id)
+            .await
+            .expect_err("unrelated agent refused");
+        assert!(
+            err.to_string().contains("not authorized"),
+            "refusal names authorization: {err}"
         );
 
         let _ = std::fs::remove_file(&db_path);
