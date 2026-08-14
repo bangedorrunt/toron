@@ -17,6 +17,8 @@ This directory contains records of the major architectural decisions made for th
 | [0011](0011-coalition-orchestration.md) | Coalition Orchestration — Steer + Collab as Layers, Intent-Based Coordination | **Accepted** (2026-08-13; implemented + live) |
 | [0012](0012-standalone-cron-type.md) | Standalone Cron Type — a scheduled primitive distinct from workflow | **Accepted** (2026-08-13; implemented + live; amends ADR-0005 Spec 3) |
 | [0013](0013-website-architecture-and-feature-presentation.md) | toron.dev Website Architecture and Feature Presentation | **Accepted** (2026-08-13; 3-agent research swarm teardown of swarmtools.ai + herdr.dev; 11 decisions via 2-round captain grilling; dark + Nostr violet; Next.js + Fumadocs; kill-the-daemon hero; flywheel as section; companion flywheel ADR-0004) |
+| [0014](0014-kind-registry-specification.md) | Kind Registry Specification — formal spec of every custom Nostr kind | **Accepted** (2026-08-14; amends ADR-0003) |
+| [0015](0015-flywheel-toron-integration-contract.md) | Flywheel ↔ Toron Integration Contract — the boundary guarantees | **Accepted** (2026-08-14) |
 
 ## Parity catalogs
 
