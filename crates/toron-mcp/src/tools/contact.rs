@@ -69,7 +69,7 @@ impl ToolServer {
     /// `list_contacts`: an agent's contact links.
     #[tool(
         name = "list_contacts",
-        description = "List an agent's contact links (AgentLink rows).",
+        description = "List an agent's contact links (AgentLink rows). Link status is the social graph (pending|approved|denied) — it does NOT gate mail. Delivery is gated by the RECIPIENT's contact policy (kind-30014, see set_contact_policy, default auto): a pending link still receives mail unless the recipient's policy blocks it.",
         output_schema = rmcp::handler::server::tool::schema_for_output::<Vec<crate::responses::ContactLinkOut>>(),
         annotations(title = "List contacts", read_only_hint = true)
     )]

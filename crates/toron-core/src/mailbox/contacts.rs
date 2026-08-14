@@ -28,7 +28,16 @@ use crate::nostr::kinds::{AGENT_PROFILE, CONTACT_POLICY, toron_kind};
 
 use super::Mailbox;
 use super::collect_replay;
-/// Status of an AgentLink.
+/// Status of an AgentLink — the SOCIAL GRAPH, not a delivery gate
+/// (ADR-0003 G14; S7 bd-contact-semantics-hs08).
+///
+/// - `pending`: request sent, not yet answered. Mail to a `pending` target
+///   STILL DELIVERS: the sender-side gate is the recipient being registered;
+///   the recipient-side gate is their contact policy (kind-30014, default
+///   `auto`), applied on INBOUND projection. `pending` never blocks.
+/// - `approved`: the peer accepted the request.
+/// - `denied`: the peer rejected the request (social statement; delivery
+///   rules unchanged — policy still governs).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum LinkStatus {
     Pending,
@@ -54,7 +63,10 @@ impl LinkStatus {
     }
 }
 
-/// A contact link (AgentLink) between two agents.
+/// A contact link (AgentLink) between two agents. Link rows describe the
+/// social graph; they do NOT gate mail. Inbound delivery is gated by the
+/// recipient's contact policy (kind-30014, [`ContactPolicy`]) — see
+/// [`LinkStatus`] for the pending-does-not-block contract.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ContactLink {
     pub project_slug: String,
@@ -63,6 +75,8 @@ pub struct ContactLink {
     pub to_name: String,
     pub to_pubkey: String,
     pub to_project: Option<String>,
+    /// `pending` | `approved` | `denied` — social graph state, not a
+    /// delivery gate (pending links still receive mail).
     pub status: LinkStatus,
     pub created_ts_us: i64,
 }

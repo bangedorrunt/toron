@@ -292,7 +292,14 @@ impl ToJson for RenewResult {
 
 impl ToJson for ReleaseResult {
     fn to_json(&self) -> Value {
-        json!({ "released": self.released })
+        json!({
+            "released": self.released,
+            "leases": self.leases.iter().map(|l| json!({
+                "path": l.path,
+                "mode": l.mode,
+                "holder": l.holder,
+            })).collect::<Vec<_>>(),
+        })
     }
 }
 
