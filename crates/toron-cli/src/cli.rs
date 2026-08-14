@@ -91,6 +91,10 @@ pub enum Command {
     /// Quick health/config overview (human by default, --json for machines).
     Status,
 
+    /// Emit the MCP surface catalog (38 tools, 25 resources, CLI commands).
+    /// The toron.dev catalog contract (ADR-0002 D3).
+    Catalog,
+
     /// Show the effective configuration (flags > env > project > user > system).
     Config(ConfigArgs),
 

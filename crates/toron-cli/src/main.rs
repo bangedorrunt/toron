@@ -1,6 +1,7 @@
 // governed-by: ADR-0003
 #![forbid(unsafe_code)]
 
+mod catalog;
 mod cli;
 mod config;
 mod daemon;
@@ -10,6 +11,7 @@ mod robot;
 mod tui;
 mod workflow;
 
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::Parser;
@@ -59,6 +61,10 @@ fn run(cli: &Cli) -> anyhow::Result<ExitCode> {
         }
         Command::Status => {
             run_status(&cfg, format)?;
+            ExitCode::SUCCESS
+        }
+        Command::Catalog => {
+            run_catalog(cli.globals.output.clone())?;
             ExitCode::SUCCESS
         }
         Command::Config(args) => {
@@ -272,6 +278,20 @@ async fn run_robot(command: &Command) -> anyhow::Result<()> {
         Err(e) => {
             operator::record_tool_error(tool_name, start.elapsed());
             Err(e)
+        }
+    }
+}
+
+/// `toron catalog` — the MCP surface catalog (ADR-0002 D3): 38 tools, 25
+/// resources, CLI commands. `--output <path>` writes the committed
+/// `docs/catalog/toron-mcp.json`; otherwise the catalog prints to stdout.
+fn run_catalog(output: Option<PathBuf>) -> anyhow::Result<()> {
+    let catalog = catalog::catalog_now()?;
+    match output {
+        Some(path) => catalog::write_catalog(&path, &catalog),
+        None => {
+            println!("{}", serde_json::to_string_pretty(&catalog)?);
+            Ok(())
         }
     }
 }

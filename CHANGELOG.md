@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **Catalog pipeline (toron.dev ADR-0002 D3, 2026-08-14)** — `toron catalog`
+  emits the machine-readable surface catalog to `docs/catalog/toron-mcp.json`:
+  all 38 AM-Rust parity tools (name, group, description, input/output JSON
+  schemas verbatim from the rmcp `#[tool]` definitions; the bd-h3oj additive
+  excluded by contract) + the 25 resources + the CLI `Command` enum
+  introspected from clap. `cargo test catalog_freshness` regenerates and
+  diffs — a surface change without a regen fails red (unmergeable). New
+  extractor modules: `toron-mcp/src/catalog.rs`, `toron-cli/src/catalog.rs`.
 - **ADR-0014 — Kind Registry Specification (2026-08-14)** — formalizes all 12 custom
   Nostr kinds (fields, d-tag semantics, lifecycle states, `status:` field on 30031,
   @mention `p` tag convention, job lifecycle 43001-43006, approval kinds 46011/46012).

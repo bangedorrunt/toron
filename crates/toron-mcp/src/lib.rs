@@ -11,6 +11,7 @@
 //! `bd-led.7.2` wires the 38 AM-Rust tools; `bd-led.7.3` exposes the 25 resources.
 
 pub mod blob_serve;
+pub mod catalog;
 pub mod resources;
 pub mod responses;
 pub mod server;

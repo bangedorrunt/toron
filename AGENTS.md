@@ -22,6 +22,7 @@ toron/
 ├── crates/toron-cli/        # bin `toron`
 ├── crates/toron-e2e/        # SC-* scenarios (feature-gated)
 ├── docs/decisions/          # ADRs (read before structural change)
+├── docs/catalog/            # generated surface catalog (toron.dev ADR-0002 D3)
 ├── workflows/               # product YAML (not GitHub Actions)
 └── scripts/verify-gates.sh  # ADR-0003 CI policy
 ```
@@ -41,6 +42,7 @@ Child maps: [toron-core](crates/toron-core/AGENTS.md) ·
 | Workflow YAML / engine | `crates/toron-workflow/src/{schema,engine}/` |
 | Cron (distinct type) | `crates/toron-workflow/src/cron.rs` (ADR-0012) |
 | MCP tools | `crates/toron-mcp/src/tools/` |
+| Catalog surface | `crates/toron-mcp/src/catalog.rs` + `crates/toron-cli/src/catalog.rs` (`docs/catalog/`) |
 | CLI / daemon | `crates/toron-cli/src/{cli,daemon,main}.rs` |
 | ADRs | `docs/decisions/` |
 
@@ -50,6 +52,7 @@ Child maps: [toron-core](crates/toron-core/AGENTS.md) ·
 - New/changed ADR-constrained files: `// governed-by: ADR-XXXX` at top.
 - Deps one-way: **flywheel → toron-workflow → toron-core**. Never reverse.
 - Frozen: 39 tool names (38 AM-Rust parity + 1 toron additive), 25 resources, kind registry. No new kinds/tools without an ADR.
+- Catalog: `toron catalog --json` regenerates `docs/catalog/toron-mcp.json`; `cargo test catalog_freshness` fails red on surface drift without regen (toron.dev ADR-0002 D3).
 - `MessageId` is String/hex. Never `u64` in shared request/response types.
 - `t` tag = project slug only. Never harness/model/job tags.
 - TDD for new features and bug fixes. No benches in this repo.
@@ -85,6 +88,8 @@ the skill is invisible to any agent that triggers the skill.
 ```bash
 bash scripts/verify-gates.sh
 cargo test --workspace
+cargo test catalog_freshness                  # catalog drift gate (toron.dev ADR-0002 D3)
+toron catalog --json                          # emit 38-tool / 25-resource / CLI catalog
 cargo test -p toron-e2e --features p1          # SC-1..8
 cargo test -p toron-e2e --features p2          # needs resonate on PATH
 cargo test -p toron-e2e --features p4          # SC-18..25 (implies p5)
