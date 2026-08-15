@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use parking_lot::Mutex;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use super::error::BackendError;
 use super::herdr::{AgentInfo, PaneInfo, Subscription, WaitOptions, WorkspaceInfo};
@@ -153,7 +153,12 @@ impl super::Backend for MockBackend {
         Ok(())
     }
 
-    fn pane_wait_output(&self, _pane_id: &str, _needle: &str, _timeout_ms: u64) -> Result<Value, BackendError> {
+    fn pane_wait_output(
+        &self,
+        _pane_id: &str,
+        _needle: &str,
+        _timeout_ms: u64,
+    ) -> Result<Value, BackendError> {
         Ok(json!({ "matched_line": null, "read": "" }))
     }
 
@@ -266,10 +271,7 @@ impl super::Backend for MockBackend {
     }
 
     fn agent_send_keys(&self, target: &str, keys: &[&str]) -> Result<(), BackendError> {
-        self.state
-            .lock()
-            .keys
-            .push((target.into(), keys.join("")));
+        self.state.lock().keys.push((target.into(), keys.join("")));
         Ok(())
     }
 
@@ -290,7 +292,10 @@ impl super::EventStream for MockEventStream {
         Ok(self.0.recv().ok())
     }
 
-    fn set_read_timeout(&mut self, _timeout: Option<std::time::Duration>) -> Result<(), BackendError> {
+    fn set_read_timeout(
+        &mut self,
+        _timeout: Option<std::time::Duration>,
+    ) -> Result<(), BackendError> {
         Ok(())
     }
 }
@@ -298,27 +303,43 @@ impl super::EventStream for MockEventStream {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::error::BackendErrorCode;
     use crate::backend::Backend;
+    use crate::backend::error::BackendErrorCode;
 
     #[test]
     fn mock_records_prompts_and_keys() {
         let backend = MockBackend::new();
-        let pane = backend.agent_start("PiAlpha", "pi", "pane-0", &[]).expect("start");
-        backend.prompt(&pane.pane_id, "hello", None).expect("prompt");
-        backend.agent_send_keys(&pane.pane_id, &["ctrl-c"]).expect("keys");
+        let pane = backend
+            .agent_start("PiAlpha", "pi", "pane-0", &[])
+            .expect("start");
+        backend
+            .prompt(&pane.pane_id, "hello", None)
+            .expect("prompt");
+        backend
+            .agent_send_keys(&pane.pane_id, &["ctrl-c"])
+            .expect("keys");
 
-        assert_eq!(backend.prompts(), vec![("pane-0".to_string(), "hello".to_string())]);
-        assert_eq!(backend.keys(), vec![("pane-0".to_string(), "ctrl-c".to_string())]);
+        assert_eq!(
+            backend.prompts(),
+            vec![("pane-0".to_string(), "hello".to_string())]
+        );
+        assert_eq!(
+            backend.keys(),
+            vec![("pane-0".to_string(), "ctrl-c".to_string())]
+        );
     }
 
     #[test]
     fn mock_wait_returns_pushed_status_then_unknown() {
         let backend = MockBackend::new();
         backend.push_status(AgentStatus::Done);
-        let info = backend.agent_wait("pane-0", &[AgentStatus::Done], None).unwrap();
+        let info = backend
+            .agent_wait("pane-0", &[AgentStatus::Done], None)
+            .unwrap();
         assert_eq!(info.agent_status, AgentStatus::Done);
-        let info2 = backend.agent_wait("pane-0", &[AgentStatus::Done], None).unwrap();
+        let info2 = backend
+            .agent_wait("pane-0", &[AgentStatus::Done], None)
+            .unwrap();
         assert_eq!(info2.agent_status, AgentStatus::Unknown);
     }
 

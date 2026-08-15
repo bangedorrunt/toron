@@ -718,7 +718,7 @@ async fn cluster_file_reservations() -> anyhow::Result<()> {
     // (non-stale) holder — that denial is the right behavior, not a failure.
     // We assert the tool runs the operator-gated logic and returns EITHER a
     // release OR a structured denial (both prove the tool is functional).
-    let re_acq = d
+    let _re_acq = d
         .call(
             "file_reservation_paths",
             serde_json::json!({

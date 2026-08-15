@@ -312,15 +312,13 @@ impl Mailbox {
                 if slug == project_slug {
                     continue;
                 }
-                if p.join("agents").is_dir() {
-                    if std::path::Path::new(&slug)
+                if p.join("agents").is_dir()
+                    && std::path::Path::new(&slug)
                         .file_name()
-                        .map(|f| f.to_str())
-                        .flatten()
+                        .and_then(|f| f.to_str())
                         == Some(want.as_str())
-                    {
-                        candidates.push(slug);
-                    }
+                {
+                    candidates.push(slug);
                 }
                 // Descend regardless: a project root may nest deeper roots.
                 stack.push(p);
@@ -383,8 +381,7 @@ impl Mailbox {
                 if p.join("agents").is_dir()
                     && std::path::Path::new(&slug)
                         .file_name()
-                        .map(|f| f.to_str())
-                        .flatten()
+                        .and_then(|f| f.to_str())
                         == Some(want.as_str())
                 {
                     out.push(slug.clone());

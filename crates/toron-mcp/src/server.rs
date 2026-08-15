@@ -261,8 +261,8 @@ pub async fn demo_mailbox() -> anyhow::Result<Mailbox> {
 /// [`Mailbox::with_trigger_tx`] so every successfully-projected gift-wrap
 /// notifies the channel; the `rx` half feeds
 /// [`WorkflowHost::spawn_mail_trigger_loop`] (F1 `message_posted`).
-pub async fn demo_mailbox_with_trigger(
-) -> anyhow::Result<(Mailbox, tokio::sync::mpsc::UnboundedReceiver<UnwrappedMail>)> {
+pub async fn demo_mailbox_with_trigger()
+-> anyhow::Result<(Mailbox, tokio::sync::mpsc::UnboundedReceiver<UnwrappedMail>)> {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mailbox = build_mailbox(Some(tx)).await?;
     Ok((mailbox, rx))
@@ -340,9 +340,9 @@ fn spawn_mail_trigger_host(
             host.spawn_mail_trigger_loop(trigger_rx);
             host.spawn_trigger_loop();
         }
-        Err(e) => tracing::warn!(
-            "workflow host unavailable; message_posted triggers disabled: {e:#}"
-        ),
+        Err(e) => {
+            tracing::warn!("workflow host unavailable; message_posted triggers disabled: {e:#}")
+        }
     }
 }
 
@@ -410,9 +410,8 @@ pub async fn router() -> anyhow::Result<axum::Router> {
     // `/.blossom` (BUD-01 retrieval + BUD-02 upload) over a per-daemon blob
     // store rooted at the demo data dir's `blobs/`.
     let blob_root = std::env::temp_dir().join("toron-mcp-demo").join("blobs");
-    let blossom = crate::blob_serve::blossom_router(
-        toron_core::archive::blob::BlobStore::new(blob_root),
-    );
+    let blossom =
+        crate::blob_serve::blossom_router(toron_core::archive::blob::BlobStore::new(blob_root));
     Ok(axum::Router::new()
         .nest_service("/mcp", service)
         .merge(blossom))
@@ -461,7 +460,9 @@ mod tests {
         let db = std::env::temp_dir().join(format!("serve-wire-{}.sqlite", uuid::Uuid::new_v4()));
         let data_dir =
             std::env::temp_dir().join(format!("serve-wire-data-{}", uuid::Uuid::new_v4()));
-        let pool = schema::connect(db.to_str().unwrap()).await.expect("connect");
+        let pool = schema::connect(db.to_str().unwrap())
+            .await
+            .expect("connect");
         schema::migrate(&pool).await.expect("migrate");
         let bus: Arc<dyn Bus> = Arc::new(
             InProcessBus::open(pool.clone(), InProcessBusConfig::default())
@@ -478,25 +479,16 @@ mod tests {
                 .with_index_pool(pool.clone()),
         );
         mailbox
-            .register_agent(
-                "demo",
-                &AgentProfile::new("demo-user"),
-            )
+            .register_agent("demo", &AgentProfile::new("demo-user"))
             .await
             .expect("register sender");
         mailbox
-            .register_agent(
-                "demo",
-                &AgentProfile::new("BlueLake"),
-            )
+            .register_agent("demo", &AgentProfile::new("BlueLake"))
             .await
             .expect("register recipient");
         // The workflow ActionRunner sends as `workflow-<project>` (F6 stamp).
         mailbox
-            .register_agent(
-                "demo",
-                &AgentProfile::new("workflow-demo"),
-            )
+            .register_agent("demo", &AgentProfile::new("workflow-demo"))
             .await
             .expect("register workflow sender");
         mailbox.spawn_unwrap_loop();
@@ -560,18 +552,17 @@ steps:
                     let recipient =
                         toron_core::keys::load_encrypted_key(&key_path, "serve-wire-pass")
                             .expect("disk key");
-                    if let Ok(unwrapped) =
-                        toron_core::nostr::gift_wrap::unwrap(&recipient, &ev)
-                    {
+                    if let Ok(unwrapped) = toron_core::nostr::gift_wrap::unwrap(&recipient, &ev) {
                         ack_body_seen = unwrapped.rumor.content.contains("workflow ack");
                         let stamped = unwrapped.rumor.tags.iter().any(|t| {
                             t.as_slice().first().map(String::as_str) == Some("t")
                                 && t.as_slice().get(1).map(String::as_str)
-                                    == Some(
-                                        toron_workflow::trigger_filter::WORKFLOW_EMITTED_TAG,
-                                    )
+                                    == Some(toron_workflow::trigger_filter::WORKFLOW_EMITTED_TAG)
                         });
-                        assert!(stamped, "workflow reply must carry the workflow-emitted stamp");
+                        assert!(
+                            stamped,
+                            "workflow reply must carry the workflow-emitted stamp"
+                        );
                     }
                 }
             }

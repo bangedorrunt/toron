@@ -569,7 +569,7 @@ impl Mailbox {
             // REPORTED (unrenewed) so the embedding's closed-bead sweep can
             // see + release it: a reservation whose owning bead closed is
             // stale even while its TTL is healthy.
-            let old_expiry_secs = res.expires_ts_us.map(|t| (t / 1_000_000) as i64);
+            let old_expiry_secs = res.expires_ts_us.map(|t| t / 1_000_000);
             let skip = match old_expiry_secs {
                 None => true, // permanent lease — nothing to renew
                 Some(abs) => abs.saturating_sub(now_secs) >= extend_secs as i64,
@@ -714,9 +714,7 @@ impl Mailbox {
                 None => true,
             })
             .ok_or_else(|| {
-                let where_ = holder
-                    .map(|h| format!(" held by {h}"))
-                    .unwrap_or_default();
+                let where_ = holder.map(|h| format!(" held by {h}")).unwrap_or_default();
                 anyhow::anyhow!("no active reservation on {path}{where_}")
             })?;
 
@@ -840,8 +838,10 @@ impl Mailbox {
         for lease in leases {
             let d = format!("{project_slug}:{}", lease.path_pattern);
             let target = EventId::from_hex(&lease.id).unwrap_or_else(|_| {
-                EventId::from_hex("b32828720d7e8a80dd5165a6cd31b2c70e8d25b83c387209cb138e77d7e7e05b")
-                    .expect("id")
+                EventId::from_hex(
+                    "b32828720d7e8a80dd5165a6cd31b2c70e8d25b83c387209cb138e77d7e7e05b",
+                )
+                .expect("id")
             });
             let tags = with_project_scoping(
                 toron_kind(FILE_RESERVATION),
@@ -906,11 +906,19 @@ impl Mailbox {
             }
             released_leases.push(ReleasedLease {
                 path: lease.path_pattern.clone(),
-                mode: if lease.exclusive { "exclusive" } else { "shared" }.into(),
+                mode: if lease.exclusive {
+                    "exclusive"
+                } else {
+                    "shared"
+                }
+                .into(),
                 holder: lease.agent_name.clone(),
             });
         }
-        Ok(ReleaseResult { released, leases: released_leases })
+        Ok(ReleaseResult {
+            released,
+            leases: released_leases,
+        })
     }
 
     /// Active (non-revoked, non-released, non-expired) kind-30031 events in a
@@ -1052,8 +1060,8 @@ impl Mailbox {
             .filter(|l| l.status == ReservationStatus::Intent)
             .filter(|l| l.created_at_secs.saturating_add(INTENT_TTL_SECS as i64) >= now_secs)
             .map(|l| {
-                let ttl_end_us = (l.created_at_secs.saturating_add(INTENT_TTL_SECS as i64))
-                    * 1_000_000;
+                let ttl_end_us =
+                    (l.created_at_secs.saturating_add(INTENT_TTL_SECS as i64)) * 1_000_000;
                 IntentReservation {
                     id: l.id,
                     agent_name: String::new(), // filled below
@@ -1141,7 +1149,10 @@ impl Mailbox {
     }
 
     /// Best-effort pubkey → agent-name map from kind-30013 profiles.
-    async fn agent_name_map(&self, project_slug: &str) -> std::collections::HashMap<String, String> {
+    async fn agent_name_map(
+        &self,
+        project_slug: &str,
+    ) -> std::collections::HashMap<String, String> {
         let filter =
             kind_project_filter(toron_kind(crate::nostr::kinds::AGENT_PROFILE), project_slug);
         let Ok(events) = collect_replay(self.bus.as_ref(), filter).await else {
@@ -1194,10 +1205,7 @@ impl Mailbox {
             .into_iter()
             .find(|r| r.id == args.reservation_id)
             .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "no active held reservation with id {}",
-                    args.reservation_id
-                )
+                anyhow::anyhow!("no active held reservation with id {}", args.reservation_id)
             })?;
         if lease.status != ReservationStatus::Held {
             anyhow::bail!(
@@ -1273,7 +1281,11 @@ impl Mailbox {
         let mut args = args.clone();
         args.project_slug = self.canonical_project(&args.project_slug).await; // ADR-0017
         let request = self
-            .find_request_by_id(&args.project_slug, &args.sender_name, &args.request_message_id)
+            .find_request_by_id(
+                &args.project_slug,
+                &args.sender_name,
+                &args.request_message_id,
+            )
             .await?;
         // The requester = the request rumor's author → name via profiles.
         let profiles = self.project_profiles(&args.project_slug).await?;
@@ -1288,7 +1300,12 @@ impl Mailbox {
             .ok_or_else(|| {
                 anyhow::anyhow!(
                     "requester {} has no registered profile in project {}",
-                    request.author_pubkey.to_hex().chars().take(8).collect::<String>(),
+                    request
+                        .author_pubkey
+                        .to_hex()
+                        .chars()
+                        .take(8)
+                        .collect::<String>(),
                     args.project_slug
                 )
             })?;
@@ -1361,11 +1378,17 @@ impl Mailbox {
                 (r.kind == Kind::PrivateDirectMessage
                     && r.tags.iter().any(|t| {
                         t.as_slice()
-                            == ["toron-kind".to_string(), "request-release-response".to_string()]
+                            == [
+                                "toron-kind".to_string(),
+                                "request-release-response".to_string(),
+                            ]
                     })
                     && r.tags.iter().any(|t| {
                         t.as_slice().first().map(|s| s == "e").unwrap_or(false)
-                            && t.as_slice().get(1).map(|s| s == request_message_id).unwrap_or(false)
+                            && t.as_slice()
+                                .get(1)
+                                .map(|s| s == request_message_id)
+                                .unwrap_or(false)
                     }))
                 .then(|| decision_from_tags(&r.tags))
                 .flatten()
@@ -1495,8 +1518,7 @@ impl Mailbox {
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut out = Vec::new();
         for name in self.registered_agent_names(project_slug).await {
-            let Some(keys) = self.load_agent_key(&self.agent_key_path(project_slug, &name))
-            else {
+            let Some(keys) = self.load_agent_key(&self.agent_key_path(project_slug, &name)) else {
                 continue;
             };
             for w in &wraps {
@@ -2049,14 +2071,7 @@ mod tests {
             .expect("publish lease");
 
         mailbox
-            .force_release_file_reservation(
-                "demo",
-                "RoseDune",
-                "src/**",
-                None,
-                Some("gone"),
-                true,
-            )
+            .force_release_file_reservation("demo", "RoseDune", "src/**", None, Some("gone"), true)
             .await
             .expect("force release stale holder");
 
@@ -2234,7 +2249,12 @@ mod tests {
         assert!(acq.conflicts.is_empty(), "NOT a hard block");
         assert_eq!(acq.soft_conflicts.len(), 1, "soft conflict reported");
         assert_eq!(acq.soft_conflicts[0].path, "src/lib.rs");
-        assert!(acq.soft_conflicts[0].holders.iter().any(|h| h == "BlueLake"));
+        assert!(
+            acq.soft_conflicts[0]
+                .holders
+                .iter()
+                .any(|h| h == "BlueLake")
+        );
         assert_eq!(
             acq.soft_conflicts[0].reservation_ids.len(),
             1,
@@ -2286,7 +2306,10 @@ mod tests {
         assert_eq!(acq.conflicts.len(), 1, "held lease hard-blocks");
         assert!(acq.soft_conflicts.is_empty(), "no soft tier involved");
         assert!(
-            acq.conflicts[0].reservation_ids.iter().any(|i| i == &held_id),
+            acq.conflicts[0]
+                .reservation_ids
+                .iter()
+                .any(|i| i == &held_id),
             "hard conflict carries the held lease's reservation id: {:?}",
             acq.conflicts[0].reservation_ids
         );
@@ -2327,7 +2350,10 @@ mod tests {
         assert_eq!(report.conflicts[0].path, "src/lib.rs");
         assert!(report.conflicts[0].holders.iter().any(|h| h == "BlueLake"));
         assert!(
-            report.conflicts[0].reservation_ids.iter().any(|i| i == &held_id),
+            report.conflicts[0]
+                .reservation_ids
+                .iter()
+                .any(|i| i == &held_id),
             "hard conflict carries the lease's id: {:?}",
             report.conflicts[0].reservation_ids
         );
@@ -2343,8 +2369,17 @@ mod tests {
             .await
             .expect("report2");
         assert_eq!(report2.soft_conflicts.len(), 1, "soft conflict reported");
-        assert_eq!(report2.soft_conflicts[0].reservation_ids.len(), 1, "soft conflict carries the intent id");
-        assert!(report2.soft_conflicts[0].holders.iter().any(|h| h == "RoseDune"));
+        assert_eq!(
+            report2.soft_conflicts[0].reservation_ids.len(),
+            1,
+            "soft conflict carries the intent id"
+        );
+        assert!(
+            report2.soft_conflicts[0]
+                .holders
+                .iter()
+                .any(|h| h == "RoseDune")
+        );
 
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_dir_all(&data_dir);
@@ -2500,7 +2535,11 @@ mod tests {
             .check_file_reservation_conflicts(
                 "demo",
                 "GaleSummit",
-                &["held/a.rs".into(), "intent/b.rs".into(), "clear/c.md".into()],
+                &[
+                    "held/a.rs".into(),
+                    "intent/b.rs".into(),
+                    "clear/c.md".into(),
+                ],
             )
             .await
             .expect("check");
@@ -2511,7 +2550,12 @@ mod tests {
         assert!(report.has_soft_conflicts, "soft tier flagged");
         assert_eq!(report.soft_conflicts.len(), 1, "intent tier soft");
         assert_eq!(report.soft_conflicts[0].path, "intent/b.rs");
-        assert!(report.soft_conflicts[0].holders.iter().any(|h| h == "BlueLake"));
+        assert!(
+            report.soft_conflicts[0]
+                .holders
+                .iter()
+                .any(|h| h == "BlueLake")
+        );
         assert!(report.clear_paths.contains(&"clear/c.md".to_string()));
         assert_eq!(report.total_conflicting_reservations, 1, "hard count only");
 
@@ -2565,7 +2609,10 @@ mod tests {
             })
             .await
             .expect_err("unknown id");
-        assert!(err.to_string().contains("no active held reservation"), "{err}");
+        assert!(
+            err.to_string().contains("no active held reservation"),
+            "{err}"
+        );
 
         // Validation: GaleSummit (not the holder) asks for BlueLake's lease
         // targeting RoseDune — holder mismatch.
@@ -2665,11 +2712,12 @@ mod tests {
 
         // Backdated request (declared past the tier window) → EscalationDue.
         let old_ts = Timestamp::from(
-            (Timestamp::now().as_secs() as i64
-                - REQUEST_RELEASE_TIER_WINDOW_SECS as i64
-                - 60) as u64,
+            (Timestamp::now().as_secs() as i64 - REQUEST_RELEASE_TIER_WINDOW_SECS as i64 - 60)
+                as u64,
         );
-        let rose_keys = mailbox.agent_keys_for("demo", "RoseDune").expect("rose keys");
+        let rose_keys = mailbox
+            .agent_keys_for("demo", "RoseDune")
+            .expect("rose keys");
         let blue_pk = mailbox
             .agent_keys_for("demo", "BlueLake")
             .expect("blue keys")
@@ -2719,14 +2767,20 @@ mod tests {
         .expect("wraps");
         assert!(
             wraps.iter().any(|w| {
-                crate::nostr::gift_wrap::unwrap(&mailbox.operator().expect("op"), w)
+                crate::nostr::gift_wrap::unwrap(mailbox.operator().expect("op"), w)
                     .map(|g| {
                         g.rumor.tags.iter().any(|t| {
                             t.as_slice()
-                                == ["toron-kind".to_string(), "request-release-escalation".to_string()]
+                                == [
+                                    "toron-kind".to_string(),
+                                    "request-release-escalation".to_string(),
+                                ]
                         }) && g.rumor.tags.iter().any(|t| {
                             t.as_slice().first().map(|s| s == "e").unwrap_or(false)
-                                && t.as_slice().get(1).map(|s| s == &backdated_id).unwrap_or(false)
+                                && t.as_slice()
+                                    .get(1)
+                                    .map(|s| s == &backdated_id)
+                                    .unwrap_or(false)
                         })
                     })
                     .unwrap_or(false)
@@ -2781,7 +2835,10 @@ mod tests {
             })
             .await
             .expect_err("non-target cannot respond");
-        assert!(err.to_string().contains("no request-release message"), "{err}");
+        assert!(
+            err.to_string().contains("no request-release message"),
+            "{err}"
+        );
 
         // The holder responds: Agreed → status resolves.
         let send = mailbox
@@ -2845,10 +2902,8 @@ mod tests {
         let bus = InProcessBus::open(pool.clone(), InProcessBusConfig::default())
             .await
             .expect("bus");
-        let data_dir = std::env::temp_dir().join(format!(
-            "toron-res-data-noop-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let data_dir =
+            std::env::temp_dir().join(format!("toron-res-data-noop-{}", uuid::Uuid::new_v4()));
         let mailbox = Mailbox::new(Arc::new(bus), data_dir.clone(), None)
             .with_agent_passphrase(PASSPHRASE)
             .with_index_pool(pool);
@@ -3065,7 +3120,11 @@ mod tests {
             .expect("no-match is not an error");
         assert_eq!(r.released, 0);
         assert_eq!(
-            mailbox.active_reservations("demo").await.expect("active").len(),
+            mailbox
+                .active_reservations("demo")
+                .await
+                .expect("active")
+                .len(),
             1,
             "bd-XX lease untouched"
         );
@@ -3078,8 +3137,8 @@ mod tests {
     /// release (mirrors force_release's gate).
     #[tokio::test]
     async fn test_release_by_reason_gated_on_operator() {
-        let db_path = std::env::temp_dir()
-            .join(format!("toron-res-h3oj-op-{}.sqlite", uuid::Uuid::new_v4()));
+        let db_path =
+            std::env::temp_dir().join(format!("toron-res-h3oj-op-{}.sqlite", uuid::Uuid::new_v4()));
         let pool = schema::connect(db_path.to_str().unwrap())
             .await
             .expect("connect");
@@ -3087,8 +3146,8 @@ mod tests {
         let bus = InProcessBus::open(pool.clone(), InProcessBusConfig::default())
             .await
             .expect("bus");
-        let data_dir = std::env::temp_dir()
-            .join(format!("toron-res-data-h3oj-op-{}", uuid::Uuid::new_v4()));
+        let data_dir =
+            std::env::temp_dir().join(format!("toron-res-data-h3oj-op-{}", uuid::Uuid::new_v4()));
         let mailbox = Mailbox::new(Arc::new(bus), data_dir.clone(), None)
             .with_agent_passphrase(PASSPHRASE)
             .with_index_pool(pool);

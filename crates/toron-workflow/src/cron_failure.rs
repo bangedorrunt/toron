@@ -110,11 +110,7 @@ pub fn failure_details(output: &serde_json::Value) -> (String, Option<String>) {
 /// - On success: the streak resets to 0; the action is `on_success`.
 ///
 /// Pure (no IO) — the caller applies side effects via the sink.
-pub fn evaluate(
-    policy: &CronPolicy,
-    failed: bool,
-    consecutive: u32,
-) -> (FailureAction, u32) {
+pub fn evaluate(policy: &CronPolicy, failed: bool, consecutive: u32) -> (FailureAction, u32) {
     if !failed {
         return (policy.on_success, 0);
     }
@@ -178,7 +174,9 @@ mod tests {
     /// `is_failed` recognizes the kind-46012 failed shape and ignores success.
     #[test]
     fn is_failed_detects_the_46012_shape() {
-        assert!(is_failed(&serde_json::json!({"status": "failed", "error": "boom"})));
+        assert!(is_failed(
+            &serde_json::json!({"status": "failed", "error": "boom"})
+        ));
         assert!(!is_failed(&serde_json::json!({"status": "succeeded"})));
         assert!(!is_failed(&serde_json::json!({"notify": "ok"})));
         assert!(!is_failed(&serde_json::json!({})));

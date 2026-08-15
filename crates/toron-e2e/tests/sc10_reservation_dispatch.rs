@@ -164,11 +164,10 @@ async fn sc10_reservation_released_dispatches_job_on_bus_event() {
     // a free-form `assignee` tag; jobs.rs:93-98).
     assert_eq!(job_req.kind.as_u16(), 43001, "kind-43001");
     assert!(
-        job_req
-            .tags
-            .iter()
-            .any(|t| t.as_slice().first().map(String::as_str) == Some("assignee")
-                && t.as_slice().get(1).map(String::as_str) == Some("OCBeta")),
+        job_req.tags.iter().any(
+            |t| t.as_slice().first().map(String::as_str) == Some("assignee")
+                && t.as_slice().get(1).map(String::as_str) == Some("OCBeta")
+        ),
         "job targeted at OC-β"
     );
 

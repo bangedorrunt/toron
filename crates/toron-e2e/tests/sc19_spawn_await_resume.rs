@@ -18,7 +18,9 @@ use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
-use toron_workflow::engine::{run_workflow, ActionRunner, ProfileResolver, RunInput, WorkflowEngine};
+use toron_workflow::engine::{
+    ActionRunner, ProfileResolver, RunInput, WorkflowEngine, run_workflow,
+};
 use toron_workflow::schema::{Action, parse_workflow};
 
 fn noop_runner() -> ActionRunner {
@@ -148,7 +150,10 @@ steps:
     // 3. The job agent completes: kind-43004 result arrives → the bus
     //    subscriber calls resolve_spawn (the 43004 side of the binding).
     engine
-        .resolve_spawn(&promise_id, serde_json::json!({ "exit": 0, "checks": "all-healthy" }))
+        .resolve_spawn(
+            &promise_id,
+            serde_json::json!({ "exit": 0, "checks": "all-healthy" }),
+        )
         .await
         .expect("job result (kind-43004) resolves the spawn promise");
 

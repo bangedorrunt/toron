@@ -16,7 +16,9 @@ use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
-use toron_workflow::engine::{run_workflow, ActionRunner, ProfileResolver, RunInput, WorkflowEngine};
+use toron_workflow::engine::{
+    ActionRunner, ProfileResolver, RunInput, WorkflowEngine, run_workflow,
+};
 use toron_workflow::schema::{Action, parse_workflow};
 
 fn noop_runner() -> ActionRunner {

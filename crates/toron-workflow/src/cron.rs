@@ -44,7 +44,7 @@ use serde::{Deserialize, Serialize};
 use crate::cron_failure::{
     PolicyEvent, PolicySink, evaluate as evaluate_policy, failure_details, is_failed,
 };
-use crate::engine::{run_workflow, RunInput};
+use crate::engine::{RunInput, run_workflow};
 use crate::schema::{
     CronCatchup, CronPolicy, CronScope, CronSpec, CronSpecPolicy, FailureAction, Workflow,
 };
@@ -142,8 +142,16 @@ struct DecideInput {
 /// RECORDED — a replay returns the original decision instead of re-deriving
 /// one from the (changed) wall clock after a restart.
 #[resonate_sdk::function]
-async fn decide_tick(_ctx: &resonate_sdk::prelude::Context, input: DecideInput) -> resonate_sdk::Result<Option<i64>> {
-    Ok(due_tick(&input.cron, input.last_fired, input.now, input.catchup))
+async fn decide_tick(
+    _ctx: &resonate_sdk::prelude::Context,
+    input: DecideInput,
+) -> resonate_sdk::Result<Option<i64>> {
+    Ok(due_tick(
+        &input.cron,
+        input.last_fired,
+        input.now,
+        input.catchup,
+    ))
 }
 
 /// Input to the durable tick body ([`run_cron_tick`]).
@@ -182,7 +190,10 @@ struct CronTickResult {
 /// the policy event is pushed exactly once per real tick (never re-played
 /// into a phantom event after a restart).
 #[resonate_sdk::function]
-async fn run_cron_tick(ctx: &resonate_sdk::prelude::Context, input: CronTickInput) -> resonate_sdk::Result<CronTickResult> {
+async fn run_cron_tick(
+    ctx: &resonate_sdk::prelude::Context,
+    input: CronTickInput,
+) -> resonate_sdk::Result<CronTickResult> {
     let trigger = serde_json::json!({
         "type": "schedule",
         "cron": input.cron,
@@ -301,8 +312,9 @@ fn spec_catchup(spec: &CronSpec) -> CronCatchup {
 /// `None` for an unparsable expression (the loop parks, never spins).
 fn due_tick(cron: &str, last_fired: i64, now: i64, catchup: CronCatchup) -> Option<i64> {
     match catchup {
-        CronCatchup::Latest => latest_due_at_or_before(cron, last_fired, now)
-            .or_else(|| next_due(cron, last_fired)),
+        CronCatchup::Latest => {
+            latest_due_at_or_before(cron, last_fired, now).or_else(|| next_due(cron, last_fired))
+        }
         CronCatchup::Skip => {
             let due = next_due(cron, last_fired)?;
             if due <= now {
@@ -622,7 +634,7 @@ impl CronManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{parse_cron, Action};
+    use crate::schema::{Action, parse_cron};
 
     /// next_due finds a future tick for a valid expr; None for garbage.
     #[test]
@@ -682,7 +694,11 @@ mod tests {
             .unwrap()
             .timestamp();
         let tick_0 = latest_due_at_or_before("*/10 * * * *", base, base + 60).unwrap();
-        assert_eq!(tick_0, base + 600, "on-time: sleep to the next scheduled tick");
+        assert_eq!(
+            tick_0,
+            base + 600,
+            "on-time: sleep to the next scheduled tick"
+        );
 
         // Down for 25 minutes (ticks 10:00, 10:10, 10:20 all due while down):
         // catch up to the LATEST (10:20), not 10:00 or 10:10.
@@ -723,7 +739,10 @@ mod tests {
         .expect("spec");
         let wf = spec_tick_workflow(&spec);
         assert_eq!(wf.name, "w");
-        assert!(wf.trigger.is_none(), "no workflow trigger — the loop owns the schedule");
+        assert!(
+            wf.trigger.is_none(),
+            "no workflow trigger — the loop owns the schedule"
+        );
         assert_eq!(wf.steps.len(), 1);
         assert_eq!(wf.steps[0].name.as_deref(), Some("a"));
         let p = wf.policy.as_ref().expect("policy mapped");
@@ -734,7 +753,8 @@ mod tests {
     /// Missing policy → None (log-only loop) + catchup defaults to `latest`.
     #[test]
     fn spec_policy_absent_maps_to_none_and_latest() {
-        let spec = parse_cron("name: w\nschedule: '* * * * *'\nowner: o\nsteps: []\n").expect("spec");
+        let spec =
+            parse_cron("name: w\nschedule: '* * * * *'\nowner: o\nsteps: []\n").expect("spec");
         let wf = spec_tick_workflow(&spec);
         assert!(wf.policy.is_none(), "no policy -> log-only");
         assert_eq!(spec_catchup(&spec), CronCatchup::Latest);
@@ -808,11 +828,12 @@ mod tests {
     #[test]
     fn cron_spec_registration_roundtrip() {
         let reg: CronSpecRegistration =
-            serde_yaml::from_str("spec:\n  name: w\n  schedule: '* * * * *'\n  owner: o\n").expect("reg");
+            serde_yaml::from_str("spec:\n  name: w\n  schedule: '* * * * *'\n  owner: o\n")
+                .expect("reg");
         assert!(reg.enabled, "enabled defaults true");
         assert!(reg.start_ts.is_none());
         let out = serde_yaml::to_string(&reg).expect("serialize");
-        assert!(out.contains("cron-spec") == false);
+        assert!(!out.contains("cron-spec"));
         assert!(out.contains("name: w"));
     }
 
@@ -824,7 +845,10 @@ mod tests {
     /// duration.
     async fn spec_engine(
         dir: &std::path::Path,
-    ) -> (std::process::Child, std::sync::Arc<crate::engine::WorkflowEngine>) {
+    ) -> (
+        std::process::Child,
+        std::sync::Arc<crate::engine::WorkflowEngine>,
+    ) {
         use std::process::{Command, Stdio};
         let port = std::net::TcpListener::bind("127.0.0.1:0")
             .unwrap()
@@ -858,11 +882,11 @@ mod tests {
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
-        let runner: crate::engine::ActionRunner = Arc::new(|a: &Action| {
-            Ok(serde_json::json!({ "ran": a.type_name() }))
-        });
+        let runner: crate::engine::ActionRunner =
+            Arc::new(|a: &Action| Ok(serde_json::json!({ "ran": a.type_name() })));
         let workflow_resolver: crate::engine::WorkflowResolver = Arc::new(|name: &str| {
-            let yaml = format!("name: {name}\nsteps:\n  - action: send_dm\n    to: t\n    body: ok\n");
+            let yaml =
+                format!("name: {name}\nsteps:\n  - action: send_dm\n    to: t\n    body: ok\n");
             crate::schema::parse_workflow(&yaml).ok()
         });
         let engine = crate::engine::WorkflowEngine::remote_with_resolvers(
@@ -927,10 +951,16 @@ steps:
         let start_ts = unix_now() - 90;
 
         let spec1 = spec.clone();
-        let spec_registry: CronSpecRegistry =
-            Arc::new(move || vec![CronSpecRegistration { spec: spec1.clone(), enabled: true, start_ts: Some(start_ts) }]);
-        let empty: CronRegistry = Arc::new(|| Vec::new());
-        let manager = CronManager::with_spec_registry(engine.clone(), empty, Some(spec_registry)).expect("manager");
+        let spec_registry: CronSpecRegistry = Arc::new(move || {
+            vec![CronSpecRegistration {
+                spec: spec1.clone(),
+                enabled: true,
+                start_ts: Some(start_ts),
+            }]
+        });
+        let empty: CronRegistry = Arc::new(Vec::new);
+        let manager = CronManager::with_spec_registry(engine.clone(), empty, Some(spec_registry))
+            .expect("manager");
         let sink = engine.policy_sink().clone();
 
         // Start → the loop catches up to the most-recent due tick (inside the
@@ -946,14 +976,20 @@ steps:
         );
         let out = event.output.as_ref().expect("tick output rides along");
         assert!(
-            out.get("probe").is_some() && out.get("upgrade").is_some() && out.get("verify").is_some(),
+            out.get("probe").is_some()
+                && out.get("upgrade").is_some()
+                && out.get("verify").is_some(),
             "call_workflow body executed via the shared engine: {out:?}"
         );
 
         // Re-start (same run id) → resume, NO duplicate dispatch for the tick.
         manager.start().await.expect("resume");
         tokio::time::sleep(Duration::from_secs(3)).await;
-        assert_eq!(count_events(&sink).await, 1, "no duplicate tick after resume");
+        assert_eq!(
+            count_events(&sink).await,
+            1,
+            "no duplicate tick after resume"
+        );
 
         // Downtime: kill the server, wait past the NEXT tick boundary, reboot
         // (same sqlite dir) + new engine → the loop resumes and catchup
@@ -968,10 +1004,16 @@ steps:
         server = server2;
         let spec2 = spec.clone();
         let spec_registry2: CronSpecRegistry = Arc::new(move || {
-            vec![CronSpecRegistration { spec: spec2.clone(), enabled: true, start_ts: Some(start_ts) }]
+            vec![CronSpecRegistration {
+                spec: spec2.clone(),
+                enabled: true,
+                start_ts: Some(start_ts),
+            }]
         });
-        let empty2: CronRegistry = Arc::new(|| Vec::new());
-        let manager2 = CronManager::with_spec_registry(engine2.clone(), empty2, Some(spec_registry2)).expect("manager2");
+        let empty2: CronRegistry = Arc::new(Vec::new);
+        let manager2 =
+            CronManager::with_spec_registry(engine2.clone(), empty2, Some(spec_registry2))
+                .expect("manager2");
         manager2.start().await.expect("resume after restart");
         let sink2 = engine2.policy_sink().clone();
         let event2 = wait_for_event(&sink2, 30)

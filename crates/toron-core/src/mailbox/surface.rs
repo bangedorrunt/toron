@@ -1402,7 +1402,7 @@ mod tests {
     async fn force_release_is_denied_while_holder_active() {
         let (surface, db_path, data_dir) = test_surface("frc").await;
         register_agent(&surface, "demo", "GreenCastle").await;
-        let ok = surface
+        let _ok = surface
             .reserve(
                 "demo",
                 "GreenCastle",

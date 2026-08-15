@@ -34,13 +34,13 @@ use toron_workflow::schema::{Action, FailureAction, parse_workflow};
 /// A runner that ALWAYS fails (every tick's step errors).
 fn always_failing_runner() -> ActionRunner {
     Arc::new(|a: &Action| {
-        if let Action::SendDm { body, .. } = a {
-            if body == "upgrade" {
-                return Ok(serde_json::json!({
-                    "ok": false,
-                    "error": "repeat failure",
-                }));
-            }
+        if let Action::SendDm { body, .. } = a
+            && body == "upgrade"
+        {
+            return Ok(serde_json::json!({
+                "ok": false,
+                "error": "repeat failure",
+            }));
         }
         Ok(serde_json::Value::Null)
     })
