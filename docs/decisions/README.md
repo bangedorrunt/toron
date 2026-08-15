@@ -23,6 +23,7 @@ This directory contains records of the major architectural decisions made for th
 | [0017](0017-project-root-canonicalization.md) | Project Root Canonicalization and Identity Resolution | **Accepted** (2026-08-15; S2 keystone — canonical short slug + alias table, one root per project, aliased read-only migration, ack authorization via pane binding / thread participant; supersedes the bd-cmgu key-basename fallback as the primary mechanism) |
 | [0018](0018-agent-identity-naming-grammar.md) | Agent Identity Naming Grammar and Routing Rules | **Accepted** (2026-08-15; naming triangle keystone — grammar `flywheel-<project-slug>-<role><seq>` as THE routable identity per pane, `agent-names.json` as pane-to-identity authority, per-project `identity_mode` (swarm/open) with canonical-name-or-npub routing, whois/send/register hardening, one-time legacy reconciliation via `agent_name_aliases` folds) |
 | [0019](0019-bead-verified-execution-and-principle-playbooks.md) | Bead-Verified Execution, Baked Principles, and Playbook Workflows | **Proposed** (2026-08-15; pstack invariants on beads: ledger-gated close, 21 principles as structure, playbook builtins; wave 1 locked by grilling; waves 2–6 specified) |
+| [0020](0020-nostr-two-plane-cli-and-crew-steering.md) | Nostr Two-Plane Surface (CLI-first) and Crew-to-Crew Steering | **Accepted** (2026-08-15; SC-27..33 green; CLI `channel`/`job`/`react`/`presence`/`watch`; MCP stays 39) |
 
 ## Parity catalogs
 

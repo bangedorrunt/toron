@@ -127,3 +127,7 @@ grep 'type MessageId' crates/toron-core/src/mailbox/surface.rs
   flywheel-side guarantee: a `br close` the loop observes is not terminal without a legal
   `.flywheel/ledger.tsv` row. Toron still does not know about that file. No new tools, no new
   kinds, one-way dep unchanged.
+- **2026-08-15:** [ADR-0020](0020-nostr-two-plane-cli-and-crew-steering.md) exposes the shared
+  Nostr plane as **CLI** (`toron channel|job|react|presence|watch`). Flywheel does not gain
+  those subcommands in wave 1. Dispatch still does not go through new MCP tools. One-way dep
+  unchanged.
