@@ -693,7 +693,9 @@ impl super::Backend for HerdrBackend {
     }
 
     fn pane_close(&self, pane_id: &str) -> Result<(), BackendError> {
-        self.client.lock().call("pane.close", json!({ "pane_id": pane_id }))?;
+        self.client
+            .lock()
+            .call("pane.close", json!({ "pane_id": pane_id }))?;
         Ok(())
     }
 
@@ -790,7 +792,12 @@ impl super::Backend for HerdrBackend {
         self.client.lock().agent_wait(target, until, timeout_ms)
     }
 
-    fn agent_read(&self, target: &str, source: &str, lines: u32) -> Result<serde_json::Value, BackendError> {
+    fn agent_read(
+        &self,
+        target: &str,
+        source: &str,
+        lines: u32,
+    ) -> Result<serde_json::Value, BackendError> {
         let text = self.client.lock().agent_read(target, source, Some(lines))?;
         Ok(json!({ "text": text }))
     }
@@ -862,8 +869,16 @@ fn parse_push(kind: &str, data: &Value) -> BackendEvent {
         .and_then(|s| s.parse().ok())
         .unwrap_or(AgentStatus::Unknown);
     match kind {
-        "pane.agent_status_changed" => BackendEvent::AgentStatusChanged { pane, agent, status },
-        "pane.agent_detected" => BackendEvent::AgentDetected { pane, agent, status },
+        "pane.agent_status_changed" => BackendEvent::AgentStatusChanged {
+            pane,
+            agent,
+            status,
+        },
+        "pane.agent_detected" => BackendEvent::AgentDetected {
+            pane,
+            agent,
+            status,
+        },
         "pane.exited" => BackendEvent::PaneExited { pane },
         other => BackendEvent::Raw(format!("{other}: {data}")),
     }
@@ -961,11 +976,14 @@ mod tests {
         assert_eq!(pane.terminal_id, "term_6583b54d13a1b9");
         assert_eq!(pane.workspace_id, "wT");
         assert_eq!(pane.tab_id, "wT:t2");
-        assert_eq!(pane.focused, false);
+        assert!(!pane.focused);
         assert_eq!(pane.agent_status, AgentStatus::Idle);
         assert_eq!(pane.revision, 557);
         assert_eq!(pane.agent.as_deref(), Some("opencode"));
-        assert_eq!(pane.cwd.as_deref(), Some("/Users/bangedorrunt/workspace/flywheel"));
+        assert_eq!(
+            pane.cwd.as_deref(),
+            Some("/Users/bangedorrunt/workspace/flywheel")
+        );
         assert!(pane.scroll.is_some());
         assert_eq!(
             pane.terminal_title.as_deref(),
@@ -998,13 +1016,14 @@ mod tests {
     #[test]
     fn agent_info_parses_live_v19_payload() {
         let f = fixture();
-        let agent: AgentInfo = serde_json::from_value(f["samples"]["agent"].clone()).expect("agent");
+        let agent: AgentInfo =
+            serde_json::from_value(f["samples"]["agent"].clone()).expect("agent");
         assert_eq!(agent.agent_status, AgentStatus::Idle);
         assert_eq!(agent.terminal_id, "term_6583b54d13a1b9");
         assert_eq!(agent.workspace_id, "wT");
         assert_eq!(agent.tab_id, "wT:t2");
         assert_eq!(agent.pane_id, "wT:p2");
-        assert_eq!(agent.focused, false);
+        assert!(!agent.focused);
         assert_eq!(agent.revision, 557);
     }
 
@@ -1036,12 +1055,31 @@ mod tests {
             .iter()
             .filter_map(|v| v.as_str())
             .collect();
-        for field in ["pane_id", "terminal_id", "workspace_id", "tab_id", "focused", "agent_status", "revision"] {
-            assert!(pane_required.contains(&field), "PaneInfo missing required {field}");
+        for field in [
+            "pane_id",
+            "terminal_id",
+            "workspace_id",
+            "tab_id",
+            "focused",
+            "agent_status",
+            "revision",
+        ] {
+            assert!(
+                pane_required.contains(&field),
+                "PaneInfo missing required {field}"
+            );
         }
         let wt_schema = &f["schemas"]["success_response"]["$defs"]["WorktreeInfo"];
         let wt_props = wt_schema["properties"].as_object().unwrap();
-        for field in ["open_workspace_id", "is_bare", "is_detached", "is_linked_worktree", "is_prunable", "path", "label"] {
+        for field in [
+            "open_workspace_id",
+            "is_bare",
+            "is_detached",
+            "is_linked_worktree",
+            "is_prunable",
+            "path",
+            "label",
+        ] {
             assert!(wt_props.contains_key(field), "WorktreeInfo missing {field}");
         }
         let wt_required: Vec<&str> = wt_schema["required"]
@@ -1050,8 +1088,18 @@ mod tests {
             .iter()
             .filter_map(|v| v.as_str())
             .collect();
-        for field in ["path", "is_bare", "is_detached", "is_prunable", "is_linked_worktree", "label"] {
-            assert!(wt_required.contains(&field), "WorktreeInfo missing required {field}");
+        for field in [
+            "path",
+            "is_bare",
+            "is_detached",
+            "is_prunable",
+            "is_linked_worktree",
+            "label",
+        ] {
+            assert!(
+                wt_required.contains(&field),
+                "WorktreeInfo missing required {field}"
+            );
         }
     }
 

@@ -36,13 +36,13 @@ use toron_workflow::schema::{Action, FailureAction, parse_workflow};
 /// with `on_error: fail_run` that flips the run to `status=failed` (P0).
 fn failing_runner() -> ActionRunner {
     Arc::new(|a: &Action| {
-        if let Action::SendDm { body, .. } = a {
-            if body == "upgrade" {
-                return Ok(serde_json::json!({
-                    "ok": false,
-                    "error": "health-gate timeout: container unhealthy",
-                }));
-            }
+        if let Action::SendDm { body, .. } = a
+            && body == "upgrade"
+        {
+            return Ok(serde_json::json!({
+                "ok": false,
+                "error": "health-gate timeout: container unhealthy",
+            }));
         }
         Ok(serde_json::Value::Null)
     })

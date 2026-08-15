@@ -43,8 +43,8 @@ use toron_core::mailbox::{
     AcquireBuildSlotResult, AcquireResult, ConflictReport, ContactHandshakeResult, ContactLink,
     Delivery, DeliveryPayload, GrantedReservation, HealthComponent, HealthReport, InboxMessage,
     Mailbox, PathConflict, PrepareThreadResult, ProductInfo, ProjectState, ReceiptResult,
-    RegisteredAgent, ReleaseResult, RenewResult, ReservationCycleResult, SearchMessage,
-    SendResult, StartSessionResult, ThreadSummary, WhoIs,
+    RegisteredAgent, ReleaseResult, RenewResult, ReservationCycleResult, SearchMessage, SendResult,
+    StartSessionResult, ThreadSummary, WhoIs,
 };
 
 /// Tool return value: serialized JSON on `Ok`, a tool error on `Err`.
@@ -628,19 +628,18 @@ mod tests {
                 if !name.contains("id") {
                     continue;
                 }
-                if let Some(t) = prop.get("type").and_then(|v| v.as_str()) {
-                    if t == "integer" || t == "number" {
-                        violations.push(format!("{}.{}: {t}", tool.name, name));
-                    }
+                if let Some(t) = prop.get("type").and_then(|v| v.as_str())
+                    && (t == "integer" || t == "number")
+                {
+                    violations.push(format!("{}.{}: {t}", tool.name, name));
                 }
                 if let Some(items) = prop
                     .get("items")
                     .and_then(|v| v.get("type"))
                     .and_then(|v| v.as_str())
+                    && (items == "integer" || items == "number")
                 {
-                    if items == "integer" || items == "number" {
-                        violations.push(format!("{}.{}: array of {items}", tool.name, name));
-                    }
+                    violations.push(format!("{}.{}: array of {items}", tool.name, name));
                 }
             }
         }
@@ -707,7 +706,10 @@ mod tests {
             .and_then(|d| d.get("properties"))
             .and_then(|v| v.as_object())
             .expect("deliveries payload props");
-        assert!(deliveries.contains_key("recipient"), "send payload recipient");
+        assert!(
+            deliveries.contains_key("recipient"),
+            "send payload recipient"
+        );
         assert!(deliveries.contains_key("event_id"), "send payload event_id");
         // release_file_reservations → {released, leases} (bd-release-breakdown-xom3
         // added the per-path breakdown; released count unchanged).

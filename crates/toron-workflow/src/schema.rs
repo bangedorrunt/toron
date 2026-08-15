@@ -366,17 +366,11 @@ pub enum Action {
     /// Iterate over a list value (`over` = template ref to a list); one
     /// sub-run per item; outputs collected under `steps.<name>` (ADR-0005
     /// Spec 4).
-    Foreach {
-        over: String,
-        each: Box<Step>,
-    },
+    Foreach { over: String, each: Box<Step> },
     /// Fan out `each` across a crew role (`over: "@crew.r"`) or N elastic
     /// copies (`over: <N>`); collected into a list under `steps.<name>`
     /// (ADR-0005 Spec 4c).
-    Parallel {
-        over: String,
-        each: Box<Step>,
-    },
+    Parallel { over: String, each: Box<Step> },
     /// Invoke another workflow as a sub-run; outputs under `steps.<name>`
     /// (ADR-0005 Spec 2; idempotent on sub-run-id).
     CallWorkflow {
@@ -524,7 +518,10 @@ pub struct CronSpec {
     /// but preserves the definition — pause/resume never drops registration
     /// state. Only a paused cron carries the field on disk (the default
     /// `true` is not serialized).
-    #[serde(default = "default_cron_enabled", skip_serializing_if = "cron_enabled_default")]
+    #[serde(
+        default = "default_cron_enabled",
+        skip_serializing_if = "cron_enabled_default"
+    )]
     pub enabled: bool,
     /// Failure/success + catch-up policy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -575,13 +572,8 @@ pub const ACTION_TYPES: [&str; 7] = [
 
 /// The P5.3 control-flow action types (ADR-0005 Spec 4) added on top of the
 /// original 7.
-pub const CONTROL_FLOW_ACTION_TYPES: [&str; 5] = [
-    "retry",
-    "branch",
-    "foreach",
-    "parallel",
-    "call_workflow",
-];
+pub const CONTROL_FLOW_ACTION_TYPES: [&str; 5] =
+    ["retry", "branch", "foreach", "parallel", "call_workflow"];
 
 /// Template-payload access for `{{trigger.<field>}}` / `{{steps.<name>}}`.
 /// The engine substitutes these at run time; this is the key contract so lint
@@ -653,10 +645,7 @@ steps:
         for (expect, yaml) in cases {
             let wf = parse_workflow(&format!("name: t\ntrigger:\n  {yaml}"))
                 .unwrap_or_else(|e| panic!("{expect}: {e}"));
-            assert_eq!(
-                wf.trigger.as_ref().map(Trigger::type_name),
-                Some(*expect)
-            );
+            assert_eq!(wf.trigger.as_ref().map(Trigger::type_name), Some(*expect));
         }
     }
 
@@ -737,7 +726,9 @@ steps:
             Action::Retry { .. }
         ));
         assert!(matches!(
-            step("action: branch\nif: \"true\"\nthen:\n  - action: send_dm\n    to: a\n    body: b"),
+            step(
+                "action: branch\nif: \"true\"\nthen:\n  - action: send_dm\n    to: a\n    body: b"
+            ),
             Action::Branch { .. }
         ));
         assert!(matches!(
@@ -769,7 +760,9 @@ steps:
             .action
         };
         assert!(matches!(
-            step("action: spawn\nprofile: \"@housekeeper\"\nworkflow: docker-upgrade\nawait: true\nno_claim_timeout: 600"),
+            step(
+                "action: spawn\nprofile: \"@housekeeper\"\nworkflow: docker-upgrade\nawait: true\nno_claim_timeout: 600"
+            ),
             Action::Spawn { .. }
         ));
         // Bare spawn (no await) parses with defaults.
@@ -831,7 +824,9 @@ steps:
 "##;
         let wf = parse_workflow(yaml).expect("extended schedule parses");
         match &wf.trigger {
-            Some(Trigger::Schedule { cron, owner, scope, .. }) => {
+            Some(Trigger::Schedule {
+                cron, owner, scope, ..
+            }) => {
                 assert_eq!(cron, "30 3 * * 0");
                 assert_eq!(owner.as_deref(), Some("housekeeper"));
                 assert_eq!(*scope, CronScope::Host);
@@ -988,7 +983,8 @@ steps:
     /// (catchup included).
     #[test]
     fn parse_cron_policy_defaults() {
-        let yaml = "name: p\nschedule: '* * * * *'\nowner: o\npolicy:\n  catchup: skip\nsteps: []\n";
+        let yaml =
+            "name: p\nschedule: '* * * * *'\nowner: o\npolicy:\n  catchup: skip\nsteps: []\n";
         let spec = parse_cron(yaml).expect("partial policy parses");
         let p = spec.policy.as_ref().expect("policy present");
         assert_eq!(p.on_failure, FailureAction::Log, "default on_failure");
@@ -1000,7 +996,8 @@ steps:
     /// scope/mode variants parse (project + pane).
     #[test]
     fn parse_cron_scope_and_mode_variants() {
-        let yaml = "name: p\nschedule: '* * * * *'\nowner: o\nscope: project\nmode: pane\nsteps: []\n";
+        let yaml =
+            "name: p\nschedule: '* * * * *'\nowner: o\nscope: project\nmode: pane\nsteps: []\n";
         let spec = parse_cron(yaml).expect("variants parse");
         assert_eq!(spec.scope, CronScope::Project);
         assert_eq!(spec.mode, CronMode::Pane);
@@ -1023,7 +1020,10 @@ steps:
         let spec = parse_cron(paused).expect("paused cron parses");
         assert!(!spec.enabled, "enabled: false honored");
         let out = serde_yaml::to_string(&spec).expect("serializes");
-        assert!(out.contains("enabled: false"), "paused state persists: {out}");
+        assert!(
+            out.contains("enabled: false"),
+            "paused state persists: {out}"
+        );
         let spec2 = parse_cron(&out).expect("round-trips");
         assert!(!spec2.enabled);
     }

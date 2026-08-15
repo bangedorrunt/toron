@@ -127,7 +127,8 @@ pub fn lint_workflow(wf: &Workflow) -> LintReport {
     if wf.steps.is_empty() && wf.graph.is_none() {
         report.issues.push(LintIssue {
             level: Level::Warning,
-            message: "workflow has no steps and no graph — trigger will fire but nothing runs".into(),
+            message: "workflow has no steps and no graph — trigger will fire but nothing runs"
+                .into(),
             line: None,
         });
     }
@@ -156,9 +157,7 @@ fn check_name(report: &mut LintReport, name: &str, kind: &str) {
     {
         report.issues.push(LintIssue {
             level: Level::Error,
-            message: format!(
-                "{kind} name {name:?} contains invalid characters (alnum/_/-/.)"
-            ),
+            message: format!("{kind} name {name:?} contains invalid characters (alnum/_/-/.)"),
             line: None,
         });
     }
@@ -265,8 +264,7 @@ fn check_graph(report: &mut LintReport, graph: &Graph) {
     // node with NO incoming dependency edges (nothing is a `to` of an edge:
     // edges are stored (need → node), so a node with a `needs` entry appears
     // as a `to`).
-    let has_incoming: std::collections::HashSet<&str> =
-        edges.iter().map(|(_, to)| *to).collect();
+    let has_incoming: std::collections::HashSet<&str> = edges.iter().map(|(_, to)| *to).collect();
     let roots: Vec<&str> = nodes
         .keys()
         .map(String::as_str)
@@ -293,9 +291,7 @@ fn check_graph(report: &mut LintReport, graph: &Graph) {
         if !reachable.contains(name.as_str()) {
             report.issues.push(LintIssue {
                 level: Level::Error,
-                message: format!(
-                    "graph node {name:?} is an orphan — not reachable from any root"
-                ),
+                message: format!("graph node {name:?} is an orphan — not reachable from any root"),
                 line: None,
             });
         }
@@ -468,9 +464,7 @@ fn check_action(report: &mut LintReport, action: &Action) {
             }
         }
         Action::Retry {
-            max_attempts,
-            step,
-            ..
+            max_attempts, step, ..
         } => {
             if *max_attempts == 0 {
                 report.issues.push(LintIssue {
@@ -481,7 +475,11 @@ fn check_action(report: &mut LintReport, action: &Action) {
             }
             check_action(report, &step.action);
         }
-        Action::Branch { if_guard, then, else_steps } => {
+        Action::Branch {
+            if_guard,
+            then,
+            else_steps,
+        } => {
             check_guard(report, if_guard, "branch guard");
             for s in then.iter().chain(else_steps.iter()) {
                 check_action(report, &s.action);
@@ -765,7 +763,10 @@ graph:
             report.issues
         );
         assert!(
-            report.issues.iter().any(|i| i.message.contains("not a node")),
+            report
+                .issues
+                .iter()
+                .any(|i| i.message.contains("not a node")),
             "unresolvable named: {:?}",
             report.issues
         );
@@ -1059,7 +1060,8 @@ steps:
     #[test]
     fn cron_lint_bad_policy_rejected() {
         // repeat_threshold 0 — degenerate (escalates on the FIRST failure).
-        let yaml = "name: c\nschedule: '* * * * *'\nowner: o\npolicy:\n  repeat_threshold: 0\nsteps: []\n";
+        let yaml =
+            "name: c\nschedule: '* * * * *'\nowner: o\npolicy:\n  repeat_threshold: 0\nsteps: []\n";
         let report = cron_lint_yaml(yaml).expect("parses");
         assert!(
             report
@@ -1071,7 +1073,8 @@ steps:
         );
 
         // no_claim_timeout 0 — abort immediately, never wait.
-        let yaml = "name: c\nschedule: '* * * * *'\nowner: o\npolicy:\n  no_claim_timeout: 0\nsteps: []\n";
+        let yaml =
+            "name: c\nschedule: '* * * * *'\nowner: o\npolicy:\n  no_claim_timeout: 0\nsteps: []\n";
         let report = cron_lint_yaml(yaml).expect("parses");
         assert!(
             report

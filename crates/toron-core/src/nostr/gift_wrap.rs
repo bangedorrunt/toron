@@ -354,7 +354,10 @@ mod tests {
         .expect("wrap tampered seal");
         match unwrap(&recipient, &wrapped) {
             Err(GiftWrapError::Verify(_)) => {}
-            other => panic!("tampered seal must fail verify, got {:?}", other.map(|_| ())),
+            other => panic!(
+                "tampered seal must fail verify, got {:?}",
+                other.map(|_| ())
+            ),
         }
     }
 

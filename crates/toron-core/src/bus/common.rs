@@ -13,9 +13,7 @@ pub fn verify_publish_event(event: &nostr_sdk::nostr::Event) -> Result<(), BusEr
     match crate::nostr::event::verify_event(event) {
         Ok(()) => Ok(()),
         Err(VerifyError::BadId) => Err(BusError::InvalidEvent("id mismatch".into())),
-        Err(VerifyError::BadSignature) => {
-            Err(BusError::InvalidEvent("signature mismatch".into()))
-        }
+        Err(VerifyError::BadSignature) => Err(BusError::InvalidEvent("signature mismatch".into())),
         Err(e) => Err(BusError::InvalidEvent(e.to_string())),
     }
 }

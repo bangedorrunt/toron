@@ -1221,18 +1221,35 @@ mod tests {
 
         // Future bound (now + 1h): the just-sent message is older → empty.
         let future = (now + chrono::Duration::hours(1)).to_rfc3339();
-        let future_inbox = surface.inbox(&query(Some(future))).await.expect("future inbox");
-        assert_eq!(future_inbox.len(), 0, "future since_ts must exclude the message");
+        let future_inbox = surface
+            .inbox(&query(Some(future)))
+            .await
+            .expect("future inbox");
+        assert_eq!(
+            future_inbox.len(),
+            0,
+            "future since_ts must exclude the message"
+        );
 
         // Past bound (now − 1h): the message is newer → present.
         let past = (now - chrono::Duration::hours(1)).to_rfc3339();
         let past_inbox = surface.inbox(&query(Some(past))).await.expect("past inbox");
-        assert_eq!(past_inbox.len(), 1, "past since_ts must include the message");
+        assert_eq!(
+            past_inbox.len(),
+            1,
+            "past since_ts must include the message"
+        );
         assert_eq!(past_inbox[0].subject, "since-conformance");
 
         // Malformed bound → Malformed error, never a silent ignore.
         let err = surface.inbox(&query(Some("not-a-timestamp".into()))).await;
-        assert!(matches!(err, Err(MailError { code: MailErrorCode::Malformed, .. })));
+        assert!(matches!(
+            err,
+            Err(MailError {
+                code: MailErrorCode::Malformed,
+                ..
+            })
+        ));
 
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_dir_all(&data_dir);
@@ -1415,7 +1432,7 @@ mod tests {
     async fn force_release_is_denied_while_holder_active() {
         let (surface, db_path, data_dir) = test_surface("frc").await;
         register_agent(&surface, "demo", "GreenCastle").await;
-        let ok = surface
+        let _ok = surface
             .reserve(
                 "demo",
                 "GreenCastle",

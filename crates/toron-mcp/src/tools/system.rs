@@ -13,8 +13,8 @@
 use std::path::Path;
 
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::{tool, tool_router};
 use rmcp::schemars::{self, JsonSchema};
+use rmcp::{tool, tool_router};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -22,7 +22,7 @@ use toron_core::backend::herdr::HerdrBackend;
 use toron_core::mailbox::ListAgentsOptions;
 use toron_core::nostr::identity::AgentProfile;
 
-use super::{ToolOutput, ToolServer, ToJson, generate_agent_name};
+use super::{ToJson, ToolOutput, ToolServer, generate_agent_name};
 
 #[tool_router(router = system_router, vis = "pub(crate)")]
 impl ToolServer {

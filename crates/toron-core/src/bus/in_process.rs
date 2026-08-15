@@ -346,7 +346,6 @@ impl Bus for InProcessBus {
             }),
         }
     }
-
 }
 
 // Allow constructing a bus for tests without exposing internals.
@@ -665,7 +664,10 @@ mod tests {
 
         // Trusted ingress: empty filter, no scoping — must still see scoped
         // events (the workflow-trigger loop's subscription shape).
-        let mut trusted = bus.subscribe_trusted(Filter::new()).await.expect("trusted sub");
+        let mut trusted = bus
+            .subscribe_trusted(Filter::new())
+            .await
+            .expect("trusted sub");
 
         let ev = signed(&keys, PROJECT_MANIFEST, "scoped secret", "demo");
         bus.publish(ev.clone()).await.expect("publish");
