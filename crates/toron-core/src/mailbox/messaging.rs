@@ -590,10 +590,8 @@ impl Mailbox {
             .map_err(|e| anyhow::anyhow!("gift wrap failed for receipt to {sender_npub}: {e}"))?;
         let ts_us = crate::index::writer::Clock::now_us(&crate::index::writer::SystemClock);
         self.publish_dm(&wrap).await?;
-        self.record_receipt(&project_slug, agent_name, &id, kind, ts_us);
-        self.record_read_state(&project_slug, npub, &id, ts_us)
-            .await;
-
+        self.record_receipt(project_slug, agent_name, &id, kind, ts_us);
+        self.record_read_state(project_slug, npub, &id, ts_us).await;
         Ok(ReceiptResult {
             message_id: message_id.to_string(),
             acknowledged,
