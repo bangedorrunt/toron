@@ -1,4 +1,5 @@
 // governed-by: ADR-0003
+// governed-by: ADR-0020
 #![forbid(unsafe_code)]
 
 //! SC-13 — Private NIP-29 channel collaboration room (P2 gate).
@@ -7,11 +8,13 @@
 //!
 //! Steps:
 //!   1. operator creates a private channel; members join.
-//!   2. Pi-α posts; OC-β reacts (kind 7); Grok-γ @mentions Pi-α.
+//!   2. Pi-α posts (kind **9**, ADR-0020); OC-β reacts (kind 7); Grok-γ
+//!      @mentions Pi-α.
 //!   3. Pi-δ attempts read/post → DENIED.
 //!
 //! Assert:
 //!   - membership is the ONLY gate (member can read/post; non-member denied)
+//!   - channel posts emit kind 9 (ADR-0020 Spec 1); legacy kind 42 ingests
 //!   - global subscription excluded from private channel events (no leak)
 //!   - reaction kind 7 works
 //!
@@ -22,7 +25,9 @@
 #![cfg(feature = "p2")]
 
 use nostr_sdk::prelude::*;
-use toron_workflow::channels::{CHANNEL_CREATE, CHANNEL_MESSAGE, ChannelStore, REACTION};
+use toron_workflow::channels::{
+    CHANNEL_CREATE, CHANNEL_MESSAGE, CHANNEL_MESSAGE_LEGACY, ChannelStore, REACTION,
+};
 
 /// Named actors with fixed keys for a readable scenario trace.
 fn actors() -> (Keys, Keys, Keys, Keys) {
@@ -66,10 +71,16 @@ async fn sc13_private_channel_membership_gate() {
     assert!(store.is_member("auth-refactor", &grok_g.public_key()));
     assert!(!store.is_member("auth-refactor", &pi_d.public_key()));
 
-    // 2. Pi-α posts; OC-β reacts (kind 7); Grok-γ @mentions Pi-α.
+    // 2. Pi-α posts (kind 9 per ADR-0020 Spec 1); OC-β reacts (kind 7);
+    //    Grok-γ @mentions Pi-α.
     let post = store
         .post(&pi_a, "auth-refactor", "password hashing review", &[])
         .expect("member posts");
+    assert_eq!(
+        post.kind.as_u16(),
+        9,
+        "channel post emits kind 9 (ADR-0020 Spec 1)"
+    );
     assert_eq!(post.kind.as_u16(), CHANNEL_MESSAGE);
 
     let reaction = store
@@ -85,6 +96,7 @@ async fn sc13_private_channel_membership_gate() {
             &[pi_a.public_key()],
         )
         .expect("member mentions");
+    assert_eq!(mention.kind.as_u16(), 9, "@mention post is also kind 9");
     assert_eq!(mention.kind.as_u16(), CHANNEL_MESSAGE);
     assert!(
         mention.tags.iter().any(|t| t.kind() == TagKind::p()
@@ -124,4 +136,24 @@ async fn sc13_private_channel_membership_gate() {
     let ch = store.get("auth-refactor").expect("channel exists");
     assert!(ch.private, "channel must be private");
     assert_eq!(CHANNEL_CREATE, 40, "kind registry stable");
+
+    // 2b. ADR-0020 Spec 1 legacy ingest: a kind-42 event from a member
+    // projects as a channel post alongside the kind-9 emits.
+    let legacy = EventBuilder::new(Kind::from_u16(42), "legacy pre-ADR-0020 post")
+        .tags(vec![Tag::parse(["h", "auth-refactor"]).expect("h tag")])
+        .sign_with_keys(&oc_b)
+        .expect("sign legacy kind-42 post");
+    let projected = store.ingest(&legacy).expect("legacy kind 42 ingests");
+    assert_eq!(projected.kind, 42, "legacy 42 projects as a channel post");
+    assert_eq!(projected.channel_id, "auth-refactor");
+    assert_eq!(
+        store.history("auth-refactor").len(),
+        4,
+        "post + reaction + mention + legacy"
+    );
+
+    // 2c. Kind registry stability (ADR-0020 Spec 1): 9 is the canonical emit,
+    // 42 is legacy ingest only.
+    assert_eq!(CHANNEL_MESSAGE, 9, "channel post emits kind 9 (ADR-0020)");
+    assert_eq!(CHANNEL_MESSAGE_LEGACY, 42, "legacy 42 is ingest only");
 }

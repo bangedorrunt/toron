@@ -1,4 +1,5 @@
 // governed-by: ADR-0003
+// governed-by: ADR-0020
 #![forbid(unsafe_code)]
 
 //! toron-workflow — Phase 2 automation engine schema + lint (bd-osp).
@@ -27,8 +28,8 @@ pub mod schema;
 pub mod trigger_filter;
 
 pub use channels::{
-    CHANNEL_CREATE, CHANNEL_MESSAGE, CHANNEL_METADATA, Channel, ChannelEvent, ChannelStore,
-    REACTION,
+    CHANNEL_CREATE, CHANNEL_MESSAGE, CHANNEL_MESSAGE_LEGACY, CHANNEL_METADATA, Channel,
+    ChannelEvent, ChannelStore, REACTION,
 };
 pub use cron::{
     CronManager, CronRegistration, CronRegistry, CronSpecRegistration, CronSpecRegistry,
@@ -58,7 +59,10 @@ pub use jobs::{
     first_claimer, job_parent, job_request_json, job_state,
 };
 pub use lint::{Level, LintIssue, LintReport, lint_workflow, lint_yaml};
-pub use mention::{Mention, content_mentions, is_mention, parse_mentions};
+pub use mention::{
+    Mention, build_job_from_coalesced, content_mentions, is_mention, parse_mentions,
+    wire_mention_dispatch,
+};
 pub use schema::{
     Action, CrewSpec, CronPolicy, FailureAction, Graph, GraphNode, InputDecl, Step, StepOnError,
     TemplateContext, Trigger, Workflow, parse_workflow, parse_workflows,
