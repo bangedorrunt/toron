@@ -36,6 +36,7 @@ Child maps: [toron-core](crates/toron-core/AGENTS.md) ·
 | Task | Location |
 |------|----------|
 | Mail send/inbox/ack | `crates/toron-core/src/mailbox/` (`MailSurface`, `MessageId`) |
+| Channels / jobs / presence (ADR-0020) | `crates/toron-workflow/src/{channels,jobs}.rs`, `crates/toron-core/src/nostr/presence.rs`, CLI `toron channel\|job\|react\|presence\|watch` |
 | Gift-wrap / kinds | `crates/toron-core/src/nostr/` |
 | Bus / federation | `crates/toron-core/src/bus/` |
 | Git archive | `crates/toron-core/src/archive/git.rs` |
@@ -51,7 +52,7 @@ Child maps: [toron-core](crates/toron-core/AGENTS.md) ·
 - Edition 2024. `#![forbid(unsafe_code)]` on every crate root.
 - New/changed ADR-constrained files: `// governed-by: ADR-XXXX` at top.
 - Deps one-way: **flywheel → toron-workflow → toron-core**. Never reverse.
-- Frozen: 39 tool names (38 AM-Rust parity + 1 toron additive), 25 resources, kind registry. No new kinds/tools without an ADR.
+- Frozen: 39 tool names (38 AM-Rust parity + 1 toron additive), 25 resources, kind registry. No new kinds/tools without an ADR. ADR-0020 (proposed) adds **CLI** nouns `channel` `job` `react` `presence` `watch` without new MCP tools. Channel posts emit kind **9** (not 42).
 - Catalog: `toron catalog --json` regenerates `docs/catalog/toron-mcp.json`; `cargo test catalog_freshness` fails red on surface drift without regen (toron.dev ADR-0002 D3).
 - `MessageId` is String/hex. Never `u64` in shared request/response types.
 - `t` tag = project slug only. Never harness/model/job tags.
@@ -63,10 +64,11 @@ Child maps: [toron-core](crates/toron-core/AGENTS.md) ·
 
 When you add/remove/rename a CLI command or MCP tool, update ALL of:
 1. The `Command` enum (`crates/toron-cli/src/cli.rs`) — ground truth (compiles).
-2. The tool `#[tool(name = "...")]` in `crates/toron-mcp/src/tools/` — MCP surface.
+2. The tool `#[tool(name = "...")]` in `crates/toron-mcp/src/tools/` — MCP surface (ADR-0020 wave 1: **no new tools**; CLI-only nouns still need steps 1, 3, 4).
 3. This AGENTS.md (STRUCTURE + CONVENTIONS sections).
-4. The skill: `~/.agents/skills/toron/SKILL.md` CLI Surface + MCP Parity Surface.
-5. The tool-count constant (AGENTS.md header + SKILL.md frontmatter).
+4. The skill: `~/.agents/skills/toron/SKILL.md` and `~/.grok/skills/toron/SKILL.md` CLI Surface + MCP Parity Surface + [crew-steering](references/crew-steering.md).
+5. The tool-count constant (AGENTS.md header + SKILL.md frontmatter) — only when an MCP tool actually changes.
+6. `toron catalog --json` + `cargo test catalog_freshness` when the CLI catalog grows.
 
 The skill files are the canonical agent-facing reference. A command/tool not in
 the skill is invisible to any agent that triggers the skill.

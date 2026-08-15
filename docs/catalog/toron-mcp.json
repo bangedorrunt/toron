@@ -51,6 +51,31 @@
       "name": "guard"
     },
     {
+      "args": "create, join, leave, list, members, post, read",
+      "description": "NIP-29 channels: create/join/leave/list/members/post/read (plane S)",
+      "name": "channel"
+    },
+    {
+      "args": "list, show, claim, progress, result, error, cancel",
+      "description": "Job lifecycle 43001-43006: list/show/claim/progress/result/error/cancel",
+      "name": "job"
+    },
+    {
+      "args": "--to <TO>, --emoji <EMOJI>, --channel <CHANNEL>, --project <PROJECT>, --as <AS_NAME>",
+      "description": "React (kind 7) to a channel post",
+      "name": "react"
+    },
+    {
+      "args": "publish, list",
+      "description": "Presence (kind 20001): publish/list (plane N)",
+      "name": "presence"
+    },
+    {
+      "args": "--project <PROJECT>, --as <AS_NAME>, --kinds <KINDS>, --channel <CHANNEL>, --once, --timeout-ms <TIMEOUT_MS>",
+      "description": "Watch the shared plane (NIP-01 REQ): --once exits on first match",
+      "name": "watch"
+    },
+    {
       "args": "reconstruct",
       "description": "Deep health checks (herdr/git/keys/resonate). --check exits 3 on any failure",
       "name": "doctor"
@@ -96,7 +121,7 @@
       "name": "workflow"
     }
   ],
-  "generated_at": "2026-08-14T21:27:45Z",
+  "generated_at": "2026-08-15T08:01:35Z",
   "resources": [
     {
       "description": "List projects known to toron.",

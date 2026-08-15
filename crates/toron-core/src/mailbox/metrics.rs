@@ -139,6 +139,11 @@ impl MailboxMetrics {
     }
 
     /// `--robot-capabilities`: capability/role map.
+    ///
+    /// ADR-0020 Spec 3: the CLI plane nouns (`channel`, `job`, `react`,
+    /// `presence`, `watch`) are shell commands, NOT MCP tools — the frozen
+    /// 39-tool cluster never grows. They are listed under a separate `cli`
+    /// cluster so a driver knows the Nostr two-plane surface exists.
     pub fn robot_capabilities(&self) -> serde_json::Value {
         serde_json::json!({
             "protocol": "am-rust-parity",
@@ -152,6 +157,14 @@ impl MailboxMetrics {
                 "macros": ["macro_start_session", "macro_prepare_thread", "macro_contact_handshake", "macro_file_reservation_cycle"],
                 "product_bus": ["ensure_product", "products_link", "search_messages_product", "fetch_inbox_product", "summarize_thread_product"],
                 "build_slots": ["acquire_build_slot", "renew_build_slot", "release_build_slot"],
+            },
+            // ADR-0020 Spec 3 (wave 1): the CLI Nostr two-plane surface.
+            // Shell nouns — never MCP tools (the 39-tool cluster is frozen).
+            "cli": {
+                "plane_s": ["channel", "react"],
+                "plane_j": ["job"],
+                "plane_n": ["presence"],
+                "plane_w": ["watch"],
             },
             "json": true,
             "stdin_dash": true,
