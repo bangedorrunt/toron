@@ -1,5 +1,7 @@
 // governed-by: ADR-0003
-#![forbid(unsafe_code)]
+// (not forbid(unsafe_code): this test sets TORON_MCP_DATA_DIR via
+// std::env::set_var, which is unsafe in edition 2024; the unsafe is confined
+// to the test harness, never to toron-core/toron-mcp library code.)
 
 //! bd-led.8.2 acceptance: operator commands (doctor/metrics/key/project/relay/backend).
 //!
@@ -10,6 +12,7 @@
 
 use std::path::PathBuf;
 use std::process::{Command, Output};
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde_json::Value;
@@ -18,11 +21,31 @@ fn toron() -> Command {
     Command::new(env!("CARGO_BIN_EXE_toron"))
 }
 
+/// Shared per-test-run data dir so the shelled-out `toron` subprocess and the
+/// in-process `register_probe_agent` mailbox NEVER touch the durable
+/// production root (`~/.local/share/toron` — 500+ agent keys there would
+/// re-run the ~1s/key argon2 KDF on every mailbox build).
+fn shared_data_dir() -> PathBuf {
+    static DIR: OnceLock<PathBuf> = OnceLock::new();
+    DIR.get_or_init(|| {
+        let d = std::env::temp_dir().join(format!("toron-cli-operator-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        // SAFETY: test process; inherited by every shelled-out subprocess.
+        unsafe {
+            std::env::set_var("TORON_MCP_DATA_DIR", &d);
+        }
+        d
+    })
+    .clone()
+}
+
 fn run(args: &[&str]) -> Output {
+    let _ = shared_data_dir();
     toron().args(args).output().expect("run toron")
 }
 
 fn run_with_env(args: &[&str], envs: &[(&str, &str)]) -> Output {
+    let _ = shared_data_dir();
     let mut cmd = toron();
     for (k, v) in envs {
         cmd.env(k, v);
@@ -271,6 +294,9 @@ fn metrics_increment_after_robot_call() {
 /// Register `metrics-probe` in the shared demo mailbox (idempotent), so the
 /// robot call in [`metrics_increment_after_robot_call`] succeeds cleanly.
 fn register_probe_agent() {
+    // Ensure the shared data dir env is set BEFORE demo_mailbox constructs
+    // in-process (a durable-root mailbox would re-KDF 500+ agent keys).
+    let _ = shared_data_dir();
     static REG: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
     let _guard = REG
         .get_or_init(|| std::sync::Mutex::new(()))

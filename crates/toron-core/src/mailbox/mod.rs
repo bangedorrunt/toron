@@ -15,8 +15,8 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use nostr_sdk::nostr::{Event, Keys};
 
@@ -87,7 +87,13 @@ pub struct Mailbox {
     /// unwrap-pipeline rebuild re-runs the argon2 KDF ONLY for key files that
     /// actually changed — never a full re-scan of every key (~1s/key at
     /// log-n 16). Keyed by content string (cheap — ncryptsec files are ~300B).
+    ///
+    /// Process-global (shared across ALL Mailbox instances): a fresh mailbox
+    /// on the same data dir must NOT re-pay the N-key KDF — the bench loop and
+    /// CLI-per-invocation mailbox builds reuse the unlocked keys of every
+    /// earlier instance in the process.
     key_cache: Arc<parking_lot::Mutex<HashMap<PathBuf, CachedAgentKey>>>,
+
     /// Total argon2 KDF invocations this process has performed (test
     /// observable; the many-keys gate asserts the warm-rebuild bound).
     kdf_loads: Arc<AtomicU64>,
@@ -103,6 +109,13 @@ struct CachedAgentKey {
     content: String,
     keys: Keys,
 }
+
+/// Process-global decrypted-key cache (see `Mailbox::key_cache`): one argon2
+/// pass per unique (path, content) ever unlocked in this process, across all
+/// mailbox instances. Prevents per-instance cold rebuilds (bench loops, CLI
+/// per-invocation mailboxes) from re-paying N × ~1s KDF.
+static AGENT_KEY_CACHE: OnceLock<Arc<parking_lot::Mutex<HashMap<PathBuf, CachedAgentKey>>>> =
+    OnceLock::new();
 
 impl std::fmt::Debug for Mailbox {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -126,7 +139,9 @@ impl Mailbox {
             agent_passphrase: None,
             receipt_cache: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             index_pool: None,
-            key_cache: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            key_cache: AGENT_KEY_CACHE
+                .get_or_init(|| Arc::new(parking_lot::Mutex::new(HashMap::new())))
+                .clone(),
             kdf_loads: Arc::new(AtomicU64::new(0)),
             trigger_tx: None,
         }
@@ -732,6 +747,81 @@ mod tests {
         );
 
         handle.abort();
+        let _ = std::fs::remove_dir_all(&data_dir);
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// S10 (workspace hygiene): a mailbox booted with a cwd-derived root —
+    /// the gate-test pattern that polluted ~/workspace with ~40 scratch dirs
+    /// (`.archive.lock` + `messages/` + `.git` trees at
+    /// `/Users/.../workspace/s66667` etc.) — must NEVER write outside its
+    /// data_dir. An absolute project key like `/tmp/workspace-sim/s66667`
+    /// resolves to the canonical short slug under data_dir; the "workspace"
+    /// dir stays untouched. Snapshot-before/after is the no-new-workspace-
+    /// dirs gate for `cargo test` runs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn gate_no_new_dirs_outside_data_dir_for_absolute_slug() {
+        let (mailbox, db, data_dir) = loop_mailbox("s10-gate").await;
+        // A fake "workspace root" the mailbox must never touch: it stands in
+        // for ~/workspace under the old cwd-derived-root bug.
+        let fake_ws = std::env::temp_dir().join(format!("toron-s10-ws-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&fake_ws).expect("fake ws");
+        let snapshot: Vec<String> = std::fs::read_dir(&fake_ws)
+            .expect("read ws")
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+
+        let slug = format!("{}/s66667", fake_ws.display());
+        mailbox
+            .register_agent(
+                &slug,
+                &AgentProfile {
+                    name: "RoseDune".into(),
+                    program: Some("opencode".into()),
+                    model: None,
+                    persona: None,
+                    task_description: None,
+                },
+            )
+            .await
+            .expect("register");
+        mailbox
+            .send_message(&crate::mailbox::SendMessage {
+                project_slug: slug.clone(),
+                sender_name: "RoseDune".into(),
+                to: vec!["RoseDune".into()],
+                subject: "s10".into(),
+                body_md: "workspace must stay clean".into(),
+                ..Default::default()
+            })
+            .await
+            .expect("send");
+
+        let after: Vec<String> = std::fs::read_dir(&fake_ws)
+            .expect("read ws")
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            after, snapshot,
+            "no new dirs may appear under the cwd-derived root \
+             (mailbox escaped data_dir): {after:?}"
+        );
+
+        // The mailbox root itself lives under data_dir under the canonical
+        // short slug — NOT at the absolute key path.
+        let canonical = std::path::Path::new(&slug)
+            .file_name()
+            .and_then(|f| f.to_str())
+            .expect("basename");
+        assert!(
+            data_dir.join(canonical).is_dir(),
+            "canonical root under data_dir: {}",
+            data_dir.join(canonical).display()
+        );
+
+        let _ = std::fs::remove_dir_all(&fake_ws);
         let _ = std::fs::remove_dir_all(&data_dir);
         let _ = std::fs::remove_file(&db);
     }

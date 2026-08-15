@@ -95,7 +95,7 @@ impl Mailbox {
     /// lands in ONE root (dir, manifest `d`-tag, scoping tags).
     pub async fn ensure_project(&self, slug: &str) -> anyhow::Result<ProjectState> {
         let slug = &self.canonical_project(slug).await; // ADR-0017: one root per project
-        std::fs::create_dir_all(self.data_dir.join(slug))?;
+        std::fs::create_dir_all(crate::mailbox::aliases::project_root(&self.data_dir, slug))?;
 
         let existing = self
             .find_manifest(slug)

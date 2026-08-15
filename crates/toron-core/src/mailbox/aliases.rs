@@ -17,7 +17,7 @@
 //! Migration — [`reconcile_aliases`]: fold pre-existing data-dir roots whose
 //! relative slug is a path form into the alias table (daemon open).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use sqlx::SqlitePool;
 
@@ -110,6 +110,38 @@ pub async fn alias_read_set(pool: Option<&SqlitePool>, slug: &str) -> Vec<String
     out.sort();
     out.dedup();
     out
+}
+
+/// The filesystem-safe project root under `data_dir` for a project key.
+///
+/// A project key is a logical id, never a filesystem path: path-form keys
+/// collapse to the canonical short slug (basename), and degenerate keys
+/// (`"."`, `".."`, `"/"`, empty) — which would escape `data_dir` via
+/// `PathBuf::join` discarding the base — fall back to a sanitized token.
+/// Mailbox project roots can therefore never escape the data root (S10
+/// workspace hygiene: gate tests booting mailboxes with cwd-derived roots
+/// must not scatter `.archive.lock` + `messages/` trees across ~/workspace).
+pub fn project_root(data_dir: &Path, slug: &str) -> PathBuf {
+    let base = short_slug(slug).unwrap_or_default();
+    let base_is_safe = !base.is_empty()
+        && base != "."
+        && base != ".."
+        && !base.contains('/')
+        && !base.contains('\\');
+    let safe = if base_is_safe {
+        base
+    } else {
+        let s: String = slug
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+            .collect();
+        if s.is_empty() || s == "." || s == ".." {
+            "project".to_string()
+        } else {
+            s
+        }
+    };
+    data_dir.join(safe)
 }
 
 /// Fold pre-existing data-dir project roots into the alias table: every root
@@ -282,5 +314,60 @@ mod tests {
         assert_eq!(reconcile_aliases(&pool, &data_dir).await.unwrap(), 2);
         assert_eq!(reconcile_aliases(&pool, &data_dir).await.unwrap(), 0);
         let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[test]
+    fn project_root_never_escapes_data_dir() {
+        let data_dir = std::env::temp_dir().join(format!("toron-proot-{}", uuid::Uuid::new_v4()));
+        // Plain short slug: nested under data_dir.
+        assert_eq!(
+            project_root(&data_dir, "demo"),
+            data_dir.join("demo"),
+            "short slug nests under data_dir"
+        );
+        // Absolute path-form key (the S10 pollution class: gate tests boot
+        // mailboxes with cwd-derived roots like /Users/.../workspace/s66667).
+        let root = project_root(&data_dir, "/Users/bangedorrunt/workspace/s66667");
+        assert!(
+            root.starts_with(&data_dir),
+            "absolute key must stay under data_dir, got {}",
+            root.display()
+        );
+        assert_eq!(root, data_dir.join("s66667"));
+        // Relative path-form key without the leading separator.
+        assert_eq!(
+            project_root(&data_dir, "Users/bangedorrunt/workspace/s66667"),
+            data_dir.join("s66667")
+        );
+        // Degenerate keys must not escape data_dir either.
+        for bad in ["..", ".", "/", "", "../escape"] {
+            let root = project_root(&data_dir, bad);
+            assert!(
+                root.starts_with(&data_dir),
+                "degenerate key {bad:?} must stay under data_dir, got {}",
+                root.display()
+            );
+        }
+        // Backslashes (windows-style) must not escape either.
+        let root = project_root(&data_dir, "..\\escape");
+        assert!(
+            root.starts_with(&data_dir),
+            "backslash key must stay under data_dir, got {}",
+            root.display()
+        );
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[test]
+    fn project_root_canonical_key_unchanged() {
+        let data_dir = PathBuf::from("/data");
+        assert_eq!(
+            project_root(&data_dir, "toron"),
+            PathBuf::from("/data/toron")
+        );
+        assert_eq!(
+            project_root(&data_dir, "toron.dev"),
+            PathBuf::from("/data/toron.dev")
+        );
     }
 }
