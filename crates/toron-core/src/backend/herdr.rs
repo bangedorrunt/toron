@@ -538,10 +538,7 @@ impl Client {
         source: &str,
         lines: Option<u32>,
     ) -> Result<String, BackendError> {
-        let res = self.call(
-            "agent.read",
-            json!({ "target": target, "source": source, "lines": lines, "format": "text", "strip_ansi": true }),
-        )?;
+        let res = self.call("agent.read", agent_read_params(target, source, lines))?;
         let text = res
             .get("content")
             .or_else(|| res.get("text"))
@@ -595,6 +592,13 @@ impl Client {
 fn parse_code(code: &str) -> BackendErrorCode {
     code.parse()
         .unwrap_or_else(|_| BackendErrorCode::Other(code.to_string()))
+}
+
+/// Wire params for `agent.read`. Source strings (recent, visible,
+/// recent-unwrapped, ...) pass through UNTOUCHED — the herdr daemon owns
+/// source semantics; this client never rewrites or whitelists them.
+fn agent_read_params(target: &str, source: &str, lines: Option<u32>) -> Value {
+    json!({ "target": target, "source": source, "lines": lines, "format": "text", "strip_ansi": true })
 }
 
 fn parse_err(msg: String) -> BackendError {
