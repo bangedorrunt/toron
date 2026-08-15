@@ -1,13 +1,15 @@
 // governed-by: ADR-0003
+// governed-by: ADR-0020
 #![forbid(unsafe_code)]
 
 //! NIP-29 channels (bd-aws): membership-only access gate + global-sub
 //! exclusion. toron-superset (Buzz-grade collaboration), not AM-Rust parity.
 //!
-//! Wire (ADR-0003 Phase 2 / NIP-29):
+//! Wire (ADR-0003 Phase 2 / ADR-0020):
 //! - kind 40 channel-create (`d`=channel-id, `h`=channel-id)
 //! - kind 41 channel-metadata (`h`)
-//! - kind 42 channel-message (`h`, `p` for @mentions)
+//! - kind **9** channel-message (`h`, `t`=project slug, `p` for @mentions)
+//! - kind 42 legacy ingest only
 //! - kind 7 reaction (`h`)
 //!
 //! **Membership is the only gate.** Enforcement lives at the same point as
@@ -29,12 +31,14 @@ use nostr_sdk::nostr::{Event, EventId, Keys, PublicKey, Tag, Timestamp};
 use toron_core::nostr::event::build_event;
 use toron_core::nostr::kinds::toron_kind;
 
-/// NIP-29 channel-create kind (40).
+/// NIP-29 channel-create kind (40). Store-local create; optional 39000 later.
 pub const CHANNEL_CREATE: u16 = 40;
 /// NIP-29 channel-metadata kind (41).
 pub const CHANNEL_METADATA: u16 = 41;
-/// NIP-29 channel-message kind (42).
-pub const CHANNEL_MESSAGE: u16 = 42;
+/// Canonical channel post (ADR-0003 / ADR-0020). NIP-29 group chat.
+pub const CHANNEL_MESSAGE: u16 = 9;
+/// Legacy emit (pre-ADR-0020). Ingest only.
+pub const CHANNEL_MESSAGE_LEGACY: u16 = 42;
 /// NIP-25 reaction kind (7).
 pub const REACTION: u16 = 7;
 
@@ -74,7 +78,7 @@ pub struct ChannelEvent {
     pub event_id: String,
     /// Author npub.
     pub author: String,
-    /// Kind (42 message / 7 reaction).
+    /// Kind (9 canonical / 42 legacy message, 7 reaction).
     pub kind: u16,
     /// Content.
     pub content: String,
@@ -186,7 +190,12 @@ impl ChannelStore {
         self.inner.lock().channels.values().cloned().collect()
     }
 
-    /// Build + record a channel-message event (kind 42). **Membership gate:**
+    /// True when `kind` is a channel post (canonical 9 or legacy 42).
+    pub fn is_post_kind(kind: u16) -> bool {
+        kind == CHANNEL_MESSAGE || kind == CHANNEL_MESSAGE_LEGACY
+    }
+
+    /// Build + record a channel-message event (kind 9). **Membership gate:**
     /// only members may post; a non-member is rejected before any event is
     /// produced (the gate is at the store boundary — the same point the
     /// projection/fanout uses).
@@ -200,6 +209,9 @@ impl ChannelStore {
         let author_pk = author.public_key();
         self.require_member(channel_id, &author_pk)?;
         let mut tags = vec![Tag::parse(["h", channel_id]).expect("h tag")];
+        if let Some(slug) = self.get(channel_id).and_then(|c| c.project) {
+            tags.push(Tag::parse(["t", &slug]).expect("t tag"));
+        }
         for m in mentions {
             tags.push(Tag::public_key(*m));
         }
@@ -220,6 +232,42 @@ impl ChannelStore {
             mentions: mentions.iter().map(|m| m.to_hex()).collect(),
         });
         Ok(ev)
+    }
+
+    /// Ingest a channel-message event from the bus (ADR-0020 Spec 1):
+    /// accepts kind 9 (canonical) and kind 42 (legacy); **both project as
+    /// channel posts**. Membership-gated at the store boundary — a
+    /// non-member's event is dropped before index/fanout (the same gate as
+    /// [`Self::post`]).
+    pub fn ingest(&self, ev: &Event) -> anyhow::Result<ChannelEvent> {
+        let kind = ev.kind.as_u16();
+        if !Self::is_post_kind(kind) {
+            anyhow::bail!("not a channel post kind: {kind} (expected 9 or 42)");
+        }
+        let channel_id = ev
+            .tags
+            .iter()
+            .find(|t| t.as_slice().first().map(String::as_str) == Some("h"))
+            .and_then(|t| t.as_slice().get(1).cloned())
+            .ok_or_else(|| anyhow::anyhow!("channel post lacks h tag"))?;
+        self.require_member(&channel_id, &ev.pubkey)?;
+        let mentions: Vec<String> = ev
+            .tags
+            .iter()
+            .filter(|t| t.as_slice().first().map(String::as_str) == Some("p"))
+            .filter_map(|t| t.as_slice().get(1).cloned())
+            .collect();
+        let ce = ChannelEvent {
+            channel_id,
+            event_id: ev.id.to_hex(),
+            author: ev.pubkey.to_hex(),
+            kind,
+            content: ev.content.clone(),
+            react_to: None,
+            mentions,
+        };
+        self.inner.lock().events.push(ce.clone());
+        Ok(ce)
     }
 
     /// Build + record a reaction (kind 7). Membership-gated.
@@ -328,6 +376,21 @@ mod tests {
     }
 
     #[test]
+    fn post_emits_kind_nine_not_forty_two() {
+        let store = ChannelStore::new();
+        let alice = keys();
+        store
+            .create_channel(&alice.public_key(), "room", "Room", false, Some("toron"))
+            .expect("create");
+        let ev = store.post(&alice, "room", "hello", &[]).expect("post");
+        assert_eq!(ev.kind.as_u16(), 9, "ADR-0020 emit is kind 9");
+        assert_eq!(CHANNEL_MESSAGE, 9);
+        assert_eq!(CHANNEL_MESSAGE_LEGACY, 42);
+        let has_t = ev.tags.iter().any(|t| format!("{t:?}").contains("toron"));
+        assert!(has_t, "project slug on t tag, tags={:?}", ev.tags);
+    }
+
+    #[test]
     fn reaction_membership_gated() {
         let store = ChannelStore::new();
         let alice = keys();
@@ -391,6 +454,24 @@ mod tests {
         assert_eq!(store.get("c").unwrap().name, "C", "first wins");
     }
 
+    /// ADR-0020 Spec 1: a channel post EMITS kind 9 (NIP-29 channel message),
+    /// never the legacy 42.
+    #[test]
+    fn post_emits_kind_9_not_42() {
+        let store = ChannelStore::new();
+        let alice = keys();
+        store
+            .create_channel(&alice.public_key(), "c", "C", false, None)
+            .expect("create");
+        let ev = store.post(&alice, "c", "hello", &[]).expect("post");
+        assert_eq!(
+            ev.kind.as_u16(),
+            9,
+            "channel post emits kind 9 (ADR-0020 Spec 1), got {}",
+            ev.kind.as_u16()
+        );
+    }
+
     #[test]
     fn post_carries_h_and_p_tags() {
         let store = ChannelStore::new();
@@ -415,6 +496,91 @@ mod tests {
                 .iter()
                 .any(|t| t.as_slice().first().map(String::as_str) == Some("p")),
             "p tag for @mention"
+        );
+    }
+
+    /// ADR-0020 Spec 1: ingest accepts kind 9 (canonical) and kind 42
+    /// (legacy) and projects both as channel posts.
+    #[test]
+    fn ingest_projects_kind_9_and_legacy_42() {
+        let store = ChannelStore::new();
+        let alice = keys();
+        store
+            .create_channel(&alice.public_key(), "c", "C", false, Some("toron"))
+            .expect("create");
+
+        // Canonical kind 9 event, built by hand (as if from the bus).
+        let ev9 = build_event(
+            &alice,
+            toron_kind(CHANNEL_MESSAGE),
+            "hello",
+            vec![Tag::parse(["h", "c"]).expect("h")],
+            Timestamp::now(),
+        )
+        .expect("build kind 9");
+        let p9 = store.ingest(&ev9).expect("ingest kind 9");
+        assert_eq!(p9.kind, 9);
+        assert_eq!(p9.channel_id, "c");
+
+        // Legacy kind 42 event, ingested the same way.
+        let ev42 = build_event(
+            &alice,
+            toron_kind(CHANNEL_MESSAGE_LEGACY),
+            "legacy hello",
+            vec![Tag::parse(["h", "c"]).expect("h")],
+            Timestamp::now(),
+        )
+        .expect("build legacy 42");
+        let p42 = store.ingest(&ev42).expect("ingest kind 42");
+        assert_eq!(p42.kind, 42);
+        assert_eq!(p42.content, "legacy hello");
+
+        // Both project into history as channel posts.
+        let hist = store.history("c");
+        assert_eq!(hist.len(), 2);
+        assert!(hist.iter().all(|e| e.kind == 9 || e.kind == 42));
+    }
+
+    /// ADR-0020 Spec 1: non-post kinds and non-member events are rejected at
+    /// ingest (the same store-boundary gate as `post`).
+    #[test]
+    fn ingest_rejects_other_kinds_and_non_members() {
+        let store = ChannelStore::new();
+        let alice = keys();
+        let mallory = keys();
+        store
+            .create_channel(&alice.public_key(), "c", "C", false, None)
+            .expect("create");
+
+        // A reaction (kind 7) is not a channel post.
+        let post = store.post(&alice, "c", "hello", &[]).expect("post");
+        let reaction = store
+            .react(&alice, "c", &post.id.to_hex(), "+1")
+            .expect("react");
+        assert!(
+            store.ingest(&reaction).is_err(),
+            "kind 7 is not a channel post"
+        );
+
+        // A kind-9 event from a non-member is dropped at the gate.
+        let stranger = build_event(
+            &mallory,
+            toron_kind(CHANNEL_MESSAGE),
+            "intrude",
+            vec![Tag::parse(["h", "c"]).expect("h")],
+            Timestamp::now(),
+        )
+        .expect("build");
+        assert!(
+            store.ingest(&stranger).is_err(),
+            "non-member event dropped before index"
+        );
+        // Only the member's post + reaction were recorded; both failed
+        // ingests added nothing.
+        assert_eq!(
+            store.history("c").len(),
+            2,
+            "rejected ingests are not recorded"
         );
     }
 }

@@ -1,4 +1,5 @@
 // governed-by: ADR-0003
+// governed-by: ADR-0020
 #![forbid(unsafe_code)]
 
 //! Frozen kind registry (ADR-0003, AGREEMENT LOCKED 2026-08-04).
@@ -28,6 +29,12 @@ pub const FILE_RESERVATION: u16 = 30031;
 pub const BUILD_SLOT: u16 = 30032;
 /// Presence / working-state (ephemeral, not stored).
 pub const PRESENCE: u16 = 20001;
+/// NIP-29 / ADR-0003 channel post (kind 9). Adopted standard.
+pub const CHANNEL_MESSAGE: u16 = 9;
+/// NIP-25 reaction.
+pub const REACTION: u16 = 7;
+/// Pre-ADR-0020 channel post. Ingest only.
+pub const CHANNEL_MESSAGE_LEGACY: u16 = 42;
 /// Job request (regular, immutable; `e`=parent). Buzz-verbatim.
 pub const JOB_REQUEST: u16 = 43001;
 /// Job accepted/claim (regular; `e`=job). Signed by claiming agent.
@@ -64,6 +71,9 @@ mod tests {
         assert_eq!(FILE_RESERVATION, 30031);
         assert_eq!(BUILD_SLOT, 30032);
         assert_eq!(PRESENCE, 20001);
+        assert_eq!(CHANNEL_MESSAGE, 9);
+        assert_eq!(REACTION, 7);
+        assert_eq!(CHANNEL_MESSAGE_LEGACY, 42);
         assert_eq!(JOB_REQUEST, 43001);
         assert_eq!(JOB_ACCEPTED, 43002);
         assert_eq!(JOB_PROGRESS, 43003);
