@@ -70,6 +70,33 @@ Pure functions (new `mailbox/naming.rs` module, fully unit-tested):
 - `is_canonical_name(name, project_slug) -> bool`
 - `is_npub(s) -> bool` (64-hex routing address)
 
+### D1a — Amendment (2026-08-15, captain): the routable identity is a registered adjective+noun pin
+
+The captain prefers **adjective+noun identities** (`DustySparrow`,
+`RoseDune` — the legacy spawn binding style) as the human-facing, routable
+mail identity. This amends D1/D3:
+
+1. **The pinned adjective+noun name is the canonical routable identity** per
+   pane: `agent-names.json` `mail_identity` = the adj+noun pin, **registered
+   idempotently at spawn** (the S8.1 pattern — registration, not randomness,
+   was what fixed routing) and unique per project (spawn registry rejects a
+   collision with a fresh draw).
+2. **The `flywheel-<slug>-<role><seq>` name is the technical pane handle** —
+   the herdr name, still resolved by `settle`/`send`/whois as an alias
+   through the `agent-names.json` binding, but NOT the primary mail identity.
+3. **D3 display-name demotion is reversed for pins**: registered adj+noun
+   pins ARE routing targets. Unregistered free strings remain rejected.
+4. `register_spawned_agent` (S8.3) is reversed to register the adj+noun pin;
+   the slug-name registration it introduced is retired. Existing
+   slug-registered identities stay as aliases (history), not re-registered.
+5. `flywheel principles` / briefs address crews by their pin; humans steer
+   by pin. `whois <pin>` resolves.
+
+Rationale (captain, 2026-08-15): slug names read like machinery; adj+noun
+names read like people, and the workspace/label convention already uses
+them. The routing fixes stand — they came from REGISTRATION and PINNING, not
+from the slug grammar.
+
 ### D2 — `agent-names.json` is the pane-to-identity authority
 
 `.flywheel/agent-names.json` (project-local, survives state-dir loss) is the
