@@ -346,7 +346,9 @@ mod tests {
         assert_eq!(ts2, 1_786_509_672_000_000, "µs row untouched");
 
         // Idempotent: second run scales nothing.
-        let again = normalize_created_ts_scale(&pool).await.expect("normalize again");
+        let again = normalize_created_ts_scale(&pool)
+            .await
+            .expect("normalize again");
         assert_eq!(again, 0, "idempotent");
 
         drop(pool);

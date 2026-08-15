@@ -197,11 +197,25 @@ async fn concurrency_spike() {
         .expect("spawn run A");
 
     let parked = poll_parked(&sink_a).await;
-    assert_eq!(parked.len(), 2, "both children must park (2 external promises)");
+    assert_eq!(
+        parked.len(),
+        2,
+        "both children must park (2 external promises)"
+    );
 
     // Map promise-id → node (each child reported its own).
-    let pid_a = parked.iter().find(|(_, n)| n == "a").expect("pid a").0.clone();
-    let pid_b = parked.iter().find(|(_, n)| n == "b").expect("pid b").0.clone();
+    let pid_a = parked
+        .iter()
+        .find(|(_, n)| n == "a")
+        .expect("pid a")
+        .0
+        .clone();
+    let pid_b = parked
+        .iter()
+        .find(|(_, n)| n == "b")
+        .expect("pid b")
+        .0
+        .clone();
     assert_ne!(pid_a, pid_b, "two distinct promise ids");
 
     // The run is genuinely PARKED (not completed) when we crash it — the whole
@@ -248,22 +262,30 @@ async fn concurrency_spike() {
         "child b keeps its identity under reversed resume: {output}"
     );
     assert_eq!(
-        output["a"]["resolved"], json!({ "n": 1 }),
+        output["a"]["resolved"],
+        json!({ "n": 1 }),
         "child a received ITS resolved value (not child b's): {output}"
     );
     assert_eq!(
-        output["b"]["resolved"], json!({ "n": 2 }),
+        output["b"]["resolved"],
+        json!({ "n": 2 }),
         "child b received ITS resolved value (not child a's): {output}"
     );
 
     // (b) Same promise-id assignment: the ids the run used after the crash
     //     match the ids captured BEFORE the crash.
     let mut ids_a: Vec<String> = parked.iter().map(|(id, _)| id.clone()).collect();
-    let mut ids_b: Vec<String> = sink_b.lock().await.iter().map(|(id, _)| id.clone()).collect();
+    let mut ids_b: Vec<String> = sink_b
+        .lock()
+        .await
+        .iter()
+        .map(|(id, _)| id.clone())
+        .collect();
     ids_a.sort();
     ids_b.sort();
     assert_eq!(
-        ids_a, ids_b,
+        ids_a,
+        ids_b,
         "promise-id assignment is identical across crash/replay: pre={parked:?} post={:?}",
         sink_b.lock().await
     );

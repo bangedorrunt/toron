@@ -66,7 +66,10 @@ pub(crate) fn sanitize_fts_query(q: &str) -> String {
             if tok.starts_with('"') || tok.ends_with('"') {
                 return tok.to_string();
             }
-            if tok.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'*') {
+            if tok
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'*')
+            {
                 return tok.to_string();
             }
             let esc = tok.replace('"', "\"\"");
@@ -115,7 +118,9 @@ impl Mailbox {
             let mut params = vec![query];
             params.extend(set.clone());
             (
-                (2..=set.len() + 1).map(|i| format!("?{i}")).collect::<Vec<_>>(),
+                (2..=set.len() + 1)
+                    .map(|i| format!("?{i}"))
+                    .collect::<Vec<_>>(),
                 params,
                 set.len() as i32 + 2,
             )
@@ -150,8 +155,9 @@ impl Mailbox {
             // resolve through the agents table (per project). An unknown
             // name matches nothing (subquery → NULL), which is the correct
             // filter semantics.
-            let sub_ph: Vec<String> =
-                (bind_id..bind_id + set.len() as i32).map(|i| format!("?{i}")).collect();
+            let sub_ph: Vec<String> = (bind_id..bind_id + set.len() as i32)
+                .map(|i| format!("?{i}"))
+                .collect();
             filter_sql.push_str(&format!(
                 " AND m.sender_pubkey = (SELECT pubkey FROM agents WHERE project_slug IN ({}) AND name = ?{})",
                 sub_ph.join(", "),
@@ -374,7 +380,10 @@ mod tests {
         assert_eq!(sanitize_fts_query("re:"), "\"re:\"");
         assert_eq!(sanitize_fts_query("toron.dev"), "\"toron.dev\"");
         assert_eq!(sanitize_fts_query("@npub1abc"), "\"@npub1abc\"");
-        assert_eq!(sanitize_fts_query("@npub1abc\u{2026}"), "\"@npub1abc\u{2026}\"");
+        assert_eq!(
+            sanitize_fts_query("@npub1abc\u{2026}"),
+            "\"@npub1abc\u{2026}\""
+        );
         assert_eq!(sanitize_fts_query("a-b: c.d"), "\"a-b:\" \"c.d\"");
         assert_eq!(sanitize_fts_query("word*"), "word*");
         assert_eq!(sanitize_fts_query("hello_world foo"), "hello_world foo");

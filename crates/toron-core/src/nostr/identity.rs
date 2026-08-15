@@ -315,8 +315,17 @@ mod tests {
             for part in tag.as_slice() {
                 let s = part.as_str();
                 assert!(
-                    !["pi", "claude-sonnet-4", "oracle", "planner", "reviewer", "coder", "scout", "housekeeper"]
-                        .contains(&s),
+                    ![
+                        "pi",
+                        "claude-sonnet-4",
+                        "oracle",
+                        "planner",
+                        "reviewer",
+                        "coder",
+                        "scout",
+                        "housekeeper"
+                    ]
+                    .contains(&s),
                     "tag value {s:?} overloads profile fields onto the bus"
                 );
             }

@@ -20,11 +20,9 @@ use toron_workflow::schema::{Action, parse_workflow};
 /// Returns `{n: 42}` for `send_dm` (a value-returning action — P0.1), Null
 /// otherwise.
 fn value_runner() -> ActionRunner {
-    Arc::new(|a: &Action| {
-        match a {
-            Action::SendDm { .. } => Ok(serde_json::json!({ "n": 42 })),
-            _ => Ok(serde_json::Value::Null),
-        }
+    Arc::new(|a: &Action| match a {
+        Action::SendDm { .. } => Ok(serde_json::json!({ "n": 42 })),
+        _ => Ok(serde_json::Value::Null),
     })
 }
 
@@ -66,5 +64,8 @@ graph:
         );
     }
     // Value-returning actions flow through the DAG (P0.1 x P5.2).
-    assert_eq!(output["scout"]["n"], 42, "node value flows through: {output}");
+    assert_eq!(
+        output["scout"]["n"], 42,
+        "node value flows through: {output}"
+    );
 }

@@ -262,12 +262,12 @@ pub fn staged_paths(repo: &git2::Repository) -> Vec<String> {
         return out;
     };
     for delta in diff.deltas() {
-        if let Some(p) = delta.new_file().path().or_else(|| delta.old_file().path()) {
-            if let Some(p) = p.to_str() {
-                let p = p.to_string();
-                if !out.contains(&p) {
-                    out.push(p);
-                }
+        if let Some(p) = delta.new_file().path().or_else(|| delta.old_file().path())
+            && let Some(p) = p.to_str()
+        {
+            let p = p.to_string();
+            if !out.contains(&p) {
+                out.push(p);
             }
         }
     }

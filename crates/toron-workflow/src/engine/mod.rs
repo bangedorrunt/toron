@@ -90,7 +90,11 @@ pub fn probe_candidate(url: &str) -> bool {
         return false;
     };
     use std::net::{TcpStream, ToSocketAddrs};
-    let Some(addr) = (host.as_str(), port).to_socket_addrs().ok().and_then(|mut it| it.next()) else {
+    let Some(addr) = (host.as_str(), port)
+        .to_socket_addrs()
+        .ok()
+        .and_then(|mut it| it.next())
+    else {
         return false;
     };
     TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(2000)).is_ok()
@@ -98,7 +102,9 @@ pub fn probe_candidate(url: &str) -> bool {
 
 /// Parse `https?://host[:port]` into `(host, port)` (pure).
 pub fn host_port(url: &str) -> Option<(String, u16)> {
-    let rest = url.strip_prefix("https://").or_else(|| url.strip_prefix("http://"))?;
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))?;
     let (host, port) = match rest.split_once(':') {
         Some((h, p)) => (h.to_string(), p.parse::<u16>().ok()?),
         None => (rest.to_string(), 0),
@@ -195,8 +201,7 @@ pub type ActionRunner = Arc<dyn Fn(&Action) -> anyhow::Result<serde_json::Value>
 /// profile name (`@housekeeper`) to the (npub, spawn spec) the embedding
 /// spawns. The ENGINE never imports flywheel — this seam is injected, same
 /// idiom as `ActionRunner`. `None` → unknown profile (fail the step).
-pub type ProfileResolver =
-    Arc<dyn Fn(&str) -> Option<serde_json::Value> + Send + Sync>;
+pub type ProfileResolver = Arc<dyn Fn(&str) -> Option<serde_json::Value> + Send + Sync>;
 
 /// ADR-0007 R4.1: resolve a workflow **name** to a full [`crate::schema::Workflow`] for
 /// `call_workflow` nested runs. Injected DI (engine never imports flywheel

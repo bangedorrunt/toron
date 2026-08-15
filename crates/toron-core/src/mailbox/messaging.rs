@@ -34,13 +34,13 @@ use nostr_sdk::nostr::event::unsigned::UnsignedEvent;
 use nostr_sdk::nostr::{Event, EventId, Keys, PublicKey, Tag, Timestamp};
 use sqlx::Row;
 
+use crate::backend::herdr::HerdrBackend;
 use crate::bus::filter::ToronFilter;
 use crate::bus::scoping::is_metadata_hiding_kind;
 use crate::mailbox::identity::ListAgentsOptions;
 use crate::mailbox::unwrap::{OVERSEER_TAG, UnwrappedMail, order_by_rumor_time, tag_value};
 use crate::nostr::gift_wrap::{self, UnwrappedGift};
 use crate::nostr::identity as nident;
-use crate::backend::herdr::HerdrBackend;
 use sha2::Digest;
 
 use super::Mailbox;
@@ -481,7 +481,7 @@ impl Mailbox {
         acknowledged: bool,
     ) -> anyhow::Result<ReceiptResult> {
         let project_slug = &self.canonical_project(project_slug).await; // ADR-0017
-        let agent_keys = self.agent_keys_for(&project_slug, agent_name)?;
+        let agent_keys = self.agent_keys_for(project_slug, agent_name)?;
         let npub = agent_keys.public_key();
 
         // Case (a): the wrap addressed to THIS agent (the recipient).
@@ -492,12 +492,12 @@ impl Mailbox {
                 // different identity. Discover the actual recipient across
                 // the project's agents (alias-set expanded), then authorize.
                 let (gift, recipient_name) = self
-                    .find_message_across_agents(&project_slug, message_id)
+                    .find_message_across_agents(project_slug, message_id)
                     .await?
                     .ok_or_else(|| {
                         anyhow::anyhow!("message not found for agent {agent_name}: {message_id}")
                     })?;
-                self.authorize_ack(&project_slug, agent_name, &recipient_name, &gift)
+                self.authorize_ack(project_slug, agent_name, &recipient_name, &gift)
                     .await?;
                 gift
             }
@@ -506,7 +506,7 @@ impl Mailbox {
 
         // Idempotency: already acked/read → return stored receipt.
         let id = EventId::from_hex(message_id).unwrap_or_else(|_| original.rumor.clone().id());
-        if let Some(ts) = self.receipt_time(&project_slug, agent_name, &id, kind) {
+        if let Some(ts) = self.receipt_time(project_slug, agent_name, &id, kind) {
             return Ok(ReceiptResult {
                 message_id: message_id.to_string(),
                 acknowledged,
@@ -532,8 +532,8 @@ impl Mailbox {
             .map_err(|e| anyhow::anyhow!("gift wrap failed for receipt to {sender_npub}: {e}"))?;
         let ts_us = crate::index::writer::Clock::now_us(&crate::index::writer::SystemClock);
         self.publish_dm(&wrap).await?;
-        self.record_receipt(&project_slug, agent_name, &id, kind, ts_us);
-        self.record_read_state(&project_slug, npub, &id, ts_us).await;
+        self.record_receipt(project_slug, agent_name, &id, kind, ts_us);
+        self.record_read_state(project_slug, npub, &id, ts_us).await;
 
         Ok(ReceiptResult {
             message_id: message_id.to_string(),
@@ -570,7 +570,9 @@ impl Mailbox {
         project_slug: &str,
         message_id: &str,
     ) -> anyhow::Result<Option<(UnwrappedGift, String)>> {
-        let agents = self.list_agents(project_slug, ListAgentsOptions::default()).await?;
+        let agents = self
+            .list_agents(project_slug, ListAgentsOptions::default())
+            .await?;
         for agent in agents {
             let Ok(keys) = self.agent_keys_for(project_slug, &agent.name) else {
                 continue; // no local key for this identity — skip
@@ -1066,8 +1068,20 @@ mod tests {
 
         // Two identical assigns (same sender+subject+body) 10s apart → one
         // row, the LATEST copy, marked duplicate_of = first id.
-        let first = mk("first", "PiAlpha", "assign", "build it", 1_700_000_000_000_000);
-        let dup = mk("dup", "PiAlpha", "assign", "build it", 1_700_000_000_010_000);
+        let first = mk(
+            "first",
+            "PiAlpha",
+            "assign",
+            "build it",
+            1_700_000_000_000_000,
+        );
+        let dup = mk(
+            "dup",
+            "PiAlpha",
+            "assign",
+            "build it",
+            1_700_000_000_010_000,
+        );
         let collapsed = collapse_duplicates(vec![first.clone(), dup]);
         assert_eq!(collapsed.len(), 1, "duplicates collapse to one row");
         assert_eq!(collapsed[0].id, "dup", "latest copy survives");
@@ -1078,15 +1092,33 @@ mod tests {
         );
 
         // Outside the window (2h later) → NOT collapsed.
-        let old = mk("old", "PiAlpha", "assign", "build it", 1_700_000_000_000_000);
-        let late = mk("late", "PiAlpha", "assign", "build it", 1_700_007_200_000_000);
+        let old = mk(
+            "old",
+            "PiAlpha",
+            "assign",
+            "build it",
+            1_700_000_000_000_000,
+        );
+        let late = mk(
+            "late",
+            "PiAlpha",
+            "assign",
+            "build it",
+            1_700_007_200_000_000,
+        );
         let kept = collapse_duplicates(vec![old, late]);
         assert_eq!(kept.len(), 2, "outside window stays separate");
         assert!(kept.iter().all(|m| m.duplicate_of.is_none()));
 
         // Different body → no collapse.
         let a = mk("a", "PiAlpha", "assign", "build it", 1_700_000_000_000_000);
-        let b = mk("b", "PiAlpha", "assign", "build other", 1_700_000_000_010_000);
+        let b = mk(
+            "b",
+            "PiAlpha",
+            "assign",
+            "build other",
+            1_700_000_000_010_000,
+        );
         let kept2 = collapse_duplicates(vec![a, b]);
         assert_eq!(kept2.len(), 2, "different body is not a duplicate");
 
@@ -1113,9 +1145,18 @@ mod tests {
             ..Default::default()
         };
 
-        mailbox.send_message(&send("build it")).await.expect("send 1");
-        mailbox.send_message(&send("build it")).await.expect("send 2 (dup)");
-        mailbox.send_message(&send("build other")).await.expect("send 3 (distinct)");
+        mailbox
+            .send_message(&send("build it"))
+            .await
+            .expect("send 1");
+        mailbox
+            .send_message(&send("build it"))
+            .await
+            .expect("send 2 (dup)");
+        mailbox
+            .send_message(&send("build other"))
+            .await
+            .expect("send 3 (distinct)");
 
         let inbox = mailbox
             .fetch_inbox(&FetchInbox {
@@ -1476,7 +1517,11 @@ mod tests {
         let msg2_id = wraps_to(&mailbox, &gc_npub, 4)
             .await
             .iter()
-            .find_map(|w| gift_wrap::unwrap(&gc, w).ok().map(|g| g.rumor.clone().id().to_hex()))
+            .find_map(|w| {
+                gift_wrap::unwrap(&gc, w)
+                    .ok()
+                    .map(|g| g.rumor.clone().id().to_hex())
+            })
             .expect("msg2 id");
 
         // BlueLake acks msg2 — its own keys cannot unwrap it (addressed to

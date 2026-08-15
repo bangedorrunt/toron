@@ -93,18 +93,17 @@ pub async fn alias_read_set(pool: Option<&SqlitePool>, slug: &str) -> Vec<String
     if !out.contains(&canonical) {
         out.push(canonical.clone());
     }
-    if let Some(pool) = pool {
-        if let Ok(rows) = sqlx::query_scalar::<_, String>(
+    if let Some(pool) = pool
+        && let Ok(rows) = sqlx::query_scalar::<_, String>(
             "SELECT alias FROM project_aliases WHERE canonical = ?1",
         )
         .bind(&canonical)
         .fetch_all(pool)
         .await
-        {
-            for alias in rows {
-                if !out.contains(&alias) {
-                    out.push(alias);
-                }
+    {
+        for alias in rows {
+            if !out.contains(&alias) {
+                out.push(alias);
             }
         }
     }
@@ -140,23 +139,24 @@ pub async fn reconcile_aliases(pool: &SqlitePool, data_dir: &Path) -> anyhow::Re
             };
             // Only real project roots (contain an agents dir), mirroring the
             // bd-f5tt walk; canonical short-slug roots need no alias.
-            if path_form(&slug) && path.join("agents").is_dir() {
-                if let Some(short) = short_slug(&slug) {
-                    // Both spellings fold (mirroring project_slug_aliases):
-                    // legacy events/rows may carry the leading-separator
-                    // form while the on-disk root is relative.
-                    for alias in [slug.clone(), format!("/{slug}")] {
-                        let res = sqlx::query(
-                            "INSERT INTO project_aliases (alias, canonical, created_ts_us) \
-                             VALUES (?1, ?2, ?3) ON CONFLICT (alias) DO NOTHING",
-                        )
-                        .bind(&alias)
-                        .bind(&short)
-                        .bind(now_us)
-                        .execute(pool)
-                        .await?;
-                        inserted += res.rows_affected() as usize;
-                    }
+            if path_form(&slug)
+                && path.join("agents").is_dir()
+                && let Some(short) = short_slug(&slug)
+            {
+                // Both spellings fold (mirroring project_slug_aliases):
+                // legacy events/rows may carry the leading-separator
+                // form while the on-disk root is relative.
+                for alias in [slug.clone(), format!("/{slug}")] {
+                    let res = sqlx::query(
+                        "INSERT INTO project_aliases (alias, canonical, created_ts_us) \
+                         VALUES (?1, ?2, ?3) ON CONFLICT (alias) DO NOTHING",
+                    )
+                    .bind(&alias)
+                    .bind(&short)
+                    .bind(now_us)
+                    .execute(pool)
+                    .await?;
+                    inserted += res.rows_affected() as usize;
                 }
             }
             stack.push(path);
@@ -171,11 +171,11 @@ mod tests {
     use crate::index::schema;
 
     async fn test_pool(tag: &str) -> SqlitePool {
-        let db_path = std::env::temp_dir().join(format!(
-            "toron-alias-{tag}-{}.sqlite",
-            uuid::Uuid::new_v4()
-        ));
-        let pool = schema::connect(db_path.to_str().unwrap()).await.expect("connect");
+        let db_path =
+            std::env::temp_dir().join(format!("toron-alias-{tag}-{}.sqlite", uuid::Uuid::new_v4()));
+        let pool = schema::connect(db_path.to_str().unwrap())
+            .await
+            .expect("connect");
         schema::migrate(&pool).await.expect("migrate");
         pool
     }
@@ -194,7 +194,10 @@ mod tests {
             short_slug("/Users/bangedorrunt/workspace/toron").as_deref(),
             Some("toron")
         );
-        assert_eq!(short_slug("Users/workspace/toron").as_deref(), Some("toron"));
+        assert_eq!(
+            short_slug("Users/workspace/toron").as_deref(),
+            Some("toron")
+        );
         assert_eq!(short_slug("toron").as_deref(), Some("toron"));
         assert_eq!(short_slug("/").as_deref(), None);
     }
@@ -216,12 +219,11 @@ mod tests {
         assert_eq!(canonicalize(Some(&pool), path_slug).await, "toron");
         assert_eq!(canonicalize(Some(&pool), path_slug).await, "toron");
         assert_eq!(canonicalize(Some(&pool), "toron").await, "toron");
-        let n: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM project_aliases WHERE alias = ?1")
-                .bind(path_slug)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM project_aliases WHERE alias = ?1")
+            .bind(path_slug)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         assert_eq!(n, 1, "alias row persisted exactly once");
     }
 
@@ -253,15 +255,15 @@ mod tests {
     #[tokio::test]
     async fn reconcile_folds_existing_path_slug_roots() {
         let pool = test_pool("reconcile").await;
-        let data_dir = std::env::temp_dir().join(format!(
-            "toron-alias-data-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let data_dir =
+            std::env::temp_dir().join(format!("toron-alias-data-{}", uuid::Uuid::new_v4()));
         let legacy = data_dir.join("Users/bangedorrunt/workspace/toron");
         std::fs::create_dir_all(legacy.join("agents")).unwrap();
         std::fs::create_dir_all(data_dir.join("toron").join("agents")).unwrap();
 
-        let inserted = reconcile_aliases(&pool, &data_dir).await.expect("reconcile");
+        let inserted = reconcile_aliases(&pool, &data_dir)
+            .await
+            .expect("reconcile");
         assert_eq!(inserted, 2, "both spellings of the path-form root fold");
 
         let set = alias_read_set(Some(&pool), "toron").await;
@@ -274,10 +276,8 @@ mod tests {
     #[tokio::test]
     async fn reconcile_is_idempotent() {
         let pool = test_pool("reconcile2").await;
-        let data_dir = std::env::temp_dir().join(format!(
-            "toron-alias-data-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let data_dir =
+            std::env::temp_dir().join(format!("toron-alias-data-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(data_dir.join("Users/a/toron").join("agents")).unwrap();
         assert_eq!(reconcile_aliases(&pool, &data_dir).await.unwrap(), 2);
         assert_eq!(reconcile_aliases(&pool, &data_dir).await.unwrap(), 0);

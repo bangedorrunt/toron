@@ -132,11 +132,7 @@ pub fn cron_registry(crons: Vec<CronRegistration>) -> CronRegistry {
 /// A [`CronRegistration`] for the fixture workflow. `cron` is the 5-field
 /// expression; `enabled` gates firing. `next_due` validates the expr on the
 /// fly so a typo fails fast at fixture-build time, not deep in a run.
-pub fn fixture_registration(
-    name: &str,
-    cron: &str,
-    enabled: bool,
-) -> CronRegistration {
+pub fn fixture_registration(name: &str, cron: &str, enabled: bool) -> CronRegistration {
     assert!(
         toron_workflow::cron::next_due(cron, 1_700_000_000).is_some(),
         "fixture cron expression must parse: {cron}"

@@ -24,18 +24,18 @@ use std::time::Duration;
 
 /// Default state dir: `$XDG_STATE_HOME/toron` else `~/.local/state/toron`.
 pub fn default_state_dir() -> PathBuf {
-    if let Ok(xdg) = std::env::var("XDG_STATE_HOME") {
-        if !xdg.is_empty() {
-            return PathBuf::from(xdg).join("toron");
-        }
+    if let Ok(xdg) = std::env::var("XDG_STATE_HOME")
+        && !xdg.is_empty()
+    {
+        return PathBuf::from(xdg).join("toron");
     }
-    if let Ok(home) = std::env::var("HOME") {
-        if !home.is_empty() {
-            return PathBuf::from(home)
-                .join(".local")
-                .join("state")
-                .join("toron");
-        }
+    if let Ok(home) = std::env::var("HOME")
+        && !home.is_empty()
+    {
+        return PathBuf::from(home)
+            .join(".local")
+            .join("state")
+            .join("toron");
     }
     PathBuf::from("toron-state")
 }
@@ -117,7 +117,9 @@ pub fn plist_xml(
     )
 }
 
-/// Render the systemd user unit (pure — golden-tested).
+/// Render the systemd user unit (pure — golden-tested). Only reachable from
+/// linux-gated install paths (and unit tests); macOS builds see it as dead.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 pub fn systemd_unit(
     label: &str,
     binary: &Path,
@@ -174,6 +176,7 @@ pub enum DaemonState {
     /// Running under launchd (macOS).
     RunningLaunchd,
     /// Running under systemd (Linux).
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     RunningSystemd,
     /// Running via pidfile spawn (fallback).
     RunningPidfile(u32),
@@ -191,10 +194,10 @@ pub fn detect_state(label: &str, pidfile: &Path, addr: &str) -> DaemonState {
         let out = Command::new("launchctl")
             .args(["print", &format!("gui/{uid}/{label}")])
             .output();
-        if let Ok(o) = out {
-            if o.status.success() {
-                return DaemonState::RunningLaunchd;
-            }
+        if let Ok(o) = out
+            && o.status.success()
+        {
+            return DaemonState::RunningLaunchd;
         }
     }
     #[cfg(target_os = "linux")]
@@ -208,10 +211,10 @@ pub fn detect_state(label: &str, pidfile: &Path, addr: &str) -> DaemonState {
             }
         }
     }
-    if let Some(pid) = read_pidfile(pidfile) {
-        if process_alive(pid) {
-            return DaemonState::RunningPidfile(pid);
-        }
+    if let Some(pid) = read_pidfile(pidfile)
+        && process_alive(pid)
+    {
+        return DaemonState::RunningPidfile(pid);
     }
     if addr_alive(addr) {
         return DaemonState::RunningUnmanaged;
@@ -463,11 +466,11 @@ pub fn start(args: &super::cli::DaemonArgs) -> anyhow::Result<()> {
         let out = Command::new("launchctl")
             .args(["kickstart", "-k", &format!("gui/{uid}/{label}")])
             .output();
-        if let Ok(o) = out {
-            if o.status.success() {
-                println!("started {label} (launchd)");
-                return Ok(());
-            }
+        if let Ok(o) = out
+            && o.status.success()
+        {
+            println!("started {label} (launchd)");
+            return Ok(());
         }
         // Not loaded yet — install (idempotent) then kickstart.
         install(args)?;
@@ -481,7 +484,7 @@ pub fn start(args: &super::cli::DaemonArgs) -> anyhow::Result<()> {
             );
         }
         println!("started {label} (launchd)");
-        return Ok(());
+        Ok(())
     }
     #[cfg(target_os = "linux")]
     {
@@ -539,18 +542,18 @@ pub fn stop(args: &super::cli::DaemonArgs) -> anyhow::Result<()> {
         let out = Command::new("launchctl")
             .args(["bootout", &format!("gui/{uid}/{label}")])
             .output();
-        if let Ok(o) = out {
-            if o.status.success() {
-                println!("stopped {label} (launchd)");
-                return Ok(());
-            }
+        if let Ok(o) = out
+            && o.status.success()
+        {
+            println!("stopped {label} (launchd)");
+            return Ok(());
         }
-        if let Some(pid) = read_pidfile(&pidfile) {
-            if process_alive(pid) {
-                let _ = Command::new("kill").arg(pid.to_string()).output();
-                println!("stopped {label} (pid {pid})");
-                return Ok(());
-            }
+        if let Some(pid) = read_pidfile(&pidfile)
+            && process_alive(pid)
+        {
+            let _ = Command::new("kill").arg(pid.to_string()).output();
+            println!("stopped {label} (pid {pid})");
+            return Ok(());
         }
         if addr_alive(&args.addr) {
             anyhow::bail!(

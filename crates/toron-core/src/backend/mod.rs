@@ -157,7 +157,12 @@ pub trait Backend: Send + Sync {
     fn pane_run(&self, _pane_id: &str, _command: &str) -> Result<(), BackendError> {
         Err(unsupported(self.name(), "pane_run"))
     }
-    fn pane_wait_output(&self, _pane_id: &str, _needle: &str, _timeout_ms: u64) -> Result<Value, BackendError> {
+    fn pane_wait_output(
+        &self,
+        _pane_id: &str,
+        _needle: &str,
+        _timeout_ms: u64,
+    ) -> Result<Value, BackendError> {
         Err(unsupported(self.name(), "pane_wait_output"))
     }
 
@@ -212,7 +217,10 @@ pub trait Backend: Send + Sync {
     }
 
     // ---- events ----
-    fn subscribe(&self, _filters: &[herdr::Subscription]) -> Result<Box<dyn EventStream>, BackendError> {
+    fn subscribe(
+        &self,
+        _filters: &[herdr::Subscription],
+    ) -> Result<Box<dyn EventStream>, BackendError> {
         Err(unsupported(self.name(), "subscribe"))
     }
 }

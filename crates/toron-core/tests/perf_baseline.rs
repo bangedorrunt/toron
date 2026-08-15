@@ -33,8 +33,11 @@ fn fmt(d: Duration) -> String {
 }
 
 async fn temp_pool(tag: &str) -> (sqlx::SqlitePool, std::path::PathBuf) {
-    let path = std::env::temp_dir().join(format!("toron-perf-{tag}-{}.sqlite", uuid::Uuid::new_v4()));
-    let pool = schema::connect(path.to_str().unwrap()).await.expect("connect");
+    let path =
+        std::env::temp_dir().join(format!("toron-perf-{tag}-{}.sqlite", uuid::Uuid::new_v4()));
+    let pool = schema::connect(path.to_str().unwrap())
+        .await
+        .expect("connect");
     schema::migrate(&pool).await.expect("migrate");
     (pool, path)
 }
@@ -87,8 +90,7 @@ async fn bus_burst_throughput_and_lag_ceiling() {
     // (sharing the publisher's runtime would starve the drainer during the
     // CPU-bound gift-wrap burst — that's a measurement artifact, not bus lag).
     // Receipts carry the receipt INSTANT so lag is timestamped at receipt.
-    let (lag_tx, lag_rx) =
-        std::sync::mpsc::channel::<(nostr_sdk::nostr::EventId, Instant)>();
+    let (lag_tx, lag_rx) = std::sync::mpsc::channel::<(nostr_sdk::nostr::EventId, Instant)>();
     let drainer = std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -152,7 +154,10 @@ async fn bus_burst_throughput_and_lag_ceiling() {
         }
     }
     let received = drainer.join().expect("drainer");
-    eprintln!("DEBUG: drainer received={received} lag_samples={}", lags.len());
+    eprintln!(
+        "DEBUG: drainer received={received} lag_samples={}",
+        lags.len()
+    );
     assert!(
         !lags.is_empty(),
         "drainer must have received at least some events during the burst (received={received})"
@@ -289,7 +294,10 @@ async fn kdf_single_key_cold_load() {
             .with_agent_passphrase("perf-kdf-pass"),
     );
     mailbox
-        .register_agent("demo", &toron_core::nostr::identity::AgentProfile::new("KdfProbe"))
+        .register_agent(
+            "demo",
+            &toron_core::nostr::identity::AgentProfile::new("KdfProbe"),
+        )
         .await
         .expect("register");
 

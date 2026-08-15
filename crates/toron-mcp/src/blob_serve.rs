@@ -23,12 +23,12 @@
 
 use std::sync::Arc;
 
+use axum::Router;
 use axum::body::Bytes;
 use axum::extract::{Path as AxumPath, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, put};
-use axum::Router;
 use serde::Serialize;
 use serde_json::json;
 use toron_core::archive::blob::{BLOB_SCHEME, BlobStore, sha256_hex};
@@ -178,9 +178,20 @@ async fn serve_blob(state: &BlossomState, sha256: &str, head_only: bool) -> Resp
             apply_cors(headers);
             headers.insert(
                 header::CONTENT_TYPE,
-                mime.parse().unwrap_or_else(|_| DEFAULT_MIME.parse().unwrap()),
+                mime.parse()
+                    .unwrap_or_else(|_| DEFAULT_MIME.parse().unwrap()),
             );
-            headers.insert(header::CONTENT_LENGTH, state.store.get(&hash).unwrap_or_default().len().to_string().parse().unwrap());
+            headers.insert(
+                header::CONTENT_LENGTH,
+                state
+                    .store
+                    .get(&hash)
+                    .unwrap_or_default()
+                    .len()
+                    .to_string()
+                    .parse()
+                    .unwrap(),
+            );
             resp
         }
         Err(_) => (
@@ -194,11 +205,7 @@ async fn serve_blob(state: &BlossomState, sha256: &str, head_only: bool) -> Resp
 
 /// PUT `/.blossom/upload` — store the raw body, return a Blob Descriptor
 /// (BUD-02). Idempotent: `201` newly stored, `200` already present.
-async fn upload(
-    State(state): State<BlossomState>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Response {
+async fn upload(State(state): State<BlossomState>, headers: HeaderMap, body: Bytes) -> Response {
     let mime = headers
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
@@ -230,10 +237,7 @@ async fn upload(
                 StatusCode::CREATED
             };
             let descriptor = BlobDescriptor {
-                url: format!(
-                    "/{MOUNT_PATH}/{sha256}{}",
-                    mime_to_ext(Some(&uploaded))
-                ),
+                url: format!("/{MOUNT_PATH}/{sha256}{}", mime_to_ext(Some(&uploaded))),
                 sha256: sha256.clone(),
                 size: body.len(),
                 mime: uploaded,
@@ -311,10 +315,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(
-            resp.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN],
-            "*"
-        );
+        assert_eq!(resp.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN], "*");
         assert_eq!(resp.headers()[header::CONTENT_TYPE], "text/plain");
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(bytes.as_ref(), b"hello blossom");
@@ -360,7 +361,9 @@ mod tests {
     async fn head_returns_headers_no_body() {
         let (router, root) = test_router("head");
         let store = BlobStore::new(root.clone());
-        let hash = store.put_with_type(b"xx", Some("application/pdf")).expect("put");
+        let hash = store
+            .put_with_type(b"xx", Some("application/pdf"))
+            .expect("put");
 
         let resp = router
             .oneshot(
@@ -454,10 +457,7 @@ mod tests {
             Some("application/pdf"),
         )
         .expect("resolves");
-        assert_eq!(
-            url,
-            format!("https://cdn.example.com/.blossom/{hash}.pdf")
-        );
+        assert_eq!(url, format!("https://cdn.example.com/.blossom/{hash}.pdf"));
         // Extension mapping.
         assert_eq!(mime_to_ext(Some("image/png")), ".png");
         assert_eq!(mime_to_ext(Some("text/plain")), ".txt");

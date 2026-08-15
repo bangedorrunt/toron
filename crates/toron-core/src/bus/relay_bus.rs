@@ -294,9 +294,7 @@ impl Bus for RelayBus {
     async fn health(&self) -> Result<Health, BusError> {
         // nostr-sdk Client tracks connected relays; we count configured relays.
         let configured = self.config.relays.len();
-        let lag = self
-            .lag_skips
-            .load(std::sync::atomic::Ordering::Relaxed);
+        let lag = self.lag_skips.load(std::sync::atomic::Ordering::Relaxed);
         if configured == 0 {
             return Ok(Health {
                 ok: true,
@@ -310,10 +308,7 @@ impl Bus for RelayBus {
             // silent.
             message.push_str(&format!("; {lag} notification(s) dropped to broadcast lag"));
         }
-        Ok(Health {
-            ok: true,
-            message,
-        })
+        Ok(Health { ok: true, message })
     }
 }
 
@@ -667,9 +662,7 @@ mod tests {
             .subscribe(crate::bus::Filter::new())
             .await
             .expect("subscribe b");
-        let drain_a = tokio::spawn(async move {
-            while let Some(_) = sub_a.next().await {}
-        });
+        let drain_a = tokio::spawn(async move { while sub_a.next().await.is_some() {} });
 
         // Burst: 1500 gift-wraps > 256 (mpsc) + 1024 (broadcast) + margin, so
         // sub_b's bridge MUST lag once the mpsc fills.

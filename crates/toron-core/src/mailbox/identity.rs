@@ -78,7 +78,7 @@ impl Mailbox {
         profile: &AgentProfile,
     ) -> anyhow::Result<RegisteredAgent> {
         let project_slug = &self.canonical_project(project_slug).await; // ADR-0017
-        let key_path = self.agent_key_path(&project_slug, &profile.name);
+        let key_path = self.agent_key_path(project_slug, &profile.name);
         if key_path.exists() {
             anyhow::bail!(
                 "create_agent_identity refused: an identity for '{name}' already exists in project '{project_slug}' (use register_agent to upsert)",
@@ -109,10 +109,10 @@ impl Mailbox {
         // ADR-0017 migration: a pre-canonicalization key under an alternate
         // (path-slug) root is adopted — re-registering under the canonical
         // slug REUSES the legacy identity instead of minting a second one.
-        let key_path = self.agent_key_path(&project_slug, &profile.name);
+        let key_path = self.agent_key_path(project_slug, &profile.name);
         let existing = self
             .load_agent_key(&key_path)
-            .or_else(|| self.alt_agent_key(&project_slug, &profile.name));
+            .or_else(|| self.alt_agent_key(project_slug, &profile.name));
         let created = existing.is_none();
         let result =
             ident::register_agent(project_slug, profile, existing.as_ref(), Timestamp::now())?;
@@ -135,7 +135,7 @@ impl Mailbox {
         result: IdentityResult,
     ) -> anyhow::Result<RegisteredAgent> {
         let project_slug = &self.canonical_project(project_slug).await; // ADR-0017
-        let key_path = self.agent_key_path(&project_slug, &profile.name);
+        let key_path = self.agent_key_path(project_slug, &profile.name);
         if !key_path.exists() {
             crate::keys::write_encrypted_key(
                 &key_path,
@@ -197,7 +197,8 @@ impl Mailbox {
     /// The `alt_agent_key` walk below remains as the legacy read fallback
     /// for pre-ADR-0017 roots.
     pub(crate) fn agent_key_path(&self, project_slug: &str, name: &str) -> PathBuf {
-        let slug = super::aliases::short_slug(project_slug).unwrap_or_else(|| project_slug.to_string());
+        let slug =
+            super::aliases::short_slug(project_slug).unwrap_or_else(|| project_slug.to_string());
         self.data_dir
             .join(slug)
             .join("agents")
@@ -250,15 +251,13 @@ impl Mailbox {
                 if slug == project_slug {
                     continue;
                 }
-                if p.join("agents").is_dir() {
-                    if std::path::Path::new(&slug)
+                if p.join("agents").is_dir()
+                    && std::path::Path::new(&slug)
                         .file_name()
-                        .map(|f| f.to_str())
-                        .flatten()
+                        .and_then(|f| f.to_str())
                         == Some(want.as_str())
-                    {
-                        candidates.push(slug);
-                    }
+                {
+                    candidates.push(slug);
                 }
                 // Descend regardless: a project root may nest deeper roots.
                 stack.push(p);
@@ -321,8 +320,7 @@ impl Mailbox {
                 if p.join("agents").is_dir()
                     && std::path::Path::new(&slug)
                         .file_name()
-                        .map(|f| f.to_str())
-                        .flatten()
+                        .and_then(|f| f.to_str())
                         == Some(want.as_str())
                 {
                     out.push(slug.clone());
@@ -362,8 +360,8 @@ impl Mailbox {
             }
             profiles.extend(events);
         }
-        let npub = npub
-            .ok_or_else(|| anyhow::anyhow!("unknown agent name: {name} (register first)"))?;
+        let npub =
+            npub.ok_or_else(|| anyhow::anyhow!("unknown agent name: {name} (register first)"))?;
 
         // Profile fields + last-active provenance (latest signed profile event).
         let profile_ev = profiles

@@ -42,7 +42,15 @@ pub async fn run_workflow(
     }
 
     let mut step_outputs: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
-    if let Some(failed) = run_steps(ctx, &runner, &input.trigger, &workflow.steps, &mut step_outputs).await? {
+    if let Some(failed) = run_steps(
+        ctx,
+        &runner,
+        &input.trigger,
+        &workflow.steps,
+        &mut step_outputs,
+    )
+    .await?
+    {
         return Ok(failed);
     }
     Ok(serde_json::Value::Object(step_outputs))
@@ -87,120 +95,136 @@ pub(crate) fn run_step<'a>(
     trigger: &'a serde_json::Value,
     step: &'a Step,
     step_outputs: &'a mut serde_json::Map<String, serde_json::Value>,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = resonate_sdk::prelude::Result<serde_json::Value>> + Send + 'a>> {
+) -> std::pin::Pin<
+    Box<
+        dyn std::future::Future<Output = resonate_sdk::prelude::Result<serde_json::Value>>
+            + Send
+            + 'a,
+    >,
+> {
     Box::pin(async move {
-    let value = match &step.action {
-        Action::Delay { secs } => {
-            // Durable sleep — UNBOUNDED (the Buzz 270s cap is gone;
-            // hours/days/weeks for SLA timers, cron-like cadence).
-            ctx.sleep(Duration::from_secs(*secs)).await?;
-            serde_json::Value::Null
-        }
-        Action::RequestApproval { message } => {
-            // Create the promise; its id is the approval key. The 0.6 SDK's
-            // PromiseTask is created eagerly (.create()); the handle's id()
-            // confirms server-side creation.
-            let pending = ctx
-                .promise::<Decision>()
-                .data(&serde_json::json!({ "message": message }))?
-                .create()?;
-            let promise_id = pending.id().await?;
-            // The binding: the embedding publishes kind-46011 with this
-            // promise_id; the operator's approval/rejection resolves it.
-            step_outputs.insert(
-                "approval".into(),
-                serde_json::json!({ "promise_id": promise_id, "message": message }),
-            );
-            // PARK here: this await survives a crash (replay resumes at
-            // this point when the promise resolves).
-            step_outputs.insert(
-                "approval".into(),
-                serde_json::json!({
-                    "promise_id": promise_id,
-                    "message": message,
-                }),
-            );
-            // Side-channel the promise_id (embedding publishes kind-46011).
-            ctx.get_dependency::<ApprovalSink>()
-                .lock()
-                .await
-                .push(promise_id.clone());
-            // Resolve OR rejection both complete the run — a rejected
-            // approval is a DECISION, never a run failure (the WF-08 fix:
-            // Buzz marks it failed; toron records the rejection).
-            //
-            // 0.6 semantics: awaiting a PENDING promise returns
-            // `Err(Error::Suspended)`, which must PROPAGATE so the runtime
-            // parks the run. A REJECTED promise (operator `promises.reject`)
-            // returns `Err(Error::Application)` — that is the decision.
-            let decision: Decision = match pending.await {
-                Ok(d) => d,
-                Err(resonate_sdk::error::Error::Suspended) => {
-                    return Err(resonate_sdk::error::Error::Suspended)
-                }
-                Err(e) => Decision::rejected(format!("rejected: {e}")),
-            };
-            let decision = serde_json::to_value(&decision)?;
-            step_outputs.insert("decision".into(), decision.clone());
-            decision
-        }
-        Action::SendMessage { .. }
-        | Action::SendDm { .. }
-        | Action::React { .. }
-        | Action::DispatchJob { .. }
-        | Action::CallWebhook { .. } => {
-            // Consistency rule: actions go through the shared Mailbox
-            // surface (the injected action runner). Templates are
-            // substituted first so the runner sees rendered values. A
-            // render failure (unserializable action) is a per-step error,
-            // not a run failure.
-            match render_action(&step.action, trigger, step_outputs) {
-                Ok(action) => match (runner)(&action) {
-                    Ok(value) => value,
-                    Err(e) => serde_json::json!({ "ok": false, "error": e.to_string() }),
-                },
-                Err(e) => serde_json::json!({ "ok": false, "error": format!("render: {e}") }),
+        let value = match &step.action {
+            Action::Delay { secs } => {
+                // Durable sleep — UNBOUNDED (the Buzz 270s cap is gone;
+                // hours/days/weeks for SLA timers, cron-like cadence).
+                ctx.sleep(Duration::from_secs(*secs)).await?;
+                serde_json::Value::Null
             }
-        }
-        Action::Retry { max_attempts, backoff_secs, step: inner } => {
-            run_retry(ctx, runner, trigger, inner, *max_attempts, *backoff_secs).await?
-        }
-        Action::Branch { if_guard, then, else_steps } => {
-            run_branch(ctx, runner, trigger, if_guard, then, else_steps).await?
-        }
-        Action::Foreach { over, each } => {
-            run_foreach(ctx, runner, trigger, over, each, step_outputs).await?
-        }
-        Action::Parallel { over, each } => {
-            run_parallel(ctx, runner, trigger, over, each).await?
-        }
-        Action::CallWorkflow { workflow, inputs } => {
-            run_call_workflow(ctx, runner, workflow, inputs, step_outputs).await?
-        }
-        Action::Spawn {
-            profile,
-            workflow,
-            await_,
-            no_claim_timeout,
-        } => run_spawn(ctx, profile, workflow.as_deref(), *await_, *no_claim_timeout).await?,
-    };
+            Action::RequestApproval { message } => {
+                // Create the promise; its id is the approval key. The 0.6 SDK's
+                // PromiseTask is created eagerly (.create()); the handle's id()
+                // confirms server-side creation.
+                let pending = ctx
+                    .promise::<Decision>()
+                    .data(&serde_json::json!({ "message": message }))?
+                    .create()?;
+                let promise_id = pending.id().await?;
+                // The binding: the embedding publishes kind-46011 with this
+                // promise_id; the operator's approval/rejection resolves it.
+                step_outputs.insert(
+                    "approval".into(),
+                    serde_json::json!({ "promise_id": promise_id, "message": message }),
+                );
+                // PARK here: this await survives a crash (replay resumes at
+                // this point when the promise resolves).
+                step_outputs.insert(
+                    "approval".into(),
+                    serde_json::json!({
+                        "promise_id": promise_id,
+                        "message": message,
+                    }),
+                );
+                // Side-channel the promise_id (embedding publishes kind-46011).
+                ctx.get_dependency::<ApprovalSink>()
+                    .lock()
+                    .await
+                    .push(promise_id.clone());
+                // Resolve OR rejection both complete the run — a rejected
+                // approval is a DECISION, never a run failure (the WF-08 fix:
+                // Buzz marks it failed; toron records the rejection).
+                //
+                // 0.6 semantics: awaiting a PENDING promise returns
+                // `Err(Error::Suspended)`, which must PROPAGATE so the runtime
+                // parks the run. A REJECTED promise (operator `promises.reject`)
+                // returns `Err(Error::Application)` — that is the decision.
+                let decision: Decision = match pending.await {
+                    Ok(d) => d,
+                    Err(resonate_sdk::error::Error::Suspended) => {
+                        return Err(resonate_sdk::error::Error::Suspended);
+                    }
+                    Err(e) => Decision::rejected(format!("rejected: {e}")),
+                };
+                let decision = serde_json::to_value(&decision)?;
+                step_outputs.insert("decision".into(), decision.clone());
+                decision
+            }
+            Action::SendMessage { .. }
+            | Action::SendDm { .. }
+            | Action::React { .. }
+            | Action::DispatchJob { .. }
+            | Action::CallWebhook { .. } => {
+                // Consistency rule: actions go through the shared Mailbox
+                // surface (the injected action runner). Templates are
+                // substituted first so the runner sees rendered values. A
+                // render failure (unserializable action) is a per-step error,
+                // not a run failure.
+                match render_action(&step.action, trigger, step_outputs) {
+                    Ok(action) => match (runner)(&action) {
+                        Ok(value) => value,
+                        Err(e) => serde_json::json!({ "ok": false, "error": e.to_string() }),
+                    },
+                    Err(e) => serde_json::json!({ "ok": false, "error": format!("render: {e}") }),
+                }
+            }
+            Action::Retry {
+                max_attempts,
+                backoff_secs,
+                step: inner,
+            } => run_retry(ctx, runner, trigger, inner, *max_attempts, *backoff_secs).await?,
+            Action::Branch {
+                if_guard,
+                then,
+                else_steps,
+            } => run_branch(ctx, runner, trigger, if_guard, then, else_steps).await?,
+            Action::Foreach { over, each } => {
+                run_foreach(ctx, runner, trigger, over, each, step_outputs).await?
+            }
+            Action::Parallel { over, each } => {
+                run_parallel(ctx, runner, trigger, over, each).await?
+            }
+            Action::CallWorkflow { workflow, inputs } => {
+                run_call_workflow(ctx, runner, workflow, inputs, step_outputs).await?
+            }
+            Action::Spawn {
+                profile,
+                workflow,
+                await_,
+                no_claim_timeout,
+            } => {
+                run_spawn(
+                    ctx,
+                    profile,
+                    workflow.as_deref(),
+                    *await_,
+                    *no_claim_timeout,
+                )
+                .await?
+            }
+        };
 
-    // P0.2 (ADR-0005 Spec 0): `on_error: fail_run` converts a step failure
-    // into a RUN failure — a deterministic durable RETURN, never a panic.
-    if step.on_error == StepOnError::FailRun
-        && value.get("ok").and_then(serde_json::Value::as_bool) == Some(false)
-    {
-        let error = value["error"]
-            .as_str()
-            .unwrap_or("step failed")
-            .to_string();
-        return Ok(serde_json::json!({
-            "status": "failed",
-            "error": error,
-            "failed_step": step.name.clone().unwrap_or_else(|| "<unnamed>".into()),
-        }));
-    }
-    Ok(value)
+        // P0.2 (ADR-0005 Spec 0): `on_error: fail_run` converts a step failure
+        // into a RUN failure — a deterministic durable RETURN, never a panic.
+        if step.on_error == StepOnError::FailRun
+            && value.get("ok").and_then(serde_json::Value::as_bool) == Some(false)
+        {
+            let error = value["error"].as_str().unwrap_or("step failed").to_string();
+            return Ok(serde_json::json!({
+                "status": "failed",
+                "error": error,
+                "failed_step": step.name.clone().unwrap_or_else(|| "<unnamed>".into()),
+            }));
+        }
+        Ok(value)
     })
 }
 
@@ -224,7 +248,10 @@ pub(crate) async fn run_retry(
         if !failed {
             return Ok(value);
         }
-        last_err = value.get("error").and_then(|e| e.as_str()).map(String::from);
+        last_err = value
+            .get("error")
+            .and_then(|e| e.as_str())
+            .map(String::from);
         if attempt < max_attempts.max(1) && backoff_secs > 0 {
             ctx.sleep(Duration::from_secs(backoff_secs)).await?;
         }
@@ -424,7 +451,7 @@ pub(crate) async fn run_spawn(
             return Ok(serde_json::json!({
                 "ok": false,
                 "error": format!("spawn: unknown profile {profile:?} (ProfileResolver returned None)"),
-            }))
+            }));
         }
     };
 
@@ -490,7 +517,10 @@ pub(crate) fn resolve_template_ref(
     {
         return super::template::resolve_template(inner, trigger, step_outputs)
             .and_then(|s| serde_json::from_str(&s).ok())
-            .or_else(|| super::template::resolve_template(inner, trigger, step_outputs).map(serde_json::Value::String));
+            .or_else(|| {
+                super::template::resolve_template(inner, trigger, step_outputs)
+                    .map(serde_json::Value::String)
+            });
     }
     serde_json::from_str(trimmed).ok()
 }
@@ -527,10 +557,7 @@ pub(crate) async fn run_graph(
             if done.contains(name) {
                 continue;
             }
-            let needs_satisfied = node
-                .needs
-                .iter()
-                .all(|need| done.contains(need));
+            let needs_satisfied = node.needs.iter().all(|need| done.contains(need));
             if needs_satisfied {
                 ready.push((name, node));
             }
@@ -659,11 +686,10 @@ pub async fn run_graph_node(
 /// with the marker `t`-tag appended (idempotent — never double-stamps).
 pub fn stamp_workflow_emitted(tags: Vec<nostr_sdk::prelude::Tag>) -> Vec<nostr_sdk::prelude::Tag> {
     use crate::trigger_filter::WORKFLOW_EMITTED_TAG;
-    if tags
-        .iter()
-        .any(|t| t.as_slice().first().map(String::as_str) == Some("t")
-            && t.as_slice().get(1).map(String::as_str) == Some(WORKFLOW_EMITTED_TAG))
-    {
+    if tags.iter().any(|t| {
+        t.as_slice().first().map(String::as_str) == Some("t")
+            && t.as_slice().get(1).map(String::as_str) == Some(WORKFLOW_EMITTED_TAG)
+    }) {
         return tags;
     }
     let mut out = tags;
