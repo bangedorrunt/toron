@@ -18,6 +18,9 @@ pub enum BackendErrorCode {
     Timeout,
     /// herdr: agent prompt stalled (no response within SLA).
     AgentPromptStalled,
+    /// herdr: agent.read/agent.prompt rejected because the agent is not idle
+    /// (alt-screen transcript unavailable while working/blocked/unknown).
+    AgentNotIdle,
     /// Could not connect to the backend socket/daemon.
     Connect,
     /// Transport I/O failure.
@@ -36,6 +39,7 @@ impl BackendErrorCode {
             BackendErrorCode::Unsupported => "unsupported",
             BackendErrorCode::Timeout => "timeout",
             BackendErrorCode::AgentPromptStalled => "agent_prompt_stalled",
+            BackendErrorCode::AgentNotIdle => "agent_not_idle",
             BackendErrorCode::Connect => "connect",
             BackendErrorCode::Io => "io",
             BackendErrorCode::Malformed => "malformed",
@@ -53,6 +57,7 @@ impl FromStr for BackendErrorCode {
             "unsupported" => BackendErrorCode::Unsupported,
             "timeout" => BackendErrorCode::Timeout,
             "agent_prompt_stalled" => BackendErrorCode::AgentPromptStalled,
+            "agent_not_idle" => BackendErrorCode::AgentNotIdle,
             "connect" => BackendErrorCode::Connect,
             "io" => BackendErrorCode::Io,
             "malformed" => BackendErrorCode::Malformed,
@@ -85,6 +90,10 @@ impl BackendError {
         Self::new(BackendErrorCode::Timeout, message.as_ref())
     }
 
+    pub fn agent_not_idle(message: impl AsRef<str>) -> Self {
+        Self::new(BackendErrorCode::AgentNotIdle, message.as_ref())
+    }
+
     pub fn code(&self) -> &BackendErrorCode {
         &self.code
     }
@@ -97,3 +106,40 @@ impl std::fmt::Display for BackendError {
 }
 
 impl std::error::Error for BackendError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn agent_not_idle_roundtrips_through_wire_string() {
+        // The herdr wire code maps to the typed variant (ADR-0003: classify
+        // on code, never message text), and the variant renders back the
+        // same wire string for error display.
+        let parsed: BackendErrorCode = "agent_not_idle".parse().expect("mapped");
+        assert_eq!(parsed, BackendErrorCode::AgentNotIdle);
+        assert_eq!(parsed.as_str(), "agent_not_idle");
+        assert_eq!(BackendErrorCode::AgentNotIdle.as_str(), "agent_not_idle");
+    }
+
+    #[test]
+    fn agent_not_idle_error_carries_typed_code() {
+        let err = BackendError::agent_not_idle("agent is working");
+        assert_eq!(err.code(), &BackendErrorCode::AgentNotIdle);
+        assert!(err.to_string().contains("agent_not_idle"), "{err}");
+        // Callers branch on the code, not message text.
+        match err.code() {
+            BackendErrorCode::AgentNotIdle => {}
+            other => panic!("expected AgentNotIdle, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unknown_codes_stay_opaque() {
+        let parsed: BackendErrorCode = "some_future_code".parse().expect("mapped");
+        assert_eq!(
+            parsed,
+            BackendErrorCode::Other("some_future_code".to_string())
+        );
+    }
+}
