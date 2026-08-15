@@ -664,6 +664,7 @@ pub async fn run_graph_node(
             name: None,
             guard: None,
             on_error: crate::schema::StepOnError::Continue,
+            build_slot: false,
             action: input.action,
         };
         return run_step(ctx, &runner, &input.trigger, &step, &mut step_outputs).await;

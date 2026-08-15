@@ -61,7 +61,18 @@ impl LintReport {
 }
 
 /// Lint a parsed workflow. Returns issues (errors block, warnings advise).
+///
+/// Uses the in-crate [`playbook_lint::DEFAULT_PRINCIPLE_NAMES`] registry
+/// fallback. Embeddings that own the canonical list (flywheel's
+/// `PRINCIPLE_NAMES` — ADR-0019 w2-name-registry, no reverse dep) MUST call
+/// [`lint_workflow_with_principles`] instead.
 pub fn lint_workflow(wf: &Workflow) -> LintReport {
+    lint_workflow_with_principles(wf, &crate::playbook_lint::DEFAULT_PRINCIPLE_NAMES)
+}
+
+/// Lint a parsed workflow against an embedding-supplied principle-name
+/// registry (ADR-0019 wave 2 bridge: flywheel passes `PRINCIPLE_NAMES` in).
+pub fn lint_workflow_with_principles(wf: &Workflow, principle_names: &[&str]) -> LintReport {
     let mut report = LintReport::default();
 
     check_name(&mut report, &wf.name, "workflow");
@@ -138,6 +149,11 @@ pub fn lint_workflow(wf: &Workflow) -> LintReport {
     if let Some(graph) = &wf.graph {
         check_graph(&mut report, graph);
     }
+
+    // ADR-0019 wave-2 structural playbook lints (bd-w2-lints-6k6l): feature
+    // data_shape, bug-fix repro predecessor, prototype/arena n>=2 + mode
+    // rules, forensics read-only, principles registry.
+    crate::playbook_lint::lint_playbook(&mut report, wf, principle_names);
 
     report
 }

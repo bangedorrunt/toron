@@ -1,0 +1,8 @@
+# Passing control: forensics with a single diagnose step, no fix.
+name: forensics
+description: diagnosis only
+steps:
+  - name: diagnose
+    action: dispatch_job
+    assignee: x
+    spec: { profile: "@scout", task: "instrumentation or artifact read. Deliverable is a diagnosis." }

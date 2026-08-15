@@ -1,0 +1,19 @@
+# Passing control: feature with data_shape declared (ADR-0019 Spec 6).
+name: feature
+description: feature with data_shape
+inputs:
+  - name: objective
+  - name: data_shape
+steps:
+  - name: shape
+    action: dispatch_job
+    assignee: x
+    spec: { profile: "@planner", task: "name the type / state machine for {{inputs.data_shape}}; refuse if empty" }
+  - name: build
+    action: dispatch_job
+    assignee: x
+    spec: { profile: "@coder", task: "implement {{inputs.objective}} against that shape; TDD" }
+  - name: prove
+    action: dispatch_job
+    assignee: x
+    spec: { profile: "@reviewer", task: "verify from the bead" }

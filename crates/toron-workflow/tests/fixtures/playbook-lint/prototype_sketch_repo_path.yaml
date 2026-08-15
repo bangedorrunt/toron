@@ -1,0 +1,20 @@
+# Failure mode: sketch-mode prototype referencing a repo build path
+# (ADR-0019 Spec 7.2 amendment: sketches write text only under
+# /tmp/flywheel-proto-*, no crate copy).
+name: prototype
+description: sketch arm touching Cargo.toml
+inputs:
+  - name: question
+  - name: n
+    default: 2
+  - name: mode
+    default: sketch
+steps:
+  - name: arms
+    action: parallel
+    over: "{{inputs.n}}"
+    each: { action: dispatch_job, assignee: x, spec: { profile: "@coder", task: "design the module layout next to Cargo.toml for the API" } }
+  - name: judge
+    action: dispatch_job
+    assignee: x
+    spec: { profile: "@oracle", task: "compare arms on named criteria; pick one" }

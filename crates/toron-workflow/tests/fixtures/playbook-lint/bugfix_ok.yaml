@@ -1,0 +1,25 @@
+# Passing control: bug-fix with repro in fix's transitive needs closure
+# (repro -> tdd -> fix -> prove).
+name: bug-fix
+description: repro -> tdd -> fix -> prove
+graph:
+  nodes:
+    repro:
+      action: dispatch_job
+      assignee: x
+      spec: { profile: "@scout", task: "run/write the repro; ACCEPTANCE = command exits non-zero" }
+    tdd:
+      needs: [repro]
+      action: dispatch_job
+      assignee: x
+      spec: { profile: "@coder", task: "failing test first; VERIFY = that test fails" }
+    fix:
+      needs: [tdd]
+      action: dispatch_job
+      assignee: x
+      spec: { profile: "@coder", task: "minimal fix; VERIFY = test passes AND repro is gone" }
+    prove:
+      needs: [fix]
+      action: dispatch_job
+      assignee: x
+      spec: { profile: "@reviewer", task: "different model; record unit-test-verified" }

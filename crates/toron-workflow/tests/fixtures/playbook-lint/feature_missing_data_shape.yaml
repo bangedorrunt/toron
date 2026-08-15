@@ -1,0 +1,9 @@
+# Failure mode: feature workflow without a data_shape input (ADR-0019 Spec 6:
+# foundational-thinking). No `inputs:` decl, no `{{inputs.data_shape}}` ref.
+name: feature
+description: feature without data_shape
+steps:
+  - name: build
+    action: dispatch_job
+    assignee: x
+    spec: { profile: "@coder", task: "implement the objective: {{inputs.objective}}" }

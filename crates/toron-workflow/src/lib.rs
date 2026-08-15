@@ -24,6 +24,7 @@ pub mod guard;
 pub mod jobs;
 pub mod lint;
 pub mod mention;
+pub mod playbook_lint;
 pub mod schema;
 pub mod trigger_filter;
 

@@ -54,6 +54,13 @@ pub struct Workflow {
     /// engine only consumes `@crew.<role>` fan-out counts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub crew: Option<CrewSpec>,
+    /// ADR-0019 Spec 5 principle-name citations (wave 2). Names are validated
+    /// by the playbook lint against the canonical 21-name registry (passed in
+    /// by the embedding; flywheel passes `PRINCIPLE_NAMES` — no reverse dep).
+    /// The engine does not execute these; they are a static steering record
+    /// (wave 3 renders them into standing orders / briefs).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub principles: Vec<String>,
 }
 
 /// Auto-crew declaration (ADR-0005 Spec 4c). Deserializes both `crew: auto`
@@ -105,6 +112,12 @@ impl CrewSpec {
 pub struct InputDecl {
     /// Input name (referenced as `{{inputs.<name>}}`).
     pub name: String,
+    /// Statically-declared default (ADR-0019 wave 2). The playbook lint reads
+    /// defaults (`n`/`mode` on prototype/arena) so structural rules are
+    /// checkable without evaluation; the engine binds a provided value over
+    /// this default at invoke time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<serde_json::Value>,
 }
 
 /// A workflow DAG (`graph:` — ADR-0005 Spec 4b). Edges are derived from each
@@ -278,9 +291,21 @@ pub struct Step {
     /// deterministic failed outcome.
     #[serde(default, skip_serializing_if = "StepOnError::is_continue")]
     pub on_error: StepOnError,
+    /// Static build-slot serialization declaration (ADR-0019 wave 2,
+    /// prototype/arena compile-mode arms). `true` → this step serializes on
+    /// the build slot (kind-30032 lease) like every other compiling work; the
+    /// playbook lint requires compile-mode arms to declare it. Execution
+    /// semantics live in the embedding (flywheel honours the lease); the
+    /// engine treats it as a static contract marker.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub build_slot: bool,
     /// The action to run.
     #[serde(flatten)]
     pub action: Action,
+}
+
+fn is_false(b: &bool) -> bool {
+    !b
 }
 
 /// A step's failure policy (ADR-0005 Spec 0).

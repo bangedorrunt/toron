@@ -1,0 +1,12 @@
+# Failure mode: bug-fix linear steps with fix BEFORE repro (order violation).
+name: bug-fix
+description: fix before repro
+steps:
+  - name: fix
+    action: dispatch_job
+    assignee: x
+    spec: { profile: "@coder", task: "minimal fix" }
+  - name: repro
+    action: dispatch_job
+    assignee: x
+    spec: { profile: "@scout", task: "run the repro" }
