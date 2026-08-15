@@ -38,8 +38,7 @@ use serde_json::Value;
 /// rmcp client connected over Streamable HTTP. Dropping this kills the server
 /// task + scrubs the temp dir.
 struct LiveDaemon {
-    client:
-        rmcp::service::RunningService<rmcp::RoleClient, rmcp::model::InitializeRequestParams>,
+    client: rmcp::service::RunningService<rmcp::RoleClient, rmcp::model::InitializeRequestParams>,
     _server: tokio::task::JoinHandle<()>,
     _dir: Arc<ScrubDir>,
 }
@@ -56,7 +55,8 @@ impl Drop for ScrubDir {
 impl LiveDaemon {
     async fn boot(tag: &str) -> anyhow::Result<Self> {
         // 1. temp dir holding the operator ncryptsec + the mailbox data dir.
-        let dir = std::env::temp_dir().join(format!("toron-am-parity-{tag}-{}", uuid::Uuid::new_v4()));
+        let dir =
+            std::env::temp_dir().join(format!("toron-am-parity-{tag}-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir)?;
         let scrub = Arc::new(ScrubDir(dir.clone()));
 
@@ -146,11 +146,7 @@ impl LiveDaemon {
     /// Call a tool and return the RAW `CallToolResult` (error flag + content).
     /// Use when an MCP error is an EXPECTED functional outcome (e.g. a
     /// force-release denial on a non-stale holder).
-    async fn call_raw(
-        &mut self,
-        tool: &str,
-        args: Value,
-    ) -> rmcp::model::CallToolResult {
+    async fn call_raw(&mut self, tool: &str, args: Value) -> rmcp::model::CallToolResult {
         let params = CallToolRequestParams::new(tool.to_string())
             .with_arguments(args.as_object().cloned().unwrap_or_default());
         self.client
@@ -187,8 +183,12 @@ async fn cluster_infra_and_identity() -> anyhow::Result<()> {
     assert!(has_status, "health_check surfaces a status field: {health}");
 
     // ensure_project → idempotent; carries a slug.
-    let p1 = d.call("ensure_project", serde_json::json!({ "human_key": proj })).await;
-    let p2 = d.call("ensure_project", serde_json::json!({ "human_key": proj })).await;
+    let p1 = d
+        .call("ensure_project", serde_json::json!({ "human_key": proj }))
+        .await;
+    let p2 = d
+        .call("ensure_project", serde_json::json!({ "human_key": proj }))
+        .await;
     assert_eq!(
         p1["slug"], p2["slug"],
         "ensure_project slug stable across calls"
@@ -197,8 +197,14 @@ async fn cluster_infra_and_identity() -> anyhow::Result<()> {
         p1["manifest_event_id"], p2["manifest_event_id"],
         "ensure_project manifest event id stable (idempotent)"
     );
-    assert_eq!(p1["created"], true, "first ensure_project creates the manifest");
-    assert_eq!(p2["created"], false, "second ensure_project is a no-op (created=false)");
+    assert_eq!(
+        p1["created"], true,
+        "first ensure_project creates the manifest"
+    );
+    assert_eq!(
+        p2["created"], false,
+        "second ensure_project is a no-op (created=false)"
+    );
 
     // register_agent (upsert) → crypto identity envelope (npub, key_path, ...).
     let alice = d
@@ -214,8 +220,14 @@ async fn cluster_infra_and_identity() -> anyhow::Result<()> {
         )
         .await;
     assert_eq!(alice["name"], "AliceOak", "register echoes the name");
-    assert!(alice["npub"].is_string(), "toron returns a crypto npub (not an int id)");
-    assert!(alice["key_path"].is_string(), "agent key path is materialized on disk");
+    assert!(
+        alice["npub"].is_string(),
+        "toron returns a crypto npub (not an int id)"
+    );
+    assert!(
+        alice["key_path"].is_string(),
+        "agent key path is materialized on disk"
+    );
     let npub_a = alice["npub"].as_str().unwrap().to_string();
 
     // re-register same name = upsert: same npub, no duplicate key.
@@ -251,7 +263,9 @@ async fn cluster_infra_and_identity() -> anyhow::Result<()> {
     assert_eq!(bob["name"], "BobPine");
 
     // list_agents → both present, each with npub.
-    let agents = d.call("list_agents", serde_json::json!({ "project_key": proj })).await;
+    let agents = d
+        .call("list_agents", serde_json::json!({ "project_key": proj }))
+        .await;
     let arr = agents
         .as_array()
         .unwrap_or_else(|| panic!("list_agents is an array: {agents}"));
@@ -268,7 +282,10 @@ async fn cluster_infra_and_identity() -> anyhow::Result<()> {
         .await;
     assert_eq!(who["name"], "AliceOak");
     assert_eq!(who["npub"].as_str().unwrap(), npub_a);
-    assert_eq!(who["program"], "opencode", "whois carries program (AM parity)");
+    assert_eq!(
+        who["program"], "opencode",
+        "whois carries program (AM parity)"
+    );
 
     // create_agent_identity → always-fresh (mint a new key, never upsert).
     let carol = d
@@ -310,7 +327,8 @@ async fn cluster_messaging_round_trip() -> anyhow::Result<()> {
             })
         }
     };
-    d.call("register_agent", reg("AliceOak", "opencode").await).await;
+    d.call("register_agent", reg("AliceOak", "opencode").await)
+        .await;
     d.call("register_agent", reg("BobPine", "pi").await).await;
 
     // send_message: Alice → Bob, ack_required, on a thread.
@@ -348,7 +366,10 @@ async fn cluster_messaging_round_trip() -> anyhow::Result<()> {
     );
     assert_eq!(msg["ack_required"], true, "ack_required flag round-trips");
     assert_eq!(msg["thread_id"], "parity-thread-1", "thread_id round-trips");
-    let msg_id = msg["id"].as_str().expect("toron id is a hex string").to_string();
+    let msg_id = msg["id"]
+        .as_str()
+        .expect("toron id is a hex string")
+        .to_string();
     assert!(
         msg_id.chars().all(|c| c.is_ascii_hexdigit()),
         "toron message id is a hex event id (not an int): {msg_id}"
@@ -394,7 +415,10 @@ async fn cluster_messaging_round_trip() -> anyhow::Result<()> {
             }),
         )
         .await;
-    assert!(read.get("message_id").is_some(), "mark_read echoes the message id");
+    assert!(
+        read.get("message_id").is_some(),
+        "mark_read echoes the message id"
+    );
 
     // reply_message: Bob → Alice on the SAME thread. AM anchors a reply to the
     // original message_id; toron replies via thread_id (its NIP-10 model). The
@@ -465,8 +489,7 @@ async fn cluster_messaging_round_trip() -> anyhow::Result<()> {
     let participants = summary["participants"]
         .as_array()
         .unwrap_or_else(|| panic!("summarize returns participants[]: {summary}"));
-    let participant_names: Vec<&str> =
-        participants.iter().filter_map(|p| p.as_str()).collect();
+    let participant_names: Vec<&str> = participants.iter().filter_map(|p| p.as_str()).collect();
     assert!(
         participant_names.contains(&"AliceOak") && participant_names.contains(&"BobPine"),
         "thread summary names both participants: {summary}"
@@ -622,7 +645,10 @@ async fn cluster_file_reservations() -> anyhow::Result<()> {
         "conflict detected against GaleSummit's exclusive lease: {conflicts}"
     );
     assert!(
-        conflicts["total_conflicting_reservations"].as_u64().unwrap_or(0) >= 1,
+        conflicts["total_conflicting_reservations"]
+            .as_u64()
+            .unwrap_or(0)
+            >= 1,
         "conflict count is non-zero: {conflicts}"
     );
     // bd-dsu1: the conflict report carries the conflicting lease's event id —
@@ -651,7 +677,10 @@ async fn cluster_file_reservations() -> anyhow::Result<()> {
             }),
         )
         .await;
-    assert!(renew["renewed"].as_u64().unwrap_or(0) >= 1, "renew extends the lease");
+    assert!(
+        renew["renewed"].as_u64().unwrap_or(0) >= 1,
+        "renew extends the lease"
+    );
 
     // release → freed.
     let release = d
@@ -663,7 +692,10 @@ async fn cluster_file_reservations() -> anyhow::Result<()> {
             }),
         )
         .await;
-    assert!(release["released"].as_u64().unwrap_or(0) >= 1, "release frees the lease");
+    assert!(
+        release["released"].as_u64().unwrap_or(0) >= 1,
+        "release frees the lease"
+    );
 
     // After release, HillCrest's conflict check is now clear.
     let clear = d
@@ -827,7 +859,10 @@ async fn cluster_macros_and_product_bus() -> anyhow::Result<()> {
             }),
         )
         .await;
-    assert_eq!(session["agent_name"], "JadeCove", "macro boots the identity");
+    assert_eq!(
+        session["agent_name"], "JadeCove",
+        "macro boots the identity"
+    );
     assert!(session["npub"].is_string(), "macro returns the npub");
     assert!(
         session["granted_reservations"].is_array()
@@ -938,7 +973,10 @@ async fn cluster_macros_and_product_bus() -> anyhow::Result<()> {
         }
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
-    assert!(linked, "products_link persists membership (probe ensure_product: {prod} -> {product_key})");
+    assert!(
+        linked,
+        "products_link persists membership (probe ensure_product: {prod} -> {product_key})"
+    );
 
     // fetch_inbox_product: JadeCove's inbox fanned across the product.
     let pinbox = d
@@ -1031,7 +1069,13 @@ async fn cluster_macros_and_product_bus() -> anyhow::Result<()> {
 /// Poll an agent's inbox until at least one entry's subject contains `needle`,
 /// returning the filtered entries. Bounded by `tries` × 500ms — the unwrap
 /// loop projects gift wraps → the sqlite inbox asynchronously.
-async fn poll_inbox(d: &mut LiveDaemon, proj: &str, agent: &str, needle: &str, tries: usize) -> Vec<Value> {
+async fn poll_inbox(
+    d: &mut LiveDaemon,
+    proj: &str,
+    agent: &str,
+    needle: &str,
+    tries: usize,
+) -> Vec<Value> {
     let mut last_full: Vec<Value> = Vec::new();
     for _ in 0..tries {
         let inbox = d
@@ -1151,8 +1195,14 @@ async fn cluster_guard_pane_and_prepare_thread() -> anyhow::Result<()> {
             }),
         )
         .await;
-    assert_eq!(prep["agent_name"], "WrenPeak", "macro_prepare_thread echoes the agent");
-    assert!(prep["npub"].is_string(), "macro_prepare_thread registers (npub): {prep}");
+    assert_eq!(
+        prep["agent_name"], "WrenPeak",
+        "macro_prepare_thread echoes the agent"
+    );
+    assert!(
+        prep["npub"].is_string(),
+        "macro_prepare_thread registers (npub): {prep}"
+    );
     assert!(
         prep.get("summary").is_some(),
         "macro_prepare_thread returns a thread summary: {prep}"
@@ -1161,7 +1211,10 @@ async fn cluster_guard_pane_and_prepare_thread() -> anyhow::Result<()> {
     // summarize_thread_product: product-bus fan-out across a linked project.
     let prod = format!("parity-prod-{}", uuid::Uuid::new_v4());
     let ep = d
-        .call("ensure_product", serde_json::json!({ "product_key": prod, "name": "parity" }))
+        .call(
+            "ensure_product",
+            serde_json::json!({ "product_key": prod, "name": "parity" }),
+        )
         .await;
     assert!(
         ep.get("product_key").is_some() || ep.get("name").is_some(),
@@ -1199,4 +1252,165 @@ async fn cluster_guard_pane_and_prepare_thread() -> anyhow::Result<()> {
     Ok(())
 }
 
+// ======================================================================
+// P0 regression: MCP fetch_inbox filter parity (bd-mcp-inbox-filter-qyyq)
+// ======================================================================
+
+/// P0 (bd-mcp-inbox-filter-qyyq): the MCP `fetch_inbox` tool MUST apply the
+/// same post-projection filters as the MailSurface path — `urgent_only` and
+/// `since_ts` (RFC3339, strict-newer, Malformed error on bad input). Live
+/// bug 2026-08-15: `since_ts` was silently ignored on the MCP path (an
+/// Aug-5-era inbox answered a 2026-08-15T02:00Z bound) because the tool
+/// called `Mailbox::fetch_inbox` directly and dropped both args.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_fetch_inbox_applies_since_ts_and_urgent_filters() -> anyhow::Result<()> {
+    let mut d = LiveDaemon::boot("inbox-filter").await?;
+    let proj = format!("/tmp/toron-am-parity-inbox-filter-{}", uuid::Uuid::new_v4());
+    d.call("ensure_project", serde_json::json!({ "human_key": proj }))
+        .await;
+    for name in ["GreenCastle", "BlueLake"] {
+        d.call(
+            "register_agent",
+            serde_json::json!({
+                "project_key": proj,
+                "program": "opencode",
+                "model": "test",
+                "name": name,
+            }),
+        )
+        .await;
+    }
+
+    // 1. urgent message first; poll until PROJECTED (unwrap loop is async).
+    d.call(
+        "send_message",
+        serde_json::json!({
+            "project_key": proj,
+            "sender_name": "GreenCastle",
+            "to": ["BlueLake"],
+            "subject": "filter-urgent",
+            "body_md": "urgent bound me",
+            "importance": "urgent",
+        }),
+    )
+    .await;
+    poll_inbox(&mut d, &proj, "BlueLake", "filter-urgent", 40).await;
+
+    // 2. take a bound, then send a normal-priority message AFTER it.
+    let bound = chrono::Utc::now().to_rfc3339();
+    d.call(
+        "send_message",
+        serde_json::json!({
+            "project_key": proj,
+            "sender_name": "GreenCastle",
+            "to": ["BlueLake"],
+            "subject": "filter-later",
+            "body_md": "newer than bound",
+        }),
+    )
+    .await;
+    poll_inbox(&mut d, &proj, "BlueLake", "filter-later", 40).await;
+
+    let both = fetch_inbox_filtered(&mut d, &proj, None).await;
+    let mut subs: Vec<String> = both
+        .as_array()
+        .unwrap_or_else(|| panic!("fetch_inbox returns an array: {both}"))
+        .iter()
+        .filter_map(|m| m["subject"].as_str().map(String::from))
+        .collect();
+    subs.sort();
+    assert_eq!(
+        subs,
+        vec!["filter-later".to_string(), "filter-urgent".to_string()],
+        "unfiltered inbox shows both messages"
+    );
+
+    // since_ts = bound taken BETWEEN the two sends → only the later message
+    // (strict-newer compare, exactly the MailSurface contract).
+    let since = fetch_inbox_filtered(&mut d, &proj, Some(("since_ts", Value::String(bound)))).await;
+    let since_subs: Vec<String> = since
+        .as_array()
+        .unwrap_or_else(|| panic!("fetch_inbox returns an array: {since}"))
+        .iter()
+        .filter_map(|m| m["subject"].as_str().map(String::from))
+        .collect();
+    assert_eq!(
+        since_subs,
+        vec!["filter-later".to_string()],
+        "since_ts must exclude pre-bound mail on the MCP path"
+    );
+
+    // urgent_only → only the urgent message.
+    let urgent =
+        fetch_inbox_filtered(&mut d, &proj, Some(("urgent_only", Value::Bool(true)))).await;
+    let urgent_subs: Vec<String> = urgent
+        .as_array()
+        .unwrap_or_else(|| panic!("fetch_inbox returns an array: {urgent}"))
+        .iter()
+        .filter_map(|m| m["subject"].as_str().map(String::from))
+        .collect();
+    assert_eq!(
+        urgent_subs,
+        vec!["filter-urgent".to_string()],
+        "urgent_only must exclude normal-priority mail on the MCP path"
+    );
+
+    // Future bound → empty inbox.
+    let future = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+    let fut = fetch_inbox_filtered(&mut d, &proj, Some(("since_ts", Value::String(future)))).await;
+    assert_eq!(
+        fut.as_array()
+            .unwrap_or_else(|| panic!("fetch_inbox array: {fut}"))
+            .len(),
+        0,
+        "future since_ts must exclude all mail on the MCP path"
+    );
+
+    // Malformed bound → tool ERROR (Malformed), never a silent ignore.
+    let raw = d
+        .call_raw(
+            "fetch_inbox",
+            serde_json::json!({
+                "project_key": proj,
+                "agent_name": "BlueLake",
+                "since_ts": "not-a-timestamp",
+            }),
+        )
+        .await;
+    assert!(
+        raw.is_error.unwrap_or(false),
+        "malformed since_ts must surface a tool error: {:?}",
+        raw.content
+    );
+    let err_text = raw
+        .content
+        .iter()
+        .find_map(|c| c.as_text().map(|t| t.text.clone()))
+        .unwrap_or_default();
+    assert!(
+        err_text.to_lowercase().contains("rfc3339")
+            || err_text.to_lowercase().contains("malformed"),
+        "malformed since_ts error names the cause: {err_text}"
+    );
+
+    Ok(())
+}
+
 // (dead helpers pruned: the test asserts behavior directly on Value.)
+
+/// `fetch_inbox` with one optional extra filter arg (bd-mcp-inbox-filter-qyyq).
+async fn fetch_inbox_filtered(
+    d: &mut LiveDaemon,
+    proj: &str,
+    extra: Option<(&str, Value)>,
+) -> Value {
+    let mut args = serde_json::json!({
+        "project_key": proj,
+        "agent_name": "BlueLake",
+        "include_bodies": true,
+    });
+    if let Some((k, v)) = extra {
+        args[k] = v;
+    }
+    d.call("fetch_inbox", args).await
+}
