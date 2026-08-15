@@ -757,9 +757,15 @@ impl Mailbox {
                     nostr_sdk::nostr::PublicKey::from_hex(name)
                         .map_err(|_| anyhow::anyhow!("invalid npub recipient: {name}"))?
                 } else if mode == super::naming::IdentityMode::Swarm {
-                    // ADR-0018: canonical name, or a folded legacy alias.
+                    // ADR-0018 D1a/D3: canonical names, REGISTERED
+                    // adjective+noun pins, or folded legacy aliases route.
+                    // An unregistered pin fails at resolve_name below
+                    // ("register it first") — matching D1a (registered pins
+                    // are routing targets; unregistered free strings are not).
                     let target: String =
-                        if super::naming::is_canonical_name(name, &args.project_slug) {
+                        if super::naming::is_canonical_name(name, &args.project_slug)
+                            || super::naming::is_adjnoun_pin(name)
+                        {
                             name.clone()
                         } else if let Some(folded) =
                             self.agent_name_alias(&args.project_slug, name).await
@@ -768,8 +774,9 @@ impl Mailbox {
                         } else {
                             anyhow::bail!(
                                 "unknown recipient: {name} — project {} routes by canonical \
-                             names (flywheel-{}-<role><seq>) or npub only; legacy names are \
-                             non-routable display metadata (ADR-0018 D3)",
+                             names (flywheel-{}-<role><seq>), REGISTERED adjective+noun \
+                             pins, or npub only; unregistered free strings are non-routable \
+                             (ADR-0018 D1a/D3)",
                                 args.project_slug,
                                 args.project_slug
                             );
