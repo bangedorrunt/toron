@@ -58,6 +58,14 @@ if ! bash docs/decisions/_scripts/verify-adr-links.sh; then
     fail=1
 fi
 
+# 5. Workspace-clean (bd-test-tmp-hygiene-pq5b): the test matrix must not
+#    pollute the workspace root with mailbox-archive scratch dirs. Relative
+#    project keys resolve under the workspace root — tests/scripts must pass
+#    absolute TMPDIR paths (temp_dir / mktemp -d).
+if ! bash scripts/verify-workspace-clean.sh; then
+    fail=1
+fi
+
 if [ "$fail" -ne 0 ]; then
     echo "GATE FAILED" >&2
     exit 1
