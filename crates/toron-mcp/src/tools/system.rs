@@ -13,8 +13,8 @@
 use std::path::Path;
 
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::{tool, tool_router};
 use rmcp::schemars::{self, JsonSchema};
+use rmcp::{tool, tool_router};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -22,7 +22,7 @@ use toron_core::backend::herdr::HerdrBackend;
 use toron_core::mailbox::ListAgentsOptions;
 use toron_core::nostr::identity::AgentProfile;
 
-use super::{ToolOutput, ToolServer, ToJson, generate_agent_name};
+use super::{ToJson, ToolOutput, ToolServer, generate_agent_name};
 
 #[tool_router(router = system_router, vis = "pub(crate)")]
 impl ToolServer {
@@ -49,7 +49,11 @@ impl ToolServer {
         annotations(title = "Ensure project", destructive_hint = true)
     )]
     async fn ensure_project(&self, Parameters(args): Parameters<EnsureProjectArgs>) -> ToolOutput {
-        ToolOutput::result(self.mailbox.ensure_project(&args.human_key).await)
+        ToolOutput::result(
+            self.mailbox
+                .ensure_project_with_mode(&args.human_key, args.identity_mode.as_deref())
+                .await,
+        )
     }
 
     /// `install_precommit_guard` (destructive): install the toron pre-commit hook.
