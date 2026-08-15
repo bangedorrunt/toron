@@ -12,10 +12,9 @@
 //! ZERO change (ADR-0007 C3).
 
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::{tool, tool_router};
 use rmcp::schemars::{self, JsonSchema};
+use rmcp::{tool, tool_router};
 use serde::{Deserialize, Serialize};
-
 
 use super::{ToolOutput, ToolServer, generate_agent_name, nonneg_secs};
 

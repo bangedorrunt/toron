@@ -1511,11 +1511,11 @@ mod tests {
         let wrap = wrap_for(&sender, &recipient, 1_700_000_000).await;
         let rumor = gift_wrap::unwrap(&recipient, &wrap).expect("unwrap").rumor;
         let rumor_id = rumor.clone().id();
-        let mail = UnwrappedMail {
+        let _mail = UnwrappedMail {
             recipient: recipient.public_key(),
             sender: sender.public_key(),
             rumor: rumor.clone(),
-            rumor_id: rumor_id.clone(),
+            rumor_id,
             wrap_event_id: wrap.id,
             created_at: Timestamp::from(1_700_000_000),
         };
@@ -1530,7 +1530,7 @@ mod tests {
 
         // NIP-09: the AUTHOR signs a kind-5 deletion referencing the message.
         let delete = nostr_sdk::nostr::EventBuilder::new(nostr_sdk::nostr::Kind::EventDeletion, "")
-            .tags([nostr_sdk::nostr::Tag::event(rumor_id.clone())])
+            .tags([nostr_sdk::nostr::Tag::event(rumor_id)])
             .sign_with_keys(&sender)
             .expect("sign kind-5");
         pipeline.project(&delete).await;
@@ -1689,9 +1689,9 @@ mod tests {
     #[tokio::test]
     async fn every_write_path_is_fts_visible() {
         use crate::bus::in_process::{InProcessBus, InProcessBusConfig};
+        use crate::index::rebuild::{MailRecord, insert_record};
         use crate::index::schema;
         use crate::index::writer::IndexWriter;
-        use crate::index::rebuild::{insert_record, MailRecord};
         use crate::mailbox::Mailbox;
 
         let db = std::env::temp_dir().join(format!("fts-coverage-{}.sqlite", uuid::Uuid::new_v4()));
@@ -1700,10 +1700,8 @@ mod tests {
         let bus = InProcessBus::open(pool.clone(), InProcessBusConfig::default())
             .await
             .expect("bus");
-        let data_dir = std::env::temp_dir().join(format!(
-            "fts-coverage-data-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let data_dir =
+            std::env::temp_dir().join(format!("fts-coverage-data-{}", uuid::Uuid::new_v4()));
         let operator = crate::keys::generate();
         let mailbox = Mailbox::new(Arc::new(bus), data_dir.clone(), Some(operator))
             .with_index_pool(pool.clone())
@@ -1963,7 +1961,7 @@ mod tests {
         let key = DedupKey::of(&recipient.public_key(), &mail.rumor_id);
 
         // ---- case 1: git leg fails -> write Err, nothing projected ----
-        let failing_git = FailSink::new();
+        let _failing_git = FailSink::new();
         let db = std::env::temp_dir().join(format!("dual-sink-{}.sqlite", uuid::Uuid::new_v4()));
         let pool = schema::connect(db.to_str().unwrap()).await.expect("pool");
         schema::migrate(&pool).await.expect("migrate");

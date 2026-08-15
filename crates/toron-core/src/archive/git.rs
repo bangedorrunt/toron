@@ -132,10 +132,10 @@ fn tree_from_head_plus(
     files: &[(PathBuf, Vec<u8>)],
 ) -> anyhow::Result<git2::Oid> {
     let mut index = git2::Index::new()?;
-    if let Ok(head) = repo.head() {
-        if let Ok(commit) = head.peel_to_commit() {
-            index.read_tree(&commit.tree()?)?;
-        }
+    if let Ok(head) = repo.head()
+        && let Ok(commit) = head.peel_to_commit()
+    {
+        index.read_tree(&commit.tree()?)?;
     }
     for (rel, content) in files {
         let blob = repo.blob(content)?;
@@ -227,7 +227,9 @@ impl GitArchive {
             std::fs::create_dir_all(parent)?;
         }
         std::fs::write(&abs, content)?;
-        self.pending.lock().push((rel.to_path_buf(), content.to_vec()));
+        self.pending
+            .lock()
+            .push((rel.to_path_buf(), content.to_vec()));
         Ok(())
     }
 

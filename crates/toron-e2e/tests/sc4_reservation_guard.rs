@@ -90,8 +90,7 @@ async fn sc4_reservation_conflict_and_guard() {
         "conflict ids parallel the holder list"
     );
     assert_eq!(
-        report.conflicts[0].reservation_ids[0],
-        acquire.granted[0].id,
+        report.conflicts[0].reservation_ids[0], acquire.granted[0].id,
         "conflict id equals PiAlpha's lease event id"
     );
 

@@ -117,9 +117,8 @@ impl BusEventStore {
         let (sql, binds): (String, Vec<i64>) = match &filter.kinds {
             Some(kinds) if !kinds.is_empty() => {
                 let kinds_vec: Vec<i64> = kinds.iter().map(|k| k.as_u16() as i64).collect();
-                let placeholders: Vec<String> = (2..=kinds_vec.len() + 1)
-                    .map(|i| format!("?{i}"))
-                    .collect();
+                let placeholders: Vec<String> =
+                    (2..=kinds_vec.len() + 1).map(|i| format!("?{i}")).collect();
                 (
                     format!(
                         "SELECT raw_json FROM bus_events
@@ -304,7 +303,7 @@ mod tests {
             let ev = build_event(
                 &keys,
                 crate::nostr::kinds::toron_kind(PROJECT_MANIFEST),
-                &format!("msg {i}"),
+                format!("msg {i}"),
                 vec![Tag::parse(["t", "demo"]).expect("t")],
                 Timestamp::from(1_700_000_000_u64 + i),
             )
@@ -317,10 +316,7 @@ mod tests {
             .expect("replay");
         assert_eq!(replayed.len(), 2, "limit respected");
         // The two newest (i=3, i=4) are kept; the oldest three are dropped.
-        let contents: Vec<String> = replayed
-            .iter()
-            .map(|e| e.content.clone())
-            .collect();
+        let contents: Vec<String> = replayed.iter().map(|e| e.content.clone()).collect();
         assert_eq!(
             contents,
             vec!["msg 3".to_string(), "msg 4".to_string()],
@@ -386,12 +382,18 @@ mod tests {
         let (store, _pool, path) = temp_store().await;
         let a = Keys::generate();
         let b = Keys::generate();
-        for (keys, d) in [(a.clone(), "proj:src/shared/*"), (b.clone(), "proj:src/shared/*")] {
+        for (keys, d) in [
+            (a.clone(), "proj:src/shared/*"),
+            (b.clone(), "proj:src/shared/*"),
+        ] {
             let ev = build_event(
                 &keys,
                 crate::nostr::kinds::toron_kind(FILE_RESERVATION),
                 r#"{"exclusive":true}"#,
-                vec![Tag::parse(["d", d]).expect("d"), Tag::parse(["t", "proj"]).expect("t")],
+                vec![
+                    Tag::parse(["d", d]).expect("d"),
+                    Tag::parse(["t", "proj"]).expect("t"),
+                ],
                 Timestamp::now(),
             )
             .expect("build");

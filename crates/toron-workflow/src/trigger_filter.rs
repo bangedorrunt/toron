@@ -222,10 +222,7 @@ pub fn matches_trigger(trigger: &Trigger, event: &Event) -> bool {
         }
         Trigger::ReactionAdded { channel, emoji } => {
             kind == 7
-                && emoji
-                    .as_ref()
-                    .map(|e| event.content == *e)
-                    .unwrap_or(true)
+                && emoji.as_ref().map(|e| event.content == *e).unwrap_or(true)
                 && scoped_tag_match(channel.as_deref(), event, "h")
         }
         Trigger::ReservationAcquired { project, path } => {
@@ -646,7 +643,11 @@ mod tests {
             &acquired
         ));
         // No project t-tag at all → no match (required scoping).
-        let unscoped = reservation(r#"{"exclusive":true}"#, vec![tag_d("demo", "src/lib.rs")], &keys);
+        let unscoped = reservation(
+            r#"{"exclusive":true}"#,
+            vec![tag_d("demo", "src/lib.rs")],
+            &keys,
+        );
         assert!(!matches_trigger(
             &Trigger::ReservationAcquired {
                 project: "demo".into(),
@@ -734,13 +735,10 @@ mod tests {
     #[test]
     fn message_posted_kind_project_and_channel_scoping() {
         let keys = Keys::generate();
-        let dm = EventBuilder::new(
-            Kind::from_u16(14),
-            "hello",
-        )
-        .tags(vec![tag_t("demo"), Tag::parse(["h", "room"]).expect("h")])
-        .sign_with_keys(&keys)
-        .expect("sign");
+        let dm = EventBuilder::new(Kind::from_u16(14), "hello")
+            .tags(vec![tag_t("demo"), Tag::parse(["h", "room"]).expect("h")])
+            .sign_with_keys(&keys)
+            .expect("sign");
         assert!(matches_trigger(
             &Trigger::MessagePosted {
                 channel: None,

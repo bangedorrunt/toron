@@ -34,7 +34,9 @@ pub use cron::{
     CronManager, CronRegistration, CronRegistry, CronSpecRegistration, CronSpecRegistry,
     latest_due_at_or_before, next_due,
 };
-pub use cron_failure::{FailureBundle, PolicyEvent, PolicySink, evaluate, failure_details, is_failed};
+pub use cron_failure::{
+    FailureBundle, PolicyEvent, PolicySink, evaluate, failure_details, is_failed,
+};
 
 pub use coalesce::{
     CoalesceDecision, Coalesced, DEFAULT_MAX_BUFFER, DEFAULT_SUBWINDOW, DEFAULT_WINDOW,

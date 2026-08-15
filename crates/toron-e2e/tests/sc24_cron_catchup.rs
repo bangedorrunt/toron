@@ -116,7 +116,10 @@ async fn sc24_catchup_loop_wakes_and_fires_single_tick() {
             break;
         }
     }
-    assert!(ticks_a >= 1, "cron_success baseline: loop A fired a tick (saw {ticks_a})");
+    assert!(
+        ticks_a >= 1,
+        "cron_success baseline: loop A fired a tick (saw {ticks_a})"
+    );
 
     // "Downtime": drop worker A. The server retains the durable loop.
     drop(mgr_a);
@@ -140,8 +143,8 @@ async fn sc24_catchup_loop_wakes_and_fires_single_tick() {
         )
         .expect("engine B"),
     );
-    let mgr_b = toron_workflow::cron::CronManager::new(engine_b.clone(), registry)
-        .expect("manager B");
+    let mgr_b =
+        toron_workflow::cron::CronManager::new(engine_b.clone(), registry).expect("manager B");
     mgr_b.start().await.expect("start loop B");
 
     // The resumed loop fires a tick through worker B (catch-up wake → one tick).

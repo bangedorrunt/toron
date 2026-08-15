@@ -539,7 +539,7 @@ impl Mailbox {
         acknowledged: bool,
     ) -> anyhow::Result<ReceiptResult> {
         let project_slug = &self.canonical_project(project_slug).await; // ADR-0017
-        let agent_keys = self.agent_keys_for(&project_slug, agent_name)?;
+        let agent_keys = self.agent_keys_for(project_slug, agent_name)?;
         let npub = agent_keys.public_key();
 
         // Case (a): the wrap addressed to THIS agent (the recipient).
@@ -550,12 +550,12 @@ impl Mailbox {
                 // different identity. Discover the actual recipient across
                 // the project's agents (alias-set expanded), then authorize.
                 let (gift, recipient_name) = self
-                    .find_message_across_agents(&project_slug, message_id)
+                    .find_message_across_agents(project_slug, message_id)
                     .await?
                     .ok_or_else(|| {
                         anyhow::anyhow!("message not found for agent {agent_name}: {message_id}")
                     })?;
-                self.authorize_ack(&project_slug, agent_name, &recipient_name, &gift)
+                self.authorize_ack(project_slug, agent_name, &recipient_name, &gift)
                     .await?;
                 gift
             }
@@ -564,7 +564,7 @@ impl Mailbox {
 
         // Idempotency: already acked/read → return stored receipt.
         let id = EventId::from_hex(message_id).unwrap_or_else(|_| original.rumor.clone().id());
-        if let Some(ts) = self.receipt_time(&project_slug, agent_name, &id, kind) {
+        if let Some(ts) = self.receipt_time(project_slug, agent_name, &id, kind) {
             return Ok(ReceiptResult {
                 message_id: message_id.to_string(),
                 acknowledged,

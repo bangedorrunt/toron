@@ -41,12 +41,7 @@ mod tests {
 
         assert_unsupported(backend.workspace_list().expect_err("unsupported"));
         assert_unsupported(backend.agent_list().expect_err("unsupported"));
-        assert_unsupported(
-            backend
-                .subscribe(&[])
-                .err()
-                .expect("subscribe unsupported"),
-        );
+        assert_unsupported(backend.subscribe(&[]).err().expect("subscribe unsupported"));
         // A default-body Unsupported names the backend + method.
         let err = backend.pane_list(None).unwrap_err();
         assert!(err.message.contains("tmux"));

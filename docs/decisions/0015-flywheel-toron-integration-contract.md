@@ -120,3 +120,10 @@ grep -rn 'fn agent_prompt' crates/ ../flywheel/src/ | wc -l  # == 1
 # MessageId is String
 grep 'type MessageId' crates/toron-core/src/mailbox/surface.rs
 ```
+
+## More Information
+
+- **2026-08-15:** [ADR-0019](0019-bead-verified-execution-and-principle-playbooks.md) adds a
+  flywheel-side guarantee: a `br close` the loop observes is not terminal without a legal
+  `.flywheel/ledger.tsv` row. Toron still does not know about that file. No new tools, no new
+  kinds, one-way dep unchanged.

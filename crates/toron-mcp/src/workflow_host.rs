@@ -33,10 +33,10 @@ use toron_workflow::coalesce::{CoalesceDecision, Coalesced, MentionCoalescer};
 use toron_workflow::engine::{ActionRunner, RunInput, WorkflowEngine};
 use toron_workflow::jobs::{JobRequest, build_job_request_with_tags};
 use toron_workflow::schema::{Action, Trigger, Workflow};
+use toron_workflow::stamp_workflow_emitted;
 use toron_workflow::trigger_filter::{
     matches_trigger, should_evaluate_trigger_event, trigger_payload, trigger_run_id,
 };
-use toron_workflow::stamp_workflow_emitted;
 use tracing::{debug, warn};
 
 /// Drive an async future from the sync ActionRunner without nested-runtime
@@ -212,8 +212,8 @@ pub fn publish_coalesced_job(
         assignee: Some(coalesced.assignee.clone()),
     };
     let stamped = stamp_workflow_emitted(vec![]);
-    let event = build_job_request_with_tags(keys, parent, &payload, Timestamp::now(), stamped)
-        .ok()?;
+    let event =
+        build_job_request_with_tags(keys, parent, &payload, Timestamp::now(), stamped).ok()?;
     // F8: publish on an isolated thread so we never nest runtimes.
     // Bus is Sync; clone the event and publish via a scoped thread.
     let published = std::thread::scope(|s| {
@@ -412,8 +412,7 @@ impl WorkflowHost {
                             }
                         }
                         let outcome =
-                            toron_workflow::guard::evaluate_guard_default(Some(guard), &vars)
-                                .await;
+                            toron_workflow::guard::evaluate_guard_default(Some(guard), &vars).await;
                         if !matches!(outcome, toron_workflow::guard::GuardOutcome::Bool(true)) {
                             continue;
                         }
@@ -425,7 +424,10 @@ impl WorkflowHost {
                     };
                     match me.engine.run(&run_id, input).await {
                         Ok(_) => debug!(run_id, "mail-trigger workflow {} ran", workflow.name),
-                        Err(e) => warn!(run_id, "mail-trigger workflow {} failed: {e}", workflow.name),
+                        Err(e) => warn!(
+                            run_id,
+                            "mail-trigger workflow {} failed: {e}", workflow.name
+                        ),
                     }
                 }
             }
@@ -465,10 +467,7 @@ impl WorkflowHost {
                 // tick() ONLY — the flushed Coalesced values are owned, the
                 // guard drops, THEN each blocking publish runs.
                 let flushed = {
-                    let mut c = self
-                        .coalescer
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner());
+                    let mut c = self.coalescer.lock().unwrap_or_else(|e| e.into_inner());
                     c.tick(now_ms())
                 };
                 if !flushed.is_empty() {
@@ -561,15 +560,20 @@ mod tests {
         let keys = nostr_sdk::nostr::Keys::generate();
         // A user kind-14 (no stamp) → evaluated.
         let user = kind14("hello", vec![]);
-        assert!(should_evaluate_trigger_event(&user), "user message evaluates");
+        assert!(
+            should_evaluate_trigger_event(&user),
+            "user message evaluates"
+        );
         // The same kind-14 carrying the workflow-emitted stamp → rejected.
         let stamped = kind14(
             "hello",
-            vec![nostr_sdk::nostr::Tag::parse([
-                "t",
-                toron_workflow::trigger_filter::WORKFLOW_EMITTED_TAG,
-            ])
-            .expect("stamp tag")],
+            vec![
+                nostr_sdk::nostr::Tag::parse([
+                    "t",
+                    toron_workflow::trigger_filter::WORKFLOW_EMITTED_TAG,
+                ])
+                .expect("stamp tag"),
+            ],
         );
         assert!(
             !should_evaluate_trigger_event(&stamped),
@@ -589,7 +593,10 @@ mod tests {
         );
         let payload = trigger_payload(&ev);
         assert_eq!(payload["id"].as_str(), Some(ev.id.to_hex().as_str()));
-        assert_eq!(payload["sender"].as_str(), Some(ev.pubkey.to_hex().as_str()));
+        assert_eq!(
+            payload["sender"].as_str(),
+            Some(ev.pubkey.to_hex().as_str())
+        );
         assert_eq!(payload["content"].as_str(), Some("urgent: fix"));
         assert_eq!(payload["kind"].as_u64(), Some(14));
         assert_eq!(payload["project"].as_str(), Some("myproject"));
@@ -601,27 +608,40 @@ mod tests {
         let msg = kind14("hi", vec![]);
         let react = {
             let keys = nostr_sdk::nostr::Keys::generate();
-            nostr_sdk::nostr::EventBuilder::new(
-                nostr_sdk::nostr::Kind::from_u16(7),
-                "+",
-            )
-            .sign_with_keys(&keys)
-            .expect("sign")
+            nostr_sdk::nostr::EventBuilder::new(nostr_sdk::nostr::Kind::from_u16(7), "+")
+                .sign_with_keys(&keys)
+                .expect("sign")
         };
         assert!(matches_trigger(
-            &Trigger::MessagePosted { channel: None, project: None },
+            &Trigger::MessagePosted {
+                channel: None,
+                project: None
+            },
             &msg
         ));
         assert!(!matches_trigger(
-            &Trigger::ReactionAdded { channel: None, emoji: None },
+            &Trigger::ReactionAdded {
+                channel: None,
+                emoji: None
+            },
             &msg
         ));
         assert!(matches_trigger(
-            &Trigger::ReactionAdded { channel: None, emoji: None },
+            &Trigger::ReactionAdded {
+                channel: None,
+                emoji: None
+            },
             &react
         ));
         // A schedule trigger is never event-driven.
-        assert!(!matches_trigger(&Trigger::Schedule { cron: "* * * * *".into(), owner: None, scope: Default::default() }, &msg));
+        assert!(!matches_trigger(
+            &Trigger::Schedule {
+                cron: "* * * * *".into(),
+                owner: None,
+                scope: Default::default()
+            },
+            &msg
+        ));
     }
 
     /// P11.1 gate (bd-foh8.1): the raw-bus trigger loop fires
@@ -638,7 +658,9 @@ mod tests {
         use toron_workflow::schema::{Action, Step, StepOnError, Trigger, Workflow};
 
         let db = std::env::temp_dir().join(format!("wf-host-{}.sqlite", uuid::Uuid::new_v4()));
-        let pool = schema::connect(db.to_str().unwrap()).await.expect("connect");
+        let pool = schema::connect(db.to_str().unwrap())
+            .await
+            .expect("connect");
         schema::migrate(&pool).await.expect("migrate");
         let bus: Arc<dyn Bus> = Arc::new(
             InProcessBus::open(pool.clone(), InProcessBusConfig::default())
@@ -761,7 +783,13 @@ mod tests {
         );
         // Disambiguation: the acquire must NOT have fired on-release.
         assert!(
-            fired.lock().unwrap().iter().filter(|f| f.as_str() == "action:send_message").count() == 1,
+            fired
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|f| f.as_str() == "action:send_message")
+                .count()
+                == 1,
             "exactly one workflow fired on acquire: {fired:?}"
         );
 
@@ -823,13 +851,11 @@ mod tests {
             "stamped workflow-emitted message must NOT re-trigger: {fired:?}"
         );
 
-        let user_msg = nostr_sdk::nostr::EventBuilder::new(
-            nostr_sdk::nostr::Kind::from_u16(14),
-            "user hello",
-        )
-        .tags(vec![t_demo])
-        .sign_with_keys(&keys)
-        .expect("sign");
+        let user_msg =
+            nostr_sdk::nostr::EventBuilder::new(nostr_sdk::nostr::Kind::from_u16(14), "user hello")
+                .tags(vec![t_demo])
+                .sign_with_keys(&keys)
+                .expect("sign");
         bus.publish(user_msg).await.expect("publish user msg");
         assert!(
             wait_for(&fired, "action:send_message", Duration::from_secs(10)).await,
@@ -847,7 +873,9 @@ mod tests {
         use toron_core::index::schema;
 
         let db = std::env::temp_dir().join(format!("wf-coal-{}.sqlite", uuid::Uuid::new_v4()));
-        let pool = schema::connect(db.to_str().unwrap()).await.expect("connect");
+        let pool = schema::connect(db.to_str().unwrap())
+            .await
+            .expect("connect");
         schema::migrate(&pool).await.expect("migrate");
         let bus: Arc<dyn Bus> = Arc::new(
             InProcessBus::open(pool, InProcessBusConfig::default())
@@ -894,7 +922,9 @@ mod tests {
 
         const PASSPHRASE: &str = "wf-stamp-pass";
         let db = std::env::temp_dir().join(format!("wf-stamp-{}.sqlite", uuid::Uuid::new_v4()));
-        let pool = schema::connect(db.to_str().unwrap()).await.expect("connect");
+        let pool = schema::connect(db.to_str().unwrap())
+            .await
+            .expect("connect");
         schema::migrate(&pool).await.expect("migrate");
         let bus: Arc<dyn Bus> = Arc::new(
             InProcessBus::open(pool, InProcessBusConfig::default())
@@ -922,11 +952,9 @@ mod tests {
             )
             .await
             .expect("register recipient");
-        let recv_keys = toron_core::keys::load_encrypted_key(
-            std::path::Path::new(&recv.key_path),
-            PASSPHRASE,
-        )
-        .expect("load recipient key");
+        let recv_keys =
+            toron_core::keys::load_encrypted_key(std::path::Path::new(&recv.key_path), PASSPHRASE)
+                .expect("load recipient key");
 
         let coalescer = Arc::new(std::sync::Mutex::new(MentionCoalescer::from_env()));
         let runner = mailbox_runner(mailbox.clone(), coalescer, None);
@@ -964,12 +992,7 @@ mod tests {
         // Two wraps arrive (one per send); both rumors must carry the stamp.
         for _ in 0..2 {
             let wrap = loop {
-                match tokio::time::timeout(
-                    std::time::Duration::from_secs(5),
-                    sub.next(),
-                )
-                .await
-                {
+                match tokio::time::timeout(std::time::Duration::from_secs(5), sub.next()).await {
                     Ok(Some(SubscriptionEvent::Event(e))) => break e,
                     Ok(Some(SubscriptionEvent::Eose)) | Ok(None) => continue,
                     Ok(Some(SubscriptionEvent::Closed(_))) => panic!("subscription closed"),
@@ -1004,7 +1027,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&data_dir);
         // A runtime cannot be dropped inside an async context — drop it on a
         // plain thread (shutdown does blocking work).
-        std::thread::spawn(move || drop(rt)).join().expect("drop rt");
+        std::thread::spawn(move || drop(rt))
+            .join()
+            .expect("drop rt");
     }
 
     /// ADR-0007 F7: a coalesced @mention burst publishes EXACTLY ONE stamped
@@ -1017,7 +1042,9 @@ mod tests {
         use toron_workflow::coalesce::InboundMention;
 
         let db = std::env::temp_dir().join(format!("wf-flush-{}.sqlite", uuid::Uuid::new_v4()));
-        let pool = schema::connect(db.to_str().unwrap()).await.expect("connect");
+        let pool = schema::connect(db.to_str().unwrap())
+            .await
+            .expect("connect");
         schema::migrate(&pool).await.expect("migrate");
         let bus: Arc<dyn Bus> = Arc::new(
             InProcessBus::open(pool, InProcessBusConfig::default())
@@ -1123,7 +1150,9 @@ mod tests {
 
         const MENTIONS: usize = 100;
         let db = std::env::temp_dir().join(format!("wf-burst-{}.sqlite", uuid::Uuid::new_v4()));
-        let pool = schema::connect(db.to_str().unwrap()).await.expect("connect");
+        let pool = schema::connect(db.to_str().unwrap())
+            .await
+            .expect("connect");
         schema::migrate(&pool).await.expect("migrate");
         let bus: Arc<dyn Bus> = Arc::new(
             InProcessBus::open(pool, InProcessBusConfig::default())
@@ -1138,7 +1167,11 @@ mod tests {
 
         // Default window semantics (2s window, 500ms sub-window, cap 64).
         let coalescer = Arc::new(std::sync::Mutex::new(MentionCoalescer::from_env()));
-        let runner = mailbox_runner(mailbox, coalescer.clone(), Some(nostr_sdk::nostr::Keys::generate()));
+        let runner = mailbox_runner(
+            mailbox,
+            coalescer.clone(),
+            Some(nostr_sdk::nostr::Keys::generate()),
+        );
 
         // Fire 100 DispatchJob mentions from 8 threads (barrier-synced).
         let barrier = Arc::new(std::sync::Barrier::new(8));
@@ -1197,7 +1230,9 @@ mod tests {
         use toron_core::index::schema;
 
         let db = std::env::temp_dir().join(format!("wf-host-{}.sqlite", uuid::Uuid::new_v4()));
-        let pool = schema::connect(db.to_str().unwrap()).await.expect("connect");
+        let pool = schema::connect(db.to_str().unwrap())
+            .await
+            .expect("connect");
         schema::migrate(&pool).await.expect("migrate");
         let bus: Arc<dyn Bus> = Arc::new(
             InProcessBus::open(pool, InProcessBusConfig::default())
@@ -1262,14 +1297,17 @@ steps:
         const PASSPHRASE: &str = "wf-stress-pass";
         const CONCURRENCY: usize = 8;
         let db = std::env::temp_dir().join(format!("wf-stress-{}.sqlite", uuid::Uuid::new_v4()));
-        let pool = schema::connect(db.to_str().unwrap()).await.expect("connect");
+        let pool = schema::connect(db.to_str().unwrap())
+            .await
+            .expect("connect");
         schema::migrate(&pool).await.expect("migrate");
         let bus: Arc<dyn Bus> = Arc::new(
             InProcessBus::open(pool, InProcessBusConfig::default())
                 .await
                 .expect("bus"),
         );
-        let data_dir = std::env::temp_dir().join(format!("wf-stress-data-{}", uuid::Uuid::new_v4()));
+        let data_dir =
+            std::env::temp_dir().join(format!("wf-stress-data-{}", uuid::Uuid::new_v4()));
         let mailbox = Arc::new(
             Mailbox::new(bus.clone(), data_dir.clone(), None).with_agent_passphrase(PASSPHRASE),
         );
@@ -1325,9 +1363,10 @@ steps:
         assert_eq!(ok, CONCURRENCY, "all {CONCURRENCY} sends delivered");
 
         // Every send landed on the bus as a stamped gift wrap.
-        let replay = toron_core::mailbox::collect_replay(bus.as_ref(), toron_core::bus::Filter::new())
-            .await
-            .expect("replay");
+        let replay =
+            toron_core::mailbox::collect_replay(bus.as_ref(), toron_core::bus::Filter::new())
+                .await
+                .expect("replay");
         let wraps = replay
             .iter()
             .filter(|e| e.kind == nostr_sdk::nostr::Kind::GiftWrap)
@@ -1390,9 +1429,11 @@ steps:
         use toron_core::index::schema;
 
         const PUBLISH_MS: u64 = 600;
-        let db = std::env::temp_dir()
-            .join(format!("wf-coalesce-lock-{}.sqlite", uuid::Uuid::new_v4()));
-        let pool = schema::connect(db.to_str().unwrap()).await.expect("connect");
+        let db =
+            std::env::temp_dir().join(format!("wf-coalesce-lock-{}.sqlite", uuid::Uuid::new_v4()));
+        let pool = schema::connect(db.to_str().unwrap())
+            .await
+            .expect("connect");
         schema::migrate(&pool).await.expect("migrate");
         let inner = Arc::new(
             InProcessBus::open(pool, InProcessBusConfig::default())
@@ -1404,8 +1445,8 @@ steps:
             sleep: std::time::Duration::from_millis(PUBLISH_MS),
         });
 
-        let data_dir = std::env::temp_dir()
-            .join(format!("wf-coalesce-lock-data-{}", uuid::Uuid::new_v4()));
+        let data_dir =
+            std::env::temp_dir().join(format!("wf-coalesce-lock-data-{}", uuid::Uuid::new_v4()));
         let mailbox = Arc::new(
             Mailbox::new(slow.clone(), data_dir.clone(), None)
                 .with_agent_passphrase("coalesce-lock-pass"),
@@ -1473,29 +1514,28 @@ steps:
         use toron_core::index::schema;
 
         let db = std::env::temp_dir().join(format!("wf-poison-{}.sqlite", uuid::Uuid::new_v4()));
-        let (runner, coalescer) = tokio::runtime::Runtime::new()
-            .expect("rt")
-            .block_on(async {
-                let pool = schema::connect(db.to_str().unwrap()).await.expect("connect");
-                schema::migrate(&pool).await.expect("migrate");
-                let bus: Arc<dyn Bus> = Arc::new(
-                    InProcessBus::open(pool, InProcessBusConfig::default())
-                        .await
-                        .expect("bus"),
-                );
-                let data_dir = std::env::temp_dir()
-                    .join(format!("wf-poison-data-{}", uuid::Uuid::new_v4()));
-                let mailbox = Arc::new(
-                    Mailbox::new(bus, data_dir, None).with_agent_passphrase("poison-pass"),
-                );
-                let coalescer = Arc::new(std::sync::Mutex::new(MentionCoalescer::from_env()));
-                let runner = mailbox_runner(
-                    mailbox.clone(),
-                    coalescer.clone(),
-                    Some(nostr_sdk::nostr::Keys::generate()),
-                );
-                (runner, coalescer)
-            });
+        let (runner, coalescer) = tokio::runtime::Runtime::new().expect("rt").block_on(async {
+            let pool = schema::connect(db.to_str().unwrap())
+                .await
+                .expect("connect");
+            schema::migrate(&pool).await.expect("migrate");
+            let bus: Arc<dyn Bus> = Arc::new(
+                InProcessBus::open(pool, InProcessBusConfig::default())
+                    .await
+                    .expect("bus"),
+            );
+            let data_dir =
+                std::env::temp_dir().join(format!("wf-poison-data-{}", uuid::Uuid::new_v4()));
+            let mailbox =
+                Arc::new(Mailbox::new(bus, data_dir, None).with_agent_passphrase("poison-pass"));
+            let coalescer = Arc::new(std::sync::Mutex::new(MentionCoalescer::from_env()));
+            let runner = mailbox_runner(
+                mailbox.clone(),
+                coalescer.clone(),
+                Some(nostr_sdk::nostr::Keys::generate()),
+            );
+            (runner, coalescer)
+        });
 
         // Poison the coalescer: panic while holding the guard (std Mutex
         // poisoning semantics — the guard's Drop during unwind poisons).
@@ -1505,7 +1545,10 @@ steps:
             panic!("simulated panic inside the coalescer guard");
         });
         assert!(panicked.is_err(), "precondition: simulated panic unwound");
-        assert!(coalescer.is_poisoned(), "precondition: std Mutex is poisoned");
+        assert!(
+            coalescer.is_poisoned(),
+            "precondition: std Mutex is poisoned"
+        );
 
         // Survivability: a subsequent flush through the REAL runner arm must
         // not panic (recover the poison, keep serving).
@@ -1524,4 +1567,3 @@ steps:
         let _ = std::fs::remove_file(&db);
     }
 }
-

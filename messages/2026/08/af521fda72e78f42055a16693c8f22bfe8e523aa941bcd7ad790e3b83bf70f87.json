@@ -1,0 +1,1 @@
+{"id":"af521fda72e78f42055a16693c8f22bfe8e523aa941bcd7ad790e3b83bf70f87","pubkey":"d9ac60b20f7ce9bbcf1255b9f8e966a05ab6dc17f944865ac554d44a88f8f874","created_at":1786764134,"kind":14,"tags":[["p","db7f18d78db83fdc1f5a3ebe0085bc5f9f08299ff68700f6af1282ad02855a65","","to"],["subject","[ADR-0018] npub send probe"]],"content":"ADR-0018 live probe: npub routing"}
