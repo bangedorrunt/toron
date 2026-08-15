@@ -139,10 +139,12 @@ impl Mailbox {
         let mode = self.project_identity_mode(project_slug).await;
         if mode == crate::mailbox::naming::IdentityMode::Swarm
             && !super::naming::is_canonical_name(name, project_slug)
+            && !super::naming::is_adjnoun_pin(name)
         {
             anyhow::bail!(
-                "agent name {name} is not canonical for project {project_slug} — swarm \
-                 projects use flywheel-{project_slug}-<role><seq> (ADR-0018 D3)"
+                "agent name {name} is not routable for project {project_slug} — swarm \
+                 projects use flywheel-{project_slug}-<role><seq> or a REGISTERED \
+                 adjective+noun pin (ADR-0018 D1a/D3)"
             );
         }
         Ok(())
@@ -258,10 +260,7 @@ impl Mailbox {
     /// The `alt_agent_key` walk below remains as the legacy read fallback
     /// for pre-ADR-0017 roots.
     pub(crate) fn agent_key_path(&self, project_slug: &str, name: &str) -> PathBuf {
-        let slug =
-            super::aliases::short_slug(project_slug).unwrap_or_else(|| project_slug.to_string());
-        self.data_dir
-            .join(slug)
+        super::aliases::project_root(&self.data_dir, project_slug)
             .join("agents")
             .join(name)
             .join("key.ncryptsec")
@@ -458,15 +457,18 @@ impl Mailbox {
         // ONLY; display names are non-routable profile metadata.
         let mode = self.project_identity_mode(&canonical).await;
         let target: String = if mode == crate::mailbox::naming::IdentityMode::Swarm {
-            if super::naming::is_canonical_name(name, &canonical) {
+            if super::naming::is_canonical_name(name, &canonical)
+                || super::naming::is_adjnoun_pin(name)
+            {
                 name.to_string()
             } else if let Some(folded) = self.agent_name_alias(&canonical, name).await {
                 folded
             } else {
                 anyhow::bail!(
                     "unknown agent name: {name} — project {canonical} routes by canonical \
-                     names (flywheel-{canonical}-<role><seq>) or npub only; legacy names are \
-                     non-routable display metadata (ADR-0018 D3)"
+                     names (flywheel-{canonical}-<role><seq>), REGISTERED adjective+noun \
+                     pins, or npub only; unregistered free strings are not routable \
+                     (ADR-0018 D1a/D3)"
                 );
             }
         } else {
@@ -725,6 +727,20 @@ mod tests {
             .expect("canonical whois");
         assert_eq!(w.name, "flywheel-toron-oc2");
 
+        // ADR-0018 D1a: a pin REGISTERED post-swarm is routable natively.
+        let pin = mailbox
+            .register_agent("toron", &profile("DustySparrow"))
+            .await
+            .expect("pin register in swarm mode (D1a)");
+        let w_pin = mailbox
+            .whois("toron", "DustySparrow")
+            .await
+            .expect("pin whois resolves");
+        assert_eq!(
+            w_pin.npub, pin.npub,
+            "registered pin resolves to its own npub"
+        );
+
         // Non-canonical name fails with an actionable grammar error.
         let err = mailbox
             .whois("toron", "lane-1-bootstrap")
@@ -735,7 +751,10 @@ mod tests {
             msg.contains("flywheel-toron-<role><seq>"),
             "error names the grammar: {msg}"
         );
-        assert!(msg.contains("non-routable"), "error names demotion: {msg}");
+        assert!(
+            msg.contains("not routable"),
+            "error names the routing rule: {msg}"
+        );
 
         // npub always resolves (the read-side twin of npub routing).
         let by_npub = mailbox.whois("toron", &w.npub).await.expect("npub whois");
@@ -765,18 +784,19 @@ mod tests {
             .await
             .expect("register canonical");
         mailbox
-            .register_agent("toron", &profile("DustySparrow"))
+            .register_agent("toron", &profile("lane-1-bootstrap"))
             .await
             .expect("legacy identity registered");
         mailbox.set_identity_mode("toron", "swarm").await;
 
-        // Fold: DustySparrow → flywheel-toron-oc2 (pane binding discoverable).
+        // Fold: lane-1-bootstrap → flywheel-toron-oc2 (pane binding
+        // discoverable). Non-pin legacy names need the fold to resolve.
         mailbox
-            .fold_agent_name_alias("toron", "DustySparrow", "flywheel-toron-oc2")
+            .fold_agent_name_alias("toron", "lane-1-bootstrap", "flywheel-toron-oc2")
             .await;
         assert_eq!(
             mailbox
-                .agent_name_alias("toron", "DustySparrow")
+                .agent_name_alias("toron", "lane-1-bootstrap")
                 .await
                 .as_deref(),
             Some("flywheel-toron-oc2")
@@ -784,7 +804,7 @@ mod tests {
 
         // whois on the legacy alias resolves through to the canonical npub.
         let w = mailbox
-            .whois("toron", "DustySparrow")
+            .whois("toron", "lane-1-bootstrap")
             .await
             .expect("alias whois");
         assert_eq!(w.npub, canonical.npub, "folded alias resolves to canonical");
@@ -823,7 +843,17 @@ mod tests {
             .await
             .expect("canonical create");
 
-        // Non-canonical names are rejected with an actionable error.
+        // ADR-0018 D1a: adjective+noun PIN SHAPES register fine in swarm mode.
+        mailbox
+            .register_agent("toron", &profile("DustySparrow"))
+            .await
+            .expect("pin register (D1a)");
+        mailbox
+            .create_agent_identity("toron", &profile("RoseDune"))
+            .await
+            .expect("pin create (D1a)");
+
+        // Non-canonical, non-pin names are rejected with an actionable error.
         let err = mailbox
             .register_agent("toron", &profile("lane-4-catalog"))
             .await
@@ -831,6 +861,14 @@ mod tests {
         assert!(
             err.to_string().contains("flywheel-toron-<role><seq>"),
             "register error names the grammar: {err}"
+        );
+        let err = mailbox
+            .register_agent("toron", &profile("freeform"))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("adjective+noun"),
+            "register error names the pin rule: {err}"
         );
         let err = mailbox
             .create_agent_identity("toron", &profile("assistant"))

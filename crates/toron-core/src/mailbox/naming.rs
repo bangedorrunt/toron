@@ -89,6 +89,39 @@ pub fn is_npub(s: &str) -> bool {
     s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit())
 }
 
+/// `true` when `name` has the adjective+noun pin shape (ADR-0018 D1a,
+/// captain amendment 2026-08-15: the routable mail identity is a REGISTERED
+/// adj+noun pin — `DustySparrow`, `RoseDune`, `CoralFinch`).
+///
+/// Shape: exactly two capitalized words concatenated, no separators, no
+/// digits, no underscores (`[A-Z][a-z]+[A-Z][a-z]+`). This mirrors the
+/// legacy flywheel pin generator's whitelist pair space (adjective + noun).
+/// Shape is necessary, not sufficient: a pin is only ROUTABLE once
+/// registered in the project (registration is the gate, the shape is the
+/// grammar — D1a #3: unregistered free strings remain rejected).
+pub fn is_adjnoun_pin(name: &str) -> bool {
+    let b = name.as_bytes();
+    if b.len() < 4 || !b[0].is_ascii_uppercase() {
+        return false;
+    }
+    let mut words = 1usize;
+    let mut saw_lower = false;
+    for (_, &c) in b.iter().enumerate().skip(1) {
+        if c.is_ascii_uppercase() {
+            if !saw_lower {
+                return false; // double upper: `DUSTYsparrow`
+            }
+            words += 1;
+            saw_lower = false;
+        } else if c.is_ascii_lowercase() {
+            saw_lower = true;
+        } else {
+            return false; // digit / separator / underscore
+        }
+    }
+    words == 2 && saw_lower
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -159,6 +192,56 @@ mod tests {
             "zzac60b20f7ce9bbcf1255b9f8e966a05ab6dc17f944865ac554d44a88f8f874"
         ));
         assert!(!is_npub("flywheel-toron-oc2"));
+    }
+
+    #[test]
+    fn adjnoun_pin_shape_matches_legacy_pins() {
+        for pin in [
+            "DustySparrow",
+            "RoseDune",
+            "BeigeFern",
+            "CoralFinch",
+            "MistyDesert",
+            "BlueLynx",
+            "PinkGorge",
+            "CalmPeak",
+            "CyanCove",
+            "ScarletOwl",
+            "SunnyTiger",
+            "FrostyKite",
+            "BlackMouse",
+            "WindyCrane",
+            "OliveLeopard",
+            "FoggyTern",
+            "SandyBay",
+            "StormyHollow",
+            "KiteLoft",
+        ] {
+            assert!(is_adjnoun_pin(pin), "{pin} must be a valid pin shape");
+        }
+    }
+
+    #[test]
+    fn adjnoun_pin_rejects_non_shapes() {
+        for bad in [
+            "flywheel-toron-oc",
+            "flywheel-toron-oc2",
+            "assistant",
+            "lane-1-bootstrap",
+            "lane4catalog",
+            "dusky",
+            "DUSTYsparrow",
+            "Dusty",
+            "Dusty Sparrow",
+            "Dusty_Sparrow",
+            "DustySparrow2",
+            "DustySparrowX",
+            "AB",
+            "",
+            "aB",
+        ] {
+            assert!(!is_adjnoun_pin(bad), "{bad:?} must NOT be a pin shape");
+        }
     }
 
     #[test]
