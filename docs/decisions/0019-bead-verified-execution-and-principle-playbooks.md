@@ -3,7 +3,7 @@
 status: proposed
 date: 2026-08-15
 decision-makers: Captain (bangedorrunt)
-consulted: grilling session 2026-08-15 (wave-1 locks); pstack / poteto-mode (cursor/plugins) as prior art
+consulted: grilling session 2026-08-15 (wave-1 locks); pre-acceptance review 2026-08-15 (br-gate verdict store, loop-run VERIFY, wave resequencing); pstack / poteto-mode (cursor/plugins) as prior art
 informed: flywheel maintainers; toron-workflow / toron-core (no surface change)
 ---
 
@@ -25,7 +25,7 @@ informed: flywheel maintainers; toron-workflow / toron-core (no surface change)
 
 ## 1. TL;DR
 
-pstack (poteto-mode) is a Cursor plugin whose real invention is not 22 playbooks. It is:
+pstack (poteto-mode) is a Cursor plugin whose real invention is not its 23 playbooks. It is:
 
 1. a checkable work unit
 2. an isolated write target
@@ -41,23 +41,25 @@ We already have the orchestrator (flywheel), the transport (toron), and the trac
 | PR + head SHA | bead id + commit SHA |
 | Graphite stack | `br dep` + `bv --robot-plan` tracks |
 | babysit PR / land stack | claim-watch + T0–T3 + ledger-gated close |
-| `units.tsv` / `ledger.tsv` | `.flywheel/ledger.tsv` |
+| `units.tsv` / `ledger.tsv` | `br gate` results + `.flywheel/receipts/` evidence files |
 | poteto-mode router | `flywheel decide` (extended, still one table) |
 | standing orders | generated file from the principle registry |
 | `/loop until predicate` | `flywheel loop run --work` until ready empty **and** claim-watch empty **and** ledger green |
 | playbooks | built-in flywheel workflows + stages |
 
-**Wave 1 (grilled, then amended 2026-08-15):** ledger + scaled verifier + short brief + reservation floor. Contention **serializes or path-splits**. Worktrees forbidden in the loop. Delete `bead_prompt` / `resume_prompt` in the same cut.
+**Wave 1 (grilled, amended 2026-08-15, re-amended at pre-acceptance review):** `br gate` verdict ledger + loop-run VERIFY on the cheap band + scaled verifier + short brief + reservation floor. Contention **serializes or path-splits**. Worktrees forbidden in the loop. Delete `bead_prompt` / `resume_prompt` in the same cut.
 
-**Wave 2:** bake all 21 principles into registry, standing orders, profiles, stages, lint, preflight, and the brief `PRINCIPLES` field.
+**Wave 2:** playbook workflows as compiled-in builtins with their structural lints (re-sequenced: structure before prose).
 
-**Wave 3:** ship the playbook workflows as compiled-in builtins and extend `decide`.
+**Wave 3:** bake the 21 principles into registry CLI, standing orders, profiles, stages, preflight, and the brief `PRINCIPLES` field.
 
-**Wave 4:** event-driven loop (flywheel ADR-0001 A2) and delete the dual loop body.
+**Wave 4:** event-driven loop promotion (the herdr reactor already exists — promote to primary + delete the dual loop body, see Spec 9).
 
 **Wave 5:** only if waves 1–3 still leave noun sprawl, collapse steer/loop/workflow into one BeadRuntime.
 
 **Wave 6:** `reflect` workflow. A correction seen twice becomes a lint, a preflight, or a principle amendment bead.
+
+**Wave 7 (optional):** difficulty-tiered dispatch via the model registry.
 
 ---
 
@@ -114,11 +116,13 @@ Four forks, captain answers:
 
 Lock 2 was **reopened and revoked the same day** (captain: worktrees are token-hungry and get abused). Spec 3 is the replacement. Locks 1, 3, 4, 5 stand.
 
+**Pre-acceptance amendment (2026-08-15, review session).** Lock 4's *intent* stands unchanged — fail-closed close, no `br` fork, no new Nostr kind, flywheel-side enforcement. Its *store* is re-decided: the verdict ledger is `br gate` results, not `.flywheel/ledger.tsv`. br already ships a per-issue gate engine (`br gate report` / `br gate list`, beads issue #312) with an actor audit trail, JSONL export, and transition authorization (`--to`); a flywheel TSV would be a fourth parallel store next to bead status, br comments, and br audit JSONL (Option F, §4). Lock 3 gains two kinds: `CommandVerified` (the loop executes VERIFY itself on the loop-runnable band — a lying worker cannot forge what it does not write) and `ReviewerSigned` (judgment-AC beads have no command to run; closing them as `unit-test-verified` would be a false verdict). The grilled wording above is retained as provenance; this paragraph governs where the two conflict.
+
 ### 2.4 Evidence of the gaps (not vibes)
 
 - **Protocol is a prompt.** `flywheel/src/durable.rs` `bead_prompt` is one interpolating string. The loop cannot tell claim from close from "I forgot."
 - **Close is trusted.** Nothing in preflight, types, or the loop requires proof. A dishonest or hurried `br close --reason "done"` drains the ready set.
-- **Loop still polls.** `flywheel/docs/agent-instructions/loop.md`. flywheel ADR-0001 A2 (subscribe to herdr events) is still open. Latency hole. Separate root cause. Wave 4.
+- **Loop polls as the floor.** The herdr event reactor already exists (`__poll_events`, bd-event-subscribe-reactor; flywheel ADR-0001 accepted + implemented 2026-08-13) but runs as a forward-only latency optimization — the heartbeat `__poll` remains the correctness floor and the cadence driver. Wave 4 promotes events to primary and deletes the duplicate loop body. Do not rebuild the reactor.
 - **`unread_only` is a NO-OP** (ADR-0015). Mail-wake already keys on message id. Do not build read-receipts in this program.
 - **Three nouns, one job.** `steer` is `goal`. `loop --work` drains ready beads. `workflow` is the generic engine. Wave 1 keeps all three. Wave 5 revisits only with evidence.
 - **Dual loop bodies.** `durable.rs` `swarm_loop` and `main.rs` sync `cmd_loop`. Wave 4 deletes one.
@@ -134,8 +138,8 @@ Lock 2 was **reopened and revoked the same day** (captain: worktrees are token-h
 ## 3. Decision Drivers
 
 1. **Beads are the tracker.** Every pstack PR-shaped object maps to a bead-shaped object or is rejected.
-2. **ADR-0003 kind freeze + ADR-0007 C3 tool freeze.** No new kinds. No new MCP tools. Ledger is a flywheel file + CLI.
-3. **ADR-0015 one-way dependency and one mail surface.** Toron does not learn about `.flywheel/ledger.tsv`. Flywheel does not grow a second mail backend.
+2. **ADR-0003 kind freeze + ADR-0007 C3 tool freeze.** No new kinds. No new MCP tools. Verdict store is `br gate` + a flywheel CLI wrapper; receipts live in `.flywheel/receipts/`.
+3. **ADR-0015 one-way dependency and one mail surface.** Toron does not learn about `.flywheel/` artifacts. Flywheel does not grow a second mail backend.
 4. **Atomic reservation conflict-check is NEVER removed** (ADR-0011). Intents stay advisory. Held stays HARD.
 5. **Headless must not fake 43001/43004** (ADR-0010 Spec E). Cheap VERIFY is headless. Live-UI VERIFY is pane.
 6. **Encode lessons in structure.** A second textual reminder is a failed implementation of this ADR.
@@ -154,9 +158,9 @@ Copy poteto playbooks into `~/.agents/skills`. No engine change.
 
 Rejected. The root cause is prompt-as-protocol and self-reported close. More text on the same string is the failure mode poteto names in **encode-lessons-in-structure**.
 
-### Option B — Ledger + verifier + briefs on the current loop, then bake principles, then playbook workflows (CHOSEN)
+### Option B — Verdict ledger + verifier + briefs on the current loop, then playbook workflows + lints, then principles (CHOSEN, amended at pre-acceptance)
 
-Keep `decide` / `steer` / `loop` / `workflow` as nouns. Add `BeadUnit` + `Verdict` + `.flywheel/ledger.tsv`. Delete the lifecycle novel. Then encode the 21 principles as registry + lint + profiles. Then compile playbooks as builtins.
+Keep `decide` / `steer` / `loop` / `workflow` as nouns. Add `BeadUnit` + `Verdict` on `br gate` (Option F). Delete the lifecycle novel. Then compile playbooks as builtins with their structural lints. Then bake the 21 principles as registry + profiles + standing orders.
 
 Chosen because it is the smallest change that makes close fail-closed, it respects the grilling locks, and it gives later waves a type to hang principles and playbooks on.
 
@@ -176,7 +180,7 @@ Rejected. Different tracker, different multiplexer, different mail. Dual vocabul
 
 ## 5. Decision Outcome
 
-Chosen option: **B**, because it matches the grilled locks, fails closed on the real artifact, and leaves a type (`Verdict`) that waves 2–3 can enforce principles and playbooks against.
+Chosen option: **B, amended by F** — ledger-first sequence as grilled, with the verdict store on `br gate`, loop-run VERIFY on the cheap band, `ReviewerSigned` for judgment ACs, and waves 2/3 re-sequenced (structure before prose). It matches the locks' intent, fails closed on the real artifact, and leaves a type (`Verdict`) that later waves can enforce principles and playbooks against.
 
 ### Spec 0 — Vocabulary (beads, not PRs)
 
@@ -193,7 +197,7 @@ These substitutions are mandatory in every workflow, skill, stage, and brief thi
 
 Mail `thread_id` stays the bead id. File reservation `reason` stays the bead id. Commit messages include the bead id.
 
-### Spec 1 — BeadUnit, Verdict, ledger
+### Spec 1 — BeadUnit, Verdict, br-gate ledger (amended 2026-08-15, pre-acceptance)
 
 Core types (Rust, flywheel). This is the data shape. Get it right before more loop branches.
 
@@ -205,12 +209,14 @@ BeadUnit
   verify:       String            # argv or shell command; required
   blast:        Normal | High     # High if overlapping reserved paths, or AC is judgment
   owner:        Option<AgentName> # ADR-0018 canonical name
-  head_sha:     Option<String>    # git SHA of the work being verified
+  head_sha:     Option<String>    # git SHA of the commit whose message carries the bead id (SHA rule below)
 
 VerdictKind
-  UnitTestVerified
-  LiveVerified
-  WorkerReceipt
+  CommandVerified     # the LOOP executed VERIFY and wrote the receipt itself
+  UnitTestVerified    # independent verifier ran the command / test
+  LiveVerified        # independent verifier exercised the live surface
+  ReviewerSigned      # independent verifier signed a judgment-AC bead (no command exists)
+  WorkerReceipt       # worker self-report; legal only where the loop cannot run VERIFY
   VerifierBlocked
   VerifierFailed
 
@@ -224,48 +230,55 @@ Verdict
   verify_cmd:   String
 ```
 
-**Illegal, must not compile as a success path:** `{ status: closed, verdict: none }`.
+**Illegal, must not compile as a success path:** `{ status: closed, verdict: none }` — and `{ status: closed, verdict: WorkerReceipt }` on a loop-runnable VERIFY.
 
-**Ledger file:** `<project>/.flywheel/ledger.tsv`
-
-Columns, tab-separated, one header row:
+**Verdict store: `br gate` (Option F, adopted).** The ledger is not a flywheel file. br already ships a per-issue gate engine (`br gate report` / `br gate list`, beads issue #312) with an actor audit trail and JSONL export. A pass verdict is:
 
 ```
-bead_id	sha	kind	actor	at	receipt_path	verify_cmd
+br gate report <bead-id> --gate <verdict-kind> --provider <actor> --status pass \
+  --note "sha=<sha> receipt=<receipt-path>"
 ```
 
-`flywheel ledger record` upserts on `(bead_id, sha)`. Re-record on the same key is idempotent (last writer wins, previous row stays in an optional `ledger.jsonl` append-only log if we want audit; TSV is the live view).
+- Gate name = kebab-cased `VerdictKind` (`command-verified`, `unit-test-verified`, `live-verified`, `reviewer-signed`, `worker-receipt`).
+- Only PASS verdicts are recorded. `VerifierBlocked` / `VerifierFailed` are loop state (respawn / fix-unit triggers), not gate rows.
+- `flywheel ledger check <bead-id>` wraps `br gate list <id> --json`, applies the legal-close table below, exits 0 only on a legal verdict for the current SHA.
+- Audit = br's JSONL export. No `.flywheel/ledger.tsv`, no `ledger.jsonl`, no single-writer TSV protocol (SQLite owns concurrency; the receipts-drain machinery and the dual `flywheel ledger record` semantics are deleted in one cut).
+- **Wave-1 spike (half day):** confirm whether br gate policy can mark `closed` gated on a pass for this project (`--to`). If yes, the illegal close is *prevented* at the tracker. Either way the loop-side reopen below ships and stays the floor.
 
-`flywheel ledger check <bead-id> [--sha HEAD]` exits 0 only when a *legal* verdict exists for that key.
+**SHA rule (new invariant).** The verdict must bind to the work. Workers commit before closing; commit messages carry the bead id (Spec 0). At close-detect the loop derives `sha = git log --all -1 --grep="<bead-id>" --format=%H`. No commit carries the id → the close is illegal regardless of verdicts. There is no `git rev-parse HEAD` fallback: in a shared tree bare HEAD is the same SHA for every bead closed between commits and may not contain the closed bead's work at all.
 
 **Legal close**
 
 | Condition | Legal kinds |
 |---|---|
-| priority ≥ 2 **and** blast = Normal **and** VERIFY is a single cheap command | `WorkerReceipt`, `UnitTestVerified`, `LiveVerified` |
-| priority ≤ 1 **or** blast = High **or** AC is judgment (review, design, "does this feel right") | `UnitTestVerified`, `LiveVerified` only |
+| priority ≥ 2, blast = Normal, VERIFY loop-runnable (single cheap command) | `CommandVerified` (loop-run) |
+| priority ≥ 2, blast = Normal, VERIFY not loop-runnable (long-running, live-UI, agent-env) | `WorkerReceipt` (+ two-tick receipt grace), or `UnitTestVerified` / `LiveVerified` |
+| priority ≤ 1 or blast = High | `UnitTestVerified`, `LiveVerified` only |
+| AC is judgment (review, design, "does this feel right") | `ReviewerSigned` only (different-family verifier; recording `unit-test-verified` for a judgment bead is a false verdict) |
 | any | never `VerifierFailed`, never `VerifierBlocked`, never missing |
 
 `VerifierBlocked` is not a pass. Respawn the verifier when the environment heals. `VerifierFailed` spawns a fix unit (or reopens). It does not get a re-verify of the same broken head.
 
-**Single ledger writer.** The loop is the only process that mutates `.flywheel/ledger.tsv`. A worker writes a receipt file only:
+**Receipts.** Evidence files stay flywheel-side, machine-written where possible:
 
 ```
 .flywheel/receipts/<bead-id>-<sha>.<kind>.txt
 ```
 
-The loop upserts the TSV from that file after spot-checking it is non-empty and contains the VERIFY command line. Two workers must never append the TSV. `flywheel ledger record` used by a worker is a helper that writes the receipt file; the loop drains receipts each tick. This is `separate-before-serializing` applied to the ledger itself.
+- `CommandVerified`: the loop runs VERIFY (timeout = the bead's TIMEBOX; cargo under the build slot) and writes the receipt itself. A lying worker cannot forge what it does not write.
+- `WorkerReceipt`: the worker helper `flywheel ledger receipt` writes the file. The loop spot-checks non-empty + contains the VERIFY command line before recording the gate row; a receipt still missing after **two consecutive ticks** (close can race the write) reopens the bead.
+- Only the loop calls `br gate report`. Workers never write verdicts.
 
 **Loop enforcement (fail closed)**
 
 The loop already knows the assigned set (claim-watch keys). Each tick it `br show --json` those ids (not a full `br list` scan, not a comment grep). For each id whose status became `closed` since last checkpoint:
 
-1. SHA = receipt filename sha, else `git rev-parse HEAD` in the **primary** tree.
-2. `ledger check`.
-3. If illegal or missing: `br reopen <id>` + mail on `thread_id=<id>` subject `[<id>] unverified close reopened`. The bead is ready again. One mail per `(bead, sha)`.
-4. If legal: leave closed. Claim-watch releases.
+1. SHA per the SHA rule (`git log --grep`; no bare HEAD).
+2. Cheap band (loop-runnable VERIFY): the loop executes VERIFY now, writes the receipt, records `command-verified`. Non-zero exit → reopen + fix-unit, never a re-verify of the same broken head.
+3. `ledger check`. Illegal or missing → `br reopen <id>` + mail on `thread_id=<id>` subject `[<id>] unverified close reopened`. The bead is ready again. One mail per `(bead, sha)`.
+4. Legal → leave closed. Claim-watch releases.
 
-A worker who closes without a receipt *cannot* drain the queue. That is the red test of wave 1.
+A worker who closes without legal proof *cannot* drain the queue — and on the cheap band cannot forge proof the loop did not produce itself. That is the red test of wave 1.
 
 **VERIFY lives on the bead.** Required block in the description, exact shape:
 
@@ -319,7 +332,7 @@ These are real single-writer invariants. A second checkout does not split them. 
 | Shared object | Why a worktree lies |
 |---|---|
 | `.beads/` (`br` db + `issues.jsonl`) | Two trees, one tracker. Dual close/claim. |
-| `.flywheel/ledger.tsv` + receipts | Proof store is per-project, not per-tree. |
+| `.flywheel/receipts/` + br gate rows | Proof store is per-project (br db + receipts dir), not per-tree. |
 | `Cargo.lock` / workspace `target/` | Two compiles, or a corrupted shared target. Build slots already serialize cargo. |
 | `docs/catalog/` | Catalog freshness is one artifact. |
 | ADR-0018 `agent-names.json` | Pane identity is per workspace, not per worktree. |
@@ -346,16 +359,17 @@ This is `separate-before-serializing` read correctly: eliminate *false* sharing 
 
 ### Spec 4 — Scaled verifier
 
-- Worker always runs VERIFY and writes the receipt file (Spec 1). It does not edit the TSV.
-- Loop spot-checks the receipt exists, is non-empty, and contains the VERIFY command line before accepting `WorkerReceipt`.
+- Cheap band (priority ≥ 2, blast Normal, loop-runnable VERIFY): **the loop is the verifier.** It runs VERIFY and records `command-verified` (Spec 1). No worker receipt exists to forge; no second model is spent.
+- The worker still runs VERIFY as part of doing the work (red-green); only where the loop *cannot* run it (long-running, live-UI, agent-env) does the worker receipt count, with the two-tick grace.
 - Independent verifier:
   - profile `@reviewer`
   - **different model family** than the worker (model registry: if worker is grok, reviewer is not grok)
-  - headless when VERIFY is a command
-  - pane when VERIFY needs a live TUI/UI
-  - records `unit-test-verified` or `live-verified` (or `verifier-failed` / `verifier-blocked`)
-- Required when priority ≤ 1, blast = High, or the bead type is `docs` with judgment AC / any `review` stage.
-- A verifier whose entire product would be rerunning one cheap P3 command is ceremony. The worker receipt plus spot-check is enough (pstack's own scale-to-unit rule).
+  - headless when VERIFY is a command; pane when VERIFY needs a live TUI/UI
+  - records `unit-test-verified` / `live-verified`, or `reviewer-signed` for judgment ACs
+  - **single-family degrade (new):** if the registry cannot supply a second family (single-provider swarm), the loop does NOT respawn forever — it marks the bead `blocked` with reason `verifier-family-missing`, mails the captain once, and honors an explicit `verifier_family_override` config. An all-one-family swarm closing P0–P1 beads unverified is the failure this prevents.
+  - **pane budget (new):** verifier dispatches share the spawn budget with workers; one reusable verifier pane per project, headless preferred.
+- Required when priority ≤ 1, blast = High, or the bead AC is judgment / any `review` stage.
+- A verifier whose entire product would be rerunning one cheap command is ceremony — and on the loop-runnable band the loop already ran it. The bands above are the whole rule (pstack's own scale-to-unit).
 
 ### Spec 5 — The 21 principles (canonical names)
 
@@ -399,7 +413,7 @@ These names are the steering vocabulary. They are copied from pstack's principle
 | Name | When | Rule |
 |---|---|---|
 | `guard-the-context-window` | Large outputs, fan-out, long files | Bulk to subagents. Summaries in the main thread. |
-| `never-block-on-the-human` | Tempted to ask "should I?" on reversible work | Proceed. Present the result. Reserve asks for irreversible or genuine preference. |
+| `never-block-on-the-human` | Tempted to ask "should I?" on reversible work | Classify the question first: if the answer is a fact observable by running something, it is not the human's — prototype/sketch it and let the result decide. Otherwise proceed and present the result. Reserve asks for irreversible writes or genuine preference calls. |
 
 **Meta**
 
@@ -434,7 +448,7 @@ Text that an agent may skip is **not** an implementation of this spec. Each prin
 | `fix-root-causes` | `bug-fix` workflow: repro step must produce a failing command *before* the fix step is dispatched (`needs: [repro]`). A "fix" workflow with no repro node fails lint. |
 | `sequence-verifiable-units` | One in-flight bead per owner. Next ready bead only after a legal ledger row or an honest reopen. |
 | `guard-the-context-window` | Brief small. Standing orders by path. No worktree. No `verify-gates.sh` default. Scout compresses. Interrogate default N=2. |
-| `never-block-on-the-human` | Reopen + T0–T3 mail is automatic. `request_approval` only for irreversible or plan-gate (`goal`, not `goal-direct`). No "should I keep going" in standing orders. |
+| `never-block-on-the-human` | Reopen + T0–T3 mail is automatic. `request_approval` only for irreversible or plan-gate (`goal`, not `goal-direct`). No "should I keep going" in standing orders. Empirical-fork questions ("which approach?") route to `prototype`, never to `request_approval` — the ask is the slow path. |
 | `encode-lessons-in-structure` | Wave 6 `reflect`. Also: this table itself. A principle with only a skill paragraph and no row above is not baked. |
 
 **Delivery surfaces for the names (so captains and crews actually meet them)**
@@ -507,18 +521,21 @@ Principles: `laziness-protocol`, `subtract-before-you-add`, `prove-it-works`.
 
 **`prototype`**
 
-Inputs: `question`, `n` (default 2, min 2, max 3).
+Inputs: `question`, `n` (default 2, min 2, max 3), `mode` (`sketch` default | `compile`).
 
 ```
-arms       parallel over n   @coder   throwaway sketch in /tmp/flywheel-proto-<run>-<arm>/ (SCOPE files only; no herdr worktree; no br)
-judge      @oracle           compare on named criteria. pick one. others discarded.
+arms (sketch)   parallel over n   @coder   NON-COMPILING design sketch: API shapes, state machines, tradeoff table. /tmp/flywheel-proto-<run>-<arm>/ text only. No crate copy, no br.
+arms (compile)  sequential over n @coder   one arm at a time, in the primary tree on a scratch ref, under the build slot. Arm N+1 starts only after arm N is measured and reset.
+judge           @oracle           compare on named criteria. pick one. others discarded.
 ```
+
+**Amendment 2026-08-15 (pre-acceptance).** The original `/tmp` crate-copy scheme is revoked. A compiling Rust arm needs `Cargo.toml` / `Cargo.lock` / workspace context, so "SCOPE files only" either does not compile (then nothing was prototyped) or quietly becomes the full-crate second context the worktree ban forbids, at the same token price. Sketches stay parallel and cheap; compiling variants pay the serialize rule like everyone else.
 
 No merge of "a bit of each" unless the oracle writes a graft bead. Principles: `exhaust-the-design-space`, `separate-before-serializing-shared-state`.
 
 **`arena`**
 
-Same shape as `prototype` but the arms may be the *same* brief on different models (model race). Selection rule declared up front: `first-pass` | `rank-all` | `best-of`. Principles: `exhaust-the-design-space`, `guard-the-context-window` (parent keeps the table, not raw dumps).
+Same shape as `prototype` but the arms may be the *same* brief on different models (model race). Compile-mode arms serialize on the build slot; the race is in the models, not the tree. Selection rule declared up front: `first-pass` | `rank-all` | `best-of`. Principles: `exhaust-the-design-space`, `guard-the-context-window` (parent keeps the table, not raw dumps).
 
 **`perf`**
 
@@ -619,9 +636,9 @@ New rows (names are the primitive ids):
 | `refactor` | `refactoring` | `workflow run refactoring --execute --mode pane` |
 | `prototype`, `sketch`, `mock it up` | `prototype` | `workflow run prototype --execute --mode pane` |
 | `arena` | `arena` | `workflow run arena --execute --mode pane` |
-| `perf`, `p95`, `slow` (not `fix` alone) | `perf` | `workflow run perf --execute --mode pane` |
+| `perf`, `p95`, `slow` (not `fix`/`implement`) | `perf` | `workflow run perf --execute --mode pane` |
 | `hillclimb` | `hillclimb` | `workflow run hillclimb --execute --mode pane` |
-| `forensic`, `leak`, `idle cpu`, `spindump` | `forensics` | `workflow run forensics --execute --mode headless` |
+| `forensic`, `leak`, `idle cpu`, `spindump` (not `fix`/`implement`) | `forensics` | `workflow run forensics --execute --mode headless` |
 | `babysit` + bead-ish | `babysit-bead` | `workflow run babysit-bead --execute --mode pane` |
 | `pickup`, `resume session` | `pickup` | `workflow run pickup --execute --mode pane` |
 | `pause`, `going offline` | `pause` | `workflow run pause --execute` |
@@ -629,50 +646,54 @@ New rows (names are the primitive ids):
 | `figure it out`, `no playbook` | `figure-it-out` | `workflow compose --agent` |
 | `ship beads`, `land the beads` | `ship-beads` | `workflow run ship-beads --execute --mode pane` |
 
+Implement-bearing targets never fall through to a diagnosis-only workflow: `fix the memory leak` must reach `bug-fix` (whose `repro` step *is* the forensics), not `forensics`. Same `!implement` guard row 1 already applies to `captain-audit`.
+
 Existing rows stay: audit → `captain-audit`; ready beads + work/loop/beads → `loop-work`; implement+tracker → `steer`; implement+direct → `steer-direct`; compose; coalition; spawn-send; cron; fallback `steer`.
 
 Every new primitive gets a `decide.rs` unit test, same style as `row1_audit_is_captain_audit`.
 
 ### Spec 9 — Waves
 
-#### Wave 1 — Bead verdict (locked, implement first)
+#### Wave 1 — Bead verdict (locked, implement first; amended at pre-acceptance)
 
-- Types `BeadUnit`, `Verdict`, `VerdictKind`, `Blast`.
-- Receipt files + loop-only TSV writer. `flywheel ledger check|status`. Worker helper writes receipts only.
-- Loop reopen-on-unverified-close (assigned-set `br show`, not a full list scan).
-- Parse exact `## VERIFY` fence. Missing → refuse-to-dispatch. No `verify-gates.sh` default.
+- Types `BeadUnit`, `Verdict`, `VerdictKind` (incl. `CommandVerified`, `ReviewerSigned`), `Blast`.
+- Verdict store = `br gate` (pass-only, loop-only reporter). `flywheel ledger check` wraps `br gate list`. Receipts in `.flywheel/receipts/`; worker helper writes receipts only. Spike: br gate close-gating policy (`--to`).
+- SHA invariant: commit-before-close, `git log --grep` derivation, no bare-HEAD fallback.
+- Loop-run VERIFY on the loop-runnable band. Reopen-on-unverified-close (assigned-set `br show`, not a full list scan). Two-tick receipt grace for the non-runnable band.
+- Parse exact `## VERIFY` fence. Missing → refuse-to-dispatch. No `verify-gates.sh` default, no exceptions (the risks-table fallback is deleted).
 - Reservation floor. Contention → split or serialize. Loop must not call `worktree create`.
 - Preflight fails on an unexpected linked worktree unless `--allow-worktree`.
-- Scaled verifier (`@reviewer`, other model family).
+- Scaled verifier (`@reviewer`, other model family, single-family degrade path).
 - Delete `bead_prompt` / `resume_prompt`. Ship the brief template. Standing orders path-only.
 - Tests: the validation paths in §7 of this ADR.
 
-**Out of wave 1:** new playbook builtins (except the brief/ledger enable them), event-driven loop, noun collapse, read receipts, dual-loop deletion, `reflect`.
+**Out of wave 1:** new playbook builtins (the brief/ledger enable them), event-driven loop promotion, noun collapse, read receipts, dual-loop deletion, `reflect`.
 
-#### Wave 2 — Principles as structure
+#### Wave 2 — Playbook workflows + structural lints (re-sequenced 2026-08-15)
+
+Structure before prose: every principle that has a structural encoding ships *with* the structure that enforces it.
+
+- All Spec 7.2 builtins compiled in, lint green, e2e smoke each (`workflow lint` + a dry control-flow run; `--execute` tests where cheap).
+- Structural lints land with their YAML: `feature` requires `data_shape`; `bug-fix` requires a `repro` predecessor; `prototype`/`arena` require `n>=2` and the mode rules. (These were wave-2 checkboxes referencing wave-3 artifacts — the dependency now runs the correct way.)
+- Minimal principle-name registry (const names only) so `principles:` lint validates names. No CLI, no leaves, yet.
+- Spec 8 decide rows + tests.
+
+#### Wave 3 — Principles as names and structure
 
 - Compiled-in principle registry + `flywheel principles list|show`.
 - Generate `~/.config/flywheel/standing-orders.md` from the registry.
 - Rewrite six `Profile.behavior` texts to **cite principle names only** (Spec 6). Do not paste leaves. `flywheel principles show` is on-demand.
 - Rewrite stages `systematic-execute` and `code-review` to cite verification principles and the ledger CLI.
-- Brief `PRINCIPLES` field required for priority ≤ 2.
-- Workflow lint: known `principles:` names; `feature` requires `data_shape`; `bug-fix` requires `repro` predecessor; `prototype`/`arena` require `n>=2`.
+- Brief `PRINCIPLES` field required for priority ≤ 2; reviewer marks empty-with-no-reason incomplete.
 - Preflight: standing-orders exists; reject `*V2*` / `*_improved*` / `*_enhanced*` new files in a playbook run.
 - Skill + AGENTS.md pointers (toron, flywheel, beads-execute, swarm).
-- Reviewer incomplete if PRINCIPLES empty on a P0–P2 bead.
 
-#### Wave 3 — Playbook workflows + decide
+#### Wave 4 — Event-driven loop + subtract the duplicate (amended)
 
-- All Spec 7.2 builtins compiled in, lint green, e2e smoke each (`workflow lint` + a dry control-flow run; `--execute` tests where cheap).
-- Spec 8 decide rows + tests.
-- Catalog freshness if the CLI catalog lists workflows (`toron catalog` / flywheel `workflow list`).
-- Skill sync contract: Command enum, AGENTS.md, flywheel skill §5, robot-capabilities.
-
-#### Wave 4 — Event-driven loop + subtract the duplicate
-
-- Implement flywheel ADR-0001 A2: `events.subscribe` is primary. Poll is heartbeat/fallback only.
-- Delete the unused loop body (sync *or* durable, whichever is proven redundant after A2). One `plan_actions`.
+- The herdr event reactor ALREADY EXISTS (`__poll_events`, bd-event-subscribe-reactor; flywheel ADR-0001 accepted + implemented 2026-08-13) as a forward-only latency optimization with `__poll` as the correctness floor. Do not rebuild it. This wave's delta: promote events to primary (poll = heartbeat/fallback only) and delete the redundant loop body (sync *or* durable). One `plan_actions`.
 - Keep claim-watch, T0–T3, ledger check, mail wake.
+- Mail wake stays poll-based (`poll_mail_digests`) in this program. herdr pub/sub carries pane/workspace lifecycle only — it cannot carry inbox arrivals, and routing mail through a pane reaction would detect the reaction, not the arrival. If mail latency ever needs push, the correct vehicle is the mail plane itself: in-process, subscribe the loop's own toron bus (`toron_core::bus`); daemon mode, the toron MCP server already emits resource-updated notifications for every bus event. That is a separate small ADR, not this program.
+- Event-source swappability already rides the unified trait: `toron_core::backend::Backend::subscribe` yields normalized `BackendEvent`s (`AgentStatusChanged` / `AgentDetected` / `PaneExited` / `Raw`) and flywheel's `__poll_events` consumes that shape. Wave 4 wires through the trait, never `herdr_shim` directly — a future `FLYWHEEL_BACKEND=superlogical` swap (flywheel ADR-0002 R2 stub) stays a config flip + `pause`/`pickup` session restart, not a rewiring.
 
 #### Wave 5 — BeadRuntime (conditional)
 
@@ -683,6 +704,10 @@ Revisit only if, after waves 1–3, captains still cannot answer "where does X c
 - `reflect` builtin.
 - Cron-optional: weekly-review may `call_workflow: reflect`.
 - Output is a bead that adds a lint/preflight, not another paragraph in AGENTS.md.
+
+#### Wave 7 — Difficulty-tiered dispatch (optional)
+
+pstack tiers subagents by difficulty: judgment model for vague/cross-cutting work, instruction-follower for precisely specified sequences, fast model for trivial edits. flywheel has the model registry (ADR-0010) and uses it only for family diversity. This wave adds a difficulty tier per dispatch: `goal` / `figure-it-out` planners tag steps; spawn resolves model by tier. Ship only if model spend or quality on P0–P1 beads justifies it.
 
 ### Spec 10 — Ownership (ADR-0015 addendum)
 
@@ -696,7 +721,7 @@ Revisit only if, after waves 1–3, captains still cannot answer "where does X c
 **toron guarantees (unchanged)**
 
 - `MailSurface`, atomic reservations, crash-survivable `request_approval`, durable XDG root, 43001–43006, ADR-0018 naming.
-- No new tools. No new kinds. No dependency on flywheel. No knowledge of `.flywheel/ledger.tsv`.
+- No new tools. No new kinds. No dependency on flywheel. No knowledge of `.flywheel/` artifacts.
 
 **beads**
 
@@ -722,13 +747,13 @@ An agent implements **one wave at a time**, TDD, beads with deps. Do not start w
 
 | Path | Change |
 |---|---|
-| `flywheel/src/ledger.rs` | **new.** types, TSV read/write, `legal_close`, upsert |
-| `flywheel/src/main.rs` | `Ledger` subcommand; loop hook after close-detect; brief builder |
-| `flywheel/src/durable.rs` | delete `bead_prompt` / `resume_prompt` bodies; brief builder; receipt drain; reopen leaf; serialize-on-overlap; never `worktree create` |
+| `flywheel/src/verdict.rs` | **new.** types, `legal_close`, br-gate report/check wrappers, receipts, loop-run VERIFY executor |
+| `flywheel/src/main.rs` | `Ledger` subcommand (`check`, `receipt`); loop hook after close-detect; brief builder |
+| `flywheel/src/durable.rs` | delete `bead_prompt` / `resume_prompt` bodies; brief builder; br-gate report leaf; loop-run VERIFY leaf; reopen leaf; serialize-on-overlap; never `worktree create` |
 | `flywheel/src/work.rs` / `__ready` | parse `## VERIFY` into `ReadyBead.verify` |
 | `flywheel/src/preflight.rs` | `.flywheel/` writable; `br` present (already) |
 | `flywheel/src/stages.rs` | `systematic-execute` points at brief + `flywheel ledger` |
-| `flywheel/tests/` | unit: legal_close matrix; reopen idempotence; brief fill; TSV upsert |
+| `flywheel/tests/` | unit: legal_close matrix; reopen idempotence; brief fill; br-gate round-trip; SHA derivation |
 | `~/.agents/skills/flywheel/SKILL.md` | ledger CLI, brief contract |
 | this ADR | status stays proposed until wave 1 green + captain accept |
 
@@ -742,26 +767,26 @@ An agent implements **one wave at a time**, TDD, beads with deps. Do not start w
 
 | Path | Change |
 |---|---|
-| `flywheel/src/principles.rs` | **new.** 21 leaves as `const` + `list`/`show` |
-| `flywheel/src/profile.rs` | behavior texts cite names |
-| `flywheel/src/stages.rs` | p2/p6 cite verification names + ledger |
-| `toron-workflow` lint | `principles:` known names; feature `data_shape`; prototype `n>=2`; bug-fix graph shape |
-| `flywheel` skill, swarm skill, beads-execute, both AGENTS.md | index, not a second bible |
-| `docs/principles/` (flywheel) | optional human-readable copies of the leaves; `show` is canonical |
+| `flywheel/src/builtin_workflows.rs` | all Spec 7.2 YAML |
+| `flywheel/src/decide.rs` | Spec 8 rows + tests |
+| `flywheel/src/stages.rs` | new stages if a playbook step is reused (`repro`, `tdd-red`, `baseline`) |
+| `flywheel/src/principles.rs` | **new.** name-only registry (const list) for lint validation |
+| `toron-workflow` lint | feature `data_shape`; prototype/arena `n>=2` + mode rules; bug-fix graph shape; `principles:` names against the registry |
+| skill sync / catalog | Commands, robot-capabilities, AGENTS.md, flywheel skill, `workflow list` |
 
 ### Wave 3 — affected paths
 
 | Path | Change |
 |---|---|
-| `flywheel/src/builtin_workflows.rs` | all Spec 7.2 YAML |
-| `flywheel/src/decide.rs` | Spec 8 rows + tests |
-| `flywheel/src/stages.rs` | new stages if a playbook step is reused (`repro`, `tdd-red`, `baseline`) |
-| skill sync | Commands, robot-capabilities, AGENTS.md, flywheel skill |
-| catalog | `workflow list` includes new names |
+| `flywheel/src/principles.rs` | full 21 leaves as `const` + `list`/`show` |
+| `flywheel/src/profile.rs` | behavior texts cite names |
+| `flywheel/src/stages.rs` | p2/p6 cite verification names + ledger |
+| `flywheel` skill, swarm skill, beads-execute, both AGENTS.md | index, not a second bible |
+| `docs/principles/` (flywheel) | optional human-readable copies of the leaves; `show` is canonical |
 
-### Waves 4–6
+### Waves 4–7
 
-Wave 4: `durable.rs` event subscribe (see flywheel ADR-0001 §4); delete duplicate loop. Wave 5: only after a written "reader-load still fails" note in this ADR's More Information. Wave 6: `reflect` YAML + optional weekly-review edge.
+Wave 4: promote the existing `__poll_events` reactor to primary + delete the duplicate loop body (do NOT rebuild the reactor — see Spec 9). Wave 5: only after a written "reader-load still fails" note in this ADR's More Information. Wave 6: `reflect` YAML + optional weekly-review edge. Wave 7: difficulty-tiered dispatch, optional.
 
 ---
 
@@ -769,36 +794,36 @@ Wave 4: `durable.rs` event subscribe (see flywheel ADR-0001 §4); delete duplica
 
 ### Wave 1
 
-- [ ] `BeadUnit` / `VerdictKind` exist. `legal_close` is table-tested for every kind × priority × blast cell.
-- [ ] `flywheel ledger record` then `check` exits 0 on the same `(id, sha)`. Second record is idempotent.
-- [ ] Fixture: worker closes with no row → loop reopens → bead is in `br ready`. **This is the red-then-green of the program.**
-- [ ] Fixture: P3 cheap VERIFY + `worker-receipt` + non-empty receipt → stays closed.
-- [ ] Fixture: P0 + `worker-receipt` only → reopened until `@reviewer` records `unit-test-verified` or `live-verified`.
+- [ ] `BeadUnit` / `VerdictKind` exist (incl. `CommandVerified`, `ReviewerSigned`). `legal_close` is table-tested for every kind × priority × blast × AC-shape cell.
+- [ ] `br gate report` then `flywheel ledger check` exits 0 on the same bead. Only the loop can record: a worker-invoked `br gate report` for a loop-owned bead is rejected or reverted (test the guard).
+- [ ] Fixture: worker closes with no gate row → loop reopens → bead is in `br ready`. **This is the red-then-green of the program.**
+- [ ] Fixture: cheap P3 loop-runnable VERIFY → loop executes it, writes the receipt, records `command-verified` → stays closed. A worker-forged receipt on this band is impossible by construction (workers never write this kind).
+- [ ] Fixture: P0 + `worker-receipt` only → reopened until `@reviewer` records `unit-test-verified` / `live-verified`.
+- [ ] Fixture: judgment-AC bead closed with `unit-test-verified` → reopened; only `reviewer-signed` from a different family closes it.
+- [ ] Fixture: close with no commit carrying the bead id → illegal under the SHA rule, reopened.
 - [ ] Two overlapping ready beads on a normal path → split **or** the second stays undispatched until release. Loop logs contain no `worktree.create`.
 - [ ] Two beads both touching `.beads/` or `Cargo.lock` → serialized. Never parallel.
 - [ ] `loop run` in a workspace with an extra linked worktree exits non-zero without `--allow-worktree`.
-- [ ] `prototype` / `arena` arms write under `/tmp/flywheel-proto-*` only. No herdr worktree. No `br` in the arm.
+- [ ] Single-family swarm: P0 bead → `blocked` with `verifier-family-missing` + exactly one captain mail (no infinite respawn loop).
 - [ ] `rg 'Execute bead \{id\}'` in flywheel/src is empty. `bead_prompt` / `resume_prompt` do not exist as the old templates.
-- [ ] `cargo test -p flywheel ledger::` and loop reopen tests green.
-- [ ] No new `use flywheel` in toron crates. No new MCP tool. No new kind.
 
 ### Wave 2
 
-- [ ] `flywheel principles list` prints 21 names. `show prove-it-works` prints the full rule, not a gist.
-- [ ] Each Spec 6 row has a *code* or *lint* or *preflight* hook. A grep for the principle name in `profile.rs` / lint / preflight / stages hits.
+- [ ] `flywheel workflow list` includes: bug-fix, feature, refactoring, prototype, arena, perf, hillclimb, forensics, babysit-bead, ship-beads, autonomous-work, pickup, pause, interrogate, figure-it-out.
+- [ ] `flywheel workflow lint` over builtins is clean.
 - [ ] `feature` YAML without `data_shape` fails `workflow lint`.
 - [ ] `bug-fix` YAML without a `repro` predecessor fails `workflow lint`.
-- [ ] `prototype` with `n=1` fails lint.
-- [ ] P2 bead report with empty PRINCIPLES is incomplete per reviewer contract (unit test on the checker, or a fixture).
-- [ ] Skills and AGENTS.md point at `flywheel principles`. They do not duplicate the 21 leaves.
+- [ ] `prototype` with `n=1` fails lint; compile-mode arms serialize on the build slot (log proof: no parallel cargo).
+- [ ] Each new `decide` primitive has a unit test. `decide("repro the scroll drift", …).primitive == "bug-fix"`. `decide("fix the memory leak", …).primitive == "bug-fix"` (not `forensics`).
+- [ ] No builtin YAML mentions pull requests, Graphite, or `gh pr`.
 
 ### Wave 3
 
-- [ ] `flywheel workflow list` includes: bug-fix, feature, refactoring, prototype, arena, perf, hillclimb, forensics, babysit-bead, ship-beads, autonomous-work, pickup, pause, interrogate, figure-it-out.
-- [ ] `flywheel workflow lint` over builtins is clean.
-- [ ] Each new `decide` primitive has a unit test. `decide("repro the scroll drift", …).primitive == "bug-fix"`.
+- [ ] `flywheel principles list` prints 21 names. `show prove-it-works` prints the full rule, not a gist.
+- [ ] Each Spec 6 row has a *code* or *lint* or *preflight* hook. A grep for the principle name in `profile.rs` / lint / preflight / stages hits.
+- [ ] P2 bead report with empty PRINCIPLES is incomplete per reviewer contract (unit test on the checker, or a fixture).
+- [ ] Skills and AGENTS.md point at `flywheel principles`. They do not duplicate the 21 leaves.
 - [ ] Skill sync contract holds (Commands + robot-capabilities + AGENTS.md + flywheel skill).
-- [ ] No builtin YAML mentions pull requests, Graphite, or `gh pr`.
 
 ### Wave 4+
 
@@ -813,7 +838,7 @@ Wave 4: `durable.rs` event subscribe (see flywheel ADR-0001 §4); delete duplica
 
 ### Good
 
-- Overnight `loop --work` becomes auditable. Morning artifact is `.flywheel/ledger.tsv`, not a transcript.
+- Overnight `loop --work` becomes auditable. Morning artifact is the br gate ledger + `.flywheel/receipts/`, not a transcript.
 - One tree, one tracker, one cargo slot. No second context window pretending to be isolation.
 - Captains steer with principle *names* that resolve to leaves and to lints.
 - Crews get a playbook for the job in front of them (`bug-fix` vs `feature` vs `forensics`) instead of one `goal` sausage.
@@ -838,11 +863,11 @@ Wave 4: `durable.rs` event subscribe (see flywheel ADR-0001 §4); delete duplica
 
 | Risk | Mitigation |
 |---|---|
-| Agents learn to write a fake receipt | Spot-check: receipt must contain the VERIFY command's stdout markers; empty file is illegal. P0 still needs a second model. |
+| Agents learn to write a fake receipt | Cheap band: the loop writes the receipt itself — nothing to forge. Non-runnable band: receipt must contain the VERIFY command's stdout markers; empty file is illegal; two-tick grace. P0–P1 still needs a second model. |
 | Someone "just this once" worktrees a bead | Preflight fail on extra linked worktree. Brief FORBIDDEN. Loop will not ledger a foreign SHA. |
 | Serialized overlap looks idle | Claim-watch must not nudge a waiting-on-overlap bead as if the owner is stuck. |
 | Reopen storms | Idempotent reopen. Mail once per `(bead, sha)` missing-verdict. |
-| VERIFY missing on old beads | Default refuse-to-dispatch + mail planner. Optional fallback to `scripts/verify-gates.sh` only for `docs`/`chore`. |
+| VERIFY missing on old beads | Default refuse-to-dispatch + mail planner. No `verify-gates.sh` fallback for any bead class (the risks-table fallback that contradicted Spec 1 is deleted). |
 | Contention detector false positives on README | Reuse ADR-0011 non-trivial path rule (source, not docs/config). |
 | Principle names become cargo-cult citations | Reviewer rejects a PRINCIPLES line with no decision. Same rule poteto-mode uses. |
 
@@ -878,6 +903,11 @@ Wave 4: `durable.rs` event subscribe (see flywheel ADR-0001 §4); delete duplica
 - Good, because playbooks already written.
 - Bad, because PR-shaped, Cursor-shaped, Graphite-shaped. Violates driver 1.
 
+### F — `br gate` as the verdict store (added 2026-08-15, pre-acceptance review; adopted as part of B)
+
+- Good, because the tracker is already the system of record and already has a gate engine (`br gate report` / `list`, actor audit trail, JSONL export, `--to` transition authorization). Prevention at the tracker beats detection-and-reopen in the loop. No TSV writer protocol, no receipts-drain race, no fourth vocabulary object next to bead status, br comments, and br audit JSONL.
+- Bad, because sha / receipt-path ride in `--note` until br grows native fields, and br is an external evolving binary. Mitigation: structured `key=value` note prefix; the revisit trigger below already covers field migration.
+
 ---
 
 ## 10. More Information
@@ -892,9 +922,10 @@ That is pstack's fearless parallelism, on beads, on toron mail, on the loop we a
 
 ### Prior art
 
-- pstack README + `skills/poteto-mode/SKILL.md` + 21 `principle-*` leaves (MIT, cursor/plugins).
-- pstack playbooks: investigation, bug-fix, perf, hillclimb, forensics, feature, refactoring, prototype, babysit, shipping, autonomous-run, orchestrate, pickup, pause, multi-phase, figure-it-out, interrogate, arena, swarm.
-- Grilling 2026-08-15 (this conversation): four locks in §2.3.
+- pstack README + `skills/poteto-mode/SKILL.md` + 21 `principle-*` leaves (MIT, cursor/plugins). 23 playbooks (earlier drafts said 22 — miscounted); this ADR merges runtime-forensics and trace-forensics into one `forensics` with an optional `artifact` input.
+- pstack playbooks: investigation, bug-fix, perf-issue, hillclimb, runtime-forensics, trace-forensics, feature, refactoring, prototype, visual-parity, authoring-a-skill, eval, babysit, shipping, autonomous-run, orchestrate, autopilot-full, autopilot-stack, session-pickup, pause-safely, multi-phase-plan, worktree-cleanup, opening-a-pr.
+- pstack rules now ported that the first draft dropped: AskQuestion classification (an answer observable by running something is not the human's — route it to `prototype`; folded into `never-block-on-the-human`, Spec 5/6) and difficulty-tiered model dispatch (wave 7).
+- Grilling 2026-08-15 (this conversation): four locks in §2.3. Pre-acceptance review 2026-08-15: amendments in §2.3 note, Spec 1, Spec 4, Spec 7.2, Spec 8, Spec 9.
 
 ### Related ADRs
 
@@ -909,7 +940,7 @@ That is pstack's fearless parallelism, on beads, on toron mail, on the loop we a
 ### Revisit triggers
 
 - Wave 5: if after wave 3 a new captain cannot find the work unit in 30 seconds.
-- If `br` grows native custom fields, consider moving the ledger row into the bead. Until then the TSV stays.
+- If `br gate` grows native fields (sha, receipt path), move them out of the `--note` prefix. The verdict store already lives in the tracker; nothing to migrate.
 - If we ever have external API users of flywheel's close semantics, the "no compatibility shim" driver changes. We do not today.
 
 ### Acceptance of this ADR
