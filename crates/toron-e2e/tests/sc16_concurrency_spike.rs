@@ -51,8 +51,8 @@ async fn spike_root(
     _input: serde_json::Value,
 ) -> resonate_sdk::Result<serde_json::Value> {
     // True concurrency via `.spawn()` — both children run in parallel.
-    let f_a = ctx.run(spike_child, json!({ "node": "a" })).spawn().await?;
-    let f_b = ctx.run(spike_child, json!({ "node": "b" })).spawn().await?;
+    let f_a = ctx.run(spike_child, json!({ "node": "a" })).spawn()?;
+    let f_b = ctx.run(spike_child, json!({ "node": "b" })).spawn()?;
     let a = f_a.await?;
     let b = f_b.await?;
     Ok(json!({ "a": a, "b": b }))
@@ -66,7 +66,7 @@ async fn spike_child(
     input: serde_json::Value,
 ) -> resonate_sdk::Result<serde_json::Value> {
     let node = input["node"].as_str().unwrap_or("?").to_string();
-    let pending = ctx.promise::<serde_json::Value>().data(&input)?;
+    let pending = ctx.promise::<serde_json::Value>().data(&input)?.create()?;
     let pid = pending.id().await?;
     ctx.get_dependency::<SpikeSink>()
         .lock()
