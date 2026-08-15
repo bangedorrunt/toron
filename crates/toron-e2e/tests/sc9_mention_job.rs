@@ -1,7 +1,8 @@
 // governed-by: ADR-0003
 #![forbid(unsafe_code)]
 
-//! SC-9 — @mention → job claim → result (P2 / Phase-2 gate).
+//! SC-9 — @mention → job claim → result (P2 / Phase-2 gate). **Plane P
+//! mention** (NIP-17 gift-wrap DM): the shared-plane (kind-9) path is SC-27.
 //!
 //! Actors: human H in channel #forge, OC-β, Grok-γ (members).
 //!
