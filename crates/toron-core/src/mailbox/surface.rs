@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use super::Mailbox;
 use super::build_slots::AcquireBuildSlotResult;
 use super::contacts::{ContactLink, RequestContact, RespondContact};
-use super::error::{MailError, MailErrorCode, MailSurfaceResult};
+use super::error::{MailError, MailSurfaceResult};
 use super::identity::{ListAgentsOptions, RegisteredAgent, WhoIs};
 use super::ids::MessageId;
 use super::infra::{HealthReport, ProjectState};
@@ -140,6 +140,8 @@ impl From<&InboxQuery> for FetchInbox {
             unread_only: q.unread_only,
             limit: q.limit,
             include_bodies: q.include_bodies,
+            urgent_only: q.urgent_only,
+            since_ts: q.since_ts.clone(),
         }
     }
 }
@@ -301,43 +303,6 @@ impl From<&ContactResponse> for RespondContact {
             from_project: r.from_project.clone(),
         }
     }
-}
-
-/// Parse an RFC3339 timestamp into epoch micros (the unit every toron row's
-/// `created_ts_us` uses). A bad timestamp is a `MailError::Malformed` — never
-/// a silently ignored filter (F11 / c3b.3 honesty).
-fn parse_rfc3339_us(ts: &str) -> Result<i64, MailError> {
-    chrono::DateTime::parse_from_rfc3339(ts)
-        .map(|dt| dt.timestamp_micros())
-        .map_err(|e| {
-            MailError::new(
-                MailErrorCode::Malformed,
-                format!("timestamp {ts:?} is not RFC3339: {e}"),
-            )
-        })
-}
-
-/// `inbox` post-projection filters (urgent / since) the mailbox's
-/// `FetchInbox` does not express (F11 / c3b.3).
-fn filter_inbox_messages(
-    items: Vec<InboxMessage>,
-    q: &InboxQuery,
-) -> Result<Vec<InboxMessage>, MailError> {
-    let since_us = q.since_ts.as_deref().map(parse_rfc3339_us).transpose()?;
-    Ok(items
-        .into_iter()
-        .filter(|m| {
-            if q.urgent_only && !matches!(m.importance.as_str(), "high" | "urgent") {
-                return false;
-            }
-            if let Some(s) = since_us
-                && m.created_ts_us <= s
-            {
-                return false;
-            }
-            true
-        })
-        .collect())
 }
 
 /// The coordination-fabric trait (ADR-0007 D2): `&self` receivers, string
@@ -661,15 +626,15 @@ impl MailSurface for ToronMailSurface {
     }
 
     async fn inbox(&self, req: &InboxQuery) -> Result<Vec<MailItem>, MailError> {
+        // F11 / c3b.3 (bd-mcp-inbox-filter-qyyq): urgent/since filtering now
+        // lives INSIDE `Mailbox::fetch_inbox` (the shared core inbox query) —
+        // this surface path and the MCP tool path inherit the same filter.
         let fetched = self
             .mailbox
             .fetch_inbox(&FetchInbox::from(req))
             .await
             .map_mail_error()?;
-        Ok(filter_inbox_messages(fetched, req)?
-            .into_iter()
-            .map(MailItem::from)
-            .collect())
+        Ok(fetched.into_iter().map(MailItem::from).collect())
     }
 
     async fn acknowledge(&self, req: &ReceiptOp) -> Result<ReceiptOutcome, MailError> {
@@ -703,9 +668,13 @@ impl MailSurface for ToronMailSurface {
         inner.since_us = req
             .date_start
             .as_deref()
-            .map(parse_rfc3339_us)
+            .map(super::messaging::parse_rfc3339_us)
             .transpose()?;
-        inner.until_us = req.date_end.as_deref().map(parse_rfc3339_us).transpose()?;
+        inner.until_us = req
+            .date_end
+            .as_deref()
+            .map(super::messaging::parse_rfc3339_us)
+            .transpose()?;
         Ok(self
             .mailbox
             .search_messages(&inner)
@@ -1042,6 +1011,7 @@ mod tests {
     use crate::bus::in_process::{InProcessBus, InProcessBusConfig};
     use crate::index::schema;
     use crate::mailbox::Mailbox;
+    use crate::mailbox::error::MailErrorCode;
     use crate::nostr::identity::AgentProfile;
 
     use super::*;
@@ -1221,18 +1191,35 @@ mod tests {
 
         // Future bound (now + 1h): the just-sent message is older → empty.
         let future = (now + chrono::Duration::hours(1)).to_rfc3339();
-        let future_inbox = surface.inbox(&query(Some(future))).await.expect("future inbox");
-        assert_eq!(future_inbox.len(), 0, "future since_ts must exclude the message");
+        let future_inbox = surface
+            .inbox(&query(Some(future)))
+            .await
+            .expect("future inbox");
+        assert_eq!(
+            future_inbox.len(),
+            0,
+            "future since_ts must exclude the message"
+        );
 
         // Past bound (now − 1h): the message is newer → present.
         let past = (now - chrono::Duration::hours(1)).to_rfc3339();
         let past_inbox = surface.inbox(&query(Some(past))).await.expect("past inbox");
-        assert_eq!(past_inbox.len(), 1, "past since_ts must include the message");
+        assert_eq!(
+            past_inbox.len(),
+            1,
+            "past since_ts must include the message"
+        );
         assert_eq!(past_inbox[0].subject, "since-conformance");
 
         // Malformed bound → Malformed error, never a silent ignore.
         let err = surface.inbox(&query(Some("not-a-timestamp".into()))).await;
-        assert!(matches!(err, Err(MailError { code: MailErrorCode::Malformed, .. })));
+        assert!(matches!(
+            err,
+            Err(MailError {
+                code: MailErrorCode::Malformed,
+                ..
+            })
+        ));
 
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_dir_all(&data_dir);

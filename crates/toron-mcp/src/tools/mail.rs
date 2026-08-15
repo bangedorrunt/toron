@@ -10,14 +10,14 @@
 //! ZERO change (ADR-0007 C3).
 
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::{tool, tool_router};
 use rmcp::schemars::{self, JsonSchema};
+use rmcp::{tool, tool_router};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use toron_core::mailbox::{FetchInbox, SearchMessages, SendMessage};
 
-use super::{ToolOutput, ToolServer, ToJson};
+use super::{ToJson, ToolOutput, ToolServer};
 
 #[tool_router(router = mail_router, vis = "pub(crate)")]
 impl ToolServer {
@@ -94,6 +94,8 @@ impl ToolServer {
             unread_only: args.unread_only.unwrap_or(false),
             limit: args.limit.map(|l| l as usize),
             include_bodies: args.include_bodies.unwrap_or(false),
+            urgent_only: args.urgent_only.unwrap_or(false),
+            since_ts: args.since_ts.clone(),
         };
         ToolOutput::result(self.mailbox.fetch_inbox(&fi).await)
     }
@@ -111,11 +113,7 @@ impl ToolServer {
     ) -> ToolOutput {
         ToolOutput::result(
             self.mailbox
-                .acknowledge_message(
-                    &args.project_key,
-                    &args.agent_name,
-                    &args.message_id,
-                )
+                .acknowledge_message(&args.project_key, &args.agent_name, &args.message_id)
                 .await,
         )
     }
@@ -133,11 +131,7 @@ impl ToolServer {
     ) -> ToolOutput {
         ToolOutput::result(
             self.mailbox
-                .mark_message_read(
-                    &args.project_key,
-                    &args.agent_name,
-                    &args.message_id,
-                )
+                .mark_message_read(&args.project_key, &args.agent_name, &args.message_id)
                 .await,
         )
     }
@@ -177,9 +171,7 @@ impl ToolServer {
         };
         match self.mailbox.search_messages(&sm).await {
             Ok(rows) => {
-                let cursor = rows
-                    .last()
-                    .map(|r| format!("s0000000000000000:i{}", r.id));
+                let cursor = rows.last().map(|r| format!("s0000000000000000:i{}", r.id));
                 let result = rows.to_json();
                 let mut map = serde_json::Map::new();
                 if let Some(c) = cursor {
