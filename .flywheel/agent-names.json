@@ -1,26 +1,26 @@
 [
   {
-    "pane_id": "w7W:p1",
-    "name": "flywheel-toron-oc",
-    "mail_identity": "flywheel-toron-oc",
+    "pane_id": "w70:p1",
+    "name": "flywheel-toron-coder",
+    "profile": "coder",
+    "harness": "omp",
+    "mail_identity": "flywheel-toron-coder",
     "skills_injected": false
   },
   {
-    "pane_id": "w7W:p2",
-    "name": "flywheel-toron-oc2",
-    "mail_identity": "flywheel-toron-oc2",
+    "pane_id": "w70:p2",
+    "name": "flywheel-toron-coder2",
+    "profile": "coder",
+    "harness": "omp",
+    "mail_identity": "flywheel-toron-coder2",
     "skills_injected": false
   },
   {
-    "pane_id": "w7W:p3",
-    "name": "flywheel-toron-oc3",
-    "mail_identity": "flywheel-toron-oc3",
-    "skills_injected": false
-  },
-  {
-    "pane_id": "w7W:p4",
-    "name": "flywheel-toron-oc4",
-    "mail_identity": "flywheel-toron-oc4",
+    "pane_id": "w70:p3",
+    "name": "flywheel-toron-coder3",
+    "profile": "coder",
+    "harness": "omp",
+    "mail_identity": "flywheel-toron-coder3",
     "skills_injected": false
   }
 ]
