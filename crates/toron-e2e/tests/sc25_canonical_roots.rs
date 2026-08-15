@@ -15,8 +15,8 @@
 
 use std::sync::Arc;
 
-use toron_core::bus::in_process::{AuthPolicy, InProcessBusConfig};
 use toron_core::bus::InProcessBus;
+use toron_core::bus::in_process::{AuthPolicy, InProcessBusConfig};
 use toron_core::index::schema;
 use toron_core::mailbox::Mailbox;
 use toron_core::mailbox::messaging::{FetchInbox, SendMessage};
@@ -50,7 +50,10 @@ async fn boot(dir: &std::path::Path) -> (Mailbox, InProcessBus, sqlx::SqlitePool
     .with_agent_passphrase("toron-dev")
     .with_index_pool(pool.clone());
     // Daemon-open migration: fold any pre-existing path-slug roots.
-    mailbox.reconcile_project_aliases().await.expect("reconcile");
+    mailbox
+        .reconcile_project_aliases()
+        .await
+        .expect("reconcile");
     (mailbox, bus, pool)
 }
 
@@ -98,7 +101,10 @@ async fn sc25_canonical_roots_slug_and_path_form_are_one_project() {
     let first = mailbox.ensure_project(SHORT).await.expect("ensure short");
     assert_eq!(first.slug, SHORT, "short slug is canonical");
     let second = mailbox.ensure_project(PATH).await.expect("ensure path");
-    assert_eq!(second.slug, SHORT, "path form resolves to the canonical slug");
+    assert_eq!(
+        second.slug, SHORT,
+        "path form resolves to the canonical slug"
+    );
     assert!(!second.created, "second ensure is a no-op on the same root");
 
     // --- registration state spans both, no duplicate rows ---
@@ -157,6 +163,8 @@ async fn sc25_canonical_roots_slug_and_path_form_are_one_project() {
             unread_only: false,
             limit: None,
             include_bodies: true,
+            urgent_only: false,
+            since_ts: None,
         })
         .await
         .expect("fetch via short root");
@@ -236,7 +244,11 @@ async fn sc25_migration_folds_preexisting_path_slug_rows_read_only() {
         toron_core::keys::DEFAULT_LOG_N,
     )
     .expect("legacy key");
-    mailbox.bus().publish(result.event).await.expect("legacy profile");
+    mailbox
+        .bus()
+        .publish(result.event)
+        .await
+        .expect("legacy profile");
     let now_us = nostr_sdk::nostr::Timestamp::now().as_secs() as i64 * 1_000_000;
     sqlx::query(
         "INSERT INTO agents (project_slug, name, pubkey, program, model, \
@@ -251,7 +263,10 @@ async fn sc25_migration_folds_preexisting_path_slug_rows_read_only() {
     .expect("legacy agents row");
 
     // Daemon-open migration folds the legacy root into the alias table.
-    mailbox.reconcile_project_aliases().await.expect("reconcile");
+    mailbox
+        .reconcile_project_aliases()
+        .await
+        .expect("reconcile");
     let set = mailbox.project_read_set(SHORT).await;
     assert!(
         set.contains(&legacy_slug.to_string()),
@@ -280,7 +295,8 @@ async fn sc25_migration_folds_preexisting_path_slug_rows_read_only() {
     );
     assert_eq!(agent_rows(&pool, SHORT).await, 1, "one canonical row");
     assert_eq!(
-        agent_rows(&pool, legacy_slug).await, 1,
+        agent_rows(&pool, legacy_slug).await,
+        1,
         "legacy row stays read-only, never deleted"
     );
 

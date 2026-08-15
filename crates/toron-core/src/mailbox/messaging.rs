@@ -34,16 +34,17 @@ use nostr_sdk::nostr::event::unsigned::UnsignedEvent;
 use nostr_sdk::nostr::{Event, EventId, Keys, PublicKey, Tag, Timestamp};
 use sqlx::Row;
 
+use crate::backend::herdr::HerdrBackend;
 use crate::bus::filter::ToronFilter;
 use crate::bus::scoping::is_metadata_hiding_kind;
 use crate::mailbox::identity::ListAgentsOptions;
 use crate::mailbox::unwrap::{OVERSEER_TAG, UnwrappedMail, order_by_rumor_time, tag_value};
 use crate::nostr::gift_wrap::{self, UnwrappedGift};
 use crate::nostr::identity as nident;
-use crate::backend::herdr::HerdrBackend;
 use sha2::Digest;
 
 use super::Mailbox;
+use super::error::{MailError, MailErrorCode};
 
 /// A recipient role on the wire (`p` tag role, G3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -158,6 +159,54 @@ pub struct FetchInbox {
     pub unread_only: bool,
     pub limit: Option<usize>,
     pub include_bodies: bool,
+    /// Keep only messages with importance ∈ {high, urgent} (F11 / c3b.3 —
+    /// applied post-projection, same for EVERY inbox path).
+    pub urgent_only: bool,
+    /// Keep only messages with `created_ts_us` strictly newer than this
+    /// RFC3339 timestamp. `None` = no time bound. A malformed timestamp is a
+    /// `MailError::Malformed` — never a silently ignored filter.
+    pub since_ts: Option<String>,
+}
+
+/// Parse an RFC3339 timestamp into epoch micros (the unit every toron row's
+/// `created_ts_us` uses). A bad timestamp is a `MailError::Malformed` — never
+/// a silently ignored filter (F11 / c3b.3 honesty). `pub(crate)`: the search
+/// surface path (surface.rs `date_start`/`date_end`) shares it.
+pub(crate) fn parse_rfc3339_us(ts: &str) -> Result<i64, MailError> {
+    chrono::DateTime::parse_from_rfc3339(ts)
+        .map(|dt| dt.timestamp_micros())
+        .map_err(|e| {
+            MailError::new(
+                MailErrorCode::Malformed,
+                format!("timestamp {ts:?} is not RFC3339: {e}"),
+            )
+        })
+}
+
+/// `fetch_inbox` post-projection filters (urgent / since) that live in the
+/// SHARED core inbox query (bd-mcp-inbox-filter-qyyq): the MailSurface path
+/// and every MCP tool path inherit them from `Mailbox::fetch_inbox` — no
+/// per-path filter copies. Applied BEFORE `limit` so a bound narrows what
+/// the limit truncates.
+fn filter_inbox_messages(
+    items: Vec<InboxMessage>,
+    q: &FetchInbox,
+) -> Result<Vec<InboxMessage>, MailError> {
+    let since_us = q.since_ts.as_deref().map(parse_rfc3339_us).transpose()?;
+    Ok(items
+        .into_iter()
+        .filter(|m| {
+            if q.urgent_only && !matches!(m.importance.as_str(), "high" | "urgent") {
+                return false;
+            }
+            if let Some(s) = since_us
+                && m.created_ts_us <= s
+            {
+                return false;
+            }
+            true
+        })
+        .collect())
 }
 
 /// A receipt outcome (idempotent).
@@ -379,6 +428,15 @@ impl Mailbox {
             messages.retain(|m| m.read_ts_us.is_none());
         }
 
+        // F11 / c3b.3 (bd-mcp-inbox-filter-qyyq): urgent/since filters are a
+        // SHARED core concern — applied here so the MailSurface path and the
+        // MCP tool path (which calls `Mailbox::fetch_inbox` directly) get the
+        // exact same post-projection filtering. Malformed `since_ts` is a
+        // hard Malformed error, never a silent ignore. Applied BEFORE limit.
+        if args.urgent_only || args.since_ts.is_some() {
+            messages = filter_inbox_messages(messages, &args)?;
+        }
+
         // Parity: AM `fetch_inbox` names the sender (the display name, not the
         // raw pubkey). toron's gift-wrap unwrap yields only the sender npub;
         // reverse-resolve npub→name from the agents index so the inbox is
@@ -533,7 +591,8 @@ impl Mailbox {
         let ts_us = crate::index::writer::Clock::now_us(&crate::index::writer::SystemClock);
         self.publish_dm(&wrap).await?;
         self.record_receipt(&project_slug, agent_name, &id, kind, ts_us);
-        self.record_read_state(&project_slug, npub, &id, ts_us).await;
+        self.record_read_state(&project_slug, npub, &id, ts_us)
+            .await;
 
         Ok(ReceiptResult {
             message_id: message_id.to_string(),
@@ -570,7 +629,9 @@ impl Mailbox {
         project_slug: &str,
         message_id: &str,
     ) -> anyhow::Result<Option<(UnwrappedGift, String)>> {
-        let agents = self.list_agents(project_slug, ListAgentsOptions::default()).await?;
+        let agents = self
+            .list_agents(project_slug, ListAgentsOptions::default())
+            .await?;
         for agent in agents {
             let Ok(keys) = self.agent_keys_for(project_slug, &agent.name) else {
                 continue; // no local key for this identity — skip
@@ -674,11 +735,18 @@ impl Mailbox {
 
     /// Resolve all recipient names → npubs via the project's kind-30013
     /// profiles (G2). Unknown name fails the whole send.
+    ///
+    /// ADR-0018 (swarm mode): routing targets are canonical names
+    /// (`flywheel-<slug>-<role><seq>`), npubs, or folded legacy aliases
+    /// (`agent_name_aliases` row → canonical). Anything else fails with an
+    /// actionable error naming the grammar. Open mode keeps the legacy
+    /// any-name resolution (AM-Rust parity).
     async fn resolve_recipients(
         &self,
         args: &SendMessage,
     ) -> anyhow::Result<Vec<ResolvedRecipient>> {
         let profiles = self.project_profiles(&args.project_slug).await?;
+        let mode = self.project_identity_mode(&args.project_slug).await;
         let mut out: Vec<ResolvedRecipient> = Vec::new();
         for (names, role) in [
             (args.to.iter().collect::<Vec<_>>(), RecipientRole::To),
@@ -686,13 +754,46 @@ impl Mailbox {
             (args.bcc.iter().collect::<Vec<_>>(), RecipientRole::Bcc),
         ] {
             for name in names {
-                let npub = nident::resolve_name(&args.project_slug, profiles.iter(), name)
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "unknown recipient: {name} (register it in project {} first)",
-                            args.project_slug
-                        )
-                    })?;
+                let npub = if super::naming::is_npub(name) {
+                    // ADR-0018: an npub is always a routing address.
+                    nostr_sdk::nostr::PublicKey::from_hex(name)
+                        .map_err(|_| anyhow::anyhow!("invalid npub recipient: {name}"))?
+                } else if mode == super::naming::IdentityMode::Swarm {
+                    // ADR-0018: canonical name, or a folded legacy alias.
+                    let target: String =
+                        if super::naming::is_canonical_name(name, &args.project_slug) {
+                            name.clone()
+                        } else if let Some(folded) =
+                            self.agent_name_alias(&args.project_slug, name).await
+                        {
+                            folded
+                        } else {
+                            anyhow::bail!(
+                                "unknown recipient: {name} — project {} routes by canonical \
+                             names (flywheel-{}-<role><seq>) or npub only; legacy names are \
+                             non-routable display metadata (ADR-0018 D3)",
+                                args.project_slug,
+                                args.project_slug
+                            );
+                        };
+                    nident::resolve_name(&args.project_slug, profiles.iter(), &target).ok_or_else(
+                        || {
+                            anyhow::anyhow!(
+                                "unknown recipient: {target} (register it in project {} first)",
+                                args.project_slug
+                            )
+                        },
+                    )?
+                } else {
+                    nident::resolve_name(&args.project_slug, profiles.iter(), name).ok_or_else(
+                        || {
+                            anyhow::anyhow!(
+                                "unknown recipient: {name} (register it in project {} first)",
+                                args.project_slug
+                            )
+                        },
+                    )?
+                };
                 out.push(ResolvedRecipient {
                     name: name.clone(),
                     npub,
@@ -1011,6 +1112,37 @@ mod tests {
         (mailbox, db_path, data_dir)
     }
 
+    /// ADR-0018: mailbox with a migrated index pool (mode + alias tables).
+    async fn test_mailbox_with_pool(
+        tag: &str,
+    ) -> (
+        Mailbox,
+        sqlx::SqlitePool,
+        std::path::PathBuf,
+        std::path::PathBuf,
+    ) {
+        let db_path = std::env::temp_dir().join(format!(
+            "toron-msg-pool-{tag}-{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+        let pool = schema::connect(db_path.to_str().unwrap())
+            .await
+            .expect("connect");
+        schema::migrate(&pool).await.expect("migrate");
+        let bus = InProcessBus::open(pool.clone(), InProcessBusConfig::default())
+            .await
+            .expect("bus");
+        let data_dir = std::env::temp_dir().join(format!(
+            "toron-msg-pool-data-{tag}-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let operator = crate::keys::generate();
+        let mailbox = Mailbox::new(Arc::new(bus), data_dir.clone(), Some(operator))
+            .with_agent_passphrase(PASSPHRASE)
+            .with_index_pool(pool.clone());
+        (mailbox, pool, db_path, data_dir)
+    }
+
     fn profile(name: &str) -> AgentProfile {
         AgentProfile {
             name: name.into(),
@@ -1066,8 +1198,20 @@ mod tests {
 
         // Two identical assigns (same sender+subject+body) 10s apart → one
         // row, the LATEST copy, marked duplicate_of = first id.
-        let first = mk("first", "PiAlpha", "assign", "build it", 1_700_000_000_000_000);
-        let dup = mk("dup", "PiAlpha", "assign", "build it", 1_700_000_000_010_000);
+        let first = mk(
+            "first",
+            "PiAlpha",
+            "assign",
+            "build it",
+            1_700_000_000_000_000,
+        );
+        let dup = mk(
+            "dup",
+            "PiAlpha",
+            "assign",
+            "build it",
+            1_700_000_000_010_000,
+        );
         let collapsed = collapse_duplicates(vec![first.clone(), dup]);
         assert_eq!(collapsed.len(), 1, "duplicates collapse to one row");
         assert_eq!(collapsed[0].id, "dup", "latest copy survives");
@@ -1078,15 +1222,33 @@ mod tests {
         );
 
         // Outside the window (2h later) → NOT collapsed.
-        let old = mk("old", "PiAlpha", "assign", "build it", 1_700_000_000_000_000);
-        let late = mk("late", "PiAlpha", "assign", "build it", 1_700_007_200_000_000);
+        let old = mk(
+            "old",
+            "PiAlpha",
+            "assign",
+            "build it",
+            1_700_000_000_000_000,
+        );
+        let late = mk(
+            "late",
+            "PiAlpha",
+            "assign",
+            "build it",
+            1_700_007_200_000_000,
+        );
         let kept = collapse_duplicates(vec![old, late]);
         assert_eq!(kept.len(), 2, "outside window stays separate");
         assert!(kept.iter().all(|m| m.duplicate_of.is_none()));
 
         // Different body → no collapse.
         let a = mk("a", "PiAlpha", "assign", "build it", 1_700_000_000_000_000);
-        let b = mk("b", "PiAlpha", "assign", "build other", 1_700_000_000_010_000);
+        let b = mk(
+            "b",
+            "PiAlpha",
+            "assign",
+            "build other",
+            1_700_000_000_010_000,
+        );
         let kept2 = collapse_duplicates(vec![a, b]);
         assert_eq!(kept2.len(), 2, "different body is not a duplicate");
 
@@ -1113,9 +1275,18 @@ mod tests {
             ..Default::default()
         };
 
-        mailbox.send_message(&send("build it")).await.expect("send 1");
-        mailbox.send_message(&send("build it")).await.expect("send 2 (dup)");
-        mailbox.send_message(&send("build other")).await.expect("send 3 (distinct)");
+        mailbox
+            .send_message(&send("build it"))
+            .await
+            .expect("send 1");
+        mailbox
+            .send_message(&send("build it"))
+            .await
+            .expect("send 2 (dup)");
+        mailbox
+            .send_message(&send("build other"))
+            .await
+            .expect("send 3 (distinct)");
 
         let inbox = mailbox
             .fetch_inbox(&FetchInbox {
@@ -1476,7 +1647,11 @@ mod tests {
         let msg2_id = wraps_to(&mailbox, &gc_npub, 4)
             .await
             .iter()
-            .find_map(|w| gift_wrap::unwrap(&gc, w).ok().map(|g| g.rumor.clone().id().to_hex()))
+            .find_map(|w| {
+                gift_wrap::unwrap(&gc, w)
+                    .ok()
+                    .map(|g| g.rumor.clone().id().to_hex())
+            })
             .expect("msg2 id");
 
         // BlueLake acks msg2 — its own keys cannot unwrap it (addressed to
@@ -1785,6 +1960,157 @@ mod tests {
         assert!(
             unread.iter().all(|m| m.read_ts_us.is_none()),
             "no pool → read_ts_us unknown (None)"
+        );
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    // --- ADR-0018: swarm-mode send-path hardening ---
+
+    fn send_args(project: &str, sender: &str, to: &[&str]) -> SendMessage {
+        SendMessage {
+            project_slug: project.into(),
+            sender_name: sender.into(),
+            to: to.iter().map(|s| s.to_string()).collect(),
+            subject: "ADR-0018".into(),
+            body_md: "canonical routing".into(),
+            cc: vec![],
+            bcc: vec![],
+            importance: None,
+            ack_required: false,
+            thread_id: None,
+            sender_token: None,
+            overseer: false,
+            extra_tags: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn swarm_mode_send_accepts_canonical_and_npub_rejects_legacy() {
+        let (mailbox, _pool, db_path, data_dir) = test_mailbox_with_pool("swarm-send").await;
+        mailbox.ensure_project("toron").await.expect("ensure");
+        mailbox
+            .register_agent("toron", &profile("flywheel-toron-oc"))
+            .await
+            .expect("sender canonical");
+        let (_recv_keys, recv_npub) = register(&mailbox, "toron", "flywheel-toron-oc2").await;
+        mailbox
+            .register_agent("toron", &profile("lane-4-catalog"))
+            .await
+            .expect("legacy registered pre-swarm");
+        mailbox.set_identity_mode("toron", "swarm").await;
+
+        // Canonical recipient delivers.
+        mailbox
+            .send_message(&send_args(
+                "toron",
+                "flywheel-toron-oc",
+                &["flywheel-toron-oc2"],
+            ))
+            .await
+            .expect("canonical recipient");
+        assert!(
+            !wraps_to(&mailbox, &recv_npub, 2).await.is_empty(),
+            "canonical send delivered"
+        );
+
+        // npub recipient delivers (npub is always a routing address).
+        mailbox
+            .send_message(&send_args(
+                "toron",
+                "flywheel-toron-oc",
+                &[&recv_npub.to_hex()],
+            ))
+            .await
+            .expect("npub recipient");
+        assert_eq!(
+            wraps_to(&mailbox, &recv_npub, 4).await.len(),
+            2,
+            "npub send delivered"
+        );
+
+        // Legacy name fails the whole send with the grammar error.
+        let err = mailbox
+            .send_message(&send_args(
+                "toron",
+                "flywheel-toron-oc",
+                &["lane-4-catalog"],
+            ))
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("flywheel-toron-<role><seq>"),
+            "error names the grammar: {msg}"
+        );
+
+        // A mixed send (canonical + legacy) also fails — no partial delivery.
+        let err = mailbox
+            .send_message(&send_args(
+                "toron",
+                "flywheel-toron-oc",
+                &["flywheel-toron-oc2", "lane-4-catalog"],
+            ))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("non-routable"),
+            "mixed send fails: {err}"
+        );
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn swarm_mode_send_resolves_folded_alias_recipient() {
+        let (mailbox, _pool, db_path, data_dir) = test_mailbox_with_pool("swarm-send-alias").await;
+        mailbox.ensure_project("toron").await.expect("ensure");
+        mailbox
+            .register_agent("toron", &profile("flywheel-toron-oc"))
+            .await
+            .expect("sender");
+        let (_recv_keys, recv_npub) = register(&mailbox, "toron", "flywheel-toron-oc2").await;
+        mailbox
+            .register_agent("toron", &profile("DustySparrow"))
+            .await
+            .expect("legacy pre-swarm");
+        mailbox.set_identity_mode("toron", "swarm").await;
+        mailbox
+            .fold_agent_name_alias("toron", "DustySparrow", "flywheel-toron-oc2")
+            .await;
+
+        // Send to the folded alias → delivered to the canonical npub.
+        mailbox
+            .send_message(&send_args("toron", "flywheel-toron-oc", &["DustySparrow"]))
+            .await
+            .expect("folded alias recipient");
+        let wraps = wraps_to(&mailbox, &recv_npub, 2).await;
+        assert_eq!(wraps.len(), 1, "alias folds to canonical npub");
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn open_mode_send_keeps_legacy_recipient_routing() {
+        let (mailbox, _pool, db_path, data_dir) = test_mailbox_with_pool("open-send").await;
+        mailbox.ensure_project("demo").await.expect("ensure");
+        mailbox
+            .register_agent("demo", &profile("GreenCastle"))
+            .await
+            .expect("sender");
+        let (_recv_keys, recv_npub) = register(&mailbox, "demo", "BlueLake").await;
+
+        // Open mode (no identity_mode row): legacy names still route.
+        mailbox
+            .send_message(&send_args("demo", "GreenCastle", &["BlueLake"]))
+            .await
+            .expect("legacy name routes in open mode");
+        assert!(
+            !wraps_to(&mailbox, &recv_npub, 1).await.is_empty(),
+            "open mode send delivered"
         );
 
         let _ = std::fs::remove_file(&db_path);
