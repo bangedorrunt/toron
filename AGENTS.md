@@ -114,3 +114,7 @@ Release profile: `strip = "none"` (macOS arm64 LINKEDIT / sqlx_macros).
 - Root `tests/` and `examples/agent_ping_pong.rs` are ADR-0001 leftovers —
   not workspace members.
 - Sibling orchestrator: `../flywheel` (herdr). Map: `../flywheel/AGENTS.md`.
+- herdr backend client surface (pane primitives, agent_read source semantics,
+  agent_not_idle, prompt gates): `~/.agents/skills/toron/SKILL.md` Backend
+  section; harness lifecycle matrix (env injection, boot prime, integration
+  preflight, alt-screen ladder): `~/.agents/skills/flywheel/SKILL.md` §7.
