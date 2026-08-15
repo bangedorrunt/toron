@@ -22,24 +22,26 @@ use nostr_sdk::nostr::{Event, Keys};
 
 use crate::bus::{Bus, BusError, Filter, SubscriptionEvent};
 
+pub mod aliases;
 pub mod build_slots;
 pub mod contacts;
 pub mod error;
 pub mod guard;
-pub mod ids;
 pub mod identity;
+pub mod ids;
 pub mod infra;
 pub mod macros;
 pub mod matrix;
 pub mod messaging;
 pub mod metrics;
+pub mod naming;
 pub mod product;
 pub mod reservations;
 pub mod search;
 pub mod surface;
 pub mod unwrap;
-pub mod aliases;
 
+pub use crate::nostr::identity::AgentProfile;
 pub use build_slots::AcquireBuildSlotResult;
 pub use contacts::{BusPolicySource, ContactLink, LinkStatus, RequestContact, RespondContact};
 pub use guard::{
@@ -47,7 +49,6 @@ pub use guard::{
     install_precommit_guard, staged_paths_in, uninstall_precommit_guard,
 };
 pub use identity::{ListAgentsOptions, RegisteredAgent, WhoIs};
-pub use crate::nostr::identity::AgentProfile;
 pub use infra::{HealthComponent, HealthReport, ProjectState};
 pub use macros::{
     ContactHandshakeResult, PrepareThreadResult, ReservationCycleResult, StartSessionResult,
@@ -257,7 +258,9 @@ impl Mailbox {
         let mut current: Option<(String, UnwrapPipeline)> = None;
         let mut seen = 0usize;
         while let Some(ev) = sub.next().await {
-            let SubscriptionEvent::Event(event) = ev else { continue };
+            let SubscriptionEvent::Event(event) = ev else {
+                continue;
+            };
             seen += 1;
             if event.kind != nostr_sdk::nostr::Kind::GiftWrap {
                 continue;
@@ -356,33 +359,26 @@ impl Mailbox {
         if keys.is_empty() {
             return None;
         }
-        let npubs: Vec<nostr_sdk::nostr::PublicKey> =
-            keys.iter().map(|k| k.public_key()).collect();
+        let npubs: Vec<nostr_sdk::nostr::PublicKey> = keys.iter().map(|k| k.public_key()).collect();
         let refs: Vec<&nostr_sdk::nostr::PublicKey> = npubs.iter().collect();
         let source = Arc::new(BusPolicySource::load_many(self, &refs).await);
         // Recipient-npub → verbatim project slug, from the registration-time
         // `agents` index (gift wraps hide the project; the sink cannot read
         // it off the wrap). Last-write-wins: one key per project in practice.
-        let npub_to_project: std::collections::HashMap<String, String> = sqlx::query_as(
-            "SELECT project_slug, pubkey FROM agents",
-        )
-        .fetch_all(pool)
-        .await
-        .map(|rows| {
-            rows.into_iter()
-                .map(|(slug, npub)| (npub, slug))
-                .collect()
-        })
-        .unwrap_or_default();
+        let npub_to_project: std::collections::HashMap<String, String> =
+            sqlx::query_as("SELECT project_slug, pubkey FROM agents")
+                .fetch_all(pool)
+                .await
+                .map(|rows| rows.into_iter().map(|(slug, npub)| (npub, slug)).collect())
+                .unwrap_or_default();
         // Sender-npub → display name (AM-parity sender naming on the
         // projected `messages.sender` column; search + summarize read it).
-        let npub_to_name: std::collections::HashMap<String, String> = sqlx::query_as(
-            "SELECT pubkey, name FROM agents",
-        )
-        .fetch_all(pool)
-        .await
-        .map(|rows| rows.into_iter().collect())
-        .unwrap_or_default();
+        let npub_to_name: std::collections::HashMap<String, String> =
+            sqlx::query_as("SELECT pubkey, name FROM agents")
+                .fetch_all(pool)
+                .await
+                .map(|rows| rows.into_iter().collect())
+                .unwrap_or_default();
         let sqlite: Arc<dyn ProjectionSink> = Arc::new(
             SqliteProjectionSink::new(pool.clone())
                 .with_projects(npub_to_project.clone())
@@ -466,11 +462,39 @@ mod tests {
         out
     }
 
-    async fn loop_mailbox(tag: &str) -> (Mailbox, std::path::PathBuf, std::path::PathBuf) {        let db = std::env::temp_dir().join(format!(
+    /// Deterministic projection wait: poll the probe until it passes or the
+    /// 90s deadline elapses. The unwrap loop's argon2 (log_n=16) key scan is
+    /// CPU/memory-hard and can exceed ANY fixed sleep under parallel test
+    /// load (bd-projection-flake-gyox) — never fixed-sleep and hope. The
+    /// `messages` count is the completion signal: the sink chain writes the
+    /// Git archive BEFORE the SQLite row (DualProjectionSink, unwrap.rs), so
+    /// a visible row implies the canonical archive write already landed.
+    async fn wait_projected<F, Fut>(mut probe: F) -> bool
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = bool>,
+    {
+        let deadline = std::time::Duration::from_secs(90);
+        let start = std::time::Instant::now();
+        loop {
+            if probe().await {
+                return true;
+            }
+            if start.elapsed() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+    }
+
+    async fn loop_mailbox(tag: &str) -> (Mailbox, std::path::PathBuf, std::path::PathBuf) {
+        let db = std::env::temp_dir().join(format!(
             "toron-unwrap-loop-{tag}-{}.sqlite",
             uuid::Uuid::new_v4()
         ));
-        let pool = schema::connect(db.to_str().unwrap()).await.expect("connect");
+        let pool = schema::connect(db.to_str().unwrap())
+            .await
+            .expect("connect");
         schema::migrate(&pool).await.expect("migrate");
         let bus = InProcessBus::open(pool.clone(), InProcessBusConfig::default())
             .await
@@ -479,9 +503,13 @@ mod tests {
             "toron-unwrap-loop-data-{tag}-{}",
             uuid::Uuid::new_v4()
         ));
-        let mailbox = Mailbox::new(Arc::new(bus), data_dir.clone(), Some(crate::keys::generate()))
-            .with_agent_passphrase("loop-test-pass")
-            .with_index_pool(pool);
+        let mailbox = Mailbox::new(
+            Arc::new(bus),
+            data_dir.clone(),
+            Some(crate::keys::generate()),
+        )
+        .with_agent_passphrase("loop-test-pass")
+        .with_index_pool(pool);
         (mailbox, db, data_dir)
     }
 
@@ -489,13 +517,16 @@ mod tests {
     async fn unwrap_loop_projects_inbound_gift_wrap() {
         let (mailbox, db, data_dir) = loop_mailbox("project").await;
         mailbox
-            .register_agent("demo", &AgentProfile {
-                name: "RoseDune".into(),
-                program: Some("opencode".into()),
-                model: None,
-                persona: None,
-                task_description: None,
-            })
+            .register_agent(
+                "demo",
+                &AgentProfile {
+                    name: "RoseDune".into(),
+                    program: Some("opencode".into()),
+                    model: None,
+                    persona: None,
+                    task_description: None,
+                },
+            )
             .await
             .expect("register");
         let sender = Keys::generate();
@@ -509,7 +540,9 @@ mod tests {
             sender.public_key(),
             nostr_sdk::nostr::Timestamp::now(),
             nostr_sdk::nostr::Kind::PrivateDirectMessage,
-            vec![nostr_sdk::nostr::Tag::parse(["p", &agent_keys.public_key().to_hex()]).expect("p")],
+            vec![
+                nostr_sdk::nostr::Tag::parse(["p", &agent_keys.public_key().to_hex()]).expect("p"),
+            ],
             "hello via daemon loop",
         );
         let wrap = crate::nostr::gift_wrap::gift_wrap(&sender, &agent_keys.public_key(), rumor)
@@ -521,15 +554,21 @@ mod tests {
 
         // Spawn the daemon inbound loop and let it discover the agent key.
         let handle = mailbox.spawn_unwrap_loop();
-        tokio::time::sleep(std::time::Duration::from_secs(8)).await;
-
-        // The wrap was projected into the messages table via the loop's sink.
+        // No fixed sleep: the loop's argon2 key scan is load-sensitive
+        // (bd-projection-flake-gyox). Poll to completion instead.
         let pool = mailbox.index_pool().unwrap();
-        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages")
-            .fetch_one(pool)
-            .await
-            .expect("count");
-        assert_eq!(count, 1, "inbound wrap must be projected by the unwrap loop");
+        let projected = wait_projected(|| async {
+            let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages")
+                .fetch_one(pool)
+                .await
+                .expect("count");
+            count == 1
+        })
+        .await;
+        assert!(
+            projected,
+            "inbound wrap must be projected by the unwrap loop (90s poll deadline)"
+        );
 
         handle.abort();
         let _ = std::fs::remove_dir_all(&data_dir);
@@ -548,13 +587,16 @@ mod tests {
     async fn unwrap_loop_projects_mail_to_both_sqlite_and_git_archive() {
         let (mailbox, db, data_dir) = loop_mailbox("both-stores").await;
         mailbox
-            .register_agent("demo", &AgentProfile {
-                name: "RoseDune".into(),
-                program: Some("opencode".into()),
-                model: None,
-                persona: None,
-                task_description: None,
-            })
+            .register_agent(
+                "demo",
+                &AgentProfile {
+                    name: "RoseDune".into(),
+                    program: Some("opencode".into()),
+                    model: None,
+                    persona: None,
+                    task_description: None,
+                },
+            )
             .await
             .expect("register");
         let sender = Keys::generate();
@@ -565,7 +607,9 @@ mod tests {
             sender.public_key(),
             nostr_sdk::nostr::Timestamp::now(),
             nostr_sdk::nostr::Kind::PrivateDirectMessage,
-            vec![nostr_sdk::nostr::Tag::parse(["p", &agent_keys.public_key().to_hex()]).expect("p")],
+            vec![
+                nostr_sdk::nostr::Tag::parse(["p", &agent_keys.public_key().to_hex()]).expect("p"),
+            ],
             "mail must reach the git archive too",
         );
         let wrap = crate::nostr::gift_wrap::gift_wrap(&sender, &agent_keys.public_key(), rumor)
@@ -574,15 +618,22 @@ mod tests {
         mailbox.bus.publish(wrap).await.expect("publish");
 
         let handle = mailbox.spawn_unwrap_loop();
-        tokio::time::sleep(std::time::Duration::from_secs(8)).await;
-
-        // 1. SQLite index has it (existing behaviour).
+        // Poll to completion — the argon2 key scan is load-sensitive
+        // (bd-projection-flake-gyox); the Git leg writes before the SQLite
+        // leg in the dual sink, so a visible row implies archive completion.
         let pool = mailbox.index_pool().unwrap();
-        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages")
-            .fetch_one(pool)
-            .await
-            .expect("count");
-        assert_eq!(count, 1, "mail must be projected into the SQLite index");
+        let projected = wait_projected(|| async {
+            let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages")
+                .fetch_one(pool)
+                .await
+                .expect("count");
+            count == 1
+        })
+        .await;
+        assert!(
+            projected,
+            "mail must be projected into the SQLite index (90s poll deadline)"
+        );
 
         // 2. The per-project Git archive holds the canonical unwrapped mail:
         //    {data_dir}/demo/messages/{YYYY}/{MM}/{rumor_id}.json. This is the
@@ -615,13 +666,16 @@ mod tests {
         let (mailbox, db, data_dir) = loop_mailbox("project").await;
         let slug = format!("/tmp/toron-abs-slug-{}", uuid::Uuid::new_v4());
         mailbox
-            .register_agent(&slug, &AgentProfile {
-                name: "RoseDune".into(),
-                program: Some("opencode".into()),
-                model: None,
-                persona: None,
-                task_description: None,
-            })
+            .register_agent(
+                &slug,
+                &AgentProfile {
+                    name: "RoseDune".into(),
+                    program: Some("opencode".into()),
+                    model: None,
+                    persona: None,
+                    task_description: None,
+                },
+            )
             .await
             .expect("register");
         let sender = Keys::generate();
@@ -632,7 +686,9 @@ mod tests {
             sender.public_key(),
             nostr_sdk::nostr::Timestamp::now(),
             nostr_sdk::nostr::Kind::PrivateDirectMessage,
-            vec![nostr_sdk::nostr::Tag::parse(["p", &agent_keys.public_key().to_hex()]).expect("p")],
+            vec![
+                nostr_sdk::nostr::Tag::parse(["p", &agent_keys.public_key().to_hex()]).expect("p"),
+            ],
             "hello via daemon loop (absolute slug)",
         );
         let wrap = crate::nostr::gift_wrap::gift_wrap(&sender, &agent_keys.public_key(), rumor)
@@ -642,26 +698,30 @@ mod tests {
         assert!(stored.stored, "wrap must be stored on the bus");
 
         let handle = mailbox.spawn_unwrap_loop();
-        tokio::time::sleep(std::time::Duration::from_secs(8)).await;
-
+        // Poll to completion — load-sensitive argon2 scan
+        // (bd-projection-flake-gyox), no fixed sleep.
         let pool = mailbox.index_pool().unwrap();
-        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages")
-            .fetch_one(pool)
-            .await
-            .expect("count");
-        assert_eq!(
-            count, 1,
-            "inbound wrap under an absolute project slug must be projected"
+        let projected = wait_projected(|| async {
+            let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages")
+                .fetch_one(pool)
+                .await
+                .expect("count");
+            count == 1
+        })
+        .await;
+        assert!(
+            projected,
+            "inbound wrap under an absolute project slug must be projected \
+             (90s poll deadline)"
         );
         // ADR-0017: the projected row carries the CANONICAL slug — the
         // absolute path form resolves to its basename at registration, so
         // search (which canonicalizes the client's key the same way) matches
         // exactly what the client passes.
-        let projected_slug: String =
-            sqlx::query_scalar("SELECT project_slug FROM messages")
-                .fetch_one(pool)
-                .await
-                .expect("project_slug");
+        let projected_slug: String = sqlx::query_scalar("SELECT project_slug FROM messages")
+            .fetch_one(pool)
+            .await
+            .expect("project_slug");
         let canonical = std::path::Path::new(&slug)
             .file_name()
             .and_then(|f| f.to_str())
@@ -732,9 +792,17 @@ mod tests {
 
         // A key whose CONTENT changed is re-KDF'd exactly once.
         let p0 = agent_dir.join("agent-0").join("key.ncryptsec");
-        crate::keys::write_encrypted_key(&p0, &crate::keys::generate(), pass, crate::keys::TEST_LOG_N)
-            .expect("rewrite key");
-        let _changed = mailbox.build_unwrap_pipeline().await.expect("changed build");
+        crate::keys::write_encrypted_key(
+            &p0,
+            &crate::keys::generate(),
+            pass,
+            crate::keys::TEST_LOG_N,
+        )
+        .expect("rewrite key");
+        let _changed = mailbox
+            .build_unwrap_pipeline()
+            .await
+            .expect("changed build");
         assert_eq!(
             mailbox.kdf_load_count(),
             52,
