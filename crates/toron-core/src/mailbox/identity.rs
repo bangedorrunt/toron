@@ -72,13 +72,18 @@ impl Mailbox {
     /// fresh key while the on-disk ncryptsec (used by whois/read paths) still
     /// holds the OLD key, and whois npub would disagree with list_agents npub
     /// (real-e2e parity bug bd-XXX). Use `register_agent` to upsert.
+    ///
+    /// ADR-0018 (swarm mode): non-canonical names are rejected — the grammar
+    /// `flywheel-<slug>-<role><seq>` is the only identity a swarm project can
+    /// create.
     pub async fn create_agent_identity(
         &self,
         project_slug: &str,
         profile: &AgentProfile,
     ) -> anyhow::Result<RegisteredAgent> {
         let project_slug = &self.canonical_project(project_slug).await; // ADR-0017
-        let key_path = self.agent_key_path(&project_slug, &profile.name);
+        self.check_swarm_name(project_slug, &profile.name).await?;
+        let key_path = self.agent_key_path(project_slug, &profile.name);
         if key_path.exists() {
             anyhow::bail!(
                 "create_agent_identity refused: an identity for '{name}' already exists in project '{project_slug}' (use register_agent to upsert)",
@@ -99,20 +104,24 @@ impl Mailbox {
     /// ADR-0017: the project key is canonicalized first, so registering via
     /// any spelling of the project (short slug or path form) upserts the ONE
     /// canonical row — no duplicate agent rows, one key file.
+    ///
+    /// ADR-0018 (swarm mode): non-canonical names are rejected — legacy
+    /// display names cannot be (re)created in a swarm project.
     pub async fn register_agent(
         &self,
         project_slug: &str,
         profile: &AgentProfile,
     ) -> anyhow::Result<RegisteredAgent> {
         let project_slug = &self.canonical_project(project_slug).await; // ADR-0017
+        self.check_swarm_name(project_slug, &profile.name).await?;
         // Existing local key? (ncryptsec at agents/{name}/key.ncryptsec)
         // ADR-0017 migration: a pre-canonicalization key under an alternate
         // (path-slug) root is adopted — re-registering under the canonical
         // slug REUSES the legacy identity instead of minting a second one.
-        let key_path = self.agent_key_path(&project_slug, &profile.name);
+        let key_path = self.agent_key_path(project_slug, &profile.name);
         let existing = self
             .load_agent_key(&key_path)
-            .or_else(|| self.alt_agent_key(&project_slug, &profile.name));
+            .or_else(|| self.alt_agent_key(project_slug, &profile.name));
         let created = existing.is_none();
         let result =
             ident::register_agent(project_slug, profile, existing.as_ref(), Timestamp::now())?;
@@ -121,6 +130,58 @@ impl Mailbox {
             .await?;
         agent.created = created;
         Ok(agent)
+    }
+
+    /// ADR-0018: swarm-mode gate — a non-canonical agent name is rejected
+    /// with an actionable error naming the grammar. Open mode passes through
+    /// (legacy AM-Rust parity).
+    async fn check_swarm_name(&self, project_slug: &str, name: &str) -> anyhow::Result<()> {
+        let mode = self.project_identity_mode(project_slug).await;
+        if mode == crate::mailbox::naming::IdentityMode::Swarm
+            && !super::naming::is_canonical_name(name, project_slug)
+        {
+            anyhow::bail!(
+                "agent name {name} is not canonical for project {project_slug} — swarm \
+                 projects use flywheel-{project_slug}-<role><seq> (ADR-0018 D3)"
+            );
+        }
+        Ok(())
+    }
+
+    /// ADR-0018 D4: record a legacy-name fold (alias → canonical). Idempotent
+    /// append-only — the row is inserted once and never deleted, so the
+    /// relation is always reversible. Best-effort: no index pool → the fold
+    /// cannot be persisted and routing degrades to strict swarm enforcement.
+    pub async fn fold_agent_name_alias(&self, project_slug: &str, alias: &str, canonical: &str) {
+        let Some(pool) = self.index_pool.as_ref() else {
+            return;
+        };
+        let now_us = crate::index::writer::Clock::now_us(&crate::index::writer::SystemClock);
+        let _ = sqlx::query(
+            "INSERT INTO agent_name_aliases (project_slug, alias, canonical, created_ts_us) \
+             VALUES (?1, ?2, ?3, ?4) ON CONFLICT (project_slug, alias) DO NOTHING",
+        )
+        .bind(project_slug)
+        .bind(alias)
+        .bind(canonical)
+        .bind(now_us)
+        .execute(pool)
+        .await;
+    }
+
+    /// ADR-0018 D4: the canonical name a legacy alias folds to (if any).
+    /// `None` when the alias is unknown or no pool is attached.
+    pub async fn agent_name_alias(&self, project_slug: &str, alias: &str) -> Option<String> {
+        let pool = self.index_pool.as_ref()?;
+        sqlx::query_scalar(
+            "SELECT canonical FROM agent_name_aliases WHERE project_slug = ?1 AND alias = ?2",
+        )
+        .bind(project_slug)
+        .bind(alias)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten()
     }
 
     /// Persist the key (ncryptsec 0600) + publish the signed profile event.
@@ -135,7 +196,7 @@ impl Mailbox {
         result: IdentityResult,
     ) -> anyhow::Result<RegisteredAgent> {
         let project_slug = &self.canonical_project(project_slug).await; // ADR-0017
-        let key_path = self.agent_key_path(&project_slug, &profile.name);
+        let key_path = self.agent_key_path(project_slug, &profile.name);
         if !key_path.exists() {
             crate::keys::write_encrypted_key(
                 &key_path,
@@ -197,7 +258,8 @@ impl Mailbox {
     /// The `alt_agent_key` walk below remains as the legacy read fallback
     /// for pre-ADR-0017 roots.
     pub(crate) fn agent_key_path(&self, project_slug: &str, name: &str) -> PathBuf {
-        let slug = super::aliases::short_slug(project_slug).unwrap_or_else(|| project_slug.to_string());
+        let slug =
+            super::aliases::short_slug(project_slug).unwrap_or_else(|| project_slug.to_string());
         self.data_dir
             .join(slug)
             .join("agents")
@@ -350,28 +412,97 @@ impl Mailbox {
     /// `d` tags are slug-scoped (`<slug>:<name>`), so a legacy profile
     /// registered under a path-form slug only matches when resolved under
     /// that spelling. Every spelling is tried.
+    ///
+    /// ADR-0018 (swarm mode): the routing target is a canonical name
+    /// (`flywheel-<slug>-<role><seq>`), an npub, or a folded legacy alias
+    /// (`agent_name_aliases` row → canonical). Anything else fails with an
+    /// actionable error naming the grammar. Open mode keeps the legacy
+    /// any-name resolution (AM-Rust parity).
     pub async fn whois(&self, project_slug: &str, name: &str) -> anyhow::Result<WhoIs> {
-        let set = self.project_read_set(project_slug).await;
+        let canonical = self.canonical_project(project_slug).await;
+        let set = self.project_read_set(&canonical).await;
         let mut npub: Option<nostr_sdk::nostr::PublicKey> = None;
         let mut profiles: Vec<nostr_sdk::nostr::Event> = Vec::new();
+
+        // ADR-0018: npub input resolves by pubkey (the read-side twin of npub
+        // routing). Works in both modes — an npub is always a routing address.
+        if super::naming::is_npub(name) {
+            for slug in &set {
+                let filter = kind_project_filter(toron_kind(AGENT_PROFILE), slug);
+                let events = collect_replay(self.bus.as_ref(), filter).await?;
+                profiles.extend(events);
+            }
+            let pubkey = nostr_sdk::nostr::PublicKey::from_hex(name)
+                .map_err(|_| anyhow::anyhow!("invalid npub: {name}"))?;
+            npub = profiles
+                .iter()
+                .find(|e| e.pubkey == pubkey)
+                .map(|e| e.pubkey);
+            let Some(npub) = npub else {
+                anyhow::bail!("no registered identity for npub {name}");
+            };
+            let name = profiles
+                .iter()
+                .filter(|e| e.pubkey == npub && e.kind.as_u16() == AGENT_PROFILE)
+                .max_by_key(|e| e.created_at.as_secs())
+                .and_then(|e| {
+                    e.tags.iter().find_map(|t| {
+                        (t.kind() == nostr_sdk::nostr::TagKind::d())
+                            .then(|| t.content())
+                            .flatten()
+                    })
+                })
+                .and_then(ident::profile_name_from_d_tag)
+                .unwrap_or(name);
+            return self.whois_build(name.to_string(), npub, profiles).await;
+        }
+
+        // ADR-0018: swarm mode resolves canonical names or folded aliases
+        // ONLY; display names are non-routable profile metadata.
+        let mode = self.project_identity_mode(&canonical).await;
+        let target: String = if mode == crate::mailbox::naming::IdentityMode::Swarm {
+            if super::naming::is_canonical_name(name, &canonical) {
+                name.to_string()
+            } else if let Some(folded) = self.agent_name_alias(&canonical, name).await {
+                folded
+            } else {
+                anyhow::bail!(
+                    "unknown agent name: {name} — project {canonical} routes by canonical \
+                     names (flywheel-{canonical}-<role><seq>) or npub only; legacy names are \
+                     non-routable display metadata (ADR-0018 D3)"
+                );
+            }
+        } else {
+            name.to_string()
+        };
+
         for slug in &set {
             let filter = kind_project_filter(toron_kind(AGENT_PROFILE), slug);
             let events = collect_replay(self.bus.as_ref(), filter).await?;
             if npub.is_none() {
-                npub = ident::resolve_name(slug, events.iter(), name);
+                npub = ident::resolve_name(slug, events.iter(), &target);
             }
             profiles.extend(events);
         }
-        let npub = npub
-            .ok_or_else(|| anyhow::anyhow!("unknown agent name: {name} (register first)"))?;
+        let npub =
+            npub.ok_or_else(|| anyhow::anyhow!("unknown agent name: {target} (register first)"))?;
+        self.whois_build(target, npub, profiles).await
+    }
 
+    /// Shared tail of `whois`: profile fields + last-active provenance.
+    async fn whois_build(
+        &self,
+        name: String,
+        npub: nostr_sdk::nostr::PublicKey,
+        profiles: Vec<nostr_sdk::nostr::Event>,
+    ) -> anyhow::Result<WhoIs> {
         // Profile fields + last-active provenance (latest signed profile event).
         let profile_ev = profiles
             .iter()
             .filter(|e| e.pubkey == npub && e.kind.as_u16() == AGENT_PROFILE)
             .max_by_key(|e| e.created_at.as_secs())
             .ok_or_else(|| anyhow::anyhow!("profile event missing for {name}"))?;
-        let profile = ident::parse_profile(profile_ev).unwrap_or_else(|| AgentProfile::new(name));
+        let profile = ident::parse_profile(profile_ev).unwrap_or_else(|| AgentProfile::new(&name));
         Ok(WhoIs {
             name: name.to_string(),
             npub: npub.to_hex(),
@@ -538,6 +669,237 @@ mod tests {
             task_description: Some("lane test agent".into()),
             persona: None,
         }
+    }
+
+    /// ADR-0018: a mailbox with an index pool attached (mode persistence
+    /// needs the pool — same posture as `message_reads`).
+    async fn test_mailbox_with_pool(
+        tag: &str,
+    ) -> (
+        Mailbox,
+        sqlx::SqlitePool,
+        std::path::PathBuf,
+        std::path::PathBuf,
+    ) {
+        let db_path = std::env::temp_dir().join(format!(
+            "toron-ident-pool-{tag}-{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+        let pool = schema::connect(db_path.to_str().unwrap())
+            .await
+            .expect("connect");
+        schema::migrate(&pool).await.expect("migrate");
+        let bus = InProcessBus::open(pool.clone(), InProcessBusConfig::default())
+            .await
+            .expect("bus");
+        let data_dir = std::env::temp_dir().join(format!(
+            "toron-ident-pool-data-{tag}-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let operator = crate::keys::generate();
+        let mailbox = Mailbox::new(Arc::new(bus), data_dir.clone(), Some(operator))
+            .with_agent_passphrase(PASSPHRASE)
+            .with_index_pool(pool.clone());
+        (mailbox, pool, db_path, data_dir)
+    }
+
+    // --- ADR-0018: swarm-mode whois + registration hardening ---
+
+    #[tokio::test]
+    async fn swarm_mode_whois_rejects_non_canonical_names() {
+        let (mailbox, _pool, db_path, data_dir) = test_mailbox_with_pool("swarm-whois").await;
+        // Pre-ADR-0018 state: the legacy identity exists BEFORE the project
+        // flips to swarm (the reconciliation scenario — nothing is deleted).
+        mailbox.ensure_project("toron").await.expect("ensure");
+        mailbox
+            .register_agent("toron", &profile("flywheel-toron-oc2"))
+            .await
+            .expect("register canonical");
+        mailbox
+            .register_agent("toron", &profile("lane-1-bootstrap"))
+            .await
+            .expect("legacy identity registered pre-swarm");
+        mailbox.set_identity_mode("toron", "swarm").await;
+
+        // Canonical name resolves.
+        let w = mailbox
+            .whois("toron", "flywheel-toron-oc2")
+            .await
+            .expect("canonical whois");
+        assert_eq!(w.name, "flywheel-toron-oc2");
+
+        // Non-canonical name fails with an actionable grammar error.
+        let err = mailbox
+            .whois("toron", "lane-1-bootstrap")
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("flywheel-toron-<role><seq>"),
+            "error names the grammar: {msg}"
+        );
+        assert!(msg.contains("non-routable"), "error names demotion: {msg}");
+
+        // npub always resolves (the read-side twin of npub routing).
+        let by_npub = mailbox.whois("toron", &w.npub).await.expect("npub whois");
+        assert_eq!(by_npub.npub, w.npub);
+
+        // list_agents still shows the legacy identity (metadata preserved).
+        let agents = mailbox
+            .list_agents("toron", Default::default())
+            .await
+            .expect("list");
+        assert!(
+            agents.iter().any(|a| a.name == "lane-1-bootstrap"),
+            "legacy identity stays listed as display metadata"
+        );
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn swarm_mode_folded_alias_resolves_through_to_canonical() {
+        let (mailbox, _pool, db_path, data_dir) = test_mailbox_with_pool("swarm-alias").await;
+        // Reconciliation order: legacy identity first (open), then swarm.
+        mailbox.ensure_project("toron").await.expect("ensure");
+        let canonical = mailbox
+            .register_agent("toron", &profile("flywheel-toron-oc2"))
+            .await
+            .expect("register canonical");
+        mailbox
+            .register_agent("toron", &profile("DustySparrow"))
+            .await
+            .expect("legacy identity registered");
+        mailbox.set_identity_mode("toron", "swarm").await;
+
+        // Fold: DustySparrow → flywheel-toron-oc2 (pane binding discoverable).
+        mailbox
+            .fold_agent_name_alias("toron", "DustySparrow", "flywheel-toron-oc2")
+            .await;
+        assert_eq!(
+            mailbox
+                .agent_name_alias("toron", "DustySparrow")
+                .await
+                .as_deref(),
+            Some("flywheel-toron-oc2")
+        );
+
+        // whois on the legacy alias resolves through to the canonical npub.
+        let w = mailbox
+            .whois("toron", "DustySparrow")
+            .await
+            .expect("alias whois");
+        assert_eq!(w.npub, canonical.npub, "folded alias resolves to canonical");
+
+        // The alias is append-only: a second fold is a no-op.
+        mailbox
+            .fold_agent_name_alias("toron", "DustySparrow", "flywheel-toron-oc2")
+            .await;
+        assert_eq!(
+            mailbox
+                .agent_name_alias("toron", "DustySparrow")
+                .await
+                .as_deref(),
+            Some("flywheel-toron-oc2")
+        );
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn swarm_mode_rejects_non_canonical_registration() {
+        let (mailbox, _pool, db_path, data_dir) = test_mailbox_with_pool("swarm-register").await;
+        mailbox
+            .ensure_project_with_mode("toron", Some("swarm"))
+            .await
+            .expect("ensure swarm");
+
+        // Canonical names register fine.
+        mailbox
+            .register_agent("toron", &profile("flywheel-toron-oc"))
+            .await
+            .expect("canonical register");
+        mailbox
+            .create_agent_identity("toron", &profile("flywheel-toron-oc3"))
+            .await
+            .expect("canonical create");
+
+        // Non-canonical names are rejected with an actionable error.
+        let err = mailbox
+            .register_agent("toron", &profile("lane-4-catalog"))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("flywheel-toron-<role><seq>"),
+            "register error names the grammar: {err}"
+        );
+        let err = mailbox
+            .create_agent_identity("toron", &profile("assistant"))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("flywheel-toron-<role><seq>"),
+            "create error names the grammar: {err}"
+        );
+
+        // Open mode (default) still accepts any name — legacy parity.
+        let (open, _p, db_path2, data_dir2) = test_mailbox_with_pool("open-register").await;
+        open.register_agent("demo", &profile("BlueLake"))
+            .await
+            .expect("open mode register");
+        open.create_agent_identity("demo", &profile("RoseDune"))
+            .await
+            .expect("open mode create");
+        let _ = std::fs::remove_file(&db_path2);
+        let _ = std::fs::remove_dir_all(&data_dir2);
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn identity_mode_persists_and_defaults_open() {
+        let (mailbox, _pool, db_path, data_dir) = test_mailbox_with_pool("mode-persist").await;
+
+        // Default (no row) is open.
+        assert_eq!(
+            mailbox.project_identity_mode("toron").await,
+            crate::mailbox::naming::IdentityMode::Open
+        );
+
+        // ensure_project_with_mode persists swarm.
+        mailbox
+            .ensure_project_with_mode("toron", Some("swarm"))
+            .await
+            .expect("ensure");
+        assert_eq!(
+            mailbox.project_identity_mode("toron").await,
+            crate::mailbox::naming::IdentityMode::Swarm
+        );
+
+        // set_identity_mode upserts (open → swarm → open).
+        mailbox.set_identity_mode("toron", "open").await;
+        assert_eq!(
+            mailbox.project_identity_mode("toron").await,
+            crate::mailbox::naming::IdentityMode::Open
+        );
+        mailbox.set_identity_mode("toron", "swarm").await;
+        assert_eq!(
+            mailbox.project_identity_mode("toron").await,
+            crate::mailbox::naming::IdentityMode::Swarm
+        );
+
+        // ensure_project (no mode) does not clobber an existing mode.
+        mailbox.ensure_project("toron").await.expect("ensure plain");
+        assert_eq!(
+            mailbox.project_identity_mode("toron").await,
+            crate::mailbox::naming::IdentityMode::Swarm
+        );
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
     }
 
     #[tokio::test]

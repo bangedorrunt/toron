@@ -167,6 +167,63 @@ impl Mailbox {
     pub fn uninstall_precommit_guard(&self, repo: &Path) -> anyhow::Result<bool> {
         crate::mailbox::guard::uninstall_precommit_guard(repo)
     }
+
+    /// `ensure_project` + persist the project's routing policy (ADR-0018 D3).
+    ///
+    /// `identity_mode = "swarm"` enforces canonical-name-or-npub routing on
+    /// whois/send/register; any other value (or `None`) leaves the project
+    /// `open` (legacy any-name routing, AM-Rust parity). Mode persistence is
+    /// best-effort: with no index pool the project still ensures, and the
+    /// routing policy degrades to `open` (same posture as `message_reads`).
+    pub async fn ensure_project_with_mode(
+        &self,
+        slug: &str,
+        identity_mode: Option<&str>,
+    ) -> anyhow::Result<ProjectState> {
+        let state = self.ensure_project(slug).await?;
+        if let Some(mode) = identity_mode {
+            self.set_identity_mode(&state.slug, mode).await;
+        }
+        Ok(state)
+    }
+
+    /// Persist the project's routing policy (`swarm` | `open`, ADR-0018 D3).
+    /// Best-effort: no index pool → the row cannot be written and the policy
+    /// degrades to `open` (documented in ADR-0018 D3).
+    pub async fn set_identity_mode(&self, slug: &str, identity_mode: &str) {
+        let Some(pool) = self.index_pool.as_ref() else {
+            return;
+        };
+        let now_us = crate::index::writer::Clock::now_us(&crate::index::writer::SystemClock);
+        let _ = sqlx::query(
+            "INSERT INTO project_identity_modes (project_slug, identity_mode, updated_ts_us) \
+             VALUES (?1, ?2, ?3) \
+             ON CONFLICT (project_slug) DO UPDATE SET identity_mode = excluded.identity_mode, \
+             updated_ts_us = excluded.updated_ts_us",
+        )
+        .bind(slug)
+        .bind(identity_mode)
+        .bind(now_us)
+        .execute(pool)
+        .await;
+    }
+
+    /// The project's routing policy (ADR-0018 D3). Default `open`; no index
+    /// pool → `open` (degrade).
+    pub async fn project_identity_mode(&self, slug: &str) -> crate::mailbox::naming::IdentityMode {
+        let Some(pool) = self.index_pool.as_ref() else {
+            return crate::mailbox::naming::IdentityMode::Open;
+        };
+        let mode: Option<String> = sqlx::query_scalar(
+            "SELECT identity_mode FROM project_identity_modes WHERE project_slug = ?1",
+        )
+        .bind(slug)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten();
+        crate::mailbox::naming::IdentityMode::parse(mode.as_deref().unwrap_or("open"))
+    }
 }
 
 #[cfg(test)]
@@ -244,6 +301,50 @@ mod tests {
                 .count()
         };
         assert_eq!(manifest_count, 1, "exactly one manifest event stored");
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// ADR-0018: ensure_project_with_mode persists the routing policy; a
+    /// plain ensure on an existing project never clobbers it.
+    #[tokio::test]
+    async fn test_ensure_project_with_mode_persists_routing_policy() {
+        let (mailbox, pool, db_path, data_dir) = test_mailbox("mode").await;
+        schema::migrate(&pool).await.expect("migrate");
+        let mailbox = mailbox.with_index_pool(pool);
+
+        // No mode yet → open.
+        assert_eq!(
+            mailbox.project_identity_mode("toron").await,
+            crate::mailbox::naming::IdentityMode::Open
+        );
+
+        // ensure_project_with_mode persists swarm.
+        let state = mailbox
+            .ensure_project_with_mode("toron", Some("swarm"))
+            .await
+            .expect("ensure with mode");
+        assert!(state.created, "first ensure creates");
+        assert_eq!(
+            mailbox.project_identity_mode("toron").await,
+            crate::mailbox::naming::IdentityMode::Swarm
+        );
+
+        // A second plain ensure (no mode) does not clobber the policy.
+        let again = mailbox.ensure_project("toron").await.expect("plain ensure");
+        assert!(!again.created, "second ensure is a no-op");
+        assert_eq!(
+            mailbox.project_identity_mode("toron").await,
+            crate::mailbox::naming::IdentityMode::Swarm
+        );
+
+        // set_identity_mode flips it back.
+        mailbox.set_identity_mode("toron", "open").await;
+        assert_eq!(
+            mailbox.project_identity_mode("toron").await,
+            crate::mailbox::naming::IdentityMode::Open
+        );
 
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_dir_all(&data_dir);
