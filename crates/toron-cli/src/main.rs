@@ -7,6 +7,7 @@ mod config;
 mod daemon;
 mod operator;
 mod output;
+mod plane;
 mod robot;
 mod tui;
 mod workflow;
@@ -123,6 +124,23 @@ fn run(cli: &Cli) -> anyhow::Result<ExitCode> {
             run_robot(command)?;
             ExitCode::SUCCESS
         }
+        Command::Channel(_)
+        | Command::Job(_)
+        | Command::React(_)
+        | Command::Presence(_)
+        | Command::Watch(_) => {
+            // Two-plane surface (ADR-0020 Spec 2): same in-process mailbox as
+            // the MCP server, but the Nostr plane as shell commands. Usage
+            // errors (unknown --as, --once without --timeout-ms) exit 2.
+            match plane::run_plane_command(command) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) if e.downcast_ref::<plane::UsageError>().is_some() => {
+                    eprintln!("toron: error: {e:#}");
+                    ExitCode::from(2)
+                }
+                Err(e) => return Err(e),
+            }
+        }
     };
     Ok(code)
 }
@@ -156,6 +174,17 @@ async fn run_bench(args: &cli::BenchArgs, format: OutputFormat) -> anyhow::Resul
     const ITERATIONS: u64 = 20;
     let mut latencies = Vec::with_capacity(ITERATIONS as usize);
 
+    // Non-startup cases measure the mailbox PRIMITIVE, not mailbox
+    // construction — build once, then time 20 iterations against the same
+    // instance (construction cost would otherwise dominate and skew the
+    // percentile report). `startup` measures construction itself, so it keeps
+    // a fresh demo_mailbox() per iteration.
+    let mb = if args.case == cli::BenchCaseArg::Startup {
+        None
+    } else {
+        Some(toron_mcp::demo_mailbox().await?)
+    };
+
     for _ in 0..ITERATIONS {
         let start = std::time::Instant::now();
         // Each case measures the mailbox primitive's latency. Success/failure
@@ -168,43 +197,41 @@ async fn run_bench(args: &cli::BenchArgs, format: OutputFormat) -> anyhow::Resul
                 let _mb = toron_mcp::demo_mailbox().await;
                 Ok(())
             }
-            cli::BenchCaseArg::Inbox => {
-                let mb = toron_mcp::demo_mailbox().await?;
-                mb.fetch_inbox(&FetchInbox {
-                    project_slug: "demo".into(),
-                    agent_name: "bench".into(),
-                    ..Default::default()
-                })
-                .await
-                .map(|_| ())
-            }
-            cli::BenchCaseArg::Send => {
-                let mb = toron_mcp::demo_mailbox().await?;
-                mb.send_message(&SendMessage {
-                    project_slug: "demo".into(),
-                    sender_name: "bench".into(),
-                    subject: "s".into(),
-                    body_md: "b".into(),
-                    ..Default::default()
-                })
-                .await
-                .map(|_| ())
-            }
-            cli::BenchCaseArg::Search => {
-                let mb = toron_mcp::demo_mailbox().await?;
-                mb.search_messages(&SearchMessages {
-                    project_key: "demo".into(),
-                    query: "bench".into(),
-                    ..Default::default()
-                })
-                .await
-                .map(|_| ())
-            }
-            cli::BenchCaseArg::Threads => {
-                let mb = toron_mcp::demo_mailbox().await?;
-                mb.summarize_thread("demo", "bench-thread", false, false, None)
-                    .await
-                    .map(|_| ())
+            _ => {
+                let mb = mb.as_ref().expect("prebuilt mailbox for non-startup");
+                match args.case {
+                    cli::BenchCaseArg::Inbox => mb
+                        .fetch_inbox(&FetchInbox {
+                            project_slug: "demo".into(),
+                            agent_name: "bench".into(),
+                            ..Default::default()
+                        })
+                        .await
+                        .map(|_| ()),
+                    cli::BenchCaseArg::Send => mb
+                        .send_message(&SendMessage {
+                            project_slug: "demo".into(),
+                            sender_name: "bench".into(),
+                            subject: "s".into(),
+                            body_md: "b".into(),
+                            ..Default::default()
+                        })
+                        .await
+                        .map(|_| ()),
+                    cli::BenchCaseArg::Search => mb
+                        .search_messages(&SearchMessages {
+                            project_key: "demo".into(),
+                            query: "bench".into(),
+                            ..Default::default()
+                        })
+                        .await
+                        .map(|_| ()),
+                    cli::BenchCaseArg::Threads => mb
+                        .summarize_thread("demo", "bench-thread", false, false, None)
+                        .await
+                        .map(|_| ()),
+                    cli::BenchCaseArg::Startup => unreachable!("handled above"),
+                }
             }
         };
         latencies.push(start.elapsed().as_micros() as u64);

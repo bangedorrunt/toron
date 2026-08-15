@@ -350,3 +350,841 @@ fn inbox_missing_required_arg_exits_2() {
         "missing required --agent must be a usage error (exit 2)"
     );
 }
+
+// ---------------------------------------------------------------------------
+// ADR-0020 Spec 2 — two-plane shared surface: channel / react (plane S),
+// job (plane J), presence (plane N), watch (plane W).
+//
+// Cross-process contract: every shelled-out `toron` invocation opens the
+// same durable root (its own TORON_MCP_DATA_DIR), so channel lifecycle
+// events (kind 40/41), posts (kind 9), jobs (43001-43006) and presence
+// (projection file) survive across processes — the SC-27 shape.
+//
+// The plane suite uses a DEDICATED data dir (not the shared cli-robot one)
+// so its extra subprocesses never contend with the pre-existing parity
+// tests on the same SQLite root. Registration is serialized and the plane
+// tests share one mutex: the mailbox builds + KDF key scans are heavy, and
+// parallel plane tests would stall each other's unwrap loops.
+// ---------------------------------------------------------------------------
+
+/// Dedicated data dir for the two-plane tests.
+fn plane_data_dir() -> std::path::PathBuf {
+    static DIR: OnceLock<std::path::PathBuf> = OnceLock::new();
+    DIR.get_or_init(|| {
+        let d = std::env::temp_dir().join(format!("toron-cli-plane-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&d);
+        d
+    })
+    .clone()
+}
+
+/// Build a mailbox directly against the plane data dir (mirrors
+/// `demo_mailbox`'s TORON_MCP_DATA_DIR branch, but without touching the
+/// process-global env var the pre-existing tests share).
+async fn plane_mailbox() -> anyhow::Result<toron_core::mailbox::Mailbox> {
+    use std::sync::Arc;
+    let d = plane_data_dir();
+    let db = d.join("index.sqlite");
+    let pool = toron_core::index::schema::connect(db.to_str().unwrap()).await?;
+    toron_core::index::schema::migrate(&pool).await?;
+    toron_core::mailbox::aliases::reconcile_aliases(&pool, &d).await?;
+    let bus = toron_core::bus::InProcessBus::open(pool.clone(), Default::default()).await?;
+    Ok(toron_core::mailbox::Mailbox::new(Arc::new(bus), d, None).with_index_pool(pool))
+}
+
+/// Serialize plane mailbox builds (KDF-heavy) across the plane tests.
+fn plane_register(names: &[&str]) {
+    static REG: OnceLock<Mutex<()>> = OnceLock::new();
+    let _guard = REG
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    rt.block_on(async {
+        let mailbox = plane_mailbox().await.expect("plane mailbox");
+        for name in names {
+            mailbox
+                .register_agent("demo", &AgentProfile::new(*name))
+                .await
+                .expect("register agent");
+        }
+    });
+}
+
+/// Run a `toron` subprocess against the plane data dir.
+fn plane_run(args: &[&str]) -> Output {
+    toron()
+        .env("TORON_MCP_DATA_DIR", plane_data_dir())
+        .args(args)
+        .output()
+        .expect("run toron on plane data dir")
+}
+
+/// Serialize the plane tests themselves (they share the plane data dir).
+fn plane_guard() -> std::sync::MutexGuard<'static, ()> {
+    static GATE: OnceLock<Mutex<()>> = OnceLock::new();
+    GATE.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+/// Channel id unique to this test run (parallel-safe).
+fn channel_id(tag: &str) -> String {
+    format!("steer-{tag}-{}", std::process::id())
+}
+
+#[test]
+fn channel_create_post_read_react_roundtrip() {
+    let _g = plane_guard();
+    plane_register(&["TestAgent"]);
+
+    // create (process 1) → kind-40 lifecycle event persisted.
+    let id = channel_id("rt");
+    let created = plane_run(&[
+        "channel",
+        "create",
+        &id,
+        "--name",
+        "Roundtrip",
+        "--project",
+        "demo",
+        "--as",
+        "TestAgent",
+        "--json",
+    ]);
+    assert!(
+        created.status.success(),
+        "channel create must exit 0, stderr: {}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    let created_json: Value = serde_json::from_slice(&created.stdout).expect("create emits JSON");
+    assert_eq!(created_json["channel_id"], serde_json::json!(id));
+
+    // post (process 2) → kind 9, binding shape {event_id, kind:9, channel, mentions}.
+    let posted = plane_run(&[
+        "channel",
+        "post",
+        &id,
+        "--body",
+        "hello plane S",
+        "--project",
+        "demo",
+        "--as",
+        "TestAgent",
+        "--json",
+    ]);
+    assert!(
+        posted.status.success(),
+        "channel post must exit 0, stderr: {}",
+        String::from_utf8_lossy(&posted.stderr)
+    );
+    let post: Value = serde_json::from_slice(&posted.stdout).expect("post emits JSON");
+    assert_eq!(post["kind"], serde_json::json!(9), "post kind is 9");
+    assert_eq!(post["channel"], serde_json::json!(id));
+    assert_eq!(post["mentions"], serde_json::json!([]));
+    let post_id = post["event_id"]
+        .as_str()
+        .expect("post event_id")
+        .to_string();
+
+    // read (process 3) → the post is visible cross-process.
+    let read = plane_run(&[
+        "channel",
+        "read",
+        &id,
+        "--project",
+        "demo",
+        "--as",
+        "TestAgent",
+        "--json",
+    ]);
+    assert!(
+        read.status.success(),
+        "channel read must exit 0, stderr: {}",
+        String::from_utf8_lossy(&read.stderr)
+    );
+    let rows: Value = serde_json::from_slice(&read.stdout).expect("read emits JSON array");
+    let found = rows
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .any(|r| r["event_id"] == serde_json::json!(post_id))
+        })
+        .unwrap_or(false);
+    assert!(found, "read must contain the posted event, got {rows}");
+
+    // react (process 4) → kind 7 with e=target.
+    let reacted = plane_run(&[
+        "react",
+        "--to",
+        &post_id,
+        "--emoji",
+        ":+1:",
+        "--channel",
+        &id,
+        "--project",
+        "demo",
+        "--as",
+        "TestAgent",
+        "--json",
+    ]);
+    assert!(
+        reacted.status.success(),
+        "react must exit 0, stderr: {}",
+        String::from_utf8_lossy(&reacted.stderr)
+    );
+    let reaction: Value = serde_json::from_slice(&reacted.stdout).expect("react emits JSON");
+    assert_eq!(reaction["kind"], serde_json::json!(7), "reaction is kind 7");
+    assert_eq!(reaction["react_to"], serde_json::json!(post_id));
+}
+
+#[test]
+fn channel_post_mention_dispatches_one_job() {
+    let _g = plane_guard();
+    plane_register(&["TestAgent", "TestAgent2"]);
+
+    let id = channel_id("mention");
+    let created = plane_run(&[
+        "channel",
+        "create",
+        &id,
+        "--name",
+        "Mention",
+        "--project",
+        "demo",
+        "--as",
+        "TestAgent",
+        "--json",
+    ]);
+    assert!(
+        created.status.success(),
+        "create: {}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    // TestAgent2 must join so the mention can target a member of the room.
+    let joined = plane_run(&[
+        "channel",
+        "join",
+        &id,
+        "--project",
+        "demo",
+        "--as",
+        "TestAgent2",
+        "--json",
+    ]);
+    assert!(
+        joined.status.success(),
+        "join: {}",
+        String::from_utf8_lossy(&joined.stderr)
+    );
+
+    // @mention post → p-tag + one 43001 via the mention dispatcher.
+    let posted = plane_run(&[
+        "channel",
+        "post",
+        &id,
+        "--body",
+        "@TestAgent2 take the repro",
+        "--mention",
+        "TestAgent2",
+        "--project",
+        "demo",
+        "--as",
+        "TestAgent",
+        "--json",
+    ]);
+    assert!(
+        posted.status.success(),
+        "mention post must exit 0, stderr: {}",
+        String::from_utf8_lossy(&posted.stderr)
+    );
+    let post: Value = serde_json::from_slice(&posted.stdout).expect("post emits JSON");
+    let mentions = post["mentions"].as_array().expect("mentions array");
+    assert_eq!(mentions.len(), 1, "one mention p-tag");
+
+    // job list (new process) sees exactly one 43001 for the mention.
+    let listed = plane_run(&[
+        "job",
+        "list",
+        "--project",
+        "demo",
+        "--assignee",
+        "TestAgent2",
+        "--json",
+    ]);
+    assert!(
+        listed.status.success(),
+        "job list must exit 0, stderr: {}",
+        String::from_utf8_lossy(&listed.stderr)
+    );
+    let jobs: Value = serde_json::from_slice(&listed.stdout).expect("job list emits JSON array");
+    let open_for_b: Vec<&Value> = jobs
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter(|j| j["state"] == serde_json::json!("open"))
+                .collect()
+        })
+        .unwrap_or_default();
+    assert_eq!(
+        open_for_b.len(),
+        1,
+        "mention must dispatch exactly ONE open 43001 for TestAgent2 (SC-27: one 43001, not N), got {jobs}"
+    );
+}
+
+#[test]
+fn channel_unknown_as_exits_2() {
+    let _g = plane_guard();
+    let out = plane_run(&[
+        "channel",
+        "create",
+        "steer-x",
+        "--name",
+        "X",
+        "--project",
+        "demo",
+        "--as",
+        "NoSuchAgent",
+        "--json",
+    ]);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "unknown --as is a usage error (exit 2), stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn channel_nonmember_post_exits_1() {
+    let _g = plane_guard();
+    plane_register(&["TestAgent", "TestAgent2"]);
+
+    let id = channel_id("gate");
+    let created = plane_run(&[
+        "channel",
+        "create",
+        &id,
+        "--name",
+        "Gate",
+        "--project",
+        "demo",
+        "--as",
+        "TestAgent",
+        "--json",
+    ]);
+    assert!(
+        created.status.success(),
+        "create: {}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+
+    // TestAgent2 never joined → membership gate rejects the post (exit 1).
+    let out = plane_run(&[
+        "channel",
+        "post",
+        &id,
+        "--body",
+        "intrude",
+        "--project",
+        "demo",
+        "--as",
+        "TestAgent2",
+        "--json",
+    ]);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "non-member post must fail (exit 1), stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn help_lists_two_plane_commands() {
+    let out = plane_run(&["channel", "--help"]);
+    assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout);
+    for sub in ["create", "join", "leave", "list", "members", "post", "read"] {
+        assert!(
+            text.contains(sub),
+            "channel --help must list {sub}, got: {text}"
+        );
+    }
+    let job_help = plane_run(&["job", "--help"]);
+    assert!(job_help.status.success());
+    let jt = String::from_utf8_lossy(&job_help.stdout);
+    for sub in [
+        "list", "show", "claim", "progress", "result", "error", "cancel",
+    ] {
+        assert!(jt.contains(sub), "job --help must list {sub}, got: {jt}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// plane J — jobs 43001-43006 (bd-36qf.4)
+// ---------------------------------------------------------------------------
+
+/// A job in project `demo` ready to claim: a mention post dispatches one
+/// 43001 for TestAgent2. Returns the job id from `job list`.
+fn make_open_job(tag: &str) -> String {
+    plane_register(&["TestAgent", "TestAgent2"]);
+    let id = channel_id(tag);
+    let created = plane_run(&[
+        "channel",
+        "create",
+        &id,
+        "--name",
+        "Job",
+        "--project",
+        "demo",
+        "--as",
+        "TestAgent",
+        "--json",
+    ]);
+    assert!(
+        created.status.success(),
+        "create: {}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    let joined = plane_run(&[
+        "channel",
+        "join",
+        &id,
+        "--project",
+        "demo",
+        "--as",
+        "TestAgent2",
+        "--json",
+    ]);
+    assert!(
+        joined.status.success(),
+        "join: {}",
+        String::from_utf8_lossy(&joined.stderr)
+    );
+    let posted = plane_run(&[
+        "channel",
+        "post",
+        &id,
+        "--body",
+        "@TestAgent2 do the work",
+        "--mention",
+        "TestAgent2",
+        "--project",
+        "demo",
+        "--as",
+        "TestAgent",
+        "--json",
+    ]);
+    assert!(
+        posted.status.success(),
+        "post: {}",
+        String::from_utf8_lossy(&posted.stderr)
+    );
+
+    let listed = plane_run(&[
+        "job",
+        "list",
+        "--project",
+        "demo",
+        "--assignee",
+        "TestAgent2",
+        "--state",
+        "open",
+        "--json",
+    ]);
+    assert!(
+        listed.status.success(),
+        "list: {}",
+        String::from_utf8_lossy(&listed.stderr)
+    );
+    let jobs: Value = serde_json::from_slice(&listed.stdout).expect("job list JSON");
+    jobs.as_array()
+        .and_then(|a| a.first())
+        .and_then(|j| j["job_id"].as_str())
+        .expect("at least one open job")
+        .to_string()
+}
+
+#[test]
+fn job_claim_first_wins_second_exits_1() {
+    let _g = plane_guard();
+    let job_id = make_open_job("claim");
+
+    // First claimer (TestAgent2) → won:true.
+    let first = plane_run(&[
+        "job",
+        "claim",
+        &job_id,
+        "--project",
+        "demo",
+        "--as",
+        "TestAgent2",
+        "--json",
+    ]);
+    assert!(
+        first.status.success(),
+        "first claim must exit 0, stderr: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let first_json: Value = serde_json::from_slice(&first.stdout).expect("claim JSON");
+    assert_eq!(first_json["kind"], serde_json::json!(43002));
+    assert_eq!(
+        first_json["won"],
+        serde_json::json!(true),
+        "first claimer wins"
+    );
+    assert_eq!(first_json["claimer"], serde_json::json!("TestAgent2"));
+
+    // Second claimer (TestAgent) → won:false, exit 1.
+    let second = plane_run(&[
+        "job",
+        "claim",
+        &job_id,
+        "--project",
+        "demo",
+        "--as",
+        "TestAgent",
+        "--json",
+    ]);
+    assert_eq!(
+        second.status.code(),
+        Some(1),
+        "second claimer must exit 1, stderr: {}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    let second_json: Value = serde_json::from_slice(&second.stdout).expect("second claim JSON");
+    assert_eq!(
+        second_json["won"],
+        serde_json::json!(false),
+        "second claimer loses"
+    );
+}
+
+#[test]
+fn job_result_sets_done_visible_to_show() {
+    let _g = plane_guard();
+    let job_id = make_open_job("result");
+
+    let claimed = plane_run(&[
+        "job",
+        "claim",
+        &job_id,
+        "--project",
+        "demo",
+        "--as",
+        "TestAgent2",
+        "--json",
+    ]);
+    assert!(
+        claimed.status.success(),
+        "claim: {}",
+        String::from_utf8_lossy(&claimed.stderr)
+    );
+
+    let result = plane_run(&[
+        "job",
+        "result",
+        &job_id,
+        "--status",
+        "ok",
+        "--body",
+        "receipt=abc123",
+        "--project",
+        "demo",
+        "--as",
+        "TestAgent2",
+        "--json",
+    ]);
+    assert!(
+        result.status.success(),
+        "result must exit 0, stderr: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+
+    // job show (new process) reads the terminal state.
+    let shown = plane_run(&["job", "show", &job_id, "--project", "demo", "--json"]);
+    assert!(
+        shown.status.success(),
+        "show: {}",
+        String::from_utf8_lossy(&shown.stderr)
+    );
+    let row: Value = serde_json::from_slice(&shown.stdout).expect("show JSON");
+    assert_eq!(
+        row["state"],
+        serde_json::json!("done"),
+        "result closes the job"
+    );
+}
+
+#[test]
+fn job_cancel_requester_only() {
+    let _g = plane_guard();
+    let job_id = make_open_job("cancel");
+
+    // Non-requester (TestAgent2) cannot cancel → exit 1.
+    let denied = plane_run(&[
+        "job",
+        "cancel",
+        &job_id,
+        "--project",
+        "demo",
+        "--as",
+        "TestAgent2",
+        "--json",
+    ]);
+    assert_eq!(
+        denied.status.code(),
+        Some(1),
+        "non-requester cancel must exit 1, stderr: {}",
+        String::from_utf8_lossy(&denied.stderr)
+    );
+
+    // Requester (TestAgent, who posted the mention) can cancel.
+    let ok = plane_run(&[
+        "job",
+        "cancel",
+        &job_id,
+        "--project",
+        "demo",
+        "--as",
+        "TestAgent",
+        "--json",
+    ]);
+    assert!(
+        ok.status.success(),
+        "requester cancel: {}",
+        String::from_utf8_lossy(&ok.stderr)
+    );
+    let shown = plane_run(&["job", "show", &job_id, "--project", "demo", "--json"]);
+    let row: Value = serde_json::from_slice(&shown.stdout).expect("show JSON");
+    assert_eq!(row["state"], serde_json::json!("cancelled"));
+}
+
+#[test]
+fn job_show_unknown_job_exits_1() {
+    let out = plane_run(&[
+        "job",
+        "show",
+        "0000000000000000000000000000000000000000000000000000000000000000",
+        "--project",
+        "demo",
+        "--json",
+    ]);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "unknown job must exit 1, stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// plane N + W — presence 20001, watch (bd-36qf.5)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn presence_publish_then_list_cross_process() {
+    let _g = plane_guard();
+    plane_register(&["TestAgent"]);
+
+    let published = plane_run(&[
+        "presence",
+        "publish",
+        "--state",
+        "working",
+        "--status",
+        "reviewing",
+        "--project",
+        "demo",
+        "--as",
+        "TestAgent",
+        "--json",
+    ]);
+    assert!(
+        published.status.success(),
+        "presence publish must exit 0, stderr: {}",
+        String::from_utf8_lossy(&published.stderr)
+    );
+    let p: Value = serde_json::from_slice(&published.stdout).expect("publish JSON");
+    assert_eq!(p["state"], serde_json::json!("working"));
+    assert_eq!(p["name"], serde_json::json!("TestAgent"));
+
+    // A separate process lists the heartbeat from the projection file.
+    let listed = plane_run(&["presence", "list", "--project", "demo", "--json"]);
+    assert!(
+        listed.status.success(),
+        "list: {}",
+        String::from_utf8_lossy(&listed.stderr)
+    );
+    let rows: Value = serde_json::from_slice(&listed.stdout).expect("list JSON");
+    let found = rows
+        .as_array()
+        .map(|a| {
+            a.iter().any(|r| {
+                r["name"] == serde_json::json!("TestAgent")
+                    && r["state"] == serde_json::json!("working")
+            })
+        })
+        .unwrap_or(false);
+    assert!(
+        found,
+        "presence list must include TestAgent working, got {rows}"
+    );
+}
+
+#[test]
+fn watch_once_catches_cross_process_post() {
+    let _g = plane_guard();
+    plane_register(&["TestAgent"]);
+    let id = channel_id("watch");
+    let created = plane_run(&[
+        "channel",
+        "create",
+        &id,
+        "--name",
+        "Watch",
+        "--project",
+        "demo",
+        "--as",
+        "TestAgent",
+        "--json",
+    ]);
+    assert!(
+        created.status.success(),
+        "create: {}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+
+    // Process 1: watch --once (listening on the shared durable root).
+    let watch = toron()
+        .env("TORON_MCP_DATA_DIR", plane_data_dir())
+        .args([
+            "watch",
+            "--project",
+            "demo",
+            "--as",
+            "TestAgent",
+            "--kinds",
+            "9",
+            "--channel",
+            &id,
+            "--once",
+            "--timeout-ms",
+            "15000",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn watch");
+
+    // Give the watcher time to open its bus + subscription.
+    std::thread::sleep(std::time::Duration::from_millis(800));
+
+    // Process 2: post on the same root.
+    let posted = plane_run(&[
+        "channel",
+        "post",
+        &id,
+        "--body",
+        "seen by watch",
+        "--project",
+        "demo",
+        "--as",
+        "TestAgent",
+        "--json",
+    ]);
+    assert!(
+        posted.status.success(),
+        "post: {}",
+        String::from_utf8_lossy(&posted.stderr)
+    );
+
+    let out = watch.wait_with_output().expect("watch completes");
+    assert!(
+        out.status.success(),
+        "watch --once must exit 0 on a match, stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let ev: Value = serde_json::from_slice(&out.stdout).expect("watch emits one event JSON");
+    assert_eq!(ev["kind"], serde_json::json!(9), "watched kind 9");
+    assert_eq!(
+        ev["content"],
+        serde_json::json!("seen by watch"),
+        "watched the posted content"
+    );
+}
+
+#[test]
+fn watch_once_timeout_exits_1() {
+    let _g = plane_guard();
+    plane_register(&["TestAgent"]);
+
+    let out = plane_run(&[
+        "watch",
+        "--project",
+        "demo",
+        "--as",
+        "TestAgent",
+        "--kinds",
+        "9",
+        "--channel",
+        "no-such-channel",
+        "--once",
+        "--timeout-ms",
+        "1500",
+    ]);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "watch timeout must exit 1, stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("timeout"),
+        "stderr names the timeout: {stderr}"
+    );
+}
+
+#[test]
+fn watch_once_without_timeout_is_usage_error() {
+    let out = plane_run(&["watch", "--project", "demo", "--once", "--kinds", "9"]);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "--once without --timeout-ms is a usage error (exit 2), stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn watch_1059_requires_self_identity() {
+    let out = plane_run(&[
+        "watch",
+        "--project",
+        "demo",
+        "--kinds",
+        "1059",
+        "--once",
+        "--timeout-ms",
+        "1000",
+    ]);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "watching 1059 without --as is a usage error (p-gated to self), stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn presence_help_lists_commands() {
+    let out = plane_run(&["presence", "--help"]);
+    assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("publish"), "presence --help lists publish");
+    assert!(text.contains("list"), "presence --help lists list");
+}

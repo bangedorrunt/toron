@@ -119,6 +119,27 @@ pub enum Command {
     #[command(subcommand)]
     Guard(GuardCommand),
 
+    // --- two-plane shared surface (ADR-0020 Spec 2): the Nostr plane as CLI.
+    // Plane S (shared rooms, kind 9/7), J (jobs 43001-43006), N (presence
+    // 20001), W (watch/NIP-01 REQ). CLI-first; the MCP cluster stays frozen.
+    /// NIP-29 channels: create/join/leave/list/members/post/read (plane S).
+    #[command(subcommand)]
+    Channel(ChannelCommand),
+
+    /// Job lifecycle 43001-43006: list/show/claim/progress/result/error/cancel.
+    #[command(subcommand)]
+    Job(JobCommand),
+
+    /// React (kind 7) to a channel post.
+    React(ReactArgs),
+
+    /// Presence (kind 20001): publish/list (plane N).
+    #[command(subcommand)]
+    Presence(PresenceCommand),
+
+    /// Watch the shared plane (NIP-01 REQ): --once exits on first match.
+    Watch(WatchArgs),
+
     // --- operator surface (bd-led.8.2): daemon-persona commands.
     /// Deep health checks (herdr/git/keys/resonate). --check exits 3 on any failure.
     Doctor(DoctorArgs),
@@ -741,6 +762,330 @@ pub struct GuardCheckArgs {
     /// Committing agent name (overrides TORON_AGENT / FLYWHEEL_MAIL_AS).
     #[arg(long)]
     pub as_agent: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Two-plane shared surface (ADR-0020 Spec 2): channel / job / react /
+// presence / watch. CLI-first; MCP cluster stays frozen (39 tools).
+//
+// Writes take `--as <canonical-name>` (ADR-0018): the registered agent key
+// signs the event. Unknown `--as` is a usage error (exit 2) — never
+// `Keys::generate()` in a write path. Reads take `--json` for robot mode.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Subcommand)]
+pub enum ChannelCommand {
+    /// Create a channel (idempotent; creator is the first member).
+    Create(ChannelCreateArgs),
+    /// Join a channel (idempotent).
+    Join(ChannelJoinArgs),
+    /// Leave a channel (the creator cannot leave).
+    Leave(ChannelJoinArgs),
+    /// List channels visible to the caller (project-scoped).
+    List(ChannelListArgs),
+    /// List a channel's member npubs.
+    Members(ChannelMembersArgs),
+    /// Post a kind-9 message (membership-gated; `--mention` dispatches 43001).
+    Post(ChannelPostArgs),
+    /// Read channel history (posts + reactions; membership-gated).
+    Read(ChannelReadArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct ChannelCreateArgs {
+    /// Channel id (the `h` tag).
+    pub id: String,
+    /// Display name.
+    #[arg(long, required = true)]
+    pub name: String,
+    /// Private channel (global subscriptions never see its events).
+    #[arg(long)]
+    pub private: bool,
+    /// Project slug.
+    #[arg(long, required = true)]
+    pub project: String,
+    /// Creating agent's canonical name (ADR-0018).
+    #[arg(long = "as", required = true)]
+    pub as_name: String,
+}
+
+#[derive(Debug, Args)]
+pub struct ChannelJoinArgs {
+    /// Channel id.
+    pub id: String,
+    /// Project slug.
+    #[arg(long, required = true)]
+    pub project: String,
+    /// Agent canonical name (ADR-0018).
+    #[arg(long = "as", required = true)]
+    pub as_name: String,
+}
+
+#[derive(Debug, Args)]
+pub struct ChannelListArgs {
+    /// Project slug.
+    #[arg(long, required = true)]
+    pub project: String,
+    /// Optional reader identity (private channels appear only to members).
+    #[arg(long = "as")]
+    pub as_name: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct ChannelMembersArgs {
+    /// Channel id.
+    pub id: String,
+    /// Project slug.
+    #[arg(long, required = true)]
+    pub project: String,
+}
+
+#[derive(Debug, Args)]
+pub struct ChannelPostArgs {
+    /// Channel id.
+    pub id: String,
+    /// Message body (markdown).
+    #[arg(long, required = true)]
+    pub body: String,
+    /// Project slug.
+    #[arg(long, required = true)]
+    pub project: String,
+    /// Posting agent's canonical name (ADR-0018).
+    #[arg(long = "as", required = true)]
+    pub as_name: String,
+    /// @mention targets (canonical names; p-tags + mention dispatcher).
+    #[arg(long, value_delimiter = ',')]
+    pub mention: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct ChannelReadArgs {
+    /// Channel id.
+    pub id: String,
+    /// Project slug.
+    #[arg(long, required = true)]
+    pub project: String,
+    /// Reading agent's canonical name (membership gate needs an identity).
+    #[arg(long = "as", required = true)]
+    pub as_name: String,
+    /// Maximum messages to return.
+    #[arg(long)]
+    pub limit: Option<usize>,
+    /// Include messages at/after this RFC3339 timestamp.
+    #[arg(long)]
+    pub since: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct ReactArgs {
+    /// Target message event id (the kind-9 post being reacted to).
+    #[arg(long, required = true)]
+    pub to: String,
+    /// Reaction emoji/shortcode (e.g. :+1:).
+    #[arg(long, required = true)]
+    pub emoji: String,
+    /// Channel id (optional; resolved from the target event's `h` tag).
+    #[arg(long)]
+    pub channel: Option<String>,
+    /// Project slug.
+    #[arg(long, required = true)]
+    pub project: String,
+    /// Reacting agent's canonical name (ADR-0018).
+    #[arg(long = "as", required = true)]
+    pub as_name: String,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum JobCommand {
+    /// List job requests (43001) with their current state.
+    List(JobListArgs),
+    /// Show one job's request + state (43001-43006 stream).
+    Show(JobShowArgs),
+    /// Claim a job (43002, signed by `--as`; first claimer wins).
+    Claim(JobClaimArgs),
+    /// Post a progress update (43003, optional).
+    Progress(JobProgressArgs),
+    /// Close with a result (43004; ok|failed).
+    Result(JobResultArgs),
+    /// Close with an error (43006).
+    Error(JobErrorArgs),
+    /// Cancel a job (43005; requester or operator only).
+    Cancel(JobCancelArgs),
+}
+
+/// Job state filter for `toron job list`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum JobStateArg {
+    Open,
+    Claimed,
+    Done,
+    Error,
+}
+
+#[derive(Debug, Args)]
+pub struct JobListArgs {
+    /// Project slug.
+    #[arg(long, required = true)]
+    pub project: String,
+    /// Filter by assigned agent name.
+    #[arg(long)]
+    pub assignee: Option<String>,
+    /// Filter by lifecycle state.
+    #[arg(long, value_enum)]
+    pub state: Option<JobStateArg>,
+    /// Caller identity (optional for reads).
+    #[arg(long = "as")]
+    pub as_name: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct JobShowArgs {
+    /// Job request event id (43001).
+    pub job_id: String,
+    /// Project slug.
+    #[arg(long, required = true)]
+    pub project: String,
+}
+
+#[derive(Debug, Args)]
+pub struct JobClaimArgs {
+    /// Job request event id (43001).
+    pub job_id: String,
+    /// Project slug.
+    #[arg(long, required = true)]
+    pub project: String,
+    /// Claiming agent's canonical name (ADR-0018).
+    #[arg(long = "as", required = true)]
+    pub as_name: String,
+}
+
+#[derive(Debug, Args)]
+pub struct JobProgressArgs {
+    /// Job request event id (43001).
+    pub job_id: String,
+    /// Progress note.
+    #[arg(long, required = true)]
+    pub body: String,
+    /// Project slug.
+    #[arg(long, required = true)]
+    pub project: String,
+    /// Reporting agent's canonical name (ADR-0018).
+    #[arg(long = "as", required = true)]
+    pub as_name: String,
+}
+
+/// Job result status selector.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum JobStatusArg {
+    Ok,
+    Failed,
+}
+
+#[derive(Debug, Args)]
+pub struct JobResultArgs {
+    /// Job request event id (43001).
+    pub job_id: String,
+    /// ok | failed.
+    #[arg(long, value_enum, required = true)]
+    pub status: JobStatusArg,
+    /// Outcome body (receipt, summary).
+    #[arg(long, required = true)]
+    pub body: String,
+    /// Project slug.
+    #[arg(long, required = true)]
+    pub project: String,
+    /// Reporting agent's canonical name (ADR-0018).
+    #[arg(long = "as", required = true)]
+    pub as_name: String,
+}
+
+#[derive(Debug, Args)]
+pub struct JobErrorArgs {
+    /// Job request event id (43001).
+    pub job_id: String,
+    /// Error message.
+    #[arg(long, required = true)]
+    pub message: String,
+    /// Project slug.
+    #[arg(long, required = true)]
+    pub project: String,
+    /// Reporting agent's canonical name (ADR-0018).
+    #[arg(long = "as", required = true)]
+    pub as_name: String,
+}
+
+#[derive(Debug, Args)]
+pub struct JobCancelArgs {
+    /// Job request event id (43001).
+    pub job_id: String,
+    /// Project slug.
+    #[arg(long, required = true)]
+    pub project: String,
+    /// Cancelling agent's canonical name (ADR-0018); requester or operator only.
+    #[arg(long = "as", required = true)]
+    pub as_name: String,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum PresenceCommand {
+    /// Publish a kind-20001 heartbeat (ephemeral; broker last-heartbeat-wins).
+    Publish(PresencePublishArgs),
+    /// List live presence for the project.
+    List(PresenceListArgs),
+}
+
+/// Presence state selector (herdr vocabulary: idle|working|blocked|done).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum PresenceStateArg {
+    Idle,
+    Working,
+    Blocked,
+    Done,
+}
+
+#[derive(Debug, Args)]
+pub struct PresencePublishArgs {
+    /// idle | working | blocked | done.
+    #[arg(long, value_enum, required = true)]
+    pub state: PresenceStateArg,
+    /// Optional status message.
+    #[arg(long)]
+    pub status: Option<String>,
+    /// Project slug.
+    #[arg(long, required = true)]
+    pub project: String,
+    /// Publishing agent's canonical name (ADR-0018).
+    #[arg(long = "as", required = true)]
+    pub as_name: String,
+}
+
+#[derive(Debug, Args)]
+pub struct PresenceListArgs {
+    /// Project slug.
+    #[arg(long, required = true)]
+    pub project: String,
+}
+
+#[derive(Debug, Args)]
+pub struct WatchArgs {
+    /// Project slug.
+    #[arg(long, required = true)]
+    pub project: String,
+    /// Watcher identity (required only when watching kind 1059).
+    #[arg(long = "as")]
+    pub as_name: Option<String>,
+    /// Comma-separated kind allowlist (default 9,7,43001,20001).
+    #[arg(long, default_value = "9,7,43001,20001")]
+    pub kinds: String,
+    /// Channel id (`h` tag filter).
+    #[arg(long)]
+    pub channel: Option<String>,
+    /// Exit 0 on the first matching event.
+    #[arg(long)]
+    pub once: bool,
+    /// Total watch budget in ms (required with --once).
+    #[arg(long)]
+    pub timeout_ms: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------
