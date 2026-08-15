@@ -1,5 +1,7 @@
 // governed-by: ADR-0003
-#![forbid(unsafe_code)]
+// (not forbid(unsafe_code): this test sets TORON_MCP_DATA_DIR via
+// std::env::set_var, which is unsafe in edition 2024; the unsafe is confined
+// to the test harness, never to toron-core/toron-mcp library code.)
 
 //! bd-esh.4 acceptance: `toron tui` TTY gate + data plumbing.
 //!
@@ -17,6 +19,23 @@ use toron_core::nostr::identity::AgentProfile;
 
 fn toron() -> Command {
     Command::new(env!("CARGO_BIN_EXE_toron"))
+}
+
+/// Shared per-test-run data dir so the in-process demo mailbox NEVER touches
+/// the durable production root (`~/.local/share/toron` — 500+ agent keys
+/// there would re-run the ~1s/key argon2 KDF on every mailbox build).
+fn shared_data_dir() -> std::path::PathBuf {
+    static DIR: OnceLock<std::path::PathBuf> = OnceLock::new();
+    DIR.get_or_init(|| {
+        let d = std::env::temp_dir().join(format!("toron-cli-tui-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&d);
+        // SAFETY: test process; inherited by every shelled-out subprocess.
+        unsafe {
+            std::env::set_var("TORON_MCP_DATA_DIR", &d);
+        }
+        d
+    })
+    .clone()
 }
 
 /// Serialize TestAgent key writes across tests (idempotent; same pattern as
@@ -69,6 +88,7 @@ fn help_lists_tui_subcommand() {
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
 async fn tui_data_plumbing_demo_mailbox() {
+    let _ = shared_data_dir();
     let mailbox = toron_mcp::demo_mailbox().await.expect("demo mailbox");
     let _guard = register_guard();
     mailbox

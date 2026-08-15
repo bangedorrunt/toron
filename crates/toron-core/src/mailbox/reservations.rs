@@ -1556,7 +1556,7 @@ impl Mailbox {
         status: &str,
         event_id: &EventId,
     ) {
-        let root = self.data_dir.join(project_slug);
+        let root = crate::mailbox::aliases::project_root(&self.data_dir, project_slug);
         if let Ok(archive) = crate::archive::git::GitArchive::open_or_init(&root) {
             let rel = std::path::Path::new(".audit").join(format!("{}.{status}.json", event_id));
             let content = format!(

@@ -448,7 +448,7 @@ impl ProjectGitProjectionSink {
         if let Some(a) = self.archives.lock().get(slug).cloned() {
             return Ok(a);
         }
-        let root = self.data_dir.join(slug);
+        let root = crate::mailbox::aliases::project_root(&self.data_dir, slug);
         let archive = Arc::new(parking_lot::Mutex::new(
             crate::archive::git::GitArchive::open_or_init(&root)?,
         ));
