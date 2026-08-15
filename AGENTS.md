@@ -58,6 +58,8 @@ Child maps: [toron-core](crates/toron-core/AGENTS.md) ·
 - `t` tag = project slug only. Never harness/model/job tags.
 - TDD for new features and bug fixes. No benches in this repo.
 - Beads: `br` CLI + `--json`. No beads MCP. Binary is `br`, never `bd`.
+- Engineering principles (ADR-0019 Spec 5/6): `flywheel principles list`. Cite the name that changed the decision. Full leaves: `flywheel principles show <name>`.
+- Wave-2 playbook lints (ADR-0019): `crates/toron-workflow/src/playbook_lint.rs` — feature requires `data_shape` input, bug-fix requires `repro` predecessor, prototype/arena require `n>=2` + mode rules (`build_slot: true` for compile, no repo build paths for sketch), forensics is read-only, `principles:` names validate against the 21-name registry. Entrypoints: `lint_workflow_with_principles(wf, &[&str])` (embedding passes the registry), `lint_workflow(wf)` (in-crate default).
 - `std::env::set_var` only in integration tests that omit `forbid(unsafe_code)`.
 
 ## Skill Sync Contract
