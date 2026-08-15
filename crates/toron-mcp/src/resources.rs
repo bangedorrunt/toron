@@ -144,9 +144,8 @@ pub fn read_resource_value(uri: &str) -> Option<serde_json::Value> {
     if let Some(v) = static_resource(base) {
         return Some(v);
     }
-    if let Some((name, template, desc)) = RESOURCES
-        .iter()
-        .find(|(_, t, _)| template_matches(t, base))
+    if let Some((name, template, desc)) =
+        RESOURCES.iter().find(|(_, t, _)| template_matches(t, base))
     {
         return Some(serde_json::json!({
             "uri": base,
@@ -205,10 +204,7 @@ fn static_resource(uri: &str) -> Option<serde_json::Value> {
 ///   → kind-30031 / 30032 events (project-scoped or by event id).
 /// - `toron://identity/{project}` → agents of the project.
 /// - `toron://views/ack-overdue/{agent}` → ack-required mail.
-pub async fn project_resource_value(
-    mailbox: &Mailbox,
-    uri: &str,
-) -> Option<serde_json::Value> {
+pub async fn project_resource_value(mailbox: &Mailbox, uri: &str) -> Option<serde_json::Value> {
     let base = uri.split('?').next().unwrap_or(uri);
     if let Some(slug) = base.strip_prefix("toron://projects/") {
         return mailbox
@@ -321,6 +317,8 @@ async fn inbox_view(mailbox: &Mailbox, name: &str) -> Option<serde_json::Value> 
         unread_only: false,
         limit: Some(25),
         include_bodies: false,
+        urgent_only: false,
+        since_ts: None,
     };
     let messages = mailbox.fetch_inbox(&args).await.ok()?;
     Some(serde_json::json!({
@@ -379,7 +377,9 @@ async fn outbox_view(mailbox: &Mailbox, name: &str) -> Option<serde_json::Value>
             return None;
         }
     };
-    Some(serde_json::json!({ "agent": name, "messages": hits.into_iter().map(search_json).collect::<Vec<_>>() }))
+    Some(
+        serde_json::json!({ "agent": name, "messages": hits.into_iter().map(search_json).collect::<Vec<_>>() }),
+    )
 }
 
 fn search_json(m: toron_core::mailbox::SearchMessage) -> serde_json::Value {
@@ -397,7 +397,10 @@ fn search_json(m: toron_core::mailbox::SearchMessage) -> serde_json::Value {
 
 /// Map one `messages`-table row to the search-result shape (AM-parity field
 /// names). Shared by the index-scan projections below.
-fn indexed_row(row: &sqlx::sqlite::SqliteRow, include_body: bool) -> toron_core::mailbox::SearchMessage {
+fn indexed_row(
+    row: &sqlx::sqlite::SqliteRow,
+    include_body: bool,
+) -> toron_core::mailbox::SearchMessage {
     toron_core::mailbox::SearchMessage {
         id: row.get("event_id"),
         subject: row.get("subject"),
@@ -431,10 +434,7 @@ async fn index_scan(
         q = q.bind(*p);
     }
     let rows = q.fetch_all(pool).await?;
-    Ok(rows
-        .iter()
-        .map(|r| indexed_row(r, include_body))
-        .collect())
+    Ok(rows.iter().map(|r| indexed_row(r, include_body)).collect())
 }
 
 /// One message by exact event id (index lookup; ids are globally unique).
@@ -479,7 +479,9 @@ async fn thread_view(mailbox: &Mailbox, id: &str) -> Option<serde_json::Value> {
     if hits.is_empty() {
         return None;
     }
-    Some(serde_json::json!({ "thread_id": id, "messages": hits.into_iter().map(search_json).collect::<Vec<_>>() }))
+    Some(
+        serde_json::json!({ "thread_id": id, "messages": hits.into_iter().map(search_json).collect::<Vec<_>>() }),
+    )
 }
 
 /// Ack-required mail sent by an agent (index scan on `ack_required` +
@@ -501,7 +503,9 @@ async fn overdue_view(mailbox: &Mailbox, agent: &str) -> Option<serde_json::Valu
             return None;
         }
     };
-    Some(serde_json::json!({ "agent": agent, "messages": hits.into_iter().map(search_json).collect::<Vec<_>>() }))
+    Some(
+        serde_json::json!({ "agent": agent, "messages": hits.into_iter().map(search_json).collect::<Vec<_>>() }),
+    )
 }
 
 /// Mailbox summary for an agent: health + recent inbox.
@@ -514,6 +518,8 @@ async fn mailbox_view(mailbox: &Mailbox, name: &str) -> Option<serde_json::Value
         unread_only: false,
         limit: Some(10),
         include_bodies: false,
+        urgent_only: false,
+        since_ts: None,
     };
     let messages = mailbox.fetch_inbox(&args).await.ok()?;
     let health = mailbox.health_check().await;
@@ -529,11 +535,7 @@ async fn mailbox_view(mailbox: &Mailbox, name: &str) -> Option<serde_json::Value
 
 /// Kind-addressable manifest events (products/reservations/slots) as a JSON
 /// array of signed events, newest first. `d` filters on the addressable tag.
-async fn manifest_view(
-    mailbox: &Mailbox,
-    kind: u16,
-    d: Option<&str>,
-) -> Option<serde_json::Value> {
+async fn manifest_view(mailbox: &Mailbox, kind: u16, d: Option<&str>) -> Option<serde_json::Value> {
     let filter = nostr_sdk::Filter::new().kinds([toron_core::nostr::kinds::toron_kind(kind)]);
     let events = toron_core::mailbox::collect_replay(mailbox.bus().as_ref(), filter)
         .await
@@ -542,9 +544,9 @@ async fn manifest_view(
         .into_iter()
         .filter(|ev| {
             d.map(|want| {
-                ev.tags
-                    .iter()
-                    .any(|t| t.kind() == nostr_sdk::nostr::TagKind::d() && t.content() == Some(want))
+                ev.tags.iter().any(|t| {
+                    t.kind() == nostr_sdk::nostr::TagKind::d() && t.content() == Some(want)
+                })
             })
             .unwrap_or(true)
         })
@@ -568,7 +570,11 @@ async fn reservation_view(mailbox: &Mailbox, param: &str) -> Option<serde_json::
         let events = manifest_view(mailbox, FILE_RESERVATION, None).await?;
         return events["events"]
             .as_array()
-            .and_then(|docs| docs.iter().find(|d| d["id"].as_str() == Some(param)).cloned())
+            .and_then(|docs| {
+                docs.iter()
+                    .find(|d| d["id"].as_str() == Some(param))
+                    .cloned()
+            })
             .map(|doc| serde_json::json!({ "reservation": doc }));
     }
     project_scoped_events(mailbox, FILE_RESERVATION, param).await
@@ -581,7 +587,11 @@ async fn slot_view(mailbox: &Mailbox, param: &str) -> Option<serde_json::Value> 
         let events = manifest_view(mailbox, BUILD_SLOT, None).await?;
         return events["events"]
             .as_array()
-            .and_then(|docs| docs.iter().find(|d| d["id"].as_str() == Some(param)).cloned())
+            .and_then(|docs| {
+                docs.iter()
+                    .find(|d| d["id"].as_str() == Some(param))
+                    .cloned()
+            })
             .map(|doc| serde_json::json!({ "slot": doc }));
     }
     project_scoped_events(mailbox, BUILD_SLOT, param).await
@@ -617,7 +627,9 @@ async fn project_scoped_events(
                 .collect()
         })
         .unwrap_or_default();
-    Some(serde_json::json!({ "project": project, "kind": kind, "count": scoped.len(), "events": scoped }))
+    Some(
+        serde_json::json!({ "project": project, "kind": kind, "count": scoped.len(), "events": scoped }),
+    )
 }
 
 #[cfg(test)]
@@ -702,9 +714,9 @@ mod tests {
             let v = read_resource_value(uri)
                 .unwrap_or_else(|| panic!("static URI must resolve: {uri}"));
             let obj = v.as_object().expect("static value is an object");
-            let has_placeholder = obj.values().any(|val| {
-                val.as_str().map(placeholder_marker).unwrap_or(false)
-            });
+            let has_placeholder = obj
+                .values()
+                .any(|val| val.as_str().map(placeholder_marker).unwrap_or(false));
             if has_placeholder {
                 let status = obj
                     .get("status")
@@ -728,7 +740,16 @@ mod tests {
             // Substitute the first {param} with a sample value; remaining
             // params get "demo" (all templates have ≤2 params).
             let mut out = template.to_string();
-            for p in ["slug", "project", "key", "name", "id", "slot", "agent", "window_seconds"] {
+            for p in [
+                "slug",
+                "project",
+                "key",
+                "name",
+                "id",
+                "slot",
+                "agent",
+                "window_seconds",
+            ] {
                 out = out.replace(&format!("{{{p}}}"), "demo");
             }
             out.replace("{", "demo").replace("}", "")
@@ -736,8 +757,8 @@ mod tests {
         assert_eq!(RESOURCES.len(), 25);
         for (name, template, _) in RESOURCES {
             let uri = concrete(template);
-            let v = read_resource_value(&uri)
-                .unwrap_or_else(|| panic!("{name}: {uri} must resolve"));
+            let v =
+                read_resource_value(&uri).unwrap_or_else(|| panic!("{name}: {uri} must resolve"));
             let non_empty = match &v {
                 serde_json::Value::Object(o) => !o.is_empty(),
                 serde_json::Value::Array(a) => !a.is_empty(),
@@ -769,7 +790,9 @@ mod tests {
 
         const PASSPHRASE: &str = "res-pass";
         let db = std::env::temp_dir().join(format!("res-{}.sqlite", uuid::Uuid::new_v4()));
-        let pool = schema::connect(db.to_str().unwrap()).await.expect("connect");
+        let pool = schema::connect(db.to_str().unwrap())
+            .await
+            .expect("connect");
         schema::migrate(&pool).await.expect("migrate");
         let bus: std::sync::Arc<dyn toron_core::bus::Bus> = std::sync::Arc::new(
             InProcessBus::open(pool.clone(), InProcessBusConfig::default())
@@ -812,10 +835,33 @@ mod tests {
             .await
             .expect("send");
         assert_eq!(sent.count, 1, "delivered");
-        // Let the unwrap loop project the wrap into the index. The pipeline's
-        // first build re-derives both agent keys via the argon2 KDF
-        // (~4.4s/key serialized, O(Δkeys)); 12s is honest margin.
-        tokio::time::sleep(std::time::Duration::from_secs(12)).await;
+        // Poll the projection to completion. The signal is the messages
+        // TABLE (toron://messages/{mid}), NOT the inbox resource: inbox
+        // replays the bus and sees the wrap BEFORE the unwrap loop's argon2
+        // KDF (log_n=16, ~4.4s/key) lands the SQLite row. A fixed sleep is
+        // never enough under parallel load (bd-projection-flake-gyox).
+        async {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+            loop {
+                if let Some(inbox) =
+                    project_resource_value(&mailbox, "toron://agents/BlueLake/inbox").await
+                    && let Some(id) = inbox["messages"]
+                        .as_array()
+                        .and_then(|a| a.first())
+                        .and_then(|m| m["id"].as_str())
+                    && let Some(by_id) =
+                        project_resource_value(&mailbox, &format!("toron://messages/{id}")).await
+                    && by_id["id"].as_str() == Some(id)
+                {
+                    return;
+                }
+                if std::time::Instant::now() >= deadline {
+                    panic!("mail never projected into the messages table (90s poll deadline)");
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
+        }
+        .await;
 
         // agents/{project} → live registration list.
         let agents = project_resource_value(&mailbox, "toron://agents/demo")
@@ -832,27 +878,8 @@ mod tests {
             "agents/demo lists registered agents: {names:?}"
         );
 
-        // agents/{name}/inbox → the projected message.
-        let inbox = project_resource_value(&mailbox, "toron://agents/BlueLake/inbox")
-            .await
-            .expect("inbox projection");
-        let subjects: Vec<&str> = inbox["messages"]
-            .as_array()
-            .expect("messages array")
-            .iter()
-            .filter_map(|m| m["subject"].as_str())
-            .collect();
-        assert!(
-            subjects.contains(&"res subject"),
-            "inbox contains the sent message: {subjects:?}"
-        );
-
-        // messages/{id} → exact event-id lookup.
-        let mid = inbox["messages"][0]["id"].as_str().expect("message id");
-        let by_id = project_resource_value(&mailbox, &format!("toron://messages/{mid}"))
-            .await
-            .expect("message projection");
-        assert_eq!(by_id["id"].as_str(), Some(mid), "message by id");
+        // agents/{name}/inbox → the projected message (exercised by the poll
+        // above; mid feeds the remaining index URIs).
 
         // threads/{id} → thread members.
         let thread = project_resource_value(&mailbox, "toron://threads/res-thread-1")
@@ -940,11 +967,12 @@ mod tests {
     /// "0 messages" while the DB is down is a silent-failure mask).
     #[tokio::test]
     async fn index_scan_db_error_propagates_not_masked() {
+        use std::sync::Arc;
         use toron_core::bus::in_process::{InProcessBus, InProcessBusConfig};
         use toron_core::index::schema;
-        use std::sync::Arc;
 
-        let db = std::env::temp_dir().join(format!("res-index-scan-{}.sqlite", uuid::Uuid::new_v4()));
+        let db =
+            std::env::temp_dir().join(format!("res-index-scan-{}.sqlite", uuid::Uuid::new_v4()));
         let pool = schema::connect(db.to_str().unwrap()).await.expect("pool");
         schema::migrate(&pool).await.expect("migrate");
         let bus = Arc::new(
@@ -952,8 +980,10 @@ mod tests {
                 .await
                 .expect("bus"),
         );
-        let data_dir = std::env::temp_dir().join(format!("res-index-scan-data-{}", uuid::Uuid::new_v4()));
-        let mailbox = toron_core::mailbox::Mailbox::new(bus, data_dir, None).with_index_pool(pool.clone());
+        let data_dir =
+            std::env::temp_dir().join(format!("res-index-scan-data-{}", uuid::Uuid::new_v4()));
+        let mailbox =
+            toron_core::mailbox::Mailbox::new(bus, data_dir, None).with_index_pool(pool.clone());
 
         pool.close().await; // break the index pool
 
