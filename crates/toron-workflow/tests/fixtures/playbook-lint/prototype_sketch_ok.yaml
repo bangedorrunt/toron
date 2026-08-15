@@ -1,0 +1,18 @@
+# Passing control: sketch-mode prototype, n=2, text-only arms.
+name: prototype
+description: sketch prototype with two arms
+inputs:
+  - name: question
+  - name: n
+    default: 2
+  - name: mode
+    default: sketch
+steps:
+  - name: arms
+    action: parallel
+    over: "{{inputs.n}}"
+    each: { action: dispatch_job, assignee: x, spec: { profile: "@coder", task: "NON-COMPILING design sketch: API shapes, state machines, tradeoff table. /tmp/flywheel-proto-<run>-<arm>/ text only. No crate copy, no br." } }
+  - name: judge
+    action: dispatch_job
+    assignee: x
+    spec: { profile: "@oracle", task: "compare arms on named criteria; pick one" }

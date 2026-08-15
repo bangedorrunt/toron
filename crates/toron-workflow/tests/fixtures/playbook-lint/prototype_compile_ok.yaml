@@ -1,0 +1,20 @@
+# Passing control: compile-mode prototype declaring build-slot serialization
+# on the arms step (ADR-0019 Spec 7.2 amendment).
+name: prototype
+description: compile prototype serialized on the build slot
+inputs:
+  - name: question
+  - name: n
+    default: 2
+  - name: mode
+    default: compile
+steps:
+  - name: arms
+    build_slot: true
+    action: parallel
+    over: "{{inputs.n}}"
+    each: { action: dispatch_job, assignee: x, spec: { profile: "@coder", task: "one arm at a time: compile and measure {{inputs.question}}" } }
+  - name: judge
+    action: dispatch_job
+    assignee: x
+    spec: { profile: "@oracle", task: "compare arms on named criteria; pick one" }

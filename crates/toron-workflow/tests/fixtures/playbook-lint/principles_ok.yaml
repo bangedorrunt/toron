@@ -1,0 +1,16 @@
+# Passing control: valid principle names from the canonical 21-name registry
+# (ADR-0019 Spec 5).
+name: bug-fix
+description: bug-fix with principles
+principles: [fix-root-causes, prove-it-works, sequence-verifiable-units]
+graph:
+  nodes:
+    repro:
+      action: dispatch_job
+      assignee: x
+      spec: { profile: "@scout", task: "run/write the repro; ACCEPTANCE = command exits non-zero" }
+    fix:
+      needs: [repro]
+      action: dispatch_job
+      assignee: x
+      spec: { profile: "@coder", task: "minimal fix; VERIFY = test passes AND repro is gone" }

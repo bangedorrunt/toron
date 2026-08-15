@@ -277,6 +277,7 @@ pub fn spec_tick_workflow(spec: &CronSpec) -> Workflow {
         graph: spec.graph.clone(),
         inputs: Vec::new(),
         crew: None,
+        principles: Vec::new(),
     }
 }
 

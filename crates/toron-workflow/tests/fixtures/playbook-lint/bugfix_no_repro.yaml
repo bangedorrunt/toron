@@ -1,0 +1,15 @@
+# Failure mode: bug-fix graph with a fix node but NO repro node (ADR-0019
+# Spec 6: fix-root-causes).
+name: bug-fix
+description: fix without repro
+graph:
+  nodes:
+    tdd:
+      action: dispatch_job
+      assignee: x
+      spec: { profile: "@coder", task: "write a failing test" }
+    fix:
+      needs: [tdd]
+      action: dispatch_job
+      assignee: x
+      spec: { profile: "@coder", task: "minimal fix" }
