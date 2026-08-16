@@ -28,7 +28,7 @@ impl ToolServer {
     /// `send_message`: NIP-17 gift-wrapped fan-out.
     #[tool(
         name = "send_message",
-        description = "Send a NIP-17 gift-wrapped message to one or more recipients.",
+        description = "Send a NIP-17 gift-wrapped message to one or more recipients. REQUIRED: project_key, sender_name (your adjective+noun pin), to[], subject, body_md. Shell available? Prefer: flywheel mail send <proj> --to <names> --subject S --body B.",
         output_schema = rmcp::handler::server::tool::schema_for_output::<crate::responses::SendResultOut>(),
         annotations(title = "Send message", destructive_hint = true)
     )]
@@ -57,7 +57,7 @@ impl ToolServer {
     /// `reply_message`: reply within a thread (NIP-10 `e` reference).
     #[tool(
         name = "reply_message",
-        description = "Reply to a message within its thread (NIP-10 reply reference).",
+        description = "Reply to a message within its thread (NIP-10 reply reference). REQUIRED: project_key, sender_name (your adjective+noun pin), to[], subject, body_md. Thread context comes from args (thread_id) - no auto-parent resolution on toron; the flywheel facade resolves it.",
         output_schema = rmcp::handler::server::tool::schema_for_output::<crate::responses::SendResultOut>(),
         annotations(title = "Reply message", destructive_hint = true)
     )]

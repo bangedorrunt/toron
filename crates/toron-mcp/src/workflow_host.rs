@@ -686,10 +686,12 @@ mod tests {
                 trigger: Some(trigger),
                 policy: None,
                 guard: None,
+                principles: vec![],
                 steps: vec![Step {
                     name: Some("rec".into()),
                     guard: None,
                     on_error: StepOnError::Continue,
+                    build_slot: false,
                     action: Action::SendMessage {
                         to: vec!["nobody".into()],
                         subject: name.into(),

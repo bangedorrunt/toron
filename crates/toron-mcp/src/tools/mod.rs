@@ -605,6 +605,64 @@ mod tests {
         );
     }
 
+    /// bd-u612: the three crew-facing mail/release tools must carry REQUIRED
+    /// arg shapes in their descriptions. SEP-2567 stateless HTTP has no
+    /// per-session identity, so `sender_name`-required is BY DESIGN
+    /// (AM parity) — agents read descriptions BEFORE calling and were
+    /// guessing arg shapes (live schema-validation failures 2026-08-16).
+    /// Guard the tokens so a future description edit cannot silently drop
+    /// them again.
+    #[test]
+    fn crew_facing_tools_carry_required_arg_shapes() {
+        let tools = ToolServer::tool_router().list_all();
+        let desc = |name: &str| {
+            tools
+                .iter()
+                .find(|t| t.name.as_ref() == name)
+                .unwrap_or_else(|| panic!("tool {name} missing from surface"))
+                .description
+                .clone()
+                .unwrap_or_default()
+                .to_string()
+        };
+        // send_message: REQUIRED token lists the mandatory args + the shell
+        // escape hatch (agents with a shell should prefer `flywheel mail`).
+        let send = desc("send_message");
+        for token in ["REQUIRED: project_key, sender_name", "flywheel mail send"] {
+            assert!(
+                send.contains(token),
+                "send_message description missing {token:?}: {send}"
+            );
+        }
+        // reply_message: same REQUIRED + thread context comes from args
+        // (no auto-parent resolution on toron; the flywheel facade resolves).
+        let reply = desc("reply_message");
+        for token in [
+            "REQUIRED: project_key, sender_name",
+            "thread_id",
+            "auto-parent",
+        ] {
+            assert!(
+                reply.contains(token),
+                "reply_message description missing {token:?}: {reply}"
+            );
+        }
+        // release_file_reservations_by_reason: REQUIRED + the crew-visible
+        // release path (their own locks go via release_file_reservations /
+        // the CLI, not this operator hook).
+        let release = desc("release_file_reservations_by_reason");
+        for token in [
+            "REQUIRED: project_key, agent_name, bead_id",
+            "release_file_reservations",
+            "toron reserve release",
+        ] {
+            assert!(
+                release.contains(token),
+                "release_file_reservations_by_reason description missing {token:?}: {release}"
+            );
+        }
+    }
+
     /// S4 / bd-p2-id-type-end-to-end-v9dy: the toron MCP surface must be
     /// all-String for id-bearing fields (hex event ids; ADR-0007 D1 — never
     /// u64 in shared request/response types). Walk every tool's live

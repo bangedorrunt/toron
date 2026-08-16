@@ -146,7 +146,7 @@ impl ToolServer {
     /// == 0` is a clean no-op.
     #[tool(
         name = "release_file_reservations_by_reason",
-        description = "Release all file reservations whose reason is the given bead id (operator-signed; release-on-bead-close).",
+        description = "Release all file reservations whose reason is the given bead id (operator-signed; release-on-bead-close). REQUIRED: project_key, agent_name, bead_id. Operator/loop after-close hook; crews release their own locks via release_file_reservations (by agent_name) or CLI: toron reserve release --project <p> --as <pin>.",
         output_schema = rmcp::handler::server::tool::schema_for_output::<crate::responses::ReleaseResultOut>(),
         annotations(title = "Release reservations by reason", destructive_hint = true)
     )]
