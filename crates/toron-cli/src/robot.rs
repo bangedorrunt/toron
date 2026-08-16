@@ -275,7 +275,11 @@ pub async fn run_guard(mailbox: &Mailbox, cmd: &GuardCommand) -> anyhow::Result<
                 .as_agent
                 .clone()
                 .or_else(|| std::env::var("TORON_AGENT").ok())
-                .or_else(|| std::env::var("FLYWHEEL_MAIL_AS").ok());
+                .or_else(|| std::env::var("FLYWHEEL_MAIL_AS").ok())
+                // bd-2dox: AGENT_NAME is the mcp-agent-mail convention the
+                // chain-runner plugin enforces; the strict guard's fail-closed
+                // message points at it, so it must resolve here too.
+                .or_else(|| std::env::var("AGENT_NAME").ok());
             let staged = toron_core::mailbox::guard::staged_paths_in(&args.repo);
             let reservations = mailbox
                 .active_reservations_all_aliases(&args.project)
@@ -287,6 +291,74 @@ pub async fn run_guard(mailbox: &Mailbox, cmd: &GuardCommand) -> anyhow::Result<
                     exclusive: r.exclusive,
                 })
                 .collect::<Vec<_>>();
+            // bd-2dox strict sweep-guard: --strict or TORON_GUARD_STRICT
+            // non-"0" enables; TORON_GUARD_STRICT=0 is the operator escape
+            // hatch (logged, wins over the flag).
+            let strict = match std::env::var("TORON_GUARD_STRICT") {
+                Ok(v) if v == "0" => {
+                    eprintln!(
+                        "toron: TORON_GUARD_STRICT=0 — strict guard disabled for this session (operator escape hatch)"
+                    );
+                    false
+                }
+                Ok(_) => true,
+                Err(_) => args.strict,
+            };
+            if strict {
+                use toron_core::mailbox::guard::{StrictBlockKind, guard_check_strict};
+                let blocked = guard_check_strict(
+                    agent.as_deref(),
+                    &staged,
+                    &reservations,
+                    toron_core::mailbox::guard::SHARED_SAFE_PATHS,
+                );
+                if !blocked.is_empty() {
+                    let summary: Vec<String> = blocked
+                        .iter()
+                        .map(|b| match &b.kind {
+                            StrictBlockKind::HeldBy(h) => {
+                                format!("{} (held by {h})", b.path)
+                            }
+                            StrictBlockKind::Unreserved => {
+                                format!("{} (no active reservation)", b.path)
+                            }
+                            StrictBlockKind::Unattributed => b.path.clone(),
+                        })
+                        .collect();
+                    if agent.is_none() {
+                        eprintln!(
+                            "toron: strict guard: unattributed commit blocked — set AGENT_NAME=<pin> (or TORON_AGENT / FLYWHEEL_MAIL_AS)"
+                        );
+                    } else {
+                        eprintln!(
+                            "toron: strict guard blocked staged paths: {}",
+                            summary.join(", ")
+                        );
+                    }
+                }
+                let out = json!({
+                    "strict": true,
+                    "blocked": blocked.iter().map(|b| json!({
+                        "path": b.path,
+                        "reason": match &b.kind {
+                            StrictBlockKind::Unattributed => "unattributed",
+                            StrictBlockKind::HeldBy(_) => "held-by",
+                            StrictBlockKind::Unreserved => "unreserved",
+                        },
+                        "holder": match &b.kind {
+                            StrictBlockKind::HeldBy(h) => Some(h),
+                            _ => None,
+                        },
+                    })).collect::<Vec<_>>(),
+                    "agent": agent,
+                    "project": args.project,
+                });
+                print_json(&out)?;
+                // Explicit exit both ways: the demo mailbox keeps a
+                // background thread alive after the tokio runtime shuts down,
+                // which would HANG a pre-commit hook.
+                std::process::exit(if blocked.is_empty() { 0 } else { 1 });
+            }
             let blocked = toron_core::mailbox::guard::guard_check_blocked(
                 agent.as_deref(),
                 &staged,

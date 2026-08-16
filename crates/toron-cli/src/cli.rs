@@ -738,6 +738,13 @@ pub enum GuardCommand {
     /// (blocked) when a staged path is exclusively reserved by ANOTHER agent;
     /// exit 0 (allow) otherwise. Attribution: --as, else TORON_AGENT, else
     /// FLYWHEEL_MAIL_AS; an unattributed commit fails open (exit 0).
+    ///
+    /// `--strict` (bd-2dox sweep-guard): every staged path must be covered by
+    /// the committer's OWN active reservation or the shared-safe bookkeeping
+    /// list (.beads/issues.jsonl, .beads/beads.base.jsonl); an unattributed
+    /// commit FAILS CLOSED (exit 1). Env TORON_GUARD_STRICT=0 disables strict
+    /// for a session (operator escape hatch, logged); the installed hook
+    /// exports TORON_GUARD_STRICT=1 by default.
     Check(GuardCheckArgs),
 }
 
@@ -762,6 +769,11 @@ pub struct GuardCheckArgs {
     /// Committing agent name (overrides TORON_AGENT / FLYWHEEL_MAIL_AS).
     #[arg(long)]
     pub as_agent: Option<String>,
+    /// Strict sweep-guard (bd-2dox): staged paths must be covered by the
+    /// committer's OWN reservations (or shared-safe bookkeeping); blocks
+    /// unattributed commits fail-closed. TORON_GUARD_STRICT=0 disables.
+    #[arg(long)]
+    pub strict: bool,
 }
 
 // ---------------------------------------------------------------------------
