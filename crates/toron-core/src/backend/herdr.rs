@@ -429,11 +429,16 @@ impl Client {
         cwd: Option<&str>,
         label: Option<&str>,
         focus: bool,
+        env: Option<&std::collections::BTreeMap<String, String>>,
     ) -> Result<(WorkspaceInfo, PaneInfo), BackendError> {
-        let res = self.call(
-            "workspace.create",
-            json!({ "cwd": cwd, "label": label, "focus": focus }),
-        )?;
+        let mut params = serde_json::Map::new();
+        params.insert("cwd".into(), serde_json::json!(cwd));
+        params.insert("label".into(), serde_json::json!(label));
+        params.insert("focus".into(), serde_json::json!(focus));
+        if let Some(env) = env {
+            params.insert("env".into(), serde_json::json!(env));
+        }
+        let res = self.call("workspace.create", serde_json::Value::Object(params))?;
         let ws: WorkspaceInfo =
             serde_json::from_value(res.get("workspace").cloned().unwrap_or(res.clone()))
                 .map_err(|e| parse_err(e.to_string()))?;
@@ -558,6 +563,64 @@ impl Client {
         self.call("agent.send_keys", json!({ "target": target, "keys": keys }))
     }
 
+    // ---- pane primitives (H2, bd-harness-pane-send-text-7fe8) ----
+    //
+    // Wire shapes verified against `herdr api schema --json` (protocol 19,
+    // build 2026-08-04-d78e3d3b5126) and the live daemon 2026-08-15:
+    // `pane.send_text` takes { pane_id, text }; `pane.send_input` takes
+    // { pane_id, keys } (key combos incl. modifier chords ctrl+h/alt+x and
+    // named punctuation minus/plus); `pane.wait_for_output` takes
+    // { pane_id, source, match: { type: substring|regex, value }, ... }.
+    // NOTE: there is NO raw `pane.run` method in protocol 19 — the herdr CLI
+    // implements `herdr pane run` as send_text + Enter. [`Client::pane_run`]
+    // mirrors that composite so pane-scoped command execution needs no agent
+    // lifecycle (ADR-0019 CommandVerified).
+
+    /// `pane.send_text` — literal text into the pane's terminal (no Enter).
+    pub fn pane_send_text(&mut self, pane_id: &str, text: &str) -> Result<Value, BackendError> {
+        self.call(
+            "pane.send_text",
+            json!({ "pane_id": pane_id, "text": text }),
+        )
+    }
+
+    /// `pane.send_input` — key combos (modifier chords, named punctuation).
+    pub fn pane_send_input(&mut self, pane_id: &str, keys: &[&str]) -> Result<Value, BackendError> {
+        self.call(
+            "pane.send_input",
+            json!({ "pane_id": pane_id, "keys": keys }),
+        )
+    }
+
+    /// `pane.run` composite (no raw method in protocol 19): send the command
+    /// text, then an Enter keypress — the same shape `herdr pane run` uses.
+    pub fn pane_run(&mut self, pane_id: &str, command: &str) -> Result<Value, BackendError> {
+        self.pane_send_text(pane_id, command)?;
+        self.pane_send_input(pane_id, &["Enter"])
+    }
+
+    /// `pane.wait_for_output` — block until the pane's output matches
+    /// `pattern` (substring or regex per `match_type`) or `timeout_ms` elapses.
+    pub fn pane_wait_for_output(
+        &mut self,
+        pane_id: &str,
+        source: &str,
+        match_type: &str,
+        pattern: &str,
+        timeout_ms: Option<u64>,
+    ) -> Result<Value, BackendError> {
+        self.call(
+            "pane.wait_for_output",
+            json!({
+                "pane_id": pane_id,
+                "source": source,
+                "match": { "type": match_type, "value": pattern },
+                "strip_ansi": true,
+                "timeout_ms": timeout_ms,
+            }),
+        )
+    }
+
     pub fn worktree_create(
         &mut self,
         workspace_id: &str,
@@ -668,7 +731,7 @@ impl super::Backend for HerdrBackend {
 
     fn workspace_create(&self, label: Option<&str>) -> Result<WorkspaceInfo, BackendError> {
         let mut client = self.client.lock();
-        let (ws, _root) = client.workspace_create(None, label, false)?;
+        let (ws, _root) = client.workspace_create(None, label, false, None)?;
         Ok(ws)
     }
 
@@ -703,10 +766,9 @@ impl super::Backend for HerdrBackend {
         Ok(())
     }
 
-    fn pane_run(&self, _pane_id: &str, _command: &str) -> Result<(), BackendError> {
-        Err(BackendError::unsupported(
-            "herdr does not implement pane_run (no typed Client helper)",
-        ))
+    fn pane_run(&self, pane_id: &str, command: &str) -> Result<(), BackendError> {
+        self.client.lock().pane_run(pane_id, command)?;
+        Ok(())
     }
 
     fn pane_wait_output(
@@ -715,17 +777,11 @@ impl super::Backend for HerdrBackend {
         needle: &str,
         timeout_ms: u64,
     ) -> Result<serde_json::Value, BackendError> {
+        // H2: schema-conformant shape { pane_id, source, match } — the old
+        // { mode, pattern } shape is rejected by the live daemon
+        // ("missing field `source`", verified 2026-08-15).
         let mut client = self.client.lock();
-        let res = client.call_coded(
-            "pane.wait_for_output",
-            json!({
-                "pane_id": pane_id,
-                "mode": "match",
-                "pattern": needle,
-                "timeout_ms": timeout_ms,
-            }),
-        )?;
-        Ok(res)
+        client.pane_wait_for_output(pane_id, "recent", "substring", needle, Some(timeout_ms))
     }
 
     fn agent_list(&self) -> Result<Vec<AgentInfo>, BackendError> {
@@ -1146,6 +1202,199 @@ mod tests {
         assert_eq!(
             json!({ "timeout_ms": prompt_wait.timeout_ms, "until": prompt_wait.until.iter().map(|s| s.as_str()).collect::<Vec<_>>() }),
             wait
+        );
+    }
+}
+
+// ---- H2 pane primitives (bd-harness-pane-send-text-7fe8) ----
+//
+// Hermetic socket round-trips: a UnixListener in the test process speaks the
+// JSON-RPC side, so the typed Client methods are exercised end-to-end
+// (serialize request → socket → parse response) with no live daemon. The
+// module sits at the file root (not inside `mod tests`) so the full test
+// path is `backend::herdr::pane_send_tests::…` — the bead VERIFY filter
+// `cargo test -p toron-core backend::herdr::pane_send` matches it.
+#[cfg(test)]
+mod pane_send_tests {
+    use super::*;
+    use std::io::{BufRead, Write};
+    use std::os::unix::net::UnixListener;
+
+    fn test_sock(n: u32) -> String {
+        format!(
+            "{}/herdr-pane-test-{}-{n}.sock",
+            std::env::temp_dir().display(),
+            std::process::id()
+        )
+    }
+
+    /// Server thread: accept `expected.len()` connections; for each, read
+    /// one request line, assert method + params, reply `reply` with the
+    /// request's id echoed (one request per connection, like the real
+    /// daemon).
+    fn serve(
+        listener: UnixListener,
+        expected: Vec<(&'static str, Value)>,
+        reply: Value,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            // Client::connect probes reachability with a throwaway
+            // connection (connect + drop, no request) — consume it first.
+            let (probe, _) = listener.accept().expect("accept probe connection");
+            let mut probe_line = String::new();
+            std::io::BufReader::new(probe.try_clone().expect("clone probe"))
+                .read_line(&mut probe_line)
+                .expect("probe read");
+            assert!(probe_line.is_empty(), "probe must not send a request");
+            for (method, params) in expected {
+                let (mut sock, _) = listener.accept().expect("accept test connection");
+                let mut line = String::new();
+                std::io::BufReader::new(sock.try_clone().expect("clone"))
+                    .read_line(&mut line)
+                    .expect("read request line");
+                let req: Value = serde_json::from_str(&line).expect("parse request");
+                assert_eq!(req["method"].as_str(), Some(method), "wire method");
+                assert_eq!(&req["params"], &params, "wire params for {method}");
+                let resp = json!({ "id": req["id"], "result": reply });
+                let mut out = serde_json::to_string(&resp).expect("serialize response");
+                out.push('\n');
+                sock.write_all(out.as_bytes()).expect("write response");
+            }
+        })
+    }
+
+    #[test]
+    fn send_text_round_trip() {
+        let path = test_sock(1);
+        let listener = UnixListener::bind(&path).expect("bind");
+        let t = serve(
+            listener,
+            vec![(
+                "pane.send_text",
+                json!({ "pane_id": "w1:p1", "text": "echo SEND_TEXT_OK" }),
+            )],
+            json!({ "type": "ok" }),
+        );
+        let mut c = Client::connect(Some(&path)).expect("connect");
+        let res = c
+            .pane_send_text("w1:p1", "echo SEND_TEXT_OK")
+            .expect("pane.send_text ok");
+        assert_eq!(res, json!({ "type": "ok" }));
+        t.join().expect("server assertions");
+    }
+
+    #[test]
+    fn send_input_round_trip() {
+        let path = test_sock(2);
+        let listener = UnixListener::bind(&path).expect("bind");
+        let t = serve(
+            listener,
+            vec![(
+                "pane.send_input",
+                json!({ "pane_id": "w1:p1", "keys": ["ctrl+h"] }),
+            )],
+            json!({ "type": "ok" }),
+        );
+        let mut c = Client::connect(Some(&path)).expect("connect");
+        let res = c
+            .pane_send_input("w1:p1", &["ctrl+h"])
+            .expect("pane.send_input ok");
+        assert_eq!(res, json!({ "type": "ok" }));
+        t.join().expect("server assertions");
+    }
+
+    #[test]
+    fn run_composite_round_trip() {
+        // No raw pane.run in protocol 19: the composite sends the command
+        // text then an Enter keypress, on two connections (one request per
+        // connection) — the same shape `herdr pane run` uses.
+        let path = test_sock(3);
+        let listener = UnixListener::bind(&path).expect("bind");
+        let t = serve(
+            listener,
+            vec![
+                (
+                    "pane.send_text",
+                    json!({ "pane_id": "w1:p1", "text": "cargo test --quiet" }),
+                ),
+                (
+                    "pane.send_input",
+                    json!({ "pane_id": "w1:p1", "keys": ["Enter"] }),
+                ),
+            ],
+            json!({ "type": "ok" }),
+        );
+        let mut c = Client::connect(Some(&path)).expect("connect");
+        let res = c
+            .pane_run("w1:p1", "cargo test --quiet")
+            .expect("pane.run composite ok");
+        assert_eq!(res, json!({ "type": "ok" }));
+        t.join().expect("server assertions");
+    }
+
+    #[test]
+    fn wait_for_output_round_trip() {
+        let path = test_sock(4);
+        let listener = UnixListener::bind(&path).expect("bind");
+        let matched = json!({
+            "type": "output_matched",
+            "pane_id": "w1:p1",
+            "revision": 0,
+            "matched_line": "cargo test --quiet",
+        });
+        let t = serve(
+            listener,
+            vec![(
+                "pane.wait_for_output",
+                json!({
+                    "pane_id": "w1:p1",
+                    "source": "recent",
+                    "match": { "type": "regex", "value": "tests passed" },
+                    "strip_ansi": true,
+                    "timeout_ms": 5000,
+                }),
+            )],
+            matched,
+        );
+        let mut c = Client::connect(Some(&path)).expect("connect");
+        let res = c
+            .pane_wait_for_output("w1:p1", "recent", "regex", "tests passed", Some(5000))
+            .expect("pane.wait_for_output ok");
+        assert_eq!(res["type"].as_str(), Some("output_matched"));
+        assert_eq!(res["matched_line"].as_str(), Some("cargo test --quiet"));
+        t.join().expect("server assertions");
+    }
+
+    /// bd-harness-alt-screen-reads: agent.read source strings pass through
+    /// the wire UNTOUCHED — recent-unwrapped included. The client must never
+    /// rewrite or whitelist source semantics.
+    #[test]
+    fn agent_read_params_pass_sources_through_untouched() {
+        for source in ["recent", "visible", "recent-unwrapped", "weird source"] {
+            let p = agent_read_params("w1:p1", source, Some(40));
+            assert_eq!(p["target"], "w1:p1");
+            assert_eq!(p["source"], source, "source must not be rewritten");
+            assert_eq!(p["lines"], 40);
+            assert_eq!(p["format"], "text");
+            assert_eq!(p["strip_ansi"], true);
+        }
+        // None lines serializes as null (herdr contract: no line cap).
+        let p = agent_read_params("w1:p1", "recent-unwrapped", None);
+        assert_eq!(p["lines"], Value::Null);
+    }
+
+    /// bd-harness-alt-screen-reads: the wire agent_not_idle code maps to the
+    /// typed variant via parse_code — callers branch on code, never text.
+    #[test]
+    fn parse_code_maps_agent_not_idle() {
+        assert_eq!(parse_code("agent_not_idle"), BackendErrorCode::AgentNotIdle);
+        assert_eq!(
+            parse_code("agent_prompt_stalled"),
+            BackendErrorCode::AgentPromptStalled
+        );
+        assert_eq!(
+            parse_code("unknown_wire_code"),
+            BackendErrorCode::Other("unknown_wire_code".into())
         );
     }
 }
