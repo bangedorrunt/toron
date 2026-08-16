@@ -59,7 +59,7 @@ pub use jobs::{
     build_job_claim, build_job_error, build_job_progress, build_job_request, build_job_result,
     first_claimer, job_parent, job_request_json, job_state,
 };
-pub use lint::{Level, LintIssue, LintReport, lint_workflow, lint_yaml};
+pub use lint::{Level, LintIssue, LintReport, lint_workflow, lint_workflow_with_principles, lint_yaml};
 pub use mention::{
     Mention, build_job_from_coalesced, content_mentions, is_mention, parse_mentions,
     wire_mention_dispatch,
