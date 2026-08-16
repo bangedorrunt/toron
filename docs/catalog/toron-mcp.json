@@ -121,7 +121,7 @@
       "name": "workflow"
     }
   ],
-  "generated_at": "2026-08-15T08:01:35Z",
+  "generated_at": "2026-08-16T03:57:28Z",
   "resources": [
     {
       "description": "List projects known to toron.",
@@ -736,7 +736,7 @@
       "parity": "AM-Rust 38-tool surface"
     },
     {
-      "description": "Send a NIP-17 gift-wrapped message to one or more recipients.",
+      "description": "Send a NIP-17 gift-wrapped message to one or more recipients. REQUIRED: project_key, sender_name (your adjective+noun pin), to[], subject, body_md. Shell available? Prefer: flywheel mail send <proj> --to <names> --subject S --body B.",
       "example": {
         "ack_required": null,
         "attachment_paths": null,
@@ -926,7 +926,7 @@
       "parity": "AM-Rust 38-tool surface"
     },
     {
-      "description": "Reply to a message within its thread (NIP-10 reply reference).",
+      "description": "Reply to a message within its thread (NIP-10 reply reference). REQUIRED: project_key, sender_name (your adjective+noun pin), to[], subject, body_md. Thread context comes from args (thread_id) - no auto-parent resolution on toron; the flywheel facade resolves it.",
       "example": {
         "ack_required": null,
         "attachment_paths": null,

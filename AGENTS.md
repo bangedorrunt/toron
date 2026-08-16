@@ -68,7 +68,7 @@ When you add/remove/rename a CLI command or MCP tool, update ALL of:
 1. The `Command` enum (`crates/toron-cli/src/cli.rs`) — ground truth (compiles).
 2. The tool `#[tool(name = "...")]` in `crates/toron-mcp/src/tools/` — MCP surface (ADR-0020 wave 1: **no new tools**; CLI-only nouns still need steps 1, 3, 4).
 3. This AGENTS.md (STRUCTURE + CONVENTIONS sections).
-4. The skill: `~/.agents/skills/toron/SKILL.md` and `~/.grok/skills/toron/SKILL.md` CLI Surface + MCP Parity Surface + [crew-steering](references/crew-steering.md).
+4. The skill: `~/.agents/skills/toron/SKILL.md` CLI Surface + MCP Parity Surface + [crew-steering](references/crew-steering.md) — single canonical copy; grok and other harnesses read the same file (grok natively scans `~/.agents/skills/`, no mirror).
 5. The tool-count constant (AGENTS.md header + SKILL.md frontmatter) — only when an MCP tool actually changes.
 6. `toron catalog --json` + `cargo test catalog_freshness` when the CLI catalog grows.
 
