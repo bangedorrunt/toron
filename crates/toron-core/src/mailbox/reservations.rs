@@ -926,10 +926,7 @@ impl Mailbox {
     /// lease acquired after a force-release or release-by-reason is visible
     /// again — the release unlocked the path (bd-reacquire regression).
     /// Without any marker, plain key-priority resolution applies.
-    fn resolve_lease_state<'a>(
-        evs: Vec<&'a Event>,
-        operator: Option<&PublicKey>,
-    ) -> Option<Event> {
+    fn resolve_lease_state<'a>(evs: Vec<&'a Event>, operator: Option<&PublicKey>) -> Option<Event> {
         let newest_marker = evs
             .iter()
             .filter(|e| {
@@ -3228,10 +3225,7 @@ mod tests {
             .await
             .expect("re-acquire");
 
-        let active = mailbox
-            .active_reservations("demo")
-            .await
-            .expect("active");
+        let active = mailbox.active_reservations("demo").await.expect("active");
         assert_eq!(active.len(), 1, "re-acquired lease visible");
         assert_eq!(active[0].path_pattern, "src/x.rs");
         assert_eq!(active[0].agent_pubkey, rose.to_hex(), "new holder wins");
