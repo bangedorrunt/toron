@@ -268,6 +268,49 @@ pub async fn demo_mailbox_with_trigger()
     Ok((mailbox, rx))
 }
 
+/// bd-6wfv: build the mailbox from EXPLICIT paths instead of process-global
+/// env vars. The e2e parity suite boots one daemon per cluster test in
+/// PARALLEL threads — each `LiveDaemon::boot` used to set
+/// `TORON_MCP_DATA_DIR` / `TORON_OPERATOR_KEY` / `TORON_KEY_PASSPHRASE`, and
+/// the env set/read race made daemons boot against each other's data dirs
+/// (intermittent "no local key" / "unknown agent" flakes). Explicit
+/// arguments have no race: every daemon uses exactly its own dir + key.
+pub async fn build_mailbox_with_opts(
+    trigger_tx: Option<tokio::sync::mpsc::UnboundedSender<UnwrappedMail>>,
+    data_dir: std::path::PathBuf,
+    operator_key_path: std::path::PathBuf,
+    operator_passphrase: &str,
+) -> anyhow::Result<Mailbox> {
+    std::fs::create_dir_all(&data_dir)?;
+    let db = data_dir.join("index.sqlite");
+    let operator = toron_core::keys::load_encrypted_key(&operator_key_path, operator_passphrase)
+        .map(Some)
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "failed to load operator key from {}: {e}",
+                operator_key_path.display()
+            )
+        })?;
+    let pool = toron_core::index::schema::connect(db.to_str().unwrap()).await?;
+    toron_core::index::schema::migrate(&pool).await?;
+    // ADR-0017 (toron.dev ADR-0017 D3): fold pre-existing path-slug project
+    // roots into the alias table on open — legacy rows stay visible
+    // read-only through every spelling of the project key.
+    toron_core::mailbox::aliases::reconcile_aliases(&pool, &data_dir).await?;
+    let bus = toron_core::bus::InProcessBus::open(pool.clone(), Default::default()).await?;
+    let mut mailbox =
+        toron_core::mailbox::Mailbox::new(std::sync::Arc::new(bus), data_dir, operator)
+            .with_index_pool(pool);
+    if let Some(tx) = trigger_tx {
+        mailbox = mailbox.with_trigger_tx(tx);
+    }
+    // ADR-0004 inbound unwrap loop (bd-pkc): G14 + Overseer + projection
+    // LIVE — without it the async projection (unwrap → search/summarize
+    // sink) never lands and the parity search assertions stall.
+    mailbox.spawn_unwrap_loop();
+    Ok(mailbox)
+}
+
 async fn build_mailbox(
     trigger_tx: Option<tokio::sync::mpsc::UnboundedSender<UnwrappedMail>>,
 ) -> anyhow::Result<Mailbox> {
@@ -394,6 +437,28 @@ pub async fn serve_stdio() -> anyhow::Result<()> {
 /// The served handler carries the 38 AM-Rust parity tools (bd-led.7.2).
 pub async fn router() -> anyhow::Result<axum::Router> {
     let (mailbox, trigger_rx) = demo_mailbox_with_trigger().await?;
+    router_with_mailbox(mailbox, trigger_rx).await
+}
+
+/// bd-6wfv: [`router`] against an EXPLICIT data dir + operator key — no
+/// process-global env reads, so parallel e2e daemons cannot cross-contaminate
+/// (each cluster test boots its own daemon with its own paths). Production
+/// and the cli_robot cross-process tests keep using [`router`].
+pub async fn router_with_isolated(
+    data_dir: std::path::PathBuf,
+    operator_key_path: std::path::PathBuf,
+    operator_passphrase: &str,
+) -> anyhow::Result<axum::Router> {
+    let (tx, trigger_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mailbox =
+        build_mailbox_with_opts(Some(tx), data_dir, operator_key_path, operator_passphrase).await?;
+    router_with_mailbox(mailbox, trigger_rx).await
+}
+
+async fn router_with_mailbox(
+    mailbox: toron_core::mailbox::Mailbox,
+    trigger_rx: tokio::sync::mpsc::UnboundedReceiver<toron_core::mailbox::unwrap::UnwrappedMail>,
+) -> anyhow::Result<axum::Router> {
     spawn_mail_trigger_host(mailbox.clone(), trigger_rx);
     let server = ToronServer::new().with_mailbox(mailbox);
     let service: StreamableHttpService<ToronServer, LocalSessionManager> =

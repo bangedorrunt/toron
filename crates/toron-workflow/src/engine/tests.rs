@@ -1357,6 +1357,27 @@ fn probe_candidate_hits_local_listener() {
     let port = l.local_addr().unwrap().port();
     let url = format!("http://127.0.0.1:{port}");
     assert!(probe_candidate(&url), "bound listener answers");
+
+    // bd-6wfv: a freed ephemeral port can be REBOUND by a concurrent test
+    // binary before the second probe (the workspace runs all crates in
+    // parallel) — "drop and re-probe" is inherently racy. Instead, hold a
+    // socket bound but NOT listening: connections get a deterministic RST
+    // (refused) while the port stays reserved, so nothing else can take it.
     drop(l);
-    assert!(!probe_candidate(&url), "closed port is dead");
+    let socket = socket2::Socket::new(
+        socket2::Domain::IPV4,
+        socket2::Type::STREAM,
+        Some(socket2::Protocol::TCP),
+    )
+    .unwrap();
+    socket
+        .bind(&socket2::SockAddr::from(std::net::SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            port,
+        )))
+        .expect("re-bind the freed port before anyone else can");
+    assert!(
+        !probe_candidate(&url),
+        "bound-but-not-listening port is dead"
+    );
 }

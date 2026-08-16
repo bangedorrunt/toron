@@ -291,14 +291,26 @@ impl Mailbox {
     }
 
     /// Resolve a name → npub within a project (G2), or fail fast.
+    ///
+    /// ADR-0017: resolves across the project's full alias set (canonical +
+    /// every stored alias) — a profile registered under ANY spelling of the
+    /// project key is reachable from every other spelling (bd-6wfv: the raw
+    /// path-form slug must not break resolution; whois does the same).
     async fn resolve_agent_npub(
         &self,
         project_slug: &str,
         name: &str,
     ) -> anyhow::Result<PublicKey> {
-        let profiles = self.project_profiles(project_slug).await?;
-        crate::nostr::identity::resolve_name(project_slug, profiles.iter(), name)
-            .ok_or_else(|| anyhow::anyhow!("unknown agent: {name} in project {project_slug}"))
+        let set = self.project_read_set(project_slug).await;
+        for slug in &set {
+            let profiles = self.project_profiles(slug).await?;
+            if let Some(npub) = crate::nostr::identity::resolve_name(slug, profiles.iter(), name) {
+                return Ok(npub);
+            }
+        }
+        Err(anyhow::anyhow!(
+            "unknown agent: {name} in project {project_slug}"
+        ))
     }
 
     /// Upsert an AgentLink row (idempotent on (from_pubkey, to_pubkey)).
