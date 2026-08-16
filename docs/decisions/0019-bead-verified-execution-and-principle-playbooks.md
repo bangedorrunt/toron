@@ -1,6 +1,6 @@
 <!-- governed-by: ADR-0003, ADR-0005, ADR-0010, ADR-0011, ADR-0015 -->
 ---
-status: proposed
+status: accepted
 date: 2026-08-15
 decision-makers: Captain (bangedorrunt)
 consulted: grilling session 2026-08-15 (wave-1 locks); pre-acceptance review 2026-08-15 (br-gate verdict store, loop-run VERIFY, wave resequencing); pstack / poteto-mode (cursor/plugins) as prior art
@@ -9,7 +9,7 @@ informed: flywheel maintainers; toron-workflow / toron-core (no surface change)
 
 # ADR-0019: Adopt Bead-Verified Execution, Bake Engineering Principles into Structure, and Ship Playbook Workflows
 
-**Status:** Proposed (2026-08-15)
+**Status:** Accepted (2026-08-15, captain)
 **Date:** 2026-08-15
 **Decision-makers:** Captain (bangedorrunt) — grilling session locked wave 1; this record is the full program
 **Extends:** [ADR-0005](0005-orchestration-layer.md) (profiles, stages, built-in workflows), [ADR-0010](0010-execution-wiring-model-registry-headless.md) (real runner, role conditioning, headless), [ADR-0011](0011-coalition-orchestration.md) (intents + reservations)
