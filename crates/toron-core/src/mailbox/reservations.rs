@@ -921,6 +921,39 @@ impl Mailbox {
         })
     }
 
+    /// Resolve a coordinate's current state with tombstone semantics: a
+    /// revocation/release marker covers only events OLDER than itself, so a
+    /// lease acquired after a force-release or release-by-reason is visible
+    /// again — the release unlocked the path (bd-reacquire regression).
+    /// Without any marker, plain key-priority resolution applies.
+    fn resolve_lease_state<'a>(
+        evs: Vec<&'a Event>,
+        operator: Option<&PublicKey>,
+    ) -> Option<Event> {
+        let newest_marker = evs
+            .iter()
+            .filter(|e| {
+                matches!(
+                    lease_status(e),
+                    ReservationStatus::Revoked | ReservationStatus::Released
+                )
+            })
+            .max_by(|a, b| a.created_at.as_secs().cmp(&b.created_at.as_secs()));
+        let Some(marker) = newest_marker else {
+            return resolve_coordinate(evs, operator);
+        };
+        let cutoff = marker.created_at.as_secs();
+        let newer: Vec<&'a Event> = evs
+            .iter()
+            .filter(|e| e.created_at.as_secs() > cutoff)
+            .copied()
+            .collect();
+        if newer.is_empty() {
+            return Some((*marker).clone());
+        }
+        resolve_coordinate(newer, operator)
+    }
+
     /// Active (non-revoked, non-released, non-expired) kind-30031 events in a
     /// project, resolved with operator priority (bd-toh) and classified by
     /// status. Both held leases and intents flow through here — the single
@@ -949,7 +982,7 @@ impl Mailbox {
         }
         let mut out = Vec::new();
         for (d, evs) in by_d {
-            let Some(winning) = resolve_coordinate(evs.iter().copied(), operator.as_ref()) else {
+            let Some(winning) = Self::resolve_lease_state(evs, operator.as_ref()) else {
                 continue;
             };
             let status = lease_status(&winning);
@@ -3128,6 +3161,80 @@ mod tests {
             1,
             "bd-XX lease untouched"
         );
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// Regression (bd-reacquire): a lease acquired AFTER an operator
+    /// revocation at the same coordinate must be visible again — the
+    /// revocation released the OLD lease (bead-closed), it does not
+    /// permanently shadow the path. Without the fix, key-priority
+    /// resolution lets the revocation (no TTL, operator class) outrank a
+    /// newer agent lease forever.
+    #[tokio::test]
+    async fn test_reacquire_after_revoke_becomes_visible() {
+        let (mailbox, db_path, data_dir) = test_mailbox("revoke-reacquire").await;
+        let rose = register(&mailbox, "demo", "RoseDune").await;
+        register(&mailbox, "demo", "BlueLake").await;
+
+        // BlueLake acquires src/x.rs under reason bd-X.
+        mailbox
+            .file_reservation_paths(
+                "demo",
+                "BlueLake",
+                &["src/x.rs".into()],
+                Some(3600),
+                true,
+                Some("bd-X"),
+            )
+            .await
+            .expect("acquire");
+        assert_eq!(
+            mailbox
+                .active_reservations("demo")
+                .await
+                .expect("active")
+                .len(),
+            1,
+            "lease active before release"
+        );
+
+        // Operator release-by-reason revokes it (bead-closed).
+        let r = mailbox
+            .release_by_reason("demo", "operator", "bd-X", false)
+            .await
+            .expect("release");
+        assert_eq!(r.released, 1);
+        assert!(
+            mailbox
+                .active_reservations("demo")
+                .await
+                .expect("active")
+                .is_empty(),
+            "revoked lease not active"
+        );
+
+        // RoseDune re-acquires the same path immediately (release unlocked it).
+        mailbox
+            .file_reservation_paths(
+                "demo",
+                "RoseDune",
+                &["src/x.rs".into()],
+                Some(3600),
+                true,
+                Some("bd-Y"),
+            )
+            .await
+            .expect("re-acquire");
+
+        let active = mailbox
+            .active_reservations("demo")
+            .await
+            .expect("active");
+        assert_eq!(active.len(), 1, "re-acquired lease visible");
+        assert_eq!(active[0].path_pattern, "src/x.rs");
+        assert_eq!(active[0].agent_pubkey, rose.to_hex(), "new holder wins");
 
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_dir_all(&data_dir);
