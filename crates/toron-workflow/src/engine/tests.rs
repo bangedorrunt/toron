@@ -1364,6 +1364,13 @@ fn probe_candidate_hits_local_listener() {
     // socket bound but NOT listening: connections get a deterministic RST
     // (refused) while the port stays reserved, so nothing else can take it.
     drop(l);
+
+    // bd-4spn follow-up (captain 2026-08-16): the previous drop-then-rebind
+    // of the SAME port had a race window — another test binary could bind it
+    // between the drop and the rebind, failing the re-bind expect. For the
+    // dead-port case, take a kernel-assigned FRESH port (bind :0) and never
+    // listen: connections get a deterministic RST while the port stays
+    // reserved, and there is no freed-port window to lose.
     let socket = socket2::Socket::new(
         socket2::Domain::IPV4,
         socket2::Type::STREAM,
@@ -1373,11 +1380,21 @@ fn probe_candidate_hits_local_listener() {
     socket
         .bind(&socket2::SockAddr::from(std::net::SocketAddr::new(
             std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-            port,
+            0,
         )))
-        .expect("re-bind the freed port before anyone else can");
+        .expect("kernel-assigned fresh port");
+    let dead_port = socket
+        .local_addr()
+        .unwrap()
+        .as_socket()
+        .expect("ipv4 socket addr")
+        .port();
+    let dead_url = format!("http://127.0.0.1:{dead_port}");
     assert!(
-        !probe_candidate(&url),
+        !probe_candidate(&dead_url),
         "bound-but-not-listening port is dead"
     );
+    // first listener's port is now freed; probing it would be racy again, so
+    // the live case was asserted BEFORE the drop above.
+    let _ = &url;
 }
