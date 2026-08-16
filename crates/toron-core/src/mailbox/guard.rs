@@ -72,6 +72,87 @@ pub fn guard_blocked_paths(
         .collect()
 }
 
+// ---------------------------------------------------------------------------
+// bd-2dox strict sweep-guard: every staged path must be covered by the
+// committer's OWN active reservation or the shared-safe bookkeeping list.
+// ---------------------------------------------------------------------------
+
+/// Shared-safe bookkeeping paths: tracker files every lane must touch to
+/// claim/close beads — never require a reservation of their own.
+pub const SHARED_SAFE_PATHS: &[&str] = &[".beads/issues.jsonl", ".beads/beads.base.jsonl"];
+
+/// Why a staged path fails the strict guard (bd-2dox).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StrictBlockKind {
+    /// No agent attribution — the commit cannot be verified (fail-closed).
+    Unattributed,
+    /// Another agent holds an active exclusive reservation on the path.
+    HeldBy(String),
+    /// Staged but covered by no active reservation at all.
+    Unreserved,
+}
+
+/// One strict-guard violation: the offending path + why it blocked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StrictBlock {
+    pub path: String,
+    pub kind: StrictBlockKind,
+}
+
+/// Strict sweep-guard (bd-2dox): every staged path must match (a) the
+/// committing agent's OWN active reservation (exclusive or shared — a
+/// shared lease is still the agent's own coverage, it never blocks others),
+/// or (b) the shared-safe bookkeeping list. Violations return per path with
+/// the reason; empty = commit allowed.
+///
+/// FAIL-CLOSED on attribution: `agent == None` blocks every staged path
+/// with `Unattributed` — an unattributed commit cannot be verified and must
+/// never silently pass (root cause 2: the legacy `guard_check_blocked`
+/// fails open). The legacy function stays byte-identical for non-strict
+/// surfaces.
+pub fn guard_check_strict(
+    agent: Option<&str>,
+    staged: &[String],
+    reservations: &[Reservation],
+    shared_safe: &[&str],
+) -> Vec<StrictBlock> {
+    let Some(agent) = agent else {
+        return staged
+            .iter()
+            .map(|p| StrictBlock {
+                path: p.clone(),
+                kind: StrictBlockKind::Unattributed,
+            })
+            .collect();
+    };
+    let mut blocked = Vec::new();
+    for path in staged {
+        if shared_safe.contains(&path.as_str()) {
+            continue;
+        }
+        let own = reservations
+            .iter()
+            .any(|r| r.holder == agent && pattern_matches(&r.pattern, path));
+        if own {
+            continue;
+        }
+        match reservations
+            .iter()
+            .find(|r| r.exclusive && r.holder != agent && pattern_matches(&r.pattern, path))
+        {
+            Some(r) => blocked.push(StrictBlock {
+                path: path.clone(),
+                kind: StrictBlockKind::HeldBy(r.holder.clone()),
+            }),
+            None => blocked.push(StrictBlock {
+                path: path.clone(),
+                kind: StrictBlockKind::Unreserved,
+            }),
+        }
+    }
+    blocked
+}
+
 /// fnmatch-style glob matcher (AM-Rust parity): supports `*`, `?`, `**`,
 /// and `[...]` character classes. `*` matches any run of chars (including
 /// `/`); `**` is equivalent to `*` for path matching (fnmatch semantics).
@@ -182,6 +263,28 @@ pub fn install_precommit_guard(repo_path: &Path, project: &str) -> anyhow::Resul
     let hooks = git_dir.join("hooks");
     std::fs::create_dir_all(&hooks)?;
     let script_path = hooks.join("pre-commit");
+    let legacy_path = hooks.join("pre-commit.legacy");
+
+    // bd-2dox: never clobber a pre-existing hook (the legacy mcp-agent-mail
+    // chain-runner in the flywheel repo). Preserve it as pre-commit.legacy
+    // and chain it AFTER the guard. NOT pre-commit.orig: the legacy
+    // chain-runner itself looks for pre-commit.orig and would exec itself
+    // (infinite recursion) if parked there. If BOTH a foreign pre-commit
+    // and a pre-commit.legacy exist, refuse — there is no lossless place
+    // for the legacy hook.
+    let existing_is_toron = script_path.exists()
+        && std::fs::read_to_string(&script_path)
+            .map(|s| s.contains("installed by toron"))
+            .unwrap_or(false);
+    if script_path.exists() && !existing_is_toron {
+        if legacy_path.exists() {
+            anyhow::bail!(
+                "cannot install toron guard: {legacy_path:?} already exists (would clobber a \
+                 preserved hook). Move it aside and retry."
+            );
+        }
+        std::fs::rename(&script_path, &legacy_path)?;
+    }
 
     let git_binary_override = std::env::var("TORON_GIT_BINARY").unwrap_or_default();
     let export = if git_binary_override.is_empty() {
@@ -193,10 +296,21 @@ pub fn install_precommit_guard(repo_path: &Path, project: &str) -> anyhow::Resul
     let script = format!(
         "#!/bin/sh\n\
          # installed by toron — governed-by: ADR-0003\n\
-         # Blocks commits that stage paths exclusively reserved by another agent.\n\
+         # Strict staged-paths sweep-guard (bd-2dox): a commit may only stage\n\
+         # paths covered by the committer's OWN active reservation (or the\n\
+         # .beads bookkeeping files). Attribution: set AGENT_NAME=<pin>\n\
+         # (or TORON_AGENT / FLYWHEEL_MAIL_AS).\n\
+         # Session escape hatch: TORON_GUARD_STRICT=0 <commit> (logged).\n\
          {export}\
          if command -v toron >/dev/null 2>&1; then\n\
-         \texec toron guard check --repo \"$PWD\" --project {project}\n\
+         \texport TORON_GUARD_STRICT=\"${{TORON_GUARD_STRICT:-1}}\"\n\
+         \ttoron guard check --repo \"$PWD\" --project {project}\n\
+         \trc=$?\n\
+         \tif [ \"$rc\" -ne 0 ]; then exit \"$rc\"; fi\n\
+         fi\n\
+         # chain a pre-existing hook preserved at install (never clobbered)\n\
+         if [ -x \"$(dirname \"$0\")/pre-commit.legacy\" ]; then\n\
+         \texec \"$(dirname \"$0\")/pre-commit.legacy\" \"$@\"\n\
          fi\n\
          exit 0\n"
     );
@@ -210,7 +324,8 @@ pub fn install_precommit_guard(repo_path: &Path, project: &str) -> anyhow::Resul
 /// Remove the toron-installed pre-commit guard (idempotent).
 ///
 /// Only removes a script that carries the toron marker; a user's own
-/// pre-commit hook is never clobbered.
+/// pre-commit hook is never clobbered. When install preserved a legacy hook
+/// as `pre-commit.legacy`, uninstall restores it to `pre-commit`.
 pub fn uninstall_precommit_guard(repo_path: &Path) -> anyhow::Result<bool> {
     let repo = git2::Repository::open(repo_path)?;
     let script_path = repo.path().join("hooks").join("pre-commit");
@@ -222,6 +337,10 @@ pub fn uninstall_precommit_guard(repo_path: &Path) -> anyhow::Result<bool> {
         return Ok(false);
     }
     std::fs::remove_file(&script_path)?;
+    let legacy_path = repo.path().join("hooks").join("pre-commit.legacy");
+    if legacy_path.exists() {
+        std::fs::rename(&legacy_path, &script_path)?;
+    }
     Ok(true)
 }
 
@@ -517,6 +636,220 @@ mod tests {
             vec!["docs/plan.md".to_string()],
             "clean tracked files must NOT appear as staged"
         );
+        drop(repo);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    // ------------------------------------------------------------------
+    // bd-2dox: strict sweep-guard — every staged path must be covered by the
+    // committer's OWN active reservation or the shared-safe bookkeeping list.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn strict_blocks_cross_agent_exclusive() {
+        // B stages A's exclusively-reserved file + B's own file. B's own
+        // path passes; A's path is blocked naming the holder.
+        let staged = vec!["src/foo.rs".to_string(), "src/b.rs".to_string()];
+        let reservations = vec![res("A", "src/foo.rs", true), res("B", "src/b.rs", true)];
+        let blocked = guard_check_strict(Some("B"), &staged, &reservations, SHARED_SAFE_PATHS);
+        assert_eq!(blocked.len(), 1, "only A's path blocks: {blocked:?}");
+        assert_eq!(blocked[0].path, "src/foo.rs");
+        assert_eq!(blocked[0].kind, StrictBlockKind::HeldBy("A".into()));
+    }
+
+    #[test]
+    fn strict_allows_own_reserved_paths() {
+        let staged = vec!["src/lib.rs".to_string(), "docs/plan.md".to_string()];
+        let reservations = vec![res("me", "src/**", true), res("me", "docs/**", true)];
+        let blocked = guard_check_strict(Some("me"), &staged, &reservations, SHARED_SAFE_PATHS);
+        assert!(
+            blocked.is_empty(),
+            "own reservations cover every staged path"
+        );
+    }
+
+    #[test]
+    fn strict_own_shared_reservation_covers() {
+        // A SHARED lease is still the agent's own active reservation — it
+        // covers the staged path in strict mode (it never blocks others).
+        let staged = vec!["src/lib.rs".to_string()];
+        let reservations = vec![res("me", "src/**", false)];
+        let blocked = guard_check_strict(Some("me"), &staged, &reservations, SHARED_SAFE_PATHS);
+        assert!(blocked.is_empty(), "own shared lease covers the path");
+    }
+
+    #[test]
+    fn strict_allows_beads_bookkeeping_without_reservation() {
+        // Tracker bookkeeping files are never reserved; the shared-safe list
+        // lets them through so every lane can close beads.
+        let staged = vec![
+            ".beads/issues.jsonl".to_string(),
+            ".beads/beads.base.jsonl".to_string(),
+        ];
+        let blocked = guard_check_strict(Some("me"), &staged, &[], SHARED_SAFE_PATHS);
+        assert!(
+            blocked.is_empty(),
+            "bookkeeping is shared-safe: {blocked:?}"
+        );
+    }
+
+    #[test]
+    fn strict_blocks_unattributed_fail_closed() {
+        // The sweep-guard must NOT fail open: with no agent attribution the
+        // committer's staged paths cannot be verified — block with the env
+        // message (exit 1, never a silent pass-through).
+        let staged = vec!["src/lib.rs".to_string()];
+        let reservations = vec![res("me", "src/**", true)];
+        let blocked = guard_check_strict(None, &staged, &reservations, SHARED_SAFE_PATHS);
+        assert_eq!(blocked.len(), 1);
+        assert_eq!(blocked[0].kind, StrictBlockKind::Unattributed);
+    }
+
+    #[test]
+    fn strict_blocks_unreserved_path() {
+        // A staged path covered by NO reservation is a sweep risk — the
+        // strict guard requires the committer to reserve what they stage.
+        let staged = vec!["src/lib.rs".to_string()];
+        let blocked = guard_check_strict(Some("me"), &staged, &[], SHARED_SAFE_PATHS);
+        assert_eq!(blocked.len(), 1);
+        assert_eq!(blocked[0].path, "src/lib.rs");
+        assert_eq!(blocked[0].kind, StrictBlockKind::Unreserved);
+    }
+
+    #[test]
+    fn strict_foreign_shared_lease_never_blocks_own_coverage() {
+        // Another agent's SHARED lease does not block; the path is covered
+        // by the committer's own exclusive lease.
+        let staged = vec!["src/lib.rs".to_string()];
+        let reservations = vec![res("other", "src/**", false), res("me", "src/lib.rs", true)];
+        let blocked = guard_check_strict(Some("me"), &staged, &reservations, SHARED_SAFE_PATHS);
+        assert!(blocked.is_empty());
+    }
+
+    #[test]
+    fn strict_mixed_report_names_each_violation() {
+        let staged = vec![
+            "a/hers.rs".to_string(),           // HeldBy(Other)
+            "b/unowned.rs".to_string(),        // Unreserved
+            "c/mine.rs".to_string(),           // own — passes
+            ".beads/issues.jsonl".to_string(), // shared-safe — passes
+        ];
+        let reservations = vec![res("Other", "a/**", true), res("me", "c/**", true)];
+        let blocked = guard_check_strict(Some("me"), &staged, &reservations, SHARED_SAFE_PATHS);
+        assert_eq!(blocked.len(), 2, "two violations named: {blocked:?}");
+        assert_eq!(
+            blocked[0],
+            StrictBlock {
+                path: "a/hers.rs".into(),
+                kind: StrictBlockKind::HeldBy("Other".into())
+            }
+        );
+        assert_eq!(
+            blocked[1],
+            StrictBlock {
+                path: "b/unowned.rs".into(),
+                kind: StrictBlockKind::Unreserved
+            }
+        );
+    }
+
+    #[test]
+    fn strict_non_strict_paths_unchanged() {
+        // Sanity: the legacy fail-open check is untouched (byte-identical
+        // behavior for non-strict surfaces).
+        let staged = vec!["src/lib.rs".to_string()];
+        let reservations = vec![res("other", "src/**", true)];
+        assert!(guard_check_blocked(None, &staged, &reservations).is_empty());
+        assert_eq!(
+            guard_check_blocked(Some("me"), &staged, &reservations),
+            vec!["src/lib.rs".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_install_preserves_existing_hook_as_legacy_and_chains() {
+        // bd-2dox: installing into a repo with a pre-existing non-toron hook
+        // (the legacy mcp-agent-mail chain-runner) must preserve it as
+        // pre-commit.legacy and chain it AFTER the guard — never clobber.
+        // NOT pre-commit.orig: the chain-runner itself execs pre-commit.orig
+        // and would recurse infinitely if parked there.
+        let root = std::env::temp_dir().join(format!(
+            "toron-guard-chain-{}-{}.git",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).expect("create repo dir");
+        let repo = git2::Repository::init(&root).expect("init repo");
+        let hooks = repo.path().join("hooks");
+        std::fs::create_dir_all(&hooks).expect("hooks dir");
+        let script_path = hooks.join("pre-commit");
+        std::fs::write(
+            &script_path,
+            "#!/usr/bin/env python3\n# legacy chain-runner\n",
+        )
+        .expect("write");
+
+        let hook = install_precommit_guard(&root, "demo").expect("install");
+        let legacy = hooks.join("pre-commit.legacy");
+        assert!(
+            legacy.exists(),
+            "legacy hook preserved as pre-commit.legacy"
+        );
+        let contents = std::fs::read_to_string(&hook).expect("read hook");
+        assert!(
+            contents.contains("TORON_GUARD_STRICT"),
+            "strict env default in hook"
+        );
+        assert!(
+            contents.contains("pre-commit.legacy"),
+            "hook chains the preserved legacy hook"
+        );
+
+        // Uninstall restores the legacy hook.
+        let removed = uninstall_precommit_guard(&root).expect("uninstall");
+        assert!(removed);
+        let restored = std::fs::read_to_string(&script_path).expect("read restored");
+        assert!(
+            restored.contains("legacy chain-runner"),
+            "legacy hook restored"
+        );
+        assert!(
+            !restored.contains("installed by toron"),
+            "toron script gone from pre-commit"
+        );
+        assert!(!legacy.exists(), "legacy consumed on restore");
+        drop(repo);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn test_install_refuses_to_clobber_when_legacy_occupied() {
+        // If BOTH a foreign pre-commit and a pre-commit.legacy exist, install
+        // must refuse (cannot preserve without overwriting) — never silent
+        // clobber.
+        let root = std::env::temp_dir().join(format!(
+            "toron-guard-clobber-{}-{}.git",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).expect("create repo dir");
+        let repo = git2::Repository::init(&root).expect("init repo");
+        let hooks = repo.path().join("hooks");
+        std::fs::create_dir_all(&hooks).expect("hooks dir");
+        std::fs::write(hooks.join("pre-commit"), "#!/bin/sh\n# foreign\n").expect("write");
+        std::fs::write(
+            hooks.join("pre-commit.legacy"),
+            "#!/bin/sh\n# legacy occupied\n",
+        )
+        .expect("write");
+
+        let err = install_precommit_guard(&root, "demo").expect_err("must refuse");
+        assert!(
+            err.to_string().contains("pre-commit.legacy"),
+            "error names the occupied path: {err}"
+        );
+        let still = std::fs::read_to_string(hooks.join("pre-commit")).expect("read");
+        assert!(still.contains("foreign"), "foreign hook untouched");
         drop(repo);
         let _ = std::fs::remove_dir_all(root);
     }

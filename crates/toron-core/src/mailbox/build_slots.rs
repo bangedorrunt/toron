@@ -90,6 +90,21 @@ impl Mailbox {
         )
         .await?;
 
+        // bd-2dox: a build-slot acquire extends the holder's active file
+        // reservations by the claimed liveness window (capped at 1h). A 4+
+        // min cargo run outlives a short reservation TTL; without this the
+        // strict pre-commit guard sees the files as unreserved when the
+        // commit lands after the build (the sweep root-cause 3). Best-effort
+        // only: slot acquisition is primary, a renewal failure never fails
+        // the slot. The cap bounds stale-lock risk from a default 90d slot.
+        let extend = ttl_secs.min(3600);
+        if let Err(e) = self
+            .renew_file_reservations(project_slug, agent_name, &[], extend)
+            .await
+        {
+            eprintln!("toron: warn: slot acquire could not renew file reservations: {e:#}");
+        }
+
         Ok(AcquireBuildSlotResult {
             granted: vec![slots::GrantedSlot {
                 slot: slot.to_string(),
@@ -262,6 +277,57 @@ mod tests {
             .await
             .expect("re-acquire a");
         assert_eq!(a2.granted.len(), 1, "own lease never conflicts");
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// bd-2dox: a build-slot acquire renews the holder's active file
+    /// reservations — a 4+ min cargo run outlives a short reservation TTL,
+    /// and the strict pre-commit guard then no longer sees the files as
+    /// own-covered when the commit lands after the build.
+    #[tokio::test]
+    async fn slot_acquire_renews_holders_file_reservations() {
+        let (mailbox, db_path, data_dir) = test_mailbox("renewres").await;
+        register(&mailbox, "BlueLake").await;
+
+        // Hold a SHORT-TTL reservation (60s) on src/**.
+        let held = mailbox
+            .file_reservation_paths(
+                "demo",
+                "BlueLake",
+                &["src/**".to_string()],
+                Some(60),
+                true,
+                None,
+            )
+            .await
+            .expect("reserve");
+        assert_eq!(held.granted.len(), 1);
+        let before = held.granted[0].expires_ts_us.expect("expiry");
+
+        // Acquire a cargo slot with a 1h window.
+        let slot = mailbox
+            .acquire_build_slot("demo", "BlueLake", "cargo", Some(3600), true)
+            .await
+            .expect("acquire slot");
+        assert_eq!(slot.granted.len(), 1, "slot granted");
+
+        // The reservation's expiry must have been extended past the 60s
+        // original (renewed: remaining 60s < extend 3600s → not skipped by
+        // the bd-evqs cap).
+        let after = mailbox
+            .active_reservations_all_aliases("demo")
+            .await
+            .expect("active")
+            .into_iter()
+            .find(|r| r.path_pattern == "src/**")
+            .expect("lease still active");
+        let after_exp = after.expires_ts_us.expect("extended expiry");
+        assert!(
+            after_exp > before + 300_000_000,
+            "reservation renewed by the slot acquire: before={before} after={after_exp}"
+        );
 
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_dir_all(&data_dir);
