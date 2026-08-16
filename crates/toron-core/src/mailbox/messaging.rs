@@ -762,15 +762,21 @@ impl Mailbox {
                     // An unregistered pin fails at resolve_name below
                     // ("register it first") — matching D1a (registered pins
                     // are routing targets; unregistered free strings are not).
+                    // The FOLDED ALIAS check precedes the pin-pattern match:
+                    // an explicit legacy-name fold is the authoritative
+                    // mapping (bd-6wfv) — a folded legacy name routes to its
+                    // canonical even when the legacy registration row still
+                    // exists (it would otherwise pattern-match as a pin and
+                    // route to the stale registration).
                     let target: String =
-                        if super::naming::is_canonical_name(name, &args.project_slug)
-                            || super::naming::is_adjnoun_pin(name)
-                        {
+                        if super::naming::is_canonical_name(name, &args.project_slug) {
                             name.clone()
                         } else if let Some(folded) =
                             self.agent_name_alias(&args.project_slug, name).await
                         {
                             folded
+                        } else if super::naming::is_adjnoun_pin(name) {
+                            name.clone()
                         } else {
                             anyhow::bail!(
                                 "unknown recipient: {name} — project {} routes by canonical \

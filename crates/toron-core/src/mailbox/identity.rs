@@ -457,12 +457,16 @@ impl Mailbox {
         // ONLY; display names are non-routable profile metadata.
         let mode = self.project_identity_mode(&canonical).await;
         let target: String = if mode == crate::mailbox::naming::IdentityMode::Swarm {
-            if super::naming::is_canonical_name(name, &canonical)
-                || super::naming::is_adjnoun_pin(name)
-            {
+            if super::naming::is_canonical_name(name, &canonical) {
                 name.to_string()
             } else if let Some(folded) = self.agent_name_alias(&canonical, name).await {
+                // bd-6wfv: the fold precedes the pin-pattern match — an
+                // explicit legacy-name fold is the authoritative mapping and
+                // must win over a stale legacy registration row that would
+                // otherwise pattern-match as a pin.
                 folded
+            } else if super::naming::is_adjnoun_pin(name) {
+                name.to_string()
             } else {
                 anyhow::bail!(
                     "unknown agent name: {name} — project {canonical} routes by canonical \

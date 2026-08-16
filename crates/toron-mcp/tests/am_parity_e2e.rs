@@ -75,28 +75,15 @@ impl LiveDaemon {
             std::fs::set_permissions(&key_path, perms)?;
         }
 
-        // 3. env MUST be set before router() — operator_keys() reads it at boot.
-        // SAFETY: test is single-threaded per process; env leak is bounded to
-        // the test process lifetime and the key is a throwaway.
-        unsafe {
-            std::env::set_var("TORON_OPERATOR_KEY", key_path.to_str().unwrap());
-            std::env::set_var("TORON_KEY_PASSPHRASE", pass);
-            // Per-invocation mailbox root (R2 / ADR-0007 D3): WITHOUT this the
-            // daemon falls back to the DURABLE XDG root
-            // (`~/.local/share/toron`), which accumulates agent keys across
-            // test runs. The unwrap-loop pipeline rebuild KDF-loads EVERY key
-            // in the root (~1s/key, cold) — after a few runs the projection
-            // (search/summarize/product fan) stalls for minutes while the
-            // per-agent inbox (single-key load) stays fast. The parity suite
-            // was green at 56s only while per-pid temp roots were the default;
-            // the durable default re-introduced the stall (F2.KDF class). This
-            // env restores per-invocation isolation for the tests; production
-            // keeps the durable root.
-            std::env::set_var("TORON_MCP_DATA_DIR", dir.join("mailbox"));
-        }
+        // 3. NO process-global env writes (bd-6wfv): the cluster tests run in
+        // PARALLEL threads; setting TORON_MCP_DATA_DIR / TORON_OPERATOR_KEY /
+        // TORON_KEY_PASSPHRASE per daemon raced — daemons booted against each
+        // other's data dirs (intermittent "unknown agent"/"no local key").
+        // The router gets its paths EXPLICITLY via router_with_isolated.
+        let mailbox_dir = dir.join("mailbox");
 
-        // 4. boot the router (reads the env above) on a kernel-chosen port.
-        let router = toron_mcp::router().await?;
+        // 4. boot the router with the explicit paths on a kernel-chosen port.
+        let router = toron_mcp::router_with_isolated(mailbox_dir.clone(), key_path, pass).await?;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let addr = listener.local_addr()?;
         let server = tokio::spawn(async move {

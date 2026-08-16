@@ -19,5 +19,7 @@ pub mod tools;
 pub mod workflow_host;
 
 pub use resources::RESOURCES;
-pub use server::{ToronServer, demo_mailbox, router, serve_http, serve_stdio};
+pub use server::{
+    ToronServer, demo_mailbox, router, router_with_isolated, serve_http, serve_stdio,
+};
 pub use tools::{ToJson, ToolServer};

@@ -110,7 +110,7 @@ async fn sc26_swarm_project_routes_canonical_names_and_npubs_only() {
         msg.contains("flywheel-toron-<role><seq>"),
         "grammar in error: {msg}"
     );
-    assert!(msg.contains("non-routable"), "demotion in error: {msg}");
+    assert!(msg.contains("not routable"), "demotion in error: {msg}");
 
     // --- registration: canonical accepted, legacy rejected ---
     mailbox
