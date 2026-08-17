@@ -78,17 +78,20 @@ pub enum ProjectionDecision {
 /// Extract the mail timestamp (i64-µs) from a RUMOR (G7).
 ///
 /// Base = `created_at * 1e6` (unix seconds → µs). An optional `ts_ms` tag
-/// supplies µs precision; the tag wins when present.
+/// carries an ABSOLUTE unix-µs timestamp and wins when present — the same
+/// semantics as `UnwrappedMail::ts_us` (bd-ts-ms-dual-semantics-kviu: the
+/// tag is never a sub-second offset added to the base).
 pub fn rumor_timestamp_us(rumor: &UnsignedEvent) -> i64 {
-    let base = rumor.created_at.as_secs() as i64 * 1_000_000;
-    let ts_ms = rumor
+    if let Some(tag) = rumor
         .tags
         .iter()
         .find(|t| t.as_slice().first().map(|s| s.as_str()) == Some("ts_ms"))
         .and_then(|t| t.as_slice().get(1))
         .and_then(|v| v.as_str().parse::<i64>().ok())
-        .unwrap_or(0);
-    base + ts_ms
+    {
+        return tag;
+    }
+    rumor.created_at.as_secs() as i64 * 1_000_000
 }
 
 /// Read a tag value by name from an event/rumor.
@@ -261,16 +264,68 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ts_ms_tag_adds_precision() {
+    async fn ts_ms_tag_is_absolute_us() {
         let sender = Keys::generate();
         let rumor = gift_wrap::build_rumor(
             sender.public_key(),
             Timestamp::from(1700000000),
             14.into(),
-            vec![Tag::parse(["ts_ms", "500000"]).unwrap()],
+            vec![Tag::parse(["ts_ms", "1700000000500000"]).unwrap()],
             "x".to_string(),
         );
+        // The tag is an absolute unix-µs timestamp, never base + tag.
         assert_eq!(rumor_timestamp_us(&rumor), 1_700_000_000_500_000);
+    }
+
+    /// Regression (bd-ts-ms-dual-semantics-kviu): the `ts_ms` tag must mean
+    /// the SAME thing on every G7 path — an ABSOLUTE unix-µs timestamp that
+    /// wins when present. The durable index timeline (rumor_timestamp_us)
+    /// and the runtime inbox ordering (UnwrappedMail::ts_us) must produce
+    /// the same key for the same rumor, with or without the tag.
+    #[tokio::test]
+    async fn ts_ms_tag_semantics_match_unwrap_ordering() {
+        use crate::mailbox::unwrap::UnwrappedMail;
+
+        let sender = Keys::generate();
+        let build = |tags| {
+            gift_wrap::build_rumor(
+                sender.public_key(),
+                Timestamp::from(1_700_000_000),
+                14.into(),
+                tags,
+                "x".to_string(),
+            )
+        };
+
+        // Absolute µs timestamp (2023-11-14T22:13:20.123456Z).
+        let tagged = build(vec![Tag::parse(["ts_ms", "1700000000123456"]).unwrap()]);
+        assert_eq!(rumor_timestamp_us(&tagged), 1_700_000_000_123_456);
+        let mail = UnwrappedMail {
+            recipient: sender.public_key(),
+            sender: sender.public_key(),
+            rumor: tagged.clone(),
+            rumor_id: tagged.clone().id(),
+            wrap_event_id: tagged.clone().id(),
+            created_at: tagged.created_at,
+        };
+        assert_eq!(
+            mail.ts_us(),
+            rumor_timestamp_us(&tagged),
+            "index timeline and inbox ordering must agree on the tag"
+        );
+
+        // No tag → both fall back to rumor created_at * 1e6.
+        let untagged = build(vec![]);
+        assert_eq!(rumor_timestamp_us(&untagged), 1_700_000_000_000_000);
+        let mail = UnwrappedMail {
+            recipient: sender.public_key(),
+            sender: sender.public_key(),
+            rumor: untagged.clone(),
+            rumor_id: untagged.clone().id(),
+            wrap_event_id: untagged.clone().id(),
+            created_at: untagged.created_at,
+        };
+        assert_eq!(mail.ts_us(), rumor_timestamp_us(&untagged));
     }
 
     #[tokio::test]
