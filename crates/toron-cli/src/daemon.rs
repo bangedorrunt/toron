@@ -232,6 +232,41 @@ pub fn process_alive(pid: u32) -> bool {
     matches!(out, Ok(o) if o.status.success())
 }
 
+/// Parse the first pid from `lsof -t` output (pure — unit-tested). Tolerates
+/// blank lines and multiple pids (first wins; one listener per port here).
+pub fn first_pid_from_lsof(out: &str) -> Option<u32> {
+    out.lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .and_then(|l| l.parse::<u32>().ok())
+}
+
+/// The pid of the process LISTENING on `addr` (lsof). `None` when the port
+/// is free or lsof is unavailable. Used to name/kill unmanaged holders.
+pub fn port_holder_pid(addr: &str) -> Option<u32> {
+    let port = addr.rsplit(':').next()?;
+    let out = Command::new("lsof")
+        .args(["-nP", "-t", &format!("-iTCP:{port}"), "-sTCP:LISTEN"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    first_pid_from_lsof(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// Wait up to `secs` for the address to accept connections (restart verify).
+pub fn wait_addr(addr: &str, secs: u64) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+    while std::time::Instant::now() < deadline {
+        if addr_alive(addr) {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    false
+}
+
 /// Current uid via `id -u` (keeps the crate unsafe-free).
 pub fn current_uid() -> String {
     let out = Command::new("id").arg("-u").output();
@@ -418,9 +453,8 @@ pub fn uninstall(args: &super::cli::DaemonArgs) -> anyhow::Result<()> {
         }
         let unit = home_systemd_user()?.join(format!("{label}.service"));
         if unit.is_file() {
-            std::fs::remove_file(&unit)?;
+            let _ = std::fs::remove_file(&unit);
         }
-        println!("uninstalled {label}");
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
@@ -454,8 +488,17 @@ pub fn start(args: &super::cli::DaemonArgs) -> anyhow::Result<()> {
             return Ok(());
         }
         DaemonState::RunningUnmanaged => {
-            println!("{label} already serving {} (unmanaged instance)", args.addr);
-            return Ok(());
+            // A start that starts NOTHING must not exit 0 — the caller
+            // asked for a supervised daemon and none exists (2026-08-17:
+            // the silent Ok here made `daemon restart` look like a no-op
+            // while a stray `toron serve` kept serving the old build).
+            let pid = port_holder_pid(&args.addr);
+            anyhow::bail!(
+                "{label} already serving {} (unmanaged pid {}) — stop it first, or \
+                 `toron daemon restart --force` to replace it",
+                args.addr,
+                pid.map(|p| p.to_string()).unwrap_or_else(|| "?".into())
+            );
         }
         DaemonState::Stopped => {}
     }
@@ -545,8 +588,15 @@ pub fn stop(args: &super::cli::DaemonArgs) -> anyhow::Result<()> {
         if let Ok(o) = out
             && o.status.success()
         {
-            println!("stopped {label} (launchd)");
-            return Ok(());
+            // launchd job booted out. When the port is free the stop is
+            // done; when something STILL holds it, that is a stray
+            // unmanaged `toron serve` (bootout cannot touch it) — fall
+            // through to the unmanaged handling instead of declaring
+            // success while the old build keeps serving.
+            if !addr_alive(&args.addr) {
+                println!("stopped {label} (launchd)");
+                return Ok(());
+            }
         }
         if let Some(pid) = read_pidfile(&pidfile)
             && process_alive(pid)
@@ -556,9 +606,27 @@ pub fn stop(args: &super::cli::DaemonArgs) -> anyhow::Result<()> {
             return Ok(());
         }
         if addr_alive(&args.addr) {
+            let pid = port_holder_pid(&args.addr);
+            if args.force && let Some(p) = pid {
+                let _ = Command::new("kill").arg(p.to_string()).output();
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while addr_alive(&args.addr) && std::time::Instant::now() < deadline {
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                }
+                if addr_alive(&args.addr) {
+                    anyhow::bail!(
+                        "unmanaged pid {p} still holds {} after SIGTERM — kill it manually",
+                        args.addr
+                    );
+                }
+                println!("stopped unmanaged instance (pid {p})");
+                return Ok(());
+            }
             anyhow::bail!(
-                "{label} not managed (launchd/pidfile) but {} responds — refusing to kill an unmanaged instance",
-                args.addr
+                "{label} not managed (launchd/pidfile) but {} responds (unmanaged pid {}) — \
+                 refusing to kill it; `toron daemon stop --force` to replace it",
+                args.addr,
+                pid.map(|p| p.to_string()).unwrap_or_else(|| "?".into())
             );
         }
         println!("{label} not running");
@@ -601,10 +669,48 @@ pub fn status(args: &super::cli::DaemonArgs) -> anyhow::Result<()> {
         DaemonState::RunningSystemd => println!("running (systemd {})", args.label),
         DaemonState::RunningPidfile(pid) => println!("running (pidfile {pid})"),
         DaemonState::RunningUnmanaged => {
-            println!("running (unmanaged instance on {})", args.addr)
+            let pid = port_holder_pid(&args.addr);
+            println!(
+                "running (unmanaged instance on {}, pid {})",
+                args.addr,
+                pid.map(|p| p.to_string()).unwrap_or_else(|| "?".into())
+            );
         }
         DaemonState::Stopped => println!("stopped"),
     }
+    Ok(())
+}
+
+/// `restart`: stop, then start, then VERIFY the new daemon actually serves
+/// the address (2026-08-17: stop+start alone reported success while a stray
+/// unmanaged instance kept serving the old build — the launchd replacement
+/// crash-looped on `Address already in use`, invisible to the caller).
+pub fn restart(args: &super::cli::DaemonArgs) -> anyhow::Result<()> {
+    stop(args)?;
+    if addr_alive(&args.addr) {
+        let pid = port_holder_pid(&args.addr);
+        anyhow::bail!(
+            "{} still responds after stop (unmanaged pid {}) — \
+             `toron daemon restart --force`",
+            args.addr,
+            pid.map(|p| p.to_string()).unwrap_or_else(|| "?".into())
+        );
+    }
+    start(args)?;
+    if !wait_addr(&args.addr, 10) {
+        anyhow::bail!(
+            "restarted {} but it never came up on {} — see ~/.local/state/toron/serve.err.log",
+            args.label,
+            args.addr
+        );
+    }
+    let pid = port_holder_pid(&args.addr);
+    println!(
+        "restarted {} on {} (pid {})",
+        args.label,
+        args.addr,
+        pid.map(|p| p.to_string()).unwrap_or_else(|| "?".into())
+    );
     Ok(())
 }
 
@@ -614,11 +720,8 @@ pub fn run_dispatch(args: &super::cli::DaemonArgs) -> anyhow::Result<()> {
     match &args.cmd {
         DaemonCommand::Status => status(args),
         DaemonCommand::Start => start(args),
+        DaemonCommand::Restart => restart(args),
         DaemonCommand::Stop => stop(args),
-        DaemonCommand::Restart => {
-            stop(args)?;
-            start(args)
-        }
         DaemonCommand::Install => install(args),
         DaemonCommand::Uninstall => uninstall(args),
     }
@@ -710,6 +813,7 @@ mod tests {
             addr: "127.0.0.1:18080".into(),
             label: "com.toron.serve".into(),
             state_dir: Some(PathBuf::from("/custom/state")),
+            force: false,
             cmd: super::super::cli::DaemonCommand::Status,
         };
         assert_eq!(
@@ -718,6 +822,15 @@ mod tests {
         );
     }
 
+    /// bd-daemon-restart: `first_pid_from_lsof` is the pure half of
+    /// port_holder_pid — blank lines tolerated, first pid wins, junk → None.
+    #[test]
+    fn first_pid_from_lsof_parses_and_tolerates_junk() {
+        assert_eq!(first_pid_from_lsof("969\n"), Some(969));
+        assert_eq!(first_pid_from_lsof("\n\n  4242 \n981\n"), Some(4242));
+        assert_eq!(first_pid_from_lsof(""), None);
+        assert_eq!(first_pid_from_lsof("not-a-pid"), None);
+    }
     #[test]
     fn effective_passphrase_has_no_empty_value() {
         let p = effective_passphrase();

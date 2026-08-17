@@ -303,11 +303,18 @@ pub async fn build_mailbox_with_opts(
             .with_index_pool(pool);
     if let Some(tx) = trigger_tx {
         mailbox = mailbox.with_trigger_tx(tx);
+        // ADR-0004 inbound unwrap loop (bd-pkc): G14 + Overseer + projection
+        // LIVE — but ONLY on the serve topology (trigger channel attached).
+        // A serve process is long-lived: it pays the agent-keyring cold KDF
+        // (N × scrypt, ~0.1-0.4s/key release) ONCE and then projects every
+        // wrap live. One-shot consumers (robot CLI, bench, tui) attach no
+        // trigger channel; spawning the loop there made every invocation
+        // replay the bus's stored gift-wraps and rebuild the keyring —
+        // 489-key data dirs burned 35-200s of pure scrypt per `toron mail
+        // inbox` / `reserve conflicts` call (observed 2026-08-17; the daemon
+        // is the projector of record, the CLI reads its SQLite projection).
+        mailbox.spawn_unwrap_loop();
     }
-    // ADR-0004 inbound unwrap loop (bd-pkc): G14 + Overseer + projection
-    // LIVE — without it the async projection (unwrap → search/summarize
-    // sink) never lands and the parity search assertions stall.
-    mailbox.spawn_unwrap_loop();
     Ok(mailbox)
 }
 
@@ -358,9 +365,11 @@ async fn build_mailbox(
     let mut mailbox = Mailbox::new(Arc::new(bus), data_dir, operator).with_index_pool(pool);
     if let Some(tx) = trigger_tx {
         mailbox = mailbox.with_trigger_tx(tx);
+        // Serve topology only — see build_mailbox_with_opts: one-shot robot
+        // consumers (demo_mailbox, no trigger channel) must not replay the
+        // bus's stored gift-wraps into a full agent-keyring KDF rebuild.
+        mailbox.spawn_unwrap_loop();
     }
-    // ADR-0004 inbound unwrap loop (bd-pkc): G14 + Overseer + projection LIVE.
-    mailbox.spawn_unwrap_loop();
     Ok(mailbox)
 }
 
@@ -668,5 +677,98 @@ steps:
         host_handle.abort();
         let _ = std::fs::remove_dir_all(&data_dir);
         let _ = std::fs::remove_file(&db);
+    }
+
+    /// bd-cli-kdf (2026-08-17): ONE-SHOT mailbox construction (robot CLI /
+    /// bench / tui — no trigger channel) must perform ZERO agent-key KDF
+    /// loads, even when the bus store holds gift-wraps. The pre-fix builders
+    /// spawned the unwrap loop unconditionally; its bus subscription REPLAYS
+    /// stored wraps, the first wrap rebuilt the agent keyring, and a
+    /// 489-key production data dir burned 35-200s of scrypt per
+    /// `toron mail inbox` / `reserve conflicts` invocation. The serve
+    /// topology (trigger channel attached) still builds the keyring — it is
+    /// the long-lived projector of record.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn one_shot_mailbox_construction_skips_unwrap_keyring_kdf() {
+        use toron_core::mailbox::FetchInbox;
+        use toron_core::nostr::identity::AgentProfile;
+
+        let data_dir =
+            std::env::temp_dir().join(format!("oneshot-kdf-data-{}", uuid::Uuid::new_v4()));
+        let key_path =
+            std::env::temp_dir().join(format!("oneshot-kdf-key-{}", uuid::Uuid::new_v4()));
+        let op = toron_core::keys::generate();
+        toron_core::keys::write_encrypted_key(&key_path, &op, "p", toron_core::keys::TEST_LOG_N)
+            .expect("operator key");
+
+        // Serve mailbox (trigger channel): registers two agents and stores a
+        // real gift-wrapped message on the shared bus.
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<UnwrappedMail>();
+        let serve =
+            build_mailbox_with_opts(Some(tx), data_dir.clone(), key_path.clone(), "p")
+                .await
+                .expect("serve mailbox");
+        serve
+            .register_agent("demo", &AgentProfile::new("QuietFern"))
+            .await
+            .expect("register sender");
+        serve
+            .register_agent("demo", &AgentProfile::new("LuckyPine"))
+            .await
+            .expect("register recipient");
+        serve
+            .send_message(&toron_core::mailbox::SendMessage {
+                project_slug: "demo".into(),
+                sender_name: "QuietFern".into(),
+                to: vec!["LuckyPine".into()],
+                subject: "kdf probe".into(),
+                body_md: "one wrapped mail".into(),
+                ..Default::default()
+            })
+            .await
+            .expect("send");
+        // The serve loop projected the wrap (keyring built at least once —
+        // generous budget: a debug-build scrypt at log_n 16 is ~4s/key).
+        for _ in 0..80 {
+            if serve.kdf_load_count() > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+
+        // One-shot (robot) mailbox on the SAME data dir: the bus replays the
+        // stored wrap on subscribe — with the gate, no loop runs, no keyring
+        // KDF fires.
+        let robot = build_mailbox_with_opts(None, data_dir.clone(), key_path.clone(), "p")
+            .await
+            .expect("robot mailbox");
+        // Bounded observation: a debug-build scrypt at log_n 16 is ~4s/key,
+        // so a regressed (spawning) builder shows its first KDF load within
+        // this window; the gated builder never loads at all.
+        for _ in 0..50 {
+            if robot.kdf_load_count() > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        assert_eq!(
+            robot.kdf_load_count(),
+            0,
+            "one-shot construction must not replay stored wraps into a KDF rebuild"
+        );
+        // The stored wrap IS visible to the robot's bus (replay works); only
+        // the projection loop is skipped.
+        let inbox = robot
+            .fetch_inbox(&FetchInbox {
+                project_slug: "demo".into(),
+                agent_name: "LuckyPine".into(),
+                ..Default::default()
+            })
+            .await
+            .expect("fetch inbox");
+        assert_eq!(inbox.len(), 1, "serve-side projection is readable");
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+        let _ = std::fs::remove_file(&key_path);
     }
 }
