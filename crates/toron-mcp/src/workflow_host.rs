@@ -26,7 +26,7 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use nostr_sdk::nostr::{EventId, Keys, Timestamp};
+use nostr_sdk::nostr::{Event, EventId, Keys, Timestamp};
 use toron_core::bus::{Bus, SubscriptionEvent};
 use toron_core::mailbox::{Mailbox, SendMessage, UnwrappedMail};
 use toron_workflow::coalesce::{CoalesceDecision, Coalesced, MentionCoalescer};
@@ -195,15 +195,11 @@ pub fn mailbox_runner(
     })
 }
 
-/// Build + publish ONE kind-43001 for a coalesced mention burst (ADR-0007
-/// F7): N mentions → exactly one job. The request carries the
-/// `toron:workflow-emitted` stamp (F6) so the trigger filter never re-evaluates
-/// it. Returns the published event id, or `None` when no signer is available.
-pub fn publish_coalesced_job(
-    bus: &dyn Bus,
-    signer: Option<&Keys>,
-    coalesced: &Coalesced,
-) -> Option<EventId> {
+/// Build the kind-43001 event for a coalesced mention burst (ADR-0007 F7):
+/// N mentions → exactly one job. The request carries the
+/// `toron:workflow-emitted` stamp (F6) so the trigger filter never
+/// re-evaluates it. Returns `None` when no signer is available.
+fn build_coalesced_job_event(signer: Option<&Keys>, coalesced: &Coalesced) -> Option<Event> {
     let keys = signer?;
     let parent = EventId::from_hex(coalesced.parent()).ok();
     let payload = JobRequest {
@@ -214,6 +210,21 @@ pub fn publish_coalesced_job(
     let stamped = stamp_workflow_emitted(vec![]);
     let event =
         build_job_request_with_tags(keys, parent, &payload, Timestamp::now(), stamped).ok()?;
+    Some(event)
+}
+
+/// Build + publish ONE kind-43001 for a coalesced mention burst, from SYNC
+/// contexts (the mailbox runner). F8: publish on an isolated thread so we
+/// never nest runtimes. Returns the published event id, or `None` when no
+/// signer is available. Async contexts (the trigger loop) must instead build
+/// via [`build_coalesced_job_event`] and `bus.publish(...).await` directly —
+/// this function BLOCKS the calling thread on the publish.
+pub fn publish_coalesced_job(
+    bus: &dyn Bus,
+    signer: Option<&Keys>,
+    coalesced: &Coalesced,
+) -> Option<EventId> {
+    let event = build_coalesced_job_event(signer, coalesced)?;
     // F8: publish on an isolated thread so we never nest runtimes.
     // Bus is Sync; clone the event and publish via a scoped thread.
     let published = std::thread::scope(|s| {
@@ -465,7 +476,7 @@ impl WorkflowHost {
                 // every subsequent tick flush.
                 // P1 (F3.COALESCER-LOCK, batch-fix): the guard is scoped to
                 // tick() ONLY — the flushed Coalesced values are owned, the
-                // guard drops, THEN each blocking publish runs.
+                // guard drops, THEN each publish runs.
                 let flushed = {
                     let mut c = self.coalescer.lock().unwrap_or_else(|e| e.into_inner());
                     c.tick(now_ms())
@@ -474,13 +485,24 @@ impl WorkflowHost {
                     debug!("coalescer flushed {} assignee(s)", flushed.len());
                 }
                 for coalesced in flushed {
-                    match publish_coalesced_job(
-                        self.bus.as_ref(),
-                        self.job_signer.as_ref(),
-                        &coalesced,
-                    ) {
-                        Some(id) => {
-                            debug!(assignee = %coalesced.assignee, %id, "kind-43001 published for coalesced burst")
+                    // We are ON an async runtime here: build the event and
+                    // await the publish directly. publish_coalesced_job's
+                    // scoped-thread block_on is for the SYNC runner only —
+                    // calling it here would block this executor thread for
+                    // the full publish duration (bug hunt 2026-08-17).
+                    match build_coalesced_job_event(self.job_signer.as_ref(), &coalesced) {
+                        Some(event) => {
+                            let id = event.id;
+                            match self.bus.publish(event).await {
+                                Ok(_) => debug!(
+                                    assignee = %coalesced.assignee, %id,
+                                    "kind-43001 published for coalesced burst"
+                                ),
+                                Err(e) => warn!(
+                                    assignee = %coalesced.assignee, %id,
+                                    "coalesced burst publish failed: {e}"
+                                ),
+                            }
                         }
                         None => warn!(
                             assignee = %coalesced.assignee,
@@ -1419,12 +1441,12 @@ steps:
     /// std-Mutex guard must NOT be held across `publish_coalesced_job`'s
     /// blocking publish (thread::scope + rt.block_on).
     ///
-    /// RED today: the guard IS held across the publish at the runner's
-    /// FlushNow arm (mailbox_runner, :156-165) and the trigger-loop tick
-    /// flush (:441-461) — a concurrent flush for an unrelated assignee
-    /// stalls for the full publish duration. After the batch fix (clone the
-    /// coalesced job under the lock, release, THEN publish) the concurrent
-    /// flush proceeds immediately.
+    /// GREEN since the batch fix landed: at BOTH publish sites the coalesced
+    /// job is cloned under the lock, the guard drops, THEN the publish runs
+    /// (runner FlushNow arm + trigger-loop tick flush), so a concurrent flush
+    /// for an unrelated assignee proceeds immediately. The trigger loop now
+    /// publishes by direct `bus.publish(...).await` (no scoped-thread
+    /// block_on on the executor thread); the runner keeps the sync path.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn coalescer_lock_not_held_across_blocking_publish() {
         use toron_core::bus::in_process::{InProcessBus, InProcessBusConfig};
