@@ -15,10 +15,10 @@
 //! subscriber (bd-led.4.4). Backpressure surfaces to the publisher via
 //! `mpsc::error::TrySendError` handling (dropped publisher-side, logged).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use sqlx::SqlitePool;
 use tokio::sync::mpsc;
 
@@ -74,7 +74,13 @@ struct Subscriber {
     global: bool,
     /// Event ids captured in the subscribe-time snapshot (replayed by the
     /// background task). Live fanout skips these until `replay_done`.
-    snapshot: Arc<std::collections::HashSet<String>>,
+    snapshot: Arc<HashSet<String>>,
+    /// Ids delivered by EITHER path (live fanout or the replay task's
+    /// snapshot/delta) while the replay task is still running — the
+    /// exactly-once claim check for the overlap window (publishes during
+    /// subscribe setup). Cleared once `replay_done` (single-path delivery
+    /// needs no dedup; bounded memory).
+    delivered: Arc<Mutex<HashSet<String>>>,
     /// Set to true once the replay task has pushed history + EOSE.
     replay_done: Arc<std::sync::atomic::AtomicBool>,
 }
@@ -170,16 +176,42 @@ impl InProcessBus {
     }
 
     fn fanout_to(&self, sub: &Subscriber, event: &Event) {
-        // Skip events the subscribe-time snapshot already covers until the
-        // replay task has pushed history + EOSE (exactly-once delivery: the
-        // replay task delivers snapshot members, live fanout delivers the rest).
-        if !sub.replay_done.load(std::sync::atomic::Ordering::Acquire)
-            && sub.snapshot.contains(&event.id.to_hex())
-        {
+        // Before the replay task finishes (snapshot + delta + EOSE), live
+        // fanout must neither re-deliver snapshot members nor race the
+        // delta: claim the id in the shared `delivered` set — whichever
+        // path inserts first delivers, the other steps aside
+        // (exactly-once, bd-subscribe-fanout-gap-race-tgex).
+        let id = event.id.to_hex();
+        if !sub.replay_done.load(std::sync::atomic::Ordering::Acquire) {
+            // Snapshot members are (being) delivered by the replay task.
+            if sub.snapshot.contains(&id) {
+                return;
+            }
+            if !sub.delivered.lock().insert(id.clone()) {
+                return; // the replay task's delta already delivered it
+            }
+            // Lossless: if the channel is full we drop publisher-side with a
+            // warning (the event remains in the store for cursor-based
+            // replay) — and release the claim so the replay task may still
+            // deliver it through the delta.
+            match sub.tx.try_send(SubscriptionEvent::Event(event.clone())) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    sub.delivered.lock().remove(&id);
+                    tracing::warn!(
+                        sub = %sub.id,
+                        event_id = %event.id,
+                        "subscription channel full; event stays in store for replay"
+                    );
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    // Subscriber dropped its receiver; remove the subscription.
+                    self.subs.write().remove(&sub.id);
+                }
+            }
             return;
         }
-        // Lossless: if the channel is full we drop publisher-side with a
-        // warning (the event remains in the store for cursor-based replay).
+        // Post-EOSE: single delivery path, no dedup bookkeeping needed.
         match sub.tx.try_send(SubscriptionEvent::Event(event.clone())) {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(_)) => {
@@ -221,25 +253,35 @@ impl InProcessBus {
             && !filter.generic_tags.contains_key(&t_tag)
             && !filter.generic_tags.contains_key(&l_tag);
 
-        // Take the history snapshot synchronously (fast DB read) so the
-        // exactly-once boundary is stable: snapshot members are replayed by
-        // the background task; anything published after subscribe() returns is
-        // delivered live.
+        // Take the history snapshot synchronously (fast DB read). The
+        // snapshot is the exactly-once base; the background task's delta
+        // phase below closes the snapshot→map-insert gap; anything published
+        // once the subscriber is in the fanout map is delivered live.
         let snapshot = self
             .store
             .replay(&filter)
             .await
             .map_err(|e| BusError::Subscription(format!("replay failure: {e}")))?;
-        let snapshot_ids: Arc<std::collections::HashSet<String>> =
+        let snapshot_ids: Arc<HashSet<String>> =
             Arc::new(snapshot.iter().map(|ev| ev.id.to_hex()).collect());
+        let delivered: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
         let replay_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
-
-        // Push the snapshot + EOSE in a background task so `subscribe` never
-        // blocks on a small channel (lossless backpressure inside the task).
+        // Push the snapshot, then the DELTA, then EOSE in a background task
+        // so `subscribe` never blocks on a small channel (lossless
+        // backpressure inside the task). The delta (bd-subscribe-fanout-gap-
+        // race-tgex): events stored after the snapshot read but published
+        // before this subscriber entered the fanout map were missed by both
+        // paths. Store writes precede fanout, so a full re-read now contains
+        // every gap event; the shared `delivered` set dedups against live
+        // fanout (exactly-once preserved).
         let replay_tx = tx.clone();
         let snapshot_clone = snapshot;
         let replay_done_clone = replay_done.clone();
         let global_clone = global;
+        let store_clone = self.store.clone();
+        let filter_clone = filter.clone();
+        let delivered_clone = delivered.clone();
+        let snapshot_ids_clone = snapshot_ids.clone();
         tokio::spawn(async move {
             for ev in snapshot_clone {
                 // Access gate applies to replay too: a global subscription
@@ -251,8 +293,35 @@ impl InProcessBus {
                     return;
                 }
             }
+            // Delta: everything the store now holds beyond the snapshot.
+            // Best-effort with a warning on read failure — live fanout and
+            // future stores still cover forward traffic.
+            match store_clone.replay(&filter_clone).await {
+                Ok(delta) => {
+                    for ev in delta {
+                        if global_clone && Self::project_slug(&ev).is_some() {
+                            continue;
+                        }
+                        let id = ev.id.to_hex();
+                        if snapshot_ids_clone.contains(&id) {
+                            continue; // replayed in the snapshot phase
+                        }
+                        if !delivered_clone.lock().insert(id) {
+                            continue; // live fanout already delivered it
+                        }
+                        if replay_tx.send(SubscriptionEvent::Event(ev)).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("subscribe delta re-read failed: {e}");
+                }
+            }
             let _ = replay_tx.send(SubscriptionEvent::Eose).await;
             replay_done_clone.store(true, std::sync::atomic::Ordering::Release);
+            // Single-path delivery from here on; the dedup set is dead.
+            delivered_clone.lock().clear();
         });
 
         let sub = Arc::new(Subscriber {
@@ -261,6 +330,7 @@ impl InProcessBus {
             tx,
             global,
             snapshot: snapshot_ids,
+            delivered,
             replay_done,
         });
         self.subs.write().insert(id.clone(), sub);
@@ -482,6 +552,91 @@ mod tests {
         let got_eose = items.iter().any(|it| matches!(it, SubscriptionEvent::Eose));
         assert!(saw_event, "live event must be delivered, got {items:?}");
         assert!(got_eose, "EOSE marker must be emitted, got {items:?}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Regression (bd-subscribe-fanout-gap-race-tgex): events published
+    /// while a subscription is being set up — between the history snapshot
+    /// read and the subscriber entering the fanout map — were in neither
+    /// the snapshot nor live fanout: permanently missed by the new
+    /// subscription. The replay task now re-reads the store (delta) after
+    /// the snapshot, with an atomic per-subscriber dedup set so delivery
+    /// stays exactly-once. Hammer test: seed history, publish a stream
+    /// concurrently with subscribe, assert every STORED event arrives
+    /// exactly once. (Ephemeral non-stored kinds are best-effort by design.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn subscribe_gap_no_missed_stored_events() {
+        let (bus, path) = temp_bus_with(InProcessBusConfig {
+            channel_capacity: 4096,
+            ..Default::default()
+        })
+        .await;
+        let keys = Keys::generate();
+
+        // Seed history so the subscribe-time snapshot read takes real time.
+        let mut expected: Vec<String> = Vec::with_capacity(500);
+        for i in 0..300 {
+            let ev = signed(&keys, PROJECT_MANIFEST, &format!("seed {i}"), "demo");
+            bus.publish(ev.clone()).await.expect("seed publish");
+            expected.push(ev.id.to_hex());
+        }
+
+        // Publisher streams 200 more events while subscribe() races through
+        // its snapshot-read → map-insert window.
+        let pub_bus = bus.clone();
+        let pub_keys = keys.clone();
+        let publisher = tokio::spawn(async move {
+            let mut ids = Vec::with_capacity(200);
+            for i in 0..200 {
+                let ev = signed(&pub_keys, PROJECT_MANIFEST, &format!("live {i}"), "demo");
+                pub_bus.publish(ev.clone()).await.expect("live publish");
+                ids.push(ev.id.to_hex());
+            }
+            ids
+        });
+
+        let mut sub = bus
+            .subscribe(crate::bus::project_filter("demo"))
+            .await
+            .expect("sub");
+        let live_ids = publisher.await.expect("publisher");
+        expected.extend(live_ids);
+
+        // Drain everything: snapshot + delta + EOSE + live, until quiet.
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        let mut saw_eose = false;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_millis(300), sub.next()).await {
+                Ok(Some(SubscriptionEvent::Event(ev))) => {
+                    *counts.entry(ev.id.to_hex()).or_insert(0) += 1;
+                }
+                Ok(Some(SubscriptionEvent::Eose)) => saw_eose = true,
+                Ok(Some(SubscriptionEvent::Closed(_))) | Ok(None) => break,
+                Err(_) => break,
+            }
+        }
+
+        assert!(saw_eose, "EOSE must arrive");
+        let mut missing = Vec::new();
+        let mut duplicated = Vec::new();
+        for id in &expected {
+            match counts.get(id).copied().unwrap_or(0) {
+                0 => missing.push(id),
+                1 => {}
+                n => duplicated.push((id, n)),
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "{} stored events missed by the subscription (subscribe/fanout gap): {:?}",
+            missing.len(),
+            &missing[..missing.len().min(10)]
+        );
+        assert!(
+            duplicated.is_empty(),
+            "duplicate deliveries: {duplicated:?}"
+        );
         let _ = std::fs::remove_file(&path);
     }
 
