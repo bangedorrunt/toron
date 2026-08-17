@@ -273,6 +273,12 @@ pub struct DaemonArgs {
     #[arg(long)]
     pub state_dir: Option<PathBuf>,
 
+    /// Kill an UNMANAGED process that holds the daemon port (stop/restart
+    /// only). Without it, stop/restart refuse when a stray `toron serve`
+    /// owns the address — the launchd replacement would crash-loop on bind.
+    #[arg(long)]
+    pub force: bool,
+
     #[command(subcommand)]
     pub cmd: DaemonCommand,
 }
