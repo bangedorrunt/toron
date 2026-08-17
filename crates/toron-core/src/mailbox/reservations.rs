@@ -1660,7 +1660,15 @@ pub fn lease_status(winning: &Event) -> ReservationStatus {
     match status_tag.as_deref() {
         Some("intent") => ReservationStatus::Intent,
         Some("released") => ReservationStatus::Released,
-        _ if winning.content.contains("released") => ReservationStatus::Released,
+        // Canonical forms only: a bare `contains("released")` classifies an
+        // ACQUIRE whose free-text reason mentions "released" as Released —
+        // the lease vanishes from the held view and the exclusive-path
+        // conflict floor stops blocking (bug hunt 2026-08-17).
+        _ if winning.content.contains("status:released")
+            || winning.content.contains("\"status\":\"released\"") =>
+        {
+            ReservationStatus::Released
+        }
         _ => ReservationStatus::Held,
     }
 }
@@ -1930,6 +1938,65 @@ mod tests {
             .await
             .expect("own conflicts");
         assert!(own.conflict_free);
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// Regression (bug hunt 2026-08-17): an acquire whose free-text `reason`
+    /// contains the substring "released" was classified Released by
+    /// `lease_status`'s bare `content.contains("released")` — the lease
+    /// vanished from the held view and the P0 exclusive-path conflict floor
+    /// silently stopped blocking the second agent. Only canonical marker
+    /// forms may classify (mirror of is_revocation's plain/JSON/tag forms).
+    #[tokio::test]
+    async fn test_acquire_with_released_in_reason_still_blocks() {
+        let (mailbox, db_path, data_dir) = test_mailbox("released-reason").await;
+        register(&mailbox, "demo", "BlueLake").await;
+        register(&mailbox, "demo", "RoseDune").await;
+
+        // A acquires with a reason that mentions "released".
+        let acq = mailbox
+            .file_reservation_paths(
+                "demo",
+                "BlueLake",
+                &["src/shared/*".into()],
+                Some(3600),
+                true,
+                Some("cleanup after v2 released"),
+            )
+            .await
+            .expect("acquire");
+        assert_eq!(acq.granted.len(), 1, "A's acquire must grant: {acq:?}");
+
+        // B must still hard-block on the same exclusive path.
+        let acq2 = mailbox
+            .file_reservation_paths(
+                "demo",
+                "RoseDune",
+                &["src/shared/*".into()],
+                Some(3600),
+                true,
+                None,
+            )
+            .await
+            .expect("B acquire");
+        assert!(
+            acq2.granted.is_empty(),
+            "reason text must NOT hide a held lease: {acq2:?}"
+        );
+        assert_eq!(acq2.conflicts.len(), 1, "{acq2:?}");
+
+        // The held view still lists A's lease.
+        register(&mailbox, "demo", "MistyPalms").await;
+        let report = mailbox
+            .check_file_reservation_conflicts("demo", "MistyPalms", &["src/shared/*".into()])
+            .await
+            .expect("held view");
+        assert!(
+            !report.conflict_free,
+            "held lease must be visible: {report:?}"
+        );
 
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_dir_all(&data_dir);

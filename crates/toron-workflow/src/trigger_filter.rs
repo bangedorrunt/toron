@@ -191,7 +191,11 @@ pub fn is_reservation_released_marker(event: &Event) -> bool {
     if is_revocation(event) {
         return true;
     }
-    event.content.contains("released")
+    // Canonical forms only (mirrors is_revocation): the bare substring
+    // "released" would misclassify an ACQUIRE whose free-text `reason`
+    // mentions "released" — routing the trigger to the wrong arm.
+    event.content.contains("status:released")
+        || event.content.contains("\"status\":\"released\"")
         || event.tags.iter().any(|t| {
             t.as_slice().first().map(String::as_str) == Some("status")
                 && t.as_slice().get(1).map(String::as_str) == Some("released")
@@ -624,6 +628,60 @@ mod tests {
             },
             &revoked
         ));
+    }
+
+    /// Regression (bug hunt 2026-08-17): the acquire event embeds the
+    /// holder's free-text `reason` in its content. A bare
+    /// `content.contains("released")` misread such acquires as release
+    /// markers — routing reservation_acquired triggers to the wrong arm and
+    /// flipping `trigger_payload.status`. Only the canonical marker forms
+    /// (`status:released` plain/JSON, or the status tag) may classify.
+    #[test]
+    fn reason_text_containing_released_is_not_a_release_marker() {
+        let keys = Keys::generate();
+        let acq_reason = reservation(
+            r#"{"exclusive":true,"reason":"cleanup after v2 released"}"#,
+            vec![tag_d("demo", "src/**"), tag_t("demo")],
+            &keys,
+        );
+        assert!(
+            !is_reservation_released_marker(&acq_reason),
+            "an acquire whose reason mentions 'released' is NOT a release marker"
+        );
+        assert!(matches_trigger(
+            &Trigger::ReservationAcquired {
+                project: "demo".into(),
+                path: None,
+            },
+            &acq_reason
+        ));
+        assert!(!matches_trigger(
+            &Trigger::ReservationReleased {
+                project: "demo".into(),
+                path: None,
+            },
+            &acq_reason
+        ));
+        assert_eq!(
+            trigger_payload(&acq_reason)["status"],
+            serde_json::json!("acquired")
+        );
+
+        // Positive controls: both canonical content forms still classify.
+        for content in [
+            r#"{"status":"released"}"#.to_string(),
+            "status:released".to_string(),
+        ] {
+            let marker = reservation(
+                &content,
+                vec![tag_d("demo", "src/**"), tag_t("demo")],
+                &keys,
+            );
+            assert!(
+                is_reservation_released_marker(&marker),
+                "canonical form {content} must classify as released"
+            );
+        }
     }
 
     #[test]
