@@ -588,11 +588,14 @@ pub fn stop(args: &super::cli::DaemonArgs) -> anyhow::Result<()> {
         if let Ok(o) = out
             && o.status.success()
         {
-            // launchd job booted out. When the port is free the stop is
-            // done; when something STILL holds it, that is a stray
-            // unmanaged `toron serve` (bootout cannot touch it) — fall
-            // through to the unmanaged handling instead of declaring
-            // success while the old build keeps serving.
+            // launchd job booted out. The serve process needs a moment to
+            // release the port — probe with a grace window before deciding
+            // a stray unmanaged holder exists (a fresh-bootout socket still
+            // accepting is a teardown race, not a holder).
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while addr_alive(&args.addr) && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
             if !addr_alive(&args.addr) {
                 println!("stopped {label} (launchd)");
                 return Ok(());
