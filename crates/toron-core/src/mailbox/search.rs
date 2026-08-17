@@ -159,7 +159,7 @@ impl Mailbox {
                 .map(|i| format!("?{i}"))
                 .collect();
             filter_sql.push_str(&format!(
-                " AND m.sender_pubkey = (SELECT pubkey FROM agents WHERE project_slug IN ({}) AND name = ?{})",
+                " AND m.sender_pubkey IN (SELECT pubkey FROM agents WHERE project_slug IN ({}) AND name = ?{})",
                 sub_ph.join(", "),
                 bind_id + set.len() as i32
             ));
@@ -526,6 +526,77 @@ mod tests {
             hits[0].id, "e-r1",
             "recency ranking: newest first (empty query, no FTS score)"
         );
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// Regression (bug hunt 2026-08-17): ADR-0017 alias sets mean the same
+    /// agent NAME can exist under more than one project spelling (legacy
+    /// rows written pre-canonicalization). The sender filter's SCALAR
+    /// subquery `sender_pubkey = (SELECT ...)` then takes an arbitrary first
+    /// row from the alias set — SQLite does not error, it silently matches
+    /// whichever spelling scans first, so the filter returns order-dependent
+    /// (often empty) results. The filter must tolerate every alias row (IN
+    /// semantics).
+    #[tokio::test]
+    async fn test_sender_filter_with_aliased_agent_rows_no_error() {
+        let (mailbox, db_path, data_dir) = test_mailbox("alias-sender").await;
+        let pool = mailbox.index_pool().unwrap();
+
+        // Legacy spelling of "demo" + an agents row under it (same name as
+        // the modern row, written pre-canonicalization).
+        sqlx::query(
+            "INSERT INTO project_aliases (alias, canonical, created_ts_us) \
+             VALUES ('/w/demo', 'demo', 1)",
+        )
+        .execute(pool)
+        .await
+        .expect("alias row");
+        sqlx::query(
+            "INSERT INTO agents (project_slug, name, pubkey, created_ts_us) \
+             VALUES ('/w/demo', 'PiAlpha', 'bbbb', 1)",
+        )
+        .execute(pool)
+        .await
+        .expect("legacy agent row");
+
+        // Modern row under the canonical spelling.
+        seed(
+            &mailbox,
+            "demo",
+            "e-1",
+            "hello",
+            "body from PiAlpha",
+            "normal",
+            None,
+            1_700_000_000_000_100,
+        )
+        .await;
+        sqlx::query(
+            "INSERT INTO agents (project_slug, name, pubkey, created_ts_us) \
+             VALUES ('demo', 'PiAlpha', 'aaaa', 2)",
+        )
+        .execute(pool)
+        .await
+        .expect("modern agent row");
+
+        // sender filter over the alias-expanded project must not SQL-error.
+        let hits = mailbox
+            .search_messages(&SearchMessages {
+                project_key: "demo".into(),
+                query: "hello".into(),
+                sender_name: Some("PiAlpha".into()),
+                limit: Some(10),
+                ..Default::default()
+            })
+            .await
+            .expect("aliased sender filter must not SQL-error");
+        assert!(
+            hits.iter().any(|m| m.id == "e-1"),
+            "sender-filtered hit, got {:?}",
+            hits.iter().map(|m| m.id.clone()).collect::<Vec<_>>()
+        );
+
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_dir_all(&data_dir);
     }
