@@ -68,6 +68,159 @@ fn register_test_agent() {
     });
 }
 
+/// bd-pin-public-plane-s-easy.3: `toron mail inbox --since <RFC3339>` is a
+/// REAL flag wired to the shared fetch_inbox since filter — not invented help
+/// text. Send via the shelled-out binary, then assert the same message is
+/// INCLUDED with a past since and EXCLUDED with a future since. A malformed
+/// timestamp is a hard error (exit 1), never a silently-ignored filter.
+#[test]
+fn inbox_since_rfc3339_filters_through_binary() {
+    register_test_agent();
+
+    let marker = format!("since-{}", std::process::id());
+    let sent = run(&[
+        "mail",
+        "send",
+        "--from",
+        "TestAgent",
+        "--to",
+        "TestAgent",
+        "--subject",
+        &marker,
+        "--body",
+        "inbox --since filter probe",
+        "--project",
+        "demo",
+        "--json",
+    ]);
+    assert!(
+        sent.status.success(),
+        "send must exit 0, stderr: {}",
+        String::from_utf8_lossy(&sent.stderr)
+    );
+
+    // Poll until the projection lands, then read the message's own
+    // created_ts_us back out of the inbox (the filter compares against it).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    let created_us: i64 = loop {
+        let out = run(&[
+            "mail",
+            "inbox",
+            "--agent",
+            "TestAgent",
+            "--project",
+            "demo",
+            "--json",
+        ]);
+        assert!(
+            out.status.success(),
+            "inbox must exit 0, stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let value: Value = serde_json::from_slice(&out.stdout).expect("inbox emits valid JSON");
+        let hit = value.as_array().and_then(|arr| {
+            arr.iter().find(|m| {
+                m.get("subject").and_then(|s| s.as_str()) == Some(marker.as_str())
+            })
+        });
+        if let Some(m) = hit {
+            break m
+                .get("created_ts_us")
+                .and_then(|v| v.as_i64())
+                .expect("inbox message carries created_ts_us");
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "marker message never projected: {value}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    };
+
+    let since_past = chrono::DateTime::from_timestamp_micros(created_us - 1_000_000)
+        .expect("created_us is a valid timestamp")
+        .to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+    let since_future = chrono::DateTime::from_timestamp_micros(created_us + 1_000_000)
+        .expect("created_us is a valid timestamp")
+        .to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+
+    // Past since: the message is strictly newer → included.
+    let past = run(&[
+        "mail",
+        "inbox",
+        "--agent",
+        "TestAgent",
+        "--project",
+        "demo",
+        "--since",
+        &since_past,
+        "--json",
+    ]);
+    assert!(
+        past.status.success(),
+        "inbox --since (past) must exit 0, stderr: {}",
+        String::from_utf8_lossy(&past.stderr)
+    );
+    let past_value: Value = serde_json::from_slice(&past.stdout).expect("inbox emits valid JSON");
+    assert!(
+        past_value.as_array().is_some_and(|arr| {
+            arr.iter()
+                .any(|m| m.get("subject").and_then(|s| s.as_str()) == Some(marker.as_str()))
+        }),
+        "past --since must include the message, got {past_value}"
+    );
+
+    // Future since: the message is older → excluded.
+    let future = run(&[
+        "mail",
+        "inbox",
+        "--agent",
+        "TestAgent",
+        "--project",
+        "demo",
+        "--since",
+        &since_future,
+        "--json",
+    ]);
+    assert!(
+        future.status.success(),
+        "inbox --since (future) must exit 0, stderr: {}",
+        String::from_utf8_lossy(&future.stderr)
+    );
+    let future_value: Value =
+        serde_json::from_slice(&future.stdout).expect("inbox emits valid JSON");
+    assert!(
+        future_value.as_array().is_some_and(|arr| {
+            !arr
+                .iter()
+                .any(|m| m.get("subject").and_then(|s| s.as_str()) == Some(marker.as_str()))
+        }),
+        "future --since must exclude the message, got {future_value}"
+    );
+
+    // Malformed since: hard error, never a silent pass-through.
+    let malformed = run(&[
+        "mail",
+        "inbox",
+        "--agent",
+        "TestAgent",
+        "--project",
+        "demo",
+        "--since",
+        "not-a-timestamp",
+        "--json",
+    ]);
+    assert!(
+        !malformed.status.success(),
+        "malformed --since must exit non-zero, stdout: {}",
+        String::from_utf8_lossy(&malformed.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&malformed.stderr).contains("RFC3339"),
+        "malformed --since must name the RFC3339 contract, stderr: {}",
+        String::from_utf8_lossy(&malformed.stderr)
+    );
+}
+
 #[test]
 fn inbox_parity_emits_valid_json() {
     register_test_agent();

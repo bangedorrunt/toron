@@ -425,7 +425,8 @@ pub struct MailInboxArgs {
     /// Project slug.
     #[arg(long, default_value = DEFAULT_PROJECT)]
     pub project: String,
-    /// Unread messages only.
+    /// Unread messages only (documented no-op: the inbox projection has no
+    /// read state; poll with --since instead, per ADR-0018/bd-pin-public-plane-s-easy.3).
     #[arg(long)]
     pub unread: bool,
     /// Maximum messages to return.
@@ -437,6 +438,10 @@ pub struct MailInboxArgs {
     /// Keep only messages in this thread (bd-harvest-thread-filter-yp9r).
     #[arg(long)]
     pub thread_id: Option<String>,
+    /// Only messages strictly newer than this RFC3339 timestamp (e.g.
+    /// 2026-08-18T00:00:00Z). A malformed value is an error, never ignored.
+    #[arg(long)]
+    pub since: Option<String>,
 }
 
 #[derive(Debug, Args)]
