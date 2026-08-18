@@ -1,6 +1,6 @@
 [
   {
-    "pane_id": "w98:p1",
+    "pane_id": "w70:p1",
     "name": "flywheel-toron-coder",
     "profile": "coder",
     "harness": "omp",
@@ -8,7 +8,7 @@
     "skills_injected": false
   },
   {
-    "pane_id": "w98:p2",
+    "pane_id": "w70:p2",
     "name": "flywheel-toron-coder2",
     "profile": "coder",
     "harness": "omp",
@@ -16,7 +16,7 @@
     "skills_injected": false
   },
   {
-    "pane_id": "w98:p3",
+    "pane_id": "w70:p3",
     "name": "flywheel-toron-coder3",
     "profile": "coder",
     "harness": "omp",
