@@ -63,7 +63,7 @@ pub use reservations::{
     AcquireResult, ConflictReport, GrantedReservation, IntentReservation, IntentResult,
     PathConflict, ReleaseAsk, ReleaseDecision, ReleaseResponse, ReleaseResult, RenewResult,
     RequestRelease, RequestReleaseResult, RequestReleaseStatus, Reservation, ReservationStatus,
-    overlaps,
+    TransferResult, overlaps,
 };
 pub use search::{SearchMessage, SearchMessages, ThreadSummary};
 pub use unwrap::{

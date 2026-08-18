@@ -527,6 +527,10 @@ pub enum ReserveCommand {
     RequestRelease(ReserveRequestReleaseArgs),
     /// Holder answers a request-release (agreed | denied | deferred:<secs>).
     Respond(ReserveRespondArgs),
+    /// Transfer a held lease to another agent (release + re-acquire, same
+    /// path, exclusive + reason preserved). Never "commit as me" — the
+    /// target commits as itself. bd-pin-public-plane-s-easy.13.
+    Transfer(ReserveTransferArgs),
 }
 
 #[derive(Debug, Args)]
@@ -655,6 +659,25 @@ pub struct ReserveRespondArgs {
     /// Note attached to the response.
     #[arg(long)]
     pub note: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct ReserveTransferArgs {
+    /// Project slug.
+    #[arg(long, default_value = DEFAULT_PROJECT)]
+    pub project: String,
+    /// The current holder releasing the lease (the pin).
+    #[arg(long, required = true)]
+    pub from: String,
+    /// The target acquiring the lease (the pin).
+    #[arg(long, required = true)]
+    pub to: String,
+    /// Path (or glob) whose lease moves.
+    #[arg(long, required = true)]
+    pub path: String,
+    /// Explicit reason override (default: preserve the held lease's reason).
+    #[arg(long)]
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
