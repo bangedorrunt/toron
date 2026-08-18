@@ -349,51 +349,50 @@ impl Mailbox {
         out
     }
 
-    /// Build the unwrap pipeline over the current local agent keys. `None`
-    /// when no index pool is attached (nothing to sink into — the loop
-    /// skips projection until a pool is available). Called only when the
-    /// agent-key signature changes, so the argon2 KDF (≈1s/key) runs at most
-    /// once per agent registration — never per inbound wrap.
+    /// Build the unwrap pipeline. **Lazy keyring** (bd-unwrap-ptag-lazy):
+    /// the build performs ZERO key decryption — the pipeline resolves the
+    /// wrap's `p`-tag recipient through the agents index at project time and
+    /// decrypts exactly that key (content-keyed cache). `None` when no
+    /// index pool is attached, or when there is neither a registered agent
+    /// nor any local key file (nothing could ever unwrap).
     ///
-    /// **R2.0 bound (C2 / F2.KDF):** keys are loaded through the content-keyed
-    /// cache, so a rebuild re-derives ONLY the added/changed key files —
-    /// O(Δkeys) per rebuild, never O(N). Cold cost is N × per-key KDF
-    /// (~1s/key at log-n 16); warm rebuilds are pure file reads + cache hits.
+    /// Policy source covers the REGISTERED roster (agents table) — the
+    /// registration index is the source of truth; unregistered key files
+    /// (fallback-scan recipients) resolve with the default policy.
     async fn build_unwrap_pipeline(&self) -> Option<UnwrapPipeline> {
-        let paths = self.local_agent_key_paths();
-        if paths.is_empty() {
-            return None;
-        }
         let pool = self.index_pool.as_ref()?;
-        let mut keys = Vec::with_capacity(paths.len());
-        for p in &paths {
-            if let Some(k) = self.cached_load_agent_key(p) {
-                keys.push(k);
-            }
-        }
-        if keys.is_empty() {
+        let paths = self.local_agent_key_paths();
+        // Roster from the registration index — pubkeys WITHOUT decryption.
+        let roster: Vec<(String, String, String)> =
+            sqlx::query_as("SELECT project_slug, name, pubkey FROM agents")
+                .fetch_all(pool)
+                .await
+                .unwrap_or_default();
+        if roster.is_empty() && paths.is_empty() {
             return None;
         }
-        let npubs: Vec<nostr_sdk::nostr::PublicKey> = keys.iter().map(|k| k.public_key()).collect();
-        let refs: Vec<&nostr_sdk::nostr::PublicKey> = npubs.iter().collect();
+        // Recipient-npub → verbatim project slug + name (the wrap hides the
+        // project; the sinks + resolver read it off this map).
+        let npub_to_agent: std::collections::HashMap<String, (String, String)> = roster
+            .iter()
+            .map(|(slug, name, npub)| (npub.clone(), (slug.clone(), name.clone())))
+            .collect();
+        // Sender-npub → display name (AM-parity sender naming).
+        let npub_to_name: std::collections::HashMap<String, String> = roster
+            .iter()
+            .map(|(_slug, name, npub)| (npub.clone(), name.clone()))
+            .collect();
+        let npub_to_project: std::collections::HashMap<String, String> = roster
+            .into_iter()
+            .map(|(slug, _name, npub)| (npub, slug))
+            .collect();
+        // Policy over the registered roster (pubkeys from the index — no KDF).
+        let roster_npubs: Vec<nostr_sdk::nostr::PublicKey> = npub_to_project
+            .keys()
+            .filter_map(|h| nostr_sdk::nostr::PublicKey::parse(h).ok())
+            .collect();
+        let refs: Vec<&nostr_sdk::nostr::PublicKey> = roster_npubs.iter().collect();
         let source = Arc::new(BusPolicySource::load_many(self, &refs).await);
-        // Recipient-npub → verbatim project slug, from the registration-time
-        // `agents` index (gift wraps hide the project; the sink cannot read
-        // it off the wrap). Last-write-wins: one key per project in practice.
-        let npub_to_project: std::collections::HashMap<String, String> =
-            sqlx::query_as("SELECT project_slug, pubkey FROM agents")
-                .fetch_all(pool)
-                .await
-                .map(|rows| rows.into_iter().map(|(slug, npub)| (npub, slug)).collect())
-                .unwrap_or_default();
-        // Sender-npub → display name (AM-parity sender naming on the
-        // projected `messages.sender` column; search + summarize read it).
-        let npub_to_name: std::collections::HashMap<String, String> =
-            sqlx::query_as("SELECT pubkey, name FROM agents")
-                .fetch_all(pool)
-                .await
-                .map(|rows| rows.into_iter().collect())
-                .unwrap_or_default();
         let sqlite: Arc<dyn ProjectionSink> = Arc::new(
             SqliteProjectionSink::new(pool.clone())
                 .with_projects(npub_to_project.clone())
@@ -416,11 +415,45 @@ impl Mailbox {
             Some(tx) => Arc::new(TriggerNotifySink::new(dual, tx.clone())),
             None => dual,
         };
-        let mut pipeline = UnwrapPipeline::new(keys, source, sink);
+        let resolver = Arc::new(MailboxKeyResolver {
+            mailbox: self.clone(),
+            npub_to_agent,
+        });
+        let mut pipeline = UnwrapPipeline::new(Vec::new(), source, sink).with_resolver(resolver);
         if let Some(op) = &self.operator {
             pipeline = pipeline.with_operator(op.public_key());
         }
         Some(pipeline)
+    }
+}
+
+/// bd-unwrap-ptag-lazy: DB-directed recipient key resolution. The agents
+/// index maps recipient npub → (project, name) at registration time;
+/// `resolve` decrypts exactly that agent's key file through the
+/// content-keyed cache. On a DB miss (raw unregistered key files — the
+/// pre-registration state some tests rely on) it falls back to a cached
+/// scan of local key files, the pre-lazy semantics, paid only for npubs
+/// the index does not know.
+struct MailboxKeyResolver {
+    mailbox: Mailbox,
+    npub_to_agent: std::collections::HashMap<String, (String, String)>,
+}
+
+impl unwrap::RecipientKeyResolver for MailboxKeyResolver {
+    fn resolve(&self, recipient: &nostr_sdk::nostr::PublicKey) -> Option<Keys> {
+        let hex = recipient.to_hex();
+        if let Some((project, name)) = self.npub_to_agent.get(&hex) {
+            let path = self.mailbox.agent_key_path(project, name);
+            return self.mailbox.cached_load_agent_key(&path);
+        }
+        for p in self.mailbox.local_agent_key_paths() {
+            if let Some(k) = self.mailbox.cached_load_agent_key(&p)
+                && k.public_key() == *recipient
+            {
+                return Some(k);
+            }
+        }
+        None
     }
 }
 
@@ -586,6 +619,95 @@ mod tests {
         );
 
         handle.abort();
+        let _ = std::fs::remove_dir_all(&data_dir);
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// bd-unwrap-ptag-lazy: a wrap for a REGISTERED agent decrypts exactly
+    /// ONE key — the wrap's p-tag names the recipient npub, the resolver
+    /// decrypts just that key, and the pipeline build itself performs ZERO
+    /// KDF (no eager keyring). RED against the eager-scan design (which
+    /// decrypts every local key at build time).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ptag_directed_unwrap_decrypts_only_the_recipient_key() {
+        let (mailbox, db, data_dir) = loop_mailbox("ptag-lazy").await;
+        let reg_a = mailbox
+            .register_agent(
+                "proj",
+                &AgentProfile {
+                    name: "AlphaOne".into(),
+                    program: Some("opencode".into()),
+                    model: None,
+                    persona: None,
+                    task_description: None,
+                },
+            )
+            .await
+            .expect("register a");
+        let reg_b = mailbox
+            .register_agent(
+                "proj",
+                &AgentProfile {
+                    name: "BetaTwo".into(),
+                    program: Some("opencode".into()),
+                    model: None,
+                    persona: None,
+                    task_description: None,
+                },
+            )
+            .await
+            .expect("register b");
+
+        // Lazy contract: the pipeline BUILD performs zero KDF.
+        let pipeline = mailbox.build_unwrap_pipeline().await.expect("pipeline");
+        assert_eq!(
+            mailbox.kdf_load_count(),
+            0,
+            "lazy keyring: build decrypts nothing"
+        );
+
+        // Wrap addressed to BetaTwo's npub: exactly ONE key decrypts.
+        let recipient_npub: nostr_sdk::nostr::PublicKey =
+            nostr_sdk::nostr::PublicKey::parse(&reg_b.npub).expect("beta npub");
+        let sender = Keys::generate();
+        let rumor = crate::nostr::gift_wrap::build_rumor(
+            sender.public_key(),
+            nostr_sdk::nostr::Timestamp::now(),
+            nostr_sdk::nostr::Kind::PrivateDirectMessage,
+            vec![nostr_sdk::nostr::Tag::parse(["p", &reg_b.npub]).expect("p")],
+            "ptag-directed hello",
+        );
+        let wrap = crate::nostr::gift_wrap::gift_wrap(&sender, &recipient_npub, rumor)
+            .await
+            .expect("wrap");
+        let out = pipeline.project(&wrap).await;
+        assert_eq!(out, ProjectOutcome::Projected, "wrap projects");
+        assert_eq!(
+            mailbox.kdf_load_count(),
+            1,
+            "exactly the p-tag recipient key decrypted (not {}/2 eager)",
+            mailbox.kdf_load_count()
+        );
+
+        // A second wrap to AlphaOne adds exactly one more decrypt.
+        let rumor2 = crate::nostr::gift_wrap::build_rumor(
+            sender.public_key(),
+            nostr_sdk::nostr::Timestamp::now(),
+            nostr_sdk::nostr::Kind::PrivateDirectMessage,
+            vec![nostr_sdk::nostr::Tag::parse(["p", &reg_a.npub]).expect("p")],
+            "ptag-directed hello two",
+        );
+        let wrap2 = crate::nostr::gift_wrap::gift_wrap(
+            &sender,
+            &nostr_sdk::nostr::PublicKey::parse(&reg_a.npub).expect("alpha npub"),
+            rumor2,
+        )
+        .await
+        .expect("wrap2");
+        let out2 = pipeline.project(&wrap2).await;
+        assert_eq!(out2, ProjectOutcome::Projected);
+        assert_eq!(mailbox.kdf_load_count(), 2, "one decrypt per recipient");
+
         let _ = std::fs::remove_dir_all(&data_dir);
         let _ = std::fs::remove_file(&db);
     }
@@ -826,10 +948,11 @@ mod tests {
         let _ = std::fs::remove_file(&db);
     }
 
-    /// R2.0 (C2 / F2.KDF): the argon2 key-scan cost on unwrap-pipeline rebuild
-    /// is BOUNDED — cached unlocks keep warm rebuilds to exactly the keys
-    /// whose file CONTENT changed (never a full re-KDF of every key). Fixture
-    /// ≥50 keys; the KDF-call counter asserts the progressive bound.
+    /// bd-unwrap-ptag-lazy cost model: pipeline builds are KDF-FREE (the
+    /// lazy keyring never bulk-decrypts), a wrap to an UNREGISTERED key file
+    /// (DB-miss fallback scan) still projects end-to-end, and a repeat wrap
+    /// is a pure cache hit. The pre-lazy eager-bound assertions (cold=50,
+    /// warm=+1) described the deleted design.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn unwrap_loop_kdf_cached_between_rebuilds_many_keys() {
         use crate::nostr::gift_wrap::{build_rumor, gift_wrap};
@@ -839,7 +962,9 @@ mod tests {
         let pass = "loop-test-pass";
         let agent_dir = data_dir.join("proj").join("agents");
 
-        // Fixture: 50 agent keys on disk (TEST_LOG_N — ~ms each, CI-safe).
+        // Fixture: 50 UNREGISTERED agent keys on disk (TEST_LOG_N — ~ms
+        // each, CI-safe). None of them sit in the agents index, so wraps to
+        // them exercise the fallback scan.
         for i in 0..50usize {
             let p = agent_dir.join(format!("agent-{i}")).join("key.ncryptsec");
             crate::keys::write_encrypted_key(
@@ -850,73 +975,78 @@ mod tests {
             )
             .expect("write key");
         }
+        let target = crate::keys::generate();
+        let p50 = agent_dir.join("agent-50").join("key.ncryptsec");
+        crate::keys::write_encrypted_key(&p50, &target, pass, crate::keys::TEST_LOG_N)
+            .expect("write target key");
 
-        // Cold build: every key is unlocked exactly once.
-        let _cold = mailbox.build_unwrap_pipeline().await.expect("cold build");
-        assert_eq!(
-            mailbox.kdf_load_count(),
-            50,
-            "cold path unlocks every key exactly once"
-        );
-
-        // Warm rebuild after ONE new key: KDF runs only for the added key —
-        // the 50 cached unlocks are served from cache, never re-derived.
-        let new_keys = crate::keys::generate();
-        let p51 = agent_dir.join("agent-50").join("key.ncryptsec");
-        crate::keys::write_encrypted_key(&p51, &new_keys, pass, crate::keys::TEST_LOG_N)
-            .expect("write new key");
-        let warm = mailbox.build_unwrap_pipeline().await.expect("warm build");
-        assert_eq!(
-            mailbox.kdf_load_count(),
-            51,
-            "warm rebuild KDFs ONLY the added key (progressive bound)"
-        );
-
-        // No-op rebuild (same signature, same contents): zero KDF.
-        let _noop = mailbox.build_unwrap_pipeline().await.expect("no-op build");
-        assert_eq!(
-            mailbox.kdf_load_count(),
-            51,
-            "unchanged rebuild is cache-only, no KDF"
-        );
-
-        // A key whose CONTENT changed is re-KDF'd exactly once.
-        let p0 = agent_dir.join("agent-0").join("key.ncryptsec");
+        // Every build is KDF-free — cold, after a new key, after a rewrite,
+        // and no-op. (The eager keyring is deleted; nothing decrypts at
+        // build time.)
+        let pipeline = mailbox.build_unwrap_pipeline().await.expect("cold build");
+        assert_eq!(mailbox.kdf_load_count(), 0, "cold build is KDF-free");
+        let other = crate::keys::generate();
         crate::keys::write_encrypted_key(
-            &p0,
-            &crate::keys::generate(),
+            &agent_dir.join("agent-51").join("key.ncryptsec"),
+            &other,
             pass,
             crate::keys::TEST_LOG_N,
         )
-        .expect("rewrite key");
-        let _changed = mailbox
-            .build_unwrap_pipeline()
-            .await
-            .expect("changed build");
+        .expect("add key");
+        let _ = mailbox.build_unwrap_pipeline().await.expect("rebuild");
         assert_eq!(
             mailbox.kdf_load_count(),
-            52,
-            "changed key re-KDFs exactly once"
+            0,
+            "rebuild after a new key file is still KDF-free"
         );
 
-        // The newly added key is LIVE in the rebuilt pipeline (a wrap to it
-        // projects end-to-end, so the cache did not skip loading it).
+        // A wrap to the unregistered target projects via the fallback scan
+        // (bounded by the local key-file count) — the pre-lazy contract for
+        // on-disk-but-unregistered keys is preserved.
         let sender = crate::keys::generate();
         let rumor = build_rumor(
             sender.public_key(),
             Timestamp::from(1_700_000_000u64),
             Kind::PrivateDirectMessage,
-            vec![Tag::parse(["p", &new_keys.public_key().to_hex()]).expect("p")],
+            vec![Tag::parse(["p", &target.public_key().to_hex()]).expect("p")],
             "hello",
         );
-        let wrap = gift_wrap(&sender, &new_keys.public_key(), rumor)
+        let wrap = gift_wrap(&sender, &target.public_key(), rumor)
             .await
             .expect("wrap");
-        let outcome = warm.project(&wrap).await;
+        let outcome = pipeline.project(&wrap).await;
         assert_eq!(
             outcome,
             ProjectOutcome::Projected,
-            "added key participates in unwrap after cached rebuild"
+            "unregistered on-disk key still unwraps (fallback scan)"
+        );
+        let after_first = mailbox.kdf_load_count();
+        assert!(
+            after_first >= 1 && after_first <= 51,
+            "fallback scan decrypts at most the local key files ({after_first})"
+        );
+
+        // Repeat wrap to the same recipient: pure cache hit.
+        let rumor2 = build_rumor(
+            sender.public_key(),
+            Timestamp::from(1_700_000_001u64),
+            Kind::PrivateDirectMessage,
+            vec![Tag::parse(["p", &target.public_key().to_hex()]).expect("p")],
+            "hello again",
+        );
+        let wrap2 = gift_wrap(&sender, &target.public_key(), rumor2)
+            .await
+            .expect("wrap2");
+        let outcome2 = pipeline.project(&wrap2).await;
+        assert_eq!(
+            outcome2,
+            ProjectOutcome::Projected,
+            "a NEW rumor to the same recipient projects (not a duplicate)"
+        );
+        assert_eq!(
+            mailbox.kdf_load_count(),
+            after_first,
+            "repeat recipient is a cache hit — zero additional KDF"
         );
 
         let _ = std::fs::remove_dir_all(&data_dir);
