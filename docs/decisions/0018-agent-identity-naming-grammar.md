@@ -76,14 +76,16 @@ The captain prefers **adjective+noun identities** (`DustySparrow`,
 `RoseDune` — the legacy spawn binding style) as the human-facing, routable
 mail identity. This amends D1/D3:
 
-1. **The pinned adjective+noun name is the canonical routable identity** per
-   pane: `agent-names.json` `mail_identity` = the adj+noun pin, **registered
-   idempotently at spawn** (the S8.1 pattern — registration, not randomness,
-   was what fixed routing) and unique per project (spawn registry rejects a
-   collision with a fresh draw).
-2. **The `flywheel-<slug>-<role><seq>` name is the technical pane handle** —
-   the herdr name, still resolved by `settle`/`send`/whois as an alias
-   through the `agent-names.json` binding, but NOT the primary mail identity.
+1. **The pinned adjective+noun name is the agent-facing public identity** —
+   the canonical routable name per pane: `agent-names.json` `mail_identity`
+   = the adj+noun pin, **registered idempotently at spawn** (the S8.1
+   pattern — registration, not randomness, was what fixed routing) and
+   unique per project (spawn registry rejects a collision with a fresh
+   draw). Agents type the pin for mail, reserve, guard, `--as`, `--to`.
+2. **The `flywheel-<slug>-<role><seq>` name is the internal herdr handle** —
+   the pane slug, folded to the pin (slug → pin alias) and still resolved by
+   `settle`/`send`/whois through the `agent-names.json` binding, but NEVER
+   the primary mail identity and never a second registered identity.
 3. **D3 display-name demotion is reversed for pins**: registered adj+noun
    pins ARE routing targets. Unregistered free strings remain rejected.
 4. `register_spawned_agent` (S8.3) is reversed to register the adj+noun pin;
@@ -102,8 +104,10 @@ from the slug grammar.
 `.flywheel/agent-names.json` (project-local, survives state-dir loss) is the
 authoritative pane→identity mapping, mirroring the spawn registry in the
 flywheel state dir. Each entry is `{pane_id, name, mail_identity}` where
-`name` is the canonical herdr name and `mail_identity` is the registered
-toron identity (S8.3: the canonical name itself).
+`name` is the herdr slug (D1 grammar) and `mail_identity` is the registered
+**pin** (D1a) — the pin, never the slug, is the routable toron identity.
+`whois(slug)` resolves through the fold to the pin's npub; the slug itself
+is never a second registered identity.
 
 - Flywheel WRITES the authority at spawn; toron CONSUMES it.
 - toron's live pane view is the herdr backend (ADR-0003 G9
@@ -112,23 +116,25 @@ toron identity (S8.3: the canonical name itself).
 - The one-time reconciliation (D4) reads the authority's bindings and folds
   legacy identities into canonical names **where discoverable**.
 
-### D3 — Routing by canonical name or npub ONLY, per-project `identity_mode`
+### D3 — Routing by pin, folded slug, or npub ONLY, per-project `identity_mode`
 
 Routing — whois and send-path recipient resolution — accepts exactly:
 
-1. a canonical name for the project (D1 grammar), or
-2. an npub (64-hex).
+1. a registered **pin** for the project (D1a: the adj+noun identity), or
+2. a **folded slug** (D1 grammar name bound by the D4/D2 authority to a pin —
+   resolved through the alias to the pin's npub), or
+3. an npub (64-hex).
 
 **Display names are demoted to non-routable profile metadata.** Legacy
-registered names (`lane-1-bootstrap`, `lane-4-catalog`, `assistant`,
-DustySparrow-era adjective+noun) remain registered (history, `list_agents`,
-archive attribution preserved) but are NOT routing targets.
+registered names (`lane-1-bootstrap`, `lane-4-catalog`, `assistant`) remain
+registered (history, `list_agents`, archive attribution preserved) but are
+NOT routing targets unless folded to a pin.
 
 Enforcement is **per-project** through a persisted `identity_mode`:
 
 | Mode | whois / send-path recipients | register / create identity |
 | :--- | :--- | :--- |
-| `swarm` | canonical name or npub ONLY; non-canonical → actionable error naming the grammar | non-canonical names REJECTED with the same error |
+| `swarm` | registered pin, folded slug, or npub ONLY; anything else → actionable error naming the grammar | non-pin names REJECTED with the same error |
 | `open` (default) | any registered name (legacy AM-Rust parity) | any name (legacy parity) |
 
 - Persisted in the archive DB (`project_identity_modes` table, migration
@@ -165,9 +171,9 @@ Existing non-canonical identities fold or demote:
 
 The one-time reconciliation for the current toron swarm:
 - The live authority (`toron.json` spawn registry + project-local
-  `agent-names.json`) binds `w7W:p1..p4 → flywheel-toron-oc..oc4`, all
-  self-bound (mail_identity == name). S8.3 already made the live swarm
-  canonical — no folds are discoverable.
+  `agent-names.json`) binds panes to **pins** (D1a): `w81:p1 →
+  BlueRidge`, `w81:p2 → LilacChapel`, `w81:p3 → RusticBarn` — the slug
+  (`flywheel-toron-coder`) folds to the pin, never a second identity.
 - `lane-1-bootstrap`, `lane-4-catalog`, `assistant`, and the DustySparrow-era
   identities have no pane binding in the current authority → **demote**.
 - The project is set to `identity_mode = swarm`; routing hardens immediately.
