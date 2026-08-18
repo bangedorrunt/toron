@@ -349,6 +349,17 @@ pub async fn run_reserve(mailbox: &Mailbox, cmd: &ReserveCommand) -> anyhow::Res
                 })
                 .await?,
         ),
+        ReserveCommand::Transfer(args) => emit(
+            mailbox
+                .transfer_reservation(
+                    &args.project,
+                    &args.from,
+                    &args.to,
+                    &args.path,
+                    args.reason.as_deref(),
+                )
+                .await?,
+        ),
     }
 }
 
@@ -449,10 +460,14 @@ pub async fn run_reserve_daemon(dc: &DaemonClient, cmd: &ReserveCommand) -> anyh
             )
             .await
         }
-        ReserveCommand::RequestRelease(_) | ReserveCommand::Respond(_) => anyhow::bail!(
-            "reserve request-release/respond are CLI-only negotiation (no daemon tool) — run \
-             with the daemon URL unset (embedded mode)"
-        ),
+        ReserveCommand::RequestRelease(_)
+        | ReserveCommand::Respond(_)
+        | ReserveCommand::Transfer(_) => {
+            anyhow::bail!(
+                "reserve request-release/respond/transfer are CLI-only (no daemon tool) — run \
+                 with the daemon URL unset (embedded mode)"
+            )
+        }
     }
 }
 

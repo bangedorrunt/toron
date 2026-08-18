@@ -159,6 +159,23 @@ pub struct RequestReleaseResult {
     pub holder: String,
 }
 
+/// Result of `transfer_reservation` (bd-pin-public-plane-s-easy.13).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TransferResult {
+    /// Path whose lease moved.
+    pub path_pattern: String,
+    /// Previous holder (released).
+    pub from_agent: String,
+    /// New holder (acquired).
+    pub to_agent: String,
+    /// Exclusivity preserved across the transfer.
+    pub exclusive: bool,
+    /// Reason preserved (or the explicit override).
+    pub reason: String,
+    /// The released lease's path (mirror of the release breakdown).
+    pub released_id: Option<String>,
+}
+
 /// `respond_request_release` (ADR-0011 Spec 6): the holder answers the
 /// request; the response carries a `decision` tag back to the requester.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -1213,6 +1230,126 @@ impl Mailbox {
         }
     }
 
+    /// bd-pin-public-plane-s-easy.13: lease transfer — a grant is a lease
+    /// transfer, never "commit as me". The holder (`from`) releases the
+    /// path; the target (`to`) acquires the SAME path preserving exclusivity
+    /// and reason. After transfer the `from` guard no longer covers the path
+    /// and the `to` guard does; `to` commits as itself, never on behalf.
+    ///
+    /// Fails loudly (no silent no-op) when `from` is not the current holder,
+    /// when the target cannot acquire (hard conflict), or when either key is
+    /// missing. The `request-release` Agreed path MAY call this helper (same
+    /// release-then-acquire semantics).
+    ///
+    /// ORDERING INVARIANT: the acquire event is stamped STRICTLY after the
+    /// release marker (created_at + 1s). `resolve_lease_state` keeps only
+    /// events with `created_at > marker.cutoff`; two `Timestamp::now()`
+    /// events in the same second would let the release marker win the
+    /// coordinate and the path would vanish from the held view.
+    pub async fn transfer_reservation(
+        &self,
+        project_slug: &str,
+        from_agent: &str,
+        to_agent: &str,
+        path: &str,
+        reason: Option<&str>,
+    ) -> anyhow::Result<TransferResult> {
+        let project_slug = &self.canonical_project(project_slug).await; // ADR-0017
+        if from_agent == to_agent {
+            anyhow::bail!("transfer to self is a no-op — {from_agent} already holds {path}");
+        }
+        let holder = self
+            .active_reservations(project_slug)
+            .await?
+            .into_iter()
+            .find(|r| r.path_pattern == path)
+            .ok_or_else(|| anyhow::anyhow!("no active held reservation on {path}"))?;
+        if holder.agent_name != from_agent {
+            anyhow::bail!(
+                "reservation {path} is held by {} (not {from_agent})",
+                holder.agent_name
+            );
+        }
+        // Target must have a local key before we touch the holder's lease.
+        self.agent_keys_for(project_slug, to_agent)?;
+
+        let release_ts = Timestamp::now();
+        let acquire_ts = Timestamp::from(release_ts.as_secs() + 1);
+        let from_keys = self.agent_keys_for(project_slug, from_agent)?;
+        let to_keys = self.agent_keys_for(project_slug, to_agent)?;
+        let d = format!("{project_slug}:{path}");
+        let effective_reason = reason
+            .map(|r| r.to_string())
+            .or_else(|| (!holder.reason.is_empty()).then(|| holder.reason.clone()))
+            .unwrap_or_default();
+
+        // 1. Release marker (same-author NIP-33 supersession, status:released).
+        let release_event = build_event(
+            &from_keys,
+            toron_kind(FILE_RESERVATION),
+            r#"{"status":"released"}"#,
+            with_project_scoping(
+                toron_kind(FILE_RESERVATION),
+                vec![
+                    Tag::parse(["d", &d]).expect("d"),
+                    Tag::parse(["status", "released"]).expect("status"),
+                ],
+                Some(project_slug),
+            ),
+            release_ts,
+        )?;
+        self.bus.publish(release_event.clone()).await?;
+        self.record_transition(project_slug, &d, "released", &release_event.id)
+            .await;
+
+        // 2. Re-acquire for the target, preserving exclusivity + reason,
+        //    stamped strictly after the release marker.
+        let acquire_event = build_event(
+            &to_keys,
+            toron_kind(FILE_RESERVATION),
+            format!(
+                r#"{{"exclusive":{},"reason":{}}}"#,
+                holder.exclusive,
+                serde_json::to_string(&effective_reason).expect("reason json")
+            ),
+            with_project_scoping(
+                toron_kind(FILE_RESERVATION),
+                vec![
+                    Tag::parse(["d", &d]).expect("d"),
+                    Tag::parse(["reason", &effective_reason]).expect("reason"),
+                ],
+                Some(project_slug),
+            ),
+            acquire_ts,
+        )?;
+        self.bus.publish(acquire_event.clone()).await?;
+        self.record_transition(project_slug, &d, "acquired", &acquire_event.id)
+            .await;
+
+        // 3. Verify the target actually holds the path now (the acquire
+        //    resolved past the release marker — never a phantom transfer).
+        let held_by_target = self
+            .active_reservations(project_slug)
+            .await?
+            .into_iter()
+            .any(|r| r.path_pattern == path && r.agent_name == to_agent);
+        if !held_by_target {
+            anyhow::bail!(
+                "transfer verification failed: {to_agent} does not hold {path} after transfer \
+                 (coordinate resolution did not pick the new lease)"
+            );
+        }
+
+        Ok(TransferResult {
+            path_pattern: path.to_string(),
+            from_agent: from_agent.to_string(),
+            to_agent: to_agent.to_string(),
+            exclusive: holder.exclusive,
+            reason: effective_reason,
+            released_id: Some(release_event.id.to_hex()),
+        })
+    }
+
     /// `request_release` (ADR-0011 Spec 6): Crew A asks holder B to release
     /// or defer a held reservation via a typed kind-14 DM (toron-kind=
     /// `request-release`, importance high, ack-required). Validates that the
@@ -1778,6 +1915,108 @@ mod tests {
         assert!(!overlaps("src/**", "docs/x.md"));
         // Distinct files.
         assert!(!overlaps("src/a.rs", "src/b.rs"));
+    }
+
+    /// bd-pin-public-plane-s-easy.13: lease transfer — a grant is a lease
+    /// transfer, never "commit as me". A releases, B acquires the SAME path
+    /// (exclusive + reason preserved); after transfer A's guard no longer
+    /// covers the path and B's does. B commits as B.
+    #[tokio::test]
+    async fn test_lease_transfer_moves_coverage_from_a_to_b() {
+        let (mailbox, db_path, data_dir) = test_mailbox("transfer").await;
+        register(&mailbox, "demo", "BlueLake").await;
+        register(&mailbox, "demo", "RoseDune").await;
+
+        // A acquires src/transfer.rs exclusively.
+        let acq = mailbox
+            .file_reservation_paths(
+                "demo",
+                "BlueLake",
+                &["src/transfer.rs".to_string()],
+                None,
+                true,
+                Some("handoff"),
+            )
+            .await
+            .expect("A acquire");
+        assert_eq!(acq.granted.len(), 1);
+
+        // Transfer: A → B, same path, reason preserved.
+        let transfer = mailbox
+            .transfer_reservation("demo", "BlueLake", "RoseDune", "src/transfer.rs", None)
+            .await
+            .expect("transfer");
+        assert_eq!(transfer.path_pattern, "src/transfer.rs");
+        assert_eq!(transfer.from_agent, "BlueLake");
+        assert_eq!(transfer.to_agent, "RoseDune");
+
+        // B now holds the path (exclusive, reason preserved).
+        let holders: Vec<Reservation> = mailbox.active_reservations("demo").await.expect("active");
+        let b_lease = holders
+            .iter()
+            .find(|r| r.path_pattern == "src/transfer.rs")
+            .expect("path still leased");
+        assert_eq!(b_lease.agent_name, "RoseDune", "B holds after transfer");
+        assert!(b_lease.exclusive, "exclusivity preserved");
+        assert_eq!(b_lease.reason, "handoff", "reason preserved");
+
+        // A cannot re-acquire the same exclusive path (B holds it).
+        let reacquire = mailbox
+            .file_reservation_paths(
+                "demo",
+                "BlueLake",
+                &["src/transfer.rs".to_string()],
+                None,
+                true,
+                None,
+            )
+            .await
+            .expect("A reacquire attempt (hard conflict, granted empty)");
+        assert!(
+            reacquire.granted.is_empty(),
+            "A must NOT be granted the transferred path"
+        );
+        assert_eq!(
+            reacquire.conflicts.len(),
+            1,
+            "hard conflict names B's lease"
+        );
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// bd-pin-public-plane-s-easy.13 unhappy path: transferring a path the
+    /// `from` agent does NOT hold fails loudly (never a silent no-op).
+    #[tokio::test]
+    async fn test_lease_transfer_requires_holder() {
+        let (mailbox, db_path, data_dir) = test_mailbox("transfer-nohold").await;
+        register(&mailbox, "demo", "BlueLake").await;
+        register(&mailbox, "demo", "RoseDune").await;
+        mailbox
+            .file_reservation_paths(
+                "demo",
+                "BlueLake",
+                &["src/held.rs".to_string()],
+                None,
+                true,
+                None,
+            )
+            .await
+            .expect("A acquire");
+
+        // RoseDune is not the holder — transfer must fail, not silently pass.
+        let err = mailbox
+            .transfer_reservation("demo", "RoseDune", "BlueLake", "src/held.rs", None)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("held by BlueLake"),
+            "error names the real holder: {err}"
+        );
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
     }
 
     #[tokio::test]
