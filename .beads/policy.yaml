@@ -1,0 +1,28 @@
+# ADR-0019 verdict-gate policy (toron project).
+# Advisory by design (bd-w1-policy-spike-nq1p, br 0.2.22+): `br close`
+# ignores gate satisfaction; enforcement is the loop's close-detect
+# reopen. The policy EXISTS so `br gate report` accepts the ADR-0019
+# legal kinds (br 0.3.2 validates gate names against the workflow), and
+# the `closed -> closed` self-transition lets the loop record a verdict
+# on an already-closed bead (bd-vsca finding).
+workflow:
+  transitions:
+    open:
+      - closed
+    closed:
+      - closed
+  gates:
+    open -> closed:
+      require_all:
+        - command-verified
+        - unit-test-verified
+        - live-verified
+        - reviewer-signed
+        - worker-receipt
+    closed -> closed:
+      require_all:
+        - command-verified
+        - unit-test-verified
+        - live-verified
+        - reviewer-signed
+        - worker-receipt
