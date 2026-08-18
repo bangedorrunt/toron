@@ -5,7 +5,7 @@
 
 use sqlx::Row;
 use toron_core::mailbox::Mailbox;
-use toron_core::nostr::kinds::{BUILD_SLOT, FILE_RESERVATION, PRODUCT_MANIFEST};
+use toron_core::nostr::kinds::{BUILD_SLOT, FILE_RESERVATION, PRODUCT_MANIFEST, toron_kind};
 
 /// All 25 parity resources as (name, uri-template, description).
 pub const RESOURCES: &[(&str, &str, &str)] = &[
@@ -600,37 +600,31 @@ async fn slot_view(mailbox: &Mailbox, param: &str) -> Option<serde_json::Value> 
 }
 
 /// Events of `kind` whose `t`-tags include `project` (project scoping).
+///
+/// bd-pin-public-plane-s-easy.14: replays with the project-scoped filter
+/// (`kind_project_filter`), NOT a bare kind filter — the bus access gate
+/// (A3) rejects project-scoped events for global (no-`#t`) subscriptions, so
+/// a bare-kind replay returned ZERO reservation events even when leases were
+/// held (the daemon's `toron://reservations/{project}` looked empty; the CLI
+/// guard saw false Unreserved). This is the same filter `resolved_leases`
+/// uses in toron-core.
 async fn project_scoped_events(
     mailbox: &Mailbox,
     kind: u16,
     project: &str,
 ) -> Option<serde_json::Value> {
-    let events = manifest_view(mailbox, kind, None).await?;
-    let scoped: Vec<serde_json::Value> = events["events"]
-        .as_array()
-        .map(|docs| {
-            docs.iter()
-                .filter(|d| {
-                    d["tags"]
-                        .as_array()
-                        .map(|tags| {
-                            tags.iter().any(|t| {
-                                t.as_array()
-                                    .map(|t| t.first().and_then(|s| s.as_str()) == Some("t"))
-                                    .unwrap_or(false)
-                                    && t.as_array()
-                                        .map(|t| t.get(1).and_then(|s| s.as_str()) == Some(project))
-                                        .unwrap_or(false)
-                            })
-                        })
-                        .unwrap_or(false)
-                })
-                .cloned()
-                .collect()
-        })
-        .unwrap_or_default();
+    let filter = toron_core::bus::filter::kind_project_filter(toron_kind(kind), project);
+    let events = toron_core::mailbox::collect_replay(mailbox.bus().as_ref(), filter)
+        .await
+        .ok()?;
+    let mut docs: Vec<serde_json::Value> = events
+        .into_iter()
+        .filter_map(|ev| serde_json::to_value(&ev).ok())
+        .collect();
+    docs.sort_by_key(|d| d["created_at"].as_i64().unwrap_or(0));
+    docs.reverse();
     Some(
-        serde_json::json!({ "project": project, "kind": kind, "count": scoped.len(), "events": scoped }),
+        serde_json::json!({ "project": project, "kind": kind, "count": docs.len(), "events": docs }),
     )
 }
 

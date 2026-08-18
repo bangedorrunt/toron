@@ -119,9 +119,8 @@ fn inbox_since_rfc3339_filters_through_binary() {
         );
         let value: Value = serde_json::from_slice(&out.stdout).expect("inbox emits valid JSON");
         let hit = value.as_array().and_then(|arr| {
-            arr.iter().find(|m| {
-                m.get("subject").and_then(|s| s.as_str()) == Some(marker.as_str())
-            })
+            arr.iter()
+                .find(|m| m.get("subject").and_then(|s| s.as_str()) == Some(marker.as_str()))
         });
         if let Some(m) = hit {
             break m
@@ -190,8 +189,7 @@ fn inbox_since_rfc3339_filters_through_binary() {
         serde_json::from_slice(&future.stdout).expect("inbox emits valid JSON");
     assert!(
         future_value.as_array().is_some_and(|arr| {
-            !arr
-                .iter()
+            !arr.iter()
                 .any(|m| m.get("subject").and_then(|s| s.as_str()) == Some(marker.as_str()))
         }),
         "future --since must exclude the message, got {future_value}"
@@ -315,8 +313,7 @@ fn request_release_roundtrip_through_binary() {
         "reserve respond must exit 0, stderr: {}",
         String::from_utf8_lossy(&resp.stderr)
     );
-    let resp_value: Value =
-        serde_json::from_slice(&resp.stdout).expect("respond emits valid JSON");
+    let resp_value: Value = serde_json::from_slice(&resp.stdout).expect("respond emits valid JSON");
     assert!(
         resp_value.get("deliveries").is_some(),
         "respond parity shape carries deliveries, got {resp_value}"
@@ -635,6 +632,147 @@ fn reserve_conflicts_parity_json() {
         value.get("conflict_free").is_some() || value.get("conflicts").is_some(),
         "ConflictReport parity shape must carry conflict_free/conflicts, got {value}"
     );
+}
+
+/// bd-pin-public-plane-s-easy.14: ONE mailbox — a lease written by one
+/// `toron` process must be visible to a SECOND `toron guard check` process
+/// (the pre-commit hook runs in its own process against the same durable
+/// root the daemon/CLI write). A guard that embeds a fresh demo_mailbox and
+/// cannot replay the daemon's held lease reports false `Unreserved` — the
+/// observed bug (flywheel `mail locks reserve` → daemon; `toron guard
+/// check` → a different store).
+#[test]
+fn guard_check_sees_lease_held_by_another_process() {
+    // Dedicated data dir (plane-test pattern): this test shells out multiple
+    // `toron` invocations, each opening its own mailbox on the SAME root.
+    // The shared cli-robot root races parallel tests' subprocesses (SQLite
+    // "database is locked" / migration UNIQUE flake); a private root makes
+    // the test hermetic.
+    let data_dir = std::env::temp_dir().join(format!("toron-guard-own-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&data_dir);
+    std::fs::create_dir_all(&data_dir).expect("mkdir dedicated data dir");
+    std::fs::create_dir_all(&data_dir).expect("create dedicated data dir");
+    let own_run = |args: &[&str]| {
+        toron()
+            .env("TORON_MCP_DATA_DIR", &data_dir)
+            .args(args)
+            .output()
+            .expect("run toron on own data dir")
+    };
+
+    // 1. Register GuardAgent (in-process, dedicated dir) then Process A
+    //    holds an EXCLUSIVE lease via the shelled-out binary.
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    rt.block_on(async {
+        use std::sync::Arc;
+        let db = data_dir.join("index.sqlite");
+        let pool = toron_core::index::schema::connect(db.to_str().unwrap())
+            .await
+            .expect("pool");
+        toron_core::index::schema::migrate(&pool)
+            .await
+            .expect("migrate");
+        toron_core::mailbox::aliases::reconcile_aliases(&pool, &data_dir)
+            .await
+            .expect("reconcile");
+        let bus = toron_core::bus::InProcessBus::open(pool.clone(), Default::default())
+            .await
+            .expect("bus");
+        let mailbox = toron_core::mailbox::Mailbox::new(Arc::new(bus), data_dir.clone(), None)
+            .with_index_pool(pool);
+        mailbox
+            .register_agent("demo", &AgentProfile::new("GuardAgent"))
+            .await
+            .expect("register GuardAgent");
+    });
+    let acq = own_run(&[
+        "reserve",
+        "acquire",
+        "--paths",
+        "src/guard.rs",
+        "--project",
+        "demo",
+        "--agent",
+        "GuardAgent",
+        "--exclusive",
+        "--json",
+    ]);
+    assert!(
+        acq.status.success(),
+        "acquire must exit 0, stderr: {}",
+        String::from_utf8_lossy(&acq.stderr)
+    );
+
+    // 2. Process B (fresh invocation, same data dir) runs the STRICT guard
+    //    against a repo staging src/guard.rs attributed to GuardAgent. The
+    //    held lease MUST be visible — the guard must NOT report Unreserved.
+    let repo = std::env::temp_dir().join(format!("toron-guard-repo-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(repo.join("src"));
+    let git = |args: &[&str]| {
+        let mut c = Command::new("git");
+        c.current_dir(&repo).args(args);
+        c.output().expect("git")
+    };
+    git(&["init", "-q"]);
+    std::fs::write(repo.join("src/guard.rs"), "pub fn g() {}\n").unwrap();
+    git(&["add", "src/guard.rs"]);
+    git(&[
+        "-c",
+        "user.email=t@t",
+        "-c",
+        "user.name=t",
+        "commit",
+        "-qm",
+        "base",
+    ]);
+    std::fs::write(repo.join("src/guard.rs"), "pub fn g() { // changed\n}\n").unwrap();
+    git(&["add", "src/guard.rs"]);
+
+    let out = own_run(&[
+        "guard",
+        "check",
+        "--repo",
+        repo.to_str().unwrap(),
+        "--project",
+        "demo",
+        "--as-agent",
+        "GuardAgent",
+        "--strict",
+        "--json",
+    ]);
+    assert!(
+        out.status.success(),
+        "guard must exit 0 (own lease visible), stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: Value = serde_json::from_slice(&out.stdout).expect("guard must emit JSON");
+    let blocked = value
+        .get("blocked")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        blocked.is_empty(),
+        "guard must see the OTHER-process held lease as own coverage, got {value}"
+    );
+
+    // 3. Release + cleanup.
+    let rel = own_run(&[
+        "reserve",
+        "release",
+        "--project",
+        "demo",
+        "--agent",
+        "GuardAgent",
+        "--json",
+    ]);
+    assert!(
+        rel.status.success(),
+        "release: {}",
+        String::from_utf8_lossy(&rel.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&repo);
+    let _ = std::fs::remove_dir_all(&data_dir);
 }
 
 #[test]
@@ -1496,4 +1634,232 @@ fn presence_help_lists_commands() {
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(text.contains("publish"), "presence --help lists publish");
     assert!(text.contains("list"), "presence --help lists list");
+}
+
+// ---------------------------------------------------------------------------
+// bd-pin-public-plane-s-easy.14: one mailbox — the guard reads reservations
+// from the daemon when a URL is set, never a second in-process demo_mailbox.
+// ---------------------------------------------------------------------------
+
+/// Boot a real `toron serve --mcp-http` daemon on a free port with its own
+/// data dir. Returns (child, port). The caller must kill the child.
+fn boot_daemon(data_dir: &std::path::Path) -> (std::process::Child, u16) {
+    // Pick a free port: bind, note it, drop the listener.
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .and_then(|l| l.local_addr())
+        .map(|a| a.port())
+        .expect("free port");
+    let child = Command::new(env!("CARGO_BIN_EXE_toron"))
+        .args(["serve", "--mcp-http", &format!("127.0.0.1:{port}")])
+        .env("TORON_MCP_DATA_DIR", data_dir)
+        .env("RUST_LOG", "error")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn toron serve");
+    // Wait for the port to accept (the daemon mounts /mcp at bind time).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "daemon did not start listening on :{port}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    (child, port)
+}
+
+/// Acquire an exclusive lease through the daemon's MCP tools (the HTTP/MCP
+/// path — the writer's view). Uses rmcp directly, mirroring am_parity_e2e.
+fn acquire_lease_via_daemon(port: u16, project: &str, agent: &str, path: &str) {
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    rt.block_on(async {
+        use rmcp::ClientServiceExt;
+        use rmcp::model::{ClientCapabilities, ClientInfo, Implementation, ProtocolVersion};
+        use rmcp::service::ClientLifecycleMode;
+        use rmcp::transport::streamable_http_client::{
+            StreamableHttpClientTransport, StreamableHttpClientTransportConfig,
+        };
+        use serde_json::json;
+
+        let transport = StreamableHttpClientTransport::from_config(
+            StreamableHttpClientTransportConfig::with_uri(format!("http://127.0.0.1:{port}/mcp")),
+        );
+        let client_info = ClientInfo::new(
+            ClientCapabilities::default(),
+            Implementation::from_build_env(),
+        );
+        let client = client_info
+            .serve_with_lifecycle(
+                transport,
+                ClientLifecycleMode::Discover {
+                    preferred_versions: vec![
+                        ProtocolVersion::V_2026_07_28,
+                        ProtocolVersion::V_2025_11_25,
+                    ],
+                },
+            )
+            .await
+            .expect("daemon connect");
+
+        // Register the agent on the daemon (its keys live in the daemon root).
+        let reg = client
+            .call_tool(
+                rmcp::model::CallToolRequestParams::new("register_agent".to_string())
+                    .with_arguments(
+                        json!({
+                            "project_key": project,
+                            "name": agent,
+                            "program": "test",
+                        })
+                        .as_object()
+                        .cloned()
+                        .unwrap_or_default(),
+                    ),
+            )
+            .await
+            .expect("register_agent over daemon");
+        assert!(!reg.is_error.unwrap_or(false), "register failed: {reg:?}");
+
+        // Acquire the exclusive lease through the daemon.
+        let acq = client
+            .call_tool(
+                rmcp::model::CallToolRequestParams::new("file_reservation_paths".to_string())
+                    .with_arguments(
+                        json!({
+                            "project_key": project,
+                            "agent_name": agent,
+                            "paths": vec![path],
+                            "exclusive": true,
+                            "reason": "bd-pin-public-plane-s-easy.14",
+                        })
+                        .as_object()
+                        .cloned()
+                        .unwrap_or_default(),
+                    ),
+            )
+            .await
+            .expect("file_reservation_paths over daemon");
+        assert!(!acq.is_error.unwrap_or(false), "acquire failed: {acq:?}");
+    });
+}
+
+/// Init a git repo with `src/a.rs` staged, return the repo path.
+fn staged_git_repo(tag: &str) -> std::path::PathBuf {
+    let root =
+        std::env::temp_dir().join(format!("toron-guard-daemon-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("src")).expect("mkdir src");
+    std::fs::write(root.join("src/a.rs"), "pub fn a() {}\n").expect("write a.rs");
+    let init = Command::new("git")
+        .arg("init")
+        .arg("-q")
+        .arg(&root)
+        .output()
+        .expect("git init");
+    assert!(
+        init.status.success(),
+        "git init: {}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+    let add = Command::new("git")
+        .arg("-C")
+        .arg(&root)
+        .args(["add", "src/a.rs"])
+        .output()
+        .expect("git add");
+    assert!(
+        add.status.success(),
+        "git add: {}",
+        String::from_utf8_lossy(&add.stderr)
+    );
+    root
+}
+
+/// The acceptance: a lease written through the HTTP/MCP path is visible to
+/// `toron guard check` when TORON_MCP_URL is set — even when TORON_MCP_DATA_DIR
+/// points at an EMPTY dir (a second in-process demo_mailbox() would see no
+/// reservations and false-block every path as Unreserved; the daemon view
+/// sees the holder).
+#[test]
+fn guard_check_reads_reservations_from_daemon_when_url_set() {
+    let daemon_dir =
+        std::env::temp_dir().join(format!("toron-guard-daemon-data-{}", std::process::id()));
+    let empty_dir =
+        std::env::temp_dir().join(format!("toron-guard-daemon-empty-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&daemon_dir);
+    let _ = std::fs::remove_dir_all(&empty_dir);
+    std::fs::create_dir_all(&empty_dir).expect("empty dir");
+
+    let (mut daemon, port) = boot_daemon(&daemon_dir);
+    let url = format!("http://127.0.0.1:{port}/mcp");
+    let repo = staged_git_repo("a");
+
+    acquire_lease_via_daemon(port, "demo", "TestAgent", "src/a.rs");
+
+    // Guard check AS the holder with the daemon URL set + an EMPTY data dir:
+    // must pass (own reservation visible from the daemon). If the guard used
+    // demo_mailbox (empty dir) it would see no reservations → Unreserved → 1.
+    let out = toron()
+        .args([
+            "guard",
+            "check",
+            "--repo",
+            repo.to_str().unwrap(),
+            "--project",
+            "demo",
+            "--as-agent",
+            "TestAgent",
+            "--strict",
+        ])
+        .env("TORON_MCP_URL", &url)
+        .env("TORON_MCP_DATA_DIR", &empty_dir)
+        .output()
+        .expect("guard check via daemon");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "guard must see the daemon lease (own path passes), stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: Value = serde_json::from_slice(&out.stdout).expect("guard JSON");
+    assert_eq!(
+        value["blocked"].as_array().map(|a| a.len()).unwrap_or(99),
+        0,
+        "no blocked paths for the holder: {value}"
+    );
+
+    // The SAME check WITHOUT the URL (embedded on the empty dir) must FAIL —
+    // proving the URL is what made the lease visible (demo_mailbox is not the
+    // guard's source when a URL is set).
+    let out_embedded = toron()
+        .args([
+            "guard",
+            "check",
+            "--repo",
+            repo.to_str().unwrap(),
+            "--project",
+            "demo",
+            "--as-agent",
+            "TestAgent",
+            "--strict",
+        ])
+        .env_remove("TORON_MCP_URL")
+        .env("TORON_MCP_DATA_DIR", &empty_dir)
+        .output()
+        .expect("guard check embedded on empty dir");
+    assert_eq!(
+        out_embedded.status.code(),
+        Some(1),
+        "embedded empty-dir guard must NOT see the daemon lease (control)"
+    );
+
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+    let _ = std::fs::remove_dir_all(&daemon_dir);
+    let _ = std::fs::remove_dir_all(&empty_dir);
+    let _ = std::fs::remove_dir_all(&repo);
 }

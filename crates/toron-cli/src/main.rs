@@ -5,6 +5,7 @@ mod catalog;
 mod cli;
 mod config;
 mod daemon;
+mod mailbox_source;
 mod operator;
 mod output;
 mod plane;
@@ -286,15 +287,43 @@ async fn run_serve(
 /// success, an error counter on failure.
 #[tokio::main]
 async fn run_robot(command: &Command) -> anyhow::Result<()> {
-    let mailbox = toron_mcp::demo_mailbox().await?;
+    // bd-pin-public-plane-s-easy.14: the robot path uses the SAME mailbox
+    // selector as flywheel — daemon when configured/serving, else the
+    // durable XDG root. No second in-process mailbox when the daemon serves.
+    let source = crate::mailbox_source::MailboxSource::resolve().await?;
     let tool_name = operator::robot_tool_name(command);
     let start = std::time::Instant::now();
-    let result = match command {
-        Command::Mail(cmd) => robot::run_mail(&mailbox, cmd).await,
-        Command::Reserve(cmd) => robot::run_reserve(&mailbox, cmd).await,
-        Command::Slot(cmd) => robot::run_slot(&mailbox, cmd).await,
-        Command::Contact(cmd) => robot::run_contact(&mailbox, cmd).await,
-        Command::Guard(cmd) => robot::run_guard(&mailbox, cmd).await,
+    let result = match (&source, command) {
+        (crate::mailbox_source::MailboxSource::Daemon(dc), Command::Mail(cmd)) => {
+            robot::run_mail_daemon(dc, cmd).await
+        }
+        (crate::mailbox_source::MailboxSource::Daemon(dc), Command::Reserve(cmd)) => {
+            robot::run_reserve_daemon(dc, cmd).await
+        }
+        (crate::mailbox_source::MailboxSource::Daemon(dc), Command::Slot(cmd)) => {
+            robot::run_slot_daemon(dc, cmd).await
+        }
+        (crate::mailbox_source::MailboxSource::Daemon(dc), Command::Contact(cmd)) => {
+            robot::run_contact_daemon(dc, cmd).await
+        }
+        (crate::mailbox_source::MailboxSource::Daemon(dc), Command::Guard(cmd)) => {
+            robot::run_guard_daemon(dc, cmd).await
+        }
+        (crate::mailbox_source::MailboxSource::Embedded(mb), Command::Mail(cmd)) => {
+            robot::run_mail(mb, cmd).await
+        }
+        (crate::mailbox_source::MailboxSource::Embedded(mb), Command::Reserve(cmd)) => {
+            robot::run_reserve(mb, cmd).await
+        }
+        (crate::mailbox_source::MailboxSource::Embedded(mb), Command::Slot(cmd)) => {
+            robot::run_slot(mb, cmd).await
+        }
+        (crate::mailbox_source::MailboxSource::Embedded(mb), Command::Contact(cmd)) => {
+            robot::run_contact(mb, cmd).await
+        }
+        (crate::mailbox_source::MailboxSource::Embedded(mb), Command::Guard(cmd)) => {
+            robot::run_guard(mb, cmd).await
+        }
         _ => anyhow::bail!("not a robot command"),
     };
     match result {
