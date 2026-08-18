@@ -863,6 +863,74 @@ mod tests {
         assert_eq!(blocked[0].kind, StrictBlockKind::HeldBy("OtherPin".into()));
     }
 
+    // --- bd-pin-public-plane-s-easy.10: anti-sweep — strict guard is the control ---
+
+    #[test]
+    fn anti_sweep_blocks_staging_path_held_by_another_agent() {
+        // Agent A holds src/a.rs (exclusive). Agent B stages src/a.rs →
+        // HeldBy(A). The strict guard is the control, not a DM.
+        let staged = vec!["src/a.rs".to_string()];
+        let reservations = vec![res("A", "src/a.rs", true)];
+        let blocked = guard_check_strict(Some("B"), &staged, &reservations, SHARED_SAFE_PATHS);
+        assert_eq!(blocked.len(), 1, "B staging A's held path must block");
+        assert_eq!(blocked[0].path, "src/a.rs");
+        assert_eq!(blocked[0].kind, StrictBlockKind::HeldBy("A".into()));
+    }
+
+    #[test]
+    fn anti_sweep_allows_staging_only_own_reserved_path() {
+        // Agent B stages ONLY its own reserved path → passes (no sweep).
+        let staged = vec!["src/b.rs".to_string()];
+        let reservations = vec![res("A", "src/a.rs", true), res("B", "src/b.rs", true)];
+        let blocked = guard_check_strict(Some("B"), &staged, &reservations, SHARED_SAFE_PATHS);
+        assert!(
+            blocked.is_empty(),
+            "B staging only its own reserved path must pass: {blocked:?}"
+        );
+    }
+
+    #[test]
+    fn anti_sweep_unreserved_path_is_unreserved_not_whispered() {
+        // A staged path covered by NO reservation is Unreserved (fail-closed
+        // sweep control — the anti-sweep contract, not a nudge).
+        let staged = vec!["src/other.rs".to_string()];
+        let reservations = vec![res("A", "src/a.rs", true)];
+        let blocked = guard_check_strict(Some("B"), &staged, &reservations, SHARED_SAFE_PATHS);
+        assert_eq!(blocked.len(), 1);
+        assert_eq!(blocked[0].path, "src/other.rs");
+        assert_eq!(blocked[0].kind, StrictBlockKind::Unreserved);
+    }
+
+    #[test]
+    fn test_install_hook_defaults_strict_on_with_escape_hatch() {
+        // bd-pin-public-plane-s-easy.10: the installed hook must default
+        // TORON_GUARD_STRICT=1 (strict is the control) and document the
+        // operator escape TORON_GUARD_STRICT=0 — never silent fail-open.
+        let root = std::env::temp_dir().join(format!(
+            "toron-guard-strict-{}-{}.git",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).expect("create repo dir");
+        let repo = git2::Repository::init(&root).expect("init repo");
+        let hook = install_precommit_guard(&root, "demo").expect("install");
+        let contents = std::fs::read_to_string(&hook).expect("read hook");
+        assert!(
+            contents.contains("TORON_GUARD_STRICT=\"${TORON_GUARD_STRICT:-1}\""),
+            "hook must default strict ON (fail-closed), got: {contents}"
+        );
+        assert!(
+            contents.contains("TORON_GUARD_STRICT=0"),
+            "hook must document the operator escape TORON_GUARD_STRICT=0"
+        );
+        assert!(
+            contents.contains("guard check"),
+            "hook delegates to the guard check"
+        );
+        drop(repo);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn test_install_preserves_existing_hook_as_legacy_and_chains() {
         // bd-2dox: installing into a repo with a pre-existing non-toron hook
