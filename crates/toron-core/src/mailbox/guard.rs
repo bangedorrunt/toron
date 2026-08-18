@@ -56,17 +56,38 @@ pub fn guard_check_blocked(
 /// - Own reservations never block (holder == agent).
 /// - A path is blocked iff some other agent holds an active exclusive
 ///   reservation whose pattern matches it (symmetric fnmatch).
+///
+/// bd-pin-public-plane-s-easy.1: holder equality goes through the resolver —
+/// pin and slug are the same holder when `resolve` maps them to one
+/// canonical name (a fold slug → pin). Without a resolver, names compare
+/// raw (identity) — legacy behavior preserved for callers that cannot
+/// resolve.
 pub fn guard_blocked_paths(
     agent: &str,
     staged: &[String],
     reservations: &[Reservation],
 ) -> Vec<String> {
+    guard_blocked_paths_resolved(agent, staged, reservations, &|n| n.to_string())
+}
+
+/// bd-pin-public-plane-s-easy.1: `guard_blocked_paths` with a name resolver.
+/// Holder equality is `resolve(holder) == resolve(agent)` — never a raw
+/// string compare across aliases (a reservation held by the pin blocks a
+/// slug-attributed commit of the SAME agent as itself, and vice versa).
+pub fn guard_blocked_paths_resolved(
+    agent: &str,
+    staged: &[String],
+    reservations: &[Reservation],
+    resolve: &dyn Fn(&str) -> String,
+) -> Vec<String> {
     staged
         .iter()
         .filter(|path| {
-            reservations
-                .iter()
-                .any(|r| r.exclusive && r.holder != agent && pattern_matches(&r.pattern, path))
+            reservations.iter().any(|r| {
+                r.exclusive
+                    && resolve(&r.holder) != resolve(agent)
+                    && pattern_matches(&r.pattern, path)
+            })
         })
         .cloned()
         .collect()
@@ -116,6 +137,20 @@ pub fn guard_check_strict(
     reservations: &[Reservation],
     shared_safe: &[&str],
 ) -> Vec<StrictBlock> {
+    guard_check_strict_resolved(agent, staged, reservations, shared_safe, &|n| n.to_string())
+}
+
+/// bd-pin-public-plane-s-easy.1: `guard_check_strict` with a name resolver —
+/// pin and slug are the same holder when `resolve` maps them to one
+/// canonical name (a fold slug → pin). Own-coverage and held-by comparison
+/// go through `resolve`, never a raw string compare across aliases.
+pub fn guard_check_strict_resolved(
+    agent: Option<&str>,
+    staged: &[String],
+    reservations: &[Reservation],
+    shared_safe: &[&str],
+    resolve: &dyn Fn(&str) -> String,
+) -> Vec<StrictBlock> {
     let Some(agent) = agent else {
         return staged
             .iter()
@@ -132,14 +167,13 @@ pub fn guard_check_strict(
         }
         let own = reservations
             .iter()
-            .any(|r| r.holder == agent && pattern_matches(&r.pattern, path));
+            .any(|r| resolve(&r.holder) == resolve(agent) && pattern_matches(&r.pattern, path));
         if own {
             continue;
         }
-        match reservations
-            .iter()
-            .find(|r| r.exclusive && r.holder != agent && pattern_matches(&r.pattern, path))
-        {
+        match reservations.iter().find(|r| {
+            r.exclusive && resolve(&r.holder) != resolve(agent) && pattern_matches(&r.pattern, path)
+        }) {
             Some(r) => blocked.push(StrictBlock {
                 path: path.clone(),
                 kind: StrictBlockKind::HeldBy(r.holder.clone()),
@@ -764,6 +798,69 @@ mod tests {
             guard_check_blocked(Some("me"), &staged, &reservations),
             vec!["src/lib.rs".to_string()]
         );
+    }
+
+    // --- bd-pin-public-plane-s-easy.1: pin and slug are ONE holder ---
+
+    #[test]
+    fn resolved_guard_treats_pin_and_slug_as_same_holder() {
+        // A reservation held by the PIN must not block a commit attributed
+        // to the SLUG (same holder after the fold slug → pin).
+        let staged = vec!["src/lib.rs".to_string()];
+        let reservations = vec![res("BlueRidge", "src/**", true)];
+        let resolve = |name: &str| -> String {
+            match name {
+                "flywheel-toron-coder" => "BlueRidge".to_string(),
+                other => other.to_string(),
+            }
+        };
+        let blocked =
+            guard_blocked_paths_resolved("flywheel-toron-coder", &staged, &reservations, &resolve);
+        assert!(
+            blocked.is_empty(),
+            "slug commit must not block against pin-held reservation"
+        );
+
+        // Reverse: slug-held reservation, pin commit.
+        let reservations = vec![res("flywheel-toron-coder", "src/**", true)];
+        let blocked = guard_blocked_paths_resolved("BlueRidge", &staged, &reservations, &resolve);
+        assert!(blocked.is_empty(), "pin commit vs slug-held reservation");
+    }
+
+    #[test]
+    fn resolved_strict_guard_treats_pin_and_slug_as_same_holder() {
+        let staged = vec!["src/lib.rs".to_string()];
+        let reservations = vec![res("BlueRidge", "src/**", true)];
+        let resolve = |name: &str| -> String {
+            match name {
+                "flywheel-toron-coder" => "BlueRidge".to_string(),
+                other => other.to_string(),
+            }
+        };
+        let blocked = guard_check_strict_resolved(
+            Some("flywheel-toron-coder"),
+            &staged,
+            &reservations,
+            SHARED_SAFE_PATHS,
+            &resolve,
+        );
+        assert!(
+            blocked.is_empty(),
+            "slug attribution counts as the pin holder's own coverage"
+        );
+
+        // A genuinely DIFFERENT holder still blocks (resolved comparison is
+        // not a wildcard).
+        let reservations = vec![res("OtherPin", "src/**", true)];
+        let blocked = guard_check_strict_resolved(
+            Some("flywheel-toron-coder"),
+            &staged,
+            &reservations,
+            SHARED_SAFE_PATHS,
+            &resolve,
+        );
+        assert_eq!(blocked.len(), 1, "foreign holder still blocks");
+        assert_eq!(blocked[0].kind, StrictBlockKind::HeldBy("OtherPin".into()));
     }
 
     #[test]

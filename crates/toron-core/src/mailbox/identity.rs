@@ -135,7 +135,19 @@ impl Mailbox {
     /// ADR-0018: swarm-mode gate — a non-canonical agent name is rejected
     /// with an actionable error naming the grammar. Open mode passes through
     /// (legacy AM-Rust parity).
+    ///
+    /// bd-pin-public-plane-s-easy.1: a name that is ALREADY a folded alias
+    /// (slug → pin) is refused as a second identity — the fold is the only
+    /// routing, never a duplicate registration. Applies in both modes (the
+    /// fold table is authoritative wherever it exists).
     async fn check_swarm_name(&self, project_slug: &str, name: &str) -> anyhow::Result<()> {
+        if let Some(canonical) = self.agent_name_alias(project_slug, name).await {
+            anyhow::bail!(
+                "agent name {name} is a folded alias of {canonical} — register {canonical} \
+                 (the pin), not a second identity (bd-pin-public-plane-s-easy.1: fold is \
+                 slug → pin)"
+            );
+        }
         let mode = self.project_identity_mode(project_slug).await;
         if mode == crate::mailbox::naming::IdentityMode::Swarm
             && !super::naming::is_canonical_name(name, project_slug)
@@ -184,6 +196,51 @@ impl Mailbox {
         .await
         .ok()
         .flatten()
+    }
+
+    /// bd-pin-public-plane-s-easy.1: THE one name resolver — pin, slug, or
+    /// folded alias → the canonical registered name (the pin, or the
+    /// canonical `flywheel-<slug>-<role><seq>` name).
+    ///
+    /// Resolution order (swarm mode): the FOLD comes first (an explicit
+    /// alias mapping is authoritative — a slug folded to a pin resolves as
+    /// the pin, never as its raw shape), then the canonical name itself,
+    /// then a registered pin shape. Anything else — an unregistered free
+    /// string — is non-routable and rejected with the ADR-0018 grammar.
+    ///
+    /// Open mode (no identity-mode row): the name passes through untouched
+    /// (legacy AM-Rust parity — any registered name resolves).
+    ///
+    /// The result is what `whois`, the send path, and `agent_keys_for`
+    /// resolve against: holder equality across pin/slug is impossible when
+    /// every consumer goes through this one helper.
+    pub async fn resolve_agent_name(
+        &self,
+        project_slug: &str,
+        name: &str,
+    ) -> anyhow::Result<String> {
+        let canonical = self.canonical_project(project_slug).await;
+        let mode = self.project_identity_mode(&canonical).await;
+        if mode != crate::mailbox::naming::IdentityMode::Swarm {
+            return Ok(name.to_string());
+        }
+        if let Some(folded) = self.agent_name_alias(&canonical, name).await {
+            // bd-6wfv: the fold precedes the pin-pattern match — an explicit
+            // fold is the authoritative mapping and must win over any shape
+            // match (a folded slug is a canonical-shaped name AND a folded
+            // legacy name may pattern-match as a pin).
+            return Ok(folded);
+        }
+        if super::naming::is_canonical_name(name, &canonical) || super::naming::is_adjnoun_pin(name)
+        {
+            return Ok(name.to_string());
+        }
+        anyhow::bail!(
+            "unknown agent name: {name} — project {canonical} routes by canonical \
+             names (flywheel-{canonical}-<role><seq>), REGISTERED adjective+noun \
+             pins, or npub only; unregistered free strings are non-routable \
+             (ADR-0018 D1a/D3)"
+        )
     }
 
     /// Persist the key (ncryptsec 0600) + publish the signed profile event.
@@ -457,28 +514,14 @@ impl Mailbox {
             return self.whois_build(name.to_string(), npub, profiles).await;
         }
 
-        // ADR-0018: swarm mode resolves canonical names or folded aliases
-        // ONLY; display names are non-routable profile metadata.
+        // ADR-0018: swarm mode resolves canonical names, folded aliases, or
+        // pins ONLY; display names are non-routable profile metadata.
+        // bd-pin-public-plane-s-easy.1: ONE resolver — the fold precedes the
+        // shape match (a slug folded to a pin resolves as the pin, not as
+        // its canonical shape — whois(slug) must hit the pin's npub).
         let mode = self.project_identity_mode(&canonical).await;
         let target: String = if mode == crate::mailbox::naming::IdentityMode::Swarm {
-            if super::naming::is_canonical_name(name, &canonical) {
-                name.to_string()
-            } else if let Some(folded) = self.agent_name_alias(&canonical, name).await {
-                // bd-6wfv: the fold precedes the pin-pattern match — an
-                // explicit legacy-name fold is the authoritative mapping and
-                // must win over a stale legacy registration row that would
-                // otherwise pattern-match as a pin.
-                folded
-            } else if super::naming::is_adjnoun_pin(name) {
-                name.to_string()
-            } else {
-                anyhow::bail!(
-                    "unknown agent name: {name} — project {canonical} routes by canonical \
-                     names (flywheel-{canonical}-<role><seq>), REGISTERED adjective+noun \
-                     pins, or npub only; unregistered free strings are not routable \
-                     (ADR-0018 D1a/D3)"
-                );
-            }
+            self.resolve_agent_name(&canonical, name).await?
         } else {
             name.to_string()
         };
@@ -760,7 +803,7 @@ mod tests {
             "error names the grammar: {msg}"
         );
         assert!(
-            msg.contains("not routable"),
+            msg.contains("non-routable"),
             "error names the routing rule: {msg}"
         );
 
@@ -1231,6 +1274,137 @@ mod tests {
             .agent_keys_for("demo", "DustyWren")
             .expect("fallback finds the nested root through the shadow");
         assert_eq!(keys.public_key().to_hex(), agent.npub, "same key");
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    // --- bd-pin-public-plane-s-easy.1: resolve_agent_name (one resolver) ---
+
+    #[tokio::test]
+    async fn resolve_agent_name_folds_slug_to_pin() {
+        let (mailbox, _pool, db_path, data_dir) = test_mailbox_with_pool("resolve-slug").await;
+        mailbox.ensure_project("toron").await.expect("ensure");
+        let pin = mailbox
+            .register_agent("toron", &profile("BlueRidge"))
+            .await
+            .expect("register pin");
+        mailbox.set_identity_mode("toron", "swarm").await;
+        mailbox
+            .fold_agent_name_alias("toron", "flywheel-toron-coder", "BlueRidge")
+            .await;
+
+        // whois(slug) must resolve to the PIN's npub after a fold exists.
+        let w = mailbox
+            .whois("toron", "flywheel-toron-coder")
+            .await
+            .expect("slug whois resolves via fold");
+        assert_eq!(w.npub, pin.npub, "whois(slug) resolves to the pin's npub");
+
+        // whois(pin) still resolves natively.
+        let w_pin = mailbox
+            .whois("toron", "BlueRidge")
+            .await
+            .expect("pin whois");
+        assert_eq!(w_pin.npub, pin.npub);
+
+        // resolve_agent_name returns the pin for the slug and the pin itself.
+        assert_eq!(
+            mailbox
+                .resolve_agent_name("toron", "flywheel-toron-coder")
+                .await
+                .expect("resolve slug"),
+            "BlueRidge"
+        );
+        assert_eq!(
+            mailbox
+                .resolve_agent_name("toron", "BlueRidge")
+                .await
+                .expect("resolve pin"),
+            "BlueRidge"
+        );
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn resolve_agent_name_rejects_unregistered_free_strings() {
+        let (mailbox, _pool, db_path, data_dir) = test_mailbox_with_pool("resolve-free").await;
+        mailbox
+            .ensure_project_with_mode("toron", Some("swarm"))
+            .await
+            .expect("ensure swarm");
+        let err = mailbox
+            .resolve_agent_name("toron", "NoSuchAgent")
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("non-routable"),
+            "unregistered free string rejected: {err}"
+        );
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn resolve_agent_name_folded_legacy_alias_resolves() {
+        let (mailbox, _pool, db_path, data_dir) = test_mailbox_with_pool("resolve-legacy").await;
+        mailbox.ensure_project("toron").await.expect("ensure");
+        mailbox
+            .register_agent("toron", &profile("flywheel-toron-oc2"))
+            .await
+            .expect("register canonical");
+        mailbox.set_identity_mode("toron", "swarm").await;
+        mailbox
+            .fold_agent_name_alias("toron", "lane-1-bootstrap", "flywheel-toron-oc2")
+            .await;
+        assert_eq!(
+            mailbox
+                .resolve_agent_name("toron", "lane-1-bootstrap")
+                .await
+                .expect("resolve legacy alias"),
+            "flywheel-toron-oc2"
+        );
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// bd-pin-public-plane-s-easy.1: registration must NOT create the slug as
+    /// a second identity — the fold (slug → pin) is the only routing. A slug
+    /// with an existing fold is refused at register/create.
+    #[tokio::test]
+    async fn register_refuses_folded_slug_as_second_identity() {
+        let (mailbox, _pool, db_path, data_dir) = test_mailbox_with_pool("resolve-register").await;
+        mailbox
+            .ensure_project_with_mode("toron", Some("swarm"))
+            .await
+            .expect("ensure swarm");
+        mailbox
+            .register_agent("toron", &profile("BlueRidge"))
+            .await
+            .expect("register pin");
+        mailbox
+            .fold_agent_name_alias("toron", "flywheel-toron-coder", "BlueRidge")
+            .await;
+
+        // Registering the folded slug must be refused (no second identity).
+        let err = mailbox
+            .register_agent("toron", &profile("flywheel-toron-coder"))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("fold"),
+            "register refuses folded slug: {err}"
+        );
+        // create_agent_identity likewise.
+        let err = mailbox
+            .create_agent_identity("toron", &profile("flywheel-toron-coder"))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("fold"),
+            "create refuses folded slug: {err}"
+        );
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_dir_all(&data_dir);
     }
