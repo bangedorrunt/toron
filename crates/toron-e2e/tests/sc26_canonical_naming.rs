@@ -3,12 +3,17 @@
 
 //! SC-26 — Agent identity naming grammar + routing rules (ADR-0018).
 //!
-//! Acceptance (FIX-SPECS-2026-08-15 S8 + bd-adr-naming-grammar-h8nj):
-//! - swarm project: whois + send by canonical name (`flywheel-<slug>-<role>
-//!   <seq>`) and npub work; non-canonical names fail with errors naming the
-//!   grammar; registration of a non-canonical name is rejected.
-//! - a folded legacy alias (`agent_name_aliases`) resolves through to the
-//!   canonical npub on whois AND the send-path.
+//! Acceptance (FIX-SPECS-2026-08-15 S8 + bd-adr-naming-grammar-h8nj,
+//! amended by bd-pin-public-plane-s-easy.4 for D1a):
+//! - ADR-0018 D1a: the **pin** (adjective+noun, e.g. `BlueRidge`) is the
+//!   public, routable identity. The D1 slug (`flywheel-<slug>-<role><seq>`)
+//!   is the internal herdr handle — a fold alias of the pin, never a second
+//!   registered identity.
+//! - swarm project: whois + send by registered pin, folded slug, or npub
+//!   work; anything else fails with errors naming the grammar; registering a
+//!   second identity for a folded slug is refused.
+//! - a folded alias (`agent_name_aliases`) resolves through to the holder's
+//!   npub on whois AND the send-path; send as the slug loads the pin key.
 //! - open project (no identity_mode): legacy names still route (AM-Rust
 //!   parity preserved).
 //! - live reconciliation: `project_identity_mode` reflects the persisted
@@ -110,7 +115,7 @@ async fn sc26_swarm_project_routes_canonical_names_and_npubs_only() {
         msg.contains("flywheel-toron-<role><seq>"),
         "grammar in error: {msg}"
     );
-    assert!(msg.contains("not routable"), "demotion in error: {msg}");
+    assert!(msg.contains("non-routable"), "demotion in error: {msg}");
 
     // --- registration: canonical accepted, legacy rejected ---
     mailbox
@@ -178,6 +183,111 @@ async fn sc26_swarm_project_routes_canonical_names_and_npubs_only() {
     assert!(
         agents.iter().any(|a| a.name == "lane-1-bootstrap"),
         "legacy identity remains visible as metadata"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// bd-pin-public-plane-s-easy.4 (D1a direction): the SLUG folds to the PIN —
+/// same npub, no second key. Mirrors the reverse of the legacy fold test
+/// above: here the pin is the registered identity and the slug is the alias.
+#[tokio::test]
+async fn sc26_slug_folds_to_pin_same_npub_no_second_key() {
+    let dir = std::env::temp_dir().join(format!("toron-sc26e-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (mailbox, _bus, _pool) = boot(&dir).await;
+
+    mailbox.ensure_project("toron").await.expect("ensure");
+    let pin_npub = register(&mailbox, "toron", "RusticBarn").await;
+    mailbox.set_identity_mode("toron", "swarm").await;
+
+    // Fold: slug → pin (D1a: the slug is an alias of the pin, never a
+    // second identity).
+    mailbox
+        .fold_agent_name_alias("toron", "flywheel-toron-coder", "RusticBarn")
+        .await;
+
+    // whois(slug) and whois(pin) return the SAME npub.
+    let w_slug = mailbox
+        .whois("toron", "flywheel-toron-coder")
+        .await
+        .expect("slug whois via fold");
+    assert_eq!(
+        w_slug.npub, pin_npub,
+        "whois(slug) must resolve to the pin's npub"
+    );
+    let w_pin = mailbox
+        .whois("toron", "RusticBarn")
+        .await
+        .expect("pin whois");
+    assert_eq!(w_pin.npub, pin_npub, "whois(pin) is the same holder");
+
+    // send to EITHER name delivers to the pin inbox. Sending AS the slug
+    // exercises the send-path key load (agent_keys_for resolves slug → pin
+    // key); sending TO the slug exercises recipient resolution.
+    mailbox
+        .send_message(&send(
+            "toron",
+            "RusticBarn",
+            "flywheel-toron-coder",
+            "to-slug ping",
+        ))
+        .await
+        .expect("send to slug delivers");
+    mailbox
+        .send_message(&send(
+            "toron",
+            "flywheel-toron-coder",
+            "RusticBarn",
+            "as-slug ping",
+        ))
+        .await
+        .expect("send as slug (pin key) delivers");
+    let inbox = mailbox
+        .fetch_inbox(&FetchInbox {
+            project_slug: "toron".into(),
+            agent_name: "RusticBarn".into(),
+            unread_only: false,
+            limit: None,
+            include_bodies: true,
+            urgent_only: false,
+            since_ts: None,
+            thread_id: None,
+        })
+        .await
+        .expect("fetch");
+    assert_eq!(
+        inbox.len(),
+        2,
+        "both sends (to-slug, as-slug) landed on the pin inbox"
+    );
+
+    // No second identity: registering the slug after the fold is refused —
+    // the fold is slug → pin, and the error names the pin as the register
+    // target.
+    let err = mailbox
+        .register_agent("toron", &AgentProfile::new("flywheel-toron-coder"))
+        .await
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("folded alias") && msg.contains("RusticBarn"),
+        "register refusal names the fold + pin: {msg}"
+    );
+
+    // list_agents shows exactly one identity for the holder (the pin), not a
+    // second slug identity.
+    let agents = mailbox
+        .list_agents("toron", Default::default())
+        .await
+        .expect("list");
+    assert!(
+        agents.iter().any(|a| a.name == "RusticBarn"),
+        "pin is listed"
+    );
+    assert!(
+        !agents.iter().any(|a| a.name == "flywheel-toron-coder"),
+        "slug must not appear as a second registered identity"
     );
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -311,6 +421,84 @@ async fn sc26_identity_mode_persists_across_mailbox_instances() {
         mailbox2.project_identity_mode("toron").await,
         toron_core::mailbox::naming::IdentityMode::Swarm,
         "identity mode survives daemon restart (archive-backed)"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// --- bd-pin-public-plane-s-easy.4: slug folds to pin, same npub, no second key ---
+
+#[tokio::test]
+async fn sc26_slug_folds_to_pin_same_npub_no_second_key() {
+    let dir = std::env::temp_dir().join(format!("toron-sc26e-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (mailbox, _bus, _pool) = boot(&dir).await;
+
+    mailbox.ensure_project("toron").await.expect("ensure");
+    register(&mailbox, "toron", "flywheel-toron-oc").await;
+    let pin_npub = register(&mailbox, "toron", "BlueRidge").await;
+    mailbox.set_identity_mode("toron", "swarm").await;
+
+    // Fold is slug → pin (ADR-0018 D1a: the pin is the routable mail
+    // identity; the slug is the herdr handle and a fold alias — never a
+    // second identity).
+    mailbox
+        .fold_agent_name_alias("toron", "flywheel-toron-coder", "BlueRidge")
+        .await;
+
+    // whois(slug) and whois(pin) return the SAME npub (one holder).
+    let w_slug = mailbox
+        .whois("toron", "flywheel-toron-coder")
+        .await
+        .expect("whois slug via fold");
+    let w_pin = mailbox
+        .whois("toron", "BlueRidge")
+        .await
+        .expect("whois pin");
+    assert_eq!(
+        w_slug.npub, pin_npub,
+        "whois(slug) resolves to the pin's npub"
+    );
+    assert_eq!(w_pin.npub, pin_npub, "whois(pin) is the pin");
+
+    // send to the slug delivers to the pin's inbox (fold is slug→pin).
+    mailbox
+        .send_message(&send(
+            "toron",
+            "flywheel-toron-oc",
+            "flywheel-toron-coder",
+            "slug ping",
+        ))
+        .await
+        .expect("send to slug");
+    let inbox = mailbox
+        .fetch_inbox(&FetchInbox {
+            project_slug: "toron".into(),
+            agent_name: "BlueRidge".into(),
+            unread_only: false,
+            limit: None,
+            include_bodies: true,
+            urgent_only: false,
+            since_ts: None,
+            thread_id: None,
+        })
+        .await
+        .expect("fetch");
+    assert_eq!(
+        inbox.len(),
+        1,
+        "send to slug landed on the pin identity's inbox"
+    );
+
+    // Registering the slug as a SECOND identity is refused — the fold is
+    // the only routing (bd-pin-public-plane-s-easy.1 refusal in swarm).
+    let err = mailbox
+        .register_agent("toron", &AgentProfile::new("flywheel-toron-coder"))
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("fold"),
+        "register refuses the folded slug as a second identity: {err}"
     );
 
     let _ = std::fs::remove_dir_all(&dir);
