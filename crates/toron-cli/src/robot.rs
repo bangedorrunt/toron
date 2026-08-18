@@ -748,6 +748,22 @@ fn finish_guard_check(
         Ok(_) => true,
         Err(_) => args.strict,
     };
+    // bd-sdzw: the hatch disables the WHOLE sweep, not just strict mode —
+    // a disabled guard must exit 0 with an empty report (the operator chose
+    // to bypass; the legacy non-strict path must not still block after the
+    // hatch). Without this, `TORON_GUARD_STRICT=0` printed the escape-hatch
+    // notice then STILL exited 1 on any held-by-other path, making commits
+    // fall back to --no-verify (the hatch was unusable).
+    if !strict {
+        print_json(&json!({
+            "strict": false,
+            "hatched": true,
+            "blocked": [],
+            "agent": agent,
+            "project": args.project,
+        }))?;
+        std::process::exit(0);
+    }
     if strict {
         use toron_core::mailbox::guard::{StrictBlockKind, guard_check_strict};
         let blocked = guard_check_strict(

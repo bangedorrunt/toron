@@ -1869,14 +1869,10 @@ fn guard_check_reads_reservations_from_daemon_when_url_set() {
 /// exist on the CLI and the lease lives on the daemon.
 #[test]
 fn request_release_respond_transfer_via_daemon_url() {
-    let daemon_dir = std::env::temp_dir().join(format!(
-        "toron-reserve-daemon-data-{}",
-        std::process::id()
-    ));
-    let empty_dir = std::env::temp_dir().join(format!(
-        "toron-reserve-daemon-empty-{}",
-        std::process::id()
-    ));
+    let daemon_dir =
+        std::env::temp_dir().join(format!("toron-reserve-daemon-data-{}", std::process::id()));
+    let empty_dir =
+        std::env::temp_dir().join(format!("toron-reserve-daemon-empty-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&daemon_dir);
     let _ = std::fs::remove_dir_all(&empty_dir);
     std::fs::create_dir_all(&empty_dir).expect("empty dir");
@@ -1916,8 +1912,7 @@ fn request_release_respond_transfer_via_daemon_url() {
         !req_err.contains("CLI-only"),
         "daemon path must not bail CLI-only, stderr: {req_err}"
     );
-    let req_value: Value =
-        serde_json::from_slice(&req.stdout).expect("request-release JSON");
+    let req_value: Value = serde_json::from_slice(&req.stdout).expect("request-release JSON");
     assert_eq!(
         req_value.get("holder").and_then(|v| v.as_str()),
         Some("HolderPin"),
@@ -2103,4 +2098,315 @@ async fn daemon_mcp_client(
         )
         .await
         .expect("daemon connect")
+}
+
+// ---------------------------------------------------------------------------
+// bd-sdzw: guard hatch + shared self-holds + committer npub derivation.
+// ---------------------------------------------------------------------------
+
+/// TDD red (bd-sdzw defect 1): TORON_GUARD_STRICT=0 must exit 0 even when
+/// staged paths are unreserved — the hatch is the operator escape, it must
+/// not fall through to the blocking path.
+#[test]
+fn strict_hatch_exits_zero_when_disabled() {
+    // A repo with an unreserved staged path.
+    let repo = staged_git_repo("hatch");
+    let out = toron()
+        .args([
+            "guard",
+            "check",
+            "--repo",
+            repo.to_str().unwrap(),
+            "--project",
+            "demo",
+            "--as-agent",
+            "HatchAgent",
+        ])
+        .env("TORON_GUARD_STRICT", "0")
+        .output()
+        .expect("guard check with hatch");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "TORON_GUARD_STRICT=0 must exit 0 (hatch), stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+/// TDD red (bd-sdzw defect 3): the guard's committer identity must derive
+/// from the SAME key source the daemon signs reservations with. A lease
+/// held by CoralFinch over the daemon, checked with --as-agent CoralFinch,
+/// must be seen as OWN coverage (not HeldBy npub) — the guard resolves the
+/// agent name to its registered npub and compares npub-to-npub.
+#[test]
+fn guard_daemon_resolves_committer_to_registered_npub() {
+    let daemon_dir = std::env::temp_dir().join(format!("toron-sdzw-data-{}", std::process::id()));
+    let empty_dir = std::env::temp_dir().join(format!("toron-sdzw-empty-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&daemon_dir);
+    let _ = std::fs::remove_dir_all(&empty_dir);
+    std::fs::create_dir_all(&empty_dir).expect("empty dir");
+
+    let (mut daemon, port) = boot_daemon(&daemon_dir);
+    let url = format!("http://127.0.0.1:{port}/mcp");
+    let repo = staged_git_repo("npub");
+
+    // Hold an exclusive lease as CoralFinch via the daemon.
+    acquire_lease_via_daemon(port, "demo", "CoralFinch", "src/a.rs");
+
+    // Guard check AS CoralFinch with the daemon URL: own npub must match.
+    let out = toron()
+        .args([
+            "guard",
+            "check",
+            "--repo",
+            repo.to_str().unwrap(),
+            "--project",
+            "demo",
+            "--as-agent",
+            "CoralFinch",
+            "--strict",
+        ])
+        .env("TORON_MCP_URL", &url)
+        .env("TORON_MCP_DATA_DIR", &empty_dir)
+        .output()
+        .expect("guard check via daemon as CoralFinch");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "CoralFinch's own daemon lease must pass, stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: Value = serde_json::from_slice(&out.stdout).expect("guard JSON");
+    assert_eq!(
+        value["blocked"].as_array().map(|a| a.len()).unwrap_or(99),
+        0,
+        "no blocked paths for CoralFinch (npub resolves): {value}"
+    );
+
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+    let _ = std::fs::remove_dir_all(&daemon_dir);
+    let _ = std::fs::remove_dir_all(&empty_dir);
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+/// TDD red (bd-sdzw defect 1, held-by variant): TORON_GUARD_STRICT=0 must
+/// exit 0 even when a staged path is held by ANOTHER agent — the hatch
+/// disables the WHOLE sweep (strict AND non-strict blocking), it is the
+/// operator escape for emergencies. The legacy non-strict guard must not
+/// still block after the hatch.
+#[test]
+fn strict_hatch_exits_zero_when_held_by_other() {
+    let daemon_dir = std::env::temp_dir().join(format!("toron-hatch-data-{}", std::process::id()));
+    let empty_dir = std::env::temp_dir().join(format!("toron-hatch-empty-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&daemon_dir);
+    let _ = std::fs::remove_dir_all(&empty_dir);
+    std::fs::create_dir_all(&empty_dir).expect("empty dir");
+
+    let (mut daemon, port) = boot_daemon(&daemon_dir);
+    let url = format!("http://127.0.0.1:{port}/mcp");
+    let repo = staged_git_repo("hatch-other");
+
+    // Another agent (CoralFinch) holds the path — non-strict would block.
+    acquire_lease_via_daemon(port, "demo", "CoralFinch", "src/a.rs");
+
+    let out = toron()
+        .args([
+            "guard",
+            "check",
+            "--repo",
+            repo.to_str().unwrap(),
+            "--project",
+            "demo",
+            "--as-agent",
+            "SomeOtherAgent",
+        ])
+        .env("TORON_MCP_URL", &url)
+        .env("TORON_MCP_DATA_DIR", &empty_dir)
+        .env("TORON_GUARD_STRICT", "0")
+        .output()
+        .expect("guard check with hatch, held-by-other");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "TORON_GUARD_STRICT=0 must exit 0 even when a path is held by another agent (hatch), stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+    let _ = std::fs::remove_dir_all(&daemon_dir);
+    let _ = std::fs::remove_dir_all(&empty_dir);
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+/// TDD red (bd-sdzw defect 3, embedded witness): the guard runs from a repo
+/// whose LOCAL project root holds `agents/CoralFinch/key.ncryptsec` — but the
+/// reservation was written by the DAEMON under ITS root, so CoralFinch's npub
+/// differs across stores. With the daemon URL set the guard MUST resolve the
+/// committer from the DAEMON's agents table (npub-to-npub), never from the
+/// repo-local key.
+#[test]
+fn guard_embedded_committer_resolves_via_daemon_npub() {
+    let daemon_dir = std::env::temp_dir().join(format!("toron-sdzw2-data-{}", std::process::id()));
+    let local_dir = std::env::temp_dir().join(format!("toron-sdzw2-local-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&daemon_dir);
+    let _ = std::fs::remove_dir_all(&local_dir);
+
+    let (mut daemon, port) = boot_daemon(&daemon_dir);
+    let url = format!("http://127.0.0.1:{port}/mcp");
+
+    // Local repo root with a DIFFERENT CoralFinch key (the witness: repo-local
+    // passphrase-encrypted key cannot match the daemon's).
+    std::fs::create_dir_all(local_dir.join("agents/CoralFinch")).expect("local agents dir");
+    // A repo whose project root is local_dir (staged under local_dir/src).
+    std::fs::create_dir_all(local_dir.join("src")).expect("local src");
+    std::fs::write(local_dir.join("src/a.rs"), "pub fn a() {}\n").expect("write a.rs");
+    let init = Command::new("git")
+        .arg("init")
+        .arg("-q")
+        .arg(&local_dir)
+        .output()
+        .expect("git init");
+    assert!(init.status.success());
+    let add = Command::new("git")
+        .arg("-C")
+        .arg(&local_dir)
+        .args(["add", "src/a.rs"])
+        .output()
+        .expect("git add");
+    assert!(add.status.success());
+
+    // Daemon holds the lease for CoralFinch (its OWN npub).
+    acquire_lease_via_daemon(port, "demo", "CoralFinch", "src/a.rs");
+
+    // Guard from the local repo AS CoralFinch with the daemon URL: the
+    // committer must resolve to the DAEMON's CoralFinch npub, so the
+    // daemon-held lease is own coverage.
+    let out = toron()
+        .args([
+            "guard",
+            "check",
+            "--repo",
+            local_dir.to_str().unwrap(),
+            "--project",
+            "demo",
+            "--as-agent",
+            "CoralFinch",
+            "--strict",
+        ])
+        .env("TORON_MCP_URL", &url)
+        .env("TORON_MCP_DATA_DIR", &daemon_dir)
+        .output()
+        .expect("guard check local repo as CoralFinch");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "CoralFinch's daemon lease must pass even with a divergent local key, stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: Value = serde_json::from_slice(&out.stdout).expect("guard JSON");
+    assert_eq!(
+        value["blocked"].as_array().map(|a| a.len()).unwrap_or(99),
+        0,
+        "committer resolves to daemon npub (own lease visible): {value}"
+    );
+
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+    let _ = std::fs::remove_dir_all(&daemon_dir);
+    let _ = std::fs::remove_dir_all(&local_dir);
+}
+
+/// TDD red (bd-sdzw defect 2): strict mode must see the committer's OWN
+/// SHARED (non-exclusive) reservations as coverage — a shared self-lease is
+/// still the agent's own reservation; only cross-agent exclusive holds block.
+/// Embedded path (shared data dir, no daemon).
+#[test]
+fn strict_shared_self_hold_covers_path_embedded() {
+    let data_dir = std::env::temp_dir().join(format!("toron-sdzw-shared-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&data_dir);
+    std::fs::create_dir_all(&data_dir).expect("data dir");
+    let own_run = |args: &[&str]| {
+        toron()
+            .env("TORON_MCP_DATA_DIR", &data_dir)
+            .args(args)
+            .output()
+            .expect("run toron on own data dir")
+    };
+
+    // Register + hold a SHARED (non-exclusive) lease.
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    rt.block_on(async {
+        use std::sync::Arc;
+        let db = data_dir.join("index.sqlite");
+        let pool = toron_core::index::schema::connect(db.to_str().unwrap())
+            .await
+            .expect("pool");
+        toron_core::index::schema::migrate(&pool)
+            .await
+            .expect("migrate");
+        toron_core::mailbox::aliases::reconcile_aliases(&pool, &data_dir)
+            .await
+            .expect("reconcile");
+        let bus = toron_core::bus::InProcessBus::open(pool.clone(), Default::default())
+            .await
+            .expect("bus");
+        let mailbox = toron_core::mailbox::Mailbox::new(Arc::new(bus), data_dir.clone(), None)
+            .with_index_pool(pool);
+        mailbox
+            .register_agent("demo", &AgentProfile::new("SharedAgent"))
+            .await
+            .expect("register");
+    });
+    let acq = own_run(&[
+        "reserve",
+        "acquire",
+        "--paths",
+        "src/a.rs",
+        "--project",
+        "demo",
+        "--agent",
+        "SharedAgent",
+        "--json", // NO --exclusive → shared
+    ]);
+    assert!(
+        acq.status.success(),
+        "shared acquire: {}",
+        String::from_utf8_lossy(&acq.stderr)
+    );
+
+    // Staged repo with src/a.rs.
+    let repo = staged_git_repo("shared");
+    let out = toron()
+        .args([
+            "guard",
+            "check",
+            "--repo",
+            repo.to_str().unwrap(),
+            "--project",
+            "demo",
+            "--as-agent",
+            "SharedAgent",
+            "--strict",
+        ])
+        .env("TORON_MCP_DATA_DIR", &data_dir)
+        .output()
+        .expect("guard check embedded shared");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "own SHARED lease must cover the staged path, stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: Value = serde_json::from_slice(&out.stdout).expect("guard JSON");
+    assert_eq!(
+        value["blocked"].as_array().map(|a| a.len()).unwrap_or(99),
+        0,
+        "own shared lease is coverage: {value}"
+    );
+
+    let _ = std::fs::remove_dir_all(&data_dir);
+    let _ = std::fs::remove_dir_all(&repo);
 }
