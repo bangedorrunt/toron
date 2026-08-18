@@ -89,6 +89,35 @@ pub fn is_npub(s: &str) -> bool {
     s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit())
 }
 
+/// bd-pin-public-plane-s-easy.8: `true` when `s` looks like a host OS
+/// username (`$USER`) — a single lowercase-alphanumeric token: lowercase
+/// start, then lowercase letters and digits only. NO separators (`-`, `_`,
+/// `.`): dashed names are slug/agent-shaped (`lane-1-bootstrap`,
+/// `flywheel-toron-coder`) and must keep the generic grammar error.
+///
+/// A username is NOT a mailbox identity: it is never a pin shape (needs an
+/// uppercase pair), never a canonical `flywheel-<slug>-<role><seq>` name,
+/// and never an npub. Detected so the reject path can name the class and
+/// the recovery (registered pin / `list_agents`) instead of the generic
+/// grammar error — callers who type their own OS username think it is their
+/// mailbox name.
+///
+/// Pure shape check: a folded legacy alias is checked BEFORE this in
+/// `resolve_agent_name` (an explicit fold is authoritative — bd-6wfv), so a
+/// username-shaped alias still resolves.
+pub fn is_username_class(s: &str) -> bool {
+    let b = s.as_bytes();
+    let Some(&first) = b.first() else {
+        return false;
+    };
+    if !first.is_ascii_lowercase() {
+        return false;
+    }
+    b.iter()
+        .skip(1)
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+}
+
 /// `true` when `name` has the adjective+noun pin shape (ADR-0018 D1a,
 /// captain amendment 2026-08-15: the routable mail identity is a REGISTERED
 /// adj+noun pin — `DustySparrow`, `RoseDune`, `CoralFinch`).
@@ -251,5 +280,35 @@ mod tests {
         assert_eq!(IdentityMode::parse("garbage"), IdentityMode::Open);
         assert_eq!(IdentityMode::Swarm.as_str(), "swarm");
         assert_eq!(IdentityMode::Open.as_str(), "open");
+    }
+
+    #[test]
+    fn username_class_matches_os_user_names() {
+        for name in ["bangedorrunt", "root", "docker", "ubuntu", "wwwdata"] {
+            assert!(is_username_class(name), "{name} must be username-class");
+        }
+        // NO separators: dashed/underscored names are slug/agent-shaped
+        // (lane-1-bootstrap, my_user) and keep the generic grammar error.
+        // Uppercase (pins), digit-start, empty, and non-alnum are never
+        // username-class.
+        for name in [
+            "BlueRidge",
+            "DustySparrow",
+            "flywheel-toron-oc",
+            "lane-1-bootstrap",
+            "my_user",
+            "",
+            "X",
+            "1bangedorrunt",
+            "aBc",
+            "abc.def",
+            "abc/def",
+            "abc def",
+        ] {
+            assert!(
+                !is_username_class(name),
+                "{name:?} must NOT be username-class"
+            );
+        }
     }
 }

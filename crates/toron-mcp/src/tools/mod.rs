@@ -556,6 +556,7 @@ pub(crate) fn nonneg_secs(v: Option<i64>) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::system::WhoisArgs;
 
     #[test]
     fn nonneg_secs_rejects_negative_wrap() {
@@ -575,6 +576,39 @@ mod tests {
         let b = generate_agent_name();
         assert_ne!(a, b, "sequential names differ");
         assert!(a.chars().count() > 3);
+    }
+
+    /// bd-pin-public-plane-s-easy.8: `whois` accepts the identity as
+    /// `agent_name` (canonical) OR `name` (serde alias — grok/other wrappers
+    /// pass `name`). Both missing still fails (required identity field).
+    #[test]
+    fn whois_args_accepts_name_alias_and_stays_required() {
+        // Canonical field name.
+        let by_agent_name: WhoisArgs = serde_json::from_value(json!({
+            "project_key": "toron",
+            "agent_name": "BlueRidge",
+        }))
+        .expect("agent_name accepted");
+        assert_eq!(by_agent_name.agent_name, "BlueRidge");
+
+        // The `name` alias maps onto the same field.
+        let by_name: WhoisArgs = serde_json::from_value(json!({
+            "project_key": "toron",
+            "name": "BlueRidge",
+        }))
+        .expect("name alias accepted");
+        assert_eq!(by_name.agent_name, "BlueRidge");
+
+        // Both missing → required-field failure (never $USER, never a
+        // generated pin — there is no default).
+        let err = serde_json::from_value::<WhoisArgs>(json!({
+            "project_key": "toron",
+        }))
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("agent_name"),
+            "missing identity field fails: {err}"
+        );
     }
 
     /// Every tool must declare an outputSchema (ADR-0003 rev7 SEP-2106).
