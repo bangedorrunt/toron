@@ -651,7 +651,6 @@ fn guard_check_sees_lease_held_by_another_process() {
     let data_dir = std::env::temp_dir().join(format!("toron-guard-own-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&data_dir);
     std::fs::create_dir_all(&data_dir).expect("mkdir dedicated data dir");
-    std::fs::create_dir_all(&data_dir).expect("create dedicated data dir");
     let own_run = |args: &[&str]| {
         toron()
             .env("TORON_MCP_DATA_DIR", &data_dir)
