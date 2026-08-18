@@ -313,6 +313,7 @@ async fn kdf_single_key_cold_load() {
             include_bodies: true,
             urgent_only: false,
             since_ts: None,
+            thread_id: None,
         })
         .await
         .expect("inbox");
@@ -321,6 +322,134 @@ async fn kdf_single_key_cold_load() {
     assert!(
         cold < Duration::from_secs(30),
         "single-key cold KDF load must stay < 30s, got {cold:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 5. bd-harvest-thread-filter-yp9r scale probe: 10k messages across 1k
+/// threads — a thread-filtered inbox returns ONLY the target thread's rows
+/// (exact row-count assertion, prove-it-works, no wall-clock). The thread
+/// id lives INSIDE the encrypted gift wrap, so the filter runs post-unwrap
+/// in the shared core stage; `idx_messages_thread` models the projected
+/// thread dimension (the messages table), but the inbox projection is
+/// bus-replay + unwrap, which SQL cannot serve — the honest index for this
+/// path is the post-unwrap stage every inbox consumer already shares.
+#[tokio::test]
+#[ignore = "perf probe: run explicitly with --ignored --nocapture"]
+async fn thread_filter_returns_only_target_thread_rows_at_scale() {
+    let dir = std::env::temp_dir().join(format!("toron-perf-thr-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).expect("dir");
+    let db = dir.join("index.sqlite");
+    let pool = schema::connect(db.to_str().unwrap()).await.expect("pool");
+    schema::migrate(&pool).await.expect("migrate");
+    let bus = InProcessBus::open(pool, InProcessBusConfig::default())
+        .await
+        .expect("bus");
+    let bus: Arc<dyn Bus> = Arc::new(bus);
+    let mailbox = Arc::new(toron_core::mailbox::Mailbox::new(bus, dir.clone(), None));
+    mailbox
+        .register_agent(
+            "demo",
+            &toron_core::nostr::identity::AgentProfile::new("GreenCastle"),
+        )
+        .await
+        .expect("register sender");
+    mailbox
+        .register_agent(
+            "demo",
+            &toron_core::nostr::identity::AgentProfile::new("BlueLake"),
+        )
+        .await
+        .expect("register recipient");
+
+    use toron_core::mailbox::messaging::{FetchInbox, SendMessage};
+    let threads = std::env::var("PERF_THREADS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1_000);
+    let per_thread = std::env::var("PERF_PER_THREAD")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10);
+    let total = threads * per_thread;
+    let send_start = Instant::now();
+    let mut kdf_warm = None;
+    for t in 0..threads {
+        let thread = format!("debate-{t}");
+        for i in 0..per_thread {
+            mailbox
+                .send_message(&SendMessage {
+                    project_slug: "demo".into(),
+                    sender_name: "GreenCastle".into(),
+                    to: vec!["BlueLake".into()],
+                    subject: format!("s-{t}-{i}"),
+                    body_md: format!("body-{t}-{i}"),
+                    thread_id: Some(thread.clone()),
+                    ..Default::default()
+                })
+                .await
+                .expect("send");
+            if kdf_warm.is_none() {
+                kdf_warm = Some(mailbox.kdf_load_count());
+            }
+        }
+        if t % 100 == 0 {
+            println!("sent {}/{} threads, {:?} total", t, threads, send_start.elapsed());
+        }
+    }
+    println!("sends done: {total} in {:?}", send_start.elapsed());
+    assert_eq!(
+        mailbox.kdf_load_count(),
+        kdf_warm.unwrap(),
+        "no per-send argon2 re-derivation (R2.0 content-keyed cache)"
+    );
+
+    let target = format!("debate-{}", threads - 1);
+    let t = Instant::now();
+    let rows = mailbox
+        .fetch_inbox(&FetchInbox {
+            project_slug: "demo".into(),
+            agent_name: "BlueLake".into(),
+            unread_only: false,
+            limit: None,
+            include_bodies: true,
+            urgent_only: false,
+            since_ts: None,
+            thread_id: Some(target.clone().into()),
+        })
+        .await
+        .expect("thread inbox");
+    let elapsed = t.elapsed();
+    assert_eq!(rows.len(), per_thread, "only the target thread's rows");
+    assert!(
+        rows.iter()
+            .all(|m| m.thread_id.as_deref() == Some(target.as_str())),
+        "every row carries the requested thread_id"
+    );
+    assert!(
+        rows.iter()
+            .all(|m| m.subject.starts_with(&format!("s-{}-", threads - 1))),
+        "no foreign-thread rows leak through"
+    );
+
+    let all = mailbox
+        .fetch_inbox(&FetchInbox {
+            project_slug: "demo".into(),
+            agent_name: "BlueLake".into(),
+            unread_only: false,
+            limit: None,
+            include_bodies: false,
+            urgent_only: false,
+            since_ts: None,
+            thread_id: None,
+        })
+        .await
+        .expect("full inbox");
+    assert_eq!(all.len(), total, "unfiltered inbox still sees everything");
+
+    println!(
+        "thread_filter_returns_only_target_thread_rows_at_scale: \
+         {total} msgs / {threads} threads, thread fetch {elapsed:?} -> {per_thread} rows"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }

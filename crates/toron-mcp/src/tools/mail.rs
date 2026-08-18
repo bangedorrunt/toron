@@ -96,6 +96,7 @@ impl ToolServer {
             include_bodies: args.include_bodies.unwrap_or(false),
             urgent_only: args.urgent_only.unwrap_or(false),
             since_ts: args.since_ts.clone(),
+            thread_id: args.thread_id.clone(),
         };
         ToolOutput::result(self.mailbox.fetch_inbox(&fi).await)
     }
@@ -265,6 +266,8 @@ pub struct FetchInboxArgs {
     pub ack_overdue_only: Option<bool>,
     pub topic: Option<String>,
     pub mark_read: Option<bool>,
+    /// Keep only messages in this thread (bd-harvest-thread-filter-yp9r).
+    pub thread_id: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone)]

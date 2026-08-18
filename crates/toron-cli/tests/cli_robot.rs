@@ -214,6 +214,7 @@ fn cross_process_mail_content_shares_durable_root() {
                     include_bodies: true,
                     urgent_only: false,
                     since_ts: None,
+                    thread_id: None,
                 })
                 .await
                 .expect("in-process inbox");

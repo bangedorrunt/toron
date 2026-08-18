@@ -267,11 +267,15 @@ impl Mailbox {
     }
 
     /// Load an agent key from disk (passphrase decrypt). `None` if absent.
+    /// bd-harvest-thread-filter-yp9r: routes through the R2.0 content-keyed
+    /// KDF cache — the SEND path (agent_keys_for) previously re-ran argon2
+    /// (~4s/key) on every message, which made the 10k/1k scale gate
+    /// unreachable. Same semantics (read + decrypt), cache-aware.
     pub(crate) fn load_agent_key(&self, path: &std::path::Path) -> Option<Keys> {
         if !path.exists() {
             return None;
         }
-        crate::keys::load_encrypted_key(path, self.agent_passphrase()).ok()
+        self.cached_load_agent_key(path)
     }
 
     /// bd-cmgu: find an agent key under an ALTERNATE project root whose slug
