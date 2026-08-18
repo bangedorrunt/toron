@@ -221,6 +221,161 @@ fn inbox_since_rfc3339_filters_through_binary() {
     );
 }
 
+/// bd-pin-public-plane-s-easy.12: `toron reserve request-release` /
+/// `reserve respond` wrap the existing Mailbox methods (ADR-0011 Spec 6).
+/// Full roundtrip over the shared durable root: A holds src/a.rs (in-process
+/// mailbox), B requests release via the shelled-out binary, B answers via
+/// the binary. The ask stays on plane P (kind-14 DM); the CLI is the verb.
+#[test]
+fn request_release_roundtrip_through_binary() {
+    let _guard = plane_guard();
+    plane_register(&["HolderAgent", "AskerAgent"]);
+
+    // A (HolderAgent) holds src/a.rs exclusively — in-process mailbox on the
+    // same durable root the CLI subprocess will use.
+    let lease_id = {
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        rt.block_on(async {
+            let mailbox = plane_mailbox().await.expect("plane mailbox");
+            let held = mailbox
+                .file_reservation_paths(
+                    "demo",
+                    "HolderAgent",
+                    &["src/a.rs".into()],
+                    Some(3600),
+                    true,
+                    None,
+                )
+                .await
+                .expect("HolderAgent holds src/a.rs");
+            held.granted[0].id.clone()
+        })
+    };
+
+    // B (AskerAgent) asks HolderAgent to release it — plane P via CLI.
+    let out = plane_run(&[
+        "reserve",
+        "request-release",
+        "--project",
+        "demo",
+        "--agent",
+        "AskerAgent",
+        "--target",
+        "HolderAgent",
+        "--reservation-id",
+        &lease_id,
+        "--ask",
+        "release",
+        "--json",
+    ]);
+    assert!(
+        out.status.success(),
+        "request-release must exit 0, stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: Value =
+        serde_json::from_slice(&out.stdout).expect("request-release emits valid JSON");
+    assert_eq!(
+        value.get("holder").and_then(|v| v.as_str()),
+        Some("HolderAgent"),
+        "request-release must name the holder, got {value}"
+    );
+    assert_eq!(
+        value.get("path_pattern").and_then(|v| v.as_str()),
+        Some("src/a.rs"),
+        "request-release must name the contested path, got {value}"
+    );
+    assert_eq!(
+        value.get("delivered").and_then(|v| v.as_bool()),
+        Some(true),
+        "request-release must deliver, got {value}"
+    );
+    let request_id = value
+        .get("message_id")
+        .and_then(|v| v.as_str())
+        .expect("request-release carries the message id")
+        .to_string();
+
+    // Holder answers via the CLI (agreed) — the response resolves the ask.
+    let resp = plane_run(&[
+        "reserve",
+        "respond",
+        "--project",
+        "demo",
+        "--agent",
+        "HolderAgent",
+        "--request-id",
+        &request_id,
+        "--decision",
+        "agreed",
+        "--json",
+    ]);
+    assert!(
+        resp.status.success(),
+        "reserve respond must exit 0, stderr: {}",
+        String::from_utf8_lossy(&resp.stderr)
+    );
+    let resp_value: Value =
+        serde_json::from_slice(&resp.stdout).expect("respond emits valid JSON");
+    assert!(
+        resp_value.get("deliveries").is_some(),
+        "respond parity shape carries deliveries, got {resp_value}"
+    );
+
+    // Unhappy path: unknown reservation id is a hard error naming it.
+    let bad = plane_run(&[
+        "reserve",
+        "request-release",
+        "--project",
+        "demo",
+        "--agent",
+        "AskerAgent",
+        "--target",
+        "HolderAgent",
+        "--reservation-id",
+        &"f".repeat(64),
+        "--ask",
+        "release",
+        "--json",
+    ]);
+    assert!(
+        !bad.status.success(),
+        "unknown reservation id must exit non-zero, stdout: {}",
+        String::from_utf8_lossy(&bad.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&bad.stderr).contains("no active held reservation"),
+        "error names the missing reservation, stderr: {}",
+        String::from_utf8_lossy(&bad.stderr)
+    );
+
+    // Unhappy path: malformed --ask is a usage error naming the grammar.
+    let bad_ask = plane_run(&[
+        "reserve",
+        "request-release",
+        "--project",
+        "demo",
+        "--agent",
+        "AskerAgent",
+        "--target",
+        "HolderAgent",
+        "--reservation-id",
+        &lease_id,
+        "--ask",
+        "maybe",
+        "--json",
+    ]);
+    assert!(
+        !bad_ask.status.success(),
+        "malformed --ask must exit non-zero"
+    );
+    assert!(
+        String::from_utf8_lossy(&bad_ask.stderr).contains("release or defer"),
+        "error names the ask grammar, stderr: {}",
+        String::from_utf8_lossy(&bad_ask.stderr)
+    );
+}
+
 #[test]
 fn inbox_parity_emits_valid_json() {
     register_test_agent();

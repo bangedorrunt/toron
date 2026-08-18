@@ -522,6 +522,11 @@ pub enum ReserveCommand {
     Release(ReserveReleaseArgs),
     /// Operator force-release of a stale reservation.
     ForceRelease(ReserveForceReleaseArgs),
+    /// Ask the holder to release or defer a held reservation (ADR-0011
+    /// Spec 6, plane P — the ask is a sealed 1:1, not a room post).
+    RequestRelease(ReserveRequestReleaseArgs),
+    /// Holder answers a request-release (agreed | denied | deferred:<secs>).
+    Respond(ReserveRespondArgs),
 }
 
 #[derive(Debug, Args)]
@@ -609,6 +614,47 @@ pub struct ReserveForceReleaseArgs {
     /// Notify the previous holder via NIP-17.
     #[arg(long)]
     pub notify_previous: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct ReserveRequestReleaseArgs {
+    /// Project slug.
+    #[arg(long, default_value = DEFAULT_PROJECT)]
+    pub project: String,
+    /// The requesting agent (crew A, the pin).
+    #[arg(long, required = true)]
+    pub agent: String,
+    /// The holder being asked (crew B).
+    #[arg(long, required = true)]
+    pub target: String,
+    /// Reservation id = the kind-30031 event id of the held lease.
+    #[arg(long, required = true)]
+    pub reservation_id: String,
+    /// Ask: `release` or `defer:<secs>`.
+    #[arg(long, default_value = "release")]
+    pub ask: String,
+    /// Note attached to the ask.
+    #[arg(long)]
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct ReserveRespondArgs {
+    /// Project slug.
+    #[arg(long, default_value = DEFAULT_PROJECT)]
+    pub project: String,
+    /// The responding holder (crew B, the pin).
+    #[arg(long, required = true)]
+    pub agent: String,
+    /// The request's message id (from request-release output).
+    #[arg(long, required = true)]
+    pub request_id: String,
+    /// Decision: `agreed` | `denied` | `deferred:<secs>`.
+    #[arg(long, required = true)]
+    pub decision: String,
+    /// Note attached to the response.
+    #[arg(long)]
+    pub note: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
