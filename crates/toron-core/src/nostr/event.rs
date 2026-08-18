@@ -23,6 +23,17 @@ pub enum VerifyError {
     Invalid(#[from] EventError),
 }
 
+/// bd-verify-once-ph7t: test-only counter of WRAP-ENVELOPE verifies —
+/// [`verify_event`] calls on `Kind::GiftWrap` events only. The unwrap path
+/// necessarily verifies the inner seal (kind 13, part of decryption); the
+/// double-verify being eliminated is the ENVELOPE re-check at projection.
+/// The exact-once acceptance gate asserts a bus-delivered wrap's envelope is
+/// verified exactly once end-to-end (bus ingress; the projection loop
+/// consumes the verified boundary via `UnwrapPipeline::project_verified`).
+#[cfg(test)]
+pub static VERIFY_EVENT_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 /// Build and sign an event with an explicit `created_at` (deterministic).
 ///
 /// `created_at` is unix seconds. For tests and ordering-sensitive callers pass
@@ -48,6 +59,12 @@ pub fn build_event(
 /// [`VerifyError::BadSignature`] when the signature does not check against the
 /// event pubkey.
 pub fn verify_event(event: &Event) -> Result<(), VerifyError> {
+    // bd-verify-once-ph7t: count wrap-envelope verifies only (the double-
+    // verified object); seal verifies inside unwrap are inherent to decrypt.
+    #[cfg(test)]
+    if event.kind == nostr_sdk::nostr::Kind::GiftWrap {
+        VERIFY_EVENT_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
     if !event.verify_id() {
         return Err(VerifyError::BadId);
     }

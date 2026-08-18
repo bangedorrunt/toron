@@ -289,7 +289,11 @@ impl Mailbox {
                 current = self.build_unwrap_pipeline().await.map(|p| (sig.clone(), p));
             }
             if let Some((_, pipeline)) = &current {
-                let out = pipeline.project(&event).await;
+                // bd-verify-once-ph7t: this loop consumes ONLY bus-delivered
+                // events (verified at publish ingress) — project_verified
+                // skips the redundant re-verify (exactly one schnorr per
+                // event end-to-end).
+                let out = pipeline.project_verified(&event).await;
                 tracing::debug!(out = ?out, "unwrap loop projected {seen}");
             }
         }
@@ -1022,7 +1026,7 @@ mod tests {
         );
         let after_first = mailbox.kdf_load_count();
         assert!(
-            after_first >= 1 && after_first <= 51,
+            (1..=51).contains(&after_first),
             "fallback scan decrypts at most the local key files ({after_first})"
         );
 
