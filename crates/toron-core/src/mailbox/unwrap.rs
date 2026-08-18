@@ -420,23 +420,107 @@ impl ProjectionSink for GitProjectionSink {
 ///
 /// Dedup markers stay per-project (`.projected/{id}.marker` under the project
 /// root), so `is_projected` is project-scoped like the archive itself.
+///
+/// Micro-batching (bd-git-batch-commit-27l0): message + marker files are
+/// staged per event, and ONE commit closes a flush window — the count
+/// boundary (default 64 messages, synchronous + fail-fast: a git error
+/// propagates from `write` exactly like the per-message commit it replaces)
+/// or the quiet-time boundary (default 500ms, async tail flush). File paths
+/// and contents are unchanged; `doctor reconstruct`/recovery read FILES, not
+/// commits, so the archive stays content-isomorphic. A crash mid-window loses
+/// nothing: the worktree files were written at stage time and the rumor id
+/// joins `projected` only when the batch commit lands (re-delivery re-stages
+/// idempotently).
 pub struct ProjectGitProjectionSink {
     data_dir: PathBuf,
     projects: HashMap<String, String>,
+    batch: Arc<ProjectGitBatch>,
+}
+
+/// Default max messages per archive commit (count boundary of a flush window).
+const DEFAULT_BATCH_WINDOW: usize = 64;
+/// Default quiet-time window that closes a flush (time boundary).
+const DEFAULT_FLUSH_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Shared sink state — Arc'd so the async debounce flush task can touch it
+/// without holding the sink itself.
+struct ProjectGitBatch {
     /// slug → open archive (opened lazily per project on first write).
     archives: Mutex<HashMap<String, Arc<parking_lot::Mutex<crate::archive::git::GitArchive>>>>,
     projected: Mutex<HashSet<String>>,
+    /// slug → rumor ids staged since the last committed flush window.
+    staged_ids: Mutex<HashMap<String, Vec<String>>>,
+    /// Async debounce flush driver (spawned once on the first staged write).
+    coalescer: crate::archive::git::CommitCoalescer,
+    spawned: Mutex<bool>,
+    /// Max messages per commit (count boundary).
+    window: usize,
+    /// Quiet-time boundary: the flush task commits the tail of a window after
+    /// this long without a new staged message.
+    debounce: std::time::Duration,
+}
+
+impl ProjectGitBatch {
+    /// Commit all staged files of one project. On success the rumor ids join
+    /// the `projected` set (their durable markers were committed with the
+    /// batch); on failure the ids stay staged for the next window's retry —
+    /// `GitArchive::commit` restored the pending files, so nothing is lost.
+    fn flush_slug(&self, slug: &str) -> anyhow::Result<bool> {
+        let ids = self.staged_ids.lock().remove(slug).unwrap_or_default();
+        if ids.is_empty() {
+            return Ok(false);
+        }
+        let Some(archive) = self.archives.lock().get(slug).cloned() else {
+            return Ok(false);
+        };
+        let message = format!("project batch of {} messages", ids.len());
+        match archive.lock().commit(&message) {
+            Ok(_) => {
+                self.projected.lock().extend(ids);
+                Ok(true)
+            }
+            Err(e) => {
+                self.staged_ids.lock().insert(slug.to_string(), ids);
+                Err(e)
+            }
+        }
+    }
 }
 
 impl ProjectGitProjectionSink {
     /// Open a per-project routing sink over `data_dir` (project roots hang
     /// off it: `{data_dir}/{slug}`) with the recipient-npub → slug map.
     pub fn for_mailbox(data_dir: PathBuf, projects: HashMap<String, String>) -> Self {
+        Self::for_mailbox_with_window(
+            data_dir,
+            projects,
+            DEFAULT_BATCH_WINDOW,
+            DEFAULT_FLUSH_DEBOUNCE,
+        )
+    }
+
+    /// `for_mailbox` with an explicit flush window (tests + tuning): the
+    /// window closes at `window` staged messages or after `debounce` of quiet,
+    /// whichever comes first. `window = 1` reproduces the pre-batch behavior
+    /// (one synchronous commit per message).
+    pub fn for_mailbox_with_window(
+        data_dir: PathBuf,
+        projects: HashMap<String, String>,
+        window: usize,
+        debounce: std::time::Duration,
+    ) -> Self {
         Self {
             data_dir,
             projects,
-            archives: Mutex::new(HashMap::new()),
-            projected: Mutex::new(HashSet::new()),
+            batch: Arc::new(ProjectGitBatch {
+                archives: Mutex::new(HashMap::new()),
+                projected: Mutex::new(HashSet::new()),
+                staged_ids: Mutex::new(HashMap::new()),
+                coalescer: crate::archive::git::CommitCoalescer::new(),
+                spawned: Mutex::new(false),
+                window,
+                debounce,
+            }),
         }
     }
 
@@ -445,14 +529,15 @@ impl ProjectGitProjectionSink {
         &self,
         slug: &str,
     ) -> anyhow::Result<Arc<parking_lot::Mutex<crate::archive::git::GitArchive>>> {
-        if let Some(a) = self.archives.lock().get(slug).cloned() {
+        if let Some(a) = self.batch.archives.lock().get(slug).cloned() {
             return Ok(a);
         }
         let root = crate::mailbox::aliases::project_root(&self.data_dir, slug);
         let archive = Arc::new(parking_lot::Mutex::new(
             crate::archive::git::GitArchive::open_or_init(&root)?,
         ));
-        self.archives
+        self.batch
+            .archives
             .lock()
             .insert(slug.to_string(), archive.clone());
         Ok(archive)
@@ -462,12 +547,45 @@ impl ProjectGitProjectionSink {
     fn slug_for(&self, recipient: &str) -> String {
         self.projects.get(recipient).cloned().unwrap_or_default()
     }
+
+    /// Spawn the debounce flush task once per sink. The task commits every
+    /// staged window after `debounce` of quiet and then idles (no periodic
+    /// wakeups between bursts).
+    fn ensure_flush_task(&self) {
+        let mut spawned = self.batch.spawned.lock();
+        if *spawned {
+            return;
+        }
+        *spawned = true;
+        drop(spawned);
+        let batch = self.batch.clone();
+        let flush_batch = batch.clone();
+        tokio::spawn(async move {
+            batch.coalescer.run(batch.debounce, move || {
+                let slugs: Vec<String> = flush_batch.staged_ids.lock().keys().cloned().collect();
+                let mut any = false;
+                for slug in slugs {
+                    match flush_batch.flush_slug(&slug) {
+                        Ok(true) => any = true,
+                        Ok(false) => {}
+                        Err(e) => {
+                            tracing::warn!(
+                                slug,
+                                "batched archive commit failed; files retained, retry next window: {e}"
+                            )
+                        }
+                    }
+                }
+                any
+            }).await;
+        });
+    }
 }
 
 #[async_trait::async_trait]
 impl ProjectionSink for ProjectGitProjectionSink {
     async fn is_projected(&self, key: &DedupKey) -> anyhow::Result<bool> {
-        if self.projected.lock().contains(&key.rumor_id) {
+        if self.batch.projected.lock().contains(&key.rumor_id) {
             return Ok(true);
         }
         let slug = self.slug_for(&key.recipient);
@@ -484,7 +602,7 @@ impl ProjectionSink for ProjectGitProjectionSink {
 
     async fn write(&self, mail: &UnwrappedMail, _local_seq: u64) -> anyhow::Result<bool> {
         let id = mail.rumor_id.to_hex();
-        if self.projected.lock().contains(&id) {
+        if self.batch.projected.lock().contains(&id) {
             return Ok(false);
         }
         let slug = self.slug_for(&mail.recipient.to_hex());
@@ -504,9 +622,29 @@ impl ProjectionSink for ProjectGitProjectionSink {
         let json = mail.rumor.as_json();
         guard.stage_file(&rel, json.as_bytes())?;
         guard.stage_file(&GitProjectionSink::marker_rel(&id), b"projected")?;
-        guard.commit(&format!("project message {id}"))?;
         drop(guard);
-        self.projected.lock().insert(id);
+
+        // bd-git-batch-commit-27l0: micro-batching — stage per event, commit
+        // once per flush window. The window closes on the count boundary
+        // (synchronous + fail-fast: a git error propagates exactly like the
+        // per-message commit it replaces) or on the debounce quiet timer
+        // (async tail flush). The rumor id joins `projected` only when the
+        // batch commit lands; a crash or failed commit mid-window loses
+        // nothing — the worktree files are already on disk and re-delivery
+        // re-stages idempotently.
+        let mut staged = self.batch.staged_ids.lock();
+        let window = staged.entry(slug.clone()).or_default();
+        if !window.contains(&id) {
+            window.push(id.clone());
+        }
+        let at_cap = window.len() >= self.batch.window;
+        drop(staged);
+        if at_cap {
+            self.batch.flush_slug(&slug)?;
+        } else {
+            self.batch.coalescer.ping();
+            self.ensure_flush_task();
+        }
         Ok(true)
     }
 }
@@ -1974,6 +2112,136 @@ mod tests {
             "no second canonical file on re-delivery"
         );
         let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// Walk a tree and return every non-git file as (rel path, bytes), sorted.
+    fn walk_files(root: &std::path::Path) -> Vec<(String, Vec<u8>)> {
+        fn walk(dir: &std::path::Path, root: &std::path::Path, out: &mut Vec<(String, Vec<u8>)>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for e in entries.flatten() {
+                let p = e.path();
+                if p.file_name().is_some_and(|n| n == ".git") {
+                    continue;
+                }
+                if p.is_dir() {
+                    walk(&p, root, out);
+                } else if let Ok(bytes) = std::fs::read(&p) {
+                    out.push((
+                        p.strip_prefix(root)
+                            .expect("inside root")
+                            .to_string_lossy()
+                            .into_owned(),
+                        bytes,
+                    ));
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(root, root, &mut out);
+        out.sort();
+        out
+    }
+
+    /// Commit count (HEAD depth) of an archive root.
+    fn archive_commits(root: &std::path::Path) -> u64 {
+        crate::archive::git::GitArchive::open_or_init(root)
+            .expect("open archive")
+            .commit_count()
+            .expect("count")
+    }
+
+    /// bd-git-batch-commit-27l0: the batched git projection is
+    /// content-isomorphic with the per-message projection (identical working
+    /// tree: same file paths + bytes) and bounds the commit count to the
+    /// flush window (<= ceil(n / window)). Ordering (local_seq) is assigned
+    /// upstream in `UnwrapPipeline::project`, untouched by this change.
+    #[tokio::test]
+    async fn projection_batched_matches_per_message_file_tree() {
+        const N: usize = 5;
+        const WINDOW: usize = 3;
+
+        let sender = keys();
+        let recipient = keys();
+        let slug = "demo";
+        let projects: HashMap<String, String> =
+            [(recipient.public_key().to_hex(), slug.to_string())]
+                .into_iter()
+                .collect();
+
+        // Arm A — per-message projection (window=1: one synchronous commit
+        // per write, the pre-batch behavior).
+        let dir_a = std::env::temp_dir().join(format!("toron-batch-a-{}", uuid::Uuid::new_v4()));
+        let sink_a = ProjectGitProjectionSink::for_mailbox_with_window(
+            dir_a.clone(),
+            projects.clone(),
+            1,
+            std::time::Duration::from_millis(10),
+        );
+        let pipeline_a = UnwrapPipeline::new(
+            vec![recipient.clone()],
+            Arc::new(AutoPolicy),
+            Arc::new(sink_a),
+        );
+
+        // Arm B — batched projection (window=3, 200ms quiet flush; the burst
+        // of N projections completes far inside the quiet window, so the
+        // count boundary closes once and the debounce closes the tail).
+        let dir_b = std::env::temp_dir().join(format!("toron-batch-b-{}", uuid::Uuid::new_v4()));
+        let sink_b = ProjectGitProjectionSink::for_mailbox_with_window(
+            dir_b.clone(),
+            projects,
+            WINDOW,
+            std::time::Duration::from_millis(200),
+        );
+        let pipeline_b = UnwrapPipeline::new(
+            vec![recipient.clone()],
+            Arc::new(AutoPolicy),
+            Arc::new(sink_b),
+        );
+
+        let mut wraps = Vec::with_capacity(N);
+        for i in 0..N {
+            wraps.push(wrap_for(&sender, &recipient, 1_700_000_000 + i as u64 * 100).await);
+        }
+        for wrap in &wraps {
+            assert_eq!(
+                pipeline_a.project(wrap).await,
+                ProjectOutcome::Projected,
+                "per-message arm projects"
+            );
+            assert_eq!(
+                pipeline_b.project(wrap).await,
+                ProjectOutcome::Projected,
+                "batched arm projects"
+            );
+        }
+
+        // Let the batched arm's debounce tail flush (200ms quiet + margin).
+        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+
+        // Acceptance 1a — identical working-tree file set (paths + bytes).
+        let files_a = walk_files(&dir_a.join(slug));
+        let files_b = walk_files(&dir_b.join(slug));
+        assert_eq!(
+            files_a, files_b,
+            "per-message and batched projections must produce identical file trees"
+        );
+
+        // Acceptance 1b — commit bound: per-message == N commits; batched
+        // commits <= ceil(N / window).
+        let commits_a = archive_commits(&dir_a.join(slug));
+        let commits_b = archive_commits(&dir_b.join(slug));
+        assert_eq!(commits_a, N as u64, "per-message arm commits once per message");
+        assert!(
+            commits_b <= N.div_ceil(WINDOW) as u64,
+            "batched arm: {commits_b} commits > ceil({N}/{WINDOW}) = {}",
+            N.div_ceil(WINDOW)
+        );
+
+        let _ = std::fs::remove_dir_all(&dir_a);
+        let _ = std::fs::remove_dir_all(&dir_b);
     }
 
     /// G11 / bd-p3-projection-atomicity-rtjz: dual-sink ordering — git FIRST.
