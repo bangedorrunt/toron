@@ -749,9 +749,25 @@ fn tag_text<'a>(rumor: &'a UnsignedEvent, name: &str) -> Option<&'a str> {
     tag_value(&rumor.tags, name)
 }
 
+/// Lazy per-recipient key resolution (bd-unwrap-ptag-lazy): a NIP-59 gift
+/// wrap names its recipient in the `p` tag; the resolver maps that npub to
+/// the ONE agent key that needs decrypting. Replaces the eager N-key
+/// keyring build (N x scrypt at serve boot) with O(1) per wrap.
+pub trait RecipientKeyResolver: Send + Sync {
+    /// The decrypted key for `recipient`, or `None` when no local key
+    /// matches. Implementations SHOULD cache (content-keyed) — the same
+    /// recipient must not re-pay the KDF within a process.
+    fn resolve(&self, recipient: &nostr_sdk::nostr::PublicKey) -> Option<Keys>;
+}
+
 /// The unwrap pipeline: bus events → unwrap with local keys → policy gate →
 /// G7 order → idempotent sink write.
 pub struct UnwrapPipeline {
+    /// Lazy p-tag-directed resolution (production path). When set, a wrap's
+    /// `p` tag decrypts exactly the named recipient's key.
+    resolver: Option<Arc<dyn RecipientKeyResolver>>,
+    /// Eagerly-provided keys (direct construction / tests). The fallback
+    /// scan when no resolver is attached, or the resolver misses.
     recipients: Vec<Keys>,
     policy: Arc<dyn PolicySource>,
     sink: Arc<dyn ProjectionSink>,
@@ -763,13 +779,15 @@ pub struct UnwrapPipeline {
 }
 
 impl UnwrapPipeline {
-    /// New pipeline over the local recipient keys + a write sink.
+    /// New pipeline over eagerly-provided recipient keys + a write sink
+    /// (direct construction / tests — no lazy resolver attached).
     pub fn new(
         recipients: Vec<Keys>,
         policy: Arc<dyn PolicySource>,
         sink: Arc<dyn ProjectionSink>,
     ) -> Self {
         Self {
+            resolver: None,
             recipients,
             policy,
             sink,
@@ -777,6 +795,14 @@ impl UnwrapPipeline {
             seen_wraps: Mutex::new(HashSet::new()),
             operator: None,
         }
+    }
+
+    /// Attach the lazy p-tag-directed resolver (bd-unwrap-ptag-lazy). A wrap
+    /// whose `p` tag names a locally-known recipient decrypts exactly that
+    /// one key — no eager keyring, no N-key scan.
+    pub fn with_resolver(mut self, resolver: Arc<dyn RecipientKeyResolver>) -> Self {
+        self.resolver = Some(resolver);
+        self
     }
 
     /// Set the operator npub for the Overseer bypass (ADR-0004 Ship 5).
@@ -791,10 +817,22 @@ impl UnwrapPipeline {
         &self.acks
     }
 
-    /// Unwrap `wrap` with the local keys, returning the first success.
+    /// Unwrap `wrap`: p-tag directed first (exactly one key), then the
+    /// eager-key scan as fallback.
     fn try_unwrap(&self, wrap: &Event) -> Option<(Keys, gift_wrap::UnwrappedGift)> {
         if wrap.kind != nostr_sdk::nostr::Kind::GiftWrap {
             return None;
+        }
+        // bd-unwrap-ptag-lazy: the wrap's `p` tag names the recipient npub.
+        // Resolve + decrypt exactly that key — the production path never
+        // scans the keyring.
+        if let Some(resolver) = &self.resolver
+            && let Some(npub) = tag_value(&wrap.tags, "p")
+                .and_then(|v| nostr_sdk::nostr::PublicKey::parse(v).ok())
+            && let Some(k) = resolver.resolve(&npub)
+            && let Ok(g) = gift_wrap::unwrap(&k, wrap)
+        {
+            return Some((k, g));
         }
         self.recipients
             .iter()
