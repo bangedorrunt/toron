@@ -14,3 +14,6 @@ resonate.db-wal
 # flywheel loop runtime artifacts (per-run, not repo state)
 .flywheel/agent-state/
 .flywheel/loop-run-verify-failed/
+.flywheel/receipts/
+.beads/beads.db-wal-cert
+.beads/beads.db-wal-cert-head
