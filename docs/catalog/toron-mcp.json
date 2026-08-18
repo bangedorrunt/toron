@@ -31,7 +31,7 @@
       "name": "mail"
     },
     {
-      "args": "acquire, conflicts, renew, release, force-release, request-release, respond",
+      "args": "acquire, conflicts, renew, release, force-release, request-release, respond, transfer",
       "description": "File reservations: acquire/conflicts/renew/release/force-release",
       "name": "reserve"
     },
@@ -121,7 +121,7 @@
       "name": "workflow"
     }
   ],
-  "generated_at": "2026-08-18T12:06:19Z",
+  "generated_at": "2026-08-18T21:17:51Z",
   "resources": [
     {
       "description": "List projects known to toron.",
@@ -254,6 +254,7 @@
     {
       "description": "Upsert an agent identity on its existing key (or create if absent).",
       "example": {
+        "alias": null,
         "attachments_policy": null,
         "model": null,
         "name": null,
@@ -268,6 +269,13 @@
       "input_schema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "properties": {
+          "alias": {
+            "description": "Herdr slug (or other alias) to fold onto `name` (the pin).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "attachments_policy": {
             "type": [
               "string",
@@ -749,6 +757,9 @@
         "convert_images": null,
         "importance": null,
         "project_key": "<string>",
+        "release_ask": null,
+        "reservation_id": null,
+        "reservation_note": null,
         "sender_name": "<string>",
         "sender_token": null,
         "subject": "<string>",
@@ -824,6 +835,27 @@
           },
           "project_key": {
             "type": "string"
+          },
+          "release_ask": {
+            "description": "`release` | `defer:<secs>` — only used with `reservation_id`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "reservation_id": {
+            "description": "When set, this call is a `request_release` (CLI compose; no new tool).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "reservation_note": {
+            "description": "Optional note on the request-release rumor.",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "sender_name": {
             "type": "string"
@@ -939,6 +971,9 @@
         "convert_images": null,
         "importance": null,
         "project_key": "<string>",
+        "release_decision": null,
+        "request_message_id": null,
+        "reservation_note": null,
         "sender_name": "<string>",
         "sender_token": null,
         "subject": "<string>",
@@ -1014,6 +1049,27 @@
           },
           "project_key": {
             "type": "string"
+          },
+          "release_decision": {
+            "description": "`agreed` | `denied` | `deferred:<secs>` — only with `request_message_id`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "request_message_id": {
+            "description": "When set, this call is a `respond_request_release` (CLI compose).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "reservation_note": {
+            "description": "Optional note on the response rumor.",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "sender_name": {
             "type": "string"
@@ -1843,6 +1899,7 @@
         ],
         "project_key": "<string>",
         "reason": null,
+        "transfer_from": null,
         "ttl_seconds": null
       },
       "group": "File-reservations",
@@ -1868,6 +1925,13 @@
             "type": "string"
           },
           "reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "transfer_from": {
+            "description": "When set, this call is a `transfer_reservation` (`agent_name` = to).",
             "type": [
               "string",
               "null"

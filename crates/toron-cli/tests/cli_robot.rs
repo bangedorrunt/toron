@@ -1862,3 +1862,245 @@ fn guard_check_reads_reservations_from_daemon_when_url_set() {
     let _ = std::fs::remove_dir_all(&empty_dir);
     let _ = std::fs::remove_dir_all(&repo);
 }
+
+/// Live daemon is the writer. `reserve request-release` / `respond` /
+/// `transfer` must hit that store (compose existing MCP tools — no new
+/// tool names). A bail that says "CLI-only" is a split-brain: the verbs
+/// exist on the CLI and the lease lives on the daemon.
+#[test]
+fn request_release_respond_transfer_via_daemon_url() {
+    let daemon_dir = std::env::temp_dir().join(format!(
+        "toron-reserve-daemon-data-{}",
+        std::process::id()
+    ));
+    let empty_dir = std::env::temp_dir().join(format!(
+        "toron-reserve-daemon-empty-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&daemon_dir);
+    let _ = std::fs::remove_dir_all(&empty_dir);
+    std::fs::create_dir_all(&empty_dir).expect("empty dir");
+
+    let (mut daemon, port) = boot_daemon(&daemon_dir);
+    let url = format!("http://127.0.0.1:{port}/mcp");
+
+    let lease_id = acquire_lease_via_daemon_returning_id(port, "demo", "HolderPin", "src/a.rs");
+    register_agent_via_daemon(port, "demo", "AskerPin");
+
+    let req = toron()
+        .args([
+            "reserve",
+            "request-release",
+            "--project",
+            "demo",
+            "--agent",
+            "AskerPin",
+            "--target",
+            "HolderPin",
+            "--reservation-id",
+            &lease_id,
+            "--ask",
+            "release",
+            "--json",
+        ])
+        .env("TORON_MCP_URL", &url)
+        .env("TORON_MCP_DATA_DIR", &empty_dir)
+        .output()
+        .expect("request-release via daemon");
+    let req_err = String::from_utf8_lossy(&req.stderr);
+    assert!(
+        req.status.success(),
+        "request-release via daemon must exit 0 (not CLI-only bail), stderr: {req_err}"
+    );
+    assert!(
+        !req_err.contains("CLI-only"),
+        "daemon path must not bail CLI-only, stderr: {req_err}"
+    );
+    let req_value: Value =
+        serde_json::from_slice(&req.stdout).expect("request-release JSON");
+    assert_eq!(
+        req_value.get("holder").and_then(|v| v.as_str()),
+        Some("HolderPin"),
+        "request-release names the holder, got {req_value}"
+    );
+    let request_id = req_value
+        .get("message_id")
+        .and_then(|v| v.as_str())
+        .expect("message_id")
+        .to_string();
+
+    let resp = toron()
+        .args([
+            "reserve",
+            "respond",
+            "--project",
+            "demo",
+            "--agent",
+            "HolderPin",
+            "--request-id",
+            &request_id,
+            "--decision",
+            "agreed",
+            "--json",
+        ])
+        .env("TORON_MCP_URL", &url)
+        .env("TORON_MCP_DATA_DIR", &empty_dir)
+        .output()
+        .expect("respond via daemon");
+    assert!(
+        resp.status.success(),
+        "respond via daemon must exit 0, stderr: {}",
+        String::from_utf8_lossy(&resp.stderr)
+    );
+
+    let xfer = toron()
+        .args([
+            "reserve",
+            "transfer",
+            "--project",
+            "demo",
+            "--from",
+            "HolderPin",
+            "--to",
+            "AskerPin",
+            "--path",
+            "src/a.rs",
+            "--json",
+        ])
+        .env("TORON_MCP_URL", &url)
+        .env("TORON_MCP_DATA_DIR", &empty_dir)
+        .output()
+        .expect("transfer via daemon");
+    assert!(
+        xfer.status.success(),
+        "transfer via daemon must exit 0, stderr: {}",
+        String::from_utf8_lossy(&xfer.stderr)
+    );
+    let xfer_value: Value = serde_json::from_slice(&xfer.stdout).expect("transfer JSON");
+    assert_eq!(
+        xfer_value.get("to_agent").and_then(|v| v.as_str()),
+        Some("AskerPin"),
+        "transfer names the new holder, got {xfer_value}"
+    );
+
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+    let _ = std::fs::remove_dir_all(&daemon_dir);
+    let _ = std::fs::remove_dir_all(&empty_dir);
+}
+
+/// Register `agent` on the live daemon (keys live in the daemon root).
+fn register_agent_via_daemon(port: u16, project: &str, agent: &str) {
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    rt.block_on(async {
+        let client = daemon_mcp_client(port).await;
+        let reg = client
+            .call_tool(
+                rmcp::model::CallToolRequestParams::new("register_agent".to_string())
+                    .with_arguments(
+                        serde_json::json!({
+                            "project_key": project,
+                            "name": agent,
+                            "program": "test",
+                        })
+                        .as_object()
+                        .cloned()
+                        .unwrap_or_default(),
+                    ),
+            )
+            .await
+            .expect("register_agent over daemon");
+        assert!(!reg.is_error.unwrap_or(false), "register failed: {reg:?}");
+    });
+}
+
+/// Acquire an exclusive lease through the daemon and return the granted id.
+fn acquire_lease_via_daemon_returning_id(
+    port: u16,
+    project: &str,
+    agent: &str,
+    path: &str,
+) -> String {
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    rt.block_on(async {
+        let client = daemon_mcp_client(port).await;
+        let reg = client
+            .call_tool(
+                rmcp::model::CallToolRequestParams::new("register_agent".to_string())
+                    .with_arguments(
+                        serde_json::json!({
+                            "project_key": project,
+                            "name": agent,
+                            "program": "test",
+                        })
+                        .as_object()
+                        .cloned()
+                        .unwrap_or_default(),
+                    ),
+            )
+            .await
+            .expect("register_agent over daemon");
+        assert!(!reg.is_error.unwrap_or(false), "register failed: {reg:?}");
+
+        let acq = client
+            .call_tool(
+                rmcp::model::CallToolRequestParams::new("file_reservation_paths".to_string())
+                    .with_arguments(
+                        serde_json::json!({
+                            "project_key": project,
+                            "agent_name": agent,
+                            "paths": vec![path],
+                            "exclusive": true,
+                            "reason": "bd-pin-public-plane-s-easy.7",
+                        })
+                        .as_object()
+                        .cloned()
+                        .unwrap_or_default(),
+                    ),
+            )
+            .await
+            .expect("file_reservation_paths over daemon");
+        assert!(!acq.is_error.unwrap_or(false), "acquire failed: {acq:?}");
+        let text = acq
+            .content
+            .iter()
+            .find_map(|c| c.as_text().map(|t| t.text.clone()))
+            .expect("acquire text");
+        let value: Value = serde_json::from_str(&text).expect("acquire JSON");
+        value["granted"][0]["id"]
+            .as_str()
+            .expect("granted id")
+            .to_string()
+    })
+}
+
+async fn daemon_mcp_client(
+    port: u16,
+) -> rmcp::service::RunningService<rmcp::service::RoleClient, rmcp::model::ClientInfo> {
+    use rmcp::ClientServiceExt;
+    use rmcp::model::{ClientCapabilities, ClientInfo, Implementation, ProtocolVersion};
+    use rmcp::service::ClientLifecycleMode;
+    use rmcp::transport::streamable_http_client::{
+        StreamableHttpClientTransport, StreamableHttpClientTransportConfig,
+    };
+
+    let transport = StreamableHttpClientTransport::from_config(
+        StreamableHttpClientTransportConfig::with_uri(format!("http://127.0.0.1:{port}/mcp")),
+    );
+    let client_info = ClientInfo::new(
+        ClientCapabilities::default(),
+        Implementation::from_build_env(),
+    );
+    client_info
+        .serve_with_lifecycle(
+            transport,
+            ClientLifecycleMode::Discover {
+                preferred_versions: vec![
+                    ProtocolVersion::V_2026_07_28,
+                    ProtocolVersion::V_2025_11_25,
+                ],
+            },
+        )
+        .await
+        .expect("daemon connect")
+}

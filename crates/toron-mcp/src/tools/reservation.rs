@@ -52,6 +52,24 @@ impl ToolServer {
         &self,
         Parameters(args): Parameters<FileReservationPathsArgs>,
     ) -> ToolOutput {
+        // Additive optional: CLI `reserve transfer` composes this existing
+        // tool so the daemon runs the atomic release+acquire helper.
+        if let Some(from) = args.transfer_from.as_deref().filter(|s| !s.is_empty()) {
+            let Some(path) = args.paths.first() else {
+                return ToolOutput::err("transfer via file_reservation_paths needs paths[0]");
+            };
+            return ToolOutput::result(
+                self.mailbox
+                    .transfer_reservation(
+                        &args.project_key,
+                        from,
+                        &args.agent_name,
+                        path,
+                        args.reason.as_deref(),
+                    )
+                    .await,
+            );
+        }
         ToolOutput::result(
             self.mailbox
                 .file_reservation_paths(
@@ -186,6 +204,8 @@ pub struct FileReservationPathsArgs {
     pub ttl_seconds: Option<i64>,
     pub exclusive: Option<bool>,
     pub reason: Option<String>,
+    /// When set, this call is a `transfer_reservation` (`agent_name` = to).
+    pub transfer_from: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone)]

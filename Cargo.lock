@@ -3777,6 +3777,7 @@ dependencies = [
  "clap",
  "crossterm",
  "ratatui",
+ "rmcp",
  "serde",
  "serde_json",
  "tokio",

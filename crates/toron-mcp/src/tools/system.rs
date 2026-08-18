@@ -118,11 +118,20 @@ impl ToolServer {
             task_description: args.task_description.clone(),
             persona: None,
         };
-        ToolOutput::result(
+        let registered = self
+            .mailbox
+            .register_agent(&args.project_key, &profile)
+            .await;
+        // Additive optional: fold a herdr slug → pin so whois(slug) hits
+        // the same npub. No new MCP tool (ADR-0020 / ADR-0007 C3 names).
+        if registered.is_ok()
+            && let Some(alias) = args.alias.as_deref().filter(|s| !s.is_empty())
+        {
             self.mailbox
-                .register_agent(&args.project_key, &profile)
-                .await,
-        )
+                .fold_agent_name_alias(&args.project_key, alias, &name)
+                .await;
+        }
+        ToolOutput::result(registered)
     }
 
     /// `create_agent_identity`: ALWAYS mint a fresh keypair.
@@ -268,6 +277,8 @@ pub struct RegisterAgentArgs {
     /// (ADR-0005 P2.2 content-map).
     pub model: Option<String>,
     pub name: Option<String>,
+    /// Herdr slug (or other alias) to fold onto `name` (the pin).
+    pub alias: Option<String>,
     pub task_description: Option<String>,
     pub attachments_policy: Option<String>,
     pub reaper_exempt: Option<bool>,

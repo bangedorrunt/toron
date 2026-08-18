@@ -1739,7 +1739,9 @@ mod tests {
             Arc::new(AutoPolicy),
             Arc::new(sink),
         );
-        let before_pipeline = pipeline.verify_count.load(std::sync::atomic::Ordering::Relaxed);
+        let before_pipeline = pipeline
+            .verify_count
+            .load(std::sync::atomic::Ordering::Relaxed);
 
         let wrap = wrap_for(&sender, &recipient, 1_700_000_000).await;
 
@@ -1770,7 +1772,9 @@ mod tests {
             drained.is_err(),
             "run() is a live subscription drain (waits for future events); timeout expected"
         );
-        let after_loop = pipeline.verify_count.load(std::sync::atomic::Ordering::Relaxed);
+        let after_loop = pipeline
+            .verify_count
+            .load(std::sync::atomic::Ordering::Relaxed);
         assert_eq!(
             after_loop - before_pipeline,
             0,
@@ -1781,7 +1785,9 @@ mod tests {
         let wrap2 = wrap_for(&sender, &recipient, 1_700_000_100).await;
         let out = pipeline.project(&wrap2).await;
         assert_eq!(out, ProjectOutcome::Projected, "direct project lands");
-        let after_direct = pipeline.verify_count.load(std::sync::atomic::Ordering::Relaxed);
+        let after_direct = pipeline
+            .verify_count
+            .load(std::sync::atomic::Ordering::Relaxed);
         assert_eq!(
             after_direct - after_loop,
             1,

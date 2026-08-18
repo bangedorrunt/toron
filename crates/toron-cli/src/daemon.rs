@@ -610,7 +610,9 @@ pub fn stop(args: &super::cli::DaemonArgs) -> anyhow::Result<()> {
         }
         if addr_alive(&args.addr) {
             let pid = port_holder_pid(&args.addr);
-            if args.force && let Some(p) = pid {
+            if args.force
+                && let Some(p) = pid
+            {
                 let _ = Command::new("kill").arg(p.to_string()).output();
                 let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
                 while addr_alive(&args.addr) && std::time::Instant::now() < deadline {
