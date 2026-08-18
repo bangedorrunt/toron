@@ -31,7 +31,7 @@
       "name": "mail"
     },
     {
-      "args": "acquire, conflicts, renew, release, force-release",
+      "args": "acquire, conflicts, renew, release, force-release, request-release, respond",
       "description": "File reservations: acquire/conflicts/renew/release/force-release",
       "name": "reserve"
     },
@@ -121,7 +121,7 @@
       "name": "workflow"
     }
   ],
-  "generated_at": "2026-08-18T06:13:36Z",
+  "generated_at": "2026-08-18T12:06:19Z",
   "resources": [
     {
       "description": "List projects known to toron.",
@@ -479,6 +479,7 @@
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "properties": {
           "agent_name": {
+            "description": "The identity to look up: a REGISTERED adjective+noun pin, canonical\nname, folded alias, or npub. bd-pin-public-plane-s-easy.8: `name` is\naccepted as a serde alias (grok/other wrappers pass `name`); the\nfield stays REQUIRED (both missing fails — never defaults to $USER\nor a generated pin).",
             "type": "string"
           },
           "commit_limit": {

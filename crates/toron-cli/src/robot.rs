@@ -13,7 +13,8 @@ use std::path::Path;
 
 use serde_json::json;
 use toron_core::mailbox::{
-    ContactPolicy, FetchInbox, Mailbox, RequestContact, RespondContact, SearchMessages, SendMessage,
+    ContactPolicy, FetchInbox, Mailbox, ReleaseAsk, ReleaseDecision, ReleaseResponse, RequestContact,
+    RequestRelease, RespondContact, SearchMessages, SendMessage,
 };
 use toron_mcp::ToJson;
 
@@ -191,6 +192,60 @@ pub async fn run_reserve(mailbox: &Mailbox, cmd: &ReserveCommand) -> anyhow::Res
                 .await?;
             print_json(&json!({ "ok": true }))
         }
+        ReserveCommand::RequestRelease(args) => emit(
+            mailbox
+                .request_release(&RequestRelease {
+                    project_slug: args.project.clone(),
+                    sender_name: args.agent.clone(),
+                    target_agent: args.target.clone(),
+                    reservation_id: args.reservation_id.clone(),
+                    ask: parse_release_ask(&args.ask)?,
+                    note: args.note.clone(),
+                })
+                .await?,
+        ),
+        ReserveCommand::Respond(args) => emit(
+            mailbox
+                .respond_request_release(&ReleaseResponse {
+                    project_slug: args.project.clone(),
+                    sender_name: args.agent.clone(),
+                    request_message_id: args.request_id.clone(),
+                    decision: parse_release_decision(&args.decision)?,
+                    note: args.note.clone(),
+                })
+                .await?,
+        ),
+    }
+}
+
+/// Parse the CLI `--ask` value: `release` | `defer:<secs>`.
+fn parse_release_ask(s: &str) -> anyhow::Result<ReleaseAsk> {
+    match s {
+        "release" => Ok(ReleaseAsk::Release),
+        _ => s
+            .strip_prefix("defer:")
+            .and_then(|secs| secs.parse::<u64>().ok())
+            .map(|defer_secs| ReleaseAsk::Defer { defer_secs })
+            .ok_or_else(|| {
+                anyhow::anyhow!("invalid --ask {s:?} — use release or defer:<secs>")
+            }),
+    }
+}
+
+/// Parse the CLI `--decision` value: `agreed` | `denied` | `deferred:<secs>`.
+fn parse_release_decision(s: &str) -> anyhow::Result<ReleaseDecision> {
+    match s {
+        "agreed" => Ok(ReleaseDecision::Agreed),
+        "denied" => Ok(ReleaseDecision::Denied),
+        _ => s
+            .strip_prefix("deferred:")
+            .and_then(|secs| secs.parse::<u64>().ok())
+            .map(|defer_secs| ReleaseDecision::Deferred { defer_secs })
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "invalid --decision {s:?} — use agreed, denied, or deferred:<secs>"
+                )
+            }),
     }
 }
 

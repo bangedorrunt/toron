@@ -43,8 +43,8 @@ use toron_core::mailbox::{
     AcquireBuildSlotResult, AcquireResult, ConflictReport, ContactHandshakeResult, ContactLink,
     Delivery, DeliveryPayload, GrantedReservation, HealthComponent, HealthReport, InboxMessage,
     Mailbox, PathConflict, PrepareThreadResult, ProductInfo, ProjectState, ReceiptResult,
-    RegisteredAgent, ReleaseResult, RenewResult, ReservationCycleResult, SearchMessage, SendResult,
-    StartSessionResult, ThreadSummary, WhoIs,
+    RegisteredAgent, ReleaseResult, RenewResult, RequestReleaseResult, ReservationCycleResult,
+    SearchMessage, SendResult, StartSessionResult, ThreadSummary, WhoIs,
 };
 
 /// Tool return value: serialized JSON on `Ok`, a tool error on `Err`.
@@ -201,6 +201,17 @@ impl ToJson for SendResult {
             "deliveries": self.deliveries.to_json(),
             "count": self.count,
             "verified_sender": self.verified_sender,
+        })
+    }
+}
+
+impl ToJson for RequestReleaseResult {
+    fn to_json(&self) -> Value {
+        json!({
+            "message_id": self.message_id,
+            "delivered": self.delivered,
+            "path_pattern": self.path_pattern,
+            "holder": self.holder,
         })
     }
 }
