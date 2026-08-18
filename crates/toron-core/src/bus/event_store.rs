@@ -16,11 +16,17 @@ use sqlx::Row;
 use sqlx::SqlitePool;
 use std::time::Duration;
 
-use nostr_sdk::nostr::{Event, JsonUtil, Timestamp};
+use nostr_sdk::nostr::{Alphabet, Event, JsonUtil, SingleLetterTag, TagKind, Timestamp};
 
 /// Max rows kept in the bus store. Beyond this, the oldest envelopes are
 /// pruned (bounded bus, permanent Git content — ADR-0003 superiority row).
 pub const MAX_STORED_EVENTS: i64 = 100_000;
+
+/// bd-replay-tag-pushdown-lurm: rows parsed in `replay()` (test-only
+/// instrumented counter; the acceptance gate asserts the SQL prefilter
+/// shrinks the parsed set to the matched rows).
+#[cfg(test)]
+static PARSED_ROWS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// The bus event table DDL (idempotent).
 pub const EVENT_TABLE_DDL: &str = "
@@ -38,6 +44,21 @@ CREATE INDEX IF NOT EXISTS bus_events_kind ON bus_events (kind);
 CREATE INDEX IF NOT EXISTS bus_events_addressable ON bus_events (kind, author, d_tag);
 ";
 
+/// p/e tag index DDL (bd-replay-tag-pushdown-lurm). The `p`/`e` tag values
+/// are persisted as rows (EAV), not first-tag columns: an event can carry
+/// several `p` or `e` tags, and a first-tag column would silently miss
+/// filters on the non-first values. Exact-match rows are index-served and
+/// sound for the hot shapes (p-recipient, e-thread).
+pub const EVENT_TAG_TABLE_DDL: &str = "
+CREATE TABLE IF NOT EXISTS bus_event_tags (
+    event_id   TEXT NOT NULL,
+    tag_kind   TEXT NOT NULL,
+    tag_value  TEXT NOT NULL,
+    PRIMARY KEY (event_id, tag_kind, tag_value)
+);
+CREATE INDEX IF NOT EXISTS bus_event_tags_kind_value ON bus_event_tags (tag_kind, tag_value);
+";
+
 /// SQLite event store for the in-process bus.
 #[derive(Clone)]
 pub struct BusEventStore {
@@ -48,7 +69,65 @@ impl BusEventStore {
     /// Open the store against an existing pool (table created idempotently).
     pub async fn new(pool: SqlitePool) -> anyhow::Result<Self> {
         sqlx::raw_sql(EVENT_TABLE_DDL).execute(&pool).await?;
+        sqlx::raw_sql(EVENT_TAG_TABLE_DDL).execute(&pool).await?;
+        Self::backfill_tag_index(&pool).await?;
         Ok(Self { pool })
+    }
+
+    /// One-time backfill of the p/e tag index from stored raw_json. Guarded
+    /// by "tag table empty" so a store that already indexes tags (new
+    /// inserts populate as they arrive) is never re-scanned.
+    async fn backfill_tag_index(pool: &SqlitePool) -> anyhow::Result<()> {
+        let row = sqlx::query("SELECT COUNT(*) FROM bus_event_tags")
+            .fetch_one(pool)
+            .await?;
+        let existing: i64 = Row::get(&row, 0);
+        if existing > 0 {
+            return Ok(());
+        }
+        let events: Vec<(String, String)> =
+            sqlx::query_as("SELECT event_id, raw_json FROM bus_events")
+                .fetch_all(pool)
+                .await?;
+        let mut tx = pool.begin().await?;
+        for (id, raw) in events {
+            if let Ok(ev) = Event::from_json(&raw) {
+                Self::index_tag_values(&mut tx, &id, &ev).await?;
+            }
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Index the p/e tag values of `event` as rows in `bus_event_tags`
+    /// (exact-match EAV; see [`EVENT_TAG_TABLE_DDL`]).
+    async fn index_tag_values(
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        event_id: &str,
+        event: &Event,
+    ) -> anyhow::Result<()> {
+        for tag in event.tags.iter() {
+            let (kind, value) = match tag.kind() {
+                TagKind::SingleLetter(s) if s == SingleLetterTag::lowercase(Alphabet::P) => {
+                    ("p", tag.content())
+                }
+                TagKind::SingleLetter(s) if s == SingleLetterTag::lowercase(Alphabet::E) => {
+                    ("e", tag.content())
+                }
+                _ => continue,
+            };
+            let Some(value) = value else { continue };
+            sqlx::query(
+                "INSERT INTO bus_event_tags (event_id, tag_kind, tag_value) VALUES (?1, ?2, ?3)
+                 ON CONFLICT (event_id, tag_kind, tag_value) DO NOTHING",
+            )
+            .bind(event_id)
+            .bind(kind)
+            .bind(value)
+            .execute(&mut **tx)
+            .await?;
+        }
+        Ok(())
     }
 
     /// Insert an event, deduping by event id.
@@ -72,6 +151,12 @@ impl BusEventStore {
         .bind(expires)
         .execute(&self.pool)
         .await?;
+
+        // p/e tag index (bd-replay-tag-pushdown-lurm): written unconditionally
+        // so a duplicate insert still converges (ON CONFLICT DO NOTHING).
+        let mut tx = self.pool.begin().await?;
+        Self::index_tag_values(&mut tx, &event.id.to_hex(), event).await?;
+        tx.commit().await?;
 
         // ON CONFLICT DO NOTHING reports 0 affected rows for duplicates.
         Ok(result.rows_affected() == 1)
@@ -110,57 +195,135 @@ impl BusEventStore {
     /// exclusive path to two agents. The `limit` is now applied to the
     /// MATCHED output, so a mailbox query always sees the events it asks
     /// for — up to the filter limit.
+    ///
+    /// bd-replay-tag-pushdown-lurm: the `#p`/`#e` tag filters are also
+    /// pushed into SQL via the `bus_event_tags` index, and the limit is a
+    /// SQL `LIMIT` on the DESCENDING matched set (the bd-cumj newest tail),
+    /// re-emitted in ASC envelope order — rows are parsed only when they can
+    /// match (the SQL prefilter is exact for p/e; `match_event` still runs
+    /// on the surviving candidates for the non-pushed predicates).
     pub async fn replay(&self, filter: &crate::bus::Filter) -> anyhow::Result<Vec<Event>> {
         let limit = filter.limit.unwrap_or(1000).min(MAX_STORED_EVENTS as usize);
-        // SQL kind pushdown: `filter.kinds` is a public field on the nostr
-        // Filter; when set, only those kinds are scanned (cheap + correct).
-        let (sql, binds): (String, Vec<i64>) = match &filter.kinds {
-            Some(kinds) if !kinds.is_empty() => {
-                let kinds_vec: Vec<i64> = kinds.iter().map(|k| k.as_u16() as i64).collect();
-                let placeholders: Vec<String> =
-                    (2..=kinds_vec.len() + 1).map(|i| format!("?{i}")).collect();
-                (
-                    format!(
-                        "SELECT raw_json FROM bus_events
-                         WHERE (expires_at IS NULL OR expires_at > ?1)
-                           AND kind IN ({})
-                         ORDER BY created_at ASC, event_id ASC",
-                        placeholders.join(",")
-                    ),
-                    kinds_vec,
-                )
-            }
-            _ => (
-                "SELECT raw_json FROM bus_events
-                 WHERE (expires_at IS NULL OR expires_at > ?1)
-                 ORDER BY created_at ASC, event_id ASC"
-                    .to_string(),
-                Vec::new(),
-            ),
+
+        // Predicates, in bind order: ?1 expiry, then kinds, then p values,
+        // then e values, then the trailing limit.
+        let mut preds: Vec<String> = vec!["(expires_at IS NULL OR expires_at > ?1)".to_string()];
+        let mut kinds_binds: Vec<i64> = Vec::new();
+        let mut p_binds: Vec<String> = Vec::new();
+        let mut e_binds: Vec<String> = Vec::new();
+        let mut next = 2usize;
+
+        if let Some(kinds) = &filter.kinds
+            && !kinds.is_empty()
+        {
+            let placeholders: Vec<String> = (next..next + kinds.len())
+                .map(|i| format!("?{i}"))
+                .collect();
+            next += kinds.len();
+            kinds_binds = kinds.iter().map(|k| k.as_u16() as i64).collect();
+            preds.push(format!("kind IN ({})", placeholders.join(",")));
+        }
+
+        let p_vals = filter
+            .generic_tags
+            .get(&SingleLetterTag::lowercase(Alphabet::P));
+        if let Some(vals) = p_vals
+            && !vals.is_empty()
+        {
+            let placeholders: Vec<String> =
+                (next..next + vals.len()).map(|i| format!("?{i}")).collect();
+            next += vals.len();
+            p_binds = vals.iter().cloned().collect();
+            preds.push(format!(
+                "event_id IN (SELECT event_id FROM bus_event_tags \
+                 WHERE tag_kind = 'p' AND tag_value IN ({}))",
+                placeholders.join(",")
+            ));
+        }
+
+        let e_vals = filter
+            .generic_tags
+            .get(&SingleLetterTag::lowercase(Alphabet::E));
+        if let Some(vals) = e_vals
+            && !vals.is_empty()
+        {
+            let placeholders: Vec<String> =
+                (next..next + vals.len()).map(|i| format!("?{i}")).collect();
+            next += vals.len();
+            e_binds = vals.iter().cloned().collect();
+            preds.push(format!(
+                "event_id IN (SELECT event_id FROM bus_event_tags \
+                 WHERE tag_kind = 'e' AND tag_value IN ({}))",
+                placeholders.join(",")
+            ));
+        }
+
+        // bd-cumj newest-tail semantics in SQL: the DESC subquery takes the
+        // NEWEST `limit` of the matched set (never truncating the latest
+        // state), and the outer query re-emits it in ASC envelope order.
+        // The matched set is never materialized beyond `limit` rows.
+        //
+        // LIMIT is pushed only when the SQL predicate set FULLY decides the
+        // match (expiry + kinds + #p/#e). Filters carrying non-pushed
+        // predicates (#t project tags, since/until, authors, ids, search)
+        // must NOT push the limit: SQL would truncate CANDIDATES before
+        // match_event runs, silently dropping older matched rows (a project
+        // replay whose newest same-kind rows belong to other projects).
+        // Those filters keep the post-parse drain over the prefiltered
+        // candidate set (still shrunk by kinds/#p/#e, per the bead).
+        let sql_exact = filter.ids.as_ref().is_none_or(|i| i.is_empty())
+            && filter.authors.as_ref().is_none_or(|a| a.is_empty())
+            && filter.search.is_none()
+            && filter.since.is_none()
+            && filter.until.is_none()
+            && filter.generic_tags.iter().all(|(tag, vals)| {
+                !vals.is_empty()
+                    && (tag == &SingleLetterTag::lowercase(Alphabet::P)
+                        || tag == &SingleLetterTag::lowercase(Alphabet::E))
+            });
+        let limit_clause = if sql_exact {
+            format!(" LIMIT ?{next}")
+        } else {
+            String::new()
         };
+        let inner = format!(
+            "SELECT raw_json, created_at, event_id FROM bus_events
+             WHERE {}
+             ORDER BY created_at DESC, event_id DESC{limit_clause}",
+            preds.join("\n               AND ")
+        );
+        let sql = format!(
+            "SELECT raw_json FROM ({inner})
+             ORDER BY created_at ASC, event_id ASC"
+        );
+
         let mut q = sqlx::query(&sql).bind(Timestamp::now().as_secs() as i64);
-        for b in binds {
+        for b in kinds_binds {
             q = q.bind(b);
+        }
+        for b in &p_binds {
+            q = q.bind(b.as_str());
+        }
+        for b in &e_binds {
+            q = q.bind(b.as_str());
+        }
+        if sql_exact {
+            q = q.bind(limit as i64);
         }
         let rows = q.fetch_all(&self.pool).await?;
 
         let mut out: Vec<Event> = Vec::with_capacity(rows.len());
         for row in rows {
             let raw: String = Row::get(&row, 0);
+            #[cfg(test)]
+            PARSED_ROWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if let Ok(ev) = Event::from_json(&raw)
                 && filter.match_event(&ev, Default::default())
             {
                 out.push(ev);
             }
         }
-        // bd-cumj: the SQL yields ASC (envelope) order; when the matched set
-        // exceeds the limit, keep the NEWEST `limit` (the tail) — dropping the
-        // OLDEST superseded events, NEVER the latest state. The prior
-        // oldest-first break silently dropped the newest events when a
-        // coordinate accumulated >1000 events (a renewal storm), making a
-        // fresh operator revocation invisible to projection resolution and
-        // leaving stale locks reported as live.
-        if out.len() > limit {
+        if !sql_exact && out.len() > limit {
             out.drain(0..out.len() - limit);
         }
         Ok(out)
@@ -188,6 +351,13 @@ impl BusEventStore {
             )",
         )
         .bind(MAX_STORED_EVENTS)
+        .execute(&self.pool)
+        .await?;
+        // Orphaned p/e tag rows of pruned events (they could never match a
+        // bus_events join again; keep the index store bounded).
+        sqlx::query(
+            "DELETE FROM bus_event_tags WHERE event_id NOT IN (SELECT event_id FROM bus_events)",
+        )
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -469,6 +639,385 @@ mod tests {
         let resolved =
             resolve_coordinate(all.iter(), Some(&operator.public_key())).expect("resolved");
         assert_eq!(resolved.id, revoke.id);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// bd-replay-tag-pushdown-lurm acceptance #1: a p-tag-filtered replay on
+    /// a 10k-event store parses only matched rows. The instrumented counter
+    /// must see exactly the 5 matching rows (SQL prefilter via
+    /// bus_event_tags), and the query plan must use the tag index.
+    #[tokio::test]
+    async fn test_replay_p_tag_pushdown_parses_only_matched() {
+        use nostr_sdk::nostr::Filter;
+        let (store, pool, path) = temp_store().await;
+        let author = Keys::generate();
+        let target = Keys::generate();
+        let other = Keys::generate();
+        let target_hex = target.public_key().to_hex();
+        let other_hex = other.public_key().to_hex();
+        const N: usize = 10_000;
+
+        let mut tx = pool.begin().await.expect("tx");
+        for i in 0..N {
+            let p = if i < N - 5 { &other_hex } else { &target_hex };
+            let ev = build_event(
+                &author,
+                crate::nostr::kinds::toron_kind(PROJECT_MANIFEST),
+                format!("target {i}"),
+                vec![
+                    Tag::parse(["p", p]).expect("p"),
+                    Tag::parse(["t", "demo"]).expect("t"),
+                ],
+                Timestamp::from(1_700_000_000u64 + i as u64),
+            )
+            .expect("build");
+            sqlx::query(
+                "INSERT INTO bus_events (event_id, raw_json, created_at, kind, author, d_tag, expires_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL)",
+            )
+            .bind(ev.id.to_hex())
+            .bind(ev.as_json())
+            .bind(ev.created_at.as_secs() as i64)
+            .bind(ev.kind.as_u16() as i64)
+            .bind(ev.pubkey.to_hex())
+            .execute(&mut *tx)
+            .await
+            .expect("bulk insert");
+            for tag in ev.tags.iter() {
+                if let Some(v) = tag.content() {
+                    sqlx::query(
+                        "INSERT INTO bus_event_tags (event_id, tag_kind, tag_value) VALUES (?1, 'p', ?2)",
+                    )
+                    .bind(ev.id.to_hex())
+                    .bind(v)
+                    .execute(&mut *tx)
+                    .await
+                    .expect("tag insert");
+                }
+            }
+        }
+        tx.commit().await.expect("commit");
+        assert_eq!(store.count().await.expect("count"), N as i64);
+
+        // EXPLAIN: the p predicate is served by the tag index.
+        let plan_rows = sqlx::query(
+            "EXPLAIN QUERY PLAN SELECT raw_json FROM (
+                 SELECT raw_json, created_at, event_id FROM bus_events
+                 WHERE (expires_at IS NULL OR expires_at > ?1)
+                   AND event_id IN (SELECT event_id FROM bus_event_tags
+                                    WHERE tag_kind = 'p' AND tag_value IN (?2))
+                 ORDER BY created_at DESC, event_id DESC LIMIT ?3
+             ) ORDER BY created_at ASC, event_id ASC",
+        )
+        .bind(1_800_000_000i64)
+        .bind(&target_hex)
+        .bind(10i64)
+        .fetch_all(&pool)
+        .await
+        .expect("explain");
+        let details: Vec<String> = plan_rows
+            .iter()
+            .map(|r| Row::get::<String, _>(r, 3))
+            .collect();
+        assert!(
+            details
+                .iter()
+                .any(|d| d.contains("bus_event_tags_kind_value")),
+            "p predicate must be served by the tag index, plan:\n{}",
+            details.join("\n")
+        );
+
+        PARSED_ROWS.store(0, std::sync::atomic::Ordering::Relaxed);
+        let replayed = store
+            .replay(&Filter::new().pubkey(target.public_key()).limit(10))
+            .await
+            .expect("replay");
+        assert_eq!(replayed.len(), 5, "only the 5 target events match");
+        assert_eq!(
+            PARSED_ROWS.load(std::sync::atomic::Ordering::Relaxed),
+            5,
+            "SQL prefilter must shrink the parsed set to the 5 matched rows"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// bd-replay-tag-pushdown-lurm acceptance #2: limit=5 over 10k matching
+    /// rows returns the NEWEST 5 without materializing 10k Events (the
+    /// parse counter sees exactly 5 rows — SQL LIMIT on the DESC matched set).
+    #[tokio::test]
+    async fn test_replay_limit_pushdown_newest_5_of_10k() {
+        use nostr_sdk::nostr::Filter;
+        let (store, pool, path) = temp_store().await;
+        let author = Keys::generate();
+        let target = Keys::generate();
+        let target_hex = target.public_key().to_hex();
+        const N: usize = 10_000;
+
+        let mut tx = pool.begin().await.expect("tx");
+        for i in 0..N {
+            let ev = build_event(
+                &author,
+                crate::nostr::kinds::toron_kind(PROJECT_MANIFEST),
+                format!("target {i}"),
+                vec![
+                    Tag::parse(["p", &target_hex]).expect("p"),
+                    Tag::parse(["t", "demo"]).expect("t"),
+                ],
+                Timestamp::from(1_700_000_000u64 + i as u64),
+            )
+            .expect("build");
+            sqlx::query(
+                "INSERT INTO bus_events (event_id, raw_json, created_at, kind, author, d_tag, expires_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL)",
+            )
+            .bind(ev.id.to_hex())
+            .bind(ev.as_json())
+            .bind(ev.created_at.as_secs() as i64)
+            .bind(ev.kind.as_u16() as i64)
+            .bind(ev.pubkey.to_hex())
+            .execute(&mut *tx)
+            .await
+            .expect("bulk insert");
+            sqlx::query(
+                "INSERT INTO bus_event_tags (event_id, tag_kind, tag_value) VALUES (?1, 'p', ?2)",
+            )
+            .bind(ev.id.to_hex())
+            .bind(&target_hex)
+            .execute(&mut *tx)
+            .await
+            .expect("tag insert");
+        }
+        tx.commit().await.expect("commit");
+
+        PARSED_ROWS.store(0, std::sync::atomic::Ordering::Relaxed);
+        let replayed = store
+            .replay(&Filter::new().pubkey(target.public_key()).limit(5))
+            .await
+            .expect("replay");
+        assert_eq!(replayed.len(), 5);
+        let contents: Vec<String> = replayed.iter().map(|e| e.content.clone()).collect();
+        assert_eq!(
+            contents,
+            vec![
+                "target 9995".to_string(),
+                "target 9996".to_string(),
+                "target 9997".to_string(),
+                "target 9998".to_string(),
+                "target 9999".to_string(),
+            ],
+            "limit=5 returns the NEWEST 5 in envelope order"
+        );
+        assert_eq!(
+            PARSED_ROWS.load(std::sync::atomic::Ordering::Relaxed),
+            5,
+            "only 5 rows parsed — no materialization of the 10k matched set"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// bd-replay-tag-pushdown-lurm soundness: an event with SEVERAL p tags
+    /// matches a filter on the non-first value (a first-p-tag column would
+    /// miss it — the EAV index matches any position).
+    #[tokio::test]
+    async fn test_replay_p_tag_any_position_sound() {
+        use nostr_sdk::nostr::Filter;
+        let (store, _pool, path) = temp_store().await;
+        let me = Keys::generate();
+        let first = Keys::generate();
+        let sender = Keys::generate();
+        let decoy_author = Keys::generate();
+        let other2 = Keys::generate();
+
+        let multi = build_event(
+            &sender,
+            crate::nostr::kinds::toron_kind(PROJECT_MANIFEST),
+            "multi",
+            vec![
+                Tag::parse(["p", &first.public_key().to_hex()]).expect("p1"),
+                Tag::parse(["p", &me.public_key().to_hex()]).expect("p2"),
+            ],
+            Timestamp::from(1_700_000_000u64),
+        )
+        .expect("build");
+        let other_ev = build_event(
+            &decoy_author,
+            crate::nostr::kinds::toron_kind(PROJECT_MANIFEST),
+            "decoy",
+            vec![Tag::parse(["p", &other2.public_key().to_hex()]).expect("p")],
+            Timestamp::from(1_700_000_001u64),
+        )
+        .expect("build");
+        assert!(store.insert(&multi).await.expect("insert multi"));
+        assert!(store.insert(&other_ev).await.expect("insert decoy"));
+
+        let mine = store
+            .replay(&Filter::new().pubkey(me.public_key()))
+            .await
+            .expect("replay");
+        assert_eq!(mine.len(), 1, "me matches only via the 2nd p tag");
+        assert_eq!(mine[0].id, multi.id);
+
+        let theirs = store
+            .replay(&Filter::new().pubkey(first.public_key()))
+            .await
+            .expect("replay");
+        assert_eq!(theirs.len(), 1, "the 1st p tag also matches");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// bd-replay-tag-pushdown-lurm soundness: e-tag filters match any e tag
+    /// position (root of a reply chain is not necessarily the first e tag).
+    #[tokio::test]
+    async fn test_replay_e_tag_any_position_sound() {
+        use nostr_sdk::nostr::Filter;
+        let (store, _pool, path) = temp_store().await;
+        let keys = Keys::generate();
+        let root: nostr_sdk::nostr::EventId = build_event(
+            &keys,
+            crate::nostr::kinds::toron_kind(PROJECT_MANIFEST),
+            "root",
+            vec![],
+            Timestamp::from(1_700_000_000u64),
+        )
+        .expect("root build")
+        .id;
+        let reply_id: nostr_sdk::nostr::EventId = build_event(
+            &keys,
+            crate::nostr::kinds::toron_kind(PROJECT_MANIFEST),
+            "reply",
+            vec![],
+            Timestamp::from(1_700_000_001u64),
+        )
+        .expect("reply build")
+        .id;
+
+        let reply = build_event(
+            &keys,
+            crate::nostr::kinds::toron_kind(PROJECT_MANIFEST),
+            "threaded",
+            vec![
+                Tag::parse(["e", &reply_id.to_hex()]).expect("e1"),
+                Tag::parse(["e", &root.to_hex()]).expect("e2"),
+            ],
+            Timestamp::from(1_700_000_002u64),
+        )
+        .expect("build");
+        let direct = build_event(
+            &keys,
+            crate::nostr::kinds::toron_kind(PROJECT_MANIFEST),
+            "direct",
+            vec![Tag::parse(["e", &root.to_hex()]).expect("e1")],
+            Timestamp::from(1_700_000_003u64),
+        )
+        .expect("build");
+        assert!(store.insert(&reply).await.expect("insert reply"));
+        assert!(store.insert(&direct).await.expect("insert direct"));
+
+        let by_root = store
+            .replay(&Filter::new().event(root))
+            .await
+            .expect("replay");
+        assert_eq!(by_root.len(), 2, "both events reference the root");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// bd-replay-tag-pushdown-lurm backfill: a store opened before the tag
+    /// index (no bus_event_tags rows) gets its existing events indexed once
+    /// at open, so p-filtered replay works without re-inserting.
+    #[tokio::test]
+    async fn test_backfill_indexes_existing_events_on_open() {
+        let (store, pool, path) = temp_store().await;
+        let k1 = Keys::generate();
+        let k2 = Keys::generate();
+        let target = Keys::generate();
+        let other = Keys::generate();
+        let target_hex = target.public_key().to_hex();
+
+        for (keys, content, p_hex) in [
+            (&k1, "wanted", &target_hex),
+            (&k2, "unwanted", &other.public_key().to_hex()),
+            (&k1, "wanted2", &target_hex),
+        ] {
+            let ev = build_event(
+                keys,
+                crate::nostr::kinds::toron_kind(PROJECT_MANIFEST),
+                content,
+                vec![Tag::parse(["p", p_hex]).expect("p")],
+                Timestamp::now(),
+            )
+            .expect("build");
+            assert!(store.insert(&ev).await.expect("insert"));
+        }
+
+        // Simulate a pre-index store: drop the tag table (and its index).
+        sqlx::raw_sql("DROP TABLE bus_event_tags")
+            .execute(&pool)
+            .await
+            .expect("drop");
+
+        // Reopen: the table is recreated and backfilled from raw_json.
+        let reopened = BusEventStore::new(pool.clone()).await.expect("reopen");
+        use nostr_sdk::nostr::Filter;
+        let replayed = reopened
+            .replay(&Filter::new().pubkey(target.public_key()))
+            .await
+            .expect("replay");
+        assert_eq!(replayed.len(), 2, "backfilled rows serve the p filter");
+        assert!(
+            replayed.iter().all(|e| e.content.starts_with("wanted")),
+            "only the target's events replay: {:?}",
+            replayed
+                .iter()
+                .map(|e| e.content.clone())
+                .collect::<Vec<_>>()
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// bd-replay-tag-pushdown-lurm: a filter with a NON-pushed predicate
+    /// (#t project tag) must not let the SQL LIMIT truncate candidates
+    /// before matching. The newest same-kind rows belong to another project;
+    /// an unconditional LIMIT pushdown would drop the project's OLDER matched
+    /// rows and replay empty. The drain over the prefiltered candidates
+    /// preserves the bd-cumj matched-set limit.
+    #[tokio::test]
+    async fn test_replay_non_pushed_t_tag_keeps_older_matched_rows() {
+        let (store, _pool, path) = temp_store().await;
+        let author = Keys::generate();
+        let kind = crate::nostr::kinds::toron_kind(PROJECT_MANIFEST);
+        // The project's events are OLDER than 10 other-project events; with
+        // limit=5 the SQL pushdown would keep only the newest 5 (all other).
+        for i in 0..2 {
+            let ev = build_event(
+                &author,
+                kind,
+                format!("mine {i}"),
+                vec![Tag::parse(["t", "demo"]).expect("t")],
+                Timestamp::from(1_699_999_990u64 + i as u64),
+            )
+            .expect("build");
+            assert!(store.insert(&ev).await.expect("insert"));
+        }
+        for i in 0..10 {
+            let ev = build_event(
+                &author,
+                kind,
+                format!("other {i}"),
+                vec![Tag::parse(["t", "other"]).expect("t")],
+                Timestamp::from(1_700_000_000u64 + i as u64),
+            )
+            .expect("build");
+            assert!(store.insert(&ev).await.expect("insert"));
+        }
+
+        let filter = crate::bus::kind_project_filter(kind, "demo").limit(5);
+        let replayed = store.replay(&filter).await.expect("replay");
+        let contents: Vec<String> = replayed.iter().map(|e| e.content.clone()).collect();
+        assert_eq!(
+            contents,
+            vec!["mine 0".to_string(), "mine 1".to_string()],
+            "older #t-matched rows must survive a non-pushed-predicate filter"
+        );
         let _ = std::fs::remove_file(&path);
     }
 }
