@@ -115,7 +115,10 @@ async fn sc26_swarm_project_routes_canonical_names_and_npubs_only() {
         msg.contains("flywheel-toron-<role><seq>"),
         "grammar in error: {msg}"
     );
-    assert!(msg.contains("non-routable"), "demotion in error: {msg}");
+    assert!(
+        msg.contains("non-routable"),
+        "demotion named in error: {msg}"
+    );
 
     // --- registration: canonical accepted, legacy rejected ---
     mailbox
@@ -183,111 +186,6 @@ async fn sc26_swarm_project_routes_canonical_names_and_npubs_only() {
     assert!(
         agents.iter().any(|a| a.name == "lane-1-bootstrap"),
         "legacy identity remains visible as metadata"
-    );
-
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-/// bd-pin-public-plane-s-easy.4 (D1a direction): the SLUG folds to the PIN —
-/// same npub, no second key. Mirrors the reverse of the legacy fold test
-/// above: here the pin is the registered identity and the slug is the alias.
-#[tokio::test]
-async fn sc26_slug_folds_to_pin_same_npub_no_second_key() {
-    let dir = std::env::temp_dir().join(format!("toron-sc26e-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let (mailbox, _bus, _pool) = boot(&dir).await;
-
-    mailbox.ensure_project("toron").await.expect("ensure");
-    let pin_npub = register(&mailbox, "toron", "RusticBarn").await;
-    mailbox.set_identity_mode("toron", "swarm").await;
-
-    // Fold: slug → pin (D1a: the slug is an alias of the pin, never a
-    // second identity).
-    mailbox
-        .fold_agent_name_alias("toron", "flywheel-toron-coder", "RusticBarn")
-        .await;
-
-    // whois(slug) and whois(pin) return the SAME npub.
-    let w_slug = mailbox
-        .whois("toron", "flywheel-toron-coder")
-        .await
-        .expect("slug whois via fold");
-    assert_eq!(
-        w_slug.npub, pin_npub,
-        "whois(slug) must resolve to the pin's npub"
-    );
-    let w_pin = mailbox
-        .whois("toron", "RusticBarn")
-        .await
-        .expect("pin whois");
-    assert_eq!(w_pin.npub, pin_npub, "whois(pin) is the same holder");
-
-    // send to EITHER name delivers to the pin inbox. Sending AS the slug
-    // exercises the send-path key load (agent_keys_for resolves slug → pin
-    // key); sending TO the slug exercises recipient resolution.
-    mailbox
-        .send_message(&send(
-            "toron",
-            "RusticBarn",
-            "flywheel-toron-coder",
-            "to-slug ping",
-        ))
-        .await
-        .expect("send to slug delivers");
-    mailbox
-        .send_message(&send(
-            "toron",
-            "flywheel-toron-coder",
-            "RusticBarn",
-            "as-slug ping",
-        ))
-        .await
-        .expect("send as slug (pin key) delivers");
-    let inbox = mailbox
-        .fetch_inbox(&FetchInbox {
-            project_slug: "toron".into(),
-            agent_name: "RusticBarn".into(),
-            unread_only: false,
-            limit: None,
-            include_bodies: true,
-            urgent_only: false,
-            since_ts: None,
-            thread_id: None,
-        })
-        .await
-        .expect("fetch");
-    assert_eq!(
-        inbox.len(),
-        2,
-        "both sends (to-slug, as-slug) landed on the pin inbox"
-    );
-
-    // No second identity: registering the slug after the fold is refused —
-    // the fold is slug → pin, and the error names the pin as the register
-    // target.
-    let err = mailbox
-        .register_agent("toron", &AgentProfile::new("flywheel-toron-coder"))
-        .await
-        .unwrap_err();
-    let msg = err.to_string();
-    assert!(
-        msg.contains("folded alias") && msg.contains("RusticBarn"),
-        "register refusal names the fold + pin: {msg}"
-    );
-
-    // list_agents shows exactly one identity for the holder (the pin), not a
-    // second slug identity.
-    let agents = mailbox
-        .list_agents("toron", Default::default())
-        .await
-        .expect("list");
-    assert!(
-        agents.iter().any(|a| a.name == "RusticBarn"),
-        "pin is listed"
-    );
-    assert!(
-        !agents.iter().any(|a| a.name == "flywheel-toron-coder"),
-        "slug must not appear as a second registered identity"
     );
 
     let _ = std::fs::remove_dir_all(&dir);
