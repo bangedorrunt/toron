@@ -169,7 +169,20 @@ impl ServerHandler for ToronServer {
         _context: RequestContext<RoleServer>,
     ) -> Result<ReadResourceResponse, ErrorData> {
         let uri = request.uri.as_str();
-        match read_resource_value(uri) {
+        // bd-pin-public-plane-s-easy.14: data-backed resource URIs project
+        // LIVE mailbox data (reservations, slots, agents, inbox, messages,
+        // threads, projects, ack-overdue) — not the static discovery stub.
+        // The CLI guard reads the reservation roster from
+        // `toron://reservations/{project}`; a stub would hide every lease
+        // (false Unreserved). Static/tooling URIs fall through to the stub.
+        let value = if let Some(mb) = self.tools.as_ref().map(|t| t.mailbox()) {
+            crate::resources::project_resource_value(mb, uri)
+                .await
+                .or_else(|| read_resource_value(uri))
+        } else {
+            read_resource_value(uri)
+        };
+        match value {
             Some(value) => {
                 let text = serde_json::to_string_pretty(&value).map_err(|e| {
                     ErrorData::internal_error(format!("serialize resource: {e}"), None)
@@ -704,10 +717,9 @@ steps:
         // Serve mailbox (trigger channel): registers two agents and stores a
         // real gift-wrapped message on the shared bus.
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<UnwrappedMail>();
-        let serve =
-            build_mailbox_with_opts(Some(tx), data_dir.clone(), key_path.clone(), "p")
-                .await
-                .expect("serve mailbox");
+        let serve = build_mailbox_with_opts(Some(tx), data_dir.clone(), key_path.clone(), "p")
+            .await
+            .expect("serve mailbox");
         serve
             .register_agent("demo", &AgentProfile::new("QuietFern"))
             .await

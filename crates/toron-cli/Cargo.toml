@@ -18,6 +18,10 @@ chrono = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
+rmcp = { version = "3.1.1", features = [
+    "client",
+    "transport-streamable-http-client-reqwest",
+] }
 toron-core = { path = "../toron-core" }
 toron-mcp = { path = "../toron-mcp" }
 toron-workflow = { path = "../toron-workflow" }

@@ -335,6 +335,10 @@ pub fn install_precommit_guard(repo_path: &Path, project: &str) -> anyhow::Resul
          # .beads bookkeeping files). Attribution: set AGENT_NAME=<pin>\n\
          # (or TORON_AGENT / FLYWHEEL_MAIL_AS).\n\
          # Session escape hatch: TORON_GUARD_STRICT=0 <commit> (logged).\n\
+         # One mailbox (bd-pin-public-plane-s-easy.14): guard check reads the\n\
+         # reservation roster from the toron daemon when TORON_MCP_URL is set\n\
+         # (or 127.0.0.1:18080 serves); otherwise it embeds against the durable\n\
+         # XDG root. Never a second mailbox.\n\
          {export}\
          if command -v toron >/dev/null 2>&1; then\n\
          \texport TORON_GUARD_STRICT=\"${{TORON_GUARD_STRICT:-1}}\"\n\
