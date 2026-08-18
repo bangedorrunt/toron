@@ -10,3 +10,7 @@ resonate.db
 resonate.db-shm
 resonate.db-wal
 .audit/
+
+# flywheel loop runtime artifacts (per-run, not repo state)
+.flywheel/agent-state/
+.flywheel/loop-run-verify-failed/
