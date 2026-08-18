@@ -235,6 +235,21 @@ impl Mailbox {
         {
             return Ok(name.to_string());
         }
+        // bd-pin-public-plane-s-easy.8: a host OS username ($USER) is NOT a
+        // mailbox identity — name the class + the recovery instead of the
+        // generic grammar error. Callers who type their own OS username
+        // think it is their mailbox name; telling them to register it would
+        // mint an identity for a non-identity. (Canonical/pin/fold shapes
+        // already returned above — this is the residual reject path only.)
+        if super::naming::is_username_class(name) {
+            anyhow::bail!(
+                "{name} looks like a host OS username ($USER), not a mailbox \
+                 identity — project {canonical} routes by REGISTERED \
+                 adjective+noun pins, canonical flywheel-{canonical}-<role><seq> \
+                 names, or npub; do not register your username — use your pin \
+                 or list_agents to find identities (ADR-0018 D1a/D3)"
+            );
+        }
         anyhow::bail!(
             "unknown agent name: {name} — project {canonical} routes by canonical \
              names (flywheel-{canonical}-<role><seq>), REGISTERED adjective+noun \
@@ -1405,6 +1420,58 @@ mod tests {
             err.to_string().contains("fold"),
             "create refuses folded slug: {err}"
         );
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// bd-pin-public-plane-s-easy.8: an OS username ($USER) is NOT a mailbox
+    /// identity — whois must name the class and the recovery (registered
+    /// pin / list_agents), never hint at registering the username.
+    #[tokio::test]
+    async fn whois_username_class_rejects_with_recovery() {
+        let (mailbox, _pool, db_path, data_dir) = test_mailbox_with_pool("whois-user").await;
+        mailbox
+            .ensure_project_with_mode("toron", Some("swarm"))
+            .await
+            .expect("ensure swarm");
+        mailbox
+            .register_agent("toron", &profile("BlueRidge"))
+            .await
+            .expect("register pin");
+
+        let err = mailbox.whois("toron", "bangedorrunt").await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("username"),
+            "error names the username class: {msg}"
+        );
+        assert!(
+            msg.contains("not a mailbox identity"),
+            "error says username ≠ mailbox identity: {msg}"
+        );
+        assert!(
+            msg.contains("BlueRidge") || msg.contains("pin") || msg.contains("list_agents"),
+            "error names the recovery (pin / list_agents): {msg}"
+        );
+
+        // The same class rejects through resolve_agent_name (send path too).
+        let err = mailbox
+            .resolve_agent_name("toron", "bangedorrunt")
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("username"),
+            "resolve_agent_name names the username class: {err}"
+        );
+
+        // A registered pin still resolves (the username path did not break
+        // normal routing).
+        let w = mailbox
+            .whois("toron", "BlueRidge")
+            .await
+            .expect("pin still resolves");
+        assert_eq!(w.name, "BlueRidge");
+
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_dir_all(&data_dir);
     }
