@@ -15,7 +15,10 @@ use rmcp::{tool, tool_router};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use toron_core::mailbox::{FetchInbox, SearchMessages, SendMessage};
+use toron_core::mailbox::{
+    FetchInbox, ReleaseAsk, ReleaseDecision, ReleaseResponse, RequestRelease, SearchMessages,
+    SendMessage,
+};
 
 use super::{ToJson, ToolOutput, ToolServer};
 
@@ -35,6 +38,35 @@ impl ToolServer {
     async fn send_message(&self, Parameters(args): Parameters<SendMessageArgs>) -> ToolOutput {
         if args.broadcast == Some(true) {
             return ToolOutput::err("broadcast=true is rejected (AM-Rust invariant)");
+        }
+        // Additive optional (ADR-0007 C3: names frozen, args may grow pre-1.0):
+        // CLI `reserve request-release` composes this existing tool.
+        if let Some(reservation_id) = args
+            .reservation_id
+            .as_deref()
+            .filter(|s| !s.is_empty())
+        {
+            let Some(target) = args.to.first().cloned() else {
+                return ToolOutput::err(
+                    "request-release via send_message needs to[0] = the holder pin",
+                );
+            };
+            let ask = match parse_release_ask(args.release_ask.as_deref().unwrap_or("release")) {
+                Ok(a) => a,
+                Err(e) => return ToolOutput::err(e),
+            };
+            return ToolOutput::result(
+                self.mailbox
+                    .request_release(&RequestRelease {
+                        project_slug: args.project_key.clone(),
+                        sender_name: args.sender_name.clone(),
+                        target_agent: target,
+                        reservation_id: reservation_id.to_string(),
+                        ask,
+                        note: args.reservation_note.clone(),
+                    })
+                    .await,
+            );
         }
         let msg = SendMessage {
             project_slug: args.project_key.clone(),
@@ -62,6 +94,30 @@ impl ToolServer {
         annotations(title = "Reply message", destructive_hint = true)
     )]
     async fn reply_message(&self, Parameters(args): Parameters<ReplyMessageArgs>) -> ToolOutput {
+        // Additive optional: CLI `reserve respond` composes this existing tool.
+        if let Some(request_message_id) = args
+            .request_message_id
+            .as_deref()
+            .filter(|s| !s.is_empty())
+        {
+            let decision = match parse_release_decision(
+                args.release_decision.as_deref().unwrap_or("agreed"),
+            ) {
+                Ok(d) => d,
+                Err(e) => return ToolOutput::err(e),
+            };
+            return ToolOutput::result(
+                self.mailbox
+                    .respond_request_release(&ReleaseResponse {
+                        project_slug: args.project_key.clone(),
+                        sender_name: args.sender_name.clone(),
+                        request_message_id: request_message_id.to_string(),
+                        decision,
+                        note: args.reservation_note.clone(),
+                    })
+                    .await,
+            );
+        }
         let msg = SendMessage {
             project_slug: args.project_key.clone(),
             sender_name: args.sender_name.clone(),
@@ -232,6 +288,12 @@ pub struct SendMessageArgs {
     pub broadcast: Option<bool>,
     pub auto_contact_if_blocked: Option<bool>,
     pub sender_token: Option<String>,
+    /// When set, this call is a `request_release` (CLI compose; no new tool).
+    pub reservation_id: Option<String>,
+    /// `release` | `defer:<secs>` — only used with `reservation_id`.
+    pub release_ask: Option<String>,
+    /// Optional note on the request-release rumor.
+    pub reservation_note: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone)]
@@ -252,6 +314,37 @@ pub struct ReplyMessageArgs {
     pub broadcast: Option<bool>,
     pub auto_contact_if_blocked: Option<bool>,
     pub sender_token: Option<String>,
+    /// When set, this call is a `respond_request_release` (CLI compose).
+    pub request_message_id: Option<String>,
+    /// `agreed` | `denied` | `deferred:<secs>` — only with `request_message_id`.
+    pub release_decision: Option<String>,
+    /// Optional note on the response rumor.
+    pub reservation_note: Option<String>,
+}
+
+fn parse_release_ask(s: &str) -> Result<ReleaseAsk, String> {
+    match s {
+        "release" => Ok(ReleaseAsk::Release),
+        _ => s
+            .strip_prefix("defer:")
+            .and_then(|secs| secs.parse::<u64>().ok())
+            .map(|defer_secs| ReleaseAsk::Defer { defer_secs })
+            .ok_or_else(|| format!("invalid --ask {s:?} — use release or defer:<secs>")),
+    }
+}
+
+fn parse_release_decision(s: &str) -> Result<ReleaseDecision, String> {
+    match s {
+        "agreed" => Ok(ReleaseDecision::Agreed),
+        "denied" => Ok(ReleaseDecision::Denied),
+        _ => s
+            .strip_prefix("deferred:")
+            .and_then(|secs| secs.parse::<u64>().ok())
+            .map(|defer_secs| ReleaseDecision::Deferred { defer_secs })
+            .ok_or_else(|| {
+                format!("invalid --decision {s:?} — use agreed, denied, or deferred:<secs>")
+            }),
+    }
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone)]

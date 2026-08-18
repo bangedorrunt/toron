@@ -161,6 +161,8 @@ pub async fn run_mail(mailbox: &Mailbox, cmd: &MailCommand) -> anyhow::Result<()
 /// Daemon arm of `run_mail` (bd-pin-public-plane-s-easy.14): call the daemon's
 /// MCP tool, print the parity JSON. CLI-only commands with no daemon tool
 /// (overseer) fail loud rather than silently using a second mailbox.
+/// `reserve request-release`/`respond`/`transfer` compose existing tools
+/// (`send_message` / `reply_message` / `file_reservation_paths`).
 pub async fn run_mail_daemon(dc: &DaemonClient, cmd: &MailCommand) -> anyhow::Result<()> {
     match cmd {
         MailCommand::Send(args) => {
@@ -460,13 +462,53 @@ pub async fn run_reserve_daemon(dc: &DaemonClient, cmd: &ReserveCommand) -> anyh
             )
             .await
         }
-        ReserveCommand::RequestRelease(_)
-        | ReserveCommand::Respond(_)
-        | ReserveCommand::Transfer(_) => {
-            anyhow::bail!(
-                "reserve request-release/respond/transfer are CLI-only (no daemon tool) — run \
-                 with the daemon URL unset (embedded mode)"
+        ReserveCommand::RequestRelease(args) => {
+            daemon_tool(
+                dc,
+                "send_message",
+                json!({
+                    "project_key": args.project,
+                    "sender_name": args.agent,
+                    "to": [args.target.clone()],
+                    "subject": "[request-release]",
+                    "body_md": args.note.clone().unwrap_or_default(),
+                    "reservation_id": args.reservation_id,
+                    "release_ask": args.ask,
+                    "reservation_note": args.note,
+                }),
             )
+            .await
+        }
+        ReserveCommand::Respond(args) => {
+            daemon_tool(
+                dc,
+                "reply_message",
+                json!({
+                    "project_key": args.project,
+                    "sender_name": args.agent,
+                    "to": [args.agent.clone()],
+                    "subject": "[request-release-response]",
+                    "body_md": args.note.clone().unwrap_or_default(),
+                    "request_message_id": args.request_id,
+                    "release_decision": args.decision,
+                    "reservation_note": args.note,
+                }),
+            )
+            .await
+        }
+        ReserveCommand::Transfer(args) => {
+            daemon_tool(
+                dc,
+                "file_reservation_paths",
+                json!({
+                    "project_key": args.project,
+                    "agent_name": args.to,
+                    "paths": [args.path.clone()],
+                    "transfer_from": args.from,
+                    "reason": args.reason,
+                }),
+            )
+            .await
         }
     }
 }

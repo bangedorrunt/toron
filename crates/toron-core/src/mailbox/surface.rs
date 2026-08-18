@@ -1632,7 +1632,11 @@ mod tests {
             })
             .await
             .expect("since inbox");
-        assert_eq!(since.len(), 1, "only the urgent send is newer than the low row");
+        assert_eq!(
+            since.len(),
+            1,
+            "only the urgent send is newer than the low row"
+        );
         assert_eq!(since[0].subject, "urgent");
 
         let bad = surface
