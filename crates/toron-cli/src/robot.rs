@@ -105,7 +105,7 @@ pub async fn run_mail(mailbox: &Mailbox, cmd: &MailCommand) -> anyhow::Result<()
                 limit: args.limit,
                 include_bodies: args.bodies,
                 urgent_only: false,
-                since_ts: None,
+                since_ts: args.since.clone(),
                 thread_id: args.thread_id.clone(),
             };
             emit(mailbox.fetch_inbox(&fi).await?)
