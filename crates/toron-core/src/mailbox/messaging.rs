@@ -262,7 +262,10 @@ impl Mailbox {
                 )
             })?
         } else {
-            self.agent_keys_for(&args.project_slug, &args.sender_name)?
+            // bd-pin-public-plane-s-easy.1: the sender name may be a slug —
+            // resolve through the fold to the pin's key.
+            self.agent_keys_for_resolved(&args.project_slug, &args.sender_name)
+                .await?
         };
 
         let visible = build_visible_rumor(&sender_keys.public_key(), &args, &resolved);
@@ -343,7 +346,11 @@ impl Mailbox {
         // of the project key.
         let mut args = args.clone();
         args.project_slug = self.canonical_project(&args.project_slug).await;
-        let agent_keys = self.agent_keys_for(&args.project_slug, &args.agent_name)?;
+        // bd-pin-public-plane-s-easy.1: the inbox owner may be named by slug
+        // — resolve through the fold to the pin's key.
+        let agent_keys = self
+            .agent_keys_for_resolved(&args.project_slug, &args.agent_name)
+            .await?;
         let npub = agent_keys.public_key();
 
         // Subscribe to gift wraps addressed to this agent (#p), drain history.
@@ -563,7 +570,11 @@ impl Mailbox {
         acknowledged: bool,
     ) -> anyhow::Result<ReceiptResult> {
         let project_slug = &self.canonical_project(project_slug).await; // ADR-0017
-        let agent_keys = self.agent_keys_for(project_slug, agent_name)?;
+        // bd-pin-public-plane-s-easy.1: ack/read identity may be a slug —
+        // resolve through the fold to the pin's key.
+        let agent_keys = self
+            .agent_keys_for_resolved(project_slug, agent_name)
+            .await?;
         let npub = agent_keys.public_key();
 
         // Case (a): the wrap addressed to THIS agent (the recipient).
@@ -678,7 +689,10 @@ impl Mailbox {
         gift: &UnwrappedGift,
     ) -> anyhow::Result<()> {
         // (c.1) The message's own sender is a thread participant.
-        let acker_keys = self.agent_keys_for(project_slug, acker_name)?;
+        // bd-pin-public-plane-s-easy.1: acker may be named by slug.
+        let acker_keys = self
+            .agent_keys_for_resolved(project_slug, acker_name)
+            .await?;
         if acker_keys.public_key() == gift.sender {
             return Ok(());
         }
@@ -781,36 +795,15 @@ impl Mailbox {
                     nostr_sdk::nostr::PublicKey::from_hex(name)
                         .map_err(|_| anyhow::anyhow!("invalid npub recipient: {name}"))?
                 } else if mode == super::naming::IdentityMode::Swarm {
-                    // ADR-0018 D1a/D3: canonical names, REGISTERED
-                    // adjective+noun pins, or folded legacy aliases route.
-                    // An unregistered pin fails at resolve_name below
-                    // ("register it first") — matching D1a (registered pins
-                    // are routing targets; unregistered free strings are not).
-                    // The FOLDED ALIAS check precedes the pin-pattern match:
-                    // an explicit legacy-name fold is the authoritative
-                    // mapping (bd-6wfv) — a folded legacy name routes to its
-                    // canonical even when the legacy registration row still
-                    // exists (it would otherwise pattern-match as a pin and
-                    // route to the stale registration).
-                    let target: String =
-                        if super::naming::is_canonical_name(name, &args.project_slug) {
-                            name.clone()
-                        } else if let Some(folded) =
-                            self.agent_name_alias(&args.project_slug, name).await
-                        {
-                            folded
-                        } else if super::naming::is_adjnoun_pin(name) {
-                            name.clone()
-                        } else {
-                            anyhow::bail!(
-                                "unknown recipient: {name} — project {} routes by canonical \
-                             names (flywheel-{}-<role><seq>), REGISTERED adjective+noun \
-                             pins, or npub only; unregistered free strings are non-routable \
-                             (ADR-0018 D1a/D3)",
-                                args.project_slug,
-                                args.project_slug
-                            );
-                        };
+                    // ADR-0018 D1a/D3 + bd-pin-public-plane-s-easy.1:
+                    // canonical names, REGISTERED adjective+noun pins, or
+                    // folded aliases route — ONE resolver (the fold precedes
+                    // the shape match, so a slug folded to a pin resolves as
+                    // the pin). An unregistered pin fails at resolve_name
+                    // below ("register it first") — matching D1a (registered
+                    // pins are routing targets; unregistered free strings
+                    // are not).
+                    let target = self.resolve_agent_name(&args.project_slug, name).await?;
                     nident::resolve_name(&args.project_slug, profiles.iter(), &target).ok_or_else(
                         || {
                             anyhow::anyhow!(
@@ -858,6 +851,23 @@ impl Mailbox {
         Err(anyhow::anyhow!(
             "agent {name} has no local key in project {project_slug} (create_agent_identity or register first)"
         ))
+    }
+
+    /// bd-pin-public-plane-s-easy.1: `agent_keys_for` through the ONE name
+    /// resolver — a SLUG folds to its PIN's key (`flywheel-toron-coder` →
+    /// `BlueRidge`), so acting as the slug loads the pin key. The sync
+    /// `agent_keys_for` above stays the exact-name primitive for callers
+    /// that already hold the registered name (build slots, contacts,
+    /// reservations pass pins under the new convention); every messaging
+    /// entry that accepts a user-supplied name routes through here.
+    pub(crate) async fn agent_keys_for_resolved(
+        &self,
+        project_slug: &str,
+        name: &str,
+    ) -> anyhow::Result<Keys> {
+        let canonical = self.canonical_project(project_slug).await;
+        let resolved = self.resolve_agent_name(&canonical, name).await?;
+        self.agent_keys_for(&canonical, &resolved)
     }
 
     /// Per-message receipt timestamp cache (idempotency, in-memory).
@@ -2146,6 +2156,67 @@ mod tests {
         assert!(
             !wraps_to(&mailbox, &recv_npub, 1).await.is_empty(),
             "open mode send delivered"
+        );
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    // --- bd-pin-public-plane-s-easy.1: slug → pin (fold is slug→pin) ---
+
+    #[tokio::test]
+    async fn swarm_send_to_slug_resolves_to_pin_recipient() {
+        let (mailbox, _pool, db_path, data_dir) = test_mailbox_with_pool("send-slug").await;
+        mailbox.ensure_project("toron").await.expect("ensure");
+        mailbox
+            .register_agent("toron", &profile("flywheel-toron-oc"))
+            .await
+            .expect("sender canonical");
+        let (_recv_keys, recv_npub) = register(&mailbox, "toron", "BlueRidge").await;
+        mailbox.set_identity_mode("toron", "swarm").await;
+        mailbox
+            .fold_agent_name_alias("toron", "flywheel-toron-coder", "BlueRidge")
+            .await;
+
+        // Send TO the slug → delivered to the PIN's npub (fold is slug→pin).
+        mailbox
+            .send_message(&send_args(
+                "toron",
+                "flywheel-toron-oc",
+                &["flywheel-toron-coder"],
+            ))
+            .await
+            .expect("send to slug resolves via fold");
+        let wraps = wraps_to(&mailbox, &recv_npub, 2).await;
+        assert_eq!(wraps.len(), 1, "slug folds to pin npub");
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn agent_keys_for_resolved_loads_pin_key_for_slug() {
+        let (mailbox, _pool, db_path, data_dir) = test_mailbox_with_pool("keys-slug").await;
+        mailbox
+            .ensure_project_with_mode("toron", Some("swarm"))
+            .await
+            .expect("ensure swarm");
+        let (pin_keys, pin_npub) = register(&mailbox, "toron", "BlueRidge").await;
+        mailbox
+            .fold_agent_name_alias("toron", "flywheel-toron-coder", "BlueRidge")
+            .await;
+
+        // Sending AS the slug must sign with the PIN's key.
+        mailbox
+            .send_message(&send_args("toron", "flywheel-toron-coder", &["BlueRidge"]))
+            .await
+            .expect("send as slug uses pin key");
+        let wraps = wraps_to(&mailbox, &pin_npub, 2).await;
+        assert_eq!(wraps.len(), 1, "wrap signed by the pin key (sender=pin)");
+        assert_eq!(
+            pin_keys.public_key().to_hex(),
+            pin_npub.to_hex(),
+            "register helper returns the pin identity"
         );
 
         let _ = std::fs::remove_file(&db_path);
