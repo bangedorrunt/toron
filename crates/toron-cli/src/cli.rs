@@ -434,6 +434,9 @@ pub struct MailInboxArgs {
     /// Include message bodies.
     #[arg(long)]
     pub bodies: bool,
+    /// Keep only messages in this thread (bd-harvest-thread-filter-yp9r).
+    #[arg(long)]
+    pub thread_id: Option<String>,
 }
 
 #[derive(Debug, Args)]

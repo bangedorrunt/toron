@@ -164,6 +164,7 @@ async fn sc26_swarm_project_routes_canonical_names_and_npubs_only() {
             include_bodies: true,
             urgent_only: false,
             since_ts: None,
+            thread_id: None,
         })
         .await
         .expect("fetch");
@@ -225,6 +226,7 @@ async fn sc26_folded_alias_resolves_through_to_canonical_on_whois_and_send() {
             include_bodies: true,
             urgent_only: false,
             since_ts: None,
+            thread_id: None,
         })
         .await
         .expect("fetch");

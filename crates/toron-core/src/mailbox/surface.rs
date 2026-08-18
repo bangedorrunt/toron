@@ -130,6 +130,10 @@ pub struct InboxQuery {
     /// RFC3339 timestamp. `None` = no time bound. A malformed timestamp is a
     /// `MailError::Malformed` — never a silently ignored filter.
     pub since_ts: Option<String>,
+    /// Keep only messages whose projected `thread_id` equals this value
+    /// (bd-harvest-thread-filter-yp9r). Post-unwrap filter — the thread tag
+    /// lives inside the encrypted gift wrap. `None` = no thread bound.
+    pub thread_id: Option<String>,
 }
 
 impl From<&InboxQuery> for FetchInbox {
@@ -142,6 +146,7 @@ impl From<&InboxQuery> for FetchInbox {
             include_bodies: q.include_bodies,
             urgent_only: q.urgent_only,
             since_ts: q.since_ts.clone(),
+            thread_id: q.thread_id.clone(),
         }
     }
 }
@@ -1566,7 +1571,10 @@ mod tests {
             })
             .await
             .expect("send low");
-        let ts = chrono::Utc::now().to_rfc3339();
+        // Rumor timestamps are second-granularity (nostr Timestamp), so a
+        // `since` bound can only separate sends in different seconds. Sleep
+        // across a boundary so the urgent send is strictly newer.
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
         surface
             .send(&SendMail {
                 project: "demo".into(),
@@ -1603,16 +1611,28 @@ mod tests {
         assert_eq!(urgent.len(), 1);
         assert_eq!(urgent[0].subject, "urgent");
 
+        // Anchor `since` on the low row's own timestamp (second-granularity
+        // rumor time — the sleep above guarantees the urgent send is a later
+        // second).
+        let low_ts = all
+            .iter()
+            .find(|m| m.subject == "low")
+            .expect("low row")
+            .created_ts_us;
         let since = surface
             .inbox(&InboxQuery {
                 project: "demo".into(),
                 agent: "BlueLake".into(),
-                since_ts: Some(ts),
+                since_ts: Some(
+                    chrono::DateTime::from_timestamp_micros(low_ts)
+                        .expect("low ts")
+                        .to_rfc3339(),
+                ),
                 ..Default::default()
             })
             .await
             .expect("since inbox");
-        assert_eq!(since.len(), 1, "only the urgent send is newer than ts");
+        assert_eq!(since.len(), 1, "only the urgent send is newer than the low row");
         assert_eq!(since[0].subject, "urgent");
 
         let bad = surface
@@ -1625,6 +1645,89 @@ mod tests {
             .await
             .expect_err("malformed since_ts is an error, never silent");
         assert_eq!(bad.code(), &MailErrorCode::Malformed);
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// bd-harvest-thread-filter-yp9r: `InboxQuery.thread_id` keeps ONLY the
+    /// target thread's rows; `None` stays byte-identical to unfiltered.
+    #[tokio::test]
+    async fn inbox_applies_thread_filter() {
+        let (surface, db_path, data_dir) = test_surface("thrd").await;
+        register_agent(&surface, "demo", "GreenCastle").await;
+        register_agent(&surface, "demo", "BlueLake").await;
+        for (subject, thread) in [
+            ("t1-a", "debate-1"),
+            ("t1-b", "debate-1"),
+            ("t2-a", "debate-2"),
+        ] {
+            surface
+                .send(&SendMail {
+                    project: "demo".into(),
+                    sender: "GreenCastle".into(),
+                    to: vec!["BlueLake".into()],
+                    subject: subject.into(),
+                    body_md: "threaded".into(),
+                    thread_id: Some(thread.into()),
+                    ..Default::default()
+                })
+                .await
+                .expect("send");
+        }
+
+        let all = surface
+            .inbox(&InboxQuery {
+                project: "demo".into(),
+                agent: "BlueLake".into(),
+                include_bodies: true,
+                ..Default::default()
+            })
+            .await
+            .expect("inbox");
+        assert_eq!(all.len(), 3);
+
+        let t1 = surface
+            .inbox(&InboxQuery {
+                project: "demo".into(),
+                agent: "BlueLake".into(),
+                include_bodies: true,
+                thread_id: Some("debate-1".into()),
+                ..Default::default()
+            })
+            .await
+            .expect("thread inbox");
+        assert_eq!(t1.len(), 2, "only debate-1 rows");
+        assert!(
+            t1.iter()
+                .all(|m| m.thread_id.as_ref().map(|t| t.as_str()) == Some("debate-1")),
+            "every row carries the requested thread_id"
+        );
+
+        let t2 = surface
+            .inbox(&InboxQuery {
+                project: "demo".into(),
+                agent: "BlueLake".into(),
+                include_bodies: true,
+                thread_id: Some("debate-2".into()),
+                ..Default::default()
+            })
+            .await
+            .expect("thread inbox 2");
+        assert_eq!(t2.len(), 1);
+        assert_eq!(t2[0].subject, "t2-a");
+
+        let missing = surface
+            .inbox(&InboxQuery {
+                project: "demo".into(),
+                agent: "BlueLake".into(),
+                include_bodies: true,
+                thread_id: Some("no-such-thread".into()),
+                ..Default::default()
+            })
+            .await
+            .expect("empty thread inbox");
+        assert!(missing.is_empty(), "unknown thread yields no rows");
+
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_dir_all(&data_dir);
     }

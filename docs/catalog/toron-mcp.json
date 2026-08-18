@@ -121,7 +121,7 @@
       "name": "workflow"
     }
   ],
-  "generated_at": "2026-08-16T03:57:28Z",
+  "generated_at": "2026-08-18T06:13:36Z",
   "resources": [
     {
       "description": "List projects known to toron.",
@@ -1125,6 +1125,7 @@
         "mark_read": null,
         "project_key": "<string>",
         "since_ts": null,
+        "thread_id": null,
         "topic": null,
         "unread_only": null,
         "urgent_only": null
@@ -1165,6 +1166,13 @@
             "type": "string"
           },
           "since_ts": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "thread_id": {
+            "description": "Keep only messages in this thread (bd-harvest-thread-filter-yp9r).",
             "type": [
               "string",
               "null"

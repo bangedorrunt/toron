@@ -2961,6 +2961,10 @@ mod tests {
         );
 
         // A deferred decision round-trips through the wire encoding too.
+        // "LATEST decision wins" resolves on second-granularity rumor time;
+        // two responses in the same second are order-dependent. Sleep across
+        // a boundary so the Deferred response is deterministically later.
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
         let send2 = mailbox
             .respond_request_release(&ReleaseResponse {
                 project_slug: "demo".into(),

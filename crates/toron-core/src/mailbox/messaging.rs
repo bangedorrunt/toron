@@ -166,6 +166,13 @@ pub struct FetchInbox {
     /// RFC3339 timestamp. `None` = no time bound. A malformed timestamp is a
     /// `MailError::Malformed` — never a silently ignored filter.
     pub since_ts: Option<String>,
+    /// Keep only messages whose projected `thread_id` equals this value
+    /// (bd-harvest-thread-filter-yp9r). Applied post-unwrap — the thread tag
+    /// lives INSIDE the encrypted gift wrap, so no SQL/bus filter can see it;
+    /// the filter runs in the shared core stage so every inbox path (surface,
+    /// MCP tool, CLI robot) inherits it. `None` = no thread bound, behavior
+    /// byte-identical to before this field existed.
+    pub thread_id: Option<String>,
 }
 
 /// Parse an RFC3339 timestamp into epoch micros (the unit every toron row's
@@ -201,6 +208,16 @@ fn filter_inbox_messages(
             }
             if let Some(s) = since_us
                 && m.created_ts_us <= s
+            {
+                return false;
+            }
+            // bd-harvest-thread-filter-yp9r: thread filter (post-unwrap —
+            // the thread tag is inside the encrypted wrap; index-served
+            // filtering is impossible for the inbox projection, which is
+            // bus-replay based). `thread_id` here is the inbox row's own
+            // thread field, so the comparison is exact.
+            if let Some(t) = &q.thread_id
+                && m.thread_id.as_deref() != Some(t.as_str())
             {
                 return false;
             }
@@ -330,9 +347,15 @@ impl Mailbox {
         let npub = agent_keys.public_key();
 
         // Subscribe to gift wraps addressed to this agent (#p), drain history.
+        // bd-harvest-thread-filter-yp9r: the bus replay defaults to a 1000-row
+        // newest-tail window (event_store.rs unwrap_or(1000)) — an inbox fetch
+        // must see EVERY wrap or mail silently vanishes past 1000. Request the
+        // store cap explicitly; the caller-facing `limit` only trims rows
+        // AFTER projection.
         let filter = ToronFilter::new()
             .kinds([nostr_sdk::nostr::Kind::GiftWrap])
             .pubkey(npub)
+            .limit(crate::bus::event_store::MAX_STORED_EVENTS as usize)
             .build();
         let events = super::collect_replay(self.bus.as_ref(), filter).await?;
 
@@ -433,7 +456,8 @@ impl Mailbox {
         // MCP tool path (which calls `Mailbox::fetch_inbox` directly) get the
         // exact same post-projection filtering. Malformed `since_ts` is a
         // hard Malformed error, never a silent ignore. Applied BEFORE limit.
-        if args.urgent_only || args.since_ts.is_some() {
+        // bd-harvest-thread-filter-yp9r: thread filter shares the same stage.
+        if args.urgent_only || args.since_ts.is_some() || args.thread_id.is_some() {
             messages = filter_inbox_messages(messages, &args)?;
         }
 

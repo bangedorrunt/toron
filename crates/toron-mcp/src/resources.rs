@@ -319,6 +319,7 @@ async fn inbox_view(mailbox: &Mailbox, name: &str) -> Option<serde_json::Value> 
         include_bodies: false,
         urgent_only: false,
         since_ts: None,
+        thread_id: None,
     };
     let messages = mailbox.fetch_inbox(&args).await.ok()?;
     Some(serde_json::json!({
@@ -520,6 +521,7 @@ async fn mailbox_view(mailbox: &Mailbox, name: &str) -> Option<serde_json::Value
         include_bodies: false,
         urgent_only: false,
         since_ts: None,
+        thread_id: None,
     };
     let messages = mailbox.fetch_inbox(&args).await.ok()?;
     let health = mailbox.health_check().await;
