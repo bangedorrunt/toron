@@ -394,7 +394,12 @@ async fn thread_filter_returns_only_target_thread_rows_at_scale() {
             }
         }
         if t % 100 == 0 {
-            println!("sent {}/{} threads, {:?} total", t, threads, send_start.elapsed());
+            println!(
+                "sent {}/{} threads, {:?} total",
+                t,
+                threads,
+                send_start.elapsed()
+            );
         }
     }
     println!("sends done: {total} in {:?}", send_start.elapsed());
