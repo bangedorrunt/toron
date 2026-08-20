@@ -2,8 +2,9 @@
 #![forbid(unsafe_code)]
 
 //! herdr backend client — newline-delimited JSON-RPC over a unix socket
-//! (protocol v19, per ADR-0003). Single shared client; flywheel's copy is
-//! deleted after this lands (ADR: "one definition of `agent_prompt`").
+//! (protocol v20, per ADR-0003; bumped for herdr 0.8.2 — see the protocol
+//! bead). Single shared client; flywheel's copy is deleted after this lands
+//! (ADR: "one definition of `agent_prompt`").
 //!
 //! Wire shape (one JSON object per line):
 //!   request:  {"id":"<n>","method":"agent.prompt","params":{...}}
@@ -25,8 +26,9 @@ use serde_json::{Value, json};
 use super::error::{BackendError, BackendErrorCode};
 use super::types::{AgentStatus, BackendEvent, PaneId, PromptLanding};
 
-/// herdr socket protocol version this client is verified against (v19).
-pub const HDR_PROTOCOL: u64 = 19;
+/// herdr socket protocol version this client is verified against (v20,
+/// herdr 0.8.2 — live `herdr api schema --json` reports 20).
+pub const HDR_PROTOCOL: u64 = 20;
 
 /// Resolve the herdr socket path from explicit env values (pure — testable).
 /// Priority: `HERDR_SOCKET_PATH` env, else `$XDG_CONFIG_HOME/herdr/herdr.sock`
@@ -195,7 +197,11 @@ pub enum SendVerdict {
 }
 
 /// Map a herdr error code + observed status to a verdict. Classifies on the
-/// protocol code, never message strings.
+/// protocol code, never message strings. `agent_blocked` (protocol v20:
+/// herdr refused to send — agent at an approval/question dialog) stays
+/// [`SendVerdict::Coded`]: no text was delivered, so callers must NOT
+/// respawn-on-stalled or blind-retry; the blocked-agent escalation paths
+/// (flywheel loop tiers) own recovery from state polls.
 pub fn classify_send_result(code: Option<&str>, status: Option<AgentStatus>) -> SendVerdict {
     match code {
         Some("agent_prompt_stalled") => SendVerdict::Stalled,
@@ -566,15 +572,21 @@ impl Client {
     // ---- pane primitives (H2, bd-harness-pane-send-text-7fe8) ----
     //
     // Wire shapes verified against `herdr api schema --json` (protocol 19,
-    // build 2026-08-04-d78e3d3b5126) and the live daemon 2026-08-15:
+    // build 2026-08-04-d78e3d3b5126) and the live daemon 2026-08-15, then
+    // re-verified field-for-field against protocol 20 (herdr 0.8.2-preview,
+    // build 2026-08-19-b5c4a0176e91) — additive only from this client's
+    // perspective:
     // `pane.send_text` takes { pane_id, text }; `pane.send_input` takes
     // { pane_id, keys } (key combos incl. modifier chords ctrl+h/alt+x and
     // named punctuation minus/plus); `pane.wait_for_output` takes
     // { pane_id, source, match: { type: substring|regex, value }, ... }.
-    // NOTE: there is NO raw `pane.run` method in protocol 19 — the herdr CLI
-    // implements `herdr pane run` as send_text + Enter. [`Client::pane_run`]
-    // mirrors that composite so pane-scoped command execution needs no agent
-    // lifecycle (ADR-0019 CommandVerified).
+    // NOTE: there is still NO raw `pane.run` method in protocol 20 — the
+    // herdr CLI implements `herdr pane run` as send_text + Enter.
+    // [`Client::pane_run`] mirrors that composite so pane-scoped command
+    // execution needs no agent lifecycle (ADR-0019 CommandVerified).
+    // (Caveat kept from v19: the schema's EventMatch def uses key `event`
+    // with underscored values, but the live daemon accepts `type` + dotted
+    // values on events.subscribe — empirically confirmed against 0.8.2.)
 
     /// `pane.send_text` — literal text into the pane's terminal (no Enter).
     pub fn pane_send_text(&mut self, pane_id: &str, text: &str) -> Result<Value, BackendError> {
@@ -592,8 +604,9 @@ impl Client {
         )
     }
 
-    /// `pane.run` composite (no raw method in protocol 19): send the command
-    /// text, then an Enter keypress — the same shape `herdr pane run` uses.
+    /// `pane.run` composite (no raw method in the protocol — v19 nor v20):
+    /// send the command text, then an Enter keypress — the same shape
+    /// `herdr pane run` uses.
     pub fn pane_run(&mut self, pane_id: &str, command: &str) -> Result<Value, BackendError> {
         self.pane_send_text(pane_id, command)?;
         self.pane_send_input(pane_id, &["Enter"])
@@ -1013,97 +1026,100 @@ mod tests {
         assert!(no_home.to_string_lossy().ends_with("herdr/herdr.sock"));
     }
 
-    /// Trimmed live v19 schema snapshot + real payload samples (captured from
-    /// the running herdr daemon, 2026-08-08; see bead bd-4eze).
-    const V19_FIXTURE: &str = include_str!("../../tests/fixtures/herdr-schema-v19.json");
+    /// Trimmed live v20 schema snapshot + real payload samples (captured from
+    /// the running herdr 0.8.2-preview daemon, 2026-08-20; protocol-bump
+    /// bead — the successor of bd-4eze's v19 capture).
+    const V20_FIXTURE: &str = include_str!("../../tests/fixtures/herdr-schema-v20.json");
 
     fn fixture() -> Value {
-        serde_json::from_str(V19_FIXTURE).expect("v19 fixture parses")
+        serde_json::from_str(V20_FIXTURE).expect("v20 fixture parses")
     }
 
     #[test]
-    fn protocol_pin_matches_live_v19_fixture() {
+    fn protocol_pin_matches_live_v20_fixture() {
         let f = fixture();
-        assert_eq!(HDR_PROTOCOL, 19);
+        assert_eq!(HDR_PROTOCOL, 20);
         assert_eq!(f["protocol"].as_u64(), Some(HDR_PROTOCOL));
     }
 
     #[test]
-    fn pane_info_parses_live_v19_payload() {
+    fn pane_info_parses_live_v20_payload() {
         let f = fixture();
         let pane: PaneInfo = serde_json::from_value(f["samples"]["pane"].clone()).expect("pane");
-        assert_eq!(pane.pane_id, "wT:p2");
-        assert_eq!(pane.terminal_id, "term_6583b54d13a1b9");
-        assert_eq!(pane.workspace_id, "wT");
-        assert_eq!(pane.tab_id, "wT:t2");
-        assert!(!pane.focused);
-        assert_eq!(pane.agent_status, AgentStatus::Idle);
-        assert_eq!(pane.revision, 557);
-        assert_eq!(pane.agent.as_deref(), Some("opencode"));
+        assert_eq!(pane.pane_id, "w37:pB");
+        assert_eq!(pane.terminal_id, "term_65975053cb0a4c");
+        assert_eq!(pane.workspace_id, "w37");
+        assert_eq!(pane.tab_id, "w37:t7");
+        assert!(pane.focused);
+        assert_eq!(pane.agent_status, AgentStatus::Working);
+        assert_eq!(pane.revision, 4958);
+        assert_eq!(pane.agent.as_deref(), Some("omp"));
         assert_eq!(
             pane.cwd.as_deref(),
-            Some("/Users/bangedorrunt/workspace/flywheel")
+            Some("/Users/bangedorrunt/workspace/toron")
         );
         assert!(pane.scroll.is_some());
-        assert_eq!(
-            pane.terminal_title.as_deref(),
-            Some("OC | Implementing remaining beads with fly...")
-        );
+        // Spinner-frame title (⠹) — v0.8.2 Claude/omp spinner stripping is a
+        // display concern; the wire still carries the raw frame here.
+        assert_eq!(pane.terminal_title.as_deref(), Some("π ⠹ toron"));
     }
 
     #[test]
-    fn worktree_info_parses_live_v19_payloads() {
+    fn worktree_info_parses_live_v20_payloads() {
         let f = fixture();
         let wts: Vec<WorktreeInfo> =
             serde_json::from_value(f["samples"]["worktrees"].clone()).expect("worktrees");
-        assert_eq!(wts.len(), 2);
-        let linked = &wts[0];
-        assert_eq!(linked.path, "/Users/bangedorrunt/workspace/toron");
-        assert_eq!(linked.label, "toron");
-        assert!(!linked.is_bare);
-        assert!(!linked.is_detached);
-        assert!(!linked.is_linked_worktree);
-        assert!(!linked.is_prunable);
-        assert_eq!(linked.branch.as_deref(), Some("main"));
-        assert_eq!(linked.open_workspace_id.as_deref(), Some("w17"));
-        let detached = &wts[1];
-        assert!(detached.is_detached);
-        assert!(detached.is_linked_worktree);
-        assert_eq!(detached.branch, None);
-        assert_eq!(detached.open_workspace_id, None);
+        assert_eq!(wts.len(), 1);
+        let main = &wts[0];
+        assert_eq!(main.path, "/Users/bangedorrunt/workspace/toron");
+        assert_eq!(main.label, "toron");
+        assert!(!main.is_bare);
+        assert!(!main.is_detached);
+        assert!(!main.is_linked_worktree);
+        assert!(!main.is_prunable);
+        assert_eq!(main.branch.as_deref(), Some("main"));
+        assert_eq!(main.open_workspace_id.as_deref(), Some("w37"));
     }
 
     #[test]
-    fn agent_info_parses_live_v19_payload() {
+    fn agent_info_parses_live_v20_payload() {
         let f = fixture();
         let agent: AgentInfo =
             serde_json::from_value(f["samples"]["agent"].clone()).expect("agent");
-        assert_eq!(agent.agent_status, AgentStatus::Idle);
-        assert_eq!(agent.terminal_id, "term_6583b54d13a1b9");
-        assert_eq!(agent.workspace_id, "wT");
-        assert_eq!(agent.tab_id, "wT:t2");
-        assert_eq!(agent.pane_id, "wT:p2");
-        assert!(!agent.focused);
-        assert_eq!(agent.revision, 557);
+        assert_eq!(agent.agent_status, AgentStatus::Working);
+        assert_eq!(agent.terminal_id, "term_65975053cb0a4c");
+        assert_eq!(agent.workspace_id, "w37");
+        assert_eq!(agent.tab_id, "w37:t7");
+        assert_eq!(agent.pane_id, "w37:pB");
+        assert!(agent.focused);
+        assert_eq!(agent.revision, 4958);
+        // v20 omits `name` for this agent (agent-kind identity only) —
+        // Option + serde's implicit missing→None covers it.
+        assert_eq!(agent.name, None);
+        // interactive_ready/launch_pending are absent in this live payload;
+        // #[serde(default)] covers missing→false.
+        assert!(!agent.interactive_ready);
+        assert!(!agent.launch_pending);
+        assert_eq!(agent.state_change_seq, 27);
     }
 
     #[test]
-    fn workspace_info_parses_live_v19_payload() {
+    fn workspace_info_parses_live_v20_payload() {
         let f = fixture();
         let ws: WorkspaceInfo =
             serde_json::from_value(f["samples"]["workspace"].clone()).expect("workspace");
-        assert_eq!(ws.workspace_id, "wD");
-        assert_eq!(ws.number, 1);
-        assert_eq!(ws.label, "chiebukuro");
-        assert!(!ws.focused);
+        assert_eq!(ws.workspace_id, "w37");
+        assert_eq!(ws.number, 4);
+        assert_eq!(ws.label, "toron");
+        assert!(ws.focused);
         assert_eq!(ws.pane_count, 3);
         assert_eq!(ws.tab_count, 3);
-        assert_eq!(ws.active_tab_id, "wD:t6");
-        assert_eq!(ws.agent_status, AgentStatus::Unknown);
+        assert_eq!(ws.active_tab_id, "w37:t7");
+        assert_eq!(ws.agent_status, AgentStatus::Working);
     }
 
     #[test]
-    fn v19_schema_requires_pane_v19_fields() {
+    fn v20_schema_requires_pane_v20_fields() {
         // Field-for-field conformance guard: the fixture schema is the live
         // daemon's; if it starts requiring something PaneInfo/WorktreeInfo
         // lack, this test fails before the socket round-trip ever does.
@@ -1165,9 +1181,10 @@ mod tests {
 
     #[test]
     #[ignore = "requires a live herdr daemon on the socket"]
-    fn live_round_trip_v19() {
-        // bd-4eze: prove the typed client parses live v19 responses for the
-        // methods the flywheel loop depends on. List-only — no side effects.
+    fn live_round_trip_v20() {
+        // Protocol bump (successor of bd-4eze's v19 live proof): prove the
+        // typed client parses live v20 responses for the methods the
+        // flywheel loop depends on. List-only — no side effects.
         let mut c = Client::connect(None).expect("connect to live herdr socket");
         c.ping().expect("ping");
         let ws = c.workspace_list().expect("workspace.list");
@@ -1305,9 +1322,9 @@ mod pane_send_tests {
 
     #[test]
     fn run_composite_round_trip() {
-        // No raw pane.run in protocol 19: the composite sends the command
-        // text then an Enter keypress, on two connections (one request per
-        // connection) — the same shape `herdr pane run` uses.
+        // No raw pane.run in the protocol (v19 nor v20): the composite sends
+        // the command text then an Enter keypress, on two connections (one
+        // request per connection) — the same shape `herdr pane run` uses.
         let path = test_sock(3);
         let listener = UnixListener::bind(&path).expect("bind");
         let t = serve(
