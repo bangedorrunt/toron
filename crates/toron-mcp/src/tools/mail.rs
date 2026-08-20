@@ -41,11 +41,7 @@ impl ToolServer {
         }
         // Additive optional (ADR-0007 C3: names frozen, args may grow pre-1.0):
         // CLI `reserve request-release` composes this existing tool.
-        if let Some(reservation_id) = args
-            .reservation_id
-            .as_deref()
-            .filter(|s| !s.is_empty())
-        {
+        if let Some(reservation_id) = args.reservation_id.as_deref().filter(|s| !s.is_empty()) {
             let Some(target) = args.to.first().cloned() else {
                 return ToolOutput::err(
                     "request-release via send_message needs to[0] = the holder pin",
@@ -95,10 +91,8 @@ impl ToolServer {
     )]
     async fn reply_message(&self, Parameters(args): Parameters<ReplyMessageArgs>) -> ToolOutput {
         // Additive optional: CLI `reserve respond` composes this existing tool.
-        if let Some(request_message_id) = args
-            .request_message_id
-            .as_deref()
-            .filter(|s| !s.is_empty())
+        if let Some(request_message_id) =
+            args.request_message_id.as_deref().filter(|s| !s.is_empty())
         {
             let decision = match parse_release_decision(
                 args.release_decision.as_deref().unwrap_or("agreed"),
