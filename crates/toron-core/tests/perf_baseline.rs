@@ -420,7 +420,7 @@ async fn thread_filter_returns_only_target_thread_rows_at_scale() {
             include_bodies: true,
             urgent_only: false,
             since_ts: None,
-            thread_id: Some(target.clone().into()),
+            thread_id: Some(target.clone()),
         })
         .await
         .expect("thread inbox");
