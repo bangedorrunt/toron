@@ -6,6 +6,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+- **herdr protocol v20 conformance (2026-08-20)** — herdr upgraded to 0.8.2
+  (socket protocol 19→20). Wire structs verified field-for-field against the
+  live `herdr api schema --json`: additive only from this client's
+  perspective — no struct changes needed. `HDR_PROTOCOL` 19→20 (successor of
+  bd-4eze's v19 bump); fixture regenerated from the live 0.8.2-preview
+  daemon (`tests/fixtures/herdr-schema-v20.json`, v19 fixture removed); new
+  typed error code `agent_blocked` (protocol v20: `agent.prompt` rejects
+  agents waiting at approval/question dialogs WITHOUT sending — previously
+  flywheel prompts could type into a blocked agent's dialog; classification
+  stays `SendVerdict::Coded`, no respawn/stall semantics). Empirical
+  subscription-shape check: the daemon accepts `type` + dotted event names
+  on `events.subscribe` (its own schema's EventMatch def with `event` +
+  underscores diverges — herdr-side doc bug, client shape confirmed
+  correct). Live round-trip + 27 backend tests + flywheel deps gate green
+  ("herdr protocol: 20 (verified 20)").
 
 - **Catalog pipeline (toron.dev ADR-0002 D3, 2026-08-14)** — `toron catalog`
   emits the machine-readable surface catalog to `docs/catalog/toron-mcp.json`:

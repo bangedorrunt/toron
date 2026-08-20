@@ -1,6 +1,6 @@
 // governed-by: ADR-0003
 // bd-led.6.1: typed backend errors with machine codes.
-// Classification MUST use `code`, never `message` text (herdr protocol v19
+// Classification MUST use `code`, never `message` text (herdr protocol v20
 // discipline — ADR-0003 "classify on code, never message text").
 
 use std::str::FromStr;
@@ -18,6 +18,10 @@ pub enum BackendErrorCode {
     Timeout,
     /// herdr: agent prompt stalled (no response within SLA).
     AgentPromptStalled,
+    /// herdr: agent prompt rejected because the agent is waiting at an
+    /// approval/question dialog — nothing was sent (protocol v20, herdr
+    /// 0.8.2: `agent.prompt` fails fast instead of typing into the dialog).
+    AgentBlocked,
     /// herdr: agent.read/agent.prompt rejected because the agent is not idle
     /// (alt-screen transcript unavailable while working/blocked/unknown).
     AgentNotIdle,
@@ -39,6 +43,7 @@ impl BackendErrorCode {
             BackendErrorCode::Unsupported => "unsupported",
             BackendErrorCode::Timeout => "timeout",
             BackendErrorCode::AgentPromptStalled => "agent_prompt_stalled",
+            BackendErrorCode::AgentBlocked => "agent_blocked",
             BackendErrorCode::AgentNotIdle => "agent_not_idle",
             BackendErrorCode::Connect => "connect",
             BackendErrorCode::Io => "io",
@@ -57,6 +62,7 @@ impl FromStr for BackendErrorCode {
             "unsupported" => BackendErrorCode::Unsupported,
             "timeout" => BackendErrorCode::Timeout,
             "agent_prompt_stalled" => BackendErrorCode::AgentPromptStalled,
+            "agent_blocked" => BackendErrorCode::AgentBlocked,
             "agent_not_idle" => BackendErrorCode::AgentNotIdle,
             "connect" => BackendErrorCode::Connect,
             "io" => BackendErrorCode::Io,
@@ -120,6 +126,17 @@ mod tests {
         assert_eq!(parsed, BackendErrorCode::AgentNotIdle);
         assert_eq!(parsed.as_str(), "agent_not_idle");
         assert_eq!(BackendErrorCode::AgentNotIdle.as_str(), "agent_not_idle");
+    }
+
+    #[test]
+    fn agent_blocked_roundtrips_through_wire_string() {
+        // Protocol v20 (herdr 0.8.2): agent.prompt rejects blocked agents
+        // with `agent_blocked` and sends nothing. Same discipline as
+        // agent_not_idle — typed variant, wire-string round-trip.
+        let parsed: BackendErrorCode = "agent_blocked".parse().expect("mapped");
+        assert_eq!(parsed, BackendErrorCode::AgentBlocked);
+        assert_eq!(parsed.as_str(), "agent_blocked");
+        assert_eq!(BackendErrorCode::AgentBlocked.as_str(), "agent_blocked");
     }
 
     #[test]

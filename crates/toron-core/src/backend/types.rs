@@ -1,6 +1,6 @@
 // governed-by: ADR-0003
 // bd-led.6.1: shared backend types — pane id, agent status, events.
-// Wire contract mirrors herdr protocol v19 (AgentStatus lowercase JSON).
+// Wire contract mirrors herdr protocol v20 (AgentStatus lowercase JSON).
 
 use std::fmt;
 use std::str::FromStr;
@@ -31,7 +31,7 @@ impl fmt::Display for PaneId {
     }
 }
 
-/// Agent lifecycle state (herdr protocol v19 wire values).
+/// Agent lifecycle state (herdr protocol v20 wire values).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AgentStatus {
