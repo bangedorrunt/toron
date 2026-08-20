@@ -186,6 +186,49 @@ Closes `bd-compose-not-durable-oxjy` on the same rail as L1/L3:
 
 **Observability:** run logs record `phase` (and `phase_degraded`) per dispatch; `flywheel runs` (ADR-0005 P6.3) gains a phase column → per-phase cycle time and cost. This is the honest baseline the crew-model rework (bd-42fs) needs for deciding which phases deserve expensive models.
 
+### 3.6 Compose versatility ladder (extends L3/L4; ships with W3 unless noted)
+
+Compose today exposes two part forms (`workflow:name`, `role:stage`) over an
+engine DSL that is far richer (`retry`/`branch`/`foreach`/`parallel`/`delay`/
+`request_approval`, step `guard`, `{{steps.*}}` dataflow). The ladder closes
+that gap so "the catalog doesn't fit" degrades gracefully instead of dead-ending:
+
+| Tier | Capability | Status |
+| :--- | :--- | :--- |
+| T0 | Recombine: parts from catalog workflows + stage library | **shipped** (bd-8xca) |
+| T1 | Full-grammar emission: parts cover the entire `Action` vocabulary — `each:`, `when:`, `retry(n)`, `parallel:` | W3 |
+| T2 | Author from scratch: `workflow compose --from-yaml -` (full `Workflow` from stdin/mail); durable via W3's `engine.invoke` routing | W3 |
+| T3 | Learn + persist: `--keep <name>` graduates a green composed run into the project catalog with provenance (`origin: composed`, `from: <parts>`, `first-run`, `author`) — the hillclimb keep-or-discard pattern lifted to workflow shapes; detect-then-find-existing starts finding previously improvised workflows | W6 |
+| T4 | Delegated composition: any agent mails a compose-request job; the loop composes when `decide` reports no catalog coverage (archetype classification: scout-fanout / verify-fence / debate / hillclimb / review) | W7 |
+
+**Safety envelope (all tiers, rides existing machinery):**
+1. Lint on every compose — fail-stop, extends R-P1..P4; unknown part forms are
+   parse errors, never silently dropped.
+2. Structural dry-run first-class (`compose --dry-run`): resolved graph,
+   fanout counts, guards against sample inputs, phase tags — the hillclimb
+   dry-run rendering generalized.
+3. Budget caps per composed run: max total dispatches, wall-clock, nesting
+   depth; declared blast-radius as reservation globs (audit trail today,
+   enforced the moment bd-reservations-not-projected-5ohc lands).
+4. Durability: T1/T2 compose through `engine.invoke` (W3) — improvisation is
+   a checkpointed run; `on_failure: bead` files the failure.
+5. Provenance: every composed run records base, parts, author, dry-run hash.
+
+**Explicitly rejected: mutating a live run.** Mid-run step editing breaks
+Resonate replay determinism (a checkpoint must resume to the same future).
+Adaptation is expressed AS composition (`retry` + observe→`branch`), and a
+genuinely-wrong run is aborted → compose v2 seeded from v1's final state
+(base-seed mechanism) → run v2, with run lineage linking them.
+
+### 3.7 Learning and delegation (post-acceptance waves)
+
+W6 (persist/lifecycle): `--keep` writes `.flywheel/workflows/<name>.yaml`
+with provenance; graduation requires one completed green live run (never a
+dry-run) + full lint; the catalog resolver picks it up like any entry.
+W7 (delegation): compose-request as a job spec shape; loop-side composition
+gated on decide's coverage report; initially behind a contact/policy
+allowlist so a buggy crewmate cannot improvise unbounded dispatch.
+
 ---
 
 ## 4. Phase semantics — the contract (normative)
@@ -231,10 +274,10 @@ Rules:
 - **Tests:** registry table test per harness; `degraded` contract test; preflight probe test with a fake harness binary.
 - **Gate:** a live 2-agent swarm where a `phase: plan` dispatch reaches the harness with the registry args observable in the pane (herdr `agent read` evidence); `flywheel deps` prints the phase-registry line.
 
-### Wave 3 — compose → engine + phase built-ins (closes bd-compose-not-durable-oxjy, bd-dispatch-spec-untyped-0iud consumers)
-- **Target:** `flywheel/src/crew.rs` (compose --run routes to `engine.invoke`; `parse_compose_part` phase resolution), `flywheel/src/builtin_workflows.rs` (resolve/plan/implement/review/ship), `flywheel/src/stages.rs` (stage `phase` field), `flywheel/src/cron.rs` (`cron run --live`).
-- **Tests:** composed run executes as engine run (run id exists in runs board); `on_failure: bead` creates a bead on a forced-failure composed run; crash-resume equivalence (kill -9 mid composed run → restart → completes; mirror `scripts/e2e-hardened-loop.sh` scenario 2); `ship` chain dry-run renders the expected 5-link graph.
-- **Gate:** live: compose a 2-step workflow, run via engine, kill flywheel mid-run, restart, run completes; catalog + composed + cron all appear in `flywheel runs`.
+### Wave 3 — compose → engine + phase built-ins + ladder T1/T2 (closes bd-compose-not-durable-oxjy, bd-dispatch-spec-untyped-0iud consumers)
+- **Target:** `flywheel/src/crew.rs` (compose --run routes to `engine.invoke`; `parse_compose_part` phase + Tier-1 grammar resolution: `each:`/`when:`/`retry(n)`/`parallel:`), `flywheel/src/builtin_workflows.rs` (resolve/plan/implement/review/ship), `flywheel/src/stages.rs` (stage `phase` field), `flywheel/src/cron.rs` (`cron run --live`), compose `--from-yaml -` + `--dry-run` first-class (Tier 2 + §3.6 envelope).
+- **Tests:** composed run executes as engine run (run id exists in runs board); `on_failure: bead` creates a bead on a forced-failure composed run; crash-resume equivalence (kill -9 mid composed run → restart → completes; mirror `scripts/e2e-hardened-loop.sh` scenario 2); `ship` chain dry-run renders the expected 5-link graph; Tier-1 grammar parse table (every part form → expected Action); `--from-yaml` round-trip (author → lint → dry-run → run); dry-run renders fanout counts + phase tags; budget caps enforced (a composed workflow exceeding max dispatches fails closed at lint).
+- **Gate:** live: compose a 2-step workflow, run via engine, kill flywheel mid-run, restart, run completes; catalog + composed + cron all appear in `flywheel runs`; one Tier-1 `each:` compose executed live.
 
 ### Wave 4 — steer migration + enforcement flip groundwork
 - **Target:** `flywheel/src/main.rs` `cmd_steer` (build via compose, invoke), run-log `phase`/`phase_degraded` fields, `flywheel runs` phase column.
@@ -243,6 +286,16 @@ Rules:
 
 ### Wave 5 — enforcement flip (separate bead, only after W3+W4 live evidence)
 - Blocking phase gates per §3.5. One-line default change + gate tests. Requires: one live swarm completing a full `ship` chain with zero phase-gate false positives.
+
+### Wave 6 — persist/lifecycle (§3.7 T3)
+- **Target:** `flywheel/src/crew.rs` + catalog resolver (`--keep <name>` → `.flywheel/workflows/<name>.yaml` with provenance), `workflow new` path unification.
+- **Tests:** keep-after-green writes catalog entry the resolver finds; keep-without-green-run refuses; provenance fields present; promote path (`workflow new`) and `--keep` produce identical lint outcomes.
+- **Gate:** live: compose → run green → keep → `flywheel workflow list` shows it → a later `decide` find-existing arm selects it.
+
+### Wave 7 — delegated composition (§3.7 T4)
+- **Target:** compose-request job spec shape (toron-workflow), loop-side coverage report in `decide`, contact/policy allowlist gate.
+- **Tests:** delegated compose honors the allowlist (deny case never dispatches); decide coverage miss → compose candidate rendered for approval (not auto-run in W7).
+- **Gate:** live: one agent-composed workflow via mail request, allowlisted, linted, run through the engine.
 
 **Post-acceptance:** each wave becomes a bead spawned from this ADR (existing: W1↔`bd-dispatch-spec-untyped-0iud`, W3↔`bd-compose-not-durable-oxjy`, cron↔`bd-cron-run-no-live-u9tg`). governed-by: ADR-0022 markers required on every Target file per `docs/decisions/_scripts/verify-adr-links.sh`.
 
@@ -275,7 +328,10 @@ Rules:
 - [ ] W3: composed `--run` produces an engine run id; kill -9 mid-run → restart → completes (crash-resume equivalence).
 - [ ] W3: forced-failure composed run with `on_failure: bead` creates the bead.
 - [ ] W3: `ship` dry-run renders the 5-link chain; `cron run --live` executes for real once.
+- [ ] W3 ladder: Tier-1 grammar parse table green; `--from-yaml` round-trip green; dry-run renders fanouts + phase tags; budget caps fail closed.
 - [ ] W4: `steer --direct` completes as an engine run with phase-tagged steps in `flywheel runs`.
+- [ ] W6: keep-after-green lands in catalog and a later decide find-existing selects it; keep-without-green-run refuses.
+- [ ] W7: one agent-composed workflow via mail request, allowlisted, runs through the engine.
 - [ ] All Target files carry `governed-by: ADR-0022`; `bash docs/decisions/_scripts/verify-adr-links.sh` green.
 - [ ] `bash scripts/verify-gates.sh` green (toron) and flywheel clippy/test gates green.
 - [ ] ADR-0005 Spec 2 amended with a pointer to §3.1; README index row added.
