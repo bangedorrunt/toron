@@ -309,10 +309,10 @@ impl ComposeRequestSpec {
         if parsed.objective.trim().is_empty() {
             return Err("compose-request: objective must be non-empty".to_string());
         }
-        if let Some(parts) = &parsed.parts {
-            if parts.iter().any(|p| p.trim().is_empty()) {
-                return Err("compose-request: parts must be non-empty tokens".to_string());
-            }
+        if let Some(parts) = &parsed.parts
+            && parts.iter().any(|p| p.trim().is_empty())
+        {
+            return Err("compose-request: parts must be non-empty tokens".to_string());
         }
         Ok(parsed)
     }
@@ -340,7 +340,8 @@ mod tests {
         let parent =
             EventId::from_hex("b32828720d7e8a80dd5165a6cd31b2c70e8d25b83c387209cb138e77d7e7e05b")
                 .expect("id");
-        let payload = JobRequest::new("fix flaky", serde_json::json!({"task": "triage"}));        let ev =
+        let payload = JobRequest::new("fix flaky", serde_json::json!({"task": "triage"}));
+        let ev =
             build_job_request(&requester, parent, &payload, Timestamp::from(TS)).expect("build");
         assert_eq!(ev.kind.as_u16(), JOB_REQUEST);
         assert_eq!(job_parent(&ev), Some(parent), "e tag links parent");

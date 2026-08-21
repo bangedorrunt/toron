@@ -999,6 +999,17 @@ fn build_bcc_rumor(
 /// still sends, just without that tag. This matches AM-Rust's tolerant
 /// handling of optional metadata.
 fn add_message_tags(tags: &mut Vec<Tag>, args: &SendMessage) {
+    // G7 precise timeline: `created_at` is second-granular (nostr
+    // Timestamp), so same-second messages were indistinguishable to the
+    // projection timeline and `since_ts` strict-newer filtering excluded
+    // post-bound mail (found live: am_parity_e2e since_ts conformance,
+    // 2026-08-21 post-wave review). Stamp the µs tag the readers already
+    // honor (unwrap.rs `ts_ms_tag` documents the VALUE as µs despite the
+    // historical name; projection.rs `rumor_timestamp_us` returns it).
+    let now_us = crate::index::writer::Clock::now_us(&crate::index::writer::SystemClock);
+    if let Ok(t) = Tag::parse(["ts_ms", &now_us.to_string()]) {
+        tags.push(t);
+    }
     if !args.subject.is_empty()
         && let Ok(t) = Tag::parse(["subject", &args.subject])
     {
