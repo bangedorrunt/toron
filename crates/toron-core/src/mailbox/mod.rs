@@ -101,6 +101,19 @@ pub struct Mailbox {
     /// `message_posted` triggers). When set, [`TriggerNotifySink`] wraps the
     /// projection sink.
     trigger_tx: Option<tokio::sync::mpsc::UnboundedSender<UnwrappedMail>>,
+
+    /// bd-py9o: memoized gift-wrap unwraps keyed by
+    /// `"{recipient_hex}/{wrap_id_hex}"`. `fetch_inbox` previously ran the
+    /// ECDH+decrypt per stored wrap on EVERY poll — the daemon burned a core
+    /// re-decrypting the same history for fleet polling. Same key + same
+    /// ciphertext = same outcome, so negative results cache too. Bounded by
+    /// the store cap; entries are pure functions of (key, wrap).
+    unwrap_cache:
+        Arc<parking_lot::Mutex<HashMap<String, Option<crate::mailbox::unwrap::UnwrappedMail>>>>,
+    /// Test/metrics observable: memo hits in [`Self::cached_unwrap`].
+    unwrap_cache_hits: Arc<AtomicU64>,
+    /// Test/metrics observable: cold decrypts in [`Self::cached_unwrap`].
+    unwrap_cache_misses: Arc<AtomicU64>,
 }
 
 /// A decrypted agent key plus the exact ncryptsec content it was derived
@@ -144,7 +157,68 @@ impl Mailbox {
                 .clone(),
             kdf_loads: Arc::new(AtomicU64::new(0)),
             trigger_tx: None,
+            unwrap_cache: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            unwrap_cache_hits: Arc::new(AtomicU64::new(0)),
+            unwrap_cache_misses: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// bd-py9o: decrypt a gift wrap through the per-(recipient, event) memo.
+    /// Cold results (including decryption failures — same key and ciphertext
+    /// cannot succeed on retry within a process) are cached; hits skip the
+    /// secp256k1 ECDH + AES decrypt entirely. Counters are test observables
+    /// for the incremental-fetch gate.
+    pub(crate) fn cached_unwrap(
+        &self,
+        agent_keys: &nostr_sdk::nostr::Keys,
+        wrap: &nostr_sdk::nostr::Event,
+        recipient: nostr_sdk::nostr::PublicKey,
+    ) -> Option<crate::mailbox::unwrap::UnwrappedMail> {
+        use crate::mailbox::unwrap::UnwrappedMail;
+        let key = format!("{}/{}", recipient.to_hex(), wrap.id.to_hex());
+        if let Some(cached) = self.unwrap_cache.lock().get(&key) {
+            self.unwrap_cache_hits
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return cached.clone();
+        }
+        self.unwrap_cache_misses
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let built = match crate::nostr::gift_wrap::unwrap(agent_keys, wrap) {
+            Ok(gift) => {
+                let rumor = gift.rumor;
+                Some(UnwrappedMail {
+                    recipient,
+                    sender: gift.sender,
+                    rumor_id: rumor.clone().id(),
+                    wrap_event_id: wrap.id,
+                    created_at: rumor.created_at,
+                    rumor,
+                })
+            }
+            Err(_) => None,
+        };
+        // Bound the memo; clear wholesale on overflow (a memo, not truth).
+        {
+            const UNWRAP_CACHE_CAP: usize = 10_000;
+            let mut cache = self.unwrap_cache.lock();
+            if cache.len() >= UNWRAP_CACHE_CAP {
+                cache.clear();
+            }
+            cache.insert(key, built.clone());
+        }
+        built
+    }
+
+    /// Memo hits since process start (test/metrics observable, bd-py9o).
+    pub fn unwrap_cache_hits(&self) -> u64 {
+        self.unwrap_cache_hits
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Cold decrypts since process start (test/metrics observable, bd-py9o).
+    pub fn unwrap_cache_misses(&self) -> u64 {
+        self.unwrap_cache_misses
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Attach a post-unwrap trigger notify channel (ADR-0007 R3).

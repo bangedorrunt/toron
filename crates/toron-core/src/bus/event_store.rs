@@ -14,6 +14,8 @@
 
 use sqlx::Row;
 use sqlx::SqlitePool;
+use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use nostr_sdk::nostr::{Alphabet, Event, JsonUtil, SingleLetterTag, TagKind, Timestamp};
@@ -22,11 +24,24 @@ use nostr_sdk::nostr::{Alphabet, Event, JsonUtil, SingleLetterTag, TagKind, Time
 /// pruned (bounded bus, permanent Git content — ADR-0003 superiority row).
 pub const MAX_STORED_EVENTS: i64 = 100_000;
 
+/// bd-py9o: entry cap for the hot parse memo. The store caps at
+/// MAX_STORED_EVENTS rows; when the memo exceeds this it clears wholesale —
+/// a memo, never the source of truth, so the worst case after a clear is one
+/// cold re-parse per row on the next replay.
+const HOT_CACHE_CAP: usize = 10_000;
+
 /// bd-replay-tag-pushdown-lurm: rows parsed in `replay()` (test-only
 /// instrumented counter; the acceptance gate asserts the SQL prefilter
 /// shrinks the parsed set to the matched rows).
 #[cfg(test)]
-static PARSED_ROWS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+pub(crate) static PARSED_ROWS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// bd-py9o: rows hydrated from the hot memo in `replay()` (test-only; the
+/// incremental-replay gate asserts a second identical replay parses ZERO
+/// rows and hits the memo for every row).
+#[cfg(test)]
+pub(crate) static HOT_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// The bus event table DDL (idempotent).
 pub const EVENT_TABLE_DDL: &str = "
@@ -63,6 +78,14 @@ CREATE INDEX IF NOT EXISTS bus_event_tags_kind_value ON bus_event_tags (tag_kind
 #[derive(Clone)]
 pub struct BusEventStore {
     pub(crate) pool: SqlitePool,
+    /// bd-py9o: hot memo of parsed events (`event_id -> Event`), shared
+    /// across clones. `replay()` hydrates from it instead of re-running
+    /// serde_json over every matching row on every subscribe — fleet polling
+    /// replays identical filters every few seconds, and re-parsing the whole
+    /// history each time pinned the daemon's cores. A memo only: SQL remains
+    /// the source of truth (only ids returned by SQL are ever surfaced, and
+    /// `match_event` still gates every hydrated row).
+    hot: Arc<parking_lot::Mutex<HashMap<String, Arc<Event>>>>,
 }
 
 impl BusEventStore {
@@ -71,7 +94,19 @@ impl BusEventStore {
         sqlx::raw_sql(EVENT_TABLE_DDL).execute(&pool).await?;
         sqlx::raw_sql(EVENT_TAG_TABLE_DDL).execute(&pool).await?;
         Self::backfill_tag_index(&pool).await?;
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            hot: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+        })
+    }
+
+    /// Memoize a freshly stored event (bd-py9o). Clears wholesale at the cap.
+    fn hot_put(&self, event: &Event) {
+        let mut hot = self.hot.lock();
+        if hot.len() >= HOT_CACHE_CAP {
+            hot.clear();
+        }
+        hot.insert(event.id.to_hex(), Arc::new(event.clone()));
     }
 
     /// One-time backfill of the p/e tag index from stored raw_json. Guarded
@@ -159,6 +194,9 @@ impl BusEventStore {
         tx.commit().await?;
 
         // ON CONFLICT DO NOTHING reports 0 affected rows for duplicates.
+        if result.rows_affected() == 1 {
+            self.hot_put(event);
+        }
         Ok(result.rows_affected() == 1)
     }
 
@@ -172,7 +210,23 @@ impl BusEventStore {
     pub async fn insert_addressable(&self, event: &Event) -> anyhow::Result<bool> {
         use crate::bus::AddressableKey;
         if let Some(key) = AddressableKey::from_event(event) {
-            // Delete the author's prior event at the same coordinate.
+            // Evict the superseded events from the hot memo BEFORE the delete
+            // (bd-py9o: stale memo entries must never outlive their rows).
+            let superseded: Vec<(String,)> = sqlx::query_as(
+                "SELECT event_id FROM bus_events WHERE kind = ?1 AND author = ?2 AND d_tag = ?3",
+            )
+            .bind(key.kind as i64)
+            .bind(&key.pubkey)
+            .bind(&key.d)
+            .fetch_all(&self.pool)
+            .await
+            .unwrap_or_default();
+            if !superseded.is_empty() {
+                let mut hot = self.hot.lock();
+                for (id,) in &superseded {
+                    hot.remove(id);
+                }
+            }
             sqlx::query("DELETE FROM bus_events WHERE kind = ?1 AND author = ?2 AND d_tag = ?3")
                 .bind(key.kind as i64)
                 .bind(&key.pubkey)
@@ -287,17 +341,17 @@ impl BusEventStore {
             String::new()
         };
         let inner = format!(
-            "SELECT raw_json, created_at, event_id FROM bus_events
+            "SELECT event_id, created_at FROM bus_events
              WHERE {}
              ORDER BY created_at DESC, event_id DESC{limit_clause}",
             preds.join("\n               AND ")
         );
         let sql = format!(
-            "SELECT raw_json FROM ({inner})
+            "SELECT event_id FROM ({inner})
              ORDER BY created_at ASC, event_id ASC"
         );
 
-        let mut q = sqlx::query(&sql).bind(Timestamp::now().as_secs() as i64);
+        let mut q = sqlx::query_as::<_, (String,)>(&sql).bind(Timestamp::now().as_secs() as i64);
         for b in kinds_binds {
             q = q.bind(b);
         }
@@ -310,17 +364,62 @@ impl BusEventStore {
         if sql_exact {
             q = q.bind(limit as i64);
         }
-        let rows = q.fetch_all(&self.pool).await?;
+        // bd-py9o: phase 1 selects ids only. Phase 2 hydrates — hot memo hits
+        // skip the raw_json transfer AND the serde parse entirely; only rows
+        // this process has never parsed are fetched and parsed (once). SQL
+        // stays the source of truth; `match_event` still gates every row.
+        let id_rows: Vec<(String,)> = q.fetch_all(&self.pool).await?;
+        let ids: Vec<String> = id_rows.into_iter().map(|(id,)| id).collect();
 
-        let mut out: Vec<Event> = Vec::with_capacity(rows.len());
-        for row in rows {
-            let raw: String = Row::get(&row, 0);
-            #[cfg(test)]
-            PARSED_ROWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if let Ok(ev) = Event::from_json(&raw)
-                && filter.match_event(&ev, Default::default())
+        let mut resolved: HashMap<String, Event> = HashMap::with_capacity(ids.len());
+        let mut cold_ids: Vec<String> = Vec::new();
+        {
+            let hot = self.hot.lock();
+            for id in &ids {
+                match hot.get(id) {
+                    Some(ev) => {
+                        #[cfg(test)]
+                        HOT_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        resolved.insert(id.clone(), ev.as_ref().clone());
+                    }
+                    None => cold_ids.push(id.clone()),
+                }
+            }
+        }
+        for chunk in cold_ids.chunks(500) {
+            let placeholders: Vec<String> = (1..=chunk.len()).map(|i| format!("?{i}")).collect();
+            let sql = format!(
+                "SELECT event_id, raw_json FROM bus_events WHERE event_id IN ({})",
+                placeholders.join(",")
+            );
+            let mut q = sqlx::query_as::<_, (String, String)>(&sql);
+            for id in chunk {
+                q = q.bind(id);
+            }
+            let rows = q.fetch_all(&self.pool).await?;
+            if rows.is_empty() {
+                continue;
+            }
+            let mut hot = self.hot.lock();
+            for (id, raw) in rows {
+                #[cfg(test)]
+                PARSED_ROWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if let Ok(ev) = Event::from_json(&raw) {
+                    if hot.len() >= HOT_CACHE_CAP {
+                        hot.clear();
+                    }
+                    hot.insert(id.clone(), Arc::new(ev.clone()));
+                    resolved.insert(id, ev);
+                }
+            }
+        }
+
+        let mut out: Vec<Event> = Vec::with_capacity(ids.len());
+        for id in &ids {
+            if let Some(ev) = resolved.get(id)
+                && filter.match_event(ev, Default::default())
             {
-                out.push(ev);
+                out.push(ev.clone());
             }
         }
         if !sql_exact && out.len() > limit {
@@ -360,6 +459,10 @@ impl BusEventStore {
         )
         .execute(&self.pool)
         .await?;
+        // bd-py9o: drop memo entries wholesale — SQL is the source of truth,
+        // and this keeps hot memory from drifting past the live row set.
+        // Next replay repopulates incrementally (cold parse per new id only).
+        self.hot.lock().clear();
         Ok(())
     }
 
@@ -422,6 +525,78 @@ mod tests {
 
         let wrong = crate::bus::project_filter("other");
         assert!(store.replay(&wrong).await.expect("replay").is_empty());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// bd-py9o acceptance gate: a SECOND identical replay must parse zero
+    /// rows — every row hydrates from the hot memo (and a warm instance,
+    /// whose inserts memoized as they arrived, parses nothing at all).
+    /// Only genuinely unseen rows may ever be parsed.
+    #[tokio::test]
+    async fn test_replay_second_identical_call_parses_zero_rows_bd_py9o() {
+        use std::sync::atomic::Ordering;
+        let (store, pool, path) = temp_store().await;
+        for i in 0..5 {
+            let ev = sample_event(&Keys::generate(), &format!("e{i}"));
+            store.insert(&ev).await.expect("insert");
+        }
+        let filter = crate::bus::project_filter("demo");
+
+        // Warm instance: inserts memoized each event on arrival.
+        let w1 = store.replay(&filter).await.expect("warm replay 1");
+        assert_eq!(w1.len(), 5);
+        let p_warm = PARSED_ROWS.load(Ordering::Relaxed);
+        let h_warm = HOT_HITS.load(Ordering::Relaxed);
+        let w2 = store.replay(&filter).await.expect("warm replay 2");
+        assert_eq!(w2.len(), 5);
+        assert_eq!(
+            PARSED_ROWS.load(Ordering::Relaxed),
+            p_warm,
+            "a warm replay parses NOTHING"
+        );
+        assert_eq!(
+            HOT_HITS.load(Ordering::Relaxed) - h_warm,
+            5,
+            "the second warm replay served every row from the memo"
+        );
+
+        // Cold instance over the same pool (the daemon-restart shape): the
+        // first replay pays one parse per row; the second pays ZERO.
+        let cold = BusEventStore::new(pool.clone()).await.expect("cold store");
+        let c1 = cold.replay(&filter).await.expect("cold replay 1");
+        assert_eq!(c1.len(), 5);
+        let p_cold = PARSED_ROWS.load(Ordering::Relaxed);
+        assert!(
+            p_cold >= p_warm + 5,
+            "cold first replay parses every row from SQL"
+        );
+        let c2 = cold.replay(&filter).await.expect("cold replay 2");
+        assert_eq!(c2.len(), 5);
+        assert_eq!(
+            c2.iter().map(|e| e.id.to_hex()).collect::<Vec<_>>(),
+            c1.iter().map(|e| e.id.to_hex()).collect::<Vec<_>>(),
+            "identical envelope order across replays"
+        );
+        assert_eq!(
+            PARSED_ROWS.load(Ordering::Relaxed),
+            p_cold,
+            "SECOND identical replay must parse ZERO rows (bd-py9o)"
+        );
+
+        // A row inserted by ANOTHER process instance (daemon-restart shape)
+        // is cold here: parsed exactly once, then memoized.
+        let other = BusEventStore::new(pool.clone()).await.expect("other store");
+        other
+            .insert(&sample_event(&Keys::generate(), "fresh"))
+            .await
+            .expect("insert fresh");
+        let c3 = cold.replay(&filter).await.expect("cold replay 3");
+        assert_eq!(c3.len(), 6);
+        assert_eq!(
+            PARSED_ROWS.load(Ordering::Relaxed),
+            p_cold + 1,
+            "only the new row may be parsed"
+        );
         let _ = std::fs::remove_file(&path);
     }
 
