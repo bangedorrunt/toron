@@ -1,4 +1,5 @@
 // governed-by: ADR-0019
+// governed-by: ADR-0022
 #![forbid(unsafe_code)]
 
 //! ADR-0019 wave-2 structural playbook lints (bd-w2-lints-6k6l).
@@ -92,6 +93,7 @@ fn shape_of(name: &str) -> Option<PlaybookShape> {
 /// canonical-name registry supplied by the embedding.
 pub fn lint_playbook(report: &mut LintReport, wf: &Workflow, principle_names: &[&str]) {
     lint_principles(report, wf, principle_names);
+    lint_phase_rules(report, wf);
 
     let Some(shape) = shape_of(&wf.name) else {
         return; // Non-playbook workflows carry no structural constraint.
@@ -101,6 +103,120 @@ pub fn lint_playbook(report: &mut LintReport, wf: &Workflow, principle_names: &[
         PlaybookShape::BugFix => lint_bug_fix(report, wf),
         PlaybookShape::Prototype | PlaybookShape::Arena => lint_prototype_arena(report, wf),
         PlaybookShape::Forensics => lint_forensics(report, wf),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ADR-0022 §3.5 phase gates (R-P1..R-P4)
+// ---------------------------------------------------------------------------
+
+/// ADR-0022 §3.5 Layer 5 phase gates. Phase-scoped, NOT playbook-shape
+/// scoped: they fire on any workflow whose `dispatch_job` specs carry a
+/// `phase` (built-ins included). Specs without a phase stay unconstrained.
+fn lint_phase_rules(report: &mut LintReport, wf: &Workflow) {
+    let has_data_shape_input = wf.inputs.iter().any(|i| i.name == "data_shape");
+    for step in &wf.steps {
+        for s in step_or_nested(step) {
+            lint_phase_step(report, s, has_data_shape_input);
+        }
+    }
+}
+
+/// Spec keys claimed by the ADR-0022 phase vocabulary, staged in `extra`
+/// until their graduation wave (§3.1: keys graduate via a schema-rs change;
+/// §3.3 already dispatches `prompt:` through the headless `extra` fallback).
+/// R-P1 does not warn on these — the phase gates consume them.
+const PHASE_CARRIER_KEYS: [&str; 3] = ["prompt", "acceptance", "n"];
+
+fn lint_phase_step(report: &mut LintReport, step: &Step, has_data_shape_input: bool) {
+    let Action::DispatchJob { assignee, spec, .. } = &step.action else {
+        return;
+    };
+
+    // R-P1 — the graduation valve stays loud: unknown extra fields warn,
+    // naming the field (ADR-0022 §3.1: extra is a staging area, not a shim).
+    for key in spec.extra.keys() {
+        if PHASE_CARRIER_KEYS.contains(&key.as_str()) {
+            continue;
+        }
+        warning(
+            report,
+            format!(
+                "dispatch_job spec has unknown extra field {key:?} — graduate it to a named \
+                 DispatchSpec field via a schema change or remove it (ADR-0022 §3.1/§3.5 R-P1)"
+            ),
+        );
+    }
+
+    let Some(phase) = spec.phase.as_deref() else {
+        return; // Unphased dispatches are not gated.
+    };
+
+    match phase {
+        "implement" => {
+            // R-P2 — implement carries its acceptance command (extends the
+            // bug-fix repro rule family: evidence over claims).
+            let has_acceptance = spec
+                .extra
+                .get("acceptance")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|v| !v.trim().is_empty());
+            if !has_acceptance {
+                error(
+                    report,
+                    "phase: implement dispatch must carry an acceptance command — declare \
+                     `acceptance: <gate command>` on the spec; the bead's gate exit 0 is the \
+                     completion evidence (ADR-0022 §4/§3.5 R-P2)"
+                        .to_string(),
+                );
+            }
+        }
+        "review" => {
+            // R-P3 — review fan-outs declare n >= 2 statically (extends the
+            // prototype/arena n rule).
+            match spec.extra.get("n").and_then(parse_u64) {
+                Some(n) if n >= 2 => {}
+                other => error(
+                    report,
+                    format!(
+                        "phase: review fan-out must declare n >= 2 statically — got {}; put \
+                         `n: <count>` on the spec (ADR-0022 §3.5 R-P3)",
+                        other.map_or("nothing".to_string(), |n| n.to_string())
+                    ),
+                ),
+            }
+        }
+        "plan" => {
+            // R-P4 — plan declares inputs.data_shape and rides a planner role.
+            let references_data_shape = spec
+                .string_values()
+                .iter()
+                .any(|v| v.contains("{{inputs.data_shape}}"));
+            if !has_data_shape_input && !references_data_shape {
+                error(
+                    report,
+                    "phase: plan requires declared run input `data_shape` — add \
+                     `inputs: [{name: data_shape}]` or reference {{inputs.data_shape}} in the \
+                     spec (ADR-0022 §3.5 R-P4)"
+                        .to_string(),
+                );
+            }
+            let planner_role = assignee.contains("planner")
+                || spec
+                    .profile
+                    .as_deref()
+                    .is_some_and(|p| p.contains("planner"));
+            if !planner_role {
+                error(
+                    report,
+                    format!(
+                        "phase: plan must dispatch to a planner-role profile — assignee \
+                         {assignee:?} is not a planner role (ADR-0022 §3.5 R-P4)"
+                    ),
+                );
+            }
+        }
+        _ => {}
     }
 }
 
@@ -685,6 +801,268 @@ steps:
         assert!(
             report.is_clean(),
             "goal must not be constrained: {:?}",
+            report.issues
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // ADR-0022 §3.5 phase gates R-P1..R-P4 (bd-adr22-phase-enum-lint-ahfh)
+    // -------------------------------------------------------------------
+
+    /// R-P1: unknown extra fields on a dispatch_job spec warn, naming the
+    /// field — the graduation valve must stay loud (ADR-0022 §3.1/§3.5).
+    #[test]
+    fn rp1_unknown_spec_extra_field_warns_naming_it() {
+        let yaml = r#"
+name: ship-chain
+steps:
+  - name: build
+    action: dispatch_job
+    assignee: "@crew.coder"
+    spec: { phase: implement, prompt: "build", acceptance: "cargo test", frobnicate: true }
+"#;
+        let report = lint_yaml(yaml).unwrap();
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|i| i.level == Level::Warning && i.message.contains("frobnicate")),
+            "expected a warning naming `frobnicate`: {:?}",
+            report.issues
+        );
+    }
+
+    #[test]
+    fn rp1_known_fields_and_phase_carriers_do_not_warn() {
+        let yaml = r#"
+name: ship-chain
+steps:
+  - name: build
+    action: dispatch_job
+    assignee: "@crew.coder"
+    spec:
+      phase: implement
+      prompt: "build {{inputs.data_shape}}"
+      acceptance: "cargo test -p toron-workflow"
+      harness: opencode
+"#;
+        let report = lint_yaml(yaml).unwrap();
+        assert!(
+            !report
+                .issues
+                .iter()
+                .any(|i| i.message.contains("extra field")),
+            "known + carrier fields must not warn: {:?}",
+            report.issues
+        );
+    }
+
+    /// R-P2: phase=implement dispatches carry an acceptance command.
+    #[test]
+    fn rp2_implement_without_acceptance_is_error() {
+        let yaml = r#"
+name: ship-chain
+steps:
+  - name: build
+    action: dispatch_job
+    assignee: "@crew.coder"
+    spec: { phase: implement, prompt: "build" }
+"#;
+        let report = lint_yaml(yaml).unwrap();
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|i| i.level == Level::Error && i.message.contains("acceptance")),
+            "implement without acceptance must error: {:?}",
+            report.issues
+        );
+    }
+
+    #[test]
+    fn rp2_implement_with_acceptance_is_clean() {
+        let yaml = r#"
+name: ship-chain
+steps:
+  - name: build
+    action: dispatch_job
+    assignee: "@crew.coder"
+    spec: { phase: implement, prompt: "build", acceptance: "cargo test" }
+"#;
+        let report = lint_yaml(yaml).unwrap();
+        assert!(
+            !report
+                .issues
+                .iter()
+                .any(|i| i.message.contains("acceptance")),
+            "implement with acceptance must not flag acceptance: {:?}",
+            report.issues
+        );
+    }
+
+    /// R-P3: review fan-outs declare n >= 2 statically (arena rule family).
+    #[test]
+    fn rp3_review_requires_declared_n_ge_2() {
+        for spec in [
+            "{ phase: review, prompt: \"r\" }",
+            "{ phase: review, prompt: \"r\", n: 1 }",
+        ] {
+            let yaml = format!(
+                r#"
+name: ship-chain
+steps:
+  - name: review
+    action: dispatch_job
+    assignee: "@crew.reviewer"
+    spec: {spec}
+"#
+            );
+            let report = lint_yaml(&yaml).unwrap();
+            assert!(
+                report
+                    .issues
+                    .iter()
+                    .any(|i| i.level == Level::Error && i.message.contains("n >= 2")),
+                "review spec {spec} must error on n >= 2: {:?}",
+                report.issues
+            );
+        }
+    }
+
+    #[test]
+    fn rp3_review_with_n_2_is_clean() {
+        let yaml = r#"
+name: ship-chain
+steps:
+  - name: review
+    action: dispatch_job
+    assignee: "@crew.reviewer"
+    spec: { phase: review, prompt: "review", n: 2 }
+"#;
+        let report = lint_yaml(yaml).unwrap();
+        assert!(
+            !report.issues.iter().any(|i| i.message.contains("n >= 2")),
+            "review with n=2 must not flag fan-out: {:?}",
+            report.issues
+        );
+    }
+
+    /// R-P4: plan phases declare inputs.data_shape and ride a planner role.
+    #[test]
+    fn rp4_plan_requires_data_shape_input() {
+        let yaml = r#"
+name: ship-chain
+inputs: [{name: goal}]
+steps:
+  - name: plan
+    action: dispatch_job
+    assignee: "@crew.planner"
+    spec: { phase: plan, prompt: "{{inputs.goal}}" }
+"#;
+        let report = lint_yaml(yaml).unwrap();
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|i| i.level == Level::Error && i.message.contains("data_shape")),
+            "plan without data_shape input must error: {:?}",
+            report.issues
+        );
+    }
+
+    #[test]
+    fn rp4_plan_requires_planner_role_dispatch() {
+        let yaml = r#"
+name: ship-chain
+inputs: [{name: data_shape}]
+steps:
+  - name: plan
+    action: dispatch_job
+    assignee: "@crew.coder"
+    spec: { phase: plan, prompt: "{{inputs.data_shape}}" }
+"#;
+        let report = lint_yaml(yaml).unwrap();
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|i| i.level == Level::Error && i.message.contains("planner")),
+            "plan dispatched to a non-planner role must error: {:?}",
+            report.issues
+        );
+    }
+
+    #[test]
+    fn rp4_plan_fully_conformed_is_clean() {
+        let yaml = r#"
+name: ship-chain
+inputs: [{name: data_shape}]
+steps:
+  - name: plan
+    action: dispatch_job
+    assignee: "@crew.planner"
+    spec: { phase: plan, prompt: "decompose {{inputs.data_shape}}" }
+"#;
+        let report = lint_yaml(yaml).unwrap();
+        assert!(
+            report.is_clean(),
+            "conformed plan step must be clean: {:?}",
+            report.issues
+        );
+    }
+
+    /// Phase gates are phase-scoped, not playbook-shape-scoped: they fire on
+    /// any workflow whose dispatches carry `phase` (built-ins included).
+    #[test]
+    fn phase_rules_fire_outside_canonical_playbook_shapes() {
+        let yaml = r#"
+name: totally-custom-pipeline
+steps:
+  - name: rev
+    action: dispatch_job
+    assignee: "@crew.reviewer"
+    spec: { phase: review, prompt: "review" }
+"#;
+        let report = lint_yaml(yaml).unwrap();
+        assert!(
+            report.issues.iter().any(|i| i.level == Level::Error),
+            "phase gate must fire on non-playbook shapes: {:?}",
+            report.issues
+        );
+    }
+
+    /// The vocabulary is closed (ADR-0022 §4): an unknown phase value is a
+    /// parse error surfaced at lint time, never a silent degrade.
+    #[test]
+    fn unknown_phase_value_fails_parse_at_lint_time() {
+        let yaml = r#"
+name: ship-chain
+steps:
+  - name: s
+    action: dispatch_job
+    assignee: x
+    spec: { phase: shipp, prompt: "x" }
+"#;
+        let err = lint_yaml(yaml).expect_err("unknown phase must fail parse");
+        assert!(err.contains("unknown variant"), "{err}");
+    }
+
+    /// Specs WITHOUT a phase stay unconstrained by the phase gates.
+    #[test]
+    fn unphased_dispatch_is_not_gated() {
+        let yaml = r#"
+name: totally-custom-pipeline
+steps:
+  - name: d
+    action: dispatch_job
+    assignee: someone
+    spec: { task: "ad hoc", mystery_knob: 3 }
+"#;
+        let report = lint_yaml(yaml).unwrap();
+        // R-P1 still applies (extra-field warning), but no phase errors.
+        assert!(
+            !report.issues.iter().any(|i| i.level == Level::Error),
+            "unphased specs get no phase errors: {:?}",
             report.issues
         );
     }

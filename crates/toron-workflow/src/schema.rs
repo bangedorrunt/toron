@@ -1,4 +1,5 @@
 // governed-by: ADR-0003
+// governed-by: ADR-0022
 #![forbid(unsafe_code)]
 
 //! YAML workflow schema (bd-osp, ADR-0003 Phase 2).
@@ -330,6 +331,52 @@ impl StepOnError {
     }
 }
 
+/// Phase of an agent job (ADR-0022 §3.1). The ORCHESTRATOR's vocabulary;
+/// harnesses map it to their own mechanics via the flywheel phase registry
+/// (ADR-0022 L2). The vocabulary is CLOSED (§4): five values, lowercase
+/// wire form; an unknown value is a parse error at lint time, never a
+/// silent degrade. New phases require an ADR amendment, not a string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Phase {
+    Resolve,
+    Plan,
+    Implement,
+    Review,
+    Verify,
+}
+
+impl Phase {
+    /// Wire/lint form of the phase (lowercase).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Resolve => "resolve",
+            Self::Plan => "plan",
+            Self::Implement => "implement",
+            Self::Review => "review",
+            Self::Verify => "verify",
+        }
+    }
+
+    /// Every wire value, in registry order — the closed vocabulary.
+    pub const ALL: [&'static str; 5] = ["resolve", "plan", "implement", "review", "verify"];
+}
+
+/// Closed-vocabulary gate for `DispatchSpec::phase` (ADR-0022 §3.1/§4):
+/// only the five [`Phase`] wire values deserialize; anything else is an
+/// `unknown variant` parse error surfaced at lint time.
+fn deserialize_closed_phase<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<String>::deserialize(deserializer)?;
+    match value.as_deref() {
+        None => Ok(None),
+        Some(s) if Phase::ALL.contains(&s) => Ok(Some(s.to_string())),
+        Some(other) => Err(serde::de::Error::unknown_variant(other, &Phase::ALL)),
+    }
+}
+
 /// Typed contract for a `dispatch_job` step's `spec` (bd-dispatch-spec-untyped-0iud).
 ///
 /// The known fields are the contract: `profile` selects the crew role,
@@ -364,8 +411,17 @@ pub struct DispatchSpec {
     /// Effort knob (e.g. low/high/xhigh).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
-    /// Lifecycle phase tag (ADR-0022 W2 phase registry).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Lifecycle phase tag (ADR-0022 §3.1). The vocabulary is CLOSED
+    /// (5 values, [`Phase`]); closure is enforced at DESERIALIZE — unknown
+    /// values fail parse loudly, never degrade silently at dispatch. The
+    /// struct keeps `Option<String>` because flywheel-side compose/crew
+    /// constructors assign `phase` directly (their files are out of this
+    /// change's blast radius); the deserializer is the gate.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_closed_phase"
+    )]
     pub phase: Option<String>,
     /// Run input rendered into the dispatch prompt (beads plan).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -407,7 +463,6 @@ impl DispatchSpec {
             &self.harness,
             &self.model,
             &self.effort,
-            &self.phase,
             &self.plan,
             &self.project,
         ]
@@ -415,6 +470,9 @@ impl DispatchSpec {
         .flatten()
         {
             out.push(field.clone());
+        }
+        if let Some(phase) = &self.phase {
+            out.push(phase.as_str().to_string());
         }
         for value in self.extra.values() {
             collect(value, &mut out);
@@ -795,6 +853,33 @@ steps:
             panic!("expected dispatch_job after round trip");
         };
         assert_eq!(*spec, again);
+    }
+
+    /// ADR-0022 §3.1/§4 (bd-adr22-phase-enum-lint-ahfh): the phase
+    /// vocabulary is CLOSED — five values, lowercase wire form; an unknown
+    /// value is a parse error, never a silent degrade.
+    #[test]
+    fn phase_enum_closed_vocabulary_roundtrip_and_reject() {
+        for (wire, value) in [
+            ("resolve", Phase::Resolve),
+            ("plan", Phase::Plan),
+            ("implement", Phase::Implement),
+            ("review", Phase::Review),
+            ("verify", Phase::Verify),
+        ] {
+            assert_eq!(
+                serde_json::to_string(&value).unwrap(),
+                format!("\"{wire}\"")
+            );
+            assert_eq!(
+                serde_json::from_str::<Phase>(&format!("\"{wire}\"")).unwrap(),
+                value
+            );
+        }
+        // Typo class: degrades LOUD at parse, never as an unknown-phase run.
+        let err = serde_json::from_str::<DispatchSpec>(r#"{"phase":"shipp"}"#)
+            .expect_err("unknown phase must fail parse");
+        assert!(err.to_string().contains("unknown variant"), "{err}");
     }
 
     /// A known field carrying a non-string scalar fails at PARSE time —

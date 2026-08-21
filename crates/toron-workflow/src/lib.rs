@@ -67,8 +67,8 @@ pub use mention::{
     wire_mention_dispatch,
 };
 pub use schema::{
-    Action, CrewSpec, CronPolicy, FailureAction, Graph, GraphNode, InputDecl, Step, StepOnError,
-    TemplateContext, Trigger, Workflow, parse_workflow, parse_workflows,
+    Action, CrewSpec, CronPolicy, FailureAction, Graph, GraphNode, InputDecl, Phase, Step,
+    StepOnError, TemplateContext, Trigger, Workflow, parse_workflow, parse_workflows,
 };
 pub use trigger_filter::{
     GIFT_WRAP, JOB_EMITS_KINDS, WORKFLOW_EMITTED_TAG, has_workflow_emitted_tag,
