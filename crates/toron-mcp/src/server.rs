@@ -507,15 +507,106 @@ async fn router_with_mailbox(
 /// Serve the toron MCP server over Streamable HTTP on `bind_addr`
 /// (e.g. `127.0.0.1:8000`).
 pub async fn serve_http(bind_addr: &str) -> anyhow::Result<()> {
-    let listener = tokio::net::TcpListener::bind(bind_addr).await?;
+    let listener = match tokio::net::TcpListener::bind(bind_addr).await {
+        Ok(listener) => listener,
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+            // bd-serve-double-spawn-oqe6: under launchd/systemd autostart a
+            // second spawn hits this whenever a healthy instance already
+            // owns the address. Exiting cleanly lets the unit's
+            // restart-on-failure policy leave it dead instead of
+            // crash-looping "Address already in use" into serve.err.log.
+            // A squatter that does not speak HTTP is still a hard failure.
+            match classify_port_peer(bind_addr).await {
+                PortPeer::HttpPeer => {
+                    tracing::info!(
+                        %bind_addr,
+                        "toron MCP HTTP already served by another instance; exiting cleanly"
+                    );
+                    return Ok(());
+                }
+                PortPeer::NonHttp => return Err(e.into()),
+            }
+        }
+        Err(e) => return Err(e.into()),
+    };
     tracing::info!(%bind_addr, "toron MCP Streamable HTTP listening at /mcp");
     axum::serve(listener, router().await?).await?;
     Ok(())
 }
 
+/// What holds a port our bind could not take.
+#[derive(Debug, PartialEq, Eq)]
+enum PortPeer {
+    /// An HTTP/1.x endpoint answered — treat as a healthy toron serve peer.
+    HttpPeer,
+    /// Nothing answered HTTP (dead port, or a non-HTTP squatter).
+    NonHttp,
+}
+
+/// Probe the current holder of `bind_addr`: connect, send a minimal HTTP
+/// request, and check for an HTTP/1.x response line. Any HTTP response
+/// counts (axum answers 404/405 on probes just like a healthy peer).
+async fn classify_port_peer(bind_addr: &str) -> PortPeer {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let connect = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        tokio::net::TcpStream::connect(bind_addr),
+    )
+    .await;
+    let Ok(Ok(mut conn)) = connect else {
+        return PortPeer::NonHttp;
+    };
+    let req = format!("GET /mcp HTTP/1.1\r\nHost: {bind_addr}\r\nConnection: close\r\n\r\n");
+    if conn.write_all(req.as_bytes()).await.is_err() {
+        return PortPeer::NonHttp;
+    }
+    let mut buf = [0u8; 16];
+    let read = tokio::time::timeout(std::time::Duration::from_secs(2), conn.read(&mut buf)).await;
+    match read {
+        Ok(Ok(n)) if buf[..n].starts_with(b"HTTP/") => PortPeer::HttpPeer,
+        _ => PortPeer::NonHttp,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// bd-serve-double-spawn-oqe6: bind-conflict classification — a healthy
+    /// HTTP peer reads as HttpPeer; junk (silent) holders and dead ports
+    /// read as NonHttp so serve still fails loudly on real squatters.
+    #[tokio::test]
+    async fn port_peer_classifies_http_junk_and_dead() {
+        use tokio::io::AsyncWriteExt;
+
+        // HTTP peer: minimal responder (405 is what axum answers on GET /mcp).
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap().to_string();
+        let responder = tokio::spawn(async move {
+            let (mut c, _) = l.accept().await.unwrap();
+            c.write_all(b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+        });
+        assert_eq!(classify_port_peer(&addr).await, PortPeer::HttpPeer);
+        responder.await.unwrap();
+
+        // Junk peer: accepts the connection but never speaks HTTP.
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap().to_string();
+        let junk = tokio::spawn(async move {
+            let (_c, _) = l.accept().await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        });
+        assert_eq!(classify_port_peer(&addr).await, PortPeer::NonHttp);
+        junk.abort();
+
+        // Dead port: nothing listening at all.
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap().to_string();
+        drop(l);
+        assert_eq!(classify_port_peer(&addr).await, PortPeer::NonHttp);
+    }
 
     #[test]
     fn capabilities_advertise_tools_and_resources() {

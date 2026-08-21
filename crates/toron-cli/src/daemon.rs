@@ -90,7 +90,10 @@ pub fn plist_xml(
 	<key>RunAtLoad</key>
 	<true/>
 	<key>KeepAlive</key>
-	<true/>
+	<dict>
+		<key>SuccessfulExit</key>
+		<false/>
+	</dict>
 	<key>ThrottleInterval</key>
 	<integer>5</integer>
 	<key>StandardOutPath</key>
@@ -141,7 +144,7 @@ pub fn systemd_unit(
          Environment=TORON_OPERATOR_KEY={}\n\
          Environment=TORON_KEY_PASSPHRASE_FILE={}\n\
          Environment=RUST_LOG=info\n\
-         Restart=always\n\
+         Restart=on-failure\n\
          RestartSec=5\n\
          StandardOutput=append:{}\n\
          StandardError=append:{}\n\
@@ -751,6 +754,12 @@ mod tests {
         assert!(xml.contains("<string>--mcp-http</string>"), "http flag");
         assert!(xml.contains("<string>127.0.0.1:18080</string>"), "addr");
         assert!(xml.contains("<key>KeepAlive</key>"), "autostart semantics");
+        assert!(
+            xml.contains("<key>SuccessfulExit</key>\n\t\t<false/>"),
+            "bd-serve-double-spawn-oqe6: respawn on failure only — a clean \
+             exit (another instance already serving) must stay dead"
+        );
+        assert!(!xml.contains("<key>KeepAlive</key>\n\t<true/>"));
         assert!(xml.contains("<key>RunAtLoad</key>"), "run at load");
         assert!(
             xml.contains("TORON_KEY_PASSPHRASE_FILE"),
@@ -781,7 +790,11 @@ mod tests {
         ));
         assert!(unit.contains("TORON_KEY_PASSPHRASE_FILE=/home/x/.config/toron/passphrase"));
         assert!(!unit.contains("TORON_KEY_PASSPHRASE="), "no inline secret");
-        assert!(unit.contains("Restart=always"));
+        assert!(
+            unit.contains("Restart=on-failure"),
+            "no respawn after clean exit"
+        );
+        assert!(!unit.contains("Restart=always"));
         assert!(unit.contains("WantedBy=default.target"));
     }
 
