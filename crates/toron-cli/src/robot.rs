@@ -772,6 +772,20 @@ fn finish_guard_check(
             reservations,
             toron_core::mailbox::guard::SHARED_SAFE_PATHS,
         );
+        // bd-9mb8 bead-hunk attribution: bd-* tokens ADDED by the staged
+        // diff must appear in the commit message (--msg-file from the
+        // commit-msg hook). Skipped when no message file was supplied.
+        let bead_blocks = match &args.msg_file {
+            Some(mf) => {
+                let msg = std::fs::read_to_string(mf).unwrap_or_default();
+                let added = toron_core::mailbox::guard::staged_added_lines_in(
+                    &args.repo,
+                    toron_core::mailbox::guard::SHARED_SAFE_PATHS,
+                );
+                toron_core::mailbox::guard::bead_hunk_violations(&added, &msg)
+            }
+            None => Vec::new(),
+        };
         if !blocked.is_empty() {
             let summary: Vec<String> = blocked
                 .iter()
@@ -794,6 +808,12 @@ fn finish_guard_check(
                 );
             }
         }
+        if !bead_blocks.is_empty() {
+            let toks: Vec<String> = bead_blocks.iter().map(|b| b.token.clone()).collect();
+            eprintln!(
+                "toron: strict guard: unattributed bead-tagged hunks — {toks:?} appear in the staged diff but not in the commit message; add them to the message (escapes: TORON_GUARD_STRICT=0 or --no-verify)"
+            );
+        }
         let out = json!({
             "strict": true,
             "blocked": blocked.iter().map(|b| json!({
@@ -808,6 +828,10 @@ fn finish_guard_check(
                     _ => None,
                 },
             })).collect::<Vec<_>>(),
+            "unattributed_bead_tokens": bead_blocks
+                .iter()
+                .map(|b| b.token.clone())
+                .collect::<Vec<_>>(),
             "agent": agent,
             "project": args.project,
         });
@@ -815,7 +839,11 @@ fn finish_guard_check(
         // Explicit exit both ways: the demo mailbox keeps a
         // background thread alive after the tokio runtime shuts down,
         // which would HANG a pre-commit hook.
-        std::process::exit(if blocked.is_empty() { 0 } else { 1 });
+        std::process::exit(if blocked.is_empty() && bead_blocks.is_empty() {
+            0
+        } else {
+            1
+        });
     }
     let blocked = toron_core::mailbox::guard::guard_check_blocked(agent, staged, reservations);
     let out = json!({

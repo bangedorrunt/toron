@@ -2410,3 +2410,162 @@ fn strict_shared_self_hold_covers_path_embedded() {
     let _ = std::fs::remove_dir_all(&data_dir);
     let _ = std::fs::remove_dir_all(&repo);
 }
+
+/// bd-9mb8: a commit whose staged diff ADDS bd-* tokens absent from the
+/// commit message is rejected by the installed commit-msg hook; naming the
+/// tokens in the message passes; the TORON_GUARD_STRICT=0 hatch warns and
+/// passes. Full-process e2e: real git, real hooks, second toron process.
+#[test]
+fn guard_commit_msg_blocks_foreign_bead_tokens() {
+    let data_dir = std::env::temp_dir().join(format!("toron-guard-bd9mb8-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&data_dir);
+    std::fs::create_dir_all(&data_dir).expect("mkdir dedicated data dir");
+
+    // Register the committing agent on a private root (own-process pattern).
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    rt.block_on(async {
+        use std::sync::Arc;
+        let db = data_dir.join("index.sqlite");
+        let pool = toron_core::index::schema::connect(db.to_str().unwrap())
+            .await
+            .expect("pool");
+        toron_core::index::schema::migrate(&pool)
+            .await
+            .expect("migrate");
+        toron_core::mailbox::aliases::reconcile_aliases(&pool, &data_dir)
+            .await
+            .expect("reconcile");
+        let bus = toron_core::bus::InProcessBus::open(pool.clone(), Default::default())
+            .await
+            .expect("bus");
+        let mailbox = toron_core::mailbox::Mailbox::new(Arc::new(bus), data_dir.clone(), None)
+            .with_index_pool(pool);
+        mailbox
+            .register_agent("demo", &AgentProfile::new("HunkAgent"))
+            .await
+            .expect("register HunkAgent");
+    });
+
+    let repo = std::env::temp_dir().join(format!("toron-hunk-repo-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&repo);
+    std::fs::create_dir_all(repo.join("src")).expect("src dir");
+
+    let bin_dir = std::path::Path::new(env!("CARGO_BIN_EXE_toron"))
+        .parent()
+        .expect("bin dir")
+        .to_path_buf();
+    let path_var = std::env::var("PATH").unwrap_or_default();
+    let with_env = |c: &mut Command| {
+        c.current_dir(&repo)
+            .env("TORON_MCP_DATA_DIR", &data_dir)
+            .env("TORON_AGENT", "HunkAgent")
+            .env(
+                "PATH",
+                std::env::join_paths(
+                    std::iter::once(bin_dir.clone()).chain(std::env::split_paths(&path_var)),
+                )
+                .expect("path"),
+            );
+    };
+    let git = |args: &[&str]| {
+        let mut c = Command::new("git");
+        with_env(&mut c);
+        c.args(args).output().expect("git")
+    };
+
+    assert!(git(&["init", "-q"]).status.success(), "git init");
+    // Lease covers the file so the pre-commit sweep passes; only the
+    // bead-hunk check may block.
+    let mut acq = Command::new(env!("CARGO_BIN_EXE_toron"));
+    acq.env("TORON_MCP_DATA_DIR", &data_dir)
+        .args([
+            "reserve",
+            "acquire",
+            "--paths",
+            "src/hunk.rs",
+            "--project",
+            "demo",
+            "--agent",
+            "HunkAgent",
+            "--exclusive",
+            "--json",
+        ])
+        .output()
+        .expect("acquire lease");
+    // Install BOTH guard hooks into the temp repo.
+    let mut inst = Command::new(env!("CARGO_BIN_EXE_toron"));
+    inst.env("TORON_MCP_DATA_DIR", &data_dir)
+        .args(["guard", "install", "--repo"])
+        .arg(&repo)
+        .args(["--project", "demo"])
+        .output()
+        .expect("install guard");
+    assert!(
+        repo.join(".git/hooks/commit-msg").exists(),
+        "install must write the commit-msg hook"
+    );
+
+    // 1. Foreign bead token in the diff, absent from the message -> blocked.
+    std::fs::write(
+        repo.join("src/hunk.rs"),
+        "// governed-by: bd-swept-foreign\n",
+    )
+    .unwrap();
+    assert!(git(&["add", "src/hunk.rs"]).status.success());
+    let blocked = git(&["commit", "-m", "feat: no attribution here"]);
+    assert!(
+        !blocked.status.success(),
+        "commit with unattributed bd-token must be rejected — stdout: {} stderr: {}",
+        String::from_utf8_lossy(&blocked.stdout),
+        String::from_utf8_lossy(&blocked.stderr)
+    );
+    let err = format!(
+        "{}{}",
+        String::from_utf8_lossy(&blocked.stdout),
+        String::from_utf8_lossy(&blocked.stderr)
+    );
+    assert!(
+        err.contains("bd-swept-foreign"),
+        "rejection must name the offending token, got: {err}"
+    );
+
+    // 2. Same change, token named in the message -> passes.
+    let ok = git(&[
+        "commit",
+        "-m",
+        "feat: hunk work attributed to bd-swept-foreign",
+    ]);
+    assert!(
+        ok.status.success(),
+        "message carrying the token must pass, stderr: {}",
+        String::from_utf8_lossy(&ok.stderr)
+    );
+
+    // 3. Hatch open (TORON_GUARD_STRICT=0): violation warns, commit passes.
+    std::fs::write(
+        repo.join("src/hunk.rs"),
+        "// governed-by: bd-swept-foreign\n// more bd-hatch-token\n",
+    )
+    .unwrap();
+    assert!(git(&["add", "src/hunk.rs"]).status.success());
+    let mut hatched = Command::new("git");
+    with_env(&mut hatched);
+    hatched.env("TORON_GUARD_STRICT", "0");
+    let hatched = hatched
+        .args(["commit", "-m", "feat: operator bypass"])
+        .output()
+        .expect("hatched commit");
+    assert!(
+        hatched.status.success(),
+        "strict hatch must let the commit through, stderr: {}",
+        String::from_utf8_lossy(&hatched.stderr)
+    );
+    let hatch_err = String::from_utf8_lossy(&hatched.stderr);
+    assert!(
+        hatch_err.contains("TORON_GUARD_STRICT=0"),
+        "hatch must log the operator bypass loudly, stderr: {hatch_err}"
+    );
+
+    let _ = std::fs::remove_dir_all(&data_dir);
+    let _ = std::fs::remove_dir_all(&repo);
+}
