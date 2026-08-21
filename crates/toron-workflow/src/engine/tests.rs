@@ -767,10 +767,7 @@ graph:
         })
         .next_back()
         .expect("oracle dispatch spec");
-    let task = oracle_spec
-        .get("task")
-        .and_then(|v| v.as_str())
-        .expect("oracle task present");
+    let task = oracle_spec.task.as_deref().expect("oracle task present");
     assert!(
         task.contains("[{\"scouted\":true}"),
         "oracle saw the fan-out: {task}"
