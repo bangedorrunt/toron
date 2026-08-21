@@ -385,7 +385,7 @@ Rules:
 - [ ] W3: forced-failure composed run with `on_failure: bead` creates the bead.
 - [ ] W3: `ship` dry-run renders the 5-link chain; `cron run --live` executes for real once.
 - [ ] W3 ladder: Tier-1 grammar parse table green; `--from-yaml` round-trip green; dry-run renders fanouts + phase tags; budget caps fail closed.
-- [ ] W4: `steer --direct` completes as an engine run with phase-tagged steps in `flywheel runs`.
+- [x] W4: `steer --direct` completes as an engine run with phase-tagged steps in `flywheel runs`. **Shipped 2026-08-21 (`bd-adr22-w4-steer-engine-w69z`):** flywheel `2621876` — steer's Run delegation proven through the same `engine.invoke` door (goal-direct engine-run completion + redelivery replay tests), `RunsCmd::List` surfaces `phase`/`phase_degraded` columns; bin suite 954 passed / 0 failed.
 - [ ] W6: keep-after-green lands in catalog and a later decide find-existing selects it; keep-without-green-run refuses.
 - [ ] W6 stages: project-tier stage resolvable and usable stage-first in a compose; promote-to-repo without evidence refuses.
 - [ ] W7: one agent-composed workflow via mail request, allowlisted, runs through the engine.
