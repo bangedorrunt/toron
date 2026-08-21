@@ -196,6 +196,33 @@ pub fn pattern_matches(pattern: &str, path: &str) -> bool {
     match_impl(&pat, &text, 0, 0)
 }
 
+/// bd-guard-crossproject-lease-er38: translate a sibling-repo lease
+/// spelling into a glob relative to the guarded repo. A lease taken on
+/// project A as `../<B>/<rest>` names a path under sibling repo B; when
+/// the guarded repo IS B, `guard check` evaluates the lease as `<rest>`
+/// so ONE reservation satisfies every spelling. Returns `None` when the
+/// pattern does not escape into `repo_name` — repo-relative patterns pass
+/// through unchanged at the call site, and deep escapes (`../../`) or
+/// backslash spellings are never guessed.
+pub fn cross_project_pattern(pattern: &str, repo_name: &str) -> Option<String> {
+    let rest = pattern.strip_prefix("../")?;
+    if rest.is_empty() {
+        return None;
+    }
+    let (first, tail) = match rest.split_once('/') {
+        Some((f, t)) => (f, Some(t)),
+        None => (rest, None),
+    };
+    if first != repo_name {
+        return None;
+    }
+    let tail = tail.map(|t| t.trim_start_matches('/'));
+    Some(match tail {
+        None | Some("") => "**".to_string(),
+        Some(t) => t.to_string(),
+    })
+}
+
 fn match_impl(pat: &[char], text: &[char], pi: usize, ti: usize) -> bool {
     if pi == pat.len() {
         return ti == text.len();
@@ -642,6 +669,69 @@ mod tests {
         let reservations = vec![res("me", "src/**", true)];
         let blocked = guard_check_blocked(Some("me"), &staged, &reservations);
         assert!(blocked.is_empty(), "own reservation must not block");
+    }
+
+    // ---- bd-guard-crossproject-lease-er38: cross-project lease spelling ----
+
+    #[test]
+    fn er38_translates_sibling_repo_spelling() {
+        assert_eq!(
+            cross_project_pattern("../flywheel/src/x.rs", "flywheel"),
+            Some("src/x.rs".to_string())
+        );
+        // Whole-repo lease (with or without trailing slash) covers all of it.
+        assert_eq!(
+            cross_project_pattern("../flywheel", "flywheel"),
+            Some("**".to_string())
+        );
+        assert_eq!(
+            cross_project_pattern("../flywheel/", "flywheel"),
+            Some("**".to_string())
+        );
+    }
+
+    #[test]
+    fn er38_rejects_non_matching_shapes() {
+        // A different sibling never translates here.
+        assert_eq!(cross_project_pattern("../other/src/x.rs", "flywheel"), None);
+        // Repo-relative spellings are not escapes; caller keeps them as-is.
+        assert_eq!(cross_project_pattern("src/x.rs", "flywheel"), None);
+        // Deep escapes and backslash spellings are never guessed.
+        assert_eq!(cross_project_pattern("../../x.rs", "flywheel"), None);
+        assert_eq!(
+            cross_project_pattern("..\\flywheel\\x.rs", "flywheel"),
+            None
+        );
+    }
+
+    #[test]
+    fn er38_toron_namespaced_lease_satisfies_flywheel_guard() {
+        // The regression: a lease taken on project toron as
+        // `../flywheel/src/x.rs` must cover staged `src/x.rs` when the
+        // commit happens in the flywheel repo — with NO second lease.
+        let raw = res("CrimsonIsland", "../flywheel/src/x.rs", true);
+        let translated = cross_project_pattern(&raw.pattern, "flywheel").expect("translate");
+        let own = vec![res("CrimsonIsland", &translated, true)];
+        let staged = vec!["src/x.rs".to_string()];
+        let blocks = guard_check_strict(Some("CrimsonIsland"), &staged, &own, SHARED_SAFE_PATHS);
+        assert!(blocks.is_empty(), "one lease must cover: {blocks:?}");
+
+        // Symmetric fairness: the same spelling held by ANOTHER agent blocks.
+        let foreign = vec![res("TealDune", &translated, true)];
+        let blocks =
+            guard_check_strict(Some("CrimsonIsland"), &staged, &foreign, SHARED_SAFE_PATHS);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].kind, StrictBlockKind::HeldBy("TealDune".into()));
+
+        // Without translation the guard saw Unreserved — the defect.
+        let untranslated = vec![res("CrimsonIsland", "../flywheel/src/x.rs", true)];
+        let blocks = guard_check_strict(
+            Some("CrimsonIsland"),
+            &staged,
+            &untranslated,
+            SHARED_SAFE_PATHS,
+        );
+        assert_eq!(blocks[0].kind, StrictBlockKind::Unreserved);
     }
 
     #[test]
