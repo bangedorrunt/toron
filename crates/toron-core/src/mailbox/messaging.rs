@@ -368,7 +368,10 @@ impl Mailbox {
 
         let mut mails: Vec<UnwrappedMail> = Vec::new();
         for wrap in &events {
-            if let Ok(gift) = gift_wrap::unwrap(&agent_keys, wrap) {
+            // bd-py9o: memoized decrypt — fleet polling replays the same
+            // history every few seconds; each wrap is decrypted once per
+            // (recipient, event) instead of once per poll.
+            if let Some(gift) = self.cached_unwrap(&agent_keys, wrap, npub) {
                 let rumor = gift.rumor;
                 mails.push(UnwrappedMail {
                     recipient: npub,
@@ -1565,6 +1568,80 @@ mod tests {
         };
         let wraps = wraps_to(&mailbox, &npub, 2).await;
         assert!(wraps.is_empty(), "no partial delivery on abort");
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// bd-py9o acceptance gate at the fetch level: the SECOND identical
+    /// `fetch_inbox` decrypts NOTHING — every stored wrap hydrates from the
+    /// unwrap memo; only genuinely new wraps may ever be decrypted.
+    #[tokio::test]
+    async fn test_fetch_inbox_second_call_decrypts_nothing_bd_py9o() {
+        let (mailbox, db_path, data_dir) = test_mailbox("inbox-incr").await;
+        let (_sender, _) = register(&mailbox, "demo", "GreenCastle").await;
+        let (_recv, _) = register(&mailbox, "demo", "BlueLake").await;
+
+        for subject in ["a", "b", "c"] {
+            mailbox
+                .send_message(&SendMessage {
+                    project_slug: "demo".into(),
+                    sender_name: "GreenCastle".into(),
+                    to: vec!["BlueLake".into()],
+                    subject: subject.into(),
+                    body_md: format!("body {subject}"),
+                    ..Default::default()
+                })
+                .await
+                .expect("send");
+        }
+
+        let args = FetchInbox {
+            project_slug: "demo".into(),
+            agent_name: "BlueLake".into(),
+            ..Default::default()
+        };
+        let first = mailbox.fetch_inbox(&args).await.expect("fetch 1");
+        assert_eq!(first.len(), 3);
+        let misses_after_first = mailbox.unwrap_cache_misses();
+        assert!(
+            misses_after_first >= 3,
+            "first fetch cold-decrypts each wrap once"
+        );
+
+        let second = mailbox.fetch_inbox(&args).await.expect("fetch 2");
+        assert_eq!(second.len(), 3);
+        assert_eq!(
+            second.iter().map(|m| m.id.clone()).collect::<Vec<_>>(),
+            first.iter().map(|m| m.id.clone()).collect::<Vec<_>>(),
+            "identical inbox across fetches"
+        );
+        assert_eq!(
+            mailbox.unwrap_cache_misses(),
+            misses_after_first,
+            "SECOND identical fetch must decrypt nothing (bd-py9o)"
+        );
+        assert!(mailbox.unwrap_cache_hits() >= 3, "memo served every wrap");
+
+        // A NEW message is decrypted exactly once on the next fetch.
+        mailbox
+            .send_message(&SendMessage {
+                project_slug: "demo".into(),
+                sender_name: "GreenCastle".into(),
+                to: vec!["BlueLake".into()],
+                subject: "d".into(),
+                body_md: "body d".into(),
+                ..Default::default()
+            })
+            .await
+            .expect("send d");
+        let third = mailbox.fetch_inbox(&args).await.expect("fetch 3");
+        assert_eq!(third.len(), 4);
+        assert_eq!(
+            mailbox.unwrap_cache_misses(),
+            misses_after_first + 1,
+            "only the new wrap may be decrypted"
+        );
 
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_dir_all(&data_dir);

@@ -531,6 +531,87 @@ mod tests {
         .expect("build")
     }
 
+    /// bd-py9o acceptance gate at the bus level: a SECOND subscribe with the
+    /// same filter must hydrate its snapshot from the hot memo — zero SQL
+    /// row parses — and still deliver the full matched history + EOSE.
+    #[tokio::test]
+    async fn test_second_subscribe_hydrates_from_memo_bd_py9o() {
+        use crate::bus::event_store::{HOT_HITS, PARSED_ROWS};
+        use std::sync::atomic::Ordering;
+
+        let (bus, path) = temp_bus().await;
+        let keys = Keys::generate();
+        let n = 8;
+        for i in 0..n {
+            let ev = signed(&keys, PROJECT_MANIFEST, &format!("m{i}"), "demo");
+            bus.publish(ev).await.expect("publish");
+        }
+
+        let filter = crate::bus::project_filter("demo");
+        // First subscribe: publishes already memoized each event (inserts
+        // warm the hot cache), so this snapshot may parse nothing — the
+        // cold-parse path is covered by the store-level gate.
+        let mut s1 = bus.subscribe(filter.clone()).await.expect("sub 1");
+        let first = drain(&mut s1, 32, Duration::from_millis(400)).await;
+        assert_eq!(
+            first
+                .iter()
+                .filter(|e| matches!(e, SubscriptionEvent::Event(_)))
+                .count(),
+            n
+        );
+        let mid = PARSED_ROWS.load(Ordering::Relaxed);
+
+        // Second subscribe: identical filter, no new events.
+        let hits_before = HOT_HITS.load(Ordering::Relaxed);
+        let mut s2 = bus.subscribe(filter.clone()).await.expect("sub 2");
+        let second = drain(&mut s2, 32, Duration::from_millis(400)).await;
+        let got: Vec<_> = second
+            .iter()
+            .filter_map(|e| match e {
+                SubscriptionEvent::Event(ev) => Some(ev.id.to_hex()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(got.len(), n, "second subscribe replays full history");
+        assert!(
+            second.iter().any(|e| matches!(e, SubscriptionEvent::Eose)),
+            "EOSE still delivered"
+        );
+        assert_eq!(
+            PARSED_ROWS.load(Ordering::Relaxed),
+            mid,
+            "second subscribe must NOT re-parse the store (bd-py9o)"
+        );
+        assert_eq!(
+            HOT_HITS.load(Ordering::Relaxed) - hits_before,
+            2 * n,
+            "every snapshot AND delta row hydrated from the memo \
+             (subscribe = snapshot replay + delta re-read)"
+        );
+
+        // A NEW event is parsed exactly once and reaches BOTH paths.
+        let fresh = signed(&keys, PROJECT_MANIFEST, "fresh", "demo");
+        bus.publish(fresh).await.expect("publish fresh");
+        let mut s3 = bus.subscribe(filter).await.expect("sub 3");
+        let third = drain(&mut s3, 32, Duration::from_millis(400)).await;
+        let third_events = third
+            .iter()
+            .filter(|e| matches!(e, SubscriptionEvent::Event(_)))
+            .count();
+        assert_eq!(third_events, n + 1);
+        // bus.publish warmed the new event's memo entry on insert, so the
+        // third subscribe parses nothing either. The genuinely-cold parse
+        // path (another process instance) is asserted by the store-level
+        // gate test_replay_second_identical_call_parses_zero_rows_bd_py9o.
+        assert_eq!(
+            PARSED_ROWS.load(Ordering::Relaxed),
+            mid,
+            "no re-parsing of known rows, ever"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[tokio::test]
     async fn test_publish_subscribe_roundtrip() {
         let (bus, path) = temp_bus().await;
@@ -543,7 +624,6 @@ mod tests {
         let ev = signed(&keys, PROJECT_MANIFEST, "hello", "demo");
         let ok = bus.publish(ev.clone()).await.expect("publish");
         assert!(ok.stored);
-
         // Replay + EOSE come first, then the live event.
         let items = drain(&mut sub, 8, Duration::from_millis(200)).await;
         let saw_event = items
