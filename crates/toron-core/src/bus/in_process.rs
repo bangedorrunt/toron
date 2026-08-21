@@ -738,7 +738,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_latency_smoke_below_50ms() {
+    async fn test_latency_smoke_below_2s() {
         let (bus, path) = temp_bus().await;
         let keys = Keys::generate();
         let mut sub = bus
@@ -765,9 +765,13 @@ mod tests {
         }
         assert!(delivered, "live event must be delivered");
         let elapsed = start.elapsed();
+        // Smoke ceiling, not a latency SLO: under parallel test load a
+        // scheduler stall routinely exceeds 50ms (bd-lib-suite-flake-j6jg).
+        // 2s still catches pathological transport regressions (relay
+        // round-trip, lost wake) while tolerating load jitter.
         assert!(
-            elapsed < Duration::from_millis(50),
-            "publish→receive latency {elapsed:?} must be < 50ms"
+            elapsed < Duration::from_secs(2),
+            "publish→receive latency {elapsed:?} must be < 2s"
         );
         tracing::info!("latency histogram sample: {elapsed:?}");
         let _ = std::fs::remove_file(&path);
