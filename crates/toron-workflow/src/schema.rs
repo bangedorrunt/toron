@@ -330,6 +330,99 @@ impl StepOnError {
     }
 }
 
+/// Typed contract for a `dispatch_job` step's `spec` (bd-dispatch-spec-untyped-0iud).
+///
+/// The known fields are the contract: `profile` selects the crew role,
+/// `task`/`stage` shape the prompt, `harness`/`model`/`effort` pin the
+/// execution lane, `phase` tags the lifecycle stage (ADR-0022 W2 consumes
+/// it), and `plan`/`project` carry run inputs into the dispatch prompt.
+/// A known field must be a string — anything else fails at parse time,
+/// never silently at dispatch.
+///
+/// The spec is also polymorphic in practice (legacy send-absorb `to`/`msg`,
+/// catalog `call_workflow` markers, pane `resolved`/`await` payloads), so
+/// unknown keys round-trip losslessly through [`DispatchSpec::extra`]
+/// instead of failing parse. Keys that earn semantics graduate to named
+/// fields; `extra` is the staging area, not a compat shim.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct DispatchSpec {
+    /// Crew role (`@scout`) or agent pin dispatched to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+    /// Inline mission text (wins over `stage` in headless conditioning).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<String>,
+    /// Named pipeline stage (prompt selection).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stage: Option<String>,
+    /// Harness override for this step (else the profile default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness: Option<String>,
+    /// Model override for this step (registry id).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Effort knob (e.g. low/high/xhigh).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    /// Lifecycle phase tag (ADR-0022 W2 phase registry).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<String>,
+    /// Run input rendered into the dispatch prompt (beads plan).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<String>,
+    /// Run input rendered into the dispatch prompt (project slug).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
+    /// Unknown keys, preserved verbatim (flatten).
+    #[serde(default, flatten, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, serde_json::Value>,
+}
+
+impl DispatchSpec {
+    /// Every string leaf in the spec: the known fields plus strings
+    /// recursively collected from `extra` (lint scans these for
+    /// `{{...}}` template references).
+    pub fn string_values(&self) -> Vec<String> {
+        fn collect(value: &serde_json::Value, out: &mut Vec<String>) {
+            match value {
+                serde_json::Value::String(s) => out.push(s.clone()),
+                serde_json::Value::Array(items) => {
+                    for item in items {
+                        collect(item, out);
+                    }
+                }
+                serde_json::Value::Object(map) => {
+                    for item in map.values() {
+                        collect(item, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        for field in [
+            &self.profile,
+            &self.task,
+            &self.stage,
+            &self.harness,
+            &self.model,
+            &self.effort,
+            &self.phase,
+            &self.plan,
+            &self.project,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            out.push(field.clone());
+        }
+        for value in self.extra.values() {
+            collect(value, &mut out);
+        }
+        out
+    }
+}
+
 /// A workflow action (one of the ADR Phase-2 set).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
@@ -354,7 +447,7 @@ pub enum Action {
     /// Dispatch a job to an agent (kind-43001; bounded semaphore A7).
     DispatchJob {
         assignee: String,
-        spec: serde_json::Value,
+        spec: DispatchSpec,
         #[serde(default)]
         channel: Option<String>,
     },
@@ -645,6 +738,101 @@ steps:
         assert_eq!(wf.steps[0].name.as_deref(), Some("ack"));
         assert!(matches!(wf.steps[0].action, Action::SendDm { .. }));
         assert!(matches!(wf.steps[1].action, Action::DispatchJob { .. }));
+    }
+
+    /// bd-dispatch-spec-untyped-0iud: the dispatch_job spec is a TYPED
+    /// contract — known fields deserialize into named Options, unknown keys
+    /// round-trip through `extra`, and the whole spec survives a
+    /// serialize → deserialize round trip losslessly.
+    #[test]
+    fn dispatch_spec_typed_fields_and_extra_roundtrip() {
+        let yaml = r##"
+name: t
+steps:
+  - name: d
+    action: dispatch_job
+    assignee: oc-beta
+    spec:
+      profile: "@scout"
+      task: "scout {{inputs.goal}}"
+      stage: p1
+      harness: opencode
+      model: big-pickle
+      effort: low
+      phase: implement
+      plan: "bd-1"
+      project: toron
+      to: oc-beta
+      msg: hello
+"##;
+        let wf = parse_workflow(yaml).expect("parse");
+        let Action::DispatchJob { spec, .. } = &wf.steps[0].action else {
+            panic!("expected dispatch_job");
+        };
+        assert_eq!(spec.profile.as_deref(), Some("@scout"));
+        assert_eq!(spec.task.as_deref(), Some("scout {{inputs.goal}}"));
+        assert_eq!(spec.stage.as_deref(), Some("p1"));
+        assert_eq!(spec.harness.as_deref(), Some("opencode"));
+        assert_eq!(spec.model.as_deref(), Some("big-pickle"));
+        assert_eq!(spec.effort.as_deref(), Some("low"));
+        assert_eq!(spec.phase.as_deref(), Some("implement"));
+        assert_eq!(spec.plan.as_deref(), Some("bd-1"));
+        assert_eq!(spec.project.as_deref(), Some("toron"));
+        // Unknown keys survive in `extra` (polymorphic legacy payloads).
+        assert_eq!(
+            spec.extra.get("to").and_then(|v| v.as_str()),
+            Some("oc-beta")
+        );
+        assert_eq!(
+            spec.extra.get("msg").and_then(|v| v.as_str()),
+            Some("hello")
+        );
+        // Round trip keeps both halves of the contract.
+        let value = serde_json::to_value(&wf.steps[0].action).expect("serialize");
+        let Action::DispatchJob { spec: again, .. } =
+            serde_json::from_value(value).expect("deserialize")
+        else {
+            panic!("expected dispatch_job after round trip");
+        };
+        assert_eq!(*spec, again);
+    }
+
+    /// A known field carrying a non-string scalar fails at PARSE time —
+    /// the contract is fail-closed, never silently coerced at dispatch.
+    #[test]
+    fn dispatch_spec_rejects_non_string_known_field() {
+        let yaml = r##"
+name: t
+steps:
+  - name: d
+    action: dispatch_job
+    assignee: oc-beta
+    spec: { harness: 3 }
+"##;
+        assert!(parse_workflow(yaml).is_err());
+    }
+
+    /// `string_values` feeds lint's template scan: known fields plus every
+    /// string leaf nested inside `extra` (e.g. pane `resolved` objects).
+    #[test]
+    fn dispatch_spec_string_values_covers_extra_nesting() {
+        let spec = DispatchSpec {
+            task: Some("do {{steps.a}}".into()),
+            extra: BTreeMap::from([
+                ("await".to_string(), serde_json::Value::Bool(true)),
+                (
+                    "resolved".to_string(),
+                    serde_json::json!({ "spec": { "harness": "{{trigger.h}}" } }),
+                ),
+            ]),
+            ..Default::default()
+        };
+        let mut values = spec.string_values();
+        values.sort();
+        assert_eq!(
+            values,
+            vec!["do {{steps.a}}".to_string(), "{{trigger.h}}".to_string(),]
+        );
     }
 
     #[test]

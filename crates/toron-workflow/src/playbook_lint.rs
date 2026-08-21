@@ -507,11 +507,7 @@ fn collect_action_strings(action: &Action, out: &mut Vec<String>) {
         Action::React { message_id, .. } => out.push(message_id.clone()),
         Action::DispatchJob { assignee, spec, .. } => {
             out.push(assignee.clone());
-            if let Some(s) = spec.as_str() {
-                out.push(s.to_string());
-            } else {
-                out.push(spec.to_string());
-            }
+            out.extend(spec.string_values());
         }
         Action::CallWebhook {
             url, method, body, ..

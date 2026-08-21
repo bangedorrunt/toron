@@ -152,7 +152,7 @@ pub fn mailbox_runner(
                 let mention = toron_workflow::coalesce::InboundMention {
                     assignee: assignee.clone(),
                     parent: String::new(),
-                    spec: spec.clone(),
+                    spec: serde_json::to_value(spec).expect("DispatchSpec is JSON-serializable"),
                 };
                 let now = now_ms();
                 // P1 (bd-p1-poison-on-panic-audit-jwpd): recover the std
@@ -916,7 +916,7 @@ mod tests {
         let runner = mailbox_runner(mailbox, coalescer.clone(), None);
         let action = |i: u32| Action::DispatchJob {
             assignee: "oc-beta".into(),
-            spec: serde_json::json!({ "i": i }),
+            spec: crate::workflow_host::test_spec(json!({ "i": i })),
             channel: None,
         };
         for i in 0..5 {
@@ -1102,7 +1102,7 @@ mod tests {
             let out = std::thread::spawn(move || {
                 runner(&Action::DispatchJob {
                     assignee: "oc".into(),
-                    spec: serde_json::json!({ "i": i }),
+                    spec: crate::workflow_host::test_spec(json!({ "i": i })),
                     channel: None,
                 })
                 .expect("runner ok")
@@ -1122,7 +1122,9 @@ mod tests {
                 .map(|i| InboundMention {
                     assignee: "gk".into(),
                     parent: parent.into(),
-                    spec: serde_json::json!({ "text": format!("mention {i}") }),
+                    spec: crate::workflow_host::test_spec(
+                        json!({ "text": format!("mention {i}") }),
+                    ),
                 })
                 .collect(),
             first_arrival_ms: 0,
@@ -1208,7 +1210,7 @@ mod tests {
                 for i in 0..(MENTIONS / 8) {
                     runner(&Action::DispatchJob {
                         assignee: "oc".into(),
-                        spec: serde_json::json!({ "i": t * 1000 + i }),
+                        spec: crate::workflow_host::test_spec(json!({ "i": t * 1000 + i })),
                         channel: None,
                     })
                     .expect("runner ok");
@@ -1491,7 +1493,7 @@ steps:
         let dispatch = |runner: &ActionRunner, assignee: &str, text: &str| {
             runner(&Action::DispatchJob {
                 assignee: assignee.into(),
-                spec: serde_json::json!({ "text": text }),
+                spec: crate::workflow_host::test_spec(json!({ "text": text })),
                 channel: None,
             })
         };
@@ -1580,7 +1582,7 @@ steps:
         let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
             runner(&Action::DispatchJob {
                 assignee: "oc".into(),
-                spec: serde_json::json!({ "text": "after-poison" }),
+                spec: crate::workflow_host::test_spec(json!({ "text": "after-poison" })),
                 channel: None,
             })
         }));
