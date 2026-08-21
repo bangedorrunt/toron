@@ -356,6 +356,38 @@ pub fn install_precommit_guard(repo_path: &Path, project: &str) -> anyhow::Resul
     let mut file = std::fs::File::create(&script_path)?;
     file.write_all(script.as_bytes())?;
     set_executable(&script_path)?;
+
+    // bd-9mb8: the bead-hunk attribution check needs the commit MESSAGE,
+    // which only exists at the commit-msg stage — pre-commit runs before
+    // the editor opens. Install a companion commit-msg hook that passes
+    // "$1" through --msg-file. Same courtesy as pre-commit: a foreign
+    // hook is never clobbered (ours is recognized by the marker).
+    let cm_path = hooks.join("commit-msg");
+    let cm_is_toron = cm_path.exists()
+        && std::fs::read_to_string(&cm_path)
+            .map(|s| s.contains("installed by toron"))
+            .unwrap_or(false);
+    if !cm_path.exists() || cm_is_toron {
+        let cm_script = format!(
+            "#!/bin/sh\n\
+             # installed by toron — governed-by: ADR-0003\n\
+             # Bead-hunk attribution guard (bd-9mb8): bd-* tokens ADDED by\n\
+             # this commit's staged diff must appear in the commit message.\n\
+             # Foreign bead-tagged code landing unattributed in a peer commit\n\
+             # silently breaks bead-to-commit traceability. Escape hatch:\n\
+             # TORON_GUARD_STRICT=0 <commit> (logged, same as pre-commit).\n\
+             {export}\
+             if command -v toron >/dev/null 2>&1; then\n\
+             \texport TORON_GUARD_STRICT=\"${{TORON_GUARD_STRICT:-1}}\"\n\
+             \ttoron guard check --repo \"$PWD\" --project {project} --msg-file \"$1\"\n\
+             \texit $?\n\
+             fi\n\
+             exit 0\n"
+        );
+        let mut cm_file = std::fs::File::create(&cm_path)?;
+        cm_file.write_all(cm_script.as_bytes())?;
+        set_executable(&cm_path)?;
+    }
     Ok(script_path)
 }
 
@@ -375,6 +407,15 @@ pub fn uninstall_precommit_guard(repo_path: &Path) -> anyhow::Result<bool> {
         return Ok(false);
     }
     std::fs::remove_file(&script_path)?;
+    // bd-9mb8: remove our companion commit-msg hook too — but never a
+    // foreign one (same marker rule as install).
+    let cm_path = repo.path().join("hooks").join("commit-msg");
+    let cm_is_toron = std::fs::read_to_string(&cm_path)
+        .map(|s| s.contains("installed by toron"))
+        .unwrap_or(false);
+    if cm_is_toron {
+        std::fs::remove_file(&cm_path)?;
+    }
     let legacy_path = repo.path().join("hooks").join("pre-commit.legacy");
     if legacy_path.exists() {
         std::fs::rename(&legacy_path, &script_path)?;
@@ -438,6 +479,120 @@ pub fn staged_paths_in(repo_path: &Path) -> Vec<String> {
         Ok(repo) => staged_paths(&repo),
         Err(_) => Vec::new(),
     }
+}
+
+// ---------------------------------------------------------------------------
+// bd-9mb8 bead-hunk attribution: bd-* tokens ADDED by the staged diff must
+// appear in the commit message. Foreign bead-tagged code sweeping into a
+// peer's shared-tree window otherwise lands with no commit carrying its id —
+// breaking commit-before-close traceability while close gates pass on
+// technicalities (observed: flywheel a1498f1 absorbed the oxjy fix).
+// ---------------------------------------------------------------------------
+
+/// One bead-hunk attribution violation (bd-9mb8): `token` appears on an
+/// ADDED line of the staged diff but is absent from the commit message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BeadHunkBlock {
+    pub token: String,
+}
+
+/// Distinct `bd-<id>` tokens in `text`, first-seen order. Token body matches
+/// tracker ids: `[a-z0-9-]+` after a literal `bd-`, case-sensitive, with a
+/// boundary before the prefix (not `[a-z0-9-]` — so `abd-x` and the flag-ish
+/// `x-bd-y` never match) and trailing hyphens trimmed.
+fn bd_tokens(text: &str) -> Vec<String> {
+    let b = text.as_bytes();
+    let mut out: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i + 3 <= b.len() {
+        let boundary = i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'-');
+        if boundary && &b[i..i + 3] == b"bd-" {
+            let start = i;
+            let mut end = start + 3;
+            while end < b.len()
+                && (b[end].is_ascii_lowercase() || b[end].is_ascii_digit() || b[end] == b'-')
+            {
+                end += 1;
+            }
+            // The regex body `[a-z0-9-]+` requires at least one char after
+            // the prefix; trailing hyphens are trimmed for prose safety
+            // ("bd-x--" → "bd-x") but never past that first body char.
+            if end > start + 3 {
+                let mut e = end;
+                while e > start + 4 && b[e - 1] == b'-' {
+                    e -= 1;
+                }
+                let tok = text[start..e].to_string();
+                if !out.contains(&tok) {
+                    out.push(tok);
+                }
+            }
+            i = end;
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Scan ADDED lines of a unified diff for bd-* tokens absent from
+/// `message`. Removed/context lines and the `+++`/`---` headers carry no
+/// attribution debt; duplicates collapse to one block per token.
+pub fn bead_hunk_violations(diff: &str, message: &str) -> Vec<BeadHunkBlock> {
+    let msg_tokens = bd_tokens(message);
+    let added: String = diff
+        .lines()
+        .filter(|l| l.starts_with('+') && !l.starts_with("+++"))
+        .map(|l| {
+            let mut s = l.to_string();
+            s.push('\n');
+            s
+        })
+        .collect();
+    bd_tokens(&added)
+        .into_iter()
+        .filter(|t| !msg_tokens.contains(t))
+        .map(|token| BeadHunkBlock { token })
+        .collect()
+}
+
+/// ADDED lines (`+`, excluding `+++` headers) of the staged diff as one
+/// text blob, skipping every file whose path is in `exclude`. Empty on any
+/// repository/index error — attribution is best-effort input to the check,
+/// never a crash surface.
+pub fn staged_added_lines_in(repo_path: &Path, exclude: &[&str]) -> String {
+    let Ok(repo) = git2::Repository::open(repo_path) else {
+        return String::new();
+    };
+    let Ok(index) = repo.index() else {
+        return String::new();
+    };
+    let head_tree = repo.head().ok().and_then(|h| h.peel_to_tree().ok());
+    let Ok(diff) = repo.diff_tree_to_index(head_tree.as_ref(), Some(&index), None) else {
+        return String::new();
+    };
+    let mut current_path = String::new();
+    let mut added = String::new();
+    let _ = diff.print(git2::DiffFormat::Patch, |delta, _hunk, line| {
+        if line.origin() == 'F' {
+            current_path.clear();
+            if let Some(p) = delta.new_file().path().and_then(|p| p.to_str()) {
+                current_path.push_str(p);
+            }
+        }
+        if line.origin() == '+'
+            && !exclude.contains(&current_path.as_str())
+            && let Ok(c) = std::str::from_utf8(line.content())
+        {
+            // libgit2 content excludes the origin sign; re-add '+' so the
+            // blob is a valid added-lines-only unified diff for
+            // [`bead_hunk_violations`]'s line filter.
+            added.push('+');
+            added.push_str(c);
+        }
+        true
+    });
+    added
 }
 
 use super::*;
@@ -1019,6 +1174,176 @@ mod tests {
         );
         let still = std::fs::read_to_string(hooks.join("pre-commit")).expect("read");
         assert!(still.contains("foreign"), "foreign hook untouched");
+        drop(repo);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    // -----------------------------------------------------------------------
+    // bd-9mb8: bead-hunk attribution — bd-* tokens ADDED by the staged diff
+    // must appear in the commit message, else the commit is attributed to
+    // nobody for that work.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn bead_hunks_foreign_token_blocked() {
+        let diff = "+// governed-by: bd-foreign-abc\n+pub fn x() {}\n";
+        let v = bead_hunk_violations(diff, "feat: stuff without any ids");
+        assert_eq!(
+            v,
+            vec![BeadHunkBlock {
+                token: "bd-foreign-abc".to_string()
+            }]
+        );
+    }
+
+    #[test]
+    fn bead_hunks_token_present_in_message_allowed() {
+        let diff = "+// governed-by: bd-9mb8\n";
+        let v = bead_hunk_violations(diff, "fix(guard): attribution bd-9mb8");
+        assert!(v.is_empty(), "a token carried by the message is attributed");
+    }
+
+    #[test]
+    fn bead_hunks_removed_and_context_lines_carry_no_debt() {
+        let diff = "-// governed-by: bd-old-one\n // governed-by: bd-ctx-nine\n";
+        let v = bead_hunk_violations(diff, "chore: cleanup");
+        assert!(
+            v.is_empty(),
+            "only ADDED lines introduce attribution debt, got {v:?}"
+        );
+    }
+
+    #[test]
+    fn bead_hunks_unified_headers_ignored() {
+        let diff = "--- a/src/x.rs\n+++ b/src/x.rs\n";
+        assert!(bead_hunk_violations(diff, "").is_empty());
+    }
+
+    #[test]
+    fn bead_hunks_multiple_tokens_deduped() {
+        let diff = "+// bd-alpha-one\n+// bd-alpha-one again, plus bd-beta-two\n";
+        let mut v = bead_hunk_violations(diff, "");
+        v.sort_by(|a, b| a.token.cmp(&b.token));
+        assert_eq!(
+            v,
+            vec![
+                BeadHunkBlock {
+                    token: "bd-alpha-one".to_string()
+                },
+                BeadHunkBlock {
+                    token: "bd-beta-two".to_string()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn bd_tokens_shape_and_boundaries() {
+        assert_eq!(bd_tokens("// bd-9mb8 ok"), vec!["bd-9mb8".to_string()]);
+        assert_eq!(
+            bd_tokens("(bd-adr22-w6-stage)"),
+            vec!["bd-adr22-w6-stage".to_string()]
+        );
+        assert_eq!(bd_tokens("bd-a-- rest"), vec!["bd-a".to_string()]);
+        assert_eq!(bd_tokens("abd-9 not a boundary"), Vec::<String>::new());
+        assert_eq!(bd_tokens("x-bd-hidden flag form"), Vec::<String>::new());
+        assert_eq!(bd_tokens("BD-UPPER case sensitive"), Vec::<String>::new());
+        assert_eq!(bd_tokens("bd- lone prefix"), Vec::<String>::new());
+        assert_eq!(bd_tokens("bd-a bd-a dedup"), vec!["bd-a".to_string()]);
+    }
+
+    #[test]
+    fn staged_added_lines_exclude_shared_safe_paths() {
+        let root = std::env::temp_dir().join(format!(
+            "toron-added-lines-{}-{}.git",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(root.join("src")).expect("src dir");
+        std::fs::create_dir_all(root.join(".beads")).expect("beads dir");
+        let repo = git2::Repository::init(&root).expect("init repo");
+        std::fs::write(
+            root.join("src/lib.rs"),
+            "// governed-by: bd-hunk-code\npub fn x() {}\n",
+        )
+        .expect("write lib");
+        std::fs::write(
+            root.join(".beads/issues.jsonl"),
+            "{\"id\":\"bd-ledger-only\"}\n",
+        )
+        .expect("write ledger");
+
+        let mut index = repo.index().expect("index");
+        index.add_path(Path::new("src/lib.rs")).expect("add lib");
+        index
+            .add_path(Path::new(".beads/issues.jsonl"))
+            .expect("add ledger");
+        index.write().expect("write index");
+
+        let added = staged_added_lines_in(&root, SHARED_SAFE_PATHS);
+        assert!(
+            added.contains("bd-hunk-code"),
+            "code hunks feed the scan, got: {added}"
+        );
+        assert!(
+            !added.contains("bd-ledger-only"),
+            ".beads ledger syncs legitimately carry foreign ids and must be exempt, got: {added}"
+        );
+        drop(repo);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn install_writes_commit_msg_hook_and_uninstall_removes_it() {
+        let root = std::env::temp_dir().join(format!(
+            "toron-commit-msg-hook-{}-{}.git",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).expect("create repo dir");
+        let repo = git2::Repository::init(&root).expect("init repo");
+
+        install_precommit_guard(&root, "toron").expect("install");
+        let cm = repo.path().join("hooks").join("commit-msg");
+        let contents = std::fs::read_to_string(&cm).expect("commit-msg written by install");
+        assert!(
+            contents.contains("--msg-file \"$1\""),
+            "commit-msg hook must pass the message file: {contents}"
+        );
+        assert!(
+            contents.contains("installed by toron"),
+            "commit-msg carries the toron marker"
+        );
+
+        assert!(uninstall_precommit_guard(&root).expect("uninstall"));
+        assert!(!cm.exists(), "our commit-msg hook removed on uninstall");
+        drop(repo);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn install_never_clobbers_foreign_commit_msg_hook() {
+        let root = std::env::temp_dir().join(format!(
+            "toron-clobber-commit-msg-{}-{}.git",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).expect("create repo dir");
+        let repo = git2::Repository::init(&root).expect("init repo");
+        let hooks = repo.path().join("hooks");
+        std::fs::create_dir_all(&hooks).expect("hooks dir");
+        std::fs::write(hooks.join("commit-msg"), "#!/bin/sh\n# user's own\n").expect("write");
+
+        install_precommit_guard(&root, "demo").expect("install");
+        let cm = std::fs::read_to_string(hooks.join("commit-msg")).expect("read");
+        assert!(cm.contains("user's own"), "foreign commit-msg untouched");
+
+        // ...and uninstall must NOT delete the user's hook either.
+        assert!(uninstall_precommit_guard(&root).expect("uninstall"));
+        assert!(
+            hooks.join("commit-msg").exists(),
+            "user's commit-msg survives uninstall"
+        );
         drop(repo);
         let _ = std::fs::remove_dir_all(root);
     }

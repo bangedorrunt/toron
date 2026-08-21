@@ -857,6 +857,12 @@ pub struct GuardCheckArgs {
     /// unattributed commits fail-closed. TORON_GUARD_STRICT=0 disables.
     #[arg(long)]
     pub strict: bool,
+    /// Commit message file ($1 of a commit-msg hook). When set, ADDED lines
+    /// of the staged diff are scanned for bd-* tokens absent from the
+    /// message (bd-9mb8 bead-hunk attribution); violations block under
+    /// strict mode, warn loudly when the strict hatch is open.
+    #[arg(long)]
+    pub msg_file: Option<PathBuf>,
 }
 
 // ---------------------------------------------------------------------------
