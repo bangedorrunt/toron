@@ -718,7 +718,7 @@ pub async fn run_guard(mailbox: &Mailbox, cmd: &GuardCommand) -> anyhow::Result<
         GuardCommand::Check(args) => {
             let agent = guard_agent(args);
             let staged = toron_core::mailbox::guard::staged_paths_in(&args.repo);
-            let reservations = mailbox
+            let mut reservations = mailbox
                 .active_reservations_all_aliases(&args.project)
                 .await?
                 .into_iter()
@@ -728,6 +728,26 @@ pub async fn run_guard(mailbox: &Mailbox, cmd: &GuardCommand) -> anyhow::Result<
                     exclusive: r.exclusive,
                 })
                 .collect::<Vec<_>>();
+            // bd-guard-crossproject-lease-er38: one lease covers every
+            // spelling. Merge other-project HELD leases that escape into
+            // this repo (`../<repo>/...`), translated to repo-relative
+            // globs, and normalize the same spelling on own-project leases.
+            if let Some(repo_name) = std::path::Path::new(&args.repo)
+                .file_name()
+                .and_then(|n| n.to_str())
+            {
+                let foreign = mailbox
+                    .active_reservations_escaping_into(&args.project, repo_name)
+                    .await?
+                    .into_iter()
+                    .map(|r| toron_core::mailbox::guard::Reservation {
+                        holder: r.agent_name,
+                        pattern: r.path_pattern,
+                        exclusive: r.exclusive,
+                    })
+                    .collect::<Vec<_>>();
+                merge_cross_project_leases(&mut reservations, repo_name, foreign);
+            }
             finish_guard_check(args, agent.as_deref(), &staged, &reservations)
         }
     }
@@ -911,16 +931,77 @@ pub async fn run_guard_daemon(dc: &DaemonClient, cmd: &GuardCommand) -> anyhow::
         GuardCommand::Check(args) => {
             let agent = guard_agent(args);
             let staged = toron_core::mailbox::guard::staged_paths_in(&args.repo);
-            let reservations = daemon_guard_roster(dc, &args.project)
-                .await
-                .with_context(|| {
-                    format!(
-                        "guard check: cannot list reservations for project {} from the daemon \
+            let mut reservations =
+                daemon_guard_roster(dc, &args.project)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "guard check: cannot list reservations for project {} from the daemon \
                          (is `toron serve --mcp-http` running?)",
-                        args.project
-                    )
-                })?;
+                            args.project
+                        )
+                    })?;
+            // bd-guard-crossproject-lease-er38: the roster resource is
+            // project-scoped, so foreign-project leases escape it. Augment
+            // from the durable root (the same store the daemon serves);
+            // best-effort — on failure the guard degrades to the old
+            // project-scoped behavior, never blocks harder.
+            if let Some(repo_name) = std::path::Path::new(&args.repo)
+                .file_name()
+                .and_then(|n| n.to_str())
+            {
+                if let Ok(mb) = toron_mcp::demo_mailbox().await {
+                    match mb
+                        .active_reservations_escaping_into(&args.project, repo_name)
+                        .await
+                    {
+                        Ok(foreign) => merge_cross_project_leases(
+                            &mut reservations,
+                            repo_name,
+                            foreign
+                                .into_iter()
+                                .map(|r| toron_core::mailbox::guard::Reservation {
+                                    holder: r.agent_name,
+                                    pattern: r.path_pattern,
+                                    exclusive: r.exclusive,
+                                }),
+                        ),
+                        Err(_) => {}
+                    }
+                }
+            }
             finish_guard_check(args, agent.as_deref(), &staged, &reservations)
+        }
+    }
+}
+
+/// bd-guard-crossproject-lease-er38: one lease covers every spelling.
+/// Append foreign-project leases whose `../<repo>/…` pattern escapes into
+/// the guarded `repo_name` (translated to a repo-relative glob), then
+/// normalize the same spelling on entries already present so a
+/// workspace-root-relative lease covers its own repo too.
+fn merge_cross_project_leases(
+    reservations: &mut Vec<toron_core::mailbox::guard::Reservation>,
+    repo_name: &str,
+    foreign: impl IntoIterator<Item = toron_core::mailbox::guard::Reservation>,
+) {
+    for r in foreign {
+        let Some(pattern) =
+            toron_core::mailbox::guard::cross_project_pattern(&r.pattern, repo_name)
+        else {
+            continue;
+        };
+        reservations.push(toron_core::mailbox::guard::Reservation {
+            holder: r.holder,
+            pattern,
+            exclusive: r.exclusive,
+        });
+    }
+    for r in reservations.iter_mut() {
+        if let Some(pattern) =
+            toron_core::mailbox::guard::cross_project_pattern(&r.pattern, repo_name)
+        {
+            r.pattern = pattern;
         }
     }
 }
