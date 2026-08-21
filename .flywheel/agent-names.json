@@ -1,26 +1,20 @@
 [
   {
-    "pane_id": "w81:p1",
-    "name": "flywheel-toron-coder",
-    "profile": "coder",
-    "harness": "omp",
-    "mail_identity": "BlueRidge",
+    "pane_id": "w87:p1",
+    "name": "flywheel-toron-oc",
+    "mail_identity": "SandySparrow",
     "skills_injected": false
   },
   {
-    "pane_id": "w81:p2",
-    "name": "flywheel-toron-coder2",
-    "profile": "coder",
-    "harness": "omp",
-    "mail_identity": "LilacChapel",
+    "pane_id": "w87:p2",
+    "name": "flywheel-toron-oc2",
+    "mail_identity": "TealDune",
     "skills_injected": false
   },
   {
-    "pane_id": "w81:p3",
-    "name": "flywheel-toron-coder3",
-    "profile": "coder",
-    "harness": "omp",
-    "mail_identity": "RusticBarn",
+    "pane_id": "w87:p3",
+    "name": "flywheel-toron-oc3",
+    "mail_identity": "TanFern",
     "skills_injected": false
   }
 ]

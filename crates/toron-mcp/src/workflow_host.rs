@@ -561,9 +561,19 @@ impl WorkflowHost {
     }
 }
 
+/// Test helper (bd-dispatch-spec-untyped-0iud migration): build a
+/// [`toron_workflow::schema::DispatchSpec`] from raw JSON — the migration
+/// rewrote legacy `spec: json!(...)` call sites to this helper but never
+/// defined it, leaving the lib-test target red (12 E0425s). Found in the
+/// post-wave adversarial review 2026-08-21.
+#[cfg(test)]
+pub(crate) fn test_spec(v: serde_json::Value) -> toron_workflow::schema::DispatchSpec {
+    serde_json::from_value(v).expect("test spec parses as DispatchSpec")
+}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// A minimal signed kind-14 event with optional tags, for trigger tests.
@@ -1122,9 +1132,7 @@ mod tests {
                 .map(|i| InboundMention {
                     assignee: "gk".into(),
                     parent: parent.into(),
-                    spec: crate::workflow_host::test_spec(
-                        json!({ "text": format!("mention {i}") }),
-                    ),
+                    spec: json!({ "text": format!("mention {i}") }),
                 })
                 .collect(),
             first_arrival_ms: 0,
