@@ -30,6 +30,22 @@ async fn daemon_tool(dc: &DaemonClient, tool: &str, args: serde_json::Value) -> 
     print_json(&out)
 }
 
+/// [`daemon_tool`] with an explicit deadline (bd-gtqe): interactive robot
+/// paths like `reserve respond` must complete or fail loudly inside seconds,
+/// never park silently on an unresponsive daemon.
+async fn daemon_tool_within(
+    dc: &DaemonClient,
+    tool: &str,
+    args: serde_json::Value,
+    deadline: std::time::Duration,
+) -> anyhow::Result<()> {
+    let out = dc.call_tool_within(tool, args, deadline).await?;
+    print_json(&out)
+}
+
+/// Deadline for `reserve respond` (bd-gtqe VERIFY): completes or errors <5s.
+const RESPOND_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Print a result's MCP-parity JSON shape to stdout (always pretty JSON).
 fn emit<T: ToJson>(result: T) -> anyhow::Result<()> {
     print_json(&result.to_json())
@@ -480,7 +496,7 @@ pub async fn run_reserve_daemon(dc: &DaemonClient, cmd: &ReserveCommand) -> anyh
             .await
         }
         ReserveCommand::Respond(args) => {
-            daemon_tool(
+            daemon_tool_within(
                 dc,
                 "reply_message",
                 json!({
@@ -493,6 +509,7 @@ pub async fn run_reserve_daemon(dc: &DaemonClient, cmd: &ReserveCommand) -> anyh
                     "release_decision": args.decision,
                     "reservation_note": args.note,
                 }),
+                RESPOND_DEADLINE,
             )
             .await
         }
