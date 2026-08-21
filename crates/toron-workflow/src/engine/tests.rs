@@ -1395,3 +1395,37 @@ fn probe_candidate_hits_local_listener() {
     // the live case was asserted BEFORE the drop above.
     let _ = &url;
 }
+
+/// bd-compose-not-durable-oxjy: crash-resume equivalence between entry
+/// doors. A redelivered run_id (crash after checkpoint, orchestrator retry)
+/// replays the RECORDED execution instead of re-running steps — the same
+/// durability semantics a catalog/trigger run gets, now pinned for ANY
+/// `WorkflowEngine::invoke` caller (compose --run included).
+#[tokio::test(flavor = "multi_thread")]
+async fn invoke_redelivery_replays_recorded_run() {
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let calls_c = calls.clone();
+    let runner: ActionRunner = std::sync::Arc::new(move |_a: &Action| {
+        calls_c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(serde_json::json!({ "ok": true }))
+    });
+    let engine = WorkflowEngine::local(runner).expect("local engine");
+    let wf = crate::parse_workflow(
+        "name: t\nsteps:\n  - name: a\n    action: send_message\n    to: [x]\n    subject: s\n    body: b\n",
+    )
+    .expect("parse");
+    let first = engine
+        .invoke("redeliver-once", wf.clone(), serde_json::json!({}))
+        .await
+        .expect("first run");
+    let redelivery = engine
+        .invoke("redeliver-once", wf.clone(), serde_json::json!({}))
+        .await
+        .expect("redelivered run");
+    assert_eq!(first, redelivery, "redelivery returns the recorded output");
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "steps execute exactly once across redelivery"
+    );
+}
