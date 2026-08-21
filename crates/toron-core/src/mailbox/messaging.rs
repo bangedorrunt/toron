@@ -790,10 +790,19 @@ impl Mailbox {
             (args.bcc.iter().collect::<Vec<_>>(), RecipientRole::Bcc),
         ] {
             for name in names {
-                let npub = if super::naming::is_npub(name) {
-                    // ADR-0018: an npub is always a routing address.
-                    nostr_sdk::nostr::PublicKey::from_hex(name)
-                        .map_err(|_| anyhow::anyhow!("invalid npub recipient: {name}"))?
+                // bd-wh6k: the ROW carries the CANONICAL recipient name — in
+                // Swarm mode the post-fold resolve_agent_name target — never
+                // the raw caller string. Downstream views key on this label;
+                // storing a folded slug forked one delivery into two
+                // disjoint inbox views whose read state can never meet.
+                let (row_name, npub) = if super::naming::is_npub(name) {
+                    // ADR-0018: an npub is always a routing address (and its
+                    // own canonical label).
+                    (
+                        name.clone(),
+                        nostr_sdk::nostr::PublicKey::from_hex(name)
+                            .map_err(|_| anyhow::anyhow!("invalid npub recipient: {name}"))?,
+                    )
                 } else if mode == super::naming::IdentityMode::Swarm {
                     // ADR-0018 D1a/D3 + bd-pin-public-plane-s-easy.1:
                     // canonical names, REGISTERED adjective+noun pins, or
@@ -804,26 +813,28 @@ impl Mailbox {
                     // pins are routing targets; unregistered free strings
                     // are not).
                     let target = self.resolve_agent_name(&args.project_slug, name).await?;
-                    nident::resolve_name(&args.project_slug, profiles.iter(), &target).ok_or_else(
-                        || {
-                            anyhow::anyhow!(
-                                "unknown recipient: {target} (register it in project {} first)",
-                                args.project_slug
-                            )
-                        },
-                    )?
+                    let npub = nident::resolve_name(&args.project_slug, profiles.iter(), &target)
+                        .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "unknown recipient: {target} (register it in project {} first)",
+                            args.project_slug
+                        )
+                    })?;
+                    (target, npub)
                 } else {
-                    nident::resolve_name(&args.project_slug, profiles.iter(), name).ok_or_else(
-                        || {
-                            anyhow::anyhow!(
-                                "unknown recipient: {name} (register it in project {} first)",
-                                args.project_slug
-                            )
-                        },
-                    )?
+                    (
+                        name.clone(),
+                        nident::resolve_name(&args.project_slug, profiles.iter(), name)
+                            .ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "unknown recipient: {name} (register it in project {} first)",
+                                    args.project_slug
+                                )
+                            })?,
+                    )
                 };
                 out.push(ResolvedRecipient {
-                    name: name.clone(),
+                    name: row_name,
                     npub,
                     role,
                 });
@@ -2189,6 +2200,81 @@ mod tests {
             .expect("send to slug resolves via fold");
         let wraps = wraps_to(&mailbox, &recv_npub, 2).await;
         assert_eq!(wraps.len(), 1, "slug folds to pin npub");
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// bd-wh6k regression: the resolved ROW carries the canonical pin.
+    /// Send to the folded slug → the delivery row names the PIN; read state
+    /// written via the slug lands under the same npub; fetch-as-pin sees it
+    /// READ and fetch-as-slug lists NO distinct unread copy (one inbox, one
+    /// label — the slug view can never fork a parallel unread row).
+    #[tokio::test]
+    async fn swarm_slug_send_rows_canonical_pin_single_read_state() {
+        let (mailbox, _pool, db_path, data_dir) = test_mailbox_with_pool("slug-row-pin").await;
+        mailbox.ensure_project("toron").await.expect("ensure");
+        mailbox
+            .register_agent("toron", &profile("flywheel-toron-oc"))
+            .await
+            .expect("sender");
+        let (_recv_keys, _recv_npub) = register(&mailbox, "toron", "BlueRidge").await;
+        mailbox.set_identity_mode("toron", "swarm").await;
+        mailbox
+            .fold_agent_name_alias("toron", "flywheel-toron-coder", "BlueRidge")
+            .await;
+
+        // Send TO the slug → the delivery ROW names the pin, not the slug.
+        let sent = mailbox
+            .send_message(&send_args(
+                "toron",
+                "flywheel-toron-oc",
+                &["flywheel-toron-coder"],
+            ))
+            .await
+            .expect("send to slug");
+        assert_eq!(sent.count, 1);
+        assert_eq!(
+            sent.deliveries[0].payload.recipient, "BlueRidge",
+            "row recipient is the post-fold canonical pin"
+        );
+
+        // Read AS the slug → receipt keyed by the pin's npub (one identity).
+        let id = sent.deliveries[0].payload.event_id.clone();
+        mailbox
+            .mark_message_read("toron", "flywheel-toron-coder", &id)
+            .await
+            .expect("read as slug");
+
+        // Fetch-as-PIN: seen, and READ (the two views' states met).
+        let as_pin = mailbox
+            .fetch_inbox(&FetchInbox {
+                project_slug: "toron".into(),
+                agent_name: "BlueRidge".into(),
+                ..Default::default()
+            })
+            .await
+            .expect("fetch as pin");
+        assert_eq!(as_pin.len(), 1, "pin view sees the delivery");
+        assert!(
+            as_pin[0].read_ts_us.is_some(),
+            "slug-written read state is visible to the pin view"
+        );
+
+        // Fetch-as-SLUG unread-only: NO distinct unread copy remains.
+        let as_slug_unread = mailbox
+            .fetch_inbox(&FetchInbox {
+                project_slug: "toron".into(),
+                agent_name: "flywheel-toron-coder".into(),
+                unread_only: true,
+                ..Default::default()
+            })
+            .await
+            .expect("fetch as slug");
+        assert!(
+            as_slug_unread.is_empty(),
+            "slug view is not a parallel unread inbox"
+        );
 
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_dir_all(&data_dir);
