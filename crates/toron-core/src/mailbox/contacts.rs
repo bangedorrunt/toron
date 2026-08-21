@@ -102,6 +102,29 @@ pub struct RespondContact {
 }
 
 impl Mailbox {
+    /// Find the project an agent npub belongs to (first project whose
+    /// kind-30013 profile is authored by `npub`). Empty when unknown.
+    ///
+    /// Single-npub cost only — bulk paths must use
+    /// [`BusPolicySource::load_roster`] (bd-gtqe: this is O(projects)
+    /// full-store replays per npub).
+    pub(crate) async fn project_for_npub(&self, npub: &PublicKey) -> String {
+        // Scan known projects on disk (data_dir/*).
+        let Ok(entries) = std::fs::read_dir(&self.data_dir) else {
+            return String::new();
+        };
+        for entry in entries.flatten() {
+            let slug = entry.file_name().to_string_lossy().to_string();
+            let filter = kind_project_filter(toron_kind(AGENT_PROFILE), &slug);
+            if let Ok(events) = collect_replay(self.bus.as_ref(), filter).await
+                && events.iter().any(|e| e.pubkey == *npub)
+            {
+                return slug;
+            }
+        }
+        String::new()
+    }
+
     /// `request_contact`: send a NIP-17 control message to the peer + record a
     /// pending AgentLink in the index.
     pub async fn request_contact(&self, args: &RequestContact) -> anyhow::Result<ContactLink> {
@@ -442,6 +465,70 @@ impl BusPolicySource {
         }
         source
     }
+
+    /// Bulk snapshot straight from the registration roster (bd-gtqe).
+    ///
+    /// `roster` rows are `(project_slug, name, pubkey_hex)` exactly as read
+    /// from the agents index. Projects are already known, so there are NO
+    /// profile lookups and ONE kind-30014 replay per DISTINCT project —
+    /// versus O(agents × projects) full-store scans in [`Self::load_many`],
+    /// which pinned the daemon at 100% CPU and starved every tool handler
+    /// (the bd-gtqe silent-hang family). Approved-link SQL unchanged.
+    pub(crate) async fn load_roster(
+        mailbox: &Mailbox,
+        roster: &[(String, String, String)],
+    ) -> Self {
+        let source = Self::default();
+        if roster.is_empty() {
+            return source;
+        }
+        // ONE policy replay per distinct project.
+        let mut by_project: std::collections::BTreeMap<&str, Vec<&str>> =
+            std::collections::BTreeMap::new();
+        for (slug, _name, hex) in roster {
+            by_project
+                .entry(slug.as_str())
+                .or_default()
+                .push(hex.as_str());
+        }
+        for (slug, hexes) in &by_project {
+            let filter = kind_project_filter(toron_kind(CONTACT_POLICY), slug);
+            let Ok(events) = collect_replay(mailbox.bus.as_ref(), filter).await else {
+                continue;
+            };
+            for hex in hexes {
+                if let Some(policy) = events
+                    .iter()
+                    .filter(|e| e.pubkey.to_hex() == *hex)
+                    .max_by_key(|e| e.created_at.as_secs())
+                    .map(|e| ContactPolicy::parse(&e.content))
+                {
+                    source.policies.write().insert((*hex).to_string(), policy);
+                }
+            }
+        }
+        // Approved links (one indexed query per agent — SQLite-local).
+        if let Some(pool) = mailbox.index_pool() {
+            for (_slug, _name, hex) in roster {
+                let rows = sqlx::query(
+                    "SELECT from_pubkey, to_pubkey FROM contacts \
+                     WHERE status = 'approved' AND (from_pubkey = ?1 OR to_pubkey = ?1)",
+                )
+                .bind(hex)
+                .fetch_all(pool)
+                .await;
+                if let Ok(rows) = rows {
+                    let mut approved = source.approved.write();
+                    for row in rows {
+                        let a: String = row.get("from_pubkey");
+                        let b: String = row.get("to_pubkey");
+                        approved.insert((a.clone(), b.clone()));
+                    }
+                }
+            }
+        }
+        source
+    }
 }
 
 impl crate::mailbox::unwrap::PolicySource for BusPolicySource {
@@ -461,27 +548,6 @@ impl crate::mailbox::unwrap::PolicySource for BusPolicySource {
                 .approved
                 .read()
                 .contains(&(sender.to_hex(), recipient.to_hex()))
-    }
-}
-
-impl Mailbox {
-    /// Find the project an agent npub belongs to (first project whose
-    /// kind-30013 profile is authored by `npub`). Empty when unknown.
-    async fn project_for_npub(&self, npub: &PublicKey) -> String {
-        // Scan known projects on disk (data_dir/*).
-        let Ok(entries) = std::fs::read_dir(&self.data_dir) else {
-            return String::new();
-        };
-        for entry in entries.flatten() {
-            let slug = entry.file_name().to_string_lossy().to_string();
-            let filter = kind_project_filter(toron_kind(AGENT_PROFILE), &slug);
-            if let Ok(events) = collect_replay(self.bus.as_ref(), filter).await
-                && events.iter().any(|e| e.pubkey == *npub)
-            {
-                return slug;
-            }
-        }
-        String::new()
     }
 }
 

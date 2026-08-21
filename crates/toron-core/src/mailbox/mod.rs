@@ -262,9 +262,16 @@ impl Mailbox {
         })
     }
 
+    /// Minimum spacing between unwrap-pipeline build attempts (bd-gtqe).
+    /// A build fans out into per-agent bus replays (`load_many` →
+    /// `contact_policy_for` → `collect_replay` per roster npub); retrying it
+    /// per inbound event starved the runtime and hung every tool call.
+    const UNWRAP_REBUILD_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
     /// Drive the unwrap loop to completion (runs until the subscription
     /// closes). See [`Self::spawn_unwrap_loop`].
     async fn run_unwrap_loop(&self) -> anyhow::Result<()> {
+        let mut policy = UnwrapRebuildPolicy::new(Self::UNWRAP_REBUILD_MIN_INTERVAL);
         let mut sub = self
             .bus
             .subscribe(Filter::new().kinds([nostr_sdk::nostr::Kind::GiftWrap]))
@@ -281,12 +288,17 @@ impl Mailbox {
                 continue;
             }
             let sig = self.local_agent_signature();
-            let rebuild = match &current {
-                Some((s, _)) => s != &sig,
-                None => true,
-            };
+            let rebuild = policy.should_rebuild(
+                current.as_ref().map(|(s, _)| s.as_str()),
+                &sig,
+                std::time::Instant::now(),
+            );
             if rebuild {
-                current = self.build_unwrap_pipeline().await.map(|p| (sig.clone(), p));
+                // Record BEFORE the await: a build that fails or yields None
+                // must still consume this event's rebuild budget (bd-gtqe —
+                // per-event retry of a doomed build pinned a core at 100%).
+                policy.record_attempt(sig.clone(), std::time::Instant::now());
+                current = self.build_unwrap_pipeline().await.map(|p| (sig, p));
             }
             if let Some((_, pipeline)) = &current {
                 // bd-verify-once-ph7t: this loop consumes ONLY bus-delivered
@@ -387,16 +399,13 @@ impl Mailbox {
             .map(|(_slug, name, npub)| (npub.clone(), name.clone()))
             .collect();
         let npub_to_project: std::collections::HashMap<String, String> = roster
-            .into_iter()
-            .map(|(slug, _name, npub)| (npub, slug))
+            .iter()
+            .map(|(slug, _name, npub)| (npub.clone(), slug.clone()))
             .collect();
         // Policy over the registered roster (pubkeys from the index — no KDF).
-        let roster_npubs: Vec<nostr_sdk::nostr::PublicKey> = npub_to_project
-            .keys()
-            .filter_map(|h| nostr_sdk::nostr::PublicKey::parse(h).ok())
-            .collect();
-        let refs: Vec<&nostr_sdk::nostr::PublicKey> = roster_npubs.iter().collect();
-        let source = Arc::new(BusPolicySource::load_many(self, &refs).await);
+        // bd-gtqe: roster-direct bulk load — ONE kind-30014 replay per
+        // distinct project, no per-npub profile scans.
+        let source = Arc::new(BusPolicySource::load_roster(self, &roster).await);
         let sqlite: Arc<dyn ProjectionSink> = Arc::new(
             SqliteProjectionSink::new(pool.clone())
                 .with_projects(npub_to_project.clone())
@@ -476,12 +485,119 @@ pub async fn collect_replay(bus: &dyn Bus, filter: Filter) -> Result<Vec<Event>,
     Ok(events)
 }
 
+/// Rebuild gate for the inbound unwrap pipeline (bd-gtqe).
+///
+/// A pipeline build is expensive: it queries the agents roster and fans out
+/// into a bus replay per registered npub (`load_many` → `contact_policy_for`
+/// → `collect_replay`). Re-attempting it on every inbound event — because the
+/// previous attempt failed, or because key files under `data_dir` flap the
+/// signature — pinned a daemon core at 100% CPU and starved every other tool
+/// handler (the bd-gtqe silent-hang family). The policy: rebuild when the
+/// live pipeline's signature no longer matches, but never more often than
+/// `min_interval` regardless of how events arrive.
+struct UnwrapRebuildPolicy {
+    last_attempt_at: Option<std::time::Instant>,
+    min_interval: std::time::Duration,
+}
+
+impl UnwrapRebuildPolicy {
+    fn new(min_interval: std::time::Duration) -> Self {
+        Self {
+            last_attempt_at: None,
+            min_interval,
+        }
+    }
+
+    /// Decide whether a pipeline build may start now.
+    ///
+    /// `current_sig` is the signature of the successfully-built pipeline
+    /// (`None` until one succeeds); `sig` is the current key-set signature.
+    fn should_rebuild(
+        &self,
+        current_sig: Option<&str>,
+        sig: &str,
+        now: std::time::Instant,
+    ) -> bool {
+        if current_sig == Some(sig) {
+            return false;
+        }
+        match self.last_attempt_at {
+            Some(t) => now.duration_since(t) >= self.min_interval,
+            None => true,
+        }
+    }
+
+    /// Record an attempt BEFORE awaiting the build so failures consume this
+    /// event's rebuild budget too.
+    fn record_attempt(&mut self, _sig: String, now: std::time::Instant) {
+        self.last_attempt_at = Some(now);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::bus::in_process::{InProcessBus, InProcessBusConfig};
     use crate::index::schema;
     use crate::nostr::identity::AgentProfile;
+
+    // ── bd-gtqe: unwrap-loop rebuild policy ─────────────────────────────
+    // The daemon previously rebuilt the unwrap pipeline on EVERY inbound
+    // event whenever a build could not succeed (and re-built at full speed
+    // under flapping key-set signatures), pinning a worker core at 100% CPU
+    // and starving every other tool handler — the bd-gtqe silent-hang root.
+    use std::time::Duration;
+
+    #[test]
+    fn rebuild_policy_first_event_builds() {
+        let policy = UnwrapRebuildPolicy::new(Duration::from_secs(2));
+        let now = std::time::Instant::now();
+        assert!(policy.should_rebuild(None, "sig-a", now));
+    }
+
+    #[test]
+    fn rebuild_policy_failed_build_not_retried_per_event() {
+        // THE regression: build failed (current stays None) → identical sig
+        // must NOT trigger another attempt per inbound event.
+        let mut policy = UnwrapRebuildPolicy::new(Duration::from_secs(2));
+        let now = std::time::Instant::now();
+        assert!(policy.should_rebuild(None, "sig-a", now));
+        policy.record_attempt("sig-a".into(), now);
+        assert!(
+            !policy.should_rebuild(None, "sig-a", now + Duration::from_millis(100)),
+            "identical failed sig must be rate-limited, not retried per event"
+        );
+    }
+
+    #[test]
+    fn rebuild_policy_rate_limits_changed_sig_within_interval() {
+        let mut policy = UnwrapRebuildPolicy::new(Duration::from_secs(2));
+        let now = std::time::Instant::now();
+        policy.record_attempt("sig-a".into(), now);
+        assert!(
+            !policy.should_rebuild(None, "sig-b", now + Duration::from_millis(1999)),
+            "inside the interval even a changed sig waits (flap guard)"
+        );
+        assert!(
+            policy.should_rebuild(None, "sig-b", now + Duration::from_secs(2)),
+            "after the interval a new sig builds"
+        );
+    }
+
+    #[test]
+    fn rebuild_policy_live_pipeline_matching_sig_skips() {
+        let mut policy = UnwrapRebuildPolicy::new(Duration::from_secs(2));
+        let now = std::time::Instant::now();
+        policy.record_attempt("sig-a".into(), now);
+        assert!(
+            !policy.should_rebuild(Some("sig-a"), "sig-a", now + Duration::from_secs(60)),
+            "live pipeline already matches — no rebuild"
+        );
+        assert!(
+            policy.should_rebuild(Some("sig-old"), "sig-new", now + Duration::from_secs(60)),
+            "changed key set after interval — rebuild"
+        );
+    }
 
     /// Recursively collect `*.json` files under `root` (the Git archive's
     /// `messages/{YYYY}/{MM}/` tree) — the G11 path-1 rebuild source.

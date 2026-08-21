@@ -35,6 +35,22 @@ use serde_json::Value;
 /// The default toron daemon MCP endpoint (flywheel `[mail.toron]` default).
 pub const DEFAULT_DAEMON_URL: &str = "http://127.0.0.1:18080/mcp";
 
+/// Hard ceiling for one daemon tool call (bd-gtqe). A wedged daemon used to
+/// park robot CLIs silently for 120s+ with zero output; now the call fails
+/// loudly instead. `TORON_TOOL_TIMEOUT_MS` overrides for slow operations.
+pub const TOOL_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Ceiling for the daemon `initialize` handshake (bd-gtqe).
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+fn tool_call_timeout() -> std::time::Duration {
+    std::env::var("TORON_TOOL_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(std::time::Duration::from_millis)
+        .unwrap_or(TOOL_CALL_TIMEOUT)
+}
+
 /// One live toron daemon connection (rmcp client over Streamable HTTP).
 ///
 /// `call_tool` returns the parsed JSON of the first text content block —
@@ -63,8 +79,9 @@ impl DaemonClient {
             ClientCapabilities::default(),
             Implementation::from_build_env(),
         );
-        let client = client_info
-            .serve_with_lifecycle(
+        let client = tokio::time::timeout(
+            CONNECT_TIMEOUT,
+            client_info.serve_with_lifecycle(
                 transport,
                 ClientLifecycleMode::Discover {
                     preferred_versions: vec![
@@ -72,9 +89,16 @@ impl DaemonClient {
                         ProtocolVersion::V_2025_11_25,
                     ],
                 },
+            ),
+        )
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "daemon connect timed out after {}s (is `toron serve --mcp-http` running and responsive?)",
+                CONNECT_TIMEOUT.as_secs()
             )
-            .await
-            .context("daemon connect (is `toron serve --mcp-http` running?)")?;
+        })?
+        .context("daemon connect (is `toron serve --mcp-http` running?)")?;
         Ok(Self {
             client: Arc::new(client),
         })
@@ -82,13 +106,32 @@ impl DaemonClient {
 
     /// Call an MCP tool by name, returning the parsed JSON payload of the
     /// first text content block. Tool errors surface as anyhow errors.
+    ///
+    /// Bounded by [`tool_call_timeout`] (bd-gtqe): a daemon that accepts the
+    /// request but never answers produces a loud timeout error instead of an
+    /// unbounded silent park. Use [`Self::call_tool_within`] for paths that
+    /// need a tighter deadline.
     pub async fn call_tool(&self, tool: &str, args: Value) -> anyhow::Result<Value> {
+        self.call_tool_within(tool, args, tool_call_timeout()).await
+    }
+
+    /// [`Self::call_tool`] with an explicit deadline (bd-gtqe).
+    pub async fn call_tool_within(
+        &self,
+        tool: &str,
+        args: Value,
+        deadline: std::time::Duration,
+    ) -> anyhow::Result<Value> {
         let params = CallToolRequestParams::new(tool.to_string())
             .with_arguments(args.as_object().cloned().unwrap_or_default());
-        let result = self
-            .client
-            .call_tool(params)
+        let result = tokio::time::timeout(deadline, self.client.call_tool(params))
             .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "call_tool({tool}) timed out after {}s — daemon unresponsive (bd-gtqe loud-fail; was a silent hang)",
+                    deadline.as_secs()
+                )
+            })?
             .with_context(|| format!("call_tool({tool}) transport error"))?;
         if result.is_error.unwrap_or(false) {
             anyhow::bail!("tool {tool} returned an error result: {:?}", result.content);
