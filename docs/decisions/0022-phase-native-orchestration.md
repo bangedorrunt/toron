@@ -1,6 +1,6 @@
 <!-- governed-by: ADR-0005, ADR-0010, ADR-0015, ADR-0019, ADR-0020 -->
 ---
-status: proposed
+status: accepted
 date: 2026-08-21
 decision-makers: Captain (bangedorrunt)
 consulted: fresh-eyes flywheel × toron seam review (2026-08-21); bd-8xca compose live acceptance; bd-4spn unwired-surface precedent
@@ -9,7 +9,7 @@ informed: flywheel maintainers; skill owners (toron, flywheel, runtime-adaptatio
 
 # ADR-0022: Phase-Native Orchestration — typed JobSpec, harness phase mechanics, and one durable execution rail
 
-**Status:** Proposed (2026-08-21)
+**Status:** Accepted (2026-08-21; umbrella + wave beads filed, 3-opencode crew steered via the durable loop)
 **Date:** 2026-08-21
 **Decision-makers:** Captain (bangedorrunt)
 **Extends:** [ADR-0005](0005-orchestration-layer.md) (orchestration tier — this ADR gives `dispatch_job` a typed spec contract), [ADR-0010](0010-execution-wiring-model-registry-headless.md) (model registry + headless — the phase registry extends `model_args`), [ADR-0012](0012-standalone-cron-type.md) (cron stays a distinct type; this ADR adds a `--live` amendment note)
