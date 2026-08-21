@@ -16,6 +16,7 @@ use sqlx::Row;
 use sqlx::SqlitePool;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
 use nostr_sdk::nostr::{Alphabet, Event, JsonUtil, SingleLetterTag, TagKind, Timestamp};
@@ -29,19 +30,6 @@ pub const MAX_STORED_EVENTS: i64 = 100_000;
 /// a memo, never the source of truth, so the worst case after a clear is one
 /// cold re-parse per row on the next replay.
 const HOT_CACHE_CAP: usize = 10_000;
-
-/// bd-replay-tag-pushdown-lurm: rows parsed in `replay()` (test-only
-/// instrumented counter; the acceptance gate asserts the SQL prefilter
-/// shrinks the parsed set to the matched rows).
-#[cfg(test)]
-pub(crate) static PARSED_ROWS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-
-/// bd-py9o: rows hydrated from the hot memo in `replay()` (test-only; the
-/// incremental-replay gate asserts a second identical replay parses ZERO
-/// rows and hits the memo for every row).
-#[cfg(test)]
-pub(crate) static HOT_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// The bus event table DDL (idempotent).
 pub const EVENT_TABLE_DDL: &str = "
@@ -57,6 +45,10 @@ CREATE TABLE IF NOT EXISTS bus_events (
 CREATE INDEX IF NOT EXISTS bus_events_created_at ON bus_events (created_at);
 CREATE INDEX IF NOT EXISTS bus_events_kind ON bus_events (kind);
 CREATE INDEX IF NOT EXISTS bus_events_addressable ON bus_events (kind, author, d_tag);
+CREATE TABLE IF NOT EXISTS bus_meta (
+    key   TEXT PRIMARY KEY,
+    value INTEGER NOT NULL
+);
 ";
 
 /// p/e tag index DDL (bd-replay-tag-pushdown-lurm). The `p`/`e` tag values
@@ -74,6 +66,61 @@ CREATE TABLE IF NOT EXISTS bus_event_tags (
 CREATE INDEX IF NOT EXISTS bus_event_tags_kind_value ON bus_event_tags (tag_kind, tag_value);
 ";
 
+/// bd-3gwy: entry cap for the per-filter snapshot memo. Fleet polling
+/// rotates dozens of distinct inbox filters; 64 slots keeps every active
+/// filter's matched-id list warm. Overflow evicts the oldest entry.
+const SNAPSHOT_MEMO_CAP: usize = 64;
+
+/// Exact-compare key for the snapshot memo: everything that decides the
+/// phase-1 SQL (and therefore the matched id set). Hashed for lookup,
+/// compared for safety — a hash collision can never serve another filter's
+/// ids. Non-pushed predicates (#t, since/until, authors, ids, search) ride
+/// in `extra` so distinct filters never share an entry.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct FilterKey {
+    kinds: Vec<i64>,
+    p: Vec<String>,
+    e: Vec<String>,
+    limit: usize,
+    sql_exact: bool,
+    extra: String,
+}
+
+/// One memoized snapshot: the ordered matched-id list plus the store
+/// version it was computed at. The version lives IN SQLite (`bus_meta`,
+/// bd-3gwy) — every writer instance bumps it through SQL and every reader
+/// compares against the same authoritative number, so instances over one
+/// pool/file invalidate each other correctly with no shared registry.
+struct SnapMemo {
+    key: FilterKey,
+    version: i64,
+    ids: Arc<Vec<String>>,
+}
+
+#[derive(Default)]
+struct SnapMemos {
+    map: HashMap<u64, SnapMemo>,
+    order: std::collections::VecDeque<u64>,
+}
+
+impl SnapMemos {
+    fn get(&self, hash: u64) -> Option<&SnapMemo> {
+        self.map.get(&hash)
+    }
+
+    fn put(&mut self, hash: u64, memo: SnapMemo) {
+        if !self.map.contains_key(&hash)
+            && self.map.len() >= SNAPSHOT_MEMO_CAP
+            && let Some(oldest) = self.order.pop_front()
+        {
+            self.map.remove(&oldest);
+        }
+        self.map.insert(hash, memo);
+        self.order.retain(|h| *h != hash);
+        self.order.push_back(hash);
+    }
+}
+
 /// SQLite event store for the in-process bus.
 #[derive(Clone)]
 pub struct BusEventStore {
@@ -86,6 +133,18 @@ pub struct BusEventStore {
     /// the source of truth (only ids returned by SQL are ever surfaced, and
     /// `match_event` still gates every hydrated row).
     hot: Arc<parking_lot::Mutex<HashMap<String, Arc<Event>>>>,
+    /// bd-3gwy: per-filter snapshot memo. Validity is checked against the
+    /// authoritative mutation counter in `bus_meta` (SQL): any insert /
+    /// supersede / prune bumps it, so every instance invalidates. While
+    /// expiring events exist the memo is bypassed entirely (TTL kinds must
+    /// be re-evaluated against `now`, never served from a snapshot).
+    snaps: Arc<parking_lot::Mutex<SnapMemos>>,
+    /// bd-py9o/bd-3gwy measurement counters (per instance — globals would
+    /// cross-contaminate under parallel tests). Rows parsed from raw_json,
+    /// rows hydrated from the hot memo, phase-1 id-scans executed.
+    parsed_rows: Arc<AtomicU64>,
+    hot_hits: Arc<AtomicU64>,
+    sql_scans: Arc<AtomicU64>,
 }
 
 impl BusEventStore {
@@ -97,6 +156,10 @@ impl BusEventStore {
         Ok(Self {
             pool,
             hot: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            snaps: Arc::new(parking_lot::Mutex::new(SnapMemos::default())),
+            parsed_rows: Arc::new(AtomicU64::new(0)),
+            hot_hits: Arc::new(AtomicU64::new(0)),
+            sql_scans: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -196,6 +259,7 @@ impl BusEventStore {
         // ON CONFLICT DO NOTHING reports 0 affected rows for duplicates.
         if result.rows_affected() == 1 {
             self.hot_put(event);
+            self.bump_mutations().await;
         }
         Ok(result.rows_affected() == 1)
     }
@@ -233,6 +297,9 @@ impl BusEventStore {
                 .bind(&key.d)
                 .execute(&self.pool)
                 .await?;
+            if !superseded.is_empty() {
+                self.bump_mutations().await;
+            }
         }
         self.insert(event).await
     }
@@ -303,7 +370,6 @@ impl BusEventStore {
         {
             let placeholders: Vec<String> =
                 (next..next + vals.len()).map(|i| format!("?{i}")).collect();
-            next += vals.len();
             e_binds = vals.iter().cloned().collect();
             preds.push(format!(
                 "event_id IN (SELECT event_id FROM bus_event_tags \
@@ -335,51 +401,93 @@ impl BusEventStore {
                     && (tag == &SingleLetterTag::lowercase(Alphabet::P)
                         || tag == &SingleLetterTag::lowercase(Alphabet::E))
             });
-        let limit_clause = if sql_exact {
-            format!(" LIMIT ?{next}")
-        } else {
-            String::new()
+        // bd-3gwy: snapshot memo key — every input that decides the phase-1
+        // result. Non-pushed predicates ride in `extra` (they change which
+        // rows `match_event` accepts, so distinct values must never share a
+        // memo entry).
+        let mut extra_tags: Vec<(String, Vec<String>)> = filter
+            .generic_tags
+            .iter()
+            .filter(|(tag, vals)| {
+                !vals.is_empty()
+                    && *tag != &SingleLetterTag::lowercase(Alphabet::P)
+                    && *tag != &SingleLetterTag::lowercase(Alphabet::E)
+            })
+            .map(|(tag, vals)| (format!("{tag:?}"), vals.iter().cloned().collect()))
+            .collect();
+        extra_tags.sort();
+        let fkey = FilterKey {
+            kinds: kinds_binds.clone(),
+            p: p_binds.clone(),
+            e: e_binds.clone(),
+            limit,
+            sql_exact,
+            extra: format!(
+                "ids={:?}|authors={:?}|search={:?}|since={:?}|until={:?}|tags={extra_tags:?}",
+                filter.ids, filter.authors, filter.search, filter.since, filter.until
+            ),
         };
-        let inner = format!(
-            "SELECT event_id, created_at FROM bus_events
-             WHERE {}
-             ORDER BY created_at DESC, event_id DESC{limit_clause}",
-            preds.join("\n               AND ")
-        );
-        let sql = format!(
-            "SELECT event_id FROM ({inner})
-             ORDER BY created_at ASC, event_id ASC"
-        );
+        let fhash = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            fkey.hash(&mut h);
+            h.finish()
+        };
 
-        let mut q = sqlx::query_as::<_, (String,)>(&sql).bind(Timestamp::now().as_secs() as i64);
-        for b in kinds_binds {
-            q = q.bind(b);
-        }
-        for b in &p_binds {
-            q = q.bind(b.as_str());
-        }
-        for b in &e_binds {
-            q = q.bind(b.as_str());
-        }
-        if sql_exact {
-            q = q.bind(limit as i64);
-        }
-        // bd-py9o: phase 1 selects ids only. Phase 2 hydrates — hot memo hits
-        // skip the raw_json transfer AND the serde parse entirely; only rows
-        // this process has never parsed are fetched and parsed (once). SQL
-        // stays the source of truth; `match_event` still gates every row.
-        let id_rows: Vec<(String,)> = q.fetch_all(&self.pool).await?;
-        let ids: Vec<String> = id_rows.into_iter().map(|(id,)| id).collect();
+        // bd-3gwy: snapshot memo — identical filter + unchanged store version
+        // (local mutations AND foreign `data_version`) + no expiring rows ⇒
+        // reuse the matched-id list and skip phase-1 SQL entirely. The two
+        // version probes are cheap seeks vs a join-scan with sort.
+        let memo_ids = if self.any_expiring().await? {
+            None
+        } else {
+            let current = self.current_mutations().await;
+            self.snaps
+                .lock()
+                .get(fhash)
+                .and_then(|m| (m.version == current && m.key == fkey).then(|| m.ids.clone()))
+        };
+        let ids: Arc<Vec<String>> = match memo_ids {
+            Some(ids) => ids,
+            None => {
+                self.sql_scans
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let v0 = self.current_mutations().await;
+                let scanned = self
+                    .scan_ids(
+                        &preds.join("\n               AND "),
+                        kinds_binds,
+                        &p_binds,
+                        &e_binds,
+                        sql_exact,
+                        limit,
+                    )
+                    .await?;
+                let v1 = self.current_mutations().await;
+                // Memoize only tear-free scans of non-expiring stores.
+                if v0 == v1 && !self.any_expiring().await? {
+                    self.snaps.lock().put(
+                        fhash,
+                        SnapMemo {
+                            key: fkey,
+                            version: v1,
+                            ids: Arc::new(scanned.clone()),
+                        },
+                    );
+                }
+                Arc::new(scanned)
+            }
+        };
 
         let mut resolved: HashMap<String, Event> = HashMap::with_capacity(ids.len());
         let mut cold_ids: Vec<String> = Vec::new();
         {
             let hot = self.hot.lock();
-            for id in &ids {
+            for id in ids.iter() {
                 match hot.get(id) {
                     Some(ev) => {
-                        #[cfg(test)]
-                        HOT_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        self.hot_hits
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         resolved.insert(id.clone(), ev.as_ref().clone());
                     }
                     None => cold_ids.push(id.clone()),
@@ -402,8 +510,8 @@ impl BusEventStore {
             }
             let mut hot = self.hot.lock();
             for (id, raw) in rows {
-                #[cfg(test)]
-                PARSED_ROWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.parsed_rows
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if let Ok(ev) = Event::from_json(&raw) {
                     if hot.len() >= HOT_CACHE_CAP {
                         hot.clear();
@@ -415,7 +523,7 @@ impl BusEventStore {
         }
 
         let mut out: Vec<Event> = Vec::with_capacity(ids.len());
-        for id in &ids {
+        for id in ids.iter() {
             if let Some(ev) = resolved.get(id)
                 && filter.match_event(ev, Default::default())
             {
@@ -426,6 +534,19 @@ impl BusEventStore {
             out.drain(0..out.len() - limit);
         }
         Ok(out)
+    }
+
+    /// bd-py9o/bd-3gwy measurement counters (per instance).
+    pub fn parsed_rows(&self) -> u64 {
+        self.parsed_rows.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn hot_hits(&self) -> u64 {
+        self.hot_hits.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn sql_scans(&self) -> u64 {
+        self.sql_scans.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Count of stored events (diagnostics / health).
@@ -463,7 +584,93 @@ impl BusEventStore {
         // and this keeps hot memory from drifting past the live row set.
         // Next replay repopulates incrementally (cold parse per new id only).
         self.hot.lock().clear();
+        // bd-3gwy: pruned rows must never be served from a stale snapshot.
+        self.bump_mutations().await;
         Ok(())
+    }
+
+    /// Bump the authoritative store mutation version in `bus_meta`,
+    /// invalidating every snapshot memo entry of EVERY instance over this
+    /// database at once (bd-3gwy). Best-effort: a failed bump only costs a
+    /// missed invalidation window that the next successful write closes.
+    async fn bump_mutations(&self) {
+        let _ = sqlx::query(
+            "INSERT INTO bus_meta (key, value) VALUES ('mutations', 1) \
+             ON CONFLICT(key) DO UPDATE SET value = value + 1",
+        )
+        .execute(&self.pool)
+        .await;
+    }
+
+    /// Authoritative mutation version from `bus_meta` (bd-3gwy).
+    async fn current_mutations(&self) -> i64 {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COALESCE((SELECT value FROM bus_meta WHERE key = 'mutations'), 0)",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .unwrap_or(0)
+    }
+
+    /// True when any stored event carries an expiration tag. While this is
+    /// true the snapshot memo is bypassed: expiry is evaluated against `now`
+    /// in SQL on every scan, and a snapshot could serve TTL rows stale.
+    /// Gift-wrap/profile/reservation traffic stores no expirations, so the
+    /// common case keeps full memo benefit. Cheap single-column EXISTS.
+    async fn any_expiring(&self) -> anyhow::Result<bool> {
+        let n: i64 = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM bus_events WHERE expires_at IS NOT NULL)",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(n != 0)
+    }
+
+    /// Phase-1 id-scan — the only query the snapshot memo skips (bd-3gwy).
+    /// Newest-tail `limit` when the predicate set fully decides the match
+    /// (bd-cumj), re-emitted in ASC envelope order.
+    async fn scan_ids(
+        &self,
+        preds_sql: &str,
+        kinds_binds: Vec<i64>,
+        p_binds: &[String],
+        e_binds: &[String],
+        sql_exact: bool,
+        limit: usize,
+    ) -> anyhow::Result<Vec<String>> {
+        let next = 2 + kinds_binds.len() + p_binds.len() + e_binds.len();
+        let limit_clause = if sql_exact {
+            format!(" LIMIT ?{next}")
+        } else {
+            String::new()
+        };
+        let inner = format!(
+            "SELECT event_id, created_at FROM bus_events
+             WHERE {preds_sql}
+             ORDER BY created_at DESC, event_id DESC{limit_clause}"
+        );
+        let sql = format!(
+            "SELECT event_id FROM ({inner})
+             ORDER BY created_at ASC, event_id ASC"
+        );
+        let mut q = sqlx::query_as::<_, (String,)>(&sql).bind(Timestamp::now().as_secs() as i64);
+        for b in kinds_binds {
+            q = q.bind(b);
+        }
+        for b in p_binds {
+            q = q.bind(b.as_str());
+        }
+        for b in e_binds {
+            q = q.bind(b.as_str());
+        }
+        if sql_exact {
+            q = q.bind(limit as i64);
+        }
+        Ok(q.fetch_all(&self.pool)
+            .await?
+            .into_iter()
+            .map(|(id,)| id)
+            .collect())
     }
 
     /// Keep-alive interval for the prune loop.
@@ -534,7 +741,6 @@ mod tests {
     /// Only genuinely unseen rows may ever be parsed.
     #[tokio::test]
     async fn test_replay_second_identical_call_parses_zero_rows_bd_py9o() {
-        use std::sync::atomic::Ordering;
         let (store, pool, path) = temp_store().await;
         for i in 0..5 {
             let ev = sample_event(&Keys::generate(), &format!("e{i}"));
@@ -545,17 +751,13 @@ mod tests {
         // Warm instance: inserts memoized each event on arrival.
         let w1 = store.replay(&filter).await.expect("warm replay 1");
         assert_eq!(w1.len(), 5);
-        let p_warm = PARSED_ROWS.load(Ordering::Relaxed);
-        let h_warm = HOT_HITS.load(Ordering::Relaxed);
+        let p_warm = store.parsed_rows();
+        let h_warm = store.hot_hits();
         let w2 = store.replay(&filter).await.expect("warm replay 2");
         assert_eq!(w2.len(), 5);
+        assert_eq!(store.parsed_rows(), p_warm, "a warm replay parses NOTHING");
         assert_eq!(
-            PARSED_ROWS.load(Ordering::Relaxed),
-            p_warm,
-            "a warm replay parses NOTHING"
-        );
-        assert_eq!(
-            HOT_HITS.load(Ordering::Relaxed) - h_warm,
+            store.hot_hits() - h_warm,
             5,
             "the second warm replay served every row from the memo"
         );
@@ -565,11 +767,8 @@ mod tests {
         let cold = BusEventStore::new(pool.clone()).await.expect("cold store");
         let c1 = cold.replay(&filter).await.expect("cold replay 1");
         assert_eq!(c1.len(), 5);
-        let p_cold = PARSED_ROWS.load(Ordering::Relaxed);
-        assert!(
-            p_cold >= p_warm + 5,
-            "cold first replay parses every row from SQL"
-        );
+        let p_cold = cold.parsed_rows();
+        assert!(p_cold >= 5, "cold first replay parses every row from SQL");
         let c2 = cold.replay(&filter).await.expect("cold replay 2");
         assert_eq!(c2.len(), 5);
         assert_eq!(
@@ -578,7 +777,7 @@ mod tests {
             "identical envelope order across replays"
         );
         assert_eq!(
-            PARSED_ROWS.load(Ordering::Relaxed),
+            cold.parsed_rows(),
             p_cold,
             "SECOND identical replay must parse ZERO rows (bd-py9o)"
         );
@@ -593,10 +792,106 @@ mod tests {
         let c3 = cold.replay(&filter).await.expect("cold replay 3");
         assert_eq!(c3.len(), 6);
         assert_eq!(
-            PARSED_ROWS.load(Ordering::Relaxed),
+            cold.parsed_rows(),
             p_cold + 1,
             "only the new row may be parsed"
         );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// bd-3gwy acceptance gate: a replay on an UNCHANGED store skips the
+    /// phase-1 SQL id-scan entirely (snapshot memo, mutation-version
+    /// validated); any insert bumps the version and forces exactly one fresh
+    /// scan. While ANY expiring events exist the memo is bypassed (TTL kinds
+    /// must never be served stale by a snapshot).
+    #[tokio::test]
+    async fn test_snapshot_memo_second_replay_skips_sql_bd_3gwy() {
+        let (store, pool, path) = temp_store().await;
+        for i in 0..4 {
+            let ev = sample_event(&Keys::generate(), &format!("e{i}"));
+            store.insert(&ev).await.expect("insert");
+        }
+        let filter = crate::bus::project_filter("demo");
+
+        let r1 = store.replay(&filter).await.expect("replay 1");
+        assert_eq!(r1.len(), 4);
+        let s1 = store.sql_scans();
+        let r2 = store.replay(&filter).await.expect("replay 2");
+        assert_eq!(r2.len(), 4);
+        assert_eq!(
+            store.sql_scans(),
+            s1,
+            "second identical replay must NOT touch SQL (memo hit)"
+        );
+        assert_eq!(
+            r2.iter().map(|e| e.id.to_hex()).collect::<Vec<_>>(),
+            r1.iter().map(|e| e.id.to_hex()).collect::<Vec<_>>()
+        );
+
+        // A mutation invalidates: next replay scans again, sees the new row.
+        let other = BusEventStore::new(pool.clone()).await.expect("other");
+        other
+            .insert(&sample_event(&Keys::generate(), "new"))
+            .await
+            .expect("insert new");
+        let r3 = store.replay(&filter).await.expect("replay 3");
+        assert_eq!(r3.len(), 5);
+        assert_eq!(
+            store.sql_scans(),
+            s1 + 1,
+            "mutation forces exactly one fresh scan"
+        );
+        // And the post-mutation state is memoized too.
+        let r4 = store.replay(&filter).await.expect("replay 4");
+        assert_eq!(r4.len(), 5);
+        assert_eq!(
+            store.sql_scans(),
+            s1 + 1,
+            "post-mutation replays are memo hits again"
+        );
+
+        // TTL safety: with an expiring event present the memo is bypassed —
+        // every replay re-scans (fresh expiry evaluation).
+        let expiring = build_event(
+            &Keys::generate(),
+            crate::nostr::kinds::toron_kind(PROJECT_MANIFEST),
+            "ttl",
+            vec![
+                Tag::parse(["t", "demo"]).expect("t"),
+                Tag::expiration(Timestamp::now() + nostr_sdk::nostr::Timestamp::from(3600)),
+            ],
+            Timestamp::now(),
+        )
+        .expect("build ttl event");
+        other.insert(&expiring).await.expect("insert ttl");
+        let before_ttl = store.sql_scans();
+        let _ = store.replay(&filter).await.expect("replay ttl 1");
+        let _ = store.replay(&filter).await.expect("replay ttl 2");
+        assert_eq!(
+            store.sql_scans(),
+            before_ttl + 2,
+            "expiring events disable the memo — every replay re-scans"
+        );
+
+        // Correctness under the memo: an EXPIRED event is never returned.
+        let expired = build_event(
+            &Keys::generate(),
+            crate::nostr::kinds::toron_kind(PROJECT_MANIFEST),
+            "expired-long-ago",
+            vec![
+                Tag::parse(["t", "demo"]).expect("t"),
+                Tag::expiration(Timestamp::from(1_500_000_000_u64)),
+            ],
+            Timestamp::from(1_400_000_000_u64),
+        )
+        .expect("build expired");
+        other.insert(&expired).await.expect("insert expired");
+        let after = store.replay(&filter).await.expect("replay expired");
+        assert!(
+            after.iter().all(|e| e.content != "expired-long-ago"),
+            "expired rows never surface"
+        );
+
         let _ = std::fs::remove_file(&path);
     }
 
@@ -902,14 +1197,17 @@ mod tests {
             details.join("\n")
         );
 
-        PARSED_ROWS.store(0, std::sync::atomic::Ordering::Relaxed);
-        let replayed = store
+        // bd-py9o: inserts warm the writer's hot memo, so the parse counter
+        // is measured through a COLD reader over the same pool — exactly the
+        // daemon-restart shape the prefilter property protects.
+        let reader = BusEventStore::new(pool.clone()).await.expect("cold reader");
+        let replayed = reader
             .replay(&Filter::new().pubkey(target.public_key()).limit(10))
             .await
             .expect("replay");
         assert_eq!(replayed.len(), 5, "only the 5 target events match");
         assert_eq!(
-            PARSED_ROWS.load(std::sync::atomic::Ordering::Relaxed),
+            reader.parsed_rows(),
             5,
             "SQL prefilter must shrink the parsed set to the 5 matched rows"
         );
@@ -923,6 +1221,7 @@ mod tests {
     async fn test_replay_limit_pushdown_newest_5_of_10k() {
         use nostr_sdk::nostr::Filter;
         let (store, pool, path) = temp_store().await;
+        let _ = &store;
         let author = Keys::generate();
         let target = Keys::generate();
         let target_hex = target.public_key().to_hex();
@@ -964,8 +1263,9 @@ mod tests {
         }
         tx.commit().await.expect("commit");
 
-        PARSED_ROWS.store(0, std::sync::atomic::Ordering::Relaxed);
-        let replayed = store
+        // bd-py9o: cold reader (see gate #1) so parses measure SQL work.
+        let reader = BusEventStore::new(pool.clone()).await.expect("cold reader");
+        let replayed = reader
             .replay(&Filter::new().pubkey(target.public_key()).limit(5))
             .await
             .expect("replay");
@@ -983,7 +1283,7 @@ mod tests {
             "limit=5 returns the NEWEST 5 in envelope order"
         );
         assert_eq!(
-            PARSED_ROWS.load(std::sync::atomic::Ordering::Relaxed),
+            reader.parsed_rows(),
             5,
             "only 5 rows parsed — no materialization of the 10k matched set"
         );

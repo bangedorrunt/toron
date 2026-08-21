@@ -120,6 +120,12 @@ pub struct InProcessBus {
 }
 
 impl InProcessBus {
+    /// Measurement accessor for the underlying store (bd-3gwy gates).
+    #[cfg(test)]
+    pub(crate) fn event_store(&self) -> &BusEventStore {
+        &self.store
+    }
+
     /// Open the bus on a SQLite pool (event-store table created idempotently).
     pub async fn open(pool: SqlitePool, config: InProcessBusConfig) -> anyhow::Result<Self> {
         let store = BusEventStore::new(pool).await?;
@@ -531,14 +537,12 @@ mod tests {
         .expect("build")
     }
 
-    /// bd-py9o acceptance gate at the bus level: a SECOND subscribe with the
-    /// same filter must hydrate its snapshot from the hot memo — zero SQL
-    /// row parses — and still deliver the full matched history + EOSE.
+    /// bd-3gwy acceptance gate at the bus level: a SECOND subscribe with the
+    /// same filter must skip the phase-1 SQL id-scan entirely (snapshot memo,
+    /// mutation-version validated) and still deliver full history + EOSE;
+    /// a mutation forces exactly one fresh scan.
     #[tokio::test]
-    async fn test_second_subscribe_hydrates_from_memo_bd_py9o() {
-        use crate::bus::event_store::{HOT_HITS, PARSED_ROWS};
-        use std::sync::atomic::Ordering;
-
+    async fn test_second_subscribe_skips_sql_scan_bd_3gwy() {
         let (bus, path) = temp_bus().await;
         let keys = Keys::generate();
         let n = 8;
@@ -560,10 +564,10 @@ mod tests {
                 .count(),
             n
         );
-        let mid = PARSED_ROWS.load(Ordering::Relaxed);
+        let mid = bus.event_store().sql_scans();
 
         // Second subscribe: identical filter, no new events.
-        let hits_before = HOT_HITS.load(Ordering::Relaxed);
+        let scans_before_second = mid;
         let mut s2 = bus.subscribe(filter.clone()).await.expect("sub 2");
         let second = drain(&mut s2, 32, Duration::from_millis(400)).await;
         let got: Vec<_> = second
@@ -579,15 +583,9 @@ mod tests {
             "EOSE still delivered"
         );
         assert_eq!(
-            PARSED_ROWS.load(Ordering::Relaxed),
-            mid,
-            "second subscribe must NOT re-parse the store (bd-py9o)"
-        );
-        assert_eq!(
-            HOT_HITS.load(Ordering::Relaxed) - hits_before,
-            2 * n,
-            "every snapshot AND delta row hydrated from the memo \
-             (subscribe = snapshot replay + delta re-read)"
+            bus.event_store().sql_scans(),
+            scans_before_second,
+            "second identical subscribe must NOT run the SQL id-scan (bd-3gwy)"
         );
 
         // A NEW event is parsed exactly once and reaches BOTH paths.
@@ -600,14 +598,12 @@ mod tests {
             .filter(|e| matches!(e, SubscriptionEvent::Event(_)))
             .count();
         assert_eq!(third_events, n + 1);
-        // bus.publish warmed the new event's memo entry on insert, so the
-        // third subscribe parses nothing either. The genuinely-cold parse
-        // path (another process instance) is asserted by the store-level
-        // gate test_replay_second_identical_call_parses_zero_rows_bd_py9o.
+        // The publish bumped the mutation version, so the third subscribe
+        // runs exactly ONE fresh id-scan; post-mutation replays memoize.
         assert_eq!(
-            PARSED_ROWS.load(Ordering::Relaxed),
-            mid,
-            "no re-parsing of known rows, ever"
+            bus.event_store().sql_scans(),
+            scans_before_second + 1,
+            "mutation forces exactly one fresh scan at the bus level"
         );
         let _ = std::fs::remove_file(&path);
     }
