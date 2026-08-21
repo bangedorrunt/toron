@@ -229,6 +229,62 @@ W7 (delegation): compose-request as a job spec shape; loop-side composition
 gated on decide's coverage report; initially behind a contact/policy
 allowlist so a buggy crewmate cannot improvise unbounded dispatch.
 
+### 3.8 Stage registry — agent-writable permanence (captain's counter-proposal, adopted 2026-08-21)
+
+Principle: **everything an agent composes WITH is data; "built-in" is a tier
+agents walk into with evidence, not a code boundary.** Rust seeds are
+bootstrap only. This replaces the earlier stance that agents never author
+built-ins — agents author DATA at every tier; the shared tier costs
+evidence, not human gating.
+
+Current state (verified): stages are compiled-seed p1–p8 +
+`~/.config/flywheel/stages.toml` field-level overrides + semantic aliases
+(ADR-0005 Spec 2a, stages.rs); the CLI surface is `stage list` ONLY; compose
+parts are role-bound; there is no project tier and no promotion path.
+
+**Layered stage registry:**
+
+| Tier | Location | Writable by | Scope |
+| :--- | :--- | :--- | :--- |
+| seed | compiled (p1–p8 + aliases) | nobody | fallback, always present |
+| user | `~/.config/flywheel/stages.toml` | any agent | this machine |
+| project | `.flywheel/stages.toml` | any agent | ships with the repo (git) |
+| repo (built-in) | flywheel source seed data | promotion | every flywheel install |
+
+Stage records gain metadata: default role affinity, `phase` (W3), declared
+principles, provenance (author, origin run).
+
+**CLI surface (the ergonomics the captain specified — list, add, select):**
+
+```bash
+flywheel stage list [--all]     # every tier, tier-tagged, phase + role affinity
+flywheel stage show <name>     # body + metadata + tier
+flywheel stage new <name>      # scaffold with role/phase/principles frontmatter
+flywheel stage lint            # all tiers: shape, affinity validity, size cap
+```
+
+**Stage-first compose:** a bare stage name becomes a valid part —
+`--parts "fresh-eyes-explore,systematic-execute"` dispatches each stage to
+its own default role; `role:stage` remains the explicit override; `phase:stage`
+per W3. "Pick multiple stages, get a workflow" is one command.
+
+**Permanence ladder (stages AND workflows, uniform):**
+
+```
+ephemeral compose → project catalog (--keep, W6)
+                  → user catalog (stage promote / workflow promote)
+                  → repo built-in tier (promote with evidence:
+                      green across ≥2 projects or ≥2 distinct objectives
+                      + a review bead; lands as DATA in the flywheel repo)
+```
+
+Why this is safe: stages are prompts (bounded blast radius); stage lint
+validates shape + affinity names + size; the repo tier's evidence bar keeps
+the registry from rotting (the crew-conduct rule — done is a claim, the
+consumer validates against the run log — applies to promotion). Over time
+the compiled seed set can be regenerated from promoted data; Rust seeds
+remain the zero-config bootstrap.
+
 ---
 
 ## 4. Phase semantics — the contract (normative)
@@ -275,7 +331,7 @@ Rules:
 - **Gate:** a live 2-agent swarm where a `phase: plan` dispatch reaches the harness with the registry args observable in the pane (herdr `agent read` evidence); `flywheel deps` prints the phase-registry line.
 
 ### Wave 3 — compose → engine + phase built-ins + ladder T1/T2 (closes bd-compose-not-durable-oxjy, bd-dispatch-spec-untyped-0iud consumers)
-- **Target:** `flywheel/src/crew.rs` (compose --run routes to `engine.invoke`; `parse_compose_part` phase + Tier-1 grammar resolution: `each:`/`when:`/`retry(n)`/`parallel:`), `flywheel/src/builtin_workflows.rs` (resolve/plan/implement/review/ship), `flywheel/src/stages.rs` (stage `phase` field), `flywheel/src/cron.rs` (`cron run --live`), compose `--from-yaml -` + `--dry-run` first-class (Tier 2 + §3.6 envelope).
+- **Target:** `flywheel/src/crew.rs` (compose --run routes to `engine.invoke`; `parse_compose_part` phase + Tier-1 grammar resolution: `each:`/`when:`/`retry(n)`/`parallel:` + stage-first bare-name parts (§3.8)), `flywheel/src/builtin_workflows.rs` (resolve/plan/implement/review/ship), `flywheel/src/stages.rs` (stage `phase` field), `flywheel/src/cron.rs` (`cron run --live`), compose `--from-yaml -` + `--dry-run` first-class (Tier 2 + §3.6 envelope).
 - **Tests:** composed run executes as engine run (run id exists in runs board); `on_failure: bead` creates a bead on a forced-failure composed run; crash-resume equivalence (kill -9 mid composed run → restart → completes; mirror `scripts/e2e-hardened-loop.sh` scenario 2); `ship` chain dry-run renders the expected 5-link graph; Tier-1 grammar parse table (every part form → expected Action); `--from-yaml` round-trip (author → lint → dry-run → run); dry-run renders fanout counts + phase tags; budget caps enforced (a composed workflow exceeding max dispatches fails closed at lint).
 - **Gate:** live: compose a 2-step workflow, run via engine, kill flywheel mid-run, restart, run completes; catalog + composed + cron all appear in `flywheel runs`; one Tier-1 `each:` compose executed live.
 
@@ -287,10 +343,10 @@ Rules:
 ### Wave 5 — enforcement flip (separate bead, only after W3+W4 live evidence)
 - Blocking phase gates per §3.5. One-line default change + gate tests. Requires: one live swarm completing a full `ship` chain with zero phase-gate false positives.
 
-### Wave 6 — persist/lifecycle (§3.7 T3)
-- **Target:** `flywheel/src/crew.rs` + catalog resolver (`--keep <name>` → `.flywheel/workflows/<name>.yaml` with provenance), `workflow new` path unification.
-- **Tests:** keep-after-green writes catalog entry the resolver finds; keep-without-green-run refuses; provenance fields present; promote path (`workflow new`) and `--keep` produce identical lint outcomes.
-- **Gate:** live: compose → run green → keep → `flywheel workflow list` shows it → a later `decide` find-existing arm selects it.
+### Wave 6 — persist/lifecycle + promotion ladder (§3.7 T3, §3.8)
+- **Target:** `flywheel/src/crew.rs` + catalog resolver (`--keep <name>` → `.flywheel/workflows/<name>.yaml` with provenance), `workflow new` path unification, stage registry surface (`stage show/new/lint`, project tier `.flywheel/stages.toml`, stage metadata fields), `stage promote` / `workflow promote` (project → user → repo tiers with the §3.8 evidence bar).
+- **Tests:** keep-after-green writes catalog entry the resolver finds; keep-without-green-run refuses; provenance fields present; promote path (`workflow new`) and `--keep` produce identical lint outcomes; stage tiers resolve seed<user<project precedence; stage lint rejects bad affinity/phase names; promote-to-repo without evidence refuses.
+- **Gate:** live: compose → run green → keep → `flywheel workflow list` shows it → a later `decide` find-existing arm selects it; one stage added at project tier and used stage-first in a compose.
 
 ### Wave 7 — delegated composition (§3.7 T4)
 - **Target:** compose-request job spec shape (toron-workflow), loop-side coverage report in `decide`, contact/policy allowlist gate.
@@ -331,6 +387,7 @@ Rules:
 - [ ] W3 ladder: Tier-1 grammar parse table green; `--from-yaml` round-trip green; dry-run renders fanouts + phase tags; budget caps fail closed.
 - [ ] W4: `steer --direct` completes as an engine run with phase-tagged steps in `flywheel runs`.
 - [ ] W6: keep-after-green lands in catalog and a later decide find-existing selects it; keep-without-green-run refuses.
+- [ ] W6 stages: project-tier stage resolvable and usable stage-first in a compose; promote-to-repo without evidence refuses.
 - [ ] W7: one agent-composed workflow via mail request, allowlisted, runs through the engine.
 - [ ] All Target files carry `governed-by: ADR-0022`; `bash docs/decisions/_scripts/verify-adr-links.sh` green.
 - [ ] `bash scripts/verify-gates.sh` green (toron) and flywheel clippy/test gates green.
