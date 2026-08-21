@@ -241,6 +241,19 @@ pub struct AcquireResult {
     pub proposal: Option<serde_json::Value>,
 }
 
+/// bd-reservations-not-projected-5ohc: one granted/renewed lease to mirror
+/// into the durable `file_reservations` SQLite projection.
+struct LeaseUpsert<'a> {
+    project_slug: &'a str,
+    agent_name: &'a str,
+    agent_pubkey: &'a str,
+    path_pattern: &'a str,
+    exclusive: bool,
+    reason: &'a str,
+    event_id: &'a str,
+    expires_ts_us: Option<i64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct GrantedReservation {
     pub id: String,
@@ -403,6 +416,19 @@ impl Mailbox {
             if !ok.stored {
                 anyhow::bail!("reservation event rejected by bus");
             }
+            self.project_lease_upsert(LeaseUpsert {
+                project_slug,
+                agent_name,
+                agent_pubkey: &agent_keys.public_key().to_hex(),
+                path_pattern: path,
+                exclusive,
+                reason: reason.unwrap_or(""),
+                event_id: &event.id.to_hex(),
+                expires_ts_us: ttl
+                    .expiration_at(created)
+                    .map(|t| t.as_secs() as i64 * 1_000_000),
+            })
+            .await;
             result.granted.push(GrantedReservation {
                 id: event.id.to_hex(),
                 path_pattern: path.clone(),
@@ -630,6 +656,19 @@ impl Mailbox {
                 created,
             )?;
             self.bus.publish(event.clone()).await?;
+            self.project_lease_upsert(LeaseUpsert {
+                project_slug,
+                agent_name,
+                agent_pubkey: &agent_keys.public_key().to_hex(),
+                path_pattern: &res.path_pattern,
+                exclusive: res.exclusive,
+                reason: &res.reason,
+                event_id: &event.id.to_hex(),
+                expires_ts_us: ttl
+                    .expiration_at(created)
+                    .map(|t| t.as_secs() as i64 * 1_000_000),
+            })
+            .await;
             result.reservations.push(GrantedReservation {
                 id: event.id.to_hex(),
                 path_pattern: res.path_pattern.clone(),
@@ -681,6 +720,13 @@ impl Mailbox {
                 Timestamp::now(),
             )?;
             self.bus.publish(event.clone()).await?;
+            self.project_lease_status(
+                project_slug,
+                &res.agent_pubkey,
+                &res.path_pattern,
+                "released",
+            )
+            .await;
             self.record_transition(project_slug, &d, "released", &event.id)
                 .await;
             leases.push(ReleasedLease {
@@ -778,6 +824,13 @@ impl Mailbox {
         )?;
         assert!(is_revocation(&revoke), "revocation must be detectable");
         self.bus.publish(revoke.clone()).await?;
+        self.project_lease_status(
+            project_slug,
+            &lease.agent_pubkey,
+            &lease.path_pattern,
+            "revoked",
+        )
+        .await;
         self.record_transition(project_slug, &d, "revoked", &revoke.id)
             .await;
 
@@ -884,6 +937,13 @@ impl Mailbox {
             )?;
             assert!(is_revocation(&revoke), "revocation must be detectable");
             self.bus.publish(revoke.clone()).await?;
+            self.project_lease_status(
+                project_slug,
+                &lease.agent_pubkey,
+                &lease.path_pattern,
+                "revoked",
+            )
+            .await;
             self.record_transition(project_slug, &d, "revoked", &revoke.id)
                 .await;
             released += 1;
@@ -1299,6 +1359,8 @@ impl Mailbox {
             release_ts,
         )?;
         self.bus.publish(release_event.clone()).await?;
+        self.project_lease_status(project_slug, &holder.agent_pubkey, path, "released")
+            .await;
         self.record_transition(project_slug, &d, "released", &release_event.id)
             .await;
 
@@ -1323,6 +1385,17 @@ impl Mailbox {
             acquire_ts,
         )?;
         self.bus.publish(acquire_event.clone()).await?;
+        self.project_lease_upsert(LeaseUpsert {
+            project_slug,
+            agent_name: to_agent,
+            agent_pubkey: &to_keys.public_key().to_hex(),
+            path_pattern: path,
+            exclusive: holder.exclusive,
+            reason: &effective_reason,
+            event_id: &acquire_event.id.to_hex(),
+            expires_ts_us: None,
+        })
+        .await;
         self.record_transition(project_slug, &d, "acquired", &acquire_event.id)
             .await;
 
@@ -1741,6 +1814,77 @@ impl Mailbox {
             }
         }
     }
+
+    /// bd-reservations-not-projected-5ohc: mirror a granted/renewed lease
+    /// into the durable SQLite `file_reservations` projection (the read model
+    /// external readers query directly). Best-effort by design: no attached
+    /// index pool → no-op; a failed projection logs but never fails the
+    /// signed lease event (the bus replay stays the source of truth).
+    async fn project_lease_upsert(&self, u: LeaseUpsert<'_>) {
+        let Some(pool) = self.index_pool() else {
+            return;
+        };
+        let r = sqlx::query(
+            "INSERT INTO file_reservations \
+             (project_slug, agent_name, agent_pubkey, path_pattern, exclusive, reason, \
+              status, event_id, expires_ts_us, created_ts_us) \
+             VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, ?) \
+             ON CONFLICT(project_slug, path_pattern, agent_pubkey) DO UPDATE SET \
+               agent_name=excluded.agent_name, exclusive=excluded.exclusive, \
+               reason=excluded.reason, status='active', event_id=excluded.event_id, \
+               expires_ts_us=excluded.expires_ts_us, created_ts_us=excluded.created_ts_us",
+        )
+        .bind(u.project_slug)
+        .bind(u.agent_name)
+        .bind(u.agent_pubkey)
+        .bind(u.path_pattern)
+        .bind(u.exclusive)
+        .bind(u.reason)
+        .bind(u.event_id)
+        .bind(u.expires_ts_us)
+        .bind(crate::index::writer::Clock::now_us(
+            &crate::index::writer::SystemClock,
+        ))
+        .execute(pool)
+        .await;
+        if let Err(e) = r {
+            tracing::warn!(
+                "reservation projection failed ({}:{}): {e}",
+                u.project_slug,
+                u.path_pattern
+            );
+        }
+    }
+
+    /// bd-reservations-not-projected-5ohc: mark the projected row for a
+    /// terminal lease transition (`released` / `revoked`). Same best-effort
+    /// contract as [`Self::project_lease_upsert`].
+    async fn project_lease_status(
+        &self,
+        project_slug: &str,
+        agent_pubkey: &str,
+        path_pattern: &str,
+        status: &str,
+    ) {
+        let Some(pool) = self.index_pool() else {
+            return;
+        };
+        let r = sqlx::query(
+            "UPDATE file_reservations SET status=? \
+             WHERE project_slug=? AND path_pattern=? AND agent_pubkey=?",
+        )
+        .bind(status)
+        .bind(project_slug)
+        .bind(path_pattern)
+        .bind(agent_pubkey)
+        .execute(pool)
+        .await;
+        if let Err(e) = r {
+            tracing::warn!(
+                "reservation projection update failed ({status} {project_slug}:{path_pattern}): {e}"
+            );
+        }
+    }
 }
 
 /// Symmetric glob overlap: `a` matches `b`, or `b` matches `a` (fnmatch both
@@ -1915,6 +2059,65 @@ mod tests {
         assert!(!overlaps("src/**", "docs/x.md"));
         // Distinct files.
         assert!(!overlaps("src/a.rs", "src/b.rs"));
+    }
+
+    /// bd-reservations-not-projected-5ohc: a granted lease must reach the
+    /// durable SQLite projection (`file_reservations`) that external readers
+    /// query — not only the bus replay. Release must mark the row
+    /// `released`, and a re-acquire must flip the SAME row back to `active`
+    /// (idempotent upsert on the UNIQUE coordinate).
+    #[tokio::test]
+    async fn test_grant_and_release_project_to_index() {
+        let (mailbox, db_path, _data_dir) = test_mailbox("project").await;
+        register(&mailbox, "demo", "ProbePin").await;
+
+        async fn row_status(db_path: &std::path::Path) -> Option<String> {
+            let pool = schema::connect(db_path.to_str().unwrap())
+                .await
+                .expect("connect");
+            sqlx::query_scalar("SELECT status FROM file_reservations WHERE path_pattern=?")
+                .bind("t.txt")
+                .fetch_optional(&pool)
+                .await
+                .expect("query")
+        }
+
+        mailbox
+            .file_reservation_paths(
+                "demo",
+                "ProbePin",
+                &["t.txt".to_string()],
+                None,
+                true,
+                Some("bd-reservations-not-projected-5ohc"),
+            )
+            .await
+            .expect("acquire");
+        assert_eq!(
+            row_status(&db_path).await.as_deref(),
+            Some("active"),
+            "reservation not projected"
+        );
+
+        mailbox
+            .release_file_reservations("demo", "ProbePin", &["t.txt".to_string()])
+            .await
+            .expect("release");
+        assert_eq!(row_status(&db_path).await.as_deref(), Some("released"));
+
+        // Re-acquire flips the same row back to active (UNIQUE coordinate).
+        mailbox
+            .file_reservation_paths(
+                "demo",
+                "ProbePin",
+                &["t.txt".to_string()],
+                None,
+                true,
+                Some("bd-reservations-not-projected-5ohc"),
+            )
+            .await
+            .expect("re-acquire");
+        assert_eq!(row_status(&db_path).await.as_deref(), Some("active"));
     }
 
     /// bd-pin-public-plane-s-easy.13: lease transfer — a grant is a lease
