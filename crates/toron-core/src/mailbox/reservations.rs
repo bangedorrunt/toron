@@ -45,7 +45,7 @@
 use nostr_sdk::nostr::{Event, EventId, Keys, Kind, PublicKey, Tag, Timestamp};
 
 use crate::bus::addressable::is_revocation;
-use crate::bus::filter::{Filter, ToronFilter, kind_project_filter};
+use crate::bus::filter::{ToronFilter, kind_project_filter};
 use crate::bus::scoping::with_project_scoping;
 use crate::bus::{EnvelopeTtl, resolve_coordinate};
 use crate::mailbox::guard::{cross_project_pattern, pattern_matches};
@@ -1116,6 +1116,14 @@ impl Mailbox {
     /// committing in the repo its lease names. Excludes `project_slug`
     /// and all of its slug aliases; holder names resolve against the
     /// OWNING project's profiles, best-effort.
+    ///
+    /// Enumeration reads the project slug straight off each lease row's
+    /// `d_tag` (`<slug>:<path>` - the same coordinate
+    /// [`Self::resolved_leases`] splits), NOT the tag index: kind-30031
+    /// rows carry no persisted `t` tag rows, and an unscoped kinds-only
+    /// replay sweep is not guaranteed by the store's pushdown contract.
+    /// Per-slug failures are best-effort skips - a hiccup in one project
+    /// never blanks the guard.
     pub async fn active_reservations_escaping_into(
         &self,
         project_slug: &str,
@@ -1124,47 +1132,37 @@ impl Mailbox {
         let canonical = self.canonical_project(project_slug).await; // ADR-0017
         let own_aliases: std::collections::HashSet<String> =
             self.project_slug_aliases(&canonical).into_iter().collect();
-        let filter = Filter::new().kinds([toron_kind(FILE_RESERVATION)]);
-        let events = collect_replay(self.bus.as_ref(), filter).await?;
-        let operator = self.operator.as_ref().map(|k| k.public_key());
-        let now_secs = Timestamp::now().as_secs() as i64;
+        let Some(pool) = self.index_pool.as_ref() else {
+            return Ok(Vec::new());
+        };
+        let slugs: Vec<String> = sqlx::query_scalar(
+            "SELECT DISTINCT substr(d_tag, 1, instr(d_tag, ':') - 1) \
+             FROM bus_events \
+             WHERE kind = ?1 AND d_tag IS NOT NULL AND instr(d_tag, ':') > 1",
+        )
+        .bind(i64::from(toron_kind(FILE_RESERVATION).as_u16()))
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default();
 
-        // Group foreign leases by their owning project's `t` tag so holder
-        // names resolve against that project's profile set.
-        let mut by_slug: std::collections::BTreeMap<String, Vec<Event>> =
-            std::collections::BTreeMap::new();
-        for ev in &events {
-            let slug = ev.tags.iter().find_map(|t| {
-                (t.as_slice().first().map(|s| s.as_str()) == Some("t"))
-                    .then(|| t.as_slice().get(1).map(|s| s.to_string()))
-                    .flatten()
-            });
-            let Some(slug) = slug else { continue };
+        let mut out = Vec::new();
+        let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for slug in slugs {
             if own_aliases.contains(&slug) {
                 continue;
             }
-            by_slug.entry(slug).or_default().push(ev.clone());
-        }
-
-        let mut out = Vec::new();
-        for (slug, evs) in by_slug {
-            let mut leases: Vec<Reservation> =
-                Self::resolve_leases_from_events(&evs, operator, now_secs)
-                    .into_iter()
-                    .filter(|l| l.status == ReservationStatus::Held)
-                    .filter(|l| cross_project_pattern(&l.path_pattern, repo_name).is_some())
-                    .map(|l| Reservation {
-                        id: l.id,
-                        agent_name: String::new(), // filled via profiles below
-                        agent_pubkey: l.agent_pubkey,
-                        path_pattern: l.path_pattern,
-                        exclusive: l.exclusive,
-                        reason: l.reason,
-                        expires_ts_us: l.expires_ts_us,
-                        status: ReservationStatus::Held,
-                    })
-                    .collect();
-            self.fill_agent_names(&slug, &mut leases).await;
+            let held = match self.active_reservations(&slug).await {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let mut leases: Vec<Reservation> = held
+                .into_iter()
+                .filter(|r| cross_project_pattern(&r.path_pattern, repo_name).is_some())
+                .filter(|r| seen_ids.insert(r.id.clone()))
+                .collect();
+            if leases.is_empty() {
+                continue;
+            }
             out.extend(leases);
         }
         Ok(out)
