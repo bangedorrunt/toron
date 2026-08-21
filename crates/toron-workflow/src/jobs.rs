@@ -281,6 +281,48 @@ pub fn build_and_serialize(
 #[allow(unused_imports)]
 use Kind as _Kind;
 
+/// The compose-request job spec shape (ADR-0022 §3.7 T4, W7): the `spec`
+/// payload an agent mails when it wants a workflow composed on its behalf.
+/// The loop honors it only from an allowlisted sender AND when `decide`
+/// reports no catalog coverage — and in W7 renders the candidate FOR
+/// APPROVAL, never auto-dispatching.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComposeRequestSpec {
+    /// What the composed workflow should accomplish.
+    pub objective: String,
+    /// Optional explicit parts (`role:stage` | bare stage | `workflow:name`).
+    /// Absent = the loop derives parts from the archetype classification.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parts: Option<Vec<String>>,
+    /// The mailing agent (filled by the loop from the message sender; a
+    /// self-claimed requester field is overridden).
+    #[serde(default)]
+    pub requester: String,
+}
+
+impl ComposeRequestSpec {
+    /// Parse + validate a spec payload. `objective` must be non-empty;
+    /// explicit parts must each be non-empty tokens.
+    pub fn parse(spec: &serde_json::Value) -> Result<Self, String> {
+        let parsed: Self =
+            serde_json::from_value(spec.clone()).map_err(|e| format!("compose-request: {e}"))?;
+        if parsed.objective.trim().is_empty() {
+            return Err("compose-request: objective must be non-empty".to_string());
+        }
+        if let Some(parts) = &parsed.parts {
+            if parts.iter().any(|p| p.trim().is_empty()) {
+                return Err("compose-request: parts must be non-empty tokens".to_string());
+            }
+        }
+        Ok(parsed)
+    }
+
+    /// Serialize as the JobRequest.spec value.
+    pub fn to_value(&self) -> serde_json::Value {
+        serde_json::to_value(self).unwrap_or(serde_json::Value::Null)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -298,8 +340,7 @@ mod tests {
         let parent =
             EventId::from_hex("b32828720d7e8a80dd5165a6cd31b2c70e8d25b83c387209cb138e77d7e7e05b")
                 .expect("id");
-        let payload = JobRequest::new("fix flaky", serde_json::json!({"task": "triage"}));
-        let ev =
+        let payload = JobRequest::new("fix flaky", serde_json::json!({"task": "triage"}));        let ev =
             build_job_request(&requester, parent, &payload, Timestamp::from(TS)).expect("build");
         assert_eq!(ev.kind.as_u16(), JOB_REQUEST);
         assert_eq!(job_parent(&ev), Some(parent), "e tag links parent");
@@ -449,6 +490,50 @@ mod tests {
         assert_eq!(
             job_state(job, &[req, claim, progress]),
             JobState::InProgress(claimer.public_key().to_hex())
+        );
+    }
+
+    /// W7 (§3.7 T4): the compose-request spec parses, validates, and
+    /// round-trips through the JobRequest.spec value.
+    #[test]
+    fn compose_request_spec_parses_and_roundtrips() {
+        let v = serde_json::json!({
+            "objective": "map the crate and find bugs",
+            "parts": ["fresh-eyes-explore", "reviewer:code-review"],
+            "requester": "SandySparrow",
+        });
+        let spec = ComposeRequestSpec::parse(&v).expect("parses");
+        assert_eq!(spec.objective, "map the crate and find bugs");
+        assert_eq!(spec.parts.as_ref().unwrap().len(), 2);
+        assert_eq!(spec.requester, "SandySparrow");
+        // Round-trip: to_value -> parse is identity.
+        let again = ComposeRequestSpec::parse(&spec.to_value()).expect("roundtrip");
+        assert_eq!(again, spec);
+        // Parts optional.
+        let bare = ComposeRequestSpec::parse(&serde_json::json!({"objective": "x"}))
+            .expect("parts optional");
+        assert!(bare.parts.is_none());
+    }
+
+    /// W7: invalid compose-request specs refuse — empty objective, empty
+    /// part token, wrong shape entirely.
+    #[test]
+    fn compose_request_spec_rejects_invalid() {
+        assert!(
+            ComposeRequestSpec::parse(&serde_json::json!({"objective": "  "})).is_err(),
+            "empty objective refuses"
+        );
+        assert!(
+            ComposeRequestSpec::parse(&serde_json::json!({
+                "objective": "x", "parts": ["ok", "   "]
+            }))
+            .is_err(),
+            "empty part token refuses"
+        );
+        assert!(
+            ComposeRequestSpec::parse(&serde_json::json!({"task": "not a compose request"}))
+                .is_err(),
+            "wrong shape refuses"
         );
     }
 }
