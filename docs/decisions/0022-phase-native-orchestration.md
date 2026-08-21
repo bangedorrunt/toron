@@ -377,9 +377,9 @@ Rules:
 
 ## 8. Verification (acceptance for this ADR)
 
-- [ ] W1: `cargo test -p toron-workflow` green incl. 4 new JobSpec tests; flywheel suite green against new schema (byte-compat proof).
+- [x] W1: `cargo test -p toron-workflow` green incl. 4 new JobSpec tests; flywheel suite green against new schema (byte-compat proof). **Verified 2026-08-22 post-wave review:** toron 841 / flywheel 977 passed, 0 failed — after the review repaired a red lib-test target (missing `test_spec`) the wave had closed against.
 - [ ] W1: lint fixture with unknown spec field produces R-P1 warning naming the field.
-- [ ] W2: `phase_launch_args` table tests + degraded contract green; `flywheel deps` prints per-harness phase-registry status.
+- [x] W2: `phase_launch_args` table tests + degraded contract green; `flywheel deps` prints per-harness phase-registry status. **Shipped (a1498f1);** caveat filed as bd-adr22-implement-not-degraded-puhs (implement wrongly degrades).
 - [ ] W2 live: `phase: plan` dispatch observable in the target pane with registry args (herdr `agent read` capture).
 - [ ] W3: composed `--run` produces an engine run id; kill -9 mid-run → restart → completes (crash-resume equivalence).
 - [ ] W3: forced-failure composed run with `on_failure: bead` creates the bead.
@@ -400,3 +400,26 @@ Rules:
 - Fresh-eyes review session 2026-08-21 (this ADR's trigger): seam findings + beads bd-dispatch-spec-untyped-0iud, bd-compose-not-durable-oxjy, bd-cron-run-no-live-u9tg, bd-reservations-not-projected-5ohc (orthogonal, not in scope here).
 - Slash-command dead-dir incident (flywheel `63cedc1`): the §2.2 motivation for mechanics-over-convention.
 - bd-4spn: the unwired-mechanism precedent this ADR's staging is designed to avoid.
+
+## 10. Post-wave adversarial review (2026-08-22)
+
+Full-scope review of the crew implementation. Verified shipped: typed
+`DispatchSpec` (lenient, `extra` round-trip), phase registry + preflight
+probe, stage registry (5-command surface, tier precedence, promote
+evidence bar with honest refusal), compose/steer through `engine.invoke`
+(one rail; in-process replay proven), W7 allowlist deny-gate, cron
+`--live`, `--keep` green-run graduation, reservation projection fix
+(verified live: acquire→row→release). Repairs made by the review:
+missing `test_spec` (red lib-test target), µs G7 timeline stamp
+(`since_ts` excluded same-second post-bound mail — real product bug),
+clippy gates both repos, an accidentally-tracked artifact.
+
+**Honest deltas (beads, not silent):** bd-adr22-phase-enum-lint-ahfh
+(String not enum; R-P1..P4 lint never implemented), bd-adr22-local-resonate-tx8q
+(in-memory store — cross-process crash-resume gate unsatisfiable; W3/W4
+shipped-notes overstate), bd-adr22-implement-not-degraded-puhs,
+bd-adr22-t1-grammar-residual-zjk0 (§3.6 Tier-1 grammar, --from-yaml,
+--dry-run, budget caps never shipped). W5 correctly still blocked
+(evidence-gated). The ADR is NOT fully implemented by its own §8
+acceptance: live gates (W2-live, W6 live, W7 live) and the lint layer
+remain unproven or absent.
