@@ -21,6 +21,14 @@ use crate::tools::ToolServer;
 /// The single non-parity additive tool (bd-h3oj) — NOT part of the 38.
 pub const ADDITIVE_TOOL: &str = "release_file_reservations_by_reason";
 
+/// Every non-parity additive tool (bd-h3oj + bd-locks-list-daemon-xetz):
+/// live on the MCP surface, excluded from the frozen 38-parity catalog.
+pub const ADDITIVE_TOOLS: &[&str] = &[
+    ADDITIVE_TOOL,
+    // read-only lease board — the state the strict guard evaluates
+    "list_file_reservations",
+];
+
 /// Expected parity tool count (frozen: toron ADR-0007 C3).
 pub const PARITY_TOOL_COUNT: usize = 38;
 
@@ -137,7 +145,7 @@ pub fn tool_catalog() -> anyhow::Result<Vec<Value>> {
     let unexpected: Vec<&str> = extras
         .iter()
         .copied()
-        .filter(|n| *n != ADDITIVE_TOOL)
+        .filter(|n| !ADDITIVE_TOOLS.contains(n))
         .collect();
     if !unexpected.is_empty() {
         anyhow::bail!(
