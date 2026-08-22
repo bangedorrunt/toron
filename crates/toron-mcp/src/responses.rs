@@ -195,6 +195,18 @@ pub struct ConflictReportOut {
     /// ADR-0011 Spec 4: additive soft tier (in-TTL intents).
     pub soft_conflicts: Vec<PathConflictOut>,
     pub has_soft_conflicts: bool,
+    /// bd-slot-visibility-gv17: ACTIVE build-slot leases held by others —
+    /// "is the cargo fence free?" in the same one-call pre-write check.
+    pub slot_holders: Vec<SlotHolderOut>,
+}
+
+/// One active build-slot lease (bd-slot-visibility-gv17).
+#[derive(Debug, Clone, JsonSchema)]
+pub struct SlotHolderOut {
+    pub slot: String,
+    pub agent_name: String,
+    pub exclusive: bool,
+    pub expires_ts_us: Option<i64>,
 }
 
 /// `file_reservation_paths`.
