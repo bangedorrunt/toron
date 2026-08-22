@@ -45,6 +45,11 @@ CREATE TABLE IF NOT EXISTS bus_events (
 CREATE INDEX IF NOT EXISTS bus_events_created_at ON bus_events (created_at);
 CREATE INDEX IF NOT EXISTS bus_events_kind ON bus_events (kind);
 CREATE INDEX IF NOT EXISTS bus_events_addressable ON bus_events (kind, author, d_tag);
+-- Hot replay path: WHERE kind IN (?) ORDER BY created_at DESC, event_id DESC
+-- needs a composite index to avoid TEMP B-TREE sort (1-5s → ms on 10k rows).
+CREATE INDEX IF NOT EXISTS bus_events_kind_created ON bus_events (kind, created_at DESC, event_id DESC);
+-- Expiry scan: WHERE expires_at IS NOT NULL / prune + snapshot-memo bypass
+CREATE INDEX IF NOT EXISTS bus_events_expires ON bus_events (expires_at);
 CREATE TABLE IF NOT EXISTS bus_meta (
     key   TEXT PRIMARY KEY,
     value INTEGER NOT NULL
@@ -586,6 +591,11 @@ impl BusEventStore {
         self.hot.lock().clear();
         // bd-3gwy: pruned rows must never be served from a stale snapshot.
         self.bump_mutations().await;
+        // Storage-leak guard: checkpoint WAL after prune so the -wal file
+        // doesn't grow unbounded (prior 4 MB wal survived until reboot).
+        let _ = sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+            .execute(&self.pool)
+            .await;
         Ok(())
     }
 
@@ -612,15 +622,20 @@ impl BusEventStore {
         .unwrap_or(0)
     }
 
-    /// True when any stored event carries an expiration tag. While this is
-    /// true the snapshot memo is bypassed: expiry is evaluated against `now`
-    /// in SQL on every scan, and a snapshot could serve TTL rows stale.
-    /// Gift-wrap/profile/reservation traffic stores no expirations, so the
-    /// common case keeps full memo benefit. Cheap single-column EXISTS.
+    /// True when any STALE (already-expired but not yet pruned) row exists.
+    /// The old check `expires_at IS NOT NULL` disabled the snapshot memo
+    /// whenever ANY TTL row existed — with 90-day reservation TTL that was
+    /// always true (4.5k future expiries), so every fleet poll paid a 1-5s
+    /// TEMP B-TREE scan and pinned the daemon's CPU, spilling to swap.
+    /// Future expiries don't need a bypass: the memo is version-bumped on
+    /// every write/prune, and a row that later expires is pruned within
+    /// PRUNE_INTERVAL (60s) which bumps the version and invalidates the memo.
+    /// Only already-expired rows (expiry ≤ now) require a fresh scan.
     async fn any_expiring(&self) -> anyhow::Result<bool> {
         let n: i64 = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM bus_events WHERE expires_at IS NOT NULL)",
+            "SELECT EXISTS(SELECT 1 FROM bus_events WHERE expires_at IS NOT NULL AND expires_at <= ?1)",
         )
+        .bind(Timestamp::now().as_secs() as i64)
         .fetch_one(&self.pool)
         .await?;
         Ok(n != 0)
@@ -850,12 +865,16 @@ mod tests {
             "post-mutation replays are memo hits again"
         );
 
-        // TTL safety: with an expiring event present the memo is bypassed —
-        // every replay re-scans (fresh expiry evaluation).
-        let expiring = build_event(
+        // TTL safety: an ALREADY-EXPIRED row disables the memo (stale snapshot
+        // would serve it until prune runs). A future TTL (far-future expiry)
+        // must NOT disable the memo — otherwise 4.5k 90-day reservation TTLs
+        // pin every fleet poll to a 1-5s TEMP B-TREE scan and spill to swap.
+        // Imminent expiry (≤ now) is the only case that needs fresh expiry
+        // evaluation on every replay.
+        let still_valid = build_event(
             &Keys::generate(),
             crate::nostr::kinds::toron_kind(PROJECT_MANIFEST),
-            "ttl",
+            "ttl-future",
             vec![
                 Tag::parse(["t", "demo"]).expect("t"),
                 Tag::expiration(Timestamp::now() + nostr_sdk::nostr::Timestamp::from(3600)),
@@ -863,14 +882,36 @@ mod tests {
             Timestamp::now(),
         )
         .expect("build ttl event");
-        other.insert(&expiring).await.expect("insert ttl");
+        other.insert(&still_valid).await.expect("insert ttl future");
+        let before_future = store.sql_scans();
+        let _ = store.replay(&filter).await.expect("replay future 1");
+        let _ = store.replay(&filter).await.expect("replay future 2");
+        assert_eq!(
+            store.sql_scans(),
+            before_future + 1,
+            "future TTL must NOT disable memo — second replay is a hit"
+        );
+
+        // Already-expired row: memo must be bypassed (fresh scan every time)
+        let expiring = build_event(
+            &Keys::generate(),
+            crate::nostr::kinds::toron_kind(PROJECT_MANIFEST),
+            "ttl-expired",
+            vec![
+                Tag::parse(["t", "demo"]).expect("t"),
+                Tag::expiration(Timestamp::from(1_500_000_000_u64)),
+            ],
+            Timestamp::from(1_400_000_000_u64),
+        )
+        .expect("build expired ttl");
+        other.insert(&expiring).await.expect("insert ttl expired");
         let before_ttl = store.sql_scans();
         let _ = store.replay(&filter).await.expect("replay ttl 1");
         let _ = store.replay(&filter).await.expect("replay ttl 2");
         assert_eq!(
             store.sql_scans(),
             before_ttl + 2,
-            "expiring events disable the memo — every replay re-scans"
+            "already-expired rows disable the memo — every replay re-scans"
         );
 
         // Correctness under the memo: an EXPIRED event is never returned.
