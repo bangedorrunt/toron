@@ -49,8 +49,22 @@ pub async fn connect(db_path: &str) -> anyhow::Result<SqlitePool> {
         .busy_timeout(Duration::from_secs(5));
     let pool = SqlitePoolOptions::new()
         .max_connections(5)
+        .acquire_timeout(Duration::from_secs(10))
         .connect_with(opts)
         .await?;
+    // Storage-leak guard: WAL autocheckpoint + size caps. Without this an
+    // idle writer can leave a multi-MB WAL that never checkpoints (the prior
+    // 4 MB index.sqlite-wal that survived until reboot). 1k pages ≈ 4 MB.
+    for pragma in [
+        "PRAGMA journal_size_limit = 67108864", // 64 MB hard cap
+        "PRAGMA wal_autocheckpoint = 1000",
+        "PRAGMA synchronous = NORMAL",
+        "PRAGMA cache_size = -64000", // 64 MB page cache
+        "PRAGMA temp_store = MEMORY",
+        "PRAGMA mmap_size = 268435456", // 256 MB mmap
+    ] {
+        let _ = sqlx::query(pragma).execute(&pool).await;
+    }
     Ok(pool)
 }
 
@@ -64,7 +78,17 @@ pub async fn connect_single(db_path: &str) -> anyhow::Result<SqliteConnection> {
         .create_if_missing(true)
         .journal_mode(SqliteJournalMode::Wal)
         .busy_timeout(Duration::from_secs(5));
-    Ok(SqliteConnection::connect_with(&opts).await?)
+    let mut conn = SqliteConnection::connect_with(&opts).await?;
+    for pragma in [
+        "PRAGMA journal_size_limit = 67108864",
+        "PRAGMA wal_autocheckpoint = 1000",
+        "PRAGMA synchronous = NORMAL",
+        "PRAGMA cache_size = -64000",
+        "PRAGMA temp_store = MEMORY",
+    ] {
+        let _ = sqlx::query(pragma).execute(&mut conn).await;
+    }
+    Ok(conn)
 }
 
 /// Apply all embedded migrations.

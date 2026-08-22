@@ -107,7 +107,7 @@ pub fn plist_xml(
 		<key>TORON_KEY_PASSPHRASE_FILE</key>
 		<string>{}</string>
 		<key>RUST_LOG</key>
-		<string>info</string>
+		<string>warn</string>
 	</dict>
 </dict>
 </plist>
@@ -143,7 +143,7 @@ pub fn systemd_unit(
          ExecStart={} serve --mcp-http {addr} --no-color\n\
          Environment=TORON_OPERATOR_KEY={}\n\
          Environment=TORON_KEY_PASSPHRASE_FILE={}\n\
-         Environment=RUST_LOG=info\n\
+         Environment=RUST_LOG=warn\n\
          Restart=on-failure\n\
          RestartSec=5\n\
          StandardOutput=append:{}\n\
