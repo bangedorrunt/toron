@@ -1331,6 +1331,79 @@ mod tests {
     /// S5 integration: two identical sends land as ONE inbox row with
     /// `duplicate_of`; a third with different body stays separate.
     #[tokio::test]
+    async fn re_register_after_key_delete_converges_identity_bd_0pcd() {
+        let (mailbox, db_path, data_dir) = test_mailbox("npub-rot").await;
+        let (_sender_keys, _sender_npub) = register(&mailbox, "demo", "GreenCastle").await;
+        let (_k1, old_npub) = register(&mailbox, "demo", "BlueLake").await;
+
+        // Operator wipes the key material (lost disk / recreated key).
+        let key_dir = mailbox
+            .agent_key_path("demo", "BlueLake")
+            .parent()
+            .expect("key dir")
+            .to_path_buf();
+        std::fs::remove_dir_all(&key_dir).expect("wipe agents/<name>");
+
+        // Re-register mints a fresh on-disk identity...
+        let re = mailbox
+            .register_agent("demo", &profile("BlueLake"))
+            .await
+            .expect("re-register");
+        let new_npub = PublicKey::from_hex(&re.npub).expect("npub");
+        assert_ne!(
+            new_npub, old_npub,
+            "fresh key material derives a fresh npub"
+        );
+
+        // ...and EVERY surface converges to it.
+        let w = mailbox.whois("demo", "BlueLake").await.expect("whois");
+        assert_eq!(
+            PublicKey::from_hex(&w.npub).expect("whois npub"),
+            new_npub,
+            "whois must serve the NEW npub, not the stale profile event"
+        );
+
+        let args = SendMessage {
+            project_slug: "demo".into(),
+            sender_name: "GreenCastle".into(),
+            to: vec!["BlueLake".into()],
+            subject: "ping".into(),
+            body_md: "after rotation".into(),
+            ..Default::default()
+        };
+        let sent = mailbox.send_message(&args).await.expect("send");
+        assert_eq!(sent.count, 1, "send claims one delivery");
+
+        // The wrap is addressed to the NEW npub and unwraps with the
+        // on-disk key — before the fix it went to the dead npub and the
+        // inbox starved while send reported success.
+        let wraps = wraps_to(&mailbox, &new_npub, 1).await;
+        assert_eq!(wraps.len(), 1, "gift-wrap addressed to the NEW npub");
+        let keys_now = mailbox
+            .load_agent_key(std::path::Path::new(&re.key_path))
+            .expect("reload on-disk key");
+        unwrap_for_recipient(&keys_now, &wraps[0]).expect("unwrap with on-disk key");
+
+        let inbox = mailbox
+            .fetch_inbox(&FetchInbox {
+                project_slug: "demo".into(),
+                agent_name: "BlueLake".into(),
+                include_bodies: true,
+                ..Default::default()
+            })
+            .await
+            .expect("inbox");
+        assert_eq!(
+            inbox.len(),
+            1,
+            "inbox must fill after key rotation + re-register"
+        );
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[tokio::test]
     async fn fetch_inbox_collapses_duplicate_assigns() {
         let (mailbox, db_path, data_dir) = test_mailbox("dup").await;
         let (_sender, _) = register(&mailbox, "demo", "GreenCastle").await;
