@@ -1331,18 +1331,22 @@ mod tests {
             .renew_reservations("demo", "GreenCastle", &["docs/*.md".to_string()], 60)
             .await
             .expect("renew");
-        // bd-evqs renewal cap: a fresh lease (remaining TTL ≈ 3600s) is NOT
-        // republished for a 60s extension — renewing it adds nothing and
-        // churns the bus (the 1218-event storm). The cap keeps `renewed` at 0
-        // for healthy leases; near-expiry leases DO renew (below).
-        assert_eq!(renewed.renewed, 0, "fresh lease skipped by the renewal cap");
+        // bd-evqs renewal cap + bd-mbh0 contract: a fresh lease (remaining
+        // TTL ≈ 3600s) is NOT republished for a 60s extension — zero events,
+        // no churn (the 1218-event storm). But it IS counted as renewed:
+        // its expiry already guarantees more runway than requested, so
+        // `renewed` equals the live lease set instead of reading as failure.
+        assert_eq!(
+            renewed.renewed, 1,
+            "healthy lease counts as renewed without a republish (bd-mbh0)"
+        );
         let still_active = surface
             .check_conflicts("demo", "BlueLake", &["src/lib.rs".to_string()])
             .await
             .expect("conflicts after capped renew");
         assert!(
             !still_active.conflict_free,
-            "skipped renewal leaves the lease active (not released)"
+            "capped renewal leaves the lease active (not released)"
         );
 
         // Release all.
