@@ -1862,7 +1862,21 @@ impl Mailbox {
             extra_tags: extra,
             ..Default::default()
         };
-        self.send_message(&send).await
+        let sent = self.send_message(&send).await?;
+        // bd-wake-id-contract-1jz1: a DECIDED request must never re-fire a
+        // wake for the responder. Record the responder's READ receipt on the
+        // request rumor — the urgent/unread wake filter (bd-dbre: read rows
+        // do not wake) then drops it permanently, loop-side and everywhere.
+        // Best-effort: the decision DM is already out; a receipt failure
+        // must not fail the response.
+        let _ = self
+            .mark_message_read(
+                &args.project_slug,
+                &args.sender_name,
+                &args.request_message_id,
+            )
+            .await;
+        Ok(sent)
     }
 
     /// `request_release_status` (ADR-0011 Spec 6): resolve a negotiation by
@@ -3968,6 +3982,88 @@ mod tests {
             "escalation DM delivered to captain with request e-ref"
         );
         let _ = rose;
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// bd-wake-id-contract-1jz1: a DECIDED request-release can never re-fire
+    /// a wake for the responder. Contract: BEFORE responding, the request is
+    /// an unread urgent row in the holder's projection (wake-citable); the
+    /// response records the holder's read receipt on the request rumor, so
+    /// AFTER, no wake-citing row remains (bd-dbre: read rows do not wake).
+    #[tokio::test]
+    async fn test_decided_request_release_never_refires_wake() {
+        let (mailbox, db_path, data_dir) = test_mailbox("wake-refire").await;
+        register(&mailbox, "demo", "BlueLake").await;
+        register(&mailbox, "demo", "RoseDune").await;
+
+        let held = mailbox
+            .file_reservation_paths(
+                "demo",
+                "BlueLake",
+                &["src/**".into()],
+                Some(3600),
+                true,
+                None,
+            )
+            .await
+            .expect("hold");
+
+        let req = mailbox
+            .request_release(&RequestRelease {
+                project_slug: "demo".into(),
+                sender_name: "RoseDune".into(),
+                target_agent: "BlueLake".into(),
+                reservation_id: held.granted[0].id.clone(),
+                ask: ReleaseAsk::Release,
+                note: None,
+            })
+            .await
+            .expect("request");
+
+        // A wake candidate = UNREAD + urgent (flywheel wake_urgent drops
+        // read rows, bd-dbre) — so the query mirrors the loop's poll.
+        let wake_rows = crate::mailbox::messaging::FetchInbox {
+            project_slug: "demo".into(),
+            agent_name: "BlueLake".into(),
+            unread_only: true,
+            limit: Some(10),
+            include_bodies: true,
+            urgent_only: true,
+            since_ts: None,
+            thread_id: None,
+        };
+        let before = mailbox
+            .fetch_inbox(&wake_rows)
+            .await
+            .expect("pre-response inbox");
+
+        assert!(
+            before
+                .iter()
+                .any(|r| r.id == req.message_id && r.read_ts_us.is_none()),
+            "the request must be a live wake candidate pre-response"
+        );
+
+        mailbox
+            .respond_request_release(&ReleaseResponse {
+                project_slug: "demo".into(),
+                sender_name: "BlueLake".into(),
+                request_message_id: req.message_id.clone(),
+                decision: ReleaseDecision::Agreed,
+                note: None,
+            })
+            .await
+            .expect("respond");
+
+        let after = mailbox
+            .fetch_inbox(&wake_rows)
+            .await
+            .expect("post-response inbox");
+        assert!(
+            !after.iter().any(|r| r.id == req.message_id),
+            "a decided request-release must never re-fire a wake"
+        );
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_dir_all(&data_dir);
     }
