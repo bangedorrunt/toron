@@ -321,6 +321,21 @@ pub struct ConflictReport {
     pub soft_conflicts: Vec<PathConflict>,
     /// True when any path has a soft conflict.
     pub has_soft_conflicts: bool,
+    /// bd-slot-visibility-gv17: ACTIVE build-slot leases held by OTHERS
+    /// (the caller's own slots are excluded — own never conflicts). Lets a
+    /// pre-write check answer "is the cargo fence free?" in ONE call.
+    #[serde(default)]
+    pub slot_holders: Vec<SlotHolder>,
+}
+
+/// One active build-slot lease as seen by a pre-write collision check
+/// (bd-slot-visibility-gv17).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SlotHolder {
+    pub slot: String,
+    pub agent_name: String,
+    pub exclusive: bool,
+    pub expires_ts_us: Option<i64>,
 }
 
 /// Result of `renew_file_reservations`.
@@ -597,6 +612,23 @@ impl Mailbox {
         report.has_soft_conflicts = !report.soft_conflicts.is_empty();
         report.total_conflicting_reservations =
             report.conflicts.iter().map(|c| c.holders.len()).sum();
+        // bd-slot-visibility-gv17: ACTIVE build-slot leases held by others —
+        // the pre-write check answers "is the cargo fence free?" in ONE call.
+        report.slot_holders = match self.index_pool() {
+            Some(pool) => crate::index::slots::active_slots(pool, project_slug)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|s| s.agent_pubkey != agent_keys.public_key().to_hex())
+                .map(|s| SlotHolder {
+                    slot: s.slot,
+                    agent_name: s.agent_name,
+                    exclusive: s.exclusive,
+                    expires_ts_us: s.expires_ts_us,
+                })
+                .collect(),
+            None => Vec::new(),
+        };
         Ok(report)
     }
 
@@ -2752,6 +2784,63 @@ mod tests {
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_dir_all(&data_dir);
         let _ = peer;
+    }
+
+    /// bd-slot-visibility-gv17: the pre-write collision check must expose
+    /// ACTIVE build-slot holders — an agent about to run the VERIFY fence
+    /// discovers a held cargo slot in ONE call. Own slots are excluded
+    /// (own never conflicts); a released slot disappears from the report.
+    #[tokio::test]
+    async fn conflict_check_exposes_active_slot_holders() {
+        let (mailbox, db_path, data_dir) = test_mailbox("slot-visibility").await;
+        register(&mailbox, "demo", "BlueLake").await;
+        register(&mailbox, "demo", "RoseDune").await;
+
+        // BlueLake holds the cargo slot.
+        mailbox
+            .acquire_build_slot("demo", "BlueLake", "cargo", Some(3600), true)
+            .await
+            .expect("acquire cargo");
+
+        // RoseDune's pre-write check on an UNRELATED path still sees the
+        // fence is busy.
+        let report = mailbox
+            .check_file_reservation_conflicts("demo", "RoseDune", &["docs/x.md".into()])
+            .await
+            .expect("conflicts");
+        let holder = report
+            .slot_holders
+            .iter()
+            .find(|s| s.slot == "cargo")
+            .expect("cargo holder visible in one call");
+        assert_eq!(holder.agent_name, "BlueLake");
+        assert!(holder.exclusive);
+        assert!(holder.expires_ts_us.is_some());
+
+        // Own slots never surface (own never conflicts).
+        let own = mailbox
+            .check_file_reservation_conflicts("demo", "BlueLake", &["docs/x.md".into()])
+            .await
+            .expect("own conflicts");
+        assert!(
+            own.slot_holders.iter().all(|s| s.slot != "cargo"),
+            "own slot excluded: {:?}",
+            own.slot_holders
+        );
+
+        // Released → gone.
+        mailbox
+            .release_build_slot("demo", "BlueLake", "cargo")
+            .await
+            .expect("release cargo");
+        let after = mailbox
+            .check_file_reservation_conflicts("demo", "RoseDune", &["docs/x.md".into()])
+            .await
+            .expect("after release");
+        assert!(after.slot_holders.is_empty(), "{:?}", after.slot_holders);
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
     }
 
     #[tokio::test]
