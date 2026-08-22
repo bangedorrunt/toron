@@ -71,6 +71,36 @@ pub const INTENT_TTL_SECS: u64 = 5 * 60;
 /// within this window escalates to a captain DM (kind-14, importance high).
 pub const REQUEST_RELEASE_TIER_WINDOW_SECS: u64 = 15 * 60;
 
+/// bd-lease-liveness-bo0g: session-liveness oracle for lease holders.
+/// Input = the holder's pubkey hex; output = true when that holder's
+/// session is STILL LIVE (herdr pane alive / fresh presence heartbeat).
+/// Installed by the embedder (the daemon knows panes; core does not).
+/// With NO oracle installed, expired leases clear — pure NIP-40 semantics,
+/// byte-identical to pre-bo0g behavior.
+pub type LeaseLivenessFn = std::sync::Arc<dyn Fn(&str) -> bool + Send + Sync>;
+
+static LEASE_LIVENESS: std::sync::Mutex<Option<LeaseLivenessFn>> = std::sync::Mutex::new(None);
+
+/// Install (or replace) the holder-liveness oracle. Idempotent per install;
+/// tests should [`clear_lease_liveness_checker`] when done (global state).
+pub fn install_lease_liveness_checker(f: LeaseLivenessFn) {
+    if let Ok(mut slot) = LEASE_LIVENESS.lock() {
+        *slot = Some(f);
+    }
+}
+
+/// Drop the oracle (back to pure TTL semantics). Test reset + daemon
+/// shutdown hygiene.
+pub fn clear_lease_liveness_checker() {
+    if let Ok(mut slot) = LEASE_LIVENESS.lock() {
+        *slot = None;
+    }
+}
+
+fn installed_lease_liveness() -> Option<LeaseLivenessFn> {
+    LEASE_LIVENESS.lock().ok().and_then(|s| s.clone())
+}
+
 /// The 30031 status state machine (ADR-0011 Spec 2). Status-less 30031s are
 /// `Held` (backward compat — existing reservations are byte-identical).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -1145,9 +1175,53 @@ impl Mailbox {
         let events = collect_replay(self.bus.as_ref(), filter).await?;
         let operator = self.operator.as_ref().map(|k| k.public_key());
         let now_secs = Timestamp::now().as_secs() as i64;
-        Ok(Self::resolve_leases_from_events(
-            &events, operator, now_secs,
-        ))
+        let mut out = Self::resolve_leases_from_events(&events, operator, now_secs);
+
+        // bd-lease-liveness-bo0g: the bus prunes EXPIRED envelopes on replay
+        // (NIP-40), so an expired-but-still-blocking lease is invisible to
+        // the event view above. Its SQL MIRROR row persists (`status=active`,
+        // `expires_ts_us` past) — resurrect that row ONLY while a liveness
+        // oracle vouches the holder's session is still live. No oracle →
+        // pure NIP-40 semantics (expired stays invisible), byte-identical to
+        // pre-bo0g behavior.
+        let liveness = installed_lease_liveness();
+        if let Some(pool) = self.index_pool() {
+            let now_us = now_secs * 1_000_000;
+            let expired_mirrors: Vec<(String, String, String, i64, i64, Option<String>)> =
+                sqlx::query_as(
+                    "SELECT agent_pubkey, path_pattern, COALESCE(reason,''), exclusive, \
+                     expires_ts_us, event_id \
+                     FROM file_reservations \
+                     WHERE project_slug = ?1 AND status = 'active' \
+                       AND expires_ts_us IS NOT NULL AND expires_ts_us < ?2",
+                )
+                .bind(project_slug)
+                .bind(now_us)
+                .fetch_all(pool)
+                .await
+                .unwrap_or_default();
+            for (pubkey, path, reason, excl, exp_us, event_id) in expired_mirrors {
+                let dup = out
+                    .iter()
+                    .any(|l| l.agent_pubkey == pubkey && l.path_pattern == path && !l.expired);
+                if dup || !liveness.as_ref().is_some_and(|f| f(&pubkey)) {
+                    continue;
+                }
+                out.push(ResolvedLease {
+                    id: event_id.unwrap_or_else(|| format!("mirror:{path}:{pubkey}")),
+                    agent_pubkey: pubkey,
+                    path_pattern: path,
+                    exclusive: excl != 0,
+                    reason,
+                    expires_ts_us: Some(exp_us),
+                    status: ReservationStatus::Held,
+                    created_at_secs: 0,
+                    expired: true,
+                    liveness_extended: true,
+                });
+            }
+        }
+        Ok(out)
     }
 
     /// Resolve lease state from raw kind-30031 events (any project scope).
@@ -1178,7 +1252,10 @@ impl Mailbox {
             if status == ReservationStatus::Revoked || status == ReservationStatus::Released {
                 continue;
             }
-            // TTL expiry clears the lease (NIP-40, held and intent alike).
+            // TTL expiry clears the lease here (NIP-40, held and intent
+            // alike). bd-lease-liveness-bo0g: an expired lease whose holder
+            // is STILL LIVE is resurrected in `resolved_leases` from the SQL
+            // mirror under oracle vouch — this view stays pure NIP-40.
             if let Some(exp) = winning.tags.expiration()
                 && (exp.as_secs() as i64) < now_secs
             {
@@ -1208,6 +1285,8 @@ impl Mailbox {
                     .map(|t| t.as_secs() as i64 * 1_000_000),
                 status,
                 created_at_secs: winning.created_at.as_secs() as i64,
+                expired: false,
+                liveness_extended: false,
             });
         }
         out
@@ -2088,6 +2167,12 @@ pub(crate) struct ResolvedLease {
     pub expires_ts_us: Option<i64>,
     pub status: ReservationStatus,
     pub created_at_secs: i64,
+    /// NIP-40 TTL has passed. Kept (flagged) when a liveness oracle says
+    /// the holder's session is still live — the lease keeps blocking.
+    pub expired: bool,
+    /// This lease blocks ONLY because of the liveness oracle
+    /// (bd-lease-liveness-bo0g); surfaces may report the reason.
+    pub liveness_extended: bool,
 }
 
 /// One ghost lease released by the pane-prune cascade (bd-gc7k).
@@ -2549,6 +2634,124 @@ mod tests {
 
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// bd-lease-liveness-bo0g: an EXPIRED lease whose holder's session is
+    /// still LIVE keeps blocking — the TTL outlived the work, not the work
+    /// the TTL. A second agent's conflict check (and acquire) against a
+    /// path being actively edited by a live peer MUST name that peer as
+    /// holder. No liveness oracle installed → pure NIP-40 semantics
+    /// (expired = clear), so every pre-existing behavior is preserved.
+    #[tokio::test]
+    async fn expired_lease_blocks_iff_holder_session_live() {
+        let (mailbox, db_path, data_dir) = test_mailbox("liveness").await;
+        let holder = register(&mailbox, "demo", "BlueLake").await;
+        let peer = register(&mailbox, "demo", "RoseDune").await;
+        let holder_hex = holder.to_hex();
+
+        // Holder acquires two paths: one with a 1s TTL (expires below), one
+        // with a healthy TTL (control — never expires mid-test).
+        mailbox
+            .file_reservation_paths(
+                "demo",
+                "BlueLake",
+                &["src/fleeting.rs".into()],
+                Some(1),
+                true,
+                Some("bd-liveness"),
+            )
+            .await
+            .expect("acquire fleeting");
+        mailbox
+            .file_reservation_paths(
+                "demo",
+                "BlueLake",
+                &["src/stable.rs".into()],
+                Some(3600),
+                true,
+                Some("bd-liveness"),
+            )
+            .await
+            .expect("acquire stable");
+        tokio::time::sleep(std::time::Duration::from_millis(1300)).await;
+
+        let check = |mailbox: &Mailbox| {
+            let mailbox = mailbox.clone();
+            async move {
+                mailbox
+                    .check_file_reservation_conflicts(
+                        "demo",
+                        "RoseDune",
+                        &["src/fleeting.rs".into(), "src/stable.rs".into()],
+                    )
+                    .await
+                    .expect("conflict check")
+            }
+        };
+
+        // Phase 1 — no liveness oracle: expired = clear (NIP-40 baseline),
+        // the healthy lease still blocks regardless.
+        let report = check(&mailbox).await;
+        assert!(
+            report.clear_paths.contains(&"src/fleeting.rs".to_string()),
+            "baseline: expired lease clears without an oracle"
+        );
+        assert!(
+            report.conflicts.iter().any(|c| c.path == "src/stable.rs"),
+            "healthy lease unaffected"
+        );
+
+        // Phase 2 — oracle says BlueLake's session is LIVE: the expired
+        // lease MUST block again, naming BlueLake, and refuse RoseDune's
+        // acquire of the same path.
+        install_lease_liveness_checker(std::sync::Arc::new(move |pubkey_hex| {
+            pubkey_hex == holder_hex
+        }));
+        let report = check(&mailbox).await;
+        let hit = report
+            .conflicts
+            .iter()
+            .find(|c| c.path == "src/fleeting.rs")
+            .expect("live holder keeps the expired lease blocking");
+        assert!(
+            hit.holders.iter().any(|h| h == "BlueLake"),
+            "peer named as holder: {hit:?}"
+        );
+        let acq = mailbox
+            .file_reservation_paths(
+                "demo",
+                "RoseDune",
+                &["src/fleeting.rs".into()],
+                Some(600),
+                true,
+                None,
+            )
+            .await
+            .expect("acquire attempt");
+        assert!(
+            acq.granted.is_empty() && !acq.conflicts.is_empty(),
+            "acquire refused while live peer holds: {acq:?}"
+        );
+
+        // Phase 3 — oracle says the session is GONE: back to clear.
+        install_lease_liveness_checker(std::sync::Arc::new(|_| false));
+        let report = check(&mailbox).await;
+        assert!(
+            report.clear_paths.contains(&"src/fleeting.rs".to_string()),
+            "gone holder's expired lease clears: {:?}",
+            report.conflicts
+        );
+        clear_lease_liveness_checker();
+
+        // The peer's own identity never trips its own check (sanity).
+        let own = mailbox
+            .check_file_reservation_conflicts("demo", "RoseDune", &["docs/own.md".into()])
+            .await
+            .expect("own check");
+        assert!(own.conflict_free);
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+        let _ = peer;
     }
 
     #[tokio::test]
