@@ -37,7 +37,13 @@ impl ToolServer {
     )]
     async fn send_message(&self, Parameters(args): Parameters<SendMessageArgs>) -> ToolOutput {
         if args.broadcast == Some(true) {
-            return ToolOutput::err("broadcast=true is rejected (AM-Rust invariant)");
+            // bd-mail-crew-fanout-xq6b: a rejection must name the supported
+            // path — explicit per-recipient sends, or flywheel's --crew
+            // spawn-registry expansion.
+            return ToolOutput::err(
+                "broadcast=true is rejected (AM-Rust invariant: explicit recipients only) —                  send one addressed copy per recipient instead; flywheel crews: \
+                 `flywheel mail send <project> --crew --subject S --body B` expands the live pins",
+            );
         }
         // Additive optional (ADR-0007 C3: names frozen, args may grow pre-1.0):
         // CLI `reserve request-release` composes this existing tool.
