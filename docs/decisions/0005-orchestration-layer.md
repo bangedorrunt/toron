@@ -513,6 +513,11 @@ it fits the captain's model.
   keeps working — parsed into the unified schema, run by the one engine.
 - `pipelines.toml` (a chain of workflow names) → a workflow whose steps are
   `call_workflow`. Chains are workflows-of-workflows; one concept.
+- **Amended by ADR-0022 §3.1 (2026-08-22):** `dispatch_job`'s spec is TYPED —
+  `DispatchSpec` (named `profile`/`task`/`stage`/`harness`/`model`/`effort`/
+  `phase`/`plan`/`project` fields, unknown keys round-trip through `extra`,
+  `phase` closed at deserialize). See
+  [0022 §3.1](0022-phase-native-orchestration.md).
 
 **Why unify (vs sibling vocabularies):** seamless integration — `flywheel
 workflow run <name>` regardless of whether the steps are simple sends or
