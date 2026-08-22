@@ -1687,6 +1687,76 @@ mod tests {
         let _ = std::fs::remove_dir_all(&data_dir);
     }
 
+    /// bd-bg8t fence: read at T1, ack at T2 > T1 → acknowledged_at_us is
+    /// the ACK's own time (differs from the read receipt, ≥ T1), a repeat
+    /// ack never regresses it, and the durable read_ts_us keeps T1.
+    #[tokio::test]
+    async fn test_ack_after_read_records_ack_time_not_read_time() {
+        let (mailbox, pool, db_path, data_dir) = test_mailbox_with_pool("bg8t").await;
+        let (_sender, npub_sender) = register(&mailbox, "demo", "GreenCastle").await;
+        let (recv, npub_recv) = register(&mailbox, "demo", "BlueLake").await;
+
+        let args = SendMessage {
+            project_slug: "demo".into(),
+            sender_name: "GreenCastle".into(),
+            to: vec!["BlueLake".into()],
+            subject: "bg8t".into(),
+            body_md: "read me, then ack me".into(),
+            ack_required: true,
+            ..Default::default()
+        };
+        mailbox.send_message(&args).await.expect("send");
+
+        let wrap = &wraps_to(&mailbox, &npub_recv, 2).await[0];
+        let gift = unwrap_for_recipient(&recv, wrap).expect("unwrap");
+        let message_id = gift.rumor.clone().id().to_hex();
+
+        // T1: mark READ only.
+        let read = mailbox
+            .mark_message_read("demo", "BlueLake", &message_id)
+            .await
+            .expect("read");
+        let t1 = read.acknowledged_at_us.expect("read receipt ts");
+
+        // T2 > T1: acknowledge.
+        tokio::time::timeout(std::time::Duration::from_millis(1), async {})
+            .await
+            .ok();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let ack = mailbox
+            .acknowledge_message("demo", "BlueLake", &message_id)
+            .await
+            .expect("ack");
+        let t2 = ack.acknowledged_at_us.expect("ack ts");
+        assert!(
+            t2 > t1,
+            "bd-bg8t: ack time must exceed the earlier read receipt time ({t1})"
+        );
+
+        // Idempotency must not regress.
+        let again = mailbox
+            .acknowledge_message("demo", "BlueLake", &message_id)
+            .await
+            .expect("ack again");
+        assert_eq!(again.acknowledged_at_us, Some(t2), "no regression");
+
+        // Durable projection keeps the EARLIEST read (T1), not the ack ts.
+        let row: Option<(i64,)> = sqlx::query_as(
+            "SELECT read_ts_us FROM message_reads \
+             WHERE project_slug = 'demo' AND recipient = ?1 AND message_id = ?2",
+        )
+        .bind(npub_recv.to_hex())
+        .bind(&message_id)
+        .fetch_optional(&pool)
+        .await
+        .expect("query");
+        assert_eq!(row.map(|r| r.0), Some(t1));
+
+        let _sender_wraps = wraps_to(&mailbox, &npub_sender, 4).await;
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
     #[tokio::test]
     async fn test_ack_idempotent_and_private() {
         let (mailbox, db_path, data_dir) = test_mailbox("ack").await;
