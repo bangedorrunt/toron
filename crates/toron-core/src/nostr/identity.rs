@@ -134,28 +134,30 @@ pub fn profile_npub(event: &Event) -> PublicKey {
 /// Names are **project-scoped**: only profiles whose `d` tag is exactly
 /// `<project_slug>:<name>` match. Unknown names return `None` (caller fails
 /// fast, AM-Rust parity).
+///
+/// bd-0pcd: kind-30013 is a NIP-01 parameterized REPLACEABLE event. After a
+/// key deletion + re-register, the archive holds TWO profiles under one d
+/// tag — first-match resolution served the DEAD npub to whois and gift-wrap
+/// (inbox starved while send reported success). The LATEST event per d tag
+/// wins, regardless of replay order.
 pub fn resolve_name<'a>(
     project_slug: &str,
     profiles: impl IntoIterator<Item = &'a Event>,
     name: &str,
 ) -> Option<PublicKey> {
     let want = profile_d_tag(project_slug, name);
-    for ev in profiles {
-        if ev.kind.as_u16() != AGENT_PROFILE {
-            continue;
-        }
-        let d = ev.tags.iter().find_map(|t| {
-            if t.kind() == nostr_sdk::nostr::TagKind::d() {
-                t.content()
-            } else {
-                None
-            }
-        });
-        if d == Some(want.as_str()) {
-            return Some(profile_npub(ev));
-        }
-    }
-    None
+    profiles
+        .into_iter()
+        .filter(|ev| ev.kind.as_u16() == AGENT_PROFILE)
+        .filter(|ev| {
+            ev.tags.iter().find_map(|t| {
+                (t.kind() == nostr_sdk::nostr::TagKind::d())
+                    .then(|| t.content())
+                    .flatten()
+            }) == Some(want.as_str())
+        })
+        .max_by_key(|ev| ev.created_at)
+        .map(profile_npub)
 }
 
 /// Parse the profile content from a kind-30013 event.
@@ -403,6 +405,32 @@ mod tests {
         let json = profile_json(&r.event);
         let parsed = Event::from_json(json).expect("parse");
         assert_eq!(parsed, r.event);
+    }
+
+    /// bd-0pcd: kind-30013 is a NIP-01 parameterized REPLACEABLE event —
+    /// after a key rotation both the old and the new profile sit in the
+    /// archive under the same d tag, and first-match resolution serves the
+    /// DEAD npub to whois + gift-wrap (inbox starves while send reports
+    /// success). The resolver must pick the LATEST event per d tag,
+    /// regardless of replay order.
+    #[test]
+    fn resolve_name_prefers_latest_replaceable_event() {
+        let old = create_agent_identity("demo", &sample_profile(), ts()).expect("old");
+        let new = create_agent_identity("demo", &sample_profile(), Timestamp::from(TS + 60))
+            .expect("new");
+
+        // Replay order A: oldest first (rumor-time order).
+        assert_eq!(
+            resolve_name("demo", [&old.event, &new.event], "BlueLake"),
+            Some(new.event.pubkey),
+            "latest profile wins over the stale one"
+        );
+        // Replay order B: newest first.
+        assert_eq!(
+            resolve_name("demo", [&new.event, &old.event], "BlueLake"),
+            Some(new.event.pubkey),
+            "order-independent: latest wins either way"
+        );
     }
 
     fn sample_profile_with_name(name: &str) -> AgentProfile {
