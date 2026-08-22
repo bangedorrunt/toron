@@ -121,7 +121,7 @@
       "name": "workflow"
     }
   ],
-  "generated_at": "2026-08-22T00:22:12Z",
+  "generated_at": "2026-08-22T01:46:40Z",
   "resources": [
     {
       "description": "List projects known to toron.",
@@ -1879,6 +1879,33 @@
               "reservation_ids"
             ],
             "type": "object"
+          },
+          "SlotHolderOut": {
+            "description": "One active build-slot lease (bd-slot-visibility-gv17).",
+            "properties": {
+              "agent_name": {
+                "type": "string"
+              },
+              "exclusive": {
+                "type": "boolean"
+              },
+              "expires_ts_us": {
+                "format": "int64",
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "slot": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "slot",
+              "agent_name",
+              "exclusive"
+            ],
+            "type": "object"
           }
         },
         "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -1906,6 +1933,13 @@
           "has_soft_conflicts": {
             "type": "boolean"
           },
+          "slot_holders": {
+            "description": "bd-slot-visibility-gv17: ACTIVE build-slot leases held by others —\n\"is the cargo fence free?\" in the same one-call pre-write check.",
+            "items": {
+              "$ref": "#/$defs/SlotHolderOut"
+            },
+            "type": "array"
+          },
           "soft_conflicts": {
             "description": "ADR-0011 Spec 4: additive soft tier (in-TTL intents).",
             "items": {
@@ -1926,7 +1960,8 @@
           "checked_paths",
           "total_conflicting_reservations",
           "soft_conflicts",
-          "has_soft_conflicts"
+          "has_soft_conflicts",
+          "slot_holders"
         ],
         "type": "object"
       },
