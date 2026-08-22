@@ -13,7 +13,7 @@ use rmcp::handler::server::wrapper::Parameters;
 use rmcp::schemars::{self, JsonSchema};
 use rmcp::{tool, tool_router};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{json, Value};
 
 use super::{ToolOutput, ToolServer, nonneg_secs};
 
@@ -183,6 +183,50 @@ impl ToolServer {
                 .await,
         )
     }
+
+    /// `list_file_reservations` (additive read, bd-locks-list-daemon-xetz —
+    /// NOT part of the AM-Rust parity 38): the daemon-side lease board. The
+    /// strict guard already evaluates this state server-side; without a read
+    /// tool the remote seam was blind (flywheel `mail locks list` errored).
+    /// Read-only: never registers or publishes.
+    #[tool(
+        name = "list_file_reservations",
+        description = "List every active (held) file reservation in the project — the lock board the strict guard evaluates: id, path glob, holder, exclusive, reason, expiry. Optional filters: holder (exact agent name), path (glob overlap). REQUIRED: project_key.",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<LeaseBoardOut>(),
+        annotations(title = "List file reservations", read_only_hint = true)
+    )]
+    async fn list_file_reservations(
+        &self,
+        Parameters(args): Parameters<ListFileReservationsArgs>,
+    ) -> ToolOutput {
+        let rows = match self.mailbox.active_reservations(&args.project_key).await {
+            Ok(rows) => rows,
+            Err(e) => return ToolOutput::result::<()>(Err(e)),
+        };
+        let matches_glob = |pattern: &str, query: &str| -> bool {
+            // the guard's own symmetric fnmatch semantics
+            toron_core::mailbox::guard::pattern_matches(pattern, query)
+                || toron_core::mailbox::guard::pattern_matches(query, pattern)
+        };
+        let reservations: Vec<LeaseRowOut> = rows
+            .into_iter()
+            .filter(|r| args.holder.as_deref().is_none_or(|h| r.agent_name == h))
+            .filter(|r| args.path.as_deref().is_none_or(|p| matches_glob(&r.path_pattern, p)))
+            .map(|r| LeaseRowOut {
+                id: r.id,
+                path: r.path_pattern,
+                holder: r.agent_name,
+                exclusive: r.exclusive,
+                reason: r.reason,
+                expires_ts_us: r.expires_ts_us,
+            })
+            .collect();
+        ToolOutput::result(Ok(LeaseBoardOut {
+            project_key: args.project_key,
+            count: reservations.len(),
+            reservations,
+        }))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -246,4 +290,54 @@ pub struct ReleaseFileReservationsByReasonArgs {
     /// Bead id whose matching (reason == bead id) leases get revoked.
     pub bead_id: String,
     pub notify_previous: Option<bool>,
+}
+
+// ---------------------------------------------------------------------------
+// bd-locks-list-daemon-xetz — additive read tool types
+// ---------------------------------------------------------------------------
+
+/// `list_file_reservations` args (additive read).
+#[derive(Debug, Clone, JsonSchema, Serialize, Deserialize)]
+pub struct ListFileReservationsArgs {
+    pub project_key: String,
+    /// exact holder filter (agent name)
+    pub holder: Option<String>,
+    /// glob-overlap filter (show holders of one path)
+    pub path: Option<String>,
+}
+
+/// One lease row (`list_file_reservations`).
+#[derive(Debug, Clone, JsonSchema, Serialize, Deserialize)]
+pub struct LeaseRowOut {
+    pub id: String,
+    pub path: String,
+    pub holder: String,
+    pub exclusive: bool,
+    pub reason: String,
+    pub expires_ts_us: Option<i64>,
+}
+
+/// `list_file_reservations`.
+#[derive(Debug, Clone, JsonSchema, Serialize, Deserialize)]
+pub struct LeaseBoardOut {
+    pub project_key: String,
+    pub count: usize,
+    pub reservations: Vec<LeaseRowOut>,
+}
+
+impl crate::tools::ToJson for LeaseBoardOut {
+    fn to_json(&self) -> Value {
+        json!({
+            "project_key": self.project_key,
+            "count": self.count,
+            "reservations": self.reservations.iter().map(|r| json!({
+                "id": r.id,
+                "path": r.path,
+                "holder": r.holder,
+                "exclusive": r.exclusive,
+                "reason": r.reason,
+                "expires_ts_us": r.expires_ts_us,
+            })).collect::<Vec<_>>(),
+        })
+    }
 }
