@@ -46,12 +46,29 @@ pub struct OkOut {
 }
 
 /// `cleanup_pane_identities`: bare `Vec<String>` of pruned pane identities
-/// (happy path) or `{note}` (no herdr backend wired).
+/// (happy path) or `{note}` (no herdr backend wired). With the bd-gc7k
+/// cascade, pruned pins also report the ghost leases released on their
+/// behalf (`removed` + `released`).
 #[derive(Debug, Clone, JsonSchema)]
 #[schemars(untagged)]
 pub enum CleanupPaneIdentitiesOut {
     Removed(Vec<String>),
-    Note { note: String },
+    RemovedWithReleases {
+        removed: Vec<String>,
+        released: Vec<ReleasedGhostOut>,
+    },
+    Note {
+        note: String,
+    },
+}
+
+/// One exclusive lease revoked because its holder pin was pruned
+/// (bd-gc7k: a dead pin must not own the ledger).
+#[derive(Debug, Clone, JsonSchema)]
+pub struct ReleasedGhostOut {
+    pub project_slug: String,
+    pub path_pattern: String,
+    pub holder: String,
 }
 
 /// `register_agent` / `create_agent_identity` / `list_agents` rows.
