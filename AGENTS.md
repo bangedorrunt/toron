@@ -108,9 +108,17 @@ Release profile: `strip = "none"` (macOS arm64 LINKEDIT / sqlx_macros).
 
 ## NOTES
 
+- Captain alias (bd-captain-alias-0g8a): `captain` is a routable fold onto
+  the project's REGISTERED orchestrator pin — set via
+  `toron contact captain --project <slug> --pin <adj+noun>`, resolved by
+  `toron mail whois <slug> captain` and `mail send --to captain`. Standing
+  orders address reports to `captain`, never to the host username.
 - `toron serve` requires `--mcp-stdio` or `--mcp-http`. No-flag serve bails.
 - Daemon label `com.toron.serve`, HTTP `127.0.0.1:18080`. Passphrase file
   `~/.config/toron/passphrase` (0600), never in plist/env flags.
+- Daemon runs at `RUST_LOG=warn` (plist + `daemon.rs` templates) with weekly
+  copy-truncate rotation via LaunchAgent `com.toron.logrotate` — rmcp session
+  churn at INFO once wrote a 604 MB serve.out.log.
 - Bare `cargo test --workspace` compiles e2e and runs 0 p1/p2 tests (feature
   gates). sc16–sc24 currently run un-gated.
 - Root `tests/` and `examples/agent_ping_pong.rs` are ADR-0001 leftovers —
