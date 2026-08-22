@@ -570,21 +570,28 @@ impl Mailbox {
         Ok(report)
     }
 
-    /// `renew_file_reservations`: republish the holder's active leases with an
-    /// extended TTL (same `(kind,d)` coordinate → supersedes per author).
+    /// `renew_file_reservations`: converge the holder's active leases to ≥
+    /// `extend_secs` of remaining TTL (same `(kind,d)` coordinate →
+    /// supersedes per author). `renewed` counts EVERY live matching lease
+    /// after the call: freshly republished ones AND already-healthy ones —
+    /// a healthy lease is covered by the operation (its expiry already
+    /// guarantees the runway), so `renewed` equals the holder's live lease
+    /// set. Before bd-mbh0 the healthy window was excluded and callers read
+    /// `renewed:0` as failure while leases lapsed un-renewed.
     ///
-    /// bd-evqs renewal cap: a lease whose remaining TTL is ALREADY ≥
-    /// `extend_secs` is NOT republished. The durable loop heartbeat renews
-    /// every tick; without the cap it re-publishes every lease each tick —
-    /// a single d-tag accumulated 1218 renewal events over ~10h (the
-    /// reservation renewal storm, holder inactive, owning bead closed).
-    /// Renewing a lease that will outlive the extension adds nothing (the
-    /// TTL ratchets: renew only when remaining < extend_secs, keeping the
-    /// lease healthy in [extend, 2×extend) forever) — the cap collapses the
-    /// churn to ~1 event per extend window per lease, and lets a concurrent
-    /// release/revocation win the coordinate instead of racing a same-second
-    /// renew. Permanent leases (no expiry) are never renewed (they never
-    /// lapse).
+    /// bd-evqs renewal cap (unchanged): a lease whose remaining TTL is
+    /// ALREADY ≥ `extend_secs` is NOT republished — zero events for the
+    /// healthy window. The durable loop heartbeat renews every tick; without
+    /// the cap it re-publishes every lease each tick — a single d-tag
+    /// accumulated 1218 renewal events over ~10h (the reservation renewal
+    /// storm, holder inactive, owning bead closed). Republishing only when
+    /// remaining < extend_secs keeps the lease healthy in [extend,
+    /// 2×extend) forever while collapsing the churn to ~1 event per extend
+    /// window per lease. Extension math is ABSOLUTE (bd-XXX pin below): new
+    /// expiry = old expiry + extend_secs, never now-derived. Permanent
+    /// leases (no expiry) are reported but never republished (they never
+    /// lapse) — and counted: the holder's set is fully converged after the
+    /// call.
     pub async fn renew_file_reservations(
         &self,
         project_slug: &str,
@@ -606,10 +613,11 @@ impl Mailbox {
         let mut result = RenewResult::default();
         for res in mine {
             let d = format!("{project_slug}:{}", res.path_pattern);
-            // bd-evqs cap: skip when the lease still has ≥ extend_secs of TTL
-            // left (or is permanent). No event is published — the loop's
-            // every-tick heartbeat stops churning the bus. The lease is still
-            // REPORTED (unrenewed) so the embedding's closed-bead sweep can
+            // bd-evqs cap: no republish when the lease still has ≥
+            // extend_secs of TTL left (or is permanent) — zero events for
+            // the healthy window. bd-mbh0: the lease is still COUNTED as
+            // renewed (its expiry is already converged ≥ the requested
+            // runway) and REPORTED so the embedding's closed-bead sweep can
             // see + release it: a reservation whose owning bead closed is
             // stale even while its TTL is healthy.
             let old_expiry_secs = res.expires_ts_us.map(|t| t / 1_000_000);
@@ -625,6 +633,7 @@ impl Mailbox {
                     reason: res.reason.clone(),
                     expires_ts_us: res.expires_ts_us,
                 });
+                result.renewed += 1;
                 continue;
             }
             let base = vec![
@@ -870,6 +879,102 @@ impl Mailbox {
             }
         }
         Ok(())
+    }
+
+    /// bd-gc7k: revoke every EXCLUSIVE held lease whose holder pin is in
+    /// `dead_holders` — the prune list from `cleanup_pane_identities`
+    /// (pins whose herdr panes are gone). A dead pin must not own the
+    /// ledger: the pane-death query IS the freshness evidence, so unlike
+    /// [`Self::force_release_file_reservation`] there is NO staleness
+    /// heuristic. Revocations are operator-signed kind-30031
+    /// `status:revoked` events at the same `(kind, d)` coordinate, the
+    /// durable projection is mirrored, and the transition is archived.
+    ///
+    /// Only holders NAMED in the prune list are reachable here — live
+    /// holders never appear in it, so a healthy peer can never be reaped.
+    /// Projects are enumerated from lease rows' `d_tag` prefix (the same
+    /// coordinate [`Self::resolved_leases`] splits). `Ok(vec![])` is the
+    /// clean no-op; per-project failures are best-effort skips.
+    pub async fn reap_ghost_leases(
+        &self,
+        dead_holders: &[String],
+        note: Option<&str>,
+    ) -> anyhow::Result<Vec<GhostRelease>> {
+        let mut out = Vec::new();
+        if dead_holders.is_empty() {
+            return Ok(out);
+        }
+        let operator = self.operator.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("no operator key configured — cannot reap ghost leases")
+        })?;
+        let Some(pool) = self.index_pool.as_ref() else {
+            return Ok(out);
+        };
+        let projects: Vec<String> = sqlx::query_scalar(
+            "SELECT DISTINCT substr(d_tag, 1, instr(d_tag, ':') - 1) FROM bus_events \
+             WHERE kind = ?1 AND d_tag IS NOT NULL AND instr(d_tag, ':') > 1",
+        )
+        .bind(i64::from(toron_kind(FILE_RESERVATION).as_u16()))
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default();
+
+        for project_slug in projects {
+            let held = match self.active_reservations(&project_slug).await {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            for lease in held {
+                if !lease.exclusive || !dead_holders.iter().any(|h| h == &lease.agent_name) {
+                    continue;
+                }
+                let agent_pubkey = lease.agent_pubkey.clone();
+                let path_pattern = lease.path_pattern.clone();
+                let holder = lease.agent_name.clone();
+                let d = format!("{project_slug}:{path_pattern}");
+                let target = EventId::from_hex(&lease.id).unwrap_or_else(|_| {
+                    EventId::from_hex(
+                        "b32828720d7e8a80dd5165a6cd31b2c70e8d25b83c387209cb138e77d7e7e05b",
+                    )
+                    .expect("id")
+                });
+                let mut tags = with_project_scoping(
+                    toron_kind(FILE_RESERVATION),
+                    vec![
+                        Tag::parse(["d", &d]).expect("d"),
+                        Tag::parse(["status", "revoked"]).expect("status"),
+                        Tag::event(target),
+                        Tag::parse([
+                            "a",
+                            &format!("30031:{}:{d}", operator.public_key().to_hex()),
+                        ])
+                        .expect("a"),
+                    ],
+                    Some(&project_slug),
+                );
+                tags.push(
+                    Tag::parse(["note", note.unwrap_or("ghost-pane-cleanup")]).expect("note"),
+                );
+                let revoke = build_event(
+                    operator,
+                    toron_kind(FILE_RESERVATION),
+                    r#"{"status":"revoked","heuristic":"ghost-pane"}"#,
+                    tags,
+                    Timestamp::now(),
+                )?;
+                self.bus.publish(revoke.clone()).await?;
+                self.project_lease_status(&project_slug, &agent_pubkey, &path_pattern, "revoked")
+                    .await;
+                self.record_transition(&project_slug, &d, "revoked", &revoke.id)
+                    .await;
+                out.push(GhostRelease {
+                    project_slug: project_slug.clone(),
+                    path_pattern,
+                    holder,
+                });
+            }
+        }
+        Ok(out)
     }
 
     /// `release_by_reason` (bd-h3oj): operator-signed revocation of every
@@ -1155,7 +1260,7 @@ impl Mailbox {
                 Ok(v) => v,
                 Err(_) => continue,
             };
-            let mut leases: Vec<Reservation> = held
+            let leases: Vec<Reservation> = held
                 .into_iter()
                 .filter(|r| cross_project_pattern(&r.path_pattern, repo_name).is_some())
                 .filter(|r| seen_ids.insert(r.id.clone()))
@@ -1985,6 +2090,14 @@ pub(crate) struct ResolvedLease {
     pub created_at_secs: i64,
 }
 
+/// One ghost lease released by the pane-prune cascade (bd-gc7k).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GhostRelease {
+    pub project_slug: String,
+    pub path_pattern: String,
+    pub holder: String,
+}
+
 /// One conflicting other-agent lease hit for a path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ConflictHit {
@@ -2118,6 +2231,91 @@ mod tests {
             .await
             .expect("register");
         PublicKey::from_hex(&agent.npub).expect("npub")
+    }
+
+    /// bd-gc7k: a lease whose holder pin is DEAD (pane gone — the prune
+    /// list from `cleanup_pane_identities`) must not own the ledger
+    /// forever. The cleanup cascade revokes every exclusive held lease of
+    /// the dead pins (operator-signed), and a peer's acquire of the same
+    /// path then SUCCEEDS. never-block-on-the-human.
+    #[tokio::test]
+    async fn test_ghost_holder_cleanup_cascades_to_release() {
+        let (mailbox, _db, _data) = test_mailbox("gc7k").await;
+        register(&mailbox, "demo", "CoralFinch").await;
+        register(&mailbox, "demo", "CrimsonIsland").await;
+
+        // The ghost acquires the shared ledger exclusively.
+        let acq = mailbox
+            .file_reservation_paths(
+                "demo",
+                "CoralFinch",
+                &[".beads/issues.jsonl".into()],
+                Some(3600),
+                true,
+                Some("ghost"),
+            )
+            .await
+            .expect("ghost acquire");
+        assert_eq!(acq.granted.len(), 1);
+
+        // A peer is hard-blocked while the holder lives.
+        let blocked = mailbox
+            .file_reservation_paths(
+                "demo",
+                "CrimsonIsland",
+                &[".beads/issues.jsonl".into()],
+                Some(3600),
+                true,
+                None,
+            )
+            .await
+            .expect("peer acquire");
+        assert!(
+            blocked.granted.is_empty() && !blocked.conflicts.is_empty(),
+            "{blocked:?}"
+        );
+
+        // The pane dies; the prune names the pin. The cascade MUST revoke
+        // every exclusive held lease of the dead pins.
+        let released = mailbox
+            .reap_ghost_leases(&["CoralFinch".to_string()], Some("pane-pruned"))
+            .await
+            .expect("reap");
+        assert_eq!(released.len(), 1, "{released:?}");
+        assert_eq!(released[0].holder, "CoralFinch");
+        assert_eq!(released[0].path_pattern, ".beads/issues.jsonl");
+        assert_eq!(released[0].project_slug, "demo");
+
+        // Acquire now succeeds — the ghost no longer owns the ledger.
+        let now_ok = mailbox
+            .file_reservation_paths(
+                "demo",
+                "CrimsonIsland",
+                &[".beads/issues.jsonl".into()],
+                Some(3600),
+                true,
+                None,
+            )
+            .await
+            .expect("post-reap acquire");
+        assert_eq!(now_ok.granted.len(), 1, "{now_ok:?}");
+
+        // Idempotent: a second reap has nothing to release.
+        let again = mailbox
+            .reap_ghost_leases(&["CoralFinch".to_string()], None)
+            .await
+            .expect("reap again");
+        assert!(again.is_empty(), "{again:?}");
+
+        // A live holder is NEVER reaped — only pins in the prune list are.
+        let untouched = mailbox
+            .reap_ghost_leases(&["CrimsonIsland".to_string()], None)
+            .await
+            .expect("reap live");
+        assert!(
+            untouched.is_empty(),
+            "live holder must survive: {untouched:?}"
+        );
     }
 
     #[test]
@@ -2508,6 +2706,87 @@ mod tests {
         assert!(
             !report.conflict_free,
             "held lease must be visible: {report:?}"
+        );
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// bd-mbh0 acceptance gate (the TanFern repro): a live lease whose
+    /// remaining TTL already exceeds extend_secs must STILL count as
+    /// renewed — the operation converges every live lease forward and
+    /// `renewed` equals the holder's live lease set. Under the old ratchet
+    /// this returned `renewed:0`, which callers read as failure while the
+    /// leases later lapsed un-renewed mid-VERIFY.
+    #[tokio::test]
+    async fn test_renew_counts_healthy_leases_bd_mbh0() {
+        let (mailbox, db_path, data_dir) = test_mailbox("renew-mbh0").await;
+        register(&mailbox, "demo", "BlueLake").await;
+
+        // Long-TTL lease: remaining (~7200s) >> extend (3600s) — the old
+        // ratchet returned renewed:0 exactly here.
+        let acq = mailbox
+            .file_reservation_paths(
+                "demo",
+                "BlueLake",
+                &["src/**".into()],
+                Some(7200),
+                true,
+                None,
+            )
+            .await
+            .expect("acquire long");
+        assert_eq!(acq.granted.len(), 1);
+
+        let renew = mailbox
+            .renew_file_reservations("demo", "BlueLake", &[], 3600)
+            .await
+            .expect("renew");
+        assert_eq!(
+            renew.renewed, 1,
+            "healthy lease counts as renewed (bd-mbh0)"
+        );
+        assert_eq!(renew.reservations.len(), 1);
+        assert_eq!(
+            renew.reservations[0].expires_ts_us, acq.granted[0].expires_ts_us,
+            "already-healthy expiry stays put (converged), never double-extended"
+        );
+
+        // Near-lapse lease on another path takes the republish path:
+        // ABSOLUTE extension (old + extend), expiry visibly moves forward.
+        let short = mailbox
+            .file_reservation_paths(
+                "demo",
+                "BlueLake",
+                &["docs/**".into()],
+                Some(60),
+                true,
+                None,
+            )
+            .await
+            .expect("acquire short");
+        let old_short = short.granted[0].expires_ts_us.expect("short expiry");
+
+        let renew2 = mailbox
+            .renew_file_reservations("demo", "BlueLake", &[], 3600)
+            .await
+            .expect("renew 2");
+        assert_eq!(
+            renew2.renewed, 2,
+            "renewed equals the live lease set (both paths)"
+        );
+        assert_eq!(renew2.reservations.len(), 2);
+        let moved = renew2
+            .reservations
+            .iter()
+            .find(|r| r.path_pattern == "docs/**")
+            .expect("short lease reported");
+        let new_exp = moved.expires_ts_us.expect("moved expiry");
+        assert!(new_exp > old_short, "near-lapse expiry moved forward");
+        assert!(
+            (new_exp - old_short) / 1_000_000 >= 3600,
+            "absolute extension: new = old + extend (got +{}s)",
+            (new_exp - old_short) / 1_000_000
         );
 
         let _ = std::fs::remove_file(&db_path);

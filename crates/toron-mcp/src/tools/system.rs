@@ -214,7 +214,39 @@ impl ToolServer {
         Parameters(_args): Parameters<CleanupPaneIdentitiesArgs>,
     ) -> ToolOutput {
         match HerdrBackend::connect(None) {
-            Ok(backend) => ToolOutput::result(self.mailbox.cleanup_pane_identities(&backend)),
+            Ok(backend) => {
+                // bd-gc7k: prune dead pins AND release their exclusive
+                // leases in the same call — a dead pin must not own the
+                // ledger. A reap failure never hides the pruned names.
+                let pruned = self.mailbox.cleanup_pane_identities(&backend);
+                match pruned {
+                    Ok(names) => {
+                        let reaped = self
+                            .mailbox
+                            .reap_ghost_leases(&names, Some("pane-pruned"))
+                            .await;
+                        match reaped {
+                            Ok(releases) if !releases.is_empty() => ToolOutput::ok(json!({
+                                "removed": names,
+                                "released": releases
+                                    .into_iter()
+                                    .map(|r| json!({
+                                        "project_slug": r.project_slug,
+                                        "path_pattern": r.path_pattern,
+                                        "holder": r.holder,
+                                    }))
+                                    .collect::<Vec<_>>(),
+                            })),
+                            Ok(_) => ToolOutput::ok(json!({ "removed": names })),
+                            Err(e) => ToolOutput::ok(json!({
+                                "removed": names,
+                                "note": format!("ghost-lease reaper failed: {e:#}"),
+                            })),
+                        }
+                    }
+                    Err(e) => ToolOutput::result::<Vec<String>>(Err(e)),
+                }
+            }
             Err(e) => ToolOutput::ok(json!({
                 "note": format!("pane cleanup requires a herdr backend; not wired: {e}"),
             })),
