@@ -106,6 +106,8 @@ Wire compatibility contract:
 - `harness` values validate against the existing harness vocabulary (pi | omp | opencode | grok — the bd-apd2 override set). Unknown harness = lint error at lint time, warning at runtime (the run proceeds with the profile default).
 - `extra` capture is the forward-compat valve: new spec fields graduate from `extra` to typed fields only via a schema-rs change, never by silently reinterpreting.
 
+**Shipped-shape note (2026-08-22):** implemented as `DispatchSpec` typed DIRECTLY on `Action::DispatchJob` (toron `08ba58a`, bd-dispatch-spec-untyped-0iud) — stronger than the `Value`-on-wire + `from_value` staging above: every existing YAML still parses (unknown keys round-trip through `extra`), known fields are named (`profile`/`task`/`stage`/`harness`/`model`/`effort`/`phase`/`plan`/`project`), non-string known scalars fail at parse, and `phase` is closed at deserialize (unknown value = parse error at lint time). The type is named `DispatchSpec`, not `JobSpec`; `prompt` rides `extra` as a PHASE_CARRIER_KEY until its graduation wave.
+
 ### 3.2 Layer 2 — the phase registry (flywheel; one match arm per harness)
 
 New pure function beside `model_args` in `flywheel/src/headless.rs`, mirrored into the pane path through `profile_launch_args`:
@@ -145,6 +147,8 @@ New built-in workflows in `flywheel/src/builtin_workflows.rs` (catalog-resolvabl
 | `review` | `review` | findings posted to thread; verdict recorded (AGREE / AGREE-WITH-CHANGES / REJECT) — harness default opencode per bd-42fs reviewer arm |
 | `ship` | chain | `call_workflow` chain resolve→plan→implement→review with the §4.5 gates between links; `crew: auto` |
 
+**Residual note (2026-08-22):** this layer is NOT shipped — no phase-native built-in exists (`builtin_workflows.rs` carries zero phase references) and the §4.5 completion contracts have no implementation. Tracked as **bd-cvv9**; until it lands, phases are mechanics without built-in consumers (the bd-4spn shape, narrowed to the built-in tier: compose parts and the W2 registry DO consume `phase`). The §3.5 runtime warn-first plan-artifact gate rides the same bead.
+
 Stage library entries (`stages.rs` `StageLibrary`) gain an optional `phase` field; `crew.rs parse_compose_part` extends from `role:stage` to also resolve `phase:stage`. Target YAML (the UX this whole ADR serves):
 
 ```yaml
@@ -171,7 +175,7 @@ Closes `bd-compose-not-durable-oxjy` on the same rail as L1/L3:
 1. **Compose → engine.** `WorkflowCmd::Compose --run` stops dispatching via pane prompt. It builds the `Workflow` struct (unchanged, `compose_workflow`), then calls `WorkflowEngine::invoke` (engine/mod.rs:425) — the SAME durable function the trigger path uses. Pane agents still execute the individual `dispatch_job` steps (the engine's spawn sink lands on herdr panes exactly as today); what changes is **ownership of the run**: crash → resume from the last Resonate checkpoint; `on_failure: bead` drains the PolicySink into `br create` for composed runs too. **Shipped 2026-08-21 (`bd-compose-not-durable-oxjy`):** flywheel `ac1c79d`+`a1498f1` route the Compose arm through `engine.invoke` with pane agents as executor surface only and drain the PolicySink (`on_failure: bead` wired); gate green — `cargo test -p toron-workflow` 173 passed incl. `invoke_redelivery_replays_recorded_run`.
 2. **Steer → engine.** Wave 4: `cmd_steer` builds its chain via `compose_workflow` + `invoke`. The hardcoded stage sequence in main.rs:17262 shrinks to prompt construction; the chain semantics become a resumable run.
 3. **Cron on-demand live fire (adjacent, rides the rail).** `flywheel cron run <name> --live` reuses the durable spec_runner path with an immediate tick injection (skip the sleep), bounded output. Dry-run stays the default (bd-8wvz semantics preserved). Closes `bd-cron-run-no-live-u9tg`.
-4. **Transition visibility.** During migration the old pane-prompt compose path remains as an explicit fallback behind `--pane-dispatch` (deprecated, run log tags which path executed) so drift between paths is visible in `flywheel runs`, not inferred from behavior. Removed one phase after the crash-resume equivalence gate (§6 W3) is green on live swarms.
+4. **Transition visibility.** During migration the old pane-prompt compose path remains as an explicit fallback behind `--pane-dispatch` (deprecated, run log tags which path executed) so drift between paths is visible in `flywheel runs`, not inferred from behavior. Removed one phase after the crash-resume equivalence gate (§6 W3) is green on live swarms. *(Not shipped, superseded 2026-08-22: the repo's no-compat-shims policy — AGENTS ANTI-PATTERNS "Compat shims" — outranks this fallback; the pane-prompt path was deleted outright in favor of the engine path. See §10.)*
 
 ### 3.5 Layer 5 — gates and measurement (warn-first, enforce-later)
 
@@ -196,8 +200,8 @@ that gap so "the catalog doesn't fit" degrades gracefully instead of dead-ending
 | Tier | Capability | Status |
 | :--- | :--- | :--- |
 | T0 | Recombine: parts from catalog workflows + stage library | **shipped** (bd-8xca) |
-| T1 | Full-grammar emission: parts cover the entire `Action` vocabulary — `each:`, `when:`, `retry(n)`, `parallel:` | W3 |
-| T2 | Author from scratch: `workflow compose --from-yaml -` (full `Workflow` from stdin/mail); durable via W3's `engine.invoke` routing | W3 |
+| T1 | Full-grammar emission: parts cover the entire `Action` vocabulary — `each:`, `when:`, `retry(n)`, `parallel:` | **shipped** (flywheel `4ef0dc1`, bd-adr22-t1-grammar-residual-zjk0) |
+| T2 | Author from scratch: `workflow compose --from-yaml -` (full `Workflow` from stdin/mail); durable via W3's `engine.invoke` routing | **shipped** (same; `--dry-run` first-class + budget caps fail closed; wall-clock half added 2026-08-22 — `FLYWHEEL_COMPOSE_MAX_SECONDS`, default 3600s, errors the attempt while the durable run stays resumable) |
 | T3 | Learn + persist: `--keep <name>` graduates a green composed run into the project catalog with provenance (`origin: composed`, `from: <parts>`, `first-run`, `author`) — the hillclimb keep-or-discard pattern lifted to workflow shapes; detect-then-find-existing starts finding previously improvised workflows | W6 |
 | T4 | Delegated composition: any agent mails a compose-request job; the loop composes when `decide` reports no catalog coverage (archetype classification: scout-fanout / verify-fence / debate / hillclimb / review) | W7 |
 
@@ -378,20 +382,20 @@ Rules:
 ## 8. Verification (acceptance for this ADR)
 
 - [x] W1: `cargo test -p toron-workflow` green incl. 4 new JobSpec tests; flywheel suite green against new schema (byte-compat proof). **Verified 2026-08-22 post-wave review:** toron 841 / flywheel 977 passed, 0 failed — after the review repaired a red lib-test target (missing `test_spec`) the wave had closed against.
-- [ ] W1: lint fixture with unknown spec field produces R-P1 warning naming the field.
-- [x] W2: `phase_launch_args` table tests + degraded contract green; `flywheel deps` prints per-harness phase-registry status. **Shipped (a1498f1);** caveat filed as bd-adr22-implement-not-degraded-puhs (implement wrongly degrades).
-- [ ] W2 live: `phase: plan` dispatch observable in the target pane with registry args (herdr `agent read` capture).
-- [ ] W3: composed `--run` produces an engine run id; kill -9 mid-run → restart → completes (crash-resume equivalence).
-- [ ] W3: forced-failure composed run with `on_failure: bead` creates the bead.
-- [ ] W3: `ship` dry-run renders the 5-link chain; `cron run --live` executes for real once.
-- [ ] W3 ladder: Tier-1 grammar parse table green; `--from-yaml` round-trip green; dry-run renders fanouts + phase tags; budget caps fail closed.
+- [x] W1: lint fixture with unknown spec field produces R-P1 warning naming the field. **Shipped (toron `29a5f5b`, bd-adr22-phase-enum-lint-ahfh):** `rp1_unknown_spec_extra_field_warns_naming_it` + 11 more R-P1..P4 tests; crate 188 passed.
+- [x] W2: `phase_launch_args` table tests + degraded contract green; `flywheel deps` prints per-harness phase-registry status. **Shipped (a1498f1);** caveat filed as bd-adr22-implement-not-degraded-puhs (implement wrongly degrades) — fixed `c218d8e` same wave-2 window.
+- [x] W2 live: `phase: plan` dispatch observable in the target pane with registry args. **Shipped (bd-adr22-w2-phase-registry-igya):** live ps-captured argv `omp -p --mode=json --model=… --thinking=high --plan-yolo <prompt>` (flag precedes prompt, effort orthogonal); durable run log `hl-2026-08-21T10:51:43Z-659825000` carries `phase=plan`; `flywheel deps` registry line green. (ps capture instead of herdr `agent read` — same evidence class.)
+- [x] W3: composed `--run` produces an engine run id; crash-resume equivalence. **Shipped:** engine-run id + redelivery-replay pinned (`invoke_redelivery_replays_recorded_run` — steps execute exactly once across redelivery); persistent-store seam shipped (flywheel `3d03aca`, bd-adr22-local-resonate-tx8q: RESONATE_URL pin > host-local `127.0.0.1:8001` > in-memory). **Caveat:** the literal cross-process kill -9 → restart gate has no test witness yet (needs the host-local Resonate serve up during the run); owed alongside bd-cvv9's live chain run.
+- [ ] W3: forced-failure composed run with `on_failure: bead` creates the bead. **Wired, untested end-to-end:** the compose arm drains the PolicySink and executes `cron::spawn_failure_bead` (mirrors the cron loop arm); `failure_bead_fields` unit-tested; no forced-failure composed-run test exists.
+- [ ] W3: `ship` dry-run renders the 5-link chain — **blocked on bd-cvv9** (no `ship` built-in yet); `cron run --live` executes for real once — **shipped** (bd-cron-run-no-live-u9tg live run `cron-…` status=completed via `runs list --json`; now on the shared store seam, 2026-08-22).
+- [x] W3 ladder: Tier-1 grammar parse table green; `--from-yaml` round-trip green; dry-run renders fanouts + phase tags; budget caps fail closed. **Shipped (flywheel `4ef0dc1`):** `t1_parse_grammar_part_forms`, `from_yaml_round_trip_full_workflow`, `dry_run_renders_fanouts_and_phase_tags`, `budget_caps_fail_closed` (dispatch leaves + nesting); wall-clock half added 2026-08-22 (`bounded_invoke_enforces_wall_clock_cap`, `FLYWHEEL_COMPOSE_MAX_SECONDS`).
 - [x] W4: `steer --direct` completes as an engine run with phase-tagged steps in `flywheel runs`. **Shipped 2026-08-21 (`bd-adr22-w4-steer-engine-w69z`):** flywheel `2621876` — steer's Run delegation proven through the same `engine.invoke` door (goal-direct engine-run completion + redelivery replay tests), `RunsCmd::List` surfaces `phase`/`phase_degraded` columns; bin suite 954 passed / 0 failed.
-- [ ] W6: keep-after-green lands in catalog and a later decide find-existing selects it; keep-without-green-run refuses.
-- [ ] W6 stages: project-tier stage resolvable and usable stage-first in a compose; promote-to-repo without evidence refuses.
-- [ ] W7: one agent-composed workflow via mail request, allowlisted, runs through the engine.
-- [ ] All Target files carry `governed-by: ADR-0022`; `bash docs/decisions/_scripts/verify-adr-links.sh` green.
-- [ ] `bash scripts/verify-gates.sh` green (toron) and flywheel clippy/test gates green.
-- [ ] ADR-0005 Spec 2 amended with a pointer to §3.1; README index row added.
+- [ ] W6: keep-after-green lands in catalog and a later decide find-existing selects it; keep-without-green-run refuses. **Mostly shipped (flywheel `50f7938`, bd-adr22-w6-stage-registry-0jgr):** keep-refusal live-probed; project-tier resolution + stage-first compose live-probed through the real binary; the full compose→green→keep→decide-find-existing END-TO-END live window honestly not run (close-reason deviation a). Also owed: RunLogEntry lacks a project field, so the repo-promotion evidence bar enforces the ≥2-distinct-objectives arm only (close-reason deviation b).
+- [ ] W6 stages: project-tier stage resolvable and usable stage-first in a compose — **shipped + live-probed**; promote-to-repo without evidence refuses — **shipped** (`w6_repo_evidence_bar`). Full-box stays open for the end-to-end keep→decide window above.
+- [ ] W7: one agent-composed workflow via mail request, allowlisted, runs through the engine. **Unit-covered, not live:** allowlist deny-gate (`w7_allowlist_deny_never_dispatches`), coverage-miss → approval-candidate (never auto-run); the live mail-request → dispatch window honestly not run (close-reason deviation).
+- [x] All Target files carry `governed-by: ADR-0022`; `bash docs/decisions/_scripts/verify-adr-links.sh` green. **Verified 2026-08-22** (adr-links pass; valid ADRs 0001–0022).
+- [ ] `bash scripts/verify-gates.sh` green (toron) and flywheel clippy/test gates green. **Status 2026-08-22:** flywheel clippy `--all-targets` green + fmt clean (bd-dklb); toron-workflow 188/0 + adr-links green; BOTH suites transiently red at HEAD only via the in-flight bd-slot-visibility-gv17 seam (`ConflictReport.slot_holders`: flywheel bin E0063 + toron `catalog_freshness` catalog regen) — lands with that bead, not ADR-0022.
+- [x] ADR-0005 Spec 2 amended with a pointer to §3.1 (2026-08-22, this pass); README index row added (docs/decisions/README.md).
 
 ---
 
@@ -414,12 +418,37 @@ missing `test_spec` (red lib-test target), µs G7 timeline stamp
 (`since_ts` excluded same-second post-bound mail — real product bug),
 clippy gates both repos, an accidentally-tracked artifact.
 
-**Honest deltas (beads, not silent):** bd-adr22-phase-enum-lint-ahfh
-(String not enum; R-P1..P4 lint never implemented), bd-adr22-local-resonate-tx8q
-(in-memory store — cross-process crash-resume gate unsatisfiable; W3/W4
-shipped-notes overstate), bd-adr22-implement-not-degraded-puhs,
+**Honest deltas (beads, not silent):** at review time —
+bd-adr22-phase-enum-lint-ahfh (lint never implemented),
+bd-adr22-local-resonate-tx8q (in-memory store),
+bd-adr22-implement-not-degraded-puhs (implement wrongly degraded),
 bd-adr22-t1-grammar-residual-zjk0 (§3.6 Tier-1 grammar, --from-yaml,
 --dry-run, budget caps never shipped). W5 correctly still blocked
 (evidence-gated). The ADR is NOT fully implemented by its own §8
 acceptance: live gates (W2-live, W6 live, W7 live) and the lint layer
 remain unproven or absent.
+
+**Status after the closes (2026-08-22 captain pass):** all four delta beads
+are closed AND code-verified — closed Phase vocabulary + R-P1..P4 lint
+(toron `29a5f5b`; phase stays `Option<String>` with a closed-vocabulary
+deserializer because flywheel compose assigns it out-of-lease — closure at
+parse, documented), persistent Resonate store seam (flywheel `3d03aca`),
+Tier-1/T2 ladder + `--from-yaml` + `--dry-run` + budget caps (`4ef0dc1`),
+implement is baseline (`c218d8e`). The two bare-`done` closes (puhs, tx8q)
+carry retro verification comments now.
+
+**Still open (2026-08-22):**
+
+1. **bd-cvv9** — §3.3 phase-native built-ins + §4.5 completion contracts +
+   §3.5 runtime warn-first plan-artifact gate: never shipped, never
+   descoped until now. The un-closed half of the ADR; also owes the
+   cross-process kill -9 gate witness and the `ship` dry-run box.
+2. **W5 flip** (bd-adr22-w5-enforcement-flip-b7cu) correctly blocked on
+   live-swarm ship-chain evidence (which needs bd-cvv9).
+3. Live gates not yet run: W6 end-to-end keep→decide find-existing; W7
+   mail-request → allowlisted dispatch; cross-process crash-resume.
+4. `--pane-dispatch` fallback (§3.4.4) intentionally never shipped — the
+   no-compat-shims policy supersedes it; the engine path is the only path.
+5. Wall-clock budget half shipped 2026-08-22 (bd-dklb,
+   `FLYWHEEL_COMPOSE_MAX_SECONDS`); `cron run --live` moved onto the shared
+   store seam in the same bead.
