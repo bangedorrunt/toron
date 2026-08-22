@@ -387,7 +387,7 @@ Rules:
 - [x] W2 live: `phase: plan` dispatch observable in the target pane with registry args. **Shipped (bd-adr22-w2-phase-registry-igya):** live ps-captured argv `omp -p --mode=json --model=… --thinking=high --plan-yolo <prompt>` (flag precedes prompt, effort orthogonal); durable run log `hl-2026-08-21T10:51:43Z-659825000` carries `phase=plan`; `flywheel deps` registry line green. (ps capture instead of herdr `agent read` — same evidence class.)
 - [x] W3: composed `--run` produces an engine run id; crash-resume equivalence. **Shipped:** engine-run id + redelivery-replay pinned (`invoke_redelivery_replays_recorded_run` — steps execute exactly once across redelivery); persistent-store seam shipped (flywheel `3d03aca`, bd-adr22-local-resonate-tx8q: RESONATE_URL pin > host-local `127.0.0.1:8001` > in-memory). **Caveat:** the literal cross-process kill -9 → restart gate has no test witness yet (needs the host-local Resonate serve up during the run); owed alongside bd-cvv9's live chain run.
 - [ ] W3: forced-failure composed run with `on_failure: bead` creates the bead. **Wired, untested end-to-end:** the compose arm drains the PolicySink and executes `cron::spawn_failure_bead` (mirrors the cron loop arm); `failure_bead_fields` unit-tested; no forced-failure composed-run test exists.
-- [ ] W3: `ship` dry-run renders the 5-link chain — **blocked on bd-cvv9** (no `ship` built-in yet); `cron run --live` executes for real once — **shipped** (bd-cron-run-no-live-u9tg live run `cron-…` status=completed via `runs list --json`; now on the shared store seam, 2026-08-22).
+- [x] W3: `ship` dry-run renders the 5-link chain — **shipped (bd-cvv9, flywheel `c473336`/`029b492`)**: phase-native built-ins (`phase-resolve`…`phase-verify`, `phase-*` namespace vs the pre-existing `plan` builtin) + §4.5 contracts as pure fns (pass+fail witnesses) + gated chain runner (warn-first; `FLYWHEEL_SHIP_GATE_MODE=block` is the W5 flip) + dry-run link expansion. Live structural probe rendered resolve→plan→implement→review(fanout=2)→verify with phase tags. Owed alongside the live window: one real full-chain run in `flywheel runs` (W5 precondition) and the cross-process kill -9 witness. `cron run --live` executes for real once — **shipped** (bd-cron-run-no-live-u9tg live run `cron-…` status=completed via `runs list --json`; now on the shared store seam, 2026-08-22).
 - [x] W3 ladder: Tier-1 grammar parse table green; `--from-yaml` round-trip green; dry-run renders fanouts + phase tags; budget caps fail closed. **Shipped (flywheel `4ef0dc1`):** `t1_parse_grammar_part_forms`, `from_yaml_round_trip_full_workflow`, `dry_run_renders_fanouts_and_phase_tags`, `budget_caps_fail_closed` (dispatch leaves + nesting); wall-clock half added 2026-08-22 (`bounded_invoke_enforces_wall_clock_cap`, `FLYWHEEL_COMPOSE_MAX_SECONDS`).
 - [x] W4: `steer --direct` completes as an engine run with phase-tagged steps in `flywheel runs`. **Shipped 2026-08-21 (`bd-adr22-w4-steer-engine-w69z`):** flywheel `2621876` — steer's Run delegation proven through the same `engine.invoke` door (goal-direct engine-run completion + redelivery replay tests), `RunsCmd::List` surfaces `phase`/`phase_degraded` columns; bin suite 954 passed / 0 failed.
 - [ ] W6: keep-after-green lands in catalog and a later decide find-existing selects it; keep-without-green-run refuses. **Mostly shipped (flywheel `50f7938`, bd-adr22-w6-stage-registry-0jgr):** keep-refusal live-probed; project-tier resolution + stage-first compose live-probed through the real binary; the full compose→green→keep→decide-find-existing END-TO-END live window honestly not run (close-reason deviation a). Also owed: RunLogEntry lacks a project field, so the repo-promotion evidence bar enforces the ≥2-distinct-objectives arm only (close-reason deviation b).
@@ -439,10 +439,11 @@ carry retro verification comments now.
 
 **Still open (2026-08-22):**
 
-1. **bd-cvv9** — §3.3 phase-native built-ins + §4.5 completion contracts +
-   §3.5 runtime warn-first plan-artifact gate: never shipped, never
-   descoped until now. The un-closed half of the ADR; also owes the
-   cross-process kill -9 gate witness and the `ship` dry-run box.
+1. **bd-cvv9 — CLOSED 2026-08-22** (flywheel `c473336`/`029b492`): §3.3
+   built-ins + §4.5 contracts + §3.5 warn-first gate shipped; toron-workflow
+   188/0, flywheel bin 1038/0 (`--test-threads=1`), clippy/fmt clean, live
+   dry-run probe of the 5-link graph captured. The live full-chain run and
+   the cross-process kill -9 witness stay open as the W5-evidence window.
 2. **W5 flip** (bd-adr22-w5-enforcement-flip-b7cu) correctly blocked on
    live-swarm ship-chain evidence (which needs bd-cvv9).
 3. Live gates not yet run: W6 end-to-end keep→decide find-existing; W7
