@@ -171,6 +171,7 @@ pub async fn run_mail(mailbox: &Mailbox, cmd: &MailCommand) -> anyhow::Result<()
                 )
                 .await?,
         ),
+        MailCommand::Whois(args) => emit(mailbox.whois(&args.project, &args.name).await?),
     }
 }
 
@@ -295,6 +296,17 @@ pub async fn run_mail_daemon(dc: &DaemonClient, cmd: &MailCommand) -> anyhow::Re
                     "include_examples": args.examples,
                     "llm_mode": args.llm_mode,
                     "llm_model": args.llm_model,
+                }),
+            )
+            .await
+        }
+        MailCommand::Whois(args) => {
+            daemon_tool(
+                dc,
+                "whois",
+                json!({
+                    "project_key": args.project,
+                    "agent_name": args.name,
                 }),
             )
             .await
@@ -635,6 +647,54 @@ pub async fn run_contact_daemon(dc: &DaemonClient, cmd: &ContactCommand) -> anyh
             )
             .await
         }
+        ContactCommand::Captain(args) => {
+            // bd-captain-alias-0g8a: validate the pin against the WRITER
+            // (the daemon's whois tool), then write the plain-state UPSERT
+            // into the durable root's index DB directly — no second
+            // in-process mailbox (guard precedent). Reads of `captain` then
+            // resolve through the ONE resolver everywhere.
+            let db_path = toron_core::config::ToronPaths::resolve().index_path();
+            match &args.pin {
+                Some(pin) => {
+                    let out = dc
+                        .call_tool(
+                            "whois",
+                            json!({ "project_key": args.project, "agent_name": pin }),
+                        )
+                        .await?;
+                    let canonical = out
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "captain must be a REGISTERED adjective+noun pin — whois did \
+                                 not resolve {pin:?}"
+                            )
+                        })?
+                        .to_string();
+                    toron_core::mailbox::identity::set_captain_alias_in_db(
+                        &db_path.display().to_string(),
+                        &args.project,
+                        &canonical,
+                    )
+                    .await?;
+                    print_json(&json!({
+                        "project": args.project,
+                        "captain": canonical,
+                        "resolved_via": "captain",
+                        "store": db_path.display().to_string(),
+                    }))
+                }
+                None => {
+                    let current = toron_core::mailbox::identity::captain_alias_in_db(
+                        &db_path.display().to_string(),
+                        &args.project,
+                    )
+                    .await?;
+                    print_json(&json!({ "project": args.project, "captain": current }))
+                }
+            }
+        }
     }
 }
 
@@ -702,6 +762,23 @@ pub async fn run_contact(mailbox: &Mailbox, cmd: &ContactCommand) -> anyhow::Res
                     .await?,
             )
         }
+        ContactCommand::Captain(args) => match &args.pin {
+            Some(pin) => {
+                let captain = mailbox.set_project_captain(&args.project, pin).await?;
+                // Prove the fold end-to-end: the alias itself must resolve.
+                let w = mailbox.whois(&args.project, "captain").await?;
+                print_json(&json!({
+                    "project": args.project,
+                    "captain": captain,
+                    "npub": w.npub,
+                    "resolved_via": "captain",
+                }))
+            }
+            None => {
+                let current = mailbox.agent_name_alias(&args.project, "captain").await;
+                print_json(&json!({ "project": args.project, "captain": current }))
+            }
+        },
     }
 }
 
@@ -949,26 +1026,22 @@ pub async fn run_guard_daemon(dc: &DaemonClient, cmd: &GuardCommand) -> anyhow::
             if let Some(repo_name) = std::path::Path::new(&args.repo)
                 .file_name()
                 .and_then(|n| n.to_str())
+                && let Ok(mb) = toron_mcp::demo_mailbox().await
+                && let Ok(foreign) = mb
+                    .active_reservations_escaping_into(&args.project, repo_name)
+                    .await
             {
-                if let Ok(mb) = toron_mcp::demo_mailbox().await {
-                    match mb
-                        .active_reservations_escaping_into(&args.project, repo_name)
-                        .await
-                    {
-                        Ok(foreign) => merge_cross_project_leases(
-                            &mut reservations,
-                            repo_name,
-                            foreign
-                                .into_iter()
-                                .map(|r| toron_core::mailbox::guard::Reservation {
-                                    holder: r.agent_name,
-                                    pattern: r.path_pattern,
-                                    exclusive: r.exclusive,
-                                }),
-                        ),
-                        Err(_) => {}
-                    }
-                }
+                merge_cross_project_leases(
+                    &mut reservations,
+                    repo_name,
+                    foreign
+                        .into_iter()
+                        .map(|r| toron_core::mailbox::guard::Reservation {
+                            holder: r.agent_name,
+                            pattern: r.path_pattern,
+                            exclusive: r.exclusive,
+                        }),
+                );
             }
             finish_guard_check(args, agent.as_deref(), &staged, &reservations)
         }

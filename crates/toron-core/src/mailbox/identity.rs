@@ -44,6 +44,51 @@ pub struct RegisteredAgent {
     pub created: bool,
 }
 
+/// What absorbing one folded slug changed (bd-legacy-slug-inbox-onoj).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+pub struct SlugAbsorption {
+    /// The standalone `agents` row for the slug was removed.
+    pub removed_registration: bool,
+    /// The canonical target has a live registration (absorb precondition).
+    pub canonical_registered: bool,
+}
+
+/// A leftover dual registration for `toron doctor`: an `agents` row whose
+/// name is a recorded fold pointing elsewhere — a second identity the fold
+/// never absorbed. Its npub is a dead inbox: no key file, wraps sealed to it
+/// are unreachable by any name-routed surface, and cross-key delete is
+/// forbidden — so doctor NAMES the row for operator cleanup.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct FoldedSlugLeftover {
+    pub project_slug: String,
+    pub slug: String,
+    pub pubkey: String,
+    pub canonical: String,
+}
+
+/// Scan one index pool for leftover dual registrations. Empty after
+/// absorption runs; doctor surfaces whatever remains.
+pub async fn folded_slug_leftovers(
+    pool: &sqlx::SqlitePool,
+) -> anyhow::Result<Vec<FoldedSlugLeftover>> {
+    let rows: Vec<(String, String, String, String)> = sqlx::query_as(
+        "SELECT a.project_slug, a.name, a.pubkey, al.canonical          FROM agents a          JOIN agent_name_aliases al ON al.project_slug = a.project_slug AND al.alias = a.name          ORDER BY a.project_slug, a.name",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(
+            |(project_slug, slug, pubkey, canonical)| FoldedSlugLeftover {
+                project_slug,
+                slug,
+                pubkey,
+                canonical,
+            },
+        )
+        .collect())
+}
+
 /// `whois` result: npub + profile fields + last-active provenance.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct WhoIs {
@@ -166,7 +211,26 @@ impl Mailbox {
     /// append-only — the row is inserted once and never deleted, so the
     /// relation is always reversible. Best-effort: no index pool → the fold
     /// cannot be persisted and routing degrades to strict swarm enforcement.
+    ///
+    /// bd-legacy-slug-inbox-onoj: recording the fold also ABSORBS any
+    /// standalone registration of the alias (see [`Self::absorb_folded_slug`])
+    /// — a fold is the only routing, never a second inbox. Use
+    /// [`Self::fold_agent_name_alias_no_absorb`] to record the mapping
+    /// without touching an existing row.
     pub async fn fold_agent_name_alias(&self, project_slug: &str, alias: &str, canonical: &str) {
+        self.fold_agent_name_alias_no_absorb(project_slug, alias, canonical)
+            .await;
+        self.absorb_folded_slug(project_slug, alias).await;
+    }
+
+    /// Record the alias → canonical mapping ONLY (no side effects on any
+    /// existing agents row).
+    pub async fn fold_agent_name_alias_no_absorb(
+        &self,
+        project_slug: &str,
+        alias: &str,
+        canonical: &str,
+    ) {
         let Some(pool) = self.index_pool.as_ref() else {
             return;
         };
@@ -181,6 +245,90 @@ impl Mailbox {
         .bind(now_us)
         .execute(pool)
         .await;
+    }
+
+    /// bd-legacy-slug-inbox-onoj: a slug that was registered STANDALONE
+    /// before its fold existed keeps a second identity (own npub) beside the
+    /// pin. Absorb = remove the standalone `agents` row:
+    ///   - routing already folds alias → canonical at every resolver touch
+    ///     (sends to the slug seal to the PIN's key),
+    ///   - the orphan's wraps are unreachable by construction (no inbox
+    ///     surface keys off a roster row, and the projection carries no
+    ///     recipient column — there is nothing to mark read), and cross-key
+    ///     NIP-09 delete is forbidden. Removing the row removes the SECOND
+    ///     INBOX itself.
+    ///
+    /// Idempotent: no fold / no row / target unregistered → zero report.
+    /// Refuses to destroy a row when the canonical target has NO live
+    /// registration (absorbing into a void would strand the identity worse
+    /// than before — doctor names those).
+    pub async fn absorb_folded_slug(&self, project_slug: &str, alias: &str) -> SlugAbsorption {
+        let Some(pool) = self.index_pool.as_ref() else {
+            return SlugAbsorption::default();
+        };
+        let Some(canonical_pubkey) = sqlx::query_scalar::<_, String>(
+            "SELECT pubkey FROM agents WHERE project_slug = ?1 AND name = \
+             (SELECT canonical FROM agent_name_aliases WHERE project_slug = ?1 AND alias = ?2)",
+        )
+        .bind(project_slug)
+        .bind(alias)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten() else {
+            // No fold recorded or no canonical registration — absorb nothing.
+            return SlugAbsorption::default();
+        };
+        let removed = sqlx::query(
+            "DELETE FROM agents WHERE project_slug = ?1 AND name = ?2 AND pubkey != ?3",
+        )
+        .bind(project_slug)
+        .bind(alias)
+        .bind(&canonical_pubkey)
+        .execute(pool)
+        .await
+        .map(|r| r.rows_affected() > 0)
+        .unwrap_or(false);
+        SlugAbsorption {
+            removed_registration: removed,
+            canonical_registered: true,
+        }
+    }
+
+    /// bd-captain-alias-0g8a: point the project's routable `captain` alias
+    /// at a REGISTERED adjective+noun pin (the orchestrator's identity).
+    /// Durable (agent_name_aliases), re-pointable (UPSERT — the CURRENT
+    /// orchestrator wins over first-fold), and never a second identity
+    /// (ADR-0018 D1a: the alias resolves through the ONE resolver; a host
+    /// username is not a mailbox identity and an unregistered pin does not
+    /// route). Returns the canonical pin name stored.
+    pub async fn set_project_captain(
+        &self,
+        project_slug: &str,
+        pin: &str,
+    ) -> anyhow::Result<String> {
+        let canonical = self.canonical_project(project_slug).await;
+        if super::naming::is_username_class(pin) {
+            anyhow::bail!(
+                "{pin} looks like a host OS username ($USER), not a mailbox \
+                 identity — captain must be a REGISTERED adjective+noun pin in \
+                 project {canonical}; do not register your username — use your \
+                 pin or list_agents to find identities (ADR-0018 D1a/D3)"
+            );
+        }
+        // Fail fast: the fold must land on a routable identity, else every
+        // later "mail the captain" bounces with an unhelpful name error.
+        let who = self.whois(&canonical, pin).await.map_err(|e| {
+            anyhow::anyhow!(
+                "captain must be a REGISTERED adjective+noun pin in project \
+                 {canonical} (whois failed: {e})"
+            )
+        })?;
+        let Some(pool) = self.index_pool.as_ref() else {
+            anyhow::bail!("no index pool attached — cannot persist the captain alias");
+        };
+        upsert_captain_alias(pool, &canonical, &who.name).await?;
+        Ok(who.name)
     }
 
     /// ADR-0018 D4: the canonical name a legacy alias folds to (if any).
@@ -698,6 +846,58 @@ impl Mailbox {
     }
 }
 
+/// bd-captain-alias-0g8a: shared UPSERT for the `captain` fold. Plain state
+/// in `agent_name_aliases` — no event projection, so the daemon-mode CLI may
+/// write it against the durable root directly (guard precedent,
+/// bd-pin-public-plane-s-easy.14) without opening a second mailbox.
+async fn upsert_captain_alias(
+    pool: &sqlx::SqlitePool,
+    project_slug: &str,
+    canonical_pin: &str,
+) -> anyhow::Result<()> {
+    let now_us = crate::index::writer::Clock::now_us(&crate::index::writer::SystemClock);
+    sqlx::query(
+        "INSERT INTO agent_name_aliases (project_slug, alias, canonical, created_ts_us) \
+         VALUES (?1, 'captain', ?2, ?3) \
+         ON CONFLICT (project_slug, alias) DO UPDATE \
+         SET canonical = excluded.canonical, created_ts_us = excluded.created_ts_us",
+    )
+    .bind(project_slug)
+    .bind(canonical_pin)
+    .bind(now_us)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// bd-captain-alias-0g8a: set the captain fold directly in an index DB —
+/// the daemon-mode CLI surface. Callers validate the pin first (whois).
+pub async fn set_captain_alias_in_db(
+    db_path: &str,
+    project_slug: &str,
+    canonical_pin: &str,
+) -> anyhow::Result<()> {
+    let pool = crate::index::schema::connect(db_path).await?;
+    crate::index::schema::migrate(&pool).await?;
+    upsert_captain_alias(&pool, project_slug, canonical_pin).await
+}
+
+/// bd-captain-alias-0g8a: read the current captain pin from an index DB.
+pub async fn captain_alias_in_db(
+    db_path: &str,
+    project_slug: &str,
+) -> anyhow::Result<Option<String>> {
+    let pool = crate::index::schema::connect(db_path).await?;
+    crate::index::schema::migrate(&pool).await?;
+    let row: Option<String> = sqlx::query_scalar(
+        "SELECT canonical FROM agent_name_aliases WHERE project_slug = ?1 AND alias = 'captain'",
+    )
+    .bind(project_slug)
+    .fetch_optional(&pool)
+    .await?;
+    Ok(row)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -766,6 +966,201 @@ mod tests {
             .with_agent_passphrase(PASSPHRASE)
             .with_index_pool(pool.clone());
         (mailbox, pool, db_path, data_dir)
+    }
+
+    // --- bd-legacy-slug-inbox-onoj: folded slugs must not keep a second inbox ---
+
+    /// The defect scenario: a slug registered STANDALONE pre-fold keeps its
+    /// own agents row beside the pin; mail sealed to the orphan npub is
+    /// unreadable forever and lingers as unread. Recording the fold must
+    /// ABSORB the row (idempotently): orphan mail marked read, standalone
+    /// registration removed, alias routing still resolves to the pin.
+    #[tokio::test]
+    async fn fold_absorbs_standalone_slug_row_and_orphan_mail() {
+        let (mailbox, pool, _db, _data) = test_mailbox_with_pool("onoj-absorb").await;
+        let project = "p-absorb";
+        mailbox.ensure_project(project).await.expect("ensure");
+        let legacy = mailbox
+            .register_agent(project, &profile("flywheel-p-absorb-oc9"))
+            .await
+            .expect("legacy slug registers (open mode)");
+        // Canonicalization: the registry stores the EXPANDED slug — every
+        // raw-SQL assertion below must bind THAT spelling, not my literal.
+        let project = legacy.project_slug.clone();
+        let pin = mailbox
+            .register_agent(&project, &profile("TanFern"))
+            .await
+            .expect("pin");
+        assert_ne!(legacy.npub, pin.npub);
+        mailbox
+            .register_agent(&project, &profile("PinkGorge"))
+            .await
+            .expect("sender");
+        // The production scenario is a SWARM project (ADR-0018) — only there
+        // does the fold precede every other resolution path.
+        mailbox.set_identity_mode(&project, "swarm").await;
+        for subject in ["[assign] high work", "fyi"] {
+            mailbox
+                .send_message(&crate::mailbox::messaging::SendMessage {
+                    project_slug: project.clone(),
+                    sender_name: "PinkGorge".into(),
+                    to: vec!["flywheel-p-absorb-oc9".into()],
+                    subject: subject.into(),
+                    body_md: "sealed to the orphan npub".into(),
+                    cc: vec![],
+                    bcc: vec![],
+                    importance: Some("high".into()),
+                    ack_required: false,
+                    thread_id: None,
+                    sender_token: None,
+                    overseer: false,
+                    extra_tags: vec![],
+                })
+                .await
+                .expect("send to slug");
+        }
+
+        // Pre-fold: the orphan inbox is REAL and unread — project it by
+        // fetching as the slug (its key still exists at this point). The
+        // `messages` projection is written at unwrap time, so this fetch is
+        // also what makes the SQL count below meaningful.
+        let pre = mailbox
+            .fetch_inbox(&crate::mailbox::messaging::FetchInbox {
+                project_slug: project.clone(),
+                agent_name: "flywheel-p-absorb-oc9".into(),
+                unread_only: false,
+                limit: None,
+                include_bodies: false,
+                urgent_only: false,
+                since_ts: None,
+                thread_id: None,
+            })
+            .await
+            .expect("pre-fold fetch as orphan");
+        assert_eq!(pre.len(), 2, "orphan holds both messages");
+        assert!(
+            pre.iter().all(|m| m.read_ts_us.is_none()),
+            "all orphan mail unread pre-fold"
+        );
+
+        mailbox
+            .fold_agent_name_alias(&project, "flywheel-p-absorb-oc9", "TanFern")
+            .await;
+
+        // Roster: the standalone row is gone.
+        let rows: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM agents WHERE project_slug = ?1 AND name = 'flywheel-p-absorb-oc9'",
+        )
+        .bind(&project)
+        .fetch_one(&pool)
+        .await
+        .expect("agent row count");
+        assert_eq!(rows, 0, "standalone slug registration absorbed");
+        // The orphan npub is no longer an inbox: routing folds to the pin,
+        // and no surface keys off the dead pubkey (projection carries no
+        // recipient column; cross-key delete is forbidden — nothing to mark).
+        // Routing: the fold still resolves — to the PIN's key.
+        let w = mailbox
+            .whois(&project, "flywheel-p-absorb-oc9")
+            .await
+            .expect("folded slug routable");
+        assert_eq!(w.npub, pin.npub, "alias resolves to the pin identity");
+
+        // Idempotent: re-folding changes nothing and never errors.
+        mailbox
+            .fold_agent_name_alias(&project, "flywheel-p-absorb-oc9", "TanFern")
+            .await;
+        let rows_again: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM agents WHERE project_slug = ?1 AND name = 'flywheel-p-absorb-oc9'",
+        )
+        .bind(&project)
+        .fetch_one(&pool)
+        .await
+        .expect("row count stable");
+        assert_eq!(rows_again, 0);
+    }
+
+    /// A fold whose canonical target is NOT registered absorbs NOTHING —
+    /// destroying an identity with no destination would strand its mail
+    /// worse than before. The row stays; doctor names it.
+    #[tokio::test]
+    async fn fold_absorb_spares_row_when_canonical_unregistered() {
+        let (mailbox, pool, _db, _data) = test_mailbox_with_pool("onoj-no-canonical").await;
+        let project = "p-nocanon";
+        mailbox.ensure_project(project).await.expect("ensure");
+        mailbox
+            .register_agent(project, &profile("flywheel-p-oc7"))
+            .await
+            .expect("legacy slug");
+        mailbox
+            .fold_agent_name_alias(project, "flywheel-p-oc7", "NoSuchPin")
+            .await;
+        let rows: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM agents WHERE project_slug = ?1 AND name = 'flywheel-p-oc7'",
+        )
+        .bind(project)
+        .fetch_one(&pool)
+        .await
+        .expect("row count");
+        assert_eq!(rows, 1, "no canonical registration → absorb refuses");
+    }
+
+    /// Doctor's data source: leftover dual registrations (agents row whose
+    /// name is a recorded fold) are listable with their unread counts.
+    #[tokio::test]
+    async fn folded_slug_leftovers_lists_remaining_dual_registrations() {
+        let (mailbox, pool, _db, _data) = test_mailbox_with_pool("onoj-doctor").await;
+        let project = "p-leftover";
+        mailbox.ensure_project(project).await.expect("ensure");
+        let legacy = mailbox
+            .register_agent(project, &profile("flywheel-p-oc5"))
+            .await
+            .expect("legacy slug");
+        // Registry's own slug spelling for the raw assertions below.
+        let project = legacy.project_slug.clone();
+        mailbox
+            .fold_agent_name_alias_no_absorb(&project, "flywheel-p-oc5", "SomePin")
+            .await;
+        // The absorbing fold needs a LIVE canonical target (spare-row rule).
+        mailbox
+            .register_agent(&project, &profile("SomePin"))
+            .await
+            .expect("canonical pin");
+        // Raw unread mail addressed to the slug.
+        let ts = 1_785_726_000_000i64;
+        sqlx::query(
+            "INSERT INTO messages (event_id, project_slug, sender, sender_pubkey, subject, body, \
+             importance, ack_required, to_list, cc_list, created_ts_us, local_seq) \
+             VALUES ('ev1', ?1, 'PiAlpha', 'aaaa', '[assign]', 'body', 'high', 0, \
+             '[\"flywheel-p-oc5\"]', '[]', ?2, 1)",
+        )
+        .bind(&project)
+        .bind(ts)
+        .execute(&pool)
+        .await
+        .expect("insert orphan message");
+
+        let leftovers = crate::mailbox::identity::folded_slug_leftovers(&pool)
+            .await
+            .expect("scan");
+        let hit = leftovers
+            .iter()
+            .find(|l| l.slug == "flywheel-p-oc5" && l.project_slug == project)
+            .expect("leftover listed");
+        assert_eq!(hit.canonical, "SomePin");
+        assert_eq!(hit.pubkey, legacy.npub);
+
+        // Absorbing clears the listing.
+        mailbox
+            .fold_agent_name_alias(&project, "flywheel-p-oc5", "SomePin")
+            .await;
+        let after = crate::mailbox::identity::folded_slug_leftovers(&pool)
+            .await
+            .expect("scan");
+        assert!(
+            after.iter().all(|l| l.slug != "flywheel-p-oc5"),
+            "absorbed slug no longer listed: {after:?}"
+        );
     }
 
     // --- ADR-0018: swarm-mode whois + registration hardening ---
@@ -1336,6 +1731,118 @@ mod tests {
                 .await
                 .expect("resolve pin"),
             "BlueRidge"
+        );
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    // --- bd-captain-alias-0g8a: `captain` folds onto the orchestrator pin ---
+
+    #[tokio::test]
+    async fn captain_alias_set_resolves_and_routes() {
+        let (mailbox, _pool, db_path, data_dir) = test_mailbox_with_pool("captain-set").await;
+        mailbox.ensure_project("toron").await.expect("ensure");
+        let pin = mailbox
+            .register_agent("toron", &profile("BlueRidge"))
+            .await
+            .expect("register pin");
+        mailbox.set_identity_mode("toron", "swarm").await;
+
+        let folded = mailbox
+            .set_project_captain("toron", "BlueRidge")
+            .await
+            .expect("set captain");
+        assert_eq!(folded, "BlueRidge");
+
+        // The fence surface: whois(project, "captain") hits the pin's npub.
+        let w = mailbox
+            .whois("toron", "captain")
+            .await
+            .expect("whois captain resolves via fold");
+        assert_eq!(w.npub, pin.npub);
+
+        // The send path shares the ONE resolver.
+        assert_eq!(
+            mailbox
+                .resolve_agent_name("toron", "captain")
+                .await
+                .expect("send-path resolution"),
+            "BlueRidge"
+        );
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn captain_alias_upsert_repoints_to_new_orchestrator() {
+        let (mailbox, _pool, db_path, data_dir) = test_mailbox_with_pool("captain-repoint").await;
+        mailbox.ensure_project("toron").await.expect("ensure");
+        mailbox
+            .register_agent("toron", &profile("BlueRidge"))
+            .await
+            .expect("register first pin");
+        mailbox
+            .register_agent("toron", &profile("AmberPlateau"))
+            .await
+            .expect("register second pin");
+        mailbox.set_identity_mode("toron", "swarm").await;
+
+        mailbox
+            .set_project_captain("toron", "BlueRidge")
+            .await
+            .expect("set first captain");
+        mailbox
+            .set_project_captain("toron", "AmberPlateau")
+            .await
+            .expect("repoint captain");
+
+        // Upsert semantics: the CURRENT orchestrator wins, not first-fold.
+        assert_eq!(
+            mailbox
+                .resolve_agent_name("toron", "captain")
+                .await
+                .expect("resolve repointed alias"),
+            "AmberPlateau"
+        );
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn set_captain_rejects_host_username() {
+        let (mailbox, _pool, db_path, data_dir) = test_mailbox_with_pool("captain-user").await;
+        mailbox.ensure_project("toron").await.expect("ensure");
+        mailbox.set_identity_mode("toron", "swarm").await;
+
+        let err = mailbox
+            .set_project_captain("toron", "bangedorrunt")
+            .await
+            .expect_err("host username is not an identity");
+        let msg = err.to_string();
+        assert!(msg.contains("username"), "names the class: {msg}");
+        assert!(msg.contains("not a mailbox identity"), "{msg}");
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn set_captain_rejects_unregistered_pin() {
+        let (mailbox, _pool, db_path, data_dir) = test_mailbox_with_pool("captain-reg").await;
+        mailbox.ensure_project("toron").await.expect("ensure");
+        mailbox.set_identity_mode("toron", "swarm").await;
+
+        let err = mailbox
+            .set_project_captain("toron", "NoSuchPin")
+            .await
+            .expect_err("unregistered pins do not route");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("REGISTERED"),
+            "error names the registered-pin requirement: {msg}"
         );
 
         let _ = std::fs::remove_file(&db_path);

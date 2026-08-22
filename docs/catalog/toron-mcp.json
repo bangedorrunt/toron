@@ -26,7 +26,7 @@
       "name": "config"
     },
     {
-      "args": "send, overseer, reply, inbox, ack, read, search, thread-summarize",
+      "args": "send, overseer, reply, inbox, ack, read, search, thread-summarize, whois",
       "description": "Mail: send/reply/inbox/ack/read/search/thread-summarize (MCP parity JSON)",
       "name": "mail"
     },
@@ -41,7 +41,7 @@
       "name": "slot"
     },
     {
-      "args": "request, respond, list, policy",
+      "args": "request, respond, list, policy, captain",
       "description": "Contacts: request/respond/list/policy",
       "name": "contact"
     },
@@ -121,7 +121,7 @@
       "name": "workflow"
     }
   ],
-  "generated_at": "2026-08-18T21:17:51Z",
+  "generated_at": "2026-08-22T00:22:12Z",
   "resources": [
     {
       "description": "List projects known to toron.",
@@ -641,6 +641,28 @@
       },
       "name": "cleanup_pane_identities",
       "output_schema": {
+        "$defs": {
+          "ReleasedGhostOut": {
+            "description": "One exclusive lease revoked because its holder pin was pruned\n(bd-gc7k: a dead pin must not own the ledger).",
+            "properties": {
+              "holder": {
+                "type": "string"
+              },
+              "path_pattern": {
+                "type": "string"
+              },
+              "project_slug": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "project_slug",
+              "path_pattern",
+              "holder"
+            ],
+            "type": "object"
+          }
+        },
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "anyOf": [
           {
@@ -648,6 +670,27 @@
               "type": "string"
             },
             "type": "array"
+          },
+          {
+            "properties": {
+              "released": {
+                "items": {
+                  "$ref": "#/$defs/ReleasedGhostOut"
+                },
+                "type": "array"
+              },
+              "removed": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              }
+            },
+            "required": [
+              "removed",
+              "released"
+            ],
+            "type": "object"
           },
           {
             "properties": {

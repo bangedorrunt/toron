@@ -324,6 +324,19 @@ pub enum MailCommand {
     Search(MailSearchArgs),
     /// Deterministic digest of a thread.
     ThreadSummarize(MailThreadSummarizeArgs),
+    /// Resolve a name/alias/pin to its identity (npub + profile fields).
+    /// bd-captain-alias-0g8a: `mail whois <project> captain` hits the
+    /// orchestrator pin once the alias is set.
+    Whois(MailWhoisArgs),
+}
+
+/// bd-captain-alias-0g8a: CLI noun for the shared whois resolver.
+#[derive(Debug, Args)]
+pub struct MailWhoisArgs {
+    /// Project slug.
+    pub project: String,
+    /// Identity to resolve (canonical name, adj+noun pin, folded alias, or npub).
+    pub name: String,
 }
 
 #[derive(Debug, Args)]
@@ -748,6 +761,21 @@ pub enum ContactCommand {
     List(ContactListArgs),
     /// Set the agent's inbound contact policy.
     Policy(ContactPolicyArgs),
+    /// Show or set the project's captain alias (bd-captain-alias-0g8a).
+    /// With `--pin`, validates the pin is REGISTERED and folds `captain`
+    /// onto it; without, prints the current fold.
+    Captain(ContactCaptainArgs),
+}
+
+/// bd-captain-alias-0g8a: the routable captain address.
+#[derive(Debug, Args)]
+pub struct ContactCaptainArgs {
+    /// Project slug.
+    #[arg(long, default_value = DEFAULT_PROJECT)]
+    pub project: String,
+    /// Registered adj+noun pin to fold `captain` onto (omit to show current).
+    #[arg(long)]
+    pub pin: Option<String>,
 }
 
 #[derive(Debug, Args)]
