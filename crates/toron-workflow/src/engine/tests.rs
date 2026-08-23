@@ -193,6 +193,37 @@ async fn approval_suspends_and_resumes() {
     );
 }
 
+/// bd-adr0006-cosmetic-sweep-q0g0: the approval message renders through the
+/// template engine BEFORE it becomes the promise payload / step output — a
+/// captain-readable signoff never carries raw `{{inputs.*}}` tokens.
+#[test]
+fn approval_message_renders_template_tokens() {
+    let wf = parse_workflow(
+        r##"
+name: signoff
+trigger:
+  type: webhook
+steps:
+  - name: signoff
+    action: request_approval
+    message: "Wave signoff for {{inputs.objective}} [{{inputs.wave_label}}]: review the VERIFY receipts."
+"##,
+    )
+    .expect("parse");
+    let trigger = serde_json::json!({
+        "inputs": {
+            "objective": "graduate the wave-swarm recipe",
+            "wave_label": "wave-1",
+        }
+    });
+    let msg = rendered_approval_message(&wf.steps[0].action, &trigger, &serde_json::Map::new())
+        .expect("render");
+    assert_eq!(
+        msg,
+        "Wave signoff for graduate the wave-swarm recipe [wave-1]: review the VERIFY receipts."
+    );
+}
+
 /// A run hitting `request_approval` and REJECTED completes with the
 /// rejection recorded (not failed — the rejection is a decision).
 #[tokio::test(flavor = "multi_thread")]

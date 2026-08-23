@@ -87,6 +87,25 @@ pub(crate) async fn run_steps(
 /// Execute ONE step (the linear body extracted from `run_workflow`, plus the
 /// P5.3 control-flow actions). Returns the step's output value.
 ///
+/// Render a `request_approval` message through the template engine — the
+/// same render-first contract the mailbox actions follow. Returns the raw
+/// message unchanged when the action is not `request_approval` (callers
+/// treat that as a contract bug) and surfaces render errors to let the
+/// caller fall back (bd-adr0006-cosmetic-sweep-q0g0).
+pub(crate) fn rendered_approval_message(
+    action: &Action,
+    trigger: &serde_json::Value,
+    step_outputs: &serde_json::Map<String, serde_json::Value>,
+) -> anyhow::Result<String> {
+    match render_action(action, trigger, step_outputs)? {
+        Action::RequestApproval { message } => Ok(message),
+        other => Err(anyhow::anyhow!(
+            "rendered approval action is not request_approval: {:?}",
+            other
+        )),
+    }
+}
+
 /// Boxed because control-flow actions recurse (`run_step` → `run_retry` →
 /// `run_step`, …) — async recursion requires a heap-allocated future.
 pub(crate) fn run_step<'a>(
@@ -111,6 +130,13 @@ pub(crate) fn run_step<'a>(
                 serde_json::Value::Null
             }
             Action::RequestApproval { message } => {
+                // Render FIRST (the same contract as the mailbox actions):
+                // the message becomes the promise payload + the operator's
+                // signoff prompt, so a raw `{{inputs.*}}` there is an
+                // unrendered template a captain actually reads
+                // (bd-adr0006-cosmetic-sweep-q0g0).
+                let message = rendered_approval_message(&step.action, trigger, step_outputs)
+                    .unwrap_or_else(|_| message.clone());
                 // Create the promise; its id is the approval key. The 0.6 SDK's
                 // PromiseTask is created eagerly (.create()); the handle's id()
                 // confirms server-side creation.
@@ -121,12 +147,6 @@ pub(crate) fn run_step<'a>(
                 let promise_id = pending.id().await?;
                 // The binding: the embedding publishes kind-46011 with this
                 // promise_id; the operator's approval/rejection resolves it.
-                step_outputs.insert(
-                    "approval".into(),
-                    serde_json::json!({ "promise_id": promise_id, "message": message }),
-                );
-                // PARK here: this await survives a crash (replay resumes at
-                // this point when the promise resolves).
                 step_outputs.insert(
                     "approval".into(),
                     serde_json::json!({
