@@ -137,8 +137,8 @@ pub use sinks::{ApprovalSink, SpawnSink};
 #[cfg(test)]
 #[allow(unused_imports)]
 pub(crate) use control_flow::{
-    resolve_template_ref, run_branch, run_call_workflow, run_foreach, run_graph, run_parallel,
-    run_retry, run_spawn, run_step, run_steps,
+    rendered_approval_message, resolve_template_ref, run_branch, run_call_workflow, run_foreach,
+    run_graph, run_parallel, run_retry, run_spawn, run_step, run_steps,
 };
 #[cfg(test)]
 #[allow(unused_imports)]
