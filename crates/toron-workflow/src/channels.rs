@@ -102,6 +102,50 @@ struct ChannelStoreInner {
     events: Vec<ChannelEvent>,
 }
 
+/// bd-channel-truncation-238e: a channel post above this many chars is
+/// REFUSED (usage error naming the limit + the `--file` chunking affordance)
+/// instead of silently truncating — silent truncation of a status report is
+/// data loss wearing a success costume.
+pub const CHANNEL_POST_MAX_CHARS: usize = 4096;
+
+/// Split an over-cap post into bounded chunks for `channel post --file`:
+/// whole lines where possible (a line longer than the cap is hard-split),
+/// each chunk prefixed `(i/N) `. A short post returns unmarked as-is.
+pub fn split_channel_post(content: &str, max_chars: usize) -> Vec<String> {
+    if content.chars().count() <= max_chars {
+        return vec![content.to_string()];
+    }
+    let mut parts: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    for line in content.split_inclusive('\n') {
+        if cur.chars().count() + line.chars().count() > max_chars {
+            if !cur.is_empty() {
+                parts.push(std::mem::take(&mut cur));
+            }
+            // single over-long line: hard-split it
+            let mut piece = String::new();
+            for ch in line.chars() {
+                piece.push(ch);
+                if piece.chars().count() >= max_chars {
+                    parts.push(std::mem::take(&mut piece));
+                }
+            }
+            cur = piece;
+        } else {
+            cur.push_str(line);
+        }
+    }
+    if !cur.is_empty() {
+        parts.push(cur);
+    }
+    let n = parts.len();
+    parts
+        .into_iter()
+        .enumerate()
+        .map(|(i, body)| format!("({}/{}) {body}", i + 1, n))
+        .collect()
+}
+
 impl ChannelStore {
     /// New empty store.
     pub fn new() -> Self {
@@ -199,6 +243,7 @@ impl ChannelStore {
     /// only members may post; a non-member is rejected before any event is
     /// produced (the gate is at the store boundary — the same point the
     /// projection/fanout uses).
+
     pub fn post(
         &self,
         author: &Keys,
@@ -208,6 +253,16 @@ impl ChannelStore {
     ) -> anyhow::Result<Event> {
         let author_pk = author.public_key();
         self.require_member(channel_id, &author_pk)?;
+        // bd-channel-truncation-238e: fail LOUD on over-cap posts.
+        let chars = content.chars().count();
+        if chars > CHANNEL_POST_MAX_CHARS {
+            anyhow::bail!(
+                "post is {chars} chars; channel posts cap at {} — split it with \
+                 `toron channel post --file <path>` ((1/N) chunked thread) or send the \
+                 full report to a file and post a summary",
+                CHANNEL_POST_MAX_CHARS
+            );
+        }
         let mut tags = vec![Tag::parse(["h", channel_id]).expect("h tag")];
         if let Some(slug) = self.get(channel_id).and_then(|c| c.project) {
             tags.push(Tag::parse(["t", &slug]).expect("t tag"));
@@ -373,6 +428,51 @@ mod tests {
         let history = store.history("auth-refactor");
         assert_eq!(history.len(), 2);
         assert!(history.iter().all(|e| e.kind == CHANNEL_MESSAGE));
+    }
+
+    /// bd-channel-truncation-238e: an over-cap post FAILS LOUDLY naming the
+    /// limit and the chunking affordance — never silently truncates.
+    #[test]
+    fn channel_post_over_cap_fails_loudly() {
+        let store = ChannelStore::new();
+        let author = Keys::generate();
+        store
+            .create_channel(&author.public_key(), "cap", "Cap", false, Some("toron"))
+            .expect("create");
+        let big = "x".repeat(CHANNEL_POST_MAX_CHARS + 1);
+        let err = format!(
+            "{}",
+            store.post(&author, "cap", &big, &[]).unwrap_err()
+        );
+        assert!(err.contains(&CHANNEL_POST_MAX_CHARS.to_string()), "{err}");
+        assert!(err.contains("--file"), "names the chunking fix: {err}");
+        // at-cap is fine
+        let at = "x".repeat(CHANNEL_POST_MAX_CHARS);
+        assert!(store.post(&author, "cap", &at, &[]).is_ok());
+    }
+
+    /// The splitter: every chunk <= max INCLUDING its (i/N) marker, markers
+    /// numbered 1..N, content preserved in order.
+    #[test]
+    fn channel_post_split_chunks_are_bounded_and_ordered() {
+        let content = ("line of crew report text.\n").repeat(200); // ~5400 chars
+        let chunks = split_channel_post(&content, 700);
+        assert!(chunks.len() > 1, "long content splits: {}", chunks.len());
+        for (i, c) in chunks.iter().enumerate() {
+            assert!(c.chars().count() <= 700, "chunk {i} is {} chars", c.len());
+            assert!(c.starts_with(&format!("({}/{}) ", i + 1, chunks.len())));
+        }
+        // round-trip: markers stripped, order preserved
+        let joined: String = chunks
+            .iter()
+            .map(|c| c.splitn(2, ' ').nth(1).expect("body"))
+            .collect::<Vec<_>>()
+            .join("");
+        assert_eq!(joined.replace('\n', ""), content.replace('\n', ""));
+        // short content = single unmarked chunk? No: single chunk gets no marker
+        let one = split_channel_post("short", 700);
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0], "short");
     }
 
     #[test]

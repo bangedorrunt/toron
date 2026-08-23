@@ -973,16 +973,23 @@ pub struct ChannelMembersArgs {
 pub struct ChannelPostArgs {
     /// Channel id.
     pub id: String,
-    /// Message body (markdown).
-    #[arg(long, required = true)]
-    pub body: String,
+    /// Message body (markdown). Required unless --file is given.
+    #[arg(long, required = false)]
+    pub body: Option<String>,
+    /// bd-channel-truncation-238e: post a LONG report from a file — the
+    /// content is chunked at 700 chars into an (1/N)-marked thread so the
+    /// channel carries what crews actually write instead of a silent
+    /// truncation. Exactly one of --body / --file.
+    #[arg(long)]
+    pub file: Option<PathBuf>,
     /// Project slug.
     #[arg(long, required = true)]
     pub project: String,
     /// Posting agent's canonical name (ADR-0018).
     #[arg(long = "as", required = true)]
     pub as_name: String,
-    /// @mention targets (canonical names; p-tags + mention dispatcher).
+    /// @mention targets (canonical names; p-tags + mention dispatcher;
+    /// applied to the first chunk only).
     #[arg(long, value_delimiter = ',')]
     pub mention: Vec<String>,
 }
@@ -995,6 +1002,9 @@ pub struct ChannelReadArgs {
     #[arg(long, required = true)]
     pub project: String,
     /// Reading agent's canonical name (membership gate needs an identity).
+    /// Read order is NEWEST-FIRST (descending created_at) by design — slice
+    /// with `--limit` from the top; do not assume ascending order
+    /// (bd-channel-truncation-238e rider).
     #[arg(long = "as", required = true)]
     pub as_name: String,
     /// Maximum messages to return.

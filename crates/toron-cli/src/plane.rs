@@ -394,9 +394,61 @@ async fn channel_post(mailbox: &Mailbox, args: &ChannelPostArgs) -> anyhow::Resu
     let keys = resolve_agent(mailbox, &args.project, &args.as_name).await?;
     let store = rebuild_store(mailbox, &args.project).await?;
 
+    // bd-channel-truncation-238e: exactly one of --body / --file. A file
+    // post chunks at 700 chars into an (1/N)-marked thread (the swarm's
+    // crew-report convention, now the mechanism instead of a brief rule).
+    let bodies: Vec<String> = match (&args.body, &args.file) {
+        (Some(b), None) => vec![b.clone()],
+        (None, Some(f)) => toron_workflow::channels::split_channel_post(
+            &std::fs::read_to_string(f)
+                .with_context(|| format!("reading {}", f.display()))?,
+            700,
+        ),
+        (Some(_), Some(_)) => {
+            return Err(anyhow::anyhow!("--body and --file are mutually exclusive"));
+        }
+        (None, None) => {
+            return Err(anyhow::anyhow!("provide --body or --file <path>"));
+        }
+    };
+    for (i, chunk) in bodies.iter().enumerate() {
+        post_one(
+            mailbox,
+            &store,
+            &keys,
+            args,
+            chunk,
+            i == 0, // mentions ride the first chunk only
+        )
+        .await?;
+    }
+    if bodies.len() > 1 {
+        eprintln!(
+            "posted {} chunks ((1/{})-marked thread)",
+            bodies.len(),
+            bodies.len()
+        );
+    }
+    Ok(())
+}
+
+/// One kind-9 post + mention dispatch (the former inline body of
+/// `channel_post`, factored for the --file chunk loop).
+async fn post_one(
+    mailbox: &Mailbox,
+    store: &toron_workflow::channels::ChannelStore,
+    keys: &Keys,
+    args: &ChannelPostArgs,
+    body: &str,
+    with_mentions: bool,
+) -> anyhow::Result<()> {
+
     // Resolve --mention names → npubs via the project identity index.
     let mut mention_pks: Vec<PublicKey> = Vec::new();
-    for name in &args.mention {
+    if !with_mentions {
+        // chunked thread: dispatch on the first chunk only
+    }
+    for name in args.mention.iter().filter(|_| with_mentions) {
         let whois = mailbox
             .whois(&args.project, name)
             .await
@@ -406,7 +458,7 @@ async fn channel_post(mailbox: &Mailbox, args: &ChannelPostArgs) -> anyhow::Resu
 
     // Membership-gated store post (kind 9; non-member → error exit 1).
     let ev = store
-        .post(&keys, &args.id, &args.body, &mention_pks)
+        .post(keys, &args.id, body, &mention_pks)
         .with_context(|| format!("post to channel {}", args.id))?;
     mailbox.bus().publish(ev.clone()).await?;
 
