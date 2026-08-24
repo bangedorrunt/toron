@@ -122,7 +122,8 @@ pub enum Command {
     // --- two-plane shared surface (ADR-0020 Spec 2): the Nostr plane as CLI.
     // Plane S (shared rooms, kind 9/7), J (jobs 43001-43006), N (presence
     // 20001), W (watch/NIP-01 REQ). CLI-first; the MCP cluster stays frozen.
-    /// NIP-29 channels: create/join/leave/list/members/post/read (plane S).
+    /// NIP-29 channels: create/join/leave/close/purge/list/members/post/read
+    /// (plane S; lifecycle open -> closed -> purged).
     #[command(subcommand)]
     Channel(ChannelCommand),
 
@@ -289,10 +290,6 @@ pub struct DaemonArgs {
 // matching MCP tool returns (see `robot.rs`).
 // ---------------------------------------------------------------------------
 
-/// Default project for robot commands whose `--project` is optional (the
-/// demo mailbox's canonical project).
-pub const DEFAULT_PROJECT: &str = "demo";
-
 /// Contact policy selector (parity: open|auto|contacts_only|block_all).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum PolicyArg {
@@ -342,7 +339,7 @@ pub struct MailWhoisArgs {
 #[derive(Debug, Args)]
 pub struct MailSendArgs {
     /// Sender agent name (must have a local key in the project).
-    #[arg(long, default_value = "agent")]
+    #[arg(long = "as", default_value = "agent")]
     pub from: String,
     /// Recipients (comma-separated).
     #[arg(long, value_delimiter = ',', required = true)]
@@ -360,7 +357,7 @@ pub struct MailSendArgs {
     #[arg(long, value_delimiter = ',')]
     pub bcc: Vec<String>,
     /// Project slug.
-    #[arg(long, default_value = DEFAULT_PROJECT)]
+    #[arg(long, required = true)]
     pub project: String,
     /// Importance tag (e.g. normal|high|urgent).
     #[arg(long)]
@@ -389,14 +386,14 @@ pub struct MailOverseerArgs {
     #[arg(long)]
     pub subject: Option<String>,
     /// Project slug.
-    #[arg(long, default_value = DEFAULT_PROJECT)]
+    #[arg(long, required = true)]
     pub project: String,
 }
 
 #[derive(Debug, Args)]
 pub struct MailReplyArgs {
     /// Sender agent name (must have a local key in the project).
-    #[arg(long, default_value = "agent")]
+    #[arg(long = "as", default_value = "agent")]
     pub from: String,
     /// Recipients (comma-separated).
     #[arg(long, value_delimiter = ',', required = true)]
@@ -414,7 +411,7 @@ pub struct MailReplyArgs {
     #[arg(long, value_delimiter = ',')]
     pub bcc: Vec<String>,
     /// Project slug.
-    #[arg(long, default_value = DEFAULT_PROJECT)]
+    #[arg(long, required = true)]
     pub project: String,
     /// Importance tag (e.g. normal|high|urgent).
     #[arg(long)]
@@ -433,10 +430,10 @@ pub struct MailReplyArgs {
 #[derive(Debug, Args)]
 pub struct MailInboxArgs {
     /// Agent whose inbox to project.
-    #[arg(long, required = true)]
+    #[arg(long = "as", required = true)]
     pub agent: String,
     /// Project slug.
-    #[arg(long, default_value = DEFAULT_PROJECT)]
+    #[arg(long, required = true)]
     pub project: String,
     /// Unread messages only (documented no-op: the inbox projection has no
     /// read state; poll with --since instead, per ADR-0018/bd-pin-public-plane-s-easy.3).
@@ -452,7 +449,10 @@ pub struct MailInboxArgs {
     #[arg(long)]
     pub thread_id: Option<String>,
     /// Only messages strictly newer than this RFC3339 timestamp (e.g.
-    /// 2026-08-18T00:00:00Z). A malformed value is an error, never ignored.
+    /// 2026-08-18T00:00:00Z), or the literal `last` (bd-since-cursor-70cf):
+    /// the daemon-side high-water cursor, read then atomically bumped —
+    /// crash-proof incremental polling. A malformed value is an error,
+    /// never ignored.
     #[arg(long)]
     pub since: Option<String>,
 }
@@ -463,7 +463,7 @@ pub struct MailReceiptArgs {
     #[arg(long, required = true)]
     pub project: String,
     /// Agent sending the receipt.
-    #[arg(long, required = true)]
+    #[arg(long = "as", required = true)]
     pub agent: String,
     /// Message id.
     #[arg(long, required = true)]
@@ -476,7 +476,7 @@ pub struct MailSearchArgs {
     #[arg(long, required = true)]
     pub query: String,
     /// Project slug.
-    #[arg(long, default_value = DEFAULT_PROJECT)]
+    #[arg(long, required = true)]
     pub project: String,
     /// Maximum results (default 100, capped 1000).
     #[arg(long)]
@@ -552,10 +552,10 @@ pub struct ReserveAcquireArgs {
     #[arg(long, value_delimiter = ',', required = true)]
     pub paths: Vec<String>,
     /// Project slug.
-    #[arg(long, default_value = DEFAULT_PROJECT)]
+    #[arg(long, required = true)]
     pub project: String,
     /// Agent acquiring the leases.
-    #[arg(long, required = true)]
+    #[arg(long = "as", required = true)]
     pub agent: String,
     /// Lease TTL in seconds (default envelope TTL).
     #[arg(long)]
@@ -574,10 +574,10 @@ pub struct ReserveConflictsArgs {
     #[arg(long, value_delimiter = ',', required = true)]
     pub paths: Vec<String>,
     /// Project slug.
-    #[arg(long, default_value = DEFAULT_PROJECT)]
+    #[arg(long, required = true)]
     pub project: String,
     /// Agent performing the check.
-    #[arg(long, required = true)]
+    #[arg(long = "as", required = true)]
     pub agent: String,
 }
 
@@ -587,10 +587,10 @@ pub struct ReserveRenewArgs {
     #[arg(long, value_delimiter = ',')]
     pub paths: Vec<String>,
     /// Project slug.
-    #[arg(long, default_value = DEFAULT_PROJECT)]
+    #[arg(long, required = true)]
     pub project: String,
     /// Agent holding the leases.
-    #[arg(long, required = true)]
+    #[arg(long = "as", required = true)]
     pub agent: String,
     /// Seconds to extend each lease's TTL.
     #[arg(long, required = true)]
@@ -603,10 +603,10 @@ pub struct ReserveReleaseArgs {
     #[arg(long, value_delimiter = ',')]
     pub paths: Vec<String>,
     /// Project slug.
-    #[arg(long, default_value = DEFAULT_PROJECT)]
+    #[arg(long, required = true)]
     pub project: String,
     /// Agent holding the leases.
-    #[arg(long, required = true)]
+    #[arg(long = "as", required = true)]
     pub agent: String,
 }
 
@@ -620,10 +620,10 @@ pub struct ReserveForceReleaseArgs {
     #[arg(long)]
     pub holder: Option<String>,
     /// Project slug.
-    #[arg(long, default_value = DEFAULT_PROJECT)]
+    #[arg(long, required = true)]
     pub project: String,
     /// Requestor agent (the operator's tool user).
-    #[arg(long, required = true)]
+    #[arg(long = "as", required = true)]
     pub agent: String,
     /// Note attached to the revocation.
     #[arg(long)]
@@ -636,10 +636,10 @@ pub struct ReserveForceReleaseArgs {
 #[derive(Debug, Args)]
 pub struct ReserveRequestReleaseArgs {
     /// Project slug.
-    #[arg(long, default_value = DEFAULT_PROJECT)]
+    #[arg(long, required = true)]
     pub project: String,
     /// The requesting agent (crew A, the pin).
-    #[arg(long, required = true)]
+    #[arg(long = "as", required = true)]
     pub agent: String,
     /// The holder being asked (crew B).
     #[arg(long, required = true)]
@@ -658,10 +658,10 @@ pub struct ReserveRequestReleaseArgs {
 #[derive(Debug, Args)]
 pub struct ReserveRespondArgs {
     /// Project slug.
-    #[arg(long, default_value = DEFAULT_PROJECT)]
+    #[arg(long, required = true)]
     pub project: String,
     /// The responding holder (crew B, the pin).
-    #[arg(long, required = true)]
+    #[arg(long = "as", required = true)]
     pub agent: String,
     /// The request's message id (from request-release output).
     #[arg(long, required = true)]
@@ -677,10 +677,10 @@ pub struct ReserveRespondArgs {
 #[derive(Debug, Args)]
 pub struct ReserveTransferArgs {
     /// Project slug.
-    #[arg(long, default_value = DEFAULT_PROJECT)]
+    #[arg(long, required = true)]
     pub project: String,
     /// The current holder releasing the lease (the pin).
-    #[arg(long, required = true)]
+    #[arg(long = "as", required = true)]
     pub from: String,
     /// The target acquiring the lease (the pin).
     #[arg(long, required = true)]
@@ -709,10 +709,10 @@ pub struct SlotAcquireArgs {
     #[arg(long, required = true)]
     pub slot: String,
     /// Project slug.
-    #[arg(long, default_value = DEFAULT_PROJECT)]
+    #[arg(long, required = true)]
     pub project: String,
     /// Agent acquiring the slot.
-    #[arg(long, required = true)]
+    #[arg(long = "as", required = true)]
     pub agent: String,
     /// Lease TTL in seconds (default envelope TTL).
     #[arg(long)]
@@ -731,10 +731,10 @@ pub struct SlotRenewArgs {
     #[arg(long, required = true)]
     pub extend_secs: u64,
     /// Project slug.
-    #[arg(long, default_value = DEFAULT_PROJECT)]
+    #[arg(long, required = true)]
     pub project: String,
     /// Agent holding the slot.
-    #[arg(long, required = true)]
+    #[arg(long = "as", required = true)]
     pub agent: String,
 }
 
@@ -744,10 +744,10 @@ pub struct SlotReleaseArgs {
     #[arg(long, required = true)]
     pub slot: String,
     /// Project slug.
-    #[arg(long, default_value = DEFAULT_PROJECT)]
+    #[arg(long, required = true)]
     pub project: String,
     /// Agent holding the slot.
-    #[arg(long, required = true)]
+    #[arg(long = "as", required = true)]
     pub agent: String,
 }
 
@@ -771,7 +771,7 @@ pub enum ContactCommand {
 #[derive(Debug, Args)]
 pub struct ContactCaptainArgs {
     /// Project slug.
-    #[arg(long, default_value = DEFAULT_PROJECT)]
+    #[arg(long, required = true)]
     pub project: String,
     /// Registered adj+noun pin to fold `captain` onto (omit to show current).
     #[arg(long)]
@@ -784,10 +784,10 @@ pub struct ContactRequestArgs {
     #[arg(long, required = true)]
     pub to: String,
     /// Requesting agent name.
-    #[arg(long, default_value = "agent")]
+    #[arg(long = "as", default_value = "agent")]
     pub from: String,
     /// Project slug.
-    #[arg(long, default_value = DEFAULT_PROJECT)]
+    #[arg(long, required = true)]
     pub project: String,
     /// Request reason.
     #[arg(long)]
@@ -800,7 +800,7 @@ pub struct ContactRequestArgs {
 #[derive(Debug, Args)]
 pub struct ContactRespondArgs {
     /// Requesting agent name.
-    #[arg(long, required = true)]
+    #[arg(long = "as", required = true)]
     pub from: String,
     /// Responding agent name.
     #[arg(long, required = true)]
@@ -809,7 +809,7 @@ pub struct ContactRespondArgs {
     #[arg(long, required = true)]
     pub accept: bool,
     /// Project slug.
-    #[arg(long, default_value = DEFAULT_PROJECT)]
+    #[arg(long, required = true)]
     pub project: String,
     /// Requester's project (defaults to --project).
     #[arg(long)]
@@ -819,23 +819,23 @@ pub struct ContactRespondArgs {
 #[derive(Debug, Args)]
 pub struct ContactListArgs {
     /// Agent whose contact links to list.
-    #[arg(long, required = true)]
+    #[arg(long = "as", required = true)]
     pub agent: String,
     /// Project slug.
-    #[arg(long, default_value = DEFAULT_PROJECT)]
+    #[arg(long, required = true)]
     pub project: String,
 }
 
 #[derive(Debug, Args)]
 pub struct ContactPolicyArgs {
     /// Agent whose inbound policy to set.
-    #[arg(long, required = true)]
+    #[arg(long = "as", required = true)]
     pub agent: String,
     /// open|auto|contacts_only|block_all.
     #[arg(long, value_enum, required = true)]
     pub policy: PolicyArg,
     /// Project slug.
-    #[arg(long, default_value = DEFAULT_PROJECT)]
+    #[arg(long, required = true)]
     pub project: String,
 }
 
@@ -865,7 +865,7 @@ pub struct GuardRepoArgs {
     #[arg(long, required = true)]
     pub repo: PathBuf,
     /// Project slug whose reservations the guard evaluates (baked into the hook).
-    #[arg(long, default_value = DEFAULT_PROJECT)]
+    #[arg(long, required = true)]
     pub project: String,
 }
 
@@ -875,7 +875,7 @@ pub struct GuardCheckArgs {
     #[arg(long, required = true)]
     pub repo: PathBuf,
     /// Project slug whose reservations are evaluated.
-    #[arg(long, default_value = DEFAULT_PROJECT)]
+    #[arg(long, required = true)]
     pub project: String,
     /// Committing agent name (overrides TORON_AGENT / FLYWHEEL_MAIL_AS).
     #[arg(long)]
@@ -918,6 +918,15 @@ pub enum ChannelCommand {
     Post(ChannelPostArgs),
     /// Read channel history (posts + reactions; membership-gated).
     Read(ChannelReadArgs),
+    /// Close (retire) a channel (bd-channel-close-purge-bsqb). Creator-only,
+    /// idempotent. A closed channel refuses posts/joins and is hidden from
+    /// `list` by default; its history survives until `purge`. Lifecycle:
+    /// open -> closed -> purged.
+    Close(ChannelCloseArgs),
+    /// Purge a CLOSED channel's local bus events (operator-grade, for
+    /// genuinely dead probe/testing channels). Caller must be the creator
+    /// or the operator. Logged to {data_dir}/channel_purge.log.
+    Purge(ChannelPurgeArgs),
 }
 
 #[derive(Debug, Args)]
@@ -948,6 +957,9 @@ pub struct ChannelJoinArgs {
     /// Agent canonical name (ADR-0018).
     #[arg(long = "as", required = true)]
     pub as_name: String,
+    /// Only join if not already a member (idempotent bootstrap, bd-kbl1c).
+    #[arg(long)]
+    pub if_missing: bool,
 }
 
 #[derive(Debug, Args)]
@@ -958,6 +970,10 @@ pub struct ChannelListArgs {
     /// Optional reader identity (private channels appear only to members).
     #[arg(long = "as")]
     pub as_name: Option<String>,
+    /// Include closed (retired) channels — hidden by default
+    /// (bd-channel-close-purge-bsqb).
+    #[arg(long)]
+    pub all: bool,
 }
 
 #[derive(Debug, Args)]
@@ -992,6 +1008,12 @@ pub struct ChannelPostArgs {
     /// applied to the first chunk only).
     #[arg(long, value_delimiter = ',')]
     pub mention: Vec<String>,
+    /// Verify-after-send (bd-verify-after-send-fxtv): after publishing,
+    /// poll the channel projection until the post's own event id is
+    /// readable, up to this many seconds; exit nonzero on timeout.
+    /// Delivery is claimed only after it is observed.
+    #[arg(long, value_name = "SECS")]
+    pub wait_ack: Option<u64>,
 }
 
 #[derive(Debug, Args)]
@@ -1013,6 +1035,10 @@ pub struct ChannelReadArgs {
     /// Include messages at/after this RFC3339 timestamp.
     #[arg(long)]
     pub since: Option<String>,
+    /// Only events authored by this agent (bd-delivery-visibility-g96y:
+    /// "did the scout report?" as a single query).
+    #[arg(long)]
+    pub author: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -1030,6 +1056,33 @@ pub struct ReactArgs {
     #[arg(long, required = true)]
     pub project: String,
     /// Reacting agent's canonical name (ADR-0018).
+    #[arg(long = "as", required = true)]
+    pub as_name: String,
+}
+
+/// bd-channel-close-purge-bsqb: close (retire) a channel. Creator-only.
+#[derive(Debug, Args)]
+pub struct ChannelCloseArgs {
+    /// Channel id.
+    pub id: String,
+    /// Project slug.
+    #[arg(long, required = true)]
+    pub project: String,
+    /// Creator's canonical name (only the creator may close).
+    #[arg(long = "as", required = true)]
+    pub as_name: String,
+}
+
+/// bd-channel-close-purge-bsqb: purge a CLOSED channel's bus events.
+/// Creator or operator only; audited.
+#[derive(Debug, Args)]
+pub struct ChannelPurgeArgs {
+    /// Channel id (must be closed first — lifecycle: open -> closed -> purged).
+    pub id: String,
+    /// Project slug.
+    #[arg(long, required = true)]
+    pub project: String,
+    /// Caller's canonical name (creator or operator).
     #[arg(long = "as", required = true)]
     pub as_name: String,
 }
@@ -1401,6 +1454,77 @@ impl BenchCaseArg {
             Self::Send => "send",
             Self::Search => "search",
             Self::Threads => "threads",
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// bd-flag-vocab-conformance-0hyv: ONE vocabulary, enforced by test.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod flag_conformance_tests {
+    use clap::CommandFactory;
+
+    use super::Cli;
+
+    /// Walk every subcommand (recursively) and enforce:
+    /// - the acting agent is ALWAYS `--as` — `--from` and `--agent` are
+    ///   banned long names anywhere on the surface;
+    /// - every subcommand that has a `--project` argument REQUIRES it (no
+    ///   silent `demo` default producing "no local key in project demo").
+    #[test]
+    fn flag_conformance_one_vocabulary_and_required_project() {
+        let mut banned: Vec<String> = Vec::new();
+        let mut bad_project: Vec<String> = Vec::new();
+        // Explicit waivers (audited): surfaces where --project is a genuine
+        // OPTIONAL filter over ALL projects — never a silent demo routing.
+        let waived = ["toron doctor reconstruct"];
+        let root = Cli::command();
+        walk(&root, String::new(), &waived, &mut banned, &mut bad_project);
+        assert!(
+            banned.is_empty(),
+            "banned sender flags found (sender must be --as): {banned:?}"
+        );
+        assert!(
+            bad_project.is_empty(),
+            "--project must be required (no silent demo default): {bad_project:?}"
+        );
+    }
+
+    fn walk(
+        cmd: &clap::Command,
+        path: String,
+        waived: &[&str],
+        banned: &mut Vec<String>,
+        bad_project: &mut Vec<String>,
+    ) {
+        let here = if path.is_empty() {
+            cmd.get_name().to_string()
+        } else {
+            format!("{path} {}", cmd.get_name())
+        };
+        for arg in cmd.get_arguments() {
+            let Some(long) = arg.get_long() else { continue };
+            match long {
+                "from" | "agent" => banned.push(format!("{here}: --{long}")),
+                "project" => {
+                    if waived.contains(&here.as_str()) {
+                        continue;
+                    }
+                    if !arg.is_required_set() || !arg.get_default_values().is_empty() {
+                        bad_project.push(format!(
+                            "{here}: --project required={}, defaults={:?}",
+                            arg.is_required_set(),
+                            arg.get_default_values()
+                        ));
+                    }
+                }
+                _ => {}
+            }
+        }
+        for sub in cmd.get_subcommands() {
+            walk(sub, here.clone(), waived, banned, bad_project);
         }
     }
 }
