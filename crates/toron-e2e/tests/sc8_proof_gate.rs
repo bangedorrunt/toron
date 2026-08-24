@@ -65,8 +65,7 @@ async fn sc8_proof_gate_fail_closed_and_nonce_persists() {
     // --- 1. Wrong kind rejected (kind mismatch) ---
     let mut store = NonceStore::new(pool.clone());
     let wrong_kind = EventBuilder::new(Kind::TextNote, "nope")
-        .sign(&anchor)
-        .await
+        .finalize(&anchor)
         .unwrap();
     assert!(
         matches!(

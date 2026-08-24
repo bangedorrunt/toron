@@ -803,7 +803,7 @@ fn inbox_missing_required_arg_exits_2() {
 //
 // Cross-process contract: every shelled-out `toron` invocation opens the
 // same durable root (its own TORON_MCP_DATA_DIR), so channel lifecycle
-// events (kind 40/41), posts (kind 9), jobs (43001-43006) and presence
+// events (kind 39000/39002), posts (kind 9), jobs (43001-43006) and presence
 // (projection file) survive across processes — the SC-27 shape.
 //
 // The plane suite uses a DEDICATED data dir (not the shared cli-robot one)
@@ -885,7 +885,7 @@ fn channel_create_post_read_react_roundtrip() {
     let _g = plane_guard();
     plane_register(&["TestAgent"]);
 
-    // create (process 1) → kind-40 lifecycle event persisted.
+    // create (process 1) → kind-39000 group metadata persisted.
     let id = channel_id("rt");
     let created = plane_run(&[
         "channel",

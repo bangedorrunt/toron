@@ -26,7 +26,7 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use nostr_sdk::nostr::{Event, EventId, Keys, Timestamp};
+use nostr::prelude::{Event, EventId, Keys, Timestamp};
 use toron_core::bus::{Bus, SubscriptionEvent};
 use toron_core::mailbox::{Mailbox, SendMessage, UnwrappedMail};
 use toron_workflow::coalesce::{CoalesceDecision, Coalesced, MentionCoalescer};
@@ -573,15 +573,16 @@ pub(crate) fn test_spec(v: serde_json::Value) -> toron_workflow::schema::Dispatc
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nostr::prelude::{EventBuilder, FinalizeEvent, Kind, Tag};
     use serde_json::json;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// A minimal signed kind-14 event with optional tags, for trigger tests.
-    fn kind14(content: &str, tags: Vec<nostr_sdk::nostr::Tag>) -> nostr_sdk::nostr::Event {
-        let keys = nostr_sdk::nostr::Keys::generate();
-        nostr_sdk::nostr::EventBuilder::new(nostr_sdk::nostr::Kind::from_u16(14), content)
+    fn kind14(content: &str, tags: Vec<Tag>) -> Event {
+        let keys = Keys::generate();
+        EventBuilder::new(Kind::from_u16(14), content)
             .tags(tags)
-            .sign_with_keys(&keys)
+            .finalize(&keys)
             .expect("sign")
     }
 
@@ -589,7 +590,7 @@ mod tests {
     /// workflow-emitted (stamped) kind-14 does NOT re-trigger.
     #[test]
     fn stamped_workflow_event_is_rejected_at_ingress() {
-        let keys = nostr_sdk::nostr::Keys::generate();
+        let keys = Keys::generate();
         // A user kind-14 (no stamp) → evaluated.
         let user = kind14("hello", vec![]);
         assert!(
@@ -600,11 +601,8 @@ mod tests {
         let stamped = kind14(
             "hello",
             vec![
-                nostr_sdk::nostr::Tag::parse([
-                    "t",
-                    toron_workflow::trigger_filter::WORKFLOW_EMITTED_TAG,
-                ])
-                .expect("stamp tag"),
+                Tag::parse(["t", toron_workflow::trigger_filter::WORKFLOW_EMITTED_TAG])
+                    .expect("stamp tag"),
             ],
         );
         assert!(
@@ -621,7 +619,7 @@ mod tests {
     fn trigger_payload_exposes_template_fields() {
         let ev = kind14(
             "urgent: fix",
-            vec![nostr_sdk::nostr::Tag::parse(["t", "myproject"]).expect("t")],
+            vec![Tag::parse(["t", "myproject"]).expect("t")],
         );
         let payload = trigger_payload(&ev);
         assert_eq!(payload["id"].as_str(), Some(ev.id.to_hex().as_str()));
@@ -639,9 +637,9 @@ mod tests {
     fn trigger_matching_is_kind_scoped() {
         let msg = kind14("hi", vec![]);
         let react = {
-            let keys = nostr_sdk::nostr::Keys::generate();
-            nostr_sdk::nostr::EventBuilder::new(nostr_sdk::nostr::Kind::from_u16(7), "+")
-                .sign_with_keys(&keys)
+            let keys = Keys::generate();
+            EventBuilder::new(Kind::from_u16(7), "+")
+                .finalize(&keys)
                 .expect("sign")
         };
         assert!(matches_trigger(
@@ -796,20 +794,17 @@ mod tests {
             !fired.lock().unwrap().iter().any(|f| f == want)
         }
 
-        let keys = nostr_sdk::nostr::Keys::generate();
-        let t_demo = nostr_sdk::nostr::Tag::parse(["t", "demo"]).expect("t");
+        let keys = Keys::generate();
+        let t_demo = Tag::parse(["t", "demo"]).expect("t");
 
         // 1. A plain acquire (status-less content) → on-acquire only.
-        let acquire = nostr_sdk::nostr::EventBuilder::new(
-            nostr_sdk::nostr::Kind::from_u16(30031),
-            r#"{"exclusive":true}"#,
-        )
-        .tags(vec![
-            nostr_sdk::nostr::Tag::parse(["d", "demo:src/**"]).expect("d"),
-            t_demo.clone(),
-        ])
-        .sign_with_keys(&keys)
-        .expect("sign");
+        let acquire = EventBuilder::new(Kind::from_u16(30031), r#"{"exclusive":true}"#)
+            .tags(vec![
+                Tag::parse(["d", "demo:src/**"]).expect("d"),
+                t_demo.clone(),
+            ])
+            .finalize(&keys)
+            .expect("sign");
         bus.publish(acquire).await.expect("publish acquire");
         assert!(
             wait_for(&fired, "action:send_message", Duration::from_secs(10)).await,
@@ -830,16 +825,13 @@ mod tests {
         // 2. A release marker (status:released content) → on-release fires,
         //    and does NOT re-fire on-acquire.
         fired.lock().unwrap().clear();
-        let release = nostr_sdk::nostr::EventBuilder::new(
-            nostr_sdk::nostr::Kind::from_u16(30031),
-            r#"{"status":"released"}"#,
-        )
-        .tags(vec![
-            nostr_sdk::nostr::Tag::parse(["d", "demo:src/**"]).expect("d"),
-            t_demo.clone(),
-        ])
-        .sign_with_keys(&keys)
-        .expect("sign");
+        let release = EventBuilder::new(Kind::from_u16(30031), r#"{"status":"released"}"#)
+            .tags(vec![
+                Tag::parse(["d", "demo:src/**"]).expect("d"),
+                t_demo.clone(),
+            ])
+            .finalize(&keys)
+            .expect("sign");
         bus.publish(release).await.expect("publish release");
         assert!(
             wait_for(&fired, "action:send_message", Duration::from_secs(10)).await,
@@ -853,8 +845,8 @@ mod tests {
 
         // 3. A kind-7 reaction → reaction_added fires.
         fired.lock().unwrap().clear();
-        let react = nostr_sdk::nostr::EventBuilder::new(nostr_sdk::nostr::Kind::from_u16(7), "+")
-            .sign_with_keys(&keys)
+        let react = EventBuilder::new(Kind::from_u16(7), "+")
+            .finalize(&keys)
             .expect("sign");
         bus.publish(react).await.expect("publish reaction");
         assert!(
@@ -865,31 +857,24 @@ mod tests {
         // 4. Loop prevention end-to-end: a WORKFLOW-EMITTED (stamped) kind-14
         //    does NOT fire message_posted; a user kind-14 does.
         fired.lock().unwrap().clear();
-        let stamped = nostr_sdk::nostr::EventBuilder::new(
-            nostr_sdk::nostr::Kind::from_u16(14),
-            "workflow ack",
-        )
-        .tags(vec![
-            t_demo.clone(),
-            nostr_sdk::nostr::Tag::parse([
-                "t",
-                toron_workflow::trigger_filter::WORKFLOW_EMITTED_TAG,
+        let stamped = EventBuilder::new(Kind::from_u16(14), "workflow ack")
+            .tags(vec![
+                t_demo.clone(),
+                Tag::parse(["t", toron_workflow::trigger_filter::WORKFLOW_EMITTED_TAG])
+                    .expect("stamp"),
             ])
-            .expect("stamp"),
-        ])
-        .sign_with_keys(&keys)
-        .expect("sign");
+            .finalize(&keys)
+            .expect("sign");
         bus.publish(stamped).await.expect("publish stamped");
         assert!(
             absent_for(&fired, "action:send_message", Duration::from_millis(800)).await,
             "stamped workflow-emitted message must NOT re-trigger: {fired:?}"
         );
 
-        let user_msg =
-            nostr_sdk::nostr::EventBuilder::new(nostr_sdk::nostr::Kind::from_u16(14), "user hello")
-                .tags(vec![t_demo])
-                .sign_with_keys(&keys)
-                .expect("sign");
+        let user_msg = EventBuilder::new(Kind::from_u16(14), "user hello")
+            .tags(vec![t_demo])
+            .finalize(&keys)
+            .expect("sign");
         bus.publish(user_msg).await.expect("publish user msg");
         assert!(
             wait_for(&fired, "action:send_message", Duration::from_secs(10)).await,
@@ -1050,7 +1035,14 @@ mod tests {
                         == Some(toron_workflow::trigger_filter::WORKFLOW_EMITTED_TAG)
             });
             assert!(has_stamp, "workflow-originated rumor carries the stamp");
-            let rumor = unsigned.sign(&recv_keys).await.expect("sign rumor");
+            // 0.45 UnsignedEvent::finalize signs the rumor's existing pubkey;
+            // the recipient key cannot finalize a sender rumor. Rebuild so
+            // the filter sees the same kind + stamp tags.
+            let rumor = EventBuilder::new(unsigned.kind, unsigned.content.clone())
+                .tags(unsigned.tags)
+                .custom_created_at(unsigned.created_at)
+                .finalize(&recv_keys)
+                .expect("sign rumor for filter check");
             assert!(
                 !should_evaluate_trigger_event(&rumor),
                 "stamped rumor must not re-trigger a workflow"
@@ -1093,7 +1085,7 @@ mod tests {
 
         // Cap-3 coalescer: the third DispatchJob mention flushes NOW through
         // the runner (the host's tick never sees it).
-        let signer = nostr_sdk::nostr::Keys::generate();
+        let signer = Keys::generate();
         let coalescer = Arc::new(std::sync::Mutex::new(MentionCoalescer::new(
             std::time::Duration::from_secs(2),
             std::time::Duration::from_millis(500),
@@ -1201,11 +1193,7 @@ mod tests {
 
         // Default window semantics (2s window, 500ms sub-window, cap 64).
         let coalescer = Arc::new(std::sync::Mutex::new(MentionCoalescer::from_env()));
-        let runner = mailbox_runner(
-            mailbox,
-            coalescer.clone(),
-            Some(nostr_sdk::nostr::Keys::generate()),
-        );
+        let runner = mailbox_runner(mailbox, coalescer.clone(), Some(Keys::generate()));
 
         // Fire 100 DispatchJob mentions from 8 threads (barrier-synced).
         let barrier = Arc::new(std::sync::Barrier::new(8));
@@ -1233,7 +1221,7 @@ mod tests {
         // window flushes are exercised by the coalescer itself in unit tests).
         let replay = toron_core::mailbox::collect_replay(
             bus.as_ref(),
-            toron_core::bus::Filter::new().kinds([nostr_sdk::nostr::Kind::from_u16(43001)]),
+            toron_core::bus::Filter::new().kinds([Kind::from_u16(43001)]),
         )
         .await
         .expect("replay");
@@ -1401,10 +1389,7 @@ steps:
             toron_core::mailbox::collect_replay(bus.as_ref(), toron_core::bus::Filter::new())
                 .await
                 .expect("replay");
-        let wraps = replay
-            .iter()
-            .filter(|e| e.kind == nostr_sdk::nostr::Kind::GiftWrap)
-            .count();
+        let wraps = replay.iter().filter(|e| e.kind == Kind::GiftWrap).count();
         assert_eq!(wraps, CONCURRENCY, "one wrap per concurrent send");
 
         let _ = std::fs::remove_dir_all(&data_dir);
@@ -1422,7 +1407,7 @@ steps:
     impl Bus for SlowBus {
         async fn publish(
             &self,
-            event: nostr_sdk::nostr::Event,
+            event: Event,
         ) -> Result<toron_core::bus::PublishOk, toron_core::bus::BusError> {
             tokio::time::sleep(self.sleep).await;
             self.inner.publish(event).await
@@ -1492,11 +1477,7 @@ steps:
             std::time::Duration::from_millis(500),
             3,
         )));
-        let runner = mailbox_runner(
-            mailbox.clone(),
-            coalescer.clone(),
-            Some(nostr_sdk::nostr::Keys::generate()),
-        );
+        let runner = mailbox_runner(mailbox.clone(), coalescer.clone(), Some(Keys::generate()));
 
         let dispatch = |runner: &ActionRunner, assignee: &str, text: &str| {
             runner(&Action::DispatchJob {
@@ -1563,11 +1544,7 @@ steps:
             let mailbox =
                 Arc::new(Mailbox::new(bus, data_dir, None).with_agent_passphrase("poison-pass"));
             let coalescer = Arc::new(std::sync::Mutex::new(MentionCoalescer::from_env()));
-            let runner = mailbox_runner(
-                mailbox.clone(),
-                coalescer.clone(),
-                Some(nostr_sdk::nostr::Keys::generate()),
-            );
+            let runner = mailbox_runner(mailbox.clone(), coalescer.clone(), Some(Keys::generate()));
             (runner, coalescer)
         });
 

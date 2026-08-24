@@ -11,6 +11,8 @@ informed: flywheel maintainers; skill owners (toron, flywheel, swarm)
 
 **Status:** Accepted (2026-08-15). Wave 1 verified: SC-27..33 green; CLI
 `channel`/`job`/`react`/`presence`/`watch` shipped; MCP tool count stays 39.
+**Amended by:** [ADR-0023](0023-nip29-group-metadata-kinds.md) (2026-08-24) —
+create/close emit **39000**, join/leave emit **39002**; 40/41 ingest-only.
 **Date:** 2026-08-15
 **Decision-makers:** Captain (bangedorrunt)
 **Extends:** [ADR-0003](0003-nostr-mailbox-fabric.md) (Nostr fabric, SC-9/SC-13), [ADR-0004](0004-operational-hardening.md) (Buzz learnings), [ADR-0014](0014-kind-registry-specification.md)

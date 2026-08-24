@@ -13,7 +13,7 @@
 //! - The index mirrors membership in `products` + `product_projects` for fast
 //!   fan-out (oc-b schema).
 
-use nostr_sdk::nostr::{PublicKey, Tag, Timestamp};
+use crate::nostr::{PublicKey, Tag, Timestamp};
 use sqlx::Row;
 
 use crate::bus::filter::ToronFilter;
@@ -266,10 +266,7 @@ impl Mailbox {
     /// store within the same second. Resolve deterministically by
     /// `(created_at, member-count)` — a later link carries strictly more
     /// member `a`-tags, so the highest member count is the newest state.
-    async fn find_product(
-        &self,
-        product_key: &str,
-    ) -> anyhow::Result<Option<nostr_sdk::nostr::Event>> {
+    async fn find_product(&self, product_key: &str) -> anyhow::Result<Option<crate::nostr::Event>> {
         let filter = ToronFilter::new()
             .kinds([toron_kind(PRODUCT_MANIFEST)])
             .build();
@@ -359,7 +356,7 @@ impl Mailbox {
 }
 
 /// Member projects from a product manifest's `a` tags (coordinate 30010).
-fn member_projects_of(ev: &nostr_sdk::nostr::Event) -> Vec<String> {
+fn member_projects_of(ev: &crate::nostr::Event) -> Vec<String> {
     ev.tags
         .iter()
         .filter_map(|t| {
@@ -382,7 +379,7 @@ fn member_projects_of(ev: &nostr_sdk::nostr::Event) -> Vec<String> {
 }
 
 /// Parse the product name from a kind-30011 manifest's JSON content.
-fn parse_product_name(ev: &nostr_sdk::nostr::Event) -> Option<String> {
+fn parse_product_name(ev: &crate::nostr::Event) -> Option<String> {
     serde_json::from_str::<serde_json::Value>(&ev.content)
         .ok()
         .and_then(|v| {

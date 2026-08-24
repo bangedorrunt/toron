@@ -26,6 +26,7 @@ This directory contains records of the major architectural decisions made for th
 | [0020](0020-nostr-two-plane-cli-and-crew-steering.md) | Nostr Two-Plane Surface (CLI-first) and Crew-to-Crew Steering | **Accepted** (2026-08-15; SC-27..33 green; CLI `channel`/`job`/`react`/`presence`/`watch`; MCP stays 39) |
 | [0021](0021-nip06-hierarchical-keys.md) | NIP-06 Hierarchical Agent Keys — One scrypt Total? | **Rejected** (2026-08-18; identity continuity unmaintainable for 119 production keys, residual cost bounded by lazy-unwrap + KDF cache, single-master compromise is structural; revisit trigger recorded) |
 | [0022](0022-phase-native-orchestration.md) | Phase-Native Orchestration — typed JobSpec, harness phase mechanics, one durable execution rail | **Accepted** (2026-08-21; W1–W7 waves incl. compose versatility ladder (§3.6) + stage registry (§3.8) + persist/delegation (§3.7); extends ADR-0005 Spec 2 + ADR-0010; closes bd-dispatch-spec-untyped-0iud + bd-compose-not-durable-oxjy; compose + steer route through `engine.invoke`) |
+| [0023](0023-nip29-group-metadata-kinds.md) | Adopt NIP-29 39000/39002; retire 40/41 to ingest-only | **Accepted** (2026-08-24; ADR-0020 wave 2; ChannelStore stays the gate; no 9000–9008 admin) |
 
 ## Parity catalogs
 

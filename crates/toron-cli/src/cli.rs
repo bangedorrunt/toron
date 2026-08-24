@@ -122,7 +122,7 @@ pub enum Command {
     // --- two-plane shared surface (ADR-0020 Spec 2): the Nostr plane as CLI.
     // Plane S (shared rooms, kind 9/7), J (jobs 43001-43006), N (presence
     // 20001), W (watch/NIP-01 REQ). CLI-first; the MCP cluster stays frozen.
-    /// NIP-29 channels: create/join/leave/close/purge/list/members/post/read
+    /// NIP-29 channels: create/join/leave/close/purge/list/members/post/read (39000/39002 + kind 9)
     /// (plane S; lifecycle open -> closed -> purged).
     #[command(subcommand)]
     Channel(ChannelCommand),

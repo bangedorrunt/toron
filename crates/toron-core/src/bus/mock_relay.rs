@@ -20,9 +20,9 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use futures_util::{SinkExt, StreamExt};
 
-use nostr_sdk::nostr::message::client::ClientMessage;
-use nostr_sdk::nostr::message::relay::RelayMessage;
-use nostr_sdk::nostr::{Event, Filter, JsonUtil, SubscriptionId};
+use crate::nostr::{Event, Filter, SubscriptionId};
+use ::nostr::message::client::ClientMessage;
+use ::nostr::message::relay::RelayMessage;
 
 /// In-memory relay state shared across connections.
 #[derive(Default)]

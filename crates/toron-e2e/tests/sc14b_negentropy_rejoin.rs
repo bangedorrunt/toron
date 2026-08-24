@@ -35,8 +35,7 @@ async fn sc14b_negentropy_rejoin_transfers_only_missing() {
     let mut events = Vec::new();
     for i in 0..5 {
         let evt = EventBuilder::new(Kind::TextNote, format!("msg-{i}"))
-            .sign(&key)
-            .await
+            .finalize(&key)
             .expect("sign");
         assert!(relay_store.insert(&evt).await.expect("relay insert"));
         events.push(evt);
@@ -84,8 +83,7 @@ async fn sc14b_no_delta_when_consistent() {
     let key = Keys::generate();
     for i in 0..4 {
         let evt = EventBuilder::new(Kind::TextNote, format!("n-{i}"))
-            .sign(&key)
-            .await
+            .finalize(&key)
             .expect("sign");
         relay_store.insert(&evt).await.expect("relay");
         node_store.insert(&evt).await.expect("node");

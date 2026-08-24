@@ -16,7 +16,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use nostr_sdk::nostr::{Event, EventId, JsonUtil, Kind, Tag, Timestamp};
+use nostr::prelude::{Event, EventId, Keys, Kind, Tag, Timestamp};
 
 use toron_core::nostr::event::build_event;
 use toron_core::nostr::kinds::{
@@ -68,11 +68,11 @@ pub struct JobError {
 /// triggering message (per beads-review: channel-agnostic; the parent may be a
 /// kind-14 DM or kind-9 channel message).
 pub fn build_job_request(
-    requester: &nostr_sdk::nostr::Keys,
+    requester: &Keys,
     parent: EventId,
     payload: &JobRequest,
     created_at: Timestamp,
-) -> Result<Event, nostr_sdk::nostr::event::builder::Error> {
+) -> Result<Event, nostr::error::Error> {
     build_job_request_with_tags(requester, Some(parent), payload, created_at, Vec::new())
 }
 
@@ -80,12 +80,12 @@ pub fn build_job_request(
 /// workflow host stamps coalesced 43001s with `toron:workflow-emitted`).
 /// `parent` is optional — coalesced bursts may lack a parseable parent id.
 pub fn build_job_request_with_tags(
-    requester: &nostr_sdk::nostr::Keys,
+    requester: &Keys,
     parent: Option<EventId>,
     payload: &JobRequest,
     created_at: Timestamp,
     extra_tags: Vec<Tag>,
-) -> Result<Event, nostr_sdk::nostr::event::builder::Error> {
+) -> Result<Event, nostr::error::Error> {
     let mut tags: Vec<Tag> = Vec::new();
     if let Some(parent) = parent {
         tags.push(Tag::event(parent));
@@ -108,10 +108,10 @@ pub fn build_job_request_with_tags(
 
 /// Build a job claim (kind-43002) referencing the job request via `e`.
 pub fn build_job_claim(
-    claimer: &nostr_sdk::nostr::Keys,
+    claimer: &Keys,
     job_request: EventId,
     created_at: Timestamp,
-) -> Result<Event, nostr_sdk::nostr::event::builder::Error> {
+) -> Result<Event, nostr::error::Error> {
     build_event(
         claimer,
         toron_kind(JOB_ACCEPTED),
@@ -123,11 +123,11 @@ pub fn build_job_claim(
 
 /// Build a job progress update (kind-43003, optional).
 pub fn build_job_progress(
-    agent: &nostr_sdk::nostr::Keys,
+    agent: &Keys,
     job_request: EventId,
     note: &str,
     created_at: Timestamp,
-) -> Result<Event, nostr_sdk::nostr::event::builder::Error> {
+) -> Result<Event, nostr::error::Error> {
     build_event(
         agent,
         toron_kind(JOB_PROGRESS),
@@ -139,11 +139,11 @@ pub fn build_job_progress(
 
 /// Build a job result (kind-43004) closing the lifecycle.
 pub fn build_job_result(
-    agent: &nostr_sdk::nostr::Keys,
+    agent: &Keys,
     job_request: EventId,
     result: &JobResult,
     created_at: Timestamp,
-) -> Result<Event, nostr_sdk::nostr::event::builder::Error> {
+) -> Result<Event, nostr::error::Error> {
     build_event(
         agent,
         toron_kind(JOB_RESULT),
@@ -155,11 +155,11 @@ pub fn build_job_result(
 
 /// Build a job cancel (kind-43005).
 pub fn build_job_cancel(
-    canceller: &nostr_sdk::nostr::Keys,
+    canceller: &Keys,
     job_request: EventId,
     reason: &str,
     created_at: Timestamp,
-) -> Result<Event, nostr_sdk::nostr::event::builder::Error> {
+) -> Result<Event, nostr::error::Error> {
     build_event(
         canceller,
         toron_kind(JOB_CANCEL),
@@ -171,11 +171,11 @@ pub fn build_job_cancel(
 
 /// Build a job error (kind-43006) — failed-with-error terminal state.
 pub fn build_job_error(
-    agent: &nostr_sdk::nostr::Keys,
+    agent: &Keys,
     job_request: EventId,
     error: &JobError,
     created_at: Timestamp,
-) -> Result<Event, nostr_sdk::nostr::event::builder::Error> {
+) -> Result<Event, nostr::error::Error> {
     build_event(
         agent,
         toron_kind(JOB_ERROR),
@@ -269,11 +269,11 @@ pub fn job_request_json(event: &Event) -> String {
 
 /// Convenience: build a job request event and serialize (round-trip helper).
 pub fn build_and_serialize(
-    requester: &nostr_sdk::nostr::Keys,
+    requester: &Keys,
     parent: EventId,
     payload: &JobRequest,
     created_at: Timestamp,
-) -> Result<String, nostr_sdk::nostr::event::builder::Error> {
+) -> Result<String, nostr::error::Error> {
     build_job_request(requester, parent, payload, created_at).map(|e| e.as_json())
 }
 
@@ -326,7 +326,7 @@ impl ComposeRequestSpec {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nostr_sdk::nostr::{Keys, Timestamp};
+    use nostr::prelude::{Keys, Timestamp};
 
     const TS: u64 = 1_700_000_000;
 

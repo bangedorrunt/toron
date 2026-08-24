@@ -700,7 +700,7 @@ steps:
         // Count kind-1059 gift wraps on the bus: exactly the user send + the
         // stamped workflow ack — never a third (self-loop would add more).
         let mut sub = bus
-            .subscribe(toron_core::bus::Filter::new().kinds([nostr_sdk::nostr::Kind::GiftWrap]))
+            .subscribe(toron_core::bus::Filter::new().kinds([toron_core::nostr::Kind::GiftWrap]))
             .await
             .expect("subscribe");
         let mut wraps = 0u32;

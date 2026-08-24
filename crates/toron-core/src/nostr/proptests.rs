@@ -9,8 +9,9 @@
 
 #[cfg(test)]
 mod tests {
-    use nostr_sdk::nostr::event::id::EventId;
-    use nostr_sdk::nostr::{Event, JsonUtil, Keys, Kind, Tag, Timestamp};
+    use crate::nostr::EventId;
+    use crate::nostr::{Event, Keys, Kind, Tag, Timestamp};
+    use ::nostr::event::FinalizeEvent;
     use proptest::prelude::*;
 
     use crate::nostr::event::{build_event, verify_event};
@@ -113,7 +114,6 @@ mod tests {
             // Property: wrap → unwrap recovers the exact rumor for arbitrary
             // plaintext (the envelope is opaque; the secret is not the
             // envelope content in the clear).
-            let rt = tokio::runtime::Runtime::new().expect("rt");
             let sender = Keys::generate();
             let recipient = Keys::generate();
             let rumor = gift_wrap::build_rumor(
@@ -123,7 +123,7 @@ mod tests {
                 Vec::<Tag>::new(),
                 secret.clone(),
             );
-            let wrapped = rt.block_on(gift_wrap::gift_wrap(&sender, &recipient.public_key(), rumor)).expect("wrap");
+            let wrapped = gift_wrap::gift_wrap(&sender, &recipient.public_key(), rumor).expect("wrap");
             prop_assert_ne!(&wrapped.content, &secret, "envelope content is not the plaintext");
             let unwrapped = gift_wrap::unwrap(&recipient, &wrapped).expect("unwrap");
             prop_assert_eq!(unwrapped.rumor.content, secret);
@@ -136,7 +136,6 @@ mod tests {
             // Property (P5 bd-p5-crypto-property-tests-2qvs): the kind-13
             // SEAL layer alone — sender signs, recipient decrypts — recovers
             // the exact rumor for arbitrary content.
-            let rt = tokio::runtime::Runtime::new().expect("rt");
             let sender = Keys::generate();
             let recipient = Keys::generate();
             let rumor = gift_wrap::build_rumor(
@@ -146,18 +145,12 @@ mod tests {
                 Vec::<Tag>::new(),
                 secret.clone(),
             );
-            let seal = rt
-                .block_on(async {
-                    nostr_sdk::nostr::EventBuilder::seal(
-                        &sender,
-                        &recipient.public_key(),
-                        rumor.clone(),
-                    )
-                    .await
-                })
-                .expect("seal builder")
-                .sign_with_keys(&sender)
-                .expect("sign seal");
+            let seal = ::nostr::nips::nip59::GiftWrapSealBuilder::new(
+                rumor.clone(),
+                recipient.public_key(),
+            )
+            .finalize(&sender)
+            .expect("sign seal");
             // Recipient decrypts the seal content → the exact rumor JSON.
             let plain = gift_wrap::decrypt(
                 recipient.secret_key(),
@@ -166,7 +159,7 @@ mod tests {
             )
             .expect("recipient decrypts seal");
             let recovered =
-                nostr_sdk::nostr::event::unsigned::UnsignedEvent::from_json(plain)
+                crate::nostr::UnsignedEvent::from_json(plain)
                     .expect("rumor json");
             prop_assert_eq!(recovered.content, secret);
             prop_assert_eq!(recovered.pubkey, rumor.pubkey, "author preserved");
@@ -179,7 +172,6 @@ mod tests {
         ) {
             // Property: a gift wrap addressed to A can never be unwrapped by
             // B for arbitrary content.
-            let rt = tokio::runtime::Runtime::new().expect("rt");
             let sender = Keys::generate();
             let recipient = Keys::generate();
             let stranger = Keys::generate();
@@ -190,7 +182,7 @@ mod tests {
                 Vec::<Tag>::new(),
                 secret,
             );
-            let wrapped = rt.block_on(gift_wrap::gift_wrap(&sender, &recipient.public_key(), rumor)).expect("wrap");
+            let wrapped = gift_wrap::gift_wrap(&sender, &recipient.public_key(), rumor).expect("wrap");
             prop_assert!(gift_wrap::unwrap(&stranger, &wrapped).is_err());
         }
 
@@ -200,7 +192,6 @@ mod tests {
         ) {
             // Property: a seal signed by Y wrapping a rumor authored by X is
             // rejected (NIP-59 SenderMismatch) for arbitrary content.
-            let rt = tokio::runtime::Runtime::new().expect("rt");
             let signer = Keys::generate();
             let rumor_author = Keys::generate();
             let recipient = Keys::generate();
@@ -211,20 +202,23 @@ mod tests {
                 Vec::<Tag>::new(),
                 secret,
             );
-            let seal = rt
-                .block_on(async {
-                    nostr_sdk::nostr::EventBuilder::seal(&signer, &recipient.public_key(), rumor)
-                        .await
-                })
-                .expect("seal builder")
-                .sign_with_keys(&signer)
-                .expect("sign seal");
-            let wrapped = nostr_sdk::nostr::EventBuilder::gift_wrap_from_seal(
-                &recipient.public_key(),
-                &seal,
-                Vec::<Tag>::new(),
+            let seal = ::nostr::nips::nip59::GiftWrapSealBuilder::new(
+                rumor,
+                recipient.public_key(),
             )
-            .expect("wrap from seal");
+            .finalize(&signer)
+            .expect("sign seal");
+            let ephemeral = Keys::generate();
+            let content = gift_wrap::encrypt(
+                ephemeral.secret_key(),
+                &recipient.public_key(),
+                seal.as_json(),
+            )
+            .expect("encrypt seal");
+            let wrapped = crate::nostr::EventBuilder::new(Kind::GiftWrap, content)
+                .tag(Tag::public_key(recipient.public_key()))
+                .finalize(&ephemeral)
+                .expect("wrap from seal");
             let err = gift_wrap::unwrap(&recipient, &wrapped).expect_err("must reject");
             prop_assert!(
                 matches!(err, gift_wrap::GiftWrapError::SenderMismatch),

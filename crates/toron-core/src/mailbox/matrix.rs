@@ -16,7 +16,7 @@ use crate::nostr::proof::{
     Attestation, NonceStore, ProofClaim, ProofError, ProofGate, ProofScheme,
     build_attestation_event,
 };
-use nostr_sdk::nostr::{Keys, Timestamp};
+use crate::nostr::{Keys, Timestamp};
 use sqlx::SqlitePool;
 
 /// Run the fail-closed proof matrix. Returns the set of cases that
@@ -82,7 +82,7 @@ pub async fn run_proof_matrix(pool: SqlitePool) -> Vec<String> {
     let att = mk_att(&n, Some(Timestamp::now().as_secs() + 3600));
     let wrong_kind = crate::nostr::event::build_event(
         &anchor,
-        nostr_sdk::nostr::Kind::TextNote,
+        crate::nostr::Kind::TextNote,
         serde_json::to_string(&att).unwrap(),
         vec![],
         Timestamp::now(),
@@ -102,7 +102,7 @@ pub async fn run_proof_matrix(pool: SqlitePool) -> Vec<String> {
     let att = mk_att(&n, Some(Timestamp::now().as_secs() + 3600));
     let valid =
         build_attestation_event(&anchor, &att, "demo", "PiAlpha", Timestamp::now()).expect("proof");
-    let forged = nostr_sdk::nostr::Event::new(
+    let forged = crate::nostr::Event::new(
         valid.id,
         valid.pubkey,
         valid.created_at,

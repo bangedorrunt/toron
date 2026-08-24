@@ -9,13 +9,13 @@
 //! InProcessBus uses `#t=[slug]`; relay-crossing kinds additionally carry
 //! NIP-32 labels `["l", slug, "toron"]` (`#l`).
 
-use nostr_sdk::nostr::{Alphabet, Kind, PublicKey, SingleLetterTag, Timestamp};
+use crate::nostr::{Kind, PublicKey, SingleLetterTag, Timestamp};
 
 /// The NIP-32 label namespace toron uses (ADR-0003 A3).
 pub const LABEL_NAMESPACE: &str = "toron";
 
 /// Re-export of the underlying NIP-01 filter type.
-pub use nostr_sdk::nostr::Filter;
+pub use crate::nostr::Filter;
 
 /// A label value in NIP-32 `["l", <value>, "toron"]` form.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,7 +51,7 @@ pub fn project_filter(slug: &str) -> Filter {
 /// Use for relay-crossing queries and federation, where bare `#t` collides
 /// with other applications (ADR-0003 A3).
 pub fn project_label_filter(slug: &str) -> Filter {
-    let tag = SingleLetterTag::lowercase(Alphabet::L);
+    let tag = SingleLetterTag::LOWERCASE_L;
     Filter::new().custom_tag(tag, slug)
 }
 
@@ -92,7 +92,7 @@ impl ToronFilter {
     }
 
     /// Add `#e` event reference.
-    pub fn event(mut self, id: nostr_sdk::nostr::EventId) -> Self {
+    pub fn event(mut self, id: crate::nostr::EventId) -> Self {
         self.inner = self.inner.event(id);
         self
     }
@@ -113,7 +113,7 @@ impl ToronFilter {
     pub fn label(mut self, label: &LabelValue) -> Self {
         self.inner = self
             .inner
-            .custom_tag(SingleLetterTag::lowercase(Alphabet::L), label.value.clone());
+            .custom_tag(SingleLetterTag::LOWERCASE_L, label.value.clone());
         self
     }
 
@@ -151,13 +151,13 @@ mod tests {
     use super::*;
     use crate::nostr::event::build_event;
     use crate::nostr::kinds::{AGENT_PROFILE, PROJECT_MANIFEST};
-    use nostr_sdk::nostr::{Keys, Kind, Tag, Timestamp};
+    use crate::nostr::{Keys, Kind, Tag, Timestamp};
 
     fn keys() -> Keys {
         Keys::generate()
     }
 
-    fn ev_with_t(keys: &Keys, slug: &str) -> nostr_sdk::nostr::Event {
+    fn ev_with_t(keys: &Keys, slug: &str) -> crate::nostr::Event {
         build_event(
             keys,
             crate::nostr::kinds::toron_kind(PROJECT_MANIFEST),
@@ -168,7 +168,7 @@ mod tests {
         .expect("build")
     }
 
-    fn ev_with_label(keys: &Keys, slug: &str) -> nostr_sdk::nostr::Event {
+    fn ev_with_label(keys: &Keys, slug: &str) -> crate::nostr::Event {
         build_event(
             keys,
             crate::nostr::kinds::toron_kind(PROJECT_MANIFEST),

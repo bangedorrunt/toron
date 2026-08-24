@@ -1,9 +1,10 @@
-// governed-by: ADR-0003, ADR-0007
+// governed-by: ADR-0003, ADR-0007, ADR-0023
 
 # ADR-0014: Kind Registry Specification
 
 **Status:** Accepted (2026-08-14)
 **Amends:** ADR-0003 (§ kind registry)
+**Amended by:** [ADR-0023](0023-nip29-group-metadata-kinds.md) (39000/39002 emit; 40/41/42 ingest-only)
 
 ## Context
 
@@ -28,9 +29,16 @@ This ADR formalizes the registry as a specification, not just a frozen list.
 |------|------|------|-------|-------------|-----------|
 | 30010 | Project manifest | Identity | project slug | — | static (kind-30010 create; immutable) |
 | 30011 | Product manifest | Identity | product key | — | static; a-tag links member projects |
-| 30013 | Agent profile | Identity | agent npub | — | static; content-map carries behavior/skills |
+| 30013 | Agent profile | Identity | `project-slug:name` | — | addressable; latest per d-tag (code; not npub) |
 | 30014 | Contact policy | Identity | agent npub | `open\|auto\|contacts_only\|block_all` | upsert (latest wins) |
-| 30031 | File reservation | Reservation | `<kind>:<author>` | `intent\|held\|released\|revoked` | addressable; latest wins; dedup per (kind, author, d-tag) |
+| 30031 | File reservation | Reservation | `project:path-glob` (code) | `intent\|held\|released\|revoked` | addressable; latest wins; dedup per (kind, author, d-tag) |
+| 7 | Reaction | Shared plane | — | — | NIP-25; `e`+`p`+`k`+`h` |
+| 9 | Channel post | Shared plane | — | — | NIP-29 chat; `h`=channel, `t`=project, `p`=mentions |
+| 39000 | Group metadata | Shared plane | channel id | `closed` | NIP-29; create/close; addressable (ADR-0023) |
+| 39002 | Group members | Shared plane | channel id | — | NIP-29; `p`=members snapshot (ADR-0023) |
+| 40 | Channel create (legacy) | Shared plane | channel id | — | NIP-28; ingest only |
+| 41 | Channel metadata (legacy) | Shared plane | — | — | NIP-28 join/leave/close; ingest only |
+| 42 | Channel post (legacy) | Shared plane | — | — | Pre-ADR-0020; ingest only |
 | 43001 | Job request | Job | job id | — | request → 43002 (claim) → 43003 (progress) → 43004 (result) |
 | 43002 | Job accepted | Job | job id | — | signed claim; first-claimer wins |
 | 43003 | Job progress | Job | job id | — | optional; informational |

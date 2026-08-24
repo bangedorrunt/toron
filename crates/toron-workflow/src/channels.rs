@@ -1,16 +1,17 @@
 // governed-by: ADR-0003
 // governed-by: ADR-0020
+// governed-by: ADR-0023
 #![forbid(unsafe_code)]
 
 //! NIP-29 channels (bd-aws): membership-only access gate + global-sub
 //! exclusion. toron-superset (Buzz-grade collaboration), not AM-Rust parity.
 //!
-//! Wire (ADR-0003 Phase 2 / ADR-0020):
-//! - kind 40 channel-create (`d`=channel-id, `h`=channel-id)
-//! - kind 41 channel-metadata (`h`)
+//! Wire (ADR-0003 Phase 2 / ADR-0020 / ADR-0023):
+//! - kind **39000** group metadata (`d`=`h`=channel-id; create/close)
+//! - kind **39002** group members (`d`=`h`; `p`=each member)
 //! - kind **9** channel-message (`h`, `t`=project slug, `p` for @mentions)
-//! - kind 42 legacy ingest only
-//! - kind 7 reaction (`h`)
+//! - kind 40/41/42 legacy ingest only
+//! - kind 7 reaction (`h`, `p`, `k`)
 //!
 //! **Membership is the only gate.** Enforcement lives at the same point as
 //! contact policies (G14, bd-led.4.4) and the Buzz access-gated fanout
@@ -26,15 +27,19 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
-use nostr_sdk::nostr::{Event, EventId, Keys, PublicKey, Tag, Timestamp};
+use nostr::prelude::{Event, EventId, Keys, PublicKey, Tag, Timestamp};
 
 use toron_core::nostr::event::build_event;
 use toron_core::nostr::kinds::toron_kind;
 
-/// NIP-29 channel-create kind (40). Store-local create; optional 39000 later.
-pub const CHANNEL_CREATE: u16 = 40;
-/// NIP-29 channel-metadata kind (41).
-pub const CHANNEL_METADATA: u16 = 41;
+/// NIP-29 group metadata (ADR-0023). Addressable create/close.
+pub const CHANNEL_CREATE: u16 = 39000;
+/// NIP-29 group members snapshot (ADR-0023).
+pub const CHANNEL_MEMBERS: u16 = 39002;
+/// Pre-ADR-0023 NIP-28 create. Ingest only.
+pub const CHANNEL_CREATE_LEGACY: u16 = 40;
+/// Pre-ADR-0023 NIP-28 join/leave/close. Ingest only.
+pub const CHANNEL_METADATA_LEGACY: u16 = 41;
 /// Canonical channel post (ADR-0003 / ADR-0020). NIP-29 group chat.
 pub const CHANNEL_MESSAGE: u16 = 9;
 /// Legacy emit (pre-ADR-0020). Ingest only.
@@ -233,6 +238,21 @@ impl ChannelStore {
         Ok(())
     }
 
+    /// Replace the member set from a kind-39002 snapshot (ADR-0023).
+    pub fn replace_members(
+        &self,
+        channel_id: &str,
+        members: impl IntoIterator<Item = String>,
+    ) -> anyhow::Result<()> {
+        let mut inner = self.inner.lock();
+        let ch = inner
+            .channels
+            .get_mut(channel_id)
+            .ok_or_else(|| anyhow::anyhow!("channel not found: {channel_id}"))?;
+        ch.members = members.into_iter().collect();
+        Ok(())
+    }
+
     /// Is `npub` a member of the channel?
     pub fn is_member(&self, channel_id: &str, npub: &PublicKey) -> bool {
         self.inner
@@ -365,16 +385,25 @@ impl ChannelStore {
         self.require_member(channel_id, &author_pk)?;
         let message = EventId::from_hex(message_id)
             .map_err(|_| anyhow::anyhow!("bad message id {message_id}"))?;
-        let ev = build_event(
-            author,
-            toron_kind(REACTION),
-            emoji,
-            vec![
-                Tag::parse(["h", channel_id]).expect("h"),
-                Tag::event(message),
-            ],
-            Timestamp::now(),
-        )?;
+        let target = self
+            .inner
+            .lock()
+            .events
+            .iter()
+            .find(|e| e.event_id == message_id)
+            .cloned()
+            .ok_or_else(|| {
+                anyhow::anyhow!("unknown message {message_id} in channel {channel_id}")
+            })?;
+        let target_pk = PublicKey::from_hex(&target.author)
+            .map_err(|e| anyhow::anyhow!("bad target author {}: {e}", target.author))?;
+        let tags = vec![
+            Tag::parse(["h", channel_id]).expect("h"),
+            Tag::event(message),
+            Tag::public_key(target_pk),
+            Tag::parse(["k", &target.kind.to_string()]).expect("k"),
+        ];
+        let ev = build_event(author, toron_kind(REACTION), emoji, tags, Timestamp::now())?;
         self.inner.lock().events.push(ChannelEvent {
             channel_id: channel_id.to_string(),
             event_id: ev.id.to_hex(),
@@ -579,6 +608,10 @@ mod tests {
             .expect("create");
         let ev = store.post(&alice, "room", "hello", &[]).expect("post");
         assert_eq!(ev.kind.as_u16(), 9, "ADR-0020 emit is kind 9");
+        assert_eq!(CHANNEL_CREATE, 39000, "ADR-0023 emit is kind 39000");
+        assert_eq!(CHANNEL_MEMBERS, 39002);
+        assert_eq!(CHANNEL_CREATE_LEGACY, 40);
+        assert_eq!(CHANNEL_METADATA_LEGACY, 41);
         assert_eq!(CHANNEL_MESSAGE, 9);
         assert_eq!(CHANNEL_MESSAGE_LEGACY, 42);
         let has_t = ev.tags.iter().any(|t| format!("{t:?}").contains("toron"));
@@ -589,13 +622,38 @@ mod tests {
     fn reaction_membership_gated() {
         let store = ChannelStore::new();
         let alice = keys();
+        let bob = keys();
         let mallory = keys();
         store
             .create_channel(&alice.public_key(), "c1", "C", false, None)
             .expect("create");
+        store.join("c1", &bob.public_key()).expect("join bob");
         let post = store.post(&alice, "c1", "hello", &[]).expect("post");
+        let alice_hex = alice.public_key().to_hex();
 
-        assert!(store.react(&alice, "c1", &post.id.to_hex(), "+1").is_ok());
+        let reaction = store
+            .react(&bob, "c1", &post.id.to_hex(), "+1")
+            .expect("member may react");
+        assert_eq!(reaction.kind.as_u16(), REACTION);
+        let parts: Vec<Vec<String>> = reaction
+            .tags
+            .iter()
+            .map(|t| t.as_slice().iter().map(|s| s.to_string()).collect())
+            .collect();
+        assert!(
+            parts
+                .iter()
+                .any(|t| t.first().map(String::as_str) == Some("p")
+                    && t.get(1).map(String::as_str) == Some(alice_hex.as_str())),
+            "NIP-25 p tag (target author) missing: {parts:?}"
+        );
+        assert!(
+            parts
+                .iter()
+                .any(|t| t.first().map(String::as_str) == Some("k")
+                    && t.get(1).map(String::as_str) == Some("9")),
+            "NIP-25 k tag (target kind) missing: {parts:?}"
+        );
         assert!(
             store
                 .react(&mallory, "c1", &post.id.to_hex(), "+1")

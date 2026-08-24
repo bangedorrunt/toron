@@ -10,7 +10,7 @@
 //! release/revoke transitions) lives in `index::slots`; this module resolves
 //! agent keys, publishes the signed events, and mirrors into the projection.
 
-use nostr_sdk::nostr::{Tag, Timestamp};
+use crate::nostr::{Tag, Timestamp};
 
 use crate::bus::scoping::with_project_scoping;
 use crate::index::slots;

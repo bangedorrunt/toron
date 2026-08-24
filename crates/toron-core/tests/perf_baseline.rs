@@ -16,11 +16,11 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use nostr_sdk::nostr::{Keys, Kind, Tag, Timestamp};
 use toron_core::bus::in_process::{InProcessBus, InProcessBusConfig};
 use toron_core::bus::{Bus, Filter, SubscriptionEvent};
 use toron_core::index::schema;
 use toron_core::mailbox::unwrap::{ProjectionSink, SqliteProjectionSink, UnwrappedMail};
+use toron_core::nostr::{EventId, Keys, Kind, Tag, Timestamp};
 
 fn percentiles(mut samples: Vec<Duration>) -> (Duration, Duration, Duration) {
     samples.sort();
@@ -90,7 +90,7 @@ async fn bus_burst_throughput_and_lag_ceiling() {
     // (sharing the publisher's runtime would starve the drainer during the
     // CPU-bound gift-wrap burst — that's a measurement artifact, not bus lag).
     // Receipts carry the receipt INSTANT so lag is timestamped at receipt.
-    let (lag_tx, lag_rx) = std::sync::mpsc::channel::<(nostr_sdk::nostr::EventId, Instant)>();
+    let (lag_tx, lag_rx) = std::sync::mpsc::channel::<(EventId, Instant)>();
     let drainer = std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -129,7 +129,6 @@ async fn bus_burst_throughput_and_lag_ceiling() {
         );
         wraps.push(
             toron_core::nostr::gift_wrap::gift_wrap(&sender, &recipient.public_key(), rumor)
-                .await
                 .expect("wrap"),
         );
     }

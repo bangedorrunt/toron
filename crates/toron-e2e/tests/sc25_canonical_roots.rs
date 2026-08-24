@@ -232,7 +232,7 @@ async fn sc25_migration_folds_preexisting_path_slug_rows_read_only() {
     let result = toron_core::nostr::identity::create_agent_identity(
         legacy_slug,
         &profile,
-        nostr_sdk::nostr::Timestamp::now(),
+        toron_core::nostr::Timestamp::now(),
     )
     .expect("legacy identity");
     let legacy_key = mailbox
@@ -250,7 +250,7 @@ async fn sc25_migration_folds_preexisting_path_slug_rows_read_only() {
         .publish(result.event)
         .await
         .expect("legacy profile");
-    let now_us = nostr_sdk::nostr::Timestamp::now().as_secs() as i64 * 1_000_000;
+    let now_us = toron_core::nostr::Timestamp::now().as_secs() as i64 * 1_000_000;
     sqlx::query(
         "INSERT INTO agents (project_slug, name, pubkey, program, model, \
          task_description, created_ts_us) VALUES (?1, ?2, ?3, '', '', '', ?4)",

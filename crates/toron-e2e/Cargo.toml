@@ -1,7 +1,7 @@
 # governed-by: ADR-0003
 [package]
 name = "toron-e2e"
-version = "1.1.0"
+version = "1.2.0"
 edition = "2024"
 
 [features]
@@ -18,7 +18,8 @@ p4 = ["p5"]
 toron-core = { path = "../toron-core" }
 toron-workflow = { path = "../toron-workflow" }
 tokio = { version = "1", features = ["full"] }
-nostr-sdk = { version = "0.44", features = ["nip44", "nip59"] }
+nostr-sdk = "0.45.2"
+nostr = { version = "0.45.3", features = ["nip44", "nip59", "os-rng"] }
 uuid = { version = "1", features = ["v4"] }
 anyhow = "1"
 sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio"] }
@@ -27,4 +28,5 @@ resonate-sdk = "0.6"
 resonate-sdk-macros = "0.1"
 
 [dev-dependencies]
-nostr-sdk = { version = "0.44", features = ["nip44", "nip59"] }
+nostr-sdk = "0.45.2"
+nostr = { version = "0.45.3", features = ["nip44", "nip59", "os-rng"] }

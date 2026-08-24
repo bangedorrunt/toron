@@ -24,8 +24,7 @@ async fn publish_subscribe_roundtrip_via_bus() {
     // Kind-14 project event; send on the bus, receive via subscription.
     let event = EventBuilder::new(Kind::TextNote, "hello e2e")
         .tags([Tag::parse(["t", "demo"]).expect("tag")])
-        .sign(&key)
-        .await
+        .finalize(&key)
         .expect("sign");
 
     daemon.send_event(&event).await.expect("publish");

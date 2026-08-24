@@ -18,7 +18,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use nostr_sdk::nostr::{Keys, PublicKey, Tag, Timestamp};
+use crate::nostr::{Keys, PublicKey, Tag, Timestamp};
 use sqlx::Row;
 
 use crate::bus::filter::kind_project_filter;
@@ -370,13 +370,12 @@ impl Mailbox {
         let rumor = crate::nostr::gift_wrap::build_rumor(
             sender.public_key(),
             Timestamp::now(),
-            nostr_sdk::nostr::Kind::PrivateDirectMessage,
+            crate::nostr::Kind::PrivateDirectMessage,
             tags,
             "",
         );
-        let wrap = crate::nostr::gift_wrap::gift_wrap(sender, recipient, rumor)
-            .await
-            .expect("wrap control");
+        let wrap =
+            crate::nostr::gift_wrap::gift_wrap(sender, recipient, rumor).expect("wrap control");
         self.publish_dm(&wrap).await?;
         Ok(())
     }

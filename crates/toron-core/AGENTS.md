@@ -25,6 +25,8 @@ Mailbox fabric: signed events on a `Bus`, projected to SQLite + Git archive.
 - `Mailbox` is the concrete type; `MailSurface` is the embedder trait (ADR-0007).
 - One dedicated SQLite write connection. WAL. i64-µs timestamps.
 - Gift wraps: no project tags. Timeline orders by rumor time, not wrap time.
+  Unwrap verifies the envelope Schnorr sig before NIP-44 decrypt. `gift_wrap`
+  is sync (`GiftWrapBuilder`, rust-nostr 0.45).
 - Presence (kind-20001) is ephemeral — never persist to SQLite or Git.
 - `GitArchive` stages worktree + pending bytes; `commit` builds an in-memory
   tree from fresh HEAD + pending. Never write the live libgit2 index.

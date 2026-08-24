@@ -12,7 +12,7 @@
 //! used on both sides so the fingerprint tree converges. A full-replay
 //! fallback guarantees convergence when negentropy is unavailable or fails.
 
-use nostr_sdk::nostr::{Event, JsonUtil};
+use crate::nostr::Event;
 
 use super::event_store::BusEventStore;
 
@@ -171,7 +171,7 @@ mod tests {
     use super::*;
     use crate::nostr::event::build_event;
     use crate::nostr::kinds::PROJECT_MANIFEST;
-    use nostr_sdk::nostr::{Keys, Tag, Timestamp};
+    use crate::nostr::{Keys, Tag, Timestamp};
 
     async fn temp_store() -> (BusEventStore, std::path::PathBuf) {
         let path = std::env::temp_dir().join(format!("toron-sync-{}.sqlite", uuid::Uuid::new_v4()));

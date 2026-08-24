@@ -18,7 +18,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
-use nostr_sdk::nostr::{Event, Keys};
+use crate::nostr::{Event, Keys};
 
 use crate::bus::{Bus, BusError, Filter, SubscriptionEvent};
 
@@ -170,9 +170,9 @@ impl Mailbox {
     /// for the incremental-fetch gate.
     pub(crate) fn cached_unwrap(
         &self,
-        agent_keys: &nostr_sdk::nostr::Keys,
-        wrap: &nostr_sdk::nostr::Event,
-        recipient: nostr_sdk::nostr::PublicKey,
+        agent_keys: &crate::nostr::Keys,
+        wrap: &crate::nostr::Event,
+        recipient: crate::nostr::PublicKey,
     ) -> Option<crate::mailbox::unwrap::UnwrappedMail> {
         use crate::mailbox::unwrap::UnwrappedMail;
         let key = format!("{}/{}", recipient.to_hex(), wrap.id.to_hex());
@@ -348,7 +348,7 @@ impl Mailbox {
         let mut policy = UnwrapRebuildPolicy::new(Self::UNWRAP_REBUILD_MIN_INTERVAL);
         let mut sub = self
             .bus
-            .subscribe(Filter::new().kinds([nostr_sdk::nostr::Kind::GiftWrap]))
+            .subscribe(Filter::new().kinds([crate::nostr::Kind::GiftWrap]))
             .await
             .map_err(|e| anyhow::anyhow!("bus subscribe: {e}"))?;
         let mut current: Option<(String, UnwrapPipeline)> = None;
@@ -358,7 +358,7 @@ impl Mailbox {
                 continue;
             };
             seen += 1;
-            if event.kind != nostr_sdk::nostr::Kind::GiftWrap {
+            if event.kind != crate::nostr::Kind::GiftWrap {
                 continue;
             }
             let sig = self.local_agent_signature();
@@ -527,7 +527,7 @@ struct MailboxKeyResolver {
 }
 
 impl unwrap::RecipientKeyResolver for MailboxKeyResolver {
-    fn resolve(&self, recipient: &nostr_sdk::nostr::PublicKey) -> Option<Keys> {
+    fn resolve(&self, recipient: &crate::nostr::PublicKey) -> Option<Keys> {
         let hex = recipient.to_hex();
         if let Some((project, name)) = self.npub_to_agent.get(&hex) {
             let path = self.mailbox.agent_key_path(project, name);
@@ -780,15 +780,12 @@ mod tests {
         let agent_keys = mailbox.load_agent_key(&path).expect("disk key");
         let rumor = crate::nostr::gift_wrap::build_rumor(
             sender.public_key(),
-            nostr_sdk::nostr::Timestamp::now(),
-            nostr_sdk::nostr::Kind::PrivateDirectMessage,
-            vec![
-                nostr_sdk::nostr::Tag::parse(["p", &agent_keys.public_key().to_hex()]).expect("p"),
-            ],
+            crate::nostr::Timestamp::now(),
+            crate::nostr::Kind::PrivateDirectMessage,
+            vec![crate::nostr::Tag::parse(["p", &agent_keys.public_key().to_hex()]).expect("p")],
             "hello via daemon loop",
         );
         let wrap = crate::nostr::gift_wrap::gift_wrap(&sender, &agent_keys.public_key(), rumor)
-            .await
             .expect("wrap");
         assert_eq!(wrap.kind.as_u16(), 1059, "wrap must be kind-1059 gift wrap");
         let stored = mailbox.bus.publish(wrap).await.expect("publish");
@@ -861,19 +858,18 @@ mod tests {
         );
 
         // Wrap addressed to BetaTwo's npub: exactly ONE key decrypts.
-        let recipient_npub: nostr_sdk::nostr::PublicKey =
-            nostr_sdk::nostr::PublicKey::parse(&reg_b.npub).expect("beta npub");
+        let recipient_npub: crate::nostr::PublicKey =
+            crate::nostr::PublicKey::parse(&reg_b.npub).expect("beta npub");
         let sender = Keys::generate();
         let rumor = crate::nostr::gift_wrap::build_rumor(
             sender.public_key(),
-            nostr_sdk::nostr::Timestamp::now(),
-            nostr_sdk::nostr::Kind::PrivateDirectMessage,
-            vec![nostr_sdk::nostr::Tag::parse(["p", &reg_b.npub]).expect("p")],
+            crate::nostr::Timestamp::now(),
+            crate::nostr::Kind::PrivateDirectMessage,
+            vec![crate::nostr::Tag::parse(["p", &reg_b.npub]).expect("p")],
             "ptag-directed hello",
         );
-        let wrap = crate::nostr::gift_wrap::gift_wrap(&sender, &recipient_npub, rumor)
-            .await
-            .expect("wrap");
+        let wrap =
+            crate::nostr::gift_wrap::gift_wrap(&sender, &recipient_npub, rumor).expect("wrap");
         let out = pipeline.project(&wrap).await;
         assert_eq!(out, ProjectOutcome::Projected, "wrap projects");
         assert_eq!(
@@ -886,17 +882,16 @@ mod tests {
         // A second wrap to AlphaOne adds exactly one more decrypt.
         let rumor2 = crate::nostr::gift_wrap::build_rumor(
             sender.public_key(),
-            nostr_sdk::nostr::Timestamp::now(),
-            nostr_sdk::nostr::Kind::PrivateDirectMessage,
-            vec![nostr_sdk::nostr::Tag::parse(["p", &reg_a.npub]).expect("p")],
+            crate::nostr::Timestamp::now(),
+            crate::nostr::Kind::PrivateDirectMessage,
+            vec![crate::nostr::Tag::parse(["p", &reg_a.npub]).expect("p")],
             "ptag-directed hello two",
         );
         let wrap2 = crate::nostr::gift_wrap::gift_wrap(
             &sender,
-            &nostr_sdk::nostr::PublicKey::parse(&reg_a.npub).expect("alpha npub"),
+            &crate::nostr::PublicKey::parse(&reg_a.npub).expect("alpha npub"),
             rumor2,
         )
-        .await
         .expect("wrap2");
         let out2 = pipeline.project(&wrap2).await;
         assert_eq!(out2, ProjectOutcome::Projected);
@@ -936,15 +931,12 @@ mod tests {
         let agent_keys = mailbox.load_agent_key(&path).expect("disk key");
         let rumor = crate::nostr::gift_wrap::build_rumor(
             sender.public_key(),
-            nostr_sdk::nostr::Timestamp::now(),
-            nostr_sdk::nostr::Kind::PrivateDirectMessage,
-            vec![
-                nostr_sdk::nostr::Tag::parse(["p", &agent_keys.public_key().to_hex()]).expect("p"),
-            ],
+            crate::nostr::Timestamp::now(),
+            crate::nostr::Kind::PrivateDirectMessage,
+            vec![crate::nostr::Tag::parse(["p", &agent_keys.public_key().to_hex()]).expect("p")],
             "mail must reach the git archive too",
         );
         let wrap = crate::nostr::gift_wrap::gift_wrap(&sender, &agent_keys.public_key(), rumor)
-            .await
             .expect("wrap");
         mailbox.bus.publish(wrap).await.expect("publish");
 
@@ -1015,15 +1007,12 @@ mod tests {
         let agent_keys = mailbox.load_agent_key(&path).expect("disk key");
         let rumor = crate::nostr::gift_wrap::build_rumor(
             sender.public_key(),
-            nostr_sdk::nostr::Timestamp::now(),
-            nostr_sdk::nostr::Kind::PrivateDirectMessage,
-            vec![
-                nostr_sdk::nostr::Tag::parse(["p", &agent_keys.public_key().to_hex()]).expect("p"),
-            ],
+            crate::nostr::Timestamp::now(),
+            crate::nostr::Kind::PrivateDirectMessage,
+            vec![crate::nostr::Tag::parse(["p", &agent_keys.public_key().to_hex()]).expect("p")],
             "hello via daemon loop (absolute slug)",
         );
         let wrap = crate::nostr::gift_wrap::gift_wrap(&sender, &agent_keys.public_key(), rumor)
-            .await
             .expect("wrap");
         let stored = mailbox.bus.publish(wrap).await.expect("publish");
         assert!(stored.stored, "wrap must be stored on the bus");
@@ -1150,7 +1139,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn unwrap_loop_kdf_cached_between_rebuilds_many_keys() {
         use crate::nostr::gift_wrap::{build_rumor, gift_wrap};
-        use nostr_sdk::nostr::{Kind, Tag, Timestamp};
+        use crate::nostr::{Kind, Tag, Timestamp};
 
         let (mailbox, db, data_dir) = loop_mailbox("kdf-bound").await;
         let pass = "loop-test-pass";
@@ -1205,9 +1194,7 @@ mod tests {
             vec![Tag::parse(["p", &target.public_key().to_hex()]).expect("p")],
             "hello",
         );
-        let wrap = gift_wrap(&sender, &target.public_key(), rumor)
-            .await
-            .expect("wrap");
+        let wrap = gift_wrap(&sender, &target.public_key(), rumor).expect("wrap");
         let outcome = pipeline.project(&wrap).await;
         assert_eq!(
             outcome,
@@ -1228,9 +1215,7 @@ mod tests {
             vec![Tag::parse(["p", &target.public_key().to_hex()]).expect("p")],
             "hello again",
         );
-        let wrap2 = gift_wrap(&sender, &target.public_key(), rumor2)
-            .await
-            .expect("wrap2");
+        let wrap2 = gift_wrap(&sender, &target.public_key(), rumor2).expect("wrap2");
         let outcome2 = pipeline.project(&wrap2).await;
         assert_eq!(
             outcome2,

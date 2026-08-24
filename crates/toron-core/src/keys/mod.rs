@@ -11,10 +11,9 @@
 use std::fs;
 use std::path::Path;
 
-use nostr_sdk::nips::nip19::{FromBech32, ToBech32};
-use nostr_sdk::nips::nip49::{EncryptedSecretKey, KeySecurity};
-use nostr_sdk::nostr::SecretKey;
-use nostr_sdk::nostr::nips::nip49::Error as Nip49Error;
+use crate::nostr::SecretKey;
+use ::nostr::nips::nip19::{FromBech32, ToBech32};
+use ::nostr::nips::nip49::{EncryptedSecretKey, KeySecurity};
 
 /// Default argon2 log-n rounds for production (slow, ~1s).
 pub const DEFAULT_LOG_N: u8 = 16;
@@ -24,12 +23,8 @@ pub const TEST_LOG_N: u8 = 10;
 /// Error returned by the key store.
 #[derive(Debug, thiserror::Error)]
 pub enum KeyStoreError {
-    #[error("nip49 failure: {0}")]
-    Nip49(#[from] Nip49Error),
-    #[error("nip19 bech32 failure: {0}")]
-    Nip19(#[from] nostr_sdk::nips::nip19::Error),
-    #[error("secret key not found in encrypted payload")]
-    SecretKey(#[from] nostr_sdk::nostr::event::Error),
+    #[error("nostr key failure: {0}")]
+    Nostr(#[from] ::nostr::error::Error),
     #[error("io failure: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -89,13 +84,11 @@ fn set_0600(_path: &Path) -> Result<(), std::io::Error> {
     Ok(())
 }
 
-// Convenience re-export for callers that only need key generation + storage.
-pub use nostr_sdk::nostr::NostrSigner;
-
 /// The signing keypair type used by the mailbox operator + agents.
 /// Re-exported so downstream crates (toron-mcp) can name it without a direct
 /// nostr-sdk dependency.
-pub use nostr_sdk::nostr::Keys;
+pub use crate::nostr::Keys;
+pub use ::nostr::event::SignEvent;
 
 #[cfg(test)]
 mod tests {
@@ -157,7 +150,6 @@ mod tests {
 
     #[test]
     fn test_nsec_not_in_serialized_events_or_cryptsec() {
-        use nostr_sdk::JsonUtil;
         let keys = generate();
         // The cryptsec payload must not contain the hex or bech32 nsec.
         let cryptsec = encrypt(&keys, "pass", TEST_LOG_N).expect("encrypt");
@@ -167,7 +159,7 @@ mod tests {
 
         // A signed event must not contain the nsec either.
         use crate::nostr::event::build_event;
-        use nostr_sdk::nostr::{Kind, Tag, Timestamp};
+        use crate::nostr::{Kind, Tag, Timestamp};
         let ev = build_event(
             &keys,
             Kind::TextNote,

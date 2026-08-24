@@ -84,18 +84,10 @@ async fn sc3_bcc_privacy_matrix() {
     );
 
     // --- wrap one copy per recipient ---
-    let wrap_to = gift_wrap::gift_wrap(&sender, &to, visible.clone())
-        .await
-        .unwrap();
-    let wrap_cc = gift_wrap::gift_wrap(&sender, &cc, visible.clone())
-        .await
-        .unwrap();
-    let wrap_b1 = gift_wrap::gift_wrap(&sender, &bcc1, variant1)
-        .await
-        .unwrap();
-    let wrap_b2 = gift_wrap::gift_wrap(&sender, &bcc2, variant2)
-        .await
-        .unwrap();
+    let wrap_to = gift_wrap::gift_wrap(&sender, &to, visible.clone()).unwrap();
+    let wrap_cc = gift_wrap::gift_wrap(&sender, &cc, visible.clone()).unwrap();
+    let wrap_b1 = gift_wrap::gift_wrap(&sender, &bcc1, variant1).unwrap();
+    let wrap_b2 = gift_wrap::gift_wrap(&sender, &bcc2, variant2).unwrap();
 
     // --- assertions ---
 

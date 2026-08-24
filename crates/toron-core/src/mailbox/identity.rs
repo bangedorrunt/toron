@@ -17,7 +17,7 @@
 
 use std::path::PathBuf;
 
-use nostr_sdk::nostr::{Keys, Timestamp};
+use crate::nostr::{Keys, Timestamp};
 
 use crate::backend::herdr::HerdrBackend;
 use crate::bus::filter::kind_project_filter;
@@ -429,7 +429,12 @@ impl Mailbox {
         }
         let ok = self.bus.publish(result.event.clone()).await?;
         if !ok.stored {
-            anyhow::bail!("profile event rejected by bus");
+            // NIP-01: same-second addressable upsert with a higher id does
+            // not replace. The existing profile on this coordinate stays.
+            tracing::debug!(
+                event_id = %result.event.id,
+                "profile event not stored (NIP-01 replaceable no-op)"
+            );
         }
         // Index the registration (search-scoped identity table). Stores the
         // VERBATIM project slug so the unwrap-loop projection can attribute
@@ -641,8 +646,8 @@ impl Mailbox {
     pub async fn whois(&self, project_slug: &str, name: &str) -> anyhow::Result<WhoIs> {
         let canonical = self.canonical_project(project_slug).await;
         let set = self.project_read_set(&canonical).await;
-        let mut npub: Option<nostr_sdk::nostr::PublicKey> = None;
-        let mut profiles: Vec<nostr_sdk::nostr::Event> = Vec::new();
+        let mut npub: Option<crate::nostr::PublicKey> = None;
+        let mut profiles: Vec<crate::nostr::Event> = Vec::new();
 
         // ADR-0018: npub input resolves by pubkey (the read-side twin of npub
         // routing). Works in both modes — an npub is always a routing address.
@@ -652,7 +657,7 @@ impl Mailbox {
                 let events = collect_replay(self.bus.as_ref(), filter).await?;
                 profiles.extend(events);
             }
-            let pubkey = nostr_sdk::nostr::PublicKey::from_hex(name)
+            let pubkey = crate::nostr::PublicKey::from_hex(name)
                 .map_err(|_| anyhow::anyhow!("invalid npub: {name}"))?;
             npub = profiles
                 .iter()
@@ -666,11 +671,9 @@ impl Mailbox {
                 .filter(|e| e.pubkey == npub && e.kind.as_u16() == AGENT_PROFILE)
                 .max_by_key(|e| e.created_at.as_secs())
                 .and_then(|e| {
-                    e.tags.iter().find_map(|t| {
-                        (t.kind() == nostr_sdk::nostr::TagKind::d())
-                            .then(|| t.content())
-                            .flatten()
-                    })
+                    e.tags
+                        .iter()
+                        .find_map(|t| (t.kind() == "d").then(|| t.content()).flatten())
                 })
                 .and_then(ident::profile_name_from_d_tag)
                 .unwrap_or(name);
@@ -706,8 +709,8 @@ impl Mailbox {
     async fn whois_build(
         &self,
         name: String,
-        npub: nostr_sdk::nostr::PublicKey,
-        profiles: Vec<nostr_sdk::nostr::Event>,
+        npub: crate::nostr::PublicKey,
+        profiles: Vec<crate::nostr::Event>,
     ) -> anyhow::Result<WhoIs> {
         // Profile fields + last-active provenance (latest signed profile event).
         let profile_ev = profiles
@@ -740,7 +743,7 @@ impl Mailbox {
             let Some(d) = ev
                 .tags
                 .iter()
-                .find_map(|t| (t.kind() == nostr_sdk::nostr::TagKind::d()).then(|| t.content()))
+                .find_map(|t| (t.kind() == "d").then(|| t.content()))
                 .flatten()
             else {
                 continue;
@@ -789,10 +792,10 @@ impl Mailbox {
     pub(crate) async fn project_profiles(
         &self,
         project_slug: &str,
-    ) -> anyhow::Result<Vec<nostr_sdk::nostr::Event>> {
+    ) -> anyhow::Result<Vec<crate::nostr::Event>> {
         let set = self.project_read_set(project_slug).await;
-        let mut out: Vec<nostr_sdk::nostr::Event> = Vec::new();
-        let mut seen: std::collections::HashSet<nostr_sdk::nostr::EventId> =
+        let mut out: Vec<crate::nostr::Event> = Vec::new();
+        let mut seen: std::collections::HashSet<crate::nostr::EventId> =
             std::collections::HashSet::new();
         for slug in &set {
             let filter = kind_project_filter(toron_kind(AGENT_PROFILE), slug);

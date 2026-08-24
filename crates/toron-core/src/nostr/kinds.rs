@@ -1,5 +1,6 @@
 // governed-by: ADR-0003
 // governed-by: ADR-0020
+// governed-by: ADR-0023
 #![forbid(unsafe_code)]
 
 //! Frozen kind registry (ADR-0003, AGREEMENT LOCKED 2026-08-04).
@@ -8,7 +9,7 @@
 //! occupancy table. Kind numbers in the toron namespace: 30010-30014, 30031,
 //! 30032, 20001, 43001-43006, 46001-46012.
 
-use nostr_sdk::nostr::Kind;
+use crate::nostr::Kind;
 
 /// Project manifest (addressable, `d`=slug). Operator-published; products list
 /// members via `a`.
@@ -33,6 +34,14 @@ pub const PRESENCE: u16 = 20001;
 pub const CHANNEL_MESSAGE: u16 = 9;
 /// NIP-25 reaction.
 pub const REACTION: u16 = 7;
+/// NIP-29 group metadata (ADR-0023). Addressable; `d`=`h`=channel id.
+pub const CHANNEL_GROUP: u16 = 39000;
+/// NIP-29 group members snapshot (ADR-0023). Addressable; `p`=members.
+pub const CHANNEL_MEMBERS: u16 = 39002;
+/// Pre-ADR-0023 NIP-28 channel-create. Ingest only.
+pub const CHANNEL_CREATE_LEGACY: u16 = 40;
+/// Pre-ADR-0023 NIP-28 channel-metadata (join/leave/close). Ingest only.
+pub const CHANNEL_METADATA_LEGACY: u16 = 41;
 /// Pre-ADR-0020 channel post. Ingest only.
 pub const CHANNEL_MESSAGE_LEGACY: u16 = 42;
 /// Job request (regular, immutable; `e`=parent). Buzz-verbatim.
@@ -73,6 +82,10 @@ mod tests {
         assert_eq!(PRESENCE, 20001);
         assert_eq!(CHANNEL_MESSAGE, 9);
         assert_eq!(REACTION, 7);
+        assert_eq!(CHANNEL_GROUP, 39000);
+        assert_eq!(CHANNEL_MEMBERS, 39002);
+        assert_eq!(CHANNEL_CREATE_LEGACY, 40);
+        assert_eq!(CHANNEL_METADATA_LEGACY, 41);
         assert_eq!(CHANNEL_MESSAGE_LEGACY, 42);
         assert_eq!(JOB_REQUEST, 43001);
         assert_eq!(JOB_ACCEPTED, 43002);
@@ -93,6 +106,9 @@ mod tests {
         assert_eq!(Kind::GiftWrap.as_u16(), 1059);
         assert_eq!(Kind::Reaction.as_u16(), 7);
         assert_eq!(Kind::from_u16(15).as_u16(), 15);
+        // rust-nostr 0.45 named NIP-29 group kinds (ADR-0023).
+        assert_eq!(Kind::GroupMetadata.as_u16(), CHANNEL_GROUP);
+        assert_eq!(Kind::GroupMembers.as_u16(), CHANNEL_MEMBERS);
     }
 
     #[test]

@@ -87,12 +87,12 @@ mod tests {
         }
     }
 
-    async fn register(mailbox: &Mailbox, project: &str, name: &str) -> nostr_sdk::nostr::PublicKey {
+    async fn register(mailbox: &Mailbox, project: &str, name: &str) -> crate::nostr::PublicKey {
         let agent = mailbox
             .register_agent(project, &profile(name))
             .await
             .expect("register");
-        nostr_sdk::nostr::PublicKey::from_hex(&agent.npub).expect("npub")
+        crate::nostr::PublicKey::from_hex(&agent.npub).expect("npub")
     }
 
     #[tokio::test]
@@ -206,15 +206,15 @@ mod tests {
     fn invariant_wrong_surface_denial() {
         // Metadata-hiding kinds must NEVER gain project scoping tags (A3).
         let base = Vec::new();
-        let scoped = with_project_scoping(nostr_sdk::nostr::Kind::GiftWrap, base, Some("demo"));
+        let scoped = with_project_scoping(crate::nostr::Kind::GiftWrap, base, Some("demo"));
         assert_invariant(
             "wrong-surface",
             scoped.is_empty(),
             "gift wraps must not be project-tagged",
         );
-        assert!(is_metadata_hiding_kind(nostr_sdk::nostr::Kind::GiftWrap));
+        assert!(is_metadata_hiding_kind(crate::nostr::Kind::GiftWrap));
         assert!(is_metadata_hiding_kind(
-            nostr_sdk::nostr::Kind::PrivateDirectMessage
+            crate::nostr::Kind::PrivateDirectMessage
         ));
 
         // A plain non-hiding kind DOES get scoped.
@@ -263,13 +263,12 @@ mod tests {
         let sender = crate::keys::generate();
         let rumor = crate::nostr::gift_wrap::build_rumor(
             sender.public_key(),
-            nostr_sdk::nostr::Timestamp::now(),
-            nostr_sdk::nostr::Kind::PrivateDirectMessage,
+            crate::nostr::Timestamp::now(),
+            crate::nostr::Kind::PrivateDirectMessage,
             vec![],
             "hi",
         );
         let wrap = crate::nostr::gift_wrap::gift_wrap(&sender, &rose, rumor)
-            .await
             .expect("wrap");
         mailbox.bus.publish(wrap).await.expect("publish");
 
@@ -291,7 +290,7 @@ mod tests {
 
         // Re-fetch the wrap (it was published above).
         let filter = crate::bus::filter::ToronFilter::new()
-            .kinds([nostr_sdk::nostr::Kind::GiftWrap])
+            .kinds([crate::nostr::Kind::GiftWrap])
             .pubkey(rose)
             .build();
         let wraps = super::super::collect_replay(mailbox.bus.as_ref(), filter)

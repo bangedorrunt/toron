@@ -218,10 +218,9 @@ async fn sc9_mention_to_job_claim_to_result() {
         .expect("publish result");
 
     let lifecycle_events = bus
-        .subscribe(Filter::new().custom_tag(
-            nostr_sdk::nostr::SingleLetterTag::lowercase(nostr_sdk::nostr::Alphabet::E),
-            job_req.id.to_hex(),
-        ))
+        .subscribe(
+            Filter::new().custom_tag(nostr::SingleLetterTag::LOWERCASE_E, job_req.id.to_hex()),
+        )
         .await
         .expect("lifecycle sub");
     let mut lc = Vec::new();

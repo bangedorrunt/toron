@@ -10,7 +10,7 @@
 
 use tokio::sync::mpsc;
 
-use nostr_sdk::nostr::Event;
+use crate::nostr::Event;
 
 /// Opaque subscription identifier.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -92,13 +92,13 @@ mod tests {
         let (tx, rx) = mpsc::channel(Subscription::DEFAULT_CAPACITY);
         let mut sub = Subscription::new(SubscriptionId::new("t"), rx);
 
-        let keys = nostr_sdk::nostr::Keys::generate();
+        let keys = crate::nostr::Keys::generate();
         let ev = crate::nostr::event::build_event(
             &keys,
-            nostr_sdk::nostr::Kind::TextNote,
+            crate::nostr::Kind::TextNote,
             "hello",
-            Vec::<nostr_sdk::nostr::Tag>::new(),
-            nostr_sdk::nostr::Timestamp::now(),
+            Vec::<crate::nostr::Tag>::new(),
+            crate::nostr::Timestamp::now(),
         )
         .expect("build");
 
