@@ -56,6 +56,9 @@ pub struct Channel {
     /// Optional project mapping (project-as-channel).
     #[serde(default)]
     pub project: Option<String>,
+    /// True once the creator retires the channel (bd-channel-close-purge-bsqb):
+    #[serde(default)]
+    pub closed: bool,
     /// Member npubs (hex).
     pub members: HashSet<String>,
     /// Creator npub.
@@ -172,6 +175,7 @@ impl ChannelStore {
                 name: name.to_string(),
                 private,
                 project: project.map(str::to_string),
+                closed: false,
                 members: HashSet::from([creator.to_hex()]),
                 creator: creator.to_hex(),
             },
@@ -186,21 +190,46 @@ impl ChannelStore {
             .channels
             .get_mut(channel_id)
             .ok_or_else(|| anyhow::anyhow!("channel not found: {channel_id}"))?;
+        // bd-channel-close-purge-bsqb: a retired channel accepts nobody new.
+        if ch.closed {
+            anyhow::bail!("channel {channel_id} is closed — join is refused");
+        }
         ch.members.insert(npub.to_hex());
         Ok(())
     }
 
-    /// Leave a channel (idempotent; the creator cannot leave — they own it).
+    /// Leave a channel (idempotent). The creator cannot leave an OPEN
+    /// channel — they own it — but MAY leave once it is closed
+    /// (bd-channel-close-purge-bsqb leave-rule fix).
     pub fn leave(&self, channel_id: &str, npub: &PublicKey) -> anyhow::Result<()> {
         let mut inner = self.inner.lock();
         let ch = inner
             .channels
             .get_mut(channel_id)
             .ok_or_else(|| anyhow::anyhow!("channel not found: {channel_id}"))?;
-        if ch.creator == npub.to_hex() {
-            anyhow::bail!("creator cannot leave channel {channel_id}");
+        if ch.creator == npub.to_hex() && !ch.closed {
+            anyhow::bail!(
+                "creator cannot leave channel {channel_id} while it is open \
+                 (close it first: toron channel close {channel_id})"
+            );
         }
         ch.members.remove(&npub.to_hex());
+        Ok(())
+    }
+
+    /// Close (retire) a channel — bd-channel-close-purge-bsqb. Creator-only,
+    /// idempotent. A closed channel refuses posts/joins/reactions; its
+    /// history survives until `toron channel purge` removes the bus events.
+    pub fn close(&self, channel_id: &str, by: &PublicKey) -> anyhow::Result<()> {
+        let mut inner = self.inner.lock();
+        let ch = inner
+            .channels
+            .get_mut(channel_id)
+            .ok_or_else(|| anyhow::anyhow!("channel not found: {channel_id}"))?;
+        if ch.creator != by.to_hex() {
+            anyhow::bail!("only the creator can close channel {channel_id}");
+        }
+        ch.closed = true;
         Ok(())
     }
 
@@ -243,7 +272,6 @@ impl ChannelStore {
     /// only members may post; a non-member is rejected before any event is
     /// produced (the gate is at the store boundary — the same point the
     /// projection/fanout uses).
-
     pub fn post(
         &self,
         author: &Keys,
@@ -380,10 +408,33 @@ impl ChannelStore {
     }
 
     fn require_member(&self, channel_id: &str, npub: &PublicKey) -> anyhow::Result<()> {
-        if !self.is_member(channel_id, npub) {
-            anyhow::bail!("not a member of channel {channel_id} — membership is the only gate");
+        let inner = self.inner.lock();
+        let Some(ch) = inner.channels.get(channel_id) else {
+            anyhow::bail!("channel not found: {channel_id}");
+        };
+        // bd-channel-close-purge-bsqb: a closed (retired) channel refuses
+        // writes outright — member or not.
+        if ch.closed {
+            anyhow::bail!(
+                "channel {channel_id} is closed — posts and reactions are refused \
+                 (removal: toron channel purge {channel_id})"
+            );
         }
-        Ok(())
+        if ch.is_member(npub) {
+            return Ok(());
+        }
+        // bd-membership-gate-remedy-uti4: the gate names its remedy — a
+        // bounce without the fix costs a help-page round-trip. The project
+        // is named when the channel knows it, else a placeholder.
+        let project = ch
+            .project
+            .as_deref()
+            .map(|p| format!("--project {p}"))
+            .unwrap_or_else(|| "--project <p>".to_string());
+        anyhow::bail!(
+            "not a member of channel {channel_id} — membership is the only gate; \
+             run: toron channel join {channel_id} {project} --as <you>"
+        );
     }
 }
 
@@ -430,6 +481,41 @@ mod tests {
         assert!(history.iter().all(|e| e.kind == CHANNEL_MESSAGE));
     }
 
+    /// bd-kbl1c / bd-join-before-post-axfm: spawn-time channel membership
+    /// bootstrap — join-before-post. Membership is the only gate; spawn must
+    /// establish it before first doorbell. The store-level gate is the same
+    /// as `create_join_post_membership_gate` but this name is the verify
+    /// entrypoint (`cargo test --offline join_before_post`).
+    #[test]
+    fn join_before_post() {
+        let store = ChannelStore::new();
+        let alice = keys();
+        let bob = keys();
+        let mallory = keys();
+        store
+            .create_channel(&alice.public_key(), "steer-axfm", "Steer", false, Some("toron"))
+            .expect("create");
+        // Bob joins before post — the bootstrap that must happen at spawn.
+        store
+            .join("steer-axfm", &bob.public_key())
+            .expect("bob joins");
+        assert!(store.post(&alice, "steer-axfm", "hello from creator", &[]).is_ok());
+        assert!(store
+            .post(&bob, "steer-axfm", "hello from member after join", &[])
+            .is_ok());
+        assert!(
+            store
+                .post(&mallory, "steer-axfm", "intrude without join", &[])
+                .is_err(),
+            "non-member post must be refused"
+        );
+        // Idempotent re-join must not error and must keep membership.
+        store
+            .join("steer-axfm", &bob.public_key())
+            .expect("re-join idempotent");
+        assert!(store.is_member("steer-axfm", &bob.public_key()));
+    }
+
     /// bd-channel-truncation-238e: an over-cap post FAILS LOUDLY naming the
     /// limit and the chunking affordance — never silently truncates.
     #[test]
@@ -440,10 +526,7 @@ mod tests {
             .create_channel(&author.public_key(), "cap", "Cap", false, Some("toron"))
             .expect("create");
         let big = "x".repeat(CHANNEL_POST_MAX_CHARS + 1);
-        let err = format!(
-            "{}",
-            store.post(&author, "cap", &big, &[]).unwrap_err()
-        );
+        let err = format!("{}", store.post(&author, "cap", &big, &[]).unwrap_err());
         assert!(err.contains(&CHANNEL_POST_MAX_CHARS.to_string()), "{err}");
         assert!(err.contains("--file"), "names the chunking fix: {err}");
         // at-cap is fine
@@ -465,7 +548,7 @@ mod tests {
         // round-trip: markers stripped, order preserved
         let joined: String = chunks
             .iter()
-            .map(|c| c.splitn(2, ' ').nth(1).expect("body"))
+            .map(|c| c.split_once(' ').map(|x| x.1).expect("body"))
             .collect::<Vec<_>>()
             .join("");
         assert_eq!(joined.replace('\n', ""), content.replace('\n', ""));
@@ -682,5 +765,102 @@ mod tests {
             2,
             "rejected ingests are not recorded"
         );
+    }
+
+    /// bd-membership-gate-remedy-uti4: the gate error names the exact
+    /// remedy — a bounce without the fix costs a help-page round-trip.
+    #[test]
+    fn membership_remedy_non_member_post_error_names_the_join_command() {
+        let store = ChannelStore::new();
+        let alice = keys();
+        let mallory = keys();
+        store
+            .create_channel(&alice.public_key(), "steer", "Steer", true, Some("beads"))
+            .expect("create");
+        let err = format!(
+            "{}",
+            store.post(&mallory, "steer", "intrude", &[]).unwrap_err()
+        );
+        assert!(err.contains("not a member"), "{err}");
+        assert!(
+            err.contains("run: toron channel join steer --project beads --as <you>"),
+            "remedy must be the exact join command: {err}"
+        );
+    }
+
+    /// bd-membership-gate-remedy-uti4: a project-less channel still names
+    /// the remedy, with a placeholder for the project.
+    #[test]
+    fn membership_remedy_projectless_channel_keeps_placeholder() {
+        let store = ChannelStore::new();
+        let alice = keys();
+        let mallory = keys();
+        store
+            .create_channel(&alice.public_key(), "loose", "Loose", false, None)
+            .expect("create");
+        let err = format!(
+            "{}",
+            store.post(&mallory, "loose", "intrude", &[]).unwrap_err()
+        );
+        assert!(
+            err.contains("run: toron channel join loose --project <p> --as <you>"),
+            "{err}"
+        );
+    }
+
+    /// bd-channel-close-purge-bsqb: close retires the channel — posts and
+    /// joins are refused, the creator MAY leave (leave-rule fix), close is
+    /// creator-only and idempotent.
+    #[test]
+    fn channel_close_retires_the_channel() {
+        let store = ChannelStore::new();
+        let alice = keys();
+        let bob = keys();
+        store
+            .create_channel(&alice.public_key(), "probe", "Probe", false, Some("fw"))
+            .expect("create");
+        store.join("probe", &bob.public_key()).expect("bob joins");
+        store
+            .post(&alice, "probe", "one-off ordering probe", &[])
+            .expect("pre-close post");
+
+        // Only the creator may close.
+        let err = store.close("probe", &bob.public_key()).unwrap_err();
+        assert!(err.to_string().contains("creator"), "{err}");
+        // Unknown channel: honest not-found, not a fake membership bounce.
+        assert!(store.close("ghost", &alice.public_key()).is_err());
+
+        store.close("probe", &alice.public_key()).expect("close");
+        assert!(
+            store.get("probe").expect("channel").closed,
+            "closed flag is visible on the channel"
+        );
+
+        // Posts refused on a closed channel — even by a member.
+        let err = store.post(&alice, "probe", "after close", &[]).unwrap_err();
+        assert!(err.to_string().contains("closed"), "{err}");
+        // Reactions refused too.
+        assert!(
+            store
+                .react(&alice, "probe", "0".repeat(64).as_str(), "✅")
+                .is_err()
+        );
+        // Joins refused: a retired channel accepts nobody new.
+        assert!(
+            store.join("probe", &keys().public_key()).is_err(),
+            "join on a closed channel must fail"
+        );
+        // The creator MAY leave a closed channel (leave-rule fix).
+        store
+            .leave("probe", &alice.public_key())
+            .expect("creator leaves a closed channel");
+        assert!(!store.is_member("probe", &alice.public_key()));
+        // Close is idempotent.
+        store
+            .close("probe", &alice.public_key())
+            .expect("close again");
+
+        // Pre-close history survives close (close retires, purge removes).
+        assert!(!store.history("probe").is_empty());
     }
 }

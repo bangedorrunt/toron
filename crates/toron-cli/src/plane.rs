@@ -53,10 +53,11 @@ use toron_workflow::jobs::{
 use toron_workflow::mention::{build_job_from_coalesced, wire_mention_dispatch};
 
 use crate::cli::{
-    ChannelCommand, ChannelCreateArgs, ChannelJoinArgs, ChannelListArgs, ChannelMembersArgs,
-    ChannelPostArgs, ChannelReadArgs, JobCancelArgs, JobClaimArgs, JobCommand, JobErrorArgs,
-    JobListArgs, JobProgressArgs, JobResultArgs, JobShowArgs, JobStateArg, JobStatusArg,
-    PresenceCommand, PresenceListArgs, PresencePublishArgs, PresenceStateArg, ReactArgs, WatchArgs,
+    ChannelCloseArgs, ChannelCommand, ChannelCreateArgs, ChannelJoinArgs, ChannelListArgs,
+    ChannelMembersArgs, ChannelPostArgs, ChannelPurgeArgs, ChannelReadArgs, JobCancelArgs,
+    JobClaimArgs, JobCommand, JobErrorArgs, JobListArgs, JobProgressArgs, JobResultArgs,
+    JobShowArgs, JobStateArg, JobStatusArg, PresenceCommand, PresenceListArgs, PresencePublishArgs,
+    PresenceStateArg, ReactArgs, WatchArgs,
 };
 
 /// Default presence TTL (mirrors `bus::presence::DEFAULT_PRESENCE_TTL`).
@@ -202,6 +203,13 @@ async fn rebuild_store(mailbox: &Mailbox, project: &str) -> anyhow::Result<Chann
                     "leave" => {
                         let _ = store.leave(id, &ev.pubkey);
                     }
+                    "close" => {
+                        // bd-channel-close-purge-bsqb: the close tombstone is
+                        // a kind-41 lifecycle event signed by the creator;
+                        // `close` itself verifies creatorship (a non-creator
+                        // close event is ignored via the per-event error).
+                        let _ = store.close(id, &ev.pubkey);
+                    }
                     _ => {}
                 }
             }
@@ -301,6 +309,15 @@ async fn channel_create(mailbox: &Mailbox, args: &ChannelCreateArgs) -> anyhow::
 async fn channel_join(mailbox: &Mailbox, args: &ChannelJoinArgs) -> anyhow::Result<()> {
     let keys = resolve_agent(mailbox, &args.project, &args.as_name).await?;
     let store = rebuild_store(mailbox, &args.project).await?;
+    if args.if_missing && store.is_member(&args.id, &keys.public_key()) {
+        print_json(&serde_json::json!({
+            "channel_id": args.id,
+            "member": keys.public_key().to_hex(),
+            "event_id": null,
+            "if_missing": true,
+        }))?;
+        return Ok(());
+    }
     store
         .join(&args.id, &keys.public_key())
         .with_context(|| format!("join {} as {}", args.id, args.as_name))?;
@@ -316,7 +333,8 @@ async fn channel_join(mailbox: &Mailbox, args: &ChannelJoinArgs) -> anyhow::Resu
         "channel_id": args.id,
         "member": keys.public_key().to_hex(),
         "event_id": ev.id.to_hex(),
-    }))
+    }))?;
+    Ok(())
 }
 
 async fn channel_leave(mailbox: &Mailbox, args: &ChannelJoinArgs) -> anyhow::Result<()> {
@@ -337,6 +355,136 @@ async fn channel_leave(mailbox: &Mailbox, args: &ChannelJoinArgs) -> anyhow::Res
         "channel_id": args.id,
         "member": keys.public_key().to_hex(),
         "event_id": ev.id.to_hex(),
+    }))?;
+    Ok(())
+}
+/// Publish the channel-close tombstone (kind 41, content "close") so every
+/// process rebuilds the retired state (bd-channel-close-purge-bsqb).
+async fn publish_close(
+    bus: &dyn Bus,
+    keys: &Keys,
+    channel: &str,
+    project: &str,
+) -> anyhow::Result<Event> {
+    let ev = build_event(
+        keys,
+        toron_kind(CHANNEL_METADATA),
+        "close",
+        vec![
+            Tag::parse(["h", channel]).expect("h tag"),
+            Tag::parse(["t", project]).expect("t tag"),
+        ],
+        Timestamp::now(),
+    )?;
+    bus.publish(ev.clone()).await?;
+    Ok(ev)
+}
+
+/// `toron channel close <id>` — retire a channel (creator-only,
+/// idempotent). The tombstone rides the bus; posts/joins refuse afterwards.
+async fn channel_close(mailbox: &Mailbox, args: &ChannelCloseArgs) -> anyhow::Result<()> {
+    let keys = resolve_agent(mailbox, &args.project, &args.as_name).await?;
+    let store = rebuild_store(mailbox, &args.project).await?;
+    let ch = store
+        .get(&args.id)
+        .with_context(|| format!("channel not found: {}", args.id))?;
+    store
+        .close(&args.id, &keys.public_key())
+        .with_context(|| format!("close channel {} as {}", args.id, args.as_name))?;
+    let ev = publish_close(mailbox.bus().as_ref(), &keys, &args.id, &args.project).await?;
+    let _ = ch; // (kept: future closed-at bookkeeping)
+    print_json(&serde_json::json!({
+        "channel": args.id,
+        "closed": true,
+        "already_closed": ch.closed,
+        "tombstone_id": ev.id.to_hex(),
+    }))
+}
+
+/// `toron channel purge <id>` — operator-grade removal of a CLOSED
+/// channel's local bus events (creator or operator only; audited to
+/// {data_dir}/channel_purge.log).
+async fn channel_purge(mailbox: &Mailbox, args: &ChannelPurgeArgs) -> anyhow::Result<()> {
+    let keys = resolve_agent(mailbox, &args.project, &args.as_name).await?;
+    let store = rebuild_store(mailbox, &args.project).await?;
+    let ch = store
+        .get(&args.id)
+        .with_context(|| format!("channel not found: {}", args.id))?;
+    if !ch.closed {
+        anyhow::bail!(
+            "channel {} is still open — close it first (lifecycle: open -> closed -> purged): \
+             toron channel close {} --project {} --as <creator>",
+            args.id,
+            args.id,
+            args.project
+        );
+    }
+    let caller = keys.public_key().to_hex();
+    let is_creator = ch.creator == caller;
+    let is_operator = mailbox
+        .operator()
+        .is_some_and(|op| op.public_key().to_hex() == caller);
+    if !is_creator && !is_operator {
+        anyhow::bail!(
+            "purge refused: {} is neither the channel creator nor the operator \
+             (bd-channel-close-purge-bsqb)",
+            args.as_name
+        );
+    }
+
+    // Every bus event bound to the channel (lifecycle + posts + reactions),
+    // scoped to this project so a same-named channel in another project is
+    // untouched.
+    let filter = Filter::new()
+        .kinds([
+            toron_kind(CHANNEL_CREATE),
+            toron_kind(CHANNEL_METADATA),
+            toron_kind(CHANNEL_MESSAGE),
+            toron_kind(CHANNEL_MESSAGE_LEGACY),
+            toron_kind(REACTION),
+        ])
+        .custom_tag(
+            toron_core::nostr_sdk::nostr::SingleLetterTag::lowercase(
+                toron_core::nostr_sdk::nostr::Alphabet::H,
+            ),
+            &args.id,
+        );
+    let events = collect_trusted(mailbox.bus().as_ref(), filter).await?;
+    let ids: Vec<String> = events
+        .iter()
+        .filter(|ev| in_project(ev, &args.project))
+        .filter(|ev| event_channel(ev).as_deref() == Some(args.id.as_str()))
+        .map(|ev| ev.id.to_hex())
+        .collect();
+    let removed = mailbox
+        .bus()
+        .purge_ids(&ids)
+        .await
+        .map_err(|e| anyhow::anyhow!("purge failed: {e}"))?;
+
+    // Audit trail (operator-grade action): who, what, how many.
+    let log_line = serde_json::json!({
+        "ts": chrono::Utc::now().to_rfc3339(),
+        "project": args.project,
+        "channel": args.id,
+        "by": args.as_name,
+        "role": if is_creator { "creator" } else { "operator" },
+        "removed_events": removed,
+    });
+    let log_path = mailbox.data_dir().join("channel_purge.log");
+    use std::io::Write as _;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+    {
+        let _ = writeln!(f, "{log_line}");
+    }
+
+    print_json(&serde_json::json!({
+        "channel": args.id,
+        "purged": removed,
+        "audit_log": log_path.display().to_string(),
     }))
 }
 
@@ -358,6 +506,11 @@ async fn channel_list(mailbox: &Mailbox, args: &ChannelListArgs) -> anyhow::Resu
         .list()
         .into_iter()
         .filter(|c| {
+            // bd-channel-close-purge-bsqb: retired channels are clutter —
+            // hidden unless --all, and flagged when shown.
+            if c.closed && !args.all {
+                return false;
+            }
             // Private channels appear only to members; open channels to anyone.
             if !c.private {
                 return true;
@@ -372,6 +525,7 @@ async fn channel_list(mailbox: &Mailbox, args: &ChannelListArgs) -> anyhow::Resu
                 "id": c.id,
                 "name": c.name,
                 "private": c.private,
+                "closed": c.closed,
                 "project": c.project,
                 "creator": c.creator,
                 "members": c.members.iter().collect::<Vec<_>>(),
@@ -468,10 +622,10 @@ async fn post_one(
     if !args.mention.is_empty() {
         let mut coalescer = MentionCoalescer::with_defaults();
         let mut jobs =
-            wire_mention_dispatch(&ev, &mut coalescer, &keys, Some(&args.project), now_ms());
+            wire_mention_dispatch(&ev, &mut coalescer, keys, Some(&args.project), now_ms());
         for batch in coalescer.force_flush_all() {
             if let Ok(job) =
-                build_job_from_coalesced(&batch, &keys, Some(&args.project), Timestamp::now())
+                build_job_from_coalesced(&batch, keys, Some(&args.project), Timestamp::now())
             {
                 jobs.push(job);
             }
@@ -481,12 +635,59 @@ async fn post_one(
         }
     }
 
+    // bd-verify-after-send-fxtv: read-back verification — the send is
+    // confirmed only when the projection serves the event id back.
+    let mut verified = false;
+    if let Some(secs) = args.wait_ack {
+        let timeout = Duration::from_secs(secs.max(1));
+        verified = wait_for_readback(mailbox, &args.id, &ev.id.to_hex(), timeout).await?;
+        if !verified {
+            anyhow::bail!(
+                "verify-after-send FAILED: event {} was not readable from channel {} \
+                 within {timeout:?} — delivery is NOT confirmed",
+                ev.id.to_hex(),
+                args.id
+            );
+        }
+    }
+
     print_json(&serde_json::json!({
         "event_id": ev.id.to_hex(),
         "kind": 9,
         "channel": args.id,
         "mentions": mention_pks.iter().map(|p| p.to_hex()).collect::<Vec<_>>(),
+        "verified": verified,
     }))
+}
+
+/// bd-verify-after-send-fxtv: poll the channel projection until the
+/// just-published event id reads back (delivery is claimed only after it is
+/// observed). Returns false on timeout — the caller fails loud.
+async fn wait_for_readback(
+    mailbox: &Mailbox,
+    channel: &str,
+    event_id: &str,
+    timeout: Duration,
+) -> anyhow::Result<bool> {
+    let filter = Filter::new()
+        .kinds([toron_kind(CHANNEL_MESSAGE)])
+        .custom_tag(
+            toron_core::nostr_sdk::nostr::SingleLetterTag::lowercase(
+                toron_core::nostr_sdk::nostr::Alphabet::H,
+            ),
+            channel,
+        );
+    let deadline = Instant::now() + timeout;
+    loop {
+        let events = collect_trusted(mailbox.bus().as_ref(), filter.clone()).await?;
+        if events.iter().any(|ev| ev.id.to_hex() == event_id) {
+            return Ok(true);
+        }
+        if Instant::now() >= deadline {
+            return Ok(false);
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 async fn channel_read(mailbox: &Mailbox, args: &ChannelReadArgs) -> anyhow::Result<()> {
@@ -503,6 +704,32 @@ async fn channel_read(mailbox: &Mailbox, args: &ChannelReadArgs) -> anyhow::Resu
             args.id
         );
     }
+
+    // bd-channel-close-purge-bsqb: a closed channel is retired — history is
+    // gone at purge; read refuses so a closed channel never looks live.
+    if ch.closed {
+        anyhow::bail!(
+            "channel {} is closed (retired) — history lives until purge: \
+             toron channel purge {} --project {} --as <creator|operator>",
+            args.id,
+            args.id,
+            args.project
+        );
+    }
+
+    // bd-delivery-visibility-g96y: `--author <pin>` narrows to one author —
+    // "did the scout report?" is a single query. Resolved through whois so
+    // the caller names the pin, never the npub.
+    let author_pk: Option<PublicKey> = match &args.author {
+        Some(name) => {
+            let whois = mailbox
+                .whois(&args.project, name)
+                .await
+                .map_err(|_| UsageError(format!("unknown --author agent: {name}")))?;
+            Some(PublicKey::from_hex(&whois.npub).context("whois npub parses")?)
+        }
+        None => None,
+    };
 
     let since = match &args.since {
         Some(s) => parse_since(s)?,
@@ -526,6 +753,9 @@ async fn channel_read(mailbox: &Mailbox, args: &ChannelReadArgs) -> anyhow::Resu
             && ev.created_at.as_secs() >= since
             && event_channel(ev).as_deref() == Some(args.id.as_str())
     });
+    if let Some(pk) = &author_pk {
+        events.retain(|ev| ev.pubkey == *pk);
+    }
     // Newest first; honor --limit after sorting.
     events.sort_by_key(|ev| std::cmp::Reverse(ev.created_at.as_secs()));
     if let Some(limit) = args.limit {
@@ -559,6 +789,22 @@ async fn channel_read(mailbox: &Mailbox, args: &ChannelReadArgs) -> anyhow::Resu
             })
         })
         .collect();
+
+    // bd-delivery-visibility-g96y: with --author, append the one-command
+    // delivery check — count + newest post ts for that author.
+    if let Some(pk) = &author_pk {
+        let posts = events.iter().filter(|ev| ev.kind.as_u16() == 9).count();
+        let newest = events.first().map(|ev| ev.created_at.as_secs());
+        print_json(&serde_json::json!({
+            "channel_id": args.id,
+            "author": pk.to_hex(),
+            "author_name": args.author,
+            "delivered_posts": posts,
+            "newest_post_at": newest,
+            "events": rows,
+        }))?;
+        return Ok(());
+    }
     print_json(&serde_json::Value::Array(rows))
 }
 
@@ -1114,6 +1360,8 @@ pub async fn run_plane(mailbox: &Mailbox, command: &crate::cli::Command) -> anyh
             ChannelCommand::Members(args) => channel_members(mailbox, args).await,
             ChannelCommand::Post(args) => channel_post(mailbox, args).await,
             ChannelCommand::Read(args) => channel_read(mailbox, args).await,
+            ChannelCommand::Close(args) => channel_close(mailbox, args).await,
+            ChannelCommand::Purge(args) => channel_purge(mailbox, args).await,
         },
         crate::cli::Command::React(args) => react(mailbox, args).await,
         crate::cli::Command::Job(cmd) => match cmd {
