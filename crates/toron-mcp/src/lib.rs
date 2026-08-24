@@ -14,6 +14,7 @@ pub mod blob_serve;
 pub mod catalog;
 pub mod resources;
 pub mod responses;
+pub mod serve_lock;
 pub mod server;
 pub mod tools;
 pub mod workflow_host;

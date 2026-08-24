@@ -120,6 +120,34 @@ pub fn plist_xml(
     )
 }
 
+/// Hourly copy-truncate of toron + resonate logs (bd-741i).
+///
+/// Weekly rotation left `resonate.out.log` at 1.3GB (`RUST_LOG=info` doorbell
+/// poll-fail storm). Hourly + 1 MiB threshold caps both daemons. Pure —
+/// golden-tested.
+pub fn logrotate_plist_xml() -> String {
+    let script = r#"for f in "$HOME/.local/state/toron/serve.out.log" "$HOME/.local/state/toron/serve.err.log" "$HOME/.local/state/flywheel/resonate.out.log" "$HOME/.local/state/flywheel/resonate.err.log"; do [ -f "$f" ] || continue; sz=$(stat -f%z "$f" 2>/dev/null || stat -c%s "$f"); if [ "$sz" -gt 1048576 ]; then cp "$f" "$f.1" && : > "$f"; fi; done"#;
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.toron.logrotate</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/sh</string>
+		<string>-c</string>
+		<string>{script}</string>
+	</array>
+	<key>StartInterval</key>
+	<integer>3600</integer>
+</dict>
+</plist>
+"#
+    )
+}
+
 /// Render the systemd user unit (pure — golden-tested). Only reachable from
 /// linux-gated install paths (and unit tests); macOS builds see it as dead.
 #[cfg_attr(target_os = "macos", allow(dead_code))]
@@ -331,6 +359,7 @@ pub fn install(args: &super::cli::DaemonArgs) -> anyhow::Result<()> {
             .args(["bootout", &format!("gui/{uid}/{label}")])
             .output();
         let _ = out; // absent unit is fine
+        install_logrotate_agent(&dir, &uid)?;
         let out = Command::new("launchctl")
             .args([
                 "bootstrap",
@@ -402,7 +431,31 @@ pub fn install(args: &super::cli::DaemonArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Write + bootstrap `com.toron.logrotate` (hourly copy-truncate, bd-741i).
 #[cfg(target_os = "macos")]
+fn install_logrotate_agent(dir: &Path, uid: &str) -> anyhow::Result<()> {
+    let label = "com.toron.logrotate";
+    let path = dir.join(format!("{label}.plist"));
+    std::fs::write(&path, logrotate_plist_xml())?;
+    let _ = Command::new("launchctl")
+        .args(["bootout", &format!("gui/{uid}/{label}")])
+        .output();
+    let out = Command::new("launchctl")
+        .args([
+            "bootstrap",
+            &format!("gui/{uid}"),
+            path.to_str().unwrap_or_default(),
+        ])
+        .output()?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if !stderr.contains("already") && !stderr.contains("Bootstrap failed: 17") {
+            anyhow::bail!("launchctl bootstrap {label} failed: {stderr}");
+        }
+    }
+    Ok(())
+}
+
 fn home_launch_agents() -> anyhow::Result<PathBuf> {
     let home = std::env::var("HOME")
         .map_err(|_| anyhow::anyhow!("HOME unset; cannot locate LaunchAgents"))?;
@@ -773,6 +826,20 @@ mod tests {
             !xml.contains("<string>toron</string>"),
             "no literal secret value in the unit"
         );
+    }
+
+    #[test]
+    fn logrotate_plist_is_hourly_and_covers_resonate() {
+        let xml = logrotate_plist_xml();
+        assert!(xml.contains("<string>com.toron.logrotate</string>"));
+        assert!(
+            xml.contains("<key>StartInterval</key>\n\t<integer>3600</integer>"),
+            "hourly, not weekly calendar"
+        );
+        assert!(!xml.contains("StartCalendarInterval"));
+        assert!(xml.contains("resonate.out.log"), "bd-741i: resonate log");
+        assert!(xml.contains("serve.out.log"));
+        assert!(xml.contains("1048576"), "1 MiB copy-truncate threshold");
     }
 
     #[test]
