@@ -120,9 +120,7 @@ async fn drain_reactions(
         if !seen.insert(id.clone()) {
             continue;
         }
-        let Ok(ev): Result<nostr_sdk::nostr::Event, _> =
-            nostr_sdk::nostr::JsonUtil::from_json(&raw)
-        else {
+        let Ok(ev) = toron_core::nostr::Event::from_json(&raw) else {
             continue;
         };
         // reaction_added: kind 7, e-tag = target, content = emoji, h = channel.

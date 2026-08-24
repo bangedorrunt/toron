@@ -15,7 +15,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use nostr_sdk::nostr::{Tag, Timestamp};
+use crate::nostr::{Tag, Timestamp};
 
 use crate::bus::filter::kind_project_filter;
 use crate::bus::scoping::with_project_scoping;
@@ -144,7 +144,7 @@ impl Mailbox {
     /// Find the stored kind-30010 manifest for `slug` (project-scoped `#t`).
     /// Addressable latest-wins per author; any kind-30010 with `d`=slug is the
     /// manifest, so the newest stored event wins.
-    async fn find_manifest(&self, slug: &str) -> anyhow::Result<Option<nostr_sdk::nostr::Event>> {
+    async fn find_manifest(&self, slug: &str) -> anyhow::Result<Option<crate::nostr::Event>> {
         let filter = kind_project_filter(toron_kind(PROJECT_MANIFEST), slug);
         let events = collect_replay(self.bus.as_ref(), filter).await?;
         Ok(events.into_iter().max_by_key(|e| e.created_at.as_secs()))
@@ -235,7 +235,7 @@ mod tests {
     use crate::bus::in_process::{InProcessBus, InProcessBusConfig};
     use crate::index::schema;
     use crate::keys;
-    use nostr_sdk::nostr::{Keys, SubscriptionId, Timestamp};
+    use crate::nostr::{Keys, SubscriptionId, Timestamp};
     use sqlx::SqlitePool;
 
     async fn test_mailbox(

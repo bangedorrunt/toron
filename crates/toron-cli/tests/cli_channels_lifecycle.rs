@@ -1,4 +1,5 @@
 // governed-by: ADR-0020
+// governed-by: ADR-0023
 // (not forbid(unsafe_code): this test sets TORON_MCP_DATA_DIR via
 // std::env::set_var, which is unsafe in edition 2024; the unsafe is confined
 // to the test harness, never to toron-core/toron-mcp library code.)
@@ -229,8 +230,8 @@ fn channel_close_purge_lifecycle_through_binary() {
         String::from_utf8_lossy(&purged.stderr)
     );
     assert!(
-        out_json(&purged)["purged"].as_u64().expect("purged count") >= 4,
-        "create + join + post + close tombstone all purged"
+        out_json(&purged)["purged"].as_u64().expect("purged count") >= 3,
+        "close 39000 supersedes create (NIP-33); join 39002 + post + close remain"
     );
 
     // After purge the channel is GONE (no create event to rebuild).

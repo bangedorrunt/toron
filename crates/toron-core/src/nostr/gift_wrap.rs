@@ -9,12 +9,12 @@
 //! the wrap (up to 2 days back) — the envelope timestamp is NOT the mail
 //! timeline; the rumor's `created_at` is.
 
-use nostr_sdk::nips::nip44;
-use nostr_sdk::nostr::event::builder::Error as BuilderError;
-use nostr_sdk::nostr::event::unsigned::UnsignedEvent;
-use nostr_sdk::nostr::{
-    Event, EventBuilder, JsonUtil, Keys, Kind, PublicKey, SecretKey, Tag, Timestamp,
-};
+use crate::nostr::UnsignedEvent;
+use crate::nostr::{Event, Keys, Kind, PublicKey, SecretKey, Tag, Timestamp};
+use ::nostr::error::Error as BuilderError;
+use ::nostr::event::FinalizeEvent;
+use ::nostr::nips::nip44;
+use ::nostr::nips::nip59::GiftWrapBuilder;
 
 /// Error returned by the gift-wrap/unwrap path.
 #[derive(Debug, thiserror::Error)]
@@ -23,10 +23,8 @@ pub enum GiftWrapError {
     NotGiftWrap,
     #[error("seal sender does not match rumor author")]
     SenderMismatch,
-    #[error("nip44 failure: {0}")]
-    Nip44(#[from] nip44::Error),
-    #[error("event json failure: {0}")]
-    Json(#[from] nostr_sdk::nostr::event::Error),
+    #[error("nostr crypto/json failure: {0}")]
+    Nostr(#[from] ::nostr::error::Error),
     #[error("event verification failure: {0}")]
     Verify(#[from] crate::nostr::event::VerifyError),
 }
@@ -45,7 +43,7 @@ pub fn encrypt(
     secret_key: &SecretKey,
     recipient: &PublicKey,
     content: impl AsRef<[u8]>,
-) -> Result<String, nip44::Error> {
+) -> Result<String, ::nostr::error::Error> {
     nip44::encrypt(secret_key, recipient, content, nip44::Version::V2)
 }
 
@@ -54,7 +52,7 @@ pub fn decrypt(
     secret_key: &SecretKey,
     sender: &PublicKey,
     payload: impl AsRef<[u8]>,
-) -> Result<String, nip44::Error> {
+) -> Result<String, ::nostr::error::Error> {
     nip44::decrypt(secret_key, sender, payload)
 }
 
@@ -72,12 +70,14 @@ pub fn build_rumor(
 /// Wrap a rumor for one recipient: kind-13 seal (sender-signed, content
 /// NIP-44-encrypted to recipient) → kind-1059 gift wrap signed by a random
 /// one-time key. Both seal and wrap get a randomized `created_at` (NIP-17).
-pub async fn gift_wrap(
+///
+/// rust-nostr 0.45 `GiftWrapBuilder` is synchronous (os-rng).
+pub fn gift_wrap(
     sender: &Keys,
     recipient: &PublicKey,
     rumor: UnsignedEvent,
 ) -> Result<Event, BuilderError> {
-    EventBuilder::gift_wrap(sender, recipient, rumor, []).await
+    GiftWrapBuilder::new(*recipient, rumor).finalize(sender)
 }
 
 /// Unwrap a gift wrap for the recipient key.
@@ -89,6 +89,8 @@ pub fn unwrap(recipient: &Keys, gift_wrap: &Event) -> Result<UnwrappedGift, Gift
     if gift_wrap.kind != Kind::GiftWrap {
         return Err(GiftWrapError::NotGiftWrap);
     }
+    // NIP-44: verify the envelope Schnorr sig before decrypting ciphertext.
+    crate::nostr::event::verify_event(gift_wrap)?;
 
     // Outer: decrypt seal with recipient key against the wrap's random pubkey.
     let seal_json = decrypt(
@@ -151,8 +153,8 @@ mod tests {
         )
     }
 
-    #[tokio::test]
-    async fn test_nip44_roundtrip() {
+    #[test]
+    fn test_nip44_roundtrip() {
         let sender = sender_keys();
         let recipient = recipient_keys();
         let cipher =
@@ -163,8 +165,8 @@ mod tests {
         assert_eq!(plain, "top secret");
     }
 
-    #[tokio::test]
-    async fn test_nip44_wrong_recipient_cannot_decrypt() {
+    #[test]
+    fn test_nip44_wrong_recipient_cannot_decrypt() {
         let sender = sender_keys();
         let recipient = recipient_keys();
         let stranger = stranger_keys();
@@ -173,14 +175,12 @@ mod tests {
         assert!(decrypt(stranger.secret_key(), &sender.public_key(), &cipher).is_err());
     }
 
-    #[tokio::test]
-    async fn test_gift_wrap_roundtrip_rumor_identical() {
+    #[test]
+    fn test_gift_wrap_roundtrip_rumor_identical() {
         let sender = sender_keys();
         let recipient = recipient_keys();
         let rumor = sample_rumor(sender.public_key());
-        let wrapped = gift_wrap(&sender, &recipient.public_key(), rumor.clone())
-            .await
-            .expect("wrap");
+        let wrapped = gift_wrap(&sender, &recipient.public_key(), rumor.clone()).expect("wrap");
 
         assert_eq!(wrapped.kind, Kind::GiftWrap);
         assert_eq!(wrapped.kind.as_u16(), 1059);
@@ -194,21 +194,19 @@ mod tests {
         assert_eq!(unwrapped.rumor.tags, rumor.tags);
     }
 
-    #[tokio::test]
-    async fn test_wrong_recipient_cannot_unwrap() {
+    #[test]
+    fn test_wrong_recipient_cannot_unwrap() {
         let sender = sender_keys();
         let recipient = recipient_keys();
         let stranger = stranger_keys();
         let rumor = sample_rumor(sender.public_key());
-        let wrapped = gift_wrap(&sender, &recipient.public_key(), rumor)
-            .await
-            .expect("wrap");
+        let wrapped = gift_wrap(&sender, &recipient.public_key(), rumor).expect("wrap");
 
         assert!(unwrap(&stranger, &wrapped).is_err());
     }
 
-    #[tokio::test]
-    async fn test_non_recipient_cannot_read_seal() {
+    #[test]
+    fn test_non_recipient_cannot_read_seal() {
         // The seal content is NIP-44-encrypted to the recipient; a third party
         // who observes the wrap cannot decrypt the seal even with the sender's
         // pubkey. The wrap's random key never appears to outsiders.
@@ -216,25 +214,21 @@ mod tests {
         let recipient = recipient_keys();
         let stranger = stranger_keys();
         let rumor = sample_rumor(sender.public_key());
-        let wrapped = gift_wrap(&sender, &recipient.public_key(), rumor)
-            .await
-            .expect("wrap");
+        let wrapped = gift_wrap(&sender, &recipient.public_key(), rumor).expect("wrap");
 
         // Stranger attempts: cannot decrypt the seal payload.
         let seal_json = decrypt(stranger.secret_key(), &wrapped.pubkey, &wrapped.content);
         assert!(seal_json.is_err());
     }
 
-    #[tokio::test]
-    async fn test_sender_mismatch_rejected() {
+    #[test]
+    fn test_sender_mismatch_rejected() {
         // A rumor that lies about its author must be rejected (NIP-59).
         let sender = sender_keys();
         let recipient = recipient_keys();
         let impersonated = stranger_keys();
         let rumor = sample_rumor(impersonated.public_key());
-        let wrapped = gift_wrap(&sender, &recipient.public_key(), rumor)
-            .await
-            .expect("wrap");
+        let wrapped = gift_wrap(&sender, &recipient.public_key(), rumor).expect("wrap");
 
         match unwrap(&recipient, &wrapped) {
             Err(GiftWrapError::SenderMismatch) => {}
@@ -242,8 +236,8 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_non_gift_wrap_rejected() {
+    #[test]
+    fn test_non_gift_wrap_rejected() {
         let sender = sender_keys();
         let not_a_wrap = build_event(
             &sender,
@@ -259,15 +253,13 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_wrap_randomizes_created_at() {
+    #[test]
+    fn test_wrap_randomizes_created_at() {
         // NIP-17: seal + wrap created_at are randomized (up to 2 days back).
         let sender = sender_keys();
         let recipient = recipient_keys();
         let rumor = sample_rumor(sender.public_key());
-        let wrapped = gift_wrap(&sender, &recipient.public_key(), rumor)
-            .await
-            .expect("wrap");
+        let wrapped = gift_wrap(&sender, &recipient.public_key(), rumor).expect("wrap");
 
         // The rumor's created_at (mail timeline) differs from the wrap's.
         assert_ne!(wrapped.created_at.as_secs(), 1_700_000_000_u64);
@@ -286,8 +278,8 @@ mod tests {
         assert_eq!(rumor.kind, Kind::PrivateDirectMessage);
     }
 
-    #[tokio::test]
-    async fn test_wrap_uses_fresh_one_time_key_per_wrap() {
+    #[test]
+    fn test_wrap_uses_fresh_one_time_key_per_wrap() {
         // NIP-59 metadata hiding: the wrap's pubkey MUST NOT be the sender's
         // identity key (a relay observer would learn the sender), and two
         // wraps from the same sender MUST use different one-time keys
@@ -295,12 +287,8 @@ mod tests {
         let sender = sender_keys();
         let recipient = recipient_keys();
         let rumor = sample_rumor(sender.public_key());
-        let w1 = gift_wrap(&sender, &recipient.public_key(), rumor.clone())
-            .await
-            .expect("wrap1");
-        let w2 = gift_wrap(&sender, &recipient.public_key(), rumor)
-            .await
-            .expect("wrap2");
+        let w1 = gift_wrap(&sender, &recipient.public_key(), rumor.clone()).expect("wrap1");
+        let w2 = gift_wrap(&sender, &recipient.public_key(), rumor).expect("wrap2");
 
         assert_ne!(
             w1.pubkey,
@@ -321,8 +309,36 @@ mod tests {
         assert_eq!(u.sender, sender.public_key());
     }
 
-    #[tokio::test]
-    async fn test_tampered_seal_rejected() {
+    #[test]
+    fn test_tampered_wrap_envelope_rejected_before_decrypt() {
+        let sender = sender_keys();
+        let recipient = recipient_keys();
+        let rumor = sample_rumor(sender.public_key());
+        let wrapped = gift_wrap(&sender, &recipient.public_key(), rumor).expect("wrap");
+
+        let mut sig_bytes = wrapped.sig.to_bytes();
+        sig_bytes[0] ^= 0xFF;
+        let bad_sig = crate::nostr::Signature::from_slice(&sig_bytes).expect("sig parse");
+        let forged = Event::new(
+            wrapped.id,
+            wrapped.pubkey,
+            wrapped.created_at,
+            wrapped.kind,
+            wrapped.tags.clone(),
+            wrapped.content.clone(),
+            bad_sig,
+        );
+        match unwrap(&recipient, &forged) {
+            Err(GiftWrapError::Verify(_)) => {}
+            other => panic!(
+                "forged wrap sig must fail verify before decrypt, got {:?}",
+                other.map(|_| ())
+            ),
+        }
+    }
+
+    #[test]
+    fn test_tampered_seal_rejected() {
         // The seal (kind-13) is sender-SIGNED, not just encrypted. Tampering
         // the seal's content invalidates its id/sig; unwrap must reject it at
         // verify_event (gift_wrap.rs:100), never deliver a forged rumor.
@@ -331,11 +347,10 @@ mod tests {
         let rumor = sample_rumor(sender.public_key());
 
         // Build the honest seal, then tamper with its content.
-        let seal = EventBuilder::seal(&sender, &recipient.public_key(), rumor.clone())
-            .await
-            .expect("seal")
-            .sign_with_keys(&sender)
-            .expect("sign seal");
+        let seal =
+            ::nostr::nips::nip59::GiftWrapSealBuilder::new(rumor.clone(), recipient.public_key())
+                .finalize(&sender)
+                .expect("seal");
         let tampered = Event::new(
             seal.id,
             seal.pubkey,
@@ -345,13 +360,18 @@ mod tests {
             "TAMPERED",
             seal.sig,
         );
-        // Wrap the tampered seal as a valid-looking gift wrap.
-        let wrapped = EventBuilder::gift_wrap_from_seal(
+        // Wrap the tampered seal as a valid-looking gift wrap (ephemeral key).
+        let ephemeral = Keys::generate();
+        let content = encrypt(
+            ephemeral.secret_key(),
             &recipient.public_key(),
-            &tampered,
-            Vec::<Tag>::new(),
+            tampered.as_json(),
         )
-        .expect("wrap tampered seal");
+        .expect("encrypt tampered seal");
+        let wrapped = crate::nostr::EventBuilder::new(Kind::GiftWrap, content)
+            .tag(Tag::public_key(recipient.public_key()))
+            .finalize(&ephemeral)
+            .expect("wrap tampered seal");
         match unwrap(&recipient, &wrapped) {
             Err(GiftWrapError::Verify(_)) => {}
             other => panic!(
@@ -361,14 +381,12 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_rumor_content_not_visible_in_wrap() {
+    #[test]
+    fn test_rumor_content_not_visible_in_wrap() {
         let sender = sender_keys();
         let recipient = recipient_keys();
         let rumor = sample_rumor(sender.public_key());
-        let wrapped = gift_wrap(&sender, &recipient.public_key(), rumor)
-            .await
-            .expect("wrap");
+        let wrapped = gift_wrap(&sender, &recipient.public_key(), rumor).expect("wrap");
         assert!(!wrapped.content.contains("secret payload"));
         // Job kinds work through the same wrapper.
         let job_rumor = build_rumor(
@@ -378,9 +396,8 @@ mod tests {
             Vec::<Tag>::new(),
             "job done",
         );
-        let wrapped_job = gift_wrap(&sender, &recipient.public_key(), job_rumor.clone())
-            .await
-            .expect("wrap job");
+        let wrapped_job =
+            gift_wrap(&sender, &recipient.public_key(), job_rumor.clone()).expect("wrap job");
         let unwrapped = unwrap(&recipient, &wrapped_job).expect("unwrap job");
         assert_eq!(unwrapped.rumor.kind.as_u16(), JOB_RESULT);
     }

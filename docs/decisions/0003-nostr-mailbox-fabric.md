@@ -2,7 +2,7 @@
 status: accepted
 date: 2026-08-04
 accepted: 2026-08-04
-revision: 6
+revision: 8
 decision-makers: bangedorrunt (captain)
 consulted: ""
 informed: ""
@@ -16,6 +16,13 @@ related: [flywheel, herdr, mcp_agent_mail_rust, nostrdevkit/nostr]
 > `mcp_agent_mail_rust` ("AM-Rust") feature-parity contract, the herdr backend
 > protocol, the flywheel integration contract, and the dependency-direction
 > analysis so a future agent can implement without external lookups.
+>
+> **Revision 8 (2026-08-24):** rust-nostr **0.45.x is stable**. Pin is now
+> `nostr-sdk` 0.45.2 + `nostr` 0.45.3 (`nip44`/`nip49`/`nip59`/`os-rng`).
+> Protocol types live in the `nostr` crate (no `nostr_sdk::nostr` nest).
+> Signing is `FinalizeEvent::finalize`. Gift wrap is sync `GiftWrapBuilder`.
+> Channel metadata emit is ADR-0023 (39000/39002). The 0.44.x pin in Rev 5
+> is historical.
 >
 > **Revision 7 (2026-08-05):** MCP crate corrigendum + 2026-07-28 spec alignment.
 > `fastmcp-rust` (Dicklesworthstone/fastmcp_rust) is built on **asupersync** — the
@@ -798,9 +805,9 @@ toron/                          # Cargo workspace
 - `[agent_mail]` config optional (remote-daemon mode only).
 
 ### Dependencies
-- **Add (toron-core):** `nostr` / `nostr-sdk` **pinned to the 0.44.x line**
-  (Buzz-proven; the current 0.45.0-alpha.8 is pre-release — revisit on stable;
-  features: nip44/nip59/nip17/nip40/nip50/nip49), `tokio` (full), `sqlx`
+- **Add (toron-core):** `nostr` / `nostr-sdk` **pinned to the 0.45.x line**
+  (Rev 8; 0.45 is stable. Protocol types in the `nostr` crate; NIP features
+  `nip44`/`nip49`/`nip59` + `os-rng` on `nostr`), `tokio` (full), `sqlx`
   (sqlite, runtime-tokio; WAL pragmas; dedicated write conn), `git2`
   (libgit2 vendored), `tokio-tungstenite` (`RelayBus`/daemon relay), `axum`
   (MCP/HTTP), `resonate-sdk` (sync HTTP → `spawn_blocking`), `ratatui`

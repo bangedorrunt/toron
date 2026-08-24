@@ -59,19 +59,14 @@ impl FileRef {
 
     /// The kind-15 tag set: `x`=sha256, `file-type`, optional
     /// `decryption-key` (NIP-17 file-message shape).
-    pub fn tags(&self) -> Vec<nostr_sdk::nostr::Tag> {
+    pub fn tags(&self) -> Vec<crate::nostr::Tag> {
         let mut tags = vec![
-            nostr_sdk::nostr::Tag::parse(["x", &self.sha256]).expect("x tag"),
-            nostr_sdk::nostr::Tag::parse([
-                "file-type",
-                &self.file_type.clone().unwrap_or_default(),
-            ])
-            .expect("file-type tag"),
+            crate::nostr::Tag::parse(["x", &self.sha256]).expect("x tag"),
+            crate::nostr::Tag::parse(["file-type", &self.file_type.clone().unwrap_or_default()])
+                .expect("file-type tag"),
         ];
         if let Some(k) = &self.decryption_key {
-            tags.push(
-                nostr_sdk::nostr::Tag::parse(["decryption-key", k]).expect("decryption-key tag"),
-            );
+            tags.push(crate::nostr::Tag::parse(["decryption-key", k]).expect("decryption-key tag"));
         }
         tags
     }

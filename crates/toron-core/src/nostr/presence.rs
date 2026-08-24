@@ -11,8 +11,8 @@
 //! This module is the pure event-shape half: build + parse kind-20001 events.
 //! The live broker (broadcast fan-out + expiry) lives in `bus::presence`.
 
-use nostr_sdk::nostr::event::builder::Error as BuilderError;
-use nostr_sdk::nostr::{Event, EventId, Keys, PublicKey, Tag, Timestamp};
+use crate::nostr::{Event, EventId, Keys, PublicKey, Tag, Timestamp};
+use ::nostr::error::Error as BuilderError;
 
 use crate::nostr::event::build_event;
 use crate::nostr::kinds::{PRESENCE, toron_kind};
@@ -92,7 +92,6 @@ pub fn presence_author(event: &Event) -> PublicKey {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nostr_sdk::nostr::JsonUtil;
 
     #[test]
     fn test_presence_state_serde() {
@@ -136,7 +135,7 @@ mod tests {
         let keys = Keys::generate();
         let note = build_event(
             &keys,
-            nostr_sdk::nostr::Kind::TextNote,
+            crate::nostr::Kind::TextNote,
             "hi",
             Vec::<Tag>::new(),
             Timestamp::from(1_700_000_000_u64),

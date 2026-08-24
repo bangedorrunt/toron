@@ -30,8 +30,8 @@
 
 use std::collections::HashMap;
 
-use nostr_sdk::nostr::event::unsigned::UnsignedEvent;
-use nostr_sdk::nostr::{Event, EventId, Keys, PublicKey, Tag, Timestamp};
+use crate::nostr::UnsignedEvent;
+use crate::nostr::{Event, EventId, Keys, PublicKey, Tag, Timestamp};
 use sqlx::Row;
 
 use crate::backend::herdr::HerdrBackend;
@@ -278,9 +278,8 @@ impl Mailbox {
 
         // to+cc: one gift wrap per recipient, same visible rumor.
         for r in resolved.iter().filter(|r| r.role != RecipientRole::Bcc) {
-            let wrap = gift_wrap::gift_wrap(&sender_keys, &r.npub, visible.clone())
-                .await
-                .map_err(|e| {
+            let wrap =
+                gift_wrap::gift_wrap(&sender_keys, &r.npub, visible.clone()).map_err(|e| {
                     anyhow::anyhow!("gift wrap failed for to/cc recipient {}: {e}", r.name)
                 })?;
             let delivered = self.publish_dm(&wrap).await?;
@@ -299,11 +298,9 @@ impl Mailbox {
         for r in resolved.iter().filter(|r| r.role == RecipientRole::Bcc) {
             let variant = build_bcc_rumor(&sender_keys.public_key(), &args, &resolved, r);
             let variant_id = variant.clone().id().to_hex();
-            let wrap = gift_wrap::gift_wrap(&sender_keys, &r.npub, variant)
-                .await
-                .map_err(|e| {
-                    anyhow::anyhow!("gift wrap failed for bcc recipient {}: {e}", r.name)
-                })?;
+            let wrap = gift_wrap::gift_wrap(&sender_keys, &r.npub, variant).map_err(|e| {
+                anyhow::anyhow!("gift wrap failed for bcc recipient {}: {e}", r.name)
+            })?;
             let delivered = self.publish_dm(&wrap).await?;
             if delivered {
                 deliveries.push(Delivery {
@@ -408,7 +405,7 @@ impl Mailbox {
         // store cap explicitly; the caller-facing `limit` only trims rows
         // AFTER projection.
         let filter = ToronFilter::new()
-            .kinds([nostr_sdk::nostr::Kind::GiftWrap])
+            .kinds([crate::nostr::Kind::GiftWrap])
             .pubkey(npub)
             .limit(crate::bus::event_store::MAX_STORED_EVENTS as usize)
             .build();
@@ -689,12 +686,11 @@ impl Mailbox {
         let rumor = gift_wrap::build_rumor(
             npub,
             Timestamp::now(),
-            nostr_sdk::nostr::Kind::PrivateDirectMessage,
+            crate::nostr::Kind::PrivateDirectMessage,
             tags,
             "",
         );
         let wrap = gift_wrap::gift_wrap(&agent_keys, &sender_npub, rumor)
-            .await
             .map_err(|e| anyhow::anyhow!("gift wrap failed for receipt to {sender_npub}: {e}"))?;
         let ts_us = crate::index::writer::Clock::now_us(&crate::index::writer::SystemClock);
         self.publish_dm(&wrap).await?;
@@ -717,7 +713,7 @@ impl Mailbox {
     ) -> anyhow::Result<Option<UnwrappedGift>> {
         let npub = keys.public_key();
         let filter = ToronFilter::new()
-            .kinds([nostr_sdk::nostr::Kind::GiftWrap])
+            .kinds([crate::nostr::Kind::GiftWrap])
             .pubkey(npub)
             .build();
         let events = super::collect_replay(self.bus.as_ref(), filter).await?;
@@ -795,7 +791,7 @@ impl Mailbox {
         if let Some(thread_id) = Self::rumor_thread_id(&gift.rumor) {
             let acker_npub = acker_keys.public_key();
             let filter = ToronFilter::new()
-                .kinds([nostr_sdk::nostr::Kind::GiftWrap])
+                .kinds([crate::nostr::Kind::GiftWrap])
                 .pubkey(acker_npub)
                 .build();
             let events = super::collect_replay(self.bus.as_ref(), filter).await?;
@@ -822,7 +818,7 @@ impl Mailbox {
 
     /// The thread id of a rumor: the literal `thread` tag, else the NIP-10
     /// `e` root tag (mirrors the projection's thread attribution).
-    fn rumor_thread_id(rumor: &nostr_sdk::nostr::UnsignedEvent) -> Option<String> {
+    fn rumor_thread_id(rumor: &crate::nostr::UnsignedEvent) -> Option<String> {
         rumor.tags.iter().find_map(|t| {
             let s = t.as_slice();
             match s.first().map(|x| x.as_str()) {
@@ -873,7 +869,7 @@ impl Mailbox {
                     // own canonical label).
                     (
                         name.clone(),
-                        nostr_sdk::nostr::PublicKey::from_hex(name)
+                        crate::nostr::PublicKey::from_hex(name)
                             .map_err(|_| anyhow::anyhow!("invalid npub recipient: {name}"))?,
                     )
                 } else if mode == super::naming::IdentityMode::Swarm {
@@ -1029,7 +1025,7 @@ fn build_visible_rumor(
     gift_wrap::build_rumor(
         *author,
         Timestamp::now(),
-        nostr_sdk::nostr::Kind::PrivateDirectMessage,
+        crate::nostr::Kind::PrivateDirectMessage,
         tags,
         args.body_md.clone(),
     )
@@ -1058,7 +1054,7 @@ fn build_bcc_rumor(
     gift_wrap::build_rumor(
         *author,
         Timestamp::now(),
-        nostr_sdk::nostr::Kind::PrivateDirectMessage,
+        crate::nostr::Kind::PrivateDirectMessage,
         tags,
         args.body_md.clone(),
     )
@@ -1123,7 +1119,11 @@ fn add_message_tags(tags: &mut Vec<Tag>, args: &SendMessage) {
             tags.push(t);
         }
         if let Ok(root) = EventId::from_hex(thread) {
-            tags.push(Tag::event(root)); // NIP-10 e = root, reply role
+            // NIP-10 marked e-tag: a direct reply to the thread root uses
+            // the `root` marker (positional e-tags are deprecated).
+            if let Ok(t) = Tag::parse(["e", &root.to_hex(), "", "root"]) {
+                tags.push(t);
+            }
         }
     }
 }
@@ -1204,7 +1204,7 @@ pub fn collapse_duplicates(messages: Vec<InboxMessage>) -> Vec<InboxMessage> {
 }
 
 /// True when a flag tag (no value) is present, e.g. `["ack-required"]`.
-fn tag_has_flag(tags: &nostr_sdk::nostr::Tags, name: &str) -> bool {
+fn tag_has_flag(tags: &crate::nostr::Tags, name: &str) -> bool {
     tags.iter()
         .any(|t| t.as_slice().first().map(|s| s.as_str()) == Some(name))
 }
@@ -1234,6 +1234,35 @@ mod tests {
     use std::sync::Arc;
 
     const PASSPHRASE: &str = "messaging-test-pass";
+
+    /// NIP-10: a hex thread_id must emit a marked `e` tag (`root`), not a
+    /// positional `["e", id]` pair.
+    #[test]
+    fn reply_hex_thread_emits_marked_nip10_root_e_tag() {
+        let mut tags = Vec::new();
+        let args = SendMessage {
+            thread_id: Some(
+                "b32828720d7e8a80dd5165a6cd31b2c70e8d25b83c387209cb138e77d7e7e05b".into(),
+            ),
+            subject: "reply".into(),
+            ..Default::default()
+        };
+        add_message_tags(&mut tags, &args);
+        let e = tags
+            .iter()
+            .find(|t| t.as_slice().first().map(String::as_str) == Some("e"))
+            .expect("e tag");
+        let parts = e.as_slice();
+        assert_eq!(
+            parts.get(3).map(String::as_str),
+            Some("root"),
+            "NIP-10 marker must be root, tags={parts:?}"
+        );
+        assert_eq!(
+            parts.get(1).map(String::as_str),
+            Some("b32828720d7e8a80dd5165a6cd31b2c70e8d25b83c387209cb138e77d7e7e05b")
+        );
+    }
 
     async fn test_mailbox(tag: &str) -> (Mailbox, std::path::PathBuf, std::path::PathBuf) {
         let db_path =
@@ -1308,7 +1337,7 @@ mod tests {
     /// Drain gift-wrap events addressed to `npub` from the bus.
     async fn wraps_to(mailbox: &Mailbox, npub: &PublicKey, limit: usize) -> Vec<Event> {
         let filter = ToronFilter::new()
-            .kinds([nostr_sdk::nostr::Kind::GiftWrap])
+            .kinds([crate::nostr::Kind::GiftWrap])
             .pubkey(*npub)
             .build();
         let events = super::super::collect_replay(mailbox.bus.as_ref(), filter)
@@ -1629,7 +1658,7 @@ mod tests {
             .rumor;
         assert_eq!(rumor_a.content, "please review");
         assert_eq!(rumor_b.content, "please review");
-        assert_eq!(rumor_a.kind, nostr_sdk::nostr::Kind::PrivateDirectMessage);
+        assert_eq!(rumor_a.kind, crate::nostr::Kind::PrivateDirectMessage);
 
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_dir_all(&data_dir);

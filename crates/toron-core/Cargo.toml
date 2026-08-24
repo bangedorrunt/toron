@@ -1,7 +1,7 @@
 # governed-by: ADR-0003
 [package]
 name = "toron-core"
-version = "1.1.0"
+version = "1.2.0"
 edition = "2024"
 
 [dependencies]
@@ -20,7 +20,8 @@ anyhow = "1"
 async-trait = "0.1"
 thiserror = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
-nostr-sdk = { version = "0.44", features = ["nip44", "nip49", "nip59"] }
+nostr-sdk = "0.45.2"
+nostr = { version = "0.45.3", features = ["nip44", "nip49", "nip59", "os-rng"] }
 negentropy = "0.5"
 hex = "0.4"
 ed25519-dalek = { version = "2.2", features = ["rand_core"] }

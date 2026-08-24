@@ -24,7 +24,8 @@ pub mod subscription;
 pub mod ttl;
 
 pub use addressable::{
-    AddressableKey, KeyPriority, is_addressable, is_revocation, resolve_coordinate,
+    AddressableKey, KeyPriority, is_addressable, is_revocation, nip01_replaceable_cmp,
+    resolve_coordinate,
 };
 pub use event_store::BusEventStore;
 pub use federation::{FederationIssue, FederationMode, FederationPolicy, PowDifficulty};
@@ -41,13 +42,13 @@ pub use scoping::{
 pub use subscription::{Subscription, SubscriptionEvent, SubscriptionId};
 pub use ttl::{DEFAULT_ENVELOPE_TTL_SECS, EnvelopeTtl};
 
-use nostr_sdk::nostr::Event;
+use crate::nostr::Event;
 
 /// Outcome of a successful publish.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PublishOk {
     /// Wire-identical event id as accepted by the bus.
-    pub event_id: nostr_sdk::nostr::EventId,
+    pub event_id: crate::nostr::EventId,
     /// True when the event was newly stored; false when deduped (duplicate).
     pub stored: bool,
 }
@@ -130,11 +131,10 @@ pub trait Bus: Send + Sync + 'static {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nostr_sdk::nostr::JsonUtil;
 
     #[test]
     fn test_publish_ok_shapes() {
-        let id = nostr_sdk::nostr::EventId::from_hex(
+        let id = crate::nostr::EventId::from_hex(
             "b32828720d7e8a80dd5165a6cd31b2c70e8d25b83c387209cb138e77d7e7e05b",
         )
         .expect("id");
@@ -189,8 +189,8 @@ mod tests {
     fn test_event_roundtrips_through_json() {
         use crate::nostr::event::build_event;
         use crate::nostr::kinds::PROJECT_MANIFEST;
-        use nostr_sdk::nostr::{Tag, Timestamp};
-        let keys = nostr_sdk::nostr::Keys::generate();
+        use crate::nostr::{Tag, Timestamp};
+        let keys = crate::nostr::Keys::generate();
         let ev = build_event(
             &keys,
             crate::nostr::kinds::toron_kind(PROJECT_MANIFEST),
@@ -200,7 +200,7 @@ mod tests {
         )
         .expect("build");
         let json = ev.as_json();
-        let parsed = nostr_sdk::nostr::Event::from_json(json).expect("parse");
+        let parsed = crate::nostr::Event::from_json(json).expect("parse");
         assert_eq!(parsed, ev);
         assert_eq!(parsed.kind.as_u16(), PROJECT_MANIFEST);
     }

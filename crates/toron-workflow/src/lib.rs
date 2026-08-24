@@ -29,8 +29,8 @@ pub mod schema;
 pub mod trigger_filter;
 
 pub use channels::{
-    CHANNEL_CREATE, CHANNEL_MESSAGE, CHANNEL_MESSAGE_LEGACY, CHANNEL_METADATA, Channel,
-    ChannelEvent, ChannelStore, REACTION,
+    CHANNEL_CREATE, CHANNEL_CREATE_LEGACY, CHANNEL_MEMBERS, CHANNEL_MESSAGE,
+    CHANNEL_MESSAGE_LEGACY, CHANNEL_METADATA_LEGACY, Channel, ChannelEvent, ChannelStore, REACTION,
 };
 pub use cron::{
     CronManager, CronRegistration, CronRegistry, CronSpecRegistration, CronSpecRegistry,

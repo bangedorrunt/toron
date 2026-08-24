@@ -15,7 +15,7 @@
 //! `e`-tags the post. `#t` is the project slug ONLY — the assignee rides the
 //! free-form `assignee` tag (ADR-0003 A3/G6).
 
-use nostr_sdk::nostr::{Event, EventId, Keys, PublicKey, Tag, TagKind, Timestamp};
+use nostr::prelude::{Event, EventId, Keys, PublicKey, Tag, Timestamp};
 
 use crate::coalesce::{CoalesceDecision, Coalesced, InboundMention, MentionCoalescer};
 use crate::jobs::{JobRequest, build_job_request_with_tags};
@@ -62,7 +62,7 @@ pub fn build_job_from_coalesced(
     requester: &Keys,
     project_slug: Option<&str>,
     created_at: Timestamp,
-) -> Result<Event, nostr_sdk::nostr::event::builder::Error> {
+) -> Result<Event, nostr::error::Error> {
     let parent = EventId::from_hex(batch.parent()).ok();
     let payload = JobRequest {
         title: format!("mention for {}", batch.assignee),
@@ -84,7 +84,7 @@ pub struct Mention {
     /// The mentioned agent's display name as written (`@name`).
     pub name: String,
     /// The triggering message id (the job's parent `e`).
-    pub message_id: nostr_sdk::nostr::EventId,
+    pub message_id: EventId,
     /// The trigger message content.
     pub content: String,
 }
@@ -98,7 +98,7 @@ pub fn parse_mentions(event: &Event) -> Vec<Mention> {
     // The `p` tags carry the mentioned recipients (kind-14 DM or kind-9).
     let mut mentions = Vec::new();
     for tag in event.tags.iter() {
-        if tag.kind() != TagKind::p() {
+        if tag.kind() != "p" {
             continue;
         }
         let parts = tag.as_slice();
@@ -153,8 +153,8 @@ pub fn is_mention(event: &Event) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nostr_sdk::nostr::event::builder::Error;
-    use nostr_sdk::nostr::{EventBuilder, JsonUtil, Keys, Tag};
+    use nostr::error::Error;
+    use nostr::prelude::{EventBuilder, FinalizeEvent, Keys, Kind, Tag};
 
     fn keys() -> Keys {
         Keys::generate()
@@ -166,9 +166,9 @@ mod tests {
             .iter()
             .map(|n| Tag::parse(["p", n]).expect("p"))
             .collect();
-        EventBuilder::new(nostr_sdk::nostr::Kind::TextNote, content)
+        EventBuilder::new(Kind::TextNote, content)
             .tags(tags)
-            .sign_with_keys(&k)
+            .finalize(&k)
     }
 
     #[test]
@@ -226,13 +226,13 @@ mod tests {
         let requester = keys();
         let bob = keys();
         // A kind-9 channel post: `@Bob take the repro` + p tag for Bob.
-        let post = EventBuilder::new(nostr_sdk::nostr::Kind::from_u16(9), "@Bob take the repro")
+        let post = EventBuilder::new(Kind::from_u16(9), "@Bob take the repro")
             .tags(vec![
                 Tag::parse(["h", "steer-1"]).expect("h"),
                 Tag::parse(["t", "toron"]).expect("t"),
                 Tag::public_key(bob.public_key()),
             ])
-            .sign_with_keys(&requester)
+            .finalize(&requester)
             .expect("sign kind-9 post");
         assert!(is_mention(&post), "@Bob + p tag is a mention");
 
@@ -248,8 +248,10 @@ mod tests {
         assert_eq!(job.kind.as_u16(), 43001, "one 43001 per coalesced batch");
         // e-tags the kind-9 post.
         assert!(
-            job.tags.iter().any(|t| t.kind() == TagKind::e()
-                && t.content().map(|c| c == post.id.to_hex()).unwrap_or(false)),
+            job.tags
+                .iter()
+                .any(|t| t.kind() == "e"
+                    && t.content().map(|c| c == post.id.to_hex()).unwrap_or(false)),
             "43001 e-tags the post, tags={:?}",
             job.tags
         );

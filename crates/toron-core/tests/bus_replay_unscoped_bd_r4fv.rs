@@ -26,20 +26,20 @@ use toron_core::nostr::event::build_event;
 use toron_core::nostr::kinds::{FILE_RESERVATION, toron_kind};
 
 fn lease_event(
-    keys: &nostr_sdk::nostr::Keys,
+    keys: &toron_core::nostr::Keys,
     slug: Option<&str>,
     body: &str,
-) -> nostr_sdk::nostr::Event {
-    let mut tags = vec![nostr_sdk::nostr::Tag::parse(["d", body]).expect("d")];
+) -> toron_core::nostr::Event {
+    let mut tags = vec![toron_core::nostr::Tag::parse(["d", body]).expect("d")];
     if let Some(slug) = slug {
-        tags.push(nostr_sdk::nostr::Tag::parse(["t", slug]).expect("t"));
+        tags.push(toron_core::nostr::Tag::parse(["t", slug]).expect("t"));
     }
     build_event(
         keys,
         toron_kind(FILE_RESERVATION),
         body,
         tags,
-        nostr_sdk::nostr::Timestamp::now(),
+        toron_core::nostr::Timestamp::now(),
     )
     .expect("build")
 }
@@ -51,7 +51,7 @@ async fn replay_contract_store_raw_vs_bus_gated_bd_r4fv() {
         .await
         .expect("connect");
     let store = BusEventStore::new(pool.clone()).await.expect("store");
-    let keys = nostr_sdk::nostr::Keys::generate();
+    let keys = toron_core::nostr::Keys::generate();
 
     for (slug, body) in [
         (Some("alpha"), "lease-a1"),

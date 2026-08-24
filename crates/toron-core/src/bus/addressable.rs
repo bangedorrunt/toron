@@ -16,7 +16,7 @@
 //! federated / multi-writer views: the operator's `status:revoked` event wins
 //! over the agent's lease regardless of NIP-33 author isolation.
 
-use nostr_sdk::nostr::{Event, Kind, PublicKey, TagKind};
+use crate::nostr::{Event, Kind, PublicKey};
 
 /// Parameterized-replaceable kinds (NIP-33): 30000–39999.
 pub const ADDRESSABLE_KIND_MIN: u16 = 30000;
@@ -48,13 +48,10 @@ impl AddressableKey {
         if !is_addressable(event.kind) {
             return None;
         }
-        let d = event.tags.iter().find_map(|t| {
-            if t.kind() == TagKind::d() {
-                t.content()
-            } else {
-                None
-            }
-        })?;
+        let d = event
+            .tags
+            .iter()
+            .find_map(|t| if t.kind() == "d" { t.content() } else { None })?;
         Some(Self {
             kind: event.kind.as_u16(),
             pubkey: event.pubkey.to_hex(),
@@ -124,17 +121,21 @@ pub fn resolve_coordinate<'a>(
         .max()
         .unwrap_or(KeyPriority::Agent);
 
-    // Among the best class, latest-wins (created_at desc, then event_id desc).
+    // Among the best class, NIP-01 latest-wins (created_at desc, lowest id).
     events
         .into_iter()
         .filter(|e| KeyPriority::of(e, operator) == best_class)
-        .max_by(|a, b| {
-            a.created_at
-                .as_secs()
-                .cmp(&b.created_at.as_secs())
-                .then_with(|| a.id.to_bytes().cmp(&b.id.to_bytes()))
-        })
+        .max_by(|a, b| nip01_replaceable_cmp(a, b))
         .cloned()
+}
+
+/// NIP-01 replaceable/addressable order: higher `created_at` wins; on a
+/// timestamp tie, the lexicographically lowest event id wins.
+pub fn nip01_replaceable_cmp(a: &Event, b: &Event) -> std::cmp::Ordering {
+    a.created_at
+        .as_secs()
+        .cmp(&b.created_at.as_secs())
+        .then_with(|| b.id.to_hex().cmp(&a.id.to_hex()))
 }
 
 #[cfg(test)]
@@ -142,7 +143,7 @@ mod tests {
     use super::*;
     use crate::nostr::event::build_event;
     use crate::nostr::kinds::{FILE_RESERVATION, PROJECT_MANIFEST};
-    use nostr_sdk::nostr::{Keys, Tag, Timestamp};
+    use crate::nostr::{Keys, Tag, Timestamp};
 
     fn reservation(keys: &Keys, d: &str, content: &str, ts: u64) -> Event {
         build_event(
@@ -163,8 +164,8 @@ mod tests {
         assert!(is_addressable(crate::nostr::kinds::toron_kind(
             PROJECT_MANIFEST
         )));
-        assert!(!is_addressable(nostr_sdk::nostr::Kind::TextNote));
-        assert!(!is_addressable(nostr_sdk::nostr::Kind::GiftWrap));
+        assert!(!is_addressable(crate::nostr::Kind::TextNote));
+        assert!(!is_addressable(crate::nostr::Kind::GiftWrap));
     }
 
     #[test]
@@ -179,7 +180,7 @@ mod tests {
         // Non-addressable → None.
         let note = build_event(
             &keys,
-            nostr_sdk::nostr::Kind::TextNote,
+            crate::nostr::Kind::TextNote,
             "hi",
             Vec::<Tag>::new(),
             Timestamp::from(1_700_000_000_u64),
@@ -278,5 +279,28 @@ mod tests {
     #[test]
     fn test_resolve_empty() {
         assert!(resolve_coordinate(Vec::<&Event>::new(), None).is_none());
+    }
+
+    /// NIP-01: equal `created_at` keeps the lowest id (lexicographic).
+    #[test]
+    fn test_equal_created_at_keeps_lowest_id() {
+        let agent = Keys::generate();
+        let a = reservation(&agent, "proj:src/**", "lease-a", 1_700_000_000);
+        let b = reservation(&agent, "proj:src/**", "lease-b", 1_700_000_000);
+        assert_ne!(a.id, b.id);
+        let (low, high) = if a.id.to_hex() < b.id.to_hex() {
+            (a, b)
+        } else {
+            (b, a)
+        };
+        let resolved = resolve_coordinate([&high, &low], None).expect("resolved");
+        assert_eq!(
+            resolved.id,
+            low.id,
+            "NIP-01 tie-break: lowest id wins, got {}",
+            resolved.id.to_hex()
+        );
+        let resolved_rev = resolve_coordinate([&low, &high], None).expect("resolved");
+        assert_eq!(resolved_rev.id, low.id, "order-independent lowest id");
     }
 }

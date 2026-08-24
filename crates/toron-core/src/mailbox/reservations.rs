@@ -42,7 +42,7 @@
 //! [`REQUEST_RELEASE_TIER_WINDOW_SECS`] escalates to a kind-14 DM to the
 //! captain (the operator key). Force-release stays the operator last resort.
 
-use nostr_sdk::nostr::{Event, EventId, Keys, Kind, PublicKey, Tag, Timestamp};
+use crate::nostr::{Event, EventId, Keys, Kind, PublicKey, Tag, Timestamp};
 
 use crate::bus::addressable::is_revocation;
 use crate::bus::filter::{ToronFilter, kind_project_filter};
@@ -913,7 +913,7 @@ impl Mailbox {
             let rumor = crate::nostr::gift_wrap::build_rumor(
                 holder_keys.public_key(),
                 Timestamp::now(),
-                nostr_sdk::nostr::Kind::PrivateDirectMessage,
+                crate::nostr::Kind::PrivateDirectMessage,
                 vec![
                     Tag::parse(["toron-kind", "reservation-revoked"]).expect("kind"),
                     Tag::parse(["p", &lease.agent_pubkey]).expect("p"),
@@ -929,7 +929,6 @@ impl Mailbox {
                 ),
             );
             let wrap = crate::nostr::gift_wrap::gift_wrap(&holder_keys, &holder_npub, rumor)
-                .await
                 .expect("wrap notify");
             // F2.SILENT-DROP (batch-fix): a failed force-release notification
             // DM must be loud — the force-released holder is entitled to know.
@@ -1124,7 +1123,7 @@ impl Mailbox {
                 let rumor = crate::nostr::gift_wrap::build_rumor(
                     holder_keys.public_key(),
                     Timestamp::now(),
-                    nostr_sdk::nostr::Kind::PrivateDirectMessage,
+                    crate::nostr::Kind::PrivateDirectMessage,
                     vec![
                         Tag::parse(["toron-kind", "reservation-revoked"]).expect("kind"),
                         Tag::parse(["p", &lease.agent_pubkey]).expect("p"),
@@ -1137,7 +1136,6 @@ impl Mailbox {
                     ),
                 );
                 let wrap = crate::nostr::gift_wrap::gift_wrap(&holder_keys, &holder_npub, rumor)
-                    .await
                     .expect("wrap notify");
                 // F2.SILENT-DROP: a failed release notification DM must be
                 // loud — the released holder is entitled to know.
@@ -1269,7 +1267,7 @@ impl Mailbox {
             if let Some(d) = ev
                 .tags
                 .iter()
-                .find_map(|t| (t.kind() == nostr_sdk::nostr::TagKind::d()).then(|| t.content()))
+                .find_map(|t| (t.kind() == "d").then(|| t.content()))
                 .flatten()
             {
                 by_d.entry(d.to_string()).or_default().push(ev);
@@ -2006,7 +2004,7 @@ impl Mailbox {
                 note.map(|n| format!(" — {n}")).unwrap_or_default()
             ),
         );
-        let wrap = gift_wrap::gift_wrap(&keys, &operator_npub, rumor).await?;
+        let wrap = gift_wrap::gift_wrap(&keys, &operator_npub, rumor)?;
         self.publish_dm(&wrap).await?;
         Ok(())
     }
@@ -2050,7 +2048,7 @@ impl Mailbox {
     /// project, deduped by rumor id. Mirrors the projection's per-key unwrap
     /// (G14): a sender cannot unwrap its own wrap (sealed for the recipient),
     /// so status/escalation lookups must scan the recipient side too.
-    async fn project_rumors(&self, project_slug: &str) -> Vec<nostr_sdk::nostr::UnsignedEvent> {
+    async fn project_rumors(&self, project_slug: &str) -> Vec<crate::nostr::UnsignedEvent> {
         let filter = ToronFilter::new().kinds([Kind::GiftWrap]).build();
         let Ok(wraps) = collect_replay(self.bus.as_ref(), filter).await else {
             return Vec::new();
@@ -2269,7 +2267,7 @@ pub fn lease_status(winning: &Event) -> ReservationStatus {
 }
 
 /// First value of a `["<name>", <value>, ...]` tag (pair form only).
-fn lease_tag_value(tags: &nostr_sdk::nostr::Tags, name: &str) -> Option<String> {
+fn lease_tag_value(tags: &crate::nostr::Tags, name: &str) -> Option<String> {
     tags.iter().find_map(|t| {
         (t.as_slice().first().map(|s| s == name).unwrap_or(false))
             .then(|| t.as_slice().get(1).map(|s| s.to_string()))
@@ -2278,7 +2276,7 @@ fn lease_tag_value(tags: &nostr_sdk::nostr::Tags, name: &str) -> Option<String> 
 }
 
 /// True when a rumor's `p` tags address `npub_hex` (kind-14 recipient list).
-fn rumor_addresses(rumor: &nostr_sdk::nostr::UnsignedEvent, npub_hex: &str) -> bool {
+fn rumor_addresses(rumor: &crate::nostr::UnsignedEvent, npub_hex: &str) -> bool {
     rumor.tags.iter().any(|t| {
         t.as_slice().first().map(|s| s == "p").unwrap_or(false)
             && t.as_slice().get(1).map(|s| s == npub_hex).unwrap_or(false)
@@ -2303,7 +2301,7 @@ fn decision_to_tag(decision: &ReleaseDecision) -> String {
 }
 
 /// Decode a response `decision` tag. Unparseable → `None` (not a response).
-fn decision_from_tags(tags: &nostr_sdk::nostr::Tags) -> Option<ReleaseDecision> {
+fn decision_from_tags(tags: &crate::nostr::Tags) -> Option<ReleaseDecision> {
     let v = lease_tag_value(tags, "decision")?;
     match v.as_str() {
         "agreed" => Some(ReleaseDecision::Agreed),
@@ -3301,7 +3299,7 @@ mod tests {
 
         // Previous holder received a NIP-17 notify (a wrap addressed to them).
         let notify_filter = ToronFilter::new()
-            .kinds([nostr_sdk::nostr::Kind::GiftWrap])
+            .kinds([crate::nostr::Kind::GiftWrap])
             .pubkey(holder.public_key())
             .build();
         let wraps = collect_replay(mailbox.bus.as_ref(), notify_filter)
@@ -3344,8 +3342,8 @@ mod tests {
             Some("demo"),
         );
         let ev = build_event(
-            &nostr_sdk::nostr::Keys::new(
-                nostr_sdk::nostr::SecretKey::from_hex(
+            &crate::nostr::Keys::new(
+                crate::nostr::SecretKey::from_hex(
                     "6b911fd37cdf5c81d4c0adb1ab7fa822ed253ab0ad9aa18d77257c88b29b718e",
                 )
                 .expect("sk"),
@@ -3623,8 +3621,8 @@ mod tests {
             Some("demo"),
         );
         let old_intent = build_event(
-            &nostr_sdk::nostr::Keys::new(
-                nostr_sdk::nostr::SecretKey::from_hex(
+            &crate::nostr::Keys::new(
+                crate::nostr::SecretKey::from_hex(
                     "6b911fd37cdf5c81d4c0adb1ab7fa822ed253ab0ad9aa18d77257c88b29b718e",
                 )
                 .expect("sk"),
@@ -3931,9 +3929,7 @@ mod tests {
             "backdated request".to_string(),
         );
         let backdated_id = backdated.clone().id().to_hex();
-        let wrap = gift_wrap::gift_wrap(&rose_keys, &blue_pk, backdated)
-            .await
-            .expect("wrap");
+        let wrap = gift_wrap::gift_wrap(&rose_keys, &blue_pk, backdated).expect("wrap");
         mailbox.bus.publish(wrap).await.expect("publish");
 
         let status = mailbox

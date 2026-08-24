@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
-use nostr_sdk::nostr::{Alphabet, Event, JsonUtil, SingleLetterTag, TagKind, Timestamp};
+use crate::nostr::{Event, SingleLetterTag, Timestamp};
 
 /// Max rows kept in the bus store. Beyond this, the oldest envelopes are
 /// pruned (bounded bus, permanent Git content — ADR-0003 superiority row).
@@ -220,12 +220,8 @@ impl BusEventStore {
     ) -> anyhow::Result<()> {
         for tag in event.tags.iter() {
             let (kind, value) = match tag.kind() {
-                TagKind::SingleLetter(s) if s == SingleLetterTag::lowercase(Alphabet::P) => {
-                    ("p", tag.content())
-                }
-                TagKind::SingleLetter(s) if s == SingleLetterTag::lowercase(Alphabet::E) => {
-                    ("e", tag.content())
-                }
+                "p" => ("p", tag.content()),
+                "e" => ("e", tag.content()),
                 _ => continue,
             };
             let Some(value) = value else { continue };
@@ -288,10 +284,8 @@ impl BusEventStore {
     pub async fn insert_addressable(&self, event: &Event) -> anyhow::Result<bool> {
         use crate::bus::AddressableKey;
         if let Some(key) = AddressableKey::from_event(event) {
-            // Evict the superseded events from the hot memo BEFORE the delete
-            // (bd-py9o: stale memo entries must never outlive their rows).
-            let superseded: Vec<(String,)> = sqlx::query_as(
-                "SELECT event_id FROM bus_events WHERE kind = ?1 AND author = ?2 AND d_tag = ?3",
+            let incumbents: Vec<(String, String)> = sqlx::query_as(
+                "SELECT event_id, raw_json FROM bus_events WHERE kind = ?1 AND author = ?2 AND d_tag = ?3",
             )
             .bind(key.kind as i64)
             .bind(&key.pubkey)
@@ -299,9 +293,23 @@ impl BusEventStore {
             .fetch_all(&self.pool)
             .await
             .unwrap_or_default();
-            if !superseded.is_empty() {
+            for (_id, raw) in &incumbents {
+                if let Ok(existing) = Event::from_json(raw)
+                    && event.created_at.as_secs() < existing.created_at.as_secs()
+                {
+                    // Older replay must not overwrite a newer coordinate.
+                    // Same-second upserts last-write-win: `Timestamp::now()` is
+                    // 1s granularity and 30013/30031 renewals land in-process
+                    // in the same second. Lowest-id ties live in projection
+                    // (`nip01_replaceable_cmp`), not the write path.
+                    return Ok(false);
+                }
+            }
+            // Evict the superseded events from the hot memo BEFORE the delete
+            // (bd-py9o: stale memo entries must never outlive their rows).
+            if !incumbents.is_empty() {
                 let mut hot = self.hot.lock();
-                for (id,) in &superseded {
+                for (id, _) in &incumbents {
                     hot.remove(id);
                 }
             }
@@ -311,7 +319,7 @@ impl BusEventStore {
                 .bind(&key.d)
                 .execute(&self.pool)
                 .await?;
-            if !superseded.is_empty() {
+            if !incumbents.is_empty() {
                 self.bump_mutations().await;
             }
         }
@@ -359,9 +367,7 @@ impl BusEventStore {
             preds.push(format!("kind IN ({})", placeholders.join(",")));
         }
 
-        let p_vals = filter
-            .generic_tags
-            .get(&SingleLetterTag::lowercase(Alphabet::P));
+        let p_vals = filter.generic_tags.get(&SingleLetterTag::LOWERCASE_P);
         if let Some(vals) = p_vals
             && !vals.is_empty()
         {
@@ -376,9 +382,7 @@ impl BusEventStore {
             ));
         }
 
-        let e_vals = filter
-            .generic_tags
-            .get(&SingleLetterTag::lowercase(Alphabet::E));
+        let e_vals = filter.generic_tags.get(&SingleLetterTag::LOWERCASE_E);
         if let Some(vals) = e_vals
             && !vals.is_empty()
         {
@@ -412,8 +416,8 @@ impl BusEventStore {
             && filter.until.is_none()
             && filter.generic_tags.iter().all(|(tag, vals)| {
                 !vals.is_empty()
-                    && (tag == &SingleLetterTag::lowercase(Alphabet::P)
-                        || tag == &SingleLetterTag::lowercase(Alphabet::E))
+                    && (tag == &SingleLetterTag::LOWERCASE_P
+                        || tag == &SingleLetterTag::LOWERCASE_E)
             });
         // bd-3gwy: snapshot memo key — every input that decides the phase-1
         // result. Non-pushed predicates ride in `extra` (they change which
@@ -424,8 +428,8 @@ impl BusEventStore {
             .iter()
             .filter(|(tag, vals)| {
                 !vals.is_empty()
-                    && *tag != &SingleLetterTag::lowercase(Alphabet::P)
-                    && *tag != &SingleLetterTag::lowercase(Alphabet::E)
+                    && *tag != &SingleLetterTag::LOWERCASE_P
+                    && *tag != &SingleLetterTag::LOWERCASE_E
             })
             .map(|(tag, vals)| (format!("{tag:?}"), vals.iter().cloned().collect()))
             .collect();
@@ -724,7 +728,7 @@ mod tests {
     use super::*;
     use crate::nostr::event::build_event;
     use crate::nostr::kinds::PROJECT_MANIFEST;
-    use nostr_sdk::nostr::{Keys, Tag};
+    use crate::nostr::{Keys, Tag};
 
     async fn temp_store() -> (BusEventStore, sqlx::SqlitePool, std::path::PathBuf) {
         let path = std::env::temp_dir().join(format!("toron-bus-{}.sqlite", uuid::Uuid::new_v4()));
@@ -961,7 +965,7 @@ mod tests {
             "ttl-future",
             vec![
                 Tag::parse(["t", "demo"]).expect("t"),
-                Tag::expiration(Timestamp::now() + nostr_sdk::nostr::Timestamp::from(3600)),
+                Tag::expiration(Timestamp::now() + crate::nostr::Timestamp::from(3600)),
             ],
             Timestamp::now(),
         )
@@ -1242,13 +1246,54 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// NIP-01 parameterized-replaceable: an older event arriving after a
+    /// newer one on the same `(kind, author, d)` must not overwrite it.
+    #[tokio::test]
+    async fn test_addressable_older_replay_does_not_overwrite_newer() {
+        let (store, _pool, path) = temp_store().await;
+        let agent = Keys::generate();
+        let newer = build_event(
+            &agent,
+            crate::nostr::kinds::toron_kind(crate::nostr::kinds::FILE_RESERVATION),
+            "lease v2",
+            vec![Tag::parse(["d", "proj:src/**"]).expect("d")],
+            Timestamp::from(1_700_000_001_u64),
+        )
+        .expect("build newer");
+        let older = build_event(
+            &agent,
+            crate::nostr::kinds::toron_kind(crate::nostr::kinds::FILE_RESERVATION),
+            "lease v1",
+            vec![Tag::parse(["d", "proj:src/**"]).expect("d")],
+            Timestamp::from(1_700_000_000_u64),
+        )
+        .expect("build older");
+
+        assert!(store.insert_addressable(&newer).await.expect("newer"));
+        let kept = store
+            .insert_addressable(&older)
+            .await
+            .expect("older replay");
+        assert!(
+            !kept,
+            "older event must not replace a newer one on the same coordinate"
+        );
+        assert_eq!(store.count().await.expect("count"), 1);
+        assert_eq!(
+            store.all_events().await.expect("all")[0].id,
+            newer.id,
+            "newer lease survives an older replay"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// bd-replay-tag-pushdown-lurm acceptance #1: a p-tag-filtered replay on
     /// a 10k-event store parses only matched rows. The instrumented counter
     /// must see exactly the 5 matching rows (SQL prefilter via
     /// bus_event_tags), and the query plan must use the tag index.
     #[tokio::test]
     async fn test_replay_p_tag_pushdown_parses_only_matched() {
-        use nostr_sdk::nostr::Filter;
+        use crate::nostr::Filter;
         let (store, pool, path) = temp_store().await;
         let author = Keys::generate();
         let target = Keys::generate();
@@ -1349,7 +1394,7 @@ mod tests {
     /// parse counter sees exactly 5 rows — SQL LIMIT on the DESC matched set).
     #[tokio::test]
     async fn test_replay_limit_pushdown_newest_5_of_10k() {
-        use nostr_sdk::nostr::Filter;
+        use crate::nostr::Filter;
         let (store, pool, path) = temp_store().await;
         let _ = &store;
         let author = Keys::generate();
@@ -1425,7 +1470,7 @@ mod tests {
     /// miss it — the EAV index matches any position).
     #[tokio::test]
     async fn test_replay_p_tag_any_position_sound() {
-        use nostr_sdk::nostr::Filter;
+        use crate::nostr::Filter;
         let (store, _pool, path) = temp_store().await;
         let me = Keys::generate();
         let first = Keys::generate();
@@ -1474,10 +1519,10 @@ mod tests {
     /// position (root of a reply chain is not necessarily the first e tag).
     #[tokio::test]
     async fn test_replay_e_tag_any_position_sound() {
-        use nostr_sdk::nostr::Filter;
+        use crate::nostr::Filter;
         let (store, _pool, path) = temp_store().await;
         let keys = Keys::generate();
-        let root: nostr_sdk::nostr::EventId = build_event(
+        let root: crate::nostr::EventId = build_event(
             &keys,
             crate::nostr::kinds::toron_kind(PROJECT_MANIFEST),
             "root",
@@ -1486,7 +1531,7 @@ mod tests {
         )
         .expect("root build")
         .id;
-        let reply_id: nostr_sdk::nostr::EventId = build_event(
+        let reply_id: crate::nostr::EventId = build_event(
             &keys,
             crate::nostr::kinds::toron_kind(PROJECT_MANIFEST),
             "reply",
@@ -1562,7 +1607,7 @@ mod tests {
 
         // Reopen: the table is recreated and backfilled from raw_json.
         let reopened = BusEventStore::new(pool.clone()).await.expect("reopen");
-        use nostr_sdk::nostr::Filter;
+        use crate::nostr::Filter;
         let replayed = reopened
             .replay(&Filter::new().pubkey(target.public_key()))
             .await

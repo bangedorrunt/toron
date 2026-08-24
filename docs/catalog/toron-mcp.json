@@ -52,7 +52,7 @@
     },
     {
       "args": "create, join, leave, list, members, post, read, close, purge",
-      "description": "NIP-29 channels: create/join/leave/close/purge/list/members/post/read (plane S; lifecycle open -> closed -> purged)",
+      "description": "NIP-29 channels: create/join/leave/close/purge/list/members/post/read (39000/39002 + kind 9) (plane S; lifecycle open -> closed -> purged)",
       "name": "channel"
     },
     {
@@ -121,7 +121,7 @@
       "name": "workflow"
     }
   ],
-  "generated_at": "2026-08-24T06:19:47Z",
+  "generated_at": "2026-08-24T10:24:52Z",
   "resources": [
     {
       "description": "List projects known to toron.",
@@ -4145,5 +4145,5 @@
       "parity": "AM-Rust 38-tool surface"
     }
   ],
-  "toron_version": "1.1.0"
+  "toron_version": "1.2.0"
 }

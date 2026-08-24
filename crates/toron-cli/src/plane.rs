@@ -1,5 +1,6 @@
 // governed-by: ADR-0003
 // governed-by: ADR-0020
+// governed-by: ADR-0023
 #![forbid(unsafe_code)]
 
 //! Two-plane shared surface (ADR-0020 Spec 2): channel/react (plane S),
@@ -18,10 +19,10 @@
 //!
 //! Channel lifecycle is persisted on the bus so a fresh CLI process can
 //! rebuild the in-memory `ChannelStore` from replay (cross-process SC-27):
-//!   - kind 40 channel-create: tags `d`=id, `h`=id, `name`, `private`,
-//!     `t`=project. Signed by the creator (the first member).
-//!   - kind 41 channel-join/leave: tags `h`=id, `p`=member npub, `t`=project,
-//!     content "join"|"leave". Signed by the member.
+//!   - kind 39000 group metadata (ADR-0023): `d`=`h`=id, `name`, `private`,
+//!     `t`=project; close adds `closed`. Signed by the creator.
+//!   - kind 39002 members snapshot: `d`=`h`=id, `p`=each member. Signed by
+//!     the joining/leaving actor. Legacy ingest: 40/41.
 //!
 //! Posts (kind 9) and reactions (kind 7) ride the bus as their own events.
 //!
@@ -34,16 +35,16 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
+use nostr::prelude::{Event, EventId, Keys, Kind, PublicKey, Tag, Timestamp};
 use serde_json::Value;
 use toron_core::bus::{Bus, Filter, SubscriptionEvent};
 use toron_core::mailbox::{Mailbox, WhoIs, aliases, collect_replay};
 use toron_core::nostr::event::build_event;
 use toron_core::nostr::kinds::toron_kind;
 use toron_core::nostr::presence::{PresencePayload, PresenceState, build_presence_event};
-use toron_core::nostr_sdk::nostr::{Event, EventId, Keys, PublicKey, Tag, TagKind, Timestamp};
 use toron_workflow::channels::{
-    CHANNEL_CREATE, CHANNEL_MESSAGE, CHANNEL_MESSAGE_LEGACY, CHANNEL_METADATA, ChannelStore,
-    REACTION,
+    CHANNEL_CREATE, CHANNEL_CREATE_LEGACY, CHANNEL_MEMBERS, CHANNEL_MESSAGE,
+    CHANNEL_MESSAGE_LEGACY, CHANNEL_METADATA_LEGACY, ChannelStore, REACTION,
 };
 use toron_workflow::coalesce::MentionCoalescer;
 use toron_workflow::jobs::{
@@ -95,7 +96,7 @@ fn now_ms() -> u64 {
 /// `toron:`-prefixed `t` values are internal markers, not slugs).
 fn event_project(ev: &Event) -> Option<&str> {
     ev.tags.iter().find_map(|t| {
-        if t.kind() == TagKind::t() {
+        if t.kind() == "t" {
             let c = t.content()?;
             if c.starts_with("toron:") {
                 return None;
@@ -157,23 +158,34 @@ async fn load_agent_key(mailbox: &Mailbox, project: &str, whois: &WhoIs) -> anyh
     })
 }
 
-/// Rebuild the in-memory channel store from the bus's kind-40/41 lifecycle
-/// events (create + join/leave), so a fresh process sees channels created by
-/// other processes (cross-process SC-27).
+/// Rebuild the in-memory channel store from bus lifecycle events so a
+/// fresh process sees rooms created by other processes (cross-process SC-27).
+/// Canonical: 39000/39002. Legacy ingest: 40/41.
 async fn rebuild_store(mailbox: &Mailbox, project: &str) -> anyhow::Result<ChannelStore> {
     let store = ChannelStore::new();
     let filter = Filter::new()
-        .kinds([toron_kind(CHANNEL_CREATE), toron_kind(CHANNEL_METADATA)])
+        .kinds([
+            Kind::GroupMetadata,
+            Kind::GroupMembers,
+            toron_kind(CHANNEL_CREATE_LEGACY),
+            toron_kind(CHANNEL_METADATA_LEGACY),
+        ])
         .hashtag(project);
     let events = collect_replay(mailbox.bus().as_ref(), filter).await?;
     for ev in events {
         match ev.kind.as_u16() {
-            CHANNEL_CREATE => {
+            CHANNEL_CREATE | CHANNEL_CREATE_LEGACY => {
                 let id = ev
                     .tags
                     .iter()
-                    .find(|t| t.kind() == TagKind::d())
+                    .find(|t| t.kind() == "d")
                     .and_then(|t| t.content())
+                    .or_else(|| {
+                        ev.tags
+                            .iter()
+                            .find(|t| t.kind() == "h")
+                            .and_then(|t| t.content())
+                    })
                     .unwrap_or_default();
                 let name = ev
                     .tags
@@ -185,15 +197,20 @@ async fn rebuild_store(mailbox: &Mailbox, project: &str) -> anyhow::Result<Chann
                     t.as_slice().first().map(String::as_str) == Some("private")
                         && t.as_slice().get(1).map(String::as_str) == Some("true")
                 });
-                // Ignore per-event errors: a corrupt lifecycle event must not
-                // brick the whole store for every later command.
                 let _ = store.create_channel(&ev.pubkey, id, &name, private, Some(project));
+                let closed = ev.tags.iter().any(|t| {
+                    t.as_slice().first().map(String::as_str) == Some("closed")
+                        && t.as_slice().get(1).map(String::as_str) != Some("false")
+                });
+                if closed {
+                    let _ = store.close(id, &ev.pubkey);
+                }
             }
-            CHANNEL_METADATA => {
+            CHANNEL_METADATA_LEGACY => {
                 let id = ev
                     .tags
                     .iter()
-                    .find(|t| t.kind() == TagKind::h())
+                    .find(|t| t.kind() == "h")
                     .and_then(|t| t.content())
                     .unwrap_or_default();
                 match ev.content.as_str() {
@@ -204,14 +221,32 @@ async fn rebuild_store(mailbox: &Mailbox, project: &str) -> anyhow::Result<Chann
                         let _ = store.leave(id, &ev.pubkey);
                     }
                     "close" => {
-                        // bd-channel-close-purge-bsqb: the close tombstone is
-                        // a kind-41 lifecycle event signed by the creator;
-                        // `close` itself verifies creatorship (a non-creator
-                        // close event is ignored via the per-event error).
                         let _ = store.close(id, &ev.pubkey);
                     }
                     _ => {}
                 }
+            }
+            CHANNEL_MEMBERS => {
+                let id = ev
+                    .tags
+                    .iter()
+                    .find_map(|t| {
+                        (t.kind() == "h" || t.kind() == "d")
+                            .then(|| t.content())
+                            .flatten()
+                    })
+                    .unwrap_or_default();
+                // Content JSON is the snapshot source of truth: rust-nostr
+                // strips a p-tag that equals the signer, which would drop the
+                // joiner from a 39002 they just signed.
+                let members: Vec<String> = serde_json::from_str(&ev.content).unwrap_or_else(|_| {
+                    ev.tags
+                        .iter()
+                        .filter(|t| t.as_slice().first().map(String::as_str) == Some("p"))
+                        .filter_map(|t| t.as_slice().get(1).cloned())
+                        .collect()
+                });
+                let _ = store.replace_members(id, members);
             }
             _ => {}
         }
@@ -223,7 +258,7 @@ async fn rebuild_store(mailbox: &Mailbox, project: &str) -> anyhow::Result<Chann
 fn event_channel(ev: &Event) -> Option<String> {
     ev.tags
         .iter()
-        .find(|t| t.kind() == TagKind::h())
+        .find(|t| t.kind() == "h")
         .and_then(|t| t.content())
         .map(str::to_string)
 }
@@ -239,8 +274,7 @@ fn parse_since(s: &str) -> anyhow::Result<u64> {
 // plane S — channels + reactions
 // ---------------------------------------------------------------------------
 
-/// Publish the channel-create lifecycle event (kind 40) so other processes
-/// can rebuild the store.
+/// Publish the channel-create lifecycle event (kind 39000).
 async fn publish_create(
     bus: &dyn Bus,
     keys: &Keys,
@@ -248,7 +282,7 @@ async fn publish_create(
 ) -> anyhow::Result<Event> {
     let ev = build_event(
         keys,
-        toron_kind(CHANNEL_CREATE),
+        Kind::GroupMetadata,
         "channel-create",
         vec![
             Tag::parse(["d", &args.id]).expect("d"),
@@ -263,25 +297,26 @@ async fn publish_create(
     Ok(ev)
 }
 
-/// Publish a join/leave lifecycle event (kind 41).
-async fn publish_membership(
+/// Publish a kind-39002 member snapshot after join/leave.
+async fn publish_members(
     bus: &dyn Bus,
     keys: &Keys,
     channel: &str,
     project: &str,
-    action: &str,
+    members: &[String],
 ) -> anyhow::Result<Event> {
-    let ev = build_event(
-        keys,
-        toron_kind(CHANNEL_METADATA),
-        action,
-        vec![
-            Tag::parse(["h", channel]).expect("h"),
-            Tag::public_key(keys.public_key()),
-            Tag::parse(["t", project]).expect("t"),
-        ],
-        Timestamp::now(),
-    )?;
+    let mut tags = vec![
+        Tag::parse(["d", channel]).expect("d"),
+        Tag::parse(["h", channel]).expect("h"),
+        Tag::parse(["t", project]).expect("t"),
+    ];
+    for m in members {
+        if let Ok(pk) = PublicKey::from_hex(m) {
+            tags.push(Tag::public_key(pk));
+        }
+    }
+    let content = serde_json::to_string(members).unwrap_or_else(|_| "[]".into());
+    let ev = build_event(keys, Kind::GroupMembers, content, tags, Timestamp::now())?;
     bus.publish(ev.clone()).await?;
     Ok(ev)
 }
@@ -321,12 +356,13 @@ async fn channel_join(mailbox: &Mailbox, args: &ChannelJoinArgs) -> anyhow::Resu
     store
         .join(&args.id, &keys.public_key())
         .with_context(|| format!("join {} as {}", args.id, args.as_name))?;
-    let ev = publish_membership(
+    let members = store.members(&args.id);
+    let ev = publish_members(
         mailbox.bus().as_ref(),
         &keys,
         &args.id,
         &args.project,
-        "join",
+        &members,
     )
     .await?;
     print_json(&serde_json::json!({
@@ -343,12 +379,13 @@ async fn channel_leave(mailbox: &Mailbox, args: &ChannelJoinArgs) -> anyhow::Res
     store
         .leave(&args.id, &keys.public_key())
         .with_context(|| format!("leave {} as {}", args.id, args.as_name))?;
-    let ev = publish_membership(
+    let members = store.members(&args.id);
+    let ev = publish_members(
         mailbox.bus().as_ref(),
         &keys,
         &args.id,
         &args.project,
-        "leave",
+        &members,
     )
     .await?;
     print_json(&serde_json::json!({
@@ -358,21 +395,26 @@ async fn channel_leave(mailbox: &Mailbox, args: &ChannelJoinArgs) -> anyhow::Res
     }))?;
     Ok(())
 }
-/// Publish the channel-close tombstone (kind 41, content "close") so every
-/// process rebuilds the retired state (bd-channel-close-purge-bsqb).
+/// Publish the channel-close tombstone (kind 39000 + `closed`).
 async fn publish_close(
     bus: &dyn Bus,
     keys: &Keys,
     channel: &str,
     project: &str,
+    name: &str,
+    private: bool,
 ) -> anyhow::Result<Event> {
     let ev = build_event(
         keys,
-        toron_kind(CHANNEL_METADATA),
-        "close",
+        Kind::GroupMetadata,
+        "channel-close",
         vec![
-            Tag::parse(["h", channel]).expect("h tag"),
-            Tag::parse(["t", project]).expect("t tag"),
+            Tag::parse(["d", channel]).expect("d"),
+            Tag::parse(["h", channel]).expect("h"),
+            Tag::parse(["name", name]).expect("name"),
+            Tag::parse(["private", if private { "true" } else { "false" }]).expect("private"),
+            Tag::parse(["closed", "true"]).expect("closed"),
+            Tag::parse(["t", project]).expect("t"),
         ],
         Timestamp::now(),
     )?;
@@ -391,7 +433,15 @@ async fn channel_close(mailbox: &Mailbox, args: &ChannelCloseArgs) -> anyhow::Re
     store
         .close(&args.id, &keys.public_key())
         .with_context(|| format!("close channel {} as {}", args.id, args.as_name))?;
-    let ev = publish_close(mailbox.bus().as_ref(), &keys, &args.id, &args.project).await?;
+    let ev = publish_close(
+        mailbox.bus().as_ref(),
+        &keys,
+        &args.id,
+        &args.project,
+        &ch.name,
+        ch.private,
+    )
+    .await?;
     let _ = ch; // (kept: future closed-at bookkeeping)
     print_json(&serde_json::json!({
         "channel": args.id,
@@ -437,18 +487,15 @@ async fn channel_purge(mailbox: &Mailbox, args: &ChannelPurgeArgs) -> anyhow::Re
     // untouched.
     let filter = Filter::new()
         .kinds([
-            toron_kind(CHANNEL_CREATE),
-            toron_kind(CHANNEL_METADATA),
+            Kind::GroupMetadata,
+            Kind::GroupMembers,
+            toron_kind(CHANNEL_CREATE_LEGACY),
+            toron_kind(CHANNEL_METADATA_LEGACY),
             toron_kind(CHANNEL_MESSAGE),
             toron_kind(CHANNEL_MESSAGE_LEGACY),
             toron_kind(REACTION),
         ])
-        .custom_tag(
-            toron_core::nostr_sdk::nostr::SingleLetterTag::lowercase(
-                toron_core::nostr_sdk::nostr::Alphabet::H,
-            ),
-            &args.id,
-        );
+        .custom_tag(nostr::filter::SingleLetterTag::LOWERCASE_H, &args.id);
     let events = collect_trusted(mailbox.bus().as_ref(), filter).await?;
     let ids: Vec<String> = events
         .iter()
@@ -671,12 +718,7 @@ async fn wait_for_readback(
 ) -> anyhow::Result<bool> {
     let filter = Filter::new()
         .kinds([toron_kind(CHANNEL_MESSAGE)])
-        .custom_tag(
-            toron_core::nostr_sdk::nostr::SingleLetterTag::lowercase(
-                toron_core::nostr_sdk::nostr::Alphabet::H,
-            ),
-            channel,
-        );
+        .custom_tag(nostr::filter::SingleLetterTag::LOWERCASE_H, channel);
     let deadline = Instant::now() + timeout;
     loop {
         let events = collect_trusted(mailbox.bus().as_ref(), filter.clone()).await?;
@@ -741,12 +783,7 @@ async fn channel_read(mailbox: &Mailbox, args: &ChannelReadArgs) -> anyhow::Resu
             toron_kind(CHANNEL_MESSAGE_LEGACY),
             toron_kind(REACTION),
         ])
-        .custom_tag(
-            toron_core::nostr_sdk::nostr::SingleLetterTag::lowercase(
-                toron_core::nostr_sdk::nostr::Alphabet::H,
-            ),
-            &args.id,
-        );
+        .custom_tag(nostr::filter::SingleLetterTag::LOWERCASE_H, &args.id);
     let mut events = collect_trusted(mailbox.bus().as_ref(), filter).await?;
     events.retain(|ev| {
         in_project(ev, &args.project)
@@ -767,13 +804,13 @@ async fn channel_read(mailbox: &Mailbox, args: &ChannelReadArgs) -> anyhow::Resu
             let react_to = ev
                 .tags
                 .iter()
-                .find(|t| t.kind() == TagKind::e())
+                .find(|t| t.kind() == "e")
                 .and_then(|t| t.content())
                 .map(str::to_string);
             let mentions: Vec<String> = ev
                 .tags
                 .iter()
-                .filter(|t| t.kind() == TagKind::p())
+                .filter(|t| t.kind() == "p")
                 .filter_map(|t| t.content())
                 .map(str::to_string)
                 .collect();
@@ -1288,20 +1325,10 @@ async fn watch(mailbox: &Mailbox, args: &WatchArgs) -> anyhow::Result<()> {
 
     let mut filter = Filter::new().kinds(kinds.iter().map(|k| toron_kind(*k)));
     if let Some(channel) = &args.channel {
-        filter = filter.custom_tag(
-            toron_core::nostr_sdk::nostr::SingleLetterTag::lowercase(
-                toron_core::nostr_sdk::nostr::Alphabet::H,
-            ),
-            channel,
-        );
+        filter = filter.custom_tag(nostr::filter::SingleLetterTag::LOWERCASE_H, channel);
     }
     if let Some(np) = &self_npub {
-        filter = filter.custom_tag(
-            toron_core::nostr_sdk::nostr::SingleLetterTag::lowercase(
-                toron_core::nostr_sdk::nostr::Alphabet::P,
-            ),
-            np,
-        );
+        filter = filter.custom_tag(nostr::filter::SingleLetterTag::LOWERCASE_P, np);
     }
 
     eprintln!("watching kinds={}", args.kinds);

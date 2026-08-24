@@ -15,8 +15,10 @@
 
 use std::sync::Arc;
 
-use nostr_sdk::nostr::{Event, Keys};
-use nostr_sdk::{Client, RelayPoolNotification};
+use crate::nostr::{Event, Keys};
+use nostr_sdk::authenticator::SignerAuthenticator;
+use nostr_sdk::client::{Client, ClientNotification};
+use nostr_sdk::prelude::StreamExt;
 use tokio::sync::mpsc;
 
 use crate::bus::scoping::is_metadata_hiding_kind;
@@ -74,9 +76,9 @@ impl Default for RelayBusConfig {
 pub struct RelayBus {
     client: Client,
     config: Arc<RelayBusConfig>,
-    /// Broadcast of relay notifications, fed by `handle_notifications` and
+    /// Broadcast of relay notifications, fed by `Client::notifications()` and
     /// consumed by per-subscription filter tasks.
-    notify_tx: tokio::sync::broadcast::Sender<RelayPoolNotification>,
+    notify_tx: tokio::sync::broadcast::Sender<ClientNotification>,
     /// F1.LAG-SWALLOW (batch-fix): total `RecvError::Lagged` skips observed by
     /// the per-subscription bridge tasks. A non-zero value means the broadcast
     /// out-ran a subscriber (mpsc filled) and events were dropped — surfaced
@@ -95,39 +97,30 @@ impl RelayBus {
                 "federation doctor failed: {issues:?}"
             )));
         }
-        let client = Client::new(config.keys.clone());
+        let client = Client::builder()
+            .authenticator(SignerAuthenticator::new(config.keys.clone()))
+            .build();
         for relay in &config.relays {
-            let _ = client
+            client
                 .add_relay(&relay.url)
                 .await
                 .map_err(|e| BusError::Transport(format!("add_relay {}: {e}", relay.url)))?;
         }
         client.connect().await;
 
-        // nostr-sdk delivers notifications only through `handle_notifications`.
-        // That closure feeds a broadcast channel; per-subscription tasks
-        // subscribe to it and filter by subscription id.
+        // rust-nostr 0.45: `handle_notifications` is gone. `notifications()`
+        // is a Stream of ClientNotification from this moment forward.
         let (notify_tx, _) = tokio::sync::broadcast::channel(1024);
         let client_for_task = client.clone();
         let notify_tx_for_task = notify_tx.clone();
         tokio::spawn(async move {
-            // IMPORTANT: return Ok(false) — Ok(true) makes handle_notifications
-            // EXIT after the first notification (drops all subsequent frames).
-            // F2.SILENT-DROP (batch-fix): the notification PUMP result is no
-            // longer silently dropped — if the pump errors/exits, every relay
-            // subscription goes dead; that must be loud, not silent.
-            if let Err(e) = client_for_task
-                .handle_notifications(move |notification| {
-                    let tx = notify_tx_for_task.clone();
-                    async move {
-                        let _ = tx.send(notification);
-                        Ok(false)
-                    }
-                })
-                .await
-            {
-                tracing::warn!("relay notification pump exited with error: {e}");
+            let mut stream = client_for_task.notifications();
+            while let Some(notification) = stream.next().await {
+                if notify_tx_for_task.send(notification).is_err() {
+                    break;
+                }
             }
+            tracing::warn!("relay notification stream ended");
         });
 
         Ok(Self {
@@ -153,7 +146,7 @@ impl RelayBus {
         filter: Filter,
     ) -> Result<
         (
-            nostr_sdk::nostr::SubscriptionId,
+            crate::nostr::SubscriptionId,
             mpsc::Receiver<SubscriptionEvent>,
         ),
         BusError,
@@ -170,10 +163,10 @@ impl RelayBus {
         // SubscriptionEvent shape.
         let output = self
             .client
-            .subscribe(filter.clone(), None)
+            .subscribe(filter.clone())
             .await
             .map_err(|e| BusError::Subscription(format!("client.subscribe: {e}")))?;
-        let sub_id = output.val;
+        let sub_id = output.id().clone();
 
         // Background task: broadcast notifications → mpsc. Filters match
         // against the original filter; EOSE maps to SubscriptionEvent::Eose.
@@ -182,22 +175,17 @@ impl RelayBus {
         tokio::spawn(async move {
             loop {
                 let item: Option<SubscriptionEvent> = match notify_rx.recv().await {
-                    Ok(RelayPoolNotification::Event {
+                    Ok(ClientNotification::Event {
                         subscription_id,
                         event,
                         ..
                     }) if subscription_id == sub_id_clone => Some(SubscriptionEvent::Event(*event)),
-                    Ok(RelayPoolNotification::Message { message, .. }) => match message {
-                        nostr_sdk::nostr::RelayMessage::Event {
+                    Ok(ClientNotification::Message { message, .. }) => match &*message {
+                        crate::nostr::RelayMessage::Event {
                             subscription_id,
                             event,
                         } if subscription_id.as_ref() == &sub_id_clone => {
-                            // P3 (bd-p3-schnorr-verify-every-ingest-q0wo):
-                            // defense-in-depth — nostr-sdk verifies relay
-                            // events before notification (Client::new default,
-                            // no skip_verification), but the bus must never
-                            // forward an unverified event downstream.
-                            let event = event.into_owned();
+                            let event = event.clone().into_owned();
                             if crate::nostr::event::verify_event(&event).is_err() {
                                 tracing::warn!(
                                     event_id = %event.id,
@@ -207,14 +195,14 @@ impl RelayBus {
                             }
                             Some(SubscriptionEvent::Event(event))
                         }
-                        nostr_sdk::nostr::RelayMessage::EndOfStoredEvents(id)
+                        crate::nostr::RelayMessage::EndOfStoredEvents(id)
                             if id.as_ref() == &sub_id_clone =>
                         {
                             Some(SubscriptionEvent::Eose)
                         }
                         _ => None,
                     },
-                    Ok(RelayPoolNotification::Shutdown) => {
+                    Ok(ClientNotification::Shutdown) => {
                         Some(SubscriptionEvent::Closed("relay bus shutdown".into()))
                     }
                     Ok(_) => None,
@@ -325,7 +313,7 @@ mod tests {
     use super::*;
     use crate::nostr::event::build_event;
     use crate::nostr::kinds::{AGENT_PROFILE, PROJECT_MANIFEST};
-    use nostr_sdk::nostr::{Kind, Tag, Timestamp};
+    use crate::nostr::{Kind, Tag, Timestamp};
 
     /// The policy gate is pure — unit test it directly (no relay needed).
     #[test]
@@ -480,7 +468,6 @@ mod tests {
             "ws roundtrip secret",
         );
         let wrapped = crate::nostr::gift_wrap::gift_wrap(&sender, &recipient.public_key(), rumor)
-            .await
             .expect("wrap");
         let ok = publisher.publish(wrapped.clone()).await.expect("publish");
         assert!(ok.stored);
@@ -537,7 +524,6 @@ mod tests {
             "replay secret",
         );
         let wrapped = crate::nostr::gift_wrap::gift_wrap(&sender, &recipient.public_key(), rumor)
-            .await
             .expect("wrap");
         publisher.publish(wrapped.clone()).await.expect("publish");
 
@@ -679,7 +665,6 @@ mod tests {
             );
             let wrapped =
                 crate::nostr::gift_wrap::gift_wrap(&sender, &recipient.public_key(), rumor)
-                    .await
                     .expect("wrap");
             publisher.publish(wrapped).await.expect("publish");
             published += 1;

@@ -20,7 +20,7 @@ use parking_lot::RwLock;
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 
-use nostr_sdk::nostr::PublicKey;
+use crate::nostr::PublicKey;
 
 use crate::bus::Bus;
 use crate::nostr::kinds::PRESENCE;
@@ -158,7 +158,7 @@ mod tests {
     use crate::bus::InProcessBus;
     use crate::index::schema;
     use crate::nostr::presence::{PresencePayload, build_presence_event};
-    use nostr_sdk::nostr::{Event, Keys, Timestamp};
+    use crate::nostr::{Event, Keys, Timestamp};
 
     async fn temp_bus() -> (InProcessBus, std::path::PathBuf) {
         let path = std::env::temp_dir().join(format!("toron-pres-{}.sqlite", uuid::Uuid::new_v4()));

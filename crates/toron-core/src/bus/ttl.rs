@@ -9,7 +9,7 @@
 //! unbounded single store). The Git archive holds unwrapped canonical content
 //! **permanently** (no TTL) — that separation is the archive layer's concern.
 
-use nostr_sdk::nostr::{Tag, Timestamp};
+use crate::nostr::{Tag, Timestamp};
 
 /// Default envelope TTL: 90 days (ADR-0003 rev6: "gift-wrap envelopes TTL 90
 /// days, configurable").
@@ -57,7 +57,7 @@ impl EnvelopeTtl {
 mod tests {
     use super::*;
     use crate::nostr::event::build_event;
-    use nostr_sdk::nostr::{Keys, Kind};
+    use crate::nostr::{Keys, Kind};
 
     fn keys() -> Keys {
         Keys::generate()

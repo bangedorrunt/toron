@@ -253,6 +253,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   NIP-34 assigns `30621`=git commit, `1630`=Open status; only `46011` is
   toron-custom).
 
+## [1.2.0] - 2026-08-24
+
+Nostr protocol hygiene, NIP-29 group metadata (ADR-0023), rust-nostr 0.45.
+Tracker: `bd-tt5o`, `bd-zb0y`.
+
+### Added
+
+- **ADR-0023 — NIP-29 group metadata** — channel create/close emit kind
+  **39000** (`d`=`h`=channel id); join/leave emit **39002** member snapshots
+  (`p` tags + JSON member list in content). Kinds 40/41/42 ingest-only.
+  `ChannelStore` stays the membership gate. No 9000–9008 admin, no new MCP
+  tools. Named rust-nostr kinds: `Kind::GroupMetadata` / `Kind::GroupMembers`.
+
+### Changed
+
+- **rust-nostr 0.45.2 / nostr 0.45.3** — protocol types live in the `nostr`
+  crate (no `nostr_sdk::nostr` nest). Signing is `FinalizeEvent::finalize`.
+  Relay bus uses `Client::notifications()` / `ClientNotification`. NIP
+  features (`nip44`/`nip49`/`nip59`) plus `os-rng` sit on `nostr`.
+- **`gift_wrap` is synchronous** — rust-nostr 0.45 `GiftWrapBuilder` is
+  sync. Callers drop `.await`.
+
+### Fixed
+
+- **NIP-01 addressable latest-wins** — store rejects an older `created_at`
+  for the same `(kind, author, d)`. Same-second upserts last-write-win
+  (`Timestamp::now()` is 1s). Projection ties use the lowest event id.
+- **Gift-wrap verify-before-decrypt** — envelope Schnorr sig is checked
+  before NIP-44 decrypt (NIP-44/NIP-59).
+- **NIP-10 marked `e` tags** — hex thread ids emit `["e", id, "", "root"]`
+  (positional e-tags are deprecated).
+- **NIP-25 reactions** — kind-7 now carries `p` (target author) and `k`
+  (target kind) plus `e` and `h`.
+
 ## [1.1.0] - 2026-08-07
 
 ADR-0004 Operational Hardening & Agent-Automation Efficiency (all 5 ships

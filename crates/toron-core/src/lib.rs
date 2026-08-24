@@ -10,7 +10,6 @@ pub mod keys;
 pub mod mailbox;
 pub mod nostr;
 
-/// Re-export of the pinned nostr-sdk (single-version coupling for embedders:
-/// toron-core owns the nostr stack; flywheel/toron-cli name event/tag/filter
-/// types through this path instead of adding their own nostr-sdk dep).
+/// Client/relay pool. rust-nostr 0.45 no longer nests protocol types under
+/// `nostr_sdk::nostr`; use `nostr_sdk::prelude::*` or the `nostr` crate.
 pub use nostr_sdk;

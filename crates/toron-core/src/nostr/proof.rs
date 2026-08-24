@@ -13,8 +13,8 @@
 //! proofs are all rejected. Nonces persist across restarts (SQLite
 //! `proof_nonces`), so a replayed nonce is rejected after a process restart.
 
-use nostr_sdk::nostr::event::builder::Error as BuilderError;
-use nostr_sdk::nostr::{Event, EventId, Keys, PublicKey, Tag, Timestamp};
+use crate::nostr::{Event, EventId, Keys, PublicKey, Tag, Timestamp};
+use ::nostr::error::Error as BuilderError;
 
 use crate::bus::scoping::with_project_scoping;
 use crate::nostr::event::build_event;

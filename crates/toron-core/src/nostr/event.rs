@@ -8,9 +8,10 @@
 //! relay's expectations. Verification rejects forged/mutated events (wrong id
 //! or sig).
 
-use nostr_sdk::nostr::event::Error as EventError;
-use nostr_sdk::nostr::event::builder::Error as BuilderError;
-use nostr_sdk::nostr::{Event, EventBuilder, JsonUtil, Keys, Kind, Tag, Timestamp};
+use crate::nostr::{Event, EventBuilder, Keys, Kind, Tag, Timestamp};
+use ::nostr::error::Error as EventError;
+use ::nostr::error::Error as BuilderError;
+use ::nostr::event::FinalizeEvent;
 
 /// Error returned by verification.
 #[derive(Debug, thiserror::Error)]
@@ -49,7 +50,7 @@ pub fn build_event(
     EventBuilder::new(kind, content)
         .tags(tags)
         .custom_created_at(created_at)
-        .sign_with_keys(keys)
+        .finalize(keys)
 }
 
 /// Verify a single event's canonical id and Schnorr signature.
@@ -62,7 +63,7 @@ pub fn verify_event(event: &Event) -> Result<(), VerifyError> {
     // bd-verify-once-ph7t: count wrap-envelope verifies only (the double-
     // verified object); seal verifies inside unwrap are inherent to decrypt.
     #[cfg(test)]
-    if event.kind == nostr_sdk::nostr::Kind::GiftWrap {
+    if event.kind == crate::nostr::Kind::GiftWrap {
         VERIFY_EVENT_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
     if !event.verify_id() {
@@ -77,7 +78,7 @@ pub fn verify_event(event: &Event) -> Result<(), VerifyError> {
 /// Verify an event against an expected author, rejecting any other pubkey.
 pub fn verify_event_author(
     event: &Event,
-    expected: &nostr_sdk::nostr::PublicKey,
+    expected: &crate::nostr::PublicKey,
 ) -> Result<(), VerifyError> {
     verify_event(event)?;
     if &event.pubkey != expected {
@@ -94,7 +95,7 @@ pub fn canonical_json(event: &Event) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nostr_sdk::nostr::{SecretKey, Tag};
+    use crate::nostr::{SecretKey, Tag};
 
     // Fixed test keypair: secret key 0x01 → known pubkey (NIP-19-style hex).
     fn test_keys() -> Keys {
@@ -250,10 +251,9 @@ mod tests {
         .expect("build ok");
 
         // Flip a byte in the signature (keep id + rest intact).
-        let mut sig_bytes = event.sig.serialize();
+        let mut sig_bytes = event.sig.to_bytes();
         sig_bytes[0] ^= 0xFF;
-        let bad_sig =
-            nostr_sdk::secp256k1::schnorr::Signature::from_slice(&sig_bytes).expect("sig parse");
+        let bad_sig = crate::nostr::Signature::from_slice(&sig_bytes).expect("sig parse");
 
         let forged = Event::new(
             event.id,

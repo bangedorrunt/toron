@@ -28,8 +28,8 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 
-use nostr_sdk::nostr::event::unsigned::UnsignedEvent;
-use nostr_sdk::nostr::{Event, EventId, JsonUtil, Keys, PublicKey, Timestamp};
+use crate::nostr::UnsignedEvent;
+use crate::nostr::{Event, EventId, Keys, PublicKey, Timestamp};
 
 use crate::bus::scoping::is_metadata_hiding_kind;
 use crate::nostr::gift_wrap::{self};
@@ -873,7 +873,7 @@ impl ProjectionSink for SqliteProjectionSink {
 /// First value of a single-letter tag (e.g. `subject`, `e`). The canonical
 /// tag-value helper (F22.SURFACE-MESSAGING, batch-fix): messaging.rs's
 /// duplicate was deleted; callers pass `&rumor.tags` directly.
-pub fn tag_value<'a>(tags: &'a nostr_sdk::nostr::Tags, name: &str) -> Option<&'a str> {
+pub fn tag_value<'a>(tags: &'a crate::nostr::Tags, name: &str) -> Option<&'a str> {
     tags.iter().find_map(|t| {
         let parts = t.as_slice();
         (parts.first().map(|s| s.as_str()) == Some(name))
@@ -895,7 +895,7 @@ pub trait RecipientKeyResolver: Send + Sync {
     /// The decrypted key for `recipient`, or `None` when no local key
     /// matches. Implementations SHOULD cache (content-keyed) — the same
     /// recipient must not re-pay the KDF within a process.
-    fn resolve(&self, recipient: &nostr_sdk::nostr::PublicKey) -> Option<Keys>;
+    fn resolve(&self, recipient: &crate::nostr::PublicKey) -> Option<Keys>;
 }
 
 /// The unwrap pipeline: bus events → unwrap with local keys → policy gate →
@@ -965,7 +965,7 @@ impl UnwrapPipeline {
     /// Unwrap `wrap`: p-tag directed first (exactly one key), then the
     /// eager-key scan as fallback.
     fn try_unwrap(&self, wrap: &Event) -> Option<(Keys, gift_wrap::UnwrappedGift)> {
-        if wrap.kind != nostr_sdk::nostr::Kind::GiftWrap {
+        if wrap.kind != crate::nostr::Kind::GiftWrap {
             return None;
         }
         // bd-unwrap-ptag-lazy: the wrap's `p` tag names the recipient npub.
@@ -973,7 +973,7 @@ impl UnwrapPipeline {
         // scans the keyring.
         if let Some(resolver) = &self.resolver
             && let Some(npub) =
-                tag_value(&wrap.tags, "p").and_then(|v| nostr_sdk::nostr::PublicKey::parse(v).ok())
+                tag_value(&wrap.tags, "p").and_then(|v| crate::nostr::PublicKey::parse(v).ok())
             && let Some(k) = resolver.resolve(&npub)
             && let Ok(g) = gift_wrap::unwrap(&k, wrap)
         {
@@ -1047,7 +1047,7 @@ impl UnwrapPipeline {
         // target row on the index (author-gated: the signer must be the
         // message's sender_pubkey — enforced inside the sink's tombstone).
         // Verified canonical above (id+sig).
-        if wrap.kind == nostr_sdk::nostr::Kind::EventDeletion {
+        if wrap.kind == crate::nostr::Kind::EventDeletion {
             let Some(target) = wrap
                 .tags
                 .iter()
@@ -1123,7 +1123,7 @@ impl UnwrapPipeline {
         let mut projected = 0usize;
         while let Some(ev) = sub.next().await {
             if let crate::bus::SubscriptionEvent::Event(event) = ev
-                && event.kind == nostr_sdk::nostr::Kind::GiftWrap
+                && event.kind == crate::nostr::Kind::GiftWrap
                 && self.project_verified(&event).await == ProjectOutcome::Projected
             {
                 projected += 1;
@@ -1136,7 +1136,7 @@ impl UnwrapPipeline {
 /// True when a rumor is a G8 ack/read receipt: kind 14 with a `toron-kind`
 /// tag of `ack` or `read` plus an `e` reference to the original message.
 pub fn is_ack_rumor(rumor: &UnsignedEvent) -> bool {
-    if rumor.kind != nostr_sdk::nostr::Kind::PrivateDirectMessage {
+    if rumor.kind != crate::nostr::Kind::PrivateDirectMessage {
         return false;
     }
     let mut toron_kind = None;
@@ -1154,8 +1154,8 @@ pub fn is_ack_rumor(rumor: &UnsignedEvent) -> bool {
 
 /// True when a kind is eligible for projection unwrapping (metadata-hiding
 /// envelope class: gift wraps). Re-exported for the run loop's filter.
-pub fn is_wrap_kind(kind: nostr_sdk::nostr::Kind) -> bool {
-    is_metadata_hiding_kind(kind) && kind == nostr_sdk::nostr::Kind::GiftWrap
+pub fn is_wrap_kind(kind: crate::nostr::Kind) -> bool {
+    is_metadata_hiding_kind(kind) && kind == crate::nostr::Kind::GiftWrap
 }
 
 #[cfg(test)]
@@ -1163,13 +1163,13 @@ mod tests {
     use super::*;
     use crate::nostr::gift_wrap::build_rumor;
     use crate::nostr::kinds::{AGENT_PROFILE, PROJECT_MANIFEST};
-    use nostr_sdk::nostr::{Kind, Tag};
+    use crate::nostr::{FinalizeEvent, Kind, Tag};
 
     fn keys() -> Keys {
         Keys::generate()
     }
 
-    async fn wrap_for(sender: &Keys, recipient: &Keys, created_at: u64) -> Event {
+    fn wrap_for(sender: &Keys, recipient: &Keys, created_at: u64) -> Event {
         let rumor = build_rumor(
             sender.public_key(),
             Timestamp::from(created_at),
@@ -1177,9 +1177,7 @@ mod tests {
             vec![Tag::parse(["p", &recipient.public_key().to_hex()]).expect("p")],
             "hello",
         );
-        gift_wrap::gift_wrap(sender, &recipient.public_key(), rumor)
-            .await
-            .expect("wrap")
+        gift_wrap::gift_wrap(sender, &recipient.public_key(), rumor).expect("wrap")
     }
 
     #[test]
@@ -1206,8 +1204,8 @@ mod tests {
         // rumor timeline. Sorting MUST follow rumor created_at.
         let sender = keys();
         let recipient = keys();
-        let older = wrap_for(&sender, &recipient, 1_700_000_000).await;
-        let newer = wrap_for(&sender, &recipient, 1_700_000_100).await;
+        let older = wrap_for(&sender, &recipient, 1_700_000_000);
+        let newer = wrap_for(&sender, &recipient, 1_700_000_100);
 
         let rumor_of = |wrap: &Event| -> UnsignedEvent {
             gift_wrap::unwrap(&recipient, wrap).expect("unwrap").rumor
@@ -1380,7 +1378,7 @@ mod tests {
         // G14: block_all mail must be dropped BEFORE any Git/archive write.
         let sender = keys();
         let recipient = keys();
-        let wrap = wrap_for(&sender, &recipient, 1_700_000_000).await;
+        let wrap = wrap_for(&sender, &recipient, 1_700_000_000);
 
         let root = temp_archive("blockall");
         let sink = Arc::new(GitProjectionSink::open(&root).expect("open"));
@@ -1424,9 +1422,7 @@ mod tests {
             ],
             "operator override: pause and handle",
         );
-        gift_wrap::gift_wrap(sender, &recipient.public_key(), rumor)
-            .await
-            .expect("wrap")
+        gift_wrap::gift_wrap(sender, &recipient.public_key(), rumor).expect("wrap")
     }
 
     #[tokio::test]
@@ -1495,7 +1491,7 @@ mod tests {
         let operator = keys();
         let recipient = keys();
         // Same sender, same importance, but NO overseer tag (plain wrap).
-        let wrap = wrap_for(&operator, &recipient, 1_700_000_000).await;
+        let wrap = wrap_for(&operator, &recipient, 1_700_000_000);
 
         let root = temp_archive("overseer-no-tag");
         let sink = Arc::new(GitProjectionSink::open(&root).expect("open"));
@@ -1520,7 +1516,7 @@ mod tests {
         // contacts_only without an approved contact link → dropped pre-write.
         let sender = keys();
         let recipient = keys();
-        let wrap = wrap_for(&sender, &recipient, 1_700_000_000).await;
+        let wrap = wrap_for(&sender, &recipient, 1_700_000_000);
 
         let root = temp_archive("contactsonly");
         let sink = Arc::new(GitProjectionSink::open(&root).expect("open"));
@@ -1544,7 +1540,7 @@ mod tests {
         // redelivery / federation replay) MUST produce one Git commit.
         let sender = keys();
         let recipient = keys();
-        let wrap = wrap_for(&sender, &recipient, 1_700_000_000).await;
+        let wrap = wrap_for(&sender, &recipient, 1_700_000_000);
 
         let root = temp_archive("idempotent");
         let sink = Arc::new(GitProjectionSink::open(&root).expect("open"));
@@ -1570,7 +1566,7 @@ mod tests {
     /// Build a gift wrap whose OUTER event carries a NIP-40 `expiration` tag
     /// (the wire-level event relays/peers enforce — NIP-17 randomized inner
     /// timestamps are irrelevant to NIP-40, which reads the wrap itself).
-    async fn wrap_with_expiration(sender: &Keys, recipient: &Keys, expires_at: Timestamp) -> Event {
+    fn wrap_with_expiration(sender: &Keys, recipient: &Keys, expires_at: Timestamp) -> Event {
         let rumor = build_rumor(
             sender.public_key(),
             Timestamp::from(1_700_000_000),
@@ -1578,14 +1574,10 @@ mod tests {
             vec![Tag::parse(["p", &recipient.public_key().to_hex()]).expect("p")],
             "expiring hello",
         );
-        nostr_sdk::nostr::EventBuilder::gift_wrap(
-            sender,
-            &recipient.public_key(),
-            rumor,
-            [Tag::expiration(expires_at)],
-        )
-        .await
-        .expect("wrap with expiration")
+        ::nostr::nips::nip59::GiftWrapBuilder::new(recipient.public_key(), rumor)
+            .extra_tags([Tag::expiration(expires_at)])
+            .finalize(sender)
+            .expect("wrap with expiration")
     }
 
     /// P0 finding (bd-p0-nip40-ingest-probe-oyaa): a gift wrap whose NIP-40
@@ -1601,7 +1593,7 @@ mod tests {
         let sender = keys();
         let recipient = keys();
         let past = Timestamp::from(Timestamp::now().as_secs().saturating_sub(60));
-        let expired = wrap_with_expiration(&sender, &recipient, past).await;
+        let expired = wrap_with_expiration(&sender, &recipient, past);
 
         let root = temp_archive("nip40-expired");
         let sink = Arc::new(GitProjectionSink::open(&root).expect("open"));
@@ -1629,7 +1621,7 @@ mod tests {
         let sender = keys();
         let recipient = keys();
         let future = Timestamp::from(Timestamp::now().as_secs() + 86_400);
-        let wrap = wrap_with_expiration(&sender, &recipient, future).await;
+        let wrap = wrap_with_expiration(&sender, &recipient, future);
 
         let root = temp_archive("nip40-future");
         let sink = Arc::new(GitProjectionSink::open(&root).expect("open"));
@@ -1660,17 +1652,17 @@ mod tests {
     async fn forged_wrap_signature_rejected_on_unwrap() {
         let sender = keys();
         let recipient = keys();
-        let wrap = wrap_for(&sender, &recipient, 1_700_000_000).await;
+        let wrap = wrap_for(&sender, &recipient, 1_700_000_000);
         // Corrupt ONLY the wrap's signature (content untouched → decrypt
         // still succeeds today).
-        let forged = nostr_sdk::nostr::Event::new(
+        let forged = crate::nostr::Event::new(
             wrap.id,
             wrap.pubkey,
             wrap.created_at,
             wrap.kind,
             wrap.tags.clone(),
             wrap.content.clone(),
-            nostr_sdk::nostr::prelude::Signature::from_slice(&[0u8; 64]).expect("sig"),
+            ::nostr::prelude::Signature::from_slice(&[0u8; 64]).expect("sig"),
         );
         assert!(
             crate::nostr::event::verify_event(&forged).is_err(),
@@ -1715,8 +1707,8 @@ mod tests {
         use crate::bus::Bus;
         use crate::bus::in_process::{InProcessBus, InProcessBusConfig};
         use crate::index::schema;
+        use crate::nostr::Filter;
         use crate::nostr::event::VERIFY_EVENT_COUNT;
-        use nostr_sdk::nostr::Filter;
 
         let sender = keys();
         let recipient = keys();
@@ -1743,7 +1735,7 @@ mod tests {
             .verify_count
             .load(std::sync::atomic::Ordering::Relaxed);
 
-        let wrap = wrap_for(&sender, &recipient, 1_700_000_000).await;
+        let wrap = wrap_for(&sender, &recipient, 1_700_000_000);
 
         // Ingress: bus publish verifies once (the trust boundary). The gauge
         // is process-global, so under parallel tests other publishes can
@@ -1763,7 +1755,7 @@ mod tests {
         // events, so the timeout is EXPECTED — the projection completed
         // before the wait, and the counter proves no re-verify happened.
         let sub = bus
-            .subscribe(Filter::new().kinds([nostr_sdk::nostr::Kind::GiftWrap]))
+            .subscribe(Filter::new().kinds([crate::nostr::Kind::GiftWrap]))
             .await
             .expect("subscribe");
         let drained =
@@ -1782,7 +1774,7 @@ mod tests {
         );
 
         // Direct-caller contract unchanged: project() still verifies.
-        let wrap2 = wrap_for(&sender, &recipient, 1_700_000_100).await;
+        let wrap2 = wrap_for(&sender, &recipient, 1_700_000_100);
         let out = pipeline.project(&wrap2).await;
         assert_eq!(out, ProjectOutcome::Projected, "direct project lands");
         let after_direct = pipeline
@@ -1824,7 +1816,7 @@ mod tests {
 
         let sender = keys();
         let recipient = keys();
-        let wrap = wrap_for(&sender, &recipient, 1_700_000_000).await;
+        let wrap = wrap_for(&sender, &recipient, 1_700_000_000);
         let rumor = gift_wrap::unwrap(&recipient, &wrap).expect("unwrap").rumor;
         let rumor_id = rumor.clone().id();
         let _mail = UnwrappedMail {
@@ -1845,9 +1837,9 @@ mod tests {
         assert_eq!(pipeline.project(&wrap).await, ProjectOutcome::Projected);
 
         // NIP-09: the AUTHOR signs a kind-5 deletion referencing the message.
-        let delete = nostr_sdk::nostr::EventBuilder::new(nostr_sdk::nostr::Kind::EventDeletion, "")
-            .tags([nostr_sdk::nostr::Tag::event(rumor_id)])
-            .sign_with_keys(&sender)
+        let delete = crate::nostr::EventBuilder::new(crate::nostr::Kind::EventDeletion, "")
+            .tags([crate::nostr::Tag::event(rumor_id)])
+            .finalize(&sender)
             .expect("sign kind-5");
         pipeline.project(&delete).await;
 
@@ -1891,7 +1883,7 @@ mod tests {
         let bus: std::sync::Arc<dyn crate::bus::Bus> = std::sync::Arc::new(bus);
         let mut wraps = Vec::with_capacity(N);
         for i in 0..N {
-            let wrap = wrap_for(&sender, &recipient, 1_700_000_000 + i as u64 * 100).await;
+            let wrap = wrap_for(&sender, &recipient, 1_700_000_000 + i as u64 * 100);
             bus.publish(wrap.clone()).await.expect("publish to bus");
             wraps.push(wrap);
         }
@@ -1927,7 +1919,7 @@ mod tests {
         // Projection 1 — bus: replay envelopes, unwrap, order by rumor time.
         let replayed = crate::mailbox::collect_replay(
             bus.as_ref(),
-            Filter::new().kinds([nostr_sdk::nostr::Kind::GiftWrap]),
+            Filter::new().kinds([crate::nostr::Kind::GiftWrap]),
         )
         .await
         .expect("bus replay");
@@ -1955,7 +1947,7 @@ mod tests {
                 if p.is_dir() {
                     stack.push(p);
                 } else if p.extension().and_then(|s| s.to_str()) == Some("json") {
-                    let rumor = nostr_sdk::nostr::event::unsigned::UnsignedEvent::from_json(
+                    let rumor = crate::nostr::UnsignedEvent::from_json(
                         std::fs::read_to_string(&p).expect("read"),
                     )
                     .expect("rumor json");
@@ -2130,7 +2122,7 @@ mod tests {
 
         let sender = keys();
         let recipient = keys();
-        let wrap = wrap_for(&sender, &recipient, 1_700_000_000).await;
+        let wrap = wrap_for(&sender, &recipient, 1_700_000_000);
         let mail = UnwrappedMail {
             recipient: recipient.public_key(),
             sender: sender.public_key(),
@@ -2166,7 +2158,7 @@ mod tests {
     async fn git_sink_restart_persists_dedup() {
         let sender = keys();
         let recipient = keys();
-        let wrap = wrap_for(&sender, &recipient, 1_700_000_000).await;
+        let wrap = wrap_for(&sender, &recipient, 1_700_000_000);
         let rumor = gift_wrap::unwrap(&recipient, &wrap).expect("unwrap").rumor;
         let mail = UnwrappedMail {
             recipient: recipient.public_key(),
@@ -2225,7 +2217,7 @@ mod tests {
         );
 
         let sender = keys();
-        let wrap = wrap_for(&sender, &recipient, 1_700_000_000).await;
+        let wrap = wrap_for(&sender, &recipient, 1_700_000_000);
         let outcome = pipeline.project(&wrap).await;
         assert_eq!(outcome, ProjectOutcome::Projected, "mail projected");
 
@@ -2343,7 +2335,11 @@ mod tests {
 
         let mut wraps = Vec::with_capacity(N);
         for i in 0..N {
-            wraps.push(wrap_for(&sender, &recipient, 1_700_000_000 + i as u64 * 100).await);
+            wraps.push(wrap_for(
+                &sender,
+                &recipient,
+                1_700_000_000 + i as u64 * 100,
+            ));
         }
         for wrap in &wraps {
             assert_eq!(
@@ -2398,7 +2394,7 @@ mod tests {
 
         let recipient = keys();
         let sender = keys();
-        let wrap = wrap_for(&sender, &recipient, 1_700_000_000).await;
+        let wrap = wrap_for(&sender, &recipient, 1_700_000_000);
         let mail = UnwrappedMail {
             recipient: recipient.public_key(),
             sender: sender.public_key(),

@@ -8,8 +8,8 @@
 //! source of truth for project-scoped identity (G2). Key storage (ncryptsec)
 //! and bus publishing are the caller's concern (mailbox layer).
 
-use nostr_sdk::nostr::event::builder::Error as BuilderError;
-use nostr_sdk::nostr::{Event, JsonUtil, Keys, PublicKey, Tag, Timestamp};
+use crate::nostr::{Event, Keys, PublicKey, Tag, Timestamp};
+use ::nostr::error::Error as BuilderError;
 
 use crate::bus::scoping::with_project_scoping;
 use crate::nostr::event::build_event;
@@ -150,13 +150,12 @@ pub fn resolve_name<'a>(
         .into_iter()
         .filter(|ev| ev.kind.as_u16() == AGENT_PROFILE)
         .filter(|ev| {
-            ev.tags.iter().find_map(|t| {
-                (t.kind() == nostr_sdk::nostr::TagKind::d())
-                    .then(|| t.content())
-                    .flatten()
-            }) == Some(want.as_str())
+            ev.tags
+                .iter()
+                .find_map(|t| (t.kind() == "d").then(|| t.content()).flatten())
+                == Some(want.as_str())
         })
-        .max_by_key(|ev| ev.created_at)
+        .max_by(|a, b| crate::bus::addressable::nip01_replaceable_cmp(a, b))
         .map(profile_npub)
 }
 
@@ -303,7 +302,7 @@ mod tests {
         let t_tags: Vec<Vec<String>> = ev
             .tags
             .iter()
-            .filter(|t| t.kind() == nostr_sdk::nostr::TagKind::t())
+            .filter(|t| t.kind() == "t")
             .map(|t| t.as_slice().iter().map(|s| s.to_string()).collect())
             .collect();
         assert_eq!(
@@ -430,6 +429,29 @@ mod tests {
             resolve_name("demo", [&new.event, &old.event], "BlueLake"),
             Some(new.event.pubkey),
             "order-independent: latest wins either way"
+        );
+    }
+
+    /// NIP-01: equal `created_at` on two 30013s under one d-tag keeps the
+    /// lowest event id, not iterator order.
+    #[test]
+    fn resolve_name_equal_created_at_keeps_lowest_id() {
+        let a = create_agent_identity("demo", &sample_profile(), ts()).expect("a");
+        let b = create_agent_identity("demo", &sample_profile(), ts()).expect("b");
+        let (low, high) = if a.event.id.to_hex() < b.event.id.to_hex() {
+            (a, b)
+        } else {
+            (b, a)
+        };
+        assert_eq!(
+            resolve_name("demo", [&high.event, &low.event], "BlueLake"),
+            Some(low.event.pubkey),
+            "lowest id wins on a created_at tie"
+        );
+        assert_eq!(
+            resolve_name("demo", [&low.event, &high.event], "BlueLake"),
+            Some(low.event.pubkey),
+            "order-independent lowest id"
         );
     }
 

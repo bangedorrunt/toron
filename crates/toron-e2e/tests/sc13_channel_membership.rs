@@ -1,5 +1,6 @@
 // governed-by: ADR-0003
 // governed-by: ADR-0020
+// governed-by: ADR-0023
 #![forbid(unsafe_code)]
 
 //! SC-13 — Private NIP-29 channel collaboration room (P2 gate).
@@ -99,7 +100,7 @@ async fn sc13_private_channel_membership_gate() {
     assert_eq!(mention.kind.as_u16(), 9, "@mention post is also kind 9");
     assert_eq!(mention.kind.as_u16(), CHANNEL_MESSAGE);
     assert!(
-        mention.tags.iter().any(|t| t.kind() == TagKind::p()
+        mention.tags.iter().any(|t| t.kind() == "p"
             && t.content()
                 .map(|c| c == pi_a.public_key().to_hex())
                 .unwrap_or(false)),
@@ -135,13 +136,16 @@ async fn sc13_private_channel_membership_gate() {
     // 1b. The channel is private (flag) and the CREATE kind is emitted.
     let ch = store.get("auth-refactor").expect("channel exists");
     assert!(ch.private, "channel must be private");
-    assert_eq!(CHANNEL_CREATE, 40, "kind registry stable");
+    assert_eq!(
+        CHANNEL_CREATE, 39000,
+        "kind registry stable (ADR-0023 39000)"
+    );
 
     // 2b. ADR-0020 Spec 1 legacy ingest: a kind-42 event from a member
     // projects as a channel post alongside the kind-9 emits.
     let legacy = EventBuilder::new(Kind::from_u16(42), "legacy pre-ADR-0020 post")
         .tags(vec![Tag::parse(["h", "auth-refactor"]).expect("h tag")])
-        .sign_with_keys(&oc_b)
+        .finalize(&oc_b)
         .expect("sign legacy kind-42 post");
     let projected = store.ingest(&legacy).expect("legacy kind 42 ingests");
     assert_eq!(projected.kind, 42, "legacy 42 projects as a channel post");

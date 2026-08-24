@@ -22,7 +22,7 @@ use parking_lot::{Mutex, RwLock};
 use sqlx::SqlitePool;
 use tokio::sync::mpsc;
 
-use nostr_sdk::nostr::Event;
+use crate::nostr::Event;
 
 use crate::bus::event_store::BusEventStore;
 use crate::bus::{
@@ -170,7 +170,7 @@ impl InProcessBus {
     /// such would make global subscribers drop stamped workflow jobs (F6/F7).
     fn project_slug(event: &Event) -> Option<&str> {
         event.tags.iter().find_map(|t| {
-            if t.kind() == nostr_sdk::nostr::TagKind::t() {
+            if t.kind() == "t" {
                 let c = t.content()?;
                 if c.starts_with("toron:") {
                     return None;
@@ -267,9 +267,9 @@ impl InProcessBus {
 
         // Global = filter has no project scoping (#t via hashtags or #l label)
         // AND not trusted. A trusted subscriber is always project-scoped.
-        use nostr_sdk::nostr::{Alphabet, SingleLetterTag};
-        let t_tag = SingleLetterTag::lowercase(Alphabet::T);
-        let l_tag = SingleLetterTag::lowercase(Alphabet::L);
+        use crate::nostr::SingleLetterTag;
+        let t_tag = SingleLetterTag::LOWERCASE_T;
+        let l_tag = SingleLetterTag::LOWERCASE_L;
         let global = !trusted
             && !filter.generic_tags.contains_key(&t_tag)
             && !filter.generic_tags.contains_key(&l_tag);
@@ -498,7 +498,7 @@ mod tests {
     use crate::index::schema;
     use crate::nostr::event::build_event;
     use crate::nostr::kinds::{AGENT_PROFILE, PROJECT_MANIFEST};
-    use nostr_sdk::nostr::{EventId, Keys, Tag, Timestamp};
+    use crate::nostr::{EventId, Keys, Tag, Timestamp};
     use std::time::{Duration, Instant};
 
     async fn temp_bus() -> (InProcessBus, std::path::PathBuf) {
@@ -1190,12 +1190,11 @@ mod tests {
         let rumor = crate::nostr::gift_wrap::build_rumor(
             sender.public_key(),
             Timestamp::now(),
-            nostr_sdk::nostr::Kind::PrivateDirectMessage,
+            crate::nostr::Kind::PrivateDirectMessage,
             vec![Tag::parse(["p", &recipient.public_key().to_hex()]).expect("p")],
             "secret",
         );
         let wrapped = crate::nostr::gift_wrap::gift_wrap(&sender, &recipient.public_key(), rumor)
-            .await
             .expect("wrap");
         // Wrap is metadata-hiding → no scoping tags applied by the helper.
         assert!(is_metadata_hiding_kind(wrapped.kind));

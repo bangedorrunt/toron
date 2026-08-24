@@ -14,7 +14,7 @@
 //! events are project-scoped implicitly by recipient membership at the
 //! projection.
 
-use nostr_sdk::nostr::{Kind, Tag};
+use crate::nostr::{Kind, Tag};
 
 use crate::bus::filter::LABEL_NAMESPACE;
 
@@ -70,9 +70,9 @@ mod tests {
     use crate::nostr::event::build_event;
     use crate::nostr::gift_wrap;
     use crate::nostr::kinds::{AGENT_PROFILE, FILE_RESERVATION, PROJECT_MANIFEST};
-    use nostr_sdk::nostr::{Keys, Timestamp};
+    use crate::nostr::{Keys, Timestamp};
 
-    fn has_tag(ev: &nostr_sdk::nostr::Event, needle: &[&str]) -> bool {
+    fn has_tag(ev: &crate::nostr::Event, needle: &[&str]) -> bool {
         ev.tags.iter().any(|t| {
             let parts: Vec<&str> = t.as_slice().iter().map(|s| s.as_str()).collect();
             parts == needle
@@ -163,9 +163,7 @@ mod tests {
             vec![Tag::parse(["p", &recipient.public_key().to_hex()]).expect("p")],
             "secret",
         );
-        let wrapped = gift_wrap::gift_wrap(&sender, &recipient.public_key(), rumor)
-            .await
-            .expect("wrap");
+        let wrapped = gift_wrap::gift_wrap(&sender, &recipient.public_key(), rumor).expect("wrap");
 
         // The kind-1059 wrap must carry NO project-scoping tags.
         assert!(!has_tag(&wrapped, &["t", "demo"]));
@@ -191,9 +189,7 @@ mod tests {
             ],
             "body",
         );
-        let wrapped = gift_wrap::gift_wrap(&sender, &recipient.public_key(), rumor)
-            .await
-            .expect("wrap");
+        let wrapped = gift_wrap::gift_wrap(&sender, &recipient.public_key(), rumor).expect("wrap");
 
         let envelope_tags: Vec<Vec<String>> = wrapped
             .tags

@@ -538,7 +538,8 @@ async fn mailbox_view(mailbox: &Mailbox, name: &str) -> Option<serde_json::Value
 /// Kind-addressable manifest events (products/reservations/slots) as a JSON
 /// array of signed events, newest first. `d` filters on the addressable tag.
 async fn manifest_view(mailbox: &Mailbox, kind: u16, d: Option<&str>) -> Option<serde_json::Value> {
-    let filter = nostr_sdk::Filter::new().kinds([toron_core::nostr::kinds::toron_kind(kind)]);
+    let filter =
+        toron_core::nostr::Filter::new().kinds([toron_core::nostr::kinds::toron_kind(kind)]);
     let events = toron_core::mailbox::collect_replay(mailbox.bus().as_ref(), filter)
         .await
         .ok()?;
@@ -546,9 +547,9 @@ async fn manifest_view(mailbox: &Mailbox, kind: u16, d: Option<&str>) -> Option<
         .into_iter()
         .filter(|ev| {
             d.map(|want| {
-                ev.tags.iter().any(|t| {
-                    t.kind() == nostr_sdk::nostr::TagKind::d() && t.content() == Some(want)
-                })
+                ev.tags
+                    .iter()
+                    .any(|t| t.kind() == "d" && t.content() == Some(want))
             })
             .unwrap_or(true)
         })

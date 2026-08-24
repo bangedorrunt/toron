@@ -16,7 +16,7 @@
 
 use std::collections::HashSet;
 
-use nostr_sdk::nostr::{PublicKey, UnsignedEvent};
+use crate::nostr::{PublicKey, UnsignedEvent};
 use parking_lot::Mutex;
 
 use crate::nostr::gift_wrap::UnwrappedGift;
@@ -95,7 +95,7 @@ pub fn rumor_timestamp_us(rumor: &UnsignedEvent) -> i64 {
 }
 
 /// Read a tag value by name from an event/rumor.
-fn tag_value<'a>(tags: &'a nostr_sdk::nostr::Tags, name: &str) -> Option<&'a str> {
+fn tag_value<'a>(tags: &'a crate::nostr::Tags, name: &str) -> Option<&'a str> {
     tags.iter()
         .find(|t| t.as_slice().first().map(String::as_str) == Some(name))
         .and_then(|t| t.as_slice().get(1))
@@ -212,8 +212,8 @@ impl AckCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::nostr::Keys;
     use crate::nostr::gift_wrap;
-    use nostr_sdk::nostr::Keys;
     use nostr_sdk::prelude::*;
 
     /// Build a rumor + gift-wrap envelope with a FIXED envelope timestamp so
@@ -231,9 +231,7 @@ mod tests {
             vec![Tag::public_key(*recipient)],
             rumor_content.to_string(),
         );
-        let wrapped = gift_wrap::gift_wrap(sender, recipient, rumor.clone())
-            .await
-            .expect("wrap");
+        let wrapped = gift_wrap::gift_wrap(sender, recipient, rumor.clone()).expect("wrap");
         (rumor, wrapped)
     }
 

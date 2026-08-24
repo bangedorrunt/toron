@@ -67,7 +67,7 @@
 //! - It does NOT deduplicate redelivered events (that's the engine's
 //!   idempotency-key job, already handled by `run_id`).
 
-use nostr_sdk::nostr::Event;
+use nostr::prelude::Event;
 
 use toron_core::bus::addressable::is_revocation;
 use toron_core::nostr::kinds::{
@@ -340,14 +340,14 @@ pub fn trigger_run_id(workflow_name: &str, event: &Event) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nostr_sdk::nostr::{Event, EventBuilder, JsonUtil, Keys, Kind, Tag};
+    use nostr::prelude::{Event, EventBuilder, FinalizeEvent, Keys, Kind, Tag};
 
     /// Build a minimal signed event of `kind` with optional extra tags, for
     /// filter tests. Content is irrelevant to the filter.
     fn ev(kind: u16, tags: Vec<Tag>, keys: &Keys) -> Event {
         EventBuilder::new(Kind::from_u16(kind), "")
             .tags(tags)
-            .sign_with_keys(keys)
+            .finalize(keys)
             .expect("sign")
     }
 
@@ -512,7 +512,7 @@ mod tests {
     fn filter_operates_on_wire_events() {
         let keys = Keys::generate();
         let e = EventBuilder::new(Kind::from_u16(JOB_RESULT), r#"{"status":"ok"}"#)
-            .sign_with_keys(&keys)
+            .finalize(&keys)
             .expect("sign");
         // Wire round-trip.
         let parsed = Event::from_json(e.as_json()).expect("parse");
@@ -530,7 +530,7 @@ mod tests {
     fn reservation(content: &str, tags: Vec<Tag>, keys: &Keys) -> Event {
         EventBuilder::new(Kind::from_u16(FILE_RESERVATION_KIND), content)
             .tags(tags)
-            .sign_with_keys(keys)
+            .finalize(keys)
             .expect("sign")
     }
 
@@ -742,7 +742,7 @@ mod tests {
         let keys = Keys::generate();
         let thumbs = EventBuilder::new(Kind::from_u16(7), "+")
             .tags(vec![Tag::parse(["h", "room"]).expect("h")])
-            .sign_with_keys(&keys)
+            .finalize(&keys)
             .expect("sign");
         assert!(matches_trigger(
             &Trigger::ReactionAdded {
@@ -795,7 +795,7 @@ mod tests {
         let keys = Keys::generate();
         let dm = EventBuilder::new(Kind::from_u16(14), "hello")
             .tags(vec![tag_t("demo"), Tag::parse(["h", "room"]).expect("h")])
-            .sign_with_keys(&keys)
+            .finalize(&keys)
             .expect("sign");
         assert!(matches_trigger(
             &Trigger::MessagePosted {
@@ -864,7 +864,7 @@ mod tests {
         assert_eq!(trigger_payload(&released)["status"], json!("released"));
         // A non-reservation payload has no status field.
         let dm = EventBuilder::new(Kind::from_u16(14), "hi")
-            .sign_with_keys(&keys)
+            .finalize(&keys)
             .expect("sign");
         assert!(trigger_payload(&dm).get("status").is_none());
         // Deterministic run ids: stable per (workflow, event), distinct per event.
