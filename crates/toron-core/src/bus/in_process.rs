@@ -129,6 +129,21 @@ impl InProcessBus {
     /// Open the bus on a SQLite pool (event-store table created idempotently).
     pub async fn open(pool: SqlitePool, config: InProcessBusConfig) -> anyhow::Result<Self> {
         let store = BusEventStore::new(pool).await?;
+        // bd-741i: prune was never scheduled in production — expired rows
+        // piled up, WAL lingered, and the snapshot memo stayed cold. One
+        // background tick per PRUNE_INTERVAL is the whole contract.
+        let prune_store = store.clone();
+        tokio::spawn(async move {
+            // Sleep first: tokio interval fires immediately, which would
+            // bump mutations on every `open()` and bust the snapshot memo
+            // before the first real replay (bd-3gwy / bd-741i).
+            loop {
+                tokio::time::sleep(BusEventStore::PRUNE_INTERVAL).await;
+                if let Err(e) = prune_store.prune().await {
+                    tracing::warn!("bus prune failed: {e:#}");
+                }
+            }
+        });
         Ok(Self {
             store,
             config: Arc::new(config),

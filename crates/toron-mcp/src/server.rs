@@ -445,6 +445,7 @@ pub(crate) fn operator_keys() -> anyhow::Result<Option<toron_core::keys::Keys>> 
 /// Blocks until the stdio connection closes.
 pub async fn serve_stdio() -> anyhow::Result<()> {
     let (mailbox, trigger_rx) = demo_mailbox_with_trigger().await?;
+    let _lock = crate::serve_lock::acquire(mailbox.data_dir())?;
     spawn_mail_trigger_host(mailbox.clone(), trigger_rx);
     let server = ToronServer::new().with_mailbox(mailbox);
     let running = server.serve(rmcp::transport::stdio()).await?;
@@ -483,15 +484,17 @@ async fn router_with_mailbox(
 ) -> anyhow::Result<axum::Router> {
     spawn_mail_trigger_host(mailbox.clone(), trigger_rx);
     let server = ToronServer::new().with_mailbox(mailbox);
+    // bd-741i: legacy_session_mode=false — every request is stateless
+    // (SEP-2567). The previous default (legacy true) accumulated
+    // LocalSessionManager sessions for every MCP client and never expired
+    // them; overnight that was part of the 16GB launchd RSS climb.
     let service: StreamableHttpService<ToronServer, LocalSessionManager> =
         StreamableHttpService::new(
             move || Ok(server.clone()),
             Arc::new(LocalSessionManager::default()),
             StreamableHttpServerConfig::default()
-                // 2026-07-28 clients are served statelessly per SEP-2567
-                // regardless of this flag; keep legacy mode enabled so
-                // pre-2026-07-28 clients still complete a session lifecycle.
-                .with_json_response(true),
+                .with_json_response(true)
+                .with_legacy_session_mode(false),
         );
     // ADR-0006 (bd-esh.5): mount the Blossom blob-serving surface at
     // `/.blossom` (BUD-01 retrieval + BUD-02 upload) over a per-daemon blob
@@ -507,6 +510,11 @@ async fn router_with_mailbox(
 /// Serve the toron MCP server over Streamable HTTP on `bind_addr`
 /// (e.g. `127.0.0.1:8000`).
 pub async fn serve_http(bind_addr: &str) -> anyhow::Result<()> {
+    let (mailbox, trigger_rx) = demo_mailbox_with_trigger().await?;
+    // bd-741i: refuse a second writer on this data dir *before* binding so
+    // a flywheel sidecar `toron serve --mcp-http <other-port>` cannot open
+    // a parallel SQLite pool against the live mailbox.
+    let _lock = crate::serve_lock::acquire(mailbox.data_dir())?;
     let listener = match tokio::net::TcpListener::bind(bind_addr).await {
         Ok(listener) => listener,
         Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
@@ -530,7 +538,7 @@ pub async fn serve_http(bind_addr: &str) -> anyhow::Result<()> {
         Err(e) => return Err(e.into()),
     };
     tracing::info!(%bind_addr, "toron MCP Streamable HTTP listening at /mcp");
-    axum::serve(listener, router().await?).await?;
+    axum::serve(listener, router_with_mailbox(mailbox, trigger_rx).await?).await?;
     Ok(())
 }
 

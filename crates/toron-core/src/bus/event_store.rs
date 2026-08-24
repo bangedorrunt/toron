@@ -76,6 +76,16 @@ CREATE INDEX IF NOT EXISTS bus_event_tags_kind_value ON bus_event_tags (tag_kind
 /// filter's matched-id list warm. Overflow evicts the oldest entry.
 const SNAPSHOT_MEMO_CAP: usize = 64;
 
+/// NIP-40: an event whose `expiration` tag is at or before now must never
+/// surface from replay, even when a snapshot memo still lists its id
+/// (the row sits until prune, ≤ PRUNE_INTERVAL).
+fn event_is_expired(event: &Event) -> bool {
+    event
+        .tags
+        .expiration()
+        .is_some_and(|exp| exp.as_secs() <= Timestamp::now().as_secs())
+}
+
 /// Exact-compare key for the snapshot memo: everything that decides the
 /// phase-1 SQL (and therefore the matched id set). Hashed for lookup,
 /// compared for safety — a hash collision can never serve another filter's
@@ -140,9 +150,8 @@ pub struct BusEventStore {
     hot: Arc<parking_lot::Mutex<HashMap<String, Arc<Event>>>>,
     /// bd-3gwy: per-filter snapshot memo. Validity is checked against the
     /// authoritative mutation counter in `bus_meta` (SQL): any insert /
-    /// supersede / prune bumps it, so every instance invalidates. While
-    /// expiring events exist the memo is bypassed entirely (TTL kinds must
-    /// be re-evaluated against `now`, never served from a snapshot).
+    /// supersede / prune bumps it, so every instance invalidates. Expired
+    /// rows do not bypass the memo (bd-741i); hydrate skips them.
     snaps: Arc<parking_lot::Mutex<SnapMemos>>,
     /// bd-py9o/bd-3gwy measurement counters (per instance — globals would
     /// cross-contaminate under parallel tests). Rows parsed from raw_json,
@@ -439,19 +448,19 @@ impl BusEventStore {
             h.finish()
         };
 
-        // bd-3gwy: snapshot memo — identical filter + unchanged store version
-        // (local mutations AND foreign `data_version`) + no expiring rows ⇒
-        // reuse the matched-id list and skip phase-1 SQL entirely. The two
-        // version probes are cheap seeks vs a join-scan with sort.
-        let memo_ids = if self.any_expiring().await? {
-            None
-        } else {
-            let current = self.current_mutations().await;
-            self.snaps
-                .lock()
-                .get(fhash)
-                .and_then(|m| (m.version == current && m.key == fkey).then(|| m.ids.clone()))
-        };
+        // bd-3gwy / bd-741i: snapshot memo — identical filter + unchanged
+        // store version ⇒ reuse the matched-id list and skip phase-1 SQL.
+        // Expired rows are NOT a memo-bypass: scan_ids already drops them
+        // (`expires_at IS NULL OR expires_at > now`) and hydrate skips
+        // `expiration() <= now`. Prune (60s) bumps the version. Bypassing
+        // the memo for any stale TTL row forced every fleet poll / `toron
+        // watch` onto a full scan and spilled 128GB RSS overnight.
+        let current = self.current_mutations().await;
+        let memo_ids = self
+            .snaps
+            .lock()
+            .get(fhash)
+            .and_then(|m| (m.version == current && m.key == fkey).then(|| m.ids.clone()));
         let ids: Arc<Vec<String>> = match memo_ids {
             Some(ids) => ids,
             None => {
@@ -469,8 +478,7 @@ impl BusEventStore {
                     )
                     .await?;
                 let v1 = self.current_mutations().await;
-                // Memoize only tear-free scans of non-expiring stores.
-                if v0 == v1 && !self.any_expiring().await? {
+                if v0 == v1 {
                     self.snaps.lock().put(
                         fhash,
                         SnapMemo {
@@ -530,6 +538,7 @@ impl BusEventStore {
         let mut out: Vec<Event> = Vec::with_capacity(ids.len());
         for id in ids.iter() {
             if let Some(ev) = resolved.get(id)
+                && !event_is_expired(ev)
                 && filter.match_event(ev, Default::default())
             {
                 out.push(ev.clone());
@@ -620,25 +629,6 @@ impl BusEventStore {
         .fetch_one(&self.pool)
         .await
         .unwrap_or(0)
-    }
-
-    /// True when any STALE (already-expired but not yet pruned) row exists.
-    /// The old check `expires_at IS NOT NULL` disabled the snapshot memo
-    /// whenever ANY TTL row existed — with 90-day reservation TTL that was
-    /// always true (4.5k future expiries), so every fleet poll paid a 1-5s
-    /// TEMP B-TREE scan and pinned the daemon's CPU, spilling to swap.
-    /// Future expiries don't need a bypass: the memo is version-bumped on
-    /// every write/prune, and a row that later expires is pruned within
-    /// PRUNE_INTERVAL (60s) which bumps the version and invalidates the memo.
-    /// Only already-expired rows (expiry ≤ now) require a fresh scan.
-    async fn any_expiring(&self) -> anyhow::Result<bool> {
-        let n: i64 = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM bus_events WHERE expires_at IS NOT NULL AND expires_at <= ?1)",
-        )
-        .bind(Timestamp::now().as_secs() as i64)
-        .fetch_one(&self.pool)
-        .await?;
-        Ok(n != 0)
     }
 
     /// Phase-1 id-scan — the only query the snapshot memo skips (bd-3gwy).
@@ -814,11 +804,10 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// bd-3gwy acceptance gate: a replay on an UNCHANGED store skips the
-    /// phase-1 SQL id-scan entirely (snapshot memo, mutation-version
-    /// validated); any insert bumps the version and forces exactly one fresh
-    /// scan. While ANY expiring events exist the memo is bypassed (TTL kinds
-    /// must never be served stale by a snapshot).
+    /// bd-3gwy / bd-741i acceptance gate: a replay on an UNCHANGED store
+    /// skips the phase-1 SQL id-scan entirely (snapshot memo); any insert
+    /// bumps the version and forces exactly one fresh scan. Expired rows
+    /// must not disable the memo (hydrate skips them).
     #[tokio::test]
     async fn test_snapshot_memo_second_replay_skips_sql_bd_3gwy() {
         let (store, pool, path) = temp_store().await;
@@ -865,12 +854,13 @@ mod tests {
             "post-mutation replays are memo hits again"
         );
 
-        // TTL safety: an ALREADY-EXPIRED row disables the memo (stale snapshot
-        // would serve it until prune runs). A future TTL (far-future expiry)
-        // must NOT disable the memo — otherwise 4.5k 90-day reservation TTLs
-        // pin every fleet poll to a 1-5s TEMP B-TREE scan and spill to swap.
-        // Imminent expiry (≤ now) is the only case that needs fresh expiry
-        // evaluation on every replay.
+        // TTL safety: a future TTL must NOT disable the memo (90-day
+        // reservation TTLs used to pin every fleet poll to a TEMP B-TREE
+        // scan). Already-expired rows must also keep the memo: scan_ids
+        // already drops them, hydrate skips expiration(), and prune (60s)
+        // bumps the version. Bypassing the memo while any stale row existed
+        // is what turned overnight fleet polls + `toron watch` into a 128GB
+        // RSS / 84-swapfile watchdog panic (bd-741i).
         let still_valid = build_event(
             &Keys::generate(),
             crate::nostr::kinds::toron_kind(PROJECT_MANIFEST),
@@ -892,7 +882,7 @@ mod tests {
             "future TTL must NOT disable memo — second replay is a hit"
         );
 
-        // Already-expired row: memo must be bypassed (fresh scan every time)
+        // Already-expired row: insert is a mutation (one scan) then memo hits.
         let expiring = build_event(
             &Keys::generate(),
             crate::nostr::kinds::toron_kind(PROJECT_MANIFEST),
@@ -906,12 +896,17 @@ mod tests {
         .expect("build expired ttl");
         other.insert(&expiring).await.expect("insert ttl expired");
         let before_ttl = store.sql_scans();
-        let _ = store.replay(&filter).await.expect("replay ttl 1");
-        let _ = store.replay(&filter).await.expect("replay ttl 2");
+        let ttl1 = store.replay(&filter).await.expect("replay ttl 1");
+        let ttl2 = store.replay(&filter).await.expect("replay ttl 2");
         assert_eq!(
             store.sql_scans(),
-            before_ttl + 2,
-            "already-expired rows disable the memo — every replay re-scans"
+            before_ttl + 1,
+            "already-expired rows must NOT disable the memo (bd-741i)"
+        );
+        assert!(
+            ttl1.iter().all(|e| e.content != "ttl-expired")
+                && ttl2.iter().all(|e| e.content != "ttl-expired"),
+            "expired rows never surface even when the memo stays hot"
         );
 
         // Correctness under the memo: an EXPIRED event is never returned.

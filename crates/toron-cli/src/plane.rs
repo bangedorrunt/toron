@@ -400,8 +400,7 @@ async fn channel_post(mailbox: &Mailbox, args: &ChannelPostArgs) -> anyhow::Resu
     let bodies: Vec<String> = match (&args.body, &args.file) {
         (Some(b), None) => vec![b.clone()],
         (None, Some(f)) => toron_workflow::channels::split_channel_post(
-            &std::fs::read_to_string(f)
-                .with_context(|| format!("reading {}", f.display()))?,
+            &std::fs::read_to_string(f).with_context(|| format!("reading {}", f.display()))?,
             700,
         ),
         (Some(_), Some(_)) => {
@@ -442,7 +441,6 @@ async fn post_one(
     body: &str,
     with_mentions: bool,
 ) -> anyhow::Result<()> {
-
     // Resolve --mention names → npubs via the project identity index.
     let mut mention_pks: Vec<PublicKey> = Vec::new();
     if !with_mentions {
@@ -1064,6 +1062,11 @@ async fn watch(mailbox: &Mailbox, args: &WatchArgs) -> anyhow::Result<()> {
     let deadline = timeout_ms.map(|ms| Instant::now() + Duration::from_millis(ms));
     let mut seen: HashSet<String> = HashSet::new();
     loop {
+        // Re-snapshot sqlite each tick: flywheel doorbell runs `toron watch`
+        // in a *separate process* from the publisher, so an in-process
+        // subscribe would miss every live post. The 100ms cadence was the
+        // RSS bomb (24GB / 5h per child, bd-741i). 1s + snapshot memo is
+        // enough for doorbell and cheap when the store is unchanged.
         let events = collect_trusted(mailbox.bus().as_ref(), filter.clone()).await?;
         for ev in events {
             if !seen.insert(ev.id.to_hex()) {
@@ -1091,7 +1094,7 @@ async fn watch(mailbox: &Mailbox, args: &WatchArgs) -> anyhow::Result<()> {
             }
             return Ok(());
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
     }
 }
 
