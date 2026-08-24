@@ -158,8 +158,9 @@ async fn http_initialize_negotiates_2026_07_28() -> anyhow::Result<()> {
     let tools = client.list_tools(None).await?;
     assert_eq!(
         tools.tools.len(),
-        39,
-        "38 AM-Rust parity tools + release_file_reservations_by_reason (bd-h3oj additive)"
+        40,
+        "38 AM-Rust parity tools + release_file_reservations_by_reason (bd-h3oj) \
+         + list_file_reservations (bd-locks-list-daemon-xetz)"
     );
 
     client.close().await?;
@@ -196,8 +197,9 @@ async fn http_lists_exactly_38_am_rust_tools() -> anyhow::Result<()> {
     let tools = client.list_tools(None).await?;
     assert_eq!(
         tools.tools.len(),
-        AM_RUST_TOOLS.len() + 1,
-        "38 parity tools + release_file_reservations_by_reason (bd-h3oj), got {}",
+        AM_RUST_TOOLS.len() + 2,
+        "38 parity tools + release_file_reservations_by_reason (bd-h3oj) \
+         + list_file_reservations (bd-locks-list-daemon-xetz), got {}",
         tools.tools.len()
     );
 
@@ -210,6 +212,10 @@ async fn http_lists_exactly_38_am_rust_tools() -> anyhow::Result<()> {
         "additive release-on-bead-close tool missing"
     );
 
+    assert!(
+        names.contains(&"list_file_reservations"),
+        "additive read-only lease board missing"
+    );
     // Exact name matches on representative tools.
     let by_name = |n: &str| {
         tools

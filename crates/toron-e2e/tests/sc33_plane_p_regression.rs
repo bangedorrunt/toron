@@ -117,7 +117,7 @@ async fn sc33_plane_p_still_gift_wraps_channel_does_not() {
         &[
             "mail",
             "send",
-            "--from",
+            "--as",
             A,
             "--to",
             B,
@@ -137,7 +137,7 @@ async fn sc33_plane_p_still_gift_wraps_channel_does_not() {
     );
 
     // B's inbox sees it; C's does not (fetch_inbox privacy).
-    let out = run(&dir, &["mail", "inbox", "--agent", B, "--project", PROJECT]);
+    let out = run(&dir, &["mail", "inbox", "--as", B, "--project", PROJECT]);
     assert_eq!(
         exit_code(&out),
         0,
@@ -149,7 +149,7 @@ async fn sc33_plane_p_still_gift_wraps_channel_does_not() {
         b_inbox.to_string().contains(subject),
         "B inbox must contain the gift-wrapped message: {b_inbox}"
     );
-    let out = run(&dir, &["mail", "inbox", "--agent", C, "--project", PROJECT]);
+    let out = run(&dir, &["mail", "inbox", "--as", C, "--project", PROJECT]);
     assert_eq!(
         exit_code(&out),
         0,

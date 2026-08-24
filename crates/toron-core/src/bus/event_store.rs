@@ -571,6 +571,43 @@ impl BusEventStore {
         Ok(Row::get(&row, 0))
     }
 
+    /// Operator-grade local removal (bd-channel-close-purge-bsqb): delete the
+    /// stored events with these hex ids, their tag rows, their hot-memo
+    /// entries, and bump the authoritative mutation version so every
+    /// instance's snapshot memo invalidates. Returns rows removed. The bus is
+    /// local-first SQLite — this is the same authority `prune` uses, scoped
+    /// to explicit ids instead of age.
+    pub async fn purge_ids(&self, ids: &[String]) -> anyhow::Result<u64> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let mut total: u64 = 0;
+        // Chunk to bound SQL bind params; channel lifecycles are small but a
+        // purge must not blow the parameter limit on a busy bus.
+        for chunk in ids.chunks(500) {
+            let ph = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut tx = self.pool.begin().await?;
+            let del_sql = format!("DELETE FROM bus_events WHERE event_id IN ({ph})");
+            let mut q = sqlx::query(&del_sql);
+            for id in chunk {
+                q = q.bind(id);
+            }
+            total += q.execute(&mut *tx).await?.rows_affected();
+            let del_tag_sql = format!("DELETE FROM bus_event_tags WHERE event_id IN ({ph})");
+            let mut qt = sqlx::query(&del_tag_sql);
+            for id in chunk {
+                qt = qt.bind(id);
+            }
+            qt.execute(&mut *tx).await?;
+            tx.commit().await?;
+        }
+        self.bump_mutations().await;
+        self.hot.lock().retain(|id, _| !ids.contains(id));
+        Ok(total)
+    }
+
     /// Prune expired envelopes + the oldest beyond the cap. Best-effort.
     pub async fn prune(&self) -> anyhow::Result<()> {
         sqlx::query("DELETE FROM bus_events WHERE expires_at IS NOT NULL AND expires_at <= ?1")
@@ -720,6 +757,63 @@ mod tests {
         let dup = store.insert(&ev).await.expect("insert");
         assert!(!dup, "duplicate id is deduped");
         assert_eq!(store.count().await.expect("count"), 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// bd-channel-close-purge-bsqb: `purge_ids` removes exactly the named
+    /// rows (+ their tag rows), bumps the mutation version, and leaves no
+    /// hot-memo residue — replay must not resurrect purged events.
+    #[tokio::test]
+    async fn channel_close_purge_removes_bus_events() {
+        let (store, _pool, path) = temp_store().await;
+        let keys = Keys::generate();
+        let keep = tagged_event(&keys, "keep");
+        let gone = tagged_event(&keys, "gone");
+        let also_gone = tagged_event(&keys, "also gone");
+        store.insert(&keep).await.expect("insert keep");
+        store.insert(&gone).await.expect("insert gone");
+        store.insert(&also_gone).await.expect("insert also_gone");
+
+        /// A p-tagged event: p/e values are the only tag rows the store indexes,
+        /// so the purge's tag-row cleanup is observable on these.
+        fn tagged_event(keys: &Keys, content: &str) -> Event {
+            build_event(
+                keys,
+                crate::nostr::kinds::toron_kind(PROJECT_MANIFEST),
+                content,
+                vec![
+                    Tag::parse(["t", "demo"]).expect("t"),
+                    Tag::public_key(Keys::generate().public_key()),
+                ],
+                Timestamp::now(),
+            )
+            .expect("build")
+        }
+        // Hydrate the hot memo so the purge must also clear memo entries.
+        let all = crate::bus::Filter::new();
+        let replayed = store.replay(&all).await.expect("replay");
+        assert_eq!(replayed.len(), 3);
+
+        let ids = vec![gone.id.to_hex(), also_gone.id.to_hex()];
+        let removed = store.purge_ids(&ids).await.expect("purge");
+        assert_eq!(removed, 2, "exactly the named rows are removed");
+
+        let after = store.replay(&all).await.expect("replay after purge");
+        assert_eq!(after.len(), 1, "only the survivor remains");
+        assert_eq!(after[0].id, keep.id);
+
+        // Tag rows went with them.
+        let tag_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM bus_event_tags")
+            .fetch_one(&store.pool)
+            .await
+            .expect("tag count");
+        assert_eq!(tag_rows, 1, "purged events carry no tag residue");
+
+        // Re-publishing a purged id is NOT blocked (no dedup residue).
+        assert!(
+            store.insert(&gone).await.expect("re-insert"),
+            "a purged id may be stored again"
+        );
         let _ = std::fs::remove_file(&path);
     }
 

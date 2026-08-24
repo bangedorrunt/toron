@@ -13,7 +13,7 @@ use rmcp::handler::server::wrapper::Parameters;
 use rmcp::schemars::{self, JsonSchema};
 use rmcp::{tool, tool_router};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use super::{ToolOutput, ToolServer, nonneg_secs};
 
@@ -211,7 +211,11 @@ impl ToolServer {
         let reservations: Vec<LeaseRowOut> = rows
             .into_iter()
             .filter(|r| args.holder.as_deref().is_none_or(|h| r.agent_name == h))
-            .filter(|r| args.path.as_deref().is_none_or(|p| matches_glob(&r.path_pattern, p)))
+            .filter(|r| {
+                args.path
+                    .as_deref()
+                    .is_none_or(|p| matches_glob(&r.path_pattern, p))
+            })
             .map(|r| LeaseRowOut {
                 id: r.id,
                 path: r.path_pattern,

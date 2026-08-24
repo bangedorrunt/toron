@@ -72,6 +72,8 @@ pub enum BusError {
     Publish(String),
     #[error("bus is shutting down")]
     Shutdown,
+    #[error("operation unsupported on this bus: {0}")]
+    Unsupported(String),
     #[error("io/transport failure: {0}")]
     Transport(String),
 }
@@ -111,6 +113,18 @@ pub trait Bus: Send + Sync + 'static {
 
     /// Liveness probe.
     async fn health(&self) -> Result<Health, BusError>;
+
+    /// Operator-grade local removal (bd-channel-close-purge-bsqb): delete the
+    /// stored events with these hex ids; returns rows removed. Only
+    /// SQLite-backed buses implement it — the default refuses LOUDLY (a
+    /// purge that silently no-ops is a silent drop wearing a success
+    /// costume).
+    async fn purge_ids(&self, ids: &[String]) -> Result<u64, BusError> {
+        let _ = ids;
+        Err(BusError::Unsupported(
+            "this bus does not support local purge".to_string(),
+        ))
+    }
 }
 
 #[cfg(test)]
