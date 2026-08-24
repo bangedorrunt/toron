@@ -658,8 +658,9 @@ mod tests {
         );
         assert_eq!(
             tools.len(),
-            39,
-            "38 AM-Rust parity tools + release_file_reservations_by_reason (bd-h3oj)"
+            40,
+            "38 AM-Rust parity tools + release_file_reservations_by_reason (bd-h3oj) \
+             + list_file_reservations (bd-locks-list-daemon-xetz)"
         );
     }
 

@@ -493,16 +493,28 @@ mod tests {
         let bob = keys();
         let mallory = keys();
         store
-            .create_channel(&alice.public_key(), "steer-axfm", "Steer", false, Some("toron"))
+            .create_channel(
+                &alice.public_key(),
+                "steer-axfm",
+                "Steer",
+                false,
+                Some("toron"),
+            )
             .expect("create");
         // Bob joins before post — the bootstrap that must happen at spawn.
         store
             .join("steer-axfm", &bob.public_key())
             .expect("bob joins");
-        assert!(store.post(&alice, "steer-axfm", "hello from creator", &[]).is_ok());
-        assert!(store
-            .post(&bob, "steer-axfm", "hello from member after join", &[])
-            .is_ok());
+        assert!(
+            store
+                .post(&alice, "steer-axfm", "hello from creator", &[])
+                .is_ok()
+        );
+        assert!(
+            store
+                .post(&bob, "steer-axfm", "hello from member after join", &[])
+                .is_ok()
+        );
         assert!(
             store
                 .post(&mallory, "steer-axfm", "intrude without join", &[])

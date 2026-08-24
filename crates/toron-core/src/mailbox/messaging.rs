@@ -339,6 +339,54 @@ impl Mailbox {
         self.send_message(&reply).await
     }
 
+    /// bd-since-cursor-70cf: the durable plane-P high-water for
+    /// (project, agent). Missing row = 0 (everything is new on a cold
+    /// start). Requires the index pool — without it there is no durable
+    /// cursor store and `--since last` refuses loudly instead of guessing.
+    async fn read_inbox_cursor(&self, project: &str, agent: &str) -> anyhow::Result<i64> {
+        let Some(pool) = self.index_pool.as_ref() else {
+            anyhow::bail!(
+                "--since \"last\" requires the durable cursor store (index pool); \
+                 pass an explicit RFC3339 timestamp instead"
+            );
+        };
+        let row: Option<i64> = sqlx::query_scalar(
+            "SELECT last_seen_us FROM inbox_cursors \
+             WHERE project_slug = ?1 AND agent_name = ?2 AND plane = 'P'",
+        )
+        .bind(project)
+        .bind(agent)
+        .fetch_optional(pool)
+        .await?;
+        Ok(row.unwrap_or(0))
+    }
+
+    /// bd-since-cursor-70cf: bump the cursor to the newest VISIBLE message
+    /// ts — one atomic UPSERT with MAX, so concurrent readers never rewind
+    /// the high-water and a crash mid-poll never skips messages.
+    async fn bump_inbox_cursor(
+        &self,
+        project: &str,
+        agent: &str,
+        seen_us: i64,
+    ) -> anyhow::Result<()> {
+        let Some(pool) = self.index_pool.as_ref() else {
+            return Ok(()); // read side already refused; nothing to bump
+        };
+        sqlx::query(
+            "INSERT INTO inbox_cursors (project_slug, agent_name, plane, last_seen_us) \
+             VALUES (?1, ?2, 'P', ?3) \
+             ON CONFLICT(project_slug, agent_name, plane) \
+             DO UPDATE SET last_seen_us = MAX(last_seen_us, excluded.last_seen_us)",
+        )
+        .bind(project)
+        .bind(agent)
+        .bind(seen_us)
+        .execute(pool)
+        .await?;
+        Ok(())
+    }
+
     /// `fetch_inbox`: project + agent projection of unwrapped kind-1059 mail to
     /// the agent's local key, ordered by rumor time (G7), never envelope time.
     pub async fn fetch_inbox(&self, args: &FetchInbox) -> anyhow::Result<Vec<InboxMessage>> {
@@ -460,15 +508,37 @@ impl Mailbox {
         if args.unread_only {
             messages.retain(|m| m.read_ts_us.is_none());
         }
-
-        // F11 / c3b.3 (bd-mcp-inbox-filter-qyyq): urgent/since filters are a
-        // SHARED core concern — applied here so the MailSurface path and the
-        // MCP tool path (which calls `Mailbox::fetch_inbox` directly) get the
-        // exact same post-projection filtering. Malformed `since_ts` is a
-        // hard Malformed error, never a silent ignore. Applied BEFORE limit.
-        // bd-harvest-thread-filter-yp9r: thread filter shares the same stage.
+        // bd-since-cursor-70cf: `--since last` resolves the daemon-side
+        // high-water cursor, filters with it, then bumps it to the newest
+        // VISIBLE message ts (atomic UPSERT). Explicit RFC3339 values keep
+        // their existing path; only the literal "last" is intercepted.
+        let since_last = args.since_ts.as_deref() == Some("last");
+        let cursor_us: i64 = if since_last {
+            self.read_inbox_cursor(&args.project_slug, &args.agent_name)
+                .await?
+        } else {
+            0
+        };
+        // High-water over VISIBLE messages (post delete/unread filters) —
+        // limit-truncated rows still advance the cursor (nothing skipped).
+        let high_water_us = messages.iter().map(|m| m.created_ts_us).max().unwrap_or(0);
         if args.urgent_only || args.since_ts.is_some() || args.thread_id.is_some() {
-            messages = filter_inbox_messages(messages, &args)?;
+            let mut q = args.clone();
+            if since_last {
+                q.since_ts = None; // "last" is not RFC3339; the manual filter below applies it
+            }
+            messages = filter_inbox_messages(messages, &q)?;
+            if since_last {
+                messages.retain(|m| m.created_ts_us > cursor_us);
+            }
+        }
+        if since_last {
+            self.bump_inbox_cursor(
+                &args.project_slug,
+                &args.agent_name,
+                high_water_us.max(cursor_us),
+            )
+            .await?;
         }
 
         // Parity: AM `fetch_inbox` names the sender (the display name, not the
@@ -1450,6 +1520,78 @@ mod tests {
             dupes[0].duplicate_of.is_some(),
             "survivor marked with duplicate_of = first id"
         );
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// bd-since-cursor-70cf: `--since last` reads the durable high-water,
+    /// returns only newer messages, then bumps the cursor — so a
+    /// crashed/re-spawned agent resumes exactly where the last poll stopped.
+    #[tokio::test]
+    async fn since_cursor_last_persists_across_reads() {
+        let (mailbox, _pool, db_path, data_dir) = test_mailbox_with_pool("sincecursor").await;
+        let (_s, _) = register(&mailbox, "demo", "SenderSC").await;
+        let (_r, _) = register(&mailbox, "demo", "ReaderSC").await;
+
+        let send = |subject: &str| SendMessage {
+            project_slug: "demo".into(),
+            sender_name: "SenderSC".into(),
+            to: vec!["ReaderSC".into()],
+            subject: subject.into(),
+            body_md: "cursor probe".into(),
+            ..Default::default()
+        };
+        let fi = FetchInbox {
+            project_slug: "demo".into(),
+            agent_name: "ReaderSC".into(),
+            since_ts: Some("last".into()),
+            ..Default::default()
+        };
+
+        mailbox
+            .send_message(&send("first"))
+            .await
+            .expect("send first");
+        let cold = mailbox.fetch_inbox(&fi).await.expect("cold since last");
+        assert_eq!(cold.len(), 1, "cold cursor = 0: the first message is new");
+
+        // No new mail → the SAME cursor yields nothing (no re-delivery).
+        let none = mailbox.fetch_inbox(&fi).await.expect("re-poll");
+        assert!(none.is_empty(), "re-poll with no new mail is empty");
+
+        // New mail → exactly the new message.
+        mailbox
+            .send_message(&send("second"))
+            .await
+            .expect("send second");
+        let warm = mailbox.fetch_inbox(&fi).await.expect("warm since last");
+        assert_eq!(warm.len(), 1, "only the message after the cursor");
+        assert_eq!(warm[0].subject, "second");
+
+        // Explicit RFC3339 keeps working alongside "last"; malformed is a
+        // hard error (never a silent ignore).
+        let past = FetchInbox {
+            project_slug: "demo".into(),
+            agent_name: "ReaderSC".into(),
+            since_ts: Some("2000-01-01T00:00:00Z".into()),
+            ..Default::default()
+        };
+        assert!(
+            !mailbox
+                .fetch_inbox(&past)
+                .await
+                .expect("rfc3339")
+                .is_empty(),
+            "explicit RFC3339 path unchanged"
+        );
+        let bad = FetchInbox {
+            project_slug: "demo".into(),
+            agent_name: "ReaderSC".into(),
+            since_ts: Some("garbage".into()),
+            ..Default::default()
+        };
+        assert!(mailbox.fetch_inbox(&bad).await.is_err(), "malformed errors");
 
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_dir_all(&data_dir);

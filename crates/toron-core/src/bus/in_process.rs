@@ -437,6 +437,15 @@ impl Bus for InProcessBus {
             }),
         }
     }
+
+    /// bd-channel-close-purge-bsqb: local SQLite authority — delegate to the
+    /// event store (rows + tag rows + hot memo + mutation bump).
+    async fn purge_ids(&self, ids: &[String]) -> Result<u64, BusError> {
+        self.store
+            .purge_ids(ids)
+            .await
+            .map_err(|e| BusError::Unsupported(format!("purge failed: {e}")))
+    }
 }
 
 // Allow constructing a bus for tests without exposing internals.

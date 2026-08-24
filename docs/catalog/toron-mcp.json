@@ -51,8 +51,8 @@
       "name": "guard"
     },
     {
-      "args": "create, join, leave, list, members, post, read",
-      "description": "NIP-29 channels: create/join/leave/list/members/post/read (plane S)",
+      "args": "create, join, leave, list, members, post, read, close, purge",
+      "description": "NIP-29 channels: create/join/leave/close/purge/list/members/post/read (plane S; lifecycle open -> closed -> purged)",
       "name": "channel"
     },
     {
@@ -121,7 +121,7 @@
       "name": "workflow"
     }
   ],
-  "generated_at": "2026-08-22T23:44:50Z",
+  "generated_at": "2026-08-24T06:19:47Z",
   "resources": [
     {
       "description": "List projects known to toron.",

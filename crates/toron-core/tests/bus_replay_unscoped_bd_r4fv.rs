@@ -47,7 +47,9 @@ fn lease_event(
 #[tokio::test]
 async fn replay_contract_store_raw_vs_bus_gated_bd_r4fv() {
     let path = std::env::temp_dir().join(format!("toron-r4fv-{}.sqlite", uuid::Uuid::new_v4()));
-    let pool = schema::connect(path.to_str().unwrap()).await.expect("connect");
+    let pool = schema::connect(path.to_str().unwrap())
+        .await
+        .expect("connect");
     let store = BusEventStore::new(pool.clone()).await.expect("store");
     let keys = nostr_sdk::nostr::Keys::generate();
 

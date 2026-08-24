@@ -272,7 +272,7 @@ fn metrics_increment_after_robot_call() {
         &[
             "mail",
             "inbox",
-            "--agent",
+            "--as",
             "metrics-probe",
             "--project",
             "demo",
