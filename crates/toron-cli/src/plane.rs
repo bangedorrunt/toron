@@ -1282,7 +1282,8 @@ fn parse_kinds(s: &str) -> anyhow::Result<Vec<u16>> {
 }
 
 /// Print one event in the binding watch shape `{kind, id, pubkey, content,
-/// tags}` as NDJSON.
+/// tags, created_at}` as NDJSON. `created_at` is gap 1 fix: the dispatcher
+/// needs a persisted plane-S cursor to avoid replay storms.
 fn print_watch_event(ev: &Event) {
     let tags: Vec<Vec<String>> = ev.tags.iter().map(|t| t.clone().to_vec()).collect();
     let v = serde_json::json!({
@@ -1291,6 +1292,7 @@ fn print_watch_event(ev: &Event) {
         "pubkey": ev.pubkey.to_hex(),
         "content": ev.content,
         "tags": tags,
+        "created_at": ev.created_at.as_secs(),
     });
     println!(
         "{}",
