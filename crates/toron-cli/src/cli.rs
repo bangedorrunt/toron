@@ -895,7 +895,8 @@ pub struct GuardCheckArgs {
 
 // ---------------------------------------------------------------------------
 // Two-plane shared surface (ADR-0020 Spec 2): channel / job / react /
-// presence / watch. CLI-first; MCP cluster stays frozen (39 tools).
+// presence / watch. CLI-first; MCP cluster stays frozen (40 tools: 38
+// AM-Rust parity + 2 additive).
 //
 // Writes take `--as <canonical-name>` (ADR-0018): the registered agent key
 // signs the event. Unknown `--as` is a usage error (exit 2) — never
