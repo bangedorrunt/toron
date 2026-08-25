@@ -1,7 +1,10 @@
 # toron
 
-Nostr-native agent mailbox. 39 MCP tools + 25 resources on Schnorr identity,
-NIP-17 gift-wrap, NIP-29 channels. Flywheel embeds this; never the reverse.
+Nostr-native agent mailbox. 40 MCP tools (38 AM-Rust parity + 2 toron additive:
+`release_file_reservations_by_reason`, `list_file_reservations`) + 25 resources
+on Schnorr identity, NIP-17 gift-wrap, NIP-29 channels. Flywheel embeds this;
+never the reverse. The committed catalog (`docs/catalog/toron-mcp.json`) is the
+38-parity subset by contract (additive excluded, `catalog_freshness` gated).
 
 **Generated:** 2026-08-13
 **Commit:** 33f8276
@@ -41,7 +44,7 @@ Child maps: [toron-core](crates/toron-core/AGENTS.md) ·
 | Bus / federation | `crates/toron-core/src/bus/` |
 | Git archive | `crates/toron-core/src/archive/git.rs` |
 | Workflow YAML / engine | `crates/toron-workflow/src/{schema,engine}/` |
-| Cron (distinct type) | `crates/toron-workflow/src/cron.rs` (ADR-0012) |
+| Cron (distinct type) | `crates/toron-workflow/src/cron.rs`  |
 | MCP tools | `crates/toron-mcp/src/tools/` |
 | Catalog surface | `crates/toron-mcp/src/catalog.rs` + `crates/toron-cli/src/catalog.rs` (`docs/catalog/`) |
 | CLI / daemon | `crates/toron-cli/src/{cli,daemon,main}.rs` |
@@ -52,7 +55,8 @@ Child maps: [toron-core](crates/toron-core/AGENTS.md) ·
 - Edition 2024. `#![forbid(unsafe_code)]` on every crate root.
 - New/changed ADR-constrained files: `// governed-by: ADR-XXXX` at top.
 - Deps one-way: **flywheel → toron-workflow → toron-core**. Never reverse.
-- Frozen: 39 tool names (38 AM-Rust parity + 1 toron additive), 25 resources, kind registry. No new kinds/tools without an ADR. ADR-0020 adds **CLI** nouns `channel` `job` `react` `presence` `watch` without new MCP tools. Channel posts emit kind **9** (not 42). ADR-0023: channel create/close emit **39000**, join/leave emit **39002**; 40/41/42 ingest only.
+- Frozen: 40 tool names (38 AM-Rust parity + 2 toron additive: `release_file_reservations_by_reason` bd-h3oj, `list_file_reservations` bd-locks-list-daemon-xetz), 25 resources, kind registry. No new kinds/tools without an ADR. 
+- ADR-0020 adds **CLI** nouns `channel` `job` `react` `presence` `watch`. Channel posts emit kind **9** (not 42). ADR-0023: channel create/close emit **39000**, join/leave emit **39002**; 40/41/42 ingest only.
 - rust-nostr **0.45**: `nostr-sdk` 0.45.2 + `nostr` 0.45.3 (`nip44`/`nip49`/`nip59`/`os-rng`). Protocol types via `crate::nostr` / `nostr::prelude`. Sign with `FinalizeEvent::finalize`. `gift_wrap` is sync (`GiftWrapBuilder`).
 - Catalog: `toron catalog --json` regenerates `docs/catalog/toron-mcp.json`; `cargo test catalog_freshness` fails red on surface drift without regen (toron.dev ADR-0002 D3).
 - Flag vocabulary (bd-flag-vocab-conformance-0hyv): the acting agent is ALWAYS `--as` — `--from`/`--agent` are banned (enforced by `cargo test -p toron-cli --bin toron flag_conformance`) — and every project-scoped subcommand REQUIRES `--project` (no silent demo default; missing-key errors name the resolved project). Channel lifecycle (bd-channel-close-purge-bsqb): `channel close` = creator-only tombstone (closed refuses posts/joins, hides from `list`, creator may leave) → `channel purge` = creator/operator removal of a closed channel's bus events, audited to `{data_dir}/channel_purge.log`. Verify-after-send: `channel post --wait-ack <secs>` (bd-verify-after-send-fxtv). Delivery visibility: `channel read --author <pin>` (bd-delivery-visibility-g96y). Inbox cursor: `mail inbox --since last` persists per-(project, agent, plane) daemon-side (bd-since-cursor-70cf, migration 0007).
@@ -71,7 +75,7 @@ When you add/remove/rename a CLI command or MCP tool, update ALL of:
 2. The tool `#[tool(name = "...")]` in `crates/toron-mcp/src/tools/` — MCP surface (ADR-0020 wave 1: **no new tools**; CLI-only nouns still need steps 1, 3, 4).
 3. This AGENTS.md (STRUCTURE + CONVENTIONS sections).
 4. The skill: `~/.agents/skills/toron/SKILL.md` CLI Surface + MCP Parity Surface + [crew-steering](references/crew-steering.md) — single canonical copy; grok and other harnesses read the same file (grok natively scans `~/.agents/skills/`, no mirror).
-5. The tool-count constant (AGENTS.md header + SKILL.md frontmatter) — only when an MCP tool actually changes.
+5. The tool-count constant (AGENTS.md header + SKILL.md frontmatter): 40 (38 parity + 2 additive). Only changes when an MCP tool actually changes.
 6. `toron catalog --json` + `cargo test catalog_freshness` when the CLI catalog grows.
 
 The skill files are the canonical agent-facing reference. A command/tool not in
@@ -95,7 +99,7 @@ the skill is invisible to any agent that triggers the skill.
 bash scripts/verify-gates.sh
 cargo test --workspace
 cargo test catalog_freshness                  # catalog drift gate (toron.dev ADR-0002 D3)
-toron catalog --json                          # emit 38-tool / 25-resource / CLI catalog
+toron catalog --json                          # emit 38-parity-tool catalog (40 served incl. additive) / 25-resource / CLI catalog
 cargo test -p toron-e2e --features p1          # SC-1..8
 cargo test -p toron-e2e --features p2          # needs resonate on PATH
 cargo test -p toron-e2e --features p4          # SC-18..25 (implies p5)
