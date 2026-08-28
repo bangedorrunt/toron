@@ -21,3 +21,4 @@
 {"id":21,"issue_id":"bd-qsed.6","from_status":"open","to_status":"closed","status_revision":0,"gate":"unit-test-verified","provider":"flywheel","passed":true,"recorded_by":"bangedorrunt","recorded_at":"2026-08-25 09:28:48"}
 {"id":22,"issue_id":"bd-qsed.5","from_status":"open","to_status":"closed","status_revision":0,"gate":"unit-test-verified","provider":"flywheel","passed":true,"recorded_by":"bangedorrunt","recorded_at":"2026-08-25 09:39:33"}
 {"id":23,"issue_id":"bd-qsed","from_status":"open","to_status":"closed","status_revision":0,"gate":"unit-test-verified","provider":"flywheel","passed":true,"recorded_by":"bangedorrunt","recorded_at":"2026-08-25 09:39:44"}
+{"id":24,"issue_id":"bd-serve-pid-reuse-stale-lock-80by","from_status":"in_progress","to_status":"closed","status_revision":425,"gate":"unit-test-verified","provider":"cargo","passed":true,"recorded_by":"bangedorrunt","recorded_at":"2026-08-28 05:58:54"}
