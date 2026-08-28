@@ -1,101 +1,112 @@
 <!-- governed-by: ADR-0003, ADR-0005, ADR-0014, ADR-0019, ADR-0020, ADR-0022 -->
 ---
 status: proposed
-date: 2026-08-25
+date: 2026-08-27
 decision-makers: Captain (bangedorrunt)
-consulted: bastani-inc/atomic deep analysis (2026-08-25 — Buffy full-stack comparison: repair loops, graph-first UX, evidence-bearing approvals, verbatim compaction, worktree isolation, hashline safety, permission gates); control_flow.rs DAG scheduler audit (wave-based concurrent dispatch via `ctx.run(run_graph_node).spawn()` with deterministic replay); engine completeness-gap audit (2026-08-25 — the engine is a transport/dispatch SUBSTRATE, not an execution RUNTIME: two sequencing paths, binary `on_error`, string-tagged phases, prose stages, no cancel/timeout); flaky-test production incidents (bd-8xca compose failure, bd-cvv9 chain-gate false positives — both resolved by captain re-dispatch)
+consulted: bastani-inc/atomic live tree (cloned 2026-08-27, `main` @ `/tmp/atomic-fresh`; packages/workflows loop-until-done, adversarial-verification, workflow-failures, durable DBOS backend, keepContext, ctx.tool failureMode=return); 2026-08-25 Buffy comparison (partially superseded by the tree study, see §3.3); Round-1 in-file debate (§12); control_flow.rs DAG scheduler + ActionRunner shape; flaky-test incidents (bd-8xca, bd-cvv9)
 informed: flywheel maintainers; toron-workflow engine owners; skill owners (toron, flywheel, runtime-adaptation)
 ---
 
-# ADR-0024: Graph-First Workflows, Bounded Repair Loops, Evidence-Bearing Approvals, and Bead-Workflow Integration
+# ADR-0024: Make the DAG Canonical, Type Runtime Failure, and Unroll Bounded Repair as Distinct Graph Nodes
 
-**Status:** Proposed (2026-08-25)
-**Date:** 2026-08-25
+**Status:** Proposed (2026-08-27, governing revision after Atomic-tree study + Round-1 debate)
+**Date:** 2026-08-27
 **Decision-makers:** Captain (bangedorrunt)
 **Extends:** [ADR-0005](0005-orchestration-layer.md) (workflow engine, DAG scheduler, control-flow actions), [ADR-0019](0019-bead-verified-execution-and-principle-playbooks.md) (ledger-gated close, VERIFY fence, 21 engineering principles), [ADR-0020](0020-nostr-two-plane-cli-and-crew-steering.md) (two-plane surface, crew steering), [ADR-0022](0022-phase-native-orchestration.md) (typed `DispatchSpec`, `Phase` enum, one durable execution rail)
-**Amends:** ADR-0005 Spec 4b (`graph:` becomes the canonical internal shape; `steps:` desugars to a chain graph at parse time). ADR-0019 Spec 1 (`Verdict` gains a `RepairCycle` variant; a repair loop produces tracked gate rows). ADR-0022 §4 (phases gain a `repair` transition — on failure, route to repair → re-verify, bounded).
-**Does not amend:** the frozen MCP tool surface (40 tools: 38 AM-Rust parity + 2 additive, 25 resources), the kind registry (ADR-0014), the one-way dependency (flywheel → toron-workflow → toron-core), the worktree ban (ADR-0019 Spec 3), the identity grammar (ADR-0018), the freeze on new CLI plane-surface nouns (ADR-0020), the atomic reservation conflict-check (ADR-0011).
+**Amends:** ADR-0005 Spec 4b only (`graph:` becomes the canonical internal shape; `steps:` desugars to a chain graph at parse time; graph nodes park `request_approval`/`delay`/`spawn`; failure objects carry a classified `kind`; a repair *pattern* unrolls as named nodes).
+**Does not amend:** ADR-0019 Spec 1 / beads-fork legal-close table (`VerdictKind` unchanged; repair is an event log, never a close-legal verdict). ADR-0022 §4 (Phase vocabulary stays five values; repair is not a sixth phase). Frozen MCP tool surface (40 tools). Kind registry (ADR-0014). One-way dep (flywheel → toron-workflow → toron-core). Worktree ban (ADR-0019 Spec 3). Identity grammar (ADR-0018). Toron plane-surface noun freeze (ADR-0020: `channel|job|react|presence|watch`). Atomic reservation conflict-check (ADR-0011).
 **Tracker:** beads. Never pull requests.
+**Companion overlay:** [ADR-0025](0025-adopt-graph-dispatch-artifact-reduce-pin-supervision.md) (proposed 2026-08-27). Lease reclaim, typed artifacts, pin supervision, plane routing table, ingress unification. Does not change Wave 1 specs. [ADR-0026](0026-failure-taxonomy-funded-preflight-fallback-chains-mail-health-escalation.md) (proposed 2026-08-28) amends Spec 1's runtime kind set with `billing` and `provider`.
 
-> **Scope:** make the execution graph the canonical shape. Make failure routable into a bounded repair loop with a different-model verifier. Make approvals carry the run state as structured evidence, not a plain message. Make beads and workflow runs the same thing so every bead close is a workflow terminal and every workflow terminal is a bead close. Build the observability surface so captains and crews can see and steer live runs.
+> **Scope (governing):** make `run_graph` the only sequencing path. Classify *runtime* failure at the ActionRunner boundary. Encode work-quality repair as an unrolled graph (worker → independent evaluator → VERIFY), each cycle a distinct named node with a durable ledger artifact. Approvals carry artifact paths and node states, not a bare string. A bead stays the unit of work; a workflow run is one durable attempt that may *prove* a close, never *be* the close.
+>
+> **Out of scope:** eleven new `flywheel workflow *` nouns, `br create --auto-workflow`, engine shell / `br close`, default `on_error` flip, `phase_chain.rs` retirement, worktrees, hashline, compaction `keepContext`, LLM mean-and-veto verifier. Those are follow-up ADRs. Provenance: 2026-08-25 draft + §12 debate + 2026-08-27 Atomic clone. Where they conflict, **§6 below governs**.
 
 ---
 
 ## 1. TL;DR
 
-The DAG scheduler exists (`control_flow.rs` `run_graph` — wave-based concurrent dispatch with `needs:` edges and Resonate deterministic replay). It is opt-in; `steps:` is the primary shape. The engine can abort a run (`on_error: fail_run`) and retry a single step (`Action::Retry`), but it cannot **repair → re-verify** with a different model in a bounded cycle — the pattern every real engineering loop needs. Approval suspends the run on a plain `message` string. The operator sees "ok?" with no context. A bead and a workflow run are two parallel timelines that the loop bridges by hand.
+The DAG scheduler exists (`control_flow.rs` `run_graph`). It is opt-in; `steps:` is the primary shape. `Action::Retry` retries the same step on the same model. `on_error` is `Continue | FailRun`. Approval parks on a plain `message` string. The engine cannot express "work, then an independent evaluator, then VERIFY, bounded, each cycle a visible node."
 
-The engine is a strong *transport and dispatch substrate* — it moves signed work around and survives crashes — but it is not yet an *execution runtime*: it has two sequencing engines, a binary failure model, string-tagged phases, prose stages, and no cancel. This ADR closes that gap. It adopts five capabilities from bastani-inc/atomic's agent runtime, adapted to our existing Rust/Resonate/Nostr spine:
+Atomic (`bastani-inc/atomic`, cloned 2026-08-27) does **not** hide that loop inside `on_error`. `loop-until-done` (`packages/workflows/builtin/loop-until-done-runner.ts`) unrolls `iteration-N` + `evaluate-N` as distinct stages, each `context: "fresh"`, with a durable JSON ledger and a structured evaluator `{done, remaining_work, validation_evidence, failures}`. Progress scores are advisory and **never a stop decision**. `ctx.tool(..., { failureMode: "return" })` lets a check fail as typed data; the engine **never injects** that evidence into the next prompt. Runtime failures are a different type (`auth | rate_limit | provider | cancelled | unknown` with `retryable`/`resumable`/`disposition`). Durability is DBOS + hashed tool-output cache, not "JSONL only."
 
-1. **The graph IS the product.** Every workflow is a DAG. Linear `steps:` is sugar that desugars at parse time. The CLI renders the graph, shows node states, streams live events, and lets captains fork at any checkpoint.
-2. **Failures are typed, not swallowed.** An `ErrorKind` taxonomy (transient/logic/blocked/escalate) lets the engine route retry vs repair vs escalate by itself — instead of binary `continue`/`fail_run` decided by the captain after the fact.
-3. **Failure routes into bounded repair.** A failed node spawns a repairer agent (different model family, fresh context), re-runs the VERIFY command, and repeats up to `max_cycles`. Only on exhaustion does it escalate to the captain.
-4. **Approvals carry evidence.** A suspended run presents the operator with the run tree (which nodes passed, which failed), produced artifacts (commit SHAs, verdicts, receipts), blast radius, and the specific decision question.
-5. **Beads and workflow runs are one thing.** A bead is a workflow run. `br create --auto-workflow` generates the YAML from the VERIFY fence and principles. `br close` triggers the terminal approval gate. The kind-46012 terminal event IS the bead close.
+We take those *invariants* onto our spine (Resonate DAG, file reservations, `br` legal-close). We do not take Atomic's process (TypeScript runtime, worktrees, DBOS, engine-as-shell).
 
-The existing DAG scheduler is the spine — we are not building a new engine. We are making the graph the canonical path, adding repair as a first-class `on_error` mode, making approvals evidence-bearing, and uniting the two lifecycles.
+Five ships, in this order:
+
+1. **The graph is canonical.** `steps:` desugars. `run_workflow` always calls `run_graph`. Graph nodes park `request_approval` / `delay` / `spawn` the same way linear steps do (today they do not — that would be a WF-08 regression).
+2. **Runtime failure is typed.** Embedding classifies `{ok:false, kind, retryable, resumable, disposition}`. Default `on_error` stays `Continue` until every runner site classifies. Work-quality failure is **not** an `ErrorKind`.
+3. **Repair is an unrolled pattern.** Worker (fresh context) → independent evaluator (fresh context, structured remaining_work) → VerifySink (embedding runs the command) → next named cycle or escalate. Max N. Ledger JSON on disk. Engine does not shell out and does not call `br`.
+4. **Approvals carry evidence.** Promise payload includes node states, artifact *paths*, repair-ledger path. Question is a template; evidence lives in files (`reads`), not dumped into the message.
+5. **A bead is not a workflow run.** `--work` stays claim → brief → close-detect → **loop-run VERIFY** (`CommandVerified` is loop-only, anti-forgery). Unrolled repair lives inside workflow YAML. Engine never writes `command-verified` and never calls `br close`.
+
+The DAG scheduler is the spine. We do not rebuild it. We do not promote it into a shell runtime. We do not merge the bead ledger into the run.
 
 ---
 
-## 2. The Execution Graph (the product this ADR delivers)
+## 2. The Execution Graph (governing picture)
 
-This is the target. Every workflow becomes a graph of typed, gated, repairable nodes. The captain sees this live. The crew executes it. The loop inspects it.
+This is the target **after §6**. Repair is not a hidden `on_error` on review/verify. It is named nodes. The loop still owns `command-verified`. There is no Wave-1 `workflow tree` CLI.
 
 ```
-                         ┌─────────────────────────────────────┐
-                         │     flywheel workflow graph ship     │
-                         │     (visual, inspectable, live)      │
-                         └──────────────┬──────────────────────┘
-                                        │
-                   ┌────────────────────┼────────────────────┐
-                   │                    │                    │
-          ┌────────▼────────┐  ┌───────▼────────┐  ┌───────▼────────┐
-          │  resolve         │  │  plan           │  │  implement      │
-          │  phase: resolve  │──▶  phase: plan    │──▶  phase: impl    │
-          │  @scout          │  │  @planner        │  │  @coder         │
-          │  → goal statement│  │  → beads + deps  │  │  → commit SHA   │
-          └──────────────────┘  └────────┬────────┘  └───────┬─────────┘
-                                         │                   │
-                                         │  ┌────────────────┤
-                                         │  │                │
-                                ┌────────▼──▼─────┐  ┌──────▼──────────┐
-                                │  review           │  │  verify          │
-                                │  phase: review    │  │  phase: verify   │
-                                │  @reviewer        │  │  loop runs cmd   │
-                                │  → verdict (A/AWC)│  │  → receipt       │
-                                │  on_error: repair │  │  on_error: repair│
-                                └────────┬──────────┘  └──────┬───────────┘
-                                         │                    │
-                                         └──────┬─────────────┘
-                                                │
-                                       ┌────────▼────────┐
-                                       │  gate             │
-                                       │  request_approval │
-                                       │  (human or auto)  │
-                                       │  carries evidence │
-                                       └────────┬─────────┘
-                                                │
-                                   ┌────────────┼────────────┐
-                                   │            │            │
-                          ┌────────▼───┐ ┌──────▼──────┐ ┌──▼──────────┐
-                          │  repair     │ │  merge       │ │  escalate   │
-                          │  fix→verify │ │  @housekeeper│ │  → captain  │
-                          │  bounded N  │ │  commit+push │ │  kind-14 DM │
-                          └────────────┘ └──────────────┘ └─────────────┘
+  compose recipe repair-until-verified
+  (or --from-yaml graph; NOT on_error: repair)
+                 │
+    ┌────────────┼────────────┐
+    ▼            ▼            ▼
+ implement    review       (optional)
+ @coder       @reviewer    judgment: ReviewerSigned
+ context:inherit           do NOT repair
+    │
+    ▼
+ ┌──────────────────────────────────────────┐
+ │  unrolled cycle N = 1..max_iterations    │
+ │                                          │
+ │   repair-N     evaluate-N     verify-N   │
+ │   spawn-await  spawn-await    VerifySink │
+ │   context:fresh context:fresh  embedding │
+ │   @coder       @reviewer      cargo slot │
+ │        │             │             │     │
+ │        └──────reads ledger path────┘     │
+ │              (never prompt-stuff stdout) │
+ └──────────────────────────────────────────┘
+          │ done && exit 0          │ else N+1
+          ▼                         ▼
+     gate (paths +              exhaust →
+     evidence_hash)             kind-14 + remaining_work
+          │                     NO br gate report
+          ▼
+     worker may br close
+          │
+          ▼
+     LOOP loop_run_verify → command-verified
+     (LOOP_ARMED only; never the graph)
+```
+
+**Two planes, do not collapse:**
+
+```
+  workflow run (ship / compose / bug-fix)
+       │  in-graph green  = run may continue
+       ▼
+  bead (--work loop SM; do not replace)
+       │  loop-run VERIFY = bead may close
+       ▼
+  br close --commit-sha   ← only closer
 ```
 
 **Every node is:**
-- **Typed** with a `Phase` (resolve/plan/implement/review/verify) — ADR-0022's closed vocabulary
-- **Gated** with an optional `guard` (evalexpr evaluated against prior node outputs)
-- **Output-producing** — typed artifacts (`commit_sha`, `verdict`, `receipt_path`, `bead_ids`) that downstream nodes reference via `{{nodes.plan.bead_ids}}`
-- **Durable** — Resonate checkpoints at each node boundary (crash → resume from last completed node)
-- **Repairable** — on failure, route to repair → re-verify, bounded; escalate only on exhaustion
+- **Typed** with a `Phase` (five values, ADR-0022). Repair is not a sixth phase.
+- **Gated** with optional `guard` over prior node JSON (`check_phase` stays structured; not a shell `verify:`).
+- **Output-producing** — artifact **paths** (`receipt_path`, `ledger_path`, `commit_sha`). Downstream `reads` the file. Engine does not dump stdout into the next prompt.
+- **Durable** — Resonate checkpoint per node. `Action::Spawn { await_: true }` waits Idle (`drain_spawn_sink`). `request_approval` parks only if the node goes through `run_step` (Spec 0 park fix).
+- **Not auto-repairable.** Work-quality repair is an unrolled subgraph (recipe). Runtime failure is `{ok:false, kind?}`. `Action::Retry` is same-step. Judgment nodes escalate.
 
 **The entire graph is:**
-- **Inspectable** — `flywheel workflow tree <run-id>` shows node states, phases, durations
-- **Resumable** — kill -9 mid-run → restart → completes from last checkpoint
-- **Forkable** — `flywheel workflow fork <run-id> --at plan` creates a new run seeded from the plan node, trying an alternative implementation path
-- **Composable** — child workflows (`call_workflow`) flatten into the parent graph; one inspectable tree
+- **Park-safe** after Spec 0 — including linear `steps:` desugared to a chain. Compose stays `graph: None` until that fix is green.
+- **Resumable** — kill -9 → same `engine.invoke` run_id; SpawnSink `seen` dedups promise ids.
+- **Not forkable/connectable in Wave 1.** Those CLI nouns are a later flywheel ADR.
+- **Not the bead closer.** Receipt path in; `br gate report` never out.
 
 ---
 
@@ -108,7 +119,7 @@ This is the target. Every workflow becomes a graph of typed, gated, repairable n
 | DAG scheduler | `crates/toron-workflow/src/engine/control_flow.rs` `run_graph` | Wave-based concurrent node dispatch; `needs:` edges; `ctx.run(run_graph_node).spawn()` per node; deterministic replay across crash-resume |
 | `on_error: fail_run` | `control_flow.rs` `run_step` (line 226) | A step with `on_error: fail_run` whose action returns `{ok:false}` aborts the run with `{status:"failed", error, failed_step}` |
 | `Action::Retry` | `control_flow.rs` `run_retry` | Retries the SAME step up to `max_attempts` with `backoff_secs` — same model, same action, same context. Useful for transient failures (network, relay); useless for logic bugs. |
-| `request_approval` | `control_flow.rs` `run_step` (line 139) | Creates a Resonate promise, parks the run, publishes kind-46011 with the `promise_id`; the operator resolves/rejects → run resumes |
+| `request_approval` | `control_flow.rs` `run_step` (line 139) | Creates a Resonate promise and parks. Engine comments say the embedding publishes kind-46011; **flywheel does not** (no `ApprovalSink` drain). Live SIGNOFF hangs until `resolve_approval`. Wave 1 drains that sink. |
 | VERIFY fence + `br gate` | ADR-0019 Spec 1 | Beads carry a `## VERIFY` command; `br gate report` records verdicts; the loop enforces legal-close by reopening unverified beads |
 | Bead lifecycle | `flywheel/src/durable.rs` swarm_loop | Poll `br ready`, dispatch to agents, claim-watch in-progress beads, detect `br close`, verify gates, reopen unverified |
 | `Phase` enum | `toron-workflow/src/schema.rs` (ADR-0022 §3.1) | Five closed-vocabulary phases: resolve/plan/implement/review/verify; typed `DispatchSpec` with lint rules R-P1..P4 |
@@ -130,46 +141,56 @@ This is the target. Every workflow becomes a graph of typed, gated, repairable n
 | Stages are prose | A stage's body is a prompt template; it declares phase/role-affinity/principles but no input/output contract. | Nothing fails loudly if an agent skips the claim→reserve→close sequence inside `systematic-execute`. The stage is advice, not a contract. |
 | No run lifecycle beyond checkpoint | `pause` (checkpoint + handoff) and `pickup` (resume) exist. No cancel/quit, no per-action timeout (only `spawn.no_claim_timeout`). | A run can be suspended and resumed but not cancelled or forked at an arbitrary node. A hung `call_webhook` or `dispatch_job` blocks the run forever. |
 
-### 3.3 What Atomic gets right (and what we don't)
+### 3.3 What Atomic actually does (live tree, 2026-08-27)
 
-Atomic (bastani-inc/atomic) is a coding-agent runtime with an execution graph at its center. It was studied in depth on 2026-08-25. Key findings:
+Cloned `bastani-inc/atomic` `main` to `/tmp/atomic-fresh` (LFS binaries skipped). The 2026-08-25 Buffy note is **partially wrong**. Cite the tree.
 
-| Atomic capability | Description | Our gap | Our asset |
-| :--- | :--- | :--- | :--- |
-| **Bounded repair loops** | Failed stage → spawn repairer (different model) → re-verify → repeat up to N → escalate on exhaustion | No repair path. `fail_run` aborts. `retry` is same-step, same-model. | Resonate durability means a repair cycle survives a crash mid-fix. Atomic's checkpointing is coarser. |
-| **Graph-first UX** | `workflow({...})` is a DAG. Linear is sugar. Runtime renders the graph, shows node states, lets you fork at checkpoints. | `steps:` is the default. `graph:` is opt-in and unused in production. | Our `run_graph` scheduler does wave-based concurrent dispatch with `needs:` edges — Atomic doesn't have durable child-spawn concurrency. |
-| **Evidence-bearing approvals** | Approval gates carry the run tree: which nodes completed, which artifacts exist, what the specific question is. | `request_approval` sends a bare `message` string. | Our approval is a Resonate promise — it survives process death. Atomic's is in-process and lost on crash. |
-| **Worktree-isolated parallelism** | Parallel agents each get their own git worktree. | We ban worktrees (ADR-0019 Spec 3). Use file reservations instead. | File reservations detect REAL conflicts (two agents touching the same path). Worktrees clone the world to dodge a queue — token-hungry and a lie about `.beads/` single-writer invariants. |
-| **Verbatim compaction** | Compaction deletes low-value transcript lines without rewriting what survives. | Coarse `CONTEXT_LIMIT` at 80% triggers full respawn. | Deferred to a separate ADR (general improvement, not graph-specific). |
-
-**The synthesis:** Atomic's repair-loop, graph-first UX, and evidence-bearing approvals are invariants we should adopt. Its worktree isolation is the wrong answer for our system. Our Resonate durability, file reservations, and bead dependency graphs are the right foundation — we add Atomic's three invariants on top of them without rebuilding the engine.
+| Atomic mechanism | Where | Buffy/ADR-2026-08-25 said | Tree says | Take? |
+| :--- | :--- | :--- | :--- | :--- |
+| **Unrolled repair loop** | `packages/workflows/builtin/loop-until-done-runner.ts:175–258` | Failed node → different-model repairer → re-verify as `on_error` | `iteration-N` worker + `evaluate-N` independent stage, both `context: "fresh"`. Structured evaluator `{done, remaining_work, validation_evidence, failures}`. Durable `progress-ledger.json`. Progress scores **never** stop the run (`PROGRESS_DISCLAIMER`; LLM-verifier spec §3.2). | **Yes.** Pattern, not `on_error`. |
+| **Adversarial verify + bounded repairs** | `builtin/adversarial-verification.ts:6–16` | (not named) | Produce candidate, N independent per-criterion verifiers, mean-and-veto gate, `max_repairs` 0–5, parse failure is re-ask not silent fail-vote. | Follow-up (ReviewerSigned). Not Wave 1. |
+| **`failureMode: "return"`** | `packages/workflows/README.md:108` | (missing) | Check may fail as `{ok:false, error, attempts, cached}`. Node stays failed. Author continues. Engine **never injects** stdout into the next prompt. Distinct serializable args per rerun (identity). Replay does not re-run the callback. | **Yes.** Our Continue swallows; we need failed-visible + explicit `reads`. |
+| **Runtime failure taxonomy** | `workflow-failures-contract.ts:38–73` | Logic/Transient/Blocked/Escalate as one enum | `auth \| rate_limit \| provider \| cancelled \| unknown` plus `retryable`, `resumable`, `recoverability`, `disposition` (`active_blocked` / `terminal_killed` / `terminal_failed`), optional `retryAfterMs`. This is *runtime* recoverability, not "the model got the test wrong." | **Yes, split layers.** Work-quality ≠ runtime. |
+| **Durability** | `src/durable/backend.ts:51–78` | "Atomic checkpointing is coarser; no durable child-spawn" | **DBOS is the sole persistent backend.** Tool outputs cached by content hash so resume does not re-execute side effects. In-memory is tests/fallback. Compaction hook (`persistence-compaction-policy.ts:41–71`) re-emits `run.start`/`stage.start` for in-flight runs so restore still sees them. | Keep Resonate. Do not port DBOS. Correct the "coarser" claim. |
+| **Graph shape** | `packages/workflows/README.md:78–85` | Linear is sugar over a static DAG | **Imperative TypeScript** `workflow({ run })`. Topology materializes at runtime. Cycles forbidden, checked at execution/replay/DBOS hydration. Not YAML `needs:` desugar. | Take inspectable DAG + unrolled loops. Do not take TS-as-YAML. |
+| **HIL** | `README.md` Example 3 `:199–216` | Approval carries the run tree | `ctx.ui.confirm` at the callsite. Best practice: write a **plan file**, pass `reads: [planPath]`. Human input is runtime-only; no declaration-time HIL marker. Durability of prompts is DBOS prompt-reservation tokens (`prompt-reservation-state.ts`). | Take artifact-path evidence. Our Resonate promise already outlasts process death. |
+| **`keepContext`** | `src/authoring/keep-context.ts:1–41` | "Verbatim compaction deletes low-value lines" | A pin tag. Compaction must never compress tagged constraints (acceptance criteria, prohibitions, run id). Tags on their own line. Tool-result tags are inert. Protected lines count against the keep target. The line-deletion planner is the coding-agent, not the workflow engine. | Follow-up (CONTEXT_LIMIT ADR). Not this record. |
+| **Hashline edits** | `packages/coding-agent/docs/tools.md:7–27` | Deferred | Session-scoped `[path#TAG]` snapshots. Stale tag fails closed unless non-overlapping recovery. Parallel edits sharing a tag batch as one snapshot. | Follow-up. Reservations remain isolation. |
+| **Worktrees** | `src/runs/shared/worktree-*.ts`, README `:34–42` | Banned here, correctly | Linked worktrees + symlink dirs + `.worktreeinclude`. Isolation for PR-shaped work. | **Reject.** ADR-0019 Spec 3 + `.beads/` single-writer. |
+| **Budgets** | LLM-verifier spec B1–B3 | (missing) | `maxDurationMs` / `maxTokens` / `maxCost`; `budget_exceeded` is a **resumable blocked** rail, not a fail. | Follow-up. |
+| **Stop door** | `ralph-review-gate.ts:6–26` | (missing) | `stop_review_loop` boolean is the sole approval door. Recomputing approval from findings arrays deadlocks. Parse failure never approves. Reviewer execution failure never approves. | Take for ReviewerSigned. Do not recompute close from repair-cycle rows. |
+| **Prompt reservations** | `durable/prompt-reservation-state.ts` | (missing) | Generation-tombstoned tokens: reserve/release of in-flight HIL prompts. | We already have file reservations. Do not confuse the two. |
 
 ### 3.4 The problem statement
 
-> How do we make the execution graph the canonical shape — the thing captains compose, crews run, and the loop inspects — add bounded repair loops so failures self-heal instead of aborting, make approvals carry the run state as structured evidence, unite beads and workflow runs into one lifecycle, and build the observability surface so live runs are inspectable, resumable, and forkable — all on the existing Resonate-durable DAG scheduler in `control_flow.rs`, without new MCP tools, without new Nostr kinds, and without worktrees?
+> How do we make `run_graph` the only sequencing path, classify runtime failure at the embedding boundary, and express bounded work-quality repair as an unrolled graph (fresh-context worker, independent evaluator, embedding VERIFY, durable ledger, distinct node per cycle) — without new MCP tools, without new Nostr kinds, without worktrees, without the engine running a shell or calling `br close`, and without making a bead identical to a workflow run?
 
 ---
 
 ## 4. Decision Drivers
 
-1. **Build on the existing DAG scheduler.** `run_graph` already does wave-based concurrent dispatch with deterministic replay. This ADR does not rebuild it — it makes it the canonical path and extends it.
-2. **No new MCP tools, no new Nostr kinds.** The frozen surfaces stay frozen. New capability is engine-internal schema (`StepOnError::Repair`, richer approval payload) + CLI observability surface. No 40th tool. No kind beyond the existing registry.
-3. **One-way dependency.** Flywheel → toron-workflow → toron-core. Never reverse. The engine changes live in toron-workflow; the CLI and orchestration live in flywheel.
-4. **Repair is a different model, same tree.** The repairer agent runs in the same project directory, under the same file reservations, on the same commit tree. It does not get a worktree (ADR-0019 Spec 3). The repairer's output is committed to the same branch.
-5. **Beads are the tracker.** A workflow run produces a bead; a bead close is a workflow terminal. One lifecycle. The loop dispatches beads as workflow runs, not as raw prompt strings.
-6. **Evidence over claims.** An approval gate must present what actually happened — node states, artifact paths, command outputs — not what an agent said happened. A repair cycle must prove the fix with a re-verify, not a self-report.
-7. **TDD for new features.** Every spec below requires a failing test before the implementation lands (repo convention).
-8. **Principles are cited by name.** This ADR's primary principles: `prove-it-works` (repair proves the fix, approval shows the evidence), `sequence-verifiable-units` (each node is a verifiable unit, each repair cycle is a tracked gate row), `fix-root-causes` (repair fixes the root cause, not the symptom; retry-of-same is not repair), `encode-lessons-in-structure` (the graph IS the structure — not prose about what to run next), `never-block-on-the-human` (auto-repair up to the bound before escalating to captain).
-9. **Type the failure model first.** Retry/repair/escalate routing needs an `ErrorKind`. Binary `on_error` is the root cause of both abort-only behavior and the impossibility of self-healing. Type it first (Spec 6), then build repair on it (Spec 1).
-10. **One sequencing engine.** The `run_graph` DAG and the `phase_chain.rs` runner must collapse into one path, or phase contracts stay un-enforceable outside `ship`. A phase contract is a node-level `on_error: repair { verify }`, not a separate gate function.
+1. **Build on the existing DAG scheduler.** `run_graph` already does wave-based concurrent dispatch with deterministic replay. Do not rebuild it. Do not hide a second sequencer inside `on_error`.
+2. **No new MCP tools, no new Nostr kinds.** Schema + embedding DI (`VerifySink`) + `DispatchSpec.context`. No 40th tool. No new kind. No new toron CLI noun. No new `br` flag in this record.
+3. **One-way dependency.** Flywheel → toron-workflow → toron-core. The engine never imports flywheel, never shells out, never calls `br`. VERIFY and spawn-await live in the embedding (`ActionRunner` is sync mailbox-shaped today; job-await is `Action::Spawn { await_: true }` + `SpawnSink`).
+4. **Two failure layers.** Runtime recoverability (rate limit, auth, reservation, cancel, timeout) is classified at the runner boundary. Work-quality (test red, review REJECT) is a graph pattern. One enum for both is how the 2026-08-25 draft overfitted Atomic.
+5. **Repair unrolls.** Each cycle is a distinct named node (`repair-2`, `evaluate-2`) with stable identity, matching Atomic `iteration-N` / `evaluate-N`. A recursive `on_error: Repair` on one node is the rejected Option D in disguise.
+6. **Fresh context, same tree, one writer.** Evaluator and repairer get `DispatchSpec.context: fresh` (new session, no transcript). They inherit the bead's reservation (extend TTL) or the original pane is interrupted. Never two holders (ADR-0011 HARD). No worktree.
+7. **Beads stay the tracker.** A workflow run is an attempt. `br close` is the only closer (ADR-0019 lock 4 / beads ADR-0001). Repair cycles are kind-9 / `br comments`, never a `VerdictKind`.
+8. **Evidence over claims, and over prompt-stuffing.** Pass artifact *paths*. Engine never auto-injects check stdout into the next prompt (Atomic README:108). `keepContext`-grade constraints (VERIFY command, bead id, non-goals) stay pinned in the dispatch spec, not hoped-for in a transcript.
+9. **TDD.** Failing test before the implementation. First proof: desugared `request_approval` still parks; a 2-cycle unrolled repair succeeds on cycle 2 without `br` or a shell in `toron-workflow`.
+10. **`phase_chain.rs` stays.** `check_phase` is structured JSON. Do not encode it as a shell `verify:` string. Retirement is a later flywheel bead.
 
 ---
 
 ## 5. Considered Options
 
-### Option A — Graph-first + error taxonomy + repair loops + evidence approvals + bead integration (CHOSEN)
+### Option A′ — Graph-canonical + split failure + unrolled repair pattern + evidence-by-path (CHOSEN, 2026-08-27)
 
-Four waves on the existing DAG scheduler. Type the failure model (`ErrorKind`) so the engine can route retry/repair/escalate. Add `on_error: repair` to `StepOnError` on top of that taxonomy. Make approvals carry structured context from accumulated `step_outputs`. Unite beads and runs through a single compose path. Build the observation CLI. Collapse the two sequencing engines into one.
+The 2026-08-25 Option A is demoted. A′ keeps the DAG substrate. Runtime failure is classified at the embedding. Work-quality repair is a flywheel-authored unrolled subgraph (or a builtin YAML that compose emits): worker → evaluate → VerifySink, each cycle a new named node, ledger JSON, `context: fresh`, one reservation holder. Approvals carry paths. Beads remain the unit of work.
+
+### Option A — Graph-first + one ErrorKind + `on_error: repair` + bead=workflow + CLI surface (2026-08-25, superseded)
+
+Four waves that hid a loop inside `StepOnError::Repair`, collapsed work-quality into `ErrorKind::Logic`, ran VERIFY in the engine, and made `br close` an engine effect. Rejected after Round-1 debate (§12) and the Atomic tree study: Atomic itself does not implement repair that way.
 
 ### Option B — Status quo (graph stays opt-in, no repair, plain approvals, separate lifecycles)
 
@@ -185,747 +206,301 @@ A new action type that a captain composes into the graph manually: "if build fai
 
 ### Option E — Repair without a taxonomy (route on error-string matching)
 
-Keep the binary `on_error` and add repair by matching `error` substrings ("flaky", "timeout", "assertion failed") to decide retry vs repair vs escalate. Rejected. String matching is fragile: it breaks when the message wording changes, can't distinguish a transient relay timeout from a logic bug in the same wording family, and pushes routing knowledge into the runner instead of a type. The `ErrorKind` taxonomy is the prerequisite — repair routing is impossible without it, and this ADR types it first.
+Keep the binary `on_error` and add repair by matching `error` substrings ("flaky", "timeout", "assertion failed") to decide retry vs repair vs escalate. Rejected. String matching is fragile. Runtime `kind` on `{ok:false}` is the substrate for retry/block/cancel. Work-quality repair is the unrolled recipe, not a kind and not substring match.
 
 ---
 
 ## 6. Decision Outcome
 
-Chosen option: **A** — four waves, each independently useful, each building on the existing DAG scheduler in `control_flow.rs`.
+Chosen option: **A′**. The 2026-08-25 Spec 0–6 text is **superseded**. Git history and [§12](#12-counter-argument-round-1--2026-08-27--git-diff-in-file) keep the draft. Implement **only** what follows.
 
-### Spec 0 — Graph-first canonical shape (Wave 1)
+### Spec 0 — Graph-canonical, park-safe (Wave 1)
 
-The `graph:` field becomes the canonical internal representation. `steps:` desugars to a chain graph at parse time. Every workflow is a DAG internally. The engine always routes through `run_graph`.
+`graph:` is the internal shape. `steps:` desugars to a chain (`needs: [previous]`). `run_workflow` always calls `run_graph`.
 
-**Schema change (`toron-workflow/src/schema.rs`):**
+`to_graph()` copies only fields `GraphNode` has today (`action`, `needs`, `guard`, `on_error`). If playbook lint still needs `build_slot` on graph nodes, add that field to `GraphNode` in the **same cut** (`schema.rs:135–149` vs `Step.build_slot` at `:302`). The 2026-08-25 snippet does not compile.
 
-```rust
-impl Workflow {
-    /// The canonical graph representation. `steps:` desugars to a chain;
-    /// `graph:` is used as-is. Every workflow has a graph.
-    pub fn to_graph(&self) -> Graph {
-        if let Some(ref graph) = self.graph {
-            return graph.clone();
-        }
-        // Desugar linear steps into a chain graph: each step depends on
-        // the previous named step, or the root (no needs) for the first.
-        // Unnamed steps get synthetic names (step_0, step_1, ...).
-        let mut nodes = BTreeMap::new();
-        let mut prev: Option<String> = None;
-        for (i, step) in self.steps.iter().enumerate() {
-            let name = step.name.clone()
-                .unwrap_or_else(|| format!("step_{i}"));
-            let needs: Vec<String> = prev.iter().cloned().collect();
-            nodes.insert(name.clone(), GraphNode {
-                action: step.action.clone(),
-                needs,
-                guard: step.guard.clone(),
-                on_error: step.on_error,
-                build_slot: step.build_slot,
-            });
-            prev = Some(name);
-        }
-        Graph { nodes }
-    }
-}
+**Same-cut park fix (non-negotiable):** `run_graph_node` currently expands only Parallel / Foreach / Branch / Retry / CallWorkflow (`control_flow.rs:673–680`). `RequestApproval`, `Delay`, and `Spawn` go to the sync `ActionRunner` and do **not** park. Linear `run_step` (`:132–180`) is the park path. After always-`run_graph`, existing `steps:` YAML with `request_approval` (triage, wave-swarm SIGNOFF) would complete without a decision (WF-08 regression). Route those three actions through `run_step` (or run every graph node through `run_step`) **before** deleting the linear path.
+
+**Same-cut `fail_run` predicate:** linear `run_step` fails the run on `ok == false` (`control_flow.rs:235–238`). Graph `run_graph` fails on **any** `error` string field (`:626–635`) — so a successful node that carries an `error` key (or a repair ledger object) would abort. Wave 1 uses **one** predicate on both paths:
+
+```text
+ok == false  →  apply on_error
 ```
 
-**Engine change:** `run_workflow` ALWAYS calls `run_graph(ctx, trigger, &workflow.to_graph())`. The old `steps:` path in `run_workflow` (lines 43–58) becomes dead code after the migration tests pass — deleted in the same wave per `migrate-callers-then-delete-legacy-apis`.
+Presence of `error` without `ok: false` is not a failure.
 
-**Backward compatibility:** existing `steps:` YAML parses identically. The run produces identical step outputs under identical `steps.<name>` keys. A linear workflow produces a chain graph with one node per wave (exactly the same sequential execution). The only behavioral change is that a workflow with independent nodes (no `needs:`) would now run them concurrently within the same wave — but such workflows don't exist today because `steps:` is inherently sequential. The desugar preserves that property.
+**Compat gate:** named `steps.<name>` keys preserved. Unnamed linear steps are omitted from `step_outputs` today; desugar may name them `step_N` and the output map may grow. Document that. Do **not** require byte-identical output.
 
-**Visualization:** `flywheel workflow graph <name>` renders the DAG showing nodes, edges, phases, and wave groupings. ASCII in the terminal; optional HTML artifact for review. Example output for the `ship` built-in:
+No Wave-1 CLI noun. Tests may dump `to_graph()` as JSON.
 
-```
-ship (5 nodes, 3 waves)
-│
-├─ Wave 1 ─────────────────────────────────────────────
-│  ◌ resolve          phase=resolve   @scout
-│
-├─ Wave 2 ─────────────────────────────────────────────
-│  ◌ plan             phase=plan      @planner    needs: [resolve]
-│
-├─ Wave 3 ─────────────────────────────────────────────
-│  ◌ implement        phase=implement @coder      needs: [plan]
-│
-├─ Wave 4 ─────────────────────────────────────────────
-│  ◌ review           phase=review    @reviewer   needs: [implement]
-│  ◌ verify           phase=verify    (loop)      needs: [implement]
-│
-├─ Wave 5 ─────────────────────────────────────────────
-│  ◌ gate             approval        captain     needs: [review, verify]
-│
-└─ Wave 6 ─────────────────────────────────────────────
-   ◌ merge            phase=verify    @housekeeper needs: [gate]
+### Spec 1 — Runtime failure at the ActionRunner boundary (Wave 1)
+
+Do **not** replace `ActionRunner` (`Arc<dyn Fn(&Action) -> anyhow::Result<Value> + Send + Sync>`, `engine/mod.rs:198`). Carry classification on the existing error object:
+
+```json
+{ "ok": false, "error": "relay timeout", "kind": "rate_limit", "retryable": true, "resumable": true, "disposition": "active_blocked", "retry_after_ms": 5000 }
 ```
 
-Live run rendering replaces ◌ with ✓ (completed), ✗ (failed), ◌ (in-progress), ⏸ (suspended/approval), ↻ (repairing).
+`kind` is optional until every flywheel runner site classifies (`main.rs`, `pane.rs`, `headless.rs`, `crew.rs`, `smart_cron.rs`). Until then, routing uses explicit `on_error` only. Default stays `Continue`. The default-flip is a **later one-line bead**, not Wave 1.
 
----
+**Runtime kinds** (Atomic `workflow-failures-contract.ts:38–73`, adapted; this is recoverability, not "the model was wrong"):
 
-### Spec 1 — Bounded repair loops (Wave 1)
+| kind | means | default |
+| :--- | :--- | :--- |
+| `timeout` | hung action / deadline | retry (bounded), then escalate |
+| `rate_limit` | 429 / quota, may carry `retry_after_ms` | retry |
+| `auth` | missing/invalid provider creds | escalate (resumable blocked) |
+| `blocked` | reservation held, build slot busy, dep missing | escalate (repair cannot unblock HARD) |
+| `cancelled` | operator / abort | terminal, no repair |
+| `unknown` | unclassified | explicit `on_error` |
 
-A graph node can declare `on_error: repair`. When the node's action fails (returns `{ok: false, error: "..."}`), the engine does not abort the run. It spawns a repair step — a different model, fresh context — gives it the failure details, re-runs the VERIFY command, and repeats up to `max_cycles`. On exhaustion, it escalates to the captain.
+Work-quality (test red, review REJECT, empty artifact) is **not** a kind. It is Spec 2.
 
-#### 6.1.1 The repair cycle state machine
+**`fail_run` is kind-aware (Wave 1, not a later flip).** `on_error: fail_run` aborts only for non-retryable failure: missing kind, `unknown`, `auth`, `blocked`, `cancelled`, or work-quality `{ok:false}` with no runtime kind. If `kind` is `rate_limit` or `timeout`, **do not abort** even when YAML says `fail_run`. The engine retries that **same node** (same action, same args) with backoff:
 
-```
-                    ┌──────────────────────────────┐
-                    │  Node action returns          │
-                    │  { ok: false, error: "..." }  │
-                    └─────────────┬────────────────┘
-                                  │
-                    ┌─────────────▼────────────────┐
-                    │  on_error == Repair?          │
-                    └─────────────┬────────────────┘
-                           No │         │ Yes
-                    ┌─────────▼──┐  ┌───▼──────────────────────┐
-                    │ Continue / │  │ Record RepairCycleStarted │
-                    │ FailRun    │  │ { cycle: 1, error, bead } │
-                    └────────────┘  └─────────────┬─────────────┘
-                                                  │
-                                    ┌─────────────▼──────────────┐
-                                    │  Spawn repairer agent       │
-                                    │  profile: repair_profile    │
-                                    │  model: repair_model        │
-                                    │  task: "Fix root cause of:  │
-                                    │    {error}. Run: {verify}"  │
-                                    └─────────────┬──────────────┘
-                                                  │
-                                    ┌─────────────▼──────────────┐
-                                    │  Await repairer result      │
-                                    │  (dispatch_job → 43001→06) │
-                                    └─────────────┬──────────────┘
-                                                  │
-                                    ┌─────────────▼──────────────┐
-                                    │  Run VERIFY command         │
-                                    │  (headless, under build     │
-                                    │   slot, same reservations)  │
-                                    └─────────────┬──────────────┘
-                                                  │
-                              ┌───────────────────┼───────────────────┐
-                              │                   │                   │
-                    ┌─────────▼──┐     ┌──────────▼──────┐   ┌───────▼──────────┐
-                    │ exit 0     │     │ exit ≠ 0        │   │ repairer failed  │
-                    │ (PASS)     │     │ (FAIL)          │   │ (no result)      │
-                    └─────┬──────┘     └──────────┬──────┘   └───────┬──────────┘
-                          │                       │                   │
-              ┌───────────▼──────────┐  ┌─────────▼────────────┐     │
-              │ Record               │  │ Record               │     │
-              │ RepairCycleSucceeded │  │ RepairCycleFailed    │     │
-              │ { cycle, receipt }   │  │ { cycle, error }     │     │
-              └───────────┬──────────┘  └─────────┬────────────┘     │
-                          │                       │                   │
-              ┌───────────▼──────────┐  ┌─────────▼────────────┐     │
-              │ Node output =        │  │ cycle < max_cycles?   │     │
-              │ repair result        │  └────┬────────────┬─────┘     │
-              │ Continue graph ──────►      Yes │        No │          │
-              └──────────────────────┘  ┌───────▼──┐ ┌───▼──────────▼─┐
-                                        │ incr     │ │ Record          │
-                                        │ cycle    │ │ RepairExhausted │
-                                        │ go to    │ │ Escalate to     │
-                                        │ spawn ───► │ captain         │
-                                        └──────────┘ │ (kind-14 DM)    │
-                                                     │ Node output =   │
-                                                     │ { ok: false,    │
-                                                     │   error: "..." }│
-                                                     │ Outer on_error  │
-                                                     │ policy applies  │
-                                                     └─────────────────┘
-```
+- honor `retry_after_ms` when present, else `backoff_secs` on an enclosing `Action::Retry`, else 1s × 2^(attempt-1), cap 60s
+- bound: enclosing `Retry.max_attempts` if present, else **3**
+- still failing after the bound → escalate (kind-14, `disposition: active_blocked` for rate_limit, terminal for timeout). **Do not** mint `repair-(N+1)`
 
-#### 6.1.2 YAML schema
+Lint: R-E1 retry-on-`blocked`/`auth` is an error. R-E2 `kind` missing is a warning until every runner site classifies. R-E3: a `spawn` node with `fail_run` and no enclosing `Retry` is a **warning** (429s still retry via the rule above; the warning tells authors to wrap spawn in `retry` so the bound is explicit).
+
+**Pane vs headless 429 (live gap).** Headless already retries **once** with the registry fallback model (`bd-42fs`, `main.rs:23461–23541`) and does **not** surface `kind`. Wave 1: after that one fallback, if still 429, return `{ok:false, kind:"rate_limit", retryable:true}`. Copy the same one-shot fallback into the **pane** spawn path (today: none). Then the engine retry rule above can fire. Do not treat the fallback retry as a repair cycle.
+
+### Spec 2 — Unrolled repair pattern (Wave 1–2)
+
+Atomic's loop (`loop-until-done-runner.ts:175–258`) is the model: each cycle is two **named** stages, both `context: "fresh"`, plus a ledger file. We do not hide this inside `StepOnError::Repair`.
+
+**Composer / builtin emits this subgraph** (YAML, not engine magic):
 
 ```yaml
-name: ship-toron
-description: "Full ship chain for toron release"
-graph:
-  nodes:
-    build:
-      action: dispatch_job
-      assignee: "@crew.coder"
-      spec:
-        phase: implement
-        task: "Implement {{inputs.spec}}"
-      on_error:
-        repair:
-          max_cycles: 3
-          repair_profile: "@coder"          # defaults to node's assignee
-          repair_model: "claude-opus-4"     # optional; different model family
-          verify: "cargo test -p {{inputs.crate}} -- {{inputs.test_filter}}"
+# cycle identity is in the node name. Do not reuse `verify` across cycles.
+# Spawn is wrapped in Retry: a 429 retries THIS node, it does not unroll repair-2.
+repair-1:
+  action: retry
+  max_attempts: 3
+  backoff_secs: 5
+  step:
+    action: spawn
+    await: true
+    spec:
+      profile: "@coder"
+      phase: implement
+      context: fresh          # new DispatchSpec field: inherit | fresh
+      model: "{{inputs.repair_model}}"   # optional different family
+      task: |
+        Fix remaining work. Ledger: {{inputs.ledger_path}}
+        Previous failures: {{inputs.ledger_path}} (read the file; do not trust this prompt dump).
+      plan: "{{inputs.bead_id}}"
+evaluate-1:
+  needs: [repair-1]
+  action: retry
+  max_attempts: 3
+  backoff_secs: 5
+  step:
+    action: spawn
+    await: true
+    spec:
+      profile: "@reviewer"
+      phase: verify
+      context: fresh
+      task: "Structured evaluation against the VERIFY command and ledger."
+verify-1:
+  needs: [evaluate-1]
+  action: verify
+  command: "{{inputs.verify}}"
+  on_error: fail_run
+  # Action::Verify { command }. fail_run here is work-quality (exit ≠ 0, no kind)
+  # or missing sink. kind:rate_limit on Verify is not expected (cargo is not an LLM).
+  # If a kind is retryable, Spec 1 still retries despite fail_run.
 ```
 
-#### 6.1.3 Rust type
+Wave 1 engine support for that pattern:
 
-```rust
-/// A node's failure policy.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum StepOnError {
-    /// Capture the error per-step and continue the run (default).
-    Continue,
-    /// Fail the run: deterministic durable return, not a panic.
-    FailRun,
-    /// Bounded repair: on failure, spawn a repairer (different model),
-    /// re-run verify, repeat up to max_cycles. Escalate on exhaustion.
-    Repair {
-        /// Maximum repair cycles (1..10; lint-enforced).
-        max_cycles: u32,
-        /// Profile for the repairer agent (defaults to the failing node's assignee).
-        #[serde(default)]
-        repair_profile: Option<String>,
-        /// Optional model override (different model family for genuine independence).
-        #[serde(default)]
-        repair_model: Option<String>,
-        /// The VERIFY command. Exit 0 = repair succeeded.
-        verify: String,
-    },
-}
-```
-
-#### 6.1.4 Engine behavior (control_flow.rs)
-
-The repair loop is a new function `run_repair_cycle` called from `run_graph_node` when the node's `on_error` is `Repair` and the action returns `{ok: false}`. Pseudocode:
-
-```rust
-async fn run_repair_cycle(
-    ctx: &Context,
-    node_name: &str,
-    repair: &RepairConfig,
-    original_error: &str,
-    trigger: &Value,
-) -> Result<Value> {
-    for cycle in 1..=repair.max_cycles {
-        // 1. Record cycle start (kind-9 post in run channel)
-        emit_repair_event(ctx, RepairCycleStarted { cycle, node: node_name, error: original_error });
-
-        // 2. Spawn repairer agent (dispatch_job via the ActionRunner)
-        let repair_result = dispatch_repairer(ctx, repair, original_error, cycle).await?;
-
-        // 3. Run VERIFY command (headless, under the build slot)
-        let verify_result = run_verify(ctx, &repair.verify).await?;
-
-        // 4. If verify passes, repair succeeded → return the repair result
-        if verify_result.exit_code == 0 {
-            emit_repair_event(ctx, RepairCycleSucceeded { cycle, receipt: verify_result.stdout });
-            record_br_gate(ctx, "repair-cycle-succeeded", cycle);
-            return Ok(repair_result);
-        }
-
-        // 5. Verify failed → record and continue to next cycle
-        emit_repair_event(ctx, RepairCycleFailed { cycle, error: verify_result.stderr });
-        record_br_gate(ctx, "repair-cycle-failed", cycle);
-    }
-
-    // Exhausted: all cycles failed
-    emit_repair_event(ctx, RepairExhausted { max_cycles: repair.max_cycles });
-    escalate_to_captain(ctx, node_name, repair.max_cycles, original_error);
-    Ok(json!({ "ok": false, "error": format!("repair exhausted after {} cycles", repair.max_cycles) }))
-}
-```
-
-Each repair cycle is a distinct tracked work unit:
-- A kind-9 post in the run's channel (`bead:<run-bead-id>`) summarizes the attempt
-- A `br gate report` row records the verify outcome (pass or fail) with cycle number
-- The run tree shows repair cycles as child nodes of the failed node
-
-#### 6.1.5 Lint rules
-
-| Rule | Condition | Severity |
-| :--- | :--- | :--- |
-| R-R1 | `max_cycles` must be 1..10. 0 or >10 is a lint error. | Error |
-| R-R2 | `verify` must be a non-empty command string. | Error |
-| R-R3 | A `Repair` node nested inside another `Repair` node. One level of repair; if the repair fails, escalate — don't recurse. | Error |
-| R-R4 | `max_cycles` exceeds `FLYWHEEL_REPAIR_MAX_CYCLES` (env, default 10). The runtime cap applies regardless of YAML value. | Warning |
-| R-R5 | `repair_model` names a model that is the SAME family as the failing node's model. The value of repair is in a different perspective. | Warning |
-
-#### 6.1.6 What repair IS and IS NOT
-
-**Repair IS:**
-- A different model (or at minimum a different agent) looking at the failure with fresh context
-- Bounded (max_cycles + runtime cap prevent unbounded spend)
-- Verified (each cycle re-runs the VERIFY command; no self-report)
-- Tracked (each cycle is a `br gate report` row + kind-9 post)
-- Escalated on exhaustion (captain gets kind-14 DM with full repair log)
-
-**Repair IS NOT:**
-- A retry of the same step on the same model (`Action::Retry` already does this for transient failures)
-- Unbounded (the env cap `FLYWHEEL_REPAIR_MAX_CYCLES` is the hard stop regardless of YAML)
-- A worktree (the repairer works in the same tree, under the same reservations)
-- A self-report (the engine runs VERIFY; the repairer's claim of "done" is not enough)
-- Silent (every cycle is a kind-9 post; exhaustion is a kind-14 DM to captain)
-
-#### 6.1.7 Principles encoded
-
-| Principle | How repair encodes it |
-| :--- | :--- |
-| `prove-it-works` | Each cycle re-runs VERIFY. A repair that doesn't re-verify is not a repair — it's a retry (which `Action::Retry` handles). |
-| `fix-root-causes` | The repairer prompt includes the exact error. "Fix the root cause, not the symptom." |
-| `sequence-verifiable-units` | Each cycle is a verifiable unit: fix → verify → gate row. |
-| `never-block-on-the-human` | Auto-repair up to the bound. Only escalate on exhaustion. |
-| `encode-lessons-in-structure` | The repair loop is a type (`StepOnError::Repair`), not a prose instruction in the task prompt. |
-
----
-
-### Spec 2 — Evidence-bearing approvals (Wave 2)
-
-`request_approval` carries structured context: the run tree state, produced artifacts, blast radius, and the specific decision question. The operator sees evidence, not a bare string.
-
-#### 6.2.1 The approval payload
-
-When a graph node hits `request_approval`, the engine builds a context object from the run's accumulated state and publishes it as the promise payload:
+1. **`DispatchSpec.context: Option<ContextMode>`** (`inherit` default, `fresh` = new session, empty transcript). Fresh is the Atomic default for both worker and evaluator. Different-model (`repair_model`) is optional and still useful; **fresh context is the load-bearing independence**, not the model family.
+2. **`Action::Verify { command: String }` + `VerifySink`.** New action variant in `schema.rs` `Action` (serde tag `verify`). Engine calls `VerifySink` (`Fn(&VerifyRequest) -> Result<VerifyResult>`): command, cwd, optional bead id → `{ok, exit, stdout_path, stderr_path}` (paths, bounded, redacted). Missing sink → `{ok:false, error:"verify sink missing"}`. Flywheel implementation reuses `__loop-run-verify` under `mail slot acquire --slot cargo`, writes a **workflow** receipt via `write_receipt` (non-`CommandVerified`). Never `std::process::Command` in toron-workflow. Never `CallWebhook`.
+3. **Ledger writer in the embedding** (flywheel), not the engine. JSON at `.flywheel/receipts/<run-id>-progress-ledger.json` (same tree as ADR-0019 receipts; do not grow a second directory). Cycle files use `write_receipt` for non-`CommandVerified` kinds. **Never** `write_command_verified_receipt` from a workflow runner (`verdict.rs:746–776`).
 
 ```json
 {
-  "run_id": "wf-2026-08-25-001",
+  "bead_id": "bd-123",
+  "verify": "cargo test -p toron-core reservation_conflict_detection",
+  "max_iterations": 3,
+  "status": "active",
+  "entries": [
+    {
+      "iteration": 1,
+      "node": "repair-1",
+      "evaluate_node": "evaluate-1",
+      "done": false,
+      "remaining_work": "conflict check still compares holder_name",
+      "failures": ["test reservation_conflict_detection ... FAILED"],
+      "validation_evidence": [".flywheel/receipts/.../verify-1.txt"],
+      "receipt_path": ".flywheel/receipts/.../verify-1.txt"
+    }
+  ]
+}
+```
+
+4. **Evaluator schema** (structured, fail loud if missing — Atomic `evaluationFrom` throws). Minimum fields: `done: bool`, `remaining_work: string`, `failures: [string]`, `validation_evidence: [string]`. `done: true` without a VerifySink exit 0 is illegal (`prove-it-works`).
+5. **No prompt injection.** Next cycle's task names the ledger **path**. The engine does not splice stdout into the prompt (Atomic README:108).
+6. **Exhaustion.** After `max_iterations` (recipe input, lint 1..10, Atomic-style; do not invent `FLYWHEEL_REPAIR_MAX_CYCLES` until something reads it), emit kind-14 to captain with the ledger path. Terminal `{ok:false, kind:"unknown", disposition:"terminal_failed", remaining_work: "..."}`. Do not write a pass-shaped `br gate` row.
+7. **One writer.** Repairer inherits the failed node's reservation (extend TTL, same `reason=<bead-id>`) **or** the original pane is interrupted first. Two holders is illegal (ADR-0011).
+8. **Spawn-await, not DispatchJob.** `Action::DispatchJob` does not await 43001→06. The await primitive is `Action::Spawn { await_: true, no_claim_timeout }` + `SpawnSink` (`control_flow.rs:218–231`, `sinks.rs:31–34`). **Headless refuses spawn** (`main.rs:23756–23762`). Default `workflow run --mode` is headless. **Wave 1 lock:** `repair-until-verified` runs as `--execute --mode pane` (same as `steer`). Headless must **fail loud** naming that flag, never record `{action:"spawn"}` and continue. Headless spawn-await is a follow-up (Spec 5), not a Wave 1 silent path.
+9. **`failureMode: return` analogue.** A check node may return `{ok:false}` with the node **visible as failed** in `step_outputs` while the graph continues to the evaluator. Today's `Continue` captures the error but the graph UX treats the run as proceeding-clean. Preserve `ok:false` on that node.
+10. **429 / timeout is not a repair cycle.** Mid-work rate limit on `repair-N` or `evaluate-N` retries that spawn (Spec 1 + enclosing `Retry`). It does **not** increment `N`, does **not** write a ledger `remaining_work` row, does **not** spawn a different-model fixer to "fix" HTTP 429. VerifySink `ok:false` with **no** runtime kind (test red) **does** unroll `repair-(N+1)`. After Retry bound on `rate_limit`: escalate, recipe status failed, ledger `status: "blocked"`. Same reservation holder until escalate.
+
+`StepOnError::Repair { ... }` as a hidden engine loop is **rejected** (Option A). Serde today rejects the unknown variant (`schema.rs` tests `:1188–1194`). Compose **always** emits `graph: None` and linear `steps` (`crew.rs:387`) with `on_error: Continue` — that is why live SIGNOFF/plan `request_approval` actually parks. Parts grammar cannot emit an unrolled repair graph (`retry(n):` is `Action::Retry`). Authoring path: a compiled-in recipe token like `wave-swarm` (`crew.rs:357–373`) named `repair-until-verified`, or `compose --from-yaml` with an explicit `graph:`. Optional later: parse-only `on_error: repair` alias that desugars to that recipe. Do not add a third sequencer inside `run_graph_node`. Do not flip compose to `graph:` until Spec 0's park fix is green (otherwise SIGNOFF becomes a silent `{action:"request_approval"}` record).
+
+**Repair IS:** fresh-context worker, independent fresh-context evaluator, embedding VERIFY, bounded, named nodes, ledger path, one reservation, escalate on exhaustion.
+
+**Repair IS NOT:** retry-of-same, engine shell, `br close`, a VerdictKind, a sixth phase, a worktree, silent, prompt-stuffed stdout, a stop decision driven by a progress score, **a 429 / timeout** (that retries the same spawn; it does not unroll `repair-(N+1)`).
+
+**Judgment nodes** (review with no command): do not repair. Use `ReviewerSigned`. Atomic's `ralph-review-gate.ts` stop door is a boolean the reviewer sets; parse failure never approves. Same here.
+
+### Spec 3 — Evidence-bearing approvals (Wave 2)
+
+`request_approval` promise data becomes:
+
+```json
+{
+  "run_id": "wf-…",
   "workflow": "ship-toron",
-  "suspended_at": {
-    "node": "approve-release",
-    "wave": 5
-  },
-  "question": "Release toron v0.4.0 to crates.io?",
+  "suspended_at": { "node": "gate", "wave": 5 },
+  "question": "Release toron v0.4.0?",
   "context": {
-    "nodes_completed": ["resolve", "plan", "implement", "review", "verify"],
-    "nodes_failed": [],
+    "nodes_completed": ["…"],
+    "nodes_failed": ["repair-1"],
     "nodes_pending": ["merge"],
-    "repair_cycles": [
-      { "node": "verify", "cycle": 1, "outcome": "failed", "error": "2 tests failed" },
-      { "node": "verify", "cycle": 2, "outcome": "succeeded", "receipt": ".flywheel/receipts/wf-001-verify-cycle2.txt" }
-    ],
     "artifacts": [
-      { "node": "resolve", "kind": "goal_statement", "thread_id": "thread-abc" },
-      { "node": "plan",    "kind": "beads", "ids": ["bd-123", "bd-124", "bd-125"], "dep_cycles_empty": true },
-      { "node": "implement", "kind": "commit", "sha": "abc1234", "bead": "bd-123" },
-      { "node": "review", "kind": "verdict", "outcome": "AGREE", "reviewer": "BlueLake", "findings": 3 },
-      { "node": "verify", "kind": "receipt", "command": "cargo test --workspace", "exit": 0, "path": ".flywheel/receipts/wf-001-verify-cycle2.txt" }
+      { "node": "implement", "kind": "commit", "sha": "abc1234" },
+      { "node": "verify-2", "kind": "receipt", "path": ".flywheel/receipts/…/verify-2.txt", "exit": 0 }
     ],
-    "blast_radius": "Publishes to crates.io. Irreversible. Affects all downstream consumers.",
+    "ledger_path": ".flywheel/receipts/…/progress-ledger.json",
+    "blast_radius": "…",
     "timeout": "PT24H"
   }
 }
 ```
 
-The `context` is built from:
-- **Graph topology**: which nodes have completed, failed, are pending (from the DAG scheduler's `done` set and `step_outputs`)
-- **Accumulated outputs**: every node's output is available under `nodes.<name>`; the engine selects the fields that matter for a human decision (commit SHA, verdict outcome, receipt path)
-- **Repair history**: if any node went through repair cycles, the cycle log is included
-- **Blast radius**: from the workflow's `blast_radius` field or the YAML `## BLAST_RADIUS` fence
-- **Timeout**: auto-reject deadline (default 24h; configurable per step via `approval_timeout_secs`)
+Built from `step_outputs` + graph topology. **Paths, not blobs.** Atomic's HIL is a string (`PendingPrompt.message` in `store-types.ts:112–126`); the README example dumps `plan.text`. The *better* authoring practice is a file + `reads`. We store paths on the promise. The operator CLI (when it exists) `cat`s the ledger; the promise does not carry 50KB of stdout.
 
-The `question` field is the rendered template from the YAML `message` — it's the human-facing question, now surrounded by the evidence needed to answer it.
+**Evidence identity (Wave 2, crash-stable).** Hash `{run_id, node, artifacts[].path, artifacts[].sha, ledger_path}` into the promise payload as `evidence_hash`. Resume that re-hits `request_approval` with a *different* hash is a new question, not a cached yes. Atomic durable UI replays by hash of kind+message+callsite (`durable/ui-primitive.ts`); we hash the *evidence*, so a later commit SHA cannot inherit an earlier approve.
 
-#### 6.2.2 CLI surface
+**There is no kind-46011 listener in flywheel.** Zero `ApprovalSink` drains, zero 46011 publishes, zero `resolve_approval` outside tests. Engine comments say "embedding publishes kind-46011"; the embedding does not. Live park is the Resonate promise. `plan` / `wave-swarm` SIGNOFF hang until something calls `WorkflowEngine::resolve_approval` (cron dry-run already documents this and caps at 25s). Wave 1: drain `ApprovalSink` the same way pane drains `SpawnSink`. Wave 2: richer promise data. CLI nouns later. Do not wrap a listener that does not exist.
 
-| Command | Behavior |
+Reject still records `status: "rejected"` (WF-08: rejection is a decision, not a crash).
+
+### Spec 4 — Bead remains the unit of work (loop SM is not replaced)
+
+`flywheel loop-mode run --work` stays the bead runtime (flywheel skill §3: do not replace). Today: `br ready` → claim → brief → claim-watch → worker `br close` → **loop** `loop_run_verify` (`durable.rs:660–711`) writes `.flywheel/receipts/<id>-<sha>.command-verified.txt` then `br gate report`. That is the legal-close path.
+
+Unrolled repair (Spec 2) lives **inside workflow YAML** (`ship`, `bug-fix`, compose graphs). It is not a second bead dispatcher.
+
+**Anti-forgery, live code (`flywheel/src/verdict.rs`):**
+
+- `CommandVerified` means **the loop executed VERIFY**. `write_receipt` **refuses** that kind (`:746–751`). `write_command_verified_receipt` requires `LOOP_ARMED` (`:767–776`). A worker-invoked `br gate report` on a loop-owned bead is rejected (`:339–341`).
+- `legal_close` is exhaustive over `VerdictKind` (`:293–327`). Cheap band (P≥2, Normal, loop-runnable VERIFY) closes on `CommandVerified` **only**. Judgment AC closes on `ReviewerSigned` only. Adding `RepairCycle` would not compile without amending this table — and we do not amend it.
+
+So Spec 2's VerifySink **must not** call `br gate report` at all (not `command-verified`, not `reviewer-signed`). `br gate` is an open append with **no actor ACL** (`beads` `GateCommands`; `--provider` is a free string). Flywheel's `LOOP_ARMED` is process-local and does not bind `br`. A workflow evaluator in the same graph writing `reviewer-signed` is the same class of lie as a worker writing `command-verified`.
+
+VerifySink writes a receipt **path** into the ledger JSON. After the worker closes, the **armed loop** still runs VERIFY and records `command-verified`. In-graph green is how the ship run continues. Loop green is how the bead closes. That duplication is the anti-forgery.
+
+**Time bomb:** `legal_close_input_for_issue` in `beads/src/close_policy.rs` still ignores `issue.verify` / `blast` / `ac_shape` (every bead looks Normal + checkable + empty VERIFY → non-runnable band). Today a forged `command-verified` is **noise**. When schema-v18 wiring lands, cheap-band closes become `command-verified` **only** — and a workflow-written row becomes a legal forged close. Do not ship workflow gate writes "for later." Never write them.
+
+**Reservation inherit-or-interrupt.** `Mailbox::transfer_reservation` exists in toron-core; MCP `file_reservation_paths` accepts `transfer_from`. Flywheel `mail locks` is only reserve/list/show — **no transfer subcommand**. `flywheel interrupt --force` is **wrong**: `--force` allows ctrl+c, which **kills the agent process** (`main.rs:314–328`). Default interrupt is Escape. Repair handoff: wait Idle or Escape-interrupt, then `toron reserve transfer`. Never `--force`. Never commit-on-behalf.
+
+**Receipt paths.** Reuse `.flywheel/receipts/` (`write_receipt` / `write_command_verified_receipt`). A `progress-ledger.json` may sit beside them. Do not invent a second receipt tree.
+
+Drop from this ADR: `br create --auto-workflow`, `workflow_yaml` on the beads schema, "kind-46012 IS the bead close", engine-side close, **loop-dispatch-via-`engine.invoke` as the primary `--work` path**.
+
+A captain may still `workflow run` a graph that cites a bead id. That is opt-in compose/steer, not the loop.
+
+### Spec 5 — Explicitly not this ADR
+
+| Item | Why later |
 | :--- | :--- |
-| `flywheel workflow approvals pending [--project <slug>]` | List all runs currently suspended on approval. Shows run_id, workflow name, suspended node, question, elapsed time since suspension. |
-| `flywheel workflow approve <run-id> [--note "..."]` | Approve the suspended run. Resolves the Resonate promise with `{ outcome: "approved", note: "..." }`. The run resumes from the suspended node. |
-| `flywheel workflow reject <run-id> [--note "..."]` | Reject the suspended run. Resolves the Resonate promise with `{ outcome: "rejected", note: "..." }`. The run records the rejection and terminates with `status: "rejected"`. |
+| `flywheel workflow tree/connect/fork/cancel` | CLI surface, flywheel ADR. `connect` ≈ Atomic steer-a-live-stage. Valuable, not a type seam. |
+| Default `on_error` routed-by-kind flip | Needs every runner site classified. |
+| `phase_chain.rs` retirement | Keep `check_phase` JSON contracts. |
+| Auto-parallel lint from BLAST_RADIUS | Title was "reservation data"; engine never sees live leases. Lint-only, later. |
+| Worktrees, hashline, `keepContext` | Isolation / edit / compaction follow-ups. `keepContext` is the right pin for VERIFY + non-goals once CONTEXT_LIMIT is an ADR. |
+| LLM mean-and-veto / Bradley-Terry | Atomic `adversarial-verification` + verifier program. Maps onto ReviewerSigned. Separate. |
+| Run budgets (`maxTokens` / `maxCost` / `budget_exceeded` blocked rail) | Atomic B1–B3. We have `FLYWHEEL_COMPOSE_MAX_SECONDS`. Token/cost budgets later. |
+| Heartbeats | Atomic 15 min product default. Resonate already durable-sleeps. |
+| Natural-language → TypeScript authoring | Atomic writes `workflow({run})`. We have `workflow compose --agent`. Stay YAML. |
+| Headless spawn-await | Wave 1 repair is `--mode pane`. Teaching headless to await spawn is a follow-up so default `workflow run` can run the recipe. |
 
-These wrap the existing `resolve_approval` / `reject_approval` engine methods. The approval CLI already works via the kind-46011 listener (operator publishes kind-46011 approval, the bus subscriber resolves the promise). This gives it a run-id-based surface with the evidence visible before the decision.
+### Spec 6 — Wave 1 files (target zone)
 
-#### 6.2.3 What evidence-bearing approvals enable
-
-Before: operator types `flywheel workflow approve wf-001` blind. The run might have failing tests, unreviewed code, or an incomplete plan. The operator trusts the agent's word.
-
-After: operator runs `flywheel workflow approvals pending`, sees the full context, verifies that verify passed and review returned AGREE, then approves. The decision is made on evidence.
-
----
-
-### Spec 3 — Bead-workflow integration (Wave 3)
-
-A bead IS a workflow run. One lifecycle. Every bead close is a workflow terminal. Every workflow terminal is a bead close. The loop dispatches beads as workflow runs, not as raw prompt strings.
-
-#### 6.3.1 The bridge: bead → workflow YAML
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│  BEAD (br SQLite)                                           │
-│                                                             │
-│  id: "bd-123"                                               │
-│  title: "Fix reservation conflict check"                    │
-│  priority: 1                                                │
-│  type: bug                                                  │
-│  description:                                               │
-│    The conflict check in toron-core/src/reservations.rs     │
-│    compares the wrong field. Held reservations from         │
-│    different agents on different paths collide.             │
-│                                                             │
-│    ## VERIFY                                                │
-│    ```bash                                                  │
-│    cargo test -p toron-core reservation_conflict_detection  │
-│    ```                                                      │
-│                                                             │
-│    ## PRINCIPLES                                            │
-│    prove-it-works — ran the VERIFY fence, not a self-report │
-│    fix-root-causes — the conflict check was comparing       │
-│      holder_name instead of path                            │
-│                                                             │
-│    ## BLAST_RADIUS                                          │
-│    toron-core/src/reservations.rs only                      │
-│                                                             │
-│  status: open                                               │
-│  depends_on: []                                             │
-└──────────────────────────┬──────────────────────────────────┘
-                           │
-                           │  br create --auto-workflow
-                           │  (or: loop detects ready bead
-                           │   and auto-composes)
-                           ▼
-┌─────────────────────────────────────────────────────────────┐
-│  WORKFLOW (YAML, auto-generated)                            │
-│                                                             │
-│  name: "bead-bd-123"                                        │
-│  description: "Fix reservation conflict check"              │
-│  trigger: null                    # invoke-only             │
-│  principles: [prove-it-works, fix-root-causes]              │
-│  inputs:                                                    │
-│    - name: bead_id                                          │
-│      default: "bd-123"                                      │
-│    - name: task                                              │
-│      default: "Fix reservation conflict check"              │
-│  graph:                                                     │
-│    nodes:                                                   │
-│      implement:                                             │
-│        action: dispatch_job                                 │
-│        assignee: "@crew.coder"                              │
-│        spec:                                                │
-│          phase: implement                                   │
-│          task: "Implement bead bd-123: Fix reservation      │
-│                 conflict check. The conflict check in        │
-│                 toron-core/src/reservations.rs compares     │
-│                 the wrong field."                            │
-│          plan: "bd-123"                                     │
-│                                                             │
-│      verify:                                                │
-│        needs: [implement]                                   │
-│        action: dispatch_job                                 │
-│        assignee: "@crew.coder"                              │
-│        spec:                                                │
-│          phase: verify                                      │
-│          task: "Run the VERIFY command for bead bd-123"     │
-│        on_error:                                            │
-│          repair:                                            │
-│            max_cycles: 3                                    │
-│            verify: "cargo test -p toron-core                │
-│                      reservation_conflict_detection"        │
-│                                                             │
-│      gate:                                                  │
-│        needs: [verify]                                      │
-│        action: request_approval                             │
-│        message: "Bead bd-123 complete. VERIFY passed.       │
-│                  Close bead?"                               │
-└─────────────────────────────────────────────────────────────┘
-```
-
-#### 6.3.2 The lifecycle: one timeline
-
-```
-br create --auto-workflow "Fix X" -p 1 -t bug
-  │
-  │  (bead status: open, workflow YAML written to bead metadata)
-  │
-  ▼
-loop detects bead ready (br ready --json)
-  │
-  │  (compose_workflow from bead metadata → Workflow struct)
-  │
-  ▼
-engine.invoke("bead-bd-123", workflow, inputs)
-  │
-  │  (Resonate durable run starts)
-  │
-  ├─ implement node dispatched → @coder
-  │   │
-  │   ├─ coder commits with "bd-123" in message
-  │   └─ node output: { commit_sha: "abc1234" }
-  │
-  ├─ verify node dispatched → @coder (runs VERIFY)
-  │   │
-  │   ├─ test fails (first attempt) → on_error: repair
-  │   ├─ repair cycle 1: fix the test, re-verify → PASS
-  │   └─ node output: { receipt_path: ".flywheel/receipts/...", exit: 0 }
-  │
-  ├─ gate node → request_approval
-  │   │
-  │   │  (run SUSPENDED on Resonate promise)
-  │   │
-  │   ├─ captain: flywheel workflow approvals pending
-  │   ├─ captain reviews: implement ✓, verify ✓ (1 repair cycle)
-  │   ├─ captain: flywheel workflow approve bead-bd-123
-  │   │
-  │   └─ (run RESUMES)
-  │
-  └─ terminal: kind-46012 emitted
-       │
-       │  { status: "succeeded", output: { implement: {...}, verify: {...}, gate: {...} } }
-       │
-       ├─ br gate report bd-123 --gate workflow-verified --status pass
-       ├─ br close bd-123 --commit-sha abc1234 --reason "..."
-       │
-       └─ loop: claim-watch releases (bead closed, workflow terminal observed)
-```
-
-#### 6.3.3 The bridge rules
-
-1. **`br create --auto-workflow`** generates a workflow YAML from the bead's `## VERIFY` fence, `## PRINCIPLES` names, `## BLAST_RADIUS` globs, type (bug/feature/task → maps to phases), and priority (P0–P1 gets mandatory reviewer node). The YAML is stored in the bead's metadata (a new `workflow_yaml` field in the beads schema). `--workflow <path>` uses an explicit YAML file instead.
-
-2. **The loop dispatches beads as workflow runs.** When the loop sees a ready bead with `workflow_yaml` metadata, it calls `compose_workflow` + `engine.invoke` instead of the old `bead_prompt` string dispatch (already deleted per ADR-0019 Spec 1). The bead's `## PRINCIPLES` names are lint-checked against the 21-name registry. Missing VERIFY fence → refuse to dispatch (existing rule, unchanged).
-
-3. **The terminal gate closes the bead.** The workflow's final node is a `request_approval` gate. For cheap P2+ beads with a loop-runnable VERIFY, the gate auto-approves (the loop ran VERIFY itself — ADR-0019 Spec 1 cheap band). For P0–P1 or judgment beads, the gate suspends for captain approval. On approval, the engine emits kind-46012 terminal, records `br gate report --gate workflow-verified`, and calls `br close`.
-
-4. **The loop's claim-watch listens for kind-46012.** Instead of polling `br list --status closed` and grep-ing for gate rows, the loop subscribes to kind-46012 events for its owned runs. A terminal event with `status: "succeeded"` releases the claim-watch entry. A terminal with `status: "failed"` reopens the bead and mails the captain.
-
-5. **Manual beads still work.** A bead created without `--auto-workflow` (quick `br q` or legacy) has no `workflow_yaml` metadata. The old `br gate report` path applies. Both paths coexist; the workflow path is the preferred one for loop-dispatched work. Over time, the loop should auto-compose workflows for any ready bead that lacks one (Wave 3 stretch goal).
-
-6. **`flywheel workflow run bead-<id>`** resumes a stranded bead's workflow run from the last Resonate checkpoint. The command to run after a crash. Thin wrapper: looks up the bead's `workflow_yaml`, calls `engine.invoke` with the same `run_id`, Resonate deduplicates and replays from the last checkpoint.
-
----
-
-### Spec 4 — Workflow observability surface (Wave 4)
-
-A CLI surface for inspecting, steering, resuming, and forking live runs. Builds on the existing `flywheel runs` board and the Resonate promise store.
-
-| Command | Behavior | JSON support |
-| :--- | :--- | :--- |
-| `flywheel workflow tree <run-id>` | ASCII tree of the DAG: ✓ completed, ✗ failed, ◌ in-progress, · pending, ⏸ suspended/approval, ↻ repairing. Each node shows phase, assignee, duration, and repair cycle count if applicable. | `--json` emits the tree as a nested object |
-| `flywheel workflow status <run-id>` | One-line summary: state, completed/total nodes, suspended node (if any), elapsed time, current repair cycle (if any). | `--json` for machine consumption |
-| `flywheel workflow connect <run-id>` | Stream node-level events to stdout as JSON lines: `NodeStarted`, `NodeCompleted`, `NodeFailed`, `RepairCycleStarted`, `RepairCycleSucceeded`, `RepairCycleFailed`, `RepairExhausted`, `ApprovalSuspended`, `ApprovalResolved`. Like `tail -f` for a workflow run. `--timeout-ms` required. | Always JSON lines |
-| `flywheel workflow resume <run-id>` | Resume a crashed/killed run from the last Resonate checkpoint. Thin wrapper over Resonate's built-in resume. | `--json` prints final outcome |
-| `flywheel workflow fork <run-id> --at <node>` | Fork a run at a completed node: create a new run seeded from the parent run's state up to that node, with a new tail YAML. `--kill-original` terminates the parent. Forked runs carry `parent_run_id` in kind-46012. | `--json` prints the new run_id |
-| `flywheel workflow approvals pending` | List all runs currently suspended on approval, across all projects. Shows run_id, workflow, node, question, elapsed. `--project <slug>` to filter. | `--json` default |
-| `flywheel workflow approve <run-id> [--note]` | Approve the suspended run. | `--json` prints outcome |
-| `flywheel workflow reject <run-id> [--note]` | Reject the suspended run. | `--json` prints outcome |
-
-**`fork` mechanics:** the engine serializes the `RunInput` up to the fork point (all node outputs accumulated before and including the named node). A new `run_workflow` is spawned with a new `run_id`, the cloned state as initial `step_outputs`, and the new tail YAML provided by the captain. The original run is untouched unless `--kill-original` is passed. Deterministic replay is per-run — fork does not affect the parent's replay.
-
----
-
-### Spec 5 — Auto-parallelization from reservation data (Wave 4)
-
-The graph analyzer can compute edges from file reservations. Two nodes that reserve disjoint file sets have no data dependency and can run concurrently.
-
-**Mechanism:** `flywheel workflow lint` inspects each node's `blast_radius` (from the YAML `## BLAST_RADIUS` fence or the `DispatchSpec.plan` field's bead metadata). Nodes with disjoint file globs that have no explicit `needs:` edge are flagged as `independent`:
-
-```
-Nodes implement-auth and implement-rate-limit are independent
-  (disjoint files: src/auth/ vs src/rate_limit/)
-  → consider removing explicit serial edge or confirming it's intentional
-
-Nodes implement-auth and fix-auth-bug conflict on src/auth/handler.rs
-  → serial edge required (implicit from reservation overlap)
-```
-
-The engine does NOT automatically add or remove edges — the lint ADVISES. The captain confirms or overrides. This is `separate-before-serializing` applied at the graph level: the lint finds false sharing, the captain decides whether to split or serialize.
-
----
-
-### Spec 6 — Error Taxonomy and Execution-Model Closure (foundational; feeds Spec 1 and Spec 4)
-
-*Foundational, discovered during the 2026-08-25 completeness audit. Spec 6 is
-listed after Spec 5 because the error taxonomy was the last gap identified,
-but it is the routing substrate that Spec 1 (repair) and Spec 4 (observability)
-consume. Repair routing is impossible without it: you cannot route a failure
-to "repair" vs "retry" vs "escalate" when every failure is an undifferentiated
-`anyhow::Error` collapsed into `{ok:false, error:"<string>"}`.*
-
-#### 6.6.1 The error taxonomy
-
-`ActionRunner` returns `anyhow::Result<Value>`; every failure collapses to a
-string. The engine cannot distinguish a transient relay timeout from a logic
-bug from a blocked reservation. That is the root cause of binary `on_error` —
-with no error kind, the only choices are "abort" or "swallow."
-
-```rust
-/// Why an action failed. The engine routes on this.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ErrorKind {
-    /// Transient: retry the SAME step on the SAME model (network, relay,
-    /// API rate limit, lock contention). `Action::Retry` is the consumer.
-    Transient,
-    /// Logic: the step's model got it wrong (wrong test assertion, missed
-    /// edge case, bad assumption). Route to repair (different model).
-    Logic,
-    /// Blocked: the environment won't allow progress (reservation held,
-    /// build slot busy, dependency missing). Route to escalate — a repair
-    /// cannot unblock a held reservation.
-    Blocked,
-    /// Escalate: an explicit call for human judgment, or a bound exhausted.
-    /// Route straight to the captain. Never auto-repair.
-    Escalate,
-}
-
-/// The ActionRunner return type. Replaces `anyhow::Result<Value>`.
-pub type ActionResult = Result<Value, ActionError>;
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ActionError {
-    pub kind: ErrorKind,
-    pub message: String,
-    /// Optional structured detail (which reservation, which relay, which test).
-    #[serde(default)]
-    pub detail: Option<Value>,
-}
-```
-
-Routing table (the engine, not the captain, decides):
-
-| `ErrorKind` | `on_error` default | Mechanism |
-| :--- | :--- | :--- |
-| `Transient` | retry (bounded backoff) | `Action::Retry` (same step, same model) |
-| `Logic` | repair (bounded, different model) | `StepOnError::Repair` (Spec 1) |
-| `Blocked` | escalate | kind-14 DM to captain naming the blocker |
-| `Escalate` | escalate | kind-14 DM to captain |
-
-`on_error` remains an override: `on_error: continue` swallows (and records) any
-kind; `on_error: fail_run` aborts on any kind; `on_error: repair` overrides the
-`Logic` route for a specific node. But the DEFAULT, absent `on_error`, is now
-routed by kind — not silently `continue` as today. This is the behavioral flip
-that makes the engine self-healing by default instead of abort-or-swallow.
-
-**Backward compatibility:** existing YAML with no `on_error` changes meaning
-from "continue on any failure" to "route by kind." That is a deliberate
-behavior change with a migration gate (Wave 1 verification): every existing
-built-in must carry an explicit `on_error` before the default flips, so no
-workflow changes behavior implicitly. Until that gate is green, the routed
-default is warn-first — a routed action logs its `ErrorKind` and the routing
-it *would* have taken, but falls back to today's `continue` behavior.
-
-**Lint rules:**
-- R-E1: an action returning `ErrorKind::Blocked` or `Escalate` must not be
-  wrapped in `Action::Retry` (a retry cannot unblock a held reservation).
-- R-E2: `on_error: repair` on a node whose action can only fail `Transient`
-  (e.g. a bare `call_webhook`) is a lint warning — repair is for `Logic`
-  failures; a transient-only action should use `retry`.
-- R-E3: the `ErrorKind` default routing is warn-first until the migration
-  gate (§8 Wave 1) is green; flipping to routed-by-default is a separate
-  bead, one line, tracked.
-
-#### 6.6.2 One sequencing engine (retire `phase_chain.rs`)
-
-Two engines sequence the same `Workflow` struct today:
-
-- `run_graph` (`control_flow.rs`) — the DAG scheduler: waves, `needs:`, `on_error`.
-- `run_ship_chain` (`phase_chain.rs`) — runs `ship`'s `call_workflow` links
-  through `engine.invoke` with its own `check_phase` gate between links.
-
-Consequence: phase contracts fire only on `ship`; a hand-authored graph with
-the same resolve→plan→implement→review→verify shape gets no contract
-enforcement. One `Workflow`, two semantics.
-
-**Retirement:** `run_ship_chain` and its `check_phase` gate collapse into the
-DAG scheduler. A phase completion contract becomes a node-level
-`on_error: repair { verify }`:
-
-| Phase contract (ADR-0022 §4.5) | Node-level encoding |
+| Path | Change |
 | :--- | :--- |
-| `resolve` — 4 fields present | `on_error: repair { verify: "<goal statement has target, non_goals, blast_radius, open_questions>" }` |
-| `plan` — beads + dep_cycles=0 | `on_error: repair { verify: "br dep cycles --json | count == 0" }` |
-| `implement` — commit cites bead | `on_error: repair { verify: "git log -1 --grep=<bead-id>" }` |
-| `review` — verdict in {AGREE, AWC, REJECT} | `on_error: repair { verify: "<verdict parsed>" }` |
-| `verify` — gate exit 0 | `on_error: repair { verify: "<the gate>" }` |
+| `crates/toron-workflow/src/schema.rs` | `Workflow::to_graph()` (compile-correct). `DispatchSpec.context`. `Action::Verify { command }`. `GraphNode.build_slot` only if lint needs it. Failure object fields documented on the Value shape, not a new `ActionRunner` type. |
+| `crates/toron-workflow/src/engine/control_flow.rs` | always `run_graph`; park RequestApproval/Delay/Spawn; graph `fail_run` uses `ok == false` (not mere `error` key); `Action::Verify` → VerifySink; **no** `Command` / `record_br_gate` / `br close`. |
+| `crates/toron-workflow/src/engine/sinks.rs` | `VerifySink` newtype (unique `TypeId`, same pattern as `ApprovalSink`). |
+| `crates/toron-workflow/src/engine/mod.rs` | register VerifySink; `Decision` unchanged (`outcome` + `note`). Optional `context` on approval `promise.data` is Wave 2. |
+| `crates/toron-workflow/src/lint.rs` | R-E1; desugar-or-reject `on_error: repair`; unnamed-step `step_N` documented. Repair lints do **not** live only in `playbook_lint.rs`. |
+| `flywheel/src/pane.rs` + `main.rs` `headless_dispatch` + `cron.rs` | Classify `{kind?}` on `{ok:false}`. Production runners are these three, **not** `crew.rs` / `smart_cron.rs` (test noops). 429 retry already lives *inside* `__run-headless` (`main.rs:23382+`) and does not currently surface `kind: rate_limit`. |
+| VerifySink impl | Reuse `__loop-run-verify` / `cmd_internal_loop_run_verify` (`main.rs:25238+`) under `mail slot acquire --slot cargo`. Write a **workflow** receipt, never `command-verified`. `headless.rs` is DispatchSpec helpers, not the VERIFY leaf. |
+| `DispatchSpec.context` | Add the field **and** honor it in the same commit: map `fresh` onto `__respawn` / new spawn pane (`pane.rs:755–771` splits if no live registry entry). A field that lands in `extra` unread is dead. |
+| `flywheel/src/crew.rs` / `builtin_workflows.rs` | optional: emit unrolled repair subgraph for verify nodes. No required YAML migration. |
+| Skills | Layer-3 `workflow-engine.md` only in Wave 1. No Layer-2 dump. No tool-count change. |
 
-The §4.5 completion contracts are preserved — they move from
-`phase_contracts.rs` (flywheel-side, one path) into the engine's `ErrorKind` +
-`repair.verify` (engine-side, all paths). `FLYWHEEL_SHIP_GATE_MODE` warn →
-block becomes the DAG-level escalation policy: on `Logic` exhaustion, warn
-(continue) or block (`fail_run`), matching today's flip.
+`governed-by: ADR-0024` on those Target files.
 
-#### 6.6.3 Phase as engine semantics + typed stage contracts
+**Wave 1 ship order (do not skip):**
 
-Two related gaps:
-
-1. **`Phase` is a string tag.** `DispatchSpec.phase` is `Option<String>`. The
-   engine cannot tell a plan node from a build node, so it cannot gate a
-   build on a plan artifact. This ADR does NOT re-open the closed vocabulary
-   (ADR-0022 §4) — the five values stay. It makes the ENGINE consume the tag:
-   `run_graph_node` reads `spec.phase` and applies the phase's default
-   `on_error` routing and (Wave 4) the plan-artifact warn gate
-   (`plan_artifact_missing` moves from `phase_chain.rs` into the engine).
-
-2. **Stages are prose.** A stage declares phase/role-affinity/principles but
-   no input/output contract. Nothing fails loudly if an agent skips the
-   claim→reserve→close sequence inside `systematic-execute`. This ADR defers
-   full typed stage contracts (inputs/outputs schemas) to a follow-up — it is
-   a larger schema change that touches ADR-0022 §3.8's stage registry. It
-   DOES make the stage's declared `phase` mechanical: the engine reads the
-   stage's `phase` and applies the same routing a `spec.phase` gets. The
-   stage stops being advice-only and becomes the node's failure contract.
-
-#### 6.6.4 Run lifecycle: cancel and per-action timeout
-
-Beyond checkpoint/resume, a runtime needs two missing primitives:
-
-- **Cancel (`flywheel workflow cancel <run-id>`).** Terminate a run that is
-  parked, hung, or wrong. A Resonate promise reject on the run's root
-  unblocks the durable function; the terminal event records
-  `status: "cancelled"`. Distinct from `pause` (checkpoint + resume) and
-  `fork` (branch, keep original).
-
-- **Per-action timeout.** `spawn` has `no_claim_timeout`, but no other action
-  does. A hung `call_webhook` or `dispatch_job` blocks the run forever. Add
-  `timeout_secs` to every `Action` (or a node-level default) with `on_timeout`
-  routing into the same `ErrorKind::Transient` → retry path (bounded), so a
-  hung action is retried a bounded number of times then escalated — never a
-  permanent park.
-
----
+1. Park-fix + `fail_run`=`ok==false` + `to_graph` (toron-workflow). SIGNOFF still linear until this is green.
+2. Drain `ApprovalSink` (flywheel, copy SpawnSink). SIGNOFF stops hanging.
+3. `{ok:false, kind?}` at pane / `headless_dispatch` / cron. Pane spawn gets bd-42fs 429→fallback then `kind: rate_limit`. `fail_run` does not abort retryable kinds. Unclassified default Continue.
+4. `Action::Verify` + `VerifySink` + `__loop-run-verify` reused, workflow receipt only.
+5. Recipe `repair-until-verified` (`--mode pane`; headless fails loud).
+6. Tests in §8 Wave 1. No `br gate report`. No new MCP tool. No new kind.
 
 ## 7. Implementation Blueprint
 
 ### 7.1 Waves
 
+Target files: **§6 Spec 6**. Do not use the 2026-08-25 path table in 7.2 as a landing list.
+
 | Wave | Ships | Gate |
 | :--- | :--- | :--- |
-| **1** (this ADR) | `Workflow::to_graph()` desugars `steps:` → chain graph. `run_workflow` always routes through `run_graph`. `ErrorKind` taxonomy + routed defaults (warn-first until the migration gate). Retire `phase_chain.rs` into the DAG (phase contracts → `on_error: repair`). `StepOnError::Repair` with bounded cycles, different-model repairer, verify gate. R-R1..R5 + R-E1..R-E3 lint rules. `flywheel workflow graph <name>` visualization. | All §8 Wave 1 tests green. No new MCP tool. No new kind. Backward compat: existing `steps:` YAML produces identical outputs. Every built-in carries explicit `on_error` before the routed default flips. |
-| **2** | Evidence-bearing approvals: structured context in the approval promise payload built from `step_outputs` + graph topology. `flywheel workflow approvals pending/approve/reject`. | Existing approval tests green with the new payload shape. Approval context includes at minimum: `nodes_completed`, `artifacts`, `blast_radius`. |
-| **3** | Bead-workflow integration: `br create --auto-workflow` generates YAML from VERIFY fence + PRINCIPLES + type. Loop dispatches beads as `engine.invoke` calls. `br close` triggers the terminal approval gate. `flywheel workflow run bead-<id>`. | One full bead → workflow → repair → verify → gate → close cycle green in e2e. Crash-resume works (kill -9 mid-run → restart → completes). |
-| **4** | Observability surface: `tree/status/connect/resume/fork/cancel`. Per-action `timeout_secs` routing into `ErrorKind::Transient` retry. Auto-parallelization lint from reservation data. | CLI commands green. Fork produces a valid, independently resumable run with `parent_run_id` set. `cancel` produces `status: "cancelled"`. Lint correctly identifies independent and conflicting nodes from reservation globs. |
+| **1** (this ADR) | Compile-correct `to_graph` + always `run_graph` + park RequestApproval/Delay/Spawn. `{ok:false, kind?}` classified at embedding (default Continue). `DispatchSpec.context`. `VerifySink` DI. Unrolled repair pattern (named nodes + ledger JSON + Spawn-await). Lint: desugar-or-reject `on_error: repair`. | §8 Wave 1. No new MCP tool. No new kind. No `br close` in engine. Named-step keys preserved. Approval still parks. |
+| **2** | Drain `ApprovalSink` (copy SpawnSink). Then richer promise `context` with artifact **paths** + `evidence_hash`. No new CLI nouns. | SIGNOFF/plan gates resolve. Payload has `nodes_completed`, `artifacts[].path`, `ledger_path`, `evidence_hash`. Reject is a decision. |
+| **3** | Loop may `engine.invoke` a composed graph for a ready bead. Terminal may write `command-verified`. Engine still does not close. | Coexistence with bare `br close` green. |
+| **later** | tree/connect/fork/cancel CLI, default-kind flip, `phase_chain` retirement, budgets, `keepContext`, hashline, LLM verifier. | Own ADRs. |
 
 ### 7.2 Affected paths
 
-| Path | Change |
-| :--- | :--- |
-| `crates/toron-workflow/src/schema.rs` | `Workflow::to_graph()`. `StepOnError::Repair` variant. `GraphNode` gains `build_slot`. `Decision` gains `context` field. Approval payload builder. |
-| `crates/toron-workflow/src/engine/control_flow.rs` | `run_workflow` always calls `run_graph`. Delete old `steps:` path. New `run_repair_cycle` function. Evidence bundle construction from `step_outputs`. |
-| `crates/toron-workflow/src/engine/mod.rs` | `ApprovalSink` payload shape. Spawn sink carries repair model override. |
-| `crates/toron-workflow/src/playbook_lint.rs` | R-R1..R5 repair lint rules. Auto-parallelization lint from reservation data. |
-| `crates/toron-workflow/src/guard.rs` | Guard evaluation for repair cycle decisions (no new functions, just wiring). |
-| `flywheel/src/builtin_workflows.rs` | All built-ins emit `graph:` shape instead of `steps:`. |
-| `flywheel/src/crew.rs` | Compose output uses `graph:` shape. `compose_workflow` accepts bead metadata as input. |
-| `flywheel/src/runs.rs` | Run board: tree view, connect stream (poll promise store), fork. |
-| `flywheel/src/main.rs` | CLI: `workflow graph/tree/status/connect/resume/fork/approvals/approve/reject`. |
-| `flywheel/src/durable.rs` | Loop dispatches beads via `engine.invoke` when `workflow_yaml` metadata present. Claim-watch listens for kind-46012 terminal events. |
-| `docs/decisions/0014-kind-registry-specification.md` | No new kinds (verify). |
-| `docs/decisions/README.md` | Row for ADR-0024. |
-| Skills: toron, flywheel, br | Drift map + token budget in §7.5. No new MCP tools, so tool-count stays 40 (38 parity + 2 additive); catalog stays the 38-parity subset. |
+See **§6 Spec 6**. The 2026-08-25 table (engine `run_repair_cycle`, `br create --auto-workflow`, eleven CLI nouns) is not the landing list.
 
 ### 7.3 Patterns to follow
 
-- `run_graph` and `run_graph_node` are the existing DAG primitives. Repair cycles are `ctx.run(run_graph_node, ...)` children spawned from the failed node — same concurrency model, same deterministic replay guarantee.
-- The approval evidence bundle is built from `step_outputs` already accumulated in the run — no new data collection, just richer serialization of existing state.
-- Bead → workflow bridge reuses `compose_workflow` (ADR-0022 §3.6) with the bead as the input spec — one compose path for catalog, cron, and beads.
-- `flywheel workflow connect` polls the Resonate promise store (or subscribes to kind-9 events in the run's channel) for state changes.
-- Fork reuses `ctx.run(run_workflow, ...)` with a cloned `RunInput` up to the fork point — the same durable function, a new run_id.
+- `run_graph` / `run_graph_node` / `Action::Spawn { await_: true }` / `SpawnSink` / `ApprovalSink` TypeId newtype. `VerifySink` copies that newtype pattern.
+- Unrolled named nodes (`repair-N`, `evaluate-N`, `verify-N`), Atomic `iteration-N` / `evaluate-N`.
+- Ledger JSON on disk; next prompt gets a **path**.
+- Reservation inherit-or-interrupt, one writer.
+- `compose_workflow` as the vehicle for a ready bead (ADR-0022 §3.6). Close stays `br`.
 
 ### 7.4 Patterns to avoid
 
-- **New MCP tools.** All new surface is CLI (`flywheel workflow *`). The frozen 40 tools are untouched.
-- **New Nostr kinds.** Repair cycles use existing kinds: 9 for status posts in the run channel, 46011 for approval pending, 46012 for terminal. No new kind numbers.
-- **Worktrees for repair.** The repairer runs in the same project tree, under the same file reservations, on the same branch. The repairer holds the bead's reservation (extended TTL during repair).
-- **Auto-accepting repair without verify.** A repair cycle that doesn't re-run VERIFY is not a repair — it's a retry (which `Action::Retry` already handles). The engine always runs VERIFY after the repairer returns.
-- **Silent repair exhaustion.** After `max_cycles`, the captain is notified via kind-14 DM with the full repair log: which cycles ran, what errors they hit, what the repairer attempted.
-- **Repair-on-repair recursion.** R-R3 lint rule prevents it. One level of repair. If the repairer's fix fails verification `max_cycles` times, escalate.
+- Engine `std::process::Command`, engine `br gate` / `br close`.
+- `StepOnError::Repair` as a hidden loop inside `run_graph_node`.
+- `ErrorKind::Logic` (work-quality is a pattern).
+- Auto-injecting VERIFY stdout into the next prompt.
+- Two reservation holders during repair.
+- `RepairCycle` VerdictKind; repair-cycle-succeeded as a legal-close row.
+- Worktrees. New MCP tools. New kinds. New toron plane nouns. New `br` flags in this record.
+- Progress scores as a stop decision (Atomic forbids this by construction).
 
 ### 7.5 Skill & Documentation Drift (token-friendly plan)
 
-ADR-0024 changes **surface** (new `flywheel workflow *` CLI, `br create
---auto-workflow`) and **semantics** (graph-first, `on_error: repair`, error
-taxonomy, evidence-bearing approvals, typed stage contracts). Per the Skill Sync
-Contract (AGENTS.md), every one of these must land in the skill files — but the
-whole point is that the drift is *small and additive*, and it lands in the
-right layer so it does not bloat the always-loaded bodies.
+Wave 1 skill drift is Layer 3 only (`toron/references/workflow-engine.md`:
+graph-canonical, `DispatchSpec.context`, VerifySink, unrolled repair-until-verified
+shape, runtime `kind` on `{ok:false}`). No Layer-2 command-token dump (no new
+CLI nouns in Wave 1). No `br` skill change. Tool-count stays 40. The 2026-08-25
+map below that still mentions `on_error: repair` / eleven CLI verbs / `--auto-workflow`
+is **not** Wave 1; ignore it until a later ADR.
 
 #### 7.5.1 Skill Sync Contract applied
 
@@ -999,47 +574,46 @@ harnesses that read `triggers:`.
 
 ### Wave 1
 
-- [ ] `Workflow::to_graph()` desugars a 3-step linear workflow into a 3-node chain graph with correct `needs:` edges: step_0→step_1→step_2.
-- [ ] `run_workflow` always calls `run_graph`. The old `steps:` path in `run_workflow` is deleted (not just dead code — removed).
-- [ ] Existing `steps:` YAML (`triage.yaml`, `goal.yaml`, all built-ins) produces identical `step_outputs` as before the change. Backward compat gate: a serialized run's output byte-matches the pre-change output for the same input.
-- [ ] `on_error: repair` with `max_cycles: 2` and a flaky verify command (fails first attempt, succeeds second) completes on the second repair cycle. The run terminal shows `status: "succeeded"` and the node output is the repairer's result.
-- [ ] `on_error: repair` on a genuinely broken step (verify always fails) exhausts cycles after `max_cycles` attempts, sends a kind-14 DM to the captain with the full repair log, and the node output is `{ok: false, error: "repair exhausted after N cycles"}`.
-- [ ] The repairer agent dispatch spec carries `repair_model` when set. Test verifies the headless spawn args include the model override.
-- [ ] Each repair cycle produces a `br gate report` row (`repair-cycle-succeeded` or `repair-cycle-failed`) and a kind-9 post in the run channel.
-- [ ] R-R1..R5 lint rules fire on invalid repair configs.
-- [ ] R-E1..R-E3 lint rules fire on invalid ErrorKind routing (retry-on-blocked, repair-on-transient-only).
-- [ ] `ErrorKind` routing: `Transient`→retry, `Logic`→repair, `Blocked`→escalate, `Escalate`→escalate (unit test with a fake ActionRunner returning each kind).
-- [ ] One sequencing engine: `phase_chain.rs` `run_ship_chain` is deleted; `ship` runs through `run_graph` and produces the same §4.5 contract outcomes as the old chain runner (gate test).
-- [ ] Every built-in carries an explicit `on_error` before the routed default flips (migration gate). A built-in with no `on_error` triggers a lint warning until the flip.
-- [ ] `flywheel workflow graph ship` renders the 5-node ship DAG with correct phases, wave groupings, and edge lines.
+- [ ] `to_graph()` desugars a 3-step linear workflow into a 3-node chain with `needs:` step_0→step_1→step_2. The function compiles (`GraphNode` fields only, or `build_slot` added in the same cut).
+- [ ] `run_workflow` always calls `run_graph`. Linear `run_steps` path deleted after the park gate is green.
+- [ ] A `steps:` YAML with `request_approval` **parks** (Resonate `Suspended`) when run through `run_graph`. Witness: existing triage / wave-swarm SIGNOFF shape. Without this, do not delete the linear path.
+- [ ] Named `step_outputs` keys preserved. Unnamed keys may appear as `step_N` and are documented. No byte-identical requirement.
+- [ ] Fake ActionRunner returning `{ok:false, kind:"blocked"}` does not enter the repair subgraph. Lint R-E1 fires on retry-on-blocked.
+- [ ] Unrolled 2-cycle graph: `repair-1`/`evaluate-1`/`verify-1` then `repair-2`/… VerifySink fails cycle 1, passes cycle 2. Run succeeded. Ledger JSON has two entries. **No `br` invoked. No `Command` in `toron-workflow`.** `DispatchSpec.context` is `fresh` on those nodes.
+- [ ] Cycle 2 task prompt contains the ledger **path**, not the cycle-1 stdout blob.
+- [ ] Exhaustion after N: kind-14 (or test sink) names the ledger path; terminal has `remaining_work`; no pass-shaped gate row.
+- [ ] Evaluator result missing `done` / `remaining_work` fails loud (not a silent continue).
+- [ ] `done: true` with VerifySink exit ≠ 0 is illegal (run does not succeed).
+- [ ] `on_error: repair` YAML is rejected at parse or lint (no hidden engine loop; recipe token is the authoring path).
+- [ ] Graph `fail_run` uses `ok == false`, same as linear. A node Value that contains `"error"` but `ok: true` does **not** fail the run.
+- [ ] `action: verify` with no VerifySink returns `{ok:false, error:"verify sink missing"}`. With a sink, exit 0 → `{ok:true, stdout_path}`; never hits `std::process::Command` in `toron-workflow`.
+- [ ] `action: call_webhook` is not a verify alias.
+- [ ] Headless `workflow run --execute` of a graph containing `action: spawn` **fails loud** naming `--mode pane`. Does not record `{action:"spawn"}` and continue.
+- [ ] Pane-mode 2-cycle repair recipe: cycle 1 VerifySink fail, cycle 2 pass; no `br gate report`; no `command-verified` file from the workflow runner.
+- [ ] Spawn on `repair-1` returns `{ok:false, kind:"rate_limit", retryable:true}`: **same node** is retried (Retry / Spec 1 bound). `repair-2` is **not** created. Ledger has no new `remaining_work` row for the 429.
+- [ ] Same spawn still 429 after the retry bound: run escalates (kind-14); status blocked/failed; **no** further unroll.
+- [ ] VerifySink `{ok:false}` with **no** `kind` (exit ≠ 0): **does** unroll `repair-2`. That is work-quality.
+- [ ] `on_error: fail_run` on a spawn that returns `kind: rate_limit` does **not** abort the graph on the first 429.
 - [ ] `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --check` on touched crates.
-- [ ] `#[tool(name` count == 40 (38 parity + 2 additive). No new kinds in `kinds.rs` beyond the existing registry.
-- [ ] `governed-by: ADR-0024` markers on all Target files listed in §7.2.
+- [ ] `#[tool(name` count == 40. No new kinds in `kinds.rs`.
+- [ ] `governed-by: ADR-0024` on §6 Spec 6 Target files.
 
 ### Wave 2
 
-- [ ] `request_approval` promise payload includes `run_id`, `suspended_at` (node + wave), `question`, `context.nodes_completed`, `context.nodes_failed`, `context.artifacts`, `context.repair_cycles` (if any), `context.blast_radius`, `context.timeout`.
-- [ ] `flywheel workflow approvals pending` lists a suspended run with all context fields visible.
-- [ ] `flywheel workflow approve <run-id> --note "looks good"` resolves the promise with `{ outcome: "approved", note: "looks good" }`. The run resumes and the terminal event shows `status: "succeeded"`.
-- [ ] `flywheel workflow reject <run-id> --note "verify didn't pass"` resolves with `{ outcome: "rejected", note: "verify didn't pass" }`. The run terminal shows `status: "rejected"`.
+- [ ] `request_approval` promise data includes `question`, `context.nodes_completed`, `context.artifacts[].path`, `context.ledger_path`, `evidence_hash`.
+- [ ] Resume that re-hits approval with a different `evidence_hash` is a new question, not a cached yes.
+- [ ] Reject → `status: "rejected"` (decision, not crash). Approve resumes.
 
 ### Wave 3
 
-- [ ] `br create --auto-workflow "Fix reservation conflict check" -p 1 -t bug` produces a bead whose metadata includes a valid `workflow_yaml` with implement→verify(repair)→gate nodes. The VERIFY command is extracted from the `## VERIFY` fence. The PRINCIPLES names are validated against the 21-name registry.
-- [ ] The loop detects the ready bead, composes the workflow from metadata, and dispatches via `engine.invoke("bead-bd-xxx", workflow, inputs)`.
-- [ ] The full lifecycle completes: implement → verify (with repair if needed) → gate (captain approves) → kind-46012 terminal → `br gate report workflow-verified` → `br close`.
-- [ ] The loop's claim-watch releases on the kind-46012 terminal event (not on the `br close` status change).
-- [ ] `flywheel workflow run bead-bd-xxx` after a kill -9 resumes from the last Resonate checkpoint and completes (crash-resume equivalence gate).
-- [ ] A bead without `--auto-workflow` still closes via the old `br gate report` path (coexistence gate).
+- [ ] A workflow VerifySink / repair ledger **cannot** write `command-verified` (the worker `write_receipt` helper already refuses it; keep that).
+- [ ] After a repaired workflow run, `loop_run_verify` still records CommandVerified (loop-armed). Cheap-band close still requires that row.
+- [ ] `legal_close` still has no `RepairCycle` kind (exhaustive match still compiles).
+- [ ] Bare `br close` + loop VERIFY path still works. Loop `--work` is not replaced by `engine.invoke` per bead.
 
-### Wave 4
+### Later (not this ADR's acceptance)
 
-- [ ] `flywheel workflow tree <run-id>` renders a graph with correct node states (✓ ✗ ◌ · ⏸ ↻), phases, assignees, and durations.
-- [ ] `flywheel workflow connect <run-id> --timeout-ms 5000` streams events (`NodeStarted`, `NodeCompleted`, `NodeFailed`, `RepairCycleStarted`, `ApprovalSuspended`) as JSON lines until timeout.
-- [ ] `flywheel workflow fork <run-id> --at plan --kill-original` creates a new run with `parent_run_id` set to the original run_id. The new run completes independently with a different tail. The original run's terminal shows `status: "killed"`.
-- [ ] `flywheel workflow cancel <run-id>` produces a `status: "cancelled"` terminal event and unblocks the parked durable function.
-- [ ] Per-action `timeout_secs`: a hung `call_webhook` is retried (bounded) then escalated; never a permanent park.
-- [ ] `flywheel workflow lint` correctly identifies independent nodes (disjoint reservation globs) and conflicting nodes (overlapping reservation globs).
+tree/connect/fork/cancel CLI, default-kind flip, `phase_chain` deletion, auto-parallel lint, `--auto-workflow`.
 
 ---
 
@@ -1047,19 +621,18 @@ harnesses that read `triggers:`.
 
 ### Good
 
-- **The graph is the product.** Captains compose DAGs, crews execute them, the loop inspects them. The DAG scheduler graduates from hidden engine detail to the primary mental model. Every workflow — built-in, composed, cron, bead — is a graph you can see (`workflow graph`), watch (`workflow connect`), and fork (`workflow fork`).
-- **Failure self-heals.** A flaky test, a missed edge case, a wrong assumption — the repairer (different model, fresh eyes) fixes it and re-verifies. The captain only sees the ones that genuinely need a human (repair exhausted after `max_cycles`). Production incident count should drop: bd-8xca (compose failure) and bd-cvv9 (chain-gate false positive) would have self-healed in cycle 1 or 2.
-- **Failures are typed and self-routing.** The engine decides retry vs repair vs escalate from the `ErrorKind`, not the captain after the fact. Transient failures retry, logic failures repair on a different model, blocked failures escalate. The binary abort-or-swallow behavior is gone.
-- **Approvals carry context.** The operator decides on evidence: which nodes passed, which artifacts exist, whether verify ran and passed, what the blast radius is. No more blind "ok?" decisions. This is `prove-it-works` applied to the human-in-the-loop.
-- **Beads and runs are one thing.** No parallel timelines. No dual closing ceremonies. The loop dispatches a bead as a workflow run. The workflow terminal closes the bead. One lifecycle, one audit trail.
-- **Live runs are observable.** The captain can see the tree, stream events, resume after a crash, and fork at any checkpoint to try an alternative path. The run is no longer a black box between dispatch and terminal.
+- **The graph is canonical and park-safe.** Captains still write `steps:`; the engine always sequences a DAG; `request_approval` still suspends.
+- **Runtime failure is typed** without a flag-day ActionRunner rename. Rate limits retry; HARD reservation blocks escalate; cancel does not "repair."
+- **Work-quality repair is visible.** `repair-1` / `evaluate-1` / `verify-1` show up as nodes. The ledger path is the evidence. Fresh context is the independence. VERIFY still runs in the embedding under the build slot.
+- **Approvals carry paths.** The operator decides on artifacts, not "ok?"
+- **Close legality stays in `br`.** A successful graph can prove a gate row. It cannot close.
 
 ### Bad
 
-- **The `steps:` → `graph:` desugar is a semantic shift.** Nodes that were implicitly sequential become explicitly dependent. Independent nodes could now run concurrently within a wave — a behavior change for workflows where step order was assumed but not declared. Mitigation: the desugar preserves exact sequential order for unnamed steps (chain graph, one node per wave). Named steps with no data dependency and no explicit `needs:` get a lint warning (Wave 4 auto-parallelization lint) but do NOT auto-parallelize without captain confirmation.
-- **Repair cycles consume agent time and model tokens.** Each cycle dispatches a repairer agent + runs verify. The `max_cycles` bound (1..10, YAML) and the env cap (`FLYWHEEL_REPAIR_MAX_CYCLES`, default 10) prevent unbounded spend. A workflow with `max_cycles: 5` that genuinely cannot be fixed will consume 5 repair dispatches before escalating — that's the cost of self-healing.
-- **Bead-workflow integration is a bridge between two systems.** `br` SQLite (local, file-based, git-synced) and Resonate (durable promise store, in-process or remote). Drift between them is a risk — e.g., a bead closed in SQLite but the Resonate run still suspended. Mitigation: the bridge is one code path (`compose_workflow` from bead metadata → `engine.invoke`), tested end-to-end. The loop's claim-watch listens for kind-46012 terminals, not SQLite status changes. A bead whose workflow run died silently (Resonate store lost) is detected by the loop's periodic `br gate report` check on non-workflow-owned beads.
-- **The `on_error` default flip is a behavior change.** Absent `on_error`, a node that today fails silently (continue) will retry/repair/escalate under routing. Mitigation: the migration gate — every built-in carries explicit `on_error` before the default flips, and the routed default is warn-first (logs what it *would* route) until then.
+- **Unrolled repair makes graphs larger.** A 3-cycle repair is 9 nodes, not one node with a hidden loop. That is the point (inspectable) and the cost (verbose YAML). Compose/builtin must generate it; humans should not hand-write `repair-7`.
+- **Fresh-context sessions cost tokens.** Bounded by `max_iterations` (1..10) and `FLYWHEEL_REPAIR_MAX_CYCLES` (default 10).
+- **`context: fresh` plus same-tree edits needs reservation inherit-or-interrupt.** Getting this wrong is two writers (ADR-0011). Spec 2.7 is load-bearing.
+- **Default `on_error` does not flip in Wave 1.** Self-healing is opt-in via the unrolled subgraph (or lint-desugar). Overnight "everything repairs" is not this cut.
 
 ### Neutral
 
@@ -1075,7 +648,7 @@ harnesses that read `triggers:`.
 | Graph desugar breaks a workflow that relied on undocumented step ordering | Low | The chain graph preserves exact sequential order. Named steps with no `needs:` get a lint warning. No auto-parallelization without captain confirmation. |
 | Bead-workflow bridge diverges from bare `br close` path | Medium | The bridge is one code path. Both paths produce `br gate report` rows. The workflow path additionally emits kind-46012. The loop consumes both. Coexistence is tested (Wave 3 verification). |
 | Fork breaks Resonate replay determinism | Low | Fork copies the serialized `RunInput` up to the fork point. A new run starts from that state with a new `run_id`. The original run's replay is unaffected. Deterministic replay is per-run, not cross-run. |
-| `on_error: repair` on every node becomes the default, masking systemic failures | Medium | Lint rule R-R5 warns when repair_model is the same family as the failing model. The env cap `FLYWHEEL_REPAIR_MAX_CYCLES` is a global brake. The captain sees `RepairExhausted` escalations — if they're frequent, something is systemically wrong. |
+| Recipe `repair-until-verified` on every verify node, masking systemic failures | Medium | Cap is recipe `max_iterations` (1..10). Exhaustion is kind-14 + `remaining_work`. Frequent exhaustions are a captain signal, not a quieter default. |
 
 ---
 
@@ -1083,19 +656,19 @@ harnesses that read `triggers:`.
 
 ### Intention
 
-A year from now a captain types `flywheel workflow graph ship-toron`, sees the DAG with ✓ ✓ ✓ ✓ ⏸, sees the repair cycles that ran overnight (verify took 2 attempts, review passed first try), reads the evidence bundle, and types `flywheel workflow approve ship-toron-042`. The bead closes. The captain never reads a "done" self-report. The captain never manually re-dispatches a failed build. The graph is the product.
+A year from now a captain opens the run, sees `repair-1 ✗` / `repair-2 ✓` / `verify-2 ✓`, reads `.flywheel/receipts/…/progress-ledger.json` (`remaining_work` empty, VERIFY exit 0), and approves. `br close` still happens through the legal-close table, with a `command-verified` row the loop wrote. Nobody pasted a 50KB log into a prompt. Nobody called `br close` from `control_flow.rs`.
 
 ### Principles cited in this ADR
 
 | Principle | Where it applies |
 | :--- | :--- |
 | `prove-it-works` | Repair cycles re-run VERIFY. Approvals carry evidence. The graph shows node states, not agent claims. |
-| `sequence-verifiable-units` | Each graph node is a verifiable unit. Each repair cycle is a tracked gate row. The graph topology makes dependencies explicit. |
+| `sequence-verifiable-units` | Each named cycle (`repair-N` / `evaluate-N` / `verify-N`) is a unit. Evidence is a receipt **path** + ledger JSON, not a `br gate` row. |
 | `fix-root-causes` | Repair fixes the root cause, not the symptom. Retry-of-same is `Action::Retry` (transient failures only). |
-| `encode-lessons-in-structure` | The graph IS the structure. `on_error: repair` is a type, not a prose instruction. The DAG is lint-checked. |
-| `never-block-on-the-human` | Auto-repair up to `max_cycles`. Only escalate on exhaustion. |
-| `build-the-lever` | `flywheel workflow tree/connect/fork` is the lever — the tool that proves the run state. |
-| `type-system-discipline` | `StepOnError` is exhaustive. `Phase` is a closed enum. `DispatchSpec` is typed. |
+| `encode-lessons-in-structure` | The unrolled recipe is the structure. `on_error: repair` as an engine loop is rejected. Compose `retry(n):` stays same-step retry. |
+| `never-block-on-the-human` | Recipe `max_iterations` then kind-14. Judgment nodes escalate, they do not auto-repair. |
+| `build-the-lever` | The lever in Wave 1 is VerifySink + ledger path + `loop_run_verify`. `workflow tree/connect/fork` is a later CLI ADR. |
+| `type-system-discipline` | `StepOnError` stays `Continue \| FailRun`. `Action::Verify` is a new action, not a sixth phase. `Phase` stays five values. |
 | `laziness-protocol` | The DAG scheduler already exists. This ADR extends it — no new engine, no new kinds, no new MCP tools. Delete the old `steps:` path after migration. |
 | `migrate-callers-then-delete-legacy-apis` | `run_workflow`'s old `steps:` path is deleted in Wave 1 after backward-compat tests pass. |
 
@@ -1103,9 +676,9 @@ A year from now a captain types `flywheel workflow graph ship-toron`, sees the D
 
 - `docs/notes/2026-08-25-atomic-analysis.md` — Buffy's full-stack comparison of Atomic vs our stack (what to adopt, what to keep)
 - ADR-0005 Spec 4b — the existing DAG scheduler (`run_graph`) this ADR promotes to canonical
-- ADR-0019 Spec 1 — VERIFY fence, `br gate`, legal-close table (repair cycles extend this)
+- ADR-0019 Spec 1 — VERIFY fence, `br gate`, legal-close table. Repair does **not** add a VerdictKind.
 - ADR-0022 §3.1 — `Phase` enum (graph nodes carry phase)
-- ADR-0022 §3.4 — one durable execution rail (`engine.invoke` for compose + steer — beads join this rail)
+- ADR-0022 §3.4 — one durable execution rail (`engine.invoke` for compose + steer). Beads stay on `--work`; they do not join this rail as runs.
 - ADR-0023 — NIP-29 39000/39002 (channel create/close; run channels use these for status posts)
 - bastani-inc/atomic — `loop-until-done` (bounded repair inspiration), `fan-out-and-synthesize` (parallel fan-out with evidence), `/workflow connect` (live run streaming)
 
@@ -1114,21 +687,20 @@ A year from now a captain types `flywheel workflow graph ship-toron`, sees the D
 - **Verbatim compaction** (Atomic's context management): the repairer's context window is bounded by `CONTEXT_LIMIT`. Smarter compaction — deleting low-value transcript lines without rewriting surviving text — is a general improvement, not repair-specific. Deferred to a separate ADR.
 - **Permission gate hooks** (Atomic's tool-call interception, blocking dangerous shell commands before execution): our reservation system + pre-commit guards already prevent most dangerous writes. Runtime command interception is defense-in-depth. Deferred.
 - **Hashline-style content verification** (Atomic's hashline edits anchored to file hashes): file reservations already prevent concurrent writes. Hash verification on commit would catch a repairer who violated the reservation. Deferred for defense-in-depth.
-- **Event-driven loop promotion** (ADR-0019 wave 4): when the loop is event-driven (herdr reactor primary, no poll), kind-46012 terminal events become the native wake signal for claim-watch release. The bead-workflow bridge in this ADR is designed to consume those events whether the loop polls or subscribes.
+- **Event-driven loop promotion** (ADR-0019 wave 4): when the loop is event-driven (herdr reactor primary, no poll), kind-46012 is a *run* wake, not a bead close. `--work` still closes through `br` + loop VERIFY.
+- **Headless spawn-await:** so default `workflow run` can run `repair-until-verified` without `--mode pane`.
 
 ---
 
-## 11. Appendix: Real Scenarios — Before and After
+## 11. Appendix: Governing scenarios
 
-This appendix takes five concrete workflows and stages from the current codebase
-(`flywheel/src/builtin_workflows.rs`, `flywheel/src/phase_chain.rs`,
-`flywheel/src/stages.rs`) and shows exactly what changes under ADR-0024.
+These replace the 2026-08-25 before/after YAML. They match §6. `--execute --mode pane` unless noted.
 
----
+### A — `goal`: do not abort the ship on a red test
 
-### Scenario A: `goal` — the meta-workflow for overnight autonomous work
+**Today:** `on_error: fail_run` on build. Flaky `cargo test` kills the run. Captain re-dispatches.
 
-**Today** (`goal` built-in, builtin_workflows.rs:330):
+**Wave 1:** after `build`, compose recipe `repair-until-verified` (unrolled nodes). Review is judgment: no repair. Gate is `request_approval` with paths (parks only after Spec 0). SIGNOFF still needs ApprovalSink drain.
 
 ```yaml
 name: goal
@@ -1139,171 +711,38 @@ steps:
   - name: plan
     action: call_workflow
     workflow: phase-plan
-  - name: track
-    action: call_workflow
-    workflow: beads
   - name: build
     action: dispatch_job
-    assignee: x
-    spec: { profile: "@coder", stage: "systematic-execute", plan: "{{steps.track}}" }
+    spec: { profile: "@coder", phase: implement, stage: systematic-execute }
     on_error: fail_run
+  - name: repair
+    action: call_workflow
+    workflow: repair-until-verified
+    inputs:
+      bead_id: "{{inputs.bead_id}}"
+      verify: "cargo test --workspace"
+      max_iterations: 3
+      repair_model: "{{inputs.repair_model}}"
+    # Inner spawn is Retry-wrapped (Spec 2). Outer fail_run is only if the
+    # recipe exhausts work-quality cycles or retryable-kind bounds.
   - name: review
     action: dispatch_job
-    assignee: x
-    spec: { profile: "@reviewer", harness: "opencode", stage: "code-review", plan: "{{steps.build}}" }
+    spec: { profile: "@reviewer", phase: review, stage: code-review }
     on_error: fail_run
-  - name: ship
-    action: dispatch_job
-    assignee: x
-    spec: { profile: "@housekeeper", stage: "commit-and-push", plan: "{{steps.build}}" }
-    on_error: fail_run
+  - name: gate
+    action: request_approval
+    message: "Goal complete. Ledger {{steps.repair.ledger_path}}. Approve ship?"
 ```
 
-**What's wrong:** Six sequential steps. Every failure aborts the run (`fail_run`).
-Review and build are sequential — they can't run concurrently. If the build
-step's `cargo test` fails (flaky test, wrong assumption), the entire `goal`
-run aborts. The captain wakes up to a red terminal and manually re-dispatches.
-The `ship` step commits and pushes without any gate — no "did review pass?"
-check, no approval.
+`--mode pane`. Headless of this graph fails loud on `spawn` inside the recipe.
 
-**After ADR-0024:**
+After a worker `br close` on a cited bead, **loop** `loop_run_verify` still writes `command-verified`. The recipe never `br gate report`.
 
-```yaml
-name: goal
-graph:
-  nodes:
-    ideate:
-      action: call_workflow
-      workflow: brainstorm
+### B — `bug-fix`: repro stays fail_run; the fix loop unrolls
 
-    plan:
-      action: call_workflow
-      workflow: phase-plan
-      needs: [ideate]
+**Today:** graph already; every node `fail_run`. Prove REJECT aborts.
 
-    track:
-      action: call_workflow
-      workflow: beads
-      needs: [plan]
-
-    build:
-      action: dispatch_job
-      assignee: "@crew.coder"
-      spec:
-        profile: "@coder"
-        phase: implement
-        stage: systematic-execute
-        plan: "{{nodes.track}}"
-      needs: [track]
-      on_error:
-        repair:
-          max_cycles: 3
-          verify: "cargo test --workspace"
-
-    review:
-      action: dispatch_job
-      assignee: "@crew.reviewer"
-      spec:
-        profile: "@reviewer"
-        harness: opencode
-        phase: review
-        stage: code-review
-        plan: "{{nodes.build}}"
-      needs: [build]
-      on_error:
-        repair:
-          max_cycles: 2
-          # Review repair: reviewer addresses findings, re-submits verdict
-
-    gate:
-      action: request_approval
-      message: "Goal complete. Approve ship?"
-      needs: [review]
-      on_error: fail_run
-
-    ship:
-      action: dispatch_job
-      assignee: "@crew.housekeeper"
-      spec:
-        profile: "@housekeeper"
-        phase: verify
-        stage: commit-and-push
-        plan: "{{nodes.build}}"
-      needs: [gate]
-      on_error: fail_run
-```
-
-**What changed:**
-
-1. **`steps:` → `graph:`.** The six steps are now explicit DAG nodes with
-   `needs:` edges. Identical sequential execution for this chain.
-
-2. **Repair on build.** If the coder's `cargo test` fails, instead of aborting
-   the entire run, the engine spawns a repairer (different model, fresh
-   context), re-runs `cargo test --workspace`, and repeats up to 3 times.
-   Only on exhaustion does it escalate to the captain.
-
-3. **Repair on review.** If the reviewer returns REJECT instead of AGREE,
-   the repairer re-reviews with fresh eyes (cycle 2) rather than aborting.
-   Two cycles, then escalate.
-
-4. **Gate before ship.** A `request_approval` node with evidence sits between
-   review and ship. The captain sees: ideate ✓, plan ✓, track ✓, build ✓
-   (0 repair cycles), review ✓ (AGREE from BlueLake, 3 findings). The captain
-   approves — or rejects and the run records it.
-
-5. **Concurrent review+verify (optional).** If we add a `verify` node (loop
-   runs VERIFY headless) with `needs: [build]`, it runs concurrently with
-   `review` in the same wave — genuine parallelism. The gate node waits for
-   both (`needs: [review, verify]`).
-
-**Captain experience:**
-
-```bash
-# Morning check
-$ flywheel workflow tree goal-2026-08-26-001
-
-goal (6 nodes, 4 waves)  elapsed: 3h12m
-│
-├─ Wave 1 ──────────────────────────────────────────
-│  ✓ ideate           phase=resolve  @scout     12s
-│
-├─ Wave 2 ──────────────────────────────────────────
-│  ✓ plan              phase=plan     @planner   8m
-│
-├─ Wave 3 ──────────────────────────────────────────
-│  ✓ track             phase=plan     @planner   14s
-│
-├─ Wave 4 ──────────────────────────────────────────
-│  ✓ build             phase=impl     @coder     2h41m
-│    ↻ repair cycle 1  (cargo test flake)        4m
-│  ✓ review            phase=review   @reviewer  5m
-│    verdict: AGREE (BlueLake, 3 findings)
-│
-├─ Wave 5 ──────────────────────────────────────────
-│  ⏸ gate              approval       captain    8h2m
-│
-└─ Wave 6 ──────────────────────────────────────────
-   · ship              phase=verify    @housekeep
-
-$ flywheel workflow approvals pending
-run_id                        workflow  node  question
----------------------------   --------  ----  --------
-goal-2026-08-26-001           goal      gate  Goal complete. Approve ship?
-  context: build ✓ (1 repair cycle), review ✓ (AGREE)
-  artifacts: commit abc1234, verdict BlueLake/AGREE
-
-$ flywheel workflow approve goal-2026-08-26-001 --note "ship it"
-run goal-2026-08-26-001: approved. resuming...
-  ship ✓ (committed, pushed abc1234)
-  terminal: status=succeeded
-```
-
----
-
-### Scenario B: `bug-fix` — repro → tdd → fix → prove, with repair
-
-**Today** (`bug-fix` built-in, builtin_workflows.rs:665):
+**Wave 1:** `repro` stays `fail_run` (no repair without a repro). `tdd`/`fix` go through `repair-until-verified` with the bead VERIFY command. `prove` is ReviewerSigned territory: one `dispatch_job` `@reviewer`, `fail_run`, no inner repair.
 
 ```yaml
 name: bug-fix
@@ -1311,571 +750,564 @@ graph:
   nodes:
     repro:
       action: dispatch_job
-      assignee: x
-      spec: { profile: "@scout", task: "Run or write the repro..." }
-      on_error: fail_run
-    tdd:
-      action: dispatch_job
-      assignee: x
-      spec: { profile: "@coder", task: "Write the FAILING test first..." }
-      needs: [repro]
+      spec: { profile: "@scout", phase: resolve, task: "Write the repro." }
       on_error: fail_run
     fix:
-      action: dispatch_job
-      assignee: x
-      spec: { profile: "@coder", task: "Apply the MINIMAL fix..." }
-      needs: [tdd]
-      on_error: fail_run
-    prove:
-      action: dispatch_job
-      assignee: x
-      spec: { profile: "@reviewer", harness: "opencode", task: "Independently prove..." }
-      needs: [fix]
-      on_error: fail_run
-```
-
-**What's wrong:** `bug-fix` already uses `graph:` — one of only three built-ins
-that do (alongside `brainstorm` and `debate`). Every node is `fail_run`. The
-`prove` node's reviewer runs on opencode (different harness) which is good, but
-if prove finds the fix didn't actually work, the entire run aborts. The captain
-must manually re-dispatch from tdd or fix.
-
-**After ADR-0024:**
-
-```yaml
-name: bug-fix
-graph:
-  nodes:
-    repro:
-      action: dispatch_job
-      assignee: "@crew.scout"
-      spec:
-        profile: "@scout"
-        phase: resolve
-        task: "Run or write the repro for: {{inputs.symptom}}..."
-      on_error: fail_run               # can't repair without a repro
-
-    tdd:
-      action: dispatch_job
-      assignee: "@crew.coder"
-      spec:
-        profile: "@coder"
-        phase: verify
-        task: "Write the FAILING test first (RED)..."
+      action: call_workflow
+      workflow: repair-until-verified
       needs: [repro]
-      on_error:
-        repair:
-          max_cycles: 2
-          verify: "cargo test {{inputs.test_filter}} -- --test-threads=1"
-
-    fix:
-      action: dispatch_job
-      assignee: "@crew.coder"
-      spec:
-        profile: "@coder"
-        phase: implement
-        task: "Apply the MINIMAL fix against the failing test..."
-      needs: [tdd]
-      on_error:
-        repair:
-          max_cycles: 3
-          repair_model: "claude-opus-4"   # different model for genuine fix
-          verify: "cargo test {{inputs.test_filter}} && {{inputs.repro}}"
-
+      inputs:
+        verify: "cargo test {{inputs.test_filter}}"
+        max_iterations: 3
     prove:
       action: dispatch_job
-      assignee: "@crew.reviewer"
-      spec:
-        profile: "@reviewer"
-        harness: opencode
-        phase: review
-        task: "Independently prove the fix..."
       needs: [fix]
-      on_error:
-        repair:
-          max_cycles: 1                 # one re-review, then escalate
-          verify: "cargo test {{inputs.test_filter}}"
-
-    gate:
-      action: request_approval
-      message: "Bug-fix complete. Repo OK?"
-      needs: [prove]
+      spec: { profile: "@reviewer", harness: opencode, phase: review }
+      on_error: fail_run
 ```
 
-**What changed:**
+Park-safe: this `graph:` only ships after Spec 0 (else `dispatch_job` is fine as graph leaves; `call_workflow` already expands). Do not put `request_approval` on a graph node until park-fix is green.
 
-1. **Phases on every node.** `repro=resolve`, `tdd=verify`, `fix=implement`,
-   `prove=review`. The phase column in `flywheel runs` now has real data for
-   cycle-time analysis.
+### C — `ship`: concurrent review+verify is a later DAG; Wave 1 does not retire `phase_chain`
 
-2. **Repair on fix.** If the coder's minimal fix doesn't make the test pass,
-   a different-model repairer (`claude-opus-4`, not the same model that wrote
-   the bad fix) gets the error and repairs it, up to 3 cycles.
+**Today:** `run_ship_chain` + `check_phase` JSON contracts. Review then verify, sequential.
 
-3. **Repair on prove.** If the reviewer finds the fix incomplete (returns
-   REJECT), one repair cycle re-reviews before escalating.
+**Wave 1:** `ship` still goes through `invoke_or_ship_chain`. Do **not** encode §4.5 as `action: verify` shell strings.
 
-4. **Gate at the end.** The bug-fix run suspends for captain approval with
-   full evidence: repro ✓ (baseline captured), tdd ✓ (test fails),
-   fix ✓ (0 repair cycles), prove ✓ (AGREE). The captain approves or rejects.
+**Later (after Spec 0 park-fix):** a graph-authored `ship` may run review ∥ verify (`needs: [implement]` both) and `gate` with `needs: [review, verify]`. Until then, compose stays linear so SIGNOFF parks.
 
-**Captain experience:**
+### D — a bead is not a workflow run (the rejected story)
 
-```bash
-$ flywheel workflow tree bug-fix-bd-456
+**Does not hold.** `--work` stays claim → brief → close-detect → `loop_run_verify`. No `br create --auto-workflow`. No `workflow_yaml` on the issue. No engine `br close`.
 
-bug-fix (5 nodes, 2 waves)  elapsed: 17m
-│
-├─ Wave 1 ──────────────────────────────────────────
-│  ✓ repro            phase=resolve @scout     3m
-│
-├─ Wave 2 ──────────────────────────────────────────
-│  ✓ tdd              phase=verify  @coder     4m
-│    ↻ repair cycle 1 (test assertion wrong)   2m
-│
-├─ Wave 3 ──────────────────────────────────────────
-│  ✓ fix              phase=impl    @coder     8m
-│
-├─ Wave 4 ──────────────────────────────────────────
-│  ✓ prove            phase=review  @reviewer  2m
-│    verdict: AGREE-WITH-CHANGES (1 minor finding)
-│
-└─ Wave 5 ──────────────────────────────────────────
-   ⏸ gate             approval      captain
-```
+A captain **may** `workflow run bug-fix --inputs bead_id=bd-123` as opt-in. That run's VerifySink writes a workflow receipt. The bead still closes only after the worker `br close --commit-sha` and the **armed loop** records `command-verified`.
 
-The captain sees the tdd node took 2 repair cycles (first assertion was wrong),
-the fix passed on the first try (0 cycles), and the reviewer returned
-AGREE-WITH-CHANGES (minor finding, not blocking). They approve.
+### E — `weekly-review` cron: retry transients; do not hang on approval
+
+**Today:** `on_failure: bead` on first failure. Graph already has parallel scout fan-out.
+
+**Wave 1:** scout arm timeout / 429 is `kind: timeout` / `rate_limit` → same-node `Action::Retry` (Spec 1), not a repair cycle. Oracle empty artifact (work-quality): `repair-until-verified` with `verify: test -s <artifact>` (existence, not `/tmp/jq`). **No** `request_approval` on the cron path until ApprovalSink is drained (cron dry-run already hangs 25s). Exhaustion of work-quality cycles: existing cron `on_failure: bead`. Exhaustion of 429 retries: same, plus kind-14.
+
+### F — migration contract
+
+Existing `steps:` YAML keeps parsing. Compose keeps emitting linear `steps:` + `graph: None` until Spec 0 park-fix is green. Then optional `repair-until-verified` recipe. No silent `on_error` default flip. No `to_graph` byte-identical output gate.
 
 ---
 
-### Scenario C: `ship` — the gated phase chain, now with concurrent review+verify
-
-**Today** (`ship` + `phase_chain.rs`):
-
-The `ship` built-in runs five `call_workflow` links sequentially through a
-gated chain runner (`run_ship_chain`). Between each link, `check_phase`
-verifies the §4.5 completion contract. The gates are warn-first
-(`FLYWHEEL_SHIP_GATE_MODE=block` is the W5 flip). The review and verify links
-are sequential — `implement → review → verify`.
-
-```yaml
-name: ship
-steps:
-  - name: resolve
-    action: call_workflow
-    workflow: phase-resolve
-    inputs: { objective: "{{inputs.objective}}" }
-  - name: plan
-    action: call_workflow
-    workflow: phase-plan
-    inputs: { goal: "{{inputs.objective}}", data_shape: "{{inputs.data_shape}}" }
-  - name: implement
-    action: call_workflow
-    workflow: phase-implement
-    inputs: { goal: "{{inputs.objective}}", plan: "{{steps.plan}}" }
-  - name: review
-    action: call_workflow
-    workflow: phase-review
-    inputs: { target: "{{inputs.objective}}", artifact: "{{steps.implement}}" }
-  - name: verify
-    action: call_workflow
-    workflow: phase-verify
-    inputs: { goal: "{{inputs.objective}}", gate: "{{inputs.gate}}" }
-```
-
-**What's wrong:** Review and verify are sequential — they could run in parallel.
-Both depend on implement, neither depends on the other. Running them
-sequentially adds ~5 minutes to every ship run. The chain runner
-(`phase_chain.rs`) is a separate execution path from the DAG scheduler — it
-can't express concurrency at all.
-
-**After ADR-0024:**
-
-```yaml
-name: ship
-graph:
-  nodes:
-    resolve:
-      action: call_workflow
-      workflow: phase-resolve
-      inputs: { objective: "{{inputs.objective}}" }
-
-    plan:
-      action: call_workflow
-      workflow: phase-plan
-      inputs: { goal: "{{inputs.objective}}", data_shape: "{{inputs.data_shape}}" }
-      needs: [resolve]
-
-    implement:
-      action: call_workflow
-      workflow: phase-implement
-      inputs: { goal: "{{inputs.objective}}", plan: "{{nodes.plan}}" }
-      needs: [plan]
-      on_error:
-        repair:
-          max_cycles: 3
-          verify: "{{inputs.gate}}"
-
-    review:                          # Wave 4: concurrent with verify
-      action: call_workflow
-      workflow: phase-review
-      inputs: { target: "{{inputs.objective}}", artifact: "{{nodes.implement}}" }
-      needs: [implement]
-      on_error:
-        repair:
-          max_cycles: 2
-
-    verify:                          # Wave 4: concurrent with review
-      action: call_workflow
-      workflow: phase-verify
-      inputs: { goal: "{{inputs.objective}}", gate: "{{inputs.gate}}" }
-      needs: [implement]
-      on_error:
-        repair:
-          max_cycles: 3
-          verify: "{{inputs.gate}}"
-
-    gate:
-      action: request_approval
-      message: "Ship {{inputs.objective}}?"
-      needs: [review, verify]        # waits for both concurrent nodes
-```
-
-**What changed:**
-
-1. **`steps:` → `graph:`.** The chain is now a DAG. The chain runner
-   (`phase_chain.rs`) can be retired — the DAG scheduler handles the gates
-   natively with `needs:` edges and `on_error: repair`.
-
-2. **Wave 4: concurrent review + verify.** Both depend on `implement`, neither
-   depends on the other. They run in the same wave. The `gate` node waits for
-   both (`needs: [review, verify]`). This saves ~5 minutes per ship run.
-
-3. **Repair on implement.** If the build fails (flaky test, missed edge case),
-   the engine spawns a repairer instead of aborting. The gated chain
-   (`run_ship_chain`) would have aborted at the failed contract check.
-
-4. **Repair on verify.** If the verify command fails, up to 3 repair cycles
-   fix and re-verify before escalating.
-
-5. **Evidence-bearing gate.** The approval carries: resolve ✓, plan ✓,
-   implement ✓ (0 cycles), review ✓ (AGREE), verify ✓ (passed, 0 cycles).
-
-```
-ship (6 nodes, 4 waves)
-│
-├─ Wave 1 ──────────────────────────────────────────
-│  ✓ resolve          phase=resolve  @scout
-│
-├─ Wave 2 ──────────────────────────────────────────
-│  ✓ plan             phase=plan     @planner   needs: [resolve]
-│
-├─ Wave 3 ──────────────────────────────────────────
-│  ✓ implement        phase=impl     @coder     needs: [plan]
-│    ↻ repair cycle 1 (test assertion wrong)
-│
-├─ Wave 4 ──── CONCURRENT ──────────────────────────
-│  ✓ review           phase=review   @reviewer  needs: [implement]
-│  ✓ verify           phase=verify   (loop)     needs: [implement]
-│
-└─ Wave 5 ──────────────────────────────────────────
-   ⏸ gate             approval       captain    needs: [review, verify]
-```
-
-**The chain runner retirement path:** `phase_chain.rs`'s `run_ship_chain` is
-replaced by the DAG scheduler. The §4.5 completion contracts (`check_phase`)
-become node-level `on_error: repair` with `verify` commands. The warn-first
-→ blocking flip (`FLYWHEEL_SHIP_GATE_MODE`) becomes a DAG-level config: nodes
-with `on_error: repair` on `max_cycles` exhaustion route to escalate (the
-current warn behavior) or to `fail_run` (the block behavior). One execution
-path instead of two.
-
----
-
-### Scenario D: Bead `bd-123` — from `br create` to `br close` as a single workflow run
-
-**Today:**
-
-```bash
-# 1. Planner creates the bead
-br create "Fix reservation conflict check" -p 1 -t bug \
-  --description "The conflict check compares the wrong field.
-
-## VERIFY
-\`\`\`bash
-cargo test -p toron-core reservation_conflict_detection
-\`\`\`
-
-## PRINCIPLES
-prove-it-works — ran the VERIFY fence, not a self-report
-fix-root-causes — the conflict check was comparing holder_name instead of path"
-
-# 2. Loop detects ready bead, dispatches via bead_prompt string
-flywheel send --to coder1 "Implement bead bd-123: Fix reservation..."
-
-# 3. Coder works, commits with "bd-123" in message
-# 4. Coder manually: br gate report bd-123 --gate unit-test-verified --status pass
-# 5. Coder manually: br close bd-123 --commit-sha abc1234 --reason "Fixed"
-# 6. Loop detects closed, runs ledger check, verifies gate row exists
-# 7. Loop releases claim-watch
-```
-
-**What's wrong:** Steps 4-6 are disconnected. The coder might close without
-running the gate report. The loop might reopen if the race condition between
-close and gate report hits. The captain has no visibility into the work
-between dispatch and close — it's a black box.
-
-**After ADR-0024:**
-
-```bash
-# 1. Planner creates the bead WITH auto-workflow generation
-br create --auto-workflow "Fix reservation conflict check" -p 1 -t bug \
-  --description "The conflict check compares the wrong field.
-
-## VERIFY
-\`\`\`bash
-cargo test -p toron-core reservation_conflict_detection
-\`\`\`
-
-## PRINCIPLES
-prove-it-works — ran the VERIFY fence, not a self-report
-fix-root-causes — comparing holder_name instead of path"
-
-# This produces a bead whose metadata includes:
-#   workflow_yaml: (auto-generated from VERIFY + PRINCIPLES + type)
-#
-#   name: "bead-bd-123"
-#   graph:
-#     nodes:
-#       implement:
-#         action: dispatch_job
-#         assignee: "@crew.coder"
-#         spec: { phase: implement, task: "Implement bead bd-123..." }
-#       verify:
-#         needs: [implement]
-#         action: dispatch_job
-#         assignee: "@crew.coder"
-#         spec: { phase: verify, task: "Run VERIFY..." }
-#         on_error:
-#           repair:
-#             max_cycles: 3
-#             verify: "cargo test -p toron-core reservation_conflict_detection"
-#       gate:
-#         needs: [verify]
-#         action: request_approval
-#         message: "Bead bd-123 complete. Close?"
-
-# 2. Loop detects ready bead WITH workflow_yaml metadata
-#    → compose_workflow from metadata → engine.invoke
-
-# 3. Engine runs the graph:
-#    implement → coder commits "bd-123" in message
-#    verify → coder runs VERIFY (fails first, repair cycle fixes it)
-#    gate → suspends for captain approval
-
-# 4. Captain reviews and approves
-$ flywheel workflow approvals pending
-bead-bd-123   implement ✓ (commit abc1234)   verify ✓ (1 repair cycle)   gate ⏸
-
-$ flywheel workflow approve bead-bd-123
-# Engine: emits kind-46012 terminal { status: "succeeded", ... }
-# Engine: br gate report bd-123 --gate workflow-verified --status pass
-# Engine: br close bd-123 --commit-sha abc1234 --reason "Workflow verified"
-
-# 5. Loop: claim-watch releases on kind-46012 terminal event
-#    No manual bridge. No race condition. One lifecycle.
-```
-
-**What changed:**
-
-1. **Bead creation generates the workflow.** `br create --auto-workflow`
-   extracts the VERIFY command from the fence, validates PRINCIPLES names
-   against the 21-name registry, and generates a typed DAG. The bead's type
-   (`bug`) and priority (`1`) determine the node set: P0–P1 gets a mandatory
-   reviewer node in addition to implement+verify+gate.
-
-2. **The loop dispatches through the engine.** Instead of a raw `send --to
-   coder1 "Implement bead bd-123..."` string, the loop calls `engine.invoke`
-   with the workflow struct. The dispatch is a durable run, not a one-shot
-   prompt.
-
-3. **Repair on verify.** If the coder's implementation fails the VERIFY
-   command, the engine spawns a repair cycle instead of requiring the coder
-   to manually fix and re-close. The repairer gets the exact failure and
-   the verify command.
-
-4. **Close is a gate, not a manual step.** The coder does not run `br gate
-   report` or `br close` — the engine does both when the captain approves
-   the gate. One ceremony, not two.
-
-5. **The loop listens for kind-46012.** Instead of polling `br list --status
-   closed` and grep-ing for gate rows, the loop subscribes to the terminal
-   event. No race condition between close and gate report.
-
-6. **Crash resilience.** If the process dies mid-run (after implement, before
-   verify), `flywheel workflow run bead-bd-123` resumes from the last
-   Resonate checkpoint. The implement node's output is preserved; verify
-   picks up where it left off.
-
----
-
-### Scenario E: `weekly-review` cron — self-healing the weekly scout→oracle pipeline
-
-**Today** (`weekly-review` built-in, builtin_workflows.rs:565):
-
-```yaml
-name: weekly-review
-trigger:
-  type: schedule
-  cron: "0 4 * * 0"
-  owner: oracle
-graph:
-  nodes:
-    scout-fanout:
-      action: parallel
-      over: "3"
-      each:
-        action: dispatch_job
-        assignee: x
-        spec: { profile: "@scout", task: "Scout toron+flywheel repos..." }
-
-    oracle:
-      action: dispatch_job
-      assignee: x
-      spec: { profile: "@oracle", task: "Synthesize..." }
-      needs: [scout-fanout]
-```
-
-This is the closest built-in to the ADR-0024 vision: it already uses `graph:`
-with `parallel` fan-out and a dependent synthesis node. The cron fires every
-Sunday at 4am. When it fails (oracle model unavailable, scout timeout, empty
-findings), the cron policy says `on_failure: bead` — it creates a bead for
-manual triage.
-
-**What's wrong:** Failure creates a bead and stops. No retry, no repair.
-If the oracle model was temporarily unavailable (rate limit, API flake),
-the entire weekly review is lost. The captain finds a bead on Monday morning
-and manually re-runs.
-
-**After ADR-0024:**
-
-```yaml
-name: weekly-review
-graph:
-  nodes:
-    scout-fanout:
-      action: parallel
-      over: "3"
-      each:
-        action: dispatch_job
-        assignee: x
-        spec: { profile: "@scout", task: "Scout toron+flywheel repos..." }
-      on_error:
-        repair:
-          max_cycles: 2
-          # One scout failing doesn't kill the fan-out; repairer picks up
-
-    oracle:
-      action: dispatch_job
-      assignee: x
-      spec: { profile: "@oracle", task: "Synthesize scout findings..." }
-      needs: [scout-fanout]
-      on_error:
-        repair:
-          max_cycles: 3
-          repair_model: "gemini-2.5-pro"  # different model family
-          verify: "test -n '$(cat /tmp/weekly-review-result.json | jq -r .idea.title)'"
-```
-
-**What changed:**
-
-1. **Repair on scout-fanout.** If one scout arm fails (rate limit, timeout),
-   a repairer picks up that arm's task instead of failing the whole fan-out.
-   2 cycles, then escalate.
-
-2. **Repair on oracle.** If the oracle model is temporarily unavailable or
-   returns empty findings, a different-model repairer (`gemini-2.5-pro`,
-   not the same family as the oracle) synthesizes instead. Up to 3 cycles.
-   The verify command checks that the output JSON has a non-null `idea.title`.
-
-3. **`on_failure: bead` only on exhaustion.** The cron policy's `on_failure:
-   bead` now fires only after repair exhaustion — not on the first transient
-   failure. The captain only sees beads for genuinely unfixable failures.
-
-**Captain experience:**
-
-```bash
-# Monday morning
-$ flywheel runs list --workflow weekly-review --since 2026-08-23
-
-run_id                    status     nodes   repairs  elapsed
-weekly-review-2026-08-23  succeeded  2/2     1        8m
-weekly-review-2026-08-16  succeeded  2/2     0        5m
-weekly-review-2026-08-09  succeeded  2/2     2        14m
-
-$ flywheel workflow tree weekly-review-2026-08-23
-
-weekly-review (2 nodes, 2 waves)  elapsed: 8m
-│
-├─ Wave 1 ──────────────────────────────────────────
-│  ✓ scout-fanout     phase=resolve  @scout(×3)  4m
-│
-├─ Wave 2 ──────────────────────────────────────────
-│  ✓ oracle           phase=plan     @oracle      4m
-│    ↻ repair cycle 1 (gemini-2.5-pro: empty output)
-```
-
-All three runs succeeded. The Aug 23 run needed one repair cycle
-(oracle returned empty, gemini fixed it). The Aug 9 run needed two
-cycles (scout timeout + oracle model unavailable). Zero beads created.
-Zero captain interventions.
-
----
-
-### Scenario F: How existing workflows migrate (the backward-compat contract)
-
-Every existing workflow continues to work without modification. The engine
-sees `steps:` and desugars to a chain graph internally. The captain can
-opt into repair and concurrency by adding `on_error: repair` and `needs:`
-edges — no migration required.
-
-**Migration path for the 26 built-ins:**
-
-| Workflow | Today | After Wave 1 | Opt-in gains |
-| :--- | :--- | :--- | :--- |
-| `goal`, `goal-direct`, `plan`, `beads`, `triage`, `plan-review`, `onboard`, `triage-deep`, `feature`, `refactoring`, `perf`, `hillclimb`, `figure-it-out`, `babysit-bead`, `ship-beads`, `autonomous-work`, `pickup`, `pause`, `wave-swarm`, `reflect`, `awareness-digest`, `phase-resolve`, `phase-plan`, `phase-implement`, `phase-review`, `phase-verify` | `steps:` | Chain graph (identical behavior) | Add `on_error: repair` to build/verify nodes. Add `needs:` to enable concurrency where file sets are disjoint. |
-| `brainstorm`, `debate`, `captain-audit`, `bug-fix`, `weekly-review`, `prototype`, `arena`, `forensics`, `interrogate` | `graph:` | Already a DAG (no change) | Add `on_error: repair` to reduce/decide/synthesize nodes. Add `verify` node with `needs: [implement]` for concurrent review+verify. |
-| `ship` | `steps:` (chain runner) | Chain graph, chain runner retired | Add `on_error: repair` to implement node. Add concurrent review+verify wave. |
-
-**Stage compatibility:** All stages (`systematic-execute`, `code-review`,
-`commit-and-push`, `baseline-measure`, `diagnose-only`, `judge-arms`, etc.)
-continue to work unchanged. Stages are prompt templates dispatched by
-`dispatch_job` actions. The graph topology and repair policy are orthogonal
-to the stage content. A `dispatch_job` with `stage: systematic-execute` and
-`on_error: repair` is valid — the stage runs inside a repairable node.
-
-**Phase compatibility:** ADR-0022's `Phase` enum (resolve/plan/implement/
-review/verify) is unchanged. Graph nodes carry `spec.phase` as before.
-The `phase_chain.rs` completion contracts (`check_phase`) become node-level
-repair policies: "implement must produce a commit citing the bead" is
-now `on_error: repair { verify: "git log -1 --grep=bd-xxx" }` — the same
-contract, enforced by the engine instead of the chain runner.
-
----
-
-### Summary: what stays, what changes
-
-| Aspect | Stays exactly the same | Changes |
+## 12. Counter-Argument (Round 1 — 2026-08-27 — git-diff in-file)
+
+> Historical. Captain then asked for a live Atomic-tree study. **§6 A′ is the governing decision.** This section is the Round-1 seam critique that A′ accepted.
+
+> Captain directive: carefully review and debate, edit in same file, do
+> better. Counter verified against the **live working trees** of `toron`
+> (`control_flow.rs`, `schema.rs`, `engine/mod.rs`, `engine/sinks.rs`) and
+> `flywheel` (`phase_chain.rs`, `phase_contracts.rs`, `builtin_workflows.rs`)
+> on 2026-08-27. Skills: adr-skill checklist, adversarial-reviewer, accretive
+> + dominance, glaze (one escalation), latent-diver.
+
+### Verdict
+
+**AGREE-WITH-CHANGES.** The Atomic lesson this ADR should take is the
+**loop invariant**: fail → different-model fix → re-verify → bound →
+escalate. Graph-canonical desugar, evidence-bearing approvals, and an
+`ErrorKind` at the ActionRunner boundary all serve that invariant.
+
+The Atomic lesson this ADR must **not** take is the **process shape**.
+Atomic is one runtime. We are a three-crate spine. "The engine is not yet
+an execution runtime" and "a bead IS a workflow run" port the process
+shape and fight ADR-0005 / ADR-0019 / the one-way dep this record claims
+not to amend.
+
+| Claim in this ADR | Counter |
+| :--- | :--- |
+| Engine must become an execution runtime | **Reject.** Substrate is the product. Repair/VERIFY/close belong in the embedding. |
+| Bead IS a workflow run | **Reject.** Bead = unit of work (ADR-0019). Workflow = one durable attempt. |
+| Wave 1 ships graph + taxonomy + repair + phase_chain retirement + viz | **Split.** Three type-seam items, not five subsystems. |
+| `to_graph` + always `run_graph` is a no-behavior change | **False.** Graph nodes do not park `request_approval`. Unnamed steps gain output keys. Snippet does not compile (`build_slot`). |
+| `Verdict` gains `RepairCycle` | **Reject.** Legal-close table lives in the beads fork. Repair is an event log. |
+| ADR-0022 §4 gains a repair *transition* | **Reject.** Repair is `StepOnError`, not a sixth phase. |
+| `run_repair_cycle` in `control_flow.rs` shells out + `br gate` + awaits DispatchJob | **Unsound.** ActionRunner is sync mailbox-shaped; job-await is `Action::Spawn { await_: true }`; VERIFY/build-slot live in flywheel; `br` is another repo. |
+| `check_phase` → `on_error: repair { verify: "<shell>" }` | **Precision loss.** §4.5 is structured JSON. Keep `check_phase`. |
+| Default `on_error` flips to routed-by-kind | **Defer** until every runner site classifies. Warn-first is not self-healing. |
+| Spec 5 reads reservation data | **Title lies.** Mechanism is BLAST_RADIUS globs. Lint-only, later wave. |
+
+### C0 — Spec 0 as written is a silent approval-park regression
+
+- **recommended_change:** Before deleting the linear `run_steps` path, route
+  `RequestApproval`, `Delay`, and `Spawn` through `run_step` from
+  `run_graph_node` (extend the `is_control_flow` match at
+  `control_flow.rs:673–680`, or run every graph node through `run_step`).
+  Drop the byte-identical output gate; require named-step key preservation
+  plus "RequestApproval still parks" as the compat gate.
+- **evidence_of_defect:** `run_graph_node` only expands Parallel / Foreach /
+  Branch / Retry / CallWorkflow. `RequestApproval` is a leaf dispatched to
+  the sync `ActionRunner`. Linear `run_step` (`control_flow.rs:132–180`) is
+  the path that creates the Resonate promise and parks. `triage.yaml` and
+  flywheel `wave-swarm` SIGNOFF use `request_approval` on `steps:`. After
+  "always `run_graph`", those runs no longer suspend. `GraphNode` has no
+  `build_slot` (`schema.rs:135–149`); the Spec 0 snippet does not compile.
+  Unnamed linear steps are omitted from `step_outputs`; desugar names them
+  `step_N` and the output map grows.
+- **confidence:** High (first-hand tree).
+- **minimum_acceptable_fix:** graph-node control-flow match includes
+  RequestApproval/Delay/Spawn; `to_graph` only copies fields `GraphNode`
+  has (or add `build_slot` in the same cut); compat gate rewritten.
+- **do_not_broaden_into:** a new engine, new kinds, observability CLI.
+- **remediation_posture:** Narrow. Same-cut fix on the Spec 0 landing.
+
+### C1 — Layering: `run_repair_cycle` as written inverts the one-way dep
+
+- **recommended_change:** Engine loops. Embedding executes. Repairer spawn
+  is `Action::Spawn { await_: true, no_claim_timeout }` (the await
+  primitive that already exists, `schema.rs:570`, `control_flow.rs:218–231`,
+  `SpawnSink` in `sinks.rs:31–34`). VERIFY is an injected `VerifySink`
+  (`Fn(&str) -> Result<VerifyResult>`), same DI idiom as `ActionRunner` /
+  `ProfileResolver` / `WorkflowResolver` (`engine/mod.rs:198–209`: "The
+  ENGINE never imports flywheel"). Cycle log is kind-9 and/or `br comments`.
+  No `std::process::Command`, no `br gate`, no `br close` in
+  `toron-workflow`.
+- **evidence_of_defect:** `ActionRunner` is
+  `Arc<dyn Fn(&Action) -> anyhow::Result<Value> + Send + Sync>` — sync,
+  mailbox-shaped. `DispatchJob` does not await 43001→06. Schema says
+  `build_slot` is "a static contract marker. Execution semantics live in
+  the embedding" (`schema.rs:296–300`). `record_br_gate` /
+  `escalate_to_captain` / `run_verify` in `control_flow.rs` would make
+  toron-workflow a br client and a shell runner, contradicting Driver 3
+  and the "Does not amend the one-way dependency" header.
+- **confidence:** High.
+- **minimum_acceptable_fix:** Spec 1 rewritten onto Spawn-await + VerifySink;
+  engine-side br/shell deleted from the pseudocode.
+- **do_not_broaden_into:** async ActionRunner, a new job-await action, a
+  toron-workflow br crate.
+- **remediation_posture:** Structural-small. The DI seam already exists.
+
+### C2 — "A bead IS a workflow run" reopens ADR-0019 lock 4
+
+- **recommended_change:** Rewrite Spec 3. A bead remains the unit of work.
+  A workflow run is one durable attempt *for* a bead. The terminal event
+  may carry evidence the loop uses to write `command-verified` /
+  `reviewer-signed`. The engine does not call `br close`. Drop
+  `br create --auto-workflow` and `workflow_yaml` on the beads schema
+  from this ADR (other repo; beads ADR-0001 owns schema v18). Keep:
+  loop may `compose_workflow` + `engine.invoke` when a ready bead is
+  dispatched (vehicle, not identity).
+- **evidence_of_defect:** ADR-0019: "The unit of work is a **bead**. Proof
+  is a **ledger row**." Lock 4 (2026-08-22, bd-54ui) moved legal-close
+  into the beads fork so an illegal close is unrepresentable. Spec 3 rule 3
+  ("On approval, the engine … calls `br close`") creates a second close
+  authority. Spec 3 rule 5 then admits two paths and calls drift a
+  residual risk in §9. `RepairCycle` is not a `VerdictKind`
+  (`CommandVerified` | `ReviewerSigned` | unit-test-verified |
+  live-verified | worker-receipt). A `repair-cycle-succeeded` gate row
+  that could legal-close is a false verdict.
+- **confidence:** High.
+- **minimum_acceptable_fix:** Spec 3 identity sentence deleted; engine
+  `br close` deleted; `RepairCycle` dropped from Amends; Wave 3 demoted
+  to a follow-up ADR or to "loop invokes a graph for a bead."
+- **do_not_broaden_into:** a BeadRuntime noun collapse (ADR-0019 wave 5,
+  evidence-gated, not due).
+- **remediation_posture:** Spec amendment. Narrower than "do not integrate";
+  the dispatch-vehicle half is keepable.
+
+### C3 — Wave 1 is five decisions; Spec 6 is foundational but sequenced last
+
+- **recommended_change:** Wave 1 (this ADR) is exactly: (1) compile-correct
+  `to_graph` + always `run_graph` + C0 park fix, (2) `{ok:false, error, kind}`
+  at the runner boundary with embedding classification, (3)
+  `StepOnError::Repair` over Spawn-await + VerifySink. Everything else
+  (phase_chain retirement, default `on_error` flip, bead identity, eleven
+  CLI nouns, auto-parallel lint, fork/cancel, engine shell) leaves this
+  record.
+- **evidence_of_defect:** Agent-readiness fails: an implementer cannot start
+  without asking which of five Wave-1 ships lands first. Spec 6 says it
+  feeds Spec 1, then Wave 1 ships Spec 0+1+6+phase_chain+viz together.
+  Default-flip is "warn-first until a one-line later bead" — so the
+  self-healing-by-default claim is not in Wave 1. Title is four ANDs
+  (graph-first, repair loops, evidence approvals, bead-workflow).
+- **confidence:** High.
+- **minimum_acceptable_fix:** retitle to a verb phrase about repair-on-DAG;
+  Wave table cut to the three type-seam items; Spec 6 moved above Spec 1
+  without the default flip.
+- **do_not_broaden_into:** rewriting the appendix scenarios (they can stay
+  as *later* illustrations once the seam is right).
+- **remediation_posture:** De-scope.
+
+### C4 — `ErrorKind` cannot be recovered from `anyhow`; the DI rename is a flag day
+
+- **recommended_change:** Do not replace `ActionRunner`. Carry `kind` on the
+  existing `{ok:false, error}` object. Embedding classifies at each runner
+  site (mailbox/relay timeout/429 → Transient; completed-agent `{ok:false}`
+  → Logic; reservation conflict / slot busy → Blocked; approval reject /
+  repair exhausted → Escalate). Until every site classifies, `kind` is
+  optional and routing uses explicit `on_error` only. Reconcile §7.5.2
+  `Fatal` with Spec 6.6.1's four-variant enum (pick four).
+- **evidence_of_defect:** `ActionRunner` is used from flywheel `main.rs`,
+  `pane.rs`, `headless.rs`, `crew.rs`, `smart_cron.rs`. A new `ActionResult`
+  type is a flag-day. `anyhow::Error` has no kind. The ADR's own migration
+  gate admits the default flip is a behavior change; "warn-first" means
+  Wave 1 does not route.
+- **confidence:** High.
+- **minimum_acceptable_fix:** kind-on-value, not a new runner type; default
+  stays Continue; Fatal dropped or defined.
+- **do_not_broaden_into:** a new error crate, colored errors, thiserror in
+  the engine.
+- **remediation_posture:** Narrow.
+
+### C5 — Retiring `phase_chain` via shell `verify:` loses the §4.5 contract
+
+- **recommended_change:** Keep `flywheel/src/phase_contracts.rs` `check_phase`
+  as the structured completion contract (JSON four-fields / verdict set /
+  gate exit). Optionally *call* it as a graph guard over node output JSON.
+  Do not encode `br dep cycles --json | count == 0` or
+  `git log -1 --grep=<bead-id>` as `repair.verify`. Those are different
+  predicates, and `verify:` is a shell string (injection + PATH + cwd).
+  `run_ship_chain` retirement is a flywheel bead, not an engine bead, and
+  not Wave 1.
+- **evidence_of_defect:** `check_phase` (`phase_contracts.rs:272`) inspects
+  structured step output. Spec 6.6.2 table replaces it with shell one-liners
+  that do not parse the four resolve fields or the verdict enum. `ship`
+  YAML today is `steps:` of `call_workflow` links; the gated runner is
+  flywheel-side (`builtin_workflows.rs:178`, `phase_chain.rs:214`).
+- **confidence:** High.
+- **minimum_acceptable_fix:** delete Spec 6.6.2 from Wave 1; keep
+  `check_phase`; document that ship concurrency (review ∥ verify) is a
+  later graph-authored `ship`, not a chain-runner rewrite.
+- **do_not_broaden_into:** deleting `phase_chain.rs` in the same PR as
+  `StepOnError::Repair`.
+- **remediation_posture:** De-scope.
+
+### C6 — Same-tree repair has no reservation-transfer protocol
+
+- **recommended_change:** State the isolation rule: the repairer *inherits*
+  the failed node's reservation (extend TTL, same `reason=<bead-id>`); the
+  original pane is interrupted or the repair is the same job continuation
+  (`Spawn` await on the same assignee, different model). Two writers on
+  one tree is the failure mode ADR-0019 Spec 3 exists to prevent. R-R5
+  (different model family) does not address file conflict.
+- **evidence_of_defect:** Spec 1.6 "the repairer works in the same tree,
+  under the same reservations" plus DispatchJob to a *new* agent. Held
+  reservations are HARD (ADR-0011). A second agent on the same paths
+  either conflicts (progress stuck, `ErrorKind::Blocked` — which Spec 6
+  then *escalates*, skipping repair) or the original holder is assumed
+  gone with no interrupt. Unspecified.
+- **confidence:** High (protocol gap, not a line-number bug).
+- **minimum_acceptable_fix:** one paragraph in Spec 1: inherit-or-interrupt;
+  never two holders.
+- **do_not_broaden_into:** lifting the worktree ban.
+- **remediation_posture:** Spec amendment (small).
+
+### C7 — Examples violate the lint this ADR writes (R-R2)
+
+- **recommended_change:** Every `on_error: repair` example carries a
+  non-empty `verify:`. Judgment nodes (review, scout synthesis) do not
+  use `repair`; they use `ReviewerSigned` / escalate. Cron
+  `verify: "test -n '$(cat /tmp/weekly-review-result.json | jq …)'"` is
+  not `prove-it-works` (tmp path, no receipt).
+- **evidence_of_defect:** Scenario A `review` repair has no `verify:`.
+  Scenario C `review` repair has no `verify:`. Scenario E `scout-fanout`
+  repair has no `verify:`. R-R2 is Error on empty verify.
+- **confidence:** High.
+- **minimum_acceptable_fix:** patch the appendix YAML, or mark those nodes
+  `on_error: fail_run` / escalate.
+- **do_not_broaden_into:** rewriting the captain-experience transcripts.
+- **remediation_posture:** Documentation correction.
+
+### C8 — Wrong seams in the Amends line
+
+- **recommended_change:** Amends ADR-0005 Spec 4b only (graph canonical +
+  `StepOnError::Repair`). Does not amend ADR-0019 Spec 1. Does not amend
+  ADR-0022 §4. CLI freeze note scoped to toron plane-surface nouns; new
+  `flywheel workflow *` nouns and `br create --auto-workflow` named as
+  follow-up surface in their own records.
+- **evidence_of_defect:** ADR-0022 §4: "The vocabulary is closed (5 values).
+  New phases require an ADR amendment, not a string." A "repair
+  transition" is either a sixth phase or a confusion of phase with
+  `on_error`. ADR-0019 `VerdictKind` is the legal-close table in the
+  beads fork; this repo does not own it. Header "Does not amend … freeze
+  on new CLI plane-surface nouns (ADR-0020)" is true for toron and false
+  for the eleven flywheel nouns in Spec 4 plus a beads CLI flag in Spec 3.
+- **confidence:** High.
+- **minimum_acceptable_fix:** rewrite the Amends / Does-not-amend lines.
+- **do_not_broaden_into:** a new ADR-0025 for CLI observability (file it
+  separately if Wave 4 still wanted).
+- **remediation_posture:** Spec amendment (small).
+
+### Soundness ledger
+
+| claim_id | claim_or_obligation | kind | witness_required | witness_status | preservation | progress | inhabitance | evidence | minimum_acceptable_fix |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| S-park | Graph `request_approval` still parks after always-`run_graph` | preservation | test: steps YAML with approval suspends via `run_graph` | **unwitnessed** (code routes the other way) | broken if Spec 0 lands as written | stuck (run completes without a decision) | RequestApproval-as-leaf is an illegal inhabitant of the graph path | `control_flow.rs:673–680` vs `:132–180` | C0 |
+| S-await | Repairer result is awaited, not fire-and-forget | progress | Spawn-await (or equivalent) in the cycle | **unwitnessed** (pseudocode uses DispatchJob) | n/a | stuck (cycle cannot observe the fix) | DispatchJob-as-await is uninhabitable today | `Action::Spawn { await_ }` exists; DispatchJob does not | C1 |
+| S-verify | Engine does not run shell; VERIFY is embedding-side | refinement | VerifySink DI; no `Command` in toron-workflow | **contradicted** by `run_verify` in Spec 1 | would break Driver 3 | n/a | shell-in-engine is an illegal inhabitant of this crate | `schema.rs:296–300`; `ActionRunner` shape | C1 |
+| S-close | Only `br` legal-close closes a bead | preservation | engine never calls `br close` | **contradicted** by Spec 3 rule 3 | broken (second closer) | n/a | engine-close is an illegal inhabitant of lock 4 | ADR-0019 lock 4; beads ADR-0001 | C2 |
+| S-kind | Failure kind is classified, not parsed from anyhow | refinement | `{ok:false, kind}` at every runner site | **partial** (enum proposed, runner type flag-day) | default-flip would not preserve Continue | n/a | unclassified anyhow has no kind | `engine/mod.rs:198` | C4 |
+| S-phase | Phase vocabulary stays five values | inhabitance | no `repair` phase, no §4 transition | **strained** by Amends line | would reopen ADR-0022 closure | n/a | repair-as-phase is illegal | ADR-0022 §4 | C8 |
+| S-tree | Same-tree repair has one writer | preservation | inherit-or-interrupt reservation rule | **unwitnessed** | two holders break ADR-0011 HARD | Blocked→escalate skips repair | two-holder is illegal | Spec 1.6 vs ADR-0011 | C6 |
+
+### Complexity delta
+
+Overall: **increases** as written (incidental). **Neutral-to-reduces** under
+A′ (below).
+
+| vector | as written | under A′ |
 | :--- | :--- | :--- |
-| YAML surface | `steps:` still parses, `actions` still work, `dispatch_job` spec unchanged, stages unchanged, crew/inputs/principles fields unchanged | `graph:` becomes canonical internally; `steps:` desugars at parse time |
-| Engine | `run_graph`, `run_graph_node`, `run_parallel`, `run_retry`, `run_branch`, `run_foreach`, `run_call_workflow`, `run_spawn` — all unchanged | `run_workflow` always routes through `run_graph`. New `run_repair_cycle`, `ErrorKind` taxonomy, richer approval payload, per-action `timeout_secs`. Old `steps:` path deleted. |
-| CLI | `flywheel workflow run/list/lint/compose`, `flywheel runs`, `flywheel steer`, `flywheel loop` — all unchanged | New: `flywheel workflow graph/tree/status/connect/resume/fork/cancel/approvals/approve/reject` |
-| Beads | `br create/list/close/gate`, `br ready`, `br dep` — all unchanged | New: `br create --auto-workflow`. New `workflow_yaml` metadata field. Loop dispatches beads as `engine.invoke`. |
-| MCP tools | All 40 tools unchanged (38 parity + 2 additive) | None |
-| Nostr kinds | All existing kinds unchanged | None |
-| Worktree ban | ADR-0019 Spec 3 unchanged | Repairer runs in same tree, under same reservations |
-| Chain runner | `phase_chain.rs` `run_ship_chain` retired after Wave 1 | Replaced by DAG scheduler with `needs:` + `on_error: repair` + concurrent waves |
-| `on_error` default | Explicit `on_error` unchanged; `continue`/`fail_run`/`repair` semantics unchanged | Absent `on_error` now routes by `ErrorKind` (retry/repair/escalate) — warn-first until the migration gate is green |
-| Run lifecycle | Checkpoint/resume (`pause`/`pickup`) unchanged | New `cancel` + per-action `timeout_secs` |
+| control-flow | two runners + repair SM + default-flip + phase_chain retirement | one DAG path + one repair loop on existing Spawn-await |
+| state | bead metadata `workflow_yaml` + dual close | none (bead schema untouched) |
+| coupling | engine→br, engine→shell, engine→job-await | engine→VerifySink (one DI, existing idiom) |
+| config-surface | `FLYWHEEL_REPAIR_MAX_CYCLES`, default flip, ship-gate-mode remapping, eleven CLI nouns | max_cycles + env cap only |
+| API-surface | ActionRunner type break + br flag + flywheel verbs | `{ok:false, kind}` additive; `StepOnError::Repair` additive |
+| operational-surface | fork/cancel/connect, crash-resume of bead-runs, two close paths | repair exhaust → existing kind-14 escalate |
+| cognitive-load | four-AND title, Spec 6 listed last, "bead IS run" | one invariant, two objects (bead, run) |
+
+Essential: typed failure, bounded different-model repair, graph-canonical,
+evidence on approval. Incidental: identity merge, engine-as-runtime,
+shell-encoded phase contracts, default-flip, observability CLI in the same
+record.
+
+### Invariant ledger
+
+| invariant | tier | status as written | blast |
+| :--- | :--- | :--- | :--- |
+| flywheel → toron-workflow → toron-core, engine never imports flywheel | critical | **strained** (C1) | cross-cutting |
+| ADR-0011 held reservation is HARD; one writer | critical | **strained** (C6) | module |
+| ADR-0019 lock 4: illegal close unrepresentable in `br` | critical | **broken** if Spec 3 rule 3 lands (C2) | cross-cutting |
+| ADR-0022 closed Phase vocabulary (5) | major | **strained** (C8) | module |
+| `request_approval` parks (WF-08) | critical | **broken** if Spec 0 lands without C0 | module |
+| MCP 40 / kind registry frozen | major | preserved | local |
+| worktree ban | major | preserved (correctly rejected Option C) | local |
+
+### Foot-gun register
+
+| foot-gun | ease | detectability | note |
+| :--- | :--- | :--- | :--- |
+| always-`run_graph` without parking RequestApproval | high | subtle (run "succeeds" with no decision) | C0 |
+| `on_error: repair` on a judgment node with no `verify:` | high | obvious once R-R2 ships; silent until then | C7 |
+| default `on_error` flip after warn-first | high | silent (continue → retry/repair overnight) | C4 |
+| `repair-cycle-succeeded` gate row legal-closing a bead | medium | subtle | C2 |
+| two agents in one tree during repair | high | subtle (reservation conflict or clobber) | C6 |
+| `verify:` shell string as phase contract | medium | subtle (wrong predicate still exit 0) | C5 |
+| Spec 5 titled "from reservation data" | medium | subtle (lint on prose globs) | title |
+
+### Non-material
+
+- ASCII tree glyphs (◌✓✗⏸↻) are fine for a later CLI ADR.
+- Skill token-budget §7.5 is well-aimed; it is not Wave 1.
+- Folded YAML `description: >-` on skills is real pre-existing debt; do not
+  couple it to this decision.
+- Verbatim compaction / hashline / permission gates correctly deferred.
+- Option C (Atomic clone) and Option D (Repair as Action) rejections stand.
+- Option E (string-match routing) rejection stands; that is why `ErrorKind`
+  is the right substrate, classified at the embedding, not parsed from
+  `e.to_string()`.
+- Evidence-bearing approval payload (Spec 2) is small and correct; it can
+  ride with Wave 1 once C0 lands (the payload is just richer
+  `promise.data`).
+
+### Verification gaps
+
+- No test named that proves graph `request_approval` parks.
+- No test that a repairer DispatchJob is *awaited* (because it cannot be).
+- "Output byte-matches" is unsatisfiable (unnamed-step keys).
+- "One full bead → workflow → repair → gate → `br close`" e2e is a beads-repo
+  + flywheel + engine test; it is not a Wave 1 gate.
+- `phase_chain.rs` retirement gate ("same §4.5 outcomes") cannot hold if
+  contracts become shell strings.
+
+### Residual uncertainty
+
+- Whether flywheel `ActionRunner` sites can classify Transient vs Logic vs
+  Blocked without a small shared helper. Fastest check: grep `{ok: false`
+  in `flywheel/src/pane.rs` and `headless.rs` and list the error strings
+  they already produce. That list is the first `ErrorKind` map.
+- Whether `VerifySink` should take the bead VERIFY fence or the node's
+  `repair.verify` string. Lean: the node's string, which the composer
+  copies from the fence. The engine never parses markdown.
+- Whether review-node failure is Logic (repair) or Escalate (human). Lean:
+  Escalate. Review is judgment; `ReviewerSigned` already exists.
+
+### Change Agenda (changes to this ADR, low → high leverage)
+
+1. **change:** Patch appendix YAML so every `repair` has `verify:`; judgment
+   nodes escalate (C7). **why:** R-R2. **posture:** doc
+2. **change:** Rewrite Amends: only ADR-0005 Spec 4b. Drop RepairCycle
+   VerdictKind and ADR-0022 repair transition. Scope the CLI freeze (C8).
+   **why:** wrong seams. **posture:** spec amendment
+3. **change:** Compile-correct `to_graph`; graph nodes park
+   RequestApproval/Delay/Spawn; drop byte-identical gate (C0). **why:**
+   Spec 0 as written is a WF-08 regression. **posture:** narrow
+4. **change:** `ErrorKind` as `{ok:false, kind}` on the existing runner
+   value; no ActionRunner rename; no default flip in Wave 1; drop Fatal
+   or define it (C4). **why:** flag-day + unclassifiable anyhow. **posture:**
+   narrow
+5. **change:** Keep `check_phase`; move phase_chain retirement out of Wave 1;
+   do not encode §4.5 as shell (C5). **why:** precision. **posture:** de-scope
+6. **change:** Spec 1 isolation paragraph: inherit-or-interrupt, never two
+   holders (C6). **why:** ADR-0011. **posture:** spec amendment
+7. **change:** Spec 1 onto Spawn-await + VerifySink; delete engine shell /
+   `br gate` / `br close` (C1). **why:** one-way dep. **posture:** structural-small
+8. **change:** **Rewrite Spec 3: workflow proves the bead; the bead remains
+   the unit of work. Engine never closes. Drop `--auto-workflow` /
+   `workflow_yaml` from this record (C2).** **why:** lock 4. **posture:**
+   spec amendment; strongest next move. Without it this ADR reopens the
+   legal-close program ADR-0019 just moved into `br`.
+
+### Option A′ — substrate-preserving repair (the better decision)
+
+Chosen if the captain ACCEPT-MODIFIED. Four ships, each independently
+useful, none inverting the spine.
+
+**Title:** Adopt bounded different-model repair on the canonical DAG, with
+typed failure at the ActionRunner boundary.
+
+**Wave 1 (this ADR, toron-workflow + flywheel runner sites):**
+
+1. `Workflow::to_graph()` copies `action`, `needs`, `guard`, `on_error`
+   (add `build_slot` to `GraphNode` in the same cut if playbook lint
+   still needs it). `run_workflow` always calls `run_graph`. Graph nodes
+   run through `run_step` so RequestApproval parks, Delay sleeps, Spawn
+   awaits. Compat gate: named `steps.<name>` keys preserved; approval
+   still suspends; unnamed keys may appear as `step_N` and are documented.
+2. Failure object is `{ok:false, error, kind?}`. Embedding classifies.
+   `StepOnError` stays Continue | FailRun until every runner site sets
+   `kind`. Lint R-E1..E3 may warn. Default does not flip.
+3. `StepOnError::Repair { max_cycles, repair_profile, repair_model, verify }`.
+   On `{ok:false, kind: logic}` (or explicit `on_error: repair`), the
+   engine runs a bounded loop: `Action::Spawn { await_: true }` with the
+   model override, then `VerifySink(verify)`. Success → node output is
+   the repair result. Exhaustion → `{ok:false, kind: escalate}` and the
+   embedding mails the captain (existing kind-14 path). Cycle log: kind-9
+   in the run channel and/or `br comments`. Not a VerdictKind.
+4. `request_approval` promise data includes `nodes_completed`, artifacts
+   already in `step_outputs`, and any repair cycle log. No new kind. No
+   new MCP tool.
+
+**Non-goals of this ADR (follow-ups, not this record):**
+
+- Bead identity merge, `br create --auto-workflow`, `workflow_yaml`
+- `flywheel workflow tree/connect/fork/cancel/approvals` CLI
+- Auto-parallelization lint
+- Default `on_error` routed-by-kind flip
+- `phase_chain.rs` retirement
+- Engine shell, engine `br close`
+- ADR-0022 phase vocabulary change
+- ADR-0019 VerdictKind change
+
+**Repair IS / IS NOT, corrected:**
+
+```diff
+  Repair IS:
+    a different model, fresh context, bounded, re-verified, tracked, escalated on exhaustion
+-   tracked as a br gate VerdictKind
++   tracked as a cycle log (kind-9 / br comments). Close legality stays br's table.
+  Repair IS NOT:
+    retry-of-same, unbounded, a worktree, a self-report, silent
++   a shell the engine runs, a br close, a sixth phase, a second unit of work
+```
+
+**First proof signal (Wave 1, one test):** a 2-node graph whose first node
+returns `{ok:false, kind:"logic"}` with `on_error: repair { max_cycles: 2,
+verify: "true" }`; a fake SpawnSink succeeds on cycle 2; VerifySink exit 0
+on cycle 2; run status succeeded; no `br` invoked; RequestApproval on a
+desugared `steps:` YAML still parks.
+
+### Bottom line
+
+Take Atomic's *loop*. Do not take Atomic's *process*. The DAG scheduler,
+Spawn-await, Verify-as-DI, `br` legal-close, and file reservations are
+already the right spine. This draft's load-bearing defect is treating
+those as gaps to close by collapsing layers. Cut Spec 3's identity claim,
+move VERIFY/`br` out of `control_flow.rs`, fix Spec 0 so approvals still
+park, and Wave 1 becomes a decision an agent can implement without asking
+which of five ships is the ship.
+
+Disagree with the *direction* (graph-first, typed failure, bounded repair,
+evidence on approval)? No. Disagree with the *seam*? Yes. The seam is the
+decision.
+
+---
+
+## 13. Atomic tree study (2026-08-27) — what we took, what we left
+
+Clone: `/tmp/atomic-fresh` from `https://github.com/bastani-inc/atomic` (`main`, LFS skipped). Package of record: `packages/workflows`.
+
+### Taken (now in §6)
+
+1. **Unroll the loop.** `loop-until-done-runner.ts:175–258` names `iteration-N` and `evaluate-N`. Both `context: "fresh"`. Structured evaluator. Ledger JSON. `remaining_work` on exhaustion. Progress scores are advisory (`PROGRESS_DISCLAIMER`; verifier spec forbids them as a kill switch).
+2. **Do not inject check output into the next prompt.** `packages/workflows/README.md:108` — `failureMode: "return"` keeps the node failed, author continues, evidence is passed explicitly, distinct args per rerun, replay does not re-execute.
+3. **Split runtime failure from work-quality.** `workflow-failures-contract.ts` kinds are `auth|rate_limit|provider|cancelled|unknown` plus `retryable/resumable/disposition`. That is recoverability. Test-red is a pattern, not a kind.
+4. **Artifact paths in HIL.** Example 3 writes `plan.md` and `reads: [planPath]`. Our promise carries paths. Resonate still outlasts the process (Atomic HIL uses DBOS prompt-reservation tokens).
+5. **Stop doors stay boolean and fail-closed.** `ralph-review-gate.ts:6–26` — `stop_review_loop` is the sole approval; parse failure never approves. Maps to `done: true` requiring VerifySink exit 0, and to ReviewerSigned not `on_error: repair`.
+
+### Left (follow-up ADRs, not this record)
+
+| Atomic | Why not now |
+| :--- | :--- |
+| Imperative TypeScript `workflow({ run })` | We stay YAML. Compose can unroll. |
+| DBOS durable backend | We have Resonate. Buffy "coarser checkpointing" was **wrong** (DBOS + hashed tool cache); we still do not port DBOS. |
+| Worktrees | ADR-0019 Spec 3, `.beads/` single-writer. |
+| Hashline `[path#TAG]` | Reservations isolate writers; hashline is edit-staleness. Later. |
+| `keepContext` pin tags | Right idea for VERIFY/non-goals vs CONTEXT_LIMIT. Own ADR. |
+| Mean-and-veto LLM verifier, Bradley-Terry tournament | ReviewerSigned follow-up. |
+| `budget_exceeded` resumable blocked rail | We have compose wall-clock. Token/cost later. |
+| Steer a live stage / `/workflow connect` | flywheel CLI ADR. |
+| Heartbeats (15 min product default) | Resonate already durable-sleeps. |
+| NL → authored workflow file | `workflow compose --agent` exists. |
+| Prompt-reservation tokens | File reservations are a different object. Do not conflate. |
+
+### Buffy note corrections (so the next agent does not re-import them)
+
+- Repair is **not** `on_error` of a node. It is an unrolled graph.
+- Atomic **does** have durable functions (DBOS). "JSONL session files only" is false for workflows.
+- "Verbatim compaction" in the workflow package is `keepContext` + re-emit `run.start` on compact. Line-deletion is the coding-agent.
+- Approval does **not** magically serialize the run tree; authors pass files.
+- "Linear is sugar" in Atomic means imperative TS, not YAML `needs:` desugar.
+- `max_repairs` default is **2** (adversarial-verification), loop-until-done default **5** (cap 20). Our cap stays 10 via env; YAML 1..10.
+
+---
+
+## 14. Flywheel × toron × beads optimality pass (2026-08-27)
+
+Round-1 + Atomic study were **not** enough. This pass reads live `flywheel/src/{verdict,durable,pane,crew}.rs` and `br close`/`br gate`. **A′ as previously written was not optimal.** Spec 4 is patched above. The rest of §6 stands.
+
+| A′ claim | Live stack | Patch |
+| :--- | :--- | :--- |
+| Workflow terminal may write `command-verified` | **False verdict.** Loop-only, `LOOP_ARMED`, `write_receipt` refuses the kind (`verdict.rs:339–341, 746–776`). Cheap band `legal_close` is CommandVerified exclusive (`:298–304`). | VerifySink writes a workflow receipt. Loop still runs `loop_run_verify` after close-detect (`durable.rs:660–711`). |
+| Loop may `engine.invoke` a graph per ready bead | **Would replace the loop SM.** Skill §3: do not replace. `--work` is claim → brief → claim-watch → close-detect → loop VERIFY. | Repair unrolls inside **workflow YAML** (`ship` / compose / `bug-fix`). Not a second dispatcher. |
+| New receipt tree under `progress-ledger.json` | Receipts already live at `.flywheel/receipts/<id>-<sha>.<kind>.txt`. | Same directory. Ledger file is additive. |
+| Inherit-or-interrupt as a new protocol | Toron `transfer_reservation` exists; flywheel mail locks do **not** wrap it. `interrupt --force` kills the process. | Escape/Idle + `toron reserve transfer`. |
+| `compose retry(n):` as repair | That grammar is `Action::Retry` (same step, same model) (`crew.rs:161, 260`). | Do not desugar repair into `retry(n):`. |
+| Spawn-await as a new primitive | **Already production.** `drain_spawn_sink` (`pane.rs:649–663`): `await: true` waits for Idle then settles; `await: false` fire-and-forget. | Use it. |
+| `DispatchSpec.context: fresh` | Loop CONTEXT_LIMIT respawn is a **different** fresh (whole pane). No per-node empty-transcript flag. | Still add the field; do not confuse it with loop respawn. |
+| Workflow may `br gate report` (any name) | `br gate report` is an open append. No loop-only ACL in `br`. `--provider` is a free string. `LOOP_ARMED` is flywheel-process only. | Workflow **never** `br gate report`. Receipt path + comments/kind-9 only. |
+| `reviewer-signed` from the graph evaluator | Same-graph "independent" review is a false `ReviewerSigned`. Legal only for judgment AC from a different-family verifier. | Evaluator output is ledger JSON. Loop/captain records `reviewer-signed` if the legal-close table says so. |
+| `legal_close` already consumes VERIFY/blast | **Stub.** `beads/src/close_policy.rs` `legal_close_input_for_issue` ignores those fields. Today forged `command-verified` is noise; post v18 it is the only cheap-band close. | Do not write workflow gate rows "to get ready for v18." |
+
+**What was already optimal and stays:** park-safe `to_graph`; runtime `kind` on `{ok:false}` without renaming ActionRunner; unrolled named repair nodes; engine never shells out; engine never `br close`; no RepairCycle VerdictKind; no worktrees; no eleven CLI nouns in Wave 1.
+
+| Wrap existing 46011 listener | **No such listener.** Flywheel never drains `ApprovalSink`, never publishes 46011, never `resolve_approval` outside tests. SIGNOFF parks on the Resonate promise until something settles it. | Wave 1: drain ApprovalSink (copy SpawnSink). Wave 2: richer `.data`. CLI later. |
+| `interrupt --force` as repair handoff | `--force` = ctrl+c = **kill agent process** (`main.rs:314–328`). | Escape or wait Idle, then `toron reserve transfer`. |
+| Compose emits unrolled repair / `graph:` | Compose always `graph: None`, linear `steps`, `on_error: Continue` (`crew.rs:387`). That is why SIGNOFF parks. `retry(n):` is `Action::Retry`. | Recipe token `repair-until-verified` (wave-swarm pattern) or `--from-yaml`. Do not force `graph:` until park-fix is green. |
+| Classifier sites include `crew.rs` / `smart_cron.rs` / `headless.rs` | Production: `pane.rs`, `main.rs` `headless_dispatch`, `cron.rs`. `headless.rs` is phase helpers. | Fix the file list. |
+| `FLYWHEEL_REPAIR_MAX_CYCLES` | **Does not exist.** Related: `FLYWHEEL_COMPOSE_MAX_SECONDS` (3600), `FLYWHEEL_SHIP_GATE_MODE`. | Cap in recipe inputs (Atomic-style `max_repairs`) plus a new env only if we actually read it. |
+| Wave-swarm VERIFY = loop VERIFY | Wave-swarm VERIFY is `@reviewer` `dispatch_job` (`builtin_workflows.rs:1187–1194`). Loop VERIFY is close-detect `__loop-run-verify`. | Do not collapse them. |
+
+**What was already optimal and stays:** park-safe `to_graph`; runtime `kind` on `{ok:false}` without renaming ActionRunner; unrolled named repair nodes; engine never shells out; engine never `br close`; no RepairCycle VerdictKind; no worktrees; no eleven CLI nouns in Wave 1; Spawn-await via existing `drain_spawn_sink`.
+
+**Verdict:** A′ **with Spec 2–4 patched from this flywheel pass**. Ship graph-park + classified `{ok:false}` + ApprovalSink drain first. Repair YAML is a `wave-swarm`-style recipe, not a new sequencer. Without the park fix, making the graph canonical **breaks live SIGNOFF**.
+
+### Extra, from the isolation/compaction pass (same clone)
+
+- **Worktrees never merge.** Parallel `worktree: true` creates `<repo>/.atomic/worktrees/<runId>-<i>`, diffs against the base commit into `worktree-diffs/task-<i>-<agent>.patch`, then `git worktree remove --force` + branch delete (`packages/subagents/src/runs/shared/worktree.ts`). Requires a **clean** tree (`status --porcelain --untracked-files=no`). No `.beads` handling exists in that repo. Another reason Spec 5 rejects them: we need commits on the live branch under one reservation, not a patch pile that is thrown away.
+- **Verbatim compaction is mechanical deletion.** Planner returns `start,end` line ranges only. Reconstruction walks original lines; `keepContext` lines are split *out* of the deletion set after the planner, so the model cannot rewrite a survivor (`packages/coding-agent` compaction docs + `deleted-ranges.ts`). Last-rung fallback is `"fresh"` (drop the compactable region, no rewrite). Workflow-side hook still only re-emits `run.start` so restore sees in-flight runs.
+- **Permission gates are fail-open.** Tools run as the user. Optional `pi.on("tool_call")` example regex-blocks `rm -rf` / `sudo`. Builtin bash interceptor is *routing* (`cat`/`sed -i` → `read`/`edit`), not a sandbox. We already have reservations + pre-commit guards; do not import a fail-open regex as a security story.
+- **Identity is a uuidv7 JSONL session file.** Intercom is a length-prefixed Unix-socket broker (`~/.atomic/agent/intercom/broker.sock`), group isolation is a string compare. Not Schnorr, not NIP-17, not cross-machine.
+- **Later ideas, still not Wave 1:** warm-first prefix-cache fan-out before parallel judges; parent-ask that *terminates* the child (parent must spawn a new run, not keep a mailbox open); Bradley-Terry `select_best` instead of knockout.
+
+### Extra, from the DAG-core pass (same clone)
+
+- **No declarative `needs:` / `graph()` authoring.** Topology is inferred at runtime by `GraphFrontierTracker` (`engine/graph-inference.ts:17–82`): spawn snapshots the unsettled frontier as parents; settle replaces those parents with this node. Linear is `ctx.chain`, fan-out is `ctx.parallel`. We keep explicit YAML `needs:`. Do not port frontier inference; it is a TypeScript-await affordance and it is un-lintable as a static DAG.
+- **Three failure layers, matching §6's split.** (A) `ctx.tool` retries are **same node, same args** (default throw after 1; opt-in `maxAttempts` 3) — this is our `Action::Retry`, not repair. (B) Engine classifies provider/auth into `retryable/resumable/disposition`; resume is **explicit** `/workflow resume`, not automatic. (C) Repair is author `for` loops minting new names. There is **no** engine `on_error: repair` and **no** engine `escalate()` API.
+- **Ralph/Goal stop door is a boolean, exhaustion is human.** Ralph default 10 loops; both reviewers must `stop_review_loop === true`. Exhaustion + `create_pr` opens a **draft PR** and stops. Goal consecutive identical blocker → `blocked`. Maps to our escalate-with-ledger-path, not to engine `br close`.
+- **Heartbeats are not durable.** Default 15 min; process exit does **not** backfill missed beats. Do not sell heartbeats as a Resonate substitute.
+- **`ctx.tool` replay is content-hash of name+args**, not Resonate yield identity for arbitrary JS. Bare `await fs.writeFile` is **not** checkpointed. Only `ctx.*` writes durable checkpoints. Our equivalent: ActionRunner + VerifySink + Spawn-await. Do not checkpoint random embedding side effects.
+- **Connect/steer is live Store snapshots + JSONL `workflow.*` entries**, not a structured evidence approval. `/workflow connect` opens a graph overlay. Valuable; still a flywheel CLI ADR.
