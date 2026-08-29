@@ -1,3 +1,4 @@
+// governed-by: ADR-0025
 // governed-by: ADR-0003
 // governed-by: ADR-0004 (MailCommand::Overseer — Ship 5)
 
@@ -648,6 +649,23 @@ pub async fn run_contact_daemon(dc: &DaemonClient, cmd: &ContactCommand) -> anyh
             .await
         }
         ContactCommand::Captain(args) => {
+            // bd-auqj: clear the captain alias for the project.
+            if args.clear {
+                let previous = toron_core::mailbox::identity::clear_captain_alias_in_db(
+                    &toron_core::config::ToronPaths::resolve()
+                        .index_path()
+                        .display()
+                        .to_string(),
+                    &args.project,
+                )
+                .await?;
+                print_json(&json!({
+                    "project": args.project,
+                    "cleared": previous.is_some(),
+                    "previous": previous,
+                }))?;
+                return Ok(());
+            }
             // bd-captain-alias-0g8a: validate the pin against the WRITER
             // (the daemon's whois tool), then write the plain-state UPSERT
             // into the durable root's index DB directly — no second
@@ -762,23 +780,34 @@ pub async fn run_contact(mailbox: &Mailbox, cmd: &ContactCommand) -> anyhow::Res
                     .await?,
             )
         }
-        ContactCommand::Captain(args) => match &args.pin {
-            Some(pin) => {
-                let captain = mailbox.set_project_captain(&args.project, pin).await?;
-                // Prove the fold end-to-end: the alias itself must resolve.
-                let w = mailbox.whois(&args.project, "captain").await?;
+        ContactCommand::Captain(args) => {
+            if args.clear {
+                let previous = mailbox.clear_project_captain(&args.project).await?;
                 print_json(&json!({
                     "project": args.project,
-                    "captain": captain,
-                    "npub": w.npub,
-                    "resolved_via": "captain",
-                }))
+                    "cleared": previous.is_some(),
+                    "previous": previous,
+                }))?;
+                return Ok(());
             }
-            None => {
-                let current = mailbox.agent_name_alias(&args.project, "captain").await;
-                print_json(&json!({ "project": args.project, "captain": current }))
+            match &args.pin {
+                Some(pin) => {
+                    let captain = mailbox.set_project_captain(&args.project, pin).await?;
+                    // Prove the fold end-to-end: the alias itself must resolve.
+                    let w = mailbox.whois(&args.project, "captain").await?;
+                    print_json(&json!({
+                        "project": args.project,
+                        "captain": captain,
+                        "npub": w.npub,
+                        "resolved_via": "captain",
+                    }))
+                }
+                None => {
+                    let current = mailbox.agent_name_alias(&args.project, "captain").await;
+                    print_json(&json!({ "project": args.project, "captain": current }))
+                }
             }
-        },
+        }
     }
 }
 

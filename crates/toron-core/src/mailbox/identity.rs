@@ -1,3 +1,4 @@
+// governed-by: ADR-0025
 // governed-by: ADR-0003
 // governed-by: ADR-0017 (project-root canonicalization)
 #![forbid(unsafe_code)]
@@ -329,6 +330,32 @@ impl Mailbox {
         };
         upsert_captain_alias(pool, &canonical, &who.name).await?;
         Ok(who.name)
+    }
+
+    /// bd-auqj: clear the captain alias for the project.
+    pub async fn clear_project_captain(
+        &self,
+        project_slug: &str,
+    ) -> anyhow::Result<Option<String>> {
+        let canonical = self.canonical_project(project_slug).await;
+        let Some(pool) = self.index_pool.as_ref() else {
+            anyhow::bail!("no index pool attached — cannot clear the captain alias");
+        };
+        let current: Option<String> = sqlx::query_scalar(
+            "SELECT canonical FROM agent_name_aliases WHERE project_slug = ?1 AND alias = 'captain'",
+        )
+        .bind(&canonical)
+        .fetch_optional(pool)
+        .await?;
+        if current.is_some() {
+            sqlx::query(
+                "DELETE FROM agent_name_aliases WHERE project_slug = ?1 AND alias = 'captain'",
+            )
+            .bind(&canonical)
+            .execute(pool)
+            .await?;
+        }
+        Ok(current)
     }
 
     /// ADR-0018 D4: the canonical name a legacy alias folds to (if any).
@@ -899,6 +926,28 @@ pub async fn captain_alias_in_db(
     .fetch_optional(&pool)
     .await?;
     Ok(row)
+}
+
+/// bd-auqj: clear the captain alias for the project.
+pub async fn clear_captain_alias_in_db(
+    db_path: &str,
+    project_slug: &str,
+) -> anyhow::Result<Option<String>> {
+    let pool = crate::index::schema::connect(db_path).await?;
+    crate::index::schema::migrate(&pool).await?;
+    let current: Option<String> = sqlx::query_scalar(
+        "SELECT canonical FROM agent_name_aliases WHERE project_slug = ?1 AND alias = 'captain'",
+    )
+    .bind(project_slug)
+    .fetch_optional(&pool)
+    .await?;
+    if current.is_some() {
+        sqlx::query("DELETE FROM agent_name_aliases WHERE project_slug = ?1 AND alias = 'captain'")
+            .bind(project_slug)
+            .execute(&pool)
+            .await?;
+    }
+    Ok(current)
 }
 
 #[cfg(test)]
@@ -1847,6 +1896,46 @@ mod tests {
             msg.contains("REGISTERED"),
             "error names the registered-pin requirement: {msg}"
         );
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn captain_clear_removes_fold() {
+        let (mailbox, _pool, db_path, data_dir) = test_mailbox_with_pool("captain-clear").await;
+        mailbox.ensure_project("toron").await.expect("ensure");
+        mailbox
+            .register_agent("toron", &profile("BlueRidge"))
+            .await
+            .expect("register");
+        mailbox.set_identity_mode("toron", "swarm").await;
+        mailbox
+            .set_project_captain("toron", "BlueRidge")
+            .await
+            .expect("set");
+        assert_eq!(
+            mailbox.agent_name_alias("toron", "captain").await.as_deref(),
+            Some("BlueRidge")
+        );
+        // Clear
+        let previous = mailbox
+            .clear_project_captain("toron")
+            .await
+            .expect("clear");
+        assert_eq!(previous.as_deref(), Some("BlueRidge"));
+        assert_eq!(mailbox.agent_name_alias("toron", "captain").await, None);
+        // whois captain should now fail (non-routable)
+        assert!(
+            mailbox.whois("toron", "captain").await.is_err(),
+            "whois captain after clear should fail"
+        );
+        // Clearing again when already cleared returns None
+        let again = mailbox
+            .clear_project_captain("toron")
+            .await
+            .expect("clear again");
+        assert!(again.is_none(), "second clear returns None");
 
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_dir_all(&data_dir);
