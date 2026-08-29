@@ -672,8 +672,31 @@ pub async fn run_contact_daemon(dc: &DaemonClient, cmd: &ContactCommand) -> anyh
             // in-process mailbox (guard precedent). Reads of `captain` then
             // resolve through the ONE resolver everywhere.
             let db_path = toron_core::config::ToronPaths::resolve().index_path();
+            let db_path_s = db_path.display().to_string();
+            // bd-lsgm: the captain fold is consulted ONLY in swarm identity
+            // mode — writing it in open mode silently creates a fold that
+            // can never route. Fail loud with the remedy; --force writes
+            // anyway, audited to stderr.
+            let mode = toron_core::mailbox::identity::project_identity_mode_in_db(
+                &db_path_s,
+                &args.project,
+            )
+            .await?;
+            let open_mode = matches!(mode, toron_core::mailbox::naming::IdentityMode::Open);
             match &args.pin {
                 Some(pin) => {
+                    captain_write_gate(&mode, args.force, &args.project)?;
+                    if args.force {
+                        eprintln!(
+                            "{}",
+                            json!({
+                                "audit": "captain fold written in open identity mode",
+                                "project": args.project,
+                                "pin": pin,
+                                "routes": false,
+                            })
+                        );
+                    }
                     let out = dc
                         .call_tool(
                             "whois",
@@ -1197,4 +1220,79 @@ async fn daemon_guard_roster(
         });
     }
     Ok(out)
+}
+
+/// bd-lsgm: the captain fold routes only in swarm identity mode. An open-mode
+/// write is refused unless explicitly forced (the call site audits it to
+/// stderr) — otherwise `contact captain` silently writes a fold that can
+/// never route (ADR-0018).
+pub(crate) fn captain_write_gate(
+    mode: &toron_core::mailbox::naming::IdentityMode,
+    force: bool,
+    project: &str,
+) -> anyhow::Result<()> {
+    if matches!(mode, toron_core::mailbox::naming::IdentityMode::Open) && !force {
+        anyhow::bail!(
+            "captain fold is swarm-only (ADR-0018): project {project} runs identity_mode=open, \
+             where the fold can never route — flip via ensure_project identity_mode=swarm, or \
+             address the pin directly; --force overrides (audited)",
+            project = project
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod captain_open_mode_tests {
+    use super::*;
+
+    #[test]
+    fn captain_open_mode_refuses_without_force() {
+        let err = captain_write_gate(
+            &toron_core::mailbox::naming::IdentityMode::Open,
+            false,
+            "flywheel",
+        )
+        .expect_err("open mode must refuse the fold write");
+        let msg = err.to_string();
+        assert!(msg.contains("swarm-only"), "{msg}");
+        assert!(msg.contains("identity_mode=swarm"), "{msg}");
+    }
+
+    #[test]
+    fn captain_open_mode_force_overrides() {
+        captain_write_gate(
+            &toron_core::mailbox::naming::IdentityMode::Open,
+            true,
+            "flywheel",
+        )
+        .expect("force overrides the open-mode refusal");
+    }
+
+    #[test]
+    fn captain_swarm_mode_writes_without_force() {
+        captain_write_gate(
+            &toron_core::mailbox::naming::IdentityMode::Swarm,
+            false,
+            "toron",
+        )
+        .expect("swarm mode routes without force");
+    }
+
+    /// The reader defaults a fresh (migrated) index DB to Open — the mode the
+    /// gate refuses by default.
+    #[tokio::test]
+    async fn captain_open_mode_reader_defaults_open() {
+        let dir = std::env::temp_dir().join(format!("bd-lsgm-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let db = dir.join("index.sqlite").display().to_string();
+        let mode = toron_core::mailbox::identity::project_identity_mode_in_db(&db, "flywheel")
+            .await
+            .expect("read mode");
+        assert!(matches!(
+            mode,
+            toron_core::mailbox::naming::IdentityMode::Open
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

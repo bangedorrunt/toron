@@ -899,6 +899,26 @@ async fn upsert_captain_alias(
     .await?;
     Ok(())
 }
+/// bd-lsgm: read the project's identity mode straight from an index DB —
+/// the CLI captain write path has no live `Mailbox`, only the durable root.
+pub async fn project_identity_mode_in_db(
+    db_path: &str,
+    project_slug: &str,
+) -> anyhow::Result<crate::mailbox::naming::IdentityMode> {
+    let pool = crate::index::schema::connect(db_path).await?;
+    crate::index::schema::migrate(&pool).await?;
+    let mode: Option<String> = sqlx::query_scalar(
+        "SELECT identity_mode FROM project_identity_modes WHERE project_slug = ?1",
+    )
+    .bind(project_slug)
+    .fetch_optional(&pool)
+    .await
+    .ok()
+    .flatten();
+    Ok(crate::mailbox::naming::IdentityMode::parse(
+        mode.as_deref().unwrap_or("open"),
+    ))
+}
 
 /// bd-captain-alias-0g8a: set the captain fold directly in an index DB —
 /// the daemon-mode CLI surface. Callers validate the pin first (whois).
