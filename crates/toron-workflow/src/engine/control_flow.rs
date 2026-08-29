@@ -21,6 +21,147 @@ use super::{
     ActionRunner, ApprovalSink, Decision, ProfileResolver, RunInput, SpawnSink, WorkflowResolver,
 };
 
+use sha2::{Digest, Sha256};
+
+/// Spec 3 helper: extract artifacts from completed node outputs (paths, not blobs)
+fn extract_artifacts(
+    outputs: &serde_json::Map<String, serde_json::Value>,
+) -> Vec<serde_json::Value> {
+    let mut artifacts = Vec::new();
+    for (node, value) in outputs {
+        if let Some(obj) = value.as_object() {
+            // Look for sha-like fields
+            for key in ["sha", "commit_sha", "commit"] {
+                if let Some(sha) = obj.get(key).and_then(|v| v.as_str()) {
+                    artifacts.push(serde_json::json!({
+                        "node": node,
+                        "kind": "commit",
+                        "sha": sha,
+                    }));
+                }
+            }
+            // Look for path-like fields
+            for key in ["path", "receipt_path", "ledger_path", "stdout_path", "stderr_path"] {
+                if let Some(path) = obj.get(key).and_then(|v| v.as_str()) {
+                    let kind = if key == "ledger_path" { "ledger" } else { "receipt" };
+                    let mut art = serde_json::json!({
+                        "node": node,
+                        "kind": kind,
+                        "path": path,
+                    });
+                    if let Some(exit) = obj.get("exit").and_then(|v| v.as_i64()) {
+                        art["exit"] = serde_json::json!(exit);
+                    }
+                    artifacts.push(art);
+                }
+            }
+            // If the node is a verify or commit-like, but the output is just {"sha": "..."} without kind, we already handled
+            // Also handle case where output is {"ok": true, "sha": "..."} - we already handled sha above
+            // For generic path without sha, we already handled
+        }
+    }
+    // Sort by node for stable hash
+    artifacts.sort_by(|a, b| a["node"].as_str().cmp(&b["node"].as_str()));
+    artifacts
+}
+
+/// Spec 3: compute evidence_hash as SHA256 hex of canonical JSON of {run_id, node, artifacts, ledger_path}
+fn compute_evidence_hash(
+    run_id: &str,
+    node: &str,
+    artifacts: &[serde_json::Value],
+    ledger_path: &str,
+) -> String {
+    // Build canonical object with sorted keys via BTreeMap
+    let mut map = std::collections::BTreeMap::new();
+    map.insert("run_id".to_string(), serde_json::Value::String(run_id.to_string()));
+    map.insert("node".to_string(), serde_json::Value::String(node.to_string()));
+    // For artifacts, only include path and sha for each, sorted
+    let arts: Vec<serde_json::Value> = artifacts
+        .iter()
+        .map(|a| {
+            let mut m = std::collections::BTreeMap::new();
+            if let Some(p) = a.get("path") {
+                m.insert("path".to_string(), p.clone());
+            }
+            if let Some(s) = a.get("sha") {
+                m.insert("sha".to_string(), s.clone());
+            }
+            serde_json::Value::Object(m.into_iter().collect())
+        })
+        .collect();
+    map.insert("artifacts".to_string(), serde_json::Value::Array(arts));
+    map.insert(
+        "ledger_path".to_string(),
+        serde_json::Value::String(ledger_path.to_string()),
+    );
+    let canonical = serde_json::to_string(&map).unwrap_or_default();
+    let mut hasher = Sha256::new();
+    hasher.update(canonical.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+/// Spec 3: build the full approval promise data
+fn build_approval_payload(
+    run_id: &str,
+    workflow_name: &str,
+    node_name: &str,
+    wave: usize,
+    question: &str,
+    outputs: &serde_json::Map<String, serde_json::Value>,
+    graph: &Graph,
+) -> serde_json::Value {
+    let nodes_completed: Vec<String> = outputs.keys().cloned().collect();
+    let nodes_failed: Vec<String> = outputs
+        .iter()
+        .filter(|(_, v)| v.get("ok").and_then(|b| b.as_bool()) == Some(false))
+        .map(|(k, _)| k.clone())
+        .collect();
+    let all_nodes: std::collections::BTreeSet<String> =
+        graph.nodes.keys().cloned().collect();
+    let done_set: std::collections::BTreeSet<String> = outputs.keys().cloned().collect();
+    let mut pending: Vec<String> = all_nodes
+        .difference(&done_set)
+        .cloned()
+        .collect();
+    // Remove the current node from pending (it's the one being requested)
+    pending.retain(|n| n != node_name);
+    pending.sort();
+
+    let mut completed_sorted = nodes_completed.clone();
+    completed_sorted.sort();
+    let mut failed_sorted = nodes_failed.clone();
+    failed_sorted.sort();
+
+    let artifacts = extract_artifacts(outputs);
+    let ledger_path = format!(".flywheel/receipts/{}-progress-ledger.json", run_id);
+    let blast_radius = workflow_name.to_string();
+    let timeout = "PT24H".to_string();
+
+    let evidence_hash = compute_evidence_hash(run_id, node_name, &artifacts, &ledger_path);
+
+    serde_json::json!({
+        "run_id": run_id,
+        "workflow": workflow_name,
+        "suspended_at": {
+            "node": node_name,
+            "wave": wave,
+        },
+        "question": question,
+        "context": {
+            "nodes_completed": completed_sorted,
+            "nodes_failed": failed_sorted,
+            "nodes_pending": pending,
+            "artifacts": artifacts,
+            "ledger_path": ledger_path,
+            "blast_radius": blast_radius,
+            "timeout": timeout,
+        },
+        "evidence_hash": evidence_hash,
+        "message": question,
+    })
+}
+
 /// The durable workflow function: executes steps, durable-sleeps on `delay`,
 /// and parks on `request_approval` until the promise resolves (WF-08 fix).
 ///
@@ -35,7 +176,12 @@ pub async fn run_workflow(
 ) -> resonate_sdk::Result<serde_json::Value> {
     let workflow = &input.workflow;
     let graph = workflow.to_graph();
-    run_graph(ctx, &input.trigger, &graph).await
+    let run_id = input
+        .run_id
+        .clone()
+        .unwrap_or_else(|| "unknown".to_string());
+    let workflow_name = workflow.name.clone();
+    run_graph(ctx, &input.trigger, &graph, &run_id, &workflow_name).await
 }
 
 /// Execute an ordered list of steps, accumulating outputs into `step_outputs`
@@ -439,6 +585,7 @@ pub(crate) async fn run_call_workflow(
     let input = RunInput {
         workflow: child_wf,
         trigger,
+        run_id: None,
     };
     let future = ctx.run(run_workflow, input).spawn()?;
     let out = future.await?;
@@ -568,6 +715,8 @@ pub(crate) async fn run_graph(
     ctx: &Context,
     trigger: &serde_json::Value,
     graph: &Graph,
+    run_id: &str,
+    workflow_name: &str,
 ) -> resonate_sdk::prelude::Result<serde_json::Value> {
     use crate::schema::GraphNode;
     use std::collections::BTreeSet;
@@ -575,8 +724,10 @@ pub(crate) async fn run_graph(
     let nodes = &graph.nodes;
     let mut outputs: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
     let mut done: BTreeSet<String> = BTreeSet::new();
+    let mut wave: usize = 0;
 
     loop {
+        wave += 1;
         // Compute the next ready wave: not done, all needs done.
         let mut ready: Vec<(&String, &GraphNode)> = Vec::new();
         for (name, node) in nodes {
@@ -619,6 +770,12 @@ pub(crate) async fn run_graph(
                     GraphNodeInput {
                         action: rendered,
                         trigger: trigger.clone(),
+                        run_id: run_id.to_string(),
+                        workflow_name: workflow_name.to_string(),
+                        node_name: (*name).clone(),
+                        wave,
+                        outputs: outputs.clone(),
+                        graph: Some(graph.clone()),
                     },
                 )
                 .spawn()?;
@@ -663,6 +820,24 @@ pub struct GraphNodeInput {
     /// branch) need it to render their inner steps — the raw runner path did
     /// not. Serialized with the action so the child is self-contained.
     pub trigger: serde_json::Value,
+    /// Spec 3: run_id for evidence-bearing approval payload (default empty for backward compat)
+    #[serde(default)]
+    pub run_id: String,
+    /// Spec 3: workflow name
+    #[serde(default)]
+    pub workflow_name: String,
+    /// Spec 3: node name for suspended_at
+    #[serde(default)]
+    pub node_name: String,
+    /// Spec 3: wave number for suspended_at
+    #[serde(default)]
+    pub wave: usize,
+    /// Spec 3: current outputs snapshot for building context (default empty)
+    #[serde(default)]
+    pub outputs: serde_json::Map<String, serde_json::Value>,
+    /// Spec 3: graph topology for pending nodes (default None for backward compat)
+    #[serde(default)]
+    pub graph: Option<Graph>,
 }
 
 /// A durable child executing ONE graph node's action. Spawned concurrently by
@@ -682,6 +857,49 @@ pub async fn run_graph_node(
     // before the node ran, so no re-render).
     let runner = ctx.get_dependency::<ActionRunner>();
     use crate::schema::Step;
+
+    // Spec 3: evidence-bearing approval payload (Wave 2)
+    if let Action::RequestApproval { message } = &input.action {
+        // Use the richer payload if we have the additional context (graph case)
+        // Fallback to simple message-only payload for backward compat (e.g., tests that don't set run_id)
+        let payload = if !input.run_id.is_empty()
+            && !input.workflow_name.is_empty()
+            && !input.node_name.is_empty()
+            && input.graph.is_some()
+        {
+            let graph = input.graph.as_ref().unwrap();
+            build_approval_payload(
+                &input.run_id,
+                &input.workflow_name,
+                &input.node_name,
+                input.wave,
+                message,
+                &input.outputs,
+                graph,
+            )
+        } else {
+            serde_json::json!({ "message": message })
+        };
+        let pending = ctx
+            .promise::<Decision>()
+            .data(&payload)?
+            .create()?;
+        let promise_id = pending.id().await?;
+        ctx.get_dependency::<ApprovalSink>()
+            .lock()
+            .await
+            .push(promise_id.clone());
+        let decision: Decision = match pending.await {
+            Ok(d) => d,
+            Err(resonate_sdk::error::Error::Suspended) => {
+                return Err(resonate_sdk::error::Error::Suspended);
+            }
+            Err(e) => Decision::rejected(format!("rejected: {e}")),
+        };
+        let decision_val = serde_json::to_value(&decision)?;
+        return Ok(decision_val);
+    }
+
     // ADR-0024 Spec 0 park fix: graph nodes for RequestApproval/Delay/Spawn
     // must park via run_step (the linear park path), not the sync runner.
     // Control-flow and Verify also route through run_step.
