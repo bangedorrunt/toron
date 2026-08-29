@@ -1,3 +1,4 @@
+// governed-by: ADR-0024
 // governed-by: ADR-0003
 #![forbid(unsafe_code)]
 
@@ -32,28 +33,9 @@ pub async fn run_workflow(
     ctx: &Context,
     input: RunInput,
 ) -> resonate_sdk::Result<serde_json::Value> {
-    let runner = ctx.get_dependency::<ActionRunner>();
     let workflow = &input.workflow;
-
-    // Graph dispatch (ADR-0005 Spec 4b): when `graph:` is present the DAG
-    // scheduler runs (independent nodes concurrently), NOT the linear steps.
-    if let Some(graph) = &workflow.graph {
-        return run_graph(ctx, &input.trigger, graph).await;
-    }
-
-    let mut step_outputs: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
-    if let Some(failed) = run_steps(
-        ctx,
-        &runner,
-        &input.trigger,
-        &workflow.steps,
-        &mut step_outputs,
-    )
-    .await?
-    {
-        return Ok(failed);
-    }
-    Ok(serde_json::Value::Object(step_outputs))
+    let graph = workflow.to_graph();
+    run_graph(ctx, &input.trigger, &graph).await
 }
 
 /// Execute an ordered list of steps, accumulating outputs into `step_outputs`
@@ -220,6 +202,7 @@ pub(crate) fn run_step<'a>(
                 workflow,
                 await_,
                 no_claim_timeout,
+                context,
             } => {
                 run_spawn(
                     ctx,
@@ -227,8 +210,26 @@ pub(crate) fn run_step<'a>(
                     workflow.as_deref(),
                     *await_,
                     *no_claim_timeout,
+                    *context,
                 )
                 .await?
+            }
+            Action::Verify { command } => {
+                let sink = ctx.get_dependency::<crate::engine::VerifySink>();
+                let guard = sink.0.lock().unwrap().clone();
+                if let Some(f) = guard {
+                    let req = crate::engine::VerifyRequest {
+                        command: command.clone(),
+                    };
+                    match f(&req) {
+                        Ok(res) => serde_json::to_value(&res).unwrap_or_else(
+                            |e| serde_json::json!({ "ok": false, "error": e.to_string() }),
+                        ),
+                        Err(e) => serde_json::json!({ "ok": false, "error": e.to_string() }),
+                    }
+                } else {
+                    serde_json::json!({ "ok": false, "error": "verify sink missing" })
+                }
             }
         };
 
@@ -462,6 +463,7 @@ pub(crate) async fn run_spawn(
     workflow: Option<&str>,
     await_: bool,
     no_claim_timeout: u64,
+    context: Option<crate::schema::ContextMode>,
 ) -> resonate_sdk::prelude::Result<serde_json::Value> {
     // 1. Resolve the profile (DI seam).
     let resolver = ctx.get_dependency::<ProfileResolver>();
@@ -476,7 +478,7 @@ pub(crate) async fn run_spawn(
     };
 
     // 2. Create the promise — the job's binding key.
-    let spec = serde_json::json!({
+    let mut spec = serde_json::json!({
         "profile": profile,
         "workflow": workflow,
         "resolved": resolved,
@@ -485,6 +487,10 @@ pub(crate) async fn run_spawn(
         // forget, never resolve).
         "await": await_,
     });
+    if let Some(ctx_mode) = context {
+        spec["context"] =
+            serde_json::to_value(ctx_mode).unwrap_or(serde_json::Value::String("inherit".into()));
+    }
     let task = ctx.promise::<serde_json::Value>().data(&spec)?;
     let task = if await_ && no_claim_timeout > 0 {
         task.timeout(Duration::from_secs(no_claim_timeout))
@@ -623,11 +629,17 @@ pub(crate) async fn run_graph(
         // deterministic).
         for (name, future) in futures {
             let value = future.await?;
-            // on_error: fail_run — a child failure must fail the run.
+            // on_error: fail_run — only `ok == false` is a failure (ADR-0024 Spec 0).
+            // Presence of `error` without `ok:false` is NOT a failure.
             let node = nodes.get(&name).expect("node in map");
-            if let Some(err) = value.get("error").and_then(|v| v.as_str())
-                && node.on_error == StepOnError::FailRun
+            if node.on_error == StepOnError::FailRun
+                && value.get("ok").and_then(|v| v.as_bool()) == Some(false)
             {
+                let err = value
+                    .get("error")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("step failed")
+                    .to_string();
                 return Ok(serde_json::json!({
                     "status": "failed",
                     "error": err,
@@ -670,15 +682,22 @@ pub async fn run_graph_node(
     // before the node ran, so no re-render).
     let runner = ctx.get_dependency::<ActionRunner>();
     use crate::schema::Step;
-    let is_control_flow = matches!(
+    // ADR-0024 Spec 0 park fix: graph nodes for RequestApproval/Delay/Spawn
+    // must park via run_step (the linear park path), not the sync runner.
+    // Control-flow and Verify also route through run_step.
+    let is_park_or_control = matches!(
         input.action,
         Action::Parallel { .. }
             | Action::Foreach { .. }
             | Action::Branch { .. }
             | Action::Retry { .. }
             | Action::CallWorkflow { .. }
+            | Action::RequestApproval { .. }
+            | Action::Delay { .. }
+            | Action::Spawn { .. }
+            | Action::Verify { .. }
     );
-    if is_control_flow {
+    if is_park_or_control {
         let mut step_outputs = serde_json::Map::new();
         let step = Step {
             name: None,

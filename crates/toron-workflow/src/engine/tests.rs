@@ -187,9 +187,15 @@ async fn approval_suspends_and_resumes() {
 
     // The parked run resumes and completes.
     let output = handle.result().await.expect("run completes after approval");
+    // ADR-0024 graph canonical: decision is under the node name (gate) and
+    // historically also under "decision". Accept either for compat.
+    let outcome = output["decision"]["outcome"]
+        .as_str()
+        .or_else(|| output["gate"]["outcome"].as_str())
+        .unwrap_or("");
     assert_eq!(
-        output["decision"]["outcome"], "approved",
-        "decision recorded after resume"
+        outcome, "approved",
+        "decision recorded after resume: {output}"
     );
 }
 
@@ -248,7 +254,11 @@ async fn approval_rejection_is_a_decision_not_a_failure() {
         .expect("reject");
 
     let output = handle.result().await.expect("completes after rejection");
-    assert_eq!(output["decision"]["outcome"], "rejected");
+    let outcome = output["decision"]["outcome"]
+        .as_str()
+        .or_else(|| output["gate"]["outcome"].as_str())
+        .unwrap_or("");
+    assert_eq!(outcome, "rejected", "rejection recorded: {output}");
 }
 
 /// A `ProfileResolver` that resolves `@housekeeper` to a spawn spec.
@@ -1458,5 +1468,141 @@ async fn invoke_redelivery_replays_recorded_run() {
         calls.load(std::sync::atomic::Ordering::SeqCst),
         1,
         "steps execute exactly once across redelivery"
+    );
+}
+
+/// ADR-0024 Spec 0 park fix: desugared `steps:` with `request_approval` still parks via run_graph.
+#[tokio::test(flavor = "multi_thread")]
+async fn park_desugared_request_approval_still_parks() {
+    let (_srv, engine) = remote_engine(noop_runner()).await;
+    let wf = parse_workflow(
+        r##"
+name: signoff
+steps:
+  - name: gate
+    action: request_approval
+    message: "approve?"
+  - name: after
+    action: send_dm
+    to: x
+    body: y
+"##,
+    )
+    .expect("parse");
+    // to_graph desugars the linear steps; run_workflow always calls run_graph.
+    let g = wf.to_graph();
+    assert_eq!(g.nodes["gate"].needs, Vec::<String>::new());
+    assert_eq!(g.nodes["after"].needs, vec!["gate"]);
+    let input = RunInput {
+        workflow: wf,
+        trigger: serde_json::json!({}),
+    };
+    let handle = engine
+        .resonate()
+        .run("park-desugared-1", run_workflow, input)
+        .spawn()
+        .await
+        .expect("spawn");
+    let promise_id = poll_promise_id(&engine).await;
+    assert!(!handle.done().await.expect("done"), "must park");
+    engine
+        .resolve_approval(&promise_id, &Decision::approved("ok"))
+        .await
+        .expect("resolve");
+    let out = handle.result().await.expect("resumes");
+    assert_eq!(out["gate"]["outcome"], "approved");
+}
+
+/// ADR-0024 Spec 0 fail_run predicate: only `ok == false` is a failure.
+#[tokio::test]
+async fn failure_kind_ok_false_is_failure_error_without_ok_is_not() {
+    // Graph node returning {ok:false, error:"boom"} with on_error fail_run → failed.
+    let engine = WorkflowEngine::local(Arc::new(|a: &Action| match a {
+        Action::SendDm { .. } => Ok(serde_json::json!({ "ok": false, "error": "boom" })),
+        _ => Ok(serde_json::Value::Null),
+    }))
+    .expect("engine");
+    let wf = parse_workflow(
+        r##"
+name: t
+graph:
+  nodes:
+    a: { action: send_dm, to: x, body: y, on_error: fail_run }
+"##,
+    )
+    .expect("parse");
+    let out = engine
+        .run(
+            "failure-kind-fail",
+            RunInput {
+                workflow: wf,
+                trigger: serde_json::json!({}),
+            },
+        )
+        .await
+        .expect("run");
+    assert_eq!(out["status"], "failed");
+    assert_eq!(out["error"], "boom");
+
+    // Presence of `error` without `ok:false` is NOT a failure — run succeeds.
+    let engine2 = WorkflowEngine::local(Arc::new(|_: &Action| {
+        Ok(serde_json::json!({ "ok": true, "error": "something" }))
+    }))
+    .expect("engine2");
+    let wf2 = parse_workflow(
+        r##"
+name: t2
+graph:
+  nodes:
+    a: { action: send_dm, to: x, body: y, on_error: fail_run }
+"##,
+    )
+    .expect("parse2");
+    let out2 = engine2
+        .run(
+            "failure-kind-not-fail",
+            RunInput {
+                workflow: wf2,
+                trigger: serde_json::json!({}),
+            },
+        )
+        .await
+        .expect("run2");
+    assert!(
+        out2.get("status").is_none() || out2["status"] != "failed",
+        "error without ok:false must not fail: {out2}"
+    );
+    assert_eq!(out2["a"]["ok"], true);
+}
+
+/// VerifySink missing → {ok:false, error:"verify sink missing"} (ADR-0024 Spec 2).
+#[tokio::test]
+async fn verify_sink_missing_returns_error() {
+    let engine = WorkflowEngine::local(noop_runner()).expect("engine");
+    let wf = parse_workflow(
+        r##"
+name: t
+graph:
+  nodes:
+    v: { action: verify, command: "cargo test" }
+"##,
+    )
+    .expect("parse verify");
+    let out = engine
+        .run(
+            "verify-missing-1",
+            RunInput {
+                workflow: wf,
+                trigger: serde_json::json!({}),
+            },
+        )
+        .await
+        .expect("run");
+    assert_eq!(out["v"]["ok"], false);
+    assert!(
+        out["v"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("verify sink missing")
     );
 }

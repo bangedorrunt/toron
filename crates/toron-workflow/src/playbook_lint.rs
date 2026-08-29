@@ -1,3 +1,4 @@
+// governed-by: ADR-0024
 // governed-by: ADR-0019
 // governed-by: ADR-0022
 #![forbid(unsafe_code)]
@@ -409,11 +410,15 @@ fn lint_prototype_arena(report: &mut LintReport, wf: &Workflow) {
 /// one step must declare `build_slot: true` — the static contract marker the
 /// embedding honours via the kind-30032 lease.
 fn lint_compile_mode(report: &mut LintReport, wf: &Workflow) {
-    let declares_slot = wf
+    let declares_slot_steps = wf
         .steps
         .iter()
         .any(|s| step_or_nested(s).any(|inner| inner.build_slot));
-    if !declares_slot {
+    let declares_slot_graph = wf
+        .graph
+        .as_ref()
+        .is_some_and(|g| g.nodes.values().any(|n| n.build_slot));
+    if !declares_slot_steps && !declares_slot_graph {
         error(
             report,
             "compile-mode prototype/arena arms must declare build-slot serialization — put `build_slot: true` on the arms step (one arm at a time under the build slot; ADR-0019 Spec 7.2 amendment 2026-08-15)",
@@ -427,6 +432,11 @@ fn lint_sketch_mode(report: &mut LintReport, wf: &Workflow) {
     let mut strings = Vec::new();
     for step in &wf.steps {
         collect_step_strings(step, &mut strings);
+    }
+    if let Some(graph) = &wf.graph {
+        for node in graph.nodes.values() {
+            collect_action_strings(&node.action, &mut strings);
+        }
     }
     for s in &strings {
         if let Some(tok) = REPO_BUILD_PATH_TOKENS.iter().find(|t| s.contains(**t)) {
@@ -669,6 +679,7 @@ fn collect_action_strings(action: &Action, out: &mut Vec<String>) {
                 out.push(w.clone());
             }
         }
+        Action::Verify { command } => out.push(command.clone()),
     }
 }
 

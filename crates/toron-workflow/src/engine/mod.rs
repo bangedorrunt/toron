@@ -1,3 +1,4 @@
+// governed-by: ADR-0024
 // governed-by: ADR-0003, ADR-0009
 #![forbid(unsafe_code)]
 
@@ -128,7 +129,7 @@ pub use control_flow::{
     GraphNodeInput, ParallelCopyInput, build_workflow_run_terminal, run_graph_node,
     run_parallel_copy, run_workflow, stamp_workflow_emitted,
 };
-pub use sinks::{ApprovalSink, SpawnSink};
+pub use sinks::{ApprovalSink, SpawnSink, VerifyRequest, VerifyResult, VerifySink};
 
 // Crate-internal: the split modules' private helpers, re-exported so the
 // tests.rs suite (moved verbatim, `use super::*`) keeps resolving them.
@@ -215,6 +216,7 @@ pub struct WorkflowEngine {
     approval_sink: ApprovalSink,
     spawn_sink: SpawnSink,
     policy_sink: crate::cron_failure::PolicySink,
+    verify_sink: VerifySink,
 }
 
 impl std::fmt::Debug for WorkflowEngine {
@@ -233,6 +235,7 @@ impl std::fmt::Debug for WorkflowEngine {
                 "policy_sink_len",
                 &self.policy_sink.try_lock().map(|g| g.len()).unwrap_or(0),
             )
+            .field("verify_sink", &self.verify_sink)
             .finish()
     }
 }
@@ -267,13 +270,15 @@ impl WorkflowEngine {
         let sink = ApprovalSink::default();
         let spawn_sink = SpawnSink::default();
         let policy_sink = crate::cron_failure::PolicySink::new();
+        let verify_sink = VerifySink::default();
         let resonate = Resonate::local()
             .with_dependency(action_runner)
             .with_dependency(profile_resolver)
             .with_dependency(workflow_resolver)
             .with_dependency(sink.clone())
             .with_dependency(spawn_sink.clone())
-            .with_dependency(policy_sink.clone());
+            .with_dependency(policy_sink.clone())
+            .with_dependency(verify_sink.clone());
         resonate
             .register(run_workflow)
             .map_err(|e| anyhow::anyhow!("register workflow function: {e}"))?;
@@ -288,6 +293,7 @@ impl WorkflowEngine {
             approval_sink: sink,
             spawn_sink,
             policy_sink,
+            verify_sink,
         })
     }
 
@@ -306,6 +312,7 @@ impl WorkflowEngine {
         let sink = ApprovalSink::default();
         let spawn_sink = SpawnSink::default();
         let policy_sink = crate::cron_failure::PolicySink::new();
+        let verify_sink = VerifySink::default();
         let config = ResonateConfig {
             url: Some(url.into()),
             ..Default::default()
@@ -316,7 +323,8 @@ impl WorkflowEngine {
             .with_dependency(Self::default_workflow_resolver())
             .with_dependency(sink.clone())
             .with_dependency(spawn_sink.clone())
-            .with_dependency(policy_sink.clone());
+            .with_dependency(policy_sink.clone())
+            .with_dependency(verify_sink.clone());
         resonate
             .register(run_workflow)
             .map_err(|e| anyhow::anyhow!("register workflow function: {e}"))?;
@@ -331,6 +339,7 @@ impl WorkflowEngine {
             approval_sink: sink,
             spawn_sink,
             policy_sink,
+            verify_sink,
         })
     }
 
@@ -345,6 +354,7 @@ impl WorkflowEngine {
         let sink = ApprovalSink::default();
         let spawn_sink = SpawnSink::default();
         let policy_sink = crate::cron_failure::PolicySink::new();
+        let verify_sink = VerifySink::default();
         let config = ResonateConfig {
             url: Some(url.into()),
             ..Default::default()
@@ -355,7 +365,8 @@ impl WorkflowEngine {
             .with_dependency(workflow_resolver)
             .with_dependency(sink.clone())
             .with_dependency(spawn_sink.clone())
-            .with_dependency(policy_sink.clone());
+            .with_dependency(policy_sink.clone())
+            .with_dependency(verify_sink.clone());
         resonate
             .register(run_workflow)
             .map_err(|e| anyhow::anyhow!("register workflow function: {e}"))?;
@@ -370,6 +381,7 @@ impl WorkflowEngine {
             approval_sink: sink,
             spawn_sink,
             policy_sink,
+            verify_sink,
         })
     }
 
@@ -406,6 +418,11 @@ impl WorkflowEngine {
     /// escalate DM).
     pub fn policy_sink(&self) -> &crate::cron_failure::PolicySink {
         &self.policy_sink
+    }
+
+    /// The verify side-channel (ADR-0024 Spec 2).
+    pub fn verify_sink(&self) -> &VerifySink {
+        &self.verify_sink
     }
 
     /// Start a workflow run, idempotent on `run_id` (a redelivered trigger

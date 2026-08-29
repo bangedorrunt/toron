@@ -1,3 +1,4 @@
+// governed-by: ADR-0024
 // governed-by: ADR-0003
 #![forbid(unsafe_code)]
 
@@ -535,6 +536,15 @@ fn check_action(report: &mut LintReport, action: &Action) {
                 report.issues.push(LintIssue {
                     level: Level::Error,
                     message: "spawn requires a non-empty `profile`".into(),
+                    line: None,
+                });
+            }
+        }
+        Action::Verify { command } => {
+            if command.trim().is_empty() {
+                report.issues.push(LintIssue {
+                    level: Level::Error,
+                    message: "verify requires a non-empty `command`".into(),
                     line: None,
                 });
             }
