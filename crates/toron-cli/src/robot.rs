@@ -682,7 +682,6 @@ pub async fn run_contact_daemon(dc: &DaemonClient, cmd: &ContactCommand) -> anyh
                 &args.project,
             )
             .await?;
-            let open_mode = matches!(mode, toron_core::mailbox::naming::IdentityMode::Open);
             match &args.pin {
                 Some(pin) => {
                     captain_write_gate(&mode, args.force, &args.project)?;
