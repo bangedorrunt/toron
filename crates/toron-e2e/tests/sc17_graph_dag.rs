@@ -49,6 +49,7 @@ graph:
         .run(
             "sc17-graph-1",
             toron_workflow::engine::RunInput {
+                run_id: Some("sc-test-run".into()),
                 workflow: wf,
                 trigger: serde_json::json!({}),
             },

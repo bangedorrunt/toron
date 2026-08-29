@@ -89,6 +89,7 @@ pub fn run(file: &PathBuf, trigger: &str) -> Result<i32> {
             .run(
                 &run_id,
                 RunInput {
+                    run_id: Some(run_id.clone()),
                     workflow,
                     trigger: trigger_value,
                 },

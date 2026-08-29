@@ -1578,14 +1578,8 @@ mod flag_conformance_tests {
         );
 
         // show (no pin, no clear) still parses
-        let cli = Cli::try_parse_from([
-            "toron",
-            "contact",
-            "captain",
-            "--project",
-            "testproj",
-        ])
-        .expect("parse show");
+        let cli = Cli::try_parse_from(["toron", "contact", "captain", "--project", "testproj"])
+            .expect("parse show");
         match cli.command {
             Some(Command::Contact(ContactCommand::Captain(args))) => {
                 assert!(!args.clear);

@@ -136,6 +136,7 @@ async fn sc11_approval_crash_resume() {
     // 2. Engine A (remote worker) runs the deploy workflow → parks on approval.
     let engine_a = WorkflowEngine::remote(&server_url, noop_runner()).expect("engine A");
     let input = RunInput {
+        run_id: Some("sc-test-run".into()),
         workflow: deploy_workflow(),
         trigger: serde_json::json!({}),
     };

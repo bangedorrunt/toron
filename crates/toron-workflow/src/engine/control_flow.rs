@@ -41,9 +41,19 @@ fn extract_artifacts(
                 }
             }
             // Look for path-like fields
-            for key in ["path", "receipt_path", "ledger_path", "stdout_path", "stderr_path"] {
+            for key in [
+                "path",
+                "receipt_path",
+                "ledger_path",
+                "stdout_path",
+                "stderr_path",
+            ] {
                 if let Some(path) = obj.get(key).and_then(|v| v.as_str()) {
-                    let kind = if key == "ledger_path" { "ledger" } else { "receipt" };
+                    let kind = if key == "ledger_path" {
+                        "ledger"
+                    } else {
+                        "receipt"
+                    };
                     let mut art = serde_json::json!({
                         "node": node,
                         "kind": kind,
@@ -66,7 +76,7 @@ fn extract_artifacts(
 }
 
 /// Spec 3: compute evidence_hash as SHA256 hex of canonical JSON of {run_id, node, artifacts, ledger_path}
-fn compute_evidence_hash(
+pub(crate) fn compute_evidence_hash(
     run_id: &str,
     node: &str,
     artifacts: &[serde_json::Value],
@@ -74,8 +84,14 @@ fn compute_evidence_hash(
 ) -> String {
     // Build canonical object with sorted keys via BTreeMap
     let mut map = std::collections::BTreeMap::new();
-    map.insert("run_id".to_string(), serde_json::Value::String(run_id.to_string()));
-    map.insert("node".to_string(), serde_json::Value::String(node.to_string()));
+    map.insert(
+        "run_id".to_string(),
+        serde_json::Value::String(run_id.to_string()),
+    );
+    map.insert(
+        "node".to_string(),
+        serde_json::Value::String(node.to_string()),
+    );
     // For artifacts, only include path and sha for each, sorted
     let arts: Vec<serde_json::Value> = artifacts
         .iter()
@@ -117,13 +133,9 @@ fn build_approval_payload(
         .filter(|(_, v)| v.get("ok").and_then(|b| b.as_bool()) == Some(false))
         .map(|(k, _)| k.clone())
         .collect();
-    let all_nodes: std::collections::BTreeSet<String> =
-        graph.nodes.keys().cloned().collect();
+    let all_nodes: std::collections::BTreeSet<String> = graph.nodes.keys().cloned().collect();
     let done_set: std::collections::BTreeSet<String> = outputs.keys().cloned().collect();
-    let mut pending: Vec<String> = all_nodes
-        .difference(&done_set)
-        .cloned()
-        .collect();
+    let mut pending: Vec<String> = all_nodes.difference(&done_set).cloned().collect();
     // Remove the current node from pending (it's the one being requested)
     pending.retain(|n| n != node_name);
     pending.sort();
@@ -880,10 +892,7 @@ pub async fn run_graph_node(
         } else {
             serde_json::json!({ "message": message })
         };
-        let pending = ctx
-            .promise::<Decision>()
-            .data(&payload)?
-            .create()?;
+        let pending = ctx.promise::<Decision>().data(&payload)?.create()?;
         let promise_id = pending.id().await?;
         ctx.get_dependency::<ApprovalSink>()
             .lock()

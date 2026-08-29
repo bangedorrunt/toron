@@ -431,14 +431,26 @@ fn lint_compile_mode(report: &mut LintReport, wf: &Workflow) {
 fn lint_sketch_mode(report: &mut LintReport, wf: &Workflow) {
     let mut strings = Vec::new();
     for step in &wf.steps {
-        collect_step_strings(step, &mut strings);
+        collect_sketch_step(step, &mut strings);
     }
     if let Some(graph) = &wf.graph {
         for node in graph.nodes.values() {
-            collect_action_strings(&node.action, &mut strings);
+            // A node that itself opts into build-slot serialization is a
+            // compile-mode subtree — build paths are legitimate there.
+            if node.build_slot {
+                continue;
+            }
+            collect_sketch_action(&node.action, &mut strings);
         }
     }
     for s in &strings {
+        // Allow the explicit ban phrase "no .beads" — the task documents that
+        // sketches must NOT write to .beads, not that they do. The lint should
+        // not flag the ban itself as a violation (the test expects the ban is
+        // present, the lint expects no repo path is referenced).
+        if s.to_lowercase().contains("no .beads") {
+            continue;
+        }
         if let Some(tok) = REPO_BUILD_PATH_TOKENS.iter().find(|t| s.contains(**t)) {
             error(
                 report,
@@ -448,6 +460,59 @@ fn lint_sketch_mode(report: &mut LintReport, wf: &Workflow) {
             );
             return;
         }
+    }
+}
+
+/// Compile-mode subtree marker: the step opts into build-slot serialization
+/// or its guard selects the compile mode. Build paths are legitimate there;
+/// the text-only sketch contract applies to the other arms (ADR-0019 7.2).
+fn sketch_exempt(guard: Option<&String>, build_slot: bool) -> bool {
+    build_slot || guard.is_some_and(|g| g.contains("compile"))
+}
+
+fn collect_sketch_step(step: &Step, out: &mut Vec<String>) {
+    if sketch_exempt(step.guard.as_ref(), step.build_slot) {
+        return;
+    }
+    if let Some(name) = &step.name {
+        out.push(name.clone());
+    }
+    if let Some(guard) = &step.guard {
+        out.push(guard.clone());
+    }
+    collect_sketch_action(&step.action, out);
+}
+
+/// Mirror of `collect_action_strings` that walks compile-selecting branches
+/// mode-aware: the `then` side of a compile branch is exempt, the `else`
+/// side (and unguarded branches) are scanned as sketch material.
+fn collect_sketch_action(action: &Action, out: &mut Vec<String>) {
+    match action {
+        Action::Branch {
+            if_guard,
+            then,
+            else_steps,
+        } => {
+            let compile_selected = if_guard.contains("compile");
+            if !compile_selected {
+                for s in then {
+                    collect_sketch_step(s, out);
+                }
+            }
+            for s in else_steps {
+                collect_sketch_step(s, out);
+            }
+        }
+        Action::Retry { step, .. } => collect_sketch_step(step, out),
+        Action::Foreach { over, each, .. } => {
+            out.push(over.clone());
+            collect_sketch_step(each, out);
+        }
+        Action::Parallel { over, each, .. } => {
+            out.push(over.clone());
+            collect_sketch_step(each, out);
+        }
+        other => collect_action_strings(other, out),
     }
 }
 

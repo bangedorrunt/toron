@@ -28,6 +28,5 @@ mod catalog_freshness_tests {
                 serde_json::from_str(&content).expect("catalog is valid json");
             assert!(v.is_object() || v.is_array());
         }
-        assert!(true);
     }
 }
