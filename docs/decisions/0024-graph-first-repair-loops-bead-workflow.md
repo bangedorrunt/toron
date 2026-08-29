@@ -692,6 +692,14 @@ A year from now a captain opens the run, sees `repair-1 ✗` / `repair-2 ✓` / 
 
 ---
 
+### Wave 1 ship proof (recorded 2026-08-29 — satisfies the ADR-0025 Spec 0 cross-repo gate)
+
+**bd-adr24-w1-graph-canonical-f0z9 CLOSED.** Commits: `32ebae8` (toron-workflow: `to_graph`, always-`run_graph`, park path, `ok==false` predicate, `Action::Verify` + `VerifySink`, `DispatchSpec.context`, lint R-E1/E2/E3) and `542cffe` (flywheel: `fresh` context honored at the spawn split, `src/pane.rs`).
+
+Park-proof witness: `engine::tests::park_desugared_request_approval_still_parks` — linear `steps:` SIGNOFF desugars to a chain (`needs` asserted), runs through Resonate, parks (handle not done), resumes on `resolve_approval` with the decision projected into `step_outputs`. Predicate witness: `failure_kind_ok_false_is_failure_error_without_ok_is_not`. Sink witness: `verify_sink_missing_returns_error`. Approval decision/reject: `approval_suspends_and_resumes`, `approval_rejection_is_a_decision_not_a_failure`.
+
+Captain verification (TealDune, 2026-08-29): full `cargo test -p toron-workflow` 203/203 green; `cargo clippy -p toron-workflow --all-targets` 0 warnings; `cargo fmt --check` clean; `cargo test -p toron-cli catalog` green (surface frozen; no new tools/kinds); no `std::process::Command` and no `br` calls under `crates/toron-workflow/src/`. Known deviation: the bead's original VERIFY filters (`graph_desugar`, `park`) matched zero test names — the substance landed under the names above; bead record amended.
+
 ## 11. Appendix: Governing scenarios
 
 These replace the 2026-08-25 before/after YAML. They match §6. `--execute --mode pane` unless noted.
