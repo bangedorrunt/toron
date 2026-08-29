@@ -1,3 +1,4 @@
+// governed-by: ADR-0025
 // governed-by: ADR-0003
 // governed-by: ADR-0004 (MailOverseerArgs — Ship 5)
 
@@ -774,8 +775,11 @@ pub struct ContactCaptainArgs {
     #[arg(long, required = true)]
     pub project: String,
     /// Registered adj+noun pin to fold `captain` onto (omit to show current).
-    #[arg(long)]
+    #[arg(long, conflicts_with = "clear")]
     pub pin: Option<String>,
+    /// Clear the captain alias for the project (bd-auqj).
+    #[arg(long, conflicts_with = "pin")]
+    pub clear: bool,
 }
 
 #[derive(Debug, Args)]
@@ -1526,6 +1530,68 @@ mod flag_conformance_tests {
         }
         for sub in cmd.get_subcommands() {
             walk(sub, here.clone(), waived, banned, bad_project);
+        }
+    }
+
+    /// bd-auqj: `toron contact captain --clear` clears the alias; `--pin` and
+    /// `--clear` conflict, and `--project` remains required.
+    #[test]
+    fn captain_clear() {
+        use crate::cli::{Cli, Command, ContactCommand};
+        use clap::Parser;
+
+        // --clear parses with --project
+        let cli = Cli::try_parse_from([
+            "toron",
+            "contact",
+            "captain",
+            "--project",
+            "testproj",
+            "--clear",
+        ])
+        .expect("parse contact captain --clear");
+        match cli.command {
+            Some(Command::Contact(ContactCommand::Captain(args))) => {
+                assert!(args.clear, "--clear flag set");
+                assert!(args.pin.is_none(), "--clear conflicts with --pin");
+                assert_eq!(args.project, "testproj");
+            }
+            _ => panic!("expected contact captain with --clear"),
+        }
+
+        // --pin and --clear conflict
+        let err = Cli::try_parse_from([
+            "toron",
+            "contact",
+            "captain",
+            "--project",
+            "testproj",
+            "--pin",
+            "SomePin",
+            "--clear",
+        ])
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("conflict") || msg.contains("cannot be used with"),
+            "conflict error: {msg}"
+        );
+
+        // show (no pin, no clear) still parses
+        let cli = Cli::try_parse_from([
+            "toron",
+            "contact",
+            "captain",
+            "--project",
+            "testproj",
+        ])
+        .expect("parse show");
+        match cli.command {
+            Some(Command::Contact(ContactCommand::Captain(args))) => {
+                assert!(!args.clear);
+                assert!(args.pin.is_none());
+            }
+            _ => panic!("expected show"),
         }
     }
 }

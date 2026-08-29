@@ -114,10 +114,11 @@ Release profile: `strip = "none"` (macOS arm64 LINKEDIT / sqlx_macros).
 
 ## NOTES
 
-- Captain alias (bd-captain-alias-0g8a): `captain` is a routable fold onto
+- Captain alias (bd-captain-alias-0g8a, bd-auqj): `captain` is a routable fold onto
   the project's REGISTERED orchestrator pin — set via
-  `toron contact captain --project <slug> --pin <adj+noun>`, resolved by
-  `toron mail whois <slug> captain` and `mail send --to captain`. Standing
+  `toron contact captain --project <slug> --pin <adj+noun>`, cleared via
+  `toron contact captain --project <slug> --clear` (bd-auqj, parent death),
+  resolved by `toron mail whois <slug> captain` and `mail send --to captain`. Standing
   orders address reports to `captain`, never to the host username.
 - `toron serve` requires `--mcp-stdio` or `--mcp-http`. No-flag serve bails.
 - Daemon label `com.toron.serve`, HTTP `127.0.0.1:18080`. Passphrase file
