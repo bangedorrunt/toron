@@ -1,3 +1,4 @@
+// governed-by: ADR-0024
 // governed-by: ADR-0003
 // governed-by: ADR-0022
 #![forbid(unsafe_code)]
@@ -108,6 +109,42 @@ impl CrewSpec {
     }
 }
 
+impl Workflow {
+    /// Desugar `steps:` to a chain `graph:` (ADR-0024 Spec 0). When `graph:` is
+    /// present it is returned as-is; otherwise each step becomes a node named
+    /// by its explicit `name` or `step_N` (1-indexed) with `needs: [previous]`
+    /// to preserve linear order. Only fields `GraphNode` carries are copied
+    /// (`action`, `needs`, `guard`, `on_error`, `build_slot`); unnamed steps
+    /// grow the output map under `step_N` (documented compat gate).
+    pub fn to_graph(&self) -> Graph {
+        if let Some(g) = &self.graph {
+            return g.clone();
+        }
+        let mut nodes = BTreeMap::new();
+        let mut prev: Option<String> = None;
+        for (idx, step) in self.steps.iter().enumerate() {
+            let name = step
+                .name
+                .clone()
+                .unwrap_or_else(|| format!("step_{}", idx + 1));
+            let mut needs = Vec::new();
+            if let Some(p) = prev.clone() {
+                needs.push(p);
+            }
+            let node = GraphNode {
+                action: step.action.clone(),
+                needs,
+                guard: step.guard.clone(),
+                on_error: step.on_error,
+                build_slot: step.build_slot,
+            };
+            nodes.insert(name.clone(), node);
+            prev = Some(name);
+        }
+        Graph { nodes }
+    }
+}
+
 /// A named workflow input declaration (ADR-0005 Spec 2).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InputDecl {
@@ -146,6 +183,11 @@ pub struct GraphNode {
     /// Failure policy for this node (ADR-0005 Spec 0).
     #[serde(default, skip_serializing_if = "StepOnError::is_continue")]
     pub on_error: StepOnError,
+    /// Static build-slot serialization marker (ADR-0019). Mirrors
+    /// [`Step::build_slot`]; required for prototype/arena compile-mode lint
+    /// when workflows are authored as linear steps and desugared to a graph.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub build_slot: bool,
 }
 
 /// A workflow trigger (one of the ADR Phase-2 set).
@@ -362,6 +404,17 @@ impl Phase {
     pub const ALL: [&'static str; 5] = ["resolve", "plan", "implement", "review", "verify"];
 }
 
+/// Execution context for a dispatched job (ADR-0024 Spec 2).
+/// `inherit` (default) continues the caller's session transcript;
+/// `fresh` starts a new session with an empty transcript.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ContextMode {
+    #[default]
+    Inherit,
+    Fresh,
+}
+
 /// Closed-vocabulary gate for `DispatchSpec::phase` (ADR-0022 §3.1/§4):
 /// only the five [`Phase`] wire values deserialize; anything else is an
 /// `unknown variant` parse error surfaced at lint time.
@@ -429,6 +482,10 @@ pub struct DispatchSpec {
     /// Run input rendered into the dispatch prompt (project slug).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project: Option<String>,
+    /// Execution context mode (ADR-0024 Spec 2). `None` = inherit (default);
+    /// `Some(Fresh)` = new session, empty transcript.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<ContextMode>,
     /// Unknown keys, preserved verbatim (flatten).
     #[serde(default, flatten, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra: BTreeMap<String, serde_json::Value>,
@@ -571,7 +628,16 @@ pub enum Action {
         /// Abort an unclaimed spawn-await after N seconds (default 600).
         #[serde(default)]
         no_claim_timeout: u64,
+        /// Execution context mode (ADR-0024 Spec 2). `None` = inherit; `Some(Fresh)` = new session.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        context: Option<ContextMode>,
     },
+    /// Verify a command via the embedding's VerifySink (ADR-0024 Spec 2).
+    /// The engine calls `VerifySink` with the command; the embedding runs
+    /// `__loop-run-verify` under the cargo slot and returns `{ok, exit,
+    /// stdout_path, stderr_path}`. Missing sink → `{ok:false,
+    /// error:"verify sink missing"}`. The engine never shells out.
+    Verify { command: String },
 }
 
 /// Default retry attempts (used by `Action::Retry` serde default).
@@ -596,6 +662,7 @@ impl Action {
             Self::Parallel { .. } => "parallel",
             Self::CallWorkflow { .. } => "call_workflow",
             Self::Spawn { .. } => "spawn",
+            Self::Verify { .. } => "verify",
         }
     }
 }
@@ -1344,5 +1411,74 @@ steps:
         assert!(parse_cron("").is_err());
         // Missing required schedule/owner -> parse error (required fields).
         assert!(parse_cron("name: p\nsteps: []\n").is_err());
+    }
+
+    // ---- ADR-0024 Spec 0: graph canonical ----
+    #[test]
+    fn graph_desugar_chain_preserves_order() {
+        let wf = parse_workflow(
+            "name: t\ntrigger:\n  type: webhook\nsteps:\n  - name: a\n    action: send_dm\n    to: x\n    body: y\n  - name: b\n    action: send_dm\n    to: x\n    body: y\n  - name: c\n    action: send_dm\n    to: x\n    body: y\n",
+        )
+        .expect("parse");
+        let g = wf.to_graph();
+        assert_eq!(g.nodes.len(), 3);
+        assert!(g.nodes.contains_key("a"));
+        assert!(g.nodes.contains_key("b"));
+        assert!(g.nodes.contains_key("c"));
+        assert_eq!(g.nodes["a"].needs, Vec::<String>::new());
+        assert_eq!(g.nodes["b"].needs, vec!["a"]);
+        assert_eq!(g.nodes["c"].needs, vec!["b"]);
+        // Existing graph is returned as-is (no desugar).
+        let wf2 = parse_workflow(
+            "name: t\ntrigger:\n  type: webhook\ngraph:\n  nodes:\n    x: { action: send_dm, to: a, body: b }\n",
+        )
+        .expect("parse graph");
+        let g2 = wf2.to_graph();
+        assert_eq!(g2.nodes.len(), 1);
+        assert!(g2.nodes.contains_key("x"));
+    }
+
+    #[test]
+    fn graph_desugar_unnamed_steps_become_step_n() {
+        let wf = parse_workflow(
+            "name: t\nsteps:\n  - action: send_dm\n    to: x\n    body: y\n  - action: send_dm\n    to: x\n    body: y\n",
+        )
+        .expect("parse");
+        let g = wf.to_graph();
+        assert!(g.nodes.contains_key("step_1"));
+        assert!(g.nodes.contains_key("step_2"));
+        assert_eq!(g.nodes["step_2"].needs, vec!["step_1"]);
+    }
+
+    #[test]
+    fn graph_desugar_preserves_build_slot() {
+        let wf = parse_workflow(
+            "name: t\nsteps:\n  - name: a\n    action: send_dm\n    to: x\n    body: y\n    build_slot: true\n",
+        )
+        .expect("parse");
+        let g = wf.to_graph();
+        assert!(g.nodes["a"].build_slot);
+    }
+
+    #[test]
+    fn graph_desugar_verify_parses() {
+        let wf = parse_workflow(
+            "name: t\nsteps:\n  - name: v\n    action: verify\n    command: \"cargo test\"\n",
+        )
+        .expect("verify parses");
+        let g = wf.to_graph();
+        assert!(matches!(g.nodes["v"].action, Action::Verify { .. }));
+    }
+
+    #[test]
+    fn dispatch_spec_context_parses() {
+        let wf = parse_workflow(
+            "name: t\nsteps:\n  - name: d\n    action: dispatch_job\n    assignee: x\n    spec: { profile: \"@coder\", context: fresh }\n",
+        )
+        .expect("context parses");
+        let Action::DispatchJob { spec, .. } = &wf.steps[0].action else {
+            panic!("dispatch");
+        };
+        assert_eq!(spec.context, Some(ContextMode::Fresh));
     }
 }
