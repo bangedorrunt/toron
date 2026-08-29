@@ -1,20 +1,10 @@
 [
   {
-    "pane_id": "w87:p1",
-    "name": "flywheel-toron-oc",
-    "mail_identity": "SandySparrow",
-    "skills_injected": false
-  },
-  {
-    "pane_id": "w87:p2",
-    "name": "flywheel-toron-oc2",
-    "mail_identity": "TealDune",
-    "skills_injected": false
-  },
-  {
-    "pane_id": "w87:p3",
-    "name": "flywheel-toron-oc3",
-    "mail_identity": "TanFern",
+    "pane_id": "w8C:p1",
+    "name": "flywheel-toron-coder",
+    "profile": "coder",
+    "harness": "jcode",
+    "mail_identity": "BrownRidge",
     "skills_injected": false
   }
 ]
