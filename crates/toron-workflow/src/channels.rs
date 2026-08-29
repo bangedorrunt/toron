@@ -1,3 +1,4 @@
+// governed-by: ADR-0025
 // governed-by: ADR-0003
 // governed-by: ADR-0020
 // governed-by: ADR-0023
@@ -301,6 +302,17 @@ impl ChannelStore {
     ) -> anyhow::Result<Event> {
         let author_pk = author.public_key();
         self.require_member(channel_id, &author_pk)?;
+        // Spec 2: kind-9 for >20 lines without a path is rejected (must be file-first)
+        if content.lines().count() > 20
+            && !content.contains("path:")
+            && !content.contains("sha256:")
+            && !content.contains("Path:")
+            && !content.contains("sha256")
+        {
+            anyhow::bail!(
+                "kind-9 over 20 lines without path rejected — write findings to a file and post summary + path + sha256:12"
+            );
+        }
         // bd-channel-truncation-238e: fail LOUD on over-cap posts.
         let chars = content.chars().count();
         if chars > CHANNEL_POST_MAX_CHARS {
