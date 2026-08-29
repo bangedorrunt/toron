@@ -385,6 +385,52 @@ impl ChannelStore {
         Ok(ce)
     }
 
+    /// Hydrate a channel message from the bus for cross-process react
+    /// visibility (bd-13lb). Unlike `ingest`, this does **not** enforce
+    /// membership of the target author — the target was already gated at post
+    /// time. It validates kind (9/42) and `h` tag, deduplicates by `event_id`,
+    /// and makes `react` see what `channel read` sees (bus projection)
+    /// synchronously, without a sleep. The reactor's own membership is still
+    /// enforced by `react` itself.
+    pub fn hydrate_message(&self, ev: &Event) -> anyhow::Result<()> {
+        let kind = ev.kind.as_u16();
+        if !Self::is_post_kind(kind) {
+            anyhow::bail!("not a channel post kind: {kind} (expected 9 or 42)");
+        }
+        let channel_id = ev
+            .tags
+            .iter()
+            .find(|t| t.kind() == "h")
+            .and_then(|t| t.content())
+            .ok_or_else(|| anyhow::anyhow!("channel post lacks h tag"))?
+            .to_string();
+        let id_hex = ev.id.to_hex();
+        {
+            let inner = self.inner.lock();
+            if inner.events.iter().any(|e| e.event_id == id_hex) {
+                return Ok(());
+            }
+        }
+        let mentions: Vec<String> = ev
+            .tags
+            .iter()
+            .filter(|t| t.kind() == "p")
+            .filter_map(|t| t.content())
+            .map(str::to_string)
+            .collect();
+        let ce = ChannelEvent {
+            channel_id,
+            event_id: id_hex,
+            author: ev.pubkey.to_hex(),
+            kind,
+            content: ev.content.clone(),
+            react_to: None,
+            mentions,
+        };
+        self.inner.lock().events.push(ce);
+        Ok(())
+    }
+
     /// Build + record a reaction (kind 7). Membership-gated.
     pub fn react(
         &self,

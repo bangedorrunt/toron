@@ -855,19 +855,46 @@ async fn react(mailbox: &Mailbox, args: &ReactArgs) -> anyhow::Result<()> {
         None => {
             let target = EventId::from_hex(&args.to)
                 .map_err(|_| anyhow::anyhow!("bad --to event id: {}", args.to))?;
-            let filter = Filter::new()
-                .id(target)
-                .kinds([
-                    toron_kind(CHANNEL_MESSAGE),
-                    toron_kind(CHANNEL_MESSAGE_LEGACY),
-                ])
-                .hashtag(&args.project);
+            let filter = Filter::new().id(target).kinds([
+                toron_kind(CHANNEL_MESSAGE),
+                toron_kind(CHANNEL_MESSAGE_LEGACY),
+            ]);
             let hits = collect_trusted(mailbox.bus().as_ref(), filter).await?;
-            hits.first()
-                .and_then(event_channel)
+            hits.into_iter()
+                .find(|ev| ev.id == target && in_project(ev, &args.project))
+                .and_then(|ev| event_channel(&ev))
                 .with_context(|| format!("cannot resolve channel of event {}", args.to))?
         }
     };
+
+    // bd-13lb: synchronous post visibility — `channel read` projects from the
+    // bus (rumor-time G7), but `store.react` looked up only the in-memory
+    // `ChannelStoreInner.events` which is empty after `rebuild_store` in a
+    // fresh process. Hydrate the target post from the bus so `react` sees
+    // what `read` sees without a sleep.
+    {
+        let target = EventId::from_hex(&args.to)
+            .map_err(|_| anyhow::anyhow!("bad --to event id: {}", args.to))?;
+        let already = store
+            .history(&channel)
+            .iter()
+            .any(|e| e.event_id == args.to);
+        if !already {
+            let filter = Filter::new().id(target).kinds([
+                toron_kind(CHANNEL_MESSAGE),
+                toron_kind(CHANNEL_MESSAGE_LEGACY),
+            ]);
+            if let Ok(hits) = collect_trusted(mailbox.bus().as_ref(), filter).await
+                && let Some(ev) = hits.into_iter().find(|ev| {
+                    ev.id == target
+                        && in_project(ev, &args.project)
+                        && event_channel(ev).as_deref() == Some(channel.as_str())
+                })
+            {
+                let _ = store.hydrate_message(&ev);
+            }
+        }
+    }
 
     let ev = store
         .react(&keys, &channel, &args.to, &args.emoji)
