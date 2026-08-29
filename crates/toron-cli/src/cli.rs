@@ -780,6 +780,10 @@ pub struct ContactCaptainArgs {
     /// Clear the captain alias for the project (bd-auqj).
     #[arg(long, conflicts_with = "pin")]
     pub clear: bool,
+    /// Write the fold even in open identity mode, where it cannot route
+    /// (bd-lsgm). Audited to stderr.
+    #[arg(long, requires = "pin")]
+    pub force: bool,
 }
 
 #[derive(Debug, Args)]
