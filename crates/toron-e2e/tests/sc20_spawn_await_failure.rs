@@ -112,6 +112,7 @@ steps:
     )
     .expect("parse");
     let input = RunInput {
+        run_id: Some("sc-test-run".into()),
         workflow: wf,
         trigger: serde_json::json!({}),
     };

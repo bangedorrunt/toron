@@ -153,6 +153,7 @@ async fn drain_reactions(
             .run(
                 &format!("sc30-{id}"),
                 RunInput {
+                    run_id: Some("sc-test-run".into()),
                     workflow: workflow.clone(),
                     trigger: payload,
                 },

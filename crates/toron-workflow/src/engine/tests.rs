@@ -159,7 +159,8 @@ async fn approval_suspends_and_resumes() {
     // the same contract end-to-end).
     let (_srv, engine) = remote_engine(noop_runner()).await;
 
-    let input = RunInput { run_id: None,
+    let input = RunInput {
+        run_id: None,
         workflow: approval_workflow(),
         trigger: serde_json::json!({}),
     };
@@ -235,7 +236,8 @@ steps:
 #[tokio::test(flavor = "multi_thread")]
 async fn approval_rejection_is_a_decision_not_a_failure() {
     let (_srv, engine) = remote_engine(noop_runner()).await;
-    let input = RunInput { run_id: None,
+    let input = RunInput {
+        run_id: None,
         workflow: approval_workflow(),
         trigger: serde_json::json!({}),
     };
@@ -306,7 +308,8 @@ steps:
 "##,
     )
     .expect("parse spawn workflow");
-    let input = RunInput { run_id: None,
+    let input = RunInput {
+        run_id: None,
         workflow: wf,
         trigger: serde_json::json!({}),
     };
@@ -354,7 +357,8 @@ steps:
 "##,
     )
     .expect("parse");
-    let input = RunInput { run_id: None,
+    let input = RunInput {
+        run_id: None,
         workflow: wf,
         trigger: serde_json::json!({}),
     };
@@ -385,7 +389,8 @@ steps:
 async fn durable_delay_completes() {
     let runner = noop_runner();
     let engine = WorkflowEngine::local(runner.clone()).expect("engine");
-    let input = RunInput { run_id: None,
+    let input = RunInput {
+        run_id: None,
         workflow: delay_workflow(),
         trigger: serde_json::json!({}),
     };
@@ -455,7 +460,8 @@ steps:
 #[tokio::test]
 async fn on_error_fail_run_fails_the_run_durably() {
     let engine = WorkflowEngine::local(error_on_send_runner()).expect("engine");
-    let input = RunInput { run_id: None,
+    let input = RunInput {
+        run_id: None,
         workflow: fail_run_workflow(),
         trigger: serde_json::json!({}),
     };
@@ -480,7 +486,8 @@ async fn on_error_fail_run_fails_the_run_durably() {
 #[tokio::test]
 async fn on_error_default_continue_completes_the_run() {
     let engine = WorkflowEngine::local(error_on_send_runner()).expect("engine");
-    let input = RunInput { run_id: None,
+    let input = RunInput {
+        run_id: None,
         workflow: continue_workflow(),
         trigger: serde_json::json!({}),
     };
@@ -578,7 +585,8 @@ async fn fail_run_emits_46012_status_failed() {
     use nostr_sdk::prelude::Keys;
 
     let engine = WorkflowEngine::local(error_on_send_runner()).expect("engine");
-    let input = RunInput { run_id: None,
+    let input = RunInput {
+        run_id: None,
         workflow: fail_run_workflow(),
         trigger: serde_json::json!({}),
     };
@@ -628,7 +636,8 @@ steps:
 "##,
     )
     .expect("parse");
-    let input = RunInput { run_id: None,
+    let input = RunInput {
+        run_id: None,
         workflow: wf,
         trigger: serde_json::json!({ "channel": "#support", "id": 7 }),
     };
@@ -711,7 +720,8 @@ graph:
 "##,
     )
     .expect("parse graph workflow");
-    let input = RunInput { run_id: None,
+    let input = RunInput {
+        run_id: None,
         workflow: wf,
         trigger: serde_json::json!({}),
     };
@@ -784,7 +794,8 @@ graph:
     let output = engine
         .run(
             "wf-graph-fanout-1",
-            RunInput { run_id: None,
+            RunInput {
+                run_id: None,
                 workflow: wf,
                 trigger: serde_json::json!({}),
             },
@@ -870,7 +881,8 @@ steps:
     let output = engine
         .run(
             "wf-retry-1",
-            RunInput { run_id: None,
+            RunInput {
+                run_id: None,
                 workflow: wf,
                 trigger: serde_json::json!({}),
             },
@@ -906,7 +918,8 @@ steps:
     let output = engine
         .run(
             "wf-retry-fail-1",
-            RunInput { run_id: None,
+            RunInput {
+                run_id: None,
                 workflow: wf,
                 trigger: serde_json::json!({}),
             },
@@ -950,7 +963,9 @@ steps:
     let _ = engine2
         .run(
             "wf-branch-true",
-            RunInput { run_id: None, workflow: wf.clone(),
+            RunInput {
+                run_id: None,
+                workflow: wf.clone(),
                 trigger: serde_json::json!({ "ok": "true" }),
             },
         )
@@ -966,7 +981,8 @@ steps:
     let _ = engine
         .run(
             "wf-branch-false",
-            RunInput { run_id: None,
+            RunInput {
+                run_id: None,
                 workflow: wf,
                 trigger: serde_json::json!({ "ok": "false" }),
             },
@@ -1013,7 +1029,8 @@ steps:
     let output = engine
         .run(
             "wf-foreach-1",
-            RunInput { run_id: None,
+            RunInput {
+                run_id: None,
                 workflow: wf,
                 trigger: serde_json::json!({}),
             },
@@ -1066,7 +1083,8 @@ steps:
     let output = engine
         .run(
             "wf-parallel-1",
-            RunInput { run_id: None,
+            RunInput {
+                run_id: None,
                 workflow: wf,
                 trigger: serde_json::json!({}),
             },
@@ -1129,7 +1147,8 @@ steps:
     let output = engine
         .run(
             "wf-call-1",
-            RunInput { run_id: None,
+            RunInput {
+                run_id: None,
                 workflow: wf,
                 trigger: serde_json::json!({}),
             },
@@ -1164,7 +1183,8 @@ steps:
     let output = engine
         .run(
             "wf-call-unknown",
-            RunInput { run_id: None,
+            RunInput {
+                run_id: None,
                 workflow: wf,
                 trigger: serde_json::json!({}),
             },
@@ -1309,7 +1329,8 @@ steps:
 "##,
     )
     .expect("parse value-flow workflow");
-    let input = RunInput { run_id: None,
+    let input = RunInput {
+        run_id: None,
         workflow: wf,
         trigger: serde_json::json!({}),
     };
@@ -1492,7 +1513,8 @@ steps:
     let g = wf.to_graph();
     assert_eq!(g.nodes["gate"].needs, Vec::<String>::new());
     assert_eq!(g.nodes["after"].needs, vec!["gate"]);
-    let input = RunInput { run_id: None,
+    let input = RunInput {
+        run_id: None,
         workflow: wf,
         trigger: serde_json::json!({}),
     };
@@ -1533,7 +1555,8 @@ graph:
     let out = engine
         .run(
             "failure-kind-fail",
-            RunInput { run_id: None,
+            RunInput {
+                run_id: None,
                 workflow: wf,
                 trigger: serde_json::json!({}),
             },
@@ -1560,7 +1583,8 @@ graph:
     let out2 = engine2
         .run(
             "failure-kind-not-fail",
-            RunInput { run_id: None,
+            RunInput {
+                run_id: None,
                 workflow: wf2,
                 trigger: serde_json::json!({}),
             },
@@ -1590,7 +1614,8 @@ graph:
     let out = engine
         .run(
             "verify-missing-1",
-            RunInput { run_id: None,
+            RunInput {
+                run_id: None,
                 workflow: wf,
                 trigger: serde_json::json!({}),
             },
@@ -1649,7 +1674,15 @@ graph:
     let run_id = "wf-test-approval-payload-1";
     let handle = engine
         .resonate()
-        .run(run_id, run_workflow, RunInput { run_id: Some(run_id.to_string()), workflow: wf.clone(), trigger: serde_json::json!({}) })
+        .run(
+            run_id,
+            run_workflow,
+            RunInput {
+                run_id: Some(run_id.to_string()),
+                workflow: wf.clone(),
+                trigger: serde_json::json!({}),
+            },
+        )
         .spawn()
         .await
         .expect("spawn");
@@ -1671,13 +1704,21 @@ graph:
     assert_eq!(data["workflow"], "ship-toron", "workflow name");
     assert_eq!(data["suspended_at"]["node"], "gate", "suspended_at.node");
     assert!(data["suspended_at"]["wave"].is_number(), "wave present");
-    assert_eq!(data["question"], "Release toron v0.4.0?", "question is the message");
-    assert!(data["context"]["nodes_completed"].is_array(), "nodes_completed");
+    assert_eq!(
+        data["question"], "Release toron v0.4.0?",
+        "question is the message"
+    );
+    assert!(
+        data["context"]["nodes_completed"].is_array(),
+        "nodes_completed"
+    );
     assert!(data["context"]["nodes_failed"].is_array(), "nodes_failed");
     assert!(data["context"]["nodes_pending"].is_array(), "nodes_pending");
     assert!(data["context"]["artifacts"].is_array(), "artifacts");
     // Artifacts should contain paths, not blobs
-    let artifacts = data["context"]["artifacts"].as_array().expect("artifacts array");
+    let artifacts = data["context"]["artifacts"]
+        .as_array()
+        .expect("artifacts array");
     assert!(!artifacts.is_empty(), "artifacts not empty");
     for art in artifacts {
         assert!(art.get("node").is_some(), "artifact has node");
@@ -1714,25 +1755,18 @@ graph:
         .to_string();
     assert_eq!(hash1, hash2, "hash stable across replay");
 
-    // Different hash when artifacts differ: run a second workflow with different sha
-    // We need to test that a second run with different artifact produces different hash
-    // For now, just verify that the hash is computed from run_id + node + artifacts + ledger
-    // We can compute expected hash manually and check it matches
-    // The payload's evidence_hash should be sha256 of canonical json of {run_id, node, artifacts, ledger_path}
-    // We can verify by recomputing
-    let expected_input = serde_json::json!({
-        "run_id": run_id,
-        "node": "gate",
-        "artifacts": artifacts.iter().map(|a| {
-            let mut m = serde_json::Map::new();
-            if let Some(p) = a.get("path") { m.insert("path".into(), p.clone()); }
-            if let Some(s) = a.get("sha") { m.insert("sha".into(), s.clone()); }
-            m
-        }).collect::<Vec<_>>(),
-        "ledger_path": data["context"]["ledger_path"]
-    });
-    // Note: the real implementation hashes {run_id, node, artifacts[].path, artifacts[].sha, ledger_path}
-    // We check that the hash is hex and length 64, which we already did
+    // Evidence hash recomputation: the payload hash must be a function of
+    // its evidence inputs alone (run_id + node + artifacts + ledger_path).
+    let expected_hash = crate::engine::control_flow::compute_evidence_hash(
+        run_id,
+        "gate",
+        artifacts.as_slice(),
+        data["context"]["ledger_path"].as_str().unwrap_or_default(),
+    );
+    assert_eq!(
+        hash1, expected_hash,
+        "evidence_hash recomputes from its evidence inputs"
+    );
 
     // Clean up: resolve the approval to let the run complete
     engine
@@ -1744,11 +1778,11 @@ graph:
 
     // Different hash = new question: simulate by checking that a different artifact would give different hash
     // For this test, we just verify that the hash would change if artifact path changes - we can compute a second hash with different path
-    let mut artifacts2 = artifacts.clone();
-    if let Some(first) = artifacts2.first_mut() {
-        if let Some(obj) = first.as_object_mut() {
-            obj.insert("path".into(), serde_json::Value::String(".flywheel/receipts/different.txt".into()));
-        }
+    if let Some(obj) = artifacts2.first_mut().and_then(|first| first.as_object_mut()) {
+        obj.insert(
+            "path".into(),
+            serde_json::Value::String(".flywheel/receipts/different.txt".into()),
+        );
     }
     let input2 = serde_json::json!({
         "run_id": run_id,
@@ -1763,7 +1797,7 @@ graph:
     });
     // Compute hash for input2 and ensure it's different from hash1
     // We use sha256 hex
-    use sha2::{Sha256, Digest};
+    use sha2::{Digest, Sha256};
     let hash_for = |v: &serde_json::Value| {
         let s = serde_json::to_string(v).unwrap();
         let mut hasher = Sha256::new();
@@ -1771,7 +1805,10 @@ graph:
         hex::encode(hasher.finalize())
     };
     let h2 = hash_for(&input2);
-    assert_ne!(hash1, h2, "different artifact path should give different hash");
+    assert_ne!(
+        hash1, h2,
+        "different artifact path should give different hash"
+    );
 
     drop(srv);
 }

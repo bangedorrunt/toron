@@ -1915,14 +1915,14 @@ mod tests {
             .await
             .expect("set");
         assert_eq!(
-            mailbox.agent_name_alias("toron", "captain").await.as_deref(),
+            mailbox
+                .agent_name_alias("toron", "captain")
+                .await
+                .as_deref(),
             Some("BlueRidge")
         );
         // Clear
-        let previous = mailbox
-            .clear_project_captain("toron")
-            .await
-            .expect("clear");
+        let previous = mailbox.clear_project_captain("toron").await.expect("clear");
         assert_eq!(previous.as_deref(), Some("BlueRidge"));
         assert_eq!(mailbox.agent_name_alias("toron", "captain").await, None);
         // whois captain should now fail (non-routable)
