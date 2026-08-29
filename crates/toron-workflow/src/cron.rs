@@ -210,6 +210,7 @@ async fn run_cron_tick(
             RunInput {
                 workflow: input.workflow.clone(),
                 trigger,
+                run_id: None,
             },
         )
         .await

@@ -188,6 +188,9 @@ pub struct RunInput {
     pub workflow: crate::schema::Workflow,
     /// The trigger payload (available to `{{trigger.*}}` templates).
     pub trigger: serde_json::Value,
+    /// The Resonate run id (for evidence-bearing approvals, Spec 3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
 }
 
 /// The shared action-execution surface (the Mailbox). Run by the workflow
@@ -427,7 +430,8 @@ impl WorkflowEngine {
 
     /// Start a workflow run, idempotent on `run_id` (a redelivered trigger
     /// must not double-start — Resonate dedups on the run id).
-    pub async fn run(&self, run_id: &str, input: RunInput) -> anyhow::Result<serde_json::Value> {
+    pub async fn run(&self, run_id: &str, mut input: RunInput) -> anyhow::Result<serde_json::Value> {
+        input.run_id = Some(run_id.to_string());
         self.resonate
             .run(run_id, run_workflow, input)
             .await
@@ -455,7 +459,7 @@ impl WorkflowEngine {
             }
         }
         trigger.insert("inputs".into(), inputs.clone());
-        let input = RunInput {
+        let input = RunInput { run_id: None,
             workflow,
             trigger: serde_json::Value::Object(trigger),
         };

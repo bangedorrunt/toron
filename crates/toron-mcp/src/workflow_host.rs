@@ -432,6 +432,7 @@ impl WorkflowHost {
                     let input = RunInput {
                         workflow: workflow.clone(),
                         trigger: payload,
+                        run_id: None,
                     };
                     match me.engine.run(&run_id, input).await {
                         Ok(_) => debug!(run_id, "mail-trigger workflow {} ran", workflow.name),
@@ -550,6 +551,7 @@ impl WorkflowHost {
                 let input = RunInput {
                     workflow: workflow.clone(),
                     trigger: trigger_payload(&event),
+                    run_id: None,
                 };
                 match self.engine.run(&run_id, input).await {
                     Ok(_) => debug!(run_id, "workflow {} ran", workflow.name),
