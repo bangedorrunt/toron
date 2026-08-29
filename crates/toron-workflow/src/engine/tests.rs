@@ -1776,9 +1776,13 @@ graph:
     let out = handle.result().await.expect("run completes");
     assert_eq!(out["gate"]["outcome"], "approved");
 
-    // Different hash = new question: simulate by checking that a different artifact would give different hash
-    // For this test, we just verify that the hash would change if artifact path changes - we can compute a second hash with different path
-    if let Some(obj) = artifacts2.first_mut().and_then(|first| first.as_object_mut()) {
+    // Different hash = new question: the hash must change when an artifact
+    // path changes.
+    let mut artifacts2 = artifacts.clone();
+    if let Some(obj) = artifacts2
+        .first_mut()
+        .and_then(|first| first.as_object_mut())
+    {
         obj.insert(
             "path".into(),
             serde_json::Value::String(".flywheel/receipts/different.txt".into()),
