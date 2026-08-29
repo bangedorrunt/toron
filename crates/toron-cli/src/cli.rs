@@ -1271,8 +1271,9 @@ pub struct WatchArgs {
     /// Watcher identity (required only when watching kind 1059).
     #[arg(long = "as")]
     pub as_name: Option<String>,
-    /// Comma-separated kind allowlist (default 9,7,43001,20001).
-    #[arg(long, default_value = "9,7,43001,20001")]
+    /// Comma-separated kind allowlist (default 9,7,39002,43001,20001 — 39002
+    /// join/leave wakes the dispatcher on crew-composition changes, ADR-0023).
+    #[arg(long, default_value = "9,7,39002,43001,20001")]
     pub kinds: String,
     /// Channel id (`h` tag filter).
     #[arg(long)]
@@ -1587,5 +1588,28 @@ mod flag_conformance_tests {
             }
             _ => panic!("expected show"),
         }
+    }
+
+    /// bd-i1o3: watch kinds must include 39002 (join/leave) next to 9,43001,30031.
+    #[test]
+    fn wake_watch_kinds_include_39002() {
+        use clap::CommandFactory;
+        let cmd = Cli::command();
+        let watch = cmd.find_subcommand("watch").expect("watch subcommand");
+        let kinds = watch
+            .get_arguments()
+            .find(|a| a.get_long() == Some("kinds"))
+            .expect("kinds arg");
+        let defaults: Vec<String> = kinds
+            .get_default_values()
+            .iter()
+            .map(|v| v.to_string_lossy().to_string())
+            .collect();
+        let joined = defaults.join(",");
+        assert!(
+            joined.contains("39002"),
+            "watch --kinds default must include 39002, got {joined}"
+        );
+        assert!(joined.contains('9'), "must still contain 9");
     }
 }
