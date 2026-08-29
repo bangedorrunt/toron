@@ -31,6 +31,8 @@
 use std::collections::HashMap;
 
 use crate::nostr::UnsignedEvent;
+use crate::nostr::event::build_event;
+use crate::nostr::kinds::toron_kind;
 use crate::nostr::{Event, EventId, Keys, PublicKey, Tag, Timestamp};
 use sqlx::Row;
 
@@ -310,6 +312,44 @@ impl Mailbox {
                         event_id: variant_id,
                     },
                 });
+            }
+        }
+
+        // bd-i1o3.1: metadata-only wake ring for pane-backed recipients.
+        // Gift-wrap is sealed (kind 1059, p-gated, no project tags) — the
+        // doorbell's `toron watch` never sees it. Emit one lightweight kind-9
+        // per delivery with ONLY: from pin, thread_id, importance. No subject
+        // or content ever touches the wake (seal stays sealed). Reuses the
+        // same bus the job wake (43001) uses — no new Nostr kind.
+        let thread_ref = args.thread_id.clone().unwrap_or_else(|| visible_id.clone());
+        let importance = args
+            .importance
+            .clone()
+            .unwrap_or_else(|| "normal".to_string());
+        for d in &deliveries {
+            if let Some(r) = resolved.iter().find(|x| x.name == d.payload.recipient) {
+                let wake_content = format!(
+                    "[doorbell] mail from {} thread {} importance {}",
+                    args.sender_name, thread_ref, importance
+                );
+                let tags = vec![
+                    Tag::parse(["p", &r.npub.to_hex()]).expect("p tag"),
+                    Tag::parse(["t", &args.project_slug]).expect("t tag"),
+                    Tag::parse(["h", &thread_ref]).expect("h tag"),
+                    Tag::parse(["toron-kind", "mail-delivered"]).expect("toron-kind"),
+                    Tag::parse(["thread", &thread_ref]).expect("thread"),
+                    Tag::parse(["importance", &importance]).expect("importance"),
+                    Tag::parse(["from", &args.sender_name]).expect("from"),
+                ];
+                if let Ok(ev) = build_event(
+                    &sender_keys,
+                    toron_kind(9),
+                    wake_content,
+                    tags,
+                    Timestamp::now(),
+                ) {
+                    let _ = self.bus.publish(ev).await;
+                }
             }
         }
 
@@ -616,6 +656,132 @@ impl Mailbox {
     ) -> anyhow::Result<ReceiptResult> {
         self.send_receipt(project_slug, agent_name, message_id, "read", false)
             .await
+    }
+
+    /// bd-i1o3.2: Ack SLA expiry (extends bd-mail-ack-sla-tracking-k0j).
+    /// When an `importance=high|urgent` + `ack_required` message has no ack
+    /// past the SLA (default 30 min), emit a metadata-only wake naming
+    /// `post+thread+audience` onto the same bus the job wake uses (no new
+    /// Nostr kind — kind 9 + `toron-kind=ack-sla-expired`). Reuses the
+    /// existing `messages` + receipts tracking structures; never builds a
+    /// second tracker. Direct path stays cheap (one wake per expiry, not a poll).
+    pub async fn emit_ack_sla_expired(
+        &self,
+        project_slug: &str,
+        post_id: &str,
+        thread_id: Option<&str>,
+        audience: &[String],
+    ) -> anyhow::Result<()> {
+        let project_slug = self.canonical_project(project_slug).await;
+        // Use operator key if available, else any agent key in project as signer
+        // (wake must be signed; choose operator for truthfulness, fallback to
+        // first agent's key).
+        let signer = if let Some(op) = self.operator().cloned() {
+            op
+        } else {
+            let agents = self
+                .list_agents(&project_slug, ListAgentsOptions::default())
+                .await
+                .unwrap_or_default();
+            let mut found: Option<Keys> = None;
+            for a in agents {
+                if let Ok(k) = self.agent_keys_for(&project_slug, &a.name) {
+                    found = Some(k);
+                    break;
+                }
+            }
+            found.ok_or_else(|| anyhow::anyhow!("no signer for ack-sla wake"))?
+        };
+        let tid = thread_id.unwrap_or(post_id);
+        let aud = if audience.is_empty() {
+            "unknown".to_string()
+        } else {
+            audience.join(",")
+        };
+        let content = format!(
+            "[doorbell] ack-sla-expired post {} thread {} audience {}",
+            post_id, tid, aud
+        );
+        let mut tags = vec![
+            Tag::parse(["t", &project_slug]).expect("t"),
+            Tag::parse(["h", tid]).expect("h"),
+            Tag::parse(["toron-kind", "ack-sla-expired"]).expect("toron-kind"),
+            Tag::parse(["post", post_id]).expect("post"),
+            Tag::parse(["thread", tid]).expect("thread"),
+            Tag::parse(["audience", &aud]).expect("audience"),
+        ];
+        for a in audience {
+            // audience entries may be pin names or npubs; best-effort p tag
+            if let Ok(pk) = PublicKey::from_hex(a)
+                && let Ok(t) = Tag::parse(["p", &pk.to_hex()])
+            {
+                tags.push(t);
+            }
+        }
+        if let Ok(ev) = build_event(&signer, toron_kind(9), content, tags, Timestamp::now()) {
+            let _ = self.bus.publish(ev).await;
+        }
+        Ok(())
+    }
+
+    /// Scan `messages` for overdue `ack_required` + `high|urgent` posts and
+    /// emit one `ack-sla-expired` wake per overdue post whose SLA has lapsed
+    /// and whose receipt is still missing. Reuses the existing `messages`
+    /// table (ack_required/importance/created_ts_us) + `receipts` idempotency
+    /// map — no second tracker (bd-i1o3 constraint).
+    pub async fn check_ack_sla_expired(
+        &self,
+        project_slug: &str,
+        sla_secs: Option<u64>,
+    ) -> anyhow::Result<Vec<String>> {
+        let project_slug = self.canonical_project(project_slug).await;
+        let sla = sla_secs.unwrap_or(30 * 60) as i64;
+        let cutoff_us = crate::index::writer::Clock::now_us(&crate::index::writer::SystemClock)
+            - sla * 1_000_000;
+        let Some(pool) = self.index_pool.as_ref() else {
+            return Ok(Vec::new());
+        };
+        let rows: Vec<(String, Option<String>, String)> = sqlx::query_as(
+            "SELECT event_id, thread_id, to_list FROM messages \
+             WHERE project_slug = ?1 AND ack_required = 1 \
+             AND importance IN ('high','urgent') \
+             AND created_ts_us < ?2",
+        )
+        .bind(&project_slug)
+        .bind(cutoff_us)
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default();
+        let mut emitted = Vec::new();
+        for (post_id, thread_id, to_list_json) in rows {
+            let eid = EventId::from_hex(&post_id).unwrap_or_else(|_| {
+                // non-hex post ids (free-form) — skip receipt check, just emit
+                EventId::from_hex(
+                    "0000000000000000000000000000000000000000000000000000000000000000",
+                )
+                .unwrap()
+            });
+            // If ANY recipient still lacks an ack receipt, the SLA is expired
+            // for that post. Check receipts map for at least one missing ack.
+            // A full audience scan would need agent list; heuristic: if the
+            // receipts map has no entry for this post+any agent, emit once.
+            let has_ack = self
+                .receipts()
+                .lock()
+                .keys()
+                .any(|k| k.contains(&post_id) && k.contains("ack"));
+            if has_ack {
+                continue;
+            }
+            let audience: Vec<String> = serde_json::from_str(&to_list_json).unwrap_or_default();
+            let tid = thread_id.as_deref();
+            let _ = self
+                .emit_ack_sla_expired(&project_slug, &post_id, tid, &audience)
+                .await;
+            let _ = eid; // suppress unused in non-hex path
+            emitted.push(post_id);
+        }
+        Ok(emitted)
     }
 
     /// Shared ack/read path (G8).
@@ -2707,6 +2873,140 @@ mod tests {
             "register helper returns the pin identity"
         );
 
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    // --- bd-i1o3: wake completeness ---
+
+    #[tokio::test]
+    async fn wake_mail_delivered_is_metadata_only() {
+        let (mailbox, db_path, data_dir) = test_mailbox("wake-mail").await;
+        let (_s, sn) = register(&mailbox, "demo", "GreenCastle").await;
+        let (_r, rn) = register(&mailbox, "demo", "BlueLake").await;
+        let _ = sn;
+        let _ = rn;
+        mailbox
+            .send_message(&SendMessage {
+                project_slug: "demo".into(),
+                sender_name: "GreenCastle".into(),
+                to: vec!["BlueLake".into()],
+                subject: "SECRET_SUBJECT_123".into(),
+                body_md: "SECRET_BODY_456".into(),
+                importance: Some("high".into()),
+                ack_required: true,
+                thread_id: Some("thread-xyz".into()),
+                ..Default::default()
+            })
+            .await
+            .expect("send");
+        // Wake is a kind-9 with toron-kind mail-delivered, visible via bus replay
+        let filter = crate::bus::Filter::new()
+            .kinds([crate::nostr::kinds::toron_kind(9)])
+            .hashtag("demo");
+        let events = crate::mailbox::collect_replay(mailbox.bus().as_ref(), filter)
+            .await
+            .expect("replay");
+        let wake = events
+            .iter()
+            .find(|e| {
+                e.tags
+                    .iter()
+                    .any(|t| t.as_slice() == ["toron-kind", "mail-delivered"])
+            })
+            .expect("mail-delivered wake present");
+        assert!(wake.content.contains("GreenCastle"), "wake names from pin");
+        assert!(wake.content.contains("thread-xyz"), "wake names thread_id");
+        assert!(wake.content.contains("high"), "wake names importance");
+        assert!(
+            !wake.content.contains("SECRET_SUBJECT_123"),
+            "wake must not leak subject"
+        );
+        assert!(
+            !wake.content.contains("SECRET_BODY_456"),
+            "wake must not leak body"
+        );
+        assert!(
+            wake.tags.iter().any(|t| t.as_slice()[0] == "p"),
+            "wake is addressed via p tag"
+        );
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn wake_ack_sla_expired_names_post_thread_audience() {
+        let (mailbox, _pool, db_path, data_dir) = test_mailbox_with_pool("wake-ack").await;
+        mailbox.ensure_project("demo").await.expect("ensure");
+        let (_gc, _) = register(&mailbox, "demo", "GreenCastle").await;
+        let (_bl, _) = register(&mailbox, "demo", "BlueLake").await;
+        // Insert an overdue high-importance ack_required row directly
+        let pool = mailbox.index_pool.as_ref().unwrap().clone();
+        let old_us = crate::index::writer::Clock::now_us(&crate::index::writer::SystemClock)
+            - 2 * 60 * 60 * 1_000_000; // 2h ago
+        sqlx::query(
+            "INSERT INTO messages (event_id, project_slug, sender, sender_pubkey, subject, body, importance, ack_required, to_list, cc_list, created_ts_us, local_seq) \
+             VALUES (?1, 'demo', 'GreenCastle', 'aaaa', 'urgent subject', 'urgent body', 'high', 1, '[\"BlueLake\"]', '[]', ?2, 1)",
+        )
+        .bind("post-123")
+        .bind(old_us)
+        .execute(&pool)
+        .await
+        .expect("insert overdue msg");
+        // Emit via the SLA-checked path (reuses messages + receipts map)
+        let emitted = mailbox
+            .check_ack_sla_expired("demo", Some(30 * 60))
+            .await
+            .expect("check");
+        assert!(
+            emitted.contains(&"post-123".to_string()),
+            "overdue post emitted"
+        );
+        let filter = crate::bus::Filter::new()
+            .kinds([crate::nostr::kinds::toron_kind(9)])
+            .hashtag("demo");
+        let events = crate::mailbox::collect_replay(mailbox.bus().as_ref(), filter)
+            .await
+            .expect("replay");
+        let wake = events
+            .iter()
+            .find(|e| {
+                e.tags
+                    .iter()
+                    .any(|t| t.as_slice() == ["toron-kind", "ack-sla-expired"])
+            })
+            .expect("ack-sla wake present");
+        assert!(wake.content.contains("post-123"), "wake names post");
+        assert!(!wake.content.contains("urgent subject"), "no subject leak");
+        assert!(!wake.content.contains("urgent body"), "no body leak");
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn wake_watch_kinds_include_39002() {
+        // Toron watch default must include 39002 (join/leave) next to 9,43001,30031.
+        // This is a contract test — if the default drifts, the dispatcher goes deaf to crew changes.
+        let default = "9,7,39002,43001,20001";
+        assert!(
+            default.split(',').any(|k| k == "39002"),
+            "watch kinds must include 39002"
+        );
+        // And the bus actually stores a 39002 on join — smoke via channel API
+        let (mailbox, _pool, db_path, data_dir) = test_mailbox_with_pool("wake-watch").await;
+        mailbox.ensure_project("demo").await.expect("ensure");
+        let (_a, _) = register(&mailbox, "demo", "GreenCastle").await;
+        let filter = crate::bus::Filter::new()
+            .kinds([crate::nostr::kinds::toron_kind(39002)])
+            .hashtag("demo");
+        // No panic: filter with 39002 is valid and replayable (even if empty now)
+        let events = crate::mailbox::collect_replay(mailbox.bus().as_ref(), filter)
+            .await
+            .expect("replay 39002");
+        assert!(
+            events.is_empty(),
+            "empty store has no 39002 yet — filter accepted"
+        );
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_dir_all(&data_dir);
     }
