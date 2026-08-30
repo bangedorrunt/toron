@@ -1,4 +1,18 @@
-# Changelog
+# Chang## [2026-08-30] orchestration engine + guard facts
+
+- Engine: kind-aware `fail_run` (rate_limit/timeout same-node retry, bounded), R-E1/E2/E3
+  lint rules, `VerifySink` exec contract pinned by tests, graph-canonical runtime pins
+  (park proof, `{ok:false}` predicate).
+- Guard: GitFact producer — attributed commits append facts to the orchestrator journal
+  (best-effort, never blocks); guard check hardened against stale-holder false blocks
+  (bd-0pjf tracks force-release propagation).
+- Channels: react resolves just-posted targets from the bus (cross-process visibility;
+  cli_robot + e2e sc30 green).
+- CLI: `contact captain --clear` for parent-death policy (ADR-0025 W4a, bd-auqj).
+- Tracker: bd-o5t7 doorbell hardening umbrella closed — all mirrored children landed;
+  superseded-upward by the fact fabric (bd-cy0s).
+
+elog
 
 All notable changes to this project will be documented in this file.
 
