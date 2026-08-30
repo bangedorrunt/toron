@@ -711,10 +711,15 @@ impl Mailbox {
             Tag::parse(["audience", &aud]).expect("audience"),
         ];
         for a in audience {
-            // audience entries may be pin names or npubs; best-effort p tag
-            if let Ok(pk) = PublicKey::from_hex(a)
-                && let Ok(t) = Tag::parse(["p", &pk.to_hex()])
-            {
+            // GS-006 bug 4: audience is pin names (adjective+noun) or npub hex.
+            // Prior code only handled hex -> npub p tag, so pin-name audience never addressed
+            // the doorbell (watch_targets empty -> None). Now always add p tag: hex as npub,
+            // pin name as raw value (doorbell SelfIndex matches both).
+            if let Ok(pk) = PublicKey::from_hex(a) {
+                if let Ok(t) = Tag::parse(["p", &pk.to_hex()]) {
+                    tags.push(t);
+                }
+            } else if let Ok(t) = Tag::parse(["p", a]) {
                 tags.push(t);
             }
         }
