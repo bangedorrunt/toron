@@ -878,7 +878,33 @@ pub async fn run_guard(mailbox: &Mailbox, cmd: &GuardCommand) -> anyhow::Result<
             }
             finish_guard_check(args, agent.as_deref(), &staged, &reservations)
         }
+        GuardCommand::Record(args) => run_guard_record(args),
     }
+}
+
+/// bd-jhes: post-commit GitFact producer — best-effort, NEVER blocks commit.
+fn run_guard_record(args: &crate::cli::GuardRecordArgs) -> anyhow::Result<()> {
+    let agent = guard_record_agent(args);
+    let journal = args
+        .journal
+        .clone()
+        .unwrap_or_else(toron_core::mailbox::guard::git_fact_journal_path);
+    if let Some(pin) = agent.as_deref() {
+        toron_core::mailbox::guard::record_git_fact_for_head_with_journal(
+            Path::new(&args.repo),
+            pin,
+            &journal,
+        );
+    }
+    // Best-effort: always exit 0, even when journal unwritable or repo unreadable.
+    print_json(&json!({
+        "recorded": agent.is_some(),
+        "agent": agent,
+        "repo": args.repo.display().to_string(),
+        "journal": journal.display().to_string(),
+        "project": args.project,
+    }))?;
+    std::process::exit(0);
 }
 
 /// Resolve the committing agent from `--as` / env (shared embedded+daemon).
@@ -890,6 +916,14 @@ fn guard_agent(args: &crate::cli::GuardCheckArgs) -> Option<String> {
         // bd-2dox: AGENT_NAME is the mcp-agent-mail convention the
         // chain-runner plugin enforces; the strict guard's fail-closed
         // message points at it, so it must resolve here too.
+        .or_else(|| std::env::var("AGENT_NAME").ok())
+}
+
+fn guard_record_agent(args: &crate::cli::GuardRecordArgs) -> Option<String> {
+    args.as_agent
+        .clone()
+        .or_else(|| std::env::var("TORON_AGENT").ok())
+        .or_else(|| std::env::var("FLYWHEEL_MAIL_AS").ok())
         .or_else(|| std::env::var("AGENT_NAME").ok())
 }
 
@@ -1096,6 +1130,7 @@ pub async fn run_guard_daemon(dc: &DaemonClient, cmd: &GuardCommand) -> anyhow::
             }
             finish_guard_check(args, agent.as_deref(), &staged, &reservations)
         }
+        GuardCommand::Record(args) => run_guard_record(args),
     }
 }
 
