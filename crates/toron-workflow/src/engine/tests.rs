@@ -1816,3 +1816,199 @@ graph:
 
     drop(srv);
 }
+
+/// ADR-0024 Spec 1 kind-aware fail_run: rate_limit retries same node
+#[tokio::test]
+async fn kind_aware_fail_run_rate_limit_retries_same_node_then_succeeds() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let attempts = std::sync::Arc::new(AtomicUsize::new(0));
+    let attempts_c = attempts.clone();
+    let runner: ActionRunner = std::sync::Arc::new(move |_a: &Action| {
+        let n = attempts_c.fetch_add(1, Ordering::SeqCst);
+        if n < 2 {
+            Ok(serde_json::json!({
+                "ok": false,
+                "error": "rate limited",
+                "kind": "rate_limit",
+                "retry_after_ms": 0
+            }))
+        } else {
+            Ok(serde_json::json!({ "ok": true, "n": 42 }))
+        }
+    });
+    let engine = WorkflowEngine::local(runner).expect("engine");
+    let wf = parse_workflow(
+        r##"
+name: kind-rate-limit
+trigger:
+  type: webhook
+steps:
+  - name: go
+    action: send_dm
+    to: x
+    body: y
+    on_error: fail_run
+"##,
+    )
+    .expect("parse");
+    let out = engine
+        .run(
+            "kind-rate-limit-1",
+            RunInput {
+                run_id: None,
+                workflow: wf,
+                trigger: serde_json::json!({}),
+            },
+        )
+        .await
+        .expect("run");
+    // Should succeed after 2 retries (3 attempts total) — not fail
+    assert!(
+        out.get("status").is_none() || out["status"] != "failed",
+        "rate_limit should retry and succeed: {out}"
+    );
+    assert_eq!(out["go"]["ok"], true);
+    assert_eq!(out["go"]["n"], 42);
+    assert_eq!(attempts.load(Ordering::SeqCst), 3);
+}
+
+/// ADR-0024 Spec 1: timeout with fail_run retries and exhausts -> escalate with disposition
+#[tokio::test]
+async fn kind_aware_fail_run_timeout_bound_exhausted_escalates_with_disposition() {
+    let runner: ActionRunner = std::sync::Arc::new(|_a: &Action| {
+        Ok(serde_json::json!({
+            "ok": false,
+            "error": "timeout",
+            "kind": "timeout",
+            "retry_after_ms": 0
+        }))
+    });
+    let engine = WorkflowEngine::local(runner).expect("engine");
+    let wf = parse_workflow(
+        r##"
+name: kind-timeout
+trigger:
+  type: webhook
+steps:
+  - name: go
+    action: send_dm
+    to: x
+    body: y
+    on_error: fail_run
+"##,
+    )
+    .expect("parse");
+    let out = engine
+        .run(
+            "kind-timeout-1",
+            RunInput {
+                run_id: None,
+                workflow: wf,
+                trigger: serde_json::json!({}),
+            },
+        )
+        .await
+        .expect("run");
+    assert_eq!(out["status"], "failed", "exhausted should escalate: {out}");
+    assert_eq!(out["failed_step"], "go");
+    assert_eq!(out["kind"], "timeout");
+    assert!(
+        out.get("disposition").is_some(),
+        "disposition must be present: {out}"
+    );
+}
+
+/// ADR-0024 Spec 1: blocked/auth do NOT retry — abort immediately
+#[tokio::test]
+async fn kind_aware_fail_run_blocked_does_not_retry_aborts_immediately() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let attempts = std::sync::Arc::new(AtomicUsize::new(0));
+    let attempts_c = attempts.clone();
+    let runner: ActionRunner = std::sync::Arc::new(move |_a: &Action| {
+        attempts_c.fetch_add(1, Ordering::SeqCst);
+        Ok(serde_json::json!({
+            "ok": false,
+            "error": "blocked",
+            "kind": "blocked"
+        }))
+    });
+    let engine = WorkflowEngine::local(runner).expect("engine");
+    let wf = parse_workflow(
+        r##"
+name: kind-blocked
+trigger:
+  type: webhook
+steps:
+  - name: go
+    action: send_dm
+    to: x
+    body: y
+    on_error: fail_run
+"##,
+    )
+    .expect("parse");
+    let out = engine
+        .run(
+            "kind-blocked-1",
+            RunInput {
+                run_id: None,
+                workflow: wf,
+                trigger: serde_json::json!({}),
+            },
+        )
+        .await
+        .expect("run");
+    assert_eq!(out["status"], "failed");
+    assert_eq!(out["kind"], "blocked");
+    assert_eq!(attempts.load(Ordering::SeqCst), 1, "blocked must not retry");
+}
+
+/// Graph node kind-aware: rate_limit retries same graph node
+#[tokio::test]
+async fn kind_aware_graph_rate_limit_retries_same_node() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let attempts = std::sync::Arc::new(AtomicUsize::new(0));
+    let attempts_c = attempts.clone();
+    let runner: ActionRunner = std::sync::Arc::new(move |_a: &Action| {
+        let n = attempts_c.fetch_add(1, Ordering::SeqCst);
+        if n < 1 {
+            Ok(serde_json::json!({
+                "ok": false,
+                "error": "rate limited",
+                "kind": "rate_limit",
+                "retry_after_ms": 0
+            }))
+        } else {
+            Ok(serde_json::json!({ "ok": true }))
+        }
+    });
+    let engine = WorkflowEngine::local(runner).expect("engine");
+    let wf = parse_workflow(
+        r##"
+name: kind-graph
+trigger:
+  type: webhook
+graph:
+  nodes:
+    a: { action: send_dm, to: x, body: y, on_error: fail_run }
+"##,
+    )
+    .expect("parse");
+    let out = engine
+        .run(
+            "kind-graph-1",
+            RunInput {
+                run_id: None,
+                workflow: wf,
+                trigger: serde_json::json!({}),
+            },
+        )
+        .await
+        .expect("run");
+    assert!(
+        out.get("status").is_none() || out["status"] != "failed",
+        "graph rate_limit should retry and succeed: {out}"
+    );
+    assert_eq!(out["a"]["ok"], true);
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+}

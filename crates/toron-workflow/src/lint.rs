@@ -151,6 +151,9 @@ pub fn lint_workflow_with_principles(wf: &Workflow, principle_names: &[&str]) ->
         check_graph(&mut report, graph);
     }
 
+    // ADR-0024 Spec 1 R-E lints (kind-aware fail_run)
+    check_re_lint(&mut report, wf);
+
     // ADR-0019 wave-2 structural playbook lints (bd-w2-lints-6k6l): feature
     // data_shape, bug-fix repro predecessor, prototype/arena n>=2 + mode
     // rules, forensics read-only, principles registry.
@@ -311,6 +314,117 @@ fn check_graph(report: &mut LintReport, graph: &Graph) {
                 message: format!("graph node {name:?} is an orphan — not reachable from any root"),
                 line: None,
             });
+        }
+    }
+}
+
+/// ADR-0024 Spec 1 R-E lints
+fn check_re_lint(report: &mut LintReport, wf: &Workflow) {
+    // Walk steps with enclosing_retry flag
+    fn walk_step(step: &Step, inside_retry: bool, report: &mut LintReport) {
+        // R-E2: fail_run step without kind classification
+        if step.on_error == crate::schema::StepOnError::FailRun {
+            report.issues.push(LintIssue {
+                level: Level::Warning,
+                message: format!(
+                    "R-E2: step {:?} with on_error: fail_run missing kind classification — rate_limit/timeout retry vs blocked/auth/cancelled/unknown escalate must be distinguished (ADR-0024 Spec 1)",
+                    step.name.clone().unwrap_or_else(|| "<unnamed>".into())
+                ),
+                line: None,
+            });
+        }
+        // R-E3: spawn + fail_run without enclosing Retry
+        if matches!(step.action, Action::Spawn { .. })
+            && step.on_error == crate::schema::StepOnError::FailRun
+            && !inside_retry
+        {
+            report.issues.push(LintIssue {
+                level: Level::Warning,
+                message: format!(
+                    "R-E3: spawn step {:?} with on_error: fail_run without enclosing retry — wrap spawn in retry so rate_limit/timeout bound is explicit (ADR-0024 Spec 1)",
+                    step.name.clone().unwrap_or_else(|| "<unnamed>".into())
+                ),
+                line: None,
+            });
+        }
+        match &step.action {
+            Action::Retry { step: inner, .. } => {
+                // R-E1: retry on blocked/auth must escalate, never retry
+                // Any Retry that would retry a fail_run step is flagged as
+                // retrying blocked/auth (the only safe retry kinds are
+                // rate_limit/timeout handled by the engine's kind-aware loop).
+                if inner.on_error == crate::schema::StepOnError::FailRun {
+                    report.issues.push(LintIssue {
+                        level: Level::Error,
+                        message: format!(
+                            "R-E1: retry on blocked/auth with fail_run step {:?} — blocked/auth must escalate, not retry (ADR-0024 Spec 1)",
+                            inner.name.clone().unwrap_or_else(|| "<unnamed>".into())
+                        ),
+                        line: None,
+                    });
+                }
+                walk_step(inner, true, report);
+            }
+            Action::Branch {
+                then, else_steps, ..
+            } => {
+                for s in then.iter().chain(else_steps.iter()) {
+                    walk_step(s, inside_retry, report);
+                }
+            }
+            Action::Foreach { each, .. } | Action::Parallel { each, .. } => {
+                walk_step(each, inside_retry, report);
+            }
+            _ => {}
+        }
+    }
+
+    for step in &wf.steps {
+        walk_step(step, false, report);
+    }
+    if let Some(graph) = &wf.graph {
+        for (name, node) in &graph.nodes {
+            if node.on_error == crate::schema::StepOnError::FailRun {
+                report.issues.push(LintIssue {
+                    level: Level::Warning,
+                    message: format!(
+                        "R-E2: graph node {name:?} with on_error: fail_run missing kind classification — rate_limit/timeout retry vs blocked/auth/cancelled/unknown escalate must be distinguished (ADR-0024 Spec 1)"
+                    ),
+                    line: None,
+                });
+            }
+            if matches!(node.action, Action::Spawn { .. })
+                && node.on_error == crate::schema::StepOnError::FailRun
+            {
+                // For graph nodes, there is no syntactic enclosing Retry unless
+                // the node's action IS Retry wrapping spawn. Treat bare spawn
+                // fail_run in graph as R-E3.
+                // Check if this node is itself inside a Retry node? Graph is flat,
+                // so we treat any bare spawn fail_run as R-E3 unless its action is Retry.
+                let is_wrapped = matches!(node.action, Action::Retry { .. });
+                if !is_wrapped {
+                    report.issues.push(LintIssue {
+                        level: Level::Warning,
+                        message: format!(
+                            "R-E3: spawn graph node {name:?} with on_error: fail_run without enclosing retry — wrap spawn in retry so rate_limit/timeout bound is explicit (ADR-0024 Spec 1)"
+                        ),
+                        line: None,
+                    });
+                }
+            }
+            // R-E1 for graph retry nodes
+            if let Action::Retry { step: inner, .. } = &node.action
+                && inner.on_error == crate::schema::StepOnError::FailRun
+            {
+                report.issues.push(LintIssue {
+                    level: Level::Error,
+                    message: format!(
+                        "R-E1: retry on blocked/auth with fail_run graph node {name:?} inner {:?} — blocked/auth must escalate, not retry (ADR-0024 Spec 1)",
+                        inner.name.clone().unwrap_or_else(|| "<unnamed>".into())
+                    ),
+                    line: None,
+                });
+            }
         }
     }
 }
@@ -1152,5 +1266,108 @@ graph:
     fn cron_lint_yaml_parse_error_actionable() {
         let err = cron_lint_yaml("name: [broken").expect_err("invalid yaml fails");
         assert!(err.contains("yaml parse error"), "actionable: {err}");
+    }
+
+    // ---- ADR-0024 Spec 1 R-E lints (kind_aware) ----
+
+    #[test]
+    fn kind_aware_r_e1_retry_on_blocked_is_error() {
+        let yaml = r##"
+name: r-e1
+trigger:
+  type: webhook
+steps:
+  - name: go
+    action: retry
+    max_attempts: 3
+    step:
+      action: send_dm
+      to: x
+      body: y
+      on_error: fail_run
+"##;
+        let wf = parse_workflow(yaml).expect("parse");
+        let report = lint_workflow(&wf);
+        assert!(
+            report.issues.iter().any(|i| i.level == Level::Error
+                && i.message.contains("R-E1")
+                && i.message.to_lowercase().contains("blocked")),
+            "R-E1 error expected: {:?}",
+            report.issues
+        );
+    }
+
+    #[test]
+    fn kind_aware_r_e2_fail_run_missing_kind_warning() {
+        let yaml = r##"
+name: r-e2
+trigger:
+  type: webhook
+steps:
+  - name: go
+    action: send_dm
+    to: x
+    body: y
+    on_error: fail_run
+"##;
+        let wf = parse_workflow(yaml).expect("parse");
+        let report = lint_workflow(&wf);
+        assert!(
+            report.issues.iter().any(|i| i.level == Level::Warning
+                && i.message.contains("R-E2")
+                && i.message.to_lowercase().contains("kind")),
+            "R-E2 warning expected: {:?}",
+            report.issues
+        );
+    }
+
+    #[test]
+    fn kind_aware_r_e3_spawn_without_retry_warning() {
+        let yaml = r##"
+name: r-e3
+trigger:
+  type: webhook
+steps:
+  - name: spawn-go
+    action: spawn
+    profile: "@housekeeper"
+    await: true
+    on_error: fail_run
+"##;
+        let wf = parse_workflow(yaml).expect("parse");
+        let report = lint_workflow(&wf);
+        assert!(
+            report.issues.iter().any(|i| i.level == Level::Warning
+                && i.message.contains("R-E3")
+                && i.message.to_lowercase().contains("spawn")),
+            "R-E3 warning expected: {:?}",
+            report.issues
+        );
+    }
+
+    #[test]
+    fn kind_aware_r_e3_spawn_with_retry_no_warning() {
+        let yaml = r##"
+name: r-e3-ok
+trigger:
+  type: webhook
+steps:
+  - name: wrapped
+    action: retry
+    max_attempts: 3
+    step:
+      action: spawn
+      profile: "@housekeeper"
+      await: true
+      on_error: fail_run
+"##;
+        let wf = parse_workflow(yaml).expect("parse");
+        let report = lint_workflow(&wf);
+        // Wrapped spawn should NOT trigger R-E3
+        assert!(
+            !report.issues.iter().any(|i| i.message.contains("R-E3")),
+            "R-E3 must not fire when wrapped in retry: {:?}",
+            report.issues
+        );
     }
 }
