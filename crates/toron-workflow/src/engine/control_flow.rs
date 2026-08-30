@@ -246,6 +246,36 @@ pub(crate) fn rendered_approval_message(
     }
 }
 
+fn is_retryable_kind(kind: &str) -> bool {
+    matches!(kind, "rate_limit" | "timeout")
+}
+
+fn disposition_for_kind(kind: &str, existing: Option<&str>) -> String {
+    if let Some(d) = existing {
+        return d.to_string();
+    }
+    match kind {
+        "rate_limit" => "active_blocked".to_string(),
+        "timeout" => "terminal_failed".to_string(),
+        _ => "terminal_failed".to_string(),
+    }
+}
+
+fn backoff_for_attempt(
+    attempt: u32,
+    retry_after_ms: Option<u64>,
+    enclosing_backoff: Option<u64>,
+) -> Duration {
+    if let Some(ms) = retry_after_ms {
+        return Duration::from_millis(ms);
+    }
+    if let Some(b) = enclosing_backoff.filter(|&b| b > 0) {
+        return Duration::from_secs(b);
+    }
+    let secs = 1u64.checked_shl(attempt - 1).unwrap_or(60).min(60);
+    Duration::from_secs(secs)
+}
+
 /// Boxed because control-flow actions recurse (`run_step` → `run_retry` →
 /// `run_step`, …) — async recursion requires a heap-allocated future.
 pub(crate) fn run_step<'a>(
@@ -261,149 +291,218 @@ pub(crate) fn run_step<'a>(
             + 'a,
     >,
 > {
-    Box::pin(async move {
-        let value = match &step.action {
-            Action::Delay { secs } => {
-                // Durable sleep — UNBOUNDED (the Buzz 270s cap is gone;
-                // hours/days/weeks for SLA timers, cron-like cadence).
-                ctx.sleep(Duration::from_secs(*secs)).await?;
-                serde_json::Value::Null
-            }
-            Action::RequestApproval { message } => {
-                // Render FIRST (the same contract as the mailbox actions):
-                // the message becomes the promise payload + the operator's
-                // signoff prompt, so a raw `{{inputs.*}}` there is an
-                // unrendered template a captain actually reads
-                // (bd-adr0006-cosmetic-sweep-q0g0).
-                let message = rendered_approval_message(&step.action, trigger, step_outputs)
-                    .unwrap_or_else(|_| message.clone());
-                // Create the promise; its id is the approval key. The 0.6 SDK's
-                // PromiseTask is created eagerly (.create()); the handle's id()
-                // confirms server-side creation.
-                let pending = ctx
-                    .promise::<Decision>()
-                    .data(&serde_json::json!({ "message": message }))?
-                    .create()?;
-                let promise_id = pending.id().await?;
-                // The binding: the embedding publishes kind-46011 with this
-                // promise_id; the operator's approval/rejection resolves it.
-                step_outputs.insert(
-                    "approval".into(),
-                    serde_json::json!({
-                        "promise_id": promise_id,
-                        "message": message,
-                    }),
-                );
-                // Side-channel the promise_id (embedding publishes kind-46011).
-                ctx.get_dependency::<ApprovalSink>()
-                    .lock()
-                    .await
-                    .push(promise_id.clone());
-                // Resolve OR rejection both complete the run — a rejected
-                // approval is a DECISION, never a run failure (the WF-08 fix:
-                // Buzz marks it failed; toron records the rejection).
-                //
-                // 0.6 semantics: awaiting a PENDING promise returns
-                // `Err(Error::Suspended)`, which must PROPAGATE so the runtime
-                // parks the run. A REJECTED promise (operator `promises.reject`)
-                // returns `Err(Error::Application)` — that is the decision.
-                let decision: Decision = match pending.await {
-                    Ok(d) => d,
-                    Err(resonate_sdk::error::Error::Suspended) => {
-                        return Err(resonate_sdk::error::Error::Suspended);
-                    }
-                    Err(e) => Decision::rejected(format!("rejected: {e}")),
-                };
-                let decision = serde_json::to_value(&decision)?;
-                step_outputs.insert("decision".into(), decision.clone());
-                decision
-            }
-            Action::SendMessage { .. }
-            | Action::SendDm { .. }
-            | Action::React { .. }
-            | Action::DispatchJob { .. }
-            | Action::CallWebhook { .. } => {
-                // Consistency rule: actions go through the shared Mailbox
-                // surface (the injected action runner). Templates are
-                // substituted first so the runner sees rendered values. A
-                // render failure (unserializable action) is a per-step error,
-                // not a run failure.
-                match render_action(&step.action, trigger, step_outputs) {
-                    Ok(action) => match (runner)(&action) {
-                        Ok(value) => value,
-                        Err(e) => serde_json::json!({ "ok": false, "error": e.to_string() }),
-                    },
-                    Err(e) => serde_json::json!({ "ok": false, "error": format!("render: {e}") }),
-                }
-            }
-            Action::Retry {
-                max_attempts,
-                backoff_secs,
-                step: inner,
-            } => run_retry(ctx, runner, trigger, inner, *max_attempts, *backoff_secs).await?,
-            Action::Branch {
-                if_guard,
-                then,
-                else_steps,
-            } => run_branch(ctx, runner, trigger, if_guard, then, else_steps).await?,
-            Action::Foreach { over, each } => {
-                run_foreach(ctx, runner, trigger, over, each, step_outputs).await?
-            }
-            Action::Parallel { over, each } => {
-                run_parallel(ctx, runner, trigger, over, each).await?
-            }
-            Action::CallWorkflow { workflow, inputs } => {
-                run_call_workflow(ctx, runner, workflow, inputs, step_outputs).await?
-            }
-            Action::Spawn {
-                profile,
-                workflow,
-                await_,
-                no_claim_timeout,
-                context,
-            } => {
-                run_spawn(
-                    ctx,
-                    profile,
-                    workflow.as_deref(),
-                    *await_,
-                    *no_claim_timeout,
-                    *context,
-                )
-                .await?
-            }
-            Action::Verify { command } => {
-                let sink = ctx.get_dependency::<crate::engine::VerifySink>();
-                let guard = sink.0.lock().unwrap().clone();
-                if let Some(f) = guard {
-                    let req = crate::engine::VerifyRequest {
-                        command: command.clone(),
-                    };
-                    match f(&req) {
-                        Ok(res) => serde_json::to_value(&res).unwrap_or_else(
-                            |e| serde_json::json!({ "ok": false, "error": e.to_string() }),
-                        ),
-                        Err(e) => serde_json::json!({ "ok": false, "error": e.to_string() }),
-                    }
-                } else {
-                    serde_json::json!({ "ok": false, "error": "verify sink missing" })
-                }
-            }
-        };
+    run_step_with_enclosing(ctx, runner, trigger, step, step_outputs, None)
+}
 
-        // P0.2 (ADR-0005 Spec 0): `on_error: fail_run` converts a step failure
-        // into a RUN failure — a deterministic durable RETURN, never a panic.
-        if step.on_error == StepOnError::FailRun
-            && value.get("ok").and_then(serde_json::Value::as_bool) == Some(false)
-        {
-            let error = value["error"].as_str().unwrap_or("step failed").to_string();
-            return Ok(serde_json::json!({
-                "status": "failed",
-                "error": error,
-                "failed_step": step.name.clone().unwrap_or_else(|| "<unnamed>".into()),
-            }));
+pub(crate) fn run_step_with_enclosing<'a>(
+    ctx: &'a Context,
+    runner: &'a ActionRunner,
+    trigger: &'a serde_json::Value,
+    step: &'a Step,
+    step_outputs: &'a mut serde_json::Map<String, serde_json::Value>,
+    enclosing_retry: Option<(u32, u64)>,
+) -> std::pin::Pin<
+    Box<
+        dyn std::future::Future<Output = resonate_sdk::prelude::Result<serde_json::Value>>
+            + Send
+            + 'a,
+    >,
+> {
+    Box::pin(async move {
+        let max_attempts = enclosing_retry.map(|(m, _)| m).unwrap_or(3);
+        let enclosing_backoff = enclosing_retry.map(|(_, b)| b);
+        let mut attempt: u32 = 0;
+        loop {
+            attempt += 1;
+            let value = match &step.action {
+                Action::Delay { secs } => {
+                    // Durable sleep — UNBOUNDED (the Buzz 270s cap is gone;
+                    // hours/days/weeks for SLA timers, cron-like cadence).
+                    ctx.sleep(Duration::from_secs(*secs)).await?;
+                    serde_json::Value::Null
+                }
+                Action::RequestApproval { message } => {
+                    // Render FIRST (the same contract as the mailbox actions):
+                    // the message becomes the promise payload + the operator's
+                    // signoff prompt, so a raw `{{inputs.*}}` there is an
+                    // unrendered template a captain actually reads
+                    // (bd-adr0006-cosmetic-sweep-q0g0).
+                    let message = rendered_approval_message(&step.action, trigger, step_outputs)
+                        .unwrap_or_else(|_| message.clone());
+                    // Create the promise; its id is the approval key. The 0.6 SDK's
+                    // PromiseTask is created eagerly (.create()); the handle's id()
+                    // confirms server-side creation.
+                    let pending = ctx
+                        .promise::<Decision>()
+                        .data(&serde_json::json!({ "message": message }))?
+                        .create()?;
+                    let promise_id = pending.id().await?;
+                    // The binding: the embedding publishes kind-46011 with this
+                    // promise_id; the operator's approval/rejection resolves it.
+                    step_outputs.insert(
+                        "approval".into(),
+                        serde_json::json!({
+                            "promise_id": promise_id,
+                            "message": message,
+                        }),
+                    );
+                    // Side-channel the promise_id (embedding publishes kind-46011).
+                    ctx.get_dependency::<ApprovalSink>()
+                        .lock()
+                        .await
+                        .push(promise_id.clone());
+                    // Resolve OR rejection both complete the run — a rejected
+                    // approval is a DECISION, never a run failure (the WF-08 fix:
+                    // Buzz marks it failed; toron records the rejection).
+                    //
+                    // 0.6 semantics: awaiting a PENDING promise returns
+                    // `Err(Error::Suspended)`, which must PROPAGATE so the runtime
+                    // parks the run. A REJECTED promise (operator `promises.reject`)
+                    // returns `Err(Error::Application)` — that is the decision.
+                    let decision: Decision = match pending.await {
+                        Ok(d) => d,
+                        Err(resonate_sdk::error::Error::Suspended) => {
+                            return Err(resonate_sdk::error::Error::Suspended);
+                        }
+                        Err(e) => Decision::rejected(format!("rejected: {e}")),
+                    };
+                    let decision = serde_json::to_value(&decision)?;
+                    step_outputs.insert("decision".into(), decision.clone());
+                    decision
+                }
+                Action::SendMessage { .. }
+                | Action::SendDm { .. }
+                | Action::React { .. }
+                | Action::DispatchJob { .. }
+                | Action::CallWebhook { .. } => {
+                    // Consistency rule: actions go through the shared Mailbox
+                    // surface (the injected action runner). Templates are
+                    // substituted first so the runner sees rendered values. A
+                    // render failure (unserializable action) is a per-step error,
+                    // not a run failure.
+                    match render_action(&step.action, trigger, step_outputs) {
+                        Ok(action) => match (runner)(&action) {
+                            Ok(value) => value,
+                            Err(e) => serde_json::json!({ "ok": false, "error": e.to_string() }),
+                        },
+                        Err(e) => {
+                            serde_json::json!({ "ok": false, "error": format!("render: {e}") })
+                        }
+                    }
+                }
+                Action::Retry {
+                    max_attempts,
+                    backoff_secs,
+                    step: inner,
+                } => run_retry(ctx, runner, trigger, inner, *max_attempts, *backoff_secs).await?,
+                Action::Branch {
+                    if_guard,
+                    then,
+                    else_steps,
+                } => run_branch(ctx, runner, trigger, if_guard, then, else_steps).await?,
+                Action::Foreach { over, each } => {
+                    run_foreach(ctx, runner, trigger, over, each, step_outputs).await?
+                }
+                Action::Parallel { over, each } => {
+                    run_parallel(ctx, runner, trigger, over, each).await?
+                }
+                Action::CallWorkflow { workflow, inputs } => {
+                    run_call_workflow(ctx, runner, workflow, inputs, step_outputs).await?
+                }
+                Action::Spawn {
+                    profile,
+                    workflow,
+                    await_,
+                    no_claim_timeout,
+                    context,
+                } => {
+                    run_spawn(
+                        ctx,
+                        profile,
+                        workflow.as_deref(),
+                        *await_,
+                        *no_claim_timeout,
+                        *context,
+                    )
+                    .await?
+                }
+                Action::Verify { command } => {
+                    let sink = ctx.get_dependency::<crate::engine::VerifySink>();
+                    let guard = sink.0.lock().unwrap().clone();
+                    if let Some(f) = guard {
+                        let req = crate::engine::VerifyRequest {
+                            command: command.clone(),
+                        };
+                        match f(&req) {
+                            Ok(res) => serde_json::to_value(&res).unwrap_or_else(
+                                |e| serde_json::json!({ "ok": false, "error": e.to_string() }),
+                            ),
+                            Err(e) => serde_json::json!({ "ok": false, "error": e.to_string() }),
+                        }
+                    } else {
+                        serde_json::json!({ "ok": false, "error": "verify sink missing" })
+                    }
+                }
+            };
+
+            // P0.2 (ADR-0005 Spec 0 + ADR-0024 Spec 1): `on_error: fail_run`
+            // converts a step failure into a RUN failure — a deterministic durable
+            // RETURN, never a panic. ADR-0024 adds kind-awareness: rate_limit and
+            // timeout are RETRYABLE (same node, bounded) even under fail_run;
+            // auth/blocked/cancelled/unknown keep today's abort.
+            if step.on_error == StepOnError::FailRun
+                && value.get("ok").and_then(serde_json::Value::as_bool) == Some(false)
+            {
+                let kind = value.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+                if is_retryable_kind(kind) {
+                    if attempt >= max_attempts {
+                        let error = value
+                            .get("error")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("step failed")
+                            .to_string();
+                        let disposition = disposition_for_kind(
+                            kind,
+                            value.get("disposition").and_then(|v| v.as_str()),
+                        );
+                        return Ok(serde_json::json!({
+                            "status": "failed",
+                            "error": error,
+                            "failed_step": step.name.clone().unwrap_or_else(|| "<unnamed>".into()),
+                            "kind": kind,
+                            "disposition": disposition,
+                            "attempts": attempt,
+                        }));
+                    }
+                    let retry_after_ms = value.get("retry_after_ms").and_then(|v| v.as_u64());
+                    let sleep_dur = backoff_for_attempt(attempt, retry_after_ms, enclosing_backoff);
+                    ctx.sleep(sleep_dur).await?;
+                    continue;
+                }
+                let error = value
+                    .get("error")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("step failed")
+                    .to_string();
+                let mut failed = serde_json::json!({
+                    "status": "failed",
+                    "error": error,
+                    "failed_step": step.name.clone().unwrap_or_else(|| "<unnamed>".into()),
+                });
+                if let Some(k) = value.get("kind") {
+                    failed["kind"] = k.clone();
+                }
+                if let Some(d) = value.get("disposition") {
+                    failed["disposition"] = d.clone();
+                } else if !kind.is_empty() {
+                    failed["disposition"] =
+                        serde_json::Value::String(disposition_for_kind(kind, None));
+                }
+                return Ok(failed);
+            }
+            return Ok(value);
         }
-        Ok(value)
+        // unreachable — loop always returns
     })
 }
 
@@ -419,27 +518,51 @@ pub(crate) async fn run_retry(
     max_attempts: u32,
     backoff_secs: u64,
 ) -> resonate_sdk::prelude::Result<serde_json::Value> {
-    let mut last_err: Option<String> = None;
+    let mut last_value: Option<serde_json::Value> = None;
     for attempt in 1..=max_attempts.max(1) {
         let mut outputs = serde_json::Map::new();
-        let value = run_step(ctx, runner, trigger, inner, &mut outputs).await?;
+        let value = run_step_with_enclosing(
+            ctx,
+            runner,
+            trigger,
+            inner,
+            &mut outputs,
+            Some((max_attempts, backoff_secs)),
+        )
+        .await?;
         let failed = value.get("ok").and_then(serde_json::Value::as_bool) == Some(false);
         if !failed {
             return Ok(value);
         }
-        last_err = value
-            .get("error")
-            .and_then(|e| e.as_str())
-            .map(String::from);
+        // If inner returned a fail_run terminal (status failed) for retryable
+        // kind, run_step_with_enclosing already retried up to bound and
+        // returned the terminal; do not loop further — escalate.
+        if value.get("status").and_then(|v| v.as_str()) == Some("failed") {
+            return Ok(value);
+        }
+        last_value = Some(value);
         if attempt < max_attempts.max(1) && backoff_secs > 0 {
             ctx.sleep(Duration::from_secs(backoff_secs)).await?;
         }
     }
-    Ok(serde_json::json!({
+    let last = last_value
+        .unwrap_or_else(|| serde_json::json!({ "ok": false, "error": "retry exhausted" }));
+    // Preserve kind/disposition if present, else generic
+    let mut out = serde_json::json!({
         "ok": false,
-        "error": last_err.unwrap_or_else(|| "retry exhausted".into()),
+        "error": last.get("error").and_then(|v| v.as_str()).unwrap_or("retry exhausted"),
         "retried": true,
-    }))
+    });
+    if let Some(k) = last.get("kind") {
+        out["kind"] = k.clone();
+    }
+    if let Some(d) = last.get("disposition") {
+        out["disposition"] = d.clone();
+    }
+    if let Some(ms) = last.get("retry_after_ms") {
+        out["retry_after_ms"] = ms.clone();
+    }
+    Ok(out)
 }
 
 /// Run a `branch` action: evaluate the guard; run the `then` or `else` step
@@ -795,28 +918,106 @@ pub(crate) async fn run_graph(
         }
 
         // Await the wave's children (they ran concurrently; order of await is
-        // deterministic).
-        for (name, future) in futures {
+        // deterministic). ADR-0024 Spec 1: rate_limit/timeout under fail_run
+        // retries the SAME node with backoff.
+        // We keep per-node attempt state; retries re-spawn the same durable child.
+        let mut pending_futures = futures;
+        // Map name -> rendered action for retry re-spawns
+        let mut rendered_map: std::collections::HashMap<String, Action> =
+            std::collections::HashMap::new();
+        for (name, node) in &ready {
+            if let Ok(a) = render_action(&node.action, trigger, &outputs) {
+                rendered_map.insert((*name).clone(), a);
+            }
+        }
+        // Track attempts per node (first spawn = attempt 1)
+        let mut attempts: std::collections::HashMap<String, u32> = pending_futures
+            .iter()
+            .map(|(n, _)| (n.clone(), 1u32))
+            .collect();
+        let max_attempts: u32 = 3;
+        let idx = 0;
+        while idx < pending_futures.len() {
+            let (name, future) = pending_futures.remove(idx);
             let value = future.await?;
-            // on_error: fail_run — only `ok == false` is a failure (ADR-0024 Spec 0).
-            // Presence of `error` without `ok:false` is NOT a failure.
             let node = nodes.get(&name).expect("node in map");
             if node.on_error == StepOnError::FailRun
                 && value.get("ok").and_then(|v| v.as_bool()) == Some(false)
             {
+                let kind = value.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+                if is_retryable_kind(kind) {
+                    let attempt = *attempts.get(&name).unwrap_or(&1);
+                    if attempt >= max_attempts {
+                        let err = value
+                            .get("error")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("step failed")
+                            .to_string();
+                        let disposition = disposition_for_kind(
+                            kind,
+                            value.get("disposition").and_then(|v| v.as_str()),
+                        );
+                        return Ok(serde_json::json!({
+                            "status": "failed",
+                            "error": err,
+                            "failed_step": name,
+                            "kind": kind,
+                            "disposition": disposition,
+                            "attempts": attempt,
+                        }));
+                    }
+                    let retry_after_ms = value.get("retry_after_ms").and_then(|v| v.as_u64());
+                    let sleep_dur = backoff_for_attempt(attempt, retry_after_ms, None);
+                    ctx.sleep(sleep_dur).await?;
+                    // Increment attempt and re-spawn same node
+                    let next_attempt = attempt + 1;
+                    attempts.insert(name.clone(), next_attempt);
+                    let rendered = rendered_map.get(&name).cloned().unwrap_or_else(|| {
+                        render_action(&node.action, trigger, &outputs)
+                            .unwrap_or(node.action.clone())
+                    });
+                    let new_future = ctx
+                        .run(
+                            run_graph_node,
+                            GraphNodeInput {
+                                action: rendered,
+                                trigger: trigger.clone(),
+                                run_id: run_id.to_string(),
+                                workflow_name: workflow_name.to_string(),
+                                node_name: name.clone(),
+                                wave,
+                                outputs: outputs.clone(),
+                                graph: Some(graph.clone()),
+                            },
+                        )
+                        .spawn()?;
+                    pending_futures.insert(idx, (name, new_future));
+                    continue;
+                }
                 let err = value
                     .get("error")
                     .and_then(|v| v.as_str())
                     .unwrap_or("step failed")
                     .to_string();
-                return Ok(serde_json::json!({
+                let mut failed = serde_json::json!({
                     "status": "failed",
                     "error": err,
                     "failed_step": name,
-                }));
+                });
+                if let Some(k) = value.get("kind") {
+                    failed["kind"] = k.clone();
+                }
+                if let Some(d) = value.get("disposition") {
+                    failed["disposition"] = d.clone();
+                } else if !kind.is_empty() {
+                    failed["disposition"] =
+                        serde_json::Value::String(disposition_for_kind(kind, None));
+                }
+                return Ok(failed);
             }
             outputs.insert(name.clone(), value);
             done.insert(name);
+            // Do not increment idx — next pending shifted into current idx
         }
     }
 
