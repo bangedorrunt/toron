@@ -415,6 +415,34 @@ pub fn install_precommit_guard(repo_path: &Path, project: &str) -> anyhow::Resul
         cm_file.write_all(cm_script.as_bytes())?;
         set_executable(&cm_path)?;
     }
+
+    // bd-jhes GitFact producer: post-commit hook appends ONE JSONL line to the
+    // flywheel fact journal on every SUCCESSFUL commit. Best-effort — ANY
+    // failure must NEVER block or fail the commit (the hook exits 0 always).
+    // Same courtesy as commit-msg: never clobber a foreign hook.
+    let pc_path = hooks.join("post-commit");
+    let pc_is_toron = pc_path.exists()
+        && std::fs::read_to_string(&pc_path)
+            .map(|s| s.contains("installed by toron"))
+            .unwrap_or(false);
+    if !pc_path.exists() || pc_is_toron {
+        let pc_script = format!(
+            "#!/bin/sh\n\
+             # installed by toron — governed-by: ADR-0003\n\
+             # GitFact producer (bd-jhes): on a SUCCESSFUL commit appends one\n\
+             # JSONL line {{type:\"git_fact\", repo, sha, subject, bead_id, pin}}\n\
+             # to the flywheel fact journal (best-effort, NEVER blocks commit).\n\
+             # Attribution: AGENT_NAME / TORON_AGENT / FLYWHEEL_MAIL_AS.\n\
+             {export}\
+             if command -v toron >/dev/null 2>&1; then\n\
+             \ttoron guard record --repo \"$PWD\" --project {project} || true\n\
+             fi\n\
+             exit 0\n"
+        );
+        let mut pc_file = std::fs::File::create(&pc_path)?;
+        pc_file.write_all(pc_script.as_bytes())?;
+        set_executable(&pc_path)?;
+    }
     Ok(script_path)
 }
 
@@ -442,6 +470,14 @@ pub fn uninstall_precommit_guard(repo_path: &Path) -> anyhow::Result<bool> {
         .unwrap_or(false);
     if cm_is_toron {
         std::fs::remove_file(&cm_path)?;
+    }
+    // bd-jhes: remove our post-commit GitFact producer too — never a foreign hook.
+    let pc_path = repo.path().join("hooks").join("post-commit");
+    let pc_is_toron = std::fs::read_to_string(&pc_path)
+        .map(|s| s.contains("installed by toron"))
+        .unwrap_or(false);
+    if pc_is_toron {
+        let _ = std::fs::remove_file(&pc_path);
     }
     let legacy_path = repo.path().join("hooks").join("pre-commit.legacy");
     if legacy_path.exists() {
@@ -620,6 +656,133 @@ pub fn staged_added_lines_in(repo_path: &Path, exclude: &[&str]) -> String {
         true
     });
     added
+}
+
+// ---------------------------------------------------------------------------
+// bd-jhes GitFact producer: strict guard appends committed facts to the
+// flywheel fact journal. Best-effort — ANY failure must NEVER block commit.
+// ---------------------------------------------------------------------------
+
+/// Journal path for GitFacts: `$XDG_STATE_HOME/flywheel/journals/git-facts.jsonl`
+/// when `XDG_STATE_HOME` is set (hermetic for tests), else the hard-coded
+/// fallback `/Users/bangedorrunt/.local/state/flywheel/journals/git-facts.jsonl`
+/// named in bd-jhes (which is `$XDG_STATE_HOME` default on this host).
+pub fn git_fact_journal_path() -> std::path::PathBuf {
+    let xdg = std::env::var_os("XDG_STATE_HOME").filter(|v| !v.is_empty());
+    git_fact_journal_path_with_xdg(xdg.as_deref().map(std::path::Path::new))
+}
+
+fn git_fact_journal_path_with_xdg(xdg: Option<&Path>) -> std::path::PathBuf {
+    if let Some(xdg) = xdg {
+        return xdg.join("flywheel/journals/git-facts.jsonl");
+    }
+    std::path::PathBuf::from("/Users/bangedorrunt/.local/state/flywheel/journals/git-facts.jsonl")
+}
+
+/// Extract the first `bd-*` token from a commit message (e.g. `fix: thing
+/// [bd-jhes]`). Returns `None` when no token is present. Delegates to the
+/// canonical `bd_tokens` scanner so boundaries match the bead-hunk guard.
+pub fn extract_bead_id(message: &str) -> Option<String> {
+    bd_tokens(message).into_iter().next()
+}
+
+/// Append one GitFact JSONL line to `journal_path`. Best-effort: `create_dir_all`
+/// and append; ANY error is swallowed and never propagates (the commit must not
+/// fail because the journal is unwritable).
+pub fn append_git_fact_to_path(
+    journal_path: &Path,
+    repo: &str,
+    sha: &str,
+    subject: &str,
+    bead_id: Option<&str>,
+    pin: &str,
+) {
+    let mut obj = serde_json::Map::new();
+    obj.insert(
+        "type".to_string(),
+        serde_json::Value::String("git_fact".to_string()),
+    );
+    obj.insert(
+        "repo".to_string(),
+        serde_json::Value::String(repo.to_string()),
+    );
+    obj.insert(
+        "sha".to_string(),
+        serde_json::Value::String(sha.to_string()),
+    );
+    obj.insert(
+        "subject".to_string(),
+        serde_json::Value::String(subject.to_string()),
+    );
+    if let Some(bid) = bead_id {
+        obj.insert(
+            "bead_id".to_string(),
+            serde_json::Value::String(bid.to_string()),
+        );
+    }
+    obj.insert(
+        "pin".to_string(),
+        serde_json::Value::String(pin.to_string()),
+    );
+    let line = serde_json::Value::Object(obj).to_string();
+    // Best-effort: never bubble errors.
+    let _ = (|| -> anyhow::Result<()> {
+        if let Some(parent) = journal_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(journal_path)?;
+        writeln!(file, "{line}")?;
+        file.flush()?;
+        Ok(())
+    })();
+}
+
+/// Production append: writes to the canonical journal path.
+pub fn append_git_fact(repo: &str, sha: &str, subject: &str, bead_id: Option<&str>, pin: &str) {
+    append_git_fact_to_path(&git_fact_journal_path(), repo, sha, subject, bead_id, pin);
+}
+
+/// Record a GitFact for `HEAD` of `repo_path` attributed to `pin`.
+/// Opens the repo, reads HEAD commit SHA + message, derives `repo` basename,
+/// `subject` (first line), and `bead_id` via [`extract_bead_id`], then
+/// appends via [`append_git_fact`] (best-effort, never errors).
+pub fn record_git_fact_for_head(repo_path: &Path, pin: &str) {
+    record_git_fact_for_head_with_journal(repo_path, pin, &git_fact_journal_path());
+}
+
+/// Testable variant with explicit journal path (hermetic tests set `XDG_STATE_HOME`
+/// or pass a temp path). Best-effort — never returns an error, never panics.
+pub fn record_git_fact_for_head_with_journal(repo_path: &Path, pin: &str, journal_path: &Path) {
+    let Ok(repo) = git2::Repository::open(repo_path) else {
+        return;
+    };
+    let Ok(head) = repo.head() else {
+        return;
+    };
+    let Ok(commit) = head.peel_to_commit() else {
+        return;
+    };
+    let sha = commit.id().to_string();
+    let message = commit.message().unwrap_or_default().to_string();
+    let subject = message.lines().next().unwrap_or_default().to_string();
+    let bead_id = extract_bead_id(&message);
+    let repo_name = repo_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("unknown")
+        .to_string();
+    append_git_fact_to_path(
+        journal_path,
+        &repo_name,
+        &sha,
+        &subject,
+        bead_id.as_deref(),
+        pin,
+    );
 }
 
 use super::*;
@@ -1433,6 +1596,238 @@ mod tests {
         assert!(
             hooks.join("commit-msg").exists(),
             "user's commit-msg survives uninstall"
+        );
+        drop(repo);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    // -----------------------------------------------------------------------
+    // bd-jhes GitFact producer
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn git_fact_line_shape_with_bead_id() {
+        let dir = std::env::temp_dir().join(format!(
+            "toron-git-fact-shape-{}-{}.jsonl",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let _ = std::fs::remove_file(&dir);
+        append_git_fact_to_path(
+            &dir,
+            "toron",
+            "abc123deadbeef",
+            "fix: thing [bd-jhes]",
+            Some("bd-jhes"),
+            "GreenPine",
+        );
+        let content = std::fs::read_to_string(&dir).expect("journal written");
+        let line = content.trim();
+        let v: serde_json::Value = serde_json::from_str(line).expect("valid json");
+        let obj = v.as_object().expect("object");
+        assert_eq!(obj.get("type").unwrap(), "git_fact");
+        assert_eq!(obj.get("repo").unwrap(), "toron");
+        assert_eq!(obj.get("sha").unwrap(), "abc123deadbeef");
+        assert_eq!(obj.get("subject").unwrap(), "fix: thing [bd-jhes]");
+        assert_eq!(obj.get("bead_id").unwrap(), "bd-jhes");
+        assert_eq!(obj.get("pin").unwrap(), "GreenPine");
+        assert_eq!(obj.len(), 6, "exactly those keys when bead_id present");
+        let _ = std::fs::remove_file(&dir);
+    }
+
+    #[test]
+    fn git_fact_line_shape_without_bead_id() {
+        let dir = std::env::temp_dir().join(format!(
+            "toron-git-fact-nobead-{}-{}.jsonl",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let _ = std::fs::remove_file(&dir);
+        append_git_fact_to_path(&dir, "flywheel", "fff", "chore: cleanup", None, "BlueLake");
+        let content = std::fs::read_to_string(&dir).expect("journal written");
+        let v: serde_json::Value = serde_json::from_str(content.trim()).expect("valid json");
+        let obj = v.as_object().expect("object");
+        assert_eq!(obj.get("type").unwrap(), "git_fact");
+        assert!(!obj.contains_key("bead_id"), "bead_id omitted when absent");
+        assert_eq!(obj.len(), 5, "exactly 5 keys when no bead_id");
+        let _ = std::fs::remove_file(&dir);
+    }
+
+    #[test]
+    fn git_fact_extract_bead_id_variants() {
+        assert_eq!(
+            extract_bead_id("fix: thing [bd-jhes]"),
+            Some("bd-jhes".to_string())
+        );
+        assert_eq!(
+            extract_bead_id("feat: add login [bd-abc123] extra"),
+            Some("bd-abc123".to_string())
+        );
+        assert_eq!(extract_bead_id("no bead here"), None);
+        assert_eq!(
+            extract_bead_id("multiple bd-first-one and bd-second-two"),
+            Some("bd-first-one".to_string())
+        );
+        // boundary check: x-bd-hidden should not match
+        assert_eq!(extract_bead_id("x-bd-hidden"), None);
+    }
+
+    #[test]
+    fn git_fact_journal_write_failure_does_not_panic() {
+        // Simulate unwritable journal by making the journal_path a directory.
+        let dir = std::env::temp_dir().join(format!(
+            "toron-git-fact-unwritable-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).expect("create dir");
+        // Using the directory itself as the file path must not panic and must not block.
+        append_git_fact_to_path(&dir, "toron", "deadbeef", "subject", None, "Pin");
+        // Also test record helper with unwritable journal — must not panic.
+        let repo_dir = std::env::temp_dir().join(format!(
+            "toron-git-fact-repo-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&repo_dir).expect("repo parent");
+        let repo = git2::Repository::init(&repo_dir).expect("init repo");
+        // create an initial commit so HEAD exists
+        std::fs::write(repo_dir.join("a.txt"), "hello\n").expect("write");
+        let mut index = repo.index().expect("index");
+        index.add_path(Path::new("a.txt")).expect("add");
+        index.write().expect("write index");
+        let tree_id = index.write_tree().expect("tree");
+        let tree = repo.find_tree(tree_id).expect("tree");
+        let sig = git2::Signature::now("Test", "test@test.com").expect("sig");
+        repo.commit(Some("HEAD"), &sig, &sig, "init commit", &tree, &[])
+            .expect("commit");
+        drop(tree);
+        // record with the directory-as-file must not panic (best-effort)
+        record_git_fact_for_head_with_journal(&repo_dir, "TestPin", &dir);
+        drop(repo);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&repo_dir);
+    }
+
+    #[test]
+    fn git_fact_record_writes_one_jsonl_line() {
+        let repo_dir = std::env::temp_dir().join(format!(
+            "toron-git-fact-record-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&repo_dir).expect("repo parent");
+        let repo = git2::Repository::init(&repo_dir).expect("init repo");
+        std::fs::write(repo_dir.join("b.txt"), "world\n").expect("write");
+        let mut index = repo.index().expect("index");
+        index.add_path(Path::new("b.txt")).expect("add");
+        index.write().expect("write index");
+        let tree_id = index.write_tree().expect("tree");
+        let tree = repo.find_tree(tree_id).expect("tree");
+        let sig = git2::Signature::now("Test", "test@test.com").expect("sig");
+        let oid = repo
+            .commit(
+                Some("HEAD"),
+                &sig,
+                &sig,
+                "feat: add thing [bd-jhes]\n\nbody",
+                &tree,
+                &[],
+            )
+            .expect("commit");
+        drop(tree);
+        let journal = std::env::temp_dir().join(format!(
+            "toron-git-fact-journal-{}-{}.jsonl",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let _ = std::fs::remove_file(&journal);
+        record_git_fact_for_head_with_journal(&repo_dir, "IndigoCove", &journal);
+        let content = std::fs::read_to_string(&journal).expect("journal written");
+        let lines: Vec<&str> = content.trim().lines().collect();
+        assert_eq!(lines.len(), 1, "ONE JSONL line");
+        let v: serde_json::Value = serde_json::from_str(lines[0]).expect("valid json");
+        assert_eq!(v["type"], "git_fact");
+        assert_eq!(v["repo"], repo_dir.file_name().unwrap().to_str().unwrap());
+        assert_eq!(v["sha"], oid.to_string());
+        assert_eq!(v["subject"], "feat: add thing [bd-jhes]");
+        assert_eq!(v["bead_id"], "bd-jhes");
+        assert_eq!(v["pin"], "IndigoCove");
+        drop(repo);
+        let _ = std::fs::remove_file(&journal);
+        let _ = std::fs::remove_dir_all(&repo_dir);
+    }
+
+    #[test]
+    fn git_fact_journal_path_respects_xdg_state_home() {
+        let tmp = std::path::Path::new("/tmp/xdg-test-abc");
+        let p = git_fact_journal_path_with_xdg(Some(tmp));
+        assert_eq!(p, tmp.join("flywheel/journals/git-facts.jsonl"));
+        let p2 = git_fact_journal_path_with_xdg(None);
+        assert_eq!(
+            p2,
+            std::path::PathBuf::from(
+                "/Users/bangedorrunt/.local/state/flywheel/journals/git-facts.jsonl"
+            )
+        );
+    }
+
+    #[test]
+    fn install_writes_post_commit_hook_and_uninstall_removes_it() {
+        let root = std::env::temp_dir().join(format!(
+            "toron-post-commit-hook-{}-{}.git",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).expect("create repo dir");
+        let repo = git2::Repository::init(&root).expect("init repo");
+
+        install_precommit_guard(&root, "toron").expect("install");
+        let pc = repo.path().join("hooks").join("post-commit");
+        let contents = std::fs::read_to_string(&pc).expect("post-commit written");
+        assert!(
+            contents.contains("guard record"),
+            "post-commit must call guard record: {contents}"
+        );
+        assert!(
+            contents.contains("installed by toron"),
+            "post-commit carries marker"
+        );
+        assert!(
+            contents.contains("|| true"),
+            "post-commit is best-effort (|| true)"
+        );
+
+        assert!(uninstall_precommit_guard(&root).expect("uninstall"));
+        assert!(!pc.exists(), "post-commit removed on uninstall");
+        drop(repo);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn install_never_clobbers_foreign_post_commit_hook() {
+        let root = std::env::temp_dir().join(format!(
+            "toron-clobber-post-{}-{}.git",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).expect("create repo dir");
+        let repo = git2::Repository::init(&root).expect("init repo");
+        let hooks = repo.path().join("hooks");
+        std::fs::create_dir_all(&hooks).expect("hooks dir");
+        std::fs::write(hooks.join("post-commit"), "#!/bin/sh\n# user's own post\n").expect("write");
+
+        install_precommit_guard(&root, "demo").expect("install");
+        let cm = std::fs::read_to_string(hooks.join("post-commit")).expect("read");
+        assert!(
+            cm.contains("user's own post"),
+            "foreign post-commit untouched"
+        );
+
+        assert!(uninstall_precommit_guard(&root).expect("uninstall"));
+        assert!(
+            hooks.join("post-commit").exists(),
+            "user's post-commit survives uninstall"
         );
         drop(repo);
         let _ = std::fs::remove_dir_all(root);

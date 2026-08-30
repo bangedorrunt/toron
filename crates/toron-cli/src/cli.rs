@@ -865,6 +865,10 @@ pub enum GuardCommand {
     /// for a session (operator escape hatch, logged); the installed hook
     /// exports TORON_GUARD_STRICT=1 by default.
     Check(GuardCheckArgs),
+    /// Record a GitFact for HEAD to the flywheel fact journal (bd-jhes).
+    /// Best-effort — ANY journal failure must NEVER block the commit (exit 0
+    /// always). Called from the post-commit hook.
+    Record(GuardRecordArgs),
 }
 
 #[derive(Debug, Args)]
@@ -899,6 +903,24 @@ pub struct GuardCheckArgs {
     /// strict mode, warn loudly when the strict hatch is open.
     #[arg(long)]
     pub msg_file: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+pub struct GuardRecordArgs {
+    /// Git repository path.
+    #[arg(long, required = true)]
+    pub repo: PathBuf,
+    /// Project slug (kept for symmetry with `guard check`; unused today).
+    #[arg(long, required = true)]
+    pub project: String,
+    /// Committing agent name (overrides TORON_AGENT / FLYWHEEL_MAIL_AS).
+    #[arg(long)]
+    pub as_agent: Option<String>,
+    /// Override journal path (hermetic tests only; default is
+    /// `$XDG_STATE_HOME/flywheel/journals/git-facts.jsonl` or the hard-coded
+    /// fallback).
+    #[arg(long)]
+    pub journal: Option<PathBuf>,
 }
 
 // ---------------------------------------------------------------------------
