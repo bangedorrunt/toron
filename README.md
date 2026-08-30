@@ -135,6 +135,24 @@ visibility + the channel-as-PR UX. Kind numbers reserved.
 
 ---
 
+## Engine & orchestration surface (2026-08-30)
+
+- **Graph-canonical workflow engine**: `steps:` desugar to chain graphs at parse;
+  `run_workflow` always executes `run_graph`; approvals park on the graph path.
+- **Kind-aware `fail_run`**: failing steps carry `{ok:false, kind, retryable, ...}`;
+  `rate_limit`/`timeout` retry the same node with backoff before escalating.
+- **`VerifySink` + R-E lint**: `action: verify` nodes exec through the embedding's
+  loop-run-verify path and write workflow receipts (never `command-verified`); lint
+  rules R-E1/E2/E3 gate compose output.
+- **`repair-until-verified`**: the bounded work-quality repair recipe (worker →
+  independent evaluator → verify), consumable directly or via the `bug-fix` builtin.
+- **Strict pre-commit guard + GitFact**: attributed commits append facts to the
+  orchestrator's journal; the guard supports force-release revocation with a
+  staleness heuristic (stale-holder propagation fix tracked as bd-0pjf).
+- **Channel react hydration**: reacting to a just-posted channel message resolves the
+  target from the bus (cross-process visibility fixed; e2e sc30 green).
+- **`contact captain --clear`**: parent-death policy support (ADR-0025 W4a).
+
 ## How agents collaborate (the workflow)
 
 ```
