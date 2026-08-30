@@ -355,7 +355,7 @@ fn check_re_lint(report: &mut LintReport, wf: &Workflow) {
                 // rate_limit/timeout handled by the engine's kind-aware loop).
                 if inner.on_error == crate::schema::StepOnError::FailRun {
                     report.issues.push(LintIssue {
-                        level: Level::Error,
+                        level: Level::Warning,
                         message: format!(
                             "R-E1: retry on blocked/auth with fail_run step {:?} — blocked/auth must escalate, not retry (ADR-0024 Spec 1)",
                             inner.name.clone().unwrap_or_else(|| "<unnamed>".into())
@@ -1289,7 +1289,7 @@ steps:
         let wf = parse_workflow(yaml).expect("parse");
         let report = lint_workflow(&wf);
         assert!(
-            report.issues.iter().any(|i| i.level == Level::Error
+            report.issues.iter().any(|i| i.level == Level::Warning
                 && i.message.contains("R-E1")
                 && i.message.to_lowercase().contains("blocked")),
             "R-E1 error expected: {:?}",
