@@ -2984,6 +2984,13 @@ mod tests {
         assert!(wake.content.contains("post-123"), "wake names post");
         assert!(!wake.content.contains("urgent subject"), "no subject leak");
         assert!(!wake.content.contains("urgent body"), "no body leak");
+        // GS-006 bug 4: pin-name audience MUST get a p tag (watch_targets resolves
+        // pin names via SelfIndex). Hex-only tagging left the doorbell never addressed.
+        let has_pin_p_tag = wake
+            .tags
+            .iter()
+            .any(|t| t.len() >= 2 && t[0] == "p" && t[1] == "BlueLake");
+        assert!(has_pin_p_tag, "ack-sla wake must p-tag pin names, tags={:?}", wake.tags);
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_dir_all(&data_dir);
     }
