@@ -1,4 +1,26 @@
-# Chang## [2026-08-30] orchestration engine + guard facts
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+## [1.3.0] — 2026-08-31 Tick Law + doorbell bind (GS-005 → GS-009)
+
+### Added
+- **Mailbox p-tag for pin names (GS-006, bd-gkw9)** — `emit_ack_sla_expired` now `p`-tags pin names (was hex-only, so `watch_targets` never resolved pin-name audience → doorbell never rang); `check_ack_sla_expired` now has a 60s production caller in the doorbell dispatcher (was test-only).
+- **ADR-0026 accepted (both waves)** — `FailureKind` + classifier, funded preflight, fallback chains, bounded mail-health + `mail_degraded` + loop-identity fail-loud (all verified file:line, one recorded deviation: escalation rides eprintln+Blocked).
+
+### Fixed
+- **Ingress seam typed (bd-0or2)** — `ingress_to_loop_msg` with real `pane.agent_status_changed`/`pane.exited` strings (were invented strings ignored downstream); only `Closed` maps to `BrClose`.
+- **Tick arms real (bd-ugd1)** — `Herdr` buffers into `pending_events` + drains at next `Tick`; `WaveGate`/`CommandVerified` via `LoopEvent` state machine (were `let _ =` no-ops).
+
+### Changed
+- Bump `toron-core`/`toron-workflow`/`toron-mcp`/`toron-cli` 1.2.0 → 1.3.0.
+
+## [1.2.0] — 2026-08-30 orchestration engine + guard facts
 
 - Engine: kind-aware `fail_run` (rate_limit/timeout same-node retry, bounded), R-E1/E2/E3
   lint rules, `VerifySink` exec contract pinned by tests, graph-canonical runtime pins
@@ -11,8 +33,6 @@
 - CLI: `contact captain --clear` for parent-death policy (ADR-0025 W4a, bd-auqj).
 - Tracker: bd-o5t7 doorbell hardening umbrella closed — all mirrored children landed;
   superseded-upward by the fact fabric (bd-cy0s).
-
-elog
 
 All notable changes to this project will be documented in this file.
 
