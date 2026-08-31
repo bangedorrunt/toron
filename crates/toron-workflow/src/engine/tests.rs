@@ -2012,3 +2012,116 @@ graph:
     assert_eq!(out["a"]["ok"], true);
     assert_eq!(attempts.load(Ordering::SeqCst), 2);
 }
+
+/// VerifySink attached → action:verify executes via the sink (not "missing")
+/// and green passes. Pins the compose --run VerifySink attachment.
+#[tokio::test]
+async fn verify_sink_attached_green_passes() {
+    let runner: ActionRunner = std::sync::Arc::new(|_a: &Action| Ok(serde_json::json!({ "ok": true })));
+    let engine = WorkflowEngine::local(runner).expect("engine");
+    let wf = parse_workflow(
+        r##"
+name: t
+steps:
+  - name: a
+    action: send_dm
+    to: x
+    body: y
+  - name: v
+    action: verify
+    command: "cargo test --lib"
+    on_error: fail_run
+"##,
+    )
+    .expect("parse verify");
+    let sink = VerifySink::default();
+    *sink.0.lock().unwrap() = Some(std::sync::Arc::new(|req: &VerifyRequest| {
+        assert_eq!(req.command, "cargo test --lib");
+        Ok(VerifyResult {
+            ok: true,
+            exit: 0,
+            stdout_path: Some("/tmp/out".into()),
+            stderr_path: None,
+            error: None,
+        })
+    }));
+    *engine.verify_sink().0.lock().unwrap() = sink.0.lock().unwrap().clone();
+    let out = engine
+        .run(
+            "verify-attached-green-1",
+            RunInput {
+                run_id: None,
+                workflow: wf,
+                trigger: serde_json::json!({}),
+            },
+        )
+        .await
+        .expect("run");
+    assert!(out.get("status").is_none() || out["status"] != "failed", "green verify must not fail: {out}");
+    assert_eq!(out["v"]["ok"], true);
+}
+
+/// Compose-style: bare dispatch followed by verify — verify executes and red
+/// fails the run. Ensures the verify sink is not missing on that arm and that
+/// bare dispatch + verify red is a visible failure (FailRun).
+#[tokio::test]
+async fn compose_bare_dispatch_plus_verify_red_fails() {
+    use parking_lot::Mutex;
+    use std::sync::Arc;
+    let runner: ActionRunner = Arc::new(|_a: &Action| Ok(serde_json::json!({ "ok": true })));
+    let engine = WorkflowEngine::local(runner).expect("engine");
+    let wf = parse_workflow(
+        r##"
+name: composed-verify
+steps:
+  - name: coder-systematic-execute-1
+    action: dispatch_job
+    assignee: x
+    spec: { profile: "@coder", stage: systematic-execute }
+    on_error: fail_run
+  - name: verify-1
+    action: verify
+    command: "cargo test --lib"
+    on_error: fail_run
+"##,
+    )
+    .expect("parse");
+    // Attach RED verify sink.
+    let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let seen_c = seen.clone();
+    let sink = VerifySink::default();
+    *sink.0.lock().unwrap() = Some(Arc::new(move |req: &VerifyRequest| {
+        seen_c.lock().push(req.command.clone());
+        Ok(VerifyResult {
+            ok: false,
+            exit: 1,
+            stdout_path: None,
+            stderr_path: None,
+            error: Some("simulated test failure".into()),
+        })
+    }));
+    *engine.verify_sink().0.lock().unwrap() = sink.0.lock().unwrap().clone();
+    let out = engine
+        .run(
+            "compose-verify-red-2",
+            RunInput {
+                run_id: None,
+                workflow: wf,
+                trigger: serde_json::json!({}),
+            },
+        )
+        .await
+        .expect("run");
+    assert_eq!(seen.lock().len(), 1, "verify must have executed");
+    assert_eq!(seen.lock()[0], "cargo test --lib");
+    assert_eq!(out["status"], "failed", "red verify must fail the run: {out}");
+    assert_eq!(out["failed_step"], "verify-1");
+    assert!(
+        !out
+            .get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .contains("verify sink missing"),
+        "sink must be attached: {out}"
+    );
+}
