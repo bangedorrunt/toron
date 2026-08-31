@@ -1414,9 +1414,9 @@ async fn wait_for_corr(mailbox: &Mailbox, args: &WaitArgs) -> anyhow::Result<()>
         Some(Instant::now() + Duration::from_secs(timeout))
     };
     let canonical = mailbox.canonical_project(&args.project).await;
-    let store = mailbox
-        .receipt_store()
-        .map_err(|e| anyhow::anyhow!("wait --corr for project {canonical} requires receipts store: {e}"))?;
+    let store = mailbox.receipt_store().map_err(|e| {
+        anyhow::anyhow!("wait --corr for project {canonical} requires receipts store: {e}")
+    })?;
     // Fast path: already present
     if let Some(r) = store.get(&args.corr).await? {
         let v = serde_json::json!({
