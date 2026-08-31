@@ -36,6 +36,7 @@ pub mod messaging;
 pub mod metrics;
 pub mod naming;
 pub mod product;
+pub mod receipts;
 pub mod reservations;
 pub mod search;
 pub mod send_tags;
@@ -60,6 +61,7 @@ pub use messaging::{
 };
 pub use metrics::{BenchCase, BenchReport, BenchTimer, MailboxMetrics, MetricsSnapshot};
 pub use product::ProductInfo;
+pub use receipts::{Receipt, ReceiptState, ReceiptStore};
 pub use reservations::{
     AcquireResult, ConflictReport, GrantedReservation, IntentReservation, IntentResult,
     PathConflict, ReleaseAsk, ReleaseDecision, ReleaseResponse, ReleaseResult, RenewResult,

@@ -177,6 +177,10 @@ pub enum Command {
     /// (catalogs/cron/crews) lives in flywheel.
     #[command(subcommand)]
     Workflow(WorkflowCommand),
+
+    /// Receipts durable store (ADR-0027 E2): `receipt get` / `receipt list`.
+    #[command(subcommand)]
+    Receipt(ReceiptCommand),
 }
 
 /// toron workflow (fabric) subcommands (ADR-0005 Spec 5).
@@ -217,6 +221,28 @@ pub enum WorkflowCommand {
         #[arg(long, default_value = "{}")]
         trigger: String,
     },
+}
+
+#[derive(Debug, clap::Subcommand)]
+pub enum ReceiptCommand {
+    /// Get one receipt by corr (reads the durable sqlite store).
+    Get(ReceiptGetArgs),
+    /// List receipts, optionally filtered by state.
+    List(ReceiptListArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct ReceiptGetArgs {
+    /// Correlation id.
+    #[arg(long, required = true)]
+    pub corr: String,
+}
+
+#[derive(Debug, Args)]
+pub struct ReceiptListArgs {
+    /// Filter by state: owed|acked|resulted.
+    #[arg(long)]
+    pub state: Option<String>,
 }
 
 #[derive(Debug, Args)]
