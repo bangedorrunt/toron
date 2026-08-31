@@ -143,6 +143,9 @@ pub enum Command {
     /// Watch the shared plane (NIP-01 REQ): --once exits on first match.
     Watch(WatchArgs),
 
+    /// Wait until a receipt appears (subscribe-until-receipt).
+    Wait(WaitArgs),
+
     // --- operator surface (bd-led.8.2): daemon-persona commands.
     /// Deep health checks (herdr/git/keys/resonate). --check exits 3 on any failure.
     Doctor(DoctorArgs),
@@ -1408,6 +1411,22 @@ pub struct WatchArgs {
     /// Total watch budget in ms (required with --once).
     #[arg(long)]
     pub timeout_ms: Option<u64>,
+    /// Live subscription (bus subscribe, yields WatchNdjson lines) — no snapshot poll.
+    #[arg(long, conflicts_with = "once")]
+    pub live: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct WaitArgs {
+    /// Correlation id to wait for (receipts store).
+    #[arg(long, required = true)]
+    pub corr: String,
+    /// Timeout in seconds (default 30, 0 = no timeout).
+    #[arg(long)]
+    pub timeout: Option<u64>,
+    /// Project slug (optional, for scoping).
+    #[arg(long)]
+    pub project: Option<String>,
 }
 
 // ---------------------------------------------------------------------------

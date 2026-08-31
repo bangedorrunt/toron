@@ -3893,6 +3893,7 @@ dependencies = [
  "rmcp",
  "serde",
  "serde_json",
+ "sqlx",
  "tokio",
  "toml",
  "toron-core",
@@ -3900,6 +3901,7 @@ dependencies = [
  "toron-workflow",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
