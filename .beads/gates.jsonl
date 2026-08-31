@@ -37,3 +37,4 @@
 {"id":37,"issue_id":"bd-gs8b","from_status":"in_progress","to_status":"closed","status_revision":602,"gate":"unit-test-verified","provider":"SwiftSparrow","passed":true,"recorded_by":"bangedorrunt","recorded_at":"2026-08-31 18:55:54"}
 {"id":38,"issue_id":"bd-dhm1","from_status":"in_progress","to_status":"closed","status_revision":606,"gate":"unit-test-verified","provider":"SwiftSparrow","passed":true,"recorded_by":"bangedorrunt","recorded_at":"2026-08-31 19:11:33"}
 {"id":39,"issue_id":"bd-gmjo","from_status":"in_progress","to_status":"closed","status_revision":580,"gate":"unit-test-verified","provider":"CreamFern","passed":true,"recorded_by":"bangedorrunt","recorded_at":"2026-08-31 19:26:18"}
+{"id":40,"issue_id":"bd-lmcy","from_status":"in_progress","to_status":"closed","status_revision":614,"gate":"unit-test-verified","provider":"TopazDune","passed":true,"recorded_by":"bangedorrunt","recorded_at":"2026-08-31 19:50:26"}
