@@ -118,6 +118,10 @@ fn run(cli: &Cli) -> anyhow::Result<ExitCode> {
             };
             ExitCode::from(code as u8)
         }
+        Command::Receipt(cmd) => {
+            run_receipt(cmd, format)?;
+            ExitCode::SUCCESS
+        }
         Command::Mail(_)
         | Command::Reserve(_)
         | Command::Slot(_)
@@ -411,6 +415,57 @@ fn run_config(cfg: &Config, args: &cli::ConfigArgs, format: OutputFormat) -> any
             for (k, v) in value.as_object().unwrap() {
                 println!("  {k}: {v}");
             }
+        }
+    }
+    Ok(())
+}
+
+#[tokio::main]
+async fn run_receipt(cmd: &cli::ReceiptCommand, format: OutputFormat) -> anyhow::Result<()> {
+    use crate::cli::ReceiptCommand;
+    use toron_core::mailbox::ReceiptState;
+    let mailbox = toron_mcp::demo_mailbox().await?;
+    let store = mailbox.receipt_store()?;
+    match cmd {
+        ReceiptCommand::Get(args) => {
+            let receipt = store.get(&args.corr).await?;
+            match receipt {
+                Some(r) => {
+                    let value = serde_json::json!({
+                        "corr": r.corr,
+                        "state": r.state.as_str(),
+                        "wake": r.wake.map(|w| w.as_str()),
+                        "due_at": r.due_at,
+                        "result_path": r.result_path,
+                        "updated_at": r.updated_at,
+                    });
+                    render_json(&value, format);
+                }
+                None => {
+                    anyhow::bail!("receipt not found for corr {}", args.corr);
+                }
+            }
+        }
+        ReceiptCommand::List(args) => {
+            let state = match &args.state {
+                Some(s) => Some(ReceiptState::parse(s).map_err(|e| anyhow::anyhow!(e))?),
+                None => None,
+            };
+            let receipts = store.list(state).await?;
+            let value: Vec<serde_json::Value> = receipts
+                .into_iter()
+                .map(|r| {
+                    serde_json::json!({
+                        "corr": r.corr,
+                        "state": r.state.as_str(),
+                        "wake": r.wake.map(|w| w.as_str()),
+                        "due_at": r.due_at,
+                        "result_path": r.result_path,
+                        "updated_at": r.updated_at,
+                    })
+                })
+                .collect();
+            render_json(&serde_json::Value::Array(value), format);
         }
     }
     Ok(())
