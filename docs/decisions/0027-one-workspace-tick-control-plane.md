@@ -168,7 +168,7 @@ Grok Bot cannot replay a control-plane log because it has none. We already journ
 
 We will not mint Grok Bot's tool catalog.
 
-Grok Bot has no replay of control-plane Msgs. It treats the orchestrator as a growing list of tools, parks humans on UI cards, and ships skills as markdown recipes. A withdrawn Proposed copied that shape onto toron. This record does not. Quiet is not English in a prompt. Human decision is a Msg (`HumanDecision { corr, verdict }`) — mail may carry the question; the mailbox does not mint a token. Playbooks are data on beads; the door is `engine.invoke` + `VerifySink`. Receipts are a projection of Model, not a process `HashMap` and not a chat journal. Cron + standing wake already exist (ADR-0012); there is no routine noun to mint. Secrets are a Cmd that writes ncryptsec, never a rumor. Two captains stay split; do not wire Firstmate. MCP grows only as the same verb as CLI when an agent cannot tick without it.
+Grok Bot has no replay of control-plane Msgs. It treats the orchestrator as a growing list of tools, parks humans on UI cards, and ships skills as markdown recipes. A withdrawn Proposed copied that shape onto toron. This record does not. Quiet is not English in a prompt. Human decision is a Msg (`HumanDecision { corr, verdict }`) — mail may carry the question; the mailbox does not mint a token. Playbooks are data on beads; the door is `engine.invoke` + `VerifySink`. Receipts are a sqlite store written by Cmd, cached in Model — not a process `HashMap` and not a chat journal. Cron + standing wake already exist (ADR-0012); there is no routine noun to mint. Secrets are a Cmd that writes ncryptsec, never a rumor. Two captains stay split; do not wire Firstmate. MCP grows only as the same verb as CLI when an agent cannot tick without it.
 
 ### 3.5 Nouns we already have (toron `66811f38`)
 
@@ -292,8 +292,8 @@ flowchart LR
     tagsLater["extra_tags corr wake"] --> tRec["tick"]
     tRec --> asgRec["WorkspaceModel.assignment"]
     tRec --> sqlRec["Cmd::SqliteUpsert"]
-    sqlRec --> projRec["receipts next to message_reads / inbox_cursors"]
-    projRec -.->|projection| asgRec
+    sqlRec --> projRec["receipts sqlite next to message_reads / inbox_cursors"]
+    projRec -.->|startup cache rebuilds| asgRec
     presLater["Msg::Presence pin state"] --> tRec
     tRec --> mapLater["WorkspaceModel.presence  missing = Unknown"]
     liveW["Cmd::Subscribe → subscribe_trusted / watch --live"] --> tRec
@@ -307,7 +307,7 @@ flowchart LR
 1. **One tick is the law, not a costume.** Every live control-plane change is `tick(WorkspaceModel, Msg) -> (WorkspaceModel, Vec<Cmd>)`. Dual reducer on the live path is a bug. `--once` and tests may call tick; they must not keep a second producer.
 2. **Invent on nouns we already have.** Doorbell, 30013, `SendMessage.extra_tags`, durable sqlite (`message_reads` / `inbox_cursors`), 20001 `PresenceBroker`, `VerifySink`. Prefer no 30015. No second doorbell, wake kind, second profile, extra `--mode`.
 3. **Beat Grok Bot, do not clone it.** Replay is the beat (we journal; they do not). Refuse prose protocol, widgets, markdown skills, process-local receipts, Auto-review cards, a tool catalog, secrets in mail, cloud-agents as a merge path.
-4. **Assignment outlives the pane.** `corr` is a tag. Receipts are a projection of Model. Standing empty is silence. Tasked empty is a result against `corr`. Chat journal is not the backlog. Do not put factory.db inside toron.
+4. **Assignment outlives the pane.** `corr` is a tag. Receipts are sqlite written by Cmd, cached in Model. Standing empty is silence. Tasked empty is a result against `corr`. Chat journal is not the backlog. Do not put factory.db inside toron.
 5. **Two captains stay split.** Flywheel never calls Firstmate. Human talks to Firstmate; the tree talks to a spawned captain pane. `audience=human` addresses one orchestrator pin. Broadcast-to-human is a hard error.
 6. **Unknown stays unknown.** Do not default idle. Inject reads presence in Model, not herdr-only gossip. Interrupt is operator/user; never onto the human pin.
 7. **MCP grows only as the same verb as CLI when an agent cannot tick without it.** A missing MCP name is not a reason to mint a Grok Bot tool.
@@ -320,7 +320,7 @@ flowchart LR
 
 ### Option A — One `WorkspaceModel`, one Msg, one tick (CHOSEN)
 
-Compose `DoorbellModel` + `LoopModel` + assignment + roles + presence + open_human under one entry. Today's two `tick` functions become private slice reducers. `Cmd` is data. Leftover bypasses fold into Msgs. Assignment rides `extra_tags` + sqlite projection. Role binding prefers 30013 `role=` tags + whois aliases. Human decision is a Msg. Presence 20001 is inject truth. Live watch is `Cmd::Subscribe`. Waiter is `Cmd::WaitCorr`. MCP later, same-verb-only.
+Compose `DoorbellModel` + `LoopModel` + assignment + roles + presence + open_human under one entry. Today's two `tick` functions become private slice reducers. `Cmd` is data. Leftover bypasses fold into Msgs. Assignment rides `extra_tags` + durable sqlite receipts (store) cached in Model. Role binding prefers 30013 `role=` tags + whois aliases. Human decision is a Msg. Presence 20001 is inject truth. Live watch is `Cmd::Subscribe`. Waiter is `Cmd::WaitCorr`. MCP later, same-verb-only.
 
 ### Option B — Copy Grok Bot (previous Proposed / diagrams revision) — rejected
 
@@ -423,8 +423,8 @@ flowchart LR
     recvE2 --> tE2["tick"]
     tE2 --> asgE2["WorkspaceModel.assignment[corr]"]
     tE2 --> sqlE2["Cmd::SqliteUpsert"]
-    sqlE2 --> sqE2["receipts next to message_reads / inbox_cursors"]
-    sqE2 -.->|projection| asgE2
+    sqlE2 --> sqE2["receipts sqlite next to message_reads / inbox_cursors"]
+    sqE2 -.->|startup cache rebuilds| asgE2
     whyE2["why --corr / --seq"] --> jsonlE2["same jsonl as log of Msg"]
     jsonlE2 --> foldE2["fold tick from Default — same Cmd sequence"]
   end
@@ -623,7 +623,7 @@ No Slice 4 "MCP facades." No Slice 5 "facts / routines / skills." Facts are left
 
 Assignment is useless on a live path that still strips tick output and wipes `bell_model`. Slice 1 is both.
 
-**In Model:** `corr` + `wake` tags on send; durable receipts as Model projection; `Cmd::WaitCorr` (CLI `toron wait --corr`; MCP not in this slice).
+**In Model:** `corr` + `wake` tags on send; durable receipts as sqlite store cached in Model; `Cmd::WaitCorr` (CLI `toron wait --corr`; MCP not in this slice).
 
 **Fold (prerequisites — the live path must not lie before assignment rides it):**
 
@@ -665,7 +665,7 @@ Whois aliases for persistent roles. Binding `role → live pin` (30013 tags, or 
 5. Tasked work has a `corr` that outlives the pane. Standing empty is silence. Tasked empty is a result against `corr`.
 6. Default tasked priority is queue. Interrupt is operator/user. Never interrupt the human pin.
 7. `audience=human` addresses one orchestrator pin. Broadcast-to-human is a hard error.
-8. Receipts are a projection of Model. Chat journal is not the backlog.
+8. Receipts are sqlite written by Cmd and cached in Model; replay never mutates the store. Chat journal is not the backlog.
 9. Unknown presence is unknown. Never default idle.
 10. Secrets never in mail, including plane P. Secret Cmd writes ncryptsec. Tripwire is `denied`, not a widget.
 11. One open `HumanDecision` per corr. Mailbox is not the gate and does not mint a token.
@@ -714,7 +714,7 @@ Whois aliases for persistent roles. Binding `role → live pin` (30013 tags, or 
 
 **SQLite:** `receipts` table next to `message_reads` / `inbox_cursors`. Projection of Model, not a bolt-on cache.
 
-**CLI (verbs, not a catalog):** `toron wait --corr`, `toron why --corr` (replay), `toron watch --live`, `toron role pin` (whois alias write), `toron receipt get` (reads Model/projection). Task send is `mail send` + tags, not a parallel product.
+**CLI (verbs, not a catalog):** `toron wait --corr`, `toron why --corr` (replay), `toron watch --live`, `toron role pin` (whois alias write), `toron receipt get` (reads the receipts store). Task send is `mail send` + tags, not a parallel product.
 
 **MCP:** none in Slice 1. Later, only the same verb as CLI, and only when an agent cannot tick without it.
 
@@ -741,8 +741,8 @@ flowchart LR
     direction TB
     k9s1["Msg WatchNdjson kind-9 extra_tags corr=FM-GS-012 wake=tasked"] --> tS1["tick"]
     tS1 --> asgS1["WorkspaceModel.assignment[FM-GS-012] = owed"]
-    tS1 --> sqlS1["Cmd::SqliteUpsert receipts projection"]
-    sqlS1 -->|new process loads| tS1b["tick  Msg Receipt owed"]
+    tS1 --> sqlS1["Cmd::SqliteUpsert receipts store"]
+    sqlS1 -->|new process loads store into Model| tS1b["tick  Msg Receipt owed"]
     tS1b --> asgS1
   end
 ```
@@ -835,7 +835,7 @@ flowchart LR
 **Positive**
 
 - Replay is a property of the log. `why` becomes a proof, not archaeology. Grok Bot cannot do this; we already journal.
-- Dead walkers do not lose the assignment (`corr` + Model-projected receipts).
+- Dead walkers do not lose the assignment (`corr` + sqlite receipts cached in Model).
 - Roles outlive panes without a farm of seq identities and without a second profile kind.
 - Doorbell and 30013 stay the nouns operators already learned.
 - Dual reducer becomes illegal on the live path, which is Tick Law, not a new religion.
@@ -902,7 +902,7 @@ Product locks, not research. One decision at a time when locking.
 1. **Slice 1 first?** Recommendation: yes — assignment in Model is useless on a live path that still strips tick output and wipes `bell_model`.
 2. **Role binding on 30013 vs new 30015?** Recommendation: try 30013 `role=` tags + whois aliases first; mint 30015 only if the charter document would have to change every pane hop. Prefer no 30015.
 3. **When, if ever, does MCP grow?** Recommendation: not in Slice 1. Grow `wait` as the same verb as `toron wait --corr` only when an MCP-only agent cannot tick without it.
-4. **Receipts store-vs-projection direction (resolved in this revision, confirm at lock):** sqlite `receipts` is the durable store; `WorkspaceModel.assignment` is a startup cache rebuilt from the table. Journal replay never writes receipts. Recommendation: keep as written.
+4. **Receipts store direction (resolved in this revision, confirm at lock):** sqlite `receipts` is the durable store; `WorkspaceModel.assignment` is a startup cache rebuilt from the table. Journal replay never writes receipts. Recommendation: keep as written.
 
 ---
 
