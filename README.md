@@ -371,6 +371,7 @@ Version bumps derive from commit types: `feat` → minor, `fix`/`perf` → patch
 | [0011](docs/decisions/0011-coalition-orchestration.md) | Coalition Orchestration — Steer + Collab Layers, Intent-Based Coordination | **Accepted** |
 | [0012](docs/decisions/0012-standalone-cron-type.md) | Standalone Cron Type — Scheduled Primitive, Distinct from Workflow | **Accepted** |
 | [0013](docs/decisions/0013-website-architecture-and-feature-presentation.md) | toron.dev Website Architecture and Feature Presentation | **Accepted** |
+| [0027](docs/decisions/0027-one-workspace-tick-control-plane.md) | One Workspace Tick — Control Plane as Elm/Redux on Doorbell + 30013 | **Accepted** (2026-09-01, captain word; slices ship as green) |
 
 > Full index (0001–0013, parity catalogs, ADR-0005 phase status): **[docs/decisions/README.md](docs/decisions/README.md)**.
 > Orchestration vocabulary (profiles/crews/workflows/cron) lives in [`flywheel`](../flywheel); see [`flywheel/docs/workflow-authoring.md`](../flywheel/docs/workflow-authoring.md).
