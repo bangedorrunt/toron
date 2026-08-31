@@ -1,6 +1,6 @@
 <!-- governed-by: ADR-0003, ADR-0005, ADR-0010, ADR-0015, ADR-0022, ADR-0024, ADR-0025 -->
 ---
-status: proposed
+status: accepted
 date: 2026-08-28
 decision-makers: Captain (bangedorrunt)
 consulted: Jido + Puppetmaster study 2026-08-27 (ADR-0025 §12); 2026-08-27 live incident (402 insufficient-balance killed two dispatched agents mid-task, work stopped); 2026-08-08 live incident (toron outputSchema regression + missing loop-identity key → lease-renews soft-failed continuously while dispatching continued)
@@ -9,7 +9,7 @@ informed: flywheel maintainers; skill owners (toron, flywheel)
 
 # ADR-0026: Failure Taxonomy, Funded Preflight, Fallback Chains, and Bounded Mail-Health Escalation
 
-**Status:** Proposed (2026-08-28)
+**Status:** Accepted (2026-08-31)
 **Date:** 2026-08-28
 **Decision-makers:** Captain (bangedorrunt)
 **Extends:** [ADR-0010](0010-execution-wiring-model-registry-headless.md) (model registry, profiles, headless fallback `bd-42fs`), [ADR-0024](0024-graph-first-repair-loops-bead-workflow.md) (runtime-failure kinds — this record takes over the "recoverable-failure classification → funded-adapter reroute" deferral recorded in [ADR-0025](0025-adopt-graph-dispatch-artifact-reduce-pin-supervision.md) §12), [ADR-0005](0005-orchestration-layer.md) (preflight surface)
@@ -345,3 +345,18 @@ Cross-cutting
 - The dispatch-hold at N fires more than once a month on a healthy daemon (that is a daemon defect — fix the daemon, not N)
 
 **Companion visuals:** none. This record is small enough to be its own picture (§2).
+
+
+---
+
+## Acceptance record (2026-08-31)
+
+Both waves verified shipped in flywheel at `53fd5bbc` (pre-bind HEAD) / `c96a7ae`:
+
+- **Spec 1 (FailureKind + classifier):** `flywheel/src/failure.rs` — `FailureKind { Auth, RateLimit, Timeout, Blocked, Provider, Cancelled, Unknown, Billing }`, the exact cross-ref-frozen spelling; classifier unit-tested per row (`cron.rs` tests 2252–2308).
+- **Spec 2 (funded preflight):** `flywheel/src/preflight.rs:240,552–573` — `provider_funded_checks` / `check_provider_funded`; honest `skip` with "no funded endpoint — classifier+fallback cover it".
+- **Spec 3 (fallback chains):** `flywheel/src/profile.rs:99` `fallback: Vec<String>`; unknown fallback name fails at catalog load (`profile.rs:272–274`), not at reroute time.
+- **Spec 4 (bounded mail-health):** `flywheel/src/durable.rs:53–80` — `mail_health` counter, `FLYWHEEL_MAIL_HEALTH_ESCALATE_AT` (default 3, 0 disables), `mail_degraded` flag, dispatch hold + `status` surfacing; **deviation:** the escalation signal is the existing eprintln + loop `Blocked` hold rather than a new kind-14 mail leaf — per this record's own note, "escalation rides existing Blocked + mail leaves".
+- **W2 loop-identity fail-loud:** `flywheel/src/durable.rs:5547` — hard-error at loop start when the resolved identity has no usable key.
+
+Checklist: verify-adr-links passes (5 enforcing files carry `governed-by: ADR-0026`); no new MCP tools; no new kinds. Tracker evidence: the 2026-08-08 CoralFinch and 2026-08-27 402 incidents this record was written from are the failure classes it eliminates.
