@@ -1,6 +1,6 @@
 <!-- governed-by: ADR-0003, ADR-0005, ADR-0011, ADR-0015, ADR-0019, ADR-0020, ADR-0022, ADR-0024 -->
 ---
-status: proposed
+status: accepted
 date: 2026-08-27
 decision-makers: Captain (bangedorrunt)
 consulted: Jido (agentjido/jido) + Puppetmaster (professorpalmer/Puppetmaster) study 2026-08-27; ADR-0024 Atomic-tree revision; Round-1 adversarial review + Elm-reducer fold; Round-2 verification pass (same day, §12)
@@ -9,7 +9,7 @@ informed: flywheel maintainers; skill owners (toron, flywheel, runtime-adaptatio
 
 # ADR-0025: Adopt Graph-Only Dispatch, Artifact Reduce, and Pin Supervision
 
-**Status:** Proposed (2026-08-27; revised same day after Round-1 review)
+**Status:** Accepted (2026-08-27; revised same day after Round-1 review; acceptance recorded 2026-08-31)
 **Date:** 2026-08-27
 **Decision-makers:** Captain (bangedorrunt)
 **Extends:** [ADR-0005](0005-orchestration-layer.md) (workflow engine, DAG, triggers), [ADR-0011](0011-coalition-orchestration.md) (steer + collab layers, reservations), [ADR-0015](0015-flywheel-toron-integration-contract.md) (one-way dep, one mail surface), [ADR-0019](0019-bead-verified-execution-and-principle-playbooks.md) (legal close, VERIFY, no worktrees), [ADR-0020](0020-nostr-two-plane-cli-and-crew-steering.md) (planes P/S/J/N/W), [ADR-0022](0022-phase-native-orchestration.md) (Phase, one durable rail), [ADR-0024](0024-graph-first-repair-loops-bead-workflow.md) (graph canonical, typed runtime failure, unrolled repair), flywheel [ADR-0001](../../../flywheel/docs/decisions/0001-event-driven-agent-collaboration-spine.md) (event spine, `LoopAction`)
@@ -822,3 +822,20 @@ Cross-cutting
 - Cheapest-sufficient model routing; `flywheel workflow connect` live run tree; kill-and-resume demo command; BT builtin recipe; calibrated `predicted_independent_gate_pass_probability`.
 
 **Companion visual:** `~/.agent/diagrams/stack-vs-jido-puppetmaster.html` (evaluation, not normative). This ADR is the normative record.
+
+
+---
+
+## Acceptance record (2026-08-31, with recorded deviations)
+
+All seven specs have shipped surface in flywheel at `c96a7ae` (doorbell-tick bind). Accepted WITH these recorded deviations — the honest-costume rule: a flip without naming deviations is a lie.
+
+- **Spec 1 (actor model):** shipped — pins + panes + mailbox addressing; reservation isolation.
+- **Spec 2 (artifact reduce):** shipped — `flywheel/src/artifact.rs` `ArtifactRecord` + stitcher (records only, never transcripts); `flywheel artifacts {list,stitch}`.
+- **Spec 3 (typed loop + Elm tick):** shipped — `durable.rs` `tick(&LoopModel, &LoopMsg)`, `LoopPhase` closed enum, `loops.json` v3 with `mail_health`, replay compares action SEQUENCES (not counts) from the journaled queue; doorbell bound to its own `doorbell_tick::tick` with journal (bd-yw4s, `c96a7ae`). **Deviation (wave-2, bd-nsb3):** the loop's heal/route_event/watch_sends still merge around `tick`, and the plane-P sweep + refresh still use the legacy queue helpers — both documented remainders, same pure classify rules.
+- **Spec 4 (parent-death):** shipped — `on_captain_death` stop|continue|adopt with alias clearing + rebind.
+- **Spec 5 (plane tripwires):** shipped — `check_send_plane_tripwires` (send) + direct `check_job_tripwire` in mail send; channel post is toron-owned (no flywheel wrapper to wire).
+- **Spec 6 (one ingress + idempotency):** shipped as a **typed seam**, not an enum merge — `IngressEvent` maps to `LoopMsg` via `ingress_to_loop_msg` at the `handle_ingress` boundary (bd-0or2); compose/`profile run` carry the stable idempotency key (ADR-0025 W5). Deviation recorded: two enums, one seam, per bd-0or2 and the ADR-0025 open-mode cost rule (ADR-0002/0025: Direct must not pay for swarm).
+- **Spec 7 (Direct vs graph):** held — Direct never requires a graph; open-mode has no dispatcher.
+
+`LoopAction::InvokeGraph` is NOT restored: the graph vehicle is a subprocess `workflow run --execute --mode pane` at dispatch time (GS-005 §9), loud-typed via `VehicleOutcome`. This is a deliberate amendment to Spec 3's action vocabulary, recorded here.
