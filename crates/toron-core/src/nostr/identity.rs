@@ -84,11 +84,45 @@ pub fn build_profile_event(
     profile: &AgentProfile,
     created_at: Timestamp,
 ) -> Result<Event, BuilderError> {
+    build_profile_event_with_roles(keys, project_slug, profile, &[], created_at)
+}
+
+/// Build a profile event that also carries `role=` tags (bd-lmcy).
+/// Roles are signed, replaceable via the same `d` tag — the latest event per
+/// `d` wins (NIP-01). Each role becomes `["role", "<name>"]`.
+pub fn build_profile_event_with_roles(
+    keys: &Keys,
+    project_slug: &str,
+    profile: &AgentProfile,
+    roles: &[String],
+    created_at: Timestamp,
+) -> Result<Event, BuilderError> {
     let content = serde_json::to_string(profile).expect("profile serializes");
-    let base_tags =
+    let mut base_tags =
         vec![Tag::parse(["d", &profile_d_tag(project_slug, &profile.name)]).expect("d tag")];
+    for role in roles {
+        if let Ok(t) = Tag::parse(["role", role]) {
+            base_tags.push(t);
+        }
+    }
     let tags = with_project_scoping(toron_kind(AGENT_PROFILE), base_tags, Some(project_slug));
     build_event(keys, toron_kind(AGENT_PROFILE), content, tags, created_at)
+}
+
+/// Extract `role=` tags from a kind-30013 profile event (bd-lmcy).
+pub fn profile_roles(event: &Event) -> Vec<String> {
+    event
+        .tags
+        .iter()
+        .filter_map(|t| {
+            let s = t.as_slice();
+            if s.first().map(|x| x.as_str()) == Some("role") && s.len() > 1 {
+                Some(s[1].clone())
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 /// `create_agent_identity`: ALWAYS generate a fresh keypair + publish the

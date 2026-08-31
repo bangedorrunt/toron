@@ -358,6 +358,135 @@ impl Mailbox {
         Ok(current)
     }
 
+    /// bd-lmcy: set a role → pin alias (signed, replaceable via alias table;
+    /// 30013 role= tags are the charter source, the alias is the whois cache).
+    /// Validates the pin is REGISTERED (whois must succeed) and that the role
+    /// name is not a reserved alias (`captain`) and is non-empty.
+    pub async fn set_role_pin(
+        &self,
+        project_slug: &str,
+        role: &str,
+        pin: &str,
+    ) -> anyhow::Result<String> {
+        let canonical = self.canonical_project(project_slug).await;
+        if role.trim().is_empty() {
+            anyhow::bail!("role name must be non-empty");
+        }
+        if role == "captain" {
+            anyhow::bail!("role 'captain' is reserved — use `toron contact captain`");
+        }
+        if super::naming::is_username_class(pin) {
+            anyhow::bail!(
+                "{pin} looks like a host OS username, not a mailbox identity — role pin must be a REGISTERED adjective+noun pin"
+            );
+        }
+        let who = self.whois(&canonical, pin).await.map_err(|e| {
+            anyhow::anyhow!(
+                "role pin must be a REGISTERED adjective+noun pin in project {canonical} (whois failed: {e})"
+            )
+        })?;
+        let Some(pool) = self.index_pool.as_ref() else {
+            anyhow::bail!("no index pool attached — cannot persist role alias");
+        };
+        upsert_role_alias(pool, &canonical, role, &who.name).await?;
+        // Publish 30013 with role= tag (the signed charter source). Best-effort
+        // — the alias table is the durable truth for whois/mail, the event is
+        // the charter. Failure to publish does not fail the alias write.
+        if let Ok(keys) = self.agent_keys_for(&canonical, &who.name) {
+            let profiles = self.project_profiles(&canonical).await.unwrap_or_default();
+            let want_d = crate::nostr::identity::profile_d_tag(&canonical, &who.name);
+            let latest = profiles
+                .iter()
+                .filter(|ev| ev.kind.as_u16() == crate::nostr::kinds::AGENT_PROFILE)
+                .filter(|ev| {
+                    ev.tags
+                        .iter()
+                        .any(|t| t.as_slice() == ["d".to_string(), want_d.clone()])
+                })
+                .max_by(|a, b| crate::bus::addressable::nip01_replaceable_cmp(a, b));
+            let mut roles = latest
+                .map(crate::nostr::identity::profile_roles)
+                .unwrap_or_default();
+            if !roles.contains(&role.to_string()) {
+                roles.push(role.to_string());
+                let profile = latest
+                    .and_then(crate::nostr::identity::parse_profile)
+                    .unwrap_or_else(|| crate::nostr::identity::AgentProfile::new(who.name.clone()));
+                if let Ok(new_event) = crate::nostr::identity::build_profile_event_with_roles(
+                    &keys,
+                    &canonical,
+                    &profile,
+                    &roles,
+                    crate::nostr::Timestamp::now(),
+                ) {
+                    let _ = self.bus.publish(new_event).await;
+                }
+            }
+        }
+        Ok(who.name)
+    }
+
+    /// bd-lmcy: get the live pin for a role (via alias table). `None` when
+    /// the role has no alias.
+    pub async fn role_pin(&self, project_slug: &str, role: &str) -> Option<String> {
+        let pool = self.index_pool.as_ref()?;
+        let canonical = self.canonical_project(project_slug).await;
+        sqlx::query_scalar(
+            "SELECT canonical FROM agent_name_aliases WHERE project_slug = ?1 AND alias = ?2",
+        )
+        .bind(&canonical)
+        .bind(role)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten()
+    }
+
+    /// bd-lmcy: list all role aliases for a project (excludes `captain`).
+    pub async fn list_role_pins(
+        &self,
+        project_slug: &str,
+    ) -> anyhow::Result<Vec<(String, String)>> {
+        let canonical = self.canonical_project(project_slug).await;
+        let Some(pool) = self.index_pool.as_ref() else {
+            anyhow::bail!("no index pool attached");
+        };
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT alias, canonical FROM agent_name_aliases WHERE project_slug = ?1 AND alias != 'captain' ORDER BY alias",
+        )
+        .bind(&canonical)
+        .fetch_all(pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// bd-lmcy: clear a role alias.
+    pub async fn clear_role_pin(
+        &self,
+        project_slug: &str,
+        role: &str,
+    ) -> anyhow::Result<Option<String>> {
+        let canonical = self.canonical_project(project_slug).await;
+        let Some(pool) = self.index_pool.as_ref() else {
+            anyhow::bail!("no index pool attached");
+        };
+        let current: Option<String> = sqlx::query_scalar(
+            "SELECT canonical FROM agent_name_aliases WHERE project_slug = ?1 AND alias = ?2",
+        )
+        .bind(&canonical)
+        .bind(role)
+        .fetch_optional(pool)
+        .await?;
+        if current.is_some() {
+            sqlx::query("DELETE FROM agent_name_aliases WHERE project_slug = ?1 AND alias = ?2")
+                .bind(&canonical)
+                .bind(role)
+                .execute(pool)
+                .await?;
+        }
+        Ok(current)
+    }
+
     /// ADR-0018 D4: the canonical name a legacy alias folds to (if any).
     /// `None` when the alias is unknown or no pool is attached.
     pub async fn agent_name_alias(&self, project_slug: &str, alias: &str) -> Option<String> {
@@ -395,6 +524,12 @@ impl Mailbox {
         name: &str,
     ) -> anyhow::Result<String> {
         let canonical = self.canonical_project(project_slug).await;
+        // bd-lmcy: role and captain aliases are authoritative in BOTH modes —
+        // a role name like "wheelhouse" is never a registered pin, it must
+        // fold via the alias table even in Open mode. Check alias first.
+        if let Some(folded) = self.agent_name_alias(&canonical, name).await {
+            return Ok(folded);
+        }
         let mode = self.project_identity_mode(&canonical).await;
         if mode != crate::mailbox::naming::IdentityMode::Swarm {
             return Ok(name.to_string());
@@ -707,6 +842,24 @@ impl Mailbox {
             return self.whois_build(name.to_string(), npub, profiles).await;
         }
 
+        // bd-lmcy: role and captain aliases are authoritative in BOTH modes —
+        // check alias first even in Open, so `whois wheelhouse` folds to the
+        // live pin via the alias table. Then fall back to mode-specific
+        // resolution.
+        if let Some(folded) = self.agent_name_alias(&canonical, name).await {
+            let target = folded;
+            for slug in &set {
+                let filter = kind_project_filter(toron_kind(AGENT_PROFILE), slug);
+                let events = collect_replay(self.bus.as_ref(), filter).await?;
+                if npub.is_none() {
+                    npub = ident::resolve_name(slug, events.iter(), &target);
+                }
+                profiles.extend(events);
+            }
+            let npub = npub
+                .ok_or_else(|| anyhow::anyhow!("unknown agent name: {target} (register first)"))?;
+            return self.whois_build(target, npub, profiles).await;
+        }
         // ADR-0018: swarm mode resolves canonical names, folded aliases, or
         // pins ONLY; display names are non-routable profile metadata.
         // bd-pin-public-plane-s-easy.1: ONE resolver — the fold precedes the
@@ -968,6 +1121,59 @@ pub async fn clear_captain_alias_in_db(
             .await?;
     }
     Ok(current)
+}
+
+/// bd-lmcy: generic role alias — same table as captain, but any role name.
+/// The alias table is the durable role → live pin map (30013 role= tags are
+/// the signed source; the alias is the whois cache, like captain).
+pub async fn set_role_alias_in_db(
+    db_path: &str,
+    project_slug: &str,
+    role: &str,
+    canonical_pin: &str,
+) -> anyhow::Result<()> {
+    let pool = crate::index::schema::connect(db_path).await?;
+    crate::index::schema::migrate(&pool).await?;
+    upsert_role_alias(&pool, project_slug, role, canonical_pin).await
+}
+
+pub async fn role_alias_in_db(
+    db_path: &str,
+    project_slug: &str,
+    role: &str,
+) -> anyhow::Result<Option<String>> {
+    let pool = crate::index::schema::connect(db_path).await?;
+    crate::index::schema::migrate(&pool).await?;
+    let row: Option<String> = sqlx::query_scalar(
+        "SELECT canonical FROM agent_name_aliases WHERE project_slug = ?1 AND alias = ?2",
+    )
+    .bind(project_slug)
+    .bind(role)
+    .fetch_optional(&pool)
+    .await?;
+    Ok(row)
+}
+
+async fn upsert_role_alias(
+    pool: &sqlx::SqlitePool,
+    project_slug: &str,
+    role: &str,
+    canonical_pin: &str,
+) -> anyhow::Result<()> {
+    let now_us = crate::index::writer::Clock::now_us(&crate::index::writer::SystemClock);
+    sqlx::query(
+        "INSERT INTO agent_name_aliases (project_slug, alias, canonical, created_ts_us) \
+         VALUES (?1, ?2, ?3, ?4) \
+         ON CONFLICT (project_slug, alias) DO UPDATE \
+         SET canonical = excluded.canonical, created_ts_us = excluded.created_ts_us",
+    )
+    .bind(project_slug)
+    .bind(role)
+    .bind(canonical_pin)
+    .bind(now_us)
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2129,6 +2335,211 @@ mod tests {
             fresh.contains(&"demo".to_string()),
             "reverse direction: {fresh:?}"
         );
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    // ---- bd-lmcy: role= tags + alias + mail --to role: (E4) ----
+
+    #[tokio::test]
+    async fn role_toron_pin_and_whois_resolves() {
+        let (mailbox, _pool, db_path, data_dir) = test_mailbox_with_pool("role-pin").await;
+        mailbox
+            .register_agent("demo", &profile("DustySparrow"))
+            .await
+            .expect("register");
+        // Pin role wheelhouse -> DustySparrow
+        let pinned = mailbox
+            .set_role_pin("demo", "wheelhouse", "DustySparrow")
+            .await
+            .expect("set role pin");
+        assert_eq!(pinned, "DustySparrow");
+        // whois wheelhouse prints charter + live pin
+        let who = mailbox
+            .whois("demo", "wheelhouse")
+            .await
+            .expect("whois role");
+        assert_eq!(who.name, "DustySparrow");
+        // Profile carries role= tag
+        let profiles = mailbox.project_profiles("demo").await.expect("profiles");
+        let want_d = crate::nostr::identity::profile_d_tag("demo", "DustySparrow");
+        let ev = profiles
+            .iter()
+            .find(|ev| {
+                ev.tags
+                    .iter()
+                    .any(|t| t.as_slice() == ["d".to_string(), want_d.clone()])
+            })
+            .expect("profile event");
+        let roles = crate::nostr::identity::profile_roles(ev);
+        assert!(
+            roles.contains(&"wheelhouse".to_string()),
+            "profile must carry role=wheelhouse tag: {roles:?}"
+        );
+        // list_role_pins shows it
+        let list = mailbox.list_role_pins("demo").await.expect("list");
+        assert!(
+            list.iter()
+                .any(|(r, p)| r == "wheelhouse" && p == "DustySparrow")
+        );
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn role_toron_mail_to_role_delivers() {
+        let (mailbox, db_path, data_dir) = test_mailbox("role-mail").await;
+        let pool = crate::index::schema::connect(db_path.to_str().unwrap())
+            .await
+            .expect("connect");
+        crate::index::schema::migrate(&pool).await.expect("migrate");
+        let mailbox = mailbox.with_index_pool(pool.clone());
+        mailbox
+            .register_agent("demo", &profile("DustySparrow"))
+            .await
+            .expect("register ds");
+        mailbox
+            .register_agent("demo", &profile("SenderOne"))
+            .await
+            .expect("register sender");
+        mailbox
+            .set_role_pin("demo", "wheelhouse", "DustySparrow")
+            .await
+            .expect("pin");
+        // Mail to role:wheelhouse resolves to DustySparrow's npub
+        let msg = crate::mailbox::SendMessage {
+            project_slug: "demo".into(),
+            sender_name: "SenderOne".into(),
+            to: vec!["role:wheelhouse".into()],
+            subject: "work".into(),
+            body_md: "do it".into(),
+            ..Default::default()
+        };
+        let res = mailbox.send_message(&msg).await.expect("send to role");
+        assert_eq!(res.count, 1);
+        assert_eq!(res.deliveries[0].payload.recipient, "DustySparrow");
+        // Inbox for DustySparrow has it
+        let inbox = mailbox
+            .fetch_inbox(&crate::mailbox::FetchInbox {
+                project_slug: "demo".into(),
+                agent_name: "DustySparrow".into(),
+                ..Default::default()
+            })
+            .await
+            .expect("inbox");
+        assert!(
+            inbox.iter().any(|m| m.subject == "work"),
+            "inbox must contain work: {inbox:?}"
+        );
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn role_toron_unknown_role_fails_loudly() {
+        let (mailbox, db_path, data_dir) = test_mailbox("role-unknown").await;
+        let pool = crate::index::schema::connect(db_path.to_str().unwrap())
+            .await
+            .expect("connect");
+        crate::index::schema::migrate(&pool).await.expect("migrate");
+        let mailbox = mailbox.with_index_pool(pool.clone());
+        mailbox
+            .register_agent("demo", &profile("SenderOne"))
+            .await
+            .expect("register sender");
+        mailbox
+            .register_agent("demo", &profile("DustySparrow"))
+            .await
+            .expect("register ds");
+        mailbox
+            .set_role_pin("demo", "wheelhouse", "DustySparrow")
+            .await
+            .expect("pin");
+        let msg = crate::mailbox::SendMessage {
+            project_slug: "demo".into(),
+            sender_name: "SenderOne".into(),
+            to: vec!["role:unknown".into()],
+            subject: "x".into(),
+            body_md: "y".into(),
+            ..Default::default()
+        };
+        let err = mailbox
+            .send_message(&msg)
+            .await
+            .expect_err("unknown role must error");
+        let msg_str = err.to_string();
+        assert!(
+            msg_str.contains("unknown role"),
+            "must name unknown role: {msg_str}"
+        );
+        assert!(
+            msg_str.contains("wheelhouse"),
+            "must name available roles: {msg_str}"
+        );
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn role_toron_rebind_after_pane_death() {
+        // S3: role outlives pane — after pane death, next pin claims same role
+        let (mailbox, db_path, data_dir) = test_mailbox("role-rebind").await;
+        let pool = crate::index::schema::connect(db_path.to_str().unwrap())
+            .await
+            .expect("connect");
+        crate::index::schema::migrate(&pool).await.expect("migrate");
+        let mailbox = mailbox.with_index_pool(pool.clone());
+        // First generation
+        mailbox
+            .register_agent("demo", &profile("DustySparrow"))
+            .await
+            .expect("register old");
+        mailbox
+            .register_agent("demo", &profile("SenderOne"))
+            .await
+            .expect("sender");
+        mailbox
+            .set_role_pin("demo", "wheelhouse", "DustySparrow")
+            .await
+            .expect("pin old");
+        // Mail to role goes to old pin
+        let msg1 = crate::mailbox::SendMessage {
+            project_slug: "demo".into(),
+            sender_name: "SenderOne".into(),
+            to: vec!["role:wheelhouse".into()],
+            subject: "first".into(),
+            body_md: "body".into(),
+            ..Default::default()
+        };
+        let r1 = mailbox.send_message(&msg1).await.expect("send1");
+        assert_eq!(r1.deliveries[0].payload.recipient, "DustySparrow");
+        // Simulate pane death: wipe key and re-register as new pin (seq>=2 new npub)
+        // For test, register a new pin RedDune and rebind role to it
+        mailbox
+            .register_agent("demo", &profile("RedDune"))
+            .await
+            .expect("register new");
+        mailbox
+            .set_role_pin("demo", "wheelhouse", "RedDune")
+            .await
+            .expect("rebind");
+        // whois wheelhouse now resolves to RedDune
+        let who = mailbox
+            .whois("demo", "wheelhouse")
+            .await
+            .expect("whois after rebind");
+        assert_eq!(who.name, "RedDune");
+        // Mail to role now goes to RedDune
+        let msg2 = crate::mailbox::SendMessage {
+            project_slug: "demo".into(),
+            sender_name: "SenderOne".into(),
+            to: vec!["role:wheelhouse".into()],
+            subject: "second".into(),
+            body_md: "body2".into(),
+            ..Default::default()
+        };
+        let r2 = mailbox.send_message(&msg2).await.expect("send2");
+        assert_eq!(r2.deliveries[0].payload.recipient, "RedDune");
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_dir_all(&data_dir);
     }

@@ -181,6 +181,10 @@ pub enum Command {
     /// Receipts durable store (ADR-0027 E2): `receipt get` / `receipt list`.
     #[command(subcommand)]
     Receipt(ReceiptCommand),
+
+    /// Role binding via 30013 role= tags + alias (ADR-0027 E4).
+    #[command(subcommand)]
+    Role(RoleCommand),
 }
 
 /// toron workflow (fabric) subcommands (ADR-0005 Spec 5).
@@ -243,6 +247,43 @@ pub struct ReceiptListArgs {
     /// Filter by state: owed|acked|resulted.
     #[arg(long)]
     pub state: Option<String>,
+}
+
+#[derive(Debug, clap::Subcommand)]
+pub enum RoleCommand {
+    /// Pin a role to a registered agent (alias write, 30013 role= tag).
+    Pin(RolePinArgs),
+    /// List role → pin aliases for a project.
+    List(RoleListArgs),
+    /// Clear a role alias.
+    Clear(RoleClearArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct RolePinArgs {
+    /// Role name (e.g. wheelhouse).
+    pub role: String,
+    /// Registered pin (adjective+noun) that holds the role.
+    pub pin: String,
+    /// Project slug.
+    #[arg(long, required = true)]
+    pub project: String,
+}
+
+#[derive(Debug, Args)]
+pub struct RoleListArgs {
+    /// Project slug.
+    #[arg(long, required = true)]
+    pub project: String,
+}
+
+#[derive(Debug, Args)]
+pub struct RoleClearArgs {
+    /// Role name to clear.
+    pub role: String,
+    /// Project slug.
+    #[arg(long, required = true)]
+    pub project: String,
 }
 
 #[derive(Debug, Args)]

@@ -122,6 +122,10 @@ fn run(cli: &Cli) -> anyhow::Result<ExitCode> {
             run_receipt(cmd, format)?;
             ExitCode::SUCCESS
         }
+        Command::Role(cmd) => {
+            run_role(cmd, format)?;
+            ExitCode::SUCCESS
+        }
         Command::Mail(_)
         | Command::Reserve(_)
         | Command::Slot(_)
@@ -466,6 +470,44 @@ async fn run_receipt(cmd: &cli::ReceiptCommand, format: OutputFormat) -> anyhow:
                 })
                 .collect();
             render_json(&serde_json::Value::Array(value), format);
+        }
+    }
+    Ok(())
+}
+
+#[tokio::main]
+async fn run_role(cmd: &cli::RoleCommand, format: OutputFormat) -> anyhow::Result<()> {
+    use crate::cli::RoleCommand;
+    let mailbox = toron_mcp::demo_mailbox().await?;
+    match cmd {
+        RoleCommand::Pin(args) => {
+            let pin = mailbox
+                .set_role_pin(&args.project, &args.role, &args.pin)
+                .await?;
+            let value = serde_json::json!({
+                "project": args.project,
+                "role": args.role,
+                "pin": pin,
+            });
+            render_json(&value, format);
+        }
+        RoleCommand::List(args) => {
+            let roles = mailbox.list_role_pins(&args.project).await?;
+            let value: Vec<serde_json::Value> = roles
+                .into_iter()
+                .map(|(role, pin)| serde_json::json!({"role": role, "pin": pin}))
+                .collect();
+            render_json(&serde_json::Value::Array(value), format);
+        }
+        RoleCommand::Clear(args) => {
+            let cleared = mailbox.clear_role_pin(&args.project, &args.role).await?;
+            let value = serde_json::json!({
+                "project": args.project,
+                "role": args.role,
+                "cleared": cleared.is_some(),
+                "previous": cleared,
+            });
+            render_json(&value, format);
         }
     }
     Ok(())

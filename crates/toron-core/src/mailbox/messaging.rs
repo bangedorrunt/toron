@@ -1038,6 +1038,51 @@ impl Mailbox {
             (args.bcc.iter().collect::<Vec<_>>(), RecipientRole::Bcc),
         ] {
             for name in names {
+                // bd-lmcy: role: prefix resolves through the role → pin alias
+                // table at send time (E4). Unknown role fails loudly naming
+                // available roles; auto-spawn on miss is FORBIDDEN.
+                if let Some(role_name) = name.strip_prefix("role:") {
+                    if role_name.trim().is_empty() {
+                        anyhow::bail!("role name must be non-empty after 'role:' (got {name:?})");
+                    }
+                    let pin = match self.role_pin(&args.project_slug, role_name).await {
+                        Some(p) => p,
+                        None => {
+                            let available = self
+                                .list_role_pins(&args.project_slug)
+                                .await
+                                .unwrap_or_default()
+                                .into_iter()
+                                .map(|(r, _)| r)
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            let avail_msg = if available.is_empty() {
+                                "no roles registered".to_string()
+                            } else {
+                                format!("available roles: {available}")
+                            };
+                            anyhow::bail!(
+                                "unknown role: {role_name} (register it with `toron role pin --project {} {role_name} <pin>`; {avail_msg})",
+                                args.project_slug
+                            );
+                        }
+                    };
+                    // Resolve the pin (folded alias → canonical) to npub.
+                    let target = self.resolve_agent_name(&args.project_slug, &pin).await?;
+                    let npub = nident::resolve_name(&args.project_slug, profiles.iter(), &target)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "unknown recipient for role {role_name}: pin {target} (register it in project {} first)",
+                                args.project_slug
+                            )
+                        })?;
+                    out.push(ResolvedRecipient {
+                        name: target,
+                        npub,
+                        role,
+                    });
+                    continue;
+                }
                 // bd-wh6k: the ROW carries the CANONICAL recipient name — in
                 // Swarm mode the post-fold resolve_agent_name target — never
                 // the raw caller string. Downstream views key on this label;
