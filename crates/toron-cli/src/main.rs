@@ -10,6 +10,7 @@ mod operator;
 mod output;
 mod plane;
 mod robot;
+mod theme;
 mod tui;
 mod workflow;
 
