@@ -399,7 +399,7 @@ pub(crate) fn run_step_with_enclosing<'a>(
                     if_guard,
                     then,
                     else_steps,
-                } => run_branch(ctx, runner, trigger, if_guard, then, else_steps).await?,
+                } => run_branch(ctx, runner, trigger, if_guard, then, else_steps, step_outputs).await?,
                 Action::Foreach { over, each } => {
                     run_foreach(ctx, runner, trigger, over, each, step_outputs).await?
                 }
@@ -574,6 +574,7 @@ pub(crate) async fn run_branch(
     guard: &str,
     then: &[Step],
     else_steps: &[Step],
+    step_outputs: &serde_json::Map<String, serde_json::Value>,
 ) -> resonate_sdk::prelude::Result<serde_json::Value> {
     use crate::guard::evaluate_guard_default;
     // Build the guard variable map from the trigger payload: `{{trigger.x}}`
@@ -587,6 +588,25 @@ pub(crate) async fn run_branch(
                 other => other.to_string(),
             };
             vars.insert(name, evalexpr::Value::from(text));
+        }
+    }
+    for (step_name, output) in step_outputs {
+        if let Some(obj) = output.as_object() {
+            for (k, v) in obj {
+                let name = format!(
+                    "steps_{}_{}",
+                    step_name.replace('-', "_"),
+                    k.replace('-', "_")
+                );
+                let text = match v {
+                    serde_json::Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                };
+                vars.insert(name, evalexpr::Value::from(text));
+            }
+        } else {
+            let name = format!("steps_{}", step_name.replace('-', "_"));
+            vars.insert(name, evalexpr::Value::from(output.to_string()));
         }
     }
     let outcome = evaluate_guard_default(Some(guard), &vars).await;
