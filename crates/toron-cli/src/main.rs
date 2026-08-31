@@ -138,7 +138,8 @@ fn run(cli: &Cli) -> anyhow::Result<ExitCode> {
         | Command::Job(_)
         | Command::React(_)
         | Command::Presence(_)
-        | Command::Watch(_) => {
+        | Command::Watch(_)
+        | Command::Wait(_) => {
             // Two-plane surface (ADR-0020 Spec 2): same in-process mailbox as
             // the MCP server, but the Nostr plane as shell commands. Usage
             // errors (unknown --as, --once without --timeout-ms) exit 2.

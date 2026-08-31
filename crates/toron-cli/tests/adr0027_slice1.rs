@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 // governed-by: ADR-0027
 //! ADR-0027 Slice 1 — toron-side S1/S2 contracts against REAL flags/store (bd-2u27 bd-gokp).
 //!

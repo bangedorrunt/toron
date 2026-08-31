@@ -1,3 +1,4 @@
+#![allow(clippy::doc_lazy_continuation)]
 // governed-by: ADR-0027
 //! ADR-0027 Slice 2 — S3 role-outlives-pane (bd-twcq).
 //!
@@ -146,7 +147,10 @@ fn adr0027_s2_flywheel_role_corr_inheritance() {
         .find("Msg::RoleBound")
         .expect("RoleBound must exist");
     let window = &content[pos..std::cmp::min(content.len(), pos + 800)];
-    let has_inheritance = window.contains("assignment") || window.contains("inherit") || window.contains("open_human") || window.contains("corr");
+    let has_inheritance = window.contains("assignment")
+        || window.contains("inherit")
+        || window.contains("open_human")
+        || window.contains("corr");
     assert!(
         has_inheritance,
         "RED (bd-if26): RoleBound arm must handle open corr inheritance — currently only `roles.insert` without `assignment`/`corr` retargeting. Window: {window:.200}"
@@ -187,8 +191,8 @@ fn adr0027_s2_flywheel_inject_reads_presence_not_herdr_gossip() {
         || (content.contains("Presence::Idle") && content.contains("presence"))
         || content.contains("Unknown stays Unknown");
     // Also check that doorbell's should_inject is now Model-fed, not herdr-only
-    let has_presence_queuing = content.contains("working") && content.contains("presence")
-        && content.contains("queue");
+    let has_presence_queuing =
+        content.contains("working") && content.contains("presence") && content.contains("queue");
     assert!(
         has_model_inject && has_presence_queuing,
         "RED (bd-9ff3): tick inject must read presence in Model (presence.get + working->queue, standing->idle check, Unknown stays Unknown) — currently presence map exists but inject still herdr-only"

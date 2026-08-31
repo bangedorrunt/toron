@@ -71,9 +71,14 @@
       "name": "presence"
     },
     {
-      "args": "--project <PROJECT>, --as <AS_NAME>, --kinds <KINDS>, --channel <CHANNEL>, --once, --timeout-ms <TIMEOUT_MS>",
+      "args": "--project <PROJECT>, --as <AS_NAME>, --kinds <KINDS>, --channel <CHANNEL>, --once, --timeout-ms <TIMEOUT_MS>, --live",
       "description": "Watch the shared plane (NIP-01 REQ): --once exits on first match",
       "name": "watch"
+    },
+    {
+      "args": "--corr <CORR>, --timeout <TIMEOUT>, --project <PROJECT>",
+      "description": "Wait until a receipt appears (subscribe-until-receipt)",
+      "name": "wait"
     },
     {
       "args": "reconstruct",
@@ -131,7 +136,7 @@
       "name": "role"
     }
   ],
-  "generated_at": "2026-08-31T19:48:40Z",
+  "generated_at": "2026-08-31T21:07:38Z",
   "resources": [
     {
       "description": "List projects known to toron.",
