@@ -32,3 +32,4 @@
 {"id":32,"issue_id":"bd-7fat","from_status":"in_progress","to_status":"closed","status_revision":582,"gate":"unit-test-verified","provider":"SwiftSparrow","passed":true,"recorded_by":"bangedorrunt","recorded_at":"2026-08-31 17:36:44"}
 {"id":33,"issue_id":"bd-2u27","from_status":"in_progress","to_status":"closed","status_revision":584,"gate":"unit-test-verified","provider":"TopazDune","passed":true,"recorded_by":"bangedorrunt","recorded_at":"2026-08-31 17:49:27"}
 {"id":34,"issue_id":"bd-gokp","from_status":"in_progress","to_status":"closed","status_revision":592,"gate":"unit-test-verified","provider":"TopazDune","passed":true,"recorded_by":"bangedorrunt","recorded_at":"2026-08-31 17:59:18"}
+{"id":35,"issue_id":"bd-lmcy","from_status":"in_progress","to_status":"closed","status_revision":596,"gate":"unit-test-verified","provider":"TopazDune","passed":true,"recorded_by":"bangedorrunt","recorded_at":"2026-08-31 18:17:47"}
