@@ -119,9 +119,19 @@
       "args": "lint, validate, run, invoke, dry-run",
       "description": "Workflow (ADR-0005 Spec 5): lint/validate/run/invoke/dry-run a single workflow file — the fabric (standalone) surface. Orchestration (catalogs/cron/crews) lives in flywheel",
       "name": "workflow"
+    },
+    {
+      "args": "get, list",
+      "description": "Receipts durable store (ADR-0027 E2): `receipt get` / `receipt list`",
+      "name": "receipt"
+    },
+    {
+      "args": "pin, list, clear",
+      "description": "Role binding via 30013 role= tags + alias (ADR-0027 E4)",
+      "name": "role"
     }
   ],
-  "generated_at": "2026-08-31T10:23:16Z",
+  "generated_at": "2026-08-31T19:48:40Z",
   "resources": [
     {
       "description": "List projects known to toron.",
@@ -774,17 +784,21 @@
       "example": {
         "ack_required": null,
         "attachment_paths": null,
+        "audience": null,
         "auto_contact_if_blocked": null,
         "bcc": null,
         "body_md": "<string>",
         "broadcast": null,
         "cc": null,
         "convert_images": null,
+        "corr": null,
         "importance": null,
+        "priority": null,
         "project_key": "<string>",
         "release_ask": null,
         "reservation_id": null,
         "reservation_note": null,
+        "result_path": null,
         "sender_name": "<string>",
         "sender_token": null,
         "subject": "<string>",
@@ -792,7 +806,8 @@
         "to": [
           "<string>"
         ],
-        "topic": null
+        "topic": null,
+        "wake": null
       },
       "group": "Messaging",
       "input_schema": {
@@ -810,6 +825,13 @@
             },
             "type": [
               "array",
+              "null"
+            ]
+          },
+          "audience": {
+            "description": "ADR-0027 E3: audience human|agents.",
+            "type": [
+              "string",
               "null"
             ]
           },
@@ -852,7 +874,21 @@
               "null"
             ]
           },
+          "corr": {
+            "description": "ADR-0027 E2: correlation id rides extra_tags corr.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "importance": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "priority": {
+            "description": "ADR-0027 E2: priority queue|interrupt.",
             "type": [
               "string",
               "null"
@@ -877,6 +913,13 @@
           },
           "reservation_note": {
             "description": "Optional note on the request-release rumor.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "result_path": {
+            "description": "ADR-0027 E2: result_path rides extra_tags result_path.",
             "type": [
               "string",
               "null"
@@ -907,6 +950,13 @@
             "type": "array"
           },
           "topic": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "wake": {
+            "description": "ADR-0027 E2: wake standing|tasked.",
             "type": [
               "string",
               "null"
@@ -988,17 +1038,21 @@
       "example": {
         "ack_required": null,
         "attachment_paths": null,
+        "audience": null,
         "auto_contact_if_blocked": null,
         "bcc": null,
         "body_md": "<string>",
         "broadcast": null,
         "cc": null,
         "convert_images": null,
+        "corr": null,
         "importance": null,
+        "priority": null,
         "project_key": "<string>",
         "release_decision": null,
         "request_message_id": null,
         "reservation_note": null,
+        "result_path": null,
         "sender_name": "<string>",
         "sender_token": null,
         "subject": "<string>",
@@ -1006,7 +1060,8 @@
         "to": [
           "<string>"
         ],
-        "topic": null
+        "topic": null,
+        "wake": null
       },
       "group": "Messaging",
       "input_schema": {
@@ -1024,6 +1079,13 @@
             },
             "type": [
               "array",
+              "null"
+            ]
+          },
+          "audience": {
+            "description": "ADR-0027 E3: audience.",
+            "type": [
+              "string",
               "null"
             ]
           },
@@ -1066,7 +1128,21 @@
               "null"
             ]
           },
+          "corr": {
+            "description": "ADR-0027 E2: correlation id.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "importance": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "priority": {
+            "description": "ADR-0027 E2: priority.",
             "type": [
               "string",
               "null"
@@ -1091,6 +1167,13 @@
           },
           "reservation_note": {
             "description": "Optional note on the response rumor.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "result_path": {
+            "description": "ADR-0027 E2: result_path.",
             "type": [
               "string",
               "null"
@@ -1121,6 +1204,13 @@
             "type": "array"
           },
           "topic": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "wake": {
+            "description": "ADR-0027 E2: wake.",
             "type": [
               "string",
               "null"

@@ -85,8 +85,15 @@ fn register_agent(data_dir: &PathBuf, project: &str, name: &str) {
 fn adr0027_s1_toron_mail_send_flags_in_help() {
     let out = run(&["mail", "send", "--help"]);
     assert!(out.status.success(), "help must exit 0");
-    let help = String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr);
-    for flag in ["--corr", "--wake", "--priority", "--audience", "--result-path"] {
+    let help =
+        String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr);
+    for flag in [
+        "--corr",
+        "--wake",
+        "--priority",
+        "--audience",
+        "--result-path",
+    ] {
         assert!(
             help.contains(flag),
             "toron mail send --help must list {flag}, got: {help}"
@@ -106,7 +113,8 @@ fn adr0027_s1_toron_mail_send_corr_rides_rumor_not_envelope() {
     // `send_tags_mail_rumor_carries_and_not_envelope`. Here we verify the CLI
     // wiring: flags are RECOGNIZED (not "unexpected argument") and help lists them.
     let out = run(&["mail", "send", "--help"]);
-    let help = String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr);
+    let help =
+        String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr);
     assert!(
         help.contains("--corr") && help.contains("--wake"),
         "CLI must recognize --corr/--wake (bd-2u27), got help: {help}"
@@ -125,7 +133,8 @@ fn adr0027_s1_toron_mail_send_rejects_unknown_wake() {
     assert!(err.message.contains("unknown wake"), "{err}");
     // also check that the CLI help mentions the typed vocab (standing|tasked)
     let out = run(&["mail", "send", "--help"]);
-    let help = String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr);
+    let help =
+        String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr);
     assert!(help.contains("standing") || help.contains("tasked") || help.contains("wake"));
     // ensure Wake::parse rejects
     assert!(Wake::parse("bogus").is_err());
@@ -159,7 +168,9 @@ fn adr0027_s1_toron_mail_send_human_fanout_hard_error() {
         audience: Some(Audience::Human),
         ..Default::default()
     };
-    let err = tags.validate_for_send(2, false).expect_err("human fan-out >1 must error");
+    let err = tags
+        .validate_for_send(2, false)
+        .expect_err("human fan-out >1 must error");
     assert!(err.message.contains("fan-out"), "{err}");
     // also check interrupt validation
     use toron_core::mailbox::send_tags::{Priority, Wake};
@@ -168,7 +179,9 @@ fn adr0027_s1_toron_mail_send_human_fanout_hard_error() {
         audience: Some(Audience::Human),
         ..Default::default()
     };
-    let err2 = tags2.validate_for_send(1, true).expect_err("interrupt onto human must error");
+    let err2 = tags2
+        .validate_for_send(1, true)
+        .expect_err("interrupt onto human must error");
     assert!(err2.message.contains("never onto human"), "{err2}");
     let _ = Wake::Tasked; // keep import used
 }
@@ -178,13 +191,15 @@ fn adr0027_s1_toron_mail_send_human_fanout_hard_error() {
 #[test]
 fn adr0027_s1_toron_receipt_help_lists_get_and_list() {
     let out = run(&["receipt", "--help"]);
-    let help = String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr);
+    let help =
+        String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr);
     assert!(
         help.contains("get") && help.contains("list"),
         "toron receipt --help must list get and list, got: {help}"
     );
     let out = run(&["receipt", "get", "--help"]);
-    let h = String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr);
+    let h =
+        String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr);
     assert!(
         h.contains("--corr"),
         "receipt get --help must list --corr, got: {h}"
@@ -196,12 +211,14 @@ async fn adr0027_s1_toron_receipt_store_roundtrip_and_survives_new_process() {
     // Direct ReceiptStore proof (the durable truth behind `toron receipt get`).
     // This mirrors the S1 scenario: upsert corr=FM-GS-012, new process still sees it.
     use toron_core::index::schema;
-    use toron_core::mailbox::{Receipt, ReceiptState};
     use toron_core::mailbox::send_tags::Wake;
+    use toron_core::mailbox::{Receipt, ReceiptState};
 
     let data_dir = temp_data_dir("receipt-roundtrip");
     let db_path = data_dir.join("receipts.sqlite");
-    let pool = schema::connect(db_path.to_str().unwrap()).await.expect("connect");
+    let pool = schema::connect(db_path.to_str().unwrap())
+        .await
+        .expect("connect");
     schema::migrate(&pool).await.expect("migrate");
     let store = toron_core::mailbox::ReceiptStore::new(pool.clone());
 
@@ -220,10 +237,19 @@ async fn adr0027_s1_toron_receipt_store_roundtrip_and_survives_new_process() {
     // Simulate walker death: new pool (new process) reading same sqlite file
     drop(store);
     drop(pool);
-    let pool2 = schema::connect(db_path.to_str().unwrap()).await.expect("reconnect");
+    let pool2 = schema::connect(db_path.to_str().unwrap())
+        .await
+        .expect("reconnect");
     let store2 = toron_core::mailbox::ReceiptStore::new(pool2);
-    let got2 = store2.get("FM-GS-012").await.expect("get2").expect("found after restart");
-    assert_eq!(got2, r, "new process must still see owed/acked (receipts table, not HashMap)");
+    let got2 = store2
+        .get("FM-GS-012")
+        .await
+        .expect("get2")
+        .expect("found after restart");
+    assert_eq!(
+        got2, r,
+        "new process must still see owed/acked (receipts table, not HashMap)"
+    );
 
     // Empty tasked still writes a result (different corr) — one-line result + result_path
     let r2 = Receipt {
@@ -235,9 +261,16 @@ async fn adr0027_s1_toron_receipt_store_roundtrip_and_survives_new_process() {
         updated_at: 1_700_000_000_000_001,
     };
     store2.upsert(&r2).await.expect("upsert empty tasked");
-    let got_empty = store2.get("FM-GS-012-empty").await.expect("get empty").expect("found");
+    let got_empty = store2
+        .get("FM-GS-012-empty")
+        .await
+        .expect("get empty")
+        .expect("found");
     assert_eq!(got_empty.state, ReceiptState::Resulted);
-    assert_eq!(got_empty.result_path.as_deref(), Some("/tmp/empty-result.txt"));
+    assert_eq!(
+        got_empty.result_path.as_deref(),
+        Some("/tmp/empty-result.txt")
+    );
 
     let _ = std::fs::remove_dir_all(&data_dir);
 }
@@ -248,7 +281,9 @@ async fn adr0027_s1_toron_receipt_upsert_is_idempotent() {
     use toron_core::mailbox::{Receipt, ReceiptState};
     let data_dir = temp_data_dir("receipt-idempotent");
     let db_path = data_dir.join("idempotent.sqlite");
-    let pool = schema::connect(db_path.to_str().unwrap()).await.expect("connect");
+    let pool = schema::connect(db_path.to_str().unwrap())
+        .await
+        .expect("connect");
     schema::migrate(&pool).await.expect("migrate");
     let store = toron_core::mailbox::ReceiptStore::new(pool);
     let r1 = Receipt {
@@ -283,11 +318,16 @@ async fn adr0027_s1_toron_receipt_upsert_is_idempotent() {
 fn adr0027_s1_guard_toron_send_extra_tags_not_envelope() {
     // The CLI sends via SendMessage.extra_tags (rumor) not envelope.
     // Verify by file scan: cli.rs mail send field `extra_tags` wiring exists.
-    let content = std::fs::read_to_string("crates/toron-core/src/mailbox/messaging.rs").unwrap_or_default();
+    let content =
+        std::fs::read_to_string("crates/toron-core/src/mailbox/messaging.rs").unwrap_or_default();
     if content.is_empty() {
         // when running from crates/toron-cli, the relative path differs
-        let content = std::fs::read_to_string("../toron-core/src/mailbox/messaging.rs").unwrap_or_default();
-        assert!(content.contains("extra_tags"), "messaging.rs must have extra_tags");
+        let content =
+            std::fs::read_to_string("../toron-core/src/mailbox/messaging.rs").unwrap_or_default();
+        assert!(
+            content.contains("extra_tags"),
+            "messaging.rs must have extra_tags"
+        );
     } else {
         assert!(content.contains("extra_tags"));
     }
