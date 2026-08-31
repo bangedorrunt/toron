@@ -1413,9 +1413,10 @@ async fn wait_for_corr(mailbox: &Mailbox, args: &WaitArgs) -> anyhow::Result<()>
     } else {
         Some(Instant::now() + Duration::from_secs(timeout))
     };
+    let canonical = mailbox.canonical_project(&args.project).await;
     let store = mailbox
         .receipt_store()
-        .map_err(|e| anyhow::anyhow!("wait --corr requires receipts store: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("wait --corr for project {canonical} requires receipts store: {e}"))?;
     // Fast path: already present
     if let Some(r) = store.get(&args.corr).await? {
         let v = serde_json::json!({
@@ -1444,7 +1445,11 @@ async fn wait_for_corr(mailbox: &Mailbox, args: &WaitArgs) -> anyhow::Result<()>
         if let Some(d) = deadline
             && Instant::now() >= d
         {
-            anyhow::bail!("wait --corr {} timed out after {}s", args.corr, timeout);
+            anyhow::bail!(
+                "wait --corr {} for project {canonical} timed out after {}s",
+                args.corr,
+                timeout
+            );
         }
         // Check store after each wake (including immediately)
         if let Some(r) = store.get(&args.corr).await? {
@@ -1701,7 +1706,7 @@ mod live_watch_tests {
             let args = WaitArgs {
                 corr: corr_clone,
                 timeout: Some(5),
-                project: None,
+                project: "demo".into(),
             };
             wait_for_corr(&mb_clone, &args).await
         });
@@ -1743,7 +1748,7 @@ mod live_watch_tests {
         let args = WaitArgs {
             corr: "non-existent-corr-xyz".into(),
             timeout: Some(1),
-            project: None,
+            project: "demo".into(),
         };
         let res = wait_for_corr(&mailbox, &args).await;
         assert!(res.is_err(), "wait should timeout on missing corr");
@@ -1751,6 +1756,10 @@ mod live_watch_tests {
         assert!(
             msg.contains("timed out") || msg.contains("timeout"),
             "timeout message: {msg}"
+        );
+        assert!(
+            msg.contains("demo"),
+            "error must name resolved project: {msg}"
         );
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_dir_all(&data_dir);

@@ -1424,9 +1424,9 @@ pub struct WaitArgs {
     /// Timeout in seconds (default 30, 0 = no timeout).
     #[arg(long)]
     pub timeout: Option<u64>,
-    /// Project slug (optional, for scoping).
-    #[arg(long)]
-    pub project: Option<String>,
+    /// Project slug (required, no silent demo default).
+    #[arg(long, required = true)]
+    pub project: String,
 }
 
 // ---------------------------------------------------------------------------
