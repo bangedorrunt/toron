@@ -399,7 +399,18 @@ pub(crate) fn run_step_with_enclosing<'a>(
                     if_guard,
                     then,
                     else_steps,
-                } => run_branch(ctx, runner, trigger, if_guard, then, else_steps, step_outputs).await?,
+                } => {
+                    run_branch(
+                        ctx,
+                        runner,
+                        trigger,
+                        if_guard,
+                        then,
+                        else_steps,
+                        step_outputs,
+                    )
+                    .await?
+                }
                 Action::Foreach { over, each } => {
                     run_foreach(ctx, runner, trigger, over, each, step_outputs).await?
                 }

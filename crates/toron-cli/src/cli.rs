@@ -81,6 +81,7 @@ pub struct Globals {
     pub robot_capabilities: bool,
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// Run the toron daemon (mailbox + MCP server).
@@ -372,6 +373,21 @@ pub struct MailSendArgs {
     /// Sender token (verification).
     #[arg(long)]
     pub sender_token: Option<String>,
+    /// Correlation id for the assignment (ADR-0027 E2: rides extra_tags corr).
+    #[arg(long)]
+    pub corr: Option<String>,
+    /// Wake kind: standing|tasked (ADR-0027 E2/E3).
+    #[arg(long)]
+    pub wake: Option<String>,
+    /// Priority: queue|interrupt (ADR-0027 E2/E3; interrupt is operator/user only).
+    #[arg(long)]
+    pub priority: Option<String>,
+    /// Audience: human|agents (ADR-0027 E3; human fan-out >1 is hard error).
+    #[arg(long)]
+    pub audience: Option<String>,
+    /// Result path for the assignment (ADR-0027 E2).
+    #[arg(long = "result-path")]
+    pub result_path: Option<String>,
 }
 
 /// Operator Overseer override args (ADR-0004 Ship 5).
@@ -426,6 +442,21 @@ pub struct MailReplyArgs {
     /// Sender token (verification).
     #[arg(long)]
     pub sender_token: Option<String>,
+    /// Correlation id (ADR-0027 E2).
+    #[arg(long)]
+    pub corr: Option<String>,
+    /// Wake kind: standing|tasked.
+    #[arg(long)]
+    pub wake: Option<String>,
+    /// Priority: queue|interrupt.
+    #[arg(long)]
+    pub priority: Option<String>,
+    /// Audience: human|agents.
+    #[arg(long)]
+    pub audience: Option<String>,
+    /// Result path.
+    #[arg(long = "result-path")]
+    pub result_path: Option<String>,
 }
 
 #[derive(Debug, Args)]
