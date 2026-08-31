@@ -70,22 +70,26 @@ impl ToolServer {
     #[tool(
         name = "list_contacts",
         description = "List an agent's contact links (AgentLink rows). Link status is the social graph (pending|approved|denied) — it does NOT gate mail. Delivery is gated by the RECIPIENT's contact policy (kind-30014, see set_contact_policy, default auto): a pending link still receives mail unless the recipient's policy blocks it.",
-        output_schema = rmcp::handler::server::tool::schema_for_output::<Vec<crate::responses::ContactLinkOut>>(),
+        output_schema = rmcp::handler::server::tool::schema_for_output::<crate::responses::ListContactsWrapper>(),
         annotations(title = "List contacts", read_only_hint = true)
     )]
     async fn list_contacts(&self, Parameters(args): Parameters<ListContactsArgs>) -> ToolOutput {
-        ToolOutput::result(
-            self.mailbox
-                .list_contacts(&args.project_key, &args.agent_name)
-                .await,
-        )
+        use super::ToJson;
+        match self
+            .mailbox
+            .list_contacts(&args.project_key, &args.agent_name)
+            .await
+        {
+            Ok(v) => ToolOutput::ok(serde_json::json!({ "contacts": v.to_json() })),
+            Err(e) => ToolOutput::err(format!("{e:#}")),
+        }
     }
 
     /// `set_contact_policy`: the agent's inbound contact policy (kind-30014).
     #[tool(
         name = "set_contact_policy",
         description = "Set the agent's inbound contact policy (open|auto|contacts_only|block_all).",
-        output_schema = rmcp::handler::server::tool::schema_for_output::<String>(),
+        output_schema = rmcp::handler::server::tool::schema_for_output::<crate::responses::SetContactPolicyWrapper>(),
         annotations(title = "Set contact policy", destructive_hint = true)
     )]
     async fn set_contact_policy(
@@ -93,11 +97,14 @@ impl ToolServer {
         Parameters(args): Parameters<SetContactPolicyArgs>,
     ) -> ToolOutput {
         let policy = ContactPolicy::parse(&args.policy);
-        ToolOutput::result(
-            self.mailbox
-                .set_contact_policy(&args.project_key, &args.agent_name, policy)
-                .await,
-        )
+        match self
+            .mailbox
+            .set_contact_policy(&args.project_key, &args.agent_name, policy)
+            .await
+        {
+            Ok(event_id) => ToolOutput::ok(serde_json::json!({ "event_id": event_id })),
+            Err(e) => ToolOutput::err(format!("{e:#}")),
+        }
     }
 }
 

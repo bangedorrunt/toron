@@ -140,7 +140,7 @@ impl ToolServer {
     #[tool(
         name = "fetch_inbox",
         description = "Project the agent's inbox (rumor-time order, G7).",
-        output_schema = rmcp::handler::server::tool::schema_for_output::<Vec<crate::responses::InboxMessageOut>>(),
+        output_schema = rmcp::handler::server::tool::schema_for_output::<crate::responses::FetchInboxWrapper>(),
         annotations(title = "Fetch inbox", read_only_hint = true)
     )]
     async fn fetch_inbox(&self, Parameters(args): Parameters<FetchInboxArgs>) -> ToolOutput {
@@ -154,7 +154,10 @@ impl ToolServer {
             since_ts: args.since_ts.clone(),
             thread_id: args.thread_id.clone(),
         };
-        ToolOutput::result(self.mailbox.fetch_inbox(&fi).await)
+        match self.mailbox.fetch_inbox(&fi).await {
+            Ok(v) => ToolOutput::ok(serde_json::json!({ "messages": v.to_json() })),
+            Err(e) => ToolOutput::err(format!("{e:#}")),
+        }
     }
 
     /// `acknowledge_message`: private idempotent ack to the original sender.
@@ -207,7 +210,7 @@ impl ToolServer {
     #[tool(
         name = "search_messages",
         description = "FTS5 search over a project's indexed messages (porter/unicode61).",
-        output_schema = rmcp::handler::server::tool::schema_for_output::<Vec<crate::responses::SearchMessageOut>>(),
+        output_schema = rmcp::handler::server::tool::schema_for_output::<crate::responses::SearchMessagesWrapper>(),
         annotations(title = "Search messages", read_only_hint = true)
     )]
     async fn search_messages(

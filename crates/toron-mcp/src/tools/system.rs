@@ -83,17 +83,20 @@ impl ToolServer {
     #[tool(
         name = "uninstall_precommit_guard",
         description = "Remove the toron pre-commit hook (never clobbers a user hook).",
-        output_schema = rmcp::handler::server::tool::schema_for_output::<bool>(),
+        output_schema = rmcp::handler::server::tool::schema_for_output::<crate::responses::UninstallHookWrapper>(),
         annotations(title = "Uninstall pre-commit guard", destructive_hint = true)
     )]
     async fn uninstall_precommit_guard(
         &self,
         Parameters(args): Parameters<UninstallPrecommitGuardArgs>,
     ) -> ToolOutput {
-        ToolOutput::result(
-            self.mailbox
-                .uninstall_precommit_guard(Path::new(&args.code_repo_path)),
-        )
+        match self
+            .mailbox
+            .uninstall_precommit_guard(Path::new(&args.code_repo_path))
+        {
+            Ok(ok) => ToolOutput::ok(json!({ "ok": ok })),
+            Err(e) => ToolOutput::err(e),
+        }
     }
 
     // ------------------------------------------------------------------
@@ -181,7 +184,7 @@ impl ToolServer {
     #[tool(
         name = "resolve_pane_identity",
         description = "Resolve a herdr pane_id to the agent name (G9).",
-        output_schema = rmcp::handler::server::tool::schema_for_output::<crate::responses::PaneIdentityOut>(),
+        output_schema = rmcp::handler::server::tool::schema_for_output::<crate::responses::ResolvePaneWrapper>(),
         annotations(title = "Resolve pane identity", read_only_hint = true)
     )]
     async fn resolve_pane_identity(
@@ -206,7 +209,7 @@ impl ToolServer {
     #[tool(
         name = "cleanup_pane_identities",
         description = "Prune identities whose herdr panes are absent from the live pane list.",
-        output_schema = rmcp::handler::server::tool::schema_for_output::<crate::responses::CleanupPaneIdentitiesOut>(),
+        output_schema = rmcp::handler::server::tool::schema_for_output::<crate::responses::CleanupWrapper>(),
         annotations(title = "Cleanup pane identities", destructive_hint = true)
     )]
     async fn cleanup_pane_identities(
@@ -257,14 +260,17 @@ impl ToolServer {
     #[tool(
         name = "list_agents",
         description = "List a project's agents with npub + last-active provenance.",
-        output_schema = rmcp::handler::server::tool::schema_for_output::<Vec<crate::responses::RegisteredAgentOut>>(),
+        output_schema = rmcp::handler::server::tool::schema_for_output::<crate::responses::ListAgentsWrapper>(),
         annotations(title = "List agents", read_only_hint = true)
     )]
     async fn list_agents(&self, Parameters(args): Parameters<ListAgentsArgs>) -> ToolOutput {
         let opts = ListAgentsOptions {
             active_within_days: args.active_within_days.map(|d| d as u64),
         };
-        ToolOutput::result(self.mailbox.list_agents(&args.project_key, opts).await)
+        match self.mailbox.list_agents(&args.project_key, opts).await {
+            Ok(v) => ToolOutput::ok(json!({ "agents": v.to_json() })),
+            Err(e) => ToolOutput::err(format!("{e:#}")),
+        }
     }
 }
 

@@ -255,7 +255,9 @@ async fn cluster_infra_and_identity() -> anyhow::Result<()> {
         .await;
     let arr = agents
         .as_array()
-        .unwrap_or_else(|| panic!("list_agents is an array: {agents}"));
+        .map(|a| a.clone())
+        .or_else(|| agents.get("agents").and_then(|v| v.as_array()).cloned())
+        .unwrap_or_else(|| panic!("list_agents is an array or {{agents:[]}}: {agents}"));
     assert!(arr.len() >= 2, "both registered agents visible: {agents}");
     let names: Vec<&str> = arr.iter().filter_map(|a| a["name"].as_str()).collect();
     assert!(names.contains(&"AliceOak") && names.contains(&"BobPine"));
@@ -562,7 +564,9 @@ async fn cluster_contacts_handshake() -> anyhow::Result<()> {
         .await;
     let arr = links
         .as_array()
-        .unwrap_or_else(|| panic!("list_contacts is an array: {links}"));
+        .map(|a| a.clone())
+        .or_else(|| links.get("contacts").and_then(|v| v.as_array()).cloned())
+        .unwrap_or_else(|| panic!("list_contacts is an array or {{contacts:[]}}: {links}"));
     assert!(
         !arr.is_empty(),
         "the accepted contact link is listed: {links}"
@@ -977,7 +981,7 @@ async fn cluster_macros_and_product_bus() -> anyhow::Result<()> {
         )
         .await;
     assert!(
-        pinbox.is_array() || pinbox.get("result").is_some(),
+        pinbox.is_array() || pinbox.get("result").is_some() || pinbox.get("messages").is_some(),
         "product inbox returns a list: {pinbox}"
     );
 
@@ -1079,7 +1083,8 @@ async fn poll_inbox(
         last_full = inbox
             .as_array()
             .cloned()
-            .unwrap_or_else(|| panic!("inbox is an array: {inbox}"));
+            .or_else(|| inbox.get("messages").and_then(|v| v.as_array()).cloned())
+            .unwrap_or_else(|| panic!("inbox is an array or {{messages:[]}}: {inbox}"));
         let matched: Vec<Value> = last_full
             .iter()
             .filter(|m| {
@@ -1299,9 +1304,12 @@ async fn mcp_fetch_inbox_applies_since_ts_and_urgent_filters() -> anyhow::Result
     poll_inbox(&mut d, &proj, "BlueLake", "filter-later", 40).await;
 
     let both = fetch_inbox_filtered(&mut d, &proj, None).await;
-    let mut subs: Vec<String> = both
+    let both_arr = both
         .as_array()
-        .unwrap_or_else(|| panic!("fetch_inbox returns an array: {both}"))
+        .map(|a| a.clone())
+        .or_else(|| both.get("messages").and_then(|v| v.as_array()).cloned())
+        .unwrap_or_else(|| panic!("fetch_inbox returns an array or {{messages:[]}}: {both}"));
+    let mut subs: Vec<String> = both_arr
         .iter()
         .filter_map(|m| m["subject"].as_str().map(String::from))
         .collect();
@@ -1315,9 +1323,12 @@ async fn mcp_fetch_inbox_applies_since_ts_and_urgent_filters() -> anyhow::Result
     // since_ts = bound taken BETWEEN the two sends → only the later message
     // (strict-newer compare, exactly the MailSurface contract).
     let since = fetch_inbox_filtered(&mut d, &proj, Some(("since_ts", Value::String(bound)))).await;
-    let since_subs: Vec<String> = since
+    let since_arr = since
         .as_array()
-        .unwrap_or_else(|| panic!("fetch_inbox returns an array: {since}"))
+        .map(|a| a.clone())
+        .or_else(|| since.get("messages").and_then(|v| v.as_array()).cloned())
+        .unwrap_or_else(|| panic!("fetch_inbox returns an array or {{messages:[]}}: {since}"));
+    let since_subs: Vec<String> = since_arr
         .iter()
         .filter_map(|m| m["subject"].as_str().map(String::from))
         .collect();
@@ -1330,9 +1341,12 @@ async fn mcp_fetch_inbox_applies_since_ts_and_urgent_filters() -> anyhow::Result
     // urgent_only → only the urgent message.
     let urgent =
         fetch_inbox_filtered(&mut d, &proj, Some(("urgent_only", Value::Bool(true)))).await;
-    let urgent_subs: Vec<String> = urgent
+    let urgent_arr = urgent
         .as_array()
-        .unwrap_or_else(|| panic!("fetch_inbox returns an array: {urgent}"))
+        .map(|a| a.clone())
+        .or_else(|| urgent.get("messages").and_then(|v| v.as_array()).cloned())
+        .unwrap_or_else(|| panic!("fetch_inbox returns an array or {{messages:[]}}: {urgent}"));
+    let urgent_subs: Vec<String> = urgent_arr
         .iter()
         .filter_map(|m| m["subject"].as_str().map(String::from))
         .collect();
@@ -1345,9 +1359,13 @@ async fn mcp_fetch_inbox_applies_since_ts_and_urgent_filters() -> anyhow::Result
     // Future bound → empty inbox.
     let future = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
     let fut = fetch_inbox_filtered(&mut d, &proj, Some(("since_ts", Value::String(future)))).await;
+    let fut_arr = fut
+        .as_array()
+        .map(|a| a.clone())
+        .or_else(|| fut.get("messages").and_then(|v| v.as_array()).cloned())
+        .unwrap_or_else(|| panic!("fetch_inbox array or {{messages:[]}}: {fut}"));
     assert_eq!(
-        fut.as_array()
-            .unwrap_or_else(|| panic!("fetch_inbox array: {fut}"))
+        fut_arr
             .len(),
         0,
         "future since_ts must exclude all mail on the MCP path"

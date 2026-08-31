@@ -46,7 +46,7 @@
       "name": "contact"
     },
     {
-      "args": "install, uninstall, check",
+      "args": "install, uninstall, check, record",
       "description": "Pre-commit guard: install/uninstall",
       "name": "guard"
     },
@@ -121,7 +121,7 @@
       "name": "workflow"
     }
   ],
-  "generated_at": "2026-08-24T10:24:52Z",
+  "generated_at": "2026-08-31T10:23:16Z",
   "resources": [
     {
       "description": "List projects known to toron.",
@@ -584,40 +584,27 @@
       "name": "resolve_pane_identity",
       "output_schema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "anyOf": [
-          {
-            "properties": {
-              "agent_name": {
-                "type": [
-                  "string",
-                  "null"
-                ]
-              },
-              "pane_id": {
-                "type": "string"
-              }
-            },
-            "required": [
-              "pane_id"
-            ],
-            "type": "object"
+        "properties": {
+          "agent_name": {
+            "type": [
+              "string",
+              "null"
+            ]
           },
-          {
-            "properties": {
-              "note": {
-                "type": "string"
-              },
-              "pane_id": {
-                "type": "string"
-              }
-            },
-            "required": [
-              "note",
-              "pane_id"
-            ],
-            "type": "object"
+          "note": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "pane_id": {
+            "type": "string"
           }
-        ]
+        },
+        "required": [
+          "pane_id"
+        ],
+        "type": "object"
       },
       "parity": "AM-Rust 38-tool surface"
     },
@@ -664,46 +651,33 @@
           }
         },
         "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "anyOf": [
-          {
+        "properties": {
+          "note": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "released": {
+            "items": {
+              "$ref": "#/$defs/ReleasedGhostOut"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "removed": {
             "items": {
               "type": "string"
             },
-            "type": "array"
-          },
-          {
-            "properties": {
-              "released": {
-                "items": {
-                  "$ref": "#/$defs/ReleasedGhostOut"
-                },
-                "type": "array"
-              },
-              "removed": {
-                "items": {
-                  "type": "string"
-                },
-                "type": "array"
-              }
-            },
-            "required": [
-              "removed",
-              "released"
-            ],
-            "type": "object"
-          },
-          {
-            "properties": {
-              "note": {
-                "type": "string"
-              }
-            },
-            "required": [
-              "note"
-            ],
-            "type": "object"
+            "type": [
+              "array",
+              "null"
+            ]
           }
-        ]
+        },
+        "type": "object"
       },
       "parity": "AM-Rust 38-tool surface"
     },
@@ -780,10 +754,18 @@
           }
         },
         "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "items": {
-          "$ref": "#/$defs/RegisteredAgentOut"
+        "properties": {
+          "agents": {
+            "items": {
+              "$ref": "#/$defs/RegisteredAgentOut"
+            },
+            "type": "array"
+          }
         },
-        "type": "array"
+        "required": [
+          "agents"
+        ],
+        "type": "object"
       },
       "parity": "AM-Rust 38-tool surface"
     },
@@ -1366,10 +1348,18 @@
           }
         },
         "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "items": {
-          "$ref": "#/$defs/InboxMessageOut"
+        "properties": {
+          "messages": {
+            "items": {
+              "$ref": "#/$defs/InboxMessageOut"
+            },
+            "type": "array"
+          }
         },
-        "type": "array"
+        "required": [
+          "messages"
+        ],
+        "type": "object"
       },
       "parity": "AM-Rust 38-tool surface"
     },
@@ -1775,10 +1765,18 @@
           }
         },
         "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "items": {
-          "$ref": "#/$defs/ContactLinkOut"
+        "properties": {
+          "contacts": {
+            "items": {
+              "$ref": "#/$defs/ContactLinkOut"
+            },
+            "type": "array"
+          }
         },
-        "type": "array"
+        "required": [
+          "contacts"
+        ],
+        "type": "object"
       },
       "parity": "AM-Rust 38-tool surface"
     },
@@ -1813,7 +1811,15 @@
       "name": "set_contact_policy",
       "output_schema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "type": "string"
+        "properties": {
+          "event_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "event_id"
+        ],
+        "type": "object"
       },
       "parity": "AM-Rust 38-tool surface"
     },
@@ -2518,10 +2524,24 @@
           }
         },
         "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "items": {
-          "$ref": "#/$defs/SearchMessageOut"
+        "properties": {
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "result": {
+            "items": {
+              "$ref": "#/$defs/SearchMessageOut"
+            },
+            "type": "array"
+          }
         },
-        "type": "array"
+        "required": [
+          "result"
+        ],
+        "type": "object"
       },
       "parity": "AM-Rust 38-tool surface"
     },
@@ -3531,10 +3551,18 @@
           }
         },
         "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "items": {
-          "$ref": "#/$defs/ProjectSearchMessageOut"
+        "properties": {
+          "result": {
+            "items": {
+              "$ref": "#/$defs/ProjectSearchMessageOut"
+            },
+            "type": "array"
+          }
         },
-        "type": "array"
+        "required": [
+          "result"
+        ],
+        "type": "object"
       },
       "parity": "AM-Rust 38-tool surface"
     },
@@ -3642,10 +3670,18 @@
           }
         },
         "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "items": {
-          "$ref": "#/$defs/ProjectInboxMessageOut"
+        "properties": {
+          "messages": {
+            "items": {
+              "$ref": "#/$defs/ProjectInboxMessageOut"
+            },
+            "type": "array"
+          }
         },
-        "type": "array"
+        "required": [
+          "messages"
+        ],
+        "type": "object"
       },
       "parity": "AM-Rust 38-tool surface"
     },
@@ -3930,14 +3966,19 @@
           }
         },
         "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "anyOf": [
-          {
-            "$ref": "#/$defs/BuildSlotOut"
-          },
-          {
-            "type": "null"
+        "properties": {
+          "slot": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/BuildSlotOut"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
-        ]
+        },
+        "type": "object"
       },
       "parity": "AM-Rust 38-tool surface"
     },
@@ -3972,7 +4013,15 @@
       "name": "release_build_slot",
       "output_schema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "type": "boolean"
+        "properties": {
+          "released": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "released"
+        ],
+        "type": "object"
       },
       "parity": "AM-Rust 38-tool surface"
     },
@@ -4140,10 +4189,18 @@
       "name": "uninstall_precommit_guard",
       "output_schema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "type": "boolean"
+        "properties": {
+          "ok": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "ok"
+        ],
+        "type": "object"
       },
       "parity": "AM-Rust 38-tool surface"
     }
   ],
-  "toron_version": "1.2.0"
+  "toron_version": "1.3.0"
 }
