@@ -38,8 +38,9 @@ Child maps: [toron-core](crates/toron-core/AGENTS.md) ·
 
 | Task | Location |
 |------|----------|
-| Mail send/inbox/ack | `crates/toron-core/src/mailbox/` (`MailSurface`, `MessageId`) |
+| Mail send/inbox/ack | `crates/toron-core/src/mailbox/` (`MailSurface`, `MessageId`) — `mail send` now carries `--corr/--wake/--priority/--audience/--result-path` via `extra_tags` (ADR-0027 E2) |
 | Channels / jobs / presence (ADR-0020) | `crates/toron-workflow/src/{channels,jobs}.rs`, `crates/toron-core/src/nostr/presence.rs`, CLI `toron channel\|job\|react\|presence\|watch` |
+| Wait / receipts / roles (ADR-0027) | `crates/toron-core/src/mailbox/{receipts.rs,send_tags.rs,identity.rs}`, CLI `toron wait --corr` (E9), `toron watch --live` (E7), `toron receipt get\|list` (E2), `toron role pin\|list\|clear` (E4) |
 | Gift-wrap / kinds | `crates/toron-core/src/nostr/` |
 | Bus / federation | `crates/toron-core/src/bus/` |
 | Git archive | `crates/toron-core/src/archive/git.rs` |
@@ -60,6 +61,7 @@ Child maps: [toron-core](crates/toron-core/AGENTS.md) ·
 - rust-nostr **0.45**: `nostr-sdk` 0.45.2 + `nostr` 0.45.3 (`nip44`/`nip49`/`nip59`/`os-rng`). Protocol types via `crate::nostr` / `nostr::prelude`. Sign with `FinalizeEvent::finalize`. `gift_wrap` is sync (`GiftWrapBuilder`).
 - Catalog: `toron catalog --json` regenerates `docs/catalog/toron-mcp.json`; `cargo test catalog_freshness` fails red on surface drift without regen (toron.dev ADR-0002 D3).
 - Flag vocabulary (bd-flag-vocab-conformance-0hyv): the acting agent is ALWAYS `--as` — `--from`/`--agent` are banned (enforced by `cargo test -p toron-cli --bin toron flag_conformance`) — and every project-scoped subcommand REQUIRES `--project` (no silent demo default; missing-key errors name the resolved project). Channel lifecycle (bd-channel-close-purge-bsqb): `channel close` = creator-only tombstone (closed refuses posts/joins, hides from `list`, creator may leave) → `channel purge` = creator/operator removal of a closed channel's bus events, audited to `{data_dir}/channel_purge.log`. Verify-after-send: `channel post --wait-ack <secs>` (bd-verify-after-send-fxtv). Delivery visibility: `channel read --author <pin>` (bd-delivery-visibility-g96y). Inbox cursor: `mail inbox --since last` persists per-(project, agent, plane) daemon-side (bd-since-cursor-70cf, migration 0007).
+- ADR-0027 one-workspace tick (accepted 2026-09-01): `MailSurface` tag vocabulary `--corr/--wake/--priority/--audience/--result-path` rides `extra_tags` (rumor, never 1059); receipts durably in `receipts` sqlite (`receipt get/list`); `wait --corr` is subscribe-until-receipt (same `Subscribe` as `watch --live`); `role pin/list/clear` binds `wheelhouse` etc. via 30013 `role=` tags + `whois` alias; `watch --live` is `subscribe_trusted` (not 1s snapshot); no new MCP tools (CLI-only nouns per Skill Sync Contract, `catalog_freshness` must stay green).
 - `MessageId` is String/hex. Never `u64` in shared request/response types.
 - `t` tag = project slug only. Never harness/model/job tags.
 - TDD for new features and bug fixes. No benches in this repo.

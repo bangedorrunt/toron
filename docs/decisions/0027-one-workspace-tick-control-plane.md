@@ -1,6 +1,6 @@
 <!-- governed-by: ADR-0003, ADR-0005, ADR-0014, ADR-0015, ADR-0018, ADR-0020, ADR-0024, ADR-0025, ADR-0026 -->
 ---
-status: proposed
+status: accepted
 date: 2026-08-31
 decision-makers: Captain (bangedorrunt)
 consulted: GS-012 restudy HEADs flywheel bde4daae7329 / toron 66811f38a332 / beads 4531075c87f5; Tick Law second walk vs 1c442d4b; previous Proposed texts withdrawn (Grok Bot clone; house-style consolidate)
@@ -9,7 +9,7 @@ informed: flywheel × toron × beads maintainers; Wheelhouse
 
 # ADR-0027: One Workspace Tick — Control Plane as Elm/Redux on Doorbell + 30013
 
-**Status:** Proposed (2026-08-31, steered restudy). Not locked. Not a ship authorization.
+**Status:** Accepted (2026-09-01, captain word ordered full implementation). Not locked as ship until slices green, but status is accepted per 2026-09-01 word.
 **Date:** 2026-08-31
 **Decision-makers:** Captain (bangedorrunt)
 **Extends:** [ADR-0003](0003-nostr-mailbox-fabric.md), [ADR-0005](0005-orchestration-layer.md), [ADR-0014](0014-kind-registry-specification.md), [ADR-0015](0015-flywheel-toron-integration-contract.md), [ADR-0018](0018-agent-identity-naming-grammar.md), [ADR-0020](0020-nostr-two-plane-cli-and-crew-steering.md), [ADR-0024](0024-graph-first-repair-loops-bead-workflow.md), [ADR-0025](0025-adopt-graph-dispatch-artifact-reduce-pin-supervision.md), [ADR-0026](0026-failure-taxonomy-funded-preflight-fallback-chains-mail-health-escalation.md)
@@ -906,8 +906,8 @@ Product locks, not research. One decision at a time when locking.
 
 ---
 
-## 15. Acceptance of this ADR (when the captain says accepted — not now)
+## 15. Acceptance of this ADR (captain word 2026-09-01)
 
-Frontmatter `status: accepted`. README decisions table gains 0027. Kind registry updated only if 30015 is chosen. MCP catalog version bumps only when a same-as-CLI verb lands. A must-pass scenario exists for Slice 1 before Slice 2 starts. Tick Law leftovers in §3.6 are Slice 1 work, not a footnote.
+Frontmatter `status: accepted` (2026-09-01, captain word ordered full implementation). README decisions table gains 0027. Kind registry updated only if 30015 is chosen. MCP catalog version bumps only when a same-as-CLI verb lands. A must-pass scenario exists for Slice 1 before Slice 2 starts. Tick Law leftovers in §3.6 are Slice 1 work, not a footnote.
 
-Until then: **Proposed.** Counsel. Hold factory ship of this ADR. Do not lock. Do not ship.
+**2026-09-01:** Status `proposed` → `accepted` per captain word. Full implementation ordered; slices ship as they go green. Changelog section 0 retained intact.
