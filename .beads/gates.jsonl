@@ -29,3 +29,5 @@
 {"id":29,"issue_id":"bd-lsgm","from_status":"open","to_status":"closed","status_revision":0,"gate":"unit-test-verified","provider":"TealDune-captain","passed":true,"recorded_by":"bangedorrunt","recorded_at":"2026-08-29 23:53:58"}
 {"id":30,"issue_id":"bd-jhes","from_status":"in_progress","to_status":"closed","status_revision":455,"gate":"unit-test-verified","provider":"IndigoCove","passed":true,"recorded_by":"bangedorrunt","recorded_at":"2026-08-30 02:40:35"}
 {"id":31,"issue_id":"bd-o5t7","from_status":"open","to_status":"closed","status_revision":0,"gate":"live-verified","provider":"TealDune-captain","passed":true,"recorded_by":"bangedorrunt","recorded_at":"2026-08-30 05:57:54"}
+{"id":32,"issue_id":"bd-7fat","from_status":"in_progress","to_status":"closed","status_revision":582,"gate":"unit-test-verified","provider":"SwiftSparrow","passed":true,"recorded_by":"bangedorrunt","recorded_at":"2026-08-31 17:36:44"}
+{"id":33,"issue_id":"bd-2u27","from_status":"in_progress","to_status":"closed","status_revision":584,"gate":"unit-test-verified","provider":"TopazDune","passed":true,"recorded_by":"bangedorrunt","recorded_at":"2026-08-31 17:49:27"}
