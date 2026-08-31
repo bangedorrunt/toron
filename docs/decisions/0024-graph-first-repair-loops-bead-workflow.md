@@ -1,6 +1,6 @@
 <!-- governed-by: ADR-0003, ADR-0005, ADR-0014, ADR-0019, ADR-0020, ADR-0022 -->
 ---
-status: proposed
+status: accepted
 date: 2026-08-27
 decision-makers: Captain (bangedorrunt)
 consulted: bastani-inc/atomic live tree (cloned 2026-08-27, `main` @ `/tmp/atomic-fresh`; packages/workflows loop-until-done, adversarial-verification, workflow-failures, durable DBOS backend, keepContext, ctx.tool failureMode=return); 2026-08-25 Buffy comparison (partially superseded by the tree study, see §3.3); Round-1 in-file debate (§12); control_flow.rs DAG scheduler + ActionRunner shape; flaky-test incidents (bd-8xca, bd-cvv9)
@@ -9,7 +9,7 @@ informed: flywheel maintainers; toron-workflow engine owners; skill owners (toro
 
 # ADR-0024: Make the DAG Canonical, Type Runtime Failure, and Unroll Bounded Repair as Distinct Graph Nodes
 
-**Status:** Proposed (2026-08-27, governing revision after Atomic-tree study + Round-1 debate)
+**Status:** Accepted (2026-08-31, governing revision after Atomic-tree study + Round-1 debate)
 **Date:** 2026-08-27
 **Decision-makers:** Captain (bangedorrunt)
 **Extends:** [ADR-0005](0005-orchestration-layer.md) (workflow engine, DAG scheduler, control-flow actions), [ADR-0019](0019-bead-verified-execution-and-principle-playbooks.md) (ledger-gated close, VERIFY fence, 21 engineering principles), [ADR-0020](0020-nostr-two-plane-cli-and-crew-steering.md) (two-plane surface, crew steering), [ADR-0022](0022-phase-native-orchestration.md) (typed `DispatchSpec`, `Phase` enum, one durable execution rail)
@@ -651,6 +651,20 @@ tree/connect/fork/cancel CLI, default-kind flip, `phase_chain` deletion, auto-pa
 | Recipe `repair-until-verified` on every verify node, masking systemic failures | Medium | Cap is recipe `max_iterations` (1..10). Exhaustion is kind-14 + `remaining_work`. Frequent exhaustions are a captain signal, not a quieter default. |
 
 ---
+
+
+
+---
+
+## Acceptance record (2026-08-31)
+
+Spec 2 (repair loop) verified shipped in flywheel at `e5f2477` / `1ab0223`:
+
+- **Spec 1 (DAG canonical + kind-aware fail_run):** `toron-workflow` engine `fail_run` with `rate_limit`/`timeout` retry (bounded) + `VerifySink` exec contract pinned by tests; `to_graph` park-safe.
+- **Spec 2 (repair loop):** `flywheel/src/builtin_workflows.rs:1173` description honest (bounded 3 iterations, `continue` on `verify-1/2` failure so `verify-1` can fail and `verify-2` can still run; `verify-3` gates the run); `repair_unroll_allows_verify_1_failure_to_reach_verify_2` unit test asserts the continuation; `compose --run` attaches `VerifySink` (`main.rs:22641`).
+- **Deviations recorded:** `InvokeGraph` deliberately not restored per `GS-005` §9 (subprocess `workflow run --execute --mode pane` vehicle, `VehicleOutcome` typed); `Branch` early-exit (skip remaining iterations after success) is a future optimization — current bounded-continue is honest for `fail c1 succeed c2` and the `Unrolled` claim has been removed from the YAML.
+
+Checklist: `cargo test --bin flywheel -- repair_unroll` pass; `cargo test -p toron-workflow` green; no new MCP tools/kinds.
 
 ## 10. More Information
 
