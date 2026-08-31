@@ -58,41 +58,49 @@ impl ToolServer {
     #[tool(
         name = "search_messages_product",
         description = "Fan an FTS5 search across a product's member projects.",
-        output_schema = rmcp::handler::server::tool::schema_for_output::<Vec<crate::responses::ProjectSearchMessageOut>>(),
+        output_schema = rmcp::handler::server::tool::schema_for_output::<crate::responses::SearchMessagesProductWrapper>(),
         annotations(title = "Search messages (product)", read_only_hint = true)
     )]
     async fn search_messages_product(
         &self,
         Parameters(args): Parameters<SearchMessagesProductArgs>,
     ) -> ToolOutput {
-        ToolOutput::result(
-            self.mailbox
-                .search_messages_product(
-                    &args.product_key,
-                    &args.query,
-                    args.limit.map(|l| l as usize),
-                    args.include_body_md.unwrap_or(false),
-                )
-                .await,
-        )
+        use super::ToJson;
+        match self
+            .mailbox
+            .search_messages_product(
+                &args.product_key,
+                &args.query,
+                args.limit.map(|l| l as usize),
+                args.include_body_md.unwrap_or(false),
+            )
+            .await
+        {
+            Ok(v) => ToolOutput::ok(serde_json::json!({ "result": v.to_json() })),
+            Err(e) => ToolOutput::err(format!("{e:#}")),
+        }
     }
 
     /// `fetch_inbox_product`: fan inbox fetch across member projects.
     #[tool(
         name = "fetch_inbox_product",
         description = "Fan an inbox fetch across a product's member projects.",
-        output_schema = rmcp::handler::server::tool::schema_for_output::<Vec<crate::responses::ProjectInboxMessageOut>>(),
+        output_schema = rmcp::handler::server::tool::schema_for_output::<crate::responses::FetchInboxProductWrapper>(),
         annotations(title = "Fetch inbox (product)", read_only_hint = true)
     )]
     async fn fetch_inbox_product(
         &self,
         Parameters(args): Parameters<FetchInboxProductArgs>,
     ) -> ToolOutput {
-        ToolOutput::result(
-            self.mailbox
-                .fetch_inbox_product(&args.product_key, &args.agent_name)
-                .await,
-        )
+        use super::ToJson;
+        match self
+            .mailbox
+            .fetch_inbox_product(&args.product_key, &args.agent_name)
+            .await
+        {
+            Ok(v) => ToolOutput::ok(serde_json::json!({ "messages": v.to_json() })),
+            Err(e) => ToolOutput::err(format!("{e:#}")),
+        }
     }
 
     /// `summarize_thread_product`: summarize across member projects.

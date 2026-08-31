@@ -835,11 +835,16 @@ mod tests {
             vec!["leases".to_string(), "released".to_string()],
             "release schema = {{released, leases}}"
         );
-        // set_contact_policy → bare kind-30014 event-id string.
+        // set_contact_policy → object wrapper {event_id} (pi client requires
+        // top-level type object; bare string fails tools/list validation).
         assert_eq!(
             by("set_contact_policy").output_schema.as_ref().unwrap()["type"],
-            "string",
-            "set_contact_policy is a bare string schema"
+            "object",
+            "set_contact_policy wrapper must be object"
+        );
+        assert!(
+            props("set_contact_policy").contains(&"event_id".to_string()),
+            "set_contact_policy schema must expose event_id"
         );
     }
 }

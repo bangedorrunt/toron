@@ -49,41 +49,48 @@ impl ToolServer {
     #[tool(
         name = "renew_build_slot",
         description = "Extend an active build-slot lease's TTL (no-op when missing).",
-        output_schema = rmcp::handler::server::tool::schema_for_output::<Option<crate::responses::BuildSlotOut>>(),
+        output_schema = rmcp::handler::server::tool::schema_for_output::<crate::responses::RenewBuildSlotWrapper>(),
         annotations(title = "Renew build slot", destructive_hint = true)
     )]
     async fn renew_build_slot(
         &self,
         Parameters(args): Parameters<RenewBuildSlotArgs>,
     ) -> ToolOutput {
-        ToolOutput::result(
-            self.mailbox
-                .renew_build_slot(
-                    &args.project_key,
-                    &args.agent_name,
-                    &args.slot,
-                    nonneg_secs(args.extend_seconds).unwrap_or(0),
-                )
-                .await,
-        )
+        use super::ToJson;
+        match self
+            .mailbox
+            .renew_build_slot(
+                &args.project_key,
+                &args.agent_name,
+                &args.slot,
+                nonneg_secs(args.extend_seconds).unwrap_or(0),
+            )
+            .await
+        {
+            Ok(v) => ToolOutput::ok(serde_json::json!({ "slot": v.to_json() })),
+            Err(e) => ToolOutput::err(format!("{e:#}")),
+        }
     }
 
     /// `release_build_slot`: release an active slot lease.
     #[tool(
         name = "release_build_slot",
         description = "Release an active build-slot lease (non-destructive).",
-        output_schema = rmcp::handler::server::tool::schema_for_output::<bool>(),
+        output_schema = rmcp::handler::server::tool::schema_for_output::<crate::responses::ReleaseBuildSlotWrapper>(),
         annotations(title = "Release build slot", destructive_hint = true)
     )]
     async fn release_build_slot(
         &self,
         Parameters(args): Parameters<ReleaseBuildSlotArgs>,
     ) -> ToolOutput {
-        ToolOutput::result(
-            self.mailbox
-                .release_build_slot(&args.project_key, &args.agent_name, &args.slot)
-                .await,
-        )
+        match self
+            .mailbox
+            .release_build_slot(&args.project_key, &args.agent_name, &args.slot)
+            .await
+        {
+            Ok(v) => ToolOutput::ok(serde_json::json!({ "released": v })),
+            Err(e) => ToolOutput::err(format!("{e:#}")),
+        }
     }
 }
 

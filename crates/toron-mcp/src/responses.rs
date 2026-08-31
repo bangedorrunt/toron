@@ -368,6 +368,66 @@ pub struct AcquireBuildSlotResultOut {
     pub conflicts: Vec<SlotConflictOut>,
 }
 
+/// MCP object-type wrappers — pi's tools/list validator requires every
+/// outputSchema to have top-level `type: "object"` (2026-08-08 regression
+/// bd-jgd). Bare arrays / primitives / anyOf used before fail that gate.
+/// Wrappers produce the compliant schema via `schema_for_output::<Wrapper>()`
+/// AND the wire payload (`ToolOutput` JSON text) is wrapped to match —
+/// honest structured output (SEP-2106).
+#[derive(Debug, Clone, JsonSchema)]
+pub struct FetchInboxWrapper {
+    pub messages: Vec<InboxMessageOut>,
+}
+#[derive(Debug, Clone, JsonSchema)]
+pub struct FetchInboxProductWrapper {
+    pub messages: Vec<ProjectInboxMessageOut>,
+}
+#[derive(Debug, Clone, JsonSchema)]
+pub struct ListAgentsWrapper {
+    pub agents: Vec<RegisteredAgentOut>,
+}
+#[derive(Debug, Clone, JsonSchema)]
+pub struct ListContactsWrapper {
+    pub contacts: Vec<ContactLinkOut>,
+}
+#[derive(Debug, Clone, JsonSchema)]
+pub struct SearchMessagesWrapper {
+    pub result: Vec<SearchMessageOut>,
+    pub next_cursor: Option<String>,
+}
+#[derive(Debug, Clone, JsonSchema)]
+pub struct SearchMessagesProductWrapper {
+    pub result: Vec<ProjectSearchMessageOut>,
+}
+#[derive(Debug, Clone, JsonSchema)]
+pub struct UninstallHookWrapper {
+    pub ok: bool,
+}
+#[derive(Debug, Clone, JsonSchema)]
+pub struct ReleaseBuildSlotWrapper {
+    pub released: bool,
+}
+#[derive(Debug, Clone, JsonSchema)]
+pub struct RenewBuildSlotWrapper {
+    pub slot: Option<BuildSlotOut>,
+}
+#[derive(Debug, Clone, JsonSchema)]
+pub struct ResolvePaneWrapper {
+    pub agent_name: Option<String>,
+    pub pane_id: String,
+    pub note: Option<String>,
+}
+#[derive(Debug, Clone, JsonSchema)]
+pub struct CleanupWrapper {
+    pub removed: Option<Vec<String>>,
+    pub released: Option<Vec<ReleasedGhostOut>>,
+    pub note: Option<String>,
+}
+#[derive(Debug, Clone, JsonSchema)]
+pub struct SetContactPolicyWrapper {
+    pub event_id: String,
+}
+
 /// `renew_build_slot` (null when no lease).
 #[derive(Debug, Clone, JsonSchema)]
 pub struct BuildSlotOut {
