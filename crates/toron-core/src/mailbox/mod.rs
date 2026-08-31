@@ -38,6 +38,7 @@ pub mod naming;
 pub mod product;
 pub mod reservations;
 pub mod search;
+pub mod send_tags;
 pub mod surface;
 pub mod unwrap;
 

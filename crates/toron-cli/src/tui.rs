@@ -109,7 +109,7 @@ async fn handle_event(state: &mut TuiState, ev: Event, mailbox: &Mailbox) -> boo
                 state.error = None;
                 return false;
             }
-            return true;
+            true
         }
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => true,
         KeyCode::Char('?') => {
@@ -320,8 +320,11 @@ fn render_resize_card(f: &mut Frame, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(HackerNight::border_focused())
-        .title(" resize ").title_style(HackerNight::title_focused());
-    let w = (msg.len() as u16 + 6).min(area.width.saturating_sub(2)).max(30);
+        .title(" resize ")
+        .title_style(HackerNight::title_focused());
+    let w = (msg.len() as u16 + 6)
+        .min(area.width.saturating_sub(2))
+        .max(30);
     let p = Paragraph::new(msg.clone())
         .style(HackerNight::warning())
         .block(block)
@@ -329,8 +332,24 @@ fn render_resize_card(f: &mut Frame, area: Rect) {
     let h = 5u16;
     let x = area.x + (area.width.saturating_sub(w)) / 2;
     let y = area.y + (area.height.saturating_sub(h)) / 2;
-    f.render_widget(Clear, Rect { x, y, width: w, height: h });
-    f.render_widget(p, Rect { x, y, width: w, height: h });
+    f.render_widget(
+        Clear,
+        Rect {
+            x,
+            y,
+            width: w,
+            height: h,
+        },
+    );
+    f.render_widget(
+        p,
+        Rect {
+            x,
+            y,
+            width: w,
+            height: h,
+        },
+    );
 }
 
 fn block_focused(title: &str) -> Block<'_> {
@@ -536,9 +555,14 @@ fn render_help_overlay(f: &mut Frame, area: Rect) {
     let h = 16u16;
     let x = area.x + (area.width.saturating_sub(w)) / 2;
     let y = area.y + (area.height.saturating_sub(h)) / 2;
-    let help_area = Rect { x, y, width: w, height: h };
+    let help_area = Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    };
 
-    let help_text = vec![
+    let help_text = [
         "toron tui — hacker-night  ·  keyboard",
         "",
         "  q / Esc / Ctrl-C     quit (Esc clears search first)",
@@ -559,10 +583,18 @@ fn render_help_overlay(f: &mut Frame, area: Rect) {
         .border_style(HackerNight::border_focused())
         .title(" help  [?/Esc/q to close] ")
         .title_style(HackerNight::title_focused())
-        .style(Style::default().bg(HackerNight::OVERLAY).fg(HackerNight::FG));
+        .style(
+            Style::default()
+                .bg(HackerNight::OVERLAY)
+                .fg(HackerNight::FG),
+        );
 
     let p = Paragraph::new(help_text)
-        .style(Style::default().bg(HackerNight::OVERLAY).fg(HackerNight::FG))
+        .style(
+            Style::default()
+                .bg(HackerNight::OVERLAY)
+                .fg(HackerNight::FG),
+        )
         .block(block)
         .wrap(ratatui::widgets::Wrap { trim: true });
 

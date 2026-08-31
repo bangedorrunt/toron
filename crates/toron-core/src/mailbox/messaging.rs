@@ -245,6 +245,10 @@ impl Mailbox {
     /// same kind-14 rumor (to/cc) or the bcc-variant rumor. Gift wraps are
     /// metadata-hiding: they carry NO project tags (A3).
     pub async fn send_message(&self, args: &SendMessage) -> anyhow::Result<SendResult> {
+        // ADR-0027 E2: parse extra_tags vocabulary at the boundary; reject
+        // unknown wake/priority/audience loudly (typed, not free strings).
+        let parsed_tags = crate::mailbox::send_tags::SendTags::parse(&args.extra_tags)
+            .map_err(|e| anyhow::anyhow!(e.message))?;
         // ADR-0017: the project key is canonicalized first — every spelling
         // of the project sends under the ONE canonical root.
         let mut args = args.clone();
@@ -254,6 +258,10 @@ impl Mailbox {
         if resolved.is_empty() {
             anyhow::bail!("no recipients (to/cc/bcc all empty)");
         }
+        // E3 invariants that need recipient count / overseer context.
+        parsed_tags
+            .validate_for_send(resolved.len(), args.overseer)
+            .map_err(|e| anyhow::anyhow!(e.message))?;
 
         let sender_keys = if args.overseer {
             // ADR-0004 Ship 5: the Overseer signs with the OPERATOR key, so
@@ -2990,7 +2998,11 @@ mod tests {
             .tags
             .iter()
             .any(|t| t.len() >= 2 && t[0] == "p" && t[1] == "BlueLake");
-        assert!(has_pin_p_tag, "ack-sla wake must p-tag pin names, tags={:?}", wake.tags);
+        assert!(
+            has_pin_p_tag,
+            "ack-sla wake must p-tag pin names, tags={:?}",
+            wake.tags
+        );
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_dir_all(&data_dir);
     }

@@ -27,6 +27,7 @@ fn truecolor() -> bool {
 /// When `NO_COLOR` is set every Style degrades to `Color::Reset` / no modifiers.
 pub struct HackerNight;
 
+#[allow(dead_code)]
 impl HackerNight {
     // raw palette
     pub const VOID: Color = Color::Rgb(0x08, 0x08, 0x0e);
@@ -133,7 +134,9 @@ impl HackerNight {
     }
     pub fn tabs_active() -> Style {
         let fg = Self::resolve(Self::CYAN, 44, Color::Cyan);
-        let mut s = Style::default().fg(fg).bg(Self::resolve(Self::VOID, 233, Color::Black));
+        let mut s = Style::default()
+            .fg(fg)
+            .bg(Self::resolve(Self::VOID, 233, Color::Black));
         if !no_color() {
             s = s.add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
         }
@@ -156,11 +159,7 @@ impl HackerNight {
 
     /// Wrap a style to respect NO_COLOR — strips fg/bg/modifiers when disabled.
     pub fn maybe_style(s: Style) -> Style {
-        if no_color() {
-            Style::default()
-        } else {
-            s
-        }
+        if no_color() { Style::default() } else { s }
     }
 }
 

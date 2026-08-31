@@ -58,9 +58,45 @@ fn print_json(value: &serde_json::Value) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn build_send_tags(
+    corr: Option<String>,
+    wake: Option<String>,
+    priority: Option<String>,
+    audience: Option<String>,
+    result_path: Option<String>,
+) -> anyhow::Result<Vec<toron_core::nostr::Tag>> {
+    use std::str::FromStr;
+    use toron_core::mailbox::send_tags::{Audience, Priority, SendTags, Wake};
+    let wake_typed = wake
+        .map(|s| Wake::from_str(&s).map_err(|e| anyhow::anyhow!(e.message)))
+        .transpose()?;
+    let priority_typed = priority
+        .map(|s| Priority::from_str(&s).map_err(|e| anyhow::anyhow!(e.message)))
+        .transpose()?;
+    let audience_typed = audience
+        .map(|s| Audience::from_str(&s).map_err(|e| anyhow::anyhow!(e.message)))
+        .transpose()?;
+    let tags = SendTags::from_fields(
+        corr,
+        wake_typed,
+        priority_typed,
+        audience_typed,
+        result_path,
+    )
+    .map_err(|e| anyhow::anyhow!(e.message))?;
+    Ok(tags.to_tags())
+}
+
 pub async fn run_mail(mailbox: &Mailbox, cmd: &MailCommand) -> anyhow::Result<()> {
     match cmd {
         MailCommand::Send(args) => {
+            let extra_tags = build_send_tags(
+                args.corr.clone(),
+                args.wake.clone(),
+                args.priority.clone(),
+                args.audience.clone(),
+                args.result_path.clone(),
+            )?;
             let msg = SendMessage {
                 project_slug: args.project.clone(),
                 sender_name: args.from.clone(),
@@ -74,7 +110,7 @@ pub async fn run_mail(mailbox: &Mailbox, cmd: &MailCommand) -> anyhow::Result<()
                 thread_id: args.thread.clone(),
                 sender_token: args.sender_token.clone(),
                 overseer: false,
-                extra_tags: Vec::new(),
+                extra_tags,
             };
             emit(mailbox.send_message(&msg).await?)
         }
@@ -106,6 +142,13 @@ pub async fn run_mail(mailbox: &Mailbox, cmd: &MailCommand) -> anyhow::Result<()
             emit(mailbox.send_message(&msg).await?)
         }
         MailCommand::Reply(args) => {
+            let extra_tags = build_send_tags(
+                args.corr.clone(),
+                args.wake.clone(),
+                args.priority.clone(),
+                args.audience.clone(),
+                args.result_path.clone(),
+            )?;
             let msg = SendMessage {
                 project_slug: args.project.clone(),
                 sender_name: args.from.clone(),
@@ -119,7 +162,7 @@ pub async fn run_mail(mailbox: &Mailbox, cmd: &MailCommand) -> anyhow::Result<()
                 thread_id: Some(args.thread.clone()),
                 sender_token: args.sender_token.clone(),
                 overseer: false,
-                extra_tags: Vec::new(),
+                extra_tags,
             };
             emit(mailbox.reply_message(&msg).await?)
         }
@@ -199,6 +242,11 @@ pub async fn run_mail_daemon(dc: &DaemonClient, cmd: &MailCommand) -> anyhow::Re
                     "ack_required": args.ack,
                     "thread_id": args.thread,
                     "sender_token": args.sender_token,
+                    "corr": args.corr,
+                    "wake": args.wake,
+                    "priority": args.priority,
+                    "audience": args.audience,
+                    "result_path": args.result_path,
                 }),
             )
             .await
@@ -223,6 +271,11 @@ pub async fn run_mail_daemon(dc: &DaemonClient, cmd: &MailCommand) -> anyhow::Re
                     "ack_required": args.ack,
                     "thread_id": args.thread,
                     "sender_token": args.sender_token,
+                    "corr": args.corr,
+                    "wake": args.wake,
+                    "priority": args.priority,
+                    "audience": args.audience,
+                    "result_path": args.result_path,
                 }),
             )
             .await

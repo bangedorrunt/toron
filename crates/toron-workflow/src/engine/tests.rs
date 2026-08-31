@@ -2017,7 +2017,8 @@ graph:
 /// and green passes. Pins the compose --run VerifySink attachment.
 #[tokio::test]
 async fn verify_sink_attached_green_passes() {
-    let runner: ActionRunner = std::sync::Arc::new(|_a: &Action| Ok(serde_json::json!({ "ok": true })));
+    let runner: ActionRunner =
+        std::sync::Arc::new(|_a: &Action| Ok(serde_json::json!({ "ok": true })));
     let engine = WorkflowEngine::local(runner).expect("engine");
     let wf = parse_workflow(
         r##"
@@ -2057,7 +2058,10 @@ steps:
         )
         .await
         .expect("run");
-    assert!(out.get("status").is_none() || out["status"] != "failed", "green verify must not fail: {out}");
+    assert!(
+        out.get("status").is_none() || out["status"] != "failed",
+        "green verify must not fail: {out}"
+    );
     assert_eq!(out["v"]["ok"], true);
 }
 
@@ -2114,11 +2118,13 @@ steps:
         .expect("run");
     assert_eq!(seen.lock().len(), 1, "verify must have executed");
     assert_eq!(seen.lock()[0], "cargo test --lib");
-    assert_eq!(out["status"], "failed", "red verify must fail the run: {out}");
+    assert_eq!(
+        out["status"], "failed",
+        "red verify must fail the run: {out}"
+    );
     assert_eq!(out["failed_step"], "verify-1");
     assert!(
-        !out
-            .get("error")
+        !out.get("error")
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .contains("verify sink missing"),

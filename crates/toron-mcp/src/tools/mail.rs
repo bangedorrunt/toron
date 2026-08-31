@@ -70,6 +70,16 @@ impl ToolServer {
                     .await,
             );
         }
+        let extra_tags = match build_extra_tags_from_args(
+            args.corr.clone(),
+            args.wake.clone(),
+            args.priority.clone(),
+            args.audience.clone(),
+            args.result_path.clone(),
+        ) {
+            Ok(v) => v,
+            Err(e) => return ToolOutput::err(e),
+        };
         let msg = SendMessage {
             project_slug: args.project_key.clone(),
             sender_name: args.sender_name.clone(),
@@ -83,7 +93,7 @@ impl ToolServer {
             thread_id: args.thread_id.clone(),
             sender_token: args.sender_token.clone(),
             overseer: false,
-            extra_tags: Vec::new(),
+            extra_tags,
         };
         ToolOutput::result(self.mailbox.send_message(&msg).await)
     }
@@ -118,6 +128,16 @@ impl ToolServer {
                     .await,
             );
         }
+        let extra_tags = match build_extra_tags_from_args(
+            args.corr.clone(),
+            args.wake.clone(),
+            args.priority.clone(),
+            args.audience.clone(),
+            args.result_path.clone(),
+        ) {
+            Ok(v) => v,
+            Err(e) => return ToolOutput::err(e),
+        };
         let msg = SendMessage {
             project_slug: args.project_key.clone(),
             sender_name: args.sender_name.clone(),
@@ -131,7 +151,7 @@ impl ToolServer {
             thread_id: args.thread_id.clone(),
             sender_token: args.sender_token.clone(),
             overseer: false,
-            extra_tags: Vec::new(),
+            extra_tags,
         };
         ToolOutput::result(self.mailbox.reply_message(&msg).await)
     }
@@ -297,6 +317,16 @@ pub struct SendMessageArgs {
     pub release_ask: Option<String>,
     /// Optional note on the request-release rumor.
     pub reservation_note: Option<String>,
+    /// ADR-0027 E2: correlation id rides extra_tags corr.
+    pub corr: Option<String>,
+    /// ADR-0027 E2: wake standing|tasked.
+    pub wake: Option<String>,
+    /// ADR-0027 E2: priority queue|interrupt.
+    pub priority: Option<String>,
+    /// ADR-0027 E3: audience human|agents.
+    pub audience: Option<String>,
+    /// ADR-0027 E2: result_path rides extra_tags result_path.
+    pub result_path: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone)]
@@ -323,6 +353,16 @@ pub struct ReplyMessageArgs {
     pub release_decision: Option<String>,
     /// Optional note on the response rumor.
     pub reservation_note: Option<String>,
+    /// ADR-0027 E2: correlation id.
+    pub corr: Option<String>,
+    /// ADR-0027 E2: wake.
+    pub wake: Option<String>,
+    /// ADR-0027 E2: priority.
+    pub priority: Option<String>,
+    /// ADR-0027 E3: audience.
+    pub audience: Option<String>,
+    /// ADR-0027 E2: result_path.
+    pub result_path: Option<String>,
 }
 
 fn parse_release_ask(s: &str) -> Result<ReleaseAsk, String> {
@@ -348,6 +388,35 @@ fn parse_release_decision(s: &str) -> Result<ReleaseDecision, String> {
                 format!("invalid --decision {s:?} — use agreed, denied, or deferred:<secs>")
             }),
     }
+}
+
+fn build_extra_tags_from_args(
+    corr: Option<String>,
+    wake: Option<String>,
+    priority: Option<String>,
+    audience: Option<String>,
+    result_path: Option<String>,
+) -> Result<Vec<toron_core::nostr::Tag>, String> {
+    use std::str::FromStr;
+    use toron_core::mailbox::send_tags::{Audience, Priority, SendTags, Wake};
+    let wake_typed = wake
+        .map(|s| Wake::from_str(&s).map_err(|e| e.message))
+        .transpose()?;
+    let priority_typed = priority
+        .map(|s| Priority::from_str(&s).map_err(|e| e.message))
+        .transpose()?;
+    let audience_typed = audience
+        .map(|s| Audience::from_str(&s).map_err(|e| e.message))
+        .transpose()?;
+    let tags = SendTags::from_fields(
+        corr,
+        wake_typed,
+        priority_typed,
+        audience_typed,
+        result_path,
+    )
+    .map_err(|e| e.message)?;
+    Ok(tags.to_tags())
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone)]
