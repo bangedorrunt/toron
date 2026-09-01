@@ -14,7 +14,7 @@ informed: flywheel × toron × beads maintainers; Wheelhouse
 **Decision-makers:** Captain (bangedorrunt)
 **Extends:** [ADR-0003](0003-nostr-mailbox-fabric.md), [ADR-0005](0005-orchestration-layer.md), [ADR-0014](0014-kind-registry-specification.md), [ADR-0015](0015-flywheel-toron-integration-contract.md), [ADR-0018](0018-agent-identity-naming-grammar.md), [ADR-0020](0020-nostr-two-plane-cli-and-crew-steering.md), [ADR-0024](0024-graph-first-repair-loops-bead-workflow.md), [ADR-0025](0025-adopt-graph-dispatch-artifact-reduce-pin-supervision.md), [ADR-0026](0026-failure-taxonomy-funded-preflight-fallback-chains-mail-health-escalation.md)
 **Amends:** ADR-0020 only in this sense: MCP grows only as the same verb as CLI when an agent cannot tick without it. Not a tool dump. Not a Grok Bot catalog.
-**Does not amend:** two captains stay split; two planes stay two planes; one-way dep flywheel → toron; beads remain the work graph; doorbell remains in-process wake; kind **30013 remains the agent profile**; Tick Law remains the control-plane law and is **not held** at this HEAD; factory ships do not merge without the captain's word. ADR-0024 stays **Accepted** (this record does not rewrite it). ADR-0019 stays **Proposed**.
+**Does not amend:** two captains stay split; two planes stay two planes; one-way dep flywheel → toron; beads remain the work graph; doorbell remains in-process wake; kind **30013 remains the agent profile**; Tick Law remains the control-plane law and **is held on the live path** (doorbell dispatcher + `swarm_loop` both call `workspace::tick` only; slice reducers are `pub(crate)`); factory ships do not merge without the captain's word. ADR-0024 stays **Accepted** (this record does not rewrite it). ADR-0019 stays **Proposed**.
 **Does not wire:** Grok Bot / Firstmate into flywheel. This ADR invents a control plane on *our* nouns. It does not connect the products and does not copy the orchestrator.
 **Tracker:** beads. Never pull requests as the log.
 
@@ -55,7 +55,7 @@ Doorbell already is in-process wake. Kind 30013 already is the agent profile. We
 
 **Decision (chosen):** one `WorkspaceModel`, one `Msg` union, `tick(model, msg) -> (model, Vec<Cmd>)` where `Cmd` is data. Assignment is tags + sqlite **inside the Model**. Role binding is 30013 + whois, not a second profile. Human decision is a Msg, not a widget. Presence 20001 is inject truth. Live watch is a Cmd subscription that yields Msgs. Skills/playbooks are beads + `VerifySink`. Waiter is a Cmd, not a pane assumption.
 
-Tick Law is **not held** at `bde4daae`. Two Models, two ticks, two Action enums, no `Cmd` type. Live loop only constructs `LoopMsg::Tick`. Other `LoopMsg` arms are costume. What folded: `self_heal_step` inside the Tick arm; live doorbell already binds `doorbell_tick::tick`.
+Tick Law **is held on the live path** at current `main` (doorbell + `swarm_loop` → `workspace::tick` only). Historical note at grounding HEAD `bde4daae`: two Models, two ticks, two Action enums, no `Cmd` type; live loop only constructed `LoopMsg::Tick`. That is no longer the live entry. Slice reducers remain private composition. Residual costumes (Cmd holes, dual heal maps) are named leftovers, not a second live reducer.
 
 ```mermaid
 flowchart TB
@@ -84,7 +84,7 @@ As-is: two nervous systems. `cmd_internal_doorbell` owns `DoorbellModel` + `door
 
 ```mermaid
 flowchart LR
-  subgraph now["as-is at bde4daae — two nervous systems"]
+  subgraph now["as-is at grounding bde4daae (historical; live main is to-be)"]
     direction TB
     subgraph bellNow["cmd_internal_doorbell"]
       st["subscribe_trusted  kinds 9,43001,30031,39002"] --> dtick["doorbell_tick::tick(&DoorbellModel, &DoorbellMsg)"]
@@ -200,7 +200,7 @@ pub fn tick(model: &LoopModel, msg: &LoopMsg) -> (LoopModel, Vec<LoopAction>)
 
 **LoopMsg** (`durable.rs:337–370`): `Herdr`, `BrClose`, `WaveGate`, `CommandVerified`, `Dispatch`, `Reclaim`, `Tick { states, digests, nudge, wake_suppressed, events }`. **No Heal.**
 
-Tick Law: every control-plane state change is `tick(Model, Msg) -> (Model, Vec<Cmd>)`. Effects as data. One reducer path. **Verdict: not held.**
+Tick Law: every control-plane state change is `tick(Model, Msg) -> (Model, Vec<Cmd>)`. Effects as data. One reducer path. **Verdict at grounding `bde4daae`: not held. Verdict on live `main` (2026-09-02): held on the live path** (doorbell dispatcher + `swarm_loop` call `workspace::tick` only; slice reducers `pub(crate)`). Leftover table below is the grounding snapshot, not a live score.
 
 | # | leftover | file:line | tick vs bypass |
 | --- | --- | --- | --- |
