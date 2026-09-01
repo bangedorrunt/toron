@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Docs
+- ADR-0027 Tick Law sentence: live path is held (grounding leftover table stays historical).
+
 ## [1.3.1] — 2026-09-01 R-E2 kinds + inbox e2e
 
 ### Added
