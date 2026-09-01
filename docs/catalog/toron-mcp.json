@@ -126,8 +126,8 @@
       "name": "workflow"
     },
     {
-      "args": "get, list",
-      "description": "Receipts durable store (ADR-0027 E2): `receipt get` / `receipt list`",
+      "args": "get, list, set",
+      "description": "Receipts durable store (ADR-0027 E2): `receipt get` / `receipt list` / `receipt set`",
       "name": "receipt"
     },
     {
@@ -136,7 +136,7 @@
       "name": "role"
     }
   ],
-  "generated_at": "2026-08-31T22:28:31Z",
+  "generated_at": "2026-09-01T05:10:28Z",
   "resources": [
     {
       "description": "List projects known to toron.",

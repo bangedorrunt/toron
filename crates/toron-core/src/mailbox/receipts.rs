@@ -190,6 +190,65 @@ impl ReceiptStore {
     pub async fn list_by_state(&self, state: ReceiptState) -> anyhow::Result<Vec<Receipt>> {
         self.list(Some(state)).await
     }
+
+    /// Transition owed -> acked for `corr`. Idempotent: acked->acked no-op;
+    /// resulted never downgrades. Returns `true` if the row was changed.
+    pub async fn transition_acked(&self, corr: &str) -> anyhow::Result<bool> {
+        let existing = self.get(corr).await?;
+        let Some(mut r) = existing else {
+            return Ok(false);
+        };
+        match r.state {
+            ReceiptState::Resulted => return Ok(false),
+            ReceiptState::Acked => return Ok(false),
+            ReceiptState::Owed => {}
+        }
+        r.state = ReceiptState::Acked;
+        r.updated_at = chrono::Utc::now().timestamp_millis();
+        self.upsert(&r).await?;
+        Ok(true)
+    }
+
+    /// Explicitly set `corr` to resulted (ADR-0027 E2.3). Never downgrades
+    /// resulted: the update is idempotent. Optionally updates `result_path`.
+    /// Creates the row if no prior receipt exists (explicit verb).
+    pub async fn set_resulted(
+        &self,
+        corr: &str,
+        result_path: Option<String>,
+    ) -> anyhow::Result<Receipt> {
+        let now = chrono::Utc::now().timestamp_millis();
+        if let Some(mut r) = self.get(corr).await? {
+            if r.state == ReceiptState::Resulted {
+                if let Some(p) = result_path.clone()
+                    && r.result_path.as_deref() != Some(p.as_str())
+                {
+                    r.result_path = Some(p);
+                    r.updated_at = now;
+                    self.upsert(&r).await?;
+                }
+                return Ok(r);
+            }
+            r.state = ReceiptState::Resulted;
+            if let Some(p) = result_path.clone() {
+                r.result_path = Some(p);
+            }
+            r.updated_at = now;
+            self.upsert(&r).await?;
+            Ok(r)
+        } else {
+            let r = Receipt {
+                corr: corr.to_string(),
+                state: ReceiptState::Resulted,
+                wake: None,
+                due_at: None,
+                result_path,
+                updated_at: now,
+            };
+            self.upsert(&r).await?;
+            Ok(r)
+        }
+    }
 }
 
 impl crate::mailbox::Mailbox {
@@ -317,5 +376,125 @@ mod tests {
     async fn receipts_state_parse_rejects_unknown() {
         assert!(ReceiptState::parse("bogus").is_err());
         assert_eq!(ReceiptState::parse("owed").unwrap(), ReceiptState::Owed);
+    }
+
+    #[tokio::test]
+    async fn receipts_transition_acked_owed_to_acked_idempotent_and_no_downgrade() {
+        let (pool, path) = test_pool("trans-acked").await;
+        let store = ReceiptStore::new(pool);
+        // missing -> no-op
+        assert!(
+            !store
+                .transition_acked("missing")
+                .await
+                .expect("transition missing")
+        );
+        // owed -> acked
+        store
+            .upsert(&Receipt {
+                corr: "c-acked".into(),
+                state: ReceiptState::Owed,
+                wake: Some(Wake::Tasked),
+                due_at: None,
+                result_path: None,
+                updated_at: 100,
+            })
+            .await
+            .expect("seed owed");
+        assert!(store.transition_acked("c-acked").await.expect("transition"));
+        let got = store.get("c-acked").await.expect("get").expect("found");
+        assert_eq!(got.state, ReceiptState::Acked);
+        // idempotent: acked -> acked no-op
+        assert!(!store.transition_acked("c-acked").await.expect("second ack"));
+        let got2 = store.get("c-acked").await.expect("get2").expect("found2");
+        assert_eq!(got2.state, ReceiptState::Acked);
+        // resulted never downgrades
+        store
+            .upsert(&Receipt {
+                corr: "c-resulted".into(),
+                state: ReceiptState::Resulted,
+                wake: None,
+                due_at: None,
+                result_path: Some("/tmp/x".into()),
+                updated_at: 300,
+            })
+            .await
+            .expect("seed resulted");
+        assert!(
+            !store
+                .transition_acked("c-resulted")
+                .await
+                .expect("ack on resulted")
+        );
+        let got3 = store
+            .get("c-resulted")
+            .await
+            .expect("get3")
+            .expect("found3");
+        assert_eq!(got3.state, ReceiptState::Resulted);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn receipts_set_resulted_creates_and_transitions_and_idempotent() {
+        let (pool, path) = test_pool("set-resulted").await;
+        let store = ReceiptStore::new(pool);
+        // create when missing
+        let r = store
+            .set_resulted("new-corr", Some("/tmp/a.json".into()))
+            .await
+            .expect("set new");
+        assert_eq!(r.state, ReceiptState::Resulted);
+        assert_eq!(r.result_path.as_deref(), Some("/tmp/a.json"));
+        // owed -> resulted
+        store
+            .upsert(&Receipt {
+                corr: "owed-1".into(),
+                state: ReceiptState::Owed,
+                wake: Some(Wake::Standing),
+                due_at: None,
+                result_path: None,
+                updated_at: 100,
+            })
+            .await
+            .expect("seed owed");
+        let r2 = store
+            .set_resulted("owed-1", Some("/tmp/b.json".into()))
+            .await
+            .expect("set owed->resulted");
+        assert_eq!(r2.state, ReceiptState::Resulted);
+        assert_eq!(r2.wake, Some(Wake::Standing));
+        assert_eq!(r2.result_path.as_deref(), Some("/tmp/b.json"));
+        // acked -> resulted
+        store
+            .upsert(&Receipt {
+                corr: "acked-1".into(),
+                state: ReceiptState::Acked,
+                wake: None,
+                due_at: None,
+                result_path: None,
+                updated_at: 200,
+            })
+            .await
+            .expect("seed acked");
+        let r3 = store
+            .set_resulted("acked-1", None)
+            .await
+            .expect("acked->resulted");
+        assert_eq!(r3.state, ReceiptState::Resulted);
+        // idempotent: resulted -> resulted (no downgrade, optional path update)
+        let r4 = store
+            .set_resulted("acked-1", Some("/tmp/c.json".into()))
+            .await
+            .expect("second resulted");
+        assert_eq!(r4.state, ReceiptState::Resulted);
+        assert_eq!(r4.result_path.as_deref(), Some("/tmp/c.json"));
+        let r5 = store
+            .set_resulted("acked-1", None)
+            .await
+            .expect("third resulted no path");
+        assert_eq!(r5.state, ReceiptState::Resulted);
+        assert_eq!(r5.result_path.as_deref(), Some("/tmp/c.json"));
+        let _ = std::fs::remove_file(&path);
     }
 }
