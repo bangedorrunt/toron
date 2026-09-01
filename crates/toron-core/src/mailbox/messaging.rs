@@ -263,6 +263,31 @@ impl Mailbox {
             .validate_for_send(resolved.len(), args.overseer)
             .map_err(|e| anyhow::anyhow!(e.message))?;
 
+        // ADR-0027 E2: a tasked send carrying a corr OWES a receipt — durable
+        // from the moment the send is validated (fresh-eyes fix 2026-09-01:
+        // the store previously had ZERO producers, so `receipt get` and
+        // `wait --corr` could never observe a real send). Best-effort: a
+        // missing index pool (demo mode) must not fail the send.
+        if let Some(corr) = parsed_tags.corr.clone() {
+            match self.receipt_store() {
+                Ok(store) => {
+                    let receipt = crate::mailbox::receipts::Receipt {
+                        corr,
+                        state: crate::mailbox::receipts::ReceiptState::Owed,
+                        wake: parsed_tags.wake,
+                        due_at: None,
+                        result_path: parsed_tags.result_path.clone(),
+                        updated_at: chrono::Utc::now().timestamp_millis(),
+                    };
+                    if let Err(e) = store.upsert(&receipt).await {
+                        eprintln!("toron: receipts store unavailable (receipt not recorded): {e}");
+                    }
+                }
+                Err(e) => {
+                    eprintln!("toron: receipts store unavailable (receipt not recorded): {e}");
+                }
+            }
+        }
         let sender_keys = if args.overseer {
             // ADR-0004 Ship 5: the Overseer signs with the OPERATOR key, so
             // the projection can verify the sender npub against it.
