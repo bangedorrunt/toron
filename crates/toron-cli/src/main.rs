@@ -472,6 +472,27 @@ async fn run_receipt(cmd: &cli::ReceiptCommand, format: OutputFormat) -> anyhow:
                 .collect();
             render_json(&serde_json::Value::Array(value), format);
         }
+        ReceiptCommand::Set(args) => {
+            let state = ReceiptState::parse(&args.state).map_err(|e| anyhow::anyhow!(e))?;
+            if state != ReceiptState::Resulted {
+                anyhow::bail!(
+                    "receipt set only supports --state resulted (got {})",
+                    args.state
+                );
+            }
+            let receipt = store
+                .set_resulted(&args.corr, args.result_path.clone())
+                .await?;
+            let value = serde_json::json!({
+                "corr": receipt.corr,
+                "state": receipt.state.as_str(),
+                "wake": receipt.wake.map(|w| w.as_str()),
+                "due_at": receipt.due_at,
+                "result_path": receipt.result_path,
+                "updated_at": receipt.updated_at,
+            });
+            render_json(&value, format);
+        }
     }
     Ok(())
 }

@@ -181,7 +181,7 @@ pub enum Command {
     #[command(subcommand)]
     Workflow(WorkflowCommand),
 
-    /// Receipts durable store (ADR-0027 E2): `receipt get` / `receipt list`.
+    /// Receipts durable store (ADR-0027 E2): `receipt get` / `receipt list` / `receipt set`.
     #[command(subcommand)]
     Receipt(ReceiptCommand),
 
@@ -236,6 +236,8 @@ pub enum ReceiptCommand {
     Get(ReceiptGetArgs),
     /// List receipts, optionally filtered by state.
     List(ReceiptListArgs),
+    /// Set receipt state to resulted (explicit verb, ADR-0027 E2.3).
+    Set(ReceiptSetArgs),
 }
 
 #[derive(Debug, Args)]
@@ -250,6 +252,19 @@ pub struct ReceiptListArgs {
     /// Filter by state: owed|acked|resulted.
     #[arg(long)]
     pub state: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct ReceiptSetArgs {
+    /// Correlation id.
+    #[arg(long, required = true)]
+    pub corr: String,
+    /// Target state — only `resulted` is accepted (explicit verb).
+    #[arg(long, required = true)]
+    pub state: String,
+    /// Optional result path to persist with the receipt.
+    #[arg(long)]
+    pub result_path: Option<String>,
 }
 
 #[derive(Debug, clap::Subcommand)]

@@ -35,7 +35,7 @@ fn run(args: &[&str]) -> std::process::Output {
     toron().args(args).output().expect("run toron")
 }
 
-fn run_with_data_dir(args: &[&str], data_dir: &PathBuf) -> std::process::Output {
+fn run_with_data_dir(args: &[&str], data_dir: &std::path::Path) -> std::process::Output {
     let mut cmd = toron();
     cmd.env("TORON_MCP_DATA_DIR", data_dir)
         .env("TORON_DATA_DIR", data_dir)
@@ -44,7 +44,7 @@ fn run_with_data_dir(args: &[&str], data_dir: &PathBuf) -> std::process::Output 
         .expect("run toron with data dir")
 }
 
-fn temp_data_dir(tag: &str) -> PathBuf {
+fn temp_data_dir(tag: &str) -> std::path::PathBuf {
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -54,7 +54,7 @@ fn temp_data_dir(tag: &str) -> PathBuf {
     p
 }
 
-fn ensure_project(data_dir: &PathBuf, slug: &str) {
+fn ensure_project(data_dir: &std::path::Path, slug: &str) {
     let out = run_with_data_dir(&["project", "ensure", slug], data_dir);
     assert!(
         out.status.success(),
@@ -332,4 +332,300 @@ fn adr0027_s1_guard_toron_send_extra_tags_not_envelope() {
     } else {
         assert!(content.contains("extra_tags"));
     }
+}
+
+// ── bd-hign: no-seed e2e (real CLI flow, not seeded store) ──
+
+fn register_agents_in_dir(data_dir: &std::path::Path, project: &str, names: &[&str]) {
+    // Blocking helper that registers `names` into `data_dir/index.sqlite`
+    // so a later shelled-out `toron` with TORON_MCP_DATA_DIR sees them.
+    // Must use the SAME default passphrase and no operator as demo_mailbox,
+    // else the CLI cannot decrypt the ncryptsec files (was "no local key").
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    rt.block_on(async {
+        use std::sync::Arc;
+        use toron_core::bus::in_process::{InProcessBus, InProcessBusConfig};
+        use toron_core::index::schema;
+        use toron_core::mailbox::Mailbox;
+        use toron_core::nostr::identity::AgentProfile;
+
+        let db_path = data_dir.join("index.sqlite");
+        let pool = schema::connect(db_path.to_str().unwrap())
+            .await
+            .expect("connect for register");
+        schema::migrate(&pool).await.expect("migrate for register");
+        let bus = InProcessBus::open(pool.clone(), InProcessBusConfig::default())
+            .await
+            .expect("bus for register");
+        // demo_mailbox uses no operator and default passphrase "toron-dev"
+        let mailbox =
+            Mailbox::new(Arc::new(bus), data_dir.to_path_buf(), None).with_index_pool(pool);
+        for name in names {
+            let profile = AgentProfile {
+                name: (*name).into(),
+                program: Some("opencode".into()),
+                model: None,
+                persona: None,
+                task_description: None,
+            };
+            mailbox
+                .register_agent(project, &profile)
+                .await
+                .unwrap_or_else(|e| panic!("register {name} in {project}: {e}"));
+        }
+    });
+}
+
+#[test]
+fn receipts_bd_hign_e2e_no_seed_owed_acked_resulted() {
+    // No-seed proof: send via CLI with --corr, then receipt get shows owed WITHOUT
+    // any direct ReceiptStore seeding; ack -> acked; receipt set -> resulted.
+    let data_dir = temp_data_dir("bd-hign-e2e");
+    let project = "demo";
+    register_agents_in_dir(&data_dir, project, &["SenderOne", "RecvOne"]);
+
+    let corr = format!("BD-HIGN-{}-{}", std::process::id(), {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    });
+
+    // 1. send with corr via CLI (real producer)
+    let out = run_with_data_dir(
+        &[
+            "mail",
+            "send",
+            "--as",
+            "SenderOne",
+            "--to",
+            "RecvOne",
+            "--subject",
+            "bd-hign e2e",
+            "--body",
+            "hello hign",
+            "--project",
+            project,
+            "--corr",
+            &corr,
+            "--wake",
+            "tasked",
+            "--json",
+        ],
+        &data_dir,
+    );
+    assert!(
+        out.status.success(),
+        "mail send with --corr must succeed, stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let send_val: serde_json::Value = serde_json::from_slice(&out.stdout).expect("send emits JSON");
+    // send should have at least one delivery
+    let deliveries = send_val
+        .get("deliveries")
+        .or_else(|| send_val.get("payload"));
+    assert!(
+        send_val.get("count").is_some() || deliveries.is_some(),
+        "send output has deliveries/count, got: {send_val}"
+    );
+
+    // 2. receipt get must show owed (no seeded row — real flow)
+    let out = run_with_data_dir(&["receipt", "get", "--corr", &corr, "--json"], &data_dir);
+    assert!(
+        out.status.success(),
+        "receipt get after send must succeed (owed), stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let r: serde_json::Value = serde_json::from_slice(&out.stdout).expect("receipt get JSON");
+    assert_eq!(
+        r.get("state").and_then(|v| v.as_str()),
+        Some("owed"),
+        "after send, receipt state must be owed (no seed), got: {r}"
+    );
+    assert_eq!(
+        r.get("corr").and_then(|v| v.as_str()),
+        Some(corr.as_str()),
+        "corr echo, got: {r}"
+    );
+
+    // 3. find message id via inbox
+    let out = run_with_data_dir(
+        &[
+            "mail",
+            "inbox",
+            "--as",
+            "RecvOne",
+            "--project",
+            project,
+            "--json",
+        ],
+        &data_dir,
+    );
+    assert!(
+        out.status.success(),
+        "inbox must succeed, stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let inbox: serde_json::Value = serde_json::from_slice(&out.stdout).expect("inbox JSON");
+    let arr = inbox.as_array().expect("inbox is array");
+    let msg = arr
+        .iter()
+        .find(|m| m.get("subject").and_then(|v| v.as_str()) == Some("bd-hign e2e"))
+        .expect("sent message in inbox");
+    let msg_id = msg
+        .get("id")
+        .and_then(|v| v.as_str())
+        .expect("id")
+        .to_string();
+    assert!(!msg_id.is_empty(), "message id must be non-empty");
+
+    // 4. ack the message (RecvOne acks)
+    let out = run_with_data_dir(
+        &[
+            "mail",
+            "ack",
+            "--project",
+            project,
+            "--as",
+            "RecvOne",
+            "--id",
+            &msg_id,
+            "--json",
+        ],
+        &data_dir,
+    );
+    assert!(
+        out.status.success(),
+        "ack must succeed, stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // 5. receipt get must now show acked (owed -> acked transition)
+    let out = run_with_data_dir(&["receipt", "get", "--corr", &corr, "--json"], &data_dir);
+    assert!(
+        out.status.success(),
+        "receipt get after ack must succeed, stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let r: serde_json::Value = serde_json::from_slice(&out.stdout).expect("receipt get after ack");
+    assert_eq!(
+        r.get("state").and_then(|v| v.as_str()),
+        Some("acked"),
+        "after ack, receipt state must be acked, got: {r}"
+    );
+
+    // ack idempotency: ack again stays acked
+    let out = run_with_data_dir(
+        &[
+            "mail",
+            "ack",
+            "--project",
+            project,
+            "--as",
+            "RecvOne",
+            "--id",
+            &msg_id,
+            "--json",
+        ],
+        &data_dir,
+    );
+    assert!(out.status.success(), "second ack idempotent");
+    let out = run_with_data_dir(&["receipt", "get", "--corr", &corr, "--json"], &data_dir);
+    let r: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("receipt after second ack");
+    assert_eq!(
+        r.get("state").and_then(|v| v.as_str()),
+        Some("acked"),
+        "second ack must stay acked (idempotent), got: {r}"
+    );
+
+    // 6. receipt set to resulted (explicit verb)
+    let out = run_with_data_dir(
+        &[
+            "receipt",
+            "set",
+            "--corr",
+            &corr,
+            "--state",
+            "resulted",
+            "--result-path",
+            "/tmp/bd-hign-result.json",
+            "--json",
+        ],
+        &data_dir,
+    );
+    assert!(
+        out.status.success(),
+        "receipt set --state resulted must succeed, stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let r: serde_json::Value = serde_json::from_slice(&out.stdout).expect("receipt set JSON");
+    assert_eq!(
+        r.get("state").and_then(|v| v.as_str()),
+        Some("resulted"),
+        "after set, state must be resulted, got: {r}"
+    );
+    assert_eq!(
+        r.get("result_path").and_then(|v| v.as_str()),
+        Some("/tmp/bd-hign-result.json"),
+        "result_path must be persisted, got: {r}"
+    );
+
+    // 7. receipt get must show resulted
+    let out = run_with_data_dir(&["receipt", "get", "--corr", &corr, "--json"], &data_dir);
+    let r: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("receipt get after resulted");
+    assert_eq!(
+        r.get("state").and_then(|v| v.as_str()),
+        Some("resulted"),
+        "final receipt state must be resulted, got: {r}"
+    );
+
+    // 8. resulted never downgrades: ack after resulted must stay resulted
+    let out = run_with_data_dir(
+        &[
+            "mail",
+            "ack",
+            "--project",
+            project,
+            "--as",
+            "RecvOne",
+            "--id",
+            &msg_id,
+            "--json",
+        ],
+        &data_dir,
+    );
+    assert!(
+        out.status.success(),
+        "ack after resulted should still succeed"
+    );
+    let out = run_with_data_dir(&["receipt", "get", "--corr", &corr, "--json"], &data_dir);
+    let r: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("receipt after downgrade attempt");
+    assert_eq!(
+        r.get("state").and_then(|v| v.as_str()),
+        Some("resulted"),
+        "resulted must never downgrade to acked, got: {r}"
+    );
+
+    // 9. wait --corr must return immediately when receipt exists (E9 unchanged)
+    let out = run_with_data_dir(
+        &["wait", "--corr", &corr, "--project", project, "--json"],
+        &data_dir,
+    );
+    assert!(
+        out.status.success(),
+        "wait --corr for existing receipt must return immediately, stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let w: serde_json::Value = serde_json::from_slice(&out.stdout).expect("wait JSON");
+    assert_eq!(
+        w.get("corr").and_then(|v| v.as_str()),
+        Some(corr.as_str()),
+        "wait output corr echo, got: {w}"
+    );
+
+    let _ = std::fs::remove_dir_all(&data_dir);
 }

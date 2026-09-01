@@ -871,9 +871,26 @@ impl Mailbox {
         };
         let sender_npub = original.sender;
 
+        // ADR-0027 E2.3: corr of the original rumor (typed tag) — used to
+        // transition the durable receipt owed -> acked. Extract once.
+        let corr_opt = original.rumor.tags.iter().find_map(|t| {
+            let s = t.as_slice();
+            if s.first().map(|x| x.as_str()) == Some("corr") && s.len() > 1 {
+                Some(s[1].clone())
+            } else {
+                None
+            }
+        });
+
         // Idempotency: already acked/read → return stored receipt.
         let id = EventId::from_hex(message_id).unwrap_or_else(|_| original.rumor.clone().id());
         if let Some(ts) = self.receipt_time(project_slug, agent_name, &id, kind) {
+            // Even on duplicate, heal a lagging durable receipt (best-effort).
+            if let Some(corr) = corr_opt.clone()
+                && let Ok(store) = self.receipt_store()
+            {
+                let _ = store.transition_acked(&corr).await;
+            }
             return Ok(ReceiptResult {
                 message_id: message_id.to_string(),
                 acknowledged,
@@ -900,6 +917,13 @@ impl Mailbox {
         self.publish_dm(&wrap).await?;
         self.record_receipt(project_slug, agent_name, &id, kind, ts_us);
         self.record_read_state(project_slug, npub, &id, ts_us).await;
+        // ADR-0027 E2.3: durable receipt owed -> acked (best-effort).
+        if let Some(corr) = corr_opt
+            && let Ok(store) = self.receipt_store()
+            && let Err(e) = store.transition_acked(&corr).await
+        {
+            eprintln!("toron: receipt transition to acked failed for corr {corr}: {e}");
+        }
         Ok(ReceiptResult {
             message_id: message_id.to_string(),
             acknowledged,
