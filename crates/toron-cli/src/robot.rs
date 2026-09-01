@@ -1252,8 +1252,37 @@ async fn daemon_guard_roster(
     let Some(events) = events else {
         return Ok(out);
     };
+    // Collect d-tags that have been revoked/released — the original lease
+    // event must be treated as dead even though we skip the revocation
+    // event itself below (fresh-eyes fix for TopazDune plane.rs phantom:
+    // force_release succeeded but guard still blocked on the lease).
+    let mut revoked_d: std::collections::HashSet<String> = std::collections::HashSet::new();
     for ev in events {
-        // Skip intent/released/revoked (server lease_status semantics).
+        let content = ev.get("content").and_then(|v| v.as_str()).unwrap_or("");
+        let is_revoked = content.contains("status:revoked")
+            || content.contains("\"status\":\"revoked\"")
+            || content.contains("status:released")
+            || content.contains("\"status\":\"released\"");
+        if is_revoked {
+            let d = ev
+                .get("tags")
+                .and_then(|v| v.as_array())
+                .and_then(|tags| {
+                    tags.iter().find_map(|t| {
+                        let a = t.as_array()?;
+                        (a.first().and_then(|s| s.as_str()) == Some("d"))
+                            .then(|| a.get(1).and_then(|s| s.as_str()).map(|s| s.to_string()))
+                            .flatten()
+                    })
+                })
+                .and_then(|d| d.split_once(':').map(|(_, p)| p.to_string()).or(Some(d)))
+                .unwrap_or_default();
+            if !d.is_empty() {
+                revoked_d.insert(d);
+            }
+        }
+    }
+    for ev in events {
         let content = ev.get("content").and_then(|v| v.as_str()).unwrap_or("");
         if content.contains("intent")
             || content.contains("status:released")
@@ -1293,6 +1322,9 @@ async fn daemon_guard_roster(
             })
             .and_then(|d| d.split_once(':').map(|(_, p)| p.to_string()).or(Some(d)))
             .unwrap_or_default();
+        if revoked_d.contains(&path) {
+            continue;
+        }
         let exclusive =
             content.contains("\"exclusive\":true") || !content.contains("\"exclusive\":false");
         let npub = ev.get("pubkey").and_then(|v| v.as_str()).unwrap_or("");

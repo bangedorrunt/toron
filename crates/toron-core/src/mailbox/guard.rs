@@ -100,7 +100,11 @@ pub fn guard_blocked_paths_resolved(
 
 /// Shared-safe bookkeeping paths: tracker files every lane must touch to
 /// claim/close beads — never require a reservation of their own.
-pub const SHARED_SAFE_PATHS: &[&str] = &[".beads/issues.jsonl", ".beads/beads.base.jsonl"];
+pub const SHARED_SAFE_PATHS: &[&str] = &[
+    ".beads/issues.jsonl",
+    ".beads/beads.base.jsonl",
+    ".beads/gates.jsonl",
+];
 
 /// Why a staged path fails the strict guard (bd-2dox).
 #[derive(Debug, Clone, PartialEq, Eq)]
