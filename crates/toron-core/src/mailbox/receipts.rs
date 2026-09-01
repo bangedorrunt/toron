@@ -6,9 +6,10 @@
 //! Table `receipts(corr TEXT PRIMARY KEY, state TEXT NOT NULL, wake TEXT,
 //! due_at INTEGER, result_path TEXT, updated_at INTEGER NOT NULL)` via
 //! mailbox migrations next to `message_reads` / `inbox_cursors`.
-//! The sqlite table is the durable truth; `receipt_cache` HashMap and
-//! `WorkspaceModel.assignment` are process caches only (rebuilt from table on
-//! startup, not folded from journal). Chat journal is NOT the cursor.
+//! The sqlite table is the durable truth; NIP-17 wrap idempotency is
+//! `Mailbox.wrap_idempotency` (not SLA). `WorkspaceModel.assignment` is a
+//! process cache rebuilt from this table on startup. Chat journal is NOT
+//! the cursor.
 
 use sqlx::SqlitePool;
 

@@ -522,6 +522,22 @@ mod tests {
                 .any(|t| t.as_slice().first().map(|s| s.as_str()) == Some("wake")),
             "envelope must not have wake"
         );
+        let inbox = mailbox
+            .fetch_inbox(&crate::mailbox::FetchInbox {
+                project_slug: "demo".into(),
+                agent_name: "RecvOne".into(),
+                include_bodies: true,
+                ..Default::default()
+            })
+            .await
+            .expect("inbox");
+        assert_eq!(
+            inbox[0].corr.as_deref(),
+            Some("FM-GS-012"),
+            "fetch_inbox must project rumor corr onto the row"
+        );
+        assert_eq!(inbox[0].wake.as_deref(), Some("tasked"));
+        assert_eq!(inbox[0].audience.as_deref(), Some("agents"));
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_dir_all(&data_dir);
     }

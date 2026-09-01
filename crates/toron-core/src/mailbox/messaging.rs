@@ -147,6 +147,14 @@ pub struct InboxMessage {
     /// original's id). Wake-side staleness is flywheel's concern (S8); toron
     /// only stops double-delivering.
     pub duplicate_of: Option<String>,
+    /// ADR-0027 E2: assignment tags projected from the rumor (never 1059).
+    pub corr: Option<String>,
+    pub wake: Option<String>,
+    pub priority: Option<String>,
+    pub audience: Option<String>,
+    pub result_path: Option<String>,
+    /// HumanDecision live producer: `verdict=` extra_tag on the rumor.
+    pub verdict: Option<String>,
 }
 
 /// S5 collapse window: identical (sender, subject, body-hash) messages
@@ -809,7 +817,7 @@ impl Mailbox {
                 .unwrap()
             });
             // SLA truth is sqlite (message_reads / receipts store), never the
-            // process-local receipt_cache HashMap.
+            // process-local wrap_idempotency HashMap.
             let has_ack: i64 =
                 sqlx::query_scalar("SELECT COUNT(*) FROM message_reads WHERE message_id = ?1")
                     .bind(&post_id)
@@ -1244,14 +1252,14 @@ impl Mailbox {
 
     /// Per-message NIP-17 wrap idempotency cache (not assignment SLA).
     fn receipt_time(&self, project: &str, agent: &str, id: &EventId, kind: &str) -> Option<i64> {
-        self.receipts()
+        self.wrap_times()
             .lock()
             .get(&receipt_key(project, agent, id, kind))
             .copied()
     }
 
     fn record_receipt(&self, project: &str, agent: &str, id: &EventId, kind: &str, ts_us: i64) {
-        self.receipts()
+        self.wrap_times()
             .lock()
             .insert(receipt_key(project, agent, id, kind), ts_us);
     }
@@ -1288,8 +1296,8 @@ impl Mailbox {
         }
     }
 
-    fn receipts(&self) -> &parking_lot::Mutex<HashMap<String, i64>> {
-        &self.receipt_cache
+    fn wrap_times(&self) -> &parking_lot::Mutex<HashMap<String, i64>> {
+        &self.wrap_idempotency
     }
 }
 
@@ -1451,6 +1459,12 @@ fn inbox_from(mail: UnwrappedMail) -> InboxMessage {
         created_ts_us: mail.ts_us(),
         read_ts_us: None, // filled by fetch_inbox from the message_reads projection
         duplicate_of: None,
+        corr: tag_value(tags, "corr").map(|s| s.to_string()),
+        wake: tag_value(tags, "wake").map(|s| s.to_string()),
+        priority: tag_value(tags, "priority").map(|s| s.to_string()),
+        audience: tag_value(tags, "audience").map(|s| s.to_string()),
+        result_path: tag_value(tags, "result_path").map(|s| s.to_string()),
+        verdict: tag_value(tags, "verdict").map(|s| s.to_string()),
     }
 }
 
@@ -1655,6 +1669,12 @@ mod tests {
             created_ts_us: ts,
             read_ts_us: None,
             duplicate_of: None,
+            corr: None,
+            wake: None,
+            priority: None,
+            audience: None,
+            result_path: None,
+            verdict: None,
         };
 
         // Two identical assigns (same sender+subject+body) 10s apart → one

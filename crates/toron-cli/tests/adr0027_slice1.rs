@@ -19,7 +19,7 @@
 //!   via `ReceiptStore` upsert/get/list (idempotent), `toron receipt get`
 //!   / `receipt list [--state]`
 //! - S1: send tasked mail corr=FM-GS-012, new process still sees owed/acked
-//!   (receipts table, not receipt_cache HashMap)
+//!   (receipts table, not wrap_idempotency HashMap)
 //!
 //! Verify: `cargo test -p toron-cli adr0027_s1` or `cargo test --manifest-path crates/toron-cli/Cargo.toml adr0027_s1`
 

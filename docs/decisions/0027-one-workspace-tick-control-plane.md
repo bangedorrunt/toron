@@ -55,7 +55,7 @@ Doorbell already is in-process wake. Kind 30013 already is the agent profile. We
 
 **Decision (chosen):** one `WorkspaceModel`, one `Msg` union, `tick(model, msg) -> (model, Vec<Cmd>)` where `Cmd` is data. Assignment is tags + sqlite **inside the Model**. Role binding is 30013 + whois, not a second profile. Human decision is a Msg, not a widget. Presence 20001 is inject truth. Live watch is a Cmd subscription that yields Msgs. Skills/playbooks are beads + `VerifySink`. Waiter is a Cmd, not a pane assumption.
 
-Tick Law **is held on the live path** at current `main` (doorbell + `swarm_loop` → `workspace::tick` only). Historical note at grounding HEAD `bde4daae`: two Models, two ticks, two Action enums, no `Cmd` type; live loop only constructed `LoopMsg::Tick`. That is no longer the live entry. Slice reducers remain private composition. Residual costumes (Cmd holes, dual heal maps) are named leftovers, not a second live reducer.
+Tick Law **is held on the live path** at current `main` (doorbell + `swarm_loop` → `workspace::tick` only). Historical note at grounding HEAD `bde4daae`: two Models, two ticks, two Action enums, no `Cmd` type; live loop only constructed `LoopMsg::Tick`. That is no longer the live entry. Slice reducers remain private composition. Heal lives on `LoopModel.heal_states` (ActiveLoop persist). Cmd apply is exhaustive at the doorbell handler; swarm I/O still via `to_loop_action`.
 
 ```mermaid
 flowchart TB
