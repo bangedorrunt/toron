@@ -1440,7 +1440,7 @@ async fn wait_for_corr(mailbox: &Mailbox, args: &WaitArgs) -> anyhow::Result<()>
         toron_kind(43001),
         toron_kind(43004),
     ]);
-    let mut sub = mailbox.bus().subscribe(filter).await?;
+    let mut sub = mailbox.bus().subscribe_trusted(filter).await?;
     loop {
         if let Some(d) = deadline
             && Instant::now() >= d
@@ -1529,7 +1529,7 @@ async fn watch_live(mailbox: &Mailbox, args: &WatchArgs) -> anyhow::Result<()> {
         print_watch_event(&ev);
     }
     // Live tail — shares one subscription with `wait --corr` (same bus source).
-    let mut sub = mailbox.bus().subscribe(filter).await?;
+    let mut sub = mailbox.bus().subscribe_trusted(filter).await?;
     while let Some(ev) = sub.next().await {
         if let SubscriptionEvent::Event(event) = ev {
             if !seen.insert(event.id.to_hex()) {
