@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- `fetch_inbox` projects rumor assignment tags (`corr`/`wake`/`priority`/`audience`/`result_path`/`verdict`) onto the row. Envelope 1059 still carries none.
+- NIP-17 wrap cache renamed `wrap_idempotency` (not SLA). Receipts sqlite remains durable truth.
+
 ### Docs
 - ADR-0027 Tick Law sentence: live path is held (grounding leftover table stays historical).
 

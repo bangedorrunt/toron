@@ -351,12 +351,19 @@ fn inbox_json(m: &toron_core::mailbox::InboxMessage) -> serde_json::Value {
         "sender": m.sender,
         "subject": m.subject,
         "body_md": m.body_md,
+        "body": m.body_md,
         "importance": m.importance,
         "ack_required": m.ack_required,
         "thread_id": m.thread_id,
         "created_ts_us": m.created_ts_us,
         "read_ts_us": m.read_ts_us,
         "duplicate_of": m.duplicate_of,
+        "corr": m.corr,
+        "wake": m.wake,
+        "priority": m.priority,
+        "audience": m.audience,
+        "result_path": m.result_path,
+        "verdict": m.verdict,
     })
 }
 

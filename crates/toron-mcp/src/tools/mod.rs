@@ -236,6 +236,7 @@ impl ToJson for InboxMessage {
             "sender": self.sender,
             "subject": self.subject,
             "body_md": self.body_md,
+            "body": self.body_md,
             "importance": self.importance,
             "ack_required": self.ack_required,
             "thread_id": self.thread_id,
@@ -243,6 +244,12 @@ impl ToJson for InboxMessage {
             "read_ts_us": self.read_ts_us,
             // S5 (bd-dup-assign-collapse-ws21): duplicate-group first id.
             "duplicate_of": self.duplicate_of,
+            "corr": self.corr,
+            "wake": self.wake,
+            "priority": self.priority,
+            "audience": self.audience,
+            "result_path": self.result_path,
+            "verdict": self.verdict,
         })
     }
 }
@@ -368,10 +375,17 @@ impl ToJson for (String, InboxMessage) {
             "sender": self.1.sender,
             "subject": self.1.subject,
             "body_md": self.1.body_md,
+            "body": self.1.body_md,
             "importance": self.1.importance,
             "ack_required": self.1.ack_required,
             "thread_id": self.1.thread_id,
             "created_ts_us": self.1.created_ts_us,
+            "corr": self.1.corr,
+            "wake": self.1.wake,
+            "priority": self.1.priority,
+            "audience": self.1.audience,
+            "result_path": self.1.result_path,
+            "verdict": self.1.verdict,
         })
     }
 }
