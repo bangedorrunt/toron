@@ -48,3 +48,4 @@
 {"id":48,"issue_id":"bd-rkom","from_status":"in_progress","to_status":"closed","status_revision":645,"gate":"unit-test-verified","provider":"TopazDune","passed":true,"recorded_by":"bangedorrunt","recorded_at":"2026-08-31 22:29:50"}
 {"id":49,"issue_id":"bd-nl9q","from_status":"open","to_status":"closed","status_revision":0,"gate":"unit-test-verified","provider":"TealDune","passed":true,"recorded_by":"bangedorrunt","recorded_at":"2026-08-31 22:54:59"}
 {"id":50,"issue_id":"bd-hign","from_status":"in_progress","to_status":"closed","status_revision":665,"gate":"unit-test-verified","provider":"VioletDune","passed":true,"recorded_by":"bangedorrunt","recorded_at":"2026-09-01 05:21:09"}
+{"id":51,"issue_id":"bd-3wzl","from_status":"in_progress","to_status":"closed","status_revision":667,"gate":"unit-test-verified","provider":"cargo","passed":true,"recorded_by":"bangedorrunt","recorded_at":"2026-09-01 05:22:54"}
