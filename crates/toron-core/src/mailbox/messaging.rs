@@ -281,6 +281,16 @@ impl Mailbox {
                     };
                     if let Err(e) = store.upsert(&receipt).await {
                         eprintln!("toron: receipts store unavailable (receipt not recorded): {e}");
+                    } else {
+                        // Opportunistic bounded retention: keep at most 1000
+                        // newest receipts and expire >30d old rows. Best-effort
+                        // background prune — never blocks the send.
+                        let pool = store.pool().clone();
+                        tokio::spawn(async move {
+                            let s = crate::mailbox::receipts::ReceiptStore::new(pool);
+                            let _ = s.prune_expired(30 * 24 * 60 * 60 * 1000).await;
+                            let _ = s.prune_to_cap(1000).await;
+                        });
                     }
                 }
                 Err(e) => {

@@ -249,6 +249,30 @@ impl ReceiptStore {
             Ok(r)
         }
     }
+    /// Prune receipts older than `retention_ms` (wall-clock). Keeps the table
+    /// bounded — callers should invoke periodically (e.g. on mailbox open
+    /// and daily). Best-effort: never errors on empty store.
+    pub async fn prune_expired(&self, retention_ms: i64) -> anyhow::Result<u64> {
+        let cutoff = chrono::Utc::now().timestamp_millis() - retention_ms;
+        let res = sqlx::query("DELETE FROM receipts WHERE updated_at < ?1")
+            .bind(cutoff)
+            .execute(&self.pool)
+            .await?;
+        Ok(res.rows_affected())
+    }
+
+    /// Keep at most `keep` newest receipts (by updated_at). Deletes oldest
+    /// beyond the cap — second bound for high-volume projects.
+    pub async fn prune_to_cap(&self, keep: i64) -> anyhow::Result<u64> {
+        let res = sqlx::query(
+            "DELETE FROM receipts WHERE corr NOT IN \
+             (SELECT corr FROM receipts ORDER BY updated_at DESC LIMIT ?1)",
+        )
+        .bind(keep)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected())
+    }
 }
 
 impl crate::mailbox::Mailbox {
