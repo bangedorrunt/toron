@@ -114,7 +114,7 @@ impl Workflow {
     /// present it is returned as-is; otherwise each step becomes a node named
     /// by its explicit `name` or `step_N` (1-indexed) with `needs: [previous]`
     /// to preserve linear order. Only fields `GraphNode` carries are copied
-    /// (`action`, `needs`, `guard`, `on_error`, `build_slot`); unnamed steps
+    /// (`action`, `needs`, `guard`, `on_error`, `error_kinds`, `build_slot`); unnamed steps
     /// grow the output map under `step_N` (documented compat gate).
     pub fn to_graph(&self) -> Graph {
         if let Some(g) = &self.graph {
@@ -136,6 +136,7 @@ impl Workflow {
                 needs,
                 guard: step.guard.clone(),
                 on_error: step.on_error,
+                error_kinds: step.error_kinds.clone(),
                 build_slot: step.build_slot,
             };
             nodes.insert(name.clone(), node);
@@ -183,6 +184,10 @@ pub struct GraphNode {
     /// Failure policy for this node (ADR-0005 Spec 0).
     #[serde(default, skip_serializing_if = "StepOnError::is_continue")]
     pub on_error: StepOnError,
+    /// ADR-0024 Spec 1 R-E2: which failure kinds this fail_run classifies
+    /// (`rate_limit`/`timeout` retry vs `blocked`/`auth`/`cancelled`/`unknown` escalate).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub error_kinds: Vec<String>,
     /// Static build-slot serialization marker (ADR-0019). Mirrors
     /// [`Step::build_slot`]; required for prototype/arena compile-mode lint
     /// when workflows are authored as linear steps and desugared to a graph.
@@ -334,6 +339,10 @@ pub struct Step {
     /// deterministic failed outcome.
     #[serde(default, skip_serializing_if = "StepOnError::is_continue")]
     pub on_error: StepOnError,
+    /// ADR-0024 Spec 1 R-E2: which failure kinds this fail_run classifies
+    /// (`rate_limit`/`timeout` retry vs `blocked`/`auth`/`cancelled`/`unknown` escalate).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub error_kinds: Vec<String>,
     /// Static build-slot serialization declaration (ADR-0019 wave 2,
     /// prototype/arena compile-mode arms). `true` → this step serializes on
     /// the build slot (kind-30032 lease) like every other compiling work; the

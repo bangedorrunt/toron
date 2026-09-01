@@ -774,9 +774,8 @@ impl Mailbox {
 
     /// Scan `messages` for overdue `ack_required` + `high|urgent` posts and
     /// emit one `ack-sla-expired` wake per overdue post whose SLA has lapsed
-    /// and whose receipt is still missing. Reuses the existing `messages`
-    /// table (ack_required/importance/created_ts_us) + `receipts` idempotency
-    /// map — no second tracker (bd-i1o3 constraint).
+    /// and whose receipt is still missing. SLA consults `message_reads` +
+    /// `receipts` sqlite — never the process HashMap.
     pub async fn check_ack_sla_expired(
         &self,
         project_slug: &str,
@@ -809,17 +808,27 @@ impl Mailbox {
                 )
                 .unwrap()
             });
-            // If ANY recipient still lacks an ack receipt, the SLA is expired
-            // for that post. Check receipts map for at least one missing ack.
-            // A full audience scan would need agent list; heuristic: if the
-            // receipts map has no entry for this post+any agent, emit once.
-            let has_ack = self
-                .receipts()
-                .lock()
-                .keys()
-                .any(|k| k.contains(&post_id) && k.contains("ack"));
-            if has_ack {
+            // SLA truth is sqlite (message_reads / receipts store), never the
+            // process-local receipt_cache HashMap.
+            let has_ack: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM message_reads WHERE message_id = ?1")
+                    .bind(&post_id)
+                    .fetch_one(pool)
+                    .await
+                    .unwrap_or(0);
+            if has_ack > 0 {
                 continue;
+            }
+            if let Ok(store) = self.receipt_store() {
+                if let Ok(Some(r)) = store.get(&post_id).await {
+                    if matches!(
+                        r.state,
+                        crate::mailbox::receipts::ReceiptState::Acked
+                            | crate::mailbox::receipts::ReceiptState::Resulted
+                    ) {
+                        continue;
+                    }
+                }
             }
             let audience: Vec<String> = serde_json::from_str(&to_list_json).unwrap_or_default();
             let tid = thread_id.as_deref();
@@ -1233,7 +1242,7 @@ impl Mailbox {
         self.agent_keys_for(&canonical, &resolved)
     }
 
-    /// Per-message receipt timestamp cache (idempotency, in-memory).
+    /// Per-message NIP-17 wrap idempotency cache (not assignment SLA).
     fn receipt_time(&self, project: &str, agent: &str, id: &EventId, kind: &str) -> Option<i64> {
         self.receipts()
             .lock()

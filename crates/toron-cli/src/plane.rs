@@ -1464,20 +1464,26 @@ async fn wait_for_corr(mailbox: &Mailbox, args: &WaitArgs) -> anyhow::Result<()>
             println!("{}", serde_json::to_string(&v)?);
             return Ok(());
         }
-        // Wait for next bus event or deadline
-        let sleep = tokio::time::sleep(Duration::from_millis(200));
-        tokio::pin!(sleep);
-        tokio::select! {
-            _ = &mut sleep => {
-                // No bus event, re-check store (covers direct DB writes without bus)
-                continue;
-            }
-            ev = sub.next() => {
-                if ev.is_none() {
-                    // Subscription closed — re-check store and continue
-                    continue;
+        // Unpark on bus event or deadline only — no 200ms costume poll.
+        if let Some(d) = deadline {
+            let remain = d.saturating_duration_since(Instant::now());
+            tokio::select! {
+                _ = tokio::time::sleep(remain) => {
+                    anyhow::bail!(
+                        "wait --corr {} for project {canonical} timed out after {}s",
+                        args.corr,
+                        timeout
+                    );
                 }
-                // Got a bus event, loop will re-check store
+                ev = sub.next() => {
+                    if ev.is_none() {
+                        continue;
+                    }
+                }
+            }
+        } else {
+            let ev = sub.next().await;
+            if ev.is_none() {
                 continue;
             }
         }
