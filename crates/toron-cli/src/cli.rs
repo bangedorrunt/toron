@@ -1413,9 +1413,10 @@ pub struct WatchArgs {
     /// Watcher identity (required only when watching kind 1059).
     #[arg(long = "as")]
     pub as_name: Option<String>,
-    /// Comma-separated kind allowlist (default 9,7,39002,43001,20001 — 39002
-    /// join/leave wakes the dispatcher on crew-composition changes, ADR-0023).
-    #[arg(long, default_value = "9,7,39002,43001,20001")]
+    /// Comma-separated kind allowlist (default 9,7,39002,43001,20001,30013 —
+    /// 39002 join/leave wakes the dispatcher on crew-composition changes,
+    /// ADR-0023; 30013 role= bind, ADR-0027 E4).
+    #[arg(long, default_value = "9,7,39002,43001,20001,30013")]
     pub kinds: String,
     /// Channel id (`h` tag filter).
     #[arg(long)]

@@ -140,6 +140,7 @@ async fn sc2_direct_mail_thread_and_ack() {
             include_bodies: true,
             urgent_only: false,
             since_ts: None,
+            thread_id: None,
         })
         .await
         .expect("fetch_inbox");

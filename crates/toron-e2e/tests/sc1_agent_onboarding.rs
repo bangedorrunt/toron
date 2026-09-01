@@ -115,6 +115,7 @@ async fn sc1_agent_onboarding() {
             include_bodies: true,
             urgent_only: false,
             since_ts: None,
+            thread_id: None,
         })
         .await
         .expect("fetch inbox");

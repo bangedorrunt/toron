@@ -79,27 +79,43 @@ impl PresenceBroker {
                 Ok(s) => s,
                 Err(_) => return,
             };
-            // Drain replay/EOSE then live events.
+            let mut gc = tokio::time::interval(ttl);
+            gc.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // Drain replay/EOSE then live events. GC so the HashMap cannot
+            // grow with every pubkey that ever heartbeated.
             loop {
-                match sub.next().await {
-                    Some(crate::bus::SubscriptionEvent::Event(ev)) => {
-                        if let Some(payload) = parse_presence(&ev) {
-                            let presence = Presence {
-                                pubkey: ev.pubkey,
-                                state: payload.state,
-                                status: payload.status,
-                                ts: payload.ts,
-                            };
-                            // Last heartbeat wins — keyed by pubkey so a newer
-                            // heartbeat for the same agent replaces the old.
-                            state_for_task
-                                .write()
-                                .insert(ev.pubkey.to_hex(), presence.clone());
-                            let _ = live_for_task.send(presence);
+                tokio::select! {
+                    ev = sub.next() => {
+                        match ev {
+                            Some(crate::bus::SubscriptionEvent::Event(ev)) => {
+                                if let Some(payload) = parse_presence(&ev) {
+                                    let presence = Presence {
+                                        pubkey: ev.pubkey,
+                                        state: payload.state,
+                                        status: payload.status,
+                                        ts: payload.ts,
+                                    };
+                                    // Last heartbeat wins — keyed by pubkey so a newer
+                                    // heartbeat for the same agent replaces the old.
+                                    state_for_task
+                                        .write()
+                                        .insert(ev.pubkey.to_hex(), presence.clone());
+                                    let _ = live_for_task.send(presence);
+                                }
+                            }
+                            Some(crate::bus::SubscriptionEvent::Eose) | Some(_) => {}
+                            None => break,
                         }
                     }
-                    Some(crate::bus::SubscriptionEvent::Eose) | Some(_) => {}
-                    None => break,
+                    _ = gc.tick() => {
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        state_for_task
+                            .write()
+                            .retain(|_, p| !p.is_stale(now, ttl));
+                    }
                 }
             }
         });
@@ -178,6 +194,17 @@ mod tests {
             ts,
         };
         build_presence_event(keys, &payload, Timestamp::from(ts)).expect("build")
+    }
+
+    #[test]
+    fn broker_start_gcs_stale_on_live_path() {
+        let src = include_str!("presence.rs");
+        let start = src.find("pub fn start(").expect("start");
+        let slice = &src[start..src.len().min(start + 3500)];
+        assert!(
+            slice.contains("is_stale") && slice.contains("interval"),
+            "PresenceBroker::start must GC stale heartbeats on a timer, not only from tests"
+        );
     }
 
     #[test]

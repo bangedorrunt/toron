@@ -84,6 +84,8 @@ pub struct Mailbox {
     data_dir: PathBuf,
     operator: Option<Keys>,
     agent_passphrase: Option<String>,
+    /// NIP-17 wrap idempotency only (event-id keys). Not SLA truth —
+    /// assignment receipts live in `receipts` sqlite (ADR-0027 E2).
     receipt_cache: Arc<parking_lot::Mutex<HashMap<String, i64>>>,
     index_pool: Option<sqlx::SqlitePool>,
     /// R2.0 (C2 / F2.KDF): decrypted agent keys cached by file CONTENT, so an

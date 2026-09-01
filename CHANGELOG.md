@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.1] — 2026-09-01 R-E2 kinds + inbox e2e
+
+### Added
+- **`error_kinds` on `Step` / `GraphNode` (ADR-0024 Spec 1 R-E2).** `fail_run` without kinds still warns; a classified list (`rate_limit`, `timeout`, `blocked`, `auth`, `cancelled`, `unknown`) is silent. Unknown names are lint errors.
+
+### Fixed
+- **e2e FetchInbox** initializers pass `thread_id: None` (sc1/sc2 compile on the thread filter field).
+
 ## [1.3.0] — 2026-08-31 Tick Law + doorbell bind (GS-005 → GS-009)
 
 ### Added
