@@ -136,7 +136,7 @@
       "name": "role"
     }
   ],
-  "generated_at": "2026-09-01T17:53:52Z",
+  "generated_at": "2026-09-03T07:12:25Z",
   "resources": [
     {
       "description": "List projects known to toron.",
@@ -1389,8 +1389,21 @@
               "ack_required": {
                 "type": "boolean"
               },
+              "audience": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
               "body_md": {
                 "type": "string"
+              },
+              "corr": {
+                "description": "ADR-0027 E2 assignment tags projected from the rumor (never 1059);\nmirror of `ToJson for InboxMessage` wire fields\n(bd-mcp-inbox-assignment-tags-sdi1). All optional, `null` = untasked.",
+                "type": [
+                  "string",
+                  "null"
+                ]
               },
               "created_ts_us": {
                 "format": "int64",
@@ -1409,11 +1422,23 @@
               "importance": {
                 "type": "string"
               },
+              "priority": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
               "read_ts_us": {
                 "description": "Read receipt timestamp (i64-µs) from the `message_reads` projection;\n`null` = unread (bd-5icg).",
                 "format": "int64",
                 "type": [
                   "integer",
+                  "null"
+                ]
+              },
+              "result_path": {
+                "type": [
+                  "string",
                   "null"
                 ]
               },
@@ -1424,6 +1449,19 @@
                 "type": "string"
               },
               "thread_id": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "verdict": {
+                "description": "HumanDecision live producer: `verdict=` extra_tag on the rumor.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "wake": {
                 "type": [
                   "string",
                   "null"
@@ -3722,8 +3760,21 @@
               "ack_required": {
                 "type": "boolean"
               },
+              "audience": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
               "body_md": {
                 "type": "string"
+              },
+              "corr": {
+                "description": "ADR-0027 E2 assignment tags (bd-mcp-inbox-assignment-tags-sdi1);\nflattened mirror of `InboxMessageOut` tags. Optional, `null` = untasked.",
+                "type": [
+                  "string",
+                  "null"
+                ]
               },
               "created_ts_us": {
                 "format": "int64",
@@ -3735,8 +3786,20 @@
               "importance": {
                 "type": "string"
               },
+              "priority": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
               "project": {
                 "type": "string"
+              },
+              "result_path": {
+                "type": [
+                  "string",
+                  "null"
+                ]
               },
               "sender": {
                 "type": "string"
@@ -3745,6 +3808,18 @@
                 "type": "string"
               },
               "thread_id": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "verdict": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "wake": {
                 "type": [
                   "string",
                   "null"
