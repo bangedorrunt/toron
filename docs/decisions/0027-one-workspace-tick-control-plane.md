@@ -676,6 +676,7 @@ Whois aliases for persistent roles. Binding `role → live pin` (30013 tags, or 
 16. One-way dep: toron never imports flywheel.
 17. Factory ships do not merge on red CI or without the captain's word.
 18. Tick Law leftovers named in §3.6 are not "documented therefore done."
+19. Two live tick owners, one tick function (bd-55nx.3 cut A): the doorbell dispatcher owns the assignment cache (seeded once via rebuild_assignment_from_receipts); swarm_loop holds no assignment in RAM — receipts sqlite is the shared truth. WaitCorr/HumanDecision stay doorbell-only.
 
 ---
 
