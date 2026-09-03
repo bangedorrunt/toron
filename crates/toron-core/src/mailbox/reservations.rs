@@ -115,6 +115,55 @@ pub enum ReservationStatus {
     Revoked,
 }
 
+/// bd-adr-0028-implementation-zfnx.11 — claim fencing epochs.
+///
+/// One monotonic integer per reservation coordinate decides ownership, so a
+/// split-brain reclaim (stale-pane false negative: force-release fires while
+/// the old holder is actually alive) yields exactly one loud loser instead
+/// of two agents double-running VERIFY. The epoch rides the existing 30031
+/// plumbing: it is a content key on lease + marker events (no new store, no
+/// new kind, no MCP/CLI surface change).
+///
+/// Rules: a fresh coordinate claims genesis `0`; EVERY new lease event at a
+/// coordinate writes `max_epoch_at + 1` (claims AND reclaims bump — never a
+/// silent reset); renewals republish the SAME epoch (a renew is not a
+/// claim); every terminal marker stamps the epoch it terminalizes. Legacy
+/// epoch-less events read as `0`.
+pub fn lease_epoch(content: &str) -> u64 {
+    serde_json::from_str::<serde_json::Value>(content)
+        .ok()
+        .and_then(|v| v.get("epoch").and_then(|e| e.as_u64()))
+        .unwrap_or(0)
+}
+
+/// Lease content with a fencing epoch (acquire / transfer re-acquire).
+fn lease_content(exclusive: bool, reason: &str, epoch: u64) -> String {
+    format!(
+        r#"{{"exclusive":{},"reason":{},"epoch":{}}}"#,
+        exclusive,
+        serde_json::to_string(reason).unwrap_or_else(|_| "\"\"".into()),
+        epoch
+    )
+}
+
+/// Terminal-marker content with the stamped epoch it terminalizes
+/// (release / force-release / reap markers).
+fn marker_content(status: &str, heuristic: Option<&str>, epoch: u64) -> String {
+    match heuristic {
+        Some(h) => format!(
+            r#"{{"status":{},"heuristic":{},"epoch":{}}}"#,
+            serde_json::to_string(status).unwrap_or_else(|_| "\"\"".into()),
+            serde_json::to_string(h).unwrap_or_else(|_| "\"\"".into()),
+            epoch
+        ),
+        None => format!(
+            r#"{{"status":{},"epoch":{}}}"#,
+            serde_json::to_string(status).unwrap_or_else(|_| "\"\"".into()),
+            epoch
+        ),
+    }
+}
+
 /// The typed ask in a request-release message (ADR-0011 Spec 6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ReleaseAsk {
@@ -252,6 +301,11 @@ pub struct Reservation {
     /// 30031 status state (ADR-0011 Spec 2). `active_reservations` returns
     /// only `Held`; intents live in [`Mailbox::active_intents`].
     pub status: ReservationStatus,
+    /// Fencing epoch (bd-adr-0028-implementation-zfnx.11): monotonic per
+    /// coordinate, parsed from the winning event's content (`0` = legacy /
+    /// genesis). Mutating ops present the epoch they claimed with; a stale
+    /// epoch fails loud via [`Mailbox::check_claim_epoch`].
+    pub epoch: u64,
 }
 
 /// Result of `file_reservation_paths` (parity shape).
@@ -291,6 +345,10 @@ pub struct GrantedReservation {
     pub exclusive: bool,
     pub reason: String,
     pub expires_ts_us: Option<i64>,
+    /// Fencing epoch (bd-adr-0028-implementation-zfnx.11). Internal
+    /// plumbing only — deliberately NOT in the MCP `ToJson` wire shape, so
+    /// the 38-tool catalog stays byte-identical (no regen, count stays 40).
+    pub epoch: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -445,11 +503,12 @@ impl Mailbox {
             if let Some(exp) = ttl.expiration_tag(created) {
                 tags.push(exp);
             }
-            let content = format!(
-                r#"{{"exclusive":{},"reason":{}}}"#,
-                exclusive,
-                serde_json::to_string(reason.unwrap_or("")).expect("reason json")
-            );
+            // bd-adr-0028-implementation-zfnx.11: every new lease bumps the coordinate epoch (fresh
+            // claim, must-convert, or post-release/revoke reclaim — the
+            // previous holder's presented epoch goes stale by construction).
+            let d_epoch = format!("{project_slug}:{path}");
+            let epoch = self.next_epoch_at(project_slug, &d_epoch).await;
+            let content = lease_content(exclusive, reason.unwrap_or(""), epoch);
             let event = build_event(
                 &agent_keys,
                 toron_kind(FILE_RESERVATION),
@@ -482,6 +541,7 @@ impl Mailbox {
                 expires_ts_us: ttl
                     .expiration_at(created)
                     .map(|t| t.as_secs() as i64 * 1_000_000),
+                epoch,
             });
         }
         Ok(result)
@@ -543,6 +603,10 @@ impl Mailbox {
                 expires_ts_us: (EnvelopeTtl { secs: Some(ttl) })
                     .expiration_at(created)
                     .map(|t| t.as_secs() as i64 * 1_000_000),
+                // bd-adr-0028-implementation-zfnx.11: intents are advisory, not ownership — they
+                // neither read nor bump the coordinate epoch. The
+                // must-convert acquire bumps past them.
+                epoch: 0,
             });
         }
         Ok(result)
@@ -694,6 +758,7 @@ impl Mailbox {
                     exclusive: res.exclusive,
                     reason: res.reason.clone(),
                     expires_ts_us: res.expires_ts_us,
+                    epoch: res.epoch,
                 });
                 result.renewed += 1;
                 continue;
@@ -722,7 +787,9 @@ impl Mailbox {
             let event = build_event(
                 &agent_keys,
                 toron_kind(FILE_RESERVATION),
-                format!(r#"{{"exclusive":{}}}"#, res.exclusive),
+                // bd-adr-0028-implementation-zfnx.11: a renew is not a claim — republish the SAME
+                // epoch so the holder's fencing belief survives renewal.
+                lease_content(res.exclusive, &res.reason, res.epoch),
                 tags,
                 created,
             )?;
@@ -748,6 +815,7 @@ impl Mailbox {
                 expires_ts_us: ttl
                     .expiration_at(created)
                     .map(|t| t.as_secs() as i64 * 1_000_000),
+                epoch: res.epoch,
             });
             result.renewed += 1;
         }
@@ -786,7 +854,9 @@ impl Mailbox {
             let event = build_event(
                 &agent_keys,
                 toron_kind(FILE_RESERVATION),
-                r#"{"status":"released"}"#,
+                // bd-adr-0028-implementation-zfnx.11: stamp the terminalized epoch so the next claim
+                // bumps past it (reclaim invalidates the old belief).
+                marker_content("released", None, res.epoch),
                 tags,
                 Timestamp::now(),
             )?;
@@ -889,7 +959,9 @@ impl Mailbox {
         let revoke = build_event(
             operator,
             toron_kind(FILE_RESERVATION),
-            r#"{"status":"revoked","heuristic":"stale-holder"}"#,
+            // bd-adr-0028-implementation-zfnx.11: stamp the revoked lease's epoch — the next claim
+            // bumps past it, the old holder's belief goes stale by construction.
+            marker_content("revoked", Some("stale-holder"), lease.epoch),
             tags,
             Timestamp::now(),
         )?;
@@ -1019,7 +1091,8 @@ impl Mailbox {
                 let revoke = build_event(
                     operator,
                     toron_kind(FILE_RESERVATION),
-                    r#"{"status":"revoked","heuristic":"ghost-pane"}"#,
+                    // bd-adr-0028-implementation-zfnx.11: stamp the terminalized epoch.
+                    marker_content("revoked", Some("ghost-pane"), lease.epoch),
                     tags,
                     Timestamp::now(),
                 )?;
@@ -1097,7 +1170,8 @@ impl Mailbox {
             let revoke = build_event(
                 operator,
                 toron_kind(FILE_RESERVATION),
-                r#"{"status":"revoked","heuristic":"bead-closed"}"#,
+                // bd-adr-0028-implementation-zfnx.11: stamp the terminalized epoch.
+                marker_content("revoked", Some("bead-closed"), lease.epoch),
                 tags,
                 Timestamp::now(),
             )?;
@@ -1246,6 +1320,10 @@ impl Mailbox {
                     expires_ts_us: Some(exp_us),
                     status: ReservationStatus::Held,
                     created_at_secs: 0,
+                    // bd-adr-0028-implementation-zfnx.11: the oracle-resurrected mirror row predates
+                    // epoch tracking (no new store column); fencing treats it
+                    // as genesis — a fenced op must re-read, never assume.
+                    epoch: 0,
                     expired: true,
                     liveness_extended: true,
                 });
@@ -1315,6 +1393,7 @@ impl Mailbox {
                     .map(|t| t.as_secs() as i64 * 1_000_000),
                 status,
                 created_at_secs: winning.created_at.as_secs() as i64,
+                epoch: lease_epoch(&winning.content),
                 expired: false,
                 liveness_extended: false,
             });
@@ -1406,6 +1485,7 @@ impl Mailbox {
                 reason: l.reason,
                 expires_ts_us: l.expires_ts_us,
                 status: ReservationStatus::Held,
+                epoch: l.epoch,
             })
             .collect();
         // Fill agent names from profiles (best-effort).
@@ -1434,6 +1514,102 @@ impl Mailbox {
             }
         }
         Ok(out)
+    }
+
+    /// bd-adr-0028-implementation-zfnx.11 — next fencing epoch for a
+    /// coordinate: `max(epoch)` over EVERY 30031 event at `(kind, d)`
+    /// (leases AND terminal markers, which stamp what they terminalize),
+    /// plus one. A fresh coordinate claims genesis `0`. Never resets:
+    /// reclaim-after-revoke/release always moves forward, so the previous
+    /// holder's presented epoch goes stale by construction.
+    async fn next_epoch_at(&self, project_slug: &str, d: &str) -> u64 {
+        let filter = kind_project_filter(toron_kind(FILE_RESERVATION), project_slug);
+        let events = collect_replay(self.bus.as_ref(), filter)
+            .await
+            .unwrap_or_default();
+        let max = events
+            .iter()
+            .filter(|e| {
+                e.tags.iter().any(|t| {
+                    let s = t.as_slice();
+                    s.first().map(|x| x == "d").unwrap_or(false)
+                        && s.get(1).map(|x| x == d).unwrap_or(false)
+                })
+            })
+            .map(|e| lease_epoch(&e.content))
+            .max();
+        max.map(|m| m.saturating_add(1)).unwrap_or(0)
+    }
+
+    /// bd-adr-0028-implementation-zfnx.11 — fencing check: the caller presents
+    /// the epoch it claimed with; a mismatch fails LOUD with the current
+    /// lease as the re-read pointer (id + holder + current epoch). Success
+    /// returns the current lease. No live lease at the coordinate is also a
+    /// loud failure (released/revoked since — re-read, never assume).
+    pub async fn check_claim_epoch(
+        &self,
+        project_slug: &str,
+        path: &str,
+        presented_epoch: u64,
+    ) -> anyhow::Result<Reservation> {
+        let project_slug = &self.canonical_project(project_slug).await; // ADR-0017
+        let current = self
+            .active_reservations(project_slug)
+            .await?
+            .into_iter()
+            .find(|r| r.path_pattern == path)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "stale claim epoch on {path}: no live lease (released or revoked since) — \
+                     re-read via active_reservations, never assume"
+                )
+            })?;
+        if current.epoch != presented_epoch {
+            anyhow::bail!(
+                "stale claim epoch on {path}: presented {presented_epoch}, current {} \
+                 (lease {} by {}) — re-read via active_reservations, never assume",
+                current.epoch,
+                current.id,
+                current.agent_name,
+            );
+        }
+        Ok(current)
+    }
+
+    /// Fenced release: present the claimed epoch, then release. A stale
+    /// epoch fails loud BEFORE anything is published (the path stays owned
+    /// by whoever the epoch says owns it).
+    pub async fn release_fenced(
+        &self,
+        project_slug: &str,
+        agent_name: &str,
+        paths: &[String],
+        presented_epoch: u64,
+    ) -> anyhow::Result<ReleaseResult> {
+        for path in paths {
+            self.check_claim_epoch(project_slug, path, presented_epoch)
+                .await?;
+        }
+        self.release_file_reservations(project_slug, agent_name, paths)
+            .await
+    }
+
+    /// Fenced renew: present the claimed epoch, then renew. Same fail-loud
+    /// contract as [`Self::release_fenced`].
+    pub async fn renew_fenced(
+        &self,
+        project_slug: &str,
+        agent_name: &str,
+        paths: &[String],
+        extend_secs: u64,
+        presented_epoch: u64,
+    ) -> anyhow::Result<RenewResult> {
+        for path in paths {
+            self.check_claim_epoch(project_slug, path, presented_epoch)
+                .await?;
+        }
+        self.renew_file_reservations(project_slug, agent_name, paths, extend_secs)
+            .await
     }
 
     /// Active (in-TTL, non-expired) intents in a project (ADR-0011 Spec 2):
@@ -1631,7 +1807,8 @@ impl Mailbox {
         let release_event = build_event(
             &from_keys,
             toron_kind(FILE_RESERVATION),
-            r#"{"status":"released"}"#,
+            // bd-adr-0028-implementation-zfnx.11: stamp the terminalized epoch.
+            marker_content("released", None, holder.epoch),
             with_project_scoping(
                 toron_kind(FILE_RESERVATION),
                 vec![
@@ -1649,15 +1826,14 @@ impl Mailbox {
             .await;
 
         // 2. Re-acquire for the target, preserving exclusivity + reason,
-        //    stamped strictly after the release marker.
+        //    stamped strictly after the release marker. bd-adr-0028-implementation-zfnx.11: the
+        //    reclaim bumps past the release marker's stamped epoch, so the
+        //    previous holder's presented epoch goes stale by construction.
+        let acquire_epoch = self.next_epoch_at(project_slug, &d).await;
         let acquire_event = build_event(
             &to_keys,
             toron_kind(FILE_RESERVATION),
-            format!(
-                r#"{{"exclusive":{},"reason":{}}}"#,
-                holder.exclusive,
-                serde_json::to_string(&effective_reason).expect("reason json")
-            ),
+            lease_content(holder.exclusive, &effective_reason, acquire_epoch),
             with_project_scoping(
                 toron_kind(FILE_RESERVATION),
                 vec![
@@ -2211,6 +2387,9 @@ pub(crate) struct ResolvedLease {
     pub expires_ts_us: Option<i64>,
     pub status: ReservationStatus,
     pub created_at_secs: i64,
+    /// Fencing epoch parsed from the winning event's content
+    /// (bd-adr-0028-implementation-zfnx.11; `0` = legacy / genesis).
+    pub epoch: u64,
     /// NIP-40 TTL has passed. Kept (flagged) when a liveness oracle says
     /// the holder's session is still live — the lease keeps blocking.
     pub expired: bool,
@@ -4519,6 +4698,164 @@ mod tests {
             err.to_string().contains("no operator key"),
             "release_by_reason gated on operator: {err}"
         );
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    // --- bd-adr-0028-implementation-zfnx.11: claim fencing epochs ---
+
+    /// Publish a raw legacy (epoch-less) lease for keys with NO profile on
+    /// the bus — the stale-pane false negative: the holder is alive, the bus
+    /// considers it stale, so `force_release` runs end-to-end.
+    async fn publish_raw_stale_lease(mailbox: &Mailbox, holder: &Keys, project: &str, path: &str) {
+        use crate::nostr::event::build_event;
+        let d = format!("{project}:{path}");
+        let tags = with_project_scoping(
+            toron_kind(FILE_RESERVATION),
+            vec![Tag::parse(["d", &d]).expect("d")],
+            Some(project),
+        );
+        let lease = build_event(
+            holder,
+            toron_kind(FILE_RESERVATION),
+            r#"{"exclusive":true,"reason":"legacy"}"#,
+            tags,
+            Timestamp::now(),
+        )
+        .expect("raw lease");
+        mailbox.bus.publish(lease).await.expect("publish");
+    }
+
+    /// Order 1 — hostile reclaim: bus-stale A holds (epoch 0), operator
+    /// force-releases, registered B reclaims. A presents 0 → exactly one
+    /// loud loser; B holds epoch 1; zero double-own.
+    #[tokio::test]
+    async fn test_fencing_epoch_force_reclaim_loser_fails_loud() {
+        let (mailbox, db_path, data_dir) = test_mailbox("fence-11a").await;
+        register(&mailbox, "demo", "RoseDune").await;
+        let holder_a = crate::keys::generate();
+        publish_raw_stale_lease(&mailbox, &holder_a, "demo", "epoch-fence.txt").await;
+
+        mailbox
+            .force_release_file_reservation(
+                "demo",
+                "RoseDune",
+                "epoch-fence.txt",
+                None,
+                Some("stale"),
+                false,
+            )
+            .await
+            .expect("force release the bus-stale lease");
+
+        let reclaim = mailbox
+            .file_reservation_paths(
+                "demo",
+                "RoseDune",
+                &["epoch-fence.txt".into()],
+                Some(3600),
+                true,
+                Some("bd-adr-0028-implementation-zfnx.11"),
+            )
+            .await
+            .expect("reclaim grants");
+        assert_eq!(reclaim.granted.len(), 1, "{reclaim:?}");
+        assert_eq!(
+            reclaim.granted[0].epoch, 1,
+            "reclaim bumps the epoch past the revoked marker: {reclaim:?}"
+        );
+
+        // A's epoch-0 belief is stale: the ONE loud loser.
+        let err = mailbox
+            .check_claim_epoch("demo", "epoch-fence.txt", 0)
+            .await
+            .expect_err("stale epoch must fail loud");
+        assert!(
+            err.to_string().contains("stale claim epoch"),
+            "loud stale-pointer, got: {err:?}"
+        );
+
+        // B presents the current epoch: the single winner.
+        let current = mailbox
+            .check_claim_epoch("demo", "epoch-fence.txt", 1)
+            .await
+            .expect("winner reads current");
+        assert_eq!(current.agent_name, "RoseDune");
+
+        // Zero double-own: exactly one live lease at the coordinate.
+        let live: Vec<_> = mailbox
+            .active_reservations("demo")
+            .await
+            .expect("active")
+            .into_iter()
+            .filter(|r| r.path_pattern == "epoch-fence.txt")
+            .collect();
+        assert_eq!(live.len(), 1, "one owner: {live:?}");
+        assert_eq!(live[0].epoch, 1);
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// Order 2 — cooperative reclaim: registered A holds genesis, transfers
+    /// to registered B (bump on reclaim). A's epoch-0 belief then fails
+    /// loud; B holds epoch 1; zero double-own.
+    #[tokio::test]
+    async fn test_fencing_epoch_transfer_reclaim_loser_fails_loud() {
+        let (mailbox, db_path, data_dir) = test_mailbox("fence-11b").await;
+        register(&mailbox, "demo", "CoralFinch").await;
+        register(&mailbox, "demo", "TealDune").await;
+
+        let genesis = mailbox
+            .file_reservation_paths(
+                "demo",
+                "CoralFinch",
+                &["epoch-fence.txt".into()],
+                Some(3600),
+                true,
+                Some("bd-adr-0028-implementation-zfnx.11"),
+            )
+            .await
+            .expect("genesis claim");
+        assert_eq!(genesis.granted.len(), 1);
+        assert_eq!(
+            genesis.granted[0].epoch, 0,
+            "first claim on a fresh coordinate is genesis: {genesis:?}"
+        );
+
+        mailbox
+            .transfer_reservation("demo", "CoralFinch", "TealDune", "epoch-fence.txt", None)
+            .await
+            .expect("transfer reclaims");
+
+        // A's epoch-0 belief is stale: the ONE loud loser.
+        let err = mailbox
+            .check_claim_epoch("demo", "epoch-fence.txt", 0)
+            .await
+            .expect_err("stale epoch must fail loud");
+        assert!(
+            err.to_string().contains("stale claim epoch"),
+            "loud stale-pointer, got: {err:?}"
+        );
+
+        // B presents the current epoch: the single winner.
+        let current = mailbox
+            .check_claim_epoch("demo", "epoch-fence.txt", 1)
+            .await
+            .expect("winner reads current");
+        assert_eq!(current.agent_name, "TealDune");
+
+        // Zero double-own.
+        let live: Vec<_> = mailbox
+            .active_reservations("demo")
+            .await
+            .expect("active")
+            .into_iter()
+            .filter(|r| r.path_pattern == "epoch-fence.txt")
+            .collect();
+        assert_eq!(live.len(), 1, "one owner: {live:?}");
+        assert_eq!(live[0].epoch, 1);
 
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_dir_all(&data_dir);
