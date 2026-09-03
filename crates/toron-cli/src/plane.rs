@@ -1695,11 +1695,15 @@ mod live_watch_tests {
         )
         .expect("event2");
         mailbox.bus().publish(ev2.clone()).await.expect("publish2");
-        // Give bus a moment to deliver
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        // The subscription should have received at least one event
-        // (we don't assert exact count, just that live path is wired)
-        let _ = sub.next().await;
+        // Deterministic: await delivery with a deadline instead of a fixed
+        // sleep (a 100ms sleep raced bus delivery under load and flaked).
+        let got = tokio::time::timeout(std::time::Duration::from_secs(5), sub.next())
+            .await
+            .expect("live delivery within 5s");
+        assert!(
+            got.is_some(),
+            "live subscription must yield the kind-9 event"
+        );
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_dir_all(&data_dir);
     }
@@ -1721,7 +1725,10 @@ mod live_watch_tests {
             wait_for_corr(&mb_clone, &args).await
         });
         // Give waiter time to subscribe
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        // No fixed subscribe-delay sleep: a single wake published before the
+        // waiter's subscription is live is LOST, and the waiter deadlines —
+        // the flake. Publish a wake stream inside the waiter's 5s deadline
+        // instead; whichever wake lands after subscribe unparks it.
         // Insert receipt — should unpark waiter
         let receipt = Receipt {
             corr: corr.clone(),
@@ -1742,12 +1749,23 @@ mod live_watch_tests {
             toron_core::nostr::Timestamp::now(),
         )
         .expect("ev");
-        mailbox.bus().publish(ev).await.expect("publish wake");
-        tokio::time::timeout(std::time::Duration::from_secs(3), handle)
+        let mb_wake = mailbox.clone();
+        let wake_task = tokio::spawn(async move {
+            for _ in 0..30 {
+                mb_wake
+                    .bus()
+                    .publish(ev.clone())
+                    .await
+                    .expect("publish wake");
+                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(4), handle)
             .await
             .expect("timeout")
             .expect("join")
             .expect("wait ok");
+        wake_task.abort();
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_dir_all(&data_dir);
     }
