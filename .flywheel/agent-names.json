@@ -1,8 +1,14 @@
 [
   {
-    "pane_id": "w8Q:p1",
+    "pane_id": "w8S:p1",
     "name": "flywheel-toron-oc",
     "mail_identity": "DustySparrow",
+    "skills_injected": false
+  },
+  {
+    "pane_id": "w8S:p2",
+    "name": "flywheel-toron-oc2",
+    "mail_identity": "RoseDune",
     "skills_injected": false
   }
 ]
