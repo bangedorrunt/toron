@@ -6,8 +6,8 @@ on Schnorr identity, NIP-17 gift-wrap, NIP-29 channels. Flywheel embeds this;
 never the reverse. The committed catalog (`docs/catalog/toron-mcp.json`) is the
 38-parity subset by contract (additive excluded, `catalog_freshness` gated).
 
-**Generated:** 2026-08-13
-**Commit:** 33f8276
+**Generated:** 2026-09-04
+**Commit:** 344794c
 **Branch:** main
 
 ## OVERVIEW
