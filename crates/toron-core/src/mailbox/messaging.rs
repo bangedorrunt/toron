@@ -346,40 +346,106 @@ impl Mailbox {
         // Send → inbox → ack/summarize round-trips must work on one id world
         // (ADR-0007 D8.2 per-backend usability).
         let visible_id = visible.clone().id().to_hex();
-        let mut deliveries: Vec<Delivery> = Vec::new();
 
-        // to+cc: one gift wrap per recipient, same visible rumor.
+        // Build every rumor up front (visible for to/cc, one variant per
+        // bcc) so the idempotent-send claim below records the complete
+        // delivery set BEFORE anything hits the bus.
+        let mut pending: Vec<(ResolvedRecipient, UnsignedEvent)> = Vec::new();
         for r in resolved.iter().filter(|r| r.role != RecipientRole::Bcc) {
-            let wrap =
-                gift_wrap::gift_wrap(&sender_keys, &r.npub, visible.clone()).map_err(|e| {
-                    anyhow::anyhow!("gift wrap failed for to/cc recipient {}: {e}", r.name)
-                })?;
-            let delivered = self.publish_dm(&wrap).await?;
-            if delivered {
-                deliveries.push(Delivery {
-                    project: args.project_slug.clone(),
-                    payload: DeliveryPayload {
-                        recipient: r.name.clone(),
-                        event_id: visible_id.clone(),
-                    },
-                });
+            pending.push((r.clone(), visible.clone()));
+        }
+        for r in resolved.iter().filter(|r| r.role == RecipientRole::Bcc) {
+            let variant = build_bcc_rumor(&sender_keys.public_key(), &args, &resolved, r);
+            pending.push((r.clone(), variant));
+        }
+
+        // ADR-0028 zfnx.12: corr-keyed idempotent send. Same
+        // (project, sender, corr) within TTL returns the existing event id
+        // instead of emitting. Claim BEFORE publish: a crash between
+        // publish and receipt-upsert (or a Publish retry) converges on the
+        // first rumor. No corr, or no index pool (demo mode): send as usual.
+        if let Some(corr) = parsed_tags.corr.clone() {
+            use crate::mailbox::idempotent::{SendClaim, send_key};
+            if let Ok(store) = self.idempotent_store() {
+                let intended: Vec<(String, String)> = pending
+                    .iter()
+                    .map(|(r, rumor)| (r.name.clone(), rumor.clone().id().to_hex()))
+                    .collect();
+                let intended_json =
+                    serde_json::to_string(&intended).unwrap_or_else(|_| "[]".into());
+                let now_ms =
+                    crate::index::writer::Clock::now_us(&crate::index::writer::SystemClock) / 1000;
+                let key = send_key(&args.project_slug, &args.sender_name, &corr);
+                match store
+                    .claim_or_duplicate(
+                        &key,
+                        &visible_id,
+                        &args.project_slug,
+                        &args.sender_name,
+                        &corr,
+                        &intended_json,
+                        now_ms,
+                    )
+                    .await
+                {
+                    Ok(SendClaim::Duplicate {
+                        event_id: _,
+                        deliveries_json,
+                    }) => {
+                        // Retry/crash-resume: replay the FIRST send's
+                        // deliveries, publish nothing, ring nothing.
+                        let stored: Vec<(String, String)> =
+                            serde_json::from_str(&deliveries_json).unwrap_or_default();
+                        let deliveries = stored
+                            .into_iter()
+                            .map(|(recipient, event_id)| Delivery {
+                                project: args.project_slug.clone(),
+                                payload: DeliveryPayload {
+                                    recipient,
+                                    event_id,
+                                },
+                            })
+                            .collect::<Vec<_>>();
+                        let count = deliveries.len();
+                        return Ok(SendResult {
+                            count,
+                            deliveries,
+                            verified_sender: true,
+                        });
+                    }
+                    Ok(SendClaim::New) => {
+                        // Opportunistic bounded retention (best-effort,
+                        // never blocks the send).
+                        let pool = store.pool().clone();
+                        tokio::spawn(async move {
+                            let s = crate::mailbox::idempotent::IdempotentSendStore::new(pool);
+                            let now = crate::index::writer::Clock::now_us(
+                                &crate::index::writer::SystemClock,
+                            ) / 1000;
+                            let _ = s.prune_expired(now).await;
+                        });
+                    }
+                    Err(e) => {
+                        eprintln!("toron: idempotent-send claim failed (sending anyway): {e}");
+                    }
+                }
             }
         }
 
-        // bcc: variant rumor per bcc listing to+cc+that bcc only.
-        for r in resolved.iter().filter(|r| r.role == RecipientRole::Bcc) {
-            let variant = build_bcc_rumor(&sender_keys.public_key(), &args, &resolved, r);
-            let variant_id = variant.clone().id().to_hex();
-            let wrap = gift_wrap::gift_wrap(&sender_keys, &r.npub, variant).map_err(|e| {
-                anyhow::anyhow!("gift wrap failed for bcc recipient {}: {e}", r.name)
-            })?;
+        let mut deliveries: Vec<Delivery> = Vec::new();
+
+        // to+cc+bcc: one gift wrap per recipient from the prebuilt rumors.
+        for (r, rumor) in pending {
+            let rumor_id = rumor.clone().id().to_hex();
+            let wrap = gift_wrap::gift_wrap(&sender_keys, &r.npub, rumor)
+                .map_err(|e| anyhow::anyhow!("gift wrap failed for recipient {}: {e}", r.name))?;
             let delivered = self.publish_dm(&wrap).await?;
             if delivered {
                 deliveries.push(Delivery {
                     project: args.project_slug.clone(),
                     payload: DeliveryPayload {
                         recipient: r.name.clone(),
-                        event_id: variant_id,
+                        event_id: rumor_id,
                     },
                 });
             }
@@ -3181,6 +3247,151 @@ mod tests {
         assert!(
             events.is_empty(),
             "empty store has no 39002 yet — filter accepted"
+        );
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    // ---- corr-keyed idempotent send (ADR-0028 zfnx.12) ----
+
+    fn idempotent_send_args(corr: &str) -> SendMessage {
+        SendMessage {
+            project_slug: "demo".into(),
+            sender_name: "GreenCastle".into(),
+            to: vec!["BlueLake".into()],
+            subject: "question".into(),
+            body_md: "do the thing".into(),
+            extra_tags: vec![crate::nostr::Tag::parse(["corr", corr]).expect("corr tag")],
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn idempotent_send_retry_returns_same_event_id() {
+        let (mailbox, _pool, db_path, data_dir) = test_mailbox_with_pool("idem-retry").await;
+        let (_s, _) = register(&mailbox, "demo", "GreenCastle").await;
+        let (_r, rnpub) = register(&mailbox, "demo", "BlueLake").await;
+        let first = mailbox
+            .send_message(&idempotent_send_args("C-RETRY"))
+            .await
+            .expect("send 1");
+        assert_eq!(first.count, 1);
+        let id1 = first.deliveries[0].payload.event_id.clone();
+        assert_eq!(
+            wraps_to(&mailbox, &rnpub, 10).await.len(),
+            1,
+            "one rumor after first send"
+        );
+        let second = mailbox
+            .send_message(&idempotent_send_args("C-RETRY"))
+            .await
+            .expect("retry");
+        assert_eq!(
+            second.deliveries[0].payload.event_id, id1,
+            "retry converges on the first event id"
+        );
+        assert_eq!(
+            wraps_to(&mailbox, &rnpub, 10).await.len(),
+            1,
+            "no second rumor on retry"
+        );
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn idempotent_send_crash_window_claim_yields_one_rumor() {
+        // Kill between publish and receipt-upsert: the claim row survives,
+        // the retry must return the claimed event id and publish nothing.
+        let (mailbox, pool, db_path, data_dir) = test_mailbox_with_pool("idem-crash").await;
+        let (_s, _) = register(&mailbox, "demo", "GreenCastle").await;
+        let (_r, rnpub) = register(&mailbox, "demo", "BlueLake").await;
+        let key = crate::mailbox::idempotent::send_key("demo", "GreenCastle", "C-CRASH");
+        let recipients = serde_json::json!([["BlueLake", "crash-event-id"]]).to_string();
+        sqlx::query(
+            "INSERT INTO idempotent_sends \
+             (send_key, event_id, project_slug, sender_name, corr, recipients_json, created_at) \
+             VALUES (?1, ?2, 'demo', 'GreenCastle', 'C-CRASH', ?3, ?4)",
+        )
+        .bind(&key)
+        .bind("crash-event-id")
+        .bind(&recipients)
+        .bind(chrono::Utc::now().timestamp_millis())
+        .execute(&pool)
+        .await
+        .expect("seed claim");
+        let retried = mailbox
+            .send_message(&idempotent_send_args("C-CRASH"))
+            .await
+            .expect("retry after crash");
+        assert_eq!(
+            retried.deliveries[0].payload.event_id, "crash-event-id",
+            "retry returns the claimed event id"
+        );
+        assert!(
+            wraps_to(&mailbox, &rnpub, 10).await.is_empty(),
+            "no rumor published on retry"
+        );
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn idempotent_send_different_corr_sends_twice() {
+        let (mailbox, _pool, db_path, data_dir) = test_mailbox_with_pool("idem-distinct").await;
+        let (_s, _) = register(&mailbox, "demo", "GreenCastle").await;
+        let (_r, rnpub) = register(&mailbox, "demo", "BlueLake").await;
+        let a = mailbox
+            .send_message(&idempotent_send_args("C-A"))
+            .await
+            .expect("send A");
+        let b = mailbox
+            .send_message(&idempotent_send_args("C-B"))
+            .await
+            .expect("send B");
+        assert_ne!(
+            a.deliveries[0].payload.event_id, b.deliveries[0].payload.event_id,
+            "distinct corr values are distinct sends"
+        );
+        assert_eq!(
+            wraps_to(&mailbox, &rnpub, 10).await.len(),
+            2,
+            "two rumors for two corrs"
+        );
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn idempotent_send_expired_claim_resends() {
+        let (mailbox, pool, db_path, data_dir) = test_mailbox_with_pool("idem-expired").await;
+        let (_s, _) = register(&mailbox, "demo", "GreenCastle").await;
+        let (_r, rnpub) = register(&mailbox, "demo", "BlueLake").await;
+        let key = crate::mailbox::idempotent::send_key("demo", "GreenCastle", "C-OLD");
+        let recipients = serde_json::json!([["BlueLake", "stale-event-id"]]).to_string();
+        sqlx::query(
+            "INSERT INTO idempotent_sends \
+             (send_key, event_id, project_slug, sender_name, corr, recipients_json, created_at) \
+             VALUES (?1, ?2, 'demo', 'GreenCastle', 'C-OLD', ?3, 1)",
+        )
+        .bind(&key)
+        .bind("stale-event-id")
+        .bind(&recipients)
+        .execute(&pool)
+        .await
+        .expect("seed stale claim");
+        let fresh = mailbox
+            .send_message(&idempotent_send_args("C-OLD"))
+            .await
+            .expect("send after expiry");
+        assert_ne!(
+            fresh.deliveries[0].payload.event_id, "stale-event-id",
+            "expired claim does not suppress the send"
+        );
+        assert_eq!(
+            wraps_to(&mailbox, &rnpub, 10).await.len(),
+            1,
+            "one fresh rumor after expiry"
         );
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_dir_all(&data_dir);
