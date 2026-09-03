@@ -473,6 +473,9 @@ pub struct MailSendArgs {
     /// Result path for the assignment (ADR-0027 E2).
     #[arg(long = "result-path")]
     pub result_path: Option<String>,
+    /// HumanDecision verdict: approve|deny (ADR-0028 E4; rides extra_tags verdict).
+    #[arg(long)]
+    pub verdict: Option<String>,
 }
 
 /// Operator Overseer override args (ADR-0004 Ship 5).
