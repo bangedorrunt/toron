@@ -145,6 +145,16 @@ pub struct InboxMessageOut {
     /// S5 (bd-dup-assign-collapse-ws21): the first id of the duplicate group
     /// this row survives for; `null` = standalone message.
     pub duplicate_of: Option<String>,
+    /// ADR-0027 E2 assignment tags projected from the rumor (never 1059);
+    /// mirror of `ToJson for InboxMessage` wire fields
+    /// (bd-mcp-inbox-assignment-tags-sdi1). All optional, `null` = untasked.
+    pub corr: Option<String>,
+    pub wake: Option<String>,
+    pub priority: Option<String>,
+    pub audience: Option<String>,
+    pub result_path: Option<String>,
+    /// HumanDecision live producer: `verdict=` extra_tag on the rumor.
+    pub verdict: Option<String>,
 }
 
 /// `acknowledge_message` / `mark_message_read`.
@@ -288,6 +298,14 @@ pub struct ProjectInboxMessageOut {
     pub ack_required: bool,
     pub thread_id: Option<String>,
     pub created_ts_us: i64,
+    /// ADR-0027 E2 assignment tags (bd-mcp-inbox-assignment-tags-sdi1);
+    /// flattened mirror of `InboxMessageOut` tags. Optional, `null` = untasked.
+    pub corr: Option<String>,
+    pub wake: Option<String>,
+    pub priority: Option<String>,
+    pub audience: Option<String>,
+    pub result_path: Option<String>,
+    pub verdict: Option<String>,
 }
 
 /// `summarize_thread` / `summarize_thread_product`.
@@ -437,4 +455,54 @@ pub struct BuildSlotOut {
     pub exclusive: bool,
     pub status: String,
     pub expires_ts_us: Option<i64>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// bd-mcp-inbox-assignment-tags-sdi1 (RED): schema must list the optional
+    /// assignment tags the wire already emits via `ToJson for InboxMessage`.
+    #[test]
+    fn inbox_message_out_schema_lists_assignment_tags() {
+        let schema = rmcp::schemars::schema_for!(InboxMessageOut);
+        let json = serde_json::to_value(&schema).expect("schema serializes");
+        let props = json
+            .get("properties")
+            .and_then(|v| v.as_object())
+            .expect("InboxMessageOut schema has properties");
+        for tag in [
+            "corr",
+            "wake",
+            "priority",
+            "audience",
+            "result_path",
+            "verdict",
+        ] {
+            assert!(
+                props.contains_key(tag),
+                "InboxMessageOut schema missing optional assignment tag `{tag}`"
+            );
+        }
+        let project_schema = rmcp::schemars::schema_for!(ProjectInboxMessageOut);
+        let project_json =
+            serde_json::to_value(&project_schema).expect("project schema serializes");
+        let project_props = project_json
+            .get("properties")
+            .and_then(|v| v.as_object())
+            .expect("ProjectInboxMessageOut schema has properties");
+        for tag in [
+            "corr",
+            "wake",
+            "priority",
+            "audience",
+            "result_path",
+            "verdict",
+        ] {
+            assert!(
+                project_props.contains_key(tag),
+                "ProjectInboxMessageOut schema missing optional assignment tag `{tag}`"
+            );
+        }
+    }
 }
