@@ -76,6 +76,16 @@ flowchart TB
   whyJ["why --corr / --seq = fold tick from Default"] -.-> logJ
 ```
 
+> **2026-09-04 implementation note (GS-016):** the diagram above is the
+> accepted to-be design; the live Cmd surface has since been honed —
+> `Cmd::Subscribe` deleted (the dispatcher-owned watch IS the
+> subscription, 55nx.7), `Cmd::WriteNcryptsec` deleted (zfnx.4, exfil
+> path), and `Cmd::Invoke` landed as the WIRED playbook vehicle (effect
+> layer routes through the durable Run gate: playbook lint + resolution,
+> `engine.invoke` + `VerifySink` downstream). `WaitCorr` parks in
+> `pending_wait` and drains on watch batches only (GS-016: never the 1s
+> sweep). History below is preserved as grounding, not live truth.
+
 ---
 
 ## 2. Layer picture

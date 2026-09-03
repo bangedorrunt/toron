@@ -10,7 +10,7 @@ informed: flywheel maintainers; skill owners (toron, flywheel, swarm)
 # ADR-0020: Expose the Nostr Two-Plane Surface (CLI-first) so Crews Steer Each Other
 
 **Status:** Accepted (2026-08-15). Wave 1 verified: SC-27..33 green; CLI
-`channel`/`job`/`react`/`presence`/`watch` shipped; MCP tool count stays 39.
+`channel`/`job`/`react`/`presence`/`watch` shipped; MCP tool count stays 40 (38 AM-Rust parity + 2 toron additive — corrected 2026-09-04, GS-016; the 39 figure predates the additive pair).
 **Amended by:** [ADR-0023](0023-nip29-group-metadata-kinds.md) (2026-08-24) —
 create/close emit **39000**, join/leave emit **39002**; 40/41 ingest-only.
 **Date:** 2026-08-15
