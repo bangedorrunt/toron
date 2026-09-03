@@ -129,6 +129,82 @@ impl std::str::FromStr for Audience {
     }
 }
 
+/// Assignment key (ADR-0028 E3). The sender mints it, non-empty; tick
+/// never invents it. Distinct from [`ThreadId`] so conflation fails loudly
+/// instead of dual-writing assignment.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Corr(String);
+
+impl Corr {
+    pub fn parse(s: &str) -> Result<Self, MailError> {
+        if s.trim().is_empty() {
+            return Err(MailError::new(
+                MailErrorCode::Malformed,
+                "corr must be non-empty when present",
+            ));
+        }
+        Ok(Self(s.to_string()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for Corr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Conversation key (NIP-10 thread / `SendMessage.thread_id`). Never an
+/// assignment key: [`reject_thread_as_corr`] hard-errors equality.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ThreadId(String);
+
+impl ThreadId {
+    pub fn parse(s: &str) -> Result<Self, MailError> {
+        if s.trim().is_empty() {
+            return Err(MailError::new(
+                MailErrorCode::Malformed,
+                "thread_id must be non-empty when present",
+            ));
+        }
+        Ok(Self(s.to_string()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for ThreadId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// ADR-0028 E3 invariant: `thread_id` is never `corr`. Hard-error (not
+/// silent skip) where the stringly-typed boundary cannot carry newtypes
+/// (e.g. `SendMessage { thread_id, extra_tags }`).
+pub fn reject_thread_as_corr(
+    thread_id: Option<&ThreadId>,
+    corr: Option<&Corr>,
+) -> Result<(), MailError> {
+    if let (Some(t), Some(c)) = (thread_id, corr)
+        && t.as_str() == c.as_str()
+    {
+        return Err(MailError::new(
+            MailErrorCode::Malformed,
+            format!(
+                "thread_id {:?} is never corr (E3): thread is the conversation key, corr is the assignment key",
+                t.as_str()
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// Typed projection of the extra_tags vocabulary.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SendTags {
@@ -324,6 +400,112 @@ mod tests {
         let rebuilt = parsed.to_tags();
         let reparsed = SendTags::parse(&rebuilt).expect("reparse");
         assert_eq!(reparsed, parsed);
+    }
+
+    #[test]
+    fn send_tags_parse_rejects_empty_corr() {
+        let tags = vec![tag("corr", "")];
+        let err = SendTags::parse(&tags).expect_err("empty corr must error");
+        assert!(err.message.contains("non-empty"), "{err}");
+        assert_eq!(err.code, MailErrorCode::Malformed);
+    }
+
+    #[test]
+    fn send_tags_from_fields_rejects_empty_corr() {
+        let err = SendTags::from_fields(Some("   ".into()), None, None, None, None)
+            .expect_err("empty corr must error");
+        assert!(err.message.contains("non-empty"), "{err}");
+    }
+
+    #[test]
+    fn send_tags_corr_newtype_rejects_empty() {
+        let err = Corr::parse("").expect_err("empty corr must error");
+        assert!(err.message.contains("non-empty"), "{err}");
+    }
+
+    #[test]
+    fn send_tags_thread_id_as_corr_fails_loud() {
+        // ADR-0028 E3: thread is the conversation key, corr is the
+        // assignment key — conflation dual-writes assignment.
+        let corr = Corr::parse("thread-abc").expect("corr");
+        let thread = ThreadId::parse("thread-abc").expect("thread");
+        let err = reject_thread_as_corr(Some(&thread), Some(&corr))
+            .expect_err("thread_id == corr must fail loud");
+        assert!(err.message.contains("never"), "{err}");
+        // Distinct values pass.
+        let other = Corr::parse("corr-xyz").expect("corr");
+        assert!(reject_thread_as_corr(Some(&thread), Some(&other)).is_ok());
+        assert!(reject_thread_as_corr(None, Some(&other)).is_ok());
+        assert!(reject_thread_as_corr(Some(&thread), None).is_ok());
+    }
+
+    #[tokio::test]
+    async fn send_tags_receipts_resulted_never_downgrades_via_upsert() {
+        use crate::index::schema;
+        use crate::mailbox::receipts::{Receipt, ReceiptState, ReceiptStore};
+
+        let path = std::env::temp_dir().join(format!(
+            "toron-send-tags-nodowngrade-{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+        let pool = schema::connect(path.to_str().unwrap())
+            .await
+            .expect("connect");
+        schema::migrate(&pool).await.expect("migrate");
+        let store = ReceiptStore::new(pool);
+        // Seed resulted.
+        store
+            .upsert(&Receipt {
+                corr: "C-NODOWN".into(),
+                state: ReceiptState::Resulted,
+                wake: None,
+                due_at: None,
+                result_path: Some("/tmp/done.json".into()),
+                updated_at: 100,
+            })
+            .await
+            .expect("seed resulted");
+        // A late owed-on-send upsert must NOT downgrade resulted.
+        store
+            .upsert(&Receipt {
+                corr: "C-NODOWN".into(),
+                state: ReceiptState::Owed,
+                wake: None,
+                due_at: None,
+                result_path: None,
+                updated_at: 200,
+            })
+            .await
+            .expect("upsert owed");
+        let got = store.get("C-NODOWN").await.expect("get").expect("found");
+        assert_eq!(got.state, ReceiptState::Resulted);
+        assert_eq!(got.result_path.as_deref(), Some("/tmp/done.json"));
+        // Acked is idempotent: owed-on-send must not drag acked back to owed.
+        store
+            .upsert(&Receipt {
+                corr: "C-ACK".into(),
+                state: ReceiptState::Acked,
+                wake: None,
+                due_at: None,
+                result_path: None,
+                updated_at: 100,
+            })
+            .await
+            .expect("seed acked");
+        store
+            .upsert(&Receipt {
+                corr: "C-ACK".into(),
+                state: ReceiptState::Owed,
+                wake: None,
+                due_at: None,
+                result_path: None,
+                updated_at: 200,
+            })
+            .await
+            .expect("upsert owed over acked");
+        let got2 = store.get("C-ACK").await.expect("get2").expect("found2");
+        assert_eq!(got2.state, ReceiptState::Acked);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -741,6 +923,71 @@ mod tests {
             .await
             .expect_err("unknown wake must error");
         assert!(err.to_string().contains("unknown wake"), "{err}");
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn send_tags_mail_thread_as_corr_rejected() {
+        use crate::bus::in_process::{InProcessBus, InProcessBusConfig};
+        use crate::index::schema;
+        use crate::mailbox::{Mailbox, SendMessage};
+        use crate::nostr::identity::AgentProfile;
+        use std::sync::Arc;
+        let db_path = std::env::temp_dir().join(format!(
+            "toron-send-tags-threadcorr-{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+        let pool = schema::connect(db_path.to_str().unwrap())
+            .await
+            .expect("connect");
+        let bus = InProcessBus::open(pool.clone(), InProcessBusConfig::default())
+            .await
+            .expect("bus");
+        let data_dir = std::env::temp_dir().join(format!(
+            "toron-send-tags-threadcorr-data-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let mailbox = Mailbox::new(
+            Arc::new(bus),
+            data_dir.clone(),
+            Some(crate::keys::generate()),
+        )
+        .with_agent_passphrase("x");
+        let p = |n: &str| AgentProfile {
+            name: n.into(),
+            program: Some("opencode".into()),
+            model: None,
+            persona: None,
+            task_description: None,
+        };
+        mailbox
+            .register_agent("demo", &p("SenderOne"))
+            .await
+            .expect("sender");
+        mailbox
+            .register_agent("demo", &p("RecvOne"))
+            .await
+            .expect("recv");
+        let corr_tag = crate::nostr::Tag::parse(["corr", "thread-abc"]).expect("tag");
+        let msg = SendMessage {
+            project_slug: "demo".into(),
+            sender_name: "SenderOne".into(),
+            to: vec!["RecvOne".into()],
+            subject: "hi".into(),
+            body_md: "body".into(),
+            extra_tags: vec![corr_tag],
+            thread_id: Some("thread-abc".into()),
+            ..Default::default()
+        };
+        let err = mailbox
+            .send_message(&msg)
+            .await
+            .expect_err("thread_id == corr must fail loud");
+        assert!(
+            err.to_string().contains("never"),
+            "expected never-corr error, got {err}"
+        );
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_dir_all(&data_dir);
     }

@@ -270,6 +270,25 @@ impl Mailbox {
         parsed_tags
             .validate_for_send(resolved.len(), args.overseer)
             .map_err(|e| anyhow::anyhow!(e.message))?;
+        // ADR-0028 E3: thread_id is never corr. The sender mints corr;
+        // tick never invents it; conflation fails loud here.
+        {
+            use crate::mailbox::send_tags::{Corr, ThreadId, reject_thread_as_corr};
+            let thread = args
+                .thread_id
+                .as_deref()
+                .map(ThreadId::parse)
+                .transpose()
+                .map_err(|e| anyhow::anyhow!(e.message))?;
+            let corr = parsed_tags
+                .corr
+                .as_deref()
+                .map(Corr::parse)
+                .transpose()
+                .map_err(|e| anyhow::anyhow!(e.message))?;
+            reject_thread_as_corr(thread.as_ref(), corr.as_ref())
+                .map_err(|e| anyhow::anyhow!(e.message))?;
+        }
 
         // ADR-0027 E2: a tasked send carrying a corr OWES a receipt — durable
         // from the moment the send is validated (fresh-eyes fix 2026-09-01:
@@ -827,16 +846,15 @@ impl Mailbox {
             if has_ack > 0 {
                 continue;
             }
-            if let Ok(store) = self.receipt_store() {
-                if let Ok(Some(r)) = store.get(&post_id).await {
-                    if matches!(
-                        r.state,
-                        crate::mailbox::receipts::ReceiptState::Acked
-                            | crate::mailbox::receipts::ReceiptState::Resulted
-                    ) {
-                        continue;
-                    }
-                }
+            if let Ok(store) = self.receipt_store()
+                && let Ok(Some(r)) = store.get(&post_id).await
+                && matches!(
+                    r.state,
+                    crate::mailbox::receipts::ReceiptState::Acked
+                        | crate::mailbox::receipts::ReceiptState::Resulted
+                )
+            {
+                continue;
             }
             let audience: Vec<String> = serde_json::from_str(&to_list_json).unwrap_or_default();
             let tid = thread_id.as_deref();

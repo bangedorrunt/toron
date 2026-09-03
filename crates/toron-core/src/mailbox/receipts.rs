@@ -85,6 +85,13 @@ impl ReceiptStore {
 
     /// Idempotent upsert (INSERT OR REPLACE via ON CONFLICT). Validates
     /// state/wake at the boundary (typed, not free strings).
+    ///
+    /// ADR-0028 E3 receipt ownership: sqlite owns `owed→acked→resulted`;
+    /// this upsert is monotonic — it never downgrades `resulted` (not to
+    /// `acked`, not to `owed`) and never drags `acked` back to `owed`
+    /// (e.g. a late owed-on-send re-fire). Forward transitions apply;
+    /// a `resulted` row keeps its stored `result_path` unless the incoming
+    /// row carries a new one.
     pub async fn upsert(&self, receipt: &Receipt) -> anyhow::Result<()> {
         if receipt.corr.trim().is_empty() {
             anyhow::bail!("corr must be non-empty");
@@ -95,6 +102,30 @@ impl ReceiptStore {
             // documents the invariant.
             let _ = w.as_str();
         }
+        // Monotonic guard: never downgrade resulted, never drag acked to owed.
+        if let Some(existing) = self.get(&receipt.corr).await? {
+            match (existing.state, receipt.state) {
+                (ReceiptState::Resulted, ReceiptState::Resulted) => {
+                    // Idempotent: keep stored row unless the incoming row
+                    // carries a new result_path.
+                    if receipt.result_path.is_some() && receipt.result_path != existing.result_path
+                    {
+                        let mut merged = existing;
+                        merged.result_path = receipt.result_path.clone();
+                        merged.updated_at = receipt.updated_at;
+                        return Box::pin(self.upsert_row(&merged)).await;
+                    }
+                    return Ok(());
+                }
+                (ReceiptState::Resulted, _) => return Ok(()),
+                (ReceiptState::Acked, ReceiptState::Owed) => return Ok(()),
+                _ => {}
+            }
+        }
+        Box::pin(self.upsert_row(receipt)).await
+    }
+
+    async fn upsert_row(&self, receipt: &Receipt) -> anyhow::Result<()> {
         let wake_s = receipt.wake.map(|w| w.as_str().to_string());
         sqlx::query(
             "INSERT INTO receipts (corr, state, wake, due_at, result_path, updated_at) \
