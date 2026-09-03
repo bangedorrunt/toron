@@ -1,6 +1,6 @@
 <!-- governed-by: ADR-0003, ADR-0015, ADR-0020, ADR-0024, ADR-0027 -->
 ---
-status: proposed
+status: accepted
 date: 2026-09-03
 decision-makers: Captain (bangedorrunt)
 consulted: GS-015 STEER (Jido breakthroughs x Wheelhouse nouns, hold-ship diagnostic at flywheel 98aab3d / toron d373230a); open-mode review 2026-09-03 (Cmd holes, corr-plumbing gap, beads drift)
@@ -9,10 +9,10 @@ informed: flywheel x toron x beads maintainers; Wheelhouse
 
 # ADR-0028: Behavior-First Contracts on Wheelhouse Nouns — Cmd Honesty, WaitCorr Parity, Assignment Ring Proof
 
-**Status:** Proposed (2026-09-03; holds ship — no implementation from this text until accepted).
+**Status:** Accepted (2026-09-03, captain word: swarm-mode objective "study our flywheel x toron x beads stack and 0027 and 0028 and implement all stack beads" — acceptance + full implementation ordered; beads `bd-adr-0028-implementation-zfnx` + children dispatch as waves).
 **Date:** 2026-09-03
 **Extends:** [ADR-0027](0027-one-workspace-tick-control-plane.md) (one `WorkspaceModel`, one `Msg`, one `tick`, `Cmd` as data). This record does not relitigate ADR-0027; it finishes the seams ADR-0027 named.
-**Amends:** nothing yet. On acceptance it will amend ADR-0020 only in the already-accepted sense (MCP grows only as the same verb as CLI when an agent cannot tick without it) by adding `verdict` to the CLI-only tag vocabulary; no new MCP tools in this record.
+**Amends:** ADR-0020 in the already-accepted sense (MCP grows only as the same verb as CLI when an agent cannot tick without it) by adding `verdict` to the CLI-only tag vocabulary; no new MCP tools in this record.
 **Does not amend:** two captains stay split; two planes stay two planes (P private rumor-14/1059, S shared kind-9); one-way dep flywheel → toron-workflow → toron-core; beads remain the work graph; doorbell remains in-process wake; kind 30013 remains the agent profile; Tick Law remains the control-plane law. ADR-0019 stays Proposed. ADR-0024 stays Accepted.
 **Does not wire:** Jido/OTP runtime, Grok Bot / Firstmate, Composer FSM, CloudEvents, Memory plugin, BEAM topology, ToolAdapter catalog, factory.db in toron, second doorbell, wake kind / 30015, supervisor heal.
 **Tracker:** beads (epic + children under this ADR; bead ID is the mail `thread_id` / reservation `reason`).
@@ -242,4 +242,4 @@ flowchart LR
 - Revisit triggers: toron bus gains store-push receipts (simplifies E2 fast path); beads schema ships typed `wave`/outcome fields (simplifies E7 atoms); presence needs signed trust beyond the E5 rule (new ADR, not an extension here).
 - Grounding file:line index is §1/§7; newer HEAD wins on conflict. Every architectural change in follow-ups carries as-is vs to-be mermaid grounded in current functions/types (captain rule).
 
-// governed-by: ADR-0028 (proposed)
+// governed-by: ADR-0028
