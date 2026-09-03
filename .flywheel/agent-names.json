@@ -1,10 +1,8 @@
 [
   {
-    "pane_id": "w8C:p1",
-    "name": "flywheel-toron-coder",
-    "profile": "coder",
-    "harness": "jcode",
-    "mail_identity": "BrownRidge",
+    "pane_id": "w8Q:p1",
+    "name": "flywheel-toron-oc",
+    "mail_identity": "DustySparrow",
     "skills_injected": false
   }
 ]
