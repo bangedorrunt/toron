@@ -1406,6 +1406,15 @@ async fn watch(mailbox: &Mailbox, args: &WatchArgs) -> anyhow::Result<()> {
 /// bd-rkom: wait --corr subscribe-until-receipt (E9) — shares the live
 /// subscription with `watch --live` (one bus source). Unparks when the
 /// receipt appears in the durable `receipts` store; no thread.sleep poll loop.
+///
+/// ADR-0028 E2 (zfnx.6): WaitCorr interest vocabulary. The wait subscribes
+/// to the already-held doorbell kinds (`DOORBELL_WATCH_KINDS` mirror:
+/// 9/14/20001/30013/43001/30031/39002) plus 1059 (gift-wrapped receipt
+/// acks) and 43004 (job results) for the direct receipt paths. Any bus
+/// event only re-checks the store fast path — the store is the truth, the
+/// bus is the wake. No second watch child, no wake kind, no poll.
+pub const WAIT_WAKE_KINDS: &[u16] = &[9, 14, 1059, 20001, 30013, 43001, 43004, 30031, 39002];
+
 async fn wait_for_corr(mailbox: &Mailbox, args: &WaitArgs) -> anyhow::Result<()> {
     let timeout = args.timeout.unwrap_or(30);
     let deadline = if timeout == 0 {
@@ -1433,13 +1442,8 @@ async fn wait_for_corr(mailbox: &Mailbox, args: &WaitArgs) -> anyhow::Result<()>
     // Subscribe to live bus (any kind that could lead to a receipt). The
     // receipts store itself is not a bus kind, so we wake on any new bus
     // event and re-check the store — still subscribe-driven, not poll.
-    let filter = Filter::new().kinds([
-        toron_kind(9),
-        toron_kind(14),
-        toron_kind(1059),
-        toron_kind(43001),
-        toron_kind(43004),
-    ]);
+    // Kinds are WAIT_WAKE_KINDS (E2 held-subscription vocabulary).
+    let filter = Filter::new().kinds(WAIT_WAKE_KINDS.iter().map(|k| toron_kind(*k)));
     let mut sub = mailbox.bus().subscribe_trusted(filter).await?;
     loop {
         if let Some(d) = deadline
@@ -1767,6 +1771,56 @@ mod live_watch_tests {
             msg.contains("demo"),
             "error must name resolved project: {msg}"
         );
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// ADR-0028 E2: WaitCorr interest rides the already-held doorbell
+    /// subscription vocabulary (DOORBELL_WATCH_KINDS mirror + 1059/43004 for
+    /// the direct receipt paths). No second watch child, no wake kind.
+    #[test]
+    fn live_watch_wait_wake_kinds_cover_doorbell() {
+        for kind in [9u16, 14, 20001, 30013, 43001, 30031, 39002] {
+            assert!(
+                WAIT_WAKE_KINDS.contains(&kind),
+                "wait wake kinds must cover doorbell kind {kind}"
+            );
+        }
+    }
+
+    /// ADR-0028 E2/S5: tasked corr survives walker death via sqlite — a
+    /// receipt that landed before the wait starts resolves on the store
+    /// fast path with no bus event at all (no live walker required).
+    #[tokio::test]
+    async fn live_watch_wait_corr_survives_walker_death() {
+        let (mailbox, _pool, db_path, data_dir) = test_mailbox("wait-walkerdeath").await;
+        let store = mailbox.receipt_store().expect("store");
+        let corr = format!("test-corr-dead-{}", uuid::Uuid::new_v4());
+        store
+            .upsert(&Receipt {
+                corr: corr.clone(),
+                state: ReceiptState::Owed,
+                wake: Some(Wake::Tasked),
+                due_at: None,
+                result_path: None,
+                updated_at: 1_700_000_000_000_000,
+            })
+            .await
+            .expect("upsert");
+        // Walker is dead: no bus event is ever published. The wait must
+        // still resolve from the durable store, fast (well under timeout).
+        let args = WaitArgs {
+            corr,
+            timeout: Some(5),
+            project: "demo".into(),
+        };
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            wait_for_corr(&mailbox, &args),
+        )
+        .await
+        .expect("no hang without a live walker")
+        .expect("wait ok from sqlite fast path");
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_dir_all(&data_dir);
     }
