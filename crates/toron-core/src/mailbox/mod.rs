@@ -27,6 +27,7 @@ pub mod build_slots;
 pub mod contacts;
 pub mod error;
 pub mod guard;
+pub mod idempotent;
 pub mod identity;
 pub mod ids;
 pub mod infra;
@@ -50,6 +51,7 @@ pub use guard::{
     Reservation as GuardReservation, guard_blocked_paths, guard_check_blocked,
     install_precommit_guard, staged_paths_in, uninstall_precommit_guard,
 };
+pub use idempotent::{IdempotentSendStore, SendClaim, send_key};
 pub use identity::{ListAgentsOptions, RegisteredAgent, WhoIs};
 pub use infra::{HealthComponent, HealthReport, ProjectState};
 pub use macros::{
