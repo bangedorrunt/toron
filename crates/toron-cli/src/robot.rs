@@ -1234,6 +1234,27 @@ async fn daemon_guard_roster(
     let agents = dc
         .read_resource(&format!("toron://agents/{project}"))
         .await?;
+    let now_secs = chrono::Utc::now().timestamp();
+    Ok(resolve_daemon_roster(&res, &agents, now_secs))
+}
+
+/// Build the guard reservation roster from raw daemon resource JSON (pure,
+/// testable). `res` is the `toron://reservations/{project}` document
+/// (`{events: [...]}`), `agents` the `toron://agents/{project}` document.
+///
+/// Held leases only: intent/released/revoked and expired events are dropped,
+/// mirroring the server's held view.
+///
+/// bd-0pjf tombstone ordering (mirrors embedded `resolve_lease_state`,
+/// bd-reacquire): a revocation/release marker covers only events at the same
+/// path OLDER than itself — a lease re-acquired after a force-release is
+/// live again on the very next check. Without any marker the coordinate
+/// resolves exactly as before (all live lease events surface).
+fn resolve_daemon_roster(
+    res: &serde_json::Value,
+    agents: &serde_json::Value,
+    now_secs: i64,
+) -> Vec<toron_core::mailbox::guard::Reservation> {
     // npub → agent name (agents resource: [{name, npub, ...}]).
     let name_by_npub: std::collections::HashMap<String, String> = agents
         .as_array()
@@ -1246,44 +1267,57 @@ async fn daemon_guard_roster(
             ))
         })
         .collect();
-    let now_secs = chrono::Utc::now().timestamp();
-    let mut out = Vec::new();
     let events = res.get("events").and_then(|v| v.as_array());
     let Some(events) = events else {
-        return Ok(out);
+        return Vec::new();
     };
-    // Collect d-tags that have been revoked/released — the original lease
-    // event must be treated as dead even though we skip the revocation
-    // event itself below (fresh-eyes fix for TopazDune plane.rs phantom:
-    // force_release succeeded but guard still blocked on the lease).
-    let mut revoked_d: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for ev in events {
-        let content = ev.get("content").and_then(|v| v.as_str()).unwrap_or("");
-        let is_revoked = content.contains("status:revoked")
+    fn event_created_at(ev: &serde_json::Value) -> i64 {
+        ev.get("created_at").and_then(|v| v.as_i64()).unwrap_or(0)
+    }
+    fn event_content(ev: &serde_json::Value) -> &str {
+        ev.get("content").and_then(|v| v.as_str()).unwrap_or("")
+    }
+    fn is_marker(content: &str) -> bool {
+        content.contains("status:revoked")
             || content.contains("\"status\":\"revoked\"")
             || content.contains("status:released")
-            || content.contains("\"status\":\"released\"");
-        if is_revoked {
-            let d = ev
-                .get("tags")
-                .and_then(|v| v.as_array())
-                .and_then(|tags| {
-                    tags.iter().find_map(|t| {
-                        let a = t.as_array()?;
-                        (a.first().and_then(|s| s.as_str()) == Some("d"))
-                            .then(|| a.get(1).and_then(|s| s.as_str()).map(|s| s.to_string()))
-                            .flatten()
-                    })
-                })
-                .and_then(|d| d.split_once(':').map(|(_, p)| p.to_string()).or(Some(d)))
-                .unwrap_or_default();
-            if !d.is_empty() {
-                revoked_d.insert(d);
-            }
-        }
+            || content.contains("\"status\":\"released\"")
     }
+    fn event_path(ev: &serde_json::Value) -> String {
+        // Path from the d-tag (`{project}:{path}` — server split_once ':').
+        ev.get("tags")
+            .and_then(|v| v.as_array())
+            .and_then(|tags| {
+                tags.iter().find_map(|t| {
+                    let a = t.as_array()?;
+                    (a.first().and_then(|s| s.as_str()) == Some("d"))
+                        .then(|| a.get(1).and_then(|s| s.as_str()).map(|s| s.to_string()))
+                        .flatten()
+                })
+            })
+            .and_then(|d| d.split_once(':').map(|(_, p)| p.to_string()).or(Some(d)))
+            .unwrap_or_default()
+    }
+    // PASS 1 — tombstone cutoff per path: the newest revocation/release
+    // marker's timestamp. Older events at that path are dead; newer ones
+    // (re-acquired after the release) stay live.
+    let mut cutoff: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
     for ev in events {
-        let content = ev.get("content").and_then(|v| v.as_str()).unwrap_or("");
+        if !is_marker(event_content(ev)) {
+            continue;
+        }
+        let path = event_path(ev);
+        let at = event_created_at(ev);
+        cutoff
+            .entry(path)
+            .and_modify(|c| *c = (*c).max(at))
+            .or_insert(at);
+    }
+    // PASS 2 — resolve live leases (markers, intents, expired, and
+    // tombstoned-older events are dropped).
+    let mut out = Vec::new();
+    for ev in events {
+        let content = event_content(ev);
         if content.contains("intent")
             || content.contains("status:released")
             || content.contains("\"status\":\"released\"")
@@ -1308,21 +1342,13 @@ async fn daemon_guard_roster(
         {
             continue;
         }
-        // Path from the d-tag (`{project}:{path}` — server split_once ':').
-        let path = ev
-            .get("tags")
-            .and_then(|v| v.as_array())
-            .and_then(|tags| {
-                tags.iter().find_map(|t| {
-                    let a = t.as_array()?;
-                    (a.first().and_then(|s| s.as_str()) == Some("d"))
-                        .then(|| a.get(1).and_then(|s| s.as_str()).map(|s| s.to_string()))
-                        .flatten()
-                })
-            })
-            .and_then(|d| d.split_once(':').map(|(_, p)| p.to_string()).or(Some(d)))
-            .unwrap_or_default();
-        if revoked_d.contains(&path) {
+        let path = event_path(ev);
+        // bd-0pjf: tombstoned-older events stay dead even though the marker
+        // itself is skipped above.
+        if cutoff
+            .get(&path)
+            .is_some_and(|c| event_created_at(ev) <= *c)
+        {
             continue;
         }
         let exclusive =
@@ -1338,7 +1364,7 @@ async fn daemon_guard_roster(
             exclusive,
         });
     }
-    Ok(out)
+    out
 }
 
 /// bd-lsgm: the captain fold routes only in swarm identity mode. An open-mode
@@ -1413,5 +1439,103 @@ mod captain_open_mode_tests {
             toron_core::mailbox::naming::IdentityMode::Open
         ));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod daemon_roster_revocation_tests {
+    use super::*;
+    use serde_json::json;
+
+    const HOLDER: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const OPERATOR: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    fn roster_event(
+        pubkey: &str,
+        created_at: i64,
+        d: &str,
+        content: &str,
+        extra_tags: serde_json::Value,
+    ) -> serde_json::Value {
+        let mut tags = vec![json!(["d", d]), json!(["expiration", "9999999999"])];
+        if let Some(arr) = extra_tags.as_array() {
+            for t in arr {
+                tags.push(t.clone());
+            }
+        }
+        json!({
+            "id": "00",
+            "pubkey": pubkey,
+            "created_at": created_at,
+            "kind": 30031,
+            "tags": tags,
+            "content": content,
+            "sig": "00"
+        })
+    }
+
+    fn held_lease(pubkey: &str, created_at: i64) -> serde_json::Value {
+        roster_event(
+            pubkey,
+            created_at,
+            "toron:scratch-guard.txt",
+            r#"{"exclusive":true,"reason":"bd-0pjf"}"#,
+            json!([]),
+        )
+    }
+
+    fn force_revoke(created_at: i64) -> serde_json::Value {
+        roster_event(
+            OPERATOR,
+            created_at,
+            "toron:scratch-guard.txt",
+            r#"{"status":"revoked","heuristic":"stale-holder"}"#,
+            json!([["status", "revoked"]]),
+        )
+    }
+
+    fn agents() -> serde_json::Value {
+        json!([{ "name": "RoseDune", "npub": HOLDER }])
+    }
+
+    fn resolve(events: Vec<serde_json::Value>) -> Vec<toron_core::mailbox::guard::Reservation> {
+        let res = json!({ "events": events });
+        resolve_daemon_roster(&res, &agents(), 500)
+    }
+
+    /// bd-0pjf core: force_release revocation hides the lease on the very
+    /// next guard check (pins the 7c98dcf behavior).
+    #[test]
+    fn revoke_hides_lease_on_next_check() {
+        let roster = resolve(vec![held_lease(HOLDER, 100), force_revoke(200)]);
+        assert!(
+            roster.is_empty(),
+            "revoked lease must not reach the guard: {roster:?}"
+        );
+    }
+
+    /// bd-0pjf tombstone ordering (mirrors embedded `resolve_lease_state`,
+    /// bd-reacquire): a revocation marker covers only OLDER events — a lease
+    /// re-acquired after the force-release is live again.
+    #[test]
+    fn reacquire_after_revoke_is_live() {
+        let roster = resolve(vec![
+            held_lease(HOLDER, 100),
+            force_revoke(200),
+            held_lease(HOLDER, 300),
+        ]);
+        assert_eq!(roster.len(), 1, "re-acquired lease is live: {roster:?}");
+        assert_eq!(roster[0].pattern, "scratch-guard.txt");
+    }
+
+    /// A stale revocation never blankets a newer lease at the same path.
+    #[test]
+    fn stale_revoke_does_not_blanket_newer_lease() {
+        let roster = resolve(vec![force_revoke(100), held_lease(HOLDER, 200)]);
+        assert_eq!(
+            roster.len(),
+            1,
+            "newer lease survives stale marker: {roster:?}"
+        );
     }
 }
