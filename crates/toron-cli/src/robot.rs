@@ -64,9 +64,10 @@ fn build_send_tags(
     priority: Option<String>,
     audience: Option<String>,
     result_path: Option<String>,
+    verdict: Option<String>,
 ) -> anyhow::Result<Vec<toron_core::nostr::Tag>> {
     use std::str::FromStr;
-    use toron_core::mailbox::send_tags::{Audience, Priority, SendTags, Wake};
+    use toron_core::mailbox::send_tags::{Audience, Priority, SendTags, Verdict, Wake};
     let wake_typed = wake
         .map(|s| Wake::from_str(&s).map_err(|e| anyhow::anyhow!(e.message)))
         .transpose()?;
@@ -76,12 +77,16 @@ fn build_send_tags(
     let audience_typed = audience
         .map(|s| Audience::from_str(&s).map_err(|e| anyhow::anyhow!(e.message)))
         .transpose()?;
+    let verdict_typed = verdict
+        .map(|s| Verdict::from_str(&s).map_err(|e| anyhow::anyhow!(e.message)))
+        .transpose()?;
     let tags = SendTags::from_fields(
         corr,
         wake_typed,
         priority_typed,
         audience_typed,
         result_path,
+        verdict_typed,
     )
     .map_err(|e| anyhow::anyhow!(e.message))?;
     Ok(tags.to_tags())
@@ -96,6 +101,7 @@ pub async fn run_mail(mailbox: &Mailbox, cmd: &MailCommand) -> anyhow::Result<()
                 args.priority.clone(),
                 args.audience.clone(),
                 args.result_path.clone(),
+                args.verdict.clone(),
             )?;
             let msg = SendMessage {
                 project_slug: args.project.clone(),
@@ -148,6 +154,7 @@ pub async fn run_mail(mailbox: &Mailbox, cmd: &MailCommand) -> anyhow::Result<()
                 args.priority.clone(),
                 args.audience.clone(),
                 args.result_path.clone(),
+                None,
             )?;
             let msg = SendMessage {
                 project_slug: args.project.clone(),

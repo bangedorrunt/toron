@@ -414,6 +414,7 @@ fn build_extra_tags_from_args(
         priority_typed,
         audience_typed,
         result_path,
+        None,
     )
     .map_err(|e| e.message)?;
     Ok(tags.to_tags())

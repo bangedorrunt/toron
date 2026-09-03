@@ -1,13 +1,14 @@
 // governed-by: ADR-0027
 #![forbid(unsafe_code)]
 
-//! Typed vocabulary for `SendMessage.extra_tags` (ADR-0027 E2/E3).
+//! Typed vocabulary for `SendMessage.extra_tags` (ADR-0027 E2/E3, ADR-0028 E4).
 //!
 //! Tags ride rumor kind 14 and job 43001 builder; NEVER the sealed 1059
 //! envelope. Vocabulary: `corr`, `wake(standing|tasked)`,
-//! `priority(queue|interrupt)`, `audience(human|agents)`, `result_path`.
-//! Parsed at the boundary into typed structs; unknown wake/priority/audience
-//! values are hard errors (type-system-discipline).
+//! `priority(queue|interrupt)`, `audience(human|agents)`, `result_path`,
+//! `verdict(approve|deny)`. Parsed at the boundary into typed structs;
+//! unknown wake/priority/audience/verdict values are hard errors
+//! (type-system-discipline).
 
 use crate::mailbox::error::{MailError, MailErrorCode};
 use crate::nostr::Tag;
@@ -129,6 +130,47 @@ impl std::str::FromStr for Audience {
     }
 }
 
+/// HumanDecision verdict (ADR-0028 E4 toron half, bd-mail-send-verdict-flag-kfo6).
+/// Carried as the `verdict` extra_tag on the rumor; flywheel tick closes one
+/// open question per corr on exactly one `approve|deny`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Verdict {
+    Approve,
+    Deny,
+}
+
+impl Verdict {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Approve => "approve",
+            Self::Deny => "deny",
+        }
+    }
+    pub fn parse(s: &str) -> Result<Self, MailError> {
+        match s {
+            "approve" => Ok(Self::Approve),
+            "deny" => Ok(Self::Deny),
+            _ => Err(MailError::new(
+                MailErrorCode::Malformed,
+                format!("unknown verdict value {s:?} — expected approve|deny"),
+            )),
+        }
+    }
+}
+
+impl std::fmt::Display for Verdict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for Verdict {
+    type Err = MailError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::parse(s)
+    }
+}
+
 /// Assignment key (ADR-0028 E3). The sender mints it, non-empty; tick
 /// never invents it. Distinct from [`ThreadId`] so conflation fails loudly
 /// instead of dual-writing assignment.
@@ -213,6 +255,7 @@ pub struct SendTags {
     pub priority: Option<Priority>,
     pub audience: Option<Audience>,
     pub result_path: Option<String>,
+    pub verdict: Option<Verdict>,
 }
 
 impl SendTags {
@@ -225,6 +268,7 @@ impl SendTags {
         priority: Option<Priority>,
         audience: Option<Audience>,
         result_path: Option<String>,
+        verdict: Option<Verdict>,
     ) -> Result<Self, MailError> {
         if let Some(c) = &corr
             && c.trim().is_empty()
@@ -248,6 +292,7 @@ impl SendTags {
             priority,
             audience,
             result_path,
+            verdict,
         })
     }
 
@@ -293,6 +338,10 @@ impl SendTags {
                         ));
                     }
                     out.result_path = Some(v);
+                }
+                "verdict" => {
+                    let v = parts.get(1).map(|s| s.as_str()).unwrap_or("");
+                    out.verdict = Some(Verdict::parse(v)?);
                 }
                 _ => {
                     // Non-vocabulary tags (workflow-emitted, etc.) are ignored
@@ -370,6 +419,11 @@ impl SendTags {
         {
             out.push(t);
         }
+        if let Some(v) = self.verdict
+            && let Ok(t) = Tag::parse(["verdict", v.as_str()])
+        {
+            out.push(t);
+        }
         out
     }
 }
@@ -412,9 +466,48 @@ mod tests {
 
     #[test]
     fn send_tags_from_fields_rejects_empty_corr() {
-        let err = SendTags::from_fields(Some("   ".into()), None, None, None, None)
+        let err = SendTags::from_fields(Some("   ".into()), None, None, None, None, None)
             .expect_err("empty corr must error");
         assert!(err.message.contains("non-empty"), "{err}");
+    }
+
+    #[test]
+    fn send_tags_parse_verdict_roundtrip() {
+        let tags = vec![tag("corr", "C-1"), tag("verdict", "approve")];
+        let parsed = SendTags::parse(&tags).expect("parse");
+        assert_eq!(parsed.verdict, Some(Verdict::Approve));
+        let rebuilt = parsed.to_tags();
+        let reparsed = SendTags::parse(&rebuilt).expect("reparse");
+        assert_eq!(reparsed, parsed);
+        let deny = SendTags::parse(&[tag("verdict", "deny")]).expect("deny");
+        assert_eq!(deny.verdict, Some(Verdict::Deny));
+    }
+
+    #[test]
+    fn send_tags_parse_rejects_unknown_verdict() {
+        let tags = vec![tag("verdict", "maybe")];
+        let err = SendTags::parse(&tags).expect_err("unknown verdict must error");
+        assert!(err.message.contains("unknown verdict"), "{err}");
+        assert_eq!(err.code, MailErrorCode::Malformed);
+    }
+
+    #[test]
+    fn send_tags_from_fields_verdict() {
+        let tags = SendTags::from_fields(
+            Some("C-1".into()),
+            None,
+            None,
+            None,
+            None,
+            Some(Verdict::Deny),
+        )
+        .expect("from_fields with verdict");
+        assert_eq!(tags.verdict, Some(Verdict::Deny));
+        assert!(
+            tags.to_tags()
+                .iter()
+                .any(|t| t.as_slice() == ["verdict", "deny"])
+        );
     }
 
     #[test]
@@ -639,6 +732,7 @@ mod tests {
             priority: Some(Priority::Queue),
             audience: Some(Audience::Agents),
             result_path: Some("/tmp/out.json".into()),
+            verdict: None,
         };
         let extra = tags.to_tags();
         let msg = SendMessage {
@@ -987,6 +1081,105 @@ mod tests {
         assert!(
             err.to_string().contains("never"),
             "expected never-corr error, got {err}"
+        );
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn send_tags_mail_verdict_rumor_and_inbox() {
+        use crate::bus::in_process::{InProcessBus, InProcessBusConfig};
+        use crate::index::schema;
+        use crate::mailbox::{Mailbox, SendMessage};
+        use crate::nostr::identity::AgentProfile;
+        use std::sync::Arc;
+        let db_path = std::env::temp_dir().join(format!(
+            "toron-send-tags-verdict-{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+        let pool = schema::connect(db_path.to_str().unwrap())
+            .await
+            .expect("connect");
+        let bus = InProcessBus::open(pool.clone(), InProcessBusConfig::default())
+            .await
+            .expect("bus");
+        let data_dir = std::env::temp_dir().join(format!(
+            "toron-send-tags-verdict-data-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let mailbox = Mailbox::new(
+            Arc::new(bus),
+            data_dir.clone(),
+            Some(crate::keys::generate()),
+        )
+        .with_agent_passphrase("x");
+        let p = |n: &str| AgentProfile {
+            name: n.into(),
+            program: Some("opencode".into()),
+            model: None,
+            persona: None,
+            task_description: None,
+        };
+        mailbox
+            .register_agent("demo", &p("SenderOne"))
+            .await
+            .expect("sender");
+        let recv = mailbox
+            .register_agent("demo", &p("RecvOne"))
+            .await
+            .expect("recv");
+        let recv_keys = mailbox
+            .load_agent_key(std::path::Path::new(&recv.key_path))
+            .expect("key");
+        let tags = SendTags::from_fields(
+            Some("C-V".into()),
+            None,
+            None,
+            None,
+            None,
+            Some(Verdict::Approve),
+        )
+        .expect("verdict tags")
+        .to_tags();
+        let msg = SendMessage {
+            project_slug: "demo".into(),
+            sender_name: "SenderOne".into(),
+            to: vec!["RecvOne".into()],
+            subject: "decision".into(),
+            body_md: "approved".into(),
+            extra_tags: tags,
+            ..Default::default()
+        };
+        mailbox.send_message(&msg).await.expect("send");
+        let filter = crate::bus::filter::ToronFilter::new()
+            .kinds([crate::nostr::Kind::GiftWrap])
+            .pubkey(recv_keys.public_key())
+            .build();
+        let wraps = crate::mailbox::collect_replay(mailbox.bus.as_ref(), filter)
+            .await
+            .expect("replay");
+        assert_eq!(wraps.len(), 1, "one wrap");
+        let gift = crate::nostr::gift_wrap::unwrap(&recv_keys, &wraps[0]).expect("unwrap");
+        assert!(
+            gift.rumor
+                .tags
+                .iter()
+                .any(|t| t.as_slice() == ["verdict", "approve"]),
+            "rumor carries verdict=approve"
+        );
+        let inbox = mailbox
+            .fetch_inbox(&crate::mailbox::FetchInbox {
+                project_slug: "demo".into(),
+                agent_name: "RecvOne".into(),
+                include_bodies: true,
+                ..Default::default()
+            })
+            .await
+            .expect("inbox");
+        assert_eq!(
+            inbox[0].verdict.as_deref(),
+            Some("approve"),
+            "fetch_inbox projects verdict"
         );
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_dir_all(&data_dir);
