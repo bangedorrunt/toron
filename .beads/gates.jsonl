@@ -52,3 +52,4 @@
 {"id":52,"issue_id":"bd-p1ds","from_status":"in_progress","to_status":"closed","status_revision":673,"gate":"unit-test-verified","provider":"cargo","passed":true,"recorded_by":"bangedorrunt","recorded_at":"2026-09-01 05:33:24"}
 {"id":53,"issue_id":"bd-7xsf","from_status":"in_progress","to_status":"closed","status_revision":677,"gate":"unit-test-verified","provider":"cargo","passed":true,"recorded_by":"bangedorrunt","recorded_at":"2026-09-01 05:38:21"}
 {"id":54,"issue_id":"bd-3b00","from_status":"open","to_status":"closed","status_revision":0,"gate":"unit-test-verified","provider":"TealDune","passed":true,"recorded_by":"bangedorrunt","recorded_at":"2026-09-01 06:05:59"}
+{"id":55,"issue_id":"bd-mcp-inbox-assignment-tags-sdi1","from_status":"in_progress","to_status":"closed","status_revision":737,"gate":"unit-test-verified","provider":"RoseDune","passed":true,"recorded_by":"bangedorrunt","recorded_at":"2026-09-03 07:15:48"}
