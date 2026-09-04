@@ -411,7 +411,7 @@ Gate: `cargo test -p toron-e2e --features p2` plus new un-gated CLI tests that s
 | C-CAT | `toron catalog --json` lists `channel`, `job`, `react`, `presence`, `watch` under CLI. `cargo test catalog_freshness` green after regen. |
 | C-ROBOT | `--robot-capabilities` JSON includes those nouns. |
 | C-SYNC | `Command` enum variants exist. AGENTS.md STRUCTURE mentions them. Skill CLI table matches `--help`. |
-| C-NO-TOOL | `rg '#\[tool\(name'` count unchanged (39). |
+| C-NO-TOOL | `rg '#\[tool\(name'` count unchanged at acceptance (39). Live 2026-09-04: **40** (38 parity + 2 additive, GS-016). |
 | C-NO-KIND-42-EMIT | `rg 'CHANNEL_MESSAGE = 42'` is gone or only `LEGACY`. |
 | C-DEP | `! grep -r 'use flywheel' crates/` still holds. |
 
@@ -485,7 +485,7 @@ Wave 1 is not done until every box is checked.
 - [ ] SC-28, SC-29, SC-30, SC-31, SC-32, SC-33 green.
 - [ ] SC-9 still green (plane P).
 - [ ] `--as` unknown name fails. Claim npub == `whois` npub.
-- [ ] `#[tool(name` count == 39.
+- [x] `#[tool(name` count == 39 at acceptance; **40 live** (38 parity + 2 additive since, GS-016).
 - [ ] `catalog_freshness` green after `toron catalog --json` regen.
 - [ ] `--robot-capabilities` lists the five nouns.
 - [ ] Skills: two-plane + Spec 5 recipe present. "DMs are the only model" gone.

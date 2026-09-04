@@ -34,6 +34,12 @@ What we already are (verified at grounding HEADs):
 - Wait: toron `wait --corr` is subscribe-until-receipt sharing the live bus (`crates/toron-cli/src/plane.rs:1409-1491`: fast-path store `get`, else `subscribe_trusted` on kinds 9/14/1059/43001/43004, unpark on bus event or deadline — no 200ms poll). `watch --live` is the same `subscribe_trusted` source (`plane.rs:1496+`).
 - Strategy is four nouns (stage / workflow / recipe / profile); Branch lives in toron `run_branch` (`crates/toron-workflow/src/engine/control_flow.rs:581`), never in tick. `VerifySink` is the verify door (`crates/toron-workflow/src/engine/mod.rs:132, :222`; flywheel `make_verify_sink` at `src/main.rs:27903`, attached in compose paths `:22721, :23197`).
 
+> **2026-09-04 (GS-017):** the items below are the GROUNDING snapshot at
+> `98aab3d`/`d373230` (2026-09-03), kept for honesty about where we were.
+> All three seams are since closed: `Invoke` WIRED through the durable Run
+> gate (E1), `WriteNcryptsec`/`Subscribe` deleted (E1), `WaitCorr` drains
+> on watch batches only with bounded `pending_wait` (E2). See §8 verification.
+
 What is still dishonest (the seams this ADR exists to close):
 
 1. `handle_workspace_cmds` still `LoudMiss`-eprintlns `Invoke` and `WriteNcryptsec` (`main.rs:8591-8595`) while the enum claims they are real effects. `Subscribe` is an intentional no-op (`:8580-8584`) but `Msg::ClaimWatch → Cmd::Subscribe { filter: "claim-watch:…" }` (`workspace.rs:800-804`) emits data no executor reads — a dead Cmd normalizing placeholder culture.
