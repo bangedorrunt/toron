@@ -7,7 +7,7 @@ never the reverse. The committed catalog (`docs/catalog/toron-mcp.json`) is the
 38-parity subset by contract (additive excluded, `catalog_freshness` gated).
 
 **Generated:** 2026-09-04
-**Commit:** 344794c
+**Commit:** 7aa6733b
 **Branch:** main
 
 ## OVERVIEW

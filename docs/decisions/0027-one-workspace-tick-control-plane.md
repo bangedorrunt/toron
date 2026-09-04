@@ -69,9 +69,10 @@ flowchart TB
   fx --> herdrOut["Prompt / Diagnose / Respawn  → herdr"]
   fx --> sqlOut["SqliteUpsert  → receipts beside inbox_cursors"]
   fx --> pubOut["Publish  → rumor 14 SendMessage.extra_tags + kind-9 ring"]
-  fx --> subOut["Subscribe  → WatchNdjson lines"]
-  fx --> waitOut["WaitCorr  → same Subscribe + receipt"]
-  fx --> invOut["Invoke  → engine.invoke + VerifySink"]
+  fx --> waitOut["WaitCorr  → pending_wait; drain on watch batches + receipt"]
+  fx --> invOut["Invoke  → durable Run gate (lint + resolution, engine.invoke + VerifySink)"]
+  watchNote["watch is dispatcher-owned: subscribe held outside tick
+    (Cmd::Subscribe deleted 55nx.7)"] -.-> tFn
   logJ["jsonl = log of Msg"] -.-> tFn
   whyJ["why --corr / --seq = fold tick from Default"] -.-> logJ
 ```
