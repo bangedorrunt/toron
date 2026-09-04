@@ -48,6 +48,8 @@ jobs:
       - name: Install stable toolchain
         uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Build toron CLI binary (cli e2e shells target/debug/toron)
+        run: cargo build -p toron-cli --bin toron
       - name: cargo test -p toron-e2e --features p1
         run: cargo test -p toron-e2e --features p1
 
@@ -66,5 +68,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Install resonate CLI (for SC-11 subprocess)
         run: cargo install resonate --locked || echo "resonate install skipped — SC-11 will #[ignore] if absent"
+      - name: Build toron CLI binary (cli e2e shells target/debug/toron)
+        run: cargo build -p toron-cli --bin toron
       - name: cargo test -p toron-e2e --features p2
         run: cargo test -p toron-e2e --features p2
