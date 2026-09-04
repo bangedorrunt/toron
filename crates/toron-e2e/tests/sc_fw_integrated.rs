@@ -76,7 +76,7 @@ async fn sc_fw_one_process_peer_mail_via_bus() {
     // ONE process: mailbox + bus share the pool; there is no second daemon.
     let (mailbox, bus) = boot(&dir).await;
 
-    let pi = register(&mailbox, "demo", "PiAlpha").await;
+    let _pi = register(&mailbox, "demo", "PiAlpha").await;
     let oc = register(&mailbox, "demo", "OCBeta").await;
 
     // OC-β subscribes to its own gift wraps BEFORE the send (push path).
