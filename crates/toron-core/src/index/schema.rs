@@ -94,9 +94,62 @@ pub async fn connect_single(db_path: &str) -> anyhow::Result<SqliteConnection> {
     Ok(conn)
 }
 
-/// Apply all embedded migrations.
+/// Apply all embedded migrations, serialized against concurrent migrators
+/// of the SAME database file (GS-018): sqlx inserts one row per version
+/// into `_sqlx_migrations`, so two processes/threads migrating a fresh
+/// shared file (e.g. the durable root under parallel test binaries) race
+/// the INSERT and die with `UNIQUE constraint failed:
+/// _sqlx_migrations.version`. The lock is an atomic `create_new` file
+/// beside the DB (O_CREAT|O_EXCL — no new deps, POSIX-atomic); stale
+/// holders (crashed mid-migrate) expire after 120s by mtime. Memory DBs
+/// skip the lock. Lock is always removed, success or failure.
 pub async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
-    MIGRATOR.run(pool).await?;
+    let lock_path: Option<std::path::PathBuf> = pool
+        .connect_options()
+        .get_filename()
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(|p| p.join(".migrate.lock"));
+    if let Some(lock) = lock_path.clone() {
+        let start = std::time::Instant::now();
+        loop {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&lock)
+            {
+                Ok(f) => {
+                    drop(f);
+                    break;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let stale = std::fs::metadata(&lock)
+                        .and_then(|m| m.modified())
+                        .ok()
+                        .and_then(|t| t.elapsed().ok())
+                        .map(|d| d.as_secs() > 120)
+                        .unwrap_or(false);
+                    if stale {
+                        let _ = std::fs::remove_file(&lock);
+                        continue;
+                    }
+                    if start.elapsed().as_secs() > 300 {
+                        anyhow::bail!(
+                            "migrate lock held over 300s at {} — holder crashed without cleanup?",
+                            lock.display()
+                        );
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+                Err(e) => anyhow::bail!("migrate lock at {}: {e:#}", lock.display()),
+            }
+        }
+    }
+    let out = MIGRATOR.run(pool).await;
+    if let Some(lock) = lock_path {
+        let _ = std::fs::remove_file(&lock);
+    }
+    out?;
     Ok(())
 }
 
