@@ -113,6 +113,7 @@ fn pid_is_toron_serve(pid: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::process::CommandExt as _;
 
     #[test]
     fn second_acquire_on_live_pid_fails() {
@@ -194,10 +195,14 @@ mod tests {
         ));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
-        // Spawn a child whose args contain "toron" to simulate a live serve
-        let mut child = std::process::Command::new("sh")
-            .arg("-c")
-            .arg("exec -a toron sleep 30")
+        // Spawn a child whose argv[0] is "toron" to simulate a live
+        // serve. Uses Command::arg0 (portable) — the old `sh -c "exec -a
+        // toron …"` form depends on shell-specific exec -a semantics and
+        // silently produced argv[0]=sh on runners whose /bin/sh lacks it
+        // (GS-018: Ubuntu CI failed the detect assert).
+        let mut child = std::process::Command::new("sleep")
+            .arg0("toron")
+            .arg("30")
             .spawn()
             .expect("spawn fake toron");
         let pid = child.id();
