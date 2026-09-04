@@ -217,7 +217,7 @@ flowchart LR
 - [ ] `cargo test catalog_freshness` green; `toron catalog --json` regen only if CLI surface grew; MCP tool count still 40.
 - [ ] Exhaustive-match guard: no silent `_` over live `Cmd` arms; source-guard test fails on new unhandled arm.
 - [ ] `Invoke` LoudMiss gone (wired to `engine.invoke` + `VerifySink` behind playbook gate, or arm deleted with bead); `WriteNcryptsec` arm gone; dead `ClaimWatch→Subscribe` gone or routed.
-- [ ] WaitCorr unparks on bus event without poll peek (S5-class test mirroring `live_watch_wait_corr_unparks_on_receipt`); `pending_wait` bounded (TTL + cap test).
+- [x] WaitCorr unparks on bus event without poll peek (S5-class test mirroring `live_watch_wait_corr_unparks_on_receipt`); `pending_wait` bounded (TTL + cap test). **Live 2026-09-04 (GS-018):** toron `live_watch_wait_corr_unparks_on_receipt` green on CI; flywheel drain gated to watch batches (`drain_waits`, GS-016/017) — the peek is the post-wake fast path E2 specifies. Two consumers of one held bus: toron CLI parks a caller (`wait --corr`), flywheel parks model interest (`pending_wait`); both complete on the kind-9/14 ring + receipts sqlite.
 - [ ] Kind-9 alone never inserts assignment; `thread_id`-as-`corr` test fails loud; tasked corr survives walker death via sqlite rebuild (S1/S2 green).
 - [ ] One `HumanDecision` per corr over live mail path with `corr` tag (no test pre-seed); duplicate/unknown corr → LoudMiss (S4 green).
 - [ ] `why --corr/--seq` fold from journal reproduces the `Vec<Cmd>`; pin-substring grep is never truth.
