@@ -174,8 +174,23 @@ async fn resolve(resonate: &Resonate, id: &str, value: serde_json::Value) -> any
     Ok(())
 }
 
+/// `resonate` presence probe (GS-018): the CI runner has no herdr/resonate
+/// stack. Absence is environmental, not a product failure — skip loud and
+/// let dev machines (stack adjacent) run the real proof.
+fn has_resonate() -> bool {
+    std::process::Command::new("resonate")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
 #[tokio::test]
 async fn concurrency_spike() {
+    if !has_resonate() {
+        eprintln!("SKIP: no `resonate` binary (needs herdr/resonate stack; runs on dev machines)");
+        return;
+    }
     let dir = std::env::temp_dir().join(format!("toron-sc16-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
     let port = free_port();
