@@ -62,7 +62,23 @@ pub fn free_port() -> u16 {
 /// Boot a persistent `resonate serve` (sqlite) in `dir`. The child is the
 /// server; dropping it must NOT lose durable state (the restart rows rely on
 /// this — the server outlives the worker).
-pub fn boot_server(port: u16, dir: &std::path::Path) -> Child {
+/// `true` when the external `resonate` binary is installed (GS-018:
+/// hosted CI runners lack the herdr/resonate stack).
+pub fn has_resonate() -> bool {
+    Command::new("resonate")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Boot a persistent `resonate serve` (sqlite) in `dir`. The child is the
+/// server; dropping it must NOT lose durable state (the restart rows rely on
+/// this — the server outlives the worker).
+pub fn boot_server(port: u16, dir: &std::path::Path) -> Option<Child> {
+    if !has_resonate() {
+        return None;
+    }
     Command::new("resonate")
         .args([
             "serve",
@@ -77,7 +93,7 @@ pub fn boot_server(port: u16, dir: &std::path::Path) -> Child {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .expect("spawn resonate server")
+        .ok()
 }
 
 /// Block until the server's HTTP port accepts TCP (bounded poll).

@@ -76,7 +76,10 @@ async fn sc24_catchup_loop_wakes_and_fires_single_tick() {
     std::fs::create_dir_all(&dir).unwrap();
     let port = free_port();
     let server_url = format!("http://127.0.0.1:{port}");
-    let mut server = boot_server(port, &dir);
+    let Some(mut server) = boot_server(port, &dir) else {
+        eprintln!("SKIP: no `resonate` binary (needs herdr/resonate stack; runs on dev machines)");
+        return;
+    };
     wait_ready(&server_url).await;
 
     // Every-second cron (6-field) so a tick lands well within the test.
