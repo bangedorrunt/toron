@@ -2474,6 +2474,15 @@ fn guard_commit_msg_blocks_foreign_bead_tokens() {
     };
 
     assert!(git(&["init", "-q"]).status.success(), "git init");
+    // CI runners have no global git identity — the fixture must carry its
+    // own or every `git commit` below fails with "tell me who you are"
+    // (GS-018: build-job red on toron-only runners).
+    assert!(
+        git(&["config", "user.email", "ci@toron.invalid"])
+            .status
+            .success()
+    );
+    assert!(git(&["config", "user.name", "toron-ci"]).status.success());
     // Lease covers the file so the pre-commit sweep passes; only the
     // bead-hunk check may block.
     let mut acq = Command::new(env!("CARGO_BIN_EXE_toron"));
