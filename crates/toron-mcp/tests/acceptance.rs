@@ -64,9 +64,29 @@ const AM_RUST_TOOLS: [&str; 38] = [
     "release_build_slot",
 ];
 
+/// Isolated router per test (GS-018): each test gets its own data dir +
+/// operator key, so parallel tests (same binary or sibling binaries in one
+/// `cargo test --workspace` run) never share a sqlite file. Sharing the
+/// durable root caused migration races (`UNIQUE ... _sqlx_migrations`) and
+/// write-lock convoys (`database is locked`) on loaded runners. Uses the
+/// bd-6wfv explicit-paths API — no process-global env reads.
+async fn isolated_router() -> anyhow::Result<axum::Router> {
+    let dir = std::env::temp_dir().join(format!("toron-accept-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir)?;
+    let keys = toron_core::keys::generate();
+    let key_path = dir.join("op.ncryptsec");
+    toron_core::keys::write_encrypted_key(
+        &key_path,
+        &keys,
+        "test-pass",
+        toron_core::keys::TEST_LOG_N,
+    )?;
+    toron_mcp::router_with_isolated(dir, key_path, "test-pass").await
+}
+
 #[tokio::test]
 async fn http_resources_list_and_read() -> anyhow::Result<()> {
-    let router = toron_mcp::router().await?;
+    let router = isolated_router().await?;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, router).await });
@@ -119,7 +139,7 @@ async fn http_resources_list_and_read() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn http_initialize_negotiates_2026_07_28() -> anyhow::Result<()> {
-    let router = toron_mcp::router().await?;
+    let router = isolated_router().await?;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, router).await });
@@ -170,7 +190,7 @@ async fn http_initialize_negotiates_2026_07_28() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn http_lists_exactly_38_am_rust_tools() -> anyhow::Result<()> {
-    let router = toron_mcp::router().await?;
+    let router = isolated_router().await?;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, router).await });
@@ -321,7 +341,7 @@ async fn blossom_route_serves_upload_and_retrieval() -> anyhow::Result<()> {
     use http_body_util::BodyExt;
     use tower::ServiceExt;
 
-    let router = toron_mcp::router().await?;
+    let router = isolated_router().await?;
     // Directly exercise the merged router (no socket needed for the contract).
     let payload = b"blossom round-trip payload";
 
