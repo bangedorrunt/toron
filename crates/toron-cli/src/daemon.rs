@@ -63,6 +63,7 @@ pub fn effective_passphrase() -> String {
 }
 
 /// Render the launchd plist (pure — golden-tested).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn plist_xml(
     label: &str,
     binary: &Path,
@@ -125,6 +126,7 @@ pub fn plist_xml(
 /// Weekly rotation left `resonate.out.log` at 1.3GB (`RUST_LOG=info` doorbell
 /// poll-fail storm). Hourly + 1 MiB threshold caps both daemons. Pure —
 /// golden-tested.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn logrotate_plist_xml() -> String {
     let script = r#"for f in "$HOME/.local/state/toron/serve.out.log" "$HOME/.local/state/toron/serve.err.log" "$HOME/.local/state/flywheel/resonate.out.log" "$HOME/.local/state/flywheel/resonate.err.log"; do [ -f "$f" ] || continue; sz=$(stat -f%z "$f" 2>/dev/null || stat -c%s "$f"); if [ "$sz" -gt 1048576 ]; then cp "$f" "$f.1" && : > "$f"; fi; done"#;
     format!(
@@ -205,6 +207,7 @@ pub fn addr_alive(addr: &str) -> bool {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DaemonState {
     /// Running under launchd (macOS).
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     RunningLaunchd,
     /// Running under systemd (Linux).
     #[cfg_attr(target_os = "macos", allow(dead_code))]
@@ -236,10 +239,10 @@ pub fn detect_state(label: &str, pidfile: &Path, addr: &str) -> DaemonState {
         let out = Command::new("systemctl")
             .args(["--user", "is-active", label])
             .output();
-        if let Ok(o) = out {
-            if String::from_utf8_lossy(&o.stdout).trim() == "active" {
-                return DaemonState::RunningSystemd;
-            }
+        if let Ok(o) = out
+            && String::from_utf8_lossy(&o.stdout).trim() == "active"
+        {
+            return DaemonState::RunningSystemd;
         }
     }
     if let Some(pid) = read_pidfile(pidfile)
@@ -299,6 +302,7 @@ pub fn wait_addr(addr: &str, secs: u64) -> bool {
 }
 
 /// Current uid via `id -u` (keeps the crate unsafe-free).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn current_uid() -> String {
     let out = Command::new("id").arg("-u").output();
     out.ok()
@@ -342,14 +346,16 @@ pub fn install(args: &super::cli::DaemonArgs) -> anyhow::Result<()> {
     std::fs::create_dir_all(&state)?;
     let pass = ensure_passphrase_file()?;
     let key_path = toron_core::config::ToronPaths::resolve().operator_key_path();
-    let out_log = state.join("serve.out.log");
-    let err_log = state.join("serve.err.log");
+    let _out_log = state.join("serve.out.log");
+    let _err_log = state.join("serve.err.log");
     let addr = args.addr.clone();
     let label = args.label.clone();
 
     #[cfg(target_os = "macos")]
     {
-        let plist = plist_xml(&label, &binary, &addr, &key_path, &pass, &out_log, &err_log);
+        let plist = plist_xml(
+            &label, &binary, &addr, &key_path, &pass, &_out_log, &_err_log,
+        );
         let dir = home_launch_agents()?;
         std::fs::create_dir_all(&dir)?;
         let plist_path = dir.join(format!("{label}.plist"));
@@ -424,7 +430,7 @@ pub fn install(args: &super::cli::DaemonArgs) -> anyhow::Result<()> {
 
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
-        let _ = (&key_path, &out_log, &err_log, &addr);
+        let _ = (&key_path, &_out_log, &_err_log, &addr);
         anyhow::bail!("daemon install: unsupported host — use `toron daemon start` (pidfile mode)")
     }
 
@@ -456,6 +462,7 @@ fn install_logrotate_agent(dir: &Path, uid: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn home_launch_agents() -> anyhow::Result<PathBuf> {
     let home = std::env::var("HOME")
         .map_err(|_| anyhow::anyhow!("HOME unset; cannot locate LaunchAgents"))?;
@@ -464,10 +471,10 @@ fn home_launch_agents() -> anyhow::Result<PathBuf> {
 
 #[cfg(target_os = "linux")]
 fn home_systemd_user() -> anyhow::Result<PathBuf> {
-    if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
-        if !xdg.is_empty() {
-            return Ok(PathBuf::from(xdg).join("systemd").join("user"));
-        }
+    if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME")
+        && !xdg.is_empty()
+    {
+        return Ok(PathBuf::from(xdg).join("systemd").join("user"));
     }
     let home = std::env::var("HOME")
         .map_err(|_| anyhow::anyhow!("HOME unset; cannot locate systemd user units"))?;
@@ -603,7 +610,7 @@ pub fn start(args: &super::cli::DaemonArgs) -> anyhow::Result<()> {
             );
         }
         println!("started {label} (systemd)");
-        return Ok(());
+        Ok(())
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
@@ -633,7 +640,7 @@ fn spawn_pidfile(state: &Path, addr: &str) -> anyhow::Result<()> {
 /// `stop`: bootout/systemctl stop/pidfile SIGTERM. Idempotent.
 pub fn stop(args: &super::cli::DaemonArgs) -> anyhow::Result<()> {
     let state = args.state_dir.clone().unwrap_or_else(default_state_dir);
-    let pidfile = state.join("toron.pid");
+    let _pidfile = state.join("toron.pid");
     let label = args.label.clone();
     #[cfg(target_os = "macos")]
     {
@@ -657,7 +664,7 @@ pub fn stop(args: &super::cli::DaemonArgs) -> anyhow::Result<()> {
                 return Ok(());
             }
         }
-        if let Some(pid) = read_pidfile(&pidfile)
+        if let Some(pid) = read_pidfile(&_pidfile)
             && process_alive(pid)
         {
             let _ = Command::new("kill").arg(pid.to_string()).output();
@@ -709,7 +716,7 @@ pub fn stop(args: &super::cli::DaemonArgs) -> anyhow::Result<()> {
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
-        if let Some(pid) = read_pidfile(&pidfile) {
+        if let Some(pid) = read_pidfile(&_pidfile) {
             if process_alive(pid) {
                 let _ = Command::new("kill").arg(pid.to_string()).output();
                 println!("stopped {label} (pid {pid})");
