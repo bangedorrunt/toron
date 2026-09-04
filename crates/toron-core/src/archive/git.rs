@@ -249,6 +249,17 @@ impl GitArchive {
         }
     }
 
+    /// Daemon archive identity (GS-018): archive commits carry an explicit
+    /// fixed signature, never ambient `repo.signature()`. Ambient identity
+    /// fails where no git config exists (CI runners, containers) and
+    /// misattributes machine-written history to whoever owns $HOME.
+    pub fn archive_signature() -> anyhow::Result<git2::Signature<'static>> {
+        Ok(git2::Signature::now(
+            "toron-archive",
+            "toron-archive@invalid",
+        )?)
+    }
+
     fn commit_pending(
         &self,
         message: &str,
@@ -256,7 +267,7 @@ impl GitArchive {
     ) -> anyhow::Result<git2::Oid> {
         let tree_id = tree_from_head_plus(&self.repo, files)?;
         let tree = self.repo.find_tree(tree_id)?;
-        let sig = self.repo.signature()?;
+        let sig = Self::archive_signature()?;
         let parent = self.repo.head().ok().and_then(|h| h.peel_to_commit().ok());
         let parent_refs: Vec<&git2::Commit> = parent.iter().collect();
         Ok(self.repo.commit(
@@ -449,7 +460,7 @@ mod tests {
         index.write().unwrap();
         let tree_id = index.write_tree().unwrap();
         let tree = repo.find_tree(tree_id).unwrap();
-        let sig = repo.signature().unwrap();
+        let sig = GitArchive::archive_signature().expect("sig");
         repo.commit(Some("HEAD"), &sig, &sig, message, &tree, parents)
             .unwrap()
     }
