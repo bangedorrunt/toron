@@ -348,58 +348,38 @@ impl BusEventStore {
     pub async fn replay(&self, filter: &crate::bus::Filter) -> anyhow::Result<Vec<Event>> {
         let limit = filter.limit.unwrap_or(1000).min(MAX_STORED_EVENTS as usize);
 
-        // Predicates, in bind order: ?1 expiry, then kinds, then p values,
-        // then e values, then the trailing limit.
-        let mut preds: Vec<String> = vec!["(expires_at IS NULL OR expires_at > ?1)".to_string()];
+        // Predicate pieces, composed inside scan_ids (bd-bus-scan): ?1 expiry,
+        // then a kind list (`kind IN (…)`, single combined query) OR a
+        // per-kind split (`kind = ?2`, index-served), then p values, then e
+        // values, then the trailing limit. Placeholders are renumbered inside
+        // scan_ids per branch, so only the tag VALUES are passed here.
+        let expiry_pred = "(expires_at IS NULL OR expires_at > ?1)".to_string();
         let mut kinds_binds: Vec<i64> = Vec::new();
-        let mut p_binds: Vec<String> = Vec::new();
-        let mut e_binds: Vec<String> = Vec::new();
-        let mut next = 2usize;
 
+        let mut kind_in_pred: Option<String> = None;
         if let Some(kinds) = &filter.kinds
             && !kinds.is_empty()
         {
-            let placeholders: Vec<String> = (next..next + kinds.len())
-                .map(|i| format!("?{i}"))
-                .collect();
-            next += kinds.len();
+            let placeholders: Vec<String> = (2..2 + kinds.len()).map(|i| format!("?{i}")).collect();
             kinds_binds = kinds.iter().map(|k| k.as_u16() as i64).collect();
-            preds.push(format!("kind IN ({})", placeholders.join(",")));
+            kind_in_pred = Some(format!("kind IN ({})", placeholders.join(",")));
         }
 
-        let p_vals = filter.generic_tags.get(&SingleLetterTag::LOWERCASE_P);
-        if let Some(vals) = p_vals
-            && !vals.is_empty()
-        {
-            let placeholders: Vec<String> =
-                (next..next + vals.len()).map(|i| format!("?{i}")).collect();
-            next += vals.len();
-            p_binds = vals.iter().cloned().collect();
-            preds.push(format!(
-                "event_id IN (SELECT event_id FROM bus_event_tags \
-                 WHERE tag_kind = 'p' AND tag_value IN ({}))",
-                placeholders.join(",")
-            ));
-        }
+        let p_vals: Vec<String> = filter
+            .generic_tags
+            .get(&SingleLetterTag::LOWERCASE_P)
+            .map(|vals| vals.iter().cloned().collect())
+            .unwrap_or_default();
+        let e_vals: Vec<String> = filter
+            .generic_tags
+            .get(&SingleLetterTag::LOWERCASE_E)
+            .map(|vals| vals.iter().cloned().collect())
+            .unwrap_or_default();
 
-        let e_vals = filter.generic_tags.get(&SingleLetterTag::LOWERCASE_E);
-        if let Some(vals) = e_vals
-            && !vals.is_empty()
-        {
-            let placeholders: Vec<String> =
-                (next..next + vals.len()).map(|i| format!("?{i}")).collect();
-            e_binds = vals.iter().cloned().collect();
-            preds.push(format!(
-                "event_id IN (SELECT event_id FROM bus_event_tags \
-                 WHERE tag_kind = 'e' AND tag_value IN ({}))",
-                placeholders.join(",")
-            ));
-        }
-
-        // bd-cumj newest-tail semantics in SQL: the DESC subquery takes the
-        // NEWEST `limit` of the matched set (never truncating the latest
-        // state), and the outer query re-emits it in ASC envelope order.
-        // The matched set is never materialized beyond `limit` rows.
+        // bd-cumj newest-tail semantics: the scan takes the NEWEST `limit` of
+        // the matched set (never truncating the latest state), and re-emits
+        // it in ASC envelope order. The matched set is never materialized
+        // beyond `limit` rows.
         //
         // LIMIT is pushed only when the SQL predicate set FULLY decides the
         // match (expiry + kinds + #p/#e). Filters carrying non-pushed
@@ -436,8 +416,8 @@ impl BusEventStore {
         extra_tags.sort();
         let fkey = FilterKey {
             kinds: kinds_binds.clone(),
-            p: p_binds.clone(),
-            e: e_binds.clone(),
+            p: p_vals.clone(),
+            e: e_vals.clone(),
             limit,
             sql_exact,
             extra: format!(
@@ -473,10 +453,11 @@ impl BusEventStore {
                 let v0 = self.current_mutations().await;
                 let scanned = self
                     .scan_ids(
-                        &preds.join("\n               AND "),
-                        kinds_binds,
-                        &p_binds,
-                        &e_binds,
+                        &expiry_pred,
+                        kind_in_pred.as_deref(),
+                        &kinds_binds,
+                        &p_vals,
+                        &e_vals,
                         sql_exact,
                         limit,
                     )
@@ -675,48 +656,143 @@ impl BusEventStore {
     /// Phase-1 id-scan — the only query the snapshot memo skips (bd-3gwy).
     /// Newest-tail `limit` when the predicate set fully decides the match
     /// (bd-cumj), re-emitted in ASC envelope order.
+    ///
+    /// bd-bus-scan: SQLite will not merge a `kind IN (…)` range with
+    /// `ORDER BY created_at DESC` through the composite index — the plan
+    /// degrades to a MULTI-INDEX OR walk of EVERY row (via
+    /// `bus_events_expires`) plus a TEMP B-TREE sort, which on a large store
+    /// spilled 48–128 GB RSS overnight (bd-741i) and produced the 1–2 s
+    /// replay queries. Splitting into one query per kind turns each into an
+    /// index-served walk of `bus_events_kind_created` (single-kind shape
+    /// verified via EXPLAIN QUERY PLAN); the per-kind DESC lists are merged
+    /// in Rust with the identical `(created_at, event_id)` comparator,
+    /// truncated to `limit` when pushdown is exact, and re-emitted ASC.
+    /// (8 bind-related params; clippy allowance matches mailbox convention.)
+    #[allow(clippy::too_many_arguments)]
     async fn scan_ids(
         &self,
-        preds_sql: &str,
-        kinds_binds: Vec<i64>,
-        p_binds: &[String],
-        e_binds: &[String],
+        expiry_pred: &str,
+        kind_in_pred: Option<&str>,
+        kinds: &[i64],
+        p_vals: &[String],
+        e_vals: &[String],
         sql_exact: bool,
         limit: usize,
     ) -> anyhow::Result<Vec<String>> {
-        let next = 2 + kinds_binds.len() + p_binds.len() + e_binds.len();
-        let limit_clause = if sql_exact {
-            format!(" LIMIT ?{next}")
-        } else {
-            String::new()
+        // p/e subquery parts, placeholder-numbered per branch (bind order:
+        // ?1 expiry, then [?2 kind], then p values, then e values, then limit).
+        let p_part = |start: usize| -> (String, usize) {
+            if p_vals.is_empty() {
+                return (String::new(), start);
+            }
+            let ph: Vec<String> = (start..start + p_vals.len())
+                .map(|i| format!("?{i}"))
+                .collect();
+            (
+                format!(
+                    " AND event_id IN (SELECT event_id FROM bus_event_tags \
+                     WHERE tag_kind = 'p' AND tag_value IN ({}))",
+                    ph.join(",")
+                ),
+                start + p_vals.len(),
+            )
         };
-        let inner = format!(
-            "SELECT event_id, created_at FROM bus_events
-             WHERE {preds_sql}
-             ORDER BY created_at DESC, event_id DESC{limit_clause}"
-        );
-        let sql = format!(
-            "SELECT event_id FROM ({inner})
-             ORDER BY created_at ASC, event_id ASC"
-        );
-        let mut q = sqlx::query_as::<_, (String,)>(&sql).bind(Timestamp::now().as_secs() as i64);
-        for b in kinds_binds {
-            q = q.bind(b);
+        let e_part = |start: usize| -> (String, usize) {
+            if e_vals.is_empty() {
+                return (String::new(), start);
+            }
+            let ph: Vec<String> = (start..start + e_vals.len())
+                .map(|i| format!("?{i}"))
+                .collect();
+            (
+                format!(
+                    " AND event_id IN (SELECT event_id FROM bus_event_tags \
+                     WHERE tag_kind = 'e' AND tag_value IN ({}))",
+                    ph.join(",")
+                ),
+                start + e_vals.len(),
+            )
+        };
+        let limit_clause = |next: usize| {
+            if sql_exact {
+                format!(" LIMIT ?{next}")
+            } else {
+                String::new()
+            }
+        };
+        let now = Timestamp::now().as_secs() as i64;
+
+        // (event_id, created_at) rows in DESC order (the merge input).
+        let mut rows: Vec<(String, i64)> = Vec::new();
+        match kind_in_pred {
+            None => {
+                // No kind filter: single combined query. Kinds-empty filters
+                // are rare, so the un-splittable plan is acceptable here.
+                let (p_part, after_p) = p_part(2);
+                let (e_part, after_e) = e_part(after_p);
+                let next = after_e;
+                let sql = format!(
+                    "SELECT event_id, created_at FROM bus_events
+                     WHERE {expiry_pred}{p_part}{e_part}
+                     ORDER BY created_at DESC, event_id DESC{}",
+                    limit_clause(next)
+                );
+                let mut q = sqlx::query_as::<_, (String, i64)>(&sql).bind(now);
+                for b in p_vals {
+                    q = q.bind(b.as_str());
+                }
+                for b in e_vals {
+                    q = q.bind(b.as_str());
+                }
+                if sql_exact {
+                    q = q.bind(limit as i64);
+                }
+                rows = q.fetch_all(&self.pool).await?;
+            }
+            Some(_) => {
+                // Per-kind split: each kind gets its own index-served query
+                // (`kind = ?2`, still filtered by expiry + p/e), so no row of
+                // a non-requested kind is ever walked and ORDER BY is served
+                // by bus_events_kind_created without a temp sort. Per-kind
+                // LIMIT n is safe for exact pushdown: a row outside its own
+                // kind's top-n is beaten by n rows of that kind, so it can
+                // never be in the global top-n.
+                for kind in kinds {
+                    let (p_part, after_p) = p_part(3);
+                    let (e_part, after_e) = e_part(after_p);
+                    let next = after_e;
+                    let sql = format!(
+                        "SELECT event_id, created_at FROM bus_events
+                         WHERE {expiry_pred} AND kind = ?2{p_part}{e_part}
+                         ORDER BY created_at DESC, event_id DESC{}",
+                        limit_clause(next)
+                    );
+                    let mut q = sqlx::query_as::<_, (String, i64)>(&sql)
+                        .bind(now)
+                        .bind(kind);
+                    for b in p_vals {
+                        q = q.bind(b.as_str());
+                    }
+                    for b in e_vals {
+                        q = q.bind(b.as_str());
+                    }
+                    if sql_exact {
+                        q = q.bind(limit as i64);
+                    }
+                    rows.extend(q.fetch_all(&self.pool).await?);
+                }
+            }
         }
-        for b in p_binds {
-            q = q.bind(b.as_str());
+
+        // Merge with the exact comparator SQLite used (ORDER BY created_at
+        // DESC, event_id DESC), keep the newest `limit` when exact, then
+        // re-emit ASC — the order the caller's drain relies on.
+        rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| b.0.cmp(&a.0)));
+        if sql_exact && rows.len() > limit {
+            rows.truncate(limit);
         }
-        for b in e_binds {
-            q = q.bind(b.as_str());
-        }
-        if sql_exact {
-            q = q.bind(limit as i64);
-        }
-        Ok(q.fetch_all(&self.pool)
-            .await?
-            .into_iter()
-            .map(|(id,)| id)
-            .collect())
+        rows.reverse();
+        Ok(rows.into_iter().map(|(id, _)| id).collect())
     }
 
     /// Keep-alive interval for the prune loop.
@@ -835,6 +911,131 @@ mod tests {
 
         let wrong = crate::bus::project_filter("other");
         assert!(store.replay(&wrong).await.expect("replay").is_empty());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// bd-bus-scan gate: the per-kind split in `scan_ids` preserves the exact
+    /// contract the single combined query produced — newest-tail `limit`
+    /// ACROSS kinds (DESC by created_at, event_id), expiry exclusion, p-tag
+    /// narrowing, and ASC envelope order.
+    #[tokio::test]
+    async fn test_replay_per_kind_split_newest_tail_expiry_and_p() {
+        let (store, _pool, path) = temp_store().await;
+        let keys = Keys::generate();
+        let k1 = crate::nostr::Kind::TextNote;
+        let k2 = crate::nostr::kinds::toron_kind(crate::nostr::kinds::AGENT_PROFILE);
+        let t = |secs: u64| Timestamp::from(secs);
+
+        // Interleaved created_at across two kinds, inserted out of order.
+        let mut evs = Vec::new();
+        let mut push = |kind: crate::nostr::Kind, secs: u64, content: &str| {
+            let ev = build_event(
+                &keys,
+                kind,
+                content,
+                vec![Tag::parse(["t", "demo"]).expect("t")],
+                t(secs),
+            )
+            .expect("build");
+            evs.push(ev.clone());
+            ev
+        };
+        push(k1, 100, "a"); // kind 1 @100
+        push(k2, 150, "b"); // kind 2 @150
+        push(k1, 200, "c"); // kind 1 @200
+        push(k2, 250, "d"); // kind 2 @250
+        push(k1, 300, "e"); // kind 1 @300
+        push(k2, 350, "f"); // kind 2 @350
+        push(k1, 400, "g"); // kind 1 @400
+        push(k2, 450, "h"); // kind 2 @450
+        for ev in &evs {
+            store.insert(ev).await.expect("insert");
+        }
+
+        // A NIP-40-expired row must never surface (prune may not have run).
+        let expired = build_event(
+            &keys,
+            k1,
+            "expired",
+            vec![
+                Tag::parse(["t", "demo"]).expect("t"),
+                Tag::expiration(t(420)),
+            ],
+            t(500),
+        )
+        .expect("build");
+        store.insert(&expired).await.expect("insert expired");
+
+        // Newest-tail across kinds: top-3 = @450 (k2), @400 (k1), @350 (k2),
+        // re-emitted in ASC envelope order.
+        let filter = crate::bus::Filter::new().kinds([k1, k2]).limit(3);
+        let replayed = store.replay(&filter).await.expect("replay");
+        let ids: Vec<u64> = replayed.iter().map(|e| e.created_at.as_secs()).collect();
+        assert_eq!(
+            ids,
+            vec![350, 400, 450],
+            "newest-tail across kinds, ASC order"
+        );
+
+        // No expiry leakage with a limit that would otherwise include it.
+        let all = crate::bus::Filter::new().kinds([k1, k2]).limit(100);
+        let replayed = store.replay(&all).await.expect("replay all");
+        let secs: Vec<u64> = replayed.iter().map(|e| e.created_at.as_secs()).collect();
+        assert_eq!(secs, vec![100, 150, 200, 250, 300, 350, 400, 450]);
+        assert!(
+            replayed.iter().all(|e| e.content != "expired"),
+            "expired event must never surface"
+        );
+
+        // #p narrowing still applies inside the split scan.
+        let target = Keys::generate();
+        let p_ev = build_event(
+            &keys,
+            k2,
+            "p-tagged",
+            vec![
+                Tag::parse(["t", "demo"]).expect("t"),
+                Tag::public_key(target.public_key()),
+            ],
+            t(600),
+        )
+        .expect("build");
+        store.insert(&p_ev).await.expect("insert p");
+        let p_filter = crate::bus::Filter::new()
+            .kinds([k1, k2])
+            .pubkey(target.public_key());
+        let replayed = store.replay(&p_filter).await.expect("replay p");
+        assert_eq!(replayed.len(), 1, "only the p-tagged event matches");
+        assert_eq!(replayed[0].id, p_ev.id);
+
+        // Same-created_at tie-break: DESC by event_id hex, then ASC re-emit.
+        let tie_a = build_event(
+            &keys,
+            k1,
+            "tie-a",
+            vec![Tag::parse(["t", "demo"]).expect("t")],
+            t(700),
+        )
+        .expect("build");
+        let tie_b = build_event(
+            &keys,
+            k1,
+            "tie-b",
+            vec![Tag::parse(["t", "demo"]).expect("t")],
+            t(700),
+        )
+        .expect("build");
+        store.insert(&tie_a).await.expect("insert tie_a");
+        store.insert(&tie_b).await.expect("insert tie_b");
+        let tie = crate::bus::Filter::new().kinds([k1]).limit(2);
+        let replayed = store.replay(&tie).await.expect("replay tie");
+        let ids: Vec<String> = replayed.iter().map(|e| e.id.to_hex()).collect();
+        assert_eq!(ids.len(), 2);
+        let mut sorted = ids.clone();
+        sorted.sort(); // ASC envelope = smaller event_id first on the tie
+        assert_eq!(ids, sorted);
+        assert!(ids.contains(&tie_a.id.to_hex()) && ids.contains(&tie_b.id.to_hex()));
+
         let _ = std::fs::remove_file(&path);
     }
 

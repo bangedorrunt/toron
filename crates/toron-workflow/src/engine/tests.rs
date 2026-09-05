@@ -2151,3 +2151,88 @@ steps:
         "sink must be attached: {out}"
     );
 }
+
+/// bd-engine-invoke-binds-defaults-o1ud (GS-028 NEW-8 residual): declared
+/// `inputs[].default` values bind under provided inputs on the invoke path,
+/// visible as both `{{inputs.x}}` and `{{trigger.x}}`. Provided wins.
+#[tokio::test]
+async fn engine_invoke_binds_defaults() {
+    use std::sync::Mutex as StdMutex;
+    // Pure merge first (no Resonate needed): defaults bind, provided wins.
+    let wf_decl = parse_workflow(
+        r##"
+name: defaults-pure
+inputs:
+  - name: mode
+    default: "fast"
+  - name: n
+    default: 2
+steps:
+  - name: plan
+    action: send_dm
+    to: "pi"
+    body: "x"
+"##,
+    )
+    .expect("parse defaults workflow");
+    let merged_none = WorkflowEngine::bind_input_defaults(&wf_decl.inputs, &serde_json::json!({}));
+    assert_eq!(
+        merged_none.get("mode").and_then(|v| v.as_str()),
+        Some("fast")
+    );
+    assert_eq!(merged_none.get("n").and_then(|v| v.as_i64()), Some(2));
+    let merged_over = WorkflowEngine::bind_input_defaults(
+        &wf_decl.inputs,
+        &serde_json::json!({ "mode": "slow" }),
+    );
+    assert_eq!(
+        merged_over.get("mode").and_then(|v| v.as_str()),
+        Some("slow")
+    );
+    assert_eq!(merged_over.get("n").and_then(|v| v.as_i64()), Some(2));
+
+    // End-to-end through invoke: missing `mode` resolves to the default in
+    // both template positions; provided `goal` passes through.
+    let seen: Arc<StdMutex<Vec<Action>>> = Arc::new(StdMutex::new(Vec::new()));
+    let seen_clone = seen.clone();
+    let runner: ActionRunner = Arc::new(move |a: &Action| {
+        seen_clone.lock().unwrap().push(a.clone());
+        Ok(serde_json::Value::Null)
+    });
+    let engine = WorkflowEngine::local(runner).expect("engine");
+    let wf = parse_workflow(
+        r##"
+name: invoke-defaults
+trigger:
+  type: webhook
+inputs:
+  - name: mode
+    default: "fast"
+  - name: goal
+steps:
+  - name: plan
+    action: send_dm
+    to: "pi"
+    body: "mode={{inputs.mode}} trigger_mode={{trigger.mode}} goal={{inputs.goal}}"
+"##,
+    )
+    .expect("parse invoke-defaults workflow");
+    let output = engine
+        .invoke(
+            "wf-invoke-defaults-1",
+            wf,
+            serde_json::json!({ "goal": "ship" }),
+        )
+        .await
+        .expect("invoke with defaults");
+    assert!(output.get("plan").is_some(), "step ran: {output}");
+    match &seen.lock().unwrap()[0] {
+        Action::SendDm { body, .. } => {
+            assert_eq!(
+                body, "mode=fast trigger_mode=fast goal=ship",
+                "defaults bind under provided inputs: {body}"
+            );
+        }
+        _ => unreachable!(),
+    }
+}

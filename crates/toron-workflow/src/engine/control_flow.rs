@@ -576,20 +576,17 @@ pub(crate) async fn run_retry(
     Ok(out)
 }
 
-/// Run a `branch` action: evaluate the guard; run the `then` or `else` step
-/// list. Returns `{branch: "then"|"else", outputs: {...}}`.
-pub(crate) async fn run_branch(
-    ctx: &Context,
-    runner: &ActionRunner,
+/// Build the guard variable map shared by Branch `if:` guards and graph-node
+/// `guard:` fields (bd-adr0008-guard-fix-16fl): every trigger-payload key
+/// becomes `trigger_<key>` (the invoke path flattens caller inputs onto the
+/// trigger, so an input-gated intent is spelled `trigger_x` in guards — raw
+/// `{{inputs.*}}` templates do NOT resolve in guard position), and every
+/// recorded step output becomes `steps_<name>[_<key>]`. Strings pass through
+/// verbatim; anything else renders as JSON text.
+pub(crate) fn guard_vars(
     trigger: &serde_json::Value,
-    guard: &str,
-    then: &[Step],
-    else_steps: &[Step],
     step_outputs: &serde_json::Map<String, serde_json::Value>,
-) -> resonate_sdk::prelude::Result<serde_json::Value> {
-    use crate::guard::evaluate_guard_default;
-    // Build the guard variable map from the trigger payload: `{{trigger.x}}`
-    // (lint substitutes these to valid identifiers before eval).
+) -> std::collections::HashMap<String, evalexpr::Value> {
     let mut vars = std::collections::HashMap::new();
     if let Some(obj) = trigger.as_object() {
         for (k, v) in obj {
@@ -620,7 +617,33 @@ pub(crate) async fn run_branch(
             vars.insert(name, evalexpr::Value::from(output.to_string()));
         }
     }
+    vars
+}
+
+/// Run a `branch` action: evaluate the guard; run the `then` or `else` step
+pub(crate) async fn run_branch(
+    ctx: &Context,
+    runner: &ActionRunner,
+    trigger: &serde_json::Value,
+    guard: &str,
+    then: &[Step],
+    else_steps: &[Step],
+    step_outputs: &serde_json::Map<String, serde_json::Value>,
+) -> resonate_sdk::prelude::Result<serde_json::Value> {
+    use crate::guard::evaluate_guard_default;
+    // Guard variables (trigger_* + steps_*); shared helper so Branch and
+    // graph-node guards evaluate the same map.
+    let vars = guard_vars(trigger, step_outputs);
     let outcome = evaluate_guard_default(Some(guard), &vars).await;
+    // bd-guard-single-quote-fail-loud-061y (GS-028 NEW-3): a non-boolean
+    // outcome silently takes else — fail LOUD on stderr so a malformed guard
+    // (e.g. single-quoted `'true'`) is observable, never a quiet wrong path.
+    match &outcome {
+        crate::guard::GuardOutcome::Bool(_) | crate::guard::GuardOutcome::Unset => {}
+        other => eprintln!(
+            "[toron-workflow] branch guard non-bool (taking else): guard={guard:?} outcome={other:?}"
+        ),
+    }
     let take_then = matches!(outcome, crate::guard::GuardOutcome::Bool(true));
     let branch_steps = if take_then { then } else { else_steps };
     let mut outputs = serde_json::Map::new();
@@ -935,6 +958,7 @@ pub(crate) async fn run_graph(
                     run_graph_node,
                     GraphNodeInput {
                         action: rendered,
+                        guard: node.guard.clone(),
                         trigger: trigger.clone(),
                         run_id: run_id.to_string(),
                         workflow_name: workflow_name.to_string(),
@@ -1012,6 +1036,7 @@ pub(crate) async fn run_graph(
                             run_graph_node,
                             GraphNodeInput {
                                 action: rendered,
+                                guard: node.guard.clone(),
                                 trigger: trigger.clone(),
                                 run_id: run_id.to_string(),
                                 workflow_name: workflow_name.to_string(),
@@ -1060,6 +1085,13 @@ pub(crate) async fn run_graph(
 pub struct GraphNodeInput {
     /// The (template-rendered) action to execute.
     pub action: Action,
+    /// Per-node `guard:` (bd-adr0008-guard-fix-16fl): evaluated at the top
+    /// of `run_graph_node` with the shared guard variable map
+    /// (`trigger_*` + `steps_*`); a non-true outcome skips the node
+    /// (returns Null, the run continues). `#[serde(default)]` keeps
+    /// in-flight serialized inputs readable.
+    #[serde(default)]
+    pub guard: Option<String>,
     /// The trigger payload (bd-m7ac): control-flow nodes (parallel/foreach/
     /// branch) need it to render their inner steps — the raw runner path did
     /// not. Serialized with the action so the child is self-contained.
@@ -1100,6 +1132,29 @@ pub async fn run_graph_node(
     // never fan out. Leaf actions keep the direct runner path (rendered
     // before the node ran, so no re-render).
     let runner = ctx.get_dependency::<ActionRunner>();
+    // bd-adr0008-guard-fix-16fl: honor per-node `guard:` — the schema
+    // declares it but no path evaluated it. A non-true outcome skips the
+    // node (Null output, the run continues); only Bool(true) — or no
+    // guard at all — proceeds. Same fail-closed contract as a Branch
+    // else-path, evaluated with the shared guard variable map.
+    if input.guard.as_deref().is_some_and(|g| !g.trim().is_empty()) {
+        let vars = guard_vars(&input.trigger, &input.outputs);
+        let outcome = crate::guard::evaluate_guard_default(input.guard.as_deref(), &vars).await;
+        if !matches!(
+            outcome,
+            crate::guard::GuardOutcome::Bool(true) | crate::guard::GuardOutcome::Unset
+        ) {
+            // bd-guard-single-quote-fail-loud-061y: skipping a node on a
+            // non-bool guard must be observable, never silent.
+            if !matches!(outcome, crate::guard::GuardOutcome::Bool(false)) {
+                eprintln!(
+                    "[toron-workflow] graph-node guard non-bool (skipping node): guard={:?} outcome={:?}",
+                    input.guard, outcome
+                );
+            }
+            return Ok(serde_json::Value::Null);
+        }
+    }
     use crate::schema::Step;
 
     // Spec 3: evidence-bearing approval payload (Wave 2)
@@ -1243,4 +1298,30 @@ pub fn build_workflow_run_terminal(
         Timestamp::now(),
     )
     .map_err(|e| anyhow::anyhow!("build kind-46012 terminal: {e}"))
+}
+#[cfg(test)]
+mod control_flow_guard_tests {
+    use super::guard_vars;
+
+    /// bd-adr0008-guard-fix-16fl: the shared guard map flattens the trigger
+    /// payload (caller inputs ride the trigger at invoke) and expands
+    /// recorded step outputs into `steps_*` variables.
+    #[test]
+    fn guard_vars_flattens_trigger_and_outputs() {
+        let trigger =
+            serde_json::json!({"objective": "x", "until": "create", "inputs": {"until": "create"}});
+        let mut outputs = serde_json::Map::new();
+        outputs.insert("grill".to_string(), serde_json::json!({"ok": true}));
+        let vars = guard_vars(&trigger, &outputs);
+        assert_eq!(
+            vars.get("trigger_until"),
+            Some(&evalexpr::Value::from("create")),
+            "inputs ride the trigger as trigger_<key>"
+        );
+        assert_eq!(
+            vars.get("steps_grill_ok"),
+            Some(&evalexpr::Value::from("true")),
+            "object outputs expand to steps_<name>_<key>"
+        );
+    }
 }

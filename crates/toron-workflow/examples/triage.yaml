@@ -13,7 +13,7 @@ trigger:
   type: message_posted
   channel: "#support"
 
-guard: "trigger.importance == 'urgent'"
+guard: "trigger.importance == \"urgent\""
 
 steps:
   - name: ack
@@ -22,7 +22,7 @@ steps:
     body: "Received: {{trigger.subject}}"
 
   - name: dispatch
-    guard: "{{trigger.importance}} == 'urgent'"
+    guard: "{{trigger.importance}} == \"urgent\""
     action: dispatch_job
     assignee: "oc-beta"
     spec:

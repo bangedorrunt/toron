@@ -447,22 +447,47 @@ impl WorkflowEngine {
     /// provided `inputs` so `{{inputs.x}}` / `{{trigger.x}}` resolve on the
     /// invoke path — the SAME durable function as the trigger path, two entry
     /// doors.
+    ///
+    /// Declared defaults (`workflow.inputs[].default`) bind UNDER provided
+    /// values (bd-engine-invoke-binds-defaults-o1ud, GS-028 NEW-8 residual):
+    /// provided wins, missing keys fall back to the declaration.
+    pub fn bind_input_defaults(
+        decls: &[crate::schema::InputDecl],
+        provided: &serde_json::Value,
+    ) -> serde_json::Map<String, serde_json::Value> {
+        let mut merged = serde_json::Map::new();
+        for decl in decls {
+            if let Some(default) = &decl.default {
+                merged.insert(decl.name.clone(), default.clone());
+            }
+        }
+        if let Some(obj) = provided.as_object() {
+            for (k, v) in obj {
+                merged.insert(k.clone(), v.clone());
+            }
+        }
+        merged
+    }
+
     pub async fn invoke(
         &self,
         run_id: &str,
         workflow: crate::schema::Workflow,
         inputs: serde_json::Value,
     ) -> anyhow::Result<serde_json::Value> {
-        // Synthesized trigger payload: the inputs are visible both as
+        // Synthesized trigger payload: the merged inputs are visible both as
         // `{{inputs.<name>}}` (under `inputs`) and `{{trigger.<name>}}`
         // (flattened at the top level).
+        let merged = Self::bind_input_defaults(&workflow.inputs, &inputs);
         let mut trigger = serde_json::Map::new();
-        if let Some(obj) = inputs.as_object() {
-            for (k, v) in obj {
-                trigger.insert(k.clone(), v.clone());
-            }
+        for (k, v) in &merged {
+            trigger.insert(k.clone(), v.clone());
         }
-        trigger.insert("inputs".into(), inputs.clone());
+        if inputs.as_object().is_some() {
+            trigger.insert("inputs".into(), serde_json::Value::Object(merged));
+        } else {
+            trigger.insert("inputs".into(), inputs.clone());
+        }
         let input = RunInput {
             run_id: None,
             workflow,
