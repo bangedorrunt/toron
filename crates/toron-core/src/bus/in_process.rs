@@ -83,6 +83,28 @@ struct Subscriber {
     delivered: Arc<Mutex<HashSet<String>>>,
     /// Set to true once the replay task has pushed history + EOSE.
     replay_done: Arc<std::sync::atomic::AtomicBool>,
+    /// Last channel-full drop report (rate-limits the WARN so a permanently
+    /// slow consumer doesn't flood the log; drops stay exactly counted).
+    last_full_warn: Arc<Mutex<std::time::Instant>>,
+}
+
+impl Subscriber {
+    /// WARN rate limit for channel-full drops (see
+    /// [`InProcessBus::note_full_drop`]).
+    const FULL_WARN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// True when a channel-full WARN should be emitted NOW — at most one per
+    /// `FULL_WARN_INTERVAL` per subscriber. The drop itself is counted on the
+    /// bus regardless (exact observability); this only throttles the log.
+    fn note_full(&self) -> bool {
+        let mut last = self.last_full_warn.lock();
+        let now = std::time::Instant::now();
+        if now.duration_since(*last) < Self::FULL_WARN_INTERVAL {
+            return false;
+        }
+        *last = now;
+        true
+    }
 }
 
 /// Configuration for [`InProcessBus`].
@@ -117,6 +139,12 @@ pub struct InProcessBus {
     config: Arc<InProcessBusConfig>,
     subs: Arc<RwLock<HashMap<SubscriptionId, Arc<Subscriber>>>>,
     next_id: Arc<std::sync::atomic::AtomicU64>,
+    /// Total channel-full drops (fall-behind subscribers): events not
+    /// delivered live, recoverable via store replay. Exact — the
+    /// observability half of the lossless-with-replay contract.
+    full_drops: Arc<std::sync::atomic::AtomicU64>,
+    /// Channel-full WARNs actually emitted (rate-limited per subscriber).
+    full_warns: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl InProcessBus {
@@ -149,6 +177,8 @@ impl InProcessBus {
             config: Arc::new(config),
             subs: Arc::new(RwLock::new(HashMap::new())),
             next_id: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            full_drops: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            full_warns: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
     }
 
@@ -219,11 +249,7 @@ impl InProcessBus {
                 Ok(()) => {}
                 Err(mpsc::error::TrySendError::Full(_)) => {
                     sub.delivered.lock().remove(&id);
-                    tracing::warn!(
-                        sub = %sub.id,
-                        event_id = %event.id,
-                        "subscription channel full; event stays in store for replay"
-                    );
+                    self.note_full_drop(sub, event);
                 }
                 Err(mpsc::error::TrySendError::Closed(_)) => {
                     // Subscriber dropped its receiver; remove the subscription.
@@ -236,17 +262,47 @@ impl InProcessBus {
         match sub.tx.try_send(SubscriptionEvent::Event(event.clone())) {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(_)) => {
-                tracing::warn!(
-                    sub = %sub.id,
-                    event_id = %event.id,
-                    "subscription channel full; event stays in store for replay"
-                );
+                self.note_full_drop(sub, event);
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
                 // Subscriber dropped its receiver; remove the subscription.
                 self.subs.write().remove(&sub.id);
             }
         }
+    }
+
+    /// A fall-behind subscriber: the event is dropped publisher-side and
+    /// stays in the store for cursor-based replay (lossless — the drop is
+    /// never silent data loss). Count every drop exactly on the bus; emit the
+    /// WARN at most once per `Subscriber::FULL_WARN_INTERVAL` per subscriber
+    /// so a permanently slow consumer can't flood the log (the Sep-1 stall
+    /// pattern, bd-bus-scan).
+    fn note_full_drop(&self, sub: &Subscriber, event: &Event) {
+        self.full_drops
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if !sub.note_full() {
+            return;
+        }
+        self.full_warns
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        tracing::warn!(
+            sub = %sub.id,
+            event_id = %event.id,
+            "subscription channel full; event stays in store for replay"
+        );
+    }
+
+    /// Test observability: exact channel-full drop count (every dropped
+    /// event, whether or not its WARN was rate-limited away).
+    #[cfg(test)]
+    pub(crate) fn full_drops(&self) -> u64 {
+        self.full_drops.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Test observability: channel-full WARNs actually emitted.
+    #[cfg(test)]
+    pub(crate) fn full_warns(&self) -> u64 {
+        self.full_warns.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Shared subscription construction (trait helper): `trusted` forces the
@@ -353,6 +409,12 @@ impl InProcessBus {
             snapshot: snapshot_ids,
             delivered,
             replay_done,
+            // Pre-dated so the FIRST full drop warns immediately.
+            last_full_warn: Arc::new(Mutex::new(
+                std::time::Instant::now()
+                    .checked_sub(Subscriber::FULL_WARN_INTERVAL)
+                    .unwrap_or_else(std::time::Instant::now),
+            )),
         });
         self.subs.write().insert(id.clone(), sub);
 
@@ -1123,6 +1185,74 @@ mod tests {
         // Bus still healthy.
         let h = bus.health().await.expect("health");
         assert!(h.ok);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// bd-bus-scan: a fall-behind subscriber's drops are counted EXACTLY on
+    /// the bus, the WARN is rate-limited (one per 5 s per subscriber), and
+    /// the lossless-replay contract holds — a fresh subscriber recovers every
+    /// dropped event from the store.
+    #[tokio::test]
+    async fn test_slow_subscriber_counts_drops_and_rate_limits_warn() {
+        let (bus, path) = temp_bus_with(InProcessBusConfig {
+            channel_capacity: 2,
+            ..Default::default()
+        })
+        .await;
+        let keys = Keys::generate();
+
+        // A subscriber that never drains → its channel fills at capacity 2.
+        let mut overflowed = bus
+            .subscribe(crate::bus::project_filter("demo"))
+            .await
+            .expect("overflow sub");
+        // Settle: drain history + EOSE and let the replay task finish, so the
+        // bus is on the single-path (post-EOSE) delivery phase and the drop
+        // accounting below is deterministic.
+        let _ = drain(&mut overflowed, 64, Duration::from_millis(300)).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // Publish 8 events: the first 2 fit the empty channel, the remaining
+        // 6 drop publisher-side — every drop exactly counted on the bus.
+        let mut ev_ids = Vec::new();
+        for i in 0..8 {
+            let ev = signed(&keys, PROJECT_MANIFEST, &format!("burst {i}"), "demo");
+            let ok = bus.publish(ev.clone()).await.expect("publish never blocks");
+            assert!(ok.stored, "event {i} stored");
+            ev_ids.push(ev.id);
+        }
+        assert_eq!(
+            bus.full_drops(),
+            6,
+            "every overflow drop is counted exactly"
+        );
+        assert_eq!(
+            bus.full_warns(),
+            1,
+            "the WARN fires once, then is rate-limited per subscriber"
+        );
+
+        // Lossless: a fresh subscriber replays all 8 from the store.
+        let mut fresh = bus
+            .subscribe(crate::bus::project_filter("demo"))
+            .await
+            .expect("fresh sub");
+        let items = drain(&mut fresh, 16, Duration::from_millis(300)).await;
+        let got: Vec<_> = items
+            .iter()
+            .filter_map(|it| match it {
+                SubscriptionEvent::Event(e) => Some(e.id),
+                _ => None,
+            })
+            .collect();
+        for id in &ev_ids {
+            assert!(
+                got.contains(id),
+                "event {id} must be recoverable via replay, got {items:?}"
+            );
+        }
+        assert_eq!(got.len(), 8, "all 8 events recovered, got {items:?}");
+
         let _ = std::fs::remove_file(&path);
     }
 

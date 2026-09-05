@@ -137,6 +137,103 @@ impl GuardOutcome {
 /// Runs `evalexpr::eval_with_context` in `spawn_blocking` wrapped in
 /// `tokio::time::timeout`. Pure + sandboxed (evalexpr is a closed evaluator;
 /// the 4 custom fns are pure string ops).
+/// Normalize single-quoted string literals to double-quoted ones before
+/// evalexpr parsing (bd-guard-single-quote-fail-loud-061y, GS-028 NEW-3).
+///
+/// evalexpr accepts ONLY double-quoted strings; a guard like
+/// `steps_verify_1_ok == 'true'` parses as an eval error (unknown token),
+/// which the engine treats as false — the Branch silently takes else every
+/// time. The runtime is tolerant (converts well-formed `'...'` pairs outside
+/// double-quoted literals); the lint boundary still rejects single quotes so
+/// authors write the canonical form.
+///
+/// String-literal aware: single quotes INSIDE `"..."` pass through verbatim;
+/// an unterminated `'` passes through verbatim (parse fails loud downstream).
+/// Backslash escapes inside the single-quoted body (`\'`, `\\`) resolve to
+/// the literal char; `"` and `\` in the body are escaped for the
+/// double-quoted emission.
+pub fn normalize_single_quoted_literals(expr: &str) -> String {
+    let mut out = String::with_capacity(expr.len());
+    let mut chars = expr.chars().peekable();
+    let mut in_double = false;
+    let mut escaped = false;
+    while let Some(c) = chars.next() {
+        if in_double {
+            out.push(c);
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_double = false;
+            }
+            continue;
+        }
+        match c {
+            '"' => {
+                in_double = true;
+                out.push(c);
+            }
+            '\'' => {
+                // Collect to the closing unescaped `'`; abort verbatim when
+                // unterminated (fail loud at parse, never silently mangle).
+                let mut body = String::new();
+                let mut inner_escaped = false;
+                let mut closed = false;
+                let mut rest = String::new();
+                for d in chars.by_ref() {
+                    if inner_escaped {
+                        match d {
+                            '\'' => body.push('\''),
+                            '\\' => body.push('\\'),
+                            'n' => body.push('\n'),
+                            't' => body.push('\t'),
+                            other => {
+                                body.push('\\');
+                                body.push(other);
+                            }
+                        }
+                        inner_escaped = false;
+                        continue;
+                    }
+                    match d {
+                        '\\' => inner_escaped = true,
+                        '\'' => {
+                            closed = true;
+                            break;
+                        }
+                        _ => body.push(d),
+                    }
+                }
+                if !closed {
+                    // Unterminated: emit the opening quote + consumed tail
+                    // verbatim so the parse error names the real text.
+                    let _ = &mut rest;
+                    out.push('\'');
+                    out.push_str(&body);
+                    if inner_escaped {
+                        out.push('\\');
+                    }
+                    continue;
+                }
+                out.push('"');
+                for b in body.chars() {
+                    match b {
+                        '"' => out.push_str("\\\""),
+                        '\\' => out.push_str("\\\\"),
+                        '\n' => out.push_str("\\n"),
+                        '\t' => out.push_str("\\t"),
+                        _ => out.push(b),
+                    }
+                }
+                out.push('"');
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 pub async fn evaluate_guard(
     guard: Option<&str>,
     variables: &std::collections::HashMap<String, Value>,
@@ -145,6 +242,11 @@ pub async fn evaluate_guard(
     let Some(expr) = guard.map(str::trim).filter(|s| !s.is_empty()) else {
         return GuardOutcome::Unset;
     };
+
+    // GS-028 NEW-3 tolerance: single-quoted literals normalize before the
+    // pre-scan + eval so `== 'true'` behaves like `== "true"`.
+    let normalized = normalize_single_quoted_literals(expr);
+    let expr = normalized.as_str();
 
     // Stack-safety pre-scan (iterative, O(n), no recursion): reject
     // pathological expressions before evalexpr's recursive tree builder can
@@ -584,6 +686,56 @@ mod tests {
         );
         assert_eq!(
             evaluate_guard(Some("str_len(s) == 11"), &v, d).await,
+            GuardOutcome::Bool(true)
+        );
+    }
+
+    /// bd-guard-single-quote-fail-loud-061y (GS-028 NEW-3): the flywheel
+    /// repair guard `steps_verify_1_ok == 'true'` must evaluate TRUE when the
+    /// step output is the string "true" — single-quoted literals normalize to
+    /// double-quoted before eval. Pure normalization cases included.
+    #[tokio::test]
+    async fn guard_single_quote_tolerance() {
+        assert_eq!(
+            normalize_single_quoted_literals("a == 'true'"),
+            "a == \"true\""
+        );
+        // Single quotes inside double-quoted literals pass through.
+        assert_eq!(
+            normalize_single_quoted_literals("a == \"don't\""),
+            "a == \"don't\""
+        );
+        // Unterminated single quote passes through (parse fails loud).
+        assert_eq!(normalize_single_quoted_literals("a == 'x"), "a == 'x");
+
+        let d = Duration::from_millis(200);
+        // The exact GS-028 repair shape: single-quoted 'true' compares true.
+        let v = vars(&[("steps_verify_1_ok", "true")]);
+        assert_eq!(
+            evaluate_guard(Some("steps_verify_1_ok == 'true'"), &v, d).await,
+            GuardOutcome::Bool(true)
+        );
+        // And false when the output differs.
+        let v_false = vars(&[("steps_verify_1_ok", "false")]);
+        assert_eq!(
+            evaluate_guard(Some("steps_verify_1_ok == 'true'"), &v_false, d).await,
+            GuardOutcome::Bool(false)
+        );
+        // OR-chain across three verifies (the full repair decide guard).
+        let v2 = vars(&[
+            ("steps_verify_1_ok", "false"),
+            ("steps_verify_2_ok", "true"),
+            ("steps_verify_3_ok", "false"),
+        ]);
+        assert_eq!(
+            evaluate_guard(
+                Some(
+                    "steps_verify_1_ok == 'true' || steps_verify_2_ok == 'true' || steps_verify_3_ok == 'true'"
+                ),
+                &v2,
+                d
+            )
+            .await,
             GuardOutcome::Bool(true)
         );
     }

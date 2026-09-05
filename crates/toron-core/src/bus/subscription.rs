@@ -73,7 +73,14 @@ impl Subscription {
     }
 
     /// Channel capacity used when the bus spawns a subscription.
-    pub const DEFAULT_CAPACITY: usize = 256;
+    ///
+    /// bd-bus-scan: raised 256 → 1024 — the mailbox's trusted projection
+    /// subscriber can burst hundreds of bus events during an inbox catch-up
+    /// (the Sep-1 "subscription channel full" stall); a full channel drops
+    /// publisher-side with the event recoverable via store replay, so the
+    /// larger buffer just defers drops while bounded (1024 × ~500 B ≈ 0.5 MB
+    /// per subscriber).
+    pub const DEFAULT_CAPACITY: usize = 1024;
 }
 
 #[cfg(test)]

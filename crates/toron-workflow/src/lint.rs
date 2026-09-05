@@ -456,6 +456,19 @@ fn check_re_lint(report: &mut LintReport, wf: &Workflow) {
 
 /// Validate a guard expression's syntax with evalexpr (no evaluation).
 fn check_guard(report: &mut LintReport, guard: &str, ctx: &str) {
+    // bd-guard-single-quote-fail-loud-061y (GS-028 NEW-3): evalexpr accepts
+    // ONLY double-quoted strings. The runtime normalizes `'...'` tolerantly,
+    // but authors must write the canonical `"..."` form — flag it here.
+    if crate::guard::normalize_single_quoted_literals(guard) != guard {
+        report.issues.push(LintIssue {
+            level: Level::Error,
+            message: format!(
+                "{ctx} expression {guard:?} uses single-quoted strings; use double quotes (evalexpr requires \"...\")"
+            ),
+            line: None,
+        });
+        return;
+    }
     // Template refs ({{trigger.x}}, {{steps.y}}) are substituted before eval;
     // the raw guard is not valid evalexpr when it references them, so lint
     // replaces template tokens with a literal before syntax-checking.
@@ -852,7 +865,7 @@ name: triage
 trigger:
   type: message_posted
   channel: "#support"
-guard: "trigger.channel == '#support'"
+guard: "trigger.channel == \"#support\""
 steps:
   - name: ack
     action: send_dm
