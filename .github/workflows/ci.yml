@@ -25,11 +25,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Install pinned nightly toolchain (rust-toolchain.toml)
+      - name: Install nightly toolchain (rust-toolchain.toml)
         uses: dtolnay/rust-toolchain@stable
         with:
-          # Shared pin with siblings beads + flywheel (bd-14ea).
-          toolchain: nightly-2026-08-20
+          # Follows rust-toolchain.toml (floating nightly, operator choice
+          # 2026-09-06; was pinned nightly-2026-08-20 per bd-14ea).
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: cargo check --workspace
@@ -47,11 +47,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Install pinned nightly toolchain (rust-toolchain.toml)
+      - name: Install nightly toolchain (rust-toolchain.toml)
         uses: dtolnay/rust-toolchain@stable
         with:
-          # Shared pin with siblings beads + flywheel (bd-14ea).
-          toolchain: nightly-2026-08-20
+          # Follows rust-toolchain.toml (floating nightly).
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Build toron CLI binary (cli e2e shells target/debug/toron)
         run: cargo build -p toron-cli --bin toron
@@ -68,11 +67,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Install pinned nightly toolchain (rust-toolchain.toml)
+      - name: Install nightly toolchain (rust-toolchain.toml)
         uses: dtolnay/rust-toolchain@stable
         with:
-          # Shared pin with siblings beads + flywheel (bd-14ea).
-          toolchain: nightly-2026-08-20
+          # Follows rust-toolchain.toml (floating nightly).
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Install resonate CLI (for SC-11 subprocess)
         run: cargo install resonate --locked || echo 'resonate install skipped (SC-11 skips when binary absent)'
