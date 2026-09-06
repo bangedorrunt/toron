@@ -59,8 +59,8 @@ Child maps: [toron-core](crates/toron-core/AGENTS.md) ·
 - Frozen: 40 tool names (38 AM-Rust parity + 2 toron additive: `release_file_reservations_by_reason` bd-h3oj, `list_file_reservations` bd-locks-list-daemon-xetz), 25 resources, kind registry. No new kinds/tools without an ADR. 
 - ADR-0020 adds **CLI** nouns `channel` `job` `react` `presence` `watch`. Channel posts emit kind **9** (not 42). ADR-0023: channel create/close emit **39000**, join/leave emit **39002**; 40/41/42 ingest only.
 - rust-nostr **0.45**: `nostr-sdk` 0.45.2 + `nostr` 0.45.3 (`nip44`/`nip49`/`nip59`/`os-rng`). Protocol types via `crate::nostr` / `nostr::prelude`. Sign with `FinalizeEvent::finalize`. `gift_wrap` is sync (`GiftWrapBuilder`).
-- Catalog: `toron catalog --json` regenerates `docs/catalog/toron-mcp.json`; `cargo test catalog_freshness` fails red on surface drift without regen (toron.dev ADR-0002 D3).
-- Flag vocabulary (bd-flag-vocab-conformance-0hyv): the acting agent is ALWAYS `--as` — `--from`/`--agent` are banned (enforced by `cargo test -p toron-cli --bin toron flag_conformance`) — and every project-scoped subcommand REQUIRES `--project` (no silent demo default; missing-key errors name the resolved project). Channel lifecycle (bd-channel-close-purge-bsqb): `channel close` = creator-only tombstone (closed refuses posts/joins, hides from `list`, creator may leave) → `channel purge` = creator/operator removal of a closed channel's bus events, audited to `{data_dir}/channel_purge.log`. Verify-after-send: `channel post --wait-ack <secs>` (bd-verify-after-send-fxtv). Delivery visibility: `channel read --author <pin>` (bd-delivery-visibility-g96y). Inbox cursor: `mail inbox --since last` persists per-(project, agent, plane) daemon-side (bd-since-cursor-70cf, migration 0007).
+- Catalog: `toron catalog --json` regenerates `docs/catalog/toron-mcp.json`; `mbx +nightly-aarch64-apple-darwin test catalog_freshness` fails red on surface drift without regen (toron.dev ADR-0002 D3).
+- Flag vocabulary (bd-flag-vocab-conformance-0hyv): the acting agent is ALWAYS `--as` — `--from`/`--agent` are banned (enforced by `mbx +nightly-aarch64-apple-darwin test -p toron-cli --bin toron flag_conformance`) — and every project-scoped subcommand REQUIRES `--project` (no silent demo default; missing-key errors name the resolved project). Channel lifecycle (bd-channel-close-purge-bsqb): `channel close` = creator-only tombstone (closed refuses posts/joins, hides from `list`, creator may leave) → `channel purge` = creator/operator removal of a closed channel's bus events, audited to `{data_dir}/channel_purge.log`. Verify-after-send: `channel post --wait-ack <secs>` (bd-verify-after-send-fxtv). Delivery visibility: `channel read --author <pin>` (bd-delivery-visibility-g96y). Inbox cursor: `mail inbox --since last` persists per-(project, agent, plane) daemon-side (bd-since-cursor-70cf, migration 0007).
 - ADR-0027 one-workspace tick (accepted 2026-09-01): `MailSurface` tag vocabulary `--corr/--wake/--priority/--audience/--result-path/--verdict` rides `extra_tags` (rumor, never 1059; `--verdict` is ADR-0028 E4); receipts durably in `receipts` sqlite (`receipt get/list/set`; owed-on-send producer lives in `send_message`, acked via `send_receipt` `owed->acked`, resulted via `receipt set --state resulted` explicit verb; SLA consults sqlite not `receipt_cache`); `wait --corr` is subscribe-until-receipt (bus event or deadline only, no 200ms poll); `role pin/list/clear` binds `wheelhouse` etc. via 30013 `role=` tags + `whois` alias (`mail send --to role:<name>` via identity/whois); `watch --live` is `subscribe_trusted` (not 1s snapshot; default kinds include 30013); no new MCP tools (CLI-only nouns per Skill Sync Contract, `catalog_freshness` must stay green). MCP grows only as the same CLI verb when an agent cannot tick without it — do not copy the foreign 44-tool surface.
 - Flywheel Tick Law (live): doorbell dispatcher and `swarm_loop` call `workspace::tick`; slice reducers stay private. Kind-9 is the ring; assignment enters from rumor 14 / FetchInbox→InboxRows.
 - ADR-0028 E3 corr authority (accepted 2026-09-03): sender mints non-empty `corr` (`SendTags::parse` rejects empty; `Corr` vs `ThreadId` newtypes, `thread_id` is never `corr` — conflation fails loud in `send_message`); toron sqlite owns `owed→acked→resulted` (monotonic upsert: never downgrades `resulted`, never drags `acked` to `owed`; `owed` on send, `owed→acked` in `send_receipt` idempotent, `resulted` only via explicit `receipt set`).
@@ -81,7 +81,7 @@ When you add/remove/rename a CLI command or MCP tool, update ALL of:
 3. This AGENTS.md (STRUCTURE + CONVENTIONS sections).
 4. The skill: `~/.agents/skills/toron/SKILL.md` CLI Surface + MCP Parity Surface + [crew-steering](references/crew-steering.md) — single canonical copy; grok and other harnesses read the same file (grok natively scans `~/.agents/skills/`, no mirror).
 5. The tool-count constant (AGENTS.md header + SKILL.md frontmatter): 40 (38 parity + 2 additive). Only changes when an MCP tool actually changes.
-6. `toron catalog --json` + `cargo test catalog_freshness` when the CLI catalog grows.
+6. `toron catalog --json` + `mbx +nightly-aarch64-apple-darwin test catalog_freshness` when the CLI catalog grows.
 
 The skill files are the canonical agent-facing reference. A command/tool not in
 the skill is invisible to any agent that triggers the skill.
@@ -99,21 +99,22 @@ the skill is invisible to any agent that triggers the skill.
 - Editing `docs/decisions/0001-*` as live policy (superseded; Tokio is required).
 
 ## COMMANDS
+Rust runs through mbx (cargo cache): prefix every cargo invocation with `mbx +nightly-aarch64-apple-darwin` (bare `cargo` misparses under the mbx shim).
 
 ```bash
 bash scripts/verify-gates.sh
-cargo test --workspace
-cargo test catalog_freshness                  # catalog drift gate (toron.dev ADR-0002 D3)
+mbx +nightly-aarch64-apple-darwin test --workspace
+mbx +nightly-aarch64-apple-darwin test catalog_freshness                  # catalog drift gate (toron.dev ADR-0002 D3)
 toron catalog --json                          # emit 38-parity-tool catalog (40 served incl. additive) / 25-resource / CLI catalog
-cargo test -p toron-e2e --features p1          # SC-1..8
-cargo test -p toron-e2e --features p2          # needs resonate on PATH
-cargo test -p toron-e2e --features p4          # SC-18..25 (implies p5)
-cargo clippy --workspace --all-targets -- -D warnings
-cargo fmt --check
-cargo test --workspace --all-features          # honest full matrix; CI build does not
+mbx +nightly-aarch64-apple-darwin test -p toron-e2e --features p1          # SC-1..8
+mbx +nightly-aarch64-apple-darwin test -p toron-e2e --features p2          # needs resonate on PATH
+mbx +nightly-aarch64-apple-darwin test -p toron-e2e --features p4          # SC-18..25 (implies p5)
+mbx +nightly-aarch64-apple-darwin clippy --workspace --all-targets -- -D warnings
+mbx +nightly-aarch64-apple-darwin fmt --check
+mbx +nightly-aarch64-apple-darwin test --workspace --all-features          # honest full matrix; CI build does not
 ```
 
-`cargo test --exclude-ignored` is invalid. Ignored tests: `-- --ignored`.
+`mbx +nightly-aarch64-apple-darwin test --exclude-ignored` is invalid. Ignored tests: `-- --ignored`.
 
 Release profile: `strip = "none"` (macOS arm64 LINKEDIT / sqlx_macros).
 
@@ -133,7 +134,7 @@ Release profile: `strip = "none"` (macOS arm64 LINKEDIT / sqlx_macros).
   `resonate.out.log`). One `toron serve` per data dir (`serve.pid`). INFO
   rmcp churn once wrote a 604 MB serve.out.log; resonate INFO doorbell
   poll-fail once wrote 1.3 GB.
-- Bare `cargo test --workspace` compiles e2e and runs 0 p1/p2 tests (feature
+- `mbx +nightly-aarch64-apple-darwin test --workspace` compiles e2e and runs 0 p1/p2 tests (feature
   gates). sc16–sc24 currently run un-gated.
 - Root `tests/` and `examples/agent_ping_pong.rs` are ADR-0001 leftovers —
   not workspace members.
