@@ -242,6 +242,10 @@ pub struct ReceiptResult {
     pub message_id: String,
     pub acknowledged: bool,
     pub acknowledged_at_us: Option<i64>,
+    /// ADR-0010 F5: read and ack are distinct shapes — true only for
+    /// `mark_message_read`, so a successful read never looks like a
+    /// failed ack (`{acknowledged: false}`) on the shared envelope.
+    pub read: bool,
 }
 
 impl Mailbox {
@@ -375,7 +379,13 @@ impl Mailbox {
                     serde_json::to_string(&intended).unwrap_or_else(|_| "[]".into());
                 let now_ms =
                     crate::index::writer::Clock::now_us(&crate::index::writer::SystemClock) / 1000;
-                let key = send_key(&args.project_slug, &args.sender_name, &corr);
+                let key = send_key(
+                    &args.project_slug,
+                    &args.sender_name,
+                    &corr,
+                    &args.subject,
+                    &args.body_md,
+                );
                 match store
                     .claim_or_duplicate(
                         &key,
@@ -594,6 +604,16 @@ impl Mailbox {
             // (recipient, event) instead of once per poll.
             if let Some(gift) = self.cached_unwrap(&agent_keys, wrap, npub) {
                 let rumor = gift.rumor;
+                // ADR-0010 F5: NIP-17 contact control messages (`toron-kind`
+                // contact-request/contact-response) carry no subject and no
+                // body — projecting them yields subjectless empty-body mail
+                // rows. They are protocol control, not mail: the contact
+                // link table is their surface.
+                if let Some(kind) = tag_value(&rumor.tags, "toron-kind")
+                    && (kind == "contact-request" || kind == "contact-response")
+                {
+                    continue;
+                }
                 mails.push(UnwrappedMail {
                     recipient: npub,
                     sender: gift.sender,
@@ -1006,6 +1026,7 @@ impl Mailbox {
                 message_id: message_id.to_string(),
                 acknowledged,
                 acknowledged_at_us: Some(ts),
+                read: kind == "read",
             });
         }
 
@@ -1039,6 +1060,7 @@ impl Mailbox {
             message_id: message_id.to_string(),
             acknowledged,
             acknowledged_at_us: Some(ts_us),
+            read: kind == "read",
         })
     }
 
@@ -3306,7 +3328,13 @@ mod tests {
         let (mailbox, pool, db_path, data_dir) = test_mailbox_with_pool("idem-crash").await;
         let (_s, _) = register(&mailbox, "demo", "GreenCastle").await;
         let (_r, rnpub) = register(&mailbox, "demo", "BlueLake").await;
-        let key = crate::mailbox::idempotent::send_key("demo", "GreenCastle", "C-CRASH");
+        let key = crate::mailbox::idempotent::send_key(
+            "demo",
+            "GreenCastle",
+            "C-CRASH",
+            "question",
+            "do the thing",
+        );
         let recipients = serde_json::json!([["BlueLake", "crash-event-id"]]).to_string();
         sqlx::query(
             "INSERT INTO idempotent_sends \
@@ -3367,7 +3395,13 @@ mod tests {
         let (mailbox, pool, db_path, data_dir) = test_mailbox_with_pool("idem-expired").await;
         let (_s, _) = register(&mailbox, "demo", "GreenCastle").await;
         let (_r, rnpub) = register(&mailbox, "demo", "BlueLake").await;
-        let key = crate::mailbox::idempotent::send_key("demo", "GreenCastle", "C-OLD");
+        let key = crate::mailbox::idempotent::send_key(
+            "demo",
+            "GreenCastle",
+            "C-OLD",
+            "question",
+            "do the thing",
+        );
         let recipients = serde_json::json!([["BlueLake", "stale-event-id"]]).to_string();
         sqlx::query(
             "INSERT INTO idempotent_sends \
@@ -3392,6 +3426,112 @@ mod tests {
             wraps_to(&mailbox, &rnpub, 10).await.len(),
             1,
             "one fresh rumor after expiry"
+        );
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// ADR-0010 F5: a successful read must not look like a failed ack —
+    /// the read receipt carries its own `read: true` semantic.
+    #[tokio::test]
+    async fn adr0010_f56_mail_surface_read_receipt_has_own_semantic() {
+        let (mailbox, _pool, db_path, data_dir) = test_mailbox_with_pool("f56-read").await;
+        let (_s, _) = register(&mailbox, "demo", "GreenCastle").await;
+        let (recv, npub_recv) = register(&mailbox, "demo", "BlueLake").await;
+        let args = SendMessage {
+            project_slug: "demo".into(),
+            sender_name: "GreenCastle".into(),
+            to: vec!["BlueLake".into()],
+            subject: "s".into(),
+            body_md: "b".into(),
+            ..Default::default()
+        };
+        mailbox.send_message(&args).await.expect("send");
+        let wrap = &wraps_to(&mailbox, &npub_recv, 2).await[0];
+        let gift = unwrap_for_recipient(&recv, wrap).expect("unwrap");
+        let message_id = gift.rumor.clone().id().to_hex();
+        let read = mailbox
+            .mark_message_read("demo", "BlueLake", &message_id)
+            .await
+            .expect("read");
+        assert!(read.read, "read receipt carries read:true");
+        assert!(
+            !read.acknowledged,
+            "read is not an ack — no shared ack envelope"
+        );
+        assert!(read.acknowledged_at_us.is_some());
+        let ack = mailbox
+            .acknowledge_message("demo", "BlueLake", &message_id)
+            .await
+            .expect("ack");
+        assert!(!ack.read, "ack receipt carries read:false");
+        assert!(ack.acknowledged);
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// ADR-0010 F5: a pending contact request must not render as a
+    /// subjectless empty-body mail row — it is protocol control, not mail.
+    #[tokio::test]
+    async fn adr0010_f56_mail_surface_contact_request_absent_from_inbox() {
+        let (mailbox, _pool, db_path, data_dir) = test_mailbox_with_pool("f56-contact").await;
+        let (_s, _) = register(&mailbox, "demo", "GreenCastle").await;
+        let (_r, _) = register(&mailbox, "demo", "BlueLake").await;
+        mailbox
+            .request_contact(&crate::mailbox::contacts::RequestContact {
+                project_slug: "demo".into(),
+                from_agent: "GreenCastle".into(),
+                to_agent: "BlueLake".into(),
+                to_project: None,
+                reason: None,
+            })
+            .await
+            .expect("request contact");
+        let inbox = mailbox
+            .fetch_inbox(&FetchInbox {
+                project_slug: "demo".into(),
+                agent_name: "BlueLake".into(),
+                unread_only: false,
+                limit: None,
+                include_bodies: true,
+                urgent_only: false,
+                since_ts: None,
+                thread_id: None,
+            })
+            .await
+            .expect("inbox");
+        assert!(
+            inbox.is_empty(),
+            "contact-request control must not render as a mail row, got {inbox:?}"
+        );
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// ADR-0010 F6: re-using a corr for a different body must never
+    /// silently inherit the first event id — it mints a new event.
+    #[tokio::test]
+    async fn adr0010_f56_mail_surface_corr_reuse_with_different_body_mints_new_event() {
+        let (mailbox, _pool, db_path, data_dir) = test_mailbox_with_pool("f56-corr").await;
+        let (_s, _) = register(&mailbox, "demo", "GreenCastle").await;
+        let (_r, rnpub) = register(&mailbox, "demo", "BlueLake").await;
+        let first = mailbox
+            .send_message(&idempotent_send_args("C-REUSE"))
+            .await
+            .expect("send 1");
+        let id1 = first.deliveries[0].payload.event_id.clone();
+        let mut second_args = idempotent_send_args("C-REUSE");
+        second_args.body_md = "a completely different body".into();
+        let second = mailbox.send_message(&second_args).await.expect("send 2");
+        let id2 = second.deliveries[0].payload.event_id.clone();
+        assert_ne!(
+            id1, id2,
+            "same corr with different body must not inherit the first event id"
+        );
+        assert_eq!(
+            wraps_to(&mailbox, &rnpub, 10).await.len(),
+            2,
+            "different content mints a new rumor"
         );
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_dir_all(&data_dir);

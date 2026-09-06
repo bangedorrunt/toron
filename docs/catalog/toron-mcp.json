@@ -1541,11 +1541,15 @@
           },
           "message_id": {
             "type": "string"
+          },
+          "read": {
+            "type": "boolean"
           }
         },
         "required": [
           "message_id",
-          "acknowledged"
+          "acknowledged",
+          "read"
         ],
         "type": "object"
       },
@@ -1596,11 +1600,15 @@
           },
           "message_id": {
             "type": "string"
+          },
+          "read": {
+            "type": "boolean"
           }
         },
         "required": [
           "message_id",
-          "acknowledged"
+          "acknowledged",
+          "read"
         ],
         "type": "object"
       },
