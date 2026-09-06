@@ -89,7 +89,10 @@ pub struct RegisteredAgentOut {
     pub created: bool,
 }
 
-/// `whois`: `{name, npub, program, model, task_description, last_active_ts_us}`.
+/// `whois`: `{name, npub, program, model, task_description, last_active_ts_us, stale}`.
+///
+/// ADR-0010 F2: `stale` flags roster rows older than the prune cadence —
+/// never a silent live pin.
 #[derive(Debug, Clone, JsonSchema)]
 pub struct WhoIsOut {
     pub name: String,
@@ -98,6 +101,7 @@ pub struct WhoIsOut {
     pub model: Option<String>,
     pub task_description: Option<String>,
     pub last_active_ts_us: i64,
+    pub stale: bool,
 }
 
 /// `resolve_pane_identity`: `{agent_name, pane_id}` (name found or not) or
@@ -411,9 +415,12 @@ pub struct FetchInboxWrapper {
 pub struct FetchInboxProductWrapper {
     pub messages: Vec<ProjectInboxMessageOut>,
 }
+/// `list_agents` rows — WhoIs-shaped (name, npub, last_active, stale),
+/// matching the runtime projection (ADR-0010 F2: recency + stale flag
+/// on the list surface, never a silent live pin).
 #[derive(Debug, Clone, JsonSchema)]
 pub struct ListAgentsWrapper {
-    pub agents: Vec<RegisteredAgentOut>,
+    pub agents: Vec<WhoIsOut>,
 }
 #[derive(Debug, Clone, JsonSchema)]
 pub struct ListContactsWrapper {

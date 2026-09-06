@@ -164,6 +164,7 @@ impl ToJson for WhoIs {
             "model": self.model,
             "task_description": self.task_description,
             "last_active_ts_us": self.last_active_ts_us,
+            "stale": self.stale,
         })
     }
 }
