@@ -140,6 +140,9 @@ impl Mailbox {
         let created = self
             .persist_and_publish(project_slug, profile, result)
             .await?;
+        // ADR-0010 F1: same first-registration auto-bind as `register_agent`.
+        self.ensure_captain_alias_on_first_registration(project_slug, &profile.name)
+            .await;
         Ok(created)
     }
 
@@ -174,6 +177,10 @@ impl Mailbox {
         let mut agent = self
             .persist_and_publish(project_slug, profile, result)
             .await?;
+        // ADR-0010 F1: first registration auto-binds `captain` (best-effort;
+        // registration still succeeds if the alias cannot persist).
+        self.ensure_captain_alias_on_first_registration(project_slug, &profile.name)
+            .await;
         agent.created = created;
         Ok(agent)
     }
@@ -356,6 +363,34 @@ impl Mailbox {
             .await?;
         }
         Ok(current)
+    }
+
+    /// ADR-0010 F1: auto-bind the project's routable `captain` alias to the
+    /// first registered agent, so `mail send --to captain` resolves without
+    /// a prior operator-only `contact captain` bind (live-use 2026-09-07:
+    /// the first-arriving agent's `to: ["captain"]` hard-failed).
+    ///
+    /// `ensure_project` alone cannot bind (no pin exists yet), so the bind
+    /// fires here on first registration and `ensure_project` stays
+    /// alias-neutral (second ensure never repoints or forks an identity).
+    /// An existing alias — explicit `set_project_captain` or an earlier
+    /// auto-bind — always wins (idempotent). Username-class names never
+    /// bind. No index pool → skip silently; registration still succeeds.
+    async fn ensure_captain_alias_on_first_registration(&self, project_slug: &str, pin: &str) {
+        if super::naming::is_username_class(pin) {
+            return;
+        }
+        if self
+            .agent_name_alias(project_slug, "captain")
+            .await
+            .is_some()
+        {
+            return;
+        }
+        let Some(pool) = self.index_pool.as_ref() else {
+            return;
+        };
+        let _ = upsert_captain_alias(pool, project_slug, pin).await;
     }
 
     /// bd-lmcy: set a role → pin alias (signed, replaceable via alias table;
@@ -2162,6 +2197,57 @@ mod tests {
             .await
             .expect("clear again");
         assert!(again.is_none(), "second clear returns None");
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// ADR-0010 F1: fresh project + first agent register auto-binds `captain`.
+    /// No prior `contact captain` needed; second ensure / second register
+    /// never repoints or forks a second identity.
+    #[tokio::test]
+    async fn adr0010_f1_captain_alias_auto_bind_on_first_registration() {
+        let (mailbox, _pool, db_path, data_dir) = test_mailbox_with_pool("f1-autobind").await;
+        mailbox.ensure_project("toron").await.expect("ensure");
+        mailbox.set_identity_mode("toron", "swarm").await;
+        assert!(
+            mailbox.whois("toron", "captain").await.is_err(),
+            "no captain before the first registration"
+        );
+
+        let pin = mailbox
+            .register_agent("toron", &profile("BlueRidge"))
+            .await
+            .expect("first register");
+        let w = mailbox
+            .whois("toron", "captain")
+            .await
+            .expect("captain resolves after first registration");
+        assert_eq!(w.npub, pin.npub);
+        assert_eq!(w.name, "BlueRidge");
+
+        mailbox
+            .register_agent("toron", &profile("AmberPlateau"))
+            .await
+            .expect("second register");
+        let w2 = mailbox
+            .whois("toron", "captain")
+            .await
+            .expect("captain still resolves");
+        assert_eq!(
+            w2.npub, pin.npub,
+            "second registration must not repoint captain"
+        );
+
+        mailbox
+            .ensure_project("toron")
+            .await
+            .expect("second ensure");
+        let w3 = mailbox
+            .whois("toron", "captain")
+            .await
+            .expect("captain survives second ensure");
+        assert_eq!(w3.npub, pin.npub);
 
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_dir_all(&data_dir);
