@@ -17,6 +17,7 @@
 //! TTL (24h) bounds the suppression; a resend with a fresh corr recovers.
 //! Demo mode (no index pool) skips dedupe entirely.
 
+use sha2::Digest;
 use sqlx::SqlitePool;
 
 /// TTL for a claimed send key (24h in ms). A retry with the same
@@ -24,11 +25,19 @@ use sqlx::SqlitePool;
 /// event id; after it, the send goes out fresh.
 pub const IDEMPOTENT_SEND_TTL_MS: i64 = 24 * 60 * 60 * 1000;
 
-/// Claim key: project, sender, and sender-minted corr. `\x1f` (unit
-/// separator) joins the parts — it cannot appear in slugs, pins, or corrs
-/// without failing their own validation first.
-pub fn send_key(project: &str, sender: &str, corr: &str) -> String {
-    format!("{project}\x1f{sender}\x1f{corr}")
+/// Claim key: project, sender, sender-minted corr, and a SHA-256 digest
+/// of the content (`subject\x1fbody`). `\x1f` (unit separator) joins the
+/// parts — it cannot appear in slugs, pins, or corrs without failing their
+/// own validation first.
+///
+/// ADR-0010 F6: the key covers the content, so re-using a corr for a
+/// DIFFERENT body/subject mints a new event instead of silently inheriting
+/// the first event id. An identical retry still converges (same key).
+/// Callers that seed claims directly (tests) must pass the send's actual
+/// subject/body — a seed with mismatched content is a different send.
+pub fn send_key(project: &str, sender: &str, corr: &str, subject: &str, body: &str) -> String {
+    let digest = sha2::Sha256::digest(format!("{subject}\x1f{body}").as_bytes());
+    format!("{project}\x1f{sender}\x1f{corr}\x1f{digest:x}")
 }
 
 /// Outcome of claiming a send key.
@@ -172,14 +181,22 @@ mod tests {
     }
 
     #[test]
-    fn idempotent_send_key_joins_three_parts() {
+    fn idempotent_send_key_covers_corr_and_content() {
+        let base = send_key("demo", "GreenCastle", "C-1", "s", "b");
         assert_eq!(
-            send_key("demo", "GreenCastle", "C-1"),
-            "demo\x1fGreenCastle\x1fC-1"
+            base,
+            send_key("demo", "GreenCastle", "C-1", "s", "b"),
+            "identical retry converges on one key"
         );
         assert_ne!(
-            send_key("demo", "GreenCastle", "C-1"),
-            send_key("demo", "GreenCastle", "C-2")
+            base,
+            send_key("demo", "GreenCastle", "C-1", "s", "DIFFERENT"),
+            "same corr with different body is a different send"
+        );
+        assert_ne!(
+            base,
+            send_key("demo", "GreenCastle", "C-2", "s", "b"),
+            "different corr is a different send"
         );
     }
 
@@ -188,7 +205,7 @@ mod tests {
         let (pool, path) = test_pool("claim").await;
         let store = IdempotentSendStore::new(pool);
         let now = 1_700_000_000_000_000;
-        let key = send_key("demo", "GreenCastle", "C-1");
+        let key = send_key("demo", "GreenCastle", "C-1", "s", "b");
         let first = store
             .claim_or_duplicate(&key, "ev-1", "demo", "GreenCastle", "C-1", "[]", now)
             .await

@@ -260,6 +260,7 @@ impl ToJson for ReceiptResult {
             "message_id": self.message_id,
             "acknowledged": self.acknowledged,
             "acknowledged_at_us": self.acknowledged_at_us,
+            "read": self.read,
         })
     }
 }

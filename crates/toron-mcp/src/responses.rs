@@ -165,11 +165,15 @@ pub struct InboxMessageOut {
 }
 
 /// `acknowledge_message` / `mark_message_read`.
+///
+/// ADR-0010 F5: `read` distinguishes the read receipt from the ack
+/// envelope — a successful read never looks like `{acknowledged: false}`.
 #[derive(Debug, Clone, JsonSchema)]
 pub struct ReceiptResultOut {
     pub message_id: String,
     pub acknowledged: bool,
     pub acknowledged_at_us: Option<i64>,
+    pub read: bool,
 }
 
 /// `request_contact` / `respond_contact` / `list_contacts` rows.
