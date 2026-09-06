@@ -348,6 +348,44 @@ fn relay_list_defaults_empty() {
 }
 
 #[test]
+fn agent_bootstrap_registers_and_reserves() {
+    let args = [
+        "agent",
+        "bootstrap",
+        "--project",
+        "bootstrap-probe",
+        "--as",
+        "QuietBadger",
+        "--paths",
+        "src/**",
+        "--reason",
+        "probe",
+        "--json",
+    ];
+    let out = run(&args);
+    assert!(
+        out.status.success(),
+        "bootstrap must exit 0, stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value = parse(&out.stdout);
+    assert_eq!(value["agent"], serde_json::json!("QuietBadger"));
+    assert!(
+        value["created"].is_boolean(),
+        "bootstrap reports created flag, got {value}"
+    );
+    // Idempotent re-run: same pin upserts, reserves again.
+    let again = run(&args);
+    assert!(again.status.success());
+    let second = parse(&again.stdout);
+    assert_eq!(
+        second["created"],
+        serde_json::json!(false),
+        "second bootstrap upserts, got {second}"
+    );
+}
+
+#[test]
 fn relay_add_returns_proposed_list() {
     let out = run(&["relay", "add", "wss://relay.example.com", "--json"]);
     assert!(out.status.success());

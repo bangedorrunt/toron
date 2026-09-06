@@ -21,7 +21,7 @@ use toron_core::mailbox::{
 use toron_mcp::ToJson;
 
 use crate::cli::{
-    ContactCommand, GuardCommand, MailCommand, PolicyArg, ReserveCommand, SlotCommand,
+    AgentCommand, ContactCommand, GuardCommand, MailCommand, PolicyArg, ReserveCommand, SlotCommand,
 };
 use crate::mailbox_source::DaemonClient;
 
@@ -371,6 +371,91 @@ pub async fn run_mail_daemon(dc: &DaemonClient, cmd: &MailCommand) -> anyhow::Re
                 }),
             )
             .await
+        }
+    }
+}
+
+/// One-step session bootstrap: idempotent identity upsert, then an optional
+/// reserve in the same call. CLI-only composition over existing mailbox
+/// methods (mirrors macro_start_session minus ensure/inbox); no new MCP tool.
+pub async fn run_agent(mailbox: &Mailbox, cmd: &AgentCommand) -> anyhow::Result<()> {
+    match cmd {
+        AgentCommand::Bootstrap(args) => {
+            let profile = toron_core::nostr::identity::AgentProfile {
+                name: args.agent.clone(),
+                program: args.program.clone(),
+                model: args.model.clone(),
+                task_description: args.task.clone(),
+                persona: None,
+            };
+            let agent = mailbox.register_agent(&args.project, &profile).await?;
+            let reservation = if args.paths.is_empty() {
+                serde_json::Value::Null
+            } else {
+                let res = mailbox
+                    .file_reservation_paths(
+                        &args.project,
+                        &args.agent,
+                        &args.paths,
+                        args.ttl_secs,
+                        args.exclusive,
+                        args.reason.as_deref(),
+                    )
+                    .await?;
+                serde_json::to_value(&res)?
+            };
+            print_json(&json!({
+                "agent": agent.name,
+                "project": agent.project_slug,
+                "npub": agent.npub,
+                "key_path": agent.key_path,
+                "created": agent.created,
+                "reservation": reservation,
+                "next": "export AGENT_NAME=<pin> (or pass --as on every call); reserve before edit — the strict guard blocks unattributed or unreserved commits",
+            }))
+        }
+    }
+}
+
+/// Daemon arm of `run_agent`: same composition over MCP tools.
+pub async fn run_agent_daemon(dc: &DaemonClient, cmd: &AgentCommand) -> anyhow::Result<()> {
+    match cmd {
+        AgentCommand::Bootstrap(args) => {
+            let registration = dc
+                .call_tool(
+                    "register_agent",
+                    json!({
+                        "project_key": args.project,
+                        "name": args.agent,
+                        "program": args.program,
+                        "model": args.model,
+                        "task_description": args.task,
+                    }),
+                )
+                .await?;
+            let reservation = if args.paths.is_empty() {
+                serde_json::Value::Null
+            } else {
+                dc.call_tool(
+                    "file_reservation_paths",
+                    json!({
+                        "project_key": args.project,
+                        "agent_name": args.agent,
+                        "paths": args.paths,
+                        "ttl_seconds": args.ttl_secs,
+                        "exclusive": args.exclusive,
+                        "reason": args.reason,
+                    }),
+                )
+                .await?
+            };
+            print_json(&json!({
+                "agent": args.agent,
+                "project": args.project,
+                "registration": registration,
+                "reservation": reservation,
+                "next": "export AGENT_NAME=<pin> (or pass --as on every call); reserve before edit — the strict guard blocks unattributed or unreserved commits",
+            }))
         }
     }
 }

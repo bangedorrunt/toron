@@ -48,7 +48,7 @@ Child maps: [toron-core](crates/toron-core/AGENTS.md) ·
 | Cron (distinct type) | `crates/toron-workflow/src/cron.rs`  |
 | MCP tools | `crates/toron-mcp/src/tools/` |
 | Catalog surface | `crates/toron-mcp/src/catalog.rs` + `crates/toron-cli/src/catalog.rs` (`docs/catalog/`) |
-| CLI / daemon | `crates/toron-cli/src/{cli,daemon,main}.rs` |
+| CLI / daemon | `crates/toron-cli/src/{cli,daemon,main}.rs` (`agent bootstrap`: register/upsert + reserve in one call) |
 | ADRs | `docs/decisions/` |
 
 ## CONVENTIONS

@@ -51,6 +51,11 @@
       "name": "guard"
     },
     {
+      "args": "bootstrap",
+      "description": "Agent identity: one-step session bootstrap (register/upsert + reserve)",
+      "name": "agent"
+    },
+    {
       "args": "create, join, leave, list, members, post, read, close, purge",
       "description": "NIP-29 channels: create/join/leave/close/purge/list/members/post/read (39000/39002 + kind 9) (plane S; lifecycle open -> closed -> purged)",
       "name": "channel"
@@ -136,7 +141,7 @@
       "name": "role"
     }
   ],
-  "generated_at": "2026-09-06T05:38:05Z",
+  "generated_at": "2026-09-06T10:13:29Z",
   "resources": [
     {
       "description": "List projects known to toron.",
