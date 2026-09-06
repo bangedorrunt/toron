@@ -1,2 +1,6 @@
 [toolchain]
-channel = "stable"
+# Pinned for reproducibility, shared with siblings beads + flywheel
+# (bd-14ea). Builds and tests green with the stricter pedantic+nursery
+# clippy lints in [workspace.lints].
+channel = "nightly-2026-08-20"
+components = ["rustfmt", "clippy"]

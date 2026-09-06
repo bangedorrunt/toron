@@ -16,3 +16,101 @@ members = [
 # Disable stripping (correctness > binary size for this project).
 [profile.release]
 strip = "none"
+
+[workspace.lints.clippy]
+# Shared lint posture with siblings beads + flywheel (bd-14ea): pedantic +
+# nursery deny with targeted allows. Unsafe is denied per-crate via
+# `#![forbid(unsafe_code)]` (ADR-0003 verify-gates.sh enforces it), so no
+# [lints.rust] section here — keep the single mechanism.
+all = "deny"
+pedantic = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
+# Allow these lints to unblock CI (need higher priority than groups)
+cast_precision_loss = { level = "allow", priority = 1 }
+doc_markdown = { level = "allow", priority = 1 }
+missing_const_for_fn = { level = "allow", priority = 1 }
+uninlined_format_args = { level = "allow", priority = 1 }
+useless_let_if_seq = { level = "allow", priority = 1 }
+format_push_string = { level = "allow", priority = 1 }
+# Stylistic nursery/pedantic lints that don't reflect real defects
+assert_is_empty = { level = "allow", priority = 1 }
+option_if_let_else = { level = "allow", priority = 1 }
+map_unwrap_or = { level = "allow", priority = 1 }
+similar_names = { level = "allow", priority = 1 }
+too_long_first_doc_paragraph = { level = "allow", priority = 1 }
+missing_errors_doc = { level = "allow", priority = 1 }
+redundant_clone = { level = "allow", priority = 1 }
+struct_excessive_bools = { level = "allow", priority = 1 }
+if_not_else = { level = "allow", priority = 1 }
+# bd-14ea wave 2: mechanical churn across the workspace (1253 sites, 48
+# kinds). Allowed, not fixed, to keep this alignment commit config-only —
+# a concurrent crew has in-flight source edits (responses.rs, operator.rs)
+# that automated `--fix` must not touch. Tighten one lint at a time later.
+cast_lossless = { level = "allow", priority = 1 }
+cast_possible_truncation = { level = "allow", priority = 1 }
+cast_possible_wrap = { level = "allow", priority = 1 }
+cast_sign_loss = { level = "allow", priority = 1 }
+default_trait_access = { level = "allow", priority = 1 }
+doc_link_with_quotes = { level = "allow", priority = 1 }
+double_must_use = { level = "allow", priority = 1 }
+equatable_if_let = { level = "allow", priority = 1 }
+explicit_iter_loop = { level = "allow", priority = 1 }
+ignored_unit_patterns = { level = "allow", priority = 1 }
+implicit_clone = { level = "allow", priority = 1 }
+implicit_hasher = { level = "allow", priority = 1 }
+items_after_statements = { level = "allow", priority = 1 }
+iter_on_single_items = { level = "allow", priority = 1 }
+iter_with_drain = { level = "allow", priority = 1 }
+literal_string_with_formatting_args = { level = "allow", priority = 1 }
+manual_assert_eq = { level = "allow", priority = 1 }
+manual_is_variant_and = { level = "allow", priority = 1 }
+manual_let_else = { level = "allow", priority = 1 }
+manual_string_new = { level = "allow", priority = 1 }
+match_same_arms = { level = "allow", priority = 1 }
+missing_fields_in_debug = { level = "allow", priority = 1 }
+missing_panics_doc = { level = "allow", priority = 1 }
+must_use_candidate = { level = "allow", priority = 1 }
+needless_collect = { level = "allow", priority = 1 }
+needless_continue = { level = "allow", priority = 1 }
+needless_pass_by_ref_mut = { level = "allow", priority = 1 }
+needless_pass_by_value = { level = "allow", priority = 1 }
+no_effect_underscore_binding = { level = "allow", priority = 1 }
+nonminimal_bool = { level = "allow", priority = 1 }
+or_fun_call = { level = "allow", priority = 1 }
+redundant_closure_for_method_calls = { level = "allow", priority = 1 }
+return_self_not_must_use = { level = "allow", priority = 1 }
+semicolon_if_nothing_returned = { level = "allow", priority = 1 }
+significant_drop_in_scrutinee = { level = "allow", priority = 1 }
+significant_drop_tightening = { level = "allow", priority = 1 }
+single_match_else = { level = "allow", priority = 1 }
+too_many_lines = { level = "allow", priority = 1 }
+unnecessary_debug_formatting = { level = "allow", priority = 1 }
+unnested_or_patterns = { level = "allow", priority = 1 }
+unreadable_literal = { level = "allow", priority = 1 }
+unused_async = { level = "allow", priority = 1 }
+unused_async_trait_impl = { level = "allow", priority = 1 }
+unused_self = { level = "allow", priority = 1 }
+use_self = { level = "allow", priority = 1 }
+used_underscore_binding = { level = "allow", priority = 1 }
+used_underscore_items = { level = "allow", priority = 1 }
+wildcard_imports = { level = "allow", priority = 1 }
+# Wave 2b: surfaced only after the first 48 allows let downstream crates
+# compile (deny blocks the graph past the first failing crate).
+derive_partial_eq_without_eq = { level = "allow", priority = 1 }
+duration_suboptimal_units = { level = "allow", priority = 1 }
+match_wildcard_for_single_variants = { level = "allow", priority = 1 }
+needless_raw_string_hashes = { level = "allow", priority = 1 }
+redundant_pub_crate = { level = "allow", priority = 1 }
+trivially_copy_pass_by_ref = { level = "allow", priority = 1 }
+unused_peekable = { level = "allow", priority = 1 }
+# Wave 2c: same story, one layer deeper (toron-mcp lib).
+case_sensitive_file_extension_comparisons = { level = "allow", priority = 1 }
+manual_assert = { level = "allow", priority = 1 }
+match_wild_err_arm = { level = "allow", priority = 1 }
+redundant_else = { level = "allow", priority = 1 }
+single_char_pattern = { level = "allow", priority = 1 }
+stable_sort_primitive = { level = "allow", priority = 1 }
+# Wave 2d: toron-cli bin test target.
+bool_to_int_with_if = { level = "allow", priority = 1 }
+many_single_char_names = { level = "allow", priority = 1 }
+unnecessary_wraps = { level = "allow", priority = 1 }
