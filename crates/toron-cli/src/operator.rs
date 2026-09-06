@@ -185,36 +185,69 @@ fn check_keys(cfg: &Config) -> CheckResult {
     }
 }
 
+/// Parse the HTTP status code from a response head. Requires a real status
+/// line (`HTTP/x.y NNN …`); rejects incidental `"200"` substrings and bare
+/// non-status bodies. Returns `None` when the body is not HTTP.
+fn http_response_status(head: &str) -> Option<u16> {
+    let line = head.lines().next()?.trim();
+    let mut parts = line.split_whitespace();
+    let proto = parts.next()?;
+    if !proto.starts_with("HTTP/") {
+        return None;
+    }
+    parts.next()?.parse().ok()
+}
+
 fn check_resonate() -> CheckResult {
     // GS-037 P1: probe 127.0.0.1:8001 (IPv4 — resonate binds v4; localhost
-    // may resolve ::1-first). When the server answers, report reachable;
-    // when absent, fail-closed (ok:false) so doctor --check cannot invent-green.
-    use std::io::{Read, Write};
-    use std::net::{SocketAddr, TcpStream};
-    use std::time::Duration;
-    let addr: SocketAddr = "127.0.0.1:8001"
+    // may resolve ::1-first). Fail-closed unless TCP opens AND /health
+    // returns HTTP 2xx — no invent-green on any HTTP/ line, incidental 200
+    // substring, or non-HTTP junk on an open port.
+    let addr: std::net::SocketAddr = "127.0.0.1:8001"
         .parse()
         .expect("static resonate probe addr");
+    check_resonate_at(addr)
+}
+
+fn check_resonate_at(addr: std::net::SocketAddr) -> CheckResult {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+    use std::time::Duration;
     match TcpStream::connect_timeout(&addr, Duration::from_secs(1)) {
         Ok(mut s) => {
             let _ = s.set_read_timeout(Some(Duration::from_millis(500)));
             let _ = s.set_write_timeout(Some(Duration::from_millis(500)));
-            let _ = s.write_all(b"GET /health HTTP/1.0\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+            let host = match addr {
+                std::net::SocketAddr::V4(a) => a.ip().to_string(),
+                std::net::SocketAddr::V6(a) => a.ip().to_string(),
+            };
+            let req = format!(
+                "GET /health HTTP/1.0\r\nHost: {host}\r\nConnection: close\r\n\r\n"
+            );
+            let _ = s.write_all(req.as_bytes());
             let mut buf = [0u8; 256];
             let n = s.read(&mut buf).unwrap_or(0);
             let head = String::from_utf8_lossy(&buf[..n]);
-            if head.contains("200") || head.starts_with("HTTP/") {
-                CheckResult {
+            match http_response_status(&head) {
+                Some(code) if (200..300).contains(&code) => CheckResult {
                     name: "resonate",
                     ok: true,
                     detail: format!("reachable at http://{addr}"),
-                }
-            } else {
-                CheckResult {
+                },
+                Some(code) => CheckResult {
                     name: "resonate",
-                    ok: true,
-                    detail: format!("port open at {addr} (TCP up; health body not HTTP)"),
-                }
+                    ok: false,
+                    detail: format!(
+                        "port open at {addr} but /health returned HTTP {code} (need 2xx) — refuse soft-ok invent-green (GS-037)"
+                    ),
+                },
+                None => CheckResult {
+                    name: "resonate",
+                    ok: false,
+                    detail: format!(
+                        "port open at {addr} but health body is not HTTP 2xx — refuse soft-ok invent-green (GS-037)"
+                    ),
+                },
             }
         }
         Err(e) => CheckResult {
@@ -223,7 +256,7 @@ fn check_resonate() -> CheckResult {
             // when resonate is down (medium invent-green / soft-ok fix).
             ok: false,
             detail: format!(
-                "not reachable at http://{addr} ({e}) — refuse soft-ok invent-green (GS-037); start resonate or use a mail-only environment that skips this probe"
+                "not reachable at http://{addr} ({e}) — refuse soft-ok invent-green (GS-037); start resonate"
             ),
         },
     }
@@ -949,6 +982,95 @@ pub fn run_backend(cfg: &Config, cmd: &BackendCommand) -> anyhow::Result<()> {
             "effective": cfg.effective_backend(),
             "note": "no persistence; set TORON_BACKEND or .toron.toml",
         })),
+    }
+}
+
+#[cfg(test)]
+mod check_resonate_tests {
+    //! GS-037: doctor resonate must not invent-green on soft-ok health.
+    use super::*;
+    use std::io::Write;
+    use std::net::TcpListener;
+    use std::thread;
+    use std::time::Duration;
+
+    /// Accept one connection and write `reply` (or drop without writing).
+    fn serve_once(reply: Option<&'static [u8]>) -> std::net::SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        thread::spawn(move || {
+            let _ = listener.set_nonblocking(false);
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 256];
+                let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
+                let _ = std::io::Read::read(&mut stream, &mut buf);
+                if let Some(bytes) = reply {
+                    let _ = stream.write_all(bytes);
+                }
+            }
+        });
+        // Brief settle so accept is armed before the probe connects.
+        thread::sleep(Duration::from_millis(20));
+        addr
+    }
+
+    #[test]
+    fn http_response_status_requires_status_line_not_substring() {
+        assert_eq!(http_response_status("HTTP/1.1 200 OK\r\n"), Some(200));
+        assert_eq!(http_response_status("HTTP/1.0 204 No Content\r\n"), Some(204));
+        assert_eq!(http_response_status("HTTP/1.1 503 Unavailable\r\n"), Some(503));
+        // Incidental "200" in a non-status body must not parse as success.
+        assert_eq!(http_response_status("error code 200 in payload"), None);
+        assert_eq!(http_response_status("Content-Length: 200\r\n"), None);
+        assert_eq!(http_response_status(""), None);
+    }
+
+    #[test]
+    fn check_resonate_unreachable_is_not_ok() {
+        // Bind then drop so we probe a free port → ECONNREFUSED → ok:false.
+        let free = {
+            let l = TcpListener::bind("127.0.0.1:0").expect("bind free");
+            let a = l.local_addr().expect("addr");
+            drop(l);
+            a
+        };
+        let r = check_resonate_at(free);
+        assert!(!r.ok, "unreachable must be ok:false, got: {}", r.detail);
+        assert!(
+            !r.detail.contains("mail-only"),
+            "detail must not claim a mail-only skip that does not exist: {}",
+            r.detail
+        );
+    }
+
+    #[test]
+    fn check_resonate_non_http_body_is_not_ok() {
+        let addr = serve_once(Some(b"not-an-http-server\nerror 200\n"));
+        let r = check_resonate_at(addr);
+        assert!(!r.ok, "non-HTTP body must be ok:false, got: {}", r.detail);
+    }
+
+    #[test]
+    fn check_resonate_http_5xx_is_not_ok() {
+        let addr = serve_once(Some(
+            b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        ));
+        let r = check_resonate_at(addr);
+        assert!(!r.ok, "HTTP 5xx must be ok:false, got: {}", r.detail);
+        assert!(
+            r.detail.contains("503"),
+            "detail should name the status: {}",
+            r.detail
+        );
+    }
+
+    #[test]
+    fn check_resonate_http_2xx_is_ok() {
+        let addr = serve_once(Some(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+        ));
+        let r = check_resonate_at(addr);
+        assert!(r.ok, "HTTP 200 must be ok:true, got: {}", r.detail);
     }
 }
 
