@@ -121,6 +121,10 @@ pub enum Command {
     #[command(subcommand)]
     Guard(GuardCommand),
 
+    /// Agent identity: one-step session bootstrap (register/upsert + reserve).
+    #[command(subcommand)]
+    Agent(AgentCommand),
+
     // --- two-plane shared surface (ADR-0020 Spec 2): the Nostr plane as CLI.
     // Plane S (shared rooms, kind 9/7), J (jobs 43001-43006), N (presence
     // 20001), W (watch/NIP-01 REQ). CLI-first; the MCP cluster stays frozen.
@@ -811,6 +815,44 @@ pub struct ReserveTransferArgs {
     /// Explicit reason override (default: preserve the held lease's reason).
     #[arg(long)]
     pub reason: Option<String>,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum AgentCommand {
+    /// Register (upsert) an identity, then optionally reserve paths — the CLI
+    /// onboarding path when `reserve acquire` fails on unknown identity.
+    Bootstrap(AgentBootstrapArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct AgentBootstrapArgs {
+    /// Project slug.
+    #[arg(long, required = true)]
+    pub project: String,
+    /// Agent pin to register.
+    #[arg(long = "as", required = true)]
+    pub agent: String,
+    /// Path globs to reserve (comma-separated; e.g. 'src/**'). Empty skips.
+    #[arg(long, value_delimiter = ',')]
+    pub paths: Vec<String>,
+    /// Lease reason.
+    #[arg(long)]
+    pub reason: Option<String>,
+    /// Exclusive leases block other agents.
+    #[arg(long)]
+    pub exclusive: bool,
+    /// Lease TTL in seconds (default envelope TTL).
+    #[arg(long)]
+    pub ttl_secs: Option<u64>,
+    /// Harness/program for the 30013 profile (optional).
+    #[arg(long)]
+    pub program: Option<String>,
+    /// Model for the 30013 profile (optional).
+    #[arg(long)]
+    pub model: Option<String>,
+    /// Task description for the 30013 profile (optional).
+    #[arg(long)]
+    pub task: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]

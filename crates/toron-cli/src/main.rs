@@ -130,6 +130,7 @@ fn run(cli: &Cli) -> anyhow::Result<ExitCode> {
         | Command::Reserve(_)
         | Command::Slot(_)
         | Command::Contact(_)
+        | Command::Agent(_)
         | Command::Guard(_) => {
             run_robot(command)?;
             ExitCode::SUCCESS
@@ -319,6 +320,9 @@ async fn run_robot(command: &Command) -> anyhow::Result<()> {
         (crate::mailbox_source::MailboxSource::Daemon(dc), Command::Guard(cmd)) => {
             robot::run_guard_daemon(dc, cmd).await
         }
+        (crate::mailbox_source::MailboxSource::Daemon(dc), Command::Agent(cmd)) => {
+            robot::run_agent_daemon(dc, cmd).await
+        }
         (crate::mailbox_source::MailboxSource::Embedded(mb), Command::Mail(cmd)) => {
             robot::run_mail(mb, cmd).await
         }
@@ -333,6 +337,9 @@ async fn run_robot(command: &Command) -> anyhow::Result<()> {
         }
         (crate::mailbox_source::MailboxSource::Embedded(mb), Command::Guard(cmd)) => {
             robot::run_guard(mb, cmd).await
+        }
+        (crate::mailbox_source::MailboxSource::Embedded(mb), Command::Agent(cmd)) => {
+            robot::run_agent(mb, cmd).await
         }
         _ => anyhow::bail!("not a robot command"),
     };

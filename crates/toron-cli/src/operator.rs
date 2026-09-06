@@ -16,9 +16,9 @@ use std::time::Duration;
 use serde_json::json;
 
 use crate::cli::{
-    BackendCommand, Command, ContactCommand, DoctorArgs, DoctorCmd, DoctorReconstructArgs,
-    GuardCommand, KeyCommand, KeyGenerateArgs, KeyInspectArgs, MailCommand, ProjectCommand,
-    ProjectEnsureArgs, RelayCommand, RelayUrlArg, ReserveCommand, SlotCommand,
+    AgentCommand, BackendCommand, Command, ContactCommand, DoctorArgs, DoctorCmd,
+    DoctorReconstructArgs, GuardCommand, KeyCommand, KeyGenerateArgs, KeyInspectArgs, MailCommand,
+    ProjectCommand, ProjectEnsureArgs, RelayCommand, RelayUrlArg, ReserveCommand, SlotCommand,
 };
 use crate::config::Config;
 use crate::output::{OutputFormat, render_json};
@@ -824,6 +824,7 @@ pub fn robot_tool_name(command: &Command) -> &'static str {
         Command::Contact(ContactCommand::Captain(_)) => "contact.captain",
         Command::Guard(GuardCommand::Install(_)) => "guard.install",
         Command::Guard(GuardCommand::Uninstall(_)) => "guard.uninstall",
+        Command::Agent(AgentCommand::Bootstrap(_)) => "agent.bootstrap",
         _ => "unknown",
     }
 }
