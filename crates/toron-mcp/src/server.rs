@@ -77,14 +77,15 @@ impl ToronServer {
     }
 
     /// Server capabilities advertised via `initialize`/`discover`.
-    #[allow(deprecated)]
+    ///
+    /// Logging is deliberately NOT advertised: SEP-2577 deprecates it and
+    /// the server never emits log notifications.
     pub fn capabilities() -> ServerCapabilities {
         ServerCapabilities::builder()
             .enable_tools()
             .enable_resources()
             .enable_resources_subscribe()
             .enable_tool_list_changed()
-            .enable_logging()
             .build()
     }
 }

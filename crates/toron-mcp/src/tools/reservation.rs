@@ -227,7 +227,7 @@ impl ToolServer {
             .collect();
         ToolOutput::result(Ok(LeaseBoardOut {
             project_key: args.project_key,
-            count: reservations.len(),
+            count: reservations.len() as i64,
             reservations,
         }))
     }
@@ -325,7 +325,7 @@ pub struct LeaseRowOut {
 #[derive(Debug, Clone, JsonSchema, Serialize, Deserialize)]
 pub struct LeaseBoardOut {
     pub project_key: String,
-    pub count: usize,
+    pub count: i64,
     pub reservations: Vec<LeaseRowOut>,
 }
 
