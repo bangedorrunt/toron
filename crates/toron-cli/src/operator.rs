@@ -188,7 +188,7 @@ fn check_keys(cfg: &Config) -> CheckResult {
 fn check_resonate() -> CheckResult {
     // GS-037 P1: probe 127.0.0.1:8001 (IPv4 — resonate binds v4; localhost
     // may resolve ::1-first). When the server answers, report reachable;
-    // when absent, stay informational ok (mail-only use needs no resonate).
+    // when absent, fail-closed (ok:false) so doctor --check cannot invent-green.
     use std::io::{Read, Write};
     use std::net::{SocketAddr, TcpStream};
     use std::time::Duration;
@@ -219,9 +219,11 @@ fn check_resonate() -> CheckResult {
         }
         Err(e) => CheckResult {
             name: "resonate",
-            ok: true,
+            // GS-037: fail-closed on unreachable — doctor --check exits 3
+            // when resonate is down (medium invent-green / soft-ok fix).
+            ok: false,
             detail: format!(
-                "not reachable at http://{addr} ({e}) — no running server expected for mail-only use"
+                "not reachable at http://{addr} ({e}) — refuse soft-ok invent-green (GS-037); start resonate or use a mail-only environment that skips this probe"
             ),
         },
     }
