@@ -25,7 +25,11 @@ cd "$ROOT"
 fail=0
 
 # Existing ADR files, as "0003" "0004" ... (numeric prefix only).
-mapfile -t ADR_FILES < <(ls docs/decisions/ | sed -n 's/^\([0-9]\{4\}\)\-.*/\1/p' | sort -u)
+# Portable: macOS ships bash 3.2, which has no mapfile (bash 4+).
+ADR_FILES=()
+while IFS= read -r line; do
+    ADR_FILES+=("$line")
+done < <(ls docs/decisions/ | sed -n 's/^\([0-9]\{4\}\)\-.*/\1/p' | sort -u)
 
 if [ "${#ADR_FILES[@]}" -eq 0 ]; then
     echo "FAIL: no ADR files found under docs/decisions/" >&2
