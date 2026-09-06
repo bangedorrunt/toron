@@ -186,12 +186,47 @@ fn check_keys(cfg: &Config) -> CheckResult {
 }
 
 fn check_resonate() -> CheckResult {
-    CheckResult {
-        name: "resonate",
-        ok: true,
-        detail: "not configured (no running server expected)".to_string(),
+    // GS-037 P1: probe 127.0.0.1:8001 (IPv4 — resonate binds v4; localhost
+    // may resolve ::1-first). When the server answers, report reachable;
+    // when absent, stay informational ok (mail-only use needs no resonate).
+    use std::io::{Read, Write};
+    use std::net::{SocketAddr, TcpStream};
+    use std::time::Duration;
+    let addr: SocketAddr = "127.0.0.1:8001"
+        .parse()
+        .expect("static resonate probe addr");
+    match TcpStream::connect_timeout(&addr, Duration::from_secs(1)) {
+        Ok(mut s) => {
+            let _ = s.set_read_timeout(Some(Duration::from_millis(500)));
+            let _ = s.set_write_timeout(Some(Duration::from_millis(500)));
+            let _ = s.write_all(b"GET /health HTTP/1.0\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+            let mut buf = [0u8; 256];
+            let n = s.read(&mut buf).unwrap_or(0);
+            let head = String::from_utf8_lossy(&buf[..n]);
+            if head.contains("200") || head.starts_with("HTTP/") {
+                CheckResult {
+                    name: "resonate",
+                    ok: true,
+                    detail: format!("reachable at http://{addr}"),
+                }
+            } else {
+                CheckResult {
+                    name: "resonate",
+                    ok: true,
+                    detail: format!("port open at {addr} (TCP up; health body not HTTP)"),
+                }
+            }
+        }
+        Err(e) => CheckResult {
+            name: "resonate",
+            ok: true,
+            detail: format!(
+                "not reachable at http://{addr} ({e}) — no running server expected for mail-only use"
+            ),
+        },
     }
 }
+
 
 /// Deep health checks. `--check` exits 3 when any check fails (fails-closed,
 /// CI-friendly); 0 when all pass. Runtime failures still exit 1.
