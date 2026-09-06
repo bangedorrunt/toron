@@ -102,6 +102,23 @@ pub struct WhoIs {
     pub task_description: Option<String>,
     /// Last active (µs) = latest signed profile event `created_at`.
     pub last_active_ts_us: i64,
+    /// ADR-0010 F2: true when the entry is older than
+    /// [`ROSTER_STALE_AFTER_DAYS`] — a stale roster row is never a silent
+    /// live pin; consumers must not address it without re-validation.
+    pub stale: bool,
+}
+
+/// ADR-0010 F2: roster-staleness cadence (days). Entries with no signed
+/// activity older than this are flagged [`WhoIs::stale`] — the same
+/// prune cadence the dead-pane cleanup (`cleanup_pane_identities`)
+/// consumers apply, so one sweep retires pane-dead and time-dead rows.
+pub const ROSTER_STALE_AFTER_DAYS: u64 = 7;
+
+/// Pure recency predicate (functional core): true when `last_active_ts_us`
+/// is strictly older than [`ROSTER_STALE_AFTER_DAYS`] at `now_us`.
+/// Future timestamps are never stale.
+pub fn roster_entry_stale(last_active_ts_us: i64, now_us: i64) -> bool {
+    now_us - last_active_ts_us > ROSTER_STALE_AFTER_DAYS as i64 * 86_400 * 1_000_000
 }
 
 /// `list_agents` filter.
@@ -934,13 +951,16 @@ impl Mailbox {
             .max_by_key(|e| e.created_at.as_secs())
             .ok_or_else(|| anyhow::anyhow!("profile event missing for {name}"))?;
         let profile = ident::parse_profile(profile_ev).unwrap_or_else(|| AgentProfile::new(&name));
+        let last_active_ts_us = profile_ev.created_at.as_secs() as i64 * 1_000_000;
+        let now_us = crate::index::writer::Clock::now_us(&crate::index::writer::SystemClock);
         Ok(WhoIs {
             name: name.to_string(),
             npub: npub.to_hex(),
             program: profile.program,
             model: profile.model,
             task_description: profile.task_description,
-            last_active_ts_us: profile_ev.created_at.as_secs() as i64 * 1_000_000,
+            last_active_ts_us,
+            stale: roster_entry_stale(last_active_ts_us, now_us),
         })
     }
 
@@ -976,6 +996,7 @@ impl Mailbox {
                 model: None,
                 task_description: None,
                 last_active_ts_us: ts_us,
+                stale: false,
             });
             if ts_us > entry.last_active_ts_us {
                 entry.npub = npub;
@@ -989,6 +1010,12 @@ impl Mailbox {
         }
 
         let now_us = crate::index::writer::Clock::now_us(&crate::index::writer::SystemClock);
+        // ADR-0010 F2: flag time-dead rows on the same prune cadence the
+        // dead-pane cleanup consumers apply — covers both the insert and
+        // the latest-wins update path above.
+        for entry in by_name.values_mut() {
+            entry.stale = roster_entry_stale(entry.last_active_ts_us, now_us);
+        }
         let mut agents: Vec<WhoIs> = by_name.into_values().collect();
         if let Some(days) = opts.active_within_days {
             let cutoff = now_us - (days as i64) * 86_400 * 1_000_000;
@@ -1042,6 +1069,10 @@ impl Mailbox {
     /// herdr's pane list. Returns the pruned agent names (G9). toron holds no
     /// per-pane identity files (live herdr mapping), so "prune" = report the
     /// stale names for the projection to drop.
+    ///
+    /// ADR-0010 F2: pane-dead rows retire on this sweep alongside time-dead
+    /// rows (`WhoIs::stale` past [`ROSTER_STALE_AFTER_DAYS`]) — one sweep
+    /// retires both, so neither is ever a silent live pin.
     pub fn cleanup_pane_identities(&self, backend: &HerdrBackend) -> anyhow::Result<Vec<String>> {
         let mut client = backend.client();
         let agents = client.agent_list()?;
@@ -2249,6 +2280,99 @@ mod tests {
             .expect("captain survives second ensure");
         assert_eq!(w3.npub, pin.npub);
 
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// ADR-0010 F2: recency predicate boundaries — strictly older than the
+    /// cadence is stale, exactly-at and future timestamps are live.
+    #[test]
+    fn adr0010_f2_roster_recency_stale_predicate_boundaries() {
+        let day_us: i64 = 86_400 * 1_000_000;
+        let now: i64 = 1_800_000_000_000_000;
+        assert!(!roster_entry_stale(now, now), "activity now is live");
+        assert!(!roster_entry_stale(now - 6 * day_us, now), "6d is live");
+        assert!(
+            !roster_entry_stale(now - 7 * day_us, now),
+            "exactly at cadence is live"
+        );
+        assert!(
+            roster_entry_stale(now - 7 * day_us - 1, now),
+            "past cadence is stale"
+        );
+        assert!(
+            roster_entry_stale(now - 9 * day_us, now),
+            "9d artifact is stale"
+        );
+        assert!(
+            !roster_entry_stale(now + day_us, now),
+            "future timestamps never stale"
+        );
+    }
+
+    /// ADR-0010 F2: a 9-day-old session identity is flagged stale in
+    /// `list_agents` — present with recency, never a silent live pin.
+    #[tokio::test]
+    async fn adr0010_f2_roster_recency_list_agents_flags_stale_session_identity() {
+        let (mailbox, _pool, db_path, data_dir) = test_mailbox_with_pool("f2-recency").await;
+        mailbox.ensure_project("toron").await.expect("ensure");
+        let pin = mailbox
+            .register_agent("toron", &profile("BlueRidge"))
+            .await
+            .expect("fresh pin");
+        // Backdated session artifact (the live-use `captain-session`
+        // class): a profile event signed 9 days ago, published to the bus.
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs();
+        let old_profile = AgentProfile {
+            name: "captain-session".into(),
+            program: None,
+            model: None,
+            task_description: None,
+            persona: None,
+        };
+        let built = ident::register_agent(
+            "toron",
+            &old_profile,
+            None,
+            crate::nostr::Timestamp::from_secs(now_secs - 9 * 86_400),
+        )
+        .expect("backdated profile");
+        assert!(
+            mailbox
+                .bus
+                .publish(built.event.clone())
+                .await
+                .expect("publish")
+                .stored,
+            "old profile lands on the bus"
+        );
+        let agents = mailbox
+            .list_agents("toron", ListAgentsOptions::default())
+            .await
+            .expect("list");
+        assert_eq!(agents.len(), 2, "fresh pin + stale artifact");
+        let fresh = agents
+            .iter()
+            .find(|a| a.name == "BlueRidge")
+            .expect("fresh row");
+        assert_eq!(fresh.npub, pin.npub);
+        assert!(
+            fresh.last_active_ts_us > 0,
+            "recency surfaced on the roster"
+        );
+        assert!(!fresh.stale, "live pin is not stale");
+        let old_row = agents
+            .iter()
+            .find(|a| a.name == "captain-session")
+            .expect("stale row");
+        assert!(old_row.stale, "9-day-old session identity is flagged stale");
+        assert!(
+            old_row.last_active_ts_us < fresh.last_active_ts_us,
+            "stale row keeps its old recency"
+        );
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_dir_all(&data_dir);
     }

@@ -559,6 +559,9 @@
               "null"
             ]
           },
+          "stale": {
+            "type": "boolean"
+          },
           "task_description": {
             "type": [
               "string",
@@ -569,7 +572,8 @@
         "required": [
           "name",
           "npub",
-          "last_active_ts_us"
+          "last_active_ts_us",
+          "stale"
         ],
         "type": "object"
       },
@@ -737,14 +741,18 @@
       "name": "list_agents",
       "output_schema": {
         "$defs": {
-          "RegisteredAgentOut": {
-            "description": "`register_agent` / `create_agent_identity` / `list_agents` rows.",
+          "WhoIsOut": {
+            "description": "`whois`: `{name, npub, program, model, task_description, last_active_ts_us, stale}`.\n\nADR-0010 F2: `stale` flags roster rows older than the prune cadence —\nnever a silent live pin.",
             "properties": {
-              "created": {
-                "type": "boolean"
+              "last_active_ts_us": {
+                "format": "int64",
+                "type": "integer"
               },
-              "key_path": {
-                "type": "string"
+              "model": {
+                "type": [
+                  "string",
+                  "null"
+                ]
               },
               "name": {
                 "type": "string"
@@ -752,20 +760,27 @@
               "npub": {
                 "type": "string"
               },
-              "profile_event_id": {
-                "type": "string"
+              "program": {
+                "type": [
+                  "string",
+                  "null"
+                ]
               },
-              "project_slug": {
-                "type": "string"
+              "stale": {
+                "type": "boolean"
+              },
+              "task_description": {
+                "type": [
+                  "string",
+                  "null"
+                ]
               }
             },
             "required": [
               "name",
-              "project_slug",
               "npub",
-              "profile_event_id",
-              "key_path",
-              "created"
+              "last_active_ts_us",
+              "stale"
             ],
             "type": "object"
           }
@@ -774,7 +789,7 @@
         "properties": {
           "agents": {
             "items": {
-              "$ref": "#/$defs/RegisteredAgentOut"
+              "$ref": "#/$defs/WhoIsOut"
             },
             "type": "array"
           }
