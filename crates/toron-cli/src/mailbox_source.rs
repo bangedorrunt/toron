@@ -40,7 +40,7 @@ pub const DEFAULT_DAEMON_URL: &str = "http://127.0.0.1:18080/mcp";
 /// loudly instead. `TORON_TOOL_TIMEOUT_MS` overrides for slow operations.
 pub const TOOL_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Ceiling for the daemon `initialize` handshake (bd-gtqe).
+/// Ceiling for the daemon `server/discover` handshake (bd-gtqe).
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 fn tool_call_timeout() -> std::time::Duration {

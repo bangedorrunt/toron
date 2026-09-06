@@ -15,7 +15,7 @@
 //! their `*Args` structs live in per-domain modules (`system`, `mail`,
 //! `reservation`, `product`, `contact`, `slot`, `workflow`); each exposes its
 //! own `#[tool_router]`-generated `*_router()` and this module merges them via
-//! `ToolRouter`'s `Add` (rmcp-3.1.1). Move-only — tool names/args/returns are
+//! `ToolRouter`'s `Add` (rmcp-3.2.0). Move-only — tool names/args/returns are
 //! byte-identical (ADR-0007 C3).
 
 pub mod contact;
@@ -526,15 +526,13 @@ impl ToolServer {
     }
 
     /// Server capabilities advertised via `initialize`/`discover` (mirrors
-    /// `ToronServer::capabilities`).
-    #[allow(deprecated)]
+    /// `ToronServer::capabilities`; no logging per SEP-2577).
     pub fn capabilities() -> ServerCapabilities {
         ServerCapabilities::builder()
             .enable_tools()
             .enable_resources()
             .enable_resources_subscribe()
             .enable_tool_list_changed()
-            .enable_logging()
             .build()
     }
 }
@@ -777,6 +775,58 @@ mod tests {
         assert!(
             violations.is_empty(),
             "id-bearing tool surface fields must be String (ADR-0007 D1); found {}: {}",
+            violations.len(),
+            violations.join(", ")
+        );
+    }
+
+    /// MCP clients validate tool schemas against JSON Schema's known
+    /// `format` vocabulary (`int32`/`int64`/`date-time`/etc.). schemars emits
+    /// `uint`/`uint32`/`uint64` for Rust unsigned ints (`usize` → `uint`),
+    /// which strict clients report as "unknown format uint ignored in schema
+    /// at path #/properties/..." — so the surface must be all-signed
+    /// (`i32`/`i64`; wire-identical JSON numbers). Walk every tool's live
+    /// inputSchema + outputSchema recursively and reject any `uint*` format.
+    #[test]
+    fn no_uint_formats_in_tool_schemas() {
+        fn walk(tool: &str, path: String, v: &Value, out: &mut Vec<String>) {
+            if let Some(o) = v.as_object() {
+                if let Some(f) = o.get("format").and_then(|f| f.as_str())
+                    && f.starts_with("uint")
+                {
+                    out.push(format!("{tool} {path}: format {f:?}"));
+                }
+                for (k, child) in o {
+                    walk(tool, format!("{path}/{k}"), child, out);
+                }
+            } else if let Some(a) = v.as_array() {
+                for (i, child) in a.iter().enumerate() {
+                    walk(tool, format!("{path}[{i}]"), child, out);
+                }
+            }
+        }
+        let tools = ToolServer::tool_router().list_all();
+        let mut violations: Vec<String> = Vec::new();
+        for tool in tools.iter() {
+            let name = tool.name.as_ref();
+            walk(
+                name,
+                "#".to_string(),
+                &Value::Object((*tool.input_schema).clone()),
+                &mut violations,
+            );
+            if let Some(output) = tool.output_schema.as_ref() {
+                walk(
+                    name,
+                    "#".to_string(),
+                    &Value::Object((**output).clone()),
+                    &mut violations,
+                );
+            }
+        }
+        assert!(
+            violations.is_empty(),
+            "unsigned `uint*` schema formats (unknown to MCP clients) at {}: {}",
             violations.len(),
             violations.join(", ")
         );

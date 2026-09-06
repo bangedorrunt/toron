@@ -8,9 +8,16 @@
 //! definitions — clients (incl. pi's adapter) parse tool results into typed
 //! shapes without heuristics, closing the bd-96a probe-divergence gap at the
 //! schema layer. None of these are used for actual (de)serialization.
+//
+//! Counts are `i64` (never `usize`): schemars maps unsigned ints to
+//! `uint*` formats unknown to MCP clients, while `i64` emits `int64`.
 
+// All schemas derive from the schemars lineage rmcp re-exports (1.x) —
+// there is deliberately NO direct `schemars` dependency (a split lineage
+// is how `uint*` formats leaked onto the wire before). The module alias
+// stays: the derive macro expands to code referencing `schemars::...`.
 use rmcp::schemars;
-use schemars::JsonSchema;
+use rmcp::schemars::JsonSchema;
 
 /// `health_check`: `{bus, archive}` each `{ok, message}`.
 #[derive(Debug, Clone, JsonSchema)]
@@ -124,7 +131,7 @@ pub struct DeliveryOut {
 #[derive(Debug, Clone, JsonSchema)]
 pub struct SendResultOut {
     pub deliveries: Vec<DeliveryOut>,
-    pub count: usize,
+    pub count: i64,
     pub verified_sender: bool,
 }
 
@@ -200,8 +207,8 @@ pub struct ConflictReportOut {
     pub conflict_free: bool,
     pub conflicts: Vec<PathConflictOut>,
     pub clear_paths: Vec<String>,
-    pub checked_paths: usize,
-    pub total_conflicting_reservations: usize,
+    pub checked_paths: i64,
+    pub total_conflicting_reservations: i64,
     /// ADR-0011 Spec 4: additive soft tier (in-TTL intents).
     pub soft_conflicts: Vec<PathConflictOut>,
     pub has_soft_conflicts: bool,
@@ -240,7 +247,7 @@ pub struct AcquireResultOut {
 /// `renew_file_reservations`.
 #[derive(Debug, Clone, JsonSchema)]
 pub struct RenewResultOut {
-    pub renewed: usize,
+    pub renewed: i64,
     pub reservations: Vec<GrantedReservationOut>,
 }
 
@@ -255,7 +262,7 @@ pub struct ReleasedLeaseOut {
 /// `release_file_reservations`.
 #[derive(Debug, Clone, JsonSchema)]
 pub struct ReleaseResultOut {
-    pub released: usize,
+    pub released: i64,
     pub leases: Vec<ReleasedLeaseOut>,
 }
 
@@ -315,7 +322,7 @@ pub struct ThreadSummaryOut {
     pub participants: Vec<String>,
     pub key_points: Vec<String>,
     pub action_items: Vec<String>,
-    pub message_count: usize,
+    pub message_count: i64,
 }
 
 /// `macro_start_session`.
@@ -325,7 +332,7 @@ pub struct StartSessionResultOut {
     pub agent_name: String,
     pub npub: String,
     pub granted_reservations: Vec<GrantedReservationOut>,
-    pub inbox_count: usize,
+    pub inbox_count: i64,
 }
 
 /// `macro_prepare_thread`.
@@ -336,7 +343,7 @@ pub struct PrepareThreadResultOut {
     pub npub: String,
     pub thread_id: String,
     pub summary: ThreadSummaryOut,
-    pub inbox_count: usize,
+    pub inbox_count: i64,
 }
 
 /// `macro_contact_handshake`.
@@ -354,7 +361,7 @@ pub struct ReservationCycleResultOut {
     pub project_key: String,
     pub agent_name: String,
     pub granted: Vec<GrantedReservationOut>,
-    pub released: usize,
+    pub released: i64,
 }
 
 /// `ensure_product` / `products_link`.

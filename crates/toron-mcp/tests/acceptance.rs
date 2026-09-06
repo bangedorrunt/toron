@@ -294,8 +294,12 @@ async fn http_lists_exactly_38_am_rust_tools() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// 2026-07-28 retired the `initialize` handshake: a client that names
+/// V_2026_07_28 over `initialize` is answered with the server's newest
+/// legacy version (V_2025_11_25). The future-proof path is `server/discover`
+/// (`ClientLifecycleMode::Discover`), exercised here over stdio.
 #[tokio::test]
-async fn stdio_initialize_completes() -> anyhow::Result<()> {
+async fn stdio_discover_negotiates_2026_07_28() -> anyhow::Result<()> {
     // Drive the server over an in-process duplex pair instead of the real
     // process stdin/stdout so the test needs no child binary. The wire frames
     // are identical to a real stdio connection (newline-delimited JSON-RPC).
@@ -317,7 +321,17 @@ async fn stdio_initialize_completes() -> anyhow::Result<()> {
         Implementation::from_build_env(),
     )
     .with_protocol_version(ProtocolVersion::V_2026_07_28);
-    let client = client_info.serve(client_io).await;
+    let client = client_info
+        .serve_with_lifecycle(
+            client_io,
+            rmcp::ClientLifecycleMode::Discover {
+                preferred_versions: vec![
+                    ProtocolVersion::V_2026_07_28,
+                    ProtocolVersion::V_2025_11_25,
+                ],
+            },
+        )
+        .await;
 
     server_task.abort();
     match client {

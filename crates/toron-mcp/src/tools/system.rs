@@ -7,7 +7,7 @@
 //! Move-only split of the former `tools.rs` monolith: infrastructure (4) +
 //! identity (6) tools. The `#[tool_router(router = system_router)]` macro
 //! emits `pub(crate) fn system_router()`; `tools/mod.rs` merges it with the
-//! other domain routers via `ToolRouter`'s `Add` (rmcp-3.1.1) into the single
+//! other domain routers via `ToolRouter`'s `Add` (rmcp-3.2.0) into the single
 //! 38-tool surface. Frozen tool names/args/returns: ZERO change (ADR-0007 C3).
 
 use std::path::Path;
@@ -265,7 +265,8 @@ impl ToolServer {
     )]
     async fn list_agents(&self, Parameters(args): Parameters<ListAgentsArgs>) -> ToolOutput {
         let opts = ListAgentsOptions {
-            active_within_days: args.active_within_days.map(|d| d as u64),
+            // `u64::try_from` rejects negatives (never wrap to ~1.8e19 days).
+            active_within_days: args.active_within_days.and_then(|d| u64::try_from(d).ok()),
         };
         match self.mailbox.list_agents(&args.project_key, opts).await {
             Ok(v) => ToolOutput::ok(json!({ "agents": v.to_json() })),
@@ -351,7 +352,7 @@ pub struct WhoisArgs {
     #[serde(alias = "name")]
     pub agent_name: String,
     pub include_recent_commits: Option<bool>,
-    pub commit_limit: Option<u32>,
+    pub commit_limit: Option<i32>,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone)]
@@ -368,6 +369,6 @@ pub struct CleanupPaneIdentitiesArgs {
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone)]
 pub struct ListAgentsArgs {
     pub project_key: String,
-    pub limit: Option<u32>,
-    pub active_within_days: Option<u32>,
+    pub limit: Option<i32>,
+    pub active_within_days: Option<i32>,
 }

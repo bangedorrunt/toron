@@ -221,9 +221,7 @@ fn check_resonate_at(addr: std::net::SocketAddr) -> CheckResult {
                 std::net::SocketAddr::V4(a) => a.ip().to_string(),
                 std::net::SocketAddr::V6(a) => a.ip().to_string(),
             };
-            let req = format!(
-                "GET /health HTTP/1.0\r\nHost: {host}\r\nConnection: close\r\n\r\n"
-            );
+            let req = format!("GET /health HTTP/1.0\r\nHost: {host}\r\nConnection: close\r\n\r\n");
             let _ = s.write_all(req.as_bytes());
             let mut buf = [0u8; 256];
             let n = s.read(&mut buf).unwrap_or(0);
@@ -261,7 +259,6 @@ fn check_resonate_at(addr: std::net::SocketAddr) -> CheckResult {
         },
     }
 }
-
 
 /// Deep health checks. `--check` exits 3 when any check fails (fails-closed,
 /// CI-friendly); 0 when all pass. Runtime failures still exit 1.
@@ -1017,8 +1014,14 @@ mod check_resonate_tests {
     #[test]
     fn http_response_status_requires_status_line_not_substring() {
         assert_eq!(http_response_status("HTTP/1.1 200 OK\r\n"), Some(200));
-        assert_eq!(http_response_status("HTTP/1.0 204 No Content\r\n"), Some(204));
-        assert_eq!(http_response_status("HTTP/1.1 503 Unavailable\r\n"), Some(503));
+        assert_eq!(
+            http_response_status("HTTP/1.0 204 No Content\r\n"),
+            Some(204)
+        );
+        assert_eq!(
+            http_response_status("HTTP/1.1 503 Unavailable\r\n"),
+            Some(503)
+        );
         // Incidental "200" in a non-status body must not parse as success.
         assert_eq!(http_response_status("error code 200 in payload"), None);
         assert_eq!(http_response_status("Content-Length: 200\r\n"), None);
