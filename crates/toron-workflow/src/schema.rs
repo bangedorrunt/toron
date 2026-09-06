@@ -382,11 +382,15 @@ impl StepOnError {
     }
 }
 
-/// Phase of an agent job (ADR-0022 §3.1). The ORCHESTRATOR's vocabulary;
-/// harnesses map it to their own mechanics via the flywheel phase registry
-/// (ADR-0022 L2). The vocabulary is CLOSED (§4): five values, lowercase
-/// wire form; an unknown value is a parse error at lint time, never a
-/// silent degrade. New phases require an ADR amendment, not a string.
+/// Phase of an agent job (ADR-0022 §3.1, amended 2026-09-06 by flywheel
+/// ADR-0009). The ORCHESTRATOR's vocabulary; harnesses map it to their own
+/// mechanics via the flywheel phase registry (ADR-0022 L2). The vocabulary
+/// is CLOSED (§4): six values, lowercase wire form; an unknown value is a
+/// parse error at lint time, never a silent degrade. New phases require an
+/// ADR amendment, not a string. `compound` (flywheel ADR-0009) is the
+/// learning-capture closer of the compound-engineering loop: it runs after
+/// verify, never gates a run on its own failure, and carries no R-P lint
+/// gate yet (deferred until a measured need).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Phase {
@@ -395,6 +399,7 @@ pub enum Phase {
     Implement,
     Review,
     Verify,
+    Compound,
 }
 
 impl Phase {
@@ -406,11 +411,19 @@ impl Phase {
             Self::Implement => "implement",
             Self::Review => "review",
             Self::Verify => "verify",
+            Self::Compound => "compound",
         }
     }
 
     /// Every wire value, in registry order — the closed vocabulary.
-    pub const ALL: [&'static str; 5] = ["resolve", "plan", "implement", "review", "verify"];
+    pub const ALL: [&'static str; 6] = [
+        "resolve",
+        "plan",
+        "implement",
+        "review",
+        "verify",
+        "compound",
+    ];
 }
 
 /// Execution context for a dispatched job (ADR-0024 Spec 2).
@@ -425,7 +438,7 @@ pub enum ContextMode {
 }
 
 /// Closed-vocabulary gate for `DispatchSpec::phase` (ADR-0022 §3.1/§4):
-/// only the five [`Phase`] wire values deserialize; anything else is an
+/// only the six [`Phase`] wire values deserialize; anything else is an
 /// `unknown variant` parse error surfaced at lint time.
 fn deserialize_closed_phase<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
 where
@@ -931,9 +944,10 @@ steps:
         assert_eq!(*spec, again);
     }
 
-    /// ADR-0022 §3.1/§4 (bd-adr22-phase-enum-lint-ahfh): the phase
-    /// vocabulary is CLOSED — five values, lowercase wire form; an unknown
-    /// value is a parse error, never a silent degrade.
+    /// ADR-0022 §3.1/§4 (bd-adr22-phase-enum-lint-ahfh), amended by flywheel
+    /// ADR-0009 (2026-09-06): the phase vocabulary is CLOSED — six values,
+    /// lowercase wire form; an unknown value is a parse error, never a
+    /// silent degrade.
     #[test]
     fn phase_enum_closed_vocabulary_roundtrip_and_reject() {
         for (wire, value) in [
@@ -942,6 +956,7 @@ steps:
             ("implement", Phase::Implement),
             ("review", Phase::Review),
             ("verify", Phase::Verify),
+            ("compound", Phase::Compound),
         ] {
             assert_eq!(
                 serde_json::to_string(&value).unwrap(),

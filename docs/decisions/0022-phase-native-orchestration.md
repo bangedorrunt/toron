@@ -453,3 +453,25 @@ carry retro verification comments now.
 5. Wall-clock budget half shipped 2026-08-22 (bd-dklb,
    `FLYWHEEL_COMPOSE_MAX_SECONDS`); `cron run --live` moved onto the shared
    store seam in the same bead.
+
+---
+
+## Addendum (2026-09-06): the phase vocabulary gains `compound` (flywheel ADR-0009)
+
+The five-value closed vocabulary (§3.1/§4) gains a sixth wire value:
+**`compound`** — the learning-capture closer of the compound-engineering loop
+(flywheel ADR-0009, adopted from EveryInc/compound-engineering-plugin). It runs
+AFTER `verify`, is tagged `phase: compound`, and by contract never gates a run
+on its own failure (`on_error: continue` — a failed learning capture is
+reported, never blocking).
+
+- `Phase::Compound` added to the enum + `Phase::ALL` (6 values); the
+  deserialize gate rejects everything else exactly as before
+  (`schema.rs`, `phase_enum_closed_vocabulary_roundtrip_and_reject` extended).
+- **No R-P lint gate** is added for `compound` in this amendment: the four
+  §3.5 gates exist to force evidence on phases whose output is *claimed*
+  (implement/plan/review). A compound dispatch either writes a learning doc or
+  cleanly skips — both observable in the artifact, neither self-reported. A
+  gate is deferred until a measured need, per subtract-before-you-add.
+- Non-goal here: no flywheel-side changes in this repo; flywheel ADR-0009
+  (stages, wave-swarm composition, `docs/learnings/` corpus) governs those.
