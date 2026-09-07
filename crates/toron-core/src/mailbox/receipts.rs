@@ -15,12 +15,20 @@ use sqlx::SqlitePool;
 
 use crate::mailbox::send_tags::Wake;
 
-/// Receipt state (E2/E3 lifecycle).
+/// Receipt state (E2/E3 lifecycle, extended by flywheel ADR-0010 D8).
+///
+/// `Degraded` means acked-unknown: the message was durably enqueued but the
+/// receipt bookkeeping failed, so whether it was acked can never be proven
+/// from the store. It is terminal-downward — never dragged back to `owed`
+/// (a re-owed corr invites a resend, and a resend would duplicate).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ReceiptState {
     Owed,
     Acked,
     Resulted,
+    /// ADR-0010 D8: bookkeeping failure after durable enqueue. The wrap
+    /// landed; the receipt could not be maintained. Never resend-inviting.
+    Degraded,
 }
 
 impl ReceiptState {
@@ -29,6 +37,7 @@ impl ReceiptState {
             Self::Owed => "owed",
             Self::Acked => "acked",
             Self::Resulted => "resulted",
+            Self::Degraded => "degraded",
         }
     }
 
@@ -37,8 +46,9 @@ impl ReceiptState {
             "owed" => Ok(Self::Owed),
             "acked" => Ok(Self::Acked),
             "resulted" => Ok(Self::Resulted),
+            "degraded" => Ok(Self::Degraded),
             _ => Err(format!(
-                "unknown receipt state {s:?} — expected owed|acked|resulted"
+                "unknown receipt state {s:?} — expected owed|acked|resulted|degraded"
             )),
         }
     }
@@ -56,6 +66,30 @@ impl std::str::FromStr for ReceiptState {
         Self::parse(s)
     }
 }
+
+/// Printed on transport-unknown (ADR-0010 D8.1): the bus did not confirm
+/// storage, so the wrap may or may not have landed. The only safe recovery is
+/// the corr-preserving resend; a plain re-run of the send mints a NEW corr and
+/// duplicates. With no corr there is nothing to preserve — the guidance
+/// degrades to the duplicate warning.
+pub fn resend_guidance(corr: Option<&str>) -> String {
+    match corr {
+        Some(c) => format!(
+            "toron: transport-unknown — the wrap may not have landed. \
+             corr-preserving resend: flywheel mail resend --corr {c} (re-supply to/subject/body). \
+             A plain re-run of the send mints a NEW corr and DUPLICATES."
+        ),
+        None => format!(
+            "toron: transport-unknown — the wrap may not have landed and no corr was stamped; \
+             any re-run mints a new corr (a plain re-run DUPLICATES at the recipient only if it landed)."
+        ),
+    }
+}
+
+/// Printed whenever a corr receipt is recorded degraded (ADR-0010 D8.2):
+/// the message was durably enqueued, only the bookkeeping failed — a resend
+/// would duplicate.
+pub const DEGRADED_NOTE: &str = "toron: receipt degraded (acked-unknown): message enqueued but receipt bookkeeping failed — do NOT resend (a resend would duplicate).";
 
 /// Durable receipt (projection of assignment).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -119,6 +153,11 @@ impl ReceiptStore {
                 }
                 (ReceiptState::Resulted, _) => return Ok(()),
                 (ReceiptState::Acked, ReceiptState::Owed) => return Ok(()),
+                // ADR-0010 D8: degraded is acked-unknown — never re-owed, and
+                // an ack is strictly more information than degraded, so an
+                // acked row must not be dragged down either.
+                (ReceiptState::Degraded, ReceiptState::Owed) => return Ok(()),
+                (ReceiptState::Acked, ReceiptState::Degraded) => return Ok(()),
                 _ => {}
             }
         }
@@ -233,6 +272,9 @@ impl ReceiptStore {
         match r.state {
             ReceiptState::Resulted => return Ok(false),
             ReceiptState::Acked => return Ok(false),
+            // ADR-0010 D8: an ack landing after a degraded record is the
+            // recovery path — degraded (acked-unknown) upgrades to acked.
+            ReceiptState::Degraded => {}
             ReceiptState::Owed => {}
         }
         r.state = ReceiptState::Acked;

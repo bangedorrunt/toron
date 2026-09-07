@@ -923,3 +923,15 @@ Product locks, not research. One decision at a time when locking.
 Frontmatter `status: accepted` (2026-09-01, captain word ordered full implementation). README decisions table gains 0027. Kind registry updated only if 30015 is chosen. MCP catalog version bumps only when a same-as-CLI verb lands. A must-pass scenario exists for Slice 1 before Slice 2 starts. Tick Law leftovers in §3.6 are Slice 1 work, not a footnote.
 
 **2026-09-01:** Status `proposed` → `accepted` per captain word. Full implementation ordered; slices ship as they go green. Changelog section 0 retained intact.
+
+---
+
+## Addendum (2026-09-07): ADR-0010 D8 — degraded receipts + corr-preserving resend
+
+Flywheel [ADR-0010 D8](../../../flywheel/docs/decisions/0010-delivery-semantics-attention-triage-decision-lifecycle.md) (bd-d8e4) extends this record's E2 receipts lifecycle. Receipts `owed → acked → resulted` gain a fourth state:
+
+- **`degraded` (acked-unknown).** Bookkeeping failure after durable enqueue (the receipt upsert fails pre-publish while the send still enqueues) records `degraded` and never invites a resend — the wrap landed, only the bookkeeping failed; a resend would duplicate. Guard matrix in `ReceiptStore::upsert`: `degraded → owed` blocked (never re-owed), `acked → degraded` blocked (an ack is strictly more information), `resulted` stays terminal, `degraded → acked` allowed (recovery path via `transition_acked`).
+- **Transport-unknown prints a corr-preserving resend.** When `publish_dm` does not confirm storage (`stored == false`, or a bus error), `send_message` prints `flywheel mail resend --corr <c>` (re-supply to/subject/body — the receipts table stores no content) plus the plain-re-run duplicate warning. A plain re-run of the send mints a NEW corr and duplicates.
+- **Duplicate wake over silence.** The kind-9 wake ring now fires for EVERY attempted recipient, not only confirmed deliveries — an unconfirmed wrap prefers the rare duplicate wake over losing the message outright. Safety rests on the flywheel D2 watermark: a re-presented wake is the same bytes and is a no-op for the consumer.
+
+Wiring: `crates/toron-core/src/mailbox/receipts.rs` (`ReceiptState::Degraded`, `resend_guidance`, `DEGRADED_NOTE`, guard matrix) and `crates/toron-core/src/mailbox/messaging.rs` (`send_message` publish loop). CLI-only surface — no new MCP tools, no new kinds; MCP catalog unchanged (`catalog_freshness` satisfied: no surface moved).
