@@ -1357,12 +1357,24 @@ impl Mailbox {
                     })?;
                     (target, npub)
                 } else {
+                    // bd-dbdi: fold the alias table in Open mode too. whois
+                    // folds aliases in every mode (bd-lmcy), so the send path
+                    // must as well — otherwise `send --to captain` fails with
+                    // "unknown recipient" while `whois captain` resolves.
+                    // The captain fold is liveness-gated at the read (dead
+                    // targets prune to absent); unfoldered names keep exact
+                    // legacy routing.
+                    let canonical = self.canonical_project(&args.project_slug).await;
+                    let target = self
+                        .agent_name_alias(&canonical, name)
+                        .await
+                        .unwrap_or_else(|| name.clone());
                     (
-                        name.clone(),
-                        nident::resolve_name(&args.project_slug, profiles.iter(), name)
+                        target.clone(),
+                        nident::resolve_name(&args.project_slug, profiles.iter(), &target)
                             .ok_or_else(|| {
                                 anyhow::anyhow!(
-                                    "unknown recipient: {name} (register it in project {} first)",
+                                    "unknown recipient: {target} (register it in project {} first)",
                                     args.project_slug
                                 )
                             })?,
@@ -3049,6 +3061,44 @@ mod tests {
         assert!(
             !wraps_to(&mailbox, &recv_npub, 1).await.is_empty(),
             "open mode send delivered"
+        );
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// bd-dbdi: open-mode `send --to captain` must agree with `whois captain`.
+    /// whois folds the captain alias in every mode; the send path folded it
+    /// only in Swarm, so open-mode crews saw whois resolve while send failed
+    /// with "unknown recipient: captain".
+    #[tokio::test]
+    async fn open_mode_send_to_captain_alias_resolves() {
+        let (mailbox, _pool, db_path, data_dir) = test_mailbox_with_pool("open-send-captain").await;
+        mailbox.ensure_project("demo").await.expect("ensure");
+        mailbox
+            .register_agent("demo", &profile("GreenCastle"))
+            .await
+            .expect("sender");
+        let (_recv_keys, recv_npub) = register(&mailbox, "demo", "BlueLake").await;
+        mailbox
+            .set_project_captain("demo", "BlueLake")
+            .await
+            .expect("set captain");
+
+        // whois resolves via the fold ...
+        let w = mailbox
+            .whois("demo", "captain")
+            .await
+            .expect("whois captain resolves via fold");
+        assert_eq!(w.name, "BlueLake");
+        // ... so the send path must route to the same pin, not fail.
+        mailbox
+            .send_message(&send_args("demo", "GreenCastle", &["captain"]))
+            .await
+            .expect("send to captain agrees with whois");
+        assert!(
+            !wraps_to(&mailbox, &recv_npub, 1).await.is_empty(),
+            "captain alias delivered to the folded pin"
         );
 
         let _ = std::fs::remove_file(&db_path);
