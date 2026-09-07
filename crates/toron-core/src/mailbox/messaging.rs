@@ -299,6 +299,9 @@ impl Mailbox {
         // the store previously had ZERO producers, so `receipt get` and
         // `wait --corr` could never observe a real send). Best-effort: a
         // missing index pool (demo mode) must not fail the send.
+        // ADR-0010 D8.2: the failure is remembered — if the send still
+        // enqueues, the corr records degraded (acked-unknown) post-loop.
+        let mut receipt_bookkeeping_failed = false;
         if let Some(corr) = parsed_tags.corr.clone() {
             match self.receipt_store() {
                 Ok(store) => {
@@ -312,6 +315,10 @@ impl Mailbox {
                     };
                     if let Err(e) = store.upsert(&receipt).await {
                         eprintln!("toron: receipts store unavailable (receipt not recorded): {e}");
+                        // ADR-0010 D8.2: remember the bookkeeping failure — if
+                        // the send still enqueues, the corr records degraded
+                        // (acked-unknown) after the publish loop.
+                        receipt_bookkeeping_failed = true;
                     } else {
                         // Opportunistic bounded retention: keep at most 1000
                         // newest receipts and expire >30d old rows. Best-effort
@@ -326,6 +333,9 @@ impl Mailbox {
                 }
                 Err(e) => {
                     eprintln!("toron: receipts store unavailable (receipt not recorded): {e}");
+                    // ADR-0010 D8.2: bookkeeping unavailable pre-publish — if
+                    // the send still enqueues, record degraded post-loop.
+                    receipt_bookkeeping_failed = true;
                 }
             }
         }
@@ -449,15 +459,58 @@ impl Mailbox {
             let rumor_id = rumor.clone().id().to_hex();
             let wrap = gift_wrap::gift_wrap(&sender_keys, &r.npub, rumor)
                 .map_err(|e| anyhow::anyhow!("gift wrap failed for recipient {}: {e}", r.name))?;
-            let delivered = self.publish_dm(&wrap).await?;
-            if delivered {
-                deliveries.push(Delivery {
-                    project: args.project_slug.clone(),
-                    payload: DeliveryPayload {
-                        recipient: r.name.clone(),
-                        event_id: rumor_id,
-                    },
-                });
+            match self.publish_dm(&wrap).await {
+                Ok(true) => {
+                    deliveries.push(Delivery {
+                        project: args.project_slug.clone(),
+                        payload: DeliveryPayload {
+                            recipient: r.name.clone(),
+                            event_id: rumor_id,
+                        },
+                    });
+                }
+                // ADR-0010 D8.1: transport-unknown (the bus did not confirm
+                // storage) — never silence. Print the corr-preserving resend
+                // guidance; a plain re-run of the send mints a NEW corr and
+                // duplicates.
+                Ok(false) => {
+                    eprintln!(
+                        "{}",
+                        crate::mailbox::receipts::resend_guidance(parsed_tags.corr.as_deref())
+                    );
+                }
+                // Bus call itself failed — same uncertainty semantics as
+                // stored=false: loud + resend guidance, never silence.
+                Err(e) => {
+                    eprintln!("toron: DM publish failed for {}: {e}", r.name);
+                    eprintln!(
+                        "{}",
+                        crate::mailbox::receipts::resend_guidance(parsed_tags.corr.as_deref())
+                    );
+                }
+            }
+        }
+
+        // ADR-0010 D8.2: the message enqueued (≥1 confirmed delivery) but the
+        // receipt bookkeeping failed → record degraded (acked-unknown) and
+        // never invite a resend.
+        if receipt_bookkeeping_failed
+            && !deliveries.is_empty()
+            && let Some(corr) = parsed_tags.corr.clone()
+        {
+            eprintln!("{}", crate::mailbox::receipts::DEGRADED_NOTE);
+            let degraded = crate::mailbox::receipts::Receipt {
+                corr,
+                state: crate::mailbox::receipts::ReceiptState::Degraded,
+                wake: parsed_tags.wake,
+                due_at: None,
+                result_path: parsed_tags.result_path.clone(),
+                updated_at: chrono::Utc::now().timestamp_millis(),
+            };
+            if let Ok(store) = self.receipt_store()
+                && let Err(e) = store.upsert(&degraded).await
+            {
+                eprintln!("toron: degraded receipt could not be recorded: {e}");
             }
         }
 
@@ -467,35 +520,38 @@ impl Mailbox {
         // per delivery with ONLY: from pin, thread_id, importance. No subject
         // or content ever touches the wake (seal stays sealed). Reuses the
         // same bus the job wake (43001) uses — no new Nostr kind.
+        // ADR-0010 D8.3: ring for EVERY attempted recipient, not only
+        // confirmed deliveries — a transport-unknown wrap prefers the rare
+        // duplicate wake over silence (duplicate over silence: the D2
+        // watermark makes the duplicate a no-op for the consumer; silence
+        // loses the message outright).
         let thread_ref = args.thread_id.clone().unwrap_or_else(|| visible_id.clone());
         let importance = args
             .importance
             .clone()
             .unwrap_or_else(|| "normal".to_string());
-        for d in &deliveries {
-            if let Some(r) = resolved.iter().find(|x| x.name == d.payload.recipient) {
-                let wake_content = format!(
-                    "[doorbell] mail from {} thread {} importance {}",
-                    args.sender_name, thread_ref, importance
-                );
-                let tags = vec![
-                    Tag::parse(["p", &r.npub.to_hex()]).expect("p tag"),
-                    Tag::parse(["t", &args.project_slug]).expect("t tag"),
-                    Tag::parse(["h", &thread_ref]).expect("h tag"),
-                    Tag::parse(["toron-kind", "mail-delivered"]).expect("toron-kind"),
-                    Tag::parse(["thread", &thread_ref]).expect("thread"),
-                    Tag::parse(["importance", &importance]).expect("importance"),
-                    Tag::parse(["from", &args.sender_name]).expect("from"),
-                ];
-                if let Ok(ev) = build_event(
-                    &sender_keys,
-                    toron_kind(9),
-                    wake_content,
-                    tags,
-                    Timestamp::now(),
-                ) {
-                    let _ = self.bus.publish(ev).await;
-                }
+        for r in &resolved {
+            let wake_content = format!(
+                "[doorbell] mail from {} thread {} importance {}",
+                args.sender_name, thread_ref, importance
+            );
+            let tags = vec![
+                Tag::parse(["p", &r.npub.to_hex()]).expect("p tag"),
+                Tag::parse(["t", &args.project_slug]).expect("t tag"),
+                Tag::parse(["h", &thread_ref]).expect("h tag"),
+                Tag::parse(["toron-kind", "mail-delivered"]).expect("toron-kind"),
+                Tag::parse(["thread", &thread_ref]).expect("thread"),
+                Tag::parse(["importance", &importance]).expect("importance"),
+                Tag::parse(["from", &args.sender_name]).expect("from"),
+            ];
+            if let Ok(ev) = build_event(
+                &sender_keys,
+                toron_kind(9),
+                wake_content,
+                tags,
+                Timestamp::now(),
+            ) {
+                let _ = self.bus.publish(ev).await;
             }
         }
 
