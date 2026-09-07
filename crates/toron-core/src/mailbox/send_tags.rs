@@ -4,7 +4,9 @@
 //! Typed vocabulary for `SendMessage.extra_tags` (ADR-0027 E2/E3, ADR-0028 E4).
 //!
 //! Tags ride rumor kind 14 and job 43001 builder; NEVER the sealed 1059
-//! envelope. Vocabulary: `corr`, `wake(standing|tasked)`,
+//! envelope — except the single bd-d0a7 outer urgency bit
+//! (`["importance", "urgent"]`, set by `gift_wrap_with_urgency`).
+//! Vocabulary: `corr`, `wake(standing|tasked)`,
 //! `priority(queue|interrupt)`, `audience(human|agents)`, `result_path`,
 //! `verdict(approve|deny)`, `bead=<id>` (ADR-0010 D9: the structural
 //! done-hold — the dispatch guard matches the TAG, never the `[{id}] done`
