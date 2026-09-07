@@ -79,10 +79,9 @@ pub fn resend_guidance(corr: Option<&str>) -> String {
              corr-preserving resend: flywheel mail resend --corr {c} (re-supply to/subject/body). \
              A plain re-run of the send mints a NEW corr and DUPLICATES."
         ),
-        None => format!(
-            "toron: transport-unknown — the wrap may not have landed and no corr was stamped; \
+        None => "toron: transport-unknown — the wrap may not have landed and no corr was stamped; \
              any re-run mints a new corr (a plain re-run DUPLICATES at the recipient only if it landed)."
-        ),
+            .to_string(),
     }
 }
 
