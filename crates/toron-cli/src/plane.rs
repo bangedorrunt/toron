@@ -1242,8 +1242,46 @@ fn read_presence(mailbox: &Mailbox, project: &str, now_secs: u64) -> Vec<Value> 
     out
 }
 
+/// bd-1wwc: presence flag/env resolution (functional core). Flags win;
+/// blank values read as absent. `env` is a provider so tests inject a map
+/// while production reads the process environment (laziness-protocol: never
+/// demand what the pane already knows).
+fn resolve_presence_project(
+    flag: Option<&str>,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Option<String> {
+    nonblank(flag.map(str::to_string)).or_else(|| nonblank(env("TORON_PROJECT")))
+}
+
+/// bd-1wwc: --as ladder — explicit flag, then TORON_AGENT, FLYWHEEL_MAIL_AS,
+/// AGENT_NAME (the guard_agent order in robot.rs, reused not reinvented).
+fn resolve_presence_as(flag: Option<&str>, env: &dyn Fn(&str) -> Option<String>) -> Option<String> {
+    nonblank(flag.map(str::to_string))
+        .or_else(|| nonblank(env("TORON_AGENT")))
+        .or_else(|| nonblank(env("FLYWHEEL_MAIL_AS")))
+        .or_else(|| nonblank(env("AGENT_NAME")))
+}
+
+fn nonblank(s: Option<String>) -> Option<String> {
+    s.filter(|v| !v.trim().is_empty())
+}
+
+/// Production env provider for the resolvers above.
+fn live_env(key: &str) -> Option<String> {
+    std::env::var(key).ok()
+}
+
 async fn presence_publish(mailbox: &Mailbox, args: &PresencePublishArgs) -> anyhow::Result<()> {
-    let keys = resolve_agent(mailbox, &args.project, &args.as_name).await?;
+    let project =
+        resolve_presence_project(args.project.as_deref(), &live_env).ok_or_else(|| {
+            anyhow::anyhow!(
+                "pass --project or export TORON_PROJECT (no project in flags or pane env)"
+            )
+        })?;
+    let as_name = resolve_presence_as(args.as_name.as_deref(), &live_env).ok_or_else(|| {
+        anyhow::anyhow!("pass --as or export TORON_AGENT / FLYWHEEL_MAIL_AS / AGENT_NAME (no pin in flags or pane env)")
+    })?;
+    let keys = resolve_agent(mailbox, &project, &as_name).await?;
     let now = Timestamp::now();
     let payload = PresencePayload {
         state: presence_state(args.state),
@@ -1255,7 +1293,7 @@ async fn presence_publish(mailbox: &Mailbox, args: &PresencePublishArgs) -> anyh
 
     // Append to the CLI projection (last-wins by npub on read).
     let whois = mailbox
-        .whois(&args.project, &args.as_name)
+        .whois(&project, &as_name)
         .await
         .context("whois for presence projection")?;
     let line = serde_json::json!({
@@ -1264,7 +1302,7 @@ async fn presence_publish(mailbox: &Mailbox, args: &PresencePublishArgs) -> anyh
         "state": state_str(&payload.state),
         "status": payload.status,
         "ts": payload.ts,
-        "project": args.project,
+        "project": project,
     });
     let mut s = line.to_string();
     s.push('\n');
@@ -1286,11 +1324,17 @@ async fn presence_publish(mailbox: &Mailbox, args: &PresencePublishArgs) -> anyh
 }
 
 async fn presence_list(mailbox: &Mailbox, args: &PresenceListArgs) -> anyhow::Result<()> {
+    let project =
+        resolve_presence_project(args.project.as_deref(), &live_env).ok_or_else(|| {
+            anyhow::anyhow!(
+                "pass --project or export TORON_PROJECT (no project in flags or pane env)"
+            )
+        })?;
     let now_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let rows = read_presence(mailbox, &args.project, now_secs);
+    let rows = read_presence(mailbox, &project, now_secs);
     print_json(&serde_json::Value::Array(rows))
 }
 
@@ -1841,5 +1885,108 @@ mod live_watch_tests {
         .expect("wait ok from sqlite fast path");
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_dir_all(&data_dir);
+    }
+}
+
+/// bd-1wwc: presence --project/--as default from pane env (RED first).
+#[cfg(test)]
+mod presence_env_tests {
+    use super::{resolve_presence_as, resolve_presence_project};
+    use std::collections::HashMap;
+
+    fn env_map(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect()
+    }
+
+    fn lookup(map: &HashMap<String, String>) -> impl Fn(&str) -> Option<String> + '_ {
+        move |k: &str| map.get(k).cloned()
+    }
+
+    #[test]
+    fn project_flag_wins_over_env() {
+        assert_eq!(
+            resolve_presence_project(
+                Some("flag-proj"),
+                &lookup(&env_map(&[("TORON_PROJECT", "env-proj")]))
+            ),
+            Some("flag-proj".to_string())
+        );
+    }
+
+    #[test]
+    fn project_falls_back_to_env() {
+        assert_eq!(
+            resolve_presence_project(None, &lookup(&env_map(&[("TORON_PROJECT", "env-proj")]))),
+            Some("env-proj".to_string())
+        );
+    }
+
+    #[test]
+    fn project_empty_env_is_absent() {
+        assert_eq!(
+            resolve_presence_project(None, &lookup(&env_map(&[("TORON_PROJECT", "  ")]))),
+            None
+        );
+    }
+
+    #[test]
+    fn project_nothing_is_none() {
+        assert_eq!(resolve_presence_project(None, &lookup(&env_map(&[]))), None);
+    }
+
+    #[test]
+    fn as_flag_wins_over_env() {
+        assert_eq!(
+            resolve_presence_as(
+                Some("FlagPin"),
+                &lookup(&env_map(&[("TORON_AGENT", "EnvPin")]))
+            ),
+            Some("FlagPin".to_string())
+        );
+    }
+
+    #[test]
+    fn as_ladder_toron_agent_first() {
+        assert_eq!(
+            resolve_presence_as(
+                None,
+                &lookup(&env_map(&[
+                    ("TORON_AGENT", "FirstPin"),
+                    ("FLYWHEEL_MAIL_AS", "SecondPin"),
+                    ("AGENT_NAME", "ThirdPin"),
+                ]))
+            ),
+            Some("FirstPin".to_string())
+        );
+    }
+
+    #[test]
+    fn as_ladder_flywheel_second() {
+        assert_eq!(
+            resolve_presence_as(
+                None,
+                &lookup(&env_map(&[
+                    ("FLYWHEEL_MAIL_AS", "SecondPin"),
+                    ("AGENT_NAME", "ThirdPin")
+                ]))
+            ),
+            Some("SecondPin".to_string())
+        );
+    }
+
+    #[test]
+    fn as_ladder_agent_name_third() {
+        assert_eq!(
+            resolve_presence_as(None, &lookup(&env_map(&[("AGENT_NAME", "ThirdPin")]))),
+            Some("ThirdPin".to_string())
+        );
+    }
+
+    #[test]
+    fn as_nothing_is_none() {
+        assert_eq!(resolve_presence_as(None, &lookup(&env_map(&[]))), None);
     }
 }
