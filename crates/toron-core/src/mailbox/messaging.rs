@@ -1842,6 +1842,7 @@ mod tests {
             audience: None,
             result_path: None,
             verdict: None,
+            bead: None,
         };
 
         // Two identical assigns (same sender+subject+body) 10s apart → one
