@@ -459,10 +459,16 @@ impl Mailbox {
         let mut deliveries: Vec<Delivery> = Vec::new();
 
         // to+cc+bcc: one gift wrap per recipient from the prebuilt rumors.
+        // bd-d0a7: hoist the urgency bit onto the outer 1059 envelope so
+        // relays/watchers order without decrypting (content stays sealed).
+        let outer_urgent = args.importance.as_deref() == Some("urgent");
         for (r, rumor) in pending {
             let rumor_id = rumor.clone().id().to_hex();
-            let wrap = gift_wrap::gift_wrap(&sender_keys, &r.npub, rumor)
-                .map_err(|e| anyhow::anyhow!("gift wrap failed for recipient {}: {e}", r.name))?;
+            let wrap =
+                gift_wrap::gift_wrap_with_urgency(&sender_keys, &r.npub, rumor, outer_urgent)
+                    .map_err(|e| {
+                        anyhow::anyhow!("gift wrap failed for recipient {}: {e}", r.name)
+                    })?;
             match self.publish_dm(&wrap).await {
                 Ok(true) => {
                     deliveries.push(Delivery {

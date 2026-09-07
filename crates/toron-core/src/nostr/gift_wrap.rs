@@ -77,7 +77,40 @@ pub fn gift_wrap(
     recipient: &PublicKey,
     rumor: UnsignedEvent,
 ) -> Result<Event, BuilderError> {
-    GiftWrapBuilder::new(*recipient, rumor).finalize(sender)
+    gift_wrap_with_urgency(sender, recipient, rumor, false)
+}
+
+/// Outer urgency bit (bd-d0a7): one metadata flag on the 1059 envelope,
+/// outside the seal. `urgent=true` stamps an outer `["importance",
+/// "urgent"]` tag; `false` stamps nothing (absent = normal). Sender,
+/// recipient, subject, thread, and content stay sealed — a relay or watcher
+/// learns urgency but never content (email-importance-flag precedent).
+/// Read it back without any key via [`outer_urgency`].
+pub fn gift_wrap_with_urgency(
+    sender: &Keys,
+    recipient: &PublicKey,
+    rumor: UnsignedEvent,
+    urgent: bool,
+) -> Result<Event, BuilderError> {
+    let builder = GiftWrapBuilder::new(*recipient, rumor);
+    if urgent {
+        builder
+            .extra_tags([Tag::parse(["importance", "urgent"]).expect("urgency tag")])
+            .finalize(sender)
+    } else {
+        builder.finalize(sender)
+    }
+}
+
+/// Read the outer urgency bit without decrypting: true iff the 1059 event
+/// carries the outer `["importance", "urgent"]` tag. Pure tag check —
+/// no key needed, so `toron watch` surfaces urgency for 1059s it cannot open.
+pub fn outer_urgency(wrap: &Event) -> bool {
+    wrap.kind == Kind::GiftWrap
+        && wrap.tags.iter().any(|t| {
+            let v = t.as_slice();
+            v.len() == 2 && v[0] == "importance" && v[1] == "urgent"
+        })
 }
 
 /// Unwrap a gift wrap for the recipient key.
@@ -379,6 +412,35 @@ mod tests {
                 other.map(|_| ())
             ),
         }
+    }
+
+    #[test]
+    fn test_outer_urgency_tag() {
+        // bd-d0a7: one urgency bit on the OUTER 1059 wrap. An urgent DM
+        // carries the outer tag, a normal DM does not, and the sealed
+        // content stays undecryptable without the recipient key in both.
+        let sender = sender_keys();
+        let recipient = recipient_keys();
+        let stranger = stranger_keys();
+        let rumor = sample_rumor(sender.public_key());
+
+        let urgent = gift_wrap_with_urgency(&sender, &recipient.public_key(), rumor.clone(), true)
+            .expect("urgent wrap");
+        assert!(outer_urgency(&urgent), "urgent wrap carries outer tag");
+
+        let normal = gift_wrap_with_urgency(&sender, &recipient.public_key(), rumor, false)
+            .expect("normal wrap");
+        assert!(!outer_urgency(&normal), "normal wrap carries no outer tag");
+
+        // Seal holds in both cases: a third party learns urgency but never
+        // content (email-importance-flag precedent).
+        for wrapped in [&urgent, &normal] {
+            assert!(decrypt(stranger.secret_key(), &wrapped.pubkey, &wrapped.content).is_err());
+            assert!(!wrapped.content.contains("secret payload"));
+        }
+        // The urgent wrap still unwraps for the real recipient.
+        let unwrapped = unwrap(&recipient, &urgent).expect("unwrap urgent");
+        assert_eq!(unwrapped.rumor.content, "secret payload");
     }
 
     #[test]
