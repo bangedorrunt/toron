@@ -105,6 +105,10 @@ pub struct WhoIs {
     /// ADR-0010 F2: true when the entry is older than
     /// [`ROSTER_STALE_AFTER_DAYS`] — a stale roster row is never a silent
     /// live pin; consumers must not address it without re-validation.
+    /// Wire compat (bd-hrmq): pre-F2 daemon rows omit this field; default
+    /// keeps old rows parseable (pin-draw treats a failed roster as
+    /// no-collision-info, never a block).
+    #[serde(default)]
     pub stale: bool,
 }
 
@@ -1913,6 +1917,27 @@ mod tests {
     fn test_list_agents_options_default() {
         let o = ListAgentsOptions::default();
         assert!(o.active_within_days.is_none());
+    }
+
+    /// bd-hrmq: pre-F2 daemon rows omit `stale` — they must still parse
+    /// (flywheel reads the roster across daemon versions).
+    #[test]
+    fn roster_stale_compat() {
+        let old = serde_json::json!({
+            "name": "BlueLake",
+            "npub": "abc",
+            "last_active_ts_us": 1_700_000_000_000_000i64,
+        });
+        let w: WhoIs = serde_json::from_value(old).expect("old row parses");
+        assert!(!w.stale, "unknown recency defaults not-stale");
+        let fresh = serde_json::json!({
+            "name": "BlueLake",
+            "npub": "abc",
+            "last_active_ts_us": 1_700_000_000_000_000i64,
+            "stale": true,
+        });
+        let w2: WhoIs = serde_json::from_value(fresh).expect("new row parses");
+        assert!(w2.stale, "explicit stale survives");
     }
 
     // ---- bd-cmgu → ADR-0017: MCP vs CLI project-key unification ----
