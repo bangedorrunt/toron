@@ -95,7 +95,7 @@ fn build_send_tags(
 pub async fn run_mail(mailbox: &Mailbox, cmd: &MailCommand) -> anyhow::Result<()> {
     match cmd {
         MailCommand::Send(args) => {
-            let extra_tags = build_send_tags(
+            let mut extra_tags = build_send_tags(
                 args.corr.clone(),
                 args.wake.clone(),
                 args.priority.clone(),
@@ -103,6 +103,15 @@ pub async fn run_mail(mailbox: &Mailbox, cmd: &MailCommand) -> anyhow::Result<()
                 args.result_path.clone(),
                 args.verdict.clone(),
             )?;
+            // ADR-0010 D9 (bd-l0fz): --resolve-bead stamps the structural
+            // done-hold tag. SendTags::parse validates it at the send boundary
+            // (non-empty); the guard matches the TAG, not the subject.
+            if let Some(bd) = args.resolve_bead.as_deref() {
+                extra_tags.push(
+                    toron_core::nostr::Tag::parse(["bead", bd.trim()])
+                        .map_err(|e| anyhow::anyhow!("bead tag: {e}"))?,
+                );
+            }
             let msg = SendMessage {
                 project_slug: args.project.clone(),
                 sender_name: args.from.clone(),

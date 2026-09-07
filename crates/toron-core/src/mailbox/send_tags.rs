@@ -6,7 +6,9 @@
 //! Tags ride rumor kind 14 and job 43001 builder; NEVER the sealed 1059
 //! envelope. Vocabulary: `corr`, `wake(standing|tasked)`,
 //! `priority(queue|interrupt)`, `audience(human|agents)`, `result_path`,
-//! `verdict(approve|deny)`. Parsed at the boundary into typed structs;
+//! `verdict(approve|deny)`, `bead=<id>` (ADR-0010 D9: the structural
+//! done-hold — the dispatch guard matches the TAG, never the `[{id}] done`
+//! subject). Parsed at the boundary into typed structs;
 //! unknown wake/priority/audience/verdict values are hard errors
 //! (type-system-discipline).
 
@@ -256,6 +258,12 @@ pub struct SendTags {
     pub audience: Option<Audience>,
     pub result_path: Option<String>,
     pub verdict: Option<Verdict>,
+    /// ADR-0010 D9 (bd-l0fz): the work-ledger bead this send resolves — the
+    /// structural done-hold. CLI-only (`--resolve-bead`); the MCP surface
+    /// intentionally does not carry it. Corr-linked: stamps on the rumor and
+    /// projects onto inbox rows; the flywheel dispatch guard matches THIS tag
+    /// instead of the `[{id}] done` subject.
+    pub bead: Option<String>,
 }
 
 impl SendTags {
@@ -293,6 +301,7 @@ impl SendTags {
             audience,
             result_path,
             verdict,
+            bead: None,
         })
     }
 
@@ -342,6 +351,16 @@ impl SendTags {
                 "verdict" => {
                     let v = parts.get(1).map(|s| s.as_str()).unwrap_or("");
                     out.verdict = Some(Verdict::parse(v)?);
+                }
+                "bead" => {
+                    let v = parts.get(1).cloned().unwrap_or_default();
+                    if v.trim().is_empty() {
+                        return Err(MailError::new(
+                            MailErrorCode::Malformed,
+                            "bead tag value must be non-empty (ADR-0010 D9: --resolve-bead)",
+                        ));
+                    }
+                    out.bead = Some(v);
                 }
                 _ => {
                     // Non-vocabulary tags (workflow-emitted, etc.) are ignored
@@ -421,6 +440,11 @@ impl SendTags {
         }
         if let Some(v) = self.verdict
             && let Ok(t) = Tag::parse(["verdict", v.as_str()])
+        {
+            out.push(t);
+        }
+        if let Some(b) = &self.bead
+            && let Ok(t) = Tag::parse(["bead", b])
         {
             out.push(t);
         }

@@ -465,6 +465,11 @@ pub struct MailSendArgs {
     /// Correlation id for the assignment (ADR-0027 E2: rides extra_tags corr).
     #[arg(long)]
     pub corr: Option<String>,
+    /// ADR-0010 D9 (bd-l0fz): the work-ledger bead this send resolves — the
+    /// structural done-hold. Stamps `bead=<id>` on the rumor; the flywheel
+    /// dispatch guard matches THIS tag, never the `[{id}] done` subject.
+    #[arg(long = "resolve-bead")]
+    pub resolve_bead: Option<String>,
     /// Wake kind: standing|tasked (ADR-0027 E2/E3).
     #[arg(long)]
     pub wake: Option<String>,
