@@ -76,7 +76,7 @@ pub fn resend_guidance(corr: Option<&str>) -> String {
     match corr {
         Some(c) => format!(
             "toron: transport-unknown — the wrap may not have landed. \
-             corr-preserving resend: flywheel mail resend --corr {c} (re-supply to/subject/body). \
+             corr-preserving resend: toron mail send --corr {c} (re-supply to/subject/body). \
              A plain re-run of the send mints a NEW corr and DUPLICATES."
         ),
         None => "toron: transport-unknown — the wrap may not have landed and no corr was stamped; \
@@ -378,6 +378,18 @@ mod tests {
         (pool, path)
     }
 
+    /// bd-d8e4 reverify: the printed resend pointer must name a REAL command.
+    /// `flywheel mail resend` never existed; the corr-preserving path is
+    /// `toron mail send --corr` (verified present on the CLI).
+    #[test]
+    fn resend_guidance_names_live_command() {
+        let g = resend_guidance(Some("c1"));
+        assert!(
+            g.contains("toron mail send --corr c1"),
+            "pointer names the live corr resend path: {g}"
+        );
+        assert!(!g.contains("mail resend"), "no dead resend pointer: {g}");
+    }
     #[tokio::test]
     async fn receipts_upsert_and_get_roundtrip() {
         let (pool, path) = test_pool("roundtrip").await;
