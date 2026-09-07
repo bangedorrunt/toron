@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Added
+- Captain alias auto-bind at project ensure; roster recency (`last_active`, stale flag) with prune cadence; mail-surface honesty (read semantic, typed contact requests, corr re-use never returns a stale id).
+- Receipts `degraded` state (acked-unknown, never resend-inviting) with printed corr-preserving resend pointer; `--resolve-bead` structural done-hold tag.
+- Outer urgency tag on gift-wrap (visible without decrypting); `WhoIs.stale` defaults for pre-F2 daemon rows (wire compat).
 
 ### Fixed
 - `fetch_inbox` projects rumor assignment tags (`corr`/`wake`/`priority`/`audience`/`result_path`/`verdict`) onto the row. Envelope 1059 still carries none.
