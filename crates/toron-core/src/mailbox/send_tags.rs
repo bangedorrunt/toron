@@ -757,6 +757,7 @@ mod tests {
             audience: Some(Audience::Agents),
             result_path: Some("/tmp/out.json".into()),
             verdict: None,
+            bead: None,
         };
         let extra = tags.to_tags();
         let msg = SendMessage {
