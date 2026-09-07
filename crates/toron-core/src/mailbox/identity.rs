@@ -545,9 +545,16 @@ impl Mailbox {
 
     /// ADR-0018 D4: the canonical name a legacy alias folds to (if any).
     /// `None` when the alias is unknown or no pool is attached.
+    /// bd-dbdi: liveness-gated read of the `captain` fold. The alias row is
+    /// durable, but a target with no live registration (missing agents row
+    /// or F2-time-stale past [`ROSTER_STALE_AFTER_DAYS`]) is pruned and
+    /// reported absent, so whois, the send path, and F1 agree the dead fold
+    /// is gone and the next registration rebinds it. A live fold always
+    /// wins (registrations never steal it). Non-captain aliases pass
+    /// through untouched — this gate owns the captain fold only.
     pub async fn agent_name_alias(&self, project_slug: &str, alias: &str) -> Option<String> {
         let pool = self.index_pool.as_ref()?;
-        sqlx::query_scalar(
+        let folded: String = sqlx::query_scalar(
             "SELECT canonical FROM agent_name_aliases WHERE project_slug = ?1 AND alias = ?2",
         )
         .bind(project_slug)
@@ -555,7 +562,49 @@ impl Mailbox {
         .fetch_optional(pool)
         .await
         .ok()
-        .flatten()
+        .flatten()?;
+        if alias == "captain" && !self.captain_target_live(pool, project_slug, &folded).await {
+            let _ = sqlx::query(
+                "DELETE FROM agent_name_aliases WHERE project_slug = ?1 AND alias = 'captain'",
+            )
+            .bind(project_slug)
+            .execute(pool)
+            .await;
+            return None;
+        }
+        Some(folded)
+    }
+
+    /// bd-dbdi: pure liveness predicate for a captain-fold target — live
+    /// means a registration row exists and is fresher than the F2 cadence.
+    /// Missing rows (pre-index registrations, wiped DBs) read as dead so a
+    /// fold can never pin routing to an identity the index cannot see.
+    async fn captain_target_live(
+        &self,
+        pool: &sqlx::SqlitePool,
+        project_slug: &str,
+        target: &str,
+    ) -> bool {
+        // Fresh registrations carry created_ts_us with a NULL last_active
+        // (the upsert only stamps last_active on re-register), so recency
+        // falls back to creation — a just-registered pin is live.
+        let last_active: Option<i64> = sqlx::query_scalar(
+            "SELECT COALESCE(last_active_ts_us, created_ts_us) FROM agents WHERE project_slug = ?1 AND name = ?2",
+        )
+        .bind(project_slug)
+        .bind(target)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten();
+        match last_active {
+            Some(ts) => {
+                let now_us =
+                    crate::index::writer::Clock::now_us(&crate::index::writer::SystemClock);
+                !roster_entry_stale(ts, now_us)
+            }
+            None => false,
+        }
     }
 
     /// bd-pin-public-plane-s-easy.1: THE one name resolver — pin, slug, or
@@ -2253,6 +2302,83 @@ mod tests {
             .await
             .expect("clear again");
         assert!(again.is_none(), "second clear returns None");
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// bd-dbdi: a captain fold onto an F2-stale pin is pruned from resolution
+    /// (alias read, whois, and the send-path resolver agree it is absent)
+    /// and the next registration rebinds the fold instead of keeping the
+    /// dead pin forever. A live fold always wins (no steal between swarms).
+    #[tokio::test]
+    async fn captain_alias_stale_target_pruned_and_rebound() {
+        let (mailbox, pool, db_path, data_dir) = test_mailbox_with_pool("captain-stale").await;
+        mailbox.ensure_project("toron").await.expect("ensure");
+        // Swarm mode so the send-path resolver shape-checks (Open mode
+        // passes unknown names through by legacy design; the send fold in
+        // resolve_recipients is covered by open_mode_send_to_captain_*).
+        mailbox.set_identity_mode("toron", "swarm").await;
+        mailbox
+            .register_agent("toron", &profile("BlueRidge"))
+            .await
+            .expect("register");
+        mailbox
+            .set_project_captain("toron", "BlueRidge")
+            .await
+            .expect("set");
+        assert_eq!(
+            mailbox
+                .agent_name_alias("toron", "captain")
+                .await
+                .as_deref(),
+            Some("BlueRidge")
+        );
+
+        // Age the target past the F2 cadence (8d > 7d).
+        let now_us = crate::index::writer::Clock::now_us(&crate::index::writer::SystemClock);
+        let stale_us = now_us - 8 * 86_400 * 1_000_000;
+        sqlx::query(
+            "UPDATE agents SET last_active_ts_us = ?1 WHERE project_slug = ?2 AND name = ?3",
+        )
+        .bind(stale_us)
+        .bind("toron")
+        .bind("BlueRidge")
+        .execute(&pool)
+        .await
+        .expect("age target past F2");
+
+        // The dead fold is pruned from every resolution surface at once.
+        assert_eq!(
+            mailbox.agent_name_alias("toron", "captain").await,
+            None,
+            "stale fold pruned from the alias read"
+        );
+        assert!(
+            mailbox.whois("toron", "captain").await.is_err(),
+            "whois captain agrees the dead fold is absent"
+        );
+        assert!(
+            mailbox
+                .resolve_agent_name("toron", "captain")
+                .await
+                .is_err(),
+            "send-path resolver agrees the dead fold is absent"
+        );
+
+        // The next registration rebinds instead of keeping the dead pin.
+        mailbox
+            .register_agent("toron", &profile("AmberPlateau"))
+            .await
+            .expect("register successor");
+        assert_eq!(
+            mailbox
+                .agent_name_alias("toron", "captain")
+                .await
+                .as_deref(),
+            Some("AmberPlateau"),
+            "first registration after prune rebinds the fold"
+        );
 
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_dir_all(&data_dir);
