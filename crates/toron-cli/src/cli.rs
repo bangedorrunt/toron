@@ -1440,19 +1440,20 @@ pub struct PresencePublishArgs {
     /// Optional status message.
     #[arg(long)]
     pub status: Option<String>,
-    /// Project slug.
-    #[arg(long, required = true)]
-    pub project: String,
-    /// Publishing agent's canonical name (ADR-0018).
-    #[arg(long = "as", required = true)]
-    pub as_name: String,
+    /// Project slug (when absent, defaults from the TORON_PROJECT env var).
+    #[arg(long)]
+    pub project: Option<String>,
+    /// Publishing agent's canonical name (ADR-0018; when absent, defaults
+    /// from the TORON_AGENT, FLYWHEEL_MAIL_AS, or AGENT_NAME env vars).
+    #[arg(long = "as")]
+    pub as_name: Option<String>,
 }
 
 #[derive(Debug, Args)]
 pub struct PresenceListArgs {
-    /// Project slug.
-    #[arg(long, required = true)]
-    pub project: String,
+    /// Project slug (when absent, defaults from the TORON_PROJECT env var).
+    #[arg(long)]
+    pub project: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -1693,8 +1694,15 @@ mod flag_conformance_tests {
         let mut banned: Vec<String> = Vec::new();
         let mut bad_project: Vec<String> = Vec::new();
         // Explicit waivers (audited): surfaces where --project is a genuine
-        // OPTIONAL filter over ALL projects — never a silent demo routing.
-        let waived = ["toron doctor reconstruct"];
+        // OPTIONAL filter over ALL projects — never a silent demo routing —
+        // plus bd-1wwc presence publish/list, whose --project defaults from
+        // the TORON_PROJECT pane env and fails LOUDLY when neither flag nor
+        // env is present (no silent default anywhere on that path).
+        let waived = [
+            "toron doctor reconstruct",
+            "toron presence publish",
+            "toron presence list",
+        ];
         let root = Cli::command();
         walk(&root, String::new(), &waived, &mut banned, &mut bad_project);
         assert!(
