@@ -155,6 +155,10 @@ pub struct InboxMessage {
     pub result_path: Option<String>,
     /// HumanDecision live producer: `verdict=` extra_tag on the rumor.
     pub verdict: Option<String>,
+    /// ADR-0010 D9 (bd-l0fz): the structural done-hold — `bead=<id>` extra_tag
+    /// on the rumor. The flywheel dispatch guard matches THIS, never the
+    /// `[{id}] done` subject.
+    pub bead: Option<String>,
 }
 
 /// S5 collapse window: identical (sender, subject, body-hash) messages
@@ -1627,6 +1631,7 @@ fn inbox_from(mail: UnwrappedMail) -> InboxMessage {
         audience: tag_value(tags, "audience").map(|s| s.to_string()),
         result_path: tag_value(tags, "result_path").map(|s| s.to_string()),
         verdict: tag_value(tags, "verdict").map(|s| s.to_string()),
+        bead: tag_value(tags, "bead").map(|s| s.to_string()),
     }
 }
 

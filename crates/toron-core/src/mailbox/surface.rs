@@ -45,10 +45,20 @@ pub struct SendMail {
     /// ADR-0004 Ship 5: operator Overseer override (signs with the operator
     /// key, skips contact-policy enforcement).
     pub overseer: bool,
+    /// ADR-0010 D9 (bd-l0fz): stamp the `bead=<id>` structural done-hold on
+    /// the rumor. CLI-only via `--resolve-bead`; the loop reporter-of-record
+    /// `[{id}] done` keeps its subject and gains this tag.
+    pub bead: Option<String>,
 }
 
 impl From<&SendMail> for SendMessage {
     fn from(r: &SendMail) -> Self {
+        let mut extra_tags = Vec::new();
+        if let Some(bd) = &r.bead
+            && let Ok(t) = crate::nostr::Tag::parse(["bead", bd])
+        {
+            extra_tags.push(t);
+        }
         SendMessage {
             project_slug: r.project.clone(),
             sender_name: r.sender.clone(),
@@ -62,7 +72,7 @@ impl From<&SendMail> for SendMessage {
             thread_id: r.thread_id.clone(),
             sender_token: None,
             overseer: r.overseer,
-            extra_tags: Vec::new(),
+            extra_tags,
         }
     }
 }
@@ -168,6 +178,10 @@ pub struct MailItem {
     /// S5 (bd-dup-assign-collapse-ws21): the first id of the duplicate group
     /// this row survives for; `None` = standalone (see `collapse_duplicates`).
     pub duplicate_of: Option<MessageId>,
+    /// ADR-0010 D9 (bd-l0fz): the structural done-hold — `bead=<id>` projected
+    /// from the rumor. Wire-safe: optional on both ends.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bead: Option<String>,
 }
 
 impl From<InboxMessage> for MailItem {
@@ -182,6 +196,7 @@ impl From<InboxMessage> for MailItem {
             thread_id: m.thread_id.map(MessageId::from),
             created_ts_us: m.created_ts_us,
             duplicate_of: m.duplicate_of.map(MessageId::from),
+            bead: m.bead,
         }
     }
 }
@@ -198,6 +213,7 @@ impl From<SearchMessage> for MailItem {
             thread_id: m.thread_id.map(MessageId::from),
             created_ts_us: m.created_ts_us,
             duplicate_of: None,
+            bead: None,
         }
     }
 }
