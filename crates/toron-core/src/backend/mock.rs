@@ -108,7 +108,7 @@ impl super::Backend for MockBackend {
         })
     }
 
-    fn workspace_close(&self, _workspace_id: &str) -> Result<(), BackendError> {
+    fn workspace_close(&self, _workspace_id: &str, _close_group: bool) -> Result<(), BackendError> {
         Ok(())
     }
 

@@ -2,7 +2,7 @@
 #![forbid(unsafe_code)]
 
 //! herdr backend client — newline-delimited JSON-RPC over a unix socket
-//! (protocol v20, per ADR-0003; bumped for herdr 0.8.2 — see the protocol
+//! (protocol v22, per ADR-0003; bumped for herdr 0.9.0 — see the protocol
 //! bead). Single shared client; flywheel's copy is deleted after this lands
 //! (ADR: "one definition of `agent_prompt`").
 //!
@@ -26,9 +26,9 @@ use serde_json::{Value, json};
 use super::error::{BackendError, BackendErrorCode};
 use super::types::{AgentStatus, BackendEvent, PaneId, PromptLanding};
 
-/// herdr socket protocol version this client is verified against (v20,
-/// herdr 0.8.2 — live `herdr api schema --json` reports 20).
-pub const HDR_PROTOCOL: u64 = 20;
+/// herdr socket protocol version this client is verified against (v22,
+/// herdr 0.9.0 — live `herdr api schema --json` reports 22).
+pub const HDR_PROTOCOL: u64 = 22;
 
 /// Resolve the herdr socket path from explicit env values (pure — testable).
 /// Priority: `HERDR_SOCKET_PATH` env, else `$XDG_CONFIG_HOME/herdr/herdr.sock`
@@ -197,7 +197,7 @@ pub enum SendVerdict {
 }
 
 /// Map a herdr error code + observed status to a verdict. Classifies on the
-/// protocol code, never message strings. `agent_blocked` (protocol v20:
+/// protocol code, never message strings. `agent_blocked` (protocol v22:
 /// herdr refused to send — agent at an approval/question dialog) stays
 /// [`SendVerdict::Coded`]: no text was delivered, so callers must NOT
 /// respawn-on-stalled or blind-retry; the blocked-agent escalation paths
@@ -459,8 +459,15 @@ impl Client {
             .map_err(|e| parse_err(e.to_string()))
     }
 
-    pub fn workspace_close(&mut self, workspace_id: &str) -> Result<Value, BackendError> {
-        self.call("workspace.close", json!({ "workspace_id": workspace_id }))
+    pub fn workspace_close(
+        &mut self,
+        workspace_id: &str,
+        close_group: bool,
+    ) -> Result<Value, BackendError> {
+        self.call(
+            "workspace.close",
+            workspace_close_params(workspace_id, close_group),
+        )
     }
 
     pub fn pane_list(&mut self, workspace_id: Option<&str>) -> Result<Vec<PaneInfo>, BackendError> {
@@ -573,20 +580,22 @@ impl Client {
     //
     // Wire shapes verified against `herdr api schema --json` (protocol 19,
     // build 2026-08-04-d78e3d3b5126) and the live daemon 2026-08-15, then
-    // re-verified field-for-field against protocol 20 (herdr 0.8.2-preview,
-    // build 2026-08-19-b5c4a0176e91) — additive only from this client's
-    // perspective:
+    // re-verified field-for-field against protocol 22 (herdr 0.9.0-preview,
+    // build 2026-09-08-62431dbd033b; live probe 2026-09-09) — additive only
+    // from this client's perspective:
     // `pane.send_text` takes { pane_id, text }; `pane.send_input` takes
     // { pane_id, keys } (key combos incl. modifier chords ctrl+h/alt+x and
     // named punctuation minus/plus); `pane.wait_for_output` takes
     // { pane_id, source, match: { type: substring|regex, value }, ... }.
-    // NOTE: there is still NO raw `pane.run` method in protocol 20 — the
+    // NOTE: there is still NO raw `pane.run` method in protocol 22 — the
     // herdr CLI implements `herdr pane run` as send_text + Enter.
     // [`Client::pane_run`] mirrors that composite so pane-scoped command
     // execution needs no agent lifecycle (ADR-0019 CommandVerified).
     // (Caveat kept from v19: the schema's EventMatch def uses key `event`
     // with underscored values, but the live daemon accepts `type` + dotted
-    // values on events.subscribe — empirically confirmed against 0.8.2.)
+    // values on events.subscribe — empirically confirmed against 0.9.0.
+    // 0.9 behavior change: subscriptions are LIVE-ONLY, no retained replay —
+    // subscribe before taking any snapshot, see bd-myab.)
 
     /// `pane.send_text` — literal text into the pane's terminal (no Enter).
     pub fn pane_send_text(&mut self, pane_id: &str, text: &str) -> Result<Value, BackendError> {
@@ -604,7 +613,7 @@ impl Client {
         )
     }
 
-    /// `pane.run` composite (no raw method in the protocol — v19 nor v20):
+    /// `pane.run` composite (no raw method in the protocol — v19 nor v22):
     /// send the command text, then an Enter keypress — the same shape
     /// `herdr pane run` uses.
     pub fn pane_run(&mut self, pane_id: &str, command: &str) -> Result<Value, BackendError> {
@@ -675,6 +684,19 @@ fn parse_code(code: &str) -> BackendErrorCode {
 /// source semantics; this client never rewrites or whitelists them.
 fn agent_read_params(target: &str, source: &str, lines: Option<u32>) -> Value {
     json!({ "target": target, "source": source, "lines": lines, "format": "text", "strip_ansi": true })
+}
+
+/// `workspace.close` params. herdr 0.9 (protocol 22) group semantics: a
+/// primary workspace with open worktree workspaces stays open unless
+/// `close_group` is set. The flag rides only when true so the param never
+/// reaches a daemon that predates it.
+fn workspace_close_params(workspace_id: &str, close_group: bool) -> Value {
+    let mut params = serde_json::Map::new();
+    params.insert("workspace_id".into(), json!(workspace_id));
+    if close_group {
+        params.insert("close_group".into(), json!(true));
+    }
+    Value::Object(params)
 }
 
 fn parse_err(msg: String) -> BackendError {
@@ -748,8 +770,10 @@ impl super::Backend for HerdrBackend {
         Ok(ws)
     }
 
-    fn workspace_close(&self, workspace_id: &str) -> Result<(), BackendError> {
-        self.client.lock().workspace_close(workspace_id)?;
+    fn workspace_close(&self, workspace_id: &str, close_group: bool) -> Result<(), BackendError> {
+        self.client
+            .lock()
+            .workspace_close(workspace_id, close_group)?;
         Ok(())
     }
 
@@ -1026,100 +1050,99 @@ mod tests {
         assert!(no_home.to_string_lossy().ends_with("herdr/herdr.sock"));
     }
 
-    /// Trimmed live v20 schema snapshot + real payload samples (captured from
-    /// the running herdr 0.8.2-preview daemon, 2026-08-20; protocol-bump
-    /// bead — the successor of bd-4eze's v19 capture).
-    const V20_FIXTURE: &str = include_str!("../../tests/fixtures/herdr-schema-v20.json");
+    /// Live v22 schema snapshot + real payload samples (captured from the
+    /// running herdr 0.9.0-preview daemon, 2026-09-09; protocol-bump bead
+    /// bd-jqgh — the successor of the v20 capture).
+    const V22_FIXTURE: &str = include_str!("../../tests/fixtures/herdr-schema-v22.json");
 
     fn fixture() -> Value {
-        serde_json::from_str(V20_FIXTURE).expect("v20 fixture parses")
+        serde_json::from_str(V22_FIXTURE).expect("v22 fixture parses")
     }
 
     #[test]
-    fn protocol_pin_matches_live_v20_fixture() {
+    fn protocol_pin_matches_live_v22_fixture() {
         let f = fixture();
-        assert_eq!(HDR_PROTOCOL, 20);
+        assert_eq!(HDR_PROTOCOL, 22);
         assert_eq!(f["protocol"].as_u64(), Some(HDR_PROTOCOL));
     }
 
     #[test]
-    fn pane_info_parses_live_v20_payload() {
+    fn pane_info_parses_live_v22_payload() {
         let f = fixture();
         let pane: PaneInfo = serde_json::from_value(f["samples"]["pane"].clone()).expect("pane");
-        assert_eq!(pane.pane_id, "w37:pB");
-        assert_eq!(pane.terminal_id, "term_65975053cb0a4c");
-        assert_eq!(pane.workspace_id, "w37");
-        assert_eq!(pane.tab_id, "w37:t7");
-        assert!(pane.focused);
-        assert_eq!(pane.agent_status, AgentStatus::Working);
-        assert_eq!(pane.revision, 4958);
-        assert_eq!(pane.agent.as_deref(), Some("omp"));
+        assert_eq!(pane.pane_id, "w5:p1");
+        assert_eq!(pane.terminal_id, "term_65af5e84e7eef1");
+        assert_eq!(pane.workspace_id, "w5");
+        assert_eq!(pane.tab_id, "w5:t1");
+        assert!(!pane.focused);
+        assert_eq!(pane.agent_status, AgentStatus::Unknown);
+        assert_eq!(pane.revision, 0);
+        assert_eq!(pane.agent, None);
         assert_eq!(
             pane.cwd.as_deref(),
-            Some("/Users/bangedorrunt/workspace/toron")
+            Some("/Users/bangedorrunt/workspace/dotfiles")
         );
         assert!(pane.scroll.is_some());
-        // Spinner-frame title (⠹) — v0.8.2 Claude/omp spinner stripping is a
-        // display concern; the wire still carries the raw frame here.
-        assert_eq!(pane.terminal_title.as_deref(), Some("π ⠹ toron"));
+        // No title on this shell pane — Option covers the absent key.
+        assert_eq!(pane.terminal_title, None);
     }
 
     #[test]
-    fn worktree_info_parses_live_v20_payloads() {
+    fn worktree_info_parses_live_v22_payloads() {
         let f = fixture();
         let wts: Vec<WorktreeInfo> =
             serde_json::from_value(f["samples"]["worktrees"].clone()).expect("worktrees");
         assert_eq!(wts.len(), 1);
         let main = &wts[0];
-        assert_eq!(main.path, "/Users/bangedorrunt/workspace/toron");
-        assert_eq!(main.label, "toron");
+        assert_eq!(main.path, "/Users/bangedorrunt/workspace/dotfiles");
+        assert_eq!(main.label, "dotfiles");
         assert!(!main.is_bare);
         assert!(!main.is_detached);
         assert!(!main.is_linked_worktree);
         assert!(!main.is_prunable);
         assert_eq!(main.branch.as_deref(), Some("main"));
-        assert_eq!(main.open_workspace_id.as_deref(), Some("w37"));
+        assert_eq!(main.open_workspace_id.as_deref(), Some("w5"));
     }
 
     #[test]
-    fn agent_info_parses_live_v20_payload() {
+    fn agent_info_parses_live_v22_payload() {
         let f = fixture();
         let agent: AgentInfo =
             serde_json::from_value(f["samples"]["agent"].clone()).expect("agent");
         assert_eq!(agent.agent_status, AgentStatus::Working);
-        assert_eq!(agent.terminal_id, "term_65975053cb0a4c");
-        assert_eq!(agent.workspace_id, "w37");
-        assert_eq!(agent.tab_id, "w37:t7");
-        assert_eq!(agent.pane_id, "w37:pB");
+        assert_eq!(agent.terminal_id, "term_65af5e84f1b009");
+        assert_eq!(agent.workspace_id, "wP");
+        assert_eq!(agent.tab_id, "wP:t1");
+        assert_eq!(agent.pane_id, "wP:p1");
         assert!(agent.focused);
-        assert_eq!(agent.revision, 4958);
-        // v20 omits `name` for this agent (agent-kind identity only) —
+        assert_eq!(agent.revision, 1654);
+        // v22 omits `name` for this agent (agent-kind identity only) —
         // Option + serde's implicit missing→None covers it.
         assert_eq!(agent.name, None);
         // interactive_ready/launch_pending are absent in this live payload;
         // #[serde(default)] covers missing→false.
         assert!(!agent.interactive_ready);
         assert!(!agent.launch_pending);
-        assert_eq!(agent.state_change_seq, 27);
+        assert_eq!(agent.state_change_seq, 10);
     }
 
     #[test]
-    fn workspace_info_parses_live_v20_payload() {
+    fn workspace_info_parses_live_v22_payload() {
         let f = fixture();
         let ws: WorkspaceInfo =
             serde_json::from_value(f["samples"]["workspace"].clone()).expect("workspace");
-        assert_eq!(ws.workspace_id, "w37");
-        assert_eq!(ws.number, 4);
-        assert_eq!(ws.label, "toron");
-        assert!(ws.focused);
-        assert_eq!(ws.pane_count, 3);
-        assert_eq!(ws.tab_count, 3);
-        assert_eq!(ws.active_tab_id, "w37:t7");
-        assert_eq!(ws.agent_status, AgentStatus::Working);
+        assert_eq!(ws.workspace_id, "w5");
+        assert_eq!(ws.number, 1);
+        assert_eq!(ws.label, "dotfiles");
+        assert!(!ws.focused);
+        assert_eq!(ws.pane_count, 2);
+        assert_eq!(ws.tab_count, 2);
+        assert_eq!(ws.active_tab_id, "w5:t2");
+        assert_eq!(ws.agent_status, AgentStatus::Unknown);
     }
 
     #[test]
-    fn v20_schema_requires_pane_v20_fields() {
+    fn v22_schema_requires_pane_v22_fields() {
         // Field-for-field conformance guard: the fixture schema is the live
         // daemon's; if it starts requiring something PaneInfo/WorktreeInfo
         // lack, this test fails before the socket round-trip ever does.
@@ -1181,10 +1204,10 @@ mod tests {
 
     #[test]
     #[ignore = "requires a live herdr daemon on the socket"]
-    fn live_round_trip_v20() {
-        // Protocol bump (successor of bd-4eze's v19 live proof): prove the
-        // typed client parses live v20 responses for the methods the
-        // flywheel loop depends on. List-only — no side effects.
+    fn live_round_trip_v22() {
+        // Protocol bump (bd-jqgh): prove the typed client parses live v22
+        // responses for the methods the flywheel loop depends on. List-only
+        // — no side effects.
         let mut c = Client::connect(None).expect("connect to live herdr socket");
         c.ping().expect("ping");
         let ws = c.workspace_list().expect("workspace.list");
@@ -1398,6 +1421,18 @@ mod pane_send_tests {
         // None lines serializes as null (herdr contract: no line cap).
         let p = agent_read_params("w1:p1", "recent-unwrapped", None);
         assert_eq!(p["lines"], Value::Null);
+    }
+
+    /// bd-jqgh: herdr 0.9 group-close semantics — the flag rides only when
+    /// true, so pre-0.9 daemons never see an unknown param.
+    #[test]
+    fn workspace_close_params_omit_group_flag_unless_true() {
+        let base = workspace_close_params("w1", false);
+        assert_eq!(base["workspace_id"], "w1");
+        assert!(base.get("close_group").is_none());
+        let group = workspace_close_params("w1", true);
+        assert_eq!(group["workspace_id"], "w1");
+        assert_eq!(group["close_group"], true);
     }
 
     /// bd-harness-alt-screen-reads: the wire agent_not_idle code maps to the
