@@ -135,7 +135,7 @@ pub trait Backend: Send + Sync {
     fn workspace_create(&self, _label: Option<&str>) -> Result<herdr::WorkspaceInfo, BackendError> {
         Err(unsupported(self.name(), "workspace_create"))
     }
-    fn workspace_close(&self, _workspace_id: &str) -> Result<(), BackendError> {
+    fn workspace_close(&self, _workspace_id: &str, _close_group: bool) -> Result<(), BackendError> {
         Err(unsupported(self.name(), "workspace_close"))
     }
 
