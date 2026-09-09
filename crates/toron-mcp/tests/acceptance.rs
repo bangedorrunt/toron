@@ -110,13 +110,42 @@ async fn http_resources_list_and_read() -> anyhow::Result<()> {
         )
         .await?;
 
-    // 25 parity resources listed.
+    // Only concrete, directly readable resources belong in resources/list.
     let resources = client.list_all_resources().await?;
-    assert_eq!(resources.len(), 25, "AM-Rust parity requires 25 resources");
+    assert_eq!(
+        resources.len(),
+        7,
+        "only concrete resources belong in resources/list"
+    );
+    assert!(
+        resources.iter().all(|r| !r.uri.contains('{')),
+        "resources/list must not contain URI templates"
+    );
 
-    // Templates expand (any resource with a {param}).
+    // Parameterized handles are advertised separately.
     let templates = client.list_resource_templates(None).await?;
-    assert!(!templates.resource_templates.is_empty());
+    assert_eq!(templates.resource_templates.len(), 18);
+    assert!(
+        templates
+            .resource_templates
+            .iter()
+            .all(|t| t.uri_template.contains('{')),
+        "resources/templates/list must contain URI templates"
+    );
+
+    // Every concrete listed resource must be directly readable at the exact
+    // URI returned by resources/list.
+    for resource in &resources {
+        let read = client
+            .read_resource(ReadResourceRequestParams::new(resource.uri.clone()))
+            .await?;
+        assert_eq!(
+            read.contents.len(),
+            1,
+            "listed resource is readable: {}",
+            resource.uri
+        );
+    }
 
     // Static resource reads succeed.
     let env = client

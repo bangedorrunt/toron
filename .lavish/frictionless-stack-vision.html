@@ -1,0 +1,605 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="night">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Frictionless stack vision — flywheel × toron × beads</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/daisyui@5.5.19/daisyui.css" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/daisyui@5.5.19/themes.css" />
+  <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4.2.4/dist/index.global.js"></script>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <style>
+    *, *::before, *::after { box-sizing: border-box; }
+    :root {
+      --void: #08080e;
+      --fg: #c8d0e8;
+      --cyan: #0db9d7;
+      --lav: #bb9af7;
+      --mint: #73daca;
+      --amber: #e0af68;
+      --red: #f7768e;
+      --ice: #89ddff;
+      --sel: #1a1a3e;
+      --font-sans: "IBM Plex Sans", ui-sans-serif, sans-serif;
+      --font-mono: "IBM Plex Mono", ui-monospace, monospace;
+    }
+    html, body {
+      background: var(--void);
+      color: var(--fg);
+      font-family: var(--font-sans);
+    }
+    :where(.grid, .flex) > * { min-width: 0; }
+    :where(p, h1, h2, h3, h4, li, td, th, .badge, code, pre) { overflow-wrap: anywhere; }
+    body { background:
+      radial-gradient(1200px 600px at 10% -10%, rgba(13,185,215,0.08), transparent 50%),
+      radial-gradient(900px 500px at 100% 0%, rgba(187,154,247,0.07), transparent 45%),
+      var(--void);
+    }
+    .mono { font-family: var(--font-mono); }
+    .label-kicker {
+      font-family: var(--font-mono);
+      font-size: 0.7rem;
+      letter-spacing: 0.14em;
+      text-transform: uppercase;
+      color: var(--cyan);
+    }
+    .hero-num { font-family: var(--font-mono); font-weight: 600; font-size: 2.4rem; line-height: 1; color: var(--amber); }
+    .hero-num.bad { color: var(--red); }
+    .hero-num.ok { color: var(--mint); }
+    table { width: 100%; }
+    th { position: sticky; top: 0; background: #0c0c16; z-index: 1; }
+    .wrap-scroll { overflow-x: auto; }
+    code, .kbd { font-family: var(--font-mono); }
+    .mermaid { background: #0c0c16; padding: 1rem; border-radius: 0.75rem; overflow-x: auto; }
+    .step-dot { width: 10px; height: 10px; border-radius: 99px; background: var(--cyan); flex: none; }
+    nav.toc a { color: var(--ice); }
+    .callout { border-left: 3px solid var(--amber); }
+    .callout.mint { border-left-color: var(--mint); }
+    .callout.red { border-left-color: var(--red); }
+    .callout.lav { border-left-color: var(--lav); }
+  </style>
+</head>
+<body class="min-h-screen">
+  <div class="max-w-6xl mx-auto px-4 py-8 lg:px-8">
+
+    <header class="mb-10">
+      <p class="label-kicker mb-3">flywheel × toron × beads · session 2026-09-08 · LucidFalcon</p>
+      <h1 class="text-4xl lg:text-5xl font-bold leading-tight mb-4">The tools exist. The session conductor does not.</h1>
+      <p class="text-lg max-w-3xl opacity-90">A random harness with an objective should get a ranked briefing (workflow + token + stages, add/remove, topology, crew N), one confirm, then unsupervised run-to-done. A second harness on the same project should join, declare, and collab. Today decide returns one keyword hit, compose balloons to 7–8 panes, and doorbell never even starts.</p>
+    </header>
+
+    <section class="grid grid-cols-2 lg:grid-cols-4 gap-3 mb-10">
+      <div class="card bg-base-200/70 border border-base-300">
+        <div class="card-body p-4">
+          <div class="hero-num bad">7</div>
+          <p class="text-sm mt-2">wave-swarm inferred panes<br /><span class="mono opacity-70">planner×2 reviewer×2 +3</span></p>
+        </div>
+      </div>
+      <div class="card bg-base-200/70 border border-base-300">
+        <div class="card-body p-4">
+          <div class="hero-num bad">8</div>
+          <p class="text-sm mt-2">bug-fix inferred panes<br /><span class="mono opacity-70">coder×3 reviewer×4 scout×1</span></p>
+        </div>
+      </div>
+      <div class="card bg-base-200/70 border border-base-300">
+        <div class="card-body p-4">
+          <div class="hero-num">lie</div>
+          <p class="text-sm mt-2">helm UNREAD / reservations<br /><span class="mono opacity-70">hardcoded degraded-empty</span></p>
+        </div>
+      </div>
+      <div class="card bg-base-200/70 border border-base-300">
+        <div class="card-body p-4">
+          <div class="hero-num bad">steer</div>
+          <p class="text-sm mt-2">decide("swarm with 2 crews")<br /><span class="mono opacity-70">N ignored, token missed</span></p>
+        </div>
+      </div>
+    </section>
+
+    <nav class="toc mb-10 text-sm flex flex-wrap gap-x-4 gap-y-2">
+      <a href="#product">Product</a>
+      <a href="#evidence">Live evidence</a>
+      <a href="#failures">Five failures</a>
+      <a href="#inventory">Already built</a>
+      <a href="#fixes">All fixes</a>
+      <a href="#dominant">Dominant move</a>
+      <a href="#contract">Briefing contract</a>
+      <a href="#waves">Waves</a>
+      <a href="#decide">Your cut</a>
+    </nav>
+
+    <!-- PRODUCT -->
+    <section id="product" class="mb-14">
+      <p class="label-kicker mb-2">The product</p>
+      <h2 class="text-2xl font-bold mb-4">One session. Two questions. Then silence until SIGNOFF.</h2>
+      <p class="mb-6 max-w-3xl opacity-90">Topology (swarm / loop / open) is how work is supervised. Workflow / stage / compose token is what runs. Those are orthogonal. Today decide collapses them into one keyword, and the TTY briefing that would ask crew N is skipped by every harness <span class="mono">--json</span> path.</p>
+
+      <ol class="grid gap-3 mb-8">
+        <li class="flex gap-3 items-start p-4 rounded-xl bg-base-200/60 border border-base-300">
+          <span class="step-dot mt-2"></span>
+          <div>
+            <p class="font-semibold">0 → Arrive</p>
+            <p class="text-sm opacity-80">Register pin if missing. <span class="mono">flywheel helm</span> + snapshot + presence publish + doorbell attach. If a fleet is live: join, do not spawn.</p>
+          </div>
+        </li>
+        <li class="flex gap-3 items-start p-4 rounded-xl bg-base-200/60 border border-base-300">
+          <span class="step-dot mt-2"></span>
+          <div>
+            <p class="font-semibold">1 → Brief</p>
+            <p class="text-sm opacity-80"><span class="mono">flywheel briefing "&lt;objective&gt;" --json</span> returns ranked proposal: workflow, token, stages, add/remove vs inferred, topology, crew map with default, join-vs-spawn, argv.</p>
+          </div>
+        </li>
+        <li class="flex gap-3 items-start p-4 rounded-xl bg-base-200/60 border border-base-300">
+          <span class="step-dot mt-2"></span>
+          <div>
+            <p class="font-semibold">2 → Two questions (one screen)</p>
+            <p class="text-sm opacity-80">Mode: swarm / loop / open (default from proposal). Crew: editable role→N (default from proposal, never from raw <span class="mono">@role</span> occurrence count). Add/remove listed as deltas.</p>
+          </div>
+        </li>
+        <li class="flex gap-3 items-start p-4 rounded-xl bg-base-200/60 border border-base-300">
+          <span class="step-dot mt-2"></span>
+          <div>
+            <p class="font-semibold">3 → Commit</p>
+            <p class="text-sm opacity-80"><span class="mono">flywheel briefing --commit</span> runs argv with explicit <span class="mono">--crew</span>, binds role pins, joins steer channel, starts dispatcher, declares coalition intent + reservations, mints corr.</p>
+          </div>
+        </li>
+        <li class="flex gap-3 items-start p-4 rounded-xl bg-base-200/60 border border-base-300">
+          <span class="step-dot mt-2"></span>
+          <div>
+            <p class="font-semibold">4 → Supervise without a person</p>
+            <p class="text-sm opacity-80">Doorbell tick is the captain-as-protocol. Benign wakes spend zero tokens. OPEN DECISIONS is the only human interrupt. Rot / write-liveness / nudge budget / WaitCorr wedge keep the fleet from going deaf. SIGNOFF or legal close ends it.</p>
+          </div>
+        </li>
+        <li class="flex gap-3 items-start p-4 rounded-xl bg-base-200/60 border border-base-300">
+          <span class="step-dot mt-2"></span>
+          <div>
+            <p class="font-semibold">5 → Second harness</p>
+            <p class="text-sm opacity-80">Same arrive. Briefing sees live pins/lanes/reservations. Default is <strong>join</strong>: declare intent, reserve, post one kind-9 line, arm watch. Coalition detect/auto-coalesce if files overlap. Never a second wave-swarm.</p>
+          </div>
+        </li>
+      </ol>
+
+      <div class="callout mint p-4 rounded-r-xl bg-base-200/40 mb-4">
+        <p class="font-semibold">Quality is already encoded.</p>
+        <p class="text-sm opacity-80 mt-1">Playbook lint, VERIFY fence, P≤2 principles, ce-review residual gate, fail-closed close. The leak is crews executing <span class="mono">--raw</span> and skipping the briefing. Fix the door, do not rewrite the gates.</p>
+      </div>
+    </section>
+
+    <!-- EVIDENCE -->
+    <section id="evidence" class="mb-14">
+      <p class="label-kicker mb-2">Live evidence · this session, this host</p>
+      <h2 class="text-2xl font-bold mb-4">What the binaries actually did when I probed them</h2>
+      <div class="wrap-scroll mb-6">
+        <table class="table table-sm">
+          <thead>
+            <tr>
+              <th>Probe</th>
+              <th>Got</th>
+              <th>Should have</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td class="mono">decide "implement a complex multi-lane feature…"</td>
+              <td><span class="badge badge-warning badge-sm">feature</span> <span class="mono text-xs">workflow run feature --mode pane</span></td>
+              <td>wave-swarm or goal, plus topology + crew</td>
+            </tr>
+            <tr>
+              <td class="mono">decide "swarm with 2 crews"</td>
+              <td><span class="badge badge-error badge-sm">steer</span> — fallback. "swarm" is not a needle; N dropped</td>
+              <td>wave-swarm, crew parsed, ask to confirm 2</td>
+            </tr>
+            <tr>
+              <td class="mono">decide "wave-swarm 3 crews"</td>
+              <td>token hit, argv <span class="mono">compose "wave-swarm 3 crews" --parts wave-swarm --run</span> — no <span class="mono">--crew</span></td>
+              <td>same token, <span class="mono">--crew coder:3,...</span></td>
+            </tr>
+            <tr>
+              <td class="mono">decide "join the running fleet"</td>
+              <td>steer (starts new work)</td>
+              <td>join primitive / coalition attach</td>
+            </tr>
+            <tr>
+              <td class="mono">decide "simple one-file typo fix"</td>
+              <td>steer (full goal pipeline)</td>
+              <td>open-mode or spawn-send ×1</td>
+            </tr>
+            <tr>
+              <td class="mono">crew preview wave-swarm</td>
+              <td>7 panes (planner 2, reviewer 2, coder 1, scout 1, housekeeper 1)</td>
+              <td>unique roles, default 1 each, extra N only for coder</td>
+            </tr>
+            <tr>
+              <td class="mono">crew preview bug-fix</td>
+              <td>8 panes</td>
+              <td>coder 1 + reviewer 1 (repair-until-verified already does this)</td>
+            </tr>
+            <tr>
+              <td class="mono">steer_brief TTY</td>
+              <td>you type coder x5, it prints the preview, returns Go/Abort only. Test: <span class="mono">edits_change_the_preview_not_the_context</span>. Dispatch uses the pre-brief plan.</td>
+              <td>edits become CrewPlan. Robot JSON is the same struct.</td>
+            </tr>
+            <tr>
+              <td class="mono">compose --help</td>
+              <td>no <span class="mono">--crew</span>. only <span class="mono">--allow-crew-expand</span> (boolean confirm of the balloon)</td>
+              <td>explicit role→N, same as steer briefing edits</td>
+            </tr>
+            <tr>
+              <td class="mono">doorbell status toron</td>
+              <td>empty stdout — no workspace ever ran a dispatcher</td>
+              <td>up, or "never started — arrive will start one"</td>
+            </tr>
+            <tr>
+              <td class="mono">snapshot toron</td>
+              <td><span class="mono">degraded: [mail, reservations]</span>; lanes are closed beads; pins empty</td>
+              <td>live pins, open lanes, joinable flag, dispatcher</td>
+            </tr>
+            <tr>
+              <td class="mono">helm toron</td>
+              <td>OPEN DECISIONS none / UNREAD all read — <strong>mail + reservations are hardcoded empty</strong> in snapshot.rs. Calm is a lie.</td>
+              <td>real receipt counts, held paths, dispatcher, joinable</td>
+            </tr>
+            <tr>
+              <td class="mono">flywheel status</td>
+              <td>chiebukuro workspace, 3 idle pi coders (wrong project)</td>
+              <td>project-scoped, or labeled foreign</td>
+            </tr>
+            <tr>
+              <td class="mono">coalition list</td>
+              <td>beads-20260810002826 still <span class="badge badge-warning badge-sm">active</span>, run completed, 0 channel events</td>
+              <td>GC after completed run + empty channel</td>
+            </tr>
+            <tr>
+              <td class="mono">presence list</td>
+              <td>[]</td>
+              <td>every arrived pane publishes working</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="text-sm opacity-70">decide Snapshot is four caller-fed flags (<span class="mono">--ready-beads --profiled-panes --launch-pending --contention</span>). It does not look at helm, doorbell, coalitions, or presence. Agents almost never pass the flags.</p>
+    </section>
+
+    <!-- FAILURES -->
+    <section id="failures" class="mb-14">
+      <p class="label-kicker mb-2">Root causes</p>
+      <h2 class="text-2xl font-bold mb-4">Five failures, not fifty symptoms</h2>
+      <div class="grid lg:grid-cols-2 gap-4">
+        <article class="p-5 rounded-xl bg-base-200/60 border border-base-300">
+          <p class="mono text-xs text-error mb-1">F1</p>
+          <h3 class="font-bold mb-2">Decide is a first-match keyword table</h3>
+          <p class="text-sm opacity-85">One primitive, one argv, no alternatives, no topology, no crew, no join. "feature" in the sentence beats multi-lane. "swarm with 2 crews" falls through to steer. JSON shape is <span class="mono">{primitive, reason, argv}</span>. File: <span class="mono">flywheel/src/decide.rs</span>.</p>
+        </article>
+        <article class="p-5 rounded-xl bg-base-200/60 border border-base-300">
+          <p class="mono text-xs text-error mb-1">F2</p>
+          <h3 class="font-bold mb-2">Crew N is occurrence-count, and robots cannot edit it</h3>
+          <p class="text-sm opacity-85"><span class="mono">crew: auto</span> counts every <span class="mono">@planner</span> step as another planner. Gate+dispatch ⇒ 2 planners. TTY <span class="mono">steer_brief</span> lets you type a new N, then <strong>throws the edit away</strong> (test name is the contract). <span class="mono">--json</span> skips the prompt. Compose has no <span class="mono">--crew</span>, only <span class="mono">--allow-crew-expand</span> which confirms the balloon. There is no path from “I want 2” to spawn 2.</p>
+        </article>
+        <article class="p-5 rounded-xl bg-base-200/60 border border-base-300">
+          <p class="mono text-xs text-error mb-1">F3</p>
+          <h3 class="font-bold mb-2">Topology is not a decide axis</h3>
+          <p class="text-sm opacity-85">ADR-0005: <span class="mono">/open /loop /swarm</span> are supervision topologies. Skills say this. Decide does not ask. AGENTS.md mixes "use wave-swarm" with "use loop-mode" as if they were workflows. A typo-fix and a 12-bead wave both fall to steer.</p>
+        </article>
+        <article class="p-5 rounded-xl bg-base-200/60 border border-base-300">
+          <p class="mono text-xs text-error mb-1">F4</p>
+          <h3 class="font-bold mb-2">Join is a ritual, not a primitive</h3>
+          <p class="text-sm opacity-85">Coalition form/intent/detect/auto-coalesce, open-mode bootstrap, <span class="mono">--reuse</span>, presence, reservations — all exist. Session start never runs them. Helm does not say "fleet live, join this". Presence is empty so discovery fails. Second grok pane starts a parallel universe.</p>
+        </article>
+        <article class="p-5 rounded-xl bg-base-200/60 border border-base-300 lg:col-span-2">
+          <p class="mono text-xs text-error mb-1">F5</p>
+          <h3 class="font-bold mb-2">The captain is a person who forgets. Supervision is optional infrastructure.</h3>
+          <p class="text-sm opacity-85">ADR-0010 already designed doorbell-with-inbox, AFK digest, OPEN DECISIONS, write-liveness, Unknown-never-promoted. ADR-0029 (proposed today) adds rot scoring because panes still die silently. On toron right now: no dispatcher, snapshot mail/reservations degraded, helm reports calm. WaitCorr parks until a receipt that never comes. OBSERVE escalates to a pin that is not watching. You force-check progress because nothing is required to ring you.</p>
+        </article>
+      </div>
+    </section>
+
+    <!-- INVENTORY -->
+    <section id="inventory" class="mb-14">
+      <p class="label-kicker mb-2">You were right</p>
+      <h2 class="text-2xl font-bold mb-4">We already have the tools. The glue is the gap.</h2>
+      <div class="wrap-scroll">
+        <table class="table table-sm">
+          <thead>
+            <tr><th>Desire</th><th>Already exists</th><th>Missing glue</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Classify workflow / token / stages</td>
+              <td>decide table, workflow list (43), stage list (31), 3 compose tokens</td>
+              <td>ranked proposal + add/remove; observe live world</td>
+            </tr>
+            <tr>
+              <td>Ask mode swarm/loop/open</td>
+              <td>slash templates, ADR-0005 topologies</td>
+              <td>topology field on briefing; default from world</td>
+            </tr>
+            <tr>
+              <td>Ask crew N with default</td>
+              <td>steer_brief TTY, crew preview, squads, GS-039 expand gate</td>
+              <td><span class="mono">--crew role:N</span> on compose; robot briefing JSON; unique-role default not occurrence-count</td>
+            </tr>
+            <tr>
+              <td>Run to completion</td>
+              <td>steer, loop --work, compose --run, SIGNOFF, legal close</td>
+              <td>commit-briefing one shot; dispatcher always on; SIGNOFF only for irreversible</td>
+            </tr>
+            <tr>
+              <td>Second harness joins</td>
+              <td>coalition *, --reuse, open-mode bootstrap, presence, helm</td>
+              <td>arrive always; join as decide primitive; helm joinable section</td>
+            </tr>
+            <tr>
+              <td>Declare work, avoid files</td>
+              <td>intent, reserve, request-release, role pin, corr</td>
+              <td>auto on commit; spawn auto-binds role (GS-030 to-be)</td>
+            </tr>
+            <tr>
+              <td>Captain × crew doorbell</td>
+              <td>tick, watch --live, wait --corr, receipts, afk, why</td>
+              <td>start dispatcher on arrive; wedge to helm; rot (0029)</td>
+            </tr>
+            <tr>
+              <td>Quality + principles</td>
+              <td>playbook_lint, VERIFY, ce-review, fail-closed close</td>
+              <td>forbid raw execute for coder work; briefing names the stage</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- FIXES -->
+    <section id="fixes" class="mb-14">
+      <p class="label-kicker mb-2">Ultrahard cut</p>
+      <h2 class="text-2xl font-bold mb-2">Every fix, ranked. Do not boil the ocean.</h2>
+      <p class="text-sm opacity-80 mb-4">P0 is the session conductor. P1 finishes supervision we already designed. P2 is skill/harness injection so a random grok/claude/codex cannot skip the door. P3 is hygiene. P4 is stretch already in ADR-0029.</p>
+
+      <h3 class="font-bold mt-6 mb-2" style="color: var(--red)">P0 — session conductor (one ADR, one JSON schema)</h3>
+      <div class="wrap-scroll mb-6">
+        <table class="table table-sm">
+          <thead><tr><th>ID</th><th>Fix</th><th>Where</th><th>Proof</th></tr></thead>
+          <tbody>
+            <tr>
+              <td class="mono">P0-1</td>
+              <td><strong>flywheel briefing</strong> — observe world, rank proposals, emit JSON, optional --commit. decide becomes its classifier leaf, not the user door.</td>
+              <td>new <span class="mono">src/briefing.rs</span>; clap noun; snapshot.v1 as input</td>
+              <td>decide("swarm with 2 crews") JSON contains topology=swarm, crew.coder=2, argv with --crew; "join the fleet" returns join when pins live</td>
+            </tr>
+            <tr>
+              <td class="mono">P0-2</td>
+              <td><strong>Crew is a map, not a boolean.</strong> <span class="mono">--crew planner:1,coder:2,...</span> on compose and workflow run. Occurrence-count auto is illegal. Unique-role default = 1. Extra N only for coder (and scout when recon).</td>
+              <td>crew.rs auto; compose clap; wave-swarm YAML <span class="mono">crew:</span> explicit like repair-until-verified</td>
+              <td><span class="mono">crew preview wave-swarm</span> → 5 unique roles ×1 = 5, not 7. User N honored.</td>
+            </tr>
+            <tr>
+              <td class="mono">P0-3</td>
+              <td><strong>Decide observes.</strong> Auto-fill Snapshot from br ready, herdr panes, coalition list, doorbell, contention. Stop requiring the agent to pass flags.</td>
+              <td>decide.rs caller in main.rs</td>
+              <td>bare <span class="mono">decide "work"</span> with 4 ready beads returns loop-work without --ready-beads</td>
+            </tr>
+            <tr>
+              <td class="mono">P0-4</td>
+              <td><strong>Join primitive.</strong> Wire existing <span class="mono">CoalitionStore::join</span> (dead_code today). Spawn on a live swarm currently refuses or --retire-orphans kills it. Default for a second harness: join, declare, reserve, kind-9, watch. Never a second compose --run.</td>
+              <td>coalition.rs join; spawn refuse-live; briefing world.joinable</td>
+              <td>second pane, same cwd: argv is coalition join + intent, not wave-swarm</td>
+            </tr>
+            <tr>
+              <td class="mono">P0-5</td>
+              <td><strong>Arrive always starts the doorbell</strong> for this project workspace, even open-mode. Presence publish on bootstrap. Helm prints dispatcher + joinable, never "calm" when degraded.</td>
+              <td>bootstrap, helm render, doorbell start on first pin</td>
+              <td><span class="mono">doorbell status toron</span> non-empty after arrive; helm names mail degraded</td>
+            </tr>
+            <tr>
+              <td class="mono">P0-6</td>
+              <td><strong>Briefing edits must mutate CrewPlan.</strong> Today they are preview-only. Invert skip matrix: --json emits the four sections as JSON. TTY is a renderer of the same struct. Compose uses the confirmed map.</td>
+              <td>steer_brief.rs (kill cosmetic edits); compose run path</td>
+              <td>type coder 2 → spawn coder 2. Non-TTY without --crew prints the suggested --crew string and bails.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 class="font-bold mt-6 mb-2" style="color: var(--amber)">P1 — captain-as-protocol (finish designed work)</h3>
+      <div class="wrap-scroll mb-6">
+        <table class="table table-sm">
+          <thead><tr><th>ID</th><th>Fix</th><th>Notes</th></tr></thead>
+          <tbody>
+            <tr><td class="mono">P1-1</td><td>Doorbell watch child must be <span class="mono">toron watch --live</span> (today: 1s snapshot, no --live). WaitCorr only drains on WatchNdjson — Sweep never drains, so captain wait is deaf up to 3600s. <span class="mono">prompt_allowed</span> is Idle-only; blocked is Busy so a stuck crew is never woken. Budget 5/30/3 drops injects with no captain ping. <span class="mono">last_wake=never</span> after failed injects looks calm.</td><td>main.rs spawn_watch_child; workspace prompt_allowed; doorbell budget.</td></tr>
+            <tr><td class="mono">P1-2</td><td>Accept + ship ADR-0029 Wave 1 rot scorer on the tick (advise → compact → restart+handoff). This is why supervision "goes silent" mid-bead: rot is behavioral before pane.exited.</td><td>Proposed today. Do not wait for all five waves.</td></tr>
+            <tr><td class="mono">P1-3</td><td>Role bind already runs at spawn HEAD, but <strong>warns and continues</strong> on failure. Skills still say “GS-030 to-be.” Fail-closed on bind, or surface the miss in helm. Stale skill is why operators skip the check.</td><td>bind_spawn_role warn+continue; whois role:coder black-hole.</td></tr>
+            <tr><td class="mono">P1-4</td><td>WaitCorr TTL wedge mails captain + folds into helm. No infinite park.</td><td>ADR-0027 E9 wait exists; wedge must be loud.</td></tr>
+            <tr><td class="mono">P1-5</td><td>OBSERVE must ring the operator if captain_pin is empty or unanswered 120s. Today it DMs a pin that may not be watching.</td><td>wave-observe stage + doorbell unanswered.</td></tr>
+            <tr><td class="mono">P1-6</td><td>Snapshot: stop hardcoding mail+reservations empty. Open lanes only. Include dispatcher, coalitions, joinable, foreign workspaces labeled. Wire <span class="mono">CoalitionStore::join</span> (exists, <span class="mono">dead_code</span>).</td><td>snapshot.rs:279-297; coalition.rs join unwired.</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 class="font-bold mt-6 mb-2" style="color: var(--cyan)">P2 — make skipping the door impossible</h3>
+      <div class="wrap-scroll mb-6">
+        <table class="table table-sm">
+          <thead><tr><th>ID</th><th>Fix</th></tr></thead>
+          <tbody>
+            <tr><td class="mono">P2-1</td><td>Replace AGENTS.md WORKFLOWS block with 12 lines: <span class="mono">flywheel briefing --json</span> then run argv. Kill the 43-workflow catalog dump from the hot path (keep it behind <span class="mono">workflow list</span>).</td></tr>
+            <tr><td class="mono">P2-2</td><td>Every slash template (open/loop/swarm/peer-aware) starts with arrive + briefing. /swarm-mode must not pin wave-swarm before briefing sees joinable / ready-beads / "2 crews".</td></tr>
+            <tr><td class="mono">P2-3</td><td>Harness integration prime (pi/omp/opencode/grok/codex): on pane boot, inject one line "run flywheel briefing before any spawn". Identity line already injects; this rides it.</td></tr>
+            <tr><td class="mono">P2-4</td><td>Open-mode collab bootstrap is code, not prose: <span class="mono">toron agent bootstrap</span> already prints next steps — make next[0] = helm + presence + watch.</td></tr>
+            <tr><td class="mono">P2-5</td><td>Coalition detect on arrive. Overlap → auto-coalesce prompt (default yes when same bead id).</td></tr>
+            <tr><td class="mono">P2-6</td><td>Parse N from free text ("2 crews", "coder:3") into briefing.crew. decide currently throws the whole target string at compose and hopes.</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 class="font-bold mt-6 mb-2" style="color: var(--lav)">P3 — hygiene that stops silent lies</h3>
+      <div class="wrap-scroll mb-6">
+        <table class="table table-sm">
+          <thead><tr><th>ID</th><th>Fix</th></tr></thead>
+          <tbody>
+            <tr><td class="mono">P3-1</td><td>Coder execution without a stage is a hard error in swarm/loop (keep --raw for nudges only). 09-03 missing-close stalls were raw briefs.</td></tr>
+            <tr><td class="mono">P3-2</td><td>GC coalitions whose run is completed and channel is empty. August "active" coalition is a lie.</td></tr>
+            <tr><td class="mono">P3-3</td><td><span class="mono">flywheel status</span> without --project must not look like "this repo's fleet" when it lists chiebukuro.</td></tr>
+            <tr><td class="mono">P3-4</td><td>bug-fix YAML: explicit <span class="mono">crew: coder:1 reviewer:1 scout:1</span> like repair-until-verified. 8-pane bug-fix is a defect.</td></tr>
+            <tr><td class="mono">P3-5</td><td>Pin grammar: reject hyphenated lucid-falcon at bootstrap with the CamelCase rewrite named. This session burned a turn on that.</td></tr>
+            <tr><td class="mono">P3-6</td><td>Fix snapshot mail/reservations degraded on toron — awareness that cannot read mail cannot join safely.</td></tr>
+            <tr><td class="mono">P3-7</td><td>SIGNOFF stays captain-only for irreversible; auto-approve when VERIFY+REVIEW residual gate is empty and no OPEN DECISIONS. Human is for preference, not "did the tests pass".</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 class="font-bold mt-6 mb-2 opacity-80">P4 — stretch (ADR-0029 rest, firstmate leftovers)</h3>
+      <ul class="text-sm opacity-85 list-disc pl-5 space-y-1">
+        <li>P4-1 Rot waves 2–5: distilled handoff, window pacing, mail caps, memory bank, repo-config may only narrow, exit 75/76.</li>
+        <li>P4-2 Subagent-guard (ADR-0010 D13): deny harness Task-tool spawn that bypasses flywheel (untracked panes = empty fleet view).</li>
+        <li>P4-3 Per-harness native command (pi.registerCommand) so /briefing is a real handler, not a markdown fire-and-forget.</li>
+        <li>P4-4 Cross-project pin reuse already exists (--from-project); arrive should offer it instead of minting LucidFalcon #2.</li>
+      </ul>
+    </section>
+
+    <!-- DOMINANT -->
+    <section id="dominant" class="mb-14">
+      <p class="label-kicker mb-2">Accretive + dominance</p>
+      <h2 class="text-2xl font-bold mb-4">Winner: briefing.v1 as the only user door</h2>
+      <div class="callout lav p-5 rounded-r-xl bg-base-200/50 mb-4">
+        <p class="font-semibold mb-2">Prompt sentence used: the single smartest capability to add is a session briefing contract.</p>
+        <p class="text-sm opacity-85">It beats "rewrite decide needles", "add more skill prose", and "always spawn 5" because it compresses F1–F4 into one typed JSON the harness cannot skip, reuses snapshot/helm/steer_brief/crew preview/compose, and leaves the tick + ledger + mail bones alone. ADR-0010 said we have stronger bones and weaker reflexes. Briefing is the missing reflex at session start. Rot is the missing reflex mid-run. Do both; ship briefing first because it is the user-visible door.</p>
+      </div>
+      <div class="grid lg:grid-cols-3 gap-3">
+        <div class="p-4 rounded-xl bg-base-200/60 border border-base-300">
+          <p class="text-xs mono opacity-70 mb-1">Rejected</p>
+          <p class="font-semibold">More skill text</p>
+          <p class="text-sm opacity-80">AGENTS.md is already 33k. Agents skip it. ADR-0022: convention silently breaks.</p>
+        </div>
+        <div class="p-4 rounded-xl bg-base-200/60 border border-base-300">
+          <p class="text-xs mono opacity-70 mb-1">Rejected as first cut</p>
+          <p class="font-semibold">Needle-patch decide.rs</p>
+          <p class="text-sm opacity-80">Fixes "swarm" miss, not crew N, not join, not topology. Whack-a-mole.</p>
+        </div>
+        <div class="p-4 rounded-xl bg-base-200/60 border border-success/40">
+          <p class="text-xs mono opacity-70 mb-1">Winner</p>
+          <p class="font-semibold">briefing --json / --commit</p>
+          <p class="text-sm opacity-80">One schema, observe+propose+ask+run. decide stays the classifier leaf.</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- CONTRACT -->
+    <section id="contract" class="mb-14">
+      <p class="label-kicker mb-2">Contract</p>
+      <h2 class="text-2xl font-bold mb-4">flywheel-briefing.v1 (the thing harnesses run)</h2>
+      <pre class="p-4 rounded-xl bg-base-300 text-xs mono overflow-x-auto leading-relaxed">{
+  "schema": "flywheel-briefing.v1",
+  "objective": "implement auth + review",
+  "world": {
+    "project": "toron",
+    "ready_beads": 0,
+    "dispatcher": "absent",
+    "joinable": false,
+    "degraded": ["mail", "reservations"],
+    "foreign_workspaces": ["flywheel-chiebukuro"]
+  },
+  "proposal": {
+    "topology": "swarm",
+    "workflow": "wave-swarm",
+    "token": "wave-swarm",
+    "stages": ["wave-gate","wave-dispatch","ce-execute","wave-observe","ce-review","wave-verify","ce-compound"],
+    "crew": {"planner":1,"coder":2,"scout":1,"reviewer":1,"housekeeper":1},
+    "crew_total": 6,
+    "add": ["ce-review already in token"],
+    "remove": [
+      "2nd planner (gate+dispatch share one pane)",
+      "2nd reviewer (review+verify share one pane)"
+    ],
+    "why": "multi-lane + review; no ready beads so not loop; not a one-file open",
+    "argv": [
+      "flywheel","workflow","compose","implement auth + review",
+      "--parts","wave-swarm","--run","--project","toron",
+      "--crew","planner:1,coder:2,scout:1,reviewer:1,housekeeper:1",
+      "--allow-crew-expand"
+    ]
+  },
+  "alternatives": [
+    {"topology":"loop","workflow":"loop-work","when":"ready beads exist","crew":{"coder":1}},
+    {"topology":"open","workflow":null,"when":"current pane, no spawn","crew":{}}
+  ],
+  "questions": [
+    {"id":"topology","options":["swarm","loop","open"],"default":"swarm"},
+    {"id":"crew","default":"planner:1,coder:2,scout:1,reviewer:1,housekeeper:1"}
+  ]
+}</pre>
+      <p class="text-sm opacity-80 mt-3">Harness rule: print proposal + add/remove, ask the two questions (defaults shown), then <span class="mono">briefing --commit --topology … --crew …</span>. No third question. Never-block-on-the-human: if --yes, commit defaults.</p>
+    </section>
+
+    <!-- WAVES -->
+    <section id="waves" class="mb-14">
+      <p class="label-kicker mb-2">Implementation waves</p>
+      <h2 class="text-2xl font-bold mb-4">Ship order if you accept the winner</h2>
+      <div class="grid gap-3">
+        <div class="p-4 rounded-xl bg-base-200/60 border border-base-300">
+          <p class="font-semibold">Wave A — stop the balloon (days, not weeks)</p>
+          <p class="text-sm opacity-85">P0-2 + P3-4: unique-role crew default; <span class="mono">--crew</span> on compose; wave-swarm + bug-fix explicit crew maps; robot error prints the --crew string. Fixes the reported "wrong crew size even when we ask" without waiting for briefing.</p>
+        </div>
+        <div class="p-4 rounded-xl bg-base-200/60 border border-base-300">
+          <p class="font-semibold">Wave B — briefing door</p>
+          <p class="text-sm opacity-85">P0-1, P0-3, P0-6, P2-1, P2-2, P2-6. New noun. decide observes. slash + AGENTS.md point at it. JSON schema test-gated.</p>
+        </div>
+        <div class="p-4 rounded-xl bg-base-200/60 border border-base-300">
+          <p class="font-semibold">Wave C — arrive / join / doorbell</p>
+          <p class="text-sm opacity-85">P0-4, P0-5, P1-3, P1-6, P2-4, P2-5, P3-2, P3-3, P3-6. Second harness becomes coalition, not a second swarm.</p>
+        </div>
+        <div class="p-4 rounded-xl bg-base-200/60 border border-base-300">
+          <p class="font-semibold">Wave D — captain-as-protocol</p>
+          <p class="text-sm opacity-85">P1-1, P1-2 (rot Wave 1), P1-4, P1-5, P3-1, P3-7. Supervision no longer needs you to poll.</p>
+        </div>
+      </div>
+      <p class="text-sm mt-4 opacity-80">Blast radius is flywheel-local except GS-030 role pin (toron CLI already exists; flywheel spawn calls it). No new MCP tools. No new kinds. Matches frozen surface.</p>
+    </section>
+
+    <!-- INPUT -->
+    <section id="decide" class="mb-16">
+      <p class="label-kicker mb-2">Your cut</p>
+      <h2 class="text-2xl font-bold mb-4">Four decisions. Queue answers here.</h2>
+      <p class="text-sm opacity-80 mb-6">Native controls. Change your mind, then Queue. Send to Agent when the set is right.</p>
+
+      <form class="mb-6 p-5 rounded-xl bg-base-200/60 border border-base-300" data-lavish-question="first-wave"
+        onsubmit="event.preventDefault(); const v = new FormData(event.currentTarget).get('first'); if (v) window.lavish.queuePrompt('First wave: ' + v, { tag: 'choice', text: 'First wave: ' + v, element: event.currentTarget, data: { question: 'first-wave', answer: v } });">
+        <p class="font-semibold mb-2">1. What do we ship first?</p>
+        <label class="flex gap-2 items-start mb-2"><input type="radio" name="first" value="wave-a-crew-map" checked /> <span><strong>Wave A (recommended)</strong> — stop the 7/8-pane balloon + honor --crew. Smallest proof of the whole vision.</span></label>
+        <label class="flex gap-2 items-start mb-2"><input type="radio" name="first" value="wave-b-briefing" /> <span><strong>Wave B</strong> — briefing.v1 door first. Bigger, fixes classify+ask in one cut.</span></label>
+        <label class="flex gap-2 items-start mb-2"><input type="radio" name="first" value="wave-c-join" /> <span><strong>Wave C</strong> — arrive/join/doorbell first. Fixes second-harness chaos.</span></label>
+        <label class="flex gap-2 items-start mb-4"><input type="radio" name="first" value="full-adr" /> <span><strong>Write the ADR covering A–D</strong>, then implement Wave A inside it.</span></label>
+        <button type="submit" class="btn btn-sm btn-primary">Queue this answer</button>
+      </form>
+
+      <form class="mb-6 p-5 rounded-xl bg-base-200/60 border border-base-300" data-lavish-question="two-crews"
+        onsubmit="event.preventDefault(); const v = new FormData(event.currentTarget).get('n'); if (v) window.lavish.queuePrompt('2 crews means: ' + v, { tag: 'choice', text: '2 crews means: ' + v, element: event.currentTarget, data: { question: 'two-crews', answer: v } });">
+        <p class="font-semibold mb-2">2. When you say "2 crews", what is N?</p>
+        <label class="flex gap-2 items-start mb-2"><input type="radio" name="n" value="coder-n" checked /> <span><strong>coder:N (recommended)</strong> — supporting roles stay 1. "2 crews" = 2 coder panes + planner/scout/reviewer/housekeeper ×1.</span></label>
+        <label class="flex gap-2 items-start mb-2"><input type="radio" name="n" value="total-n" /> <span><strong>total panes = N</strong> — "2 crews" = exactly 2 agents, squash roles.</span></label>
+        <label class="flex gap-2 items-start mb-4"><input type="radio" name="n" value="squad-default" /> <span><strong>squad default</strong> — compiled-in default squad (coder 3 + scout + reviewer) unless overridden.</span></label>
+        <button type="submit" class="btn btn-sm btn-primary">Queue this answer</button>
+      </form>
+
+      <form class="mb-6 p-5 rounded-xl bg-base-200/60 border border-base-300" data-lavish-question="captain-model"
+        onsubmit="event.preventDefault(); const v = new FormData(event.currentTarget).get('cap'); if (v) window.lavish.queuePrompt('Captain model: ' + v, { tag: 'choice', text: 'Captain model: ' + v, element: event.currentTarget, data: { question: 'captain-model', answer: v } });">
+        <p class="font-semibold mb-2">3. Who is the captain when you open grok?</p>
+        <label class="flex gap-2 items-start mb-2"><input type="radio" name="cap" value="protocol" checked /> <span><strong>Captain-as-protocol (recommended)</strong> — this pane is the human fold (OPEN DECISIONS only). Tick + doorbell supervise. Alias <span class="mono">captain</span> points at this pin.</span></label>
+        <label class="flex gap-2 items-start mb-2"><input type="radio" name="cap" value="spawn-planner" /> <span><strong>Always spawn a planner pane</strong> as captain; human only approves SIGNOFF.</span></label>
+        <label class="flex gap-2 items-start mb-4"><input type="radio" name="cap" value="this-pane-supervises" /> <span><strong>This pane supervises in-band</strong> — grok stays hot, polls helm, nudges. (This is today's silent failure.)</span></label>
+        <button type="submit" class="btn btn-sm btn-primary">Queue this answer</button>
+      </form>
+
+      <form class="mb-6 p-5 rounded-xl bg-base-200/60 border border-base-300" data-lavish-question="second-harness"
+        onsubmit="event.preventDefault(); const v = new FormData(event.currentTarget).get('join'); if (v) window.lavish.queuePrompt('Second harness: ' + v, { tag: 'choice', text: 'Second harness: ' + v, element: event.currentTarget, data: { question: 'second-harness', answer: v } });">
+        <p class="font-semibold mb-2">4. Second harness, fleet already running?</p>
+        <label class="flex gap-2 items-start mb-2"><input type="radio" name="join" value="join-default" checked /> <span><strong>Join by default (recommended)</strong> — declare + reserve + kind-9. Ask only if files overlap hard.</span></label>
+        <label class="flex gap-2 items-start mb-2"><input type="radio" name="join" value="always-ask" /> <span><strong>Always ask</strong> join vs new topology.</span></label>
+        <label class="flex gap-2 items-start mb-4"><input type="radio" name="join" value="open-sidecar" /> <span><strong>Open-mode sidecar</strong> — never join automatically; only watch + mail.</span></label>
+        <button type="submit" class="btn btn-sm btn-primary">Queue this answer</button>
+      </form>
+    </section>
+
+    <footer class="text-xs opacity-60 pb-8">
+      <p>Design source: project hacker-night tokens + DaisyUI night (subject system, not a generic template).</p>
+      <p>Grounded in flywheel decide.rs, crew preview, steer_brief.rs skip matrix, compose --allow-crew-expand, snapshot.v1, helm, doorbell status, ADR-0005/0008/0010, toron ADR-0027/0029, live probes 2026-09-08.</p>
+    </footer>
+  </div>
+</body>
+</html>

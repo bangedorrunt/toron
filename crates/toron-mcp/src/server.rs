@@ -18,7 +18,10 @@ use rmcp::{ServerHandler, ServiceExt};
 use toron_core::bus::Bus;
 use toron_core::mailbox::{Mailbox, UnwrappedMail};
 
-use crate::resources::{RESOURCES, read_resource_value};
+use crate::resources::{
+    concrete_resources, notification_resource_uri, read_resource_value, resource_templates,
+    resource_uri_supported,
+};
 use crate::tools::ToolServer;
 use crate::workflow_host::WorkflowHost;
 
@@ -134,8 +137,7 @@ impl ServerHandler for ToronServer {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListResourcesResult, ErrorData> {
-        let resources: Vec<Resource> = RESOURCES
-            .iter()
+        let resources: Vec<Resource> = concrete_resources()
             .map(|(name, uri, desc)| {
                 Resource::new(uri.to_string(), name.to_string())
                     .with_title(name.to_string())
@@ -151,9 +153,7 @@ impl ServerHandler for ToronServer {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListResourceTemplatesResult, ErrorData> {
-        let templates: Vec<ResourceTemplate> = RESOURCES
-            .iter()
-            .filter(|(_, uri, _)| uri.contains('{'))
+        let templates: Vec<ResourceTemplate> = resource_templates()
             .map(|(name, uri, desc)| {
                 ResourceTemplate::new(uri.to_string(), name.to_string())
                     .with_title(name.to_string())
@@ -209,11 +209,7 @@ impl ServerHandler for ToronServer {
         if let Some(uris) = &requested.resource_subscriptions {
             let keep: Vec<String> = uris
                 .iter()
-                .filter(|u| {
-                    RESOURCES
-                        .iter()
-                        .any(|(_, t, _)| crate::resources::template_matches(t, u))
-                })
+                .filter(|u| resource_uri_supported(u))
                 .cloned()
                 .collect();
             if !keep.is_empty() {
@@ -239,7 +235,7 @@ impl ServerHandler for ToronServer {
                 ev = sub.next() => {
                     let Some(ev) = ev else { return Ok(()) };
                     if let toron_core::bus::SubscriptionEvent::Event(event) = ev {
-                        let uri = format!("toron://events/{}/{}", event.kind.as_u16(), event.id);
+                        let uri = notification_resource_uri(&event);
                         let notification =
                             ResourceUpdatedNotification::new(ResourceUpdatedNotificationParam::new(uri));
                         if context.sink().send(notification.into()).await.is_err() {
@@ -580,6 +576,7 @@ async fn classify_port_peer(bind_addr: &str) -> PortPeer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::resources::RESOURCES;
 
     /// bd-serve-double-spawn-oqe6: bind-conflict classification — a healthy
     /// HTTP peer reads as HttpPeer; junk (silent) holders and dead ports
@@ -628,8 +625,10 @@ mod tests {
     }
 
     #[test]
-    fn resource_surface_matches_fixture_count() {
+    fn resource_surface_splits_literals_from_templates() {
         assert_eq!(RESOURCES.len(), 25);
+        assert_eq!(concrete_resources().count(), 7);
+        assert_eq!(resource_templates().count(), 18);
     }
 
     /// ADR-0007 R3/F1 serve wire e2e: with the trigger channel attached

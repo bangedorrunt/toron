@@ -1,0 +1,125 @@
+{
+  "version": 1,
+  "skills": {
+    "api-doc-generator": {
+      "source": "accolver/skill-maker",
+      "sourceType": "github",
+      "skillPath": "api-doc-generator/SKILL.md",
+      "computedHash": "7787e10dfbcef92205d581133cfbc75be781f891ec821ed6725b1f805e85b055"
+    },
+    "error-handling": {
+      "source": "accolver/skill-maker",
+      "sourceType": "github",
+      "skillPath": "error-handling/SKILL.md",
+      "computedHash": "7cf747e94e69d531fed0e38a51fc493daeb68aeb2d1bd38086ee533c5ab1a057"
+    },
+    "experiment-tracker": {
+      "source": "accolver/skill-maker",
+      "sourceType": "github",
+      "skillPath": "experiment-tracker/SKILL.md",
+      "computedHash": "121505461f9a453458413a2e32ed9f77e093f73682547644b7a6b4d74ffef7da"
+    },
+    "nostr-bunker-integration": {
+      "source": "accolver/skill-maker",
+      "sourceType": "github",
+      "skillPath": "nostr-bunker-integration/SKILL.md",
+      "computedHash": "4f4c17d9c4494afae2167951f848693126fe6fd45b14bb43aff28ad635a1cc3b"
+    },
+    "nostr-client-patterns": {
+      "source": "accolver/skill-maker",
+      "sourceType": "github",
+      "skillPath": "nostr-client-patterns/SKILL.md",
+      "computedHash": "a48c2e64cfd8debaa8eec3eba919c1834936b6a7f965e7041cca9d0784793b0c"
+    },
+    "nostr-crypto-guide": {
+      "source": "accolver/skill-maker",
+      "sourceType": "github",
+      "skillPath": "nostr-crypto-guide/SKILL.md",
+      "computedHash": "bdf9d7d1d787f89cb564931ec8dd8ee21f12f3ebde5c1fe275b143c036e7cae8"
+    },
+    "nostr-dvms": {
+      "source": "accolver/skill-maker",
+      "sourceType": "github",
+      "skillPath": "nostr-dvms/SKILL.md",
+      "computedHash": "2ce16439df221ea462f338fd62eff19603f4f5385434486fc4c8550eabc7c28d"
+    },
+    "nostr-event-builder": {
+      "source": "accolver/skill-maker",
+      "sourceType": "github",
+      "skillPath": "nostr-event-builder/SKILL.md",
+      "computedHash": "0639970a1828e353100903d82aebfc871f93cb44773932d758870e7745a4e035"
+    },
+    "nostr-filter-designer": {
+      "source": "accolver/skill-maker",
+      "sourceType": "github",
+      "skillPath": "nostr-filter-designer/SKILL.md",
+      "computedHash": "7a8c6a05f9321ba3fe2cdde488a76879e5fca8e49d3621897cae5345c4809cbb"
+    },
+    "nostr-marketplace-builder": {
+      "source": "accolver/skill-maker",
+      "sourceType": "github",
+      "skillPath": "nostr-marketplace-builder/SKILL.md",
+      "computedHash": "2fce8f4ce3d0879c36b3acf701cc4e4e0906cfc1b491d92493d8df58f66ef5c6"
+    },
+    "nostr-nip-advisor": {
+      "source": "accolver/skill-maker",
+      "sourceType": "github",
+      "skillPath": "nostr-nip-advisor/SKILL.md",
+      "computedHash": "d8e91f955e8020bfe1fca6c17a98f72b68e72a342114d70dc6e0194f1f90e782"
+    },
+    "nostr-nip05-setup": {
+      "source": "accolver/skill-maker",
+      "sourceType": "github",
+      "skillPath": "nostr-nip05-setup/SKILL.md",
+      "computedHash": "324ddaf9eeab90ac12e43ac894789b4cea018504cdec58ef9ebd828571f857b2"
+    },
+    "nostr-relay-builder": {
+      "source": "accolver/skill-maker",
+      "sourceType": "github",
+      "skillPath": "nostr-relay-builder/SKILL.md",
+      "computedHash": "84780e4a4e75334efc32bfcd63b32435f5cf754bc181052f64bfbe93e571a02b"
+    },
+    "nostr-sdks-update": {
+      "source": "941design/claude-plugins",
+      "sourceType": "github",
+      "skillPath": "plugins/nostr-skills/skills/nostr-sdks-update/SKILL.md",
+      "computedHash": "88d6d52b8aad26bf40c13c2bb4526c3ef66c970353b9a64c672fc6c499c9937b"
+    },
+    "nostr-social-graph": {
+      "source": "accolver/skill-maker",
+      "sourceType": "github",
+      "skillPath": "nostr-social-graph/SKILL.md",
+      "computedHash": "92f8a369cd378857aad42a8ed9b122dfdb51ec781d6b4af18029db3ecb4c4735"
+    },
+    "nostr-zap-integration": {
+      "source": "accolver/skill-maker",
+      "sourceType": "github",
+      "skillPath": "nostr-zap-integration/SKILL.md",
+      "computedHash": "5c0c9a97fb74b6b620340bdc522fc3e813dae34a2af87cfda764733d2632229c"
+    },
+    "pr-description": {
+      "source": "accolver/skill-maker",
+      "sourceType": "github",
+      "skillPath": "pr-description/SKILL.md",
+      "computedHash": "26aa86ccb6c90ebd2ca8411125a39d72b2b79a3c206d80bda41dfe05bdecf494"
+    },
+    "pr-qa": {
+      "source": "accolver/skill-maker",
+      "sourceType": "github",
+      "skillPath": "pr-qa/SKILL.md",
+      "computedHash": "53c220bf891384161f20dfe6ada8341d8a78947abed697e9595e96e54427c2ff"
+    },
+    "skill-maker": {
+      "source": "accolver/skill-maker",
+      "sourceType": "github",
+      "skillPath": "skill-maker/SKILL.md",
+      "computedHash": "ff05660ddc7d129796730d39553ecd2ab9a7acb1f6dc5f6222935e4432ce77dd"
+    },
+    "tui-design": {
+      "source": "hyperb1iss/hyperskills",
+      "sourceType": "github",
+      "skillPath": "skills/tui-design/SKILL.md",
+      "computedHash": "a6730abd3cf3f19b7f0ab3ffdd6cf0579f895f4c6e453ea39e7983b38877486f"
+    }
+  }
+}
