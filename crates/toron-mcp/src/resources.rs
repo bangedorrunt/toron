@@ -5,7 +5,10 @@
 
 use sqlx::Row;
 use toron_core::mailbox::Mailbox;
-use toron_core::nostr::kinds::{BUILD_SLOT, FILE_RESERVATION, PRODUCT_MANIFEST, toron_kind};
+use toron_core::nostr::Event;
+use toron_core::nostr::kinds::{
+    AGENT_PROFILE, BUILD_SLOT, FILE_RESERVATION, PRODUCT_MANIFEST, PROJECT_MANIFEST, toron_kind,
+};
 
 /// All 25 parity resources as (name, uri-template, description).
 pub const RESOURCES: &[(&str, &str, &str)] = &[
@@ -128,11 +131,83 @@ pub const RESOURCES: &[(&str, &str, &str)] = &[
     ),
 ];
 
-/// True if a concrete URI matches a resource template (prefix match on the
-/// static part before the first `{`).
+/// Return the concrete resources that can be listed and read without
+/// substituting template parameters.
+pub fn concrete_resources()
+-> impl Iterator<Item = &'static (&'static str, &'static str, &'static str)> {
+    RESOURCES.iter().filter(|(_, uri, _)| !uri.contains('{'))
+}
+
+/// Return the parameterized resources for `resources/templates/list`.
+pub fn resource_templates()
+-> impl Iterator<Item = &'static (&'static str, &'static str, &'static str)> {
+    RESOURCES.iter().filter(|(_, uri, _)| uri.contains('{'))
+}
+
+/// Return whether a URI is a supported resource handle or a concrete
+/// expansion of one of the advertised templates.
+pub fn resource_uri_supported(uri: &str) -> bool {
+    let base = uri.split('?').next().unwrap_or(uri);
+    concrete_resources().any(|(_, known, _)| *known == base)
+        || resource_templates().any(|(_, template, _)| template_matches(template, base))
+}
+
+/// Select a concrete, readable resource URI for a bus update.
+///
+/// Resource-update notifications carry handles, not arbitrary event IDs. Use
+/// the most specific readable projection when the event has enough identity;
+/// otherwise use the concrete metrics resource as a safe refresh signal.
+pub fn notification_resource_uri(event: &Event) -> String {
+    let project = event
+        .tags
+        .iter()
+        .find_map(|tag| (tag.kind() == "t").then(|| tag.content()).flatten());
+    let d_tag = event
+        .tags
+        .iter()
+        .find_map(|tag| (tag.kind() == "d").then(|| tag.content()).flatten());
+
+    match event.kind.as_u16() {
+        PROJECT_MANIFEST => project
+            .map(|slug| format!("toron://project/{slug}"))
+            .unwrap_or_else(|| "toron://tooling/metrics".to_string()),
+        PRODUCT_MANIFEST => d_tag
+            .map(|key| format!("toron://products/{key}"))
+            .unwrap_or_else(|| "toron://tooling/metrics".to_string()),
+        AGENT_PROFILE => d_tag
+            .and_then(|identity| identity.split_once(':').map(|(_, name)| name))
+            .map(|name| format!("toron://agents/{name}/profile"))
+            .unwrap_or_else(|| "toron://tooling/metrics".to_string()),
+        FILE_RESERVATION => project
+            .map(|slug| format!("toron://reservations/{slug}"))
+            .unwrap_or_else(|| "toron://tooling/metrics".to_string()),
+        BUILD_SLOT => project
+            .map(|slug| format!("toron://slots/{slug}"))
+            .unwrap_or_else(|| "toron://tooling/metrics".to_string()),
+        _ => "toron://tooling/metrics".to_string(),
+    }
+}
+
+/// True if a concrete URI matches a resource template.
+///
+/// Matching is segment-aware: literal segments must be equal, variable
+/// segments must be non-empty, and extra or missing path segments reject the
+/// URI. Query parameters are ignored for matching but remain available to the
+/// projection layer through the original URI.
 pub fn template_matches(template: &str, uri: &str) -> bool {
-    let prefix = template.split('{').next().unwrap_or(template);
-    uri.starts_with(prefix)
+    let concrete = uri.split('?').next().unwrap_or(uri);
+    let template_segments: Vec<&str> = template.split('/').collect();
+    let concrete_segments: Vec<&str> = concrete.split('/').collect();
+    template_segments.len() == concrete_segments.len()
+        && template_segments.iter().zip(concrete_segments).all(
+            |(template_segment, concrete_segment)| {
+                if template_segment.starts_with('{') && template_segment.ends_with('}') {
+                    !concrete_segment.is_empty()
+                } else {
+                    template_segment == &concrete_segment
+                }
+            },
+        )
 }
 
 /// Resolve a resource URI to its JSON value. Static metadata is served
@@ -145,7 +220,7 @@ pub fn read_resource_value(uri: &str) -> Option<serde_json::Value> {
         return Some(v);
     }
     if let Some((name, template, desc)) =
-        RESOURCES.iter().find(|(_, t, _)| template_matches(t, base))
+        resource_templates().find(|(_, t, _)| template_matches(t, base))
     {
         return Some(serde_json::json!({
             "uri": base,
@@ -655,20 +730,76 @@ mod tests {
 
     #[test]
     fn templates_are_a_subset() {
-        let templates: Vec<&str> = RESOURCES
-            .iter()
-            .filter(|(_, u, _)| u.contains('{'))
-            .map(|(_, u, _)| *u)
-            .collect();
+        let templates: Vec<&str> = resource_templates().map(|(_, u, _)| *u).collect();
         assert!(!templates.is_empty());
         assert!(templates.len() < RESOURCES.len());
+        assert_eq!(
+            concrete_resources().count() + templates.len(),
+            RESOURCES.len()
+        );
+    }
+
+    #[test]
+    fn concrete_resources_are_literal_uris() {
+        assert!(concrete_resources().all(|(_, uri, _)| !uri.contains('{')));
+        assert!(concrete_resources().all(|(_, uri, _)| read_resource_value(uri).is_some()));
+        assert!(resource_uri_supported("toron://tooling/metrics"));
+        assert!(resource_uri_supported("toron://agents/BlueLake/inbox"));
+        assert!(!resource_uri_supported(
+            "toron://agents/BlueLake/inbox/extra"
+        ));
+        assert!(!resource_uri_supported("toron://events/14/abc"));
+    }
+
+    #[test]
+    fn notification_uris_are_concrete_and_readable() {
+        use nostr::prelude::{EventBuilder, FinalizeEvent, Kind, Tag};
+
+        let fallback = EventBuilder::new(Kind::from_u16(14), "update")
+            .finalize(&toron_core::nostr::Keys::generate())
+            .expect("sign test event");
+        let fallback_uri = notification_resource_uri(&fallback);
+        assert_eq!(fallback_uri, "toron://tooling/metrics");
+        assert!(read_resource_value(&fallback_uri).is_some());
+
+        let reservation = EventBuilder::new(Kind::from_u16(FILE_RESERVATION), "lease")
+            .tags(vec![Tag::parse(["t", "demo"]).expect("project tag")])
+            .finalize(&toron_core::nostr::Keys::generate())
+            .expect("sign reservation event");
+        let reservation_uri = notification_resource_uri(&reservation);
+        assert_eq!(reservation_uri, "toron://reservations/demo");
+        assert!(template_matches(
+            "toron://reservations/{project}",
+            &reservation_uri
+        ));
+
+        let profile = EventBuilder::new(Kind::from_u16(AGENT_PROFILE), "profile")
+            .tags(vec![
+                Tag::parse(["d", "demo:BlueLake"]).expect("profile tag"),
+            ])
+            .finalize(&toron_core::nostr::Keys::generate())
+            .expect("sign profile event");
+        let profile_uri = notification_resource_uri(&profile);
+        assert_eq!(profile_uri, "toron://agents/BlueLake/profile");
+        assert!(template_matches(
+            "toron://agents/{name}/profile",
+            &profile_uri
+        ));
     }
 
     #[test]
     fn template_matching_works() {
         assert!(template_matches(
             "toron://agents/{name}/inbox",
-            "toron://agents/BlueLake/inbox"
+            "toron://agents/BlueLake/inbox?unread=true"
+        ));
+        assert!(!template_matches(
+            "toron://agents/{name}/inbox",
+            "toron://agents/BlueLake/inbox/extra"
+        ));
+        assert!(!template_matches(
+            "toron://agents/{name}/inbox",
+            "toron://agents//inbox"
         ));
         assert!(!template_matches(
             "toron://agents/{name}/inbox",

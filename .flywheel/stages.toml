@@ -1,0 +1,13 @@
+# Project-authored stages (ADR-0022 §3.8 project tier; ADR-0009 ce- loop).
+# Field-level override: a [stages.<name>] entry replaces the seed/user entry
+# of the same name; a new name adds a stage. Later tiers win.
+# Names are semantic only (p-code aliases retired by ADR-0009); `stage list`
+# shows name + tier + role + phase. Valid phases:
+# resolve | plan | implement | review | verify | compound.
+#
+# Example (delete or replace):
+# [stages.my-check]
+# name = "my-check"
+# role = "reviewer"
+# phase = "review"
+# prompt = "Check ... against this repo's conventions. Quote file:line evidence."
