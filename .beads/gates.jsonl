@@ -101,3 +101,4 @@
 {"id":101,"issue_id":"bd-z2d0","from_status":"in_progress","to_status":"closed","status_revision":946,"gate":"command-verified","provider":"ToronScribe","passed":true,"recorded_by":"bangedorrunt","recorded_at":"2026-09-10 11:53:00"}
 {"id":102,"issue_id":"bd-z2d0","from_status":"in_progress","to_status":"closed","status_revision":946,"gate":"live-verified","provider":"ToronScribe","passed":true,"recorded_by":"bangedorrunt","recorded_at":"2026-09-10 11:53:33"}
 {"id":103,"issue_id":"bd-wpqz","from_status":"in_progress","to_status":"closed","status_revision":953,"gate":"live-verified","provider":"ToronScribe","passed":true,"recorded_by":"bangedorrunt","recorded_at":"2026-09-10 12:04:58"}
+{"id":104,"issue_id":"bd-ufc1","from_status":"in_progress","to_status":"closed","status_revision":958,"gate":"live-verified","provider":"ToronScribe","passed":true,"recorded_by":"bangedorrunt","recorded_at":"2026-09-10 12:24:38"}
