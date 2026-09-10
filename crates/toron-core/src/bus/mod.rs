@@ -14,6 +14,7 @@ pub mod federation;
 pub mod filter;
 pub mod http_guard;
 pub mod in_process;
+pub mod inspection;
 #[cfg(test)]
 mod mock_relay;
 pub mod presence;

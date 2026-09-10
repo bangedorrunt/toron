@@ -183,9 +183,13 @@ impl InProcessBus {
     }
 
     fn stage_log(&self, stage: Stage, event: &Event, detail: &str) {
+        // bd-ii04: writers emit taxonomy kinds by construction — every
+        // Stage maps via STAGE_MAP (proven by inspection_events tests).
+        let emitted = super::inspection::InspectionEvent::for_stage(stage.name(), detail);
         if self.config.detailed_stage_logging {
             tracing::debug!(
                 stage = stage.name(),
+                kind = emitted.kind.as_str(),
                 event_id = %event.id,
                 detail,
                 "bus rejection"
