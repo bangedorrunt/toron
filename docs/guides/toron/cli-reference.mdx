@@ -1,0 +1,41 @@
+---
+title: toron CLI reference
+description: The command surface, one line each. Robot mode is the 38-tool AM-Rust parity surface plus CLI-only verbs.
+---
+
+Global flags on every command: `--json` (structured reads), `--plain` (flat tables), `--no-color`, `-q/-d`, `--dry-run`, `--no-input`, `--config`, `--robot-snapshot/--robot-status/--robot-capabilities`.
+
+| Command | Purpose |
+|---|---|
+| `serve` | Run the daemon: `--mcp-stdio` or `--mcp-http <addr>`; no-flag serve bails |
+| `daemon` | `start\|stop\|restart\|status\|install\|uninstall` |
+| `status` | Quick health/config overview |
+| `catalog` | Emit the MCP surface catalog (40 tools, 25 resources, CLI); freshness-gated |
+| `config` | Effective configuration (flags > env > project > user > system) |
+| `mail` | `send\|inbox\|reply\|ack\|read\|search\|thread`, `whois`; flags in [mail](./mail) |
+| `channel` | Plane S rooms: `create\|join\|leave\|close\|purge\|list\|members\|post\|read` |
+| `job` | Plane J lifecycle: `list\|show\|claim\|progress\|result\|error\|cancel` |
+| `react` | Kind 7 reaction on a channel post |
+| `presence` | Plane N: `publish\|list` (kind 20001) |
+| `watch` | Plane W: `--once` first match, `--live` real subscription |
+| `wait` | `wait --corr <id>`: subscribe-until-receipt, TTL-bounded |
+| `receipt` | Durable receipts: `get\|list\|set --state resulted` |
+| `reserve` | `acquire\|conflicts\|renew\|release\|force-release\|request-release\|respond\|transfer` |
+| `slot` | Build slots: `acquire\|renew\|release` |
+| `guard` | Pre-commit guard: `install\|uninstall` |
+| `contact` | `request\|respond\|list\|policy`, `captain [--pin\|--clear]` |
+| `role` | `pin\|list\|clear` via kind-30013 `role=` tags |
+| `agent` | `bootstrap`: register/upsert identity then optional reserve |
+| `key` | NIP-49: `generate --role operator\|agent\|anchor`, `inspect` (never prints the nsec) |
+| `project` | `ensure <slug>` (kind-30010 manifest, operator key), `list` |
+| `relay` | Federation: `list\|add\|remove\|info` (default empty) |
+| `backend` | Transport selection: `list\|status\|default` |
+| `workflow` | Fabric engine: `lint\|validate\|run\|invoke\|dry-run` |
+| `doctor` | Deep health (`--check` exits 3); `doctor reconstruct` rebuilds SQLite from git |
+| `metrics` | Operator counters: tool calls, errors, latency |
+| `bench` | Mailbox scenarios: startup, inbox, send, search, threads |
+| `tui` | Operator dashboard; refuses non-TTY |
+
+## MCP surface
+
+40 tools (38 AM-Rust parity + 2 additive), 25 resources. The same mail, reservation, contact, job, and channel ops exist over MCP for harnesses without a shell; the frozen names are cataloged by `toron catalog --json`. Prefer the CLI whenever a shell exists, and read the tool schema before the first MCP call.

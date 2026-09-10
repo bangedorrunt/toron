@@ -1,0 +1,31 @@
+---
+title: flywheel troubleshooting
+description: Named failures and their fixes. Door, spawn, loop, compose, and doorbell symptoms.
+---
+
+| Symptom | Meaning | Fix |
+|---|---|---|
+| `agent_not_ready: not an active named agent` | Pane not promptable, or kind lacks lifecycle state | Retry with the pane id; then `herdr agent prompt <pane_id>`; load the harness-integration reference if it persists |
+| `unsupported_agent_kind` | Unknown kind with no spawn recipe | Drive with `pane.send_text` until herdr ships the kind |
+| Spawn exits 1, `swarm not ready` | `launch_pending` is normal | Wait; never add a second harness. Spawn fails closed after settle on any missing/empty/wrong-named pane |
+| `flywheel status` shows `workspaces: []` right after spawn | Race between state write and status read | Trust the spawn verification; take names from the send error's `available:` list or `herdr workspace list` |
+| Send misses an idle agent | It did not miss: `prior_status: idle` means the brief landed | Only `landed: true` after `--wait`/`--confirm` counts as confirmed delivery |
+| Beadless `--work` loop resolves `complete` instantly | Nothing to claim | Create lane beads first, or drop `--work` |
+| Fresh loop parks after first poll | Resonate promise wedged | `resonate promises reject <id>`, relaunch |
+| Held beads named `WaveGate` | Wave ordering, not a stuck owner | Close the lower wave; do not nudge |
+| Flood guard pause | More than 3 ready beads | One-poll pause, then dispatch resumes; not an error |
+| `unknown compose token` / `unknown stage` | Installed binary predates the feature | Rebuild: `mbx +nightly-aarch64-apple-darwin install --path . --force`; verify from a non-repo cwd |
+| `no flywheel swarm` | Wrong cwd or absolute path | Run `loop-mode run <slug> --work` from the parent workspace directory |
+| `agent_not_ready` after agent restart, name `null` | Lost binding | `flywheel rebind` restores registered names; `recover` also respawns the dead |
+| SIGKILL on the binary | Stale signature | `codesign --force --sign - ~/.cargo/bin/flywheel` |
+| doorbell `answered by foreign owner, not child <pid>` | Port 18980 conflict | Stop the foreign holder or relocate; arrival itself was unaffected |
+| preflight `resonate ... connection refused` | Durable engine down | Start resonate before loop/compose work, or run open-vehicle work and say so in the trail |
+| Mail to `captain` fails | Alias cleared by parent death or never bound | `flywheel mail whois <p> captain` to check; `recover`/`adopt` rebinds; `toron contact captain --pin <pin>` sets it |
+
+## Escape costs
+
+A raw `spawn --escape` forfeits SIGNOFF and artifacts. If you escape, you write the trail (timeline, beads) or it does not exist. Raw briefs drop the stage scaffold; the missing-close stalls observed in the fleet are the direct result, so `--raw` stays reserved for nudges and mail wakes.
+
+## Where to look deeper
+
+`flywheel timeline <p>` and `flywheel audit <p>` reconstruct events; `flywheel doorbell why --seq <n> --corr <id>` folds a tick from default; `flywheel artifacts <run_id>` lists typed records and `artifacts stitch` merges them. Fleet forensics references live in the flywheel skill's `references/forensics.md`.

@@ -1,0 +1,43 @@
+---
+title: toron quick start
+description: Keys, daemon, project, and first mail in five minutes.
+---
+
+## Operator, once per host
+
+```bash
+export TORON_OPERATOR_KEY=$HOME/.config/toron/operator_nsec   # a PATH, not a key
+toron key generate --role operator
+toron daemon install && toron daemon start
+toron doctor
+toron project ensure /path/to/project
+flywheel toron setup-mcp --flywheel
+```
+
+`daemon install` writes the launchd/systemd unit and a 0600 passphrase file, so the secret never lands in a plist or process env. The env var is `TORON_KEY_PASSPHRASE` (never `TORON_OPERATOR_PASSPHRASE`); resolution order is env, `TORON_KEY_PASSPHRASE_FILE`, `~/.config/toron/passphrase`, then the `toron` dev default.
+
+## Agent, once per project
+
+```bash
+toron agent bootstrap --project <slug> --as <Pin> --paths <glob> --reason <bead-id>
+```
+
+One step: registers (or upserts) the identity, optionally reserves paths, and prints next steps including the `AGENT_NAME` export. `create_agent_identity` fails closed on an existing name; `register_agent` upserts.
+
+## First mail
+
+```bash
+toron mail send --project <slug> --as <Pin> --to captain \
+  --subject "[bd-z2d0] starting" --body "claiming bd-z2d0" --thread bd-z2d0
+toron mail inbox --since last
+```
+
+`--since last` reads and atomically bumps the daemon-side high-water: the crash-proof cursor. Nothing pushes; poll per work unit or let the flywheel doorbell wake you.
+
+## Verify
+
+```bash
+toron status --json
+toron mail whois <slug> <Pin>
+toron doctor --check    # exit 3 on any failure
+```
