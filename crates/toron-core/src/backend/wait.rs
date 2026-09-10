@@ -57,7 +57,8 @@ impl PromptTarget {
 /// Outcome of [`prompt_wait`]. `Stalled` (no post-submit activity) stays
 /// distinct from `Timeout` (active but unsettled past deadline) — they
 /// demand different recovery (read-then-decide vs keep-waiting-or-escalate),
-/// and neither auto-resubmits.
+/// and neither auto-resubmits. `Aborted` mirrors `waitFor`'s abort-first
+/// semantics: the caller cancelled, so no outcome is claimed at all.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WaitOutcome {
     /// Settled to the observed state for the pinned occupant.
@@ -68,6 +69,8 @@ pub enum WaitOutcome {
     Blocked,
     /// Activity seen but no settled state within `timeout_ms`.
     Timeout,
+    /// Aborted before submit or mid-wait — caller cancelled.
+    Aborted,
 }
 
 /// Effect-free host surface the wait drives. Implementations (scripted fakes
@@ -75,6 +78,9 @@ pub enum WaitOutcome {
 /// module owns only the decision order: blocked-check → submit → activity
 /// gate → pinned settle.
 pub trait PromptHost {
+    /// Cancellation flag (`waitFor`'s AbortSignal analog). Checked before
+    /// submit and after the settle wait; abort wins over any outcome.
+    fn aborted(&mut self) -> bool;
     /// Current canonical state of the pinned target's pane.
     fn state(&self, target: &PromptTarget) -> AgentStatus;
     /// Current occupant of the pane (`None` = anonymous).
@@ -105,6 +111,10 @@ pub fn prompt_wait(
     line: &str,
     timeout_ms: u64,
 ) -> WaitOutcome {
+    // Abort-first, mirroring waitFor (aborted signal rejects immediately).
+    if host.aborted() {
+        return WaitOutcome::Aborted;
+    }
     if host.state(target) == AgentStatus::Blocked {
         return WaitOutcome::Blocked;
     }
@@ -115,7 +125,13 @@ pub fn prompt_wait(
     // Occupant pinning: resolve the occupant now; only that occupant's
     // settle counts. A replacement mid-wait leaves `current != pinned`.
     let pinned = PromptTarget::new(target.pane.clone(), host.occupant(target));
-    match host.await_settled(&pinned, timeout_ms) {
+    let settled = host.await_settled(&pinned, timeout_ms);
+    // Mid-wait abort wins over settle/timeout (waitFor rejects on abort
+    // even when the predicate just matched).
+    if host.aborted() {
+        return WaitOutcome::Aborted;
+    }
+    match settled {
         Some(state)
             if pinned.is_same_occupant(&PromptTarget::new(
                 target.pane.clone(),
@@ -143,6 +159,7 @@ mod wait_for_tests {
         occupants: VecDeque<Option<String>>,
         activity: VecDeque<bool>,
         settles: VecDeque<Option<(AgentStatus, Option<String>)>>,
+        aborts: VecDeque<bool>,
         submits: usize,
     }
 
@@ -153,8 +170,13 @@ mod wait_for_tests {
                 occupants: [occupant.map(str::to_string)].into(),
                 activity: VecDeque::new(),
                 settles: VecDeque::new(),
+                aborts: VecDeque::new(),
                 submits: 0,
             }
+        }
+        fn with_abort(mut self, v: bool) -> Self {
+            self.aborts.push_back(v);
+            self
         }
         fn with_activity(mut self, v: bool) -> Self {
             self.activity.push_back(v);
@@ -172,6 +194,9 @@ mod wait_for_tests {
     }
 
     impl PromptHost for Scripted {
+        fn aborted(&mut self) -> bool {
+            self.aborts.pop_front().unwrap_or(false)
+        }
         fn state(&self, _t: &PromptTarget) -> AgentStatus {
             *self.states.back().unwrap_or(&AgentStatus::Unknown)
         }
@@ -257,6 +282,32 @@ mod wait_for_tests {
         assert_eq!(
             prompt_wait(&mut h, &target(), "do it", 1_000),
             WaitOutcome::Timeout
+        );
+        assert_eq!(h.submits, 1);
+    }
+
+    #[test]
+    fn aborted_before_submit_sends_nothing() {
+        let mut h = Scripted::new(AgentStatus::Working, Some("PiAlpha")).with_abort(true);
+        assert_eq!(
+            prompt_wait(&mut h, &target(), "do it", 1_000),
+            WaitOutcome::Aborted
+        );
+        assert_eq!(h.submits, 0, "abort-first: zero bytes sent");
+    }
+
+    #[test]
+    fn aborted_during_wait_wins_over_settle() {
+        // Entry check passes, settle is ready, but the mid-wait check
+        // aborts — outcome is Aborted, never Settled (waitFor semantics).
+        let mut h = Scripted::new(AgentStatus::Working, Some("PiAlpha"))
+            .with_abort(false)
+            .with_activity(true)
+            .with_settle(AgentStatus::Done, Some("PiAlpha"))
+            .with_abort(true);
+        assert_eq!(
+            prompt_wait(&mut h, &target(), "do it", 1_000),
+            WaitOutcome::Aborted
         );
         assert_eq!(h.submits, 1);
     }

@@ -1,13 +1,19 @@
 // governed-by: ADR-0031
 //! Typed inspection events (ADR-0031 XState inspection protocol, bead bd-ii04).
 //!
-//! XState types every runtime event (`snapshot/event/actor/transition/
-//! microstep/action`) for one inspector consumer. Our journal stages, audit
-//! rows, SSE stream, and `why`-fold each grew their own vocabulary. This
-//! module is the one taxonomy they share:
+//! XState types every runtime event (`@xstate.snapshot/event/actor/
+//! transition/microstep/action`, each carrying its actor ref) for one
+//! inspector consumer. Our journal stages, audit rows, SSE stream, and
+//! `why`-fold each grew their own vocabulary. This module is the one
+//! taxonomy they share:
 //!
-//! - [`InspectionKind`]: `snapshot`, `transition` (Msg + state-delta +
-//!   Effects triple), `microstep`, `action`, `degraded`.
+//! - [`InspectionKind`]: the six source kinds (`snapshot`, `event`,
+//!   `actor`, `transition`, `microstep`, `action`) plus `degraded` — a
+//!   toron extension for failure-shaped rows (XState has no failure kind;
+//!   the stage alone never proves health, so the escalation is explicit).
+//!   `transition` carries the Msg + state-delta + Effects triple.
+//! - [`InspectionEvent::actor`]: the actorRef analog (agent/pane identity),
+//!   present on every event whose actor is known.
 //! - [`STAGE_MAP`]: rename table from every existing journal `stage:` string
 //!   onto the taxonomy. Readers tolerate old stage-only rows (mapped here);
 //!   writers emit [`InspectionEvent`] with a kind. Unknown kinds fail loudly
@@ -20,12 +26,15 @@
 
 use serde::{Deserialize, Serialize};
 
-/// The five inspection kinds. New kinds need an ADR (same frozen-contract
+/// The inspection kinds: the six XState source types plus `degraded` (toron
+/// extension, see module docs). New kinds need an ADR (same frozen-contract
 /// instinct as the tool surface) — the validator rejects anything else.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum InspectionKind {
     Snapshot,
+    Event,
+    Actor,
     Transition,
     Microstep,
     Action,
@@ -36,6 +45,8 @@ impl InspectionKind {
     pub fn as_str(self) -> &'static str {
         match self {
             InspectionKind::Snapshot => "snapshot",
+            InspectionKind::Event => "event",
+            InspectionKind::Actor => "actor",
             InspectionKind::Transition => "transition",
             InspectionKind::Microstep => "microstep",
             InspectionKind::Action => "action",
@@ -46,6 +57,8 @@ impl InspectionKind {
     fn parse(raw: &str) -> Option<InspectionKind> {
         match raw {
             "snapshot" => Some(InspectionKind::Snapshot),
+            "event" => Some(InspectionKind::Event),
+            "actor" => Some(InspectionKind::Actor),
             "transition" => Some(InspectionKind::Transition),
             "microstep" => Some(InspectionKind::Microstep),
             "action" => Some(InspectionKind::Action),
@@ -70,7 +83,9 @@ pub const STAGE_MAP: &[(&str, InspectionKind)] = &[
 ];
 
 /// One inspection event. `kind` is always present on newly written rows;
-/// `stage` carries the legacy journal string for back-compat reads.
+/// `stage` carries the legacy journal string for back-compat reads;
+/// `actor` is the actorRef analog (agent/pane identity), present whenever
+/// the emitter knows whose event this is.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InspectionEvent {
     pub kind: InspectionKind,
@@ -78,6 +93,8 @@ pub struct InspectionEvent {
     /// synthetic events (snapshots) that never had a stage.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stage: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
 }
@@ -103,7 +120,20 @@ impl InspectionEvent {
         Self {
             kind,
             stage: Some(stage.to_string()),
+            actor: None,
             detail: Some(detail.to_string()),
+        }
+    }
+
+    /// Emitter-side constructor for stageless kinds (`snapshot`, `event`,
+    /// `actor`, explicit `degraded`): the actor whose event this is rides
+    /// along, like XState's actorRef on every inspection event.
+    pub fn emitted(kind: InspectionKind, actor: Option<String>, detail: Option<String>) -> Self {
+        Self {
+            kind,
+            stage: None,
+            actor,
+            detail,
         }
     }
 
@@ -121,6 +151,10 @@ impl InspectionEvent {
             stage: value
                 .get("stage")
                 .and_then(|s| s.as_str())
+                .map(str::to_string),
+            actor: value
+                .get("actor")
+                .and_then(|a| a.as_str())
                 .map(str::to_string),
             detail: value
                 .get("detail")
@@ -149,10 +183,16 @@ pub fn why_fold(rows: &[serde_json::Value]) -> Result<String, String> {
             ));
         };
         let detail = ev.detail.as_deref().unwrap_or("");
+        let actor = ev
+            .actor
+            .as_deref()
+            .map(|a| format!(" @{a}"))
+            .unwrap_or_default();
         out.push(format!(
-            "{}:{}{}",
+            "{}:{}{}{}",
             ev.kind.as_str(),
             ev.stage.as_deref().unwrap_or("-"),
+            actor,
             if detail.is_empty() {
                 String::new()
             } else {
@@ -228,5 +268,27 @@ mod inspection_events_tests {
         ];
         let err = why_fold(&rows).expect_err("must stop at the gap");
         assert!(err.contains("row 1"), "names the index, got: {err}");
+    }
+
+    #[test]
+    fn source_kinds_event_and_actor_round_trip() {
+        // XState inspection.ts carries six types; event + actor were
+        // missing. Both validate and fold like any other kind.
+        for kind in [InspectionKind::Event, InspectionKind::Actor] {
+            let ev = InspectionEvent::emitted(kind, Some("PiAlpha".into()), None);
+            let v = serde_json::to_value(&ev).expect("serializes");
+            assert_eq!(v["kind"], kind.as_str());
+            assert_eq!(InspectionEvent::validate(&v).expect("valid"), ev);
+        }
+        let digest = why_fold(&[
+            json!({"kind": "event", "actor": "PiAlpha"}),
+            json!({"kind": "actor", "actor": "PiBeta", "detail": "detected"}),
+        ])
+        .expect("folds");
+        assert!(digest.contains("event:- @PiAlpha"), "got: {digest}");
+        assert!(
+            digest.contains("actor:- @PiBeta (detected)"),
+            "got: {digest}"
+        );
     }
 }
