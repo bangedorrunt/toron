@@ -180,7 +180,7 @@ impl super::Backend for MockBackend {
                 program: kind.into(),
                 cwd: None,
             },
-            PaneId(pane_id.into()),
+            PaneId::new(pane_id),
         ));
         Ok(AgentInfo {
             agent: Some(name.into()),
@@ -348,7 +348,7 @@ mod tests {
         let backend = MockBackend::new();
         let mut rx = backend.subscribe(&[]).expect("subscribe");
         backend.emit(BackendEvent::AgentStatusChanged {
-            pane: PaneId("pane-0".into()),
+            pane: PaneId::new("pane-0"),
             agent: Some("PiAlpha".into()),
             status: AgentStatus::Working,
         });
@@ -356,7 +356,7 @@ mod tests {
         assert_eq!(
             evt,
             Some(BackendEvent::AgentStatusChanged {
-                pane: PaneId("pane-0".into()),
+                pane: PaneId::new("pane-0"),
                 agent: Some("PiAlpha".into()),
                 status: AgentStatus::Working,
             })
