@@ -1,13 +1,18 @@
 // governed-by: ADR-0031
 //! Persist-envelope cross-check (ADR-0031 XState persist, bead bd-eg09).
 //!
+//! Relearned from source (`packages/core`): XState core persistence is
+//! snapshot passthrough per logic (`getPersistedSnapshot` /
+//! `restoreSnapshot`) — versioning, write-ahead, and torn-tail handling are
+//! the ENVELOPE's job, which is exactly what journal v2 must define.
+//!
 //! The versioned envelope itself is flywheel's journal v2 scope; toron's
 //! share is the durable contract v2 builds on (receipts `owed→acked→
 //! resulted` monotonicity + bus sqlite as the cross-process share). This
 //! module pins toron's side so the v2 checklist is asserted, not prose:
 //!
 //! - [`EnvelopeRow`]: version-tolerant row shape — a missing `v` reads as 1
-//!   (XState's version-tolerance rule); unknown states never parse.
+//!   (old rows stay readable); unknown states never parse.
 //! - [`fold_strict`]: strict replay — write-ahead ordering (acked/degraded
 //!   need a prior owed for the corr; `resulted` is the explicit verb and may
 //!   create), monotonicity mirroring the store guards (downgrades ignored,
