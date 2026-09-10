@@ -1,6 +1,6 @@
 # ADR-0031: Herdr Runtime Study — Pane/Agent Split, Evidence-Based Detection, Frozen Contracts, Elm Decision Cores, Superlogical-Proof Seams
 
-**Status:** Proposed (awaiting captain word)
+**Status:** Accepted (captain word 2026-09-10: operator message `accepted and close all beads`; all slices S1–S5 plus xstate steals landed green, closed bd-r1si, bd-ucjx, bd-nc5d, bd-i7bh, bd-hie0, bd-mvf1, bd-ii04, bd-eg09)
 **Date:** 2026-09-10
 **Decision-makers:** Captain (bangedorrunt)
 **Extends:** [ADR-0002](adopt-agent-adapter-architecture.md) (backend trait), [ADR-0003](0003-nostr-mailbox-fabric.md) (mailbox fabric), [ADR-0005](0005-orchestration-layer.md) (orchestration tier), [ADR-0014](0014-kind-registry-specification.md) (kind registry), [ADR-0020](0020-nostr-two-plane-cli-and-crew-steering.md) (two-plane surface), [ADR-0027](0027-one-workspace-tick-control-plane.md) (one workspace tick), [ADR-0028](0028-jido-behavior-first-on-wheelhouse-nouns.md) (behavior-first contracts), flywheel [ADR-0012](../../flywheel/docs/decisions/0012-doorbell-plane-independent-runtime.md) (doorbell plane D, accepted rev 3 — this ADR is its toron-side companion; toron carries, doorbell drives, neither duplicates the other)
