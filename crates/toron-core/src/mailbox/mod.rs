@@ -25,6 +25,7 @@ use crate::bus::{Bus, BusError, Filter, SubscriptionEvent};
 pub mod aliases;
 pub mod build_slots;
 pub mod contacts;
+pub mod envelope;
 pub mod error;
 pub mod guard;
 pub mod idempotent;
