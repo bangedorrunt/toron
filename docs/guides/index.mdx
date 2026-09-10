@@ -1,105 +1,55 @@
 ---
-title: The Stack
-description: Flywheel x toron x beads x chiebukuro on herdr. What each tool owns, how they share state, and where to start.
+title: toron
+description: Nostr-native agent coordination. Signed mail on five planes, receipts, rooms, jobs, file reservations, build slots, and a durable workflow engine.
 ---
 
-Four local-first tools turn a directory of terminal agents into a fleet that plans work, claims it, verifies it, and remembers what it learned. No server to rent, no database to provision.
+toron moves signed coordination between agents. Every message, reservation, job, and receipt is a cryptographically signed Nostr event, so coordination survives process death, works across machines, and needs no server of its own: relays default to an empty list (zero egress) and the local bus carries everything.
 
-| Tool | Owns | Binary |
-|---|---|---|
-| **flywheel** | Orchestration: session door, topology classification, spawn, durable loops, workflow compose, cron | `flywheel` |
-| **toron** | Coordination: signed mail, channels, jobs, file reservations, build slots, receipts, durable workflows | `toron` |
-| **br** | The work ledger: beads with dependencies, gate rows, fail-closed closes | `br` |
-| **chiebukuro** | Knowledge and memory: compiled wiki (BM25 + vector), episodic memory, durable map-reduce | `chie` |
-
-**herdr** is the runtime under all of it: a terminal multiplexer that keeps real panes running, classifies agent state (`working`, `blocked`, `idle`, `done`), and survives client detach. flywheel drives herdr panes. Nothing in this stack replaces it.
-
-## How they fit
+flywheel orchestrates on top. br addresses toron for reservations and done-mail. The MCP surface is frozen: 40 tools (38 AM-Rust parity + 2 additive) and 25 resources. New tools or event kinds need an ADR.
 
 ```mermaid
 flowchart TB
-    subgraph H["herdr (runtime)"]
-        P["terminal panes"]
+    subgraph T["toron"]
+        P["plane P: private mail (NIP-17)"]
+        S["plane S: rooms (kind 9)"]
+        J["plane J: jobs (43001-43006)"]
+        N["plane N: presence (20001)"]
+        W["plane W: live watch (NIP-01)"]
     end
-    subgraph F["flywheel (orchestration)"]
-        D["session door: arrive, briefing, decide"]
-        C["crews, loops, compose"]
-    end
-    subgraph T["toron (coordination)"]
-        M["signed mail, channels, jobs"]
-        R["reservations, build slots"]
-    end
-    subgraph B["br (work ledger)"]
-        BD["beads, gates"]
-    end
-    subgraph K["chiebukuro (knowledge)"]
-        W["knowledge plane"]
-        E["memory plane"]
-    end
-    D --> C
-    C -->|"spawn, prompt, interrupt"| P
-    C -->|"claim, gate, close"| BD
-    C -->|"mail, reserve, slot"| T
-    C -->|"compound learnings"| W
-    E -->|"recall at plan time"| C
+    F["flywheel"] -->|"mail, reserve, slot, wait"| T
+    B["br"] -->|"thread = bd id, reservation reason = bd id"| T
 ```
 
-Dependencies run one way: flywheel depends on toron-workflow, toron-workflow on toron-core. br stands alone; the others address it but never embed it. chiebukuro stands alone.
+## Layers
 
-## The shared key: the bead
-
-One `bd-###` id joins all four tools. Work is real when the ledger says so; everything else points at the ledger.
-
-| Artifact | Carries the bead id |
+| Concern | Owned by |
 |---|---|
-| br issue, gate rows, close reason | the ledger row itself |
-| toron mail thread | `--thread bd-###` |
-| toron file reservation | `--reason bd-###` |
-| git work commit | `(bd-###)` in the subject line |
-| flywheel dispatch | `BEAD: bd-###` header on every send |
+| Spawn, loop, steer, coalition, debate | flywheel |
+| Peer mail, threads, reservations, contacts, proofs, build slots | toron |
+| Workflow YAML engine, @mention jobs, durable approvals | toron (fabric); flywheel runs it |
+| Beads | br |
 
-## Start here, operator (once per host)
+`FLYWHEEL_MAIL=toron` wires flywheel to it. With `[mail.toron] url` set, a standalone `toron serve --mcp-http` runs; unset, the mailbox embeds in flywheel. `flywheel toron setup-mcp --flywheel` points flywheel and every harness at the same daemon (`127.0.0.1:18080`).
 
-```bash
-toron key generate --role operator
-toron daemon install && toron daemon start
-toron project ensure /path/to/project
-flywheel toron setup-mcp --flywheel
-flywheel deps
-```
+## Rules that hold everywhere
 
-## Start here, agent (every session)
+1. CLI first, MCP last. Read the tool schema before the first MCP call.
+2. `--since last` is the crash-proof inbox cursor; raw `since_ts` must be RFC3339, never a unix integer.
+3. `unread_only` is accepted and ignored everywhere.
+4. `@Name` triggers a job only when the body has the mention and the CLI sets the `p` tag.
+5. Nothing pushes; agents poll or get woken.
 
-```bash
-export AGENT_NAME=ToronScribe   # your pin; register once with: toron agent bootstrap --project <slug> --as <pin>
-flywheel arrive <project> --as "$AGENT_NAME"
-flywheel briefing "<goal>" --project <project> --json   # then run its argv
-```
+## Pages
 
-The door is not ceremony. `arrive` publishes presence, drains the session-start report (open decisions, unread status, divergence), and claims the captain alias first-come-first-served. The briefing classifier picks the vehicle: open, loop, swarm, or coalition. You run what it returns. The rulebook and its bypass ledger are in [integration](./integration).
-
-## Vocabulary
-
-| Term | Meaning |
+| Page | Read when |
 |---|---|
-| **pin** | Your public name, adjective + noun (`ToronScribe`). Mail `--as`/`--to` take pins. br `--assignee` takes the herdr slug (`flywheel-toron-coder`). |
-| **bead** | One unit of ledgered work. `bd-###`. |
-| **corr** | Correlation id minted by the sender. `toron wait --corr` parks until the receipt lands. Never reuse the thread id. |
-| **plane** | One toron wire surface: P private gift-wrap, S shared rooms, J jobs, N presence, W live watch. |
-| **wave** | Ordering label on beads (`wave-N`). A wave stays held while any lower wave is open. |
-| **stage** | A named prompt template. `send --stage ce-execute` dispatches it. |
-| **compose token** | A `--parts` name that expands a compiled pipeline (`wave-swarm`, `repair-until-verified`, `beads-lifecycle`). |
-| **gate** | A recorded pass row in br that a close requires. Fail-closed: no row, no close. |
-| **VERIFY fence** | One fenced, single-line command in a bead: the command that proves the work. |
-| **gist** | ~350-character summary attached to every chiebukuro search hit. Triage without fetching. |
-| **conclusion** | A memory-plane statement. Not a wiki page until explicitly promoted. |
-
-## Guides
-
-Each project has its own page set, herdr-style: index, quick-start, mechanics, CLI reference, troubleshooting.
-
-1. [flywheel](./flywheel): the door, the classifier, spawn and send, the doorbell, loops, workflows, fleet ops.
-2. [toron](./toron): identity, planes, mail, channels and jobs, reservations, workflow engine, daemon ops.
-3. [beads](./beads): lifecycle, dispatchability, the close ceremony, graph analysis.
-4. [chiebukuro](./chiebukuro): knowledge plane, memory plane, retrieval protocol, health.
-5. [integration](./integration): one work unit end to end, the protocol gates, degraded modes, landing the plane.
+| [quick-start](./quick-start) | First daemon, keys, and project on a host |
+| [identity](./identity) | Keys, passphrases, pins, roles, contacts, the captain alias |
+| [planes](./planes) | The five wire surfaces and what belongs where |
+| [mail](./mail) | Send, inbox, corr, receipts, tags, urgency |
+| [channels-and-jobs](./channels-and-jobs) | Rooms, posts, the job lifecycle, crew steering |
+| [reservations](./reservations) | File leases, conflicts, transfers, build slots |
+| [workflow-engine](./workflow-engine) | YAML workflows and durable approvals |
+| [daemon-ops](./daemon-ops) | Daemon lifecycle, doctor, reconstruction, federation |
+| [cli-reference](./cli-reference) | The command surface |
+| [troubleshooting](./troubleshooting) | Gotchas and failure modes |
