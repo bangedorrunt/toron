@@ -24,7 +24,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::error::{BackendError, BackendErrorCode};
-use super::types::{AgentStatus, BackendEvent, PaneId, PromptLanding};
+use super::types::{AgentStatus, BackendEvent, PaneId, PromptLanding, normalize_herdr_status};
 
 /// herdr socket protocol version this client is verified against (v22,
 /// herdr 0.9.0 — live `herdr api schema --json` reports 22).
@@ -949,11 +949,13 @@ impl super::EventStream for HerdrEventStreamAdapter {
 /// `pane.agent_detected` → [`BackendEvent::AgentDetected`];
 /// `pane.exited` → [`BackendEvent::PaneExited`]; everything else → [`BackendEvent::Raw`].
 fn parse_push(kind: &str, data: &Value) -> BackendEvent {
+    // ADR-0031 S1: PaneId constructed at the adapter edge only; status
+    // enters through the canonical normalizer, never .parse() in reducers.
     let pane = data
         .get("pane_id")
         .and_then(Value::as_str)
-        .map(|s| PaneId(s.to_string()))
-        .unwrap_or_else(|| PaneId(String::new()));
+        .map(PaneId::new)
+        .unwrap_or_else(PaneId::empty);
     let agent = data
         .get("agent")
         .and_then(Value::as_str)
@@ -963,7 +965,7 @@ fn parse_push(kind: &str, data: &Value) -> BackendEvent {
         .get("agent_status")
         .or_else(|| data.get("final_status"))
         .and_then(Value::as_str)
-        .and_then(|s| s.parse().ok())
+        .map(normalize_herdr_status)
         .unwrap_or(AgentStatus::Unknown);
     match kind {
         "pane.agent_status_changed" => BackendEvent::AgentStatusChanged {

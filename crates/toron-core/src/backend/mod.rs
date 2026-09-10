@@ -89,7 +89,9 @@ pub mod tmux;
 pub mod types;
 
 pub use error::{BackendError, BackendErrorCode};
-pub use types::{AgentStatus, BackendEvent, PaneId, PromptLanding, SpawnOptions};
+pub use types::{
+    AgentStatus, BackendEvent, PaneId, PromptLanding, SpawnOptions, normalize_herdr_status,
+};
 
 use std::time::Duration;
 
