@@ -37,6 +37,8 @@ flowchart TD
 - `renew` extends the stored absolute expiry; recomputing from now is a bug.
 - The don't-sweep request is a **guard**, not a DM: `guard install|uninstall` puts the pre-commit hook in the repo (it never clobbers a user hook, and `TORON_GUARD_STRICT=0` is operator-only).
 
+Mechanics worth knowing: leases are kind-30031 addressable events (`d`=`project:path-glob`, NIP-40 expiration, dual-emit scoping), and conflicts are symmetric fnmatch both ways. Force-release is never a NIP-09 delete: the operator signs a kind-30031 `status:revoked` event at the same `(kind, d)` coordinate, and the projection resolves it by key-priority `operator > agent`. An acquire against the declarer's own intent converts intent to held at the same coordinate (must-convert). Status-less 30031s read as `held` for backward compatibility.
+
 ## Build slots
 
 Build slots (kind 30032) serialize heavy builds across agents and crews:
