@@ -261,3 +261,14 @@ not = [{ contains = ["esc to cancel"] }]
 - Reducer zeal: PTY bytes, crypto, and transport stay imperative; forcing them into `tick` would destroy the determinism property this ADR exists to gain.
 - Manifest sprawl: one rule file per backend dialect, capped; generic regexes without `not` guards are rejected in review (herdr's evidence-based tuning loop is mandatory, not advisory).
 - Non-goals: no new kinds/tools/profiles, no TUI work, no remote-persistence work, no Superlogical SDK implementation (stub stays until upstream ships).
+
+---
+
+## 12. Expected benefits if implemented
+
+- **Wakes that can be trusted (A3, S2).** The activity gate plus occupant-pinned waits make a stalled prompt report `stalled`, never silently resubmit, and a replacement process can never satisfy another wait. Fewer duplicate prompts, fewer blind retries compounding them.
+- **Presence that stops lying (A4, S4).** Versioned detection manifests plus the five-state normalizer move lifecycle classification out of inline heuristics into hot-reloadable rules with evidence snapshots. One dialect file per backend, one truth downstream; a new agent kind becomes a TOML file, not a code change.
+- **Closes that mean something (A2).** The done-vs-seen split keeps the ledger close terminal and fail-closed while the captain's copy becomes explicitly per-observer. The "looks compliant" failure class (2026-09-09 solo lane) gets structurally harder, not just procedurally discouraged.
+- **Interchangeable backends (A1, S1, §8).** Opaque IDs plus status normalization quarantine every backend dialect at the adapter edge, so a future backend changes method bodies, never reducers. The swap is proven by replay tests, not by a staging weekend.
+- **Coverage no human writes (A5, S3).** Model-based path generation turns the dispatch core's own transition table into its test suite: illegal transitions are caught by generated paths instead of production incidents, and "same log, same effects" becomes a CI fact alongside the envelope conformance test (S5).
+- **Immediate, zero-risk half (A6, A7).** The AGENTS.md conventions block and VERIFY honesty already landed: every future bead inherits them, and report beads can no longer borrow test gates. That half pays rent from today with no implementation risk.
