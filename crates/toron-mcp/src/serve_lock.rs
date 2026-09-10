@@ -93,14 +93,9 @@ fn pid_is_toron_serve(pid: u32) -> bool {
     // Check cmdline/args for "toron" to avoid PID-reuse false positives.
     // Broad check intentionally matches "toron", "toron_mcp", etc. for test
     // coverage (second_acquire test's holder is the test binary itself).
-    #[cfg(target_os = "linux")]
-    {
-        if let Ok(cmdline) = fs::read(format!("/proc/{pid}/cmdline")) {
-            let text = String::from_utf8_lossy(&cmdline);
-            if text.contains("toron") {
-                return true;
-            }
-        }
+    // The /proc fast path lives in platform/<os>.rs (bd-nc5d).
+    if crate::platform::proc_cmdline_contains(pid, "toron") {
+        return true;
     }
     Command::new("ps")
         .args(["-o", "args=", "-p", &pid.to_string()])

@@ -17,6 +17,7 @@
 //! `~/.config/toron/passphrase` (0600) and the unit sets
 //! `TORON_KEY_PASSPHRASE_FILE` instead of `TORON_KEY_PASSPHRASE`.
 
+use crate::platform::DaemonState;
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -62,133 +63,6 @@ pub fn effective_passphrase() -> String {
     toron_core::config::operator_passphrase()
 }
 
-/// Render the launchd plist (pure — golden-tested).
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-pub fn plist_xml(
-    label: &str,
-    binary: &Path,
-    addr: &str,
-    key_path: &Path,
-    passphrase_file: &Path,
-    out_log: &Path,
-    err_log: &Path,
-) -> String {
-    format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-	<key>Label</key>
-	<string>{label}</string>
-	<key>ProgramArguments</key>
-	<array>
-		<string>{}</string>
-		<string>serve</string>
-		<string>--mcp-http</string>
-		<string>{addr}</string>
-		<string>--no-color</string>
-	</array>
-	<key>RunAtLoad</key>
-	<true/>
-	<key>KeepAlive</key>
-	<dict>
-		<key>SuccessfulExit</key>
-		<false/>
-	</dict>
-	<key>ThrottleInterval</key>
-	<integer>5</integer>
-	<key>StandardOutPath</key>
-	<string>{}</string>
-	<key>StandardErrorPath</key>
-	<string>{}</string>
-	<key>EnvironmentVariables</key>
-	<dict>
-		<key>TORON_OPERATOR_KEY</key>
-		<string>{}</string>
-		<key>TORON_KEY_PASSPHRASE_FILE</key>
-		<string>{}</string>
-		<key>RUST_LOG</key>
-		<string>warn</string>
-	</dict>
-</dict>
-</plist>
-"#,
-        binary.display(),
-        out_log.display(),
-        err_log.display(),
-        key_path.display(),
-        passphrase_file.display(),
-    )
-}
-
-/// Hourly copy-truncate of toron + resonate logs (bd-741i).
-///
-/// Weekly rotation left `resonate.out.log` at 1.3GB (`RUST_LOG=info` doorbell
-/// poll-fail storm). Hourly + 1 MiB threshold caps both daemons. Pure —
-/// golden-tested.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-pub fn logrotate_plist_xml() -> String {
-    let script = r#"for f in "$HOME/.local/state/toron/serve.out.log" "$HOME/.local/state/toron/serve.err.log" "$HOME/.local/state/flywheel/resonate.out.log" "$HOME/.local/state/flywheel/resonate.err.log"; do [ -f "$f" ] || continue; sz=$(stat -f%z "$f" 2>/dev/null || stat -c%s "$f"); if [ "$sz" -gt 1048576 ]; then cp "$f" "$f.1" && : > "$f"; fi; done"#;
-    format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-	<key>Label</key>
-	<string>com.toron.logrotate</string>
-	<key>ProgramArguments</key>
-	<array>
-		<string>/bin/sh</string>
-		<string>-c</string>
-		<string>{script}</string>
-	</array>
-	<key>StartInterval</key>
-	<integer>3600</integer>
-</dict>
-</plist>
-"#
-    )
-}
-
-/// Render the systemd user unit (pure — golden-tested). Only reachable from
-/// linux-gated install paths (and unit tests); macOS builds see it as dead.
-#[cfg_attr(target_os = "macos", allow(dead_code))]
-pub fn systemd_unit(
-    label: &str,
-    binary: &Path,
-    addr: &str,
-    key_path: &Path,
-    passphrase_file: &Path,
-    state_dir: &Path,
-) -> String {
-    let out = state_dir.join("serve.out.log");
-    let err = state_dir.join("serve.err.log");
-    format!(
-        "[Unit]\n\
-         Description={label} — toron Nostr-native agent mailbox daemon\n\
-         After=network-online.target\n\
-         Wants=network-online.target\n\
-         \n\
-         [Service]\n\
-         ExecStart={} serve --mcp-http {addr} --no-color\n\
-         Environment=TORON_OPERATOR_KEY={}\n\
-         Environment=TORON_KEY_PASSPHRASE_FILE={}\n\
-         Environment=RUST_LOG=warn\n\
-         Restart=on-failure\n\
-         RestartSec=5\n\
-         StandardOutput=append:{}\n\
-         StandardError=append:{}\n\
-         \n\
-         [Install]\n\
-         WantedBy=default.target\n",
-        binary.display(),
-        key_path.display(),
-        passphrase_file.display(),
-        out.display(),
-        err.display(),
-    )
-}
-
 /// Read a pidfile into an optional pid (pure — tolerant of junk).
 pub fn read_pidfile(path: &Path) -> Option<u32> {
     let s = std::fs::read_to_string(path).ok()?;
@@ -203,47 +77,12 @@ pub fn addr_alive(addr: &str) -> bool {
     TcpStream::connect_timeout(&sa, Duration::from_millis(2000)).is_ok()
 }
 
-/// How the daemon is currently supervised / running.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DaemonState {
-    /// Running under launchd (macOS).
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-    RunningLaunchd,
-    /// Running under systemd (Linux).
-    #[cfg_attr(target_os = "macos", allow(dead_code))]
-    RunningSystemd,
-    /// Running via pidfile spawn (fallback).
-    RunningPidfile(u32),
-    /// Address responds but no managed pidfile/unit — likely an unmanaged
-    /// `toron serve` (e.g. the flywheel-managed daemon).
-    RunningUnmanaged,
-    Stopped,
-}
-
 /// Detect state: launchd (darwin) / systemd (linux) / pidfile + addr probe.
 pub fn detect_state(label: &str, pidfile: &Path, addr: &str) -> DaemonState {
-    #[cfg(target_os = "macos")]
-    {
-        let uid = current_uid();
-        let out = Command::new("launchctl")
-            .args(["print", &format!("gui/{uid}/{label}")])
-            .output();
-        if let Ok(o) = out
-            && o.status.success()
-        {
-            return DaemonState::RunningLaunchd;
-        }
-    }
-    #[cfg(target_os = "linux")]
-    {
-        let out = Command::new("systemctl")
-            .args(["--user", "is-active", label])
-            .output();
-        if let Ok(o) = out
-            && String::from_utf8_lossy(&o.stdout).trim() == "active"
-        {
-            return DaemonState::RunningSystemd;
-        }
+    // Supervisor probe lives in platform/<os>.rs (bd-nc5d); shared
+    // pidfile + addr probes stay here.
+    if let Some(state) = crate::platform::detect_supervised(label) {
+        return state;
     }
     if let Some(pid) = read_pidfile(pidfile)
         && process_alive(pid)
@@ -301,17 +140,6 @@ pub fn wait_addr(addr: &str, secs: u64) -> bool {
     false
 }
 
-/// Current uid via `id -u` (keeps the crate unsafe-free).
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-pub fn current_uid() -> String {
-    let out = Command::new("id").arg("-u").output();
-    out.ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "501".to_string())
-}
-
 /// Write `~/.config/toron/passphrase` (0600) if absent — the unit references
 /// only this file, never the secret inline. Idempotent.
 pub fn ensure_passphrase_file() -> anyhow::Result<PathBuf> {
@@ -351,187 +179,25 @@ pub fn install(args: &super::cli::DaemonArgs) -> anyhow::Result<()> {
     let addr = args.addr.clone();
     let label = args.label.clone();
 
-    #[cfg(target_os = "macos")]
-    {
-        let plist = plist_xml(
-            &label, &binary, &addr, &key_path, &pass, &_out_log, &_err_log,
-        );
-        let dir = home_launch_agents()?;
-        std::fs::create_dir_all(&dir)?;
-        let plist_path = dir.join(format!("{label}.plist"));
-        std::fs::write(&plist_path, plist)?;
-        let uid = current_uid();
-        let out = Command::new("launchctl")
-            .args(["bootout", &format!("gui/{uid}/{label}")])
-            .output();
-        let _ = out; // absent unit is fine
-        install_logrotate_agent(&dir, &uid)?;
-        let out = Command::new("launchctl")
-            .args([
-                "bootstrap",
-                &format!("gui/{uid}"),
-                plist_path.to_str().unwrap_or_default(),
-            ])
-            .output()?;
-        if !out.status.success() {
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            // "already bootstrapped" is fine (idempotent re-install).
-            if !stderr.contains("already") && !stderr.contains("Bootstrap failed: 17") {
-                anyhow::bail!("launchctl bootstrap failed: {stderr}");
-            }
-        }
-        let out = Command::new("launchctl")
-            .args(["enable", &format!("gui/{uid}/{label}")])
-            .output()?;
-        if !out.status.success() {
-            anyhow::bail!(
-                "launchctl enable failed: {}",
-                String::from_utf8_lossy(&out.stderr)
-            );
-        }
-        let out = Command::new("launchctl")
-            .args(["kickstart", "-k", &format!("gui/{uid}/{label}")])
-            .output()?;
-        if !out.status.success() {
-            anyhow::bail!(
-                "launchctl kickstart failed: {}",
-                String::from_utf8_lossy(&out.stderr)
-            );
-        }
-        println!(
-            "installed + started {label} (plist {})",
-            plist_path.display()
-        );
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        let unit = systemd_unit(&label, &binary, &addr, &key_path, &pass, &state);
-        let dir = home_systemd_user()?;
-        std::fs::create_dir_all(&dir)?;
-        let unit_path = dir.join(format!("{label}.service"));
-        std::fs::write(&unit_path, unit)?;
-        for c in [
-            Command::new("systemctl").args(["--user", "daemon-reload"]),
-            Command::new("systemctl").args(["--user", "enable", &label]),
-            Command::new("systemctl").args(["--user", "start", &label]),
-        ] {
-            let out = c.output()?;
-            if !out.status.success() {
-                anyhow::bail!(
-                    "systemctl {:?} failed: {}",
-                    c.get_args().collect::<Vec<_>>(),
-                    String::from_utf8_lossy(&out.stderr)
-                );
-            }
-        }
-        println!("installed + started {label} (unit {})", unit_path.display());
-    }
-
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    {
-        let _ = (&key_path, &_out_log, &_err_log, &addr);
-        anyhow::bail!("daemon install: unsupported host — use `toron daemon start` (pidfile mode)")
-    }
-
-    Ok(())
+    // Supervised install lives in platform/<os>.rs (bd-nc5d); the prelude
+    // above is shared.
+    let ctx = crate::platform::InstallCtx {
+        label: &label,
+        binary: &binary,
+        addr: &addr,
+        key_path: &key_path,
+        pass: &pass,
+        out_log: &_out_log,
+        err_log: &_err_log,
+        state: &state,
+    };
+    crate::platform::install_supervised(&ctx)
 }
 
 /// Write + bootstrap `com.toron.logrotate` (hourly copy-truncate, bd-741i).
-#[cfg(target_os = "macos")]
-fn install_logrotate_agent(dir: &Path, uid: &str) -> anyhow::Result<()> {
-    let label = "com.toron.logrotate";
-    let path = dir.join(format!("{label}.plist"));
-    std::fs::write(&path, logrotate_plist_xml())?;
-    let _ = Command::new("launchctl")
-        .args(["bootout", &format!("gui/{uid}/{label}")])
-        .output();
-    let out = Command::new("launchctl")
-        .args([
-            "bootstrap",
-            &format!("gui/{uid}"),
-            path.to_str().unwrap_or_default(),
-        ])
-        .output()?;
-    if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        if !stderr.contains("already") && !stderr.contains("Bootstrap failed: 17") {
-            anyhow::bail!("launchctl bootstrap {label} failed: {stderr}");
-        }
-    }
-    Ok(())
-}
-
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-fn home_launch_agents() -> anyhow::Result<PathBuf> {
-    let home = std::env::var("HOME")
-        .map_err(|_| anyhow::anyhow!("HOME unset; cannot locate LaunchAgents"))?;
-    Ok(PathBuf::from(home).join("Library").join("LaunchAgents"))
-}
-
-#[cfg(target_os = "linux")]
-fn home_systemd_user() -> anyhow::Result<PathBuf> {
-    if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME")
-        && !xdg.is_empty()
-    {
-        return Ok(PathBuf::from(xdg).join("systemd").join("user"));
-    }
-    let home = std::env::var("HOME")
-        .map_err(|_| anyhow::anyhow!("HOME unset; cannot locate systemd user units"))?;
-    Ok(PathBuf::from(home)
-        .join(".config")
-        .join("systemd")
-        .join("user"))
-}
-
 /// `uninstall`: stop + remove the unit (idempotent).
 pub fn uninstall(args: &super::cli::DaemonArgs) -> anyhow::Result<()> {
-    let state = args.state_dir.clone().unwrap_or_else(default_state_dir);
-    let label = args.label.clone();
-    #[cfg(target_os = "macos")]
-    {
-        let uid = current_uid();
-        let out = Command::new("launchctl")
-            .args(["bootout", &format!("gui/{uid}/{label}")])
-            .output()?;
-        if !out.status.success() {
-            anyhow::bail!(
-                "launchctl bootout failed: {}",
-                String::from_utf8_lossy(&out.stderr)
-            );
-        }
-        let plist = home_launch_agents()?.join(format!("{label}.plist"));
-        if plist.is_file() {
-            std::fs::remove_file(&plist)?;
-        }
-        println!("uninstalled {label}");
-    }
-    #[cfg(target_os = "linux")]
-    {
-        for c in [
-            Command::new("systemctl").args(["--user", "stop", &label]),
-            Command::new("systemctl").args(["--user", "disable", &label]),
-        ] {
-            let _ = c.output();
-        }
-        let unit = home_systemd_user()?.join(format!("{label}.service"));
-        if unit.is_file() {
-            let _ = std::fs::remove_file(&unit);
-        }
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    {
-        let pidfile = state.join("toron.pid");
-        if let Some(pid) = read_pidfile(&pidfile) {
-            if process_alive(pid) {
-                unsafe { libc::kill(pid as i32, libc::SIGTERM) };
-            }
-        }
-        let _ = std::fs::remove_file(&pidfile);
-        println!("uninstalled {label} (pidfile mode)");
-    }
-    let _ = state;
-    Ok(())
+    crate::platform::uninstall_supervised(args)
 }
 
 /// `start`: install-if-absent, then ensure running (launchctl kickstart /
@@ -566,166 +232,16 @@ pub fn start(args: &super::cli::DaemonArgs) -> anyhow::Result<()> {
         DaemonState::Stopped => {}
     }
 
-    #[cfg(target_os = "macos")]
-    {
-        let uid = current_uid();
-        let out = Command::new("launchctl")
-            .args(["kickstart", "-k", &format!("gui/{uid}/{label}")])
-            .output();
-        if let Ok(o) = out
-            && o.status.success()
-        {
-            println!("started {label} (launchd)");
-            return Ok(());
-        }
-        // Not loaded yet — install (idempotent) then kickstart.
-        install(args)?;
-        let out = Command::new("launchctl")
-            .args(["kickstart", "-k", &format!("gui/{uid}/{label}")])
-            .output()?;
-        if !out.status.success() {
-            anyhow::bail!(
-                "launchctl kickstart failed: {}",
-                String::from_utf8_lossy(&out.stderr)
-            );
-        }
-        println!("started {label} (launchd)");
-        Ok(())
-    }
-    #[cfg(target_os = "linux")]
-    {
-        let out = Command::new("systemctl")
-            .args(["--user", "start", &label])
-            .output()?;
-        if !out.status.success() {
-            install(args)?;
-        }
-        let out = Command::new("systemctl")
-            .args(["--user", "start", &label])
-            .output()?;
-        if !out.status.success() {
-            anyhow::bail!(
-                "systemctl start failed: {}",
-                String::from_utf8_lossy(&out.stderr)
-            );
-        }
-        println!("started {label} (systemd)");
-        Ok(())
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    {
-        spawn_pidfile(&state, &args.addr)?;
-        println!("started {label} (pidfile {})", pidfile.display());
-        Ok(())
-    }
-}
-
-/// Detached pidfile spawn (fallback hosts): double-fork-ish via `setsid`
-/// (Command pre_exec), logs to the state dir.
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn spawn_pidfile(state: &Path, addr: &str) -> anyhow::Result<()> {
-    let binary = std::env::current_exe()?;
-    let out = std::fs::File::create(state.join("serve.out.log"))?;
-    let err = std::fs::File::create(state.join("serve.err.log"))?;
-    let child = Command::new(binary)
-        .args(["serve", "--mcp-http", addr, "--no-color"])
-        .stdout(std::os::unix::process::CommandExt::stdout(out))
-        .stderr(std::os::unix::process::CommandExt::stderr(err))
-        .spawn()?;
-    let pidfile = state.join("toron.pid");
-    std::fs::write(&pidfile, child.id().to_string())?;
-    Ok(())
+    // Supervised start lives in platform/<os>.rs (bd-nc5d).
+    crate::platform::start_supervised(args, &pidfile)
 }
 
 /// `stop`: bootout/systemctl stop/pidfile SIGTERM. Idempotent.
 pub fn stop(args: &super::cli::DaemonArgs) -> anyhow::Result<()> {
     let state = args.state_dir.clone().unwrap_or_else(default_state_dir);
-    let _pidfile = state.join("toron.pid");
-    let label = args.label.clone();
-    #[cfg(target_os = "macos")]
-    {
-        let uid = current_uid();
-        let out = Command::new("launchctl")
-            .args(["bootout", &format!("gui/{uid}/{label}")])
-            .output();
-        if let Ok(o) = out
-            && o.status.success()
-        {
-            // launchd job booted out. The serve process needs a moment to
-            // release the port — probe with a grace window before deciding
-            // a stray unmanaged holder exists (a fresh-bootout socket still
-            // accepting is a teardown race, not a holder).
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-            while addr_alive(&args.addr) && std::time::Instant::now() < deadline {
-                std::thread::sleep(std::time::Duration::from_millis(250));
-            }
-            if !addr_alive(&args.addr) {
-                println!("stopped {label} (launchd)");
-                return Ok(());
-            }
-        }
-        if let Some(pid) = read_pidfile(&_pidfile)
-            && process_alive(pid)
-        {
-            let _ = Command::new("kill").arg(pid.to_string()).output();
-            println!("stopped {label} (pid {pid})");
-            return Ok(());
-        }
-        if addr_alive(&args.addr) {
-            let pid = port_holder_pid(&args.addr);
-            if args.force
-                && let Some(p) = pid
-            {
-                let _ = Command::new("kill").arg(p.to_string()).output();
-                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-                while addr_alive(&args.addr) && std::time::Instant::now() < deadline {
-                    std::thread::sleep(std::time::Duration::from_millis(200));
-                }
-                if addr_alive(&args.addr) {
-                    anyhow::bail!(
-                        "unmanaged pid {p} still holds {} after SIGTERM — kill it manually",
-                        args.addr
-                    );
-                }
-                println!("stopped unmanaged instance (pid {p})");
-                return Ok(());
-            }
-            anyhow::bail!(
-                "{label} not managed (launchd/pidfile) but {} responds (unmanaged pid {}) — \
-                 refusing to kill it; `toron daemon stop --force` to replace it",
-                args.addr,
-                pid.map(|p| p.to_string()).unwrap_or_else(|| "?".into())
-            );
-        }
-        println!("{label} not running");
-        Ok(())
-    }
-    #[cfg(target_os = "linux")]
-    {
-        let out = Command::new("systemctl")
-            .args(["--user", "stop", &label])
-            .output()?;
-        if !out.status.success() {
-            anyhow::bail!(
-                "systemctl stop failed: {}",
-                String::from_utf8_lossy(&out.stderr)
-            );
-        }
-        println!("stopped {label} (systemd)");
-        Ok(())
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    {
-        if let Some(pid) = read_pidfile(&_pidfile) {
-            if process_alive(pid) {
-                let _ = Command::new("kill").arg(pid.to_string()).output();
-                println!("stopped {label} (pid {pid})");
-                return Ok(());
-            }
-        }
-        println!("{label} not running");
-        Ok(())
-    }
+    let pidfile = state.join("toron.pid");
+    // Supervised stop lives in platform/<os>.rs (bd-nc5d).
+    crate::platform::stop_supervised(args, &pidfile)
 }
 
 /// `status`: print the detection result.
@@ -798,79 +314,6 @@ pub fn run_dispatch(args: &super::cli::DaemonArgs) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn plist_golden_shape_and_no_secret_inline() {
-        let xml = plist_xml(
-            "com.toron.serve",
-            Path::new("/usr/local/bin/toron"),
-            "127.0.0.1:18080",
-            Path::new("/Users/x/.config/toron/operator_nsec"),
-            Path::new("/Users/x/.config/toron/passphrase"),
-            Path::new("/Users/x/.local/state/toron/serve.out.log"),
-            Path::new("/Users/x/.local/state/toron/serve.err.log"),
-        );
-        assert!(xml.contains("<string>com.toron.serve</string>"), "label");
-        assert!(xml.contains("<string>--mcp-http</string>"), "http flag");
-        assert!(xml.contains("<string>127.0.0.1:18080</string>"), "addr");
-        assert!(xml.contains("<key>KeepAlive</key>"), "autostart semantics");
-        assert!(
-            xml.contains("<key>SuccessfulExit</key>\n\t\t<false/>"),
-            "bd-serve-double-spawn-oqe6: respawn on failure only — a clean \
-             exit (another instance already serving) must stay dead"
-        );
-        assert!(!xml.contains("<key>KeepAlive</key>\n\t<true/>"));
-        assert!(xml.contains("<key>RunAtLoad</key>"), "run at load");
-        assert!(
-            xml.contains("TORON_KEY_PASSPHRASE_FILE"),
-            "file-based secret"
-        );
-        assert!(
-            !xml.contains("TORON_KEY_PASSPHRASE</key>"),
-            "no inline passphrase env"
-        );
-        assert!(
-            !xml.contains("<string>toron</string>"),
-            "no literal secret value in the unit"
-        );
-    }
-
-    #[test]
-    fn logrotate_plist_is_hourly_and_covers_resonate() {
-        let xml = logrotate_plist_xml();
-        assert!(xml.contains("<string>com.toron.logrotate</string>"));
-        assert!(
-            xml.contains("<key>StartInterval</key>\n\t<integer>3600</integer>"),
-            "hourly, not weekly calendar"
-        );
-        assert!(!xml.contains("StartCalendarInterval"));
-        assert!(xml.contains("resonate.out.log"), "bd-741i: resonate log");
-        assert!(xml.contains("serve.out.log"));
-        assert!(xml.contains("1048576"), "1 MiB copy-truncate threshold");
-    }
-
-    #[test]
-    fn systemd_golden_shape_and_no_secret_inline() {
-        let unit = systemd_unit(
-            "com.toron.serve",
-            Path::new("/usr/local/bin/toron"),
-            "127.0.0.1:18080",
-            Path::new("/home/x/.config/toron/operator_nsec"),
-            Path::new("/home/x/.config/toron/passphrase"),
-            Path::new("/home/x/.local/state/toron"),
-        );
-        assert!(unit.contains(
-            "ExecStart=/usr/local/bin/toron serve --mcp-http 127.0.0.1:18080 --no-color"
-        ));
-        assert!(unit.contains("TORON_KEY_PASSPHRASE_FILE=/home/x/.config/toron/passphrase"));
-        assert!(!unit.contains("TORON_KEY_PASSPHRASE="), "no inline secret");
-        assert!(
-            unit.contains("Restart=on-failure"),
-            "no respawn after clean exit"
-        );
-        assert!(!unit.contains("Restart=always"));
-        assert!(unit.contains("WantedBy=default.target"));
-    }
 
     #[test]
     fn pidfile_read_tolerates_junk() {

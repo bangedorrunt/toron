@@ -9,6 +9,7 @@ mod mailbox_source;
 mod operator;
 mod output;
 mod plane;
+mod platform;
 mod robot;
 mod theme;
 mod tui;
