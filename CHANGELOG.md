@@ -18,6 +18,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Docs
 - ADR-0027 Tick Law sentence: live path is held (grounding leftover table stays historical).
 
+## [1.5.0] — 2026-09-10 ADR-0031 slices S1–S5 plus xstate steals
+
+### Added
+- **ADR-0031 accepted** — herdr runtime study companion to flywheel ADR-0012; all slices landed green (bd-9m16, bd-9l7v).
+- **Opaque `PaneId` plus `normalize_herdr_status` (S1, bd-r1si)** — workspace-qualified ids constructed at the adapter edge only; unknown dialects fail safe to `Unknown`, which never proves completion.
+- **Activity-gated, occupant-pinned `prompt_wait` (S2, bd-i7bh)** — 5s activity gate, `Stalled` distinct from `Timeout`, blocked fail-fast with zero bytes sent, abort-first plus mid-wait-abort-wins (bd-p71i).
+- **Pure dispatch decision core (S3, bd-hie0)** — `tick(Model, Msg) -> (Model, Vec<Effect>)`, named `Guard` and/or/not combinators, parameterized effects, serializable `machine_config`; std plus serde only, import-fenced.
+- **Model-based path harness (bd-mvf1)** — BFS shortest per reachable state plus depth-capped DFS simple paths, all edges tick-derived (41 states / 41 shortest / 501 simple); guard-bypass caught on 56 transition-cover paths.
+- **Typed inspection taxonomy (bd-ii04, bd-p71i)** — six XState source kinds plus toron `degraded`, actorRef analog on every event, `STAGE_MAP` covering all seven journal stages, `why_fold` that stops loudly at gaps.
+- **Persist envelope cross-check (bd-eg09)** — version-tolerant `EnvelopeRow` (missing `v` reads as 1), strict `fold_strict` (write-ahead, monotonic, seq-continuity), live-store pins.
+- **Frozen method-shapes fixture (S5, bd-ucjx)** — 40 tools plus 25 resources pinned in `tool-method-shapes-v1.json`; drift without regen fails red (proven on a live trial).
+- **RUST PRACTICES in AGENTS.md** — pure decision cores, platform isolation, multiplicative perf, frozen contracts, test constructors, VERIFY honesty.
+
+### Changed
+- **Platform extraction (bd-nc5d)** — OS-gated blocks moved verbatim out of `daemon.rs`/`serve_lock.rs` into `platform/<os>.rs`; both files carry zero `cfg(target_os)`. Behavior-preserving.
+- Bump `toron-core`/`toron-workflow`/`toron-mcp`/`toron-cli` 1.4.0 → 1.5.0.
+
 ## [1.3.1] — 2026-09-01 R-E2 kinds + inbox e2e
 
 ### Added
