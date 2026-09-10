@@ -33,7 +33,7 @@ Hard rules: do not gift-wrap a room post; do not write kind 42 (ingest only, lik
 
 ## Watch (W)
 
-`watch` with no flag is a 1-second SQLite snapshot: a debug surface. `watch --live` is a real `subscribe_trusted` subscription and what the doorbell uses. Default watched kinds include 20001 and 30013. `watch --once --timeout-ms N` exits on the first match: the crew-steering doorbell. `wait --corr <id>` is subscribe-until-receipt over the same subscription plus the receipt store.
+`watch` with no flag is a 1-second SQLite snapshot: a debug surface. `watch --live` is a real `subscribe_trusted` subscription and what the doorbell uses. The default watched kinds are `9,7,39002,43001,20001` (a contract test pins this set; if it drifts, the dispatcher goes deaf to crew changes). `watch --once --timeout-ms N` exits on the first match: the crew-steering doorbell. `wait --corr <id>` is subscribe-until-receipt over the same subscription plus the receipt store.
 
 ## Reaction events
 

@@ -42,3 +42,7 @@ Recovery needs exactly one of two survivors: the git archive or the bus replay. 
 ## Configuration
 
 `toron config` prints the effective configuration. Precedence: flags, then env, then project, then user, then system. `backend list|status|default` selects the transport backend; `project ensure <slug>|list` manages kind-30010 project manifests (operator key required).
+
+## Projects and products
+
+`project ensure <slug>` publishes the kind-30010 project manifest (operator key required). A **product** (kind-30011) groups projects for cross-project fan-out: `ensure_product`, then `products_link` to attach projects, then `search_messages_product`, `fetch_inbox_product`, and `summarize_thread_product` fan the inbox and thread views across every member project. The flywheel side of the same move is `flywheel xproj` (contact + product). Privileged product ops and force-release fail loud without the operator key configured.
