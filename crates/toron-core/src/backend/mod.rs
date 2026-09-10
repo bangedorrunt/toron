@@ -87,11 +87,13 @@ pub mod herdr;
 pub mod mock;
 pub mod tmux;
 pub mod types;
+pub mod wait;
 
 pub use error::{BackendError, BackendErrorCode};
 pub use types::{
     AgentStatus, BackendEvent, PaneId, PromptLanding, SpawnOptions, normalize_herdr_status,
 };
+pub use wait::{ACTIVITY_GATE_MS, PromptHost, PromptTarget, WaitOutcome, prompt_wait};
 
 use std::time::Duration;
 
