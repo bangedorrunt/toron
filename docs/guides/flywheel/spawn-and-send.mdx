@@ -1,0 +1,52 @@
+---
+title: Spawn and send
+description: Pins, profiles, strict model routing, spawn verification, and dispatch semantics with receipts.
+---
+
+## Names
+
+A **pin** (adjective + noun, `DustySparrow`) is the public mail name. `flywheel mail whois <project> <name>` resolves pin to npub. A spawned crew member gets a unique pin drawn at spawn, registered in `agent-names.json` as `mail_identity`, and injected into the pane; crews never self-register a second name.
+
+Composed names pass through unhashed: `crew-<workflow>-<role>` and `flywheel-<base>-<profile>` are legal in `--as`/`--to` as-is. A raw harness pane with no registry entry is addressable by its agent kind (`--to grok`) or its pane id; the send error lists every raw pane as `kind (pane_id)`. Never `--to coder1`: the seq-1 grammar is invalid, the first agent of a profile has no suffix. Unregistered free strings fail loud; there is no silent hash rewrite.
+
+The tracker uses different names: br claims take the herdr slug (`flywheel-toron-coder`), never a pin.
+
+## Profiles and spawn
+
+```bash
+flywheel profile list
+flywheel spawn <project> --profile coder --count 2 --join-channel steer-bd-z2d0
+```
+
+Unsure of the role: list first. Bare harness flags (`--oc/--pi/--gk`) count only under an explicit captain harness constraint, recorded in the trail. `--join-channel` auto-joins every spawned pin at pane creation (join-before-post: a non-member post fails loud and names the remedy).
+
+Spawn fails closed:
+
+- `launch_pending` is not idle. Wait; never add a second harness.
+- After settle, exit 1 if any pane is missing, empty-named, or wrong-named.
+- `--retire-orphans` is opt-in; default never silently reaps.
+- `flywheel status` may briefly show `workspaces: []` after a verified spawn. Trust the spawn verification; take names from the send error's `available:` list or `herdr workspace list`.
+
+Panes are peer-aware by default (`integrations/peer-aware.md.tpl`). Opt out per spawn with `--no-peer-aware`; never pass `--peer-aware`.
+
+## Model routing (strict)
+
+Registry keys are composite `provider/model`, for example `[models."opencode-go/deepseek-v4-flash"]`. `Profile.provider` pins the composite key; bare ids fall back to the default provider (user-file entries first, else alphabetically first). `resolve_strict` adds the prefix and enforces `caps`; an unregistered id or a caps-excluded harness fails the spawn and names the fix (`flywheel model add <id> --provider <p>`). Nothing bypasses the registry.
+
+Compiled slots: `cheap` (opencode/big-pickle), `standard` (pi + muse-spark), `premium` (omp + glm, fallback grok). The grok harness runs only its own proprietary model; grok models are available on pi, omp, and opencode. Dotted ids need quotes: `[models."glm-5.2"]`.
+
+Bare `spawn --model <id> [--provider <p>]` is the lenient fallback for spawns without a named profile; `--provider` requires `--model`.
+
+## Send semantics
+
+```bash
+flywheel send <p> --to <pin> --stage ce-execute --param bead=bd-z2d0 --param scope=crates/x "<note>"
+```
+
+Stage payloads substitute `{{k}}` slots from repeatable `--param k=v`. Reserved slots: `{{bead}}`, `{{scope}}`, `{{exit}}`, `{{channel}}`, `{{pin}}`, `{{report_file}}`. The wave DISPATCH adds `--param learnings=<paths>` when the grounding gate matched. Missing required params exit nonzero and name the slot. Zero params renders byte-identical to the unparameterized prompt. Message text alongside `--stage` appends after the rendered stage; a `--param` with no matching slot warns and is ignored. Every send headers the bound bead (`BEAD: <id>`) or states none is bound. Project-tier `.flywheel/stages.toml` resolves in CLI sends.
+
+`send` prepends the target's profile preamble plus a skill-load prefix on first dispatch. Unprofiled targets stay raw. `--raw` is for nudges and mail wakes only: a raw brief drops the stage scaffold, and the missing-close stalls are the documented result. Coder execution is `--stage ce-execute`; scout exploration is `--stage fresh-eyes-explore`.
+
+## The send receipt
+
+The send JSON reports `dispatched: true` plus `prior_status` (herdr status at target time). `prior_status: idle` is not a miss: the brief landed while the target was idle. `landed: true` appears only after `--wait`/`--confirm`. Exit 0 with `dispatched` is success for fire-and-forget. Never probe with `READY?`. Never interrupt an agent herdr shows `working`; interrupt of a working agent needs `--force`.

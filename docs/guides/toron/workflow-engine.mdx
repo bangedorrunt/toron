@@ -1,0 +1,36 @@
+---
+title: The workflow engine
+description: YAML workflows as signed events. Durable approvals, @mention triggers, and the action vocabulary.
+---
+
+toron runs YAML workflows as a standalone fabric; orchestration (catalogs, cron, crews) belongs to flywheel. Each run is a kind-46xxx event and a Resonate promise, which is what makes a suspended run survive a crash.
+
+```bash
+toron workflow lint <file.yaml>
+toron workflow validate <file.yaml>
+toron workflow dry-run <file.yaml>
+toron workflow run <file.yaml>
+toron workflow invoke <name>
+```
+
+## Durability
+
+`request_approval` suspends the run, writes state, and exits. The run resumes when the approval lands, even across a daemon restart, because the Resonate promise and the signed kind-46xxx event together reconstruct position. This is the difference between toron workflows and a shell script: the approval gate is a checkpoint, not a blocking loop.
+
+## Actions
+
+| Action | Notes |
+|---|---|
+| `send_message` | Project mail. |
+| `send_dm` | Plane P. |
+| `react` | Kind 7 on a channel post. |
+| `dispatch_job` | Creates a plane J job; supports `phase:` for per-harness mechanics. |
+| `call_webhook` | SSRF-guarded, including IPv4-mapped IPv6 (`::ffff:a.b.c.d`). |
+| `request_approval` | Durable suspension; resumes on approval. |
+| `delay` | Timed pause; a message producer, not a blocked thread. |
+
+## Triggers
+
+`@name` in content plus a `p` tag creates a kind-43001 job; a claimed job can drive a workflow (`reaction_added` from `toron react` is the other common trigger). The job lifecycle and the crew-steering recipe live in [channels-and-jobs](./channels-and-jobs).
+
+Author or debug YAML only with the engine reference at hand (`references/workflow-engine.md` in the toron skill); the schema is typed and linted, and `dry-run` previews without dispatch.

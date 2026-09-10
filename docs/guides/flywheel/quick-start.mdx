@@ -1,0 +1,57 @@
+---
+title: flywheel quick start
+description: Bootstrap the fleet on a host, enter through the session door, and run your first dispatch.
+---
+
+## Once per host
+
+```bash
+toron daemon start                      # mailbox + MCP on 127.0.0.1:18080
+flywheel toron setup-mcp --flywheel     # point flywheel and harnesses at the same daemon
+flywheel deps                           # toolchain health
+```
+
+`flywheel preflight` checks herdr socket, resonate, operator key, toron mail, and standing orders. Fix FAILs before fleet work; the loop and compose engine need resonate (`http://localhost:8001`).
+
+## Every session
+
+```bash
+export AGENT_NAME=DustySparrow          # adjective + noun pin
+flywheel arrive <project> --as "$AGENT_NAME"
+flywheel briefing "<goal>" --project <project> --json
+```
+
+Run the proposal's argv (`--commit` accepts and executes). The four normal shapes:
+
+| Pattern | When | Command |
+|---|---|---|
+| **Loop work** | beads exist | `flywheel loop-mode run <p> --work --on-blocked mail` |
+| **Steer** | greenfield, autonomous | `flywheel steer "<objective>" --project <p>` |
+| **Coalition** | multi-crew, shared files | `flywheel coalition form <goal> --crews <squad> --as <captain>` |
+| **Spawn-send** | one agent, one task | `flywheel spawn <p> --profile <role>`, then `flywheel send <p> --to <name> "<msg>"` |
+
+## First swarm
+
+```bash
+flywheel workflow compose "ship the parser fix" --parts wave-swarm --run --crew 3
+```
+
+Lint is fail-stop, the crew infers from unique roles, panes spawn, stages dispatch, the run reaps, and artifacts land under `flywheel artifacts <run_id>`. `--crew N` is total panes, capped at `crew.max` (default 5).
+
+## First loop
+
+```bash
+flywheel loop-mode run <project> --work
+```
+
+The loop polls `br ready`, claims dispatchable beads (VERIFY fence + principles present), dispatches coders with `--stage ce-execute`, and mails the captain on blocks. Crash-resume is the same command. A beadless `--work` loop resolves `complete` immediately: create lane beads first.
+
+## Monitor and stop
+
+```bash
+flywheel watch <p> --until blocked
+flywheel loop-mode run <p> --status
+flywheel runs pending
+flywheel mail digest <p> --all
+flywheel kill <p> --drain      # graceful: agents finish their VERIFY fences
+```
