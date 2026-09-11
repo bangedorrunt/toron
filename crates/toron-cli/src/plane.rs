@@ -1195,11 +1195,13 @@ fn state_str(state: &PresenceState) -> &'static str {
     }
 }
 
-/// CLI-side presence projection path (`{data_dir}/presence.jsonl`). The bus
+/// CLI-side presence projection path (`<root>/presence.jsonl`). The bus
 /// never stores 20001 (ephemeral contract); this last-wins file lets a
 /// separate process read another process's heartbeat within the TTL.
+/// bd-m5ym: the Mailbox data_dir is `<root>/projects` in production, so the
+/// root is lifted via `mailbox_root` — never `projects/presence.jsonl`.
 fn presence_file(mailbox: &Mailbox) -> PathBuf {
-    mailbox.data_dir().join("presence.jsonl")
+    toron_core::config::mailbox_root(mailbox.data_dir()).join("presence.jsonl")
 }
 
 /// Load the presence projection: last heartbeat per npub, newest ts wins.
