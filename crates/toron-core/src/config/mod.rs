@@ -89,6 +89,22 @@ pub fn durable_data_dir() -> PathBuf {
     resolve_data_root(&DataRootEnv::from_ambient())
 }
 
+/// Root-level file dir for a mailbox `data_dir` (bd-m5ym).
+///
+/// Production mailboxes are wired with `data_dir = <root>/projects`
+/// (the `Mailbox` treats its `data_dir` as the parent of project roots),
+/// but root-level files (`serve.pid`, `presence.jsonl`, `index.sqlite`)
+/// belong at `<root>/`. Demo/test mailboxes use `data_dir` as the root
+/// itself, so it is returned unchanged.
+pub fn mailbox_root(data_dir: &std::path::Path) -> PathBuf {
+    if data_dir.file_name().map(|n| n == "projects").unwrap_or(false)
+        && let Some(parent) = data_dir.parent()
+    {
+        return parent.to_path_buf();
+    }
+    data_dir.to_path_buf()
+}
+
 /// The durable data-root layout (ADR-0007 D3).
 ///
 /// `root` is the mailbox data dir: project roots hang directly off it as
@@ -446,6 +462,25 @@ mod tests {
             resolve_passphrase(None, None, &candidates),
             "toron",
             "whitespace-only file is ignored"
+        );
+    }
+
+    #[test]
+    fn mailbox_root_lifts_projects_to_parent() {
+        // bd-m5ym: production Mailbox data_dir is <root>/projects;
+        // root-level files belong at <root>/.
+        assert_eq!(
+            mailbox_root(&PathBuf::from("/data/toron/projects")),
+            PathBuf::from("/data/toron")
+        );
+        // Demo/test roots pass through unchanged.
+        assert_eq!(
+            mailbox_root(&PathBuf::from("/tmp/toron-mcp-demo-123")),
+            PathBuf::from("/tmp/toron-mcp-demo-123")
+        );
+        assert_eq!(
+            mailbox_root(&PathBuf::from("/tmp/toron-cli-plane-123")),
+            PathBuf::from("/tmp/toron-cli-plane-123")
         );
     }
 
