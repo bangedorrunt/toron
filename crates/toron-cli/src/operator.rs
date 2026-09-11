@@ -806,6 +806,7 @@ pub fn robot_tool_name(command: &Command) -> &'static str {
         Command::Mail(MailCommand::Search(_)) => "mail.search",
         Command::Mail(MailCommand::ThreadSummarize(_)) => "mail.thread_summarize",
         Command::Mail(MailCommand::Whois(_)) => "mail.whois",
+        Command::AckSla(_) => "mail.ack_sla",
         Command::Reserve(ReserveCommand::Acquire(_)) => "reserve.acquire",
         Command::Reserve(ReserveCommand::Conflicts(_)) => "reserve.conflicts",
         Command::Reserve(ReserveCommand::Renew(_)) => "reserve.renew",

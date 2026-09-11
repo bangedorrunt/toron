@@ -21,7 +21,8 @@ use toron_core::mailbox::{
 use toron_mcp::ToJson;
 
 use crate::cli::{
-    AgentCommand, ContactCommand, GuardCommand, MailCommand, PolicyArg, ReserveCommand, SlotCommand,
+    AckSlaArgs, AgentCommand, ContactCommand, GuardCommand, MailCommand, PolicyArg, ReserveCommand,
+    SlotCommand,
 };
 use crate::mailbox_source::DaemonClient;
 
@@ -467,6 +468,32 @@ pub async fn run_agent_daemon(dc: &DaemonClient, cmd: &AgentCommand) -> anyhow::
             }))
         }
     }
+}
+
+/// Ack-SLA scan+publish (bd-0zcr.2 G1): the CLI verb over the mailbox
+/// primitive — one `ack-sla-expired` wake per overdue ack-required post.
+/// Prints the expired post ids so the doorbell daemon can close its G1 gap.
+pub async fn run_ack_sla(mailbox: &Mailbox, args: &AckSlaArgs) -> anyhow::Result<()> {
+    let expired = mailbox
+        .check_ack_sla_expired(&args.project, args.sla_secs)
+        .await?;
+    print_json(&json!({
+        "project": args.project,
+        "sla_secs": args.sla_secs.unwrap_or(30 * 60),
+        "expired": expired,
+        "count": expired.len(),
+    }))
+}
+
+/// Daemon arm of `run_ack_sla`: no daemon MCP tool exists (ADR-0020 wave 1
+/// freeze: CLI-only nouns stay CLI-only), so the scan runs against the
+/// shared durable XDG root the daemon itself uses — the same store, never
+/// a second one. SLA truth is sqlite (`message_reads` / `receipts`), never
+/// process-local state, so the cross-process read is exact.
+pub async fn run_ack_sla_daemon(_dc: &DaemonClient, args: &AckSlaArgs) -> anyhow::Result<()> {
+    eprintln!("toron ack-sla: no daemon tool; scanning the shared durable root directly");
+    let mb = toron_mcp::demo_mailbox().await?;
+    run_ack_sla(&mb, args).await
 }
 
 pub async fn run_reserve(mailbox: &Mailbox, cmd: &ReserveCommand) -> anyhow::Result<()> {

@@ -105,6 +105,11 @@ pub enum Command {
     #[command(subcommand)]
     Mail(MailCommand),
 
+    /// Ack-SLA scan+publish (bd-0zcr.2 G1): emit one `ack-sla-expired` wake
+    /// per overdue ack-required post and print the expired ids. CLI-only
+    /// (no new MCP tool, ADR-0020 wave 1 freeze).
+    AckSla(AckSlaArgs),
+
     /// File reservations: acquire/conflicts/renew/release/force-release.
     #[command(subcommand)]
     Reserve(ReserveCommand),
@@ -650,6 +655,18 @@ pub struct MailThreadSummarizeArgs {
     /// LLM model id (llm_mode only).
     #[arg(long)]
     pub llm_model: Option<String>,
+}
+
+/// Args for `toron ack-sla` (bd-0zcr.2 G1): scan+publish overdue ack wakes.
+#[derive(Debug, Args)]
+pub struct AckSlaArgs {
+    /// Project slug.
+    #[arg(long, required = true)]
+    pub project: String,
+    /// Ack SLA in seconds (default 1800: posts older than this with
+    /// ack_required + high/urgent importance and no receipt get a wake).
+    #[arg(long)]
+    pub sla_secs: Option<u64>,
 }
 
 #[derive(Debug, Subcommand)]

@@ -31,6 +31,11 @@
       "name": "mail"
     },
     {
+      "args": "--project <PROJECT>, --sla-secs <SLA_SECS>",
+      "description": "Ack-SLA scan+publish (bd-0zcr.2 G1): emit one `ack-sla-expired` wake per overdue ack-required post and print the expired ids. CLI-only (no new MCP tool, ADR-0020 wave 1 freeze)",
+      "name": "ack-sla"
+    },
+    {
       "args": "acquire, conflicts, renew, release, force-release, request-release, respond, transfer",
       "description": "File reservations: acquire/conflicts/renew/release/force-release",
       "name": "reserve"
@@ -141,7 +146,7 @@
       "name": "role"
     }
   ],
-  "generated_at": "2026-09-06T10:13:29Z",
+  "generated_at": "2026-09-11T08:49:03Z",
   "resources": [
     {
       "description": "List projects known to toron.",
@@ -4385,5 +4390,5 @@
       "parity": "AM-Rust 38-tool surface"
     }
   ],
-  "toron_version": "1.3.2"
+  "toron_version": "1.5.0"
 }

@@ -128,6 +128,7 @@ fn run(cli: &Cli) -> anyhow::Result<ExitCode> {
             ExitCode::SUCCESS
         }
         Command::Mail(_)
+        | Command::AckSla(_)
         | Command::Reserve(_)
         | Command::Slot(_)
         | Command::Contact(_)
@@ -324,6 +325,9 @@ async fn run_robot(command: &Command) -> anyhow::Result<()> {
         (crate::mailbox_source::MailboxSource::Daemon(dc), Command::Agent(cmd)) => {
             robot::run_agent_daemon(dc, cmd).await
         }
+        (crate::mailbox_source::MailboxSource::Daemon(dc), Command::AckSla(cmd)) => {
+            robot::run_ack_sla_daemon(dc, cmd).await
+        }
         (crate::mailbox_source::MailboxSource::Embedded(mb), Command::Mail(cmd)) => {
             robot::run_mail(mb, cmd).await
         }
@@ -341,6 +345,9 @@ async fn run_robot(command: &Command) -> anyhow::Result<()> {
         }
         (crate::mailbox_source::MailboxSource::Embedded(mb), Command::Agent(cmd)) => {
             robot::run_agent(mb, cmd).await
+        }
+        (crate::mailbox_source::MailboxSource::Embedded(mb), Command::AckSla(cmd)) => {
+            robot::run_ack_sla(mb, cmd).await
         }
         _ => anyhow::bail!("not a robot command"),
     };
