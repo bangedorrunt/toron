@@ -105,3 +105,4 @@
 {"id":105,"issue_id":"bd-qfai","from_status":"open","to_status":"closed","status_revision":0,"gate":"command-verified","provider":"QuietAnvil","passed":true,"recorded_by":"bangedorrunt","recorded_at":"2026-09-10 17:22:00"}
 {"id":106,"issue_id":"bd-qfai","from_status":"open","to_status":"closed","status_revision":0,"gate":"triage-verified","provider":"QuietAnvil","passed":true,"recorded_by":"bangedorrunt","recorded_at":"2026-09-10 17:22:16"}
 {"id":107,"issue_id":"bd-m5ym","from_status":"in_progress","to_status":"closed","status_revision":968,"gate":"unit-test-verified","provider":"assistant","passed":true,"recorded_by":"bangedorrunt","recorded_at":"2026-09-11 10:15:40"}
+{"id":108,"issue_id":"bd-oyzi","from_status":"open","to_status":"closed","status_revision":0,"gate":"unit-test-verified","provider":"TealDune","passed":true,"recorded_by":"bangedorrunt","recorded_at":"2026-09-11 11:22:36"}
