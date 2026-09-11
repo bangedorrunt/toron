@@ -43,7 +43,7 @@ Child maps: [toron-core](crates/toron-core/AGENTS.md) ·
 |------|----------|
 | Mail send/inbox/ack | `crates/toron-core/src/mailbox/` (`MailSurface`, `MessageId`) — `mail send` now carries `--corr/--wake/--priority/--audience/--result-path/--verdict` via `extra_tags` (ADR-0027 E2; `--verdict approve|deny` is ADR-0028 E4, kfo6) |
 | Channels / jobs / presence (ADR-0020) | `crates/toron-workflow/src/{channels,jobs}.rs`, `crates/toron-core/src/nostr/presence.rs`, CLI `toron channel\|job\|react\|presence\|watch` |
-| Wait / receipts / roles (ADR-0027) | `crates/toron-core/src/mailbox/{receipts.rs,send_tags.rs,identity.rs}`, CLI `toron wait --corr` (E9), `toron watch --live` (E7), `toron receipt get\|list\|set` (E2: `get/list` read, `set --state resulted` explicit verb), `toron role pin\|list\|clear` (E4) |
+| Wait / receipts / roles (ADR-0027) | `crates/toron-core/src/mailbox/{receipts.rs,send_tags.rs,identity.rs}`, CLI `toron wait --corr` (E9), `toron watch --live` (E7), `toron receipt get\|list\|set` (E2: `get/list` read, `set --state resulted` explicit verb), `toron role pin\|list\|clear` (E4), `toron ack-sla --project` (ack-SLA scan+publish, CLI-only) |
 | Gift-wrap / kinds | `crates/toron-core/src/nostr/` |
 | Bus / federation | `crates/toron-core/src/bus/` |
 | Git archive | `crates/toron-core/src/archive/git.rs` |
