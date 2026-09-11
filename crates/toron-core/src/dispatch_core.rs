@@ -129,6 +129,9 @@ impl Guard {
         Guard::Or(Box::new(a), Box::new(b))
     }
 
+    // Named combinator (not `std::ops::Not`): and/or/not stay symmetric
+    // constructors so tick arms read uniformly.
+    #[allow(clippy::should_implement_trait)]
     pub fn not(a: Guard) -> Guard {
         Guard::Not(Box::new(a))
     }

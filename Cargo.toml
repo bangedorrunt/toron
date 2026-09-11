@@ -33,7 +33,6 @@ uninlined_format_args = { level = "allow", priority = 1 }
 useless_let_if_seq = { level = "allow", priority = 1 }
 format_push_string = { level = "allow", priority = 1 }
 # Stylistic nursery/pedantic lints that don't reflect real defects
-assert_is_empty = { level = "allow", priority = 1 }
 option_if_let_else = { level = "allow", priority = 1 }
 map_unwrap_or = { level = "allow", priority = 1 }
 similar_names = { level = "allow", priority = 1 }
@@ -62,7 +61,6 @@ items_after_statements = { level = "allow", priority = 1 }
 iter_on_single_items = { level = "allow", priority = 1 }
 iter_with_drain = { level = "allow", priority = 1 }
 literal_string_with_formatting_args = { level = "allow", priority = 1 }
-manual_assert_eq = { level = "allow", priority = 1 }
 manual_is_variant_and = { level = "allow", priority = 1 }
 manual_let_else = { level = "allow", priority = 1 }
 manual_string_new = { level = "allow", priority = 1 }
@@ -88,7 +86,6 @@ unnecessary_debug_formatting = { level = "allow", priority = 1 }
 unnested_or_patterns = { level = "allow", priority = 1 }
 unreadable_literal = { level = "allow", priority = 1 }
 unused_async = { level = "allow", priority = 1 }
-unused_async_trait_impl = { level = "allow", priority = 1 }
 unused_self = { level = "allow", priority = 1 }
 use_self = { level = "allow", priority = 1 }
 used_underscore_binding = { level = "allow", priority = 1 }
