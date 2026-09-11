@@ -97,7 +97,10 @@ pub fn durable_data_dir() -> PathBuf {
 /// belong at `<root>/`. Demo/test mailboxes use `data_dir` as the root
 /// itself, so it is returned unchanged.
 pub fn mailbox_root(data_dir: &std::path::Path) -> PathBuf {
-    if data_dir.file_name().map(|n| n == "projects").unwrap_or(false)
+    if data_dir
+        .file_name()
+        .map(|n| n == "projects")
+        .unwrap_or(false)
         && let Some(parent) = data_dir.parent()
     {
         return parent.to_path_buf();

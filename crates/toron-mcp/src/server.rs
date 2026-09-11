@@ -444,8 +444,7 @@ pub async fn serve_stdio() -> anyhow::Result<()> {
     let (mailbox, trigger_rx) = demo_mailbox_with_trigger().await?;
     // bd-m5ym: the Mailbox data_dir is <root>/projects in production;
     // the serve lock is a root-level file (<root>/serve.pid).
-    let _lock =
-        crate::serve_lock::acquire(&toron_core::config::mailbox_root(mailbox.data_dir()))?;
+    let _lock = crate::serve_lock::acquire(&toron_core::config::mailbox_root(mailbox.data_dir()))?;
     spawn_mail_trigger_host(mailbox.clone(), trigger_rx);
     let server = ToronServer::new().with_mailbox(mailbox);
     let running = server.serve(rmcp::transport::stdio()).await?;
@@ -515,8 +514,7 @@ pub async fn serve_http(bind_addr: &str) -> anyhow::Result<()> {
     // a flywheel sidecar `toron serve --mcp-http <other-port>` cannot open
     // a parallel SQLite pool against the live mailbox.
     // bd-m5ym: lock lives at the data root, not <root>/projects/.
-    let _lock =
-        crate::serve_lock::acquire(&toron_core::config::mailbox_root(mailbox.data_dir()))?;
+    let _lock = crate::serve_lock::acquire(&toron_core::config::mailbox_root(mailbox.data_dir()))?;
     let listener = match tokio::net::TcpListener::bind(bind_addr).await {
         Ok(listener) => listener,
         Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
