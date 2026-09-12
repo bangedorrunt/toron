@@ -403,7 +403,10 @@ fn stamp_bootstrap_pane(
         return None;
     }
     match toron_core::backend::herdr::HerdrBackend::connect(None) {
-        Ok(backend) => match backend.client().pane_report_metadata(&pane_id, pin, project, npub) {
+        Ok(backend) => match backend
+            .client()
+            .pane_report_metadata(&pane_id, pin, project, npub)
+        {
             Ok(_) => Some(pane_id),
             Err(e) => {
                 eprintln!("toron: pane stamp skipped ({e})");
@@ -506,7 +509,10 @@ pub async fn run_agent_daemon(dc: &DaemonClient, cmd: &AgentCommand) -> anyhow::
                 args.pane_id.clone(),
                 &args.agent,
                 &args.project,
-                registration.get("npub").and_then(Value::as_str).unwrap_or_default(),
+                registration
+                    .get("npub")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
             );
             print_json(&json!({
                 "agent": args.agent,
@@ -1700,7 +1706,7 @@ mod captain_open_mode_tests {
 #[cfg(test)]
 mod daemon_roster_revocation_tests {
     use super::*;
-use serde_json::{Value, json};
+    use serde_json::json;
 
     const HOLDER: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const OPERATOR: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
