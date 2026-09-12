@@ -143,6 +143,136 @@ pub fn corr_for_effect(effect_key: &str) -> String {
     effect_key.to_string()
 }
 
+// ---------------------------------------------------------------------------
+// Idempotent cleanup + retention policy (ADR-0032 Spec 8.2, bd-v139.3).
+//
+// Cleanup is a fixed set of host effects (never a user-authored undo DSL):
+// each attempt journals under its own stable key, retries converge without
+// touching the original failure, and rollback of completed external work is
+// never claimed.
+// ---------------------------------------------------------------------------
+
+/// The fixed cleanup set (ADR-0032 Spec 8.2): lease release, bounded
+/// captain evidence, bead comment. Nothing else is a cleanup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CleanupKind {
+    ReleaseReservations,
+    CaptainEvidence,
+    BeadComment,
+}
+
+impl CleanupKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ReleaseReservations => "release-reservations",
+            Self::CaptainEvidence => "captain-evidence",
+            Self::BeadComment => "bead-comment",
+        }
+    }
+
+    /// Retry safety per kind: reservation release is natively idempotent
+    /// (releasing twice converges); evidence mail and bead comments are
+    /// not — an ambiguous attempt refuses an unforced retry so one timeout
+    /// can never duplicate operator-visible evidence.
+    pub fn capability(self) -> ProviderCapability {
+        match self {
+            Self::ReleaseReservations => ProviderCapability {
+                supports_idempotency_key: true,
+                supports_reconcile_query: false,
+            },
+            Self::CaptainEvidence | Self::BeadComment => ProviderCapability {
+                supports_idempotency_key: false,
+                supports_reconcile_query: false,
+            },
+        }
+    }
+}
+
+/// Capability override for an operator-forced cleanup retry: the operator
+/// confirmed out-of-band that the ambiguous attempt sent nothing, so the
+/// same key may re-dispatch once. The force is explicit at the call site,
+/// never inferred.
+pub const FORCED_CLEANUP_CAPABILITY: ProviderCapability = ProviderCapability {
+    supports_idempotency_key: true,
+    supports_reconcile_query: false,
+};
+
+/// Stable cleanup identity: `{parent}/cleanup:{kind}`. Retries reuse it;
+/// the parent failure row is never written by cleanup.
+pub fn cleanup_effect_key(parent_key: &str, kind: CleanupKind) -> String {
+    format!("{parent_key}/cleanup:{}", kind.as_str())
+}
+
+/// One cleanup invocation (what the provider closure receives).
+#[derive(Debug, Clone)]
+pub struct CleanupRequest {
+    pub parent_key: String,
+    pub kind: CleanupKind,
+    pub note: Option<serde_json::Value>,
+}
+
+/// Map a journaled action type back to its retry capability for reporting.
+/// Unknown actions are conservative: no idempotency, no query.
+pub fn capability_for_action_type(action_type: &str) -> ProviderCapability {
+    match action_type {
+        "cleanup:release-reservations" => CleanupKind::ReleaseReservations.capability(),
+        _ => ProviderCapability {
+            supports_idempotency_key: false,
+            supports_reconcile_query: false,
+        },
+    }
+}
+
+/// Operator-facing report for an effect stuck in uncertainty.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnknownReport {
+    pub effect_key: String,
+    pub run_id: String,
+    pub node_path: String,
+    pub state: EffectState,
+    pub attempt: i64,
+    pub evidence: Option<String>,
+    pub next_step: String,
+}
+
+/// The actionable next check for an uncertain effect. Names who moves
+/// next — provider query, reconciler, or operator — never a bare state.
+pub fn describe_unknown(state: EffectState, has_reconcile_path: bool) -> &'static str {
+    match (state, has_reconcile_path) {
+        (EffectState::Unknown, true) => {
+            "query the provider with the stable effect key, then settle or fail with the returned evidence"
+        }
+        (EffectState::Unknown, false) => {
+            "operator decision required: confirm the external outcome out-of-band, then force-retry or fail the effect"
+        }
+        (EffectState::ReconcilePending, _) => "a reconciler owns the next check; do not dispatch",
+        _ => "no reconciliation needed",
+    }
+}
+
+/// Retention/compaction policy (ADR-0032 Spec 5.1 + §9 residual risks).
+/// Terminal effects prune by their own `retention_until`; published
+/// terminals and terminal runs prune by age. Parked pending rows and
+/// uncertain effects (in-flight, unknown, reconcile-pending) are NEVER
+/// pruned: live work and uncertainty outlive any evidence window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetentionPolicy {
+    /// Maximum age (µs) for published terminals and terminal runs.
+    pub terminal_max_age_us: i64,
+    /// Maximum rows deleted per table per run (bounded compaction).
+    pub batch_limit: i64,
+}
+
+impl Default for RetentionPolicy {
+    /// Thirty days of terminal evidence, 500 rows per table per run.
+    fn default() -> Self {
+        Self {
+            terminal_max_age_us: 30 * 24 * 3_600 * 1_000_000,
+            batch_limit: 500,
+        }
+    }
+}
+
 #[cfg(test)]
 mod effect_reconciliation_tests {
     use super::*;

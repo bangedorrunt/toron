@@ -138,8 +138,10 @@ pub use control_flow::{
     run_parallel_copy, run_workflow, stamp_workflow_emitted,
 };
 pub use reconcile::{
-    DispatchPlan, EffectView, ProviderCapability, ProviderOutcome, ReplayMismatch, check_replay,
-    corr_for_effect, may_settle, plan_attempt,
+    CleanupKind, CleanupRequest, DispatchPlan, EffectView, FORCED_CLEANUP_CAPABILITY,
+    ProviderCapability, ProviderOutcome, ReplayMismatch, RetentionPolicy, UnknownReport,
+    capability_for_action_type, check_replay, cleanup_effect_key, corr_for_effect,
+    describe_unknown, may_settle, plan_attempt,
 };
 pub use sinks::{
     ApprovalSink, MAX_PENDING_QUESTION, ParkKind, PendingEntry, PendingRegistry, Resolution,
