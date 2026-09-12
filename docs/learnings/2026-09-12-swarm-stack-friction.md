@@ -94,7 +94,27 @@ Verified against the working tree; fixes landed in the toron repo only.
 | F13 | Verified, **flywheel-side (+ follow-up)** — filed **bd-zugo** | `--from-project` register minting a nameless key is a flywheel register bug. Toron-side follow-up: warn loud at acquire when the acting name has no registered profile (hot path — needs its own change). |
 | F16 | Verified, **beads-side** — filed **bd-9ewu** | `br ready`/`next` count `parent-child` as blocking and surface open epics; epics are grouping, not ordering. |
 | F17 | Verified, **flywheel-side** — filed **bd-xe9t** | Doorbell stayed standby with 0 subscribers all swarm (stale binary lacks the arming verb, spawn subscriptions never landed, status is green while blind). |
-| F3, F6, F9/F12/F15, F10 | Verified, **not toron** | Process gap (F3) / flywheel compose+harness (F6) / flywheel send observation (F9,F12,F15) / flywheel arrive captain rebind (F10). |
+| F3, F6, F9/F12/F15, F10 | Verified, **not toron** | Process gap (F3) / flywheel compose+harness (F6) / flywheel send observation (F9,F12/F15) / flywheel arrive captain rebind (F10). |
+
+## Cross-repo resolution pass — 2026-09-12 (flywheel + beads)
+
+Every remaining item was re-verified against the live code in each repo,
+then fixed in place. Each fix is unit-tested and land through that repo's
+own gates (strict staged-path guard + clippy -D warnings + fmt).
+
+| Item | Verdict | Where |
+|---|---|---|
+| F6 | **Fixed** | flywheel `98a5890`: `compose --harness <kind>` per-run override, normalized (`oc`→`opencode`) and validated against the herdr kind registry + `[harness.*]` recipes at both profile-create and compose time. |
+| F7/F8 | **Fixed** | flywheel `98a5890`: the run row is persisted BEFORE the crew spawns; an idempotency-key hit with live panes ADOPTS instead of minting a second run/crew; `--timeout` caps the wall clock and fails loud. |
+| F9/F15 | **Fixed** | flywheel `98a5890`: adaptive settle + post-timeout status re-read; a non-working → working transition proves the prompt LANDED, so healthy oc panes stop reading as ambiguous. |
+| F10 | **Fixed** | flywheel `98a5890`: `arrive` OFFERS the captain rebind verb when the fold holder has no live pane/dispatcher/heartbeat (never auto-rebinds). |
+| F12 | **Fixed** | flywheel `98a5890`: `--to` resolves spawned pins through the same `mail_identity` the panes post with. |
+| F13 (flywheel half) | **Fixed** | flywheel `98a5890`: `--from-project` register binds the agent's EXISTING key into the target slot and refuses loud when the source key is missing. |
+| F13 (toron half) | **Fixed** | toron `92abadb`: `Mailbox::agent_registered` roster oracle; the `reserve acquire` warning lands with the robot.rs edit leased to bd-8xwk. |
+| F1/F4 | **Fixed** | flywheel `98a5890`: `mail register` upserts toron's shared identity store, so whois/reserve/guard agree on one pin (regression-tested against the durable root). |
+| F3 | **Fixed** | flywheel `98a5890`: the session door names uncommitted `docs/decisions/**` files. |
+| F17 | **Fixed** | flywheel `98a5890` + `crates/doorbell-bin`: `doorbell start --host` arms per workspace (a stale binary that cannot arm fails loud), spawn verifies its wake-subscription row landed, and standby-with-known-workspaces reports DEGRADED with the arming remedy. |
+| F16 | **Fixed** | beads `4237f214` (`beads_rust-lqybg`): `create --parent` refuses a closed/tombstone parent at cut time. The ready-side semantics (`parent-child` is hierarchy, not a schedule edge) already held at HEAD via #355/#357 — re-verified, no change needed. |
 
 ## Clean (worth keeping)
 
