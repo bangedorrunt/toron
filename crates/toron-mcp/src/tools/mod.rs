@@ -61,7 +61,18 @@ impl IntoCallToolResult for ToolOutput {
             Ok(value) => {
                 let text = serde_json::to_string(&value)
                     .unwrap_or_else(|e| format!("serialize tool result: {e}"));
-                Ok(CallToolResult::success(vec![ContentBlock::text(text)]).into())
+                let mut result = CallToolResult::success(vec![ContentBlock::text(text)]);
+                // MCP 2025-06-18: a tool that declares an `outputSchema` MUST
+                // return `structuredContent` conforming to it. Every tool here
+                // declares one, so a text-only result made strict clients
+                // reject the call ("has an output schema but did not return
+                // structured content"). structuredContent must be a JSON
+                // object; object-shaped results get it, scalar/array results
+                // keep the text contract only.
+                if value.is_object() {
+                    result.structured_content = Some(value);
+                }
+                Ok(result.into())
             }
             Err(e) => Ok(CallToolResult::error(vec![ContentBlock::text(format!("{e:#}"))]).into()),
         }

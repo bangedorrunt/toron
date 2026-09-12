@@ -634,6 +634,171 @@ fn reserve_conflicts_parity_json() {
     );
 }
 
+/// F14 + F11 (docs/learnings/2026-09-12-swarm-stack-friction.md): the lease
+/// board is now a CLI noun (`reserve list`), and release-on-bead-close is
+/// reachable without MCP (`reserve release-by-reason <bead>`). Own data dir +
+/// an explicit operator key so the operator-signed revocation fires.
+#[test]
+fn reserve_list_board_and_release_by_reason() {
+    let data_dir = std::env::temp_dir().join(format!("toron-reserve-list-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&data_dir);
+    std::fs::create_dir_all(&data_dir).expect("mkdir dedicated data dir");
+    let op_key = data_dir.join("operator.ncryptsec");
+
+    // Pin the root (embedded path beats the live-daemon probe) and set the
+    // operator key so `release-by-reason` is not "no operator key configured".
+    let own_run = |args: &[&str]| {
+        toron()
+            .env("TORON_MCP_DATA_DIR", &data_dir)
+            .env("TORON_OPERATOR_KEY", &op_key)
+            .args(args)
+            .output()
+            .expect("run toron on own data dir")
+    };
+    let json = |out: &std::process::Output| -> Value {
+        serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+            panic!(
+                "expected JSON, stderr: {}\nerror: {e}",
+                String::from_utf8_lossy(&out.stderr)
+            )
+        })
+    };
+
+    // Operator key + the pin, then one exclusive lease keyed to a bead id.
+    let keygen = own_run(&[
+        "key",
+        "generate",
+        "--role",
+        "operator",
+        "--out",
+        op_key.to_str().unwrap(),
+        "--json",
+    ]);
+    assert!(
+        keygen.status.success(),
+        "key generate: {}",
+        String::from_utf8_lossy(&keygen.stderr)
+    );
+    let boot = own_run(&[
+        "agent",
+        "bootstrap",
+        "--project",
+        "demo",
+        "--as",
+        "BoardAgent",
+        "--json",
+    ]);
+    assert!(
+        boot.status.success(),
+        "bootstrap: {}",
+        String::from_utf8_lossy(&boot.stderr)
+    );
+    let acq = own_run(&[
+        "reserve",
+        "acquire",
+        "--paths",
+        "src/board/**",
+        "--reason",
+        "bd-f11-test",
+        "--exclusive",
+        "--project",
+        "demo",
+        "--as",
+        "BoardAgent",
+        "--json",
+    ]);
+    assert!(
+        acq.status.success(),
+        "acquire: {}",
+        String::from_utf8_lossy(&acq.stderr)
+    );
+
+    // The board shows the held lease with holder/reason/exclusive.
+    let listed = own_run(&["reserve", "list", "--project", "demo", "--json"]);
+    assert!(
+        listed.status.success(),
+        "list: {}",
+        String::from_utf8_lossy(&listed.stderr)
+    );
+    let board = json(&listed);
+    let rows = board["reservations"]
+        .as_array()
+        .expect("reservations array");
+    assert!(
+        rows.iter().any(|r| {
+            r["reason"] == "bd-f11-test" && r["holder"] == "BoardAgent" && r["exclusive"] == true
+        }),
+        "board must show the held lease, got {board}"
+    );
+
+    // Filters: exact holder hit, and a stranger matches nothing.
+    let by_holder = json(&own_run(&[
+        "reserve",
+        "list",
+        "--project",
+        "demo",
+        "--holder",
+        "BoardAgent",
+        "--json",
+    ]));
+    assert!(
+        by_holder["count"].as_i64().unwrap_or(0) >= 1,
+        "holder filter must keep the lease, got {by_holder}"
+    );
+    let miss = json(&own_run(&[
+        "reserve",
+        "list",
+        "--project",
+        "demo",
+        "--holder",
+        "NobodyHere",
+        "--json",
+    ]));
+    assert_eq!(
+        miss["count"].as_i64().unwrap_or(-1),
+        0,
+        "holder filter must exclude a stranger, got {miss}"
+    );
+
+    // Release-on-bead-close, then the board no longer carries that reason.
+    let rel = own_run(&[
+        "reserve",
+        "release-by-reason",
+        "bd-f11-test",
+        "--project",
+        "demo",
+        "--as",
+        "BoardAgent",
+        "--json",
+    ]);
+    assert!(
+        rel.status.success(),
+        "release-by-reason: {}",
+        String::from_utf8_lossy(&rel.stderr)
+    );
+    let rel_v = json(&rel);
+    assert!(
+        rel_v["released"].as_i64().unwrap_or(0) >= 1,
+        "must release the reason-matching lease, got {rel_v}"
+    );
+    let after = json(&own_run(&[
+        "reserve",
+        "list",
+        "--project",
+        "demo",
+        "--json",
+    ]));
+    assert!(
+        !after["reservations"]
+            .as_array()
+            .map(|rows| rows.iter().any(|r| r["reason"] == "bd-f11-test"))
+            .unwrap_or(false),
+        "released lease must leave the board, got {after}"
+    );
+
+    let _ = std::fs::remove_dir_all(&data_dir);
+}
+
 /// bd-pin-public-plane-s-easy.14: ONE mailbox — a lease written by one
 /// `toron` process must be visible to a SECOND `toron guard check` process
 /// (the pre-commit hook runs in its own process against the same durable

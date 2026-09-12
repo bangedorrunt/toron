@@ -110,7 +110,7 @@ pub enum Command {
     /// (no new MCP tool, ADR-0020 wave 1 freeze).
     AckSla(AckSlaArgs),
 
-    /// File reservations: acquire/conflicts/renew/release/force-release.
+    /// File reservations: acquire/conflicts/list/renew/release/release-by-reason/force-release.
     #[command(subcommand)]
     Reserve(ReserveCommand),
 
@@ -675,10 +675,15 @@ pub enum ReserveCommand {
     Acquire(ReserveAcquireArgs),
     /// Symmetric-glob conflict report for paths vs other agents' reservations.
     Conflicts(ReserveConflictsArgs),
+    /// Show the active lease board (the state the strict guard evaluates).
+    List(ReserveListArgs),
     /// Extend the TTLs of the holder's active file reservations.
     Renew(ReserveRenewArgs),
     /// Release the holder's active file reservations (idempotent).
     Release(ReserveReleaseArgs),
+    /// Release every reservation whose reason is the given bead id
+    /// (release-on-bead-close; operator-signed, no staleness heuristic).
+    ReleaseByReason(ReserveReleaseByReasonArgs),
     /// Operator force-release of a stale reservation.
     ForceRelease(ReserveForceReleaseArgs),
     /// Ask the holder to release or defer a held reservation (ADR-0011
@@ -728,6 +733,19 @@ pub struct ReserveConflictsArgs {
 }
 
 #[derive(Debug, Args)]
+pub struct ReserveListArgs {
+    /// Project slug.
+    #[arg(long, required = true)]
+    pub project: String,
+    /// Only leases held by this exact agent pin.
+    #[arg(long)]
+    pub holder: Option<String>,
+    /// Only leases whose path glob overlaps this path (symmetric fnmatch).
+    #[arg(long)]
+    pub path: Option<String>,
+}
+
+#[derive(Debug, Args)]
 pub struct ReserveRenewArgs {
     /// Path globs to renew (comma-separated; empty = renew all of the agent's).
     #[arg(long, value_delimiter = ',')]
@@ -754,6 +772,21 @@ pub struct ReserveReleaseArgs {
     /// Agent holding the leases.
     #[arg(long = "as", required = true)]
     pub agent: String,
+}
+
+#[derive(Debug, Args)]
+pub struct ReserveReleaseByReasonArgs {
+    /// Bead id whose matching (reason == bead id) leases are revoked.
+    pub bead_id: String,
+    /// Project slug.
+    #[arg(long, required = true)]
+    pub project: String,
+    /// Operator agent performing the revocation.
+    #[arg(long = "as", required = true)]
+    pub agent: String,
+    /// Skip the NIP-17 notification to the previous holders (default: notify).
+    #[arg(long)]
+    pub no_notify: bool,
 }
 
 #[derive(Debug, Args)]

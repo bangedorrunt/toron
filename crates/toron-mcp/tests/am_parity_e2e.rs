@@ -154,6 +154,34 @@ impl LiveDaemon {
 }
 
 // ======================================================================
+// F14: structuredContent present for outputSchema-bearing tools
+// ======================================================================
+
+/// F14 (docs/learnings/2026-09-12-swarm-stack-friction.md): every tool here
+/// declares an `outputSchema`, so the server MUST return `structuredContent`
+/// — strict MCP clients rejected object calls with "has an output schema but
+/// did not return structured content". The text block stays (parity JSON).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tool_results_carry_structured_content() -> anyhow::Result<()> {
+    let mut d = LiveDaemon::boot("structured").await?;
+    let result = d.call_raw("health_check", serde_json::json!({})).await;
+    assert!(
+        !result.is_error.unwrap_or(false),
+        "health_check returned an error result: {:?}",
+        result.content
+    );
+    let structured = result
+        .structured_content
+        .expect("an object tool must return structuredContent");
+    let text = LiveDaemon::text_json("health_check", &result.content);
+    assert_eq!(
+        structured, text,
+        "structuredContent must mirror the text parity JSON"
+    );
+    Ok(())
+}
+
+// ======================================================================
 // Cluster 1+2: Infrastructure + Identity
 // ======================================================================
 

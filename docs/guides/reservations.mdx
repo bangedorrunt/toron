@@ -16,6 +16,17 @@ toron reserve release --project <slug> --as <Pin>
 
 `--paths` takes one glob per flag; repeat the flag for multiple paths. `--reason` is the bead id, always: release-on-bead-close keys off it (`release_file_reservations_by_reason`, operator/loop; crews use `release_file_reservations`).
 
+Two board verbs close the loop when a bead closes or a lane needs to see holders:
+
+```bash
+# The active lease board the strict guard evaluates (holder, path, reason, expiry).
+toron reserve list --project <slug> [--holder <Pin>] [--path 'crates/x/src/**']
+# Release-on-bead-close: revoke every lease whose reason is the bead id.
+toron reserve release-by-reason bd-z2d0 --project <slug> --as <operator-pin>
+```
+
+`reserve list` is read-only and filters by exact holder and/or symmetric-glob path overlap. `release-by-reason` is operator-signed (no staleness heuristic: the closed bead IS the evidence) and exits with `released: 0` as a clean no-op when nothing matches. Neither adds an MCP tool; both drive the existing `list_file_reservations` / `release_file_reservations_by_reason` operators.
+
 ## Conflicts
 
 ```mermaid
@@ -36,6 +47,7 @@ flowchart TD
 - Never commit on behalf of someone else. A grant is a `transfer` of the lease, not a favor.
 - `renew` extends the stored absolute expiry; recomputing from now is a bug.
 - The don't-sweep request is a **guard**, not a DM: `guard install|uninstall` puts the pre-commit hook in the repo (it never clobbers a user hook, and `TORON_GUARD_STRICT=0` is operator-only).
+- The strict guard evaluates the **git index**, not a `git commit -- <pathspec>` selection. A staged file outside the pathspec you commit still counts, so it can block you (`.beads/issues.jsonl` and the other `.beads` bookkeeping files are shared-safe and exempt). Unstage what you are not committing, or reserve it.
 
 Mechanics worth knowing: leases are kind-30031 addressable events (`d`=`project:path-glob`, NIP-40 expiration, dual-emit scoping), and conflicts are symmetric fnmatch both ways. Force-release is never a NIP-09 delete: the operator signs a kind-30031 `status:revoked` event at the same `(kind, d)` coordinate, and the projection resolves it by key-priority `operator > agent`. An acquire against the declarer's own intent converts intent to held at the same coordinate (must-convert). Status-less 30031s read as `held` for backward compatibility.
 
