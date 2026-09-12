@@ -228,8 +228,14 @@ steps:
             "wave_label": "wave-1",
         }
     });
-    let msg = rendered_approval_message(&wf.steps[0].action, &trigger, &serde_json::Map::new())
-        .expect("render");
+    let msg = rendered_approval_message(
+        &wf.steps[0].action,
+        &trigger,
+        &serde_json::Map::new(),
+        "wave-signoff",
+        "signoff",
+    )
+    .expect("render");
     assert_eq!(
         msg,
         "Wave signoff for graduate the wave-swarm recipe [wave-1]: review the VERIFY receipts."
