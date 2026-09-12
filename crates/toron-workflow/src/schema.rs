@@ -562,7 +562,7 @@ impl DispatchSpec {
 
 /// A workflow action (one of the ADR Phase-2 set).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "action", rename_all = "snake_case")]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Action {
     /// Publish a kind-14 message (to/cc/bcc supported by the mailbox).
     SendMessage {
@@ -1335,7 +1335,7 @@ policy:
   catchup: latest
 steps:
   - { name: probe,  action: call_workflow, workflow: health-check }
-  - { name: upgrade, action: call_workflow, workflow: docker-upgrade, if: "{{steps.probe.healthy}}" }
+  - { name: upgrade, action: call_workflow, workflow: docker-upgrade, guard: "{{steps.probe.healthy}}" }
   - { name: verify, action: call_workflow, workflow: health-check }
 "##;
         let spec = parse_cron(yaml).expect("ADR example parses");

@@ -543,6 +543,21 @@ fn substitute_templates(s: &str) -> String {
 
 /// Validate an action's fields.
 fn check_action(report: &mut LintReport, action: &Action) {
+    // ADR-0032 Spec 2 (bd-htoo): the authoring gate consumes the closed
+    // contract table. Deprecated variants with no wired sink fail here so
+    // they never reach execution by accident.
+    let contract = crate::action_contract::contract_for(action);
+    if !contract.supported {
+        report.issues.push(LintIssue {
+            level: Level::Error,
+            message: format!(
+                "{:?} is deprecated with no wired sink and never executes; remove the step",
+                contract.type_name
+            ),
+            line: None,
+        });
+        return;
+    }
     match action {
         Action::SendMessage {
             to, subject, body, ..
@@ -1173,7 +1188,7 @@ policy:
   catchup: latest
 steps:
   - { name: probe,  action: call_workflow, workflow: health-check }
-  - { name: upgrade, action: call_workflow, workflow: docker-upgrade, if: "{{steps.probe.healthy}}" }
+  - { name: upgrade, action: call_workflow, workflow: docker-upgrade, guard: "{{steps.probe.healthy}}" }
   - { name: verify, action: call_workflow, workflow: health-check }
 "##;
 
