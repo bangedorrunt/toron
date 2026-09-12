@@ -118,3 +118,4 @@
 {"id":118,"issue_id":"bd-v139","from_status":"open","to_status":"closed","status_revision":0,"gate":"worker-receipt","provider":"AmberVellum","passed":true,"recorded_by":"bangedorrunt","recorded_at":"2026-09-12 06:40:47"}
 {"id":119,"issue_id":"bd-wu2b","from_status":"open","to_status":"closed","status_revision":0,"gate":"worker-receipt","provider":"AmberVellum","passed":true,"recorded_by":"bangedorrunt","recorded_at":"2026-09-12 06:41:16"}
 {"id":120,"issue_id":"bd-wu2b","from_status":"open","to_status":"closed","status_revision":0,"gate":"operator-directed","provider":"AmberVellum","passed":true,"recorded_by":"bangedorrunt","recorded_at":"2026-09-12 06:41:47"}
+{"id":121,"issue_id":"bd-v139","from_status":"open","to_status":"closed","status_revision":0,"gate":"operator-directed","provider":"AmberVellum","passed":true,"recorded_by":"bangedorrunt","recorded_at":"2026-09-12 06:42:16"}
