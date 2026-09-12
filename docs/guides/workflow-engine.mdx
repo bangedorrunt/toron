@@ -5,6 +5,8 @@ description: YAML workflows as signed events. Durable approvals, @mention trigge
 
 toron runs YAML workflows as a standalone fabric; orchestration (catalogs, cron, crews) belongs to flywheel. Each run is a kind-46xxx event and a Resonate promise, which is what makes a suspended run survive a crash.
 
+> **ADR-0032** ([workflow-engine honesty and Jido action contracts](../decisions/0032-workflow-engine-honesty-jido-contracts.md), **proposed**, not accepted) is the design target. Its fixed point is **truthful durable orchestration under at-least-once external effects, with explicit reconciliation where the outcome is uncertain**. It is not exactly-once execution, not rollback of completed side effects, and a successful `engine.run` does not mean business completion. Docs below describe **shipped** behavior; proposed gates are labeled **(proposed)**.
+
 ```bash
 toron workflow lint <file.yaml>
 toron workflow validate <file.yaml>
@@ -17,17 +19,37 @@ toron workflow invoke <name>
 
 `request_approval` suspends the run, writes state, and exits. The run resumes when the approval lands, even across a daemon restart, because the Resonate promise and the signed kind-46xxx event together reconstruct position. This is the difference between toron workflows and a shell script: the approval gate is a checkpoint, not a blocking loop.
 
+## Two stores, four states
+
+Mailbox receipts and workflow effects are **different stores**. The mailbox `ReceiptStore` tracks message lifecycle (`owed → acked → resulted`, plus `degraded`): it proves a message moved, never that a workflow effect happened. The workflow **effect_key / effect journal** (intent → dispatch → settlement, with an explicit `unknown`/reconcile state) is **(proposed)** per ADR-0032 Spec 5; no `workflow_effects` table ships yet. A workflow-originated mail **may** project `effect_key` as transport `corr`, but the receipt row never replaces the journal row. `thread_id` is conversation identity and is never `corr` or `effect_key`.
+
+Four claims that must not be conflated: **suspended** (parked on a durable promise, resumable, never failed) ≠ **terminal** (one semantic run end, published once per `terminal_digest`) ≠ **settled** (a contract-valid action outcome at the action boundary) ≠ **business completion** (the external world actually did it). `settled` never implies a human read the message or the business process finished.
+
 ## Actions
 
-| Action | Notes |
+| Action | Shipped behavior |
 |---|---|
-| `send_message` | Project mail. |
+| `send_message` | Project mail (kind-14 gift wrap). |
 | `send_dm` | Plane P. |
-| `react` | Kind 7 on a channel post. |
-| `dispatch_job` | Creates a plane J job; supports `phase:` for per-harness mechanics. |
-| `call_webhook` | SSRF-guarded, including IPv4-mapped IPv6 (`::ffff:a.b.c.d`). |
+| `dispatch_job` | Creates a plane J job (kind-43001); supports `phase:` for per-harness mechanics. |
 | `request_approval` | Durable suspension; resumes on approval. |
 | `delay` | Timed pause; a message producer, not a blocked thread. |
+| `spawn` | Engine-parked sequenced control; `await: true` parks. `no_claim_timeout` defaults to **600s**; explicit `0` is the only no-timeout spelling. |
+| `verify` | Embedding-owned `VerifySink` effect; the engine never shells out. |
+| `react` | **Deprecated, fail-closed** (bd-i6kc): parses for migration but the boundary rejects it with `unsupported_action`. It does not post kind 7. |
+| `call_webhook` | **Deprecated, fail-closed** (bd-i6kc): parses for migration but the boundary rejects it with `unsupported_action`. No webhook sink is wired; there is no SSRF guard to rely on because nothing is dispatched. |
+
+Control-flow actions (`branch`, `retry`, `foreach`, `parallel`, `call_workflow`) are engine-sequenced and never reach an effect runner; a misdispatch fails typed, never `Ok(Null)`.
+
+## Authoring contracts (shipped)
+
+- One guard evaluator for linear, graph, branch, and nested steps: false guard = explicit skip, syntax/type/ref errors fail loud, never else-branch or placeholder.
+- Strict template rendering: unresolved refs fail naming workflow, node, field, and reference path.
+- Loud composites: non-list `foreach` input fails (never `[]`); invalid `parallel` count fails (never `1`, cap 32); `call_workflow` binds defaults through the same function as `invoke`.
+- One retry coordinator over the frozen `FailureKind` set; nested retry wrappers flatten. `rate_limit`/`timeout` retry only when the effect is known safe or the provider honors the stable key, otherwise reconcile.
+- CLI refuses parked-action runs when the required host/sink is unavailable, instead of parking forever.
+
+**(Proposed)** until their waves land: the normalized `ActionInvocation`/`ActionOutcome`/`ActionFailure` boundary, the per-variant contract table with parse/lint/invoke gates, canonical graph digest with stable node/iteration identity, the workflow-effect journal with crash-matrix reconciliation, terminal-publication dedupe with restart recovery, and the full host-owned sink drain (engine builds the kind-46012 terminal record and exposes the pending binding; the host lifecycle manager per Spec 6 is the proposed owner). No new MCP tools or Nostr kinds are planned for any of this.
 
 ## Triggers
 
