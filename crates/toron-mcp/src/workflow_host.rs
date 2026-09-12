@@ -26,11 +26,15 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use nostr::prelude::{Event, EventId, Keys, Timestamp};
+use nostr::prelude::{Event, EventBuilder, EventId, FinalizeEvent, Keys, Kind, Tag, Timestamp};
 use toron_core::bus::{Bus, SubscriptionEvent};
 use toron_core::mailbox::{Mailbox, SendMessage, UnwrappedMail};
 use toron_workflow::coalesce::{CoalesceDecision, Coalesced, MentionCoalescer};
-use toron_workflow::engine::{ActionRunner, RunInput, WorkflowEngine};
+use toron_workflow::engine::{
+    ActionRunner, Decision, ParkKind, PendingEntry, PendingRegistry, Resolution,
+    ResolutionMismatch, ResolutionVerdict, RunInput, TerminalLedger, TerminalNote, TerminalRecord,
+    WorkflowEngine, attribute_parks, terminal_digest, validate_resolution,
+};
 use toron_workflow::jobs::{JobRequest, build_job_request_with_tags};
 use toron_workflow::schema::{Action, Trigger, Workflow};
 use toron_workflow::stamp_workflow_emitted;
@@ -295,6 +299,9 @@ pub struct WorkflowHost {
     /// ADR-0007 F7: signs coalesced kind-43001 job requests. Absent → flushes
     /// are logged but not published (honest degradation).
     job_signer: Option<Keys>,
+    /// bd-asx3: host-owned pending lifecycle — structured entries, terminal
+    /// ledger, run states. Shared across the trigger and resolution loops.
+    pending: Arc<tokio::sync::Mutex<PendingDrain>>,
 }
 
 impl std::fmt::Debug for WorkflowHost {
@@ -303,6 +310,10 @@ impl std::fmt::Debug for WorkflowHost {
             .field("workflows", &self.workflows.len())
             .field("engine", &self.engine)
             .field("has_job_signer", &self.job_signer.is_some())
+            .field(
+                "pending_len",
+                &self.pending.try_lock().map(|g| g.registry_len()),
+            )
             .finish()
     }
 }
@@ -327,6 +338,7 @@ impl WorkflowHost {
             workflows,
             coalescer,
             job_signer,
+            pending: Arc::new(tokio::sync::Mutex::new(PendingDrain::new())),
         })
     }
 
@@ -344,7 +356,25 @@ impl WorkflowHost {
             workflows,
             coalescer: Arc::new(std::sync::Mutex::new(MentionCoalescer::from_env())),
             job_signer: None,
+            pending: Arc::new(tokio::sync::Mutex::new(PendingDrain::new())),
         })
+    }
+
+    /// Construct over an explicit bus AND engine (bd-asx3 lifecycle tests:
+    /// a remote Resonate engine is required for real promise parks).
+    pub fn over_bus_with_engine(
+        bus: Arc<dyn Bus>,
+        engine: WorkflowEngine,
+        workflows: Vec<Workflow>,
+    ) -> Self {
+        Self {
+            engine: Arc::new(engine),
+            bus,
+            workflows,
+            coalescer: Arc::new(std::sync::Mutex::new(MentionCoalescer::from_env())),
+            job_signer: None,
+            pending: Arc::new(tokio::sync::Mutex::new(PendingDrain::new())),
+        }
     }
 
     /// Set the key that signs coalesced kind-43001 job requests (F7). Without
@@ -374,6 +404,328 @@ impl WorkflowHost {
     /// The registered workflows.
     pub fn workflows(&self) -> &[Workflow] {
         &self.workflows
+    }
+
+    /// The host-owned pending lifecycle (bd-asx3).
+    pub fn pending(&self) -> &Arc<tokio::sync::Mutex<PendingDrain>> {
+        &self.pending
+    }
+
+    /// Publish one approval-pending event (kind-46011) for a structured
+    /// entry: run/node/effect/promise/generation plus the bounded payload.
+    /// Requires a signer; without one, bail honestly instead of staging an
+    /// unpublished pending.
+    pub async fn publish_approval_pending(&self, entry: &PendingEntry) -> Result<EventId> {
+        let signer = self
+            .job_signer
+            .as_ref()
+            .context("no signer: cannot publish kind-46011 approval-pending")?;
+        let mut tags = Vec::new();
+        if let Some(project) = &entry.project {
+            tags.push(Tag::parse(["t", project]).map_err(|e| anyhow::anyhow!("t tag: {e}"))?);
+        }
+        let body = serde_json::json!({
+            "run_id": entry.run_id,
+            "workflow": entry.workflow,
+            "node": entry.node_path,
+            "promise_id": entry.promise_id,
+            "generation": entry.generation,
+            "kind": entry.kind.as_str(),
+            "question": entry.question,
+            "evidence_hash": entry.evidence_hash,
+            "deadline_secs": entry.deadline_secs,
+        });
+        let event = EventBuilder::new(Kind::from_u16(46011), body.to_string())
+            .tags(tags)
+            .finalize(signer)
+            .map_err(|e| anyhow::anyhow!("sign 46011: {e}"))?;
+        let id = event.id;
+        self.bus
+            .publish(event)
+            .await
+            .map_err(|e| anyhow::anyhow!("publish 46011: {e}"))?;
+        Ok(id)
+    }
+
+    /// Publish one spawn-await pending event (kind-43001 job request) for a
+    /// structured entry, so the spawn-await park is operator-visible like an
+    /// approval park. The spec carries the promise/run/node correlation.
+    pub async fn publish_spawn_pending(&self, entry: &PendingEntry) -> Result<EventId> {
+        let signer = self
+            .job_signer
+            .as_ref()
+            .context("no signer: cannot publish kind-43001 spawn-pending")?;
+        let payload = JobRequest {
+            title: format!("spawn-await {}/{}", entry.run_id, entry.node_path),
+            spec: serde_json::json!({
+                "promise_id": entry.promise_id,
+                "run_id": entry.run_id,
+                "node": entry.node_path,
+                "generation": entry.generation,
+                "workflow": entry.workflow,
+            }),
+            assignee: None,
+        };
+        let mut tags = Vec::new();
+        if let Some(project) = &entry.project {
+            tags.push(Tag::parse(["t", project]).map_err(|e| anyhow::anyhow!("t tag: {e}"))?);
+        }
+        let event = build_job_request_with_tags(signer, None, &payload, Timestamp::now(), tags)
+            .map_err(|e| anyhow::anyhow!("build 43001: {e}"))?;
+        let id = event.id;
+        self.bus
+            .publish(event)
+            .await
+            .map_err(|e| anyhow::anyhow!("publish 43001: {e}"))?;
+        Ok(id)
+    }
+
+    /// Publish one semantic terminal (kind-46012) for a run. The ledger
+    /// dedupes by digest: a same-digest republish returns `Duplicate`
+    /// without a bus write (no duplicate semantic terminal); a different
+    /// digest for the same run returns `Conflict` and still publishes, so
+    /// the conflict is evidence-visible instead of silently merged.
+    pub async fn publish_terminal(
+        &self,
+        run_id: &str,
+        workflow_digest: &str,
+        status: &str,
+        node: &str,
+        evidence: &str,
+    ) -> Result<TerminalNote> {
+        let digest = terminal_digest(run_id, workflow_digest, status, node, evidence);
+        let record = TerminalRecord {
+            run_id: run_id.to_string(),
+            digest: digest.clone(),
+            status: status.to_string(),
+            node: node.to_string(),
+        };
+        let note = self.pending.lock().await.note_terminal(record);
+        if matches!(note, TerminalNote::Duplicate) {
+            return Ok(note);
+        }
+        let signer = self
+            .job_signer
+            .as_ref()
+            .context("no signer: cannot publish kind-46012 terminal")?;
+        let outcome = serde_json::json!({
+            "status": status,
+            "run_id": run_id,
+            "failed_step": node,
+            "evidence": evidence,
+        });
+        let event = toron_workflow::engine::build_workflow_run_terminal(signer, run_id, &outcome)
+            .map_err(|e| anyhow::anyhow!("build 46012: {e}"))?;
+        self.bus
+            .publish(event)
+            .await
+            .map_err(|e| anyhow::anyhow!("publish 46012: {e}"))?;
+        let terminal_state = match status {
+            "succeeded" => RunState::Succeeded,
+            "blocked" => RunState::Blocked,
+            "cancelled" => RunState::Cancelled,
+            "unknown" => RunState::Unknown,
+            _ => RunState::Failed,
+        };
+        self.pending
+            .lock()
+            .await
+            .set_run_state(run_id, terminal_state);
+        Ok(note)
+    }
+
+    /// Parse an approval resolution event (bd-asx3 wire contract): kind-46011
+    /// content JSON `{promise_id, run_id, generation, verdict, note?}` with
+    /// the project in the `t` tag. Pending publications carry no `verdict`,
+    /// so they never parse as resolutions. Returns `None` for anything else.
+    pub fn parse_approval_resolution(event: &Event) -> Option<Resolution> {
+        if event.kind.as_u16() != 46011 {
+            return None;
+        }
+        let body: serde_json::Value = serde_json::from_str(&event.content).ok()?;
+        let verdict = ResolutionVerdict::parse(body.get("verdict")?.as_str()?)?;
+        let project = event.tags.iter().find_map(|t| {
+            let slice = t.as_slice();
+            if slice.first().map(String::as_str) == Some("t") {
+                slice.get(1).cloned()
+            } else {
+                None
+            }
+        });
+        Some(Resolution {
+            run_id: body.get("run_id")?.as_str()?.to_string(),
+            project,
+            promise_id: body.get("promise_id")?.as_str()?.to_string(),
+            generation: body.get("generation")?.as_u64()?,
+            verdict,
+            note: body
+                .get("note")
+                .and_then(|n| n.as_str())
+                .unwrap_or_default()
+                .to_string(),
+        })
+    }
+
+    /// Settle one parked approval against the registry: validate identity,
+    /// then resolve or reject the exact promise. Mismatches are recorded in
+    /// the drain and returned as errors — they never touch a promise.
+    pub async fn resolve_parked(&self, res: Resolution) -> Result<PendingEntry> {
+        let entry = self
+            .pending
+            .lock()
+            .await
+            .resolve(res.clone())
+            .map_err(|m| anyhow::anyhow!("resolution ignored: {m:?}"))?;
+        match res.verdict {
+            ResolutionVerdict::Approved => {
+                self.engine
+                    .resolve_approval(&entry.promise_id, &Decision::approved(res.note))
+                    .await?
+            }
+            ResolutionVerdict::Rejected => {
+                self.engine
+                    .reject_approval(&entry.promise_id, &Decision::rejected(res.note))
+                    .await?
+            }
+            ResolutionVerdict::SpawnCompleted => {
+                anyhow::bail!("spawn verdict on an approval park: {}", entry.promise_id)
+            }
+        }
+        self.pending
+            .lock()
+            .await
+            .set_run_state(&entry.run_id, RunState::Running);
+        Ok(entry)
+    }
+
+    /// Subscribe to kind-46011 resolution events and settle parked approvals
+    /// (bd-asx3 Spec 6.2): validate run/project/promise/generation before
+    /// touching a promise; stale/wrong resolutions are recorded and ignored.
+    pub fn spawn_resolution_loop(&self) -> tokio::task::JoinHandle<()> {
+        let me = self.clone();
+        tokio::spawn(async move {
+            let mut sub = match me
+                .bus
+                .subscribe_trusted(toron_core::bus::Filter::new())
+                .await
+            {
+                Ok(sub) => sub,
+                Err(e) => {
+                    warn!("resolution loop: subscribe failed: {e}");
+                    return;
+                }
+            };
+            while let Some(ev) = sub.next().await {
+                let SubscriptionEvent::Event(event) = ev else {
+                    continue;
+                };
+                let Some(res) = Self::parse_approval_resolution(&event) else {
+                    continue;
+                };
+                match me.resolve_parked(res).await {
+                    Ok(entry) => debug!(
+                        run_id = %entry.run_id,
+                        promise_id = %entry.promise_id,
+                        "approval resolution settled a parked promise"
+                    ),
+                    Err(e) => debug!("ignoring unresolvable approval resolution: {e:#}"),
+                }
+            }
+        })
+    }
+
+    /// Run one workflow detached from the ingress await and drain its new
+    /// parks (bd-asx3): a parked run must not hold the trigger loop, and
+    /// parked work is structured + published independently of completion.
+    /// Suspended runs track [`RunState::Suspended`]; only terminal task
+    /// outcomes mark success or failure. A per-run drain follower keeps
+    /// re-draining until the run is terminal, so parks created after the
+    /// first await point are picked up without waiting for bus traffic.
+    async fn spawn_run_and_drain(&self, run_id: String, workflow: Workflow, input: RunInput) {
+        self.pending
+            .lock()
+            .await
+            .track_run(&run_id, workflow.clone());
+        let me = self.clone();
+        let rid = run_id.clone();
+        tokio::spawn(async move {
+            match me.engine.run(&rid, input).await {
+                Ok(_) => {
+                    me.pending
+                        .lock()
+                        .await
+                        .set_run_state(&rid, RunState::Succeeded);
+                    debug!(run_id = rid, "workflow ran");
+                }
+                Err(e) => {
+                    me.pending
+                        .lock()
+                        .await
+                        .set_run_state(&rid, RunState::Failed);
+                    warn!(run_id = rid, "workflow failed: {e}");
+                }
+            }
+        });
+        self.drain_and_publish(&run_id, &workflow).await;
+        let me = self.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                let terminal = me.pending.lock().await.run_state(&run_id).is_terminal();
+                if terminal {
+                    break;
+                }
+                let fresh = {
+                    let engine = me.engine.clone();
+                    me.pending.lock().await.drain_all(&engine).await
+                };
+                me.publish_fresh(&fresh).await;
+            }
+        });
+    }
+
+    /// Drain one run's fresh parks and publish their pending events.
+    async fn drain_and_publish(&self, run_id: &str, workflow: &Workflow) {
+        for kind in [ParkKind::Approval, ParkKind::Spawn] {
+            let ctx = ParkCtx {
+                run_id: run_id.to_string(),
+                workflow: workflow.name.clone(),
+                project: None,
+                kind,
+                candidates: park_candidates(workflow, kind),
+            };
+            let fresh = self.pending.lock().await.drain(&self.engine, &ctx).await;
+            self.publish_fresh(&fresh).await;
+        }
+    }
+
+    /// Re-drain every tracked non-terminal run (per loop tick, so parks are
+    /// picked up independently of any one run's await) and publish fresh
+    /// pending events.
+    async fn drain_all_known(&self) {
+        let fresh = {
+            let engine = self.engine.clone();
+            self.pending.lock().await.drain_all(&engine).await
+        };
+        self.publish_fresh(&fresh).await;
+    }
+
+    /// Publish pending events for freshly drained entries. Failures warn;
+    /// the entries stay in the registry for the next attempt.
+    async fn publish_fresh(&self, fresh: &[PendingEntry]) {
+        for entry in fresh {
+            let published = match entry.kind {
+                ParkKind::Approval => self.publish_approval_pending(entry).await.map(|_| ()),
+                ParkKind::Spawn => self.publish_spawn_pending(entry).await.map(|_| ()),
+            };
+            if let Err(e) = published {
+                warn!(
+                    run_id = %entry.run_id,
+                    promise_id = %entry.promise_id,
+                    "pending publication failed (entry retained): {e:#}"
+                );
+            }
+        }
     }
 
     /// Spawn the trigger-ingress loop: subscribe to the bus, apply
@@ -456,14 +808,11 @@ impl WorkflowHost {
                         trigger: payload,
                         run_id: None,
                     };
-                    match me.engine.run(&run_id, input).await {
-                        Ok(_) => debug!(run_id, "mail-trigger workflow {} ran", workflow.name),
-                        Err(e) => warn!(
-                            run_id,
-                            "mail-trigger workflow {} failed: {e}", workflow.name
-                        ),
-                    }
+                    // bd-asx3: detached run + drain, same contract as the bus loop.
+                    me.spawn_run_and_drain(run_id, workflow.clone(), input)
+                        .await;
                 }
+                me.drain_all_known().await;
             }
         })
     }
@@ -575,13 +924,246 @@ impl WorkflowHost {
                     trigger: trigger_payload(&event),
                     run_id: None,
                 };
-                match self.engine.run(&run_id, input).await {
-                    Ok(_) => debug!(run_id, "workflow {} ran", workflow.name),
-                    Err(e) => warn!(run_id, "workflow {} failed: {e}", workflow.name),
-                }
+                // bd-asx3: detached run + immediate drain — a parked run
+                // never holds this loop, and its parks are structured at once.
+                self.spawn_run_and_drain(run_id, workflow.clone(), input)
+                    .await;
             }
+            // bd-asx3: re-drain every tracked run per tick, so parks created
+            // after a spawn are picked up independently of any one await.
+            self.drain_all_known().await;
         }
         Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Host-owned pending lifecycle (ADR-0032 Spec 6, bd-asx3).
+//
+// The engine parks on promises and pushes bare ids into its sinks; this host
+// drains those ids into structured [`PendingEntry`] records, publishes the
+// pending events (kind-46011 approval-pending, kind-43001 spawn-await job),
+// validates resolutions, and publishes one semantic terminal (kind-46012)
+// per digest. Runs execute detached from the ingress await so a parked run
+// never holds the trigger loop, and a suspended run is tracked as
+// [`RunState::Suspended`] — never logged as failed.
+// ---------------------------------------------------------------------------
+
+/// Park observation context: the run whose new sink ids are being drained,
+/// with the schema candidate nodes that may have parked, in order.
+#[derive(Debug, Clone)]
+pub struct ParkCtx {
+    pub run_id: String,
+    pub workflow: String,
+    pub project: Option<String>,
+    pub kind: ParkKind,
+    pub candidates: Vec<String>,
+}
+
+/// Scan a workflow schema for parked-action node names of one kind, in
+/// authoring order: linear steps first (named, or `step-{i}` fallback), then
+/// graph nodes by key (BTreeMap order is deterministic).
+pub fn park_candidates(workflow: &Workflow, kind: ParkKind) -> Vec<String> {
+    fn is_park(action: &Action, kind: ParkKind) -> bool {
+        match (action, kind) {
+            (Action::RequestApproval { .. }, ParkKind::Approval) => true,
+            (Action::Spawn { await_, .. }, ParkKind::Spawn) => *await_,
+            _ => false,
+        }
+    }
+    let mut out = Vec::new();
+    for (i, step) in workflow.steps.iter().enumerate() {
+        if is_park(&step.action, kind) {
+            out.push(step.name.clone().unwrap_or_else(|| format!("step-{i}")));
+        }
+    }
+    if let Some(graph) = &workflow.graph {
+        for (name, node) in &graph.nodes {
+            if is_park(&node.action, kind) {
+                out.push(name.clone());
+            }
+        }
+    }
+    out
+}
+
+/// Host-tracked run status. `Suspended` (parked on a promise) is distinct
+/// from `Succeeded`/`Failed` — a parked run is never logged as failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunState {
+    Running,
+    Suspended,
+    Succeeded,
+    Failed,
+    Blocked,
+    Cancelled,
+    Unknown,
+}
+
+impl RunState {
+    /// True once the run reached any terminal state.
+    pub fn is_terminal(self) -> bool {
+        !matches!(self, Self::Running | Self::Suspended)
+    }
+}
+
+/// Host-owned pending drain: registry + terminal ledger + per-(run, node)
+/// generation counters + known promise ids + run states + recorded
+/// mismatches. One drain serves every tracked run, independently of any
+/// single `engine.run` await; re-draining the same live sinks after a
+/// restart reconstructs the identical registry (deterministically
+/// replayable — no durable row required at Wave 1).
+#[derive(Debug, Default)]
+pub struct PendingDrain {
+    registry: PendingRegistry,
+    ledger: TerminalLedger,
+    generations: std::collections::HashMap<(String, String), u64>,
+    known: std::collections::HashSet<String>,
+    runs: std::collections::HashMap<String, RunState>,
+    run_workflows: std::collections::HashMap<String, Workflow>,
+    ignored: Vec<(Resolution, ResolutionMismatch)>,
+}
+
+impl PendingDrain {
+    /// Empty drain.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Track a run's workflow for later re-drains (called when the run starts).
+    pub fn track_run(&mut self, run_id: &str, workflow: Workflow) {
+        self.run_workflows.insert(run_id.to_string(), workflow);
+        self.runs.insert(run_id.to_string(), RunState::Running);
+    }
+
+    /// Current tracked state (`Running` when never observed).
+    pub fn run_state(&self, run_id: &str) -> RunState {
+        self.runs.get(run_id).copied().unwrap_or(RunState::Running)
+    }
+
+    /// Set the tracked state.
+    pub fn set_run_state(&mut self, run_id: &str, state: RunState) {
+        self.runs.insert(run_id.to_string(), state);
+    }
+
+    /// Drain one run's new sink ids of the context kind into structured
+    /// entries. Unknown future ids stay unmarked (retried next drain);
+    /// count-mismatched ids stay unmarked too — never guessed.
+    pub async fn drain(&mut self, engine: &WorkflowEngine, ctx: &ParkCtx) -> Vec<PendingEntry> {
+        let ids: Vec<String> = match ctx.kind {
+            ParkKind::Approval => engine.approval_sink().lock().await.clone(),
+            ParkKind::Spawn => engine.spawn_sink().lock().await.clone(),
+        };
+        let fresh: Vec<String> = ids
+            .into_iter()
+            .filter(|id| !self.known.contains(id))
+            .collect();
+        if fresh.is_empty() {
+            return Vec::new();
+        }
+        // Fresh sink ids exist: the run parked, even before attribution.
+        self.runs.insert(ctx.run_id.clone(), RunState::Suspended);
+        let attributed = attribute_parks(&ctx.candidates, &fresh);
+        if attributed.is_empty() {
+            warn!(
+                run_id = %ctx.run_id,
+                candidates = ctx.candidates.len(),
+                fresh = fresh.len(),
+                "park attribution refused: candidate/promise counts mismatch, retrying next drain"
+            );
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        for (node, id) in attributed {
+            let generation = self
+                .generations
+                .entry((ctx.run_id.clone(), node.clone()))
+                .or_insert(0);
+            *generation += 1;
+            let entry = PendingEntry::new(
+                ctx.run_id.clone(),
+                ctx.project.clone(),
+                ctx.workflow.clone(),
+                node,
+                None,
+                id.clone(),
+                *generation,
+                ctx.kind,
+            );
+            self.known.insert(id);
+            if self.registry.observe(entry.clone()) {
+                out.push(entry);
+            }
+        }
+        out
+    }
+
+    /// Re-drain every tracked non-terminal run (the loop calls this per
+    /// tick, so parks are picked up independently of any one run's await).
+    pub async fn drain_all(&mut self, engine: &WorkflowEngine) -> Vec<PendingEntry> {
+        let live: Vec<(String, Workflow)> = self
+            .run_workflows
+            .iter()
+            .filter(|(run_id, _)| !self.run_state(run_id).is_terminal())
+            .map(|(run_id, wf)| (run_id.clone(), wf.clone()))
+            .collect();
+        let mut out = Vec::new();
+        for (run_id, workflow) in &live {
+            for kind in [ParkKind::Approval, ParkKind::Spawn] {
+                let ctx = ParkCtx {
+                    run_id: run_id.clone(),
+                    workflow: workflow.name.clone(),
+                    project: None,
+                    kind,
+                    candidates: park_candidates(workflow, kind),
+                };
+                out.extend(self.drain(engine, &ctx).await);
+            }
+        }
+        out
+    }
+
+    /// Validate a claimed resolution: a match removes and returns the
+    /// parked entry for the caller to settle; a mismatch is recorded and
+    /// returned (never resumes anything).
+    pub fn resolve(&mut self, res: Resolution) -> Result<PendingEntry, ResolutionMismatch> {
+        // Look up by (run, promise) at the newest generation: a claimed
+        // older generation must surface as StaleGeneration, not UnknownPromise.
+        let found = self.registry.get_latest(&res.run_id, &res.promise_id);
+        match validate_resolution(found, &res) {
+            Ok(()) => Ok(self
+                .registry
+                .remove(&res.run_id, &res.promise_id, res.generation)
+                .expect("validated entry exists")),
+            Err(m) => {
+                self.ignored.push((res, m.clone()));
+                Err(m)
+            }
+        }
+    }
+
+    /// Record a terminal publication attempt in the ledger.
+    pub fn note_terminal(&mut self, record: TerminalRecord) -> TerminalNote {
+        self.ledger.note(record)
+    }
+
+    /// Number of parked entries.
+    pub fn registry_len(&self) -> usize {
+        self.registry.len()
+    }
+
+    /// Entries parked for one run.
+    pub fn entries_for_run(&self, run_id: &str) -> Vec<PendingEntry> {
+        self.registry
+            .entries_for_run(run_id)
+            .into_iter()
+            .cloned()
+            .collect()
+    }
+
+    /// Number of recorded (ignored) resolution mismatches.
+    pub fn ignored_count(&self) -> usize {
+        self.ignored.len()
     }
 }
 
@@ -1625,6 +2207,351 @@ steps:
         ));
         let coalescer = Arc::new(std::sync::Mutex::new(MentionCoalescer::from_env()));
         mailbox_runner(mailbox, coalescer, None)
+    }
+
+    /// bd-asx3 RED: draining a newly parked promise records one structured
+    /// entry (run/node/promise/generation) and suspends the run; a second
+    /// drain observes no duplicates.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn host_lifecycle_drain_records_structured_entry() {
+        use toron_workflow::engine::ParkKind;
+        let engine = WorkflowEngine::local(Arc::new(|_: &Action| Ok(serde_json::Value::Null)))
+            .expect("local engine");
+        engine
+            .approval_sink()
+            .lock()
+            .await
+            .push("promise-1".to_string());
+        let mut drain = PendingDrain::new();
+        let ctx = ParkCtx {
+            run_id: "run-1".into(),
+            workflow: "ship".into(),
+            project: None,
+            kind: ParkKind::Approval,
+            candidates: vec!["gate".into()],
+        };
+        let fresh = drain.drain(&engine, &ctx).await;
+        assert_eq!(fresh.len(), 1, "one structured entry for the new park");
+        let entry = &fresh[0];
+        assert_eq!(entry.run_id, "run-1");
+        assert_eq!(entry.node_path, "gate");
+        assert_eq!(entry.promise_id, "promise-1");
+        assert_eq!(entry.generation, 1);
+        assert_eq!(drain.run_state("run-1"), RunState::Suspended);
+        let again = drain.drain(&engine, &ctx).await;
+        assert!(again.is_empty(), "re-drain is idempotent");
+    }
+
+    /// bd-asx3 RED: restart recovery — a fresh drain over the same live
+    /// sinks reconstructs the identical registry without an in-memory carry.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn host_lifecycle_restart_recovery() {
+        use toron_workflow::engine::ParkKind;
+        let engine = WorkflowEngine::local(Arc::new(|_: &Action| Ok(serde_json::Value::Null)))
+            .expect("local engine");
+        engine
+            .approval_sink()
+            .lock()
+            .await
+            .push("promise-9".to_string());
+        let ctx = ParkCtx {
+            run_id: "run-9".into(),
+            workflow: "ship".into(),
+            project: None,
+            kind: ParkKind::Approval,
+            candidates: vec!["gate".into()],
+        };
+        let mut first = PendingDrain::new();
+        let a = first.drain(&engine, &ctx).await;
+        assert_eq!(a.len(), 1);
+        drop(first);
+        // Restart: brand-new drain, same live sinks.
+        let mut second = PendingDrain::new();
+        let b = second.drain(&engine, &ctx).await;
+        assert_eq!(b.len(), 1, "recovery re-observes the live park");
+        assert_eq!(b[0].key(), a[0].key(), "identical entry identity");
+    }
+
+    /// bd-asx3 RED: stale and unknown resolutions are recorded and ignored —
+    /// they never touch the parked promise.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn host_lifecycle_stale_resolution_ignored() {
+        use toron_workflow::engine::{Resolution, ResolutionMismatch, ResolutionVerdict};
+        let engine = WorkflowEngine::local(Arc::new(|_: &Action| Ok(serde_json::Value::Null)))
+            .expect("local engine");
+        engine
+            .approval_sink()
+            .lock()
+            .await
+            .push("promise-1".to_string());
+        let mut drain = PendingDrain::new();
+        let ctx = ParkCtx {
+            run_id: "run-1".into(),
+            workflow: "ship".into(),
+            project: None,
+            kind: ParkKind::Approval,
+            candidates: vec!["gate".into()],
+        };
+        assert_eq!(drain.drain(&engine, &ctx).await.len(), 1);
+        let stale = Resolution {
+            run_id: "run-1".into(),
+            project: None,
+            promise_id: "promise-1".into(),
+            generation: 0,
+            verdict: ResolutionVerdict::Approved,
+            note: "old".into(),
+        };
+        assert!(
+            matches!(
+                drain.resolve(stale),
+                Err(ResolutionMismatch::StaleGeneration { expected: 1 })
+            ),
+            "stale generation is rejected"
+        );
+        let unknown = Resolution {
+            run_id: "run-1".into(),
+            project: None,
+            promise_id: "promise-nope".into(),
+            generation: 1,
+            verdict: ResolutionVerdict::Approved,
+            note: "x".into(),
+        };
+        assert!(
+            matches!(
+                drain.resolve(unknown),
+                Err(ResolutionMismatch::UnknownPromise)
+            ),
+            "unknown promise is rejected"
+        );
+        assert_eq!(drain.ignored_count(), 2, "both mismatches recorded");
+        assert_eq!(drain.registry_len(), 1, "parked entry untouched");
+    }
+
+    /// bd-asx3 RED: park candidates come from the workflow schema in order —
+    /// named steps first, positional fallback for the unnamed.
+    #[test]
+    fn host_lifecycle_park_candidates_scan() {
+        use toron_workflow::engine::ParkKind;
+        let wf = toron_workflow::schema::parse_workflow(
+            "name: ship\ntrigger:\n  type: webhook\nsteps:\n  - name: gate\n    action: request_approval\n    message: q\n  - action: send_dm\n    to: a\n    body: b\n",
+        )
+        .expect("parse");
+        assert_eq!(
+            park_candidates(&wf, ParkKind::Approval),
+            vec!["gate".to_string()]
+        );
+        let wf2 = toron_workflow::schema::parse_workflow(
+            "name: ship\ntrigger:\n  type: webhook\nsteps:\n  - action: request_approval\n    message: q\n",
+        )
+        .expect("parse");
+        assert_eq!(
+            park_candidates(&wf2, ParkKind::Approval),
+            vec!["step-0".to_string()]
+        );
+    }
+
+    /// bd-asx3 RED: approval pending publication emits kind-46011 carrying
+    /// run/node/promise/generation — and terminal republish with the same
+    /// digest writes no second semantic terminal.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn host_lifecycle_pending_and_terminal_publication() {
+        use toron_core::bus::in_process::{InProcessBus, InProcessBusConfig};
+        use toron_core::index::schema;
+        use toron_workflow::engine::{ParkKind, PendingEntry};
+
+        let db = std::env::temp_dir().join(format!("wf-life-{}.sqlite", uuid::Uuid::new_v4()));
+        let pool = schema::connect(db.to_str().unwrap())
+            .await
+            .expect("connect");
+        schema::migrate(&pool).await.expect("migrate");
+        let bus: Arc<dyn Bus> = Arc::new(
+            InProcessBus::open(pool, InProcessBusConfig::default())
+                .await
+                .expect("bus"),
+        );
+        let runner: ActionRunner = Arc::new(|_: &Action| Ok(serde_json::Value::Null));
+        let host = WorkflowHost::over_bus(bus.clone(), runner, vec![])
+            .expect("host")
+            .with_job_signer(Some(Keys::generate()));
+
+        let entry = PendingEntry::new(
+            "run-1",
+            None,
+            "ship",
+            "gate",
+            None,
+            "promise-1",
+            1,
+            ParkKind::Approval,
+        );
+        let mut sub = bus
+            .subscribe_trusted(toron_core::bus::Filter::new())
+            .await
+            .expect("subscribe");
+        host.publish_approval_pending(&entry)
+            .await
+            .expect("publish pending");
+        let mut kinds = vec![];
+        for _ in 0..2 {
+            let got = tokio::time::timeout(std::time::Duration::from_secs(5), sub.next())
+                .await
+                .expect("event arrives")
+                .expect("stream item");
+            if let toron_core::bus::SubscriptionEvent::Event(ev) = got {
+                kinds.push(ev.kind.as_u16());
+                if ev.kind.as_u16() == 46011 {
+                    let body: serde_json::Value =
+                        serde_json::from_str(&ev.content).expect("46011 json");
+                    assert_eq!(body["promise_id"], serde_json::json!("promise-1"));
+                    assert_eq!(body["run_id"], serde_json::json!("run-1"));
+                    assert_eq!(body["generation"], serde_json::json!(1));
+                }
+            }
+        }
+        assert!(
+            kinds.contains(&46011),
+            "pending published as 46011: {kinds:?}"
+        );
+
+        // Terminal: same digest twice → one semantic terminal on the bus.
+        let note1 = host
+            .publish_terminal("run-1", "digest-1", "succeeded", "gate", "ev-1")
+            .await
+            .expect("publish terminal");
+        assert!(matches!(note1, toron_workflow::engine::TerminalNote::New));
+        let note2 = host
+            .publish_terminal("run-1", "digest-1", "succeeded", "gate", "ev-1")
+            .await
+            .expect("republish terminal");
+        assert!(matches!(
+            note2,
+            toron_workflow::engine::TerminalNote::Duplicate
+        ));
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// bd-asx3 e2e: a real parked run is SUSPENDED (never failed), drains
+    /// into the registry independently of the run await, and resumes to
+    /// Succeeded through the validated host resolution path.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn host_lifecycle_parked_run_suspends_and_resolves() {
+        use toron_core::bus::in_process::{InProcessBus, InProcessBusConfig};
+        use toron_core::index::schema;
+        use toron_workflow::engine::ResolutionVerdict;
+
+        // Real `resonate serve` (same requirement as the engine WF-08 tests).
+        let dir = std::env::temp_dir().join(format!("wf-life-rsrv-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("tmpdir");
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("port")
+            .local_addr()
+            .expect("addr")
+            .port();
+        let url = format!("http://127.0.0.1:{port}");
+        let mut server = std::process::Command::new("resonate")
+            .args([
+                "serve",
+                "--storage-type",
+                "sqlite",
+                "--server-port",
+                &port.to_string(),
+                "--server-host",
+                "127.0.0.1",
+            ])
+            .current_dir(&dir)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("resonate serve");
+        // Wait for the server port (up to ~10s).
+        let mut ready = false;
+        for _ in 0..100 {
+            if std::net::TcpStream::connect(format!("127.0.0.1:{port}")).is_ok() {
+                ready = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        if !ready {
+            let _ = server.kill();
+            let _ = server.wait();
+            eprintln!("SKIP: resonate serve did not come up");
+            return;
+        }
+
+        let db = std::env::temp_dir().join(format!("wf-lifee2e-{}.sqlite", uuid::Uuid::new_v4()));
+        let pool = schema::connect(db.to_str().unwrap())
+            .await
+            .expect("connect");
+        schema::migrate(&pool).await.expect("migrate");
+        let bus: Arc<dyn Bus> = Arc::new(
+            InProcessBus::open(pool, InProcessBusConfig::default())
+                .await
+                .expect("bus"),
+        );
+        let runner: ActionRunner = Arc::new(|_: &Action| Ok(serde_json::json!({"ok": true})));
+        let engine = WorkflowEngine::remote(&url, runner).expect("remote engine");
+        let host = WorkflowHost::over_bus_with_engine(bus, engine, vec![])
+            .with_job_signer(Some(Keys::generate()));
+
+        let wf = toron_workflow::schema::parse_workflow(
+            "name: ship\ntrigger:\n  type: webhook\nsteps:\n  - name: gate\n    action: request_approval\n    message: Release?\n",
+        )
+        .expect("parse");
+        let input = toron_workflow::engine::RunInput {
+            workflow: wf.clone(),
+            trigger: serde_json::json!({}),
+            run_id: None,
+        };
+        host.spawn_run_and_drain("run-e2e-1".to_string(), wf, input)
+            .await;
+
+        // The run parks: Suspended, structured, and NOT failed.
+        let mut parked = false;
+        for _ in 0..150 {
+            let pending = host.pending().lock().await;
+            if pending.run_state("run-e2e-1") == RunState::Suspended && pending.registry_len() == 1
+            {
+                parked = true;
+                break;
+            }
+            drop(pending);
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(parked, "run parks as Suspended with one structured entry");
+        assert_ne!(
+            host.pending().lock().await.run_state("run-e2e-1"),
+            RunState::Failed,
+            "suspended is distinct from failed"
+        );
+        let entries = host.pending().lock().await.entries_for_run("run-e2e-1");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].node_path, "gate");
+
+        // Operator approves through the validated host path.
+        let res = toron_workflow::engine::Resolution {
+            run_id: "run-e2e-1".into(),
+            project: None,
+            promise_id: entries[0].promise_id.clone(),
+            generation: 1,
+            verdict: ResolutionVerdict::Approved,
+            note: "ship it".into(),
+        };
+        host.resolve_parked(res).await.expect("resolve parked");
+
+        // The parked run resumes and completes.
+        let mut done = false;
+        for _ in 0..150 {
+            if host.pending().lock().await.run_state("run-e2e-1") == RunState::Succeeded {
+                done = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(done, "run resumes to Succeeded after validated resolution");
+        let _ = server.kill();
+        let _ = server.wait();
+        let _ = std::fs::remove_file(&db);
     }
 
     /// bd-i6kc: `react` has no reaction sink — it MUST fail closed with an

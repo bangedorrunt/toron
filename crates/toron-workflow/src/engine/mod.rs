@@ -136,8 +136,11 @@ pub use control_flow::{
     GraphNodeInput, ParallelCopyInput, build_workflow_run_terminal, run_graph_node,
     run_parallel_copy, run_workflow, stamp_workflow_emitted,
 };
-pub use sinks::{ApprovalSink, SpawnSink, VerifyRequest, VerifyResult, VerifySink};
-
+pub use sinks::{
+    ApprovalSink, MAX_PENDING_QUESTION, ParkKind, PendingEntry, PendingRegistry, Resolution,
+    ResolutionMismatch, ResolutionVerdict, SpawnSink, TerminalLedger, TerminalNote, TerminalRecord,
+    VerifyRequest, VerifyResult, VerifySink, attribute_parks, terminal_digest, validate_resolution,
+};
 // Crate-internal: the split modules' private helpers, re-exported so the
 // tests.rs suite (moved verbatim, `use super::*`) keeps resolving them.
 // Some names are exercised only indirectly — the allow documents that the
