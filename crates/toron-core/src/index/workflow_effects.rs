@@ -427,6 +427,15 @@ pub enum TerminalOutcome {
     Conflict { existing_digest: String },
 }
 
+/// How many rows one [`WorkflowEffectStore::prune_expired`] run removed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PruneCounts {
+    pub effects: i64,
+    pub attempts: i64,
+    pub terminals: i64,
+    pub runs: i64,
+}
+
 /// Durable workflow-effect journal over the `workflow_*` SQLite tables.
 #[derive(Debug, Clone)]
 pub struct WorkflowEffectStore {
@@ -997,6 +1006,78 @@ impl WorkflowEffectStore {
         .execute(&self.pool)
         .await?;
         Ok(res.rows_affected() > 0)
+    }
+
+    /// Enforce retention/compaction bounds (bd-v139.3): delete terminal
+    /// effects whose `retention_until` passed (plus their orphaned attempt
+    /// evidence), published terminals older than `terminal_max_age_us`, and
+    /// terminal runs older than `terminal_max_age_us` with no live effects.
+    /// NEVER deletes: non-terminal effects, `unknown`/`reconcile_pending`
+    /// rows (uncertainty outlives every evidence window), or parked pending
+    /// rows (live work is not evidence). Each table is bounded by `limit`.
+    pub async fn prune_expired(
+        &self,
+        now: i64,
+        terminal_max_age_us: i64,
+        limit: i64,
+    ) -> anyhow::Result<PruneCounts> {
+        // NOTE: stock SQLite has no DELETE..LIMIT; bound each pass with a
+        // rowid subquery instead (same bound, portable syntax).
+        let effects = sqlx::query(
+            "DELETE FROM workflow_effects WHERE effect_key IN \
+             (SELECT effect_key FROM workflow_effects \
+              WHERE retention_until IS NOT NULL AND retention_until < ?1 \
+                AND state IN ('settled','failed','cancelled') \
+              LIMIT ?2)",
+        )
+        .bind(now)
+        .bind(limit)
+        .execute(&self.pool)
+        .await?
+        .rows_affected() as i64;
+        let attempts = sqlx::query(
+            "DELETE FROM workflow_effect_attempts WHERE id IN \
+             (SELECT id FROM workflow_effect_attempts \
+              WHERE effect_key NOT IN (SELECT effect_key FROM workflow_effects) \
+              LIMIT ?1)",
+        )
+        .bind(limit)
+        .execute(&self.pool)
+        .await?
+        .rows_affected() as i64;
+        let cutoff = now.saturating_sub(terminal_max_age_us);
+        let terminals = sqlx::query(
+            "DELETE FROM workflow_terminal_events WHERE terminal_digest IN \
+             (SELECT terminal_digest FROM workflow_terminal_events \
+              WHERE publication_state = 'published' AND updated_at < ?1 \
+              LIMIT ?2)",
+        )
+        .bind(cutoff)
+        .bind(limit)
+        .execute(&self.pool)
+        .await?
+        .rows_affected() as i64;
+        let runs = sqlx::query(
+            "DELETE FROM workflow_runs WHERE run_id IN \
+             (SELECT run_id FROM workflow_runs \
+              WHERE status IN ('succeeded','failed','blocked','cancelled','unknown') \
+                AND updated_at < ?1 \
+                AND NOT EXISTS (SELECT 1 FROM workflow_effects \
+                                WHERE workflow_effects.run_id = workflow_runs.run_id \
+                                  AND state NOT IN ('settled','failed','cancelled')) \
+              LIMIT ?2)",
+        )
+        .bind(cutoff)
+        .bind(limit)
+        .execute(&self.pool)
+        .await?
+        .rows_affected() as i64;
+        Ok(PruneCounts {
+            effects,
+            attempts,
+            terminals,
+            runs,
+        })
     }
 }
 

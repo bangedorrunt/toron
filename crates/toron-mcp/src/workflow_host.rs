@@ -31,9 +31,12 @@ use toron_core::bus::{Bus, SubscriptionEvent};
 use toron_core::mailbox::{Mailbox, SendMessage, UnwrappedMail};
 use toron_workflow::coalesce::{CoalesceDecision, Coalesced, MentionCoalescer};
 use toron_workflow::engine::{
-    ActionRunner, Decision, ParkKind, PendingEntry, PendingRegistry, Resolution,
-    ResolutionMismatch, ResolutionVerdict, RunInput, TerminalLedger, TerminalNote, TerminalRecord,
-    WorkflowEngine, attribute_parks, terminal_digest, validate_resolution,
+    ActionRunner, CleanupKind, CleanupRequest, Decision, DispatchPlan, EffectView,
+    FORCED_CLEANUP_CAPABILITY, ParkKind, PendingEntry, PendingRegistry, ProviderCapability,
+    ProviderOutcome, Resolution, ResolutionMismatch, ResolutionVerdict, RunInput, TerminalLedger,
+    TerminalNote, TerminalRecord, UnknownReport, WorkflowEngine, attribute_parks,
+    capability_for_action_type, cleanup_effect_key, corr_for_effect, describe_unknown,
+    plan_attempt, terminal_digest, validate_resolution,
 };
 use toron_workflow::jobs::{JobRequest, build_job_request_with_tags};
 use toron_workflow::schema::{Action, Trigger, Workflow};
@@ -1181,9 +1184,6 @@ impl PendingDrain {
 use toron_core::index::workflow_effects::{
     ClaimAttempt, EffectState, NewAttempt, NewEffect, WorkflowEffect, WorkflowEffectStore, now_us,
 };
-use toron_workflow::engine::{
-    DispatchPlan, EffectView, ProviderCapability, ProviderOutcome, corr_for_effect, plan_attempt,
-};
 
 /// One effect dispatch request: identity inputs plus the provider's
 /// declared capability. The effect key is minted by the caller (stable
@@ -1413,6 +1413,94 @@ impl EffectDispatcher {
             attempt: row.attempt,
             state: row.state,
             outcome,
+        }
+    }
+
+    /// Run one fixed cleanup effect (ADR-0032 Spec 8.2, bd-v139.3): lease
+    /// release, bounded captain evidence, or bead comment — never a
+    /// user-authored undo, never a rollback claim, never a bead close.
+    /// The attempt journals under `{parent}/cleanup:{kind}` with the
+    /// kind's retry capability; the parent failure row is never written.
+    /// `force` is the explicit operator override for ambiguous non-idempotent
+    /// cleanups (out-of-band confirmation first): without it, an uncertain
+    /// mail/comment refuses to re-fire.
+    pub async fn run_cleanup(
+        &self,
+        parent_key: &str,
+        kind: CleanupKind,
+        note: Option<serde_json::Value>,
+        force: bool,
+        provider: impl FnOnce(&CleanupRequest) -> ProviderOutcome,
+    ) -> anyhow::Result<DispatchResult> {
+        let key = cleanup_effect_key(parent_key, kind);
+        let mut capability = kind.capability();
+        if force {
+            let row = self.store.get_effect(&key).await?;
+            let needs_override = match row {
+                Some(r) if !r.state.is_terminal() => {
+                    let now = now_us();
+                    let lease_live = matches!(r.lease_expires_at, Some(e) if e > now);
+                    let view = EffectView {
+                        state: r.state,
+                        attempt: r.attempt,
+                        lease_live,
+                    };
+                    matches!(
+                        plan_attempt(Some(&view), &capability),
+                        DispatchPlan::RefuseBlindRetry { .. } | DispatchPlan::ReconcileFirst { .. }
+                    )
+                }
+                _ => false,
+            };
+            if needs_override {
+                capability = FORCED_CLEANUP_CAPABILITY;
+            }
+        }
+        let run_id = match self.store.get_effect(parent_key).await? {
+            Some(parent) => parent.run_id,
+            None => parent_key.to_string(),
+        };
+        let action_type = format!("cleanup:{}", kind.as_str());
+        let req = DispatchRequest {
+            effect_key: key,
+            run_id,
+            project: None,
+            workflow_digest: String::new(),
+            node_path: String::new(),
+            iteration_key: None,
+            action_type,
+            action_digest: String::new(),
+            redacted_action: note.clone(),
+            capability,
+        };
+        let cleanup = CleanupRequest {
+            parent_key: parent_key.to_string(),
+            kind,
+            note,
+        };
+        self.dispatch(&req, |_| provider(&cleanup)).await
+    }
+
+    /// Render the operator-facing report for an effect stuck in uncertainty.
+    /// Returns `None` for settled/failed rows (nothing to reconcile) and
+    /// unknown keys.
+    pub async fn unknown_report(&self, effect_key: &str) -> Option<UnknownReport> {
+        let row = self.store.get_effect(effect_key).await.ok()??;
+        match row.state {
+            EffectState::Unknown | EffectState::ReconcilePending => {
+                let cap = capability_for_action_type(&row.action_type);
+                Some(UnknownReport {
+                    effect_key: row.effect_key,
+                    run_id: row.run_id,
+                    node_path: row.node_path,
+                    state: row.state,
+                    attempt: row.attempt,
+                    evidence: row.failure_json.clone().or(row.outcome_json.clone()),
+                    next_step: describe_unknown(row.state, cap.supports_reconcile_query)
+                        .to_string(),
+                })
+            }
+            _ => None,
         }
     }
 }
@@ -3051,6 +3139,431 @@ steps:
             EffectState::Settled,
             "cleanup separately settled"
         );
+    }
+
+    /// bd-v139.3 test helper: a cleanup dispatcher over a throwaway journal.
+    async fn cleanup_dispatcher(
+        tag: &str,
+    ) -> (
+        EffectDispatcher,
+        toron_core::index::workflow_effects::WorkflowEffectStore,
+    ) {
+        let store = recon_store(tag).await;
+        let dispatcher = EffectDispatcher::new(store.clone());
+        (dispatcher, store)
+    }
+
+    /// bd-v139.3 RED: reservation-release cleanup is natively idempotent —
+    /// an ambiguous attempt journals `unknown`, then a same-key retry
+    /// settles without touching the parent failure.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn effect_cleanup_release_idempotent_retry() {
+        use toron_core::index::workflow_effects::EffectState;
+        use toron_workflow::engine::CleanupKind;
+        let (dispatcher, store) = cleanup_dispatcher("release").await;
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c2 = calls.clone();
+        let first = dispatcher
+            .run_cleanup(
+                "ek-parent",
+                CleanupKind::ReleaseReservations,
+                None,
+                false,
+                |_| {
+                    c2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    ProviderOutcome::Ambiguous("release timeout".into())
+                },
+            )
+            .await
+            .expect("first cleanup attempt");
+        assert_eq!(first.state, EffectState::Unknown);
+        assert_eq!(first.effect_key, "ek-parent/cleanup:release-reservations");
+        let second = dispatcher
+            .run_cleanup(
+                "ek-parent",
+                CleanupKind::ReleaseReservations,
+                None,
+                false,
+                |_| {
+                    c2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    ProviderOutcome::Delivered(serde_json::json!({"ok": true}))
+                },
+            )
+            .await
+            .expect("retry converges");
+        assert_eq!(second.state, EffectState::Settled);
+        assert_eq!(second.attempt, 2);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 2);
+        assert!(store.get_effect("ek-parent").await.unwrap().is_none());
+    }
+
+    /// bd-v139.3 RED: captain-evidence mail is NOT natively idempotent — an
+    /// ambiguous attempt refuses an unforced retry (no duplicate mail), and
+    /// an operator-forced retry settles the same key after out-of-band
+    /// confirmation.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn effect_cleanup_mail_force_retry() {
+        use toron_core::index::workflow_effects::EffectState;
+        use toron_workflow::engine::CleanupKind;
+        let (dispatcher, _store) = cleanup_dispatcher("mail").await;
+        dispatcher
+            .run_cleanup(
+                "ek-parent",
+                CleanupKind::CaptainEvidence,
+                None,
+                false,
+                |_| ProviderOutcome::Ambiguous("send timeout".into()),
+            )
+            .await
+            .expect("first attempt journals unknown");
+        let refused = dispatcher
+            .run_cleanup(
+                "ek-parent",
+                CleanupKind::CaptainEvidence,
+                None,
+                false,
+                |_| ProviderOutcome::Delivered(serde_json::json!({"ok": true})),
+            )
+            .await;
+        assert!(refused.is_err(), "unforced retry of ambiguous mail refuses");
+        let forced = dispatcher
+            .run_cleanup(
+                "ek-parent",
+                CleanupKind::CaptainEvidence,
+                None,
+                true,
+                |_| ProviderOutcome::Delivered(serde_json::json!({"ok": true})),
+            )
+            .await
+            .expect("operator-forced retry settles");
+        assert_eq!(forced.state, EffectState::Settled);
+        assert_eq!(forced.attempt, 2);
+    }
+
+    /// bd-v139.3 RED: duplicate cleanup returns the stored outcome without
+    /// re-firing the provider.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn effect_cleanup_duplicate_no_refire() {
+        use toron_workflow::engine::CleanupKind;
+        let (dispatcher, _store) = cleanup_dispatcher("dupe").await;
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c2 = calls.clone();
+        let run = |_: &toron_workflow::engine::CleanupRequest| {
+            c2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            ProviderOutcome::Delivered(serde_json::json!({"ok": true}))
+        };
+        let first = dispatcher
+            .run_cleanup("ek-p", CleanupKind::BeadComment, None, false, run)
+            .await
+            .expect("first");
+        let second = dispatcher
+            .run_cleanup("ek-p", CleanupKind::BeadComment, None, false, run)
+            .await
+            .expect("second");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(first.outcome, second.outcome);
+    }
+
+    /// bd-v139.3 RED: interrupted cleanup (claimed, never classified) is
+    /// recoverable — a new dispatcher over the same journal retries the
+    /// same key after lease expiry instead of forking.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn effect_cleanup_interrupted_recoverable() {
+        use toron_core::index::workflow_effects::{ClaimAttempt, EffectState, NewEffect};
+        use toron_workflow::engine::CleanupKind;
+        let (dispatcher, store) = cleanup_dispatcher("interrupt").await;
+        // Simulate a crash between claim and classification: prepared intent
+        // plus a live-looking claim with an already-expired lease.
+        store
+            .prepare_effect(NewEffect {
+                effect_key: "ek-p/cleanup:release-reservations".into(),
+                run_id: "run-1".into(),
+                project: None,
+                workflow_digest: "d".into(),
+                node_path: "n".into(),
+                iteration_key: None,
+                action_type: "cleanup:release-reservations".into(),
+                action_digest: "a".into(),
+                redacted_action: None,
+                retention_until: None,
+            })
+            .await
+            .unwrap();
+        store
+            .claim_attempt(
+                "ek-p/cleanup:release-reservations",
+                ClaimAttempt {
+                    attempt: 1,
+                    attempt_id: "att-1".into(),
+                    claim_token: "tok-crash".into(),
+                    lease_expires_at: 1,
+                    expected_claim_token: None,
+                },
+            )
+            .await
+            .unwrap();
+        let recovered = dispatcher
+            .run_cleanup(
+                "ek-p",
+                CleanupKind::ReleaseReservations,
+                None,
+                false,
+                |_| ProviderOutcome::Delivered(serde_json::json!({"ok": true})),
+            )
+            .await
+            .expect("expired lease recovers");
+        assert_eq!(recovered.state, EffectState::Settled);
+        assert_eq!(recovered.attempt, 2, "same key, next attempt");
+    }
+
+    /// bd-v139.3 RED: retention prunes only terminal evidence within policy —
+    /// settled-with-expired-retention goes (with its attempts), while
+    /// unknown, in-flight, pending, and unexpired rows survive.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn effect_cleanup_retention_prunes_only_terminal() {
+        use toron_core::index::workflow_effects::{
+            ClaimAttempt, EffectState, NewAttempt, NewEffect, NewPending, PendingKind, TerminalPub,
+        };
+        use toron_workflow::engine::RetentionPolicy;
+        let (_dispatcher, store) = cleanup_dispatcher("retention").await;
+        let old = 1i64;
+        let future = 9_999_999_999_999_999i64;
+        let seed_effect = |key: &str, run: &str, retention: i64| NewEffect {
+            effect_key: key.into(),
+            run_id: run.into(),
+            project: None,
+            workflow_digest: "d".into(),
+            node_path: "n".into(),
+            iteration_key: None,
+            action_type: "send_message".into(),
+            action_digest: "a".into(),
+            redacted_action: None,
+            retention_until: Some(retention),
+        };
+        // Settled + expired retention: prunable, with its attempts.
+        store
+            .prepare_effect(seed_effect("ek-old", "run-old", old))
+            .await
+            .unwrap();
+        store
+            .transition_effect("ek-old", EffectState::InFlight, None, None)
+            .await
+            .unwrap();
+        store
+            .transition_effect(
+                "ek-old",
+                EffectState::Settled,
+                None,
+                Some(serde_json::json!(1)),
+            )
+            .await
+            .unwrap();
+        store
+            .record_attempt(NewAttempt {
+                effect_key: "ek-old".into(),
+                attempt: 1,
+                attempt_id: "att-1".into(),
+                claim_token: None,
+                state: EffectState::Settled,
+                evidence: None,
+            })
+            .await
+            .unwrap();
+        // Unknown + expired retention: uncertainty survives.
+        store
+            .prepare_effect(seed_effect("ek-unk", "run-old", old))
+            .await
+            .unwrap();
+        store
+            .transition_effect("ek-unk", EffectState::InFlight, None, None)
+            .await
+            .unwrap();
+        store
+            .transition_effect(
+                "ek-unk",
+                EffectState::Unknown,
+                Some(serde_json::json!({"error": "t/o"})),
+                None,
+            )
+            .await
+            .unwrap();
+        // Settled + live retention: survives.
+        store
+            .prepare_effect(seed_effect("ek-new", "run-old", future))
+            .await
+            .unwrap();
+        store
+            .transition_effect("ek-new", EffectState::InFlight, None, None)
+            .await
+            .unwrap();
+        store
+            .transition_effect("ek-new", EffectState::Settled, None, None)
+            .await
+            .unwrap();
+        // In-flight: survives regardless.
+        store
+            .prepare_effect(seed_effect("ek-fly", "run-old", old))
+            .await
+            .unwrap();
+        store
+            .claim_attempt(
+                "ek-fly",
+                ClaimAttempt {
+                    attempt: 1,
+                    attempt_id: "att-1".into(),
+                    claim_token: "tok".into(),
+                    lease_expires_at: future,
+                    expected_claim_token: None,
+                },
+            )
+            .await
+            .unwrap();
+        // Pending: never auto-pruned.
+        store
+            .upsert_pending(NewPending {
+                run_id: "run-old".into(),
+                promise_id: "p-1".into(),
+                park_generation: 1,
+                project: None,
+                workflow: "w".into(),
+                node_path: "n".into(),
+                effect_key: None,
+                kind: PendingKind::Approval,
+                pending_payload: serde_json::json!({}),
+                deadline_secs: None,
+            })
+            .await
+            .unwrap();
+        // A fully quiesced run (terminal, no live effects) IS prunable.
+        store
+            .create_run(toron_core::index::workflow_effects::NewRun {
+                run_id: "run-old".into(),
+                project: None,
+                workflow: "w".into(),
+                workflow_digest: "d".into(),
+            })
+            .await
+            .unwrap();
+        store
+            .create_run(toron_core::index::workflow_effects::NewRun {
+                run_id: "run-gone".into(),
+                project: None,
+                workflow: "w".into(),
+                workflow_digest: "d".into(),
+            })
+            .await
+            .unwrap();
+        use toron_core::index::workflow_effects::RunStatus;
+        for (from, to) in [
+            (RunStatus::Started, RunStatus::Running),
+            (RunStatus::Running, RunStatus::Succeeded),
+        ] {
+            store.cas_run_status("run-gone", from, to).await.unwrap();
+        }
+        store
+            .prepare_effect(seed_effect("ek-gone", "run-gone", old))
+            .await
+            .unwrap();
+        store
+            .transition_effect("ek-gone", EffectState::InFlight, None, None)
+            .await
+            .unwrap();
+        store
+            .transition_effect("ek-gone", EffectState::Settled, None, None)
+            .await
+            .unwrap();
+        store
+            .note_terminal_pub(TerminalPub::new("run-old", "digest-old", "succeeded", "n"))
+            .await
+            .unwrap();
+        store.mark_terminal_published("digest-old").await.unwrap();
+        let counts = store
+            .prune_expired(
+                5_000_000_000_000_000,
+                RetentionPolicy::default().terminal_max_age_us,
+                500,
+            )
+            .await
+            .unwrap();
+        assert_eq!(counts.effects, 2, "expired terminal effects only");
+        assert_eq!(counts.attempts, 1, "orphaned attempt evidence");
+        assert!(store.get_effect("ek-old").await.unwrap().is_none());
+        assert!(store.get_effect("ek-gone").await.unwrap().is_none());
+        assert!(
+            store.get_effect("ek-unk").await.unwrap().is_some(),
+            "unknown survives"
+        );
+        assert!(
+            store.get_effect("ek-new").await.unwrap().is_some(),
+            "live retention survives"
+        );
+        assert!(
+            store.get_effect("ek-fly").await.unwrap().is_some(),
+            "in-flight survives"
+        );
+        assert_eq!(
+            store.list_pending("run-old").await.unwrap().len(),
+            1,
+            "pending survives"
+        );
+        assert_eq!(counts.terminals, 1, "published terminal pruned by age");
+        assert_eq!(counts.runs, 1, "only the quiesced run pruned");
+        assert!(
+            store.get_run("run-old").await.unwrap().is_some(),
+            "run with live effects survives"
+        );
+    }
+
+    /// bd-v139.3 RED: journaled evidence is redacted by bound — a huge
+    /// redacted action projection lands truncated, never raw.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn effect_cleanup_evidence_redacted() {
+        use toron_core::index::workflow_effects::MAX_EVIDENCE_BYTES;
+        use toron_workflow::engine::CleanupKind;
+        let (dispatcher, store) = cleanup_dispatcher("redact").await;
+        let big = "s3cr3t-".repeat(2000);
+        dispatcher
+            .run_cleanup(
+                "ek-p",
+                CleanupKind::CaptainEvidence,
+                Some(serde_json::json!({"body": big})),
+                true,
+                |_| ProviderOutcome::Delivered(serde_json::json!({"ok": true})),
+            )
+            .await
+            .expect("dispatch");
+        let row = store
+            .get_effect("ek-p/cleanup:captain-evidence")
+            .await
+            .unwrap()
+            .unwrap();
+        let stored = row.redacted_action.unwrap();
+        assert!(stored.len() <= MAX_EVIDENCE_BYTES + 32, "bounded");
+        assert!(stored.ends_with("…[truncated]"), "truncation is explicit");
+    }
+
+    /// bd-v139.3 RED: unknown rows render an operator-actionable report —
+    /// key, location, attempt, and the next check, never a bare state.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn effect_cleanup_unknown_report_actionable() {
+        use toron_workflow::engine::CleanupKind;
+        let (dispatcher, _store) = cleanup_dispatcher("report").await;
+        dispatcher
+            .run_cleanup("ek-p", CleanupKind::BeadComment, None, false, |_| {
+                ProviderOutcome::Ambiguous("comment timeout".into())
+            })
+            .await
+            .expect("unknown");
+        let report = dispatcher
+            .unknown_report("ek-p/cleanup:bead-comment")
+            .await
+            .expect("report exists for unknown row");
+        assert_eq!(report.effect_key, "ek-p/cleanup:bead-comment");
+        assert!(
+            report.next_step.contains("operator"),
+            "names the next check"
+        );
+        assert!(dispatcher.unknown_report("ek-missing").await.is_none());
     }
 
     /// bd-i6kc: `react` has no reaction sink — it MUST fail closed with an
