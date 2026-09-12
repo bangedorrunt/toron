@@ -160,6 +160,9 @@ fn render_json_value_strict(
 /// (`steps.<name>.<path>` or `trigger.<path>`), rendered as JSON text.
 /// FAILS with the raw token when a ref does not resolve — the caller turns
 /// it into a workflow/node/field/path error (ADR-0032 Spec 4).
+///
+/// [`render_text`] is the single-string entrypoint for execution points
+/// (per-item join templates); this is its shared implementation.
 fn render_template_strict(
     s: &str,
     trigger: &serde_json::Value,
@@ -188,6 +191,17 @@ fn render_template_strict(
     }
     out.push_str(rest);
     Ok(out)
+}
+
+/// Render one template string strictly: `Ok` rendered text, `Err` the raw
+/// token of the first unresolvable ref. Single-string entrypoint for
+/// execution points (per-item join templates in bd-3pti).
+pub(crate) fn render_text(
+    s: &str,
+    trigger: &serde_json::Value,
+    step_outputs: &serde_json::Map<String, serde_json::Value>,
+) -> Result<String, String> {
+    render_template_strict(s, trigger, step_outputs)
 }
 
 /// Resolve one template token to a rendered string, or `None` when the path

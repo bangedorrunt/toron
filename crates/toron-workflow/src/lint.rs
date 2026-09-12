@@ -726,6 +726,17 @@ fn check_action(report: &mut LintReport, action: &Action) {
                 });
             }
         }
+        Action::Reduce { .. } => {
+            // ADR-0032 Spec 2 (bd-3pti): the authoring gate consumes the
+            // closed contract table for the new variant.
+            for v in crate::action_contract::validate_action(action) {
+                report.issues.push(LintIssue {
+                    level: Level::Error,
+                    message: format!("reduce field {:?}: {}", v.field, v.message),
+                    line: None,
+                });
+            }
+        }
     }
 }
 
