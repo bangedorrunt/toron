@@ -5,4 +5,5 @@ pub mod projection;
 pub mod rebuild;
 pub mod schema;
 pub mod slots;
+pub mod workflow_effects;
 pub mod writer;
