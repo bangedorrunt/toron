@@ -38,7 +38,7 @@ fn bound_evidence(value: &serde_json::Value) -> String {
 }
 
 /// Microsecond clock (i64-µs, ADR G7).
-fn now_us() -> i64 {
+pub fn now_us() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -612,7 +612,8 @@ impl WorkflowEffectStore {
         let outcome_json = outcome.as_ref().map(bound_evidence);
         let updated = sqlx::query(
             "UPDATE workflow_effects SET state = ?1, failure_json = COALESCE(?2, failure_json), \
-                    outcome_json = COALESCE(?3, outcome_json), updated_at = ?4 \
+                    outcome_json = COALESCE(?3, outcome_json), lease_expires_at = NULL, \
+                    updated_at = ?4 \
              WHERE effect_key = ?5 AND state = ?6",
         )
         .bind(to.as_str())
@@ -620,6 +621,70 @@ impl WorkflowEffectStore {
         .bind(&outcome_json)
         .bind(now_us())
         .bind(effect_key)
+        .bind(current.state.as_str())
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        Ok(updated > 0)
+    }
+
+    /// Link one effect to its mailbox transport correlation (ADR-0032
+    /// Spec 5.4): for a workflow-originated mailbox effect the sender sets
+    /// `corr = effect_key` as a deliberate projection. The link is one
+    /// column, never a second journal — the receipts table stays untouched.
+    /// Returns `false` when the effect is unknown.
+    pub async fn link_transport_corr(
+        &self,
+        effect_key: &str,
+        transport_corr: &str,
+    ) -> anyhow::Result<bool> {
+        let res = sqlx::query(
+            "UPDATE workflow_effects SET transport_corr = ?1, updated_at = ?2 \
+             WHERE effect_key = ?3",
+        )
+        .bind(transport_corr)
+        .bind(now_us())
+        .bind(effect_key)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    /// Settle (or fail) one effect under fencing: the presented token must
+    /// equal the live claim token, and the transition must be legal (see
+    /// [`can_transition`]). A stale owner fails closed with `false` and
+    /// changes nothing — uncertainty is preserved, never overwritten.
+    pub async fn settle_with_fence(
+        &self,
+        effect_key: &str,
+        presented_token: &str,
+        to: EffectState,
+        failure: Option<serde_json::Value>,
+        outcome: Option<serde_json::Value>,
+    ) -> anyhow::Result<bool> {
+        let Some(current) = self.get_effect(effect_key).await? else {
+            anyhow::bail!("unknown effect {effect_key:?}");
+        };
+        if presented_token.is_empty() || current.claim_token.as_deref() != Some(presented_token) {
+            return Ok(false);
+        }
+        if !can_transition(current.state, to) {
+            return Ok(false);
+        }
+        let failure_json = failure.as_ref().map(bound_evidence);
+        let outcome_json = outcome.as_ref().map(bound_evidence);
+        let updated = sqlx::query(
+            "UPDATE workflow_effects SET state = ?1, failure_json = COALESCE(?2, failure_json), \
+                    outcome_json = COALESCE(?3, outcome_json), lease_expires_at = NULL, \
+                    updated_at = ?4 \
+             WHERE effect_key = ?5 AND claim_token = ?6 AND state = ?7",
+        )
+        .bind(to.as_str())
+        .bind(&failure_json)
+        .bind(&outcome_json)
+        .bind(now_us())
+        .bind(effect_key)
+        .bind(presented_token)
         .bind(current.state.as_str())
         .execute(&self.pool)
         .await?
