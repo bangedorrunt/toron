@@ -30,6 +30,15 @@ use super::types::{AgentStatus, BackendEvent, PaneId, PromptLanding, normalize_h
 /// herdr 0.9.0 — live `herdr api schema --json` reports 22).
 pub const HDR_PROTOCOL: u64 = 22;
 
+/// Source id for toron mail-identity pane stamps (bd-6f57). Display-only
+/// `pane.report_metadata` — never `pane.report_agent`, which would steal
+/// lifecycle authority (waits/rollups) from the herdr integration.
+pub const MAIL_IDENTITY_SOURCE: &str = "toron:mail-identity";
+/// Token keys for the mail-identity stamp (ASCII alnum/`_`/`-`, ≤32 chars).
+pub const TOKEN_PIN: &str = "toron_pin";
+pub const TOKEN_PROJECT: &str = "toron_project";
+pub const TOKEN_NPUB: &str = "toron_npub";
+
 /// Resolve the herdr socket path from explicit env values (pure — testable).
 /// Priority: `HERDR_SOCKET_PATH` env, else `$XDG_CONFIG_HOME/herdr/herdr.sock`
 /// (absolute only), else `~/.config/herdr/herdr.sock`.
@@ -643,6 +652,23 @@ impl Client {
         )
     }
 
+    /// `pane.report_metadata` — display-only mail-identity stamp (bd-6f57).
+    /// Sets `display_agent` to the pin so the Agents sidebar shows the mail
+    /// id, plus `toron_pin`/`toron_project`/`toron_npub` tokens for
+    /// token-first resolve. No TTL: the stamp lives until the pane closes.
+    pub fn pane_report_metadata(
+        &mut self,
+        pane_id: &str,
+        pin: &str,
+        project: &str,
+        npub: &str,
+    ) -> Result<Value, BackendError> {
+        self.call(
+            "pane.report_metadata",
+            report_metadata_params(pane_id, pin, project, npub),
+        )
+    }
+
     pub fn worktree_create(
         &mut self,
         workspace_id: &str,
@@ -697,6 +723,23 @@ fn workspace_close_params(workspace_id: &str, close_group: bool) -> Value {
         params.insert("close_group".into(), json!(true));
     }
     Value::Object(params)
+}
+
+/// Pure param builder for the mail-identity stamp (bd-6f57): display-only
+/// `pane.report_metadata` with `display_agent` = pin and tokens for
+/// token-first resolve. Pure so the wire shape is unit-tested without a
+/// live herdr socket.
+pub fn report_metadata_params(pane_id: &str, pin: &str, project: &str, npub: &str) -> Value {
+    json!({
+        "pane_id": pane_id,
+        "source": MAIL_IDENTITY_SOURCE,
+        "display_agent": pin,
+        "tokens": {
+            TOKEN_PIN: pin,
+            TOKEN_PROJECT: project,
+            TOKEN_NPUB: npub,
+        },
+    })
 }
 
 fn parse_err(msg: String) -> BackendError {
@@ -997,6 +1040,25 @@ mod tests {
                 "type": "pane.agent_status_changed",
                 "pane_id": "w1:p2",
                 "agent_status": "working",
+            })
+        );
+    }
+
+    #[test]
+    fn report_metadata_shape() {
+        // bd-6f57: display-only stamp — pane_id + source + display_agent +
+        // toron_pin/toron_project/toron_npub tokens, no lifecycle fields.
+        assert_eq!(
+            report_metadata_params("w1:p1", "DustySparrow", "toron", "npub1abc"),
+            json!({
+                "pane_id": "w1:p1",
+                "source": "toron:mail-identity",
+                "display_agent": "DustySparrow",
+                "tokens": {
+                    "toron_pin": "DustySparrow",
+                    "toron_project": "toron",
+                    "toron_npub": "npub1abc",
+                },
             })
         );
     }
