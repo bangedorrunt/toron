@@ -86,3 +86,520 @@ impl std::fmt::Debug for VerifySink {
             .finish()
     }
 }
+
+// ---------------------------------------------------------------------------
+// Structured parked work (ADR-0032 Spec 6, bd-asx3).
+//
+// The engine pushes bare promise ids into [`ApprovalSink`]/[`SpawnSink`]
+// (that seam is unchanged). The host drains those ids into [`PendingEntry`]
+// records carrying run/node/effect/promise/generation identity plus a
+// bounded payload, kept in a [`PendingRegistry`] with idempotent
+// observation. Entries are deterministically replayable: re-draining the
+// same live sinks after a restart reconstructs the identical registry — no
+// durable row and no in-memory carry required (Wave-1 per captain review;
+// durable `workflow_pending` rows are Wave 3).
+// ---------------------------------------------------------------------------
+
+/// Which parked control produced the promise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ParkKind {
+    Approval,
+    Spawn,
+}
+
+impl ParkKind {
+    /// Canonical wire spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Approval => "approval",
+            Self::Spawn => "spawn",
+        }
+    }
+}
+
+/// Maximum bytes kept in [`PendingEntry::question`].
+pub const MAX_PENDING_QUESTION: usize = 512;
+
+/// One structured parked promise (ADR-0032 Spec 6.1): everything the host
+/// needs to publish the pending event, validate the resolution, and recover
+/// after a restart. Identity is `(run_id, promise_id, generation)`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingEntry {
+    pub run_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
+    pub workflow: String,
+    pub node_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effect_key: Option<String>,
+    pub promise_id: String,
+    pub generation: u64,
+    pub kind: ParkKind,
+    /// Bounded approval question / spawn summary (truncated, never a blob).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub question: Option<String>,
+    /// Bounded evidence artifact paths (never blobs).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artifacts: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deadline_secs: Option<u64>,
+}
+
+impl PendingEntry {
+    /// Build an entry; the question is truncated to
+    /// [`MAX_PENDING_QUESTION`] bytes.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        run_id: impl Into<String>,
+        project: Option<String>,
+        workflow: impl Into<String>,
+        node_path: impl Into<String>,
+        effect_key: Option<String>,
+        promise_id: impl Into<String>,
+        generation: u64,
+        kind: ParkKind,
+    ) -> Self {
+        Self {
+            run_id: run_id.into(),
+            project,
+            workflow: workflow.into(),
+            node_path: node_path.into(),
+            effect_key,
+            promise_id: promise_id.into(),
+            generation,
+            kind,
+            question: None,
+            artifacts: Vec::new(),
+            evidence_hash: None,
+            deadline_secs: None,
+        }
+    }
+
+    /// Attach a bounded question/summary payload.
+    pub fn with_question(mut self, question: impl Into<String>) -> Self {
+        let mut q: String = question.into();
+        if q.len() > MAX_PENDING_QUESTION {
+            q.truncate(MAX_PENDING_QUESTION);
+            q.push_str("…[truncated]");
+        }
+        self.question = Some(q);
+        self
+    }
+
+    /// Registry identity: `(run_id, promise_id, generation)`.
+    pub fn key(&self) -> (String, String, u64) {
+        (
+            self.run_id.clone(),
+            self.promise_id.clone(),
+            self.generation,
+        )
+    }
+}
+
+/// Host-side registry of parked entries. Observation is idempotent on the
+/// entry key: re-draining the same live sinks (e.g. after a restart)
+/// reconstructs the identical registry instead of duplicating it.
+#[derive(Debug, Default)]
+pub struct PendingRegistry {
+    entries: std::collections::HashMap<(String, String, u64), PendingEntry>,
+}
+
+impl PendingRegistry {
+    /// Observe one entry. Returns `true` when it is new, `false` when the
+    /// identical key was already recorded (duplicate observation).
+    pub fn observe(&mut self, entry: PendingEntry) -> bool {
+        use std::collections::hash_map::Entry as MapEntry;
+        match self.entries.entry(entry.key()) {
+            MapEntry::Occupied(_) => false,
+            MapEntry::Vacant(v) => {
+                v.insert(entry);
+                true
+            }
+        }
+    }
+
+    /// Look up one parked entry by full identity.
+    pub fn get(&self, run_id: &str, promise_id: &str, generation: u64) -> Option<&PendingEntry> {
+        self.entries
+            .get(&(run_id.to_string(), promise_id.to_string(), generation))
+    }
+
+    /// Look up the newest parked generation of a promise in a run, for
+    /// resolution validation: a claimed older generation must report
+    /// `StaleGeneration` (not `UnknownPromise`) so re-parked promises
+    /// resolve only at their current generation.
+    pub fn get_latest(&self, run_id: &str, promise_id: &str) -> Option<&PendingEntry> {
+        self.entries
+            .iter()
+            .filter(|((r, p, _), _)| r == run_id && p == promise_id)
+            .max_by_key(|((_, _, g), _)| *g)
+            .map(|(_, e)| e)
+    }
+
+    /// Remove (on validated resolution) and return the entry.
+    pub fn remove(
+        &mut self,
+        run_id: &str,
+        promise_id: &str,
+        generation: u64,
+    ) -> Option<PendingEntry> {
+        self.entries
+            .remove(&(run_id.to_string(), promise_id.to_string(), generation))
+    }
+
+    /// Number of parked entries.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// True when empty.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// True when any generation of this promise is parked.
+    pub fn is_known_promise(&self, promise_id: &str) -> bool {
+        self.entries.keys().any(|(_, p, _)| p == promise_id)
+    }
+
+    /// All entries for one run.
+    pub fn entries_for_run(&self, run_id: &str) -> Vec<&PendingEntry> {
+        self.entries
+            .values()
+            .filter(|e| e.run_id == run_id)
+            .collect()
+    }
+}
+
+/// How a parked promise was settled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResolutionVerdict {
+    Approved,
+    Rejected,
+    SpawnCompleted,
+}
+
+impl ResolutionVerdict {
+    /// Canonical wire spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Approved => "approved",
+            Self::Rejected => "rejected",
+            Self::SpawnCompleted => "spawn_completed",
+        }
+    }
+
+    /// Closed parse: only the three canonical spellings.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "approved" => Some(Self::Approved),
+            "rejected" => Some(Self::Rejected),
+            "spawn_completed" => Some(Self::SpawnCompleted),
+            _ => None,
+        }
+    }
+}
+
+/// A claimed settlement of one parked promise, as parsed from a resolution
+/// event (kind-46011 approval/rejection echoing the promise id).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Resolution {
+    pub run_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
+    pub promise_id: String,
+    pub generation: u64,
+    pub verdict: ResolutionVerdict,
+    #[serde(default)]
+    pub note: String,
+}
+
+/// Why a claimed resolution must not resume a run (ADR-0032 Spec 6.2:
+/// duplicate resolutions are harmless, stale/wrong ones are recorded and
+/// ignored — a stale resolution must never resume another node or run).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolutionMismatch {
+    /// No parked entry for this promise at all.
+    UnknownPromise,
+    /// The promise is parked under a different run — never cross-resume.
+    WrongRun { expected: String },
+    /// Project scope does not match the parked entry.
+    WrongProject { expected: Option<String> },
+    /// An older generation of a re-parked promise — the newer park owns it.
+    StaleGeneration { expected: u64 },
+}
+
+/// Validate a claimed resolution against the parked entry (if any).
+/// `None` entry → [`ResolutionMismatch::UnknownPromise`].
+pub fn validate_resolution(
+    entry: Option<&PendingEntry>,
+    resolution: &Resolution,
+) -> Result<(), ResolutionMismatch> {
+    let Some(entry) = entry else {
+        return Err(ResolutionMismatch::UnknownPromise);
+    };
+    if entry.run_id != resolution.run_id {
+        return Err(ResolutionMismatch::WrongRun {
+            expected: entry.run_id.clone(),
+        });
+    }
+    if entry.project != resolution.project {
+        return Err(ResolutionMismatch::WrongProject {
+            expected: entry.project.clone(),
+        });
+    }
+    if entry.generation != resolution.generation {
+        return Err(ResolutionMismatch::StaleGeneration {
+            expected: entry.generation,
+        });
+    }
+    Ok(())
+}
+
+/// One semantic terminal identity (ADR-0032 Spec 5/6.2): canonical hash of
+/// run id, workflow digest, terminal status, node, and evidence reference.
+/// Event delivery may be at-least-once; consumers dedupe this identity.
+pub fn terminal_digest(
+    run_id: &str,
+    workflow_digest: &str,
+    status: &str,
+    node: &str,
+    evidence: &str,
+) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    for part in [run_id, workflow_digest, status, node, evidence] {
+        h.update(part.as_bytes());
+        h.update([0x1f]);
+    }
+    hex::encode(h.finalize())
+}
+
+/// One committed semantic terminal for a run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerminalRecord {
+    pub run_id: String,
+    pub digest: String,
+    pub status: String,
+    pub node: String,
+}
+
+/// How [`TerminalLedger::note`] classified a terminal publication attempt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TerminalNote {
+    /// First publication of this digest — publish it.
+    New,
+    /// Same digest republished — no-op, no second semantic terminal.
+    Duplicate,
+    /// A different digest for an already-terminal run — conflict requiring
+    /// evidence, recorded but never silently merged.
+    Conflict { existing_digest: String },
+}
+
+/// Host-side terminal dedupe: one semantic terminal per digest; republication
+/// of the same digest is a no-op; a different digest for the same run is an
+/// explicit conflict.
+#[derive(Debug, Default)]
+pub struct TerminalLedger {
+    by_digest: std::collections::HashMap<String, TerminalRecord>,
+    by_run: std::collections::HashMap<String, String>,
+}
+
+impl TerminalLedger {
+    /// Record a terminal publication attempt.
+    pub fn note(&mut self, record: TerminalRecord) -> TerminalNote {
+        if self.by_digest.contains_key(&record.digest) {
+            return TerminalNote::Duplicate;
+        }
+        if let Some(existing) = self.by_run.get(&record.run_id) {
+            return TerminalNote::Conflict {
+                existing_digest: existing.clone(),
+            };
+        }
+        self.by_run
+            .insert(record.run_id.clone(), record.digest.clone());
+        self.by_digest.insert(record.digest.clone(), record);
+        TerminalNote::New
+    }
+
+    /// Look up a published terminal by digest.
+    pub fn get(&self, digest: &str) -> Option<&TerminalRecord> {
+        self.by_digest.get(digest)
+    }
+}
+
+/// Attribute newly observed promise ids to schema candidate nodes in order
+/// (ADR-0032 Spec 6.1 generation discipline). Returns `(node, promise_id)`
+/// pairs; the caller assigns per-node generations from its own counters.
+/// Counts must match exactly — a mismatch returns empty (never guess which
+/// promise belongs to which node; the caller warns and retries next drain).
+pub fn attribute_parks(candidates: &[String], new_ids: &[String]) -> Vec<(String, String)> {
+    if candidates.len() != new_ids.len() || candidates.is_empty() {
+        return Vec::new();
+    }
+    candidates
+        .iter()
+        .zip(new_ids.iter())
+        .map(|(node, id)| (node.clone(), id.clone()))
+        .collect()
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+
+    fn approval_entry() -> PendingEntry {
+        PendingEntry::new(
+            "run-1",
+            None,
+            "ship",
+            "gate",
+            None,
+            "promise-1",
+            1,
+            ParkKind::Approval,
+        )
+    }
+
+    /// bd-asx3: duplicate sink observations are idempotent — observing the
+    /// same (run, promise, generation) twice records one entry.
+    #[test]
+    fn host_lifecycle_registry_dedupes_duplicate_observations() {
+        let mut reg = PendingRegistry::default();
+        assert!(reg.observe(approval_entry()), "first observation is new");
+        assert!(!reg.observe(approval_entry()), "duplicate is idempotent");
+        assert_eq!(reg.len(), 1);
+        assert!(reg.is_known_promise("promise-1"));
+        assert!(!reg.is_known_promise("promise-9"));
+        let mut second_gen = approval_entry();
+        second_gen.generation = 2;
+        assert!(reg.observe(second_gen), "next generation is a new entry");
+        assert_eq!(reg.len(), 2);
+    }
+
+    /// bd-asx3: resolution validates run/project/promise/generation/action
+    /// identity — matches resolve, everything else is a typed mismatch.
+    #[test]
+    fn host_lifecycle_resolution_validation() {
+        let entry = approval_entry();
+        let ok = Resolution {
+            run_id: "run-1".into(),
+            project: None,
+            promise_id: "promise-1".into(),
+            generation: 1,
+            verdict: ResolutionVerdict::Approved,
+            note: "ship it".into(),
+        };
+        assert!(validate_resolution(Some(&entry), &ok).is_ok());
+        assert!(matches!(
+            validate_resolution(None, &ok),
+            Err(ResolutionMismatch::UnknownPromise)
+        ));
+        let wrong_run = Resolution {
+            run_id: "run-2".into(),
+            ..ok.clone()
+        };
+        assert!(matches!(
+            validate_resolution(Some(&entry), &wrong_run),
+            Err(ResolutionMismatch::WrongRun { .. })
+        ));
+        let stale = Resolution {
+            generation: 0,
+            ..ok.clone()
+        };
+        assert!(matches!(
+            validate_resolution(Some(&entry), &stale),
+            Err(ResolutionMismatch::StaleGeneration { expected: 1 })
+        ));
+        let wrong_project = Resolution {
+            project: Some("other".into()),
+            ..ok.clone()
+        };
+        assert!(matches!(
+            validate_resolution(Some(&entry), &wrong_project),
+            Err(ResolutionMismatch::WrongProject { .. })
+        ));
+        // A project-scoped entry resolves only under the same project.
+        let mut scoped = approval_entry();
+        scoped.project = Some("demo".into());
+        let cross = Resolution {
+            project: None,
+            ..ok
+        };
+        assert!(matches!(
+            validate_resolution(Some(&scoped), &cross),
+            Err(ResolutionMismatch::WrongProject { .. })
+        ));
+    }
+
+    /// bd-asx3: one semantic terminal digest — stable for the same terminal,
+    /// distinct across runs, nodes, and statuses.
+    #[test]
+    fn host_lifecycle_terminal_digest_stable_and_unique() {
+        let a = terminal_digest("run-1", "digest", "succeeded", "gate", "ev");
+        assert_eq!(
+            a,
+            terminal_digest("run-1", "digest", "succeeded", "gate", "ev")
+        );
+        assert_eq!(a.len(), 64, "hex sha256");
+        assert_ne!(
+            a,
+            terminal_digest("run-2", "digest", "succeeded", "gate", "ev")
+        );
+        assert_ne!(
+            a,
+            terminal_digest("run-1", "digest", "failed", "gate", "ev")
+        );
+        assert_ne!(
+            a,
+            terminal_digest("run-1", "digest", "succeeded", "other", "ev")
+        );
+    }
+
+    /// bd-asx3: terminal ledger — first publication is new, same-digest
+    /// republish is a duplicate no-op, a different digest for the same run
+    /// is a conflict requiring evidence.
+    #[test]
+    fn host_lifecycle_terminal_ledger_dedupe_and_conflict() {
+        let mut ledger = TerminalLedger::default();
+        let digest = terminal_digest("run-1", "d", "succeeded", "gate", "ev");
+        let rec = TerminalRecord {
+            run_id: "run-1".into(),
+            digest: digest.clone(),
+            status: "succeeded".into(),
+            node: "gate".into(),
+        };
+        assert!(matches!(ledger.note(rec.clone()), TerminalNote::New));
+        assert!(matches!(ledger.note(rec), TerminalNote::Duplicate));
+        let other = TerminalRecord {
+            run_id: "run-1".into(),
+            digest: terminal_digest("run-1", "d", "failed", "gate", "ev2"),
+            status: "failed".into(),
+            node: "gate".into(),
+        };
+        assert!(matches!(ledger.note(other), TerminalNote::Conflict { .. }));
+    }
+
+    /// bd-asx3: park attribution zips candidates to new promise ids in
+    /// order — and refuses to guess when counts mismatch.
+    #[test]
+    fn host_lifecycle_attribute_parks_zips_in_order_and_rejects_mismatch() {
+        let got = attribute_parks(
+            &["gate".into(), "second".into()],
+            &["p1".into(), "p2".into()],
+        );
+        assert_eq!(
+            got,
+            vec![
+                ("gate".to_string(), "p1".to_string()),
+                ("second".to_string(), "p2".to_string()),
+            ]
+        );
+        assert!(attribute_parks(&["gate".into()], &["p1".into(), "p2".into()]).is_empty());
+        assert!(attribute_parks(&["gate".into()], &[]).is_empty());
+    }
+}
