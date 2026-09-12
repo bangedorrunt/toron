@@ -908,6 +908,10 @@ pub struct AgentBootstrapArgs {
     /// Task description for the 30013 profile (optional).
     #[arg(long)]
     pub task: Option<String>,
+    /// Herdr pane id to stamp with the mail identity (optional; defaults to
+    /// $HERDR_PANE_ID when set). Best-effort display-only metadata.
+    #[arg(long = "pane-id")]
+    pub pane_id: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]

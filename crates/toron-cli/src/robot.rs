@@ -399,6 +399,33 @@ pub async fn run_agent(mailbox: &Mailbox, cmd: &AgentCommand) -> anyhow::Result<
                 persona: None,
             };
             let agent = mailbox.register_agent(&args.project, &profile).await?;
+            // bd-6f57: best-effort display-only pane stamp (pin -> pane).
+            // Never fails bootstrap: herdr may be down or the pane flag
+            // absent (detached/CI). Explicit --pane-id wins, else
+            // $HERDR_PANE_ID injected by herdr into managed panes.
+            let pane_id = args
+                .pane_id
+                .clone()
+                .or_else(|| std::env::var("HERDR_PANE_ID").ok())
+                .filter(|p| !p.is_empty());
+            let mut stamped: Option<String> = None;
+            if let Some(pid) = pane_id {
+                match toron_core::backend::herdr::HerdrBackend::connect(None) {
+                    Ok(backend) => {
+                        let r = backend.client().pane_report_metadata(
+                            &pid,
+                            &agent.name,
+                            &agent.project_slug,
+                            &agent.npub,
+                        );
+                        match r {
+                            Ok(_) => stamped = Some(pid),
+                            Err(e) => eprintln!("toron: pane stamp skipped ({e})"),
+                        }
+                    }
+                    Err(e) => eprintln!("toron: pane stamp skipped ({e})"),
+                }
+            }
             let reservation = if args.paths.is_empty() {
                 serde_json::Value::Null
             } else {
@@ -420,6 +447,7 @@ pub async fn run_agent(mailbox: &Mailbox, cmd: &AgentCommand) -> anyhow::Result<
                 "npub": agent.npub,
                 "key_path": agent.key_path,
                 "created": agent.created,
+                "pane_id": stamped,
                 "reservation": reservation,
                 "next": "export AGENT_NAME=<pin> (or pass --as on every call); reserve before edit — the strict guard blocks unattributed or unreserved commits",
             }))
