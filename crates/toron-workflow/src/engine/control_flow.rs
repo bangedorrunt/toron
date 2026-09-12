@@ -10,6 +10,8 @@
 
 use std::time::Duration;
 
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 
 use resonate_sdk::prelude::Context;
@@ -18,8 +20,9 @@ use crate::schema::{Action, Graph, Step, StepOnError};
 
 use super::template::{RenderContext, render_action, render_action_lenient, render_text};
 use super::{
-    ActionRunner, ApprovalSink, Decision, FailureKind, ProfileResolver, RunInput, SpawnSink,
-    WorkflowEngine, WorkflowResolver,
+    ActionInvocation, ActionPartition, ActionRunner, ApprovalSink, Decision, EffectRunner,
+    ExecutionPolicy, FailureKind, ProfileResolver, RunContext, RunInput, SpawnSink, WorkflowEngine,
+    WorkflowResolver, partition,
 };
 
 use sha2::{Digest, Sha256};
@@ -194,7 +197,18 @@ pub async fn run_workflow(
         .clone()
         .unwrap_or_else(|| "unknown".to_string());
     let workflow_name = workflow.name.clone();
-    run_graph(ctx, &input.trigger, &graph, &run_id, &workflow_name).await
+    // bd-zczp: canonical digest travels with the run so every leaf can
+    // mint run-scoped effect keys without re-canonicalizing per step.
+    let workflow_digest = crate::identity::workflow_digest(workflow);
+    run_graph(
+        ctx,
+        &input.trigger,
+        &graph,
+        &run_id,
+        &workflow_name,
+        &workflow_digest,
+    )
+    .await
 }
 
 /// Execute an ordered list of steps, accumulating outputs into `step_outputs`
@@ -205,6 +219,9 @@ pub async fn run_workflow(
 /// when a step with `on_error: fail_run` failed — the failed-outcome value is
 /// the run's terminal result (propagated to the caller, never stored under a
 /// step name).
+// Threaded dispatch context (run identity for leaf invocations) exceeds the
+// default arity cap; see run_retry.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_steps(
     ctx: &Context,
     runner: &ActionRunner,
@@ -212,9 +229,21 @@ pub(crate) async fn run_steps(
     steps: &[Step],
     step_outputs: &mut serde_json::Map<String, serde_json::Value>,
     workflow: &str,
+    run_id: &str,
+    workflow_digest: &str,
 ) -> resonate_sdk::prelude::Result<Option<serde_json::Value>> {
     for step in steps {
-        let value = run_step(ctx, runner, trigger, step, step_outputs, workflow).await?;
+        let value = run_step(
+            ctx,
+            runner,
+            trigger,
+            step,
+            step_outputs,
+            workflow,
+            run_id,
+            workflow_digest,
+        )
+        .await?;
         // fail_run short-circuit: the failed outcome IS the run's result.
         if value.get("status").and_then(serde_json::Value::as_str) == Some("failed") {
             return Ok(Some(value));
@@ -339,8 +368,61 @@ fn backoff_for_attempt(
     Duration::from_secs(secs)
 }
 
+/// Build the context-bearing invocation for one rendered leaf action
+/// (bd-zczp, Spec 1): run/node identity plus the attempt the retry
+/// coordinator is on. The host derives the stable effect key from
+/// (workflow_digest, run_id, node, iteration, action_digest) and honors
+/// a pre-set `RunContext.effect_key` when the caller already minted one.
+pub(crate) fn invocation_for_leaf(
+    action: Action,
+    run_id: &str,
+    workflow_digest: &str,
+    node: &str,
+    attempt: u32,
+    max_attempts: u32,
+) -> ActionInvocation {
+    ActionInvocation {
+        action,
+        run: RunContext {
+            run_id: run_id.to_string(),
+            workflow_digest: workflow_digest.to_string(),
+            node_path: node.to_string(),
+            iteration_key: None,
+            effect_key: None,
+            attempt,
+        },
+        execution: ExecutionPolicy {
+            max_attempts,
+            timeout_secs: None,
+        },
+    }
+}
+
+/// Dispatch one rendered leaf action (bd-zczp): mailbox/job HostSink
+/// actions prefer the context-bearing [`EffectRunner`] when the engine
+/// was constructed with one; everything else (pure actions, deprecated
+/// rejections, journal-less embeddings) keeps the legacy [`ActionRunner`]
+/// compat path. Returns `Some(value)` when the effect runner handled it.
+fn dispatch_leaf(ctx: &Context, invocation: &ActionInvocation) -> Option<serde_json::Value> {
+    let effectful = matches!(
+        partition(&invocation.action),
+        ActionPartition::HostSink { sink: "mailbox" } | ActionPartition::HostSink { sink: "job" }
+    );
+    if !effectful {
+        return None;
+    }
+    let stored: Arc<Option<EffectRunner>> = ctx.get_dependency::<Option<EffectRunner>>();
+    (*stored).clone().map(|fx| match fx(invocation) {
+        Ok(value) => value,
+        Err(e) => serde_json::json!({ "ok": false, "error": e.to_string() }),
+    })
+}
+
 /// Boxed because control-flow actions recurse (`run_step` → `run_retry` →
 /// `run_step`, …) — async recursion requires a heap-allocated future.
+// Threaded dispatch context (run identity for leaf invocations) exceeds the
+// default arity cap; see run_retry.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_step<'a>(
     ctx: &'a Context,
     runner: &'a ActionRunner,
@@ -348,6 +430,8 @@ pub(crate) fn run_step<'a>(
     step: &'a Step,
     step_outputs: &'a mut serde_json::Map<String, serde_json::Value>,
     workflow: &'a str,
+    run_id: &'a str,
+    workflow_digest: &'a str,
 ) -> std::pin::Pin<
     Box<
         dyn std::future::Future<Output = resonate_sdk::prelude::Result<serde_json::Value>>
@@ -355,9 +439,22 @@ pub(crate) fn run_step<'a>(
             + 'a,
     >,
 > {
-    run_step_with_enclosing(ctx, runner, trigger, step, step_outputs, None, workflow)
+    run_step_with_enclosing(
+        ctx,
+        runner,
+        trigger,
+        step,
+        step_outputs,
+        None,
+        workflow,
+        run_id,
+        workflow_digest,
+    )
 }
 
+// Threaded dispatch context (run identity for leaf invocations) exceeds the
+// default arity cap; see run_retry.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_step_with_enclosing<'a>(
     ctx: &'a Context,
     runner: &'a ActionRunner,
@@ -366,6 +463,8 @@ pub(crate) fn run_step_with_enclosing<'a>(
     step_outputs: &'a mut serde_json::Map<String, serde_json::Value>,
     enclosing_retry: Option<(u32, u64)>,
     workflow: &'a str,
+    run_id: &'a str,
+    workflow_digest: &'a str,
 ) -> std::pin::Pin<
     Box<
         dyn std::future::Future<Output = resonate_sdk::prelude::Result<serde_json::Value>>
@@ -460,16 +559,32 @@ pub(crate) fn run_step_with_enclosing<'a>(
                 | Action::DispatchJob { .. }
                 | Action::CallWebhook { .. } => {
                     // Consistency rule: actions go through the shared Mailbox
-                    // surface (the injected action runner). Templates are
-                    // Render FIRST so the runner sees rendered values; a render
-                    // failure (unresolved ref) is a per-step error with
-                    // workflow/node/field/ref attribution, not a run failure.
+                    // surface. Templates are Render FIRST so the runner sees
+                    // rendered values; a render failure (unresolved ref) is a
+                    // per-step error with workflow/node/field/ref
+                    // attribution, not a run failure. bd-zczp: effectful
+                    // actions prefer the context-bearing EffectRunner; the
+                    // legacy compat path stays for the rest.
                     let render_ctx = RenderContext::new(workflow, node);
                     match render_action(&step.action, trigger, step_outputs, &render_ctx) {
-                        Ok(action) => match (runner)(&action) {
-                            Ok(value) => value,
-                            Err(e) => serde_json::json!({ "ok": false, "error": e.to_string() }),
-                        },
+                        Ok(action) => {
+                            let invocation = invocation_for_leaf(
+                                action,
+                                run_id,
+                                workflow_digest,
+                                node,
+                                attempt,
+                                enclosing_retry.map(|(m, _)| m).unwrap_or(1),
+                            );
+                            dispatch_leaf(ctx, &invocation).unwrap_or_else(|| {
+                                match (runner)(&invocation.action) {
+                                    Ok(value) => value,
+                                    Err(e) => {
+                                        serde_json::json!({ "ok": false, "error": e.to_string() })
+                                    }
+                                }
+                            })
+                        }
                         Err(e) => {
                             serde_json::json!({ "ok": false, "error": format!("render: {e}") })
                         }
@@ -489,6 +604,8 @@ pub(crate) fn run_step_with_enclosing<'a>(
                         *backoff_secs,
                         step_outputs,
                         workflow,
+                        run_id,
+                        workflow_digest,
                     )
                     .await?
                 }
@@ -507,6 +624,8 @@ pub(crate) fn run_step_with_enclosing<'a>(
                         step_outputs,
                         workflow,
                         node,
+                        run_id,
+                        workflow_digest,
                     )
                     .await?
                 }
@@ -520,11 +639,24 @@ pub(crate) fn run_step_with_enclosing<'a>(
                         step_outputs,
                         workflow,
                         node,
+                        run_id,
+                        workflow_digest,
                     )
                     .await?
                 }
                 Action::Parallel { over, each } => {
-                    run_parallel(ctx, runner, trigger, over, each, workflow, node).await?
+                    run_parallel(
+                        ctx,
+                        runner,
+                        trigger,
+                        over,
+                        each,
+                        workflow,
+                        node,
+                        run_id,
+                        workflow_digest,
+                    )
+                    .await?
                 }
                 Action::Reduce { .. } => {
                     run_reduce(
@@ -660,6 +792,8 @@ pub(crate) async fn run_retry(
     backoff_secs: u64,
     step_outputs: &serde_json::Map<String, serde_json::Value>,
     workflow: &str,
+    run_id: &str,
+    workflow_digest: &str,
 ) -> resonate_sdk::prelude::Result<serde_json::Value> {
     // Flatten nested wrappers: the outer policy wins for the whole subtree.
     let mut target = inner;
@@ -679,6 +813,8 @@ pub(crate) async fn run_retry(
             &mut outputs,
             Some((max_attempts, backoff_secs)),
             workflow,
+            run_id,
+            workflow_digest,
         )
         .await?;
         let failed = value.get("ok").and_then(serde_json::Value::as_bool) == Some(false);
@@ -825,6 +961,8 @@ pub(crate) async fn run_branch(
     step_outputs: &serde_json::Map<String, serde_json::Value>,
     workflow: &str,
     node: &str,
+    run_id: &str,
+    workflow_digest: &str,
 ) -> resonate_sdk::prelude::Result<serde_json::Value> {
     let take_then = match evaluate_step_guard(Some(guard), trigger, step_outputs, node).await {
         GuardVerdict::Proceed => true,
@@ -838,8 +976,17 @@ pub(crate) async fn run_branch(
     // visibility as top-level steps); only newly produced outputs return.
     let known: std::collections::BTreeSet<String> = step_outputs.keys().cloned().collect();
     let mut outputs = step_outputs.clone();
-    if let Some(failed) =
-        run_steps(ctx, runner, trigger, branch_steps, &mut outputs, workflow).await?
+    if let Some(failed) = run_steps(
+        ctx,
+        runner,
+        trigger,
+        branch_steps,
+        &mut outputs,
+        workflow,
+        run_id,
+        workflow_digest,
+    )
+    .await?
     {
         return Ok(failed);
     }
@@ -866,6 +1013,8 @@ pub(crate) async fn run_foreach(
     step_outputs: &serde_json::Map<String, serde_json::Value>,
     workflow: &str,
     node: &str,
+    run_id: &str,
+    workflow_digest: &str,
 ) -> resonate_sdk::prelude::Result<serde_json::Value> {
     let resolved = resolve_template_ref(over, trigger, step_outputs);
     let Some(value) = resolved else {
@@ -899,6 +1048,8 @@ pub(crate) async fn run_foreach(
             each,
             &mut item_outputs,
             workflow,
+            run_id,
+            workflow_digest,
         )
         .await?;
         collected.push(value);
@@ -916,6 +1067,9 @@ pub(crate) const MAX_PARALLEL_FANOUT: usize = 32;
 /// ADR-0032 Spec 3 (I10): `over` MUST be a valid positive bounded count. A
 /// crew role (`@crew.r`) needs the orchestrator to concretize it before
 /// invoke; anything else FAILS LOUD — never coerces to 1.
+// Threaded dispatch context (run identity for leaf invocations) exceeds the
+// default arity cap; see run_retry.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_parallel(
     ctx: &Context,
     _runner: &ActionRunner,
@@ -924,6 +1078,8 @@ pub(crate) async fn run_parallel(
     each: &Step,
     workflow: &str,
     node: &str,
+    run_id: &str,
+    workflow_digest: &str,
 ) -> resonate_sdk::prelude::Result<serde_json::Value> {
     // Elastic N: `over: "4"` → 4 concurrent copies. Crew role (@crew.r) is
     // resolved by the orchestrator before invoke; the engine sees a concrete N.
@@ -952,6 +1108,8 @@ pub(crate) async fn run_parallel(
                     step: each,
                     trigger,
                     workflow,
+                    run_id: run_id.to_string(),
+                    workflow_digest: workflow_digest.to_string(),
                 },
             )
             .spawn()?;
@@ -973,6 +1131,12 @@ pub struct ParallelCopyInput {
     /// keeps in-flight serialized inputs readable).
     #[serde(default)]
     pub workflow: String,
+    /// Run identity for context-bearing leaf dispatch (bd-zczp).
+    #[serde(default)]
+    pub run_id: String,
+    /// Canonical workflow digest for run-scoped effect keys (bd-zczp).
+    #[serde(default)]
+    pub workflow_digest: String,
 }
 
 /// A durable child running one `parallel` copy of a step. The runner is
@@ -991,6 +1155,8 @@ pub async fn run_parallel_copy(
         &input.step,
         &mut outputs,
         &input.workflow,
+        &input.run_id,
+        &input.workflow_digest,
     )
     .await?;
     Ok(value)
@@ -1515,6 +1681,7 @@ pub(crate) async fn run_graph(
     graph: &Graph,
     run_id: &str,
     workflow_name: &str,
+    workflow_digest: &str,
 ) -> resonate_sdk::prelude::Result<serde_json::Value> {
     use crate::schema::GraphNode;
     use std::collections::BTreeSet;
@@ -1588,6 +1755,8 @@ pub(crate) async fn run_graph(
                         wave,
                         outputs: outputs.clone(),
                         graph: Some(graph.clone()),
+                        workflow_digest: workflow_digest.to_string(),
+                        attempt: 1,
                     },
                 )
                 .spawn()?;
@@ -1677,6 +1846,8 @@ pub(crate) async fn run_graph(
                                 wave,
                                 outputs: outputs.clone(),
                                 graph: Some(graph.clone()),
+                                workflow_digest: workflow_digest.to_string(),
+                                attempt: next_attempt,
                             },
                         )
                         .spawn()?;
@@ -1759,6 +1930,19 @@ pub struct GraphNodeInput {
     /// Spec 3: graph topology for pending nodes (default None for backward compat)
     #[serde(default)]
     pub graph: Option<Graph>,
+    /// Canonical workflow digest for run-scoped effect keys (bd-zczp;
+    /// default empty keeps in-flight serialized inputs readable).
+    #[serde(default)]
+    pub workflow_digest: String,
+    /// Graph-level attempt counter for retries that re-spawn this node
+    /// (bd-zczp; default 1 keeps in-flight inputs readable).
+    #[serde(default = "default_attempt")]
+    pub attempt: u32,
+}
+
+/// Default graph-node attempt (serde default fn — `1`, not `0`).
+fn default_attempt() -> u32 {
+    1
 }
 
 /// A durable child executing ONE graph node's action. Spawned concurrently by
@@ -1871,6 +2055,8 @@ pub async fn run_graph_node(
             &step,
             &mut step_outputs,
             &input.workflow_name,
+            &input.run_id,
+            &input.workflow_digest,
         )
         .await;
     }
@@ -1884,10 +2070,23 @@ pub async fn run_graph_node(
             return Ok(serde_json::json!({ "ok": false, "error": format!("render: {e}") }));
         }
     };
-    match (runner)(&action) {
-        Ok(value) => Ok(value),
-        Err(e) => Ok(serde_json::json!({ "ok": false, "error": e.to_string() })),
-    }
+    // bd-zczp: the graph leaf carries full run identity — effectful actions
+    // prefer the context-bearing EffectRunner; the legacy compat path stays
+    // for the rest.
+    let invocation = invocation_for_leaf(
+        action,
+        &input.run_id,
+        &input.workflow_digest,
+        &input.node_name,
+        input.attempt,
+        1,
+    );
+    Ok(
+        dispatch_leaf(ctx, &invocation).unwrap_or_else(|| match (runner)(&invocation.action) {
+            Ok(value) => value,
+            Err(e) => serde_json::json!({ "ok": false, "error": e.to_string() }),
+        }),
+    )
 }
 
 /// The `toron:workflow-emitted` stamp (ADR-0004 Ship 2 / bd-pkc part 3).

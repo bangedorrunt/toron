@@ -31,12 +31,13 @@ use toron_core::bus::{Bus, SubscriptionEvent};
 use toron_core::mailbox::{Mailbox, SendMessage, UnwrappedMail};
 use toron_workflow::coalesce::{CoalesceDecision, Coalesced, MentionCoalescer};
 use toron_workflow::engine::{
-    ActionRunner, CleanupKind, CleanupRequest, Decision, DispatchPlan, EffectView,
-    FORCED_CLEANUP_CAPABILITY, ParkKind, PendingEntry, PendingRegistry, ProviderCapability,
-    ProviderOutcome, Resolution, ResolutionMismatch, ResolutionVerdict, RunInput, TerminalLedger,
-    TerminalNote, TerminalRecord, UnknownReport, WorkflowEngine, attribute_parks,
-    capability_for_action_type, cleanup_effect_key, corr_for_effect, describe_unknown,
-    plan_attempt, terminal_digest, validate_resolution,
+    ActionInvocation, ActionRunner, CleanupKind, CleanupRequest, Decision, DispatchPlan,
+    EffectRunner, EffectView, FORCED_CLEANUP_CAPABILITY, ParkKind, PendingEntry, PendingRegistry,
+    ProviderCapability, ProviderErrorClass, ProviderOutcome, Resolution, ResolutionMismatch,
+    ResolutionVerdict, RunInput, TerminalLedger, TerminalNote, TerminalRecord, UnknownReport,
+    WorkflowEngine, attribute_parks, capability_for_action_type, classify_provider_error_msg,
+    cleanup_effect_key, corr_for_effect, derive_effect_key, describe_unknown, invoke, plan_attempt,
+    terminal_digest, validate_resolution,
 };
 use toron_workflow::jobs::{JobRequest, build_job_request_with_tags};
 use toron_workflow::schema::{Action, Trigger, Workflow};
@@ -157,6 +158,63 @@ pub(crate) fn compat_request(action: &Action) -> DispatchRequest {
     }
 }
 
+/// Map one mailbox send error onto a provider outcome (bd-zczp):
+/// ambiguous transport outcomes become Ambiguous (I5 — a timeout is not
+/// proof of absence); deterministic rejections stay ProvenFailed.
+fn classify_send_error(msg: String) -> ProviderOutcome {
+    match classify_provider_error_msg(&msg) {
+        ProviderErrorClass::Ambiguous => ProviderOutcome::Ambiguous(msg),
+        ProviderErrorClass::Proven => ProviderOutcome::ProvenFailed(msg),
+    }
+}
+
+/// Map one mailbox send result onto a provider outcome (bd-zczp): the
+/// Delivered value carries the wire count plus the journal key so the
+/// step output joins back to the effect row.
+fn mail_outcome(send: Result<usize, String>, key: String) -> ProviderOutcome {
+    match send {
+        Ok(count) => ProviderOutcome::Delivered(serde_json::json!({
+            "ok": true,
+            "count": count,
+            "effect_key": key,
+        })),
+        Err(msg) => classify_send_error(msg),
+    }
+}
+
+/// Map one coalescer decision onto a provider outcome (bd-zczp): Buffered
+/// records the burst-buffer hand-off; FlushNow publishes with typed
+/// errors — NoSigner is proven never-sent, transport loss is ambiguous.
+fn mention_outcome(
+    bus: &dyn Bus,
+    signer: Option<&Keys>,
+    decision: CoalesceDecision,
+    key: String,
+) -> ProviderOutcome {
+    match decision {
+        CoalesceDecision::Buffered { .. } => ProviderOutcome::Delivered(serde_json::json!({
+            "ok": true,
+            "coalesced": true,
+            "effect_key": key,
+        })),
+        CoalesceDecision::FlushNow(coalesced) => {
+            match publish_coalesced_job(bus, signer, &coalesced) {
+                Ok(id) => ProviderOutcome::Delivered(serde_json::json!({
+                    "ok": true,
+                    "coalesced": false,
+                    "published": true,
+                    "job_id": id.to_hex(),
+                    "effect_key": key,
+                })),
+                Err(CoalescePublishError::NoSigner) => {
+                    ProviderOutcome::ProvenFailed("no job signer configured".to_string())
+                }
+                Err(CoalescePublishError::Transport(e)) => ProviderOutcome::Ambiguous(e),
+            }
+        }
+    }
+}
+
 /// Map one fenced dispatch result back onto the arm's `{ok,…}` shape
 /// (bd-1kr2): `Settled` returns the provider's stored outcome verbatim;
 /// any other journaled state reports `ok:false` with the state named —
@@ -250,14 +308,12 @@ pub fn mailbox_runner_with_dispatcher(
                     &key_out,
                     block_on_async(async move {
                         disp.dispatch(&req, move |_| {
-                            match block_on_async(async move { mb.send_message(&msg).await }) {
-                                Ok(res) => ProviderOutcome::Delivered(serde_json::json!({
-                                    "ok": true,
-                                    "count": res.count,
-                                    "effect_key": key,
-                                })),
-                                Err(e) => ProviderOutcome::ProvenFailed(e.to_string()),
-                            }
+                            let sent =
+                                match block_on_async(async move { mb.send_message(&msg).await }) {
+                                    Ok(res) => Ok(res.count),
+                                    Err(e) => Err(e.to_string()),
+                                };
+                            mail_outcome(sent, key)
                         })
                         .await
                     }),
@@ -310,14 +366,12 @@ pub fn mailbox_runner_with_dispatcher(
                     &key_out,
                     block_on_async(async move {
                         disp.dispatch(&req, move |_| {
-                            match block_on_async(async move { mb.send_message(&msg).await }) {
-                                Ok(res) => ProviderOutcome::Delivered(serde_json::json!({
-                                    "ok": true,
-                                    "count": res.count,
-                                    "effect_key": key,
-                                })),
-                                Err(e) => ProviderOutcome::ProvenFailed(e.to_string()),
-                            }
+                            let sent =
+                                match block_on_async(async move { mb.send_message(&msg).await }) {
+                                    Ok(res) => Ok(res.count),
+                                    Err(e) => Err(e.to_string()),
+                                };
+                            mail_outcome(sent, key)
                         })
                         .await
                     }),
@@ -354,19 +408,27 @@ pub fn mailbox_runner_with_dispatcher(
                                 publish_coalesced_job(bus.as_ref(), signer.as_ref(), &coalesced);
                             // bd-cnr5: an unpublished flush is a dropped effect —
                             // report ok:false loud, never ok:true with
-                            // published:false.
+                            // published:false. bd-zczp: a bus failure names
+                            // itself (ambiguous) instead of borrowing the
+                            // no-signer message.
                             match published {
-                                Some(_) => Ok(serde_json::json!({
+                                Ok(_) => Ok(serde_json::json!({
                                     "ok": true,
                                     "coalesced": false,
                                     "published": true,
                                     "error": serde_json::Value::Null,
                                 })),
-                                None => Ok(serde_json::json!({
+                                Err(CoalescePublishError::NoSigner) => Ok(serde_json::json!({
                                     "ok": false,
                                     "coalesced": false,
                                     "published": false,
                                     "error": "no job signer configured",
+                                })),
+                                Err(CoalescePublishError::Transport(e)) => Ok(serde_json::json!({
+                                    "ok": false,
+                                    "coalesced": false,
+                                    "published": false,
+                                    "error": e,
                                 })),
                             }
                         }
@@ -390,32 +452,8 @@ pub fn mailbox_runner_with_dispatcher(
                 Some(Ok(fenced_outcome(
                     &key_out,
                     block_on_async(async move {
-                        disp.dispatch(&req, move |_| match decision {
-                            CoalesceDecision::Buffered { .. } => {
-                                ProviderOutcome::Delivered(serde_json::json!({
-                                    "ok": true,
-                                    "coalesced": true,
-                                    "effect_key": key,
-                                }))
-                            }
-                            CoalesceDecision::FlushNow(coalesced) => {
-                                match publish_coalesced_job(
-                                    bus.as_ref(),
-                                    signer.as_ref(),
-                                    &coalesced,
-                                ) {
-                                    Some(id) => ProviderOutcome::Delivered(serde_json::json!({
-                                        "ok": true,
-                                        "coalesced": false,
-                                        "published": true,
-                                        "job_id": id.to_hex(),
-                                        "effect_key": key,
-                                    })),
-                                    None => ProviderOutcome::ProvenFailed(
-                                        "no job signer configured".to_string(),
-                                    ),
-                                }
-                            }
+                        disp.dispatch(&req, move |_| {
+                            mention_outcome(bus.as_ref(), signer.as_ref(), decision, key)
                         })
                         .await
                     }),
@@ -427,6 +465,209 @@ pub fn mailbox_runner_with_dispatcher(
         });
         Ok(value)
     })
+}
+
+/// Derive the run-scoped effect identity for one invocation (bd-zczp):
+/// the stable key comes from (workflow_digest, run_id, node, iteration,
+/// redacted action digest) via [`derive_effect_key`]; a pre-minted
+/// `RunContext.effect_key` wins when the caller set one. Returns
+/// `(effect_key, action_digest)`. Secrets never enter a digest
+/// unredacted: the action digest hashes the redacted canonical form.
+fn scoped_effect_key(inv: &ActionInvocation) -> (String, String) {
+    let rendered = serde_json::to_value(&inv.action).unwrap_or(serde_json::Value::Null);
+    let (redacted, _) = toron_workflow::identity::redact_value(&rendered);
+    let action_digest = toron_workflow::identity::action_digest_of(&redacted);
+    let key = inv.run.effect_key.clone().unwrap_or_else(|| {
+        derive_effect_key(
+            &inv.run.workflow_digest,
+            &inv.run.run_id,
+            &inv.run.node_path,
+            inv.run.iteration_key.as_deref(),
+            &action_digest,
+        )
+    });
+    (key, action_digest)
+}
+
+/// Build the fenced dispatch request for one invocation (bd-zczp): the
+/// run-scoped key replaces the compat content hash, so identical
+/// payloads in different runs (or nodes) no longer share a journal row.
+fn scoped_request(
+    inv: &ActionInvocation,
+    action_digest: String,
+    effect_key: String,
+) -> DispatchRequest {
+    let action_type = inv.action.type_name().to_string();
+    let project = match &inv.action {
+        Action::SendMessage { project, .. } | Action::SendDm { project, .. } => project.clone(),
+        _ => None,
+    };
+    DispatchRequest {
+        effect_key,
+        run_id: inv.run.run_id.clone(),
+        project,
+        workflow_digest: inv.run.workflow_digest.clone(),
+        node_path: inv.run.node_path.clone(),
+        iteration_key: inv.run.iteration_key.clone(),
+        action_type: action_type.clone(),
+        action_digest,
+        redacted_action: None,
+        capability: capability_for_action_type(&action_type),
+    }
+}
+
+/// The context-bearing production effect runner (bd-zczp, Spec 1): every
+/// call crosses [`invoke`] — never the compat adapter — so effectful
+/// actions arrive with run/node/effect context and journal under
+/// run-scoped keys. Transport `corr` == effect key (Spec 5.4).
+/// Returns runner-shaped values (`{ok:false,…}` failures, never bare
+/// `Err`) so the engine's failure predicate keeps working; ambiguous
+/// provider errors surface inside those values as
+/// `effect_state: "unknown"` (I5), via [`invoke`]'s classification.
+pub fn mailbox_effect_runner(
+    mailbox: Arc<Mailbox>,
+    coalescer: Arc<std::sync::Mutex<MentionCoalescer>>,
+    job_signer: Option<Keys>,
+    dispatcher: Arc<std::sync::Mutex<Option<EffectDispatcher>>>,
+) -> EffectRunner {
+    Arc::new(move |inv: &ActionInvocation| {
+        let outcome = invoke(inv, |action| {
+            match action {
+                Action::SendMessage {
+                    to,
+                    subject,
+                    body,
+                    project,
+                } => {
+                    let project = project.clone().unwrap_or_default();
+                    let (key, digest) = scoped_effect_key(inv);
+                    let mut tags = stamp_workflow_emitted(vec![]);
+                    tags.push(Tag::parse(["corr", key.as_str()]).expect("corr tag parses"));
+                    let msg = SendMessage {
+                        project_slug: project.clone(),
+                        sender_name: sender_for(&project).to_string(),
+                        to: to.clone(),
+                        subject: subject.clone(),
+                        body_md: body.clone(),
+                        cc: vec![],
+                        bcc: vec![],
+                        importance: None,
+                        ack_required: false,
+                        thread_id: None,
+                        sender_token: None,
+                        overseer: false,
+                        extra_tags: tags,
+                    };
+                    let req = scoped_request(inv, digest, key.clone());
+                    send_via_dispatch(mailbox.clone(), &dispatcher, req, msg, key)
+                }
+                Action::SendDm { to, body, project } => {
+                    let project = project.clone().unwrap_or_default();
+                    let (key, digest) = scoped_effect_key(inv);
+                    let mut tags = stamp_workflow_emitted(vec![]);
+                    tags.push(Tag::parse(["corr", key.as_str()]).expect("corr tag parses"));
+                    let msg = SendMessage {
+                        project_slug: project.clone(),
+                        sender_name: sender_for(&project).to_string(),
+                        to: vec![to.clone()],
+                        subject: "workflow dm".to_string(),
+                        body_md: body.clone(),
+                        cc: vec![],
+                        bcc: vec![],
+                        importance: None,
+                        ack_required: false,
+                        thread_id: None,
+                        sender_token: None,
+                        overseer: false,
+                        extra_tags: tags,
+                    };
+                    let req = scoped_request(inv, digest, key.clone());
+                    send_via_dispatch(mailbox.clone(), &dispatcher, req, msg, key)
+                }
+                Action::DispatchJob { assignee, spec, .. } => {
+                    let mention = toron_workflow::coalesce::InboundMention {
+                        assignee: assignee.clone(),
+                        parent: String::new(),
+                        spec: serde_json::to_value(spec)
+                            .expect("DispatchSpec is JSON-serializable"),
+                    };
+                    let now = now_ms();
+                    let decision = {
+                        let mut c = coalescer.lock().unwrap_or_else(|e| e.into_inner());
+                        c.submit(mention, now)
+                    };
+                    let (key, digest) = scoped_effect_key(inv);
+                    let req = scoped_request(inv, digest, key.clone());
+                    let bus = mailbox.bus().clone();
+                    let signer = job_signer.clone();
+                    let disp = dispatcher.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                    let Some(disp) = disp else {
+                        // No journal: direct hand-off; failures return Err
+                        // so `invoke` classifies them (I5) identically.
+                        return match mention_outcome(bus.as_ref(), signer.as_ref(), decision, key) {
+                            ProviderOutcome::Delivered(v) => Ok(v),
+                            ProviderOutcome::ProvenFailed(m) | ProviderOutcome::Ambiguous(m) => {
+                                Err(anyhow::anyhow!(m))
+                            }
+                        };
+                    };
+                    let key_out = key.clone();
+                    Ok(fenced_outcome(
+                        &key_out,
+                        block_on_async(async move {
+                            disp.dispatch(&req, move |_| {
+                                mention_outcome(bus.as_ref(), signer.as_ref(), decision, key)
+                            })
+                            .await
+                        }),
+                    ))
+                }
+                // Any other HostSink (today: `Verify`) has no sink on this
+                // mailbox-only runner — fail loud, never silently succeed.
+                _ => Err(anyhow::anyhow!(
+                    "effect runner has no sink for '{}'",
+                    action.type_name()
+                )),
+            }
+        });
+        Ok(match outcome {
+            Ok(o) => o.value,
+            Err(f) => f.to_value(),
+        })
+    })
+}
+
+/// Send one fenced mail message: journaled dispatch when a dispatcher is
+/// attached, direct classified send otherwise (bd-zczp). Direct-path
+/// failures return `Err` so [`invoke`] classifies them (I5) identically.
+fn send_via_dispatch(
+    mailbox: Arc<Mailbox>,
+    dispatcher: &Arc<std::sync::Mutex<Option<EffectDispatcher>>>,
+    req: DispatchRequest,
+    msg: SendMessage,
+    key: String,
+) -> anyhow::Result<serde_json::Value> {
+    let disp = dispatcher.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let Some(disp) = disp else {
+        return match block_on_async(async move { mailbox.send_message(&msg).await }) {
+            Ok(res) => Ok(serde_json::json!({ "ok": true, "count": res.count })),
+            Err(e) => Err(anyhow::anyhow!(e.to_string())),
+        };
+    };
+    let key_out = key.clone();
+    Ok(fenced_outcome(
+        &key_out,
+        block_on_async(async move {
+            disp.dispatch(&req, move |_| {
+                let sent = match block_on_async(async move { mailbox.send_message(&msg).await }) {
+                    Ok(res) => Ok(res.count),
+                    Err(e) => Err(e.to_string()),
+                };
+                mail_outcome(sent, key)
+            })
+            .await
+        }),
+    ))
 }
 
 /// Build the kind-43001 event for a coalesced mention burst (ADR-0007 F7):
@@ -447,34 +688,47 @@ fn build_coalesced_job_event(signer: Option<&Keys>, coalesced: &Coalesced) -> Op
     Some(event)
 }
 
+/// Why a coalesced burst published nothing (bd-zczp): no signer is a
+/// proven never-send; a bus failure is ambiguous (the burst may have
+/// landed). Providers classify them differently — never conflated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CoalescePublishError {
+    /// No key to sign the 43001: deterministically unsent.
+    NoSigner,
+    /// The bus failed mid-publish: the job may or may not exist.
+    Transport(String),
+}
+
 /// Build + publish ONE kind-43001 for a coalesced mention burst, from SYNC
 /// contexts (the mailbox runner). F8: publish on an isolated thread so we
-/// never nest runtimes. Returns the published event id, or `None` when no
-/// signer is available. Async contexts (the trigger loop) must instead build
+/// never nest runtimes. Async contexts (the trigger loop) must instead build
 /// via [`build_coalesced_job_event`] and `bus.publish(...).await` directly —
 /// this function BLOCKS the calling thread on the publish.
 pub fn publish_coalesced_job(
     bus: &dyn Bus,
     signer: Option<&Keys>,
     coalesced: &Coalesced,
-) -> Option<EventId> {
-    let event = build_coalesced_job_event(signer, coalesced)?;
+) -> Result<EventId, CoalescePublishError> {
+    let event =
+        build_coalesced_job_event(signer, coalesced).ok_or(CoalescePublishError::NoSigner)?;
     // F8: publish on an isolated thread so we never nest runtimes.
     // Bus is Sync; clone the event and publish via a scoped thread.
-    let published = std::thread::scope(|s| {
+    let outcome = std::thread::scope(|s| {
         s.spawn(|| {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
-                .ok()?;
-            rt.block_on(bus.publish(event.clone())).ok()
+                .map_err(|e| format!("runner runtime: {e:#}"))?;
+            rt.block_on(bus.publish(event.clone()))
+                .map_err(|e| format!("bus publish: {e}"))
         })
         .join()
-        .ok()
-        .flatten()
+        .map_err(|_| "publish thread panicked".to_string())
     });
-    published?;
-    Some(event.id)
+    match outcome {
+        Ok(Ok(_)) => Ok(event.id),
+        Ok(Err(e)) | Err(e) => Err(CoalescePublishError::Transport(e)),
+    }
 }
 
 /// The sender identity for workflow-originated mail. Workflows are authored
@@ -567,10 +821,22 @@ impl WorkflowHost {
             job_signer.clone(),
             dispatcher.clone(),
         );
+        // bd-zczp: the engine prefers the context-bearing effect runner
+        // for mailbox/job HostSink actions (Spec 1); the legacy compat
+        // runner above stays for pure actions and journal-less fallbacks.
+        let effect_runner = mailbox_effect_runner(
+            mailbox.clone(),
+            coalescer.clone(),
+            job_signer.clone(),
+            dispatcher.clone(),
+        );
         let engine = match toron_workflow::engine::resonate_server_url() {
-            Some(url) => WorkflowEngine::remote(url, runner)
-                .context("workflow engine (remote resonate server)")?,
-            None => WorkflowEngine::local(runner).context("workflow engine")?,
+            Some(url) => {
+                WorkflowEngine::remote_with_effect_runner(url, runner, Some(effect_runner))
+                    .context("workflow engine (remote resonate server)")?
+            }
+            None => WorkflowEngine::local_with_effect_runner(runner, Some(effect_runner))
+                .context("workflow engine")?,
         };
         let bus = mailbox.bus().clone();
         Ok(Self {
@@ -4727,5 +4993,125 @@ steps:
             "blind retry after Unknown must refuse, never re-dispatch"
         );
         let _ = std::fs::remove_file(&db);
+    }
+
+    /// bd-zczp: the context-bearing effect runner journals run-scoped
+    /// keys — identical payloads in different runs send twice (no
+    /// compat over-dedupe), while the same invocation twice attaches.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn effect_runner_uses_run_scoped_keys() {
+        use toron_core::bus::in_process::{InProcessBus, InProcessBusConfig};
+        use toron_core::index::schema;
+        use toron_workflow::engine::{ActionInvocation, ExecutionPolicy, RunContext};
+        const PASSPHRASE: &str = "wf-effect-scope";
+        let db = std::env::temp_dir().join(format!("wf-scope-{}.sqlite", uuid::Uuid::new_v4()));
+        let pool = schema::connect(db.to_str().unwrap())
+            .await
+            .expect("connect");
+        schema::migrate(&pool).await.expect("migrate");
+        let bus: Arc<dyn Bus> = Arc::new(
+            InProcessBus::open(pool.clone(), InProcessBusConfig::default())
+                .await
+                .expect("bus"),
+        );
+        let data_dir = std::env::temp_dir().join(format!("wf-scope-data-{}", uuid::Uuid::new_v4()));
+        let mailbox = Arc::new(
+            Mailbox::new(bus.clone(), data_dir.clone(), None).with_agent_passphrase(PASSPHRASE),
+        );
+        mailbox
+            .register_agent(
+                "demo",
+                &toron_core::nostr::identity::AgentProfile::new("workflow-demo"),
+            )
+            .await
+            .expect("register sender");
+        mailbox
+            .register_agent(
+                "demo",
+                &toron_core::nostr::identity::AgentProfile::new("BlueLake"),
+            )
+            .await
+            .expect("register recipient");
+        let store = toron_core::index::workflow_effects::WorkflowEffectStore::new(pool);
+        let dispatcher = EffectDispatcher::new(store.clone());
+        let cell = Arc::new(std::sync::Mutex::new(Some(dispatcher.clone())));
+        let runner = mailbox_effect_runner(
+            mailbox,
+            Arc::new(std::sync::Mutex::new(MentionCoalescer::from_env())),
+            None,
+            cell,
+        );
+        fn inv(run: &str, node: &str) -> ActionInvocation {
+            ActionInvocation {
+                action: Action::SendMessage {
+                    to: vec!["BlueLake".into()],
+                    subject: "scoped".into(),
+                    body: "same payload".into(),
+                    project: Some("demo".into()),
+                },
+                run: RunContext {
+                    run_id: run.into(),
+                    workflow_digest: "digest-1".into(),
+                    node_path: node.into(),
+                    iteration_key: None,
+                    effect_key: None,
+                    attempt: 1,
+                },
+                execution: ExecutionPolicy {
+                    max_attempts: 1,
+                    timeout_secs: None,
+                },
+            }
+        }
+        let call = |runner: &EffectRunner, invocation: ActionInvocation| {
+            let runner = runner.clone();
+            std::thread::spawn(move || runner(&invocation).expect("effect ok"))
+                .join()
+                .expect("effect thread")
+        };
+        let out_a1 = call(&runner, inv("run-A", "gate"));
+        assert_eq!(out_a1["ok"], serde_json::json!(true));
+        // Same logical invocation retries attach (one wire send).
+        let out_a2 = call(&runner, inv("run-A", "gate"));
+        assert_eq!(out_a2["ok"], serde_json::json!(true));
+        // Identical payload, different run: a DIFFERENT effect (rescoped).
+        let out_b = call(&runner, inv("run-B", "gate"));
+        assert_eq!(out_b["ok"], serde_json::json!(true));
+        let replay = toron_core::mailbox::collect_replay(
+            bus.as_ref(),
+            toron_core::bus::Filter::new().kinds([nostr::prelude::Kind::GiftWrap]),
+        )
+        .await
+        .expect("replay");
+        assert_eq!(
+            replay.len(),
+            2,
+            "run-scoped keys: A×2 attaches (1 wrap), B sends again"
+        );
+        // The journal holds two run-scoped rows, keyed by
+        // derive_effect_key — not the compat content hash.
+        let rendered = serde_json::to_value(&inv("run-A", "gate").action).expect("action json");
+        let action_digest = toron_workflow::identity::action_digest_of(
+            &toron_workflow::identity::redact_value(&rendered).0,
+        );
+        let expected_a = toron_workflow::engine::derive_effect_key(
+            "digest-1",
+            "run-A",
+            "gate",
+            None,
+            &action_digest,
+        );
+        let row = store
+            .get_effect(&expected_a)
+            .await
+            .expect("read")
+            .expect("run-scoped row for run-A exists");
+        assert_eq!(
+            row.state,
+            toron_core::index::workflow_effects::EffectState::Settled
+        );
+        assert_eq!(row.transport_corr.as_deref(), Some(expected_a.as_str()));
+        let _ = std::fs::remove_file(&db);
+        let _ = std::fs::remove_dir_all(&data_dir);
     }
 }

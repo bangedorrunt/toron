@@ -507,6 +507,97 @@ pub fn failure_for_invalid_output(type_name: &'static str, evidence: EvidenceRef
         evidence,
     }
 }
+/// How one provider error reads against the journal (bd-zczp, I5):
+/// a proven failure vs an ambiguous outcome no retry may assume.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderErrorClass {
+    /// Durably proven no-dispatch (unknown recipient, missing signer,
+    /// validation rejection): Failed + TerminalFailed stands.
+    Proven,
+    /// The send may or may not have happened (timeout, transport loss):
+    /// Unknown + Reconcile, never blanket Failed.
+    Ambiguous,
+}
+
+/// Classify one provider error message (bd-zczp, I5 — a timeout is not
+/// proof of absence). Conservative by design: only recognized ambiguity
+/// signals read Ambiguous; everything else stays Proven (today's
+/// behavior). The signal list names transport uncertainty, never
+/// deterministic rejections — and it deliberately avoids the bare word
+/// "unknown" so "unknown agent" (proven: no such recipient) never reads
+/// as ambiguous.
+pub fn classify_provider_error_msg(msg: &str) -> ProviderErrorClass {
+    const AMBIGUOUS: &[&str] = &[
+        "timeout",
+        "timed out",
+        "timed-out",
+        "deadline",
+        "transport",
+        "connection",
+        "network",
+        "unavailable",
+        "ambiguous",
+        "not confirmed",
+        "unknown outcome",
+        "may have",
+        "broken pipe",
+        "reset by peer",
+        "eof",
+    ];
+    let lower = msg.to_lowercase();
+    if AMBIGUOUS.iter().any(|sig| lower.contains(sig)) {
+        ProviderErrorClass::Ambiguous
+    } else {
+        ProviderErrorClass::Proven
+    }
+}
+
+/// The frozen runtime kind for an ambiguous error: timeouts keep their
+/// kind (a retry candidate per Spec 7); other transport uncertainty
+/// takes the frozen `unknown` kind — the set never expands.
+fn ambiguous_kind(msg: &str) -> FailureKind {
+    const TIMEOUT: &[&str] = &["timeout", "timed out", "timed-out", "deadline"];
+    let lower = msg.to_lowercase();
+    if TIMEOUT.iter().any(|sig| lower.contains(sig)) {
+        FailureKind::Timeout
+    } else {
+        FailureKind::Unknown
+    }
+}
+
+/// Build the boundary failure for one provider error (bd-zczp): proven
+/// errors keep Failed + TerminalFailed + retryable:false; ambiguous
+/// errors surface Unknown + Reconcile with the frozen kind. Shared by
+/// [`normalize_dispatch_result`] and [`invoke_compat`] so both paths
+/// classify identically.
+pub fn failure_for_provider_error(message: String, evidence: EvidenceRef) -> ActionFailure {
+    if classify_provider_error_msg(&message) == ProviderErrorClass::Ambiguous {
+        let kind = ambiguous_kind(&message);
+        return ActionFailure {
+            stage: ActionStage::Effect,
+            code: ActionErrorCode::ProviderError,
+            message,
+            kind: Some(kind),
+            retryable: kind.is_retry_candidate(),
+            resumable: false,
+            disposition: Disposition::Reconcile,
+            effect_state: EffectState::Unknown,
+            evidence,
+        };
+    }
+    ActionFailure {
+        stage: ActionStage::Effect,
+        code: ActionErrorCode::ProviderError,
+        message,
+        kind: None,
+        retryable: false,
+        resumable: false,
+        disposition: Disposition::TerminalFailed,
+        effect_state: EffectState::Failed,
+        evidence,
+    }
+}
+
 /// Normalize one dispatch result at the boundary: a provider error becomes
 /// a structured failure; `Null` is rejected because no action crossing this
 /// boundary declares unit output (ADR-0032 Spec 2: null is not a universal
@@ -519,23 +610,16 @@ pub fn normalize_dispatch_result(
     result: anyhow::Result<serde_json::Value>,
 ) -> Result<ActionOutcome, Box<ActionFailure>> {
     match result {
-        Err(e) => Err(Box::new(ActionFailure {
-            stage: ActionStage::Effect,
-            code: ActionErrorCode::ProviderError,
-            message: format!("dispatch failed: {e:#}"),
-            kind: None,
-            retryable: false,
-            resumable: false,
-            disposition: Disposition::TerminalFailed,
-            effect_state: EffectState::Failed,
-            evidence: EvidenceRef {
+        Err(e) => Err(Box::new(failure_for_provider_error(
+            format!("dispatch failed: {e:#}"),
+            EvidenceRef {
                 run_id: Some(invocation.run.run_id.clone()),
                 node: Some(invocation.run.node_path.clone()),
                 effect_key: invocation.run.effect_key.clone(),
                 attempt: Some(invocation.run.attempt),
                 ..EvidenceRef::with_detail(format!("{e:#}"))
             },
-        })),
+        ))),
         Ok(value) => {
             if value.is_null() {
                 Err(Box::new(failure_for_invalid_output(
@@ -590,17 +674,10 @@ pub fn invoke_compat(
         ActionPartition::Unsupported { .. } => failure_for_unsupported(action).to_value(),
         ActionPartition::HostSink { sink } => match dispatch_host(action) {
             None => failure_for_missing_sink(action, sink).to_value(),
-            Some(Err(e)) => ActionFailure {
-                stage: ActionStage::Effect,
-                code: ActionErrorCode::ProviderError,
-                message: format!("dispatch failed: {e:#}"),
-                kind: None,
-                retryable: false,
-                resumable: false,
-                disposition: Disposition::TerminalFailed,
-                effect_state: EffectState::Failed,
-                evidence: EvidenceRef::with_detail(format!("{e:#}")),
-            }
+            Some(Err(e)) => failure_for_provider_error(
+                format!("dispatch failed: {e:#}"),
+                EvidenceRef::with_detail(format!("{e:#}")),
+            )
             .to_value(),
             Some(Ok(value)) => {
                 if value.is_null() {
@@ -865,9 +942,10 @@ mod tests {
         assert_eq!(out.effect, EffectSettlement::None);
     }
 
-    /// bd-i6kc honesty gate: a dispatch error crosses as a structured
-    /// `provider_error` failure with `failed` effect state — never a stringly
-    /// success and never a fresh retry.
+    /// bd-i6kc honesty gate (bd-zczp amended): a dispatch error crosses as
+    /// a structured `provider_error` failure — and a TIMEOUT crosses as
+    /// Unknown + Reconcile (I5: a timeout is not proof of absence), never
+    /// a fresh retry and never blanket Failed.
     #[test]
     fn honesty_gate_dispatch_error_is_structured_failure() {
         let calls = Cell::new(0u32);
@@ -878,18 +956,20 @@ mod tests {
         });
         let err = invoke(&inv, |_| {
             calls.set(calls.get() + 1);
-            anyhow::bail!("relay timeout")
+            Err(anyhow::anyhow!("relay timeout"))
         })
         .expect_err("dispatch error must surface");
         assert_eq!(calls.get(), 1, "no retry on dispatch error");
         assert_eq!(err.code, ActionErrorCode::ProviderError);
         assert_eq!(err.stage, ActionStage::Effect);
-        assert_eq!(err.effect_state, EffectState::Failed);
+        // bd-zczp: timeout is ambiguous — Unknown + Reconcile, not Failed.
+        assert_eq!(err.effect_state, EffectState::Unknown);
+        assert_eq!(err.disposition, Disposition::Reconcile);
+        assert_eq!(err.kind, Some(FailureKind::Timeout));
         assert!(
-            err.kind.is_none(),
-            "unclassified errors take no runtime kind"
+            err.kind.is_some(),
+            "classified errors take a frozen runtime kind"
         );
-        assert!(!err.retryable);
     }
 
     /// bd-i6kc honesty gate: `Null` is not success — no action on this
@@ -1002,5 +1082,91 @@ mod tests {
         assert_ne!(a, other_node, "distinct nodes differ");
         let iterated = derive_effect_key("digest", "run", "node", Some("item-3"), "action-digest");
         assert_ne!(a, iterated, "iteration key participates");
+    }
+
+    /// bd-zczp RED: a timeout is not proof of absence — an ambiguous
+    /// provider error surfaces as Unknown + Reconcile, never Failed +
+    /// TerminalFailed.
+    #[test]
+    fn boundary_timeout_is_unknown_not_failed() {
+        let inv = invocation_for(Action::SendDm {
+            to: "a".into(),
+            body: "b".into(),
+            project: None,
+        });
+        let err =
+            invoke(&inv, |_| Err(anyhow::anyhow!("relay timeout"))).expect_err("must surface");
+        assert_eq!(err.code, ActionErrorCode::ProviderError);
+        assert_eq!(err.effect_state, EffectState::Unknown);
+        assert_eq!(err.disposition, Disposition::Reconcile);
+        assert_eq!(err.kind, Some(FailureKind::Timeout));
+        let v = err.to_value();
+        assert_eq!(v["effect_state"], serde_json::json!("unknown"));
+        assert_eq!(v["disposition"], serde_json::json!("reconcile"));
+    }
+
+    /// bd-zczp RED: transport loss is ambiguous — Unknown + Reconcile.
+    #[test]
+    fn boundary_transport_error_is_unknown() {
+        let inv = invocation_for(Action::SendDm {
+            to: "a".into(),
+            body: "b".into(),
+            project: None,
+        });
+        let err = invoke(&inv, |_| {
+            Err(anyhow::anyhow!("transport: connection reset by peer"))
+        })
+        .expect_err("must surface");
+        assert_eq!(err.effect_state, EffectState::Unknown);
+        assert_eq!(err.disposition, Disposition::Reconcile);
+    }
+
+    /// bd-zczp RED: a deterministic rejection stays Failed + TerminalFailed
+    /// — only recognized-ambiguous signals become Unknown.
+    #[test]
+    fn boundary_deterministic_error_stays_failed() {
+        let inv = invocation_for(Action::SendDm {
+            to: "a".into(),
+            body: "b".into(),
+            project: None,
+        });
+        let err = invoke(&inv, |_| Err(anyhow::anyhow!("unknown agent: nobody")))
+            .expect_err("must surface");
+        assert_eq!(err.effect_state, EffectState::Failed);
+        assert_eq!(err.disposition, Disposition::TerminalFailed);
+        assert!(!err.retryable);
+    }
+
+    /// bd-zczp RED: the compat adapter classifies too — a host-closure
+    /// timeout is Unknown, never blanket Failed.
+    #[test]
+    fn boundary_compat_timeout_is_unknown() {
+        let v = invoke_compat(
+            &Action::SendDm {
+                to: "a".into(),
+                body: "b".into(),
+                project: None,
+            },
+            |_| Some(Err(anyhow::anyhow!("send timeout"))),
+        );
+        assert_eq!(v["ok"], serde_json::json!(false));
+        assert_eq!(v["effect_state"], serde_json::json!("unknown"));
+        assert_eq!(v["disposition"], serde_json::json!("reconcile"));
+    }
+
+    /// bd-zczp RED: the compat adapter keeps proven failures Failed.
+    #[test]
+    fn boundary_compat_deterministic_stays_failed() {
+        let v = invoke_compat(
+            &Action::SendDm {
+                to: "a".into(),
+                body: "b".into(),
+                project: None,
+            },
+            |_| Some(Err(anyhow::anyhow!("no job signer configured"))),
+        );
+        assert_eq!(v["ok"], serde_json::json!(false));
+        assert_eq!(v["effect_state"], serde_json::json!("failed"));
+        assert_eq!(v["disposition"], serde_json::json!("terminal_failed"));
     }
 }

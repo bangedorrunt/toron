@@ -130,8 +130,9 @@ pub fn host_port(url: &str) -> Option<(String, u16)> {
 pub use boundary::{
     ActionErrorCode, ActionFailure, ActionInvocation, ActionOutcome, ActionPartition, ActionStage,
     DEPRECATED_ACTION_TYPES, Disposition, ENGINE_ACTION_TYPES, EffectSettlement, EffectState,
-    EvidenceRef, ExecutionPolicy, FailureKind, MAX_EVIDENCE_DETAIL, RunContext,
-    advertised_action_names, derive_effect_key, invoke, invoke_compat, is_failure_value, partition,
+    EvidenceRef, ExecutionPolicy, FailureKind, MAX_EVIDENCE_DETAIL, ProviderErrorClass, RunContext,
+    advertised_action_names, classify_provider_error_msg, derive_effect_key,
+    failure_for_provider_error, invoke, invoke_compat, is_failure_value, partition,
 };
 pub use control_flow::{
     GraphNodeInput, ParallelCopyInput, build_workflow_run_terminal, run_graph_node,
@@ -218,6 +219,14 @@ pub struct RunInput {
 /// valid "no output" action.
 pub type ActionRunner = Arc<dyn Fn(&Action) -> anyhow::Result<serde_json::Value> + Send + Sync>;
 
+/// The context-bearing effect surface (bd-zczp, ADR-0032 Spec 1): every
+/// effectful invocation carries its [`ActionInvocation`] (run/node/effect
+/// context + policy). The engine prefers this over [`ActionRunner`] for
+/// mailbox/job HostSink actions whenever one is injected; the legacy
+/// runner stays for pure actions, journal-less embeddings, and tests.
+pub type EffectRunner =
+    Arc<dyn Fn(&ActionInvocation) -> anyhow::Result<serde_json::Value> + Send + Sync>;
+
 /// The `spawn` profile resolver DI seam (ADR-0005 Spec 4a). Resolves a
 /// profile name (`@housekeeper`) to the (npub, spawn spec) the embedding
 /// spawns. The ENGINE never imports flywheel — this seam is injected, same
@@ -287,12 +296,39 @@ impl WorkflowEngine {
         profile_resolver: ProfileResolver,
         workflow_resolver: WorkflowResolver,
     ) -> anyhow::Result<Self> {
+        Self::local_with_resolvers_effect(action_runner, profile_resolver, workflow_resolver, None)
+    }
+
+    /// Like [`Self::local_with_resolvers`] with a context-bearing
+    /// [`EffectRunner`] (bd-zczp): the engine prefers it over the legacy
+    /// runner for mailbox/job HostSink actions. `None` preserves the
+    /// legacy compat path.
+    pub fn local_with_effect_runner(
+        action_runner: ActionRunner,
+        effect_runner: Option<EffectRunner>,
+    ) -> anyhow::Result<Self> {
+        Self::local_with_resolvers_effect(
+            action_runner,
+            Self::default_resolver(),
+            Self::default_workflow_resolver(),
+            effect_runner,
+        )
+    }
+
+    /// Funnel for the local constructors: all four established above.
+    fn local_with_resolvers_effect(
+        action_runner: ActionRunner,
+        profile_resolver: ProfileResolver,
+        workflow_resolver: WorkflowResolver,
+        effect_runner: Option<EffectRunner>,
+    ) -> anyhow::Result<Self> {
         let sink = ApprovalSink::default();
         let spawn_sink = SpawnSink::default();
         let policy_sink = crate::cron_failure::PolicySink::new();
         let verify_sink = VerifySink::default();
         let resonate = Resonate::local()
             .with_dependency(action_runner)
+            .with_dependency(effect_runner)
             .with_dependency(profile_resolver)
             .with_dependency(workflow_resolver)
             .with_dependency(sink.clone())
@@ -329,38 +365,16 @@ impl WorkflowEngine {
         action_runner: ActionRunner,
         profile_resolver: ProfileResolver,
     ) -> anyhow::Result<Self> {
-        let sink = ApprovalSink::default();
-        let spawn_sink = SpawnSink::default();
-        let policy_sink = crate::cron_failure::PolicySink::new();
-        let verify_sink = VerifySink::default();
-        let config = ResonateConfig {
-            url: Some(url.into()),
-            ..Default::default()
-        };
-        let resonate = Resonate::new(config)
-            .with_dependency(action_runner)
-            .with_dependency(profile_resolver)
-            .with_dependency(Self::default_workflow_resolver())
-            .with_dependency(sink.clone())
-            .with_dependency(spawn_sink.clone())
-            .with_dependency(policy_sink.clone())
-            .with_dependency(verify_sink.clone());
-        resonate
-            .register(run_workflow)
-            .map_err(|e| anyhow::anyhow!("register workflow function: {e}"))?;
-        resonate
-            .register(run_graph_node)
-            .map_err(|e| anyhow::anyhow!("register graph node function: {e}"))?;
-        resonate
-            .register(run_parallel_copy)
-            .map_err(|e| anyhow::anyhow!("register parallel copy function: {e}"))?;
-        Ok(Self {
-            resonate: Arc::new(resonate),
-            approval_sink: sink,
-            spawn_sink,
-            policy_sink,
-            verify_sink,
-        })
+        // Delegates to the funnel so every construction site injects the
+        // same dependency set (bd-zczp: a directly-built Resonate once
+        // missed the effect-runner dep and panicked leaf dispatch).
+        Self::remote_with_resolvers_effect(
+            url,
+            action_runner,
+            profile_resolver,
+            Self::default_workflow_resolver(),
+            None,
+        )
     }
 
     /// Like [`Self::remote_with`] with an explicit [`WorkflowResolver`] for
@@ -370,6 +384,39 @@ impl WorkflowEngine {
         action_runner: ActionRunner,
         profile_resolver: ProfileResolver,
         workflow_resolver: WorkflowResolver,
+    ) -> anyhow::Result<Self> {
+        Self::remote_with_resolvers_effect(
+            url,
+            action_runner,
+            profile_resolver,
+            workflow_resolver,
+            None,
+        )
+    }
+
+    /// Like [`Self::remote_with_resolvers`] with a context-bearing
+    /// [`EffectRunner`] (bd-zczp). `None` preserves the legacy compat path.
+    pub fn remote_with_effect_runner(
+        url: impl Into<String>,
+        action_runner: ActionRunner,
+        effect_runner: Option<EffectRunner>,
+    ) -> anyhow::Result<Self> {
+        Self::remote_with_resolvers_effect(
+            url,
+            action_runner,
+            Self::default_resolver(),
+            Self::default_workflow_resolver(),
+            effect_runner,
+        )
+    }
+
+    /// Funnel for the remote constructors.
+    fn remote_with_resolvers_effect(
+        url: impl Into<String>,
+        action_runner: ActionRunner,
+        profile_resolver: ProfileResolver,
+        workflow_resolver: WorkflowResolver,
+        effect_runner: Option<EffectRunner>,
     ) -> anyhow::Result<Self> {
         let sink = ApprovalSink::default();
         let spawn_sink = SpawnSink::default();
@@ -381,6 +428,7 @@ impl WorkflowEngine {
         };
         let resonate = Resonate::new(config)
             .with_dependency(action_runner)
+            .with_dependency(effect_runner)
             .with_dependency(profile_resolver)
             .with_dependency(workflow_resolver)
             .with_dependency(sink.clone())
