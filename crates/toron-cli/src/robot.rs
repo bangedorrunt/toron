@@ -515,6 +515,26 @@ pub async fn run_reserve(mailbox: &Mailbox, cmd: &ReserveCommand) -> anyhow::Res
                 .check_file_reservation_conflicts(&args.project, &args.agent, &args.paths)
                 .await?,
         ),
+        ReserveCommand::List(args) => {
+            let rows = mailbox
+                .list_file_reservations(&args.project, args.holder.as_deref(), args.path.as_deref())
+                .await?;
+            emit(toron_mcp::tools::reservation::LeaseBoardOut {
+                project_key: args.project.clone(),
+                count: rows.len() as i64,
+                reservations: rows
+                    .into_iter()
+                    .map(|r| toron_mcp::tools::reservation::LeaseRowOut {
+                        id: r.id,
+                        path: r.path_pattern,
+                        holder: r.agent_name,
+                        exclusive: r.exclusive,
+                        reason: r.reason,
+                        expires_ts_us: r.expires_ts_us,
+                    })
+                    .collect(),
+            })
+        }
         ReserveCommand::Renew(args) => emit(
             mailbox
                 .renew_file_reservations(&args.project, &args.agent, &args.paths, args.extend_secs)
@@ -523,6 +543,11 @@ pub async fn run_reserve(mailbox: &Mailbox, cmd: &ReserveCommand) -> anyhow::Res
         ReserveCommand::Release(args) => emit(
             mailbox
                 .release_file_reservations(&args.project, &args.agent, &args.paths)
+                .await?,
+        ),
+        ReserveCommand::ReleaseByReason(args) => emit(
+            mailbox
+                .release_by_reason(&args.project, &args.agent, &args.bead_id, !args.no_notify)
                 .await?,
         ),
         ReserveCommand::ForceRelease(args) => {
@@ -632,6 +657,18 @@ pub async fn run_reserve_daemon(dc: &DaemonClient, cmd: &ReserveCommand) -> anyh
             )
             .await
         }
+        ReserveCommand::List(args) => {
+            daemon_tool(
+                dc,
+                "list_file_reservations",
+                json!({
+                    "project_key": args.project,
+                    "holder": args.holder,
+                    "path": args.path,
+                }),
+            )
+            .await
+        }
         ReserveCommand::Renew(args) => {
             daemon_tool(
                 dc,
@@ -653,6 +690,19 @@ pub async fn run_reserve_daemon(dc: &DaemonClient, cmd: &ReserveCommand) -> anyh
                     "project_key": args.project,
                     "agent_name": args.agent,
                     "paths": args.paths,
+                }),
+            )
+            .await
+        }
+        ReserveCommand::ReleaseByReason(args) => {
+            daemon_tool(
+                dc,
+                "release_file_reservations_by_reason",
+                json!({
+                    "project_key": args.project,
+                    "agent_name": args.agent,
+                    "bead_id": args.bead_id,
+                    "notify_previous": !args.no_notify,
                 }),
             )
             .await

@@ -80,6 +80,22 @@ Ordered by severity. "Fix" = suggested owner.
 - Root causes: (a) the installed `~/.cargo/bin/flywheel` predates the `doorbell start --host <project>/<workspace>` arming verb (bd-ene2) — plain `doorbell start <p>` just adopts the daemon and exits; the skill documents a flag the binary doesn't have (the documented binary-freshness trap, but on a wake-critical verb). (b) spawn's documented "records a subscription row and defers to a healthy daemon" left subscribers at 0 across 4 spawned panes — the subscription row either never wrote or bound to a dead run's workspace. (c) nothing surfaces "doorbell is in standby with 0 subscribers" at arrive/briefing time — the swarm started wake-blind and no gate noticed.
 - Fix: binary freshness gate that covers DOORBELL verbs (arrive should refuse-or-warn when the installed binary can't arm the plane), spawn should verify its subscription row landed (subscribers count > 0) and warn loud, and `doorbell status` standby-with-active-workspaces should be a visible degraded state, not a green JSON.
 
+## Resolution pass — 2026-09-12 (verify + fix)
+
+Verified against the working tree; fixes landed in the toron repo only.
+
+| Item | Verdict | Where |
+|---|---|---|
+| F11 | **Fixed** | `toron reserve release-by-reason <bead> --project <p> --as <operator>` — CLI door for release-on-bead-close (wraps `release_by_reason`); embedded + daemon arms. No new MCP tool. Skill sync: toron SKILL (0.3.9) and the br close ceremony (SKILL 1.1.3 + `br-close-ceremony.md`) now carry the RELEASE step. |
+| F14 | **Fixed** | `toron reserve list --project <p> [--holder <pin>] [--path <glob>]` (CLI) shares ONE filter (`Mailbox::list_file_reservations`) with the MCP `list_file_reservations` tool; `ToolOutput` now emits `structured_content` for object results, so outputSchema-bearing tools stop failing strict clients. |
+| F2 | **Documented** | `docs/guides/reservations.mdx`: the strict guard evaluates the git **index**, not the `git commit -- <pathspec>` selection; `.beads` bookkeeping files are shared-safe. |
+| F5 | **Already fixed** | `staged_added_lines_in` is called with `SHARED_SAFE_PATHS` (`.beads/issues.jsonl` et al. excluded from the bead-hunk scan); covered by `staged_added_lines_exclude_shared_safe_paths`. The observed block came from a stale installed hook/binary, not workspace code. |
+| F1/F4 | Verified, **flywheel-side** — filed **bd-enov** | `whois` resolves kind-30013 profiles; `reserve` resolves the key file — two planes. Toron already ships the canonical door (`toron agent bootstrap`, upsert preserving the npub); `flywheel mail register` must call it or arrive must fall back to the key-file identity. |
+| F13 | Verified, **flywheel-side (+ follow-up)** — filed **bd-zugo** | `--from-project` register minting a nameless key is a flywheel register bug. Toron-side follow-up: warn loud at acquire when the acting name has no registered profile (hot path — needs its own change). |
+| F16 | Verified, **beads-side** — filed **bd-9ewu** | `br ready`/`next` count `parent-child` as blocking and surface open epics; epics are grouping, not ordering. |
+| F17 | Verified, **flywheel-side** — filed **bd-xe9t** | Doorbell stayed standby with 0 subscribers all swarm (stale binary lacks the arming verb, spawn subscriptions never landed, status is green while blind). |
+| F3, F6, F9/F12/F15, F10 | Verified, **not toron** | Process gap (F3) / flywheel compose+harness (F6) / flywheel send observation (F9,F12,F15) / flywheel arrive captain rebind (F10). |
+
 ## Clean (worth keeping)
 
 - Strict guard's blocked[] JSON is precise (agent, path, reason) — fast to act on once identity resolved.

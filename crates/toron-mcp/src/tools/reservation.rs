@@ -164,7 +164,7 @@ impl ToolServer {
     /// == 0` is a clean no-op.
     #[tool(
         name = "release_file_reservations_by_reason",
-        description = "Release all file reservations whose reason is the given bead id (operator-signed; release-on-bead-close). REQUIRED: project_key, agent_name, bead_id. Operator/loop after-close hook; crews release their own locks via release_file_reservations (by agent_name) or CLI: toron reserve release --project <p> --agent <pin>.",
+        description = "Release all file reservations whose reason is the given bead id (operator-signed; release-on-bead-close). REQUIRED: project_key, agent_name, bead_id. Operator/loop after-close hook; crews release their own locks via release_file_reservations (by agent_name) or CLI: toron reserve release --project <p> --as <pin>. Operator CLI door: toron reserve release-by-reason <bead> --project <p> --as <operator>.",
         output_schema = rmcp::handler::server::tool::schema_for_output::<crate::responses::ReleaseResultOut>(),
         annotations(title = "Release reservations by reason", destructive_hint = true)
     )]
@@ -199,23 +199,20 @@ impl ToolServer {
         &self,
         Parameters(args): Parameters<ListFileReservationsArgs>,
     ) -> ToolOutput {
-        let rows = match self.mailbox.active_reservations(&args.project_key).await {
+        let rows = match self
+            .mailbox
+            .list_file_reservations(
+                &args.project_key,
+                args.holder.as_deref(),
+                args.path.as_deref(),
+            )
+            .await
+        {
             Ok(rows) => rows,
             Err(e) => return ToolOutput::result::<()>(Err(e)),
         };
-        let matches_glob = |pattern: &str, query: &str| -> bool {
-            // the guard's own symmetric fnmatch semantics
-            toron_core::mailbox::guard::pattern_matches(pattern, query)
-                || toron_core::mailbox::guard::pattern_matches(query, pattern)
-        };
         let reservations: Vec<LeaseRowOut> = rows
             .into_iter()
-            .filter(|r| args.holder.as_deref().is_none_or(|h| r.agent_name == h))
-            .filter(|r| {
-                args.path
-                    .as_deref()
-                    .is_none_or(|p| matches_glob(&r.path_pattern, p))
-            })
             .map(|r| LeaseRowOut {
                 id: r.id,
                 path: r.path_pattern,

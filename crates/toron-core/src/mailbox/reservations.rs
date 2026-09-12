@@ -1493,6 +1493,30 @@ impl Mailbox {
         Ok(out)
     }
 
+    /// The lease board view shared by the `list_file_reservations` MCP tool
+    /// and `toron reserve list`: active HELD reservations filtered by an
+    /// exact holder name and/or a symmetric-glob path overlap. One filter
+    /// implementation keeps the CLI and MCP surfaces from drifting.
+    pub async fn list_file_reservations(
+        &self,
+        project_slug: &str,
+        holder: Option<&str>,
+        path: Option<&str>,
+    ) -> anyhow::Result<Vec<Reservation>> {
+        let rows = self.active_reservations(project_slug).await?;
+        Ok(rows
+            .into_iter()
+            .filter(|r| holder.is_none_or(|h| r.agent_name == h))
+            .filter(|r| {
+                path.is_none_or(|p| {
+                    // the guard's own symmetric fnmatch semantics
+                    super::guard::pattern_matches(&r.path_pattern, p)
+                        || super::guard::pattern_matches(p, &r.path_pattern)
+                })
+            })
+            .collect())
+    }
+
     /// bd-f5tt: active HELD reservations across every slug alias of
     /// `project_slug` (CLI absolute-path key + MCP short key). A lease is
     /// tagged with the slug as-written at acquire time; the guard check
@@ -4546,6 +4570,68 @@ mod tests {
             .expect("conflict check");
         assert!(rep.conflict_free, "src/x.rs released without waiting TTL");
         assert!(rep.conflicts.is_empty(), "{:?}", rep.conflicts);
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// The shared lease-board filter (`list_file_reservations`): exact holder
+    /// and symmetric-glob path overlap. One implementation backs both the MCP
+    /// tool and `toron reserve list`, so the CLI and MCP boards cannot drift
+    /// (F14, docs/learnings/2026-09-12-swarm-stack-friction.md).
+    #[tokio::test]
+    async fn test_list_file_reservations_filters_holder_and_path() {
+        let (mailbox, db_path, data_dir) = test_mailbox("locks-list").await;
+        register(&mailbox, "demo", "BlueLake").await;
+        register(&mailbox, "demo", "RedStone").await;
+        mailbox
+            .file_reservation_paths(
+                "demo",
+                "BlueLake",
+                &["src/a.rs".into()],
+                Some(3600),
+                true,
+                Some("bd-a"),
+            )
+            .await
+            .expect("acquire a");
+        mailbox
+            .file_reservation_paths(
+                "demo",
+                "RedStone",
+                &["docs/*.md".into()],
+                Some(3600),
+                false,
+                Some("bd-b"),
+            )
+            .await
+            .expect("acquire b");
+
+        let all = mailbox
+            .list_file_reservations("demo", None, None)
+            .await
+            .expect("all");
+        assert_eq!(all.len(), 2, "board shows both held leases");
+
+        let by_holder = mailbox
+            .list_file_reservations("demo", Some("BlueLake"), None)
+            .await
+            .expect("holder");
+        assert_eq!(by_holder.len(), 1);
+        assert_eq!(by_holder[0].path_pattern, "src/a.rs");
+
+        let by_path = mailbox
+            .list_file_reservations("demo", None, Some("docs/readme.md"))
+            .await
+            .expect("path");
+        assert_eq!(by_path.len(), 1, "glob overlap on the requested path");
+        assert_eq!(by_path[0].agent_name, "RedStone");
+
+        let none = mailbox
+            .list_file_reservations("demo", Some("NobodyHere"), None)
+            .await
+            .expect("none");
+        assert!(none.is_empty(), "unknown holder matches nothing");
 
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_dir_all(&data_dir);
