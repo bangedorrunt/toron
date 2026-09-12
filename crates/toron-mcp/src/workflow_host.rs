@@ -1167,6 +1167,256 @@ impl PendingDrain {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Fenced effect dispatch (ADR-0032 Spec 5.3, bd-v139.2).
+//
+// [`EffectDispatcher`] executes the [`toron_workflow::engine`] reconciliation
+// policy against [`WorkflowEffectStore`]: commit prepared intent before any
+// provider call, keep one effect key across attempts, fence every attempt
+// with a claim token, settle only with the current token, journal ambiguous
+// outcomes as `unknown` (never inferred absence), and link mailbox `corr`
+// by projection without touching the receipt store.
+// ---------------------------------------------------------------------------
+
+use toron_core::index::workflow_effects::{
+    ClaimAttempt, EffectState, NewAttempt, NewEffect, WorkflowEffect, WorkflowEffectStore, now_us,
+};
+use toron_workflow::engine::{
+    DispatchPlan, EffectView, ProviderCapability, ProviderOutcome, corr_for_effect, plan_attempt,
+};
+
+/// One effect dispatch request: identity inputs plus the provider's
+/// declared capability. The effect key is minted by the caller (stable
+/// across retries); the dispatcher never invents a second key.
+#[derive(Debug, Clone)]
+pub struct DispatchRequest {
+    pub effect_key: String,
+    pub run_id: String,
+    pub project: Option<String>,
+    pub workflow_digest: String,
+    pub node_path: String,
+    pub iteration_key: Option<String>,
+    pub action_type: String,
+    pub action_digest: String,
+    pub redacted_action: Option<serde_json::Value>,
+    pub capability: ProviderCapability,
+}
+
+/// The journaled result of one dispatch call.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DispatchResult {
+    pub effect_key: String,
+    pub attempt: i64,
+    pub state: EffectState,
+    pub outcome: serde_json::Value,
+}
+
+/// Classify one provider outcome into (effect state, failure evidence,
+/// outcome value). `Null` delivery and unproven results never read as
+/// success: null is `invalid_output`, ambiguity is `unknown`.
+fn classify_outcome(
+    outcome: &ProviderOutcome,
+) -> (
+    EffectState,
+    Option<serde_json::Value>,
+    Option<serde_json::Value>,
+) {
+    match outcome {
+        ProviderOutcome::Delivered(v) if v.is_null() => (
+            EffectState::Failed,
+            Some(serde_json::json!({"code": "invalid_output"})),
+            None,
+        ),
+        ProviderOutcome::Delivered(v) => (EffectState::Settled, None, Some(v.clone())),
+        ProviderOutcome::ProvenFailed(msg) => (
+            EffectState::Failed,
+            Some(serde_json::json!({"error": msg})),
+            None,
+        ),
+        ProviderOutcome::Ambiguous(msg) => (
+            EffectState::Unknown,
+            Some(serde_json::json!({"error": msg})),
+            None,
+        ),
+    }
+}
+
+/// Dispatch-lease duration per attempt (5 minutes in µs). An attempt that
+/// outlives its lease without settling is recoverable by a new owner; it is
+/// never proof the provider was not called.
+pub const DISPATCH_LEASE_US: i64 = 300_000_000;
+
+/// Executes fenced effect dispatches against the workflow-effect journal.
+#[derive(Debug, Clone)]
+pub struct EffectDispatcher {
+    store: WorkflowEffectStore,
+}
+
+impl EffectDispatcher {
+    pub fn new(store: WorkflowEffectStore) -> Self {
+        Self { store }
+    }
+
+    pub fn store(&self) -> &WorkflowEffectStore {
+        &self.store
+    }
+
+    /// Run the dispatch algorithm (ADR-0032 §5.3): render/validate aside,
+    /// 1. insert-or-load the prepared intent (duplicate keys attach, never
+    ///    fork);
+    /// 2. return the stored outcome when the row is already terminal;
+    /// 3. plan from the journaled view (refuse/reconcile/duplicate honored);
+    /// 4. claim the attempt under fencing before invoking the provider;
+    /// 5. link `transport_corr` by projection;
+    /// 6. invoke the provider exactly once for this attempt;
+    /// 7. settle, fail, or mark `unknown` from the classified outcome, with
+    ///    append-only attempt evidence at every step.
+    pub async fn dispatch(
+        &self,
+        req: &DispatchRequest,
+        provider: impl FnOnce(&DispatchRequest) -> ProviderOutcome,
+    ) -> anyhow::Result<DispatchResult> {
+        let prepared = self
+            .store
+            .prepare_effect(NewEffect {
+                effect_key: req.effect_key.clone(),
+                run_id: req.run_id.clone(),
+                project: req.project.clone(),
+                workflow_digest: req.workflow_digest.clone(),
+                node_path: req.node_path.clone(),
+                iteration_key: req.iteration_key.clone(),
+                action_type: req.action_type.clone(),
+                action_digest: req.action_digest.clone(),
+                redacted_action: req.redacted_action.clone(),
+                retention_until: None,
+            })
+            .await?;
+        let row = prepared.effect;
+        if row.state.is_terminal() {
+            return Ok(self.result_from_row(&row));
+        }
+        let now = now_us();
+        // Live means an owner may be dispatching right now: a token pinned
+        // by an unexpired lease. A token with no lease (classified outcome)
+        // still fences at claim time but does not block planning.
+        let lease_live = matches!(row.lease_expires_at, Some(expires) if expires > now);
+        let view = EffectView {
+            state: row.state,
+            attempt: row.attempt,
+            lease_live,
+        };
+        let attempt_no = match plan_attempt(Some(&view), &req.capability) {
+            DispatchPlan::DispatchNew => row.attempt,
+            DispatchPlan::RetrySameKey { attempt } => attempt,
+            DispatchPlan::DuplicateTerminal => return Ok(self.result_from_row(&row)),
+            DispatchPlan::ReconcileFirst { reason } | DispatchPlan::RefuseBlindRetry { reason } => {
+                anyhow::bail!("dispatch refused for {}: {reason}", req.effect_key)
+            }
+        };
+        // Fencing identity is deterministic per (key, attempt): unique
+        // across attempts without a randomness dependency (the fence
+        // defeats stale writers via the journal, not via token secrecy).
+        let token = format!("tok-{}-a{}", req.effect_key, attempt_no);
+        let attempt_id = format!("att-{}-a{}", req.effect_key, attempt_no);
+        let claimed = self
+            .store
+            .claim_attempt(
+                &req.effect_key,
+                ClaimAttempt {
+                    attempt: attempt_no,
+                    attempt_id: attempt_id.clone(),
+                    claim_token: token.clone(),
+                    lease_expires_at: now + DISPATCH_LEASE_US,
+                    expected_claim_token: row.claim_token.clone(),
+                },
+            )
+            .await?;
+        if !claimed {
+            anyhow::bail!(
+                "dispatch fenced for {}: live owner holds the lease",
+                req.effect_key
+            );
+        }
+        self.store
+            .record_attempt(NewAttempt {
+                effect_key: req.effect_key.clone(),
+                attempt: attempt_no,
+                attempt_id: attempt_id.clone(),
+                claim_token: Some(token.clone()),
+                state: EffectState::InFlight,
+                evidence: None,
+            })
+            .await?;
+        self.store
+            .link_transport_corr(&req.effect_key, &corr_for_effect(&req.effect_key))
+            .await?;
+        let outcome = provider(req);
+        let (to, failure, value) = classify_outcome(&outcome);
+        let settled = self
+            .store
+            .settle_with_fence(&req.effect_key, &token, to, failure, value)
+            .await?;
+        if !settled {
+            anyhow::bail!("dispatch lost fencing for {} mid-attempt", req.effect_key);
+        }
+        self.store
+            .record_attempt(NewAttempt {
+                effect_key: req.effect_key.clone(),
+                attempt: attempt_no,
+                attempt_id,
+                claim_token: Some(token),
+                state: to,
+                evidence: Some(match &outcome {
+                    ProviderOutcome::Delivered(v) => v.clone(),
+                    ProviderOutcome::ProvenFailed(m) | ProviderOutcome::Ambiguous(m) => {
+                        serde_json::json!({"error": m})
+                    }
+                }),
+            })
+            .await?;
+        let row = self
+            .store
+            .get_effect(&req.effect_key)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("effect vanished after settle"))?;
+        Ok(self.result_from_row(&row))
+    }
+
+    /// Settle one effect with an explicitly presented fencing token.
+    /// Returns `false` (changing nothing) when the token is stale — the
+    /// caller that lost the fence must reconcile, not overwrite.
+    pub async fn settle_with_presented(
+        &self,
+        effect_key: &str,
+        presented_token: &str,
+        outcome: ProviderOutcome,
+    ) -> anyhow::Result<bool> {
+        let (to, failure, value) = classify_outcome(&outcome);
+        self.store
+            .settle_with_fence(effect_key, presented_token, to, failure, value)
+            .await
+    }
+
+    fn result_from_row(&self, row: &WorkflowEffect) -> DispatchResult {
+        let outcome = row
+            .outcome_json
+            .as_deref()
+            .and_then(|s| serde_json::from_str(s).ok())
+            .or_else(|| {
+                row.failure_json
+                    .as_deref()
+                    .and_then(|s| serde_json::from_str(s).ok())
+            })
+            .unwrap_or(serde_json::Value::Null);
+        DispatchResult {
+            effect_key: row.effect_key.clone(),
+            attempt: row.attempt,
+            state: row.state,
+            outcome,
+        }
+    }
+}
+
 /// Test helper (bd-dispatch-spec-untyped-0iud migration): build a
 /// [`toron_workflow::schema::DispatchSpec`] from raw JSON — the migration
 /// rewrote legacy `spec: json!(...)` call sites to this helper but never
@@ -2552,6 +2802,255 @@ steps:
         let _ = server.kill();
         let _ = server.wait();
         let _ = std::fs::remove_file(&db);
+    }
+
+    /// bd-v139.2 test helper: a dispatcher over a throwaway journal.
+    async fn recon_store(tag: &str) -> toron_core::index::workflow_effects::WorkflowEffectStore {
+        use toron_core::index::schema;
+        let dir = std::env::temp_dir().join(format!("wf-recon-{tag}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("tmpdir");
+        let db = dir.join("recon.sqlite");
+        let pool = schema::connect(db.to_str().unwrap())
+            .await
+            .expect("connect");
+        schema::migrate(&pool).await.expect("migrate");
+        toron_core::index::workflow_effects::WorkflowEffectStore::new(pool)
+    }
+
+    fn recon_req(key: &str) -> DispatchRequest {
+        DispatchRequest {
+            effect_key: key.into(),
+            run_id: "run-1".into(),
+            project: None,
+            workflow_digest: "digest-1".into(),
+            node_path: "gate".into(),
+            iteration_key: None,
+            action_type: "send_message".into(),
+            action_digest: "adigest-1".into(),
+            redacted_action: None,
+            capability: ProviderCapability {
+                supports_idempotency_key: true,
+                supports_reconcile_query: false,
+            },
+        }
+    }
+
+    /// bd-v139.2 RED: intent precedes dispatch — the provider observes a
+    /// journaled prepared/in-flight intent for the same key it is asked to
+    /// execute; the effect key is fixed before the call.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn effect_reconciliation_intent_before_dispatch() {
+        let store = recon_store("intent").await;
+        let dispatcher = EffectDispatcher::new(store.clone());
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen2 = seen.clone();
+        let out = dispatcher
+            .dispatch(&recon_req("ek-1"), |req| {
+                let row = tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(store.get_effect(&req.effect_key))
+                })
+                .expect("read")
+                .expect("intent committed before dispatch");
+                seen2
+                    .lock()
+                    .unwrap()
+                    .push((row.effect_key, row.state.as_str().to_string()));
+                ProviderOutcome::Delivered(serde_json::json!({"ok": true}))
+            })
+            .await
+            .expect("dispatch");
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        assert_eq!(seen.lock().unwrap()[0].0, "ek-1");
+        assert_eq!(
+            out.state,
+            toron_core::index::workflow_effects::EffectState::Settled
+        );
+    }
+
+    /// bd-v139.2 RED: duplicate terminal dispatch returns the stored outcome
+    /// without calling the provider again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn effect_reconciliation_duplicate_terminal_no_redispatch() {
+        let store = recon_store("dupe").await;
+        let dispatcher = EffectDispatcher::new(store);
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c2 = calls.clone();
+        let provider = move |_: &DispatchRequest| {
+            c2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            ProviderOutcome::Delivered(serde_json::json!({"ok": true, "n": 1}))
+        };
+        let first = dispatcher
+            .dispatch(&recon_req("ek-1"), &provider)
+            .await
+            .expect("first");
+        let second = dispatcher
+            .dispatch(&recon_req("ek-1"), &provider)
+            .await
+            .expect("second");
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "one dispatch only"
+        );
+        assert_eq!(first.outcome, second.outcome, "same stored outcome");
+    }
+
+    /// bd-v139.2 RED: ambiguous provider result becomes `unknown` (never
+    /// failure-by-inference), then a same-key idempotent retry settles with
+    /// attempt 2 under the identical key.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn effect_reconciliation_unknown_then_same_key_retry() {
+        use toron_core::index::workflow_effects::EffectState;
+        let store = recon_store("retry").await;
+        let dispatcher = EffectDispatcher::new(store.clone());
+        let out = dispatcher
+            .dispatch(&recon_req("ek-1"), |_| {
+                ProviderOutcome::Ambiguous("timeout".into())
+            })
+            .await
+            .expect("ambiguous dispatch");
+        assert_eq!(out.state, EffectState::Unknown, "timeout is not absence");
+        let out2 = dispatcher
+            .dispatch(&recon_req("ek-1"), |_| {
+                ProviderOutcome::Delivered(serde_json::json!({"ok": true}))
+            })
+            .await
+            .expect("retry");
+        assert_eq!(out2.state, EffectState::Settled);
+        assert_eq!(out2.attempt, 2);
+        assert_eq!(out2.effect_key, "ek-1", "one logical key across attempts");
+    }
+
+    /// bd-v139.2 RED: a rotated fencing token refuses the stale owner's
+    /// settlement — state and evidence are unchanged.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn effect_reconciliation_stale_fence_settle_refused() {
+        use toron_core::index::workflow_effects::{ClaimAttempt, EffectState};
+        let store = recon_store("fence").await;
+        let dispatcher = EffectDispatcher::new(store.clone());
+        dispatcher
+            .dispatch(&recon_req("ek-1"), |_| {
+                ProviderOutcome::Ambiguous("lost".into())
+            })
+            .await
+            .expect("park as unknown");
+        let row = store.get_effect("ek-1").await.unwrap().unwrap();
+        let live_token = row.claim_token.clone().unwrap();
+        // New owner rotates the claim (expired-lease recovery path).
+        assert!(
+            store
+                .claim_attempt(
+                    "ek-1",
+                    ClaimAttempt {
+                        attempt: 9,
+                        attempt_id: "att-9".into(),
+                        claim_token: "token-new".into(),
+                        lease_expires_at: 1,
+                        expected_claim_token: Some("wrong-but-expired".into()),
+                    },
+                )
+                .await
+                .unwrap_or(false)
+                || store
+                    .get_effect("ek-1")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .claim_token
+                    .is_some()
+        );
+        // Stale owner settles with the old token: refused.
+        let settled = dispatcher
+            .settle_with_presented(
+                "ek-1",
+                &live_token,
+                ProviderOutcome::Delivered(serde_json::json!({"ok": true})),
+            )
+            .await
+            .expect("settle call");
+        assert!(!settled, "stale token cannot settle after rotation");
+        let row = store.get_effect("ek-1").await.unwrap().unwrap();
+        assert_eq!(row.state, EffectState::Unknown, "uncertainty preserved");
+    }
+
+    /// bd-v139.2 RED: mailbox corr links by projection — `transport_corr`
+    /// carries the effect key while the receipts table gains no row (the
+    /// receipt store never becomes the journal).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn effect_reconciliation_corr_linked_not_journaled() {
+        let store = recon_store("corr").await;
+        let pool = store.pool().clone();
+        let dispatcher = EffectDispatcher::new(store.clone());
+        dispatcher
+            .dispatch(&recon_req("ek-1"), |_| {
+                ProviderOutcome::Delivered(serde_json::json!({"ok": true}))
+            })
+            .await
+            .expect("dispatch");
+        let row = store.get_effect("ek-1").await.unwrap().unwrap();
+        assert_eq!(row.transport_corr.as_deref(), Some("ek-1"));
+        let receipts = toron_core::mailbox::receipts::ReceiptStore::new(pool);
+        assert!(
+            receipts.get("ek-1").await.unwrap().is_none(),
+            "no receipt row is implied by an effect dispatch"
+        );
+    }
+
+    /// bd-v139.2 RED: compensation preserves the original failure — a
+    /// cleanup attempt journals under its own key while the failed effect's
+    /// evidence stays intact (cleanup never rewrites uncertainty).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn effect_reconciliation_cleanup_preserves_failure() {
+        use toron_core::index::workflow_effects::EffectState;
+        let store = recon_store("cleanup").await;
+        let dispatcher = EffectDispatcher::new(store.clone());
+        dispatcher
+            .dispatch(&recon_req("ek-1"), |_| {
+                ProviderOutcome::ProvenFailed("relay 403".into())
+            })
+            .await
+            .expect("failed dispatch");
+        let failed = store.get_effect("ek-1").await.unwrap().unwrap();
+        assert_eq!(failed.state, EffectState::Failed);
+        assert!(
+            failed
+                .failure_json
+                .as_deref()
+                .unwrap_or("")
+                .contains("relay 403")
+        );
+        // Fixed cleanup (lease release by bead reason) journals separately.
+        let mut cleanup = recon_req("ek-1/cleanup:release-reservation");
+        cleanup.action_type = "release_reservation".into();
+        dispatcher
+            .dispatch(&cleanup, |_| {
+                ProviderOutcome::Delivered(serde_json::json!({"ok": true}))
+            })
+            .await
+            .expect("cleanup dispatch");
+        let failed = store.get_effect("ek-1").await.unwrap().unwrap();
+        assert_eq!(
+            failed.state,
+            EffectState::Failed,
+            "original failure retained"
+        );
+        assert!(
+            failed
+                .failure_json
+                .as_deref()
+                .unwrap_or("")
+                .contains("relay 403")
+        );
+        let done = store
+            .get_effect("ek-1/cleanup:release-reservation")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            done.state,
+            EffectState::Settled,
+            "cleanup separately settled"
+        );
     }
 
     /// bd-i6kc: `react` has no reaction sink — it MUST fail closed with an

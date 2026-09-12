@@ -32,6 +32,7 @@
 
 mod boundary;
 mod control_flow;
+mod reconcile;
 mod sinks;
 mod template;
 #[cfg(test)]
@@ -135,6 +136,10 @@ pub use boundary::{
 pub use control_flow::{
     GraphNodeInput, ParallelCopyInput, build_workflow_run_terminal, run_graph_node,
     run_parallel_copy, run_workflow, stamp_workflow_emitted,
+};
+pub use reconcile::{
+    DispatchPlan, EffectView, ProviderCapability, ProviderOutcome, ReplayMismatch, check_replay,
+    corr_for_effect, may_settle, plan_attempt,
 };
 pub use sinks::{
     ApprovalSink, MAX_PENDING_QUESTION, ParkKind, PendingEntry, PendingRegistry, Resolution,
