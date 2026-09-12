@@ -67,14 +67,26 @@ where
 /// tag (bd-pkc part 3 completion — the loop-prevention belt is dead until
 /// stamped).
 ///
-/// Dispatch semantics:
+/// Dispatch semantics (bd-i6kc, ADR-0032 Spec 1 + Spec 2.1 decision):
+/// every call is partitioned by [`toron_workflow::engine::partition`] first —
 /// - `SendMessage` / `SendDm` → `Mailbox::send_message` (kind-14 gift wrap).
 /// - `DispatchJob` → a coalesced job via the [`MentionCoalescer`] (kind-43001
 ///   with the merged spec; the coalescer decides when to flush).
-/// - `Delay` / `RequestApproval` / control-flow → the engine handles these
-///   itself; the runner returns `Null` (never reached for those).
-/// - `React` / `CallWebhook` → not yet wired (returns an honest `{ok:false}`
-///   error — a run using them fails the step, never silently succeeds).
+/// - Engine-owned control actions (`Delay` / `RequestApproval` / `Retry` /
+///   `Branch` / `Foreach` / `Parallel` / `CallWorkflow` / `Spawn`) →
+///   `control_action_misdispatch` failure (the engine sequences these; the
+///   runner never executes them).
+/// - `Verify` → `missing_sink` failure (verification runs through the
+///   embedding-owned `VerifySink`, never this mailbox-only runner).
+/// - `React` / `CallWebhook` → DEPRECATED (bd-i6kc retain-or-remove
+///   decision: remove). No reaction/webhook sink is wired, and the webhook
+///   SSRF contract (scheme/host policy, redirect and DNS-rebinding control,
+///   bounds, redaction) is unmet, so both fail closed with
+///   `unsupported_action` — a run using them fails the step, never silently
+///   succeeds.
+///
+/// No arm returns bare `Null`: dispatch results are output-normalized, so a
+/// null result is an `invalid_output` failure, not success.
 ///
 /// The runner is sync (engine contract) and thread-safe; the coalescer is
 /// parked behind a `Mutex`.
@@ -84,7 +96,10 @@ pub fn mailbox_runner(
     job_signer: Option<Keys>,
 ) -> ActionRunner {
     Arc::new(move |action: &Action| {
-        match action {
+        // bd-i6kc: the context-free runner is the migration compat adapter —
+        // every call crosses the boundary partition first. `None` from the
+        // host closure means the required named sink is absent here.
+        let value = toron_workflow::engine::invoke_compat(action, |action| match action {
             Action::SendMessage {
                 to,
                 subject,
@@ -111,13 +126,15 @@ pub fn mailbox_runner(
                     extra_tags: stamp_workflow_emitted(vec![]),
                 };
                 let mb = mailbox.clone();
-                match block_on_async(async move { mb.send_message(&msg).await }) {
-                    Ok(res) => Ok(serde_json::json!({
-                        "ok": true,
-                        "count": res.count,
-                    })),
-                    Err(e) => Ok(serde_json::json!({ "ok": false, "error": e.to_string() })),
-                }
+                Some(
+                    match block_on_async(async move { mb.send_message(&msg).await }) {
+                        Ok(res) => Ok(serde_json::json!({
+                            "ok": true,
+                            "count": res.count,
+                        })),
+                        Err(e) => Ok(serde_json::json!({ "ok": false, "error": e.to_string() })),
+                    },
+                )
             }
             Action::SendDm { to, body, project } => {
                 let project = project.clone().unwrap_or_default();
@@ -139,13 +156,15 @@ pub fn mailbox_runner(
                     extra_tags: stamp_workflow_emitted(vec![]),
                 };
                 let mb = mailbox.clone();
-                match block_on_async(async move { mb.send_message(&msg).await }) {
-                    Ok(res) => Ok(serde_json::json!({
-                        "ok": true,
-                        "count": res.count,
-                    })),
-                    Err(e) => Ok(serde_json::json!({ "ok": false, "error": e.to_string() })),
-                }
+                Some(
+                    match block_on_async(async move { mb.send_message(&msg).await }) {
+                        Ok(res) => Ok(serde_json::json!({
+                            "ok": true,
+                            "count": res.count,
+                        })),
+                        Err(e) => Ok(serde_json::json!({ "ok": false, "error": e.to_string() })),
+                    },
+                )
             }
             Action::DispatchJob { assignee, spec, .. } => {
                 // @mention dispatch through the coalescer: one job per burst.
@@ -166,7 +185,7 @@ pub fn mailbox_runner(
                     let mut c = coalescer.lock().unwrap_or_else(|e| e.into_inner());
                     c.submit(mention, now)
                 };
-                match decision {
+                Some(match decision {
                     // Hard-cap flush: publish the coalesced 43001 NOW (the
                     // host's tick cannot — the buffer is already drained).
                     CoalesceDecision::FlushNow(coalesced) => {
@@ -188,10 +207,13 @@ pub fn mailbox_runner(
                         "ok": true,
                         "coalesced": true,
                     })),
-                }
+                })
             }
-            _ => Ok(serde_json::Value::Null),
-        }
+            // Every other HostSink action (today: `Verify`) has no sink on
+            // this mailbox-only runner — the boundary reports `missing_sink`.
+            _ => None,
+        });
+        Ok(value)
     })
 }
 
@@ -1579,5 +1601,174 @@ steps:
             "poisoned coalescer must survive — subsequent flush panicked: {out:?}"
         );
         let _ = std::fs::remove_file(&db);
+    }
+
+    /// bd-i6kc RED: build a production runner over a throwaway mailbox.
+    async fn honesty_mailbox_runner() -> ActionRunner {
+        use toron_core::bus::in_process::{InProcessBus, InProcessBusConfig};
+        use toron_core::index::schema;
+
+        let db = std::env::temp_dir().join(format!("wf-honesty-{}.sqlite", uuid::Uuid::new_v4()));
+        let pool = schema::connect(db.to_str().unwrap())
+            .await
+            .expect("connect");
+        schema::migrate(&pool).await.expect("migrate");
+        let bus: Arc<dyn Bus> = Arc::new(
+            InProcessBus::open(pool, InProcessBusConfig::default())
+                .await
+                .expect("bus"),
+        );
+        let mailbox = Arc::new(Mailbox::new(
+            bus,
+            std::env::temp_dir().join(format!("wf-honesty-data-{}", uuid::Uuid::new_v4())),
+            None,
+        ));
+        let coalescer = Arc::new(std::sync::Mutex::new(MentionCoalescer::from_env()));
+        mailbox_runner(mailbox, coalescer, None)
+    }
+
+    /// bd-i6kc: `react` has no reaction sink — it MUST fail closed with an
+    /// explicit unsupported-action error, never `Ok(Null)` success.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn honesty_gate_react_fails_closed() {
+        let runner = honesty_mailbox_runner().await;
+        let out = runner(&Action::React {
+            message_id: "deadbeef".into(),
+            emoji: "+1".into(),
+        })
+        .expect("runner returns a value, never Err");
+        assert_ne!(
+            out,
+            serde_json::Value::Null,
+            "react must not return bare Null"
+        );
+        assert_eq!(
+            out["ok"],
+            serde_json::json!(false),
+            "react must fail: {out}"
+        );
+        assert!(
+            out["error"].as_str().is_some_and(|e| !e.is_empty()),
+            "react failure names the cause: {out}"
+        );
+    }
+
+    /// bd-i6kc: `call_webhook` has no webhook sink — it MUST fail closed with
+    /// an explicit unsupported-action error, never `Ok(Null)` success.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn honesty_gate_call_webhook_fails_closed() {
+        let runner = honesty_mailbox_runner().await;
+        let out = runner(&Action::CallWebhook {
+            url: "https://example.com/hook".into(),
+            method: None,
+            body: None,
+        })
+        .expect("runner returns a value, never Err");
+        assert_ne!(
+            out,
+            serde_json::Value::Null,
+            "call_webhook must not return bare Null"
+        );
+        assert_eq!(
+            out["ok"],
+            serde_json::json!(false),
+            "call_webhook must fail: {out}"
+        );
+        assert!(
+            out["error"].as_str().is_some_and(|e| !e.is_empty()),
+            "call_webhook failure names the cause: {out}"
+        );
+    }
+
+    /// bd-i6kc: engine-owned control actions accidentally passed to the
+    /// effect runner MUST be rejected with a typed misdispatch error, never
+    /// executed and never `Ok(Null)`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn honesty_gate_control_actions_rejected_by_runner() {
+        use toron_workflow::schema::{ContextMode, Step, StepOnError};
+        let leaf = || Step {
+            name: None,
+            guard: None,
+            on_error: StepOnError::Continue,
+            error_kinds: vec![],
+            build_slot: false,
+            action: Action::Delay { secs: 0 },
+        };
+        let cases: Vec<(&str, Action)> = vec![
+            ("delay", Action::Delay { secs: 1 }),
+            (
+                "request_approval",
+                Action::RequestApproval {
+                    message: "m".into(),
+                },
+            ),
+            (
+                "retry",
+                Action::Retry {
+                    max_attempts: 1,
+                    backoff_secs: 0,
+                    step: Box::new(leaf()),
+                },
+            ),
+            (
+                "branch",
+                Action::Branch {
+                    if_guard: "true".into(),
+                    then: vec![],
+                    else_steps: vec![],
+                },
+            ),
+            (
+                "foreach",
+                Action::Foreach {
+                    over: "x".into(),
+                    each: Box::new(leaf()),
+                },
+            ),
+            (
+                "parallel",
+                Action::Parallel {
+                    over: "1".into(),
+                    each: Box::new(leaf()),
+                },
+            ),
+            (
+                "call_workflow",
+                Action::CallWorkflow {
+                    workflow: "w".into(),
+                    inputs: serde_json::json!({}),
+                },
+            ),
+            (
+                "spawn",
+                Action::Spawn {
+                    profile: "@p".into(),
+                    workflow: None,
+                    await_: false,
+                    no_claim_timeout: 0,
+                    context: Some(ContextMode::Inherit),
+                },
+            ),
+            (
+                "verify",
+                Action::Verify {
+                    command: "true".into(),
+                },
+            ),
+        ];
+        let runner = honesty_mailbox_runner().await;
+        for (name, action) in &cases {
+            let out = runner(action).expect("runner returns a value, never Err");
+            assert_ne!(
+                out,
+                serde_json::Value::Null,
+                "{name} must not return bare Null"
+            );
+            assert_eq!(
+                out["ok"],
+                serde_json::json!(false),
+                "{name} must fail: {out}"
+            );
+        }
     }
 }

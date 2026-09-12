@@ -30,6 +30,7 @@
 //! the DI sink newtypes in [`sinks`], and the test suite in `tests.rs`
 //! (move-only split of the former single-file engine — no behavior change).
 
+mod boundary;
 mod control_flow;
 mod sinks;
 mod template;
@@ -125,6 +126,12 @@ pub fn host_port(url: &str) -> Option<(String, u16)> {
 
 // Re-export the split-out surface exactly as the former single file exposed it
 // (lib.rs + toron-mcp/cli/e2e import via `engine::*` — zero external edits).
+pub use boundary::{
+    ActionErrorCode, ActionFailure, ActionInvocation, ActionOutcome, ActionPartition, ActionStage,
+    DEPRECATED_ACTION_TYPES, Disposition, ENGINE_ACTION_TYPES, EffectSettlement, EffectState,
+    EvidenceRef, ExecutionPolicy, FailureKind, MAX_EVIDENCE_DETAIL, RunContext,
+    advertised_action_names, derive_effect_key, invoke, invoke_compat, is_failure_value, partition,
+};
 pub use control_flow::{
     GraphNodeInput, ParallelCopyInput, build_workflow_run_terminal, run_graph_node,
     run_parallel_copy, run_workflow, stamp_workflow_emitted,
