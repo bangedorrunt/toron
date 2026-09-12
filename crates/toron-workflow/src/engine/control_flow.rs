@@ -16,9 +16,10 @@ use resonate_sdk::prelude::Context;
 
 use crate::schema::{Action, Graph, Step, StepOnError};
 
-use super::template::render_action;
+use super::template::{RenderContext, render_action, render_action_lenient};
 use super::{
-    ActionRunner, ApprovalSink, Decision, ProfileResolver, RunInput, SpawnSink, WorkflowResolver,
+    ActionRunner, ApprovalSink, Decision, FailureKind, ProfileResolver, RunInput, SpawnSink,
+    WorkflowEngine, WorkflowResolver,
 };
 
 use sha2::{Digest, Sha256};
@@ -210,9 +211,10 @@ pub(crate) async fn run_steps(
     trigger: &serde_json::Value,
     steps: &[Step],
     step_outputs: &mut serde_json::Map<String, serde_json::Value>,
+    workflow: &str,
 ) -> resonate_sdk::prelude::Result<Option<serde_json::Value>> {
     for step in steps {
-        let value = run_step(ctx, runner, trigger, step, step_outputs).await?;
+        let value = run_step(ctx, runner, trigger, step, step_outputs, workflow).await?;
         // fail_run short-circuit: the failed outcome IS the run's result.
         if value.get("status").and_then(serde_json::Value::as_str) == Some("failed") {
             return Ok(Some(value));
@@ -236,8 +238,11 @@ pub(crate) fn rendered_approval_message(
     action: &Action,
     trigger: &serde_json::Value,
     step_outputs: &serde_json::Map<String, serde_json::Value>,
+    workflow: &str,
+    node: &str,
 ) -> anyhow::Result<String> {
-    match render_action(action, trigger, step_outputs)? {
+    let render_ctx = RenderContext::new(workflow, node);
+    match render_action(action, trigger, step_outputs, &render_ctx)? {
         Action::RequestApproval { message } => Ok(message),
         other => Err(anyhow::anyhow!(
             "rendered approval action is not request_approval: {:?}",
@@ -246,8 +251,66 @@ pub(crate) fn rendered_approval_message(
     }
 }
 
-fn is_retryable_kind(kind: &str) -> bool {
-    matches!(kind, "rate_limit" | "timeout")
+/// ADR-0032 Spec 7: ONE retry coordinator. Every retry loop in this module
+/// (linear fail_run, explicit `Retry`, graph-node fail_run) reads bounds,
+/// backoff, and retry candidacy from one owner. `Action::Retry` contributes
+/// an explicit policy; otherwise the default (3 attempts, exponential
+/// backoff) applies. Nested `Retry` wrappers flatten at runtime (lint
+/// rejects them statically) so bounds never multiply.
+pub(crate) struct RetryCoordinator {
+    max_attempts: u32,
+    /// Fixed inter-attempt backoff from the enclosing `Retry` action, if any.
+    /// `None` → exponential 1s/2s/4s… capped at 60s.
+    fixed_backoff_secs: Option<u64>,
+}
+
+impl RetryCoordinator {
+    /// Default policy: 3 attempts, exponential backoff.
+    fn default_policy() -> Self {
+        Self {
+            max_attempts: 3,
+            fixed_backoff_secs: None,
+        }
+    }
+
+    /// Explicit policy from an enclosing `Action::Retry`.
+    fn from_retry_action(max_attempts: u32, backoff_secs: u64) -> Self {
+        Self {
+            max_attempts,
+            fixed_backoff_secs: (backoff_secs > 0).then_some(backoff_secs),
+        }
+    }
+
+    /// Policy from an enclosing retry context (`run_step_with_enclosing`),
+    /// or the default when there is none.
+    fn from_enclosing(enclosing: Option<(u32, u64)>) -> Self {
+        match enclosing {
+            Some((max, backoff)) => Self::from_retry_action(max, backoff),
+            None => Self::default_policy(),
+        }
+    }
+
+    /// Whether another attempt is allowed after `attempt` (1-based) failed.
+    fn should_retry(&self, attempt: u32) -> bool {
+        attempt < self.max_attempts.max(1)
+    }
+
+    /// Retry candidacy for a step value: `rate_limit`/`timeout` (the frozen
+    /// [`FailureKind`] vocabulary) are candidates; everything else escalates.
+    /// Unknown kind strings are never retryable.
+    fn is_retryable_value(value: &serde_json::Value) -> bool {
+        value
+            .get("kind")
+            .and_then(|v| v.as_str())
+            .and_then(|k| k.parse::<FailureKind>().ok())
+            .is_some_and(|k| k.is_retry_candidate())
+    }
+
+    /// Backoff before the next attempt: provider `retry_after_ms` wins, then
+    /// the enclosing fixed backoff, else exponential.
+    fn backoff(&self, attempt: u32, retry_after_ms: Option<u64>) -> Duration {
+        backoff_for_attempt(attempt, retry_after_ms, self.fixed_backoff_secs)
+    }
 }
 
 fn disposition_for_kind(kind: &str, existing: Option<&str>) -> String {
@@ -284,6 +347,7 @@ pub(crate) fn run_step<'a>(
     trigger: &'a serde_json::Value,
     step: &'a Step,
     step_outputs: &'a mut serde_json::Map<String, serde_json::Value>,
+    workflow: &'a str,
 ) -> std::pin::Pin<
     Box<
         dyn std::future::Future<Output = resonate_sdk::prelude::Result<serde_json::Value>>
@@ -291,7 +355,7 @@ pub(crate) fn run_step<'a>(
             + 'a,
     >,
 > {
-    run_step_with_enclosing(ctx, runner, trigger, step, step_outputs, None)
+    run_step_with_enclosing(ctx, runner, trigger, step, step_outputs, None, workflow)
 }
 
 pub(crate) fn run_step_with_enclosing<'a>(
@@ -301,6 +365,7 @@ pub(crate) fn run_step_with_enclosing<'a>(
     step: &'a Step,
     step_outputs: &'a mut serde_json::Map<String, serde_json::Value>,
     enclosing_retry: Option<(u32, u64)>,
+    workflow: &'a str,
 ) -> std::pin::Pin<
     Box<
         dyn std::future::Future<Output = resonate_sdk::prelude::Result<serde_json::Value>>
@@ -309,8 +374,21 @@ pub(crate) fn run_step_with_enclosing<'a>(
     >,
 > {
     Box::pin(async move {
-        let max_attempts = enclosing_retry.map(|(m, _)| m).unwrap_or(3);
-        let enclosing_backoff = enclosing_retry.map(|(_, b)| b);
+        // ADR-0032 Spec 4: the step guard runs through the ONE evaluator
+        // before anything else executes (nested steps included — the graph
+        // path evaluates node guards in run_graph_node instead).
+        let node = step.name.as_deref().unwrap_or("<unnamed>");
+        match evaluate_step_guard(step.guard.as_deref(), trigger, step_outputs, node).await {
+            GuardVerdict::Proceed => {}
+            GuardVerdict::Skip { reason } => return Ok(skipped_value(node, reason)),
+            GuardVerdict::Fail { error } => {
+                return Ok(serde_json::json!({ "ok": false, "error": error }));
+            }
+        }
+        // ADR-0032 Spec 7: this loop is a client of the ONE retry
+        // coordinator — bounds, backoff, and retry candidacy all resolve
+        // there. A retryable runtime failure retries the SAME logical node.
+        let coordinator = RetryCoordinator::from_enclosing(enclosing_retry);
         let mut attempt: u32 = 0;
         loop {
             attempt += 1;
@@ -327,8 +405,14 @@ pub(crate) fn run_step_with_enclosing<'a>(
                     // signoff prompt, so a raw `{{inputs.*}}` there is an
                     // unrendered template a captain actually reads
                     // (bd-adr0006-cosmetic-sweep-q0g0).
-                    let message = rendered_approval_message(&step.action, trigger, step_outputs)
-                        .unwrap_or_else(|_| message.clone());
+                    let message = rendered_approval_message(
+                        &step.action,
+                        trigger,
+                        step_outputs,
+                        workflow,
+                        node,
+                    )
+                    .unwrap_or_else(|_| message.clone());
                     // Create the promise; its id is the approval key. The 0.6 SDK's
                     // PromiseTask is created eagerly (.create()); the handle's id()
                     // confirms server-side creation.
@@ -377,10 +461,11 @@ pub(crate) fn run_step_with_enclosing<'a>(
                 | Action::CallWebhook { .. } => {
                     // Consistency rule: actions go through the shared Mailbox
                     // surface (the injected action runner). Templates are
-                    // substituted first so the runner sees rendered values. A
-                    // render failure (unserializable action) is a per-step error,
-                    // not a run failure.
-                    match render_action(&step.action, trigger, step_outputs) {
+                    // Render FIRST so the runner sees rendered values; a render
+                    // failure (unresolved ref) is a per-step error with
+                    // workflow/node/field/ref attribution, not a run failure.
+                    let render_ctx = RenderContext::new(workflow, node);
+                    match render_action(&step.action, trigger, step_outputs, &render_ctx) {
                         Ok(action) => match (runner)(&action) {
                             Ok(value) => value,
                             Err(e) => serde_json::json!({ "ok": false, "error": e.to_string() }),
@@ -394,7 +479,19 @@ pub(crate) fn run_step_with_enclosing<'a>(
                     max_attempts,
                     backoff_secs,
                     step: inner,
-                } => run_retry(ctx, runner, trigger, inner, *max_attempts, *backoff_secs).await?,
+                } => {
+                    run_retry(
+                        ctx,
+                        runner,
+                        trigger,
+                        inner,
+                        *max_attempts,
+                        *backoff_secs,
+                        step_outputs,
+                        workflow,
+                    )
+                    .await?
+                }
                 Action::Branch {
                     if_guard,
                     then,
@@ -408,18 +505,31 @@ pub(crate) fn run_step_with_enclosing<'a>(
                         then,
                         else_steps,
                         step_outputs,
+                        workflow,
+                        node,
                     )
                     .await?
                 }
                 Action::Foreach { over, each } => {
-                    run_foreach(ctx, runner, trigger, over, each, step_outputs).await?
+                    run_foreach(
+                        ctx,
+                        runner,
+                        trigger,
+                        over,
+                        each,
+                        step_outputs,
+                        workflow,
+                        node,
+                    )
+                    .await?
                 }
                 Action::Parallel { over, each } => {
-                    run_parallel(ctx, runner, trigger, over, each).await?
+                    run_parallel(ctx, runner, trigger, over, each, workflow, node).await?
                 }
-                Action::CallWorkflow { workflow, inputs } => {
-                    run_call_workflow(ctx, runner, workflow, inputs, step_outputs).await?
-                }
+                Action::CallWorkflow {
+                    workflow: child,
+                    inputs,
+                } => run_call_workflow(ctx, runner, child, inputs, step_outputs).await?,
                 Action::Spawn {
                     profile,
                     workflow,
@@ -458,15 +568,15 @@ pub(crate) fn run_step_with_enclosing<'a>(
 
             // P0.2 (ADR-0005 Spec 0 + ADR-0024 Spec 1): `on_error: fail_run`
             // converts a step failure into a RUN failure — a deterministic durable
-            // RETURN, never a panic. ADR-0024 adds kind-awareness: rate_limit and
-            // timeout are RETRYABLE (same node, bounded) even under fail_run;
-            // auth/blocked/cancelled/unknown keep today's abort.
+            // RETURN, never a panic. ADR-0032 Spec 7: retry candidacy resolves
+            // in the ONE coordinator (frozen FailureKind vocabulary); a
+            // retryable runtime failure retries the SAME node, bounded.
             if step.on_error == StepOnError::FailRun
                 && value.get("ok").and_then(serde_json::Value::as_bool) == Some(false)
             {
                 let kind = value.get("kind").and_then(|v| v.as_str()).unwrap_or("");
-                if is_retryable_kind(kind) {
-                    if attempt >= max_attempts {
+                if RetryCoordinator::is_retryable_value(&value) {
+                    if !coordinator.should_retry(attempt) {
                         let error = value
                             .get("error")
                             .and_then(|v| v.as_str())
@@ -486,8 +596,8 @@ pub(crate) fn run_step_with_enclosing<'a>(
                         }));
                     }
                     let retry_after_ms = value.get("retry_after_ms").and_then(|v| v.as_u64());
-                    let sleep_dur = backoff_for_attempt(attempt, retry_after_ms, enclosing_backoff);
-                    ctx.sleep(sleep_dur).await?;
+                    ctx.sleep(coordinator.backoff(attempt, retry_after_ms))
+                        .await?;
                     continue;
                 }
                 let error = value
@@ -521,6 +631,14 @@ pub(crate) fn run_step_with_enclosing<'a>(
 /// waiting `backoff_secs` between failures. Returns the inner step's output;
 /// if all attempts fail, returns `{ok:false,error}` (the on_error policy at
 /// the OUTER step decides run fate).
+///
+/// ADR-0032 Spec 7: this loop is a client of the ONE retry coordinator.
+/// A `Retry` nested directly inside another is FLATTENED at runtime — the
+/// outermost policy owns the whole subtree, so bounds never multiply
+/// (lint rejects new nests statically; this covers old payloads).
+// Threaded dispatch context (ctx/runner/trigger/target/policy/attrs) exceeds
+// the default arity cap; bundling would churn every call site for no gain.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_retry(
     ctx: &Context,
     runner: &ActionRunner,
@@ -528,17 +646,27 @@ pub(crate) async fn run_retry(
     inner: &Step,
     max_attempts: u32,
     backoff_secs: u64,
+    step_outputs: &serde_json::Map<String, serde_json::Value>,
+    workflow: &str,
 ) -> resonate_sdk::prelude::Result<serde_json::Value> {
+    // Flatten nested wrappers: the outer policy wins for the whole subtree.
+    let mut target = inner;
+    while let Action::Retry { step: nested, .. } = &target.action {
+        target = nested;
+    }
+    let coordinator = RetryCoordinator::from_retry_action(max_attempts, backoff_secs);
     let mut last_value: Option<serde_json::Value> = None;
     for attempt in 1..=max_attempts.max(1) {
-        let mut outputs = serde_json::Map::new();
+        // Attempts resolve against the enclosing scope.
+        let mut outputs = step_outputs.clone();
         let value = run_step_with_enclosing(
             ctx,
             runner,
             trigger,
-            inner,
+            target,
             &mut outputs,
             Some((max_attempts, backoff_secs)),
+            workflow,
         )
         .await?;
         let failed = value.get("ok").and_then(serde_json::Value::as_bool) == Some(false);
@@ -552,7 +680,7 @@ pub(crate) async fn run_retry(
             return Ok(value);
         }
         last_value = Some(value);
-        if attempt < max_attempts.max(1) && backoff_secs > 0 {
+        if coordinator.should_retry(attempt) && backoff_secs > 0 {
             ctx.sleep(Duration::from_secs(backoff_secs)).await?;
         }
     }
@@ -620,7 +748,61 @@ pub(crate) fn guard_vars(
     vars
 }
 
-/// Run a `branch` action: evaluate the guard; run the `then` or `else` step
+/// ADR-0032 Spec 4: ONE guard/ref evaluator for graph nodes,
+/// linear-desugared steps, branch guards, and nested steps.
+///
+/// - `false` is an explicit skip (never a silent Null, never an else path);
+/// - syntax/type/unresolved-ref/timeout/complexity errors FAIL LOUD as an
+///   action/contract failure (never false, never else, never placeholder).
+pub(crate) enum GuardVerdict {
+    Proceed,
+    Skip { reason: String },
+    Fail { error: String },
+}
+
+pub(crate) async fn evaluate_step_guard(
+    guard: Option<&str>,
+    trigger: &serde_json::Value,
+    step_outputs: &serde_json::Map<String, serde_json::Value>,
+    node: &str,
+) -> GuardVerdict {
+    let Some(g) = guard.filter(|g| !g.trim().is_empty()) else {
+        return GuardVerdict::Proceed;
+    };
+    let vars = guard_vars(trigger, step_outputs);
+    match crate::guard::evaluate_guard_default(Some(g), &vars).await {
+        crate::guard::GuardOutcome::Bool(true) => GuardVerdict::Proceed,
+        crate::guard::GuardOutcome::Unset => GuardVerdict::Proceed,
+        crate::guard::GuardOutcome::Bool(false) => GuardVerdict::Skip {
+            reason: format!("guard false on node {node:?}"),
+        },
+        // Every non-boolean outcome is a loud contract failure (I10).
+        crate::guard::GuardOutcome::TypeError { got } => GuardVerdict::Fail {
+            error: format!("guard {g:?} on node {node:?} evaluated to non-boolean ({got})"),
+        },
+        crate::guard::GuardOutcome::EvalError { err } => GuardVerdict::Fail {
+            error: format!("guard {g:?} on node {node:?} failed to evaluate: {err}"),
+        },
+        crate::guard::GuardOutcome::TimedOut { after_ms } => GuardVerdict::Fail {
+            error: format!("guard {g:?} on node {node:?} timed out after {after_ms}ms"),
+        },
+        crate::guard::GuardOutcome::TooComplex { reason } => GuardVerdict::Fail {
+            error: format!("guard {g:?} on node {node:?} rejected as too complex: {reason}"),
+        },
+    }
+}
+
+/// The explicit skipped-step value (ADR-0032 Spec 4): a false guard names
+/// the node and reason instead of vanishing into Null.
+pub(crate) fn skipped_value(node: &str, reason: String) -> serde_json::Value {
+    serde_json::json!({ "skipped": true, "node": node, "reason": reason })
+}
+
+/// Run a `branch` action: evaluate the guard through the ONE evaluator; run
+/// the `then` or `else` steps. A guard error FAILS the step loudly — it
+/// never silently takes `else` (ADR-0032 Spec 4).
+// Threaded dispatch context exceeds the default arity cap; see run_retry.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_branch(
     ctx: &Context,
     runner: &ActionRunner,
@@ -629,27 +811,27 @@ pub(crate) async fn run_branch(
     then: &[Step],
     else_steps: &[Step],
     step_outputs: &serde_json::Map<String, serde_json::Value>,
+    workflow: &str,
+    node: &str,
 ) -> resonate_sdk::prelude::Result<serde_json::Value> {
-    use crate::guard::evaluate_guard_default;
-    // Guard variables (trigger_* + steps_*); shared helper so Branch and
-    // graph-node guards evaluate the same map.
-    let vars = guard_vars(trigger, step_outputs);
-    let outcome = evaluate_guard_default(Some(guard), &vars).await;
-    // bd-guard-single-quote-fail-loud-061y (GS-028 NEW-3): a non-boolean
-    // outcome silently takes else — fail LOUD on stderr so a malformed guard
-    // (e.g. single-quoted `'true'`) is observable, never a quiet wrong path.
-    match &outcome {
-        crate::guard::GuardOutcome::Bool(_) | crate::guard::GuardOutcome::Unset => {}
-        other => eprintln!(
-            "[toron-workflow] branch guard non-bool (taking else): guard={guard:?} outcome={other:?}"
-        ),
-    }
-    let take_then = matches!(outcome, crate::guard::GuardOutcome::Bool(true));
+    let take_then = match evaluate_step_guard(Some(guard), trigger, step_outputs, node).await {
+        GuardVerdict::Proceed => true,
+        GuardVerdict::Skip { .. } => false,
+        GuardVerdict::Fail { error } => {
+            return Ok(serde_json::json!({ "ok": false, "error": error }));
+        }
+    };
     let branch_steps = if take_then { then } else { else_steps };
-    let mut outputs = serde_json::Map::new();
-    if let Some(failed) = run_steps(ctx, runner, trigger, branch_steps, &mut outputs).await? {
+    // Nested bodies resolve against the enclosing scope (same `steps.*`
+    // visibility as top-level steps); only newly produced outputs return.
+    let known: std::collections::BTreeSet<String> = step_outputs.keys().cloned().collect();
+    let mut outputs = step_outputs.clone();
+    if let Some(failed) =
+        run_steps(ctx, runner, trigger, branch_steps, &mut outputs, workflow).await?
+    {
         return Ok(failed);
     }
+    outputs.retain(|k, _| !known.contains(k));
     Ok(serde_json::json!({
         "branch": if take_then { "then" } else { "else" },
         "outputs": serde_json::Value::Object(outputs),
@@ -658,6 +840,11 @@ pub(crate) async fn run_branch(
 
 /// Run a `foreach` action: resolve `over` to a list; run `each` once per
 /// item; collect the sub-run outputs into a list.
+///
+/// ADR-0032 Spec 3 (I10): `over` MUST resolve to a proper list. A missing
+/// ref or a non-list value FAILS LOUD — never coerces to `[]`.
+// Threaded dispatch context exceeds the default arity cap; see run_retry.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_foreach(
     ctx: &Context,
     runner: &ActionRunner,
@@ -665,12 +852,24 @@ pub(crate) async fn run_foreach(
     over: &str,
     each: &Step,
     step_outputs: &serde_json::Map<String, serde_json::Value>,
+    workflow: &str,
+    node: &str,
 ) -> resonate_sdk::prelude::Result<serde_json::Value> {
-    let list = resolve_template_ref(over, trigger, step_outputs)
-        .and_then(|v| v.as_array().cloned())
-        .unwrap_or_default();
+    let resolved = resolve_template_ref(over, trigger, step_outputs);
+    let Some(value) = resolved else {
+        return Ok(serde_json::json!({
+            "ok": false,
+            "error": format!("workflow {workflow:?} node {node:?}: foreach `over` {over:?} does not resolve to a value"),
+        }));
+    };
+    let Some(list) = value.as_array() else {
+        return Ok(serde_json::json!({
+            "ok": false,
+            "error": format!("workflow {workflow:?} node {node:?}: foreach `over` {over:?} must be a list"),
+        }));
+    };
     let mut collected = Vec::new();
-    for item in &list {
+    for item in list {
         // Each iteration sees the current item as `{{item}}` (ADR-0007 F4):
         // inject it into the iteration's trigger copy so the template
         // renderer can resolve it.
@@ -679,38 +878,68 @@ pub(crate) async fn run_foreach(
             iter_trigger = serde_json::Value::Object(obj.clone());
         }
         iter_trigger["item"] = item.clone();
-        let mut item_outputs = serde_json::Map::new();
-        let value = run_step(ctx, runner, &iter_trigger, each, &mut item_outputs).await?;
+        // Iterations resolve against the enclosing scope plus the item.
+        let mut item_outputs = step_outputs.clone();
+        let value = run_step(
+            ctx,
+            runner,
+            &iter_trigger,
+            each,
+            &mut item_outputs,
+            workflow,
+        )
+        .await?;
         collected.push(value);
     }
     Ok(serde_json::Value::Array(collected))
 }
 
-/// Run a `parallel` action: fan `each` out across a crew role (`over:
-/// "@crew.r"`) or N elastic copies (`over: "<N>"`). For elastic N, spawns N
-/// concurrent sub-runs of `each`; collected into a list. Crew-role fan-out
-/// (the orchestrator steers the actual spawned agents) is resolved by the
-/// embedder via the `ProfileResolver` DI seam — here N elastic copies run.
+/// Elastick fan-out cap (ADR-0032 Spec 3): `parallel` concurrency is bounded
+/// by explicit policy. Counts above this fail loud instead of fanning out.
+pub(crate) const MAX_PARALLEL_FANOUT: usize = 32;
+
+/// Run a `parallel` action: fan `each` out across N elastic copies
+/// (`over: "<N>"`); collected into a list.
+///
+/// ADR-0032 Spec 3 (I10): `over` MUST be a valid positive bounded count. A
+/// crew role (`@crew.r`) needs the orchestrator to concretize it before
+/// invoke; anything else FAILS LOUD — never coerces to 1.
 pub(crate) async fn run_parallel(
     ctx: &Context,
     _runner: &ActionRunner,
     trigger: &serde_json::Value,
     over: &str,
     each: &Step,
+    workflow: &str,
+    node: &str,
 ) -> resonate_sdk::prelude::Result<serde_json::Value> {
     // Elastic N: `over: "4"` → 4 concurrent copies. Crew role (@crew.r) is
     // resolved by the orchestrator before invoke; the engine sees a concrete N.
-    let n: usize = over.trim().parse().unwrap_or(1);
+    let parsed: Option<usize> = over.trim().parse().ok().filter(|n| *n > 0);
+    let Some(n) = parsed else {
+        return Ok(serde_json::json!({
+            "ok": false,
+            "error": format!("workflow {workflow:?} node {node:?}: parallel `over` {over:?} must be a positive count (a crew role needs orchestrator concretization first)"),
+        }));
+    };
+    if n > MAX_PARALLEL_FANOUT {
+        return Ok(serde_json::json!({
+            "ok": false,
+            "error": format!("workflow {workflow:?} node {node:?}: parallel `over` {n} exceeds the bounded fan-out cap {MAX_PARALLEL_FANOUT}"),
+        }));
+    }
     let mut futures = Vec::new();
-    for _ in 0..n.max(1) {
+    for _ in 0..n {
         let each = each.clone();
         let trigger = trigger.clone();
+        let workflow = workflow.to_string();
         let future = ctx
             .run(
                 run_parallel_copy,
                 ParallelCopyInput {
                     step: each,
                     trigger,
+                    workflow,
                 },
             )
             .spawn()?;
@@ -728,6 +957,10 @@ pub(crate) async fn run_parallel(
 pub struct ParallelCopyInput {
     pub step: Step,
     pub trigger: serde_json::Value,
+    /// Workflow name for render/guard error attribution (`#[serde(default)]`
+    /// keeps in-flight serialized inputs readable).
+    #[serde(default)]
+    pub workflow: String,
 }
 
 /// A durable child running one `parallel` copy of a step. The runner is
@@ -739,7 +972,15 @@ pub async fn run_parallel_copy(
 ) -> resonate_sdk::Result<serde_json::Value> {
     let runner = ctx.get_dependency::<ActionRunner>();
     let mut outputs = serde_json::Map::new();
-    let value = run_step(ctx, &runner, &input.trigger, &input.step, &mut outputs).await?;
+    let value = run_step(
+        ctx,
+        &runner,
+        &input.trigger,
+        &input.step,
+        &mut outputs,
+        &input.workflow,
+    )
+    .await?;
     Ok(value)
 }
 
@@ -761,19 +1002,28 @@ pub(crate) async fn run_call_workflow(
             "error": format!("unknown workflow: {workflow}"),
         }));
     };
-    // Child trigger = rendered inputs object (templates already expanded in
-    // the Action by the parent step path when present); fall back to raw
-    // inputs + expose parent step_outputs under `parent_steps` for templates.
-    let mut trigger = inputs.clone();
-    if let Some(obj) = trigger.as_object_mut() {
-        obj.insert(
-            "parent_steps".into(),
-            serde_json::Value::Object(step_outputs.clone()),
-        );
+    // ADR-0032 Spec 3: `call_workflow` binds the child's declared defaults
+    // through the SAME function as direct `invoke` (provided values win).
+    // The synthesized trigger has invoke's exact shape: merged inputs
+    // flattened at top level plus the `inputs` object, with parent
+    // step_outputs exposed under `parent_steps` for templates.
+    let merged = WorkflowEngine::bind_input_defaults(&child_wf.inputs, inputs);
+    let mut trigger_map = serde_json::Map::new();
+    for (k, v) in &merged {
+        trigger_map.insert(k.clone(), v.clone());
     }
+    if inputs.as_object().is_some() {
+        trigger_map.insert("inputs".into(), serde_json::Value::Object(merged));
+    } else {
+        trigger_map.insert("inputs".into(), inputs.clone());
+    }
+    trigger_map.insert(
+        "parent_steps".into(),
+        serde_json::Value::Object(step_outputs.clone()),
+    );
     let input = RunInput {
         workflow: child_wf,
-        trigger,
+        trigger: serde_json::Value::Object(trigger_map),
         run_id: None,
     };
     let future = ctx.run(run_workflow, input).spawn()?;
@@ -887,6 +1137,63 @@ pub(crate) fn resolve_template_ref(
     serde_json::from_str(trimmed).ok()
 }
 
+/// ADR-0032 Spec 3: runtime graph validation — the second honesty gate.
+/// Lint rejects bad graphs statically, but `engine.run`/`invoke` bypass
+/// lint. Direct execution validates upfront: unknown `needs` refs and
+/// cycles/stalls FAIL with named nodes instead of returning partial success.
+pub(crate) fn validate_graph_runtime(graph: &Graph) -> Result<(), String> {
+    let nodes = &graph.nodes;
+    if nodes.is_empty() {
+        return Err("graph is empty — no nodes".to_string());
+    }
+    // Unknown needs first (names the missing dependency).
+    for (name, node) in nodes {
+        for need in &node.needs {
+            if !nodes.contains_key(need) {
+                return Err(format!(
+                    "graph node {name:?} needs {need:?}, which is not a node"
+                ));
+            }
+        }
+    }
+    // Cycle check via Kahn's algorithm: peel nodes with no incoming edges;
+    // leftovers participate in a cycle. (All needs are known nodes here —
+    // unknown refs returned above.)
+    let mut indegree: std::collections::HashMap<&str, usize> = nodes
+        .iter()
+        .map(|(name, node)| (name.as_str(), node.needs.len()))
+        .collect();
+    let mut queue: Vec<&str> = indegree
+        .iter()
+        .filter(|(_, d)| **d == 0)
+        .map(|(n, _)| *n)
+        .collect();
+    let mut peeled = 0usize;
+    while let Some(n) = queue.pop() {
+        peeled += 1;
+        for (name, node) in nodes {
+            if node.needs.iter().any(|need| need == n)
+                && let Some(deg) = indegree.get_mut(name.as_str())
+            {
+                *deg -= 1;
+                if *deg == 0 {
+                    queue.push(name.as_str());
+                }
+            }
+        }
+    }
+    if peeled != nodes.len() {
+        let mut cyclic: Vec<&str> = indegree
+            .iter()
+            .filter(|(_, d)| **d > 0)
+            .map(|(n, _)| *n)
+            .collect();
+        cyclic.sort();
+        return Err(format!("graph has a cycle involving nodes: {cyclic:?}"));
+    }
+    Ok(())
+}
+
 /// The DAG scheduler (ADR-0005 Spec 4b / P5.2). Runs a `graph:` workflow:
 ///
 /// 1. Schedule nodes in waves — a wave is the set of nodes whose `needs` are
@@ -915,6 +1222,17 @@ pub(crate) async fn run_graph(
     let mut done: BTreeSet<String> = BTreeSet::new();
     let mut wave: usize = 0;
 
+    // ADR-0032 Spec 3: runtime validation even when lint is bypassed — a
+    // cyclic/unresolvable graph fails here with named nodes, never partial
+    // success.
+    if let Err(error) = validate_graph_runtime(graph) {
+        return Ok(serde_json::json!({
+            "status": "failed",
+            "error": error,
+            "failed_step": "<graph>",
+        }));
+    }
+
     loop {
         wave += 1;
         // Compute the next ready wave: not done, all needs done.
@@ -929,13 +1247,15 @@ pub(crate) async fn run_graph(
             }
         }
         if ready.is_empty() {
-            break; // nothing ready: either all done or a cycle (lint prevents).
+            break; // All done (cycles/unknown-needs fail in validation above).
         }
 
         // Spawn the whole wave concurrently as durable children.
         let mut futures = Vec::new();
         for (name, node) in &ready {
-            let rendered = match render_action(&node.action, trigger, &outputs) {
+            // Planning render (lenient): nested bodies may carry deferred
+            // context enforced strictly at execution in run_graph_node.
+            let rendered = match render_action_lenient(&node.action, trigger, &outputs) {
                 Ok(a) => a,
                 Err(e) => {
                     // A render failure is a per-node error (continue unless
@@ -981,7 +1301,7 @@ pub(crate) async fn run_graph(
         let mut rendered_map: std::collections::HashMap<String, Action> =
             std::collections::HashMap::new();
         for (name, node) in &ready {
-            if let Ok(a) = render_action(&node.action, trigger, &outputs) {
+            if let Ok(a) = render_action_lenient(&node.action, trigger, &outputs) {
                 rendered_map.insert((*name).clone(), a);
             }
         }
@@ -990,19 +1310,30 @@ pub(crate) async fn run_graph(
             .iter()
             .map(|(n, _)| (n.clone(), 1u32))
             .collect();
-        let max_attempts: u32 = 3;
         let idx = 0;
         while idx < pending_futures.len() {
             let (name, future) = pending_futures.remove(idx);
             let value = future.await?;
             let node = nodes.get(&name).expect("node in map");
+            // ADR-0032 Spec 7: the graph fail_run path is a client of the ONE
+            // coordinator. An explicit `Retry` node action contributes its
+            // policy; otherwise the default applies. A retryable failure
+            // re-spawns the SAME node (never a repair graph).
+            let coordinator = match &node.action {
+                Action::Retry {
+                    max_attempts,
+                    backoff_secs,
+                    ..
+                } => RetryCoordinator::from_retry_action(*max_attempts, *backoff_secs),
+                _ => RetryCoordinator::default_policy(),
+            };
             if node.on_error == StepOnError::FailRun
                 && value.get("ok").and_then(|v| v.as_bool()) == Some(false)
             {
                 let kind = value.get("kind").and_then(|v| v.as_str()).unwrap_or("");
-                if is_retryable_kind(kind) {
+                if RetryCoordinator::is_retryable_value(&value) {
                     let attempt = *attempts.get(&name).unwrap_or(&1);
-                    if attempt >= max_attempts {
+                    if !coordinator.should_retry(attempt) {
                         let err = value
                             .get("error")
                             .and_then(|v| v.as_str())
@@ -1022,13 +1353,13 @@ pub(crate) async fn run_graph(
                         }));
                     }
                     let retry_after_ms = value.get("retry_after_ms").and_then(|v| v.as_u64());
-                    let sleep_dur = backoff_for_attempt(attempt, retry_after_ms, None);
-                    ctx.sleep(sleep_dur).await?;
+                    ctx.sleep(coordinator.backoff(attempt, retry_after_ms))
+                        .await?;
                     // Increment attempt and re-spawn same node
                     let next_attempt = attempt + 1;
                     attempts.insert(name.clone(), next_attempt);
                     let rendered = rendered_map.get(&name).cloned().unwrap_or_else(|| {
-                        render_action(&node.action, trigger, &outputs)
+                        render_action_lenient(&node.action, trigger, &outputs)
                             .unwrap_or(node.action.clone())
                     });
                     let new_future = ctx
@@ -1077,6 +1408,19 @@ pub(crate) async fn run_graph(
         }
     }
 
+    // Defensive stall gate: validation above makes an empty ready-set with
+    // remaining nodes unreachable, but a stall must FAIL (never partial
+    // success) if it ever happens.
+    if done.len() != nodes.len() {
+        let mut remaining: Vec<&String> = nodes.keys().filter(|n| !done.contains(*n)).collect();
+        remaining.sort();
+        return Ok(serde_json::json!({
+            "status": "failed",
+            "error": format!("graph stalled with no ready nodes; remaining: {remaining:?}"),
+            "failed_step": "<graph>",
+        }));
+    }
+
     Ok(serde_json::Value::Object(outputs))
 }
 
@@ -1085,10 +1429,9 @@ pub(crate) async fn run_graph(
 pub struct GraphNodeInput {
     /// The (template-rendered) action to execute.
     pub action: Action,
-    /// Per-node `guard:` (bd-adr0008-guard-fix-16fl): evaluated at the top
-    /// of `run_graph_node` with the shared guard variable map
-    /// (`trigger_*` + `steps_*`); a non-true outcome skips the node
-    /// (returns Null, the run continues). `#[serde(default)]` keeps
+    /// Per-node `guard:` evaluated at the top of `run_graph_node` through
+    /// the ONE evaluator (ADR-0032 Spec 4): false is an explicit skip,
+    /// guard errors fail the node. `#[serde(default)]` keeps
     /// in-flight serialized inputs readable.
     #[serde(default)]
     pub guard: Option<String>,
@@ -1132,27 +1475,22 @@ pub async fn run_graph_node(
     // never fan out. Leaf actions keep the direct runner path (rendered
     // before the node ran, so no re-render).
     let runner = ctx.get_dependency::<ActionRunner>();
-    // bd-adr0008-guard-fix-16fl: honor per-node `guard:` — the schema
-    // declares it but no path evaluated it. A non-true outcome skips the
-    // node (Null output, the run continues); only Bool(true) — or no
-    // guard at all — proceeds. Same fail-closed contract as a Branch
-    // else-path, evaluated with the shared guard variable map.
-    if input.guard.as_deref().is_some_and(|g| !g.trim().is_empty()) {
-        let vars = guard_vars(&input.trigger, &input.outputs);
-        let outcome = crate::guard::evaluate_guard_default(input.guard.as_deref(), &vars).await;
-        if !matches!(
-            outcome,
-            crate::guard::GuardOutcome::Bool(true) | crate::guard::GuardOutcome::Unset
-        ) {
-            // bd-guard-single-quote-fail-loud-061y: skipping a node on a
-            // non-bool guard must be observable, never silent.
-            if !matches!(outcome, crate::guard::GuardOutcome::Bool(false)) {
-                eprintln!(
-                    "[toron-workflow] graph-node guard non-bool (skipping node): guard={:?} outcome={:?}",
-                    input.guard, outcome
-                );
-            }
-            return Ok(serde_json::Value::Null);
+    // ADR-0032 Spec 4: per-node `guard:` runs through the ONE evaluator.
+    // False is an explicit skip; any guard error FAILS the node loudly.
+    match evaluate_step_guard(
+        input.guard.as_deref(),
+        &input.trigger,
+        &input.outputs,
+        &input.node_name,
+    )
+    .await
+    {
+        GuardVerdict::Proceed => {}
+        GuardVerdict::Skip { reason } => {
+            return Ok(skipped_value(&input.node_name, reason));
+        }
+        GuardVerdict::Fail { error } => {
+            return Ok(serde_json::json!({ "ok": false, "error": error }));
         }
     }
     use crate::schema::Step;
@@ -1212,7 +1550,9 @@ pub async fn run_graph_node(
             | Action::Verify { .. }
     );
     if is_park_or_control {
-        let mut step_outputs = serde_json::Map::new();
+        // Nested execution sees prior-wave outputs (the same ref scope as
+        // top-level steps); the map itself is discarded after the node.
+        let mut step_outputs = input.outputs.clone();
         let step = Step {
             name: None,
             guard: None,
@@ -1221,9 +1561,27 @@ pub async fn run_graph_node(
             build_slot: false,
             action: input.action,
         };
-        return run_step(ctx, &runner, &input.trigger, &step, &mut step_outputs).await;
+        return run_step(
+            ctx,
+            &runner,
+            &input.trigger,
+            &step,
+            &mut step_outputs,
+            &input.workflow_name,
+        )
+        .await;
     }
-    match (runner)(&input.action) {
+    // Leaf actions re-render STRICTLY at execution: the scheduler's planning
+    // render is lenient, so an unresolvable ref fails HERE with
+    // workflow/node/field/ref attribution — never a verbatim placeholder.
+    let render_ctx = RenderContext::new(&input.workflow_name, &input.node_name);
+    let action = match render_action(&input.action, &input.trigger, &input.outputs, &render_ctx) {
+        Ok(a) => a,
+        Err(e) => {
+            return Ok(serde_json::json!({ "ok": false, "error": format!("render: {e}") }));
+        }
+    };
+    match (runner)(&action) {
         Ok(value) => Ok(value),
         Err(e) => Ok(serde_json::json!({ "ok": false, "error": e.to_string() })),
     }

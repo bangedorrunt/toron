@@ -151,7 +151,7 @@ pub(crate) use control_flow::{
 #[cfg(test)]
 #[allow(unused_imports)]
 pub(crate) use template::{
-    descend, render_action, render_json_value, render_scalar, render_template, resolve_steps,
+    RenderContext, descend, render_action, render_action_lenient, render_scalar, resolve_steps,
     resolve_template,
 };
 
