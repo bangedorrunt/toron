@@ -124,3 +124,4 @@
 {"id":124,"issue_id":"bd-scmd","from_status":"in_progress","to_status":"closed","status_revision":1111,"gate":"unit-test-verified","provider":"flywheel-toron-coder2","passed":true,"recorded_by":"bangedorrunt","recorded_at":"2026-09-12 07:49:12"}
 {"id":125,"issue_id":"bd-zczp","from_status":"in_progress","to_status":"closed","status_revision":1088,"gate":"unit-test-verified","provider":"flywheel-toron-coder","passed":true,"recorded_by":"bangedorrunt","recorded_at":"2026-09-12 07:50:36"}
 {"id":126,"issue_id":"bd-6f57","from_status":"in_progress","to_status":"closed","status_revision":1120,"gate":"unit-test-verified","provider":"assistant","passed":true,"recorded_by":"bangedorrunt","recorded_at":"2026-09-12 08:45:23"}
+{"id":127,"issue_id":"bd-0sbf","from_status":"in_progress","to_status":"closed","status_revision":1123,"gate":"unit-test-verified","provider":"assistant","passed":true,"recorded_by":"bangedorrunt","recorded_at":"2026-09-12 08:49:56"}
