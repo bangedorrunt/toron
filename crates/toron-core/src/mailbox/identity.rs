@@ -897,6 +897,31 @@ impl Mailbox {
         self.agent_passphrase.as_deref().unwrap_or("toron-dev")
     }
 
+    /// Is `name` a DURABLE registered identity in the project (an `agents`
+    /// row)? Lease acquisition binds the resolved key file, but the roster is
+    /// what `whois` and the strict commit guard attribute through — a
+    /// key-file holder with no row holds a lease nobody can attribute (the
+    /// "ghost holder" of bd-zugo: it can lease, but transfer fails and no
+    /// name-routed surface can reach it).
+    ///
+    /// Advisory, never a gate. With NO index pool attached this reads `true`
+    /// (cannot judge → never a false alarm). Missing rows (pre-index
+    /// registrations, wiped DBs) read `false` so the caller can warn.
+    pub async fn agent_registered(&self, project_slug: &str, name: &str) -> bool {
+        let canonical = self.canonical_project(project_slug).await;
+        let Some(pool) = self.index_pool.as_ref() else {
+            return true;
+        };
+        sqlx::query_scalar::<_, i64>("SELECT 1 FROM agents WHERE project_slug = ?1 AND name = ?2")
+            .bind(&canonical)
+            .bind(name)
+            .fetch_optional(pool)
+            .await
+            .ok()
+            .flatten()
+            .is_some()
+    }
+
     /// `whois`: name → npub via the project's kind-30013 profiles (G2).
     /// Unknown name fails fast (AM-Rust parity).
     ///
@@ -1733,6 +1758,29 @@ mod tests {
             "legacy identity stays listed as display metadata"
         );
 
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// bd-zugo / F13: `agent_registered` is the ghost-holder oracle — a
+    /// durable `agents` row is what whois and the strict guard attribute
+    /// through; a bare key file is not, so the lease warn can fire.
+    #[tokio::test]
+    async fn agent_registered_reads_the_roster_row() {
+        let (mailbox, _pool, db_path, data_dir) = test_mailbox_with_pool("ghost-holder").await;
+        mailbox.ensure_project("toron").await.expect("ensure");
+        mailbox
+            .register_agent("toron", &profile("AmberVellum"))
+            .await
+            .expect("register");
+        assert!(
+            mailbox.agent_registered("toron", "AmberVellum").await,
+            "a registered pin reads registered"
+        );
+        assert!(
+            !mailbox.agent_registered("toron", "WindyGlen").await,
+            "a name with no roster row reads unregistered"
+        );
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_dir_all(&data_dir);
     }
