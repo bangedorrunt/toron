@@ -102,6 +102,96 @@ pub fn mailbox_runner(
     coalescer: Arc<std::sync::Mutex<MentionCoalescer>>,
     job_signer: Option<Keys>,
 ) -> ActionRunner {
+    mailbox_runner_with_dispatcher(
+        mailbox,
+        coalescer,
+        job_signer,
+        Arc::new(std::sync::Mutex::new(None)),
+    )
+}
+
+/// Stable compat effect identity (bd-1kr2): the context-free runner has
+/// no run/node scope (run-scoped keys arrive with bd-zczp's RunContext),
+/// so the key is `compat/{action_type}/{sha256(canonical action JSON)}`.
+/// Same payload retries attach to one journaled effect; a different
+/// payload mints a different key. Returns `(effect_key, action_digest)`.
+///
+/// Boundary (documented over-dedupe): two unrelated runs sending
+/// byte-identical payloads share a key at this layer — the second
+/// attaches to the first's stored outcome instead of re-sending.
+/// bd-zczp removes this by scoping keys with the run context.
+pub(crate) fn compat_effect_key(action: &Action) -> (String, String) {
+    use sha2::{Digest, Sha256};
+    let canonical = serde_json::to_value(action).expect("Action is JSON-serializable");
+    let canonical = serde_json::to_string(&canonical).expect("canonical action JSON serializes");
+    let mut hasher = Sha256::new();
+    hasher.update(canonical.as_bytes());
+    let digest = hex::encode(hasher.finalize());
+    let key = format!("compat/{}/{}", action.type_name(), digest);
+    (key, digest)
+}
+
+/// Build the fenced dispatch request for one compat action (bd-1kr2).
+/// Transport `corr` == effect key (Spec 5.4); the capability is the
+/// conservative journal default for the action type (mailbox/coalescer
+/// providers offer no query-or-idempotency contract, so uncertainty
+/// refuses a blind retry instead of risking a duplicate send).
+pub(crate) fn compat_request(action: &Action) -> DispatchRequest {
+    let (effect_key, action_digest) = compat_effect_key(action);
+    let action_type = action.type_name().to_string();
+    let project = match action {
+        Action::SendMessage { project, .. } | Action::SendDm { project, .. } => project.clone(),
+        _ => None,
+    };
+    DispatchRequest {
+        effect_key,
+        run_id: "compat".to_string(),
+        project,
+        workflow_digest: "compat".to_string(),
+        node_path: action_type.clone(),
+        iteration_key: None,
+        action_type: action_type.clone(),
+        action_digest,
+        redacted_action: None,
+        capability: capability_for_action_type(&action_type),
+    }
+}
+
+/// Map one fenced dispatch result back onto the arm's `{ok,…}` shape
+/// (bd-1kr2): `Settled` returns the provider's stored outcome verbatim;
+/// any other journaled state reports `ok:false` with the state named —
+/// an unproven effect never reads as success.
+fn fenced_outcome(key: &str, result: anyhow::Result<DispatchResult>) -> serde_json::Value {
+    match result {
+        Ok(res) if res.state == EffectState::Settled => res.outcome,
+        Ok(res) => serde_json::json!({
+            "ok": false,
+            "effect_key": key,
+            "effect_state": res.state.as_str(),
+            "outcome": res.outcome,
+        }),
+        Err(e) => serde_json::json!({
+            "ok": false,
+            "effect_key": key,
+            "error": format!("{e:#}"),
+        }),
+    }
+}
+/// A production [`ActionRunner`] with fenced effect dispatch (bd-1kr2):
+/// the shared dispatcher cell is read per call, so a late
+/// [`WorkflowHost::with_effect_store`] attach rewires sends without a
+/// rebuild. When the cell holds a dispatcher, the SendMessage / SendDm /
+/// DispatchJob arms journal intent before invoking the provider
+/// (claim → invoke → settle_with_fence → link_transport_corr, Spec 5.3)
+/// and project `corr == effect_key` on the wire (Spec 5.4). When it
+/// holds `None` the arms behave exactly as [`mailbox_runner`] (direct
+/// sends, compat fallback for embeddings without a journal).
+pub fn mailbox_runner_with_dispatcher(
+    mailbox: Arc<Mailbox>,
+    coalescer: Arc<std::sync::Mutex<MentionCoalescer>>,
+    job_signer: Option<Keys>,
+    dispatcher: Arc<std::sync::Mutex<Option<EffectDispatcher>>>,
+) -> ActionRunner {
     Arc::new(move |action: &Action| {
         // bd-i6kc: the context-free runner is the migration compat adapter —
         // every call crosses the boundary partition first. `None` from the
@@ -114,7 +204,8 @@ pub fn mailbox_runner(
                 project,
             } => {
                 let project = project.clone().unwrap_or_default();
-                let msg = SendMessage {
+                let mut tags = stamp_workflow_emitted(vec![]);
+                let mut msg = SendMessage {
                     project_slug: project.clone(),
                     sender_name: sender_for(&project).to_string(),
                     to: to.clone(),
@@ -130,22 +221,52 @@ pub fn mailbox_runner(
                     // ADR-0007 F6: every workflow-originated rumor carries the
                     // `toron:workflow-emitted` stamp (gift wrap stays
                     // metadata-hiding — the stamp is INSIDE the rumor).
-                    extra_tags: stamp_workflow_emitted(vec![]),
+                    extra_tags: vec![],
                 };
+                let disp = dispatcher.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                let Some(disp) = disp else {
+                    msg.extra_tags = tags;
+                    let mb = mailbox.clone();
+                    return Some(
+                        match block_on_async(async move { mb.send_message(&msg).await }) {
+                            Ok(res) => Ok(serde_json::json!({
+                                "ok": true,
+                                "count": res.count,
+                            })),
+                            Err(e) => {
+                                Ok(serde_json::json!({ "ok": false, "error": e.to_string() }))
+                            }
+                        },
+                    );
+                };
+                // bd-1kr2: fenced send — corr == effect_key (Spec 5.4).
+                let req = compat_request(action);
+                tags.push(Tag::parse(["corr", req.effect_key.as_str()]).expect("corr tag parses"));
+                msg.extra_tags = tags;
                 let mb = mailbox.clone();
-                Some(
-                    match block_on_async(async move { mb.send_message(&msg).await }) {
-                        Ok(res) => Ok(serde_json::json!({
-                            "ok": true,
-                            "count": res.count,
-                        })),
-                        Err(e) => Ok(serde_json::json!({ "ok": false, "error": e.to_string() })),
-                    },
-                )
+                let key = req.effect_key.clone();
+                let key_out = key.clone();
+                Some(Ok(fenced_outcome(
+                    &key_out,
+                    block_on_async(async move {
+                        disp.dispatch(&req, move |_| {
+                            match block_on_async(async move { mb.send_message(&msg).await }) {
+                                Ok(res) => ProviderOutcome::Delivered(serde_json::json!({
+                                    "ok": true,
+                                    "count": res.count,
+                                    "effect_key": key,
+                                })),
+                                Err(e) => ProviderOutcome::ProvenFailed(e.to_string()),
+                            }
+                        })
+                        .await
+                    }),
+                )))
             }
             Action::SendDm { to, body, project } => {
                 let project = project.clone().unwrap_or_default();
-                let msg = SendMessage {
+                let mut tags = stamp_workflow_emitted(vec![]);
+                let mut msg = SendMessage {
                     project_slug: project.clone(),
                     sender_name: sender_for(&project).to_string(),
                     to: vec![to.clone()],
@@ -160,18 +281,47 @@ pub fn mailbox_runner(
                     overseer: false,
                     // ADR-0007 F6: workflow-originated DM rumors are stamped
                     // too — a workflow can never re-trigger itself.
-                    extra_tags: stamp_workflow_emitted(vec![]),
+                    extra_tags: vec![],
                 };
+                let disp = dispatcher.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                let Some(disp) = disp else {
+                    msg.extra_tags = tags;
+                    let mb = mailbox.clone();
+                    return Some(
+                        match block_on_async(async move { mb.send_message(&msg).await }) {
+                            Ok(res) => Ok(serde_json::json!({
+                                "ok": true,
+                                "count": res.count,
+                            })),
+                            Err(e) => {
+                                Ok(serde_json::json!({ "ok": false, "error": e.to_string() }))
+                            }
+                        },
+                    );
+                };
+                // bd-1kr2: fenced DM — corr == effect_key (Spec 5.4).
+                let req = compat_request(action);
+                tags.push(Tag::parse(["corr", req.effect_key.as_str()]).expect("corr tag parses"));
+                msg.extra_tags = tags;
                 let mb = mailbox.clone();
-                Some(
-                    match block_on_async(async move { mb.send_message(&msg).await }) {
-                        Ok(res) => Ok(serde_json::json!({
-                            "ok": true,
-                            "count": res.count,
-                        })),
-                        Err(e) => Ok(serde_json::json!({ "ok": false, "error": e.to_string() })),
-                    },
-                )
+                let key = req.effect_key.clone();
+                let key_out = key.clone();
+                Some(Ok(fenced_outcome(
+                    &key_out,
+                    block_on_async(async move {
+                        disp.dispatch(&req, move |_| {
+                            match block_on_async(async move { mb.send_message(&msg).await }) {
+                                Ok(res) => ProviderOutcome::Delivered(serde_json::json!({
+                                    "ok": true,
+                                    "count": res.count,
+                                    "effect_key": key,
+                                })),
+                                Err(e) => ProviderOutcome::ProvenFailed(e.to_string()),
+                            }
+                        })
+                        .await
+                    }),
+                )))
             }
             Action::DispatchJob { assignee, spec, .. } => {
                 // @mention dispatch through the coalescer: one job per burst.
@@ -192,38 +342,84 @@ pub fn mailbox_runner(
                     let mut c = coalescer.lock().unwrap_or_else(|e| e.into_inner());
                     c.submit(mention, now)
                 };
-                Some(match decision {
-                    // Hard-cap flush: publish the coalesced 43001 NOW (the
-                    // host's tick cannot — the buffer is already drained).
-                    CoalesceDecision::FlushNow(coalesced) => {
-                        let published = publish_coalesced_job(
-                            mailbox.bus().as_ref(),
-                            job_signer.as_ref(),
-                            &coalesced,
-                        );
-                        // bd-cnr5: an unpublished flush is a dropped effect —
-                        // report ok:false loud, never ok:true with
-                        // published:false.
-                        match published {
-                            Some(_) => Ok(serde_json::json!({
-                                "ok": true,
-                                "coalesced": false,
-                                "published": true,
-                                "error": serde_json::Value::Null,
-                            })),
-                            None => Ok(serde_json::json!({
-                                "ok": false,
-                                "coalesced": false,
-                                "published": false,
-                                "error": "no job signer configured",
-                            })),
+                let bus = mailbox.bus().clone();
+                let signer = job_signer.clone();
+                let disp = dispatcher.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                let Some(disp) = disp else {
+                    return Some(match decision {
+                        // Hard-cap flush: publish the coalesced 43001 NOW (the
+                        // host's tick cannot — the buffer is already drained).
+                        CoalesceDecision::FlushNow(coalesced) => {
+                            let published =
+                                publish_coalesced_job(bus.as_ref(), signer.as_ref(), &coalesced);
+                            // bd-cnr5: an unpublished flush is a dropped effect —
+                            // report ok:false loud, never ok:true with
+                            // published:false.
+                            match published {
+                                Some(_) => Ok(serde_json::json!({
+                                    "ok": true,
+                                    "coalesced": false,
+                                    "published": true,
+                                    "error": serde_json::Value::Null,
+                                })),
+                                None => Ok(serde_json::json!({
+                                    "ok": false,
+                                    "coalesced": false,
+                                    "published": false,
+                                    "error": "no job signer configured",
+                                })),
+                            }
                         }
-                    }
-                    CoalesceDecision::Buffered { .. } => Ok(serde_json::json!({
-                        "ok": true,
-                        "coalesced": true,
-                    })),
-                })
+                        CoalesceDecision::Buffered { .. } => Ok(serde_json::json!({
+                            "ok": true,
+                            "coalesced": true,
+                        })),
+                    });
+                };
+                // bd-1kr2: fenced @mention hand-off. Buffered means the
+                // burst buffer accepted the mention (the host tick owns the
+                // later 43001 publish — Settled here records the hand-off,
+                // not the wire delivery; the in-memory coalescer's
+                // crash-loss window is unchanged and documented).
+                // A coalesced 43001 merges N effects into one job, so no
+                // single corr rides it — per-effect corr lives in the
+                // journal's transport_corr projection (linked by dispatch).
+                let req = compat_request(action);
+                let key = req.effect_key.clone();
+                let key_out = key.clone();
+                Some(Ok(fenced_outcome(
+                    &key_out,
+                    block_on_async(async move {
+                        disp.dispatch(&req, move |_| match decision {
+                            CoalesceDecision::Buffered { .. } => {
+                                ProviderOutcome::Delivered(serde_json::json!({
+                                    "ok": true,
+                                    "coalesced": true,
+                                    "effect_key": key,
+                                }))
+                            }
+                            CoalesceDecision::FlushNow(coalesced) => {
+                                match publish_coalesced_job(
+                                    bus.as_ref(),
+                                    signer.as_ref(),
+                                    &coalesced,
+                                ) {
+                                    Some(id) => ProviderOutcome::Delivered(serde_json::json!({
+                                        "ok": true,
+                                        "coalesced": false,
+                                        "published": true,
+                                        "job_id": id.to_hex(),
+                                        "effect_key": key,
+                                    })),
+                                    None => ProviderOutcome::ProvenFailed(
+                                        "no job signer configured".to_string(),
+                                    ),
+                                }
+                            }
+                        })
+                        .await
+                    }),
+                )))
             }
             // Every other HostSink action (today: `Verify`) has no sink on
             // this mailbox-only runner — the boundary reports `missing_sink`.
@@ -314,6 +510,11 @@ pub struct WorkflowHost {
     /// bd-asx3: host-owned pending lifecycle — structured entries, terminal
     /// ledger, run states. Shared across the trigger and resolution loops.
     pending: Arc<tokio::sync::Mutex<PendingDrain>>,
+    /// bd-1kr2: fenced effect dispatch (Spec 5.3) for the production
+    /// runner arms. Shared with the runner (which snapshots it per call,
+    /// so a late [`Self::with_effect_store`] attach also rewires sends).
+    /// `None` on journal-less embeddings (direct sends).
+    dispatcher: Arc<std::sync::Mutex<Option<EffectDispatcher>>>,
 }
 
 impl std::fmt::Debug for WorkflowHost {
@@ -322,6 +523,14 @@ impl std::fmt::Debug for WorkflowHost {
             .field("workflows", &self.workflows.len())
             .field("engine", &self.engine)
             .field("has_job_signer", &self.job_signer.is_some())
+            .field(
+                "has_dispatcher",
+                &self
+                    .dispatcher
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .is_some(),
+            )
             .field(
                 "pending_len",
                 &self.pending.try_lock().map(|g| g.registry_len()),
@@ -337,21 +546,33 @@ impl WorkflowHost {
     pub fn new(mailbox: Arc<Mailbox>, workflows: Vec<Workflow>) -> Result<Self> {
         let coalescer = Arc::new(std::sync::Mutex::new(MentionCoalescer::from_env()));
         let job_signer = mailbox.operator().cloned();
-        let runner = mailbox_runner(mailbox.clone(), coalescer.clone(), job_signer.clone());
+        // bd-cnr5 + bd-1kr2: production touches the durable journal — when
+        // the mailbox carries the index pool, run states + terminal dedupe
+        // persist in workflow_runs / workflow_terminal_events instead of
+        // dying with the host process, and the effect arms dispatch
+        // through the fenced EffectDispatcher (Spec 5.3).
+        let store = mailbox
+            .index_pool()
+            .map(|pool| WorkflowEffectStore::new(pool.clone()));
+        let dispatcher = Arc::new(std::sync::Mutex::new(
+            store.clone().map(EffectDispatcher::new),
+        ));
+        let pending = match store {
+            Some(store) => PendingDrain::new().with_store(store),
+            None => PendingDrain::new(),
+        };
+        let runner = mailbox_runner_with_dispatcher(
+            mailbox.clone(),
+            coalescer.clone(),
+            job_signer.clone(),
+            dispatcher.clone(),
+        );
         let engine = match toron_workflow::engine::resonate_server_url() {
             Some(url) => WorkflowEngine::remote(url, runner)
                 .context("workflow engine (remote resonate server)")?,
             None => WorkflowEngine::local(runner).context("workflow engine")?,
         };
         let bus = mailbox.bus().clone();
-        // bd-cnr5: production touches the durable journal — when the
-        // mailbox carries the index pool, run states + terminal dedupe
-        // persist in workflow_runs / workflow_terminal_events instead of
-        // dying with the host process.
-        let pending = match mailbox.index_pool() {
-            Some(pool) => PendingDrain::new().with_store(WorkflowEffectStore::new(pool.clone())),
-            None => PendingDrain::new(),
-        };
         Ok(Self {
             engine: Arc::new(engine),
             bus,
@@ -359,6 +580,7 @@ impl WorkflowHost {
             coalescer,
             job_signer,
             pending: Arc::new(tokio::sync::Mutex::new(pending)),
+            dispatcher,
         })
     }
 
@@ -377,6 +599,7 @@ impl WorkflowHost {
             coalescer: Arc::new(std::sync::Mutex::new(MentionCoalescer::from_env())),
             job_signer: None,
             pending: Arc::new(tokio::sync::Mutex::new(PendingDrain::new())),
+            dispatcher: Arc::new(std::sync::Mutex::new(None)),
         })
     }
 
@@ -394,6 +617,7 @@ impl WorkflowHost {
             coalescer: Arc::new(std::sync::Mutex::new(MentionCoalescer::from_env())),
             job_signer: None,
             pending: Arc::new(tokio::sync::Mutex::new(PendingDrain::new())),
+            dispatcher: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -404,13 +628,27 @@ impl WorkflowHost {
         self
     }
 
-    /// Attach the durable effect journal (bd-cnr5): run states + terminal
-    /// dedupe persist in `workflow_runs` / `workflow_terminal_events`.
-    /// Production (`new`) attaches automatically when the mailbox carries
-    /// the index pool; tests attach explicitly. Blocking on the pending
-    /// mutex is brief (one pointer swap under the lock).
+    /// Attach the durable effect journal (bd-cnr5 + bd-1kr2): run states +
+    /// terminal dedupe persist in `workflow_runs` / `workflow_terminal_events`,
+    /// and the shared dispatcher cell gains an `EffectDispatcher`, so the
+    /// runner arms fence sends without a rebuild. Production (`new`)
+    /// attaches automatically when the mailbox carries the index pool;
+    /// tests attach explicitly.
     pub async fn with_effect_store(&self, store: WorkflowEffectStore) {
-        self.pending.lock().await.set_store(store);
+        self.pending.lock().await.set_store(store.clone());
+        *self.dispatcher.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some(EffectDispatcher::new(store));
+    }
+
+    /// The fenced effect dispatcher (bd-1kr2, Spec 5.3): `Some` when the
+    /// host was constructed over a journal (`new` with an index pool, or
+    /// after [`Self::with_effect_store`]); `None` on journal-less
+    /// embeddings, where the arms send directly.
+    pub fn effect_dispatcher(&self) -> Option<EffectDispatcher> {
+        self.dispatcher
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// The engine (for tests / embedding observability).
@@ -4137,5 +4375,357 @@ steps:
             );
             let _ = std::fs::remove_file(&db);
         });
+    }
+
+    /// bd-1kr2 RED: compat effect keys are stable — the same action mints
+    /// the same key (idempotent retry attaches), a different payload mints
+    /// a different key.
+    #[test]
+    fn prod_effect_fencing_compat_key_stable() {
+        let a = Action::SendMessage {
+            to: vec!["BlueLake".into()],
+            subject: "review".into(),
+            body: "stamped body".into(),
+            project: Some("demo".into()),
+        };
+        let b = a.clone();
+        assert_eq!(compat_effect_key(&a), compat_effect_key(&b));
+        let c = Action::SendMessage {
+            to: vec!["BlueLake".into()],
+            subject: "review".into(),
+            body: "different body".into(),
+            project: Some("demo".into()),
+        };
+        assert_ne!(compat_effect_key(&a).0, compat_effect_key(&c).0);
+    }
+
+    /// bd-1kr2 RED helper: a dispatcher-backed production runner over
+    /// throwaway sqlite, with sender + recipient registered in `demo`.
+    async fn fencing_runner(
+        tag: &str,
+    ) -> (
+        ActionRunner,
+        EffectDispatcher,
+        Arc<dyn Bus>,
+        std::path::PathBuf,
+        std::path::PathBuf,
+        toron_core::nostr::Keys,
+    ) {
+        use toron_core::bus::in_process::{InProcessBus, InProcessBusConfig};
+        use toron_core::index::schema;
+        const PASSPHRASE: &str = "wf-fencing-pass";
+        let db = std::env::temp_dir().join(format!("wf-fencing-{tag}-{}", uuid::Uuid::new_v4()));
+        let pool = schema::connect(db.to_str().unwrap())
+            .await
+            .expect("connect");
+        schema::migrate(&pool).await.expect("migrate");
+        let bus: Arc<dyn Bus> = Arc::new(
+            InProcessBus::open(pool.clone(), InProcessBusConfig::default())
+                .await
+                .expect("bus"),
+        );
+        let data_dir =
+            std::env::temp_dir().join(format!("wf-fencing-data-{tag}-{}", uuid::Uuid::new_v4()));
+        let mailbox = Arc::new(
+            Mailbox::new(bus.clone(), data_dir.clone(), None).with_agent_passphrase(PASSPHRASE),
+        );
+        mailbox
+            .register_agent(
+                "demo",
+                &toron_core::nostr::identity::AgentProfile::new("workflow-demo"),
+            )
+            .await
+            .expect("register sender");
+        let recv = mailbox
+            .register_agent(
+                "demo",
+                &toron_core::nostr::identity::AgentProfile::new("BlueLake"),
+            )
+            .await
+            .expect("register recipient");
+        let recv_keys =
+            toron_core::keys::load_encrypted_key(std::path::Path::new(&recv.key_path), PASSPHRASE)
+                .expect("load recipient key");
+        let store = toron_core::index::workflow_effects::WorkflowEffectStore::new(pool);
+        let dispatcher = EffectDispatcher::new(store);
+        let coalescer = Arc::new(std::sync::Mutex::new(MentionCoalescer::from_env()));
+        let runner = mailbox_runner_with_dispatcher(
+            mailbox,
+            coalescer,
+            None,
+            Arc::new(std::sync::Mutex::new(Some(dispatcher.clone()))),
+        );
+        (runner, dispatcher, bus, db, data_dir, recv_keys)
+    }
+
+    /// Drive a sync runner from a plain OS thread (the runner block_ons
+    /// internally; never call it from inside an async context directly).
+    fn drive_runner(runner: &ActionRunner, action: Action) -> serde_json::Value {
+        let runner = runner.clone();
+        std::thread::spawn(move || runner(&action).expect("runner ok"))
+            .join()
+            .expect("runner thread")
+    }
+
+    /// bd-1kr2 RED: the REAL SendMessage arm journals intent before
+    /// dispatch — a same-key retry attaches (one gift wrap on the wire,
+    /// never two) and the journal projects corr == effect_key.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn prod_effect_fencing_send_message_sends_once_and_projects_corr() {
+        use toron_core::mailbox::messaging::unwrap_for_recipient;
+        let (runner, dispatcher, bus, db, data_dir, recv_keys) = fencing_runner("once").await;
+        let action = Action::SendMessage {
+            to: vec!["BlueLake".into()],
+            subject: "fenced".into(),
+            body: "exactly once".into(),
+            project: Some("demo".into()),
+        };
+        let (key, _) = compat_effect_key(&action);
+        let out1 = drive_runner(&runner, action.clone());
+        assert_eq!(out1["ok"], serde_json::json!(true), "first send ok: {out1}");
+        let out2 = drive_runner(&runner, action.clone());
+        assert_eq!(
+            out2["ok"],
+            serde_json::json!(true),
+            "same-key retry attaches: {out2}"
+        );
+        // Exactly one gift wrap on the wire — the retry dispatched nothing.
+        let replay = toron_core::mailbox::collect_replay(
+            bus.as_ref(),
+            toron_core::bus::Filter::new().kinds([nostr::prelude::Kind::GiftWrap]),
+        )
+        .await
+        .expect("replay");
+        assert_eq!(replay.len(), 1, "one wrap for two same-key sends");
+        // The rumor projects corr == effect_key (Spec 5.4).
+        let rumor = unwrap_for_recipient(&recv_keys, &replay[0])
+            .expect("unwrap")
+            .rumor;
+        assert!(
+            rumor
+                .tags
+                .iter()
+                .any(|t| t.as_slice() == ["corr", key.as_str()]),
+            "rumor carries corr == effect_key"
+        );
+        // The journal agrees: settled with transport_corr == key.
+        let row = dispatcher
+            .store()
+            .get_effect(&key)
+            .await
+            .expect("read")
+            .expect("effect row exists — intent preceded dispatch");
+        assert_eq!(
+            row.state,
+            toron_core::index::workflow_effects::EffectState::Settled
+        );
+        assert_eq!(row.transport_corr.as_deref(), Some(key.as_str()));
+        let _ = std::fs::remove_file(&db);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// bd-1kr2 RED: crash recovery on the REAL arm — after the host state
+    /// is dropped, a rebuilt runner over the same journal still attaches
+    /// (no second wrap).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn prod_effect_fencing_crash_recovery_no_double_send() {
+        use toron_core::bus::in_process::{InProcessBus, InProcessBusConfig};
+        use toron_core::index::schema;
+        const PASSPHRASE: &str = "wf-fencing-crash";
+        let db = std::env::temp_dir().join(format!("wf-fencing-crash-{}", uuid::Uuid::new_v4()));
+        let pool = schema::connect(db.to_str().unwrap())
+            .await
+            .expect("connect");
+        schema::migrate(&pool).await.expect("migrate");
+        let bus: Arc<dyn Bus> = Arc::new(
+            InProcessBus::open(pool.clone(), InProcessBusConfig::default())
+                .await
+                .expect("bus"),
+        );
+        let data_dir =
+            std::env::temp_dir().join(format!("wf-fencing-crash-data-{}", uuid::Uuid::new_v4()));
+        let action = Action::SendMessage {
+            to: vec!["BlueLake".into()],
+            subject: "crash".into(),
+            body: "survives restart".into(),
+            project: Some("demo".into()),
+        };
+        {
+            let mailbox = Arc::new(
+                Mailbox::new(bus.clone(), data_dir.clone(), None).with_agent_passphrase(PASSPHRASE),
+            );
+            mailbox
+                .register_agent(
+                    "demo",
+                    &toron_core::nostr::identity::AgentProfile::new("workflow-demo"),
+                )
+                .await
+                .expect("register sender");
+            mailbox
+                .register_agent(
+                    "demo",
+                    &toron_core::nostr::identity::AgentProfile::new("BlueLake"),
+                )
+                .await
+                .expect("register recipient");
+            let store = toron_core::index::workflow_effects::WorkflowEffectStore::new(pool.clone());
+            let runner = mailbox_runner_with_dispatcher(
+                mailbox,
+                Arc::new(std::sync::Mutex::new(MentionCoalescer::from_env())),
+                None,
+                Arc::new(std::sync::Mutex::new(Some(EffectDispatcher::new(store)))),
+            );
+            let out = drive_runner(&runner, action.clone());
+            assert_eq!(out["ok"], serde_json::json!(true));
+            drop(runner);
+        }
+        // "Restart": brand-new mailbox + runner over the SAME pool/bus.
+        {
+            let mailbox = Arc::new(
+                Mailbox::new(bus.clone(), data_dir.clone(), None).with_agent_passphrase(PASSPHRASE),
+            );
+            let store = toron_core::index::workflow_effects::WorkflowEffectStore::new(pool.clone());
+            let runner = mailbox_runner_with_dispatcher(
+                mailbox,
+                Arc::new(std::sync::Mutex::new(MentionCoalescer::from_env())),
+                None,
+                Arc::new(std::sync::Mutex::new(Some(EffectDispatcher::new(store)))),
+            );
+            let out = drive_runner(&runner, action.clone());
+            assert_eq!(
+                out["ok"],
+                serde_json::json!(true),
+                "recovery attaches: {out}"
+            );
+        }
+        let replay = toron_core::mailbox::collect_replay(
+            bus.as_ref(),
+            toron_core::bus::Filter::new().kinds([nostr::prelude::Kind::GiftWrap]),
+        )
+        .await
+        .expect("replay");
+        assert_eq!(replay.len(), 1, "one wrap across the restart");
+        let _ = std::fs::remove_file(&db);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// bd-1kr2 RED: the REAL DispatchJob arm through the journal — a
+    /// cap-flush with no signer journals a terminal Failed (never a
+    /// silent success), and the retry attaches without publishing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn prod_effect_fencing_no_signer_flush_fails_terminal() {
+        use toron_core::bus::in_process::{InProcessBus, InProcessBusConfig};
+        use toron_core::index::schema;
+        let db = std::env::temp_dir().join(format!("wf-fencing-nosign-{}", uuid::Uuid::new_v4()));
+        let pool = schema::connect(db.to_str().unwrap())
+            .await
+            .expect("connect");
+        schema::migrate(&pool).await.expect("migrate");
+        let bus: Arc<dyn Bus> = Arc::new(
+            InProcessBus::open(pool.clone(), InProcessBusConfig::default())
+                .await
+                .expect("bus"),
+        );
+        let mailbox = Arc::new(Mailbox::new(
+            bus.clone(),
+            std::env::temp_dir().join(format!("wf-fencing-nosign-data-{}", uuid::Uuid::new_v4())),
+            None,
+        ));
+        let store = toron_core::index::workflow_effects::WorkflowEffectStore::new(pool);
+        let dispatcher = EffectDispatcher::new(store);
+        // Cap-1: every mention flushes NOW, with no signer to publish it.
+        let coalescer = Arc::new(std::sync::Mutex::new(MentionCoalescer::new(
+            std::time::Duration::from_secs(60),
+            std::time::Duration::from_secs(60),
+            1,
+        )));
+        let runner = mailbox_runner_with_dispatcher(
+            mailbox,
+            coalescer,
+            None,
+            Arc::new(std::sync::Mutex::new(Some(dispatcher.clone()))),
+        );
+        let action = Action::DispatchJob {
+            assignee: "oc".into(),
+            spec: crate::workflow_host::test_spec(serde_json::json!({ "nosign": 1 })),
+            channel: None,
+        };
+        let (key, _) = compat_effect_key(&action);
+        for _ in 0..2 {
+            let out = drive_runner(&runner, action.clone());
+            assert_eq!(out["ok"], serde_json::json!(false), "unpublished: {out}");
+        }
+        let row = dispatcher
+            .store()
+            .get_effect(&key)
+            .await
+            .expect("read")
+            .expect("effect row exists");
+        assert_eq!(
+            row.state,
+            toron_core::index::workflow_effects::EffectState::Failed
+        );
+        let replay = toron_core::mailbox::collect_replay(
+            bus.as_ref(),
+            toron_core::bus::Filter::new().kinds([nostr::prelude::Kind::from_u16(43001)]),
+        )
+        .await
+        .expect("replay");
+        assert!(replay.is_empty(), "nothing published without a signer");
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// bd-1kr2 RED: uncertainty on an arm-shaped key journals Unknown and
+    /// refuses a blind retry — the crash-matrix row the policy owns
+    /// (plan logic is arm-agnostic; the key shape is the real one).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn prod_effect_fencing_unknown_refuses_blind_retry() {
+        use toron_core::index::schema;
+        let db = std::env::temp_dir().join(format!("wf-fencing-unk-{}", uuid::Uuid::new_v4()));
+        let pool = schema::connect(db.to_str().unwrap())
+            .await
+            .expect("connect");
+        schema::migrate(&pool).await.expect("migrate");
+        let store = toron_core::index::workflow_effects::WorkflowEffectStore::new(pool);
+        let dispatcher = EffectDispatcher::new(store);
+        let action = Action::SendMessage {
+            to: vec!["BlueLake".into()],
+            subject: "ambiguous".into(),
+            body: "did it send?".into(),
+            project: Some("demo".into()),
+        };
+        let (key, digest) = compat_effect_key(&action);
+        let req = DispatchRequest {
+            effect_key: key.clone(),
+            run_id: "compat".into(),
+            project: Some("demo".into()),
+            workflow_digest: "compat".into(),
+            node_path: action.type_name().into(),
+            iteration_key: None,
+            action_type: action.type_name().into(),
+            action_digest: digest,
+            redacted_action: None,
+            capability: toron_workflow::engine::capability_for_action_type("send_message"),
+        };
+        let out = dispatcher
+            .dispatch(&req, |_| {
+                toron_workflow::engine::ProviderOutcome::Ambiguous("bus timeout".into())
+            })
+            .await
+            .expect("dispatch records uncertainty");
+        assert_eq!(
+            out.state,
+            toron_core::index::workflow_effects::EffectState::Unknown
+        );
+        let retry = dispatcher
+            .dispatch(&req, |_| {
+                toron_workflow::engine::ProviderOutcome::Delivered(serde_json::json!({"ok": true}))
+            })
+            .await;
+        assert!(
+            retry.is_err(),
+            "blind retry after Unknown must refuse, never re-dispatch"
+        );
+        let _ = std::fs::remove_file(&db);
     }
 }
