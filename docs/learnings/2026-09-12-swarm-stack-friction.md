@@ -47,6 +47,33 @@ Ordered by severity. "Fix" = suggested owner.
 **F3. Canonical ADR left uncommitted by the prior session.**
 - Working tree held ADR-0032 rev 3 (the version the beads were re-cut against); HEAD held the superseded rev-2 text that rev 3 explicitly corrects. Any crew reading git history implements the wrong contract. No end-of-session gate covers doc-only changes (bead gates only witness code commits). Fix: captain close-out checklist includes "commit docs working tree" or a dirt-preflight on briefing that names uncommitted decision files.
 
+## Wave-1 execution addenda (same session, ~05:30)
+
+**F11. Bead close does not release reservations; the release-on-bead-close primitive is MCP-only.**
+- SwiftBadger closed bd-i6kc green but its broad `crates/toron-workflow/src/engine/**` lease stayed held; BrightCoast (bd-o1hl scope: control_flow.rs + template.rs) was blocked, sent request-release into the void (holder pane already idle — finished agents don't answer), and mailed the captain.
+- `release_file_reservations_by_reason` exists as an MCP tool but has NO CLI noun; the crews' close ceremony (br skill + ce-execute stage) never mentions releasing reservations. TTL expiry (2h) is the only automatic backstop.
+- Fix: add `toron reserve release-by-reason <bead>` (or auto-release offer on `br close` detection), and add one RELEASE line to the close ceremony in br skill + ce-execute standing orders.
+
+**F12. `flywheel send --to <pin>` does not resolve for spawned crew agents — only registry slugs.**
+- Crew panes post mail FROM their pins (SwiftBadger, BrightCoast, WindyGlen on the steer channel), but `send --to SwiftBadger` fails "no agents match ... available: crew-toro091203590020-coder,...". The skill says `--to <pin>` resolves via spawn-registry mail_identity; in practice only the `crew-<run>-<role>` slugs address. First two operator replies (to pins) silently missed — caught only because the asx3 dispatch failed loud with the available-names list.
+- Fix: make --to resolve pins through the same mail_identity the panes post with, or make the failure generic (it was loud here — good — but the two earlier sends exited clean-looking).
+
+**F13. STEP-0 cross-project register mints a nameless key that can hold leases but never commit.**
+- WindyGlen ran `flywheel mail register flywheel --name crew-toro...-coder3 --from-project toron` as briefed; the flywheel-side lease then landed on a fresh nameless npub (17cb8b3f). Transfer rejected, expiry 2h, only operator force-release cleared (×3 paths). The commit guard correctly refused the mismatch — but the create-a-ghost-holder path shouldn't exist.
+- Fix: --from-project register should reuse the AGENT's existing key (env/injected ncryptsec), and lease acquisition under a key with no registered name should warn loud at acquire time.
+
+**F14. Lease board is invisible: no CLI noun, MCP tool returns no structured content.**
+- `toron reserve` has acquire/conflicts/renew/release/force-release/request-release/respond — no list/show. `toron_list_file_reservations` MCP errors "has an output schema but did not return structured content". I reconstructed holder state with `reserve conflicts` against guessed paths; WindyGlen's and BrightCoast's mails disagreed with the actual board.
+- Fix: `toron reserve list --project <p>` (CLI) and fix the MCP tool's structured output.
+
+**F15. `send --wait` false-ambiguity confirmed systemic (F9 generalizes).**
+- All four --stage ce-execute dispatches: dispatched=true, then "no settled observation ... treat as ambiguous". Healthy panes were working within seconds. De-facto protocol is now --fire-and-forget + eyeball the pane, which is exactly the receipt-skepticism the receipt system was built to prevent.
+
+**F16. Epic/parent-child structure deadlocks the ready set — and inverts cleanly-wrong.**
+- `br ready`/`br next` count `parent-child` deps as blocking: bd-v139.1 had its only real blocker (htoo) closed, verify+principles legal, yet not dispatchable because the epic bd-v139 was open — and the epic only closes when its children close. Second structural deadlock this swarm (after the wave-label one, review fix).
+- The epic's own deps were INVERTED at cut time (bd-v139 depends_on bd-htoo/bd-i6kc, i.e. epic blocked by children), and the open epic itself appeared in `br ready` output as dispatchable work.
+- Fix options: ready() should ignore parent-child type (epics are grouping, not ordering), epics should never surface in ready, and `br create --parent` should validate direction. Worked around by removing the three parent-child links (grouping lives in the effect-journal label) — epic closes at drain citing children.
+
 ## Clean (worth keeping)
 
 - Strict guard's blocked[] JSON is precise (agent, path, reason) — fast to act on once identity resolved.
