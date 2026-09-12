@@ -647,8 +647,9 @@ pub enum Action {
         /// `await: true` → suspend until the job's terminal event.
         #[serde(default, rename = "await")]
         await_: bool,
-        /// Abort an unclaimed spawn-await after N seconds (default 600).
-        #[serde(default)]
+        /// Abort an unclaimed spawn-await after N seconds (default 600;
+        /// explicit 0 is the only no-timeout spelling — ADR-0032 Spec 3).
+        #[serde(default = "default_no_claim_timeout")]
         no_claim_timeout: u64,
         /// Execution context mode (ADR-0024 Spec 2). `None` = inherit; `Some(Fresh)` = new session.
         #[serde(default, skip_serializing_if = "Option::is_none")]

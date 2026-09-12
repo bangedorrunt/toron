@@ -69,6 +69,7 @@ pub fn lint(file: &PathBuf) -> Result<i32> {
 /// `toron workflow run <file> --trigger <json>`.
 pub fn run(file: &PathBuf, trigger: &str) -> Result<i32> {
     let workflow = load(file)?;
+    preflight(&workflow)?;
     let trigger_value: serde_json::Value = serde_json::from_str(trigger)
         .with_context(|| format!("trigger must be valid JSON, got: {trigger:?}"))?;
     let runner = noop_runner();
@@ -103,6 +104,7 @@ pub fn run(file: &PathBuf, trigger: &str) -> Result<i32> {
 /// `toron workflow invoke <file> --inputs <json>`.
 pub fn invoke(file: &PathBuf, inputs: &str) -> Result<i32> {
     let workflow = load(file)?;
+    preflight(&workflow)?;
     let inputs_value: serde_json::Value = serde_json::from_str(inputs)
         .with_context(|| format!("inputs must be valid JSON, got: {inputs:?}"))?;
     let runner = noop_runner();
@@ -143,6 +145,53 @@ pub fn dry_run(file: &PathBuf, _trigger: &str) -> Result<i32> {
     Ok(EXIT_OK)
 }
 
+/// ADR-0032 Spec 6: parked actions need a draining host. The standalone CLI
+/// runs a no-op runner with no sink drain and no resolvers, so a workflow
+/// containing a parked action would park forever with no operator-visible
+/// pending event. Refuse before starting, naming the required host/mode.
+/// Returns the refusal reason, or `None` when the workflow needs no host.
+pub fn parked_preflight(workflow: &toron_workflow::schema::Workflow) -> Option<String> {
+    use toron_workflow::schema::{Action, Step};
+    fn step_needs_host(step: &Step) -> Option<&'static str> {
+        action_needs_host(&step.action)
+    }
+    fn steps_need_host(steps: &[Step]) -> Option<&'static str> {
+        steps.iter().find_map(step_needs_host)
+    }
+    fn action_needs_host(action: &Action) -> Option<&'static str> {
+        match action {
+            Action::RequestApproval { .. } => Some("request_approval"),
+            Action::Spawn { await_, .. } if *await_ => Some("spawn await:true"),
+            Action::Retry { step, .. } => step_needs_host(step),
+            Action::Branch {
+                then, else_steps, ..
+            } => steps_need_host(then).or_else(|| steps_need_host(else_steps)),
+            Action::Foreach { each, .. } | Action::Parallel { each, .. } => step_needs_host(each),
+            _ => None,
+        }
+    }
+    let found = steps_need_host(&workflow.steps).or_else(|| {
+        workflow
+            .graph
+            .as_ref()
+            .and_then(|g| g.nodes.values().find_map(|n| action_needs_host(&n.action)))
+    });
+    found.map(|kind| {
+        format!(
+            "workflow {:?} contains parked action `{kind}` but the standalone CLI has no draining host (no approval/spawn sink, no resolvers) — run it under a host lifecycle that drains sinks and publishes pending events"
+        , workflow.name)
+    })
+}
+
+/// Enforce [`parked_preflight`]: refuse parked workflows before they can park
+/// forever in the no-op host.
+fn preflight(workflow: &toron_workflow::schema::Workflow) -> Result<()> {
+    if let Some(reason) = parked_preflight(workflow) {
+        bail!("{reason}");
+    }
+    Ok(())
+}
+
 /// Load + lint a workflow file (the gate before any run).
 fn load(file: &PathBuf) -> Result<toron_workflow::schema::Workflow> {
     let yaml = fs::read_to_string(file).with_context(|| format!("read {}", file.display()))?;
@@ -164,4 +213,49 @@ fn print_json(value: &serde_json::Value) {
         "{}",
         serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn wf(yaml: &str) -> toron_workflow::schema::Workflow {
+        parse_workflow(yaml).expect("test workflow parses")
+    }
+
+    #[test]
+    fn preflight_refuses_request_approval() {
+        let w = wf(
+            "name: p\ntrigger:\n  type: webhook\nsteps:\n  - { name: g, action: request_approval, message: q }\n",
+        );
+        let reason = parked_preflight(&w).expect("refused");
+        assert!(reason.contains("request_approval"), "{reason}");
+        assert!(preflight(&w).is_err(), "run/invoke must refuse");
+    }
+
+    #[test]
+    fn preflight_refuses_spawn_await_nested_in_retry() {
+        let w = wf(
+            "name: p\ntrigger:\n  type: webhook\nsteps:\n  - name: w\n    action: retry\n    max_attempts: 2\n    step:\n      action: spawn\n      profile: \"@housekeeper\"\n      await: true\n",
+        );
+        let reason = parked_preflight(&w).expect("nested spawn-await refused");
+        assert!(reason.contains("spawn await:true"), "{reason}");
+    }
+
+    #[test]
+    fn preflight_allows_detached_spawn_and_plain_steps() {
+        let w = wf(
+            "name: p\ntrigger:\n  type: webhook\nsteps:\n  - { name: f, action: spawn, profile: \"@h\", await: false }\n  - { name: d, action: send_dm, to: x, body: y }\n",
+        );
+        assert!(parked_preflight(&w).is_none(), "no parked action");
+        assert!(preflight(&w).is_ok());
+    }
+
+    #[test]
+    fn preflight_refuses_graph_parked_node() {
+        let w = wf(
+            "name: p\ntrigger:\n  type: webhook\ngraph:\n  nodes:\n    g: { action: request_approval, message: q }\n",
+        );
+        assert!(parked_preflight(&w).is_some(), "graph node refused");
+    }
 }

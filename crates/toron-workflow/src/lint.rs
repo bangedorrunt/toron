@@ -642,6 +642,16 @@ fn check_action(report: &mut LintReport, action: &Action) {
                     line: None,
                 });
             }
+            // ADR-0032 Spec 7: one retry coordinator. A retry wrapper nested
+            // directly inside another multiplies bounds (2x2=4 attempts) —
+            // reject at lint so the outer policy is the single owner.
+            if matches!(step.action, Action::Retry { .. }) {
+                report.issues.push(LintIssue {
+                    level: Level::Error,
+                    message: "retry must not nest directly inside retry — flatten to one wrapper (one coordinator owns attempts/backoff)".into(),
+                    line: None,
+                });
+            }
             check_action(report, &step.action);
         }
         Action::Branch {
@@ -1428,6 +1438,38 @@ steps:
         assert!(
             !report.issues.iter().any(|i| i.message.contains("R-E3")),
             "R-E3 must not fire when wrapped in retry: {:?}",
+            report.issues
+        );
+    }
+
+    /// ADR-0032 Spec 7: directly nested retry wrappers multiply bounds, so
+    /// lint rejects them — one coordinator owns attempts/backoff.
+    #[test]
+    fn nested_retry_rejected() {
+        let yaml = r##"
+name: nested
+trigger:
+  type: webhook
+steps:
+  - name: go
+    action: retry
+    max_attempts: 2
+    step:
+      action: retry
+      max_attempts: 2
+      step:
+        action: send_dm
+        to: x
+        body: y
+"##;
+        let wf = parse_workflow(yaml).expect("parse");
+        let report = lint_workflow(&wf);
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|i| i.level == Level::Error && i.message.contains("flatten")),
+            "nested retry must be an error: {:?}",
             report.issues
         );
     }
