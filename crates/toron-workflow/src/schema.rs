@@ -661,6 +661,54 @@ pub enum Action {
     /// stdout_path, stderr_path}`. Missing sink → `{ok:false,
     /// error:"verify sink missing"}`. The engine never shells out.
     Verify { command: String },
+    /// Bounded fold over a proper list (ADR-0032 Spec 3, bd-3pti): one of
+    /// `all`/`any`/`count`/`sum`/`join`, evaluated in authored order into a
+    /// single scalar. Pure in-engine work: no effect key, sink, or provider
+    /// call. Invalid collections, operations, keys, and over-limit inputs
+    /// fail loud — never a silent zero, empty string, or partial fold.
+    Reduce {
+        /// Canonical ref path (or literal JSON) resolving to a proper list.
+        over: String,
+        /// The fold operation.
+        op: ReduceOp,
+        /// Optional dot-path selecting each item's operand.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        key: Option<String>,
+        /// Join-only: per-item template rendered in order.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        template: Option<String>,
+        /// Join-only: separator between rendered items (default `""`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        separator: Option<String>,
+        /// Optional starting accumulator (type-checked per operation).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        init: Option<serde_json::Value>,
+    },
+}
+
+/// The closed reduce-operation vocabulary (bd-3pti). Unknown spellings fail
+/// parse loudly — there is no fallback operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReduceOp {
+    All,
+    Any,
+    Count,
+    Sum,
+    Join,
+}
+
+impl ReduceOp {
+    /// Canonical wire spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Any => "any",
+            Self::Count => "count",
+            Self::Sum => "sum",
+            Self::Join => "join",
+        }
+    }
 }
 
 /// Default retry attempts (used by `Action::Retry` serde default).
@@ -686,6 +734,7 @@ impl Action {
             Self::CallWorkflow { .. } => "call_workflow",
             Self::Spawn { .. } => "spawn",
             Self::Verify { .. } => "verify",
+            Self::Reduce { .. } => "reduce",
         }
     }
 }
@@ -838,8 +887,14 @@ pub const ACTION_TYPES: [&str; 7] = [
 
 /// The P5.3 control-flow action types (ADR-0005 Spec 4) added on top of the
 /// original 7.
-pub const CONTROL_FLOW_ACTION_TYPES: [&str; 5] =
-    ["retry", "branch", "foreach", "parallel", "call_workflow"];
+pub const CONTROL_FLOW_ACTION_TYPES: [&str; 6] = [
+    "retry",
+    "branch",
+    "foreach",
+    "parallel",
+    "call_workflow",
+    "reduce",
+];
 
 /// Template-payload access for `{{trigger.<field>}}` / `{{steps.<name>}}`.
 /// The engine substitutes these at run time; this is the key contract so lint

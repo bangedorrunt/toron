@@ -411,6 +411,7 @@ pub fn partition(action: &Action) -> ActionPartition {
         | Action::Foreach { .. }
         | Action::Parallel { .. }
         | Action::CallWorkflow { .. }
+        | Action::Reduce { .. }
         | Action::Spawn { .. } => ActionPartition::EngineControl,
         Action::SendMessage { .. } | Action::SendDm { .. } => {
             ActionPartition::HostSink { sink: "mailbox" }
@@ -728,6 +729,14 @@ mod tests {
             Action::Verify {
                 command: "true".into(),
             },
+            Action::Reduce {
+                over: "x".into(),
+                op: crate::schema::ReduceOp::Count,
+                key: None,
+                template: None,
+                separator: None,
+                init: None,
+            },
         ]
     }
 
@@ -755,13 +764,13 @@ mod tests {
     #[test]
     fn honesty_gate_partition_is_exhaustive() {
         let actions = every_action();
-        assert_eq!(actions.len(), 14, "one case per live Action variant");
+        assert_eq!(actions.len(), 15, "one case per live Action variant");
         let mut names: Vec<&str> = actions.iter().map(|a| a.type_name()).collect();
         names.sort_unstable();
         names.dedup();
         assert_eq!(
             names.len(),
-            14,
+            15,
             "type names are unique per variant: {names:?}"
         );
         for action in &actions {
@@ -775,7 +784,7 @@ mod tests {
             .iter()
             .filter(|a| matches!(partition(a), ActionPartition::EngineControl))
             .count();
-        assert_eq!(control, 8, "engine-owned control actions");
+        assert_eq!(control, 9, "engine-owned control actions");
         let unsupported = actions
             .iter()
             .filter(|a| matches!(partition(a), ActionPartition::Unsupported { .. }))
@@ -977,7 +986,7 @@ mod tests {
         use std::collections::BTreeSet;
         let advertised: BTreeSet<&str> = advertised_action_names().into_iter().collect();
         let live: BTreeSet<&str> = every_action().iter().map(|a| a.type_name()).collect();
-        assert_eq!(live.len(), 14, "one name per live Action variant");
+        assert_eq!(live.len(), 15, "one name per live Action variant");
         assert_eq!(advertised, live, "advertised names == live type names");
     }
 

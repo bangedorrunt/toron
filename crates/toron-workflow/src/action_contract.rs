@@ -206,6 +206,14 @@ const VERIFY: ActionContract = ActionContract {
     output: OutputKind::ObjectWithOk,
     supported: true,
 };
+const REDUCE: ActionContract = ActionContract {
+    type_name: "reduce",
+    class: ActionClass::DurableControl,
+    effect: EffectKind::NoneControl,
+    template_fields: &["over", "template"],
+    output: OutputKind::AnyNonNull,
+    supported: true,
+};
 
 /// The contract for one action. Exhaustive over [`Action`]: a new variant
 /// without an arm is a compile error.
@@ -225,6 +233,7 @@ pub fn contract_for(action: &Action) -> &'static ActionContract {
         Action::CallWorkflow { .. } => &CALL_WORKFLOW,
         Action::Spawn { .. } => &SPAWN,
         Action::Verify { .. } => &VERIFY,
+        Action::Reduce { .. } => &REDUCE,
     }
 }
 
@@ -327,6 +336,55 @@ pub fn validate_action(action: &Action) -> Vec<Violation> {
         }
         Action::Verify { command } => {
             push(&mut out, non_empty("command", command, "verify"));
+        }
+        Action::Reduce {
+            over,
+            op,
+            template,
+            init,
+            ..
+        } => {
+            push(&mut out, non_empty("over", over, "reduce"));
+            // Join folds through its template, never a key.
+            if *op == crate::schema::ReduceOp::Join {
+                match template {
+                    Some(t) if !t.trim().is_empty() => {}
+                    _ => out.push(violation(
+                        "template",
+                        ActionErrorCode::InvalidInput,
+                        "reduce join requires a non-empty `template`".into(),
+                    )),
+                }
+            }
+            // The accumulator is a literal: templates belong in `over` and
+            // join `template`, so a `{{...}}` here would silently persist.
+            if let Some(init) = init {
+                if init.to_string().contains("{{") {
+                    out.push(violation(
+                        "init",
+                        ActionErrorCode::InvalidInput,
+                        "reduce `init` is a literal accumulator and must not contain templates"
+                            .into(),
+                    ));
+                } else {
+                    let type_ok = match op {
+                        crate::schema::ReduceOp::All | crate::schema::ReduceOp::Any => {
+                            init.is_boolean()
+                        }
+                        crate::schema::ReduceOp::Count | crate::schema::ReduceOp::Sum => {
+                            init.is_number()
+                        }
+                        crate::schema::ReduceOp::Join => init.is_string(),
+                    };
+                    if !type_ok {
+                        out.push(violation(
+                            "init",
+                            ActionErrorCode::InvalidInput,
+                            format!("reduce `init` must match the {op:?} accumulator shape"),
+                        ));
+                    }
+                }
+            }
         }
     }
     out

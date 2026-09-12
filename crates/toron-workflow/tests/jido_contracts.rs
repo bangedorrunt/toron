@@ -47,6 +47,7 @@ fn all_variant_actions() -> Vec<Action> {
         parse_action("    action: call_workflow\n    workflow: kid\n    inputs: {}\n"),
         parse_action("    action: spawn\n    profile: \"@housekeeper\"\n    await: true\n"),
         parse_action("    action: verify\n    command: \"mbx test\"\n"),
+        parse_action("    action: reduce\n    over: \"{{trigger.items}}\"\n    op: count\n"),
     ]
 }
 
@@ -67,7 +68,7 @@ fn contract_covers_every_advertised_name() {
         covered, advertised,
         "contract table == advertised vocabulary"
     );
-    assert_eq!(covered.len(), 14, "closed set has 14 variants");
+    assert_eq!(covered.len(), 15, "closed set has 15 variants");
 }
 
 /// The contract table never disagrees with the engine partition: same sink,

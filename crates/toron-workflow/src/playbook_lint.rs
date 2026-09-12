@@ -745,6 +745,12 @@ fn collect_action_strings(action: &Action, out: &mut Vec<String>) {
             }
         }
         Action::Verify { command } => out.push(command.clone()),
+        Action::Reduce { over, template, .. } => {
+            out.push(over.clone());
+            if let Some(t) = template {
+                out.push(t.clone());
+            }
+        }
     }
 }
 

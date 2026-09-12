@@ -16,7 +16,7 @@ use resonate_sdk::prelude::Context;
 
 use crate::schema::{Action, Graph, Step, StepOnError};
 
-use super::template::{RenderContext, render_action, render_action_lenient};
+use super::template::{RenderContext, render_action, render_action_lenient, render_text};
 use super::{
     ActionRunner, ApprovalSink, Decision, FailureKind, ProfileResolver, RunInput, SpawnSink,
     WorkflowEngine, WorkflowResolver,
@@ -526,6 +526,18 @@ pub(crate) fn run_step_with_enclosing<'a>(
                 Action::Parallel { over, each } => {
                     run_parallel(ctx, runner, trigger, over, each, workflow, node).await?
                 }
+                Action::Reduce { .. } => {
+                    run_reduce(
+                        ctx,
+                        runner,
+                        trigger,
+                        &step.action,
+                        step_outputs,
+                        workflow,
+                        node,
+                    )
+                    .await?
+                }
                 Action::CallWorkflow {
                     workflow: child,
                     inputs,
@@ -982,6 +994,296 @@ pub async fn run_parallel_copy(
     )
     .await?;
     Ok(value)
+}
+
+/// Bounded reduce cap (bd-3pti): inputs longer than this fail loud instead
+/// of folding unboundedly.
+pub(crate) const MAX_REDUCE_ITEMS: usize = 1024;
+
+/// Join-output cap (bd-3pti): the accumulated string never grows past this;
+/// longer folds fail loud instead of materializing unbounded text.
+pub(crate) const MAX_JOIN_LEN: usize = 65536;
+
+/// Run a `reduce` action: resolve `over` to a proper list and fold it in
+/// authored order into a single scalar (bd-3pti). Pure in-engine work.
+pub(crate) async fn run_reduce(
+    _ctx: &Context,
+    _runner: &ActionRunner,
+    trigger: &serde_json::Value,
+    action: &Action,
+    step_outputs: &serde_json::Map<String, serde_json::Value>,
+    workflow: &str,
+    node: &str,
+) -> resonate_sdk::prelude::Result<serde_json::Value> {
+    let Action::Reduce {
+        over,
+        op,
+        key,
+        template,
+        separator,
+        init,
+    } = action
+    else {
+        return Ok(serde_json::json!({
+            "ok": false,
+            "error": format!("workflow {workflow:?} node {node:?}: reduce dispatch reached a non-reduce action"),
+        }));
+    };
+    let ctx_name = format!("workflow {workflow:?} node {node:?}");
+    // Join takes its operand from the template, never from a key.
+    if *op == crate::schema::ReduceOp::Join && key.is_some() {
+        return Ok(serde_json::json!({
+            "ok": false,
+            "error": format!("{ctx_name}: join uses `template`, not `key`"),
+        }));
+    }
+    // Resolve the collection through the canonical ref path: the rendered
+    // `over` must parse to a proper JSON list. Anything else — missing ref,
+    // scalar, object — fails the list contract loudly, never a silent fold.
+    let resolved = resolve_template_ref(over, trigger, step_outputs);
+    let list = match resolved.as_ref().and_then(|v| v.as_array()) {
+        Some(list) => list.clone(),
+        None => {
+            return Ok(serde_json::json!({
+                "ok": false,
+                "error": format!("{ctx_name}: reduce `over` {over:?} must resolve to a proper list"),
+            }));
+        }
+    };
+    if list.len() > MAX_REDUCE_ITEMS {
+        return Ok(serde_json::json!({
+            "ok": false,
+            "error": format!("{ctx_name}: reduce input has {} items, over the {MAX_REDUCE_ITEMS} bound", list.len()),
+        }));
+    }
+    // Operand selection: the key dot-path into each item, or the item
+    // itself. A missing path on any item fails naming the key and index.
+    let operand = |item: &serde_json::Value, index: usize| -> Result<serde_json::Value, String> {
+        match key {
+            Some(path) => super::template::descend(item, path.split('.'))
+                .cloned()
+                .ok_or_else(|| format!("{ctx_name}: reduce key {path:?} missing on item {index}")),
+            None => Ok(item.clone()),
+        }
+    };
+    // Initial accumulator: op-typed literal (templates are rejected
+    // statically), or the op identity when absent.
+    let init_value = init.clone();
+    match op {
+        crate::schema::ReduceOp::All => {
+            let mut acc = match init_value {
+                Some(serde_json::Value::Bool(b)) => b,
+                Some(other) => {
+                    return Ok(serde_json::json!({
+                        "ok": false,
+                        "error": format!("{ctx_name}: all `init` must be a boolean, got {other}"),
+                    }));
+                }
+                None => true,
+            };
+            for (i, item) in list.iter().enumerate() {
+                let v = operand(item, i);
+                match v {
+                    Ok(v) => acc = acc && is_truthy(&v),
+                    Err(e) => {
+                        return Ok(serde_json::json!({ "ok": false, "error": e }));
+                    }
+                }
+            }
+            Ok(serde_json::Value::Bool(acc))
+        }
+        crate::schema::ReduceOp::Any => {
+            let mut acc = match init_value {
+                Some(serde_json::Value::Bool(b)) => b,
+                Some(other) => {
+                    return Ok(serde_json::json!({
+                        "ok": false,
+                        "error": format!("{ctx_name}: any `init` must be a boolean, got {other}"),
+                    }));
+                }
+                None => false,
+            };
+            for (i, item) in list.iter().enumerate() {
+                let v = operand(item, i);
+                match v {
+                    Ok(v) => acc = acc || is_truthy(&v),
+                    Err(e) => {
+                        return Ok(serde_json::json!({ "ok": false, "error": e }));
+                    }
+                }
+            }
+            Ok(serde_json::Value::Bool(acc))
+        }
+        crate::schema::ReduceOp::Count => {
+            let mut acc = match init_value {
+                Some(serde_json::Value::Number(n)) => match n.as_i64() {
+                    Some(i) => i,
+                    None => {
+                        return Ok(serde_json::json!({
+                            "ok": false,
+                            "error": format!("{ctx_name}: count `init` must be an integer"),
+                        }));
+                    }
+                },
+                Some(other) => {
+                    return Ok(serde_json::json!({
+                        "ok": false,
+                        "error": format!("{ctx_name}: count `init` must be a number, got {other}"),
+                    }));
+                }
+                None => 0,
+            };
+            for (i, item) in list.iter().enumerate() {
+                let v = operand(item, i);
+                match v {
+                    Ok(v) => {
+                        if is_truthy(&v) {
+                            acc += 1;
+                        }
+                    }
+                    Err(e) => {
+                        return Ok(serde_json::json!({ "ok": false, "error": e }));
+                    }
+                }
+            }
+            Ok(serde_json::json!(acc))
+        }
+        crate::schema::ReduceOp::Sum => {
+            // Integer path when every operand and init are i64; otherwise
+            // f64. Integers stay integers in the output.
+            let mut acc_i: Option<i64> = match init_value {
+                Some(serde_json::Value::Number(n)) => {
+                    if let Some(i) = n.as_i64() {
+                        Some(i)
+                    } else if n.as_f64().is_some() {
+                        None
+                    } else {
+                        return Ok(serde_json::json!({
+                            "ok": false,
+                            "error": format!("{ctx_name}: sum `init` must be a number"),
+                        }));
+                    }
+                }
+                Some(other) => {
+                    return Ok(serde_json::json!({
+                        "ok": false,
+                        "error": format!("{ctx_name}: sum `init` must be a number, got {other}"),
+                    }));
+                }
+                None => Some(0),
+            };
+            let mut acc_f = acc_i.map(|i| i as f64).unwrap_or(0.0);
+            let mut floating = acc_i.is_none();
+            for (i, item) in list.iter().enumerate() {
+                let v = operand(item, i);
+                let v = match v {
+                    Ok(v) => v,
+                    Err(e) => {
+                        return Ok(serde_json::json!({ "ok": false, "error": e }));
+                    }
+                };
+                match v {
+                    serde_json::Value::Number(n) => {
+                        if let (Some(a), Some(b)) = (acc_i, n.as_i64()) {
+                            acc_i = a.checked_add(b);
+                            if acc_i.is_none() {
+                                return Ok(serde_json::json!({
+                                    "ok": false,
+                                    "error": format!("{ctx_name}: sum overflow at item {i}"),
+                                }));
+                            }
+                            acc_f = acc_i.unwrap_or(0) as f64;
+                        } else if let Some(f) = n.as_f64() {
+                            floating = true;
+                            acc_i = None;
+                            acc_f += f;
+                        } else {
+                            return Ok(serde_json::json!({
+                                "ok": false,
+                                "error": format!("{ctx_name}: sum operand at item {i} is not a number"),
+                            }));
+                        }
+                    }
+                    other => {
+                        return Ok(serde_json::json!({
+                            "ok": false,
+                            "error": format!("{ctx_name}: sum operand at item {i} must be a number, got {other}"),
+                        }));
+                    }
+                }
+            }
+            if floating {
+                Ok(serde_json::json!(acc_f))
+            } else {
+                Ok(serde_json::json!(acc_i.unwrap_or(0)))
+            }
+        }
+        crate::schema::ReduceOp::Join => {
+            let Some(tpl) = template else {
+                return Ok(serde_json::json!({
+                    "ok": false,
+                    "error": format!("{ctx_name}: join requires a `template`"),
+                }));
+            };
+            let mut acc = match init_value {
+                Some(serde_json::Value::String(s)) => s,
+                Some(other) => {
+                    return Ok(serde_json::json!({
+                        "ok": false,
+                        "error": format!("{ctx_name}: join `init` must be a string, got {other}"),
+                    }));
+                }
+                None => String::new(),
+            };
+            let sep = separator.as_deref().unwrap_or("");
+            let mut first = acc.is_empty();
+            for (i, item) in list.iter().enumerate() {
+                // Each item renders with itself as `{{item}}` (same deferred
+                // context as foreach); missing refs fail naming item index.
+                let mut iter_trigger = match trigger.as_object() {
+                    Some(obj) => serde_json::Value::Object(obj.clone()),
+                    None => serde_json::Value::Object(serde_json::Map::new()),
+                };
+                iter_trigger["item"] = item.clone();
+                iter_trigger["index"] = serde_json::json!(i);
+                match render_text(tpl, &iter_trigger, step_outputs) {
+                    Ok(rendered) => {
+                        if !first {
+                            acc.push_str(sep);
+                        }
+                        first = false;
+                        acc.push_str(&rendered);
+                        if acc.len() > MAX_JOIN_LEN {
+                            return Ok(serde_json::json!({
+                                "ok": false,
+                                "error": format!("{ctx_name}: join output over the {MAX_JOIN_LEN} bound at item {i}"),
+                            }));
+                        }
+                    }
+                    Err(token) => {
+                        return Ok(serde_json::json!({
+                            "ok": false,
+                            "error": format!("{ctx_name}: join template ref {{{{{token}}}}} does not resolve on item {i}"),
+                        }));
+                    }
+                }
+            }
+            Ok(serde_json::Value::String(acc))
+        }
+    }
+}
+
+/// JSON truthiness for reduce folds: `Null`/`false`/`0`/`""`/`[]`/`{}`
+/// are falsy; everything else is truthy.
+pub(crate) fn is_truthy(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Null => false,
+        serde_json::Value::Bool(b) => *b,
+        serde_json::Value::Number(n) => n.as_f64().is_some_and(|f| f != 0.0),
+        serde_json::Value::String(s) => !s.is_empty(),
+        serde_json::Value::Array(a) => !a.is_empty(),
+        serde_json::Value::Object(o) => !o.is_empty(),
+    }
 }
 
 /// Run a `call_workflow` action: invoke another workflow as a sub-run
@@ -1541,6 +1843,7 @@ pub async fn run_graph_node(
         input.action,
         Action::Parallel { .. }
             | Action::Foreach { .. }
+            | Action::Reduce { .. }
             | Action::Branch { .. }
             | Action::Retry { .. }
             | Action::CallWorkflow { .. }
