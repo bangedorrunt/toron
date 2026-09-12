@@ -201,14 +201,23 @@ pub fn mailbox_runner(
                             job_signer.as_ref(),
                             &coalesced,
                         );
-                        Ok(serde_json::json!({
-                            "ok": true,
-                            "coalesced": false,
-                            "published": published.is_some(),
-                            "error": if published.is_some() { serde_json::Value::Null } else {
-                                serde_json::json!("no job signer configured")
-                            },
-                        }))
+                        // bd-cnr5: an unpublished flush is a dropped effect —
+                        // report ok:false loud, never ok:true with
+                        // published:false.
+                        match published {
+                            Some(_) => Ok(serde_json::json!({
+                                "ok": true,
+                                "coalesced": false,
+                                "published": true,
+                                "error": serde_json::Value::Null,
+                            })),
+                            None => Ok(serde_json::json!({
+                                "ok": false,
+                                "coalesced": false,
+                                "published": false,
+                                "error": "no job signer configured",
+                            })),
+                        }
                     }
                     CoalesceDecision::Buffered { .. } => Ok(serde_json::json!({
                         "ok": true,
@@ -335,13 +344,21 @@ impl WorkflowHost {
             None => WorkflowEngine::local(runner).context("workflow engine")?,
         };
         let bus = mailbox.bus().clone();
+        // bd-cnr5: production touches the durable journal — when the
+        // mailbox carries the index pool, run states + terminal dedupe
+        // persist in workflow_runs / workflow_terminal_events instead of
+        // dying with the host process.
+        let pending = match mailbox.index_pool() {
+            Some(pool) => PendingDrain::new().with_store(WorkflowEffectStore::new(pool.clone())),
+            None => PendingDrain::new(),
+        };
         Ok(Self {
             engine: Arc::new(engine),
             bus,
             workflows,
             coalescer,
             job_signer,
-            pending: Arc::new(tokio::sync::Mutex::new(PendingDrain::new())),
+            pending: Arc::new(tokio::sync::Mutex::new(pending)),
         })
     }
 
@@ -385,6 +402,15 @@ impl WorkflowHost {
     pub fn with_job_signer(mut self, keys: Option<Keys>) -> Self {
         self.job_signer = keys;
         self
+    }
+
+    /// Attach the durable effect journal (bd-cnr5): run states + terminal
+    /// dedupe persist in `workflow_runs` / `workflow_terminal_events`.
+    /// Production (`new`) attaches automatically when the mailbox carries
+    /// the index pool; tests attach explicitly. Blocking on the pending
+    /// mutex is brief (one pointer swap under the lock).
+    pub async fn with_effect_store(&self, store: WorkflowEffectStore) {
+        self.pending.lock().await.set_store(store);
     }
 
     /// The engine (for tests / embedding observability).
@@ -496,6 +522,13 @@ impl WorkflowHost {
         node: &str,
         evidence: &str,
     ) -> Result<TerminalNote> {
+        // bd-cnr5: parse the status LOUD before any side effect —
+        // unrecognized strings never silently become Failed.
+        let terminal_state = RunState::parse_status(status)
+            .map_err(|e| anyhow::anyhow!("refusing terminal with {e}"))?;
+        if !terminal_state.is_terminal() {
+            anyhow::bail!("refusing non-terminal status {status:?} as a semantic terminal");
+        }
         let digest = terminal_digest(run_id, workflow_digest, status, node, evidence);
         let record = TerminalRecord {
             run_id: run_id.to_string(),
@@ -503,7 +536,19 @@ impl WorkflowHost {
             status: status.to_string(),
             node: node.to_string(),
         };
-        let note = self.pending.lock().await.note_terminal(record);
+        // bd-cnr5: durable dedupe is authoritative when a store is
+        // attached; memory mirrors it. Duplicate short-circuits before
+        // any bus write.
+        let has_store = self.pending.lock().await.store().is_some();
+        let note = if has_store {
+            self.pending
+                .lock()
+                .await
+                .note_terminal_durable(record)
+                .await?
+        } else {
+            self.pending.lock().await.note_terminal(record)
+        };
         if matches!(note, TerminalNote::Duplicate) {
             return Ok(note);
         }
@@ -523,17 +568,25 @@ impl WorkflowHost {
             .publish(event)
             .await
             .map_err(|e| anyhow::anyhow!("publish 46012: {e}"))?;
-        let terminal_state = match status {
-            "succeeded" => RunState::Succeeded,
-            "blocked" => RunState::Blocked,
-            "cancelled" => RunState::Cancelled,
-            "unknown" => RunState::Unknown,
-            _ => RunState::Failed,
-        };
-        self.pending
-            .lock()
-            .await
-            .set_run_state(run_id, terminal_state);
+        if has_store {
+            // Journal the publication; a crash between bus publish and
+            // this mark retries the same digest (idempotent, never a
+            // second semantic terminal).
+            if let Some(store) = self.pending.lock().await.store().cloned() {
+                let _ = store.mark_terminal_published(&digest).await;
+            }
+            let _ = self
+                .pending
+                .lock()
+                .await
+                .set_run_state_durable(run_id, terminal_state)
+                .await;
+        } else {
+            self.pending
+                .lock()
+                .await
+                .set_run_state(run_id, terminal_state);
+        }
         Ok(note)
     }
 
@@ -594,10 +647,15 @@ impl WorkflowHost {
                 anyhow::bail!("spawn verdict on an approval park: {}", entry.promise_id)
             }
         }
-        self.pending
+        if let Err(e) = self
+            .pending
             .lock()
             .await
-            .set_run_state(&entry.run_id, RunState::Running);
+            .set_run_state_durable(&entry.run_id, RunState::Running)
+            .await
+        {
+            warn!(run_id = %entry.run_id, "durable run state failed: {e:#}");
+        }
         Ok(entry)
     }
 
@@ -645,26 +703,42 @@ impl WorkflowHost {
     /// re-draining until the run is terminal, so parks created after the
     /// first await point are picked up without waiting for bus traffic.
     async fn spawn_run_and_drain(&self, run_id: String, workflow: Workflow, input: RunInput) {
-        self.pending
+        // bd-cnr5: durable track — the workflow_runs row outlives the host.
+        if let Err(e) = self
+            .pending
             .lock()
             .await
-            .track_run(&run_id, workflow.clone());
+            .track_run_durable(&run_id, workflow.clone())
+            .await
+        {
+            warn!(run_id = %run_id, "durable run track failed (memory still tracked): {e:#}");
+        }
         let me = self.clone();
         let rid = run_id.clone();
         tokio::spawn(async move {
             match me.engine.run(&rid, input).await {
                 Ok(_) => {
-                    me.pending
+                    if let Err(e) = me
+                        .pending
                         .lock()
                         .await
-                        .set_run_state(&rid, RunState::Succeeded);
+                        .set_run_state_durable(&rid, RunState::Succeeded)
+                        .await
+                    {
+                        warn!(run_id = %rid, "durable run state failed: {e:#}");
+                    }
                     debug!(run_id = rid, "workflow ran");
                 }
                 Err(e) => {
-                    me.pending
+                    if let Err(e2) = me
+                        .pending
                         .lock()
                         .await
-                        .set_run_state(&rid, RunState::Failed);
+                        .set_run_state_durable(&rid, RunState::Failed)
+                        .await
+                    {
+                        warn!(run_id = %rid, "durable run state failed: {e2:#}");
+                    }
                     warn!(run_id = rid, "workflow failed: {e}");
                 }
             }
@@ -996,6 +1070,7 @@ pub fn park_candidates(workflow: &Workflow, kind: ParkKind) -> Vec<String> {
 pub enum RunState {
     Running,
     Suspended,
+    ReconcilePending,
     Succeeded,
     Failed,
     Blocked,
@@ -1006,7 +1081,72 @@ pub enum RunState {
 impl RunState {
     /// True once the run reached any terminal state.
     pub fn is_terminal(self) -> bool {
-        !matches!(self, Self::Running | Self::Suspended)
+        !matches!(
+            self,
+            Self::Running | Self::Suspended | Self::ReconcilePending
+        )
+    }
+
+    /// Canonical wire string for this state.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Suspended => "suspended",
+            Self::ReconcilePending => "reconcile_pending",
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::Blocked => "blocked",
+            Self::Cancelled => "cancelled",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    /// Exhaustive status-string parse (bd-cnr5): every known run status
+    /// maps explicitly; unrecognized strings and typos error loud instead
+    /// of silently becoming `Failed`.
+    pub fn parse_status(s: &str) -> Result<Self, String> {
+        match s {
+            "running" | "started" => Ok(Self::Running),
+            "suspended" => Ok(Self::Suspended),
+            "reconcile_pending" => Ok(Self::ReconcilePending),
+            "succeeded" => Ok(Self::Succeeded),
+            "failed" => Ok(Self::Failed),
+            "blocked" => Ok(Self::Blocked),
+            "cancelled" => Ok(Self::Cancelled),
+            "unknown" => Ok(Self::Unknown),
+            _ => Err(format!("unknown run status {s:?}")),
+        }
+    }
+
+    /// Map onto the durable journal status.
+    pub fn to_run_status(self) -> toron_core::index::workflow_effects::RunStatus {
+        use toron_core::index::workflow_effects::RunStatus as S;
+        match self {
+            Self::Running => S::Running,
+            Self::Suspended => S::Suspended,
+            Self::ReconcilePending => S::ReconcilePending,
+            Self::Succeeded => S::Succeeded,
+            Self::Failed => S::Failed,
+            Self::Blocked => S::Blocked,
+            Self::Cancelled => S::Cancelled,
+            Self::Unknown => S::Unknown,
+        }
+    }
+
+    /// Map from the durable journal status (`Started` has no host
+    /// counterpart yet — it reads as `Running`).
+    pub fn from_run_status(s: toron_core::index::workflow_effects::RunStatus) -> Self {
+        use toron_core::index::workflow_effects::RunStatus as S;
+        match s {
+            S::Started | S::Running => Self::Running,
+            S::Suspended => Self::Suspended,
+            S::ReconcilePending => Self::ReconcilePending,
+            S::Succeeded => Self::Succeeded,
+            S::Failed => Self::Failed,
+            S::Blocked => Self::Blocked,
+            S::Cancelled => Self::Cancelled,
+            S::Unknown => Self::Unknown,
+        }
     }
 }
 
@@ -1016,6 +1156,11 @@ impl RunState {
 /// single `engine.run` await; re-draining the same live sinks after a
 /// restart reconstructs the identical registry (deterministically
 /// replayable — no durable row required at Wave 1).
+///
+/// bd-cnr5: an optional [`WorkflowEffectStore`] backs the run-state map
+/// and the terminal dedupe through the durable `workflow_runs` /
+/// `workflow_terminal_events` tables (Spec 5.1/I12). Memory stays the
+/// fast path; the store is authoritative across restarts.
 #[derive(Debug, Default)]
 pub struct PendingDrain {
     registry: PendingRegistry,
@@ -1025,6 +1170,7 @@ pub struct PendingDrain {
     runs: std::collections::HashMap<String, RunState>,
     run_workflows: std::collections::HashMap<String, Workflow>,
     ignored: Vec<(Resolution, ResolutionMismatch)>,
+    store: Option<WorkflowEffectStore>,
 }
 
 impl PendingDrain {
@@ -1033,10 +1179,59 @@ impl PendingDrain {
         Self::default()
     }
 
+    /// Attach the durable journal (bd-cnr5). Memory stays the fast path;
+    /// the store is authoritative across restarts.
+    pub fn with_store(mut self, store: WorkflowEffectStore) -> Self {
+        self.store = Some(store);
+        self
+    }
+
+    /// Attach the durable journal in place.
+    pub fn set_store(&mut self, store: WorkflowEffectStore) {
+        self.store = Some(store);
+    }
+
+    /// The attached durable journal, if any.
+    pub fn store(&self) -> Option<&WorkflowEffectStore> {
+        self.store.as_ref()
+    }
+
     /// Track a run's workflow for later re-drains (called when the run starts).
     pub fn track_run(&mut self, run_id: &str, workflow: Workflow) {
         self.run_workflows.insert(run_id.to_string(), workflow);
         self.runs.insert(run_id.to_string(), RunState::Running);
+    }
+
+    /// Track a run durably (bd-cnr5): memory plus an idempotent
+    /// `workflow_runs` row, transitioned to `Running`.
+    pub async fn track_run_durable(
+        &mut self,
+        run_id: &str,
+        workflow: Workflow,
+    ) -> anyhow::Result<()> {
+        let workflow_name = workflow.name.clone();
+        self.track_run(run_id, workflow);
+        if let Some(store) = self.store.clone() {
+            let created = store
+                .create_run(NewRun {
+                    run_id: run_id.to_string(),
+                    project: None,
+                    workflow: workflow_name,
+                    workflow_digest: String::new(),
+                })
+                .await?;
+            if created {
+                // Fresh rows start as `started`; advance to the tracked state.
+                let _ = store
+                    .cas_run_status(
+                        run_id,
+                        toron_core::index::workflow_effects::RunStatus::Started,
+                        toron_core::index::workflow_effects::RunStatus::Running,
+                    )
+                    .await?;
+            }
+        }
+        Ok(())
     }
 
     /// Current tracked state (`Running` when never observed).
@@ -1044,9 +1239,98 @@ impl PendingDrain {
         self.runs.get(run_id).copied().unwrap_or(RunState::Running)
     }
 
+    /// Current tracked state with durable fallback (bd-cnr5): memory
+    /// first, then the `workflow_runs` row (restart recovery).
+    pub async fn run_state_durable(&self, run_id: &str) -> RunState {
+        if let Some(state) = self.runs.get(run_id).copied() {
+            // Memory wins only when it actually observed the run; a fresh
+            // drain after restart has no entry and must read the journal.
+            // `Running` is also the never-observed default, so fall through
+            // to the store when memory holds just the default.
+            if state != RunState::Running || self.store.is_none() {
+                return state;
+            }
+        }
+        if let Some(store) = self.store.as_ref()
+            && let Ok(Some(row)) = store.get_run(run_id).await
+        {
+            return RunState::from_run_status(row.status);
+        }
+        self.run_state(run_id)
+    }
+
     /// Set the tracked state.
     pub fn set_run_state(&mut self, run_id: &str, state: RunState) {
         self.runs.insert(run_id.to_string(), state);
+    }
+
+    /// Set the tracked state durably (bd-cnr5): memory plus a
+    /// compare-and-swap on the `workflow_runs` row. Terminal rows never
+    /// move; a refused CAS leaves the journal untouched (memory still
+    /// updates — the journal is authoritative, never corrupted).
+    pub async fn set_run_state_durable(
+        &mut self,
+        run_id: &str,
+        state: RunState,
+    ) -> anyhow::Result<()> {
+        self.set_run_state(run_id, state);
+        if let Some(store) = self.store.clone() {
+            let target = state.to_run_status();
+            let current = match store.get_run(run_id).await? {
+                Some(row) => row.status,
+                None => {
+                    store
+                        .create_run(NewRun {
+                            run_id: run_id.to_string(),
+                            project: None,
+                            workflow: self
+                                .run_workflows
+                                .get(run_id)
+                                .map(|w| w.name.clone())
+                                .unwrap_or_else(|| "unknown".to_string()),
+                            workflow_digest: String::new(),
+                        })
+                        .await?;
+                    toron_core::index::workflow_effects::RunStatus::Started
+                }
+            };
+            if current != target {
+                let _ = store.cas_run_status(run_id, current, target).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Record a terminal publication durably (bd-cnr5): the journal's
+    /// `note_terminal_pub` is authoritative (same digest → Duplicate,
+    /// rival digest → Conflict); memory mirrors the outcome for the fast
+    /// path. Returns the durable outcome when a store is attached.
+    pub async fn note_terminal_durable(
+        &mut self,
+        record: TerminalRecord,
+    ) -> anyhow::Result<TerminalNote> {
+        let Some(store) = self.store.clone() else {
+            return Ok(self.ledger.note(record));
+        };
+        use toron_core::index::workflow_effects::{TerminalOutcome, TerminalPub};
+        let outcome = store
+            .note_terminal_pub(TerminalPub {
+                terminal_digest: record.digest.clone(),
+                run_id: record.run_id.clone(),
+                status: record.status.clone(),
+                node_path: Some(record.node.clone()),
+                evidence: None,
+            })
+            .await?;
+        // Mirror into memory so the fast path converges.
+        let _ = self.ledger.note(record);
+        Ok(match outcome {
+            TerminalOutcome::New => TerminalNote::New,
+            TerminalOutcome::Duplicate => TerminalNote::Duplicate,
+            TerminalOutcome::Conflict { existing_digest } => {
+                TerminalNote::Conflict { existing_digest }
+            }
+        })
     }
 
     /// Drain one run's new sink ids of the context kind into structured
@@ -1182,7 +1466,8 @@ impl PendingDrain {
 // ---------------------------------------------------------------------------
 
 use toron_core::index::workflow_effects::{
-    ClaimAttempt, EffectState, NewAttempt, NewEffect, WorkflowEffect, WorkflowEffectStore, now_us,
+    ClaimAttempt, EffectState, NewAttempt, NewEffect, NewRun, WorkflowEffect, WorkflowEffectStore,
+    now_us,
 };
 
 /// One effect dispatch request: identity inputs plus the provider's
@@ -3709,5 +3994,148 @@ steps:
                 "{name} must fail: {out}"
             );
         }
+    }
+
+    /// bd-cnr5 RED: durable run ledger — run state survives a host restart
+    /// via the workflow_runs table (in-memory HashMap alone loses it).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_ledger_durable_run_state_survives_restart() {
+        use toron_core::index::schema;
+        use toron_core::index::workflow_effects::WorkflowEffectStore;
+        let db = std::env::temp_dir().join(format!("wf-runledger-{}.sqlite", uuid::Uuid::new_v4()));
+        let pool = schema::connect(db.to_str().unwrap())
+            .await
+            .expect("connect");
+        schema::migrate(&pool).await.expect("migrate");
+        let store = WorkflowEffectStore::new(pool);
+        let wf = toron_workflow::schema::parse_workflow(
+            "name: ship\ntrigger:\n  type: webhook\nsteps:\n  - name: gate\n    action: request_approval\n    message: q\n",
+        )
+        .expect("parse");
+        let mut first = PendingDrain::new().with_store(store.clone());
+        first
+            .track_run_durable("run-restart-1", wf.clone())
+            .await
+            .expect("track durable");
+        first
+            .set_run_state_durable("run-restart-1", RunState::Suspended)
+            .await
+            .expect("set durable");
+        drop(first);
+        // Restart: brand-new drain over the SAME store recovers the state.
+        let second = PendingDrain::new().with_store(store);
+        assert_eq!(
+            second.run_state_durable("run-restart-1").await,
+            RunState::Suspended,
+            "run state survives restart via workflow_runs"
+        );
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// bd-cnr5 RED: durable terminal dedupe — a same-digest republish after
+    /// restart is still a Duplicate (in-memory ledger alone forgets it).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_ledger_terminal_dedupe_survives_restart() {
+        use toron_core::index::schema;
+        use toron_core::index::workflow_effects::WorkflowEffectStore;
+        let db =
+            std::env::temp_dir().join(format!("wf-termdedupe-{}.sqlite", uuid::Uuid::new_v4()));
+        let pool = schema::connect(db.to_str().unwrap())
+            .await
+            .expect("connect");
+        schema::migrate(&pool).await.expect("migrate");
+        let store = WorkflowEffectStore::new(pool);
+        let digest =
+            toron_workflow::engine::terminal_digest("run-t-1", "d", "succeeded", "gate", "ev");
+        let rec = toron_workflow::engine::TerminalRecord {
+            run_id: "run-t-1".into(),
+            digest: digest.clone(),
+            status: "succeeded".into(),
+            node: "gate".into(),
+        };
+        let mut first = PendingDrain::new().with_store(store.clone());
+        assert!(matches!(
+            first
+                .note_terminal_durable(rec.clone())
+                .await
+                .expect("note"),
+            toron_workflow::engine::TerminalNote::New
+        ));
+        drop(first);
+        let mut second = PendingDrain::new().with_store(store);
+        assert!(matches!(
+            second.note_terminal_durable(rec).await.expect("renote"),
+            toron_workflow::engine::TerminalNote::Duplicate
+        ));
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// bd-cnr5 RED: status-string parse is exhaustive — unrecognized and
+    /// future statuses never silently become Failed.
+    #[test]
+    fn run_ledger_status_parse_rejects_unknown() {
+        assert_eq!(
+            RunState::parse_status("succeeded").unwrap(),
+            RunState::Succeeded
+        );
+        assert_eq!(RunState::parse_status("failed").unwrap(), RunState::Failed);
+        assert!(
+            RunState::parse_status("suspended").is_ok(),
+            "suspended is known"
+        );
+        assert!(
+            RunState::parse_status("no-such-status-xyz").is_err(),
+            "unknown status must error loud, never map to Failed"
+        );
+        assert!(
+            RunState::parse_status("typo-failed").is_err(),
+            "typos must error loud"
+        );
+    }
+
+    /// bd-cnr5 RED: FlushNow with no signer publishes nothing — the result
+    /// must report ok:false, never ok:true with published:false.
+    #[test]
+    fn run_ledger_flushnow_unpublished_is_failure() {
+        use toron_core::bus::in_process::{InProcessBus, InProcessBusConfig};
+        use toron_core::index::schema;
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        rt.block_on(async {
+            let db =
+                std::env::temp_dir().join(format!("wf-flushok-{}.sqlite", uuid::Uuid::new_v4()));
+            let pool = schema::connect(db.to_str().unwrap())
+                .await
+                .expect("connect");
+            schema::migrate(&pool).await.expect("migrate");
+            let bus: Arc<dyn Bus> = Arc::new(
+                InProcessBus::open(pool, InProcessBusConfig::default())
+                    .await
+                    .expect("bus"),
+            );
+            let mailbox = Arc::new(Mailbox::new(
+                bus,
+                std::env::temp_dir().join(format!("wf-flushok-data-{}", uuid::Uuid::new_v4())),
+                None,
+            ));
+            // Cap-1 coalescer: the FIRST mention flushes NOW with no signer.
+            let coalescer = Arc::new(std::sync::Mutex::new(MentionCoalescer::new(
+                std::time::Duration::from_secs(60),
+                std::time::Duration::from_secs(60),
+                1,
+            )));
+            let runner = mailbox_runner(mailbox, coalescer, None);
+            let out = runner(&Action::DispatchJob {
+                assignee: "oc".into(),
+                spec: crate::workflow_host::test_spec(serde_json::json!({ "t": 1 })),
+                channel: None,
+            })
+            .expect("runner ok");
+            assert_eq!(
+                out["ok"],
+                serde_json::json!(false),
+                "unpublished flush must report ok:false, got {out}"
+            );
+            let _ = std::fs::remove_file(&db);
+        });
     }
 }

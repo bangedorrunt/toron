@@ -112,7 +112,7 @@ pub(crate) fn compute_evidence_hash(
         "ledger_path".to_string(),
         serde_json::Value::String(ledger_path.to_string()),
     );
-    let canonical = serde_json::to_string(&map).unwrap_or_default();
+    let canonical = serde_json::to_string(&map).expect("canonical evidence JSON serializes");
     let mut hasher = Sha256::new();
     hasher.update(canonical.as_bytes());
     hex::encode(hasher.finalize())
