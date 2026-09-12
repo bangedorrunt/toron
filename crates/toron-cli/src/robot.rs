@@ -13,7 +13,7 @@
 use std::path::Path;
 
 use anyhow::Context;
-use serde_json::json;
+use serde_json::{Value, json};
 use toron_core::mailbox::{
     ContactPolicy, FetchInbox, Mailbox, ReleaseAsk, ReleaseDecision, ReleaseResponse,
     RequestContact, RequestRelease, RespondContact, SearchMessages, SendMessage,
@@ -385,6 +385,38 @@ pub async fn run_mail_daemon(dc: &DaemonClient, cmd: &MailCommand) -> anyhow::Re
     }
 }
 
+/// Pane mail-identity stamp shared by both bootstrap arms (bd-6f57 direct,
+/// bd-8xwk daemon): display-only `pane.report_metadata` (pin -> pane).
+/// Best-effort — never fails bootstrap: herdr may be down or the pane flag
+/// absent (detached/CI). Explicit `--pane-id` wins, else `$HERDR_PANE_ID`
+/// injected by herdr into managed panes. Returns the stamped pane id.
+fn stamp_bootstrap_pane(
+    pane_flag: Option<String>,
+    pin: &str,
+    project: &str,
+    npub: &str,
+) -> Option<String> {
+    let pane_id = pane_flag
+        .or_else(|| std::env::var("HERDR_PANE_ID").ok())
+        .filter(|p| !p.is_empty())?;
+    if npub.is_empty() {
+        return None;
+    }
+    match toron_core::backend::herdr::HerdrBackend::connect(None) {
+        Ok(backend) => match backend.client().pane_report_metadata(&pane_id, pin, project, npub) {
+            Ok(_) => Some(pane_id),
+            Err(e) => {
+                eprintln!("toron: pane stamp skipped ({e})");
+                None
+            }
+        },
+        Err(e) => {
+            eprintln!("toron: pane stamp skipped ({e})");
+            None
+        }
+    }
+}
+
 /// One-step session bootstrap: idempotent identity upsert, then an optional
 /// reserve in the same call. CLI-only composition over existing mailbox
 /// methods (mirrors macro_start_session minus ensure/inbox); no new MCP tool.
@@ -399,33 +431,12 @@ pub async fn run_agent(mailbox: &Mailbox, cmd: &AgentCommand) -> anyhow::Result<
                 persona: None,
             };
             let agent = mailbox.register_agent(&args.project, &profile).await?;
-            // bd-6f57: best-effort display-only pane stamp (pin -> pane).
-            // Never fails bootstrap: herdr may be down or the pane flag
-            // absent (detached/CI). Explicit --pane-id wins, else
-            // $HERDR_PANE_ID injected by herdr into managed panes.
-            let pane_id = args
-                .pane_id
-                .clone()
-                .or_else(|| std::env::var("HERDR_PANE_ID").ok())
-                .filter(|p| !p.is_empty());
-            let mut stamped: Option<String> = None;
-            if let Some(pid) = pane_id {
-                match toron_core::backend::herdr::HerdrBackend::connect(None) {
-                    Ok(backend) => {
-                        let r = backend.client().pane_report_metadata(
-                            &pid,
-                            &agent.name,
-                            &agent.project_slug,
-                            &agent.npub,
-                        );
-                        match r {
-                            Ok(_) => stamped = Some(pid),
-                            Err(e) => eprintln!("toron: pane stamp skipped ({e})"),
-                        }
-                    }
-                    Err(e) => eprintln!("toron: pane stamp skipped ({e})"),
-                }
-            }
+            let stamped = stamp_bootstrap_pane(
+                args.pane_id.clone(),
+                &agent.name,
+                &agent.project_slug,
+                &agent.npub,
+            );
             let reservation = if args.paths.is_empty() {
                 serde_json::Value::Null
             } else {
@@ -487,11 +498,22 @@ pub async fn run_agent_daemon(dc: &DaemonClient, cmd: &AgentCommand) -> anyhow::
                 )
                 .await?
             };
+            // bd-8xwk: client-side pane stamp — the daemon has no pane
+            // context (and the MCP register_agent schema is frozen), so the
+            // CLI stamps from its own pane env, same best-effort rule as the
+            // direct arm above.
+            let daemon_stamped = stamp_bootstrap_pane(
+                args.pane_id.clone(),
+                &args.agent,
+                &args.project,
+                registration.get("npub").and_then(Value::as_str).unwrap_or_default(),
+            );
             print_json(&json!({
                 "agent": args.agent,
                 "project": args.project,
                 "registration": registration,
                 "reservation": reservation,
+                "pane_id": daemon_stamped,
                 "next": "export AGENT_NAME=<pin> (or pass --as on every call); reserve before edit — the strict guard blocks unattributed or unreserved commits",
             }))
         }
@@ -524,20 +546,42 @@ pub async fn run_ack_sla_daemon(_dc: &DaemonClient, args: &AckSlaArgs) -> anyhow
     run_ack_sla(&mb, args).await
 }
 
+/// bd-zugo / F13: a lease binds the resolved actor, but the ROSTER is what
+/// `whois` and the strict commit guard attribute through. When the acting
+/// name has no durable registration (`agents` row) in the project, the lease
+/// lands on a ghost holder — it can hold, but transfer fails, no
+/// name-routed surface reaches it, and the guard cannot map the commit back
+/// to a pin. Warn loud, name the remedy; NEVER block (a key-file holder is
+/// legal and this is advisory).
+async fn warn_if_unregistered(mailbox: &Mailbox, project: &str, agent: &str) {
+    if mailbox.agent_registered(project, agent).await {
+        return;
+    }
+    eprintln!(
+        "toron reserve: warning — `{agent}` has no registered identity in project `{project}`. \
+         This lease binds a key-file holder the roster cannot resolve, so whois/guard attribution \
+         will fail and a transfer cannot reach it. Register it first: \
+         `toron agent bootstrap --project {project} --as {agent}` (bd-zugo)."
+    );
+}
+
 pub async fn run_reserve(mailbox: &Mailbox, cmd: &ReserveCommand) -> anyhow::Result<()> {
     match cmd {
-        ReserveCommand::Acquire(args) => emit(
-            mailbox
-                .file_reservation_paths(
-                    &args.project,
-                    &args.agent,
-                    &args.paths,
-                    args.ttl_secs,
-                    args.exclusive,
-                    args.reason.as_deref(),
-                )
-                .await?,
-        ),
+        ReserveCommand::Acquire(args) => {
+            warn_if_unregistered(mailbox, &args.project, &args.agent).await;
+            emit(
+                mailbox
+                    .file_reservation_paths(
+                        &args.project,
+                        &args.agent,
+                        &args.paths,
+                        args.ttl_secs,
+                        args.exclusive,
+                        args.reason.as_deref(),
+                    )
+                    .await?,
+            )
+        }
         ReserveCommand::Conflicts(args) => emit(
             mailbox
                 .check_file_reservation_conflicts(&args.project, &args.agent, &args.paths)
@@ -659,6 +703,11 @@ fn parse_release_decision(s: &str) -> anyhow::Result<ReleaseDecision> {
 pub async fn run_reserve_daemon(dc: &DaemonClient, cmd: &ReserveCommand) -> anyhow::Result<()> {
     match cmd {
         ReserveCommand::Acquire(args) => {
+            // bd-zugo: same ghost-holder warning on the daemon arm — the
+            // shared durable root is readable from here (`demo_mailbox`).
+            if let Ok(mb) = toron_mcp::demo_mailbox().await {
+                warn_if_unregistered(&mb, &args.project, &args.agent).await;
+            }
             daemon_tool(
                 dc,
                 "file_reservation_paths",
@@ -1651,7 +1700,7 @@ mod captain_open_mode_tests {
 #[cfg(test)]
 mod daemon_roster_revocation_tests {
     use super::*;
-    use serde_json::json;
+use serde_json::{Value, json};
 
     const HOLDER: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const OPERATOR: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
