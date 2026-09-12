@@ -71,6 +71,12 @@ Child maps: [toron-core](crates/toron-core/AGENTS.md) ·
 - Flywheel Tick Law (live): doorbell dispatcher and `swarm_loop` call `workspace::tick`; slice reducers stay private. Kind-9 is the ring; assignment enters from rumor 14 / FetchInbox→InboxRows.
 - ADR-0028 E3 corr authority (accepted 2026-09-03): sender mints non-empty `corr` (`SendTags::parse` rejects empty; `Corr` vs `ThreadId` newtypes, `thread_id` is never `corr` — conflation fails loud in `send_message`); toron sqlite owns `owed→acked→resulted` (monotonic upsert: never downgrades `resulted`, never drags `acked` to `owed`; `owed` on send, `owed→acked` in `send_receipt` idempotent, `resulted` only via explicit `receipt set`).
 - `MessageId` is String/hex. Never `u64` in shared request/response types.
+- Pane mail-identity stamp (bd-6f57/bd-0sbf): `agent bootstrap` writes the pin
+  onto the pane via display-only `pane.report_metadata` (`toron:mail-identity`
+  source, `toron_pin`/`toron_project`/`toron_npub` tokens) — never
+  `pane.report_agent` (that steals lifecycle authority). Resolve/cleanup read
+  tokens first, `agent.list` names second; liveness always from live
+  `pane.list`, never cached.
 - `t` tag = project slug only. Never harness/model/job tags.
 - TDD for new features and bug fixes. No benches in this repo.
 - Beads: bare `br` is the TUI (ratatui, since 2026-08-24) — humans run `br`, agents run `br --robot-*` with `--format json|toon` (never bare `br` in automation); `bv` is deprecated.
