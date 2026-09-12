@@ -20,7 +20,7 @@ use std::path::PathBuf;
 
 use crate::nostr::{Keys, Timestamp};
 
-use crate::backend::herdr::HerdrBackend;
+use crate::backend::herdr::{AgentInfo, HerdrBackend, PaneInfo};
 use crate::bus::filter::kind_project_filter;
 use crate::nostr::identity::{self as ident, AgentProfile, IdentityResult};
 use crate::nostr::kinds::{AGENT_PROFILE, toron_kind};
@@ -1105,6 +1105,11 @@ impl Mailbox {
 
     /// `resolve_pane_identity`: herdr pane_id → agent name (G9). `None` when
     /// the pane has no agent mapping.
+    ///
+    /// bd-0sbf: token-first — a `toron:mail-identity` pane stamp
+    /// (`toron_pin` token, written by `agent bootstrap`) wins over the
+    /// `agent.list` name match, so a reused pane id never resolves to the
+    /// previous occupant's pin.
     pub fn resolve_pane_identity(
         &self,
         backend: &HerdrBackend,
@@ -1112,10 +1117,15 @@ impl Mailbox {
     ) -> anyhow::Result<Option<String>> {
         let mut client = backend.client();
         let agents = client.agent_list()?;
-        Ok(agents
-            .into_iter()
-            .find(|a| a.pane_id == pane_id)
-            .and_then(|a| a.name))
+        let panes: Vec<PaneInfo> = client
+            .workspace_list()
+            .map(|wss| {
+                wss.into_iter()
+                    .flat_map(|ws| client.pane_list(Some(&ws.workspace_id)).unwrap_or_default())
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(resolve_pin_for_pane(&panes, &agents, pane_id))
     }
 
     /// `cleanup_pane_identities`: prune identities whose panes are absent from
@@ -1129,23 +1139,54 @@ impl Mailbox {
     pub fn cleanup_pane_identities(&self, backend: &HerdrBackend) -> anyhow::Result<Vec<String>> {
         let mut client = backend.client();
         let agents = client.agent_list()?;
-        let live_panes: Vec<String> = client
+        let panes: Vec<PaneInfo> = client
             .workspace_list()?
             .into_iter()
-            .flat_map(|ws| {
-                client
-                    .pane_list(Some(&ws.workspace_id))
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|p| p.pane_id)
-            })
+            .flat_map(|ws| client.pane_list(Some(&ws.workspace_id)).unwrap_or_default())
             .collect();
+        // bd-0sbf: a pin stamped on a live pane is live even when the
+        // `agent.list` occupant name has rolled over to someone else.
+        let live_pins: Vec<&str> = panes.iter().filter_map(pane_token_pin).collect();
+        let live_panes: Vec<&str> = panes.iter().map(|p| p.pane_id.as_str()).collect();
         Ok(agents
             .into_iter()
-            .filter(|a| a.name.is_some() && !live_panes.contains(&a.pane_id))
-            .filter_map(|a| a.name)
+            .filter_map(|a| {
+                let name = a.name?;
+                let alive =
+                    live_panes.contains(&a.pane_id.as_str()) || live_pins.contains(&name.as_str());
+                (!alive).then_some(name)
+            })
             .collect())
     }
+}
+
+/// bd-0sbf: read the mail-identity stamp off a pane (pure — testable).
+/// Returns the stamped pin when the `toron_pin` token is present.
+pub fn pane_token_pin(pane: &PaneInfo) -> Option<&str> {
+    pane.tokens
+        .get(crate::backend::herdr::TOKEN_PIN)
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+}
+
+/// bd-0sbf: pure resolve core — token-first, `agent.list` name fallback
+/// (functional core; the method above is the imperative shell).
+pub fn resolve_pin_for_pane(
+    panes: &[PaneInfo],
+    agents: &[AgentInfo],
+    pane_id: &str,
+) -> Option<String> {
+    if let Some(pin) = panes
+        .iter()
+        .find(|p| p.pane_id == pane_id)
+        .and_then(pane_token_pin)
+    {
+        return Some(pin.to_string());
+    }
+    agents
+        .iter()
+        .find(|a| a.pane_id == pane_id)
+        .and_then(|a| a.name.clone())
 }
 
 /// bd-captain-alias-0g8a: shared UPSERT for the `captain` fold. Plain state
@@ -1365,8 +1406,72 @@ mod tests {
         (mailbox, pool, db_path, data_dir)
     }
 
-    // --- bd-legacy-slug-inbox-onoj: folded slugs must not keep a second inbox ---
+    fn test_pane(pane_id: &str, pin_token: Option<&str>) -> PaneInfo {
+        let mut tokens = serde_json::Map::new();
+        if let Some(pin) = pin_token {
+            tokens.insert(
+                crate::backend::herdr::TOKEN_PIN.into(),
+                serde_json::Value::String(pin.into()),
+            );
+        }
+        serde_json::from_value(serde_json::json!({
+            "pane_id": pane_id,
+            "terminal_id": "term_test",
+            "workspace_id": "w1",
+            "tab_id": "w1:t1",
+            "focused": false,
+            "agent_status": "working",
+            "revision": 1,
+            "tokens": tokens,
+        }))
+        .expect("test pane parses")
+    }
 
+    fn test_agent(pane_id: &str, name: Option<&str>) -> AgentInfo {
+        serde_json::from_value(serde_json::json!({
+            "agent_status": "working",
+            "focused": false,
+            "name": name,
+            "pane_id": pane_id,
+            "revision": 1,
+            "tab_id": "w1:t1",
+            "terminal_id": "term_test",
+            "workspace_id": "w1",
+        }))
+        .expect("test agent parses")
+    }
+
+    /// bd-0sbf: the stamp wins — a reused pane id resolves to the stamped
+    /// pin, never the previous occupant's `agent.list` name; unstamped
+    /// panes keep the legacy name fallback; unknown panes resolve None.
+    #[test]
+    fn token_first_resolve() {
+        let panes = vec![
+            test_pane("w1:p1", Some("DustySparrow")),
+            test_pane("w1:p2", None),
+        ];
+        let agents = vec![
+            test_agent("w1:p1", Some("OldOccupant")),
+            test_agent("w1:p2", Some("PlainAgent")),
+        ];
+        assert_eq!(
+            resolve_pin_for_pane(&panes, &agents, "w1:p1"),
+            Some("DustySparrow".to_string()),
+            "stamp beats the stale occupant name"
+        );
+        assert_eq!(
+            resolve_pin_for_pane(&panes, &agents, "w1:p2"),
+            Some("PlainAgent".to_string()),
+            "unstamped panes keep the name fallback"
+        );
+        assert_eq!(resolve_pin_for_pane(&panes, &agents, "w1:p9"), None);
+        // A stamped pin keeps its pane live for cleanup even when the
+        // occupant name rolled over.
+        assert_eq!(pane_token_pin(&panes[0]), Some("DustySparrow"));
+        assert_eq!(pane_token_pin(&panes[1]), None);
+    }
+
+    // --- bd-legacy-slug-inbox-onoj: folded slugs must not keep a second inbox ---
     /// The defect scenario: a slug registered STANDALONE pre-fold keeps its
     /// own agents row beside the pin; mail sealed to the orphan npub is
     /// unreadable forever and lingers as unread. Recording the fold must
