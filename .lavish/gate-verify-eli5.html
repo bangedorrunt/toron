@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Gates and Verification, Explained Like You're 5</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; }
+  :root {
+    --void: #08080e; --fg: #c8d0e8; --cyan: #0db9d7; --lav: #bb9af7;
+    --mint: #73daca; --amber: #e0af68; --red: #f7768e; --ice: #89ddff;
+  }
+  body {
+    margin: 0; background: var(--void); color: var(--fg);
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    line-height: 1.5;
+  }
+  header { text-align: center; padding: 48px 20px 8px; }
+  header h1 { font-size: clamp(28px, 5vw, 54px); margin: 0 0 8px; color: #fff; }
+  header p { font-size: clamp(16px, 2.4vw, 22px); color: var(--ice); margin: 0; }
+  main { max-width: 860px; margin: 0 auto; padding: 24px 20px 64px; }
+  section.card {
+    background: #101024; border: 2px solid #2a2a4e; border-radius: 20px;
+    padding: 28px; margin: 28px 0;
+  }
+  section.card h2 { margin: 0 0 4px; font-size: clamp(22px, 3.4vw, 32px); color: #fff; }
+  section.card .kid { font-size: clamp(17px, 2.4vw, 21px); margin: 8px 0 16px; }
+  section.card .grown { font-size: 14px; color: #8b93b0; border-top: 1px dashed #2a2a4e; padding-top: 12px; margin-top: 16px; }
+  section.card .grown code { color: var(--mint); font-size: 13px; }
+  figure { margin: 0; text-align: center; }
+  .big { font-size: clamp(64px, 12vw, 120px); line-height: 1.1; }
+  svg.flow { width: 100%; height: auto; display: block; }
+  svg text { font-family: system-ui, sans-serif; }
+  .c-mint { color: var(--mint); } .c-amber { color: var(--amber); }
+  .c-red { color: var(--red); } .c-cyan { color: var(--cyan); } .c-lav { color: var(--lav); }
+  footer { text-align: center; color: #8b93b0; padding: 0 20px 48px; font-size: 14px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>🔐 Gates &amp; Verification</h1>
+  <p>How our robots prove their homework is really done. No big words inside.</p>
+</header>
+<main>
+
+  <section class="card" id="chore-card">
+    <h2>1. Every job comes with a chore card 📋</h2>
+    <figure><div class="big">📋✅</div></figure>
+    <p class="kid">Every job card has a <strong class="c-mint">magic line</strong> at the bottom. It says exactly how to check the work. No magic line, no job.</p>
+    <p class="grown">Grown-up words: every bead carries a <code>VERIFY</code> fence, one loop-runnable command. A bead without it is not implementation-ready. <code>br ready</code> only lists beads that have one.</p>
+  </section>
+
+  <section class="card" id="stamp">
+    <h2>2. Finished? Get a stamp 🔏</h2>
+    <figure><div class="big">🔏➡️🚪</div></figure>
+    <p class="kid">Done is not done until a <strong class="c-amber">stamp</strong> says PASS. Then the locked door opens, but only if you also show the <strong class="c-cyan">photo of your work</strong> (the commit).</p>
+    <p class="grown">Grown-up words: <code>br gate report --status pass</code> records the verdict row. <code>br close --commit-sha</code> needs that PASS row plus a commit whose message cites the bead. No stamp plus photo, no close. Ever.</p>
+  </section>
+
+  <section class="card" id="bouncer">
+    <h2>3. The bouncer at the save button 🦍</h2>
+    <figure>
+      <svg class="flow" viewBox="0 0 600 190" role="img" aria-label="Bouncer checks three things">
+        <title>Three checks at commit time</title>
+        <circle cx="90" cy="70" r="34" fill="#bb9af7"/>
+        <text x="90" y="82" text-anchor="middle" font-size="34">🦍</text>
+        <text x="90" y="130" text-anchor="middle" font-size="15" fill="#c8d0e8">bouncer</text>
+        <g font-size="16" fill="#c8d0e8">
+          <rect x="180" y="18" width="390" height="44" rx="12" fill="#101024" stroke="#73daca" stroke-width="2"/>
+          <text x="200" y="46">🏷️ name tag on? (who are you)</text>
+          <rect x="180" y="72" width="390" height="44" rx="12" fill="#101024" stroke="#0db9d7" stroke-width="2"/>
+          <text x="200" y="100">🖍️ your crayons reserved? (which files)</text>
+          <rect x="180" y="126" width="390" height="44" rx="12" fill="#101024" stroke="#e0af68" stroke-width="2"/>
+          <text x="200" y="154">🔢 job numbers in the note? (which beads)</text>
+        </g>
+      </svg>
+    </figure>
+    <p class="kid">When a robot saves work, a bouncer checks three things: <strong class="c-mint">name tag on?</strong> <strong class="c-cyan">Did you reserve those crayons?</strong> <strong class="c-amber">Did your note name the jobs?</strong> Miss one, no save.</p>
+    <p class="grown">Grown-up words: the pre-commit guard fails closed on unattributed commits (<code>AGENT_NAME</code>), unreserved paths (toron reservations), and bead tokens in the diff missing from the message. Escape hatches are operator-only.</p>
+  </section>
+
+  <section class="card" id="no-fake">
+    <h2>4. No fake stamps, no skipping the line 🚫</h2>
+    <figure><div class="big">🚫🔏&nbsp;&nbsp;🪑⏳</div></figure>
+    <p class="kid">You cannot stamp <strong class="c-red">homework that has no homework</strong>. A drawing never gets a swimming stamp. And a <strong class="c-amber">suggestion waits in the waiting room</strong> until the captain says yes, it never sneaks out early.</p>
+    <p class="grown">Grown-up words: report beads are refused test gates (a <code>unit-test-verified</code> row on docs is a false witness and fails the close). Propose-for-review beads stay open until review lands; that review is their only honest gate.</p>
+  </section>
+
+  <section class="card" id="journey">
+    <h2>5. The whole trip 🗺️</h2>
+    <figure>
+      <svg class="flow" viewBox="0 0 620 120" role="img" aria-label="The full journey">
+        <title>Claim to done journey</title>
+        <g font-size="14" text-anchor="middle" fill="#c8d0e8">
+          <circle cx="45" cy="45" r="34" fill="#101024" stroke="#0db9d7" stroke-width="2"/>
+          <text x="45" y="40">🙋</text><text x="45" y="102" font-size="12">claim it</text>
+          <circle cx="150" cy="45" r="34" fill="#101024" stroke="#0db9d7" stroke-width="2"/>
+          <text x="150" y="40">🖍️</text><text x="150" y="102" font-size="12">reserve</text>
+          <circle cx="255" cy="45" r="34" fill="#101024" stroke="#0db9d7" stroke-width="2"/>
+          <text x="255" y="40">🔨</text><text x="255" y="102" font-size="12">do work</text>
+          <circle cx="360" cy="45" r="34" fill="#101024" stroke="#73daca" stroke-width="2"/>
+          <text x="360" y="40">🧪</text><text x="360" y="102" font-size="12">run check</text>
+          <circle cx="465" cy="45" r="34" fill="#101024" stroke="#e0af68" stroke-width="2"/>
+          <text x="465" y="40">🔏</text><text x="465" y="102" font-size="12">stamp+save</text>
+          <circle cx="570" cy="45" r="34" fill="#101024" stroke="#bb9af7" stroke-width="2"/>
+          <text x="570" y="40">📣</text><text x="570" y="102" font-size="12">tell captain</text>
+        </g>
+        <g stroke="#2a2a4e" stroke-width="3">
+          <line x1="79" y1="45" x2="116" y2="45"/><line x1="184" y1="45" x2="221" y2="45"/>
+          <line x1="289" y1="45" x2="326" y2="45"/><line x1="394" y1="45" x2="431" y2="45"/>
+          <line x1="499" y1="45" x2="536" y2="45"/>
+        </g>
+      </svg>
+    </figure>
+    <p class="kid">Raise your hand, grab your crayons, do the work, run the check, get stamped and save, then <strong class="c-lav">shout the news twice</strong>, once in the diary, once to the captain.</p>
+    <p class="grown">Grown-up words: claim → reserve → work → VERIFY → gate row → commit-before-close → legal close (durable copy) → <code>[bd-*] done</code> mail (captain's copy). One report, two channels.</p>
+  </section>
+
+</main>
+<footer>Design source: toron hacker-night palette · Big pictures, few words, per the eli5 skill.</footer>
+</body>
+</html>
