@@ -70,6 +70,25 @@ const PRESENCE_TTL_SECS: u64 = 60;
 #[derive(Debug)]
 pub struct UsageError(pub String);
 
+/// Idle exit → exit 4 (extension to ADR-0003's 0/1/2/3 vocabulary). `watch
+/// --live --idle-exit <secs>` gives up after N seconds with no matching
+/// event: a silently-disconnected bus subscription delivers nothing AND
+/// never errors (observed live as a zombie `toron watch` child whose host
+/// saw a quiet workspace for 14 minutes), so the consumer's Died→respawn
+/// path needs a timer, not an error it will never get.
+#[derive(Debug)]
+pub struct IdleExit {
+    pub secs: u64,
+}
+
+impl std::fmt::Display for IdleExit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "watch --live: no event for {}s (idle exit)", self.secs)
+    }
+}
+
+impl std::error::Error for IdleExit {}
+
 impl std::fmt::Display for UsageError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0)
@@ -1374,8 +1393,19 @@ fn print_watch_event(ev: &Event) {
 }
 
 async fn watch(mailbox: &Mailbox, args: &WatchArgs) -> anyhow::Result<()> {
+    // ADR-0017: match the SEND side before filtering. `send_message`
+    // canonicalizes its project and stamps the CANONICAL slug as the `t`
+    // hashtag (aliases.rs: a path form folds to its basename when no
+    // alias row exists). A watcher that filters the RAW caller string
+    // (`--project /abs/path/to/proj`) subscribes to a hashtag no sender
+    // ever writes: every wake for that project is silently invisible.
+    // `wait_for_corr` already canonicalizes; watch must too.
+    let args = WatchArgs {
+        project: mailbox.canonical_project(&args.project).await,
+        ..args.clone()
+    };
     if args.live {
-        return watch_live(mailbox, args).await;
+        return watch_live(mailbox, &args).await;
     }
     // 1059 gift-wrap is p-gated to the watcher's own inbox (ADR-0020 Spec 6).
     let kinds = parse_kinds(&args.kinds)?;
@@ -1585,7 +1615,38 @@ async fn watch_live(mailbox: &Mailbox, args: &WatchArgs) -> anyhow::Result<()> {
         print_watch_event(&ev);
     }
     // Live tail — shares one subscription with `wait --corr` (same bus source).
+    // `--idle-exit <secs>` bounds silence: no matching event for N seconds
+    // exits 4 so the consumer can respawn a fresh child (a half-open bus
+    // subscription otherwise sits here forever — the zombie-watch defect).
     let mut sub = mailbox.bus().subscribe_trusted(filter).await?;
+    if let Some(idle_secs) = args.idle_exit {
+        loop {
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(idle_secs);
+            match tokio::time::timeout_at(deadline, sub.next()).await {
+                Err(_elapsed) => return Err(anyhow::Error::new(IdleExit { secs: idle_secs })),
+                Ok(None) => return Ok(()),
+                Ok(Some(SubscriptionEvent::Closed(reason))) => {
+                    eprintln!("watch --live: subscription closed: {reason}");
+                    return Ok(());
+                }
+                Ok(Some(other)) => {
+                    if let SubscriptionEvent::Event(event) = other
+                        && seen.insert(event.id.to_hex())
+                    {
+                        if !in_project(&event, &args.project) {
+                            continue;
+                        }
+                        if let Some(ch) = &args.channel
+                            && event_channel(&event).as_deref() != Some(ch.as_str())
+                        {
+                            continue;
+                        }
+                        print_watch_event(&event);
+                    }
+                }
+            }
+        }
+    }
     while let Some(ev) = sub.next().await {
         if let SubscriptionEvent::Event(event) = ev {
             if !seen.insert(event.id.to_hex()) {
@@ -1850,6 +1911,90 @@ mod live_watch_tests {
                 "wait wake kinds must cover doorbell kind {kind}"
             );
         }
+    }
+
+    /// Idle-exit contract: `watch --live --idle-exit <secs>` on a bus that
+    /// never delivers must return an `IdleExit` error quickly, and the
+    /// error must survive as a typed exit-4 mapping in main.rs. This is the
+    /// supervisor contract for the zombie-watch defect (half-open bus
+    /// subscription: no events, no error, no exit — observed live).
+    #[tokio::test]
+    async fn live_watch_idle_exit_fires_on_silence() {
+        let (mailbox, _pool, db_path, data_dir) = test_mailbox("idle-exit").await;
+        let args = WatchArgs {
+            project: "demo".into(),
+            as_name: None,
+            kinds: "9".into(),
+            channel: None,
+            once: false,
+            timeout_ms: None,
+            live: true,
+            idle_exit: Some(1),
+        };
+        let started = std::time::Instant::now();
+        let res = watch_live(&mailbox, &args).await;
+        let elapsed = started.elapsed();
+        let err = res.expect_err("silent bus must idle-exit");
+        let idle = err
+            .downcast_ref::<IdleExit>()
+            .expect("error must be the typed IdleExit (main.rs maps it to exit 4)");
+        assert_eq!(idle.secs, 1);
+        assert!(
+            elapsed >= std::time::Duration::from_millis(900),
+            "must actually wait the idle window, took {elapsed:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "must not hang past the window, took {elapsed:?}"
+        );
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// Events reset the idle clock: a delivery inside the window keeps the
+    /// watch alive, so a healthy busy bus never churns respawns.
+    #[tokio::test]
+    async fn live_watch_idle_exit_resets_on_event() {
+        let (mailbox, _pool, db_path, data_dir) = test_mailbox("idle-reset").await;
+        let mailbox = std::sync::Arc::new(mailbox);
+        let keys = toron_core::keys::generate();
+        let ev = toron_core::nostr::event::build_event(
+            &keys,
+            toron_core::nostr::kinds::toron_kind(9),
+            "keeps the watch alive",
+            vec![toron_core::nostr::Tag::parse(["t", "demo"]).unwrap()],
+            toron_core::nostr::Timestamp::now(),
+        )
+        .expect("event");
+        let pub_box = mailbox.clone();
+        // Deliver at t+600ms, window is 1s: the event must reset the clock.
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+            let _ = pub_box.bus().publish(ev).await;
+        });
+        let args = WatchArgs {
+            project: "demo".into(),
+            as_name: None,
+            kinds: "9".into(),
+            channel: None,
+            once: false,
+            timeout_ms: None,
+            live: true,
+            idle_exit: Some(1),
+        };
+        // Spawn the watch; it must still be running 1.1s later (one idle
+        // window elapsed, but the event reset the clock mid-window).
+        let handle = tokio::spawn(async move {
+            let _ = watch_live(&mailbox, &args).await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        assert!(
+            !handle.is_finished(),
+            "event delivery must reset the idle clock (watch still alive)"
+        );
+        handle.abort();
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
     }
 
     /// ADR-0028 E2/S5: tasked corr survives walker death via sqlite — a

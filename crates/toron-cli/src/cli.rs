@@ -1510,7 +1510,7 @@ pub struct PresenceListArgs {
     pub project: Option<String>,
 }
 
-#[derive(Debug, Args)]
+#[derive(Debug, Args, Clone)]
 pub struct WatchArgs {
     /// Project slug.
     #[arg(long, required = true)]
@@ -1535,6 +1535,11 @@ pub struct WatchArgs {
     /// Live subscription (bus subscribe, yields WatchNdjson lines) — no snapshot poll.
     #[arg(long, conflicts_with = "once")]
     pub live: bool,
+    /// Exit 4 after N seconds with no matching event (silence-bounded live
+    /// watch; consumers respawn the child). Without it a half-open bus
+    /// subscription delivers nothing AND never errors — a silent zombie.
+    #[arg(long, conflicts_with = "once")]
+    pub idle_exit: Option<u64>,
 }
 
 #[derive(Debug, Args)]
