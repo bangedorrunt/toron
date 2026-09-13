@@ -1,6 +1,6 @@
 <!-- governed-by: ADR-0024, ADR-0026, ADR-0027, ADR-0028, ADR-0014, ADR-0003 -->
 ---
-status: proposed
+status: accepted
 date: 2026-09-12
 decision-makers: Captain (bangedorrunt)
 consulted: Jido v3-spike branch study (2026-09-12); jido_action release/v3 branch study (2026-09-12); Jido v2.3.x and jido.run study (2026-09-11); grilling interview and 25-defect audit (2026-09-11); toron ADR review (0024, 0026, 0027, 0028); fresh-eyes contract review (2026-09-12)
@@ -9,7 +9,7 @@ informed: flywheel x toron x beads maintainers
 
 # ADR-0032: Workflow-Engine Honesty, Jido Action Contracts, and Truthful Effect Lifecycle
 
-**Status:** Proposed. Acceptance = captain word on this file.
+**Status:** Accepted — captain word on this file, 2026-09-13 (stack-reset grilling session, QuietHeron, bead bd-2o1v). Implementation state at acceptance: workflow_effects store + reconcile policy + EffectDispatcher live (toron-core migration 0010, toron-workflow engine/reconcile.rs, toron-mcp workflow_host); engine run-path journaling remains host-owned per boundary.rs (follow-up beads sequence it).
 
 **Decision in one sentence:** Keep Resonate, the closed `Action` enum, the DAG engine, the mailbox, and the existing kind taxonomy; add a single normalized action boundary, a real host run lifecycle, and a workflow-specific effect journal so that action contracts, failures, parked work, and external-effect uncertainty are explicit rather than inferred from mailbox delivery receipts.
 
