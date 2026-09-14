@@ -233,6 +233,50 @@ pub type ActionRunner = Arc<dyn Fn(&Action) -> anyhow::Result<serde_json::Value>
 pub type EffectRunner =
     Arc<dyn Fn(&ActionInvocation) -> anyhow::Result<serde_json::Value> + Send + Sync>;
 
+/// A run-lifecycle phase (bd-mi9n, ADR-0032 Spec 5/6).
+///
+/// The engine's run row is the INDEX its effect rows hang off: `Running` and
+/// its terminals mirror `workflow_runs.status` exactly, so an engine-driven
+/// run is visible without the embedding's own `create_run`/`cas_run_status`
+/// calls.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RunPhase {
+    /// A `workflow_runs` row exists (`workflow_runs` starts here).
+    Started,
+    /// The run is executing steps.
+    Running,
+    /// Terminal: the run completed (`workflow_runs.status = succeeded`).
+    Succeeded,
+    /// Terminal: the run failed or errored.
+    Failed,
+}
+
+/// One run-lifecycle transition (bd-mi9n): `run_id` is the SAME id the
+/// effect rows carry, so the run row and its effects agree by construction.
+///
+/// Strings are owned so the seam stays a plain closure alias (the
+/// [`EffectRunner`] house style) instead of a trait object with a lifetime
+/// parameter.
+#[derive(Clone, Debug)]
+pub struct RunTransition {
+    pub run_id: String,
+    pub workflow: String,
+    pub workflow_digest: String,
+    pub phase: RunPhase,
+}
+
+/// The injected run-lifecycle seam (bd-mi9n).
+///
+/// The engine calls it at run start (`Started`, then `Running`) and once at
+/// the end (`Succeeded`/`Failed`). Sync by the same house rule as
+/// [`EffectRunner`]: the embedding owns the blocking. The implementation MUST
+/// be idempotent — a durable run replays, so the same phase arrives more than
+/// once and a correct journal no-ops on the repeat.
+///
+/// Absent journal = no run rows (a journal-less embedding keeps its own
+/// lifecycle calls, exactly as before).
+pub type RunJournal = Arc<dyn Fn(&RunTransition) + Send + Sync>;
+
 /// How the engine treats an effectful HostSink leaf that has no journaling
 /// [`EffectRunner`] to go through (bd-engine-run-path-journaling-fwlx, the
 /// ADR-0032 Spec 6 flip).
@@ -410,6 +454,29 @@ impl WorkflowEngine {
         )
     }
 
+    /// Like [`Self::local_with_resolvers_and_effect_mode`] with an injected
+    /// [`RunJournal`] (bd-mi9n): the engine writes its own run-lifecycle rows
+    /// (`Started` → `Running` → terminal) through the same journal its effects
+    /// go through, so an engine-driven run needs no host lifecycle calls.
+    #[allow(clippy::too_many_arguments)]
+    pub fn local_with_resolvers_effect_mode_and_run_journal(
+        action_runner: ActionRunner,
+        profile_resolver: ProfileResolver,
+        workflow_resolver: WorkflowResolver,
+        effect_runner: Option<EffectRunner>,
+        journal_mode: EffectJournalMode,
+        run_journal: Option<RunJournal>,
+    ) -> anyhow::Result<Self> {
+        Self::local_with_resolvers_effect_mode_run_journal(
+            action_runner,
+            profile_resolver,
+            workflow_resolver,
+            effect_runner,
+            journal_mode,
+            run_journal,
+        )
+    }
+
     /// The mode-carrying twin of [`Self::remote_with_resolvers_and_effect`].
     pub fn remote_with_resolvers_and_effect_mode(
         url: impl Into<String>,
@@ -426,6 +493,29 @@ impl WorkflowEngine {
             workflow_resolver,
             effect_runner,
             journal_mode,
+        )
+    }
+
+    /// The remote twin of
+    /// [`Self::local_with_resolvers_effect_mode_and_run_journal`] (bd-mi9n).
+    #[allow(clippy::too_many_arguments)]
+    pub fn remote_with_resolvers_effect_mode_and_run_journal(
+        url: impl Into<String>,
+        action_runner: ActionRunner,
+        profile_resolver: ProfileResolver,
+        workflow_resolver: WorkflowResolver,
+        effect_runner: Option<EffectRunner>,
+        journal_mode: EffectJournalMode,
+        run_journal: Option<RunJournal>,
+    ) -> anyhow::Result<Self> {
+        Self::remote_with_resolvers_effect_mode_run_journal(
+            url,
+            action_runner,
+            profile_resolver,
+            workflow_resolver,
+            effect_runner,
+            journal_mode,
+            run_journal,
         )
     }
 
@@ -455,6 +545,26 @@ impl WorkflowEngine {
         effect_runner: Option<EffectRunner>,
         journal_mode: EffectJournalMode,
     ) -> anyhow::Result<Self> {
+        Self::local_with_resolvers_effect_mode_run_journal(
+            action_runner,
+            profile_resolver,
+            workflow_resolver,
+            effect_runner,
+            journal_mode,
+            None,
+        )
+    }
+
+    /// [`Self::local_with_resolvers_effect_mode`] + the injected run-lifecycle
+    /// journal (bd-mi9n).
+    fn local_with_resolvers_effect_mode_run_journal(
+        action_runner: ActionRunner,
+        profile_resolver: ProfileResolver,
+        workflow_resolver: WorkflowResolver,
+        effect_runner: Option<EffectRunner>,
+        journal_mode: EffectJournalMode,
+        run_journal: Option<RunJournal>,
+    ) -> anyhow::Result<Self> {
         let sink = ApprovalSink::default();
         let spawn_sink = SpawnSink::default();
         let policy_sink = crate::cron_failure::PolicySink::new();
@@ -465,6 +575,7 @@ impl WorkflowEngine {
             .with_dependency(profile_resolver)
             .with_dependency(workflow_resolver)
             .with_dependency(journal_mode)
+            .with_dependency(run_journal)
             .with_dependency(sink.clone())
             .with_dependency(spawn_sink.clone())
             .with_dependency(policy_sink.clone())
@@ -591,6 +702,29 @@ impl WorkflowEngine {
         effect_runner: Option<EffectRunner>,
         journal_mode: EffectJournalMode,
     ) -> anyhow::Result<Self> {
+        Self::remote_with_resolvers_effect_mode_run_journal(
+            url,
+            action_runner,
+            profile_resolver,
+            workflow_resolver,
+            effect_runner,
+            journal_mode,
+            None,
+        )
+    }
+
+    /// [`Self::remote_with_resolvers_effect_mode`] + the injected
+    /// run-lifecycle journal (bd-mi9n).
+    #[allow(clippy::too_many_arguments)]
+    fn remote_with_resolvers_effect_mode_run_journal(
+        url: impl Into<String>,
+        action_runner: ActionRunner,
+        profile_resolver: ProfileResolver,
+        workflow_resolver: WorkflowResolver,
+        effect_runner: Option<EffectRunner>,
+        journal_mode: EffectJournalMode,
+        run_journal: Option<RunJournal>,
+    ) -> anyhow::Result<Self> {
         let sink = ApprovalSink::default();
         let spawn_sink = SpawnSink::default();
         let policy_sink = crate::cron_failure::PolicySink::new();
@@ -605,6 +739,7 @@ impl WorkflowEngine {
             .with_dependency(profile_resolver)
             .with_dependency(workflow_resolver)
             .with_dependency(journal_mode)
+            .with_dependency(run_journal)
             .with_dependency(sink.clone())
             .with_dependency(spawn_sink.clone())
             .with_dependency(policy_sink.clone())

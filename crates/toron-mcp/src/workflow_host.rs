@@ -34,10 +34,11 @@ use toron_workflow::engine::{
     ActionInvocation, ActionRunner, CleanupKind, CleanupRequest, Decision, DispatchPlan,
     EffectJournalMode, EffectRunner, EffectView, FORCED_CLEANUP_CAPABILITY, ParkKind, PendingEntry,
     PendingRegistry, ProviderCapability, ProviderErrorClass, ProviderOutcome, Resolution,
-    ResolutionMismatch, ResolutionVerdict, RunInput, TerminalLedger, TerminalNote, TerminalRecord,
-    UnknownReport, WorkflowEngine, attribute_parks, capability_for_action_type,
-    classify_provider_error_msg, cleanup_effect_key, corr_for_effect, derive_effect_key,
-    describe_unknown, invoke, plan_attempt, terminal_digest, validate_resolution,
+    ResolutionMismatch, ResolutionVerdict, RunInput, RunJournal, RunPhase, RunTransition,
+    TerminalLedger, TerminalNote, TerminalRecord, UnknownReport, WorkflowEngine, attribute_parks,
+    capability_for_action_type, classify_provider_error_msg, cleanup_effect_key, corr_for_effect,
+    derive_effect_key, describe_unknown, invoke, plan_attempt, terminal_digest,
+    validate_resolution,
 };
 use toron_workflow::jobs::{JobRequest, build_job_request_with_tags};
 use toron_workflow::schema::{Action, Trigger, Workflow};
@@ -542,6 +543,78 @@ fn scoped_request(
 /// `Err`) so the engine's failure predicate keeps working; ambiguous
 /// provider errors surface inside those values as
 /// `effect_state: "unknown"` (I5), via [`invoke`]'s classification.
+/// Apply ONE run-lifecycle transition to the durable journal (bd-mi9n).
+///
+/// This is the ONE write path for `workflow_runs`: the host's own lifecycle
+/// calls AND the engine's injected [`RunJournal`] both land here, so the two
+/// cannot disagree about a run and a repeat is a no-op rather than a
+/// double-write.
+///
+/// Idempotent by construction: the row is created if absent (born `started`),
+/// then CAS'd to `target` only when the current status differs. A terminal row
+/// never moves (toron-core refuses the CAS), so a replayed phase cannot
+/// resurrect a finished run.
+pub async fn apply_run_status(
+    store: &WorkflowEffectStore,
+    run_id: &str,
+    workflow: &str,
+    workflow_digest: &str,
+    target: RunStatus,
+) -> anyhow::Result<()> {
+    let current = match store.get_run(run_id).await? {
+        Some(row) => row.status,
+        None => {
+            store
+                .create_run(NewRun {
+                    run_id: run_id.to_string(),
+                    project: None,
+                    workflow: workflow.to_string(),
+                    workflow_digest: workflow_digest.to_string(),
+                })
+                .await?;
+            RunStatus::Started
+        }
+    };
+    if current != target {
+        let _ = store.cas_run_status(run_id, current, target).await?;
+    }
+    Ok(())
+}
+
+/// The engine-facing run-lifecycle journal over this store (bd-mi9n).
+///
+/// Sync by the engine's house rule ([`EffectRunner`] is a sync closure too):
+/// the durable write runs on `block_on_async`'s isolated thread. Best-effort —
+/// a journal failure is reported and never changes the run's outcome.
+///
+/// The engine reports only the four phases it can prove (Started, Running,
+/// Succeeded, Failed); host-level states (Suspended, Blocked, Cancelled) stay
+/// the host's own calls through [`apply_run_status`].
+pub fn run_journal(store: WorkflowEffectStore) -> RunJournal {
+    Arc::new(move |t: &RunTransition| {
+        let target = match t.phase {
+            RunPhase::Started | RunPhase::Running => RunStatus::Running,
+            RunPhase::Succeeded => RunStatus::Succeeded,
+            RunPhase::Failed => RunStatus::Failed,
+        };
+        let store = store.clone();
+        let (run_id, workflow, digest) = (
+            t.run_id.clone(),
+            t.workflow.clone(),
+            t.workflow_digest.clone(),
+        );
+        let label = run_id.clone();
+        if let Err(e) = block_on_async(async move {
+            apply_run_status(&store, &run_id, &workflow, &digest, target).await
+        }) {
+            eprintln!(
+                "toron-mcp: run lifecycle row for {label} ({:?}) not journaled: {e:#}",
+                t.phase
+            );
+        }
+    })
+}
+
 pub fn mailbox_effect_runner(
     mailbox: Arc<Mailbox>,
     coalescer: Arc<std::sync::Mutex<MentionCoalescer>>,
@@ -882,22 +955,29 @@ impl WorkflowHost {
         // bd-engine-run-path-journaling-fwlx (the Spec 6 flip): the host
         // really dispatches, so its engine is Enforced — an effectful leaf
         // with no journal seam fails loud instead of running unjournaled.
+        // bd-mi9n: the engine also reports its OWN run lifecycle through the
+        // same store, so an engine-driven run's `workflow_runs` row exists
+        // without the host calling `track_run_durable` — and both go through
+        // the one `apply_run_status` path (no double-write).
+        let run_journal = pending.store().map(|store| run_journal(store.clone()));
         let engine = match toron_workflow::engine::resonate_server_url() {
-            Some(url) => WorkflowEngine::remote_with_resolvers_and_effect_mode(
+            Some(url) => WorkflowEngine::remote_with_resolvers_effect_mode_and_run_journal(
                 url,
                 runner,
                 WorkflowEngine::default_resolver(),
                 WorkflowEngine::default_workflow_resolver(),
                 Some(effect_runner),
                 EffectJournalMode::Enforced,
+                run_journal,
             )
             .context("workflow engine (remote resonate server)")?,
-            None => WorkflowEngine::local_with_resolvers_and_effect_mode(
+            None => WorkflowEngine::local_with_resolvers_effect_mode_and_run_journal(
                 runner,
                 WorkflowEngine::default_resolver(),
                 WorkflowEngine::default_workflow_resolver(),
                 Some(effect_runner),
                 EffectJournalMode::Enforced,
+                run_journal,
             )
             .context("workflow engine")?,
         };
@@ -1771,6 +1851,10 @@ impl PendingDrain {
 
     /// Track a run durably (bd-cnr5): memory plus an idempotent
     /// `workflow_runs` row, transitioned to `Running`.
+    ///
+    /// bd-mi9n: the durable write goes through [`apply_run_status`] — the SAME
+    /// path the engine's injected [`RunJournal`] uses — so the host and the
+    /// engine agree on the row and a repeat is a no-op, never a double-write.
     pub async fn track_run_durable(
         &mut self,
         run_id: &str,
@@ -1779,24 +1863,14 @@ impl PendingDrain {
         let workflow_name = workflow.name.clone();
         self.track_run(run_id, workflow);
         if let Some(store) = self.store.clone() {
-            let created = store
-                .create_run(NewRun {
-                    run_id: run_id.to_string(),
-                    project: None,
-                    workflow: workflow_name,
-                    workflow_digest: String::new(),
-                })
-                .await?;
-            if created {
-                // Fresh rows start as `started`; advance to the tracked state.
-                let _ = store
-                    .cas_run_status(
-                        run_id,
-                        toron_core::index::workflow_effects::RunStatus::Started,
-                        toron_core::index::workflow_effects::RunStatus::Running,
-                    )
-                    .await?;
-            }
+            apply_run_status(
+                &store,
+                run_id,
+                &workflow_name,
+                "",
+                toron_core::index::workflow_effects::RunStatus::Running,
+            )
+            .await?;
         }
         Ok(())
     }
@@ -1835,6 +1909,9 @@ impl PendingDrain {
     /// compare-and-swap on the `workflow_runs` row. Terminal rows never
     /// move; a refused CAS leaves the journal untouched (memory still
     /// updates — the journal is authoritative, never corrupted).
+    ///
+    /// bd-mi9n: routes through [`apply_run_status`] — the SAME path the
+    /// engine's injected [`RunJournal`] uses.
     pub async fn set_run_state_durable(
         &mut self,
         run_id: &str,
@@ -1842,28 +1919,12 @@ impl PendingDrain {
     ) -> anyhow::Result<()> {
         self.set_run_state(run_id, state);
         if let Some(store) = self.store.clone() {
-            let target = state.to_run_status();
-            let current = match store.get_run(run_id).await? {
-                Some(row) => row.status,
-                None => {
-                    store
-                        .create_run(NewRun {
-                            run_id: run_id.to_string(),
-                            project: None,
-                            workflow: self
-                                .run_workflows
-                                .get(run_id)
-                                .map(|w| w.name.clone())
-                                .unwrap_or_else(|| "unknown".to_string()),
-                            workflow_digest: String::new(),
-                        })
-                        .await?;
-                    toron_core::index::workflow_effects::RunStatus::Started
-                }
-            };
-            if current != target {
-                let _ = store.cas_run_status(run_id, current, target).await?;
-            }
+            let workflow = self
+                .run_workflows
+                .get(run_id)
+                .map(|w| w.name.clone())
+                .unwrap_or_else(|| "unknown".to_string());
+            apply_run_status(&store, run_id, &workflow, "", state.to_run_status()).await?;
         }
         Ok(())
     }
@@ -2033,8 +2094,8 @@ impl PendingDrain {
 // ---------------------------------------------------------------------------
 
 use toron_core::index::workflow_effects::{
-    ClaimAttempt, EffectState, NewAttempt, NewEffect, NewRun, WorkflowEffect, WorkflowEffectStore,
-    now_us,
+    ClaimAttempt, EffectState, NewAttempt, NewEffect, NewRun, RunStatus, WorkflowEffect,
+    WorkflowEffectStore, now_us,
 };
 
 /// One effect dispatch request: identity inputs plus the provider's

@@ -48,7 +48,7 @@ Child maps: [toron-core](crates/toron-core/AGENTS.md) ·
 | Gift-wrap / kinds | `crates/toron-core/src/nostr/` |
 | Bus / federation | `crates/toron-core/src/bus/` |
 | Git archive | `crates/toron-core/src/archive/git.rs` |
-| Workflow YAML / engine | `crates/toron-workflow/src/{schema,engine}/` — authoring/operator guide: `docs/guides/workflow-engine.mdx`. Design target is ADR-0032 (proposed): mailbox receipts stay mailbox receipts; the workflow-effect journal is proposed, not shipped |
+| Workflow YAML / engine | `crates/toron-workflow/src/{schema,engine}/` — authoring/operator guide: `docs/guides/workflow-engine.mdx`. Governing record is ADR-0032 (**Accepted**): mailbox receipts stay mailbox receipts; the workflow-effect journal ships (toron-core migration `0010`, `EffectJournalMode`, `RunJournal` run lifecycle) |
 | Workflow honesty (bd-i6kc, bd-o1hl) | `crates/toron-workflow/src/engine/boundary.rs` (exhaustive partition: `react`/`call_webhook` fail closed), `crates/toron-mcp/src/workflow_host.rs` (compat runner), `crates/toron-workflow/src/engine/control_flow.rs` (guard/retry/graph/composite parity) |
 | Cron (distinct type) | `crates/toron-workflow/src/cron.rs`  |
 | MCP tools | `crates/toron-mcp/src/tools/` |
