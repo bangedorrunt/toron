@@ -1203,9 +1203,32 @@ pub async fn run_guard(mailbox: &Mailbox, cmd: &GuardCommand) -> anyhow::Result<
         GuardCommand::Check(args) => {
             let agent = guard_agent(args);
             let staged = toron_core::mailbox::guard::staged_paths_in(&args.repo);
-            let mut reservations = mailbox
+            let rows = mailbox
                 .active_reservations_all_aliases(&args.project)
-                .await?
+                .await?;
+            // adr-0018 D1a ("ONE resolver") + bd-guard-holder-identity-fold-dqog:
+            // every lease row carries the holder's AUTHORITATIVE hex pubkey
+            // (`agent_pubkey`) beside its possibly-rendered name. Seed the fold
+            // from the row's own pubkey FIRST — that evidence needs no roster
+            // read, so a lease held under an `npub[..8]` rendering still folds
+            // to the same identity as the name. The roster/`whois` lookup below
+            // is an ADDITIONAL source for spellings the rows cannot attribute
+            // (aliases, slugs), never the primary one.
+            let mut holder_fold = HolderFold::default();
+            for r in &rows {
+                holder_fold.record(&r.agent_pubkey, &r.agent_pubkey);
+                holder_fold.record(&r.agent_name, &r.agent_pubkey);
+            }
+            // The committer resolves through the SAME name→pubkey path the
+            // acquire stamped the lease with (local key material, never the
+            // roster): acting as your own pin matches your own lease even when
+            // the roster cannot name either spelling.
+            if let Some(name) = agent.as_deref()
+                && let Some(pk) = mailbox.agent_pubkey_hex(&args.project, name).await
+            {
+                holder_fold.record(name, &pk);
+            }
+            let mut reservations = rows
                 .into_iter()
                 .map(|r| toron_core::mailbox::guard::Reservation {
                     holder: r.agent_name,
@@ -1223,7 +1246,12 @@ pub async fn run_guard(mailbox: &Mailbox, cmd: &GuardCommand) -> anyhow::Result<
             {
                 let foreign = mailbox
                     .active_reservations_escaping_into(&args.project, repo_name)
-                    .await?
+                    .await?;
+                for r in &foreign {
+                    holder_fold.record(&r.agent_pubkey, &r.agent_pubkey);
+                    holder_fold.record(&r.agent_name, &r.agent_pubkey);
+                }
+                let foreign = foreign
                     .into_iter()
                     .map(|r| toron_core::mailbox::guard::Reservation {
                         holder: r.agent_name,
@@ -1233,7 +1261,15 @@ pub async fn run_guard(mailbox: &Mailbox, cmd: &GuardCommand) -> anyhow::Result<
                     .collect::<Vec<_>>();
                 merge_cross_project_leases(&mut reservations, repo_name, foreign);
             }
-            finish_guard_check(args, agent.as_deref(), &staged, &reservations)
+            // Additional evidence only: the project roster (the writer's view)
+            // plus a best-effort `whois` for spellings it does not name (the
+            // alias table — the pin a role/slug folds to).
+            let spellings = reservations
+                .iter()
+                .map(|r| r.holder.clone())
+                .chain(agent.clone());
+            holder_fold.merge(embedded_roster_fold(mailbox, &args.project, spellings).await);
+            finish_guard_check(args, agent.as_deref(), &staged, &reservations, &holder_fold)
         }
         GuardCommand::Record(args) => run_guard_record(args),
     }
@@ -1264,6 +1300,130 @@ fn run_guard_record(args: &crate::cli::GuardRecordArgs) -> anyhow::Result<()> {
     std::process::exit(0);
 }
 
+/// ADR-0018 D1a ("ONE resolver") applied to the sweep-guard: fold every
+/// spelling of an agent — pin, slug, folded alias, npub, and the daemon's
+/// `npub[..8]` holder fallback — onto ONE canonical identity (the agent's
+/// full pubkey hex), so a lease held under one spelling covers the same
+/// agent committing under another.
+///
+/// Why this exists (observed live): `reserve acquire --as <name>` stores the
+/// lease under the resolved agent, while `guard check` compares the lease
+/// HOLDER against the committer NAME **raw**. When the roster could not name
+/// the holder, the daemon rendered it as an 8-char npub prefix — a string no
+/// agent name can ever equal — so the owner's own lease blocked its own
+/// commit until the committer passed the literal prefix.
+///
+/// Fail-closed by construction: a spelling we cannot attribute folds to
+/// ITSELF, never to a wildcard, so the fold cannot turn a foreign lease into
+/// an own one. An ambiguous npub prefix also stays itself (two candidates are
+/// not an attribution).
+#[derive(Debug, Default)]
+struct HolderFold {
+    /// spelling (name · alias · npub · prefix) → canonical pubkey hex.
+    by_spelling: std::collections::HashMap<String, String>,
+    /// Every canonical pubkey (the npub-prefix fallback looks here).
+    npubs: std::collections::BTreeSet<String>,
+}
+
+impl HolderFold {
+    /// `npub` is the canonical for both spellings.
+    fn record(&mut self, spelling: &str, npub: &str) {
+        let canonical = npub.trim().to_ascii_lowercase();
+        let spelling = spelling.trim();
+        if spelling.is_empty() || canonical.is_empty() {
+            return;
+        }
+        self.by_spelling
+            .insert(spelling.to_string(), canonical.clone());
+        self.by_spelling
+            .insert(canonical.clone(), canonical.clone());
+        self.npubs.insert(canonical);
+    }
+
+    /// True when this spelling is already attributable (so callers can skip
+    /// an expensive roster lookup).
+    fn knows(&self, spelling: &str) -> bool {
+        self.by_spelling.contains_key(spelling.trim())
+    }
+
+    /// Union another fold in, first-wins per spelling (so the daemon's roster
+    /// — the writer's view — outranks a later local lookup).
+    fn merge(&mut self, other: HolderFold) {
+        for (spelling, canonical) in other.by_spelling {
+            self.by_spelling.entry(spelling).or_insert(canonical);
+        }
+        self.npubs.extend(other.npubs);
+    }
+
+    fn resolve(&self, spelling: &str) -> String {
+        if let Some(canonical) = self.by_spelling.get(spelling) {
+            return canonical.clone();
+        }
+        let lower = spelling.trim().to_ascii_lowercase();
+        if (8..64).contains(&lower.len()) && lower.bytes().all(|b| b.is_ascii_hexdigit()) {
+            let hits: Vec<&String> = self
+                .npubs
+                .iter()
+                .filter(|n| n.starts_with(&lower))
+                .collect();
+            if let [only] = hits.as_slice() {
+                return (*only).clone();
+            }
+        }
+        spelling.to_string()
+    }
+}
+
+/// Additional fold evidence from the project roster plus a best-effort
+/// `whois` for any spelling the roster does not name — `whois` resolves the
+/// alias table (the pin a role/slug folds to), which is precisely the case a
+/// raw name compare got wrong. Best-effort throughout: an unusable roster
+/// leaves this contribution empty and the caller keeps the lease-row evidence
+/// it already has, which degrades to the previous raw compare instead of
+/// blocking harder.
+async fn embedded_roster_fold(
+    mailbox: &Mailbox,
+    project: &str,
+    spellings: impl IntoIterator<Item = String>,
+) -> HolderFold {
+    let mut fold = HolderFold::default();
+    if let Ok(roster) = mailbox
+        .list_agents(project, toron_core::mailbox::ListAgentsOptions::default())
+        .await
+    {
+        for who in &roster {
+            fold.record(&who.name, &who.npub);
+        }
+    }
+    let mut wanted: Vec<String> = spellings.into_iter().collect();
+    wanted.sort_unstable();
+    wanted.dedup();
+    for spelling in wanted {
+        if spelling.trim().is_empty() || fold.knows(&spelling) {
+            continue;
+        }
+        if let Ok(who) = mailbox.whois(project, &spelling).await {
+            fold.record(&spelling, &who.npub);
+            fold.record(&who.name, &who.npub);
+        }
+    }
+    fold
+}
+
+/// Fold from the daemon's `toron://agents/{project}` document (pure).
+fn fold_from_agents_resource(agents: &serde_json::Value) -> HolderFold {
+    let mut fold = HolderFold::default();
+    for entry in agents.as_array().into_iter().flatten() {
+        if let (Some(name), Some(npub)) = (
+            entry.get("name").and_then(serde_json::Value::as_str),
+            entry.get("npub").and_then(serde_json::Value::as_str),
+        ) {
+            fold.record(name, npub);
+        }
+    }
+    fold
+}
+
 /// Resolve the committing agent from `--as` / env (shared embedded+daemon).
 fn guard_agent(args: &crate::cli::GuardCheckArgs) -> Option<String> {
     args.as_agent
@@ -1290,7 +1450,12 @@ fn finish_guard_check(
     agent: Option<&str>,
     staged: &[String],
     reservations: &[toron_core::mailbox::guard::Reservation],
+    fold: &HolderFold,
 ) -> anyhow::Result<()> {
+    // Both comparison surfaces go through the ONE identity fold: a lease's
+    // holder and the committer's name are the same person when they fold to
+    // the same pubkey, whatever spelling either side used.
+    let resolve = |n: &str| fold.resolve(n);
     // bd-2dox strict sweep-guard: --strict or TORON_GUARD_STRICT
     // non-"0" enables; TORON_GUARD_STRICT=0 is the operator escape
     // hatch (logged, wins over the flag).
@@ -1321,12 +1486,13 @@ fn finish_guard_check(
         std::process::exit(0);
     }
     if strict {
-        use toron_core::mailbox::guard::{StrictBlockKind, guard_check_strict};
-        let blocked = guard_check_strict(
+        use toron_core::mailbox::guard::{StrictBlockKind, guard_check_strict_resolved};
+        let blocked = guard_check_strict_resolved(
             agent,
             staged,
             reservations,
             toron_core::mailbox::guard::SHARED_SAFE_PATHS,
+            &resolve,
         );
         // bd-9mb8 bead-hunk attribution: bd-* tokens ADDED by the staged
         // diff must appear in the commit message (--msg-file from the
@@ -1401,7 +1567,17 @@ fn finish_guard_check(
             1
         });
     }
-    let blocked = toron_core::mailbox::guard::guard_check_blocked(agent, staged, reservations);
+    // Legacy (non-strict) surface: unchanged fail-open for an unattributed
+    // commit, but the same identity fold for everything attributed.
+    let blocked = match agent {
+        None => Vec::new(),
+        Some(agent) => toron_core::mailbox::guard::guard_blocked_paths_resolved(
+            agent,
+            staged,
+            reservations,
+            &resolve,
+        ),
+    };
     let out = json!({
         "blocked": blocked,
         "agent": agent,
@@ -1450,16 +1626,39 @@ pub async fn run_guard_daemon(dc: &DaemonClient, cmd: &GuardCommand) -> anyhow::
         GuardCommand::Check(args) => {
             let agent = guard_agent(args);
             let staged = toron_core::mailbox::guard::staged_paths_in(&args.repo);
-            let mut reservations =
-                daemon_guard_roster(dc, &args.project)
-                    .await
-                    .with_context(|| {
-                        format!(
-                            "guard check: cannot list reservations for project {} from the daemon \
+            let (mut reservations, mut fold) = daemon_guard_roster(dc, &args.project)
+                .await
+                .with_context(|| {
+                    format!(
+                        "guard check: cannot list reservations for project {} from the daemon \
                          (is `toron serve --mcp-http` running?)",
-                            args.project
-                        )
-                    })?;
+                        args.project
+                    )
+                })?;
+            // adr-0018 D1a: the daemon's roster is a RENDERING — when it
+            // cannot name a holder it emits `npub[..8]`, a string no agent
+            // name can equal, so the owner's own shared lease reads as
+            // "unreserved". Identity is LOCAL truth (the key store the lease
+            // was acquired from), so fold the committer and any unnamed
+            // holder through one local mailbox lookup. Best-effort: no local
+            // store leaves today's raw compare, never a harder block.
+            let local = toron_mcp::demo_mailbox().await.ok();
+            if let Some(mb) = local.as_ref() {
+                // The committer resolves through the SAME local name→pubkey
+                // path `reserve acquire` stamped the lease with, so acting as
+                // one's own pin matches one's own lease even when the roster
+                // cannot name either spelling.
+                if let Some(name) = agent.as_deref()
+                    && let Some(pk) = mb.agent_pubkey_hex(&args.project, name).await
+                {
+                    fold.record(name, &pk);
+                }
+                let spellings = reservations
+                    .iter()
+                    .map(|r| r.holder.clone())
+                    .chain(agent.clone());
+                fold.merge(embedded_roster_fold(mb, &args.project, spellings).await);
+            }
             // bd-guard-crossproject-lease-er38: the roster resource is
             // project-scoped, so foreign-project leases escape it. Augment
             // from the durable root (the same store the daemon serves);
@@ -1468,7 +1667,7 @@ pub async fn run_guard_daemon(dc: &DaemonClient, cmd: &GuardCommand) -> anyhow::
             if let Some(repo_name) = std::path::Path::new(&args.repo)
                 .file_name()
                 .and_then(|n| n.to_str())
-                && let Ok(mb) = toron_mcp::demo_mailbox().await
+                && let Some(mb) = local.as_ref()
                 && let Ok(foreign) = mb
                     .active_reservations_escaping_into(&args.project, repo_name)
                     .await
@@ -1485,7 +1684,7 @@ pub async fn run_guard_daemon(dc: &DaemonClient, cmd: &GuardCommand) -> anyhow::
                         }),
                 );
             }
-            finish_guard_check(args, agent.as_deref(), &staged, &reservations)
+            finish_guard_check(args, agent.as_deref(), &staged, &reservations, &fold)
         }
         GuardCommand::Record(args) => run_guard_record(args),
     }
@@ -1531,7 +1730,7 @@ fn merge_cross_project_leases(
 async fn daemon_guard_roster(
     dc: &DaemonClient,
     project: &str,
-) -> anyhow::Result<Vec<toron_core::mailbox::guard::Reservation>> {
+) -> anyhow::Result<(Vec<toron_core::mailbox::guard::Reservation>, HolderFold)> {
     let res = dc
         .read_resource(&format!("toron://reservations/{project}"))
         .await?;
@@ -1539,7 +1738,12 @@ async fn daemon_guard_roster(
         .read_resource(&format!("toron://agents/{project}"))
         .await?;
     let now_secs = chrono::Utc::now().timestamp();
-    Ok(resolve_daemon_roster(&res, &agents, now_secs))
+    // adr-0018 D1a: seed the fold from the lease events' own author pubkeys
+    // FIRST (roster-independent — it holds even when the agents document is
+    // empty), then let the agents document name any remaining spellings.
+    let mut fold = fold_from_daemon_leases(&res, &agents);
+    fold.merge(fold_from_agents_resource(&agents));
+    Ok((resolve_daemon_roster(&res, &agents, now_secs), fold))
 }
 
 /// Build the guard reservation roster from raw daemon resource JSON (pure,
@@ -1559,18 +1763,7 @@ fn resolve_daemon_roster(
     agents: &serde_json::Value,
     now_secs: i64,
 ) -> Vec<toron_core::mailbox::guard::Reservation> {
-    // npub → agent name (agents resource: [{name, npub, ...}]).
-    let name_by_npub: std::collections::HashMap<String, String> = agents
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|a| {
-            Some((
-                a.get("npub")?.as_str()?.to_string(),
-                a.get("name")?.as_str()?.to_string(),
-            ))
-        })
-        .collect();
+    let name_by_npub = name_by_npub(agents);
     let events = res.get("events").and_then(|v| v.as_array());
     let Some(events) = events else {
         return Vec::new();
@@ -1669,6 +1862,57 @@ fn resolve_daemon_roster(
         });
     }
     out
+}
+
+/// npub → agent name from the daemon's `toron://agents/{project}` document
+/// (empty when the roster read returns nothing).
+fn name_by_npub(agents: &serde_json::Value) -> std::collections::HashMap<String, String> {
+    agents
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|a| {
+            Some((
+                a.get("npub")?.as_str()?.to_string(),
+                a.get("name")?.as_str()?.to_string(),
+            ))
+        })
+        .collect()
+}
+
+/// Seed the identity fold from the lease events' OWN author pubkeys (pure,
+/// bd-guard-holder-identity-fold-dqog).
+///
+/// Each kind-30031 event carries the holder's canonical hex `pubkey`; the
+/// holder NAME the roster builds is a rendering that falls back to
+/// `npub[..8]` when the roster cannot name the author. Recording both makes
+/// every rendered spelling fold back to the event's real identity — with no
+/// roster read. This is the evidence a roster-blind guard needs: it works
+/// even when `toron://agents/{project}` returns `[]`.
+fn fold_from_daemon_leases(res: &serde_json::Value, agents: &serde_json::Value) -> HolderFold {
+    let names = name_by_npub(agents);
+    let mut fold = HolderFold::default();
+    for ev in res
+        .get("events")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+    {
+        let Some(pk) = ev
+            .get("pubkey")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        else {
+            continue;
+        };
+        fold.record(pk, pk);
+        let holder = names
+            .get(pk)
+            .cloned()
+            .unwrap_or_else(|| pk.chars().take(8).collect());
+        fold.record(&holder, pk);
+    }
+    fold
 }
 
 /// bd-lsgm: the captain fold routes only in swarm identity mode. An open-mode
@@ -1840,6 +2084,195 @@ mod daemon_roster_revocation_tests {
             roster.len(),
             1,
             "newer lease survives stale marker: {roster:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod holder_fold_tests {
+    use super::*;
+    use serde_json::json;
+
+    const ALICE: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const BOB: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    /// A minimal held kind-30031 lease event, as `toron://reservations/{p}`
+    /// renders it (the author pubkey is the authoritative field).
+    fn lease_event(pubkey: &str) -> serde_json::Value {
+        json!({
+            "id": "00",
+            "pubkey": pubkey,
+            "created_at": 100,
+            "kind": 30031,
+            "tags": [["d", "toron:src/effect_journal.rs"]],
+            "content": r#"{"exclusive":false,"reason":"bd-guard-holder-identity-fold-dqog"}"#,
+            "sig": "00"
+        })
+    }
+
+    fn fold_with(names: &[(&str, &str)]) -> HolderFold {
+        let agents = serde_json::Value::Array(
+            names
+                .iter()
+                .map(|(name, npub)| json!({ "name": name, "npub": npub }))
+                .collect(),
+        );
+        fold_from_agents_resource(&agents)
+    }
+
+    /// The fold's whole point: a name, its npub, and the daemon's `npub[..8]`
+    /// holder rendering are ONE identity.
+    #[test]
+    fn name_npub_and_prefix_fold_to_one_identity() {
+        let fold = fold_with(&[("RoseDune", ALICE)]);
+        assert_eq!(fold.resolve("RoseDune"), ALICE);
+        assert_eq!(fold.resolve(ALICE), ALICE);
+        assert_eq!(
+            fold.resolve(&ALICE[..8]),
+            ALICE,
+            "the daemon's holder rendering must fold"
+        );
+    }
+
+    /// Fail-closed: an unattributable spelling is ITSELF, never a wildcard, so
+    /// it cannot collide with a lease holder.
+    #[test]
+    fn unknown_spelling_folds_to_itself() {
+        let fold = fold_with(&[("RoseDune", ALICE)]);
+        assert_eq!(fold.resolve("Ghost"), "Ghost");
+        assert_ne!(fold.resolve("Ghost"), fold.resolve("RoseDune"));
+    }
+
+    /// An ambiguous prefix is not an attribution.
+    #[test]
+    fn ambiguous_prefix_stays_itself() {
+        let twin = format!(
+            "aaaaaaaa{}aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            &BOB[8..16]
+        );
+        let fold = fold_with(&[("RoseDune", ALICE), ("BlueLake", &twin)]);
+        assert_eq!(fold.resolve(&ALICE[..8]), ALICE[..8]);
+    }
+
+    /// `record` refuses empty spellings: an empty name must never become a key
+    /// that matches some other empty holder.
+    #[test]
+    fn empty_spellings_are_not_recorded() {
+        let mut fold = HolderFold::default();
+        fold.record("", ALICE);
+        fold.record("  ", ALICE);
+        fold.record("RoseDune", "");
+        assert!(!fold.knows(""));
+        assert_eq!(fold.resolve(""), "");
+        assert_eq!(fold.resolve("RoseDune"), "RoseDune");
+    }
+
+    /// The live bug, end to end at the guard seam: a lease whose holder
+    /// degraded to the `npub[..8]` rendering must still count as the OWNER's
+    /// coverage, so a shared lease stops reading as "unreserved".
+    #[test]
+    fn own_shared_lease_covers_the_owner_despite_the_prefix_holder() {
+        let fold = fold_with(&[("RoseDune", ALICE)]);
+        let reservations = vec![toron_core::mailbox::guard::Reservation {
+            holder: ALICE[..8].to_string(),
+            pattern: "src/**".to_string(),
+            exclusive: false,
+        }];
+        let staged = vec!["src/effect_journal.rs".to_string()];
+        let resolve = |n: &str| fold.resolve(n);
+
+        let blocked = toron_core::mailbox::guard::guard_check_strict_resolved(
+            Some("RoseDune"),
+            &staged,
+            &reservations,
+            toron_core::mailbox::guard::SHARED_SAFE_PATHS,
+            &resolve,
+        );
+        assert!(
+            blocked.is_empty(),
+            "the owner's own shared lease must cover its commit: {blocked:?}"
+        );
+
+        // And a DIFFERENT agent is still blocked — the fold must not open the
+        // guard for everyone.
+        let other = toron_core::mailbox::guard::guard_check_strict_resolved(
+            Some("BlueLake"),
+            &staged,
+            &reservations,
+            toron_core::mailbox::guard::SHARED_SAFE_PATHS,
+            &resolve,
+        );
+        assert_eq!(
+            other.len(),
+            1,
+            "an unrelated agent has no coverage: {other:?}"
+        );
+    }
+
+    /// bd-guard-holder-identity-fold-dqog: the lease events' own author
+    /// pubkeys seed the fold with NO roster at all. This is the case that
+    /// matters live — `toron://agents/{project}` returned `[]`, so any
+    /// roster-built fold was empty and the owner's own lease read as
+    /// "unreserved".
+    #[test]
+    fn lease_events_seed_the_fold_without_any_roster() {
+        let res = json!({ "events": [lease_event(ALICE)] });
+        let fold = fold_from_daemon_leases(&res, &json!([]));
+        assert_eq!(fold.resolve(ALICE), ALICE);
+        assert_eq!(
+            fold.resolve(&ALICE[..8]),
+            ALICE,
+            "the rendered holder spelling must fold to the event author"
+        );
+        assert_eq!(
+            fold.resolve("RoseDune"),
+            "RoseDune",
+            "with no roster a name the events do not carry stays itself"
+        );
+    }
+
+    /// The full roster-blind attribution: a fold seeded only from the lease
+    /// event plus the committer's locally-resolved pubkey (what
+    /// `Mailbox::agent_pubkey_hex` supplies) covers the owner's own commit and
+    /// still blocks a foreign one.
+    #[test]
+    fn roster_blind_fold_covers_the_owner_and_blocks_foreign_pins() {
+        let res = json!({ "events": [lease_event(ALICE)] });
+        let mut fold = fold_from_daemon_leases(&res, &json!([]));
+        // The committer resolves through local key material, exactly as the
+        // guard seeds it (`agent_pubkey_hex`).
+        fold.record("RoseDune", ALICE);
+        let reservations = vec![toron_core::mailbox::guard::Reservation {
+            holder: ALICE[..8].to_string(),
+            pattern: "src/**".to_string(),
+            exclusive: false,
+        }];
+        let staged = vec!["src/effect_journal.rs".to_string()];
+        let resolve = |n: &str| fold.resolve(n);
+
+        let own = toron_core::mailbox::guard::guard_check_strict_resolved(
+            Some("RoseDune"),
+            &staged,
+            &reservations,
+            toron_core::mailbox::guard::SHARED_SAFE_PATHS,
+            &resolve,
+        );
+        assert!(
+            own.is_empty(),
+            "the owner's own lease must cover its commit with no roster: {own:?}"
+        );
+
+        let foreign = toron_core::mailbox::guard::guard_check_strict_resolved(
+            Some("GhostPin"),
+            &staged,
+            &reservations,
+            toron_core::mailbox::guard::SHARED_SAFE_PATHS,
+            &resolve,
+        );
+        assert_eq!(
+            foreign.len(),
+            1,
+            "an unattributable pin must stay blocked: {foreign:?}"
         );
     }
 }

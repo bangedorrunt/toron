@@ -1434,6 +1434,28 @@ impl Mailbox {
         self.agent_keys_for(&canonical, &resolved)
     }
 
+    /// Canonical hex pubkey for `name` in `project_slug`, or `None` when the
+    /// agent holds no local key here (bd-guard-holder-identity-fold-dqog).
+    ///
+    /// Why this is public: the strict sweep-guard must attribute a commit to
+    /// the SAME identity `reserve acquire --as <name>` stamped its lease
+    /// with. Acquire resolves a name through LOCAL KEY MATERIAL
+    /// ([`Self::agent_keys_for`], never the roster), so the guard resolves it
+    /// the same way — a name→pubkey map that survives a roster read failure.
+    /// The alias-resolving [`Self::agent_keys_for_resolved`] comes first (a
+    /// slug acts as its pin), then the exact-name primitive as the fallback.
+    ///
+    /// Fail-closed: no local key = `None`. Never a guess, never a wildcard.
+    pub async fn agent_pubkey_hex(&self, project_slug: &str, name: &str) -> Option<String> {
+        if let Ok(keys) = self.agent_keys_for_resolved(project_slug, name).await {
+            return Some(keys.public_key().to_hex());
+        }
+        let canonical = self.canonical_project(project_slug).await;
+        self.agent_keys_for(&canonical, name)
+            .ok()
+            .map(|keys| keys.public_key().to_hex())
+    }
+
     /// Per-message NIP-17 wrap idempotency cache (not assignment SLA).
     fn receipt_time(&self, project: &str, agent: &str, id: &EventId, kind: &str) -> Option<i64> {
         self.wrap_times()
