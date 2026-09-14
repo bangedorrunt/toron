@@ -19,7 +19,16 @@
 //! This module never retries: [`invoke`] calls the dispatch closure exactly
 //! once. Retry, backoff, and effect-safety live in the one engine/host retry
 //! coordinator (ADR-0032 Spec 7). Effect journaling and run-context threading
-//! are host-owned (follow-up bead); [`RunContext`] is the consumable contract.
+//! are host-owned; [`RunContext`] is the consumable contract. Host-owned does
+//! not mean silent: an effectful host sink dispatched with no injected
+//! [`crate::engine::EffectRunner`] is marked
+//! [`crate::engine::EFFECT_JOURNAL_BYPASSED`] on its value, and a sink an
+//! injected runner does not cover is marked
+//! [`crate::engine::EFFECT_JOURNAL_SINK_UNCOVERED`], each with a loud reason —
+//! so a run that journaled nothing reads as a gap, never as a settled effect.
+//! The first embedding adopted the contract 2026-09-14: flywheel injects a
+//! host-owned runner (`flywheel/src/effect_journal.rs`) for every run that
+//! really dispatches (`bd-engine-run-path-journaling-fwlx`).
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};

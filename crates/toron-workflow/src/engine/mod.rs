@@ -138,6 +138,12 @@ pub use control_flow::{
     GraphNodeInput, ParallelCopyInput, build_workflow_run_terminal, run_graph_node,
     run_parallel_copy, run_workflow, stamp_workflow_emitted,
 };
+// bd-engine-run-path-journaling-fwlx: the effect-journal bypass markers are
+// part of the contract an embedding reports against — an injected
+// `EffectRunner` that does not cover a host sink must carry the SAME marker the
+// engine's own fall-through uses, or the ledger grows two vocabularies for one
+// gap.
+pub use control_flow::{EFFECT_JOURNAL_BYPASSED, EFFECT_JOURNAL_SINK_UNCOVERED};
 pub use reconcile::{
     CleanupKind, CleanupRequest, DispatchPlan, EffectView, FORCED_CLEANUP_CAPABILITY,
     ProviderCapability, ProviderOutcome, ReplayMismatch, RetentionPolicy, UnknownReport,
@@ -315,6 +321,25 @@ impl WorkflowEngine {
         )
     }
 
+    /// Like [`Self::local_with_resolvers`] **and** [`Self::local_with_effect_runner`]
+    /// at once (bd-engine-run-path-journaling-fwlx): an embedding that has both
+    /// resolvers and a journaling runner previously had to drop one — the
+    /// combined funnel was private, so `spawn`/`call_workflow` resolution or the
+    /// effect journal was lost. `None` preserves the legacy compat path.
+    pub fn local_with_resolvers_and_effect(
+        action_runner: ActionRunner,
+        profile_resolver: ProfileResolver,
+        workflow_resolver: WorkflowResolver,
+        effect_runner: Option<EffectRunner>,
+    ) -> anyhow::Result<Self> {
+        Self::local_with_resolvers_effect(
+            action_runner,
+            profile_resolver,
+            workflow_resolver,
+            effect_runner,
+        )
+    }
+
     /// Funnel for the local constructors: all four established above.
     fn local_with_resolvers_effect(
         action_runner: ActionRunner,
@@ -410,6 +435,26 @@ impl WorkflowEngine {
         )
     }
 
+    /// Like [`Self::remote_with_resolvers`] **and**
+    /// [`Self::remote_with_effect_runner`] at once
+    /// (bd-engine-run-path-journaling-fwlx): the remote (durable-server) twin of
+    /// [`Self::local_with_resolvers_and_effect`].
+    pub fn remote_with_resolvers_and_effect(
+        url: impl Into<String>,
+        action_runner: ActionRunner,
+        profile_resolver: ProfileResolver,
+        workflow_resolver: WorkflowResolver,
+        effect_runner: Option<EffectRunner>,
+    ) -> anyhow::Result<Self> {
+        Self::remote_with_resolvers_effect(
+            url,
+            action_runner,
+            profile_resolver,
+            workflow_resolver,
+            effect_runner,
+        )
+    }
+
     /// Funnel for the remote constructors.
     fn remote_with_resolvers_effect(
         url: impl Into<String>,
@@ -455,13 +500,13 @@ impl WorkflowEngine {
 
     /// The default `ProfileResolver`: every profile is unknown (the embedding
     /// must inject a real one for `spawn` to succeed).
-    fn default_resolver() -> ProfileResolver {
+    pub fn default_resolver() -> ProfileResolver {
         Arc::new(|_name: &str| None)
     }
 
     /// The default `WorkflowResolver`: no named workflows (call_workflow fails
     /// until the embedding injects a catalog).
-    fn default_workflow_resolver() -> WorkflowResolver {
+    pub fn default_workflow_resolver() -> WorkflowResolver {
         Arc::new(|_name: &str| None)
     }
 
