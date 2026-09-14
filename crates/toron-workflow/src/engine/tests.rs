@@ -840,9 +840,19 @@ graph:
         .next_back()
         .expect("oracle dispatch spec");
     let task = oracle_spec.task.as_deref().expect("oracle task present");
+    // Pinned on the scout key/value, not a JSON prefix: the step value now
+    // also carries the journal marker below, so a prefix match would pin
+    // field order rather than the fan-out reaching the oracle.
     assert!(
-        task.contains("[{\"scouted\":true}"),
+        task.contains("\"scouted\":true"),
         "oracle saw the fan-out: {task}"
+    );
+    // bd-engine-run-path-journaling-fwlx: these copies were dispatched with no
+    // EffectRunner, so the bypass marker rides their values and therefore the
+    // downstream render — the journal gap is visible, never silent.
+    assert!(
+        task.contains("effect_journal"),
+        "the journal bypass is visible downstream, not silent: {task}"
     );
     // The runner saw 3 scout copies + 1 oracle dispatch, never a raw
     // parallel action.
@@ -1274,6 +1284,179 @@ steps:
         }
         _ => unreachable!(),
     }
+}
+
+/// Recursive marker lookup: the engine wraps step values differently on the
+/// invoke vs graph paths, and this test pins the MARKER, not the wrapping.
+fn find_marker(v: &serde_json::Value, key: &str) -> Option<String> {
+    match v {
+        serde_json::Value::Object(m) => m
+            .get(key)
+            .and_then(|x| x.as_str())
+            .map(str::to_string)
+            .or_else(|| m.values().find_map(|x| find_marker(x, key))),
+        serde_json::Value::Array(a) => a.iter().find_map(|x| find_marker(x, key)),
+        _ => None,
+    }
+}
+
+/// ADR-0032 Spec 6 (bd-engine-run-path-journaling-fwlx): an EFFECTFUL leaf
+/// dispatched with no injected `EffectRunner` wrote no journal row. That must
+/// not be a SILENT bypass — warn-first, like the ADR-0022 plan-artifact gate:
+/// the value carries a machine-readable marker so a journal-less embedding is
+/// visible in the run ledger instead of looking journaled.
+#[tokio::test]
+async fn effectful_leaf_without_effect_runner_is_marked_not_silent() {
+    let runner: ActionRunner = Arc::new(|_a: &Action| Ok(serde_json::json!({ "ok": true })));
+    let engine = WorkflowEngine::local(runner).expect("engine");
+    let wf = parse_workflow(
+        r##"
+name: journal-bypass
+trigger:
+  type: webhook
+steps:
+  - name: notify
+    action: send_dm
+    to: "pi"
+    body: "hi"
+"##,
+    )
+    .expect("parse journal-bypass workflow");
+
+    let output = engine
+        .invoke("wf-bypass-1", wf, serde_json::json!({}))
+        .await
+        .expect("invoke returns run output");
+
+    assert_eq!(
+        find_marker(&output, "effect_journal").as_deref(),
+        Some("bypassed-no-effect-runner"),
+        "an effectful leaf with no EffectRunner must not look journaled: {output}"
+    );
+}
+
+/// Control for the marker above: with an `EffectRunner` injected the same
+/// effectful leaf goes through the context-bearing surface, so there is no
+/// bypass to mark.
+#[tokio::test]
+async fn effectful_leaf_with_effect_runner_is_not_marked() {
+    let runner: ActionRunner = Arc::new(|_a: &Action| Ok(serde_json::json!({ "ok": true })));
+    let calls = Arc::new(std::sync::Mutex::new(0usize));
+    let calls_clone = calls.clone();
+    let fx: EffectRunner = Arc::new(move |_inv: &ActionInvocation| {
+        *calls_clone.lock().unwrap() += 1;
+        Ok(serde_json::json!({ "journaled": true }))
+    });
+    let engine =
+        WorkflowEngine::local_with_effect_runner(runner, Some(fx)).expect("engine with runner");
+    let wf = parse_workflow(
+        r##"
+name: journal-covered
+trigger:
+  type: webhook
+steps:
+  - name: notify
+    action: send_dm
+    to: "pi"
+    body: "hi"
+"##,
+    )
+    .expect("parse journal-covered workflow");
+
+    let output = engine
+        .invoke("wf-covered-1", wf, serde_json::json!({}))
+        .await
+        .expect("invoke returns run output");
+
+    assert_eq!(
+        *calls.lock().unwrap(),
+        1,
+        "the injected effect runner handled the leaf"
+    );
+    assert!(
+        find_marker(&output, "effect_journal").is_none(),
+        "a journaled run carries no bypass marker: {output}"
+    );
+}
+
+/// bd-engine-run-path-journaling-fwlx: a real embedding needs BOTH resolvers
+/// (so `spawn`/`call_workflow` resolve) AND a journaling `EffectRunner` (so an
+/// effectful leaf journals instead of bypassing). Only the combined funnel had
+/// both, and it was private — the public constructors each dropped one. Prove
+/// the combined constructor installs both: the resolver resolves the sub-run
+/// and the effect runner handles the effectful leaf inside it.
+#[tokio::test]
+async fn resolvers_and_effect_runner_coexist_on_one_engine() {
+    let runner: ActionRunner = Arc::new(|_a: &Action| Ok(serde_json::json!({ "ok": true })));
+    let resolved = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let resolved_c = resolved.clone();
+    let child = parse_workflow(
+        r##"
+name: journal-child
+trigger:
+  type: webhook
+steps:
+  - name: dispatch
+    action: dispatch_job
+    assignee: pi
+    spec:
+      task: work
+"##,
+    )
+    .expect("child");
+    let workflow_resolver: WorkflowResolver = Arc::new(move |name: &str| {
+        if name == "journal-child" {
+            resolved_c.store(true, std::sync::atomic::Ordering::SeqCst);
+            Some(child.clone())
+        } else {
+            None
+        }
+    });
+    let profile_resolver: ProfileResolver = Arc::new(|_: &str| None);
+    let calls = Arc::new(std::sync::Mutex::new(0usize));
+    let calls_c = calls.clone();
+    let fx: EffectRunner = Arc::new(move |_inv: &ActionInvocation| {
+        *calls_c.lock().unwrap() += 1;
+        Ok(serde_json::json!({ "journaled": true }))
+    });
+    let engine = WorkflowEngine::local_with_resolvers_and_effect(
+        runner,
+        profile_resolver,
+        workflow_resolver,
+        Some(fx),
+    )
+    .expect("engine with resolvers + effect runner");
+    let wf = parse_workflow(
+        r##"
+name: journal-parent
+trigger:
+  type: webhook
+steps:
+  - name: sub
+    action: call_workflow
+    workflow: journal-child
+"##,
+    )
+    .expect("parent");
+
+    let output = engine
+        .invoke("wf-resolvers-and-effect-1", wf, serde_json::json!({}))
+        .await
+        .expect("invoke returns run output");
+
+    assert!(
+        resolved.load(std::sync::atomic::Ordering::SeqCst),
+        "the injected workflow resolver resolved the sub-run"
+    );
+    assert_eq!(
+        *calls.lock().unwrap(),
+        1,
+        "the injected effect runner handled the child's dispatch_job leaf: {output}"
+    );
+    assert!(
+        find_marker(&output, "effect_journal").is_none(),
+        "a journaled run carries no bypass marker: {output}"
+    );
 }
 
 /// P3.4 (ADR-0005 Spec 2): a workflow with NO trigger (`trigger:` omitted)

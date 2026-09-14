@@ -418,6 +418,68 @@ fn dispatch_leaf(ctx: &Context, invocation: &ActionInvocation) -> Option<serde_j
     })
 }
 
+/// ADR-0032 Spec 6 (bd-engine-run-path-journaling-fwlx): an effectful leaf
+/// dispatched with NO `EffectRunner` wrote no journal row. Warn-first (cf. the
+/// ADR-0022 plan-artifact gate: warn + tag, never block — the flip owns
+/// blocking): the value carries this marker so a journal-less embedding is
+/// visible in the run ledger instead of looking journaled.
+///
+/// The fail-closed flip is still the follow-up, but the precondition it named
+/// is met: flywheel injects a host-owned `EffectRunner` for every run that
+/// really dispatches (`flywheel/src/effect_journal.rs`, 2026-09-14). The flip
+/// is now gated on the remaining bead items — routing `HostSink{verify}`
+/// through the effect surface, and keeping the dry arms (`workflow run`
+/// without `--execute`, `cron run` without `--live`) unjournaled by design
+/// rather than refused. Until then this stays warn + tag, because refusing
+/// would fail those two legitimate journal-less paths.
+pub const EFFECT_JOURNAL_BYPASSED: &str = "bypassed-no-effect-runner";
+
+/// Same bypass, but an `EffectRunner` IS injected and simply does not cover
+/// this host sink (`dispatch_leaf` handles mailbox/job, not verify) — a
+/// different gap with a different fix, so a different marker.
+pub const EFFECT_JOURNAL_SINK_UNCOVERED: &str = "bypassed-sink-uncovered";
+
+/// Dispatch one rendered leaf through the context-bearing [`EffectRunner`]
+/// when one is injected, else the legacy compat runner. A HOST-SINK leaf that
+/// falls through to the legacy runner wrote no journal row, so it is marked
+/// and warned about loudly (ADR-0032 Spec 6: no silent bypass). Pure and
+/// engine-control leaves pass through untouched.
+fn dispatch_leaf_or_compat(
+    ctx: &Context,
+    runner: &ActionRunner,
+    invocation: &ActionInvocation,
+) -> serde_json::Value {
+    if let Some(value) = dispatch_leaf(ctx, invocation) {
+        return value;
+    }
+    let sink = match partition(&invocation.action) {
+        ActionPartition::HostSink { sink } => Some(sink),
+        _ => None,
+    };
+    let mut value = match (runner)(&invocation.action) {
+        Ok(value) => value,
+        Err(e) => serde_json::json!({ "ok": false, "error": e.to_string() }),
+    };
+    let Some(sink) = sink else {
+        return value;
+    };
+    let stored: Arc<Option<EffectRunner>> = ctx.get_dependency::<Option<EffectRunner>>();
+    let marker = if (*stored).is_some() {
+        EFFECT_JOURNAL_SINK_UNCOVERED
+    } else {
+        EFFECT_JOURNAL_BYPASSED
+    };
+    eprintln!(
+        "toron-workflow: effectful '{sink}' action '{}' wrote NO effect-journal row ({marker}) — \
+         ADR-0032 Spec 6 forbids a silent bypass; inject an EffectRunner covering this sink",
+        invocation.action.type_name()
+    );
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert("effect_journal".into(), serde_json::json!(marker));
+    }
+    value
+}
+
 /// Boxed because control-flow actions recurse (`run_step` → `run_retry` →
 /// `run_step`, …) — async recursion requires a heap-allocated future.
 // Threaded dispatch context (run identity for leaf invocations) exceeds the
@@ -576,14 +638,7 @@ pub(crate) fn run_step_with_enclosing<'a>(
                                 attempt,
                                 enclosing_retry.map(|(m, _)| m).unwrap_or(1),
                             );
-                            dispatch_leaf(ctx, &invocation).unwrap_or_else(|| {
-                                match (runner)(&invocation.action) {
-                                    Ok(value) => value,
-                                    Err(e) => {
-                                        serde_json::json!({ "ok": false, "error": e.to_string() })
-                                    }
-                                }
-                            })
+                            dispatch_leaf_or_compat(ctx, runner, &invocation)
                         }
                         Err(e) => {
                             serde_json::json!({ "ok": false, "error": format!("render: {e}") })
@@ -2081,12 +2136,7 @@ pub async fn run_graph_node(
         input.attempt,
         1,
     );
-    Ok(
-        dispatch_leaf(ctx, &invocation).unwrap_or_else(|| match (runner)(&invocation.action) {
-            Ok(value) => value,
-            Err(e) => serde_json::json!({ "ok": false, "error": e.to_string() }),
-        }),
-    )
+    Ok(dispatch_leaf_or_compat(ctx, runner.as_ref(), &invocation))
 }
 
 /// The `toron:workflow-emitted` stamp (ADR-0004 Ship 2 / bd-pkc part 3).
