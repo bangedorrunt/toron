@@ -7,6 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 ### Added
+- Engine run-path journal honesty (ADR-0032 Spec 6, `bd-engine-run-path-journaling-fwlx`): an effectful host-sink leaf dispatched with no injected `EffectRunner` is now marked `EFFECT_JOURNAL_BYPASSED` (`bypassed-no-effect-runner`) on its step value instead of falling through to the compat runner unflagged, and a sink an injected runner does not cover is marked `EFFECT_JOURNAL_SINK_UNCOVERED` (`bypassed-sink-uncovered`) — two markers because they are two gaps with two different fixes. Both warn loudly with the reason. Pure and engine-control leaves pass through untouched, and nothing blocks: the fail-closed flip is the remaining bead item, now that flywheel injects a runner (`flywheel/src/effect_journal.rs`).
 - Captain alias auto-bind at project ensure; roster recency (`last_active`, stale flag) with prune cadence; mail-surface honesty (read semantic, typed contact requests, corr re-use never returns a stale id).
 - Receipts `degraded` state (acked-unknown, never resend-inviting) with printed corr-preserving resend pointer; `--resolve-bead` structural done-hold tag.
 - Outer urgency tag on gift-wrap (visible without decrypting); `WhoIs.stale` defaults for pre-F2 daemon rows (wire compat).
@@ -17,6 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Docs
 - ADR-0027 Tick Law sentence: live path is held (grounding leftover table stays historical).
+- ADR-0032 records the 2026-09-14 implementation state (engine bypass markers + the first embedding adopting the host-owned journal); `engine/boundary.rs` no longer says a journal-less run is invisible.
 
 ## [1.5.0] — 2026-09-10 ADR-0031 slices S1–S5 plus xstate steals
 
