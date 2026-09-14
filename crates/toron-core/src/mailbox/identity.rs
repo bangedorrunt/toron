@@ -45,6 +45,28 @@ pub struct RegisteredAgent {
     pub created: bool,
 }
 
+/// Read-only preview of a bootstrap registration: what
+/// [`Mailbox::plan_agent_registration`] would do, with no write, no publish,
+/// and no key material.
+///
+/// bd-toron-bootstrap-dryrun-mutates-1-we4c: `-n/--dry-run` is a GLOBAL flag
+/// whose own help promises "show changes without running", so a mutating arm
+/// that ignores it hands the caller a side effect they cannot retry away
+/// (the next real run can no longer show what it would have done). This is the
+/// shape that flag needs: the decision inputs, never the mutation.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AgentRegistrationPlan {
+    /// Agent name (project-scoped).
+    pub name: String,
+    /// Canonical project slug a real registration would bind.
+    pub project_slug: String,
+    /// Absolute path a real registration would write the ncryptsec to.
+    pub key_path: String,
+    /// True when a real registration would mint a fresh keypair; false when an
+    /// existing local key would be reused.
+    pub created: bool,
+}
+
 /// What absorbing one folded slug changed (bd-legacy-slug-inbox-onoj).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
 pub struct SlugAbsorption {
@@ -204,6 +226,33 @@ impl Mailbox {
             .await;
         agent.created = created;
         Ok(agent)
+    }
+
+    /// Read-only preview of [`Self::register_agent`]
+    /// (bd-toron-bootstrap-dryrun-mutates-1-we4c): the same decision inputs —
+    /// canonical slug, the swarm-name gate, the key path a real run would
+    /// write, and whether a fresh keypair would be minted — with no write, no
+    /// publish, and no key material.
+    ///
+    /// Everything a caller could be refused for still refuses here (the gate
+    /// runs first), so a plan never promises what the real call would reject.
+    pub async fn plan_agent_registration(
+        &self,
+        project_slug: &str,
+        profile: &AgentProfile,
+    ) -> anyhow::Result<AgentRegistrationPlan> {
+        let project_slug = self.canonical_project(project_slug).await; // ADR-0017
+        self.check_swarm_name(&project_slug, &profile.name).await?;
+        let key_path = self.agent_key_path(&project_slug, &profile.name);
+        let existing = self
+            .load_agent_key(&key_path)
+            .or_else(|| self.alt_agent_key(&project_slug, &profile.name));
+        Ok(AgentRegistrationPlan {
+            name: profile.name.clone(),
+            project_slug,
+            key_path: key_path.display().to_string(),
+            created: existing.is_none(),
+        })
     }
 
     /// ADR-0018: swarm-mode gate — a non-canonical agent name is rejected
@@ -1397,6 +1446,47 @@ mod tests {
             task_description: Some("lane test agent".into()),
             persona: None,
         }
+    }
+
+    /// bd-toron-bootstrap-dryrun-mutates-1-we4c: a dry-run preview must be
+    /// read-only. The plan names the key file a real run would write and
+    /// whether that run would mint a keypair — and mints nothing.
+    #[tokio::test]
+    async fn plan_agent_registration_writes_nothing() {
+        let (mailbox, db_path, data_dir) = test_mailbox("plan-no-write").await;
+        mailbox.ensure_project("demo-plan").await.expect("ensure");
+
+        let plan = mailbox
+            .plan_agent_registration("demo-plan", &profile("QuietHeron"))
+            .await
+            .expect("plan");
+        assert_eq!(plan.name, "QuietHeron");
+        assert!(plan.created, "a fresh project would mint a keypair");
+        assert!(
+            plan.key_path.ends_with("key.ncryptsec"),
+            "names the key file a real run would write: {}",
+            plan.key_path
+        );
+        assert!(
+            !std::path::Path::new(&plan.key_path).exists(),
+            "the dry run minted key material at {} — the one side effect callers cannot retry away",
+            plan.key_path
+        );
+
+        // After a REAL registration the plan reports reuse, never a second mint.
+        mailbox
+            .register_agent("demo-plan", &profile("QuietHeron"))
+            .await
+            .expect("register");
+        let plan = mailbox
+            .plan_agent_registration("demo-plan", &profile("QuietHeron"))
+            .await
+            .expect("plan again");
+        assert!(!plan.created, "an existing key is reused, not re-minted");
+        assert!(std::path::Path::new(&plan.key_path).exists());
+
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_dir_all(data_dir);
     }
 
     /// ADR-0018: a mailbox with an index pool attached (mode persistence

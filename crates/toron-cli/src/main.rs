@@ -134,7 +134,7 @@ fn run(cli: &Cli) -> anyhow::Result<ExitCode> {
         | Command::Contact(_)
         | Command::Agent(_)
         | Command::Guard(_) => {
-            run_robot(command)?;
+            run_robot(command, cli.globals.dry_run)?;
             ExitCode::SUCCESS
         }
         Command::Channel(_)
@@ -305,7 +305,7 @@ async fn run_serve(
 /// instrumented into the operator metrics (bd-led.8.2): tool name + duration on
 /// success, an error counter on failure.
 #[tokio::main]
-async fn run_robot(command: &Command) -> anyhow::Result<()> {
+async fn run_robot(command: &Command, dry_run: bool) -> anyhow::Result<()> {
     // bd-pin-public-plane-s-easy.14: the robot path uses the SAME mailbox
     // selector as flywheel — daemon when configured/serving, else the
     // durable XDG root. No second in-process mailbox when the daemon serves.
@@ -329,7 +329,7 @@ async fn run_robot(command: &Command) -> anyhow::Result<()> {
             robot::run_guard_daemon(dc, cmd).await
         }
         (crate::mailbox_source::MailboxSource::Daemon(dc), Command::Agent(cmd)) => {
-            robot::run_agent_daemon(dc, cmd).await
+            robot::run_agent_daemon(dc, cmd, dry_run).await
         }
         (crate::mailbox_source::MailboxSource::Daemon(dc), Command::AckSla(cmd)) => {
             robot::run_ack_sla_daemon(dc, cmd).await
@@ -350,7 +350,7 @@ async fn run_robot(command: &Command) -> anyhow::Result<()> {
             robot::run_guard(mb, cmd).await
         }
         (crate::mailbox_source::MailboxSource::Embedded(mb), Command::Agent(cmd)) => {
-            robot::run_agent(mb, cmd).await
+            robot::run_agent(mb, cmd, dry_run).await
         }
         (crate::mailbox_source::MailboxSource::Embedded(mb), Command::AckSla(cmd)) => {
             robot::run_ack_sla(mb, cmd).await
