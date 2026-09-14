@@ -21,8 +21,8 @@ use crate::schema::{Action, Graph, Step, StepOnError};
 use super::template::{RenderContext, render_action, render_action_lenient, render_text};
 use super::{
     ActionInvocation, ActionPartition, ActionRunner, ApprovalSink, Decision, EffectJournalMode,
-    EffectRunner, ExecutionPolicy, FailureKind, ProfileResolver, RunContext, RunInput, SpawnSink,
-    WorkflowEngine, WorkflowResolver, partition,
+    EffectRunner, ExecutionPolicy, FailureKind, ProfileResolver, RunContext, RunInput, RunJournal,
+    RunPhase, RunTransition, SpawnSink, WorkflowEngine, WorkflowResolver, partition,
 };
 
 use sha2::{Digest, Sha256};
@@ -200,7 +200,25 @@ pub async fn run_workflow(
     // bd-zczp: canonical digest travels with the run so every leaf can
     // mint run-scoped effect keys without re-canonicalizing per step.
     let workflow_digest = crate::identity::workflow_digest(workflow);
-    run_graph(
+    // bd-mi9n: the run reports its OWN lifecycle through the same injected
+    // journal its effects go through, so an engine-driven run has a
+    // `workflow_runs` row without the embedding calling
+    // `create_run`/`cas_run_status` itself — and the run row and the effect
+    // rows agree on `run_id` by construction (same field). Absent journal =
+    // no run rows (the embedding owns its lifecycle, as before).
+    let run_journal_dep = ctx.get_dependency::<Option<RunJournal>>();
+    let run_journal: Option<&RunJournal> = run_journal_dep.as_ref().as_ref();
+    if let Some(journal) = run_journal {
+        for phase in [RunPhase::Started, RunPhase::Running] {
+            journal(&RunTransition {
+                run_id: run_id.clone(),
+                workflow: workflow_name.clone(),
+                workflow_digest: workflow_digest.clone(),
+                phase,
+            });
+        }
+    }
+    let outcome = run_graph(
         ctx,
         &input.trigger,
         &graph,
@@ -208,7 +226,26 @@ pub async fn run_workflow(
         &workflow_name,
         &workflow_digest,
     )
-    .await
+    .await;
+    if let Some(journal) = run_journal {
+        // The engine's ONE outcome rule (same one `build_workflow_run_terminal`
+        // reads): an outcome carrying `status: "failed"` is the failure, any
+        // other Ok is success, and an Err is a failure.
+        let phase = match &outcome {
+            Ok(v) if v.get("status").and_then(serde_json::Value::as_str) == Some("failed") => {
+                RunPhase::Failed
+            }
+            Ok(_) => RunPhase::Succeeded,
+            Err(_) => RunPhase::Failed,
+        };
+        journal(&RunTransition {
+            run_id: run_id.clone(),
+            workflow: workflow_name.clone(),
+            workflow_digest: workflow_digest.clone(),
+            phase,
+        });
+    }
+    outcome
 }
 
 /// Execute an ordered list of steps, accumulating outputs into `step_outputs`

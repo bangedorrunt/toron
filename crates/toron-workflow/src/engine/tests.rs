@@ -2822,3 +2822,155 @@ steps:
         _ => unreachable!(),
     }
 }
+
+// ---------------------------------------------------------------------------
+// bd-mi9n: engine-side run-lifecycle rows through the injected journal.
+// ---------------------------------------------------------------------------
+
+/// A journal that records every transition it is handed.
+fn recording_run_journal() -> (RunJournal, Arc<std::sync::Mutex<Vec<RunTransition>>>) {
+    let seen: Arc<std::sync::Mutex<Vec<RunTransition>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = seen.clone();
+    let journal: RunJournal = Arc::new(move |t: &RunTransition| {
+        sink.lock().unwrap().push(t.clone());
+    });
+    (journal, seen)
+}
+
+fn phases(seen: &Arc<std::sync::Mutex<Vec<RunTransition>>>) -> Vec<RunPhase> {
+    seen.lock().unwrap().iter().map(|t| t.phase).collect()
+}
+
+/// The engine reports its own lifecycle: a run through an injected journal
+/// yields Started -> Running -> Succeeded, all carrying the run's id (so the
+/// run row and its effect rows agree).
+#[tokio::test]
+async fn run_lifecycle_rows_are_journaled_for_a_successful_run() {
+    let runner: ActionRunner = Arc::new(|_a: &Action| Ok(serde_json::json!({ "ok": true })));
+    let (journal, seen) = recording_run_journal();
+    let engine = WorkflowEngine::local_with_resolvers_effect_mode_and_run_journal(
+        runner,
+        WorkflowEngine::default_resolver(),
+        WorkflowEngine::default_workflow_resolver(),
+        None,
+        EffectJournalMode::Recording,
+        Some(journal),
+    )
+    .expect("engine with run journal");
+    let wf = parse_workflow(
+        r##"
+name: lifecycle-ok
+trigger:
+  type: webhook
+steps:
+  - name: wait
+    action: delay
+    secs: 0
+"##,
+    )
+    .expect("parse lifecycle-ok workflow");
+
+    let output = engine
+        .invoke("wf-lifecycle-ok-1", wf, serde_json::json!({}))
+        .await
+        .expect("invoke returns run output");
+    assert!(
+        output.get("status") != Some(&serde_json::json!("failed")),
+        "the fixture run succeeds: {output}"
+    );
+
+    assert_eq!(
+        phases(&seen),
+        vec![RunPhase::Started, RunPhase::Running, RunPhase::Succeeded],
+        "Started -> Running -> terminal Succeeded"
+    );
+    let rows = seen.lock().unwrap();
+    assert!(
+        rows.iter().all(|t| t.run_id == "wf-lifecycle-ok-1"),
+        "every lifecycle row carries the run's own id (the id its effect rows carry): {rows:?}"
+    );
+    assert!(
+        rows.iter().all(|t| t.workflow == "lifecycle-ok"),
+        "the run row knows which workflow it is: {rows:?}"
+    );
+    assert!(
+        rows.iter().all(|t| !t.workflow_digest.is_empty()),
+        "the digest travels with the lifecycle rows too: {rows:?}"
+    );
+}
+
+/// A failed run reports the Failed terminal — never a bare stop.
+#[tokio::test]
+async fn run_lifecycle_rows_report_failure() {
+    let runner: ActionRunner = Arc::new(|_a: &Action| Err(anyhow::anyhow!("provider exploded")));
+    let (journal, seen) = recording_run_journal();
+    let engine = WorkflowEngine::local_with_resolvers_effect_mode_and_run_journal(
+        runner,
+        WorkflowEngine::default_resolver(),
+        WorkflowEngine::default_workflow_resolver(),
+        None,
+        EffectJournalMode::Recording,
+        Some(journal),
+    )
+    .expect("engine with run journal");
+    let wf = parse_workflow(
+        r##"
+name: lifecycle-fail
+trigger:
+  type: webhook
+steps:
+  - name: boom
+    action: send_dm
+    to: "pi"
+    body: "hi"
+    on_error: fail_run
+"##,
+    )
+    .expect("parse lifecycle-fail workflow");
+
+    let output = engine
+        .invoke("wf-lifecycle-fail-1", wf, serde_json::json!({}))
+        .await
+        .expect("invoke returns run output");
+    assert_eq!(
+        output["status"],
+        serde_json::json!("failed"),
+        "the fixture run fails: {output}"
+    );
+
+    assert_eq!(
+        phases(&seen),
+        vec![RunPhase::Started, RunPhase::Running, RunPhase::Failed],
+        "Started -> Running -> terminal Failed"
+    );
+}
+
+/// No journal injected = no lifecycle claims (a journal-less embedding keeps
+/// its own lifecycle calls; the engine must not invent rows).
+#[tokio::test]
+async fn run_lifecycle_is_silent_without_a_journal() {
+    let runner: ActionRunner = Arc::new(|_a: &Action| Ok(serde_json::json!({ "ok": true })));
+    let engine = WorkflowEngine::local(runner).expect("journal-less engine");
+    let wf = parse_workflow(
+        r##"
+name: lifecycle-silent
+trigger:
+  type: webhook
+steps:
+  - name: wait
+    action: delay
+    secs: 0
+"##,
+    )
+    .expect("parse lifecycle-silent workflow");
+
+    let output = engine
+        .invoke("wf-lifecycle-silent-1", wf, serde_json::json!({}))
+        .await
+        .expect("invoke runs without a journal");
+    assert!(
+        output.get("status") != Some(&serde_json::json!("failed")),
+        "the run still completes: {output}"
+    );
+}
