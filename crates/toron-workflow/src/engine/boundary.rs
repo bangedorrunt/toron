@@ -18,17 +18,31 @@
 //!
 //! This module never retries: [`invoke`] calls the dispatch closure exactly
 //! once. Retry, backoff, and effect-safety live in the one engine/host retry
-//! coordinator (ADR-0032 Spec 7). Effect journaling and run-context threading
-//! are host-owned; [`RunContext`] is the consumable contract. Host-owned does
-//! not mean silent: an effectful host sink dispatched with no injected
-//! [`crate::engine::EffectRunner`] is marked
-//! [`crate::engine::EFFECT_JOURNAL_BYPASSED`] on its value, and a sink an
-//! injected runner does not cover is marked
-//! [`crate::engine::EFFECT_JOURNAL_SINK_UNCOVERED`], each with a loud reason —
-//! so a run that journaled nothing reads as a gap, never as a settled effect.
-//! The first embedding adopted the contract 2026-09-14: flywheel injects a
-//! host-owned runner (`flywheel/src/effect_journal.rs`) for every run that
-//! really dispatches (`bd-engine-run-path-journaling-fwlx`).
+//! coordinator (ADR-0032 Spec 7). The journal itself is host-owned;
+//! [`RunContext`] is the consumable contract, and `RunContext.provider_result`
+//! carries the one sink the engine executes itself (`verify`, via the
+//! embedding's `VerifySink`, ADR-0024 Spec 2) so a journaling runner settles
+//! AROUND an effect that already happened instead of re-performing it.
+//!
+//! Host-owned does not mean silent, and the embedding declares how loud it
+//! wants to be (`EffectJournalMode`, ADR-0032 Spec 6):
+//! - `Recording` (default) marks an effectful host sink dispatched with no
+//!   injected [`crate::engine::EffectRunner`] as
+//!   [`crate::engine::EFFECT_JOURNAL_BYPASSED`], and a sink an injected runner
+//!   does not cover as [`crate::engine::EFFECT_JOURNAL_SINK_UNCOVERED`], each
+//!   with a loud reason — the dry arms (`workflow run` without `--execute`,
+//!   `cron run` without `--live`) record instead of perform, so their leaves
+//!   stay visibly unjournaled rather than settled.
+//! - `Enforced` REFUSES an effectful host sink with no injected runner
+//!   (fail-closed), so a dispatcher that really performs effects cannot run an
+//!   effect nobody journaled.
+//!
+//! Both embeddings adopted the contract 2026-09-14
+//! (`bd-engine-run-path-journaling-fwlx`): flywheel injects a host-owned runner
+//! (`flywheel/src/effect_journal.rs`) and the toron host its own
+//! (`toron-mcp/src/workflow_host.rs`), each Enforced on the arms that really
+//! dispatch and Recording on the dry arms. `verify` now routes through
+//! [`partition`]'s host-sink path like every other effectful leaf.
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -342,6 +356,14 @@ pub struct RunContext {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effect_key: Option<String>,
     pub attempt: u32,
+    /// The sink's already-executed result, for sinks the engine executes
+    /// synchronously before the runner is invoked (today: `verify` through
+    /// the embedding's `VerifySink`, ADR-0024 Spec 2). The journaling runner
+    /// settles AROUND this result — the external effect already happened; a
+    /// journal row must observe it, never re-perform it.
+    /// `#[serde(default)]` keeps old serialized invocations loadable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_result: Option<serde_json::Value>,
 }
 
 /// Execution policy selected by the one engine/host coordinator
@@ -836,6 +858,7 @@ mod tests {
                 iteration_key: None,
                 effect_key: None,
                 attempt: 1,
+                provider_result: None,
             },
             execution: ExecutionPolicy {
                 max_attempts: 1,

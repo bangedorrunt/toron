@@ -1379,6 +1379,403 @@ steps:
     );
 }
 
+/// bd-engine-run-path-journaling-fwlx (flip item 1): `verify` is a HostSink
+/// (`ActionPartition::HostSink { sink: "verify" }`), so it routes through the
+/// context-bearing `EffectRunner` like mailbox/job — the runner IS the journal
+/// seam. The `VerifySink` executes the command; the effect runner wraps it.
+#[tokio::test]
+async fn verify_routes_through_the_effect_runner() {
+    let runner: ActionRunner = Arc::new(|_a: &Action| Ok(serde_json::json!({ "ok": true })));
+    let calls = Arc::new(std::sync::Mutex::new(0usize));
+    let calls_clone = calls.clone();
+    let fx: EffectRunner = Arc::new(move |inv: &ActionInvocation| {
+        assert!(
+            matches!(inv.action, Action::Verify { .. }),
+            "the effect runner must see the verify action: {:?}",
+            inv.action.type_name()
+        );
+        *calls_clone.lock().unwrap() += 1;
+        Ok(serde_json::json!({ "ok": true, "journaled": true }))
+    });
+    let engine =
+        WorkflowEngine::local_with_effect_runner(runner, Some(fx)).expect("engine with runner");
+    let wf = parse_workflow(
+        r##"
+name: journal-verify
+trigger:
+  type: webhook
+steps:
+  - name: v
+    action: verify
+    command: "cargo test"
+"##,
+    )
+    .expect("parse journal-verify workflow");
+
+    let output = engine
+        .invoke("wf-verify-fx-1", wf, serde_json::json!({}))
+        .await
+        .expect("invoke returns run output");
+
+    assert_eq!(
+        *calls.lock().unwrap(),
+        1,
+        "verify must be dispatched through the EffectRunner (the journal seam): {output}"
+    );
+    assert!(
+        find_marker(&output, "effect_journal").is_none(),
+        "a journaled verify carries no bypass marker: {output}"
+    );
+}
+
+/// bd-engine-run-path-journaling-fwlx (flip item 2, the fail-closed refuse):
+/// `EffectJournalMode::Enforced` refuses to dispatch an effectful leaf with no
+/// injected `EffectRunner` — the run fails loud naming the gap, instead of
+/// writing unjournaled effects. `Recording` (the default) keeps the warn + tag
+/// behavior so journal-less dry arms stay legal.
+#[tokio::test]
+async fn enforced_mode_refuses_effectful_leaf_without_effect_runner() {
+    let runner: ActionRunner = Arc::new(|_a: &Action| Ok(serde_json::json!({ "ok": true })));
+    let engine = WorkflowEngine::local_with_journal_mode(runner, EffectJournalMode::Enforced)
+        .expect("enforced engine");
+    let wf = parse_workflow(
+        r##"
+name: enforced-refuse
+trigger:
+  type: webhook
+steps:
+  - name: notify
+    action: send_dm
+    to: "pi"
+    body: "hi"
+    on_error: fail_run
+"##,
+    )
+    .expect("parse enforced-refuse workflow");
+
+    let output = engine
+        .invoke("wf-enforced-1", wf, serde_json::json!({}))
+        .await
+        .expect("invoke returns run output");
+
+    assert_eq!(
+        output["status"],
+        serde_json::json!("failed"),
+        "enforced mode must fail the run, not bypass silently: {output}"
+    );
+    assert!(
+        output["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("no EffectRunner")),
+        "the refusal names the missing journal seam: {output}"
+    );
+    assert!(
+        find_marker(&output, "effect_journal").is_none(),
+        "a refused effect never looks journaled: {output}"
+    );
+}
+
+/// The enforced carve-out: pure/engine-control leaves never need a journal, so
+/// a journal-less `Enforced` engine still runs them.
+#[tokio::test]
+async fn enforced_mode_still_runs_pure_and_control_leaves() {
+    let runner: ActionRunner =
+        Arc::new(|a: &Action| Ok(serde_json::json!({ "ok": true, "ran": a.type_name() })));
+    let engine = WorkflowEngine::local_with_journal_mode(runner, EffectJournalMode::Enforced)
+        .expect("enforced engine");
+    let wf = parse_workflow(
+        r##"
+name: enforced-pure
+trigger:
+  type: webhook
+steps:
+  - name: wait
+    action: delay
+    secs: 0
+"##,
+    )
+    .expect("parse enforced-pure workflow");
+
+    let output = engine
+        .invoke("wf-enforced-pure-1", wf, serde_json::json!({}))
+        .await
+        .expect("invoke returns run output");
+
+    assert!(
+        output.get("status") != Some(&serde_json::json!("failed")),
+        "pure leaves must not be refused under enforced mode: {output}"
+    );
+}
+
+/// The dry-arm carve-out must be EXPLICIT, not accidental: under Enforced mode
+/// a journal-less verify is refused even when a `VerifySink` is attached — the
+/// sink executes real external work (a shell command) and must not run
+/// unjournaled. An embedding that wants sink-without-journal (a dry arm) stays
+/// on `Recording`, where the marker keeps it honest in the ledger.
+#[tokio::test]
+async fn enforced_mode_refuses_uncovered_verify_even_with_sink() {
+    let runner: ActionRunner = Arc::new(|_a: &Action| Ok(serde_json::json!({ "ok": true })));
+    let engine = WorkflowEngine::local_with_journal_mode(runner, EffectJournalMode::Enforced)
+        .expect("enforced engine");
+    let wf = parse_workflow(
+        r##"
+name: enforced-verify
+trigger:
+  type: webhook
+steps:
+  - name: v
+    action: verify
+    command: "cargo test"
+    on_error: fail_run
+"##,
+    )
+    .expect("parse enforced-verify workflow");
+    let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let ran_c = ran.clone();
+    let sink = VerifySink::default();
+    *sink.0.lock().unwrap() = Some(std::sync::Arc::new(move |_req: &VerifyRequest| {
+        ran_c.store(true, std::sync::atomic::Ordering::SeqCst);
+        Ok(VerifyResult {
+            ok: true,
+            exit: 0,
+            stdout_path: None,
+            stderr_path: None,
+            error: None,
+        })
+    }));
+    *engine.verify_sink().0.lock().unwrap() = sink.0.lock().unwrap().clone();
+
+    let output = engine
+        .invoke("wf-enforced-verify-1", wf, serde_json::json!({}))
+        .await
+        .expect("invoke returns run output");
+
+    assert_eq!(
+        output["status"],
+        serde_json::json!("failed"),
+        "enforced mode refuses a journal-less verify even when a VerifySink is attached: {output}"
+    );
+    assert!(
+        output["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("no EffectRunner")),
+        "the refusal names the missing journal seam: {output}"
+    );
+    // The refusal is only worth anything if it holds the effect BACK: the sink
+    // runs a real shell command, so "refused" must mean "never executed".
+    assert!(
+        !ran.load(std::sync::atomic::Ordering::SeqCst),
+        "a refused verify must not run its sink — refusing AFTER the command ran would \
+         defeat the point: {output}"
+    );
+}
+
+/// The dry-arm counterpart of the refusal: under `Recording` (the default) a
+/// journal-less verify still runs its sink (a dry run is a faithful preview)
+/// but the value carries the bypass marker, so the absent journal row is
+/// visible in the ledger instead of reading as a clean, journaled verify.
+#[tokio::test]
+async fn recording_mode_verify_without_runner_keeps_the_marker() {
+    let runner: ActionRunner = Arc::new(|_a: &Action| Ok(serde_json::json!({ "ok": true })));
+    let engine = WorkflowEngine::local(runner).expect("recording engine");
+    let wf = parse_workflow(
+        r##"
+name: recording-verify
+trigger:
+  type: webhook
+steps:
+  - name: v
+    action: verify
+    command: "cargo test"
+    on_error: continue
+"##,
+    )
+    .expect("parse recording-verify workflow");
+    let sink = VerifySink::default();
+    *sink.0.lock().unwrap() = Some(std::sync::Arc::new(|_req: &VerifyRequest| {
+        Ok(VerifyResult {
+            ok: true,
+            exit: 0,
+            stdout_path: Some("receipt.txt".to_string()),
+            stderr_path: None,
+            error: None,
+        })
+    }));
+    *engine.verify_sink().0.lock().unwrap() = sink.0.lock().unwrap().clone();
+
+    let output = engine
+        .invoke("wf-recording-verify-1", wf, serde_json::json!({}))
+        .await
+        .expect("invoke returns run output");
+
+    assert_eq!(
+        output["v"]["stdout_path"],
+        serde_json::json!("receipt.txt"),
+        "the sink still executes and projects its result in a dry run: {output}"
+    );
+    assert_eq!(
+        find_marker(&output, "effect_journal").as_deref(),
+        Some("bypassed-no-effect-runner"),
+        "a journal-less verify must announce the missing journal row: {output}"
+    );
+}
+
+/// A verify `command` is a TEMPLATE (`command: "{{inputs.verify}}"` in the
+/// builtin repair loop), so it must be RENDERED before the sink sees it. The
+/// separate verify arm this flip removed skipped the render, so a templated
+/// command reached the sink verbatim — the sink would have run the literal
+/// placeholder instead of the verification command.
+#[tokio::test]
+async fn verify_command_is_rendered_before_the_sink() {
+    let runner: ActionRunner = Arc::new(|_a: &Action| Ok(serde_json::json!({ "ok": true })));
+    let engine = WorkflowEngine::local(runner).expect("recording engine");
+    let wf = parse_workflow(
+        r##"
+name: verify-render
+inputs:
+  - name: cmd
+trigger:
+  type: webhook
+steps:
+  - name: v
+    action: verify
+    command: "echo {{inputs.cmd}}"
+"##,
+    )
+    .expect("parse verify-render workflow");
+    let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen_c = seen.clone();
+    let sink = VerifySink::default();
+    *sink.0.lock().unwrap() = Some(std::sync::Arc::new(move |req: &VerifyRequest| {
+        seen_c.lock().unwrap().push(req.command.clone());
+        Ok(VerifyResult {
+            ok: true,
+            exit: 0,
+            stdout_path: None,
+            stderr_path: None,
+            error: None,
+        })
+    }));
+    *engine.verify_sink().0.lock().unwrap() = sink.0.lock().unwrap().clone();
+
+    engine
+        .invoke(
+            "wf-verify-render-1",
+            wf,
+            serde_json::json!({ "cmd": "cargo test" }),
+        )
+        .await
+        .expect("invoke returns run output");
+
+    assert_eq!(
+        seen.lock().unwrap().as_slice(),
+        ["echo cargo test"],
+        "the sink must receive the RENDERED command, never the raw template"
+    );
+}
+
+/// The sink executes FIRST and its result rides the invocation: an injected
+/// `EffectRunner` must be able to journal the effect that already happened
+/// (`RunContext.provider_result`) without re-running the command (ADR-0024
+/// Spec 2 keeps the sink the executor).
+#[tokio::test]
+async fn effect_runner_observes_the_executed_verify_result() {
+    let runner: ActionRunner = Arc::new(|_a: &Action| Ok(serde_json::json!({ "ok": true })));
+    let observed: Arc<std::sync::Mutex<Option<serde_json::Value>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let observed_c = observed.clone();
+    let fx: EffectRunner = Arc::new(move |inv: &ActionInvocation| {
+        *observed_c.lock().unwrap() = inv.run.provider_result.clone();
+        Ok(serde_json::json!({ "ok": true, "journaled": true }))
+    });
+    let engine =
+        WorkflowEngine::local_with_effect_runner(runner, Some(fx)).expect("engine with runner");
+    let wf = parse_workflow(
+        r##"
+name: verify-observed
+trigger:
+  type: webhook
+steps:
+  - name: v
+    action: verify
+    command: "cargo test"
+"##,
+    )
+    .expect("parse verify-observed workflow");
+    let sink = VerifySink::default();
+    *sink.0.lock().unwrap() = Some(std::sync::Arc::new(|_req: &VerifyRequest| {
+        Ok(VerifyResult {
+            ok: true,
+            exit: 0,
+            stdout_path: Some("receipt.txt".to_string()),
+            stderr_path: None,
+            error: None,
+        })
+    }));
+    *engine.verify_sink().0.lock().unwrap() = sink.0.lock().unwrap().clone();
+
+    engine
+        .invoke("wf-verify-observed-1", wf, serde_json::json!({}))
+        .await
+        .expect("invoke returns run output");
+
+    let observed = observed.lock().unwrap().clone().expect(
+        "the effect runner must receive the sink's already-executed result: a journal row for \
+         verify that re-ran the command would double the external effect",
+    );
+    assert_eq!(observed["stdout_path"], serde_json::json!("receipt.txt"));
+    assert_eq!(observed["ok"], serde_json::json!(true));
+}
+
+/// The covered path: under Enforced mode with an EffectRunner injected, verify
+/// runs through the journal seam and does not fail — enforcement never refuses
+/// a leaf the injected runner covers.
+#[tokio::test]
+async fn enforced_mode_with_effect_runner_runs_verify_through_the_journal() {
+    let runner: ActionRunner = Arc::new(|_a: &Action| Ok(serde_json::json!({ "ok": true })));
+    let calls = Arc::new(std::sync::Mutex::new(0usize));
+    let calls_clone = calls.clone();
+    let fx: EffectRunner = Arc::new(move |_inv: &ActionInvocation| {
+        *calls_clone.lock().unwrap() += 1;
+        Ok(serde_json::json!({ "ok": true, "journaled": true }))
+    });
+    let engine = WorkflowEngine::local_with_resolvers_and_effect_mode(
+        runner,
+        WorkflowEngine::default_resolver(),
+        WorkflowEngine::default_workflow_resolver(),
+        Some(fx),
+        EffectJournalMode::Enforced,
+    )
+    .expect("enforced engine with runner");
+    let wf = parse_workflow(
+        r##"
+name: enforced-covered-verify
+trigger:
+  type: webhook
+steps:
+  - name: v
+    action: verify
+    command: "cargo test"
+"##,
+    )
+    .expect("parse enforced-covered-verify workflow");
+
+    let output = engine
+        .invoke("wf-enforced-covered-1", wf, serde_json::json!({}))
+        .await
+        .expect("invoke returns run output");
+
+    assert_eq!(
+        *calls.lock().unwrap(),
+        1,
+        "the covered verify dispatched once: {output}"
+    );
+    assert!(
+        output.get("status") != Some(&serde_json::json!("failed")),
+        "a covered verify must not be refused under enforced mode: {output}"
+    );
+}
+
 /// bd-engine-run-path-journaling-fwlx: a real embedding needs BOTH resolvers
 /// (so `spawn`/`call_workflow` resolve) AND a journaling `EffectRunner` (so an
 /// effectful leaf journals instead of bypassing). Only the combined funnel had

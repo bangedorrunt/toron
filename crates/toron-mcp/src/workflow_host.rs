@@ -32,12 +32,12 @@ use toron_core::mailbox::{Mailbox, SendMessage, UnwrappedMail};
 use toron_workflow::coalesce::{CoalesceDecision, Coalesced, MentionCoalescer};
 use toron_workflow::engine::{
     ActionInvocation, ActionRunner, CleanupKind, CleanupRequest, Decision, DispatchPlan,
-    EffectRunner, EffectView, FORCED_CLEANUP_CAPABILITY, ParkKind, PendingEntry, PendingRegistry,
-    ProviderCapability, ProviderErrorClass, ProviderOutcome, Resolution, ResolutionMismatch,
-    ResolutionVerdict, RunInput, TerminalLedger, TerminalNote, TerminalRecord, UnknownReport,
-    WorkflowEngine, attribute_parks, capability_for_action_type, classify_provider_error_msg,
-    cleanup_effect_key, corr_for_effect, derive_effect_key, describe_unknown, invoke, plan_attempt,
-    terminal_digest, validate_resolution,
+    EffectJournalMode, EffectRunner, EffectView, FORCED_CLEANUP_CAPABILITY, ParkKind, PendingEntry,
+    PendingRegistry, ProviderCapability, ProviderErrorClass, ProviderOutcome, Resolution,
+    ResolutionMismatch, ResolutionVerdict, RunInput, TerminalLedger, TerminalNote, TerminalRecord,
+    UnknownReport, WorkflowEngine, attribute_parks, capability_for_action_type,
+    classify_provider_error_msg, cleanup_effect_key, corr_for_effect, derive_effect_key,
+    describe_unknown, invoke, plan_attempt, terminal_digest, validate_resolution,
 };
 use toron_workflow::jobs::{JobRequest, build_job_request_with_tags};
 use toron_workflow::schema::{Action, Trigger, Workflow};
@@ -161,6 +161,24 @@ pub(crate) fn compat_request(action: &Action) -> DispatchRequest {
 /// Map one mailbox send error onto a provider outcome (bd-zczp):
 /// ambiguous transport outcomes become Ambiguous (I5 — a timeout is not
 /// proof of absence); deterministic rejections stay ProvenFailed.
+/// Project one engine-observed verify result into a [`ProviderOutcome`]
+/// (bd-engine-run-path-journaling-fwlx): `{ok:true,…}` is a delivered
+/// observation, an in-band `{ok:false,…}` is a PROVEN failure — the sink
+/// returned, so there is no transport ambiguity to reconcile. Same rule
+/// flywheel's effect journal applies to `verify`.
+fn verify_outcome(observed: serde_json::Value) -> ProviderOutcome {
+    match observed.get("ok").and_then(serde_json::Value::as_bool) {
+        Some(true) => ProviderOutcome::Delivered(observed),
+        _ => ProviderOutcome::ProvenFailed(
+            observed
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("verify failed")
+                .to_string(),
+        ),
+    }
+}
+
 fn classify_send_error(msg: String) -> ProviderOutcome {
     match classify_provider_error_msg(&msg) {
         ProviderErrorClass::Ambiguous => ProviderOutcome::Ambiguous(msg),
@@ -622,8 +640,39 @@ pub fn mailbox_effect_runner(
                         }),
                     ))
                 }
-                // Any other HostSink (today: `Verify`) has no sink on this
-                // mailbox-only runner — fail loud, never silently succeed.
+                // `verify` (bd-engine-run-path-journaling-fwlx): the engine
+                // already executed the embedding's `VerifySink` and handed the
+                // observed result over on the invocation (ADR-0024 Spec 2), so
+                // this journals an effect that already happened — the provider
+                // re-runs nothing. Journaling here is what keeps the host's
+                // Enforced contract honest: without it a sink this runner did
+                // not cover would perform a real command with NO journal row.
+                Action::Verify { .. } => {
+                    // No `engine.verify_sink()` is attached on this host, so the
+                    // observed value is normally the sink's own
+                    // `{ok:false, error:"verify sink missing"}` — a typed
+                    // failure naming the real cause, not a generic one.
+                    let observed = inv.run.provider_result.clone().unwrap_or_else(
+                        || serde_json::json!({ "ok": false, "error": "verify sink missing" }),
+                    );
+                    let (key, digest) = scoped_effect_key(inv);
+                    let req = scoped_request(inv, digest, key.clone());
+                    let disp = dispatcher.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                    let Some(disp) = disp else {
+                        // No journal attached: hand the observation straight
+                        // through; `invoke` classifies it (I5) identically.
+                        return Ok(observed);
+                    };
+                    let key_out = key.clone();
+                    Ok(fenced_outcome(
+                        &key_out,
+                        block_on_async(async move {
+                            disp.dispatch(&req, move |_| verify_outcome(observed)).await
+                        }),
+                    ))
+                }
+                // Any other HostSink has no sink on this mailbox-only runner —
+                // fail loud, never silently succeed.
                 _ => Err(anyhow::anyhow!(
                     "effect runner has no sink for '{}'",
                     action.type_name()
@@ -830,13 +879,27 @@ impl WorkflowHost {
             job_signer.clone(),
             dispatcher.clone(),
         );
+        // bd-engine-run-path-journaling-fwlx (the Spec 6 flip): the host
+        // really dispatches, so its engine is Enforced — an effectful leaf
+        // with no journal seam fails loud instead of running unjournaled.
         let engine = match toron_workflow::engine::resonate_server_url() {
-            Some(url) => {
-                WorkflowEngine::remote_with_effect_runner(url, runner, Some(effect_runner))
-                    .context("workflow engine (remote resonate server)")?
-            }
-            None => WorkflowEngine::local_with_effect_runner(runner, Some(effect_runner))
-                .context("workflow engine")?,
+            Some(url) => WorkflowEngine::remote_with_resolvers_and_effect_mode(
+                url,
+                runner,
+                WorkflowEngine::default_resolver(),
+                WorkflowEngine::default_workflow_resolver(),
+                Some(effect_runner),
+                EffectJournalMode::Enforced,
+            )
+            .context("workflow engine (remote resonate server)")?,
+            None => WorkflowEngine::local_with_resolvers_and_effect_mode(
+                runner,
+                WorkflowEngine::default_resolver(),
+                WorkflowEngine::default_workflow_resolver(),
+                Some(effect_runner),
+                EffectJournalMode::Enforced,
+            )
+            .context("workflow engine")?,
         };
         let bus = mailbox.bus().clone();
         Ok(Self {
@@ -5056,6 +5119,7 @@ steps:
                     iteration_key: None,
                     effect_key: None,
                     attempt: 1,
+                    provider_result: None,
                 },
                 execution: ExecutionPolicy {
                     max_attempts: 1,
@@ -5111,6 +5175,137 @@ steps:
             toron_core::index::workflow_effects::EffectState::Settled
         );
         assert_eq!(row.transport_corr.as_deref(), Some(expected_a.as_str()));
+        let _ = std::fs::remove_file(&db);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// bd-engine-run-path-journaling-fwlx: the host journals `verify` around
+    /// the engine-observed `VerifySink` result — the one effectful sink whose
+    /// provider is the ENGINE, not this runner (ADR-0024 Spec 2). Without this
+    /// arm the host's `Enforced` engine would run a sink it cannot journal,
+    /// which is exactly the Spec 6 bypass the flip exists to close.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn effect_runner_journals_verify_around_the_observed_result() {
+        use toron_core::bus::in_process::{InProcessBus, InProcessBusConfig};
+        use toron_core::index::schema;
+        use toron_workflow::engine::{ActionInvocation, ExecutionPolicy, RunContext};
+        let db = std::env::temp_dir().join(format!("wf-verify-{}.sqlite", uuid::Uuid::new_v4()));
+        let pool = schema::connect(db.to_str().unwrap())
+            .await
+            .expect("connect");
+        schema::migrate(&pool).await.expect("migrate");
+        let bus: Arc<dyn Bus> = Arc::new(
+            InProcessBus::open(pool.clone(), InProcessBusConfig::default())
+                .await
+                .expect("bus"),
+        );
+        let data_dir =
+            std::env::temp_dir().join(format!("wf-verify-data-{}", uuid::Uuid::new_v4()));
+        let mailbox = Arc::new(Mailbox::new(bus.clone(), data_dir.clone(), None));
+        let store = toron_core::index::workflow_effects::WorkflowEffectStore::new(pool);
+        let cell = Arc::new(std::sync::Mutex::new(Some(EffectDispatcher::new(
+            store.clone(),
+        ))));
+        let runner = mailbox_effect_runner(
+            mailbox,
+            Arc::new(std::sync::Mutex::new(MentionCoalescer::from_env())),
+            None,
+            cell,
+        );
+        let action = Action::Verify {
+            command: "cargo test".into(),
+        };
+        // A distinct run per observation: the effect key is run-scoped, so
+        // reusing one run would attach to the first row instead of dispatching.
+        let invocation = |run: &str, observed: Option<serde_json::Value>| ActionInvocation {
+            action: action.clone(),
+            run: RunContext {
+                run_id: run.into(),
+                workflow_digest: "digest-1".into(),
+                node_path: "gate".into(),
+                iteration_key: None,
+                effect_key: None,
+                attempt: 1,
+                provider_result: observed,
+            },
+            execution: ExecutionPolicy {
+                max_attempts: 1,
+                timeout_secs: None,
+            },
+        };
+        let call = |i: ActionInvocation| {
+            let runner = runner.clone();
+            std::thread::spawn(move || runner(&i).expect("effect ok"))
+                .join()
+                .expect("effect thread")
+        };
+
+        let green = call(invocation(
+            "run-verify-green",
+            Some(serde_json::json!({ "ok": true, "exit": 0, "stdout_path": "r.txt" })),
+        ));
+        assert_eq!(
+            green["ok"],
+            serde_json::json!(true),
+            "a green verify passes through: {green}"
+        );
+        let red = call(invocation(
+            "run-verify-red",
+            Some(serde_json::json!({ "ok": false, "exit": 101, "error": "tests failed" })),
+        ));
+        assert_eq!(
+            red["ok"],
+            serde_json::json!(false),
+            "a red verify fails loud, never as a delivered success: {red}"
+        );
+        assert_eq!(
+            red["effect_state"],
+            serde_json::json!("failed"),
+            "a returned non-zero exit is a PROVEN failure, not transport \
+             ambiguity (nothing to reconcile): {red}"
+        );
+        // The host attaches no `VerifySink` of its own, so the engine hands
+        // over the sink's own missing-sink projection: name the real cause,
+        // and journal it (an unjournaled verify is the bypass this closes).
+        let missing = call(invocation("run-verify-missing", None));
+        assert!(
+            missing.to_string().contains("verify sink missing"),
+            "a host without a VerifySink names the real cause: {missing}"
+        );
+
+        let rendered = serde_json::to_value(&action).expect("action json");
+        let action_digest = toron_workflow::identity::action_digest_of(
+            &toron_workflow::identity::redact_value(&rendered).0,
+        );
+        for (run, want) in [
+            (
+                "run-verify-green",
+                toron_core::index::workflow_effects::EffectState::Settled,
+            ),
+            (
+                "run-verify-red",
+                toron_core::index::workflow_effects::EffectState::Failed,
+            ),
+            (
+                "run-verify-missing",
+                toron_core::index::workflow_effects::EffectState::Failed,
+            ),
+        ] {
+            let key = toron_workflow::engine::derive_effect_key(
+                "digest-1",
+                run,
+                "gate",
+                None,
+                &action_digest,
+            );
+            let row = store
+                .get_effect(&key)
+                .await
+                .expect("read")
+                .unwrap_or_else(|| panic!("verify effect row for {run} must be journaled"));
+            assert_eq!(row.action_type, "verify");
+            assert_eq!(row.state, want, "row state for {run}");
+        }
         let _ = std::fs::remove_file(&db);
         let _ = std::fs::remove_dir_all(&data_dir);
     }

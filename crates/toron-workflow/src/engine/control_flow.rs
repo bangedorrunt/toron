@@ -20,9 +20,9 @@ use crate::schema::{Action, Graph, Step, StepOnError};
 
 use super::template::{RenderContext, render_action, render_action_lenient, render_text};
 use super::{
-    ActionInvocation, ActionPartition, ActionRunner, ApprovalSink, Decision, EffectRunner,
-    ExecutionPolicy, FailureKind, ProfileResolver, RunContext, RunInput, SpawnSink, WorkflowEngine,
-    WorkflowResolver, partition,
+    ActionInvocation, ActionPartition, ActionRunner, ApprovalSink, Decision, EffectJournalMode,
+    EffectRunner, ExecutionPolicy, FailureKind, ProfileResolver, RunContext, RunInput, SpawnSink,
+    WorkflowEngine, WorkflowResolver, partition,
 };
 
 use sha2::{Digest, Sha256};
@@ -390,6 +390,7 @@ pub(crate) fn invocation_for_leaf(
             iteration_key: None,
             effect_key: None,
             attempt,
+            provider_result: None,
         },
         execution: ExecutionPolicy {
             max_attempts,
@@ -398,86 +399,143 @@ pub(crate) fn invocation_for_leaf(
     }
 }
 
-/// Dispatch one rendered leaf action (bd-zczp): mailbox/job HostSink
-/// actions prefer the context-bearing [`EffectRunner`] when the engine
-/// was constructed with one; everything else (pure actions, deprecated
-/// rejections, journal-less embeddings) keeps the legacy [`ActionRunner`]
-/// compat path. Returns `Some(value)` when the effect runner handled it.
-fn dispatch_leaf(ctx: &Context, invocation: &ActionInvocation) -> Option<serde_json::Value> {
-    let effectful = matches!(
-        partition(&invocation.action),
-        ActionPartition::HostSink { sink: "mailbox" } | ActionPartition::HostSink { sink: "job" }
-    );
-    if !effectful {
-        return None;
-    }
-    let stored: Arc<Option<EffectRunner>> = ctx.get_dependency::<Option<EffectRunner>>();
-    (*stored).clone().map(|fx| match fx(invocation) {
-        Ok(value) => value,
-        Err(e) => serde_json::json!({ "ok": false, "error": e.to_string() }),
-    })
-}
-
 /// ADR-0032 Spec 6 (bd-engine-run-path-journaling-fwlx): an effectful leaf
-/// dispatched with NO `EffectRunner` wrote no journal row. Warn-first (cf. the
-/// ADR-0022 plan-artifact gate: warn + tag, never block — the flip owns
-/// blocking): the value carries this marker so a journal-less embedding is
-/// visible in the run ledger instead of looking journaled.
+/// dispatched with NO `EffectRunner` wrote no journal row. `Recording` marks it
+/// (below) so a journal-less embedding is visible in the run ledger instead of
+/// looking journaled; `Enforced` refuses it outright.
 ///
-/// The fail-closed flip is still the follow-up, but the precondition it named
-/// is met: flywheel injects a host-owned `EffectRunner` for every run that
-/// really dispatches (`flywheel/src/effect_journal.rs`, 2026-09-14). The flip
-/// is now gated on the remaining bead items — routing `HostSink{verify}`
-/// through the effect surface, and keeping the dry arms (`workflow run`
-/// without `--execute`, `cron run` without `--live`) unjournaled by design
-/// rather than refused. Until then this stays warn + tag, because refusing
-/// would fail those two legitimate journal-less paths.
+/// The fail-closed flip has LANDED (bd-engine-run-path-journaling-fwlx):
+/// `EffectJournalMode::Enforced` refuses uncovered effectful leaves, and the
+/// engines that really dispatch (toron-mcp's host, flywheel's journaled
+/// constructors) are built Enforced. `Recording` — the default — stays the
+/// dry-arm carve-out: `workflow run` without `--execute` and `cron run`
+/// without `--live` record instead of perform, so their leaves must stay
+/// unjournaled, visibly.
 pub const EFFECT_JOURNAL_BYPASSED: &str = "bypassed-no-effect-runner";
 
-/// Same bypass, but an `EffectRunner` IS injected and simply does not cover
-/// this host sink (`dispatch_leaf` handles mailbox/job, not verify) — a
-/// different gap with a different fix, so a different marker.
+/// The same gap, one step narrower: an `EffectRunner` IS injected and simply
+/// does not cover this host sink — a different gap with a different fix, so a
+/// different marker. Emitted by HOST runners that cover only part of their
+/// sinks (e.g. flywheel's mailbox-without-an-in-process-plane path), never by
+/// the engine: since the verify flip every HostSink leaf routes through the
+/// injected runner, so the engine can no longer observe a partial runner.
 pub const EFFECT_JOURNAL_SINK_UNCOVERED: &str = "bypassed-sink-uncovered";
 
-/// Dispatch one rendered leaf through the context-bearing [`EffectRunner`]
-/// when one is injected, else the legacy compat runner. A HOST-SINK leaf that
-/// falls through to the legacy runner wrote no journal row, so it is marked
-/// and warned about loudly (ADR-0032 Spec 6: no silent bypass). Pure and
-/// engine-control leaves pass through untouched.
+/// Dispatch one rendered leaf action through the effect surface (bd-zczp,
+/// bd-engine-run-path-journaling-fwlx).
+///
+/// ONE function owns the whole contract, because a half-applied contract is
+/// exactly how a bypass gets re-introduced:
+///
+/// - a pure / engine-control / unsupported leaf keeps the legacy
+///   [`ActionRunner`] compat path (the boundary rejects a real misdispatch on
+///   its own);
+/// - an effectful HostSink leaf (mailbox · job · verify) goes through the
+///   context-bearing [`EffectRunner`] when one is injected;
+/// - `verify` is a HostSink too, so its embedding-owned `VerifySink` executes
+///   FIRST and its result rides [`RunContext::provider_result`]: the sink stays
+///   the executor (ADR-0024 Spec 2), the journal settles AROUND an effect that
+///   already happened, and the command never runs twice;
+/// - with NO injected runner, [`EffectJournalMode`] decides — see
+///   [`without_journal_seam`].
+///
+/// Returns the leaf's value, never an `Option`: a refusal is a value, so no
+/// caller can mistake "refused" for "not my concern" and re-dispatch it.
 fn dispatch_leaf_or_compat(
     ctx: &Context,
     runner: &ActionRunner,
     invocation: &ActionInvocation,
 ) -> serde_json::Value {
-    if let Some(value) = dispatch_leaf(ctx, invocation) {
-        return value;
-    }
-    let sink = match partition(&invocation.action) {
-        ActionPartition::HostSink { sink } => Some(sink),
-        _ => None,
-    };
-    let mut value = match (runner)(&invocation.action) {
-        Ok(value) => value,
-        Err(e) => serde_json::json!({ "ok": false, "error": e.to_string() }),
-    };
-    let Some(sink) = sink else {
-        return value;
+    let ActionPartition::HostSink { sink } = partition(&invocation.action) else {
+        return compat_leaf(runner, &invocation.action);
     };
     let stored: Arc<Option<EffectRunner>> = ctx.get_dependency::<Option<EffectRunner>>();
-    let marker = if (*stored).is_some() {
-        EFFECT_JOURNAL_SINK_UNCOVERED
-    } else {
-        EFFECT_JOURNAL_BYPASSED
+    let Some(fx) = (*stored).clone() else {
+        return without_journal_seam(ctx, runner, invocation, sink);
+    }; // Only `verify` needs a second, carrier-bearing invocation (the clone is
+    // avoided on the common path: an effectful leaf dispatches on every run).
+    let outcome = match &invocation.action {
+        Action::Verify { command } => {
+            let sink: Arc<crate::engine::VerifySink> =
+                ctx.get_dependency::<crate::engine::VerifySink>();
+            let mut journaled = invocation.clone();
+            journaled.run.provider_result = Some(sink.project(command));
+            fx(&journaled)
+        }
+        _ => fx(invocation),
     };
+    match outcome {
+        Ok(value) => value,
+        Err(e) => serde_json::json!({ "ok": false, "error": e.to_string() }),
+    }
+}
+
+/// An effectful HostSink leaf with NO injected [`EffectRunner`].
+///
+/// `Enforced` REFUSES it — before the leaf's provider runs, because the
+/// provider performs the very external effect the journal exists to cover.
+/// `Recording` runs the leaf's own provider (the compat runner, or the
+/// engine-owned `verify` sink) and tags the value with
+/// [`EFFECT_JOURNAL_BYPASSED`] plus a loud reason: there is no journal row, and
+/// a run has to be able to see that rather than read a silent success.
+fn without_journal_seam(
+    ctx: &Context,
+    runner: &ActionRunner,
+    invocation: &ActionInvocation,
+    sink: &'static str,
+) -> serde_json::Value {
+    let mode: Arc<EffectJournalMode> = ctx.get_dependency::<EffectJournalMode>();
+    if *mode == EffectJournalMode::Enforced {
+        eprintln!(
+            "toron-workflow: effectful '{sink}' action '{}' REFUSED — no EffectRunner is \
+             injected (EffectJournalMode::Enforced): an external effect is never performed \
+             without its journal (ADR-0032 Spec 6, bd-engine-run-path-journaling-fwlx)",
+            invocation.action.type_name()
+        );
+        return serde_json::json!({
+            "ok": false,
+            "error": format!(
+                "effectful '{sink}' action '{}' refused: no EffectRunner injected \
+                 (EffectJournalMode::Enforced, ADR-0032 Spec 6) — build the engine with a \
+                 journaling runner or drop to Recording for dry arms",
+                invocation.action.type_name()
+            ),
+            "kind": "effect_journal_unavailable",
+        });
+    }
     eprintln!(
-        "toron-workflow: effectful '{sink}' action '{}' wrote NO effect-journal row ({marker}) — \
-         ADR-0032 Spec 6 forbids a silent bypass; inject an EffectRunner covering this sink",
+        "toron-workflow: effectful '{sink}' action '{}' wrote NO effect-journal row \
+         ({EFFECT_JOURNAL_BYPASSED}) — ADR-0032 Spec 6 forbids a silent bypass; inject an \
+         EffectRunner covering this sink",
         invocation.action.type_name()
     );
+    let mut value = match &invocation.action {
+        // `Recording` records instead of performs, so the leaf's value must be
+        // byte-identical to the sink-direct path a dry run has always had.
+        Action::Verify { command } => {
+            let sink: Arc<crate::engine::VerifySink> =
+                ctx.get_dependency::<crate::engine::VerifySink>();
+            sink.project(command)
+        }
+        _ => compat_leaf(runner, &invocation.action),
+    };
     if let Some(obj) = value.as_object_mut() {
-        obj.insert("effect_journal".into(), serde_json::json!(marker));
+        obj.insert(
+            "effect_journal".into(),
+            serde_json::json!(EFFECT_JOURNAL_BYPASSED),
+        );
     }
     value
+}
+
+/// The compat projection of one leaf: `Ok(value)` verbatim, `Err(e)` in the
+/// engine's `{ok:false, error}` shape (a bare error string would be a second
+/// failure spelling, ADR-0032 Spec 9).
+fn compat_leaf(runner: &ActionRunner, action: &Action) -> serde_json::Value {
+    match (runner)(action) {
+        Ok(value) => value,
+        Err(e) => serde_json::json!({ "ok": false, "error": e.to_string() }),
+    }
 }
 
 /// Boxed because control-flow actions recurse (`run_step` → `run_retry` →
@@ -615,18 +673,23 @@ pub(crate) fn run_step_with_enclosing<'a>(
                     step_outputs.insert("decision".into(), decision.clone());
                     decision
                 }
+                // Every leaf that reaches an embedding dispatches through the
+                // SAME effect surface (bd-zczp + bd-engine-run-path-journaling-
+                // fwlx): `verify` belongs here now that it routes through the
+                // injected EffectRunner like mailbox/job — the render, the
+                // invocation identity, and the mode/refusal/marker contract are
+                // identical, so a separate arm would only invite drift.
                 Action::SendMessage { .. }
                 | Action::SendDm { .. }
                 | Action::React { .. }
                 | Action::DispatchJob { .. }
-                | Action::CallWebhook { .. } => {
-                    // Consistency rule: actions go through the shared Mailbox
-                    // surface. Templates are Render FIRST so the runner sees
-                    // rendered values; a render failure (unresolved ref) is a
-                    // per-step error with workflow/node/field/ref
-                    // attribution, not a run failure. bd-zczp: effectful
-                    // actions prefer the context-bearing EffectRunner; the
-                    // legacy compat path stays for the rest.
+                | Action::CallWebhook { .. }
+                | Action::Verify { .. } => {
+                    // Consistency rule: templates are rendered FIRST so the
+                    // runner sees rendered values (a `verify: "{{inputs.x}}"`
+                    // command must reach the sink resolved, not verbatim); a
+                    // render failure (unresolved ref) is a per-step error with
+                    // workflow/node/field/ref attribution, not a run failure.
                     let render_ctx = RenderContext::new(workflow, node);
                     match render_action(&step.action, trigger, step_outputs, &render_ctx) {
                         Ok(action) => {
@@ -745,23 +808,6 @@ pub(crate) fn run_step_with_enclosing<'a>(
                         *context,
                     )
                     .await?
-                }
-                Action::Verify { command } => {
-                    let sink = ctx.get_dependency::<crate::engine::VerifySink>();
-                    let guard = sink.0.lock().unwrap().clone();
-                    if let Some(f) = guard {
-                        let req = crate::engine::VerifyRequest {
-                            command: command.clone(),
-                        };
-                        match f(&req) {
-                            Ok(res) => serde_json::to_value(&res).unwrap_or_else(
-                                |e| serde_json::json!({ "ok": false, "error": e.to_string() }),
-                            ),
-                            Err(e) => serde_json::json!({ "ok": false, "error": e.to_string() }),
-                        }
-                    } else {
-                        serde_json::json!({ "ok": false, "error": "verify sink missing" })
-                    }
                 }
             };
 
