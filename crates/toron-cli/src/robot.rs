@@ -423,7 +423,7 @@ fn stamp_bootstrap_pane(
 /// One-step session bootstrap: idempotent identity upsert, then an optional
 /// reserve in the same call. CLI-only composition over existing mailbox
 /// methods (mirrors macro_start_session minus ensure/inbox); no new MCP tool.
-pub async fn run_agent(mailbox: &Mailbox, cmd: &AgentCommand) -> anyhow::Result<()> {
+pub async fn run_agent(mailbox: &Mailbox, cmd: &AgentCommand, dry_run: bool) -> anyhow::Result<()> {
     match cmd {
         AgentCommand::Bootstrap(args) => {
             let profile = toron_core::nostr::identity::AgentProfile {
@@ -433,6 +433,26 @@ pub async fn run_agent(mailbox: &Mailbox, cmd: &AgentCommand) -> anyhow::Result<
                 task_description: args.task.clone(),
                 persona: None,
             };
+            // bd-toron-bootstrap-dryrun-mutates-1-we4c: `-n/--dry-run` is a
+            // GLOBAL flag whose help promises "show changes without running".
+            // Minting key material under it is the one class of side effect
+            // callers cannot retry away — the next real run can no longer show
+            // what it would have done. Preview, never mutate.
+            if dry_run {
+                let plan = mailbox
+                    .plan_agent_registration(&args.project, &profile)
+                    .await?;
+                print_json(&json!({
+                    "agent": plan.name,
+                    "project": plan.project_slug,
+                    "key_path": plan.key_path,
+                    "created": plan.created,
+                    "dry_run": true,
+                    "would_reserve": args.paths,
+                    "next": "re-run without --dry-run to register; nothing was written",
+                }))?;
+                return Ok(());
+            }
             let agent = mailbox.register_agent(&args.project, &profile).await?;
             let stamped = stamp_bootstrap_pane(
                 args.pane_id.clone(),
@@ -470,9 +490,32 @@ pub async fn run_agent(mailbox: &Mailbox, cmd: &AgentCommand) -> anyhow::Result<
 }
 
 /// Daemon arm of `run_agent`: same composition over MCP tools.
-pub async fn run_agent_daemon(dc: &DaemonClient, cmd: &AgentCommand) -> anyhow::Result<()> {
+pub async fn run_agent_daemon(
+    dc: &DaemonClient,
+    cmd: &AgentCommand,
+    dry_run: bool,
+) -> anyhow::Result<()> {
     match cmd {
         AgentCommand::Bootstrap(args) => {
+            // bd-toron-bootstrap-dryrun-mutates-1-we4c: the daemon arm must not
+            // mutate under `--dry-run` either. The daemon holds the mailbox, so
+            // the CLI cannot canonicalize the slug or read the key path without
+            // a new MCP verb (MCP freeze: same-verb-as-CLI only) — so it
+            // reports the request it would send and leaves the outcome
+            // explicitly unknown rather than guessing a `created` value.
+            if dry_run {
+                print_json(&json!({
+                    "dry_run": true,
+                    "would_call": "register_agent",
+                    "project": args.project,
+                    "agent": args.agent,
+                    "created": Value::Null,
+                    "would_reserve": args.paths,
+                    "note": "the daemon path cannot preview the key mint (it holds the mailbox); set TORON_MCP_DATA_DIR to run against an embedded mailbox and preview, or re-run without --dry-run to register",
+                    "next": "re-run without --dry-run to register; nothing was written",
+                }))?;
+                return Ok(());
+            }
             let registration = dc
                 .call_tool(
                     "register_agent",
