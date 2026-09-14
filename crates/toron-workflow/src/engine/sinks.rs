@@ -87,6 +87,38 @@ impl std::fmt::Debug for VerifySink {
     }
 }
 
+impl VerifySink {
+    /// Execute one verify command through the embedding's sink (ADR-0024
+    /// Spec 2) and project the result into the leaf's `{ok,…}` value.
+    ///
+    /// The sink owns BOTH halves of its contract — running the command and
+    /// shaping the outcome — so the projection cannot drift between callers
+    /// (the journaling effect path and any sink-direct path both call this).
+    /// A missing sink, a serialization failure, and a sink error are all the
+    /// same shape: `{ok:false, error:"…"}`, never a panic and never `ok:true`.
+    ///
+    /// "Missing sink" is deliberately reported here (not pre-checked by the
+    /// caller) because it is the sink's own contract: `None` → `{ok:false,
+    /// error:"verify sink missing"}`.
+    pub fn project(&self, command: &str) -> serde_json::Value {
+        let guard = match self.0.lock() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
+        let Some(f) = guard else {
+            return serde_json::json!({ "ok": false, "error": "verify sink missing" });
+        };
+        let req = VerifyRequest {
+            command: command.to_string(),
+        };
+        match f(&req) {
+            Ok(res) => serde_json::to_value(&res)
+                .unwrap_or_else(|e| serde_json::json!({ "ok": false, "error": e.to_string() })),
+            Err(e) => serde_json::json!({ "ok": false, "error": e.to_string() }),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Structured parked work (ADR-0032 Spec 6, bd-asx3).
 //

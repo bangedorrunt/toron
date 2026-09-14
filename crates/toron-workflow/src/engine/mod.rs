@@ -228,10 +228,37 @@ pub type ActionRunner = Arc<dyn Fn(&Action) -> anyhow::Result<serde_json::Value>
 /// The context-bearing effect surface (bd-zczp, ADR-0032 Spec 1): every
 /// effectful invocation carries its [`ActionInvocation`] (run/node/effect
 /// context + policy). The engine prefers this over [`ActionRunner`] for
-/// mailbox/job HostSink actions whenever one is injected; the legacy
+/// effectful HostSink actions whenever one is injected; the legacy
 /// runner stays for pure actions, journal-less embeddings, and tests.
 pub type EffectRunner =
     Arc<dyn Fn(&ActionInvocation) -> anyhow::Result<serde_json::Value> + Send + Sync>;
+
+/// How the engine treats an effectful HostSink leaf that has no journaling
+/// [`EffectRunner`] to go through (bd-engine-run-path-journaling-fwlx, the
+/// ADR-0032 Spec 6 flip).
+///
+/// - [`EffectJournalMode::Recording`] (default): the legacy warn + tag
+///   behavior. The leaf runs unjournaled through the compat runner and its
+///   value carries the machine-readable bypass marker, so a journal-less
+///   embedding is visible in the run ledger instead of looking journaled.
+///   This is the mode for DRY arms by design: `workflow run` without
+///   `--execute` and `cron run` without `--live` record instead of perform,
+///   and their leaves must stay unjournaled.
+/// - [`EffectJournalMode::Enforced`]: fail closed. An effectful leaf with no
+///   runner is refused — the step fails loud naming the missing journal seam —
+///   instead of performing an external effect nobody can reconcile. This is
+///   the mode for every engine that really dispatches (toron-mcp's host,
+///   flywheel's journaled constructors).
+///
+/// There is no mode where an unjournaled effect reads as success.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EffectJournalMode {
+    /// Warn + tag: the leaf runs unjournaled, visibly (dry arms, tests).
+    #[default]
+    Recording,
+    /// Fail closed: an effectful leaf with no journal seam refuses to run.
+    Enforced,
+}
 
 /// The `spawn` profile resolver DI seam (ADR-0005 Spec 4a). Resolves a
 /// profile name (`@housekeeper`) to the (npub, spawn spec) the embedding
@@ -340,12 +367,93 @@ impl WorkflowEngine {
         )
     }
 
+    /// [`Self::local`] with an explicit [`EffectJournalMode`]
+    /// (bd-engine-run-path-journaling-fwlx, the Spec 6 flip): `Enforced` makes
+    /// an effectful HostSink leaf with no [`EffectRunner`] FAIL the step
+    /// (naming the missing journal seam) instead of running unjournaled.
+    /// `Recording` keeps the warn + tag behavior for dry arms.
+    ///
+    /// Test-only: a real embedding injects a runner, so it uses
+    /// [`Self::local_with_resolvers_and_effect_mode`]; this is the no-runner
+    /// shape the mode-refusal tests need, and `#[cfg(test)]` keeps it out of
+    /// the public surface.
+    #[cfg(test)]
+    pub(crate) fn local_with_journal_mode(
+        action_runner: ActionRunner,
+        journal_mode: EffectJournalMode,
+    ) -> anyhow::Result<Self> {
+        Self::local_with_resolvers_effect_mode(
+            action_runner,
+            Self::default_resolver(),
+            Self::default_workflow_resolver(),
+            None,
+            journal_mode,
+        )
+    }
+
+    /// The mode-carrying twin of [`Self::local_with_resolvers_and_effect`] —
+    /// the constructor a real (effect-performing) embedding uses: resolvers,
+    /// journaling runner, AND [`EffectJournalMode::Enforced`].
+    pub fn local_with_resolvers_and_effect_mode(
+        action_runner: ActionRunner,
+        profile_resolver: ProfileResolver,
+        workflow_resolver: WorkflowResolver,
+        effect_runner: Option<EffectRunner>,
+        journal_mode: EffectJournalMode,
+    ) -> anyhow::Result<Self> {
+        Self::local_with_resolvers_effect_mode(
+            action_runner,
+            profile_resolver,
+            workflow_resolver,
+            effect_runner,
+            journal_mode,
+        )
+    }
+
+    /// The mode-carrying twin of [`Self::remote_with_resolvers_and_effect`].
+    pub fn remote_with_resolvers_and_effect_mode(
+        url: impl Into<String>,
+        action_runner: ActionRunner,
+        profile_resolver: ProfileResolver,
+        workflow_resolver: WorkflowResolver,
+        effect_runner: Option<EffectRunner>,
+        journal_mode: EffectJournalMode,
+    ) -> anyhow::Result<Self> {
+        Self::remote_with_resolvers_effect_mode(
+            url,
+            action_runner,
+            profile_resolver,
+            workflow_resolver,
+            effect_runner,
+            journal_mode,
+        )
+    }
+
     /// Funnel for the local constructors: all four established above.
     fn local_with_resolvers_effect(
         action_runner: ActionRunner,
         profile_resolver: ProfileResolver,
         workflow_resolver: WorkflowResolver,
         effect_runner: Option<EffectRunner>,
+    ) -> anyhow::Result<Self> {
+        Self::local_with_resolvers_effect_mode(
+            action_runner,
+            profile_resolver,
+            workflow_resolver,
+            effect_runner,
+            EffectJournalMode::default(),
+        )
+    }
+
+    /// The mode-carrying funnel: every local constructor tail. The journal
+    /// mode is an engine dependency so the dispatch path can enforce Spec 6
+    /// without a global.
+    fn local_with_resolvers_effect_mode(
+        action_runner: ActionRunner,
+        profile_resolver: ProfileResolver,
+        workflow_resolver: WorkflowResolver,
+        effect_runner: Option<EffectRunner>,
+        journal_mode: EffectJournalMode,
     ) -> anyhow::Result<Self> {
         let sink = ApprovalSink::default();
         let spawn_sink = SpawnSink::default();
@@ -356,6 +464,7 @@ impl WorkflowEngine {
             .with_dependency(effect_runner)
             .with_dependency(profile_resolver)
             .with_dependency(workflow_resolver)
+            .with_dependency(journal_mode)
             .with_dependency(sink.clone())
             .with_dependency(spawn_sink.clone())
             .with_dependency(policy_sink.clone())
@@ -463,6 +572,25 @@ impl WorkflowEngine {
         workflow_resolver: WorkflowResolver,
         effect_runner: Option<EffectRunner>,
     ) -> anyhow::Result<Self> {
+        Self::remote_with_resolvers_effect_mode(
+            url,
+            action_runner,
+            profile_resolver,
+            workflow_resolver,
+            effect_runner,
+            EffectJournalMode::default(),
+        )
+    }
+
+    /// The mode-carrying remote funnel.
+    fn remote_with_resolvers_effect_mode(
+        url: impl Into<String>,
+        action_runner: ActionRunner,
+        profile_resolver: ProfileResolver,
+        workflow_resolver: WorkflowResolver,
+        effect_runner: Option<EffectRunner>,
+        journal_mode: EffectJournalMode,
+    ) -> anyhow::Result<Self> {
         let sink = ApprovalSink::default();
         let spawn_sink = SpawnSink::default();
         let policy_sink = crate::cron_failure::PolicySink::new();
@@ -476,6 +604,7 @@ impl WorkflowEngine {
             .with_dependency(effect_runner)
             .with_dependency(profile_resolver)
             .with_dependency(workflow_resolver)
+            .with_dependency(journal_mode)
             .with_dependency(sink.clone())
             .with_dependency(spawn_sink.clone())
             .with_dependency(policy_sink.clone())
