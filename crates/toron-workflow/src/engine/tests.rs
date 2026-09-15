@@ -1193,6 +1193,153 @@ steps:
     assert_eq!(seen.lock().unwrap().len(), 1, "child action executed once");
 }
 
+#[test]
+fn workflow_lineage_guard_is_bounded_and_cycle_safe() {
+    let root = serde_json::json!({});
+    let lineage = super::control_flow::lineage_for_trigger(&root, "outer").expect("root lineage");
+    assert_eq!(lineage.chain, vec!["outer"]);
+    assert_eq!(
+        lineage.remaining_children,
+        super::control_flow::MAX_WORKFLOW_CHILDREN
+    );
+
+    let mismatched = serde_json::json!({
+        "__flywheel_workflow_lineage": {
+            "chain": ["outer", "inner"],
+            "remaining_children": 3
+        }
+    });
+    let err = super::control_flow::lineage_for_trigger(&mismatched, "wrong").unwrap_err();
+    assert!(
+        err.contains("tail"),
+        "mismatched lineage is rejected: {err}"
+    );
+
+    let cycle = serde_json::json!({
+        "__flywheel_workflow_lineage": {
+            "chain": ["outer", "inner", "outer"],
+            "remaining_children": 3
+        }
+    });
+    let err = super::control_flow::lineage_for_trigger(&cycle, "outer").unwrap_err();
+    assert!(
+        err.contains("recursive"),
+        "recursive lineage is rejected: {err}"
+    );
+
+    let too_deep = serde_json::json!({
+        "__flywheel_workflow_lineage": {
+            "chain": (0..=super::control_flow::MAX_WORKFLOW_DEPTH).map(|n| format!("w{n}")).collect::<Vec<_>>(),
+            "remaining_children": 1
+        }
+    });
+    let err = super::control_flow::lineage_for_trigger(
+        &too_deep,
+        &format!("w{}", super::control_flow::MAX_WORKFLOW_DEPTH),
+    )
+    .unwrap_err();
+    assert!(err.contains("nesting depth"), "depth is bounded: {err}");
+}
+
+#[tokio::test]
+async fn call_workflow_refuses_cycle_and_exhausted_budget() {
+    let engine = WorkflowEngine::local_with_resolvers(
+        noop_runner(),
+        Arc::new(|_: &str| None),
+        Arc::new(|name: &str| {
+            (name == "caller" || name == "inner").then(|| {
+                parse_workflow(if name == "caller" {
+                    r#"
+name: caller
+trigger: { type: webhook }
+steps:
+  - name: sub
+    action: call_workflow
+    workflow: caller
+    inputs: {}
+"#
+                } else {
+                    r#"
+name: inner
+trigger: { type: webhook }
+steps:
+  - name: done
+    action: delay
+    secs: 0
+"#
+                })
+                .expect("resolved workflow")
+            })
+        }),
+    )
+    .expect("engine");
+    let workflow = parse_workflow(
+        r#"
+name: caller
+trigger: { type: webhook }
+steps:
+  - name: sub
+    action: call_workflow
+    workflow: caller
+    inputs: {}
+"#,
+    )
+    .expect("workflow");
+    let cycle = engine
+        .run(
+            "wf-call-cycle",
+            RunInput {
+                run_id: None,
+                workflow: workflow.clone(),
+                trigger: serde_json::json!({}),
+            },
+        )
+        .await
+        .expect("cycle returns a value");
+    assert!(
+        cycle["sub"]["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("recursive")
+    );
+
+    let exhausted_trigger = serde_json::json!({
+        "__flywheel_workflow_lineage": {
+            "chain": ["caller"],
+            "remaining_children": 0
+        }
+    });
+    let budget_workflow = parse_workflow(
+        r#"
+name: caller
+trigger: { type: webhook }
+steps:
+  - name: sub
+    action: call_workflow
+    workflow: inner
+    inputs: {}
+"#,
+    )
+    .expect("budget workflow");
+    let exhausted = engine
+        .run(
+            "wf-call-budget",
+            RunInput {
+                run_id: None,
+                workflow: budget_workflow,
+                trigger: exhausted_trigger,
+            },
+        )
+        .await
+        .expect("budget returns a value");
+    assert!(
+        exhausted["sub"]["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("budget")
+    );
+}
+
 /// Unknown workflow name → honest {ok:false}, not a hang.
 #[tokio::test]
 async fn call_workflow_unknown_reports_error() {

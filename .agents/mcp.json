@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "toron": {
+      "type": "http",
+      "url": "http://127.0.0.1:18080/mcp"
+    },
+    "chiebukuro": {
+      "type": "http",
+      "url": "http://127.0.0.1:18081/mcp"
+    }
+  }
+}

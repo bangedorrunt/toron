@@ -197,6 +197,13 @@ pub async fn run_workflow(
         .clone()
         .unwrap_or_else(|| "unknown".to_string());
     let workflow_name = workflow.name.clone();
+    if let Err(error) = validate_workflow_lineage(&input.trigger, &workflow_name) {
+        return Ok(serde_json::json!({
+            "status": "failed",
+            "error": error,
+            "failed_step": "<workflow-lineage>",
+        }));
+    }
     // bd-zczp: canonical digest travels with the run so every leaf can
     // mint run-scoped effect keys without re-canonicalizing per step.
     let workflow_digest = crate::identity::workflow_digest(workflow);
@@ -828,7 +835,10 @@ pub(crate) fn run_step_with_enclosing<'a>(
                 Action::CallWorkflow {
                     workflow: child,
                     inputs,
-                } => run_call_workflow(ctx, runner, child, inputs, step_outputs).await?,
+                } => {
+                    run_call_workflow(ctx, runner, workflow, child, inputs, step_outputs, trigger)
+                        .await?
+                }
                 Action::Spawn {
                     profile,
                     workflow,
@@ -1590,29 +1600,116 @@ pub(crate) fn is_truthy(value: &serde_json::Value) -> bool {
     }
 }
 
-/// Run a `call_workflow` action: invoke another workflow as a sub-run
-/// (idempotent on a deterministic sub-run id derived from the parent run +
-/// step). Outputs flow into `steps.<name>` via the returned value.
+/// Reserved trigger key carrying the durable workflow lineage envelope.
+/// The envelope is deliberately part of `trigger`, rather than `Context`, so
+/// Resonate serializes it with the child input and replay sees the same guard.
+const WORKFLOW_LINEAGE_KEY: &str = "__flywheel_workflow_lineage";
+/// Maximum call depth, including the root workflow.
+pub const MAX_WORKFLOW_DEPTH: usize = 8;
+/// Maximum child calls along one durable lineage branch.
+pub const MAX_WORKFLOW_CHILDREN: u32 = 32;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct WorkflowLineage {
+    pub(crate) chain: Vec<String>,
+    pub(crate) remaining_children: u32,
+}
+
+pub(crate) fn lineage_for_trigger(
+    trigger: &serde_json::Value,
+    workflow: &str,
+) -> std::result::Result<WorkflowLineage, String> {
+    let Some(raw) = trigger.get(WORKFLOW_LINEAGE_KEY) else {
+        return Ok(WorkflowLineage {
+            chain: vec![workflow.to_string()],
+            remaining_children: MAX_WORKFLOW_CHILDREN,
+        });
+    };
+    let lineage: WorkflowLineage = serde_json::from_value(raw.clone())
+        .map_err(|e| format!("invalid workflow lineage for {workflow:?}: {e}"))?;
+    if lineage.chain.last().map(String::as_str) != Some(workflow) {
+        return Err(format!(
+            "workflow lineage tail {:?} does not match running workflow {workflow:?}",
+            lineage.chain.last()
+        ));
+    }
+    if lineage.chain.len() > MAX_WORKFLOW_DEPTH {
+        return Err(format!(
+            "workflow nesting depth {} exceeds the bound {MAX_WORKFLOW_DEPTH}",
+            lineage.chain.len()
+        ));
+    }
+    if lineage
+        .chain
+        .iter()
+        .enumerate()
+        .any(|(index, name)| lineage.chain[..index].contains(name))
+    {
+        return Err(format!(
+            "workflow lineage contains a recursive edge at {workflow:?}"
+        ));
+    }
+    Ok(lineage)
+}
+
+fn validate_workflow_lineage(
+    trigger: &serde_json::Value,
+    workflow: &str,
+) -> std::result::Result<(), String> {
+    lineage_for_trigger(trigger, workflow).map(|_| ())
+}
+
+/// Run a `call_workflow` action: invoke another workflow as a sub-run.
+/// The host rejects cycles, excessive nesting, and exhausted branch budget
+/// before `ctx.run` creates a durable child. Outputs flow into `steps.<name>`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_call_workflow(
     ctx: &Context,
     _runner: &ActionRunner,
-    workflow: &str,
+    parent_workflow: &str,
+    child_name: &str,
     inputs: &serde_json::Value,
     step_outputs: &serde_json::Map<String, serde_json::Value>,
+    trigger: &serde_json::Value,
 ) -> resonate_sdk::prelude::Result<serde_json::Value> {
     // ADR-0007 R4.1: nested durable run via WorkflowResolver DI + ctx.run.
     let resolver = ctx.get_dependency::<WorkflowResolver>();
-    let Some(child_wf) = (resolver)(workflow) else {
+    let Some(child_wf) = (resolver)(child_name) else {
         return Ok(serde_json::json!({
             "ok": false,
-            "error": format!("unknown workflow: {workflow}"),
+            "error": format!("unknown workflow: {child_name}"),
         }));
     };
-    // ADR-0032 Spec 3: `call_workflow` binds the child's declared defaults
-    // through the SAME function as direct `invoke` (provided values win).
-    // The synthesized trigger has invoke's exact shape: merged inputs
-    // flattened at top level plus the `inputs` object, with parent
-    // step_outputs exposed under `parent_steps` for templates.
+    let lineage = match lineage_for_trigger(trigger, parent_workflow) {
+        Ok(value) => value,
+        Err(error) => return Ok(serde_json::json!({ "ok": false, "error": error })),
+    };
+    if lineage.chain.iter().any(|name| name == child_name) {
+        return Ok(serde_json::json!({
+            "ok": false,
+            "error": format!(
+                "recursive workflow call refused: {parent_workflow:?} -> {child_name:?}; call chain: {:?}",
+                lineage.chain
+            ),
+        }));
+    }
+    if lineage.chain.len() >= MAX_WORKFLOW_DEPTH {
+        return Ok(serde_json::json!({
+            "ok": false,
+            "error": format!(
+                "workflow child {child_name:?} refused: nesting depth bound {MAX_WORKFLOW_DEPTH} reached"
+            ),
+        }));
+    }
+    if lineage.remaining_children == 0 {
+        return Ok(serde_json::json!({
+            "ok": false,
+            "error": format!(
+                "workflow child {child_name:?} refused: child budget exhausted (bound {MAX_WORKFLOW_CHILDREN})"
+            ),
+        }));
+    }
+    // ADR-0032 Spec 3: bind declared defaults exactly like direct invoke.
     let merged = WorkflowEngine::bind_input_defaults(&child_wf.inputs, inputs);
     let mut trigger_map = serde_json::Map::new();
     for (k, v) in &merged {
@@ -1627,14 +1724,20 @@ pub(crate) async fn run_call_workflow(
         "parent_steps".into(),
         serde_json::Value::Object(step_outputs.clone()),
     );
+    let mut child_lineage = lineage;
+    child_lineage.chain.push(child_name.to_string());
+    child_lineage.remaining_children -= 1;
+    trigger_map.insert(
+        WORKFLOW_LINEAGE_KEY.into(),
+        serde_json::to_value(child_lineage).expect("workflow lineage serializes"),
+    );
     let input = RunInput {
         workflow: child_wf,
         trigger: serde_json::Value::Object(trigger_map),
         run_id: None,
     };
     let future = ctx.run(run_workflow, input).spawn()?;
-    let out = future.await?;
-    Ok(out)
+    Ok(future.await?)
 }
 
 /// Run a `spawn` action (ADR-0005 Spec 4a).
