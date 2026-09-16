@@ -839,9 +839,12 @@ fn guard_check_sees_lease_held_by_another_process() {
         toron_core::mailbox::aliases::reconcile_aliases(&pool, &data_dir)
             .await
             .expect("reconcile");
-        let bus = toron_core::bus::InProcessBus::open(pool.clone(), Default::default())
-            .await
-            .expect("bus");
+        let bus = toron_core::bus::InProcessBus::open(
+            pool.clone(),
+            toron_core::bus::in_process::InProcessBusConfig::default(),
+        )
+        .await
+        .expect("bus");
         let mailbox = toron_core::mailbox::Mailbox::new(Arc::new(bus), data_dir.clone(), None)
             .with_index_pool(pool);
         mailbox
@@ -999,7 +1002,11 @@ async fn plane_mailbox() -> anyhow::Result<toron_core::mailbox::Mailbox> {
     let pool = toron_core::index::schema::connect(db.to_str().unwrap()).await?;
     toron_core::index::schema::migrate(&pool).await?;
     toron_core::mailbox::aliases::reconcile_aliases(&pool, &d).await?;
-    let bus = toron_core::bus::InProcessBus::open(pool.clone(), Default::default()).await?;
+    let bus = toron_core::bus::InProcessBus::open(
+        pool.clone(),
+        toron_core::bus::in_process::InProcessBusConfig::default(),
+    )
+    .await?;
     Ok(toron_core::mailbox::Mailbox::new(Arc::new(bus), d, None).with_index_pool(pool))
 }
 
@@ -2515,9 +2522,12 @@ fn strict_shared_self_hold_covers_path_embedded() {
         toron_core::mailbox::aliases::reconcile_aliases(&pool, &data_dir)
             .await
             .expect("reconcile");
-        let bus = toron_core::bus::InProcessBus::open(pool.clone(), Default::default())
-            .await
-            .expect("bus");
+        let bus = toron_core::bus::InProcessBus::open(
+            pool.clone(),
+            toron_core::bus::in_process::InProcessBusConfig::default(),
+        )
+        .await
+        .expect("bus");
         let mailbox = toron_core::mailbox::Mailbox::new(Arc::new(bus), data_dir.clone(), None)
             .with_index_pool(pool);
         mailbox
@@ -2600,9 +2610,12 @@ fn guard_commit_msg_blocks_foreign_bead_tokens() {
         toron_core::mailbox::aliases::reconcile_aliases(&pool, &data_dir)
             .await
             .expect("reconcile");
-        let bus = toron_core::bus::InProcessBus::open(pool.clone(), Default::default())
-            .await
-            .expect("bus");
+        let bus = toron_core::bus::InProcessBus::open(
+            pool.clone(),
+            toron_core::bus::in_process::InProcessBusConfig::default(),
+        )
+        .await
+        .expect("bus");
         let mailbox = toron_core::mailbox::Mailbox::new(Arc::new(bus), data_dir.clone(), None)
             .with_index_pool(pool);
         mailbox

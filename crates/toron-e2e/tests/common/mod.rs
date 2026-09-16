@@ -29,6 +29,7 @@ use std::time::Duration;
 
 use toron_workflow::cron::{CronRegistration, CronRegistry};
 use toron_workflow::engine::{ActionRunner, ProfileResolver};
+use toron_workflow::schema::CronScope;
 use toron_workflow::schema::{Action, parse_workflow};
 
 /// A no-op action runner (steps succeed, return null).
@@ -158,7 +159,7 @@ pub fn fixture_registration(name: &str, cron: &str, enabled: bool) -> CronRegist
         cron: cron.to_string(),
         workflow: housekeeper_workflow(),
         owner: "@housekeeper".to_string(),
-        scope: Default::default(),
+        scope: CronScope::default(),
         enabled,
     }
 }

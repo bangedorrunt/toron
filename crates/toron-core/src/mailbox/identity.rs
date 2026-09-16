@@ -1840,7 +1840,7 @@ mod tests {
 
         // list_agents still shows the legacy identity (metadata preserved).
         let agents = mailbox
-            .list_agents("toron", Default::default())
+            .list_agents("toron", ListAgentsOptions::default())
             .await
             .expect("list");
         assert!(

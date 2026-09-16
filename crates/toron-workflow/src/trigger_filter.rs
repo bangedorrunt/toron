@@ -524,7 +524,7 @@ mod tests {
     // P11.1 trigger-spec evaluation
     // ------------------------------------------------------------------
 
-    use crate::schema::Trigger;
+    use crate::schema::{CronScope, Trigger};
 
     /// A kind-30031 event with project scoping + optional status marker.
     fn reservation(content: &str, tags: Vec<Tag>, keys: &Keys) -> Event {
@@ -837,7 +837,7 @@ mod tests {
             &Trigger::Schedule {
                 cron: "* * * * *".into(),
                 owner: None,
-                scope: Default::default(),
+                scope: CronScope::default(),
             },
             &dm
         ));

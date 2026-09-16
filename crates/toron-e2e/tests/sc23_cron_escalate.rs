@@ -29,7 +29,7 @@ use common::*;
 use toron_workflow::cron::{CronManager, CronRegistration, CronRegistry};
 use toron_workflow::cron_failure::PolicyEvent;
 use toron_workflow::engine::{ActionRunner, WorkflowEngine};
-use toron_workflow::schema::{Action, FailureAction, parse_workflow};
+use toron_workflow::schema::{Action, CronScope, FailureAction, parse_workflow};
 
 /// A runner that ALWAYS fails (every tick's step errors).
 fn always_failing_runner() -> ActionRunner {
@@ -78,7 +78,7 @@ fn registration(name: &str) -> CronRegistration {
         cron: "*/2 * * * * *".into(),
         workflow: wf,
         owner: "@housekeeper".into(),
-        scope: Default::default(),
+        scope: CronScope::default(),
         enabled: true,
     }
 }

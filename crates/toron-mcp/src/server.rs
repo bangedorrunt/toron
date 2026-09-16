@@ -16,6 +16,7 @@ use rmcp::transport::streamable_http_server::session::local::LocalSessionManager
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use rmcp::{ServerHandler, ServiceExt};
 use toron_core::bus::Bus;
+use toron_core::bus::in_process::InProcessBusConfig;
 use toron_core::mailbox::{Mailbox, UnwrappedMail};
 
 use crate::resources::{
@@ -307,7 +308,8 @@ pub async fn build_mailbox_with_opts(
     // roots into the alias table on open — legacy rows stay visible
     // read-only through every spelling of the project key.
     toron_core::mailbox::aliases::reconcile_aliases(&pool, &data_dir).await?;
-    let bus = toron_core::bus::InProcessBus::open(pool.clone(), Default::default()).await?;
+    let bus =
+        toron_core::bus::InProcessBus::open(pool.clone(), InProcessBusConfig::default()).await?;
     let mut mailbox =
         toron_core::mailbox::Mailbox::new(std::sync::Arc::new(bus), data_dir, operator)
             .with_index_pool(pool);
@@ -371,7 +373,8 @@ async fn build_mailbox(
     // roots into the alias table on open — legacy rows stay visible
     // read-only through every spelling of the project key.
     toron_core::mailbox::aliases::reconcile_aliases(&pool, &data_dir).await?;
-    let bus = toron_core::bus::InProcessBus::open(pool.clone(), Default::default()).await?;
+    let bus =
+        toron_core::bus::InProcessBus::open(pool.clone(), InProcessBusConfig::default()).await?;
     let mut mailbox = Mailbox::new(Arc::new(bus), data_dir, operator).with_index_pool(pool);
     if let Some(tx) = trigger_tx {
         mailbox = mailbox.with_trigger_tx(tx);

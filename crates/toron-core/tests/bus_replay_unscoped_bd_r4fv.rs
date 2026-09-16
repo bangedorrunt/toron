@@ -19,6 +19,7 @@
 
 use toron_core::bus::event_store::BusEventStore;
 use toron_core::bus::filter::{Filter, kind_project_filter};
+use toron_core::bus::in_process::InProcessBusConfig;
 use toron_core::bus::{Bus, InProcessBus};
 use toron_core::index::schema;
 use toron_core::mailbox::collect_replay;
@@ -73,7 +74,7 @@ async fn replay_contract_store_raw_vs_bus_gated_bd_r4fv() {
     );
 
     // Layer 2: a GLOBAL subscription receives only the unscoped row.
-    let bus = InProcessBus::open(pool.clone(), Default::default())
+    let bus = InProcessBus::open(pool.clone(), InProcessBusConfig::default())
         .await
         .expect("bus");
     let gated = collect_replay(&bus, unscoped.clone()).await.expect("gated");

@@ -41,7 +41,7 @@ use toron_workflow::engine::{
     validate_resolution,
 };
 use toron_workflow::jobs::{JobRequest, build_job_request_with_tags};
-use toron_workflow::schema::{Action, Trigger, Workflow};
+use toron_workflow::schema::{Action, CronScope, Trigger, Workflow};
 use toron_workflow::stamp_workflow_emitted;
 use toron_workflow::trigger_filter::{
     matches_trigger, should_evaluate_trigger_event, trigger_payload, trigger_run_id,
@@ -2548,7 +2548,7 @@ mod tests {
             &Trigger::Schedule {
                 cron: "* * * * *".into(),
                 owner: None,
-                scope: Default::default()
+                scope: CronScope::default()
             },
             &msg
         ));
