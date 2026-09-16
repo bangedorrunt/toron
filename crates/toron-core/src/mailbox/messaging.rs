@@ -358,23 +358,29 @@ impl Mailbox {
                 .await?
         };
 
-        let visible = build_visible_rumor(&sender_keys.public_key(), &args, &resolved);
+        let mut visible = build_visible_rumor(&sender_keys.public_key(), &args, &resolved);
         // Canonical id = the RUMOR id (G7 / D1), the SAME id the projection
         // shows in inbox/search rows — never the transport-internal wrap id.
         // Send → inbox → ack/summarize round-trips must work on one id world
         // (ADR-0007 D8.2 per-backend usability).
-        let visible_id = visible.clone().id().to_hex();
+        let visible_id = visible.id().to_hex();
 
         // Build every rumor up front (visible for to/cc, one variant per
         // bcc) so the idempotent-send claim below records the complete
-        // delivery set BEFORE anything hits the bus.
-        let mut pending: Vec<(ResolvedRecipient, UnsignedEvent)> = Vec::new();
+        // delivery set BEFORE anything hits the bus. The hex id is
+        // precomputed once per owned rumor (bd-kkid): `id()` takes `&mut`
+        // (internal cache), so computing it here — where the rumor is
+        // already owned — saves one full event clone per recipient later.
+        let mut pending: Vec<(ResolvedRecipient, UnsignedEvent, String)> = Vec::new();
         for r in resolved.iter().filter(|r| r.role != RecipientRole::Bcc) {
-            pending.push((r.clone(), visible.clone()));
+            let mut rumor = visible.clone();
+            let id_hex = rumor.id().to_hex();
+            pending.push((r.clone(), rumor, id_hex));
         }
         for r in resolved.iter().filter(|r| r.role == RecipientRole::Bcc) {
-            let variant = build_bcc_rumor(&sender_keys.public_key(), &args, &resolved, r);
-            pending.push((r.clone(), variant));
+            let mut variant = build_bcc_rumor(&sender_keys.public_key(), &args, &resolved, r);
+            let id_hex = variant.id().to_hex();
+            pending.push((r.clone(), variant, id_hex));
         }
 
         // ADR-0028 zfnx.12: corr-keyed idempotent send. Same
@@ -387,7 +393,7 @@ impl Mailbox {
             if let Ok(store) = self.idempotent_store() {
                 let intended: Vec<(String, String)> = pending
                     .iter()
-                    .map(|(r, rumor)| (r.name.clone(), rumor.clone().id().to_hex()))
+                    .map(|(r, _, id_hex)| (r.name.clone(), id_hex.clone()))
                     .collect();
                 let intended_json =
                     serde_json::to_string(&intended).unwrap_or_else(|_| "[]".into());
@@ -462,8 +468,7 @@ impl Mailbox {
         // bd-d0a7: hoist the urgency bit onto the outer 1059 envelope so
         // relays/watchers order without decrypting (content stays sealed).
         let outer_urgent = args.importance.as_deref() == Some("urgent");
-        for (r, rumor) in pending {
-            let rumor_id = rumor.clone().id().to_hex();
+        for (r, rumor, rumor_id) in pending {
             let wrap =
                 gift_wrap::gift_wrap_with_urgency(&sender_keys, &r.npub, rumor, outer_urgent)
                     .map_err(|e| {
@@ -3453,6 +3458,59 @@ mod tests {
             wraps_to(&mailbox, &rnpub, 10).await.len(),
             1,
             "no second rumor on retry"
+        );
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// BCC × corr interaction: a same-corr retry with bcc recipients
+    /// replays the FIRST send's per-variant deliveries and publishes
+    /// nothing new. Pins the pending-set (visible rumor for to/cc,
+    /// per-bcc variants) × idempotent-claim interaction that any phase
+    /// split of `send_message` must preserve (bd-kkid).
+    #[tokio::test]
+    async fn idempotent_send_retry_with_bcc_replays_variants() {
+        let (mailbox, _pool, db_path, data_dir) = test_mailbox_with_pool("idem-bcc").await;
+        let (_s, _) = register(&mailbox, "demo", "GreenCastle").await;
+        let (_r, rnpub) = register(&mailbox, "demo", "BlueLake").await;
+        let (_b, bnpub) = register(&mailbox, "demo", "CoralFinch").await;
+        let args = || SendMessage {
+            project_slug: "demo".into(),
+            sender_name: "GreenCastle".into(),
+            to: vec!["BlueLake".into()],
+            bcc: vec!["CoralFinch".into()],
+            subject: "question".into(),
+            body_md: "do the thing".into(),
+            extra_tags: vec![crate::nostr::Tag::parse(["corr", "C-BCC-RETRY"]).expect("corr tag")],
+            ..Default::default()
+        };
+        let first = mailbox.send_message(&args()).await.expect("send 1");
+        assert_eq!(first.count, 2, "to+bcc = 2 wraps");
+        assert_eq!(
+            wraps_to(&mailbox, &rnpub, 10).await.len(),
+            1,
+            "one to wrap after first send"
+        );
+        assert_eq!(
+            wraps_to(&mailbox, &bnpub, 10).await.len(),
+            1,
+            "one bcc wrap after first send"
+        );
+        let second = mailbox.send_message(&args()).await.expect("retry");
+        assert_eq!(second.count, 2, "retry replays both deliveries");
+        assert_eq!(
+            second.deliveries, first.deliveries,
+            "retry returns the FIRST send's delivery set"
+        );
+        assert_eq!(
+            wraps_to(&mailbox, &rnpub, 10).await.len(),
+            1,
+            "no new to wrap on retry"
+        );
+        assert_eq!(
+            wraps_to(&mailbox, &bnpub, 10).await.len(),
+            1,
+            "no new bcc wrap on retry"
         );
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_dir_all(&data_dir);
