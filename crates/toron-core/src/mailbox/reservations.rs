@@ -149,19 +149,23 @@ fn lease_content(exclusive: bool, reason: &str, epoch: u64) -> String {
 /// Terminal-marker content with the stamped epoch it terminalizes
 /// (release / force-release / reap markers).
 fn marker_content(status: &str, heuristic: Option<&str>, epoch: u64) -> String {
-    match heuristic {
-        Some(h) => format!(
-            r#"{{"status":{},"heuristic":{},"epoch":{}}}"#,
-            serde_json::to_string(status).unwrap_or_else(|_| "\"\"".into()),
-            serde_json::to_string(h).unwrap_or_else(|_| "\"\"".into()),
-            epoch
-        ),
-        None => format!(
-            r#"{{"status":{},"epoch":{}}}"#,
-            serde_json::to_string(status).unwrap_or_else(|_| "\"\"".into()),
-            epoch
-        ),
-    }
+    heuristic.map_or_else(
+        || {
+            format!(
+                r#"{{"status":{},"epoch":{}}}"#,
+                serde_json::to_string(status).unwrap_or_else(|_| "\"\"".into()),
+                epoch
+            )
+        },
+        |h| {
+            format!(
+                r#"{{"status":{},"heuristic":{},"epoch":{}}}"#,
+                serde_json::to_string(status).unwrap_or_else(|_| "\"\"".into()),
+                serde_json::to_string(h).unwrap_or_else(|_| "\"\"".into()),
+                epoch
+            )
+        },
+    )
 }
 
 /// The typed ask in a request-release message (ADR-0011 Spec 6).
@@ -747,10 +751,9 @@ impl Mailbox {
             // see + release it: a reservation whose owning bead closed is
             // stale even while its TTL is healthy.
             let old_expiry_secs = res.expires_ts_us.map(|t| t / 1_000_000);
-            let skip = match old_expiry_secs {
-                None => true, // permanent lease — nothing to renew
-                Some(abs) => abs.saturating_sub(now_secs) >= extend_secs as i64,
-            };
+            // permanent lease (no expiry) needs no renewal runway — converged.
+            let skip = old_expiry_secs
+                .is_none_or(|abs| abs.saturating_sub(now_secs) >= extend_secs as i64);
             if skip {
                 result.reservations.push(GrantedReservation {
                     id: res.id.clone(),
@@ -913,10 +916,7 @@ impl Mailbox {
             .await?
             .into_iter()
             .filter(|r| overlaps(&r.path_pattern, path))
-            .find(|r| match holder {
-                Some(h) => r.agent_name == h,
-                None => true,
-            })
+            .find(|r| holder.is_none_or(|h| r.agent_name == h))
             .ok_or_else(|| {
                 let where_ = holder.map(|h| format!(" held by {h}")).unwrap_or_default();
                 anyhow::anyhow!("no active reservation on {path}{where_}")
@@ -1720,8 +1720,9 @@ impl Mailbox {
     async fn is_holder_stale(&self, project_slug: &str, res: &Reservation) -> bool {
         let filter =
             kind_project_filter(toron_kind(crate::nostr::kinds::AGENT_PROFILE), project_slug);
-        match collect_replay(self.bus.as_ref(), filter).await {
-            Ok(events) => {
+        collect_replay(self.bus.as_ref(), filter)
+            .await
+            .is_ok_and(|events| {
                 let now = Timestamp::now().as_secs() as i64;
                 let holder_pubkey = res.agent_pubkey.clone();
                 let last_active = events
@@ -1729,14 +1730,9 @@ impl Mailbox {
                     .filter(|e| e.pubkey.to_hex() == holder_pubkey)
                     .map(|e| e.created_at.as_secs() as i64)
                     .max();
-                match last_active {
-                    Some(ts) => now - ts > STALE_AFTER_SECS as i64,
-                    // No profile at all → treat as stale (unknown agent).
-                    None => true,
-                }
-            }
-            Err(_) => false,
-        }
+                // No profile at all → treat as stale (unknown agent).
+                last_active.is_none_or(|ts| now - ts > STALE_AFTER_SECS as i64)
+            })
     }
 
     /// Best-effort pubkey → agent-name map from kind-30013 profiles.

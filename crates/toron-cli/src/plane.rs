@@ -131,10 +131,7 @@ fn event_project(ev: &Event) -> Option<&str> {
 /// the slug; un-scoped events (presence, reactions, DM-path jobs) are
 /// project-agnostic on the local bus and pass through.
 fn in_project(ev: &Event, project: &str) -> bool {
-    match event_project(ev) {
-        Some(slug) => slug == project,
-        None => true,
-    }
+    event_project(ev).is_none_or(|slug| slug == project)
 }
 
 /// Collect all events matching `filter` via a TRUSTED subscription (the CLI
@@ -581,10 +578,7 @@ async fn channel_list(mailbox: &Mailbox, args: &ChannelListArgs) -> anyhow::Resu
             if !c.private {
                 return true;
             }
-            match &reader {
-                Some(r) => c.is_member(r),
-                None => false,
-            }
+            reader.as_ref().is_some_and(|r| c.is_member(r))
         })
         .map(|c| {
             serde_json::json!({

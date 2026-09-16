@@ -281,15 +281,16 @@ impl Mailbox {
         agent_npub: &PublicKey,
     ) -> ContactPolicy {
         let filter = kind_project_filter(toron_kind(CONTACT_POLICY), project_slug);
-        match collect_replay(self.bus.as_ref(), filter).await {
-            Ok(events) => events
-                .iter()
-                .filter(|e| e.pubkey == *agent_npub)
-                .max_by_key(|e| e.created_at.as_secs())
-                .map(|e| ContactPolicy::parse(&e.content))
-                .unwrap_or(ContactPolicy::Auto),
-            Err(_) => ContactPolicy::Auto,
-        }
+        collect_replay(self.bus.as_ref(), filter)
+            .await
+            .map_or(ContactPolicy::Auto, |events| {
+                events
+                    .iter()
+                    .filter(|e| e.pubkey == *agent_npub)
+                    .max_by_key(|e| e.created_at.as_secs())
+                    .map(|e| ContactPolicy::parse(&e.content))
+                    .unwrap_or(ContactPolicy::Auto)
+            })
     }
 
     /// Is `sender` an approved contact of `recipient` (AgentLink approved)?

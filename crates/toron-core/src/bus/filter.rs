@@ -9,7 +9,7 @@
 //! InProcessBus uses `#t=[slug]`; relay-crossing kinds additionally carry
 //! NIP-32 labels `["l", slug, "toron"]` (`#l`).
 
-use crate::nostr::{Kind, MatchEventOptions, PublicKey, SingleLetterTag, Timestamp};
+use crate::nostr::{Kind, PublicKey, SingleLetterTag, Timestamp};
 
 /// The NIP-32 label namespace toron uses (ADR-0003 A3).
 pub const LABEL_NAMESPACE: &str = "toron";
@@ -149,6 +149,7 @@ impl ToronFilter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::nostr::MatchEventOptions;
     use crate::nostr::event::build_event;
     use crate::nostr::kinds::{AGENT_PROFILE, PROJECT_MANIFEST};
     use crate::nostr::{Keys, Kind, Tag, Timestamp};

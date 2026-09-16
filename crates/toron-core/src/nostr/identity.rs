@@ -145,10 +145,7 @@ pub fn register_agent(
     existing: Option<&Keys>,
     created_at: Timestamp,
 ) -> Result<IdentityResult, BuilderError> {
-    let keys = match existing {
-        Some(k) => k.clone(),
-        None => crate::keys::generate(),
-    };
+    let keys = existing.cloned().unwrap_or_else(crate::keys::generate);
     let event = build_profile_event(&keys, project_slug, profile, created_at)?;
     Ok(IdentityResult { keys, event })
 }

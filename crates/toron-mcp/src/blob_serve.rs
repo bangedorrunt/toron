@@ -167,8 +167,16 @@ async fn serve_blob(state: &BlossomState, sha256: &str, head_only: bool) -> Resp
         .store
         .get_type(&hash)
         .unwrap_or_else(|| DEFAULT_MIME.to_string());
-    match state.store.get(&hash) {
-        Ok(bytes) => {
+    state.store.get(&hash).map_or_else(
+        |_| {
+            (
+                StatusCode::NOT_FOUND,
+                cors_headers(),
+                json!({ "error": "blob not found" }).to_string(),
+            )
+                .into_response()
+        },
+        |bytes| {
             let mut resp = if head_only {
                 StatusCode::OK.into_response()
             } else {
@@ -193,14 +201,8 @@ async fn serve_blob(state: &BlossomState, sha256: &str, head_only: bool) -> Resp
                     .unwrap(),
             );
             resp
-        }
-        Err(_) => (
-            StatusCode::NOT_FOUND,
-            cors_headers(),
-            json!({ "error": "blob not found" }).to_string(),
-        )
-            .into_response(),
-    }
+        },
+    )
 }
 
 /// PUT `/.blossom/upload` — store the raw body, return a Blob Descriptor

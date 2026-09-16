@@ -45,10 +45,7 @@ pub fn guard_check_blocked(
     staged: &[String],
     reservations: &[Reservation],
 ) -> Vec<String> {
-    match agent {
-        None => Vec::new(),
-        Some(agent) => guard_blocked_paths(agent, staged, reservations),
-    }
+    agent.map_or_else(Vec::new, |a| guard_blocked_paths(a, staged, reservations))
 }
 
 /// Check whether a commit's staged paths violate any OTHER agent's exclusive
@@ -543,10 +540,7 @@ pub fn staged_paths(repo: &git2::Repository) -> Vec<String> {
 /// Open a repository at `repo_path` and return its staged paths (empty on
 /// open/index errors — the guard never fails a commit on unreadable state).
 pub fn staged_paths_in(repo_path: &Path) -> Vec<String> {
-    match git2::Repository::open(repo_path) {
-        Ok(repo) => staged_paths(&repo),
-        Err(_) => Vec::new(),
-    }
+    git2::Repository::open(repo_path).map_or_else(|_| Vec::new(), |repo| staged_paths(&repo))
 }
 
 // ---------------------------------------------------------------------------

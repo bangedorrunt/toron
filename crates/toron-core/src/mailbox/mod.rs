@@ -603,10 +603,8 @@ impl UnwrapRebuildPolicy {
         if current_sig == Some(sig) {
             return false;
         }
-        match self.last_attempt_at {
-            Some(t) => now.duration_since(t) >= self.min_interval,
-            None => true,
-        }
+        self.last_attempt_at
+            .is_none_or(|t| now.duration_since(t) >= self.min_interval)
     }
 
     /// Record an attempt BEFORE awaiting the build so failures consume this

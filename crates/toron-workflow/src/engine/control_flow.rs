@@ -1183,11 +1183,10 @@ pub(crate) async fn run_foreach(
         // Each iteration sees the current item as `{{item}}` (ADR-0007 F4):
         // inject it into the iteration's trigger copy so the template
         // renderer can resolve it.
-        let mut iter_trigger = if let Some(obj) = trigger.as_object() {
-            serde_json::Value::Object(obj.clone())
-        } else {
-            serde_json::Value::Object(serde_json::Map::new())
-        };
+        let mut iter_trigger = trigger.as_object().map_or_else(
+            || serde_json::Value::Object(serde_json::Map::new()),
+            |obj| serde_json::Value::Object(obj.clone()),
+        );
         iter_trigger["item"] = item.clone();
         // Iterations resolve against the enclosing scope plus the item.
         let mut item_outputs = step_outputs.clone();
@@ -1375,12 +1374,16 @@ pub(crate) async fn run_reduce(
     // Operand selection: the key dot-path into each item, or the item
     // itself. A missing path on any item fails naming the key and index.
     let operand = |item: &serde_json::Value, index: usize| -> Result<serde_json::Value, String> {
-        match key {
-            Some(path) => super::template::descend(item, path.split('.'))
-                .cloned()
-                .ok_or_else(|| format!("{ctx_name}: reduce key {path:?} missing on item {index}")),
-            None => Ok(item.clone()),
-        }
+        key.as_ref().map_or_else(
+            || Ok(item.clone()),
+            |path| {
+                super::template::descend(item, path.split('.'))
+                    .cloned()
+                    .ok_or_else(|| {
+                        format!("{ctx_name}: reduce key {path:?} missing on item {index}")
+                    })
+            },
+        )
     };
     // Initial accumulator: op-typed literal (templates are rejected
     // statically), or the op identity when absent.
@@ -1556,10 +1559,10 @@ pub(crate) async fn run_reduce(
             for (i, item) in list.iter().enumerate() {
                 // Each item renders with itself as `{{item}}` (same deferred
                 // context as foreach); missing refs fail naming item index.
-                let mut iter_trigger = match trigger.as_object() {
-                    Some(obj) => serde_json::Value::Object(obj.clone()),
-                    None => serde_json::Value::Object(serde_json::Map::new()),
-                };
+                let mut iter_trigger = trigger.as_object().map_or_else(
+                    || serde_json::Value::Object(serde_json::Map::new()),
+                    |obj| serde_json::Value::Object(obj.clone()),
+                );
                 iter_trigger["item"] = item.clone();
                 iter_trigger["index"] = serde_json::json!(i);
                 match render_text(tpl, &iter_trigger, step_outputs) {

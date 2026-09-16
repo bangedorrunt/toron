@@ -646,14 +646,10 @@ impl Mailbox {
         .await
         .ok()
         .flatten();
-        match last_active {
-            Some(ts) => {
-                let now_us =
-                    crate::index::writer::Clock::now_us(&crate::index::writer::SystemClock);
-                !roster_entry_stale(ts, now_us)
-            }
-            None => false,
-        }
+        last_active.is_some_and(|ts| {
+            let now_us = crate::index::writer::Clock::now_us(&crate::index::writer::SystemClock);
+            !roster_entry_stale(ts, now_us)
+        })
     }
 
     /// bd-pin-public-plane-s-easy.1: THE one name resolver — pin, slug, or

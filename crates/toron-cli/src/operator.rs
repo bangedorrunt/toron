@@ -856,17 +856,14 @@ pub fn run_key(cfg: &Config, cmd: &KeyCommand) -> anyhow::Result<()> {
 }
 
 fn run_key_generate(cfg: &Config, args: &KeyGenerateArgs) -> anyhow::Result<()> {
-    let path = match &args.out {
-        Some(p) => p.clone(),
-        None => match args.role {
-            crate::cli::RoleArg::Operator => cfg
-                .operator_key
-                .clone()
-                .unwrap_or_else(|| default_key_path("operator")),
-            crate::cli::RoleArg::Agent => default_key_path("agent"),
-            crate::cli::RoleArg::Anchor => default_key_path("anchor"),
-        },
-    };
+    let path = args.out.clone().unwrap_or_else(|| match args.role {
+        crate::cli::RoleArg::Operator => cfg
+            .operator_key
+            .clone()
+            .unwrap_or_else(|| default_key_path("operator")),
+        crate::cli::RoleArg::Agent => default_key_path("agent"),
+        crate::cli::RoleArg::Anchor => default_key_path("anchor"),
+    });
     let keys = toron_core::keys::generate();
     let password = key_password();
     toron_core::keys::write_encrypted_key(&path, &keys, &password, KEY_LOG_N)?;

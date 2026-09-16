@@ -524,10 +524,8 @@ fn normalize_dow(token: &str) -> String {
 
 /// vixie day-of-week digit → crate ordinal (`(d % 7) + 1`; 0 and 7 → 1).
 fn dow_ordinal(d: &str) -> String {
-    match d.parse::<u32>() {
-        Ok(n) => ((n % 7) + 1).to_string(),
-        Err(_) => d.to_string(),
-    }
+    d.parse::<u32>()
+        .map_or_else(|_| d.to_string(), |n| ((n % 7) + 1).to_string())
 }
 
 /// Drives the durable-sleep cron loops over a registry (Spec 3).

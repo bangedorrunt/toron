@@ -73,16 +73,16 @@ impl std::str::FromStr for ReceiptState {
 /// duplicates. With no corr there is nothing to preserve — the guidance
 /// degrades to the duplicate warning.
 pub fn resend_guidance(corr: Option<&str>) -> String {
-    match corr {
-        Some(c) => format!(
+    corr.map_or_else(
+        || "toron: transport-unknown — the wrap may not have landed and no corr was stamped; \
+             any re-run mints a new corr (a plain re-run DUPLICATES at the recipient only if it landed)."
+            .to_string(),
+        |c| format!(
             "toron: transport-unknown — the wrap may not have landed. \
              corr-preserving resend: toron mail send --corr {c} (re-supply to/subject/body). \
              A plain re-run of the send mints a NEW corr and DUPLICATES."
         ),
-        None => "toron: transport-unknown — the wrap may not have landed and no corr was stamped; \
-             any re-run mints a new corr (a plain re-run DUPLICATES at the recipient only if it landed)."
-            .to_string(),
-    }
+    )
 }
 
 /// Printed whenever a corr receipt is recorded degraded (ADR-0010 D8.2):
