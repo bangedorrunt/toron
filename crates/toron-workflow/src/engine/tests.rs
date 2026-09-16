@@ -760,7 +760,7 @@ graph:
     assert_eq!(output["scout"]["n"], 42, "node value flows through");
 
     // Wave ordering: the runner saw scout before plan before the fixes.
-    let actions = seen.lock().unwrap();
+    let actions = seen.lock().unwrap().clone();
     let names: Vec<&str> = actions
         .iter()
         .filter_map(|a| match a {
@@ -830,7 +830,7 @@ graph:
     assert_eq!(fan.len(), 3, "three scout copies: {fan:?}");
     // The oracle consumed the fan-out: its dispatch spec's task was
     // rendered with the scout array (the runner saw the rendered action).
-    let actions = seen.lock().unwrap();
+    let actions = seen.lock().unwrap().clone();
     let oracle_spec = actions
         .iter()
         .filter_map(|a| match a {
@@ -2094,7 +2094,7 @@ steps:
 
     // (b) The downstream step's `{{steps.foo.n}}` was substituted with the
     //     value BEFORE the runner saw the action.
-    let seen_actions = seen.lock().unwrap();
+    let seen_actions = seen.lock().unwrap().clone();
     let bar = seen_actions
         .iter()
         .find(|a| matches!(a, Action::SendMessage { .. }))
@@ -3038,7 +3038,7 @@ steps:
         vec![RunPhase::Started, RunPhase::Running, RunPhase::Succeeded],
         "Started -> Running -> terminal Succeeded"
     );
-    let rows = seen.lock().unwrap();
+    let rows = seen.lock().unwrap().clone();
     assert!(
         rows.iter().all(|t| t.run_id == "wf-lifecycle-ok-1"),
         "every lifecycle row carries the run's own id (the id its effect rows carry): {rows:?}"

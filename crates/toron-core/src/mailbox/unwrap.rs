@@ -402,6 +402,7 @@ impl ProjectionSink for GitProjectionSink {
         archive.stage_file(&rel, json.as_bytes())?;
         archive.stage_file(&Self::marker_rel(&id), b"projected")?;
         archive.commit(&format!("project message {id}"))?;
+        drop(archive);
         self.projected.lock().insert(id);
         Ok(true)
     }
@@ -470,7 +471,8 @@ impl ProjectGitBatch {
             return Ok(false);
         };
         let message = format!("project batch of {} messages", ids.len());
-        match archive.lock().commit(&message) {
+        let committed = archive.lock().commit(&message);
+        match committed {
             Ok(_) => {
                 self.projected.lock().extend(ids);
                 Ok(true)
@@ -525,7 +527,8 @@ impl ProjectGitProjectionSink {
         &self,
         slug: &str,
     ) -> anyhow::Result<Arc<parking_lot::Mutex<crate::archive::git::GitArchive>>> {
-        if let Some(a) = self.batch.archives.lock().get(slug).cloned() {
+        let cached = self.batch.archives.lock().get(slug).cloned();
+        if let Some(a) = cached {
             return Ok(a);
         }
         let root = crate::mailbox::aliases::project_root(&self.data_dir, slug);

@@ -88,7 +88,7 @@ static SPAWNED: std::sync::LazyLock<std::sync::Mutex<Vec<String>>> =
 /// invoked"). The toron test actors are NAMED `flywheel-toron-coder*`
 /// (ADR-0018), so the check is on spawned program names, never output text.
 fn assert_no_foreign_binary_spawned() {
-    let progs = SPAWNED.lock().unwrap();
+    let progs = SPAWNED.lock().unwrap().clone();
     assert!(
         progs.iter().all(|p| p == "toron"),
         "only the toron binary may be spawned, got: {progs:?}"

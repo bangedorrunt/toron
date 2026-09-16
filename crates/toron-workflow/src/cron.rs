@@ -1045,16 +1045,22 @@ steps:
             event2.tick
         );
         tokio::time::sleep(Duration::from_secs(3)).await;
-        {
+        let (ticks, n) = {
             let guard = sink2.lock().await;
-            let ticks: Vec<(i64, i64)> = guard.iter().map(|e| (e.tick, unix_now())).collect();
-            assert_eq!(
+            (
+                guard
+                    .iter()
+                    .map(|e| (e.tick, unix_now()))
+                    .collect::<Vec<_>>(),
                 guard.len(),
-                1,
-                "exactly one catch-up tick (events: {ticks:?}, next_tick={next_tick}, now={})",
-                unix_now()
-            );
-        }
+            )
+        };
+        assert_eq!(
+            n,
+            1,
+            "exactly one catch-up tick (events: {ticks:?}, next_tick={next_tick}, now={})",
+            unix_now()
+        );
 
         let _ = server.kill();
         let _ = server.wait();

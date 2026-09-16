@@ -186,6 +186,7 @@ impl ChannelStore {
                 creator: creator.to_hex(),
             },
         );
+        drop(inner);
         Ok(())
     }
 
@@ -201,6 +202,7 @@ impl ChannelStore {
             anyhow::bail!("channel {channel_id} is closed — join is refused");
         }
         ch.members.insert(npub.to_hex());
+        drop(inner);
         Ok(())
     }
 
@@ -220,6 +222,7 @@ impl ChannelStore {
             );
         }
         ch.members.remove(&npub.to_hex());
+        drop(inner);
         Ok(())
     }
 
@@ -236,6 +239,7 @@ impl ChannelStore {
             anyhow::bail!("only the creator can close channel {channel_id}");
         }
         ch.closed = true;
+        drop(inner);
         Ok(())
     }
 
@@ -251,6 +255,7 @@ impl ChannelStore {
             .get_mut(channel_id)
             .ok_or_else(|| anyhow::anyhow!("channel not found: {channel_id}"))?;
         ch.members = members.into_iter().collect();
+        drop(inner);
         Ok(())
     }
 
@@ -494,8 +499,8 @@ impl ChannelStore {
     }
 
     fn require_member(&self, channel_id: &str, npub: &PublicKey) -> anyhow::Result<()> {
-        let inner = self.inner.lock();
-        let Some(ch) = inner.channels.get(channel_id) else {
+        let ch = self.inner.lock().channels.get(channel_id).cloned();
+        let Some(ch) = ch else {
             anyhow::bail!("channel not found: {channel_id}");
         };
         // bd-channel-close-purge-bsqb: a closed (retired) channel refuses

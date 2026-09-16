@@ -145,8 +145,9 @@ impl PresenceBroker {
 
     /// All currently-live agents (not stale), newest heartbeat first.
     pub fn live_agents(&self, now_secs: u64) -> Vec<Presence> {
-        let state = self.state.read();
-        let mut v: Vec<Presence> = state
+        let mut v: Vec<Presence> = self
+            .state
+            .read()
             .values()
             .filter(|p| !p.is_stale(now_secs, self.ttl))
             .cloned()

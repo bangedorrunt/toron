@@ -1238,7 +1238,8 @@ impl WorkflowHost {
             // Journal the publication; a crash between bus publish and
             // this mark retries the same digest (idempotent, never a
             // second semantic terminal).
-            if let Some(store) = self.pending.lock().await.store().cloned() {
+            let store = self.pending.lock().await.store().cloned();
+            if let Some(store) = store {
                 let _ = store.mark_terminal_published(&digest).await;
             }
             let _ = self
@@ -2801,11 +2802,13 @@ mod tests {
         }
         // All five @mentions are buffered in the coalescer (window open),
         // NOT emitted as five separate jobs — one buffered batch.
-        let c = coalescer.lock().unwrap_or_else(PoisonError::into_inner);
-        assert!(
-            c.buffered_for("oc-beta") == 5,
-            "all mentions buffered for oc-beta, got {}",
+        let buffered = {
+            let c = coalescer.lock().unwrap_or_else(PoisonError::into_inner);
             c.buffered_for("oc-beta")
+        };
+        assert!(
+            buffered == 5,
+            "all mentions buffered for oc-beta, got {buffered}"
         );
         let _ = std::fs::remove_file(&db);
     }
