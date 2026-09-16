@@ -88,7 +88,7 @@ impl super::Backend for MockBackend {
             focused: false,
             pane_count: 0,
             tab_count: 0,
-            active_tab_id: "".into(),
+            active_tab_id: String::new(),
             agent_status: AgentStatus::Unknown,
             cwd: None,
         }])
@@ -102,7 +102,7 @@ impl super::Backend for MockBackend {
             focused: false,
             pane_count: 0,
             tab_count: 0,
-            active_tab_id: "".into(),
+            active_tab_id: String::new(),
             agent_status: AgentStatus::Unknown,
             cwd: None,
         })
@@ -196,8 +196,8 @@ impl super::Backend for MockBackend {
             revision: 0,
             state_change_seq: 0,
             state_labels: Default::default(),
-            tab_id: "".into(),
-            terminal_id: "".into(),
+            tab_id: String::new(),
+            terminal_id: String::new(),
             terminal_title: None,
             workspace_id: "w0".into(),
         })
@@ -259,8 +259,8 @@ impl super::Backend for MockBackend {
             revision: 0,
             state_change_seq: 0,
             state_labels: Default::default(),
-            tab_id: "".into(),
-            terminal_id: "".into(),
+            tab_id: String::new(),
+            terminal_id: String::new(),
             terminal_title: None,
             workspace_id: "w0".into(),
         })
