@@ -2871,7 +2871,7 @@ mod tests {
             let wrap = loop {
                 match tokio::time::timeout(std::time::Duration::from_secs(5), sub.next()).await {
                     Ok(Some(SubscriptionEvent::Event(e))) => break e,
-                    Ok(Some(SubscriptionEvent::Eose)) | Ok(None) => continue,
+                    Ok(Some(SubscriptionEvent::Eose)) | Ok(None) => {}
                     Ok(Some(SubscriptionEvent::Closed(_))) => panic!("subscription closed"),
                     Err(_) => panic!("timed out waiting for wrap event"),
                 }
@@ -3002,8 +3002,8 @@ mod tests {
             let ev = loop {
                 match tokio::time::timeout(std::time::Duration::from_secs(5), sub.next()).await {
                     Ok(Some(SubscriptionEvent::Event(e))) if e.kind.as_u16() == 43001 => break e,
-                    Ok(Some(SubscriptionEvent::Event(_))) => continue,
-                    Ok(Some(SubscriptionEvent::Eose)) | Ok(None) => continue,
+                    Ok(Some(SubscriptionEvent::Event(_))) => {}
+                    Ok(Some(SubscriptionEvent::Eose)) | Ok(None) => {}
                     Ok(Some(SubscriptionEvent::Closed(_))) => panic!("subscription closed"),
                     Err(_) => panic!("timed out waiting for 43001"),
                 }

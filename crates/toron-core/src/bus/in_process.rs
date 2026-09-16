@@ -925,7 +925,7 @@ mod tests {
                     delivered = true;
                     break;
                 }
-                Ok(_) => continue,
+                Ok(_) => {}
                 _ => break,
             }
         }

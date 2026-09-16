@@ -105,11 +105,11 @@ async fn bus_burst_throughput_and_lag_ceiling() {
                         let _ = lag_tx.send((ev.id, Instant::now()));
                         received += 1;
                     }
-                    Ok(_) => continue,
+                    Ok(_) => {}
                     // Only exit on silence AFTER the burst started (the
                     // pre-publish wrap-build phase is legitimately quiet).
                     Err(_) if received > 0 => break,
-                    Err(_) => continue,
+                    Err(_) => {}
                 }
             }
         });
@@ -178,7 +178,7 @@ async fn bus_burst_throughput_and_lag_ceiling() {
         match tokio::time::timeout(Duration::from_millis(500), recovered.next()).await {
             Ok(Some(SubscriptionEvent::Event(_))) => replayed += 1,
             Ok(Some(SubscriptionEvent::Eose)) => break,
-            Ok(_) => continue,
+            Ok(_) => {}
             Err(_) => break,
         }
     }
