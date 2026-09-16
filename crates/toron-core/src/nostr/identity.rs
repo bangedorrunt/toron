@@ -116,7 +116,7 @@ pub fn profile_roles(event: &Event) -> Vec<String> {
         .iter()
         .filter_map(|t| {
             let s = t.as_slice();
-            if s.first().map(|x| x.as_str()) == Some("role") && s.len() > 1 {
+            if s.first().map(String::as_str) == Some("role") && s.len() > 1 {
                 Some(s[1].clone())
             } else {
                 None
@@ -337,7 +337,7 @@ mod tests {
             .tags
             .iter()
             .filter(|t| t.kind() == "t")
-            .map(|t| t.as_slice().iter().map(|s| s.to_string()).collect())
+            .map(|t| t.as_slice().iter().map(ToString::to_string).collect())
             .collect();
         assert_eq!(
             t_tags,

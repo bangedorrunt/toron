@@ -427,7 +427,7 @@ mod pure_cores_tests {
     fn machine_config_serializes() {
         let cfg = machine_config();
         assert_eq!(cfg["machine"], "dispatch_core");
-        assert_eq!(cfg["transitions"].as_array().map(|a| a.len()), Some(4));
+        assert_eq!(cfg["transitions"].as_array().map(Vec::len), Some(4));
         let text = serde_json::to_string(&cfg).expect("serializes");
         assert!(text.contains("agent_free"));
     }

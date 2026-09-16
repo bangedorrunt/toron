@@ -560,7 +560,7 @@ fn failure_kind_vocabulary_frozen() {
     for kind in ["rate_limit", "timeout"] {
         assert!(
             kind.parse::<FailureKind>()
-                .is_ok_and(|k| k.is_retry_candidate()),
+                .is_ok_and(toron_workflow::engine::FailureKind::is_retry_candidate),
             "{kind} is a retry candidate"
         );
     }

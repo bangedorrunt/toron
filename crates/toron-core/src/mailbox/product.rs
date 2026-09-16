@@ -275,8 +275,8 @@ impl Mailbox {
             .into_iter()
             .filter(|e| {
                 e.tags.iter().any(|t| {
-                    t.as_slice().first().map(|s| s.as_str()) == Some("d")
-                        && t.as_slice().get(1).map(|s| s.as_str()) == Some(product_key)
+                    t.as_slice().first().map(String::as_str) == Some("d")
+                        && t.as_slice().get(1).map(String::as_str) == Some(product_key)
                 })
             })
             .max_by(|a, b| {
@@ -361,7 +361,7 @@ fn member_projects_of(ev: &crate::nostr::Event) -> Vec<String> {
         .iter()
         .filter_map(|t| {
             let parts = t.as_slice();
-            if parts.first().map(|s| s.as_str()) != Some("a") {
+            if parts.first().map(String::as_str) != Some("a") {
                 return None;
             }
             let coord = parts.get(1)?;
@@ -385,7 +385,7 @@ fn parse_product_name(ev: &crate::nostr::Event) -> Option<String> {
         .and_then(|v| {
             v.get("name")
                 .and_then(|n| n.as_str())
-                .map(|s| s.to_string())
+                .map(ToString::to_string)
         })
 }
 

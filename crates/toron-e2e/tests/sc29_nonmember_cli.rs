@@ -148,7 +148,7 @@ async fn sc29_nonmember_cli_post_denied() {
         Value::Object(map) => map
             .values()
             .find_map(|v| v.as_array())
-            .map(|rows| rows.len())
+            .map(Vec::len)
             .unwrap_or(0),
         _ => 0,
     };
@@ -207,7 +207,7 @@ async fn sc29_nonmember_cli_post_denied() {
         Value::Object(map) => map
             .values()
             .find_map(|v| v.as_array())
-            .map(|rows| rows.len())
+            .map(Vec::len)
             .unwrap_or(0),
         _ => 0,
     };

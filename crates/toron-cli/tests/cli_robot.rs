@@ -12,7 +12,7 @@
 //! a local key.
 
 use std::process::{Command, Output};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock, PoisonError};
 
 use serde_json::Value;
 use toron_core::nostr::identity::AgentProfile;
@@ -56,7 +56,7 @@ fn register_test_agent() {
     let _guard = REG
         .get_or_init(|| Mutex::new(()))
         .lock()
-        .unwrap_or_else(|e| e.into_inner());
+        .unwrap_or_else(PoisonError::into_inner);
 
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     rt.block_on(async {
@@ -125,7 +125,7 @@ fn inbox_since_rfc3339_filters_through_binary() {
         if let Some(m) = hit {
             break m
                 .get("created_ts_us")
-                .and_then(|v| v.as_i64())
+                .and_then(serde_json::Value::as_i64)
                 .expect("inbox message carries created_ts_us");
         }
         assert!(
@@ -284,7 +284,7 @@ fn request_release_roundtrip_through_binary() {
         "request-release must name the contested path, got {value}"
     );
     assert_eq!(
-        value.get("delivered").and_then(|v| v.as_bool()),
+        value.get("delivered").and_then(serde_json::Value::as_bool),
         Some(true),
         "request-release must deliver, got {value}"
     );
@@ -1009,7 +1009,7 @@ fn plane_register(names: &[&str]) {
     let _guard = REG
         .get_or_init(|| Mutex::new(()))
         .lock()
-        .unwrap_or_else(|e| e.into_inner());
+        .unwrap_or_else(PoisonError::into_inner);
 
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     rt.block_on(async {
@@ -1037,7 +1037,7 @@ fn plane_guard() -> std::sync::MutexGuard<'static, ()> {
     static GATE: OnceLock<Mutex<()>> = OnceLock::new();
     GATE.get_or_init(|| Mutex::new(()))
         .lock()
-        .unwrap_or_else(|e| e.into_inner())
+        .unwrap_or_else(PoisonError::into_inner)
 }
 
 /// Channel id unique to this test run (parallel-safe).
@@ -1991,7 +1991,7 @@ fn guard_check_reads_reservations_from_daemon_when_url_set() {
     );
     let value: Value = serde_json::from_slice(&out.stdout).expect("guard JSON");
     assert_eq!(
-        value["blocked"].as_array().map(|a| a.len()).unwrap_or(99),
+        value["blocked"].as_array().map(Vec::len).unwrap_or(99),
         0,
         "no blocked paths for the holder: {value}"
     );
@@ -2344,7 +2344,7 @@ fn guard_daemon_resolves_committer_to_registered_npub() {
     );
     let value: Value = serde_json::from_slice(&out.stdout).expect("guard JSON");
     assert_eq!(
-        value["blocked"].as_array().map(|a| a.len()).unwrap_or(99),
+        value["blocked"].as_array().map(Vec::len).unwrap_or(99),
         0,
         "no blocked paths for CoralFinch (npub resolves): {value}"
     );
@@ -2473,7 +2473,7 @@ fn guard_embedded_committer_resolves_via_daemon_npub() {
     );
     let value: Value = serde_json::from_slice(&out.stdout).expect("guard JSON");
     assert_eq!(
-        value["blocked"].as_array().map(|a| a.len()).unwrap_or(99),
+        value["blocked"].as_array().map(Vec::len).unwrap_or(99),
         0,
         "committer resolves to daemon npub (own lease visible): {value}"
     );
@@ -2567,7 +2567,7 @@ fn strict_shared_self_hold_covers_path_embedded() {
     );
     let value: Value = serde_json::from_slice(&out.stdout).expect("guard JSON");
     assert_eq!(
-        value["blocked"].as_array().map(|a| a.len()).unwrap_or(99),
+        value["blocked"].as_array().map(Vec::len).unwrap_or(99),
         0,
         "own shared lease is coverage: {value}"
     );

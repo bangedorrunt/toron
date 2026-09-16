@@ -343,7 +343,7 @@ impl ChannelStore {
             kind: CHANNEL_MESSAGE,
             content: content.to_string(),
             react_to: None,
-            mentions: mentions.iter().map(|m| m.to_hex()).collect(),
+            mentions: mentions.iter().map(nostr::key::PublicKey::to_hex).collect(),
         });
         Ok(ev)
     }
@@ -695,7 +695,7 @@ mod tests {
         let parts: Vec<Vec<String>> = reaction
             .tags
             .iter()
-            .map(|t| t.as_slice().iter().map(|s| s.to_string()).collect())
+            .map(|t| t.as_slice().iter().map(ToString::to_string).collect())
             .collect();
         assert!(
             parts

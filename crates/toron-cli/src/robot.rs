@@ -1589,11 +1589,7 @@ fn finish_guard_check(
     // HANG a pre-commit hook. A hook must terminate with the exit
     // code of the check, never dangle.
     std::process::exit(
-        if out["blocked"]
-            .as_array()
-            .map(|a| a.is_empty())
-            .unwrap_or(true)
-        {
+        if out["blocked"].as_array().map(Vec::is_empty).unwrap_or(true) {
             0
         } else {
             1
@@ -1769,7 +1765,9 @@ fn resolve_daemon_roster(
         return Vec::new();
     };
     fn event_created_at(ev: &serde_json::Value) -> i64 {
-        ev.get("created_at").and_then(|v| v.as_i64()).unwrap_or(0)
+        ev.get("created_at")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(0)
     }
     fn event_content(ev: &serde_json::Value) -> &str {
         ev.get("content").and_then(|v| v.as_str()).unwrap_or("")
@@ -1788,7 +1786,7 @@ fn resolve_daemon_roster(
                 tags.iter().find_map(|t| {
                     let a = t.as_array()?;
                     (a.first().and_then(|s| s.as_str()) == Some("d"))
-                        .then(|| a.get(1).and_then(|s| s.as_str()).map(|s| s.to_string()))
+                        .then(|| a.get(1).and_then(|s| s.as_str()).map(ToString::to_string))
                         .flatten()
                 })
             })

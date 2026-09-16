@@ -156,7 +156,7 @@ pub fn is_overseer_bypass(mail: &UnwrappedMail, operator: Option<&PublicKey>) ->
 fn ts_ms_tag(rumor: &UnsignedEvent) -> Option<i64> {
     rumor.tags.iter().find_map(|t| {
         let parts = t.as_slice();
-        if parts.first().map(|s| s.as_str()) == Some("ts_ms") && parts.len() >= 2 {
+        if parts.first().map(String::as_str) == Some("ts_ms") && parts.len() >= 2 {
             parts[1].parse().ok()
         } else {
             None
@@ -795,7 +795,7 @@ impl ProjectionSink for SqliteProjectionSink {
             .rumor
             .tags
             .iter()
-            .any(|t| t.as_slice().first().map(|s| s.as_str()) == Some("ack-required"));
+            .any(|t| t.as_slice().first().map(String::as_str) == Some("ack-required"));
         // Prefer the literal `thread` tag (free-form AM-style ids); fall
         // back to the NIP-10 `e` root tag (event-id threads); a HEAD message
         // (no thread refs) is its own thread — self-thread with its rumor id
@@ -804,7 +804,7 @@ impl ProjectionSink for SqliteProjectionSink {
         let thread_id = Some(
             tag_text(&mail.rumor, "thread")
                 .or_else(|| tag_text(&mail.rumor, "e"))
-                .map(|s| s.to_string())
+                .map(ToString::to_string)
                 .unwrap_or_else(|| id.clone()),
         );
 
@@ -876,8 +876,8 @@ impl ProjectionSink for SqliteProjectionSink {
 pub fn tag_value<'a>(tags: &'a crate::nostr::Tags, name: &str) -> Option<&'a str> {
     tags.iter().find_map(|t| {
         let parts = t.as_slice();
-        (parts.first().map(|s| s.as_str()) == Some(name))
-            .then(|| parts.get(1).map(|s| s.as_str()))?
+        (parts.first().map(String::as_str) == Some(name))
+            .then(|| parts.get(1).map(String::as_str))?
     })
 }
 
@@ -1051,8 +1051,8 @@ impl UnwrapPipeline {
             let Some(target) = wrap
                 .tags
                 .iter()
-                .find(|t| t.as_slice().first().map(|s| s.as_str()) == Some("e"))
-                .and_then(|t| t.as_slice().get(1).map(|s| s.to_string()))
+                .find(|t| t.as_slice().first().map(String::as_str) == Some("e"))
+                .and_then(|t| t.as_slice().get(1).map(ToString::to_string))
             else {
                 return ProjectOutcome::NotForUs;
             };
@@ -1143,8 +1143,8 @@ pub fn is_ack_rumor(rumor: &UnsignedEvent) -> bool {
     let mut has_e = false;
     for t in rumor.tags.iter() {
         let parts = t.as_slice();
-        match parts.first().map(|s| s.as_str()) {
-            Some("toron-kind") => toron_kind = parts.get(1).map(|s| s.as_str()),
+        match parts.first().map(String::as_str) {
+            Some("toron-kind") => toron_kind = parts.get(1).map(String::as_str),
             Some("e") => has_e = true,
             _ => {}
         }

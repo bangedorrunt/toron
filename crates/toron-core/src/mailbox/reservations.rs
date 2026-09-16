@@ -132,7 +132,7 @@ pub enum ReservationStatus {
 pub fn lease_epoch(content: &str) -> u64 {
     serde_json::from_str::<serde_json::Value>(content)
         .ok()
-        .and_then(|v| v.get("epoch").and_then(|e| e.as_u64()))
+        .and_then(|v| v.get("epoch").and_then(serde_json::Value::as_u64))
         .unwrap_or(0)
 }
 
@@ -1277,7 +1277,7 @@ impl Mailbox {
     ) -> anyhow::Result<Vec<ResolvedLease>> {
         let filter = kind_project_filter(toron_kind(FILE_RESERVATION), project_slug);
         let events = collect_replay(self.bus.as_ref(), filter).await?;
-        let operator = self.operator.as_ref().map(|k| k.public_key());
+        let operator = self.operator.as_ref().map(nostr::key::Keys::public_key);
         let now_secs = Timestamp::now().as_secs() as i64;
         let mut out = Self::resolve_leases_from_events(&events, operator, now_secs);
 
@@ -1376,8 +1376,8 @@ impl Mailbox {
                 .tags
                 .iter()
                 .find_map(|t| {
-                    (t.as_slice().first().map(|s| s.as_str()) == Some("reason"))
-                        .then(|| t.as_slice().get(1).map(|s| s.to_string()))
+                    (t.as_slice().first().map(String::as_str) == Some("reason"))
+                        .then(|| t.as_slice().get(1).map(ToString::to_string))
                 })
                 .flatten()
                 .unwrap_or_default();
@@ -1823,7 +1823,7 @@ impl Mailbox {
         let to_keys = self.agent_keys_for(project_slug, to_agent)?;
         let d = format!("{project_slug}:{path}");
         let effective_reason = reason
-            .map(|r| r.to_string())
+            .map(ToString::to_string)
             .or_else(|| (!holder.reason.is_empty()).then(|| holder.reason.clone()))
             .unwrap_or_default();
 
@@ -2452,7 +2452,7 @@ pub fn lease_status(winning: &Event) -> ReservationStatus {
         .tags
         .iter()
         .find(|t| t.as_slice().first().map(|s| s == "status").unwrap_or(false))
-        .and_then(|t| t.as_slice().get(1).map(|s| s.to_string()));
+        .and_then(|t| t.as_slice().get(1).map(ToString::to_string));
     match status_tag.as_deref() {
         Some("intent") => ReservationStatus::Intent,
         Some("released") => ReservationStatus::Released,
@@ -2473,7 +2473,7 @@ pub fn lease_status(winning: &Event) -> ReservationStatus {
 fn lease_tag_value(tags: &crate::nostr::Tags, name: &str) -> Option<String> {
     tags.iter().find_map(|t| {
         (t.as_slice().first().map(|s| s == name).unwrap_or(false))
-            .then(|| t.as_slice().get(1).map(|s| s.to_string()))
+            .then(|| t.as_slice().get(1).map(ToString::to_string))
             .flatten()
     })
 }

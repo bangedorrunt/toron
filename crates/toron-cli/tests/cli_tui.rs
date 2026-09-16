@@ -12,7 +12,7 @@
 //! (fetch_inbox / list_agents over the same project+agent pair) works.
 
 use std::process::Command;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock, PoisonError};
 
 use toron_core::mailbox::{FetchInbox, ListAgentsOptions};
 use toron_core::nostr::identity::AgentProfile;
@@ -45,7 +45,7 @@ static REG: OnceLock<Mutex<()>> = OnceLock::new();
 fn register_guard() -> std::sync::MutexGuard<'static, ()> {
     REG.get_or_init(|| Mutex::new(()))
         .lock()
-        .unwrap_or_else(|e| e.into_inner())
+        .unwrap_or_else(PoisonError::into_inner)
 }
 
 /// `toron tui` on a piped stdout must exit 1 with a TTY explanation on stderr

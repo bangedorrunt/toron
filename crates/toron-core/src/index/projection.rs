@@ -85,7 +85,7 @@ pub fn rumor_timestamp_us(rumor: &UnsignedEvent) -> i64 {
     if let Some(tag) = rumor
         .tags
         .iter()
-        .find(|t| t.as_slice().first().map(|s| s.as_str()) == Some("ts_ms"))
+        .find(|t| t.as_slice().first().map(String::as_str) == Some("ts_ms"))
         .and_then(|t| t.as_slice().get(1))
         .and_then(|v| v.as_str().parse::<i64>().ok())
     {

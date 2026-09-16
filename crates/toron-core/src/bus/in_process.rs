@@ -1346,7 +1346,7 @@ mod tests {
         let visible: Vec<Vec<String>> = wrapped
             .tags
             .iter()
-            .map(|t| t.as_slice().iter().map(|s| s.to_string()).collect())
+            .map(|t| t.as_slice().iter().map(ToString::to_string).collect())
             .collect();
         assert_eq!(
             visible.len(),

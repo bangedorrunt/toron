@@ -77,7 +77,7 @@ fn cli_commands() -> Value {
                     "args": sub_args(sub),
                     "description": sub
                         .get_about()
-                        .map(|a| a.to_string())
+                        .map(ToString::to_string)
                         .unwrap_or_default(),
                 })
             })
