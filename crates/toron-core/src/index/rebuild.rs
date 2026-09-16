@@ -325,7 +325,7 @@ mod tests {
         // --- destroy SQLite ---
         drop((w, r, writer));
         let _ = std::fs::remove_file(&db_path);
-        assert!(!std::fs::metadata(&db_path).is_ok(), "sqlite destroyed");
+        assert!(std::fs::metadata(&db_path).is_err(), "sqlite destroyed");
 
         // --- rebuild from Git archive ---
         let wp = schema::connect(&db_path).await.unwrap();
