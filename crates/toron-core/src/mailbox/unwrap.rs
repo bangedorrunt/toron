@@ -104,11 +104,7 @@ impl UnwrappedMail {
     /// rumor `created_at*1e6`, overridden by an optional `["ts_ms", µs]` tag
     /// when the sender provides microsecond precision.
     pub fn ts_us(&self) -> i64 {
-        if let Some(ms) = ts_ms_tag(&self.rumor) {
-            ms
-        } else {
-            self.created_at.as_secs() as i64 * 1_000_000
-        }
+        ts_ms_tag(&self.rumor).unwrap_or(self.created_at.as_secs() as i64 * 1_000_000)
     }
 }
 

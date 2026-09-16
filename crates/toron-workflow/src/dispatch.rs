@@ -92,17 +92,17 @@ impl DispatchPool {
             return None; // one-in-flight-per-agent
         }
         // Check global concurrency without blocking.
-        match self.semaphore.clone().try_acquire_owned() {
-            Ok(permit) => {
+        self.semaphore.clone().try_acquire_owned().map_or_else(
+            |_| None, // global cap reached
+            |permit| {
                 *count += 1;
                 Some(DispatchPermit {
                     pool: self,
                     agent: agent.to_string(),
                     _permit: permit,
                 })
-            }
-            Err(_) => None, // global cap reached
-        }
+            },
+        )
     }
 
     /// Pop the next queued job for an agent with a free slot, if any.

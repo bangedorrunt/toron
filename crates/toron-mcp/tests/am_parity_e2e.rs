@@ -1059,14 +1059,12 @@ async fn cluster_macros_and_product_bus() -> anyhow::Result<()> {
         // Wire shape is a BARE array of ProjectSearchMessageOut (outputSchema
         // `Vec<ProjectSearchMessageOut>`), unlike per-project search_messages
         // which wraps in `{result: [...], next_cursor}`. Accept both.
-        prod_hits = if let Some(arr) = s.as_array() {
-            arr.clone()
-        } else {
+        prod_hits = s.as_array().cloned().unwrap_or_else(|| {
             s.get("result")
                 .and_then(|r| r.as_array())
                 .cloned()
                 .unwrap_or_default()
-        };
+        });
         if !prod_hits.is_empty() {
             break;
         }

@@ -250,16 +250,14 @@ pub fn job_state(job: EventId, events: &[Event]) -> JobState {
 
     // Non-terminal: claim (and optional progress) drive the state.
     let job_events_owned: Vec<Event> = job_events.iter().map(|e| (*e).clone()).collect();
-    if let Some(claimer) = first_claimer(job, &job_events_owned) {
+    first_claimer(job, &job_events_owned).map_or(JobState::Open, |claimer| {
         let has_progress = job_events.iter().any(|e| e.kind.as_u16() == JOB_PROGRESS);
         if has_progress {
             JobState::InProgress(claimer)
         } else {
             JobState::Claimed(claimer)
         }
-    } else {
-        JobState::Open
-    }
+    })
 }
 
 /// The kind-43001 request as JSON (wire-identical, relay-acceptable).

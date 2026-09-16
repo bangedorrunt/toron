@@ -1497,17 +1497,14 @@ fn finish_guard_check(
         // bd-9mb8 bead-hunk attribution: bd-* tokens ADDED by the staged
         // diff must appear in the commit message (--msg-file from the
         // commit-msg hook). Skipped when no message file was supplied.
-        let bead_blocks = match &args.msg_file {
-            Some(mf) => {
-                let msg = std::fs::read_to_string(mf).unwrap_or_default();
-                let added = toron_core::mailbox::guard::staged_added_lines_in(
-                    &args.repo,
-                    toron_core::mailbox::guard::SHARED_SAFE_PATHS,
-                );
-                toron_core::mailbox::guard::bead_hunk_violations(&added, &msg)
-            }
-            None => Vec::new(),
-        };
+        let bead_blocks = args.msg_file.as_ref().map_or_else(Vec::new, |mf| {
+            let msg = std::fs::read_to_string(mf).unwrap_or_default();
+            let added = toron_core::mailbox::guard::staged_added_lines_in(
+                &args.repo,
+                toron_core::mailbox::guard::SHARED_SAFE_PATHS,
+            );
+            toron_core::mailbox::guard::bead_hunk_violations(&added, &msg)
+        });
         if !blocked.is_empty() {
             let summary: Vec<String> = blocked
                 .iter()
@@ -1569,15 +1566,14 @@ fn finish_guard_check(
     }
     // Legacy (non-strict) surface: unchanged fail-open for an unattributed
     // commit, but the same identity fold for everything attributed.
-    let blocked = match agent {
-        None => Vec::new(),
-        Some(agent) => toron_core::mailbox::guard::guard_blocked_paths_resolved(
+    let blocked = agent.map_or_else(Vec::new, |agent| {
+        toron_core::mailbox::guard::guard_blocked_paths_resolved(
             agent,
             staged,
             reservations,
             &resolve,
-        ),
-    };
+        )
+    });
     let out = json!({
         "blocked": blocked,
         "agent": agent,

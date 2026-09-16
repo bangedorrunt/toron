@@ -259,10 +259,7 @@ pub fn tag_match<'a>(event: &'a Event, name: &str) -> Option<&'a str> {
 /// Optional scoping: `None` = unconstrained; `Some(want)` = the event's
 /// `<tag>` must equal `want`.
 fn scoped_tag_match(want: Option<&str>, event: &Event, tag: &str) -> bool {
-    match want {
-        None => true,
-        Some(w) => tag_match(event, tag) == Some(w),
-    }
+    want.is_none_or(|w| tag_match(event, tag) == Some(w))
 }
 
 /// Optional reservation-path glob: `None` = unconstrained; `Some(glob)` =
