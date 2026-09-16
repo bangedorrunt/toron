@@ -262,7 +262,7 @@ async fn run_bench(args: &cli::BenchArgs, format: OutputFormat) -> anyhow::Resul
     };
     match format {
         OutputFormat::Json | OutputFormat::Plain => {
-            render_json(&serde_json::to_value(&report)?, format)
+            render_json(&serde_json::to_value(&report)?, format);
         }
         OutputFormat::Human => println!(
             "bench {}: {} iterations, avg {}us, p50 {}us, p95 {}us",
