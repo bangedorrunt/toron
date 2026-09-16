@@ -456,8 +456,7 @@ async fn reconstruct_project(root: &Path, dry_run: bool) -> anyhow::Result<Recon
     // Forensic bundle + quarantine the original db (and its wal/shm).
     let ts = unix_ts_secs();
     let forensic_dir = root.join(format!("doctor-forensic-{ts}"));
-    let mut quarantine = None;
-    if db_exists {
+    let quarantine = if db_exists {
         std::fs::create_dir_all(&forensic_dir)?;
         for suffix in ["", "-wal", "-shm"] {
             let src = root.join(format!("index.sqlite{suffix}"));
@@ -477,8 +476,10 @@ async fn reconstruct_project(root: &Path, dry_run: bool) -> anyhow::Result<Recon
             forensic_dir.join("manifest.json"),
             serde_json::to_string_pretty(&manifest)?,
         )?;
-        quarantine = Some(forensic_dir.to_string_lossy().into_owned());
-    }
+        Some(forensic_dir.to_string_lossy().into_owned())
+    } else {
+        None
+    };
 
     // Build a fresh db at `index.sqlite.new`, migrate, rebuild from archive.
     let new_db = root.join("index.sqlite.new");
@@ -723,12 +724,13 @@ fn metrics_file_path() -> PathBuf {
 
 fn state() -> &'static Mutex<MetricsState> {
     STATE.get_or_init(|| {
-        let mut loaded = MetricsState::default();
-        if let Ok(raw) = std::fs::read_to_string(metrics_file_path())
+        let loaded = if let Ok(raw) = std::fs::read_to_string(metrics_file_path())
             && let Ok(parsed) = serde_json::from_str::<MetricsState>(&raw)
         {
-            loaded = parsed;
-        }
+            parsed
+        } else {
+            MetricsState::default()
+        };
         Mutex::new(loaded)
     })
 }
@@ -1282,7 +1284,7 @@ mod reconstruct_tests {
         }];
         assert_eq!(classify_exit(&ok, true, 1), ReconstructExit::Ok);
         // Failed when any project failed (quarantine preserved).
-        let mut mixed = ok.clone();
+        let mut mixed = ok;
         mixed.push(ReconstructReport {
             slug: "b".into(),
             archive_messages: 1,

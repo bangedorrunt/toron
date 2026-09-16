@@ -48,7 +48,6 @@ impl MockRelay {
 
         let handle = tokio::spawn({
             let state = state.clone();
-            let live_tx = live_tx.clone();
             async move {
                 while let Ok((stream, _)) = listener.accept().await {
                     let state = state.clone();

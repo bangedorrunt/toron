@@ -136,6 +136,6 @@ mod tests {
         let id = MessageId::from(raw.clone());
         assert_eq!(id.as_ref(), raw);
         assert_eq!(id.to_string(), raw);
-        assert_eq!(id.clone(), MessageId::from(raw.as_str()));
+        assert_eq!(id, MessageId::from(raw.as_str()));
     }
 }

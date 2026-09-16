@@ -29,7 +29,7 @@ use toron_workflow::schema::{Action, parse_workflow};
 /// A runner that records every action it executes (the tick's workflow runs
 /// `send_dm` → observed here).
 fn recording_runner(seen: Arc<Mutex<Vec<Action>>>) -> ActionRunner {
-    let seen_clone = seen.clone();
+    let seen_clone = seen;
     Arc::new(move |a: &Action| {
         seen_clone.lock().unwrap().push(a.clone());
         Ok(serde_json::Value::Null)

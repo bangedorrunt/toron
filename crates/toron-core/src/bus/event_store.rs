@@ -356,14 +356,15 @@ impl BusEventStore {
         let expiry_pred = "(expires_at IS NULL OR expires_at > ?1)".to_string();
         let mut kinds_binds: Vec<i64> = Vec::new();
 
-        let mut kind_in_pred: Option<String> = None;
-        if let Some(kinds) = &filter.kinds
+        let kind_in_pred: Option<String> = if let Some(kinds) = &filter.kinds
             && !kinds.is_empty()
         {
             let placeholders: Vec<String> = (2..2 + kinds.len()).map(|i| format!("?{i}")).collect();
             kinds_binds = kinds.iter().map(|k| k.as_u16() as i64).collect();
-            kind_in_pred = Some(format!("kind IN ({})", placeholders.join(",")));
-        }
+            Some(format!("kind IN ({})", placeholders.join(",")))
+        } else {
+            None
+        };
 
         let p_vals: Vec<String> = filter
             .generic_tags

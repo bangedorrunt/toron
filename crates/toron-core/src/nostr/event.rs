@@ -260,8 +260,8 @@ mod tests {
             event.pubkey,
             event.created_at,
             event.kind,
-            event.tags.clone(),
-            event.content.clone(),
+            event.tags,
+            event.content,
             bad_sig,
         );
         match verify_event(&forged) {

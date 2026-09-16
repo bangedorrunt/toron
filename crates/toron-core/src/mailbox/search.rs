@@ -10,6 +10,7 @@
 //! ties exact. NIP-50 accelerator is a later optional add — not parity-scope.
 
 use sqlx::Row;
+use std::fmt::Write as _;
 
 use super::Mailbox;
 
@@ -158,11 +159,12 @@ impl Mailbox {
             let sub_ph: Vec<String> = (bind_id..bind_id + set.len() as i32)
                 .map(|i| format!("?{i}"))
                 .collect();
-            filter_sql.push_str(&format!(
+            let _ = write!(
+                filter_sql,
                 " AND m.sender_pubkey IN (SELECT pubkey FROM agents WHERE project_slug IN ({}) AND name = ?{})",
                 sub_ph.join(", "),
                 bind_id + set.len() as i32
-            ));
+            );
             for s in &set {
                 params.push(s.clone());
             }
@@ -170,22 +172,22 @@ impl Mailbox {
             bind_id += set.len() as i32 + 1;
         }
         if let Some(i) = args.importance.clone() {
-            filter_sql.push_str(&format!(" AND m.importance = ?{}", bind_id));
+            let _ = write!(filter_sql, " AND m.importance = ?{bind_id}");
             params.push(i);
             bind_id += 1;
         }
         if let Some(t) = args.thread_id.clone() {
-            filter_sql.push_str(&format!(" AND m.thread_id = ?{}", bind_id));
+            let _ = write!(filter_sql, " AND m.thread_id = ?{bind_id}");
             params.push(t);
             bind_id += 1;
         }
         if let Some(s) = since {
-            filter_sql.push_str(&format!(" AND m.created_ts_us >= ?{}", bind_id));
+            let _ = write!(filter_sql, " AND m.created_ts_us >= ?{bind_id}");
             params.push(s.to_string());
             bind_id += 1;
         }
         if let Some(u) = until {
-            filter_sql.push_str(&format!(" AND m.created_ts_us <= ?{}", bind_id));
+            let _ = write!(filter_sql, " AND m.created_ts_us <= ?{bind_id}");
             params.push(u.to_string());
             bind_id += 1;
         }
@@ -197,7 +199,7 @@ impl Mailbox {
             _ => sql.push_str(" ORDER BY bm25(messages_fts), m.created_ts_us DESC"),
         }
         let limit = args.limit.unwrap_or(100).min(1000);
-        sql.push_str(&format!(" LIMIT ?{}", bind_id));
+        let _ = write!(sql, " LIMIT ?{bind_id}");
         params.push(limit.to_string());
 
         let mut q = sqlx::query(&sql);

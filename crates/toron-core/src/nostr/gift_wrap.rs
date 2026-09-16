@@ -357,8 +357,8 @@ mod tests {
             wrapped.pubkey,
             wrapped.created_at,
             wrapped.kind,
-            wrapped.tags.clone(),
-            wrapped.content.clone(),
+            wrapped.tags,
+            wrapped.content,
             bad_sig,
         );
         match unwrap(&recipient, &forged) {
@@ -380,10 +380,9 @@ mod tests {
         let rumor = sample_rumor(sender.public_key());
 
         // Build the honest seal, then tamper with its content.
-        let seal =
-            ::nostr::nips::nip59::GiftWrapSealBuilder::new(rumor.clone(), recipient.public_key())
-                .finalize(&sender)
-                .expect("seal");
+        let seal = ::nostr::nips::nip59::GiftWrapSealBuilder::new(rumor, recipient.public_key())
+            .finalize(&sender)
+            .expect("seal");
         let tampered = Event::new(
             seal.id,
             seal.pubkey,
@@ -458,8 +457,7 @@ mod tests {
             Vec::<Tag>::new(),
             "job done",
         );
-        let wrapped_job =
-            gift_wrap(&sender, &recipient.public_key(), job_rumor.clone()).expect("wrap job");
+        let wrapped_job = gift_wrap(&sender, &recipient.public_key(), job_rumor).expect("wrap job");
         let unwrapped = unwrap(&recipient, &wrapped_job).expect("unwrap job");
         assert_eq!(unwrapped.rumor.kind.as_u16(), JOB_RESULT);
     }

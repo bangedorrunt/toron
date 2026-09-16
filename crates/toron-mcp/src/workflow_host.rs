@@ -284,7 +284,7 @@ pub fn mailbox_runner_with_dispatcher(
                 let mut tags = stamp_workflow_emitted(vec![]);
                 let mut msg = SendMessage {
                     project_slug: project.clone(),
-                    sender_name: sender_for(&project).to_string(),
+                    sender_name: sender_for(&project),
                     to: to.clone(),
                     subject: subject.clone(),
                     body_md: body.clone(),
@@ -343,7 +343,7 @@ pub fn mailbox_runner_with_dispatcher(
                 let mut tags = stamp_workflow_emitted(vec![]);
                 let mut msg = SendMessage {
                     project_slug: project.clone(),
-                    sender_name: sender_for(&project).to_string(),
+                    sender_name: sender_for(&project),
                     to: vec![to.clone()],
                     subject: "workflow dm".to_string(),
                     body_md: body.clone(),
@@ -636,7 +636,7 @@ pub fn mailbox_effect_runner(
                     tags.push(Tag::parse(["corr", key.as_str()]).expect("corr tag parses"));
                     let msg = SendMessage {
                         project_slug: project.clone(),
-                        sender_name: sender_for(&project).to_string(),
+                        sender_name: sender_for(&project),
                         to: to.clone(),
                         subject: subject.clone(),
                         body_md: body.clone(),
@@ -659,7 +659,7 @@ pub fn mailbox_effect_runner(
                     tags.push(Tag::parse(["corr", key.as_str()]).expect("corr tag parses"));
                     let msg = SendMessage {
                         project_slug: project.clone(),
-                        sender_name: sender_for(&project).to_string(),
+                        sender_name: sender_for(&project),
                         to: vec![to.clone()],
                         subject: "workflow dm".to_string(),
                         body_md: body.clone(),
@@ -736,7 +736,7 @@ pub fn mailbox_effect_runner(
                         // through; `invoke` classifies it (I5) identically.
                         return Ok(observed);
                     };
-                    let key_out = key.clone();
+                    let key_out = key;
                     Ok(fenced_outcome(
                         &key_out,
                         block_on_async(async move {
@@ -3335,7 +3335,7 @@ steps:
             std::time::Duration::from_millis(500),
             3,
         )));
-        let runner = mailbox_runner(mailbox.clone(), coalescer.clone(), Some(Keys::generate()));
+        let runner = mailbox_runner(mailbox, coalescer, Some(Keys::generate()));
 
         let dispatch = |runner: &ActionRunner, assignee: &str, text: &str| {
             runner(&Action::DispatchJob {
@@ -3402,7 +3402,7 @@ steps:
             let mailbox =
                 Arc::new(Mailbox::new(bus, data_dir, None).with_agent_passphrase("poison-pass"));
             let coalescer = Arc::new(std::sync::Mutex::new(MentionCoalescer::from_env()));
-            let runner = mailbox_runner(mailbox.clone(), coalescer.clone(), Some(Keys::generate()));
+            let runner = mailbox_runner(mailbox, coalescer.clone(), Some(Keys::generate()));
             (runner, coalescer)
         });
 

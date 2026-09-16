@@ -29,7 +29,7 @@ fn percentiles(mut samples: Vec<Duration>) -> (Duration, Duration, Duration) {
 }
 
 fn fmt(d: Duration) -> String {
-    format!("{:?}", d)
+    format!("{d:?}")
 }
 
 async fn temp_pool(tag: &str) -> (sqlx::SqlitePool, std::path::PathBuf) {

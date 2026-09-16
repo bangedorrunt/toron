@@ -1928,8 +1928,7 @@ pub(crate) fn captain_write_gate(
         anyhow::bail!(
             "captain fold is swarm-only (ADR-0018): project {project} runs identity_mode=open, \
              where the fold can never route — flip via ensure_project identity_mode=swarm, or \
-             address the pin directly; --force overrides (audited)",
-            project = project
+             address the pin directly; --force overrides (audited)"
         );
     }
     Ok(())

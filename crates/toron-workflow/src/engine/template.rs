@@ -11,6 +11,8 @@
 //! verbatim placeholder. (The guard-syntax lint keeps its own lenient
 //! substitution; that is static analysis, not execution.)
 
+use std::fmt::Write as _;
+
 use crate::schema::Action;
 
 /// Render context carried into errors: workflow + node identity so a missing
@@ -105,7 +107,7 @@ fn render_template_lenient(
                 if let Some(replaced) = resolve_template(token.trim(), trigger, step_outputs) {
                     out.push_str(&replaced);
                 } else {
-                    out.push_str(&format!("{{{{{token}}}}}"));
+                    let _ = write!(out, "{{{{{token}}}}}");
                 }
                 rest = &after[end + 2..];
             }

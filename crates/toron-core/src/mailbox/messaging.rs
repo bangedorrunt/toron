@@ -920,10 +920,8 @@ impl Mailbox {
         } else {
             audience.join(",")
         };
-        let content = format!(
-            "[doorbell] ack-sla-expired post {} thread {} audience {}",
-            post_id, tid, aud
-        );
+        let content =
+            format!("[doorbell] ack-sla-expired post {post_id} thread {tid} audience {aud}");
         let mut tags = vec![
             Tag::parse(["t", &project_slug]).expect("t"),
             Tag::parse(["h", tid]).expect("h"),
@@ -2628,7 +2626,7 @@ mod tests {
             .find_map(|w| {
                 gift_wrap::unwrap(&gc, w)
                     .ok()
-                    .map(|g| g.rumor.clone().id().to_hex())
+                    .map(|mut g| g.rumor.id().to_hex())
             })
             .expect("msg2 id");
 
@@ -2666,7 +2664,6 @@ mod tests {
         let message_id = unwrap_for_recipient(&bl, wrap)
             .expect("unwrap")
             .rumor
-            .clone()
             .id()
             .to_hex();
 

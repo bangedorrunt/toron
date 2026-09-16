@@ -55,7 +55,7 @@ pub fn lint(file: &PathBuf) -> Result<i32> {
                 );
             }
             if blocking > 0 {
-                bail!("{} blocking lint issue(s)", blocking);
+                bail!("{blocking} blocking lint issue(s)");
             }
             Ok(EXIT_OK)
         }

@@ -2296,7 +2296,7 @@ impl Mailbox {
     ) {
         let root = crate::mailbox::aliases::project_root(&self.data_dir, project_slug);
         if let Ok(archive) = crate::archive::git::GitArchive::open_or_init(&root) {
-            let rel = std::path::Path::new(".audit").join(format!("{}.{status}.json", event_id));
+            let rel = std::path::Path::new(".audit").join(format!("{event_id}.{status}.json"));
             let content = format!(
                 r#"{{"d":"{d}","status":"{status}","event_id":"{event_id}","ts_us":{}}}"#,
                 crate::index::writer::Clock::now_us(&crate::index::writer::SystemClock)

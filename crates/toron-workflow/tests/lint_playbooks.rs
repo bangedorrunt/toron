@@ -77,8 +77,7 @@ fn failure_mode_fixtures_error_with_expected_message() {
         );
         assert!(
             blocking.iter().any(|m| m.contains(expected)),
-            "{fixture}: expected error containing {expected:?}, got {:?}",
-            blocking
+            "{fixture}: expected error containing {expected:?}, got {blocking:?}"
         );
     }
 }

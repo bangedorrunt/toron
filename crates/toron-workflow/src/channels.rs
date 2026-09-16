@@ -317,10 +317,9 @@ impl ChannelStore {
         let chars = content.chars().count();
         if chars > CHANNEL_POST_MAX_CHARS {
             anyhow::bail!(
-                "post is {chars} chars; channel posts cap at {} — split it with \
+                "post is {chars} chars; channel posts cap at {CHANNEL_POST_MAX_CHARS} — split it with \
                  `toron channel post --file <path>` ((1/N) chunked thread) or send the \
-                 full report to a file and post a summary",
-                CHANNEL_POST_MAX_CHARS
+                 full report to a file and post a summary"
             );
         }
         let mut tags = vec![Tag::parse(["h", channel_id]).expect("h tag")];

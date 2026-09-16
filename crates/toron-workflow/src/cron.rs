@@ -620,7 +620,7 @@ impl CronManager {
                     run_prefix: "cron-spec".to_string(),
                     start_ts: reg.start_ts,
                 };
-                let run_id = format!("cron-spec:{}", name);
+                let run_id = format!("cron-spec:{name}");
                 let _ = self
                     .engine
                     .resonate()

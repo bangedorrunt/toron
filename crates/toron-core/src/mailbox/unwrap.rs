@@ -1261,7 +1261,7 @@ mod tests {
     fn test_ts_ms_tag_override() {
         let sender = keys();
         let recipient = keys();
-        let rumor = build_rumor(
+        let mut rumor = build_rumor(
             sender.public_key(),
             Timestamp::from(1_700_000_000),
             Kind::PrivateDirectMessage,
@@ -1271,8 +1271,8 @@ mod tests {
         let mail = UnwrappedMail {
             recipient: recipient.public_key(),
             sender: sender.public_key(),
-            rumor: rumor.clone(),
-            rumor_id: rumor.clone().id(),
+            rumor_id: rumor.id(),
+            rumor,
             wrap_event_id: EventId::from_hex(
                 "b32828720d7e8a80dd5165a6cd31b2c70e8d25b83c387209cb138e77d7e7e05b",
             )
@@ -2159,12 +2159,12 @@ mod tests {
         let sender = keys();
         let recipient = keys();
         let wrap = wrap_for(&sender, &recipient, 1_700_000_000);
-        let rumor = gift_wrap::unwrap(&recipient, &wrap).expect("unwrap").rumor;
+        let mut rumor = gift_wrap::unwrap(&recipient, &wrap).expect("unwrap").rumor;
         let mail = UnwrappedMail {
             recipient: recipient.public_key(),
             sender: sender.public_key(),
+            rumor_id: rumor.id(),
             rumor: rumor.clone(),
-            rumor_id: rumor.clone().id(),
             wrap_event_id: wrap.id,
             created_at: Timestamp::from(1_700_000_000),
         };
@@ -2178,7 +2178,7 @@ mod tests {
         drop(sink_a);
         let sink_b = GitProjectionSink::open(&root).expect("reopen");
         assert_eq!(sink_b.projected_count(), 0, "fresh in-mem set");
-        let key = DedupKey::of(&recipient.public_key(), &rumor.clone().id());
+        let key = DedupKey::of(&recipient.public_key(), &rumor.id());
         assert!(
             sink_b.is_projected(&key).await.expect("is_projected"),
             "marker on disk survives restart"

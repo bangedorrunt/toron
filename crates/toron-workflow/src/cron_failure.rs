@@ -227,7 +227,7 @@ mod tests {
         let back: PolicyEvent = serde_json::from_str(&s).expect("deserializes");
         assert_eq!(back.output.as_ref().unwrap(), &out);
         // Absent output round-trips as None (backward compat).
-        let mut ev2 = ev.clone();
+        let mut ev2 = ev;
         ev2.output = None;
         let s2 = serde_json::to_string(&ev2).expect("serializes");
         assert!(!s2.contains("\"output\""), "None output is skipped");
