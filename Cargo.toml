@@ -46,7 +46,6 @@ cast_possible_wrap = { level = "allow", priority = 1 }
 cast_sign_loss = { level = "allow", priority = 1 }
 default_trait_access = { level = "allow", priority = 1 }
 doc_link_with_quotes = { level = "allow", priority = 1 }
-double_must_use = { level = "allow", priority = 1 }
 equatable_if_let = { level = "allow", priority = 1 }
 ignored_unit_patterns = { level = "allow", priority = 1 }
 implicit_clone = { level = "allow", priority = 1 }
