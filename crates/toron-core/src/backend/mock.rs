@@ -365,8 +365,8 @@ mod tests {
 
     #[test]
     fn mock_is_object_safe_and_named() {
-        fn _assert_dyn(_: &dyn crate::backend::Backend) {}
-        _assert_dyn(&MockBackend::new());
+        fn assert_dyn(_: &dyn crate::backend::Backend) {}
+        assert_dyn(&MockBackend::new());
         assert_eq!(MockBackend::new().name(), "mock");
     }
 
