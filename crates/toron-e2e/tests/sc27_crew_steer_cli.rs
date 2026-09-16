@@ -365,15 +365,11 @@ async fn sc27_crew_steer_cli_no_captain() {
             .unwrap_or_default(),
         _ => Vec::new(),
     };
-    let b_rows: Vec<&&Value> = rows
+    let b_rows = rows
         .iter()
         .filter(|r| r.to_string().contains(B) || r.to_string().contains(&b_npub))
-        .collect();
-    assert_eq!(
-        b_rows.len(),
-        1,
-        "exactly one open job for B, got {jobs_json}"
-    );
+        .count();
+    assert_eq!(b_rows, 1, "exactly one open job for B, got {jobs_json}");
     // settle: still exactly one 43001 (not N)
     tokio::time::sleep(Duration::from_millis(1500)).await;
     assert_eq!(
