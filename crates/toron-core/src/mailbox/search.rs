@@ -374,7 +374,7 @@ mod tests {
         );
     }
 
-    /// Acceptance (S1): any token with characters outside [A-Za-z0-9_*"]
+    /// Acceptance (S1): any token with characters outside `[A-Za-z0-9_*"]`
     /// gets quoted — colon, dot, @, unicode forms. Operators, quoted
     /// phrases and trailing-star prefix queries stay bare.
     #[test]
