@@ -16,7 +16,7 @@ fn recording_runner(
     seen: Arc<StdMutex<Vec<Action>>>,
     f: impl Fn(&Action) -> serde_json::Value + Send + Sync + 'static,
 ) -> ActionRunner {
-    let seen_c = seen.clone();
+    let seen_c = seen;
     Arc::new(move |a: &Action| {
         seen_c.lock().unwrap().push(a.clone());
         Ok(f(a))

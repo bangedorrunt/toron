@@ -227,7 +227,7 @@ async fn sc28_first_claimer_cli_exactly_one_wins() {
     let job_b = job_id.clone();
     let t_b = std::thread::spawn(move || claim(&dir_b, &job_b, B));
     let dir_a = dir.clone();
-    let job_a = job_id.clone();
+    let job_a = job_id;
     let t_a = std::thread::spawn(move || claim(&dir_a, &job_a, A));
     let out_b = t_b.join().expect("thread B");
     let out_a = t_a.join().expect("thread A");

@@ -388,8 +388,7 @@ impl SendTags {
             return Err(MailError::new(
                 MailErrorCode::Malformed,
                 format!(
-                    "audience=human fan-out to {} recipients is a hard error (E3): human audience addresses one orchestrator pin",
-                    recipient_count
+                    "audience=human fan-out to {recipient_count} recipients is a hard error (E3): human audience addresses one orchestrator pin"
                 ),
             ));
         }

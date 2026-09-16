@@ -238,7 +238,7 @@ async fn upload(State(state): State<BlossomState>, headers: HeaderMap, body: Byt
             };
             let descriptor = BlobDescriptor {
                 url: format!("/{MOUNT_PATH}/{sha256}{}", mime_to_ext(Some(&uploaded))),
-                sha256: sha256.clone(),
+                sha256,
                 size: body.len(),
                 mime: uploaded,
                 uploaded: now_unix(),

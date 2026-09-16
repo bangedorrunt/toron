@@ -285,8 +285,7 @@ fn ui(f: &mut Frame, state: &mut TuiState) {
     // header — hacker-night void + muted + neon accents
     let live = spinner(state.tick);
     let header = Paragraph::new(format!(
-        "toron ◆ operator dashboard  ·  {}/{}  ·  demo/TestAgent  ·  {} live",
-        PROJECT, AGENT, live
+        "toron ◆ operator dashboard  ·  {PROJECT}/{AGENT}  ·  demo/TestAgent  ·  {live} live"
     ))
     .style(HackerNight::header());
     f.render_widget(header, chunks[0]);
@@ -304,7 +303,7 @@ fn ui(f: &mut Frame, state: &mut TuiState) {
         _ => render_search(f, chunks[2], state),
     }
 
-    let footer = Paragraph::new(footer_hint(state).to_string()).style(HackerNight::fg_muted());
+    let footer = Paragraph::new(footer_hint(state)).style(HackerNight::fg_muted());
     f.render_widget(footer, chunks[3]);
 
     if state.show_help {
@@ -325,7 +324,7 @@ fn render_resize_card(f: &mut Frame, area: Rect) {
     let w = (msg.len() as u16 + 6)
         .min(area.width.saturating_sub(2))
         .max(30);
-    let p = Paragraph::new(msg.clone())
+    let p = Paragraph::new(msg)
         .style(HackerNight::warning())
         .block(block)
         .centered();

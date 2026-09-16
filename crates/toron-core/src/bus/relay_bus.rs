@@ -13,6 +13,7 @@
 //! toron owns an embedded relay (ADR-0003 NEW-D3). This is enforced by
 //! [`RelayBus::federation_policy_allows`].
 
+use std::fmt::Write as _;
 use std::sync::Arc;
 
 use crate::nostr::{Event, Keys};
@@ -294,7 +295,7 @@ impl Bus for RelayBus {
             // F1.LAG-SWALLOW: a non-zero count is an observable gap — dropped
             // relay notifications (workflow triggers / mailbox events). Never
             // silent.
-            message.push_str(&format!("; {lag} notification(s) dropped to broadcast lag"));
+            let _ = write!(message, "; {lag} notification(s) dropped to broadcast lag");
         }
         Ok(Health { ok: true, message })
     }
@@ -321,7 +322,7 @@ mod tests {
         let keys = Keys::generate();
         let bus_config = RelayBusConfig {
             relays: vec![],
-            keys: keys.clone(),
+            keys,
             federation_policy_enabled: true,
             ..Default::default()
         };

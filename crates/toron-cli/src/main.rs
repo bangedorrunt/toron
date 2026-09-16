@@ -155,7 +155,7 @@ fn run(cli: &Cli) -> anyhow::Result<ExitCode> {
                 // Idle exit → 4 (documented extension): watch --live
                 // --idle-exit fired; a supervisor treats it as Died→respawn.
                 Err(e) if e.downcast_ref::<plane::IdleExit>().is_some() => {
-                    eprintln!("toron: {}", e);
+                    eprintln!("toron: {e}");
                     ExitCode::from(4)
                 }
                 Err(e) => return Err(e),

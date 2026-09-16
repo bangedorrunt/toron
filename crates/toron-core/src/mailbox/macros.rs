@@ -83,8 +83,7 @@ impl Mailbox {
         let agent = self.register_agent(project_key, &profile).await?;
 
         // 3. Optional reservation cycle.
-        let mut granted = Vec::new();
-        if let Some(paths) = reservation_paths {
+        let granted = if let Some(paths) = reservation_paths {
             let res = self
                 .file_reservation_paths(
                     project_key,
@@ -95,8 +94,10 @@ impl Mailbox {
                     reservation_reason,
                 )
                 .await?;
-            granted = res.granted;
-        }
+            res.granted
+        } else {
+            Vec::new()
+        };
 
         // 4. Inbox snapshot.
         let inbox = self

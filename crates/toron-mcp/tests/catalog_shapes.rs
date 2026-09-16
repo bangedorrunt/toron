@@ -125,7 +125,7 @@ fn catalog_shapes_tampered_shape_fails() {
         find_drift(&live, &frozen).is_empty(),
         "pristine live matches"
     );
-    let mut tampered = live.clone();
+    let mut tampered = live;
     let first = tampered["tools"]
         .as_object()
         .and_then(|o| o.keys().next().cloned())

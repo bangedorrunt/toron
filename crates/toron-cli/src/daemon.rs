@@ -352,7 +352,7 @@ mod tests {
             cmd: super::super::cli::DaemonCommand::Status,
         };
         assert_eq!(
-            args.state_dir.clone().unwrap_or_else(default_state_dir),
+            args.state_dir.unwrap_or_else(default_state_dir),
             PathBuf::from("/custom/state")
         );
     }

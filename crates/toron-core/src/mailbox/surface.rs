@@ -1269,7 +1269,7 @@ mod tests {
         let (surface, db_path, data_dir) = test_surface("meta").await;
         assert_eq!(surface.name(), "toron");
         assert_eq!(surface.agent_name(), "", "unset until with_agent_name");
-        let rebound = surface.clone().with_agent_name("GreenCastle");
+        let rebound = surface.with_agent_name("GreenCastle");
         assert_eq!(rebound.agent_name(), "GreenCastle");
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_dir_all(&data_dir);

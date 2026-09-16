@@ -150,7 +150,7 @@ fn build_approval_payload(
     failed_sorted.sort();
 
     let artifacts = extract_artifacts(outputs);
-    let ledger_path = format!(".flywheel/receipts/{}-progress-ledger.json", run_id);
+    let ledger_path = format!(".flywheel/receipts/{run_id}-progress-ledger.json");
     let blast_radius = workflow_name.to_string();
     let timeout = "PT24H".to_string();
 
@@ -318,8 +318,7 @@ pub(crate) fn rendered_approval_message(
     match render_action(action, trigger, step_outputs, &render_ctx)? {
         Action::RequestApproval { message } => Ok(message),
         other => Err(anyhow::anyhow!(
-            "rendered approval action is not request_approval: {:?}",
-            other
+            "rendered approval action is not request_approval: {other:?}"
         )),
     }
 }
@@ -1014,7 +1013,7 @@ pub(crate) fn guard_vars(
     let mut vars = std::collections::HashMap::new();
     if let Some(obj) = trigger.as_object() {
         for (k, v) in obj {
-            let name = format!("trigger_{}", k);
+            let name = format!("trigger_{k}");
             let text = match v {
                 serde_json::Value::String(s) => s.clone(),
                 other => other.to_string(),
@@ -1182,10 +1181,11 @@ pub(crate) async fn run_foreach(
         // Each iteration sees the current item as `{{item}}` (ADR-0007 F4):
         // inject it into the iteration's trigger copy so the template
         // renderer can resolve it.
-        let mut iter_trigger = serde_json::Value::Object(serde_json::Map::new());
-        if let Some(obj) = trigger.as_object() {
-            iter_trigger = serde_json::Value::Object(obj.clone());
-        }
+        let mut iter_trigger = if let Some(obj) = trigger.as_object() {
+            serde_json::Value::Object(obj.clone())
+        } else {
+            serde_json::Value::Object(serde_json::Map::new())
+        };
         iter_trigger["item"] = item.clone();
         // Iterations resolve against the enclosing scope plus the item.
         let mut item_outputs = step_outputs.clone();

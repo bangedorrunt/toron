@@ -601,7 +601,7 @@ mod lifecycle_tests {
         let digest = terminal_digest("run-1", "d", "succeeded", "gate", "ev");
         let rec = TerminalRecord {
             run_id: "run-1".into(),
-            digest: digest.clone(),
+            digest,
             status: "succeeded".into(),
             node: "gate".into(),
         };
