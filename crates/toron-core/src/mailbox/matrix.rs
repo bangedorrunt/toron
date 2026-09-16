@@ -31,7 +31,7 @@ pub async fn run_proof_matrix(pool: SqlitePool) -> Vec<String> {
         case: &str,
         result: Result<(), crate::nostr::proof::ProofError>,
     ) {
-        if let Ok(()) = result {
+        if result.is_ok() {
             leaked.push(case.to_string());
         }
     }

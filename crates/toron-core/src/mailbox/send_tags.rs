@@ -382,9 +382,7 @@ impl SendTags {
         recipient_count: usize,
         overseer: bool,
     ) -> Result<(), MailError> {
-        if let Some(Audience::Human) = self.audience
-            && recipient_count > 1
-        {
+        if self.audience == Some(Audience::Human) && recipient_count > 1 {
             return Err(MailError::new(
                 MailErrorCode::Malformed,
                 format!(
@@ -392,14 +390,14 @@ impl SendTags {
                 ),
             ));
         }
-        if let Some(Priority::Interrupt) = self.priority {
+        if self.priority == Some(Priority::Interrupt) {
             if !overseer {
                 return Err(MailError::new(
                     MailErrorCode::PolicyDenied,
                     "priority=interrupt is operator/user only (requires overseer)",
                 ));
             }
-            if let Some(Audience::Human) = self.audience {
+            if self.audience == Some(Audience::Human) {
                 return Err(MailError::new(
                     MailErrorCode::Malformed,
                     "priority=interrupt never onto human pin (E3)",
