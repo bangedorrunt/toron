@@ -251,7 +251,7 @@ mod tests {
             "e1",
             "Running builds",
             "quick brown foxes jump fence",
-            1700000000000000,
+            1_700_000_000_000_000,
             1,
         )
         .await;
@@ -260,7 +260,7 @@ mod tests {
             "e2",
             "Lunch",
             "rendezvous café résumé",
-            1700000000000001,
+            1_700_000_000_000_001,
             2,
         )
         .await;

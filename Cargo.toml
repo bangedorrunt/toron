@@ -66,7 +66,6 @@ single_match_else = { level = "allow", priority = 1 }
 too_many_lines = { level = "allow", priority = 1 }
 unnecessary_debug_formatting = { level = "allow", priority = 1 }
 unnested_or_patterns = { level = "allow", priority = 1 }
-unreadable_literal = { level = "allow", priority = 1 }
 unused_async = { level = "allow", priority = 1 }
 unused_self = { level = "allow", priority = 1 }
 use_self = { level = "allow", priority = 1 }
