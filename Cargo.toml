@@ -62,7 +62,6 @@ missing_fields_in_debug = { level = "allow", priority = 1 }
 missing_panics_doc = { level = "allow", priority = 1 }
 must_use_candidate = { level = "allow", priority = 1 }
 needless_collect = { level = "allow", priority = 1 }
-needless_continue = { level = "allow", priority = 1 }
 needless_pass_by_ref_mut = { level = "allow", priority = 1 }
 needless_pass_by_value = { level = "allow", priority = 1 }
 no_effect_underscore_binding = { level = "allow", priority = 1 }

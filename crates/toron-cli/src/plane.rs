@@ -1556,16 +1556,12 @@ async fn wait_for_corr(mailbox: &Mailbox, args: &WaitArgs) -> anyhow::Result<()>
                     );
                 }
                 ev = sub.next() => {
-                    if ev.is_none() {
-                        continue;
-                    }
+                    if ev.is_none() {}
                 }
             }
         } else {
             let ev = sub.next().await;
-            if ev.is_none() {
-                continue;
-            }
+            if ev.is_none() {}
         }
     }
 }
