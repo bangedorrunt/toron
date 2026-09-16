@@ -24,7 +24,7 @@ use std::time::Duration;
 
 use toron_workflow::cron::{CronManager, CronRegistration, CronRegistry};
 use toron_workflow::engine::{ActionRunner, WorkflowEngine};
-use toron_workflow::schema::{Action, parse_workflow};
+use toron_workflow::schema::{Action, CronScope, parse_workflow};
 
 /// A runner that records every action it executes (the tick's workflow runs
 /// `send_dm` → observed here).
@@ -106,7 +106,7 @@ fn registration(name: &str, cron: &str) -> CronRegistration {
         cron: cron.into(),
         workflow: tick_workflow(),
         owner: "@housekeeper".into(),
-        scope: Default::default(),
+        scope: CronScope::default(),
         enabled: true,
     }
 }

@@ -21,7 +21,7 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use futures_util::{SinkExt, StreamExt};
 
-use crate::nostr::{Event, Filter, SubscriptionId};
+use crate::nostr::{Event, Filter, MatchEventOptions, SubscriptionId};
 use ::nostr::message::client::ClientMessage;
 use ::nostr::message::relay::RelayMessage;
 
@@ -136,7 +136,7 @@ async fn handle_conn(
                         // Replay stored matches (clone under lock, no guard across await).
                         let stored: Vec<Event> = state.lock().events.clone();
                         for ev in stored {
-                            if filter.match_event(&ev, Default::default()) {
+                            if filter.match_event(&ev, MatchEventOptions::default()) {
                                 let msg = RelayMessage::event(sub_id.clone(), ev);
                                 sink.send(WsMessage::Text(msg.as_json())).await?;
                             }
@@ -159,7 +159,7 @@ async fn handle_conn(
                         // Forward to this connection's own matching subscriptions.
                         let subs = local_subs.clone();
                         for (sub_id, filter) in subs {
-                            if filter.match_event(&event, Default::default()) {
+                            if filter.match_event(&event, MatchEventOptions::default()) {
                                 let msg = RelayMessage::event(sub_id, event.clone());
                                 sink.send(WsMessage::Text(msg.as_json())).await?;
                             }

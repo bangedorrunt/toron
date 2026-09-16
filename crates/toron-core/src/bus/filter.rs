@@ -9,7 +9,7 @@
 //! InProcessBus uses `#t=[slug]`; relay-crossing kinds additionally carry
 //! NIP-32 labels `["l", slug, "toron"]` (`#l`).
 
-use crate::nostr::{Kind, PublicKey, SingleLetterTag, Timestamp};
+use crate::nostr::{Kind, MatchEventOptions, PublicKey, SingleLetterTag, Timestamp};
 
 /// The NIP-32 label namespace toron uses (ADR-0003 A3).
 pub const LABEL_NAMESPACE: &str = "toron";
@@ -187,8 +187,8 @@ mod tests {
         let k = keys();
         let ev = ev_with_t(&k, "demo");
         let f = project_filter("demo");
-        assert!(f.match_event(&ev, Default::default()));
-        assert!(!project_filter("other").match_event(&ev, Default::default()));
+        assert!(f.match_event(&ev, MatchEventOptions::default()));
+        assert!(!project_filter("other").match_event(&ev, MatchEventOptions::default()));
     }
 
     #[test]
@@ -196,8 +196,8 @@ mod tests {
         let k = keys();
         let ev = ev_with_label(&k, "demo");
         let f = project_label_filter("demo");
-        assert!(f.match_event(&ev, Default::default()));
-        assert!(!project_label_filter("other").match_event(&ev, Default::default()));
+        assert!(f.match_event(&ev, MatchEventOptions::default()));
+        assert!(!project_label_filter("other").match_event(&ev, MatchEventOptions::default()));
     }
 
     #[test]
@@ -206,12 +206,12 @@ mod tests {
         let ev = ev_with_t(&k, "demo");
         assert!(
             kind_project_filter(crate::nostr::kinds::toron_kind(PROJECT_MANIFEST), "demo")
-                .match_event(&ev, Default::default())
+                .match_event(&ev, MatchEventOptions::default())
         );
         // Wrong kind → no match.
         assert!(
             !kind_project_filter(crate::nostr::kinds::toron_kind(AGENT_PROFILE), "demo")
-                .match_event(&ev, Default::default())
+                .match_event(&ev, MatchEventOptions::default())
         );
     }
 
@@ -221,11 +221,12 @@ mod tests {
         let ev = ev_with_t(&k, "demo");
         let other = Keys::generate();
         assert!(
-            authors_project_filter([k.public_key()], "demo").match_event(&ev, Default::default())
+            authors_project_filter([k.public_key()], "demo")
+                .match_event(&ev, MatchEventOptions::default())
         );
         assert!(
             !authors_project_filter([other.public_key()], "demo")
-                .match_event(&ev, Default::default())
+                .match_event(&ev, MatchEventOptions::default())
         );
     }
 
@@ -237,13 +238,13 @@ mod tests {
             .project("demo")
             .kinds([crate::nostr::kinds::toron_kind(PROJECT_MANIFEST)])
             .build();
-        assert!(f.match_event(&ev, Default::default()));
+        assert!(f.match_event(&ev, MatchEventOptions::default()));
 
         let f_no_kind = ToronFilter::new()
             .project("demo")
             .kinds([Kind::TextNote])
             .build();
-        assert!(!f_no_kind.match_event(&ev, Default::default()));
+        assert!(!f_no_kind.match_event(&ev, MatchEventOptions::default()));
     }
 
     #[test]

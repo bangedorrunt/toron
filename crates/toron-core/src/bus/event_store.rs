@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
-use crate::nostr::{Event, SingleLetterTag, Timestamp};
+use crate::nostr::{Event, MatchEventOptions, SingleLetterTag, Timestamp};
 
 /// Max rows kept in the bus store. Beyond this, the oldest envelopes are
 /// pruned (bounded bus, permanent Git content — ADR-0003 superiority row).
@@ -525,7 +525,7 @@ impl BusEventStore {
         for id in ids.iter() {
             if let Some(ev) = resolved.get(id)
                 && !event_is_expired(ev)
-                && filter.match_event(ev, Default::default())
+                && filter.match_event(ev, MatchEventOptions::default())
             {
                 out.push(ev.clone());
             }

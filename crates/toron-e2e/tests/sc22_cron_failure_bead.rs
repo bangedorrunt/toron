@@ -30,7 +30,7 @@ use common::*;
 use toron_workflow::cron::{CronManager, CronRegistration, CronRegistry};
 use toron_workflow::cron_failure::PolicyEvent;
 use toron_workflow::engine::{ActionRunner, WorkflowEngine};
-use toron_workflow::schema::{Action, FailureAction, parse_workflow};
+use toron_workflow::schema::{Action, CronScope, FailureAction, parse_workflow};
 
 /// A runner that FAILS the `upgrade` action (returns `{ok:false,error}`) —
 /// with `on_error: fail_run` that flips the run to `status=failed` (P0).
@@ -81,7 +81,7 @@ fn registration(name: &str) -> CronRegistration {
         cron: "*/1 * * * * *".into(),
         workflow: wf,
         owner: "@housekeeper".into(),
-        scope: Default::default(),
+        scope: CronScope::default(),
         enabled: true,
     }
 }

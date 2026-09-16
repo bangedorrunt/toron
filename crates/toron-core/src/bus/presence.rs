@@ -172,6 +172,7 @@ impl PresenceBroker {
 mod tests {
     use super::*;
     use crate::bus::InProcessBus;
+    use crate::bus::in_process::InProcessBusConfig;
     use crate::index::schema;
     use crate::nostr::presence::{PresencePayload, build_presence_event};
     use crate::nostr::{Event, Keys, Timestamp};
@@ -181,7 +182,7 @@ mod tests {
         let pool = schema::connect(path.to_str().unwrap())
             .await
             .expect("connect");
-        let bus = InProcessBus::open(pool, Default::default())
+        let bus = InProcessBus::open(pool, InProcessBusConfig::default())
             .await
             .expect("bus");
         (bus, path)

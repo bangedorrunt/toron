@@ -13,7 +13,7 @@
 pub use ::nostr::event::{
     Event, EventBuilder, EventId, FinalizeEvent, Kind, Signature, Tag, Tags, UnsignedEvent,
 };
-pub use ::nostr::filter::{Filter, SingleLetterTag};
+pub use ::nostr::filter::{Filter, MatchEventOptions, SingleLetterTag};
 pub use ::nostr::key::{Keys, PublicKey, SecretKey};
 pub use ::nostr::message::{ClientMessage, RelayMessage, SubscriptionId};
 pub use ::nostr::types::Timestamp;

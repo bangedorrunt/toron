@@ -26,6 +26,7 @@ use std::sync::Arc;
 use toron_core::bus::InProcessBus;
 use toron_core::bus::in_process::{AuthPolicy, InProcessBusConfig};
 use toron_core::index::schema;
+use toron_core::mailbox::ListAgentsOptions;
 use toron_core::mailbox::Mailbox;
 use toron_core::mailbox::messaging::{FetchInbox, SendMessage};
 use toron_core::nostr::identity::AgentProfile;
@@ -180,7 +181,7 @@ async fn sc26_swarm_project_routes_canonical_names_and_npubs_only() {
 
     // --- legacy identities stay listed as display metadata ---
     let agents = mailbox
-        .list_agents("toron", Default::default())
+        .list_agents("toron", ListAgentsOptions::default())
         .await
         .expect("list");
     assert!(

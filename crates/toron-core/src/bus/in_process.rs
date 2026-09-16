@@ -23,6 +23,7 @@ use sqlx::SqlitePool;
 use tokio::sync::mpsc;
 
 use crate::nostr::Event;
+use crate::nostr::MatchEventOptions;
 
 use crate::bus::event_store::BusEventStore;
 use crate::bus::{
@@ -225,7 +226,7 @@ impl InProcessBus {
                 return false;
             }
             // Subscriber's filter must match the event's own #t.
-            return sub.filter.match_event(event, Default::default());
+            return sub.filter.match_event(event, MatchEventOptions::default());
         }
         true
     }
@@ -531,7 +532,9 @@ impl InProcessBus {
         };
         let mut fanned = 0usize;
         for sub in &subs {
-            if sub.filter.match_event(&event, Default::default()) && self.access_gate(sub, &event) {
+            if sub.filter.match_event(&event, MatchEventOptions::default())
+                && self.access_gate(sub, &event)
+            {
                 self.fanout_to(sub, &event);
                 fanned += 1;
             }
