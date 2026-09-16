@@ -140,8 +140,7 @@ pub fn prompt_wait(
         {
             WaitOutcome::Settled(state)
         }
-        Some(_) => WaitOutcome::Timeout,
-        None => WaitOutcome::Timeout,
+        _ => WaitOutcome::Timeout,
     }
 }
 
