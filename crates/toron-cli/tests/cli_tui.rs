@@ -90,12 +90,12 @@ fn help_lists_tui_subcommand() {
 async fn tui_data_plumbing_demo_mailbox() {
     let _ = shared_data_dir();
     let mailbox = toron_mcp::demo_mailbox().await.expect("demo mailbox");
-    let _guard = register_guard();
+    let guard = register_guard();
     mailbox
         .register_agent("demo", &AgentProfile::new("TestAgent"))
         .await
         .expect("register TestAgent");
-    drop(_guard);
+    drop(guard);
 
     let inbox = mailbox
         .fetch_inbox(&FetchInbox {

@@ -94,11 +94,11 @@ impl super::Backend for MockBackend {
         }])
     }
 
-    fn workspace_create(&self, _label: Option<&str>) -> Result<WorkspaceInfo, BackendError> {
+    fn workspace_create(&self, label: Option<&str>) -> Result<WorkspaceInfo, BackendError> {
         Ok(WorkspaceInfo {
             workspace_id: "w0".into(),
             number: 0,
-            label: _label.unwrap_or("demo").into(),
+            label: label.unwrap_or("demo").into(),
             focused: false,
             pane_count: 0,
             tab_count: 0,

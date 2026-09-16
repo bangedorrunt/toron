@@ -741,12 +741,12 @@ mod tests {
             .register_agent("demo", &profile("SenderOne"))
             .await
             .expect("register sender");
-        let _recv = mailbox
+        let recv = mailbox
             .register_agent("demo", &profile("RecvOne"))
             .await
             .expect("register recv");
         let recv_keys = mailbox
-            .load_agent_key(std::path::Path::new(&_recv.key_path))
+            .load_agent_key(std::path::Path::new(&recv.key_path))
             .expect("key");
         // Build typed tags
         let tags = SendTags {

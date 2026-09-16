@@ -174,8 +174,8 @@ pub fn install(args: &super::cli::DaemonArgs) -> anyhow::Result<()> {
     std::fs::create_dir_all(&state)?;
     let pass = ensure_passphrase_file()?;
     let key_path = toron_core::config::ToronPaths::resolve().operator_key_path();
-    let _out_log = state.join("serve.out.log");
-    let _err_log = state.join("serve.err.log");
+    let out_log = state.join("serve.out.log");
+    let err_log = state.join("serve.err.log");
     let addr = args.addr.clone();
     let label = args.label.clone();
 
@@ -187,8 +187,8 @@ pub fn install(args: &super::cli::DaemonArgs) -> anyhow::Result<()> {
         addr: &addr,
         key_path: &key_path,
         pass: &pass,
-        out_log: &_out_log,
-        err_log: &_err_log,
+        out_log: &out_log,
+        err_log: &err_log,
         state: &state,
     };
     crate::platform::install_supervised(&ctx)

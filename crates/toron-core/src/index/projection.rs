@@ -336,22 +336,22 @@ mod tests {
         // B: rumor t=500, envelope t=100  (envelope says B is OLDER)
         // Correct G7 order: A (t=100) then B (t=500). The envelope's
         // created_at is deliberately NOT consulted.
-        let (rumor_a, _wrap_a) = wrap_with(&sender, &rpk, Timestamp::from(100), "a").await;
-        let (rumor_b, _wrap_b) = wrap_with(&sender, &rpk, Timestamp::from(500), "b").await;
+        let (rumor_a, wrap_a) = wrap_with(&sender, &rpk, Timestamp::from(100), "a").await;
+        let (rumor_b, wrap_b) = wrap_with(&sender, &rpk, Timestamp::from(500), "b").await;
 
         // Unwrap both with the recipient key (envelope id filled in here).
-        let unwrap_a = gift_wrap::unwrap(&recipient, &_wrap_a).expect("unwrap a");
-        let unwrap_b = gift_wrap::unwrap(&recipient, &_wrap_b).expect("unwrap b");
+        let unwrap_a = gift_wrap::unwrap(&recipient, &wrap_a).expect("unwrap a");
+        let unwrap_b = gift_wrap::unwrap(&recipient, &wrap_b).expect("unwrap b");
 
         // Envelope timestamps are inverted vs rumor order (NIP-17 randomization).
         let mut items = vec![
             MailItem {
-                envelope_id: _wrap_b.id.to_string(),
+                envelope_id: wrap_b.id.to_string(),
                 created_ts_us: rumor_timestamp_us(&rumor_b),
                 ..extract_mail(&unwrap_b, 2)
             },
             MailItem {
-                envelope_id: _wrap_a.id.to_string(),
+                envelope_id: wrap_a.id.to_string(),
                 created_ts_us: rumor_timestamp_us(&rumor_a),
                 ..extract_mail(&unwrap_a, 1)
             },
