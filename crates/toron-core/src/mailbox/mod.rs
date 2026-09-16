@@ -252,7 +252,7 @@ impl Mailbox {
     }
 
     /// The SQLite index pool, if attached.
-    pub fn index_pool(&self) -> Option<&sqlx::SqlitePool> {
+    pub const fn index_pool(&self) -> Option<&sqlx::SqlitePool> {
         self.index_pool.as_ref()
     }
 
@@ -262,7 +262,7 @@ impl Mailbox {
     }
 
     /// The on-disk directory under which project roots live.
-    pub fn data_dir(&self) -> &PathBuf {
+    pub const fn data_dir(&self) -> &PathBuf {
         &self.data_dir
     }
 
@@ -291,7 +291,7 @@ impl Mailbox {
     }
 
     /// The operator key (if configured).
-    pub fn operator(&self) -> Option<&Keys> {
+    pub const fn operator(&self) -> Option<&Keys> {
         self.operator.as_ref()
     }
     /// Load a local agent key with the content-keyed KDF cache (R2.0 C2):
@@ -583,7 +583,7 @@ struct UnwrapRebuildPolicy {
 }
 
 impl UnwrapRebuildPolicy {
-    fn new(min_interval: std::time::Duration) -> Self {
+    const fn new(min_interval: std::time::Duration) -> Self {
         Self {
             last_attempt_at: None,
             min_interval,

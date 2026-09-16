@@ -28,7 +28,6 @@ nursery = { level = "deny", priority = -1 }
 # Allow these lints to unblock CI (need higher priority than groups)
 cast_precision_loss = { level = "allow", priority = 1 }
 doc_markdown = { level = "allow", priority = 1 }
-missing_const_for_fn = { level = "allow", priority = 1 }
 # Stylistic nursery/pedantic lints that don't reflect real defects
 option_if_let_else = { level = "allow", priority = 1 }
 map_unwrap_or = { level = "allow", priority = 1 }

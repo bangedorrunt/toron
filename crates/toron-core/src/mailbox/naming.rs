@@ -34,7 +34,7 @@ impl IdentityMode {
     }
 
     /// The persisted form.
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             IdentityMode::Open => "open",
             IdentityMode::Swarm => "swarm",

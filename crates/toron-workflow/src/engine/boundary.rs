@@ -63,7 +63,7 @@ pub enum ActionStage {
 
 impl ActionStage {
     /// Canonical wire spelling.
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Normalize => "normalize",
             Self::Input => "input",
@@ -92,7 +92,7 @@ pub enum EffectState {
 
 impl EffectState {
     /// Canonical wire spelling.
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::None => "none",
             Self::Prepared => "prepared",
@@ -122,7 +122,7 @@ pub enum Disposition {
 
 impl Disposition {
     /// Canonical wire spelling.
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Continue => "continue",
             Self::Retry => "retry",
@@ -153,7 +153,7 @@ pub enum FailureKind {
 
 impl FailureKind {
     /// Canonical wire spelling.
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Auth => "auth",
             Self::RateLimit => "rate_limit",
@@ -182,7 +182,7 @@ impl FailureKind {
     /// and `timeout` are candidates only when the effect state is known safe
     /// or the provider honors the stable effect key (ADR-0032 Spec 7). This
     /// flag never causes a retry by itself — the boundary never retries.
-    pub fn is_retry_candidate(self) -> bool {
+    pub const fn is_retry_candidate(self) -> bool {
         matches!(self, Self::RateLimit | Self::Timeout)
     }
 }
@@ -227,7 +227,7 @@ pub enum ActionErrorCode {
 
 impl ActionErrorCode {
     /// Canonical wire spelling.
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::InvalidInput => "invalid_input",
             Self::InvalidOutput => "invalid_output",
@@ -433,7 +433,7 @@ pub enum ActionPartition {
 /// Classify one rendered action. Exhaustive over `Action`: adding a variant
 /// without extending this match is a compile error, which is the witness
 /// that no live variant can fall through.
-pub fn partition(action: &Action) -> ActionPartition {
+pub const fn partition(action: &Action) -> ActionPartition {
     match action {
         Action::Delay { .. }
         | Action::RequestApproval { .. }

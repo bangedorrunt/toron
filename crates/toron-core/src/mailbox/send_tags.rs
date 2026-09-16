@@ -25,7 +25,7 @@ pub enum Wake {
 }
 
 impl Wake {
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Standing => "standing",
             Self::Tasked => "tasked",
@@ -64,7 +64,7 @@ pub enum Priority {
 }
 
 impl Priority {
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Queue => "queue",
             Self::Interrupt => "interrupt",
@@ -103,7 +103,7 @@ pub enum Audience {
 }
 
 impl Audience {
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Human => "human",
             Self::Agents => "agents",
@@ -144,7 +144,7 @@ pub enum Verdict {
 }
 
 impl Verdict {
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Approve => "approve",
             Self::Deny => "deny",

@@ -242,7 +242,7 @@ pub struct Subscription {
 }
 
 impl Subscription {
-    pub fn agent_status_changed(pane_id: String) -> Self {
+    pub const fn agent_status_changed(pane_id: String) -> Self {
         Subscription {
             event: SubscriptionEventKind::PaneAgentStatusChanged,
             pane_id,
@@ -250,7 +250,7 @@ impl Subscription {
         }
     }
 
-    pub fn with_agent_status(mut self, status: AgentStatus) -> Self {
+    pub const fn with_agent_status(mut self, status: AgentStatus) -> Self {
         self.agent_status = Some(status);
         self
     }

@@ -60,7 +60,7 @@ impl ContactPolicy {
     }
 
     /// The canonical string form.
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Open => "open",
             Self::Auto => "auto",
@@ -73,7 +73,7 @@ impl ContactPolicy {
     ///
     /// `is_approved_contact` is true when an AgentLink exists (used by
     /// `ContactsOnly`). `Open` and `Auto` accept; `BlockAll` always drops.
-    pub fn allows(self, is_approved_contact: bool) -> bool {
+    pub const fn allows(self, is_approved_contact: bool) -> bool {
         match self {
             Self::Open | Self::Auto => true,
             Self::ContactsOnly => is_approved_contact,
@@ -711,7 +711,7 @@ impl ProjectionSink for DualProjectionSink {
 
 /// (year, month) from a unix-seconds timestamp (UTC), for the AM-Rust
 /// `messages/{YYYY}/{MM}/` layout. Howard Hinnant's civil-from-days algorithm.
-fn civil_from_secs(secs: u64) -> (u32, u32) {
+const fn civil_from_secs(secs: u64) -> (u32, u32) {
     let z = (secs / 86_400) as i64;
     let z = z + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
@@ -952,13 +952,13 @@ impl UnwrapPipeline {
 
     /// Set the operator npub for the Overseer bypass (ADR-0004 Ship 5).
     /// Without this, the policy gate is absolute (no override path).
-    pub fn with_operator(mut self, operator: PublicKey) -> Self {
+    pub const fn with_operator(mut self, operator: PublicKey) -> Self {
         self.operator = Some(operator);
         self
     }
 
     /// The ack/read-receipt cache (observable for tests + mailbox queries).
-    pub fn acks(&self) -> &AckCache {
+    pub const fn acks(&self) -> &AckCache {
         &self.acks
     }
 

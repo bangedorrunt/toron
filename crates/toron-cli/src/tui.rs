@@ -544,7 +544,7 @@ fn footer_hint(state: &TuiState) -> String {
     }
 }
 
-fn spinner(tick: u64) -> &'static str {
+const fn spinner(tick: u64) -> &'static str {
     const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
     FRAMES[(tick as usize) % FRAMES.len()]
 }

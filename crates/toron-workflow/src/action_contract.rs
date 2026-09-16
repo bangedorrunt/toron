@@ -217,7 +217,7 @@ const REDUCE: ActionContract = ActionContract {
 
 /// The contract for one action. Exhaustive over [`Action`]: a new variant
 /// without an arm is a compile error.
-pub fn contract_for(action: &Action) -> &'static ActionContract {
+pub const fn contract_for(action: &Action) -> &'static ActionContract {
     match action {
         Action::SendMessage { .. } => &SEND_MESSAGE,
         Action::SendDm { .. } => &SEND_DM,
@@ -237,7 +237,7 @@ pub fn contract_for(action: &Action) -> &'static ActionContract {
     }
 }
 
-fn violation(field: &'static str, code: ActionErrorCode, message: String) -> Violation {
+const fn violation(field: &'static str, code: ActionErrorCode, message: String) -> Violation {
     Violation {
         field,
         code,

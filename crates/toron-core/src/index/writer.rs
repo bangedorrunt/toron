@@ -176,7 +176,7 @@ impl IndexWriter {
 
     /// The dedicated write pool (callers that need raw access, e.g.
     /// migrations, must also run on the writer path).
-    pub fn write_pool(&self) -> &SqlitePool {
+    pub const fn write_pool(&self) -> &SqlitePool {
         &self.write_pool
     }
 }

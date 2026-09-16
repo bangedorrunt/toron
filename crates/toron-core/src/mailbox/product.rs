@@ -352,7 +352,7 @@ impl Mailbox {
 
     // Keep PublicKey imported for future cross-project resolution (G2).
     #[allow(dead_code)]
-    fn _pubkey_type(_k: PublicKey) {}
+    const fn _pubkey_type(_k: PublicKey) {}
 }
 
 /// Member projects from a product manifest's `a` tags (coordinate 30010).

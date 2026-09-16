@@ -75,7 +75,7 @@ impl ToronServer {
     }
 
     /// The attached tool surface, if any.
-    pub fn tools(&self) -> Option<&ToolServer> {
+    pub const fn tools(&self) -> Option<&ToolServer> {
         self.tools.as_ref()
     }
 

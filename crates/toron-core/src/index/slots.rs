@@ -33,7 +33,7 @@ pub enum SlotStatus {
 }
 
 impl SlotStatus {
-    pub fn as_str(&self) -> &'static str {
+    pub const fn as_str(&self) -> &'static str {
         match self {
             SlotStatus::Active => "active",
             SlotStatus::Released => "released",

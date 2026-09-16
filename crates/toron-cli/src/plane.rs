@@ -968,7 +968,7 @@ fn request_assignee(ev: &Event) -> Option<String> {
         .and_then(|t| t.as_slice().get(1).cloned())
 }
 
-fn state_name(state: &JobState) -> &'static str {
+const fn state_name(state: &JobState) -> &'static str {
     match state {
         JobState::Open => "open",
         JobState::Claimed(_) => "claimed",
@@ -1195,7 +1195,7 @@ async fn job_cancel(mailbox: &Mailbox, args: &JobCancelArgs) -> anyhow::Result<(
 // plane N — presence 20001
 // ---------------------------------------------------------------------------
 
-fn presence_state(arg: PresenceStateArg) -> PresenceState {
+const fn presence_state(arg: PresenceStateArg) -> PresenceState {
     match arg {
         PresenceStateArg::Idle => PresenceState::Idle,
         PresenceStateArg::Working => PresenceState::Working,
@@ -1204,7 +1204,7 @@ fn presence_state(arg: PresenceStateArg) -> PresenceState {
     }
 }
 
-fn state_str(state: &PresenceState) -> &'static str {
+const fn state_str(state: &PresenceState) -> &'static str {
     match state {
         PresenceState::Idle => "idle",
         PresenceState::Working => "working",

@@ -42,7 +42,7 @@ pub enum Stage {
 }
 
 impl Stage {
-    fn name(self) -> &'static str {
+    const fn name(self) -> &'static str {
         match self {
             Stage::Verify => "verify",
             Stage::Auth => "auth",
@@ -150,7 +150,7 @@ pub struct InProcessBus {
 impl InProcessBus {
     /// Measurement accessor for the underlying store (bd-3gwy gates).
     #[cfg(test)]
-    pub(crate) fn event_store(&self) -> &BusEventStore {
+    pub(crate) const fn event_store(&self) -> &BusEventStore {
         &self.store
     }
 

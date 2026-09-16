@@ -100,7 +100,7 @@ impl BackendError {
         Self::new(BackendErrorCode::AgentNotIdle, message.as_ref())
     }
 
-    pub fn code(&self) -> &BackendErrorCode {
+    pub const fn code(&self) -> &BackendErrorCode {
         &self.code
     }
 }

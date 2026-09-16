@@ -142,7 +142,7 @@ pub enum ParkKind {
 
 impl ParkKind {
     /// Canonical wire spelling.
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Approval => "approval",
             Self::Spawn => "spawn",
@@ -317,7 +317,7 @@ pub enum ResolutionVerdict {
 
 impl ResolutionVerdict {
     /// Canonical wire spelling.
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Approved => "approved",
             Self::Rejected => "rejected",

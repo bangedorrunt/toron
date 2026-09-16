@@ -60,7 +60,7 @@ pub enum EffectState {
 }
 
 impl EffectState {
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Prepared => "prepared",
             Self::InFlight => "in_flight",
@@ -89,7 +89,7 @@ impl EffectState {
 
     /// True for terminal effect claims (settled, proven failed, cancelled).
     /// `unknown` and `reconcile_pending` are explicitly nonterminal.
-    pub fn is_terminal(self) -> bool {
+    pub const fn is_terminal(self) -> bool {
         matches!(self, Self::Settled | Self::Failed | Self::Cancelled)
     }
 }
@@ -112,7 +112,7 @@ impl std::fmt::Display for EffectState {
 /// particular: `unknown` enters only from in-flight/accepted uncertainty
 /// and leaves only via reconciliation; terminal states never move; a
 /// timeout never becomes absence (there is no transition to "nothing").
-pub fn can_transition(from: EffectState, to: EffectState) -> bool {
+pub const fn can_transition(from: EffectState, to: EffectState) -> bool {
     use EffectState as S;
     matches!(
         (from, to),
@@ -152,7 +152,7 @@ pub enum RunStatus {
 }
 
 impl RunStatus {
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Started => "started",
             Self::Running => "running",
@@ -182,7 +182,7 @@ impl RunStatus {
     }
 
     /// Terminal run claims. `reconcile_pending` is explicitly nonterminal.
-    pub fn is_terminal(self) -> bool {
+    pub const fn is_terminal(self) -> bool {
         matches!(
             self,
             Self::Succeeded | Self::Failed | Self::Blocked | Self::Cancelled | Self::Unknown
@@ -207,7 +207,7 @@ pub enum PublicationState {
 }
 
 impl PublicationState {
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Noted => "noted",
             Self::Published => "published",
@@ -233,7 +233,7 @@ pub enum PendingKind {
 }
 
 impl PendingKind {
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Approval => "approval",
             Self::Spawn => "spawn",
@@ -443,11 +443,11 @@ pub struct WorkflowEffectStore {
 }
 
 impl WorkflowEffectStore {
-    pub fn new(pool: SqlitePool) -> Self {
+    pub const fn new(pool: SqlitePool) -> Self {
         Self { pool }
     }
 
-    pub fn pool(&self) -> &SqlitePool {
+    pub const fn pool(&self) -> &SqlitePool {
         &self.pool
     }
 

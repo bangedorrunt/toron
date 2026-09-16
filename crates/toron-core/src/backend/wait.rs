@@ -44,7 +44,7 @@ pub struct PromptTarget {
 }
 
 impl PromptTarget {
-    pub fn new(pane: PaneId, occupant: Option<String>) -> Self {
+    pub const fn new(pane: PaneId, occupant: Option<String>) -> Self {
         Self { pane, occupant }
     }
 

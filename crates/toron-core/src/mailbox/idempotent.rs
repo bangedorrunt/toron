@@ -61,11 +61,11 @@ pub struct IdempotentSendStore {
 }
 
 impl IdempotentSendStore {
-    pub fn new(pool: SqlitePool) -> Self {
+    pub const fn new(pool: SqlitePool) -> Self {
         Self { pool }
     }
 
-    pub fn pool(&self) -> &SqlitePool {
+    pub const fn pool(&self) -> &SqlitePool {
         &self.pool
     }
 

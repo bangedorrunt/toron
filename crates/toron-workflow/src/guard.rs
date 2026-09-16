@@ -118,7 +118,7 @@ pub enum GuardOutcome {
 impl GuardOutcome {
     /// Whether the step should PROCEED (guard true or unset). Convenience for
     /// the engine.
-    pub fn proceeds(&self) -> bool {
+    pub const fn proceeds(&self) -> bool {
         matches!(self, Self::Bool(true) | Self::Unset)
     }
 }

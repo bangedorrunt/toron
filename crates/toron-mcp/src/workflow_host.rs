@@ -1066,7 +1066,7 @@ impl WorkflowHost {
     }
 
     /// The coalescer (for tests).
-    pub fn coalescer(&self) -> &Arc<std::sync::Mutex<MentionCoalescer>> {
+    pub const fn coalescer(&self) -> &Arc<std::sync::Mutex<MentionCoalescer>> {
         &self.coalescer
     }
 
@@ -1083,7 +1083,7 @@ impl WorkflowHost {
     }
 
     /// The host-owned pending lifecycle (bd-asx3).
-    pub fn pending(&self) -> &Arc<tokio::sync::Mutex<PendingDrain>> {
+    pub const fn pending(&self) -> &Arc<tokio::sync::Mutex<PendingDrain>> {
         &self.pending
     }
 
@@ -1688,7 +1688,7 @@ pub struct ParkCtx {
 /// authoring order: linear steps first (named, or `step-{i}` fallback), then
 /// graph nodes by key (BTreeMap order is deterministic).
 pub fn park_candidates(workflow: &Workflow, kind: ParkKind) -> Vec<String> {
-    fn is_park(action: &Action, kind: ParkKind) -> bool {
+    const fn is_park(action: &Action, kind: ParkKind) -> bool {
         match (action, kind) {
             (Action::RequestApproval { .. }, ParkKind::Approval) => true,
             (Action::Spawn { await_, .. }, ParkKind::Spawn) => *await_,
@@ -1727,7 +1727,7 @@ pub enum RunState {
 
 impl RunState {
     /// True once the run reached any terminal state.
-    pub fn is_terminal(self) -> bool {
+    pub const fn is_terminal(self) -> bool {
         !matches!(
             self,
             Self::Running | Self::Suspended | Self::ReconcilePending
@@ -1735,7 +1735,7 @@ impl RunState {
     }
 
     /// Canonical wire string for this state.
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Running => "running",
             Self::Suspended => "suspended",
@@ -1766,7 +1766,7 @@ impl RunState {
     }
 
     /// Map onto the durable journal status.
-    pub fn to_run_status(self) -> toron_core::index::workflow_effects::RunStatus {
+    pub const fn to_run_status(self) -> toron_core::index::workflow_effects::RunStatus {
         use toron_core::index::workflow_effects::RunStatus as S;
         match self {
             Self::Running => S::Running,
@@ -1782,7 +1782,7 @@ impl RunState {
 
     /// Map from the durable journal status (`Started` has no host
     /// counterpart yet — it reads as `Running`).
-    pub fn from_run_status(s: toron_core::index::workflow_effects::RunStatus) -> Self {
+    pub const fn from_run_status(s: toron_core::index::workflow_effects::RunStatus) -> Self {
         use toron_core::index::workflow_effects::RunStatus as S;
         match s {
             S::Started | S::Running => Self::Running,
@@ -1839,7 +1839,7 @@ impl PendingDrain {
     }
 
     /// The attached durable journal, if any.
-    pub fn store(&self) -> Option<&WorkflowEffectStore> {
+    pub const fn store(&self) -> Option<&WorkflowEffectStore> {
         self.store.as_ref()
     }
 
@@ -2077,7 +2077,7 @@ impl PendingDrain {
     }
 
     /// Number of recorded (ignored) resolution mismatches.
-    pub fn ignored_count(&self) -> usize {
+    pub const fn ignored_count(&self) -> usize {
         self.ignored.len()
     }
 }
@@ -2166,11 +2166,11 @@ pub struct EffectDispatcher {
 }
 
 impl EffectDispatcher {
-    pub fn new(store: WorkflowEffectStore) -> Self {
+    pub const fn new(store: WorkflowEffectStore) -> Self {
         Self { store }
     }
 
-    pub fn store(&self) -> &WorkflowEffectStore {
+    pub const fn store(&self) -> &WorkflowEffectStore {
         &self.store
     }
 

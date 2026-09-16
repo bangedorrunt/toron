@@ -31,7 +31,7 @@ use super::receipts::ReceiptState;
 /// Current envelope version.
 pub const ENVELOPE_VERSION: u32 = 1;
 
-fn v1() -> u32 {
+const fn v1() -> u32 {
     1
 }
 
