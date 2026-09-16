@@ -151,6 +151,7 @@ async fn collect_until(
         tokio::time::sleep(Duration::from_millis(50)).await;
         let sink = engine.policy_sink().lock().await;
         let events: Vec<PolicyEvent> = sink.iter().filter(|e| e.cron == cron).cloned().collect();
+        drop(sink);
         if let Some(ev) = events.iter().find(|e| e.action == want) {
             return Some(ev.clone());
         }

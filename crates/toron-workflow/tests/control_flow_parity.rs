@@ -484,8 +484,7 @@ steps:
         output["sub"]["do"].is_object() || output["sub"].is_object(),
         "child output returned: {output}"
     );
-    let actions = seen.lock().unwrap();
-    let body = actions.iter().find_map(|a| match a {
+    let body = seen.lock().unwrap().iter().find_map(|a| match a {
         Action::SendDm { body, .. } => Some(body.clone()),
         _ => None,
     });

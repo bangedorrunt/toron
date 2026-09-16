@@ -403,16 +403,18 @@ fn stamp_bootstrap_pane(
         return None;
     }
     match toron_core::backend::herdr::HerdrBackend::connect(None) {
-        Ok(backend) => match backend
-            .client()
-            .pane_report_metadata(&pane_id, pin, project, npub)
-        {
-            Ok(_) => Some(pane_id),
-            Err(e) => {
-                eprintln!("toron: pane stamp skipped ({e})");
-                None
+        Ok(backend) => {
+            let stamped = backend
+                .client()
+                .pane_report_metadata(&pane_id, pin, project, npub);
+            match stamped {
+                Ok(_) => Some(pane_id),
+                Err(e) => {
+                    eprintln!("toron: pane stamp skipped ({e})");
+                    None
+                }
             }
-        },
+        }
         Err(e) => {
             eprintln!("toron: pane stamp skipped ({e})");
             None

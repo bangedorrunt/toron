@@ -808,8 +808,10 @@ impl super::Backend for HerdrBackend {
     }
 
     fn workspace_create(&self, label: Option<&str>) -> Result<WorkspaceInfo, BackendError> {
-        let mut client = self.client.lock();
-        let (ws, _root) = client.workspace_create(None, label, false, None)?;
+        let (ws, _root) = self
+            .client
+            .lock()
+            .workspace_create(None, label, false, None)?;
         Ok(ws)
     }
 
@@ -826,8 +828,7 @@ impl super::Backend for HerdrBackend {
         direction: &str,
         cwd: Option<&str>,
     ) -> Result<PaneInfo, BackendError> {
-        let mut client = self.client.lock();
-        let res = client.call(
+        let res = self.client.lock().call(
             "pane.split",
             json!({ "target_pane_id": parent_pane_id, "direction": direction, "cwd": cwd }),
         )?;
@@ -894,8 +895,10 @@ impl super::Backend for HerdrBackend {
         text: &str,
         wait: Option<&WaitOptions>,
     ) -> Result<serde_json::Value, BackendError> {
-        let mut client = self.client.lock();
-        let info = client.agent_prompt(target, text, wait.cloned())?;
+        let info = self
+            .client
+            .lock()
+            .agent_prompt(target, text, wait.cloned())?;
         let status = Some(info.agent_status.as_str().to_string());
         Ok(json!({
             "agent": info.agent.clone().unwrap_or_default(),
@@ -910,8 +913,12 @@ impl super::Backend for HerdrBackend {
         text: &str,
         wait: Option<&WaitOptions>,
     ) -> Result<PromptLanding, BackendError> {
-        let mut client = self.client.lock();
-        match client.agent_prompt_coded(target, text, wait.cloned()) {
+        let res = {
+            self.client
+                .lock()
+                .agent_prompt_coded(target, text, wait.cloned())
+        };
+        match res {
             Ok(info) => Ok(PromptLanding {
                 status: Some(info.agent_status),
                 code: None,
@@ -951,8 +958,7 @@ impl super::Backend for HerdrBackend {
         &self,
         filters: &[Subscription],
     ) -> Result<Box<dyn super::EventStream>, BackendError> {
-        let mut client = self.client.lock();
-        let stream = client.subscribe(filters)?;
+        let stream = self.client.lock().subscribe(filters)?;
         Ok(Box::new(HerdrEventStreamAdapter(stream)))
     }
 }

@@ -1185,16 +1185,20 @@ impl Mailbox {
         backend: &HerdrBackend,
         pane_id: &str,
     ) -> anyhow::Result<Option<String>> {
-        let mut client = backend.client();
-        let agents = client.agent_list()?;
-        let panes: Vec<PaneInfo> = client
-            .workspace_list()
-            .map(|wss| {
-                wss.into_iter()
-                    .flat_map(|ws| client.pane_list(Some(&ws.workspace_id)).unwrap_or_default())
-                    .collect()
-            })
-            .unwrap_or_default();
+        let (agents, panes) = {
+            let mut client = backend.client();
+            let agents = client.agent_list()?;
+            let panes: Vec<PaneInfo> = client
+                .workspace_list()
+                .map(|wss| {
+                    wss.into_iter()
+                        .flat_map(|ws| client.pane_list(Some(&ws.workspace_id)).unwrap_or_default())
+                        .collect()
+                })
+                .unwrap_or_default();
+            drop(client);
+            (agents, panes)
+        };
         Ok(resolve_pin_for_pane(&panes, &agents, pane_id))
     }
 
@@ -1207,13 +1211,17 @@ impl Mailbox {
     /// rows (`WhoIs::stale` past [`ROSTER_STALE_AFTER_DAYS`]) — one sweep
     /// retires both, so neither is ever a silent live pin.
     pub fn cleanup_pane_identities(&self, backend: &HerdrBackend) -> anyhow::Result<Vec<String>> {
-        let mut client = backend.client();
-        let agents = client.agent_list()?;
-        let panes: Vec<PaneInfo> = client
-            .workspace_list()?
-            .into_iter()
-            .flat_map(|ws| client.pane_list(Some(&ws.workspace_id)).unwrap_or_default())
-            .collect();
+        let (agents, panes) = {
+            let mut client = backend.client();
+            let agents = client.agent_list()?;
+            let panes: Vec<PaneInfo> = client
+                .workspace_list()?
+                .into_iter()
+                .flat_map(|ws| client.pane_list(Some(&ws.workspace_id)).unwrap_or_default())
+                .collect();
+            drop(client);
+            (agents, panes)
+        };
         // bd-0sbf: a pin stamped on a live pane is live even when the
         // `agent.list` occupant name has rolled over to someone else.
         let live_pins: Vec<&str> = panes.iter().filter_map(pane_token_pin).collect();

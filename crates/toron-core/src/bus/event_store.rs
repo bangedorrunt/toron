@@ -507,15 +507,20 @@ impl BusEventStore {
             if rows.is_empty() {
                 continue;
             }
-            let mut hot = self.hot.lock();
             for (id, raw) in rows {
                 self.parsed_rows
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if let Ok(ev) = Event::from_json(&raw) {
-                    if hot.len() >= HOT_CACHE_CAP {
-                        hot.clear();
+                    // Tight per-row guard (significant-drop): the JSON parse
+                    // above runs lock-free; only the cap check + insert hold
+                    // the map, so readers never wait out 500 parses.
+                    {
+                        let mut hot = self.hot.lock();
+                        if hot.len() >= HOT_CACHE_CAP {
+                            hot.clear();
+                        }
+                        hot.insert(id.clone(), Arc::new(ev.clone()));
                     }
-                    hot.insert(id.clone(), Arc::new(ev.clone()));
                     resolved.insert(id, ev);
                 }
             }

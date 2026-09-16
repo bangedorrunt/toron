@@ -106,23 +106,25 @@ impl MailboxMetrics {
 
     /// Serializable snapshot (the `metrics` / `--robot-status` payload).
     pub fn snapshot(&self) -> MetricsSnapshot {
-        let tools = self.per_tool.lock();
         let mut out = MetricsSnapshot {
             total_calls: 0,
             total_errors: 0,
             tools: std::collections::BTreeMap::new(),
         };
-        for (name, m) in tools.iter() {
-            out.tools.insert(
-                name.clone(),
-                ToolCounters {
-                    calls: m.calls.load(Ordering::Relaxed),
-                    errors: m.errors.load(Ordering::Relaxed),
-                    latency_hist: m.latency_hist.lock().to_vec(),
-                },
-            );
-            out.total_calls += m.calls.load(Ordering::Relaxed);
-            out.total_errors += m.errors.load(Ordering::Relaxed);
+        {
+            let tools = self.per_tool.lock();
+            for (name, m) in tools.iter() {
+                out.tools.insert(
+                    name.clone(),
+                    ToolCounters {
+                        calls: m.calls.load(Ordering::Relaxed),
+                        errors: m.errors.load(Ordering::Relaxed),
+                        latency_hist: m.latency_hist.lock().to_vec(),
+                    },
+                );
+                out.total_calls += m.calls.load(Ordering::Relaxed);
+                out.total_errors += m.errors.load(Ordering::Relaxed);
+            }
         }
         out
     }

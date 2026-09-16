@@ -59,8 +59,6 @@ needless_pass_by_ref_mut = { level = "allow", priority = 1 }
 needless_pass_by_value = { level = "allow", priority = 1 }
 or_fun_call = { level = "allow", priority = 1 }
 return_self_not_must_use = { level = "allow", priority = 1 }
-significant_drop_in_scrutinee = { level = "allow", priority = 1 }
-significant_drop_tightening = { level = "allow", priority = 1 }
 single_match_else = { level = "allow", priority = 1 }
 too_many_lines = { level = "allow", priority = 1 }
 unnecessary_debug_formatting = { level = "allow", priority = 1 }

@@ -773,20 +773,26 @@ pub fn record_tool_error(name: &str, duration: Duration) {
 
 /// JSON snapshot: `{tool_calls, errors, total_calls, latency_us}`.
 pub fn snapshot() -> serde_json::Value {
-    let guard = match state().lock() {
-        Ok(g) => g,
-        Err(p) => p.into_inner(),
+    let (tool_calls, total, lat_count, lat_sum, errors) = {
+        let guard = match state().lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let mut tool_calls = serde_json::Map::new();
+        for (name, count) in &guard.call_counts {
+            tool_calls.insert(name.clone(), json!(count));
+        }
+        (
+            tool_calls,
+            guard.total_calls(),
+            guard.latencies_us.len(),
+            guard.latencies_us.iter().sum::<u64>(),
+            guard.errors,
+        )
     };
-    let mut tool_calls = serde_json::Map::new();
-    for (name, count) in &guard.call_counts {
-        tool_calls.insert(name.clone(), json!(count));
-    }
-    let total = guard.total_calls();
-    let lat_count = guard.latencies_us.len();
-    let lat_sum: u64 = guard.latencies_us.iter().sum();
     json!({
         "tool_calls": tool_calls,
-        "errors": guard.errors,
+        "errors": errors,
         "total_calls": total,
         "latency_us": { "count": lat_count, "sum": lat_sum },
     })
