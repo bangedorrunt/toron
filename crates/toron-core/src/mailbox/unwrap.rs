@@ -635,7 +635,7 @@ impl ProjectionSink for ProjectGitProjectionSink {
         let mut staged = self.batch.staged_ids.lock();
         let window = staged.entry(slug.clone()).or_default();
         if !window.contains(&id) {
-            window.push(id.clone());
+            window.push(id);
         }
         let at_cap = window.len() >= self.batch.window;
         drop(staged);
