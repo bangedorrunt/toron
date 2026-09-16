@@ -1666,7 +1666,7 @@ impl Mailbox {
             })
             .collect();
         let names = self.agent_name_map(project_slug).await;
-        for i in intents.iter_mut() {
+        for i in &mut intents {
             i.agent_name = names
                 .get(&i.agent_pubkey)
                 .cloned()

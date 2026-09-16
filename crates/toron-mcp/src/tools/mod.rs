@@ -758,7 +758,7 @@ mod tests {
     fn no_integer_id_fields_in_tool_surface() {
         let tools = ToolServer::tool_router().list_all();
         let mut violations: Vec<String> = Vec::new();
-        for tool in tools.iter() {
+        for tool in &tools {
             let Some(props) = tool
                 .input_schema
                 .get("properties")
@@ -820,7 +820,7 @@ mod tests {
         }
         let tools = ToolServer::tool_router().list_all();
         let mut violations: Vec<String> = Vec::new();
-        for tool in tools.iter() {
+        for tool in &tools {
             let name = tool.name.as_ref();
             walk(
                 name,
