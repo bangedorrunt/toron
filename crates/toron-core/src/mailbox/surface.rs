@@ -1722,8 +1722,11 @@ mod tests {
             .expect("thread inbox");
         assert_eq!(t1.len(), 2, "only debate-1 rows");
         assert!(
-            t1.iter()
-                .all(|m| m.thread_id.as_ref().map(|t| t.as_str()) == Some("debate-1")),
+            t1.iter().all(|m| m
+                .thread_id
+                .as_ref()
+                .map(super::super::ids::MessageId::as_str)
+                == Some("debate-1")),
             "every row carries the requested thread_id"
         );
 

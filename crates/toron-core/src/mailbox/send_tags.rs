@@ -329,15 +329,15 @@ impl SendTags {
                     out.corr = Some(v);
                 }
                 "wake" => {
-                    let v = parts.get(1).map(|s| s.as_str()).unwrap_or("");
+                    let v = parts.get(1).map(String::as_str).unwrap_or("");
                     out.wake = Some(Wake::parse(v)?);
                 }
                 "priority" => {
-                    let v = parts.get(1).map(|s| s.as_str()).unwrap_or("");
+                    let v = parts.get(1).map(String::as_str).unwrap_or("");
                     out.priority = Some(Priority::parse(v)?);
                 }
                 "audience" => {
-                    let v = parts.get(1).map(|s| s.as_str()).unwrap_or("");
+                    let v = parts.get(1).map(String::as_str).unwrap_or("");
                     out.audience = Some(Audience::parse(v)?);
                 }
                 "result_path" => {
@@ -351,7 +351,7 @@ impl SendTags {
                     out.result_path = Some(v);
                 }
                 "verdict" => {
-                    let v = parts.get(1).map(|s| s.as_str()).unwrap_or("");
+                    let v = parts.get(1).map(String::as_str).unwrap_or("");
                     out.verdict = Some(Verdict::parse(v)?);
                 }
                 "bead" => {
@@ -812,14 +812,14 @@ mod tests {
             !wraps[0]
                 .tags
                 .iter()
-                .any(|t| t.as_slice().first().map(|s| s.as_str()) == Some("corr")),
+                .any(|t| t.as_slice().first().map(String::as_str) == Some("corr")),
             "envelope must not have corr"
         );
         assert!(
             !wraps[0]
                 .tags
                 .iter()
-                .any(|t| t.as_slice().first().map(|s| s.as_str()) == Some("wake")),
+                .any(|t| t.as_slice().first().map(String::as_str) == Some("wake")),
             "envelope must not have wake"
         );
         let inbox = mailbox

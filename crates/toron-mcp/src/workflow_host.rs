@@ -23,7 +23,7 @@
 //!
 //! governed-by: ADR-0004 ships 1/2/4/5, ADR-0005 Spec 2
 
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError};
 
 use anyhow::{Context, Result};
 use nostr::prelude::{Event, EventBuilder, EventId, FinalizeEvent, Keys, Kind, Tag, Timestamp};
@@ -300,7 +300,10 @@ pub fn mailbox_runner_with_dispatcher(
                     // metadata-hiding — the stamp is INSIDE the rumor).
                     extra_tags: vec![],
                 };
-                let disp = dispatcher.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                let disp = dispatcher
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clone();
                 let Some(disp) = disp else {
                     msg.extra_tags = tags;
                     let mb = mailbox.clone();
@@ -358,7 +361,10 @@ pub fn mailbox_runner_with_dispatcher(
                     // too — a workflow can never re-trigger itself.
                     extra_tags: vec![],
                 };
-                let disp = dispatcher.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                let disp = dispatcher
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clone();
                 let Some(disp) = disp else {
                     msg.extra_tags = tags;
                     let mb = mailbox.clone();
@@ -412,12 +418,15 @@ pub fn mailbox_runner_with_dispatcher(
                 // THEN the blocking publish runs (no lock held across
                 // publish_coalesced_job's rt.block_on).
                 let decision = {
-                    let mut c = coalescer.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut c = coalescer.lock().unwrap_or_else(PoisonError::into_inner);
                     c.submit(mention, now)
                 };
                 let bus = mailbox.bus().clone();
                 let signer = job_signer.clone();
-                let disp = dispatcher.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                let disp = dispatcher
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clone();
                 let Some(disp) = disp else {
                     return Some(match decision {
                         // Hard-cap flush: publish the coalesced 43001 NOW (the
@@ -684,14 +693,17 @@ pub fn mailbox_effect_runner(
                     };
                     let now = now_ms();
                     let decision = {
-                        let mut c = coalescer.lock().unwrap_or_else(|e| e.into_inner());
+                        let mut c = coalescer.lock().unwrap_or_else(PoisonError::into_inner);
                         c.submit(mention, now)
                     };
                     let (key, digest) = scoped_effect_key(inv);
                     let req = scoped_request(inv, digest, key.clone());
                     let bus = mailbox.bus().clone();
                     let signer = job_signer.clone();
-                    let disp = dispatcher.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                    let disp = dispatcher
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .clone();
                     let Some(disp) = disp else {
                         // No journal: direct hand-off; failures return Err
                         // so `invoke` classifies them (I5) identically.
@@ -730,7 +742,10 @@ pub fn mailbox_effect_runner(
                     );
                     let (key, digest) = scoped_effect_key(inv);
                     let req = scoped_request(inv, digest, key.clone());
-                    let disp = dispatcher.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                    let disp = dispatcher
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .clone();
                     let Some(disp) = disp else {
                         // No journal attached: hand the observation straight
                         // through; `invoke` classifies it (I5) identically.
@@ -769,7 +784,10 @@ fn send_via_dispatch(
     msg: SendMessage,
     key: String,
 ) -> anyhow::Result<serde_json::Value> {
-    let disp = dispatcher.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let disp = dispatcher
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone();
     let Some(disp) = disp else {
         return match block_on_async(async move { mailbox.send_message(&msg).await }) {
             Ok(res) => Ok(serde_json::json!({ "ok": true, "count": res.count })),
@@ -904,7 +922,7 @@ impl std::fmt::Debug for WorkflowHost {
                 &self
                     .dispatcher
                     .lock()
-                    .unwrap_or_else(|e| e.into_inner())
+                    .unwrap_or_else(PoisonError::into_inner)
                     .is_some(),
             )
             .field(
@@ -1045,8 +1063,10 @@ impl WorkflowHost {
     /// tests attach explicitly.
     pub async fn with_effect_store(&self, store: WorkflowEffectStore) {
         self.pending.lock().await.set_store(store.clone());
-        *self.dispatcher.lock().unwrap_or_else(|e| e.into_inner()) =
-            Some(EffectDispatcher::new(store));
+        *self
+            .dispatcher
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(EffectDispatcher::new(store));
     }
 
     /// The fenced effect dispatcher (bd-1kr2, Spec 5.3): `Some` when the
@@ -1056,7 +1076,7 @@ impl WorkflowHost {
     pub fn effect_dispatcher(&self) -> Option<EffectDispatcher> {
         self.dispatcher
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(PoisonError::into_inner)
             .clone()
     }
 
@@ -1574,7 +1594,10 @@ impl WorkflowHost {
                 // tick() ONLY — the flushed Coalesced values are owned, the
                 // guard drops, THEN each publish runs.
                 let flushed = {
-                    let mut c = self.coalescer.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut c = self
+                        .coalescer
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner);
                     c.tick(now_ms())
                 };
                 if !flushed.is_empty() {
@@ -2778,7 +2801,7 @@ mod tests {
         }
         // All five @mentions are buffered in the coalescer (window open),
         // NOT emitted as five separate jobs — one buffered batch.
-        let c = coalescer.lock().unwrap_or_else(|e| e.into_inner());
+        let c = coalescer.lock().unwrap_or_else(PoisonError::into_inner);
         assert!(
             c.buffered_for("oc-beta") == 5,
             "all mentions buffered for oc-beta, got {}",
@@ -3235,7 +3258,7 @@ steps:
             let delivered = out
                 .as_ref()
                 .ok()
-                .and_then(|v| v.get("ok").and_then(|b| b.as_bool()))
+                .and_then(|v| v.get("ok").and_then(serde_json::Value::as_bool))
                 == Some(true);
             assert!(delivered, "concurrent send must deliver: {out:?}");
             ok += 1;

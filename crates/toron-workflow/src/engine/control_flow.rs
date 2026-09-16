@@ -63,7 +63,7 @@ fn extract_artifacts(
                         "kind": kind,
                         "path": path,
                     });
-                    if let Some(exit) = obj.get("exit").and_then(|v| v.as_i64()) {
+                    if let Some(exit) = obj.get("exit").and_then(serde_json::Value::as_i64) {
                         art["exit"] = serde_json::json!(exit);
                     }
                     artifacts.push(art);
@@ -134,7 +134,7 @@ fn build_approval_payload(
     let nodes_completed: Vec<String> = outputs.keys().cloned().collect();
     let nodes_failed: Vec<String> = outputs
         .iter()
-        .filter(|(_, v)| v.get("ok").and_then(|b| b.as_bool()) == Some(false))
+        .filter(|(_, v)| v.get("ok").and_then(serde_json::Value::as_bool) == Some(false))
         .map(|(k, _)| k.clone())
         .collect();
     let all_nodes: std::collections::BTreeSet<String> = graph.nodes.keys().cloned().collect();
@@ -375,7 +375,7 @@ impl RetryCoordinator {
             .get("kind")
             .and_then(|v| v.as_str())
             .and_then(|k| k.parse::<FailureKind>().ok())
-            .is_some_and(|k| k.is_retry_candidate())
+            .is_some_and(super::boundary::FailureKind::is_retry_candidate)
     }
 
     /// Backoff before the next attempt: provider `retry_after_ms` wins, then
@@ -886,7 +886,9 @@ pub(crate) fn run_step_with_enclosing<'a>(
                             "attempts": attempt,
                         }));
                     }
-                    let retry_after_ms = value.get("retry_after_ms").and_then(|v| v.as_u64());
+                    let retry_after_ms = value
+                        .get("retry_after_ms")
+                        .and_then(serde_json::Value::as_u64);
                     ctx.sleep(coordinator.backoff(attempt, retry_after_ms))
                         .await?;
                     continue;
@@ -2040,7 +2042,7 @@ pub(crate) async fn run_graph(
                 _ => RetryCoordinator::default_policy(),
             };
             if node.on_error == StepOnError::FailRun
-                && value.get("ok").and_then(|v| v.as_bool()) == Some(false)
+                && value.get("ok").and_then(serde_json::Value::as_bool) == Some(false)
             {
                 let kind = value.get("kind").and_then(|v| v.as_str()).unwrap_or("");
                 if RetryCoordinator::is_retryable_value(&value) {
@@ -2064,7 +2066,9 @@ pub(crate) async fn run_graph(
                             "attempts": attempt,
                         }));
                     }
-                    let retry_after_ms = value.get("retry_after_ms").and_then(|v| v.as_u64());
+                    let retry_after_ms = value
+                        .get("retry_after_ms")
+                        .and_then(serde_json::Value::as_u64);
                     ctx.sleep(coordinator.backoff(attempt, retry_after_ms))
                         .await?;
                     // Increment attempt and re-spawn same node

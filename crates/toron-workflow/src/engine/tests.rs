@@ -2913,7 +2913,10 @@ steps:
         merged_none.get("mode").and_then(|v| v.as_str()),
         Some("fast")
     );
-    assert_eq!(merged_none.get("n").and_then(|v| v.as_i64()), Some(2));
+    assert_eq!(
+        merged_none.get("n").and_then(serde_json::Value::as_i64),
+        Some(2)
+    );
     let merged_over = WorkflowEngine::bind_input_defaults(
         &wf_decl.inputs,
         &serde_json::json!({ "mode": "slow" }),
@@ -2922,7 +2925,10 @@ steps:
         merged_over.get("mode").and_then(|v| v.as_str()),
         Some("slow")
     );
-    assert_eq!(merged_over.get("n").and_then(|v| v.as_i64()), Some(2));
+    assert_eq!(
+        merged_over.get("n").and_then(serde_json::Value::as_i64),
+        Some(2)
+    );
 
     // End-to-end through invoke: missing `mode` resolves to the default in
     // both template positions; provided `goal` passes through.

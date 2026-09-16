@@ -74,7 +74,7 @@ mod tests {
 
     fn has_tag(ev: &crate::nostr::Event, needle: &[&str]) -> bool {
         ev.tags.iter().any(|t| {
-            let parts: Vec<&str> = t.as_slice().iter().map(|s| s.as_str()).collect();
+            let parts: Vec<&str> = t.as_slice().iter().map(String::as_str).collect();
             parts == needle
         })
     }
@@ -194,7 +194,7 @@ mod tests {
         let envelope_tags: Vec<Vec<String>> = wrapped
             .tags
             .iter()
-            .map(|t| t.as_slice().iter().map(|s| s.to_string()).collect())
+            .map(|t| t.as_slice().iter().map(ToString::to_string).collect())
             .collect();
         // Only the recipient p tag should be visible on the wrap.
         assert_eq!(envelope_tags.len(), 1, "got {envelope_tags:?}");

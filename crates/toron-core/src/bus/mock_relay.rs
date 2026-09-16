@@ -11,6 +11,7 @@
 
 #![cfg(test)]
 
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -130,7 +131,7 @@ async fn handle_conn(
                         let filter = filters
                             .into_iter()
                             .next()
-                            .map(|c| c.into_owned())
+                            .map(Cow::into_owned)
                             .unwrap_or_default();
                         // Replay stored matches (clone under lock, no guard across await).
                         let stored: Vec<Event> = state.lock().events.clone();

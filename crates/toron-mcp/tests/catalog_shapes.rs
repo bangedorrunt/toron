@@ -90,12 +90,12 @@ fn fixture_path() -> std::path::PathBuf {
 fn catalog_shapes_frozen() {
     let live = live_shapes();
     assert_eq!(
-        live["tools"].as_object().map(|o| o.len()),
+        live["tools"].as_object().map(serde_json::Map::len),
         Some(TOOL_COUNT),
         "frozen surface is 40 tools (38 parity + 2 additive)"
     );
     assert_eq!(
-        live["resources"].as_array().map(|a| a.len()),
+        live["resources"].as_array().map(Vec::len),
         Some(RESOURCE_COUNT),
         "frozen surface is 25 resources"
     );

@@ -335,7 +335,7 @@ impl ActionFailure {
             "error": message,
             "code": self.code.as_str(),
             "stage": self.stage.as_str(),
-            "kind": self.kind.map(|k| k.as_str()),
+            "kind": self.kind.map(FailureKind::as_str),
             "retryable": self.retryable,
             "effect_state": self.effect_state.as_str(),
             "disposition": self.disposition.as_str(),
@@ -874,7 +874,10 @@ mod tests {
     fn honesty_gate_partition_is_exhaustive() {
         let actions = every_action();
         assert_eq!(actions.len(), 15, "one case per live Action variant");
-        let mut names: Vec<&str> = actions.iter().map(|a| a.type_name()).collect();
+        let mut names: Vec<&str> = actions
+            .iter()
+            .map(crate::schema::Action::type_name)
+            .collect();
         names.sort_unstable();
         names.dedup();
         assert_eq!(
@@ -1097,7 +1100,10 @@ mod tests {
     fn honesty_gate_advertised_action_lists_are_exhaustive() {
         use std::collections::BTreeSet;
         let advertised: BTreeSet<&str> = advertised_action_names().into_iter().collect();
-        let live: BTreeSet<&str> = every_action().iter().map(|a| a.type_name()).collect();
+        let live: BTreeSet<&str> = every_action()
+            .iter()
+            .map(crate::schema::Action::type_name)
+            .collect();
         assert_eq!(live.len(), 15, "one name per live Action variant");
         assert_eq!(advertised, live, "advertised names == live type names");
     }

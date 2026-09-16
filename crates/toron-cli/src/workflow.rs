@@ -139,7 +139,12 @@ pub fn dry_run(file: &PathBuf, _trigger: &str) -> Result<i32> {
     );
     plan.insert(
         "trigger".into(),
-        json!(workflow.trigger.as_ref().map(|t| t.type_name())),
+        json!(
+            workflow
+                .trigger
+                .as_ref()
+                .map(toron_workflow::Trigger::type_name)
+        ),
     );
     print_json(&serde_json::Value::Object(plan));
     Ok(EXIT_OK)

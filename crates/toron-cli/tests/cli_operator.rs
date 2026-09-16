@@ -12,8 +12,8 @@
 
 use std::path::PathBuf;
 use std::process::{Command, Output};
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{OnceLock, PoisonError};
 
 use serde_json::Value;
 
@@ -301,7 +301,7 @@ fn register_probe_agent() {
     let _guard = REG
         .get_or_init(|| std::sync::Mutex::new(()))
         .lock()
-        .unwrap_or_else(|e| e.into_inner());
+        .unwrap_or_else(PoisonError::into_inner);
 
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     rt.block_on(async {

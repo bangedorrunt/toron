@@ -460,7 +460,7 @@ async fn run_receipt(cmd: &cli::ReceiptCommand, format: OutputFormat) -> anyhow:
                     let value = serde_json::json!({
                         "corr": r.corr,
                         "state": r.state.as_str(),
-                        "wake": r.wake.map(|w| w.as_str()),
+                        "wake": r.wake.map(toron_core::mailbox::send_tags::Wake::as_str),
                         "due_at": r.due_at,
                         "result_path": r.result_path,
                         "updated_at": r.updated_at,
@@ -484,7 +484,7 @@ async fn run_receipt(cmd: &cli::ReceiptCommand, format: OutputFormat) -> anyhow:
                     serde_json::json!({
                         "corr": r.corr,
                         "state": r.state.as_str(),
-                        "wake": r.wake.map(|w| w.as_str()),
+                        "wake": r.wake.map(toron_core::mailbox::send_tags::Wake::as_str),
                         "due_at": r.due_at,
                         "result_path": r.result_path,
                         "updated_at": r.updated_at,
@@ -507,7 +507,7 @@ async fn run_receipt(cmd: &cli::ReceiptCommand, format: OutputFormat) -> anyhow:
             let value = serde_json::json!({
                 "corr": receipt.corr,
                 "state": receipt.state.as_str(),
-                "wake": receipt.wake.map(|w| w.as_str()),
+                "wake": receipt.wake.map(toron_core::mailbox::send_tags::Wake::as_str),
                 "due_at": receipt.due_at,
                 "result_path": receipt.result_path,
                 "updated_at": receipt.updated_at,

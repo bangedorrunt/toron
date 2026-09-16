@@ -14,7 +14,7 @@
 
 use sqlx::Row;
 use sqlx::SqlitePool;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::time::Duration;
@@ -390,8 +390,8 @@ impl BusEventStore {
         // replay whose newest same-kind rows belong to other projects).
         // Those filters keep the post-parse drain over the prefiltered
         // candidate set (still shrunk by kinds/#p/#e, per the bead).
-        let sql_exact = filter.ids.as_ref().is_none_or(|i| i.is_empty())
-            && filter.authors.as_ref().is_none_or(|a| a.is_empty())
+        let sql_exact = filter.ids.as_ref().is_none_or(BTreeSet::is_empty)
+            && filter.authors.as_ref().is_none_or(BTreeSet::is_empty)
             && filter.search.is_none()
             && filter.since.is_none()
             && filter.until.is_none()

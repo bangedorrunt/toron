@@ -11,7 +11,7 @@
 //! bus is the contract under test).
 
 use std::process::{Command, Output};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock, PoisonError};
 
 use serde_json::Value;
 use toron_core::nostr::identity::AgentProfile;
@@ -44,7 +44,7 @@ fn register_agents() {
     let _guard = REG
         .get_or_init(|| Mutex::new(()))
         .lock()
-        .unwrap_or_else(|e| e.into_inner());
+        .unwrap_or_else(PoisonError::into_inner);
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     rt.block_on(async {
         let mailbox = toron_mcp::demo_mailbox().await.expect("demo mailbox");

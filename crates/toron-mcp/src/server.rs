@@ -176,7 +176,7 @@ impl ServerHandler for ToronServer {
         // The CLI guard reads the reservation roster from
         // `toron://reservations/{project}`; a stub would hide every lease
         // (false Unreserved). Static/tooling URIs fall through to the stub.
-        let value = if let Some(mb) = self.tools.as_ref().map(|t| t.mailbox()) {
+        let value = if let Some(mb) = self.tools.as_ref().map(super::tools::ToolServer::mailbox) {
             crate::resources::project_resource_value(mb, uri)
                 .await
                 .or_else(|| read_resource_value(uri))

@@ -276,7 +276,7 @@ impl Client {
     /// Connect (probes reachability now so callers fail fast).
     pub fn connect(socket_path: Option<&str>) -> Result<Self, BackendError> {
         let path = socket_path
-            .map(|p| p.to_string())
+            .map(ToString::to_string)
             .or_else(|| std::env::var("HERDR_SOCKET_PATH").ok())
             .unwrap_or_else(|| default_socket_path().to_string_lossy().into_owned());
         let _probe = UnixStream::connect(&path).map_err(|e| {
@@ -380,7 +380,7 @@ impl Client {
             "id": id,
             "method": "events.subscribe",
             "params": {
-                "subscriptions": subscriptions.iter().map(|s| s.to_value()).collect::<Vec<_>>()
+                "subscriptions": subscriptions.iter().map(Subscription::to_value).collect::<Vec<_>>()
             }
         });
         let mut line = serde_json::to_string(&req)
@@ -531,7 +531,7 @@ impl Client {
         wait: Option<WaitOptions>,
     ) -> Result<AgentInfo, BackendError> {
         let wait = wait.map(|w| {
-            json!({ "timeout_ms": w.timeout_ms, "until": w.until.iter().map(|s| s.as_str()).collect::<Vec<_>>() })
+            json!({ "timeout_ms": w.timeout_ms, "until": w.until.iter().map(super::types::AgentStatus::as_str).collect::<Vec<_>>() })
         });
         let res = self.call_coded(
             "agent.prompt",
@@ -551,7 +551,7 @@ impl Client {
             "agent.wait",
             json!({
                 "target": target,
-                "until": until.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+                "until": until.iter().map(super::types::AgentStatus::as_str).collect::<Vec<_>>(),
                 "timeout_ms": timeout_ms,
             }),
         )?;
@@ -1003,7 +1003,7 @@ fn parse_push(kind: &str, data: &Value) -> BackendEvent {
         .get("agent")
         .and_then(Value::as_str)
         .or_else(|| data.get("display_agent").and_then(Value::as_str))
-        .map(|s| s.to_string());
+        .map(ToString::to_string);
     let status = data
         .get("agent_status")
         .or_else(|| data.get("final_status"))
@@ -1304,7 +1304,7 @@ mod tests {
         };
         let wait = json!({ "timeout_ms": 5000, "until": ["done"] });
         assert_eq!(
-            json!({ "timeout_ms": prompt_wait.timeout_ms, "until": prompt_wait.until.iter().map(|s| s.as_str()).collect::<Vec<_>>() }),
+            json!({ "timeout_ms": prompt_wait.timeout_ms, "until": prompt_wait.until.iter().map(super::super::types::AgentStatus::as_str).collect::<Vec<_>>() }),
             wait
         );
     }

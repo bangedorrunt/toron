@@ -721,7 +721,7 @@ async fn post_one(
         "event_id": ev.id.to_hex(),
         "kind": 9,
         "channel": args.id,
-        "mentions": mention_pks.iter().map(|p| p.to_hex()).collect::<Vec<_>>(),
+        "mentions": mention_pks.iter().map(toron_core::nostr::PublicKey::to_hex).collect::<Vec<_>>(),
         "verified": verified,
     }))
 }
@@ -1241,14 +1241,19 @@ fn read_presence(mailbox: &Mailbox, project: &str, now_secs: u64) -> Vec<Value> 
             continue;
         }
         let npub = v.get("npub").and_then(|n| n.as_str()).unwrap_or_default();
-        let ts = v.get("ts").and_then(|t| t.as_u64()).unwrap_or(0);
+        let ts = v.get("ts").and_then(serde_json::Value::as_u64).unwrap_or(0);
         // Stale heartbeats drop out (broker-expiry parity).
         if now_secs.saturating_sub(ts) > ttl {
             continue;
         }
         let is_newer = by_npub
             .get(npub)
-            .map(|old| old.get("ts").and_then(|t| t.as_u64()).unwrap_or(0) <= ts)
+            .map(|old| {
+                old.get("ts")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0)
+                    <= ts
+            })
             .unwrap_or(true);
         if is_newer {
             by_npub.insert(npub.to_string(), v);
@@ -1507,7 +1512,7 @@ async fn wait_for_corr(mailbox: &Mailbox, args: &WaitArgs) -> anyhow::Result<()>
         let v = serde_json::json!({
             "corr": r.corr,
             "state": r.state.as_str(),
-            "wake": r.wake.map(|w| w.as_str()),
+            "wake": r.wake.map(toron_core::mailbox::send_tags::Wake::as_str),
             "due_at": r.due_at,
             "result_path": r.result_path,
             "updated_at": r.updated_at,
@@ -1536,7 +1541,7 @@ async fn wait_for_corr(mailbox: &Mailbox, args: &WaitArgs) -> anyhow::Result<()>
             let v = serde_json::json!({
                 "corr": r.corr,
                 "state": r.state.as_str(),
-                "wake": r.wake.map(|w| w.as_str()),
+                "wake": r.wake.map(toron_core::mailbox::send_tags::Wake::as_str),
                 "due_at": r.due_at,
                 "result_path": r.result_path,
                 "updated_at": r.updated_at,

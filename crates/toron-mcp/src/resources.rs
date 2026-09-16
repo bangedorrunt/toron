@@ -1021,7 +1021,7 @@ mod tests {
             .await
             .expect("thread projection");
         assert!(
-            thread["messages"].as_array().map(|a| a.len()) == Some(1),
+            thread["messages"].as_array().map(Vec::len) == Some(1),
             "thread has the one message"
         );
 
@@ -1062,7 +1062,7 @@ mod tests {
             .await
             .expect("identity projection");
         assert_eq!(
-            identity.as_array().map(|a| a.len()),
+            identity.as_array().map(Vec::len),
             Some(2),
             "identity lists both registered agents"
         );

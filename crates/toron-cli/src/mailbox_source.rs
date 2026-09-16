@@ -250,5 +250,5 @@ fn flywheel_toron_url() -> Option<String> {
         .get("toron")?
         .get("url")?
         .as_str()
-        .map(|s| s.to_string())
+        .map(ToString::to_string)
 }

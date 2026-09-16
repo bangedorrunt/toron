@@ -400,13 +400,19 @@ pub fn check_output(action: &Action, value: &serde_json::Value) -> Result<(), Vi
         OutputKind::Array => value.is_array(),
         OutputKind::Object => value.is_object(),
         OutputKind::ObjectWithOk => {
-            value.get("ok").and_then(|v| v.as_bool()).is_some() && value.is_object()
+            value
+                .get("ok")
+                .and_then(serde_json::Value::as_bool)
+                .is_some()
+                && value.is_object()
         }
         OutputKind::Branch => {
             matches!(
                 value.get("branch").and_then(|v| v.as_str()),
                 Some("then") | Some("else")
-            ) && value.get("outputs").is_some_and(|v| v.is_object())
+            ) && value
+                .get("outputs")
+                .is_some_and(serde_json::Value::is_object)
         }
         OutputKind::AnyNonNull => !value.is_null(),
     };

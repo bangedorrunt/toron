@@ -1075,7 +1075,7 @@ impl Mailbox {
         // transition the durable receipt owed -> acked. Extract once.
         let corr_opt = original.rumor.tags.iter().find_map(|t| {
             let s = t.as_slice();
-            if s.first().map(|x| x.as_str()) == Some("corr") && s.len() > 1 {
+            if s.first().map(String::as_str) == Some("corr") && s.len() > 1 {
                 Some(s[1].clone())
             } else {
                 None
@@ -1251,7 +1251,7 @@ impl Mailbox {
     fn rumor_thread_id(rumor: &crate::nostr::UnsignedEvent) -> Option<String> {
         rumor.tags.iter().find_map(|t| {
             let s = t.as_slice();
-            match s.first().map(|x| x.as_str()) {
+            match s.first().map(String::as_str) {
                 Some("thread") | Some("e") if s.len() > 1 => Some(s[1].to_string()),
                 _ => None,
             }
@@ -1648,12 +1648,12 @@ fn inbox_from(mail: UnwrappedMail) -> InboxMessage {
     // thread_id: prefer the literal `thread` tag (free-form AM-style ids);
     // fall back to the NIP-10 `e` root tag (event-id threads).
     let thread_id = tag_value(tags, "thread")
-        .map(|s| s.to_string())
+        .map(ToString::to_string)
         .or_else(|| {
             tags.iter().find_map(|t| {
                 let parts = t.as_slice();
-                (parts.first().map(|s| s.as_str()) == Some("e"))
-                    .then(|| parts.get(1).map(|s| s.to_string()))
+                (parts.first().map(String::as_str) == Some("e"))
+                    .then(|| parts.get(1).map(ToString::to_string))
                     .flatten()
             })
         });
@@ -1668,13 +1668,13 @@ fn inbox_from(mail: UnwrappedMail) -> InboxMessage {
         created_ts_us: mail.ts_us(),
         read_ts_us: None, // filled by fetch_inbox from the message_reads projection
         duplicate_of: None,
-        corr: tag_value(tags, "corr").map(|s| s.to_string()),
-        wake: tag_value(tags, "wake").map(|s| s.to_string()),
-        priority: tag_value(tags, "priority").map(|s| s.to_string()),
-        audience: tag_value(tags, "audience").map(|s| s.to_string()),
-        result_path: tag_value(tags, "result_path").map(|s| s.to_string()),
-        verdict: tag_value(tags, "verdict").map(|s| s.to_string()),
-        bead: tag_value(tags, "bead").map(|s| s.to_string()),
+        corr: tag_value(tags, "corr").map(ToString::to_string),
+        wake: tag_value(tags, "wake").map(ToString::to_string),
+        priority: tag_value(tags, "priority").map(ToString::to_string),
+        audience: tag_value(tags, "audience").map(ToString::to_string),
+        result_path: tag_value(tags, "result_path").map(ToString::to_string),
+        verdict: tag_value(tags, "verdict").map(ToString::to_string),
+        bead: tag_value(tags, "bead").map(ToString::to_string),
     }
 }
 
@@ -1722,7 +1722,7 @@ pub fn collapse_duplicates(messages: Vec<InboxMessage>) -> Vec<InboxMessage> {
 /// True when a flag tag (no value) is present, e.g. `["ack-required"]`.
 fn tag_has_flag(tags: &crate::nostr::Tags, name: &str) -> bool {
     tags.iter()
-        .any(|t| t.as_slice().first().map(|s| s.as_str()) == Some(name))
+        .any(|t| t.as_slice().first().map(String::as_str) == Some(name))
 }
 
 /// Cache key for a receipt: `project:agent:kind:event_id`.
@@ -2266,7 +2266,7 @@ mod tests {
             gift.rumor
                 .tags
                 .iter()
-                .filter(|t| t.as_slice().first().map(|s| s.as_str()) == Some("p"))
+                .filter(|t| t.as_slice().first().map(String::as_str) == Some("p"))
                 .map(|t| t.as_slice()[1].clone())
                 .collect()
         };
@@ -2952,7 +2952,7 @@ mod tests {
         SendMessage {
             project_slug: project.into(),
             sender_name: sender.into(),
-            to: to.iter().map(|s| s.to_string()).collect(),
+            to: to.iter().map(ToString::to_string).collect(),
             subject: "ADR-0018".into(),
             body_md: "canonical routing".into(),
             cc: vec![],
