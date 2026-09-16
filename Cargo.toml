@@ -50,7 +50,6 @@ ignored_unit_patterns = { level = "allow", priority = 1 }
 implicit_clone = { level = "allow", priority = 1 }
 implicit_hasher = { level = "allow", priority = 1 }
 items_after_statements = { level = "allow", priority = 1 }
-iter_on_single_items = { level = "allow", priority = 1 }
 iter_with_drain = { level = "allow", priority = 1 }
 literal_string_with_formatting_args = { level = "allow", priority = 1 }
 manual_is_variant_and = { level = "allow", priority = 1 }
