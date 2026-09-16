@@ -144,9 +144,9 @@ fn build_approval_payload(
     pending.retain(|n| n != node_name);
     pending.sort();
 
-    let mut completed_sorted = nodes_completed.clone();
+    let mut completed_sorted = nodes_completed;
     completed_sorted.sort();
-    let mut failed_sorted = nodes_failed.clone();
+    let mut failed_sorted = nodes_failed;
     failed_sorted.sort();
 
     let artifacts = extract_artifacts(outputs);
@@ -1737,7 +1737,7 @@ pub(crate) async fn run_call_workflow(
         run_id: None,
     };
     let future = ctx.run(run_workflow, input).spawn()?;
-    Ok(future.await?)
+    future.await
 }
 
 /// Run a `spawn` action (ADR-0005 Spec 4a).
