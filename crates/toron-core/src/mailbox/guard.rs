@@ -15,6 +15,7 @@
 //! (toron-cli, oc-c lane) calls back into `guard_check_paths` below.
 
 use std::path::Path;
+use std::path::PathBuf;
 
 /// An active file reservation as seen by the guard.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -788,8 +789,6 @@ pub fn record_git_fact_for_head_with_journal(repo_path: &Path, pin: &str, journa
         pin,
     );
 }
-
-use super::*;
 
 #[cfg(test)]
 mod tests {

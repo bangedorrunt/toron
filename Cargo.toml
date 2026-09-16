@@ -44,7 +44,6 @@ cast_lossless = { level = "allow", priority = 1 }
 cast_possible_truncation = { level = "allow", priority = 1 }
 cast_possible_wrap = { level = "allow", priority = 1 }
 cast_sign_loss = { level = "allow", priority = 1 }
-doc_link_with_quotes = { level = "allow", priority = 1 }
 ignored_unit_patterns = { level = "allow", priority = 1 }
 implicit_clone = { level = "allow", priority = 1 }
 implicit_hasher = { level = "allow", priority = 1 }
@@ -54,13 +53,11 @@ literal_string_with_formatting_args = { level = "allow", priority = 1 }
 manual_is_variant_and = { level = "allow", priority = 1 }
 manual_let_else = { level = "allow", priority = 1 }
 match_same_arms = { level = "allow", priority = 1 } # keep: per-arm domain comments (receipt/envelope transition tables, http_guard RFC ranges, types status vocab); merging types.rs:124 trips wildcard_in_or_patterns — the two lints conflict, two-arm form is clippy-all clean (bd-579t)
-missing_fields_in_debug = { level = "allow", priority = 1 }
+missing_fields_in_debug = { level = "allow", priority = 1 } # keep: Mailbox Debug deliberately redacts secrets (operator keys, passphrases) to booleans — listing all fields would leak key material into logs (bd-s5kr)
 missing_panics_doc = { level = "allow", priority = 1 }
 must_use_candidate = { level = "allow", priority = 1 }
-needless_collect = { level = "allow", priority = 1 }
 needless_pass_by_ref_mut = { level = "allow", priority = 1 }
 needless_pass_by_value = { level = "allow", priority = 1 }
-nonminimal_bool = { level = "allow", priority = 1 }
 or_fun_call = { level = "allow", priority = 1 }
 return_self_not_must_use = { level = "allow", priority = 1 }
 significant_drop_in_scrutinee = { level = "allow", priority = 1 }
@@ -73,7 +70,6 @@ unreadable_literal = { level = "allow", priority = 1 }
 unused_async = { level = "allow", priority = 1 }
 unused_self = { level = "allow", priority = 1 }
 use_self = { level = "allow", priority = 1 }
-wildcard_imports = { level = "allow", priority = 1 }
 # Wave 2b: surfaced only after the first 48 allows let downstream crates
 # compile (deny blocks the graph past the first failing crate).
 derive_partial_eq_without_eq = { level = "allow", priority = 1 }
