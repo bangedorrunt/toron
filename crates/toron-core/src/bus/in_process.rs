@@ -663,14 +663,14 @@ mod tests {
         let scans_before_second = mid;
         let mut s2 = bus.subscribe(filter.clone()).await.expect("sub 2");
         let second = drain(&mut s2, 32, Duration::from_millis(400)).await;
-        let got: Vec<_> = second
+        let got = second
             .iter()
             .filter_map(|e| match e {
                 SubscriptionEvent::Event(ev) => Some(ev.id.to_hex()),
                 _ => None,
             })
-            .collect();
-        assert_eq!(got.len(), n, "second subscribe replays full history");
+            .count();
+        assert_eq!(got, n, "second subscribe replays full history");
         assert!(
             second.iter().any(|e| matches!(e, SubscriptionEvent::Eose)),
             "EOSE still delivered"

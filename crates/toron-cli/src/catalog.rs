@@ -161,9 +161,11 @@ mod tests {
             toron_mcp::catalog::PARITY_TOOL_COUNT,
             "toron ADR-0007 C3: exactly 38 parity tools in the catalog"
         );
-        let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
         assert!(
-            !names.contains(&toron_mcp::catalog::ADDITIVE_TOOL),
+            !tools
+                .iter()
+                .filter_map(|t| t["name"].as_str())
+                .any(|n| n == toron_mcp::catalog::ADDITIVE_TOOL),
             "additive {} excluded from the 38-tool catalog",
             toron_mcp::catalog::ADDITIVE_TOOL
         );
