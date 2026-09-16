@@ -209,7 +209,7 @@ mod tests {
         });
         let ev = PolicyEvent {
             cron: "weekly-review".into(),
-            tick: 1720000000,
+            tick: 1_720_000_000,
             action: FailureAction::Log,
             bundle: FailureBundle {
                 run_id: "cron:weekly-review:1720000000".into(),

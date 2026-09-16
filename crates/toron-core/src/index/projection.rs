@@ -266,7 +266,7 @@ mod tests {
         let sender = Keys::generate();
         let rumor = gift_wrap::build_rumor(
             sender.public_key(),
-            Timestamp::from(1700000000),
+            Timestamp::from(1_700_000_000),
             14.into(),
             vec![Tag::parse(["ts_ms", "1700000000500000"]).unwrap()],
             "x".to_string(),
