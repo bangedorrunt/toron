@@ -1721,9 +1721,7 @@ mod tests {
             std::env::temp_dir().join(format!("verify-once-data-{}", uuid::Uuid::new_v4()));
         let sink = ProjectGitProjectionSink::for_mailbox(
             data_dir.clone(),
-            [(recipient.public_key().to_hex(), "demo".to_string())]
-                .into_iter()
-                .collect(),
+            HashMap::from([(recipient.public_key().to_hex(), "demo".to_string())]),
         );
         let pipeline = UnwrapPipeline::new(
             vec![recipient.clone()],
@@ -2205,9 +2203,7 @@ mod tests {
         let recipient = keys();
         let slug = "demo";
         let projects: HashMap<String, String> =
-            [(recipient.public_key().to_hex(), slug.to_string())]
-                .into_iter()
-                .collect();
+            HashMap::from([(recipient.public_key().to_hex(), slug.to_string())]);
         let sink = ProjectGitProjectionSink::for_mailbox(data_dir.clone(), projects);
         let pipeline = UnwrapPipeline::new(
             vec![recipient.clone()],
@@ -2297,9 +2293,7 @@ mod tests {
         let recipient = keys();
         let slug = "demo";
         let projects: HashMap<String, String> =
-            [(recipient.public_key().to_hex(), slug.to_string())]
-                .into_iter()
-                .collect();
+            HashMap::from([(recipient.public_key().to_hex(), slug.to_string())]);
 
         // Arm A — per-message projection (window=1: one synchronous commit
         // per write, the pre-batch behavior).
