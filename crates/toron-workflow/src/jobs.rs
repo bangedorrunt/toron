@@ -228,7 +228,7 @@ pub fn job_state(job: EventId, events: &[Event]) -> JobState {
         .collect();
 
     // Terminal states take priority (result, error, cancel).
-    for ev in job_events.iter() {
+    for ev in &job_events {
         match ev.kind.as_u16() {
             JOB_RESULT => {
                 let r: JobResult = serde_json::from_str(&ev.content).unwrap_or(JobResult {

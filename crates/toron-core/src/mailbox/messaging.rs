@@ -736,7 +736,7 @@ impl Mailbox {
                 .unwrap_or_default();
             read_ts.extend(rows);
         }
-        for m in messages.iter_mut() {
+        for m in &mut messages {
             m.read_ts_us = read_ts.get(&m.id).copied();
         }
         // F19.NIP09 (batch-fix): a NIP-09-tombstoned message must not appear

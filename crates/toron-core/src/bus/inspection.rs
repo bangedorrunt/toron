@@ -42,7 +42,7 @@ pub enum InspectionKind {
 }
 
 impl InspectionKind {
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             InspectionKind::Snapshot => "snapshot",
             InspectionKind::Event => "event",
@@ -128,7 +128,11 @@ impl InspectionEvent {
     /// Emitter-side constructor for stageless kinds (`snapshot`, `event`,
     /// `actor`, explicit `degraded`): the actor whose event this is rides
     /// along, like XState's actorRef on every inspection event.
-    pub fn emitted(kind: InspectionKind, actor: Option<String>, detail: Option<String>) -> Self {
+    pub const fn emitted(
+        kind: InspectionKind,
+        actor: Option<String>,
+        detail: Option<String>,
+    ) -> Self {
         Self {
             kind,
             stage: None,
