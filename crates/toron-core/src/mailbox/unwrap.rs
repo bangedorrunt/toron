@@ -720,7 +720,6 @@ const fn civil_from_secs(secs: u64) -> (u32, u32) {
     let y = yoe as i64 + era * 400;
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
     let mp = (5 * doy + 2) / 153;
-    let _d = doy - (153 * mp + 2) / 5 + 1;
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     ((if m <= 2 { y + 1 } else { y }) as u32, m as u32)
 }

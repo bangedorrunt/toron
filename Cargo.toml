@@ -63,7 +63,6 @@ must_use_candidate = { level = "allow", priority = 1 }
 needless_collect = { level = "allow", priority = 1 }
 needless_pass_by_ref_mut = { level = "allow", priority = 1 }
 needless_pass_by_value = { level = "allow", priority = 1 }
-no_effect_underscore_binding = { level = "allow", priority = 1 }
 nonminimal_bool = { level = "allow", priority = 1 }
 or_fun_call = { level = "allow", priority = 1 }
 return_self_not_must_use = { level = "allow", priority = 1 }
