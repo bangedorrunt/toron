@@ -1283,12 +1283,12 @@ impl WorkflowHost {
             ResolutionVerdict::Approved => {
                 self.engine
                     .resolve_approval(&entry.promise_id, &Decision::approved(res.note))
-                    .await?
+                    .await?;
             }
             ResolutionVerdict::Rejected => {
                 self.engine
                     .reject_approval(&entry.promise_id, &Decision::rejected(res.note))
-                    .await?
+                    .await?;
             }
             ResolutionVerdict::SpawnCompleted => {
                 anyhow::bail!("spawn verdict on an approval park: {}", entry.promise_id)

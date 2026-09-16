@@ -403,7 +403,7 @@ fn spawn_mail_trigger_host(
             host.spawn_trigger_loop();
         }
         Err(e) => {
-            tracing::warn!("workflow host unavailable; message_posted triggers disabled: {e:#}")
+            tracing::warn!("workflow host unavailable; message_posted triggers disabled: {e:#}");
         }
     }
 }

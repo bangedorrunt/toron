@@ -572,7 +572,7 @@ impl ProjectGitProjectionSink {
                             tracing::warn!(
                                 slug,
                                 "batched archive commit failed; files retained, retry next window: {e}"
-                            )
+                            );
                         }
                     }
                 }
