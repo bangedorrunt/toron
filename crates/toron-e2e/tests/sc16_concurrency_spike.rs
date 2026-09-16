@@ -45,15 +45,14 @@ pub type SpikeSink = Arc<tokio::sync::Mutex<Vec<(String, String)>>>;
 /// The ROOT workflow: spawns two children CONCURRENTLY, awaits both. Each
 /// child suspends on an external promise. This is the DAG-shaped topology the
 /// spike must prove deterministic.
-// `_input` cannot be renamed to a bare `_`: the name is kept for the
-// resonate durable-function shape, and the proc macro drops outer
-// #[allow] attributes, so the underscore binding is spelled out here.
+// `input` is unused by design (the root takes no arguments) but the
+// resonate durable-function shape requires the (ctx, input) signature.
 #[resonate_sdk::function]
 async fn spike_root(
     ctx: &Context,
-    _input: serde_json::Value,
+    input: serde_json::Value,
 ) -> resonate_sdk::Result<serde_json::Value> {
-    let _ = _input;
+    let _ = input;
     // True concurrency via `.spawn()` — both children run in parallel.
     let f_a = ctx.run(spike_child, json!({ "node": "a" })).spawn()?;
     let f_b = ctx.run(spike_child, json!({ "node": "b" })).spawn()?;
