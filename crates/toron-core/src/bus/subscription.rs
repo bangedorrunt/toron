@@ -51,12 +51,12 @@ pub struct Subscription {
 
 impl Subscription {
     /// Create a subscription from a channel receiver.
-    pub fn new(id: SubscriptionId, rx: mpsc::Receiver<SubscriptionEvent>) -> Self {
+    pub const fn new(id: SubscriptionId, rx: mpsc::Receiver<SubscriptionEvent>) -> Self {
         Self { id, rx }
     }
 
     /// The subscription id.
-    pub fn id(&self) -> &SubscriptionId {
+    pub const fn id(&self) -> &SubscriptionId {
         &self.id
     }
 

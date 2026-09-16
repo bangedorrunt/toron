@@ -338,7 +338,7 @@ pub(crate) struct RetryCoordinator {
 
 impl RetryCoordinator {
     /// Default policy: 3 attempts, exponential backoff.
-    fn default_policy() -> Self {
+    const fn default_policy() -> Self {
         Self {
             max_attempts: 3,
             fixed_backoff_secs: None,
@@ -2182,7 +2182,7 @@ pub struct GraphNodeInput {
 }
 
 /// Default graph-node attempt (serde default fn — `1`, not `0`).
-fn default_attempt() -> u32 {
+const fn default_attempt() -> u32 {
     1
 }
 

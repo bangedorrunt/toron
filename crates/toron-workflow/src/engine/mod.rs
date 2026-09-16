@@ -775,30 +775,30 @@ impl WorkflowEngine {
     }
 
     /// The Resonate runtime (for the approval listener to resolve promises).
-    pub fn resonate(&self) -> &Arc<Resonate> {
+    pub const fn resonate(&self) -> &Arc<Resonate> {
         &self.resonate
     }
 
     /// The approval side-channel: promise-ids of parked approvals.
-    pub fn approval_sink(&self) -> &ApprovalSink {
+    pub const fn approval_sink(&self) -> &ApprovalSink {
         &self.approval_sink
     }
 
     /// The spawn side-channel: promise-ids of parked spawn-awaits (the
     /// embedding reads these to emit the kind-43001 job carrying them).
-    pub fn spawn_sink(&self) -> &SpawnSink {
+    pub const fn spawn_sink(&self) -> &SpawnSink {
         &self.spawn_sink
     }
 
     /// The cron failure-policy side-channel (ADR-0005 Spec 3, P4.4): policy
     /// decisions recorded by the cron loop, executed by the embedding (bead /
     /// escalate DM).
-    pub fn policy_sink(&self) -> &crate::cron_failure::PolicySink {
+    pub const fn policy_sink(&self) -> &crate::cron_failure::PolicySink {
         &self.policy_sink
     }
 
     /// The verify side-channel (ADR-0024 Spec 2).
-    pub fn verify_sink(&self) -> &VerifySink {
+    pub const fn verify_sink(&self) -> &VerifySink {
         &self.verify_sink
     }
 

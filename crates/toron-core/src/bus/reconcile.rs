@@ -160,7 +160,7 @@ impl BusEventStore {
 }
 
 impl SyncStats {
-    fn with_negentropy(mut self, used: bool) -> Self {
+    const fn with_negentropy(mut self, used: bool) -> Self {
         self.used_negentropy = used;
         self
     }

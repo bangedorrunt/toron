@@ -30,11 +30,11 @@ impl PaneId {
     }
 
     /// Empty id for missing `pane_id` in push payloads (same as before).
-    pub fn empty() -> Self {
+    pub const fn empty() -> Self {
         Self(String::new())
     }
 
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
 
@@ -83,7 +83,7 @@ pub enum AgentStatus {
 }
 
 impl AgentStatus {
-    pub fn as_str(&self) -> &'static str {
+    pub const fn as_str(&self) -> &'static str {
         match self {
             AgentStatus::Idle => "idle",
             AgentStatus::Working => "working",

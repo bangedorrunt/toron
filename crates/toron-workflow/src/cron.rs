@@ -69,7 +69,7 @@ pub struct CronRegistration {
     pub enabled: bool,
 }
 
-fn default_enabled() -> bool {
+const fn default_enabled() -> bool {
     true
 }
 
@@ -284,7 +284,7 @@ pub fn spec_tick_workflow(spec: &CronSpec) -> Workflow {
 
 /// Map the cron-specific policy (which carries `catchup`, ADR-0012) to the
 /// workflow policy the loop's failure-policy machinery consumes.
-fn spec_policy_to_cron_policy(p: &CronSpecPolicy) -> CronPolicy {
+const fn spec_policy_to_cron_policy(p: &CronSpecPolicy) -> CronPolicy {
     CronPolicy {
         on_failure: p.on_failure,
         on_repeat_failure: p.on_repeat_failure,

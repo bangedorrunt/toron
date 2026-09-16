@@ -162,7 +162,7 @@ pub enum CleanupKind {
 }
 
 impl CleanupKind {
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::ReleaseReservations => "release-reservations",
             Self::CaptainEvidence => "captain-evidence",
@@ -174,7 +174,7 @@ impl CleanupKind {
     /// (releasing twice converges); evidence mail and bead comments are
     /// not — an ambiguous attempt refuses an unforced retry so one timeout
     /// can never duplicate operator-visible evidence.
-    pub fn capability(self) -> ProviderCapability {
+    pub const fn capability(self) -> ProviderCapability {
         match self {
             Self::ReleaseReservations => ProviderCapability {
                 supports_idempotency_key: true,
@@ -237,7 +237,7 @@ pub struct UnknownReport {
 
 /// The actionable next check for an uncertain effect. Names who moves
 /// next — provider query, reconciler, or operator — never a bare state.
-pub fn describe_unknown(state: EffectState, has_reconcile_path: bool) -> &'static str {
+pub const fn describe_unknown(state: EffectState, has_reconcile_path: bool) -> &'static str {
     match (state, has_reconcile_path) {
         (EffectState::Unknown, true) => {
             "query the provider with the stable effect key, then settle or fail with the returned evidence"

@@ -45,7 +45,7 @@ pub struct Presence {
 
 impl Presence {
     /// True when this observation is stale relative to `now` and the TTL.
-    pub fn is_stale(&self, now_secs: u64, ttl: Duration) -> bool {
+    pub const fn is_stale(&self, now_secs: u64, ttl: Duration) -> bool {
         now_secs.saturating_sub(self.ts) > ttl.as_secs()
     }
 }

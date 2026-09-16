@@ -78,7 +78,7 @@ pub struct BlobStore {
 }
 
 impl BlobStore {
-    pub fn new(project_root: PathBuf) -> Self {
+    pub const fn new(project_root: PathBuf) -> Self {
         Self { project_root }
     }
 
@@ -143,7 +143,7 @@ impl BlobStore {
 
     /// True if `data` is small enough (text/JSON) to inline in a rumor
     /// instead of storing as a blob (ADR G4: small payloads embed inline).
-    pub fn should_inline(&self, data: &[u8]) -> bool {
+    pub const fn should_inline(&self, data: &[u8]) -> bool {
         data.len() <= INLINE_CAP_BYTES
     }
 }

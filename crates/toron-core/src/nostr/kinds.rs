@@ -62,7 +62,7 @@ pub const WORKFLOW_RUN_FIRST: u16 = 46001;
 pub const WORKFLOW_RUN_LAST: u16 = 46012;
 
 /// Convert a toron kind number to a `Kind`.
-pub fn toron_kind(kind: u16) -> Kind {
+pub const fn toron_kind(kind: u16) -> Kind {
     Kind::from_u16(kind)
 }
 

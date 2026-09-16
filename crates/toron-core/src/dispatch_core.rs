@@ -43,7 +43,7 @@ pub struct DispatchModel {
 }
 
 impl DispatchModel {
-    pub fn new(max_concurrency: usize) -> Self {
+    pub const fn new(max_concurrency: usize) -> Self {
         Self {
             max_concurrency,
             used: 0,
@@ -53,7 +53,7 @@ impl DispatchModel {
     }
 
     /// Test constructor free of daemon/network/PTY (ADR-0031 A8).
-    pub fn test_new() -> Self {
+    pub const fn test_new() -> Self {
         Self::new(100)
     }
 }

@@ -273,7 +273,7 @@ pub struct NonceStore {
 
 impl NonceStore {
     /// Open the store on a pool.
-    pub fn new(pool: sqlx::SqlitePool) -> Self {
+    pub const fn new(pool: sqlx::SqlitePool) -> Self {
         Self {
             pool,
             enabled: true,
@@ -281,7 +281,7 @@ impl NonceStore {
     }
 
     /// Disable replay protection (used by pure/gate-off tests).
-    pub fn disabled(pool: sqlx::SqlitePool) -> Self {
+    pub const fn disabled(pool: sqlx::SqlitePool) -> Self {
         Self {
             pool,
             enabled: false,
@@ -346,7 +346,7 @@ pub fn build_attestation_event(
 }
 
 /// Convenience for the doc example / E2E: an attestation's event id as hex.
-pub fn attestation_event_id(event: &Event) -> EventId {
+pub const fn attestation_event_id(event: &Event) -> EventId {
     event.id
 }
 

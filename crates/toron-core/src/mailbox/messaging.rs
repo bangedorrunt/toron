@@ -57,7 +57,7 @@ pub enum RecipientRole {
 }
 
 impl RecipientRole {
-    fn tag_value(self) -> &'static str {
+    const fn tag_value(self) -> &'static str {
         match self {
             Self::To => "to",
             Self::Cc => "cc",

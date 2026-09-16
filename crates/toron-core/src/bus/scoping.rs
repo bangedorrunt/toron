@@ -34,7 +34,7 @@ pub fn project_scoping_tags(slug: &str) -> Vec<Tag> {
 /// Wraps (1059), seals (13), and private DMs (14/15) are encrypted; project
 /// scoping leaks the project in envelope metadata. ADR-0003: gift-wrapped DMs
 /// carry neither `#t` nor NIP-32 labels.
-pub fn is_metadata_hiding_kind(kind: Kind) -> bool {
+pub const fn is_metadata_hiding_kind(kind: Kind) -> bool {
     matches!(kind.as_u16(), 13 | 14 | 15 | 1059)
 }
 

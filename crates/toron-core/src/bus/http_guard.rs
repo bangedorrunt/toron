@@ -27,7 +27,7 @@ pub fn is_private_ip(ip: IpAddr) -> bool {
 }
 
 /// Resolve `::ffff:a.b.c.d` (IPv4-mapped-IPv6) to the embedded IPv4.
-fn ipv4_mapped_to_v4(v6: Ipv6Addr) -> Option<Ipv4Addr> {
+const fn ipv4_mapped_to_v4(v6: Ipv6Addr) -> Option<Ipv4Addr> {
     match v6.octets() {
         // ::ffff:0:0/96
         [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, a, b, c, d] => Some(Ipv4Addr::new(a, b, c, d)),

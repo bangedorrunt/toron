@@ -129,7 +129,7 @@ impl DispatchPool {
     }
 
     /// Global concurrency limit.
-    pub fn max_concurrency(&self) -> usize {
+    pub const fn max_concurrency(&self) -> usize {
         self.config.max_concurrency
     }
 }

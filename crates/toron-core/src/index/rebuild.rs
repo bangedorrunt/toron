@@ -65,7 +65,7 @@ impl MailRecord {
 }
 
 /// Split a µs timestamp into calendar `(year, month)`.
-fn calendar_ym(ts_us: i64) -> (u32, u32) {
+const fn calendar_ym(ts_us: i64) -> (u32, u32) {
     let secs = ts_us / 1_000_000;
     // Days since epoch.
     let days = secs / 86_400;

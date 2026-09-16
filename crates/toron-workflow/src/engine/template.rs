@@ -23,7 +23,7 @@ pub(crate) struct RenderContext<'a> {
 }
 
 impl<'a> RenderContext<'a> {
-    pub fn new(workflow: &'a str, node: &'a str) -> Self {
+    pub const fn new(workflow: &'a str, node: &'a str) -> Self {
         Self { workflow, node }
     }
 }

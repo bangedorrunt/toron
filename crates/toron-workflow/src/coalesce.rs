@@ -130,7 +130,7 @@ pub struct Coalesced {
 
 impl Coalesced {
     /// The coalesced count (mentions collapsed into this one job).
-    pub fn count(&self) -> usize {
+    pub const fn count(&self) -> usize {
         self.mentions.len()
     }
 
@@ -193,7 +193,7 @@ struct Buffer {
 }
 
 impl Buffer {
-    fn new(now_ms: u64) -> Self {
+    const fn new(now_ms: u64) -> Self {
         Self {
             mentions: VecDeque::new(),
             first_arrival_ms: now_ms,

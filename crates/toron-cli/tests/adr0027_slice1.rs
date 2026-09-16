@@ -63,7 +63,7 @@ fn ensure_project(data_dir: &std::path::Path, slug: &str) {
     );
 }
 
-fn register_agent(data_dir: &PathBuf, project: &str, name: &str) {
+const fn register_agent(data_dir: &PathBuf, project: &str, name: &str) {
     // Use the `mail` registration via the mailbox directly is not via CLI;
     // instead we rely on the CLI's ability to create the agent on first send?
     // The toron CLI `mail send` requires a local key; we create it by using

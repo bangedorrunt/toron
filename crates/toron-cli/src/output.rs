@@ -24,7 +24,7 @@ pub enum ColorChoice {
 
 impl OutputFormat {
     /// Resolve the format from global flags.
-    pub fn from_globals(g: &Globals) -> Self {
+    pub const fn from_globals(g: &Globals) -> Self {
         if g.json {
             Self::Json
         } else if g.plain {

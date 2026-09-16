@@ -798,7 +798,7 @@ pub fn run_metrics() -> anyhow::Result<()> {
 
 /// The MCP-tool-style name for a robot command (e.g. "mail.inbox"), used as
 /// the metrics key. Non-robot commands never reach `run_robot`.
-pub fn robot_tool_name(command: &Command) -> &'static str {
+pub const fn robot_tool_name(command: &Command) -> &'static str {
     match command {
         Command::Mail(MailCommand::Send(_)) => "mail.send",
         Command::Mail(MailCommand::Reply(_)) => "mail.reply",

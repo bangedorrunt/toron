@@ -563,7 +563,7 @@ pub struct ToronMailSurface {
 }
 
 impl ToronMailSurface {
-    pub fn new(mailbox: Mailbox) -> Self {
+    pub const fn new(mailbox: Mailbox) -> Self {
         Self {
             mailbox,
             agent_name: String::new(),
@@ -581,7 +581,7 @@ impl ToronMailSurface {
         &self.agent_name
     }
 
-    pub fn mailbox(&self) -> &Mailbox {
+    pub const fn mailbox(&self) -> &Mailbox {
         &self.mailbox
     }
 }

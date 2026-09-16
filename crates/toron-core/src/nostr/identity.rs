@@ -159,7 +159,7 @@ pub fn profile_name_from_d_tag(d: &str) -> Option<&str> {
 }
 
 /// Extract the agent's npub (the event author) from a kind-30013 profile.
-pub fn profile_npub(event: &Event) -> PublicKey {
+pub const fn profile_npub(event: &Event) -> PublicKey {
     event.pubkey
 }
 

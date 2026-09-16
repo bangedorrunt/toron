@@ -80,12 +80,12 @@ pub fn parse_presence(event: &Event) -> Option<PresencePayload> {
 }
 
 /// Convenience: event id as hex (diagnostics / SC-15 assertions).
-pub fn presence_event_id(event: &Event) -> EventId {
+pub const fn presence_event_id(event: &Event) -> EventId {
     event.id
 }
 
 /// Convenience for tests / SC-15: the author of a presence event.
-pub fn presence_author(event: &Event) -> PublicKey {
+pub const fn presence_author(event: &Event) -> PublicKey {
     event.pubkey
 }
 

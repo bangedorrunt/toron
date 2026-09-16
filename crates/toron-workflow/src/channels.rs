@@ -285,7 +285,7 @@ impl ChannelStore {
     }
 
     /// True when `kind` is a channel post (canonical 9 or legacy 42).
-    pub fn is_post_kind(kind: u16) -> bool {
+    pub const fn is_post_kind(kind: u16) -> bool {
         kind == CHANNEL_MESSAGE || kind == CHANNEL_MESSAGE_LEGACY
     }
 

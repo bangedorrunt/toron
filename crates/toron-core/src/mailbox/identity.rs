@@ -143,7 +143,7 @@ pub const ROSTER_STALE_AFTER_DAYS: u64 = 7;
 /// Pure recency predicate (functional core): true when `last_active_ts_us`
 /// is strictly older than [`ROSTER_STALE_AFTER_DAYS`] at `now_us`.
 /// Future timestamps are never stale.
-pub fn roster_entry_stale(last_active_ts_us: i64, now_us: i64) -> bool {
+pub const fn roster_entry_stale(last_active_ts_us: i64, now_us: i64) -> bool {
     now_us - last_active_ts_us > ROSTER_STALE_AFTER_DAYS as i64 * 86_400 * 1_000_000
 }
 

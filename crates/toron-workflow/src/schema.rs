@@ -300,18 +300,18 @@ pub struct CronPolicy {
 }
 
 /// Default repeat threshold (3 consecutive failures).
-fn default_repeat_threshold() -> u32 {
+const fn default_repeat_threshold() -> u32 {
     3
 }
 
 /// Default spawn-await claim timeout (600s = 10m).
-fn default_no_claim_timeout() -> u64 {
+const fn default_no_claim_timeout() -> u64 {
     600
 }
 
 impl Trigger {
     /// The canonical trigger type name (as written in YAML).
-    pub fn type_name(&self) -> &'static str {
+    pub const fn type_name(&self) -> &'static str {
         match self {
             Self::MessagePosted { .. } => "message_posted",
             Self::ReactionAdded { .. } => "reaction_added",
@@ -377,7 +377,7 @@ pub enum StepOnError {
 
 impl StepOnError {
     /// True for the default `Continue` (drives serde skip).
-    pub fn is_continue(&self) -> bool {
+    pub const fn is_continue(&self) -> bool {
         matches!(self, Self::Continue)
     }
 }
@@ -404,7 +404,7 @@ pub enum Phase {
 
 impl Phase {
     /// Wire/lint form of the phase (lowercase).
-    pub fn as_str(&self) -> &'static str {
+    pub const fn as_str(&self) -> &'static str {
         match self {
             Self::Resolve => "resolve",
             Self::Plan => "plan",
@@ -700,7 +700,7 @@ pub enum ReduceOp {
 
 impl ReduceOp {
     /// Canonical wire spelling.
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::All => "all",
             Self::Any => "any",
@@ -712,13 +712,13 @@ impl ReduceOp {
 }
 
 /// Default retry attempts (used by `Action::Retry` serde default).
-fn default_max_attempts() -> u32 {
+const fn default_max_attempts() -> u32 {
     3
 }
 
 impl Action {
     /// The canonical action name (as written in YAML).
-    pub fn type_name(&self) -> &'static str {
+    pub const fn type_name(&self) -> &'static str {
         match self {
             Self::SendMessage { .. } => "send_message",
             Self::SendDm { .. } => "send_dm",
@@ -855,11 +855,11 @@ pub fn parse_cron(yaml: &str) -> Result<CronSpec, serde_yaml::Error> {
     serde_yaml::from_str(yaml)
 }
 
-fn default_cron_enabled() -> bool {
+const fn default_cron_enabled() -> bool {
     true
 }
 
-fn cron_enabled_default(enabled: &bool) -> bool {
+const fn cron_enabled_default(enabled: &bool) -> bool {
     *enabled
 }
 

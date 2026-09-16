@@ -1672,7 +1672,7 @@ pub enum BackendArg {
 }
 
 impl BackendArg {
-    pub fn as_str(&self) -> &'static str {
+    pub const fn as_str(&self) -> &'static str {
         match self {
             BackendArg::Herdr => "herdr",
             BackendArg::Tmux => "tmux",
@@ -1722,7 +1722,7 @@ pub enum BenchCaseArg {
 
 impl BenchCaseArg {
     /// The AM-Rust parity case name.
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Startup => "startup",
             Self::Inbox => "inbox",

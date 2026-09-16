@@ -99,7 +99,7 @@ impl MailError {
         )
     }
 
-    pub fn code(&self) -> &MailErrorCode {
+    pub const fn code(&self) -> &MailErrorCode {
         &self.code
     }
 }

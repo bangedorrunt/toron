@@ -80,7 +80,7 @@ impl IntoCallToolResult for ToolOutput {
 }
 
 impl ToolOutput {
-    fn ok(value: Value) -> Self {
+    const fn ok(value: Value) -> Self {
         Self(Ok(value))
     }
 
@@ -534,7 +534,7 @@ impl ToolServer {
     }
 
     /// The wrapped mailbox.
-    pub fn mailbox(&self) -> &Arc<Mailbox> {
+    pub const fn mailbox(&self) -> &Arc<Mailbox> {
         &self.mailbox
     }
 

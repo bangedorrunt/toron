@@ -32,7 +32,7 @@ pub enum ReceiptState {
 }
 
 impl ReceiptState {
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Owed => "owed",
             Self::Acked => "acked",
@@ -108,11 +108,11 @@ pub struct ReceiptStore {
 }
 
 impl ReceiptStore {
-    pub fn new(pool: SqlitePool) -> Self {
+    pub const fn new(pool: SqlitePool) -> Self {
         Self { pool }
     }
 
-    pub fn pool(&self) -> &SqlitePool {
+    pub const fn pool(&self) -> &SqlitePool {
         &self.pool
     }
 
