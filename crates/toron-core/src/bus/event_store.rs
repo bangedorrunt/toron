@@ -605,10 +605,17 @@ impl BusEventStore {
             .bind(Timestamp::now().as_secs() as i64)
             .execute(&self.pool)
             .await?;
+        // bd-eifs: evict FIFO BY ARRIVAL (rowid), never by `created_at`.
+        // NIP-17/NIP-59 gift wraps carry a randomized created_at up to 2 days
+        // in the past for metadata privacy — timestamp-ordered eviction made
+        // a just-arrived mail wrap the OLDEST row in a full store and pruned
+        // it before any reader saw it, while send had already reported
+        // success. Storage age is arrival order; created_at is protocol
+        // metadata only.
         sqlx::query(
             "DELETE FROM bus_events WHERE event_id IN (
                 SELECT event_id FROM bus_events
-                ORDER BY created_at ASC, event_id ASC
+                ORDER BY rowid ASC
                 LIMIT MAX(0, (SELECT COUNT(*) FROM bus_events) - ?1)
             )",
         )
@@ -1315,6 +1322,80 @@ mod tests {
         let filter = crate::bus::project_filter("demo");
         let replayed = store.replay(&filter).await.expect("replay");
         assert_eq!(replayed[0].as_json(), ev.as_json());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// bd-eifs regression: cap eviction is FIFO BY ARRIVAL (rowid), never by
+    /// NIP-17 randomized `created_at`. Gift wraps (and NIP-59 seals) are born
+    /// with a created_at up to 2 days in the past for metadata privacy — under
+    /// `created_at ASC` eviction a freshly arrived mail wrap looks like the
+    /// oldest row in a full store and is pruned BEFORE ANY READER SEES IT,
+    /// while send already reported success. Live reproduction: the doorbell's
+    /// kind-9 wake flood pins the store at MAX_STORED_EVENTS continuously, so
+    /// the prune tick runs constantly and the eviction window is seconds.
+    #[tokio::test]
+    async fn test_cap_eviction_is_arrival_fifo_not_created_at() {
+        let (store, pool, path) = temp_store().await;
+        let keys = Keys::generate();
+
+        // Pin the store at the cap with filler rows whose created_at is
+        // NEWER than the backdated arrival below — under created_at-ordering
+        // these all outrank it for survival.
+        sqlx::query(
+            "WITH RECURSIVE cnt(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM cnt WHERE x < 100000) \
+             INSERT INTO bus_events (event_id, raw_json, created_at, kind, author, d_tag, expires_at) \
+             SELECT 'filler-' || x, '{}', 1789630000 + x, 9, 'filler-author', NULL, NULL FROM cnt",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed fillers");
+
+        // First arrival: punctual timestamp. Second arrival: BACKDATED
+        // created_at (what gift_wrap_with_urgency produces — NIP-17 jitter
+        // up to 2 days back). Arrival order: early → backdated.
+        let early = build_event(
+            &keys,
+            crate::nostr::kinds::toron_kind(PROJECT_MANIFEST),
+            "early arrival",
+            vec![Tag::parse(["t", "demo"]).expect("t")],
+            Timestamp::now(),
+        )
+        .expect("build early");
+        store.insert(&early).await.expect("insert early");
+
+        let backdated_created_at = Timestamp::now().as_secs() - 2 * 24 * 60 * 60;
+        let backdated = build_event(
+            &keys,
+            crate::nostr::kinds::toron_kind(PROJECT_MANIFEST),
+            "backdated arrival",
+            vec![Tag::parse(["t", "demo"]).expect("t")],
+            Timestamp::from(backdated_created_at),
+        )
+        .expect("build backdated");
+        store.insert(&backdated).await.expect("insert backdated");
+
+        assert_eq!(store.count().await.expect("count"), 100_002);
+        store.prune().await.expect("prune");
+
+        // Cap holds (100_000), and BOTH arrivals survive: the eviction
+        // victims are the earliest-ARRIVED filler rows, not the row whose
+        // protocol timestamp happens to look oldest.
+        let n = store.count().await.expect("count after prune");
+        assert!(n <= super::MAX_STORED_EVENTS, "cap holds: {n}");
+        for (name, ev) in [("backdated", &backdated), ("early", &early)] {
+            let hit: Option<i64> = sqlx::query_scalar(
+                "SELECT 1 FROM bus_events WHERE event_id = ?1",
+            )
+            .bind(ev.id.to_hex())
+            .fetch_optional(&pool)
+            .await
+            .expect("survivor lookup");
+            assert!(
+                hit.is_some(),
+                "{name} arrival must survive cap prune — created_at is \
+                 protocol metadata, not storage age"
+            );
+        }
         let _ = std::fs::remove_file(&path);
     }
 
