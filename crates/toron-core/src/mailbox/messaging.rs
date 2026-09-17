@@ -29,6 +29,7 @@
 //! Read receipts are lost on an index rebuild (projection-only, documented).
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::nostr::UnsignedEvent;
 use crate::nostr::event::build_event;
@@ -40,7 +41,10 @@ use crate::backend::herdr::HerdrBackend;
 use crate::bus::filter::ToronFilter;
 use crate::bus::scoping::is_metadata_hiding_kind;
 use crate::mailbox::identity::ListAgentsOptions;
-use crate::mailbox::unwrap::{OVERSEER_TAG, UnwrappedMail, order_by_rumor_time, tag_value};
+use crate::mailbox::unwrap::{
+    DualProjectionSink, OVERSEER_TAG, ProjectGitProjectionSink, ProjectionSink, SqliteProjectionSink,
+    UnwrappedMail, order_by_rumor_time, tag_value,
+};
 use crate::nostr::gift_wrap::{self, UnwrappedGift};
 use crate::nostr::identity as nident;
 use sha2::Digest;
@@ -698,6 +702,11 @@ impl Mailbox {
 
         // G7: order by rumor time (+ts_ms) + local_seq; never envelope time.
         let ordered = order_by_rumor_time(mails);
+        // bd-fts-projection-lag: the read door heals the search projection —
+        // every mail the fetch just decrypted lands in the `messages`/FTS
+        // index even with no projecting daemon running. Idempotent on
+        // rumor-id; contract in `heal_search_projection`.
+        self.heal_search_projection(&ordered).await;
         let mut messages: Vec<InboxMessage> =
             ordered.into_iter().map(|(m, _seq)| inbox_from(m)).collect();
 
@@ -816,6 +825,103 @@ impl Mailbox {
         };
         self.resolve_sender_names(&mut messages).await;
         Ok(messages)
+    }
+
+    /// bd-fts-projection-lag: heal the search projection at READ time.
+    ///
+    /// The `messages`/FTS projection's only writer used to be the daemon's
+    /// unwrap loop — a CLI-only session (no projecting daemon) left every
+    /// fresh mail invisible to `search_messages`. `fetch_inbox` is the
+    /// recipient's read door: it has already decrypted each wrap, so writing
+    /// the unwrapped mail through the same dual sink the daemon uses heals
+    /// the lag with zero extra crypto. The write is the daemon's exact
+    /// contract — git-first (G11), idempotent on rumor-id (`DedupKey` +
+    /// `ON CONFLICT DO NOTHING`), so repeated fetches and the daemon's own
+    /// subscription loop converge on the same rows. The pre-check is a
+    /// chunked bulk SQL lookup — already-projected history (the steady-state
+    /// fleet-poll case) skips the sink entirely.
+    ///
+    /// Best-effort: any sink error degrades to the pre-fix behavior (search
+    /// lags until a projecting daemon runs); the inbox read itself never
+    /// fails. Triggers do NOT fire here — reads are not deliveries; the
+    /// daemon loop owns `message_posted` side effects.
+    async fn heal_search_projection(&self, ordered: &[(UnwrappedMail, u64)]) {
+        let Some(pool) = self.index_pool.as_ref() else {
+            return;
+        };
+        if ordered.is_empty() {
+            return;
+        }
+        let ids: Vec<String> = ordered.iter().map(|(m, _)| m.rumor_id.to_hex()).collect();
+        let mut projected: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        // Chunked `IN` — a full-history fetch can carry tens of thousands of
+        // rumor ids and SQLite caps bound variables per statement.
+        for chunk in ids.chunks(500) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql =
+                format!("SELECT event_id FROM messages WHERE event_id IN ({placeholders})");
+            let mut q = sqlx::query(&sql);
+            for id in chunk {
+                q = q.bind(id);
+            }
+            match q.fetch_all(pool).await {
+                Ok(rows) => projected.extend(
+                    rows.into_iter()
+                        .filter_map(|r| r.try_get::<String, _>(0).ok()),
+                ),
+                Err(e) => {
+                    // A failed chunk degrades to healing writes for it —
+                    // the sink dedup makes the re-write a no-op when the
+                    // row is actually there.
+                    tracing::debug!("projection pre-check failed (healing write covers it): {e}");
+                }
+            }
+        }
+        let todo: Vec<(&UnwrappedMail, u64)> = ordered
+            .iter()
+            .filter(|(m, _)| !projected.contains(&m.rumor_id.to_hex()))
+            .map(|(m, s)| (m, *s))
+            .collect();
+        if todo.is_empty() {
+            return;
+        }
+        // Recipient-npub → project / sender-npub → name maps, the same
+        // shapes `build_unwrap_pipeline` feeds the daemon's sink. The wrap
+        // hides the project; the sink resolves it from the recipient key.
+        let roster: Vec<(String, String, String)> =
+            sqlx::query_as("SELECT project_slug, name, pubkey FROM agents")
+                .fetch_all(pool)
+                .await
+                .unwrap_or_default();
+        let npub_to_project: HashMap<String, String> = roster
+            .iter()
+            .map(|(slug, _name, npub)| (npub.clone(), slug.clone()))
+            .collect();
+        let npub_to_name: HashMap<String, String> = roster
+            .iter()
+            .map(|(_slug, name, npub)| (npub.clone(), name.clone()))
+            .collect();
+        let sqlite: Arc<dyn ProjectionSink> = Arc::new(
+            SqliteProjectionSink::new(pool.clone())
+                .with_projects(npub_to_project.clone())
+                .with_names(npub_to_name),
+        );
+        let git: Arc<dyn ProjectionSink> = Arc::new(ProjectGitProjectionSink::for_mailbox(
+            self.data_dir.clone(),
+            npub_to_project,
+        ));
+        let dual = DualProjectionSink::new(git, sqlite);
+        for (mail, seq) in &todo {
+            if let Err(e) = dual.write(mail, *seq).await {
+                tracing::debug!(
+                    rumor_id = %mail.rumor_id,
+                    "search-projection heal failed (index lags until next fetch/daemon): {e}"
+                );
+            }
+        }
     }
 
     /// Best-effort batch npub→name resolution for inbox entries. Mutates
@@ -1746,6 +1852,7 @@ mod tests {
     use crate::bus::in_process::{InProcessBus, InProcessBusConfig};
     use crate::index::schema;
     use crate::mailbox::Mailbox;
+    use crate::mailbox::search::SearchMessages;
     use crate::nostr::identity::AgentProfile;
     use std::sync::Arc;
 
@@ -3730,5 +3837,86 @@ mod tests {
         );
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    // bd-fts-projection-lag: search reads the `messages`/FTS projection, whose
+    // only writer was the daemon's unwrap loop. A CLI-only session (no
+    // projecting daemon) left fresh mail invisible to `mail search`. The
+    // recipient's fetch is the read door — it must heal the projection lag by
+    // writing every mail it unwraps through the same idempotent sink.
+    #[tokio::test]
+    async fn fetch_inbox_projects_to_search_index() {
+        let (mailbox, pool, db_path, data_dir) = test_mailbox_with_pool("ftslag").await;
+        let _ = register(&mailbox, "ftslag-proj", "FtsSender").await;
+        let _ = register(&mailbox, "ftslag-proj", "FtsRecv").await;
+
+        mailbox
+            .send_message(&SendMessage {
+                project_slug: "ftslag-proj".into(),
+                sender_name: "FtsSender".into(),
+                to: vec!["FtsRecv".into()],
+                subject: "fts projection lag probe".into(),
+                body_md: "xrayspectrumunique body".into(),
+                ..Default::default()
+            })
+            .await
+            .expect("send");
+
+        // Pre-fetch: send alone must NOT leak into the search index (the
+        // recipient's read is the projection door, not the sender's send).
+        let found = mailbox
+            .search_messages(&SearchMessages {
+                project_key: "ftslag-proj".into(),
+                query: "xrayspectrumunique".into(),
+                ..Default::default()
+            })
+            .await
+            .expect("search");
+        assert!(found.is_empty(), "pre-fetch: nothing projected yet");
+
+        let inbox = mailbox
+            .fetch_inbox(&FetchInbox {
+                project_slug: "ftslag-proj".into(),
+                agent_name: "FtsRecv".into(),
+                ..Default::default()
+            })
+            .await
+            .expect("fetch");
+        assert_eq!(inbox.len(), 1, "fetch sees the mail");
+
+        // Post-fetch: searchable with no daemon having ever run.
+        let found = mailbox
+            .search_messages(&SearchMessages {
+                project_key: "ftslag-proj".into(),
+                query: "xrayspectrumunique".into(),
+                ..Default::default()
+            })
+            .await
+            .expect("search");
+        assert_eq!(found.len(), 1, "post-fetch: searchable without a daemon");
+        assert_eq!(found[0].subject, "fts projection lag probe");
+
+        // Idempotent: a re-fetch must not duplicate the projection.
+        mailbox
+            .fetch_inbox(&FetchInbox {
+                project_slug: "ftslag-proj".into(),
+                agent_name: "FtsRecv".into(),
+                ..Default::default()
+            })
+            .await
+            .expect("refetch");
+        let found = mailbox
+            .search_messages(&SearchMessages {
+                project_key: "ftslag-proj".into(),
+                query: "xrayspectrumunique".into(),
+                ..Default::default()
+            })
+            .await
+            .expect("search");
+        assert_eq!(found.len(), 1, "re-fetch is dedup-safe");
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+        drop(pool);
     }
 }
