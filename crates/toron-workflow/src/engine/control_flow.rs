@@ -2123,7 +2123,7 @@ pub(crate) async fn run_graph(
                 }
                 return Ok(failed);
             }
-            outputs.insert(name.clone(), value);
+            land_node_output(&mut outputs, &name, &node.action, value);
             done.insert(name);
             // Do not increment idx — next pending shifted into current idx
         }
@@ -2143,6 +2143,45 @@ pub(crate) async fn run_graph(
     }
 
     Ok(serde_json::Value::Object(outputs))
+}
+
+/// Land one completed graph node's value into the run's output map.
+///
+/// ADR-0024 Spec 2 (ONE decision spelling): a completed `request_approval`
+/// node publishes its [`Decision`] under `decision` as well as under its own
+/// node name. The linear path has always inserted the `decision` alias
+/// ([`run_step`]'s request_approval arm); the DAG scheduler landed the value
+/// under the node name ONLY, so an identical workflow routed through
+/// `to_graph()` served a silent Null to every consumer reading `decision`.
+/// Both paths now agree because the alias is inserted in the ONE place graph
+/// node values land — see [`is_approval_decision`].
+///
+/// With more than one approval node the LAST completed one owns the alias,
+/// matching the linear path's last-insert-wins behavior.
+fn land_node_output(
+    outputs: &mut serde_json::Map<String, serde_json::Value>,
+    name: &str,
+    action: &Action,
+    value: serde_json::Value,
+) {
+    if is_approval_decision(action, &value) {
+        outputs.insert("decision".into(), value.clone());
+    }
+    outputs.insert(name.to_string(), value);
+}
+
+/// ADR-0024 Spec 2: did this completed node produce a real approval DECISION?
+///
+/// Only the `request_approval` action's resolved promise qualifies, and only
+/// when the value actually carries a [`Decision`] payload (`outcome`) — a
+/// guard skip (`skipped`), a refusal, or a failure is NOT a decision and must
+/// never be aliased as one.
+fn is_approval_decision(action: &Action, value: &serde_json::Value) -> bool {
+    matches!(action, Action::RequestApproval { .. })
+        && value
+            .get("outcome")
+            .and_then(serde_json::Value::as_str)
+            .is_some()
 }
 
 /// The input for one graph node execution (the durable child's input).
@@ -2426,5 +2465,89 @@ mod control_flow_guard_tests {
             Some(&evalexpr::Value::from("true")),
             "object outputs expand to steps_<name>_<key>"
         );
+    }
+}
+
+#[cfg(test)]
+mod control_flow_output_tests {
+    use super::{Action, is_approval_decision, land_node_output};
+
+    /// ADR-0024 Spec 2: a completed approval node lands under BOTH its node
+    /// name and `decision` — the DAG scheduler used to publish only the node
+    /// name, so a consumer reading `decision` saw a silent Null.
+    #[test]
+    fn approval_node_lands_the_decision_alias() {
+        let mut outputs = serde_json::Map::new();
+        let decision = serde_json::json!({ "outcome": "approved", "note": "ship it" });
+        land_node_output(
+            &mut outputs,
+            "gate",
+            &Action::RequestApproval {
+                message: "ok?".into(),
+            },
+            decision.clone(),
+        );
+        assert_eq!(outputs["decision"], decision, "alias published");
+        assert_eq!(outputs["gate"], decision, "node-name output published");
+    }
+
+    /// A guard SKIP on an approval node is not a decision: the node name lands,
+    /// the alias does not — a skip must never read as an approval.
+    #[test]
+    fn skipped_approval_node_never_lands_the_alias() {
+        let mut outputs = serde_json::Map::new();
+        land_node_output(
+            &mut outputs,
+            "gate",
+            &Action::RequestApproval {
+                message: "ok?".into(),
+            },
+            serde_json::json!({ "skipped": true, "node": "gate", "reason": "guard false" }),
+        );
+        assert!(outputs.contains_key("gate"), "the node still lands");
+        assert!(
+            !outputs.contains_key("decision"),
+            "a skip is not a decision: {outputs:?}"
+        );
+    }
+
+    /// The alias is about the APPROVAL contract, not about any node that
+    /// happens to carry an `outcome` key.
+    #[test]
+    fn non_approval_node_never_lands_the_alias() {
+        let mut outputs = serde_json::Map::new();
+        land_node_output(
+            &mut outputs,
+            "ship",
+            &Action::Delay { secs: 1 },
+            serde_json::json!({ "outcome": "approved" }),
+        );
+        assert!(outputs.contains_key("ship"));
+        assert!(
+            !outputs.contains_key("decision"),
+            "only request_approval mints the alias: {outputs:?}"
+        );
+    }
+
+    /// The predicate: only a `request_approval` action carrying a resolved
+    /// `outcome` is a decision.
+    #[test]
+    fn is_approval_decision_requires_action_and_outcome() {
+        let approval = Action::RequestApproval {
+            message: "ok?".into(),
+        };
+        let delay = Action::Delay { secs: 1 };
+        assert!(is_approval_decision(
+            &approval,
+            &serde_json::json!({ "outcome": "rejected" })
+        ));
+        assert!(!is_approval_decision(
+            &approval,
+            &serde_json::json!({ "ok": true })
+        ));
+        assert!(!is_approval_decision(
+            &delay,
+            &serde_json::json!({ "outcome": "approved" })
+        ));
     }
 }

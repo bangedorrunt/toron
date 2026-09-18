@@ -147,7 +147,7 @@ async fn sc11_approval_crash_resume() {
         trigger: serde_json::json!({}),
     };
     // Spawn the run; it parks at `request_approval`. Capture the promise_id.
-    let _handle_a = engine_a
+    let handle_a = engine_a
         .resonate()
         .run(
             "sc11-deploy",
@@ -174,7 +174,7 @@ async fn sc11_approval_crash_resume() {
     // 3. KILL THE WORKER: drop Engine A entirely. The Resonate server retains
     //    the durable execution + the parked promise — nothing is lost.
     drop(engine_a);
-    drop(_handle_a);
+    drop(handle_a);
 
     // 4. RESTART: a fresh worker (Engine B) on the same server. The operator's
     //    approval (operator-signed kind-46011, echoed promise_id) resolves the
@@ -195,9 +195,18 @@ async fn sc11_approval_crash_resume() {
 
     // The run completed with the approval decision recorded — the checkpoint
     // after request_approval was reached, then the run finished.
+    //
+    // ADR-0024 Spec 2 (one decision spelling): the decision is published under
+    // the node's OWN name (`gate`) AND under `decision` — asserted strictly, on
+    // both keys, so this witness pins the contract the engine implements rather
+    // than papering over a path that omits one of them.
     assert_eq!(
         output["decision"]["outcome"], "approved",
-        "resumed run records the approval decision"
+        "resumed run records the approval decision under `decision`: {output}"
+    );
+    assert_eq!(
+        output["decision"], output["gate"],
+        "the node-name output and the `decision` alias must agree: {output}"
     );
     // The pre-approval step (prep) + post-approval step (ship) both ran —
     // the durable replay re-executed from the checkpoint.
