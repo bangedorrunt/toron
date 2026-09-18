@@ -122,6 +122,15 @@ pub async fn wait_ready(url: &str) {
 /// FW rows drive this through [`CronManager`](toron_workflow::cron::CronManager).
 /// The `send_dm` step is a stand-in "tick recorded" marker — the injected
 /// no-op runner swallows it (assertions read the step output, not the DM).
+///
+/// bd-sc24-catchup-tick-never-fires-19xu: the recipient templates
+/// `{{trigger.owner}}` — the field a
+/// `schedule` trigger actually carries (`Trigger::Schedule { cron, owner,
+/// scope }`). It must NOT be `{{trigger.sender}}` (a `message_posted`-only
+/// field): the engine renders action fields STRICTLY (ADR-0032 Spec 4), so an
+/// unresolvable ref fails the tick BEFORE the runner ever sees it — and the
+/// runner is the only observable the cron rows have, so the loop would look
+/// like it never fired.
 pub fn housekeeper_workflow() -> toron_workflow::schema::Workflow {
     parse_workflow(
         r##"
@@ -133,7 +142,7 @@ trigger:
 steps:
   - name: record
     action: send_dm
-    to: "{{trigger.sender}}"
+    to: "{{trigger.owner}}"
     body: "tick"
 "##,
     )
