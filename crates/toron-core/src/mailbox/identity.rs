@@ -81,12 +81,24 @@ pub struct SlugAbsorption {
 /// never absorbed. Its npub is a dead inbox: no key file, wraps sealed to it
 /// are unreachable by any name-routed surface, and cross-key delete is
 /// forbidden — so doctor NAMES the row for operator cleanup.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct FoldedSlugLeftover {
     pub project_slug: String,
     pub slug: String,
     pub pubkey: String,
     pub canonical: String,
+}
+
+/// bd-4a0u: the outcome of one `agent prune` sweep — the CLI report shape.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SlugPruneReport {
+    /// Leftover rows ABSORBED: the standalone `agents` row was removed, so
+    /// the second inbox stops existing.
+    pub removed: Vec<FoldedSlugLeftover>,
+    /// Leftovers KEPT because the canonical target has no live registration:
+    /// absorbing into a void would strand the identity worse than before.
+    /// `doctor` keeps naming these until the pin registers.
+    pub kept: Vec<FoldedSlugLeftover>,
 }
 
 /// Scan one index pool for leftover dual registrations. Empty after
@@ -132,6 +144,28 @@ pub struct WhoIs {
     /// no-collision-info, never a block).
     #[serde(default)]
     pub stale: bool,
+    /// bd-u4e2: the LIVE herdr pane this pin is running in — the pin → pane
+    /// mapping an operator needs to intervene. `None` when no herdr backend
+    /// is reachable, when the pin has no live pane, or when the row predates
+    /// u4e2 (additive `Option`, so old wire rows stay parseable). Pane
+    /// visibility is ADVISORY — never a routing gate.
+    #[serde(default)]
+    pub pane_id: Option<String>,
+    /// bd-u4e2: workspace owning [`Self::pane_id`] (`None` with no live pane).
+    #[serde(default)]
+    pub workspace_id: Option<String>,
+    /// bd-u4e2: tab owning [`Self::pane_id`] (`None` with no live pane).
+    #[serde(default)]
+    pub tab_id: Option<String>,
+}
+
+/// bd-u4e2: a live pane's identity triple — where a pin's mailbox actually
+/// runs. Additive read-model shape; nothing routes on it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PaneRef {
+    pub pane_id: String,
+    pub workspace_id: String,
+    pub tab_id: String,
 }
 
 /// ADR-0010 F2: roster-staleness cadence (days). Entries with no signed
@@ -371,6 +405,53 @@ impl Mailbox {
             removed_registration: removed,
             canonical_registered: true,
         }
+    }
+
+    /// bd-4a0u: the folded-slug leftovers for ONE project — the read-only
+    /// preview `agent prune --dry-run` prints. Matches the row's verbatim
+    /// project slug against every alias of the canonical project (ADR-0017),
+    /// so a leftover written under a path-form slug is not silently skipped.
+    pub async fn folded_slug_leftovers_for(
+        &self,
+        project_slug: &str,
+    ) -> anyhow::Result<Vec<FoldedSlugLeftover>> {
+        let Some(pool) = self.index_pool.as_ref() else {
+            anyhow::bail!("no index pool attached — nothing to scan");
+        };
+        let canonical = self.canonical_project(project_slug).await;
+        let aliases = self.project_slug_aliases(&canonical);
+        Ok(folded_slug_leftovers(pool)
+            .await?
+            .into_iter()
+            .filter(|l| aliases.contains(&l.project_slug))
+            .collect())
+    }
+
+    /// bd-4a0u: purge the folded-slug leftovers `doctor` reports (the
+    /// `legacy_slug_identities` check) — the `agent prune` core. For every
+    /// `agents` row whose name is a recorded fold alias, absorb it
+    /// ([`Self::absorb_folded_slug`]): once the canonical pin is registered,
+    /// the standalone row goes away and the SECOND inbox stops existing.
+    ///
+    /// Idempotent and honest: a row whose canonical target is NOT registered
+    /// is returned in [`SlugPruneReport::kept`] instead of destroyed —
+    /// absorbing into a void would strand the identity worse than leaving it.
+    /// Cross-key NIP-09 delete is forbidden, so this removes the local roster
+    /// row only; the orphan's already-sealed wraps stay unreachable by
+    /// construction (no surface keys off a roster row).
+    pub async fn prune_folded_slugs(&self, project_slug: &str) -> anyhow::Result<SlugPruneReport> {
+        let mut report = SlugPruneReport::default();
+        for leftover in self.folded_slug_leftovers_for(project_slug).await? {
+            let absorbed = self
+                .absorb_folded_slug(&leftover.project_slug, &leftover.slug)
+                .await;
+            if absorbed.removed_registration {
+                report.removed.push(leftover);
+            } else {
+                report.kept.push(leftover);
+            }
+        }
+        Ok(report)
     }
 
     /// bd-captain-alias-0g8a: point the project's routable `captain` alias
@@ -1076,6 +1157,8 @@ impl Mailbox {
         let profile = ident::parse_profile(profile_ev).unwrap_or_else(|| AgentProfile::new(&name));
         let last_active_ts_us = profile_ev.created_at.as_secs() as i64 * 1_000_000;
         let now_us = crate::index::writer::Clock::now_us(&crate::index::writer::SystemClock);
+        // bd-u4e2: attach the LIVE pane when herdr can be reached (advisory).
+        let pane = Self::live_pin_pane_map().remove(&name);
         Ok(WhoIs {
             name: name.to_string(),
             npub: npub.to_hex(),
@@ -1084,6 +1167,9 @@ impl Mailbox {
             task_description: profile.task_description,
             last_active_ts_us,
             stale: roster_entry_stale(last_active_ts_us, now_us),
+            pane_id: pane.as_ref().map(|p| p.pane_id.clone()),
+            workspace_id: pane.as_ref().map(|p| p.workspace_id.clone()),
+            tab_id: pane.as_ref().map(|p| p.tab_id.clone()),
         })
     }
 
@@ -1120,6 +1206,9 @@ impl Mailbox {
                 task_description: None,
                 last_active_ts_us: ts_us,
                 stale: false,
+                pane_id: None,
+                workspace_id: None,
+                tab_id: None,
             });
             if ts_us > entry.last_active_ts_us {
                 entry.npub = npub;
@@ -1145,6 +1234,16 @@ impl Mailbox {
             agents.retain(|a| a.last_active_ts_us >= cutoff);
         }
         agents.sort_by_key(|b| std::cmp::Reverse(b.last_active_ts_us));
+        // bd-u4e2: attach each pin's LIVE pane when herdr can be reached
+        // (advisory; an unreachable backend leaves the fields `None`).
+        let mut panes = Self::live_pin_pane_map();
+        for agent in &mut agents {
+            if let Some(pane) = panes.remove(&agent.name) {
+                agent.pane_id = Some(pane.pane_id);
+                agent.workspace_id = Some(pane.workspace_id);
+                agent.tab_id = Some(pane.tab_id);
+            }
+        }
         Ok(agents)
     }
 
@@ -1171,6 +1270,31 @@ impl Mailbox {
             }
         }
         Ok(out)
+    }
+
+    /// bd-u4e2: best-effort live pin → pane map for `whois`/`list_agents`.
+    /// No herdr backend reachable → empty map, so those reads report `None`
+    /// pane fields instead of failing. Pane visibility is ADVISORY (the same
+    /// posture as the other opportunistic `HerdrBackend::connect` callers) —
+    /// a pane-less environment must never turn a roster read into an error.
+    fn live_pin_pane_map() -> std::collections::HashMap<String, PaneRef> {
+        let Ok(backend) = HerdrBackend::connect(None) else {
+            return std::collections::HashMap::new();
+        };
+        let mut client = backend.client();
+        let Ok(agents) = client.agent_list() else {
+            return std::collections::HashMap::new();
+        };
+        let panes: Vec<PaneInfo> = client
+            .workspace_list()
+            .map(|wss| {
+                wss.into_iter()
+                    .flat_map(|ws| client.pane_list(Some(&ws.workspace_id)).unwrap_or_default())
+                    .collect()
+            })
+            .unwrap_or_default();
+        drop(client);
+        pin_pane_map(&panes, &agents)
     }
 
     /// `resolve_pane_identity`: herdr pane_id → agent name (G9). `None` when
@@ -1236,6 +1360,52 @@ impl Mailbox {
             })
             .collect())
     }
+}
+
+/// bd-u4e2: pure pin → live pane map (functional core; [`Mailbox::whois`]
+/// and [`Mailbox::list_agents`] are the imperative shell). One sweep answers
+/// every pin, with the SAME precedence as [`resolve_pin_for_pane`]: the
+/// `toron_pin` mail-identity stamp wins over an `agent.list` name, so a
+/// reused pane id never maps a pin to the previous occupant's pane.
+pub fn pin_pane_map(
+    panes: &[PaneInfo],
+    agents: &[AgentInfo],
+) -> std::collections::HashMap<String, PaneRef> {
+    let mut out: std::collections::HashMap<String, PaneRef> = std::collections::HashMap::new();
+    // Token-first: the display-only `toron:mail-identity` stamp is
+    // authoritative (bd-0sbf).
+    for pane in panes {
+        if let Some(pin) = pane_token_pin(pane) {
+            out.entry(pin.to_string()).or_insert_with(|| PaneRef {
+                pane_id: pane.pane_id.clone(),
+                workspace_id: pane.workspace_id.clone(),
+                tab_id: pane.tab_id.clone(),
+            });
+        }
+    }
+    // Fallback: the pane's `agent.list` occupant name — only for UNSTAMPED
+    // panes, so a rolled-over occupant never becomes a second mapping beside
+    // the pin the pane actually carries (the same token-first rule as
+    // [`resolve_pin_for_pane`]).
+    let pane_by_id: std::collections::HashMap<&str, &PaneInfo> =
+        panes.iter().map(|p| (p.pane_id.as_str(), p)).collect();
+    for agent in agents {
+        let Some(name) = agent.name.as_deref() else {
+            continue;
+        };
+        let Some(pane) = pane_by_id.get(agent.pane_id.as_str()) else {
+            continue;
+        };
+        if pane_token_pin(pane).is_some() {
+            continue;
+        }
+        out.entry(name.to_string()).or_insert_with(|| PaneRef {
+            pane_id: pane.pane_id.clone(),
+            workspace_id: pane.workspace_id.clone(),
+            tab_id: pane.tab_id.clone(),
+        });
+    }
+    out
 }
 
 /// bd-0sbf: read the mail-identity stamp off a pane (pure — testable).
@@ -1590,6 +1760,41 @@ mod tests {
         assert_eq!(pane_token_pin(&panes[1]), None);
     }
 
+    /// bd-u4e2: the pure pin → pane map carries the live triple (pane +
+    /// workspace + tab) and keeps the token-first precedence — a stamped pin
+    /// maps to its own pane even when `agent.list` still names the previous
+    /// occupant there.
+    #[test]
+    fn pin_pane_map_is_token_first_and_carries_the_triple() {
+        let panes = vec![
+            test_pane("w1:p1", Some("DustySparrow")),
+            test_pane("w1:p2", None),
+        ];
+        let agents = vec![
+            test_agent("w1:p1", Some("OldOccupant")),
+            test_agent("w1:p2", Some("PlainAgent")),
+        ];
+        let map = pin_pane_map(&panes, &agents);
+        assert_eq!(
+            map.get("DustySparrow"),
+            Some(&PaneRef {
+                pane_id: "w1:p1".into(),
+                workspace_id: "w1".into(),
+                tab_id: "w1:t1".into(),
+            }),
+            "stamped pin maps to its own pane (workspace + tab carried)"
+        );
+        assert_eq!(
+            map.get("PlainAgent").map(|p| p.pane_id.as_str()),
+            Some("w1:p2"),
+            "unstamped pane falls back to the agent.list name"
+        );
+        assert!(
+            !map.contains_key("OldOccupant"),
+            "a stale occupant on a stamped pane never becomes a second mapping"
+        );
+    }
+
     // --- bd-legacy-slug-inbox-onoj: folded slugs must not keep a second inbox ---
     /// The defect scenario: a slug registered STANDALONE pre-fold keeps its
     /// own agents row beside the pin; mail sealed to the orphan npub is
@@ -1782,6 +1987,84 @@ mod tests {
             after.iter().all(|l| l.slug != "flywheel-p-oc5"),
             "absorbed slug no longer listed: {after:?}"
         );
+    }
+
+    /// bd-4a0u: `agent prune` absorbs the leftover rows doctor names, KEEPS
+    /// (and reports) a row whose canonical target is unregistered rather than
+    /// destroying it, and is idempotent on re-run.
+    #[tokio::test]
+    async fn prune_absorbs_leftovers_and_keeps_stranded_ones() {
+        let (mailbox, pool, _db, _data) = test_mailbox_with_pool("4a0u-prune").await;
+        let project = "p-prune";
+        mailbox.ensure_project(project).await.expect("ensure");
+        let absorbable = mailbox
+            .register_agent(project, &profile("flywheel-p-prune-oc1"))
+            .await
+            .expect("absorbable slug");
+        // Registry's own slug spelling for the raw assertions below.
+        let project = absorbable.project_slug.clone();
+        let stranded = mailbox
+            .register_agent(&project, &profile("flywheel-p-prune-oc2"))
+            .await
+            .expect("stranded slug");
+        let pin = mailbox
+            .register_agent(&project, &profile("RealPin"))
+            .await
+            .expect("canonical pin");
+        // Records the folds WITHOUT absorbing — the legacy leftover shape a
+        // pre-absorb registry left behind.
+        mailbox
+            .fold_agent_name_alias_no_absorb(&project, "flywheel-p-prune-oc1", "RealPin")
+            .await;
+        mailbox
+            .fold_agent_name_alias_no_absorb(&project, "flywheel-p-prune-oc2", "GhostPin")
+            .await;
+
+        // `--dry-run` preview: sees both, mutates nothing.
+        let preview = mailbox
+            .folded_slug_leftovers_for(&project)
+            .await
+            .expect("preview");
+        assert_eq!(preview.len(), 2, "both leftovers previewed");
+        let rows_before: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM agents WHERE project_slug = ?1")
+                .bind(&project)
+                .fetch_one(&pool)
+                .await
+                .expect("row count");
+        assert_eq!(rows_before, 3, "preview removed nothing");
+
+        let report = mailbox.prune_folded_slugs(&project).await.expect("prune");
+        assert_eq!(report.removed.len(), 1, "canonical-registered row absorbed");
+        assert_eq!(report.removed[0].slug, "flywheel-p-prune-oc1");
+        assert_eq!(report.kept.len(), 1, "stranded row reported, not destroyed");
+        assert_eq!(report.kept[0].slug, "flywheel-p-prune-oc2");
+        assert_eq!(report.kept[0].pubkey, stranded.npub);
+
+        // Roster: only the stranded row survives beside the pin.
+        let rows: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM agents WHERE project_slug = ?1 ORDER BY name")
+                .bind(&project)
+                .fetch_all(&pool)
+                .await
+                .expect("roster");
+        assert!(rows.iter().any(|n| n == "flywheel-p-prune-oc2"));
+        assert!(!rows.iter().any(|n| n == "flywheel-p-prune-oc1"));
+
+        // Idempotent: a second sweep has nothing left to remove.
+        let again = mailbox
+            .prune_folded_slugs(&project)
+            .await
+            .expect("re-prune");
+        assert!(again.removed.is_empty(), "nothing left to remove");
+        assert_eq!(again.kept.len(), 1, "stranded row stays reported");
+
+        // The absorbed slug still routes — folds to the pin's key.
+        let w = mailbox
+            .whois(&project, "flywheel-p-prune-oc1")
+            .await
+            .expect("folded slug still routable");
+        assert_eq!(w.npub, pin.npub, "alias resolves to the pin identity");
     }
 
     // --- ADR-0018: swarm-mode whois + registration hardening ---

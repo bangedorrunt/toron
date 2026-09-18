@@ -836,6 +836,7 @@ pub const fn robot_tool_name(command: &Command) -> &'static str {
         Command::Guard(GuardCommand::Install(_)) => "guard.install",
         Command::Guard(GuardCommand::Uninstall(_)) => "guard.uninstall",
         Command::Agent(AgentCommand::Bootstrap(_)) => "agent.bootstrap",
+        Command::Agent(AgentCommand::Prune(_)) => "agent.prune",
         _ => "unknown",
     }
 }

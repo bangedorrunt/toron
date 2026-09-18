@@ -53,7 +53,7 @@ Child maps: [toron-core](crates/toron-core/AGENTS.md) ·
 | Cron (distinct type) | `crates/toron-workflow/src/cron.rs`  |
 | MCP tools | `crates/toron-mcp/src/tools/` |
 | Catalog surface | `crates/toron-mcp/src/catalog.rs` + `crates/toron-cli/src/catalog.rs` (`docs/catalog/`) |
-| CLI / daemon | `crates/toron-cli/src/{cli,daemon,main}.rs` (`agent bootstrap`: register/upsert + reserve in one call) |
+| CLI / daemon | `crates/toron-cli/src/{cli,daemon,main}.rs` (`agent bootstrap`: register/upsert + reserve in one call; `agent prune`: absorb the folded-slug leftovers `doctor` names, bd-4a0u) |
 | ADRs | `docs/decisions/` |
 
 ## CONVENTIONS
@@ -64,6 +64,7 @@ Child maps: [toron-core](crates/toron-core/AGENTS.md) ·
 - Frozen: 40 tool names (38 AM-Rust parity + 2 toron additive: `release_file_reservations_by_reason` bd-h3oj, `list_file_reservations` bd-locks-list-daemon-xetz), 25 resources, kind registry. No new kinds/tools without an ADR. 
 - ADR-0020 adds **CLI** nouns `channel` `job` `react` `presence` `watch`. Channel posts emit kind **9** (not 42). ADR-0023: channel create/close emit **39000**, join/leave emit **39002**; 40/41/42 ingest only.
 - Lease board + release-on-bead-close are CLI-reachable: `toron reserve list --project <p> [--holder <pin> --path <glob>]` and `toron reserve release-by-reason <bead> --project <p> --as <operator>`. No new MCP tool — both wrap existing operators (`list_file_reservations` / `release_file_reservations_by_reason`); `release-by-reason` is operator-signed and fails loud without an operator key.
+- Folded-slug cleanup is CLI-reachable: `toron agent prune --project <p> [--as <pin>]` (preview with the global `-n/--dry-run`) absorbs the `legacy_slug_identities` leftovers `doctor` names — the standalone `agents` row goes away once the canonical pin is registered; a row whose target is unregistered is KEPT and reported (bd-4a0u). No new MCP tool: CLI-only noun (daemon arm sweeps the shared durable root directly, like `ack-sla`).
 - rust-nostr **0.45**: `nostr-sdk` 0.45.2 + `nostr` 0.45.3 (`nip44`/`nip49`/`nip59`/`os-rng`). Protocol types via `crate::nostr` / `nostr::prelude`. Sign with `FinalizeEvent::finalize`. `gift_wrap` is sync (`GiftWrapBuilder`).
 - Catalog: `toron catalog --json` regenerates `docs/catalog/toron-mcp.json`; `mbx test catalog_freshness` fails red on surface drift without regen (toron.dev ADR-0002 D3).
 - Flag vocabulary (bd-flag-vocab-conformance-0hyv): the acting agent is ALWAYS `--as` (`--from`/`--agent` banned, gated by `mbx test -p toron-cli --bin toron flag_conformance`); every project-scoped subcommand REQUIRES `--project`. Channel lifecycle, verify-after-send (`--wait-ack`), delivery visibility (`read --author`), and the inbox cursor (`--since last`, migration 0007) are toron-skill surface; this repo owns their CLI parsing and bus behavior.
@@ -76,7 +77,9 @@ Child maps: [toron-core](crates/toron-core/AGENTS.md) ·
   source, `toron_pin`/`toron_project`/`toron_npub` tokens) — never
   `pane.report_agent` (that steals lifecycle authority). Resolve/cleanup read
   tokens first, `agent.list` names second; liveness always from live
-  `pane.list`, never cached.
+  `pane.list`, never cached. `whois`/`list_agents` carry the resolved live
+  pane as additive optionals `pane_id`/`workspace_id`/`tab_id` (bd-u4e2;
+  `None` when no herdr backend is reachable — advisory, never a routing gate).
 - `t` tag = project slug only. Never harness/model/job tags.
 - TDD for new features and bug fixes. No benches in this repo.
 - Beads: bare `br` is the TUI (ratatui, since 2026-08-24) — humans run `br`, agents run `br --robot-*` with `--format json|toon` (never bare `br` in automation); `bv` is deprecated.

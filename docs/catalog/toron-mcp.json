@@ -56,7 +56,7 @@
       "name": "guard"
     },
     {
-      "args": "bootstrap",
+      "args": "bootstrap, prune",
       "description": "Agent identity: one-step session bootstrap (register/upsert + reserve)",
       "name": "agent"
     },
@@ -146,7 +146,7 @@
       "name": "role"
     }
   ],
-  "generated_at": "2026-09-14T03:51:55Z",
+  "generated_at": "2026-09-18T12:26:32Z",
   "resources": [
     {
       "description": "List projects known to toron.",
@@ -558,6 +558,12 @@
           "npub": {
             "type": "string"
           },
+          "pane_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "program": {
             "type": [
               "string",
@@ -567,7 +573,19 @@
           "stale": {
             "type": "boolean"
           },
+          "tab_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "task_description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "workspace_id": {
             "type": [
               "string",
               "null"
@@ -747,7 +765,7 @@
       "output_schema": {
         "$defs": {
           "WhoIsOut": {
-            "description": "`whois`: `{name, npub, program, model, task_description, last_active_ts_us, stale}`.\n\nADR-0010 F2: `stale` flags roster rows older than the prune cadence —\nnever a silent live pin.",
+            "description": "`whois`: `{name, npub, program, model, task_description, last_active_ts_us,\nstale, pane_id, workspace_id, tab_id}`.\n\nADR-0010 F2: `stale` flags roster rows older than the prune cadence —\nnever a silent live pin.\n\nbd-u4e2: `pane_id`/`workspace_id`/`tab_id` are the LIVE herdr pane the pin\nruns in (advisory; all `None` when no herdr backend is reachable). Additive\noptionals — pre-u4e2 clients parse rows unchanged.",
             "properties": {
               "last_active_ts_us": {
                 "format": "int64",
@@ -765,6 +783,12 @@
               "npub": {
                 "type": "string"
               },
+              "pane_id": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
               "program": {
                 "type": [
                   "string",
@@ -774,7 +798,19 @@
               "stale": {
                 "type": "boolean"
               },
+              "tab_id": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
               "task_description": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "workspace_id": {
                 "type": [
                   "string",
                   "null"

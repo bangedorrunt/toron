@@ -89,10 +89,15 @@ pub struct RegisteredAgentOut {
     pub created: bool,
 }
 
-/// `whois`: `{name, npub, program, model, task_description, last_active_ts_us, stale}`.
+/// `whois`: `{name, npub, program, model, task_description, last_active_ts_us,
+/// stale, pane_id, workspace_id, tab_id}`.
 ///
 /// ADR-0010 F2: `stale` flags roster rows older than the prune cadence —
 /// never a silent live pin.
+///
+/// bd-u4e2: `pane_id`/`workspace_id`/`tab_id` are the LIVE herdr pane the pin
+/// runs in (advisory; all `None` when no herdr backend is reachable). Additive
+/// optionals — pre-u4e2 clients parse rows unchanged.
 #[derive(Debug, Clone, JsonSchema)]
 pub struct WhoIsOut {
     pub name: String,
@@ -102,6 +107,9 @@ pub struct WhoIsOut {
     pub task_description: Option<String>,
     pub last_active_ts_us: i64,
     pub stale: bool,
+    pub pane_id: Option<String>,
+    pub workspace_id: Option<String>,
+    pub tab_id: Option<String>,
 }
 
 /// `resolve_pane_identity`: `{agent_name, pane_id}` (name found or not) or
