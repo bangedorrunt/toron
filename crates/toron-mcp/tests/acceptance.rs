@@ -7,7 +7,7 @@
 use rmcp::ClientServiceExt;
 use rmcp::ServiceExt;
 use rmcp::model::{
-    ClientCapabilities, ClientInfo, Implementation, ProtocolVersion, ReadResourceRequestParams,
+    ClientCapabilities, ClientConfig, Implementation, ProtocolVersion, ReadResourceRequestParams,
 };
 use rmcp::transport::streamable_http_client::{
     StreamableHttpClientTransport, StreamableHttpClientTransportConfig,
@@ -94,7 +94,7 @@ async fn http_resources_list_and_read() -> anyhow::Result<()> {
     let transport = StreamableHttpClientTransport::from_config(
         StreamableHttpClientTransportConfig::with_uri(format!("http://{addr}/mcp")),
     );
-    let client_info = ClientInfo::new(
+    let client_info = ClientConfig::new(
         ClientCapabilities::default(),
         Implementation::from_build_env(),
     );
@@ -177,7 +177,7 @@ async fn http_initialize_negotiates_2026_07_28() -> anyhow::Result<()> {
         StreamableHttpClientTransportConfig::with_uri(format!("http://{addr}/mcp")),
     );
 
-    let client_info = ClientInfo::new(
+    let client_info = ClientConfig::new(
         ClientCapabilities::default(),
         Implementation::from_build_env(),
     );
@@ -227,7 +227,7 @@ async fn http_lists_exactly_38_am_rust_tools() -> anyhow::Result<()> {
     let transport = StreamableHttpClientTransport::from_config(
         StreamableHttpClientTransportConfig::with_uri(format!("http://{addr}/mcp")),
     );
-    let client_info = ClientInfo::new(
+    let client_info = ClientConfig::new(
         ClientCapabilities::default(),
         Implementation::from_build_env(),
     );
@@ -345,7 +345,7 @@ async fn stdio_discover_negotiates_2026_07_28() -> anyhow::Result<()> {
         }
     });
 
-    let client_info = ClientInfo::new(
+    let client_info = ClientConfig::new(
         ClientCapabilities::default(),
         Implementation::from_build_env(),
     )

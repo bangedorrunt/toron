@@ -27,6 +27,7 @@ use toron_core::bus::in_process::{AuthPolicy, InProcessBusConfig};
 use toron_core::bus::{Bus, Filter, InProcessBus, SubscriptionEvent};
 use toron_core::index::schema;
 use toron_core::mailbox::Mailbox;
+use toron_core::nostr::SingleLetterTag;
 use toron_core::nostr::identity::AgentProfile;
 use toron_workflow::jobs::{
     JobRequest, JobResult, JobState, build_job_claim, build_job_request, build_job_result,
@@ -109,7 +110,7 @@ async fn sc9_mention_to_job_claim_to_result() {
         loop {
             match oc_sub.next().await {
                 Some(SubscriptionEvent::Event(evt)) => return Some(evt),
-                Some(SubscriptionEvent::Eose) => continue,
+                Some(SubscriptionEvent::Eose) => {}
                 Some(SubscriptionEvent::Closed(_)) | None => return None,
             }
         }
@@ -218,9 +219,7 @@ async fn sc9_mention_to_job_claim_to_result() {
         .expect("publish result");
 
     let lifecycle_events = bus
-        .subscribe(
-            Filter::new().custom_tag(nostr::SingleLetterTag::LOWERCASE_E, job_req.id.to_hex()),
-        )
+        .subscribe(Filter::new().custom_tag(SingleLetterTag::LOWERCASE_E, job_req.id.to_hex()))
         .await
         .expect("lifecycle sub");
     let mut lc = Vec::new();
@@ -243,7 +242,7 @@ async fn sc9_mention_to_job_claim_to_result() {
         loop {
             match grok_sub.next().await {
                 Some(SubscriptionEvent::Event(_)) => return true,
-                Some(SubscriptionEvent::Eose) => continue,
+                Some(SubscriptionEvent::Eose) => {}
                 Some(SubscriptionEvent::Closed(_)) | None => return false,
             }
         }

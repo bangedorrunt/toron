@@ -105,7 +105,7 @@ async fn sc_fw_one_process_peer_mail_via_bus() {
         loop {
             match sub.next().await {
                 Some(SubscriptionEvent::Event(evt)) => return Some(evt),
-                Some(SubscriptionEvent::Eose) => continue,
+                Some(SubscriptionEvent::Eose) => {}
                 Some(SubscriptionEvent::Closed(_)) | None => return None,
             }
         }

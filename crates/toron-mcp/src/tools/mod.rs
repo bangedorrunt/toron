@@ -33,7 +33,7 @@ use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::tool::IntoCallToolResult;
 use rmcp::model::{
     CallToolResponse, CallToolResult, ContentBlock, Implementation, InitializeResult,
-    ProtocolVersion, ServerCapabilities, ServerInfo,
+    ProtocolVersion, ServerCapabilities, ServerConfig,
 };
 use rmcp::{ServerHandler, tool_handler};
 use serde_json::{Value, json};
@@ -568,7 +568,7 @@ impl ToolServer {
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for ToolServer {
-    fn get_info(&self) -> ServerInfo {
+    fn get_info(&self) -> ServerConfig {
         InitializeResult::new(Self::capabilities())
             .with_protocol_version(ProtocolVersion::V_2026_07_28)
             .with_server_info(Implementation::new("toron", env!("CARGO_PKG_VERSION")))

@@ -60,8 +60,7 @@ fn sc12_burst_backpressure_bounded_and_ordered() {
 
     // Re-acquire → one-in-flight again; release → next in order.
     let p1 = pool.try_acquire("OCBeta").expect("p1");
-    let p2 = pool.try_acquire("OCBeta");
-    assert!(p2.is_none(), "still one-in-flight");
+    assert!(pool.try_acquire("OCBeta").is_none(), "still one-in-flight");
     drop(p1);
     let ready2 = pool.next_ready().expect("next after second release");
     assert_eq!(ready2.job_id, "job-1", "FIFO preserved: job-1 next");

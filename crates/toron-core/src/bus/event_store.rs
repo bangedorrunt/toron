@@ -1383,13 +1383,12 @@ mod tests {
         let n = store.count().await.expect("count after prune");
         assert!(n <= super::MAX_STORED_EVENTS, "cap holds: {n}");
         for (name, ev) in [("backdated", &backdated), ("early", &early)] {
-            let hit: Option<i64> = sqlx::query_scalar(
-                "SELECT 1 FROM bus_events WHERE event_id = ?1",
-            )
-            .bind(ev.id.to_hex())
-            .fetch_optional(&pool)
-            .await
-            .expect("survivor lookup");
+            let hit: Option<i64> =
+                sqlx::query_scalar("SELECT 1 FROM bus_events WHERE event_id = ?1")
+                    .bind(ev.id.to_hex())
+                    .fetch_optional(&pool)
+                    .await
+                    .expect("survivor lookup");
             assert!(
                 hit.is_some(),
                 "{name} arrival must survive cap prune — created_at is \

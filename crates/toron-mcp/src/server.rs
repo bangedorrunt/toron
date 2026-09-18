@@ -9,7 +9,7 @@ use rmcp::model::{
     ListResourceTemplatesResult, ListResourcesResult, ListToolsResult, PaginatedRequestParams,
     ProtocolVersion, ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult, Resource,
     ResourceContents, ResourceTemplate, ResourceUpdatedNotification,
-    ResourceUpdatedNotificationParam, ServerCapabilities, ServerInfo, SubscriptionFilter, Tool,
+    ResourceUpdatedNotificationParam, ServerCapabilities, ServerConfig, SubscriptionFilter, Tool,
 };
 use rmcp::service::{RequestContext, RoleServer, SubscriptionContext};
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
@@ -95,7 +95,7 @@ impl ToronServer {
 }
 
 impl ServerHandler for ToronServer {
-    fn get_info(&self) -> ServerInfo {
+    fn get_info(&self) -> ServerConfig {
         // rmcp auto-negotiates: prefers V_2026_07_28, falls back to V_2025_11_25.
         InitializeResult::new(Self::capabilities())
             .with_protocol_version(ProtocolVersion::V_2026_07_28)
