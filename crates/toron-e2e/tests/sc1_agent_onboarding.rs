@@ -136,8 +136,11 @@ async fn sc1_agent_onboarding() {
         )
         .await
         .expect("list agents again");
-    let pi_entries: Vec<&WhoIs> = agents2.iter().filter(|a| a.name == "PiAlpha").collect();
-    assert_eq!(pi_entries.len(), 1, "no duplicate profile entries");
+    assert_eq!(
+        agents2.iter().filter(|a| a.name == "PiAlpha").count(),
+        1,
+        "no duplicate profile entries"
+    );
 
     let _ = std::fs::remove_dir_all(dir);
 }

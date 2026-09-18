@@ -111,7 +111,7 @@ async fn sc10_reservation_released_dispatches_job_on_bus_event() {
                         return Some(evt);
                     }
                 }
-                Some(SubscriptionEvent::Eose) => continue,
+                Some(SubscriptionEvent::Eose) => {}
                 Some(SubscriptionEvent::Closed(_)) | None => return None,
             }
         }
@@ -178,7 +178,7 @@ async fn sc10_reservation_released_dispatches_job_on_bus_event() {
     // --- OC-β claims (kind-43002, first-claimer wins) ---
     let claim = build_job_claim(&oc_keys, job_req.id, Timestamp::now()).expect("build claim");
     assert_eq!(claim.kind.as_u16(), 43002, "kind-43002 claim");
-    let events = vec![claim.clone()];
+    let events = vec![claim];
     assert_eq!(
         first_claimer(job_req.id, &events).as_deref(),
         Some(oc_keys.public_key().to_hex().as_str()),

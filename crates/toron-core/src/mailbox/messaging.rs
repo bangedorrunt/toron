@@ -42,8 +42,8 @@ use crate::bus::filter::ToronFilter;
 use crate::bus::scoping::is_metadata_hiding_kind;
 use crate::mailbox::identity::ListAgentsOptions;
 use crate::mailbox::unwrap::{
-    DualProjectionSink, OVERSEER_TAG, ProjectGitProjectionSink, ProjectionSink, SqliteProjectionSink,
-    UnwrappedMail, order_by_rumor_time, tag_value,
+    DualProjectionSink, OVERSEER_TAG, ProjectGitProjectionSink, ProjectionSink,
+    SqliteProjectionSink, UnwrappedMail, order_by_rumor_time, tag_value,
 };
 use crate::nostr::gift_wrap::{self, UnwrappedGift};
 use crate::nostr::identity as nident;
@@ -853,16 +853,14 @@ impl Mailbox {
             return;
         }
         let ids: Vec<String> = ordered.iter().map(|(m, _)| m.rumor_id.to_hex()).collect();
-        let mut projected: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
+        let mut projected: std::collections::HashSet<String> = std::collections::HashSet::new();
         // Chunked `IN` — a full-history fetch can carry tens of thousands of
         // rumor ids and SQLite caps bound variables per statement.
         for chunk in ids.chunks(500) {
             let placeholders = std::iter::repeat_n("?", chunk.len())
                 .collect::<Vec<_>>()
                 .join(", ");
-            let sql =
-                format!("SELECT event_id FROM messages WHERE event_id IN ({placeholders})");
+            let sql = format!("SELECT event_id FROM messages WHERE event_id IN ({placeholders})");
             let mut q = sqlx::query(&sql);
             for id in chunk {
                 q = q.bind(id);

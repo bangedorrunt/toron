@@ -36,9 +36,9 @@ async fn fixture(
 ) -> anyhow::Result<MailboxFixture> {
     let dir = std::env::temp_dir().join(format!("toron-sc7-{tag}-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir)?;
-    let mailbox = Mailbox::new(Arc::new(bus.clone()), dir.clone(), None)
+    let mailbox = Mailbox::new(Arc::new(bus), dir.clone(), None)
         .with_agent_passphrase("toron-dev")
-        .with_index_pool(pool.clone());
+        .with_index_pool(pool);
     Ok(MailboxFixture {
         mailbox,
         data_dir: dir,

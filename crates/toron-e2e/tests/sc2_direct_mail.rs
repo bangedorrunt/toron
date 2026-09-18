@@ -101,7 +101,7 @@ async fn sc2_direct_mail_thread_and_ack() {
         loop {
             match sub.next().await {
                 Some(SubscriptionEvent::Event(evt)) => return Some(evt),
-                Some(SubscriptionEvent::Eose) => continue,
+                Some(SubscriptionEvent::Eose) => {}
                 Some(SubscriptionEvent::Closed(_)) | None => return None,
             }
         }

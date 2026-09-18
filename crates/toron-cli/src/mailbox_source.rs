@@ -23,7 +23,7 @@ use std::sync::Arc;
 use anyhow::Context;
 use rmcp::ClientServiceExt;
 use rmcp::model::{
-    CallToolRequestParams, ClientCapabilities, ClientInfo, Implementation, ProtocolVersion,
+    CallToolRequestParams, ClientCapabilities, ClientConfig, Implementation, ProtocolVersion,
     ReadResourceRequestParams, ResourceContents,
 };
 use rmcp::service::{ClientLifecycleMode, RoleClient, RunningService};
@@ -58,7 +58,7 @@ fn tool_call_timeout() -> std::time::Duration {
 /// returns the parsed JSON of the first text resource content block.
 #[derive(Clone)]
 pub struct DaemonClient {
-    client: Arc<RunningService<RoleClient, ClientInfo>>,
+    client: Arc<RunningService<RoleClient, ClientConfig>>,
 }
 
 impl DaemonClient {
@@ -75,7 +75,7 @@ impl DaemonClient {
         let transport = StreamableHttpClientTransport::from_config(
             StreamableHttpClientTransportConfig::with_uri(endpoint),
         );
-        let client_info = ClientInfo::new(
+        let client_info = ClientConfig::new(
             ClientCapabilities::default(),
             Implementation::from_build_env(),
         );

@@ -22,7 +22,7 @@ use std::sync::Arc;
 
 use rmcp::ClientServiceExt;
 use rmcp::model::{
-    CallToolRequestParams, ClientCapabilities, ClientInfo, Implementation, ProtocolVersion,
+    CallToolRequestParams, ClientCapabilities, ClientConfig, Implementation, ProtocolVersion,
 };
 use rmcp::transport::streamable_http_client::{
     StreamableHttpClientTransport, StreamableHttpClientTransportConfig,
@@ -94,7 +94,7 @@ impl LiveDaemon {
         let transport = StreamableHttpClientTransport::from_config(
             StreamableHttpClientTransportConfig::with_uri(format!("http://{addr}/mcp")),
         );
-        let client_info = ClientInfo::new(
+        let client_info = ClientConfig::new(
             ClientCapabilities::default(),
             Implementation::from_build_env(),
         );

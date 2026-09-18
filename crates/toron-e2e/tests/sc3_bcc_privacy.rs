@@ -50,7 +50,7 @@ async fn sc3_bcc_privacy_matrix() {
     // --- visible rumor: to + cc only, NO bcc (ADR G3) ---
     let visible = gift_wrap::build_rumor(
         sender.public_key(),
-        Timestamp::from(1700000000),
+        Timestamp::from(1_700_000_000),
         14.into(),
         vec![
             Tag::parse(["p", &npub(&to), "", "to"]).unwrap(),
@@ -62,7 +62,7 @@ async fn sc3_bcc_privacy_matrix() {
     // --- bcc-variant rumors: to + cc + ONE bcc (each omits the other) ---
     let variant1 = gift_wrap::build_rumor(
         sender.public_key(),
-        Timestamp::from(1700000000),
+        Timestamp::from(1_700_000_000),
         14.into(),
         vec![
             Tag::parse(["p", &npub(&to), "", "to"]).unwrap(),
@@ -73,7 +73,7 @@ async fn sc3_bcc_privacy_matrix() {
     );
     let variant2 = gift_wrap::build_rumor(
         sender.public_key(),
-        Timestamp::from(1700000000),
+        Timestamp::from(1_700_000_000),
         14.into(),
         vec![
             Tag::parse(["p", &npub(&to), "", "to"]).unwrap(),
@@ -85,7 +85,7 @@ async fn sc3_bcc_privacy_matrix() {
 
     // --- wrap one copy per recipient ---
     let wrap_to = gift_wrap::gift_wrap(&sender, &to, visible.clone()).unwrap();
-    let wrap_cc = gift_wrap::gift_wrap(&sender, &cc, visible.clone()).unwrap();
+    let wrap_cc = gift_wrap::gift_wrap(&sender, &cc, visible).unwrap();
     let wrap_b1 = gift_wrap::gift_wrap(&sender, &bcc1, variant1).unwrap();
     let wrap_b2 = gift_wrap::gift_wrap(&sender, &bcc2, variant2).unwrap();
 
