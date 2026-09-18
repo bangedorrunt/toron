@@ -193,15 +193,18 @@ async fn approval_suspends_and_resumes() {
 
     // The parked run resumes and completes.
     let output = handle.result().await.expect("run completes after approval");
-    // ADR-0024 graph canonical: decision is under the node name (gate) and
-    // historically also under "decision". Accept either for compat.
-    let outcome = output["decision"]["outcome"]
-        .as_str()
-        .or_else(|| output["gate"]["outcome"].as_str())
-        .unwrap_or("");
+    // ADR-0024 Spec 2 (one decision spelling): the decision is published under
+    // the node name AND under `decision`, so a consumer reading either key sees
+    // the same value. Accepting only one of them is how a graph-routed run
+    // served a silent Null for `decision`.
     assert_eq!(
-        outcome, "approved",
-        "decision recorded after resume: {output}"
+        output["decision"]["outcome"].as_str(),
+        Some("approved"),
+        "decision published under `decision` after resume: {output}"
+    );
+    assert_eq!(
+        output["decision"], output["gate"],
+        "the `decision` alias and the node-name output must agree: {output}"
     );
 }
 

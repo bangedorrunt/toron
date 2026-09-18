@@ -44,6 +44,7 @@ Control-flow actions (`branch`, `retry`, `foreach`, `parallel`, `call_workflow`)
 ## Authoring contracts (shipped)
 
 - One guard evaluator for linear, graph, branch, and nested steps: false guard = explicit skip, syntax/type/ref errors fail loud, never else-branch or placeholder.
+- One decision spelling: a completed `request_approval` node publishes its decision under the node name **and** under `decision`, on the linear and graph paths alike — a consumer reading either key sees the same value. A guard skip is never a decision and never mints the alias.
 - Strict template rendering: unresolved refs fail naming workflow, node, field, and reference path.
 - Loud composites: non-list `foreach` input fails (never `[]`); invalid `parallel` count fails (never `1`, cap 32); `call_workflow` binds defaults through the same function as `invoke`.
 - One retry coordinator over the frozen `FailureKind` set; nested retry wrappers flatten. `rate_limit`/`timeout` retry only when the effect is known safe or the provider honors the stable key, otherwise reconcile.
