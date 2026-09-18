@@ -488,6 +488,37 @@ pub async fn run_agent(mailbox: &Mailbox, cmd: &AgentCommand, dry_run: bool) -> 
                 "next": "export AGENT_NAME=<pin> (or pass --as on every call); reserve before edit — the strict guard blocks unattributed or unreserved commits",
             }))
         }
+        AgentCommand::Prune(args) => {
+            // bd-4a0u: `-n/--dry-run` is a GLOBAL flag promising "show changes
+            // without running" — so preview the rows doctor names and absorb
+            // nothing (the mutation could not be retried away otherwise).
+            if dry_run {
+                let leftovers = mailbox.folded_slug_leftovers_for(&args.project).await?;
+                print_json(&json!({
+                    "project": args.project,
+                    "as": args.agent,
+                    "would_absorb": leftovers,
+                    "count": leftovers.len(),
+                    "dry_run": true,
+                    "next": "re-run without --dry-run to absorb the listed rows; nothing was written",
+                }))?;
+                return Ok(());
+            }
+            let report = mailbox.prune_folded_slugs(&args.project).await?;
+            print_json(&json!({
+                "project": args.project,
+                "as": args.agent,
+                "removed": report.removed,
+                "kept": report.kept,
+                "removed_count": report.removed.len(),
+                "kept_count": report.kept.len(),
+                "next": if report.kept.is_empty() {
+                    "no folded-slug leftovers remain — doctor's legacy_slug_identities is clean"
+                } else {
+                    "kept rows have NO registered canonical pin; register the pin, then re-run `toron agent prune`"
+                },
+            }))
+        }
     }
 }
 
@@ -567,6 +598,18 @@ pub async fn run_agent_daemon(
                 "pane_id": daemon_stamped,
                 "next": "export AGENT_NAME=<pin> (or pass --as on every call); reserve before edit — the strict guard blocks unattributed or unreserved commits",
             }))
+        }
+        AgentCommand::Prune(_) => {
+            // bd-4a0u: no daemon MCP tool exists (ADR-0020 wave 1 freeze:
+            // CLI-only nouns stay CLI-only), so the sweep runs against the
+            // shared durable XDG root the daemon itself uses — the same
+            // store, never a second one. Roster state is sqlite, so the
+            // cross-process read is exact.
+            eprintln!(
+                "toron agent prune: no daemon tool; sweeping the shared durable root directly"
+            );
+            let mb = toron_mcp::demo_mailbox().await?;
+            run_agent(&mb, cmd, dry_run).await
         }
     }
 }

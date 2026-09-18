@@ -176,6 +176,9 @@ impl ToJson for WhoIs {
             "task_description": self.task_description,
             "last_active_ts_us": self.last_active_ts_us,
             "stale": self.stale,
+            "pane_id": self.pane_id,
+            "workspace_id": self.workspace_id,
+            "tab_id": self.tab_id,
         })
     }
 }

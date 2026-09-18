@@ -877,6 +877,22 @@ pub enum AgentCommand {
     /// Register (upsert) an identity, then optionally reserve paths — the CLI
     /// onboarding path when `reserve acquire` fails on unknown identity.
     Bootstrap(AgentBootstrapArgs),
+    /// bd-4a0u: purge the folded-slug leftovers `doctor` names — absorb the
+    /// standalone `agents` row for every recorded fold alias whose canonical
+    /// pin is registered (the second inbox stops existing). Idempotent; a row
+    /// whose canonical target is unregistered is KEPT and reported.
+    Prune(AgentPruneArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct AgentPruneArgs {
+    /// Project slug.
+    #[arg(long, required = true)]
+    pub project: String,
+    /// Acting operator/pin, recorded in the report. No signing: this is a
+    /// local roster cleanup (sqlite), never a signed event.
+    #[arg(long = "as")]
+    pub agent: Option<String>,
 }
 
 #[derive(Debug, Args)]

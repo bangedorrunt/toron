@@ -380,6 +380,9 @@ fn whois_json(w: &toron_core::mailbox::WhoIs) -> serde_json::Value {
         "model": w.model,
         "task_description": w.task_description,
         "last_active_ts_us": w.last_active_ts_us,
+        "pane_id": w.pane_id,
+        "workspace_id": w.workspace_id,
+        "tab_id": w.tab_id,
     })
 }
 

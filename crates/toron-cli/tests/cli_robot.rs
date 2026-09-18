@@ -1849,7 +1849,7 @@ fn acquire_lease_via_daemon(port: u16, project: &str, agent: &str, path: &str) {
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     rt.block_on(async {
         use rmcp::ClientServiceExt;
-        use rmcp::model::{ClientCapabilities, ClientInfo, Implementation, ProtocolVersion};
+        use rmcp::model::{ClientCapabilities, ClientConfig, Implementation, ProtocolVersion};
         use rmcp::service::ClientLifecycleMode;
         use rmcp::transport::streamable_http_client::{
             StreamableHttpClientTransport, StreamableHttpClientTransportConfig,
@@ -1859,7 +1859,7 @@ fn acquire_lease_via_daemon(port: u16, project: &str, agent: &str, path: &str) {
         let transport = StreamableHttpClientTransport::from_config(
             StreamableHttpClientTransportConfig::with_uri(format!("http://127.0.0.1:{port}/mcp")),
         );
-        let client_info = ClientInfo::new(
+        let client_info = ClientConfig::new(
             ClientCapabilities::default(),
             Implementation::from_build_env(),
         );
@@ -2243,9 +2243,9 @@ fn acquire_lease_via_daemon_returning_id(
 
 async fn daemon_mcp_client(
     port: u16,
-) -> rmcp::service::RunningService<rmcp::service::RoleClient, rmcp::model::ClientInfo> {
+) -> rmcp::service::RunningService<rmcp::service::RoleClient, rmcp::model::ClientConfig> {
     use rmcp::ClientServiceExt;
-    use rmcp::model::{ClientCapabilities, ClientInfo, Implementation, ProtocolVersion};
+    use rmcp::model::{ClientCapabilities, ClientConfig, Implementation, ProtocolVersion};
     use rmcp::service::ClientLifecycleMode;
     use rmcp::transport::streamable_http_client::{
         StreamableHttpClientTransport, StreamableHttpClientTransportConfig,
@@ -2254,7 +2254,7 @@ async fn daemon_mcp_client(
     let transport = StreamableHttpClientTransport::from_config(
         StreamableHttpClientTransportConfig::with_uri(format!("http://127.0.0.1:{port}/mcp")),
     );
-    let client_info = ClientInfo::new(
+    let client_info = ClientConfig::new(
         ClientCapabilities::default(),
         Implementation::from_build_env(),
     );
@@ -2755,4 +2755,78 @@ fn guard_commit_msg_blocks_foreign_bead_tokens() {
 
     let _ = std::fs::remove_dir_all(&data_dir);
     let _ = std::fs::remove_dir_all(&repo);
+}
+
+/// bd-4a0u: `toron agent prune` absorbs the folded-slug leftovers `doctor`
+/// names, stays preview-only under the global `--dry-run`, and is idempotent
+/// on a second sweep. Exercises the real binary against the shared durable
+/// root, with the leftover seeded in-process (the same store the subprocess
+/// reads).
+#[test]
+fn agent_prune_absorbs_folded_slug_leftovers_through_binary() {
+    let _ = shared_data_dir();
+    let project = format!("prune-{}", std::process::id());
+    let slug = "flywheel-prune-cli-oc1";
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    rt.block_on(async {
+        let mailbox = toron_mcp::demo_mailbox().await.expect("demo mailbox");
+        // No `ensure_project`: the demo mailbox has no operator key to sign a
+        // project manifest, and registration + folds only need the index pool.
+        mailbox
+            .register_agent(&project, &AgentProfile::new(slug))
+            .await
+            .expect("legacy slug");
+        mailbox
+            .register_agent(&project, &AgentProfile::new("CliPrunePin"))
+            .await
+            .expect("canonical pin");
+        // Record the fold WITHOUT absorbing — the legacy leftover shape.
+        mailbox
+            .fold_agent_name_alias_no_absorb(&project, slug, "CliPrunePin")
+            .await;
+    });
+
+    // Global --dry-run previews; nothing is absorbed.
+    let preview = run(&[
+        "agent",
+        "prune",
+        "--project",
+        &project,
+        "--json",
+        "--dry-run",
+    ]);
+    assert!(
+        preview.status.success(),
+        "preview must exit 0, stderr: {}",
+        String::from_utf8_lossy(&preview.stderr)
+    );
+    let preview_json: Value = serde_json::from_slice(&preview.stdout).expect("preview JSON");
+    assert_eq!(
+        preview_json["count"], 1,
+        "one leftover previewed: {preview_json}"
+    );
+
+    let pruned = run(&["agent", "prune", "--project", &project, "--json"]);
+    assert!(
+        pruned.status.success(),
+        "prune must exit 0, stderr: {}",
+        String::from_utf8_lossy(&pruned.stderr)
+    );
+    let pruned_json: Value = serde_json::from_slice(&pruned.stdout).expect("prune JSON");
+    assert_eq!(pruned_json["removed_count"], 1, "absorbed: {pruned_json}");
+    assert_eq!(
+        pruned_json["kept_count"], 0,
+        "nothing stranded: {pruned_json}"
+    );
+    assert_eq!(
+        pruned_json["removed"][0]["slug"], slug,
+        "report names the absorbed slug"
+    );
+
+    // Idempotent: a second sweep finds nothing left to do.
+    let again = run(&["agent", "prune", "--project", &project, "--json"]);
+    assert!(again.status.success(), "re-prune must exit 0");
+    let again_json: Value = serde_json::from_slice(&again.stdout).expect("re-prune JSON");
+    assert_eq!(again_json["removed_count"], 0, "idempotent: {again_json}");
+    assert_eq!(again_json["kept_count"], 0, "clean: {again_json}");
 }
