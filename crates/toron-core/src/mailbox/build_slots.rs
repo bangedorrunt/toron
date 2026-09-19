@@ -27,8 +27,13 @@ pub struct AcquireBuildSlotResult {
 
 impl Mailbox {
     /// `acquire_build_slot`: acquire an advisory slot lease, optionally
-    /// exclusive. Exclusive serializes (conflicts with any holder); shared
-    /// conflicts only with an exclusive holder. Own lease never conflicts.
+    /// exclusive. G3 decide-first: the projection decides atomically via
+    /// `try_acquire` BEFORE anything is published, so a loser never leaves
+    /// an orphan lease event on the bus. A publish failure after a win is
+    /// compensated (projection released) — never a phantom grant, never a
+    /// phantom event. Exclusive serializes (conflicts with any holder);
+    /// shared conflicts only with an exclusive holder. Own lease never
+    /// conflicts.
     pub async fn acquire_build_slot(
         &self,
         project_slug: &str,
@@ -41,19 +46,8 @@ impl Mailbox {
         let npub = agent_keys.public_key().to_hex();
 
         let pool = self.index_pool_required()?;
-        let active = slots::active_slots(pool, project_slug).await?;
-        let conflicts = slots::conflict_for(&active, slot, &npub, exclusive);
-        if !conflicts.is_empty() {
-            return Ok(AcquireBuildSlotResult {
-                granted: Vec::new(),
-                conflicts: vec![slots::SlotConflict {
-                    slot: slot.to_string(),
-                    holders: conflicts,
-                }],
-            });
-        }
 
-        // Publish the kind-30032 lease (NIP-40 expiration + dual-emit).
+        // Build the lease event first (pure — nothing published yet).
         let d = format!("{project_slug}:{slot}");
         let created = Timestamp::now();
         let ttl_secs = ttl_secs.unwrap_or(crate::bus::DEFAULT_ENVELOPE_TTL_SECS);
@@ -70,13 +64,9 @@ impl Mailbox {
             tags,
             created,
         )?;
-        let ok = self.bus.publish(event.clone()).await?;
-        if !ok.stored {
-            anyhow::bail!("build-slot event rejected by bus");
-        }
 
-        // Mirror into the projection.
-        slots::insert_slot(
+        // Decide atomically: win → granted; lose → holder list, no publish.
+        let decision = slots::try_acquire(
             pool,
             &slots::SlotLease {
                 project_slug: project_slug.to_string(),
@@ -89,6 +79,31 @@ impl Mailbox {
             },
         )
         .await?;
+        if !decision.conflicts.is_empty() {
+            return Ok(AcquireBuildSlotResult {
+                granted: Vec::new(),
+                conflicts: vec![slots::SlotConflict {
+                    slot: slot.to_string(),
+                    holders: decision.conflicts[0].holders.clone(),
+                }],
+            });
+        }
+
+        // Publish the kind-30032 lease (NIP-40 expiration + dual-emit).
+        // A publish failure compensates the projection win (release by own
+        // key — only our just-written row matches) so no phantom grant
+        // survives.
+        let ok = self.bus.publish(event.clone()).await?;
+        if !ok.stored {
+            let _ = slots::release_slot(
+                pool,
+                project_slug,
+                slot,
+                &agent_keys.public_key().to_hex(),
+            )
+            .await;
+            anyhow::bail!("build-slot event rejected by bus");
+        }
 
         // bd-2dox: a build-slot acquire extends the holder's active file
         // reservations by the claimed liveness window (capped at 1h). A 4+

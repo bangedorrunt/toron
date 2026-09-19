@@ -57,7 +57,7 @@ impl RetryPolicy {
     }
 
     /// True while another try is allowed after `attempt` failures.
-    pub fn should_retry(&self, failed_attempts: u32) -> bool {
+    pub const fn should_retry(&self, failed_attempts: u32) -> bool {
         failed_attempts < self.max_attempts
     }
 }
@@ -115,7 +115,7 @@ fn apply_jitter(delay: Duration, attempt: u32) -> Duration {
     x ^= x << 25;
     x ^= x >> 27;
     let unit = (x >> 11) as f64 / (u64::MAX >> 11) as f64;
-    delay.mul_f64(0.75 + 0.5 * unit)
+    delay.mul_f64(0.5f64.mul_add(unit, 0.75))
 }
 
 #[cfg(test)]

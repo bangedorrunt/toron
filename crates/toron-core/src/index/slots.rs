@@ -74,6 +74,72 @@ pub struct SlotLease {
     pub expires_ts_us: Option<i64>,
 }
 
+/// Atomic acquire (G3): decision + win in ONE statement — no check-then-act
+/// window between readers. The row is written iff no conflicting active
+/// lease exists (the `conflict_for` rule evaluated in SQL: an exclusive
+/// request is blocked by any other holder, a shared one only by an
+/// exclusive holder; own leases never block). Otherwise nothing is written
+/// and the existing holder is reported. The single-writer database makes
+/// this statement the linearization point: concurrent acquirers converge on
+/// exactly one winner, losers get the holder list, never a phantom grant.
+pub async fn try_acquire(
+    pool: &SqlitePool,
+    lease: &SlotLease,
+) -> anyhow::Result<AcquireSlotResult> {
+    let now = now_us();
+    let touched = sqlx::query(
+        "INSERT INTO build_slots \
+         (project_slug, slot, agent_name, agent_pubkey, exclusive, status, \
+          event_id, expires_ts_us, created_ts_us) \
+         SELECT ?1, ?2, ?3, ?4, ?5, 'active', ?6, ?7, ?8 \
+         WHERE NOT EXISTS ( \
+           SELECT 1 FROM build_slots \
+           WHERE project_slug = ?1 AND slot = ?2 AND status = 'active' \
+             AND (expires_ts_us IS NULL OR expires_ts_us > ?9) \
+             AND agent_pubkey <> ?4 \
+             AND (?5 OR exclusive) \
+         ) \
+         ON CONFLICT (project_slug, slot) DO UPDATE SET \
+           agent_name = excluded.agent_name, \
+           agent_pubkey = excluded.agent_pubkey, \
+           exclusive = excluded.exclusive, \
+           status = 'active', \
+           event_id = excluded.event_id, \
+           expires_ts_us = excluded.expires_ts_us",
+    )
+    .bind(&lease.project_slug)
+    .bind(&lease.slot)
+    .bind(&lease.agent_name)
+    .bind(&lease.agent_pubkey)
+    .bind(lease.exclusive)
+    .bind(&lease.event_id)
+    .bind(lease.expires_ts_us)
+    .bind(now)
+    .bind(now)
+    .execute(pool)
+    .await?;
+    if touched.rows_affected() > 0 {
+        return Ok(AcquireSlotResult {
+            granted: vec![GrantedSlot {
+                slot: lease.slot.clone(),
+                exclusive: lease.exclusive,
+                expires_ts_us: lease.expires_ts_us,
+            }],
+            conflicts: Vec::new(),
+        });
+    }
+    // Lost the race (or blocked): name the winner, write nothing.
+    let active = active_slots(pool, &lease.project_slug).await?;
+    let holders = conflict_for(&active, &lease.slot, &lease.agent_pubkey, lease.exclusive);
+    Ok(AcquireSlotResult {
+        granted: Vec::new(),
+        conflicts: vec![SlotConflict {
+            slot: lease.slot.clone(),
+            holders,
+        }],
+    })
+}
+
 /// Insert a slot lease (idempotent on (project_slug, slot)).
 pub async fn insert_slot(pool: &SqlitePool, lease: &SlotLease) -> anyhow::Result<()> {
     sqlx::query(
@@ -245,6 +311,66 @@ mod tests {
             event_id: format!("e-{slot}-{agent}"),
             expires_ts_us: None,
         }
+    }
+
+    #[tokio::test]
+    async fn try_acquire_concurrent_grants_exactly_one() {
+        // G3: eight concurrent exclusive acquirers converge on ONE winner;
+        // every loser names the holder (never a phantom grant).
+        let (p, dir) = pool("race").await;
+        let mut handles = Vec::new();
+        for i in 0..8u32 {
+            let pool = p.clone();
+            handles.push(tokio::spawn(async move {
+                let npub = format!("racer-{i:02}");
+                try_acquire(&pool, &lease("ci", &format!("R{i}"), &npub, true)).await
+            }));
+        }
+        let mut winners = 0u32;
+        let mut losers = 0u32;
+        for h in handles {
+            let r = h.await.expect("task").expect("acquire");
+            match (r.granted.len(), r.conflicts.len()) {
+                (1, 0) => winners += 1,
+                (0, 1) => {
+                    losers += 1;
+                    assert!(
+                        !r.conflicts[0].holders.is_empty(),
+                        "loser names the holder"
+                    );
+                }
+                other => panic!("grant XOR conflict, got {other:?}"),
+            }
+        }
+        assert_eq!((winners, losers), (1, 7), "exactly one winner");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn try_acquire_own_reacquire_and_shared_coexist() {
+        // G3: own re-acquire always wins; shared vs shared never conflicts
+        // (overwrite semantics preserved from insert_slot).
+        let (p, dir) = pool("reacq").await;
+        let r1 = try_acquire(&p, &lease("ci", "A", "aaa", true))
+            .await
+            .unwrap();
+        assert_eq!(r1.granted.len(), 1);
+        let r2 = try_acquire(&p, &lease("ci", "A", "aaa", true))
+            .await
+            .unwrap();
+        assert_eq!(r2.granted.len(), 1, "own re-acquire wins");
+        assert!(r2.conflicts.is_empty());
+
+        let s1 = try_acquire(&p, &lease("sh", "A", "aaa", false))
+            .await
+            .unwrap();
+        assert_eq!(s1.granted.len(), 1);
+        let s2 = try_acquire(&p, &lease("sh", "B", "bbb", false))
+            .await
+            .unwrap();
+        assert_eq!(s2.granted.len(), 1, "shared coexists");
+        assert!(s2.conflicts.is_empty());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
