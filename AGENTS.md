@@ -61,7 +61,8 @@ Child maps: [toron-core](crates/toron-core/AGENTS.md) ·
 - Edition 2024. `#![forbid(unsafe_code)]` on every crate root.
 - New/changed ADR-constrained files: `// governed-by: ADR-XXXX` at top.
 - Deps one-way: **flywheel → toron-workflow → toron-core**. Never reverse.
-- Frozen: 40 tool names (38 AM-Rust parity + 2 toron additive: `release_file_reservations_by_reason` bd-h3oj, `list_file_reservations` bd-locks-list-daemon-xetz), 25 resources, kind registry. No new kinds/tools without an ADR. 
+- Frozen: 40 tool names (38 AM-Rust parity + 2 toron additive: `release_file_reservations_by_reason` bd-h3oj, `list_file_reservations` bd-locks-list-daemon-xetz), 25 resources, kind registry. No new kinds/tools without an ADR.
+- Additive discipline (ADR-0033, proposed, bd-ncpt): additive tools/kinds allowed with ADR + catalog regen + tests + versioning; renumber and parity drift stay forbidden. 
 - ADR-0020 adds **CLI** nouns `channel` `job` `react` `presence` `watch`. Channel posts emit kind **9** (not 42). ADR-0023: channel create/close emit **39000**, join/leave emit **39002**; 40/41/42 ingest only.
 - Lease board + release-on-bead-close are CLI-reachable: `toron reserve list --project <p> [--holder <pin> --path <glob>]` and `toron reserve release-by-reason <bead> --project <p> --as <operator>`. No new MCP tool — both wrap existing operators (`list_file_reservations` / `release_file_reservations_by_reason`); `release-by-reason` is operator-signed and fails loud without an operator key.
 - Folded-slug cleanup is CLI-reachable: `toron agent prune --project <p> [--as <pin>]` (preview with the global `-n/--dry-run`) absorbs the `legacy_slug_identities` leftovers `doctor` names — the standalone `agents` row goes away once the canonical pin is registered; a row whose target is unregistered is KEPT and reported (bd-4a0u). No new MCP tool: CLI-only noun (daemon arm sweeps the shared durable root directly, like `ack-sla`).
