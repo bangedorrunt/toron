@@ -174,6 +174,27 @@ pub struct GitArchive {
     pending: Mutex<Vec<(PathBuf, Vec<u8>)>>,
 }
 
+/// Fail-fast validation for a configured git binary (G2). A bare name
+/// (`git`) resolves via PATH and is left to spawn; anything path-shaped
+/// (contains a `/`) must already be an existing file, else the commit would
+/// hang-or-crash far from the misconfiguration.
+fn validate_git_binary(bin: &Path) -> anyhow::Result<()> {
+    if bin.components().count() > 1 {
+        if !bin.is_file() {
+            anyhow::bail!("git binary {} does not exist", bin.display());
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(bin)?.permissions().mode();
+            if mode & 0o111 == 0 {
+                anyhow::bail!("git binary {} is not executable", bin.display());
+            }
+        }
+    }
+    Ok(())
+}
+
 impl GitArchive {
     /// Open an existing archive or initialize a new repository at root.
     pub fn open_or_init(root: &Path) -> anyhow::Result<Self> {
@@ -281,26 +302,69 @@ impl GitArchive {
     }
 
     /// Commit via the configured git binary (subprocess path; honored when
-    /// `TORON_GIT_BINARY` is set). libgit2 remains the default.
+    /// `TORON_GIT_BINARY` is set). libgit2 remains the default. Bounded by
+    /// [`BINARY_COMMIT_TIMEOUT`] (G2): a hung binary is killed, never waited
+    /// on forever.
     pub fn commit_via_binary(&self, message: &str) -> anyhow::Result<()> {
+        self.commit_via_binary_with_timeout(message, Self::BINARY_COMMIT_TIMEOUT)
+    }
+
+    /// Default bound for the binary commit path (G2).
+    pub const BINARY_COMMIT_TIMEOUT: std::time::Duration =
+        std::time::Duration::from_secs(30);
+
+    /// Bounded binary commit: validates the binary, spawns, polls to the
+    /// deadline, kills past it. Timeout inside, kill outside — the edge
+    /// owns resilience, never the caller.
+    pub fn commit_via_binary_with_timeout(
+        &self,
+        message: &str,
+        timeout: std::time::Duration,
+    ) -> anyhow::Result<()> {
         let bin = self
             .git_binary
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("no git binary configured"))?;
-        let out = std::process::Command::new(bin)
+        validate_git_binary(bin)?;
+        let mut child = std::process::Command::new(bin)
             .arg("-C")
             .arg(&self.project_root)
             .arg("commit")
             .arg("-m")
             .arg(message)
-            .output()?;
-        if !out.status.success() {
-            anyhow::bail!(
-                "git commit failed: {}",
-                String::from_utf8_lossy(&out.stderr)
-            );
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| anyhow::anyhow!("git binary {} failed to spawn: {e}", bin.display()))?;
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    if !status.success() {
+                        let mut err = String::new();
+                        if let Some(mut stderr) = child.stderr.take() {
+                            use std::io::Read;
+                            let _ = stderr.read_to_string(&mut err);
+                        }
+                        anyhow::bail!("git commit failed: {}", err.trim());
+                    }
+                    return Ok(());
+                }
+                Ok(None) => {
+                    if std::time::Instant::now() >= deadline {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        anyhow::bail!(
+                            "git binary {} timed out after {}s (child killed)",
+                            bin.display(),
+                            timeout.as_secs(),
+                        );
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(e) => anyhow::bail!("git commit wait failed: {e}"),
+            }
         }
-        Ok(())
     }
 
     /// Total commit count (HEAD depth) — observable for coalescer tests.
@@ -340,6 +404,59 @@ mod tests {
 
     fn temp_root(tag: &str) -> PathBuf {
         std::env::temp_dir().join(format!("toron-archive-{tag}-{}", uuid::Uuid::new_v4()))
+    }
+
+    #[test]
+    fn binary_commit_missing_bin_fails_fast() {
+        // G2: a configured-but-absent binary is a config error, surfaced
+        // fast with the path named — never a hung commit.
+        let root = temp_root("nobin");
+        let archive = GitArchive::open_or_init_with_binary(
+            &root,
+            Some(PathBuf::from("/nonexistent/toron-git-shim")),
+        )
+        .expect("init");
+        let err = archive
+            .commit_via_binary("msg")
+            .expect_err("missing binary must fail");
+        assert!(
+            err.to_string().contains("/nonexistent/toron-git-shim"),
+            "names the binary: {err:#}"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn binary_commit_hang_is_bounded() {
+        // G2: a hung git binary is killed at the deadline; the error names
+        // the timeout. Fake binary that sleeps past the 1s test bound.
+        let dir = temp_root("hangbin");
+        std::fs::create_dir_all(&dir).unwrap();
+        let shim = dir.join("git-hang");
+        std::fs::write(&shim, b"#!/bin/sh\nsleep 30\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+        }
+        let root = temp_root("hangroot");
+        let archive =
+            GitArchive::open_or_init_with_binary(&root, Some(shim)).expect("init");
+        let start = std::time::Instant::now();
+        let err = archive
+            .commit_via_binary_with_timeout("msg", std::time::Duration::from_secs(1))
+            .expect_err("hang must time out");
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(10),
+            "commit returns inside the bound"
+        );
+        assert!(
+            err.to_string().contains("timed out"),
+            "names the timeout: {err:#}"
+        );
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]

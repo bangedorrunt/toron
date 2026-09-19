@@ -61,6 +61,12 @@ impl FromStr for MailErrorCode {
     }
 }
 
+/// Typed mailbox edge (ADR-0034 G1): new fallible `MailSurface` methods
+/// return this instead of `anyhow::Result`. Existing `anyhow` sites migrate
+/// only when touched — no flag-day signature churn. Bridge with
+/// [`MailSurfaceResult::map_mail_error`].
+pub type MailboxResult<T> = Result<T, MailError>;
+
 /// Mail error: machine code + human message. Classify on `code`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MailError {
@@ -187,6 +193,18 @@ mod tests {
             mail_error_from_anyhow(e).code,
             MailErrorCode::Other("boom".into())
         );
+    }
+
+    #[test]
+    fn mailbox_result_edge_round_trips() {
+        // G1: the typed edge carries codes end-to-end (anyhow bridge in,
+        // typed result out) without per-site signature churn.
+        let via_anyhow: anyhow::Result<u32> = Err(anyhow::anyhow!("agent X not found"));
+        let typed: MailboxResult<u32> = via_anyhow.map_mail_error();
+        let err = typed.expect_err("maps to typed error");
+        assert_eq!(err.code, MailErrorCode::NotFound);
+        let ok: MailboxResult<u32> = Ok(7);
+        assert_eq!(ok.unwrap(), 7);
     }
 
     #[test]
