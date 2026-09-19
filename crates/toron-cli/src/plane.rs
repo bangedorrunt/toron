@@ -525,7 +525,7 @@ async fn channel_purge(mailbox: &Mailbox, args: &ChannelPurgeArgs) -> anyhow::Re
         .await
         .map_err(|e| anyhow::anyhow!("purge failed: {e}"))?;
 
-    // Audit trail (operator-grade action): who, what, how many.
+    // Audit trail (operator-grade action): who, what, how many. Guarded row.
     let log_line = serde_json::json!({
         "ts": chrono::Utc::now().to_rfc3339(),
         "project": args.project,
@@ -535,14 +535,7 @@ async fn channel_purge(mailbox: &Mailbox, args: &ChannelPurgeArgs) -> anyhow::Re
         "removed_events": removed,
     });
     let log_path = mailbox.data_dir().join("channel_purge.log");
-    use std::io::Write as _;
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
-    {
-        let _ = writeln!(f, "{log_line}");
-    }
+    let _ = toron_core::jsonl::append_row(&log_path, &log_line);
 
     print_json(&serde_json::json!({
         "channel": args.id,
@@ -1362,7 +1355,8 @@ async fn presence_publish(mailbox: &Mailbox, args: &PresencePublishArgs) -> anyh
     let ev = build_presence_event(&keys, &payload, now)?;
     mailbox.bus().publish(ev).await?;
 
-    // Append to the CLI projection (last-wins by npub on read).
+    // Append to the CLI projection (last-wins by npub on read). Guarded:
+    // exactly one JSON row, never a corrupt line.
     let whois = mailbox
         .whois(&project, &as_name)
         .await
@@ -1375,15 +1369,7 @@ async fn presence_publish(mailbox: &Mailbox, args: &PresencePublishArgs) -> anyh
         "ts": payload.ts,
         "project": project,
     });
-    let mut s = line.to_string();
-    s.push('\n');
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(presence_file(mailbox))
-        .context("open presence projection")?;
-    use std::io::Write;
-    file.write_all(s.as_bytes())
+    toron_core::jsonl::append_row(&presence_file(mailbox), &line)
         .context("write presence projection")?;
     print_json(&serde_json::json!({
         "npub": keys.public_key().to_hex(),

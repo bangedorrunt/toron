@@ -752,19 +752,10 @@ pub fn append_git_fact_to_path(
         "pin".to_string(),
         serde_json::Value::String(pin.to_string()),
     );
-    let line = serde_json::Value::Object(obj).to_string();
-    // Best-effort: never bubble errors.
+    let line = serde_json::Value::Object(obj);
+    // Best-effort: never bubble errors. Guarded row (G7).
     let _ = (|| -> anyhow::Result<()> {
-        if let Some(parent) = journal_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        use std::io::Write;
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(journal_path)?;
-        writeln!(file, "{line}")?;
-        file.flush()?;
+        crate::jsonl::append_row(journal_path, &line)?;
         Ok(())
     })();
 }

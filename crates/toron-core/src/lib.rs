@@ -7,6 +7,7 @@ pub mod bus;
 pub mod config;
 pub mod dispatch_core;
 pub mod index;
+pub mod jsonl;
 pub mod keys;
 pub mod mailbox;
 pub mod nostr;
