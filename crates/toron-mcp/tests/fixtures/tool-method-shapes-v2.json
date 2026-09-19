@@ -280,7 +280,7 @@
       }
     },
     "ask_judgment": {
-      "description": "Ask flywheel judgment math (effect_key + pack_id + state in, typed answers + journaled JudgmentEffect out; idempotent replay on effect_key).",
+      "description": "Ask flywheel judgment math (effect_key + pack_id + state in, typed answers + journaled JudgmentEffect out; idempotent replay on effect_key). Offline transport is pure; system-one reaches a live model API.",
       "input_schema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "properties": {
@@ -762,11 +762,12 @@
       }
     },
     "fetch_inbox": {
-      "description": "Project the agent's inbox (rumor-time order, G7).",
+      "description": "Project the agent's inbox (rumor-time order, G7). unread_only and ack_overdue_only are accepted but no-ops (no read-state projection); use since_ts / thread_id to scope.",
       "input_schema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "properties": {
           "ack_overdue_only": {
+            "description": "Accepted but a no-op (schema only): ack-overdue is derived\nclient-side over ack_required + read state (see ack-sla), never by\nthis projection.",
             "type": [
               "boolean",
               "null"
@@ -817,6 +818,7 @@
             ]
           },
           "unread_only": {
+            "description": "Accepted but a no-op (schema only): the projection carries no read\nstate, so every fetch returns all matching rows. Scope with since_ts.",
             "type": [
               "boolean",
               "null"

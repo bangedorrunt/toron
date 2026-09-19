@@ -159,7 +159,7 @@ impl ToolServer {
     /// `fetch_inbox` (read-only): the agent's inbox projection (rumor-time).
     #[tool(
         name = "fetch_inbox",
-        description = "Project the agent's inbox (rumor-time order, G7).",
+        description = "Project the agent's inbox (rumor-time order, G7). unread_only and ack_overdue_only are accepted but no-ops (no read-state projection); use since_ts / thread_id to scope.",
         output_schema = rmcp::handler::server::tool::schema_for_output::<crate::responses::FetchInboxWrapper>(),
         annotations(title = "Fetch inbox", read_only_hint = true)
     )]
@@ -428,7 +428,12 @@ pub struct FetchInboxArgs {
     pub since_ts: Option<String>,
     pub limit: Option<i32>,
     pub include_bodies: Option<bool>,
+    /// Accepted but a no-op (schema only): the projection carries no read
+    /// state, so every fetch returns all matching rows. Scope with since_ts.
     pub unread_only: Option<bool>,
+    /// Accepted but a no-op (schema only): ack-overdue is derived
+    /// client-side over ack_required + read state (see ack-sla), never by
+    /// this projection.
     pub ack_overdue_only: Option<bool>,
     pub topic: Option<String>,
     pub mark_read: Option<bool>,

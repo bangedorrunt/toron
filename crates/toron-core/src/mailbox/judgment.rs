@@ -191,11 +191,13 @@ pub fn check_judgment_args(
 }
 
 fn stdout_tail(s: &str) -> String {
+    // Char-boundary safe: byte slicing can split a multibyte char (bd-7qcw).
     const N: usize = 300;
-    if s.len() <= N {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= N {
         return s.to_string();
     }
-    format!("…{}", &s[s.len() - N..])
+    format!("…{}", chars[chars.len() - N..].iter().collect::<String>())
 }
 
 fn now_micros() -> i64 {
@@ -346,6 +348,17 @@ mod tests {
                         "by_question": {}, "usage": "1+1"}
         })
         .to_string()
+    }
+
+    #[test]
+    fn test_stdout_tail_multibyte_safe_bd_7qcw() {
+        // 400 × U+00E9 (800 bytes): a byte slice at len-300 splits a char.
+        let s = "é".repeat(400);
+        let tail = stdout_tail(&s);
+        assert!(tail.starts_with('…'), "truncated marker");
+        assert_eq!(tail.chars().count(), 301, "300 chars + marker");
+        assert!(tail.ends_with('é'), "char intact");
+        assert_eq!(stdout_tail("short"), "short");
     }
 
     #[test]
