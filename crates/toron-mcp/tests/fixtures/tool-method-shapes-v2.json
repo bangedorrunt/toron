@@ -349,8 +349,7 @@
             "type": "string"
           },
           "pack_version": {
-            "format": "uint32",
-            "minimum": 0,
+            "format": "int64",
             "type": "integer"
           },
           "replayed": {
