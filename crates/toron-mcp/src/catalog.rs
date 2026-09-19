@@ -7,8 +7,8 @@
 //! Builds the machine-readable catalog of the 38 AM-Rust parity tools
 //! (name, group, description, input/output JSON schemas verbatim from the
 //! rmcp `#[tool]` definitions via the assembled [`ToolServer`] router) and
-//! the 25 resources. The `release_file_reservations_by_reason` additive
-//! (bd-h3oj) is excluded — the catalog contract is exactly 38.
+//! the 25 resources. Additive tools (ADR-0033) are excluded — the catalog
+//! contract is exactly the frozen 38.
 
 use serde_json::{Map, Value, json};
 use std::collections::HashSet;
@@ -18,15 +18,18 @@ use rmcp::model::Tool;
 use crate::resources::RESOURCES;
 use crate::tools::ToolServer;
 
-/// The single non-parity additive tool (bd-h3oj) — NOT part of the 38.
+/// The first non-parity additive tool (bd-h3oj) — NOT part of the 38.
+/// (Singular for history; the full list is [`ADDITIVE_TOOLS`].)
 pub const ADDITIVE_TOOL: &str = "release_file_reservations_by_reason";
 
-/// Every non-parity additive tool (bd-h3oj + bd-locks-list-daemon-xetz):
-/// live on the MCP surface, excluded from the frozen 38-parity catalog.
+/// Every non-parity additive tool (ADR-0033 discipline): live on the MCP
+/// surface, excluded from the frozen 38-parity catalog.
 pub const ADDITIVE_TOOLS: &[&str] = &[
     ADDITIVE_TOOL,
     // read-only lease board — the state the strict guard evaluates
     "list_file_reservations",
+    // judgment bridge — flywheel math out-of-process, journaled by effect_key
+    "ask_judgment",
 ];
 
 /// Expected parity tool count (frozen: toron ADR-0007 C3).
@@ -118,7 +121,7 @@ pub const TOOL_GROUPS: &[(&str, &[&str])] = &[
 ///
 /// Emits entries in `TOOL_GROUPS` order. Fails on drift: a parity name
 /// missing from the live surface, or any tool outside the frozen 38 + the
-/// single additive, is a catalog error (ADR-0007 C3).
+/// ADR-0033 additives, is a catalog error (ADR-0007 C3).
 pub fn tool_catalog() -> anyhow::Result<Vec<Value>> {
     let tools = ToolServer::tool_router().list_all();
     let mut seen: HashSet<&str> = HashSet::with_capacity(PARITY_TOOL_COUNT);

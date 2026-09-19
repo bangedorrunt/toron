@@ -52,6 +52,24 @@ pub struct OkOut {
     pub ok: bool,
 }
 
+/// `ask_judgment` (bd-ncpt): typed answers + journaled JudgmentEffect.
+/// Mirrors the `ToJson` shape in `tools/judgment.rs` (schemars + hand-mirror
+/// must agree — the shapes fixture pins both).
+#[derive(Debug, Clone, JsonSchema)]
+pub struct JudgmentOutcomeOut {
+    pub effect_key: String,
+    pub pack_id: String,
+    pub pack_version: u32,
+    pub model_id: String,
+    pub confidence: f64,
+    pub usage: String,
+    pub fallback_flag: bool,
+    pub escalated: bool,
+    pub note: String,
+    pub answers: serde_json::Value,
+    pub replayed: bool,
+}
+
 /// `cleanup_pane_identities`: bare `Vec<String>` of pruned pane identities
 /// (happy path) or `{note}` (no herdr backend wired). With the bd-gc7k
 /// cascade, pruned pins also report the ghost leases released on their

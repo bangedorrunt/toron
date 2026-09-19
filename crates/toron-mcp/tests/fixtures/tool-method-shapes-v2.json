@@ -1,0 +1,4092 @@
+{
+  "resources": [
+    {
+      "description": "List projects known to toron.",
+      "name": "projects",
+      "uri": "toron://projects/{slug}"
+    },
+    {
+      "description": "Project manifest (kind-30010).",
+      "name": "project",
+      "uri": "toron://project/{slug}"
+    },
+    {
+      "description": "Product + linked projects (kind-30011).",
+      "name": "product",
+      "uri": "toron://products/{key}"
+    },
+    {
+      "description": "Registered agents in a project.",
+      "name": "agents",
+      "uri": "toron://agents/{project}"
+    },
+    {
+      "description": "Agent profile (kind-30013).",
+      "name": "agent_profile",
+      "uri": "toron://agents/{name}/profile"
+    },
+    {
+      "description": "Agent inbox (unwrapped mail).",
+      "name": "agent_inbox",
+      "uri": "toron://agents/{name}/inbox"
+    },
+    {
+      "description": "Messages sent by an agent.",
+      "name": "agent_outbox",
+      "uri": "toron://agents/{name}/outbox"
+    },
+    {
+      "description": "Agent mailbox + commit metadata.",
+      "name": "mailbox",
+      "uri": "toron://mailbox/{name}"
+    },
+    {
+      "description": "Single message body/metadata.",
+      "name": "message",
+      "uri": "toron://messages/{id}"
+    },
+    {
+      "description": "Thread DAG (NIP-10 e tags).",
+      "name": "thread",
+      "uri": "toron://threads/{id}"
+    },
+    {
+      "description": "File reservations.",
+      "name": "reservations",
+      "uri": "toron://reservations/{project}"
+    },
+    {
+      "description": "Single file reservation.",
+      "name": "reservation",
+      "uri": "toron://reservations/{id}"
+    },
+    {
+      "description": "Build slots.",
+      "name": "slots",
+      "uri": "toron://slots/{project}"
+    },
+    {
+      "description": "Single build slot.",
+      "name": "slot",
+      "uri": "toron://slots/{slot}"
+    },
+    {
+      "description": "Identity resolution for a project.",
+      "name": "identity",
+      "uri": "toron://identity/{project}"
+    },
+    {
+      "description": "Server environment + HTTP settings.",
+      "name": "config_environment",
+      "uri": "toron://config/environment"
+    },
+    {
+      "description": "Aggregated tool call/error counts.",
+      "name": "metrics",
+      "uri": "toron://tooling/metrics"
+    },
+    {
+      "description": "Core system metrics (HTTP/DB/storage).",
+      "name": "metrics_core",
+      "uri": "toron://tooling/metrics_core"
+    },
+    {
+      "description": "Clustered tool directory.",
+      "name": "directory",
+      "uri": "toron://tooling/directory"
+    },
+    {
+      "description": "Parameter schemas for tools/macros.",
+      "name": "schemas",
+      "uri": "toron://tooling/schemas"
+    },
+    {
+      "description": "Recent tool activity.",
+      "name": "recent",
+      "uri": "toron://tooling/recent/{window_seconds}"
+    },
+    {
+      "description": "Lock metadata from archive storage.",
+      "name": "locks",
+      "uri": "toron://tooling/locks"
+    },
+    {
+      "description": "Diagnostic report + recommendations.",
+      "name": "diagnostics",
+      "uri": "toron://tooling/diagnostics"
+    },
+    {
+      "description": "Tooling capabilities for an agent.",
+      "name": "capabilities",
+      "uri": "toron://tooling/capabilities/{agent}"
+    },
+    {
+      "description": "Ack-required messages past TTL.",
+      "name": "ack_overdue",
+      "uri": "toron://views/ack-overdue/{agent}"
+    }
+  ],
+  "tools": {
+    "acknowledge_message": {
+      "description": "Acknowledge a message (private NIP-17 ack, idempotent).",
+      "input_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "agent_name": {
+            "type": "string"
+          },
+          "message_id": {
+            "description": "toron message id = the rumor's content-addressed hex EventId (NOT an\nAM-style integer sequence). The arg is a string to match toron's own\nid model — `fetch_inbox` returns `id` as hex; this accepts it verbatim.\n(known-divergences §1: id-type differs by design per ADR-0003.)",
+            "type": "string"
+          },
+          "project_key": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "project_key",
+          "agent_name",
+          "message_id"
+        ],
+        "type": "object"
+      },
+      "output_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "acknowledged": {
+            "type": "boolean"
+          },
+          "acknowledged_at_us": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "message_id": {
+            "type": "string"
+          },
+          "read": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "message_id",
+          "acknowledged",
+          "read"
+        ],
+        "type": "object"
+      }
+    },
+    "acquire_build_slot": {
+      "description": "Acquire an advisory build-slot lease (kind-30032), optionally exclusive.",
+      "input_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "agent_name": {
+            "type": "string"
+          },
+          "exclusive": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "project_key": {
+            "type": "string"
+          },
+          "slot": {
+            "type": "string"
+          },
+          "ttl_seconds": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "project_key",
+          "agent_name",
+          "slot"
+        ],
+        "type": "object"
+      },
+      "output_schema": {
+        "$defs": {
+          "GrantedSlotOut": {
+            "description": "`acquire_build_slot`.",
+            "properties": {
+              "exclusive": {
+                "type": "boolean"
+              },
+              "expires_ts_us": {
+                "format": "int64",
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "slot": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "slot",
+              "exclusive"
+            ],
+            "type": "object"
+          },
+          "SlotConflictOut": {
+            "properties": {
+              "holders": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "slot": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "slot",
+              "holders"
+            ],
+            "type": "object"
+          }
+        },
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "conflicts": {
+            "items": {
+              "$ref": "#/$defs/SlotConflictOut"
+            },
+            "type": "array"
+          },
+          "granted": {
+            "items": {
+              "$ref": "#/$defs/GrantedSlotOut"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "granted",
+          "conflicts"
+        ],
+        "type": "object"
+      }
+    },
+    "ask_judgment": {
+      "description": "Ask flywheel judgment math (effect_key + pack_id + state in, typed answers + journaled JudgmentEffect out; idempotent replay on effect_key).",
+      "input_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "effect_key": {
+            "description": "Idempotency key: a recorded key replays the stored row, no re-invoke.",
+            "type": "string"
+          },
+          "pack_id": {
+            "description": "Flywheel resolves the question pack (unknown pack = typed error).",
+            "type": "string"
+          },
+          "project_key": {
+            "type": "string"
+          },
+          "state": {
+            "description": "State fields (object); capped at 64KiB serialized."
+          },
+          "timeout_seconds": {
+            "description": "Child budget, default 30, max 300.",
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "transport": {
+            "description": "offline (pure, default) or system-one (live model).",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "project_key",
+          "effect_key",
+          "pack_id",
+          "state"
+        ],
+        "type": "object"
+      },
+      "output_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "answers": true,
+          "confidence": {
+            "format": "double",
+            "type": "number"
+          },
+          "effect_key": {
+            "type": "string"
+          },
+          "escalated": {
+            "type": "boolean"
+          },
+          "fallback_flag": {
+            "type": "boolean"
+          },
+          "model_id": {
+            "type": "string"
+          },
+          "note": {
+            "type": "string"
+          },
+          "pack_id": {
+            "type": "string"
+          },
+          "pack_version": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "replayed": {
+            "type": "boolean"
+          },
+          "usage": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "effect_key",
+          "pack_id",
+          "pack_version",
+          "model_id",
+          "confidence",
+          "usage",
+          "fallback_flag",
+          "escalated",
+          "note",
+          "answers",
+          "replayed"
+        ],
+        "type": "object"
+      }
+    },
+    "check_file_reservation_conflicts": {
+      "description": "Symmetric-glob conflict report for paths vs other agents' reservations.",
+      "input_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "agent_name": {
+            "type": "string"
+          },
+          "paths": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "project_key": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "project_key",
+          "agent_name",
+          "paths"
+        ],
+        "type": "object"
+      },
+      "output_schema": {
+        "$defs": {
+          "PathConflictOut": {
+            "description": "`check_file_reservation_conflicts`.",
+            "properties": {
+              "holders": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "path": {
+                "type": "string"
+              },
+              "reservation_ids": {
+                "description": "Kind-30031 event id of each conflicting lease (bd-dsu1) — parallel to\n`holders`, one id per holder. The operator lock board surfaces these\nfor diagnostics (force-release, request-release, replay).",
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              }
+            },
+            "required": [
+              "path",
+              "holders",
+              "reservation_ids"
+            ],
+            "type": "object"
+          },
+          "SlotHolderOut": {
+            "description": "One active build-slot lease (bd-slot-visibility-gv17).",
+            "properties": {
+              "agent_name": {
+                "type": "string"
+              },
+              "exclusive": {
+                "type": "boolean"
+              },
+              "expires_ts_us": {
+                "format": "int64",
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "slot": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "slot",
+              "agent_name",
+              "exclusive"
+            ],
+            "type": "object"
+          }
+        },
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "checked_paths": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "clear_paths": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "conflict_free": {
+            "type": "boolean"
+          },
+          "conflicts": {
+            "items": {
+              "$ref": "#/$defs/PathConflictOut"
+            },
+            "type": "array"
+          },
+          "has_soft_conflicts": {
+            "type": "boolean"
+          },
+          "slot_holders": {
+            "description": "bd-slot-visibility-gv17: ACTIVE build-slot leases held by others —\n\"is the cargo fence free?\" in the same one-call pre-write check.",
+            "items": {
+              "$ref": "#/$defs/SlotHolderOut"
+            },
+            "type": "array"
+          },
+          "soft_conflicts": {
+            "description": "ADR-0011 Spec 4: additive soft tier (in-TTL intents).",
+            "items": {
+              "$ref": "#/$defs/PathConflictOut"
+            },
+            "type": "array"
+          },
+          "total_conflicting_reservations": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "conflict_free",
+          "conflicts",
+          "clear_paths",
+          "checked_paths",
+          "total_conflicting_reservations",
+          "soft_conflicts",
+          "has_soft_conflicts",
+          "slot_holders"
+        ],
+        "type": "object"
+      }
+    },
+    "cleanup_pane_identities": {
+      "description": "Prune identities whose herdr panes are absent from the live pane list.",
+      "input_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "project_key": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "output_schema": {
+        "$defs": {
+          "ReleasedGhostOut": {
+            "description": "One exclusive lease revoked because its holder pin was pruned\n(bd-gc7k: a dead pin must not own the ledger).",
+            "properties": {
+              "holder": {
+                "type": "string"
+              },
+              "path_pattern": {
+                "type": "string"
+              },
+              "project_slug": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "project_slug",
+              "path_pattern",
+              "holder"
+            ],
+            "type": "object"
+          }
+        },
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "note": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "released": {
+            "items": {
+              "$ref": "#/$defs/ReleasedGhostOut"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "removed": {
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      }
+    },
+    "create_agent_identity": {
+      "description": "Mint a fresh agent keypair (ncryptsec) and publish the kind-30013 profile.",
+      "input_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "attachments_policy": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "model": {
+            "description": "Model (maps to 30013 content `model`). Optional for backward compat\n(ADR-0005 P2.2 content-map).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name_hint": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "pane_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "program": {
+            "description": "Harness / program (maps to 30013 content `program`). Optional for\nbackward compat — old callers omit it (ADR-0005 P2.2 content-map).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "project_key": {
+            "type": "string"
+          },
+          "registration_proof": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "task_description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "project_key"
+        ],
+        "type": "object"
+      },
+      "output_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "created": {
+            "type": "boolean"
+          },
+          "key_path": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "npub": {
+            "type": "string"
+          },
+          "profile_event_id": {
+            "type": "string"
+          },
+          "project_slug": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "project_slug",
+          "npub",
+          "profile_event_id",
+          "key_path",
+          "created"
+        ],
+        "type": "object"
+      }
+    },
+    "ensure_product": {
+      "description": "Idempotent product manifest (kind-30011) for a product key.",
+      "input_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "product_key": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "output_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "created": {
+            "type": "boolean"
+          },
+          "member_projects": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "name": {
+            "type": "string"
+          },
+          "product_key": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "product_key",
+          "name",
+          "member_projects",
+          "created"
+        ],
+        "type": "object"
+      }
+    },
+    "ensure_project": {
+      "description": "Idempotent project initialization (kind-30010 manifest).",
+      "input_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "human_key": {
+            "type": "string"
+          },
+          "identity_mode": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "human_key"
+        ],
+        "type": "object"
+      },
+      "output_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "created": {
+            "type": "boolean"
+          },
+          "manifest_event_id": {
+            "type": "string"
+          },
+          "slug": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "slug",
+          "manifest_event_id",
+          "created"
+        ],
+        "type": "object"
+      }
+    },
+    "fetch_inbox": {
+      "description": "Project the agent's inbox (rumor-time order, G7).",
+      "input_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "ack_overdue_only": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "agent_name": {
+            "type": "string"
+          },
+          "include_bodies": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "limit": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "mark_read": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "project_key": {
+            "type": "string"
+          },
+          "since_ts": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "thread_id": {
+            "description": "Keep only messages in this thread (bd-harvest-thread-filter-yp9r).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "topic": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "unread_only": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "urgent_only": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "project_key",
+          "agent_name"
+        ],
+        "type": "object"
+      },
+      "output_schema": {
+        "$defs": {
+          "InboxMessageOut": {
+            "description": "`fetch_inbox` rows.",
+            "properties": {
+              "ack_required": {
+                "type": "boolean"
+              },
+              "audience": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "body_md": {
+                "type": "string"
+              },
+              "corr": {
+                "description": "ADR-0027 E2 assignment tags projected from the rumor (never 1059);\nmirror of `ToJson for InboxMessage` wire fields\n(bd-mcp-inbox-assignment-tags-sdi1). All optional, `null` = untasked.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "created_ts_us": {
+                "format": "int64",
+                "type": "integer"
+              },
+              "duplicate_of": {
+                "description": "S5 (bd-dup-assign-collapse-ws21): the first id of the duplicate group\nthis row survives for; `null` = standalone message.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "id": {
+                "type": "string"
+              },
+              "importance": {
+                "type": "string"
+              },
+              "priority": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "read_ts_us": {
+                "description": "Read receipt timestamp (i64-µs) from the `message_reads` projection;\n`null` = unread (bd-5icg).",
+                "format": "int64",
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "result_path": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "sender": {
+                "type": "string"
+              },
+              "subject": {
+                "type": "string"
+              },
+              "thread_id": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "verdict": {
+                "description": "HumanDecision live producer: `verdict=` extra_tag on the rumor.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "wake": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "id",
+              "sender",
+              "subject",
+              "body_md",
+              "importance",
+              "ack_required",
+              "created_ts_us"
+            ],
+            "type": "object"
+          }
+        },
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "messages": {
+            "items": {
+              "$ref": "#/$defs/InboxMessageOut"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "messages"
+        ],
+        "type": "object"
+      }
+    },
+    "fetch_inbox_product": {
+      "description": "Fan an inbox fetch across a product's member projects.",
+      "input_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "agent_name": {
+            "type": "string"
+          },
+          "include_bodies": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "limit": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "product_key": {
+            "type": "string"
+          },
+          "since_ts": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "urgent_only": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "product_key",
+          "agent_name"
+        ],
+        "type": "object"
+      },
+      "output_schema": {
+        "$defs": {
+          "ProjectInboxMessageOut": {
+            "description": "`fetch_inbox_product` rows (`(project, InboxMessage)` flatten).",
+            "properties": {
+              "ack_required": {
+                "type": "boolean"
+              },
+              "audience": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "body_md": {
+                "type": "string"
+              },
+              "corr": {
+                "description": "ADR-0027 E2 assignment tags (bd-mcp-inbox-assignment-tags-sdi1);\nflattened mirror of `InboxMessageOut` tags. Optional, `null` = untasked.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "created_ts_us": {
+                "format": "int64",
+                "type": "integer"
+              },
+              "id": {
+                "type": "string"
+              },
+              "importance": {
+                "type": "string"
+              },
+              "priority": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "project": {
+                "type": "string"
+              },
+              "result_path": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "sender": {
+                "type": "string"
+              },
+              "subject": {
+                "type": "string"
+              },
+              "thread_id": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "verdict": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "wake": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "project",
+              "id",
+              "sender",
+              "subject",
+              "body_md",
+              "importance",
+              "ack_required",
+              "created_ts_us"
+            ],
+            "type": "object"
+          }
+        },
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "messages": {
+            "items": {
+              "$ref": "#/$defs/ProjectInboxMessageOut"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "messages"
+        ],
+        "type": "object"
+      }
+    },
+    "file_reservation_paths": {
+      "description": "Acquire exclusive/shared leases on path globs (kind-30031).",
+      "input_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "agent_name": {
+            "type": "string"
+          },
+          "exclusive": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "paths": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "project_key": {
+            "type": "string"
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "transfer_from": {
+            "description": "When set, this call is a `transfer_reservation` (`agent_name` = to).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "ttl_seconds": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "project_key",
+          "agent_name",
+          "paths"
+        ],
+        "type": "object"
+      },
+      "output_schema": {
+        "$defs": {
+          "GrantedReservationOut": {
+            "description": "`file_reservation_paths`.",
+            "properties": {
+              "exclusive": {
+                "type": "boolean"
+              },
+              "expires_ts_us": {
+                "format": "int64",
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "id": {
+                "type": "string"
+              },
+              "path_pattern": {
+                "type": "string"
+              },
+              "reason": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "id",
+              "path_pattern",
+              "exclusive",
+              "reason"
+            ],
+            "type": "object"
+          },
+          "PathConflictOut": {
+            "description": "`check_file_reservation_conflicts`.",
+            "properties": {
+              "holders": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "path": {
+                "type": "string"
+              },
+              "reservation_ids": {
+                "description": "Kind-30031 event id of each conflicting lease (bd-dsu1) — parallel to\n`holders`, one id per holder. The operator lock board surfaces these\nfor diagnostics (force-release, request-release, replay).",
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              }
+            },
+            "required": [
+              "path",
+              "holders",
+              "reservation_ids"
+            ],
+            "type": "object"
+          }
+        },
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "conflicts": {
+            "items": {
+              "$ref": "#/$defs/PathConflictOut"
+            },
+            "type": "array"
+          },
+          "granted": {
+            "items": {
+              "$ref": "#/$defs/GrantedReservationOut"
+            },
+            "type": "array"
+          },
+          "soft_conflicts": {
+            "description": "ADR-0011 Spec 4: additive soft tier (frozen-acquire paths).",
+            "items": {
+              "$ref": "#/$defs/PathConflictOut"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "granted",
+          "conflicts",
+          "soft_conflicts"
+        ],
+        "type": "object"
+      }
+    },
+    "force_release_file_reservation": {
+      "description": "Operator force-release of a stale reservation (staleness heuristic + revocation).",
+      "input_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "agent_name": {
+            "type": "string"
+          },
+          "holder": {
+            "description": "Optional holder name to disambiguate when multiple holders match the\npath. Omit to revoke the (single) matching lease.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "note": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "notify_previous": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "path": {
+            "description": "Path (or glob) of the stale reservation to revoke. The daemon resolves\nthe active lease on this path itself (bd-cumj) — the caller does NOT\nneed the holder's event id.",
+            "type": "string"
+          },
+          "project_key": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "project_key",
+          "agent_name",
+          "path"
+        ],
+        "type": "object"
+      },
+      "output_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "ok": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "ok"
+        ],
+        "type": "object"
+      }
+    },
+    "health_check": {
+      "description": "Bus liveness + archive health for a project (AM-Rust parity).",
+      "input_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "project_key": {
+            "default": null,
+            "description": "AM parity: `health_check` takes no required args. The field is kept\noptional (default empty) so clients that mirror the project-scoped\nconvention still parse, but it is NOT required and NOT used — the\ndaemon reports process-global bus + archive health.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "output_schema": {
+        "$defs": {
+          "HealthComponentOut": {
+            "description": "`health_check`: `{bus, archive}` each `{ok, message}`.",
+            "properties": {
+              "message": {
+                "type": "string"
+              },
+              "ok": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "ok",
+              "message"
+            ],
+            "type": "object"
+          }
+        },
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "archive": {
+            "$ref": "#/$defs/HealthComponentOut"
+          },
+          "bus": {
+            "$ref": "#/$defs/HealthComponentOut"
+          }
+        },
+        "required": [
+          "bus",
+          "archive"
+        ],
+        "type": "object"
+      }
+    },
+    "install_precommit_guard": {
+      "description": "Install the toron pre-commit hook in a git repository.",
+      "input_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "code_repo_path": {
+            "type": "string"
+          },
+          "project_key": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "project_key",
+          "code_repo_path"
+        ],
+        "type": "object"
+      },
+      "output_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "hook_path": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "hook_path"
+        ],
+        "type": "object"
+      }
+    },
+    "list_agents": {
+      "description": "List a project's agents with npub + last-active provenance.",
+      "input_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "active_within_days": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "limit": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "project_key": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "project_key"
+        ],
+        "type": "object"
+      },
+      "output_schema": {
+        "$defs": {
+          "WhoIsOut": {
+            "description": "`whois`: `{name, npub, program, model, task_description, last_active_ts_us,\nstale, pane_id, workspace_id, tab_id}`.\n\nADR-0010 F2: `stale` flags roster rows older than the prune cadence —\nnever a silent live pin.\n\nbd-u4e2: `pane_id`/`workspace_id`/`tab_id` are the LIVE herdr pane the pin\nruns in (advisory; all `None` when no herdr backend is reachable). Additive\noptionals — pre-u4e2 clients parse rows unchanged.",
+            "properties": {
+              "last_active_ts_us": {
+                "format": "int64",
+                "type": "integer"
+              },
+              "model": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "name": {
+                "type": "string"
+              },
+              "npub": {
+                "type": "string"
+              },
+              "pane_id": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "program": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "stale": {
+                "type": "boolean"
+              },
+              "tab_id": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "task_description": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "workspace_id": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "name",
+              "npub",
+              "last_active_ts_us",
+              "stale"
+            ],
+            "type": "object"
+          }
+        },
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "agents": {
+            "items": {
+              "$ref": "#/$defs/WhoIsOut"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "agents"
+        ],
+        "type": "object"
+      }
+    },
+    "list_contacts": {
+      "description": "List an agent's contact links (AgentLink rows). Link status is the social graph (pending|approved|denied) — it does NOT gate mail. Delivery is gated by the RECIPIENT's contact policy (kind-30014, see set_contact_policy, default auto): a pending link still receives mail unless the recipient's policy blocks it.",
+      "input_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "agent_name": {
+            "type": "string"
+          },
+          "project_key": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "project_key",
+          "agent_name"
+        ],
+        "type": "object"
+      },
+      "output_schema": {
+        "$defs": {
+          "ContactLinkOut": {
+            "description": "`request_contact` / `respond_contact` / `list_contacts` rows.\n\nLink rows describe the SOCIAL GRAPH — they do not gate mail. Inbound\ndelivery is gated by the recipient's contact policy (kind-30014, default\n`auto`): a `pending` link still receives mail unless the recipient's\npolicy blocks it.",
+            "properties": {
+              "created_ts_us": {
+                "format": "int64",
+                "type": "integer"
+              },
+              "from_name": {
+                "type": "string"
+              },
+              "from_pubkey": {
+                "type": "string"
+              },
+              "project_slug": {
+                "type": "string"
+              },
+              "status": {
+                "description": "pending | approved | denied — social graph state, not a delivery gate.",
+                "type": "string"
+              },
+              "to_name": {
+                "type": "string"
+              },
+              "to_project": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "to_pubkey": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "project_slug",
+              "from_name",
+              "from_pubkey",
+              "to_name",
+              "to_pubkey",
+              "status",
+              "created_ts_us"
+            ],
+            "type": "object"
+          }
+        },
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "contacts": {
+            "items": {
+              "$ref": "#/$defs/ContactLinkOut"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "contacts"
+        ],
+        "type": "object"
+      }
+    },
+    "list_file_reservations": {
+      "description": "List every active (held) file reservation in the project — the lock board the strict guard evaluates: id, path glob, holder, exclusive, reason, expiry. Optional filters: holder (exact agent name), path (glob overlap). REQUIRED: project_key.",
+      "input_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "holder": {
+            "description": "exact holder filter (agent name)",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "path": {
+            "description": "glob-overlap filter (show holders of one path)",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "project_key": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "project_key"
+        ],
+        "type": "object"
+      },
+      "output_schema": {
+        "$defs": {
+          "LeaseRowOut": {
+            "description": "One lease row (`list_file_reservations`).",
+            "properties": {
+              "exclusive": {
+                "type": "boolean"
+              },
+              "expires_ts_us": {
+                "format": "int64",
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "holder": {
+                "type": "string"
+              },
+              "id": {
+                "type": "string"
+              },
+              "path": {
+                "type": "string"
+              },
+              "reason": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "id",
+              "path",
+              "holder",
+              "exclusive",
+              "reason"
+            ],
+            "type": "object"
+          }
+        },
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "count": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "project_key": {
+            "type": "string"
+          },
+          "reservations": {
+            "items": {
+              "$ref": "#/$defs/LeaseRowOut"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "project_key",
+          "count",
+          "reservations"
+        ],
+        "type": "object"
+      }
+    },
+    "macro_contact_handshake": {
+      "description": "Batch: request contact + optional auto-accept + welcome message.",
+      "input_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "agent_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "auto_accept": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "model": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "program": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "project_key": {
+            "type": "string"
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "register_if_missing": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "requester": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "target": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "task_description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "thread_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "to_agent": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "to_project": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "ttl_seconds": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "welcome_body": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "welcome_subject": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "project_key"
+        ],
+        "type": "object"
+      },
+      "output_schema": {
+        "$defs": {
+          "ContactLinkOut": {
+            "description": "`request_contact` / `respond_contact` / `list_contacts` rows.\n\nLink rows describe the SOCIAL GRAPH — they do not gate mail. Inbound\ndelivery is gated by the recipient's contact policy (kind-30014, default\n`auto`): a `pending` link still receives mail unless the recipient's\npolicy blocks it.",
+            "properties": {
+              "created_ts_us": {
+                "format": "int64",
+                "type": "integer"
+              },
+              "from_name": {
+                "type": "string"
+              },
+              "from_pubkey": {
+                "type": "string"
+              },
+              "project_slug": {
+                "type": "string"
+              },
+              "status": {
+                "description": "pending | approved | denied — social graph state, not a delivery gate.",
+                "type": "string"
+              },
+              "to_name": {
+                "type": "string"
+              },
+              "to_project": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "to_pubkey": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "project_slug",
+              "from_name",
+              "from_pubkey",
+              "to_name",
+              "to_pubkey",
+              "status",
+              "created_ts_us"
+            ],
+            "type": "object"
+          }
+        },
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "link": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/ContactLinkOut"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "requester": {
+            "type": "string"
+          },
+          "target": {
+            "type": "string"
+          },
+          "welcome_sent": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "requester",
+          "target",
+          "welcome_sent"
+        ],
+        "type": "object"
+      }
+    },
+    "macro_file_reservation_cycle": {
+      "description": "Batch: reserve a set of path globs, optionally release them at the end.",
+      "input_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "agent_name": {
+            "type": "string"
+          },
+          "auto_release": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "exclusive": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "paths": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "project_key": {
+            "type": "string"
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "ttl_seconds": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "project_key",
+          "agent_name",
+          "paths"
+        ],
+        "type": "object"
+      },
+      "output_schema": {
+        "$defs": {
+          "GrantedReservationOut": {
+            "description": "`file_reservation_paths`.",
+            "properties": {
+              "exclusive": {
+                "type": "boolean"
+              },
+              "expires_ts_us": {
+                "format": "int64",
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "id": {
+                "type": "string"
+              },
+              "path_pattern": {
+                "type": "string"
+              },
+              "reason": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "id",
+              "path_pattern",
+              "exclusive",
+              "reason"
+            ],
+            "type": "object"
+          }
+        },
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "agent_name": {
+            "type": "string"
+          },
+          "granted": {
+            "items": {
+              "$ref": "#/$defs/GrantedReservationOut"
+            },
+            "type": "array"
+          },
+          "project_key": {
+            "type": "string"
+          },
+          "released": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "project_key",
+          "agent_name",
+          "granted",
+          "released"
+        ],
+        "type": "object"
+      }
+    },
+    "macro_prepare_thread": {
+      "description": "Batch: ensure registration + thread summary + recent inbox context.",
+      "input_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "agent_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "inbox_limit": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "include_examples": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "include_inbox_bodies": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "llm_mode": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "llm_model": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "model": {
+            "type": "string"
+          },
+          "program": {
+            "type": "string"
+          },
+          "project_key": {
+            "type": "string"
+          },
+          "register_if_missing": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "registration_proof": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "task_description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "thread_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "project_key",
+          "thread_id",
+          "program",
+          "model"
+        ],
+        "type": "object"
+      },
+      "output_schema": {
+        "$defs": {
+          "ThreadSummaryOut": {
+            "description": "`summarize_thread` / `summarize_thread_product`.",
+            "properties": {
+              "action_items": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "key_points": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "message_count": {
+                "format": "int64",
+                "type": "integer"
+              },
+              "participants": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "thread_id": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "thread_id",
+              "participants",
+              "key_points",
+              "action_items",
+              "message_count"
+            ],
+            "type": "object"
+          }
+        },
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "agent_name": {
+            "type": "string"
+          },
+          "inbox_count": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "npub": {
+            "type": "string"
+          },
+          "project_key": {
+            "type": "string"
+          },
+          "summary": {
+            "$ref": "#/$defs/ThreadSummaryOut"
+          },
+          "thread_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "project_key",
+          "agent_name",
+          "npub",
+          "thread_id",
+          "summary",
+          "inbox_count"
+        ],
+        "type": "object"
+      }
+    },
+    "macro_start_session": {
+      "description": "Batch: ensure_project + register agent + optional file reservation + inbox snapshot.",
+      "input_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "agent_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "file_reservation_paths": {
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "file_reservation_reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "file_reservation_ttl_seconds": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "human_key": {
+            "type": "string"
+          },
+          "inbox_limit": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "model": {
+            "type": "string"
+          },
+          "pane_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "program": {
+            "type": "string"
+          },
+          "reaper_exempt": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "registration_proof": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "task_description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "human_key",
+          "program",
+          "model"
+        ],
+        "type": "object"
+      },
+      "output_schema": {
+        "$defs": {
+          "GrantedReservationOut": {
+            "description": "`file_reservation_paths`.",
+            "properties": {
+              "exclusive": {
+                "type": "boolean"
+              },
+              "expires_ts_us": {
+                "format": "int64",
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "id": {
+                "type": "string"
+              },
+              "path_pattern": {
+                "type": "string"
+              },
+              "reason": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "id",
+              "path_pattern",
+              "exclusive",
+              "reason"
+            ],
+            "type": "object"
+          }
+        },
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "agent_name": {
+            "type": "string"
+          },
+          "granted_reservations": {
+            "items": {
+              "$ref": "#/$defs/GrantedReservationOut"
+            },
+            "type": "array"
+          },
+          "inbox_count": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "npub": {
+            "type": "string"
+          },
+          "project_key": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "project_key",
+          "agent_name",
+          "npub",
+          "granted_reservations",
+          "inbox_count"
+        ],
+        "type": "object"
+      }
+    },
+    "mark_message_read": {
+      "description": "Mark a message read (private NIP-17 read receipt, idempotent).",
+      "input_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "agent_name": {
+            "type": "string"
+          },
+          "message_id": {
+            "description": "See [`AcknowledgeMessageArgs::message_id`] — hex event id, not an int.",
+            "type": "string"
+          },
+          "project_key": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "project_key",
+          "agent_name",
+          "message_id"
+        ],
+        "type": "object"
+      },
+      "output_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "acknowledged": {
+            "type": "boolean"
+          },
+          "acknowledged_at_us": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "message_id": {
+            "type": "string"
+          },
+          "read": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "message_id",
+          "acknowledged",
+          "read"
+        ],
+        "type": "object"
+      }
+    },
+    "products_link": {
+      "description": "Link a project into a product (idempotent; kind-30011 a-tag).",
+      "input_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "product_key": {
+            "type": "string"
+          },
+          "project_key": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "product_key",
+          "project_key"
+        ],
+        "type": "object"
+      },
+      "output_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "created": {
+            "type": "boolean"
+          },
+          "member_projects": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "name": {
+            "type": "string"
+          },
+          "product_key": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "product_key",
+          "name",
+          "member_projects",
+          "created"
+        ],
+        "type": "object"
+      }
+    },
+    "register_agent": {
+      "description": "Upsert an agent identity on its existing key (or create if absent).",
+      "input_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "alias": {
+            "description": "Herdr slug (or other alias) to fold onto `name` (the pin).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "attachments_policy": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "model": {
+            "description": "Model (maps to 30013 content `model`). Optional for backward compat\n(ADR-0005 P2.2 content-map).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "pane_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "program": {
+            "description": "Harness / program (maps to 30013 content `program`). Optional for\nbackward compat — old callers omit it (ADR-0005 P2.2 content-map).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "project_key": {
+            "type": "string"
+          },
+          "reaper_exempt": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "registration_proof": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "task_description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "project_key"
+        ],
+        "type": "object"
+      },
+      "output_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "created": {
+            "type": "boolean"
+          },
+          "key_path": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "npub": {
+            "type": "string"
+          },
+          "profile_event_id": {
+            "type": "string"
+          },
+          "project_slug": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "project_slug",
+          "npub",
+          "profile_event_id",
+          "key_path",
+          "created"
+        ],
+        "type": "object"
+      }
+    },
+    "release_build_slot": {
+      "description": "Release an active build-slot lease (non-destructive).",
+      "input_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "agent_name": {
+            "type": "string"
+          },
+          "project_key": {
+            "type": "string"
+          },
+          "slot": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "project_key",
+          "agent_name",
+          "slot"
+        ],
+        "type": "object"
+      },
+      "output_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "released": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "released"
+        ],
+        "type": "object"
+      }
+    },
+    "release_file_reservations": {
+      "description": "Release the holder's active file reservations (idempotent).",
+      "input_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "agent_name": {
+            "type": "string"
+          },
+          "paths": {
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "project_key": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "project_key",
+          "agent_name"
+        ],
+        "type": "object"
+      },
+      "output_schema": {
+        "$defs": {
+          "ReleasedLeaseOut": {
+            "description": "`release_file_reservations` per-lease breakdown (S6).",
+            "properties": {
+              "holder": {
+                "type": "string"
+              },
+              "mode": {
+                "type": "string"
+              },
+              "path": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "path",
+              "mode",
+              "holder"
+            ],
+            "type": "object"
+          }
+        },
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "leases": {
+            "items": {
+              "$ref": "#/$defs/ReleasedLeaseOut"
+            },
+            "type": "array"
+          },
+          "released": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "released",
+          "leases"
+        ],
+        "type": "object"
+      }
+    },
+    "release_file_reservations_by_reason": {
+      "description": "Release all file reservations whose reason is the given bead id (operator-signed; release-on-bead-close). REQUIRED: project_key, agent_name, bead_id. Operator/loop after-close hook; crews release their own locks via release_file_reservations (by agent_name) or CLI: toron reserve release --project <p> --as <pin>. Operator CLI door: toron reserve release-by-reason <bead> --project <p> --as <operator>.",
+      "input_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "agent_name": {
+            "description": "Requestor (operator-facing name; used in the holder notification DM).",
+            "type": "string"
+          },
+          "bead_id": {
+            "description": "Bead id whose matching (reason == bead id) leases get revoked.",
+            "type": "string"
+          },
+          "notify_previous": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "project_key": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "project_key",
+          "agent_name",
+          "bead_id"
+        ],
+        "type": "object"
+      },
+      "output_schema": {
+        "$defs": {
+          "ReleasedLeaseOut": {
+            "description": "`release_file_reservations` per-lease breakdown (S6).",
+            "properties": {
+              "holder": {
+                "type": "string"
+              },
+              "mode": {
+                "type": "string"
+              },
+              "path": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "path",
+              "mode",
+              "holder"
+            ],
+            "type": "object"
+          }
+        },
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "leases": {
+            "items": {
+              "$ref": "#/$defs/ReleasedLeaseOut"
+            },
+            "type": "array"
+          },
+          "released": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "released",
+          "leases"
+        ],
+        "type": "object"
+      }
+    },
+    "renew_build_slot": {
+      "description": "Extend an active build-slot lease's TTL (no-op when missing).",
+      "input_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "agent_name": {
+            "type": "string"
+          },
+          "extend_seconds": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "project_key": {
+            "type": "string"
+          },
+          "slot": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "project_key",
+          "agent_name",
+          "slot"
+        ],
+        "type": "object"
+      },
+      "output_schema": {
+        "$defs": {
+          "BuildSlotOut": {
+            "description": "`renew_build_slot` (null when no lease).",
+            "properties": {
+              "agent_name": {
+                "type": "string"
+              },
+              "agent_pubkey": {
+                "type": "string"
+              },
+              "exclusive": {
+                "type": "boolean"
+              },
+              "expires_ts_us": {
+                "format": "int64",
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "slot": {
+                "type": "string"
+              },
+              "status": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "slot",
+              "agent_name",
+              "agent_pubkey",
+              "exclusive",
+              "status"
+            ],
+            "type": "object"
+          }
+        },
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "slot": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/BuildSlotOut"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "type": "object"
+      }
+    },
+    "renew_file_reservations": {
+      "description": "Extend the TTLs of the holder's active file reservations.",
+      "input_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "agent_name": {
+            "type": "string"
+          },
+          "extend_seconds": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "paths": {
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "project_key": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "project_key",
+          "agent_name"
+        ],
+        "type": "object"
+      },
+      "output_schema": {
+        "$defs": {
+          "GrantedReservationOut": {
+            "description": "`file_reservation_paths`.",
+            "properties": {
+              "exclusive": {
+                "type": "boolean"
+              },
+              "expires_ts_us": {
+                "format": "int64",
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "id": {
+                "type": "string"
+              },
+              "path_pattern": {
+                "type": "string"
+              },
+              "reason": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "id",
+              "path_pattern",
+              "exclusive",
+              "reason"
+            ],
+            "type": "object"
+          }
+        },
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "renewed": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "reservations": {
+            "items": {
+              "$ref": "#/$defs/GrantedReservationOut"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "renewed",
+          "reservations"
+        ],
+        "type": "object"
+      }
+    },
+    "reply_message": {
+      "description": "Reply to a message within its thread (NIP-10 reply reference). REQUIRED: project_key, sender_name (your adjective+noun pin), to[], subject, body_md. Thread context comes from args (thread_id) - no auto-parent resolution on toron; the flywheel facade resolves it.",
+      "input_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "ack_required": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "attachment_paths": {
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "audience": {
+            "description": "ADR-0027 E3: audience.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "auto_contact_if_blocked": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "bcc": {
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "body_md": {
+            "type": "string"
+          },
+          "broadcast": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "cc": {
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "convert_images": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "corr": {
+            "description": "ADR-0027 E2: correlation id.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "importance": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "priority": {
+            "description": "ADR-0027 E2: priority.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "project_key": {
+            "type": "string"
+          },
+          "release_decision": {
+            "description": "`agreed` | `denied` | `deferred:<secs>` — only with `request_message_id`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "request_message_id": {
+            "description": "When set, this call is a `respond_request_release` (CLI compose).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "reservation_note": {
+            "description": "Optional note on the response rumor.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "result_path": {
+            "description": "ADR-0027 E2: result_path.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "sender_name": {
+            "type": "string"
+          },
+          "sender_token": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "subject": {
+            "type": "string"
+          },
+          "thread_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "to": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "topic": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "wake": {
+            "description": "ADR-0027 E2: wake.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "project_key",
+          "sender_name",
+          "to",
+          "subject",
+          "body_md"
+        ],
+        "type": "object"
+      },
+      "output_schema": {
+        "$defs": {
+          "DeliveryOut": {
+            "properties": {
+              "payload": {
+                "$ref": "#/$defs/DeliveryPayloadOut"
+              },
+              "project": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "project",
+              "payload"
+            ],
+            "type": "object"
+          },
+          "DeliveryPayloadOut": {
+            "description": "`send_message` / `reply_message`.",
+            "properties": {
+              "event_id": {
+                "type": "string"
+              },
+              "recipient": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "recipient",
+              "event_id"
+            ],
+            "type": "object"
+          }
+        },
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "count": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "deliveries": {
+            "items": {
+              "$ref": "#/$defs/DeliveryOut"
+            },
+            "type": "array"
+          },
+          "verified_sender": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "deliveries",
+          "count",
+          "verified_sender"
+        ],
+        "type": "object"
+      }
+    },
+    "request_contact": {
+      "description": "Request contact with another agent (AgentLink + NIP-17 control message).",
+      "input_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "from_agent": {
+            "type": "string"
+          },
+          "model": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "program": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "project_key": {
+            "type": "string"
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "register_if_missing": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "task_description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "to_agent": {
+            "type": "string"
+          },
+          "to_project": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "ttl_seconds": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "project_key",
+          "from_agent",
+          "to_agent"
+        ],
+        "type": "object"
+      },
+      "output_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "created_ts_us": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "from_name": {
+            "type": "string"
+          },
+          "from_pubkey": {
+            "type": "string"
+          },
+          "project_slug": {
+            "type": "string"
+          },
+          "status": {
+            "description": "pending | approved | denied — social graph state, not a delivery gate.",
+            "type": "string"
+          },
+          "to_name": {
+            "type": "string"
+          },
+          "to_project": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "to_pubkey": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "project_slug",
+          "from_name",
+          "from_pubkey",
+          "to_name",
+          "to_pubkey",
+          "status",
+          "created_ts_us"
+        ],
+        "type": "object"
+      }
+    },
+    "resolve_pane_identity": {
+      "description": "Resolve a herdr pane_id to the agent name (G9).",
+      "input_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "pane_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "project_key": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "project_key"
+        ],
+        "type": "object"
+      },
+      "output_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "agent_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "note": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "pane_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "pane_id"
+        ],
+        "type": "object"
+      }
+    },
+    "respond_contact": {
+      "description": "Approve or deny a pending contact request.",
+      "input_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "accept": {
+            "type": "boolean"
+          },
+          "from_agent": {
+            "type": "string"
+          },
+          "from_project": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "project_key": {
+            "type": "string"
+          },
+          "to_agent": {
+            "type": "string"
+          },
+          "ttl_seconds": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "project_key",
+          "to_agent",
+          "from_agent",
+          "accept"
+        ],
+        "type": "object"
+      },
+      "output_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "created_ts_us": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "from_name": {
+            "type": "string"
+          },
+          "from_pubkey": {
+            "type": "string"
+          },
+          "project_slug": {
+            "type": "string"
+          },
+          "status": {
+            "description": "pending | approved | denied — social graph state, not a delivery gate.",
+            "type": "string"
+          },
+          "to_name": {
+            "type": "string"
+          },
+          "to_project": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "to_pubkey": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "project_slug",
+          "from_name",
+          "from_pubkey",
+          "to_name",
+          "to_pubkey",
+          "status",
+          "created_ts_us"
+        ],
+        "type": "object"
+      }
+    },
+    "search_messages": {
+      "description": "FTS5 search over a project's indexed messages (porter/unicode61).",
+      "input_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "cursor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "explain": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "importance": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "include_body_md": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "limit": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "offset": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "project_key": {
+            "type": "string"
+          },
+          "query": {
+            "type": "string"
+          },
+          "ranking": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "sender": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "since": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "thread_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "until": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "project_key",
+          "query"
+        ],
+        "type": "object"
+      },
+      "output_schema": {
+        "$defs": {
+          "SearchMessageOut": {
+            "description": "`search_messages` rows.",
+            "properties": {
+              "ack_required": {
+                "type": "boolean"
+              },
+              "body_md": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "created_ts_us": {
+                "format": "int64",
+                "type": "integer"
+              },
+              "from": {
+                "type": "string"
+              },
+              "id": {
+                "type": "string"
+              },
+              "importance": {
+                "type": "string"
+              },
+              "subject": {
+                "type": "string"
+              },
+              "thread_id": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "id",
+              "subject",
+              "from",
+              "created_ts_us",
+              "importance",
+              "ack_required"
+            ],
+            "type": "object"
+          }
+        },
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "result": {
+            "items": {
+              "$ref": "#/$defs/SearchMessageOut"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "type": "object"
+      }
+    },
+    "search_messages_product": {
+      "description": "Fan an FTS5 search across a product's member projects.",
+      "input_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "cursor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "importance": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "include_body_md": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "limit": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "product_key": {
+            "type": "string"
+          },
+          "project": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "query": {
+            "type": "string"
+          },
+          "ranking": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "sender": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "thread_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "product_key",
+          "query"
+        ],
+        "type": "object"
+      },
+      "output_schema": {
+        "$defs": {
+          "ProjectSearchMessageOut": {
+            "description": "`search_messages_product` rows (`(project, SearchMessage)` flatten).",
+            "properties": {
+              "ack_required": {
+                "type": "boolean"
+              },
+              "body_md": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "created_ts_us": {
+                "format": "int64",
+                "type": "integer"
+              },
+              "from": {
+                "type": "string"
+              },
+              "id": {
+                "type": "string"
+              },
+              "importance": {
+                "type": "string"
+              },
+              "project": {
+                "type": "string"
+              },
+              "subject": {
+                "type": "string"
+              },
+              "thread_id": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "project",
+              "id",
+              "subject",
+              "from",
+              "created_ts_us",
+              "importance",
+              "ack_required"
+            ],
+            "type": "object"
+          }
+        },
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "result": {
+            "items": {
+              "$ref": "#/$defs/ProjectSearchMessageOut"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "type": "object"
+      }
+    },
+    "send_message": {
+      "description": "Send a NIP-17 gift-wrapped message to one or more recipients. REQUIRED: project_key, sender_name (your adjective+noun pin), to[], subject, body_md. Shell available? Prefer: flywheel mail send <proj> --to <names> --subject S --body B.",
+      "input_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "ack_required": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "attachment_paths": {
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "audience": {
+            "description": "ADR-0027 E3: audience human|agents.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "auto_contact_if_blocked": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "bcc": {
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "body_md": {
+            "type": "string"
+          },
+          "broadcast": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "cc": {
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "convert_images": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "corr": {
+            "description": "ADR-0027 E2: correlation id rides extra_tags corr.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "importance": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "priority": {
+            "description": "ADR-0027 E2: priority queue|interrupt.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "project_key": {
+            "type": "string"
+          },
+          "release_ask": {
+            "description": "`release` | `defer:<secs>` — only used with `reservation_id`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "reservation_id": {
+            "description": "When set, this call is a `request_release` (CLI compose; no new tool).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "reservation_note": {
+            "description": "Optional note on the request-release rumor.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "result_path": {
+            "description": "ADR-0027 E2: result_path rides extra_tags result_path.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "sender_name": {
+            "type": "string"
+          },
+          "sender_token": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "subject": {
+            "type": "string"
+          },
+          "thread_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "to": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "topic": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "wake": {
+            "description": "ADR-0027 E2: wake standing|tasked.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "project_key",
+          "sender_name",
+          "to",
+          "subject",
+          "body_md"
+        ],
+        "type": "object"
+      },
+      "output_schema": {
+        "$defs": {
+          "DeliveryOut": {
+            "properties": {
+              "payload": {
+                "$ref": "#/$defs/DeliveryPayloadOut"
+              },
+              "project": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "project",
+              "payload"
+            ],
+            "type": "object"
+          },
+          "DeliveryPayloadOut": {
+            "description": "`send_message` / `reply_message`.",
+            "properties": {
+              "event_id": {
+                "type": "string"
+              },
+              "recipient": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "recipient",
+              "event_id"
+            ],
+            "type": "object"
+          }
+        },
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "count": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "deliveries": {
+            "items": {
+              "$ref": "#/$defs/DeliveryOut"
+            },
+            "type": "array"
+          },
+          "verified_sender": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "deliveries",
+          "count",
+          "verified_sender"
+        ],
+        "type": "object"
+      }
+    },
+    "set_contact_policy": {
+      "description": "Set the agent's inbound contact policy (open|auto|contacts_only|block_all).",
+      "input_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "agent_name": {
+            "type": "string"
+          },
+          "policy": {
+            "type": "string"
+          },
+          "project_key": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "project_key",
+          "agent_name",
+          "policy"
+        ],
+        "type": "object"
+      },
+      "output_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "event_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "event_id"
+        ],
+        "type": "object"
+      }
+    },
+    "summarize_thread": {
+      "description": "Deterministic digest of a thread (participants, key points, actions).",
+      "input_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "include_examples": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "llm_mode": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "llm_model": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "per_thread_limit": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "project_key": {
+            "type": "string"
+          },
+          "thread_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "project_key",
+          "thread_id"
+        ],
+        "type": "object"
+      },
+      "output_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "action_items": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "key_points": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "message_count": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "participants": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "thread_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "thread_id",
+          "participants",
+          "key_points",
+          "action_items",
+          "message_count"
+        ],
+        "type": "object"
+      }
+    },
+    "summarize_thread_product": {
+      "description": "Summarize a thread across a product's member projects.",
+      "input_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "include_examples": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "llm_mode": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "llm_model": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "per_thread_limit": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "product_key": {
+            "type": "string"
+          },
+          "thread_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "product_key",
+          "thread_id"
+        ],
+        "type": "object"
+      },
+      "output_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "action_items": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "key_points": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "message_count": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "participants": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "thread_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "thread_id",
+          "participants",
+          "key_points",
+          "action_items",
+          "message_count"
+        ],
+        "type": "object"
+      }
+    },
+    "uninstall_precommit_guard": {
+      "description": "Remove the toron pre-commit hook (never clobbers a user hook).",
+      "input_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "code_repo_path": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "code_repo_path"
+        ],
+        "type": "object"
+      },
+      "output_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "ok": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "ok"
+        ],
+        "type": "object"
+      }
+    },
+    "whois": {
+      "description": "Resolve an agent name to npub + profile fields (fail-fast on unknown).",
+      "input_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "agent_name": {
+            "description": "The identity to look up: a REGISTERED adjective+noun pin, canonical\nname, folded alias, or npub. bd-pin-public-plane-s-easy.8: `name` is\naccepted as a serde alias (grok/other wrappers pass `name`); the\nfield stays REQUIRED (both missing fails — never defaults to $USER\nor a generated pin).",
+            "type": "string"
+          },
+          "commit_limit": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "include_recent_commits": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "project_key": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "project_key",
+          "agent_name"
+        ],
+        "type": "object"
+      },
+      "output_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "last_active_ts_us": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "model": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "npub": {
+            "type": "string"
+          },
+          "pane_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "program": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "stale": {
+            "type": "boolean"
+          },
+          "tab_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "task_description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "workspace_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "name",
+          "npub",
+          "last_active_ts_us",
+          "stale"
+        ],
+        "type": "object"
+      }
+    }
+  }
+}

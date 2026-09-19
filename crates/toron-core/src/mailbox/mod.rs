@@ -32,6 +32,7 @@ pub mod idempotent;
 pub mod identity;
 pub mod ids;
 pub mod infra;
+pub mod judgment;
 pub mod macros;
 pub mod matrix;
 pub mod messaging;
