@@ -663,6 +663,8 @@ pub async fn run_reserve(mailbox: &Mailbox, cmd: &ReserveCommand) -> anyhow::Res
     match cmd {
         ReserveCommand::Acquire(args) => {
             warn_if_unregistered(mailbox, &args.project, &args.agent).await;
+            // bd-v354: loud zero-file-match warning (stderr, warning only).
+            warn_zero_file_matches(&args.paths);
             emit(
                 mailbox
                     .file_reservation_paths(
@@ -793,6 +795,61 @@ fn parse_release_decision(s: &str) -> anyhow::Result<ReleaseDecision> {
     }
 }
 
+/// bd-v354: warn loudly when a reserve glob matches zero files under the
+/// repo (warning only — the lease is still granted, fail-closed unchanged).
+/// Stderr so the parity JSON on stdout stays parseable. Silent when the
+/// file list cannot be built (non-repo cwd) — never blocks an acquire.
+fn warn_zero_file_matches(paths: &[String]) {
+    let files = repo_relative_files();
+    if files.is_empty() {
+        return;
+    }
+    for p in paths {
+        let n = toron_core::mailbox::guard::count_pattern_matches(p, &files);
+        if let Some(w) = toron_core::mailbox::guard::zero_file_match_warning(p, n) {
+            eprintln!("{w}");
+        }
+    }
+}
+
+/// Best-effort repo file list: recursive walk of the cwd, slash-joined
+/// repo-relative paths. Skips `.git` and `target`; capped so a huge tree
+/// cannot stall an acquire.
+fn repo_relative_files() -> Vec<String> {
+    const CAP: usize = 100_000;
+    let mut out = Vec::new();
+    let mut stack = vec![std::path::PathBuf::from(".")];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if name == ".git" || name == "target" {
+                    continue;
+                }
+                stack.push(path);
+            } else if path.is_file() {
+                let rel = path
+                    .strip_prefix(".")
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .trim_start_matches('/')
+                    .trim_start_matches("./")
+                    .replace('\\', "/");
+                out.push(rel);
+                if out.len() >= CAP {
+                    return out;
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Daemon arm of `run_reserve` (bd-pin-public-plane-s-easy.14).
 pub async fn run_reserve_daemon(dc: &DaemonClient, cmd: &ReserveCommand) -> anyhow::Result<()> {
     match cmd {
@@ -802,6 +859,9 @@ pub async fn run_reserve_daemon(dc: &DaemonClient, cmd: &ReserveCommand) -> anyh
             if let Ok(mb) = toron_mcp::demo_mailbox().await {
                 warn_if_unregistered(&mb, &args.project, &args.agent).await;
             }
+            // bd-v354: client-side zero-file-match warning (cwd is the repo;
+            // the daemon never sees it). Stderr, warning only.
+            warn_zero_file_matches(&args.paths);
             daemon_tool(
                 dc,
                 "file_reservation_paths",
