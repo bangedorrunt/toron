@@ -86,4 +86,3 @@ async fn ask_judgment_live_stub_journals_and_replays() {
     }
     let _ = std::fs::remove_dir_all(&tmp);
 }
-

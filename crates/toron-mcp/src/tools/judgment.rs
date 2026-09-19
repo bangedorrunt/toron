@@ -26,11 +26,13 @@ impl ToolServer {
     /// (default offline — pure, no network). timeout_seconds default 30, max
     /// 300. Tick/DecisionReady feed is flywheel-side; this tool returns and
     /// journals the effect. Needs `flywheel` on PATH (or FLYWHEEL_BIN).
+    /// Open-world note: transport=system-one calls a live model API (paid,
+    /// networked, non-hermetic); transport=offline is pure table math.
     #[tool(
         name = "ask_judgment",
-        description = "Ask flywheel judgment math (effect_key + pack_id + state in, typed answers + journaled JudgmentEffect out; idempotent replay on effect_key).",
+        description = "Ask flywheel judgment math (effect_key + pack_id + state in, typed answers + journaled JudgmentEffect out; idempotent replay on effect_key). Offline transport is pure; system-one reaches a live model API.",
         output_schema = rmcp::handler::server::tool::schema_for_output::<crate::responses::JudgmentOutcomeOut>(),
-        annotations(title = "Ask judgment", destructive_hint = true)
+        annotations(title = "Ask judgment", destructive_hint = true, idempotent_hint = true)
     )]
     async fn ask_judgment(&self, Parameters(args): Parameters<AskJudgmentArgs>) -> ToolOutput {
         ToolOutput::result(
