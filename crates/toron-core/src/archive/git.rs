@@ -326,6 +326,8 @@ impl GitArchive {
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("no git binary configured"))?;
         validate_git_binary(bin)?;
+        let wait = crate::policy::Timeout::new(timeout);
+        let start = std::time::Instant::now();
         let mut child = std::process::Command::new(bin)
             .arg("-C")
             .arg(&self.project_root)
@@ -336,7 +338,6 @@ impl GitArchive {
             .stderr(std::process::Stdio::piped())
             .spawn()
             .map_err(|e| anyhow::anyhow!("git binary {} failed to spawn: {e}", bin.display()))?;
-        let deadline = std::time::Instant::now() + timeout;
         loop {
             match child.try_wait() {
                 Ok(Some(status)) => {
@@ -351,7 +352,7 @@ impl GitArchive {
                     return Ok(());
                 }
                 Ok(None) => {
-                    if std::time::Instant::now() >= deadline {
+                    if wait.expired(start) {
                         let _ = child.kill();
                         let _ = child.wait();
                         anyhow::bail!(
@@ -360,7 +361,7 @@ impl GitArchive {
                             timeout.as_secs(),
                         );
                     }
-                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    std::thread::sleep(wait.poll);
                 }
                 Err(e) => anyhow::bail!("git commit wait failed: {e}"),
             }
