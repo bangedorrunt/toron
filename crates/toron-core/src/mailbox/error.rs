@@ -204,7 +204,7 @@ mod tests {
         let err = typed.expect_err("maps to typed error");
         assert_eq!(err.code, MailErrorCode::NotFound);
         let ok: MailboxResult<u32> = Ok(7);
-        assert_eq!(ok.unwrap(), 7);
+        assert_eq!(ok, Ok(7));
     }
 
     #[test]

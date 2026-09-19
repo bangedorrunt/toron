@@ -159,7 +159,7 @@ impl ToolServer {
     /// `fetch_inbox` (read-only): the agent's inbox projection (rumor-time).
     #[tool(
         name = "fetch_inbox",
-        description = "Project the agent's inbox (rumor-time order, G7). unread_only and ack_overdue_only are accepted but no-ops (no read-state projection); use since_ts / thread_id to scope.",
+        description = "Project the agent's inbox (rumor-time order, G7). unread_only is accepted but a no-op (no read-state filter); ack_overdue_only keeps ack-required high/urgent posts past the 30m SLA the recipient has not read. Use since_ts / thread_id to scope.",
         output_schema = rmcp::handler::server::tool::schema_for_output::<crate::responses::FetchInboxWrapper>(),
         annotations(title = "Fetch inbox", read_only_hint = true)
     )]
@@ -173,6 +173,7 @@ impl ToolServer {
             urgent_only: args.urgent_only.unwrap_or(false),
             since_ts: args.since_ts.clone(),
             thread_id: args.thread_id.clone(),
+            ack_overdue_only: args.ack_overdue_only.unwrap_or(false),
         };
         match self.mailbox.fetch_inbox(&fi).await {
             Ok(v) => ToolOutput::ok(serde_json::json!({ "messages": v.to_json() })),
@@ -431,9 +432,9 @@ pub struct FetchInboxArgs {
     /// Accepted but a no-op (schema only): the projection carries no read
     /// state, so every fetch returns all matching rows. Scope with since_ts.
     pub unread_only: Option<bool>,
-    /// Accepted but a no-op (schema only): ack-overdue is derived
-    /// client-side over ack_required + read state (see ack-sla), never by
-    /// this projection.
+    /// Implemented: keeps ack-required high/urgent posts older than the
+    /// 30m ack SLA that this recipient has not read. Same rule as the
+    /// ack-sla scan, applied post-projection.
     pub ack_overdue_only: Option<bool>,
     pub topic: Option<String>,
     pub mark_read: Option<bool>,

@@ -169,6 +169,11 @@ pub struct InboxMessage {
 /// within this window collapse to one inbox row (i64-µs, 1h default).
 pub const DUP_COLLAPSE_WINDOW_US: i64 = 3_600_000_000;
 
+/// Default ack-SLA grace: shared by the overdue scan and the
+/// `ack_overdue_only` inbox branch so both agree on what "overdue" means.
+/// No per-call SLA arg on the inbox path (schema freeze — one meaning).
+pub const ACK_SLA_DEFAULT_SECS: i64 = 30 * 60;
+
 /// `fetch_inbox` options.
 #[derive(Debug, Clone, Default)]
 pub struct FetchInbox {
@@ -177,6 +182,11 @@ pub struct FetchInbox {
     pub unread_only: bool,
     pub limit: Option<usize>,
     pub include_bodies: bool,
+    /// Keep only ack-overdue rows: ack_required + high/urgent +
+    /// older than `ACK_SLA_DEFAULT_SECS` + this recipient unacked. Same rule
+    /// as the SLA scan, applied post-projection so every inbox path inherits
+    /// it. `false` = byte-identical to before the field existed.
+    pub ack_overdue_only: bool,
     /// Keep only messages with importance ∈ {high, urgent} (F11 / c3b.3 —
     /// applied post-projection, same for EVERY inbox path).
     pub urgent_only: bool,
@@ -218,6 +228,10 @@ fn filter_inbox_messages(
     q: &FetchInbox,
 ) -> Result<Vec<InboxMessage>, MailError> {
     let since_us = q.since_ts.as_deref().map(parse_rfc3339_us).transpose()?;
+    // ack-SLA: the overdue cutoff is shared with the SLA scan (one meaning
+    // of "overdue" across scan + inbox branch).
+    let overdue_us = crate::index::writer::Clock::now_us(&crate::index::writer::SystemClock)
+        - ACK_SLA_DEFAULT_SECS * 1_000_000;
     Ok(items
         .into_iter()
         .filter(|m| {
@@ -236,6 +250,16 @@ fn filter_inbox_messages(
             // thread field, so the comparison is exact.
             if let Some(t) = &q.thread_id
                 && m.thread_id.as_deref() != Some(t.as_str())
+            {
+                return false;
+            }
+            // ack-SLA: ack-overdue branch — the recipient's own read state
+            // rides the row (`read_ts_us`), so no extra query is needed.
+            if q.ack_overdue_only
+                && !(m.ack_required
+                    && matches!(m.importance.as_str(), "high" | "urgent")
+                    && m.created_ts_us < overdue_us
+                    && m.read_ts_us.is_none())
             {
                 return false;
             }
@@ -1068,7 +1092,7 @@ impl Mailbox {
         sla_secs: Option<u64>,
     ) -> anyhow::Result<Vec<String>> {
         let project_slug = self.canonical_project(project_slug).await;
-        let sla = sla_secs.unwrap_or(30 * 60) as i64;
+        let sla = sla_secs.map(|s| s as i64).unwrap_or(ACK_SLA_DEFAULT_SECS);
         let cutoff_us = crate::index::writer::Clock::now_us(&crate::index::writer::SystemClock)
             - sla * 1_000_000;
         let Some(pool) = self.index_pool.as_ref() else {
@@ -1095,14 +1119,36 @@ impl Mailbox {
                 .unwrap()
             });
             // SLA truth is sqlite (message_reads / receipts store), never the
-            // process-local wrap_idempotency HashMap.
-            let has_ack: i64 =
-                sqlx::query_scalar("SELECT COUNT(*) FROM message_reads WHERE message_id = ?1")
-                    .bind(&post_id)
-                    .fetch_one(pool)
-                    .await
-                    .unwrap_or(0);
-            if has_ack > 0 {
+            // process-local wrap_idempotency HashMap. ack-SLA: ack state is
+            // per (message, recipient) — one reader's receipt must not
+            // silence the wake for co-recipients. Handled iff EVERY
+            // addressed recipient has a read row.
+            let audience: Vec<String> = serde_json::from_str(&to_list_json).unwrap_or_default();
+            let mut unique: Vec<String> = audience.clone();
+            unique.sort();
+            unique.dedup();
+            let mut handled = !unique.is_empty();
+            if handled {
+                for chunk in unique.chunks(50) {
+                    // All-anonymous placeholders: mixing `?1` with bare `?`
+                    // misbinds under sqlx (IN-list silently matches nothing).
+                    let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+                    let sql = format!(
+                        "SELECT COUNT(DISTINCT recipient) FROM message_reads \
+                         WHERE message_id = ? AND recipient IN ({placeholders})"
+                    );
+                    let mut query = sqlx::query_scalar::<_, i64>(&sql).bind(&post_id);
+                    for recipient in chunk {
+                        query = query.bind(recipient);
+                    }
+                    let acked: i64 = query.fetch_one(pool).await.unwrap_or(0);
+                    if acked as usize != chunk.len() {
+                        handled = false;
+                        break;
+                    }
+                }
+            }
+            if handled {
                 continue;
             }
             if let Ok(store) = self.receipt_store()
@@ -1115,7 +1161,6 @@ impl Mailbox {
             {
                 continue;
             }
-            let audience: Vec<String> = serde_json::from_str(&to_list_json).unwrap_or_default();
             let tid = thread_id.as_deref();
             let _ = self
                 .emit_ack_sla_expired(&project_slug, &post_id, tid, &audience)
@@ -3521,6 +3566,163 @@ mod tests {
         let _ = std::fs::remove_dir_all(&data_dir);
     }
 
+    // ---- ack_overdue_only projection + per-recipient SLA ----
+
+    fn overdue_row(id: &str, importance: &str, created_ts_us: i64, read: bool, ack: bool) -> InboxMessage {
+        InboxMessage {
+            id: id.into(),
+            sender: "GreenCastle".into(),
+            subject: "s".into(),
+            body_md: "b".into(),
+            importance: importance.into(),
+            ack_required: ack,
+            thread_id: None,
+            created_ts_us,
+            read_ts_us: if read { Some(created_ts_us + 1) } else { None },
+            duplicate_of: None,
+            corr: None,
+            wake: None,
+            priority: None,
+            audience: None,
+            result_path: None,
+            verdict: None,
+            bead: None,
+        }
+    }
+
+    fn overdue_query() -> FetchInbox {
+        FetchInbox {
+            project_slug: "demo".into(),
+            agent_name: "BlueLake".into(),
+            ack_overdue_only: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn ack_overdue_only_keeps_unacked_required_past_sla() {
+        // Item 1: the flag must filter — ack_required + high/urgent + older
+        // than the SLA + unacked survives; everything else drops.
+        let now = crate::index::writer::Clock::now_us(&crate::index::writer::SystemClock);
+        let old = now - 2 * 60 * 60 * 1_000_000;
+        let rows = vec![
+            overdue_row("keep", "high", old, false, true),
+            overdue_row("read", "high", old, true, true),
+            overdue_row("noack", "high", old, false, false),
+            overdue_row("fresh", "urgent", now, false, true),
+            overdue_row("low", "low", old, false, true),
+        ];
+        let kept = filter_inbox_messages(rows, &overdue_query()).expect("filter");
+        let ids: Vec<&str> = kept.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, vec!["keep"], "only the overdue row survives");
+    }
+
+    #[test]
+    fn ack_overdue_only_off_changes_nothing() {
+        // Flag off = byte-identical behavior to before the field existed.
+        let now = crate::index::writer::Clock::now_us(&crate::index::writer::SystemClock);
+        let old = now - 2 * 60 * 60 * 1_000_000;
+        let rows = vec![
+            overdue_row("a", "high", old, false, true),
+            overdue_row("b", "low", old, false, false),
+        ];
+        let q = FetchInbox {
+            project_slug: "demo".into(),
+            agent_name: "BlueLake".into(),
+            ..Default::default()
+        };
+        let kept = filter_inbox_messages(rows, &q).expect("filter");
+        assert_eq!(kept.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn sla_scan_partial_read_still_overdue_per_recipient() {
+        // Item 2: one reader's receipt must not silence the overdue wake
+        // for the other recipient on a fan-out.
+        let (mailbox, _pool, db_path, data_dir) = test_mailbox_with_pool("sla-perrcp").await;
+        mailbox.ensure_project("demo").await.expect("ensure");
+        let (_, _) = register(&mailbox, "demo", "GreenCastle").await;
+        let (_, bnpub) = register(&mailbox, "demo", "BlueLake").await;
+        let (_, cnpub) = register(&mailbox, "demo", "RoseDune").await;
+        let pool = mailbox.index_pool.as_ref().unwrap().clone();
+        let old_us = crate::index::writer::Clock::now_us(&crate::index::writer::SystemClock)
+            - 2 * 60 * 60 * 1_000_000;
+        let to_list = serde_json::to_string(&vec![bnpub.to_hex(), cnpub.to_hex()]).unwrap();
+        sqlx::query(
+            "INSERT INTO messages (event_id, project_slug, sender, sender_pubkey, subject, body, importance, ack_required, to_list, cc_list, created_ts_us, local_seq) \
+             VALUES ('post-fan', 'demo', 'GreenCastle', 'aaaa', 's', 'b', 'high', 1, ?1, '[]', ?2, 1)",
+        )
+        .bind(&to_list)
+        .bind(old_us)
+        .execute(&pool)
+        .await
+        .expect("insert fan-out");
+        // Only BlueLake reads; RoseDune never does.
+        sqlx::query(
+            "INSERT INTO message_reads (project_slug, message_id, recipient, read_ts_us) \
+             VALUES ('demo', 'post-fan', ?1, ?2)",
+        )
+        .bind(bnpub.to_hex())
+        .bind(old_us + 1)
+        .execute(&pool)
+        .await
+        .expect("BlueLake reads");
+        let emitted = mailbox
+            .check_ack_sla_expired("demo", Some(30 * 60))
+            .await
+            .expect("check");
+        assert!(
+            emitted.contains(&"post-fan".to_string()),
+            "partial read still overdue for RoseDune"
+        );
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn sla_scan_all_recipients_read_silences() {
+        // Every recipient handled → no wake (guards the item-2 fix).
+        let (mailbox, _pool, db_path, data_dir) = test_mailbox_with_pool("sla-allread").await;
+        mailbox.ensure_project("demo").await.expect("ensure");
+        let (_, _) = register(&mailbox, "demo", "GreenCastle").await;
+        let (_, bnpub) = register(&mailbox, "demo", "BlueLake").await;
+        let (_, cnpub) = register(&mailbox, "demo", "RoseDune").await;
+        let pool = mailbox.index_pool.as_ref().unwrap().clone();
+        let old_us = crate::index::writer::Clock::now_us(&crate::index::writer::SystemClock)
+            - 2 * 60 * 60 * 1_000_000;
+        let to_list = serde_json::to_string(&vec![bnpub.to_hex(), cnpub.to_hex()]).unwrap();
+        sqlx::query(
+            "INSERT INTO messages (event_id, project_slug, sender, sender_pubkey, subject, body, importance, ack_required, to_list, cc_list, created_ts_us, local_seq) \
+             VALUES ('post-both', 'demo', 'GreenCastle', 'aaaa', 's', 'b', 'high', 1, ?1, '[]', ?2, 1)",
+        )
+        .bind(&to_list)
+        .bind(old_us)
+        .execute(&pool)
+        .await
+        .expect("insert fan-out");
+        for npub in [bnpub.to_hex(), cnpub.to_hex()] {
+            sqlx::query(
+                "INSERT INTO message_reads (project_slug, message_id, recipient, read_ts_us) \
+                 VALUES ('demo', 'post-both', ?1, ?2)",
+            )
+            .bind(npub)
+            .bind(old_us + 1)
+            .execute(&pool)
+            .await
+            .expect("read");
+        }
+        let emitted = mailbox
+            .check_ack_sla_expired("demo", Some(30 * 60))
+            .await
+            .expect("check");
+        assert!(
+            !emitted.contains(&"post-both".to_string()),
+            "all read → silent"
+        );
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
     // ---- corr-keyed idempotent send (ADR-0028 zfnx.12) ----
 
     fn idempotent_send_args(corr: &str) -> SendMessage {
@@ -3797,6 +3999,7 @@ mod tests {
                 urgent_only: false,
                 since_ts: None,
                 thread_id: None,
+                ack_overdue_only: false,
             })
             .await
             .expect("inbox");

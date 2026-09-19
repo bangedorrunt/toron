@@ -38,15 +38,21 @@ fn fetch_inbox_noop_disclosure_bd_7qcw() {
         .pointer("/properties")
         .cloned()
         .expect("properties");
-    for field in ["unread_only", "ack_overdue_only"] {
-        let fdesc = props
-            .get(field)
-            .and_then(|f| f.get("description"))
-            .and_then(|d| d.as_str())
-            .unwrap_or("");
-        assert!(
-            fdesc.contains("no-op"),
-            "{field} arg discloses no-op, got: {fdesc}"
-        );
-    }
+    // unread_only is still an accepted no-op (disclosed); ack_overdue_only
+    // is implemented and must NOT claim no-op.
+    let unread = props
+        .get("unread_only")
+        .and_then(|f| f.get("description"))
+        .and_then(|d| d.as_str())
+        .unwrap_or("");
+    assert!(unread.contains("no-op"), "unread_only discloses no-op");
+    let overdue = props
+        .get("ack_overdue_only")
+        .and_then(|f| f.get("description"))
+        .and_then(|d| d.as_str())
+        .unwrap_or("");
+    assert!(
+        !overdue.contains("no-op"),
+        "ack_overdue_only is implemented, must not claim no-op"
+    );
 }

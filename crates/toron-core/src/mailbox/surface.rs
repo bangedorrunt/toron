@@ -157,6 +157,7 @@ impl From<&InboxQuery> for FetchInbox {
             urgent_only: q.urgent_only,
             since_ts: q.since_ts.clone(),
             thread_id: q.thread_id.clone(),
+            ack_overdue_only: false,
         }
     }
 }
