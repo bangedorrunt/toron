@@ -1058,6 +1058,39 @@ async fn job_show(mailbox: &Mailbox, args: &JobShowArgs) -> anyhow::Result<()> {
     print_json(&job_row(&job, &events))
 }
 
+/// Wait until an observed count stops growing (quiescence = convergence
+/// signal), bounded by `wait` (G6). Fast when the peer is fast (two stable
+/// polls and out), bounded when claims storm in. Returns the latest count.
+/// Replaces fixed blind settle sleeps: the store is watched, not hoped on.
+async fn wait_claim_quiescent<F, Fut>(
+    wait: toron_core::policy::Timeout,
+    mut count: F,
+) -> usize
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = usize>,
+{
+    let start = Instant::now();
+    let mut stable = 0u32;
+    let mut last = count().await;
+    loop {
+        if wait.expired(start) {
+            return last;
+        }
+        tokio::time::sleep(wait.poll).await;
+        let now = count().await;
+        if now == last {
+            stable += 1;
+            if stable >= 2 {
+                return now;
+            }
+        } else {
+            stable = 0;
+            last = now;
+        }
+    }
+}
+
 /// Claim a job: publish a 43002 signed by `--as`, then resolve the winner
 /// from the stored 43002 stream. First claimer wins; a second claimer gets
 /// `won: false` and exits 1 (never a silent success).
@@ -1070,11 +1103,29 @@ async fn job_claim(mailbox: &Mailbox, args: &JobClaimArgs) -> anyhow::Result<()>
     let claim = build_job_claim(&keys, job, Timestamp::now())?;
     mailbox.bus().publish(claim.clone()).await?;
 
-    // Cross-process convergence: another process may be claiming the same
-    // job at nearly the same moment (SC-28). A settle window lets the other
-    // claim land in the shared store so BOTH processes compute the winner
-    // over the SAME claim set — exactly one `won: true`, the other exit 1.
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    // Cross-process convergence (SC-28, G6): another process may be
+    // claiming the same job at nearly the same moment. Watch the stored
+    // claim set until it stops growing (quiescence), bounded by Timeout —
+    // BOTH processes then compute the winner over the SAME claim set:
+    // exactly one `won: true`, the other exit 1. Never a fixed blind sleep.
+    let quiesce = toron_core::policy::Timeout::new(Duration::from_secs(2))
+        .with_poll(Duration::from_millis(50));
+    wait_claim_quiescent(quiesce, || {
+        let mb = mailbox;
+        let project = args.project.clone();
+        async move {
+            collect_jobs(mb, &project)
+                .await
+                .map(|events| {
+                    events
+                        .iter()
+                        .filter(|ev| ev.kind.as_u16() == 43002 && job_parent(ev) == Some(job))
+                        .count()
+                })
+                .unwrap_or(0)
+        }
+    })
+    .await;
 
     // Winner = first observed 43002 (store order; deterministic tie-break).
     let events = collect_jobs(mailbox, &args.project).await?;
@@ -2033,8 +2084,9 @@ mod live_watch_tests {
 /// bd-1wwc: presence --project/--as default from pane env (RED first).
 #[cfg(test)]
 mod presence_env_tests {
-    use super::{resolve_presence_as, resolve_presence_project};
+    use super::{resolve_presence_as, resolve_presence_project, wait_claim_quiescent};
     use std::collections::HashMap;
+    use std::time::{Duration, Instant};
 
     fn env_map(pairs: &[(&str, &str)]) -> HashMap<String, String> {
         pairs
@@ -2072,6 +2124,41 @@ mod presence_env_tests {
             resolve_presence_project(None, &lookup(&env_map(&[("TORON_PROJECT", "  ")]))),
             None
         );
+    }
+
+    /// G6: quiescence returns fast once the claim set stops growing…
+    #[tokio::test]
+    async fn claim_quiescence_returns_fast_on_stable_set() {
+        let wait = toron_core::policy::Timeout::new(Duration::from_secs(2))
+            .with_poll(Duration::from_millis(10));
+        let scripted = std::sync::Mutex::new(vec![1usize, 1, 1, 1].into_iter());
+        let start = Instant::now();
+        let seen = wait_claim_quiescent(wait, || {
+            let next = scripted.lock().unwrap().next().unwrap_or(1);
+            async move { next }
+        })
+        .await;
+        assert_eq!(seen, 1);
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "stable set returns without waiting out the bound"
+        );
+    }
+
+    /// …and stays bounded (returns the latest count) while claims storm in.
+    #[tokio::test]
+    async fn claim_quiescence_bounded_when_storm() {
+        let wait = toron_core::policy::Timeout::new(Duration::from_millis(150))
+            .with_poll(Duration::from_millis(10));
+        let n = std::sync::Mutex::new(0usize);
+        let seen = wait_claim_quiescent(wait, || {
+            let mut guard = n.lock().unwrap();
+            *guard += 1;
+            let next = *guard;
+            async move { next }
+        })
+        .await;
+        assert!(seen >= 3, "kept observing until the bound: {seen}");
     }
 
     #[test]
