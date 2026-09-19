@@ -23,8 +23,10 @@ committed (the `cargo fmt --check` pattern, ADR-0002 D3.2).
 
 ## Contract notes
 
-- Exactly 38 tools (frozen names, toron ADR-0007 C3). The bd-h3oj additive
-  `release_file_reservations_by_reason` is excluded by contract.
+- Exactly 38 tools (frozen names, toron ADR-0007 C3). Additive tools ride
+  under ADR-0033 discipline and are excluded by contract (bd-h3oj
+  `release_file_reservations_by_reason`, bd-locks-list-daemon-xetz
+  `list_file_reservations`, bd-ncpt `ask_judgment`).
 - Group names + order: Identity · Messaging · Contacts · File-reservations ·
   Search · Macros · Product-bus · Build-slots · Infrastructure (9 groups).
 - Tools extracted via `ToolServer::tool_router().list_all()` (rmcp), so

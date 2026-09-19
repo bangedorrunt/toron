@@ -19,6 +19,7 @@
 //! byte-identical (ADR-0007 C3).
 
 pub mod contact;
+pub mod judgment;
 pub mod mail;
 pub mod product;
 pub mod reservation;
@@ -554,14 +555,16 @@ impl ToolServer {
 }
 
 impl ToolServer {
-    /// The assembled 38-tool router (F21.TOOLS-SPLIT): each domain module
-    /// contributes its `#[tool_router]`-generated router; `Add` merges them
-    /// into the single surface. Tool names/args/returns are byte-identical
-    /// to the pre-split monolith (ADR-0007 C3).
+    /// The assembled router (38 parity + additive domain modules): each domain
+    /// module contributes its `#[tool_router]`-generated router; `Add` merges
+    /// them into the single surface. Parity tool names/args/returns are
+    /// byte-identical to the pre-split monolith (ADR-0007 C3); additive tools
+    /// ride under ADR-0033 discipline.
     pub fn tool_router() -> ToolRouter<Self> {
         Self::system_router()
             + Self::mail_router()
             + Self::reservation_router()
+            + Self::judgment_router()
             + Self::product_router()
             + Self::contact_router()
             + Self::slot_router()

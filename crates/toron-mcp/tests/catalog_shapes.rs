@@ -3,9 +3,10 @@
 //!
 //! `catalog_freshness` guards the 38-parity CLI catalog, but nothing froze
 //! the MCP wire shapes: an additive tool could silently reshape a parity
-//! tool and stay green. This test freezes all 40 tool shapes
+//! tool and stay green. This test freezes all 41 tool shapes
 //! (name/description/input/output schema) + 25 resource shapes in
-//! `fixtures/tool-method-shapes-v1.json`. Any drift without regen fails red.
+//! `fixtures/tool-method-shapes-v2.json` (v1 kept beside it as the audit
+//! trail per ADR-0033 §4). Any drift without regen fails red.
 //!
 //! Regen (explicit, reviewed): `TORON_REGEN_SHAPES=1 mbx test -p toron-mcp catalog_shapes`
 
@@ -15,8 +16,8 @@ use std::collections::BTreeMap;
 use toron_mcp::catalog::{ADDITIVE_TOOLS, resource_catalog, tool_catalog};
 use toron_mcp::tools::ToolServer;
 
-const FIXTURE: &str = include_str!("fixtures/tool-method-shapes-v1.json");
-const TOOL_COUNT: usize = 40;
+const FIXTURE: &str = include_str!("fixtures/tool-method-shapes-v2.json");
+const TOOL_COUNT: usize = 41;
 const RESOURCE_COUNT: usize = 25;
 
 /// Live shapes: all router tools (38 parity + additives) + resources.
@@ -83,7 +84,7 @@ fn find_drift(live: &Value, frozen: &Value) -> Vec<String> {
 
 fn fixture_path() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/tool-method-shapes-v1.json")
+        .join("tests/fixtures/tool-method-shapes-v2.json")
 }
 
 #[test]
@@ -92,7 +93,7 @@ fn catalog_shapes_frozen() {
     assert_eq!(
         live["tools"].as_object().map(serde_json::Map::len),
         Some(TOOL_COUNT),
-        "frozen surface is 40 tools (38 parity + 2 additive)"
+        "frozen surface is 41 tools (38 parity + 3 additive)"
     );
     assert_eq!(
         live["resources"].as_array().map(Vec::len),
