@@ -225,6 +225,35 @@ pub fn cross_project_pattern(pattern: &str, repo_name: &str) -> Option<String> {
     })
 }
 
+/// bd-v354: count how many repo-relative paths a reservation glob matches
+/// (fnmatch via [`pattern_matches`]). The CLI `reserve acquire` path feeds
+/// the repo file list so a zero count can warn loudly without blocking.
+pub fn count_pattern_matches(pattern: &str, files: &[String]) -> usize {
+    files
+        .iter()
+        .filter(|f| pattern_matches(pattern, f.as_str()))
+        .count()
+}
+
+/// bd-v354: loud zero-file-match warning for `reserve acquire`.
+/// Returns `None` when `matched > 0` (nothing to say). Warning only —
+/// the lease is still granted (fail-closed unchanged); the message names
+/// the fnmatch rule (`**` collapses to `*`, but a literal `/` still needs
+/// a `/` in the path, so `src/**/*.rs` misses top-level `src/*.rs`)
+/// and points at the remedy (reserve BOTH levels).
+pub fn zero_file_match_warning(pattern: &str, matched: usize) -> Option<String> {
+    if matched > 0 {
+        return None;
+    }
+    Some(format!(
+        "reserve acquire: warning — glob `{pattern}` matched 0 files under the repo. \
+         fnmatch rule: `**` collapses to `*` but a literal `/` still needs a `/` in the path, \
+         so `src/**/*.rs` misses top-level `src/*.rs`. \
+         Reserve BOTH levels (`src/*.rs` + `src/**/*.rs`) when you mean the whole tree. \
+         Lease granted anyway (fail-closed unchanged)."
+    ))
+}
+
 fn match_impl(pat: &[char], text: &[char], pi: usize, ti: usize) -> bool {
     if pi == pat.len() {
         return ti == text.len();
@@ -968,6 +997,40 @@ mod tests {
         assert!(!pattern_matches("src/[n-z]ib.rs", "src/lib.rs"));
         assert!(pattern_matches("src/[!a-k]ib.rs", "src/lib.rs"));
         assert!(pattern_matches("foo[0-9].rs", "foo5.rs"));
+    }
+
+    #[test]
+    fn test_double_star_footgun_misses_top_level_bd_v354() {
+        // bd-v354 (prior guard saga 2026-09-19): `**` collapses to `*` but the literal `/`
+        // still needs a `/` in the path, so `src/**/*.rs` misses top-level.
+        assert!(
+            !pattern_matches("src/**/*.rs", "src/main.rs"),
+            "src/**/*.rs must NOT match top-level src/main.rs (fnmatch rule)"
+        );
+        assert!(pattern_matches("src/**/*.rs", "src/sub/main.rs"));
+    }
+
+    #[test]
+    fn test_count_pattern_matches_bd_v354() {
+        let files = vec!["src/main.rs".to_string(), "src/sub/a.rs".to_string()];
+        assert_eq!(count_pattern_matches("src/**/*.rs", &files), 1);
+        // `*` crosses `/` (fnmatch), so `src/*.rs` already covers both;
+        // the footgun is the literal `/` in `**/` missing top-level.
+        assert_eq!(count_pattern_matches("src/*.rs", &files), 2);
+        assert_eq!(count_pattern_matches("*.md", &files), 0);
+    }
+
+    #[test]
+    fn test_zero_file_match_warning_bd_v354() {
+        let warn = zero_file_match_warning("src/**/*.rs", 0).expect("warn on zero");
+        assert!(warn.contains("src/**/*.rs"), "names the glob");
+        assert!(warn.contains("0 files"), "says zero");
+        assert!(warn.contains("fnmatch"), "names the rule");
+        assert!(warn.contains("BOTH"), "points at the remedy");
+        assert!(
+            zero_file_match_warning("src/**", 3).is_none(),
+            "silent on match"
+        );
     }
 
     #[test]
