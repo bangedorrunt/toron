@@ -54,12 +54,15 @@ pub struct OkOut {
 
 /// `ask_judgment` (bd-ncpt): typed answers + journaled JudgmentEffect.
 /// Mirrors the `ToJson` shape in `tools/judgment.rs` (schemars + hand-mirror
-/// must agree — the shapes fixture pins both).
+/// must agree — the shapes fixture pins both). `pack_version` is `i64` on
+/// the wire (bd-2wvb): schemars maps unsigned ints to `uint*` formats
+/// unknown to MCP clients; the value is a small pack revision, lossless in
+/// i64 (core record stays `u32`).
 #[derive(Debug, Clone, JsonSchema)]
 pub struct JudgmentOutcomeOut {
     pub effect_key: String,
     pub pack_id: String,
-    pub pack_version: u32,
+    pub pack_version: i64,
     pub model_id: String,
     pub confidence: f64,
     pub usage: String,

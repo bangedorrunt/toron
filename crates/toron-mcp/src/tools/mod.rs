@@ -739,11 +739,11 @@ mod tests {
     }
 
     /// Every tool must declare an outputSchema (ADR-0003 rev7 SEP-2106).
-    /// This is the acceptance gate for bd-jgd: 38/38 parity tools carry a
-    /// schemars-derived `output_schema` on their tool definition. The count
-    /// is 39 since bd-h3oj: 38 AM-Rust parity tools + the additive
-    /// `release_file_reservations_by_reason` (release-on-bead-close) — the
-    /// parity names/args/returns stay byte-identical (ADR-0007 C3).
+    /// Parity tools carry a schemars-derived `output_schema` on their tool
+    /// definition. The count is 41: 38 AM-Rust parity tools + the additives
+    /// `release_file_reservations_by_reason` +
+    /// `list_file_reservations` + `ask_judgment` — the parity names/args/returns
+    /// stay byte-identical (ADR-0007 C3).
     #[test]
     fn all_tools_declare_output_schema() {
         let tools = ToolServer::tool_router().list_all();
@@ -761,9 +761,9 @@ mod tests {
         );
         assert_eq!(
             tools.len(),
-            40,
-            "38 AM-Rust parity tools + release_file_reservations_by_reason (bd-h3oj) \
-             + list_file_reservations (bd-locks-list-daemon-xetz)"
+            41,
+            "38 AM-Rust parity tools + release_file_reservations_by_reason \
+             + list_file_reservations + ask_judgment"
         );
     }
 
