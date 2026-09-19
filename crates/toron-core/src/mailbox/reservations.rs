@@ -4227,6 +4227,7 @@ mod tests {
             urgent_only: true,
             since_ts: None,
             thread_id: None,
+            ack_overdue_only: false,
         };
         let before = mailbox
             .fetch_inbox(&wake_rows)

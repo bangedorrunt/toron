@@ -398,6 +398,7 @@ async fn inbox_view(mailbox: &Mailbox, name: &str) -> Option<serde_json::Value> 
         urgent_only: false,
         since_ts: None,
         thread_id: None,
+        ack_overdue_only: false,
     };
     let messages = mailbox.fetch_inbox(&args).await.ok()?;
     Some(serde_json::json!({
@@ -607,6 +608,7 @@ async fn mailbox_view(mailbox: &Mailbox, name: &str) -> Option<serde_json::Value
         urgent_only: false,
         since_ts: None,
         thread_id: None,
+        ack_overdue_only: false,
     };
     let messages = mailbox.fetch_inbox(&args).await.ok()?;
     let health = mailbox.health_check().await;

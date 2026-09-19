@@ -762,12 +762,12 @@
       }
     },
     "fetch_inbox": {
-      "description": "Project the agent's inbox (rumor-time order, G7). unread_only and ack_overdue_only are accepted but no-ops (no read-state projection); use since_ts / thread_id to scope.",
+      "description": "Project the agent's inbox (rumor-time order, G7). unread_only is accepted but a no-op (no read-state filter); ack_overdue_only keeps ack-required high/urgent posts past the 30m SLA the recipient has not read. Use since_ts / thread_id to scope.",
       "input_schema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "properties": {
           "ack_overdue_only": {
-            "description": "Accepted but a no-op (schema only): ack-overdue is derived\nclient-side over ack_required + read state (see ack-sla), never by\nthis projection.",
+            "description": "Implemented: keeps ack-required high/urgent posts older than the\n30m ack SLA that this recipient has not read. Same rule as the\nack-sla scan, applied post-projection.",
             "type": [
               "boolean",
               "null"

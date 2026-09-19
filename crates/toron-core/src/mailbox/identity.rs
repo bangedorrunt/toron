@@ -1860,6 +1860,7 @@ mod tests {
                 urgent_only: false,
                 since_ts: None,
                 thread_id: None,
+                ack_overdue_only: false,
             })
             .await
             .expect("pre-fold fetch as orphan");

@@ -313,6 +313,7 @@ async fn kdf_single_key_cold_load() {
             urgent_only: false,
             since_ts: None,
             thread_id: None,
+            ack_overdue_only: false,
         })
         .await
         .expect("inbox");
@@ -420,6 +421,7 @@ async fn thread_filter_returns_only_target_thread_rows_at_scale() {
             urgent_only: false,
             since_ts: None,
             thread_id: Some(target.clone()),
+            ack_overdue_only: false,
         })
         .await
         .expect("thread inbox");
@@ -446,6 +448,7 @@ async fn thread_filter_returns_only_target_thread_rows_at_scale() {
             urgent_only: false,
             since_ts: None,
             thread_id: None,
+            ack_overdue_only: false,
         })
         .await
         .expect("full inbox");

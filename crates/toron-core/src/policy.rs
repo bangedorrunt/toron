@@ -182,7 +182,9 @@ mod tests {
         assert!(!t.expired(std::time::Instant::now()), "fresh start");
         std::thread::sleep(Duration::from_millis(5));
         let t0 = Timeout::new(Duration::from_millis(1));
-        let start = std::time::Instant::now() - Duration::from_secs(1);
+        let start = std::time::Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .expect("past deadline is representable");
         assert!(t0.expired(start), "past deadline");
         let _ = t;
     }
