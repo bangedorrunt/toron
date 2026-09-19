@@ -122,7 +122,7 @@ pub fn mail_error_from_anyhow(e: anyhow::Error) -> MailError {
         MailErrorCode::PolicyDenied
     } else if lowered.contains("unsupported") {
         MailErrorCode::Unsupported
-    } else if lowered.contains("timeout") {
+    } else if lowered.contains("timeout") || lowered.contains("timed out") {
         MailErrorCode::Timeout
     } else if lowered.contains("malformed") || lowered.contains("parse") {
         MailErrorCode::Malformed

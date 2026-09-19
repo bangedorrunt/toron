@@ -56,6 +56,49 @@ use toron_core::mailbox::{
 /// contract on the wire.
 pub struct ToolOutput(pub anyhow::Result<serde_json::Value>);
 
+/// MCP error envelope (ADR-0034 G4): machine `code` + conservative
+/// `retryable` + one-line `hint` alongside the human message. Additive on
+/// the error path only: the first content block keeps today's exact text,
+/// the second carries the envelope JSON. Success shapes, tool names, and
+/// counts untouched (ADR-0033). Codes reuse `MailErrorCode` (ADR-0007 R1).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ToolError {
+    pub code: String,
+    pub retryable: bool,
+    pub hint: String,
+    pub message: String,
+}
+
+impl ToolError {
+    pub fn classify(e: anyhow::Error) -> Self {
+        use toron_core::mailbox::error::{MailErrorCode, mail_error_from_anyhow};
+        let message = format!("{e:#}");
+        let code = mail_error_from_anyhow(anyhow::anyhow!("{message}")).code;
+        let retryable = matches!(
+            code,
+            MailErrorCode::Timeout | MailErrorCode::Io
+        );
+        let hint = match &code {
+            MailErrorCode::NotFound =>
+                "check the agent/project/message id and retry with the correct one",
+            MailErrorCode::PolicyDenied =>
+                "request contact or use an authorized pin; never retry blind",
+            MailErrorCode::Unsupported => "use a supported backend or operation",
+            MailErrorCode::Timeout | MailErrorCode::Io => "safe to retry with backoff",
+            MailErrorCode::Malformed | MailErrorCode::Serialize => {
+                "fix the input shape and retry"
+            }
+            MailErrorCode::Other(_) => "unclassified failure; do not retry blindly",
+        };
+        Self {
+            code: code.as_str().to_string(),
+            retryable,
+            hint: hint.to_string(),
+            message,
+        }
+    }
+}
+
 impl IntoCallToolResult for ToolOutput {
     fn into_call_tool_result(self) -> Result<CallToolResponse, rmcp::ErrorData> {
         match self.0 {
@@ -75,7 +118,16 @@ impl IntoCallToolResult for ToolOutput {
                 }
                 Ok(result.into())
             }
-            Err(e) => Ok(CallToolResult::error(vec![ContentBlock::text(format!("{e:#}"))]).into()),
+            Err(e) => {
+                let env = ToolError::classify(e);
+                let envelope = serde_json::to_string(&env)
+                    .unwrap_or_else(|_| "{\"code\":\"serialize\"}".to_string());
+                Ok(CallToolResult::error(vec![
+                    ContentBlock::text(env.message),
+                    ContentBlock::text(envelope),
+                ])
+                .into())
+            }
         }
     }
 }
@@ -612,6 +664,26 @@ pub(crate) fn nonneg_secs(v: Option<i64>) -> Option<u64> {
 mod tests {
     use super::*;
     use crate::tools::system::WhoisArgs;
+
+    #[test]
+    fn tool_error_envelope_is_conservative_and_parseable() {
+        // G4: every tool error carries {code, retryable, hint}; deny-codes
+        // are never retryable; the envelope round-trips as JSON.
+        for (msg, code, retryable) in [
+            ("agent X not found", "not_found", false),
+            ("policy denied: block_all", "policy_denied", false),
+            ("fetch timed out", "timeout", true),
+            ("boom", "boom", false),
+        ] {
+            let env = ToolError::classify(anyhow::anyhow!(msg));
+            assert_eq!(env.code, code, "code for {msg}");
+            assert_eq!(env.retryable, retryable, "retryable for {msg}");
+            assert!(!env.hint.is_empty(), "hint for {msg}");
+            let v = serde_json::to_value(&env).expect("envelope serializes");
+            assert_eq!(v["code"], code);
+            assert_eq!(v["retryable"], retryable);
+        }
+    }
 
     #[test]
     fn nonneg_secs_rejects_negative_wrap() {
