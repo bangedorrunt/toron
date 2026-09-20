@@ -520,6 +520,7 @@ fn cross_process_mail_content_shares_durable_root() {
                     urgent_only: false,
                     since_ts: None,
                     thread_id: None,
+                    ack_overdue_only: false,
                 })
                 .await
                 .expect("in-process inbox");

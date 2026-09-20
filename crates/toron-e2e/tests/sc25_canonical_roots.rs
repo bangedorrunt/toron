@@ -166,6 +166,7 @@ async fn sc25_canonical_roots_slug_and_path_form_are_one_project() {
             urgent_only: false,
             since_ts: None,
             thread_id: None,
+            ack_overdue_only: false,
         })
         .await
         .expect("fetch via short root");

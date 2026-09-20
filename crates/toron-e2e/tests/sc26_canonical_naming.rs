@@ -174,6 +174,7 @@ async fn sc26_swarm_project_routes_canonical_names_and_npubs_only() {
             urgent_only: false,
             since_ts: None,
             thread_id: None,
+            ack_overdue_only: false,
         })
         .await
         .expect("fetch");
@@ -236,6 +237,7 @@ async fn sc26_folded_alias_resolves_through_to_canonical_on_whois_and_send() {
             urgent_only: false,
             since_ts: None,
             thread_id: None,
+            ack_overdue_only: false,
         })
         .await
         .expect("fetch");
@@ -380,6 +382,7 @@ async fn sc26_slug_folds_to_pin_same_npub_no_second_key() {
             urgent_only: false,
             since_ts: None,
             thread_id: None,
+            ack_overdue_only: false,
         })
         .await
         .expect("fetch");
