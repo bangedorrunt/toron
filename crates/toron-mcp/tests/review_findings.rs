@@ -56,3 +56,25 @@ fn fetch_inbox_noop_disclosure_bd_7qcw() {
         "ack_overdue_only is implemented, must not claim no-op"
     );
 }
+
+/// bd-4f2e (no silent flags): the ack_overdue_only disclosure must name
+/// the live rule — ack-required + high/urgent + 30m SLA + recipient
+/// unacked — so a future revert of the filter branch fails loudly here
+/// instead of shipping a silent flag. Characterization: pins current
+/// behavior, no behavior change in this commit.
+#[test]
+fn fetch_inbox_ack_overdue_discloses_live_rule_bd_4f2e() {
+    let schema = rmcp::schemars::schema_for!(toron_mcp::tools::mail::FetchInboxArgs);
+    let overdue = serde_json::to_value(&schema)
+        .expect("schema serializes")
+        .pointer("/properties/ack_overdue_only/description")
+        .and_then(|d| d.as_str())
+        .unwrap_or("")
+        .to_string();
+    for needle in ["ack-required", "high", "urgent", "30m", "not read"] {
+        assert!(
+            overdue.contains(needle),
+            "ack_overdue_only disclosure names the live rule ({needle}): {overdue}"
+        );
+    }
+}
