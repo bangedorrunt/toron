@@ -14,9 +14,9 @@ use async_trait::async_trait;
 use super::Mailbox;
 use super::build_slots::AcquireBuildSlotResult;
 use super::contacts::{ContactLink, RequestContact, RespondContact};
-use super::error::{MailError, MailSurfaceResult};
+use super::error::{MailError, MailErrorCode, MailSurfaceResult};
 use super::identity::{ListAgentsOptions, RegisteredAgent, WhoIs};
-use super::ids::MessageId;
+use super::ids::{MessageId, MessageIdError};
 use super::infra::{HealthReport, ProjectState};
 use super::messaging::{FetchInbox, InboxMessage, SendMessage};
 use super::product::ProductInfo;
@@ -185,37 +185,46 @@ pub struct MailItem {
     pub bead: Option<String>,
 }
 
-impl From<InboxMessage> for MailItem {
-    fn from(m: InboxMessage) -> Self {
-        MailItem {
-            id: MessageId::from(m.id),
+impl TryFrom<InboxMessage> for MailItem {
+    // Rows are a validated writer's output, but ids still parse loud
+    // (bd-r328): a corrupt row errors as Malformed instead of riding
+    // through as a silent default.
+    type Error = MailError;
+
+    fn try_from(m: InboxMessage) -> Result<Self, MailError> {
+        let bad = |e: MessageIdError| MailError::new(MailErrorCode::Malformed, e.to_string());
+        Ok(MailItem {
+            id: m.id.parse().map_err(bad)?,
             sender: m.sender,
             subject: m.subject,
             body_md: m.body_md,
             importance: m.importance,
             ack_required: m.ack_required,
-            thread_id: m.thread_id.map(MessageId::from),
+            thread_id: m.thread_id.map(|t| t.parse()).transpose().map_err(bad)?,
             created_ts_us: m.created_ts_us,
-            duplicate_of: m.duplicate_of.map(MessageId::from),
+            duplicate_of: m.duplicate_of.map(|d| d.parse()).transpose().map_err(bad)?,
             bead: m.bead,
-        }
+        })
     }
 }
 
-impl From<SearchMessage> for MailItem {
-    fn from(m: SearchMessage) -> Self {
-        MailItem {
-            id: MessageId::from(m.id),
+impl TryFrom<SearchMessage> for MailItem {
+    type Error = MailError;
+
+    fn try_from(m: SearchMessage) -> Result<Self, MailError> {
+        let bad = |e: MessageIdError| MailError::new(MailErrorCode::Malformed, e.to_string());
+        Ok(MailItem {
+            id: m.id.parse().map_err(bad)?,
             sender: m.from,
             subject: m.subject,
             body_md: m.body_md.unwrap_or_default(),
             importance: m.importance,
             ack_required: m.ack_required,
-            thread_id: m.thread_id.map(MessageId::from),
+            thread_id: m.thread_id.map(|t| t.parse()).transpose().map_err(bad)?,
             created_ts_us: m.created_ts_us,
             duplicate_of: None,
             bead: None,
-        }
+        })
     }
 }
 
@@ -606,15 +615,22 @@ impl MailSurface for ToronMailSurface {
         let deliveries: Vec<DeliveryLine> = result
             .deliveries
             .into_iter()
-            .map(|d| DeliveryLine {
-                recipient: d.payload.recipient,
-                event_id: MessageId::from(d.payload.event_id),
+            .map(|d| {
+                Ok::<_, MailError>(DeliveryLine {
+                    recipient: d.payload.recipient,
+                    event_id: d.payload.event_id.parse().map_err(|e: MessageIdError| {
+                        MailError::new(MailErrorCode::Malformed, e.to_string())
+                    })?,
+                })
             })
-            .collect();
-        let id = deliveries
-            .first()
-            .map(|d| d.event_id.clone())
-            .unwrap_or_else(|| MessageId::from(String::new()));
+            .collect::<Result<Vec<_>, _>>()?;
+        let Some(first) = deliveries.first() else {
+            return Err(MailError::new(
+                MailErrorCode::Malformed,
+                "send produced zero deliveries — no receipt id to report",
+            ));
+        };
+        let id = first.event_id.clone();
         Ok(SendReceipt {
             id,
             deliveries,
@@ -631,15 +647,22 @@ impl MailSurface for ToronMailSurface {
         let deliveries: Vec<DeliveryLine> = result
             .deliveries
             .into_iter()
-            .map(|d| DeliveryLine {
-                recipient: d.payload.recipient,
-                event_id: MessageId::from(d.payload.event_id),
+            .map(|d| {
+                Ok::<_, MailError>(DeliveryLine {
+                    recipient: d.payload.recipient,
+                    event_id: d.payload.event_id.parse().map_err(|e: MessageIdError| {
+                        MailError::new(MailErrorCode::Malformed, e.to_string())
+                    })?,
+                })
             })
-            .collect();
-        let id = deliveries
-            .first()
-            .map(|d| d.event_id.clone())
-            .unwrap_or_else(|| MessageId::from(String::new()));
+            .collect::<Result<Vec<_>, _>>()?;
+        let Some(first) = deliveries.first() else {
+            return Err(MailError::new(
+                MailErrorCode::Malformed,
+                "reply produced zero deliveries — no receipt id to report",
+            ));
+        };
+        let id = first.event_id.clone();
         Ok(SendReceipt {
             id,
             deliveries,
@@ -656,7 +679,10 @@ impl MailSurface for ToronMailSurface {
             .fetch_inbox(&FetchInbox::from(req))
             .await
             .map_mail_error()?;
-        Ok(fetched.into_iter().map(MailItem::from).collect())
+        Ok(fetched
+            .into_iter()
+            .map(MailItem::try_from)
+            .collect::<Result<Vec<_>, _>>()?)
     }
 
     async fn acknowledge(&self, req: &ReceiptOp) -> Result<ReceiptOutcome, MailError> {
@@ -666,7 +692,9 @@ impl MailSurface for ToronMailSurface {
             .await
             .map_mail_error()?;
         Ok(ReceiptOutcome {
-            message_id: MessageId::from(r.message_id),
+            message_id: r.message_id.parse().map_err(|e: MessageIdError| {
+                MailError::new(MailErrorCode::Malformed, e.to_string())
+            })?,
             acknowledged: r.acknowledged,
             acknowledged_at_us: r.acknowledged_at_us,
         })
@@ -679,7 +707,9 @@ impl MailSurface for ToronMailSurface {
             .await
             .map_mail_error()?;
         Ok(ReceiptOutcome {
-            message_id: MessageId::from(r.message_id),
+            message_id: r.message_id.parse().map_err(|e: MessageIdError| {
+                MailError::new(MailErrorCode::Malformed, e.to_string())
+            })?,
             acknowledged: r.acknowledged,
             acknowledged_at_us: r.acknowledged_at_us,
         })
@@ -703,8 +733,8 @@ impl MailSurface for ToronMailSurface {
             .await
             .map_mail_error()?
             .into_iter()
-            .map(MailItem::from)
-            .collect())
+            .map(MailItem::try_from)
+            .collect::<Result<Vec<_>, _>>()?)
     }
 
     async fn request_contact(&self, req: &ContactRequest) -> Result<ContactLink, MailError> {
@@ -935,11 +965,13 @@ impl MailSurface for ToronMailSurface {
             .await
             .map_mail_error()?
             .into_iter()
-            .map(|(project, m)| ProductHit {
-                project,
-                item: MailItem::from(m),
+            .map(|(project, m)| {
+                Ok::<_, MailError>(ProductHit {
+                    project,
+                    item: MailItem::try_from(m)?,
+                })
             })
-            .collect())
+            .collect::<Result<Vec<_>, _>>()?)
     }
 
     async fn inbox_product(
@@ -955,11 +987,13 @@ impl MailSurface for ToronMailSurface {
             .map_mail_error()?
             .into_iter()
             .take(limit.unwrap_or(usize::MAX))
-            .map(|(project, m)| ProductHit {
-                project,
-                item: MailItem::from(m),
+            .map(|(project, m)| {
+                Ok::<_, MailError>(ProductHit {
+                    project,
+                    item: MailItem::try_from(m)?,
+                })
             })
-            .collect())
+            .collect::<Result<Vec<_>, _>>()?)
     }
 
     async fn summarize_thread_product(

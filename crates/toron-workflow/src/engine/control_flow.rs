@@ -406,14 +406,62 @@ impl RetryCoordinator {
     }
 }
 
-fn disposition_for_kind(kind: &str, existing: Option<&str>) -> String {
-    if let Some(d) = existing {
-        return d.to_string();
+/// Parse one canonical wire spelling back into its enum (local inverse of
+/// [`Disposition::as_str`]; kept beside its only caller so boundary.rs
+/// stays untouched). `None` is unknown — the caller normalizes via kind.
+fn parse_disposition(s: &str) -> Option<super::boundary::Disposition> {
+    use super::boundary::Disposition as D;
+    Some(match s {
+        "continue" => D::Continue,
+        "retry" => D::Retry,
+        "reroute" => D::Reroute,
+        "blocked" => D::Blocked,
+        "terminal_failed" => D::TerminalFailed,
+        "cancelled" => D::Cancelled,
+        "reconcile" => D::Reconcile,
+        _ => return None,
+    })
+}
+
+/// Engine-internal failure routing as data (ADR-0035 Spec 6): a prior
+/// disposition wins when it parses; otherwise the kind maps. `rate_limit`
+/// normalizes to `Blocked` (`active_blocked` had exactly one producer —
+/// this fn — and zero readers, so the spelling is unified, not migrated).
+fn disposition_for_kind(kind: &str, existing: Option<&str>) -> super::boundary::Disposition {
+    use super::boundary::Disposition as D;
+    if let Some(d) = existing.and_then(parse_disposition) {
+        return d;
     }
     match kind {
-        "rate_limit" => "active_blocked".to_string(),
-        "timeout" => "terminal_failed".to_string(),
-        _ => "terminal_failed".to_string(),
+        "rate_limit" => D::Blocked,
+        "timeout" => D::TerminalFailed,
+        _ => D::TerminalFailed,
+    }
+}
+
+#[cfg(test)]
+mod disposition_tests_bd_r328 {
+    use super::super::boundary::Disposition;
+    use super::disposition_for_kind;
+
+    #[test]
+    fn red_kind_maps_to_enum() {
+        assert_eq!(
+            disposition_for_kind("rate_limit", None),
+            Disposition::Blocked
+        );
+        assert_eq!(
+            disposition_for_kind("timeout", None),
+            Disposition::TerminalFailed
+        );
+        assert_eq!(
+            disposition_for_kind("whatever", None),
+            Disposition::TerminalFailed
+        );
+        assert_eq!(
+            disposition_for_kind("timeout", Some("retry")),
+            Disposition::Retry
+        );
     }
 }
 
@@ -987,8 +1035,7 @@ pub(crate) fn run_step_with_enclosing<'a>(
                 if let Some(d) = value.get("disposition") {
                     failed["disposition"] = d.clone();
                 } else if !kind.is_empty() {
-                    failed["disposition"] =
-                        serde_json::Value::String(disposition_for_kind(kind, None));
+                    failed["disposition"] = serde_json::json!(disposition_for_kind(kind, None));
                 }
                 return Ok(failed);
             }
@@ -2197,8 +2244,7 @@ pub(crate) async fn run_graph(
                 if let Some(d) = value.get("disposition") {
                     failed["disposition"] = d.clone();
                 } else if !kind.is_empty() {
-                    failed["disposition"] =
-                        serde_json::Value::String(disposition_for_kind(kind, None));
+                    failed["disposition"] = serde_json::json!(disposition_for_kind(kind, None));
                 }
                 return Ok(failed);
             }
