@@ -19,12 +19,19 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use toron_workflow::engine::{
-    ActionRunner, ProfileResolver, RunInput, WorkflowEngine, run_workflow,
+    AsyncEffectRunner, ProfileResolver, RunInput, WorkflowEngine, run_workflow,
 };
-use toron_workflow::schema::{Action, parse_workflow};
+use toron_workflow::schema::parse_workflow;
 
-fn noop_runner() -> ActionRunner {
-    Arc::new(|_a: &Action| Ok(serde_json::Value::Null))
+fn noop_runner() -> AsyncEffectRunner {
+    Arc::new(|_: &toron_workflow::engine::ActionInvocation| {
+        Box::pin(async move { Ok(serde_json::Value::Null) })
+            as std::pin::Pin<
+                Box<
+                    dyn std::future::Future<Output = anyhow::Result<serde_json::Value>> + Send,
+                >,
+            >
+    })
 }
 
 fn housekeeper_resolver() -> ProfileResolver {
@@ -103,7 +110,12 @@ async fn sc19_spawn_await_resumes_on_job_result() {
 
     // 1. Engine runs the workflow; the `spawn` step parks on the job promise.
     //    The run is genuinely SUSPENDED (not done) when the result arrives.
-    let engine = WorkflowEngine::remote_with(&server_url, noop_runner(), housekeeper_resolver())
+    let engine = WorkflowEngine::remote_with_resolvers_and_async_effect(
+            &server_url,
+            housekeeper_resolver(),
+            WorkflowEngine::default_workflow_resolver(),
+            Some(noop_runner()),
+        )
         .expect("engine");
     let wf = parse_workflow(
         r##"

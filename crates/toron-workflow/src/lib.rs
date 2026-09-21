@@ -49,8 +49,8 @@ pub use coalesce::{
 };
 pub use dispatch::{DispatchConfig, DispatchPermit, DispatchPool, QueuedJob};
 pub use engine::{
-    ActionRunner, Decision, GraphNodeInput, ParallelCopyInput, ProfileResolver, RunInput,
-    SpawnSink, WorkflowEngine, WorkflowResolver, build_workflow_run_terminal, run_graph_node,
+    Decision, GraphNodeInput, ParallelCopyInput, ProfileResolver, RunInput, SpawnSink,
+    WorkflowEngine, WorkflowResolver, build_workflow_run_terminal, run_graph_node,
     run_parallel_copy, run_workflow, stamp_workflow_emitted,
 };
 pub use guard::{

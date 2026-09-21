@@ -28,10 +28,10 @@ evalexpr = "13.1.0"
 nostr-sdk = "0.45.2"
 nostr = { version = "0.45.3", features = ["nip44", "nip49", "nip59", "os-rng"] }
 sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio"] }
+tower = { version = "0.5", features = ["timeout", "limit", "util"] }
 
 [dev-dependencies]
 async-trait = "0.1"
-tower = "0.5"
 http-body-util = "0.1"
 uuid = { version = "1", features = ["v4"] }
 chrono = "0.4"

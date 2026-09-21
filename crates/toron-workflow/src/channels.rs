@@ -281,9 +281,8 @@ impl ChannelStore {
     pub fn apply_lifecycle(&self, ev: &Event) -> anyhow::Result<bool> {
         match ev.kind.as_u16() {
             CHANNEL_CREATE | CHANNEL_CREATE_LEGACY => {
-                let id = Self::lifecycle_channel_id(ev).ok_or_else(|| {
-                    anyhow::anyhow!("channel create lacks d/h tag")
-                })?;
+                let id = Self::lifecycle_channel_id(ev)
+                    .ok_or_else(|| anyhow::anyhow!("channel create lacks d/h tag"))?;
                 let name = ev
                     .tags
                     .iter()
@@ -314,20 +313,18 @@ impl ChannelStore {
                 Ok(true)
             }
             CHANNEL_MEMBERS => {
-                let id = Self::lifecycle_channel_id(ev).ok_or_else(|| {
-                    anyhow::anyhow!("channel members snapshot lacks d/h tag")
-                })?;
+                let id = Self::lifecycle_channel_id(ev)
+                    .ok_or_else(|| anyhow::anyhow!("channel members snapshot lacks d/h tag"))?;
                 // Content JSON is the snapshot source of truth: rust-nostr
                 // strips a p-tag that equals the signer, which would drop the
                 // joiner from a 39002 they just signed.
-                let members: Vec<String> =
-                    serde_json::from_str(&ev.content).unwrap_or_else(|_| {
-                        ev.tags
-                            .iter()
-                            .filter(|t| t.as_slice().first().map(String::as_str) == Some("p"))
-                            .filter_map(|t| t.as_slice().get(1).cloned())
-                            .collect()
-                    });
+                let members: Vec<String> = serde_json::from_str(&ev.content).unwrap_or_else(|_| {
+                    ev.tags
+                        .iter()
+                        .filter(|t| t.as_slice().first().map(String::as_str) == Some("p"))
+                        .filter_map(|t| t.as_slice().get(1).cloned())
+                        .collect()
+                });
                 if self.replace_members(&id, members).is_err() {
                     return Ok(false);
                 }

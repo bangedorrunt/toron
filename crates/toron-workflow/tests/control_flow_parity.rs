@@ -9,21 +9,27 @@
 
 use std::sync::{Arc, Mutex as StdMutex};
 
-use toron_workflow::engine::{ActionRunner, RunInput, WorkflowEngine};
+use toron_workflow::engine::{
+    ActionInvocation, AsyncEffectRunner, RunInput, WorkflowEngine,
+};
 use toron_workflow::schema::{Action, parse_workflow};
 
 fn recording_runner(
     seen: Arc<StdMutex<Vec<Action>>>,
     f: impl Fn(&Action) -> serde_json::Value + Send + Sync + 'static,
-) -> ActionRunner {
+) -> AsyncEffectRunner {
     let seen_c = seen;
-    Arc::new(move |a: &Action| {
-        seen_c.lock().unwrap().push(a.clone());
-        Ok(f(a))
+    Arc::new(move |inv: &ActionInvocation| {
+        seen_c.lock().unwrap().push(inv.action.clone());
+        let value = f(&inv.action);
+        Box::pin(async move { Ok(value) })
+            as std::pin::Pin<
+                Box<dyn std::future::Future<Output = anyhow::Result<serde_json::Value>> + Send>,
+            >
     })
 }
 
-fn always_ok_runner(seen: Arc<StdMutex<Vec<Action>>>) -> ActionRunner {
+fn always_ok_runner(seen: Arc<StdMutex<Vec<Action>>>) -> AsyncEffectRunner {
     recording_runner(seen, |_| serde_json::json!({ "ok": true }))
 }
 
@@ -31,7 +37,7 @@ fn always_ok_runner(seen: Arc<StdMutex<Vec<Action>>>) -> ActionRunner {
 #[tokio::test]
 async fn foreach_non_list_fails_loud_not_empty() {
     let seen = Arc::new(StdMutex::new(Vec::new()));
-    let engine = WorkflowEngine::local(always_ok_runner(seen)).expect("engine");
+    let engine = WorkflowEngine::local_with_async_effect_runner(Some(always_ok_runner(seen))).expect("engine");
     let wf = parse_workflow(
         r##"
 name: foreach-bad
@@ -77,7 +83,7 @@ steps:
 #[tokio::test]
 async fn parallel_invalid_count_fails_loud_not_one() {
     let seen = Arc::new(StdMutex::new(Vec::new()));
-    let engine = WorkflowEngine::local(always_ok_runner(seen)).expect("engine");
+    let engine = WorkflowEngine::local_with_async_effect_runner(Some(always_ok_runner(seen))).expect("engine");
     let wf = parse_workflow(
         r##"
 name: parallel-bad
@@ -115,7 +121,7 @@ steps:
 #[tokio::test]
 async fn parallel_zero_count_fails_loud() {
     let seen = Arc::new(StdMutex::new(Vec::new()));
-    let engine = WorkflowEngine::local(always_ok_runner(seen)).expect("engine");
+    let engine = WorkflowEngine::local_with_async_effect_runner(Some(always_ok_runner(seen))).expect("engine");
     let wf = parse_workflow(
         r##"
 name: parallel-zero
@@ -154,7 +160,7 @@ steps:
 #[tokio::test]
 async fn runtime_graph_cycle_fails_when_lint_bypassed() {
     let seen = Arc::new(StdMutex::new(Vec::new()));
-    let engine = WorkflowEngine::local(always_ok_runner(seen)).expect("engine");
+    let engine = WorkflowEngine::local_with_async_effect_runner(Some(always_ok_runner(seen))).expect("engine");
     // parse_workflow does not validate the graph; engine.run must.
     let wf = parse_workflow(
         r##"
@@ -195,7 +201,7 @@ graph:
 #[tokio::test]
 async fn runtime_graph_unknown_needs_fails_when_lint_bypassed() {
     let seen = Arc::new(StdMutex::new(Vec::new()));
-    let engine = WorkflowEngine::local(always_ok_runner(seen)).expect("engine");
+    let engine = WorkflowEngine::local_with_async_effect_runner(Some(always_ok_runner(seen))).expect("engine");
     let wf = parse_workflow(
         r##"
 name: bad-needs
@@ -238,7 +244,8 @@ graph:
 #[tokio::test]
 async fn linear_step_guard_false_skips_without_running() {
     let seen = Arc::new(StdMutex::new(Vec::new()));
-    let engine = WorkflowEngine::local(always_ok_runner(seen.clone())).expect("engine");
+    let engine = WorkflowEngine::local_with_async_effect_runner(Some(always_ok_runner(seen.clone())))
+        .expect("engine");
     let wf = parse_workflow(
         r##"
 name: linear-guard
@@ -285,7 +292,7 @@ steps:
 #[tokio::test]
 async fn branch_guard_error_fails_not_else() {
     let seen = Arc::new(StdMutex::new(Vec::new()));
-    let engine = WorkflowEngine::local(always_ok_runner(seen)).expect("engine");
+    let engine = WorkflowEngine::local_with_async_effect_runner(Some(always_ok_runner(seen))).expect("engine");
     let wf = parse_workflow(
         r##"
 name: branch-err
@@ -336,7 +343,7 @@ steps:
 #[tokio::test]
 async fn graph_node_guard_nonbool_fails_not_silent_skip() {
     let seen = Arc::new(StdMutex::new(Vec::new()));
-    let engine = WorkflowEngine::local(always_ok_runner(seen)).expect("engine");
+    let engine = WorkflowEngine::local_with_async_effect_runner(Some(always_ok_runner(seen))).expect("engine");
     let wf = parse_workflow(
         r##"
 name: node-guard
@@ -372,11 +379,14 @@ async fn nested_retry_does_not_multiply_attempts() {
     use std::sync::atomic::{AtomicUsize, Ordering};
     let calls = Arc::new(AtomicUsize::new(0));
     let calls_c = calls.clone();
-    let runner: ActionRunner = Arc::new(move |_: &Action| {
+    let afx: AsyncEffectRunner = Arc::new(move |_: &ActionInvocation| {
         calls_c.fetch_add(1, Ordering::SeqCst);
-        Ok(serde_json::json!({ "ok": false, "error": "boom" }))
+        Box::pin(async move { Ok(serde_json::json!({ "ok": false, "error": "boom" })) })
+            as std::pin::Pin<
+                Box<dyn std::future::Future<Output = anyhow::Result<serde_json::Value>> + Send>,
+            >
     });
-    let engine = WorkflowEngine::local(runner).expect("engine");
+    let engine = WorkflowEngine::local_with_async_effect_runner(Some(afx)).expect("engine");
     let wf = parse_workflow(
         r##"
 name: nested-retry
@@ -423,7 +433,7 @@ steps:
 #[tokio::test]
 async fn call_workflow_binds_child_defaults_like_invoke() {
     let seen = Arc::new(StdMutex::new(Vec::new()));
-    let runner = recording_runner(seen.clone(), |_| serde_json::json!({ "ran": true }));
+    let afx = recording_runner(seen.clone(), |_| serde_json::json!({ "ran": true }));
     let child = parse_workflow(
         r##"
 name: kid
@@ -450,10 +460,10 @@ steps:
             }
         })
     };
-    let engine = toron_workflow::engine::WorkflowEngine::local_with_resolvers(
-        runner,
+    let engine = toron_workflow::engine::WorkflowEngine::local_with_resolvers_and_async_effect(
         Arc::new(|_: &str| None),
         resolver,
+        Some(afx),
     )
     .expect("engine");
     let wf = parse_workflow(
@@ -500,7 +510,7 @@ steps:
 #[tokio::test]
 async fn unresolved_template_ref_fails_loud() {
     let seen = Arc::new(StdMutex::new(Vec::new()));
-    let engine = WorkflowEngine::local(always_ok_runner(seen)).expect("engine");
+    let engine = WorkflowEngine::local_with_async_effect_runner(Some(always_ok_runner(seen))).expect("engine");
     let wf = parse_workflow(
         r##"
 name: bad-ref

@@ -28,7 +28,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
-use toron_workflow::engine::{ActionRunner, Decision, RunInput, WorkflowEngine};
+use toron_workflow::engine::{AsyncEffectRunner, Decision, RunInput, WorkflowEngine};
 use toron_workflow::schema::{Action, Workflow, parse_workflow};
 
 /// A `deploy` workflow that hits `request_approval` after one step.
@@ -57,11 +57,16 @@ steps:
     .expect("parse deploy workflow")
 }
 
-fn noop_runner() -> ActionRunner {
-    Arc::new(|a: &Action| {
+fn noop_runner() -> AsyncEffectRunner {
+    Arc::new(|inv: &toron_workflow::engine::ActionInvocation| {
         // Record step actions for the "step events emitted throughout" assert.
-        eprintln!("[sc11] action: {}", a.type_name());
-        Ok(serde_json::Value::Null)
+        eprintln!("[sc11] action: {}", inv.action.type_name());
+        Box::pin(async move { Ok(serde_json::Value::Null) })
+            as std::pin::Pin<
+                Box<
+                    dyn std::future::Future<Output = anyhow::Result<serde_json::Value>> + Send,
+                >,
+            >
     })
 }
 
@@ -140,7 +145,8 @@ async fn sc11_approval_crash_resume() {
     wait_ready(&server_url).await;
 
     // 2. Engine A (remote worker) runs the deploy workflow → parks on approval.
-    let engine_a = WorkflowEngine::remote(&server_url, noop_runner()).expect("engine A");
+    let engine_a = WorkflowEngine::remote_with_async_effect_runner(&server_url, Some(noop_runner()))
+        .expect("engine A");
     let input = RunInput {
         run_id: Some("sc-test-run".into()),
         workflow: deploy_workflow(),
@@ -179,7 +185,8 @@ async fn sc11_approval_crash_resume() {
     // 4. RESTART: a fresh worker (Engine B) on the same server. The operator's
     //    approval (operator-signed kind-46011, echoed promise_id) resolves the
     //    promise via the fresh engine.
-    let engine_b = WorkflowEngine::remote(&server_url, noop_runner()).expect("engine B");
+    let engine_b = WorkflowEngine::remote_with_async_effect_runner(&server_url, Some(noop_runner()))
+        .expect("engine B");
     engine_b
         .resolve_approval(&promise_id, &Decision::approved("go"))
         .await

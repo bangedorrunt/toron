@@ -29,13 +29,13 @@ use std::time::Duration;
 use common::*;
 use toron_workflow::cron::{CronManager, CronRegistration, CronRegistry};
 use toron_workflow::cron_failure::PolicyEvent;
-use toron_workflow::engine::{ActionRunner, WorkflowEngine};
+use toron_workflow::engine::WorkflowEngine;
 use toron_workflow::schema::{Action, CronScope, FailureAction, parse_workflow};
 
 /// A runner that FAILS the `upgrade` action (returns `{ok:false,error}`) —
 /// with `on_error: fail_run` that flips the run to `status=failed` (P0).
-fn failing_runner() -> ActionRunner {
-    Arc::new(|a: &Action| {
+fn failing_runner() -> toron_workflow::engine::AsyncEffectRunner {
+    common::lift_async(|a: &Action| {
         if let Action::SendDm { body, .. } = a
             && body == "upgrade"
         {
@@ -115,8 +115,13 @@ async fn sc22_cron_failure_bead_records_triageable_bundle() {
     wait_ready(&server_url).await;
 
     let engine = Arc::new(
-        WorkflowEngine::remote_with(&server_url, failing_runner(), housekeeper_resolver())
-            .expect("engine"),
+        WorkflowEngine::remote_with_resolvers_and_async_effect(
+            &server_url,
+            housekeeper_resolver(),
+            WorkflowEngine::default_workflow_resolver(),
+            Some(failing_runner()),
+        )
+        .expect("engine"),
     );
     let registry: CronRegistry = {
         let reg = registration("sc22-failing");

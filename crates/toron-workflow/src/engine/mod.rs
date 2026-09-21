@@ -45,7 +45,6 @@ use serde::{Deserialize, Serialize};
 use resonate_sdk::prelude::{Resonate, ResonateConfig};
 use resonate_sdk::types::Value;
 
-use crate::schema::Action;
 
 // ---------------------------------------------------------------------------
 // Resonate server selection: remote Tailscale default, local fallback.
@@ -231,19 +230,11 @@ pub struct RunInput {
     pub run_id: Option<String>,
 }
 
-/// The shared action-execution surface (the Mailbox). Run by the workflow
-/// function via a Resonate dependency (consistency rule).
-///
-/// Every action returns a [`serde_json::Value`] (ADR-0005 Spec 0): the value
-/// flows into `steps.<name>` for downstream templates/guards. `Null` is a
-/// valid "no output" action.
-pub type ActionRunner = Arc<dyn Fn(&Action) -> anyhow::Result<serde_json::Value> + Send + Sync>;
-
 /// The context-bearing effect surface (bd-zczp, ADR-0032 Spec 1): every
 /// effectful invocation carries its [`ActionInvocation`] (run/node/effect
-/// context + policy). The engine prefers this over [`ActionRunner`] for
-/// effectful HostSink actions whenever one is injected; the legacy
-/// runner stays for pure actions, journal-less embeddings, and tests.
+/// context + policy). The engine routes effectful HostSink actions through
+/// it whenever one is injected; pure leaves compute in the boundary with no
+/// runner at all.
 pub type EffectRunner =
     Arc<dyn Fn(&ActionInvocation) -> anyhow::Result<serde_json::Value> + Send + Sync>;
 
@@ -346,8 +337,8 @@ pub enum EffectJournalMode {
 
 /// The `spawn` profile resolver DI seam (ADR-0005 Spec 4a). Resolves a
 /// profile name (`@housekeeper`) to the (npub, spawn spec) the embedding
-/// spawns. The ENGINE never imports flywheel — this seam is injected, same
-/// idiom as `ActionRunner`. `None` → unknown profile (fail the step).
+/// spawns. The ENGINE never imports flywheel — this seam is injected.
+/// `None` → unknown profile (fail the step).
 pub type ProfileResolver = Arc<dyn Fn(&str) -> Option<serde_json::Value> + Send + Sync>;
 
 /// ADR-0007 R4.1: resolve a workflow **name** to a full [`crate::schema::Workflow`] for
@@ -387,45 +378,34 @@ impl std::fmt::Debug for WorkflowEngine {
 }
 
 impl WorkflowEngine {
-    /// New engine over an in-process Resonate runtime (`Resonate::local`),
-    /// with the shared action runner + an approval sink injected.
-    pub fn local(action_runner: ActionRunner) -> anyhow::Result<Self> {
-        Self::local_with(action_runner, Self::default_resolver())
+    /// New engine over an in-process Resonate runtime (`Resonate::local`)
+    /// with an approval sink injected. Pure leaves compute in the engine;
+    /// effectful leaves need an injected async runner or journal mode.
+    pub fn local() -> anyhow::Result<Self> {
+        Self::local_with(Self::default_resolver())
     }
 
     /// Like [`Self::local`] with a `ProfileResolver` for the `spawn` action
     /// (ADR-0005 Spec 4a DI seam).
-    pub fn local_with(
-        action_runner: ActionRunner,
-        profile_resolver: ProfileResolver,
-    ) -> anyhow::Result<Self> {
-        Self::local_with_resolvers(
-            action_runner,
-            profile_resolver,
-            Self::default_workflow_resolver(),
-        )
+    pub fn local_with(profile_resolver: ProfileResolver) -> anyhow::Result<Self> {
+        Self::local_with_resolvers(profile_resolver, Self::default_workflow_resolver())
     }
 
     /// Like [`Self::local_with`] with an explicit [`WorkflowResolver`] for
     /// `call_workflow` (ADR-0007 R4.1).
     pub fn local_with_resolvers(
-        action_runner: ActionRunner,
         profile_resolver: ProfileResolver,
         workflow_resolver: WorkflowResolver,
     ) -> anyhow::Result<Self> {
-        Self::local_with_resolvers_effect(action_runner, profile_resolver, workflow_resolver, None)
+        Self::local_with_resolvers_effect(profile_resolver, workflow_resolver, None)
     }
 
     /// Like [`Self::local_with_resolvers`] with a context-bearing
     /// [`EffectRunner`] (bd-zczp): the engine prefers it over the legacy
     /// runner for mailbox/job HostSink actions. `None` preserves the
     /// legacy compat path.
-    pub fn local_with_effect_runner(
-        action_runner: ActionRunner,
-        effect_runner: Option<EffectRunner>,
-    ) -> anyhow::Result<Self> {
+    pub fn local_with_effect_runner(effect_runner: Option<EffectRunner>) -> anyhow::Result<Self> {
         Self::local_with_resolvers_effect(
-            action_runner,
             Self::default_resolver(),
             Self::default_workflow_resolver(),
             effect_runner,
@@ -437,13 +417,26 @@ impl WorkflowEngine {
     /// effectful HostSink leaves — no thread-hop bridge, no `block_on`.
     /// `None` preserves the legacy compat path.
     pub fn local_with_async_effect_runner(
-        action_runner: ActionRunner,
         async_effect_runner: Option<AsyncEffectRunner>,
     ) -> anyhow::Result<Self> {
         Self::local_with_resolvers_async_effect(
-            action_runner,
             Self::default_resolver(),
             Self::default_workflow_resolver(),
+            async_effect_runner,
+        )
+    }
+
+    /// Like [`Self::local_with_resolvers`] with an [`AsyncEffectRunner`]
+    /// (bd-ctj7): the constructor embeddings use — resolvers plus the one
+    /// async effect seam, Recording mode, no journal.
+    pub fn local_with_resolvers_and_async_effect(
+        profile_resolver: ProfileResolver,
+        workflow_resolver: WorkflowResolver,
+        async_effect_runner: Option<AsyncEffectRunner>,
+    ) -> anyhow::Result<Self> {
+        Self::local_with_resolvers_async_effect(
+            profile_resolver,
+            workflow_resolver,
             async_effect_runner,
         )
     }
@@ -454,17 +447,11 @@ impl WorkflowEngine {
     /// combined funnel was private, so `spawn`/`call_workflow` resolution or the
     /// effect journal was lost. `None` preserves the legacy compat path.
     pub fn local_with_resolvers_and_effect(
-        action_runner: ActionRunner,
         profile_resolver: ProfileResolver,
         workflow_resolver: WorkflowResolver,
         effect_runner: Option<EffectRunner>,
     ) -> anyhow::Result<Self> {
-        Self::local_with_resolvers_effect(
-            action_runner,
-            profile_resolver,
-            workflow_resolver,
-            effect_runner,
-        )
+        Self::local_with_resolvers_effect(profile_resolver, workflow_resolver, effect_runner)
     }
 
     /// [`Self::local`] with an explicit [`EffectJournalMode`]
@@ -478,12 +465,8 @@ impl WorkflowEngine {
     /// shape the mode-refusal tests need, and `#[cfg(test)]` keeps it out of
     /// the public surface.
     #[cfg(test)]
-    pub(crate) fn local_with_journal_mode(
-        action_runner: ActionRunner,
-        journal_mode: EffectJournalMode,
-    ) -> anyhow::Result<Self> {
+    pub(crate) fn local_with_journal_mode(journal_mode: EffectJournalMode) -> anyhow::Result<Self> {
         Self::local_with_resolvers_effect_mode(
-            action_runner,
             Self::default_resolver(),
             Self::default_workflow_resolver(),
             None,
@@ -495,14 +478,12 @@ impl WorkflowEngine {
     /// the constructor a real (effect-performing) embedding uses: resolvers,
     /// journaling runner, AND [`EffectJournalMode::Enforced`].
     pub fn local_with_resolvers_and_effect_mode(
-        action_runner: ActionRunner,
         profile_resolver: ProfileResolver,
         workflow_resolver: WorkflowResolver,
         effect_runner: Option<EffectRunner>,
         journal_mode: EffectJournalMode,
     ) -> anyhow::Result<Self> {
         Self::local_with_resolvers_effect_mode(
-            action_runner,
             profile_resolver,
             workflow_resolver,
             effect_runner,
@@ -516,7 +497,6 @@ impl WorkflowEngine {
     /// go through, so an engine-driven run needs no host lifecycle calls.
     #[allow(clippy::too_many_arguments)]
     pub fn local_with_resolvers_effect_mode_and_run_journal(
-        action_runner: ActionRunner,
         profile_resolver: ProfileResolver,
         workflow_resolver: WorkflowResolver,
         effect_runner: Option<EffectRunner>,
@@ -524,7 +504,6 @@ impl WorkflowEngine {
         run_journal: Option<RunJournal>,
     ) -> anyhow::Result<Self> {
         Self::local_with_resolvers_effect_mode_run_journal(
-            action_runner,
             profile_resolver,
             workflow_resolver,
             effect_runner,
@@ -536,7 +515,6 @@ impl WorkflowEngine {
     /// The mode-carrying twin of [`Self::remote_with_resolvers_and_effect`].
     pub fn remote_with_resolvers_and_effect_mode(
         url: impl Into<String>,
-        action_runner: ActionRunner,
         profile_resolver: ProfileResolver,
         workflow_resolver: WorkflowResolver,
         effect_runner: Option<EffectRunner>,
@@ -544,7 +522,6 @@ impl WorkflowEngine {
     ) -> anyhow::Result<Self> {
         Self::remote_with_resolvers_effect_mode(
             url,
-            action_runner,
             profile_resolver,
             workflow_resolver,
             effect_runner,
@@ -557,7 +534,6 @@ impl WorkflowEngine {
     #[allow(clippy::too_many_arguments)]
     pub fn remote_with_resolvers_effect_mode_and_run_journal(
         url: impl Into<String>,
-        action_runner: ActionRunner,
         profile_resolver: ProfileResolver,
         workflow_resolver: WorkflowResolver,
         effect_runner: Option<EffectRunner>,
@@ -566,7 +542,6 @@ impl WorkflowEngine {
     ) -> anyhow::Result<Self> {
         Self::remote_with_resolvers_effect_mode_run_journal(
             url,
-            action_runner,
             profile_resolver,
             workflow_resolver,
             effect_runner,
@@ -577,13 +552,11 @@ impl WorkflowEngine {
 
     /// Funnel for the local constructors: all four established above.
     fn local_with_resolvers_effect(
-        action_runner: ActionRunner,
         profile_resolver: ProfileResolver,
         workflow_resolver: WorkflowResolver,
         effect_runner: Option<EffectRunner>,
     ) -> anyhow::Result<Self> {
         Self::local_with_resolvers_effect_mode(
-            action_runner,
             profile_resolver,
             workflow_resolver,
             effect_runner,
@@ -594,13 +567,11 @@ impl WorkflowEngine {
     /// Async funnel twin of [`Self::local_with_resolvers_effect`] (bd-ckkf):
     /// resolvers + an [`AsyncEffectRunner`], Recording mode, no journal.
     fn local_with_resolvers_async_effect(
-        action_runner: ActionRunner,
         profile_resolver: ProfileResolver,
         workflow_resolver: WorkflowResolver,
         async_effect_runner: Option<AsyncEffectRunner>,
     ) -> anyhow::Result<Self> {
         Self::local_with_resolvers_async_effect_mode_and_journal(
-            action_runner,
             profile_resolver,
             workflow_resolver,
             async_effect_runner,
@@ -616,7 +587,6 @@ impl WorkflowEngine {
     /// (effect-performing) async embedding uses.
     #[allow(clippy::too_many_arguments)]
     pub fn local_with_resolvers_async_effect_mode_and_journal(
-        action_runner: ActionRunner,
         profile_resolver: ProfileResolver,
         workflow_resolver: WorkflowResolver,
         async_effect_runner: Option<AsyncEffectRunner>,
@@ -624,7 +594,6 @@ impl WorkflowEngine {
         async_run_journal: Option<AsyncRunJournal>,
     ) -> anyhow::Result<Self> {
         Self::local_with_resolvers_effect_mode_run_journal_async(
-            action_runner,
             profile_resolver,
             workflow_resolver,
             None,
@@ -639,14 +608,12 @@ impl WorkflowEngine {
     /// mode is an engine dependency so the dispatch path can enforce Spec 6
     /// without a global.
     fn local_with_resolvers_effect_mode(
-        action_runner: ActionRunner,
         profile_resolver: ProfileResolver,
         workflow_resolver: WorkflowResolver,
         effect_runner: Option<EffectRunner>,
         journal_mode: EffectJournalMode,
     ) -> anyhow::Result<Self> {
         Self::local_with_resolvers_effect_mode_run_journal(
-            action_runner,
             profile_resolver,
             workflow_resolver,
             effect_runner,
@@ -658,7 +625,6 @@ impl WorkflowEngine {
     /// [`Self::local_with_resolvers_effect_mode`] + the injected run-lifecycle
     /// journal (bd-mi9n).
     fn local_with_resolvers_effect_mode_run_journal(
-        action_runner: ActionRunner,
         profile_resolver: ProfileResolver,
         workflow_resolver: WorkflowResolver,
         effect_runner: Option<EffectRunner>,
@@ -666,7 +632,6 @@ impl WorkflowEngine {
         run_journal: Option<RunJournal>,
     ) -> anyhow::Result<Self> {
         Self::local_with_resolvers_effect_mode_run_journal_async(
-            action_runner,
             profile_resolver,
             workflow_resolver,
             effect_runner,
@@ -683,7 +648,6 @@ impl WorkflowEngine {
     /// prefers and awaits inline.
     #[allow(clippy::too_many_arguments)]
     fn local_with_resolvers_effect_mode_run_journal_async(
-        action_runner: ActionRunner,
         profile_resolver: ProfileResolver,
         workflow_resolver: WorkflowResolver,
         effect_runner: Option<EffectRunner>,
@@ -697,7 +661,6 @@ impl WorkflowEngine {
         let policy_sink = crate::cron_failure::PolicySink::new();
         let verify_sink = VerifySink::default();
         let resonate = Resonate::local()
-            .with_dependency(action_runner)
             .with_dependency(effect_runner)
             .with_dependency(async_effect_runner)
             .with_dependency(profile_resolver)
@@ -729,14 +692,13 @@ impl WorkflowEngine {
 
     /// New engine over a remote Resonate server (`ResonateConfig.url`),
     /// enabling cross-process crash survival (SC-11 uses a real server).
-    pub fn remote(url: impl Into<String>, action_runner: ActionRunner) -> anyhow::Result<Self> {
-        Self::remote_with(url, action_runner, Self::default_resolver())
+    pub fn remote(url: impl Into<String>) -> anyhow::Result<Self> {
+        Self::remote_with(url, Self::default_resolver())
     }
 
     /// Like [`Self::remote`] with a `ProfileResolver` for the `spawn` action.
     pub fn remote_with(
         url: impl Into<String>,
-        action_runner: ActionRunner,
         profile_resolver: ProfileResolver,
     ) -> anyhow::Result<Self> {
         // Delegates to the funnel so every construction site injects the
@@ -744,7 +706,6 @@ impl WorkflowEngine {
         // missed the effect-runner dep and panicked leaf dispatch).
         Self::remote_with_resolvers_effect(
             url,
-            action_runner,
             profile_resolver,
             Self::default_workflow_resolver(),
             None,
@@ -755,29 +716,73 @@ impl WorkflowEngine {
     /// `call_workflow` (ADR-0007 R4.1; mirrors `local_with_resolvers`).
     pub fn remote_with_resolvers(
         url: impl Into<String>,
-        action_runner: ActionRunner,
         profile_resolver: ProfileResolver,
         workflow_resolver: WorkflowResolver,
     ) -> anyhow::Result<Self> {
-        Self::remote_with_resolvers_effect(
+        Self::remote_with_resolvers_effect(url, profile_resolver, workflow_resolver, None)
+    }
+
+    /// Like [`Self::remote_with_resolvers_and_effect`] with an
+    /// [`AsyncEffectRunner`] (bd-ctj7): resolvers plus the one async effect
+    /// seam over a remote Resonate server, Recording mode, no journal.
+    pub fn remote_with_resolvers_and_async_effect(
+        url: impl Into<String>,
+        profile_resolver: ProfileResolver,
+        workflow_resolver: WorkflowResolver,
+        async_effect_runner: Option<AsyncEffectRunner>,
+    ) -> anyhow::Result<Self> {
+        Self::remote_with_resolvers_async_effect(
             url,
-            action_runner,
             profile_resolver,
             workflow_resolver,
+            async_effect_runner,
+        )
+    }
+
+    /// Async funnel twin of [`Self::remote_with_resolvers_effect`] (bd-ctj7).
+    fn remote_with_resolvers_async_effect(
+        url: impl Into<String>,
+        profile_resolver: ProfileResolver,
+        workflow_resolver: WorkflowResolver,
+        async_effect_runner: Option<AsyncEffectRunner>,
+    ) -> anyhow::Result<Self> {
+        Self::remote_with_resolvers_effect_mode_run_journal_async(
+            url,
+            profile_resolver,
+            workflow_resolver,
+            None,
+            async_effect_runner,
+            EffectJournalMode::default(),
+            None,
+            None,
+        )
+    }
+
+    /// Like [`Self::remote_with_effect_runner`] with an [`AsyncEffectRunner`]
+    /// (bd-ctj7): awaited inline, never bridged. `None` preserves the
+    /// no-runner path.
+    pub fn remote_with_async_effect_runner(
+        url: impl Into<String>,
+        async_effect_runner: Option<AsyncEffectRunner>,
+    ) -> anyhow::Result<Self> {
+        Self::remote_with_resolvers_async_effect_mode_and_journal(
+            url,
+            Self::default_resolver(),
+            Self::default_workflow_resolver(),
+            async_effect_runner,
+            EffectJournalMode::default(),
             None,
         )
     }
 
     /// Like [`Self::remote_with_resolvers`] with a context-bearing
-    /// [`EffectRunner`] (bd-zczp). `None` preserves the legacy compat path.
+    /// [`EffectRunner`] (bd-zczp). `None` preserves the no-runner path.
     pub fn remote_with_effect_runner(
         url: impl Into<String>,
-        action_runner: ActionRunner,
         effect_runner: Option<EffectRunner>,
     ) -> anyhow::Result<Self> {
         Self::remote_with_resolvers_effect(
             url,
-            action_runner,
             Self::default_resolver(),
             Self::default_workflow_resolver(),
             effect_runner,
@@ -790,18 +795,11 @@ impl WorkflowEngine {
     /// [`Self::local_with_resolvers_and_effect`].
     pub fn remote_with_resolvers_and_effect(
         url: impl Into<String>,
-        action_runner: ActionRunner,
         profile_resolver: ProfileResolver,
         workflow_resolver: WorkflowResolver,
         effect_runner: Option<EffectRunner>,
     ) -> anyhow::Result<Self> {
-        Self::remote_with_resolvers_effect(
-            url,
-            action_runner,
-            profile_resolver,
-            workflow_resolver,
-            effect_runner,
-        )
+        Self::remote_with_resolvers_effect(url, profile_resolver, workflow_resolver, effect_runner)
     }
 
     /// The remote twin of
@@ -809,7 +807,6 @@ impl WorkflowEngine {
     #[allow(clippy::too_many_arguments)]
     pub fn remote_with_resolvers_async_effect_mode_and_journal(
         url: impl Into<String>,
-        action_runner: ActionRunner,
         profile_resolver: ProfileResolver,
         workflow_resolver: WorkflowResolver,
         async_effect_runner: Option<AsyncEffectRunner>,
@@ -818,7 +815,6 @@ impl WorkflowEngine {
     ) -> anyhow::Result<Self> {
         Self::remote_with_resolvers_effect_mode_run_journal_async(
             url,
-            action_runner,
             profile_resolver,
             workflow_resolver,
             None,
@@ -832,14 +828,12 @@ impl WorkflowEngine {
     /// Funnel for the remote constructors.
     fn remote_with_resolvers_effect(
         url: impl Into<String>,
-        action_runner: ActionRunner,
         profile_resolver: ProfileResolver,
         workflow_resolver: WorkflowResolver,
         effect_runner: Option<EffectRunner>,
     ) -> anyhow::Result<Self> {
         Self::remote_with_resolvers_effect_mode(
             url,
-            action_runner,
             profile_resolver,
             workflow_resolver,
             effect_runner,
@@ -850,7 +844,6 @@ impl WorkflowEngine {
     /// The mode-carrying remote funnel.
     fn remote_with_resolvers_effect_mode(
         url: impl Into<String>,
-        action_runner: ActionRunner,
         profile_resolver: ProfileResolver,
         workflow_resolver: WorkflowResolver,
         effect_runner: Option<EffectRunner>,
@@ -858,7 +851,6 @@ impl WorkflowEngine {
     ) -> anyhow::Result<Self> {
         Self::remote_with_resolvers_effect_mode_run_journal(
             url,
-            action_runner,
             profile_resolver,
             workflow_resolver,
             effect_runner,
@@ -872,7 +864,6 @@ impl WorkflowEngine {
     #[allow(clippy::too_many_arguments)]
     fn remote_with_resolvers_effect_mode_run_journal(
         url: impl Into<String>,
-        action_runner: ActionRunner,
         profile_resolver: ProfileResolver,
         workflow_resolver: WorkflowResolver,
         effect_runner: Option<EffectRunner>,
@@ -881,7 +872,6 @@ impl WorkflowEngine {
     ) -> anyhow::Result<Self> {
         Self::remote_with_resolvers_effect_mode_run_journal_async(
             url,
-            action_runner,
             profile_resolver,
             workflow_resolver,
             effect_runner,
@@ -897,7 +887,6 @@ impl WorkflowEngine {
     #[allow(clippy::too_many_arguments)]
     fn remote_with_resolvers_effect_mode_run_journal_async(
         url: impl Into<String>,
-        action_runner: ActionRunner,
         profile_resolver: ProfileResolver,
         workflow_resolver: WorkflowResolver,
         effect_runner: Option<EffectRunner>,
@@ -915,7 +904,6 @@ impl WorkflowEngine {
             ..Default::default()
         };
         let resonate = Resonate::new(config)
-            .with_dependency(action_runner)
             .with_dependency(effect_runner)
             .with_dependency(async_effect_runner)
             .with_dependency(profile_resolver)

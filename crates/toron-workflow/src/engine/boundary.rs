@@ -11,9 +11,9 @@
 //! [`FailureKind`] set is closed — contract codes live in
 //! [`ActionErrorCode`] and never expand it.
 //!
-//! The old context-free [`crate::engine::ActionRunner`] remains as the
-//! migration compat adapter (ADR-0032 permits it for pure actions); the
-//! production effect path routes every call through [`partition`] and output
+//! The old context-free runner is deleted (bd-ctj7); pure leaves compute
+//! through [`invoke_compat`] with no sink, and the production effect path
+//! routes every call through [`partition`] and output
 //! normalization first, so no live variant can fall through to success.
 //!
 //! This module never retries: [`invoke`] calls the dispatch closure exactly
@@ -691,9 +691,9 @@ pub fn invoke(
     }
 }
 
-/// Compat-adapter helper for the context-free `ActionRunner` seam: route one
-/// legacy call through the boundary partition and return the
-/// runner-shaped value (`{ok:false,…}` failure object, never bare `Null`).
+/// Pure-leaf helper: route one effect-free call through the boundary
+/// partition and return the runner-shaped value (`{ok:false,…}` failure
+/// object, never bare `Null`).
 /// `dispatch_host` runs only for named-sink actions the caller can serve;
 /// when it returns `None` the sink is missing on this runner.
 pub fn invoke_compat(
