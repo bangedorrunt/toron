@@ -9,8 +9,9 @@
 //! - **one-in-flight-per-agent** (a second job for an already-working agent
 //!   QUEUES, never drops);
 //! - queued jobs are **durable**: they live in the bus event store (the
-//!   lossless-projection rule — never a dropping channel), so a toron restart
-//!   resumes the dispatch cursor.
+//!   lossless-projection rule — never a dropping channel); the in-process
+//!   queue is a single-writer cache over those rows and a restart rebuilds
+//!   it via [`DispatchPool::rebuild_from_jobs`], resuming the cursor.
 //!
 //! This is the in-process dispatcher; the Resonate-backed durable runner
 //! (bd-oge) layers crash-survivable execution on top.
@@ -80,6 +81,22 @@ impl DispatchPool {
         let mut q = self.queue.lock();
         q.push_back(job);
         q.len()
+    }
+
+    /// Rebuild the in-process queue from the durable record (bd-e03q,
+    /// ADR-0035 Spec 4): the bus kind-43001s are the source of truth and
+    /// this queue is their single-writer in-memory projection. Fresh
+    /// processes replay the unacked rows in cursor order; the embedding
+    /// sources them from the bus (the same filter `rebuild_store`-style
+    /// readers use). Replaces whatever the cache held — a restart never
+    /// merges stale memory with the truth.
+    pub fn rebuild_from_jobs(config: DispatchConfig, jobs: Vec<QueuedJob>) -> Self {
+        let pool = Self::new(config);
+        {
+            let mut q = pool.queue.lock();
+            q.extend(jobs);
+        }
+        pool
     }
 
     /// Try to acquire a dispatch slot for `agent`. Returns a permit guard when
@@ -165,6 +182,33 @@ impl Drop for DispatchPermit<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// bd-e03q RED (ADR-0035 Spec 4): the in-process queue rebuilds
+    /// from the durable record — a fresh pool over the same job rows
+    /// resumes the dispatch cursor in order.
+    #[test]
+    fn rebuild_from_jobs_restores_queue_after_restart() {
+        let jobs = vec![
+            QueuedJob {
+                job_id: "j1".into(),
+                assignee: "a".into(),
+                parent_id: "p".into(),
+                spec: serde_json::json!({}),
+            },
+            QueuedJob {
+                job_id: "j2".into(),
+                assignee: "b".into(),
+                parent_id: "p".into(),
+                spec: serde_json::json!({}),
+            },
+        ];
+        // Fresh process, wiped cache: rebuild from the durable rows.
+        let pool = DispatchPool::rebuild_from_jobs(DispatchConfig::default(), jobs);
+        assert_eq!(pool.queued_len(), 2, "both rows restored");
+        assert_eq!(pool.next_ready().expect("j1").job_id, "j1");
+        assert_eq!(pool.next_ready().expect("j2").job_id, "j2");
+        assert_eq!(pool.queued_len(), 0, "cursor drained");
+    }
 
     #[test]
     fn one_in_flight_per_agent() {

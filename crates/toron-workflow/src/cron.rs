@@ -75,6 +75,11 @@ const fn default_enabled() -> bool {
 
 /// Registry access (DI seam): the embedding supplies the current cron set.
 /// Returns the enabled registrations to drive.
+/// The registry query seam (bd-e03q, ADR-0035 Spec 4): a closure over the
+/// spec source (YAML files, DB rows), NOT a snapshot. The manager calls it
+/// on every start, so the registry is a live projection — edited specs take
+/// effect at the next start with no cache to invalidate and nothing to
+/// rebuild. Closures own no state; staleness is impossible by construction.
 pub type CronRegistry = Arc<dyn Fn() -> Vec<CronRegistration> + Send + Sync>;
 
 /// One ADR-0012 spec-driven cron the manager drives (P12.2, bd-25g7.2): the
@@ -927,6 +932,33 @@ mod tests {
 
     async fn count_events(sink: &PolicySink) -> usize {
         sink.lock().await.len()
+    }
+
+    /// bd-e03q RED (ADR-0035 Spec 4): the registry is queried fresh on
+    /// every start — no snapshot is cached, so edited specs take effect at
+    /// the next start with nothing to invalidate.
+    #[tokio::test]
+    async fn registry_is_queried_fresh_on_every_start() {
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+        let calls2 = calls.clone();
+        let registry: CronRegistry = std::sync::Arc::new(move || {
+            *calls2.lock().unwrap() += 1;
+            Vec::new()
+        });
+        let engine = std::sync::Arc::new(
+            crate::engine::WorkflowEngine::local(Arc::new(|_: &Action| {
+                Ok(serde_json::json!({ "ran": true }))
+            }))
+            .expect("local engine"),
+        );
+        let manager = CronManager::new(engine, registry).expect("manager");
+        manager.start().await.expect("first start");
+        manager.start().await.expect("second start");
+        assert_eq!(
+            *calls.lock().unwrap(),
+            2,
+            "one live query per start, never a cached snapshot"
+        );
     }
 
     /// The P12.2 gate: a CronSpec runs as a Resonate durable function —

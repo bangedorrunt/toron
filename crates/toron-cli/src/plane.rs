@@ -43,7 +43,7 @@ use toron_core::nostr::event::build_event;
 use toron_core::nostr::kinds::toron_kind;
 use toron_core::nostr::presence::{PresencePayload, PresenceState, build_presence_event};
 use toron_workflow::channels::{
-    CHANNEL_CREATE, CHANNEL_CREATE_LEGACY, CHANNEL_MEMBERS, CHANNEL_MESSAGE,
+    CHANNEL_CREATE_LEGACY, CHANNEL_MESSAGE,
     CHANNEL_MESSAGE_LEGACY, CHANNEL_METADATA_LEGACY, ChannelStore, REACTION,
 };
 use toron_workflow::coalesce::MentionCoalescer;
@@ -177,6 +177,11 @@ async fn load_agent_key(mailbox: &Mailbox, project: &str, whois: &WhoIs) -> anyh
 /// Rebuild the in-memory channel store from bus lifecycle events so a
 /// fresh process sees rooms created by other processes (cross-process SC-27).
 /// Canonical: 39000/39002. Legacy ingest: 40/41.
+///
+/// Parsing lives in [`ChannelStore::apply_lifecycle`] (bd-e03q, Spec 4 — one
+/// parser, not two); this edge stays lenient like before (a malformed event
+/// is skipped, never a command-killing abort), while library callers that
+/// need fail-closed use [`ChannelStore::rebuild`].
 async fn rebuild_store(mailbox: &Mailbox, project: &str) -> anyhow::Result<ChannelStore> {
     let store = ChannelStore::new();
     let filter = Filter::new()
@@ -189,83 +194,7 @@ async fn rebuild_store(mailbox: &Mailbox, project: &str) -> anyhow::Result<Chann
         .hashtag(project);
     let events = collect_replay(mailbox.bus().as_ref(), filter).await?;
     for ev in events {
-        match ev.kind.as_u16() {
-            CHANNEL_CREATE | CHANNEL_CREATE_LEGACY => {
-                let id = ev
-                    .tags
-                    .iter()
-                    .find(|t| t.kind() == "d")
-                    .and_then(|t| t.content())
-                    .or_else(|| {
-                        ev.tags
-                            .iter()
-                            .find(|t| t.kind() == "h")
-                            .and_then(|t| t.content())
-                    })
-                    .unwrap_or_default();
-                let name = ev
-                    .tags
-                    .iter()
-                    .find(|t| t.as_slice().first().map(String::as_str) == Some("name"))
-                    .and_then(|t| t.as_slice().get(1).cloned())
-                    .unwrap_or_default();
-                let private = ev.tags.iter().any(|t| {
-                    t.as_slice().first().map(String::as_str) == Some("private")
-                        && t.as_slice().get(1).map(String::as_str) == Some("true")
-                });
-                let _ = store.create_channel(&ev.pubkey, id, &name, private, Some(project));
-                let closed = ev.tags.iter().any(|t| {
-                    t.as_slice().first().map(String::as_str) == Some("closed")
-                        && t.as_slice().get(1).map(String::as_str) != Some("false")
-                });
-                if closed {
-                    let _ = store.close(id, &ev.pubkey);
-                }
-            }
-            CHANNEL_METADATA_LEGACY => {
-                let id = ev
-                    .tags
-                    .iter()
-                    .find(|t| t.kind() == "h")
-                    .and_then(|t| t.content())
-                    .unwrap_or_default();
-                match ev.content.as_str() {
-                    "join" => {
-                        let _ = store.join(id, &ev.pubkey);
-                    }
-                    "leave" => {
-                        let _ = store.leave(id, &ev.pubkey);
-                    }
-                    "close" => {
-                        let _ = store.close(id, &ev.pubkey);
-                    }
-                    _ => {}
-                }
-            }
-            CHANNEL_MEMBERS => {
-                let id = ev
-                    .tags
-                    .iter()
-                    .find_map(|t| {
-                        (t.kind() == "h" || t.kind() == "d")
-                            .then(|| t.content())
-                            .flatten()
-                    })
-                    .unwrap_or_default();
-                // Content JSON is the snapshot source of truth: rust-nostr
-                // strips a p-tag that equals the signer, which would drop the
-                // joiner from a 39002 they just signed.
-                let members: Vec<String> = serde_json::from_str(&ev.content).unwrap_or_else(|_| {
-                    ev.tags
-                        .iter()
-                        .filter(|t| t.as_slice().first().map(String::as_str) == Some("p"))
-                        .filter_map(|t| t.as_slice().get(1).cloned())
-                        .collect()
-                });
-                let _ = store.replace_members(id, members);
-            }
-            _ => {}
-        }
+        let _ = store.apply_lifecycle(&ev);
     }
     Ok(store)
 }
