@@ -425,8 +425,9 @@ fn parse_disposition(s: &str) -> Option<super::boundary::Disposition> {
 
 /// Engine-internal failure routing as data (ADR-0035 Spec 6): a prior
 /// disposition wins when it parses; otherwise the kind maps. `rate_limit`
-/// normalizes to `Blocked` (`active_blocked` had exactly one producer —
-/// this fn — and zero readers, so the spelling is unified, not migrated).
+/// normalizes to `Blocked` (the legacy string spelling had exactly one
+/// producer — this fn — and zero readers, so the spelling is unified,
+/// not migrated).
 fn disposition_for_kind(kind: &str, existing: Option<&str>) -> super::boundary::Disposition {
     use super::boundary::Disposition as D;
     if let Some(d) = existing.and_then(parse_disposition) {
