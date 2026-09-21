@@ -40,6 +40,7 @@ pub mod metrics;
 pub mod naming;
 pub mod product;
 pub mod receipts;
+pub mod receipts_core;
 pub mod reservations;
 pub mod search;
 pub mod send_tags;
@@ -55,6 +56,7 @@ pub use guard::{
 };
 pub use idempotent::{IdempotentSendStore, SendClaim, send_key};
 pub use identity::{ListAgentsOptions, RegisteredAgent, WhoIs};
+pub use ids::{BoundaryIdError, Corr, EffectKey, MessageId, RunId, ThreadId};
 pub use infra::{HealthComponent, HealthReport, ProjectState};
 pub use macros::{
     ContactHandshakeResult, PrepareThreadResult, ReservationCycleResult, StartSessionResult,
@@ -75,8 +77,9 @@ pub use reservations::{
 pub use search::{SearchMessage, SearchMessages, ThreadSummary};
 pub use unwrap::{
     AckCache, AutoPolicy, ContactPolicy, DedupKey, DualProjectionSink, FixedPolicy,
-    GitProjectionSink, PolicySource, ProjectGitProjectionSink, ProjectOutcome, ProjectionSink,
-    SqliteProjectionSink, TriggerNotifySink, UnwrapPipeline, UnwrappedMail, order_by_rumor_time,
+    GitProjectionSink, PolicyError, PolicySource, ProjectGitProjectionSink, ProjectOutcome,
+    ProjectionSink, SqliteProjectionSink, TriggerNotifySink, UnwrapPipeline, UnwrappedMail,
+    order_by_rumor_time,
 };
 
 /// Mailbox context: the bus every tool publishes to + the on-disk project

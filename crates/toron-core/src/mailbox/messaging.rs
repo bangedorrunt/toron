@@ -29,6 +29,7 @@
 //! Read receipts are lost on an index rebuild (projection-only, documented).
 
 use std::collections::HashMap;
+use std::str::FromStr;
 use std::sync::Arc;
 
 use crate::nostr::UnsignedEvent;
@@ -358,7 +359,11 @@ impl Mailbox {
                         let pool = store.pool().clone();
                         tokio::spawn(async move {
                             let s = crate::mailbox::receipts::ReceiptStore::new(pool);
-                            let _ = s.prune_expired(30 * 24 * 60 * 60 * 1000).await;
+                            // Host clock (ADR-0035 Spec 1): prune takes host time.
+                            let now_ms = crate::index::writer::Clock::now_us(
+                                &crate::index::writer::SystemClock,
+                            ) / 1000;
+                            let _ = s.prune_expired(now_ms, 30 * 24 * 60 * 60 * 1000).await;
                             let _ = s.prune_to_cap(1000).await;
                         });
                     }
@@ -1235,10 +1240,13 @@ impl Mailbox {
         let id = EventId::from_hex(message_id).unwrap_or_else(|_| original.rumor.clone().id());
         if let Some(ts) = self.receipt_time(project_slug, agent_name, &id, kind) {
             // Even on duplicate, heal a lagging durable receipt (best-effort).
-            if let Some(corr) = corr_opt.clone()
+            if let Some(corr_s) = corr_opt.clone()
+                && let Ok(corr) = crate::mailbox::ids::Corr::from_str(&corr_s)
                 && let Ok(store) = self.receipt_store()
             {
-                let _ = store.transition_acked(&corr).await;
+                let now_ms =
+                    crate::index::writer::Clock::now_us(&crate::index::writer::SystemClock) / 1000;
+                let _ = store.transition_acked(&corr, now_ms).await;
             }
             return Ok(ReceiptResult {
                 message_id: message_id.to_string(),
@@ -1268,11 +1276,15 @@ impl Mailbox {
         self.record_receipt(project_slug, agent_name, &id, kind, ts_us);
         self.record_read_state(project_slug, npub, &id, ts_us).await;
         // ADR-0027 E2.3: durable receipt owed -> acked (best-effort).
-        if let Some(corr) = corr_opt
+        if let Some(corr_s) = corr_opt
+            && let Ok(corr) = crate::mailbox::ids::Corr::from_str(&corr_s)
             && let Ok(store) = self.receipt_store()
-            && let Err(e) = store.transition_acked(&corr).await
         {
-            eprintln!("toron: receipt transition to acked failed for corr {corr}: {e}");
+            let now_ms =
+                crate::index::writer::Clock::now_us(&crate::index::writer::SystemClock) / 1000;
+            if let Err(e) = store.transition_acked(&corr, now_ms).await {
+                eprintln!("toron: receipt transition to acked failed for corr {corr}: {e}");
+            }
         }
         Ok(ReceiptResult {
             message_id: message_id.to_string(),
@@ -3568,7 +3580,13 @@ mod tests {
 
     // ---- ack_overdue_only projection + per-recipient SLA ----
 
-    fn overdue_row(id: &str, importance: &str, created_ts_us: i64, read: bool, ack: bool) -> InboxMessage {
+    fn overdue_row(
+        id: &str,
+        importance: &str,
+        created_ts_us: i64,
+        read: bool,
+        ack: bool,
+    ) -> InboxMessage {
         InboxMessage {
             id: id.into(),
             sender: "GreenCastle".into(),

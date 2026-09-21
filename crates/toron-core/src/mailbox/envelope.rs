@@ -184,21 +184,32 @@ mod journal_envelope_tests {
 
     #[tokio::test]
     async fn store_ack_without_row_creates_nothing() {
+        use super::super::ids::Corr;
         use super::super::receipts::ReceiptStore;
+        use std::str::FromStr;
         let (pool, _path) = test_pool("no-row").await;
         let store = ReceiptStore::new(pool);
-        assert!(!store.transition_acked("ghost").await.expect("ok"));
+        assert!(
+            !store
+                .transition_acked(&Corr::from_str("ghost").expect("corr"), 7000)
+                .await
+                .expect("ok")
+        );
         assert!(store.get("ghost").await.expect("ok").is_none());
     }
 
     #[tokio::test]
     async fn store_guards_never_downgrade() {
+        use super::super::ids::Corr;
         use super::super::receipts::{Receipt, ReceiptStore};
+        use std::str::FromStr;
         let (pool, _path) = test_pool("guards").await;
         let store = ReceiptStore::new(pool);
-        let now = chrono::Utc::now().timestamp_millis();
+        // Fixed host clock (ADR-0035 Spec 1): no wall reads in tests either.
+        let now = 7001;
+        let c1 = Corr::from_str("c1").expect("corr");
         store
-            .set_resulted("c1", None)
+            .set_resulted(&c1, None, now)
             .await
             .expect("explicit verb creates");
         store

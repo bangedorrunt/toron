@@ -288,7 +288,7 @@ impl Mailbox {
                     .iter()
                     .filter(|e| e.pubkey == *agent_npub)
                     .max_by_key(|e| e.created_at.as_secs())
-                    .map(|e| ContactPolicy::parse(&e.content))
+                    .and_then(|e| ContactPolicy::parse(&e.content).ok())
                     .unwrap_or(ContactPolicy::Auto)
             })
     }
@@ -501,7 +501,7 @@ impl BusPolicySource {
                     .iter()
                     .filter(|e| e.pubkey.to_hex() == *hex)
                     .max_by_key(|e| e.created_at.as_secs())
-                    .map(|e| ContactPolicy::parse(&e.content))
+                    .and_then(|e| ContactPolicy::parse(&e.content).ok())
                 {
                     source.policies.write().insert((*hex).to_string(), policy);
                 }

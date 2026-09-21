@@ -17,6 +17,7 @@ mod workflow;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::str::FromStr;
 
 use clap::Parser;
 
@@ -501,8 +502,16 @@ async fn run_receipt(cmd: &cli::ReceiptCommand, format: OutputFormat) -> anyhow:
                     args.state
                 );
             }
+            // Boundary parse (ADR-0035 Spec 6): an empty corr fails loud.
+            let corr = toron_core::mailbox::Corr::from_str(&args.corr)
+                .map_err(|e| anyhow::anyhow!("invalid --corr: {e}"))?;
+            // Host clock (ADR-0035 Spec 1): the store takes host time.
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0);
             let receipt = store
-                .set_resulted(&args.corr, args.result_path.clone())
+                .set_resulted(&corr, args.result_path.clone(), now_ms)
                 .await?;
             let value = serde_json::json!({
                 "corr": receipt.corr,

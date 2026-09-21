@@ -12,7 +12,10 @@
 //! the cursor.
 
 use sqlx::SqlitePool;
+use std::str::FromStr;
 
+use super::ids::Corr;
+use super::receipts_core::{self, ReceiptEffect, ReceiptsModel, ReceiptsMsg, State as CoreState};
 use crate::mailbox::send_tags::Wake;
 
 /// Receipt state (E2/E3 lifecycle, extended by flywheel ADR-0010 D8).
@@ -29,6 +32,28 @@ pub enum ReceiptState {
     /// ADR-0010 D8: bookkeeping failure after durable enqueue. The wrap
     /// landed; the receipt could not be maintained. Never resend-inviting.
     Degraded,
+}
+
+impl From<ReceiptState> for CoreState {
+    fn from(s: ReceiptState) -> Self {
+        match s {
+            ReceiptState::Owed => Self::Owed,
+            ReceiptState::Acked => Self::Acked,
+            ReceiptState::Resulted => Self::Resulted,
+            ReceiptState::Degraded => Self::Degraded,
+        }
+    }
+}
+
+impl From<CoreState> for ReceiptState {
+    fn from(s: CoreState) -> Self {
+        match s {
+            CoreState::Owed => Self::Owed,
+            CoreState::Acked => Self::Acked,
+            CoreState::Resulted => Self::Resulted,
+            CoreState::Degraded => Self::Degraded,
+        }
+    }
 }
 
 impl ReceiptState {
@@ -111,9 +136,23 @@ impl ReceiptStore {
     pub const fn new(pool: SqlitePool) -> Self {
         Self { pool }
     }
-
     pub const fn pool(&self) -> &SqlitePool {
         &self.pool
+    }
+
+    /// Load one corr row as a core model plus the raw row (for the host to
+    /// carry wake/due_at across the stamp). One loader for both transitions.
+    async fn load_model(&self, corr: &Corr) -> anyhow::Result<(ReceiptsModel, Option<Receipt>)> {
+        let current = self.get(corr.as_str()).await?;
+        let model = current.as_ref().map_or_else(ReceiptsModel::new, |r| {
+            ReceiptsModel::with_row(
+                corr.as_str(),
+                CoreState::from(r.state),
+                r.result_path.clone(),
+                r.updated_at,
+            )
+        });
+        Ok((model, current))
     }
 
     /// Idempotent upsert (INSERT OR REPLACE via ON CONFLICT). Validates
@@ -126,7 +165,8 @@ impl ReceiptStore {
     /// a `resulted` row keeps its stored `result_path` unless the incoming
     /// row carries a new one.
     pub async fn upsert(&self, receipt: &Receipt) -> anyhow::Result<()> {
-        if receipt.corr.trim().is_empty() {
+        // Boundary parse (ADR-0035 Spec 6): corr is a `Corr`, non-empty.
+        if Corr::from_str(&receipt.corr).is_err() {
             anyhow::bail!("corr must be non-empty");
         }
         // Validate wake if present (ensures only standing|tasked ever lands)
@@ -262,71 +302,115 @@ impl ReceiptStore {
     }
 
     /// Transition owed -> acked for `corr`. Idempotent: acked->acked no-op;
-    /// resulted never downgrades. Returns `true` if the row was changed.
-    pub async fn transition_acked(&self, corr: &str) -> anyhow::Result<bool> {
-        let existing = self.get(corr).await?;
-        let Some(mut r) = existing else {
-            return Ok(false);
-        };
-        match r.state {
-            ReceiptState::Resulted => return Ok(false),
-            ReceiptState::Acked => return Ok(false),
-            // ADR-0010 D8: an ack landing after a degraded record is the
-            // recovery path — degraded (acked-unknown) upgrades to acked.
-            ReceiptState::Degraded => {}
-            ReceiptState::Owed => {}
+    /// resulted never downgrades. `now_ms` is host-supplied (ADR-0035 Spec 1:
+    /// the clock enters as a Msg payload). Returns `true` if the row changed.
+    /// The decision lives in `receipts_core::tick`; this method interprets.
+    pub async fn transition_acked(&self, corr: &Corr, now_ms: i64) -> anyhow::Result<bool> {
+        let (model, current) = self.load_model(corr).await?;
+        let (_, fx) = receipts_core::tick(
+            &model,
+            &ReceiptsMsg::Ack {
+                corr: corr.as_str().to_string(),
+                now_ms,
+            },
+        );
+        match fx.first() {
+            Some(ReceiptEffect::Stamp {
+                state,
+                result_path,
+                updated_at_ms,
+                ..
+            }) => {
+                let base = current.unwrap_or_else(|| Receipt {
+                    corr: corr.as_str().to_string(),
+                    state: ReceiptState::Owed,
+                    wake: None,
+                    due_at: None,
+                    result_path: None,
+                    updated_at: 0,
+                });
+                self.upsert_row(&Receipt {
+                    corr: corr.as_str().to_string(),
+                    state: ReceiptState::from(*state),
+                    wake: base.wake,
+                    due_at: base.due_at,
+                    result_path: result_path.clone(),
+                    updated_at: *updated_at_ms,
+                })
+                .await?;
+                Ok(true)
+            }
+            _ => Ok(false),
         }
-        r.state = ReceiptState::Acked;
-        r.updated_at = chrono::Utc::now().timestamp_millis();
-        self.upsert(&r).await?;
-        Ok(true)
     }
 
     /// Explicitly set `corr` to resulted (ADR-0027 E2.3). Never downgrades
     /// resulted: the update is idempotent. Optionally updates `result_path`.
-    /// Creates the row if no prior receipt exists (explicit verb).
+    /// Creates the row if no prior receipt exists (explicit verb). `now_ms`
+    /// is host-supplied; the decision lives in `receipts_core::tick`.
     pub async fn set_resulted(
         &self,
-        corr: &str,
+        corr: &Corr,
         result_path: Option<String>,
+        now_ms: i64,
     ) -> anyhow::Result<Receipt> {
-        let now = chrono::Utc::now().timestamp_millis();
-        if let Some(mut r) = self.get(corr).await? {
-            if r.state == ReceiptState::Resulted {
-                if let Some(p) = result_path.clone()
-                    && r.result_path.as_deref() != Some(p.as_str())
-                {
-                    r.result_path = Some(p);
-                    r.updated_at = now;
-                    self.upsert(&r).await?;
-                }
-                return Ok(r);
+        let (model, current) = self.load_model(corr).await?;
+        let (_, fx) = receipts_core::tick(
+            &model,
+            &ReceiptsMsg::SetResulted {
+                corr: corr.as_str().to_string(),
+                result_path: result_path.clone(),
+                now_ms,
+            },
+        );
+        match fx.first() {
+            Some(ReceiptEffect::Stamp {
+                state,
+                result_path: stamped_path,
+                updated_at_ms,
+                ..
+            }) => {
+                let base = current.unwrap_or_else(|| Receipt {
+                    corr: corr.as_str().to_string(),
+                    state: ReceiptState::Owed,
+                    wake: None,
+                    due_at: None,
+                    result_path: None,
+                    updated_at: 0,
+                });
+                let stamped = Receipt {
+                    corr: corr.as_str().to_string(),
+                    state: ReceiptState::from(*state),
+                    wake: base.wake,
+                    due_at: base.due_at,
+                    result_path: stamped_path.clone(),
+                    updated_at: *updated_at_ms,
+                };
+                self.upsert_row(&stamped).await?;
+                Ok(stamped)
             }
-            r.state = ReceiptState::Resulted;
-            if let Some(p) = result_path.clone() {
-                r.result_path = Some(p);
-            }
-            r.updated_at = now;
-            self.upsert(&r).await?;
-            Ok(r)
-        } else {
-            let r = Receipt {
-                corr: corr.to_string(),
-                state: ReceiptState::Resulted,
-                wake: None,
-                due_at: None,
-                result_path,
-                updated_at: now,
-            };
-            self.upsert(&r).await?;
-            Ok(r)
+            _ => self
+                .get(corr.as_str())
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("receipt vanished mid-transition")),
         }
     }
-    /// Prune receipts older than `retention_ms` (wall-clock). Keeps the table
-    /// bounded — callers should invoke periodically (e.g. on mailbox open
-    /// and daily). Best-effort: never errors on empty store.
-    pub async fn prune_expired(&self, retention_ms: i64) -> anyhow::Result<u64> {
-        let cutoff = chrono::Utc::now().timestamp_millis() - retention_ms;
+    /// Prune receipts older than `retention_ms` of host time `now_ms` (both
+    /// host-supplied; ADR-0035 Spec 1). Keeps the table bounded — callers
+    /// should invoke periodically (e.g. on mailbox open and daily).
+    /// Best-effort: never errors on empty store.
+    pub async fn prune_expired(&self, now_ms: i64, retention_ms: i64) -> anyhow::Result<u64> {
+        let (_, fx) = receipts_core::tick(
+            &ReceiptsModel::new(),
+            &ReceiptsMsg::Prune {
+                now_ms,
+                retention_ms,
+            },
+        );
+        let cutoff = match fx.first() {
+            Some(ReceiptEffect::PruneBefore { cutoff_ms }) => *cutoff_ms,
+            _ => now_ms.saturating_sub(retention_ms),
+        };
         let res = sqlx::query("DELETE FROM receipts WHERE updated_at < ?1")
             .bind(cutoff)
             .execute(&self.pool)
@@ -489,12 +573,16 @@ mod tests {
 
     #[tokio::test]
     async fn receipts_transition_acked_owed_to_acked_idempotent_and_no_downgrade() {
+        use super::super::ids::Corr;
+        fn c(s: &str) -> Corr {
+            s.parse().expect("test corr")
+        }
         let (pool, path) = test_pool("trans-acked").await;
         let store = ReceiptStore::new(pool);
         // missing -> no-op
         assert!(
             !store
-                .transition_acked("missing")
+                .transition_acked(&c("missing"), 1000)
                 .await
                 .expect("transition missing")
         );
@@ -510,11 +598,22 @@ mod tests {
             })
             .await
             .expect("seed owed");
-        assert!(store.transition_acked("c-acked").await.expect("transition"));
+        assert!(
+            store
+                .transition_acked(&c("c-acked"), 1001)
+                .await
+                .expect("transition")
+        );
         let got = store.get("c-acked").await.expect("get").expect("found");
         assert_eq!(got.state, ReceiptState::Acked);
+        assert_eq!(got.updated_at, 1001, "host clock stamps the row");
         // idempotent: acked -> acked no-op
-        assert!(!store.transition_acked("c-acked").await.expect("second ack"));
+        assert!(
+            !store
+                .transition_acked(&c("c-acked"), 1002)
+                .await
+                .expect("second ack")
+        );
         let got2 = store.get("c-acked").await.expect("get2").expect("found2");
         assert_eq!(got2.state, ReceiptState::Acked);
         // resulted never downgrades
@@ -531,7 +630,7 @@ mod tests {
             .expect("seed resulted");
         assert!(
             !store
-                .transition_acked("c-resulted")
+                .transition_acked(&c("c-resulted"), 1003)
                 .await
                 .expect("ack on resulted")
         );
@@ -546,11 +645,15 @@ mod tests {
 
     #[tokio::test]
     async fn receipts_set_resulted_creates_and_transitions_and_idempotent() {
+        use super::super::ids::Corr;
+        fn c(s: &str) -> Corr {
+            s.parse().expect("test corr")
+        }
         let (pool, path) = test_pool("set-resulted").await;
         let store = ReceiptStore::new(pool);
         // create when missing
         let r = store
-            .set_resulted("new-corr", Some("/tmp/a.json".into()))
+            .set_resulted(&c("new-corr"), Some("/tmp/a.json".into()), 2000)
             .await
             .expect("set new");
         assert_eq!(r.state, ReceiptState::Resulted);
@@ -568,7 +671,7 @@ mod tests {
             .await
             .expect("seed owed");
         let r2 = store
-            .set_resulted("owed-1", Some("/tmp/b.json".into()))
+            .set_resulted(&c("owed-1"), Some("/tmp/b.json".into()), 2001)
             .await
             .expect("set owed->resulted");
         assert_eq!(r2.state, ReceiptState::Resulted);
@@ -587,19 +690,19 @@ mod tests {
             .await
             .expect("seed acked");
         let r3 = store
-            .set_resulted("acked-1", None)
+            .set_resulted(&c("acked-1"), None, 2002)
             .await
             .expect("acked->resulted");
         assert_eq!(r3.state, ReceiptState::Resulted);
         // idempotent: resulted -> resulted (no downgrade, optional path update)
         let r4 = store
-            .set_resulted("acked-1", Some("/tmp/c.json".into()))
+            .set_resulted(&c("acked-1"), Some("/tmp/c.json".into()), 2003)
             .await
             .expect("second resulted");
         assert_eq!(r4.state, ReceiptState::Resulted);
         assert_eq!(r4.result_path.as_deref(), Some("/tmp/c.json"));
         let r5 = store
-            .set_resulted("acked-1", None)
+            .set_resulted(&c("acked-1"), None, 2004)
             .await
             .expect("third resulted no path");
         assert_eq!(r5.state, ReceiptState::Resulted);

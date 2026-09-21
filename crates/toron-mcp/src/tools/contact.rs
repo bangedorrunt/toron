@@ -96,7 +96,10 @@ impl ToolServer {
         &self,
         Parameters(args): Parameters<SetContactPolicyArgs>,
     ) -> ToolOutput {
-        let policy = ContactPolicy::parse(&args.policy);
+        let policy = match ContactPolicy::parse(&args.policy) {
+            Ok(p) => p,
+            Err(e) => return ToolOutput::err(format!("invalid policy: {e}")),
+        };
         match self
             .mailbox
             .set_contact_policy(&args.project_key, &args.agent_name, policy)

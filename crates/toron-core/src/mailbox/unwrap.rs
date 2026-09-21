@@ -49,13 +49,16 @@ pub enum ContactPolicy {
 }
 
 impl ContactPolicy {
-    /// Parse from a kind-30014 policy string (or config).
-    pub fn parse(s: &str) -> Self {
+    /// Parse from a kind-30014 policy string (or config). Unknown input is a
+    /// typed error, never a silent default (ADR-0035 Spec 6): event-replay
+    /// callers skip unparseable rows explicitly; user-input callers fail loud.
+    pub fn parse(s: &str) -> Result<Self, PolicyError> {
         match s.trim().to_ascii_lowercase().as_str() {
-            "open" => Self::Open,
-            "contacts_only" => Self::ContactsOnly,
-            "block_all" => Self::BlockAll,
-            _ => Self::Auto,
+            "open" => Ok(Self::Open),
+            "auto" => Ok(Self::Auto),
+            "contacts_only" => Ok(Self::ContactsOnly),
+            "block_all" => Ok(Self::BlockAll),
+            _ => Err(PolicyError::Unknown(s.to_string())),
         }
     }
 
@@ -81,6 +84,27 @@ impl ContactPolicy {
         }
     }
 }
+
+/// Why a [`ContactPolicy`] failed to parse (ADR-0035 Spec 6: unknown
+/// inputs fail loud, never default).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PolicyError {
+    /// The input named no known policy (`open|auto|contacts_only|block_all`).
+    Unknown(String),
+}
+
+impl std::fmt::Display for PolicyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unknown(s) => write!(
+                f,
+                "unknown contact policy {s:?} — expected open|auto|contacts_only|block_all"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for PolicyError {}
 
 /// A projected mail unit: the unwrapped rumor + its G7 ordering key.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1180,14 +1204,27 @@ mod tests {
 
     #[test]
     fn test_policy_parse_and_allows() {
-        assert_eq!(ContactPolicy::parse("open"), ContactPolicy::Open);
-        assert_eq!(ContactPolicy::parse("auto"), ContactPolicy::Auto);
         assert_eq!(
-            ContactPolicy::parse("contacts_only"),
+            ContactPolicy::parse("open").expect("open"),
+            ContactPolicy::Open
+        );
+        assert_eq!(
+            ContactPolicy::parse("auto").expect("auto"),
+            ContactPolicy::Auto
+        );
+        assert_eq!(
+            ContactPolicy::parse("contacts_only").expect("contacts_only"),
             ContactPolicy::ContactsOnly
         );
-        assert_eq!(ContactPolicy::parse("block_all"), ContactPolicy::BlockAll);
-        assert_eq!(ContactPolicy::parse("BOGUS"), ContactPolicy::Auto);
+        assert_eq!(
+            ContactPolicy::parse("block_all").expect("block_all"),
+            ContactPolicy::BlockAll
+        );
+        // Unknown input fails loud, never a silent default (ADR-0035 Spec 6).
+        assert!(
+            matches!(ContactPolicy::parse("BOGUS"), Err(PolicyError::Unknown(_))),
+            "BOGUS policy rejected loudly"
+        );
 
         assert!(ContactPolicy::Open.allows(false));
         assert!(ContactPolicy::Auto.allows(false));
