@@ -28,6 +28,10 @@ impl ToolServer {
     /// journals the effect. Needs `flywheel` on PATH (or FLYWHEEL_BIN).
     /// Open-world note: transport=system-one calls a live model API (paid,
     /// networked, non-hermetic); transport=offline is pure table math.
+    /// Offline note (bd-8yj0): offline asks naming one of the five seeded
+    /// packs (route-triage, wake-priority, dispatchable, verify-citation,
+    /// hazard-guardrail) answer hermetically in toron-core with scripted
+    /// seeds — no subprocess; unseeded packs still delegate to flywheel.
     #[tool(
         name = "ask_judgment",
         description = "Ask flywheel judgment math (effect_key + pack_id + state in, typed answers + journaled JudgmentEffect out; idempotent replay on effect_key). Offline transport is pure; system-one reaches a live model API.",

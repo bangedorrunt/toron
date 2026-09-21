@@ -61,6 +61,11 @@ pub struct JudgmentEffectRecord {
     pub escalated: bool,
     pub note: String,
     pub answers: serde_json::Value,
+    /// Stable content hash of the judged state (ADR-0035 Spec 3: journal
+    /// rows gain pack_version + state_hash). Defaulted so pre-bd-8yj0 rows
+    /// parse; the TEXT effect_json column carries it, no migration needed.
+    #[serde(default)]
+    pub state_hash: String,
 }
 
 /// Outcome of `ask_judgment`: the record + whether it was replayed.
@@ -153,7 +158,225 @@ pub fn record_from_value(
             .unwrap_or(false),
         note,
         answers,
+        // Parse boundary cannot see the judged state; `ask_judgment` fills
+        // the hash before journaling (bd-8yj0).
+        state_hash: String::new(),
     })
+}
+
+// ── Pack registry + offline seeds (ADR-0035 Spec 3, bd-8yj0) ───────────────
+// Packs are data, versioned. System-one delegates to flywheel (which resolves
+// the pack; unknown there is a typed error, never a guess). Offline answers
+// known packs hermetically (no subprocess); an offline ask naming an
+// unseeded pack falls through to the child so doors that name flywheel-side
+// packs keep working (flywheel resolves; unknown there errors loud).
+
+/// One question in a pack. IDs are for code; full meaning stays inline here.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PackQuestion {
+    Choice { id: String, options: Vec<String> },
+    Score { id: String, min: f64, max: f64 },
+    Noul { id: String },
+}
+
+/// A versioned question pack.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Pack {
+    pub id: &'static str,
+    pub version: u32,
+    pub questions: Vec<PackQuestion>,
+}
+
+fn choice(id: &str, options: &[&str]) -> PackQuestion {
+    PackQuestion::Choice {
+        id: id.to_string(),
+        options: options.iter().map(|s| (*s).to_string()).collect(),
+    }
+}
+
+fn score(id: &str, min: f64, max: f64) -> PackQuestion {
+    PackQuestion::Score {
+        id: id.to_string(),
+        min,
+        max,
+    }
+}
+
+fn noul(id: &str) -> PackQuestion {
+    PackQuestion::Noul { id: id.to_string() }
+}
+
+/// The five Spec-3 packs. Pure constructor, no globals.
+pub fn pack_registry() -> Vec<Pack> {
+    vec![
+        Pack {
+            id: "route-triage",
+            version: 1,
+            questions: vec![
+                choice(
+                    "primitive",
+                    &["loop-work", "steer", "compose", "audit", "open", "none"],
+                ),
+                noul("risk_destructive"),
+                noul("risk_security"),
+            ],
+        },
+        Pack {
+            id: "wake-priority",
+            version: 1,
+            questions: vec![
+                score("urgency", 0.0, 1.0),
+                score("actionability", 0.0, 1.0),
+                noul("interrupt"),
+            ],
+        },
+        Pack {
+            id: "dispatchable",
+            version: 1,
+            questions: vec![noul("sufficient")],
+        },
+        Pack {
+            id: "verify-citation",
+            version: 1,
+            questions: vec![choice(
+                "support",
+                &["supports", "contradicts", "insufficient"],
+            )],
+        },
+        Pack {
+            id: "hazard-guardrail",
+            version: 1,
+            questions: vec![noul("hazard"), score("severity", 0.0, 1.0)],
+        },
+    ]
+}
+
+/// Resolve a pack by id. `None` is unknown — the caller errors loud.
+pub fn find_pack(pack_id: &str) -> Option<Pack> {
+    pack_registry().into_iter().find(|p| p.id == pack_id)
+}
+
+fn sorted_value(v: &serde_json::Value) -> serde_json::Value {
+    match v {
+        serde_json::Value::Object(m) => {
+            let mut keys: Vec<&String> = m.keys().collect();
+            keys.sort();
+            let mut out = serde_json::Map::with_capacity(m.len());
+            for k in keys {
+                out.insert(k.clone(), sorted_value(&m[k]));
+            }
+            serde_json::Value::Object(out)
+        }
+        serde_json::Value::Array(a) => {
+            serde_json::Value::Array(a.iter().map(sorted_value).collect())
+        }
+        _ => v.clone(),
+    }
+}
+
+/// Stable content hash of the judged state (FNV-1a over canonical JSON with
+/// sorted object keys). Journal discrimination + replay identity; not a secret.
+pub fn state_hash(state: &serde_json::Value) -> String {
+    let canon = serde_json::to_string(&sorted_value(state)).unwrap_or_default();
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in canon.as_bytes() {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    format!("{h:016x}")
+}
+
+/// Scripted hermetic answer for a known pack (offline transport). Fixed per
+/// pack, so unit tests are deterministic; the state hash is still recorded
+/// for journal discrimination. Noul-near-0.5 seeds escalate per the
+/// confidence discipline (code routes those to human review).
+pub fn offline_answer(
+    effect_key: &str,
+    pack: &Pack,
+    state: &serde_json::Value,
+) -> JudgmentEffectRecord {
+    let (answers, confidence, escalated) = match pack.id {
+        "route-triage" => (
+            serde_json::json!({
+                "primitive": "open",
+                "risk_destructive": 0.1,
+                "risk_security": 0.1
+            }),
+            0.6,
+            false,
+        ),
+        "wake-priority" => (
+            serde_json::json!({
+                "urgency": 0.5,
+                "actionability": 0.5,
+                "interrupt": 0.5
+            }),
+            0.5,
+            true,
+        ),
+        "dispatchable" => (serde_json::json!({"sufficient": 0.5}), 0.5, true),
+        "verify-citation" => (serde_json::json!({"support": "insufficient"}), 0.5, true),
+        "hazard-guardrail" => (
+            serde_json::json!({"hazard": 0.1, "severity": 0.2}),
+            0.9,
+            false,
+        ),
+        _ => (serde_json::json!({}), 0.0, true),
+    };
+    JudgmentEffectRecord {
+        effect_key: effect_key.to_string(),
+        pack_id: pack.id.to_string(),
+        pack_version: pack.version,
+        model_id: "offline-seed".to_string(),
+        confidence,
+        usage: "0+0".to_string(),
+        fallback_flag: false,
+        escalated,
+        note: "offline seed (hermetic, no subprocess)".to_string(),
+        answers,
+        state_hash: state_hash(state),
+    }
+}
+
+/// Wake routing verdict for tick-side call sites (Spec 3.5 composite).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WakeGate {
+    Inject,
+    Digest,
+    Queue,
+}
+
+/// Code-owned composite: 0.5*urgency + 0.3*actionability + 0.2*interrupt.
+/// Thresholds are tuned on project data; changing them never re-runs inference.
+pub fn decide_wake_gate(urgency: f64, actionability: f64, interrupt: f64) -> WakeGate {
+    let s = 0.5_f64.mul_add(urgency, 0.3_f64.mul_add(actionability, 0.2 * interrupt));
+    if s >= 0.65 {
+        WakeGate::Inject
+    } else if s >= 0.35 {
+        WakeGate::Queue
+    } else {
+        WakeGate::Digest
+    }
+}
+
+/// Route-triage verdict for tick-side call sites.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RouteDecision {
+    pub primitive: String,
+    pub needs_human: bool,
+}
+
+/// High per-risk Noul routes to human; never auto-acts through risk.
+pub fn route_triage_decision(
+    primitive: &str,
+    risk_destructive: f64,
+    risk_security: f64,
+) -> RouteDecision {
+    RouteDecision {
+        primitive: primitive.to_string(),
+        needs_human: risk_destructive >= 0.7 || risk_security >= 0.7,
+    }
 }
 
 /// Validate call args before spawning: non-empty keys, bounded state/transport/timeout.
@@ -281,6 +504,20 @@ impl super::Mailbox {
                 replayed: true,
             });
         }
+        // Offline + seeded pack: hermetic scripted answer, no subprocess.
+        // Offline + unseeded pack: fall through to the child (flywheel
+        // resolves the pack; unknown there is a typed error, never a guess).
+        if transport == "offline"
+            && let Some(pack) = find_pack(pack_id)
+        {
+            let record = offline_answer(effect_key, &pack, state);
+            journal_insert(pool, project_slug, &record).await?;
+            let record = journal_get(pool, effect_key).await?.unwrap_or(record);
+            return Ok(JudgmentOutcome {
+                record,
+                replayed: false,
+            });
+        }
         let bin = flywheel_bin();
         let argv = judgment_argv(effect_key, pack_id, &state_json, transport);
         let mut cmd = tokio::process::Command::new(&bin);
@@ -319,7 +556,8 @@ impl super::Mailbox {
             );
         }
         let stdout = String::from_utf8_lossy(&out.stdout);
-        let record = parse_judgment_stdout(effect_key, pack_id, &stdout)?;
+        let mut record = parse_judgment_stdout(effect_key, pack_id, &stdout)?;
+        record.state_hash = state_hash(state);
         journal_insert(pool, project_slug, &record).await?;
         let record = journal_get(pool, effect_key).await?.unwrap_or(record);
         Ok(JudgmentOutcome {
@@ -431,6 +669,85 @@ mod tests {
         let big = serde_json::json!({"blob": "x".repeat(JUDGMENT_MAX_STATE_BYTES)});
         let e = check_judgment_args("k", "p", &big, "offline", None).unwrap_err();
         assert!(e.to_string().contains("cap"), "{e}");
+    }
+
+    #[test]
+    fn test_pack_registry_has_five_packs_bd_8yj0() {
+        let packs = pack_registry();
+        let ids: Vec<&str> = packs.iter().map(|p| p.id).collect();
+        assert_eq!(
+            ids,
+            vec![
+                "route-triage",
+                "wake-priority",
+                "dispatchable",
+                "verify-citation",
+                "hazard-guardrail"
+            ]
+        );
+        for p in &packs {
+            assert!(p.version >= 1, "{} unversioned", p.id);
+            assert!(!p.questions.is_empty(), "{} questionless", p.id);
+        }
+    }
+
+    #[test]
+    fn test_find_pack_unknown_is_none_bd_8yj0() {
+        assert!(find_pack("nope").is_none());
+        assert!(find_pack("route-triage").is_some());
+    }
+
+    #[test]
+    fn test_offline_seed_deterministic_bd_8yj0() {
+        let s = serde_json::json!({"goal": "x"});
+        let pack = find_pack("wake-priority").expect("seeded");
+        let a = offline_answer("k", &pack, &s);
+        let b = offline_answer("k", &pack, &s);
+        assert_eq!(a, b);
+        assert_eq!(a.effect_key, "k");
+        assert_eq!(a.pack_version, pack.version);
+        assert!(!a.state_hash.is_empty(), "seed carries state hash");
+    }
+
+    #[test]
+    fn test_state_hash_stable_and_order_insensitive_bd_8yj0() {
+        let a = serde_json::json!({"x": 1, "y": {"b": 2, "a": 1}});
+        let b = serde_json::json!({"y": {"a": 1, "b": 2}, "x": 1});
+        assert_eq!(state_hash(&a), state_hash(&b));
+        assert_ne!(
+            state_hash(&a),
+            state_hash(&serde_json::json!({"x": 2})),
+            "content change moves the hash"
+        );
+    }
+
+    #[test]
+    fn test_wake_gate_thresholds_bd_8yj0() {
+        assert_eq!(decide_wake_gate(0.9, 0.9, 0.9), WakeGate::Inject);
+        assert_eq!(decide_wake_gate(0.5, 0.5, 0.5), WakeGate::Queue);
+        assert_eq!(decide_wake_gate(0.1, 0.1, 0.1), WakeGate::Digest);
+    }
+
+    #[test]
+    fn test_route_triage_high_risk_needs_human_bd_8yj0() {
+        let d = route_triage_decision("steer", 0.9, 0.1);
+        assert!(d.needs_human, "destructive risk routes to human");
+        let calm = route_triage_decision("steer", 0.1, 0.1);
+        assert_eq!(calm.primitive, "steer");
+        assert!(!calm.needs_human);
+    }
+
+    #[test]
+    fn test_old_row_without_state_hash_still_parses_bd_8yj0() {
+        let full = serde_json::to_value(
+            parse_judgment_stdout("k", "p", &sample_out("k", "p")).expect("parse"),
+        )
+        .expect("to value");
+        let mut obj = full.as_object().expect("object").clone();
+        obj.remove("state_hash");
+        let r: JudgmentEffectRecord =
+            serde_json::from_value(serde_json::Value::Object(obj)).expect("old row parses");
+        assert_eq!(r.state_hash, "");
     }
 
     #[tokio::test]
