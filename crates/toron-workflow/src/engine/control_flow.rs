@@ -20,9 +20,10 @@ use crate::schema::{Action, Graph, Step, StepOnError};
 
 use super::template::{RenderContext, render_action, render_action_lenient, render_text};
 use super::{
-    ActionInvocation, ActionPartition, ActionRunner, ApprovalSink, Decision, EffectJournalMode,
-    EffectRunner, ExecutionPolicy, FailureKind, ProfileResolver, RunContext, RunInput, RunJournal,
-    RunPhase, RunTransition, SpawnSink, WorkflowEngine, WorkflowResolver, partition,
+    ActionInvocation, ActionPartition, ActionRunner, ApprovalSink, AsyncEffectRunner,
+    AsyncRunJournal, Decision, EffectJournalMode, EffectRunner, ExecutionPolicy, FailureKind,
+    ProfileResolver, RunContext, RunInput, RunJournal, RunPhase, RunTransition, SpawnSink,
+    WorkflowEngine, WorkflowResolver, partition,
 };
 
 use sha2::{Digest, Sha256};
@@ -215,14 +216,34 @@ pub async fn run_workflow(
     // no run rows (the embedding owns its lifecycle, as before).
     let run_journal_dep = ctx.get_dependency::<Option<RunJournal>>();
     let run_journal: Option<&RunJournal> = run_journal_dep.as_ref().as_ref();
-    if let Some(journal) = run_journal {
+    // bd-ckkf: the async journal wins — awaited inline, never bridged.
+    let async_journal_dep = ctx.get_dependency::<Option<AsyncRunJournal>>();
+    let async_run_journal: Option<AsyncRunJournal> = (*async_journal_dep).clone();
+    let report_phase =
+        |run_id: &str, workflow: &str, workflow_digest: &str, phase: RunPhase| RunTransition {
+            run_id: run_id.to_string(),
+            workflow: workflow.to_string(),
+            workflow_digest: workflow_digest.to_string(),
+            phase,
+        };
+    if let Some(journal) = async_run_journal.clone() {
         for phase in [RunPhase::Started, RunPhase::Running] {
-            journal(&RunTransition {
-                run_id: run_id.clone(),
-                workflow: workflow_name.clone(),
-                workflow_digest: workflow_digest.clone(),
+            journal(report_phase(
+                &run_id,
+                &workflow_name,
+                &workflow_digest,
                 phase,
-            });
+            ))
+            .await;
+        }
+    } else if let Some(journal) = run_journal {
+        for phase in [RunPhase::Started, RunPhase::Running] {
+            journal(&report_phase(
+                &run_id,
+                &workflow_name,
+                &workflow_digest,
+                phase,
+            ));
         }
     }
     let outcome = run_graph(
@@ -234,7 +255,7 @@ pub async fn run_workflow(
         &workflow_digest,
     )
     .await;
-    if let Some(journal) = run_journal {
+    if async_run_journal.clone().is_some() || run_journal.is_some() {
         // The engine's ONE outcome rule (same one `build_workflow_run_terminal`
         // reads): an outcome carrying `status: "failed"` is the failure, any
         // other Ok is success, and an Err is a failure.
@@ -245,12 +266,12 @@ pub async fn run_workflow(
             Ok(_) => RunPhase::Succeeded,
             Err(_) => RunPhase::Failed,
         };
-        journal(&RunTransition {
-            run_id: run_id.clone(),
-            workflow: workflow_name.clone(),
-            workflow_digest: workflow_digest.clone(),
-            phase,
-        });
+        let transition = report_phase(&run_id, &workflow_name, &workflow_digest, phase);
+        if let Some(journal) = async_run_journal {
+            journal(transition).await;
+        } else if let Some(journal) = run_journal {
+            journal(&transition);
+        }
     }
     outcome
 }
@@ -484,7 +505,10 @@ pub const EFFECT_JOURNAL_SINK_UNCOVERED: &str = "bypassed-sink-uncovered";
 ///
 /// Returns the leaf's value, never an `Option`: a refusal is a value, so no
 /// caller can mistake "refused" for "not my concern" and re-dispatch it.
-fn dispatch_leaf_or_compat(
+///
+/// Async: every branch that touches a runner is awaited inline — the one
+/// async boundary in the leaf path (bd-ckkf, ADR-0035 Spec 2.2).
+async fn dispatch_leaf_or_compat(
     ctx: &Context,
     runner: &ActionRunner,
     invocation: &ActionInvocation,
@@ -492,6 +516,13 @@ fn dispatch_leaf_or_compat(
     let ActionPartition::HostSink { sink } = partition(&invocation.action) else {
         return compat_leaf(runner, &invocation.action);
     };
+    // bd-ckkf: the async seam wins for HostSink leaves — awaited inline,
+    // never thread-hop bridged. Absent = the legacy sync surface below.
+    let async_stored: Arc<Option<AsyncEffectRunner>> =
+        ctx.get_dependency::<Option<AsyncEffectRunner>>();
+    if let Some(afx) = (*async_stored).clone() {
+        return dispatch_leaf_async(ctx, &afx, invocation).await;
+    }
     let stored: Arc<Option<EffectRunner>> = ctx.get_dependency::<Option<EffectRunner>>();
     let Some(fx) = (*stored).clone() else {
         return without_journal_seam(ctx, runner, invocation, sink);
@@ -506,6 +537,33 @@ fn dispatch_leaf_or_compat(
             fx(&journaled)
         }
         _ => fx(invocation),
+    };
+    match outcome {
+        Ok(value) => value,
+        Err(e) => serde_json::json!({ "ok": false, "error": e.to_string() }),
+    }
+}
+
+/// The async twin of the sync effect branch above (bd-ckkf): the same
+/// verify-first carrier rule, but the runner is awaited inline instead of
+/// bridged. Runner-shaped values throughout (`{ok:false,…}` failures, never
+/// bare `Err`), so the engine's failure predicate keeps working.
+async fn dispatch_leaf_async(
+    ctx: &Context,
+    afx: &AsyncEffectRunner,
+    invocation: &ActionInvocation,
+) -> serde_json::Value {
+    // Only `verify` needs a second, carrier-bearing invocation (the clone is
+    // avoided on the common path: an effectful leaf dispatches on every run).
+    let outcome = match &invocation.action {
+        Action::Verify { command } => {
+            let sink: Arc<crate::engine::VerifySink> =
+                ctx.get_dependency::<crate::engine::VerifySink>();
+            let mut journaled = invocation.clone();
+            journaled.run.provider_result = Some(sink.project(command));
+            afx(&journaled).await
+        }
+        _ => afx(invocation).await,
     };
     match outcome {
         Ok(value) => value,
@@ -656,10 +714,30 @@ pub(crate) fn run_step_with_enclosing<'a>(
             attempt += 1;
             let value = match &step.action {
                 Action::Delay { secs } => {
-                    // Durable sleep — UNBOUNDED (the Buzz 270s cap is gone;
-                    // hours/days/weeks for SLA timers, cron-like cadence).
-                    ctx.sleep(Duration::from_secs(*secs)).await?;
-                    serde_json::Value::Null
+                    // bd-zbnw (ADR-0035 Spec 2.5): the lint advisory cap is
+                    // now enforced — an over-cap delay sleeps the cap, says
+                    // so loud (stderr + the value), and never sleeps
+                    // unbounded.
+                    let requested = *secs;
+                    let capped = requested > crate::lint::DELAY_CAP_SECS;
+                    let applied = requested.min(crate::lint::DELAY_CAP_SECS);
+                    if capped {
+                        eprintln!(
+                            "toron-workflow: delay {requested}s exceeds the cap {}s — sleeping the cap (bd-zbnw, ADR-0035 Spec 2.5)",
+                            crate::lint::DELAY_CAP_SECS
+                        );
+                    }
+                    ctx.sleep(Duration::from_secs(applied)).await?;
+                    // bd-a5ky: a typed Unit, never Null past the output
+                    // contract.
+                    let mut unit = serde_json::Map::new();
+                    unit.insert("ok".into(), serde_json::Value::Bool(true));
+                    unit.insert("unit".into(), serde_json::json!({ "delay_secs": applied }));
+                    if capped {
+                        unit.insert("capped".into(), serde_json::Value::Bool(true));
+                        unit.insert("requested_secs".into(), serde_json::json!(requested));
+                    }
+                    serde_json::Value::Object(unit)
                 }
                 Action::RequestApproval { message } => {
                     // Render FIRST (the same contract as the mailbox actions):
@@ -744,7 +822,7 @@ pub(crate) fn run_step_with_enclosing<'a>(
                                 attempt,
                                 enclosing_retry.map(|(m, _)| m).unwrap_or(1),
                             );
-                            dispatch_leaf_or_compat(ctx, runner, &invocation)
+                            dispatch_leaf_or_compat(ctx, runner, &invocation).await
                         }
                         Err(e) => {
                             serde_json::json!({ "ok": false, "error": format!("render: {e}") })
@@ -1596,12 +1674,13 @@ pub(crate) async fn run_reduce(
 /// are falsy; everything else is truthy.
 pub(crate) fn is_truthy(value: &serde_json::Value) -> bool {
     match value {
-        serde_json::Value::Null => false,
         serde_json::Value::Bool(b) => *b,
         serde_json::Value::Number(n) => n.as_f64().is_some_and(|f| f != 0.0),
         serde_json::Value::String(s) => !s.is_empty(),
         serde_json::Value::Array(a) => !a.is_empty(),
         serde_json::Value::Object(o) => !o.is_empty(),
+        // Null is the only variant not listed above, and it is falsy.
+        _ => false,
     }
 }
 
@@ -2368,7 +2447,7 @@ pub async fn run_graph_node(
         input.attempt,
         1,
     );
-    Ok(dispatch_leaf_or_compat(ctx, runner.as_ref(), &invocation))
+    Ok(dispatch_leaf_or_compat(ctx, runner.as_ref(), &invocation).await)
 }
 
 /// The `toron:workflow-emitted` stamp (ADR-0004 Ship 2 / bd-pkc part 3).

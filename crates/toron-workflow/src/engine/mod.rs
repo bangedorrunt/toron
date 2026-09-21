@@ -233,6 +233,22 @@ pub type ActionRunner = Arc<dyn Fn(&Action) -> anyhow::Result<serde_json::Value>
 pub type EffectRunner =
     Arc<dyn Fn(&ActionInvocation) -> anyhow::Result<serde_json::Value> + Send + Sync>;
 
+/// The async context-bearing effect surface (bd-ckkf, ADR-0035 Spec 2.2):
+/// same contract as [`EffectRunner`], but the closure returns a future the
+/// engine awaits inline — no thread-hop bridge, no `block_on`. The engine
+/// prefers this over [`EffectRunner`] for effectful HostSink actions
+/// whenever one is injected; the sync runner stays for pure leaves,
+/// journal-less embeddings, and existing flywheel constructors (untouched).
+// governed-by: ADR-0035
+pub type AsyncEffectRunner = Arc<
+    dyn Fn(
+            &ActionInvocation,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = anyhow::Result<serde_json::Value>> + Send>,
+        > + Send
+        + Sync,
+>;
+
 /// A run-lifecycle phase (bd-mi9n, ADR-0032 Spec 5/6).
 ///
 /// The engine's run row is the INDEX its effect rows hang off: `Running` and
@@ -276,6 +292,16 @@ pub struct RunTransition {
 /// Absent journal = no run rows (a journal-less embedding keeps its own
 /// lifecycle calls, exactly as before).
 pub type RunJournal = Arc<dyn Fn(&RunTransition) + Send + Sync>;
+
+/// The async run-lifecycle seam (bd-ckkf, ADR-0035 Spec 2.2): same contract
+/// as [`RunJournal`], awaited inline by the engine — no `block_on`. The
+/// engine prefers this over [`RunJournal`] whenever one is injected.
+// governed-by: ADR-0035
+pub type AsyncRunJournal = Arc<
+    dyn Fn(RunTransition) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+        + Send
+        + Sync,
+>;
 
 /// How the engine treats an effectful HostSink leaf that has no journaling
 /// [`EffectRunner`] to go through (bd-engine-run-path-journaling-fwlx, the
@@ -389,6 +415,22 @@ impl WorkflowEngine {
             Self::default_resolver(),
             Self::default_workflow_resolver(),
             effect_runner,
+        )
+    }
+
+    /// Like [`Self::local_with_effect_runner`] with an [`AsyncEffectRunner`]
+    /// (bd-ckkf, ADR-0035 Spec 2.2): the engine awaits it inline for
+    /// effectful HostSink leaves — no thread-hop bridge, no `block_on`.
+    /// `None` preserves the legacy compat path.
+    pub fn local_with_async_effect_runner(
+        action_runner: ActionRunner,
+        async_effect_runner: Option<AsyncEffectRunner>,
+    ) -> anyhow::Result<Self> {
+        Self::local_with_resolvers_async_effect(
+            action_runner,
+            Self::default_resolver(),
+            Self::default_workflow_resolver(),
+            async_effect_runner,
         )
     }
 
@@ -535,6 +577,50 @@ impl WorkflowEngine {
         )
     }
 
+    /// Async funnel twin of [`Self::local_with_resolvers_effect`] (bd-ckkf):
+    /// resolvers + an [`AsyncEffectRunner`], Recording mode, no journal.
+    fn local_with_resolvers_async_effect(
+        action_runner: ActionRunner,
+        profile_resolver: ProfileResolver,
+        workflow_resolver: WorkflowResolver,
+        async_effect_runner: Option<AsyncEffectRunner>,
+    ) -> anyhow::Result<Self> {
+        Self::local_with_resolvers_async_effect_mode_and_journal(
+            action_runner,
+            profile_resolver,
+            workflow_resolver,
+            async_effect_runner,
+            EffectJournalMode::default(),
+            None,
+        )
+    }
+
+    /// The full async local constructor (bd-ckkf, ADR-0035 Spec 2.2):
+    /// resolvers, an [`AsyncEffectRunner`] the engine awaits inline, an
+    /// explicit [`EffectJournalMode`], and an [`AsyncRunJournal`] for the
+    /// engine's own run-lifecycle rows. The constructor a real
+    /// (effect-performing) async embedding uses.
+    #[allow(clippy::too_many_arguments)]
+    pub fn local_with_resolvers_async_effect_mode_and_journal(
+        action_runner: ActionRunner,
+        profile_resolver: ProfileResolver,
+        workflow_resolver: WorkflowResolver,
+        async_effect_runner: Option<AsyncEffectRunner>,
+        journal_mode: EffectJournalMode,
+        async_run_journal: Option<AsyncRunJournal>,
+    ) -> anyhow::Result<Self> {
+        Self::local_with_resolvers_effect_mode_run_journal_async(
+            action_runner,
+            profile_resolver,
+            workflow_resolver,
+            None,
+            async_effect_runner,
+            journal_mode,
+            None,
+            async_run_journal,
+        )
+    }
+
     /// The mode-carrying funnel: every local constructor tail. The journal
     /// mode is an engine dependency so the dispatch path can enforce Spec 6
     /// without a global.
@@ -565,6 +651,33 @@ impl WorkflowEngine {
         journal_mode: EffectJournalMode,
         run_journal: Option<RunJournal>,
     ) -> anyhow::Result<Self> {
+        Self::local_with_resolvers_effect_mode_run_journal_async(
+            action_runner,
+            profile_resolver,
+            workflow_resolver,
+            effect_runner,
+            None,
+            journal_mode,
+            run_journal,
+            None,
+        )
+    }
+
+    /// Terminal local funnel (bd-ckkf): every local constructor tails here.
+    /// Sync seams keep their exact behavior (`None` async = legacy paths);
+    /// `Some` async seams are registered as context dependencies the engine
+    /// prefers and awaits inline.
+    #[allow(clippy::too_many_arguments)]
+    fn local_with_resolvers_effect_mode_run_journal_async(
+        action_runner: ActionRunner,
+        profile_resolver: ProfileResolver,
+        workflow_resolver: WorkflowResolver,
+        effect_runner: Option<EffectRunner>,
+        async_effect_runner: Option<AsyncEffectRunner>,
+        journal_mode: EffectJournalMode,
+        run_journal: Option<RunJournal>,
+        async_run_journal: Option<AsyncRunJournal>,
+    ) -> anyhow::Result<Self> {
         let sink = ApprovalSink::default();
         let spawn_sink = SpawnSink::default();
         let policy_sink = crate::cron_failure::PolicySink::new();
@@ -572,10 +685,12 @@ impl WorkflowEngine {
         let resonate = Resonate::local()
             .with_dependency(action_runner)
             .with_dependency(effect_runner)
+            .with_dependency(async_effect_runner)
             .with_dependency(profile_resolver)
             .with_dependency(workflow_resolver)
             .with_dependency(journal_mode)
             .with_dependency(run_journal)
+            .with_dependency(async_run_journal)
             .with_dependency(sink.clone())
             .with_dependency(spawn_sink.clone())
             .with_dependency(policy_sink.clone())
@@ -675,6 +790,31 @@ impl WorkflowEngine {
         )
     }
 
+    /// The remote twin of
+    /// [`Self::local_with_resolvers_async_effect_mode_and_journal`] (bd-ckkf).
+    #[allow(clippy::too_many_arguments)]
+    pub fn remote_with_resolvers_async_effect_mode_and_journal(
+        url: impl Into<String>,
+        action_runner: ActionRunner,
+        profile_resolver: ProfileResolver,
+        workflow_resolver: WorkflowResolver,
+        async_effect_runner: Option<AsyncEffectRunner>,
+        journal_mode: EffectJournalMode,
+        async_run_journal: Option<AsyncRunJournal>,
+    ) -> anyhow::Result<Self> {
+        Self::remote_with_resolvers_effect_mode_run_journal_async(
+            url,
+            action_runner,
+            profile_resolver,
+            workflow_resolver,
+            None,
+            async_effect_runner,
+            journal_mode,
+            None,
+            async_run_journal,
+        )
+    }
+
     /// Funnel for the remote constructors.
     fn remote_with_resolvers_effect(
         url: impl Into<String>,
@@ -725,6 +865,33 @@ impl WorkflowEngine {
         journal_mode: EffectJournalMode,
         run_journal: Option<RunJournal>,
     ) -> anyhow::Result<Self> {
+        Self::remote_with_resolvers_effect_mode_run_journal_async(
+            url,
+            action_runner,
+            profile_resolver,
+            workflow_resolver,
+            effect_runner,
+            None,
+            journal_mode,
+            run_journal,
+            None,
+        )
+    }
+
+    /// Terminal remote funnel (bd-ckkf): every remote constructor tails
+    /// here. See the local terminal funnel for the seam contract.
+    #[allow(clippy::too_many_arguments)]
+    fn remote_with_resolvers_effect_mode_run_journal_async(
+        url: impl Into<String>,
+        action_runner: ActionRunner,
+        profile_resolver: ProfileResolver,
+        workflow_resolver: WorkflowResolver,
+        effect_runner: Option<EffectRunner>,
+        async_effect_runner: Option<AsyncEffectRunner>,
+        journal_mode: EffectJournalMode,
+        run_journal: Option<RunJournal>,
+        async_run_journal: Option<AsyncRunJournal>,
+    ) -> anyhow::Result<Self> {
         let sink = ApprovalSink::default();
         let spawn_sink = SpawnSink::default();
         let policy_sink = crate::cron_failure::PolicySink::new();
@@ -736,10 +903,12 @@ impl WorkflowEngine {
         let resonate = Resonate::new(config)
             .with_dependency(action_runner)
             .with_dependency(effect_runner)
+            .with_dependency(async_effect_runner)
             .with_dependency(profile_resolver)
             .with_dependency(workflow_resolver)
             .with_dependency(journal_mode)
             .with_dependency(run_journal)
+            .with_dependency(async_run_journal)
             .with_dependency(sink.clone())
             .with_dependency(spawn_sink.clone())
             .with_dependency(policy_sink.clone())
