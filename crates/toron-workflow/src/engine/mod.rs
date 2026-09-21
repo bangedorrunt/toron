@@ -72,10 +72,23 @@ pub fn resonate_server_url() -> Option<String> {
 
 /// Pure resolution core (testable with a fake probe).
 pub fn resonate_server_url_with(probe: impl Fn(&str) -> bool) -> Option<String> {
-    if let Ok(pin) = std::env::var(RESONATE_URL_ENV)
-        && !pin.trim().is_empty()
-    {
-        return Some(pin);
+    resolve_resonate_url(resonate_url_pin_from_env().as_deref(), probe)
+}
+
+/// The process-environment pin read (ADR-0035 Spec 1: env reads live at
+/// this one named host edge, never inside the resolution core).
+pub fn resonate_url_pin_from_env() -> Option<String> {
+    std::env::var(RESONATE_URL_ENV)
+        .ok()
+        .map(|pin| pin.trim().to_string())
+        .filter(|pin| !pin.is_empty())
+}
+
+/// Pure resolution core: explicit pin > probed remote > probed local >
+/// embedded (`None`). No env, no cache, no I/O beyond the injected probe.
+pub fn resolve_resonate_url(pin: Option<&str>, probe: impl Fn(&str) -> bool) -> Option<String> {
+    if let Some(p) = pin.filter(|p| !p.trim().is_empty()) {
+        return Some(p.to_string());
     }
     if probe(REMOTE_RESONATE_URL) {
         return Some(REMOTE_RESONATE_URL.to_string());
@@ -132,7 +145,8 @@ pub use boundary::{
     DEPRECATED_ACTION_TYPES, Disposition, ENGINE_ACTION_TYPES, EffectSettlement, EffectState,
     EvidenceRef, ExecutionPolicy, FailureKind, MAX_EVIDENCE_DETAIL, ProviderErrorClass, RunContext,
     advertised_action_names, classify_provider_error_msg, derive_effect_key,
-    failure_for_provider_error, invoke, invoke_compat, is_failure_value, partition,
+    failure_for_control_misdispatch, failure_for_provider_error, failure_for_unsupported, invoke,
+    invoke_compat, is_failure_value, normalize_dispatch_result, partition,
 };
 pub use control_flow::{
     GraphNodeInput, ParallelCopyInput, build_workflow_run_terminal, run_graph_node,
@@ -1099,5 +1113,32 @@ impl WorkflowEngine {
             .await
             .map_err(|e| anyhow::anyhow!("reject spawn promise {promise_id}: {e}"))?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod resolve_tests_bd_r328 {
+    use super::{LOCAL_RESONATE_URL, REMOTE_RESONATE_URL, resolve_resonate_url};
+
+    #[test]
+    fn explicit_pin_wins_without_probing() {
+        assert_eq!(
+            resolve_resonate_url(Some("https://pin.example"), |_| panic!("no probe on pin")),
+            Some("https://pin.example".to_string())
+        );
+        assert_eq!(resolve_resonate_url(Some("  "), |_| false), None);
+    }
+
+    #[test]
+    fn probe_order_remote_then_local() {
+        assert_eq!(
+            resolve_resonate_url(None, |u| u == REMOTE_RESONATE_URL),
+            Some(REMOTE_RESONATE_URL.to_string())
+        );
+        assert_eq!(
+            resolve_resonate_url(None, |u| u == LOCAL_RESONATE_URL),
+            Some(LOCAL_RESONATE_URL.to_string())
+        );
+        assert_eq!(resolve_resonate_url(None, |_| false), None);
     }
 }
