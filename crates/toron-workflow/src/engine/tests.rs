@@ -3130,3 +3130,125 @@ steps:
         "the run still completes: {output}"
     );
 }
+
+/// bd-a5ky (ADR-0035 Spec 2): `delay` returns a typed Unit object, never Null.
+#[tokio::test]
+async fn delay_returns_typed_unit() {
+    let runner = noop_runner();
+    let engine = WorkflowEngine::local(runner.clone()).expect("engine");
+    let wf = parse_workflow(
+        r##"
+name: timer-unit
+trigger:
+  type: webhook
+steps:
+  - name: wait
+    action: delay
+    secs: 0
+"##,
+    )
+    .expect("parse timer-unit workflow");
+    let output = engine
+        .invoke("wf-delay-unit-1", wf, serde_json::json!({}))
+        .await
+        .expect("delay run completes");
+    let wait = &output["wait"];
+    assert!(
+        wait.is_object(),
+        "delay step output is an object, never Null: {output}"
+    );
+    assert_eq!(
+        wait.get("ok"),
+        Some(&serde_json::json!(true)),
+        "delay unit carries ok:true: {output}"
+    );
+    assert!(
+        wait.get("unit").is_some(),
+        "delay unit carries the typed Unit payload: {output}"
+    );
+}
+
+/// bd-zbnw (ADR-0035 Spec 2.5): an over-cap delay clamps loud — it sleeps the
+/// named cap, says so in the value, and never sleeps unbounded.
+#[tokio::test]
+async fn delay_over_cap_clamps_loud() {
+    let runner = noop_runner();
+    let engine = WorkflowEngine::local(runner.clone()).expect("engine");
+    let over = crate::lint::DELAY_CAP_SECS + 10_000;
+    let wf = parse_workflow(&format!(
+        r##"
+name: timer-cap
+trigger:
+  type: webhook
+steps:
+  - name: wait
+    action: delay
+    secs: {over}
+"##
+    ))
+    .expect("parse timer-cap workflow");
+    let started = std::time::Instant::now();
+    let output = engine
+        .invoke("wf-delay-cap-1", wf, serde_json::json!({}))
+        .await
+        .expect("over-cap delay run completes");
+    let wait = &output["wait"];
+    assert_eq!(
+        wait.get("capped"),
+        Some(&serde_json::json!(true)),
+        "over-cap delay names the clamp: {output}"
+    );
+    assert_eq!(
+        wait.get("unit"),
+        Some(&serde_json::json!({"delay_secs": crate::lint::DELAY_CAP_SECS})),
+        "clamped unit carries the applied cap: {output}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(crate::lint::DELAY_CAP_SECS + 30),
+        "over-cap delay never sleeps the requested unbounded duration"
+    );
+}
+
+/// bd-3q75 (ADR-0035 Spec 2.2): the engine prefers the async effect runner —
+/// a HostSink leaf is awaited through it, never thread-hop bridged.
+#[tokio::test]
+async fn async_effect_runner_handles_host_sink() {
+    let runner: ActionRunner = Arc::new(|_a: &Action| Ok(serde_json::json!({ "ok": true })));
+    let calls = Arc::new(std::sync::Mutex::new(0usize));
+    let calls_clone = calls.clone();
+    let afx: AsyncEffectRunner = Arc::new(move |_inv: &ActionInvocation| {
+        let calls_clone = calls_clone.clone();
+        Box::pin(async move {
+            *calls_clone.lock().unwrap() += 1;
+            Ok(serde_json::json!({ "journaled": true }))
+        })
+    });
+    let engine = WorkflowEngine::local_with_async_effect_runner(runner, Some(afx))
+        .expect("engine with async runner");
+    let wf = parse_workflow(
+        r##"
+name: async-covered
+trigger:
+  type: webhook
+steps:
+  - name: notify
+    action: send_dm
+    to: "pi"
+    body: "hi"
+"##,
+    )
+    .expect("parse async-covered workflow");
+    let output = engine
+        .invoke("wf-async-covered-1", wf, serde_json::json!({}))
+        .await
+        .expect("invoke returns run output");
+    assert_eq!(
+        *calls.lock().unwrap(),
+        1,
+        "the async effect runner handled the leaf"
+    );
+    assert!(
+        find_marker(&output, "effect_journal").is_none(),
+        "an async-journaled run carries no bypass marker: {output}"
+    );
+}

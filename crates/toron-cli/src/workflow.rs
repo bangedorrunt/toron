@@ -67,64 +67,68 @@ pub fn lint(file: &PathBuf) -> Result<i32> {
 }
 
 /// `toron workflow run <file> --trigger <json>`.
+///
+/// Owns its runtime at the edge (`#[tokio::main]`): the engine is awaited
+/// inline, so this module performs no thread-hop bridge (bd-ckkf, ADR-0035
+/// Spec 2.2). The standalone runner stays a pure sync valueeeper.
 pub fn run(file: &PathBuf, trigger: &str) -> Result<i32> {
+    let output = run_async(file, trigger)?;
+    print_json(&output);
+    Ok(EXIT_OK)
+}
+
+#[tokio::main]
+async fn run_async(file: &PathBuf, trigger: &str) -> Result<serde_json::Value> {
     let workflow = load(file)?;
     preflight(&workflow)?;
     let trigger_value: serde_json::Value = serde_json::from_str(trigger)
         .with_context(|| format!("trigger must be valid JSON, got: {trigger:?}"))?;
     let runner = noop_runner();
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .context("build runtime")?;
-    let output = rt.block_on(async {
-        let engine = WorkflowEngine::local(runner.clone()).context("engine")?;
-        let run_id = format!(
-            "cli-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        );
-        engine
-            .run(
-                &run_id,
-                RunInput {
-                    run_id: Some(run_id.clone()),
-                    workflow,
-                    trigger: trigger_value,
-                },
-            )
-            .await
-    })?;
+    let engine = WorkflowEngine::local(runner.clone()).context("engine")?;
+    let run_id = format!(
+        "cli-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    );
+    engine
+        .run(
+            &run_id,
+            RunInput {
+                run_id: Some(run_id.clone()),
+                workflow,
+                trigger: trigger_value,
+            },
+        )
+        .await
+}
+
+/// `toron workflow invoke <file> --inputs <json>`.
+///
+/// Same runtime-at-the-edge shape as [`run`](self::run) (bd-ckkf).
+pub fn invoke(file: &PathBuf, inputs: &str) -> Result<i32> {
+    let output = invoke_async(file, inputs)?;
     print_json(&output);
     Ok(EXIT_OK)
 }
 
-/// `toron workflow invoke <file> --inputs <json>`.
-pub fn invoke(file: &PathBuf, inputs: &str) -> Result<i32> {
+#[tokio::main]
+async fn invoke_async(file: &PathBuf, inputs: &str) -> Result<serde_json::Value> {
     let workflow = load(file)?;
     preflight(&workflow)?;
     let inputs_value: serde_json::Value = serde_json::from_str(inputs)
         .with_context(|| format!("inputs must be valid JSON, got: {inputs:?}"))?;
     let runner = noop_runner();
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .context("build runtime")?;
-    let output = rt.block_on(async {
-        let engine = WorkflowEngine::local(runner.clone()).context("engine")?;
-        let run_id = format!(
-            "cli-invoke-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        );
-        engine.invoke(&run_id, workflow, inputs_value).await
-    })?;
-    print_json(&output);
-    Ok(EXIT_OK)
+    let engine = WorkflowEngine::local(runner.clone()).context("engine")?;
+    let run_id = format!(
+        "cli-invoke-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    );
+    engine.invoke(&run_id, workflow, inputs_value).await
 }
 
 /// `toron workflow dry-run <file> --trigger <json>` — lint + describe.
