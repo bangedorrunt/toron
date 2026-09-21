@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html data-theme="luxury" lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ADR-0035 Fresh-Eyes Review — implementation vs vision</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/daisyui@5.5.19/daisyui.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/daisyui@5.5.19/themes.css">
+<script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4.2.4/dist/index.global.js"></script>
+<style>
+*,*::before,*::after{box-sizing:border-box}
+p,h1,h2,h3,li,td,th,.badge{overflow-wrap:anywhere}
+pre{overflow-x:auto;white-space:pre}
+code{font-family:ui-monospace,Menlo,monospace;font-size:.82em}
+.small{font-size:.85rem}
+.tight li{margin-bottom:.3rem}
+.kbd{font-family:ui-monospace,monospace}
+</style>
+</head>
+<body class="bg-base-100 text-base-content">
+<div class="max-w-6xl mx-auto px-4 py-8">
+
+<div class="hero bg-base-200 rounded-2xl mb-6"><div class="hero-content text-center py-8"><div class="max-w-3xl">
+<div class="badge badge-primary mb-3">bd-yq9q · vehicle: none (raw) · adversarial, de novo, no fixes</div>
+<h1 class="text-4xl font-bold">ADR-0035 review: what shipped vs what was promised</h1>
+<p class="py-3 small">Three independent auditors read the ADR, then the code — never the lane reports. Every finding below was re-verified by the supervisor with file:line evidence. Genuinely done items are named. Overstated items are named louder. One auditor sub-finding is void, and saying so is part of the review.</p>
+</div></div></div>
+
+<div role="alert" class="alert alert-error mb-6"><span><strong>Reviewer bottom line.</strong> The Crews did real, verified work — receipts_core, Delay cap, async seams, 5 packs, dual-write, WakeTable guard, 24 LEGAL closes. But three load-bearing claims are false as stated: the sync runner was <strong>not</strong> deleted, the Judge plane is <strong>not</strong> wired, and wake unity is a flood guard <strong>wearing the name</strong>. Ten gap beads are filed. The strongest move is last.</span></div>
+
+<h2 class="text-2xl font-bold mt-8 mb-3">Review basis</h2>
+<div class="card bg-base-200"><div class="card-body small">
+<p>ADR-0035 Specs 1–6 vs toron + flywheel + beads HEAD. Method: three fresh-eyes audits (kernels/effects · judgment/types · storage/wake/ceremony), each instructed to falsify the lane claims, then supervisor re-verification of every headline (all greps re-run, all foreign shas resolved with <span class="kbd">cat-file</span> across all three repos). Scope is code truth, not bead rows — 24 LEGAL closes prove ceremony, not architecture.</p>
+</div></div>
+
+<h2 class="text-2xl font-bold mt-8 mb-3">Material findings</h2>
+<div class="grid md:grid-cols-2 gap-4">
+
+<div class="card card-border border-error"><div class="card-body small">
+<h3 class="card-title text-base">F1 · Sync runner not deleted (wave 2 remainder)</h3>
+<p><strong>Recommended change:</strong> delete <span class="kbd">ActionRunner</span> type, compat_leaf sync path, Recording-performs arm, and <span class="kbd">rt.block_on</span> in operator.rs — or amend the ADR. <strong>Evidence of defect:</strong> <span class="kbd">engine/mod.rs:240</span> type alive; <span class="kbd">workflow_host.rs:58</span>, <span class="kbd">cli/workflow.rs:31</span> constructors live; <span class="kbd">control_flow.rs:560-567, 662-689</span> compat + Recording-performs; <span class="kbd">operator.rs:91,606</span> block_on. <strong>Evidence of remedy:</strong> zero block_on at the two named sites is real; Delay Unit + cap real (<span class="kbd">control_flow.rs:771-789</span>). <strong>Confidence:</strong> high. <strong>Minimum fix:</strong> remove the type + 4 call sites + Recording arm. <strong>Do not broaden into:</strong> a runner redesign. <strong>Posture:</strong> narrow. → <strong>bd-zm67</strong></p>
+</div></div>
+
+<div class="card card-border border-error"><div class="card-body small">
+<h3 class="card-title text-base">F2 · Judge plane unwired (Spec 3 core)</h3>
+<p><strong>Recommended change:</strong> wire <span class="kbd">Effect::Judge</span> into one tick loop with confidence routing, or descope the plane in the ADR. <strong>Evidence of defect:</strong> zero <span class="kbd">Effect::Judge</span> in repo; <span class="kbd">ask_judgment</span> called only from the MCP tool; WakeGate/RouteDecision test-only; substring classifier live (<span class="kbd">boundary.rs:560-597</span>). <strong>Evidence of remedy:</strong> registry + pack_version + deterministic seeds + replay are real (<span class="kbd">judgment.rs:211-253, 294-340</span>). <strong>Confidence:</strong> high. <strong>Minimum fix:</strong> one production call site end-to-end. <strong>Do not broaden into:</strong> a judgment framework. <strong>Posture:</strong> narrow (one seam proves the pattern). → <strong>bd-3f9w</strong></p>
+</div></div>
+
+<div class="card card-border border-error"><div class="card-body small">
+<h3 class="card-title text-base">F3 · Wake unity is a flood guard (Spec 5 core)</h3>
+<p><strong>Recommended change:</strong> build the real Wake table + Inject/Digest/Queue/Drop + why, and delete the four caches + snapshot children — or amend the ADR. <strong>Evidence of defect:</strong> GateDecision is Proceed/Pause (<span class="kbd">doorbell-core:1043-1050</span>); pending_wait/rering/presented/digest_queue live (<span class="kbd">workspace.rs:264-280</span>); snapshot pump admitted kept (<span class="kbd">plane.rs:1428-1453</span>); WatchChild respawn live (<span class="kbd">file_host.rs:469-529</span>); boot-gate permissive (<span class="kbd">binpath.rs:117-124</span>). <strong>Evidence of remedy:</strong> persisted seen-sets real (<span class="kbd">durable.rs:6140,7509</span>). <strong>Confidence:</strong> high. <strong>Minimum fix:</strong> none narrower exists — this one is structural by nature. <strong>Do not broaden into:</strong> touching the flood guard before the table exists. <strong>Posture:</strong> structural. → <strong>bd-8xxd</strong></p>
+</div></div>
+
+<div class="card card-border border-warning"><div class="card-body small">
+<h3 class="card-title text-base">F4 · Replay keyed on effect_key alone (silent stale)</h3>
+<p><strong>Recommended change:</strong> composite identity or loud mismatch on pack_version/state drift. <strong>Evidence of defect:</strong> <span class="kbd">judgment.rs:501-506</span> returns first row without discriminating; state_hash unqueryable (TEXT-embedded, defaults empty); INSERT OR IGNORE cements winner. <strong>Confidence:</strong> high. <strong>Minimum fix:</strong> mismatch error on version/state drift. → <strong>bd-fbgi</strong></p>
+</div></div>
+
+<div class="card card-border border-warning"><div class="card-body small">
+<h3 class="card-title text-base">F5 · Reader switch never happened (Spec 4 half)</h3>
+<p><strong>Recommended change:</strong> switch index/archive/workflow-effects readers onto events, or stop claiming one truth. <strong>Evidence of defect:</strong> only receipts projects from events (<span class="kbd">receipts.rs:281-389</span>); <span class="kbd">rebuild.rs:9-17</span> knows Git/bus only; <span class="kbd">read_since</span> caller-less; mailbox selector fail-soft (<span class="kbd">mailbox_source.rs:200-237</span>); beads flush still full-file rewrite (<span class="kbd">sync/mod.rs:9998</span>). <strong>Evidence of remedy:</strong> dual-write + fold + manifest + draft/doctor-expiry real. <strong>Confidence:</strong> high. → <strong>bd-jysu</strong> (+ bd-nsr7 for the selector)</p>
+</div></div>
+
+<div class="card card-border border-warning"><div class="card-body small">
+<h3 class="card-title text-base">F6 · Boundary types decorative end-to-end</h3>
+<p><strong>Recommended change:</strong> validate derived Deserialize, unify Corr twins, loud rejects. <strong>Evidence of defect:</strong> <span class="kbd">boundary_id!</span> skips FromStr (<span class="kbd">ids.rs:118-119</span>); Corr/ThreadId twins (<span class="kbd">ids.rs</span> vs <span class="kbd">send_tags.rs:182,209</span>); stringly fields across messaging/surface/boundary/sinks; shadow ContactPolicy unknown→BlockAll (<span class="kbd">projection.rs:58-66</span>); unwrap_or(Auto) ×3 (<span class="kbd">contacts.rs</span>); silent nonneg_secs (<span class="kbd">tools/mod.rs:656</span>). <strong>Evidence of remedy:</strong> MessageId FromStr + loud unwrap.rs PolicyError real. <strong>Confidence:</strong> high. → <strong>bd-05yr</strong></p>
+</div></div>
+
+</div>
+
+<h2 class="text-2xl font-bold mt-8 mb-3">Soundness ledger (condensed)</h2>
+<div class="overflow-x-auto"><table class="table table-zebra small">
+<thead><tr><th>Claim</th><th>Obligation</th><th>Witness</th><th>Status</th></tr></thead>
+<tbody>
+<tr><td>Journal-before-execution everywhere</td><td>No live effect without a row</td><td>Recording-performs arm + compat leaf</td><td><span class="badge badge-error">violated</span></td></tr>
+<tr><td>Replay never re-asks, never stale</td><td>Version/state discrimination</td><td>First-row-wins + unqueryable hash</td><td><span class="badge badge-error">violated</span></td></tr>
+<tr><td>One wake decision</td><td>Single table + enum + why</td><td>Four caches + Proceed/Pause + flood-why</td><td><span class="badge badge-error">violated</span></td></tr>
+<tr><td>One storage truth</td><td>All readers project events</td><td>One reader switched</td><td><span class="badge badge-warning">partial</span></td></tr>
+<tr><td>Effects journaled before execution (mailbox/job/verify)</td><td>Enforced live arms</td><td>Enforced on mcp arms; CLI local runs Recording</td><td><span class="badge badge-warning">partial</span></td></tr>
+<tr><td>Judgment calibrated + routed</td><td>Confidence consumed in code</td><td>Helpers test-only</td><td><span class="badge badge-error">violated</span></td></tr>
+</tbody></table></div>
+
+<h2 class="text-2xl font-bold mt-8 mb-3">Genuinely done (credit where due)</h2>
+<ul class="small list-disc pl-5 tight">
+<li>receipts_core pure kernel + Delay cap + zero block_on at named sites + single journal executor + remote-mail fail-closed + /health 12.5s→0.3ms + packs/seeds/replay + dual-write + WakeTable guard + persisted seen-sets + draft/doctor-expiry + beads event tables + 24 LEGAL closes.</li>
+<li>BeigeSnow's handoffs (wave-1 report, F report with deviations, j9mm measurement) and RoseCitadel's false-close refusal were supervision-grade honesty.</li>
+<li>One auditor sub-finding is <strong>void</strong>: bd-guard-bootstrap-ux-2qwm's sha <span class="kbd">b6ee37c</span> resolves in toron (verified <span class="kbd">cat-file</span>) — local binding, no action. The two foreign bindings beside it (98a5890 flywheel-only, 4237f214 beads-only) are real → <strong>bd-o9ye</strong>.</li>
+</ul>
+
+<h2 class="text-2xl font-bold mt-8 mb-3">Change agenda (strongest last)</h2>
+<div class="overflow-x-auto"><table class="table table-zebra small">
+<thead><tr><th>#</th><th>Change</th><th>Why</th><th>Minimum fix</th></tr></thead>
+<tbody>
+<tr><td>1</td><td>Fail-loud mailbox selector (bd-nsr7)</td><td>Second store survives by fallback</td><td>Refuse instead of embed</td></tr>
+<tr><td>2</td><td>Fence hardening + receipts paths tests (bd-zh38)</td><td>Fence misses qualified paths; no path cover</td><td>Harden + add tests</td></tr>
+<tr><td>3</td><td>Rebind foreign closes (bd-o9ye)</td><td>Two toron beads cite non-local shas</td><td>Local re-gate + close</td></tr>
+<tr><td>4</td><td>Boundary types end-to-end (bd-05yr)</td><td>Untrusted input still flows as String</td><td>Validate derives, unify twins, loud rejects</td></tr>
+<tr><td>5</td><td>Tower resilience + matrix (bd-qdup)</td><td>No edge armor on any interpreter</td><td>Wrap outside-in + six scenarios</td></tr>
+<tr><td>6</td><td>Reader switch (bd-jysu)</td><td>One truth claimed, one reader switched</td><td>Switch or stop claiming</td></tr>
+<tr><td>7</td><td>Replay identity (bd-fbgi)</td><td>Stale answers by construction</td><td>Loud mismatch</td></tr>
+<tr><td>8</td><td>Sync-runner deletion (bd-zm67)</td><td>Old architecture alive beside the new</td><td>Delete type + 4 sites + arm</td></tr>
+<tr><td>9</td><td>Wake unity proper (bd-8xxd)</td><td>Flood guard wearing the name</td><td>Real table/decision/why</td></tr>
+<tr><td><strong>10</strong></td><td><strong>Wire Effect::Judge or descope (bd-3f9w)</strong></td><td><strong>The flagship claim is unwired; everything semantic still runs on substrings. One production seam proves the whole plane — or the ADR should say it doesn't.</strong></td><td><strong>One call site end-to-end</strong></td></tr>
+</tbody></table></div>
+
+<h2 class="text-2xl font-bold mt-8 mb-3">Fixed-point judgment</h2>
+<div class="card bg-base-200"><div class="card-body small">
+<p>ADR-0035 is <strong>not</strong> fully implemented. It is ~65% implemented by structure (foundations real, caps enforced, storage/beads/journal/health shipped) and unimplemented at its three headline verbs (delete the runner, wire the judge, unify the wake). The honest endgame is one more crew wave over the 10 gap beads, with bd-3f9w first among equals only by flagship status — technically bd-fbgi (silent stale replay) is the sharpest hazard. No bead in this review was closed on anything but evidence; the voided sub-finding stays on record as proof the supervisor checks the checkers.</p>
+</div></div>
+
+<p class="small opacity-70 mt-6">Deliverable for bd-yq9q. Verify: <span class="kbd">test -f .lavish/adr35-review.html</span>. Vehicle: none (raw). No code edited. Gap beads bd-zm67 bd-3f9w bd-8xxd bd-fbgi bd-jysu bd-qdup bd-05yr bd-zh38 bd-o9ye bd-nsr7 parented under bd-vhmn.</p>
+</div>
+</body>
+</html>
