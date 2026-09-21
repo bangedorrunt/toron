@@ -25,6 +25,14 @@ use crate::nostr::{Event, MatchEventOptions, SingleLetterTag, Timestamp};
 /// pruned (bounded bus, permanent Git content — ADR-0003 superiority row).
 pub const MAX_STORED_EVENTS: i64 = 100_000;
 
+/// Durable coordination state (bd-fxzv): channel room (39000/39002),
+/// project manifest (30010), agent profile (30013) and file reservation
+/// (30031) rows are the OLDEST arrivals on a kind-9-flood-pinned bus, so
+/// FIFO cap eviction ate them first (channel list empty, reads not-found,
+/// agent rows flapped). These kinds are exempt from CAP eviction; the
+/// expiry-GC delete above still applies to every kind.
+const DURABLE_KINDS: [i64; 5] = [39000, 39002, 30010, 30013, 30031];
+
 /// bd-py9o: entry cap for the hot parse memo. The store caps at
 /// MAX_STORED_EVENTS rows; when the memo exceeds this it clears wholesale —
 /// a memo, never the source of truth, so the worst case after a clear is one
@@ -612,14 +620,26 @@ impl BusEventStore {
         // it before any reader saw it, while send had already reported
         // success. Storage age is arrival order; created_at is protocol
         // metadata only.
+        // bd-fxzv: cap victims are the oldest NON-DURABLE arrivals (rowid).
+        // Durable coordination state (39000/39002 rooms, 30010 manifests,
+        // 30013 profiles, 30031 reservations) never dates the cap — a
+        // kind-9 flood would otherwise evict the rooms first. If the store
+        // is over cap with nothing but durable rows, it stays over cap:
+        // losing the rooms is worse than breaching the bound.
         sqlx::query(
             "DELETE FROM bus_events WHERE event_id IN (
                 SELECT event_id FROM bus_events
+                WHERE kind NOT IN (?2, ?3, ?4, ?5, ?6)
                 ORDER BY rowid ASC
                 LIMIT MAX(0, (SELECT COUNT(*) FROM bus_events) - ?1)
             )",
         )
         .bind(MAX_STORED_EVENTS)
+        .bind(DURABLE_KINDS[0])
+        .bind(DURABLE_KINDS[1])
+        .bind(DURABLE_KINDS[2])
+        .bind(DURABLE_KINDS[3])
+        .bind(DURABLE_KINDS[4])
         .execute(&self.pool)
         .await?;
         // Orphaned p/e tag rows of pruned events (they could never match a
@@ -1393,6 +1413,65 @@ mod tests {
                 hit.is_some(),
                 "{name} arrival must survive cap prune — created_at is \
                  protocol metadata, not storage age"
+            );
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// bd-fxzv: cap prune must not evict durable coordination state. A
+    /// kind-9 flood pins the store at MAX_STORED_EVENTS; the prune tick
+    /// then eats the OLDEST arrivals first — which are the channel room
+    /// (39000/39002), manifest (30010), profile (30013) and reservation
+    /// (30031) rows. Those kinds are exempt from CAP eviction (expiry GC
+    /// still applies); the victims are the flood rows.
+    #[tokio::test]
+    async fn test_cap_prune_exempts_durable_coordination_state() {
+        use crate::nostr::kinds::{
+            AGENT_PROFILE, CHANNEL_GROUP, CHANNEL_MEMBERS, FILE_RESERVATION,
+        };
+        let (store, pool, path) = temp_store().await;
+        let keys = Keys::generate();
+        // Durable rows arrive FIRST (oldest rowid — today's victims).
+        let mut durable_ids = Vec::new();
+        for kind in [
+            CHANNEL_GROUP,
+            CHANNEL_MEMBERS,
+            PROJECT_MANIFEST,
+            AGENT_PROFILE,
+            FILE_RESERVATION,
+        ] {
+            let ev = build_event(
+                &keys,
+                crate::nostr::kinds::toron_kind(kind),
+                "durable",
+                vec![Tag::parse(["t", "demo"]).expect("t")],
+                Timestamp::now(),
+            )
+            .expect("build durable");
+            durable_ids.push(ev.id.to_hex());
+            store.insert(&ev).await.expect("insert durable");
+        }
+        // Flood past the cap with kind-9 rows (same CTE as the FIFO test).
+        sqlx::query(
+            "WITH RECURSIVE cnt(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM cnt WHERE x < 100000) \
+             INSERT INTO bus_events (event_id, raw_json, created_at, kind, author, d_tag, expires_at) \
+             SELECT 'flood-' || x, '{}', 1789630000 + x, 9, 'filler-author', NULL, NULL FROM cnt",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed flood");
+        assert_eq!(store.count().await.expect("count"), 100_005);
+        store.prune().await.expect("prune");
+        for id in &durable_ids {
+            let hit: Option<i64> =
+                sqlx::query_scalar("SELECT 1 FROM bus_events WHERE event_id = ?1")
+                    .bind(id)
+                    .fetch_optional(&pool)
+                    .await
+                    .expect("durable lookup");
+            assert!(
+                hit.is_some(),
+                "durable row {id} must survive cap prune — flood rows are the victims"
             );
         }
         let _ = std::fs::remove_file(&path);
