@@ -3869,7 +3869,7 @@ mod tests {
         .bind(&key)
         .bind("crash-event-id")
         .bind(&recipients)
-        .bind(chrono::Utc::now().timestamp_millis())
+        .bind(crate::index::writer::Clock::now_us(&crate::index::writer::SystemClock) / 1000)
         .execute(&pool)
         .await
         .expect("seed claim");
