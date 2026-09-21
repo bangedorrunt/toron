@@ -197,6 +197,16 @@ pub struct ReceiptStore {
     pool: SqlitePool,
 }
 
+/// Raw receipts table row (backfill + tripwire comparisons).
+type TableRow = (
+    String,
+    String,
+    Option<String>,
+    Option<i64>,
+    Option<String>,
+    i64,
+);
+
 impl ReceiptStore {
     pub const fn new(pool: SqlitePool) -> Self {
         Self { pool }
@@ -316,76 +326,81 @@ impl ReceiptStore {
         anyhow::bail!("receipt dual-write contention on {:?}", receipt.corr)
     }
 
-    /// Get one receipt by corr.
-    #[allow(clippy::type_complexity)]
-    pub async fn get(&self, corr: &str) -> anyhow::Result<Option<Receipt>> {
-        let row: Option<(String, String, Option<String>, Option<i64>, Option<String>, i64)> =
-            sqlx::query_as(
-                "SELECT corr, state, wake, due_at, result_path, updated_at FROM receipts WHERE corr = ?1",
-            )
-            .bind(corr)
-            .fetch_optional(&self.pool)
-            .await?;
-        match row {
-            Some((corr, state_s, wake_s, due_at, result_path, updated_at)) => {
-                let state = ReceiptState::parse(&state_s).map_err(|e| anyhow::anyhow!(e))?;
-                let wake = match wake_s {
-                    Some(s) => Some(Wake::parse(&s).map_err(|e| anyhow::anyhow!(e.message))?),
-                    None => None,
-                };
-                Ok(Some(Receipt {
+    /// Wave-4 projection fold (ADR-0035 Spec 4): `receipt.stamped`
+    /// last-write-wins per corr, `receipt.pruned` tombstones applied.
+    /// Shared by readers, rebuild, and verify — one fold, never three.
+    fn fold_events(
+        events: &[crate::index::event_log::StoredEvent],
+    ) -> BTreeMap<String, Option<ReceiptEvent>> {
+        let mut folded = BTreeMap::new();
+        for e in events {
+            if e.kind == ReceiptEvent::STAMPED {
+                if let Ok(ev) = serde_json::from_str::<ReceiptEvent>(&e.payload) {
+                    folded.insert(ev.corr.clone(), Some(ev));
+                }
+            } else if e.kind == ReceiptEvent::PRUNED
+                && let Ok(v) = serde_json::from_str::<serde_json::Value>(&e.payload)
+                && let Some(corr) = v.get("corr").and_then(|c| c.as_str())
+            {
+                folded.insert(corr.to_string(), None);
+            }
+        }
+        folded
+    }
+
+    /// Wave-4 projection fold (ADR-0035 Spec 4): the receipts table as the
+    /// event log sees it — `receipt.stamped` last-write-wins per corr,
+    /// `receipt.pruned` tombstones applied. Unparseable payloads are skipped
+    /// (verify_against_log surfaces them as Ghost/Missing, never silent).
+    /// ponytail: full fold per read; receipts are low-volume (hundreds of
+    /// rows). Per-corr index if this ever serves a hot path.
+    async fn fold_projected(&self) -> anyhow::Result<BTreeMap<String, Receipt>> {
+        let log = crate::index::event_log::EventLog::new(self.pool.clone());
+        let events = log.read_since(0).await?;
+        let mut out = BTreeMap::new();
+        for (corr, slot) in Self::fold_events(&events) {
+            let Some(ev) = slot else { continue };
+            let Ok(state) = ReceiptState::parse(&ev.state) else {
+                continue;
+            };
+            let wake = match ev.wake {
+                Some(s) => match Wake::parse(&s) {
+                    Ok(w) => Some(w),
+                    Err(_) => continue,
+                },
+                None => None,
+            };
+            out.insert(
+                corr.clone(),
+                Receipt {
                     corr,
                     state,
                     wake,
-                    due_at,
-                    result_path,
-                    updated_at,
-                }))
-            }
-            None => Ok(None),
+                    due_at: ev.due_at,
+                    result_path: ev.result_path,
+                    updated_at: ev.updated_at,
+                },
+            );
         }
+        Ok(out)
     }
 
-    /// List receipts, optionally filtered by state. `None` = all states.
-    #[allow(clippy::type_complexity)]
+    /// Get one receipt by corr — served from the event projection (wave-4
+    /// reader switch). The table stays dual-written as the tripwire.
+    pub async fn get(&self, corr: &str) -> anyhow::Result<Option<Receipt>> {
+        Ok(self.fold_projected().await?.remove(corr))
+    }
+
+    /// List receipts, optionally filtered by state — from the projection.
+    /// `None` = all states, newest first (table order preserved).
     pub async fn list(&self, state: Option<ReceiptState>) -> anyhow::Result<Vec<Receipt>> {
-        let rows: Vec<(
-            String,
-            String,
-            Option<String>,
-            Option<i64>,
-            Option<String>,
-            i64,
-        )> = if let Some(st) = state {
-            sqlx::query_as(
-                    "SELECT corr, state, wake, due_at, result_path, updated_at FROM receipts WHERE state = ?1 ORDER BY updated_at DESC",
-                )
-                .bind(st.as_str())
-                .fetch_all(&self.pool)
-                .await?
-        } else {
-            sqlx::query_as(
-                    "SELECT corr, state, wake, due_at, result_path, updated_at FROM receipts ORDER BY updated_at DESC",
-                )
-                .fetch_all(&self.pool)
-                .await?
-        };
-        let mut out = Vec::with_capacity(rows.len());
-        for (corr, state_s, wake_s, due_at, result_path, updated_at) in rows {
-            let state = ReceiptState::parse(&state_s).map_err(|e| anyhow::anyhow!(e))?;
-            let wake = match wake_s {
-                Some(s) => Some(Wake::parse(&s).map_err(|e| anyhow::anyhow!(e.message))?),
-                None => None,
-            };
-            out.push(Receipt {
-                corr,
-                state,
-                wake,
-                due_at,
-                result_path,
-                updated_at,
-            });
-        }
+        let mut out: Vec<Receipt> = self
+            .fold_projected()
+            .await?
+            .into_values()
+            .filter(|r| state.is_none_or(|st| r.state == st))
+            .collect();
+        out.sort_by_key(|r| std::cmp::Reverse(r.updated_at));
         Ok(out)
     }
 
@@ -565,27 +580,109 @@ impl ReceiptStore {
         Ok(res.rows_affected())
     }
 
+    /// One-time backfill (wave-4 cutover): stamp every table row into the
+    /// log under its deterministic id. Idempotent — reruns dedupe and
+    /// append nothing. Returns rows newly stamped.
+    pub async fn backfill_from_table(&self) -> anyhow::Result<u64> {
+        let rows = self.list_table_rows().await?;
+        let log = crate::index::event_log::EventLog::new(self.pool.clone());
+        let mut stamped = 0u64;
+        for r in &rows {
+            let event = ReceiptEvent::stamped(r);
+            if log.existing(&event.event_id()).await?.is_some() {
+                continue;
+            }
+            let payload = serde_json::to_string(&event).unwrap_or_default();
+            log.append(
+                &event.event_id(),
+                ReceiptEvent::STAMPED,
+                &payload,
+                r.updated_at.saturating_mul(1000),
+            )
+            .await?;
+            stamped += 1;
+        }
+        Ok(stamped)
+    }
+
+    /// Rebuild the table from the log fold (export+import target, disaster
+    /// recovery). Table-only writes — no new events. Tombstones delete.
+    /// Returns (rows_written, rows_deleted).
+    pub async fn rebuild_from_log(&self) -> anyhow::Result<(u64, u64)> {
+        let log = crate::index::event_log::EventLog::new(self.pool.clone());
+        let events = log.read_since(0).await?;
+        let folded = Self::fold_events(&events);
+        let mut written = 0u64;
+        let mut deleted = 0u64;
+        for (corr, slot) in &folded {
+            match slot {
+                Some(ev) => {
+                    sqlx::query(
+                        "INSERT INTO receipts (corr, state, wake, due_at, result_path, updated_at) \
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+                         ON CONFLICT(corr) DO UPDATE SET \
+                           state = excluded.state, wake = excluded.wake, \
+                           due_at = excluded.due_at, result_path = excluded.result_path, \
+                           updated_at = excluded.updated_at",
+                    )
+                    .bind(corr)
+                    .bind(&ev.state)
+                    .bind(&ev.wake)
+                    .bind(ev.due_at)
+                    .bind(&ev.result_path)
+                    .bind(ev.updated_at)
+                    .execute(&self.pool)
+                    .await?;
+                    written += 1;
+                }
+                None => {
+                    let res = sqlx::query("DELETE FROM receipts WHERE corr = ?1")
+                        .bind(corr)
+                        .execute(&self.pool)
+                        .await?;
+                    deleted += res.rows_affected();
+                }
+            }
+        }
+        Ok((written, deleted))
+    }
+
+    /// Raw table rows (backfill source). Not a reader — readers serve the
+    /// projection.
+    async fn list_table_rows(&self) -> anyhow::Result<Vec<Receipt>> {
+        let rows: Vec<TableRow> = sqlx::query_as(
+            "SELECT corr, state, wake, due_at, result_path, updated_at FROM receipts",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for (corr, state_s, wake_s, due_at, result_path, updated_at) in rows {
+            let state = ReceiptState::parse(&state_s).map_err(|e| anyhow::anyhow!(e))?;
+            let wake = match wake_s {
+                Some(s) => Some(Wake::parse(&s).map_err(|e| anyhow::anyhow!(e.message))?),
+                None => None,
+            };
+            out.push(Receipt {
+                corr,
+                state,
+                wake,
+                due_at,
+                result_path,
+                updated_at,
+            });
+        }
+        Ok(out)
+    }
+
     /// Rebuild-verify (ADR-0035 wave 4): fold the `receipt.*` events
-    /// last-write-wins per corr and diff against the table. Readers are NOT
-    /// switched this wave — this proves the log can replace them. Pre-log
-    /// rows report as `Ghost` (informational, never a failure).
+    /// last-write-wins per corr and diff against the RAW table rows (never
+    /// the projection — comparing fold-to-fold would always agree).
+    /// Pre-log rows report as `Ghost` (informational, never a failure).
     pub async fn verify_against_log(&self) -> anyhow::Result<Vec<ReceiptDivergence>> {
         let log = crate::index::event_log::EventLog::new(self.pool.clone());
         let events = log.read_since(0).await?;
-        let mut expected: BTreeMap<String, Option<ReceiptEvent>> = BTreeMap::new();
-        for e in events {
-            if e.kind == ReceiptEvent::STAMPED {
-                if let Ok(ev) = serde_json::from_str::<ReceiptEvent>(&e.payload) {
-                    expected.insert(ev.corr.clone(), Some(ev));
-                }
-            } else if e.kind == ReceiptEvent::PRUNED
-                && let Ok(v) = serde_json::from_str::<serde_json::Value>(&e.payload)
-                && let Some(corr) = v.get("corr").and_then(|c| c.as_str())
-            {
-                expected.insert(corr.to_string(), None);
-            }
-        }
-        let rows = self.list(None).await?;
+        let expected = Self::fold_events(&events);
+        let rows = self.list_table_rows().await?;
         let table: BTreeMap<&str, &Receipt> = rows.iter().map(|r| (r.corr.as_str(), r)).collect();
         let mut out = Vec::new();
         for (corr, exp) in &expected {
@@ -874,6 +971,66 @@ mod tests {
             1
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn reader_switch_backfill_rebuild_parallel_close() {
+        use super::super::ids::Corr;
+        fn c(s: &str) -> Corr {
+            s.parse().expect("test corr")
+        }
+        let (pool, path) = test_pool("switch").await;
+        let store = ReceiptStore::new(pool.clone());
+        // Two lanes stamp concurrently: both survive (no lost writes).
+        let (s1, s2) = (store.clone(), store.clone());
+        let (r1, r2) = tokio::join!(
+            async move {
+                for i in 0..10 {
+                    s1.set_resulted(&c(&format!("lane-a-{i}")), None, 7000 + i)
+                        .await
+                        .expect("a");
+                }
+            },
+            async move {
+                for i in 0..10 {
+                    s2.set_resulted(&c(&format!("lane-b-{i}")), None, 8000 + i)
+                        .await
+                        .expect("b");
+                }
+            }
+        );
+        let _ = (r1, r2);
+        // Readers serve the projection: all 20 visible via get/list.
+        assert_eq!(store.list(None).await.expect("list").len(), 20);
+        assert!(store.get("lane-a-3").await.expect("get").is_some());
+        assert_eq!(
+            store
+                .list_by_state(ReceiptState::Resulted)
+                .await
+                .expect("filtered")
+                .len(),
+            20
+        );
+        // Backfill is a no-op on dual-written rows (idempotent).
+        assert_eq!(store.backfill_from_table().await.expect("backfill"), 0);
+        // Export + import into a fresh pool: both lanes survive.
+        let log = crate::index::event_log::EventLog::new(pool);
+        let exported = log.read_since(0).await.expect("export");
+        assert_eq!(exported.len(), 20);
+        let (pool2, path2) = test_pool("switch-import").await;
+        let log2 = crate::index::event_log::EventLog::new(pool2.clone());
+        for e in &exported {
+            log2.append(&e.event_id, &e.kind, &e.payload, e.ts_us)
+                .await
+                .expect("import");
+        }
+        let store2 = ReceiptStore::new(pool2);
+        let (wrote, deleted) = store2.rebuild_from_log().await.expect("rebuild");
+        assert_eq!((wrote, deleted), (20, 0));
+        assert_eq!(store2.list(None).await.expect("list2").len(), 20);
+        assert!(store2.verify_against_log().await.expect("v2").is_empty());
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&path2);
     }
 
     #[tokio::test]
