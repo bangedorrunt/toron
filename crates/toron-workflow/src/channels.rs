@@ -259,6 +259,117 @@ impl ChannelStore {
         Ok(())
     }
 
+    /// Rebuild a store from wire lifecycle events (bd-e03q, ADR-0035 Spec 4):
+    /// the bus 39000/39002 sequence (legacy 40/41) is the durable truth and
+    /// this store is its single-writer in-memory projection. Fresh processes
+    /// replay in wire order; later events win (a close retire beats an
+    /// earlier join, a 39002 snapshot replaces the set). Structural breaks
+    /// (missing channel id) fail the rebuild — a half-room is worse than none.
+    pub fn rebuild(events: impl IntoIterator<Item = Event>) -> anyhow::Result<Self> {
+        let store = Self::new();
+        for ev in events {
+            store.apply_lifecycle(&ev)?;
+        }
+        Ok(store)
+    }
+
+    /// Apply one lifecycle event to the projection. Returns whether the
+    /// store changed: unknown kinds and inapplicable transitions (a join for
+    /// a room that never existed, a close by a non-creator) are valid stream
+    /// dynamics and report `false` — only a structurally unreadable event
+    /// (no channel id) is a rebuild-stopping error.
+    pub fn apply_lifecycle(&self, ev: &Event) -> anyhow::Result<bool> {
+        match ev.kind.as_u16() {
+            CHANNEL_CREATE | CHANNEL_CREATE_LEGACY => {
+                let id = Self::lifecycle_channel_id(ev).ok_or_else(|| {
+                    anyhow::anyhow!("channel create lacks d/h tag")
+                })?;
+                let name = ev
+                    .tags
+                    .iter()
+                    .find(|t| t.as_slice().first().map(String::as_str) == Some("name"))
+                    .and_then(|t| t.as_slice().get(1).cloned())
+                    .unwrap_or_default();
+                let private = ev.tags.iter().any(|t| {
+                    t.as_slice().first().map(String::as_str) == Some("private")
+                        && t.as_slice().get(1).map(String::as_str) == Some("true")
+                });
+                let project = ev
+                    .tags
+                    .iter()
+                    .find(|t| t.as_slice().first().map(String::as_str) == Some("t"))
+                    .and_then(|t| t.as_slice().get(1).cloned());
+                self.create_channel(&ev.pubkey, &id, &name, private, project.as_deref())?;
+                let closed = ev.tags.iter().any(|t| {
+                    t.as_slice().first().map(String::as_str) == Some("closed")
+                        && t.as_slice().get(1).map(String::as_str) != Some("false")
+                });
+                if closed {
+                    // A close inside the create event retires immediately;
+                    // a non-creator close tag is an inapplicable no-op.
+                    if self.close(&id, &ev.pubkey).is_err() {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
+            CHANNEL_MEMBERS => {
+                let id = Self::lifecycle_channel_id(ev).ok_or_else(|| {
+                    anyhow::anyhow!("channel members snapshot lacks d/h tag")
+                })?;
+                // Content JSON is the snapshot source of truth: rust-nostr
+                // strips a p-tag that equals the signer, which would drop the
+                // joiner from a 39002 they just signed.
+                let members: Vec<String> =
+                    serde_json::from_str(&ev.content).unwrap_or_else(|_| {
+                        ev.tags
+                            .iter()
+                            .filter(|t| t.as_slice().first().map(String::as_str) == Some("p"))
+                            .filter_map(|t| t.as_slice().get(1).cloned())
+                            .collect()
+                    });
+                if self.replace_members(&id, members).is_err() {
+                    return Ok(false);
+                }
+                Ok(true)
+            }
+            CHANNEL_METADATA_LEGACY => {
+                let Some(id) = ev
+                    .tags
+                    .iter()
+                    .find(|t| t.kind() == "h")
+                    .and_then(|t| t.content())
+                else {
+                    anyhow::bail!("legacy channel metadata lacks h tag");
+                };
+                let applied = match ev.content.as_str() {
+                    "join" => self.join(&id, &ev.pubkey).is_ok(),
+                    "leave" => self.leave(&id, &ev.pubkey).is_ok(),
+                    "close" => self.close(&id, &ev.pubkey).is_ok(),
+                    _ => false,
+                };
+                Ok(applied)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    /// The channel id of a lifecycle event: `d` first, `h` as fallback
+    /// (both spellings ride the wire across the ADR-0023 cutover).
+    fn lifecycle_channel_id(ev: &Event) -> Option<String> {
+        ev.tags
+            .iter()
+            .find(|t| t.kind() == "d")
+            .and_then(|t| t.content())
+            .or_else(|| {
+                ev.tags
+                    .iter()
+                    .find(|t| t.kind() == "h")
+                    .and_then(|t| t.content())
+            })
+            .map(str::to_string)
+    }
+
     /// Is `npub` a member of the channel?
     pub fn is_member(&self, channel_id: &str, npub: &PublicKey) -> bool {
         self.inner
@@ -617,6 +728,50 @@ mod tests {
             .join("steer-axfm", &bob.public_key())
             .expect("re-join idempotent");
         assert!(store.is_member("steer-axfm", &bob.public_key()));
+    }
+
+    /// bd-e03q RED (ADR-0035 Spec 4): the store rebuilds from wire
+    /// lifecycle events — a fresh process replays create + members and
+    /// recovers the room, the single projection over the bus truth.
+    #[test]
+    fn rebuild_from_lifecycle_events_restores_membership() {
+        let creator = keys();
+        let member = keys();
+        let create = build_event(
+            &creator,
+            toron_kind(CHANNEL_CREATE),
+            "",
+            vec![
+                Tag::parse(["d", "rebuild-room"]).expect("d tag"),
+                Tag::parse(["name", "Rebuild"]).expect("name tag"),
+            ],
+            Timestamp::now(),
+        )
+        .expect("create event");
+        let members = build_event(
+            &creator,
+            toron_kind(CHANNEL_MEMBERS),
+            serde_json::to_string(&vec![
+                creator.public_key().to_hex(),
+                member.public_key().to_hex(),
+            ])
+            .expect("members json"),
+            vec![Tag::parse(["h", "rebuild-room"]).expect("h tag")],
+            Timestamp::now(),
+        )
+        .expect("members event");
+        // A fresh process, wiped cache: replay restores the room.
+        let store = ChannelStore::rebuild([create, members]).expect("rebuild");
+        assert!(
+            store.is_member("rebuild-room", &member.public_key()),
+            "replayed membership admits the member"
+        );
+        assert!(
+            store
+                .post(&member, "rebuild-room", "hello again", &[])
+                .is_ok(),
+            "rebuilt room accepts member posts"
+        );
     }
 
     /// bd-channel-truncation-238e: an over-cap post FAILS LOUDLY naming the
