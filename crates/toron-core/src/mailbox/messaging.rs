@@ -364,7 +364,7 @@ impl Mailbox {
                                 &crate::index::writer::SystemClock,
                             ) / 1000;
                             let _ = s.prune_expired(now_ms, 30 * 24 * 60 * 60 * 1000).await;
-                            let _ = s.prune_to_cap(1000).await;
+                            let _ = s.prune_to_cap(1000, now_ms).await;
                         });
                     }
                 }

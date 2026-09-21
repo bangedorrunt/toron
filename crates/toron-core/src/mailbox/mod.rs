@@ -67,7 +67,9 @@ pub use messaging::{
 };
 pub use metrics::{BenchCase, BenchReport, BenchTimer, MailboxMetrics, MetricsSnapshot};
 pub use product::ProductInfo;
-pub use receipts::{Receipt, ReceiptState, ReceiptStore};
+pub use receipts::{
+    DivergenceKind, Receipt, ReceiptDivergence, ReceiptEvent, ReceiptState, ReceiptStore,
+};
 pub use reservations::{
     AcquireResult, ConflictReport, GrantedReservation, IntentReservation, IntentResult,
     PathConflict, ReleaseAsk, ReleaseDecision, ReleaseResponse, ReleaseResult, RenewResult,

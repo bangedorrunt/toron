@@ -12,7 +12,10 @@
 //! the cursor.
 
 use sqlx::SqlitePool;
+use std::collections::BTreeMap;
 use std::str::FromStr;
+
+use serde::{Deserialize, Serialize};
 
 use super::ids::Corr;
 use super::receipts_core::{self, ReceiptEffect, ReceiptsModel, ReceiptsMsg, State as CoreState};
@@ -126,6 +129,68 @@ pub struct Receipt {
     pub updated_at: i64,
 }
 
+/// Wave-4 receipt event (ADR-0035 Spec 4): the log form of one stamp or
+/// prune. The event log folds these last-write-wins per corr; the table
+/// is that fold's projection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReceiptEvent {
+    pub corr: String,
+    pub state: String,
+    pub wake: Option<String>,
+    pub due_at: Option<i64>,
+    pub result_path: Option<String>,
+    pub updated_at: i64,
+}
+
+impl ReceiptEvent {
+    /// One table stamp committed.
+    pub const STAMPED: &'static str = "receipt.stamped";
+    /// One prune tombstone: rebuild must NOT resurrect this corr.
+    pub const PRUNED: &'static str = "receipt.pruned";
+
+    pub fn stamped(r: &Receipt) -> Self {
+        Self {
+            corr: r.corr.clone(),
+            state: r.state.as_str().to_string(),
+            wake: r.wake.map(|w| w.as_str().to_string()),
+            due_at: r.due_at,
+            result_path: r.result_path.clone(),
+            updated_at: r.updated_at,
+        }
+    }
+
+    /// Unique per stamp (corr + stamp clock): idempotent re-stamps of the
+    /// same row dedupe commutatively.
+    pub fn event_id(&self) -> String {
+        format!("receipt:{}:{}", self.corr, self.updated_at)
+    }
+
+    /// Tombstone id for a prune of `corr` at host time `now_ms`.
+    pub fn prune_id(corr: &str, now_ms: i64) -> String {
+        format!("receipt-prune:{corr}:{now_ms}")
+    }
+}
+
+/// One place where the receipts table disagrees with its event fold.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReceiptDivergence {
+    pub corr: String,
+    pub kind: DivergenceKind,
+}
+
+/// How table and log disagree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DivergenceKind {
+    /// The log stamps a corr the table lacks.
+    Missing,
+    /// Same corr, different stamped field (names it).
+    DivergedField(&'static str),
+    /// A pruned corr is back in the table (resurrected by a raw write).
+    Resurrected,
+    /// A table row predates the log (pre-wave-4 write, informational).
+    Ghost,
+}
+
 /// Store over the `receipts` sqlite table (E2).
 #[derive(Debug, Clone)]
 pub struct ReceiptStore {
@@ -203,24 +268,52 @@ impl ReceiptStore {
         Box::pin(self.upsert_row(receipt)).await
     }
 
+    /// Wave-4 dual-write (ADR-0035 Spec 4): the table row and its
+    /// `receipt.stamped` event commit in ONE transaction. The log is the
+    /// emerging source of truth; the table is its projection. A log failure
+    /// fails the write (fail-closed) — never row-without-event.
     async fn upsert_row(&self, receipt: &Receipt) -> anyhow::Result<()> {
-        let wake_s = receipt.wake.map(|w| w.as_str().to_string());
-        sqlx::query(
-            "INSERT INTO receipts (corr, state, wake, due_at, result_path, updated_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
-             ON CONFLICT(corr) DO UPDATE SET \
-               state = excluded.state, wake = excluded.wake, due_at = excluded.due_at, \
-               result_path = excluded.result_path, updated_at = excluded.updated_at",
-        )
-        .bind(&receipt.corr)
-        .bind(receipt.state.as_str())
-        .bind(wake_s)
-        .bind(receipt.due_at)
-        .bind(&receipt.result_path)
-        .bind(receipt.updated_at)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
+        let log = crate::index::event_log::EventLog::new(self.pool.clone());
+        for _ in 0..3 {
+            let mut tx = self.pool.begin().await?;
+            let wake_s = receipt.wake.map(|w| w.as_str().to_string());
+            sqlx::query(
+                "INSERT INTO receipts (corr, state, wake, due_at, result_path, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+                 ON CONFLICT(corr) DO UPDATE SET \
+                   state = excluded.state, wake = excluded.wake, due_at = excluded.due_at, \
+                   result_path = excluded.result_path, updated_at = excluded.updated_at",
+            )
+            .bind(&receipt.corr)
+            .bind(receipt.state.as_str())
+            .bind(wake_s)
+            .bind(receipt.due_at)
+            .bind(&receipt.result_path)
+            .bind(receipt.updated_at)
+            .execute(&mut *tx)
+            .await?;
+            let event = ReceiptEvent::stamped(receipt);
+            let payload = serde_json::to_string(&event).unwrap_or_default();
+            match log
+                .append_in(
+                    &mut tx,
+                    &event.event_id(),
+                    ReceiptEvent::STAMPED,
+                    &payload,
+                    receipt.updated_at.saturating_mul(1000),
+                )
+                .await
+            {
+                Ok(_) => {
+                    tx.commit().await?;
+                    return Ok(());
+                }
+                Err(_) => {
+                    tx.rollback().await?;
+                }
+            }
+        }
+        anyhow::bail!("receipt dual-write contention on {:?}", receipt.corr)
     }
 
     /// Get one receipt by corr.
@@ -396,9 +489,8 @@ impl ReceiptStore {
         }
     }
     /// Prune receipts older than `retention_ms` of host time `now_ms` (both
-    /// host-supplied; ADR-0035 Spec 1). Keeps the table bounded — callers
-    /// should invoke periodically (e.g. on mailbox open and daily).
-    /// Best-effort: never errors on empty store.
+    /// host-supplied; ADR-0035 Spec 1). Tombstones each pruned corr in the
+    /// log so a rebuild never resurrects it. Best-effort on empty store.
     pub async fn prune_expired(&self, now_ms: i64, retention_ms: i64) -> anyhow::Result<u64> {
         let (_, fx) = receipts_core::tick(
             &ReceiptsModel::new(),
@@ -411,24 +503,128 @@ impl ReceiptStore {
             Some(ReceiptEffect::PruneBefore { cutoff_ms }) => *cutoff_ms,
             _ => now_ms.saturating_sub(retention_ms),
         };
+        let doomed: Vec<(String,)> =
+            sqlx::query_as("SELECT corr FROM receipts WHERE updated_at < ?1")
+                .bind(cutoff)
+                .fetch_all(&self.pool)
+                .await?;
+        let log = crate::index::event_log::EventLog::new(self.pool.clone());
+        let mut tx = self.pool.begin().await?;
         let res = sqlx::query("DELETE FROM receipts WHERE updated_at < ?1")
             .bind(cutoff)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
+        for (corr,) in &doomed {
+            let payload =
+                serde_json::to_string(&serde_json::json!({ "corr": corr })).unwrap_or_default();
+            log.append_in(
+                &mut tx,
+                &ReceiptEvent::prune_id(corr, now_ms),
+                ReceiptEvent::PRUNED,
+                &payload,
+                now_ms.saturating_mul(1000),
+            )
+            .await?;
+        }
+        tx.commit().await?;
         Ok(res.rows_affected())
     }
 
-    /// Keep at most `keep` newest receipts (by updated_at). Deletes oldest
-    /// beyond the cap — second bound for high-volume projects.
-    pub async fn prune_to_cap(&self, keep: i64) -> anyhow::Result<u64> {
+    /// Keep at most `keep` newest receipts (by updated_at), tombstoning the
+    /// evicted corrs in the log (same anti-resurrection contract as prune).
+    pub async fn prune_to_cap(&self, keep: i64, now_ms: i64) -> anyhow::Result<u64> {
+        let doomed: Vec<(String,)> = sqlx::query_as(
+            "SELECT corr FROM receipts WHERE corr NOT IN \
+             (SELECT corr FROM receipts ORDER BY updated_at DESC LIMIT ?1)",
+        )
+        .bind(keep)
+        .fetch_all(&self.pool)
+        .await?;
+        let log = crate::index::event_log::EventLog::new(self.pool.clone());
+        let mut tx = self.pool.begin().await?;
         let res = sqlx::query(
             "DELETE FROM receipts WHERE corr NOT IN \
              (SELECT corr FROM receipts ORDER BY updated_at DESC LIMIT ?1)",
         )
         .bind(keep)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        for (corr,) in &doomed {
+            let payload =
+                serde_json::to_string(&serde_json::json!({ "corr": corr })).unwrap_or_default();
+            log.append_in(
+                &mut tx,
+                &ReceiptEvent::prune_id(corr, now_ms),
+                ReceiptEvent::PRUNED,
+                &payload,
+                now_ms.saturating_mul(1000),
+            )
+            .await?;
+        }
+        tx.commit().await?;
         Ok(res.rows_affected())
+    }
+
+    /// Rebuild-verify (ADR-0035 wave 4): fold the `receipt.*` events
+    /// last-write-wins per corr and diff against the table. Readers are NOT
+    /// switched this wave — this proves the log can replace them. Pre-log
+    /// rows report as `Ghost` (informational, never a failure).
+    pub async fn verify_against_log(&self) -> anyhow::Result<Vec<ReceiptDivergence>> {
+        let log = crate::index::event_log::EventLog::new(self.pool.clone());
+        let events = log.read_since(0).await?;
+        let mut expected: BTreeMap<String, Option<ReceiptEvent>> = BTreeMap::new();
+        for e in events {
+            if e.kind == ReceiptEvent::STAMPED {
+                if let Ok(ev) = serde_json::from_str::<ReceiptEvent>(&e.payload) {
+                    expected.insert(ev.corr.clone(), Some(ev));
+                }
+            } else if e.kind == ReceiptEvent::PRUNED
+                && let Ok(v) = serde_json::from_str::<serde_json::Value>(&e.payload)
+                && let Some(corr) = v.get("corr").and_then(|c| c.as_str())
+            {
+                expected.insert(corr.to_string(), None);
+            }
+        }
+        let rows = self.list(None).await?;
+        let table: BTreeMap<&str, &Receipt> = rows.iter().map(|r| (r.corr.as_str(), r)).collect();
+        let mut out = Vec::new();
+        for (corr, exp) in &expected {
+            match (exp, table.get(corr.as_str())) {
+                (Some(_), None) => out.push(ReceiptDivergence {
+                    corr: corr.clone(),
+                    kind: DivergenceKind::Missing,
+                }),
+                (Some(ev), Some(row)) => {
+                    for (field, same) in [
+                        ("state", ev.state == row.state.as_str()),
+                        ("updated_at", ev.updated_at == row.updated_at),
+                        ("result_path", ev.result_path == row.result_path),
+                    ] {
+                        if !same {
+                            out.push(ReceiptDivergence {
+                                corr: corr.clone(),
+                                kind: DivergenceKind::DivergedField(field),
+                            });
+                            break;
+                        }
+                    }
+                }
+                (None, Some(_)) => out.push(ReceiptDivergence {
+                    corr: corr.clone(),
+                    kind: DivergenceKind::Resurrected,
+                }),
+                (None, None) => {}
+            }
+        }
+        for corr in table.keys() {
+            if !expected.contains_key(*corr) {
+                out.push(ReceiptDivergence {
+                    corr: (*corr).to_string(),
+                    kind: DivergenceKind::Ghost,
+                });
+            }
+        }
+        Ok(out)
     }
 }
 
@@ -640,6 +836,64 @@ mod tests {
             .expect("get3")
             .expect("found3");
         assert_eq!(got3.state, ReceiptState::Resulted);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn receipts_dual_write_and_rebuild_verify_clean() {
+        use super::super::ids::Corr;
+        fn c(s: &str) -> Corr {
+            s.parse().expect("test corr")
+        }
+        let (pool, path) = test_pool("dual-write").await;
+        let store = ReceiptStore::new(pool.clone());
+        let log = crate::index::event_log::EventLog::new(pool);
+        // Every stamp lands an event; the fold matches the table exactly.
+        store
+            .set_resulted(&c("w1"), Some("/w.json".into()), 5000)
+            .await
+            .expect("w1");
+        store
+            .transition_acked(&c("w1"), 5001)
+            .await
+            .expect("no downgrade of proven");
+        assert_eq!(
+            log.count_kind(ReceiptEvent::STAMPED).await.expect("count"),
+            1
+        );
+        assert_eq!(log.generation().await.expect("gen"), 1);
+        let div = store.verify_against_log().await.expect("verify");
+        assert!(div.is_empty(), "clean fold, no divergence: {div:?}");
+        // Prune tombstones: rebuild must not resurrect.
+        store.prune_expired(9000, 1000).await.expect("prune");
+        assert!(store.get("w1").await.expect("get").is_none(), "row pruned");
+        let div = store.verify_against_log().await.expect("verify2");
+        assert!(div.is_empty(), "tombstoned fold stays clean: {div:?}");
+        assert_eq!(
+            log.count_kind(ReceiptEvent::PRUNED).await.expect("pruned"),
+            1
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn rebuild_verify_catches_raw_table_write() {
+        use super::super::ids::Corr;
+        fn c(s: &str) -> Corr {
+            s.parse().expect("test corr")
+        }
+        let (pool, path) = test_pool("diverged").await;
+        let store = ReceiptStore::new(pool.clone());
+        store.set_resulted(&c("v1"), None, 6000).await.expect("v1");
+        // Bypass the store: raw write the table behind the log's back.
+        sqlx::query("UPDATE receipts SET state = 'owed' WHERE corr = 'v1'")
+            .execute(&pool)
+            .await
+            .expect("raw write");
+        let div = store.verify_against_log().await.expect("verify");
+        assert_eq!(div.len(), 1);
+        assert_eq!(div[0].corr, "v1");
+        assert_eq!(div[0].kind, DivergenceKind::DivergedField("state"));
         let _ = std::fs::remove_file(&path);
     }
 
