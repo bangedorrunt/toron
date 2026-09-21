@@ -477,6 +477,14 @@ pub async fn journal_get(
     .transpose()
 }
 
+/// Wake-priority input scores (travel together; one struct, not three args).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WakeScores {
+    pub urgency: f64,
+    pub actionability: f64,
+    pub interrupt: f64,
+}
+
 impl super::Mailbox {
     /// `ask_judgment`: idempotent replay → child `flywheel judgment-ask` under
     /// a timeout → validate → journal → return. Loud typed errors at every
@@ -498,7 +506,12 @@ impl super::Mailbox {
                  refusing rather than returning an unjournaled answer"
             )
         })?;
-        if let Some(record) = journal_get(pool, effect_key).await? {
+        // Discriminating replay (bd-fbgi): version/state drift is loud.
+        let expected_version = find_pack(pack_id).map(|p| p.version);
+        let expected_hash = state_hash(state);
+        if let Some(record) =
+            journal_get_for(pool, effect_key, expected_version, &expected_hash).await?
+        {
             return Ok(JudgmentOutcome {
                 record,
                 replayed: true,
@@ -512,7 +525,9 @@ impl super::Mailbox {
         {
             let record = offline_answer(effect_key, &pack, state);
             journal_insert(pool, project_slug, &record).await?;
-            let record = journal_get(pool, effect_key).await?.unwrap_or(record);
+            let record = journal_get_for(pool, effect_key, expected_version, &expected_hash)
+                .await?
+                .unwrap_or(record);
             return Ok(JudgmentOutcome {
                 record,
                 replayed: false,
@@ -559,11 +574,346 @@ impl super::Mailbox {
         let mut record = parse_judgment_stdout(effect_key, pack_id, &stdout)?;
         record.state_hash = state_hash(state);
         journal_insert(pool, project_slug, &record).await?;
-        let record = journal_get(pool, effect_key).await?.unwrap_or(record);
+        let record = journal_get_for(pool, effect_key, expected_version, &expected_hash)
+            .await?
+            .unwrap_or(record);
         Ok(JudgmentOutcome {
             record,
             replayed: false,
         })
+    }
+
+    /// Production seam (bd-sd9j): tick → journal → interpret → route for
+    /// wake priority. Builds the deferred `Effect::Judge`, runs it through
+    /// `ask_judgment` (journal-before-ask inside), then applies code-owned
+    /// confidence routing plus the wake-gate composite. Returns the gate,
+    /// the route, and the journaled outcome (proof).
+    pub async fn judge_wake_priority(
+        &self,
+        project_slug: &str,
+        effect_key: &str,
+        scores: WakeScores,
+        transport: &str,
+        timeout_secs: Option<u64>,
+    ) -> anyhow::Result<(WakeGate, JudgeRoute, JudgmentOutcome)> {
+        let state = serde_json::json!({
+            "urgency": scores.urgency,
+            "actionability": scores.actionability,
+            "interrupt": scores.interrupt,
+        });
+        let effect = JudgeEffect::request(
+            effect_key,
+            "wake-priority",
+            &state,
+            transport,
+            timeout_secs.unwrap_or(JUDGMENT_DEFAULT_TIMEOUT_SECS),
+        );
+        let (_, effects) = tick(&JudgeModel::new(), &JudgeMsg::Request { effect });
+        let Some(Effect::Judge(effect)) = effects.into_iter().next() else {
+            anyhow::bail!("judge kernel emitted no Judge effect (duplicate key?)");
+        };
+        let outcome = self
+            .ask_judgment(
+                project_slug,
+                &effect.effect_key,
+                &effect.pack_id,
+                &effect.state,
+                &effect.transport,
+                Some(effect.timeout_secs),
+            )
+            .await?;
+        let answers = &outcome.record.answers;
+        let num = |name: &str| {
+            answers
+                .get(name)
+                .and_then(serde_json::Value::as_f64)
+                .ok_or_else(|| anyhow::anyhow!("wake-priority answer missing number `{name}`"))
+        };
+        let gate = decide_wake_gate(num("urgency")?, num("actionability")?, num("interrupt")?);
+        let route = route_outcome(&outcome.record);
+        Ok((gate, route, outcome))
+    }
+}
+
+// ── Effect::Judge kernel (ADR-0035 Spec 3, bd-sd9j) ───────────────────────
+// Judgment as a deferred Effect value: tick constructs it (pure data),
+// the interpreter runs it exactly once at the edge (journal-before-ask),
+// and confidence routing decides Act vs human. One Judge variant with one
+// interpreter; substitutes (FakeJudge) ride the same Effect shape.
+//
+// Note on fences: dispatch_core-style import fences cannot apply to this
+// file — the interpreter (subprocess, sqlx, clock) cohabits it by scope
+// (mailbox/judgment.rs only). Kernel purity is structural instead: `tick`
+// takes `&Model, &Msg` and returns owned data, with zero IO types in its
+// signature, plus the determinism test below.
+
+use std::collections::{BTreeMap, VecDeque};
+
+/// Typed judgment failures. Version/state drift on replay is a loud
+/// mismatch, never a silent first-row accept (bd-fbgi).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JudgeError {
+    /// Stored row names another pack version than the asking call.
+    VersionMismatch {
+        effect_key: String,
+        stored: u32,
+        asked: u32,
+    },
+    /// Stored row judged different state than the asking call.
+    StalePack {
+        effect_key: String,
+        stored_hash: String,
+        asked_hash: String,
+    },
+    /// No local pack and no way to resolve one.
+    UnknownPack(String),
+}
+
+impl std::fmt::Display for JudgeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::VersionMismatch {
+                effect_key,
+                stored,
+                asked,
+            } => write!(
+                f,
+                "judgment replay version_mismatch for `{effect_key}`: stored pack v{stored}, asked v{asked} — re-ask under a fresh effect_key, never replay across versions"
+            ),
+            Self::StalePack {
+                effect_key,
+                stored_hash,
+                asked_hash,
+            } => write!(
+                f,
+                "judgment replay stale_pack for `{effect_key}`: stored state {stored_hash}, asked {asked_hash} — the world moved; re-ask, never replay stale judgment"
+            ),
+            Self::UnknownPack(pack) => write!(
+                f,
+                "judgment pack `{pack}` is not in the local registry and no resolver was supplied"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for JudgeError {}
+
+/// Deferred judgment: data only, no I/O. Built by `tick`, run once by the
+/// interpreter (`interpret_judge` / `Mailbox::ask_judgment`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct JudgeEffect {
+    pub effect_key: String,
+    pub pack_id: String,
+    /// Registry version at construction; `None` when the pack is resolved
+    /// downstream (version check then defers to the child, hash still binds).
+    pub pack_version: Option<u32>,
+    pub state: serde_json::Value,
+    pub state_hash: String,
+    pub transport: String,
+    pub timeout_secs: u64,
+}
+
+impl JudgeEffect {
+    /// Construct + hash in one step: callers never hand-assemble the fields.
+    pub fn request(
+        effect_key: &str,
+        pack_id: &str,
+        state: &serde_json::Value,
+        transport: &str,
+        timeout_secs: u64,
+    ) -> Self {
+        Self {
+            effect_key: effect_key.to_string(),
+            pack_id: pack_id.to_string(),
+            pack_version: find_pack(pack_id).map(|p| p.version),
+            state: state.clone(),
+            state_hash: state_hash(state),
+            transport: transport.to_string(),
+            timeout_secs,
+        }
+    }
+}
+
+/// Closed interpreter effects. One Judge variant with one interpreter;
+/// adding a variant without an interpreter arm is a compile error at the
+/// match in `interpret_effect`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Effect {
+    Judge(JudgeEffect),
+}
+
+/// Judgment kernel model: in-flight keys only. Clone-and-return keeps
+/// `tick` pure.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct JudgeModel {
+    pub inflight: BTreeMap<String, u64>,
+}
+
+impl JudgeModel {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+/// All kernel state changes enter as messages.
+#[derive(Debug, Clone, PartialEq)]
+pub enum JudgeMsg {
+    /// Ask for judgment (idempotent per key: a duplicate emits nothing).
+    Request { effect: JudgeEffect },
+    /// The interpreter's answer landed; drop the in-flight key.
+    Settled {
+        effect_key: String,
+        record: JudgmentEffectRecord,
+    },
+}
+
+/// Pure decision: `(Model, Msg) -> (Model, Effects)`.
+pub fn tick(model: &JudgeModel, msg: &JudgeMsg) -> (JudgeModel, Vec<Effect>) {
+    let mut next = model.clone();
+    match msg {
+        JudgeMsg::Request { effect } => {
+            if next.inflight.contains_key(&effect.effect_key) {
+                return (next, Vec::new());
+            }
+            next.inflight.insert(effect.effect_key.clone(), 1);
+            (next, vec![Effect::Judge(effect.clone())])
+        }
+        JudgeMsg::Settled { effect_key, .. } => {
+            next.inflight.remove(effect_key);
+            (next, Vec::new())
+        }
+    }
+}
+
+/// Machine config JSON for the visualizer (dispatch_core pattern).
+pub fn machine_config() -> serde_json::Value {
+    serde_json::json!({
+        "machine": "judge_kernel",
+        "states": ["idle", "inflight"],
+        "transitions": [
+            {"on": "Request", "guard": "key_not_inflight", "effects": ["Judge"]},
+            {"on": "Settled", "guard": null, "effects": []},
+        ],
+        "guards": ["key_not_inflight"],
+    })
+}
+
+/// Confidence routing (code-owned thresholds; changing them never re-runs
+/// inference). Escalated answers and sub-threshold confidence route to a
+/// human; everything else may act.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JudgeRoute {
+    Act,
+    EscalateHuman,
+}
+
+/// Noul-near-0.5 seeds escalate at the source, so 0.55 also catches bare
+/// low-confidence answers without a flag.
+pub fn route_outcome(record: &JudgmentEffectRecord) -> JudgeRoute {
+    if record.escalated || record.confidence < 0.55 {
+        JudgeRoute::EscalateHuman
+    } else {
+        JudgeRoute::Act
+    }
+}
+
+/// Discriminating replay: a stored row replays ONLY on full identity
+/// (effect_key + pack_version + state_hash). Drift is a loud typed error
+/// (bd-fbgi), never a silent first-row accept. Rows journaled before
+/// state hashes existed carry an empty hash: the hash check is skipped
+/// for those (documented legacy), the version check still binds.
+pub fn replay_check(
+    stored: &JudgmentEffectRecord,
+    expected_version: Option<u32>,
+    expected_hash: &str,
+) -> Result<(), JudgeError> {
+    if let Some(asked) = expected_version
+        && stored.pack_version != asked
+    {
+        return Err(JudgeError::VersionMismatch {
+            effect_key: stored.effect_key.clone(),
+            stored: stored.pack_version,
+            asked,
+        });
+    }
+    if !stored.state_hash.is_empty() && stored.state_hash != expected_hash {
+        return Err(JudgeError::StalePack {
+            effect_key: stored.effect_key.clone(),
+            stored_hash: stored.state_hash.clone(),
+            asked_hash: expected_hash.to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// Journal read with identity: `None` (no row) or the checked row.
+pub async fn journal_get_for(
+    pool: &sqlx::SqlitePool,
+    effect_key: &str,
+    expected_version: Option<u32>,
+    expected_hash: &str,
+) -> anyhow::Result<Option<JudgmentEffectRecord>> {
+    let Some(record) = journal_get(pool, effect_key).await? else {
+        return Ok(None);
+    };
+    replay_check(&record, expected_version, expected_hash).map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok(Some(record))
+}
+
+/// Scripted substitute for the interpreter (tests + dry runs): per-key
+/// answer/fail/hang scripts with millisecond runtimes — no subprocess,
+/// no sleeps. A drained script replays its last answer (stable under
+/// retry); unknown keys escalate loudly.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FakeStep {
+    Answer(JudgmentEffectRecord),
+    Fail(String),
+    Hang,
+}
+
+#[derive(Debug, Default)]
+pub struct FakeJudge {
+    script: BTreeMap<String, VecDeque<FakeStep>>,
+    pub calls: u64,
+}
+
+impl FakeJudge {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Script one key: fail-twice-then-succeed is
+    /// `[Fail, Fail, Answer]`; hang is `[Hang]`; storm is N `Answer`s.
+    pub fn script(&mut self, effect_key: &str, steps: Vec<FakeStep>) {
+        self.script.insert(effect_key.to_string(), steps.into());
+    }
+
+    /// Run one deferred effect (sync, ms-scale). Hang surfaces as the
+    /// same timeout shape the live interpreter reports.
+    pub fn answer(&mut self, effect: &JudgeEffect) -> anyhow::Result<JudgmentOutcome> {
+        self.calls += 1;
+        let queue = self.script.get_mut(&effect.effect_key).ok_or_else(|| {
+            anyhow::anyhow!(
+                "fake judge has no script for `{}` — script every key under test",
+                effect.effect_key
+            )
+        })?;
+        let step = if queue.len() > 1 {
+            queue.pop_front().expect("len checked")
+        } else {
+            queue.front().cloned().expect("script never empty")
+        };
+        match step {
+            FakeStep::Answer(record) => Ok(JudgmentOutcome {
+                record,
+                replayed: false,
+            }),
+            FakeStep::Fail(reason) => anyhow::bail!("fake judge failure: {reason}"),
+            FakeStep::Hang => anyhow::bail!(
+                "fake judge hang on `{}` (timeout shape, no sleep taken)",
+                effect.effect_key
+            ),
+        }
     }
 }
 
@@ -748,6 +1098,289 @@ mod tests {
         let r: JudgmentEffectRecord =
             serde_json::from_value(serde_json::Value::Object(obj)).expect("old row parses");
         assert_eq!(r.state_hash, "");
+    }
+
+    // ── Lane I kernel + replay identity (bd-sd9j) ────────────────────────
+
+    fn judge_effect(key: &str) -> JudgeEffect {
+        JudgeEffect::request(
+            key,
+            "wake-priority",
+            &serde_json::json!({"urgency": 0.9}),
+            "offline",
+            5,
+        )
+    }
+
+    #[test]
+    fn test_tick_request_emits_one_judge_and_dedupes() {
+        let (m1, fx1) = tick(
+            &JudgeModel::new(),
+            &JudgeMsg::Request {
+                effect: judge_effect("k"),
+            },
+        );
+        assert_eq!(fx1.len(), 1);
+        assert!(matches!(fx1[0], Effect::Judge(_)));
+        // Duplicate key emits nothing (replay dedup at tick level).
+        let (_, fx2) = tick(
+            &m1,
+            &JudgeMsg::Request {
+                effect: judge_effect("k"),
+            },
+        );
+        assert!(fx2.is_empty());
+        // Settled drops the key; a fresh request emits again.
+        let record = offline_answer(
+            "k",
+            &find_pack("wake-priority").unwrap(),
+            &serde_json::json!({}),
+        );
+        let (m3, _) = tick(
+            &m1,
+            &JudgeMsg::Settled {
+                effect_key: "k".to_string(),
+                record,
+            },
+        );
+        let (_, fx4) = tick(
+            &m3,
+            &JudgeMsg::Request {
+                effect: judge_effect("k"),
+            },
+        );
+        assert_eq!(fx4.len(), 1);
+    }
+
+    #[test]
+    fn test_tick_deterministic_bd_sd9j() {
+        let log = vec![
+            JudgeMsg::Request {
+                effect: judge_effect("a"),
+            },
+            JudgeMsg::Request {
+                effect: judge_effect("a"),
+            },
+            JudgeMsg::Request {
+                effect: judge_effect("b"),
+            },
+        ];
+        let replay = |log: &[JudgeMsg]| {
+            let mut model = JudgeModel::new();
+            let mut all = Vec::new();
+            for msg in log {
+                let (next, fx) = tick(&model, msg);
+                model = next;
+                all.extend(fx);
+            }
+            (model, all)
+        };
+        let (ma, fa) = replay(&log);
+        let (mb, fb) = replay(&log);
+        assert_eq!(format!("{fa:?}"), format!("{fb:?}"));
+        assert_eq!(ma, mb);
+        assert_eq!(fa.len(), 2, "two distinct keys, one dup suppressed");
+    }
+
+    #[test]
+    fn test_replay_check_binds_version_and_hash_bd_fbgi() {
+        let pack = find_pack("wake-priority").unwrap();
+        let state = serde_json::json!({"urgency": 0.9});
+        let record = offline_answer("k", &pack, &state);
+        // Full identity replays.
+        replay_check(&record, Some(pack.version), &state_hash(&state)).expect("match replays");
+        // Version drift is loud.
+        let err = replay_check(&record, Some(pack.version + 1), &state_hash(&state)).unwrap_err();
+        assert!(matches!(err, JudgeError::VersionMismatch { .. }), "{err}");
+        assert!(err.to_string().contains("version_mismatch"));
+        // State drift is loud.
+        let err = replay_check(&record, Some(pack.version), "deadbeef").unwrap_err();
+        assert!(matches!(err, JudgeError::StalePack { .. }), "{err}");
+        assert!(err.to_string().contains("stale_pack"));
+        // Legacy rows without a hash skip only the hash check.
+        let mut legacy = record;
+        legacy.state_hash = String::new();
+        replay_check(&legacy, Some(pack.version), "anything").expect("legacy hash skipped");
+        assert!(replay_check(&legacy, Some(pack.version + 1), "anything").is_err());
+    }
+
+    #[test]
+    fn test_route_outcome_thresholds_bd_sd9j() {
+        let pack = find_pack("hazard-guardrail").unwrap();
+        let calm = offline_answer("c", &pack, &serde_json::json!({}));
+        assert_eq!(route_outcome(&calm), JudgeRoute::Act);
+        let mut hot = calm.clone();
+        hot.escalated = true;
+        assert_eq!(route_outcome(&hot), JudgeRoute::EscalateHuman);
+        let mut low = calm;
+        low.escalated = false;
+        low.confidence = 0.1;
+        assert_eq!(route_outcome(&low), JudgeRoute::EscalateHuman);
+    }
+
+    #[test]
+    fn test_machine_config_serializes_bd_sd9j() {
+        let cfg = machine_config();
+        assert_eq!(cfg["machine"], "judge_kernel");
+    }
+
+    #[test]
+    fn test_fake_judge_fail_twice_then_succeed() {
+        let pack = find_pack("dispatchable").unwrap();
+        let state = serde_json::json!({});
+        let answer = offline_answer("k", &pack, &state);
+        let mut fake = FakeJudge::new();
+        fake.script(
+            "k",
+            vec![
+                FakeStep::Fail("boom-1".to_string()),
+                FakeStep::Fail("boom-2".to_string()),
+                FakeStep::Answer(answer.clone()),
+            ],
+        );
+        let effect = judge_effect("k");
+        assert!(fake.answer(&effect).is_err());
+        assert!(fake.answer(&effect).is_err());
+        let out = fake.answer(&effect).expect("third succeeds");
+        assert_eq!(out.record, answer);
+        assert_eq!(fake.calls, 3);
+    }
+
+    #[test]
+    fn test_fake_judge_hang_is_timeout_shape() {
+        let mut fake = FakeJudge::new();
+        fake.script("h", vec![FakeStep::Hang]);
+        let err = fake.answer(&judge_effect("h")).unwrap_err();
+        assert!(err.to_string().contains("hang"), "{err}");
+    }
+
+    #[test]
+    fn test_fake_judge_storm_is_ms_scale() {
+        use std::time::Instant;
+        let pack = find_pack("hazard-guardrail").unwrap();
+        let mut fake = FakeJudge::new();
+        let t0 = Instant::now();
+        for i in 0..100 {
+            let key = format!("storm-{i}");
+            let effect = JudgeEffect::request(
+                &key,
+                "hazard-guardrail",
+                &serde_json::json!({"n": i}),
+                "offline",
+                5,
+            );
+            fake.script(
+                &key,
+                vec![FakeStep::Answer(offline_answer(
+                    &key,
+                    &pack,
+                    &serde_json::json!({}),
+                ))],
+            );
+            fake.answer(&effect).expect("storm answer");
+        }
+        assert!(
+            t0.elapsed().as_secs() < 5,
+            "100 scripted answers run ms-scale"
+        );
+        assert_eq!(fake.calls, 100);
+    }
+
+    #[test]
+    fn test_fake_judge_unknown_key_escalates_loudly() {
+        let mut fake = FakeJudge::new();
+        assert!(fake.answer(&judge_effect("ghost")).is_err());
+    }
+
+    #[tokio::test]
+    async fn test_judge_wake_priority_seam_offline_bd_sd9j() {
+        // Production seam end to end on the hermetic transport:
+        // tick -> Effect::Judge -> journal -> interpret -> route.
+        use std::sync::Arc;
+        let tag = format!("seam-{}", uuid::Uuid::new_v4());
+        let db_path = std::env::temp_dir().join(format!("toron-judge-{tag}.sqlite"));
+        let pool = crate::index::schema::connect(db_path.to_str().unwrap())
+            .await
+            .expect("connect");
+        crate::index::schema::migrate(&pool).await.expect("migrate");
+        let bus = crate::bus::in_process::InProcessBus::open(
+            pool.clone(),
+            crate::bus::in_process::InProcessBusConfig::default(),
+        )
+        .await
+        .expect("bus");
+        let data_dir = std::env::temp_dir().join(format!("toron-judge-data-{tag}"));
+        let mailbox = super::super::Mailbox::new(
+            Arc::new(bus),
+            data_dir.clone(),
+            Some(crate::keys::generate()),
+        )
+        .with_index_pool(pool);
+        // Offline seed answers 0.5/0.5/0.5 regardless of inputs: gate Queue,
+        // escalated seed routes to human. Inputs still bind the journal row.
+        let scores = WakeScores {
+            urgency: 0.9,
+            actionability: 0.9,
+            interrupt: 0.9,
+        };
+        let (gate, route, outcome) = mailbox
+            .judge_wake_priority("toron", "seam-k1", scores, "offline", Some(10))
+            .await
+            .expect("seam answers");
+        assert_eq!(gate, WakeGate::Queue);
+        assert_eq!(route, JudgeRoute::EscalateHuman);
+        assert!(!outcome.replayed);
+        assert_eq!(outcome.record.effect_key, "seam-k1");
+        // Same call replays the journaled row (same state binds).
+        let (gate2, route2, outcome2) = mailbox
+            .judge_wake_priority("toron", "seam-k1", scores, "offline", Some(10))
+            .await
+            .expect("replay answers");
+        assert!(outcome2.replayed);
+        assert_eq!((gate2, route2), (gate, route));
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn test_journal_get_for_discriminates_bd_fbgi() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:")
+            .await
+            .expect("mem pool");
+        crate::index::schema::MIGRATOR
+            .run(&pool)
+            .await
+            .expect("migrate");
+        let pack = find_pack("wake-priority").unwrap();
+        let state = serde_json::json!({"urgency": 0.9});
+        let record = offline_answer("k", &pack, &state);
+        journal_insert(&pool, "toron", &record)
+            .await
+            .expect("insert");
+        // Full identity hits.
+        let hit = journal_get_for(&pool, "k", Some(pack.version), &state_hash(&state))
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(hit, record);
+        // Drift is loud, not a silent row.
+        assert!(
+            journal_get_for(&pool, "k", Some(pack.version + 1), &state_hash(&state))
+                .await
+                .is_err()
+        );
+        assert!(
+            journal_get_for(&pool, "k", Some(pack.version), "other")
+                .await
+                .is_err()
+        );
+        // Missing key is None, never an error.
+        assert!(
+            journal_get_for(&pool, "nope", Some(1), "x")
+                .await
+                .expect("get")
+                .is_none()
+        );
     }
 
     #[tokio::test]
