@@ -142,6 +142,17 @@ impl EventLog {
         Ok(row.map(|(g,)| g))
     }
 
+    /// Generation already stored for `event_id`, if any (idempotent
+    /// backfill checks).
+    pub async fn existing(&self, event_id: &str) -> anyhow::Result<Option<i64>> {
+        let row: Option<(i64,)> =
+            sqlx::query_as("SELECT generation FROM events WHERE event_id = ?1")
+                .bind(event_id)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row.map(|(g,)| g))
+    }
+
     /// Every event above `generation`, in generation order (rebuild input).
     pub async fn read_since(&self, generation: i64) -> anyhow::Result<Vec<StoredEvent>> {
         let rows: Vec<(i64, String, String, String, i64)> = sqlx::query_as(
