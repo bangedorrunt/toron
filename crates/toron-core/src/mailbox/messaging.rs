@@ -334,6 +334,11 @@ impl Mailbox {
         // missing index pool (demo mode) must not fail the send.
         // ADR-0010 D8.2: the failure is remembered — if the send still
         // enqueues, the corr records degraded (acked-unknown) post-loop.
+        // ADR-0035 Spec 1 (per-method clock, bd-r328): one host-edge clock
+        // read per send; every receipt stamped below shares it. Mid-logic
+        // `Utc::now()` reads are banned — the method is the host, the
+        // `Clock` trait is the seam (tests inject `FakeClock` at the edge).
+        let now_ms = crate::index::writer::Clock::now_us(&crate::index::writer::SystemClock) / 1000;
         let mut receipt_bookkeeping_failed = false;
         if let Some(corr) = parsed_tags.corr.clone() {
             match self.receipt_store() {
@@ -344,7 +349,7 @@ impl Mailbox {
                         wake: parsed_tags.wake,
                         due_at: None,
                         result_path: parsed_tags.result_path.clone(),
-                        updated_at: chrono::Utc::now().timestamp_millis(),
+                        updated_at: now_ms,
                     };
                     if let Err(e) = store.upsert(&receipt).await {
                         eprintln!("toron: receipts store unavailable (receipt not recorded): {e}");
@@ -553,7 +558,7 @@ impl Mailbox {
                 wake: parsed_tags.wake,
                 due_at: None,
                 result_path: parsed_tags.result_path.clone(),
-                updated_at: chrono::Utc::now().timestamp_millis(),
+                updated_at: now_ms,
             };
             if let Ok(store) = self.receipt_store()
                 && let Err(e) = store.upsert(&degraded).await

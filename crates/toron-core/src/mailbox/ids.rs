@@ -13,7 +13,8 @@ use serde::{Deserialize, Serialize};
 /// Wraps the raw string id: a hex event/rumor id on toron, a decimal
 /// string on agent-mail. `FromStr` rejects empty / whitespace-only ids so
 /// a corrupt id fails loudly instead of propagating as a silent default.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// Wire ingress (serde) routes through the same validation (bd-r328).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 pub struct MessageId(String);
 
 impl MessageId {
@@ -43,17 +44,17 @@ impl FromStr for MessageId {
     }
 }
 
-impl From<String> for MessageId {
-    fn from(s: String) -> Self {
-        // Callers constructing from already-validated ids (inbox rows,
-        // event ids) — parse for the same non-empty guarantee.
-        Self(s)
-    }
-}
-
-impl From<&str> for MessageId {
-    fn from(s: &str) -> Self {
-        Self(s.to_string())
+// Wire ingress validates like every other construction (bd-r328): a JSON
+// `"message_id": ""` fails loud instead of deserializing into a silent
+// default. (No `From<String>`/`From<&str>` by design — those spellings
+// cannot fail, so they cannot validate; parse explicitly.)
+impl<'de> Deserialize<'de> for MessageId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        s.parse().map_err(serde::de::Error::custom)
     }
 }
 
@@ -176,6 +177,19 @@ boundary_id!(
     RunId,
     "Workflow run id: one `tick` + `RunJournal` Started-to-terminal lifecycle."
 );
+boundary_id!(
+    NodePath,
+    "Distribution path inside a repo (never absolute): the unit one lane owns."
+);
+boundary_id!(
+    JobId,
+    "Job lifecycle identity (43001-43006 request stream)."
+);
+boundary_id!(ChannelId, "Shared-room identity (plane S channel name).");
+boundary_id!(
+    Pin,
+    "Public agent name: adjective+noun pin or crew-*/flywheel-* pass-through."
+);
 
 #[cfg(test)]
 mod tests {
@@ -221,10 +235,48 @@ mod tests {
     #[test]
     fn round_trips_through_string() {
         let raw = "0badbeef".to_string();
-        let id = MessageId::from(raw.clone());
+        let id: MessageId = raw.parse().expect("validated construction");
         assert_eq!(id.as_ref(), raw);
         assert_eq!(id.to_string(), raw);
-        assert_eq!(id, MessageId::from(raw.as_str()));
+        assert_eq!(id, raw.parse().expect("re-parse"));
+    }
+
+    #[test]
+    fn wire_ingress_rejects_bad_ids_bd_r328() {
+        // Serde ingress routes through FromStr: empty / whitespace ids fail
+        // loud instead of deserializing into a silent default.
+        assert!(serde_json::from_str::<MessageId>("\"\"").is_err());
+        assert!(serde_json::from_str::<MessageId>("\"ab cd\"").is_err());
+        let ok: MessageId = serde_json::from_str("\"0badbeef\"").expect("valid");
+        assert_eq!(ok.as_str(), "0badbeef");
+    }
+
+    #[test]
+    fn new_boundary_ids_parse_bd_r328() {
+        let n: NodePath = "crates/toron-core/src/lib.rs".parse().expect("node path");
+        assert_eq!(n.as_str(), "crates/toron-core/src/lib.rs");
+        let j: JobId = "job-1".parse().expect("job id");
+        assert_eq!(j.into_inner(), "job-1");
+        let c: ChannelId = "steer-adr35".parse().expect("channel id");
+        assert_eq!(c.to_string(), "steer-adr35");
+        let p: Pin = "RoseCitadel".parse().expect("pin");
+        assert_eq!(p.as_str(), "RoseCitadel");
+        assert_eq!(
+            "".parse::<Pin>().unwrap_err(),
+            BoundaryIdError::Empty("Pin")
+        );
+        assert_eq!(
+            "a b".parse::<NodePath>().unwrap_err(),
+            BoundaryIdError::Whitespace("NodePath")
+        );
+        assert_eq!(
+            "".parse::<JobId>().unwrap_err(),
+            BoundaryIdError::Empty("JobId")
+        );
+        assert_eq!(
+            "".parse::<ChannelId>().unwrap_err(),
+            BoundaryIdError::Empty("ChannelId")
+        );
     }
 
     #[test]

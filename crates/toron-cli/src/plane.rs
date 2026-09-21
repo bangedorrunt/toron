@@ -1055,10 +1055,7 @@ async fn job_show(mailbox: &Mailbox, args: &JobShowArgs) -> anyhow::Result<()> {
 /// signal), bounded by `wait` (G6). Fast when the peer is fast (two stable
 /// polls and out), bounded when claims storm in. Returns the latest count.
 /// Replaces fixed blind settle sleeps: the store is watched, not hoped on.
-async fn wait_claim_quiescent<F, Fut>(
-    wait: toron_core::policy::Timeout,
-    mut count: F,
-) -> usize
+async fn wait_claim_quiescent<F, Fut>(wait: toron_core::policy::Timeout, mut count: F) -> usize
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = usize>,
@@ -1428,6 +1425,26 @@ fn print_watch_event(ev: &Event) {
     );
 }
 
+/// Shared watch emit gate (bd-r328, minimize-reader-load): dedup +
+/// project + channel in one place so the snapshot pump and the live tail
+/// cannot drift apart. Returns true when the event was printed (the
+/// `--once` signal).
+fn watch_emit(seen: &mut HashSet<String>, args: &WatchArgs, ev: &Event) -> bool {
+    if !seen.insert(ev.id.to_hex()) {
+        return false;
+    }
+    if !in_project(ev, &args.project) {
+        return false;
+    }
+    if let Some(ch) = &args.channel
+        && event_channel(ev).as_deref() != Some(ch.as_str())
+    {
+        return false;
+    }
+    print_watch_event(ev);
+    true
+}
+
 async fn watch(mailbox: &Mailbox, args: &WatchArgs) -> anyhow::Result<()> {
     // ADR-0017: match the SEND side before filtering. `send_message`
     // canonicalizes its project and stamps the CANONICAL slug as the `t`
@@ -1484,21 +1501,14 @@ async fn watch(mailbox: &Mailbox, args: &WatchArgs) -> anyhow::Result<()> {
         // subscribe would miss every live post. The 100ms cadence was the
         // RSS bomb (24GB / 5h per child, bd-741i). 1s + snapshot memo is
         // enough for doorbell and cheap when the store is unchanged.
+        // ADR-0035 Spec 5 status (bd-r328): this pump IS the embedded-mode
+        // Msg source (shared-sqlite FetchInbox-equivalent) — sc32 proves
+        // cross-process `--once` over it. Deleting it needs a daemon-shared
+        // subscription first; until then the pump stays and both paths
+        // share one emit gate below.
         let events = collect_trusted(mailbox.bus().as_ref(), filter.clone()).await?;
         for ev in events {
-            if !seen.insert(ev.id.to_hex()) {
-                continue;
-            }
-            if !in_project(&ev, &args.project) {
-                continue;
-            }
-            if let Some(ch) = &args.channel
-                && event_channel(&ev).as_deref() != Some(ch.as_str())
-            {
-                continue;
-            }
-            print_watch_event(&ev);
-            if args.once {
+            if watch_emit(&mut seen, &args, &ev) && args.once {
                 return Ok(());
             }
         }
@@ -1633,18 +1643,7 @@ async fn watch_live(mailbox: &Mailbox, args: &WatchArgs) -> anyhow::Result<()> {
     let replay = collect_trusted(mailbox.bus().as_ref(), filter.clone()).await?;
     let mut seen: HashSet<String> = HashSet::new();
     for ev in replay {
-        if !seen.insert(ev.id.to_hex()) {
-            continue;
-        }
-        if !in_project(&ev, &args.project) {
-            continue;
-        }
-        if let Some(ch) = &args.channel
-            && event_channel(&ev).as_deref() != Some(ch.as_str())
-        {
-            continue;
-        }
-        print_watch_event(&ev);
+        watch_emit(&mut seen, args, &ev);
     }
     // Live tail — shares one subscription with `wait --corr` (same bus source).
     // `--idle-exit <secs>` bounds silence: no matching event for N seconds
@@ -1662,18 +1661,8 @@ async fn watch_live(mailbox: &Mailbox, args: &WatchArgs) -> anyhow::Result<()> {
                     return Ok(());
                 }
                 Ok(Some(other)) => {
-                    if let SubscriptionEvent::Event(event) = other
-                        && seen.insert(event.id.to_hex())
-                    {
-                        if !in_project(&event, &args.project) {
-                            continue;
-                        }
-                        if let Some(ch) = &args.channel
-                            && event_channel(&event).as_deref() != Some(ch.as_str())
-                        {
-                            continue;
-                        }
-                        print_watch_event(&event);
+                    if let SubscriptionEvent::Event(event) = other {
+                        watch_emit(&mut seen, args, &event);
                     }
                 }
             }
@@ -1681,18 +1670,7 @@ async fn watch_live(mailbox: &Mailbox, args: &WatchArgs) -> anyhow::Result<()> {
     }
     while let Some(ev) = sub.next().await {
         if let SubscriptionEvent::Event(event) = ev {
-            if !seen.insert(event.id.to_hex()) {
-                continue;
-            }
-            if !in_project(&event, &args.project) {
-                continue;
-            }
-            if let Some(ch) = &args.channel
-                && event_channel(&event).as_deref() != Some(ch.as_str())
-            {
-                continue;
-            }
-            print_watch_event(&event);
+            watch_emit(&mut seen, args, &event);
         }
     }
     Ok(())
@@ -2138,9 +2116,11 @@ mod presence_env_tests {
             .with_poll(Duration::from_millis(10));
         let n = std::sync::Mutex::new(0usize);
         let seen = wait_claim_quiescent(wait, || {
-            let mut guard = n.lock().unwrap();
-            *guard += 1;
-            let next = *guard;
+            let next = {
+                let mut guard = n.lock().unwrap();
+                *guard += 1;
+                *guard
+            };
             async move { next }
         })
         .await;
