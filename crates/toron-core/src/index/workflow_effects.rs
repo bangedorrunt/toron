@@ -38,12 +38,12 @@ fn bound_evidence(value: &serde_json::Value) -> String {
 }
 
 /// Microsecond clock (i64-µs, ADR G7).
+///
+/// Host-side stamp (ADR-0035 wave 1): the single `SystemTime` read lives in
+/// `index::writer::SystemClock`; this delegates so no clock is read in this
+/// file. Per-method host-clock threading lands with wave-4 storage truth.
 pub fn now_us() -> i64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_micros() as i64)
-        .unwrap_or(0)
+    crate::index::writer::Clock::now_us(&crate::index::writer::SystemClock)
 }
 
 /// Lifecycle state of one logical external effect (ADR-0032 Spec 5.2).
