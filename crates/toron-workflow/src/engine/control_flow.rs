@@ -20,10 +20,10 @@ use crate::schema::{Action, Graph, Step, StepOnError};
 
 use super::template::{RenderContext, render_action, render_action_lenient, render_text};
 use super::{
-    ActionInvocation, ActionPartition, ActionRunner, ApprovalSink, AsyncEffectRunner,
-    AsyncRunJournal, Decision, EffectJournalMode, EffectRunner, ExecutionPolicy, FailureKind,
-    ProfileResolver, RunContext, RunInput, RunJournal, RunPhase, RunTransition, SpawnSink,
-    WorkflowEngine, WorkflowResolver, partition,
+    ActionInvocation, ActionPartition, ApprovalSink, AsyncEffectRunner, AsyncRunJournal, Decision,
+    EffectJournalMode, EffectRunner, ExecutionPolicy, FailureKind, ProfileResolver, RunContext,
+    RunInput, RunJournal, RunPhase, RunTransition, SpawnSink, WorkflowEngine, WorkflowResolver,
+    invoke_compat, partition,
 };
 
 use sha2::{Digest, Sha256};
@@ -289,7 +289,6 @@ pub async fn run_workflow(
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_steps(
     ctx: &Context,
-    runner: &ActionRunner,
     trigger: &serde_json::Value,
     steps: &[Step],
     step_outputs: &mut serde_json::Map<String, serde_json::Value>,
@@ -300,7 +299,6 @@ pub(crate) async fn run_steps(
     for step in steps {
         let value = run_step(
             ctx,
-            runner,
             trigger,
             step,
             step_outputs,
@@ -540,11 +538,12 @@ pub const EFFECT_JOURNAL_SINK_UNCOVERED: &str = "bypassed-sink-uncovered";
 /// ONE function owns the whole contract, because a half-applied contract is
 /// exactly how a bypass gets re-introduced:
 ///
-/// - a pure / engine-control / unsupported leaf keeps the legacy
-///   [`ActionRunner`] compat path (the boundary rejects a real misdispatch on
-///   its own);
+/// - a pure / engine-control / unsupported leaf computes in the boundary
+///   with no runner at all (bd-ctj7: the sync compat path is deleted — there
+///   is no runner to misdispatch through, the boundary rejects on its own);
 /// - an effectful HostSink leaf (mailbox · job · verify) goes through the
-///   context-bearing [`EffectRunner`] when one is injected;
+///   context-bearing async runner when one is injected, else the sync
+///   [`EffectRunner`];
 /// - `verify` is a HostSink too, so its embedding-owned `VerifySink` executes
 ///   FIRST and its result rides [`RunContext::provider_result`]: the sink stays
 ///   the executor (ADR-0024 Spec 2), the journal settles AROUND an effect that
@@ -559,11 +558,10 @@ pub const EFFECT_JOURNAL_SINK_UNCOVERED: &str = "bypassed-sink-uncovered";
 /// async boundary in the leaf path (bd-ckkf, ADR-0035 Spec 2.2).
 async fn dispatch_leaf_or_compat(
     ctx: &Context,
-    runner: &ActionRunner,
     invocation: &ActionInvocation,
 ) -> serde_json::Value {
     let ActionPartition::HostSink { sink } = partition(&invocation.action) else {
-        return compat_leaf(runner, &invocation.action);
+        return invoke_compat(&invocation.action, |_| None);
     };
     // bd-ckkf: the async seam wins for HostSink leaves — awaited inline,
     // never thread-hop bridged. Absent = the legacy sync surface below.
@@ -574,7 +572,7 @@ async fn dispatch_leaf_or_compat(
     }
     let stored: Arc<Option<EffectRunner>> = ctx.get_dependency::<Option<EffectRunner>>();
     let Some(fx) = (*stored).clone() else {
-        return without_journal_seam(ctx, runner, invocation, sink);
+        return without_journal_seam(ctx, invocation, sink);
     }; // Only `verify` needs a second, carrier-bearing invocation (the clone is
     // avoided on the common path: an effectful leaf dispatches on every run).
     let outcome = match &invocation.action {
@@ -620,17 +618,16 @@ async fn dispatch_leaf_async(
     }
 }
 
-/// An effectful HostSink leaf with NO injected [`EffectRunner`].
+/// An effectful HostSink leaf with NO injected runner.
 ///
-/// `Enforced` REFUSES it — before the leaf's provider runs, because the
-/// provider performs the very external effect the journal exists to cover.
-/// `Recording` runs the leaf's own provider (the compat runner, or the
-/// engine-owned `verify` sink) and tags the value with
-/// [`EFFECT_JOURNAL_BYPASSED`] plus a loud reason: there is no journal row, and
-/// a run has to be able to see that rather than read a silent success.
+/// `Enforced` REFUSES it — before any provider runs, because the provider
+/// performs the very external effect the journal exists to cover.
+/// `Recording` records the refusal visibly (bd-ctj7: Recording never
+/// performs — the old compat-runner execution is deleted): the leaf's value
+/// carries [`EFFECT_JOURNAL_BYPASSED`], so a dry arm reads as unperformed,
+/// never as success.
 fn without_journal_seam(
     ctx: &Context,
-    runner: &ActionRunner,
     invocation: &ActionInvocation,
     sink: &'static str,
 ) -> serde_json::Value {
@@ -660,14 +657,15 @@ fn without_journal_seam(
         invocation.action.type_name()
     );
     let mut value = match &invocation.action {
-        // `Recording` records instead of performs, so the leaf's value must be
-        // byte-identical to the sink-direct path a dry run has always had.
+        // `Recording` records instead of performs (bd-ctj7): the verify
+        // sink still projects (it already executed), every other HostSink
+        // leaf reports its missing sink — nothing performs here, ever.
         Action::Verify { command } => {
             let sink: Arc<crate::engine::VerifySink> =
                 ctx.get_dependency::<crate::engine::VerifySink>();
             sink.project(command)
         }
-        _ => compat_leaf(runner, &invocation.action),
+        _ => invoke_compat(&invocation.action, |_| None),
     };
     if let Some(obj) = value.as_object_mut() {
         obj.insert(
@@ -678,24 +676,8 @@ fn without_journal_seam(
     value
 }
 
-/// The compat projection of one leaf: `Ok(value)` verbatim, `Err(e)` in the
-/// engine's `{ok:false, error}` shape (a bare error string would be a second
-/// failure spelling, ADR-0032 Spec 9).
-fn compat_leaf(runner: &ActionRunner, action: &Action) -> serde_json::Value {
-    match (runner)(action) {
-        Ok(value) => value,
-        Err(e) => serde_json::json!({ "ok": false, "error": e.to_string() }),
-    }
-}
-
-/// Boxed because control-flow actions recurse (`run_step` → `run_retry` →
-/// `run_step`, …) — async recursion requires a heap-allocated future.
-// Threaded dispatch context (run identity for leaf invocations) exceeds the
-// default arity cap; see run_retry.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_step<'a>(
     ctx: &'a Context,
-    runner: &'a ActionRunner,
     trigger: &'a serde_json::Value,
     step: &'a Step,
     step_outputs: &'a mut serde_json::Map<String, serde_json::Value>,
@@ -711,7 +693,6 @@ pub(crate) fn run_step<'a>(
 > {
     run_step_with_enclosing(
         ctx,
-        runner,
         trigger,
         step,
         step_outputs,
@@ -727,7 +708,6 @@ pub(crate) fn run_step<'a>(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_step_with_enclosing<'a>(
     ctx: &'a Context,
-    runner: &'a ActionRunner,
     trigger: &'a serde_json::Value,
     step: &'a Step,
     step_outputs: &'a mut serde_json::Map<String, serde_json::Value>,
@@ -871,7 +851,7 @@ pub(crate) fn run_step_with_enclosing<'a>(
                                 attempt,
                                 enclosing_retry.map(|(m, _)| m).unwrap_or(1),
                             );
-                            dispatch_leaf_or_compat(ctx, runner, &invocation).await
+                            dispatch_leaf_or_compat(ctx, &invocation).await
                         }
                         Err(e) => {
                             serde_json::json!({ "ok": false, "error": format!("render: {e}") })
@@ -885,7 +865,6 @@ pub(crate) fn run_step_with_enclosing<'a>(
                 } => {
                     run_retry(
                         ctx,
-                        runner,
                         trigger,
                         inner,
                         *max_attempts,
@@ -904,7 +883,6 @@ pub(crate) fn run_step_with_enclosing<'a>(
                 } => {
                     run_branch(
                         ctx,
-                        runner,
                         trigger,
                         if_guard,
                         then,
@@ -920,7 +898,6 @@ pub(crate) fn run_step_with_enclosing<'a>(
                 Action::Foreach { over, each } => {
                     run_foreach(
                         ctx,
-                        runner,
                         trigger,
                         over,
                         each,
@@ -935,7 +912,6 @@ pub(crate) fn run_step_with_enclosing<'a>(
                 Action::Parallel { over, each } => {
                     run_parallel(
                         ctx,
-                        runner,
                         trigger,
                         over,
                         each,
@@ -947,24 +923,12 @@ pub(crate) fn run_step_with_enclosing<'a>(
                     .await?
                 }
                 Action::Reduce { .. } => {
-                    run_reduce(
-                        ctx,
-                        runner,
-                        trigger,
-                        &step.action,
-                        step_outputs,
-                        workflow,
-                        node,
-                    )
-                    .await?
+                    run_reduce(ctx, trigger, &step.action, step_outputs, workflow, node).await?
                 }
                 Action::CallWorkflow {
                     workflow: child,
                     inputs,
-                } => {
-                    run_call_workflow(ctx, runner, workflow, child, inputs, step_outputs, trigger)
-                        .await?
-                }
+                } => run_call_workflow(ctx, workflow, child, inputs, step_outputs, trigger).await?,
                 Action::Spawn {
                     profile,
                     workflow,
@@ -1060,7 +1024,6 @@ pub(crate) fn run_step_with_enclosing<'a>(
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_retry(
     ctx: &Context,
-    runner: &ActionRunner,
     trigger: &serde_json::Value,
     inner: &Step,
     max_attempts: u32,
@@ -1082,7 +1045,6 @@ pub(crate) async fn run_retry(
         let mut outputs = step_outputs.clone();
         let value = run_step_with_enclosing(
             ctx,
-            runner,
             trigger,
             target,
             &mut outputs,
@@ -1228,7 +1190,6 @@ pub(crate) fn skipped_value(node: &str, reason: String) -> serde_json::Value {
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_branch(
     ctx: &Context,
-    runner: &ActionRunner,
     trigger: &serde_json::Value,
     guard: &str,
     then: &[Step],
@@ -1253,7 +1214,6 @@ pub(crate) async fn run_branch(
     let mut outputs = step_outputs.clone();
     if let Some(failed) = run_steps(
         ctx,
-        runner,
         trigger,
         branch_steps,
         &mut outputs,
@@ -1281,7 +1241,6 @@ pub(crate) async fn run_branch(
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_foreach(
     ctx: &Context,
-    runner: &ActionRunner,
     trigger: &serde_json::Value,
     over: &str,
     each: &Step,
@@ -1318,7 +1277,6 @@ pub(crate) async fn run_foreach(
         let mut item_outputs = step_outputs.clone();
         let value = run_step(
             ctx,
-            runner,
             &iter_trigger,
             each,
             &mut item_outputs,
@@ -1347,7 +1305,6 @@ pub(crate) const MAX_PARALLEL_FANOUT: usize = 32;
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_parallel(
     ctx: &Context,
-    _runner: &ActionRunner,
     trigger: &serde_json::Value,
     over: &str,
     each: &Step,
@@ -1421,11 +1378,9 @@ pub async fn run_parallel_copy(
     ctx: &Context,
     input: ParallelCopyInput,
 ) -> resonate_sdk::Result<serde_json::Value> {
-    let runner = ctx.get_dependency::<ActionRunner>();
     let mut outputs = serde_json::Map::new();
     let value = run_step(
         ctx,
-        &runner,
         &input.trigger,
         &input.step,
         &mut outputs,
@@ -1449,7 +1404,6 @@ pub(crate) const MAX_JOIN_LEN: usize = 65536;
 /// authored order into a single scalar (bd-3pti). Pure in-engine work.
 pub(crate) async fn run_reduce(
     _ctx: &Context,
-    _runner: &ActionRunner,
     trigger: &serde_json::Value,
     action: &Action,
     step_outputs: &serde_json::Map<String, serde_json::Value>,
@@ -1797,7 +1751,6 @@ fn validate_workflow_lineage(
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_call_workflow(
     ctx: &Context,
-    _runner: &ActionRunner,
     parent_workflow: &str,
     child_name: &str,
     inputs: &serde_json::Value,
@@ -2360,7 +2313,7 @@ const fn default_attempt() -> u32 {
 
 /// A durable child executing ONE graph node's action. Spawned concurrently by
 /// the DAG scheduler via `ctx.run(...).spawn()`. Runs through the shared
-/// `ActionRunner` (the Mailbox surface — the consistency rule). Failures are
+/// async effect seam (the Mailbox surface — the consistency rule). Failures are
 /// returned as `{ok:false,error}` values (the parent applies on_error).
 #[resonate_sdk::function]
 pub async fn run_graph_node(
@@ -2370,10 +2323,9 @@ pub async fn run_graph_node(
     // bd-m7ac: graph nodes must route CONTROL-FLOW actions through the same
     // expansion as linear steps. A graph `parallel` node (the weekly-review
     // scout fan-out) needs `run_parallel` to spawn its copies — dispatching
-    // the raw action to the runner would record `{action:"parallel"}` and
-    // never fan out. Leaf actions keep the direct runner path (rendered
+    // the raw action to the engine would record `{action:"parallel"}` and
+    // never fan out. Leaf actions keep the direct dispatch path (rendered
     // before the node ran, so no re-render).
-    let runner = ctx.get_dependency::<ActionRunner>();
     // ADR-0032 Spec 4: per-node `guard:` runs through the ONE evaluator.
     // False is an explicit skip; any guard error FAILS the node loudly.
     match evaluate_step_guard(
@@ -2463,7 +2415,6 @@ pub async fn run_graph_node(
         };
         return run_step(
             ctx,
-            &runner,
             &input.trigger,
             &step,
             &mut step_outputs,
@@ -2494,12 +2445,12 @@ pub async fn run_graph_node(
         input.attempt,
         1,
     );
-    Ok(dispatch_leaf_or_compat(ctx, runner.as_ref(), &invocation).await)
+    Ok(dispatch_leaf_or_compat(ctx, &invocation).await)
 }
 
 /// The `toron:workflow-emitted` stamp (ADR-0004 Ship 2 / bd-pkc part 3).
 ///
-/// The ActionRunner's embedding applies this single-`t` tag to every event a
+/// The host embedding applies this single-`t` tag to every event a
 /// workflow action emits, so the trigger-ingress filter
 /// ([`crate::trigger_filter::should_evaluate_trigger_event`]) rejects
 /// workflow-emitted events by tag — loop-prevention defense-in-depth

@@ -311,6 +311,165 @@ mod pure_cores_tests {
                 "receipts_core.rs contains clock read `{needle}`"
             );
         }
+        // bd-zh38: harden to QUALIFIED paths — the use-line fence above is
+        // blind to `tokio::spawn` written inline. The shipped body must not
+        // name a runtime, clock, env, fs, net, process, or thread path.
+        for path in [
+            "tokio::",
+            "nostr::",
+            "sqlx::",
+            "chrono::",
+            "parking_lot::",
+            "axum::",
+            "rmcp::",
+            "flywheel::",
+            "doorbell::",
+            "herdr::",
+            "std::time::",
+            "std::env::",
+            "std::fs::",
+            "std::net::",
+            "std::process::",
+            "std::thread::",
+            "std::sync::Mutex",
+            "std::sync::RwLock",
+        ] {
+            assert!(
+                !shipped.contains(path),
+                "receipts_core.rs names runtime path `{path}` outside imports"
+            );
+        }
+    }
+
+    /// bd-zh38 RED: BFS over the reachable state space — every reachable
+    /// row obeys the monotonic invariants, no path escapes them.
+    #[test]
+    fn bfs_reachable_states_obey_monotonic_invariants() {
+        use std::collections::{HashSet, VecDeque};
+        // Alphabet: one message per shape, two corrs, two timestamps.
+        fn alphabet(corr: &str) -> Vec<ReceiptsMsg> {
+            vec![
+                ReceiptsMsg::Ack {
+                    corr: corr.into(),
+                    now_ms: 7,
+                },
+                ReceiptsMsg::SetResulted {
+                    corr: corr.into(),
+                    result_path: Some("/r.json".into()),
+                    now_ms: 8,
+                },
+                ReceiptsMsg::Prune {
+                    now_ms: 100,
+                    retention_ms: 50,
+                },
+            ]
+        }
+        let seeds = vec![
+            ReceiptsModel::new(),
+            ReceiptsModel::with_row("s", State::Owed, None, 1),
+            ReceiptsModel::with_row("s", State::Degraded, None, 1),
+            ReceiptsModel::with_row("s", State::Resulted, Some("/p.json".into()), 1),
+        ];
+        let mut visited: HashSet<String> = HashSet::new();
+        let mut queue: VecDeque<(ReceiptsModel, usize)> = VecDeque::new();
+        for seed in seeds {
+            for _ in 0..3 {
+                queue.push_back((seed.clone(), 0));
+            }
+        }
+        let mut transitions = 0usize;
+        while let Some((model, depth)) = queue.pop_front() {
+            // Canonical encoding bounds the BFS (timestamps normalized: the
+            // core only compares them, so shape + state space is finite).
+            let key = format!("{:?}", model.entries);
+            if !visited.insert(key) {
+                continue;
+            }
+            for msg in alphabet("s").into_iter().chain(alphabet("t")) {
+                let (next, _) = tick(&model, &msg);
+                for (corr, entry) in &next.entries {
+                    // Invariants on EVERY reachable row, not just named cases.
+                    if entry.state == State::Owed {
+                        // Nothing ever transitions INTO owed: any row that is
+                        // owed now was owed before (no re-owe path exists).
+                        let before = model.entries.get(corr).map(|e| e.state);
+                        assert!(
+                            before.is_none() || before == Some(State::Owed),
+                            "row {corr} reached Owed from {before:?} — re-owe path"
+                        );
+                    }
+                }
+                transitions += 1;
+                if depth < 4 {
+                    queue.push_back((next, depth + 1));
+                }
+            }
+        }
+        assert!(transitions > 50, "BFS explored: {transitions} transitions");
+        assert!(!visited.is_empty());
+    }
+
+    /// bd-zh38: DFS over the same space, asserting the same invariants
+    /// plus determinism — replaying one path twice yields byte-identical
+    /// effects, so the journal can trust a Msg log as its identity.
+    #[test]
+    fn dfs_paths_obey_invariants_and_replay_deterministically() {
+        fn alphabet(corr: &str) -> Vec<ReceiptsMsg> {
+            vec![
+                ReceiptsMsg::Ack {
+                    corr: corr.into(),
+                    now_ms: 7,
+                },
+                ReceiptsMsg::SetResulted {
+                    corr: corr.into(),
+                    result_path: Some("/r.json".into()),
+                    now_ms: 8,
+                },
+            ]
+        }
+        // One deep path per seed, replayed twice.
+        let seeds = vec![
+            ReceiptsModel::new(),
+            ReceiptsModel::with_row("s", State::Owed, None, 1),
+            ReceiptsModel::with_row("s", State::Degraded, None, 1),
+        ];
+        for seed in &seeds {
+            let path: Vec<ReceiptsMsg> = alphabet("s")
+                .into_iter()
+                .chain(alphabet("t"))
+                .chain(alphabet("s"))
+                .collect();
+            let run_once = {
+                let mut model = seed.clone();
+                let mut all_fx = Vec::new();
+                for msg in &path {
+                    let (next, fx) = tick(&model, msg);
+                    model = next;
+                    all_fx.push(fx);
+                }
+                (model, all_fx)
+            };
+            let run_twice = {
+                let mut model = seed.clone();
+                let mut all_fx = Vec::new();
+                for msg in &path {
+                    let (next, fx) = tick(&model, msg);
+                    model = next;
+                    all_fx.push(fx);
+                }
+                (model, all_fx)
+            };
+            assert_eq!(run_once, run_twice, "replay is deterministic");
+            // Terminal invariant on the deep state: the path acked every
+            // seeded row, so no Owed may remain (nothing re-owes).
+            for entry in run_once.0.entries.values() {
+                assert_ne!(
+                    entry.state,
+                    State::Owed,
+                    "deep path acked all rows — Owed must not remain"
+                );
+            }
+        }
     }
 
     fn scripted_log() -> Vec<ReceiptsMsg> {

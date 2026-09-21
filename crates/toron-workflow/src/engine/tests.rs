@@ -41,8 +41,29 @@ steps:
     .expect("parse")
 }
 
-fn noop_runner() -> ActionRunner {
-    Arc::new(|_a: &Action| Ok(serde_json::Value::Null))
+/// Lift a PURE leaf-value fn into the async seam (tests only): the
+/// closures here compute values with no I/O and no blocking, so the async
+/// wrapper adds no bridge — it only satisfies the engine's async contract.
+/// Any closure performing I/O belongs in a fenced host runner, never here.
+fn lift_async(
+    f: impl Fn(&Action) -> anyhow::Result<serde_json::Value> + Send + Sync + 'static,
+) -> AsyncEffectRunner {
+    Arc::new(move |inv: &ActionInvocation| {
+        let value = f(&inv.action);
+        Box::pin(async move { value })
+            as std::pin::Pin<
+                Box<dyn std::future::Future<Output = anyhow::Result<serde_json::Value>> + Send>,
+            >
+    })
+}
+
+fn noop_async() -> AsyncEffectRunner {
+    Arc::new(|_: &ActionInvocation| {
+        Box::pin(async move { Ok(serde_json::Value::Null) })
+            as std::pin::Pin<
+                Box<dyn std::future::Future<Output = anyhow::Result<serde_json::Value>> + Send>,
+            >
+    })
 }
 
 /// Boot a real `resonate serve` + a remote engine (the 0.6 SDK's
@@ -50,7 +71,7 @@ fn noop_runner() -> ActionRunner {
 /// drive the background promise-creation task). Returns (server, engine);
 /// the caller keeps the server alive for the test's duration.
 async fn remote_engine(
-    action_runner: ActionRunner,
+    async_fx: Option<AsyncEffectRunner>,
 ) -> Option<(std::process::Child, WorkflowEngine)> {
     use std::process::{Command, Stdio};
     let dir = std::env::temp_dir().join(format!("wf-rsrv-{}", uuid::Uuid::new_v4()));
@@ -89,7 +110,8 @@ async fn remote_engine(
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    let engine = WorkflowEngine::remote(&url, action_runner).expect("remote engine");
+    let engine = WorkflowEngine::remote_with_async_effect_runner(&url, async_fx)
+        .expect("remote engine");
     Some((server, engine))
 }
 
@@ -135,7 +157,7 @@ async fn remote_engine_with(
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     let engine =
-        WorkflowEngine::remote_with(&url, noop_runner(), profile_resolver).expect("remote engine");
+        WorkflowEngine::remote_with(&url, profile_resolver).expect("remote engine");
     Some((server, engine))
 }
 
@@ -159,7 +181,7 @@ async fn approval_suspends_and_resumes() {
     // cannot drive the background promise-creation task while the run
     // blocks on the promise id (a local-runtime limitation; sc11 covers
     // the same contract end-to-end).
-    let Some((_srv, engine)) = remote_engine(noop_runner()).await else {
+    let Some((_srv, engine)) = remote_engine(Some(noop_async())).await else {
         eprintln!("SKIP: no `resonate` binary (needs herdr/resonate stack; runs on dev machines");
         return;
     };
@@ -249,7 +271,7 @@ steps:
 /// rejection recorded (not failed — the rejection is a decision).
 #[tokio::test(flavor = "multi_thread")]
 async fn approval_rejection_is_a_decision_not_a_failure() {
-    let Some((_srv, engine)) = remote_engine(noop_runner()).await else {
+    let Some((_srv, engine)) = remote_engine(Some(noop_async())).await else {
         eprintln!("SKIP: no `resonate` binary (needs herdr/resonate stack; runs on dev machines");
         return;
     };
@@ -410,8 +432,8 @@ steps:
 /// Durable delay: a `delay` action runs and the run completes.
 #[tokio::test]
 async fn durable_delay_completes() {
-    let runner = noop_runner();
-    let engine = WorkflowEngine::local(runner.clone()).expect("engine");
+    let runner = noop_async();
+    let engine = WorkflowEngine::local_with_async_effect_runner(Some(runner.clone())).expect("engine");
     let input = RunInput {
         run_id: None,
         workflow: delay_workflow(),
@@ -426,13 +448,17 @@ async fn durable_delay_completes() {
 
 /// A runner that errors on `send_message` actions (the "upgrade" step
 /// below), succeeds on everything else.
-fn error_on_send_runner() -> ActionRunner {
-    Arc::new(|a: &Action| {
-        if matches!(a, Action::SendMessage { .. }) {
+fn error_on_send_async() -> AsyncEffectRunner {
+    Arc::new(|inv: &ActionInvocation| {
+        let outcome = if matches!(inv.action, Action::SendMessage { .. }) {
             Err(anyhow::anyhow!("boom"))
         } else {
             Ok(serde_json::Value::Null)
-        }
+        };
+        Box::pin(async move { outcome })
+            as std::pin::Pin<
+                Box<dyn std::future::Future<Output = anyhow::Result<serde_json::Value>> + Send>,
+            >
     })
 }
 
@@ -482,7 +508,7 @@ steps:
 /// (a durable deterministic return, NOT a panic/abort).
 #[tokio::test]
 async fn on_error_fail_run_fails_the_run_durably() {
-    let engine = WorkflowEngine::local(error_on_send_runner()).expect("engine");
+    let engine = WorkflowEngine::local_with_async_effect_runner(Some(error_on_send_async())).expect("engine");
     let input = RunInput {
         run_id: None,
         workflow: fail_run_workflow(),
@@ -508,7 +534,7 @@ async fn on_error_fail_run_fails_the_run_durably() {
 /// step → run completes; step output `{ok:false}`; later steps still run.
 #[tokio::test]
 async fn on_error_default_continue_completes_the_run() {
-    let engine = WorkflowEngine::local(error_on_send_runner()).expect("engine");
+    let engine = WorkflowEngine::local_with_async_effect_runner(Some(error_on_send_async())).expect("engine");
     let input = RunInput {
         run_id: None,
         workflow: continue_workflow(),
@@ -607,7 +633,7 @@ fn workflow_emitted_stamp_is_idempotent() {
 async fn fail_run_emits_46012_status_failed() {
     use nostr_sdk::prelude::Keys;
 
-    let engine = WorkflowEngine::local(error_on_send_runner()).expect("engine");
+    let engine = WorkflowEngine::local_with_async_effect_runner(Some(error_on_send_async())).expect("engine");
     let input = RunInput {
         run_id: None,
         workflow: fail_run_workflow(),
@@ -641,11 +667,11 @@ async fn template_substitution_trigger_in_body() {
     use std::sync::Mutex as StdMutex;
     let seen: Arc<StdMutex<Vec<Action>>> = Arc::new(StdMutex::new(Vec::new()));
     let seen_clone = seen.clone();
-    let runner: ActionRunner = Arc::new(move |a: &Action| {
+    let runner = lift_async(move |a: &Action| {
         seen_clone.lock().unwrap().push(a.clone());
         Ok(serde_json::Value::Null)
     });
-    let engine = WorkflowEngine::local(runner.clone()).expect("engine");
+    let engine = WorkflowEngine::local_with_async_effect_runner(Some(runner.clone())).expect("engine");
     let wf = parse_workflow(
         r##"
 name: trigger-template
@@ -720,14 +746,14 @@ async fn graph_dag_runs_and_collects_outputs() {
     use std::sync::Mutex as StdMutex;
     let seen: Arc<StdMutex<Vec<Action>>> = Arc::new(StdMutex::new(Vec::new()));
     let seen_clone = seen.clone();
-    let runner: ActionRunner = Arc::new(move |a: &Action| {
+    let runner = lift_async(move |a: &Action| {
         seen_clone.lock().unwrap().push(a.clone());
         match a {
             Action::SendDm { .. } => Ok(serde_json::json!({ "n": 42 })),
             _ => Ok(serde_json::Value::Null),
         }
     });
-    let engine = WorkflowEngine::local(runner.clone()).expect("engine");
+    let engine = WorkflowEngine::local_with_async_effect_runner(Some(runner.clone())).expect("engine");
     let wf = parse_workflow(
         r##"
 name: graph-ship
@@ -784,14 +810,14 @@ async fn graph_parallel_node_expands_copies() {
     use std::sync::Mutex as StdMutex;
     let seen: Arc<StdMutex<Vec<Action>>> = Arc::new(StdMutex::new(Vec::new()));
     let seen_clone = seen.clone();
-    let runner: ActionRunner = Arc::new(move |a: &Action| {
+    let runner = lift_async(move |a: &Action| {
         seen_clone.lock().unwrap().push(a.clone());
         match a {
             Action::DispatchJob { .. } => Ok(serde_json::json!({ "scouted": true })),
             _ => Ok(serde_json::Value::Null),
         }
     });
-    let engine = WorkflowEngine::local(runner.clone()).expect("engine");
+    let engine = WorkflowEngine::local_with_async_effect_runner(Some(runner.clone())).expect("engine");
     let wf = parse_workflow(
         r##"
 name: graph-fanout
@@ -850,12 +876,13 @@ graph:
         task.contains("\"scouted\":true"),
         "oracle saw the fan-out: {task}"
     );
-    // bd-engine-run-path-journaling-fwlx: these copies were dispatched with no
-    // EffectRunner, so the bypass marker rides their values and therefore the
-    // downstream render — the journal gap is visible, never silent.
+    // bd-ctj7: with an async runner covering the sink there is no bypass —
+    // values stay clean AND the fan-out still reaches the oracle. The
+    // runner-less marker case is pinned by
+    // effectful_leaf_without_effect_runner_is_marked_not_silent.
     assert!(
-        task.contains("effect_journal"),
-        "the journal bypass is visible downstream, not silent: {task}"
+        !task.contains("effect_journal"),
+        "a covered path carries no bypass marker: {task}"
     );
     // The runner saw 3 scout copies + 1 oracle dispatch, never a raw
     // parallel action.
@@ -884,7 +911,7 @@ async fn retry_backoff_retries_until_success() {
     let attempts_clone = attempts.clone();
     let seen: Arc<StdMutex<Vec<Action>>> = Arc::new(StdMutex::new(Vec::new()));
     let seen_clone = seen.clone();
-    let runner: ActionRunner = Arc::new(move |a: &Action| {
+    let runner = lift_async(move |a: &Action| {
         seen_clone.lock().unwrap().push(a.clone());
         let n = attempts_clone.fetch_add(1, Ordering::SeqCst);
         if n < 2 {
@@ -893,7 +920,7 @@ async fn retry_backoff_retries_until_success() {
             Ok(serde_json::json!({ "ok": true, "attempt": n + 1 }))
         }
     });
-    let engine = WorkflowEngine::local(runner.clone()).expect("engine");
+    let engine = WorkflowEngine::local_with_async_effect_runner(Some(runner.clone())).expect("engine");
     let wf = parse_workflow(
         r##"
 name: retry-wf
@@ -930,8 +957,8 @@ steps:
 /// P5.3: `retry` exhausts → `{ok:false}` (outer on_error decides).
 #[tokio::test]
 async fn retry_exhausts_reports_failure() {
-    let runner: ActionRunner = Arc::new(|_a: &Action| Err(anyhow::anyhow!("always fails")));
-    let engine = WorkflowEngine::local(runner.clone()).expect("engine");
+    let runner = lift_async(|_a: &Action| Err(anyhow::anyhow!("always fails")));
+    let engine = WorkflowEngine::local_with_async_effect_runner(Some(runner.clone())).expect("engine");
     let wf = parse_workflow(
         r##"
 name: retry-fail
@@ -969,11 +996,11 @@ async fn branch_then_else_on_guard() {
     use std::sync::Mutex as StdMutex;
     let seen: Arc<StdMutex<Vec<Action>>> = Arc::new(StdMutex::new(Vec::new()));
     let seen_clone = seen.clone();
-    let runner: ActionRunner = Arc::new(move |a: &Action| {
+    let runner = lift_async(move |a: &Action| {
         seen_clone.lock().unwrap().push(a.clone());
         Ok(serde_json::Value::Null)
     });
-    let engine = WorkflowEngine::local(runner.clone()).expect("engine");
+    let engine = WorkflowEngine::local_with_async_effect_runner(Some(runner.clone())).expect("engine");
     let wf = parse_workflow(
         r##"
 name: branch-wf
@@ -992,7 +1019,7 @@ steps:
     .expect("parse branch workflow");
 
     // Guard true → then branch.
-    let engine2 = WorkflowEngine::local(runner.clone()).expect("engine2");
+    let engine2 = WorkflowEngine::local_with_async_effect_runner(Some(runner.clone())).expect("engine2");
     let _ = engine2
         .run(
             "wf-branch-true",
@@ -1038,11 +1065,11 @@ async fn foreach_over_list_collects() {
     use std::sync::Mutex as StdMutex;
     let seen: Arc<StdMutex<Vec<Action>>> = Arc::new(StdMutex::new(Vec::new()));
     let seen_clone = seen.clone();
-    let runner: ActionRunner = Arc::new(move |a: &Action| {
+    let runner = lift_async(move |a: &Action| {
         seen_clone.lock().unwrap().push(a.clone());
         Ok(serde_json::json!({ "ran": true }))
     });
-    let engine = WorkflowEngine::local(runner.clone()).expect("engine");
+    let engine = WorkflowEngine::local_with_async_effect_runner(Some(runner.clone())).expect("engine");
     let wf = parse_workflow(
         r##"
 name: foreach-wf
@@ -1092,11 +1119,11 @@ async fn parallel_elastic_spawns_n() {
     use std::sync::Mutex as StdMutex;
     let seen: Arc<StdMutex<Vec<Action>>> = Arc::new(StdMutex::new(Vec::new()));
     let seen_clone = seen.clone();
-    let runner: ActionRunner = Arc::new(move |a: &Action| {
+    let runner = lift_async(move |a: &Action| {
         seen_clone.lock().unwrap().push(a.clone());
         Ok(serde_json::json!({ "worker": true }))
     });
-    let engine = WorkflowEngine::local(runner.clone()).expect("engine");
+    let engine = WorkflowEngine::local_with_async_effect_runner(Some(runner.clone())).expect("engine");
     let wf = parse_workflow(
         r##"
 name: parallel-wf
@@ -1135,7 +1162,7 @@ async fn call_workflow_nested_subrun_returns_child_output() {
     use std::sync::Mutex as StdMutex;
     let seen: Arc<StdMutex<Vec<Action>>> = Arc::new(StdMutex::new(Vec::new()));
     let seen_c = seen.clone();
-    let runner: ActionRunner = Arc::new(move |a: &Action| {
+    let afx = lift_async(move |a: &Action| {
         seen_c.lock().unwrap().push(a.clone());
         Ok(serde_json::json!({ "ran": true }))
     });
@@ -1162,7 +1189,12 @@ steps:
             }
         })
     };
-    let engine = WorkflowEngine::local_with_resolvers(runner, Arc::new(|_: &str| None), resolver)
+    let engine =
+        WorkflowEngine::local_with_resolvers_and_async_effect(
+            Arc::new(|_: &str| None),
+            resolver,
+            Some(afx),
+        )
         .expect("engine");
     let wf = parse_workflow(
         r##"
@@ -1247,7 +1279,6 @@ fn workflow_lineage_guard_is_bounded_and_cycle_safe() {
 #[tokio::test]
 async fn call_workflow_refuses_cycle_and_exhausted_budget() {
     let engine = WorkflowEngine::local_with_resolvers(
-        noop_runner(),
         Arc::new(|_: &str| None),
         Arc::new(|name: &str| {
             (name == "caller" || name == "inner").then(|| {
@@ -1346,7 +1377,7 @@ steps:
 /// Unknown workflow name → honest {ok:false}, not a hang.
 #[tokio::test]
 async fn call_workflow_unknown_reports_error() {
-    let engine = WorkflowEngine::local(noop_runner()).expect("engine");
+    let engine = WorkflowEngine::local().expect("engine");
     let wf = parse_workflow(
         r##"
 name: caller
@@ -1391,11 +1422,11 @@ async fn invoke_runs_workflow_with_synthesized_inputs_trigger() {
     use std::sync::Mutex as StdMutex;
     let seen: Arc<StdMutex<Vec<Action>>> = Arc::new(StdMutex::new(Vec::new()));
     let seen_clone = seen.clone();
-    let runner: ActionRunner = Arc::new(move |a: &Action| {
+    let runner = lift_async(move |a: &Action| {
         seen_clone.lock().unwrap().push(a.clone());
         Ok(serde_json::Value::Null)
     });
-    let engine = WorkflowEngine::local(runner.clone()).expect("engine");
+    let engine = WorkflowEngine::local_with_async_effect_runner(Some(runner.clone())).expect("engine");
     let wf = parse_workflow(
         r##"
 name: invoke-me
@@ -1457,8 +1488,8 @@ fn find_marker(v: &serde_json::Value, key: &str) -> Option<String> {
 /// visible in the run ledger instead of looking journaled.
 #[tokio::test]
 async fn effectful_leaf_without_effect_runner_is_marked_not_silent() {
-    let runner: ActionRunner = Arc::new(|_a: &Action| Ok(serde_json::json!({ "ok": true })));
-    let engine = WorkflowEngine::local(runner).expect("engine");
+    // No runner at all: the leaf must hit the runner-less seam.
+    let engine = WorkflowEngine::local().expect("engine");
     let wf = parse_workflow(
         r##"
 name: journal-bypass
@@ -1490,7 +1521,6 @@ steps:
 /// bypass to mark.
 #[tokio::test]
 async fn effectful_leaf_with_effect_runner_is_not_marked() {
-    let runner: ActionRunner = Arc::new(|_a: &Action| Ok(serde_json::json!({ "ok": true })));
     let calls = Arc::new(std::sync::Mutex::new(0usize));
     let calls_clone = calls.clone();
     let fx: EffectRunner = Arc::new(move |_inv: &ActionInvocation| {
@@ -1498,7 +1528,7 @@ async fn effectful_leaf_with_effect_runner_is_not_marked() {
         Ok(serde_json::json!({ "journaled": true }))
     });
     let engine =
-        WorkflowEngine::local_with_effect_runner(runner, Some(fx)).expect("engine with runner");
+        WorkflowEngine::local_with_effect_runner(Some(fx)).expect("engine with runner");
     let wf = parse_workflow(
         r##"
 name: journal-covered
@@ -1535,7 +1565,6 @@ steps:
 /// seam. The `VerifySink` executes the command; the effect runner wraps it.
 #[tokio::test]
 async fn verify_routes_through_the_effect_runner() {
-    let runner: ActionRunner = Arc::new(|_a: &Action| Ok(serde_json::json!({ "ok": true })));
     let calls = Arc::new(std::sync::Mutex::new(0usize));
     let calls_clone = calls.clone();
     let fx: EffectRunner = Arc::new(move |inv: &ActionInvocation| {
@@ -1548,7 +1577,7 @@ async fn verify_routes_through_the_effect_runner() {
         Ok(serde_json::json!({ "ok": true, "journaled": true }))
     });
     let engine =
-        WorkflowEngine::local_with_effect_runner(runner, Some(fx)).expect("engine with runner");
+        WorkflowEngine::local_with_effect_runner(Some(fx)).expect("engine with runner");
     let wf = parse_workflow(
         r##"
 name: journal-verify
@@ -1585,8 +1614,7 @@ steps:
 /// behavior so journal-less dry arms stay legal.
 #[tokio::test]
 async fn enforced_mode_refuses_effectful_leaf_without_effect_runner() {
-    let runner: ActionRunner = Arc::new(|_a: &Action| Ok(serde_json::json!({ "ok": true })));
-    let engine = WorkflowEngine::local_with_journal_mode(runner, EffectJournalMode::Enforced)
+    let engine = WorkflowEngine::local_with_journal_mode(EffectJournalMode::Enforced)
         .expect("enforced engine");
     let wf = parse_workflow(
         r##"
@@ -1629,9 +1657,7 @@ steps:
 /// a journal-less `Enforced` engine still runs them.
 #[tokio::test]
 async fn enforced_mode_still_runs_pure_and_control_leaves() {
-    let runner: ActionRunner =
-        Arc::new(|a: &Action| Ok(serde_json::json!({ "ok": true, "ran": a.type_name() })));
-    let engine = WorkflowEngine::local_with_journal_mode(runner, EffectJournalMode::Enforced)
+    let engine = WorkflowEngine::local_with_journal_mode(EffectJournalMode::Enforced)
         .expect("enforced engine");
     let wf = parse_workflow(
         r##"
@@ -1664,8 +1690,7 @@ steps:
 /// on `Recording`, where the marker keeps it honest in the ledger.
 #[tokio::test]
 async fn enforced_mode_refuses_uncovered_verify_even_with_sink() {
-    let runner: ActionRunner = Arc::new(|_a: &Action| Ok(serde_json::json!({ "ok": true })));
-    let engine = WorkflowEngine::local_with_journal_mode(runner, EffectJournalMode::Enforced)
+    let engine = WorkflowEngine::local_with_journal_mode(EffectJournalMode::Enforced)
         .expect("enforced engine");
     let wf = parse_workflow(
         r##"
@@ -1726,8 +1751,9 @@ steps:
 /// visible in the ledger instead of reading as a clean, journaled verify.
 #[tokio::test]
 async fn recording_mode_verify_without_runner_keeps_the_marker() {
-    let runner: ActionRunner = Arc::new(|_a: &Action| Ok(serde_json::json!({ "ok": true })));
-    let engine = WorkflowEngine::local(runner).expect("recording engine");
+    // No runner at all: the Recording arm runs the sink directly (a dry run
+    // is a faithful preview) and marks the missing journal row.
+    let engine = WorkflowEngine::local().expect("recording engine");
     let wf = parse_workflow(
         r##"
 name: recording-verify
@@ -1777,8 +1803,8 @@ steps:
 /// placeholder instead of the verification command.
 #[tokio::test]
 async fn verify_command_is_rendered_before_the_sink() {
-    let runner: ActionRunner = Arc::new(|_a: &Action| Ok(serde_json::json!({ "ok": true })));
-    let engine = WorkflowEngine::local(runner).expect("recording engine");
+    let runner = lift_async(|_a: &Action| Ok(serde_json::json!({ "ok": true })));
+    let engine = WorkflowEngine::local_with_async_effect_runner(Some(runner)).expect("recording engine");
     let wf = parse_workflow(
         r##"
 name: verify-render
@@ -1830,7 +1856,6 @@ steps:
 /// Spec 2 keeps the sink the executor).
 #[tokio::test]
 async fn effect_runner_observes_the_executed_verify_result() {
-    let runner: ActionRunner = Arc::new(|_a: &Action| Ok(serde_json::json!({ "ok": true })));
     let observed: Arc<std::sync::Mutex<Option<serde_json::Value>>> =
         Arc::new(std::sync::Mutex::new(None));
     let observed_c = observed.clone();
@@ -1839,7 +1864,7 @@ async fn effect_runner_observes_the_executed_verify_result() {
         Ok(serde_json::json!({ "ok": true, "journaled": true }))
     });
     let engine =
-        WorkflowEngine::local_with_effect_runner(runner, Some(fx)).expect("engine with runner");
+        WorkflowEngine::local_with_effect_runner(Some(fx)).expect("engine with runner");
     let wf = parse_workflow(
         r##"
 name: verify-observed
@@ -1882,7 +1907,6 @@ steps:
 /// a leaf the injected runner covers.
 #[tokio::test]
 async fn enforced_mode_with_effect_runner_runs_verify_through_the_journal() {
-    let runner: ActionRunner = Arc::new(|_a: &Action| Ok(serde_json::json!({ "ok": true })));
     let calls = Arc::new(std::sync::Mutex::new(0usize));
     let calls_clone = calls.clone();
     let fx: EffectRunner = Arc::new(move |_inv: &ActionInvocation| {
@@ -1890,7 +1914,6 @@ async fn enforced_mode_with_effect_runner_runs_verify_through_the_journal() {
         Ok(serde_json::json!({ "ok": true, "journaled": true }))
     });
     let engine = WorkflowEngine::local_with_resolvers_and_effect_mode(
-        runner,
         WorkflowEngine::default_resolver(),
         WorkflowEngine::default_workflow_resolver(),
         Some(fx),
@@ -1934,7 +1957,6 @@ steps:
 /// and the effect runner handles the effectful leaf inside it.
 #[tokio::test]
 async fn resolvers_and_effect_runner_coexist_on_one_engine() {
-    let runner: ActionRunner = Arc::new(|_a: &Action| Ok(serde_json::json!({ "ok": true })));
     let resolved = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let resolved_c = resolved.clone();
     let child = parse_workflow(
@@ -1966,9 +1988,7 @@ steps:
         *calls_c.lock().unwrap() += 1;
         Ok(serde_json::json!({ "journaled": true }))
     });
-    let engine = WorkflowEngine::local_with_resolvers_and_effect(
-        runner,
-        profile_resolver,
+    let engine = WorkflowEngine::local_with_resolvers_and_effect(profile_resolver,
         workflow_resolver,
         Some(fx),
     )
@@ -2011,7 +2031,7 @@ steps:
 /// reactive trigger to auto-fire.
 #[tokio::test]
 async fn triggerless_workflow_invokes_but_has_no_trigger() {
-    let engine = WorkflowEngine::local(noop_runner()).expect("engine");
+    let engine = WorkflowEngine::local().expect("engine");
     let wf = parse_workflow(
         r##"
 name: invoke-only
@@ -2050,7 +2070,7 @@ async fn value_returning_action_flows_into_downstream_template() {
     use std::sync::Mutex as StdMutex;
     let seen: Arc<StdMutex<Vec<Action>>> = Arc::new(StdMutex::new(Vec::new()));
     let seen_clone = seen.clone();
-    let runner: ActionRunner = Arc::new(move |a: &Action| {
+    let runner = lift_async(move |a: &Action| {
         // Record what the runner received (post-substitution).
         seen_clone.lock().unwrap().push(a.clone());
         match a {
@@ -2059,7 +2079,7 @@ async fn value_returning_action_flows_into_downstream_template() {
             other => Ok(serde_json::json!({ "action": other.type_name() })),
         }
     });
-    let engine = WorkflowEngine::local(runner.clone()).expect("engine");
+    let engine = WorkflowEngine::local_with_async_effect_runner(Some(runner.clone())).expect("engine");
 
     let wf = parse_workflow(
         r##"
@@ -2092,7 +2112,7 @@ steps:
     // (a) The runner's return for step `foo` populated `steps.foo`.
     assert_eq!(
         output["foo"]["n"], 42,
-        "ActionRunner return must populate steps.foo: {output}"
+        "async effect return must populate steps.foo: {output}"
     );
 
     // (b) The downstream step's `{{steps.foo.n}}` was substituted with the
@@ -2216,11 +2236,11 @@ fn probe_candidate_hits_local_listener() {
 async fn invoke_redelivery_replays_recorded_run() {
     let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let calls_c = calls.clone();
-    let runner: ActionRunner = std::sync::Arc::new(move |_a: &Action| {
+    let runner = lift_async(move |_a: &Action| {
         calls_c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(serde_json::json!({ "ok": true }))
     });
-    let engine = WorkflowEngine::local(runner).expect("local engine");
+    let engine = WorkflowEngine::local_with_async_effect_runner(Some(runner)).expect("local engine");
     let wf = crate::parse_workflow(
         "name: t\nsteps:\n  - name: a\n    action: send_message\n    to: [x]\n    subject: s\n    body: b\n",
     )
@@ -2244,7 +2264,7 @@ async fn invoke_redelivery_replays_recorded_run() {
 /// ADR-0024 Spec 0 park fix: desugared `steps:` with `request_approval` still parks via run_graph.
 #[tokio::test(flavor = "multi_thread")]
 async fn park_desugared_request_approval_still_parks() {
-    let Some((_srv, engine)) = remote_engine(noop_runner()).await else {
+    let Some((_srv, engine)) = remote_engine(Some(noop_async())).await else {
         eprintln!("SKIP: no `resonate` binary (needs herdr/resonate stack; runs on dev machines");
         return;
     };
@@ -2291,10 +2311,12 @@ steps:
 #[tokio::test]
 async fn failure_kind_ok_false_is_failure_error_without_ok_is_not() {
     // Graph node returning {ok:false, error:"boom"} with on_error fail_run → failed.
-    let engine = WorkflowEngine::local(Arc::new(|a: &Action| match a {
-        Action::SendDm { .. } => Ok(serde_json::json!({ "ok": false, "error": "boom" })),
-        _ => Ok(serde_json::Value::Null),
-    }))
+    let engine = WorkflowEngine::local_with_async_effect_runner(Some(lift_async(
+        move |a: &Action| match a {
+            Action::SendDm { .. } => Ok(serde_json::json!({ "ok": false, "error": "boom" })),
+            _ => Ok(serde_json::Value::Null),
+        },
+    )))
     .expect("engine");
     let wf = parse_workflow(
         r##"
@@ -2320,9 +2342,9 @@ graph:
     assert_eq!(out["error"], "boom");
 
     // Presence of `error` without `ok:false` is NOT a failure — run succeeds.
-    let engine2 = WorkflowEngine::local(Arc::new(|_: &Action| {
-        Ok(serde_json::json!({ "ok": true, "error": "something" }))
-    }))
+    let engine2 = WorkflowEngine::local_with_async_effect_runner(Some(lift_async(
+        |_: &Action| Ok(serde_json::json!({ "ok": true, "error": "something" })),
+    )))
     .expect("engine2");
     let wf2 = parse_workflow(
         r##"
@@ -2354,7 +2376,7 @@ graph:
 /// VerifySink missing → {ok:false, error:"verify sink missing"} (ADR-0024 Spec 2).
 #[tokio::test]
 async fn verify_sink_missing_returns_error() {
-    let engine = WorkflowEngine::local(noop_runner()).expect("engine");
+    let engine = WorkflowEngine::local().expect("engine");
     let wf = parse_workflow(
         r##"
 name: t
@@ -2392,7 +2414,7 @@ async fn approval_payload() {
     // Runner that returns a commit sha for the implement node
     let seen: Arc<StdMutex<Vec<Action>>> = Arc::new(StdMutex::new(Vec::new()));
     let seen_clone = seen.clone();
-    let runner: ActionRunner = Arc::new(move |a: &Action| {
+    let runner = lift_async(move |a: &Action| {
         seen_clone.lock().unwrap().push(a.clone());
         match a {
             Action::SendDm { body, .. } if body == "implement" => {
@@ -2405,7 +2427,7 @@ async fn approval_payload() {
         }
     });
 
-    let Some((srv, engine)) = remote_engine(runner).await else {
+    let Some((srv, engine)) = remote_engine(Some(runner)).await else {
         eprintln!("SKIP: no `resonate` binary (needs herdr/resonate stack; runs on dev machines)");
         return;
     };
@@ -2579,7 +2601,7 @@ async fn kind_aware_fail_run_rate_limit_retries_same_node_then_succeeds() {
     use std::sync::atomic::{AtomicUsize, Ordering};
     let attempts = std::sync::Arc::new(AtomicUsize::new(0));
     let attempts_c = attempts.clone();
-    let runner: ActionRunner = std::sync::Arc::new(move |_a: &Action| {
+    let runner = lift_async(move |_a: &Action| {
         let n = attempts_c.fetch_add(1, Ordering::SeqCst);
         if n < 2 {
             Ok(serde_json::json!({
@@ -2592,7 +2614,7 @@ async fn kind_aware_fail_run_rate_limit_retries_same_node_then_succeeds() {
             Ok(serde_json::json!({ "ok": true, "n": 42 }))
         }
     });
-    let engine = WorkflowEngine::local(runner).expect("engine");
+    let engine = WorkflowEngine::local_with_async_effect_runner(Some(runner)).expect("engine");
     let wf = parse_workflow(
         r##"
 name: kind-rate-limit
@@ -2631,7 +2653,7 @@ steps:
 /// ADR-0024 Spec 1: timeout with fail_run retries and exhausts -> escalate with disposition
 #[tokio::test]
 async fn kind_aware_fail_run_timeout_bound_exhausted_escalates_with_disposition() {
-    let runner: ActionRunner = std::sync::Arc::new(|_a: &Action| {
+    let runner = lift_async(|_a: &Action| {
         Ok(serde_json::json!({
             "ok": false,
             "error": "timeout",
@@ -2639,7 +2661,7 @@ async fn kind_aware_fail_run_timeout_bound_exhausted_escalates_with_disposition(
             "retry_after_ms": 0
         }))
     });
-    let engine = WorkflowEngine::local(runner).expect("engine");
+    let engine = WorkflowEngine::local_with_async_effect_runner(Some(runner)).expect("engine");
     let wf = parse_workflow(
         r##"
 name: kind-timeout
@@ -2680,7 +2702,7 @@ async fn kind_aware_fail_run_blocked_does_not_retry_aborts_immediately() {
     use std::sync::atomic::{AtomicUsize, Ordering};
     let attempts = std::sync::Arc::new(AtomicUsize::new(0));
     let attempts_c = attempts.clone();
-    let runner: ActionRunner = std::sync::Arc::new(move |_a: &Action| {
+    let runner = lift_async(move |_a: &Action| {
         attempts_c.fetch_add(1, Ordering::SeqCst);
         Ok(serde_json::json!({
             "ok": false,
@@ -2688,7 +2710,7 @@ async fn kind_aware_fail_run_blocked_does_not_retry_aborts_immediately() {
             "kind": "blocked"
         }))
     });
-    let engine = WorkflowEngine::local(runner).expect("engine");
+    let engine = WorkflowEngine::local_with_async_effect_runner(Some(runner)).expect("engine");
     let wf = parse_workflow(
         r##"
 name: kind-blocked
@@ -2725,7 +2747,7 @@ async fn kind_aware_graph_rate_limit_retries_same_node() {
     use std::sync::atomic::{AtomicUsize, Ordering};
     let attempts = std::sync::Arc::new(AtomicUsize::new(0));
     let attempts_c = attempts.clone();
-    let runner: ActionRunner = std::sync::Arc::new(move |_a: &Action| {
+    let runner = lift_async(move |_a: &Action| {
         let n = attempts_c.fetch_add(1, Ordering::SeqCst);
         if n < 1 {
             Ok(serde_json::json!({
@@ -2738,7 +2760,7 @@ async fn kind_aware_graph_rate_limit_retries_same_node() {
             Ok(serde_json::json!({ "ok": true }))
         }
     });
-    let engine = WorkflowEngine::local(runner).expect("engine");
+    let engine = WorkflowEngine::local_with_async_effect_runner(Some(runner)).expect("engine");
     let wf = parse_workflow(
         r##"
 name: kind-graph
@@ -2773,9 +2795,8 @@ graph:
 /// and green passes. Pins the compose --run VerifySink attachment.
 #[tokio::test]
 async fn verify_sink_attached_green_passes() {
-    let runner: ActionRunner =
-        std::sync::Arc::new(|_a: &Action| Ok(serde_json::json!({ "ok": true })));
-    let engine = WorkflowEngine::local(runner).expect("engine");
+    let runner = lift_async(|_a: &Action| Ok(serde_json::json!({ "ok": true })));
+    let engine = WorkflowEngine::local_with_async_effect_runner(Some(runner)).expect("engine");
     let wf = parse_workflow(
         r##"
 name: t
@@ -2828,8 +2849,9 @@ steps:
 async fn compose_bare_dispatch_plus_verify_red_fails() {
     use parking_lot::Mutex;
     use std::sync::Arc;
-    let runner: ActionRunner = Arc::new(|_a: &Action| Ok(serde_json::json!({ "ok": true })));
-    let engine = WorkflowEngine::local(runner).expect("engine");
+    // No runner: bare dispatch records its missing sink without failing the
+    // run; the red verify still executes through the sink and fails loud.
+    let engine = WorkflowEngine::local().expect("engine");
     let wf = parse_workflow(
         r##"
 name: composed-verify
@@ -2838,7 +2860,9 @@ steps:
     action: dispatch_job
     assignee: x
     spec: { profile: "@coder", stage: systematic-execute }
-    on_error: fail_run
+    # bd-ctj7: journal-less dispatch records its missing sink (ok:false) —
+    # continue past the known gap so the test pins the VERIFY failure.
+    on_error: continue
   - name: verify-1
     action: verify
     command: "cargo test --lib"
@@ -2937,11 +2961,11 @@ steps:
     // both template positions; provided `goal` passes through.
     let seen: Arc<StdMutex<Vec<Action>>> = Arc::new(StdMutex::new(Vec::new()));
     let seen_clone = seen.clone();
-    let runner: ActionRunner = Arc::new(move |a: &Action| {
+    let runner = lift_async(move |a: &Action| {
         seen_clone.lock().unwrap().push(a.clone());
         Ok(serde_json::Value::Null)
     });
-    let engine = WorkflowEngine::local(runner).expect("engine");
+    let engine = WorkflowEngine::local_with_async_effect_runner(Some(runner)).expect("engine");
     let wf = parse_workflow(
         r##"
 name: invoke-defaults
@@ -3003,11 +3027,8 @@ fn phases(seen: &Arc<std::sync::Mutex<Vec<RunTransition>>>) -> Vec<RunPhase> {
 /// run row and its effect rows agree).
 #[tokio::test]
 async fn run_lifecycle_rows_are_journaled_for_a_successful_run() {
-    let runner: ActionRunner = Arc::new(|_a: &Action| Ok(serde_json::json!({ "ok": true })));
     let (journal, seen) = recording_run_journal();
-    let engine = WorkflowEngine::local_with_resolvers_effect_mode_and_run_journal(
-        runner,
-        WorkflowEngine::default_resolver(),
+    let engine = WorkflowEngine::local_with_resolvers_effect_mode_and_run_journal(WorkflowEngine::default_resolver(),
         WorkflowEngine::default_workflow_resolver(),
         None,
         EffectJournalMode::Recording,
@@ -3059,11 +3080,8 @@ steps:
 /// A failed run reports the Failed terminal — never a bare stop.
 #[tokio::test]
 async fn run_lifecycle_rows_report_failure() {
-    let runner: ActionRunner = Arc::new(|_a: &Action| Err(anyhow::anyhow!("provider exploded")));
     let (journal, seen) = recording_run_journal();
-    let engine = WorkflowEngine::local_with_resolvers_effect_mode_and_run_journal(
-        runner,
-        WorkflowEngine::default_resolver(),
+    let engine = WorkflowEngine::local_with_resolvers_effect_mode_and_run_journal(WorkflowEngine::default_resolver(),
         WorkflowEngine::default_workflow_resolver(),
         None,
         EffectJournalMode::Recording,
@@ -3106,8 +3124,8 @@ steps:
 /// its own lifecycle calls; the engine must not invent rows).
 #[tokio::test]
 async fn run_lifecycle_is_silent_without_a_journal() {
-    let runner: ActionRunner = Arc::new(|_a: &Action| Ok(serde_json::json!({ "ok": true })));
-    let engine = WorkflowEngine::local(runner).expect("journal-less engine");
+    let runner = lift_async(|_a: &Action| Ok(serde_json::json!({ "ok": true })));
+    let engine = WorkflowEngine::local_with_async_effect_runner(Some(runner)).expect("journal-less engine");
     let wf = parse_workflow(
         r##"
 name: lifecycle-silent
@@ -3134,8 +3152,8 @@ steps:
 /// bd-a5ky (ADR-0035 Spec 2): `delay` returns a typed Unit object, never Null.
 #[tokio::test]
 async fn delay_returns_typed_unit() {
-    let runner = noop_runner();
-    let engine = WorkflowEngine::local(runner.clone()).expect("engine");
+    let runner = noop_async();
+    let engine = WorkflowEngine::local_with_async_effect_runner(Some(runner.clone())).expect("engine");
     let wf = parse_workflow(
         r##"
 name: timer-unit
@@ -3172,8 +3190,8 @@ steps:
 /// named cap, says so in the value, and never sleeps unbounded.
 #[tokio::test]
 async fn delay_over_cap_clamps_loud() {
-    let runner = noop_runner();
-    let engine = WorkflowEngine::local(runner.clone()).expect("engine");
+    let runner = noop_async();
+    let engine = WorkflowEngine::local_with_async_effect_runner(Some(runner.clone())).expect("engine");
     let over = crate::lint::DELAY_CAP_SECS + 10_000;
     let wf = parse_workflow(&format!(
         r##"
@@ -3213,7 +3231,6 @@ steps:
 /// a HostSink leaf is awaited through it, never thread-hop bridged.
 #[tokio::test]
 async fn async_effect_runner_handles_host_sink() {
-    let runner: ActionRunner = Arc::new(|_a: &Action| Ok(serde_json::json!({ "ok": true })));
     let calls = Arc::new(std::sync::Mutex::new(0usize));
     let calls_clone = calls.clone();
     let afx: AsyncEffectRunner = Arc::new(move |_inv: &ActionInvocation| {
@@ -3223,7 +3240,7 @@ async fn async_effect_runner_handles_host_sink() {
             Ok(serde_json::json!({ "journaled": true }))
         })
     });
-    let engine = WorkflowEngine::local_with_async_effect_runner(runner, Some(afx))
+    let engine = WorkflowEngine::local_with_async_effect_runner(Some(afx))
         .expect("engine with async runner");
     let wf = parse_workflow(
         r##"

@@ -89,7 +89,7 @@ async fn sc24_catchup_loop_wakes_and_fires_single_tick() {
     let seen_a: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(vec![]));
     let runner_a = {
         let seen = seen_a.clone();
-        Arc::new(move |a: &toron_workflow::schema::Action| {
+        common::lift_async(move |a: &toron_workflow::schema::Action| {
             seen.lock().unwrap().push(format!("{a:?}"));
             Ok(serde_json::Value::Null)
         })
@@ -99,10 +99,11 @@ async fn sc24_catchup_loop_wakes_and_fires_single_tick() {
         Arc::new(move || vec![reg.clone()])
     };
     let engine_a = Arc::new(
-        toron_workflow::engine::WorkflowEngine::remote_with(
+        toron_workflow::engine::WorkflowEngine::remote_with_resolvers_and_async_effect(
             &server_url,
-            runner_a,
             housekeeper_resolver(),
+            toron_workflow::engine::WorkflowEngine::default_workflow_resolver(),
+            Some(runner_a),
         )
         .expect("engine A"),
     );
@@ -133,16 +134,17 @@ async fn sc24_catchup_loop_wakes_and_fires_single_tick() {
     let seen_b: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(vec![]));
     let runner_b = {
         let seen = seen_b.clone();
-        Arc::new(move |a: &toron_workflow::schema::Action| {
+        common::lift_async(move |a: &toron_workflow::schema::Action| {
             seen.lock().unwrap().push(format!("{a:?}"));
             Ok(serde_json::Value::Null)
         })
     };
     let engine_b = Arc::new(
-        toron_workflow::engine::WorkflowEngine::remote_with(
+        toron_workflow::engine::WorkflowEngine::remote_with_resolvers_and_async_effect(
             &server_url,
-            runner_b,
             housekeeper_resolver(),
+            toron_workflow::engine::WorkflowEngine::default_workflow_resolver(),
+            Some(runner_b),
         )
         .expect("engine B"),
     );

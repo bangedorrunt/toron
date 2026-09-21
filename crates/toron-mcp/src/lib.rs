@@ -15,6 +15,7 @@ pub mod catalog;
 pub mod platform;
 pub mod resources;
 pub mod responses;
+pub mod send_armor;
 pub mod serve_lock;
 pub mod server;
 pub mod tools;

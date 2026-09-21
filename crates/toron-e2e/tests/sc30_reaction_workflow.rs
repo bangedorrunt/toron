@@ -34,7 +34,7 @@ use toron_core::index::schema;
 use toron_core::mailbox::Mailbox;
 use toron_core::nostr::identity::AgentProfile;
 use toron_workflow::engine::{RunInput, WorkflowEngine};
-use toron_workflow::schema::{Action, Workflow, parse_workflow};
+use toron_workflow::schema::{Workflow, parse_workflow};
 use toron_workflow::stamp_workflow_emitted;
 
 const PROJECT: &str = "crew-demo";
@@ -136,12 +136,21 @@ async fn drain_reactions(
         if !seen.insert(format!("key|{key}")) {
             continue; // identical react → idempotent filter, no double-fire
         }
-        // Fire the reaction workflow (stamped runner).
-        let engine = WorkflowEngine::local(Arc::new(|action: &Action| {
-            let _ = stamp_workflow_emitted(vec![]);
-            let _ = action;
-            Ok(serde_json::json!({ "ok": true, "stamped": true }))
-        }))
+        // Fire the reaction workflow (stamped async runner).
+        let engine = WorkflowEngine::local_with_async_effect_runner(Some(Arc::new(
+            |inv: &toron_workflow::engine::ActionInvocation| {
+                let _ = stamp_workflow_emitted(vec![]);
+                let _ = &inv.action;
+                Box::pin(async move { Ok(serde_json::json!({ "ok": true, "stamped": true })) })
+                    as std::pin::Pin<
+                        Box<
+                            dyn std::future::Future<
+                                Output = anyhow::Result<serde_json::Value>,
+                            > + Send,
+                        >,
+                    >
+            },
+        )))
         .expect("engine");
         let payload = serde_json::json!({
             "kind": 7,

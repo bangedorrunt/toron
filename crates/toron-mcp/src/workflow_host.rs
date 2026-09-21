@@ -15,7 +15,7 @@
 //! - A workflow whose `trigger` spec matches an event, and whose `guard`
 //!   evaluates true, is invoked through [`WorkflowEngine`] (`run`, the same
 //!   durable function as the trigger path).
-//! - The engine's ActionRunner dispatches through the Mailbox (a DM send
+//! - The engine's async effect runner dispatches through the Mailbox (a DM send
 //!   emits a kind-14 gift wrap) and STAMPS every event it emits with
 //!   `toron:workflow-emitted` — so a workflow can never re-trigger itself.
 //! - `@mention` dispatch runs through a [`MentionCoalescer`] (one job per
@@ -31,7 +31,7 @@ use toron_core::bus::{Bus, SubscriptionEvent};
 use toron_core::mailbox::{Mailbox, SendMessage, UnwrappedMail};
 use toron_workflow::coalesce::{CoalesceDecision, Coalesced, MentionCoalescer};
 use toron_workflow::engine::{
-    ActionInvocation, ActionPartition, ActionRunner, AsyncEffectRunner, AsyncRunJournal,
+    ActionInvocation, ActionPartition, AsyncEffectRunner, AsyncRunJournal,
     CleanupKind, CleanupRequest, Decision, DispatchPlan, EffectJournalMode, EffectView,
     FORCED_CLEANUP_CAPABILITY, ParkKind, PendingEntry, PendingRegistry, ProviderCapability,
     ProviderErrorClass, ProviderOutcome, Resolution, ResolutionMismatch, ResolutionVerdict,
@@ -41,6 +41,10 @@ use toron_workflow::engine::{
     failure_for_control_misdispatch, failure_for_unsupported, normalize_dispatch_result,
     plan_attempt, terminal_digest, validate_resolution,
 };
+use crate::send_armor::{
+    ARMOR_MAX_CONCURRENCY, ARMOR_SEND_TIMEOUT, ArmorError, SendArmor, SendFuture, SendRequest,
+    passthrough,
+};
 use toron_workflow::jobs::{JobRequest, build_job_request_with_tags};
 use toron_workflow::schema::{Action, Trigger, Workflow};
 use toron_workflow::stamp_workflow_emitted;
@@ -48,16 +52,6 @@ use toron_workflow::trigger_filter::{
     matches_trigger, should_evaluate_trigger_event, trigger_payload, trigger_run_id,
 };
 use tracing::{debug, warn};
-
-/// The sync pure action runner (bd-ckkf, ADR-0035 Spec 2.2): the ONLY sync
-/// runner left. Pure leaves compute synchronously inside [`invoke_compat`]
-/// with no sink attached — no I/O and no runtime bridge of any kind. Every
-/// HostSink leaf routes through the injected async effect runner first (the
-/// engine prefers it); reaching here journal-less yields a loud
-/// `missing_sink`, never a silent send.
-pub fn pure_action_runner() -> ActionRunner {
-    Arc::new(|action: &Action| Ok(toron_workflow::engine::invoke_compat(action, |_| None)))
-}
 
 /// Map one mailbox send error onto a provider outcome (bd-zczp):
 /// ambiguous transport outcomes become Ambiguous (I5 — a timeout is not
@@ -296,12 +290,14 @@ pub fn mailbox_async_effect_runner(
     coalescer: Arc<std::sync::Mutex<MentionCoalescer>>,
     job_signer: Option<Keys>,
     dispatcher: Arc<std::sync::Mutex<Option<EffectDispatcher>>>,
+    armor: Arc<SendArmor>,
 ) -> AsyncEffectRunner {
     Arc::new(move |inv: &ActionInvocation| {
         let mailbox = mailbox.clone();
         let coalescer = coalescer.clone();
         let job_signer = job_signer.clone();
         let dispatcher = dispatcher.clone();
+        let armor = armor.clone();
         let inv = inv.clone();
         Box::pin(async move {
             // The `invoke` contract over an async provider: partition
@@ -316,7 +312,7 @@ pub fn mailbox_async_effect_runner(
                 }
                 ActionPartition::HostSink { .. } => normalize_dispatch_result(
                     &inv,
-                    dispatch_host_sink(mailbox, coalescer, job_signer, dispatcher, inv.clone())
+                    dispatch_host_sink(mailbox, coalescer, job_signer, dispatcher, armor, inv.clone())
                         .await,
                 ),
             };
@@ -338,6 +334,7 @@ async fn dispatch_host_sink(
     coalescer: Arc<std::sync::Mutex<MentionCoalescer>>,
     job_signer: Option<Keys>,
     dispatcher: Arc<std::sync::Mutex<Option<EffectDispatcher>>>,
+    armor: Arc<SendArmor>,
     inv: ActionInvocation,
 ) -> anyhow::Result<serde_json::Value> {
     match inv.action.clone() {
@@ -367,7 +364,7 @@ async fn dispatch_host_sink(
                 extra_tags: tags,
             };
             let req = scoped_request(&inv, digest, key.clone());
-            send_via_dispatch(mailbox, &dispatcher, req, msg, key).await
+            send_via_dispatch(&armor, mailbox, &dispatcher, req, msg, key).await
         }
         Action::SendDm { to, body, project } => {
             let project = project.unwrap_or_default();
@@ -390,7 +387,7 @@ async fn dispatch_host_sink(
                 extra_tags: tags,
             };
             let req = scoped_request(&inv, digest, key.clone());
-            send_via_dispatch(mailbox, &dispatcher, req, msg, key).await
+            send_via_dispatch(&armor, mailbox, &dispatcher, req, msg, key).await
         }
         Action::DispatchJob { assignee, spec, .. } => {
             let mention = toron_workflow::coalesce::InboundMention {
@@ -494,7 +491,29 @@ async fn dispatch_host_sink(
 /// attached, direct classified send otherwise (bd-zczp). Direct-path
 /// failures return `Err` so the normalization classifies them (I5)
 /// identically. Fully async — awaited inline, never bridged.
+/// One tower-armored send (bd-qdup): the mailbox send as a guarded request.
+/// The armor (timeout, bulkhead, breaker) bounds it; classification stays
+/// with the host — this only performs.
+fn armored_send_request(mailbox: Arc<Mailbox>, msg: SendMessage) -> SendRequest {
+    SendRequest {
+        send: Arc::new(move || {
+            // Cloned per call: the armor never re-fires, but the closure
+            // must stay callable (tower services are `Clone`).
+            let msg = msg.clone();
+            let mailbox = mailbox.clone();
+            Box::pin(async move {
+                mailbox
+                    .send_message(&msg)
+                    .await
+                    .map(|res| res.count)
+                    .map_err(|e| e.to_string())
+            }) as SendFuture
+        }),
+    }
+}
+
 async fn send_via_dispatch(
+    armor: &SendArmor,
     mailbox: Arc<Mailbox>,
     dispatcher: &Arc<std::sync::Mutex<Option<EffectDispatcher>>>,
     req: DispatchRequest,
@@ -506,23 +525,37 @@ async fn send_via_dispatch(
         .unwrap_or_else(PoisonError::into_inner)
         .clone();
     let Some(disp) = disp else {
-        return match mailbox.send_message(&msg).await {
-            Ok(res) => Ok(serde_json::json!({ "ok": true, "count": res.count })),
-            Err(e) => Err(anyhow::anyhow!(e.to_string())),
+        // Direct path: armored send, pre-journal value shape preserved
+        // ({ok,count} / Err) so dry embeddings read identically.
+        return match armor.send(armored_send_request(mailbox, msg)).await {
+            Ok(sent) => match sent {
+                Ok(count) => Ok(serde_json::json!({ "ok": true, "count": count })),
+                Err(e) => Err(anyhow::anyhow!(e)),
+            },
+            Err(ArmorError::BreakerOpen) => {
+                Err(anyhow::anyhow!("send refused: breaker open (storm fail-fast)"))
+            }
+            Err(ArmorError::Ambiguous(e)) => Err(anyhow::anyhow!(e)),
         };
     };
     let key_out = key.clone();
     Ok(fenced_outcome(
         &key_out,
         disp.dispatch_async(&req, move |_| {
+            let armor = armor.clone();
             let mailbox = mailbox.clone();
             let key = key.clone();
             async move {
-                let sent = match mailbox.send_message(&msg).await {
-                    Ok(res) => Ok(res.count),
-                    Err(e) => Err(e.to_string()),
-                };
-                mail_outcome(sent, key)
+                match armor.send(armored_send_request(mailbox, msg)).await {
+                    Ok(sent) => mail_outcome(sent, key),
+                    // Storm fail-fast is a DETERMINED refusal (the send did
+                    // not happen): settle Failed, never Unknown — reconcile
+                    // must not retry what was deliberately refused.
+                    Err(ArmorError::BreakerOpen) => ProviderOutcome::ProvenFailed(
+                        "send refused: breaker open (storm fail-fast)".to_string(),
+                    ),
+                    Err(ArmorError::Ambiguous(e)) => ProviderOutcome::Ambiguous(e),
+                }
             }
         })
         .await,
@@ -658,16 +691,21 @@ impl WorkflowHost {
         let pending = store.map_or_else(PendingDrain::new, |store| {
             PendingDrain::new().with_store(store)
         });
-        let runner = pure_action_runner();
-        // bd-ckkf: the engine prefers the context-bearing async effect
-        // runner for mailbox/job HostSink actions (Spec 1 + Spec 2.2) —
-        // awaited inline, never bridged. The sync runner above stays for
-        // pure actions only.
+        // bd-qdup: one shared tower armor (timeout inner, bulkhead,
+        // breaker, explicit fallback) guards every mailbox send below.
+        let armor = Arc::new(SendArmor::new(
+            passthrough(),
+            ARMOR_SEND_TIMEOUT,
+            ARMOR_MAX_CONCURRENCY,
+        ));
+        // bd-ctj7: no sync runner exists anymore — the engine computes pure
+        // leaves itself and awaits the async seam for the rest.
         let async_effect_runner = mailbox_async_effect_runner(
             mailbox.clone(),
             coalescer.clone(),
             job_signer.clone(),
             dispatcher.clone(),
+            armor,
         );
         // bd-engine-run-path-journaling-fwlx (the Spec 6 flip): the host
         // really dispatches, so its engine is Enforced — an effectful leaf
@@ -682,7 +720,6 @@ impl WorkflowHost {
         let engine = match toron_workflow::engine::resonate_server_url() {
             Some(url) => WorkflowEngine::remote_with_resolvers_async_effect_mode_and_journal(
                 url,
-                runner,
                 WorkflowEngine::default_resolver(),
                 WorkflowEngine::default_workflow_resolver(),
                 Some(async_effect_runner),
@@ -691,7 +728,6 @@ impl WorkflowHost {
             )
             .context("workflow engine (remote resonate server)")?,
             None => WorkflowEngine::local_with_resolvers_async_effect_mode_and_journal(
-                runner,
                 WorkflowEngine::default_resolver(),
                 WorkflowEngine::default_workflow_resolver(),
                 Some(async_effect_runner),
@@ -714,12 +750,15 @@ impl WorkflowHost {
 
     /// Construct over an explicit bus (tests / embeddings without a mailbox).
     /// Call [`Self::with_job_signer`] to enable coalesced 43001 publishing.
+    /// The async effect seam is injected (bd-ctj7): `None` keeps the
+    /// runner-less Recording path for pure leaves.
     pub fn over_bus(
         bus: Arc<dyn Bus>,
-        runner: ActionRunner,
         workflows: Vec<Workflow>,
+        effect: Option<AsyncEffectRunner>,
     ) -> Result<Self> {
-        let engine = WorkflowEngine::local(runner).context("workflow engine")?;
+        let engine =
+            WorkflowEngine::local_with_async_effect_runner(effect).context("workflow engine")?;
         Ok(Self {
             engine: Arc::new(engine),
             bus,
@@ -2361,12 +2400,20 @@ mod tests {
         // Recording runner: each dispatched action records the workflow name.
         let fired: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
         let fired2 = fired.clone();
-        let runner: ActionRunner = Arc::new(move |a: &Action| {
+        let afx: AsyncEffectRunner = Arc::new(move |inv: &ActionInvocation| {
             fired2
                 .lock()
                 .unwrap()
-                .push(format!("action:{}", a.type_name()));
-            Ok(serde_json::json!({ "action": a.type_name() }))
+                .push(format!("action:{}", inv.action.type_name()));
+            let value = serde_json::json!({ "action": inv.action.type_name() });
+            Box::pin(async move { Ok(value) })
+                as std::pin::Pin<
+                    Box<
+                        dyn std::future::Future<
+                            Output = anyhow::Result<serde_json::Value>,
+                        > + Send,
+                    >,
+                >
         });
 
         fn wf(name: &str, trigger: Trigger) -> Workflow {
@@ -2426,7 +2473,7 @@ mod tests {
                 },
             ),
         ];
-        let host = WorkflowHost::over_bus(bus.clone(), runner, workflows).expect("host");
+        let host = WorkflowHost::over_bus(bus.clone(), workflows, Some(afx)).expect("host");
         let _handle = host.spawn_trigger_loop();
 
         async fn wait_for(
@@ -2574,6 +2621,7 @@ mod tests {
             coalescer.clone(),
             None,
             Arc::new(std::sync::Mutex::new(None)),
+            test_armor(),
         );
         let action = |i: u32| Action::DispatchJob {
             assignee: "oc-beta".into(),
@@ -2649,6 +2697,7 @@ mod tests {
             coalescer,
             None,
             Arc::new(std::sync::Mutex::new(None)),
+            test_armor(),
         );
         let mut sub = bus
             .subscribe(toron_core::bus::Filter::new())
@@ -2760,6 +2809,7 @@ mod tests {
             coalescer.clone(),
             Some(signer.clone()),
             Arc::new(std::sync::Mutex::new(None)),
+            test_armor(),
         );
         // Global sub: assignee is NOT a project slug (`assignee` tag, not `#t`).
         // Stamped `t=toron:workflow-emitted` is ignored by access_gate.
@@ -2863,6 +2913,7 @@ mod tests {
             coalescer.clone(),
             Some(Keys::generate()),
             Arc::new(std::sync::Mutex::new(None)),
+            test_armor(),
         );
 
         // Fire 100 DispatchJob mentions from 8 tasks (barrier-synced).
@@ -2939,11 +2990,18 @@ mod tests {
         // Recording runner: counts how many times each action fires.
         let ran = Arc::new(AtomicUsize::new(0));
         let ran2 = ran.clone();
-        let runner: ActionRunner = Arc::new(move |a: &Action| {
-            if let Action::SendDm { .. } = a {
+        let afx: AsyncEffectRunner = Arc::new(move |inv: &ActionInvocation| {
+            if let toron_workflow::schema::Action::SendDm { .. } = &inv.action {
                 ran2.fetch_add(1, Ordering::Relaxed);
             }
-            Ok(serde_json::Value::Null)
+            Box::pin(async move { Ok(serde_json::Value::Null) })
+                as std::pin::Pin<
+                    Box<
+                        dyn std::future::Future<
+                            Output = anyhow::Result<serde_json::Value>,
+                        > + Send,
+                    >,
+                >
         });
 
         let wf = toron_workflow::schema::parse_workflow(
@@ -2961,7 +3019,7 @@ steps:
         )
         .expect("parse workflow");
 
-        let host = WorkflowHost::over_bus(bus.clone(), runner, vec![wf]).expect("host");
+        let host = WorkflowHost::over_bus(bus.clone(), vec![wf], Some(afx)).expect("host");
         let handle = host.spawn_trigger_loop();
 
         // Publish a matching kind-14 event → the loop must invoke the workflow.
@@ -3026,6 +3084,7 @@ steps:
             coalescer,
             None,
             Arc::new(std::sync::Mutex::new(None)),
+            test_armor(),
         );
 
         // All N tasks fire at once (barrier) — maximal contention through
@@ -3159,6 +3218,7 @@ steps:
             coalescer,
             Some(Keys::generate()),
             Arc::new(std::sync::Mutex::new(None)),
+            test_armor(),
         );
 
         // Prime oc's buffer (two mentions buffered, no flush).
@@ -3262,6 +3322,7 @@ steps:
             coalescer.clone(),
             Some(Keys::generate()),
             Arc::new(std::sync::Mutex::new(None)),
+            test_armor(),
         );
 
         // Poison the coalescer: panic while holding the guard (std Mutex
@@ -3300,21 +3361,13 @@ steps:
         let _ = std::fs::remove_file(&db);
     }
 
-    /// bd-i6kc: the honesty tests only exercise UNSUPPORTED actions (react,
-    /// call_webhook, control misdispatch) — the pure runner decides those
-    /// identically to any production runner (partition first, no sink
-    /// involved), so no mailbox fixture is built.
-    fn honesty_pure_runner() -> ActionRunner {
-        pure_action_runner()
-    }
-
     /// bd-asx3 RED: draining a newly parked promise records one structured
     /// entry (run/node/promise/generation) and suspends the run; a second
     /// drain observes no duplicates.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn host_lifecycle_drain_records_structured_entry() {
         use toron_workflow::engine::ParkKind;
-        let engine = WorkflowEngine::local(Arc::new(|_: &Action| Ok(serde_json::Value::Null)))
+        let engine = WorkflowEngine::local()
             .expect("local engine");
         engine
             .approval_sink()
@@ -3346,7 +3399,7 @@ steps:
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn host_lifecycle_restart_recovery() {
         use toron_workflow::engine::ParkKind;
-        let engine = WorkflowEngine::local(Arc::new(|_: &Action| Ok(serde_json::Value::Null)))
+        let engine = WorkflowEngine::local()
             .expect("local engine");
         engine
             .approval_sink()
@@ -3376,7 +3429,7 @@ steps:
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn host_lifecycle_stale_resolution_ignored() {
         use toron_workflow::engine::{Resolution, ResolutionMismatch, ResolutionVerdict};
-        let engine = WorkflowEngine::local(Arc::new(|_: &Action| Ok(serde_json::Value::Null)))
+        let engine = WorkflowEngine::local()
             .expect("local engine");
         engine
             .approval_sink()
@@ -3468,8 +3521,7 @@ steps:
                 .await
                 .expect("bus"),
         );
-        let runner: ActionRunner = Arc::new(|_: &Action| Ok(serde_json::Value::Null));
-        let host = WorkflowHost::over_bus(bus.clone(), runner, vec![])
+        let host = WorkflowHost::over_bus(bus.clone(), vec![], None)
             .expect("host")
             .with_job_signer(Some(Keys::generate()));
 
@@ -3588,8 +3640,7 @@ steps:
                 .await
                 .expect("bus"),
         );
-        let runner: ActionRunner = Arc::new(|_: &Action| Ok(serde_json::json!({"ok": true})));
-        let engine = WorkflowEngine::remote(&url, runner).expect("remote engine");
+        let engine = WorkflowEngine::remote(&url).expect("remote engine");
         let host = WorkflowHost::over_bus_with_engine(bus, engine, vec![])
             .with_job_signer(Some(Keys::generate()));
 
@@ -4336,12 +4387,13 @@ steps:
     /// explicit unsupported-action error, never `Ok(Null)` success.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn honesty_gate_react_fails_closed() {
-        let runner = honesty_pure_runner();
-        let out = runner(&Action::React {
-            message_id: "deadbeef".into(),
-            emoji: "+1".into(),
-        })
-        .expect("runner returns a value, never Err");
+        let out = toron_workflow::engine::invoke_compat(
+            &Action::React {
+                message_id: "deadbeef".into(),
+                emoji: "+1".into(),
+            },
+            |_| None,
+        );
         assert_ne!(
             out,
             serde_json::Value::Null,
@@ -4362,13 +4414,14 @@ steps:
     /// an explicit unsupported-action error, never `Ok(Null)` success.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn honesty_gate_call_webhook_fails_closed() {
-        let runner = honesty_pure_runner();
-        let out = runner(&Action::CallWebhook {
-            url: "https://example.com/hook".into(),
-            method: None,
-            body: None,
-        })
-        .expect("runner returns a value, never Err");
+        let out = toron_workflow::engine::invoke_compat(
+            &Action::CallWebhook {
+                url: "https://example.com/hook".into(),
+                method: None,
+                body: None,
+            },
+            |_| None,
+        );
         assert_ne!(
             out,
             serde_json::Value::Null,
@@ -4461,9 +4514,8 @@ steps:
                 },
             ),
         ];
-        let runner = honesty_pure_runner();
         for (name, action) in &cases {
-            let out = runner(action).expect("runner returns a value, never Err");
+            let out = toron_workflow::engine::invoke_compat(action, |_| None);
             assert_ne!(
                 out,
                 serde_json::Value::Null,
@@ -4608,6 +4660,7 @@ steps:
                 coalescer,
                 None,
                 Arc::new(std::sync::Mutex::new(None)),
+                test_armor(),
             );
             let out = drive_async(
                 &afx,
@@ -4683,8 +4736,20 @@ steps:
             coalescer,
             None,
             Arc::new(std::sync::Mutex::new(Some(dispatcher.clone()))),
+            test_armor(),
         );
         (runner, dispatcher, bus, db, data_dir, recv_keys)
+    }
+
+    /// Test armor (bd-qdup): production tuning at test speed — the 30s
+    /// production timeout never trips here, and the breaker stays shut on
+    /// green paths (storm tests build their own tuned armor).
+    fn test_armor() -> Arc<SendArmor> {
+        Arc::new(SendArmor::new(
+            passthrough(),
+            ARMOR_SEND_TIMEOUT,
+            ARMOR_MAX_CONCURRENCY,
+        ))
     }
 
     /// Drive one action through the async host runner inline (bd-ckkf):
@@ -4844,6 +4909,7 @@ steps:
                 Arc::new(std::sync::Mutex::new(MentionCoalescer::from_env())),
                 None,
                 Arc::new(std::sync::Mutex::new(Some(EffectDispatcher::new(store)))),
+                test_armor(),
             );
             let out = drive_async(&afx, action.clone(), "run-fencing-crash").await;
             assert_eq!(out["ok"], serde_json::json!(true));
@@ -4860,6 +4926,7 @@ steps:
                 Arc::new(std::sync::Mutex::new(MentionCoalescer::from_env())),
                 None,
                 Arc::new(std::sync::Mutex::new(Some(EffectDispatcher::new(store)))),
+                test_armor(),
             );
             let out = drive_async(&afx, action.clone(), "run-fencing-crash").await;
             assert_eq!(
@@ -4914,6 +4981,7 @@ steps:
             coalescer,
             None,
             Arc::new(std::sync::Mutex::new(Some(dispatcher.clone()))),
+            test_armor(),
         );
         let action = Action::DispatchJob {
             assignee: "oc".into(),
@@ -5044,6 +5112,7 @@ steps:
             Arc::new(std::sync::Mutex::new(MentionCoalescer::from_env())),
             None,
             cell,
+            test_armor(),
         );
         fn inv(run: &str, node: &str) -> ActionInvocation {
             ActionInvocation {
@@ -5150,6 +5219,7 @@ steps:
             Arc::new(std::sync::Mutex::new(MentionCoalescer::from_env())),
             None,
             cell,
+            test_armor(),
         );
         let action = Action::Verify {
             command: "cargo test".into(),

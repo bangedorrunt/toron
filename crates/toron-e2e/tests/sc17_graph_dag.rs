@@ -14,21 +14,29 @@
 
 use std::sync::Arc;
 
-use toron_workflow::engine::{ActionRunner, WorkflowEngine};
+use toron_workflow::engine::{AsyncEffectRunner, WorkflowEngine};
 use toron_workflow::schema::{Action, parse_workflow};
 
 /// Returns `{n: 42}` for `send_dm` (a value-returning action — P0.1), Null
 /// otherwise.
-fn value_runner() -> ActionRunner {
-    Arc::new(|a: &Action| match a {
-        Action::SendDm { .. } => Ok(serde_json::json!({ "n": 42 })),
-        _ => Ok(serde_json::Value::Null),
+fn value_runner() -> AsyncEffectRunner {
+    Arc::new(|inv: &toron_workflow::engine::ActionInvocation| {
+        let value = match &inv.action {
+            Action::SendDm { .. } => serde_json::json!({ "n": 42 }),
+            _ => serde_json::Value::Null,
+        };
+        Box::pin(async move { Ok(value) })
+            as std::pin::Pin<
+                Box<
+                    dyn std::future::Future<Output = anyhow::Result<serde_json::Value>> + Send,
+                >,
+            >
     })
 }
 
 #[tokio::test]
 async fn graph_dag_runs_through_engine() {
-    let engine = WorkflowEngine::local(value_runner()).expect("engine");
+    let engine = WorkflowEngine::local_with_async_effect_runner(Some(value_runner())).expect("engine");
     let wf = parse_workflow(
         r##"
 name: sc17-ship

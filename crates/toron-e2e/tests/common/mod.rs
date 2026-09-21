@@ -28,13 +28,41 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use toron_workflow::cron::{CronRegistration, CronRegistry};
-use toron_workflow::engine::{ActionRunner, ProfileResolver};
+use toron_workflow::engine::{ActionInvocation, AsyncEffectRunner, ProfileResolver};
 use toron_workflow::schema::CronScope;
 use toron_workflow::schema::{Action, parse_workflow};
 
-/// A no-op action runner (steps succeed, return null).
-pub fn noop_runner() -> ActionRunner {
-    Arc::new(|_a: &Action| Ok(serde_json::Value::Null))
+/// A no-op async effect runner (steps succeed, return null). Pure, no I/O.
+pub fn noop_runner() -> AsyncEffectRunner {
+    Arc::new(|_: &ActionInvocation| {
+        Box::pin(async move { Ok(serde_json::Value::Null) })
+            as std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                        Output = anyhow::Result<serde_json::Value>,
+                    > + Send,
+                >,
+            >
+    })
+}
+
+/// Lift a PURE leaf-value fn into the async seam (fixtures only): no I/O,
+/// no blocking — the async wrapper around pure computation. Closures that
+/// perform I/O belong in fenced host runners, never here.
+pub fn lift_async(
+    f: impl Fn(&Action) -> anyhow::Result<serde_json::Value> + Send + Sync + 'static,
+) -> AsyncEffectRunner {
+    Arc::new(move |inv: &ActionInvocation| {
+        let value = f(&inv.action);
+        Box::pin(async move { value })
+            as std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                        Output = anyhow::Result<serde_json::Value>,
+                    > + Send,
+                >,
+            >
+    })
 }
 
 /// Resolves `@housekeeper` to a spawn spec (the canonical P4 owner).

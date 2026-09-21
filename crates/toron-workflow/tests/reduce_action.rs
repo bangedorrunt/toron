@@ -7,21 +7,9 @@
 //! runtime asserts — this file always compiles) and pass after.
 //! Filter: `mbx test -p toron-workflow reduce_action`.
 
-use std::sync::{Arc, Mutex as StdMutex};
-
 use toron_workflow::action_contract::{contract_for, contract_partition_agrees};
-use toron_workflow::engine::{ActionRunner, RunInput, WorkflowEngine};
+use toron_workflow::engine::{RunInput, WorkflowEngine};
 use toron_workflow::schema::{Action, parse_workflow};
-
-fn noop_seen() -> (ActionRunner, Arc<StdMutex<Vec<Action>>>) {
-    let seen = Arc::new(StdMutex::new(Vec::new()));
-    let seen_c = seen.clone();
-    let runner: ActionRunner = Arc::new(move |a: &Action| {
-        seen_c.lock().unwrap().push(a.clone());
-        Ok(serde_json::json!({ "ok": true }))
-    });
-    (runner, seen)
-}
 
 fn run_reduce_case(
     run_id: &str,
@@ -38,8 +26,7 @@ fn run_reduce_case(
         .build()
         .expect("runtime");
     rt.block_on(async {
-        let (runner, _) = noop_seen();
-        let engine = WorkflowEngine::local(runner).expect("engine");
+        let engine = WorkflowEngine::local().expect("engine");
         engine
             .run(
                 run_id,
@@ -261,8 +248,7 @@ fn reduce_action_runs_as_graph_node() {
         .build()
         .expect("runtime");
     let out = rt.block_on(async {
-        let (runner, _) = noop_seen();
-        let engine = WorkflowEngine::local(runner).expect("engine");
+        let engine = WorkflowEngine::local().expect("engine");
         engine
             .run(
                 "wf-reduce-graph",

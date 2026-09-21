@@ -28,12 +28,12 @@ use std::time::Duration;
 use common::*;
 use toron_workflow::cron::{CronManager, CronRegistration, CronRegistry};
 use toron_workflow::cron_failure::PolicyEvent;
-use toron_workflow::engine::{ActionRunner, WorkflowEngine};
+use toron_workflow::engine::WorkflowEngine;
 use toron_workflow::schema::{Action, CronScope, FailureAction, parse_workflow};
 
 /// A runner that ALWAYS fails (every tick's step errors).
-fn always_failing_runner() -> ActionRunner {
-    Arc::new(|a: &Action| {
+fn always_failing_runner() -> toron_workflow::engine::AsyncEffectRunner {
+    common::lift_async(|a: &Action| {
         if let Action::SendDm { body, .. } = a
             && body == "upgrade"
         {
@@ -96,7 +96,12 @@ async fn sc23_cron_escalate_at_threshold() {
     wait_ready(&server_url).await;
 
     let engine = Arc::new(
-        WorkflowEngine::remote_with(&server_url, always_failing_runner(), housekeeper_resolver())
+        WorkflowEngine::remote_with_resolvers_and_async_effect(
+            &server_url,
+            housekeeper_resolver(),
+            WorkflowEngine::default_workflow_resolver(),
+            Some(always_failing_runner()),
+        )
             .expect("engine"),
     );
     let registry: CronRegistry = {

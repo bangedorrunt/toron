@@ -639,7 +639,7 @@ impl CronManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{Action, parse_cron};
+    use crate::schema::parse_cron;
 
     /// next_due finds a future tick for a valid expr; None for garbage.
     #[test]
@@ -897,20 +897,34 @@ mod tests {
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
-        let runner: crate::engine::ActionRunner =
-            Arc::new(|a: &Action| Ok(serde_json::json!({ "ran": a.type_name() })));
+        let afx: crate::engine::AsyncEffectRunner = std::sync::Arc::new(
+            |inv: &crate::engine::ActionInvocation| {
+                let value = serde_json::json!({ "ran": inv.action.type_name() });
+                Box::pin(async move { Ok(value) })
+                    as std::pin::Pin<
+                        Box<
+                            dyn std::future::Future<
+                                Output = anyhow::Result<serde_json::Value>,
+                            > + Send,
+                        >,
+                    >
+            },
+        );
         let workflow_resolver: crate::engine::WorkflowResolver = Arc::new(|name: &str| {
             let yaml =
                 format!("name: {name}\nsteps:\n  - action: send_dm\n    to: t\n    body: ok\n");
             crate::schema::parse_workflow(&yaml).ok()
         });
-        let engine = crate::engine::WorkflowEngine::remote_with_resolvers(
-            url,
-            runner,
-            Arc::new(|_name: &str| None),
-            workflow_resolver,
-        )
-        .expect("engine");
+        let engine =
+            crate::engine::WorkflowEngine::remote_with_resolvers_async_effect_mode_and_journal(
+                url,
+                Arc::new(|_name: &str| None),
+                workflow_resolver,
+                Some(afx),
+                crate::engine::EffectJournalMode::Recording,
+                None,
+            )
+            .expect("engine");
         Some((server, std::sync::Arc::new(engine)))
     }
 
@@ -946,9 +960,19 @@ mod tests {
             Vec::new()
         });
         let engine = std::sync::Arc::new(
-            crate::engine::WorkflowEngine::local(Arc::new(|_: &Action| {
-                Ok(serde_json::json!({ "ran": true }))
-            }))
+            crate::engine::WorkflowEngine::local_with_async_effect_runner(Some(std::sync::Arc::new(
+                |inv: &crate::engine::ActionInvocation| {
+                    let value = serde_json::json!({ "ran": inv.action.type_name() });
+                    Box::pin(async move { Ok(value) })
+                        as std::pin::Pin<
+                            Box<
+                                dyn std::future::Future<
+                                    Output = anyhow::Result<serde_json::Value>,
+                                > + Send,
+                            >,
+                        >
+                },
+            )))
             .expect("local engine"),
         );
         let manager = CronManager::new(engine, registry).expect("manager");
