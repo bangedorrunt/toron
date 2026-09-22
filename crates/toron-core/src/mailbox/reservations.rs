@@ -56,6 +56,7 @@ use crate::nostr::kinds::{FILE_RESERVATION, toron_kind};
 use super::Mailbox;
 use super::collect_replay;
 use super::messaging::{SendMessage, SendResult};
+use super::reservations_core::{self, EntryState, KernelModel, LeaseEntry};
 
 /// Default staleness threshold for force-release (holder inactive this long
 /// counts as stale). Matches the AM-Rust inactivity heuristic spirit (30 min).
@@ -425,6 +426,16 @@ pub struct ReleasedLease {
     pub holder: String,
 }
 
+/// Probe inputs for one kernel acquire decision (travel together).
+struct AcquireProbe {
+    holder_hex: String,
+    path: String,
+    exclusive: bool,
+    expires_us: Option<i64>,
+    epoch: u64,
+    now_us: i64,
+}
+
 impl Mailbox {
     /// `file_reservation_paths` (acquire): request leases on `paths`. Conflict
     /// is checked symmetrically against OTHER agents' active reservations; own
@@ -450,30 +461,24 @@ impl Mailbox {
         let mut result = AcquireResult::default();
 
         for path in paths {
-            let d = format!("{project_slug}:{path}");
-            let hits = self
-                .conflict_view(&agent_keys.public_key(), project_slug, path)
-                .await;
-            let hard: Vec<String> = hits
-                .iter()
-                .filter(|h| h.status == ReservationStatus::Held)
-                .map(|h| h.agent_name.clone())
-                .collect();
-            let hard_ids: Vec<String> = hits
-                .iter()
-                .filter(|h| h.status == ReservationStatus::Held)
-                .map(|h| h.reservation_id.clone())
-                .collect();
-            let soft: Vec<String> = hits
-                .iter()
-                .filter(|h| h.status == ReservationStatus::Intent)
-                .map(|h| h.agent_name.clone())
-                .collect();
-            let soft_ids: Vec<String> = hits
-                .iter()
-                .filter(|h| h.status == ReservationStatus::Intent)
-                .map(|h| h.reservation_id.clone())
-                .collect();
+            // Decided by the kernel (bd-y6t7): build once per call, tick
+            // per path. Granted publishes below; Denied maps to hard/soft.
+            let now_us = Self::kernel_now_us();
+            let (model, meta) = self.kernel_model_for(project_slug).await;
+            let ttl_us = ttl_secs.unwrap_or(crate::bus::DEFAULT_ENVELOPE_TTL_SECS);
+            let blockers = Self::kernel_blockers_for(
+                &model,
+                &meta,
+                &AcquireProbe {
+                    holder_hex: agent_keys.public_key().to_hex(),
+                    path: path.clone(),
+                    exclusive,
+                    expires_us: Some(now_us + ttl_us as i64 * 1_000_000),
+                    epoch: 0,
+                    now_us,
+                },
+            );
+            let (hard, hard_ids, soft, soft_ids) = Self::split_blockers(&blockers);
             if !hard.is_empty() {
                 result.conflicts.push(PathConflict {
                     path: path.clone(),
@@ -494,6 +499,7 @@ impl Mailbox {
             }
 
             // Publish the lease: NIP-40 expiration (TTL) + dual-emit scoping.
+            let d = format!("{project_slug}:{path}");
             let base = vec![
                 Tag::parse(["d", &d]).expect("d"),
                 Tag::parse(["reason", reason.unwrap_or("")]).expect("reason"),
@@ -634,29 +640,23 @@ impl Mailbox {
             ..Default::default()
         };
         for path in paths {
-            let hits = self
-                .conflict_view(&agent_keys.public_key(), project_slug, path)
-                .await;
-            let hard: Vec<String> = hits
-                .iter()
-                .filter(|h| h.status == ReservationStatus::Held)
-                .map(|h| h.agent_name.clone())
-                .collect();
-            let hard_ids: Vec<String> = hits
-                .iter()
-                .filter(|h| h.status == ReservationStatus::Held)
-                .map(|h| h.reservation_id.clone())
-                .collect();
-            let soft: Vec<String> = hits
-                .iter()
-                .filter(|h| h.status == ReservationStatus::Intent)
-                .map(|h| h.agent_name.clone())
-                .collect();
-            let soft_ids: Vec<String> = hits
-                .iter()
-                .filter(|h| h.status == ReservationStatus::Intent)
-                .map(|h| h.reservation_id.clone())
-                .collect();
+            // Dry-run decision through the kernel (bd-y6t7): no publish,
+            // same decider as the acquire path.
+            let now_us = Self::kernel_now_us();
+            let (model, meta) = self.kernel_model_for(project_slug).await;
+            let blockers = Self::kernel_blockers_for(
+                &model,
+                &meta,
+                &AcquireProbe {
+                    holder_hex: agent_keys.public_key().to_hex(),
+                    path: path.clone(),
+                    exclusive: true,
+                    expires_us: None,
+                    epoch: 0,
+                    now_us,
+                },
+            );
+            let (hard, hard_ids, soft, soft_ids) = Self::split_blockers(&blockers);
             if hard.is_empty() && soft.is_empty() {
                 report.clear_paths.push(path.clone());
             } else {
@@ -1675,44 +1675,125 @@ impl Mailbox {
         Ok(intents)
     }
 
-    /// Symmetric-glob conflict view against OTHER agents' active leases:
-    /// held exclusive leases = HARD (`Held` hits), in-TTL intents = SOFT
-    /// (`Intent` hits). Own leases never conflict; shared leases never block.
-    /// One replay serves both tiers (ADR-0011 Spec 4).
-    async fn conflict_view(
+    /// Build the kernel model from projected leases (bd-y6t7): the host
+    /// owns I/O (bus replay, mirrors, names); the tick owns grant/deny.
+    /// Only Held/Intent rows decide — terminal markers never reach the
+    /// kernel. Errors degrade to an empty model (same as the old inline
+    /// view: no rows, no conflicts).
+    async fn kernel_model_for(
         &self,
-        own_npub: &PublicKey,
         project_slug: &str,
-        path: &str,
-    ) -> Vec<ConflictHit> {
-        let leases = match self.resolved_leases(project_slug).await {
-            Ok(l) => l,
-            Err(_) => return Vec::new(),
-        };
-        let now_secs = Timestamp::now().as_secs() as i64;
+    ) -> (
+        KernelModel,
+        std::collections::HashMap<String, (String, ReservationStatus)>,
+    ) {
+        let leases = self.resolved_leases(project_slug).await.unwrap_or_default();
         let names = self.agent_name_map(project_slug).await;
-        leases
-            .into_iter()
-            .filter(|l| l.agent_pubkey != own_npub.to_hex())
-            .filter(|l| l.exclusive)
-            .filter(|l| overlaps(&l.path_pattern, path))
-            .filter(|l| match l.status {
-                ReservationStatus::Held => true,
-                ReservationStatus::Intent => {
-                    l.created_at_secs.saturating_add(INTENT_TTL_SECS as i64) >= now_secs
+        let mut model = KernelModel::new();
+        let mut meta = std::collections::HashMap::new();
+        for l in leases {
+            let state = match l.status {
+                ReservationStatus::Held => EntryState::Held,
+                ReservationStatus::Intent => EntryState::Intent,
+                _ => continue,
+            };
+            let name = names
+                .get(&l.agent_pubkey)
+                .cloned()
+                .unwrap_or_else(|| l.agent_pubkey.chars().take(8).collect());
+            meta.insert(l.id.clone(), (name, l.status));
+            model.leases.insert(
+                l.id.clone(),
+                LeaseEntry {
+                    id: l.id.clone(),
+                    holder: l.agent_pubkey.clone(),
+                    path_pattern: l.path_pattern.clone(),
+                    exclusive: l.exclusive,
+                    expires_us: l.expires_ts_us,
+                    created_at_secs: l.created_at_secs,
+                    epoch: l.epoch,
+                    state,
+                    liveness_extended: l.liveness_extended,
+                },
+            );
+        }
+        (model, meta)
+    }
+
+    /// Host clock for kernel Msgs (µs, ADR G7): read once per decision at
+    /// the host edge, never inside the tick.
+    fn kernel_now_us() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_micros() as i64)
+            .unwrap_or(0)
+    }
+
+    /// Split kernel blockers into hard (Held) and soft (Intent) tiers.
+    /// One splitter for both the acquire and check paths.
+    fn split_blockers(
+        blockers: &[(String, String, ReservationStatus)],
+    ) -> (Vec<String>, Vec<String>, Vec<String>, Vec<String>) {
+        let mut hard = Vec::new();
+        let mut hard_ids = Vec::new();
+        let mut soft = Vec::new();
+        let mut soft_ids = Vec::new();
+        for (name, id, status) in blockers {
+            match status {
+                ReservationStatus::Held => {
+                    hard.push(name.clone());
+                    hard_ids.push(id.clone());
                 }
-                _ => false,
-            })
-            .map(|l| ConflictHit {
-                agent_name: names
-                    .get(&l.agent_pubkey)
-                    .cloned()
-                    .unwrap_or_else(|| l.agent_pubkey.chars().take(8).collect()),
-                reservation_id: l.id,
-                path_pattern: l.path_pattern,
-                status: l.status,
-            })
-            .collect()
+                ReservationStatus::Intent => {
+                    soft.push(name.clone());
+                    soft_ids.push(id.clone());
+                }
+                _ => {}
+            }
+        }
+        (hard, hard_ids, soft, soft_ids)
+    }
+
+    /// Decide one acquire through the kernel (bd-y6t7): returns every
+    /// blocking (name, id, status) by re-ticking past each blocker on a
+    /// scratch model. One decider — the old inline `conflict_view` is gone.
+    fn kernel_blockers_for(
+        model: &KernelModel,
+        meta: &std::collections::HashMap<String, (String, ReservationStatus)>,
+        probe: &AcquireProbe,
+    ) -> Vec<(String, String, ReservationStatus)> {
+        use super::reservations_core::{KernelEffect, KernelMsg};
+        let mut scratch = model.clone();
+        let mut out = Vec::new();
+        for _ in 0..=scratch.leases.len() {
+            let (_, fx) = reservations_core::tick(
+                &scratch,
+                &KernelMsg::Acquire {
+                    id: format!("probe:{}:{}", probe.path, probe.now_us),
+                    holder: probe.holder_hex.clone(),
+                    path_pattern: probe.path.clone(),
+                    exclusive: probe.exclusive,
+                    expires_us: probe.expires_us,
+                    created_at_secs: probe.now_us / 1_000_000,
+                    epoch: probe.epoch,
+                    state: EntryState::Held,
+                    now_us: probe.now_us,
+                },
+            );
+            match fx.into_iter().next() {
+                Some(KernelEffect::Denied {
+                    reason: super::reservations_core::DenyReason::HardConflict { blocking_id },
+                    ..
+                }) => {
+                    if let Some((name, status)) = meta.get(&blocking_id) {
+                        out.push((name.clone(), blocking_id.clone(), *status));
+                    }
+                    scratch.leases.remove(&blocking_id);
+                }
+                _ => break,
+            }
+        }
+        out
     }
 
     /// Staleness heuristic: holder has no signed profile activity within
@@ -2424,15 +2505,6 @@ pub struct GhostRelease {
     pub project_slug: String,
     pub path_pattern: String,
     pub holder: String,
-}
-
-/// One conflicting other-agent lease hit for a path.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ConflictHit {
-    pub agent_name: String,
-    pub reservation_id: String,
-    pub path_pattern: String,
-    pub status: ReservationStatus,
 }
 
 /// Classify a coordinate-winning 30031 event's status (ADR-0011 Spec 2).
