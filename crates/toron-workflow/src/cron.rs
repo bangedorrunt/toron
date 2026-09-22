@@ -356,6 +356,11 @@ fn spec_catchup(spec: &CronSpec) -> CronCatchup {
 ///   the first tick after `now` (downtime ticks are dropped).
 ///
 /// `None` for an unparsable expression (the loop parks, never spins).
+///
+/// Legacy oracle for the kernel conformance tests below: production calls
+/// go through `cron_core`, tests pin this math. Only referenced under
+/// `cfg(test)`, hence the allow.
+#[allow(dead_code)]
 fn due_tick(cron: &str, last_fired: i64, now: i64, catchup: CronCatchup) -> Option<i64> {
     match catchup {
         CronCatchup::Latest => {

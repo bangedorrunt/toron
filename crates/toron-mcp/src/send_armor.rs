@@ -440,9 +440,6 @@ mod armor_matrix_tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-    /// Manual test clock (bd-mbck): drives Open -> HalfOpen -> probe with
-    /// no real sleeps. Production always uses the default system clock.
-
     /// One fake send service: counts calls, answers per the script.
     /// Scripts answer with VALUES (`Ok`), so classification stays with the
     /// caller — the armor never invents it.
@@ -473,6 +470,7 @@ mod armor_matrix_tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let armor = SendArmor::new(fake(calls.clone(), || Ok(7)), Duration::from_secs(5), 4);
         let out = armor.send(req()).await.expect("armor ok");
+        drop(armor);
         assert_eq!(out, Ok(7));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
@@ -489,6 +487,7 @@ mod armor_matrix_tests {
             4,
         );
         let out = armor.send(req()).await.expect("armor ok");
+        drop(armor);
         assert_eq!(out, Err("refused: no signer".to_string()));
         assert_eq!(
             calls.load(Ordering::SeqCst),
@@ -508,6 +507,7 @@ mod armor_matrix_tests {
             4,
         );
         let out = armor.send(req()).await.expect("armor ok");
+        drop(armor);
         assert_eq!(out, Err("bus timeout".to_string()));
         assert_eq!(calls.load(Ordering::SeqCst), 1, "no blind retry");
     }
@@ -520,6 +520,7 @@ mod armor_matrix_tests {
         let armor = SendArmor::new(inner, Duration::from_millis(20), 4);
         let t0 = tokio::time::Instant::now();
         let err = armor.send(req()).await.expect_err("timeout must fail");
+        drop(armor);
         assert!(
             matches!(err, ArmorError::Ambiguous(_)),
             "hang maps to Ambiguous, got {err:?}"
@@ -548,6 +549,7 @@ mod armor_matrix_tests {
         }
         assert_eq!(calls.load(Ordering::SeqCst), 3);
         let err = armor.send(req()).await.expect_err("open breaker fails");
+        drop(armor);
         assert_eq!(err, ArmorError::BreakerOpen);
         assert_eq!(
             calls.load(Ordering::SeqCst),
@@ -587,12 +589,16 @@ mod armor_matrix_tests {
         let out = armor.send(req()).await.expect("probe goes through");
         assert_eq!(out, Ok(1), "probe success closes the breaker");
         let out = armor.send(req()).await.expect("traffic flows");
+        drop(armor);
         assert_eq!(out, Ok(1));
         assert_eq!(calls.load(Ordering::SeqCst), 4);
     }
 
     /// Controllable clock handle: `clock()` is the injected `ClockFn`,
     /// `advance` moves it. No tokio sleeps, no wall time.
+    ///
+    /// Manual test clock (bd-mbck): drives Open -> HalfOpen -> probe with
+    /// no real sleeps. Production always uses the default system clock.
     #[derive(Clone)]
     struct ManualClock {
         now: Arc<Mutex<tokio::time::Instant>>,
@@ -612,7 +618,7 @@ mod armor_matrix_tests {
 
         fn advance(&self, d: Duration) {
             let mut now = self.now.lock().unwrap_or_else(PoisonError::into_inner);
-            *now = *now + d;
+            *now += d;
         }
     }
 
@@ -684,6 +690,7 @@ mod armor_matrix_tests {
         let out = handle.await.expect("probe task").expect("armor ok");
         assert_eq!(out, Ok(3));
         let out = armor.send(req()).await.expect("traffic flows");
+        drop(armor);
         assert_eq!(out, Ok(1));
         assert_eq!(calls.load(Ordering::SeqCst), 3);
     }
@@ -720,6 +727,7 @@ mod armor_matrix_tests {
         let out = armor.send(req()).await.expect("probe goes through");
         assert_eq!(out, Ok(1), "probe success closes the breaker");
         let out = armor.send(req()).await.expect("traffic flows");
+        drop(armor);
         assert_eq!(out, Ok(1));
         assert_eq!(calls.load(Ordering::SeqCst), 3);
     }

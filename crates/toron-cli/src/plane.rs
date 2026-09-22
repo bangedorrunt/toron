@@ -1382,7 +1382,7 @@ fn print_watch_event(ev: &Event) {
 /// un-scoped events pass through as project-agnostic).
 fn raw_project_tag(tags: &[Vec<String>]) -> Option<&str> {
     tags.iter().find_map(|t| {
-        if t.first().map(|s| s.as_str()) != Some("t") {
+        if t.first().map(String::as_str) != Some("t") {
             return None;
         }
         let c = t.get(1)?;
@@ -1402,7 +1402,7 @@ pub(crate) fn watch_gate(
     id: &str,
     tags: &[Vec<String>],
     project: &str,
-    channel: &Option<String>,
+    channel: Option<&String>,
 ) -> bool {
     if !seen.insert(id.to_string()) {
         return false;
@@ -1415,9 +1415,9 @@ pub(crate) fn watch_gate(
     if let Some(ch) = channel {
         let h = tags
             .iter()
-            .find(|t| t.first().map(|s| s.as_str()) == Some("h"))
+            .find(|t| t.first().map(String::as_str) == Some("h"))
             .and_then(|t| t.get(1));
-        if h != Some(&ch) {
+        if h != Some(ch) {
             return false;
         }
     }
@@ -1430,7 +1430,13 @@ pub(crate) fn watch_gate(
 /// `--once` signal).
 fn watch_emit(seen: &mut HashSet<String>, args: &WatchArgs, ev: &Event) -> bool {
     let tags: Vec<Vec<String>> = ev.tags.iter().map(|t| t.clone().to_vec()).collect();
-    if !watch_gate(seen, &ev.id.to_hex(), &tags, &args.project, &args.channel) {
+    if !watch_gate(
+        seen,
+        &ev.id.to_hex(),
+        &tags,
+        &args.project,
+        args.channel.as_ref(),
+    ) {
         return false;
     }
     print_watch_event(ev);
@@ -1534,7 +1540,7 @@ async fn watch_once(mailbox: &Mailbox, args: &WatchArgs) -> anyhow::Result<()> {
                             break;
                         }
                         Ok(Ok(crate::wake_sock::ConnEvent::Event(ev))) => {
-                            if watch_gate(&mut seen, &ev.id, &ev.tags, &project, &channel) {
+                            if watch_gate(&mut seen, &ev.id, &ev.tags, &project, channel.as_ref()) {
                                 println!("{}", crate::wake_sock::format_sock_line(&ev));
                                 return Ok(());
                             }
@@ -1768,7 +1774,7 @@ async fn watch_live(mailbox: &Mailbox, args: &WatchArgs) -> anyhow::Result<()> {
             .run(&mut |ev| {
                 // `true` keeps tailing: filtering is the gate's job,
                 // stopping is `--once`'s (run stops only on false).
-                if watch_gate(&mut seen, &ev.id, &ev.tags, &project, &channel) {
+                if watch_gate(&mut seen, &ev.id, &ev.tags, &project, channel.as_ref()) {
                     println!("{}", crate::wake_sock::format_sock_line(ev));
                 }
                 true

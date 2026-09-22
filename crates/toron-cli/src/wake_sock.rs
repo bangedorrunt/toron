@@ -220,7 +220,7 @@ pub struct WakeSockTail {
 
 impl WakeSockTail {
     /// No I/O: stores config only.
-    pub fn new(config: WakeSockConfig) -> Self {
+    pub const fn new(config: WakeSockConfig) -> Self {
         Self { config }
     }
 
@@ -403,7 +403,7 @@ mod wake_tail_tests {
                 vec!["t".into(), "demo".into()],
                 vec!["h".into(), "steer-adr35".into()],
             ],
-            created_at: 1790050000,
+            created_at: 1_790_050_000,
         }
     }
 
@@ -604,20 +604,18 @@ mod wake_tail_tests {
         let tags = sample_event("G").tags;
         let mut seen: HashSet<String> = HashSet::new();
         assert!(crate::plane::watch_gate(
-            &mut seen, "G", &tags, &project, &channel
+            &mut seen,
+            "G",
+            &tags,
+            &project,
+            channel.as_ref()
         ));
         assert!(
-            !crate::plane::watch_gate(&mut seen, "G", &tags, &project, &channel),
+            !crate::plane::watch_gate(&mut seen, "G", &tags, &project, channel.as_ref()),
             "dup id emits once"
         );
         assert!(
-            !crate::plane::watch_gate(
-                &mut HashSet::new(),
-                "H",
-                &tags,
-                &"other".to_string(),
-                &channel
-            ),
+            !crate::plane::watch_gate(&mut HashSet::new(), "H", &tags, "other", channel.as_ref()),
             "foreign project filtered"
         );
         assert!(
@@ -626,7 +624,7 @@ mod wake_tail_tests {
                 "H",
                 &tags,
                 &project,
-                &Some("other-room".into())
+                Some("other-room".to_string()).as_ref()
             ),
             "foreign channel filtered"
         );
@@ -637,7 +635,7 @@ mod wake_tail_tests {
             "I",
             &bare,
             &project,
-            &channel
+            channel.as_ref()
         ));
     }
 }
