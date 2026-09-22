@@ -142,21 +142,60 @@ struct DecideInput {
     catchup: CronCatchup,
 }
 
+/// The edge's bounded candidate set for one decision (bd-j32w): the
+/// latest due tick (if any) plus the next ticks from `now` and from
+/// `last_fired` — O(1) schedule reads, no gap enumeration. Shared by the
+/// durable child and the conformance battery below.
+fn decide_candidates(cron: &str, last_fired: i64, now: i64) -> Vec<i64> {
+    let mut candidates = Vec::new();
+    for t in [
+        latest_due_at_or_before(cron, last_fired, now),
+        next_due(cron, now),
+        next_due(cron, last_fired),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if !candidates.contains(&t) {
+            candidates.push(t);
+        }
+    }
+    candidates
+}
+
 /// The durable catch-up decision: which tick to fire next, under the
 /// effective catch-up policy. Run as a child of the loop so the decision is
 /// RECORDED — a replay returns the original decision instead of re-deriving
 /// one from the (changed) wall clock after a restart.
+///
+/// bd-j32w: the edge materializes a bounded candidate set with the existing
+/// schedule fns (latest-due + next-from-now + next-from-last, all O(1)
+/// calls); the kernel owns the SELECTION, so there is exactly one
+/// implementation. Shapes unchanged (`Option<i64>`, fire-or-park), so
+/// recorded histories replay verbatim.
 #[resonate_sdk::function]
 async fn decide_tick(
     _ctx: &resonate_sdk::prelude::Context,
     input: DecideInput,
 ) -> resonate_sdk::Result<Option<i64>> {
-    Ok(due_tick(
-        &input.cron,
-        input.last_fired,
-        input.now,
-        input.catchup,
-    ))
+    use crate::cron_core::{Catchup, next_future, select_fireable};
+    let candidates = decide_candidates(&input.cron, input.last_fired, input.now);
+    if candidates.is_empty() {
+        // Unparsable expression (all three schedule reads failed) — park
+        // exactly as before (the loop sleeps long, never spins).
+        return Ok(None);
+    }
+    let catchup = match input.catchup {
+        CronCatchup::Latest => Catchup::Latest,
+        CronCatchup::Skip => Catchup::Skip,
+    };
+    match select_fireable(catchup, Some(input.last_fired), input.now, &candidates) {
+        Some(tick) => Ok(Some(tick)),
+        // Nothing fireable: sleep target = earliest future tick (the loop
+        // sleeps to it, preserving decide→sleep→fire). Present whenever
+        // the schedule parses (see analysis on the bead).
+        None => Ok(next_future(Some(input.last_fired), input.now, &candidates)),
+    }
 }
 
 /// Input to the durable tick body ([`run_cron_tick`]).
@@ -688,6 +727,108 @@ mod tests {
         assert!(next_due("not a cron", 1_700_000_000).is_none());
     }
 
+    /// bd-j32w conformance: the kernel selection agrees with the legacy
+    /// `due_tick` schedule math across catch-up modes, gaps, and edges —
+    /// one implementation going forward, machine-checked here.
+    #[test]
+    fn kernel_selection_agrees_with_legacy_due_tick() {
+        use crate::cron_core::{Catchup, next_future, select_fireable};
+        use crate::schema::CronCatchup;
+        let schedules = [
+            "*/10 * * * *",   // every 10 minutes
+            "30 3 * * *",     // daily
+            "0 * * * *",      // hourly
+            "*/1 * * * * *",  // every second (6-field)
+            "not a schedule", // unparsable
+        ];
+        let base = 1_700_000_000i64;
+        let mut cases = 0usize;
+        for cron in schedules {
+            for last_fired in [base - 3600, base - 61, base - 1, base, base + 30] {
+                for now in [base, base + 1, base + 599, base + 3600] {
+                    for (legacy_catchup, kernel_catchup) in [
+                        (CronCatchup::Latest, Catchup::Latest),
+                        (CronCatchup::Skip, Catchup::Skip),
+                    ] {
+                        let legacy = due_tick(cron, last_fired, now, legacy_catchup);
+                        let candidates = decide_candidates(cron, last_fired, now);
+                        let kernel_fire =
+                            select_fireable(kernel_catchup, Some(last_fired), now, &candidates);
+                        let kernel_sleep = next_future(Some(last_fired), now, &candidates);
+                        // Full-decision agreement: the legacy Option carries
+                        // fire-or-sleep-target in one value; the kernel
+                        // splits them (Fire vs SleepUntil) and the durable
+                        // child recombines identically (fire wins).
+                        assert_eq!(
+                            kernel_fire.or(kernel_sleep),
+                            legacy,
+                            "kernel vs legacy decision: {cron} last={last_fired} now={now} {legacy_catchup:?}"
+                        );
+                        if kernel_catchup == Catchup::Skip {
+                            assert_eq!(
+                                kernel_fire, None,
+                                "skip fires nothing overdue: {cron} last={last_fired} now={now}"
+                            );
+                        }
+                        if legacy.is_none() && candidates.is_empty() {
+                            assert!(
+                                kernel_sleep.is_none(),
+                                "unparsable parks on both sides: {cron}"
+                            );
+                        }
+                        cases += 1;
+                    }
+                }
+            }
+        }
+        assert!(cases > 100, "battery covered: {cases} cases");
+    }
+
+    /// bd-j32w conformance: the kernel policy table agrees with the legacy
+    /// `cron_failure::evaluate` across the streak space.
+    #[test]
+    fn kernel_policy_table_agrees_with_legacy_evaluate() {
+        use crate::cron_core::{CronPolicyData, PolicyActionKind, select_policy_action};
+        use crate::cron_failure::evaluate as legacy_evaluate;
+        use crate::schema::{CronPolicy, FailureAction};
+        let legacy_policy = CronPolicy {
+            on_failure: FailureAction::Bead,
+            on_repeat_failure: FailureAction::Escalate,
+            repeat_threshold: 3,
+            on_success: FailureAction::Log,
+            max_retries: 2,
+            no_claim_timeout: 600,
+        };
+        let kernel_policy = CronPolicyData {
+            on_failure: PolicyActionKind::Bead,
+            on_repeat_failure: PolicyActionKind::Escalate,
+            repeat_threshold: 3,
+            on_success: PolicyActionKind::Log,
+        };
+        for consecutive in 0..6u32 {
+            for failed in [false, true] {
+                let (legacy_action, legacy_next) =
+                    legacy_evaluate(&legacy_policy, failed, consecutive);
+                let (kernel_action, kernel_next) =
+                    select_policy_action(&kernel_policy, failed, consecutive);
+                let map = |a: PolicyActionKind| match a {
+                    PolicyActionKind::Log => FailureAction::Log,
+                    PolicyActionKind::Bead => FailureAction::Bead,
+                    PolicyActionKind::Escalate => FailureAction::Escalate,
+                };
+                assert_eq!(
+                    map(kernel_action),
+                    legacy_action,
+                    "policy agree: failed={failed} streak={consecutive}"
+                );
+                assert_eq!(
+                    kernel_next, legacy_next,
+                    "streak agree: failed={failed} streak={consecutive}"
+                );
+            }
+        }
+    }
+
     /// `latest` catch-up: after downtime skipping several ticks, the loop
     /// fires ONLY the most-recent due tick — never a burst of every missed.
     #[test]
@@ -897,19 +1038,17 @@ mod tests {
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
-        let afx: crate::engine::AsyncEffectRunner = std::sync::Arc::new(
-            |inv: &crate::engine::ActionInvocation| {
+        let afx: crate::engine::AsyncEffectRunner =
+            std::sync::Arc::new(|inv: &crate::engine::ActionInvocation| {
                 let value = serde_json::json!({ "ran": inv.action.type_name() });
                 Box::pin(async move { Ok(value) })
                     as std::pin::Pin<
                         Box<
-                            dyn std::future::Future<
-                                Output = anyhow::Result<serde_json::Value>,
-                            > + Send,
+                            dyn std::future::Future<Output = anyhow::Result<serde_json::Value>>
+                                + Send,
                         >,
                     >
-            },
-        );
+            });
         let workflow_resolver: crate::engine::WorkflowResolver = Arc::new(|name: &str| {
             let yaml =
                 format!("name: {name}\nsteps:\n  - action: send_dm\n    to: t\n    body: ok\n");
@@ -960,19 +1099,18 @@ mod tests {
             Vec::new()
         });
         let engine = std::sync::Arc::new(
-            crate::engine::WorkflowEngine::local_with_async_effect_runner(Some(std::sync::Arc::new(
-                |inv: &crate::engine::ActionInvocation| {
+            crate::engine::WorkflowEngine::local_with_async_effect_runner(Some(
+                std::sync::Arc::new(|inv: &crate::engine::ActionInvocation| {
                     let value = serde_json::json!({ "ran": inv.action.type_name() });
                     Box::pin(async move { Ok(value) })
                         as std::pin::Pin<
                             Box<
-                                dyn std::future::Future<
-                                    Output = anyhow::Result<serde_json::Value>,
-                                > + Send,
+                                dyn std::future::Future<Output = anyhow::Result<serde_json::Value>>
+                                    + Send,
                             >,
                         >
-                },
-            )))
+                }),
+            ))
             .expect("local engine"),
         );
         let manager = CronManager::new(engine, registry).expect("manager");

@@ -17,6 +17,7 @@
 pub mod channels;
 pub mod coalesce;
 pub mod cron;
+pub mod cron_core;
 pub mod cron_failure;
 pub mod dispatch;
 pub mod engine;
