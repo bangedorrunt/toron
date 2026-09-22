@@ -15,22 +15,22 @@ never the reverse. The committed catalog (`docs/catalog/toron-mcp.json`) is the
 One `toron` binary (daemon + MCP + robot CLI). Workflows run on Resonate
 through `toron-workflow`. Peer mail never goes through flywheel.
 
-Orchestration door is flywheel (ADR-0011): `flywheel arrive` then
+Orchestration door is flywheel: `flywheel arrive` then
 `flywheel briefing --json`, then run argv. Do not invent a second selector.
 
 ## STRUCTURE
 
 ```
 toron/
-├── crates/toron-core/       # mailbox, bus, nostr, archive, index
-├── crates/toron-workflow/   # YAML engine, cron, spawn/dispatch
-├── crates/toron-mcp/        # rmcp server (stdio + HTTP /mcp)
-├── crates/toron-cli/        # bin `toron`
-├── crates/toron-e2e/        # SC-* scenarios (feature-gated)
-├── docs/decisions/          # ADRs (read before structural change)
-├── docs/catalog/            # generated surface catalog (toron.dev ADR-0002 D3)
-├── workflows/               # product YAML (not GitHub Actions)
-└── scripts/verify-gates.sh  # ADR-0003 CI policy
+├── crates/toron-core/ # mailbox, bus, nostr, archive, index
+├── crates/toron-workflow/ # YAML engine, cron, spawn/dispatch
+├── crates/toron-mcp/ # rmcp server (stdio + HTTP /mcp)
+├── crates/toron-cli/ # bin `toron`
+├── crates/toron-e2e/ # SC-* scenarios (feature-gated)
+├── docs/decisions/ # ADRs (read before structural change)
+├── docs/catalog/ # generated surface catalog (toron.dev)
+├── workflows/ # product YAML (not GitHub Actions)
+└── scripts/verify-gates.sh # CI policy
 ```
 
 Child maps: [toron-core](crates/toron-core/AGENTS.md) ·
@@ -41,19 +41,19 @@ Child maps: [toron-core](crates/toron-core/AGENTS.md) ·
 
 | Task | Location |
 |------|----------|
-| Mail send/inbox/ack | `crates/toron-core/src/mailbox/` (`MailSurface`, `MessageId`) — `mail send` now carries `--corr/--wake/--priority/--audience/--result-path/--verdict` via `extra_tags` (ADR-0027 E2; `--verdict approve|deny` is ADR-0028 E4, kfo6) |
-| Channels / jobs / presence (ADR-0020) | `crates/toron-workflow/src/{channels,jobs}.rs`, `crates/toron-core/src/nostr/presence.rs`, CLI `toron channel\|job\|react\|presence\|watch` |
+| Mail send/inbox/ack | `crates/toron-core/src/mailbox/` (`MailSurface`, `MessageId`) — `mail send` now carries `--corr/--wake/--priority/--audience/--result-path/--verdict` via `extra_tags` (`--verdict approve|deny` closes one human decision) |
+| Channels / jobs / presence | `crates/toron-workflow/src/{channels,jobs}.rs`, `crates/toron-core/src/nostr/presence.rs`, CLI `toron channel\|job\|react\|presence\|watch` |
 | File reservations / lease board | `crates/toron-core/src/mailbox/reservations.rs` (`list_file_reservations` is the one board filter both surfaces call); CLI `toron reserve acquire\|conflicts\|list\|renew\|release\|release-by-reason\|force-release\|request-release\|respond\|transfer`. `reserve list` shows the state the strict guard evaluates; `reserve release-by-reason <bead>` is the CLI door for release-on-bead-close (MCP `release_file_reservations_by_reason`, operator-signed) |
-| Wait / receipts / roles (ADR-0027) | `crates/toron-core/src/mailbox/{receipts.rs,send_tags.rs,identity.rs}`, CLI `toron wait --corr` (E9), `toron watch --live` (E7), `toron receipt get\|list\|set` (E2: `get/list` read, `set --state resulted` explicit verb), `toron role pin\|list\|clear` (E4), `toron ack-sla --project` (ack-SLA scan+publish, CLI-only) |
+| Wait / receipts / roles | `crates/toron-core/src/mailbox/{receipts.rs,send_tags.rs,identity.rs}`, CLI `toron wait --corr`, `toron watch --live`, `toron receipt get\|list\|set` (`get/list` read, `set --state resulted` explicit verb), `toron role pin\|list\|clear`, `toron ack-sla --project` (ack-SLA scan+publish, CLI-only) |
 | Gift-wrap / kinds | `crates/toron-core/src/nostr/` |
 | Bus / federation | `crates/toron-core/src/bus/` |
 | Git archive | `crates/toron-core/src/archive/git.rs` |
-| Workflow YAML / engine | `crates/toron-workflow/src/{schema,engine}/` — authoring/operator guide: `docs/guides/workflow-engine.mdx`. Governing record is ADR-0032 (**Accepted**): mailbox receipts stay mailbox receipts; the workflow-effect journal ships (toron-core migration `0010`, `EffectJournalMode`, `RunJournal` run lifecycle) |
-| Workflow honesty (bd-i6kc, bd-o1hl) | `crates/toron-workflow/src/engine/boundary.rs` (exhaustive partition: `react`/`call_webhook` fail closed), `crates/toron-mcp/src/workflow_host.rs` (compat runner), `crates/toron-workflow/src/engine/control_flow.rs` (guard/retry/graph/composite parity) |
-| Cron (distinct type) | `crates/toron-workflow/src/cron.rs`  |
+| Workflow YAML / engine | `crates/toron-workflow/src/{schema,engine}/` — authoring/operator guide: `docs/guides/workflow-engine.mdx`. Mailbox receipts stay mailbox receipts. The workflow-effect journal ships (toron-core migration `0010`, `EffectJournalMode`, `RunJournal` run lifecycle) |
+| Workflow honesty | `crates/toron-workflow/src/engine/boundary.rs` (exhaustive partition: `react`/`call_webhook` fail closed), `crates/toron-mcp/src/workflow_host.rs` (compat runner), `crates/toron-workflow/src/engine/control_flow.rs` (guard/retry/graph/composite parity) |
+| Cron (distinct type) | `crates/toron-workflow/src/cron.rs` |
 | MCP tools | `crates/toron-mcp/src/tools/` |
 | Catalog surface | `crates/toron-mcp/src/catalog.rs` + `crates/toron-cli/src/catalog.rs` (`docs/catalog/`) |
-| CLI / daemon | `crates/toron-cli/src/{cli,daemon,main}.rs` (`agent bootstrap`: register/upsert + reserve in one call; `agent prune`: absorb the folded-slug leftovers `doctor` names, bd-4a0u) |
+| CLI / daemon | `crates/toron-cli/src/{cli,daemon,main}.rs` (`agent bootstrap`: register/upsert + reserve in one call; `agent prune`: absorb the folded-slug leftovers `doctor` names) |
 | ADRs | `docs/decisions/` |
 
 ## CONVENTIONS
@@ -61,40 +61,59 @@ Child maps: [toron-core](crates/toron-core/AGENTS.md) ·
 - Edition 2024. `#![forbid(unsafe_code)]` on every crate root.
 - New/changed ADR-constrained files: `// governed-by: ADR-XXXX` at top.
 - Deps one-way: **flywheel → toron-workflow → toron-core**. Never reverse.
-- Frozen: 40 tool names (38 AM-Rust parity + 2 toron additive: `release_file_reservations_by_reason` bd-h3oj, `list_file_reservations` bd-locks-list-daemon-xetz), 25 resources, kind registry. No new kinds/tools without an ADR.
-- Additive discipline (ADR-0033, proposed, bd-ncpt): additive tools/kinds allowed with ADR + catalog regen + tests + versioning; renumber and parity drift stay forbidden. 
-- ADR-0020 adds **CLI** nouns `channel` `job` `react` `presence` `watch`. Channel posts emit kind **9** (not 42). ADR-0023: channel create/close emit **39000**, join/leave emit **39002**; 40/41/42 ingest only.
+- Frozen: 40 tool names (38 AM-Rust parity + 2 toron additive: `release_file_reservations_by_reason`, `list_file_reservations`), 25 resources, kind registry. No new kinds/tools without an ADR.
+- Additive discipline (proposed): additive tools/kinds allowed with ADR + catalog regen + tests + versioning; renumber and parity drift stay forbidden. 
+- CLI nouns: `channel` `job` `react` `presence` `watch`. Channel posts emit kind **9** (not 42). Channel create/close emit **39000**, join/leave emit **39002**; 40/41/42 ingest only.
 - Lease board + release-on-bead-close are CLI-reachable: `toron reserve list --project <p> [--holder <pin> --path <glob>]` and `toron reserve release-by-reason <bead> --project <p> --as <operator>`. No new MCP tool — both wrap existing operators (`list_file_reservations` / `release_file_reservations_by_reason`); `release-by-reason` is operator-signed and fails loud without an operator key.
-- Folded-slug cleanup is CLI-reachable: `toron agent prune --project <p> [--as <pin>]` (preview with the global `-n/--dry-run`) absorbs the `legacy_slug_identities` leftovers `doctor` names — the standalone `agents` row goes away once the canonical pin is registered; a row whose target is unregistered is KEPT and reported (bd-4a0u). No new MCP tool: CLI-only noun (daemon arm sweeps the shared durable root directly, like `ack-sla`).
+- Folded-slug cleanup is CLI-reachable: `toron agent prune --project <p> [--as <pin>]` (preview with the global `-n/--dry-run`) absorbs the `legacy_slug_identities` leftovers `doctor` names — the standalone `agents` row goes away once the canonical pin is registered; a row whose target is unregistered is KEPT and reported. No new MCP tool: CLI-only noun (daemon arm sweeps the shared durable root directly, like `ack-sla`).
 - rust-nostr **0.45**: `nostr-sdk` 0.45.2 + `nostr` 0.45.3 (`nip44`/`nip49`/`nip59`/`os-rng`). Protocol types via `crate::nostr` / `nostr::prelude`. Sign with `FinalizeEvent::finalize`. `gift_wrap` is sync (`GiftWrapBuilder`).
-- Catalog: `toron catalog --json` regenerates `docs/catalog/toron-mcp.json`; `mbx test catalog_freshness` fails red on surface drift without regen (toron.dev ADR-0002 D3).
-- Flag vocabulary (bd-flag-vocab-conformance-0hyv): the acting agent is ALWAYS `--as` (`--from`/`--agent` banned, gated by `mbx test -p toron-cli --bin toron flag_conformance`); every project-scoped subcommand REQUIRES `--project`. Channel lifecycle, verify-after-send (`--wait-ack`), delivery visibility (`read --author`), and the inbox cursor (`--since last`, migration 0007) are toron-skill surface; this repo owns their CLI parsing and bus behavior.
-- ADR-0027 one-workspace tick (accepted 2026-09-01): tag vocabulary rides `extra_tags`, receipts live in `receipts` sqlite, `wait --corr` is subscribe-until-receipt, `role pin/list/clear` binds via 30013 tags. CLI-only nouns per the Skill Sync Contract below; `catalog_freshness` stays green. Semantics live in the toron skill; this repo owns `crates/toron-core/src/mailbox/{receipts.rs,send_tags.rs,identity.rs}`.
+- Catalog: `toron catalog --json` regenerates `docs/catalog/toron-mcp.json`; `mbx test catalog_freshness` fails red on surface drift without regen (toron.dev).
+- Flag vocabulary: the acting agent is ALWAYS `--as` (`--from`/`--agent` banned, gated by `mbx test -p toron-cli --bin toron flag_conformance`); every project-scoped subcommand REQUIRES `--project`. Channel lifecycle, verify-after-send (`--wait-ack`), delivery visibility (`read --author`), and the inbox cursor (`--since last`, migration 0007) are toron-skill surface; this repo owns their CLI parsing and bus behavior.
+- One-workspace tick (accepted 2026-09-01): tag vocabulary rides `extra_tags`, receipts live in `receipts` sqlite, `wait --corr` is subscribe-until-receipt, `role pin/list/clear` binds via 30013 tags. CLI-only nouns per the Skill Sync Contract below; `catalog_freshness` stays green. Semantics live in the toron skill; this repo owns `crates/toron-core/src/mailbox/{receipts.rs,send_tags.rs,identity.rs}`.
 - Flywheel Tick Law (live): doorbell dispatcher and `swarm_loop` call `workspace::tick`; slice reducers stay private. Kind-9 is the ring; assignment enters from rumor 14 / FetchInbox→InboxRows.
-- ADR-0028 E3 corr authority (accepted 2026-09-03): sender mints non-empty `corr` (`SendTags::parse` rejects empty; `Corr` vs `ThreadId` newtypes, `thread_id` is never `corr` — conflation fails loud in `send_message`); toron sqlite owns `owed→acked→resulted` (monotonic upsert: never downgrades `resulted`, never drags `acked` to `owed`; `owed` on send, `owed→acked` in `send_receipt` idempotent, `resulted` only via explicit `receipt set`).
+- Corr authority (accepted 2026-09-03): sender mints non-empty `corr` (`SendTags::parse` rejects empty; `Corr` vs `ThreadId` newtypes, `thread_id` is never `corr` — conflation fails loud in `send_message`); toron sqlite owns `owed→acked→resulted` (monotonic upsert: never downgrades `resulted`, never drags `acked` to `owed`; `owed` on send, `owed→acked` in `send_receipt` idempotent, `resulted` only via explicit `receipt set`).
 - `MessageId` is String/hex. Never `u64` in shared request/response types.
-- Pane mail-identity stamp (bd-6f57/bd-0sbf): `agent bootstrap` writes the pin
+- Pane mail-identity stamp: `agent bootstrap` writes the pin
   onto the pane via display-only `pane.report_metadata` (`toron:mail-identity`
   source, `toron_pin`/`toron_project`/`toron_npub` tokens) — never
   `pane.report_agent` (that steals lifecycle authority). Resolve/cleanup read
   tokens first, `agent.list` names second; liveness always from live
   `pane.list`, never cached. `whois`/`list_agents` carry the resolved live
-  pane as additive optionals `pane_id`/`workspace_id`/`tab_id` (bd-u4e2;
-  `None` when no herdr backend is reachable — advisory, never a routing gate).
+  pane as additive optionals `pane_id`/`workspace_id`/`tab_id` (`None` when no herdr backend is reachable, advisory, never a routing gate).
 - `t` tag = project slug only. Never harness/model/job tags.
 - TDD for new features and bug fixes. No benches in this repo.
 - Beads: bare `br` is the TUI (ratatui, since 2026-08-24) — humans run `br`, agents run `br --robot-*` with `--format json|toon` (never bare `br` in automation); `bv` is deprecated.
 - TUI theme (hacker-night, tui-design skill): single source is `toron-cli/src/theme.rs` (`HackerNight`); widget code uses semantic slots only, never hex/ANSI. `toron tui` lives in `crates/toron-cli/src/tui.rs`. Skill §-level layout/interaction rules live in the tui-design skill; sibling palettes mirror in `flywheel/src/output.rs` and `beads/src/tui/theme.rs`.
-- Engineering principles (ADR-0019 Spec 5/6): `flywheel principles list`. Cite the name that changed the decision. Full leaves: `flywheel principles show <name>`.
-- Wave-2 playbook lints (ADR-0019): `crates/toron-workflow/src/playbook_lint.rs` — feature requires `data_shape` input, bug-fix requires `repro` predecessor, prototype/arena require `n>=2` + mode rules (`build_slot: true` for compile, no repo build paths for sketch), forensics is read-only, `principles:` names validate against the 21-name registry. Entrypoints: `lint_workflow_with_principles(wf, &[&str])` (embedding passes the registry), `lint_workflow(wf)` (in-crate default).
+- Engineering principles: `flywheel principles list`. Cite the name that changed the decision. Full leaves: `flywheel principles show <name>`.
+- Wave-2 playbook lints: `crates/toron-workflow/src/playbook_lint.rs` — feature requires `data_shape` input, bug-fix requires `repro` predecessor, prototype/arena require `n>=2` + mode rules (`build_slot: true` for compile, no repo build paths for sketch), forensics is read-only, `principles:` names validate against the 21-name registry. Entrypoints: `lint_workflow_with_principles(wf, &[&str])` (embedding passes the registry), `lint_workflow(wf)` (in-crate default).
 - `std::env::set_var` only in integration tests that omit `forbid(unsafe_code)`.
-- RUST PRACTICES (distilled 2026-09-10, ADR-0031 accepted 2026-09-10): decision cores are pure — one Model, one Msg union, `tick(&Model, &Msg) -> (Model, Vec<Effect>)`, no I/O across the API, wall-clock enters only as Msg payloads, effects are journaled before execution. Guards are named pure predicates, never inline boolean soup; actions carry data, never closures; platform code lives in `platform/<os>.rs`, never `#[cfg(target_os)]` in core. Full checklist (multiplicative paths, frozen contracts, vendored-dep ledger, test constructors, VERIFY honesty) lives in the cited ADRs and applies to new decision-core code.
+- Decision cores stay pure. The binding for new code and tests is the Effect law section below.
+
+## Effect law for code and tests
+
+Before writing or testing a decision core, journal, retry, timeout, breaker, receipt transition, or judgment call, read `~/.agents/skills/effect-oriented/SKILL.md`. That skill is the binding. Journal a live effect before the provider runs.
+
+A core is `tick(&Model, &Msg) -> (Model, Vec<Effect>)`. The file does not read the clock, the environment, or the network. The host runs the effects and feeds results back as messages. Guards are named predicates. Actions carry data. Platform code lives in `platform/<os>.rs`.
+
+A change is unfinished until:
+
+- A determinism test shows one message log produces the same model and the same effects.
+- An interpreter test uses a fake and covers success, typed failure, hang, and cancellation. It does not sleep real time or dial the network.
+- A live effect is journaled before the provider runs. `Recording` is only for a dry arm. A live effect with no runner refuses.
+- Retry wraps one idempotent effect. Fallback stays outside the retry. The breaker stays inside the retry. The attempt timeout wraps only the call.
+
+A change that touches one of these functions closes that defect instead of copying it:
+
+- `dispatch_core` `Release` decrements `used` even when that assignee is not in flight. Decrement only a slot that was held.
+- A receipt prune is a tombstone. `upsert` must see it, in the same transaction as the write, or a later owed-on-send recreates the corr.
+- `ask_judgment` runs the external call and journals afterward. Journal the attempt first. Ticking a fresh `JudgeModel` on every wake does not make the in-flight guard real.
+- `send_armor` half-open admits every caller that arrives after the state flips. One probe, then the rest stay refused until that probe settles.
 
 ## Skill Sync Contract
 
 When you add/remove/rename a CLI command or MCP tool, update ALL of:
 1. The `Command` enum (`crates/toron-cli/src/cli.rs`) — ground truth (compiles).
-2. The tool `#[tool(name = "...")]` in `crates/toron-mcp/src/tools/` — MCP surface (ADR-0020 wave 1: **no new tools**; CLI-only nouns still need steps 1, 3, 4).
+2. The tool `#[tool(name = "...")]` in `crates/toron-mcp/src/tools/` — MCP surface (wave 1: **no new tools**; CLI-only nouns still need steps 1, 3, 4).
 3. This AGENTS.md (STRUCTURE + CONVENTIONS sections).
 4. The skill: `~/.agents/skills/toron/SKILL.md` CLI Surface + Mail tool REQUIRED args + [crew-steering](references/crew-steering.md) — single canonical copy; grok and other harnesses read the same file (grok natively scans `~/.agents/skills/`, no mirror).
 5. The tool-count constant (AGENTS.md header + SKILL.md frontmatter): 40 (38 parity + 2 additive). Only changes when an MCP tool actually changes.
@@ -121,14 +140,14 @@ Rust runs through mbx (cargo cache): prefix every cargo invocation with `mbx` (b
 ```bash
 bash scripts/verify-gates.sh
 mbx test --workspace
-mbx test catalog_freshness                   # catalog drift gate (toron.dev ADR-0002 D3)
-toron catalog --json                         # emit 38-parity-tool catalog (40 served incl. additive) / 25-resource / CLI catalog
-mbx test -p toron-e2e --features p1          # SC-1..8
-mbx test -p toron-e2e --features p2          # needs resonate on PATH
-mbx test -p toron-e2e --features p4          # SC-18..25 (implies p5)
+mbx test catalog_freshness # catalog drift gate (toron.dev)
+toron catalog --json # emit 38-parity-tool catalog (40 served incl. additive) / 25-resource / CLI catalog
+mbx test -p toron-e2e --features p1 # SC-1..8
+mbx test -p toron-e2e --features p2 # needs resonate on PATH
+mbx test -p toron-e2e --features p4 # SC-18..25 (implies p5)
 mbx clippy --workspace --all-targets -- -D warnings
 mbx fmt --check
-mbx test --workspace --all-features          # honest full matrix; CI build does not
+mbx test --workspace --all-features # honest full matrix; CI build does not
 ```
 
 `mbx test --exclude-ignored` is invalid. Ignored tests: `-- --ignored`.
@@ -137,10 +156,10 @@ Release profile: `strip = "none"` (macOS arm64 LINKEDIT / sqlx_macros).
 
 ## NOTES
 
-- Captain alias (bd-captain-alias-0g8a, bd-auqj): `captain` is a routable fold onto
+- Captain alias: `captain` is a routable fold onto
   the project's REGISTERED orchestrator pin — set via
   `toron contact captain --project <slug> --pin <adj+noun>`, cleared via
-  `toron contact captain --project <slug> --clear` (bd-auqj, parent death),
+  `toron contact captain --project <slug> --clear` (parent death),
   resolved by `toron mail whois <slug> captain` and `mail send --to captain`. Standing
   orders address reports to `captain`, never to the host username.
 - `toron serve` requires `--mcp-stdio` or `--mcp-http`. No-flag serve bails.
@@ -153,7 +172,7 @@ Release profile: `strip = "none"` (macOS arm64 LINKEDIT / sqlx_macros).
   poll-fail once wrote 1.3 GB.
 - `mbx test --workspace` compiles e2e and runs 0 p1/p2 tests (feature
   gates). sc16–sc24 currently run un-gated.
-- Root `tests/` and `examples/agent_ping_pong.rs` are ADR-0001 leftovers —
+- Root `tests/` and `examples/agent_ping_pong.rs` are leftovers —
   not workspace members.
 - Sibling orchestrator: `../flywheel` (herdr). Map: `../flywheel/AGENTS.md`.
 - herdr backend client surface (pane primitives, agent_read source semantics,

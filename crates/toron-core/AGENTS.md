@@ -20,9 +20,11 @@ Mailbox fabric: signed events on a `Bus`, projected to SQLite + Git archive.
 | Projection / FTS | `src/index/` |
 | Keys (ncryptsec) | `src/keys/` |
 
+Effect law for every core and its tests is the root `AGENTS.md` section of that name. Load `~/.agents/skills/effect-oriented/SKILL.md` before editing `dispatch_core`, receipts, or judgment.
+
 ## CONVENTIONS
 
-- `Mailbox` is the concrete type; `MailSurface` is the embedder trait (ADR-0007).
+- `Mailbox` is the concrete type; `MailSurface` is the embedder trait.
 - One dedicated SQLite write connection. WAL. i64-µs timestamps.
 - Gift wraps: no project tags. Timeline orders by rumor time, not wrap time.
   Unwrap verifies the envelope Schnorr sig before NIP-44 decrypt. `gift_wrap`
