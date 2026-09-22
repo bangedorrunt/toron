@@ -38,6 +38,8 @@ This directory contains records of the major architectural decisions made for th
 | [0032](0032-workflow-engine-honesty-jido-contracts.md) | Workflow-Engine Honesty Gate and Jido Action Contracts — Per-Step Turn Receipts, Closed-Enum Schema Tables, Catalog-Driven Decide | **Proposed** (2026-09-11, rev 2 review pass 2026-09-12; wave-1 beads `bd-i6kc` toron + `bd-himk`/`bd-40d1` flywheel, wave-2 `bd-htoo`/`bd-3pti` toron; extends ADR-0024/0026/0028) |
 | [0033](0033-additive-tools-kinds-discipline.md) | Additive MCP Tools and Kinds — Replacement Discipline for the Frozen Surface | **Proposed** (2026-09-19, bead bd-ncpt; amends ADR-0003 freeze clause + ADR-0032 count lock: additive tools/kinds with ADR + catalog regen + tests + versioning; renumber/parity drift still forbidden) |
 
+Flywheel [ADR-0017](../../../flywheel/docs/decisions/0017-shared-foldcore-crate.md) (proposed 2026-09-22) places a zero-dependency `foldcore` crate in this repo at `crates/foldcore`. It is not created yet. Toron-core may depend on it. Flywheel must not become a dependency of this repo.
+
 ## Parity catalogs
 
 | Catalog | Scope |

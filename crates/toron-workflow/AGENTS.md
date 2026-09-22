@@ -10,11 +10,13 @@ Resonate-backed YAML engine. Schema + lint + durable run. Never imports flywheel
 | Engine + DI | `src/engine/mod.rs` (`ActionRunner`, `ProfileResolver`, `WorkflowResolver`) |
 | `spawn` / graph | `src/engine/control_flow.rs` (`run_spawn`) |
 | Lint | `src/lint.rs` |
-| Cron manager | `src/cron.rs` (ADR-0012 — distinct type, not `trigger: schedule`) |
+| Cron manager | `src/cron.rs` (— distinct type, not `trigger: schedule`) |
 | Cron failure policy | `src/cron_failure.rs` |
 | Job kinds 43001–43006 | `src/jobs.rs` |
 | @mention coalesce | `src/coalesce.rs` |
 | Trigger filter | `src/trigger_filter.rs` (skip workflow-emitted loops) |
+
+Effect law for the engine, journal mode, retry, and their tests is the root `AGENTS.md` section of that name. Load `~/.agents/skills/effect-oriented/SKILL.md` before editing those paths. `Enforced` refuses a live effect with no runner. `Recording` is a dry arm.
 
 ## CONVENTIONS
 
@@ -37,4 +39,4 @@ Resonate-backed YAML engine. Schema + lint + durable run. Never imports flywheel
 - Treating `default_resolver` as a bug — it is the DI fail-closed.
 - Silent `call_workflow` success when `WorkflowResolver` is None.
 - Workflow-emitted kind-14 re-entering the trigger path.
-- Changing `triage.yaml` without keeping ADR-0004 suite green.
+- Changing `triage.yaml` without keeping suite green.
