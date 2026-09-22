@@ -28,6 +28,7 @@
 //! spelling of the path and no generic-resolution fragility.
 
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -45,8 +46,7 @@ pub struct SendRequest {
 }
 
 /// Boxed send future (bounded by the armor, never by the caller).
-pub type SendFuture =
-    Pin<Box<dyn std::future::Future<Output = Result<usize, String>> + Send>>;
+pub type SendFuture = Pin<Box<dyn std::future::Future<Output = Result<usize, String>> + Send>>;
 
 /// Armor failure: every variant maps onto a journal outcome without
 /// inventing success.
@@ -76,21 +76,25 @@ pub const BREAKER_THRESHOLD: u32 = 5;
 pub const BREAKER_RESET_AFTER: Duration = Duration::from_secs(30);
 
 /// Breaker state: closed (flowing), open (failing fast until a deadline),
-/// half-open (exactly one probe in flight).
+/// half-open (exactly one probe in flight — the `probe_in_flight` permit,
+/// taken by `call`, refused to every other caller until it settles).
 #[derive(Debug)]
 enum BreakerState {
     Closed { consecutive_failures: u32 },
     Open { retry_at: tokio::time::Instant },
-    HalfOpen,
+    HalfOpen { probe_in_flight: bool },
 }
+
+/// Breaker clock: production is wall time, tests inject a manual clock
+/// (bd-i7ld — no `tokio::time::Instant::now()` in the decision logic,
+/// so recovery is deterministic with no real sleeps).
+pub type ClockFn = Arc<dyn Fn() -> tokio::time::Instant + Send + Sync>;
 
 /// The boxed inner send service: any send closure adapter.
 type BoxSend = tower::util::BoxCloneService<SendRequest, Result<usize, String>, ArmorError>;
 
 /// Adapt a send closure into the boxed service shape.
-pub fn box_send(
-    f: impl Fn(SendRequest) -> SendFuture + Send + Sync + Clone + 'static,
-) -> BoxSend {
+pub fn box_send(f: impl Fn(SendRequest) -> SendFuture + Send + Sync + Clone + 'static) -> BoxSend {
     tower::util::BoxCloneService::new(tower::service_fn(move |req: SendRequest| {
         let f = f.clone();
         async move { Ok::<_, ArmorError>((f)(req).await) }
@@ -118,19 +122,67 @@ pub fn passthrough() -> BoxSend {
 /// passes, when exactly one probe goes through (success closes, failure
 /// re-opens). Success resets the consecutive count. The lock guards only
 /// the transition, never across an `.await`.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct CircuitBreaker {
     inner: tower::limit::ConcurrencyLimit<tower::timeout::Timeout<BoxSend>>,
     state: Arc<Mutex<BreakerState>>,
     threshold: u32,
     reset_after: Duration,
+    clock: ClockFn,
+}
+
+impl std::fmt::Debug for CircuitBreaker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CircuitBreaker")
+            .field(
+                "state",
+                &self.state.lock().unwrap_or_else(PoisonError::into_inner),
+            )
+            .field("threshold", &self.threshold)
+            .field("reset_after", &self.reset_after)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Releases a HalfOpen probe permit when the probe future is dropped
+/// before settling: caller cancellation must not wedge the breaker shut.
+/// Completed probes mark `done` before `observe`, so the guard no-ops.
+struct ProbeGuard {
+    state: Arc<Mutex<BreakerState>>,
+    probe: bool,
+    done: Arc<AtomicBool>,
+}
+
+impl Drop for ProbeGuard {
+    fn drop(&mut self) {
+        if !self.probe || self.done.load(Ordering::SeqCst) {
+            return;
+        }
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if matches!(
+            *state,
+            BreakerState::HalfOpen {
+                probe_in_flight: true
+            }
+        ) {
+            *state = BreakerState::HalfOpen {
+                probe_in_flight: false,
+            };
+        }
+    }
 }
 
 impl CircuitBreaker {
     /// New breaker over an inner send service (starts closed, production
     /// tuning from the named constants).
     pub fn new(inner: BoxSend, timeout: Duration, max_concurrency: usize) -> Self {
-        Self::with_tuning(inner, timeout, max_concurrency, BREAKER_THRESHOLD, BREAKER_RESET_AFTER)
+        Self::with_tuning(
+            inner,
+            timeout,
+            max_concurrency,
+            BREAKER_THRESHOLD,
+            BREAKER_RESET_AFTER,
+        )
     }
 
     /// Test/edge tuning: custom storm threshold and reset interval.
@@ -151,34 +203,55 @@ impl CircuitBreaker {
             })),
             threshold,
             reset_after,
+            clock: Arc::new(tokio::time::Instant::now),
         }
     }
 
-    /// Observe one completed inner call.
+    /// Swap the breaker clock (tests inject a manual clock; production
+    /// keeps the default wall time from `with_tuning`).
+    pub fn with_clock(mut self, clock: ClockFn) -> Self {
+        self.clock = clock;
+        self
+    }
+
+    /// Observe one completed inner call. The clock is injected: `Open`
+    /// deadlines and `HalfOpen` re-opens read `(self.clock)()`, never
+    /// wall time directly (bd-i7ld).
     fn observe(&self, failed: bool) {
         let threshold = self.threshold;
         let reset_after = self.reset_after;
+        let now = (self.clock)();
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         match (&mut *state, failed) {
-            (BreakerState::Closed { consecutive_failures }, true) => {
+            (
+                BreakerState::Closed {
+                    consecutive_failures,
+                },
+                true,
+            ) => {
                 *consecutive_failures += 1;
                 if *consecutive_failures >= threshold {
                     *state = BreakerState::Open {
-                        retry_at: tokio::time::Instant::now() + reset_after,
+                        retry_at: now + reset_after,
                     };
                 }
             }
-            (BreakerState::Closed { consecutive_failures }, false) => {
+            (
+                BreakerState::Closed {
+                    consecutive_failures,
+                },
+                false,
+            ) => {
                 *consecutive_failures = 0;
             }
-            (BreakerState::HalfOpen, false) => {
+            (BreakerState::HalfOpen { .. }, false) => {
                 *state = BreakerState::Closed {
                     consecutive_failures: 0,
                 };
             }
-            (BreakerState::HalfOpen, true) => {
+            (BreakerState::HalfOpen { .. }, true) => {
                 *state = BreakerState::Open {
-                    retry_at: tokio::time::Instant::now() + reset_after,
+                    retry_at: now + reset_after,
                 };
             }
             (BreakerState::Open { .. }, _) => {}
@@ -189,18 +262,34 @@ impl CircuitBreaker {
 impl Service<SendRequest> for CircuitBreaker {
     type Response = Result<usize, String>;
     type Error = ArmorError;
-    type Future =
-        Pin<Box<dyn std::future::Future<Output = Result<Result<usize, String>, ArmorError>> + Send>>;
+    type Future = Pin<
+        Box<dyn std::future::Future<Output = Result<Result<usize, String>, ArmorError>> + Send>,
+    >;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         {
             let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
             if let BreakerState::Open { retry_at } = *state {
-                if tokio::time::Instant::now() >= retry_at {
-                    *state = BreakerState::HalfOpen;
+                if (self.clock)() >= retry_at {
+                    // Time opens the gate; the probe permit is taken in
+                    // `call`, so exactly one probe is admitted (bd-i7ld).
+                    *state = BreakerState::HalfOpen {
+                        probe_in_flight: false,
+                    };
                 } else {
                     return Poll::Ready(Err(ArmorError::BreakerOpen));
                 }
+            }
+            // Fast refusal: a probe is already in flight — never queue
+            // a second one behind it. (`call` re-checks for the race
+            // where two tasks both passed readiness first.)
+            if matches!(
+                *state,
+                BreakerState::HalfOpen {
+                    probe_in_flight: true
+                }
+            ) {
+                return Poll::Ready(Err(ArmorError::BreakerOpen));
             }
         }
         // The guarded stack's own backpressure applies below the breaker;
@@ -211,6 +300,32 @@ impl Service<SendRequest> for CircuitBreaker {
     }
 
     fn call(&mut self, req: SendRequest) -> Self::Future {
+        // The permit lives here, one atomic take under the lock (bd-i7ld):
+        // the shared state may have moved since `poll_ready` (an older
+        // in-flight call settling re-opens), so re-check. A taken permit
+        // or an Open breaker refuses WITHOUT touching inner.
+        let probe = {
+            let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            match *state {
+                BreakerState::Open { .. } => {
+                    return Box::pin(async { Err(ArmorError::BreakerOpen) });
+                }
+                BreakerState::HalfOpen {
+                    probe_in_flight: true,
+                } => {
+                    return Box::pin(async { Err(ArmorError::BreakerOpen) });
+                }
+                BreakerState::HalfOpen {
+                    probe_in_flight: false,
+                } => {
+                    *state = BreakerState::HalfOpen {
+                        probe_in_flight: true,
+                    };
+                    true
+                }
+                BreakerState::Closed { .. } => false,
+            }
+        };
         let mut inner = self.inner.clone();
         let observer_state = self.state.clone();
         let observer = Self {
@@ -218,21 +333,31 @@ impl Service<SendRequest> for CircuitBreaker {
             state: observer_state,
             threshold: self.threshold,
             reset_after: self.reset_after,
+            clock: self.clock.clone(),
         };
         Box::pin(async move {
+            let done = Arc::new(AtomicBool::new(false));
+            let _permit = ProbeGuard {
+                state: observer.state.clone(),
+                probe,
+                done: done.clone(),
+            };
             // Tower contract: readiness before every call (the bulkhead
             // grants its slot here; the breaker's own gate ran in
-            // poll_ready above).
+            // poll_ready above and re-checked at the top of this call).
             if let Err(e) = inner.ready().await {
+                done.store(true, Ordering::SeqCst);
                 observer.observe(true);
                 return Err(ArmorError::Ambiguous(e.to_string()));
             }
             match inner.call(req).await {
                 Ok(outcome) => {
+                    done.store(true, Ordering::SeqCst);
                     observer.observe(outcome.is_err());
                     Ok(outcome)
                 }
                 Err(e) => {
+                    done.store(true, Ordering::SeqCst);
                     observer.observe(true);
                     Err(ArmorError::Ambiguous(e.to_string()))
                 }
@@ -254,7 +379,13 @@ pub struct SendArmor {
 impl SendArmor {
     /// New armor over an inner send service (production tuning).
     pub fn new(inner: BoxSend, timeout: Duration, max_concurrency: usize) -> Self {
-        Self::with_tuning(inner, timeout, max_concurrency, BREAKER_THRESHOLD, BREAKER_RESET_AFTER)
+        Self::with_tuning(
+            inner,
+            timeout,
+            max_concurrency,
+            BREAKER_THRESHOLD,
+            BREAKER_RESET_AFTER,
+        )
     }
 
     /// Test tuning: custom storm threshold and reset interval.
@@ -267,9 +398,23 @@ impl SendArmor {
     ) -> Self {
         Self {
             stack: Arc::new(Mutex::new(CircuitBreaker::with_tuning(
-                inner, timeout, max_concurrency, threshold, reset_after,
+                inner,
+                timeout,
+                max_concurrency,
+                threshold,
+                reset_after,
             ))),
         }
+    }
+
+    /// Swap the breaker clock (tests inject a manual clock; production
+    /// keeps the default wall time from `with_tuning`).
+    pub fn with_clock(self, clock: ClockFn) -> Self {
+        self.stack
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clock = clock;
+        self
     }
 
     /// Run one send through the whole stack: timeout bounds the attempt, the
@@ -293,7 +438,10 @@ impl SendArmor {
 #[cfg(test)]
 mod armor_matrix_tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    /// Manual test clock (bd-i7ld): drives Open -> HalfOpen -> probe with
+    /// no real sleeps. Production always uses the default system clock.
 
     /// One fake send service: counts calls, answers per the script.
     /// Scripts answer with VALUES (`Ok`), so classification stays with the
@@ -425,8 +573,13 @@ mod armor_matrix_tests {
                 }
             }) as SendFuture
         });
-        let armor =
-            SendArmor::with_tuning(inner, Duration::from_secs(5), 4, 2, Duration::from_millis(50));
+        let armor = SendArmor::with_tuning(
+            inner,
+            Duration::from_secs(5),
+            4,
+            2,
+            Duration::from_millis(50),
+        );
         let _ = armor.send(req()).await;
         let _ = armor.send(req()).await;
         assert_eq!(calls.load(Ordering::SeqCst), 2);
@@ -436,5 +589,138 @@ mod armor_matrix_tests {
         let out = armor.send(req()).await.expect("traffic flows");
         assert_eq!(out, Ok(1));
         assert_eq!(calls.load(Ordering::SeqCst), 4);
+    }
+
+    /// Controllable clock handle: `clock()` is the injected `ClockFn`,
+    /// `advance` moves it. No tokio sleeps, no wall time.
+    #[derive(Clone)]
+    struct ManualClock {
+        now: Arc<Mutex<tokio::time::Instant>>,
+    }
+
+    impl ManualClock {
+        fn new() -> Self {
+            Self {
+                now: Arc::new(Mutex::new(tokio::time::Instant::now())),
+            }
+        }
+
+        fn clock(&self) -> ClockFn {
+            let now = self.now.clone();
+            Arc::new(move || *now.lock().unwrap_or_else(PoisonError::into_inner))
+        }
+
+        fn advance(&self, d: Duration) {
+            let mut now = self.now.lock().unwrap_or_else(PoisonError::into_inner);
+            *now = *now + d;
+        }
+    }
+
+    /// bd-i7ld: while one probe is in flight the second caller is refused
+    /// WITHOUT touching the inner service — one probe means one.
+    #[tokio::test]
+    async fn halfopen_second_caller_refused_while_probe_in_flight() {
+        let manual = ManualClock::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let entered = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = tokio::sync::oneshot::channel::<Result<usize, String>>();
+        let rx = Arc::new(Mutex::new(Some(rx)));
+        let inner = {
+            let calls = calls.clone();
+            let entered = entered.clone();
+            box_send(move |_| {
+                let calls = calls.clone();
+                let entered = entered.clone();
+                let rx = rx.clone();
+                Box::pin(async move {
+                    let c = calls.fetch_add(1, Ordering::SeqCst);
+                    if c == 0 {
+                        return Err("down".to_string());
+                    }
+                    if c == 1 {
+                        entered.store(true, Ordering::SeqCst);
+                        let recv = rx
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .take()
+                            .expect("one probe");
+                        return recv.await.expect("probe released");
+                    }
+                    Ok(1usize)
+                }) as SendFuture
+            })
+        };
+        let armor =
+            SendArmor::with_tuning(inner, Duration::from_secs(5), 4, 1, Duration::from_secs(30))
+                .with_clock(manual.clock());
+        // Trip open with one failure.
+        let out = armor.send(req()).await.expect("armor ok");
+        assert_eq!(out, Err("down".to_string()));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        // Still open before the reset interval: refused, inner untouched.
+        let err = armor.send(req()).await.expect_err("open refuses");
+        assert_eq!(err, ArmorError::BreakerOpen);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        // Past the reset interval: one probe goes through and blocks.
+        manual.advance(Duration::from_secs(31));
+        let probe = armor.clone();
+        let handle = tokio::spawn(async move { probe.send(req()).await });
+        let mut spins = 0;
+        while !entered.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+            spins += 1;
+            assert!(spins < 10_000, "probe never entered inner");
+        }
+        // Second caller while the probe is in flight: refused, no new call.
+        let err = armor.send(req()).await.expect_err("second probe refused");
+        assert_eq!(err, ArmorError::BreakerOpen);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "exactly one probe touched inner"
+        );
+        // Release the probe: success closes, traffic flows.
+        tx.send(Ok(3)).expect("release probe");
+        let out = handle.await.expect("probe task").expect("armor ok");
+        assert_eq!(out, Ok(3));
+        let out = armor.send(req()).await.expect("traffic flows");
+        assert_eq!(out, Ok(1));
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    /// bd-i7ld: the injected clock alone drives recovery — open refuses,
+    /// advancing past the reset admits exactly one probe. No sleeps.
+    #[tokio::test]
+    async fn injected_clock_drives_recovery_without_sleep() {
+        let manual = ManualClock::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = calls.clone();
+        let armor = SendArmor::with_tuning(
+            fake(calls.clone(), move || {
+                // `fake` counts the call before asking: the first inner
+                // call observes count 1.
+                if count.load(Ordering::SeqCst) == 1 {
+                    Err("down".into())
+                } else {
+                    Ok(1)
+                }
+            }),
+            Duration::from_secs(5),
+            4,
+            1,
+            Duration::from_secs(30),
+        )
+        .with_clock(manual.clock());
+        let out = armor.send(req()).await.expect("armor ok");
+        assert_eq!(out, Err("down".to_string()));
+        let err = armor.send(req()).await.expect_err("open refuses");
+        assert_eq!(err, ArmorError::BreakerOpen);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        manual.advance(Duration::from_secs(31));
+        let out = armor.send(req()).await.expect("probe goes through");
+        assert_eq!(out, Ok(1), "probe success closes the breaker");
+        let out = armor.send(req()).await.expect("traffic flows");
+        assert_eq!(out, Ok(1));
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
     }
 }
