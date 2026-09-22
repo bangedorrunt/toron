@@ -13,6 +13,7 @@ mod platform;
 mod robot;
 mod theme;
 mod tui;
+mod wake_sock;
 mod workflow;
 
 use std::path::PathBuf;

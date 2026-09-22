@@ -1551,6 +1551,11 @@ pub struct WatchArgs {
     /// Live subscription (bus subscribe, yields WatchNdjson lines) — no snapshot poll.
     #[arg(long, conflicts_with = "once")]
     pub live: bool,
+    /// Socket tail (ADR-0036 slice B, bd-981p): read wake frames from the
+    /// daemon wake.sock when present; absent socket degrades LOUD to the
+    /// in-process replay+live, never silent. Only honored with `--live`.
+    #[arg(long)]
+    pub watch_sock: bool,
     /// Exit 4 after N seconds with no matching event (silence-bounded live
     /// watch; consumers respawn the child). Without it a half-open bus
     /// subscription delivers nothing AND never errors — a silent zombie.
