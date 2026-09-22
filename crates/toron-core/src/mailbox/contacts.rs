@@ -288,7 +288,20 @@ impl Mailbox {
                     .iter()
                     .filter(|e| e.pubkey == *agent_npub)
                     .max_by_key(|e| e.created_at.as_secs())
-                    .and_then(|e| ContactPolicy::parse(&e.content).ok())
+                    .and_then(|e| match ContactPolicy::parse(&e.content) {
+                        Ok(policy) => Some(policy),
+                        // bd-05yr: corrupt historic rows skip loudly, never
+                        // silently default mid-stream (default applies only
+                        // when NO row parses at all).
+                        Err(err) => {
+                            tracing::warn!(
+                                agent = %agent_npub.to_hex(),
+                                content = %e.content,
+                                "skipping unparseable contact-policy event ({err}); falling back to Auto"
+                            );
+                            None
+                        }
+                    })
                     .unwrap_or(ContactPolicy::Auto)
             })
     }
@@ -501,7 +514,17 @@ impl BusPolicySource {
                     .iter()
                     .filter(|e| e.pubkey.to_hex() == *hex)
                     .max_by_key(|e| e.created_at.as_secs())
-                    .and_then(|e| ContactPolicy::parse(&e.content).ok())
+                    .and_then(|e| match ContactPolicy::parse(&e.content) {
+                        Ok(policy) => Some(policy),
+                        Err(err) => {
+                            tracing::warn!(
+                                agent = %hex,
+                                content = %e.content,
+                                "skipping unparseable contact-policy event ({err})"
+                            );
+                            None
+                        }
+                    })
                 {
                     source.policies.write().insert((*hex).to_string(), policy);
                 }

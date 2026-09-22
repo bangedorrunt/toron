@@ -16,6 +16,7 @@
 
 use std::collections::HashSet;
 
+use crate::mailbox::unwrap::ContactPolicy;
 use crate::nostr::{PublicKey, UnsignedEvent};
 use parking_lot::Mutex;
 
@@ -46,26 +47,9 @@ pub struct MailItem {
     pub toron_kind: Option<String>,
 }
 
-/// Contact policy attached to a recipient (kind-30014, ADR G14).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ContactPolicy {
-    Open,
-    Auto,
-    ContactsOnly,
-    BlockAll,
-}
-
-impl ContactPolicy {
-    pub fn parse(s: &str) -> Self {
-        match s {
-            "open" => ContactPolicy::Open,
-            "auto" => ContactPolicy::Auto,
-            "contacts_only" => ContactPolicy::ContactsOnly,
-            _ => ContactPolicy::BlockAll,
-        }
-    }
-}
-
+// Contact policy (kind-30014, ADR G14) lives in crate::mailbox::unwrap —
+// one canonical home (bd-05yr twins unification). The old infallible shadow
+// `parse` (unknown → BlockAll) is gone; callers parse strictly and fail loud.
 /// Outcome of deciding whether to project one unwrapped gift.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProjectionDecision {
