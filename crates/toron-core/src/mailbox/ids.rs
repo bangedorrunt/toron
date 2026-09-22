@@ -111,11 +111,11 @@ impl std::error::Error for BoundaryIdError {}
 
 /// Define one ADR-0035 Spec 6 boundary newtype: non-empty, whitespace-free,
 /// parsed at the boundary via `FromStr`, trusted inside. Deserialization
-/// assumes a validated writer (sqlite rows); construction validates.
+/// validates (never a silent bypass); sqlite rows assume a validated writer.
 macro_rules! boundary_id {
     ($name:ident, $doc:literal) => {
         #[doc = $doc]
-        #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+        #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
         pub struct $name(String);
 
         impl $name {
@@ -142,6 +142,18 @@ macro_rules! boundary_id {
                     return Err(BoundaryIdError::Whitespace(stringify!($name)));
                 }
                 Ok(Self(trimmed.to_string()))
+            }
+        }
+
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                // bd-05yr: Deserialize validates — never a silent bypass of
+                // FromStr (the old derive accepted any string).
+                let s = String::deserialize(deserializer)?;
+                s.parse().map_err(serde::de::Error::custom)
             }
         }
 

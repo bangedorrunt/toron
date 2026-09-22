@@ -14,6 +14,8 @@
 //! unknown wake/priority/audience/verdict values are hard errors
 //! (type-system-discipline).
 
+use std::str::FromStr;
+
 use crate::mailbox::error::{MailError, MailErrorCode};
 use crate::nostr::Tag;
 
@@ -175,60 +177,12 @@ impl std::str::FromStr for Verdict {
     }
 }
 
-/// Assignment key (ADR-0028 E3). The sender mints it, non-empty; tick
-/// never invents it. Distinct from [`ThreadId`] so conflation fails loudly
-/// instead of dual-writing assignment.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct Corr(String);
-
-impl Corr {
-    pub fn parse(s: &str) -> Result<Self, MailError> {
-        if s.trim().is_empty() {
-            return Err(MailError::new(
-                MailErrorCode::Malformed,
-                "corr must be non-empty when present",
-            ));
-        }
-        Ok(Self(s.to_string()))
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl std::fmt::Display for Corr {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-/// Conversation key (NIP-10 thread / `SendMessage.thread_id`). Never an
-/// assignment key: [`reject_thread_as_corr`] hard-errors equality.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct ThreadId(String);
-
-impl ThreadId {
-    pub fn parse(s: &str) -> Result<Self, MailError> {
-        if s.trim().is_empty() {
-            return Err(MailError::new(
-                MailErrorCode::Malformed,
-                "thread_id must be non-empty when present",
-            ));
-        }
-        Ok(Self(s.to_string()))
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl std::fmt::Display for ThreadId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
+/// Assignment key (ADR-0028 E3) and conversation key (NIP-10 thread) live
+/// in [`super::ids`] — one canonical home (bd-05yr twins unification).
+/// Re-exported here so `send_tags::{Corr, ThreadId}` paths keep resolving.
+/// Parsing is `FromStr` (loud `BoundaryIdError`); MailError mapping happens
+/// at the mail boundary call sites, never inside the types.
+pub use super::ids::{Corr, ThreadId};
 
 /// ADR-0028 E3 invariant: `thread_id` is never `corr`. Hard-error (not
 /// silent skip) where the stringly-typed boundary cannot carry newtypes
@@ -254,7 +208,7 @@ pub fn reject_thread_as_corr(
 /// Typed projection of the extra_tags vocabulary.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SendTags {
-    pub corr: Option<String>,
+    pub corr: Option<Corr>,
     pub wake: Option<Wake>,
     pub priority: Option<Priority>,
     pub audience: Option<Audience>,
@@ -280,14 +234,13 @@ impl SendTags {
         result_path: Option<String>,
         verdict: Option<Verdict>,
     ) -> Result<Self, MailError> {
-        if let Some(c) = &corr
-            && c.trim().is_empty()
-        {
-            return Err(MailError::new(
-                MailErrorCode::Malformed,
-                "corr must be non-empty when present",
-            ));
-        }
+        let corr = corr
+            .map(|c| {
+                Corr::from_str(&c).map_err(|e| {
+                    MailError::new(MailErrorCode::Malformed, format!("corr invalid: {e}"))
+                })
+            })
+            .transpose()?;
         if let Some(r) = &result_path
             && r.trim().is_empty()
         {
@@ -320,13 +273,12 @@ impl SendTags {
             match parts[0].as_str() {
                 "corr" => {
                     let v = parts.get(1).cloned().unwrap_or_default();
-                    if v.trim().is_empty() {
-                        return Err(MailError::new(
+                    out.corr = Some(Corr::from_str(&v).map_err(|e| {
+                        MailError::new(
                             MailErrorCode::Malformed,
-                            "corr tag value must be non-empty",
-                        ));
-                    }
-                    out.corr = Some(v);
+                            format!("corr tag value invalid: {e}"),
+                        )
+                    })?);
                 }
                 "wake" => {
                     let v = parts.get(1).map(String::as_str).unwrap_or("");
@@ -413,7 +365,7 @@ impl SendTags {
     pub fn to_tags(&self) -> Vec<Tag> {
         let mut out = Vec::new();
         if let Some(c) = &self.corr
-            && let Ok(t) = Tag::parse(["corr", c])
+            && let Ok(t) = Tag::parse(["corr", c.as_str()])
         {
             out.push(t);
         }
@@ -469,7 +421,7 @@ mod tests {
             tag("result_path", "/tmp/result.json"),
         ];
         let parsed = SendTags::parse(&tags).expect("parse");
-        assert_eq!(parsed.corr.as_deref(), Some("FM-GS-012"));
+        assert_eq!(parsed.corr.as_ref().map(Corr::as_str), Some("FM-GS-012"));
         assert_eq!(parsed.wake, Some(Wake::Tasked));
         assert_eq!(parsed.priority, Some(Priority::Queue));
         assert_eq!(parsed.audience, Some(Audience::Agents));
@@ -483,7 +435,7 @@ mod tests {
     fn send_tags_parse_rejects_empty_corr() {
         let tags = vec![tag("corr", "")];
         let err = SendTags::parse(&tags).expect_err("empty corr must error");
-        assert!(err.message.contains("non-empty"), "{err}");
+        assert!(err.message.contains("empty"), "{err}");
         assert_eq!(err.code, MailErrorCode::Malformed);
     }
 
@@ -491,7 +443,7 @@ mod tests {
     fn send_tags_from_fields_rejects_empty_corr() {
         let err = SendTags::from_fields(Some("   ".into()), None, None, None, None, None)
             .expect_err("empty corr must error");
-        assert!(err.message.contains("non-empty"), "{err}");
+        assert!(err.message.contains("empty"), "{err}");
     }
 
     #[test]
@@ -535,21 +487,21 @@ mod tests {
 
     #[test]
     fn send_tags_corr_newtype_rejects_empty() {
-        let err = Corr::parse("").expect_err("empty corr must error");
-        assert!(err.message.contains("non-empty"), "{err}");
+        let err = "".parse::<Corr>().expect_err("empty corr must error");
+        assert!(err.to_string().contains("empty"), "{err}");
     }
 
     #[test]
     fn send_tags_thread_id_as_corr_fails_loud() {
         // ADR-0028 E3: thread is the conversation key, corr is the
         // assignment key — conflation dual-writes assignment.
-        let corr = Corr::parse("thread-abc").expect("corr");
-        let thread = ThreadId::parse("thread-abc").expect("thread");
+        let corr: Corr = "thread-abc".parse().expect("corr");
+        let thread: ThreadId = "thread-abc".parse().expect("thread");
         let err = reject_thread_as_corr(Some(&thread), Some(&corr))
             .expect_err("thread_id == corr must fail loud");
         assert!(err.message.contains("never"), "{err}");
         // Distinct values pass.
-        let other = Corr::parse("corr-xyz").expect("corr");
+        let other: Corr = "corr-xyz".parse().expect("corr");
         assert!(reject_thread_as_corr(Some(&thread), Some(&other)).is_ok());
         assert!(reject_thread_as_corr(None, Some(&other)).is_ok());
         assert!(reject_thread_as_corr(Some(&thread), None).is_ok());
@@ -691,7 +643,7 @@ mod tests {
             Tag::parse(["p", "abcd"]).unwrap(),
         ];
         let parsed = SendTags::parse(&tags).expect("parse");
-        assert_eq!(parsed.corr.as_deref(), Some("X"));
+        assert_eq!(parsed.corr.as_ref().map(Corr::as_str), Some("X"));
         assert_eq!(parsed.wake, None);
     }
 
@@ -750,7 +702,7 @@ mod tests {
             .expect("key");
         // Build typed tags
         let tags = SendTags {
-            corr: Some("FM-GS-012".into()),
+            corr: Some("FM-GS-012".parse().expect("corr")),
             wake: Some(Wake::Tasked),
             priority: Some(Priority::Queue),
             audience: Some(Audience::Agents),
@@ -832,7 +784,7 @@ mod tests {
             .await
             .expect("inbox");
         assert_eq!(
-            inbox[0].corr.as_deref(),
+            inbox[0].corr.as_ref().map(Corr::as_str),
             Some("FM-GS-012"),
             "fetch_inbox must project rumor corr onto the row"
         );

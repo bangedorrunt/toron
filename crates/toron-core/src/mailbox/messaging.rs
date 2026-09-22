@@ -32,6 +32,7 @@ use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
 
+use crate::mailbox::ids::Corr;
 use crate::nostr::UnsignedEvent;
 use crate::nostr::event::build_event;
 use crate::nostr::kinds::toron_kind;
@@ -153,7 +154,8 @@ pub struct InboxMessage {
     /// only stops double-delivering.
     pub duplicate_of: Option<String>,
     /// ADR-0027 E2: assignment tags projected from the rumor (never 1059).
-    pub corr: Option<String>,
+    /// Typed: a corrupt corr tag fails the projection loudly (bd-05yr).
+    pub corr: Option<Corr>,
     pub wake: Option<String>,
     pub priority: Option<String>,
     pub audience: Option<String>,
@@ -310,19 +312,15 @@ impl Mailbox {
         // ADR-0028 E3: thread_id is never corr. The sender mints corr;
         // tick never invents it; conflation fails loud here.
         {
-            use crate::mailbox::send_tags::{Corr, ThreadId, reject_thread_as_corr};
+            use crate::mailbox::send_tags::{ThreadId, reject_thread_as_corr};
+            use std::str::FromStr;
             let thread = args
                 .thread_id
                 .as_deref()
-                .map(ThreadId::parse)
+                .map(ThreadId::from_str)
                 .transpose()
-                .map_err(|e| anyhow::anyhow!(e.message))?;
-            let corr = parsed_tags
-                .corr
-                .as_deref()
-                .map(Corr::parse)
-                .transpose()
-                .map_err(|e| anyhow::anyhow!(e.message))?;
+                .map_err(|e| anyhow::anyhow!(e))?;
+            let corr = parsed_tags.corr.clone();
             reject_thread_as_corr(thread.as_ref(), corr.as_ref())
                 .map_err(|e| anyhow::anyhow!(e.message))?;
         }
@@ -344,7 +342,7 @@ impl Mailbox {
             match self.receipt_store() {
                 Ok(store) => {
                     let receipt = crate::mailbox::receipts::Receipt {
-                        corr,
+                        corr: corr.as_str().to_string(),
                         state: crate::mailbox::receipts::ReceiptState::Owed,
                         wake: parsed_tags.wake,
                         due_at: None,
@@ -440,7 +438,7 @@ impl Mailbox {
                 let key = send_key(
                     &args.project_slug,
                     &args.sender_name,
-                    &corr,
+                    corr.as_str(),
                     &args.subject,
                     &args.body_md,
                 );
@@ -450,7 +448,7 @@ impl Mailbox {
                         &visible_id,
                         &args.project_slug,
                         &args.sender_name,
-                        &corr,
+                        corr.as_str(),
                         &intended_json,
                         now_ms,
                     )
@@ -529,7 +527,9 @@ impl Mailbox {
                 Ok(false) => {
                     eprintln!(
                         "{}",
-                        crate::mailbox::receipts::resend_guidance(parsed_tags.corr.as_deref())
+                        crate::mailbox::receipts::resend_guidance(
+                            parsed_tags.corr.as_ref().map(Corr::as_str)
+                        )
                     );
                 }
                 // Bus call itself failed — same uncertainty semantics as
@@ -538,7 +538,9 @@ impl Mailbox {
                     eprintln!("toron: DM publish failed for {}: {e}", r.name);
                     eprintln!(
                         "{}",
-                        crate::mailbox::receipts::resend_guidance(parsed_tags.corr.as_deref())
+                        crate::mailbox::receipts::resend_guidance(
+                            parsed_tags.corr.as_ref().map(Corr::as_str)
+                        )
                     );
                 }
             }
@@ -553,7 +555,7 @@ impl Mailbox {
         {
             eprintln!("{}", crate::mailbox::receipts::DEGRADED_NOTE);
             let degraded = crate::mailbox::receipts::Receipt {
-                corr,
+                corr: corr.as_str().to_string(),
                 state: crate::mailbox::receipts::ReceiptState::Degraded,
                 wake: parsed_tags.wake,
                 due_at: None,
@@ -741,8 +743,10 @@ impl Mailbox {
         // index even with no projecting daemon running. Idempotent on
         // rumor-id; contract in `heal_search_projection`.
         self.heal_search_projection(&ordered).await;
-        let mut messages: Vec<InboxMessage> =
-            ordered.into_iter().map(|(m, _seq)| inbox_from(m)).collect();
+        let mut messages: Vec<InboxMessage> = ordered
+            .into_iter()
+            .filter_map(|(m, _seq)| inbox_from(m))
+            .collect();
 
         // S5 (bd-dup-assign-collapse-ws21): collapse identical
         // (sender, subject, body-hash) within the window into one row
@@ -1804,7 +1808,8 @@ fn add_message_tags(tags: &mut Vec<Tag>, args: &SendMessage) {
 }
 
 /// Project an unwrapped mail into the inbox view.
-fn inbox_from(mail: UnwrappedMail) -> InboxMessage {
+fn inbox_from(mail: UnwrappedMail) -> Option<InboxMessage> {
+    use std::str::FromStr;
     let tags = &mail.rumor.tags;
     let subject = tag_value(tags, "subject").unwrap_or_default().to_string();
     let importance = tag_value(tags, "importance")
@@ -1823,7 +1828,23 @@ fn inbox_from(mail: UnwrappedMail) -> InboxMessage {
                     .flatten()
             })
         });
-    InboxMessage {
+    // Corr is typed at the projection boundary (bd-05yr): a corrupt tag
+    // fails this row loudly (warn + skip) instead of flowing as String.
+    // Search healing already ran upstream, so the mail itself is preserved
+    // in the archive/bus — only assignment projection refuses the row.
+    let corr = match tag_value(tags, "corr").map(Corr::from_str) {
+        Some(Err(e)) => {
+            tracing::warn!(
+                rumor_id = %mail.rumor_id.to_hex(),
+                sender = %mail.sender.to_hex(),
+                "dropping inbox row with corrupt corr tag ({e}); mail preserved in archive"
+            );
+            return None;
+        }
+        Some(Ok(corr)) => Some(corr),
+        None => None,
+    };
+    Some(InboxMessage {
         id: mail.rumor_id.to_hex(),
         sender: mail.sender.to_hex(),
         subject,
@@ -1834,14 +1855,14 @@ fn inbox_from(mail: UnwrappedMail) -> InboxMessage {
         created_ts_us: mail.ts_us(),
         read_ts_us: None, // filled by fetch_inbox from the message_reads projection
         duplicate_of: None,
-        corr: tag_value(tags, "corr").map(ToString::to_string),
+        corr,
         wake: tag_value(tags, "wake").map(ToString::to_string),
         priority: tag_value(tags, "priority").map(ToString::to_string),
         audience: tag_value(tags, "audience").map(ToString::to_string),
         result_path: tag_value(tags, "result_path").map(ToString::to_string),
         verdict: tag_value(tags, "verdict").map(ToString::to_string),
         bead: tag_value(tags, "bead").map(ToString::to_string),
-    }
+    })
 }
 
 /// S5 (bd-dup-assign-collapse-ws21): projection-level duplicate collapse.
