@@ -125,6 +125,9 @@ pub struct Mailbox {
     /// the store cap; entries are pure functions of (key, wrap).
     unwrap_cache:
         Arc<parking_lot::Mutex<HashMap<String, Option<crate::mailbox::unwrap::UnwrappedMail>>>>,
+    /// bd-uhkr: host-owned judgment kernel model (claim-before-invoke
+    /// dedup). Clones share one instance — never a per-call `new()`.
+    judge_model: Arc<parking_lot::Mutex<crate::mailbox::judgment::JudgeModel>>,
     /// Test/metrics observable: memo hits in [`Self::cached_unwrap`].
     unwrap_cache_hits: Arc<AtomicU64>,
     /// Test/metrics observable: cold decrypts in [`Self::cached_unwrap`].
@@ -173,6 +176,9 @@ impl Mailbox {
             kdf_loads: Arc::new(AtomicU64::new(0)),
             trigger_tx: None,
             unwrap_cache: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            judge_model: Arc::new(parking_lot::Mutex::new(
+                crate::mailbox::judgment::JudgeModel::new(),
+            )),
             unwrap_cache_hits: Arc::new(AtomicU64::new(0)),
             unwrap_cache_misses: Arc::new(AtomicU64::new(0)),
         }
