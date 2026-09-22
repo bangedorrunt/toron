@@ -23,6 +23,7 @@ pub mod relay_bus;
 pub mod scoping;
 pub mod subscription;
 pub mod ttl;
+pub mod wake;
 
 pub use addressable::{
     AddressableKey, KeyPriority, is_addressable, is_revocation, nip01_replaceable_cmp,
