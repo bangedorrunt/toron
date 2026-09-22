@@ -47,6 +47,9 @@ pub struct LeaseEntry {
     /// Fencing epoch (monotonic per coordinate; carried, not decided here).
     pub epoch: u64,
     pub state: EntryState,
+    /// Liveness-oracle voucher (bd-lease-liveness-bo0g): an expired TTL
+    /// still blocks while the holder's session is live.
+    pub liveness_extended: bool,
 }
 
 /// Model: the whole reservation table. Clone-and-return keeps `tick` pure.
@@ -114,11 +117,20 @@ pub enum DenyReason {
 }
 
 /// Named pure predicates only — no inline boolean soup in [`tick`].
-const fn is_live(entry: &LeaseEntry, now_us: i64) -> bool {
+const fn ttl_live(entry: &LeaseEntry, now_us: i64) -> bool {
     match entry.expires_us {
         None => true,
         Some(expires) => expires > now_us,
     }
+}
+
+const fn is_live(entry: &LeaseEntry, now_us: i64) -> bool {
+    // Oracle-vouched rows outlive their TTL (host sets the flag from the
+    // liveness oracle + SQL mirror; the kernel only honors it).
+    if ttl_live(entry, now_us) {
+        return true;
+    }
+    entry.liveness_extended
 }
 
 const fn intent_live(entry: &LeaseEntry, now_us: i64) -> bool {
@@ -188,6 +200,9 @@ pub fn tick(model: &KernelModel, msg: &KernelMsg) -> (KernelModel, Vec<KernelEff
                     created_at_secs: *created_at_secs,
                     epoch: *epoch,
                     state: *state,
+                    // Fresh grants are TTL-live by admission; the oracle
+                    // flag arrives only via projected mirror rows.
+                    liveness_extended: false,
                 },
             );
             (next, vec![KernelEffect::Granted { id: id.clone() }])
@@ -244,7 +259,7 @@ pub fn machine_config() -> serde_json::Value {
             {"on": "Renew", "guard": "holder_matches", "effects": ["Renewed"]},
             {"on": "ExpireTick", "guard": null, "effects": ["Expired"]},
         ],
-        "guards": ["is_live", "intent_live", "entry_blocks"],
+        "guards": ["ttl_live", "is_live", "intent_live", "entry_blocks"],
     })
 }
 
@@ -588,6 +603,42 @@ mod kernel_tests {
             },
         );
         assert!(fx.is_empty(), "foreign renew emits nothing");
+    }
+
+    #[test]
+    fn expired_vouched_lease_still_blocks() {
+        // bd-lease-liveness-bo0g: TTL past but oracle-vouched → blocks.
+        let mut model = KernelModel::new();
+        model.leases.insert(
+            "v".into(),
+            LeaseEntry {
+                id: "v".into(),
+                holder: "alice".into(),
+                path_pattern: "src/**".into(),
+                exclusive: true,
+                expires_us: Some(500),
+                created_at_secs: 1,
+                epoch: 0,
+                state: EntryState::Held,
+                liveness_extended: true,
+            },
+        );
+        let (_, fx) = tick(&model, &acquire("b", "bob", "src/x.rs", true, 1_000));
+        assert!(
+            matches!(
+                &fx[0],
+                KernelEffect::Denied {
+                    reason: DenyReason::HardConflict { .. },
+                    ..
+                }
+            ),
+            "vouched expiry blocks: {fx:?}"
+        );
+        // Same row unvouched: expiry frees the path.
+        let mut model2 = model;
+        model2.leases.get_mut("v").unwrap().liveness_extended = false;
+        let (_, fx2) = tick(&model2, &acquire("b", "bob", "src/x.rs", true, 1_000));
+        assert_eq!(fx2, vec![KernelEffect::Granted { id: "b".into() }]);
     }
 
     #[test]
