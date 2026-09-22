@@ -95,13 +95,9 @@ impl Mailbox {
         // survives.
         let ok = self.bus.publish(event.clone()).await?;
         if !ok.stored {
-            let _ = slots::release_slot(
-                pool,
-                project_slug,
-                slot,
-                &agent_keys.public_key().to_hex(),
-            )
-            .await;
+            let _ =
+                slots::release_slot(pool, project_slug, slot, &agent_keys.public_key().to_hex())
+                    .await;
             anyhow::bail!("build-slot event rejected by bus");
         }
 

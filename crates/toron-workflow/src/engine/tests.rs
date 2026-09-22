@@ -110,8 +110,8 @@ async fn remote_engine(
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    let engine = WorkflowEngine::remote_with_async_effect_runner(&url, async_fx)
-        .expect("remote engine");
+    let engine =
+        WorkflowEngine::remote_with_async_effect_runner(&url, async_fx).expect("remote engine");
     Some((server, engine))
 }
 
@@ -156,8 +156,7 @@ async fn remote_engine_with(
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    let engine =
-        WorkflowEngine::remote_with(&url, profile_resolver).expect("remote engine");
+    let engine = WorkflowEngine::remote_with(&url, profile_resolver).expect("remote engine");
     Some((server, engine))
 }
 
@@ -433,7 +432,8 @@ steps:
 #[tokio::test]
 async fn durable_delay_completes() {
     let runner = noop_async();
-    let engine = WorkflowEngine::local_with_async_effect_runner(Some(runner.clone())).expect("engine");
+    let engine =
+        WorkflowEngine::local_with_async_effect_runner(Some(runner.clone())).expect("engine");
     let input = RunInput {
         run_id: None,
         workflow: delay_workflow(),
@@ -508,7 +508,8 @@ steps:
 /// (a durable deterministic return, NOT a panic/abort).
 #[tokio::test]
 async fn on_error_fail_run_fails_the_run_durably() {
-    let engine = WorkflowEngine::local_with_async_effect_runner(Some(error_on_send_async())).expect("engine");
+    let engine = WorkflowEngine::local_with_async_effect_runner(Some(error_on_send_async()))
+        .expect("engine");
     let input = RunInput {
         run_id: None,
         workflow: fail_run_workflow(),
@@ -534,7 +535,8 @@ async fn on_error_fail_run_fails_the_run_durably() {
 /// step → run completes; step output `{ok:false}`; later steps still run.
 #[tokio::test]
 async fn on_error_default_continue_completes_the_run() {
-    let engine = WorkflowEngine::local_with_async_effect_runner(Some(error_on_send_async())).expect("engine");
+    let engine = WorkflowEngine::local_with_async_effect_runner(Some(error_on_send_async()))
+        .expect("engine");
     let input = RunInput {
         run_id: None,
         workflow: continue_workflow(),
@@ -633,7 +635,8 @@ fn workflow_emitted_stamp_is_idempotent() {
 async fn fail_run_emits_46012_status_failed() {
     use nostr_sdk::prelude::Keys;
 
-    let engine = WorkflowEngine::local_with_async_effect_runner(Some(error_on_send_async())).expect("engine");
+    let engine = WorkflowEngine::local_with_async_effect_runner(Some(error_on_send_async()))
+        .expect("engine");
     let input = RunInput {
         run_id: None,
         workflow: fail_run_workflow(),
@@ -671,7 +674,8 @@ async fn template_substitution_trigger_in_body() {
         seen_clone.lock().unwrap().push(a.clone());
         Ok(serde_json::Value::Null)
     });
-    let engine = WorkflowEngine::local_with_async_effect_runner(Some(runner.clone())).expect("engine");
+    let engine =
+        WorkflowEngine::local_with_async_effect_runner(Some(runner.clone())).expect("engine");
     let wf = parse_workflow(
         r##"
 name: trigger-template
@@ -753,7 +757,8 @@ async fn graph_dag_runs_and_collects_outputs() {
             _ => Ok(serde_json::Value::Null),
         }
     });
-    let engine = WorkflowEngine::local_with_async_effect_runner(Some(runner.clone())).expect("engine");
+    let engine =
+        WorkflowEngine::local_with_async_effect_runner(Some(runner.clone())).expect("engine");
     let wf = parse_workflow(
         r##"
 name: graph-ship
@@ -817,7 +822,8 @@ async fn graph_parallel_node_expands_copies() {
             _ => Ok(serde_json::Value::Null),
         }
     });
-    let engine = WorkflowEngine::local_with_async_effect_runner(Some(runner.clone())).expect("engine");
+    let engine =
+        WorkflowEngine::local_with_async_effect_runner(Some(runner.clone())).expect("engine");
     let wf = parse_workflow(
         r##"
 name: graph-fanout
@@ -920,7 +926,8 @@ async fn retry_backoff_retries_until_success() {
             Ok(serde_json::json!({ "ok": true, "attempt": n + 1 }))
         }
     });
-    let engine = WorkflowEngine::local_with_async_effect_runner(Some(runner.clone())).expect("engine");
+    let engine =
+        WorkflowEngine::local_with_async_effect_runner(Some(runner.clone())).expect("engine");
     let wf = parse_workflow(
         r##"
 name: retry-wf
@@ -958,7 +965,8 @@ steps:
 #[tokio::test]
 async fn retry_exhausts_reports_failure() {
     let runner = lift_async(|_a: &Action| Err(anyhow::anyhow!("always fails")));
-    let engine = WorkflowEngine::local_with_async_effect_runner(Some(runner.clone())).expect("engine");
+    let engine =
+        WorkflowEngine::local_with_async_effect_runner(Some(runner.clone())).expect("engine");
     let wf = parse_workflow(
         r##"
 name: retry-fail
@@ -1000,7 +1008,8 @@ async fn branch_then_else_on_guard() {
         seen_clone.lock().unwrap().push(a.clone());
         Ok(serde_json::Value::Null)
     });
-    let engine = WorkflowEngine::local_with_async_effect_runner(Some(runner.clone())).expect("engine");
+    let engine =
+        WorkflowEngine::local_with_async_effect_runner(Some(runner.clone())).expect("engine");
     let wf = parse_workflow(
         r##"
 name: branch-wf
@@ -1019,7 +1028,8 @@ steps:
     .expect("parse branch workflow");
 
     // Guard true → then branch.
-    let engine2 = WorkflowEngine::local_with_async_effect_runner(Some(runner.clone())).expect("engine2");
+    let engine2 =
+        WorkflowEngine::local_with_async_effect_runner(Some(runner.clone())).expect("engine2");
     let _ = engine2
         .run(
             "wf-branch-true",
@@ -1069,7 +1079,8 @@ async fn foreach_over_list_collects() {
         seen_clone.lock().unwrap().push(a.clone());
         Ok(serde_json::json!({ "ran": true }))
     });
-    let engine = WorkflowEngine::local_with_async_effect_runner(Some(runner.clone())).expect("engine");
+    let engine =
+        WorkflowEngine::local_with_async_effect_runner(Some(runner.clone())).expect("engine");
     let wf = parse_workflow(
         r##"
 name: foreach-wf
@@ -1123,7 +1134,8 @@ async fn parallel_elastic_spawns_n() {
         seen_clone.lock().unwrap().push(a.clone());
         Ok(serde_json::json!({ "worker": true }))
     });
-    let engine = WorkflowEngine::local_with_async_effect_runner(Some(runner.clone())).expect("engine");
+    let engine =
+        WorkflowEngine::local_with_async_effect_runner(Some(runner.clone())).expect("engine");
     let wf = parse_workflow(
         r##"
 name: parallel-wf
@@ -1189,13 +1201,12 @@ steps:
             }
         })
     };
-    let engine =
-        WorkflowEngine::local_with_resolvers_and_async_effect(
-            Arc::new(|_: &str| None),
-            resolver,
-            Some(afx),
-        )
-        .expect("engine");
+    let engine = WorkflowEngine::local_with_resolvers_and_async_effect(
+        Arc::new(|_: &str| None),
+        resolver,
+        Some(afx),
+    )
+    .expect("engine");
     let wf = parse_workflow(
         r##"
 name: caller
@@ -1426,7 +1437,8 @@ async fn invoke_runs_workflow_with_synthesized_inputs_trigger() {
         seen_clone.lock().unwrap().push(a.clone());
         Ok(serde_json::Value::Null)
     });
-    let engine = WorkflowEngine::local_with_async_effect_runner(Some(runner.clone())).expect("engine");
+    let engine =
+        WorkflowEngine::local_with_async_effect_runner(Some(runner.clone())).expect("engine");
     let wf = parse_workflow(
         r##"
 name: invoke-me
@@ -1527,8 +1539,7 @@ async fn effectful_leaf_with_effect_runner_is_not_marked() {
         *calls_clone.lock().unwrap() += 1;
         Ok(serde_json::json!({ "journaled": true }))
     });
-    let engine =
-        WorkflowEngine::local_with_effect_runner(Some(fx)).expect("engine with runner");
+    let engine = WorkflowEngine::local_with_effect_runner(Some(fx)).expect("engine with runner");
     let wf = parse_workflow(
         r##"
 name: journal-covered
@@ -1576,8 +1587,7 @@ async fn verify_routes_through_the_effect_runner() {
         *calls_clone.lock().unwrap() += 1;
         Ok(serde_json::json!({ "ok": true, "journaled": true }))
     });
-    let engine =
-        WorkflowEngine::local_with_effect_runner(Some(fx)).expect("engine with runner");
+    let engine = WorkflowEngine::local_with_effect_runner(Some(fx)).expect("engine with runner");
     let wf = parse_workflow(
         r##"
 name: journal-verify
@@ -1804,7 +1814,8 @@ steps:
 #[tokio::test]
 async fn verify_command_is_rendered_before_the_sink() {
     let runner = lift_async(|_a: &Action| Ok(serde_json::json!({ "ok": true })));
-    let engine = WorkflowEngine::local_with_async_effect_runner(Some(runner)).expect("recording engine");
+    let engine =
+        WorkflowEngine::local_with_async_effect_runner(Some(runner)).expect("recording engine");
     let wf = parse_workflow(
         r##"
 name: verify-render
@@ -1863,8 +1874,7 @@ async fn effect_runner_observes_the_executed_verify_result() {
         *observed_c.lock().unwrap() = inv.run.provider_result.clone();
         Ok(serde_json::json!({ "ok": true, "journaled": true }))
     });
-    let engine =
-        WorkflowEngine::local_with_effect_runner(Some(fx)).expect("engine with runner");
+    let engine = WorkflowEngine::local_with_effect_runner(Some(fx)).expect("engine with runner");
     let wf = parse_workflow(
         r##"
 name: verify-observed
@@ -1988,7 +1998,8 @@ steps:
         *calls_c.lock().unwrap() += 1;
         Ok(serde_json::json!({ "journaled": true }))
     });
-    let engine = WorkflowEngine::local_with_resolvers_and_effect(profile_resolver,
+    let engine = WorkflowEngine::local_with_resolvers_and_effect(
+        profile_resolver,
         workflow_resolver,
         Some(fx),
     )
@@ -2079,7 +2090,8 @@ async fn value_returning_action_flows_into_downstream_template() {
             other => Ok(serde_json::json!({ "action": other.type_name() })),
         }
     });
-    let engine = WorkflowEngine::local_with_async_effect_runner(Some(runner.clone())).expect("engine");
+    let engine =
+        WorkflowEngine::local_with_async_effect_runner(Some(runner.clone())).expect("engine");
 
     let wf = parse_workflow(
         r##"
@@ -2240,7 +2252,8 @@ async fn invoke_redelivery_replays_recorded_run() {
         calls_c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(serde_json::json!({ "ok": true }))
     });
-    let engine = WorkflowEngine::local_with_async_effect_runner(Some(runner)).expect("local engine");
+    let engine =
+        WorkflowEngine::local_with_async_effect_runner(Some(runner)).expect("local engine");
     let wf = crate::parse_workflow(
         "name: t\nsteps:\n  - name: a\n    action: send_message\n    to: [x]\n    subject: s\n    body: b\n",
     )
@@ -2342,9 +2355,9 @@ graph:
     assert_eq!(out["error"], "boom");
 
     // Presence of `error` without `ok:false` is NOT a failure — run succeeds.
-    let engine2 = WorkflowEngine::local_with_async_effect_runner(Some(lift_async(
-        |_: &Action| Ok(serde_json::json!({ "ok": true, "error": "something" })),
-    )))
+    let engine2 = WorkflowEngine::local_with_async_effect_runner(Some(lift_async(|_: &Action| {
+        Ok(serde_json::json!({ "ok": true, "error": "something" }))
+    })))
     .expect("engine2");
     let wf2 = parse_workflow(
         r##"
@@ -3028,7 +3041,8 @@ fn phases(seen: &Arc<std::sync::Mutex<Vec<RunTransition>>>) -> Vec<RunPhase> {
 #[tokio::test]
 async fn run_lifecycle_rows_are_journaled_for_a_successful_run() {
     let (journal, seen) = recording_run_journal();
-    let engine = WorkflowEngine::local_with_resolvers_effect_mode_and_run_journal(WorkflowEngine::default_resolver(),
+    let engine = WorkflowEngine::local_with_resolvers_effect_mode_and_run_journal(
+        WorkflowEngine::default_resolver(),
         WorkflowEngine::default_workflow_resolver(),
         None,
         EffectJournalMode::Recording,
@@ -3081,7 +3095,8 @@ steps:
 #[tokio::test]
 async fn run_lifecycle_rows_report_failure() {
     let (journal, seen) = recording_run_journal();
-    let engine = WorkflowEngine::local_with_resolvers_effect_mode_and_run_journal(WorkflowEngine::default_resolver(),
+    let engine = WorkflowEngine::local_with_resolvers_effect_mode_and_run_journal(
+        WorkflowEngine::default_resolver(),
         WorkflowEngine::default_workflow_resolver(),
         None,
         EffectJournalMode::Recording,
@@ -3125,7 +3140,8 @@ steps:
 #[tokio::test]
 async fn run_lifecycle_is_silent_without_a_journal() {
     let runner = lift_async(|_a: &Action| Ok(serde_json::json!({ "ok": true })));
-    let engine = WorkflowEngine::local_with_async_effect_runner(Some(runner)).expect("journal-less engine");
+    let engine =
+        WorkflowEngine::local_with_async_effect_runner(Some(runner)).expect("journal-less engine");
     let wf = parse_workflow(
         r##"
 name: lifecycle-silent
@@ -3153,7 +3169,8 @@ steps:
 #[tokio::test]
 async fn delay_returns_typed_unit() {
     let runner = noop_async();
-    let engine = WorkflowEngine::local_with_async_effect_runner(Some(runner.clone())).expect("engine");
+    let engine =
+        WorkflowEngine::local_with_async_effect_runner(Some(runner.clone())).expect("engine");
     let wf = parse_workflow(
         r##"
 name: timer-unit
@@ -3191,7 +3208,8 @@ steps:
 #[tokio::test]
 async fn delay_over_cap_clamps_loud() {
     let runner = noop_async();
-    let engine = WorkflowEngine::local_with_async_effect_runner(Some(runner.clone())).expect("engine");
+    let engine =
+        WorkflowEngine::local_with_async_effect_runner(Some(runner.clone())).expect("engine");
     let over = crate::lint::DELAY_CAP_SECS + 10_000;
     let wf = parse_workflow(&format!(
         r##"

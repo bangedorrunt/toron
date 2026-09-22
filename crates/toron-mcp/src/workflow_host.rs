@@ -25,14 +25,18 @@
 
 use std::sync::{Arc, PoisonError};
 
+use crate::send_armor::{
+    ARMOR_MAX_CONCURRENCY, ARMOR_SEND_TIMEOUT, ArmorError, SendArmor, SendFuture, SendRequest,
+    passthrough,
+};
 use anyhow::{Context, Result};
 use nostr::prelude::{Event, EventBuilder, EventId, FinalizeEvent, Keys, Kind, Tag, Timestamp};
 use toron_core::bus::{Bus, SubscriptionEvent};
 use toron_core::mailbox::{Mailbox, SendMessage, UnwrappedMail};
 use toron_workflow::coalesce::{CoalesceDecision, Coalesced, MentionCoalescer};
 use toron_workflow::engine::{
-    ActionInvocation, ActionPartition, AsyncEffectRunner, AsyncRunJournal,
-    CleanupKind, CleanupRequest, Decision, DispatchPlan, EffectJournalMode, EffectView,
+    ActionInvocation, ActionPartition, AsyncEffectRunner, AsyncRunJournal, CleanupKind,
+    CleanupRequest, Decision, DispatchPlan, EffectJournalMode, EffectView,
     FORCED_CLEANUP_CAPABILITY, ParkKind, PendingEntry, PendingRegistry, ProviderCapability,
     ProviderErrorClass, ProviderOutcome, Resolution, ResolutionMismatch, ResolutionVerdict,
     RunInput, RunPhase, RunTransition, TerminalLedger, TerminalNote, TerminalRecord, UnknownReport,
@@ -40,10 +44,6 @@ use toron_workflow::engine::{
     cleanup_effect_key, corr_for_effect, derive_effect_key, describe_unknown,
     failure_for_control_misdispatch, failure_for_unsupported, normalize_dispatch_result,
     plan_attempt, terminal_digest, validate_resolution,
-};
-use crate::send_armor::{
-    ARMOR_MAX_CONCURRENCY, ARMOR_SEND_TIMEOUT, ArmorError, SendArmor, SendFuture, SendRequest,
-    passthrough,
 };
 use toron_workflow::jobs::{JobRequest, build_job_request_with_tags};
 use toron_workflow::schema::{Action, Trigger, Workflow};
@@ -312,8 +312,15 @@ pub fn mailbox_async_effect_runner(
                 }
                 ActionPartition::HostSink { .. } => normalize_dispatch_result(
                     &inv,
-                    dispatch_host_sink(mailbox, coalescer, job_signer, dispatcher, armor, inv.clone())
-                        .await,
+                    dispatch_host_sink(
+                        mailbox,
+                        coalescer,
+                        job_signer,
+                        dispatcher,
+                        armor,
+                        inv.clone(),
+                    )
+                    .await,
                 ),
             };
             Ok(match outcome {
@@ -532,9 +539,9 @@ async fn send_via_dispatch(
                 Ok(count) => Ok(serde_json::json!({ "ok": true, "count": count })),
                 Err(e) => Err(anyhow::anyhow!(e)),
             },
-            Err(ArmorError::BreakerOpen) => {
-                Err(anyhow::anyhow!("send refused: breaker open (storm fail-fast)"))
-            }
+            Err(ArmorError::BreakerOpen) => Err(anyhow::anyhow!(
+                "send refused: breaker open (storm fail-fast)"
+            )),
             Err(ArmorError::Ambiguous(e)) => Err(anyhow::anyhow!(e)),
         };
     };
@@ -2407,11 +2414,7 @@ mod tests {
             let value = serde_json::json!({ "action": inv.action.type_name() });
             Box::pin(async move { Ok(value) })
                 as std::pin::Pin<
-                    Box<
-                        dyn std::future::Future<
-                            Output = anyhow::Result<serde_json::Value>,
-                        > + Send,
-                    >,
+                    Box<dyn std::future::Future<Output = anyhow::Result<serde_json::Value>> + Send>,
                 >
         });
 
@@ -2995,11 +2998,7 @@ mod tests {
             }
             Box::pin(async move { Ok(serde_json::Value::Null) })
                 as std::pin::Pin<
-                    Box<
-                        dyn std::future::Future<
-                            Output = anyhow::Result<serde_json::Value>,
-                        > + Send,
-                    >,
+                    Box<dyn std::future::Future<Output = anyhow::Result<serde_json::Value>> + Send>,
                 >
         });
 
@@ -3366,8 +3365,7 @@ steps:
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn host_lifecycle_drain_records_structured_entry() {
         use toron_workflow::engine::ParkKind;
-        let engine = WorkflowEngine::local()
-            .expect("local engine");
+        let engine = WorkflowEngine::local().expect("local engine");
         engine
             .approval_sink()
             .lock()
@@ -3398,8 +3396,7 @@ steps:
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn host_lifecycle_restart_recovery() {
         use toron_workflow::engine::ParkKind;
-        let engine = WorkflowEngine::local()
-            .expect("local engine");
+        let engine = WorkflowEngine::local().expect("local engine");
         engine
             .approval_sink()
             .lock()
@@ -3428,8 +3425,7 @@ steps:
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn host_lifecycle_stale_resolution_ignored() {
         use toron_workflow::engine::{Resolution, ResolutionMismatch, ResolutionVerdict};
-        let engine = WorkflowEngine::local()
-            .expect("local engine");
+        let engine = WorkflowEngine::local().expect("local engine");
         engine
             .approval_sink()
             .lock()

@@ -34,9 +34,7 @@ fn recording_runner(seen: Arc<Mutex<Vec<Action>>>) -> AsyncEffectRunner {
         seen_clone.lock().unwrap().push(inv.action.clone());
         Box::pin(async move { Ok(serde_json::Value::Null) })
             as std::pin::Pin<
-                Box<
-                    dyn std::future::Future<Output = anyhow::Result<serde_json::Value>> + Send,
-                >,
+                Box<dyn std::future::Future<Output = anyhow::Result<serde_json::Value>> + Send>,
             >
     })
 }
@@ -142,7 +140,11 @@ async fn sc21_cron_durable_loop_fires_and_resumes_after_restart() {
         Arc::new(move || vec![reg.clone()])
     };
     let engine_a = Arc::new(
-        WorkflowEngine::remote_with_async_effect_runner(&server_url, Some(recording_runner(seen_a.clone()))).expect("engine A"),
+        WorkflowEngine::remote_with_async_effect_runner(
+            &server_url,
+            Some(recording_runner(seen_a.clone())),
+        )
+        .expect("engine A"),
     );
     let mgr_a = CronManager::new(engine_a.clone(), registry.clone()).expect("manager A");
     mgr_a.start().await.expect("start loop A");
@@ -172,7 +174,11 @@ async fn sc21_cron_durable_loop_fires_and_resumes_after_restart() {
     //    fires through the new worker.
     let seen_b: Arc<Mutex<Vec<Action>>> = Arc::new(Mutex::new(Vec::new()));
     let engine_b = Arc::new(
-        WorkflowEngine::remote_with_async_effect_runner(&server_url, Some(recording_runner(seen_b.clone()))).expect("engine B"),
+        WorkflowEngine::remote_with_async_effect_runner(
+            &server_url,
+            Some(recording_runner(seen_b.clone())),
+        )
+        .expect("engine B"),
     );
     let mgr_b = CronManager::new(engine_b.clone(), registry).expect("manager B");
     mgr_b.start().await.expect("start loop B");

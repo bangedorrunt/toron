@@ -1,19 +1,22 @@
 [
   {
-    "pane_id": "w14:p1",
-    "name": "flywheel-toron-coder",
-    "profile": "coder",
-    "harness": "opencode",
-    "mail_identity": "BlueRidge",
+    "pane_id": "w13:p1",
+    "name": "flywheel-toron-pi",
+    "mail_identity": "HazySparrow",
     "skills_injected": false,
     "incarnation": 0
   },
   {
-    "pane_id": "w14:p2",
-    "name": "flywheel-toron-coder2",
-    "profile": "coder",
-    "harness": "opencode",
-    "mail_identity": "ChartreuseChapel",
+    "pane_id": "w13:p2",
+    "name": "flywheel-toron-pi2",
+    "mail_identity": "TanSnow",
+    "skills_injected": false,
+    "incarnation": 0
+  },
+  {
+    "pane_id": "w13:p3",
+    "name": "flywheel-toron-pi3",
+    "mail_identity": "RubyCitadel",
     "skills_injected": false,
     "incarnation": 0
   }

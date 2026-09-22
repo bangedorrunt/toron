@@ -310,8 +310,7 @@ impl GitArchive {
     }
 
     /// Default bound for the binary commit path (G2).
-    pub const BINARY_COMMIT_TIMEOUT: std::time::Duration =
-        std::time::Duration::from_secs(30);
+    pub const BINARY_COMMIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
     /// Bounded binary commit: validates the binary, spawns, polls to the
     /// deadline, kills past it. Timeout inside, kill outside — the edge
@@ -438,12 +437,10 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755))
-                .unwrap();
+            std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
         let root = temp_root("hangroot");
-        let archive =
-            GitArchive::open_or_init_with_binary(&root, Some(shim)).expect("init");
+        let archive = GitArchive::open_or_init_with_binary(&root, Some(shim)).expect("init");
         let start = std::time::Instant::now();
         let err = archive
             .commit_via_binary_with_timeout("msg", std::time::Duration::from_secs(1))

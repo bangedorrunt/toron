@@ -22,9 +22,7 @@ fn noop_runner() -> AsyncEffectRunner {
     Arc::new(|_: &toron_workflow::engine::ActionInvocation| {
         Box::pin(async move { Ok(serde_json::Value::Null) })
             as std::pin::Pin<
-                Box<
-                    dyn std::future::Future<Output = anyhow::Result<serde_json::Value>> + Send,
-                >,
+                Box<dyn std::future::Future<Output = anyhow::Result<serde_json::Value>> + Send>,
             >
     })
 }
@@ -104,12 +102,12 @@ async fn sc18_spawn_no_claim_timeout_aborts() {
     wait_ready(&server_url).await;
 
     let engine = WorkflowEngine::remote_with_resolvers_and_async_effect(
-            &server_url,
-            housekeeper_resolver(),
-            WorkflowEngine::default_workflow_resolver(),
-            Some(noop_runner()),
-        )
-        .expect("engine");
+        &server_url,
+        housekeeper_resolver(),
+        WorkflowEngine::default_workflow_resolver(),
+        Some(noop_runner()),
+    )
+    .expect("engine");
     let wf = parse_workflow(
         r##"
 name: spawn-timeout

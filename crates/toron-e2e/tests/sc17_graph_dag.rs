@@ -27,16 +27,15 @@ fn value_runner() -> AsyncEffectRunner {
         };
         Box::pin(async move { Ok(value) })
             as std::pin::Pin<
-                Box<
-                    dyn std::future::Future<Output = anyhow::Result<serde_json::Value>> + Send,
-                >,
+                Box<dyn std::future::Future<Output = anyhow::Result<serde_json::Value>> + Send>,
             >
     })
 }
 
 #[tokio::test]
 async fn graph_dag_runs_through_engine() {
-    let engine = WorkflowEngine::local_with_async_effect_runner(Some(value_runner())).expect("engine");
+    let engine =
+        WorkflowEngine::local_with_async_effect_runner(Some(value_runner())).expect("engine");
     let wf = parse_workflow(
         r##"
 name: sc17-ship
