@@ -86,7 +86,7 @@ enum BreakerState {
 }
 
 /// Breaker clock: production is wall time, tests inject a manual clock
-/// (bd-i7ld — no `tokio::time::Instant::now()` in the decision logic,
+/// (bd-mbck — no `tokio::time::Instant::now()` in the decision logic,
 /// so recovery is deterministic with no real sleeps).
 pub type ClockFn = Arc<dyn Fn() -> tokio::time::Instant + Send + Sync>;
 
@@ -216,7 +216,7 @@ impl CircuitBreaker {
 
     /// Observe one completed inner call. The clock is injected: `Open`
     /// deadlines and `HalfOpen` re-opens read `(self.clock)()`, never
-    /// wall time directly (bd-i7ld).
+    /// wall time directly (bd-mbck).
     fn observe(&self, failed: bool) {
         let threshold = self.threshold;
         let reset_after = self.reset_after;
@@ -272,7 +272,7 @@ impl Service<SendRequest> for CircuitBreaker {
             if let BreakerState::Open { retry_at } = *state {
                 if (self.clock)() >= retry_at {
                     // Time opens the gate; the probe permit is taken in
-                    // `call`, so exactly one probe is admitted (bd-i7ld).
+                    // `call`, so exactly one probe is admitted (bd-mbck).
                     *state = BreakerState::HalfOpen {
                         probe_in_flight: false,
                     };
@@ -300,7 +300,7 @@ impl Service<SendRequest> for CircuitBreaker {
     }
 
     fn call(&mut self, req: SendRequest) -> Self::Future {
-        // The permit lives here, one atomic take under the lock (bd-i7ld):
+        // The permit lives here, one atomic take under the lock (bd-mbck):
         // the shared state may have moved since `poll_ready` (an older
         // in-flight call settling re-opens), so re-check. A taken permit
         // or an Open breaker refuses WITHOUT touching inner.
@@ -440,7 +440,7 @@ mod armor_matrix_tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-    /// Manual test clock (bd-i7ld): drives Open -> HalfOpen -> probe with
+    /// Manual test clock (bd-mbck): drives Open -> HalfOpen -> probe with
     /// no real sleeps. Production always uses the default system clock.
 
     /// One fake send service: counts calls, answers per the script.
@@ -616,7 +616,7 @@ mod armor_matrix_tests {
         }
     }
 
-    /// bd-i7ld: while one probe is in flight the second caller is refused
+    /// bd-mbck: while one probe is in flight the second caller is refused
     /// WITHOUT touching the inner service — one probe means one.
     #[tokio::test]
     async fn halfopen_second_caller_refused_while_probe_in_flight() {
@@ -688,7 +688,7 @@ mod armor_matrix_tests {
         assert_eq!(calls.load(Ordering::SeqCst), 3);
     }
 
-    /// bd-i7ld: the injected clock alone drives recovery — open refuses,
+    /// bd-mbck: the injected clock alone drives recovery — open refuses,
     /// advancing past the reset admits exactly one probe. No sleeps.
     #[tokio::test]
     async fn injected_clock_drives_recovery_without_sleep() {
