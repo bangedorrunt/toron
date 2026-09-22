@@ -43,8 +43,8 @@ use toron_core::nostr::event::build_event;
 use toron_core::nostr::kinds::toron_kind;
 use toron_core::nostr::presence::{PresencePayload, PresenceState, build_presence_event};
 use toron_workflow::channels::{
-    CHANNEL_CREATE_LEGACY, CHANNEL_MESSAGE,
-    CHANNEL_MESSAGE_LEGACY, CHANNEL_METADATA_LEGACY, ChannelStore, REACTION,
+    CHANNEL_CREATE_LEGACY, CHANNEL_MESSAGE, CHANNEL_MESSAGE_LEGACY, CHANNEL_METADATA_LEGACY,
+    ChannelStore, REACTION,
 };
 use toron_workflow::coalesce::MentionCoalescer;
 use toron_workflow::jobs::{
@@ -1335,23 +1335,93 @@ fn parse_kinds(s: &str) -> anyhow::Result<Vec<u16>> {
         .collect()
 }
 
-/// Print one event in the binding watch shape `{kind, id, pubkey, content,
-/// tags, created_at}` as NDJSON. `created_at` is gap 1 fix: the dispatcher
-/// needs a persisted plane-S cursor to avoid replay storms.
+/// Build one event line in the binding watch shape `{kind, id, pubkey,
+/// content, tags, created_at}` as NDJSON. `created_at` is gap 1 fix: the
+/// dispatcher needs a persisted plane-S cursor to avoid replay storms.
+///
+/// ONE mapping, two transports: the in-process tail and the wake.sock
+/// tail (slice B, ADR-0036) both print through here, so consumers cannot
+/// tell the transport apart (BrainMsg mapping byte-identical).
+pub(crate) fn format_watch_line(
+    kind: u16,
+    id: &str,
+    pubkey: &str,
+    content: &str,
+    tags: &[Vec<String>],
+    created_at: u64,
+) -> String {
+    let v = serde_json::json!({
+        "kind": kind,
+        "id": id,
+        "pubkey": pubkey,
+        "content": content,
+        "tags": tags,
+        "created_at": created_at,
+    });
+    serde_json::to_string(&v).expect("watch event serializes")
+}
+
+/// Print one event in the binding watch shape (see [`format_watch_line`]).
 fn print_watch_event(ev: &Event) {
     let tags: Vec<Vec<String>> = ev.tags.iter().map(|t| t.clone().to_vec()).collect();
-    let v = serde_json::json!({
-        "kind": ev.kind.as_u16(),
-        "id": ev.id.to_hex(),
-        "pubkey": ev.pubkey.to_hex(),
-        "content": ev.content,
-        "tags": tags,
-        "created_at": ev.created_at.as_secs(),
-    });
     println!(
         "{}",
-        serde_json::to_string(&v).expect("watch event serializes")
+        format_watch_line(
+            ev.kind.as_u16(),
+            &ev.id.to_hex(),
+            &ev.pubkey.to_hex(),
+            &ev.content,
+            &tags,
+            ev.created_at.as_secs(),
+        )
     );
+}
+
+/// Raw `t` tag slug with the `toron:`-internal skip (mirrors
+/// [`event_project`]: project-scoped tags match, internal tags and
+/// un-scoped events pass through as project-agnostic).
+fn raw_project_tag(tags: &[Vec<String>]) -> Option<&str> {
+    tags.iter().find_map(|t| {
+        if t.first().map(|s| s.as_str()) != Some("t") {
+            return None;
+        }
+        let c = t.get(1)?;
+        if c.starts_with("toron:") {
+            return None;
+        }
+        Some(c.as_str())
+    })
+}
+
+/// Shared watch emit gate over raw tag vectors (bd-981p, slice B): the
+/// socket tail and the in-process paths filter here, never in two
+/// places, so the cutover cannot drift them apart. Returns true when the
+/// event passes (the caller prints it through [`format_watch_line`]).
+pub(crate) fn watch_gate(
+    seen: &mut HashSet<String>,
+    id: &str,
+    tags: &[Vec<String>],
+    project: &str,
+    channel: &Option<String>,
+) -> bool {
+    if !seen.insert(id.to_string()) {
+        return false;
+    }
+    if let Some(slug) = raw_project_tag(tags)
+        && slug != project
+    {
+        return false;
+    }
+    if let Some(ch) = channel {
+        let h = tags
+            .iter()
+            .find(|t| t.first().map(|s| s.as_str()) == Some("h"))
+            .and_then(|t| t.get(1));
+        if h != Some(&ch) {
+            return false;
+        }
+    }
+    true
 }
 
 /// Shared watch emit gate (bd-r328, minimize-reader-load): dedup +
@@ -1359,15 +1429,8 @@ fn print_watch_event(ev: &Event) {
 /// cannot drift apart. Returns true when the event was printed (the
 /// `--once` signal).
 fn watch_emit(seen: &mut HashSet<String>, args: &WatchArgs, ev: &Event) -> bool {
-    if !seen.insert(ev.id.to_hex()) {
-        return false;
-    }
-    if !in_project(ev, &args.project) {
-        return false;
-    }
-    if let Some(ch) = &args.channel
-        && event_channel(ev).as_deref() != Some(ch.as_str())
-    {
+    let tags: Vec<Vec<String>> = ev.tags.iter().map(|t| t.clone().to_vec()).collect();
+    if !watch_gate(seen, &ev.id.to_hex(), &tags, &args.project, &args.channel) {
         return false;
     }
     print_watch_event(ev);
@@ -1568,6 +1631,37 @@ async fn watch_live(mailbox: &Mailbox, args: &WatchArgs) -> anyhow::Result<()> {
         filter = filter.custom_tag(nostr::filter::SingleLetterTag::LOWERCASE_P, np);
     }
     eprintln!("watch --live kinds={}", args.kinds);
+    // Slice B (bd-981p, ADR-0036 Spec 8 row 2): socket tail behind
+    // `--watch-sock`. Absent socket degrades LOUD to the in-process
+    // replay+live below, never silent. NO deletions (wave 3).
+    if args.watch_sock {
+        let mut cfg = crate::wake_sock::WakeSockConfig::discover(kinds.clone());
+        cfg.project = Some(args.project.clone());
+        let tail = crate::wake_sock::WakeSockTail::new(cfg);
+        let mut seen: HashSet<String> = HashSet::new();
+        let project = args.project.clone();
+        let channel = args.channel.clone();
+        match tail
+            .run(&mut |ev| {
+                if !watch_gate(&mut seen, &ev.id, &ev.tags, &project, &channel) {
+                    return false;
+                }
+                println!("{}", crate::wake_sock::format_sock_line(ev));
+                true
+            })
+            .await
+        {
+            Ok(crate::wake_sock::TailOutcome::Done { .. }) => return Ok(()),
+            Ok(crate::wake_sock::TailOutcome::Shed { resync_from }) => {
+                eprintln!(
+                    "wake.sock shed (slow consumer) resync_from={resync_from} — replaying from store, then live (LOUD fallback)"
+                );
+            }
+            Err(e) => {
+                eprintln!("{e}");
+            }
+        }
+    }
     // Collect replay first (so late joiners see history), then stream live.
     let replay = collect_trusted(mailbox.bus().as_ref(), filter.clone()).await?;
     let mut seen: HashSet<String> = HashSet::new();
@@ -1868,6 +1962,7 @@ mod live_watch_tests {
             once: false,
             timeout_ms: None,
             live: true,
+            watch_sock: false,
             idle_exit: Some(1),
         };
         let started = std::time::Instant::now();
@@ -1919,6 +2014,7 @@ mod live_watch_tests {
             once: false,
             timeout_ms: None,
             live: true,
+            watch_sock: false,
             idle_exit: Some(1),
         };
         // Spawn the watch; it must still be running 1.1s later (one idle
