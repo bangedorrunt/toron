@@ -137,9 +137,9 @@ Chosen option: **Option A**, because the socket already has a proven pattern (he
 
 | Consumer | Today | Target | Flag |
 |---|---|---|---|
-| doorbell `FileHost` watch | `toron watch --live` child + respawn loop | `wake.sock` subscription, same `BrainMsg::Watch/Died` mapping | `doorbell.watch_sock` |
-| toron `watch --live` | in-process tail or pump | socket tail when daemon present, else today's paths | `toron.watch_sock` |
-| `wait --corr` unpark | any-bus-event wake + store re-check | socket wake + same store re-check (store stays the truth) | same as above |
+| doorbell `FileHost` watch | `toron watch --live` child + respawn loop | `wake.sock` subscription, same `BrainMsg::Watch/Died` mapping | removed (wave 4, bd-ud7k) |
+| toron `watch --live` | in-process tail or pump | socket tail when daemon present, else today's paths | removed (wave 4, bd-ud7k) |
+| `wait --corr` unpark | any-bus-event wake + store re-check | socket wake + same store re-check (store stays the truth) | removed (wave 4, bd-ud7k) |
 | per-pin inbox sweep | CLI fork per pin per sweep | unchanged initially (correctness first; socket inbox later, explicitly out of scope) | — |
 
 1. Migrate in the table's order (daemon consumer first — biggest win).
@@ -184,3 +184,10 @@ Chosen option: **Option A**, because the socket already has a proven pattern (he
 - No-go record it answers: bd-un5s (design record on the bead).
 - Revisit triggers: Phase-1 relay policy lift (revisit §4 option C); Resonate streaming primitive appearing (revisit park-only assumption); socket shed rate above tuned baseline.
 - Status changes append here with date stamps.
+- 2026-09-22 (bd-ud7k, wave 4): cutover flags removed on both sides
+  (`toron.watch_sock`, `doorbell.watch_sock`); socket tail is the
+  unconditional path with LOUD in-process fallback. Shed counters exported
+  (`WakeHandle::aggregate_stats`: exact delivered/shed sums + live gauge;
+  disconnects reap on the heartbeat write so error paths keep their counts).
+  Deaf-vs-quiet asserted (`wake_bus_quiet_gets_heartbeat_deaf_gets_eof`:
+  quiet bus heartbeats on the injected clock, dead server reads EOF).

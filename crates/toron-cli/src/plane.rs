@@ -1511,7 +1511,9 @@ async fn watch_once(mailbox: &Mailbox, args: &WatchArgs) -> anyhow::Result<()> {
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
     let filter = watch_filter(mailbox, args, &kinds).await?;
     eprintln!("watching kinds={}", args.kinds);
-    if args.watch_sock {
+    // Wave 4 (bd-ud7k): the socket tail is the path, no flag. Absent
+    // socket degrades LOUD to the in-process replay+live below.
+    {
         let mut cfg = crate::wake_sock::WakeSockConfig::discover(kinds.clone());
         cfg.project = Some(args.project.clone());
         let tail = crate::wake_sock::WakeSockTail::new(cfg);
@@ -1751,10 +1753,11 @@ async fn watch_live(mailbox: &Mailbox, args: &WatchArgs) -> anyhow::Result<()> {
     let kinds = parse_kinds(&args.kinds)?;
     let filter = watch_filter(mailbox, args, &kinds).await?;
     eprintln!("watch --live kinds={}", args.kinds);
-    // Socket tail behind `--watch-sock` (slices B+C, ADR-0036 Spec 8).
-    // Absent socket degrades LOUD to the in-process replay+live below,
-    // never silent. The 1s snapshot pump is deleted (bd-qg6w, wave 3).
-    if args.watch_sock {
+    // Wave 4 (bd-ud7k): the socket tail is the path, no flag (slices B+C,
+    // ADR-0036 Spec 8). Absent socket degrades LOUD to the in-process
+    // replay+live below, never silent. The 1s snapshot pump is deleted
+    // (bd-qg6w, wave 3).
+    {
         let mut cfg = crate::wake_sock::WakeSockConfig::discover(kinds.clone());
         cfg.project = Some(args.project.clone());
         let tail = crate::wake_sock::WakeSockTail::new(cfg);
@@ -2083,7 +2086,6 @@ mod live_watch_tests {
             once: false,
             timeout_ms: None,
             live: true,
-            watch_sock: false,
             idle_exit: Some(1),
         };
         let started = std::time::Instant::now();
@@ -2135,7 +2137,6 @@ mod live_watch_tests {
             once: false,
             timeout_ms: None,
             live: true,
-            watch_sock: false,
             idle_exit: Some(1),
         };
         // Spawn the watch; it must still be running 1.1s later (one idle

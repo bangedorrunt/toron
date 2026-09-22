@@ -81,7 +81,7 @@
       "name": "presence"
     },
     {
-      "args": "--project <PROJECT>, --as <AS_NAME>, --kinds <KINDS>, --channel <CHANNEL>, --once, --timeout-ms <TIMEOUT_MS>, --live, --watch-sock, --idle-exit <IDLE_EXIT>",
+      "args": "--project <PROJECT>, --as <AS_NAME>, --kinds <KINDS>, --channel <CHANNEL>, --once, --timeout-ms <TIMEOUT_MS>, --live, --idle-exit <IDLE_EXIT>",
       "description": "Watch the shared plane (NIP-01 REQ): --once exits on first match",
       "name": "watch"
     },
@@ -146,7 +146,7 @@
       "name": "role"
     }
   ],
-  "generated_at": "2026-09-22T06:29:54Z",
+  "generated_at": "2026-09-22T07:19:36Z",
   "resources": [
     {
       "description": "List projects known to toron.",
