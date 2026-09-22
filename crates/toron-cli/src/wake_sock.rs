@@ -224,14 +224,11 @@ impl WakeSockTail {
         Self { config }
     }
 
-    /// Connect, subscribe, then replay-then-live. `emit` returns true when
-    /// the event was printed (same contract as the in-process emit gate).
-    /// Heartbeats reset the idle clock; EOSE records the cursor and the
-    /// stream continues live; shed returns [`TailOutcome::Shed`].
-    pub async fn run(
-        &self,
-        emit: &mut impl FnMut(&SockEvent) -> bool,
-    ) -> Result<TailOutcome, WakeSockError> {
+    /// Connect and subscribe. Hands back an open connection for callers
+    /// that need per-frame control (`--once` match-or-deadline, `wait
+    /// --corr` store re-check per wake — both must `await` between frames,
+    /// which a sync `emit` closure cannot).
+    pub async fn connect(&self) -> Result<WakeSockConn, WakeSockError> {
         let path = &self.config.sock_path;
         if !Path::new(path).exists() {
             return Err(WakeSockError::Absent(path.clone()));
@@ -266,44 +263,109 @@ impl WakeSockTail {
             path: path.clone(),
             reason: e.to_string(),
         })?;
-        let mut lines = BufReader::new(read_half).lines();
-        let mut last_cursor: Option<String> = self.config.since_cursor.clone();
+        Ok(WakeSockConn {
+            lines: BufReader::new(read_half).lines(),
+            path: path.clone(),
+            idle_timeout: self.config.idle_timeout,
+            last_cursor: self.config.since_cursor.clone(),
+        })
+    }
+
+    /// Connect, subscribe, then replay-then-live. `emit` returns false to
+    /// stop the tail after a match (`--once`); true keeps tailing.
+    /// Heartbeats reset the idle clock; EOSE records the cursor and the
+    /// stream continues live; shed returns [`TailOutcome::Shed`].
+    pub async fn run(
+        &self,
+        emit: &mut impl FnMut(&SockEvent) -> bool,
+    ) -> Result<TailOutcome, WakeSockError> {
+        let mut conn = self.connect().await?;
         loop {
-            let next = tokio::time::timeout(self.config.idle_timeout, lines.next_line())
+            match conn.next().await? {
+                ConnEvent::Event(ev) => {
+                    if !emit(&ev) {
+                        return Ok(TailOutcome::Done {
+                            last_cursor: conn.last_cursor.clone(),
+                        });
+                    }
+                }
+                ConnEvent::Eose | ConnEvent::Heartbeat => {}
+                ConnEvent::Shed { resync_from } => {
+                    return Ok(TailOutcome::Shed { resync_from });
+                }
+                ConnEvent::Closed => {
+                    return Ok(TailOutcome::Done {
+                        last_cursor: conn.last_cursor.clone(),
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// One item from the socket stream (bd-qg6w, wave 3): per-frame control
+/// for callers that must `await` between frames.
+#[derive(Debug, PartialEq)]
+pub enum ConnEvent {
+    Event(SockEvent),
+    Eose,
+    Heartbeat,
+    Shed { resync_from: String },
+    Closed,
+}
+
+/// An open wake.sock subscription. Owned lines + path; closes on drop
+/// (RAII — no spawned tasks, nothing to leak).
+pub struct WakeSockConn {
+    lines: tokio::io::Lines<BufReader<tokio::net::unix::OwnedReadHalf>>,
+    path: PathBuf,
+    idle_timeout: Duration,
+    /// Newest EOSE cursor seen (resume point for resubscribe).
+    pub last_cursor: Option<String>,
+}
+
+impl WakeSockConn {
+    /// Next frame, bounded by the idle ceiling (any frame — event, EOSE,
+    /// even heartbeat — resets it; silence past it is a deaf watcher).
+    pub async fn next(&mut self) -> Result<ConnEvent, WakeSockError> {
+        loop {
+            let next = tokio::time::timeout(self.idle_timeout, self.lines.next_line())
                 .await
-                .map_err(|_| WakeSockError::IdleTimeout { path: path.clone() })?
+                .map_err(|_| WakeSockError::IdleTimeout {
+                    path: self.path.clone(),
+                })?
                 .map_err(|e| WakeSockError::Connect {
-                    path: path.clone(),
+                    path: self.path.clone(),
                     reason: e.to_string(),
                 })?;
             let Some(raw) = next else {
-                return Ok(TailOutcome::Done { last_cursor });
+                return Ok(ConnEvent::Closed);
             };
             if raw.trim().is_empty() {
                 continue;
             }
             let frame: SockFrame =
                 serde_json::from_str(&raw).map_err(|e| WakeSockError::BadFrame {
-                    path: path.clone(),
+                    path: self.path.clone(),
                     reason: e.to_string(),
                 })?;
             match frame {
-                SockFrame::Event(ev) => {
-                    emit(&ev);
-                }
+                SockFrame::Event(ev) => return Ok(ConnEvent::Event(ev)),
                 SockFrame::Eose(e) => {
                     // Replay complete; the stream continues live on the
                     // same socket (replay-then-live, one connection).
-                    last_cursor = e.cursor;
+                    self.last_cursor = e.cursor;
+                    return Ok(ConnEvent::Eose);
                 }
                 SockFrame::Heartbeat(h) => {
                     // Quiet-bus proof: the arrival itself resets the
                     // idle clock. The stamp is the server's, kept for
                     // skew inspection, never trusted as our clock.
                     let _ = h.ts_ms;
+                    return Ok(ConnEvent::Heartbeat);
                 }
                 SockFrame::Shed(s) => {
-                    return Ok(TailOutcome::Shed {
+                    return Ok(ConnEvent::Shed {
                         resync_from: s.resync_from,
                     });
                 }
@@ -453,10 +515,11 @@ mod wake_tail_tests {
         let mut seen: HashSet<String> = HashSet::new();
         let outcome = tail
             .run(&mut |ev| {
-                if !seen.insert(ev.id.clone()) {
-                    return false;
+                // Dedup lives in the caller's gate; the tail only stops
+                // on explicit false (the `--once` contract).
+                if seen.insert(ev.id.clone()) {
+                    order.push(ev.id.clone());
                 }
-                order.push(ev.id.clone());
                 true
             })
             .await
@@ -472,6 +535,33 @@ mod wake_tail_tests {
             vec!["A".to_string(), "B".to_string()],
             "replay then live, dup once"
         );
+        server.abort();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Per-frame control: `connect` + `next` yields frames one at a time
+    /// so callers can `await` between them (the `--once`/`wait` contract).
+    /// Heartbeats surface (liveness proof), never deliveries.
+    #[tokio::test]
+    async fn wake_tail_conn_yields_frames_one_at_a_time() {
+        let path = sock_path("frames");
+        let listener = tokio::net::UnixListener::bind(&path).expect("bind fake wake.sock");
+        let a = sample_event("A");
+        let script = vec![
+            serde_json::json!({"heartbeat": {"ts_ms": 7}}).to_string(),
+            serde_json::json!({"event": a}).to_string(),
+            serde_json::json!({"eose": {"cursor": "c9"}}).to_string(),
+        ];
+        let server = tokio::spawn(fake_server(listener, script));
+        let tail = WakeSockTail::new(WakeSockConfig::new(path.clone(), vec![9]));
+        let mut conn = tail.connect().await.expect("scripted connect");
+        assert_eq!(conn.next().await.expect("frame 1"), ConnEvent::Heartbeat);
+        let ConnEvent::Event(got) = conn.next().await.expect("frame 2") else {
+            panic!("frame 2 must be the event");
+        };
+        assert_eq!(got.id, "A");
+        assert_eq!(conn.next().await.expect("frame 3"), ConnEvent::Eose);
+        assert_eq!(conn.last_cursor.as_deref(), Some("c9"));
         server.abort();
         let _ = std::fs::remove_file(&path);
     }
