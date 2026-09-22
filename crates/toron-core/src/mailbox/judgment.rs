@@ -1766,4 +1766,50 @@ mod tests {
         };
         assert_eq!(fx.len(), 1);
     }
+
+    #[tokio::test]
+    async fn test_success_settles_claim_no_leftovers_bd_pgvf() {
+        // bd-pgvf symptom: journal-after-invoke double-journals and strands
+        // rows. A successful ask settles its claim: exactly one journal row
+        // survives, zero claim rows remain, and a repeat ask replays it.
+        let pool = uhkr_pool().await;
+        let mailbox = uhkr_mailbox(pool.clone()).await;
+        let state = serde_json::json!({"urgency": 0.9});
+        let out = mailbox
+            .ask_judgment(
+                "toron",
+                "k-settle",
+                "wake-priority",
+                &state,
+                "offline",
+                Some(5),
+            )
+            .await
+            .expect("ask settles");
+        assert!(!out.replayed);
+        let (rows,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM judgment_effects")
+            .fetch_one(&pool)
+            .await
+            .expect("count");
+        assert_eq!(rows, 1, "one journal row, never two");
+        let (claims,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM judgment_effects WHERE model_id = '__claim__'")
+                .fetch_one(&pool)
+                .await
+                .expect("count claims");
+        assert_eq!(claims, 0, "no unsettled claim survives success");
+        let replay = mailbox
+            .ask_judgment(
+                "toron",
+                "k-settle",
+                "wake-priority",
+                &state,
+                "offline",
+                Some(5),
+            )
+            .await
+            .expect("replay");
+        assert!(replay.replayed);
+        assert_eq!(replay.record, out.record);
+    }
 }
