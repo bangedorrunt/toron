@@ -1,6 +1,6 @@
 // governed-by: ADR-0036
-//! Slice B surface (bd-981p): socket tail behind `--watch-sock`, loud
-//! fallback, no deletions (wave 3 deletes, not this bead).
+//! Wave 3 surface (bd-qg6w; slices B+C before it): socket tail behind
+//! `--watch-sock`, loud fallback, pump deleted, socket is the live path.
 
 use std::path::PathBuf;
 
@@ -13,14 +13,17 @@ fn src(name: &str) -> String {
 
 #[test]
 fn wake_tail_flag_exists_behind_live() {
+    // clap derives `--watch-sock` from the field name + `#[arg(long)]`;
+    // assert the source pair, not the derived spelling.
     let cli = src("cli.rs");
     assert!(
-        cli.contains("watch_sock"),
-        "WatchArgs must carry --watch-sock"
+        cli.contains("pub watch_sock: bool"),
+        "WatchArgs must carry the watch_sock flag"
     );
+    let field = cli.find("pub watch_sock: bool").unwrap();
     assert!(
-        cli.contains("watch-sock"),
-        "flag must be spelled --watch-sock"
+        cli[..field].rfind("#[arg(long)]").is_some(),
+        "watch_sock must be a long flag (clap derives --watch-sock)"
     );
 }
 
@@ -42,17 +45,26 @@ fn wake_tail_absent_socket_is_loud_never_silent() {
 }
 
 #[test]
-fn wake_tail_no_deletions_wave3() {
-    // Slice B adds the tail; the pump and the in-process live tail stay
-    // until wave 3. Deleting them here strands embedded mode.
+fn wake_tail_wave3_pump_deleted_socket_live() {
+    // Wave 3 (bd-qg6w): the 1s snapshot pump is deleted, the socket tail
+    // is the live path. Pump and socket are never both live (slice C
+    // tripwire contract).
     let plane = src("plane.rs");
     assert!(
-        plane.contains("Re-snapshot sqlite each tick"),
-        "the 1s snapshot pump stays (wave 3 deletes)"
+        !plane.contains("Re-snapshot sqlite each tick"),
+        "the 1s snapshot pump must be deleted (bead VERIFY)"
+    );
+    assert!(
+        !plane.contains("sleep(Duration::from_secs(1))"),
+        "no 1s poll sleep may remain in the watch path"
+    );
+    assert!(
+        plane.contains("wake.sock") || plane.contains("wake_sock"),
+        "the socket tail must be the live path"
     );
     assert!(
         plane.contains("subscribe_trusted"),
-        "the in-process live tail stays (wave 3 deletes)"
+        "the in-process subscribe stays as the loud embedded fallback (not the pump)"
     );
 }
 

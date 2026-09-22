@@ -1452,8 +1452,28 @@ async fn watch(mailbox: &Mailbox, args: &WatchArgs) -> anyhow::Result<()> {
     if args.live {
         return watch_live(mailbox, &args).await;
     }
-    // 1059 gift-wrap is p-gated to the watcher's own inbox (ADR-0020 Spec 6).
-    let kinds = parse_kinds(&args.kinds)?;
+    if args.once && args.timeout_ms.is_none() {
+        return Err(anyhow::Error::from(UsageError(
+            "--once requires --timeout-ms (no infinite hang in CI)".to_string(),
+        )));
+    }
+    if !args.once {
+        // Bare non-live watch (no bound, no --live): the 1s snapshot pump
+        // is deleted (bd-qg6w, wave 3) — this is the live tail now.
+        return watch_live(mailbox, &args).await;
+    }
+    watch_once(mailbox, &args).await
+}
+
+/// Build the bus filter for a watch invocation. One construction, two
+/// callers (`watch_live`, `watch_once`) — the cutover cannot drift them
+/// apart. 1059 gift-wrap stays p-gated to the watcher's own inbox
+/// (ADR-0020 Spec 6).
+async fn watch_filter(
+    mailbox: &Mailbox,
+    args: &WatchArgs,
+    kinds: &[u16],
+) -> anyhow::Result<Filter> {
     let self_npub = if kinds.contains(&1059) {
         let name = args.as_name.as_deref().ok_or_else(|| {
             UsageError("--as <name> is required to watch kind 1059 (p-gated to self)".to_string())
@@ -1468,14 +1488,6 @@ async fn watch(mailbox: &Mailbox, args: &WatchArgs) -> anyhow::Result<()> {
     } else {
         None
     };
-
-    let timeout_ms = args.timeout_ms;
-    if args.once && timeout_ms.is_none() {
-        return Err(anyhow::Error::from(UsageError(
-            "--once requires --timeout-ms (no infinite hang in CI)".to_string(),
-        )));
-    }
-
     let mut filter = Filter::new().kinds(kinds.iter().map(|k| toron_kind(*k)));
     if let Some(channel) = &args.channel {
         filter = filter.custom_tag(nostr::filter::SingleLetterTag::LOWERCASE_H, channel);
@@ -1483,37 +1495,101 @@ async fn watch(mailbox: &Mailbox, args: &WatchArgs) -> anyhow::Result<()> {
     if let Some(np) = &self_npub {
         filter = filter.custom_tag(nostr::filter::SingleLetterTag::LOWERCASE_P, np);
     }
+    Ok(filter)
+}
 
+/// `--once`: bounded live subscription (bd-qg6w, wave 3). First gated
+/// match prints and exits 0; deadline expiry prints `watch: timeout` and
+/// exits 1. Socket first, in-process subscribe fallback (loud) — the 1s
+/// snapshot pump is deleted, so replay and timeout cases resolve exactly
+/// as before while post-after-start needs a live socket.
+async fn watch_once(mailbox: &Mailbox, args: &WatchArgs) -> anyhow::Result<()> {
+    let kinds = parse_kinds(&args.kinds)?;
+    let timeout_ms = args.timeout_ms.ok_or_else(|| {
+        UsageError("--once requires --timeout-ms (no infinite hang in CI)".to_string())
+    })?;
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    let filter = watch_filter(mailbox, args, &kinds).await?;
     eprintln!("watching kinds={}", args.kinds);
-    let deadline = timeout_ms.map(|ms| Instant::now() + Duration::from_millis(ms));
-    let mut seen: HashSet<String> = HashSet::new();
-    loop {
-        // Re-snapshot sqlite each tick: flywheel doorbell runs `toron watch`
-        // in a *separate process* from the publisher, so an in-process
-        // subscribe would miss every live post. The 100ms cadence was the
-        // RSS bomb (24GB / 5h per child, bd-741i). 1s + snapshot memo is
-        // enough for doorbell and cheap when the store is unchanged.
-        // ADR-0035 Spec 5 status (bd-r328): this pump IS the embedded-mode
-        // Msg source (shared-sqlite FetchInbox-equivalent) — sc32 proves
-        // cross-process `--once` over it. Deleting it needs a daemon-shared
-        // subscription first; until then the pump stays and both paths
-        // share one emit gate below.
-        let events = collect_trusted(mailbox.bus().as_ref(), filter.clone()).await?;
-        for ev in events {
-            if watch_emit(&mut seen, &args, &ev) && args.once {
-                return Ok(());
+    if args.watch_sock {
+        let mut cfg = crate::wake_sock::WakeSockConfig::discover(kinds.clone());
+        cfg.project = Some(args.project.clone());
+        let tail = crate::wake_sock::WakeSockTail::new(cfg);
+        match tail.connect().await {
+            Ok(mut conn) => {
+                let mut seen: HashSet<String> = HashSet::new();
+                let project = args.project.clone();
+                let channel = args.channel.clone();
+                loop {
+                    let remain = deadline.saturating_duration_since(Instant::now());
+                    if remain.is_zero() {
+                        break;
+                    }
+                    match tokio::time::timeout(remain, conn.next()).await {
+                        Err(_) => break,
+                        Ok(Err(e)) => {
+                            eprintln!("{e}");
+                            break;
+                        }
+                        Ok(Ok(crate::wake_sock::ConnEvent::Event(ev))) => {
+                            if watch_gate(&mut seen, &ev.id, &ev.tags, &project, &channel) {
+                                println!("{}", crate::wake_sock::format_sock_line(&ev));
+                                return Ok(());
+                            }
+                        }
+                        Ok(Ok(crate::wake_sock::ConnEvent::Shed { resync_from })) => {
+                            eprintln!(
+                                "wake.sock shed (slow consumer) resync_from={resync_from} — replaying from store, then live (LOUD fallback)"
+                            );
+                            break;
+                        }
+                        Ok(Ok(_)) => {}
+                    }
+                }
+                // Fell through without a match: remaining budget (if any)
+                // continues in-process below.
+                if Instant::now() >= deadline {
+                    eprintln!("watch: timeout");
+                    std::process::exit(1);
+                }
+            }
+            Err(e) => {
+                eprintln!("{e}");
             }
         }
-        if let Some(d) = deadline
-            && Instant::now() >= d
-        {
-            if args.once {
+    }
+    // In-process bounded live tail: replay first (late joiners), then
+    // subscribe until the deadline. No snapshot poll (pump deleted).
+    let replay = collect_trusted(mailbox.bus().as_ref(), filter.clone()).await?;
+    let mut seen: HashSet<String> = HashSet::new();
+    for ev in replay {
+        if watch_emit(&mut seen, args, &ev) {
+            return Ok(());
+        }
+    }
+    let mut sub = mailbox.bus().subscribe_trusted(filter).await?;
+    loop {
+        let remain = deadline.saturating_duration_since(Instant::now());
+        if remain.is_zero() {
+            eprintln!("watch: timeout");
+            std::process::exit(1);
+        }
+        match tokio::time::timeout(remain, sub.next()).await {
+            Err(_) => {
                 eprintln!("watch: timeout");
                 std::process::exit(1);
             }
-            return Ok(());
+            Ok(None) | Ok(Some(SubscriptionEvent::Closed(_))) => {
+                eprintln!("watch: timeout");
+                std::process::exit(1);
+            }
+            Ok(Some(SubscriptionEvent::Event(event))) => {
+                if watch_emit(&mut seen, args, &event) {
+                    return Ok(());
+                }
+            }
+            Ok(Some(_)) => {}
         }
-        tokio::time::sleep(Duration::from_secs(1)).await;
     }
 }
 
@@ -1529,6 +1605,22 @@ async fn watch(mailbox: &Mailbox, args: &WatchArgs) -> anyhow::Result<()> {
 /// bus is the wake. No second watch child, no wake kind, no poll.
 pub const WAIT_WAKE_KINDS: &[u16] = &[9, 14, 1059, 20001, 30013, 43001, 43004, 30031, 39002];
 
+/// Print one receipt in the binding wait shape (bd-qg6w, wave 3): one
+/// printer, three callers (fast path, socket wake, in-process wake) —
+/// the store is the truth on every path.
+fn print_corr_receipt(r: &toron_core::mailbox::Receipt) -> anyhow::Result<()> {
+    let v = serde_json::json!({
+        "corr": r.corr,
+        "state": r.state.as_str(),
+        "wake": r.wake.map(toron_core::mailbox::send_tags::Wake::as_str),
+        "due_at": r.due_at,
+        "result_path": r.result_path,
+        "updated_at": r.updated_at,
+    });
+    println!("{}", serde_json::to_string(&v)?);
+    Ok(())
+}
+
 async fn wait_for_corr(mailbox: &Mailbox, args: &WaitArgs) -> anyhow::Result<()> {
     let timeout = args.timeout.unwrap_or(30);
     let deadline = if timeout == 0 {
@@ -1542,16 +1634,71 @@ async fn wait_for_corr(mailbox: &Mailbox, args: &WaitArgs) -> anyhow::Result<()>
     })?;
     // Fast path: already present
     if let Some(r) = store.get(&args.corr).await? {
-        let v = serde_json::json!({
-            "corr": r.corr,
-            "state": r.state.as_str(),
-            "wake": r.wake.map(toron_core::mailbox::send_tags::Wake::as_str),
-            "due_at": r.due_at,
-            "result_path": r.result_path,
-            "updated_at": r.updated_at,
-        });
-        println!("{}", serde_json::to_string(&v)?);
+        print_corr_receipt(&r)?;
         return Ok(());
+    }
+    // Wave 3 (bd-qg6w): socket wake first. Any EVENT frame re-checks the
+    // store (the store is the truth, the socket is the wake); heartbeats
+    // only prove liveness and never touch the store. Shed, absent socket,
+    // or error degrades LOUD to the in-process subscribe below.
+    {
+        let mut cfg = crate::wake_sock::WakeSockConfig::discover(WAIT_WAKE_KINDS.to_vec());
+        cfg.project = Some(canonical.clone());
+        let tail = crate::wake_sock::WakeSockTail::new(cfg);
+        match tail.connect().await {
+            Ok(mut conn) => {
+                let socketed = async {
+                    loop {
+                        match conn.next().await {
+                            Err(e) => {
+                                eprintln!("{e}");
+                                break;
+                            }
+                            Ok(crate::wake_sock::ConnEvent::Event(_)) => {
+                                if let Some(r) = store.get(&args.corr).await? {
+                                    print_corr_receipt(&r)?;
+                                    return Ok::<bool, anyhow::Error>(true);
+                                }
+                            }
+                            Ok(crate::wake_sock::ConnEvent::Shed { resync_from }) => {
+                                eprintln!(
+                                    "wake.sock shed during wait resync_from={resync_from} — store stays the truth, continuing in-process (LOUD fallback)"
+                                );
+                                break;
+                            }
+                            Ok(_) => {}
+                        }
+                        // No inner deadline check: the outer `timeout(remain)`
+                        // owns expiry. Falling through here means shed or a
+                        // loud socket error — the in-process path below still
+                        // enforces the absolute deadline.
+                    }
+                    Ok::<bool, anyhow::Error>(false)
+                };
+                match deadline {
+                    Some(d) => {
+                        let remain = d.saturating_duration_since(Instant::now());
+                        match tokio::time::timeout(remain, socketed).await {
+                            Err(_) => anyhow::bail!(
+                                "wait --corr {} for project {canonical} timed out after {}s",
+                                args.corr,
+                                timeout
+                            ),
+                            Ok(Ok(true)) => return Ok(()),
+                            Ok(Ok(false)) | Ok(Err(_)) => {}
+                        }
+                    }
+                    None => {
+                        if socketed.await? {
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("{e}");
+            }
+        }
     }
     // Subscribe to live bus (any kind that could lead to a receipt). The
     // receipts store itself is not a bus kind, so we wake on any new bus
@@ -1571,15 +1718,7 @@ async fn wait_for_corr(mailbox: &Mailbox, args: &WaitArgs) -> anyhow::Result<()>
         }
         // Check store after each wake (including immediately)
         if let Some(r) = store.get(&args.corr).await? {
-            let v = serde_json::json!({
-                "corr": r.corr,
-                "state": r.state.as_str(),
-                "wake": r.wake.map(toron_core::mailbox::send_tags::Wake::as_str),
-                "due_at": r.due_at,
-                "result_path": r.result_path,
-                "updated_at": r.updated_at,
-            });
-            println!("{}", serde_json::to_string(&v)?);
+            print_corr_receipt(&r)?;
             return Ok(());
         }
         // Unpark on bus event or deadline only — no 200ms costume poll.
@@ -1605,35 +1744,16 @@ async fn wait_for_corr(mailbox: &Mailbox, args: &WaitArgs) -> anyhow::Result<()>
 }
 
 /// bd-rkom: live subscription (E7) — the same source the flywheel dispatcher
-/// uses (`bus.subscribe`, not the 1s snapshot). Every line yields WatchNdjson
-/// for the consumer; snapshot stays as `--once` debug only. No second doorbell.
+/// uses (`bus.subscribe`, not a snapshot poll). Every line yields WatchNdjson
+/// for the consumer. `--once` is a bounded live subscription with the same
+/// source (bd-qg6w, wave 3: the 1s snapshot pump is deleted). No second doorbell.
 async fn watch_live(mailbox: &Mailbox, args: &WatchArgs) -> anyhow::Result<()> {
     let kinds = parse_kinds(&args.kinds)?;
-    let self_npub = if kinds.contains(&1059) {
-        let name = args.as_name.as_deref().ok_or_else(|| {
-            UsageError("--as <name> is required to watch kind 1059 (p-gated to self)".to_string())
-        })?;
-        let whois = mailbox.whois(&args.project, name).await.map_err(|_| {
-            UsageError(format!(
-                "unknown agent name: {name} for project {}",
-                args.project
-            ))
-        })?;
-        Some(whois.npub)
-    } else {
-        None
-    };
-    let mut filter = Filter::new().kinds(kinds.iter().map(|k| toron_kind(*k)));
-    if let Some(channel) = &args.channel {
-        filter = filter.custom_tag(nostr::filter::SingleLetterTag::LOWERCASE_H, channel);
-    }
-    if let Some(np) = &self_npub {
-        filter = filter.custom_tag(nostr::filter::SingleLetterTag::LOWERCASE_P, np);
-    }
+    let filter = watch_filter(mailbox, args, &kinds).await?;
     eprintln!("watch --live kinds={}", args.kinds);
-    // Slice B (bd-981p, ADR-0036 Spec 8 row 2): socket tail behind
-    // `--watch-sock`. Absent socket degrades LOUD to the in-process
-    // replay+live below, never silent. NO deletions (wave 3).
+    // Socket tail behind `--watch-sock` (slices B+C, ADR-0036 Spec 8).
+    // Absent socket degrades LOUD to the in-process replay+live below,
+    // never silent. The 1s snapshot pump is deleted (bd-qg6w, wave 3).
     if args.watch_sock {
         let mut cfg = crate::wake_sock::WakeSockConfig::discover(kinds.clone());
         cfg.project = Some(args.project.clone());
@@ -1643,10 +1763,11 @@ async fn watch_live(mailbox: &Mailbox, args: &WatchArgs) -> anyhow::Result<()> {
         let channel = args.channel.clone();
         match tail
             .run(&mut |ev| {
-                if !watch_gate(&mut seen, &ev.id, &ev.tags, &project, &channel) {
-                    return false;
+                // `true` keeps tailing: filtering is the gate's job,
+                // stopping is `--once`'s (run stops only on false).
+                if watch_gate(&mut seen, &ev.id, &ev.tags, &project, &channel) {
+                    println!("{}", crate::wake_sock::format_sock_line(ev));
                 }
-                println!("{}", crate::wake_sock::format_sock_line(ev));
                 true
             })
             .await
