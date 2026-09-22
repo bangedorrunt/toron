@@ -61,9 +61,15 @@ fn exit_code(out: &Output) -> i32 {
     out.status.code().unwrap_or(-1)
 }
 
-/// Spawn watch in the background (process 1). Returns the child + a reader
-/// that signals when the watch is listening (stderr shows "watching").
-fn spawn_watch(data_dir: &Path, timeout_ms: &str) -> (Child, std::thread::JoinHandle<String>) {
+/// Spawn watch in the background (process 1), backed by the daemon socket
+/// at `wake_sock` (bd-hs8y harness: `TORON_WAKE_SOCK` points the child's
+/// socket-first tail at the test-held [`WakeServer`]). Returns the child +
+/// a reader that captures the child's stderr once it exits.
+fn spawn_watch(
+    data_dir: &Path,
+    timeout_ms: &str,
+    wake_sock: &Path,
+) -> (Child, std::thread::JoinHandle<String>) {
     let mut child = Command::new(toron_bin())
         .args([
             "watch",
@@ -82,6 +88,7 @@ fn spawn_watch(data_dir: &Path, timeout_ms: &str) -> (Child, std::thread::JoinHa
         .arg("--json")
         .arg("--no-input")
         .env("TORON_MCP_DATA_DIR", data_dir)
+        .env("TORON_WAKE_SOCK", wake_sock)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -96,7 +103,7 @@ fn spawn_watch(data_dir: &Path, timeout_ms: &str) -> (Child, std::thread::JoinHa
     (child, reader)
 }
 
-async fn setup(data_dir: &Path, project: &str, names: &[&str]) {
+async fn setup(data_dir: &Path, project: &str, names: &[&str]) -> Mailbox {
     std::fs::create_dir_all(data_dir).expect("create data dir");
     let db = data_dir.join("index.sqlite");
     let pool = schema::connect(db.to_str().unwrap())
@@ -113,12 +120,33 @@ async fn setup(data_dir: &Path, project: &str, names: &[&str]) {
             .await
             .expect("register agent");
     }
+    mailbox
 }
 
 #[tokio::test]
 async fn sc32_watch_once_sees_cross_process_post() {
+    // bd-hs8y daemon-backed harness: the test process holds a WakeServer
+    // (the daemon sidecar) on the shared bus; the watch child connects to
+    // it via TORON_WAKE_SOCK (socket-first, wave 4) instead of its own
+    // blind embedded subscription. The post goes through the harness bus,
+    // so post-after-start resolves instead of clean-timing-out.
+    use toron_core::bus::wake::{SystemClock, WakeConfig, WakeServer};
+
     let dir = std::env::temp_dir().join(format!("toron-sc32-{}", uuid::Uuid::new_v4()));
-    setup(&dir, PROJECT, &[A, B]).await;
+    let mailbox = setup(&dir, PROJECT, &[A, B]).await;
+    // Short socket path: UDS paths must fit SUN_LEN, but the data dir
+    // carries a UUID. The socket lives beside temp, keyed by pid (this
+    // target runs serially; stale files are taken over, never blindly
+    // deleted while live).
+    let sock = std::env::temp_dir().join(format!("toron-sc32-{}.sock", std::process::id()));
+    let _daemon = WakeServer::new(
+        WakeConfig::new(&sock),
+        mailbox.bus().clone(),
+        Arc::new(SystemClock),
+    )
+    .start()
+    .await
+    .expect("daemon wake.sock");
 
     // A creates the channel + joins B first (watch filters kinds 9 + channel).
     let out = run(
@@ -152,32 +180,27 @@ async fn sc32_watch_once_sees_cross_process_post() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    // Process 1: watch --once (listening).
-    let (mut child, stderr_reader) = spawn_watch(&dir, "15000");
+    // Process 1: watch --once (listening on the daemon socket).
+    let (mut child, stderr_reader) = spawn_watch(&dir, "15000", &sock);
     // Give the watch time to subscribe before process 2 posts.
     tokio::time::sleep(Duration::from_millis(1000)).await;
 
-    // Process 2: the post.
-    let out = run(
-        &dir,
-        &[
-            "channel",
-            "post",
-            CHANNEL,
-            "--body",
-            "watch me",
-            "--project",
-            PROJECT,
-            "--as",
-            A,
+    // Process 2: the post, through the daemon-held bus (this is the
+    // daemon-backed half of the harness — an embedded CLI post would
+    // stay invisible to the other process's in-process subscription).
+    let keys = toron_core::keys::generate();
+    let ev = toron_core::nostr::event::build_event(
+        &keys,
+        toron_core::nostr::kinds::toron_kind(9),
+        "watch me",
+        vec![
+            toron_core::nostr::Tag::parse(["t", PROJECT]).expect("t tag"),
+            toron_core::nostr::Tag::parse(["h", CHANNEL]).expect("h tag"),
         ],
-    );
-    assert_eq!(
-        exit_code(&out),
-        0,
-        "channel post: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+        toron_core::nostr::Timestamp::now(),
+    )
+    .expect("sign kind-9");
+    mailbox.bus().publish(ev).await.expect("daemon publish");
 
     // Process 1 exits 0 with the kind-9 event JSON.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
@@ -246,7 +269,7 @@ async fn sc32_watch_once_sees_cross_process_post() {
 #[tokio::test]
 async fn sc32_watch_once_timeout_exits_1() {
     let dir = std::env::temp_dir().join(format!("toron-sc32b-{}", uuid::Uuid::new_v4()));
-    setup(&dir, PROJECT, &[A, B]).await;
+    let _ = setup(&dir, PROJECT, &[A, B]).await;
 
     // No post at all → watch --once times out: exit 1, stderr "watch: timeout".
     let out = run(

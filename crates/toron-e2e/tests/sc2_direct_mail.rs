@@ -138,6 +138,7 @@ async fn sc2_direct_mail_thread_and_ack() {
             unread_only: false,
             limit: None,
             include_bodies: true,
+            ack_overdue_only: false,
             urgent_only: false,
             since_ts: None,
             thread_id: None,
