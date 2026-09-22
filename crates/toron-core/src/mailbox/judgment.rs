@@ -11,6 +11,7 @@
 //! row without re-invoking). No index pool → loud error, never silent.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
@@ -486,7 +487,13 @@ pub struct WakeScores {
 }
 
 impl super::Mailbox {
-    /// `ask_judgment`: idempotent replay → child `flywheel judgment-ask` under
+    /// Host-owned judgment kernel model (bd-uhkr): every clone shares one
+    /// instance, so duplicate keys dedupe across callers (never per-call new).
+    pub const fn judge_model(&self) -> &Arc<parking_lot::Mutex<JudgeModel>> {
+        &self.judge_model
+    }
+
+    /// `ask_judgment`: idempotent replay → claim → child `flywheel judgment-ask` under
     /// a timeout → validate → journal → return. Loud typed errors at every
     /// stage (binary missing, timeout, non-zero, bad JSON, key mismatch).
     pub async fn ask_judgment(
@@ -507,15 +514,32 @@ impl super::Mailbox {
             )
         })?;
         // Discriminating replay (bd-fbgi): version/state drift is loud.
+        // Claims never replay (bd-uhkr): an unsettled claim is not an answer.
         let expected_version = find_pack(pack_id).map(|p| p.version);
         let expected_hash = state_hash(state);
         if let Some(record) =
-            journal_get_for(pool, effect_key, expected_version, &expected_hash).await?
+            journal_get_final_for(pool, effect_key, expected_version, &expected_hash).await?
         {
             return Ok(JudgmentOutcome {
                 record,
                 replayed: true,
             });
+        }
+        // Claim-before-invoke (bd-uhkr): Prepared row BEFORE spawn. A lost
+        // race owns nothing — replay the winner's final row, else refuse as
+        // inflight (never a second spawn, never a double model pay).
+        if !claim_judgment(pool, project_slug, effect_key, pack_id, expected_version).await? {
+            if let Some(record) =
+                journal_get_final_for(pool, effect_key, expected_version, &expected_hash).await?
+            {
+                return Ok(JudgmentOutcome {
+                    record,
+                    replayed: true,
+                });
+            }
+            anyhow::bail!(
+                "ask_judgment `{effect_key}` inflight under another caller (claim-before-invoke dedup) — retry after it settles, never spawn twice"
+            );
         }
         // Offline + seeded pack: hermetic scripted answer, no subprocess.
         // Offline + unseeded pack: fall through to the child (flywheel
@@ -524,10 +548,17 @@ impl super::Mailbox {
             && let Some(pack) = find_pack(pack_id)
         {
             let record = offline_answer(effect_key, &pack, state);
-            journal_insert(pool, project_slug, &record).await?;
-            let record = journal_get_for(pool, effect_key, expected_version, &expected_hash)
-                .await?
-                .unwrap_or(record);
+            if !journal_settle(pool, project_slug, &record).await? {
+                // Lost settle race: another caller settled first — replay it.
+                let record =
+                    journal_get_final_for(pool, effect_key, expected_version, &expected_hash)
+                        .await?
+                        .unwrap_or(record);
+                return Ok(JudgmentOutcome {
+                    record,
+                    replayed: true,
+                });
+            }
             return Ok(JudgmentOutcome {
                 record,
                 replayed: false,
@@ -573,10 +604,19 @@ impl super::Mailbox {
         let stdout = String::from_utf8_lossy(&out.stdout);
         let mut record = parse_judgment_stdout(effect_key, pack_id, &stdout)?;
         record.state_hash = state_hash(state);
-        journal_insert(pool, project_slug, &record).await?;
-        let record = journal_get_for(pool, effect_key, expected_version, &expected_hash)
-            .await?
-            .unwrap_or(record);
+        // Settle the pre-spawn claim (bd-uhkr). A lost settle race replays
+        // the winner — INSERT OR IGNORE would silently keep a stale claim.
+        // Child/spawn failures above return with `?`: the claim stays for
+        // crash-resume to reap (never a silent pay, never a delete).
+        if !journal_settle(pool, project_slug, &record).await? {
+            let record = journal_get_final_for(pool, effect_key, expected_version, &expected_hash)
+                .await?
+                .unwrap_or(record);
+            return Ok(JudgmentOutcome {
+                record,
+                replayed: true,
+            });
+        }
         Ok(JudgmentOutcome {
             record,
             replayed: false,
@@ -608,9 +648,53 @@ impl super::Mailbox {
             transport,
             timeout_secs.unwrap_or(JUDGMENT_DEFAULT_TIMEOUT_SECS),
         );
-        let (_, effects) = tick(&JudgeModel::new(), &JudgeMsg::Request { effect });
-        let Some(Effect::Judge(effect)) = effects.into_iter().next() else {
-            anyhow::bail!("judge kernel emitted no Judge effect (duplicate key?)");
+        // Host-owned model (bd-uhkr): duplicate keys dedup here instead of
+        // spawning a second child. The lock scope ends before any await
+        // (parking_lot guards are !Send and must never cross one).
+        let emitted: Option<JudgeEffect> = {
+            let mut guard = self.judge_model.lock();
+            let (next, effects) = tick(&guard, &JudgeMsg::Request { effect });
+            *guard = next;
+            drop(guard);
+            effects.into_iter().next().map(|fx| {
+                let Effect::Judge(effect) = fx;
+                effect
+            })
+        };
+        let Some(effect) = emitted else {
+            // Dup with a settled row replays it; live flight refuses loud.
+            let pool = self.index_pool.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("judge_wake_priority journal unavailable (no index open)")
+            })?;
+            let expected_version = find_pack("wake-priority").map(|p| p.version);
+            let expected_hash = state_hash(&state);
+            if let Some(record) =
+                journal_get_final_for(pool, effect_key, expected_version, &expected_hash).await?
+            {
+                let answers = &record.answers;
+                let num = |name: &str| {
+                    answers
+                        .get(name)
+                        .and_then(serde_json::Value::as_f64)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("wake-priority answer missing number `{name}`")
+                        })
+                };
+                let gate =
+                    decide_wake_gate(num("urgency")?, num("actionability")?, num("interrupt")?);
+                let route = route_outcome(&record);
+                return Ok((
+                    gate,
+                    route,
+                    JudgmentOutcome {
+                        record,
+                        replayed: true,
+                    },
+                ));
+            }
+            anyhow::bail!(
+                "judge_wake_priority `{effect_key}` inflight under another caller (host-model dedup) — retry after it settles, never spawn twice"
+            );
         };
         let outcome = self
             .ask_judgment(
@@ -621,7 +705,12 @@ impl super::Mailbox {
                 &effect.transport,
                 Some(effect.timeout_secs),
             )
-            .await?;
+            .await;
+        // Memory tracks live flight only: the DB claim is the cross-caller
+        // guard, so drop the key on both success and failure (a retry then
+        // meets the claim row, never a second spawn).
+        self.judge_model.lock().inflight.remove(effect_key);
+        let outcome = outcome?;
         let answers = &outcome.record.answers;
         let num = |name: &str| {
             answers
@@ -858,6 +947,134 @@ pub async fn journal_get_for(
     };
     replay_check(&record, expected_version, expected_hash).map_err(|e| anyhow::anyhow!("{e}"))?;
     Ok(Some(record))
+}
+
+// ── Lane Q claim-before-invoke (bd-uhkr) ────────────────────────────────
+// A Prepared claim row lands BEFORE the child spawns. A second caller in
+// the window sees the claim and returns/waits — never a second spawn, never
+// a double model pay. Crash between model-return and settle leaves the
+// claim (not a silent pay); `reconcile_judgment_claims` reaps it on resume.
+
+/// Placeholder model id marking an unsettled claim (never a final answer).
+pub const CLAIM_MODEL_ID: &str = "__claim__";
+
+/// True when the row is an unsettled claim, not a judged answer.
+pub fn is_claim_record(record: &JudgmentEffectRecord) -> bool {
+    record.model_id == CLAIM_MODEL_ID
+}
+
+/// Insert a Prepared claim (INSERT OR IGNORE: the first claimant wins).
+/// Returns true when this caller owns the claim (may spawn), false when a
+/// row already exists (another caller owns — never spawn).
+pub async fn claim_judgment(
+    pool: &sqlx::SqlitePool,
+    project: &str,
+    effect_key: &str,
+    pack_id: &str,
+    pack_version: Option<u32>,
+) -> anyhow::Result<bool> {
+    let claim = JudgmentEffectRecord {
+        effect_key: effect_key.to_string(),
+        pack_id: pack_id.to_string(),
+        pack_version: pack_version.unwrap_or(0),
+        model_id: CLAIM_MODEL_ID.to_string(),
+        confidence: 0.0,
+        usage: String::new(),
+        fallback_flag: false,
+        escalated: false,
+        note: "claim (bd-uhkr, unsettled)".to_string(),
+        answers: serde_json::json!({}),
+        state_hash: String::new(),
+    };
+    let answers_json = serde_json::to_string(&claim.answers)?;
+    let effect_json = serde_json::to_string(&claim)?;
+    let res = sqlx::query(
+        "INSERT OR IGNORE INTO judgment_effects \
+         (effect_key, project, pack_id, pack_version, model_id, confidence, \
+          escalated, fallback_flag, answers_json, effect_json, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+    )
+    .bind(&claim.effect_key)
+    .bind(project)
+    .bind(&claim.pack_id)
+    .bind(i64::from(claim.pack_version))
+    .bind(&claim.model_id)
+    .bind(claim.confidence)
+    .bind(0_i64)
+    .bind(0_i64)
+    .bind(answers_json)
+    .bind(effect_json)
+    .bind(now_micros())
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected() == 1)
+}
+
+/// Journal read that skips unsettled claims: `None` on no row OR claim row,
+/// the checked final row otherwise (drift still loud).
+pub async fn journal_get_final_for(
+    pool: &sqlx::SqlitePool,
+    effect_key: &str,
+    expected_version: Option<u32>,
+    expected_hash: &str,
+) -> anyhow::Result<Option<JudgmentEffectRecord>> {
+    let Some(record) = journal_get(pool, effect_key).await? else {
+        return Ok(None);
+    };
+    if is_claim_record(&record) {
+        return Ok(None);
+    }
+    replay_check(&record, expected_version, expected_hash).map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok(Some(record))
+}
+
+/// Settle a claim into the final answer (one UPDATE guarded on the claim
+/// marker: a settled-by-other row is never overwritten). Returns true when
+/// this caller settled, false when another caller already did.
+pub async fn journal_settle(
+    pool: &sqlx::SqlitePool,
+    project: &str,
+    record: &JudgmentEffectRecord,
+) -> anyhow::Result<bool> {
+    let answers_json = serde_json::to_string(&record.answers)?;
+    let effect_json = serde_json::to_string(record)?;
+    let res = sqlx::query(
+        "UPDATE judgment_effects SET project = ?2, pack_id = ?3, pack_version = ?4, \
+          model_id = ?5, confidence = ?6, escalated = ?7, fallback_flag = ?8, \
+          answers_json = ?9, effect_json = ?10, created_at = ?11 \
+         WHERE effect_key = ?1 AND model_id = '__claim__'",
+    )
+    .bind(&record.effect_key)
+    .bind(project)
+    .bind(&record.pack_id)
+    .bind(i64::from(record.pack_version))
+    .bind(&record.model_id)
+    .bind(record.confidence)
+    .bind(i64::from(record.escalated))
+    .bind(i64::from(record.fallback_flag))
+    .bind(answers_json)
+    .bind(effect_json)
+    .bind(now_micros())
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected() == 1)
+}
+
+/// Crash-resume: reap unsettled claims older than `older_than_micros`
+/// (age 0 reaps all). Returns the reaped count — the keys are claimable
+/// again, and no silent pay ever existed for them.
+pub async fn reconcile_judgment_claims(
+    pool: &sqlx::SqlitePool,
+    older_than_micros: i64,
+) -> anyhow::Result<u64> {
+    let cutoff = now_micros().saturating_sub(older_than_micros.max(0));
+    let res = sqlx::query(
+        "DELETE FROM judgment_effects WHERE model_id = '__claim__' AND created_at <= ?1",
+    )
+    .bind(cutoff)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected())
 }
 
 /// Scripted substitute for the interpreter (tests + dry runs): per-key
@@ -1403,5 +1620,150 @@ mod tests {
             .expect("re-insert keeps first");
         let back = journal_get(&pool, "k").await.expect("get").expect("row");
         assert_eq!(back, r);
+    }
+
+    // ── Lane Q claim-before-invoke + host-owned model (bd-uhkr) ─────────
+    // Law: Prepared claim row BEFORE spawn (second caller waits/returns,
+    // never double-pays); JudgeModel host-owned and threaded through calls
+    // (never per-call new); crash between model-return and settle leaves a
+    // claim, not a silent pay; resume reconciles claims.
+
+    async fn uhkr_pool() -> sqlx::SqlitePool {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:")
+            .await
+            .expect("mem pool");
+        crate::index::schema::MIGRATOR
+            .run(&pool)
+            .await
+            .expect("migrate");
+        pool
+    }
+
+    async fn uhkr_mailbox(pool: sqlx::SqlitePool) -> super::super::Mailbox {
+        use std::sync::Arc;
+        let tag = format!("uhkr-{}", uuid::Uuid::new_v4());
+        let bus = crate::bus::in_process::InProcessBus::open(
+            pool.clone(),
+            crate::bus::in_process::InProcessBusConfig::default(),
+        )
+        .await
+        .expect("bus");
+        let data_dir = std::env::temp_dir().join(format!("toron-uhkr-data-{tag}"));
+        super::super::Mailbox::new(Arc::new(bus), data_dir, Some(crate::keys::generate()))
+            .with_index_pool(pool)
+    }
+
+    #[tokio::test]
+    async fn test_second_caller_never_spawns_bd_uhkr() {
+        // Pre-claimed key = a parallel caller inside the spawn window.
+        // ask_judgment must refuse as inflight WITHOUT spawning a child
+        // (system-one would spawn; the inflight refusal proves no spawn).
+        let pool = uhkr_pool().await;
+        let pack = find_pack("wake-priority").unwrap();
+        let state = serde_json::json!({"urgency": 0.9});
+        assert!(
+            claim_judgment(&pool, "toron", "k-dup", "wake-priority", Some(pack.version))
+                .await
+                .expect("claim"),
+            "first claim owns"
+        );
+        let mailbox = uhkr_mailbox(pool).await;
+        let err = mailbox
+            .ask_judgment(
+                "toron",
+                "k-dup",
+                "wake-priority",
+                &state,
+                "system-one",
+                Some(5),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("inflight"),
+            "no second spawn: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_crash_leaves_claim_reconcile_clears_bd_uhkr() {
+        // Crash between model-return and settle: the claim row survives,
+        // no final answer exists, and resume reaps the claim so the key
+        // is claimable again (never a silent pay, never a wedged key).
+        let pool = uhkr_pool().await;
+        let pack = find_pack("wake-priority").unwrap();
+        let state = serde_json::json!({"urgency": 0.9});
+        let hash = state_hash(&state);
+        assert!(
+            claim_judgment(
+                &pool,
+                "toron",
+                "k-crash",
+                "wake-priority",
+                Some(pack.version)
+            )
+            .await
+            .expect("claim")
+        );
+        assert!(
+            journal_get_final_for(&pool, "k-crash", Some(pack.version), &hash)
+                .await
+                .expect("get")
+                .is_none(),
+            "crash leaves claim, never a final row"
+        );
+        assert_eq!(
+            reconcile_judgment_claims(&pool, 0)
+                .await
+                .expect("reconcile"),
+            1
+        );
+        assert!(
+            claim_judgment(
+                &pool,
+                "toron",
+                "k-crash",
+                "wake-priority",
+                Some(pack.version)
+            )
+            .await
+            .expect("reclaim"),
+            "key reclaimable after reconcile"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_host_model_shared_and_dedupes_bd_uhkr() {
+        // The model is host-owned: clones share one instance (never
+        // per-call new), so a duplicate Request dedupes across callers.
+        use std::sync::Arc;
+        let pool = uhkr_pool().await;
+        let m1 = uhkr_mailbox(pool).await;
+        let m2 = m1.clone();
+        assert!(
+            Arc::ptr_eq(m1.judge_model(), m2.judge_model()),
+            "one host model"
+        );
+        let fx = {
+            let model = m1.judge_model();
+            let mut guard = model.lock();
+            let (next, fx1) = tick(
+                &guard,
+                &JudgeMsg::Request {
+                    effect: judge_effect("k-host"),
+                },
+            );
+            *guard = next;
+            let (_, fx2) = tick(
+                &guard,
+                &JudgeMsg::Request {
+                    effect: judge_effect("k-host"),
+                },
+            );
+            assert!(fx2.is_empty(), "duplicate dedupes on the host model");
+            drop(guard);
+            fx1
+        };
+        assert_eq!(fx.len(), 1);
     }
 }
