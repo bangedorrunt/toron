@@ -102,7 +102,7 @@ async fn sc23_cron_escalate_at_threshold() {
             WorkflowEngine::default_workflow_resolver(),
             Some(always_failing_runner()),
         )
-            .expect("engine"),
+        .expect("engine"),
     );
     let registry: CronRegistry = {
         let reg = registration("sc23-escalating");

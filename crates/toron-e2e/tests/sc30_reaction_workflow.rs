@@ -144,9 +144,8 @@ async fn drain_reactions(
                 Box::pin(async move { Ok(serde_json::json!({ "ok": true, "stamped": true })) })
                     as std::pin::Pin<
                         Box<
-                            dyn std::future::Future<
-                                Output = anyhow::Result<serde_json::Value>,
-                            > + Send,
+                            dyn std::future::Future<Output = anyhow::Result<serde_json::Value>>
+                                + Send,
                         >,
                     >
             },

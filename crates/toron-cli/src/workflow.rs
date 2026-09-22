@@ -35,9 +35,7 @@ fn noop_runner() -> AsyncEffectRunner {
         let value = json!({ "action": inv.action.type_name() });
         Box::pin(async move { Ok(value) })
             as std::pin::Pin<
-                Box<
-                    dyn std::future::Future<Output = anyhow::Result<serde_json::Value>> + Send,
-                >,
+                Box<dyn std::future::Future<Output = anyhow::Result<serde_json::Value>> + Send>,
             >
     })
 }
@@ -94,8 +92,7 @@ async fn run_async(file: &PathBuf, trigger: &str) -> Result<serde_json::Value> {
     let trigger_value: serde_json::Value = serde_json::from_str(trigger)
         .with_context(|| format!("trigger must be valid JSON, got: {trigger:?}"))?;
     let runner = noop_runner();
-    let engine = WorkflowEngine::local_with_async_effect_runner(Some(runner))
-        .context("engine")?;
+    let engine = WorkflowEngine::local_with_async_effect_runner(Some(runner)).context("engine")?;
     let run_id = format!(
         "cli-{}",
         std::time::SystemTime::now()
@@ -131,8 +128,7 @@ async fn invoke_async(file: &PathBuf, inputs: &str) -> Result<serde_json::Value>
     let inputs_value: serde_json::Value = serde_json::from_str(inputs)
         .with_context(|| format!("inputs must be valid JSON, got: {inputs:?}"))?;
     let runner = noop_runner();
-    let engine = WorkflowEngine::local_with_async_effect_runner(Some(runner))
-        .context("engine")?;
+    let engine = WorkflowEngine::local_with_async_effect_runner(Some(runner)).context("engine")?;
     let run_id = format!(
         "cli-invoke-{}",
         std::time::SystemTime::now()

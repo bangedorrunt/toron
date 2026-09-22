@@ -37,11 +37,7 @@ pub fn noop_runner() -> AsyncEffectRunner {
     Arc::new(|_: &ActionInvocation| {
         Box::pin(async move { Ok(serde_json::Value::Null) })
             as std::pin::Pin<
-                Box<
-                    dyn std::future::Future<
-                        Output = anyhow::Result<serde_json::Value>,
-                    > + Send,
-                >,
+                Box<dyn std::future::Future<Output = anyhow::Result<serde_json::Value>> + Send>,
             >
     })
 }
@@ -56,11 +52,7 @@ pub fn lift_async(
         let value = f(&inv.action);
         Box::pin(async move { value })
             as std::pin::Pin<
-                Box<
-                    dyn std::future::Future<
-                        Output = anyhow::Result<serde_json::Value>,
-                    > + Send,
-                >,
+                Box<dyn std::future::Future<Output = anyhow::Result<serde_json::Value>> + Send>,
             >
     })
 }

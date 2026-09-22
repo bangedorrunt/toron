@@ -74,20 +74,17 @@ impl ToolError {
         use toron_core::mailbox::error::{MailErrorCode, mail_error_from_anyhow};
         let message = format!("{e:#}");
         let code = mail_error_from_anyhow(anyhow::anyhow!("{message}")).code;
-        let retryable = matches!(
-            code,
-            MailErrorCode::Timeout | MailErrorCode::Io
-        );
+        let retryable = matches!(code, MailErrorCode::Timeout | MailErrorCode::Io);
         let hint = match &code {
-            MailErrorCode::NotFound =>
-                "check the agent/project/message id and retry with the correct one",
-            MailErrorCode::PolicyDenied =>
-                "request contact or use an authorized pin; never retry blind",
+            MailErrorCode::NotFound => {
+                "check the agent/project/message id and retry with the correct one"
+            }
+            MailErrorCode::PolicyDenied => {
+                "request contact or use an authorized pin; never retry blind"
+            }
             MailErrorCode::Unsupported => "use a supported backend or operation",
             MailErrorCode::Timeout | MailErrorCode::Io => "safe to retry with backoff",
-            MailErrorCode::Malformed | MailErrorCode::Serialize => {
-                "fix the input shape and retry"
-            }
+            MailErrorCode::Malformed | MailErrorCode::Serialize => "fix the input shape and retry",
             MailErrorCode::Other(_) => "unclassified failure; do not retry blindly",
         };
         Self {

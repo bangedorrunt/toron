@@ -9,9 +9,7 @@
 
 use std::sync::{Arc, Mutex as StdMutex};
 
-use toron_workflow::engine::{
-    ActionInvocation, AsyncEffectRunner, RunInput, WorkflowEngine,
-};
+use toron_workflow::engine::{ActionInvocation, AsyncEffectRunner, RunInput, WorkflowEngine};
 use toron_workflow::schema::{Action, parse_workflow};
 
 fn recording_runner(
@@ -37,7 +35,8 @@ fn always_ok_runner(seen: Arc<StdMutex<Vec<Action>>>) -> AsyncEffectRunner {
 #[tokio::test]
 async fn foreach_non_list_fails_loud_not_empty() {
     let seen = Arc::new(StdMutex::new(Vec::new()));
-    let engine = WorkflowEngine::local_with_async_effect_runner(Some(always_ok_runner(seen))).expect("engine");
+    let engine = WorkflowEngine::local_with_async_effect_runner(Some(always_ok_runner(seen)))
+        .expect("engine");
     let wf = parse_workflow(
         r##"
 name: foreach-bad
@@ -83,7 +82,8 @@ steps:
 #[tokio::test]
 async fn parallel_invalid_count_fails_loud_not_one() {
     let seen = Arc::new(StdMutex::new(Vec::new()));
-    let engine = WorkflowEngine::local_with_async_effect_runner(Some(always_ok_runner(seen))).expect("engine");
+    let engine = WorkflowEngine::local_with_async_effect_runner(Some(always_ok_runner(seen)))
+        .expect("engine");
     let wf = parse_workflow(
         r##"
 name: parallel-bad
@@ -121,7 +121,8 @@ steps:
 #[tokio::test]
 async fn parallel_zero_count_fails_loud() {
     let seen = Arc::new(StdMutex::new(Vec::new()));
-    let engine = WorkflowEngine::local_with_async_effect_runner(Some(always_ok_runner(seen))).expect("engine");
+    let engine = WorkflowEngine::local_with_async_effect_runner(Some(always_ok_runner(seen)))
+        .expect("engine");
     let wf = parse_workflow(
         r##"
 name: parallel-zero
@@ -160,7 +161,8 @@ steps:
 #[tokio::test]
 async fn runtime_graph_cycle_fails_when_lint_bypassed() {
     let seen = Arc::new(StdMutex::new(Vec::new()));
-    let engine = WorkflowEngine::local_with_async_effect_runner(Some(always_ok_runner(seen))).expect("engine");
+    let engine = WorkflowEngine::local_with_async_effect_runner(Some(always_ok_runner(seen)))
+        .expect("engine");
     // parse_workflow does not validate the graph; engine.run must.
     let wf = parse_workflow(
         r##"
@@ -201,7 +203,8 @@ graph:
 #[tokio::test]
 async fn runtime_graph_unknown_needs_fails_when_lint_bypassed() {
     let seen = Arc::new(StdMutex::new(Vec::new()));
-    let engine = WorkflowEngine::local_with_async_effect_runner(Some(always_ok_runner(seen))).expect("engine");
+    let engine = WorkflowEngine::local_with_async_effect_runner(Some(always_ok_runner(seen)))
+        .expect("engine");
     let wf = parse_workflow(
         r##"
 name: bad-needs
@@ -244,8 +247,9 @@ graph:
 #[tokio::test]
 async fn linear_step_guard_false_skips_without_running() {
     let seen = Arc::new(StdMutex::new(Vec::new()));
-    let engine = WorkflowEngine::local_with_async_effect_runner(Some(always_ok_runner(seen.clone())))
-        .expect("engine");
+    let engine =
+        WorkflowEngine::local_with_async_effect_runner(Some(always_ok_runner(seen.clone())))
+            .expect("engine");
     let wf = parse_workflow(
         r##"
 name: linear-guard
@@ -292,7 +296,8 @@ steps:
 #[tokio::test]
 async fn branch_guard_error_fails_not_else() {
     let seen = Arc::new(StdMutex::new(Vec::new()));
-    let engine = WorkflowEngine::local_with_async_effect_runner(Some(always_ok_runner(seen))).expect("engine");
+    let engine = WorkflowEngine::local_with_async_effect_runner(Some(always_ok_runner(seen)))
+        .expect("engine");
     let wf = parse_workflow(
         r##"
 name: branch-err
@@ -343,7 +348,8 @@ steps:
 #[tokio::test]
 async fn graph_node_guard_nonbool_fails_not_silent_skip() {
     let seen = Arc::new(StdMutex::new(Vec::new()));
-    let engine = WorkflowEngine::local_with_async_effect_runner(Some(always_ok_runner(seen))).expect("engine");
+    let engine = WorkflowEngine::local_with_async_effect_runner(Some(always_ok_runner(seen)))
+        .expect("engine");
     let wf = parse_workflow(
         r##"
 name: node-guard
@@ -510,7 +516,8 @@ steps:
 #[tokio::test]
 async fn unresolved_template_ref_fails_loud() {
     let seen = Arc::new(StdMutex::new(Vec::new()));
-    let engine = WorkflowEngine::local_with_async_effect_runner(Some(always_ok_runner(seen))).expect("engine");
+    let engine = WorkflowEngine::local_with_async_effect_runner(Some(always_ok_runner(seen)))
+        .expect("engine");
     let wf = parse_workflow(
         r##"
 name: bad-ref

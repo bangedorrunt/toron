@@ -334,10 +334,7 @@ mod tests {
                 (1, 0) => winners += 1,
                 (0, 1) => {
                     losers += 1;
-                    assert!(
-                        !r.conflicts[0].holders.is_empty(),
-                        "loser names the holder"
-                    );
+                    assert!(!r.conflicts[0].holders.is_empty(), "loser names the holder");
                 }
                 other => panic!("grant XOR conflict, got {other:?}"),
             }

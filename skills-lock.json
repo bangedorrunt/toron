@@ -19,6 +19,12 @@
       "skillPath": "experiment-tracker/SKILL.md",
       "computedHash": "121505461f9a453458413a2e32ed9f77e093f73682547644b7a6b4d74ffef7da"
     },
+    "mcp-builder": {
+      "source": "anthropics/skills",
+      "sourceType": "github",
+      "skillPath": "skills/mcp-builder/SKILL.md",
+      "computedHash": "826e46adf81e1372282e205c34e1a2ee876e72148007726e4a2512599d2fef7b"
+    },
     "nostr-bunker-integration": {
       "source": "accolver/skill-maker",
       "sourceType": "github",
@@ -120,6 +126,12 @@
       "sourceType": "github",
       "skillPath": "skills/tui-design/SKILL.md",
       "computedHash": "a6730abd3cf3f19b7f0ab3ffdd6cf0579f895f4c6e453ea39e7983b38877486f"
+    },
+    "typesafe-ai": {
+      "source": "typesafe-ai/skills",
+      "sourceType": "github",
+      "skillPath": "skills/typesafe-ai/SKILL.md",
+      "computedHash": "9cd84c5e535dec8dec59917c110f9c00b4a61faadb86b432ec7e41051170af12"
     }
   }
 }

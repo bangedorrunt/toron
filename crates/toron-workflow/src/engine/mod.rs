@@ -45,7 +45,6 @@ use serde::{Deserialize, Serialize};
 use resonate_sdk::prelude::{Resonate, ResonateConfig};
 use resonate_sdk::types::Value;
 
-
 // ---------------------------------------------------------------------------
 // Resonate server selection: remote Tailscale default, local fallback.
 // ---------------------------------------------------------------------------

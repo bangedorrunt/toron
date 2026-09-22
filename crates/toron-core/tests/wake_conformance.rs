@@ -351,6 +351,9 @@ fn conformance_scripts_are_deterministic() {
     assert_eq!(seq, again);
     let mut seen = HashMap::new();
     for (i, s) in seq.iter().enumerate() {
-        assert!(seen.insert(s.clone(), i).is_none(), "no duplicate script step");
+        assert!(
+            seen.insert(s.clone(), i).is_none(),
+            "no duplicate script step"
+        );
     }
 }

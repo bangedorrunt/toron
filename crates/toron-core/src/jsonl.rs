@@ -125,7 +125,11 @@ mod tests {
         let p = tmp("lint");
         std::fs::write(&p, "{\"a\":1}\nnot json\n{\"b\":2}\n").unwrap();
         assert_eq!(lint_file(&p).unwrap(), Some(2));
-        assert_eq!(lint_file(&tmp("missing")).unwrap(), None, "absent file is clean");
+        assert_eq!(
+            lint_file(&tmp("missing")).unwrap(),
+            None,
+            "absent file is clean"
+        );
         let _ = std::fs::remove_file(&p);
     }
 
