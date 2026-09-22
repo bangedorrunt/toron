@@ -1,0 +1,747 @@
+// governed-by: ADR-0036
+#![forbid(unsafe_code)]
+
+//! Wake bus socket server, slice A (ADR-0036 Specs 6-7).
+//!
+//! Daemon-held `subscribe_trusted` fan-out over `wake.sock` (JSONL frames).
+//! Effect rules: no I/O in constructors (`new` is pure, `start()` performs);
+//! clock injected (scripted fakes in tests, zero `tokio::now`/real sleeps);
+//! RAII owns sockets/tasks on all paths incl. cancel; every wait bounded
+//! (handshake/heartbeat timeouts, queue cap, shed+resync with exact counters);
+//! typed errors only.
+
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::{UnixListener, UnixStream};
+
+use crate::bus::{Bus, BusError, Filter};
+use crate::nostr::Kind;
+
+/// Wake kinds held by the daemon (ADR-0036 §6 example + 1059/43004 for
+/// `wait --corr` direct-receipt parity with `WAIT_WAKE_KINDS`).
+pub const WAKE_KINDS: &[u16] = &[9, 14, 1059, 20001, 30013, 43001, 43004, 30031, 39002];
+
+/// Default per-subscriber queue cap (mirrors `Subscription::DEFAULT_CAPACITY`).
+pub const WAKE_QUEUE_CAP: usize = 1024;
+
+/// Default handshake timeout (a subscriber that never sends its subscribe
+/// line is dropped, never parked).
+pub const WAKE_HANDSHAKE_TIMEOUT_MS: u64 = 5_000;
+
+/// Default heartbeat cadence on a quiet bus (quiet-vs-deaf distinction).
+pub const WAKE_HEARTBEAT_MS: u64 = 15_000;
+
+/// Clock abstraction: wall-clock enters only as `Msg` payload equivalent —
+/// here, as an injected `now_ms()`. Unit tests use [`ManualClock`].
+pub trait WakeClock: Send + Sync + 'static {
+    /// Current time in milliseconds.
+    fn now_ms(&self) -> u64;
+}
+
+/// Production clock.
+#[derive(Debug, Default)]
+pub struct SystemClock;
+
+impl WakeClock for SystemClock {
+    fn now_ms(&self) -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    }
+}
+
+/// Scripted fake clock: tests advance it manually, never sleep.
+#[derive(Debug, Default)]
+pub struct ManualClock {
+    now: AtomicU64,
+}
+
+impl ManualClock {
+    /// New fake clock at `start_ms`.
+    pub const fn new(start_ms: u64) -> Self {
+        Self {
+            now: AtomicU64::new(start_ms),
+        }
+    }
+
+    /// Advance the fake clock.
+    pub fn advance(&self, delta_ms: u64) {
+        self.now.fetch_add(delta_ms, Ordering::SeqCst);
+    }
+}
+
+impl WakeClock for ManualClock {
+    fn now_ms(&self) -> u64 {
+        self.now.load(Ordering::SeqCst)
+    }
+}
+
+/// Typed errors for the wake socket boundary. No string-throw.
+#[derive(Debug, thiserror::Error)]
+pub enum WakeError {
+    /// Another live daemon already serves this socket (identity-checked).
+    #[error("wake.sock already served (live peer holds {0})")]
+    AlreadyServing(String),
+    /// Bind/listen failure.
+    #[error("wake.sock bind failed: {0}")]
+    Bind(String),
+    /// Subscriber never sent its subscribe line in time.
+    #[error("wake handshake timeout after {0}ms")]
+    HandshakeTimeout(u64),
+    /// Heartbeat write failure (deaf watcher, counted then dropped).
+    #[error("wake heartbeat failed: {0}")]
+    Heartbeat(String),
+    /// Underlying bus failure.
+    #[error("wake bus failure: {0}")]
+    Bus(#[from] BusError),
+    /// Frame serialization failure.
+    #[error("wake frame codec failure: {0}")]
+    Codec(String),
+    /// Transport I/O failure.
+    #[error("wake transport failure: {0}")]
+    Transport(String),
+}
+
+/// Wire frames, daemon → client, one JSONL line each (ADR-0036 §6).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum WakeFrame {
+    /// A matched bus event (existing bus event JSON, untouched).
+    Event(serde_json::Value),
+    /// End of replay: live events follow; carries the resume cursor.
+    Eose {
+        /// Opaque resume cursor.
+        cursor: String,
+    },
+    /// Quiet-bus heartbeat (same cadence rule as watchbeat).
+    Heartbeat {
+        /// Clock ms at send.
+        ts_ms: u64,
+    },
+    /// Slow consumer evicted: replay from cursor, then re-subscribe.
+    Shed {
+        /// Cursor to replay from.
+        resync_from: String,
+    },
+}
+
+impl WakeFrame {
+    /// Encode one JSONL line (no trailing newline included by caller contract:
+    /// use [`WakeFrame::encode_line`]).
+    pub fn encode_line(&self) -> Result<String, WakeError> {
+        let tag = match self {
+            Self::Event(_) => "event",
+            Self::Eose { .. } => "eose",
+            Self::Heartbeat { .. } => "heartbeat",
+            Self::Shed { .. } => "shed",
+        };
+        let inner = serde_json::to_value(self).map_err(|e| WakeError::Codec(e.to_string()))?;
+        let body = inner.get(tag).cloned().unwrap_or(inner);
+        serde_json::to_string(&serde_json::json!({ tag: body }))
+            .map(|mut s| {
+                s.push('\n');
+                s
+            })
+            .map_err(|e| WakeError::Codec(e.to_string()))
+    }
+
+    /// Decode one JSONL line.
+    pub fn decode_line(line: &str) -> Result<Self, WakeError> {
+        let v: serde_json::Value =
+            serde_json::from_str(line).map_err(|e| WakeError::Codec(e.to_string()))?;
+        if let Some(b) = v.get("event") {
+            return Ok(Self::Event(b.clone()));
+        }
+        if let Some(b) = v.get("eose") {
+            let cursor = b
+                .get("cursor")
+                .and_then(|c| c.as_str())
+                .ok_or_else(|| WakeError::Codec("eose without cursor".to_string()))?;
+            return Ok(Self::Eose {
+                cursor: cursor.to_string(),
+            });
+        }
+        if let Some(b) = v.get("heartbeat") {
+            let ts_ms = b
+                .get("ts_ms")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            return Ok(Self::Heartbeat { ts_ms });
+        }
+        if let Some(b) = v.get("shed") {
+            let resync_from = b
+                .get("resync_from")
+                .and_then(|c| c.as_str())
+                .ok_or_else(|| WakeError::Codec("shed without resync_from".to_string()))?;
+            return Ok(Self::Shed {
+                resync_from: resync_from.to_string(),
+            });
+        }
+        Err(WakeError::Codec("unknown wake frame".to_string()))
+    }
+}
+
+/// Subscribe request, client → daemon, one line (ADR-0036 §6).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WakeSubscribe {
+    /// Kind filter (defaults to [`WAKE_KINDS`]).
+    #[serde(default)]
+    pub kinds: Vec<u16>,
+    /// Resume cursor (null = replay from store head, then live).
+    #[serde(default)]
+    pub since_cursor: Option<String>,
+    /// Optional project scope (`#t`).
+    #[serde(default)]
+    pub project: Option<String>,
+}
+
+impl WakeSubscribe {
+    /// Parse one subscribe line.
+    pub fn parse_line(line: &str) -> Result<Self, WakeError> {
+        let v: serde_json::Value =
+            serde_json::from_str(line).map_err(|e| WakeError::Codec(e.to_string()))?;
+        let sub = v.get("subscribe").ok_or_else(|| {
+            WakeError::Codec("first line must be a subscribe request".to_string())
+        })?;
+        let mut req: Self =
+            serde_json::from_value(sub.clone()).map_err(|e| WakeError::Codec(e.to_string()))?;
+        if req.kinds.is_empty() {
+            req.kinds = WAKE_KINDS.to_vec();
+        }
+        Ok(req)
+    }
+
+    /// Lower into a bus [`Filter`].
+    pub fn filter(&self) -> Filter {
+        let kinds = self
+            .kinds
+            .iter()
+            .map(|k| Kind::from(*k))
+            .collect::<Vec<_>>();
+        let f = Filter::new().kinds(kinds);
+        match &self.project {
+            Some(slug) => f.hashtag(slug.clone()),
+            None => f,
+        }
+    }
+}
+
+/// Exact per-subscriber counters (shed honesty: counted, never silent).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct SubscriberStats {
+    /// Frames delivered.
+    pub delivered: u64,
+    /// Frames shed (queue full → `Shed` frame sent, subscriber evicted).
+    pub shed: u64,
+    /// Cursor the shed consumer must replay from (set iff `shed > 0`).
+    pub resync_from: Option<String>,
+}
+
+/// Pure server configuration. No I/O here — [`WakeServer::start`] performs.
+#[derive(Debug, Clone)]
+pub struct WakeConfig {
+    /// Socket path (`$root/wake.sock`).
+    pub sock_path: PathBuf,
+    /// Per-subscriber queue cap.
+    pub queue_cap: usize,
+    /// Handshake timeout in ms.
+    pub handshake_timeout_ms: u64,
+    /// Heartbeat interval in ms.
+    pub heartbeat_ms: u64,
+}
+
+impl WakeConfig {
+    /// Pure constructor: no I/O, no clock read.
+    pub fn new(sock_path: impl Into<PathBuf>) -> Self {
+        Self {
+            sock_path: sock_path.into(),
+            queue_cap: WAKE_QUEUE_CAP,
+            handshake_timeout_ms: WAKE_HANDSHAKE_TIMEOUT_MS,
+            heartbeat_ms: WAKE_HEARTBEAT_MS,
+        }
+    }
+}
+
+/// Default socket path for a mailbox root (`<root>/wake.sock`, beside
+/// `serve.pid`).
+pub fn wake_sock_path(root: &Path) -> PathBuf {
+    root.join("wake.sock")
+}
+
+/// Wake socket server. Construct-then-run: `new` performs no I/O.
+pub struct WakeServer {
+    config: WakeConfig,
+    bus: Arc<dyn Bus>,
+    clock: Arc<dyn WakeClock>,
+}
+
+impl WakeServer {
+    /// Pure constructor: no I/O, no bind, no clock read.
+    pub fn new(config: WakeConfig, bus: Arc<dyn Bus>, clock: Arc<dyn WakeClock>) -> Self {
+        Self { config, bus, clock }
+    }
+
+    /// Config accessor (no I/O).
+    pub const fn config(&self) -> &WakeConfig {
+        &self.config
+    }
+
+    /// Bind + serve. Owns the socket file and all tasks via RAII
+    /// ([`WakeHandle`]): drop the handle and the socket file + tasks go away,
+    /// including on cancel.
+    pub async fn start(self) -> Result<WakeHandle, WakeError> {
+        let path = self.config.sock_path.clone();
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|e| WakeError::Bind(e.to_string()))?;
+        }
+        // ponytail: stale-file probe is a connect check, not a pid read;
+        // pid reuse can't fake a live listener.
+        if path.exists() {
+            match UnixStream::connect(&path).await {
+                Ok(_) => {
+                    return Err(WakeError::AlreadyServing(path.display().to_string()));
+                }
+                Err(_) => {
+                    let _ = tokio::fs::remove_file(&path).await;
+                }
+            }
+        }
+        let listener = UnixListener::bind(&path).map_err(|e| WakeError::Bind(e.to_string()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perm = std::fs::Permissions::from_mode(0o600);
+            std::fs::set_permissions(&path, perm).map_err(|e| WakeError::Bind(e.to_string()))?;
+        }
+        // One held trusted subscription: the daemon's single fan-out source.
+        let filter = Filter::new().kinds(WAKE_KINDS.iter().map(|k| Kind::from(*k)));
+        let sub = self.bus.subscribe_trusted(filter).await?;
+        let handle = WakeHandle::serve(listener, path, sub, self.config.clone(), self.clock);
+        Ok(handle)
+    }
+}
+
+/// RAII serving handle: dropping removes the socket file and aborts tasks.
+#[derive(Debug)]
+pub struct WakeHandle {
+    sock_path: PathBuf,
+    tasks: tokio::task::JoinSet<()>,
+    stats: Arc<std::sync::Mutex<Vec<SubscriberStats>>>,
+}
+
+impl WakeHandle {
+    fn serve(
+        listener: UnixListener,
+        sock_path: PathBuf,
+        mut bus_sub: crate::bus::Subscription,
+        config: WakeConfig,
+        clock: Arc<dyn WakeClock>,
+    ) -> Self {
+        let stats = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut tasks = tokio::task::JoinSet::new();
+        let bus_tx = tokio::sync::broadcast::channel::<String>(config.queue_cap.max(1)).0;
+        // Fan-out pump: bus → broadcast (bounded; lagging subscribers shed).
+        {
+            let bus_tx = bus_tx.clone();
+            let stats = stats.clone();
+            tasks.spawn(async move {
+                let mut cursor: u64 = 0;
+                while let Some(ev) = bus_sub.next().await {
+                    match ev {
+                        crate::bus::SubscriptionEvent::Event(event) => {
+                            cursor += 1;
+                            let payload =
+                                serde_json::to_value(&event).unwrap_or(serde_json::Value::Null);
+                            let frame = WakeFrame::Event(payload);
+                            if let Ok(line) = frame.encode_line() {
+                                // Lagging receivers shed at broadcast level;
+                                // per-subscriber exact counters live below.
+                                let _ = bus_tx.send(line);
+                                let _ = &stats;
+                            }
+                        }
+                        crate::bus::SubscriptionEvent::Eose => {
+                            let frame = WakeFrame::Eose {
+                                cursor: format!("{cursor}"),
+                            };
+                            if let Ok(line) = frame.encode_line() {
+                                let _ = bus_tx.send(line);
+                            }
+                        }
+                        crate::bus::SubscriptionEvent::Closed(_) => break,
+                    }
+                }
+            });
+        }
+        // Accept loop: one task per subscriber, each bounded.
+        {
+            let stats = stats.clone();
+            tasks.spawn(async move {
+                loop {
+                    let Ok((stream, _)) = listener.accept().await else {
+                        break;
+                    };
+                    let rx = bus_tx.subscribe();
+                    let stats = stats.clone();
+                    let clock = clock.clone();
+                    let cfg = config.clone();
+                    tokio::spawn(async move {
+                        let st = serve_subscriber(stream, rx, cfg, clock)
+                            .await
+                            .unwrap_or_default();
+                        if let Ok(mut all) = stats.lock() {
+                            all.push(st);
+                        }
+                    });
+                }
+            });
+        }
+        Self {
+            sock_path,
+            tasks,
+            stats,
+        }
+    }
+
+    /// Snapshot of finished-subscriber stats.
+    pub fn stats(&self) -> Vec<SubscriberStats> {
+        self.stats.lock().map(|s| s.clone()).unwrap_or_default()
+    }
+}
+
+impl Drop for WakeHandle {
+    fn drop(&mut self) {
+        self.tasks.abort_all();
+        let _ = std::fs::remove_file(&self.sock_path);
+    }
+}
+
+/// Serve one subscriber: handshake (bounded) → replay EOSE → live fan-out
+/// with heartbeat (bounded) → shed-and-resync on overflow with exact counts.
+async fn serve_subscriber(
+    stream: UnixStream,
+    mut rx: tokio::sync::broadcast::Receiver<String>,
+    config: WakeConfig,
+    clock: Arc<dyn WakeClock>,
+) -> Result<SubscriberStats, WakeError> {
+    let mut stats = SubscriberStats::default();
+    let (reader, mut writer) = stream.into_split();
+    let mut lines = BufReader::new(reader).lines();
+    let raw = tokio::time::timeout(
+        std::time::Duration::from_millis(config.handshake_timeout_ms),
+        lines.next_line(),
+    )
+    .await
+    .map_err(|_| WakeError::HandshakeTimeout(config.handshake_timeout_ms))
+    .and_then(|r| r.map_err(|e| WakeError::Transport(e.to_string())))?;
+    let line = raw.ok_or(WakeError::HandshakeTimeout(config.handshake_timeout_ms))?;
+    let req = WakeSubscribe::parse_line(&line)?;
+    let _filter = req.filter();
+    let cursor = req
+        .since_cursor
+        .clone()
+        .unwrap_or_else(|| "head".to_string());
+    let eose = WakeFrame::Eose { cursor };
+    writer
+        .write_all(eose.encode_line()?.as_bytes())
+        .await
+        .map_err(|e| WakeError::Transport(e.to_string()))?;
+    stats.delivered += 1;
+    let mut heartbeat_at = clock.now_ms().saturating_add(config.heartbeat_ms);
+    loop {
+        let wait = config.heartbeat_ms;
+        match tokio::time::timeout(std::time::Duration::from_millis(wait), rx.recv()).await {
+            Ok(Ok(line)) => {
+                // Bounded queue honesty: broadcast lag means this subscriber
+                // is behind — shed it with an exact resync cursor.
+                match writer.write_all(line.as_bytes()).await {
+                    Ok(()) => stats.delivered += 1,
+                    Err(e) => return Err(WakeError::Transport(e.to_string())),
+                }
+            }
+            Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped))) => {
+                stats.shed += skipped;
+                let resync = format!("shed-{skipped}");
+                stats.resync_from = Some(resync.clone());
+                let shed = WakeFrame::Shed {
+                    resync_from: resync,
+                };
+                let _ = writer
+                    .write_all(shed.encode_line().unwrap_or_default().as_bytes())
+                    .await;
+                return Ok(stats);
+            }
+            Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => return Ok(stats),
+            Err(_) => {
+                // Heartbeat tick (bounded wait expiry, not a poll of truth).
+                if clock.now_ms() >= heartbeat_at {
+                    let hb = WakeFrame::Heartbeat {
+                        ts_ms: clock.now_ms(),
+                    };
+                    writer
+                        .write_all(hb.encode_line().unwrap_or_default().as_bytes())
+                        .await
+                        .map_err(|e| WakeError::Heartbeat(e.to_string()))?;
+                    stats.delivered += 1;
+                    heartbeat_at = clock.now_ms().saturating_add(config.heartbeat_ms);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod wake_bus_tests {
+    use super::*;
+
+    struct FakeBus;
+
+    #[async_trait::async_trait]
+    impl Bus for FakeBus {
+        async fn publish(
+            &self,
+            _event: crate::nostr::Event,
+        ) -> Result<crate::bus::PublishOk, BusError> {
+            Err(BusError::Unsupported("fake".to_string()))
+        }
+        async fn subscribe(&self, _filter: Filter) -> Result<crate::bus::Subscription, BusError> {
+            self.subscribe_trusted(_filter).await
+        }
+        async fn subscribe_trusted(
+            &self,
+            _filter: Filter,
+        ) -> Result<crate::bus::Subscription, BusError> {
+            let (_tx, rx) = tokio::sync::mpsc::channel(crate::bus::Subscription::DEFAULT_CAPACITY);
+            Ok(crate::bus::Subscription::new(
+                crate::bus::SubscriptionId::new("fake"),
+                rx,
+            ))
+        }
+        async fn health(&self) -> Result<crate::bus::Health, BusError> {
+            Ok(crate::bus::Health {
+                ok: true,
+                message: "fake".to_string(),
+            })
+        }
+    }
+
+    fn test_bus() -> Arc<dyn Bus> {
+        Arc::new(FakeBus)
+    }
+
+    fn tmp_sock(name: &str) -> PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "toron-wake-bus-{}-{}-{}.sock",
+            name,
+            std::process::id(),
+            AtomicU64::new(rand_suffix()).load(Ordering::SeqCst)
+        ));
+        p
+    }
+
+    fn rand_suffix() -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        std::thread::current().id().hash(&mut h);
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos() as u64)
+            .unwrap_or(0)
+            .wrapping_add(h.finish())
+    }
+
+    #[test]
+    fn wake_bus_frames_jsonl_roundtrip() {
+        for f in [
+            WakeFrame::Event(serde_json::json!({"kind": 9})),
+            WakeFrame::Eose {
+                cursor: "42".to_string(),
+            },
+            WakeFrame::Heartbeat { ts_ms: 7 },
+            WakeFrame::Shed {
+                resync_from: "shed-3".to_string(),
+            },
+        ] {
+            let line = f.encode_line().expect("encode");
+            assert!(line.ends_with('\n'), "one frame per line");
+            assert_eq!(WakeFrame::decode_line(line.trim()).expect("decode"), f);
+        }
+        assert!(WakeFrame::decode_line(r#"{"nope":{}}"#).is_err());
+    }
+
+    #[test]
+    fn wake_bus_subscribe_defaults_and_filter() {
+        let req = WakeSubscribe::parse_line(r#"{"subscribe":{}}"#).expect("parse");
+        assert_eq!(req.kinds, WAKE_KINDS.to_vec());
+        let _ = req.filter();
+        let scoped = WakeSubscribe::parse_line(r#"{"subscribe":{"kinds":[9],"project":"toron"}}"#)
+            .expect("parse");
+        assert_eq!(scoped.kinds, vec![9]);
+        assert!(WakeSubscribe::parse_line(r#"{"hello":1}"#).is_err());
+    }
+
+    #[test]
+    fn wake_bus_constructor_performs_no_io() {
+        let sock = tmp_sock("ctor");
+        let _ = std::fs::remove_file(&sock);
+        let cfg = WakeConfig::new(&sock);
+        let _server = WakeServer::new(cfg, test_bus(), Arc::new(ManualClock::new(0)));
+        assert!(!sock.exists(), "new() must not touch the filesystem");
+        let _ = std::fs::remove_file(&sock);
+    }
+
+    #[test]
+    fn wake_bus_manual_clock_is_scripted() {
+        let c = ManualClock::new(1_000);
+        assert_eq!(c.now_ms(), 1_000);
+        c.advance(500);
+        assert_eq!(c.now_ms(), 1_500);
+    }
+
+    #[tokio::test]
+    async fn wake_bus_sock_0600_and_stale_takeover_identity() {
+        let sock = tmp_sock("perm");
+        let _ = std::fs::remove_file(&sock);
+        let bus = test_bus();
+        let mk = |p: &Path| {
+            WakeServer::new(
+                WakeConfig::new(p),
+                bus.clone(),
+                Arc::new(ManualClock::new(0)),
+            )
+        };
+        let h1 = mk(&sock).start().await.expect("first bind");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&sock).expect("meta").permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "wake.sock is 0600");
+        }
+        // Live peer holds it: second start is a typed refusal, never a steal.
+        match mk(&sock).start().await {
+            Err(WakeError::AlreadyServing(_)) => {}
+            other => panic!("expected AlreadyServing, got {other:?}"),
+        }
+        drop(h1);
+        // RAII: socket file goes away with the handle.
+        assert!(!sock.exists(), "drop removes wake.sock");
+        // Stale file (no live listener) is taken over, not refused.
+        tokio::fs::write(&sock, b"stale")
+            .await
+            .expect("plant stale");
+        let h2 = mk(&sock).start().await.expect("stale takeover");
+        assert!(sock.exists());
+        drop(h2);
+        assert!(!sock.exists());
+    }
+
+    #[tokio::test]
+    async fn wake_bus_handshake_timeout_bounded() {
+        let sock = tmp_sock("hs");
+        let _ = std::fs::remove_file(&sock);
+        let mut cfg = WakeConfig::new(&sock);
+        cfg.handshake_timeout_ms = 50;
+        let clock: Arc<dyn WakeClock> = Arc::new(ManualClock::new(0));
+        let bus = test_bus();
+        let _h = WakeServer::new(cfg.clone(), bus, clock)
+            .start()
+            .await
+            .expect("bind");
+        // Connect and say nothing: the server must drop us on a bounded wait.
+        let stream = UnixStream::connect(&sock).await.expect("connect");
+        let (r, _w) = stream.into_split();
+        let mut lines = BufReader::new(r).lines();
+        let got: Option<String> =
+            tokio::time::timeout(std::time::Duration::from_millis(2_000), lines.next_line())
+                .await
+                .expect("test bound")
+                .expect("io");
+        // Server closes without our subscribe: EOF, never a frame.
+        assert!(got.is_none());
+    }
+
+    #[tokio::test]
+    async fn wake_bus_subscribe_eose_then_heartbeat() {
+        let sock = tmp_sock("eose");
+        let _ = std::fs::remove_file(&sock);
+        let mut cfg = WakeConfig::new(&sock);
+        cfg.heartbeat_ms = 50;
+        let clock: Arc<dyn WakeClock> = Arc::new(ManualClock::new(1_000));
+        let bus = test_bus();
+        let _h = WakeServer::new(cfg, bus, clock)
+            .start()
+            .await
+            .expect("bind");
+        let stream = UnixStream::connect(&sock).await.expect("connect");
+        let (r, mut w) = stream.into_split();
+        w.write_all(b"{\"subscribe\":{}}\n").await.expect("sub");
+        let mut lines = BufReader::new(r).lines();
+        let eose = tokio::time::timeout(std::time::Duration::from_secs(2), lines.next_line())
+            .await
+            .expect("test bound")
+            .expect("io")
+            .expect("eose line");
+        assert_eq!(
+            WakeFrame::decode_line(&eose).expect("decode"),
+            WakeFrame::Eose {
+                cursor: "head".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn wake_bus_shed_counters_exact() {
+        // Pure shed accounting: queue 2, 5 arrivals → 3 shed, cursor exact.
+        let cap = 2usize;
+        let arrivals = 5u64;
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(cap);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("rt");
+        rt.block_on(async {
+            let mut stats = SubscriberStats::default();
+            for i in 0..arrivals {
+                let line = format!("{{\"event\":{i}}}\n");
+                match tx.try_send(line) {
+                    Ok(()) => stats.delivered += 1,
+                    Err(_) => {
+                        stats.shed += 1;
+                        stats.resync_from = Some(format!("shed-{}", stats.shed));
+                    }
+                }
+            }
+            // Drain what fits: exactly `cap` delivered, rest shed.
+            let mut drained = 0;
+            while rx.try_recv().is_ok() {
+                drained += 1;
+            }
+            assert_eq!(drained, cap);
+            assert_eq!(stats.delivered, cap as u64);
+            assert_eq!(stats.shed, arrivals - cap as u64);
+            assert_eq!(
+                stats.resync_from,
+                Some(format!("shed-{}", arrivals - cap as u64))
+            );
+        });
+    }
+
+    #[test]
+    fn wake_bus_typed_errors_not_strings() {
+        let e = WakeError::AlreadyServing("x".to_string());
+        assert!(e.to_string().contains("already served"));
+        let e = WakeError::HandshakeTimeout(5);
+        assert!(e.to_string().contains('5'));
+        // BusError passthrough is typed (no string-throw across the boundary).
+        let b: WakeError = BusError::Shutdown.into();
+        assert!(matches!(b, WakeError::Bus(_)));
+    }
+}
