@@ -13,7 +13,9 @@
 //! `owed → acked → resulted` describes message lifecycle only and can never
 //! substitute for workflow-effect state (ADR-0032 §31 correction).
 
+use serde::{Deserialize, Serialize};
 use sqlx::{Row, SqlitePool};
+use std::collections::BTreeMap;
 
 /// Maximum bytes kept in any single evidence projection. Longer payloads
 /// are truncated with a marker — diagnostics stay bounded and secret-safe
@@ -46,8 +48,117 @@ pub fn now_us() -> i64 {
     crate::index::writer::Clock::now_us(&crate::index::writer::SystemClock)
 }
 
+/// Per-process event distinguisher: two mutations of one key in one µs
+/// still land distinct log rows (never a silent dedup loss).
+static WFX_EVENT_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Append one `wfx.row` event inside the caller's transaction (dual-write
+/// half of the v20 log for workflow effects). The payload is the full
+/// post-write row; replay folds last-write-wins per (table, key).
+/// Generation contention retries 3x, then fails loud (fail-closed).
+async fn log_wfx_event_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    table: &str,
+    key: &str,
+    row_json: &serde_json::Value,
+    ts_us: i64,
+) -> anyhow::Result<()> {
+    let payload = serde_json::to_string(&serde_json::json!({
+        "table": table,
+        "key": key,
+        "row": row_json,
+        "ts_us": ts_us,
+    }))
+    .unwrap_or_default();
+    append_wfx_event_in_tx(
+        tx,
+        "wfx.row",
+        &format!("wfx:{table}:{key}"),
+        &payload,
+        ts_us,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("wfx dual-write contention on {table}:{key}: {e}"))
+}
+
+/// Tombstone twin of [`log_wfx_event_in_tx`]: rebuild must not resurrect
+/// pruned/deleted rows.
+async fn log_wfx_tombstone_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    table: &str,
+    key: &str,
+    ts_us: i64,
+) -> anyhow::Result<()> {
+    let payload = serde_json::to_string(&serde_json::json!({
+        "table": table,
+        "key": key,
+        "tombstone": true,
+    }))
+    .unwrap_or_default();
+    append_wfx_event_in_tx(
+        tx,
+        "wfx.tombstone",
+        &format!("wfx-tomb:{table}:{key}"),
+        &payload,
+        ts_us,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("wfx tombstone contention on {table}:{key}: {e}"))
+}
+
+/// Single generation-assigning append behind both log helpers: one retry
+/// loop, one manifest advance. Event ids suffix pid+seq so two mutations
+/// of one key in one µs never collide into a silent dedup loss.
+async fn append_wfx_event_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    kind: &str,
+    id_prefix: &str,
+    payload: &str,
+    ts_us: i64,
+) -> anyhow::Result<()> {
+    for _ in 0..3 {
+        let mrow: Option<(i64,)> =
+            sqlx::query_as("SELECT generation FROM generation_manifest WHERE singleton = 1")
+                .fetch_optional(&mut **tx)
+                .await?;
+        let next = mrow.map_or(0, |(g,)| g) + 1;
+        let seq = WFX_EVENT_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let event_id = format!("{id_prefix}:{ts_us}:{pid}:{seq}", pid = std::process::id());
+        let inserted = sqlx::query(
+            "INSERT INTO events (generation, event_id, kind, payload, ts_us) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+        )
+        .bind(next)
+        .bind(&event_id)
+        .bind(kind)
+        .bind(payload)
+        .bind(ts_us)
+        .execute(&mut **tx)
+        .await;
+        let inserted = match inserted {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        if inserted.rows_affected() == 0 {
+            continue;
+        }
+        sqlx::query(
+            "INSERT INTO generation_manifest (singleton, generation, updated_ts_us) \
+             VALUES (1, ?1, ?2) ON CONFLICT(singleton) DO UPDATE SET \
+             generation = excluded.generation, updated_ts_us = excluded.updated_ts_us",
+        )
+        .bind(next)
+        .bind(ts_us)
+        .execute(&mut **tx)
+        .await?;
+        return Ok(());
+    }
+    anyhow::bail!("retry budget spent")
+}
+
 /// Lifecycle state of one logical external effect (ADR-0032 Spec 5.2).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum EffectState {
     Prepared,
     InFlight,
@@ -138,7 +249,8 @@ pub const fn can_transition(from: EffectState, to: EffectState) -> bool {
 }
 
 /// Workflow run status (ADR-0032 Spec 5.1 `workflow_runs` record).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum RunStatus {
     Started,
     Running,
@@ -199,7 +311,8 @@ impl std::str::FromStr for RunStatus {
 }
 
 /// Terminal-publication state for one semantic terminal digest.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PublicationState {
     Noted,
     Published,
@@ -226,7 +339,8 @@ impl PublicationState {
 }
 
 /// Parked-promise kind.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PendingKind {
     Approval,
     Spawn,
@@ -250,7 +364,7 @@ impl PendingKind {
 }
 
 /// A logical workflow effect (current-state row).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WorkflowEffect {
     pub effect_key: String,
     pub run_id: String,
@@ -311,7 +425,7 @@ pub struct ClaimAttempt {
 }
 
 /// One append-only dispatch-attempt evidence row.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EffectAttempt {
     pub id: Option<i64>,
     pub effect_key: String,
@@ -343,7 +457,7 @@ pub struct NewRun {
 }
 
 /// A workflow run (lifecycle row).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WorkflowRun {
     pub run_id: String,
     pub project: Option<String>,
@@ -374,7 +488,7 @@ pub struct NewPending {
 }
 
 /// A parked pending row.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Pending {
     pub run_id: String,
     pub promise_id: String,
@@ -415,6 +529,19 @@ impl TerminalPub {
     }
 }
 
+/// One terminal-event row (projection shape for the log fold).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TerminalRow {
+    pub terminal_digest: String,
+    pub run_id: String,
+    pub status: String,
+    pub node_path: Option<String>,
+    pub evidence_json: Option<String>,
+    pub publication_state: PublicationState,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
 /// How [`WorkflowEffectStore::note_terminal_pub`] classified the attempt.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TerminalOutcome {
@@ -442,6 +569,90 @@ pub struct WorkflowEffectStore {
     pool: SqlitePool,
 }
 
+/// Folded workflow projection: one map per table plus skip count.
+/// Tuples carry the winning event's clock for timestamp restoration.
+#[derive(Debug, Default)]
+pub struct WfxFold {
+    pub effects: BTreeMap<String, (WorkflowEffect, i64)>,
+    pub attempts: BTreeMap<i64, (EffectAttempt, i64)>,
+    pub runs: BTreeMap<String, (WorkflowRun, i64)>,
+    pub pending: BTreeMap<String, (Pending, i64)>,
+    pub terminals: BTreeMap<String, (TerminalRow, i64)>,
+    pub skipped: u64,
+}
+
+impl WfxFold {
+    fn remove(&mut self, table: &str, key: &str) {
+        match table {
+            "workflow_effects" => {
+                self.effects.remove(key);
+            }
+            "workflow_effect_attempts" => {
+                if let Ok(id) = key.parse::<i64>() {
+                    self.attempts.remove(&id);
+                }
+            }
+            "workflow_runs" => {
+                self.runs.remove(key);
+            }
+            "workflow_pending" => {
+                self.pending.remove(key);
+            }
+            "workflow_terminal_events" => {
+                self.terminals.remove(key);
+            }
+            _ => {}
+        }
+    }
+
+    /// Insert one row payload; `false` when table/row won't parse.
+    fn insert(&mut self, table: &str, key: &str, row: &serde_json::Value, ts_us: i64) -> bool {
+        match table {
+            "workflow_effects" => match serde_json::from_value::<WorkflowEffect>(row.clone()) {
+                Ok(r) => {
+                    self.effects.insert(key.to_string(), (r, ts_us));
+                    true
+                }
+                Err(_) => false,
+            },
+            "workflow_effect_attempts" => {
+                match serde_json::from_value::<EffectAttempt>(row.clone()) {
+                    Ok(r) => {
+                        // Logged attempts always carry their row id (post-insert
+                        // read-back); 0 is unreachable from our writer.
+                        self.attempts.insert(r.id.unwrap_or(0), (r, ts_us));
+                        true
+                    }
+                    Err(_) => false,
+                }
+            }
+            "workflow_runs" => match serde_json::from_value::<WorkflowRun>(row.clone()) {
+                Ok(r) => {
+                    self.runs.insert(key.to_string(), (r, ts_us));
+                    true
+                }
+                Err(_) => false,
+            },
+            "workflow_pending" => match serde_json::from_value::<Pending>(row.clone()) {
+                Ok(r) => {
+                    self.pending.insert(key.to_string(), (r, ts_us));
+                    true
+                }
+                Err(_) => false,
+            },
+            "workflow_terminal_events" => {
+                match serde_json::from_value::<TerminalRow>(row.clone()) {
+                    Ok(r) => {
+                        self.terminals.insert(key.to_string(), (r, ts_us));
+                        true
+                    }
+                    Err(_) => false,
+                }
+            }
+            _ => false,
+        }
+    }
+}
 impl WorkflowEffectStore {
     pub const fn new(pool: SqlitePool) -> Self {
         Self { pool }
@@ -449,6 +660,101 @@ impl WorkflowEffectStore {
 
     pub const fn pool(&self) -> &SqlitePool {
         &self.pool
+    }
+
+    /// Re-read one effect row inside the committing tx and append its
+    /// `wfx.row` event (dual-write read-back; keeps payloads exact).
+    async fn log_effect_row_in_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        effect_key: &str,
+        ts_us: i64,
+    ) -> anyhow::Result<()> {
+        let row = sqlx::query(
+            "SELECT effect_key, run_id, project, workflow_digest, node_path, iteration_key, \
+                    action_type, action_digest, redacted_action, state, attempt, attempt_id, \
+                    claim_token, lease_expires_at, transport_corr, external_id, outcome_json, \
+                    failure_json, reconcile_after, retention_until \
+             FROM workflow_effects WHERE effect_key = ?1",
+        )
+        .bind(effect_key)
+        .fetch_optional(&mut **tx)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("effect vanished mid-write"))?;
+        let payload = serde_json::to_value(self.map_effect(&row)?)?;
+        log_wfx_event_in_tx(tx, "workflow_effects", effect_key, &payload, ts_us).await
+    }
+
+    /// Re-read one run row inside the committing tx and append its event.
+    async fn log_run_row_in_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        run_id: &str,
+        ts_us: i64,
+    ) -> anyhow::Result<()> {
+        let row = sqlx::query(
+            "SELECT run_id, project, workflow, workflow_digest, status, started_at, \
+                    suspended_at, finished_at, current_node, failed_node, terminal_digest \
+             FROM workflow_runs WHERE run_id = ?1",
+        )
+        .bind(run_id)
+        .fetch_optional(&mut **tx)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("run vanished mid-write"))?;
+        let payload = serde_json::to_value(self.map_run(&row)?)?;
+        log_wfx_event_in_tx(tx, "workflow_runs", run_id, &payload, ts_us).await
+    }
+
+    /// Re-read one pending row inside the committing tx and append its event.
+    async fn log_pending_row_in_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        run_id: &str,
+        promise_id: &str,
+        park_generation: i64,
+        ts_us: i64,
+    ) -> anyhow::Result<()> {
+        let row = sqlx::query(
+            "SELECT run_id, promise_id, park_generation, project, workflow, node_path, \
+                    effect_key, kind, pending_payload, publication_state \
+             FROM workflow_pending WHERE run_id = ?1 AND promise_id = ?2 AND park_generation = ?3",
+        )
+        .bind(run_id)
+        .bind(promise_id)
+        .bind(park_generation)
+        .fetch_optional(&mut **tx)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("pending vanished mid-write"))?;
+        let payload = serde_json::to_value(self.map_pending(&row)?)?;
+        let key = format!("{run_id}:{promise_id}:{park_generation}");
+        log_wfx_event_in_tx(tx, "workflow_pending", &key, &payload, ts_us).await
+    }
+
+    /// Re-read one terminal row inside the committing tx and append its event.
+    async fn log_terminal_row_in_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        terminal_digest: &str,
+        ts_us: i64,
+    ) -> anyhow::Result<()> {
+        let row = sqlx::query(
+            "SELECT terminal_digest, run_id, status, node_path, evidence_json, publication_state, \
+                    created_at, updated_at \
+             FROM workflow_terminal_events WHERE terminal_digest = ?1",
+        )
+        .bind(terminal_digest)
+        .fetch_optional(&mut **tx)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("terminal vanished mid-write"))?;
+        let payload = serde_json::to_value(self.map_terminal(&row)?)?;
+        log_wfx_event_in_tx(
+            tx,
+            "workflow_terminal_events",
+            terminal_digest,
+            &payload,
+            ts_us,
+        )
+        .await
     }
 
     /// True when a table exists (migration witness).
@@ -467,6 +773,7 @@ impl WorkflowEffectStore {
     pub async fn prepare_effect(&self, effect: NewEffect) -> anyhow::Result<PrepareOutcome> {
         let now = now_us();
         let redacted = effect.redacted_action.map(|v| bound_evidence(&v));
+        let mut tx = self.pool.begin().await?;
         let res = sqlx::query(
             "INSERT INTO workflow_effects \
              (effect_key, run_id, project, workflow_digest, node_path, iteration_key, \
@@ -487,21 +794,9 @@ impl WorkflowEffectStore {
         .bind(effect.retention_until)
         .bind(now)
         .bind(now)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
         let created = res.rows_affected() > 0;
-        let row = self
-            .get_effect(&effect.effect_key)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("effect vanished after prepare"))?;
-        Ok(PrepareOutcome {
-            created,
-            effect: row,
-        })
-    }
-
-    /// Load one effect by key.
-    pub async fn get_effect(&self, effect_key: &str) -> anyhow::Result<Option<WorkflowEffect>> {
         let row = sqlx::query(
             "SELECT effect_key, run_id, project, workflow_digest, node_path, iteration_key, \
                     action_type, action_digest, redacted_action, state, attempt, attempt_id, \
@@ -509,10 +804,318 @@ impl WorkflowEffectStore {
                     failure_json, reconcile_after, retention_until \
              FROM workflow_effects WHERE effect_key = ?1",
         )
-        .bind(effect_key)
-        .fetch_optional(&self.pool)
+        .bind(&effect.effect_key)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("effect vanished after prepare"))?;
+        let row = self.map_effect(&row)?;
+        let payload = serde_json::to_value(&row)?;
+        log_wfx_event_in_tx(
+            &mut tx,
+            "workflow_effects",
+            &effect.effect_key,
+            &payload,
+            now,
+        )
         .await?;
-        row.map(|r| self.map_effect(&r)).transpose()
+        tx.commit().await?;
+        Ok(PrepareOutcome {
+            created,
+            effect: row,
+        })
+    }
+
+    /// Fold key for one pending row (unit separators: unambiguous even
+    /// when ids contain colons).
+    pub fn pending_fold_key(run_id: &str, promise_id: &str, park_generation: i64) -> String {
+        format!("{run_id}\u{1f}{promise_id}\u{1f}{park_generation}")
+    }
+
+    /// Wave-4 projection fold (ADR-0035 Spec 4): the workflow tables as the
+    /// event log sees them. `wfx.row` last-write-wins per (table, key),
+    /// `wfx.tombstone` removes. Unparseable rows are skipped (rebuild and
+    /// verify surface the counts, never silent).
+    /// ponytail: full fold per read; effect tables are run-scoped (hundreds
+    /// of rows). A per-table index if this ever serves a hot path.
+    pub async fn fold_projected(&self) -> anyhow::Result<WfxFold> {
+        let log = crate::index::event_log::EventLog::new(self.pool.clone());
+        let mut fold = WfxFold::default();
+        for event in log.read_since(0).await? {
+            if event.kind != "wfx.row" && event.kind != "wfx.tombstone" {
+                continue;
+            }
+            let payload: serde_json::Value = match serde_json::from_str(&event.payload) {
+                Ok(v) => v,
+                Err(_) => {
+                    fold.skipped += 1;
+                    continue;
+                }
+            };
+            let Some(table) = payload.get("table").and_then(|t| t.as_str()) else {
+                fold.skipped += 1;
+                continue;
+            };
+            let Some(key) = payload.get("key").and_then(|k| k.as_str()) else {
+                fold.skipped += 1;
+                continue;
+            };
+            if event.kind == "wfx.tombstone" {
+                fold.remove(table, key);
+                continue;
+            }
+            let Some(row) = payload.get("row") else {
+                fold.skipped += 1;
+                continue;
+            };
+            let ts_us = payload
+                .get("ts_us")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0);
+            if !fold.insert(table, key, row, ts_us) {
+                fold.skipped += 1;
+            }
+        }
+        // Attempts pruned as orphans carry no tombstone: drop attempts whose
+        // effect is absent from the fold (matches prune semantics exactly).
+        fold.attempts
+            .retain(|_, (a, _)| fold.effects.contains_key(&a.effect_key));
+        Ok(fold)
+    }
+
+    /// Table-only row restores (rebuild path: no events, no policy).
+    /// `event_ts_us` stamps created/updated from the winning event's clock
+    /// (the same clock the live write used, so rebuilds reproduce stamps).
+    pub async fn restore_attempt_row(
+        &self,
+        row: &EffectAttempt,
+        event_ts_us: i64,
+    ) -> anyhow::Result<()> {
+        sqlx::query(
+            "INSERT INTO workflow_effect_attempts \
+             (id, effect_key, attempt, attempt_id, claim_token, state, evidence_json, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+             ON CONFLICT (id) DO UPDATE SET \
+               effect_key = excluded.effect_key, attempt = excluded.attempt, \
+               attempt_id = excluded.attempt_id, claim_token = excluded.claim_token, \
+               state = excluded.state, evidence_json = excluded.evidence_json",
+        )
+        .bind(row.id)
+        .bind(&row.effect_key)
+        .bind(row.attempt)
+        .bind(&row.attempt_id)
+        .bind(&row.claim_token)
+        .bind(row.state.as_str())
+        .bind(&row.evidence_json)
+        .bind(event_ts_us)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn restore_run_row(&self, row: &WorkflowRun, event_ts_us: i64) -> anyhow::Result<()> {
+        sqlx::query(
+            "INSERT INTO workflow_runs \
+             (run_id, project, workflow, workflow_digest, status, started_at, \
+              suspended_at, finished_at, current_node, failed_node, terminal_digest, \
+              created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13) \
+             ON CONFLICT (run_id) DO UPDATE SET \
+               project = excluded.project, workflow = excluded.workflow, \
+               workflow_digest = excluded.workflow_digest, status = excluded.status, \
+               started_at = excluded.started_at, suspended_at = excluded.suspended_at, \
+               finished_at = excluded.finished_at, current_node = excluded.current_node, \
+               failed_node = excluded.failed_node, terminal_digest = excluded.terminal_digest, \
+               updated_at = excluded.updated_at",
+        )
+        .bind(&row.run_id)
+        .bind(&row.project)
+        .bind(&row.workflow)
+        .bind(&row.workflow_digest)
+        .bind(row.status.as_str())
+        .bind(row.started_at)
+        .bind(row.suspended_at)
+        .bind(row.finished_at)
+        .bind(&row.current_node)
+        .bind(&row.failed_node)
+        .bind(&row.terminal_digest)
+        .bind(event_ts_us)
+        .bind(event_ts_us)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn restore_pending_row(&self, row: &Pending, event_ts_us: i64) -> anyhow::Result<()> {
+        sqlx::query(
+            "INSERT INTO workflow_pending \
+             (run_id, promise_id, park_generation, project, workflow, node_path, effect_key, \
+              kind, pending_payload, deadline, publication_state, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13) \
+             ON CONFLICT (run_id, promise_id, park_generation) DO UPDATE SET \
+               project = excluded.project, workflow = excluded.workflow, \
+               node_path = excluded.node_path, effect_key = excluded.effect_key, \
+               kind = excluded.kind, pending_payload = excluded.pending_payload, \
+               deadline = excluded.deadline, publication_state = excluded.publication_state, \
+               updated_at = excluded.updated_at",
+        )
+        .bind(&row.run_id)
+        .bind(&row.promise_id)
+        .bind(row.park_generation)
+        .bind(&row.project)
+        .bind(&row.workflow)
+        .bind(&row.node_path)
+        .bind(&row.effect_key)
+        .bind(row.kind.as_str())
+        .bind(&row.pending_payload)
+        .bind(None::<i64>)
+        .bind(&row.publication_state)
+        .bind(event_ts_us)
+        .bind(event_ts_us)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn restore_terminal_row(
+        &self,
+        row: &TerminalRow,
+        event_ts_us: i64,
+    ) -> anyhow::Result<()> {
+        sqlx::query(
+            "INSERT INTO workflow_terminal_events \
+             (terminal_digest, run_id, status, node_path, evidence_json, publication_state, \
+              created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+             ON CONFLICT (terminal_digest) DO UPDATE SET \
+               run_id = excluded.run_id, status = excluded.status, \
+               node_path = excluded.node_path, evidence_json = excluded.evidence_json, \
+               publication_state = excluded.publication_state, \
+               updated_at = excluded.updated_at",
+        )
+        .bind(&row.terminal_digest)
+        .bind(&row.run_id)
+        .bind(&row.status)
+        .bind(&row.node_path)
+        .bind(&row.evidence_json)
+        .bind(row.publication_state.as_str())
+        .bind(event_ts_us)
+        .bind(event_ts_us)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Table-only row restore (rebuild path: no events, no policy).
+    /// `event_ts_us` stamps created/updated (the mutation clock the event
+    /// carries); on conflict the stored created_at is preserved.
+    pub async fn restore_effect_row(
+        &self,
+        row: &WorkflowEffect,
+        event_ts_us: i64,
+    ) -> anyhow::Result<()> {
+        sqlx::query(
+            "INSERT INTO workflow_effects \
+             (effect_key, run_id, project, workflow_digest, node_path, iteration_key, \
+              action_type, action_digest, redacted_action, state, attempt, attempt_id, \
+              claim_token, lease_expires_at, transport_corr, external_id, outcome_json, \
+              failure_json, reconcile_after, retention_until, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, \
+                     ?16, ?17, ?18, ?19, ?20, ?21, ?22) \
+             ON CONFLICT (effect_key) DO UPDATE SET \
+               run_id = excluded.run_id, project = excluded.project, \
+               workflow_digest = excluded.workflow_digest, node_path = excluded.node_path, \
+               iteration_key = excluded.iteration_key, action_type = excluded.action_type, \
+               action_digest = excluded.action_digest, redacted_action = excluded.redacted_action, \
+               state = excluded.state, attempt = excluded.attempt, attempt_id = excluded.attempt_id, \
+               claim_token = excluded.claim_token, lease_expires_at = excluded.lease_expires_at, \
+               transport_corr = excluded.transport_corr, external_id = excluded.external_id, \
+               outcome_json = excluded.outcome_json, failure_json = excluded.failure_json, \
+               reconcile_after = excluded.reconcile_after, retention_until = excluded.retention_until, \
+               created_at = excluded.created_at, updated_at = excluded.updated_at",
+        )
+        .bind(&row.effect_key)
+        .bind(&row.run_id)
+        .bind(&row.project)
+        .bind(&row.workflow_digest)
+        .bind(&row.node_path)
+        .bind(&row.iteration_key)
+        .bind(&row.action_type)
+        .bind(&row.action_digest)
+        .bind(&row.redacted_action)
+        .bind(row.state.as_str())
+        .bind(row.attempt)
+        .bind(&row.attempt_id)
+        .bind(&row.claim_token)
+        .bind(row.lease_expires_at)
+        .bind(&row.transport_corr)
+        .bind(&row.external_id)
+        .bind(&row.outcome_json)
+        .bind(&row.failure_json)
+        .bind(row.reconcile_after)
+        .bind(row.retention_until)
+        .bind(event_ts_us)
+        .bind(event_ts_us)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+    /// Load one effect by key — served from the event projection
+    /// (wave-4 reader switch). The table stays dual-written as the tripwire.
+    pub async fn get_effect(&self, effect_key: &str) -> anyhow::Result<Option<WorkflowEffect>> {
+        Ok(self
+            .fold_projected()
+            .await?
+            .effects
+            .remove(effect_key)
+            .map(|(row, _)| row))
+    }
+
+    fn map_run(&self, r: &sqlx::sqlite::SqliteRow) -> anyhow::Result<WorkflowRun> {
+        let status: String = r.get("status");
+        Ok(WorkflowRun {
+            run_id: r.get("run_id"),
+            project: r.get("project"),
+            workflow: r.get("workflow"),
+            workflow_digest: r.get("workflow_digest"),
+            status: RunStatus::parse(&status).map_err(|e| anyhow::anyhow!("{e}"))?,
+            started_at: r.get("started_at"),
+            suspended_at: r.get("suspended_at"),
+            finished_at: r.get("finished_at"),
+            current_node: r.get("current_node"),
+            failed_node: r.get("failed_node"),
+            terminal_digest: r.get("terminal_digest"),
+        })
+    }
+
+    fn map_pending(&self, r: &sqlx::sqlite::SqliteRow) -> anyhow::Result<Pending> {
+        let kind: String = r.get("kind");
+        Ok(Pending {
+            run_id: r.get("run_id"),
+            promise_id: r.get("promise_id"),
+            park_generation: r.get("park_generation"),
+            project: r.get("project"),
+            workflow: r.get("workflow"),
+            node_path: r.get("node_path"),
+            effect_key: r.get("effect_key"),
+            kind: PendingKind::parse(&kind).map_err(|e| anyhow::anyhow!("{e}"))?,
+            pending_payload: r.get("pending_payload"),
+            publication_state: r.get("publication_state"),
+        })
+    }
+
+    fn map_terminal(&self, r: &sqlx::sqlite::SqliteRow) -> anyhow::Result<TerminalRow> {
+        let publication_state: String = r.get("publication_state");
+        Ok(TerminalRow {
+            terminal_digest: r.get("terminal_digest"),
+            run_id: r.get("run_id"),
+            status: r.get("status"),
+            node_path: r.get("node_path"),
+            evidence_json: r.get("evidence_json"),
+            publication_state: PublicationState::parse(&publication_state)
+                .map_err(|e| anyhow::anyhow!("{e}"))?,
+            created_at: r.get("created_at"),
+            updated_at: r.get("updated_at"),
+        })
     }
 
     fn map_effect(&self, r: &sqlx::sqlite::SqliteRow) -> anyhow::Result<WorkflowEffect> {
@@ -567,7 +1170,8 @@ impl WorkflowEffectStore {
             return Ok(false);
         }
         let updated = if let Some(owned) = &current.claim_token {
-            sqlx::query(
+            let mut tx = self.pool.begin().await?;
+            let updated = sqlx::query(
                 "UPDATE workflow_effects SET attempt = ?1, attempt_id = ?2, claim_token = ?3, \
                         lease_expires_at = ?4, state = 'in_flight', updated_at = ?5 \
                  WHERE effect_key = ?6 AND claim_token = ?7",
@@ -579,11 +1183,17 @@ impl WorkflowEffectStore {
             .bind(now)
             .bind(effect_key)
             .bind(owned)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?
-            .rows_affected()
+            .rows_affected();
+            if updated > 0 {
+                self.log_effect_row_in_tx(&mut tx, effect_key, now).await?;
+            }
+            tx.commit().await?;
+            updated
         } else {
-            sqlx::query(
+            let mut tx = self.pool.begin().await?;
+            let updated = sqlx::query(
                 "UPDATE workflow_effects SET attempt = ?1, attempt_id = ?2, claim_token = ?3, \
                         lease_expires_at = ?4, state = 'in_flight', updated_at = ?5 \
                  WHERE effect_key = ?6 AND claim_token IS NULL",
@@ -594,9 +1204,14 @@ impl WorkflowEffectStore {
             .bind(claim.lease_expires_at)
             .bind(now)
             .bind(effect_key)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?
-            .rows_affected()
+            .rows_affected();
+            if updated > 0 {
+                self.log_effect_row_in_tx(&mut tx, effect_key, now).await?;
+            }
+            tx.commit().await?;
+            updated
         };
         Ok(updated > 0)
     }
@@ -619,6 +1234,8 @@ impl WorkflowEffectStore {
         }
         let failure_json = failure.as_ref().map(bound_evidence);
         let outcome_json = outcome.as_ref().map(bound_evidence);
+        let now = now_us();
+        let mut tx = self.pool.begin().await?;
         let updated = sqlx::query(
             "UPDATE workflow_effects SET state = ?1, failure_json = COALESCE(?2, failure_json), \
                     outcome_json = COALESCE(?3, outcome_json), lease_expires_at = NULL, \
@@ -628,12 +1245,16 @@ impl WorkflowEffectStore {
         .bind(to.as_str())
         .bind(&failure_json)
         .bind(&outcome_json)
-        .bind(now_us())
+        .bind(now)
         .bind(effect_key)
         .bind(current.state.as_str())
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?
         .rows_affected();
+        if updated > 0 {
+            self.log_effect_row_in_tx(&mut tx, effect_key, now).await?;
+        }
+        tx.commit().await?;
         Ok(updated > 0)
     }
 
@@ -647,15 +1268,21 @@ impl WorkflowEffectStore {
         effect_key: &str,
         transport_corr: &str,
     ) -> anyhow::Result<bool> {
+        let now = now_us();
+        let mut tx = self.pool.begin().await?;
         let res = sqlx::query(
             "UPDATE workflow_effects SET transport_corr = ?1, updated_at = ?2 \
              WHERE effect_key = ?3",
         )
         .bind(transport_corr)
-        .bind(now_us())
+        .bind(now)
         .bind(effect_key)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        if res.rows_affected() > 0 {
+            self.log_effect_row_in_tx(&mut tx, effect_key, now).await?;
+        }
+        tx.commit().await?;
         Ok(res.rows_affected() > 0)
     }
 
@@ -682,6 +1309,8 @@ impl WorkflowEffectStore {
         }
         let failure_json = failure.as_ref().map(bound_evidence);
         let outcome_json = outcome.as_ref().map(bound_evidence);
+        let now = now_us();
+        let mut tx = self.pool.begin().await?;
         let updated = sqlx::query(
             "UPDATE workflow_effects SET state = ?1, failure_json = COALESCE(?2, failure_json), \
                     outcome_json = COALESCE(?3, outcome_json), lease_expires_at = NULL, \
@@ -691,20 +1320,26 @@ impl WorkflowEffectStore {
         .bind(to.as_str())
         .bind(&failure_json)
         .bind(&outcome_json)
-        .bind(now_us())
+        .bind(now)
         .bind(effect_key)
         .bind(presented_token)
         .bind(current.state.as_str())
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?
         .rows_affected();
+        if updated > 0 {
+            self.log_effect_row_in_tx(&mut tx, effect_key, now).await?;
+        }
+        tx.commit().await?;
         Ok(updated > 0)
     }
 
     /// Record one append-only attempt-evidence row.
     pub async fn record_attempt(&self, attempt: NewAttempt) -> anyhow::Result<i64> {
         let evidence = attempt.evidence.as_ref().map(bound_evidence);
-        let res = sqlx::query(
+        let now = now_us();
+        let mut tx = self.pool.begin().await?;
+        let rowid = sqlx::query(
             "INSERT INTO workflow_effect_attempts \
              (effect_key, attempt, attempt_id, claim_token, state, evidence_json, created_at) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -715,40 +1350,58 @@ impl WorkflowEffectStore {
         .bind(&attempt.claim_token)
         .bind(attempt.state.as_str())
         .bind(&evidence)
-        .bind(now_us())
-        .execute(&self.pool)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?
+        .last_insert_rowid();
+        let row = sqlx::query(
+            "SELECT id, effect_key, attempt, attempt_id, claim_token, state, evidence_json \
+             FROM workflow_effect_attempts WHERE id = ?1",
+        )
+        .bind(rowid)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("attempt vanished after record"))?;
+        let state: String = row.get("state");
+        let payload = serde_json::to_value(EffectAttempt {
+            id: row.get("id"),
+            effect_key: row.get("effect_key"),
+            attempt: row.get("attempt"),
+            attempt_id: row.get("attempt_id"),
+            claim_token: row.get("claim_token"),
+            state: EffectState::parse(&state).map_err(|e| anyhow::anyhow!("{e}"))?,
+            evidence_json: row.get("evidence_json"),
+        })?;
+        log_wfx_event_in_tx(
+            &mut tx,
+            "workflow_effect_attempts",
+            &format!("attempt:{rowid}"),
+            &payload,
+            now,
+        )
         .await?;
-        Ok(res.last_insert_rowid())
+        tx.commit().await?;
+        Ok(rowid)
     }
 
-    /// Attempt evidence for one effect, oldest first.
+    /// Attempt evidence for one effect, oldest first — from the projection.
     pub async fn list_attempts(&self, effect_key: &str) -> anyhow::Result<Vec<EffectAttempt>> {
-        let rows = sqlx::query(
-            "SELECT id, effect_key, attempt, attempt_id, claim_token, state, evidence_json \
-             FROM workflow_effect_attempts WHERE effect_key = ?1 ORDER BY id ASC",
-        )
-        .bind(effect_key)
-        .fetch_all(&self.pool)
-        .await?;
-        rows.iter()
-            .map(|r| {
-                let state: String = r.get("state");
-                Ok(EffectAttempt {
-                    id: r.get("id"),
-                    effect_key: r.get("effect_key"),
-                    attempt: r.get("attempt"),
-                    attempt_id: r.get("attempt_id"),
-                    claim_token: r.get("claim_token"),
-                    state: EffectState::parse(&state).map_err(|e| anyhow::anyhow!("{e}"))?,
-                    evidence_json: r.get("evidence_json"),
-                })
-            })
-            .collect()
+        let mut out: Vec<EffectAttempt> = self
+            .fold_projected()
+            .await?
+            .attempts
+            .into_values()
+            .filter(|(row, _)| row.effect_key == effect_key)
+            .map(|(row, _)| row)
+            .collect();
+        out.sort_by_key(|a| a.id);
+        Ok(out)
     }
 
     /// Create one run. Idempotent on `run_id`: duplicates return `false`.
     pub async fn create_run(&self, run: NewRun) -> anyhow::Result<bool> {
         let now = now_us();
+        let mut tx = self.pool.begin().await?;
         let res = sqlx::query(
             "INSERT INTO workflow_runs \
              (run_id, project, workflow, workflow_digest, status, started_at, \
@@ -763,38 +1416,23 @@ impl WorkflowEffectStore {
         .bind(now)
         .bind(now)
         .bind(now)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        if res.rows_affected() > 0 {
+            self.log_run_row_in_tx(&mut tx, &run.run_id, now).await?;
+        }
+        tx.commit().await?;
         Ok(res.rows_affected() > 0)
     }
 
-    /// Load one run by id.
+    /// Load one run by id — served from the event projection.
     pub async fn get_run(&self, run_id: &str) -> anyhow::Result<Option<WorkflowRun>> {
-        let row = sqlx::query(
-            "SELECT run_id, project, workflow, workflow_digest, status, started_at, \
-                    suspended_at, finished_at, current_node, failed_node, terminal_digest \
-             FROM workflow_runs WHERE run_id = ?1",
-        )
-        .bind(run_id)
-        .fetch_optional(&self.pool)
-        .await?;
-        row.map(|r| {
-            let status: String = r.get("status");
-            Ok(WorkflowRun {
-                run_id: r.get("run_id"),
-                project: r.get("project"),
-                workflow: r.get("workflow"),
-                workflow_digest: r.get("workflow_digest"),
-                status: RunStatus::parse(&status).map_err(|e| anyhow::anyhow!("{e}"))?,
-                started_at: r.get("started_at"),
-                suspended_at: r.get("suspended_at"),
-                finished_at: r.get("finished_at"),
-                current_node: r.get("current_node"),
-                failed_node: r.get("failed_node"),
-                terminal_digest: r.get("terminal_digest"),
-            })
-        })
-        .transpose()
+        Ok(self
+            .fold_projected()
+            .await?
+            .runs
+            .remove(run_id)
+            .map(|(row, _)| row))
     }
 
     /// Compare-and-swap one run's status: transitions only from the
@@ -811,6 +1449,7 @@ impl WorkflowEffectStore {
             return Ok(false);
         }
         let now = now_us();
+        let mut tx = self.pool.begin().await?;
         let updated = sqlx::query(
             "UPDATE workflow_runs SET status = ?1, \
                     suspended_at = CASE WHEN ?1 = 'suspended' THEN ?2 ELSE suspended_at END, \
@@ -824,9 +1463,13 @@ impl WorkflowEffectStore {
         .bind(now)
         .bind(run_id)
         .bind(expected.as_str())
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?
         .rows_affected();
+        if updated > 0 {
+            self.log_run_row_in_tx(&mut tx, run_id, now).await?;
+        }
+        tx.commit().await?;
         Ok(updated > 0)
     }
 
@@ -835,6 +1478,7 @@ impl WorkflowEffectStore {
     pub async fn upsert_pending(&self, pending: NewPending) -> anyhow::Result<bool> {
         let now = now_us();
         let payload = bound_evidence(&pending.pending_payload);
+        let mut tx = self.pool.begin().await?;
         let res = sqlx::query(
             "INSERT INTO workflow_pending \
              (run_id, promise_id, park_generation, project, workflow, node_path, effect_key, \
@@ -855,73 +1499,49 @@ impl WorkflowEffectStore {
         .bind(PublicationState::Noted.as_str())
         .bind(now)
         .bind(now)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        if res.rows_affected() > 0 {
+            self.log_pending_row_in_tx(
+                &mut tx,
+                &pending.run_id,
+                &pending.promise_id,
+                pending.park_generation,
+                now,
+            )
+            .await?;
+        }
+        tx.commit().await?;
         Ok(res.rows_affected() > 0)
     }
 
-    /// Load one pending entry by full identity.
+    /// Load one pending entry by full identity — from the projection.
     pub async fn get_pending(
         &self,
         run_id: &str,
         promise_id: &str,
         park_generation: i64,
     ) -> anyhow::Result<Option<Pending>> {
-        let row = sqlx::query(
-            "SELECT run_id, promise_id, park_generation, project, workflow, node_path, \
-                    effect_key, kind, pending_payload, publication_state \
-             FROM workflow_pending WHERE run_id = ?1 AND promise_id = ?2 AND park_generation = ?3",
-        )
-        .bind(run_id)
-        .bind(promise_id)
-        .bind(park_generation)
-        .fetch_optional(&self.pool)
-        .await?;
-        row.map(|r| {
-            let kind: String = r.get("kind");
-            Ok(Pending {
-                run_id: r.get("run_id"),
-                promise_id: r.get("promise_id"),
-                park_generation: r.get("park_generation"),
-                project: r.get("project"),
-                workflow: r.get("workflow"),
-                node_path: r.get("node_path"),
-                effect_key: r.get("effect_key"),
-                kind: PendingKind::parse(&kind).map_err(|e| anyhow::anyhow!("{e}"))?,
-                pending_payload: r.get("pending_payload"),
-                publication_state: r.get("publication_state"),
-            })
-        })
-        .transpose()
+        Ok(self
+            .fold_projected()
+            .await?
+            .pending
+            .remove(&Self::pending_fold_key(run_id, promise_id, park_generation))
+            .map(|(row, _)| row))
     }
 
-    /// All pending entries for one run, in park order.
+    /// All pending entries for one run, in park order — from the projection.
     pub async fn list_pending(&self, run_id: &str) -> anyhow::Result<Vec<Pending>> {
-        let rows = sqlx::query(
-            "SELECT run_id, promise_id, park_generation, project, workflow, node_path, \
-                    effect_key, kind, pending_payload, publication_state \
-             FROM workflow_pending WHERE run_id = ?1 ORDER BY rowid ASC",
-        )
-        .bind(run_id)
-        .fetch_all(&self.pool)
-        .await?;
-        rows.iter()
-            .map(|r| {
-                let kind: String = r.get("kind");
-                Ok(Pending {
-                    run_id: r.get("run_id"),
-                    promise_id: r.get("promise_id"),
-                    park_generation: r.get("park_generation"),
-                    project: r.get("project"),
-                    workflow: r.get("workflow"),
-                    node_path: r.get("node_path"),
-                    effect_key: r.get("effect_key"),
-                    kind: PendingKind::parse(&kind).map_err(|e| anyhow::anyhow!("{e}"))?,
-                    pending_payload: r.get("pending_payload"),
-                    publication_state: r.get("publication_state"),
-                })
-            })
-            .collect()
+        let mut out: Vec<Pending> = self
+            .fold_projected()
+            .await?
+            .pending
+            .into_values()
+            .filter(|(row, _)| row.run_id == run_id)
+            .map(|(row, _)| row)
+            .collect();
+        out.sort_by_key(|r| r.park_generation);
+        Ok(out)
     }
 
     /// Delete one pending entry (on validated resolution). Returns `false`
@@ -932,6 +1552,8 @@ impl WorkflowEffectStore {
         promise_id: &str,
         park_generation: i64,
     ) -> anyhow::Result<bool> {
+        let now = now_us();
+        let mut tx = self.pool.begin().await?;
         let res = sqlx::query(
             "DELETE FROM workflow_pending \
              WHERE run_id = ?1 AND promise_id = ?2 AND park_generation = ?3",
@@ -939,8 +1561,13 @@ impl WorkflowEffectStore {
         .bind(run_id)
         .bind(promise_id)
         .bind(park_generation)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        if res.rows_affected() > 0 {
+            let key = format!("{run_id}:{promise_id}:{park_generation}");
+            log_wfx_tombstone_in_tx(&mut tx, "workflow_pending", &key, now).await?;
+        }
+        tx.commit().await?;
         Ok(res.rows_affected() > 0)
     }
 
@@ -970,6 +1597,7 @@ impl WorkflowEffectStore {
         .await?;
         let now = now_us();
         let evidence = terminal.evidence.as_ref().map(bound_evidence);
+        let mut tx = self.pool.begin().await?;
         sqlx::query(
             "INSERT INTO workflow_terminal_events \
              (terminal_digest, run_id, status, node_path, evidence_json, publication_state, \
@@ -984,8 +1612,11 @@ impl WorkflowEffectStore {
         .bind(PublicationState::Noted.as_str())
         .bind(now)
         .bind(now)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        self.log_terminal_row_in_tx(&mut tx, &terminal.terminal_digest, now)
+            .await?;
+        tx.commit().await?;
         match rival {
             Some((other,)) => Ok(TerminalOutcome::Conflict {
                 existing_digest: other,
@@ -996,15 +1627,22 @@ impl WorkflowEffectStore {
 
     /// Mark one terminal digest published. Returns `false` when unknown.
     pub async fn mark_terminal_published(&self, terminal_digest: &str) -> anyhow::Result<bool> {
+        let now = now_us();
+        let mut tx = self.pool.begin().await?;
         let res = sqlx::query(
             "UPDATE workflow_terminal_events SET publication_state = ?1, updated_at = ?2 \
              WHERE terminal_digest = ?3",
         )
         .bind(PublicationState::Published.as_str())
-        .bind(now_us())
+        .bind(now)
         .bind(terminal_digest)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        if res.rows_affected() > 0 {
+            self.log_terminal_row_in_tx(&mut tx, terminal_digest, now)
+                .await?;
+        }
+        tx.commit().await?;
         Ok(res.rows_affected() > 0)
     }
 
@@ -1023,6 +1661,17 @@ impl WorkflowEffectStore {
     ) -> anyhow::Result<PruneCounts> {
         // NOTE: stock SQLite has no DELETE..LIMIT; bound each pass with a
         // rowid subquery instead (same bound, portable syntax).
+        let mut tx = self.pool.begin().await?;
+        let doomed_effects: Vec<(String,)> = sqlx::query_as(
+            "SELECT effect_key FROM workflow_effects \
+             WHERE retention_until IS NOT NULL AND retention_until < ?1 \
+                AND state IN ('settled','failed','cancelled') \
+              LIMIT ?2",
+        )
+        .bind(now)
+        .bind(limit)
+        .fetch_all(&mut *tx)
+        .await?;
         let effects = sqlx::query(
             "DELETE FROM workflow_effects WHERE effect_key IN \
              (SELECT effect_key FROM workflow_effects \
@@ -1032,9 +1681,12 @@ impl WorkflowEffectStore {
         )
         .bind(now)
         .bind(limit)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?
         .rows_affected() as i64;
+        for (key,) in &doomed_effects {
+            log_wfx_tombstone_in_tx(&mut tx, "workflow_effects", key, now).await?;
+        }
         let attempts = sqlx::query(
             "DELETE FROM workflow_effect_attempts WHERE id IN \
              (SELECT id FROM workflow_effect_attempts \
@@ -1042,10 +1694,19 @@ impl WorkflowEffectStore {
               LIMIT ?1)",
         )
         .bind(limit)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?
         .rows_affected() as i64;
         let cutoff = now.saturating_sub(terminal_max_age_us);
+        let doomed_terminals: Vec<(String,)> = sqlx::query_as(
+            "SELECT terminal_digest FROM workflow_terminal_events \
+             WHERE publication_state = 'published' AND updated_at < ?1 \
+              LIMIT ?2",
+        )
+        .bind(cutoff)
+        .bind(limit)
+        .fetch_all(&mut *tx)
+        .await?;
         let terminals = sqlx::query(
             "DELETE FROM workflow_terminal_events WHERE terminal_digest IN \
              (SELECT terminal_digest FROM workflow_terminal_events \
@@ -1054,9 +1715,25 @@ impl WorkflowEffectStore {
         )
         .bind(cutoff)
         .bind(limit)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?
         .rows_affected() as i64;
+        for (key,) in &doomed_terminals {
+            log_wfx_tombstone_in_tx(&mut tx, "workflow_terminal_events", key, now).await?;
+        }
+        let doomed_runs: Vec<(String,)> = sqlx::query_as(
+            "SELECT run_id FROM workflow_runs \
+             WHERE status IN ('succeeded','failed','blocked','cancelled','unknown') \
+                AND updated_at < ?1 \
+                AND NOT EXISTS (SELECT 1 FROM workflow_effects \
+                                WHERE workflow_effects.run_id = workflow_runs.run_id \
+                                  AND state NOT IN ('settled','failed','cancelled')) \
+              LIMIT ?2",
+        )
+        .bind(cutoff)
+        .bind(limit)
+        .fetch_all(&mut *tx)
+        .await?;
         let runs = sqlx::query(
             "DELETE FROM workflow_runs WHERE run_id IN \
              (SELECT run_id FROM workflow_runs \
@@ -1069,9 +1746,13 @@ impl WorkflowEffectStore {
         )
         .bind(cutoff)
         .bind(limit)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?
         .rows_affected() as i64;
+        for (key,) in &doomed_runs {
+            log_wfx_tombstone_in_tx(&mut tx, "workflow_runs", key, now).await?;
+        }
+        tx.commit().await?;
         Ok(PruneCounts {
             effects,
             attempts,
@@ -1125,6 +1806,135 @@ mod workflow_effect_schema_tests {
             "workflow_terminal_events",
         ] {
             assert!(store.table_exists(table).await.unwrap(), "{table} exists");
+        }
+    }
+
+    /// bd-jysu: every mutation dual-writes a wfx.row event in the same
+    /// transaction; the generation manifest advances per event.
+    #[tokio::test]
+    async fn workflow_events_dual_write_per_mutation() {
+        let (p, _dir) = pool("dual").await;
+        let store = WorkflowEffectStore::new(p.clone());
+        store
+            .create_run(NewRun {
+                run_id: "run-1".into(),
+                project: Some("demo".into()),
+                workflow: "wf".into(),
+                workflow_digest: "d".into(),
+            })
+            .await
+            .unwrap();
+        store.prepare_effect(effect("ek-1", "run-1")).await.unwrap();
+        let log = crate::index::event_log::EventLog::new(p);
+        assert_eq!(log.count_kind("wfx.row").await.unwrap(), 2);
+        assert_eq!(log.generation().await.unwrap(), 2);
+    }
+
+    /// bd-jysu: readers serve the projection — a raw row smuggled behind
+    /// the log's back is invisible to get/list.
+    #[tokio::test]
+    async fn workflow_readers_serve_projection_not_table() {
+        let (p, _dir) = pool("projread").await;
+        let store = WorkflowEffectStore::new(p.clone());
+        store
+            .create_run(NewRun {
+                run_id: "run-1".into(),
+                project: Some("demo".into()),
+                workflow: "wf".into(),
+                workflow_digest: "d".into(),
+            })
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO workflow_runs (run_id, project, workflow, workflow_digest, status, \
+             started_at, created_at, updated_at) \
+             VALUES ('ghost', 'demo', 'wf', 'd', 'started', 1, 1, 1)",
+        )
+        .execute(&p)
+        .await
+        .unwrap();
+        assert!(store.get_run("ghost").await.unwrap().is_none());
+        assert!(store.get_run("run-1").await.unwrap().is_some());
+    }
+
+    /// bd-jysu: wipe all five tables, rebuild purely from the log — full
+    /// state returns, tombstoned rows stay deleted.
+    #[tokio::test]
+    async fn workflow_rebuild_from_log_restores_all_tables() {
+        use crate::index::rebuild::rebuild_workflow_effects_from_log;
+        let (p, _dir) = pool("rebuild").await;
+        let store = WorkflowEffectStore::new(p.clone());
+        store
+            .create_run(NewRun {
+                run_id: "run-1".into(),
+                project: Some("demo".into()),
+                workflow: "wf".into(),
+                workflow_digest: "d".into(),
+            })
+            .await
+            .unwrap();
+        store.prepare_effect(effect("ek-1", "run-1")).await.unwrap();
+        store
+            .record_attempt(NewAttempt {
+                effect_key: "ek-1".into(),
+                attempt: 1,
+                attempt_id: "att-1".into(),
+                claim_token: None,
+                state: EffectState::Prepared,
+                evidence: None,
+            })
+            .await
+            .unwrap();
+        store
+            .upsert_pending(NewPending {
+                run_id: "run-1".into(),
+                promise_id: "p1".into(),
+                park_generation: 0,
+                project: Some("demo".into()),
+                workflow: "wf".into(),
+                node_path: "gate".into(),
+                effect_key: Some("ek-1".into()),
+                kind: PendingKind::Approval,
+                pending_payload: serde_json::json!({}),
+                deadline_secs: None,
+            })
+            .await
+            .unwrap();
+        store
+            .note_terminal_pub(TerminalPub::new("dig-1", "run-1", "succeeded", "gate"))
+            .await
+            .unwrap();
+        // Tombstone one pending entry before the wipe.
+        assert!(store.delete_pending("run-1", "p1", 0).await.unwrap());
+        wipe_workflow_tables(&p).await;
+        let (applied, deleted, skipped) = rebuild_workflow_effects_from_log(&store).await.unwrap();
+        assert_eq!(skipped, 0);
+        // 4 live rows (run, effect, attempt, terminal); the pending entry
+        // was tombstoned pre-wipe and stays deleted.
+        assert_eq!(applied, 4, "live rows restored, got {applied}");
+        assert_eq!(deleted, 0);
+        assert!(store.get_effect("ek-1").await.unwrap().is_some());
+        assert_eq!(store.list_attempts("ek-1").await.unwrap().len(), 1);
+        assert!(store.get_run("run-1").await.unwrap().is_some());
+        assert!(store.list_pending("run-1").await.unwrap().is_empty());
+        // Second rebuild is idempotent (same rows, no dupes).
+        let (applied2, _, _) = rebuild_workflow_effects_from_log(&store).await.unwrap();
+        assert_eq!(applied2, applied);
+    }
+
+    /// Wipe all five workflow tables (rebuild-test helper).
+    async fn wipe_workflow_tables(pool: &sqlx::SqlitePool) {
+        for table in [
+            "workflow_effects",
+            "workflow_effect_attempts",
+            "workflow_runs",
+            "workflow_pending",
+            "workflow_terminal_events",
+        ] {
+            sqlx::query(&format!("DELETE FROM {table} WHERE 1 = 1"))
+                .execute(pool)
+                .await
+                .unwrap();
         }
     }
 
