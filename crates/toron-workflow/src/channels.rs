@@ -340,9 +340,9 @@ impl ChannelStore {
                     anyhow::bail!("legacy channel metadata lacks h tag");
                 };
                 let applied = match ev.content.as_str() {
-                    "join" => self.join(&id, &ev.pubkey).is_ok(),
-                    "leave" => self.leave(&id, &ev.pubkey).is_ok(),
-                    "close" => self.close(&id, &ev.pubkey).is_ok(),
+                    "join" => self.join(id, &ev.pubkey).is_ok(),
+                    "leave" => self.leave(id, &ev.pubkey).is_ok(),
+                    "close" => self.close(id, &ev.pubkey).is_ok(),
                     _ => false,
                 };
                 Ok(applied)

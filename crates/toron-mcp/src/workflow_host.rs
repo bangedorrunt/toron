@@ -693,11 +693,6 @@ impl WorkflowHost {
         });
         // bd-qdup: one shared tower armor (timeout inner, bulkhead,
         // breaker, explicit fallback) guards every mailbox send below.
-        let armor = Arc::new(SendArmor::new(
-            passthrough(),
-            ARMOR_SEND_TIMEOUT,
-            ARMOR_MAX_CONCURRENCY,
-        ));
         // bd-ctj7: no sync runner exists anymore — the engine computes pure
         // leaves itself and awaits the async seam for the rest.
         let async_effect_runner = mailbox_async_effect_runner(
@@ -705,7 +700,11 @@ impl WorkflowHost {
             coalescer.clone(),
             job_signer.clone(),
             dispatcher.clone(),
-            armor,
+            Arc::new(SendArmor::new(
+                passthrough(),
+                ARMOR_SEND_TIMEOUT,
+                ARMOR_MAX_CONCURRENCY,
+            )),
         );
         // bd-engine-run-path-journaling-fwlx (the Spec 6 flip): the host
         // really dispatches, so its engine is Enforced — an effectful leaf

@@ -522,11 +522,9 @@ mod kernel_paths_tests {
             for msg in &msgs {
                 let (next, fx) = tick(&model, msg);
                 transitions += 1;
-                // Invariant 1: at most one tick in flight, always.
-                assert!(
-                    next.in_flight.map_or(true, |_| true),
-                    "in_flight is Option by construction"
-                );
+                // Invariant 1: at most one tick in flight, always —
+                // structural (in_flight is Option<i64>, one slot by type),
+                // so there is nothing to assert at runtime.
                 // Invariant 2: last_fired never moves backward.
                 if let (Some(a), Some(b)) = (model.last_fired, next.last_fired) {
                     assert!(b >= a, "checkpoint monotonic: {a} -> {b}");
@@ -576,13 +574,13 @@ mod kernel_paths_tests {
                 }
                 // Invariant 4: terminal reports always clear in-flight for
                 // the reported tick (no stranded overlap).
-                if let CronMsg::TickSucceeded { tick } | CronMsg::TickFailed { tick } = msg {
-                    if model.in_flight == Some(*tick) {
-                        assert_eq!(
-                            next.in_flight, None,
-                            "terminal report clears its own in-flight"
-                        );
-                    }
+                if let CronMsg::TickSucceeded { tick } | CronMsg::TickFailed { tick } = msg
+                    && model.in_flight == Some(*tick)
+                {
+                    assert_eq!(
+                        next.in_flight, None,
+                        "terminal report clears its own in-flight"
+                    );
                 }
                 if depth < 3 {
                     queue.push_back((next, depth + 1));
@@ -636,7 +634,7 @@ mod kernel_paths_tests {
         };
         let (m1, f1, _) = run_once();
         let (m2, f2, _) = run_once();
-        assert_eq!((m1.clone(), f1.clone()), (m2, f2), "storm replays");
+        assert_eq!((m1.clone(), f1), (m2, f2), "storm replays");
         // Backoff gate: the next overdue decision waits out the spacing
         // instead of hot-looping — and fires the NEXT due tick (1420),
         // never refiring the failed one (1360 already checkpointed).

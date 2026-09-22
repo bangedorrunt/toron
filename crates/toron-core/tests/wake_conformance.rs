@@ -31,11 +31,11 @@ struct ManualClock {
 }
 
 impl ManualClock {
-    fn new(t: u64) -> Self {
+    const fn new(t: u64) -> Self {
         Self { now_ms: t }
     }
 
-    fn advance(&mut self, dt_ms: u64) {
+    const fn advance(&mut self, dt_ms: u64) {
         self.now_ms += dt_ms;
     }
 }
@@ -43,14 +43,14 @@ impl ManualClock {
 /// Quiet-vs-deaf predicate (the /health distinction ADR-0036 keeps):
 /// a quiet bus (recent heartbeat, zero events) is NOT deaf; only a stale
 /// heartbeat is deaf.
-fn is_deaf(last_heartbeat_ms: u64, now_ms: u64, timeout_ms: u64) -> bool {
+const fn is_deaf(last_heartbeat_ms: u64, now_ms: u64, timeout_ms: u64) -> bool {
     now_ms.saturating_sub(last_heartbeat_ms) > timeout_ms
 }
 
 /// Stale-takeover identity predicate (serve.pid pattern, Spec 2.1):
 /// takeover allowed only after an identity check proves the holder dead or
 /// foreign; a live same-identity holder refuses; blind delete never happens.
-fn takeover_allowed(holder_pid_live: bool, holder_is_owner: bool, checked: bool) -> bool {
+const fn takeover_allowed(holder_pid_live: bool, holder_is_owner: bool, checked: bool) -> bool {
     if !checked {
         return false;
     }
@@ -295,11 +295,10 @@ fn conformance_quiet_vs_deaf() {
     assert!(is_deaf(clock.now_ms - timeout - 1, clock.now_ms, timeout));
 
     // Long-quiet but heartbeating watcher stays not-deaf across advances.
-    let mut beat = 0u64;
     let mut now = ManualClock::new(0);
     for _ in 0..5 {
         now.advance(5_000);
-        beat = now.now_ms; // heartbeat each quiet interval
+        let beat = now.now_ms; // heartbeat each quiet interval
         assert!(!is_deaf(beat, now.now_ms, timeout));
     }
 }
