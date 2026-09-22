@@ -83,6 +83,11 @@ pub enum ReceiptsMsg {
         result_path: Option<String>,
         now_ms: i64,
     },
+    /// Record delivery-without-bookkeeping as degraded (acked-unknown).
+    /// Creates the row when bookkeeping never ran; guarded by
+    /// `transition_allowed` like every other transition — one kernel,
+    /// one decider (bd-i7ld). Acked/resulted rows never drag down.
+    MarkDegraded { corr: String, now_ms: i64 },
     /// Expire rows older than `retention_ms` (host deletes).
     Prune { now_ms: i64, retention_ms: i64 },
 }
@@ -244,6 +249,60 @@ pub fn tick(model: &ReceiptsModel, msg: &ReceiptsMsg) -> (ReceiptsModel, Vec<Rec
                 cutoff_ms: now_ms.saturating_sub(*retention_ms),
             }],
         ),
+        ReceiptsMsg::MarkDegraded { corr, now_ms } => match next.entries.get(corr).cloned() {
+            None => {
+                next.entries.insert(
+                    corr.clone(),
+                    Entry {
+                        state: State::Degraded,
+                        result_path: None,
+                        updated_at_ms: *now_ms,
+                    },
+                );
+                (
+                    next,
+                    vec![ReceiptEffect::Stamp {
+                        corr: corr.clone(),
+                        state: State::Degraded,
+                        result_path: None,
+                        updated_at_ms: *now_ms,
+                    }],
+                )
+            }
+            Some(entry) if entry.state == State::Degraded => (
+                next,
+                vec![ReceiptEffect::Ignored {
+                    corr: corr.clone(),
+                    reason: "idempotent",
+                }],
+            ),
+            Some(entry) if !transition_allowed(entry.state, State::Degraded) => (
+                next,
+                vec![ReceiptEffect::Ignored {
+                    corr: corr.clone(),
+                    reason: "monotonic-guard",
+                }],
+            ),
+            Some(entry) => {
+                next.entries.insert(
+                    corr.clone(),
+                    Entry {
+                        state: State::Degraded,
+                        result_path: entry.result_path.clone(),
+                        updated_at_ms: *now_ms,
+                    },
+                );
+                (
+                    next,
+                    vec![ReceiptEffect::Stamp {
+                        corr: corr.clone(),
+                        state: State::Degraded,
+                        result_path: entry.result_path,
+                        updated_at_ms: *now_ms,
+                    }],
+                )
+            }
+        },
     }
 }
 
@@ -255,6 +314,7 @@ pub fn machine_config() -> serde_json::Value {
         "transitions": [
             {"on": "Ack", "guard": "transition_allowed", "effects": ["Stamp", "Ignored"]},
             {"on": "SetResulted", "guard": "transition_allowed", "effects": ["Stamp", "Ignored"]},
+            {"on": "MarkDegraded", "guard": "transition_allowed", "effects": ["Stamp", "Ignored"]},
             {"on": "Prune", "guard": null, "effects": ["PruneBefore"]},
         ],
         "guards": ["is_proven", "transition_allowed"],
@@ -684,5 +744,77 @@ mod pure_cores_tests {
             cfg["transitions"].as_array().is_some(),
             "transitions listed"
         );
+    }
+
+    /// bd-i7ld: MarkDegraded creates the row when bookkeeping never ran.
+    #[test]
+    fn mark_degraded_creates_row_from_missing() {
+        let (model, fx) = tick(
+            &ReceiptsModel::new(),
+            &ReceiptsMsg::MarkDegraded {
+                corr: "c".into(),
+                now_ms: 9,
+            },
+        );
+        assert_eq!(
+            fx,
+            vec![ReceiptEffect::Stamp {
+                corr: "c".into(),
+                state: State::Degraded,
+                result_path: None,
+                updated_at_ms: 9,
+            }]
+        );
+        assert_eq!(model.entries["c"].state, State::Degraded);
+    }
+
+    /// bd-i7ld: an owed row degrades in place (never re-owes later).
+    #[test]
+    fn mark_degraded_from_owed_stamps_degraded() {
+        let seed = ReceiptsModel::with_row("c", State::Owed, Some("/r.json".into()), 1);
+        let (model, fx) = tick(
+            &seed,
+            &ReceiptsMsg::MarkDegraded {
+                corr: "c".into(),
+                now_ms: 9,
+            },
+        );
+        assert_eq!(
+            fx,
+            vec![ReceiptEffect::Stamp {
+                corr: "c".into(),
+                state: State::Degraded,
+                result_path: Some("/r.json".into()),
+                updated_at_ms: 9,
+            }]
+        );
+        assert_eq!(model.entries["c"].state, State::Degraded);
+    }
+
+    /// bd-i7ld: degraded is idempotent; acked/resulted never drag down.
+    #[test]
+    fn mark_degraded_idempotent_and_guarded() {
+        for (state, reason) in [
+            (State::Degraded, "idempotent"),
+            (State::Acked, "monotonic-guard"),
+            (State::Resulted, "monotonic-guard"),
+        ] {
+            let seed = ReceiptsModel::with_row("c", state, None, 1);
+            let (_, fx) = tick(
+                &seed,
+                &ReceiptsMsg::MarkDegraded {
+                    corr: "c".into(),
+                    now_ms: 9,
+                },
+            );
+            assert_eq!(
+                fx,
+                vec![ReceiptEffect::Ignored {
+                    corr: "c".into(),
+                    reason,
+                }],
+                "MarkDegraded from {state:?}"
+            );
+        }
     }
 }

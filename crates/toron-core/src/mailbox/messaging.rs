@@ -554,18 +554,44 @@ impl Mailbox {
             && let Some(corr) = parsed_tags.corr.clone()
         {
             eprintln!("{}", crate::mailbox::receipts::DEGRADED_NOTE);
-            let degraded = crate::mailbox::receipts::Receipt {
-                corr: corr.as_str().to_string(),
-                state: crate::mailbox::receipts::ReceiptState::Degraded,
-                wake: parsed_tags.wake,
-                due_at: None,
-                result_path: parsed_tags.result_path.clone(),
-                updated_at: now_ms,
-            };
-            if let Ok(store) = self.receipt_store()
-                && let Err(e) = store.upsert(&degraded).await
-            {
-                eprintln!("toron: degraded receipt could not be recorded: {e}");
+            if let Ok(store) = self.receipt_store() {
+                // bd-i7ld: one kernel decides each transition — the stored
+                // row (if any) enters `tick` as the model and only a `Stamp`
+                // effect writes. Direct upserts from this path are forbidden.
+                let model = match store.get(corr.as_str()).await.ok().flatten() {
+                    Some(row) => crate::mailbox::receipts_core::ReceiptsModel::with_row(
+                        corr.as_str(),
+                        row.state.into(),
+                        row.result_path.clone(),
+                        row.updated_at,
+                    ),
+                    None => crate::mailbox::receipts_core::ReceiptsModel::new(),
+                };
+                let (_, fx) = crate::mailbox::receipts_core::tick(
+                    &model,
+                    &crate::mailbox::receipts_core::ReceiptsMsg::MarkDegraded {
+                        corr: corr.as_str().to_string(),
+                        now_ms,
+                    },
+                );
+                if let Some(crate::mailbox::receipts_core::ReceiptEffect::Stamp {
+                    result_path,
+                    updated_at_ms,
+                    ..
+                }) = fx.into_iter().next()
+                {
+                    let degraded = crate::mailbox::receipts::Receipt {
+                        corr: corr.as_str().to_string(),
+                        state: crate::mailbox::receipts::ReceiptState::Degraded,
+                        wake: parsed_tags.wake,
+                        due_at: None,
+                        result_path: result_path.or(parsed_tags.result_path.clone()),
+                        updated_at: updated_at_ms,
+                    };
+                    if let Err(e) = store.upsert(&degraded).await {
+                        eprintln!("toron: degraded receipt could not be recorded: {e}");
+                    }
+                }
             }
         }
 
