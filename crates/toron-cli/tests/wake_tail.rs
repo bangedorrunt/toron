@@ -1,6 +1,6 @@
 // governed-by: ADR-0036
-//! Wave 3 surface (bd-qg6w; slices B+C before it): socket tail behind
-//! `--watch-sock`, loud fallback, pump deleted, socket is the live path.
+//! Wave 4 surface (bd-ud7k; waves 2/3 cut over): the socket tail is the
+//! path with no flag, loud fallback, pump deleted.
 
 use std::path::PathBuf;
 
@@ -12,18 +12,23 @@ fn src(name: &str) -> String {
 }
 
 #[test]
-fn wake_tail_flag_exists_behind_live() {
-    // clap derives `--watch-sock` from the field name + `#[arg(long)]`;
-    // assert the source pair, not the derived spelling.
+fn wake_tail_flag_removed_socket_is_the_path() {
+    // Wave 4 (bd-ud7k): the cutover flag is removed — the socket tail is
+    // unconditional, the in-process subscribe stays as the loud fallback.
+    // Assert the absence, not a spelling: any reintroduction fails loud.
     let cli = src("cli.rs");
     assert!(
-        cli.contains("pub watch_sock: bool"),
-        "WatchArgs must carry the watch_sock flag"
+        !cli.contains("watch_sock"),
+        "the --watch-sock flag must be removed (wave 4)"
     );
-    let field = cli.find("pub watch_sock: bool").unwrap();
+    let plane = src("plane.rs");
     assert!(
-        cli[..field].rfind("#[arg(long)]").is_some(),
-        "watch_sock must be a long flag (clap derives --watch-sock)"
+        !plane.contains("args.watch_sock"),
+        "no flag gate may remain in the watch path (wave 4)"
+    );
+    assert!(
+        plane.contains("wake.sock") || plane.contains("wake_sock"),
+        "the socket tail must stay the live path"
     );
 }
 

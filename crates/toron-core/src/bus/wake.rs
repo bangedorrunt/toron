@@ -328,12 +328,28 @@ impl WakeServer {
     }
 }
 
+/// Exported shed-counter snapshot (wave 4, bd-ud7k): exact sums over
+/// finished subscribers plus the live count. Shed honesty leaves the
+/// process — this is the shape a `/health` or metrics scrape reads.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct WakeStats {
+    /// Finished subscriber tasks recorded.
+    pub subscribers_finished: usize,
+    /// Currently connected subscribers.
+    pub subscribers_live: usize,
+    /// Sum of frames delivered across finished subscribers.
+    pub delivered: u64,
+    /// Sum of shed frames across finished subscribers.
+    pub shed: u64,
+}
+
 /// RAII serving handle: dropping removes the socket file and aborts tasks.
 #[derive(Debug)]
 pub struct WakeHandle {
     sock_path: PathBuf,
     tasks: tokio::task::JoinSet<()>,
     stats: Arc<std::sync::Mutex<Vec<SubscriberStats>>>,
+    live: Arc<AtomicU64>,
 }
 
 impl WakeHandle {
@@ -345,12 +361,12 @@ impl WakeHandle {
         clock: Arc<dyn WakeClock>,
     ) -> Self {
         let stats = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let live = Arc::new(AtomicU64::new(0));
         let mut tasks = tokio::task::JoinSet::new();
         let bus_tx = tokio::sync::broadcast::channel::<String>(config.queue_cap.max(1)).0;
         // Fan-out pump: bus → broadcast (bounded; lagging subscribers shed).
         {
             let bus_tx = bus_tx.clone();
-            let stats = stats.clone();
             tasks.spawn(async move {
                 let mut cursor: u64 = 0;
                 while let Some(ev) = bus_sub.next().await {
@@ -364,7 +380,6 @@ impl WakeHandle {
                                 // Lagging receivers shed at broadcast level;
                                 // per-subscriber exact counters live below.
                                 let _ = bus_tx.send(line);
-                                let _ = &stats;
                             }
                         }
                         crate::bus::SubscriptionEvent::Eose => {
@@ -383,6 +398,7 @@ impl WakeHandle {
         // Accept loop: one task per subscriber, each bounded.
         {
             let stats = stats.clone();
+            let live_accept = live.clone();
             tasks.spawn(async move {
                 loop {
                     let Ok((stream, _)) = listener.accept().await else {
@@ -390,15 +406,16 @@ impl WakeHandle {
                     };
                     let rx = bus_tx.subscribe();
                     let stats = stats.clone();
+                    let live = live_accept.clone();
                     let clock = clock.clone();
                     let cfg = config.clone();
+                    live.fetch_add(1, Ordering::SeqCst);
                     tokio::spawn(async move {
-                        let st = serve_subscriber(stream, rx, cfg, clock)
-                            .await
-                            .unwrap_or_default();
+                        let st = serve_subscriber(stream, rx, cfg, clock).await;
                         if let Ok(mut all) = stats.lock() {
                             all.push(st);
                         }
+                        live.fetch_sub(1, Ordering::SeqCst);
                     });
                 }
             });
@@ -407,12 +424,24 @@ impl WakeHandle {
             sock_path,
             tasks,
             stats,
+            live,
         }
     }
 
     /// Snapshot of finished-subscriber stats.
     pub fn stats(&self) -> Vec<SubscriberStats> {
         self.stats.lock().map(|s| s.clone()).unwrap_or_default()
+    }
+
+    /// Exported aggregate (wave 4): exact sums + live count.
+    pub fn aggregate_stats(&self) -> WakeStats {
+        let done = self.stats();
+        WakeStats {
+            subscribers_finished: done.len(),
+            subscribers_live: self.live.load(Ordering::SeqCst) as usize,
+            delivered: done.iter().map(|s| s.delivered).sum(),
+            shed: done.iter().map(|s| s.shed).sum(),
+        }
     }
 }
 
@@ -425,34 +454,43 @@ impl Drop for WakeHandle {
 
 /// Serve one subscriber: handshake (bounded) → replay EOSE → live fan-out
 /// with heartbeat (bounded) → shed-and-resync on overflow with exact counts.
+///
+/// Always returns the accumulated stats, even on error paths (wave 4
+/// export honesty: a dropped connection must not discard its counters).
 async fn serve_subscriber(
     stream: UnixStream,
     mut rx: tokio::sync::broadcast::Receiver<String>,
     config: WakeConfig,
     clock: Arc<dyn WakeClock>,
-) -> Result<SubscriberStats, WakeError> {
+) -> SubscriberStats {
     let mut stats = SubscriberStats::default();
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
-    let raw = tokio::time::timeout(
+    let raw = match tokio::time::timeout(
         std::time::Duration::from_millis(config.handshake_timeout_ms),
         lines.next_line(),
     )
     .await
-    .map_err(|_| WakeError::HandshakeTimeout(config.handshake_timeout_ms))
-    .and_then(|r| r.map_err(|e| WakeError::Transport(e.to_string())))?;
-    let line = raw.ok_or(WakeError::HandshakeTimeout(config.handshake_timeout_ms))?;
-    let req = WakeSubscribe::parse_line(&line)?;
+    {
+        Ok(Ok(line)) => line,
+        _ => return stats,
+    };
+    let Some(line) = raw else { return stats };
+    let Ok(req) = WakeSubscribe::parse_line(&line) else {
+        return stats;
+    };
     let _filter = req.filter();
     let cursor = req
         .since_cursor
         .clone()
         .unwrap_or_else(|| "head".to_string());
     let eose = WakeFrame::Eose { cursor };
-    writer
-        .write_all(eose.encode_line()?.as_bytes())
-        .await
-        .map_err(|e| WakeError::Transport(e.to_string()))?;
+    let Ok(eose_line) = eose.encode_line() else {
+        return stats;
+    };
+    if writer.write_all(eose_line.as_bytes()).await.is_err() {
+        return stats;
+    }
     stats.delivered += 1;
     let mut heartbeat_at = clock.now_ms().saturating_add(config.heartbeat_ms);
     loop {
@@ -463,7 +501,7 @@ async fn serve_subscriber(
                 // is behind — shed it with an exact resync cursor.
                 match writer.write_all(line.as_bytes()).await {
                     Ok(()) => stats.delivered += 1,
-                    Err(e) => return Err(WakeError::Transport(e.to_string())),
+                    Err(_) => return stats,
                 }
             }
             Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped))) => {
@@ -476,19 +514,22 @@ async fn serve_subscriber(
                 let _ = writer
                     .write_all(shed.encode_line().unwrap_or_default().as_bytes())
                     .await;
-                return Ok(stats);
+                return stats;
             }
-            Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => return Ok(stats),
+            Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => return stats,
             Err(_) => {
                 // Heartbeat tick (bounded wait expiry, not a poll of truth).
                 if clock.now_ms() >= heartbeat_at {
                     let hb = WakeFrame::Heartbeat {
                         ts_ms: clock.now_ms(),
                     };
-                    writer
+                    if writer
                         .write_all(hb.encode_line().unwrap_or_default().as_bytes())
                         .await
-                        .map_err(|e| WakeError::Heartbeat(e.to_string()))?;
+                        .is_err()
+                    {
+                        return stats;
+                    }
                     stats.delivered += 1;
                     heartbeat_at = clock.now_ms().saturating_add(config.heartbeat_ms);
                 }
@@ -743,5 +784,104 @@ mod wake_bus_tests {
         // BusError passthrough is typed (no string-throw across the boundary).
         let b: WakeError = BusError::Shutdown.into();
         assert!(matches!(b, WakeError::Bus(_)));
+    }
+
+    /// Wave 4 (bd-ud7k): the exported aggregate is exact — two sequential
+    /// subscribers each take one EOSE, then the export sums them.
+    #[tokio::test]
+    async fn wake_bus_aggregate_shed_stats_exact() {
+        let sock = tmp_sock("agg");
+        let _ = std::fs::remove_file(&sock);
+        // Short heartbeat: disconnects are detected on the next heartbeat
+        // write, so finished stats land within one interval of the drop.
+        let mut cfg = WakeConfig::new(&sock);
+        cfg.heartbeat_ms = 50;
+        let clock = Arc::new(ManualClock::new(0));
+        let serve_clock: Arc<dyn WakeClock> = clock.clone();
+        let h = WakeServer::new(cfg, test_bus(), serve_clock)
+            .start()
+            .await
+            .expect("bind");
+        assert_eq!(h.aggregate_stats(), WakeStats::default());
+        for _ in 0..2 {
+            let stream = UnixStream::connect(&sock).await.expect("connect");
+            let (r, mut w) = stream.into_split();
+            w.write_all(b"{\"subscribe\":{}}\n").await.expect("sub");
+            let mut lines = BufReader::new(r).lines();
+            let eose = tokio::time::timeout(std::time::Duration::from_secs(2), lines.next_line())
+                .await
+                .expect("test bound")
+                .expect("io")
+                .expect("eose line");
+            assert!(eose.contains("eose"));
+            drop(lines);
+            drop(w);
+        }
+        // Finished-subscriber stats land on task end: bounded spin, never
+        // an unbounded wait. The scripted clock advances each tick so the
+        // heartbeat fires and the dropped connection is reaped.
+        let agg = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let a = h.aggregate_stats();
+                if a.subscribers_finished == 2 {
+                    break a;
+                }
+                clock.advance(1_000);
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("stats land on task end");
+        assert_eq!(agg.subscribers_live, 0);
+        assert_eq!(agg.delivered, 2, "one EOSE per subscriber, exact");
+        assert_eq!(agg.shed, 0);
+    }
+
+    /// Wave 4 (bd-ud7k): deaf-vs-quiet. A quiet bus delivers a heartbeat
+    /// stamped by the injected clock; a dead server reads EOF, never a
+    /// frame. The two states are asserted distinct, never conflated.
+    #[tokio::test]
+    async fn wake_bus_quiet_gets_heartbeat_deaf_gets_eof() {
+        let sock = tmp_sock("dq");
+        let _ = std::fs::remove_file(&sock);
+        let mut cfg = WakeConfig::new(&sock);
+        cfg.heartbeat_ms = 50;
+        let clock = Arc::new(ManualClock::new(1_000));
+        let serve_clock: Arc<dyn WakeClock> = clock.clone();
+        let h = WakeServer::new(cfg, test_bus(), serve_clock)
+            .start()
+            .await
+            .expect("bind");
+        let stream = UnixStream::connect(&sock).await.expect("connect");
+        let (r, mut w) = stream.into_split();
+        w.write_all(b"{\"subscribe\":{}}\n").await.expect("sub");
+        let mut lines = BufReader::new(r).lines();
+        let eose = tokio::time::timeout(std::time::Duration::from_secs(2), lines.next_line())
+            .await
+            .expect("test bound")
+            .expect("io")
+            .expect("eose line");
+        assert!(eose.contains("eose"), "live path starts at EOSE");
+        // Quiet bus: advance the scripted clock past the heartbeat
+        // interval and the next frame must be a stamped heartbeat.
+        clock.advance(60_000);
+        let hb = tokio::time::timeout(std::time::Duration::from_secs(2), lines.next_line())
+            .await
+            .expect("test bound")
+            .expect("io")
+            .expect("heartbeat line");
+        assert_eq!(
+            WakeFrame::decode_line(&hb).expect("decode"),
+            WakeFrame::Heartbeat { ts_ms: 61_000 },
+            "quiet bus heartbeats with the injected clock, not wall time"
+        );
+        // Deaf watcher: the server is gone, the client reads EOF.
+        drop(h);
+        let eof: Option<String> =
+            tokio::time::timeout(std::time::Duration::from_secs(2), lines.next_line())
+                .await
+                .expect("test bound")
+                .expect("io");
+        assert!(eof.is_none(), "dead server reads EOF, never a frame");
     }
 }
