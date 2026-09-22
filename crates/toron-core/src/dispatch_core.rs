@@ -94,6 +94,11 @@ pub enum DispatchEffect {
     Released {
         assignee: String,
     },
+    /// Release for an assignee with no in-flight entry: no counter moves,
+    /// no permit freed (bd-de4k: a blind decrement over-admits one job).
+    ReleaseIgnored {
+        assignee: String,
+    },
     Dispatched {
         job_id: String,
         assignee: String,
@@ -205,16 +210,25 @@ pub fn tick(model: &DispatchModel, msg: &DispatchMsg) -> (DispatchModel, Vec<Dis
             }
         }
         DispatchMsg::Release { assignee } => {
-            if let Some(count) = next.in_flight.get_mut(assignee) {
-                *count = count.saturating_sub(1);
-                if *count == 0 {
-                    next.in_flight.remove(assignee);
+            // bd-de4k: only a held permit frees one. A Release without
+            // in_flight membership moves NO counter — a blind decrement
+            // over-admits one job per stray release (used<max while all
+            // permits are actually held).
+            match next.in_flight.get_mut(assignee) {
+                Some(count) if *count > 0 => {
+                    *count -= 1;
+                    if *count == 0 {
+                        next.in_flight.remove(assignee);
+                    }
+                    next.used = next.used.saturating_sub(1);
+                    vec![DispatchEffect::Released {
+                        assignee: assignee.clone(),
+                    }]
                 }
+                _ => vec![DispatchEffect::ReleaseIgnored {
+                    assignee: assignee.clone(),
+                }],
             }
-            next.used = next.used.saturating_sub(1);
-            vec![DispatchEffect::Released {
-                assignee: assignee.clone(),
-            }]
         }
         DispatchMsg::Poll => {
             let idx = next
@@ -246,7 +260,7 @@ pub fn machine_config() -> serde_json::Value {
         "transitions": [
             {"on": "Submit", "guard": null, "effects": ["Queued"]},
             {"on": "Acquire", "guard": can_admit_name(), "effects": ["Admitted", "Denied"]},
-            {"on": "Release", "guard": null, "effects": ["Released"]},
+            {"on": "Release", "guard": null, "effects": ["Released", "ReleaseIgnored"]},
             {"on": "Poll", "guard": can_admit_name(), "effects": ["Dispatched"]},
         ],
         "guards": ["agent_free", "global_capacity", can_admit_name()],
@@ -424,6 +438,69 @@ mod pure_cores_tests {
     }
 
     #[test]
+    fn double_release_ignored_preserves_sum() {
+        // bd-de4k: max 1, a holds the only permit. A Release for stranger
+        // b must free nothing — otherwise b acquires while a still holds
+        // (used=1, held=2) and preservation breaks.
+        let mut model = DispatchModel::new(1);
+        let (next, fx) = tick(
+            &model,
+            &DispatchMsg::Acquire {
+                assignee: "a".into(),
+            },
+        );
+        model = next;
+        assert!(matches!(fx[0], DispatchEffect::Admitted { .. }));
+        let (next, fx) = tick(
+            &model,
+            &DispatchMsg::Release {
+                assignee: "b".into(),
+            },
+        );
+        assert_eq!(
+            fx,
+            vec![DispatchEffect::ReleaseIgnored {
+                assignee: "b".into()
+            }],
+            "stranger release frees no permit"
+        );
+        assert_eq!(next.used, 1, "used untouched by stranger release");
+        assert_eq!(next.in_flight.get("a"), Some(&1));
+        assert!(!next.in_flight.contains_key("b"));
+        let held: usize = next.in_flight.values().sum();
+        assert_eq!(next.used, held, "preservation holds");
+        // The permit is still a's: b is denied on the global cap.
+        let (_, fx) = tick(
+            &next,
+            &DispatchMsg::Acquire {
+                assignee: "b".into(),
+            },
+        );
+        assert_eq!(
+            fx,
+            vec![DispatchEffect::Denied {
+                assignee: "b".into(),
+                reason: DenyReason::GlobalCap,
+            }]
+        );
+        // The real release still works and frees exactly one permit.
+        let (next, fx) = tick(
+            &next,
+            &DispatchMsg::Release {
+                assignee: "a".into(),
+            },
+        );
+        assert_eq!(
+            fx,
+            vec![DispatchEffect::Released {
+                assignee: "a".into()
+            }]
+        );
+        assert_eq!(next.used, 0);
+        assert!(next.in_flight.is_empty());
+    }
+
+    #[test]
     fn machine_config_serializes() {
         let cfg = machine_config();
         assert_eq!(cfg["machine"], "dispatch_core");
@@ -477,6 +554,8 @@ mod model_paths_tests {
 
     /// Invariants asserted at EVERY step of every generated path:
     /// - budget: used never exceeds max (monotonicity of the semaphore);
+    /// - preservation: used always equals the sum of per-agent in-flight
+    ///   counts (bd-de4k: a Release without membership must not move used);
     /// - one-in-flight: no agent count ever exceeds 1;
     /// - no unjournaled delivery: submitted == queued + dispatched.
     fn check_invariants(
@@ -487,6 +566,13 @@ mod model_paths_tests {
     ) -> Result<(), String> {
         if model.used > model.max_concurrency {
             return Err(format!("budget blown {model:?} after {path:?}"));
+        }
+        let held: usize = model.in_flight.values().sum();
+        if model.used != held {
+            return Err(format!(
+                "preservation broken: used={} sum(in_flight)={held} {model:?} after {path:?}",
+                model.used
+            ));
         }
         for (agent, n) in &model.in_flight {
             if *n > 1 {
