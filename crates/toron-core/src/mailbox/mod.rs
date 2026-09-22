@@ -42,6 +42,7 @@ pub mod product;
 pub mod receipts;
 pub mod receipts_core;
 pub mod reservations;
+pub mod reservations_core;
 pub mod search;
 pub mod send_tags;
 pub mod surface;
