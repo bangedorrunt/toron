@@ -162,6 +162,97 @@ pub async fn replay_sink(writer: &IndexWriter, records: &[MailRecord]) -> anyhow
     Ok(records.len())
 }
 
+/// Rebuild workflow tables from the v20 event log (ADR-0035 wave 4,
+/// bd-jysu): fold `wfx.row` last-write-wins per (table, key), restore rows
+/// table-only (no events, no policy), apply `wfx.tombstone` deletes.
+/// Attempts pruned as orphans stay pruned (fold drops attempts whose
+/// effect is absent). Returns (rows_applied, tombstone_deletes, skipped).
+///
+/// This is the third EventLog consumer after receipts: `EventLog` or
+/// `read_since` in this module satisfies the wave-4 reader-switch fence.
+pub async fn rebuild_workflow_effects_from_log(
+    store: &crate::index::workflow_effects::WorkflowEffectStore,
+) -> anyhow::Result<(u64, u64, u64)> {
+    let fold = store.fold_projected().await?;
+    let skipped = fold.skipped;
+    let mut applied = 0u64;
+    for (row, ts) in fold.effects.values() {
+        store.restore_effect_row(row, *ts).await?;
+        applied += 1;
+    }
+    for (row, ts) in fold.attempts.values() {
+        store.restore_attempt_row(row, *ts).await?;
+        applied += 1;
+    }
+    for (row, ts) in fold.runs.values() {
+        store.restore_run_row(row, *ts).await?;
+        applied += 1;
+    }
+    for (row, ts) in fold.pending.values() {
+        store.restore_pending_row(row, *ts).await?;
+        applied += 1;
+    }
+    for (row, ts) in fold.terminals.values() {
+        store.restore_terminal_row(row, *ts).await?;
+        applied += 1;
+    }
+    // Tombstones: delete rows the fold dropped. The fold already applied
+    // tombstone removals, so diff the tables against it.
+    let log = crate::index::event_log::EventLog::new(store.pool().clone());
+    let mut deleted = 0u64;
+    for event in log.read_since(0).await? {
+        if event.kind != "wfx.tombstone" {
+            continue;
+        }
+        let payload: serde_json::Value = match serde_json::from_str(&event.payload) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let table = payload.get("table").and_then(|t| t.as_str()).unwrap_or("");
+        let key = payload.get("key").and_then(|k| k.as_str()).unwrap_or("");
+        let rows: u64 = match table {
+            "workflow_effects" => sqlx::query("DELETE FROM workflow_effects WHERE effect_key = ?1")
+                .bind(key)
+                .execute(store.pool())
+                .await?
+                .rows_affected(),
+            "workflow_runs" => sqlx::query("DELETE FROM workflow_runs WHERE run_id = ?1")
+                .bind(key)
+                .execute(store.pool())
+                .await?
+                .rows_affected(),
+            "workflow_pending" => {
+                let mut parts = key.split('\u{1f}');
+                match (parts.next(), parts.next(), parts.next()) {
+                    (Some(run), Some(promise), Some(park_gen)) => {
+                        let park_gen: i64 = park_gen.parse().unwrap_or(-1);
+                        sqlx::query(
+                            "DELETE FROM workflow_pending WHERE run_id = ?1 AND promise_id = ?2 AND park_generation = ?3",
+                        )
+                        .bind(run)
+                        .bind(promise)
+                        .bind(park_gen)
+                        .execute(store.pool())
+                        .await?
+                        .rows_affected()
+                    }
+                    _ => 0,
+                }
+            }
+            "workflow_terminal_events" => {
+                sqlx::query("DELETE FROM workflow_terminal_events WHERE terminal_digest = ?1")
+                    .bind(key)
+                    .execute(store.pool())
+                    .await?
+                    .rows_affected()
+            }
+            _ => 0,
+        };
+        deleted += rows;
+    }
+    Ok((applied, deleted, skipped))
+}
+
 /// Inspect an existing index db without rebuilding (bd-jwa, ADR-0004 Ship 3).
 /// Returns `(db_exists, integrity_ok, row_count)`. An absent db is
 /// `(false, false, None)`; an existing-but-corrupt/unreadable db collapses to
