@@ -1,7 +1,7 @@
 <!-- governed-by: ADR-0019, ADR-0027, ADR-0028, ADR-0031, ADR-0032, ADR-0003 -->
 ---
-status: proposed
-date: 2026-09-21
+status: accepted
+date: 2026-09-22
 decision-makers: bangedorrunt
 consulted: PatientElm Elm/effects study (bd-fp4u, .lavish/elm-effects-redesign.html); toron/flywheel/beads explore reports 2026-09-21; effect-oriented skill (rust.md, patterns.md); TypeSafe System-One docs (llms.txt 2026-09-21)
 informed: flywheel x toron x beads maintainers
@@ -9,7 +9,7 @@ informed: flywheel x toron x beads maintainers
 
 # ADR-0035: Elm Kernel Law and Judgment Plane Across toron, flywheel, and beads
 
-**Status:** Proposed — awaiting operator word. Research bead bd-fp4u; implementation epic bd-vhmn.
+**Status:** Accepted — operator word 2026-09-22. Research bead bd-fp4u (closed); implementation epic bd-vhmn (closing).
 
 **Decision in one sentence:** Every decision core in toron, flywheel, and beads becomes one Model, one Msg union, and one pure `tick(&Model, &Msg) -> (Model, Vec<Effect>)` with effects journaled before execution, and semantic judgment becomes a first-class journaled `Judge` effect served by versioned question packs (Jev/System-One pattern) instead of stringly prompts and substring classifiers.
 
@@ -300,3 +300,25 @@ flowchart TD
 - Parent study: bd-fp4u + `.lavish/elm-effects-redesign.html` (Lavish review session; comparison tables, code shapes, per-aspect current→target).
 - Revisit triggers: measured journal latency regression >20% at wave-2; judgment misroute rate above tuned baseline; any new kind/tool proposal (routes via ADR-0033, not this record).
 - Status changes append here with date stamps; supersession links both ways.
+
+## Acceptance record (2026-09-22)
+
+Accepted with the implementation as landed (36 LEGAL closes across toron +
+flywheel + beads) plus five verified follow-up defects filed under the epic,
+all confirmed against the code with file:line evidence before acceptance:
+
+- bd-de4k (P1): dispatch_core double-Release over-admits (`dispatch_core.rs:207-214`);
+  the copy-me core breaks `used == sum(in_flight)` and no paths test asserts it.
+- bd-aku0 (P1): receipt prune resurrection + check-then-act lost update
+  (`receipts.rs:254-295`); guard is tombstone-blind and runs outside the tx.
+- bd-pgvf (P1): judgment journal-after-invoke on the live path + per-call
+  `JudgeModel::new()` defeats the in-flight guard (`judgment.rs:541-576,611,775`).
+- bd-mbck (P2): breaker HalfOpen admits N probes + hardcoded tokio clock
+  (`send_armor.rs:209-225,175,194,213`).
+- bd-5mxm (P2): Degraded decided in messaging.rs:552-570, no `ReceiptsMsg`
+  variant creates it.
+
+Fresh-eyes review (bd-yq9q, `.lavish/adr35-review.html`) stands: ~65% by
+structure at acceptance; the ten gap beads from that review are all closed
+except bd-un5s (transports need greenfield shared-bus design — future work,
+design record on the bead).
