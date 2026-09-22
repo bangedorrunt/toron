@@ -172,9 +172,10 @@ impl DaemonClient {
 
 /// The mailbox source for the robot path (bd-pin-public-plane-s-easy.14).
 ///
-/// `Daemon(url)` when a toron MCP HTTP endpoint is configured or serving
-/// (env `TORON_MCP_URL` → default port probe → flywheel `[mail.toron] url`);
-/// `Embedded` otherwise — the durable XDG root the daemon would use.
+/// `Daemon(url)` when a toron MCP HTTP endpoint is explicitly configured
+/// (`TORON_MCP_URL`, flywheel `[mail.toron] url`); `Embedded` otherwise —
+/// the durable XDG root the daemon would use. A live default-port daemon
+/// with no configured URL refuses resolution loudly (one store).
 #[derive(Clone)]
 pub enum MailboxSource {
     /// The daemon at this MCP URL (the writer; the CLI is a client).
@@ -184,30 +185,71 @@ pub enum MailboxSource {
     Embedded(Arc<toron_core::mailbox::Mailbox>),
 }
 
+/// Pure selector decision (bd-nsr7: testable without sockets or env).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SourceDecision {
+    DaemonUrl(String),
+    EmbeddedPinned,
+    EmbeddedXdg,
+    RefuseSecondStore,
+}
+
+fn decide_source(
+    env_url: Option<String>,
+    data_dir_pinned: bool,
+    flywheel_url: Option<String>,
+    default_port_live: bool,
+) -> SourceDecision {
+    if let Some(url) = env_url {
+        return SourceDecision::DaemonUrl(url);
+    }
+    if data_dir_pinned {
+        return SourceDecision::EmbeddedPinned;
+    }
+    if let Some(url) = flywheel_url {
+        return SourceDecision::DaemonUrl(url);
+    }
+    if default_port_live {
+        return SourceDecision::RefuseSecondStore;
+    }
+    SourceDecision::EmbeddedXdg
+}
+
 impl MailboxSource {
     /// Resolve the robot path's mailbox source with the flywheel selector.
     ///
+    /// One selector, fail-loud (ADR-0035 Spec 4.5, bd-nsr7): an explicit
+    /// daemon URL connects or errors — never a silent second store. When no
+    /// daemon is configured, a live default-port daemon refuses embedded
+    /// fallback instead of diverging beside it.
+    ///
     /// Precedence (explicit wins over implicit):
-    /// 1. `TORON_MCP_URL` — explicit daemon URL.
-    /// 2. `TORON_MCP_DATA_DIR` — explicit durable-root pin (test isolation;
-    ///    the daemon honors the same env when launched with it). Pinned
-    ///    roots beat the implicit default-port probe: a caller that sets
-    ///    one has said "use THIS root", and the probe would silently route
-    ///    to an unrelated live daemon.
-    /// 3. Default `127.0.0.1:18080` when that port serves.
-    /// 4. flywheel `[mail.toron] url`.
-    /// 5. Embedded against the durable XDG root.
+    /// 1. `TORON_MCP_URL` — explicit daemon URL (connect failure is loud).
+    /// 2. `TORON_MCP_DATA_DIR` — explicit durable-root pin (test isolation).
+    /// 3. flywheel `[mail.toron] url` — configured daemon (connect loud).
+    /// 4. Embedded against the durable XDG root — refused loud when the
+    ///    default port serves (that daemon owns the store; set
+    ///    `TORON_MCP_URL` to use it or stop it).
     pub async fn resolve() -> anyhow::Result<Self> {
-        if let Some(url) = daemon_url_from_env() {
-            return Ok(Self::Daemon(DaemonClient::connect(&url).await?));
+        let decision = decide_source(
+            daemon_url_from_env(),
+            std::env::var_os("TORON_MCP_DATA_DIR").is_some(),
+            flywheel_toron_url(),
+            default_port_serving(),
+        );
+        match decision {
+            SourceDecision::DaemonUrl(url) => Ok(Self::Daemon(DaemonClient::connect(&url).await?)),
+            SourceDecision::EmbeddedPinned | SourceDecision::EmbeddedXdg => {
+                Ok(Self::Embedded(Arc::new(toron_mcp::demo_mailbox().await?)))
+            }
+            SourceDecision::RefuseSecondStore => {
+                anyhow::bail!(
+                    "a toron daemon serves {DEFAULT_DAEMON_URL} but no daemon URL is configured: \
+                     set TORON_MCP_URL to use it or stop it. Refusing to open a second \
+                     embedded store beside a live daemon (one store per project)."
+                );
+            }
         }
-        if std::env::var_os("TORON_MCP_DATA_DIR").is_some() {
-            return Ok(Self::Embedded(Arc::new(toron_mcp::demo_mailbox().await?)));
-        }
-        if let Some(url) = default_daemon_if_serving().or_else(flywheel_toron_url) {
-            return Ok(Self::Daemon(DaemonClient::connect(&url).await?));
-        }
-        Ok(Self::Embedded(Arc::new(toron_mcp::demo_mailbox().await?)))
     }
 }
 
@@ -218,22 +260,25 @@ fn daemon_url_from_env() -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-/// The default daemon endpoint when the port serves (TCP probe, short
-/// timeout — fail-soft: a down daemon just falls through to embedded).
-fn default_daemon_if_serving() -> Option<String> {
+/// Whether an addr serves (TCP probe, short timeout).
+fn port_serving(addr: &str) -> bool {
+    let Ok(sock) = addr.parse() else {
+        return false;
+    };
+    std::net::TcpStream::connect_timeout(&sock, std::time::Duration::from_millis(200)).is_ok()
+}
+
+/// Whether the default daemon port serves (TCP probe, short timeout).
+/// Used ONLY as a second-store guard: a live default daemon with no
+/// configured URL refuses embedded fallback loudly in `resolve`.
+fn default_port_serving() -> bool {
     let host = DEFAULT_DAEMON_URL
         .trim_start_matches("http://")
         .split('/')
         .next()
         .unwrap_or("127.0.0.1:18080");
     let (addr, port) = host.split_once(':').unwrap_or((host, "18080"));
-    let probe = format!("{addr}:{port}");
-    std::net::TcpStream::connect_timeout(
-        &probe.parse().ok()?,
-        std::time::Duration::from_millis(200),
-    )
-    .ok()
-    .map(|_| DEFAULT_DAEMON_URL.to_string())
+    port_serving(&format!("{addr}:{port}"))
 }
 
 /// flywheel `[mail.toron] url` (best-effort: `~/.config/flywheel/config.toml`).
@@ -251,4 +296,65 @@ fn flywheel_toron_url() -> Option<String> {
         .get("url")?
         .as_str()
         .map(ToString::to_string)
+}
+
+#[cfg(test)]
+mod selector_tests {
+    use super::*;
+
+    #[test]
+    fn decide_env_url_wins_over_everything() {
+        assert_eq!(
+            decide_source(
+                Some("http://x/mcp".to_string()),
+                true,
+                Some("http://y/mcp".to_string()),
+                true,
+            ),
+            SourceDecision::DaemonUrl("http://x/mcp".to_string())
+        );
+    }
+
+    #[test]
+    fn decide_data_dir_pin_beats_probe_and_config() {
+        assert_eq!(
+            decide_source(None, true, Some("http://y/mcp".to_string()), true,),
+            SourceDecision::EmbeddedPinned
+        );
+    }
+
+    #[test]
+    fn decide_flywheel_url_connects_loud() {
+        assert_eq!(
+            decide_source(None, false, Some("http://y/mcp".to_string()), false),
+            SourceDecision::DaemonUrl("http://y/mcp".to_string())
+        );
+    }
+
+    #[test]
+    fn decide_live_default_port_refuses_second_store() {
+        // bd-nsr7: no configured URL + live default daemon = loud refusal,
+        // never a silent embedded second store.
+        assert_eq!(
+            decide_source(None, false, None, true),
+            SourceDecision::RefuseSecondStore
+        );
+    }
+
+    #[test]
+    fn decide_quiet_defaults_embed() {
+        assert_eq!(
+            decide_source(None, false, None, false),
+            SourceDecision::EmbeddedXdg
+        );
+    }
+
+    #[test]
+    fn port_probe_sees_bound_socket() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("ephemeral port");
+        let addr = listener.local_addr().expect("addr").to_string();
+        assert!(port_serving(&addr));
+        drop(listener);
+        assert!(!port_serving(&addr));
+    }
 }
