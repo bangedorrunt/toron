@@ -555,7 +555,7 @@ impl Mailbox {
         {
             eprintln!("{}", crate::mailbox::receipts::DEGRADED_NOTE);
             if let Ok(store) = self.receipt_store() {
-                // bd-i7ld: one kernel decides each transition — the stored
+                // bd-5mxm: one kernel decides each transition — the stored
                 // row (if any) enters `tick` as the model and only a `Stamp`
                 // effect writes. Direct upserts from this path are forbidden.
                 let model = match store.get(corr.as_str()).await.ok().flatten() {

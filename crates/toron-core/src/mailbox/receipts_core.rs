@@ -86,7 +86,7 @@ pub enum ReceiptsMsg {
     /// Record delivery-without-bookkeeping as degraded (acked-unknown).
     /// Creates the row when bookkeeping never ran; guarded by
     /// `transition_allowed` like every other transition — one kernel,
-    /// one decider (bd-i7ld). Acked/resulted rows never drag down.
+    /// one decider (bd-5mxm). Acked/resulted rows never drag down.
     MarkDegraded { corr: String, now_ms: i64 },
     /// Expire rows older than `retention_ms` (host deletes).
     Prune { now_ms: i64, retention_ms: i64 },
@@ -746,7 +746,7 @@ mod pure_cores_tests {
         );
     }
 
-    /// bd-i7ld: MarkDegraded creates the row when bookkeeping never ran.
+    /// bd-5mxm: MarkDegraded creates the row when bookkeeping never ran.
     #[test]
     fn mark_degraded_creates_row_from_missing() {
         let (model, fx) = tick(
@@ -768,7 +768,7 @@ mod pure_cores_tests {
         assert_eq!(model.entries["c"].state, State::Degraded);
     }
 
-    /// bd-i7ld: an owed row degrades in place (never re-owes later).
+    /// bd-5mxm: an owed row degrades in place (never re-owes later).
     #[test]
     fn mark_degraded_from_owed_stamps_degraded() {
         let seed = ReceiptsModel::with_row("c", State::Owed, Some("/r.json".into()), 1);
@@ -791,7 +791,7 @@ mod pure_cores_tests {
         assert_eq!(model.entries["c"].state, State::Degraded);
     }
 
-    /// bd-i7ld: degraded is idempotent; acked/resulted never drag down.
+    /// bd-5mxm: degraded is idempotent; acked/resulted never drag down.
     #[test]
     fn mark_degraded_idempotent_and_guarded() {
         for (state, reason) in [
