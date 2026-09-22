@@ -251,6 +251,15 @@ impl ReceiptStore {
             let _ = w.as_str();
         }
         // Monotonic guard: never downgrade resulted, never drag acked to owed.
+        // bd-aku0: tombstones refuse first — a pruned corr stays dead no
+        // matter what the projection fold returns (get() hides pruned rows
+        // as None, which the old code read as "free to insert").
+        if self.is_tombstoned(&receipt.corr).await? {
+            anyhow::bail!(
+                "corr {} was pruned (tombstoned); refusing resurrection",
+                receipt.corr
+            );
+        }
         if let Some(existing) = self.get(&receipt.corr).await? {
             match (existing.state, receipt.state) {
                 (ReceiptState::Resulted, ReceiptState::Resulted) => {
@@ -261,7 +270,7 @@ impl ReceiptStore {
                         let mut merged = existing;
                         merged.result_path = receipt.result_path.clone();
                         merged.updated_at = receipt.updated_at;
-                        return Box::pin(self.upsert_row(&merged)).await;
+                        return Box::pin(self.upsert_row(&merged)).await.map(|_| ());
                     }
                     return Ok(());
                 }
@@ -275,33 +284,128 @@ impl ReceiptStore {
                 _ => {}
             }
         }
-        Box::pin(self.upsert_row(receipt)).await
+        Box::pin(self.upsert_row(receipt)).await.map(|_| ())
+    }
+
+    /// Tombstone probe (bd-aku0): true when the event log carries a
+    /// `receipt.pruned` for `corr` with no later stamp. A tombstoned corr
+    /// must never be re-inserted — `get()` reports it as None, which is
+    /// exactly what the old guard misread as "free to insert".
+    async fn is_tombstoned(&self, corr: &str) -> anyhow::Result<bool> {
+        let log = crate::index::event_log::EventLog::new(self.pool.clone());
+        let events = log.read_since(0).await?;
+        Ok(matches!(Self::fold_events(&events).get(corr), Some(None)))
+    }
+
+    /// Authority for the monotonic lifecycle (bd-aku0): the same
+    /// never-downgrade rules the outer `upsert` applies, re-checked on a
+    /// fresh read every write attempt and enforced atomically by the
+    /// conditional write's WHERE clause. False = skip (no write).
+    const fn transition_allowed(current: ReceiptState, incoming: &Receipt) -> bool {
+        match (current, incoming.state) {
+            // Idempotent re-stamp carries nothing new unless it brings a path.
+            (ReceiptState::Resulted, ReceiptState::Resulted) => incoming.result_path.is_some(),
+            (ReceiptState::Resulted, _) => false,
+            (ReceiptState::Acked, ReceiptState::Owed) => false,
+            // ADR-0010 D8: degraded is acked-unknown — never re-owed, and
+            // an ack is strictly more information than degraded.
+            (ReceiptState::Degraded, ReceiptState::Owed) => false,
+            (ReceiptState::Acked, ReceiptState::Degraded) => false,
+            _ => true,
+        }
     }
 
     /// Wave-4 dual-write (ADR-0035 Spec 4): the table row and its
     /// `receipt.stamped` event commit in ONE transaction. The log is the
     /// emerging source of truth; the table is its projection. A log failure
     /// fails the write (fail-closed) — never row-without-event.
-    async fn upsert_row(&self, receipt: &Receipt) -> anyhow::Result<()> {
+    ///
+    /// Returns true when the write landed, false when the guard skipped a
+    /// stale write (bd-aku0: check-then-act with busy-retry re-validation —
+    /// every attempt re-reads before writing, and the write itself is
+    /// conditional so a concurrent commit between read and write matches
+    /// zero rows instead of landing last). A tombstoned corr fails loud
+    /// (never resurrected).
+    ///
+    /// Lock discipline: no SELECT ever runs inside the write tx before the
+    /// write statement — the tx goes straight to a conditional write (which
+    /// takes RESERVED up-front, so contenders wait on the busy timeout)
+    /// instead of holding SHARED across an upgrade (which deadlocks).
+    async fn upsert_row(&self, receipt: &Receipt) -> anyhow::Result<bool> {
         let log = crate::index::event_log::EventLog::new(self.pool.clone());
         for _ in 0..3 {
+            // Pre-tx read (no locks held): fast skip + expected-state
+            // snapshot. Re-read every attempt — a retry re-validates.
+            if self.is_tombstoned(&receipt.corr).await? {
+                anyhow::bail!(
+                    "corr {} was pruned (tombstoned); refusing resurrection",
+                    receipt.corr
+                );
+            }
+            let current: Option<ReceiptState> =
+                sqlx::query_scalar("SELECT state FROM receipts WHERE corr = ?1")
+                    .bind(&receipt.corr)
+                    .fetch_optional(&self.pool)
+                    .await?
+                    .map(|s: String| ReceiptState::parse(&s))
+                    .transpose()
+                    .map_err(|e| anyhow::anyhow!(e))?;
+            if let Some(s) = current
+                && !Self::transition_allowed(s, receipt)
+            {
+                return Ok(false);
+            }
             let mut tx = self.pool.begin().await?;
             let wake_s = receipt.wake.map(|w| w.as_str().to_string());
-            sqlx::query(
-                "INSERT INTO receipts (corr, state, wake, due_at, result_path, updated_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
-                 ON CONFLICT(corr) DO UPDATE SET \
-                   state = excluded.state, wake = excluded.wake, due_at = excluded.due_at, \
-                   result_path = excluded.result_path, updated_at = excluded.updated_at",
-            )
-            .bind(&receipt.corr)
-            .bind(receipt.state.as_str())
-            .bind(wake_s)
-            .bind(receipt.due_at)
-            .bind(&receipt.result_path)
-            .bind(receipt.updated_at)
-            .execute(&mut *tx)
-            .await?;
+            // Conditional act: the WHERE clause is the atomic guard.
+            let wrote = match current {
+                None => sqlx::query(
+                    "INSERT OR IGNORE INTO receipts (corr, state, wake, due_at, result_path, updated_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                )
+                .bind(&receipt.corr)
+                .bind(receipt.state.as_str())
+                .bind(wake_s)
+                .bind(receipt.due_at)
+                .bind(&receipt.result_path)
+                .bind(receipt.updated_at)
+                .execute(&mut *tx)
+                .await?
+                .rows_affected()
+                    == 1,
+                Some(expected) => sqlx::query(
+                    "UPDATE receipts SET state = ?1, wake = ?2, due_at = ?3, \
+                     result_path = ?4, updated_at = ?5 \
+                     WHERE corr = ?6 AND state = ?7",
+                )
+                .bind(receipt.state.as_str())
+                .bind(wake_s)
+                .bind(receipt.due_at)
+                .bind(&receipt.result_path)
+                .bind(receipt.updated_at)
+                .bind(&receipt.corr)
+                .bind(expected.as_str())
+                .execute(&mut *tx)
+                .await?
+                .rows_affected()
+                    == 1,
+            };
+            if !wrote {
+                // Lost the race: another writer moved the row first.
+                // Roll back and re-read — the next attempt re-validates.
+                tx.rollback().await?;
+                continue;
+            }
+            // Re-check the tombstone AFTER holding the write lock: a prune
+            // that committed between our pre-read and this tx must refuse
+            // us (otherwise the insert above resurrected a pruned corr).
+            if self.is_tombstoned(&receipt.corr).await? {
+                tx.rollback().await?;
+                anyhow::bail!(
+                    "corr {} was pruned (tombstoned); refusing resurrection",
+                    receipt.corr
+                );
+            }
             let event = ReceiptEvent::stamped(receipt);
             let payload = serde_json::to_string(&event).unwrap_or_default();
             match log
@@ -316,7 +420,7 @@ impl ReceiptStore {
             {
                 Ok(_) => {
                     tx.commit().await?;
-                    return Ok(());
+                    return Ok(true);
                 }
                 Err(_) => {
                     tx.rollback().await?;
@@ -445,8 +549,7 @@ impl ReceiptStore {
                     result_path: result_path.clone(),
                     updated_at: *updated_at_ms,
                 })
-                .await?;
-                Ok(true)
+                .await
             }
             _ => Ok(false),
         }
@@ -494,8 +597,15 @@ impl ReceiptStore {
                     result_path: stamped_path.clone(),
                     updated_at: *updated_at_ms,
                 };
-                self.upsert_row(&stamped).await?;
-                Ok(stamped)
+                // bd-aku0: the in-tx guard is the authority — a stale Stamp
+                // decision that lost its race skips instead of landing last.
+                if self.upsert_row(&stamped).await? {
+                    Ok(stamped)
+                } else {
+                    self.get(corr.as_str())
+                        .await?
+                        .ok_or_else(|| anyhow::anyhow!("receipt vanished mid-transition"))
+                }
             }
             _ => self
                 .get(corr.as_str())
@@ -767,6 +877,85 @@ mod tests {
         );
         assert!(!g.contains("mail resend"), "no dead resend pointer: {g}");
     }
+    #[tokio::test]
+    async fn receipt_prune_tombstone_blocks_resurrection() {
+        // bd-aku0: a pruned corr is tombstoned in the log. A later upsert
+        // for the same corr must NOT resurrect it — the guard refuses.
+        let (pool, path) = test_pool("tombstone").await;
+        let store = ReceiptStore::new(pool);
+        let r = Receipt {
+            corr: "doomed-1".into(),
+            state: ReceiptState::Owed,
+            wake: None,
+            due_at: None,
+            result_path: None,
+            updated_at: 100,
+        };
+        store.upsert(&r).await.expect("upsert");
+        let pruned = store.prune_expired(10_000, 1_000).await.expect("prune");
+        assert_eq!(pruned, 1, "one row pruned");
+        assert!(store.get("doomed-1").await.expect("get").is_none());
+        let ghost = Receipt {
+            updated_at: 20_000,
+            ..r
+        };
+        let err = store
+            .upsert(&ghost)
+            .await
+            .expect_err("resurrection refused");
+        assert!(
+            err.to_string().contains("pruned"),
+            "refusal names the tombstone: {err}"
+        );
+        assert!(store.get("doomed-1").await.expect("get").is_none());
+        assert!(
+            store
+                .verify_against_log()
+                .await
+                .expect("verify")
+                .iter()
+                .all(|d| d.kind != DivergenceKind::Resurrected),
+            "no resurrection in the tripwire"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn receipt_guard_in_tx_no_lost_update() {
+        // bd-aku0: the monotonic guard must live INSIDE the write tx.
+        // A stale owed write applied directly to the row writer must not
+        // drag a committed resulted row back — even when the outer
+        // check-then-act was bypassed.
+        let (pool, path) = test_pool("intx").await;
+        let store = ReceiptStore::new(pool);
+        store
+            .upsert(&Receipt {
+                corr: "race-1".into(),
+                state: ReceiptState::Resulted,
+                wake: None,
+                due_at: None,
+                result_path: Some("/done.json".into()),
+                updated_at: 300,
+            })
+            .await
+            .expect("resulted");
+        store
+            .upsert_row(&Receipt {
+                corr: "race-1".into(),
+                state: ReceiptState::Owed,
+                wake: None,
+                due_at: None,
+                result_path: None,
+                updated_at: 200,
+            })
+            .await
+            .expect("stale write skipped, not failed");
+        let got = store.get("race-1").await.expect("get").expect("found");
+        assert_eq!(got.state, ReceiptState::Resulted, "no lost update");
+        assert_eq!(got.result_path.as_deref(), Some("/done.json"));
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[tokio::test]
     async fn receipts_upsert_and_get_roundtrip() {
         let (pool, path) = test_pool("roundtrip").await;
