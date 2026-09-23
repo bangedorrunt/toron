@@ -9,7 +9,7 @@ informed: flywheel x toron x beads maintainers
 
 # ADR-0036: Daemon Push Sidecar (Wake Bus) for Cross-Process Observation
 
-**Status:** Proposed — awaiting operator word. Design bead bd-42tn; target bead bd-un5s (transports future work); wake-unity remainder rides along.
+**Status:** Accepted — operator word 2026-09-23; serve wiring landed (bd-ewsi), see status log. Design bead bd-42tn and transports bead bd-un5s closed with the wake-unity waves.
 
 **Decision in one sentence:** The toron daemon holds one `subscribe_trusted` over the wake kinds and fans wake frames out over a Unix-domain socket (`wake.sock`, JSONL, herdr-sock pattern), so every cross-process consumer (doorbell `FileHost`, `toron watch --live`, `wait --corr`) subscribes instead of polling SQLite or spawning a `toron watch` child — while SQLite replay stays the catch-up/repair path and kind-9 stays the wire vocabulary.
 
@@ -191,3 +191,17 @@ Chosen option: **Option A**, because the socket already has a proven pattern (he
   disconnects reap on the heartbeat write so error paths keep their counts).
   Deaf-vs-quiet asserted (`wake_bus_quiet_gets_heartbeat_deaf_gets_eof`:
   quiet bus heartbeats on the injected clock, dead server reads EOF).
+- 2026-09-23 (bd-ewsi, OPERATOR WORD): serve wiring landed —
+  `serve_stdio`/`serve_http` start `WakeServer` after the one-writer serve
+  lock and hold the handle across the serve await (RAII drop removes the
+  socket). Bind path and every discovery now share
+  `toron_core::config::state_dir()/wake.sock` — one derivation by
+  construction, closing the consumers-first gap (waves 2-4 shipped dialers
+  while no process ever bound the socket: doorbell looped
+  `wake_sock_absent`/`Died` ~16s apart, no wake delivered for hours).
+  Spec 2.5 best-effort holds: `AlreadyServing`/bind failure warns loud and
+  serve continues. Process-boundary pin:
+  `cli_robot::serve_binds_wake_sock_for_consumers` (RED before wiring,
+  GREEN after). Live verification: all six doorbell wake consumers
+  reconnected, watch heartbeats fresh (`last_event_age_s: 12`),
+  `degraded: []`.
