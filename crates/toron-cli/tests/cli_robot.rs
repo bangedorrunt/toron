@@ -1844,6 +1844,95 @@ fn boot_daemon(data_dir: &std::path::Path) -> (std::process::Child, u16) {
     (child, port)
 }
 
+// ---------------------------------------------------------------------------
+// ADR-0036 Spec 2: `serve` IS the sidecar (bd-ewsi).
+// ---------------------------------------------------------------------------
+
+/// The serving process must bind `wake.sock` at the SAME path every
+/// consumer's discovery derives (`$XDG_STATE_HOME/toron/wake.sock`) and
+/// answer a subscribe line with EOSE. The 2026-09-23 cutover shipped the
+/// consumers (doorbell FileHost, `watch --live`) while `serve` never
+/// started `WakeServer` — doorbell looped `wake_sock_absent`/`Died` every
+/// ~16s and no hosted workspace got a wake for hours. A file that exists
+/// is not the contract; a handshake answer is. After the serve dies the
+/// path must refuse connects (stale or gone — both read as absent).
+#[test]
+fn serve_binds_wake_sock_for_consumers() {
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixStream;
+
+    let state = std::env::temp_dir().join(format!("twk-state-{}", std::process::id()));
+    let data = std::env::temp_dir().join(format!("twk-data-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&state);
+    let _ = std::fs::remove_dir_all(&data);
+    std::fs::create_dir_all(&state).expect("state dir");
+
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .and_then(|l| l.local_addr())
+        .map(|a| a.port())
+        .expect("free port");
+    let mut child = toron()
+        .args(["serve", "--mcp-http", &format!("127.0.0.1:{port}")])
+        .env("TORON_MCP_DATA_DIR", &data)
+        .env("XDG_STATE_HOME", &state)
+        .env("RUST_LOG", "error")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn serve");
+
+    let sock = state.join("toron").join("wake.sock");
+    // Serve must come up at all first (port probe mirrors boot_daemon).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "serve never listened on :{port}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    // Then the handshake: subscribe -> EOSE, bounded (a bare file is not
+    // the contract — the frame is).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    let mut answered = String::new();
+    while std::time::Instant::now() < deadline {
+        answered.clear();
+        if let Ok(mut s) = UnixStream::connect(&sock) {
+            let _ = s.set_read_timeout(Some(std::time::Duration::from_secs(3)));
+            let _ = s.set_write_timeout(Some(std::time::Duration::from_secs(3)));
+            if s.write_all(b"{\"subscribe\":{}}\n").is_ok() {
+                let mut buf = [0u8; 1024];
+                if let Ok(n) = s.read(&mut buf) {
+                    answered = String::from_utf8_lossy(&buf[..n]).to_string();
+                    if answered.contains("\"eose\"") {
+                        break;
+                    }
+                }
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(
+        answered.contains("\"eose\""),
+        "serve must bind {} and answer subscribe with EOSE; got: {answered:?}",
+        sock.display()
+    );
+
+    // Dead serve refuses the path — stale file or gone, both read as absent.
+    let _ = child.kill();
+    let _ = child.wait();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while UnixStream::connect(&sock).is_ok() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "wake.sock still accepting after serve died"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let _ = std::fs::remove_dir_all(&state);
+    let _ = std::fs::remove_dir_all(&data);
+}
+
 /// Acquire an exclusive lease through the daemon's MCP tools (the HTTP/MCP
 /// path — the writer's view). Uses rmcp directly, mirroring am_parity_e2e.
 fn acquire_lease_via_daemon(port: u16, project: &str, agent: &str, path: &str) {
