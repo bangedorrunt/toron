@@ -1886,6 +1886,33 @@ mod live_watch_tests {
     use toron_core::mailbox::send_tags::Wake;
     use toron_core::mailbox::{Mailbox, Receipt, ReceiptState};
 
+    /// bd-nepl: isolate wake-socket discovery for this whole test binary.
+    /// Since `serve` started holding the real `$state/wake.sock` (ADR-0036
+    /// wiring), default discovery would attach these unit tests to the
+    /// MACHINE daemon: their own-bus wakes never arrive there, so the
+    /// socket-first branch times out instead of degrading to the in-process
+    /// path the test actually exercises (observed on
+    /// `live_watch_wait_corr_unparks_on_receipt` after the sidecar landed).
+    /// Point discovery at a guaranteed-absent path: connect fails loud and
+    /// the degrade lands in-process — byte-identical to pre-sidecar behavior.
+    fn isolate_wake_sock() {
+        use std::sync::OnceLock;
+        static DONE: OnceLock<()> = OnceLock::new();
+        DONE.get_or_init(|| {
+            let p = std::env::temp_dir().join(format!(
+                "toron-test-wake-absent-{}.sock",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_file(&p);
+            // Safe cfg(test) seam (no env set_var: the crate forbids unsafe).
+            // OnceLock serialization plus fixture-first ordering: every
+            // socket-discovering test here builds its mailbox through
+            // `test_mailbox` BEFORE spawning its waiter/watcher, so no
+            // discovery read can race this pin.
+            crate::wake_sock::pin_wake_sock_for_tests(p);
+        });
+    }
+
     async fn test_mailbox(
         tag: &str,
     ) -> (
@@ -1894,6 +1921,7 @@ mod live_watch_tests {
         std::path::PathBuf,
         std::path::PathBuf,
     ) {
+        isolate_wake_sock();
         let db_path = std::env::temp_dir().join(format!(
             "toron-live-watch-{}-{}.sqlite",
             tag,
