@@ -438,6 +438,44 @@ fn disposition_for_kind(kind: &str, existing: Option<&str>) -> super::boundary::
     }
 }
 
+/// bd-90eb: truncated preview of a failed leaf value for the fail_run
+/// terminal artifact — sorted top-level keys, 512-char bound with the
+/// marker appended past the bound, bare leaves emit the fixed `empty-leaf`
+/// token so terminal artifacts never again carry zero evidence. Pure
+/// value-render; kept out of the async dispatch.
+fn leaf_preview_for_value(value: &serde_json::Value) -> String {
+    const BOUND: usize = 512;
+    const MARKER: &str = "\u{2026}(truncated)";
+    const EMPTY: &str = "empty-leaf";
+    let is_bare = match value {
+        serde_json::Value::Null => true,
+        serde_json::Value::Object(m) => m.is_empty(),
+        _ => false,
+    };
+    if is_bare {
+        return EMPTY.to_string();
+    }
+    let canonical = match value {
+        serde_json::Value::Object(m) => {
+            let mut sorted = serde_json::Map::new();
+            let mut keys: Vec<&String> = m.keys().collect();
+            keys.sort();
+            for k in keys {
+                sorted.insert(k.clone(), m[k].clone());
+            }
+            serde_json::Value::Object(sorted).to_string()
+        }
+        _ => value.to_string(),
+    };
+    let chars: Vec<char> = canonical.chars().collect();
+    if chars.len() > BOUND {
+        let head: String = chars[..BOUND].iter().collect();
+        format!("{head}{MARKER}")
+    } else {
+        canonical
+    }
+}
+
 #[cfg(test)]
 mod disposition_tests_bd_r328 {
     use super::super::boundary::Disposition;
@@ -974,6 +1012,7 @@ pub(crate) fn run_step_with_enclosing<'a>(
                             "failed_step": step.name.clone().unwrap_or_else(|| "<unnamed>".into()),
                             "kind": kind,
                             "disposition": disposition,
+                            "leaf_preview": leaf_preview_for_value(&value),
                             "attempts": attempt,
                         }));
                     }
@@ -1002,6 +1041,7 @@ pub(crate) fn run_step_with_enclosing<'a>(
                 } else if !kind.is_empty() {
                     failed["disposition"] = serde_json::json!(disposition_for_kind(kind, None));
                 }
+                failed["leaf_preview"] = serde_json::json!(leaf_preview_for_value(&value));
                 return Ok(failed);
             }
             return Ok(value);
@@ -2146,6 +2186,7 @@ pub(crate) async fn run_graph(
                             "failed_step": name,
                             "kind": kind,
                             "disposition": disposition,
+                            "leaf_preview": leaf_preview_for_value(&value),
                             "attempts": attempt,
                         }));
                     }
@@ -2200,6 +2241,7 @@ pub(crate) async fn run_graph(
                 } else if !kind.is_empty() {
                     failed["disposition"] = serde_json::json!(disposition_for_kind(kind, None));
                 }
+                failed["leaf_preview"] = serde_json::json!(leaf_preview_for_value(&value));
                 return Ok(failed);
             }
             land_node_output(&mut outputs, &name, &node.action, value);
@@ -2626,5 +2668,101 @@ mod control_flow_output_tests {
             &delay,
             &serde_json::json!({ "outcome": "approved" })
         ));
+    }
+}
+
+#[cfg(test)]
+mod fail_run_preview_tests_bd_90eb {
+    use super::leaf_preview_for_value;
+    use super::super::{ActionInvocation, AsyncEffectRunner, RunInput, WorkflowEngine};
+    use crate::schema::{Action, parse_workflow};
+    use std::sync::Arc;
+
+    /// bd-90eb: the preview carries kind/disposition evidence when present.
+    #[test]
+    fn preview_embeds_kind_and_disposition() {
+        let v = serde_json::json!({
+            "ok": false,
+            "error": "bad creds",
+            "kind": "auth",
+            "disposition": "TerminalFailed",
+        });
+        let preview = leaf_preview_for_value(&v);
+        assert!(preview.contains("auth"), "kind embedded: {preview}");
+        assert!(
+            preview.contains("TerminalFailed"),
+            "disposition embedded: {preview}"
+        );
+        assert!(preview.contains("bad creds"), "error embedded: {preview}");
+    }
+
+    /// bd-90eb: a bare leaf never yields zero evidence.
+    #[test]
+    fn bare_leaf_emits_empty_leaf_token() {
+        assert_eq!(leaf_preview_for_value(&serde_json::json!({})), "empty-leaf");
+        assert_eq!(leaf_preview_for_value(&serde_json::Value::Null), "empty-leaf");
+    }
+
+    /// bd-90eb: bound is 512 chars, then the marker is appended.
+    #[test]
+    fn long_leaf_truncates_with_marker() {
+        let v = serde_json::json!({"blob": "x".repeat(2000)});
+        let preview = leaf_preview_for_value(&v);
+        assert!(
+            preview.ends_with("\u{2026}(truncated)"),
+            "marker appended: {preview}"
+        );
+        assert_eq!(preview.chars().count(), 512 + "\u{2026}(truncated)".chars().count());
+    }
+
+    /// bd-90eb: the linear fail_run fallback embeds leaf preview plus
+    /// kind/disposition when the leaf value carries them. `auth` parses
+    /// but is not a retry candidate, so this hits the fallback directly.
+    #[tokio::test]
+    async fn fail_run_fallback_embeds_preview_kind_disposition() {
+        let runner: AsyncEffectRunner = Arc::new(|inv: &ActionInvocation| {
+            let value = if matches!(inv.action, Action::SendMessage { .. }) {
+                serde_json::json!({"ok": false, "error": "bad creds", "kind": "auth"})
+            } else {
+                serde_json::Value::Null
+            };
+            Box::pin(async move { Ok(value) })
+                as std::pin::Pin<
+                    Box<dyn std::future::Future<Output = anyhow::Result<serde_json::Value>> + Send>,
+                >
+        });
+        let engine =
+            WorkflowEngine::local_with_async_effect_runner(Some(runner)).expect("engine");
+        let workflow = parse_workflow(
+            r##"
+name: upgrade-wf
+trigger:
+  type: webhook
+steps:
+  - name: upgrade
+    action: send_message
+    to: ["ops"]
+    subject: "upgrade"
+    body: "go"
+    on_error: fail_run
+"##,
+        )
+        .expect("parse fail_run workflow");
+        let output = engine
+            .run(
+                "wf-fail-run-preview-1",
+                RunInput { run_id: None, workflow, trigger: serde_json::json!({}) },
+            )
+            .await
+            .expect("run returns a value, not a panic");
+        assert_eq!(output["status"], "failed", "run failed: {output}");
+        assert_eq!(output["kind"], "auth", "kind carried: {output}");
+        assert!(
+            !output["disposition"].is_null(),
+            "disposition carried: {output}"
+        );
+        let preview = output["leaf_preview"].as_str().expect("leaf_preview string");
+        assert!(preview.contains("auth"), "preview embeds kind: {output}");
+        assert!(preview.contains("bad creds"), "preview embeds error: {output}");
     }
 }
