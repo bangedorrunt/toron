@@ -207,9 +207,10 @@ async fn http_initialize_negotiates_2026_07_28() -> anyhow::Result<()> {
     let tools = client.list_tools(None).await?;
     assert_eq!(
         tools.tools.len(),
-        40,
+        41,
         "38 AM-Rust parity tools + release_file_reservations_by_reason (bd-h3oj) \
-         + list_file_reservations (bd-locks-list-daemon-xetz)"
+         + list_file_reservations (bd-locks-list-daemon-xetz) \
+         + ask_judgment (bd-ncpt, the frozen41-surface)"
     );
 
     client.close().await?;
@@ -246,9 +247,10 @@ async fn http_lists_exactly_38_am_rust_tools() -> anyhow::Result<()> {
     let tools = client.list_tools(None).await?;
     assert_eq!(
         tools.tools.len(),
-        AM_RUST_TOOLS.len() + 2,
+        AM_RUST_TOOLS.len() + 3,
         "38 parity tools + release_file_reservations_by_reason (bd-h3oj) \
-         + list_file_reservations (bd-locks-list-daemon-xetz), got {}",
+         + list_file_reservations (bd-locks-list-daemon-xetz) \
+         + ask_judgment (bd-ncpt), got {}",
         tools.tools.len()
     );
 
@@ -264,6 +266,11 @@ async fn http_lists_exactly_38_am_rust_tools() -> anyhow::Result<()> {
     assert!(
         names.contains(&"list_file_reservations"),
         "additive read-only lease board missing"
+    );
+
+    assert!(
+        names.contains(&"ask_judgment"),
+        "additive judgment bridge missing (bd-ncpt)"
     );
     // Exact name matches on representative tools.
     let by_name = |n: &str| {
