@@ -1,5 +1,6 @@
 // governed-by: ADR-0003
 // governed-by: ADR-0017 (project-root canonicalization)
+// governed-by: ADR-0036 (serve-side wake sidecar)
 #![forbid(unsafe_code)]
 
 use std::sync::Arc;
@@ -279,6 +280,44 @@ pub async fn demo_mailbox_with_trigger()
     Ok((mailbox, rx))
 }
 
+/// ADR-0036 Spec 2 (bd-ewsi): the serving process IS the wake sidecar —
+/// one held `subscribe_trusted` fans bus events over `wake.sock` at the
+/// path [`toron_core::config::state_dir`] derives for EVERYONE (toron-cli
+/// slice B, doorbell `discover_from`), so producer and consumers agree by
+/// construction instead of by review.
+///
+/// Best-effort per Spec 2.5: a live peer on the socket (exotic layout —
+/// two serves sharing one state dir) or a bind failure degrades LOUD
+/// (`tracing::warn`) and serve continues; consumers already degrade loud
+/// on an absent socket. The returned handle must be HELD for the serve's
+/// lifetime — dropping it removes the socket file (RAII).
+async fn start_wake_sidecar(mailbox: &Mailbox) -> Option<toron_core::bus::wake::WakeHandle> {
+    use toron_core::bus::wake::{SystemClock, WakeConfig, WakeServer};
+    let sock = match std::env::var("TORON_WAKE_SOCK") {
+        Ok(p) if !p.is_empty() => std::path::PathBuf::from(p),
+        _ => toron_core::config::state_dir().join("wake.sock"),
+    };
+    let server = WakeServer::new(
+        WakeConfig::new(&sock),
+        mailbox.bus().clone(),
+        Arc::new(SystemClock),
+    );
+    match server.start().await {
+        Ok(handle) => {
+            tracing::info!(sock = %sock.display(), "wake sidecar listening");
+            Some(handle)
+        }
+        Err(e) => {
+            tracing::warn!(
+                sock = %sock.display(),
+                error = %e,
+                "wake sidecar not serving — consumers degrade loud (ADR-0036 Spec 2.5)"
+            );
+            None
+        }
+    }
+}
+
 /// bd-6wfv: build the mailbox from EXPLICIT paths instead of process-global
 /// env vars. The e2e parity suite boots one daemon per cluster test in
 /// PARALLEL threads — each `LiveDaemon::boot` used to set
@@ -448,6 +487,8 @@ pub async fn serve_stdio() -> anyhow::Result<()> {
     // bd-m5ym: the Mailbox data_dir is <root>/projects in production;
     // the serve lock is a root-level file (<root>/serve.pid).
     let _lock = crate::serve_lock::acquire(&toron_core::config::mailbox_root(mailbox.data_dir()))?;
+    // Held across `running.waiting()` below: drop removes wake.sock (RAII).
+    let _wake = start_wake_sidecar(&mailbox).await;
     spawn_mail_trigger_host(mailbox.clone(), trigger_rx);
     let server = ToronServer::new().with_mailbox(mailbox);
     let running = server.serve(rmcp::transport::stdio()).await?;
@@ -541,6 +582,10 @@ pub async fn serve_http(bind_addr: &str) -> anyhow::Result<()> {
         Err(e) => return Err(e.into()),
     };
     tracing::info!(%bind_addr, "toron MCP Streamable HTTP listening at /mcp");
+    // ADR-0036 Spec 2 (bd-ewsi): bound only once THIS instance owns the
+    // address (a healthy HttpPeer instance already returned above and keeps
+    // its own sidecar); held across the serve await — drop removes the file.
+    let _wake = start_wake_sidecar(&mailbox).await;
     axum::serve(listener, router_with_mailbox(mailbox, trigger_rx).await?).await?;
     Ok(())
 }

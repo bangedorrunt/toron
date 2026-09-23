@@ -1,4 +1,5 @@
 // governed-by: ADR-0007
+// governed-by: ADR-0036 (daemon state dir — wake.sock discovery)
 #![forbid(unsafe_code)]
 
 //! Durable data-root configuration (ADR-0007 D3 / R2).
@@ -87,6 +88,51 @@ pub fn resolve_data_root(env: &DataRootEnv) -> PathBuf {
 /// The durable data root from the ambient environment.
 pub fn durable_data_dir() -> PathBuf {
     resolve_data_root(&DataRootEnv::from_ambient())
+}
+
+/// Ambient environment inputs to daemon **state**-dir resolution (pidfiles,
+/// logs, `wake.sock`). Pure struct so resolution is unit-testable without
+/// mutating the process-global env — mirrors [`DataRootEnv`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StateDirEnv {
+    pub xdg_state_home: Option<PathBuf>,
+    pub home: Option<PathBuf>,
+}
+
+impl StateDirEnv {
+    /// Snapshot the ambient environment.
+    pub fn from_ambient() -> Self {
+        Self {
+            xdg_state_home: env_non_empty("XDG_STATE_HOME"),
+            home: env_non_empty("HOME"),
+        }
+    }
+}
+
+/// Resolve the daemon STATE dir (distinct from the data root):
+/// `$XDG_STATE_HOME/toron` > `~/.local/state/toron`. Last resort is the
+/// relative `toron-state` name the CLI always used.
+///
+/// The single derivation for state-side discovery (ADR-0036 Spec 2,
+/// bd-ewsi): pidfiles, logs, and `wake.sock` resolve through here — the
+/// serve-side sidecar bind and the consumer-side discoveries (toron-cli
+/// slice B, doorbell `discover_from`) share it, so producer and consumers
+/// cannot disagree about the path by construction. Deriving independently
+/// is the exact starvation this closes: every consumer dialed
+/// `$XDG_STATE_HOME/toron/wake.sock` while nothing served it.
+pub fn resolve_state_dir(env: &StateDirEnv) -> PathBuf {
+    if let Some(dir) = &env.xdg_state_home {
+        return dir.join("toron");
+    }
+    if let Some(home) = &env.home {
+        return home.join(".local").join("state").join("toron");
+    }
+    PathBuf::from("toron-state")
+}
+
+/// The daemon state dir from the ambient environment.
+pub fn state_dir() -> PathBuf {
+    resolve_state_dir(&StateDirEnv::from_ambient())
 }
 
 /// Root-level file dir for a mailbox `data_dir` (bd-m5ym).
@@ -269,6 +315,30 @@ pub fn resolve_passphrase(
 
 #[cfg(test)]
 mod tests {
+    /// ADR-0036 Spec 2 (bd-ewsi): state-dir resolution — XDG wins, HOME
+    /// falls back, neither keeps the historical relative name. Pure (env
+    /// passed in): no set_var, no ambient reads.
+    #[test]
+    fn state_dir_resolution_prefers_xdg_then_home() {
+        let xdg = StateDirEnv {
+            xdg_state_home: Some("/xdg".into()),
+            home: Some("/h".into()),
+        };
+        assert_eq!(resolve_state_dir(&xdg), PathBuf::from("/xdg/toron"));
+        let home = StateDirEnv {
+            xdg_state_home: None,
+            home: Some("/h".into()),
+        };
+        assert_eq!(
+            resolve_state_dir(&home),
+            PathBuf::from("/h/.local/state/toron")
+        );
+        assert_eq!(
+            resolve_state_dir(&StateDirEnv::default()),
+            PathBuf::from("toron-state")
+        );
+    }
+
     use super::*;
     use std::sync::atomic::{AtomicU32, Ordering};
 

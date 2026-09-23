@@ -24,21 +24,13 @@ use std::process::Command;
 use std::time::Duration;
 
 /// Default state dir: `$XDG_STATE_HOME/toron` else `~/.local/state/toron`.
+///
+/// Delegates to [`toron_core::config::state_dir`] — the ONE derivation the
+/// serve-side wake sidecar and every consumer's discovery share (ADR-0036
+/// Spec 2; bd-ewsi). Two sides deriving independently is the disagreement
+/// that starved wake.sock: consumers dialed a path no serve ever bound.
 pub fn default_state_dir() -> PathBuf {
-    if let Ok(xdg) = std::env::var("XDG_STATE_HOME")
-        && !xdg.is_empty()
-    {
-        return PathBuf::from(xdg).join("toron");
-    }
-    if let Ok(home) = std::env::var("HOME")
-        && !home.is_empty()
-    {
-        return PathBuf::from(home)
-            .join(".local")
-            .join("state")
-            .join("toron");
-    }
-    PathBuf::from("toron-state")
+    toron_core::config::state_dir()
 }
 
 /// The daemon passphrase file: first config-home candidate.
