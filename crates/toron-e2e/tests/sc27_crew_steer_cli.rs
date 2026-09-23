@@ -72,11 +72,19 @@ fn toron_bin() -> PathBuf {
 /// program name so the "no flywheel binary invoked" assert is exact.
 fn run(data_dir: &Path, args: &[&str]) -> Output {
     SPAWNED.lock().unwrap().push("toron".to_string());
+    // bd-nepl: pin discovery to an absent sock for every child. Since
+    // `serve` holds the machine `$state/wake.sock`, an unpinned watch/wait
+    // child would attach to that FOREIGN daemon, spend its whole timeout on
+    // events this test dir never produces, and skip the in-process replay
+    // path the test actually asserts (was green pre-sidecar, red after).
+    let absent = std::env::temp_dir().join(format!("toron-e2e-absent-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&absent);
     Command::new(toron_bin())
         .args(args)
         .arg("--json")
         .arg("--no-input")
         .env("TORON_MCP_DATA_DIR", data_dir)
+        .env("TORON_WAKE_SOCK", &absent)
         .output()
         .expect("spawn toron")
 }

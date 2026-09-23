@@ -42,8 +42,22 @@ fn env_ms(name: &str, fallback: Duration) -> Duration {
 /// Where the daemon sidecar listens (ADR-0036 Spec 7). Env read only —
 /// no I/O, safe to call anywhere.
 pub fn discover_sock_path() -> PathBuf {
+    // bd-nepl test seam: unit tests pin an absent path here so they never
+    // attach to a real machine daemon now that `serve` holds the state-dir
+    // socket (their own-bus wakes would never arrive on a foreign socket).
+    // The OnceLock is dormant in production — only the cfg(test) setter
+    // (parked just above the test module) can set it — and the crate's
+    // `forbid(unsafe_code)` rules out env mutation as the alternative.
+    if let Some(p) = WAKE_SOCK_TEST_PIN.get() {
+        return p.clone();
+    }
     discover_from(std::env::var(WAKE_SOCK_ENV).ok())
 }
+
+/// Test-binary pin backing the seam in [`discover_sock_path`]. Unconditional
+/// (prod reads it, always `None`); the setter is cfg(test) and lives above
+/// the test module so the wake_tail layout gate keeps its prod slice.
+static WAKE_SOCK_TEST_PIN: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 
 /// Pure discovery core: explicit override wins, else the daemon state
 /// dir. Tested without touching the process env (no `set_var`:)
@@ -386,6 +400,16 @@ pub fn format_sock_line(ev: &SockEvent) -> String {
         &ev.tags,
         ev.created_at,
     )
+}
+
+/// Pin discovery to one path for this test binary (an absent temp file →
+/// loud connect failure → the in-process fallback the tests exercise).
+/// Parked here, not next to the static: `wake_tail_mapping_is_shared_not_copied`
+/// splits prod at the first cfg(test) attribute, which must land after the
+/// formatter wiring and before the test module's `json!` fixtures.
+#[cfg(test)]
+pub(crate) fn pin_wake_sock_for_tests(path: PathBuf) {
+    let _ = WAKE_SOCK_TEST_PIN.set(path);
 }
 
 #[cfg(test)]

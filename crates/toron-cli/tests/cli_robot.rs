@@ -1677,49 +1677,75 @@ fn watch_once_catches_cross_process_post() {
         String::from_utf8_lossy(&created.stderr)
     );
 
-    // Process 1: watch --once (listening on the shared durable root).
-    let watch = toron()
-        .env("TORON_MCP_DATA_DIR", plane_data_dir())
-        .args([
-            "watch",
-            "--project",
-            "demo",
-            "--as",
-            "TestAgent",
-            "--kinds",
-            "9",
-            "--channel",
-            &id,
-            "--once",
-            "--timeout-ms",
-            "15000",
-        ])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .expect("spawn watch");
+    // bd-nepl harness (mirrors toron-e2e sc32, bd-hs8y): the test process
+    // holds a WakeServer over the SHARED plane bus and the watch child
+    // connects to it via TORON_WAKE_SOCK (socket-first, wave 4). The post
+    // goes through the harness bus: a CLI post child's in-process bus dies
+    // with the process — the wave-3 sqlite pump that bridged it is deleted —
+    // so only the socket half can be cross-process, which is production's
+    // shape (watch children consume the daemon-held socket, never a peer's
+    // ephemeral bus).
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    let (server, watch, post_err) = rt.block_on(async {
+        let mailbox = plane_mailbox().await.expect("plane mailbox");
+        // UDS paths must fit SUN_LEN: short pid-keyed socket beside temp.
+        // Stale files are taken over by WakeServer, never blindly deleted.
+        let sock =
+            std::env::temp_dir().join(format!("toron-cli-watch-{}.sock", std::process::id()));
+        let server = toron_core::bus::wake::WakeServer::new(
+            toron_core::bus::wake::WakeConfig::new(&sock),
+            mailbox.bus().clone(),
+            std::sync::Arc::new(toron_core::bus::wake::SystemClock),
+        )
+        .start()
+        .await
+        .expect("harness wake.sock");
 
-    // Give the watcher time to open its bus + subscription.
-    std::thread::sleep(std::time::Duration::from_millis(800));
+        // Process 1: watch --once (socket-first at the harness socket).
+        let watch = toron()
+            .env("TORON_MCP_DATA_DIR", plane_data_dir())
+            .env("TORON_WAKE_SOCK", &sock)
+            .args([
+                "watch",
+                "--project",
+                "demo",
+                "--as",
+                "TestAgent",
+                "--kinds",
+                "9",
+                "--channel",
+                &id,
+                "--once",
+                "--timeout-ms",
+                "15000",
+            ])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn watch");
 
-    // Process 2: post on the same root.
-    let posted = plane_run(&[
-        "channel",
-        "post",
-        &id,
-        "--body",
-        "seen by watch",
-        "--project",
-        "demo",
-        "--as",
-        "TestAgent",
-        "--json",
-    ]);
-    assert!(
-        posted.status.success(),
-        "post: {}",
-        String::from_utf8_lossy(&posted.stderr)
-    );
+        // Give the watcher time to connect + subscribe.
+        std::thread::sleep(std::time::Duration::from_millis(800));
+
+        // Process 2's post, through the harness-held bus: the same kind-9
+        // event `channel post` signs (t = project, h = channel id), so the
+        // watch gate sees a real channel post, not a test-shaped frame.
+        let keys = toron_core::keys::generate();
+        let ev = toron_core::nostr::event::build_event(
+            &keys,
+            toron_core::nostr::kinds::toron_kind(9),
+            "seen by watch",
+            vec![
+                toron_core::nostr::Tag::parse(["t", "demo"]).expect("t tag"),
+                toron_core::nostr::Tag::parse(["h", &id]).expect("h tag"),
+            ],
+            toron_core::nostr::Timestamp::now(),
+        )
+        .expect("sign kind-9");
+        let post = mailbox.bus().publish(ev).await.map_err(|e| e.to_string());
+        (server, watch, post)
+    });
+    assert!(post_err.is_ok(), "harness publish: {post_err:?}");
 
     let out = watch.wait_with_output().expect("watch completes");
     assert!(
@@ -1734,6 +1760,9 @@ fn watch_once_catches_cross_process_post() {
         serde_json::json!("seen by watch"),
         "watched the posted content"
     );
+    // Held across the child's wait on purpose: dropping the handle removes
+    // the socket file (RAII), and the watcher must die on its own first.
+    drop(server);
 }
 
 #[test]

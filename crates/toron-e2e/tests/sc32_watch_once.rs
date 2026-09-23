@@ -48,11 +48,19 @@ fn toron_bin() -> PathBuf {
 }
 
 fn run(data_dir: &Path, args: &[&str]) -> Output {
+    // bd-nepl: pin discovery to an absent sock for every child (the
+    // socket-phase proof lives in `spawn_watch`, which points at the
+    // test-held WakeServer). Unpinned, the replay-phase watch below would
+    // attach to the machine daemon's `$state/wake.sock` and never read this
+    // test dir's stored post — foreign-socket starvation, not the ADR path.
+    let absent = std::env::temp_dir().join(format!("toron-e2e-absent-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&absent);
     Command::new(toron_bin())
         .args(args)
         .arg("--json")
         .arg("--no-input")
         .env("TORON_MCP_DATA_DIR", data_dir)
+        .env("TORON_WAKE_SOCK", &absent)
         .output()
         .expect("spawn toron")
 }
