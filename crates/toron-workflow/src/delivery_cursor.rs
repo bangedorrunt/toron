@@ -208,6 +208,60 @@ impl DeliveryCursorStore {
     }
 }
 
+
+/// RAII guard for [`DeliveryCursorStore::reserve_undelivered`] reservations
+/// (GS-062 INFLIGHT-RESERVATION-LEAK).
+///
+/// On Drop (cancel/panic/early return) releases in-flight ids so they are
+/// retryable. Call [`Self::commit`] after successful publish to mark delivered
+/// and disarm the release.
+pub struct ReservationGuard<'a> {
+    store: &'a DeliveryCursorStore,
+    session: SessionId,
+    ids: Vec<DeliveryId>,
+    armed: bool,
+}
+
+impl<'a> ReservationGuard<'a> {
+    /// Take ownership of `ids` already reserved under `session`.
+    pub fn new(
+        store: &'a DeliveryCursorStore,
+        session: impl Into<String>,
+        ids: Vec<DeliveryId>,
+    ) -> Self {
+        Self {
+            store,
+            session: session.into(),
+            ids,
+            armed: true,
+        }
+    }
+
+    /// Reserved ids (read-only).
+    pub fn ids(&self) -> &[DeliveryId] {
+        &self.ids
+    }
+
+    /// Mark reserved ids delivered and disarm (Drop will not release).
+    pub fn commit(mut self) {
+        if self.armed {
+            self.store
+                .mark_delivered(&self.session, self.ids.iter().cloned());
+            self.armed = false;
+        }
+    }
+}
+
+impl Drop for ReservationGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.store
+                .release_reservation(&self.session, self.ids.iter().cloned());
+            self.armed = false;
+        }
+    }
+}
+
 /// Pure helper: reject agent-key-as-seen heuristic — signing key ≠ delivery.
 pub fn agent_key_is_not_delivery_proof(_agent_pubkey_hex: &str, _event_id: &str) -> bool {
     // Intentionally always true as a documentation assertion for callers:
@@ -365,5 +419,50 @@ mod tests {
         }
         assert_eq!(*winners.lock().expect("winners"), 1);
         assert!(store.cursor(session).delivered.contains(id));
+    }
+
+    /// GS-062 INFLIGHT-RESERVATION-LEAK: Drop clears in_flight without mark.
+    #[test]
+    fn reservation_guard_drop_releases_inflight() {
+        let store = DeliveryCursorStore::new();
+        let session = "sess-guard";
+        let id = "parent-guard";
+        let (keep, _) = store.reserve_undelivered(session, [id]);
+        assert_eq!(keep, vec![id]);
+        {
+            let _g = ReservationGuard::new(&store, session, keep);
+            assert!(store.cursor(session).in_flight.contains(id));
+        }
+        assert!(
+            !store.cursor(session).in_flight.contains(id),
+            "Drop must clear in_flight"
+        );
+        assert!(!store.cursor(session).delivered.contains(id));
+        // Reservable again after Drop.
+        let (keep2, _) = store.reserve_undelivered(session, [id]);
+        assert_eq!(keep2, vec![id]);
+        let g = ReservationGuard::new(&store, session, keep2);
+        g.commit();
+        assert!(store.cursor(session).delivered.contains(id));
+        assert!(store.cursor(session).in_flight.is_empty());
+    }
+
+    /// GS-062 INFLIGHT-RESERVATION-LEAK: unwind/panic path clears via Drop.
+    #[test]
+    fn reservation_guard_drop_on_panic_unwind() {
+        let store = Arc::new(DeliveryCursorStore::new());
+        let session = "sess-panic";
+        let id = "parent-panic";
+        let (keep, _) = store.reserve_undelivered(session, [id]);
+        let store2 = store.clone();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _g = ReservationGuard::new(store2.as_ref(), session, keep);
+            panic!("simulated cancel between reserve and mark");
+        }));
+        assert!(result.is_err());
+        assert!(
+            !store.cursor(session).in_flight.contains(id),
+            "panic Drop must clear in_flight"
+        );
     }
 }
