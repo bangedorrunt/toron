@@ -1088,8 +1088,51 @@ mod tests {
         }
     }
 
-    async fn count_events(sink: &PolicySink) -> usize {
-        sink.lock().await.len()
+    /// bd-0lyz: resume/catchup dedup is about tick IDENTITY, not a raw
+    /// event count. The old `count == 1` misread a legitimate later minute
+    /// boundary that landed inside the observation window while the suite
+    /// ran under workspace-parallel load as a duplicate. A re-fired tick,
+    /// any tick predating the caught-up one (a catchup burst), or any
+    /// repeated tick still fails here.
+    fn assert_no_duplicate_ticks(ticks: &[i64], first: i64, phase: &str) {
+        assert!(!ticks.is_empty(), "{phase}: no tick recorded");
+        assert_eq!(
+            ticks[0], first,
+            "{phase}: first event must be the caught-up tick (ticks: {ticks:?})"
+        );
+        let mut seen = std::collections::BTreeSet::new();
+        for t in ticks {
+            assert!(
+                seen.insert(*t),
+                "{phase}: tick {t} fired twice (ticks: {ticks:?})"
+            );
+            assert!(
+                *t >= first,
+                "{phase}: tick {t} predates the caught-up {first} — catchup burst? (ticks: {ticks:?})"
+            );
+        }
+    }
+
+    /// The load scenario that broke the old count assertion (bd-0lyz): a
+    /// real minute boundary lands inside the observation window.
+    #[test]
+    fn later_boundary_is_not_a_duplicate() {
+        assert_no_duplicate_ticks(&[120], 120, "resume");
+        assert_no_duplicate_ticks(&[120, 180], 120, "resume");
+    }
+
+    /// A resume re-firing the caught-up tick still fails loud.
+    #[test]
+    #[should_panic(expected = "fired twice")]
+    fn re_fired_tick_fails_loud() {
+        assert_no_duplicate_ticks(&[120, 120], 120, "resume");
+    }
+
+    /// An earlier missed tick surfacing (catchup burst) still fails loud.
+    #[test]
+    #[should_panic(expected = "catchup burst")]
+    fn earlier_burst_tick_fails_loud() {
+        assert_no_duplicate_ticks(&[120, 60], 120, "resume");
     }
 
     /// bd-e03q RED (ADR-0035 Spec 4): the registry is queried fresh on
@@ -1199,11 +1242,11 @@ steps:
         // Re-start (same run id) → resume, NO duplicate dispatch for the tick.
         manager.start().await.expect("resume");
         tokio::time::sleep(Duration::from_secs(3)).await;
-        assert_eq!(
-            count_events(&sink).await,
-            1,
-            "no duplicate tick after resume"
-        );
+        let ticks: Vec<i64> = {
+            let guard = sink.lock().await;
+            guard.iter().map(|e| e.tick).collect()
+        };
+        assert_no_duplicate_ticks(&ticks, t1, "resume");
 
         // Downtime: kill the server, wait past the NEXT tick boundary, reboot
         // (same sqlite dir) + new engine → the loop resumes and catchup
@@ -1244,22 +1287,11 @@ steps:
             event2.tick
         );
         tokio::time::sleep(Duration::from_secs(3)).await;
-        let (ticks, n) = {
+        let ticks: Vec<i64> = {
             let guard = sink2.lock().await;
-            (
-                guard
-                    .iter()
-                    .map(|e| (e.tick, unix_now()))
-                    .collect::<Vec<_>>(),
-                guard.len(),
-            )
+            guard.iter().map(|e| e.tick).collect()
         };
-        assert_eq!(
-            n,
-            1,
-            "exactly one catch-up tick (events: {ticks:?}, next_tick={next_tick}, now={})",
-            unix_now()
-        );
+        assert_no_duplicate_ticks(&ticks, next_tick, "post-restart catchup");
 
         let _ = server.kill();
         let _ = server.wait();
