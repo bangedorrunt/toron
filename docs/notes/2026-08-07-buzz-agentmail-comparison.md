@@ -330,7 +330,7 @@ Pointer: **ADR-0003 Revision 9** (leverage/backlog refresh — not a protocol re
 
 ### New P0/P1 from 2026-08→09 Buzz (this ship)
 
-- **P0** busy-owner bound+fence+deadline wake (#7337/#7340); verify-before-route tripwires (#7010)
-- **P1** convergence fail-closed (#7298/#7532, SQLite); workflow delete honesty (#7735); delivery-cursor dedup (#7620); wake quiet/deaf telemetry (#7546 pattern)
+- **P0** busy-owner bound+fence+deadline wake (#7337/#7340) — **library wedge / not on live path** (`try_acquire` still live); verify-before-route tripwires (#7010) — wired
+- **P1** convergence / `presence_admit` (#7298/#7532, SQLite) — library + hardcoded `presence_admit(true)` (do **not** claim fail-closed presence shipped); workflow delete honesty (#7735) / delivery-cursor (#7620) — pure modules without host call sites; wake quiet/deaf (#7546) — toron `WakeStats` only; flywheel classifier on `gs-061/wake-liveness`
 
 Do **not** invent-green LIVE features beyond what the code + tests now prove. Historical body of this note is unchanged.
