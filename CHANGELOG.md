@@ -6,6 +6,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Docs
+- ADR-0003 **Rev9** Buzz GS-061 leverage refresh (Prior Art steal/adapt/reject + ranked P0/P1/P2 as-is→to-be; explicit REJECT list). Scout path + Buzz tip `d01e5f82…`. Docs only for the ADR/note; P0/P1 code wedges land in the same ship under Unreleased/Added.
+- `docs/notes/2026-08-07-buzz-agentmail-comparison.md` — GS-061 delta section (landed L2/L4/L5; open L1/L3/L6; new P0/P1).
+
+### Added
+- **P0 dispatch fence** (Buzz #7337/#7340): `toron_core::busy_owner` pure core + `DispatchPool::{try_acquire_fenced,fork_rebind,deadline_wake}` — busy-owner hold bound, generation fence, deadline wake (journaled Sleep; settlement ≠ provider done). No ACP/stdio port.
+- **P0 verify-before-route tripwires** (Buzz #7010): `bus::verify_tripwire` stage-order + forge tests; source-order assert that `verify_publish_event` precedes store insert/fanout.
+- **P1 convergence** (Buzz #7298/#7532 pattern, SQLite): `bus::convergence` Commit-only FireLive + re-add fence; `presence_admit` fail-closed before ephemeral fanout (no Redis).
+- **P1 workflow delete honesty** (Buzz #7735): `WorkflowLifecycle::soft_delete` clears executable under one lock.
+- **P1 delivery-cursor dedup** (Buzz #7620): `DeliveryCursorStore` session-scoped; agent-key ≠ delivery proof.
+- **P1 wake quiet vs deaf**: `WakeStats::{heartbeats_ok,heartbeat_deaf}` (ADR-0036); flywheel `wake_liveness` classifier on sibling branch when required.
+
 ### Added
 - Engine run-path journal honesty (ADR-0032 Spec 6, `bd-engine-run-path-journaling-fwlx`): an effectful host-sink leaf dispatched with no injected `EffectRunner` is now marked `EFFECT_JOURNAL_BYPASSED` (`bypassed-no-effect-runner`) on its step value instead of falling through to the compat runner unflagged, and a sink an injected runner does not cover is marked `EFFECT_JOURNAL_SINK_UNCOVERED` (`bypassed-sink-uncovered`) — two markers because they are two gaps with two different fixes. Both warn loudly with the reason. Pure and engine-control leaves pass through untouched. (Since the flip below, the engine only ever emits the first: every reason a HostSink leaf can fall through is now "no runner injected". `EFFECT_JOURNAL_SINK_UNCOVERED` remains part of the contract for HOST runners that cover only some of their sinks.)
 - The fail-closed half landed (`bd-engine-run-path-journaling-fwlx`, the same record): the engine now carries an explicit `EffectJournalMode`. `Recording` (default) keeps the bypass/uncovered markers for arms that record instead of perform; `Enforced` REFUSES an effectful host sink with no injected runner, so a dispatcher that really performs effects cannot run one nobody journaled. Both embeddings construct `Enforced` where they really dispatch (`flywheel/src/pane.rs`, `flywheel/src/cron.rs`, `toron-mcp/src/workflow_host.rs`) and `Recording` on the dry arms.
