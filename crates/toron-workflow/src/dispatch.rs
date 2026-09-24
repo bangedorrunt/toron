@@ -46,7 +46,12 @@ pub struct QueuedJob {
 pub struct DispatchConfig {
     /// Global max in-flight jobs (bounded semaphore).
     pub max_concurrency: usize,
-    /// Busy-owner hold bound (ms) — Buzz #7337/#7340; 0 disables timed hold.
+    /// Busy-owner hold bound (ms) — Buzz #7337/#7340.
+    ///
+    /// `0` is a **zero-length** bound: a busy agent still emits
+    /// `SleepUntilDeadline` with `until_ms == now_ms` (immediate wake /
+    /// `HoldExpired` on the next deadline check). It does **not** disable
+    /// the hold path or convert busy→reject-without-window.
     pub hold_bound_ms: u64,
 }
 
@@ -182,6 +187,12 @@ impl DispatchPool {
     /// When the agent is busy, returns `Err(effects)` containing
     /// `SleepUntilDeadline` / `HoldContinued` / `HoldExpired` / `FencedStale`
     /// — the host journals Sleep (Resonate park); settlement ≠ provider done.
+    ///
+    /// `Err([])` (empty vec) means **race-loss after rollback**: the busy-owner
+    /// model had already emitted `Acquired` and inserted a holder, but the
+    /// global/agent semaphore `try_acquire` then failed; the holder is released
+    /// so holders and `in_flight` stay in lockstep. No journalable busy-owner
+    /// effect remains — callers treat empty as "retry later / cap contention".
     pub fn try_acquire_fenced(
         &self,
         agent: &str,
