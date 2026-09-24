@@ -308,3 +308,29 @@ long bets (ATC vs Forge) based on whether the priority is *smarter agents* (ATC)
   "project", `1630`=Open-status not "CI-passed"; only `46011` is toron-custom).
 
 // governed-by: ADR-0003
+
+---
+
+## GS-061 delta (2026-09-24)
+
+Scout: `/home/box/agent-data/grok-ship/reports/GS-061.md` · Buzz tip `d01e5f82…`.
+Pointer: **ADR-0003 Revision 9** (leverage/backlog refresh — not a protocol rewrite).
+
+### Aug-07 L-items — landed vs open @ toron tip `b514dea9`
+
+| ID | Theme | Status |
+|----|-------|--------|
+| L2 | Mention coalescing | **LANDED** (`MentionCoalescer`; CHANGELOG Ship 1) |
+| L4 | Workflow `if:` guards + 100ms | **LANDED** (`guard.rs`) |
+| L5 | Loop-prevention | **LANDED** (`trigger_filter`) |
+| L1 | `toron-audit` hash-chain | **OPEN** (Buzz TLV #7492 refreshes encoding) |
+| L3 | Forge / NIP-34 | **OPEN / epic** (captain kinds gate; ADR-0033 freeze) |
+| L6 | Ingress isolation (reject before store) | **PARTIAL** — verify-before-route tripwires landed GS-061; projection-side still weaker than Buzz relay ingress |
+| L7–L9 | Push / voice / relay-mesh | **REJECT (scope)** |
+
+### New P0/P1 from 2026-08→09 Buzz (this ship)
+
+- **P0** busy-owner bound+fence+deadline wake (#7337/#7340) — **library wedge / not on live path** (`try_acquire` still live); verify-before-route tripwires (#7010) — wired
+- **P1** convergence / `presence_admit` (#7298/#7532, SQLite) — library + hardcoded `presence_admit(true)` (do **not** claim fail-closed presence shipped); workflow delete honesty (#7735) / delivery-cursor (#7620) — pure modules without host call sites; wake quiet/deaf (#7546) — toron `WakeStats` only; flywheel classifier on `gs-061/wake-liveness`
+
+Do **not** invent-green LIVE features beyond what the code + tests now prove. Historical body of this note is unchanged.

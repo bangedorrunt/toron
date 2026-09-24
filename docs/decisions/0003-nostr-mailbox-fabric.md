@@ -2,7 +2,7 @@
 status: accepted
 date: 2026-08-04
 accepted: 2026-08-04
-revision: 8
+revision: 9
 decision-makers: bangedorrunt (captain)
 consulted: ""
 informed: ""
@@ -16,6 +16,16 @@ related: [flywheel, herdr, mcp_agent_mail_rust, nostrdevkit/nostr]
 > `mcp_agent_mail_rust` ("AM-Rust") feature-parity contract, the herdr backend
 > protocol, the flywheel integration contract, and the dependency-direction
 > analysis so a future agent can implement without external lookups.
+>
+> **Revision 9 (2026-09-24):** GS-061 Buzz leverage refresh. Scout:
+> `/home/box/agent-data/grok-ship/reports/GS-061.md` (SHA256
+> `1749f2b442c4a941b94976f97656c55aabd3a61b87027111f43c2a62dae18e13`); Buzz tip
+> `d01e5f82058463709a22e93bb4cd795da5f53e10`. Prior Art & Leverage (block/buzz)
+> updated with steal/adapt/reject + ranked P0/P1/P2 backlog (as-is → to-be).
+> Accepted decisions unchanged — leverage/backlog refresh, not a protocol rewrite.
+> Does **not** invent kinds; does **not** claim P0 wedges were already LIVE before
+> this ship. Explicit REJECT: Redis/Postgres mesh, NIP-FI runtime, push/UX, ACP
+> port, AgentServer/OTP, casual kinds, Forge without captain.
 >
 > **Revision 8 (2026-08-24):** rust-nostr **0.45.x is stable**. Pin is now
 > `nostr-sdk` 0.45.2 + `nostr` 0.45.3 (`nip44`/`nip49`/`nip59`/`os-rng`).
@@ -660,6 +670,72 @@ already exceeds.
   table-name allowlist.
 - **Multi-tenant** — community = workspace by request host; fail-closed on
   unknown hosts; NIP-98 stamps must agree with host-derived community.
+
+
+### GS-061 refresh (2026-09-24) — steal / adapt / reject
+
+Grounded in Buzz tip `d01e5f82058463709a22e93bb4cd795da5f53e10` and PRs cited by the GS-061 scout. Effect vocabulary
+only (composability, explicit boundaries, honesty at I/O). **No ACP port.**
+
+#### Steal
+| Buzz (PR) | Toron effect | As-is → to-be |
+|---|---|---|
+| Busy-owner hold bound + generation fence (#7337/#7340) | `BusyOwnerModel` + `DispatchPool::try_acquire_fenced` / `fork_rebind` / `deadline_wake` (library; live path still `try_acquire`) | A7 semaphore only → timed hold + gen fence + journaled SleepUntilDeadline (settlement ≠ provider done) |
+| Verify-before-route (#7010) | Ingress `verify_publish_event` + `verify_tripwire` | Likely present → tripwire tests fail if verify moves after stamp-seen/fanout |
+| Audit TLV framing (#7492) | Encoding for future `toron-audit` (L1) | Git-only → TLV field tags when captain authorizes L1 |
+| Workflow deletion honesty (#7735) | `WorkflowLifecycle::soft_delete` under one lock | Soft-delete + clear executable atomically — no ghost runnable |
+| Delivery-cursor dedup (#7620) | `DeliveryCursorStore` session-scoped | Replace agent-key-signed⇒seen heuristics in prompt/mention context |
+| Ephemeral excluded from durable quota (#7736) | Budget policy (doorbell/bus) | Confirm presence 20001 not counted in durable backpressure |
+
+#### Adapt
+| Buzz (PR) | Toron map | Constraint |
+|---|---|---|
+| Kick convergence (#7298) + presence fail-closed (#7532) | `bus::convergence` + `presence_admit` on SQLite | **Never Redis**; library gate exists — live fanout still calls `presence_admit(true)` (hardcoded); real confirm bit = ask-user |
+| Newest-first thread windows (#7823) + read-state snapshots (#7572) | Query shape honesty for mention/session context | Effect-oriented; **no chat-UX clone** |
+| NIP-29 extract (#7285) | Pure membership core (channels already membership-gated) | Keep testable; no admin HTTP sprawl |
+| Correlated OK false (#6961) | Refuse with reason at ingress (no silent drop) | Already BusError path; keep correlated |
+| npub foundation (#7488–#7495) | Tighten display/parse gates | Toron already Nostr-native |
+| ifc-core (#7293) | Vocabulary only (effects carry authority/label) | Do **not** bolt lattice runtime onto Tick Law |
+| Wake recovery telemetry (#7546) | `WakeStats::{heartbeats_ok,heartbeat_deaf}` quiet vs deaf | ADR-0036 wake.sock; no second broker |
+
+#### Ranked backlog (captain bar: as-is → to-be)
+
+**P0**
+| Item | As-is | To-be | Status @ GS-061 ship |
+|---|---|---|---|
+| Busy-owner bound + gen fence + deadline wake | Semaphore / one-in-flight | Timed hold + fence + SleepUntilDeadline effects | **Library wedge / not on live path** — pure `busy_owner` + `try_acquire_fenced` / Drop→Release exist; **live `DispatchPool` callers still use `try_acquire`** (cutover is ask-user with captain) |
+| Verify-before-route tripwires | Verify first in publish | Stage-order + forge tripwires | **Landed** (tripwire tests on publish path) |
+
+**P1**
+| Item | As-is | To-be | Status |
+|---|---|---|---|
+| Convergence kick/revoke/disable | Best-effort projection | Commit-only FireLive + re-add fence | **Library wedge / not on live path** — pure `bus::convergence` module + unit tests; no host/engine call sites wiring Kick/FireLive |
+| Workflow delete honesty | Ad-hoc remove paths | Soft-delete + executable one lock | **Library wedge / not on live path** — `WorkflowLifecycle` pure module; not wired into engine delete paths |
+| Delivery-cursor dedup | Agent-key heuristics risk | Session delivery cursor | **Library wedge / not on live path** — `DeliveryCursorStore` pure module; not wired into prompt/mention hosts |
+| Wake quiet vs deaf telemetry | Heartbeat exists | Explicit heartbeats_ok / heartbeat_deaf + flywheel classifier | **Partial library** — `WakeStats` fields in toron; flywheel `wake_liveness` classifier is on sibling branch `gs-061/wake-liveness` — **do not claim flywheel module landed inside toron** |
+
+> Honesty note (Rev9 auto-fix): `presence_admit(true)` is hardcoded at the ephemeral fanout site — verify+auth today stand in for a real presence-authority confirm bit. **Do not claim Buzz #7532 fail-closed presence as live product behavior** until a confirm flag exists. Captain has not answered ask-user on fenced-acquire cutover vs library-only.
+
+**P2** (backlog only — not this ship)
+| Item | Notes |
+|---|---|
+| `toron-audit` TLV hash-chain (L1) | Captain authorize; no Postgres |
+| Per-agent session/policy scope (#7578) | Profile config explicit |
+| Publish-time mention authz (#7124) | NIP-29 groups ADR-0023 |
+| beads↔toron fail-closed create symmetry | Schema language only |
+
+#### Explicit REJECT
+1. Postgres + Redis + S3 relay mesh (incl. Redis presence #7532 dep)
+2. ACP / stdio agent harness as toron runtime (herdr+MCP; no AgentServer/OTP)
+3. buzz-push-gateway / Expo / APNs / FCM / voice / huddle
+4. buzz-relay-mesh as default topology
+5. NIP-FI production runtime (JWKS federation) without captain epic
+6. Desktop/mobile UX, canvas history, onboarding, age-gates
+7. Casual new Nostr kinds / NIP-MP 30621 / Forge wire without captain + ADR-0033 thaw
+8. Funnel / dual SoT / cloud KB (GS-053/054 locks)
+9. GS-054/055 Jev W1–W3 implement or ADR merges — **untouched**
+10. ifc-core lattice runtime on Tick — vocabulary only
+11. Databricks / Codex / Pi adapter forks
 
 ### Adopt (drop-in, proven)
 
