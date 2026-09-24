@@ -46,6 +46,7 @@ use toron_workflow::engine::{
     plan_attempt, terminal_digest, validate_resolution,
 };
 use toron_workflow::jobs::{JobRequest, build_job_request_with_tags};
+use toron_workflow::dispatch::{DispatchAcquire, DispatchConfig, DispatchPermit, DispatchPool};
 use toron_workflow::lifecycle::{LifecycleEffect, WorkflowLifecycle};
 use toron_workflow::schema::{Action, Trigger, Workflow};
 use toron_workflow::stamp_workflow_emitted;
@@ -127,6 +128,17 @@ async fn mention_outcome(
                 })),
                 Err(CoalescePublishError::NoSigner) => {
                     ProviderOutcome::ProvenFailed("no job signer configured".to_string())
+                }
+                Err(CoalescePublishError::AlreadyDelivered) => {
+                    // Idempotent cursor skip → Delivered/Settled (never Ambiguous→Unknown).
+                    ProviderOutcome::Delivered(serde_json::json!({
+                        "ok": true,
+                        "coalesced": false,
+                        "published": false,
+                        "skipped": true,
+                        "reason": "already delivered to session",
+                        "effect_key": key,
+                    }))
                 }
                 Err(CoalescePublishError::Transport(e)) => ProviderOutcome::Ambiguous(e),
             }
@@ -635,12 +647,58 @@ pub enum CoalescePublishError {
     NoSigner,
     /// The bus failed mid-publish: the job may or may not exist.
     Transport(String),
+    /// GS-062: DeliveryCursorStore determined skip (keep empty) — idempotent
+    /// already-delivered, NOT a bus failure. Maps to Delivered/Settled.
+    AlreadyDelivered,
 }
 
 /// Build + publish ONE kind-43001 for a coalesced mention burst (bd-ckkf):
 /// awaited inline on the caller's runtime — no scoped thread, no runtime
 /// bridge of any kind. Async contexts (the trigger loop, the async runner)
 /// all await this directly.
+
+/// GS-062 captain C: acquire a dispatch permit for a live host publish.
+/// Parks `SleepUntilDeadline` (journal/park + [`DispatchPool::deadline_wake`]);
+/// never uses the Option [`DispatchPool::try_acquire`] shim that maps fenced
+/// Err→None (e2e-only).
+pub async fn host_acquire_for_assignee<'a>(
+    pool: &'a DispatchPool,
+    assignee: &str,
+    now_ms: u64,
+) -> Result<DispatchPermit<'a>, String> {
+    let claimed_generation = pool.generation_of(assignee);
+    match pool.try_acquire_for_host(assignee, now_ms, claimed_generation) {
+        DispatchAcquire::Granted(permit) => Ok(permit),
+        DispatchAcquire::Park {
+            until_ms, effects, ..
+        } => {
+            // Journal/park SleepUntilDeadline (settlement ≠ provider done).
+            tracing::debug!(
+                assignee,
+                until_ms,
+                ?effects,
+                "host DispatchAcquire::Park — sleep then deadline_wake"
+            );
+            let wait_ms = until_ms.saturating_sub(now_ms).max(1);
+            tokio::time::sleep(std::time::Duration::from_millis(wait_ms.min(5_000))).await;
+            let wake_now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(until_ms);
+            let _ = pool.deadline_wake(assignee, wake_now);
+            let claimed_generation = pool.generation_of(assignee);
+            match pool.try_acquire_for_host(assignee, wake_now, claimed_generation) {
+                DispatchAcquire::Granted(permit) => Ok(permit),
+                other => Err(format!(
+                    "dispatch still unavailable after deadline_wake: {other:?}"
+                )),
+            }
+        }
+        DispatchAcquire::Refused(fx) => Err(format!("dispatch refused: {fx:?}")),
+        DispatchAcquire::CapContention => Err("dispatch cap contention".into()),
+    }
+}
+
 pub async fn publish_coalesced_job(
     bus: &dyn Bus,
     signer: Option<&Keys>,
@@ -675,9 +733,8 @@ pub async fn publish_coalesced_job_with_cursor(
             // Reserve all parents under the lock — do not advance delivered yet.
             let (keep, _) = store.reserve_undelivered(session, parent_ids.clone());
             if keep.is_empty() {
-                return Err(CoalescePublishError::Transport(
-                    "skip: already delivered to session (DeliveryCursorStore)".into(),
-                ));
+                // Idempotent skip: never Transport/Ambiguous/Unknown.
+                return Err(CoalescePublishError::AlreadyDelivered);
             }
             reserved = keep;
         }
@@ -759,6 +816,10 @@ pub struct WorkflowHost {
     /// so a late [`Self::with_effect_store`] attach also rewires sends).
     /// `None` on journal-less embeddings (direct sends).
     dispatcher: Arc<std::sync::Mutex<Option<EffectDispatcher>>>,
+    /// GS-062 captain C: live host acquire path. Arc-shared on Clone so the
+    /// trigger-loop host parks SleepUntilDeadline via try_acquire_for_host
+    /// (Option try_acquire remains e2e-only).
+    dispatch_pool: Arc<DispatchPool>,
 }
 
 impl std::fmt::Debug for WorkflowHost {
@@ -865,6 +926,7 @@ impl WorkflowHost {
             job_signer,
             pending: Arc::new(tokio::sync::Mutex::new(pending)),
             dispatcher,
+            dispatch_pool: Arc::new(DispatchPool::new(DispatchConfig::default())),
         })
     }
 
@@ -894,6 +956,7 @@ impl WorkflowHost {
             job_signer: None,
             pending: Arc::new(tokio::sync::Mutex::new(PendingDrain::new())),
             dispatcher: Arc::new(std::sync::Mutex::new(None)),
+            dispatch_pool: Arc::new(DispatchPool::new(DispatchConfig::default())),
         })
     }
 
@@ -919,6 +982,7 @@ impl WorkflowHost {
             job_signer: None,
             pending: Arc::new(tokio::sync::Mutex::new(PendingDrain::new())),
             dispatcher: Arc::new(std::sync::Mutex::new(None)),
+            dispatch_pool: Arc::new(DispatchPool::new(DispatchConfig::default())),
         }
     }
 
@@ -967,12 +1031,26 @@ impl WorkflowHost {
     /// Register an additional workflow (idempotent by name).
     /// GS-062: also registers with [`WorkflowLifecycle`] under one lock.
     pub fn add_workflow(&mut self, workflow: Workflow) {
+        // GS-062 lock order: NEVER call lifecycle.register while holding
+        // workflows — soft_delete takes lifecycle then workflows; opposite
+        // order on Arc Clone deadlocks. Register first, then workflows.
+        let name = workflow.name.clone();
+        {
+            let defs = self
+                .workflows
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if defs.iter().any(|w| w.name == name) {
+                return;
+            }
+        } // release workflows before lifecycle.register
+        let _ = self.lifecycle.register(name.clone());
         let mut defs = self
             .workflows
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        if !defs.iter().any(|w| w.name == workflow.name) {
-            let _ = self.lifecycle.register(workflow.name.clone());
+        // Re-check under lock so concurrent add_workflow cannot duplicate.
+        if !defs.iter().any(|w| w.name == name) {
             defs.push(workflow);
         }
     }
@@ -997,6 +1075,11 @@ impl WorkflowHost {
     /// Lifecycle registry (tests / diagnostics).
     pub fn lifecycle(&self) -> &WorkflowLifecycle {
         self.lifecycle.as_ref()
+    }
+
+    /// GS-062 captain C: live [`DispatchPool`] (try_acquire_for_host path).
+    pub fn dispatch_pool(&self) -> &DispatchPool {
+        self.dispatch_pool.as_ref()
     }
 
     /// Snapshot of registered workflow definitions (shared Arc registry).
@@ -1529,6 +1612,27 @@ impl WorkflowHost {
                     debug!("coalescer flushed {} assignee(s)", flushed.len());
                 }
                 for coalesced in flushed {
+                    // GS-062 captain C: live host DispatchAcquire before publish.
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+                    let permit = match host_acquire_for_assignee(
+                        self.dispatch_pool.as_ref(),
+                        &coalesced.assignee,
+                        now_ms,
+                    )
+                    .await
+                    {
+                        Ok(p) => p,
+                        Err(e) => {
+                            warn!(
+                                assignee = %coalesced.assignee,
+                                "coalesced burst deferred (dispatch acquire): {e}"
+                            );
+                            continue;
+                        }
+                    };
                     // GS-062: session delivery-cursor before kind-43001 publish.
                     match publish_coalesced_job_with_cursor(
                         self.bus.as_ref(),
@@ -1542,6 +1646,10 @@ impl WorkflowHost {
                             assignee = %coalesced.assignee, %id,
                             "kind-43001 published for coalesced burst"
                         ),
+                        Err(CoalescePublishError::AlreadyDelivered) => debug!(
+                            assignee = %coalesced.assignee,
+                            "kind-43001 skipped (already delivered to session)"
+                        ),
                         Err(CoalescePublishError::NoSigner) => warn!(
                             assignee = %coalesced.assignee,
                             "coalesced burst NOT published (no job signer configured)"
@@ -1551,6 +1659,7 @@ impl WorkflowHost {
                             "coalesced burst publish failed: {e:?}"
                         ),
                     }
+                    drop(permit); // release busy holder after publish CS
                 }
             }
             let defs = self.workflows.lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -5627,7 +5736,10 @@ steps:
         )
         .await
         .expect_err("fully delivered batch skips");
-        assert!(matches!(err, CoalescePublishError::Transport(_)));
+        assert!(
+            matches!(err, CoalescePublishError::AlreadyDelivered),
+            "idempotent skip must be AlreadyDelivered, not Transport, got {err:?}"
+        );
 
         let _ = std::fs::remove_file(&db);
     }
@@ -5691,10 +5803,15 @@ steps:
             Some(&delivery),
         )
         .await;
-        assert!(
-            matches!(out2, ProviderOutcome::Ambiguous(ref m) if m.contains("already delivered")),
-            "second FlushNow must skip via cursor, got {out2:?}"
-        );
+        match &out2 {
+            ProviderOutcome::Delivered(v) => {
+                assert_eq!(v["skipped"], serde_json::json!(true), "{v}");
+                assert_eq!(v["published"], serde_json::json!(false), "{v}");
+            }
+            other => panic!(
+                "second FlushNow skip must Delivered{{skipped:true}} (Settled), never Ambiguous/Unknown, got {other:?}"
+            ),
+        }
         let _ = std::fs::remove_file(&db);
     }
 
@@ -5765,6 +5882,100 @@ steps:
 
         let _ = std::fs::remove_file(&db);
     }
+
+
+    /// GS-062 captain C: live host acquire parks SleepUntilDeadline and
+    /// recovers via deadline_wake — Option try_acquire remains e2e-only.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn host_acquire_parks_then_deadline_wake() {
+        use toron_workflow::dispatch::{DispatchAcquire, DispatchConfig, DispatchPool};
+        let pool = DispatchPool::new(DispatchConfig {
+            max_concurrency: 2,
+            hold_bound_ms: 50,
+        });
+        let hold = pool
+            .try_acquire_fenced("oc", 10, 0)
+            .expect("first grant");
+        match pool.try_acquire_for_host("oc", 20, 0) {
+            DispatchAcquire::Park { until_ms, .. } => assert!(until_ms >= 20),
+            other => panic!("expected Park, got {other:?}"),
+        }
+        assert!(
+            pool.try_acquire("oc").is_none(),
+            "Option shim maps Sleep→None; live hosts must not use it"
+        );
+        drop(hold);
+        let _ = pool.deadline_wake("oc", 10_000);
+        let permit = host_acquire_for_assignee(&pool, "oc", 10_000)
+            .await
+            .expect("host acquire after wake");
+        drop(permit);
+    }
+
+    /// GS-062: add_workflow / soft_delete_workflow opposite lock order must not
+    /// deadlock on Clone'd hosts (register never while holding workflows).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn add_workflow_soft_delete_lock_order_no_deadlock() {
+        use std::sync::{Arc, Barrier};
+        use std::time::{Duration, Instant};
+        use toron_core::bus::in_process::{InProcessBus, InProcessBusConfig};
+        use toron_core::index::schema;
+        use toron_workflow::schema::Workflow;
+
+        let db = std::env::temp_dir().join(format!("wf-lock-{}.sqlite", uuid::Uuid::new_v4()));
+        let pool = schema::connect(db.to_str().unwrap())
+            .await
+            .expect("connect");
+        schema::migrate(&pool).await.expect("migrate");
+        let bus: Arc<dyn Bus> = Arc::new(
+            InProcessBus::open(pool, InProcessBusConfig::default())
+                .await
+                .expect("bus"),
+        );
+        let host = WorkflowHost::over_bus(bus, vec![], None).expect("host");
+        let host_a = host.clone();
+        let host_b = host.clone();
+        let barrier = Arc::new(Barrier::new(2));
+        let b1 = barrier.clone();
+        let b2 = barrier.clone();
+        let t0 = Instant::now();
+        let h1 = std::thread::spawn(move || {
+            b1.wait();
+            for i in 0..40 {
+                let wf = Workflow {
+                    name: format!("w-a-{i}"),
+                    description: None,
+                    trigger: None,
+                    policy: None,
+                    guard: None,
+                    principles: vec![],
+                    steps: vec![],
+                    graph: None,
+                    inputs: vec![],
+                    crew: None,
+                };
+                let mut h = host_a.clone();
+                h.add_workflow(wf);
+            }
+        });
+        let h2 = std::thread::spawn(move || {
+            b2.wait();
+            for i in 0..40 {
+                let mut h = host_b.clone();
+                let _ = h.soft_delete_workflow(&format!("w-a-{i}"));
+            }
+        });
+        h1.join().expect("add thread");
+        h2.join().expect("del thread");
+        assert!(
+            t0.elapsed() < Duration::from_secs(5),
+            "lock-order deadlock suspected"
+        );
+        let _ = std::fs::remove_file(&db);
+    }
+
+
+
 
     /// GS-062 ask-user B: Clone shares Arc definition registry — soft_delete
     /// visible to the cloned trigger-loop host (not a Vec copy).

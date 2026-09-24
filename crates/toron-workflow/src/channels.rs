@@ -478,10 +478,26 @@ impl ChannelStore {
                 else {
                     anyhow::bail!("legacy channel metadata lacks h tag");
                 };
+                // GS-062: leave/close HOLD after FireLive for in-process CS
+                // (captain A). apply_lifecycle is rebuild/replay — settle so
+                // replayed Kick does not permanently FenceReAdd joins.
+                // Live leave()/close() still hold; CLI/host settle after publish CS.
                 let applied = match ev.content.as_str() {
                     "join" => self.join(id, &ev.pubkey).is_ok(),
-                    "leave" => self.leave(id, &ev.pubkey).is_ok(),
-                    "close" => self.close(id, &ev.pubkey).is_ok(),
+                    "leave" => {
+                        let ok = self.leave(id, &ev.pubkey).is_ok();
+                        if ok {
+                            self.settle_authority(id);
+                        }
+                        ok
+                    }
+                    "close" => {
+                        let ok = self.close(id, &ev.pubkey).is_ok();
+                        if ok {
+                            self.settle_authority(id);
+                        }
+                        ok
+                    }
                     _ => false,
                 };
                 Ok(applied)
@@ -1055,6 +1071,53 @@ mod tests {
 
     /// GS-062: ReAdd under a held Kick generation is fenced at join
     /// (hold_authority_for_test helper; production path covered below).
+    
+    /// GS-062: apply_lifecycle leave settles authority so rebuild/replay does
+    /// not permanently FenceReAdd. Live leave() still holds until settle_authority.
+    #[test]
+    fn apply_lifecycle_leave_settles_authority() {
+        let alice = keys();
+        let bob = keys();
+        let create = build_event(
+            &alice,
+            toron_kind(CHANNEL_CREATE),
+            "",
+            vec![
+                Tag::parse(["d", "c"]).expect("d"),
+                Tag::parse(["name", "C"]).expect("name"),
+            ],
+            Timestamp::now(),
+        )
+        .expect("create");
+        let members = build_event(
+            &alice,
+            toron_kind(CHANNEL_MEMBERS),
+            serde_json::to_string(&vec![
+                alice.public_key().to_hex(),
+                bob.public_key().to_hex(),
+            ])
+            .expect("json"),
+            vec![Tag::parse(["h", "c"]).expect("h")],
+            Timestamp::now(),
+        )
+        .expect("members");
+        let leave = build_event(
+            &bob,
+            toron_kind(CHANNEL_METADATA_LEGACY),
+            "leave",
+            vec![Tag::parse(["h", "c"]).expect("h")],
+            Timestamp::now(),
+        )
+        .expect("leave");
+        let store = ChannelStore::rebuild([create, members, leave]).expect("rebuild");
+        assert!(!store.is_member("c", &bob.public_key()));
+        // apply_lifecycle settled — join must NOT permanent-fence.
+        store
+            .join("c", &bob.public_key())
+            .expect("join after apply_lifecycle leave must work (settled)");
+        assert!(store.is_member("c", &bob.public_key()));
+    }
+
     #[test]
     fn join_honors_readd_fence_under_held_kick() {
         let store = ChannelStore::new();

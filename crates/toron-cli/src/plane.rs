@@ -321,6 +321,9 @@ async fn channel_join(mailbox: &Mailbox, args: &ChannelJoinArgs) -> anyhow::Resu
 async fn channel_leave(mailbox: &Mailbox, args: &ChannelJoinArgs) -> anyhow::Result<()> {
     let keys = resolve_agent(mailbox, &args.project, &args.as_name).await?;
     let store = rebuild_store(mailbox, &args.project).await?;
+    // GS-062 captain A: leave() HOLDS authority after FireLive across the
+    // critical section (publish CS). settle_authority ends the CS — required
+    // so CLI leave does not permanently FenceReAdd (unlike in-process hold).
     store
         .leave(&args.id, &keys.public_key())
         .with_context(|| format!("leave {} as {}", args.id, args.as_name))?;
@@ -333,10 +336,13 @@ async fn channel_leave(mailbox: &Mailbox, args: &ChannelJoinArgs) -> anyhow::Res
         &members,
     )
     .await?;
+    // End of CS: settle after successful publish (captain A lock).
+    store.settle_authority(&args.id);
     print_json(&serde_json::json!({
         "channel_id": args.id,
         "member": keys.public_key().to_hex(),
         "event_id": ev.id.to_hex(),
+        "authority_settled": true,
     }))?;
     Ok(())
 }
@@ -375,6 +381,7 @@ async fn channel_close(mailbox: &Mailbox, args: &ChannelCloseArgs) -> anyhow::Re
     let ch = store
         .get(&args.id)
         .with_context(|| format!("channel not found: {}", args.id))?;
+    // GS-062 captain A: close() HOLDS Disable after FireLive across publish CS.
     store
         .close(&args.id, &keys.public_key())
         .with_context(|| format!("close channel {} as {}", args.id, args.as_name))?;
@@ -387,12 +394,15 @@ async fn channel_close(mailbox: &Mailbox, args: &ChannelCloseArgs) -> anyhow::Re
         ch.private,
     )
     .await?;
+    // End of CS: settle after successful publish (captain A lock).
+    store.settle_authority(&args.id);
     let _ = ch; // (kept: future closed-at bookkeeping)
     print_json(&serde_json::json!({
         "channel": args.id,
         "closed": true,
         "already_closed": ch.closed,
         "tombstone_id": ev.id.to_hex(),
+        "authority_settled": true,
     }))
 }
 
