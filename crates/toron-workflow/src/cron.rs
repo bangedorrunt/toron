@@ -1072,20 +1072,40 @@ mod tests {
         Some((server, std::sync::Arc::new(engine)))
     }
 
-    async fn wait_for_event(sink: &PolicySink, timeout_secs: u64) -> Option<PolicyEvent> {
+    /// bd-a6e5: a timeout returns the sink state (count + ticks) instead of a
+    /// bare `None`, so a load-starved miss self-names instead of panicking
+    /// message-free. Deadline uses `>=` so a 0s bound times out deterministically.
+    async fn wait_for_event(sink: &PolicySink, timeout_secs: u64) -> Result<PolicyEvent, String> {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
         loop {
             {
                 let guard = sink.lock().await;
                 if let Some(e) = guard.first() {
-                    return Some(e.clone());
+                    return Ok(e.clone());
                 }
             }
-            if std::time::Instant::now() > deadline {
-                return None;
+            if std::time::Instant::now() >= deadline {
+                let ticks: Vec<i64> = sink.lock().await.iter().map(|e| e.tick).collect();
+                return Err(format!(
+                    "no event after {timeout_secs}s; sink holds {} event(s), ticks={ticks:?}",
+                    ticks.len()
+                ));
             }
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         }
+    }
+
+    /// bd-a6e5: a timeout must NAME the sink state. The one miss in 21
+    /// isolated runs (33.56s, matching the old 30s bound under post-suspend
+    /// load) panicked with no diagnostic at all.
+    #[tokio::test]
+    async fn wait_for_event_timeout_names_the_sink_state() {
+        let sink = PolicySink::new();
+        let err = wait_for_event(&sink, 0)
+            .await
+            .expect_err("an empty sink must time out");
+        assert!(err.contains("no event after 0s"), "{err}");
+        assert!(err.contains("sink holds 0 event(s)"), "{err}");
     }
 
     /// bd-0lyz: resume/catchup dedup is about tick IDENTITY, not a raw
@@ -1223,9 +1243,9 @@ steps:
         // Start → the loop catches up to the most-recent due tick (inside the
         // 90s downtime window) and runs the body through the shared engine.
         manager.start().await.expect("start");
-        let event = wait_for_event(&sink, 30)
+        let event = wait_for_event(&sink, 60)
             .await
-            .expect("tick event within 30s");
+            .unwrap_or_else(|e| panic!("first tick event: {e}"));
         let t1 = event.tick;
         assert!(
             t1 <= unix_now() && t1 >= start_ts,
@@ -1278,9 +1298,9 @@ steps:
                 .expect("manager2");
         manager2.start().await.expect("resume after restart");
         let sink2 = engine2.policy_sink().clone();
-        let event2 = wait_for_event(&sink2, 30)
+        let event2 = wait_for_event(&sink2, 60)
             .await
-            .expect("catchup event after restart within 30s");
+            .unwrap_or_else(|e| panic!("catchup event after restart: {e}"));
         assert_eq!(
             event2.tick, next_tick,
             "most-recent missed tick, not a burst (got {})",
