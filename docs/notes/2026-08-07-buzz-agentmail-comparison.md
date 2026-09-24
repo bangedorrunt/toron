@@ -352,4 +352,4 @@ Captain cutover of GS-061 library wedges onto live call sites (branches
 | flywheel wake_liveness on `/health` | **Sibling ship** `gs-062/wake-health` — not claimed on this toron tip |
 
 
-> **Living tracker:** [`docs/parity/buzz-parity.md`](../parity/buzz-parity.md) — steal/adapt/reject/hold status for GS-061/062+ (update there, not by invent-greening this note).
+> **Living tracker:** [`docs/guides/buzz-parity.mdx`](../guides/buzz-parity.mdx) — harness-general Landed/Adapt/Reject/Hold status for Buzz×toron semantics (update there, not by invent-greening this note).
