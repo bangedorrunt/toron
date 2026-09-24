@@ -33,7 +33,7 @@ use anyhow::{Context, Result};
 use nostr::prelude::{Event, EventBuilder, EventId, FinalizeEvent, Keys, Kind, Tag, Timestamp};
 use toron_core::bus::{Bus, SubscriptionEvent};
 use toron_core::mailbox::{Mailbox, SendMessage, UnwrappedMail};
-use toron_workflow::coalesce::{CoalesceDecision, Coalesced, MentionCoalescer};
+use toron_workflow::coalesce::{CoalesceDecision, Coalesced, MentionCoalescer, RequeueOutcome, RequeueSchedule};
 use toron_workflow::engine::{
     ActionInvocation, ActionPartition, AsyncEffectRunner, AsyncRunJournal, CleanupKind,
     CleanupRequest, Decision, DispatchPlan, EffectJournalMode, EffectView,
@@ -125,20 +125,31 @@ async fn mention_outcome(
                 match host_acquire_for_assignee(pool, &coalesced.assignee, now_ms()).await {
                     Ok(p) => Some(p),
                     Err(e) => {
-                        // Do not drop the already-flushed burst — requeue.
-                        // LOW FLUSHNOW-ACQUIRE-REQUEUE-PLUS-UNKNOWN: when
-                        // requeue restores the burst, prefer a quiet Delivered
-                        // deferred (not Ambiguous→Unknown double-write).
+                        // Do not drop the already-flushed burst — Transient
+                        // requeue with backoff (TRANSPORT-REQUEUE-HOT-SPIN).
+                        // Quiet Delivered{deferred} (not Ambiguous→Unknown).
                         if let Some(c) = coalescer {
                             let mut g = c.lock().unwrap_or_else(PoisonError::into_inner);
-                            g.requeue(coalesced, now_ms(), true);
-                            return ProviderOutcome::Delivered(serde_json::json!({
-                                "ok": true,
-                                "coalesced": true,
-                                "deferred": true,
-                                "reason": format!("dispatch acquire deferred: {e}"),
-                                "effect_key": key,
-                            }));
+                            match g.requeue(
+                                coalesced,
+                                now_ms(),
+                                RequeueSchedule::Transient,
+                            ) {
+                                RequeueOutcome::Queued { .. } => {
+                                    return ProviderOutcome::Delivered(serde_json::json!({
+                                        "ok": true,
+                                        "coalesced": true,
+                                        "deferred": true,
+                                        "reason": format!("dispatch acquire deferred: {e}"),
+                                        "effect_key": key,
+                                    }));
+                                }
+                                RequeueOutcome::Exhausted => {
+                                    return ProviderOutcome::ProvenFailed(format!(
+                                        "dispatch acquire retry budget exhausted: {e}"
+                                    ));
+                                }
+                            }
                         }
                         return ProviderOutcome::Ambiguous(format!(
                             "dispatch acquire deferred: {e}"
@@ -151,20 +162,23 @@ async fn mention_outcome(
             let out = match publish_coalesced_job_with_cursor(bus, signer, &coalesced, delivery)
                 .await
             {
-                Ok(id) => ProviderOutcome::Delivered(serde_json::json!({
-                    "ok": true,
-                    "coalesced": false,
-                    "published": true,
-                    "job_id": id.to_hex(),
-                    "effect_key": key,
-                })),
-                Err(CoalescePublishError::NoSigner) => {
-                    // CapMention Buffered→Settled already handed off — requeue
-                    // so a later signer config can publish (do not permanently lose).
+                Ok(id) => {
                     if let Some(c) = coalescer {
                         let mut g = c.lock().unwrap_or_else(PoisonError::into_inner);
-                        g.requeue(coalesced, now_ms(), false);
+                        g.clear_retry(&coalesced.assignee);
                     }
+                    ProviderOutcome::Delivered(serde_json::json!({
+                        "ok": true,
+                        "coalesced": false,
+                        "published": true,
+                        "job_id": id.to_hex(),
+                        "effect_key": key,
+                    }))
+                }
+                Err(CoalescePublishError::NoSigner) => {
+                    // GS-062 NOSIGNER-FAILED-PLUS-REQUEUE: terminal config
+                    // failure — ProvenFailed with NO requeue (never Failed+requeue).
+                    let _ = coalesced;
                     ProviderOutcome::ProvenFailed("no job signer configured".to_string())
                 }
                 Err(CoalescePublishError::AlreadyDelivered) => {
@@ -179,23 +193,51 @@ async fn mention_outcome(
                     }))
                 }
                 Err(CoalescePublishError::InFlight) => {
-                    // Concurrent reserve — NOT Settled. Requeue + Ambiguous/retry.
+                    // Concurrent reserve — NOT Settled. FreshWindow requeue
+                    // (no Transient budget) + Ambiguous/retry.
                     if let Some(c) = coalescer {
                         let mut g = c.lock().unwrap_or_else(PoisonError::into_inner);
-                        g.requeue(coalesced, now_ms(), false);
+                        let _ = g.requeue(
+                            coalesced,
+                            now_ms(),
+                            RequeueSchedule::FreshWindow,
+                        );
+                    } else {
+                        let _ = coalesced;
                     }
                     ProviderOutcome::Ambiguous(
                         "delivery in-flight for session (concurrent reserve)".into(),
                     )
                 }
                 Err(CoalescePublishError::Transport(e)) => {
-                    // GS-062 TRANSPORT-DROP-FLUSHNOW: requeue like trigger /
-                    // acquire Err — do not leave stuck Unknown + lost 43001.
+                    // GS-062 FLUSHNOW-TRANSPORT-AMBIGUOUS-AFTER-REQUEUE:
+                    // Transient requeue + quiet Delivered{deferred} (same as
+                    // acquire Err) — NOT Ambiguous→Unknown dual-publish via
+                    // DispatchJob force-retry. Exhausted → Ambiguous once
+                    // (honest, no requeue).
                     if let Some(c) = coalescer {
                         let mut g = c.lock().unwrap_or_else(PoisonError::into_inner);
-                        g.requeue(coalesced, now_ms(), true);
+                        match g.requeue(
+                            coalesced,
+                            now_ms(),
+                            RequeueSchedule::Transient,
+                        ) {
+                            RequeueOutcome::Queued { .. } => {
+                                ProviderOutcome::Delivered(serde_json::json!({
+                                    "ok": true,
+                                    "coalesced": true,
+                                    "deferred": true,
+                                    "reason": format!("transport deferred: {e}"),
+                                    "effect_key": key,
+                                }))
+                            }
+                            RequeueOutcome::Exhausted => ProviderOutcome::Ambiguous(format!(
+                                "transport retry budget exhausted: {e}"
+                            )),
+                        }
+                    } else {
+                        ProviderOutcome::Ambiguous(e)
                     }
-                    ProviderOutcome::Ambiguous(e)
                 }
             };
             drop(permit);
@@ -1718,16 +1760,24 @@ impl WorkflowHost {
             {
                 Ok(p) => p,
                 Err(e) => {
-                    // Do NOT drop already-flushed burst — requeue.
-                    warn!(
-                        assignee = %coalesced.assignee,
-                        "coalesced burst deferred (dispatch acquire): {e} — requeue"
-                    );
+                    // Transient requeue + backoff (not flush_ready forever).
+                    let assignee = coalesced.assignee.clone();
                     let mut c = self
                         .coalescer
                         .lock()
                         .unwrap_or_else(PoisonError::into_inner);
-                    c.requeue(coalesced, now_ms(), true);
+                    match c.requeue(coalesced, now_ms(), RequeueSchedule::Transient) {
+                        RequeueOutcome::Queued { attempt, delay_ms } => warn!(
+                            assignee = %assignee,
+                            attempt,
+                            delay_ms,
+                            "coalesced burst deferred (dispatch acquire): {e} — requeue"
+                        ),
+                        RequeueOutcome::Exhausted => warn!(
+                            assignee = %assignee,
+                            "coalesced burst dropped (dispatch acquire retry budget exhausted): {e}"
+                        ),
+                    }
                     continue;
                 }
             };
@@ -1740,16 +1790,30 @@ impl WorkflowHost {
             )
             .await
             {
-                Ok(id) => debug!(
-                    assignee = %coalesced.assignee, %id,
-                    "kind-43001 published for coalesced burst"
-                ),
-                Err(CoalescePublishError::AlreadyDelivered) => debug!(
-                    assignee = %coalesced.assignee,
-                    "kind-43001 skipped (already delivered to session)"
-                ),
+                Ok(id) => {
+                    let mut c = self
+                        .coalescer
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner);
+                    c.clear_retry(&coalesced.assignee);
+                    debug!(
+                        assignee = %coalesced.assignee, %id,
+                        "kind-43001 published for coalesced burst"
+                    );
+                }
+                Err(CoalescePublishError::AlreadyDelivered) => {
+                    let mut c = self
+                        .coalescer
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner);
+                    c.clear_retry(&coalesced.assignee);
+                    debug!(
+                        assignee = %coalesced.assignee,
+                        "kind-43001 skipped (already delivered to session)"
+                    );
+                }
                 Err(CoalescePublishError::InFlight) => {
-                    // Concurrent reserve — requeue, do not Settled-drop.
+                    // Concurrent reserve — FreshWindow (no Transient budget).
                     warn!(
                         assignee = %coalesced.assignee,
                         "kind-43001 in-flight (concurrent reserve) — requeue"
@@ -1758,33 +1822,34 @@ impl WorkflowHost {
                         .coalescer
                         .lock()
                         .unwrap_or_else(PoisonError::into_inner);
-                    c.requeue(coalesced, now_ms(), false);
+                    let _ = c.requeue(coalesced, now_ms(), RequeueSchedule::FreshWindow);
                 }
                 Err(CoalescePublishError::NoSigner) => {
-                    // GS-062 TRANSPORT-DROP-TRIGGER: CapMention already
-                    // Settled — requeue (do not warn+continue drop).
+                    // GS-062 NOSIGNER-FAILED-PLUS-REQUEUE: terminal — no requeue.
                     warn!(
                         assignee = %coalesced.assignee,
-                        "coalesced burst NOT published (no job signer) — requeue"
+                        "coalesced burst NOT published (no job signer) — terminal drop"
                     );
-                    let mut c = self
-                        .coalescer
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner);
-                    c.requeue(coalesced, now_ms(), false);
                 }
                 Err(CoalescePublishError::Transport(e)) => {
-                    // GS-062 TRANSPORT-DROP-TRIGGER: bus failure after
-                    // flush must requeue like acquire Err / InFlight.
-                    warn!(
-                        assignee = %coalesced.assignee,
-                        "coalesced burst publish transport failed: {e} — requeue"
-                    );
+                    // Transient backoff requeue (TRANSPORT-REQUEUE-HOT-SPIN).
+                    let assignee = coalesced.assignee.clone();
                     let mut c = self
                         .coalescer
                         .lock()
                         .unwrap_or_else(PoisonError::into_inner);
-                    c.requeue(coalesced, now_ms(), true);
+                    match c.requeue(coalesced, now_ms(), RequeueSchedule::Transient) {
+                        RequeueOutcome::Queued { attempt, delay_ms } => warn!(
+                            assignee = %assignee,
+                            attempt,
+                            delay_ms,
+                            "coalesced burst publish transport failed: {e} — requeue"
+                        ),
+                        RequeueOutcome::Exhausted => warn!(
+                            assignee = %assignee,
+                            "coalesced burst dropped (transport retry budget exhausted): {e}"
+                        ),
+                    }
                 }
             }
             drop(permit); // release busy holder after publish CS
@@ -6186,8 +6251,9 @@ steps:
         );
         let batch = c.force_flush("oc").expect("flushed");
         assert_eq!(c.buffered_for("oc"), 0);
-        // Simulate trigger-loop acquire Err path.
-        c.requeue(batch, 1_000, true);
+        // Simulate trigger-loop acquire Err path (Transient attempt 0 = immediate).
+        let q = c.requeue(batch, 1_000, RequeueSchedule::Transient);
+        assert!(matches!(q, RequeueOutcome::Queued { delay_ms: 0, .. }), "{q:?}");
         assert_eq!(c.buffered_for("oc"), 1);
         let again = c.tick(1_000);
         assert_eq!(again.len(), 1, "requeued burst must flush again");
@@ -6534,10 +6600,14 @@ steps:
             Some(&coalescer),
         )
         .await;
-        assert!(
-            matches!(out, ProviderOutcome::Ambiguous(_)),
-            "Transport stays Ambiguous (honest), got {out:?}"
-        );
+        match &out {
+            ProviderOutcome::Delivered(v) => {
+                assert_eq!(v["deferred"], serde_json::json!(true), "{v}");
+            }
+            other => panic!(
+                "FlushNow Transport+requeue must quiet Delivered deferred (not Ambiguous), got {other:?}"
+            ),
+        }
         assert!(
             coalescer
                 .lock()
@@ -6572,8 +6642,9 @@ steps:
             0,
         );
         let batch = c.force_flush("oc").expect("flushed");
-        // Simulate trigger-loop Transport arm (flush_ready=true).
-        c.requeue(batch, 1_000, true);
+        // Simulate trigger-loop Transport arm (Transient attempt 0 = immediate).
+        let q = c.requeue(batch, 1_000, RequeueSchedule::Transient);
+        assert!(matches!(q, RequeueOutcome::Queued { delay_ms: 0, .. }), "{q:?}");
         let again = c.tick(1_000);
         assert_eq!(again.len(), 1, "Transport requeue must flush on next tick");
         assert_eq!(again[0].parent(), "p-tn");
@@ -6734,5 +6805,137 @@ steps:
             "acquire Err must requeue"
         );
         let _ = std::fs::remove_file(&db);
+    }
+
+    /// GS-062 NOSIGNER-FAILED-PLUS-REQUEUE: ProvenFailed without requeue.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn flushnow_nosigner_is_terminal_no_requeue() {
+        use toron_core::bus::in_process::{InProcessBus, InProcessBusConfig};
+        use toron_core::index::schema;
+        use toron_workflow::coalesce::InboundMention;
+        use toron_workflow::DeliveryCursorStore;
+
+        let db = std::env::temp_dir().join(format!("wf-ns-{}.sqlite", uuid::Uuid::new_v4()));
+        let pool = schema::connect(db.to_str().unwrap())
+            .await
+            .expect("connect");
+        schema::migrate(&pool).await.expect("migrate");
+        let bus: Arc<dyn Bus> = Arc::new(
+            InProcessBus::open(pool, InProcessBusConfig::default())
+                .await
+                .expect("bus"),
+        );
+        let store = DeliveryCursorStore::new();
+        let session = "oc-ns";
+        let batch = Coalesced {
+            assignee: session.into(),
+            mentions: vec![InboundMention {
+                assignee: session.into(),
+                parent: "ns-parent".into(),
+                spec: json!({"t": "nosigner"}),
+            }],
+            first_arrival_ms: 0,
+        };
+        let coalescer = std::sync::Mutex::new(MentionCoalescer::with_defaults());
+        let out = mention_outcome(
+            bus.as_ref(),
+            None, // no signer
+            CoalesceDecision::FlushNow(batch),
+            "ek-ns".into(),
+            Some(&store),
+            None,
+            Some(&coalescer),
+        )
+        .await;
+        assert!(
+            matches!(out, ProviderOutcome::ProvenFailed(_)),
+            "NoSigner must ProvenFailed, got {out:?}"
+        );
+        assert_eq!(
+            coalescer
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .buffered_for(session),
+            0,
+            "NoSigner must NOT requeue (Failed+requeue forbidden)"
+        );
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// GS-062 REQUEUE-FLUSH-READY-LOST-ON-CONCURRENT-SUBMIT (host-facing).
+    #[test]
+    fn requeue_transient_survives_concurrent_submit_merge() {
+        use toron_workflow::coalesce::InboundMention;
+        let mut c = MentionCoalescer::new(
+            std::time::Duration::from_millis(2_000),
+            std::time::Duration::from_millis(500),
+            64,
+        );
+        c.submit(
+            InboundMention {
+                assignee: "oc".into(),
+                parent: "live".into(),
+                spec: json!({"t": 1}),
+            },
+            1_000,
+        );
+        let failed = Coalesced {
+            assignee: "oc".into(),
+            mentions: vec![InboundMention {
+                assignee: "oc".into(),
+                parent: "retry".into(),
+                spec: json!({"t": 2}),
+            }],
+            first_arrival_ms: 0,
+        };
+        let q = c.requeue(failed, 1_000, RequeueSchedule::Transient);
+        assert!(matches!(q, RequeueOutcome::Queued { delay_ms: 0, .. }), "{q:?}");
+        let flushed = c.tick(1_000);
+        assert_eq!(flushed.len(), 1, "merge path must honor immediate Transient");
+        let parents: Vec<_> = flushed[0]
+            .mentions
+            .iter()
+            .map(|m| m.parent.as_str())
+            .collect();
+        assert!(parents.contains(&"live") && parents.contains(&"retry"), "{parents:?}");
+    }
+
+    /// GS-062 LOW: flush tick constant drains requeues without further bus events.
+    #[test]
+    fn flush_tick_drains_requeue_without_bus_event() {
+        use toron_workflow::coalesce::InboundMention;
+        // Timer ≤ subwindow so a lone Transient/FreshWindow requeue becomes
+        // ready without requiring another SubscriptionEvent on the bus.
+        assert!(COALESCE_FLUSH_TICK_MS <= 500);
+        let mut c = MentionCoalescer::new(
+            std::time::Duration::from_millis(2_000),
+            std::time::Duration::from_millis(500),
+            64,
+        );
+        c.submit(
+            InboundMention {
+                assignee: "oc".into(),
+                parent: "tick-p".into(),
+                spec: json!({"t": 1}),
+            },
+            0,
+        );
+        let batch = c.force_flush("oc").expect("flushed");
+        let _ = c.requeue(batch, 1_000, RequeueSchedule::FreshWindow);
+        // No further submit/bus event — only advancing time by tick cadence.
+        assert!(c.tick(1_000).is_empty());
+        let mut t = 1_000u64;
+        let mut drained = false;
+        for _ in 0..8 {
+            t = t.saturating_add(COALESCE_FLUSH_TICK_MS);
+            if !c.tick(t).is_empty() {
+                drained = true;
+                break;
+            }
+        }
+        assert!(
+            drained,
+            "COALESCE_FLUSH_TICK_MS cadence must drain FreshWindow requeue without bus events"
+        );
     }
 }
