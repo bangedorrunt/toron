@@ -30,6 +30,9 @@ use serde::{Deserialize, Serialize};
 
 use nostr::prelude::{Event, EventId, Keys, PublicKey, Tag, Timestamp};
 
+use toron_core::bus::convergence::{
+    AuthorityOp, Convergence, ConvergenceEffect, ConvergenceMsg, tick as convergence_tick,
+};
 use toron_core::nostr::event::build_event;
 use toron_core::nostr::kinds::toron_kind;
 
@@ -109,6 +112,10 @@ pub struct ChannelStore {
 struct ChannelStoreInner {
     channels: BTreeMap<String, Channel>,
     events: Vec<ChannelEvent>,
+    /// In-flight / last authority op per channel (GS-062 Kick/Disable convergence).
+    authority: BTreeMap<String, Convergence>,
+    /// Monotonic generation for Propose (re-add fence key).
+    authority_generation: u64,
 }
 
 /// bd-channel-truncation-238e: a channel post above this many chars is
@@ -191,16 +198,55 @@ impl ChannelStore {
     }
 
     /// Join a channel (idempotent).
+    ///
+    /// GS-062 / Buzz #7298 (ask-user A): ReAdd fences when Kick/Disable is held.
+    /// Production leave/close hold authority after FireLive; settle_authority ends it.
     pub fn join(&self, channel_id: &str, npub: &PublicKey) -> anyhow::Result<()> {
         let mut inner = self.inner.lock();
         let ch = inner
             .channels
-            .get_mut(channel_id)
+            .get(channel_id)
             .ok_or_else(|| anyhow::anyhow!("channel not found: {channel_id}"))?;
         // bd-channel-close-purge-bsqb: a retired channel accepts nobody new.
         if ch.closed {
             anyhow::bail!("channel {channel_id} is closed — join is refused");
         }
+        if let Some(held) = inner.authority.get(channel_id) {
+            let held_gen = match held {
+                Convergence::Pending { generation, .. }
+                | Convergence::Committed { generation, .. } => *generation,
+                Convergence::Fenced {
+                    held_generation, ..
+                } => *held_generation,
+                Convergence::Rejected { .. } => 0,
+            };
+            if !matches!(held, Convergence::Rejected { .. }) {
+                // Always ≠ held_gen so other channels' global counter bumps
+                // cannot accidentally equal `held` and skip FenceReAdd.
+                let attempted = held_gen.wrapping_add(1);
+                let (next, fx) = convergence_tick(
+                    Some(held),
+                    &ConvergenceMsg::ReAdd {
+                        generation: attempted,
+                    },
+                );
+                if fx
+                    .iter()
+                    .any(|e| matches!(e, ConvergenceEffect::FenceReAdd { .. }))
+                {
+                    if let Some(state) = next {
+                        inner.authority.insert(channel_id.to_string(), state);
+                    }
+                    anyhow::bail!(
+                        "channel {channel_id} re-add fenced under held authority generation"
+                    );
+                }
+            }
+        }
+        let ch = inner
+            .channels
+            .get_mut(channel_id)
+            .ok_or_else(|| anyhow::anyhow!("channel not found: {channel_id}"))?;
         ch.members.insert(npub.to_hex());
         drop(inner);
         Ok(())
@@ -209,36 +255,135 @@ impl ChannelStore {
     /// Leave a channel (idempotent). The creator cannot leave an OPEN
     /// channel — they own it — but MAY leave once it is closed
     /// (bd-channel-close-purge-bsqb leave-rule fix).
+    ///
+    /// GS-062: membership mutation is the FireLive host action after
+    /// Propose→Commit for [`AuthorityOp::Kick`] (Buzz #7298 convergence).
     pub fn leave(&self, channel_id: &str, npub: &PublicKey) -> anyhow::Result<()> {
         let mut inner = self.inner.lock();
         let ch = inner
             .channels
-            .get_mut(channel_id)
+            .get(channel_id)
             .ok_or_else(|| anyhow::anyhow!("channel not found: {channel_id}"))?;
         if ch.creator == npub.to_hex() && !ch.closed {
             anyhow::bail!(
-                "creator cannot leave channel {channel_id} while it is open \
-                 (close it first: toron channel close {channel_id})"
+                "creator cannot leave channel {channel_id} while it is open                  (close it first: toron channel close {channel_id})"
             );
         }
-        ch.members.remove(&npub.to_hex());
+        let target = npub.to_hex();
+        let generation = inner.authority_generation.saturating_add(1);
+        inner.authority_generation = generation;
+        let op = AuthorityOp::Kick {
+            target: target.clone(),
+        };
+        let (pending, propose_fx) = convergence_tick(
+            None,
+            &ConvergenceMsg::Propose {
+                op: op.clone(),
+                generation,
+            },
+        );
+        anyhow::ensure!(
+            propose_fx.is_empty(),
+            "kick propose must not fanout before commit"
+        );
+        let (committed, commit_fx) = convergence_tick(pending.as_ref(), &ConvergenceMsg::Commit);
+        let fired = commit_fx.iter().any(|e| {
+            matches!(
+                e,
+                ConvergenceEffect::FireLive {
+                    op: AuthorityOp::Kick { target: t },
+                    generation: g,
+                } if t == &target && *g == generation
+            )
+        });
+        anyhow::ensure!(fired, "kick FireLive missing after Commit");
+        if let Some(state) = committed {
+            inner.authority.insert(channel_id.to_string(), state);
+        }
+        // FireLive host action: mutate membership (single SoT).
+        let ch = inner
+            .channels
+            .get_mut(channel_id)
+            .ok_or_else(|| anyhow::anyhow!("channel not found: {channel_id}"))?;
+        ch.members.remove(&target);
+        // Ask-user A supersession (GS-062): HOLD Committed across the
+        // post-FireLive critical section so a production join hits FenceReAdd.
+        // (Authority already inserted above.) End with [`Self::settle_authority`].
         drop(inner);
         Ok(())
+    }
+
+    /// End the post-FireLive authority critical section (GS-062 ask-user A).
+    /// After settle, join is no longer ReAdd-fenced by this Kick/Disable hold.
+    /// Idempotent.
+    pub fn settle_authority(&self, channel_id: &str) {
+        self.inner.lock().authority.remove(channel_id);
+    }
+
+    /// Whether Kick/Disable authority is currently held for `channel_id`
+    /// (rebuild honesty / GS-062 create+closed settle).
+    pub fn authority_is_held(&self, channel_id: &str) -> bool {
+        self.inner.lock().authority.contains_key(channel_id)
+    }
+
+    /// Test helper: insert a held convergence state. Production leave/close
+    /// already hold after FireLive; this remains for unit tests that skip leave.
+    pub fn hold_authority_for_test(&self, channel_id: &str, state: Convergence) {
+        self.inner
+            .lock()
+            .authority
+            .insert(channel_id.to_string(), state);
     }
 
     /// Close (retire) a channel — bd-channel-close-purge-bsqb. Creator-only,
     /// idempotent. A closed channel refuses posts/joins/reactions; its
     /// history survives until `toron channel purge` removes the bus events.
+    ///
+    /// GS-062: `closed = true` is the FireLive host action after
+    /// Propose→Commit for [`AuthorityOp::Disable`].
     pub fn close(&self, channel_id: &str, by: &PublicKey) -> anyhow::Result<()> {
         let mut inner = self.inner.lock();
         let ch = inner
             .channels
-            .get_mut(channel_id)
+            .get(channel_id)
             .ok_or_else(|| anyhow::anyhow!("channel not found: {channel_id}"))?;
         if ch.creator != by.to_hex() {
             anyhow::bail!("only the creator can close channel {channel_id}");
         }
+        let target = channel_id.to_string();
+        let generation = inner.authority_generation.saturating_add(1);
+        inner.authority_generation = generation;
+        let op = AuthorityOp::Disable {
+            target: target.clone(),
+        };
+        let (pending, propose_fx) = convergence_tick(
+            None,
+            &ConvergenceMsg::Propose {
+                op: op.clone(),
+                generation,
+            },
+        );
+        anyhow::ensure!(propose_fx.is_empty(), "disable propose must not fanout");
+        let (committed, commit_fx) = convergence_tick(pending.as_ref(), &ConvergenceMsg::Commit);
+        let fired = commit_fx.iter().any(|e| {
+            matches!(
+                e,
+                ConvergenceEffect::FireLive {
+                    op: AuthorityOp::Disable { target: t },
+                    generation: g,
+                } if t == &target && *g == generation
+            )
+        });
+        anyhow::ensure!(fired, "disable FireLive missing after Commit");
+        if let Some(state) = committed {
+            inner.authority.insert(channel_id.to_string(), state);
+        }
+        let ch = inner
+            .channels
+            .get_mut(channel_id)
+            .ok_or_else(|| anyhow::anyhow!("channel not found: {channel_id}"))?;
         ch.closed = true;
+        // Ask-user A supersession: HOLD Disable across critical section.
         drop(inner);
         Ok(())
     }
@@ -306,9 +451,15 @@ impl ChannelStore {
                 if closed {
                     // A close inside the create event retires immediately;
                     // a non-creator close tag is an inapplicable no-op.
+                    // GS-062: CLI publish_close is Kind::GroupMetadata 39000
+                    // closed=true — production rebuild path. Settle after
+                    // close() here (same as METADATA leave/close) so replay
+                    // does not permanent-FenceReAdd. Live close() still holds
+                    // for in-process CS.
                     if self.close(&id, &ev.pubkey).is_err() {
                         return Ok(false);
                     }
+                    self.settle_authority(&id);
                 }
                 Ok(true)
             }
@@ -339,10 +490,26 @@ impl ChannelStore {
                 else {
                     anyhow::bail!("legacy channel metadata lacks h tag");
                 };
+                // GS-062: leave/close HOLD after FireLive for in-process CS
+                // (captain A). apply_lifecycle is rebuild/replay — settle so
+                // replayed Kick does not permanently FenceReAdd joins.
+                // Live leave()/close() still hold; CLI/host settle after publish CS.
                 let applied = match ev.content.as_str() {
                     "join" => self.join(id, &ev.pubkey).is_ok(),
-                    "leave" => self.leave(id, &ev.pubkey).is_ok(),
-                    "close" => self.close(id, &ev.pubkey).is_ok(),
+                    "leave" => {
+                        let ok = self.leave(id, &ev.pubkey).is_ok();
+                        if ok {
+                            self.settle_authority(id);
+                        }
+                        ok
+                    }
+                    "close" => {
+                        let ok = self.close(id, &ev.pubkey).is_ok();
+                        if ok {
+                            self.settle_authority(id);
+                        }
+                        ok
+                    }
                     _ => false,
                 };
                 Ok(applied)
@@ -888,6 +1055,259 @@ mod tests {
         // A non-member reader (the global-sub stand-in) cannot read it.
         let outsider = keys();
         assert!(!store.can_read("private-1", &outsider.public_key()));
+    }
+
+    /// GS-062: leave runs Propose→Commit→FireLive(Kick) then mutates membership.
+    #[test]
+    fn leave_fires_kick_only_after_commit() {
+        let store = ChannelStore::new();
+        let alice = keys();
+        let bob = keys();
+        store
+            .create_channel(&alice.public_key(), "c", "C", false, None)
+            .expect("create");
+        store.join("c", &bob.public_key()).expect("join");
+        store.leave("c", &bob.public_key()).expect("leave");
+        assert!(!store.is_member("c", &bob.public_key()));
+        // Ask-user A: authority held after FireLive — production join FenceReAdd.
+        let err = store
+            .join("c", &bob.public_key())
+            .expect_err("re-join under held Kick must fence");
+        assert!(err.to_string().contains("fenced"), "got {err}");
+        store.settle_authority("c");
+        store
+            .join("c", &bob.public_key())
+            .expect("re-join after settle_authority");
+        assert!(store.is_member("c", &bob.public_key()));
+    }
+
+    /// GS-062: ReAdd under a held Kick generation is fenced at join
+    /// (hold_authority_for_test helper; production path covered below).
+    
+    /// GS-062: apply_lifecycle leave settles authority so rebuild/replay does
+    /// not permanently FenceReAdd. Live leave() still holds until settle_authority.
+    #[test]
+    fn apply_lifecycle_leave_settles_authority() {
+        let alice = keys();
+        let bob = keys();
+        let create = build_event(
+            &alice,
+            toron_kind(CHANNEL_CREATE),
+            "",
+            vec![
+                Tag::parse(["d", "c"]).expect("d"),
+                Tag::parse(["name", "C"]).expect("name"),
+            ],
+            Timestamp::now(),
+        )
+        .expect("create");
+        let members = build_event(
+            &alice,
+            toron_kind(CHANNEL_MEMBERS),
+            serde_json::to_string(&vec![
+                alice.public_key().to_hex(),
+                bob.public_key().to_hex(),
+            ])
+            .expect("json"),
+            vec![Tag::parse(["h", "c"]).expect("h")],
+            Timestamp::now(),
+        )
+        .expect("members");
+        let leave = build_event(
+            &bob,
+            toron_kind(CHANNEL_METADATA_LEGACY),
+            "leave",
+            vec![Tag::parse(["h", "c"]).expect("h")],
+            Timestamp::now(),
+        )
+        .expect("leave");
+        let store = ChannelStore::rebuild([create, members, leave]).expect("rebuild");
+        assert!(!store.is_member("c", &bob.public_key()));
+        // apply_lifecycle settled — join must NOT permanent-fence.
+        store
+            .join("c", &bob.public_key())
+            .expect("join after apply_lifecycle leave must work (settled)");
+        assert!(store.is_member("c", &bob.public_key()));
+    }
+
+    /// GS-062: CHANNEL_CREATE|LEGACY with closed=true must settle_authority
+    /// (CLI publish_close is 39000 closed=true rebuild path).
+    #[test]
+    fn apply_lifecycle_create_closed_settles_authority() {
+        let alice = keys();
+        let bob = keys();
+        let create_closed = build_event(
+            &alice,
+            toron_kind(CHANNEL_CREATE),
+            "channel-close",
+            vec![
+                Tag::parse(["d", "c"]).expect("d"),
+                Tag::parse(["h", "c"]).expect("h"),
+                Tag::parse(["name", "C"]).expect("name"),
+                Tag::parse(["closed", "true"]).expect("closed"),
+            ],
+            Timestamp::now(),
+        )
+        .expect("create+closed");
+        let store = ChannelStore::rebuild([create_closed]).expect("rebuild");
+        assert!(store.get("c").expect("ch").closed);
+        assert!(
+            !store.authority_is_held("c"),
+            "create+closed rebuild must settle_authority (CLI 39000 closed path)"
+        );
+        // Settled — join must fail as closed, NOT as FenceReAdd from held Disable.
+        let err = store
+            .join("c", &bob.public_key())
+            .expect_err("closed refuses join");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("closed"),
+            "expected closed refuse, got {msg}"
+        );
+        assert!(
+            !msg.contains("fenced"),
+            "create+closed rebuild must settle (not FenceReAdd), got {msg}"
+        );
+        // Live close() still holds for in-process CS (unchanged).
+        let live = ChannelStore::new();
+        live
+            .create_channel(&alice.public_key(), "live", "L", false, None)
+            .expect("create");
+        live.close("live", &alice.public_key()).expect("close");
+        assert!(
+            live.authority_is_held("live"),
+            "live close() must still HOLD for in-process CS"
+        );
+        live.settle_authority("live");
+        assert!(!live.authority_is_held("live"));
+        let _ = bob;
+    }
+
+
+    #[test]
+    fn join_honors_readd_fence_under_held_kick() {
+        let store = ChannelStore::new();
+        let alice = keys();
+        let bob = keys();
+        store
+            .create_channel(&alice.public_key(), "c", "C", false, None)
+            .expect("create");
+        store.hold_authority_for_test(
+            "c",
+            Convergence::Committed {
+                op: AuthorityOp::Kick {
+                    target: bob.public_key().to_hex(),
+                },
+                generation: 7,
+            },
+        );
+        let err = store
+            .join("c", &bob.public_key())
+            .expect_err("re-add under held kick must fence");
+        assert!(
+            err.to_string().contains("fenced"),
+            "expected fence, got {err}"
+        );
+        assert!(!store.is_member("c", &bob.public_key()));
+    }
+
+    /// GS-062 ask-user A: leave holds authority — production join FenceReAdd
+    /// without hold_authority_for_test.
+    #[test]
+    fn leave_holds_authority_join_fences_on_live_path() {
+        let store = ChannelStore::new();
+        let alice = keys();
+        let bob = keys();
+        store
+            .create_channel(&alice.public_key(), "c", "C", false, None)
+            .expect("create");
+        store.join("c", &bob.public_key()).expect("join");
+        store.leave("c", &bob.public_key()).expect("leave");
+        let err = store
+            .join("c", &bob.public_key())
+            .expect_err("live leave→rejoin must FenceReAdd while held");
+        assert!(err.to_string().contains("fenced"), "got {err}");
+        store.settle_authority("c");
+        store.join("c", &bob.public_key()).expect("after settle");
+    }
+
+    /// GS-062 ask-user A hazard: other channels' leave/close bump the global
+    /// authority_generation; join must still fence using held generation
+    /// (not authority_generation+1 which can skip FenceReAdd).
+    #[test]
+    fn join_fences_despite_other_channel_generation_bumps() {
+        let store = ChannelStore::new();
+        let alice = keys();
+        let bob = keys();
+        let carol = keys();
+        store
+            .create_channel(&alice.public_key(), "a", "A", false, None)
+            .expect("a");
+        store
+            .create_channel(&alice.public_key(), "b", "B", false, None)
+            .expect("b");
+        store.join("a", &bob.public_key()).expect("bob a");
+        store.join("b", &carol.public_key()).expect("carol b");
+        store.leave("a", &bob.public_key()).expect("leave a — hold Kick");
+        // Bump global authority_generation via other channel leave/close.
+        store.leave("b", &carol.public_key()).expect("leave b");
+        store
+            .create_channel(&alice.public_key(), "d", "D", false, None)
+            .expect("d");
+        store.close("d", &alice.public_key()).expect("close d bumps gen");
+        let err = store
+            .join("a", &bob.public_key())
+            .expect_err("must still FenceReAdd on a despite other-channel bumps");
+        assert!(err.to_string().contains("fenced"), "got {err}");
+    }
+
+    /// GS-062: two mismatched joins under held Committed both FenceReAdd
+    /// (fence must not be one-shot — Committed stays held).
+    #[test]
+    fn two_mismatched_joins_under_held_committed_both_fence() {
+        let store = ChannelStore::new();
+        let alice = keys();
+        let bob = keys();
+        let carol = keys();
+        store
+            .create_channel(&alice.public_key(), "c", "C", false, None)
+            .expect("create");
+        store.hold_authority_for_test(
+            "c",
+            Convergence::Committed {
+                op: AuthorityOp::Kick {
+                    target: bob.public_key().to_hex(),
+                },
+                generation: 7,
+            },
+        );
+        let err1 = store
+            .join("c", &bob.public_key())
+            .expect_err("first re-add must fence");
+        assert!(err1.to_string().contains("fenced"), "first: {err1}");
+        let err2 = store
+            .join("c", &carol.public_key())
+            .expect_err("second re-add must still fence under held Committed");
+        assert!(err2.to_string().contains("fenced"), "second: {err2}");
+        assert!(!store.is_member("c", &bob.public_key()));
+        assert!(!store.is_member("c", &carol.public_key()));
+    }
+
+    /// GS-062: close runs Propose→Commit→FireLive(Disable) then sets closed.
+    #[test]
+    fn close_fires_disable_only_after_commit() {
+        let store = ChannelStore::new();
+        let alice = keys();
+        store
+            .create_channel(&alice.public_key(), "c", "C", false, None)
+            .expect("create");
+        store.close("c", &alice.public_key()).expect("close");
+        assert!(store.get("c").expect("ch").closed);
+        let bob = keys();
+        assert!(
+            store.join("c", &bob.public_key()).is_err(),
+            "closed channel refuses join"
+        );
     }
 
     #[test]

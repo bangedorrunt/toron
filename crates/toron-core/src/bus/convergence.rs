@@ -22,19 +22,11 @@ pub enum AuthorityOp {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Convergence {
     /// Proposed; not yet committed — no live side-effects.
-    Pending {
-        op: AuthorityOp,
-        generation: u64,
-    },
+    Pending { op: AuthorityOp, generation: u64 },
     /// Authority committed; live fanout may fire exactly once.
-    Committed {
-        op: AuthorityOp,
-        generation: u64,
-    },
+    Committed { op: AuthorityOp, generation: u64 },
     /// Store/authority could not confirm — fail closed (no fanout).
-    Rejected {
-        reason: String,
-    },
+    Rejected { reason: String },
     /// Re-add raced under held generation — fenced.
     Fenced {
         attempted_generation: u64,
@@ -79,10 +71,7 @@ pub fn tick(
             }),
             vec![],
         ),
-        (
-            Some(Convergence::Pending { op, generation }),
-            ConvergenceMsg::Commit,
-        ) => (
+        (Some(Convergence::Pending { op, generation }), ConvergenceMsg::Commit) => (
             Some(Convergence::Committed {
                 op: op.clone(),
                 generation: *generation,
@@ -101,16 +90,19 @@ pub fn tick(
             }],
         ),
         (
-            Some(Convergence::Pending { generation: held, .. })
-            | Some(Convergence::Committed { generation: held, .. }),
+            Some(Convergence::Pending {
+                generation: held, ..
+            })
+            | Some(Convergence::Committed {
+                generation: held, ..
+            }),
             ConvergenceMsg::ReAdd { generation },
         ) => {
             if generation != held {
+                // Keep Pending|Committed held so a second ReAdd still fences
+                // (do not collapse to Fenced — that made the fence one-shot).
                 (
-                    Some(Convergence::Fenced {
-                        attempted_generation: *generation,
-                        held_generation: *held,
-                    }),
+                    state.cloned(),
                     vec![ConvergenceEffect::FenceReAdd {
                         attempted: *generation,
                         held: *held,
@@ -120,6 +112,20 @@ pub fn tick(
                 (state.cloned(), vec![])
             }
         }
+        // Belt: if a prior Fenced snapshot is held, keep fencing ReAdds.
+        (
+            Some(Convergence::Fenced {
+                held_generation: held,
+                ..
+            }),
+            ConvergenceMsg::ReAdd { generation },
+        ) => (
+            state.cloned(),
+            vec![ConvergenceEffect::FenceReAdd {
+                attempted: *generation,
+                held: *held,
+            }],
+        ),
         // Fail-closed: commit/fail with no pending proposal refuses.
         (None, ConvergenceMsg::Commit) => (
             Some(Convergence::Rejected {
@@ -170,13 +176,7 @@ mod tests {
         );
         assert!(fx.is_empty(), "propose must not fanout");
         let (_s, fx) = tick(s.as_ref(), &ConvergenceMsg::Commit);
-        assert_eq!(
-            fx,
-            vec![ConvergenceEffect::FireLive {
-                op,
-                generation: 1
-            }]
-        );
+        assert_eq!(fx, vec![ConvergenceEffect::FireLive { op, generation: 1 }]);
     }
 
     #[test]
@@ -184,9 +184,7 @@ mod tests {
         let (s, _) = tick(
             None,
             &ConvergenceMsg::Propose {
-                op: AuthorityOp::Disable {
-                    target: "x".into(),
-                },
+                op: AuthorityOp::Disable { target: "x".into() },
                 generation: 2,
             },
         );
@@ -209,13 +207,11 @@ mod tests {
         let (s, _) = tick(
             None,
             &ConvergenceMsg::Propose {
-                op: AuthorityOp::Revoke {
-                    target: "y".into(),
-                },
+                op: AuthorityOp::Revoke { target: "y".into() },
                 generation: 7,
             },
         );
-        let (_s, fx) = tick(s.as_ref(), &ConvergenceMsg::ReAdd { generation: 8 });
+        let (s2, fx) = tick(s.as_ref(), &ConvergenceMsg::ReAdd { generation: 8 });
         assert_eq!(
             fx,
             vec![ConvergenceEffect::FenceReAdd {
@@ -223,6 +219,85 @@ mod tests {
                 held: 7
             }]
         );
+        // Prior Pending must stay held — not collapse to Fenced (one-shot bug).
+        assert!(
+            matches!(
+                s2,
+                Some(Convergence::Pending {
+                    generation: 7,
+                    ..
+                })
+            ),
+            "expected Pending held, got {s2:?}"
+        );
+        // Second mismatched ReAdd still fences under held Pending.
+        let (s3, fx2) = tick(s2.as_ref(), &ConvergenceMsg::ReAdd { generation: 9 });
+        assert_eq!(
+            fx2,
+            vec![ConvergenceEffect::FenceReAdd {
+                attempted: 9,
+                held: 7
+            }]
+        );
+        assert!(matches!(
+            s3,
+            Some(Convergence::Pending {
+                generation: 7,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn two_readds_under_held_committed_both_fence() {
+        let op = AuthorityOp::Kick {
+            target: "bob".into(),
+        };
+        let (s, _) = tick(
+            None,
+            &ConvergenceMsg::Propose {
+                op: op.clone(),
+                generation: 7,
+            },
+        );
+        let (s, _) = tick(s.as_ref(), &ConvergenceMsg::Commit);
+        assert!(matches!(
+            s,
+            Some(Convergence::Committed {
+                generation: 7,
+                ..
+            })
+        ));
+        let (s2, fx1) = tick(s.as_ref(), &ConvergenceMsg::ReAdd { generation: 8 });
+        assert_eq!(
+            fx1,
+            vec![ConvergenceEffect::FenceReAdd {
+                attempted: 8,
+                held: 7
+            }]
+        );
+        assert!(matches!(
+            s2,
+            Some(Convergence::Committed {
+                generation: 7,
+                ..
+            })
+        ));
+        let (s3, fx2) = tick(s2.as_ref(), &ConvergenceMsg::ReAdd { generation: 99 });
+        assert_eq!(
+            fx2,
+            vec![ConvergenceEffect::FenceReAdd {
+                attempted: 99,
+                held: 7
+            }]
+        );
+        assert!(matches!(
+            s3,
+            Some(Convergence::Committed {
+                generation: 7,
+                ..
+            })
+        ));
     }
 
     #[test]

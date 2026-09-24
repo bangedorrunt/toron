@@ -21,10 +21,10 @@ pub mod cron_core;
 pub mod cron_failure;
 pub mod delivery_cursor;
 pub mod dispatch;
-pub mod lifecycle;
 pub mod engine;
 pub mod guard;
 pub mod jobs;
+pub mod lifecycle;
 pub mod lint;
 pub mod mention;
 pub mod playbook_lint;
@@ -48,9 +48,11 @@ pub use cron_failure::{
 
 pub use coalesce::{
     CoalesceDecision, Coalesced, DEFAULT_MAX_BUFFER, DEFAULT_SUBWINDOW, DEFAULT_WINDOW,
-    FlushOutcome, InboundMention, MentionCoalescer, subwindow_from_env, window_from_env,
+    DlqEntry, DlqReason, FlushOutcome, InboundMention, MentionCoalescer, REQUEUE_BACKOFF_BASE_MS,
+    REQUEUE_BACKOFF_CAP_MS, REQUEUE_MAX_ATTEMPTS, RequeueOutcome, RequeueSchedule,
+    subwindow_from_env, transient_backoff_delay_ms, window_from_env,
 };
-pub use dispatch::{DispatchConfig, DispatchPermit, DispatchPool, QueuedJob};
+pub use dispatch::{DispatchAcquire, DispatchConfig, DispatchPermit, DispatchPool, QueuedJob};
 pub use engine::{
     Decision, GraphNodeInput, ParallelCopyInput, ProfileResolver, RunInput, SpawnSink,
     WorkflowEngine, WorkflowResolver, build_workflow_run_terminal, run_graph_node,
@@ -70,7 +72,7 @@ pub use lint::{
 };
 pub use mention::{
     Mention, build_job_from_coalesced, content_mentions, is_mention, parse_mentions,
-    wire_mention_dispatch,
+    wire_mention_dispatch, wire_mention_dispatch_with_cursor,
 };
 pub use schema::{
     Action, CrewSpec, CronPolicy, FailureAction, Graph, GraphNode, InputDecl, Phase, Step,
@@ -105,5 +107,8 @@ mod tests {
     }
 }
 
-pub use delivery_cursor::{DeliveryCursor, DeliveryCursorStore, DeliveryEffect, agent_key_is_not_delivery_proof};
+pub use delivery_cursor::{
+    DeliveryCursor, DeliveryCursorStore, DeliveryEffect, ReservationGuard,
+    agent_key_is_not_delivery_proof,
+};
 pub use lifecycle::{LifecycleEffect, WorkflowLifecycle, WorkflowRecord};

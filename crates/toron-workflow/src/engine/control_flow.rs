@@ -2673,8 +2673,8 @@ mod control_flow_output_tests {
 
 #[cfg(test)]
 mod fail_run_preview_tests_bd_90eb {
-    use super::leaf_preview_for_value;
     use super::super::{ActionInvocation, AsyncEffectRunner, RunInput, WorkflowEngine};
+    use super::leaf_preview_for_value;
     use crate::schema::{Action, parse_workflow};
     use std::sync::Arc;
 
@@ -2700,7 +2700,10 @@ mod fail_run_preview_tests_bd_90eb {
     #[test]
     fn bare_leaf_emits_empty_leaf_token() {
         assert_eq!(leaf_preview_for_value(&serde_json::json!({})), "empty-leaf");
-        assert_eq!(leaf_preview_for_value(&serde_json::Value::Null), "empty-leaf");
+        assert_eq!(
+            leaf_preview_for_value(&serde_json::Value::Null),
+            "empty-leaf"
+        );
     }
 
     /// bd-90eb: bound is 512 chars, then the marker is appended.
@@ -2712,7 +2715,10 @@ mod fail_run_preview_tests_bd_90eb {
             preview.ends_with("\u{2026}(truncated)"),
             "marker appended: {preview}"
         );
-        assert_eq!(preview.chars().count(), 512 + "\u{2026}(truncated)".chars().count());
+        assert_eq!(
+            preview.chars().count(),
+            512 + "\u{2026}(truncated)".chars().count()
+        );
     }
 
     /// bd-90eb: the linear fail_run fallback embeds leaf preview plus
@@ -2731,8 +2737,7 @@ mod fail_run_preview_tests_bd_90eb {
                     Box<dyn std::future::Future<Output = anyhow::Result<serde_json::Value>> + Send>,
                 >
         });
-        let engine =
-            WorkflowEngine::local_with_async_effect_runner(Some(runner)).expect("engine");
+        let engine = WorkflowEngine::local_with_async_effect_runner(Some(runner)).expect("engine");
         let workflow = parse_workflow(
             r##"
 name: upgrade-wf
@@ -2751,7 +2756,11 @@ steps:
         let output = engine
             .run(
                 "wf-fail-run-preview-1",
-                RunInput { run_id: None, workflow, trigger: serde_json::json!({}) },
+                RunInput {
+                    run_id: None,
+                    workflow,
+                    trigger: serde_json::json!({}),
+                },
             )
             .await
             .expect("run returns a value, not a panic");
@@ -2761,8 +2770,13 @@ steps:
             !output["disposition"].is_null(),
             "disposition carried: {output}"
         );
-        let preview = output["leaf_preview"].as_str().expect("leaf_preview string");
+        let preview = output["leaf_preview"]
+            .as_str()
+            .expect("leaf_preview string");
         assert!(preview.contains("auth"), "preview embeds kind: {output}");
-        assert!(preview.contains("bad creds"), "preview embeds error: {output}");
+        assert!(
+            preview.contains("bad creds"),
+            "preview embeds error: {output}"
+        );
     }
 }
