@@ -348,5 +348,5 @@ Captain cutover of GS-061 library wedges onto live call sites (branches
 | WorkflowLifecycle on WorkflowHost | **Landed** |
 | DeliveryCursor on mention→43001 | **Landed** |
 | Verify-before-route tripwires | **Landed** (unchanged; kept honest) |
-| flywheel wake_liveness on `/health` | **Landed** (sibling flywheel branch) |
+| flywheel wake_liveness on `/health` | **Sibling ship** `gs-062/wake-health` — not claimed on this toron tip |
 

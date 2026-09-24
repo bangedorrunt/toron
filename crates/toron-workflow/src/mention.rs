@@ -52,9 +52,10 @@ pub fn wire_mention_dispatch_with_cursor(
     for m in parse_mentions(event) {
         // Honesty: agent-key-signed ≠ delivery proof (call-site assertion).
         let _ = agent_key_is_not_delivery_proof(&m.target.to_hex(), &m.message_id.to_hex());
+        let delivery_id = m.message_id.to_hex();
+        let session = m.name.as_str(); // assignee / dispatch session id
         if let Some(store) = delivery {
-            let session = m.name.as_str(); // assignee / dispatch session id
-            let (keep, _) = store.filter_undelivered(session, [m.message_id.to_hex()]);
+            let (keep, _) = store.peek_undelivered(session, [delivery_id.clone()]);
             if keep.is_empty() {
                 continue; // already delivered to this session
             }
@@ -62,16 +63,25 @@ pub fn wire_mention_dispatch_with_cursor(
         let decision = coalescer.submit(
             InboundMention {
                 assignee: m.name.clone(),
-                parent: m.message_id.to_hex(),
+                parent: delivery_id.clone(),
                 spec: serde_json::json!({ "text": m.content }),
             },
             now_ms,
         );
-        if let CoalesceDecision::FlushNow(batch) = decision
-            && let Ok(ev) =
-                build_job_from_coalesced(&batch, requester, project_slug, Timestamp::now())
-        {
-            jobs.push(ev);
+        if let CoalesceDecision::FlushNow(batch) = decision {
+            match build_job_from_coalesced(&batch, requester, project_slug, Timestamp::now()) {
+                Ok(ev) => {
+                    // Mark only after successful build — failed build must not
+                    // advance the cursor (silent kind-43001 loss hazard).
+                    if let Some(store) = delivery {
+                        store.mark_delivered(session, [delivery_id]);
+                    }
+                    jobs.push(ev);
+                }
+                Err(_) => {
+                    // Do not mark_delivered — parent stays undelivered for retry.
+                }
+            }
         }
     }
     jobs
@@ -320,29 +330,34 @@ mod tests {
         // Force content to contain @token matching — parse_mentions needs @name
         // matching p-tag; content_mentions may need the name. Use wire with cursor.
         let store = DeliveryCursorStore::new();
-        let mut coalescer = MentionCoalescer::new(
+        let coalescer = MentionCoalescer::new(
             std::time::Duration::from_millis(0),
             std::time::Duration::from_millis(0),
             64,
         );
-        // First pass may or may not parse depending on @token↔npub heuristic;
-        // exercise filter_undelivered at the call site directly for honesty.
+        // Exercise peek / mark at the call site (advance only after success).
         let session = "OCBeta";
         let id = post.id.to_hex();
         assert!(agent_key_is_not_delivery_proof(
             &agent.public_key().to_hex(),
             &id
         ));
-        let (keep1, _) = store.filter_undelivered(session, [id.clone()]);
+        let (keep1, _) = store.peek_undelivered(session, [id.clone()]);
         assert_eq!(keep1, vec![id.clone()]);
-        let (keep2, fx) = store.filter_undelivered(session, [id.clone()]);
-        assert!(keep2.is_empty(), "second delivery skipped");
+        assert_eq!(store.cursor(session).cursor, 0, "peek must not advance");
+        // Simulate failed build/publish: no mark → still undelivered.
+        let (keep_fail, _) = store.peek_undelivered(session, [id.clone()]);
+        assert_eq!(keep_fail, vec![id.clone()]);
+        // Successful path marks.
+        store.mark_delivered(session, [id.clone()]);
+        let (keep2, fx) = store.peek_undelivered(session, [id.clone()]);
+        assert!(keep2.is_empty(), "second delivery skipped after mark");
         assert!(matches!(
             fx[0],
             crate::delivery_cursor::DeliveryEffect::SkipAlreadyDelivered { .. }
         ));
         // Different session still delivers.
-        let (keep3, _) = store.filter_undelivered("other-session", [id]);
+        let (keep3, _) = store.peek_undelivered("other-session", [id]);
         assert_eq!(keep3.len(), 1);
         let _ = (post, coalescer, requester);
     }
