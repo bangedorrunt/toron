@@ -450,14 +450,12 @@ impl Bus for InProcessBus {
         }
 
         // 3. Ephemeral kinds (20000–29999, e.g. presence 20001) are broadcast
-        //    but NOT stored. GS-061 / Buzz #7532 pattern: fail closed without
-        //    Redis — authority must already have passed verify+auth; if a
-        //    future presence-authority flag is unset, refuse before fanout.
+        //    but NOT stored. GS-062 / Buzz #7532 pattern: fail closed without
+        //    Redis — after verify+auth, confirm SQLite store health (`SELECT 1`).
+        //    Unreachable store → presence_admit(false) → refuse fanout.
         if crate::bus::is_ephemeral_kind(event.kind) {
-            if let Err(reason) = crate::bus::convergence::presence_admit(true) {
-                // `true` today: verify+auth above ARE the authority confirm on
-                // SQLite-local bus. Flip to a real confirm bit when a presence
-                // store is added — never Redis.
+            let store_ok = self.store.is_healthy().await;
+            if let Err(reason) = crate::bus::convergence::presence_admit(store_ok) {
                 self.stage_log(Stage::Auth, &event, reason);
                 return Err(BusError::Publish(reason.into()));
             }

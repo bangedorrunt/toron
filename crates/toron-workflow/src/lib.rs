@@ -21,10 +21,10 @@ pub mod cron_core;
 pub mod cron_failure;
 pub mod delivery_cursor;
 pub mod dispatch;
-pub mod lifecycle;
 pub mod engine;
 pub mod guard;
 pub mod jobs;
+pub mod lifecycle;
 pub mod lint;
 pub mod mention;
 pub mod playbook_lint;
@@ -70,7 +70,7 @@ pub use lint::{
 };
 pub use mention::{
     Mention, build_job_from_coalesced, content_mentions, is_mention, parse_mentions,
-    wire_mention_dispatch,
+    wire_mention_dispatch, wire_mention_dispatch_with_cursor,
 };
 pub use schema::{
     Action, CrewSpec, CronPolicy, FailureAction, Graph, GraphNode, InputDecl, Phase, Step,
@@ -105,5 +105,7 @@ mod tests {
     }
 }
 
-pub use delivery_cursor::{DeliveryCursor, DeliveryCursorStore, DeliveryEffect, agent_key_is_not_delivery_proof};
+pub use delivery_cursor::{
+    DeliveryCursor, DeliveryCursorStore, DeliveryEffect, agent_key_is_not_delivery_proof,
+};
 pub use lifecycle::{LifecycleEffect, WorkflowLifecycle, WorkflowRecord};

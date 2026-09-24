@@ -37,7 +37,11 @@ pub struct DeliveryCursorStore {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeliveryEffect {
     /// Id is new for this session — include in context and advance cursor.
-    Deliver { session: SessionId, id: DeliveryId, cursor: u64 },
+    Deliver {
+        session: SessionId,
+        id: DeliveryId,
+        cursor: u64,
+    },
     /// Already delivered to this session — skip (not "agent key signed").
     SkipAlreadyDelivered { session: SessionId, id: DeliveryId },
 }

@@ -59,7 +59,10 @@ impl WorkflowLifecycle {
     pub fn register(&self, id: impl Into<String>) -> LifecycleEffect {
         let id = id.into();
         let mut g = self.inner.lock().expect("lifecycle lock");
-        let generation = g.get(&id).map(|r| r.generation.saturating_add(1)).unwrap_or(1);
+        let generation = g
+            .get(&id)
+            .map(|r| r.generation.saturating_add(1))
+            .unwrap_or(1);
         g.insert(
             id.clone(),
             WorkflowRecord {

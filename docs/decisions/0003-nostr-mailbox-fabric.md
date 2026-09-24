@@ -2,7 +2,7 @@
 status: accepted
 date: 2026-08-04
 accepted: 2026-08-04
-revision: 9
+revision: 10
 decision-makers: bangedorrunt (captain)
 consulted: ""
 informed: ""
@@ -16,6 +16,12 @@ related: [flywheel, herdr, mcp_agent_mail_rust, nostrdevkit/nostr]
 > `mcp_agent_mail_rust` ("AM-Rust") feature-parity contract, the herdr backend
 > protocol, the flywheel integration contract, and the dependency-direction
 > analysis so a future agent can implement without external lookups.
+>
+> **Revision 10 (2026-09-24):** GS-062 live cutover of GS-061 library wedges onto
+> real call sites (DispatchPool `try_acquire` → fenced; SQLite `presence_admit`;
+> ChannelStore leave/close convergence; WorkflowLifecycle on WorkflowHost;
+> DeliveryCursor on mention→43001; flywheel `wake_liveness` on `/health`). Landed
+> only where call sites prove it.
 >
 > **Revision 9 (2026-09-24):** GS-061 Buzz leverage refresh. Scout:
 > `/home/box/agent-data/grok-ship/reports/GS-061.md` (SHA256
@@ -680,7 +686,7 @@ only (composability, explicit boundaries, honesty at I/O). **No ACP port.**
 #### Steal
 | Buzz (PR) | Toron effect | As-is → to-be |
 |---|---|---|
-| Busy-owner hold bound + generation fence (#7337/#7340) | `BusyOwnerModel` + `DispatchPool::try_acquire_fenced` / `fork_rebind` / `deadline_wake` (library; live path still `try_acquire`) | A7 semaphore only → timed hold + gen fence + journaled SleepUntilDeadline (settlement ≠ provider done) |
+| Busy-owner hold bound + generation fence (#7337/#7340) | `BusyOwnerModel` + live `DispatchPool::try_acquire` → `try_acquire_fenced` (GS-062) / `fork_rebind` / `deadline_wake` | A7 semaphore only → timed hold + gen fence + journaled SleepUntilDeadline (settlement ≠ provider done) |
 | Verify-before-route (#7010) | Ingress `verify_publish_event` + `verify_tripwire` | Likely present → tripwire tests fail if verify moves after stamp-seen/fanout |
 | Audit TLV framing (#7492) | Encoding for future `toron-audit` (L1) | Git-only → TLV field tags when captain authorizes L1 |
 | Workflow deletion honesty (#7735) | `WorkflowLifecycle::soft_delete` under one lock | Soft-delete + clear executable atomically — no ghost runnable |
@@ -690,7 +696,7 @@ only (composability, explicit boundaries, honesty at I/O). **No ACP port.**
 #### Adapt
 | Buzz (PR) | Toron map | Constraint |
 |---|---|---|
-| Kick convergence (#7298) + presence fail-closed (#7532) | `bus::convergence` + `presence_admit` on SQLite | **Never Redis**; library gate exists — live fanout still calls `presence_admit(true)` (hardcoded); real confirm bit = ask-user |
+| Kick convergence (#7298) + presence fail-closed (#7532) | `bus::convergence` + `presence_admit` on SQLite store `ping()` (GS-062) | **Never Redis**; ChannelStore leave/close Propose→Commit→FireLive; ephemeral fanout admits only when store healthy |
 | Newest-first thread windows (#7823) + read-state snapshots (#7572) | Query shape honesty for mention/session context | Effect-oriented; **no chat-UX clone** |
 | NIP-29 extract (#7285) | Pure membership core (channels already membership-gated) | Keep testable; no admin HTTP sprawl |
 | Correlated OK false (#6961) | Refuse with reason at ingress (no silent drop) | Already BusError path; keep correlated |
@@ -701,20 +707,20 @@ only (composability, explicit boundaries, honesty at I/O). **No ACP port.**
 #### Ranked backlog (captain bar: as-is → to-be)
 
 **P0**
-| Item | As-is | To-be | Status @ GS-061 ship |
+| Item | As-is | To-be | Status @ GS-062 cutover |
 |---|---|---|---|
-| Busy-owner bound + gen fence + deadline wake | Semaphore / one-in-flight | Timed hold + fence + SleepUntilDeadline effects | **Library wedge / not on live path** — pure `busy_owner` + `try_acquire_fenced` / Drop→Release exist; **live `DispatchPool` callers still use `try_acquire`** (cutover is ask-user with captain) |
+| Busy-owner bound + gen fence + deadline wake | Semaphore / one-in-flight | Timed hold + fence + SleepUntilDeadline effects | **Landed** (GS-062) — public `try_acquire` routes through fence; Drop→Release; e2e Option API maps Err→None |
 | Verify-before-route tripwires | Verify first in publish | Stage-order + forge tripwires | **Landed** (tripwire tests on publish path) |
 
 **P1**
 | Item | As-is | To-be | Status |
 |---|---|---|---|
-| Convergence kick/revoke/disable | Best-effort projection | Commit-only FireLive + re-add fence | **Library wedge / not on live path** — pure `bus::convergence` module + unit tests; no host/engine call sites wiring Kick/FireLive |
-| Workflow delete honesty | Ad-hoc remove paths | Soft-delete + executable one lock | **Library wedge / not on live path** — `WorkflowLifecycle` pure module; not wired into engine delete paths |
-| Delivery-cursor dedup | Agent-key heuristics risk | Session delivery cursor | **Library wedge / not on live path** — `DeliveryCursorStore` pure module; not wired into prompt/mention hosts |
-| Wake quiet vs deaf telemetry | Heartbeat exists | Explicit heartbeats_ok / heartbeat_deaf + flywheel classifier | **Partial library** — `WakeStats` fields in toron; flywheel `wake_liveness` classifier is on sibling branch `gs-061/wake-liveness` — **do not claim flywheel module landed inside toron** |
+| Convergence kick/revoke/disable | Best-effort projection | Commit-only FireLive + re-add fence | **Landed** (GS-062) — `ChannelStore::leave`/`close` Propose→Commit→FireLive; join honors ReAdd fence |
+| Workflow delete honesty | Ad-hoc remove paths | Soft-delete + executable one lock | **Landed** (GS-062) — `WorkflowHost` registers + `soft_delete_workflow` + `try_start` gate on spawn |
+| Delivery-cursor dedup | Agent-key heuristics risk | Session delivery cursor | **Landed** (GS-062) — `wire_mention_dispatch_with_cursor`; session = assignee; agent-key≠proof asserted |
+| Wake quiet vs deaf telemetry | Heartbeat exists | Explicit heartbeats_ok / heartbeat_deaf + flywheel classifier | **Landed** (GS-062 flywheel) — `wake_liveness` on `/health`; event/hb stamps split; toron `WakeStats` fields remain |
 
-> Honesty note (Rev9 auto-fix): `presence_admit(true)` is hardcoded at the ephemeral fanout site — verify+auth today stand in for a real presence-authority confirm bit. **Do not claim Buzz #7532 fail-closed presence as live product behavior** until a confirm flag exists. Captain has not answered ask-user on fenced-acquire cutover vs library-only.
+> Honesty note (Rev10 GS-062): ephemeral fanout calls `presence_admit(store.is_healthy())` via SQLite `SELECT 1` — **never Redis**. Verify-before-route tripwires unchanged (still Landed).
 
 **P2** (backlog only — not this ship)
 | Item | Notes |

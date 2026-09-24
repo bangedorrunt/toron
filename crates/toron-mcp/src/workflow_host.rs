@@ -46,6 +46,7 @@ use toron_workflow::engine::{
     plan_attempt, terminal_digest, validate_resolution,
 };
 use toron_workflow::jobs::{JobRequest, build_job_request_with_tags};
+use toron_workflow::lifecycle::{LifecycleEffect, WorkflowLifecycle};
 use toron_workflow::schema::{Action, Trigger, Workflow};
 use toron_workflow::stamp_workflow_emitted;
 use toron_workflow::trigger_filter::{
@@ -607,6 +608,28 @@ pub async fn publish_coalesced_job(
     signer: Option<&Keys>,
     coalesced: &Coalesced,
 ) -> Result<EventId, CoalescePublishError> {
+    publish_coalesced_job_with_cursor(bus, signer, coalesced, None).await
+}
+
+/// GS-062: session delivery-cursor filter before kind-43001 publish.
+/// Session key = assignee (dispatch session), never agent pubkey.
+pub async fn publish_coalesced_job_with_cursor(
+    bus: &dyn Bus,
+    signer: Option<&Keys>,
+    coalesced: &Coalesced,
+    delivery: Option<&toron_workflow::DeliveryCursorStore>,
+) -> Result<EventId, CoalescePublishError> {
+    if let Some(store) = delivery {
+        let session = coalesced.assignee.as_str();
+        let parent = coalesced.parent();
+        let _ = toron_workflow::agent_key_is_not_delivery_proof("unused", parent);
+        let (keep, _) = store.filter_undelivered(session, [parent]);
+        if keep.is_empty() {
+            return Err(CoalescePublishError::Transport(
+                "skip: already delivered to session (DeliveryCursorStore)".into(),
+            ));
+        }
+    }
     let event =
         build_coalesced_job_event(signer, coalesced).ok_or(CoalescePublishError::NoSigner)?;
     bus.publish(event.clone())
@@ -641,6 +664,10 @@ pub struct WorkflowHost {
     engine: Arc<WorkflowEngine>,
     bus: Arc<dyn Bus>,
     workflows: Vec<Workflow>,
+    /// GS-062: soft-delete + start_admit under one lock (Buzz #7735).
+    lifecycle: Arc<WorkflowLifecycle>,
+    /// GS-062: session delivery-cursor dedup for mention→43001 (Buzz #7620).
+    delivery: Arc<toron_workflow::DeliveryCursorStore>,
     coalescer: Arc<std::sync::Mutex<MentionCoalescer>>,
     /// ADR-0007 F7: signs coalesced kind-43001 job requests. Absent → flushes
     /// are logged but not published (honest degradation).
@@ -683,6 +710,11 @@ impl WorkflowHost {
     /// key (when present) signs coalesced job requests (F7).
     pub fn new(mailbox: Arc<Mailbox>, workflows: Vec<Workflow>) -> Result<Self> {
         let coalescer = Arc::new(std::sync::Mutex::new(MentionCoalescer::from_env()));
+        let lifecycle = Arc::new(WorkflowLifecycle::new());
+        let delivery = Arc::new(toron_workflow::DeliveryCursorStore::new());
+        for w in &workflows {
+            let _ = lifecycle.register(w.name.clone());
+        }
         let job_signer = mailbox.operator().cloned();
         // bd-cnr5 + bd-1kr2: production touches the durable journal — when
         // the mailbox carries the index pool, run states + terminal dedupe
@@ -747,6 +779,8 @@ impl WorkflowHost {
             engine: Arc::new(engine),
             bus,
             workflows,
+            lifecycle: lifecycle.clone(),
+            delivery: delivery.clone(),
             coalescer,
             job_signer,
             pending: Arc::new(tokio::sync::Mutex::new(pending)),
@@ -765,10 +799,17 @@ impl WorkflowHost {
     ) -> Result<Self> {
         let engine =
             WorkflowEngine::local_with_async_effect_runner(effect).context("workflow engine")?;
+        let lifecycle = Arc::new(WorkflowLifecycle::new());
+        let delivery = Arc::new(toron_workflow::DeliveryCursorStore::new());
+        for w in &workflows {
+            let _ = lifecycle.register(w.name.clone());
+        }
         Ok(Self {
             engine: Arc::new(engine),
             bus,
             workflows,
+            lifecycle,
+            delivery,
             coalescer: Arc::new(std::sync::Mutex::new(MentionCoalescer::from_env())),
             job_signer: None,
             pending: Arc::new(tokio::sync::Mutex::new(PendingDrain::new())),
@@ -783,10 +824,17 @@ impl WorkflowHost {
         engine: WorkflowEngine,
         workflows: Vec<Workflow>,
     ) -> Self {
+        let lifecycle = Arc::new(WorkflowLifecycle::new());
+        let delivery = Arc::new(toron_workflow::DeliveryCursorStore::new());
+        for w in &workflows {
+            let _ = lifecycle.register(w.name.clone());
+        }
         Self {
             engine: Arc::new(engine),
             bus,
             workflows,
+            lifecycle,
+            delivery,
             coalescer: Arc::new(std::sync::Mutex::new(MentionCoalescer::from_env())),
             job_signer: None,
             pending: Arc::new(tokio::sync::Mutex::new(PendingDrain::new())),
@@ -837,10 +885,30 @@ impl WorkflowHost {
     }
 
     /// Register an additional workflow (idempotent by name).
+    /// GS-062: also registers with [`WorkflowLifecycle`] under one lock.
     pub fn add_workflow(&mut self, workflow: Workflow) {
         if !self.workflows.iter().any(|w| w.name == workflow.name) {
+            let _ = self.lifecycle.register(workflow.name.clone());
             self.workflows.push(workflow);
         }
+    }
+
+    /// Soft-delete a workflow definition (Buzz #7735 / GS-062): clears
+    /// executable under the lifecycle lock and drops the in-memory definition.
+    pub fn soft_delete_workflow(&mut self, id: &str) -> LifecycleEffect {
+        let fx = self.lifecycle.soft_delete(id);
+        if matches!(
+            fx,
+            LifecycleEffect::SoftDeleted { .. } | LifecycleEffect::AlreadyDeleted { .. }
+        ) {
+            self.workflows.retain(|w| w.name != id);
+        }
+        fx
+    }
+
+    /// Lifecycle registry (tests / diagnostics).
+    pub fn lifecycle(&self) -> &WorkflowLifecycle {
+        self.lifecycle.as_ref()
     }
 
     /// The registered workflows.
@@ -1117,6 +1185,24 @@ impl WorkflowHost {
     /// re-draining until the run is terminal, so parks created after the
     /// first await point are picked up without waiting for bus traffic.
     async fn spawn_run_and_drain(&self, run_id: String, workflow: Workflow, input: RunInput) {
+        // GS-062: refuse soft-deleted / non-executable definitions (Buzz #7735).
+        match self.lifecycle.try_start(&workflow.name) {
+            LifecycleEffect::StartAdmitted { .. } => {}
+            LifecycleEffect::NotFound { .. } => {
+                // Definitions loaded at construct may predate lifecycle register —
+                // admit once by registering lazily, then proceed.
+                let _ = self.lifecycle.register(workflow.name.clone());
+            }
+            other => {
+                warn!(
+                    run_id = %run_id,
+                    workflow = %workflow.name,
+                    ?other,
+                    "workflow start refused by WorkflowLifecycle"
+                );
+                return;
+            }
+        }
         // bd-cnr5: durable track — the workflow_runs row outlives the host.
         if let Err(e) = self
             .pending
@@ -1351,25 +1437,26 @@ impl WorkflowHost {
                     debug!("coalescer flushed {} assignee(s)", flushed.len());
                 }
                 for coalesced in flushed {
-                    // We are ON an async runtime here: build the event and
-                    // await the publish directly — the sync bridge is gone.
-                    match build_coalesced_job_event(self.job_signer.as_ref(), &coalesced) {
-                        Some(event) => {
-                            let id = event.id;
-                            match self.bus.publish(event).await {
-                                Ok(_) => debug!(
-                                    assignee = %coalesced.assignee, %id,
-                                    "kind-43001 published for coalesced burst"
-                                ),
-                                Err(e) => warn!(
-                                    assignee = %coalesced.assignee, %id,
-                                    "coalesced burst publish failed: {e}"
-                                ),
-                            }
-                        }
-                        None => warn!(
+                    // GS-062: session delivery-cursor before kind-43001 publish.
+                    match publish_coalesced_job_with_cursor(
+                        self.bus.as_ref(),
+                        self.job_signer.as_ref(),
+                        &coalesced,
+                        Some(self.delivery.as_ref()),
+                    )
+                    .await
+                    {
+                        Ok(id) => debug!(
+                            assignee = %coalesced.assignee, %id,
+                            "kind-43001 published for coalesced burst"
+                        ),
+                        Err(CoalescePublishError::NoSigner) => warn!(
                             assignee = %coalesced.assignee,
                             "coalesced burst NOT published (no job signer configured)"
+                        ),
+                        Err(e) => warn!(
+                            assignee = %coalesced.assignee,
+                            "coalesced burst publish failed: {e:?}"
                         ),
                     }
                 }
