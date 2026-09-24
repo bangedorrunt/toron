@@ -149,7 +149,7 @@ async fn sc10_reservation_released_dispatches_job_on_bus_event() {
     )
     .expect("build job request");
 
-    let pool = DispatchPool::new(DispatchConfig { max_concurrency: 1 });
+    let pool = DispatchPool::new(DispatchConfig { max_concurrency: 1, ..DispatchConfig::default() });
     let depth = pool.enqueue(QueuedJob {
         job_id: job_req.id.to_hex(),
         assignee: "OCBeta".into(),

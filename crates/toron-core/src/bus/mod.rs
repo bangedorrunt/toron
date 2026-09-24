@@ -9,6 +9,7 @@
 
 pub mod addressable;
 pub mod common;
+pub mod convergence;
 pub mod event_store;
 pub mod federation;
 pub mod filter;
@@ -23,6 +24,7 @@ pub mod relay_bus;
 pub mod scoping;
 pub mod subscription;
 pub mod ttl;
+pub mod verify_tripwire;
 pub mod wake;
 
 pub use addressable::{
@@ -43,6 +45,8 @@ pub use scoping::{
 };
 pub use subscription::{Subscription, SubscriptionEvent, SubscriptionId};
 pub use ttl::{DEFAULT_ENVELOPE_TTL_SECS, EnvelopeTtl};
+pub use convergence::{AuthorityOp, Convergence, ConvergenceEffect, ConvergenceMsg, presence_admit, tick as convergence_tick};
+pub use verify_tripwire::{PUBLISH_STAGE_ORDER, StageTrace, assert_stage_before, publish_source_verify_before_side_effects};
 
 use crate::nostr::Event;
 

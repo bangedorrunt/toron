@@ -251,6 +251,10 @@ pub struct SubscriberStats {
     pub shed: u64,
     /// Cursor the shed consumer must replay from (set iff `shed > 0`).
     pub resync_from: Option<String>,
+    /// Heartbeats successfully written (quiet bus proof).
+    pub heartbeats_ok: u64,
+    /// Heartbeat write failures (deaf watcher — counted, then dropped).
+    pub heartbeat_deaf: u64,
 }
 
 /// Pure server configuration. No I/O here — [`WakeServer::start`] performs.
@@ -363,6 +367,10 @@ pub struct WakeStats {
     pub delivered: u64,
     /// Sum of shed frames across finished subscribers.
     pub shed: u64,
+    /// Sum of successful quiet-bus heartbeats.
+    pub heartbeats_ok: u64,
+    /// Sum of heartbeat write failures (deaf watchers).
+    pub heartbeat_deaf: u64,
 }
 
 /// RAII serving handle: dropping removes the socket file and aborts tasks.
@@ -529,6 +537,8 @@ impl WakeHandle {
             subscribers_live: self.live.load(Ordering::SeqCst) as usize,
             delivered: done.iter().map(|s| s.delivered).sum(),
             shed: done.iter().map(|s| s.shed).sum(),
+            heartbeats_ok: done.iter().map(|s| s.heartbeats_ok).sum(),
+            heartbeat_deaf: done.iter().map(|s| s.heartbeat_deaf).sum(),
         }
     }
 }
@@ -616,8 +626,10 @@ async fn serve_subscriber(
                         .await
                         .is_err()
                     {
+                        stats.heartbeat_deaf += 1;
                         return stats;
                     }
+                    stats.heartbeats_ok += 1;
                     stats.delivered += 1;
                     heartbeat_at = clock.now_ms().saturating_add(config.heartbeat_ms);
                 }
