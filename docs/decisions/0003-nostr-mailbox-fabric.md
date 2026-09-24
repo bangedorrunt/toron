@@ -20,8 +20,9 @@ related: [flywheel, herdr, mcp_agent_mail_rust, nostrdevkit/nostr]
 > **Revision 10 (2026-09-24):** GS-062 live cutover of GS-061 library wedges onto
 > real call sites (DispatchPool `try_acquire` → fenced; SQLite `presence_admit`;
 > ChannelStore leave/close convergence; WorkflowLifecycle on WorkflowHost;
-> DeliveryCursor on mention→43001; flywheel `wake_liveness` on `/health`). Landed
-> only where call sites prove it.
+> DeliveryCursor on mention→43001). Landed only where call sites on **this toron
+> tip** prove it. Flywheel `wake_liveness` on `/health` is **not** claimed here —
+> sibling ship `gs-062/wake-health`.
 >
 > **Revision 9 (2026-09-24):** GS-061 Buzz leverage refresh. Scout:
 > `/home/box/agent-data/grok-ship/reports/GS-061.md` (SHA256
@@ -718,7 +719,7 @@ only (composability, explicit boundaries, honesty at I/O). **No ACP port.**
 | Convergence kick/revoke/disable | Best-effort projection | Commit-only FireLive + re-add fence | **Landed** (GS-062) — `ChannelStore::leave`/`close` Propose→Commit→FireLive; join honors ReAdd fence |
 | Workflow delete honesty | Ad-hoc remove paths | Soft-delete + executable one lock | **Landed** (GS-062) — `WorkflowHost` registers + `soft_delete_workflow` + `try_start` gate on spawn |
 | Delivery-cursor dedup | Agent-key heuristics risk | Session delivery cursor | **Landed** (GS-062) — `wire_mention_dispatch_with_cursor`; session = assignee; agent-key≠proof asserted |
-| Wake quiet vs deaf telemetry | Heartbeat exists | Explicit heartbeats_ok / heartbeat_deaf + flywheel classifier | **Landed** (GS-062 flywheel) — `wake_liveness` on `/health`; event/hb stamps split; toron `WakeStats` fields remain |
+| Wake quiet vs deaf telemetry | Heartbeat exists | Explicit heartbeats_ok / heartbeat_deaf + flywheel classifier | **Sibling ship** `gs-062/wake-health` — not claimed on this toron tip; toron `WakeStats` fields remain; flywheel `wake_liveness` on `/health` lands on wake-health |
 
 > Honesty note (Rev10 GS-062): ephemeral fanout calls `presence_admit(store.is_healthy())` via SQLite `SELECT 1` — **never Redis**. Verify-before-route tripwires unchanged (still Landed).
 

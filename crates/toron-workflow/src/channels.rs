@@ -1054,6 +1054,38 @@ mod tests {
         assert!(!store.is_member("c", &bob.public_key()));
     }
 
+    /// GS-062: two mismatched joins under held Committed both FenceReAdd
+    /// (fence must not be one-shot — Committed stays held).
+    #[test]
+    fn two_mismatched_joins_under_held_committed_both_fence() {
+        let store = ChannelStore::new();
+        let alice = keys();
+        let bob = keys();
+        let carol = keys();
+        store
+            .create_channel(&alice.public_key(), "c", "C", false, None)
+            .expect("create");
+        store.hold_authority_for_test(
+            "c",
+            Convergence::Committed {
+                op: AuthorityOp::Kick {
+                    target: bob.public_key().to_hex(),
+                },
+                generation: 7,
+            },
+        );
+        let err1 = store
+            .join("c", &bob.public_key())
+            .expect_err("first re-add must fence");
+        assert!(err1.to_string().contains("fenced"), "first: {err1}");
+        let err2 = store
+            .join("c", &carol.public_key())
+            .expect_err("second re-add must still fence under held Committed");
+        assert!(err2.to_string().contains("fenced"), "second: {err2}");
+        assert!(!store.is_member("c", &bob.public_key()));
+        assert!(!store.is_member("c", &carol.public_key()));
+    }
+
     /// GS-062: close runs Propose→Commit→FireLive(Disable) then sets closed.
     #[test]
     fn close_fires_disable_only_after_commit() {

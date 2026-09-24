@@ -619,11 +619,12 @@ pub async fn publish_coalesced_job_with_cursor(
     coalesced: &Coalesced,
     delivery: Option<&toron_workflow::DeliveryCursorStore>,
 ) -> Result<EventId, CoalescePublishError> {
+    let parent = coalesced.parent().to_string();
+    let session = coalesced.assignee.as_str();
     if let Some(store) = delivery {
-        let session = coalesced.assignee.as_str();
-        let parent = coalesced.parent();
-        let _ = toron_workflow::agent_key_is_not_delivery_proof("unused", parent);
-        let (keep, _) = store.filter_undelivered(session, [parent]);
+        let _ = toron_workflow::agent_key_is_not_delivery_proof("unused", &parent);
+        // Peek only — do not advance before build/publish (silent-loss hazard).
+        let (keep, _) = store.peek_undelivered(session, [parent.clone()]);
         if keep.is_empty() {
             return Err(CoalescePublishError::Transport(
                 "skip: already delivered to session (DeliveryCursorStore)".into(),
@@ -635,6 +636,10 @@ pub async fn publish_coalesced_job_with_cursor(
     bus.publish(event.clone())
         .await
         .map_err(|e| CoalescePublishError::Transport(format!("bus publish: {e}")))?;
+    // Mark only after successful publish.
+    if let Some(store) = delivery {
+        store.mark_delivered(session, [parent]);
+    }
     Ok(event.id)
 }
 

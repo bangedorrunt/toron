@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 ### Docs
-- ADR-0003 **Rev10** GS-062 live cutover: flip P0 busy-owner / P1 convergence / lifecycle / delivery-cursor / wake classifier to **Landed** where call sites prove it; presence fail-closed via SQLite `ping()` (never Redis).
+- ADR-0003 **Rev10** GS-062 live cutover: flip P0 busy-owner / P1 convergence / lifecycle / delivery-cursor to **Landed** where toron call sites prove it; presence fail-closed via SQLite `ping()` (never Redis). Flywheel wake classifier (`wake_liveness`) is sibling ship `gs-062/wake-health` — not claimed on this toron tip.
 - `docs/notes/2026-08-07-buzz-agentmail-comparison.md` — GS-062 delta (cutover landed).
 
 ### Changed
