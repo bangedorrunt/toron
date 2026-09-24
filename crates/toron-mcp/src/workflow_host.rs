@@ -33,7 +33,7 @@ use anyhow::{Context, Result};
 use nostr::prelude::{Event, EventBuilder, EventId, FinalizeEvent, Keys, Kind, Tag, Timestamp};
 use toron_core::bus::{Bus, SubscriptionEvent};
 use toron_core::mailbox::{Mailbox, SendMessage, UnwrappedMail};
-use toron_workflow::coalesce::{CoalesceDecision, Coalesced, MentionCoalescer, RequeueOutcome, RequeueSchedule};
+use toron_workflow::coalesce::{CoalesceDecision, Coalesced, DlqReason, MentionCoalescer, RequeueOutcome, RequeueSchedule};
 use toron_workflow::engine::{
     ActionInvocation, ActionPartition, AsyncEffectRunner, AsyncRunJournal, CleanupKind,
     CleanupRequest, Decision, DispatchPlan, EffectJournalMode, EffectView,
@@ -97,9 +97,11 @@ fn mail_outcome(send: Result<usize, String>, key: String) -> ProviderOutcome {
     }
 }
 
-/// Map one coalescer decision onto a provider outcome (bd-zczp): Buffered
-/// records the burst-buffer hand-off; FlushNow publishes with typed
-/// errors — NoSigner is proven never-sent, transport loss is ambiguous.
+/// Map one coalescer decision onto a provider outcome (bd-zczp / GS-062 T1):
+/// Buffered and Transient-requeued deferred stay [`ProviderOutcome::Deferred`]
+/// (journal [`EffectState::Accepted`] — non-Settled) until kind-43001 is on
+/// the wire. FlushNow publish success / AlreadyDelivered → Delivered/Settled.
+/// Exhausted → ProvenFailed + DLQ (T2); NoSigner → ProvenFailed (T3 align).
 /// Async: the flush publish is awaited inline (bd-ckkf).
 async fn mention_outcome(
     bus: &dyn Bus,
@@ -111,9 +113,12 @@ async fn mention_outcome(
     coalescer: Option<&std::sync::Mutex<MentionCoalescer>>,
 ) -> ProviderOutcome {
     match decision {
-        CoalesceDecision::Buffered { .. } => ProviderOutcome::Delivered(serde_json::json!({
+        // T1: CapMention Buffered must NOT Settled-Delivered before tick/wire publish.
+        CoalesceDecision::Buffered { .. } => ProviderOutcome::Deferred(serde_json::json!({
             "ok": true,
             "coalesced": true,
+            "deferred": true,
+            "buffered": true,
             "effect_key": key,
         })),
         // GS-062: FlushNow shares peek→publish→mark with the trigger-loop
@@ -127,7 +132,8 @@ async fn mention_outcome(
                     Err(e) => {
                         // Do not drop the already-flushed burst — Transient
                         // requeue with backoff (TRANSPORT-REQUEUE-HOT-SPIN).
-                        // Quiet Delivered{deferred} (not Ambiguous→Unknown).
+                        // T1: Deferred (Accepted), not Delivered{deferred} Settled,
+                        // not Ambiguous→Unknown dual-publish.
                         if let Some(c) = coalescer {
                             let mut g = c.lock().unwrap_or_else(PoisonError::into_inner);
                             let assignee = coalesced.assignee.clone();
@@ -137,7 +143,7 @@ async fn mention_outcome(
                                 RequeueSchedule::Transient,
                             ) {
                                 RequeueOutcome::Queued { .. } => {
-                                    return ProviderOutcome::Delivered(serde_json::json!({
+                                    return ProviderOutcome::Deferred(serde_json::json!({
                                         "ok": true,
                                         "coalesced": true,
                                         "deferred": true,
@@ -146,8 +152,7 @@ async fn mention_outcome(
                                     }));
                                 }
                                 RequeueOutcome::Exhausted => {
-                                    // Clear retry map (coalesce also clears on
-                                    // Exhausted; host mirror keeps map honest).
+                                    // T2: requeue already parked whole batch on DLQ.
                                     g.clear_retry(&assignee);
                                     return ProviderOutcome::ProvenFailed(format!(
                                         "dispatch acquire retry budget exhausted: {e}"
@@ -180,9 +185,14 @@ async fn mention_outcome(
                     }))
                 }
                 Err(CoalescePublishError::NoSigner) => {
-                    // GS-062 NOSIGNER-FAILED-PLUS-REQUEUE: terminal config
-                    // failure — ProvenFailed with NO requeue (never Failed+requeue).
-                    let _ = coalesced;
+                    // GS-062 NOSIGNER + T3: terminal ProvenFailed, park DLQ
+                    // (never Failed+requeue; never silent drop).
+                    if let Some(c) = coalescer {
+                        let mut g = c.lock().unwrap_or_else(PoisonError::into_inner);
+                        g.park_dlq(coalesced, DlqReason::NoSigner);
+                    } else {
+                        let _ = coalesced;
+                    }
                     ProviderOutcome::ProvenFailed("no job signer configured".to_string())
                 }
                 Err(CoalescePublishError::AlreadyDelivered) => {
@@ -219,13 +229,10 @@ async fn mention_outcome(
                     )
                 }
                 Err(CoalescePublishError::Transport(e)) => {
-                    // GS-062 FLUSHNOW-TRANSPORT-AMBIGUOUS-AFTER-REQUEUE:
-                    // Transient requeue + quiet Delivered{deferred} (same as
-                    // acquire Err) — NOT Ambiguous→Unknown dual-publish via
-                    // DispatchJob force-retry.
-                    // Exhausted: clear_retry + ProvenFailed (same terminal
-                    // class as acquire Exhausted — no force-retry dual-publish;
-                    // captain ask-user still owns broader settlement design).
+                    // GS-062 T1: Transient requeue + Deferred (Accepted) —
+                    // NOT Delivered{deferred} Settled, NOT Ambiguous→Unknown
+                    // dual-publish via DispatchJob force-retry.
+                    // T2 Exhausted: DLQ park (in requeue) + ProvenFailed.
                     if let Some(c) = coalescer {
                         let mut g = c.lock().unwrap_or_else(PoisonError::into_inner);
                         let assignee = coalesced.assignee.clone();
@@ -235,7 +242,7 @@ async fn mention_outcome(
                             RequeueSchedule::Transient,
                         ) {
                             RequeueOutcome::Queued { .. } => {
-                                ProviderOutcome::Delivered(serde_json::json!({
+                                ProviderOutcome::Deferred(serde_json::json!({
                                     "ok": true,
                                     "coalesced": true,
                                     "deferred": true,
@@ -268,6 +275,9 @@ async fn mention_outcome(
 fn fenced_outcome(key: &str, result: anyhow::Result<DispatchResult>) -> serde_json::Value {
     match result {
         Ok(res) if res.state == EffectState::Settled => res.outcome,
+        // T1 Deferred → Accepted: runner sees hand-off payload; journal stays
+        // non-Settled (not Delivered/Settled before wire publish).
+        Ok(res) if res.state == EffectState::Accepted => res.outcome,
         Ok(res) => serde_json::json!({
             "ok": false,
             "effect_key": key,
@@ -590,17 +600,16 @@ async fn dispatch_host_sink(
                 )
                 .await
                 {
-                    ProviderOutcome::Delivered(v) => Ok(v),
+                    ProviderOutcome::Delivered(v) | ProviderOutcome::Deferred(v) => Ok(v),
                     ProviderOutcome::ProvenFailed(m) | ProviderOutcome::Ambiguous(m) => {
                         Err(anyhow::anyhow!(m))
                     }
                 };
             };
-            // bd-1kr2: fenced @mention hand-off. Buffered means the
-            // burst buffer accepted the mention (the host tick owns the
-            // later 43001 publish — Settled here records the hand-off,
-            // not the wire delivery; the in-memory coalescer's
-            // crash-loss window is unchanged and documented).
+            // bd-1kr2 / GS-062 T1: fenced @mention hand-off. Buffered is
+            // Deferred→Accepted (non-Settled) until tick/wire publish;
+            // Settled only on FlushNow publish success / AlreadyDelivered.
+            // In-memory coalescer crash-loss window unchanged and documented.
             // A coalesced 43001 merges N effects into one job, so no
             // single corr rides it — per-effect corr lives in the
             // journal's transport_corr projection (linked by dispatch).
@@ -1789,10 +1798,11 @@ impl WorkflowHost {
                             "coalesced burst deferred (dispatch acquire): {e} — requeue"
                         ),
                         RequeueOutcome::Exhausted => {
+                            // T2: requeue parked whole batch on DLQ (not silent drop).
                             c.clear_retry(&assignee);
                             warn!(
                                 assignee = %assignee,
-                                "coalesced burst dropped (dispatch acquire retry budget exhausted): {e}"
+                                "coalesced burst DLQ (dispatch acquire retry budget exhausted): {e}"
                             );
                         }
                     }
@@ -1843,10 +1853,17 @@ impl WorkflowHost {
                     let _ = c.requeue(coalesced, now_ms(), RequeueSchedule::FreshWindow);
                 }
                 Err(CoalescePublishError::NoSigner) => {
-                    // GS-062 NOSIGNER-FAILED-PLUS-REQUEUE: terminal — no requeue.
+                    // GS-062 T3: durable DLQ (align FlushNow ProvenFailed) —
+                    // NOT intentional warn!+silent drop.
+                    let assignee = coalesced.assignee.clone();
+                    let mut c = self
+                        .coalescer
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner);
+                    c.park_dlq(coalesced, DlqReason::NoSigner);
                     warn!(
-                        assignee = %coalesced.assignee,
-                        "coalesced burst NOT published (no job signer) — terminal drop"
+                        assignee = %assignee,
+                        "coalesced burst NOT published (no job signer) — parked DLQ"
                     );
                 }
                 Err(CoalescePublishError::Transport(e)) => {
@@ -1864,10 +1881,11 @@ impl WorkflowHost {
                             "coalesced burst publish transport failed: {e} — requeue"
                         ),
                         RequeueOutcome::Exhausted => {
+                            // T2: requeue parked whole batch on DLQ (not silent drop).
                             c.clear_retry(&assignee);
                             warn!(
                                 assignee = %assignee,
-                                "coalesced burst dropped (transport retry budget exhausted): {e}"
+                                "coalesced burst DLQ (transport retry budget exhausted): {e}"
                             );
                         }
                     }
@@ -2455,6 +2473,9 @@ fn classify_outcome(
             None,
         ),
         ProviderOutcome::Delivered(v) => (EffectState::Settled, None, Some(v.clone())),
+        // T1: Deferred → Accepted (non-Settled). Default CapMention capability
+        // refuses blind retry — no Ambiguous→Unknown dual-publish storm.
+        ProviderOutcome::Deferred(v) => (EffectState::Accepted, None, Some(v.clone())),
         ProviderOutcome::ProvenFailed(msg) => (
             EffectState::Failed,
             Some(serde_json::json!({"error": msg})),
@@ -2674,7 +2695,7 @@ impl EffectDispatcher {
                 claim_token: Some(token),
                 state: to,
                 evidence: Some(match outcome {
-                    ProviderOutcome::Delivered(v) => v.clone(),
+                    ProviderOutcome::Delivered(v) | ProviderOutcome::Deferred(v) => v.clone(),
                     ProviderOutcome::ProvenFailed(m) | ProviderOutcome::Ambiguous(m) => {
                         serde_json::json!({"error": m})
                     }
@@ -6622,11 +6643,11 @@ steps:
         )
         .await;
         match &out {
-            ProviderOutcome::Delivered(v) => {
+            ProviderOutcome::Deferred(v) => {
                 assert_eq!(v["deferred"], serde_json::json!(true), "{v}");
             }
             other => panic!(
-                "FlushNow Transport+requeue must quiet Delivered deferred (not Ambiguous), got {other:?}"
+                "FlushNow Transport+requeue must Deferred (not Settled Delivered / not Ambiguous), got {other:?}"
             ),
         }
         assert!(
@@ -6760,9 +6781,9 @@ steps:
         assert!(COALESCE_FLUSH_TICK_MS > 0);
     }
 
-    /// GS-062 LOW FLUSHNOW-ACQUIRE: requeue restores quietly (Delivered deferred).
+    /// GS-062 T1 FLUSHNOW-ACQUIRE: requeue restores as Deferred (non-Settled).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn flushnow_acquire_requeue_is_quiet_delivered() {
+    async fn flushnow_acquire_requeue_is_deferred() {
         use toron_core::bus::in_process::{InProcessBus, InProcessBusConfig};
         use toron_core::index::schema;
         use toron_workflow::coalesce::InboundMention;
@@ -6812,10 +6833,10 @@ steps:
         .await;
         drop(hold);
         match out {
-            ProviderOutcome::Delivered(v) => {
+            ProviderOutcome::Deferred(v) => {
                 assert_eq!(v["deferred"], serde_json::json!(true), "{v}");
             }
-            other => panic!("acquire+requeue must quiet Delivered deferred, got {other:?}"),
+            other => panic!("acquire+requeue must Deferred (non-Settled), got {other:?}"),
         }
         assert!(
             coalescer
@@ -6880,6 +6901,349 @@ steps:
             0,
             "NoSigner must NOT requeue (Failed+requeue forbidden)"
         );
+        assert_eq!(
+            coalescer
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .dlq_len(),
+            1,
+            "NoSigner must park batch on DLQ"
+        );
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// GS-062 T1(a): FlushNow Transient Queued must NOT Settled-Delivered.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn t1_flushnow_transient_queued_is_deferred_not_settled() {
+        use toron_core::bus::in_process::{InProcessBus, InProcessBusConfig};
+        use toron_core::index::schema;
+        use toron_core::index::workflow_effects::EffectState;
+        use toron_workflow::coalesce::InboundMention;
+        use toron_workflow::DeliveryCursorStore;
+
+        let db = std::env::temp_dir().join(format!("wf-t1-fn-{}.sqlite", uuid::Uuid::new_v4()));
+        let pool = schema::connect(db.to_str().unwrap())
+            .await
+            .expect("connect");
+        schema::migrate(&pool).await.expect("migrate");
+        let inner = Arc::new(
+            InProcessBus::open(pool, InProcessBusConfig::default())
+                .await
+                .expect("bus"),
+        );
+        let bus: Arc<dyn Bus> = Arc::new(FailBus { inner });
+        let store = DeliveryCursorStore::new();
+        let signer = Keys::generate();
+        let session = "oc-t1-fn";
+        let batch = Coalesced {
+            assignee: session.into(),
+            mentions: vec![InboundMention {
+                assignee: session.into(),
+                parent: "t1-fn-parent".into(),
+                spec: json!({"t": "t1"}),
+            }],
+            first_arrival_ms: 0,
+        };
+        let coalescer = std::sync::Mutex::new(MentionCoalescer::with_defaults());
+        let out = mention_outcome(
+            bus.as_ref(),
+            Some(&signer),
+            CoalesceDecision::FlushNow(batch),
+            "ek-t1-fn".into(),
+            Some(&store),
+            None,
+            Some(&coalescer),
+        )
+        .await;
+        let deferred = match &out {
+            ProviderOutcome::Deferred(v) => v.clone(),
+            other => panic!("T1 FlushNow Transient Queued must Deferred, got {other:?}"),
+        };
+        assert_eq!(deferred["deferred"], serde_json::json!(true));
+        let (state, _, _) = classify_outcome(&out);
+        assert_eq!(
+            state,
+            EffectState::Accepted,
+            "Deferred must journal Accepted (non-Settled), not Settled"
+        );
+        assert!(
+            coalescer
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .buffered_for(session)
+                >= 1,
+            "Transient Queued must requeue burst"
+        );
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// GS-062 T1(a): CapMention Buffered must NOT Settled-Delivered before tick publish.
+    #[test]
+    fn t1_capmention_buffered_is_deferred_not_settled() {
+        use toron_core::index::workflow_effects::EffectState;
+        let out = {
+            // mention_outcome Buffered arm is sync in effect (no I/O) — drive via
+            // the decision mapping by constructing the Deferred shape classify uses.
+            // Full async path covered by dispatch_job_actions_coalesce_via_runner.
+            ProviderOutcome::Deferred(serde_json::json!({
+                "ok": true,
+                "coalesced": true,
+                "deferred": true,
+                "buffered": true,
+                "effect_key": "ek-buf",
+            }))
+        };
+        // Also exercise live mention_outcome Buffered via block_on-free classify of
+        // the real function in the async twin below; here lock the settle class.
+        let (state, _, val) = classify_outcome(&out);
+        assert_eq!(state, EffectState::Accepted, "Buffered must not Settled");
+        assert_ne!(state, EffectState::Settled);
+        assert_eq!(val.unwrap()["buffered"], serde_json::json!(true));
+    }
+
+    /// GS-062 T1(a): CapMention Buffered via mention_outcome is Deferred.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn t1_capmention_buffered_mention_outcome_deferred() {
+        use toron_core::bus::in_process::{InProcessBus, InProcessBusConfig};
+        use toron_core::index::schema;
+        use toron_core::index::workflow_effects::EffectState;
+        use toron_workflow::DeliveryCursorStore;
+
+        let db = std::env::temp_dir().join(format!("wf-t1-buf-{}.sqlite", uuid::Uuid::new_v4()));
+        let pool = schema::connect(db.to_str().unwrap())
+            .await
+            .expect("connect");
+        schema::migrate(&pool).await.expect("migrate");
+        let bus: Arc<dyn Bus> = Arc::new(
+            InProcessBus::open(pool, InProcessBusConfig::default())
+                .await
+                .expect("bus"),
+        );
+        let store = DeliveryCursorStore::new();
+        let out = mention_outcome(
+            bus.as_ref(),
+            Some(&Keys::generate()),
+            CoalesceDecision::Buffered { buffered: 1 },
+            "ek-t1-buf".into(),
+            Some(&store),
+            None,
+            None,
+        )
+        .await;
+        match &out {
+            ProviderOutcome::Deferred(v) => {
+                assert_eq!(v["buffered"], serde_json::json!(true), "{v}");
+                assert_eq!(v["deferred"], serde_json::json!(true), "{v}");
+            }
+            other => panic!("Buffered must Deferred, got {other:?}"),
+        }
+        assert_eq!(classify_outcome(&out).0, EffectState::Accepted);
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// GS-062 T1(a): publish success Settles Delivered.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn t1_publish_success_settles_delivered() {
+        use toron_core::bus::in_process::{InProcessBus, InProcessBusConfig};
+        use toron_core::index::schema;
+        use toron_core::index::workflow_effects::EffectState;
+        use toron_workflow::coalesce::InboundMention;
+        use toron_workflow::DeliveryCursorStore;
+
+        let db = std::env::temp_dir().join(format!("wf-t1-ok-{}.sqlite", uuid::Uuid::new_v4()));
+        let pool = schema::connect(db.to_str().unwrap())
+            .await
+            .expect("connect");
+        schema::migrate(&pool).await.expect("migrate");
+        let bus: Arc<dyn Bus> = Arc::new(
+            InProcessBus::open(pool, InProcessBusConfig::default())
+                .await
+                .expect("bus"),
+        );
+        let store = DeliveryCursorStore::new();
+        let signer = Keys::generate();
+        let session = "oc-t1-ok";
+        let batch = Coalesced {
+            assignee: session.into(),
+            mentions: vec![InboundMention {
+                assignee: session.into(),
+                parent: "t1-ok-parent".into(),
+                spec: json!({"t": "ok"}),
+            }],
+            first_arrival_ms: 0,
+        };
+        let out = mention_outcome(
+            bus.as_ref(),
+            Some(&signer),
+            CoalesceDecision::FlushNow(batch),
+            "ek-t1-ok".into(),
+            Some(&store),
+            None,
+            None,
+        )
+        .await;
+        match &out {
+            ProviderOutcome::Delivered(v) => {
+                assert_eq!(v["published"], serde_json::json!(true), "{v}");
+            }
+            other => panic!("publish success must Delivered, got {other:?}"),
+        }
+        assert_eq!(classify_outcome(&out).0, EffectState::Settled);
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// GS-062 T2(b): Exhausted → ProvenFailed + DLQ whole batch; siblings preserved.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn t2_exhausted_proven_failed_dlq_preserves_siblings() {
+        use toron_core::bus::in_process::{InProcessBus, InProcessBusConfig};
+        use toron_core::index::schema;
+        use toron_workflow::coalesce::{InboundMention, REQUEUE_MAX_ATTEMPTS};
+        use toron_workflow::DeliveryCursorStore;
+
+        let db = std::env::temp_dir().join(format!("wf-t2-ex-{}.sqlite", uuid::Uuid::new_v4()));
+        let pool = schema::connect(db.to_str().unwrap())
+            .await
+            .expect("connect");
+        schema::migrate(&pool).await.expect("migrate");
+        let inner = Arc::new(
+            InProcessBus::open(pool, InProcessBusConfig::default())
+                .await
+                .expect("bus"),
+        );
+        let bus: Arc<dyn Bus> = Arc::new(FailBus { inner });
+        let store = DeliveryCursorStore::new();
+        let signer = Keys::generate();
+        let session = "oc-t2-ex";
+        let coalescer = std::sync::Mutex::new(MentionCoalescer::with_defaults());
+        // Sibling already Buffered (live buffer) — must survive Exhausted.
+        {
+            let mut g = coalescer.lock().unwrap_or_else(PoisonError::into_inner);
+            let _ = g.submit(
+                InboundMention {
+                    assignee: session.into(),
+                    parent: "sibling-live".into(),
+                    spec: json!({"sib": true}),
+                },
+                0,
+            );
+            assert_eq!(g.buffered_for(session), 1);
+        }
+        // Burn Transient budget with FlushNow Transport failures.
+        for i in 0..REQUEUE_MAX_ATTEMPTS {
+            let batch = Coalesced {
+                assignee: session.into(),
+                mentions: vec![InboundMention {
+                    assignee: session.into(),
+                    parent: format!("ex-parent-{i}"),
+                    spec: json!({"i": i}),
+                }],
+                first_arrival_ms: 0,
+            };
+            let out = mention_outcome(
+                bus.as_ref(),
+                Some(&signer),
+                CoalesceDecision::FlushNow(batch),
+                format!("ek-t2-ex-{i}"),
+                Some(&store),
+                None,
+                Some(&coalescer),
+            )
+            .await;
+            assert!(
+                matches!(out, ProviderOutcome::Deferred(_)),
+                "attempt {i} must Deferred Queued, got {out:?}"
+            );
+        }
+        let batch = Coalesced {
+            assignee: session.into(),
+            mentions: vec![InboundMention {
+                assignee: session.into(),
+                parent: "ex-parent-final".into(),
+                spec: json!({"final": true}),
+            }],
+            first_arrival_ms: 0,
+        };
+        let out = mention_outcome(
+            bus.as_ref(),
+            Some(&signer),
+            CoalesceDecision::FlushNow(batch),
+            "ek-t2-ex-final".into(),
+            Some(&store),
+            None,
+            Some(&coalescer),
+        )
+        .await;
+        assert!(
+            matches!(out, ProviderOutcome::ProvenFailed(_)),
+            "Exhausted must ProvenFailed (no force-retry), got {out:?}"
+        );
+        let g = coalescer.lock().unwrap_or_else(PoisonError::into_inner);
+        assert!(
+            g.dlq_len() >= 1,
+            "Exhausted must DLQ whole coalesced batch, dlq={}",
+            g.dlq_len()
+        );
+        assert!(
+            g.dlq_for(session)
+                .iter()
+                .any(|e| e.reason == DlqReason::Exhausted),
+            "DLQ reason Exhausted"
+        );
+        // Sibling + any Transient-restored parents may be in live buffer;
+        // critically the pre-existing sibling must not be wiped.
+        assert!(
+            g.buffered_for(session) >= 1,
+            "sibling Buffered must not be silently lost, buffered={}",
+            g.buffered_for(session)
+        );
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// GS-062 T3: timer NoSigner parks DLQ (not warn+silent drop).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn t3_timer_nosigner_parks_dlq() {
+        use toron_core::bus::in_process::{InProcessBus, InProcessBusConfig};
+        use toron_core::index::schema;
+        use toron_workflow::coalesce::InboundMention;
+
+        let db = std::env::temp_dir().join(format!("wf-t3-ns-{}.sqlite", uuid::Uuid::new_v4()));
+        let pool = schema::connect(db.to_str().unwrap())
+            .await
+            .expect("connect");
+        schema::migrate(&pool).await.expect("migrate");
+        let bus: Arc<dyn Bus> = Arc::new(
+            InProcessBus::open(pool, InProcessBusConfig::default())
+                .await
+                .expect("bus"),
+        );
+        // over_bus with no job signer — timer NoSigner path.
+        let host = WorkflowHost::over_bus(bus, vec![], None).expect("host");
+        {
+            let mut c = host
+                .coalescer()
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            c.submit(
+                InboundMention {
+                    assignee: "oc-t3".into(),
+                    parent: "t3-parent".into(),
+                    spec: json!({"t": 3}),
+                },
+                0,
+            );
+            // Force flush-ready so tick publishes immediately.
+            let batch = c.force_flush("oc-t3").expect("flush");
+            let _ = c.requeue(batch, 0, RequeueSchedule::FreshWindow);
+        }
+        // Drive one flush (timer path).
+        host.flush_coalesced_bursts().await;
+        let c = host
+            .coalescer()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        assert_eq!(c.dlq_len(), 1, "timer NoSigner must park DLQ, not drop");
+        assert_eq!(c.dlq_for("oc-t3")[0].reason, DlqReason::NoSigner);
+        assert_eq!(c.buffered_for("oc-t3"), 0, "must not live-requeue NoSigner");
         let _ = std::fs::remove_file(&db);
     }
 

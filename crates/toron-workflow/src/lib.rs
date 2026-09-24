@@ -48,7 +48,7 @@ pub use cron_failure::{
 
 pub use coalesce::{
     CoalesceDecision, Coalesced, DEFAULT_MAX_BUFFER, DEFAULT_SUBWINDOW, DEFAULT_WINDOW,
-    FlushOutcome, InboundMention, MentionCoalescer, REQUEUE_BACKOFF_BASE_MS,
+    DlqEntry, DlqReason, FlushOutcome, InboundMention, MentionCoalescer, REQUEUE_BACKOFF_BASE_MS,
     REQUEUE_BACKOFF_CAP_MS, REQUEUE_MAX_ATTEMPTS, RequeueOutcome, RequeueSchedule,
     subwindow_from_env, transient_backoff_delay_ms, window_from_env,
 };
