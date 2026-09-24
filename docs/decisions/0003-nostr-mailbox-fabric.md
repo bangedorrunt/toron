@@ -697,7 +697,7 @@ only (composability, explicit boundaries, honesty at I/O). **No ACP port.**
 #### Adapt
 | Buzz (PR) | Toron map | Constraint |
 |---|---|---|
-| Kick convergence (#7298) + presence fail-closed (#7532) | `bus::convergence` + `presence_admit` on SQLite store `ping()` (GS-062) | **Never Redis**; ChannelStore leave/close Propose→Commit→FireLive; ephemeral fanout admits only when store healthy |
+| Kick convergence (#7298) + presence fail-closed (#7532) | `bus::convergence` + `presence_admit` on SQLite store `ping()` (GS-062) | **Never Redis**; ChannelStore leave/close Propose→Commit→FireLive **+ hold authority** (live ReAdd fence; settle_authority ends hold; join attempted from held gen); ephemeral fanout admits only when store healthy |
 | Newest-first thread windows (#7823) + read-state snapshots (#7572) | Query shape honesty for mention/session context | Effect-oriented; **no chat-UX clone** |
 | NIP-29 extract (#7285) | Pure membership core (channels already membership-gated) | Keep testable; no admin HTTP sprawl |
 | Correlated OK false (#6961) | Refuse with reason at ingress (no silent drop) | Already BusError path; keep correlated |
@@ -710,18 +710,18 @@ only (composability, explicit boundaries, honesty at I/O). **No ACP port.**
 **P0**
 | Item | As-is | To-be | Status @ GS-062 cutover |
 |---|---|---|---|
-| Busy-owner bound + gen fence + deadline wake | Semaphore / one-in-flight | Timed hold + fence + SleepUntilDeadline effects | **Landed** (GS-062) — public `try_acquire` routes through fence; Drop→Release; e2e Option API maps Err→None |
+| Busy-owner bound + gen fence + deadline wake | Semaphore / one-in-flight | Timed hold + fence + SleepUntilDeadline effects | **Landed** (GS-062 C) — live hosts use `try_acquire_fenced` / `try_acquire_for_host` and journal/park SleepUntilDeadline; `try_acquire` Option Err→None is **e2e-only**, not live |
 | Verify-before-route tripwires | Verify first in publish | Stage-order + forge tripwires | **Landed** (tripwire tests on publish path) |
 
 **P1**
 | Item | As-is | To-be | Status |
 |---|---|---|---|
-| Convergence kick/revoke/disable | Best-effort projection | Commit-only FireLive + re-add fence | **Landed** (GS-062) — `ChannelStore::leave`/`close` Propose→Commit→FireLive; join honors ReAdd fence |
-| Workflow delete honesty | Ad-hoc remove paths | Soft-delete + executable one lock | **Landed** (GS-062) — `WorkflowHost` registers + `soft_delete_workflow` + `try_start` gate on spawn |
+| Convergence kick/revoke/disable | Best-effort projection | Commit-only FireLive + re-add fence | **Landed** (GS-062 A) — leave/close Propose→Commit→FireLive **hold** authority across critical section; join FenceReAdd on live path; `settle_authority` ends hold. Join attempted gen derived from **held** (not global counter) so other-channel bumps cannot skip fence |
+| Workflow delete honesty | Ad-hoc remove paths / Vec copy on Clone | Soft-delete + executable one lock + **shared Arc definition registry** | **Landed** (GS-062 B) — as-is: `workflows: Vec` copied on Clone (soft_delete invisible to trigger loop) → to-be: `Arc<Mutex<Vec<Workflow>>>` shared with lifecycle; soft_delete_workflow + try_start + clones see one list |
 | Delivery-cursor dedup | Agent-key heuristics risk | Session delivery cursor | **Landed** (GS-062) — `wire_mention_dispatch_with_cursor`; session = assignee; agent-key≠proof asserted |
 | Wake quiet vs deaf telemetry | Heartbeat exists | Explicit heartbeats_ok / heartbeat_deaf + flywheel classifier | **Sibling ship** `gs-062/wake-health` — not claimed on this toron tip; toron `WakeStats` fields remain; flywheel `wake_liveness` on `/health` lands on wake-health |
 
-> Honesty note (Rev10 GS-062): ephemeral fanout calls `presence_admit(store.is_healthy())` via SQLite `SELECT 1` — **never Redis**. Verify-before-route tripwires unchanged (still Landed).
+> Honesty note (Rev10 GS-062): ephemeral fanout calls `presence_admit(store.is_healthy())` via SQLite `SELECT 1` — **never Redis**. Verify-before-route tripwires unchanged (still Landed). ChannelStore ReAdd fencing is **Landed** on the live path: leave/close hold authority after FireLive; join FenceReAdd until `settle_authority`; attempted gen from held generation (cross-channel counter bumps cannot skip fence).
 
 **P2** (backlog only — not this ship)
 | Item | Notes |

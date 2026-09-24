@@ -65,6 +65,49 @@ impl Default for DispatchConfig {
     }
 }
 
+
+/// Host-facing result of [`DispatchPool::try_acquire_for_host`] (GS-062 C).
+/// Live dispatch must consume this (or raw [`DispatchPool::try_acquire_fenced`])
+/// — never the Option shim that drops Sleep/Fence effects.
+pub enum DispatchAcquire<'a> {
+    /// Permit granted; Drop releases busy holder + slot.
+    Granted(DispatchPermit<'a>),
+    /// Agent busy — host must journal/park until `until_ms`, then
+    /// [`DispatchPool::deadline_wake`] (settlement ≠ provider done).
+    Park {
+        agent: String,
+        until_ms: u64,
+        effects: Vec<BusyOwnerEffect>,
+    },
+    /// Fenced stale / hold expired / other non-park refusal — do not treat as
+    /// "slot free".
+    Refused(Vec<BusyOwnerEffect>),
+    /// Empty Err from fenced path: Acquired then semaphore race-loss (holder
+    /// rolled back). Retry later; no journalable busy-owner sleep.
+    CapContention,
+}
+
+impl std::fmt::Debug for DispatchAcquire<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Granted(_) => f.write_str("Granted(..)"),
+            Self::Park {
+                agent,
+                until_ms,
+                effects,
+            } => f
+                .debug_struct("Park")
+                .field("agent", agent)
+                .field("until_ms", until_ms)
+                .field("effects", effects)
+                .finish(),
+            Self::Refused(fx) => f.debug_tuple("Refused").field(fx).finish(),
+            Self::CapContention => f.write_str("CapContention"),
+        }
+    }
+}
+
+
 /// The in-process dispatch pool (A7).
 pub struct DispatchPool {
     config: DispatchConfig,
@@ -114,13 +157,12 @@ impl DispatchPool {
         pool
     }
 
-    /// Live cutover (GS-062): route through the busy-owner fence with wall-clock
-    /// `now_ms` and the agent's current generation (0 for a fresh never-forked
-    /// acquire — honest per `BusyOwnerModel`). Preserves `Option<DispatchPermit>`
-    /// for e2e: `Ok` → `Some`; busy hold / fence / empty contention → `None`.
-    /// Callers that need `SleepUntilDeadline` / `FencedStale` effects must use
-    /// [`Self::try_acquire_fenced`] directly (sc10/sc12 one-in-flight stays on
-    /// this thin wrapper).
+    /// **E2e / Option shim only (GS-062 ask-user C):** maps fenced `Err`
+    /// (including `SleepUntilDeadline` / `HoldContinued` / `HoldExpired` /
+    /// `FencedStale`) → `None`. **Not** the live production path — hosts must
+    /// call [`Self::try_acquire_fenced`] or [`Self::try_acquire_for_host`] and
+    /// journal/park `SleepUntilDeadline` (settlement ≠ provider done).
+    /// sc10/sc12 one-in-flight tests may keep this thin wrapper.
     pub fn try_acquire(&self, agent: &str) -> Option<DispatchPermit<'_>> {
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -129,8 +171,7 @@ impl DispatchPool {
         let claimed_generation = self.generation_of(agent);
         match self.try_acquire_fenced(agent, now_ms, claimed_generation) {
             Ok(permit) => Some(permit),
-            // Busy / fenced / semaphore race-loss: Option API cannot express
-            // effects — map to None. Empty Err is cap contention after rollback.
+            // Option API drops effects — live hosts must not use this path.
             Err(_fx) => None,
         }
     }
@@ -258,6 +299,38 @@ impl DispatchPool {
                 }
             }
             _ => Err(fx),
+        }
+    }
+
+    /// GS-062 ask-user C live cutover: acquire for hosts that **must** observe
+    /// fenced effects. Never maps `SleepUntilDeadline` / `HoldContinued` /
+    /// `HoldExpired` / `FencedStale` → absence. Host journals/parks Sleep
+    /// (Resonate-style); settlement ≠ provider completion.
+    pub fn try_acquire_for_host(
+        &self,
+        agent: &str,
+        now_ms: u64,
+        claimed_generation: u64,
+    ) -> DispatchAcquire<'_> {
+        match self.try_acquire_fenced(agent, now_ms, claimed_generation) {
+            Ok(permit) => DispatchAcquire::Granted(permit),
+            Err(effects) if effects.is_empty() => DispatchAcquire::CapContention,
+            Err(effects) => {
+                let until_ms = effects.iter().find_map(|e| match e {
+                    BusyOwnerEffect::SleepUntilDeadline { until_ms, .. }
+                    | BusyOwnerEffect::HoldContinued { until_ms, .. } => Some(*until_ms),
+                    _ => None,
+                });
+                if let Some(until_ms) = until_ms {
+                    DispatchAcquire::Park {
+                        agent: agent.to_string(),
+                        until_ms,
+                        effects,
+                    }
+                } else {
+                    DispatchAcquire::Refused(effects)
+                }
+            }
         }
     }
 
@@ -523,5 +596,38 @@ mod tests {
         assert!(pool.busy_holder("a"));
         drop(ok);
         assert!(!pool.busy_holder("a"));
+    }
+
+    /// GS-062 C: live host acquire must surface SleepUntilDeadline (not None).
+    #[test]
+    fn try_acquire_for_host_parks_sleep_until_deadline() {
+        let pool = DispatchPool::new(DispatchConfig {
+            max_concurrency: 2,
+            hold_bound_ms: 1_000,
+        });
+        let _permit = pool
+            .try_acquire_fenced("a", 10, 0)
+            .expect("first fenced grant");
+        match pool.try_acquire_for_host("a", 20, 0) {
+            DispatchAcquire::Park {
+                until_ms, effects, ..
+            } => {
+                assert!(until_ms >= 20);
+                assert!(
+                    effects.iter().any(|e| matches!(
+                        e,
+                        BusyOwnerEffect::SleepUntilDeadline { .. }
+                            | BusyOwnerEffect::HoldContinued { .. }
+                    )),
+                    "expected Sleep/HoldContinued, got {effects:?}"
+                );
+            }
+            other => panic!("busy agent must Park with effects, got {other:?}"),
+        }
+        // Option shim still drops — prove why live must not use it.
+        assert!(
+            pool.try_acquire("a").is_none(),
+            "Option shim maps Sleep→None; hosts must use try_acquire_for_host"
+        );
     }
 }

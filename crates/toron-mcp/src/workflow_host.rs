@@ -105,6 +105,7 @@ async fn mention_outcome(
     signer: Option<&Keys>,
     decision: CoalesceDecision,
     key: String,
+    delivery: Option<&toron_workflow::DeliveryCursorStore>,
 ) -> ProviderOutcome {
     match decision {
         CoalesceDecision::Buffered { .. } => ProviderOutcome::Delivered(serde_json::json!({
@@ -112,8 +113,11 @@ async fn mention_outcome(
             "coalesced": true,
             "effect_key": key,
         })),
+        // GS-062: FlushNow shares peek→publish→mark with the trigger-loop
+        // timer flush via publish_coalesced_job_with_cursor (never delivery=None
+        // when the host owns a DeliveryCursorStore).
         CoalesceDecision::FlushNow(coalesced) => {
-            match publish_coalesced_job(bus, signer, &coalesced).await {
+            match publish_coalesced_job_with_cursor(bus, signer, &coalesced, delivery).await {
                 Ok(id) => ProviderOutcome::Delivered(serde_json::json!({
                     "ok": true,
                     "coalesced": false,
@@ -293,12 +297,29 @@ pub fn mailbox_async_effect_runner(
     dispatcher: Arc<std::sync::Mutex<Option<EffectDispatcher>>>,
     armor: Arc<SendArmor>,
 ) -> AsyncEffectRunner {
+    mailbox_async_effect_runner_with_delivery(
+        mailbox, coalescer, job_signer, dispatcher, armor, None,
+    )
+}
+
+/// Like [`mailbox_async_effect_runner`] with a shared session
+/// [`toron_workflow::DeliveryCursorStore`] so DispatchJob / cap FlushNow
+/// shares peek→publish→mark with the trigger-loop timer flush (GS-062).
+pub fn mailbox_async_effect_runner_with_delivery(
+    mailbox: Arc<Mailbox>,
+    coalescer: Arc<std::sync::Mutex<MentionCoalescer>>,
+    job_signer: Option<Keys>,
+    dispatcher: Arc<std::sync::Mutex<Option<EffectDispatcher>>>,
+    armor: Arc<SendArmor>,
+    delivery: Option<Arc<toron_workflow::DeliveryCursorStore>>,
+) -> AsyncEffectRunner {
     Arc::new(move |inv: &ActionInvocation| {
         let mailbox = mailbox.clone();
         let coalescer = coalescer.clone();
         let job_signer = job_signer.clone();
         let dispatcher = dispatcher.clone();
         let armor = armor.clone();
+        let delivery = delivery.clone();
         let inv = inv.clone();
         Box::pin(async move {
             // The `invoke` contract over an async provider: partition
@@ -319,6 +340,7 @@ pub fn mailbox_async_effect_runner(
                         job_signer,
                         dispatcher,
                         armor,
+                        delivery,
                         inv.clone(),
                     )
                     .await,
@@ -343,6 +365,7 @@ async fn dispatch_host_sink(
     job_signer: Option<Keys>,
     dispatcher: Arc<std::sync::Mutex<Option<EffectDispatcher>>>,
     armor: Arc<SendArmor>,
+    delivery: Option<Arc<toron_workflow::DeliveryCursorStore>>,
     inv: ActionInvocation,
 ) -> anyhow::Result<serde_json::Value> {
     match inv.action.clone() {
@@ -423,7 +446,14 @@ async fn dispatch_host_sink(
             let Some(disp) = disp else {
                 // No journal: direct hand-off; failures return Err
                 // so the normalization classifies them (I5) identically.
-                return match mention_outcome(bus.as_ref(), job_signer.as_ref(), decision, key).await
+                return match mention_outcome(
+                    bus.as_ref(),
+                    job_signer.as_ref(),
+                    decision,
+                    key,
+                    delivery.as_deref(),
+                )
+                .await
                 {
                     ProviderOutcome::Delivered(v) => Ok(v),
                     ProviderOutcome::ProvenFailed(m) | ProviderOutcome::Ambiguous(m) => {
@@ -446,8 +476,16 @@ async fn dispatch_host_sink(
                     let bus = bus.clone();
                     let job_signer = job_signer.clone();
                     let key = key.clone();
+                    let delivery = delivery.clone();
                     async move {
-                        mention_outcome(bus.as_ref(), job_signer.as_ref(), decision, key).await
+                        mention_outcome(
+                            bus.as_ref(),
+                            job_signer.as_ref(),
+                            decision,
+                            key,
+                            delivery.as_deref(),
+                        )
+                        .await
                     }
                 })
                 .await,
@@ -613,32 +651,64 @@ pub async fn publish_coalesced_job(
 
 /// GS-062: session delivery-cursor filter before kind-43001 publish.
 /// Session key = assignee (dispatch session), never agent pubkey.
+///
+/// Peeks/reserves **all** mention parent ids in the batch (not only
+/// [`Coalesced::parent`]): skip the whole batch only when none remain
+/// undelivered. Reserve under the lock before awaiting publish so concurrent
+/// with_cursor calls cannot double-publish; release reservation on transport
+/// failure.
 pub async fn publish_coalesced_job_with_cursor(
     bus: &dyn Bus,
     signer: Option<&Keys>,
     coalesced: &Coalesced,
     delivery: Option<&toron_workflow::DeliveryCursorStore>,
 ) -> Result<EventId, CoalescePublishError> {
-    let parent = coalesced.parent().to_string();
+    let parent_ids = coalesced.parent_ids();
     let session = coalesced.assignee.as_str();
+    let mut reserved: Vec<String> = Vec::new();
+    // DispatchJob / synthetic bursts may carry empty parents — no delivery id
+    // to dedup, so the cursor gate does not apply (do not treat keep=[] as skip).
     if let Some(store) = delivery {
-        let _ = toron_workflow::agent_key_is_not_delivery_proof("unused", &parent);
-        // Peek only — do not advance before build/publish (silent-loss hazard).
-        let (keep, _) = store.peek_undelivered(session, [parent.clone()]);
-        if keep.is_empty() {
-            return Err(CoalescePublishError::Transport(
-                "skip: already delivered to session (DeliveryCursorStore)".into(),
-            ));
+        if !parent_ids.is_empty() {
+            let proof_id = parent_ids.first().map(String::as_str).unwrap_or("");
+            let _ = toron_workflow::agent_key_is_not_delivery_proof("unused", proof_id);
+            // Reserve all parents under the lock — do not advance delivered yet.
+            let (keep, _) = store.reserve_undelivered(session, parent_ids.clone());
+            if keep.is_empty() {
+                return Err(CoalescePublishError::Transport(
+                    "skip: already delivered to session (DeliveryCursorStore)".into(),
+                ));
+            }
+            reserved = keep;
         }
     }
-    let event =
-        build_coalesced_job_event(signer, coalesced).ok_or(CoalescePublishError::NoSigner)?;
-    bus.publish(event.clone())
-        .await
-        .map_err(|e| CoalescePublishError::Transport(format!("bus publish: {e}")))?;
-    // Mark only after successful publish.
+    let event = match build_coalesced_job_event(signer, coalesced) {
+        Some(ev) => ev,
+        None => {
+            if let Some(store) = delivery {
+                store.release_reservation(session, &reserved);
+            }
+            return Err(CoalescePublishError::NoSigner);
+        }
+    };
+    match bus.publish(event.clone()).await {
+        Ok(_) => {}
+        Err(e) => {
+            if let Some(store) = delivery {
+                store.release_reservation(session, &reserved);
+            }
+            return Err(CoalescePublishError::Transport(format!("bus publish: {e}")));
+        }
+    }
+    // Mark only after successful publish (all reserved / batch parents).
     if let Some(store) = delivery {
-        store.mark_delivered(session, [parent]);
+        // Mark every parent in the batch (idempotent for already-delivered).
+        let to_mark = if reserved.is_empty() {
+            parent_ids
+        } else {
+            reserved
+        };
+        store.mark_delivered(session, to_mark);
     }
     Ok(event.id)
 }
@@ -668,7 +738,11 @@ fn now_ms() -> u64 {
 pub struct WorkflowHost {
     engine: Arc<WorkflowEngine>,
     bus: Arc<dyn Bus>,
-    workflows: Vec<Workflow>,
+    /// GS-062 ask-user B: definition list behind Arc so Clone (trigger-loop)
+    /// shares ONE registry with soft_delete_workflow / try_start / workflows().
+    /// Do NOT copy Vec on Clone — only lifecycle Arc was shared before, which
+    /// left trigger clones blind to soft_delete.
+    workflows: Arc<std::sync::Mutex<Vec<Workflow>>>,
     /// GS-062: soft-delete + start_admit under one lock (Buzz #7735).
     lifecycle: Arc<WorkflowLifecycle>,
     /// GS-062: session delivery-cursor dedup for mention→43001 (Buzz #7620).
@@ -690,7 +764,7 @@ pub struct WorkflowHost {
 impl std::fmt::Debug for WorkflowHost {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WorkflowHost")
-            .field("workflows", &self.workflows.len())
+            .field("workflows", &self.workflows.lock().map(|g| g.len()).unwrap_or(0))
             .field("engine", &self.engine)
             .field("has_job_signer", &self.job_signer.is_some())
             .field(
@@ -739,7 +813,7 @@ impl WorkflowHost {
         // breaker, explicit fallback) guards every mailbox send below.
         // bd-ctj7: no sync runner exists anymore — the engine computes pure
         // leaves itself and awaits the async seam for the rest.
-        let async_effect_runner = mailbox_async_effect_runner(
+        let async_effect_runner = mailbox_async_effect_runner_with_delivery(
             mailbox.clone(),
             coalescer.clone(),
             job_signer.clone(),
@@ -749,6 +823,7 @@ impl WorkflowHost {
                 ARMOR_SEND_TIMEOUT,
                 ARMOR_MAX_CONCURRENCY,
             )),
+            Some(delivery.clone()),
         );
         // bd-engine-run-path-journaling-fwlx (the Spec 6 flip): the host
         // really dispatches, so its engine is Enforced — an effectful leaf
@@ -783,7 +858,7 @@ impl WorkflowHost {
         Ok(Self {
             engine: Arc::new(engine),
             bus,
-            workflows,
+            workflows: Arc::new(std::sync::Mutex::new(workflows)),
             lifecycle: lifecycle.clone(),
             delivery: delivery.clone(),
             coalescer,
@@ -812,7 +887,7 @@ impl WorkflowHost {
         Ok(Self {
             engine: Arc::new(engine),
             bus,
-            workflows,
+            workflows: Arc::new(std::sync::Mutex::new(workflows)),
             lifecycle,
             delivery,
             coalescer: Arc::new(std::sync::Mutex::new(MentionCoalescer::from_env())),
@@ -837,7 +912,7 @@ impl WorkflowHost {
         Self {
             engine: Arc::new(engine),
             bus,
-            workflows,
+            workflows: Arc::new(std::sync::Mutex::new(workflows)),
             lifecycle,
             delivery,
             coalescer: Arc::new(std::sync::Mutex::new(MentionCoalescer::from_env())),
@@ -892,21 +967,29 @@ impl WorkflowHost {
     /// Register an additional workflow (idempotent by name).
     /// GS-062: also registers with [`WorkflowLifecycle`] under one lock.
     pub fn add_workflow(&mut self, workflow: Workflow) {
-        if !self.workflows.iter().any(|w| w.name == workflow.name) {
+        let mut defs = self
+            .workflows
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if !defs.iter().any(|w| w.name == workflow.name) {
             let _ = self.lifecycle.register(workflow.name.clone());
-            self.workflows.push(workflow);
+            defs.push(workflow);
         }
     }
 
     /// Soft-delete a workflow definition (Buzz #7735 / GS-062): clears
-    /// executable under the lifecycle lock and drops the in-memory definition.
+    /// executable under the lifecycle lock and drops the in-memory definition
+    /// from the **shared** Arc registry so Clone'd trigger-loop hosts see it.
     pub fn soft_delete_workflow(&mut self, id: &str) -> LifecycleEffect {
         let fx = self.lifecycle.soft_delete(id);
         if matches!(
             fx,
             LifecycleEffect::SoftDeleted { .. } | LifecycleEffect::AlreadyDeleted { .. }
         ) {
-            self.workflows.retain(|w| w.name != id);
+            self.workflows
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .retain(|w| w.name != id);
         }
         fx
     }
@@ -916,9 +999,12 @@ impl WorkflowHost {
         self.lifecycle.as_ref()
     }
 
-    /// The registered workflows.
-    pub fn workflows(&self) -> &[Workflow] {
-        &self.workflows
+    /// Snapshot of registered workflow definitions (shared Arc registry).
+    pub fn workflows(&self) -> Vec<Workflow> {
+        self.workflows
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// The host-owned pending lifecycle (bd-asx3).
@@ -1347,7 +1433,8 @@ impl WorkflowHost {
                     continue;
                 }
                 let kind = mail.rumor.kind.as_u16();
-                for workflow in &me.workflows {
+                let defs = me.workflows.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                for workflow in &defs {
                     let Some(trigger) = &workflow.trigger else {
                         continue;
                     };
@@ -1466,7 +1553,8 @@ impl WorkflowHost {
                     }
                 }
             }
-            for workflow in &self.workflows {
+            let defs = self.workflows.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            for workflow in &defs {
                 let Some(trigger) = &workflow.trigger else {
                     continue;
                 };
@@ -5448,5 +5536,277 @@ steps:
         );
         let _ = std::fs::remove_file(&db);
         let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// GS-062: multi-parent batch peeks/marks ALL parents; a later batch whose
+    /// first parent is already delivered still publishes undelivered siblings.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn multi_parent_cursor_marks_all_and_keeps_siblings() {
+        use toron_core::bus::in_process::{InProcessBus, InProcessBusConfig};
+        use toron_core::index::schema;
+        use toron_workflow::coalesce::InboundMention;
+        use toron_workflow::DeliveryCursorStore;
+
+        let db = std::env::temp_dir().join(format!("wf-mp-{}.sqlite", uuid::Uuid::new_v4()));
+        let pool = schema::connect(db.to_str().unwrap())
+            .await
+            .expect("connect");
+        schema::migrate(&pool).await.expect("migrate");
+        let bus: Arc<dyn Bus> = Arc::new(
+            InProcessBus::open(pool, InProcessBusConfig::default())
+                .await
+                .expect("bus"),
+        );
+        let store = DeliveryCursorStore::new();
+        let signer = Keys::generate();
+        let session = "oc-mp";
+
+        let batch1 = Coalesced {
+            assignee: session.into(),
+            mentions: vec![
+                InboundMention {
+                    assignee: session.into(),
+                    parent: "parent-a".into(),
+                    spec: json!({"text": "a"}),
+                },
+                InboundMention {
+                    assignee: session.into(),
+                    parent: "parent-b".into(),
+                    spec: json!({"text": "b"}),
+                },
+            ],
+            first_arrival_ms: 0,
+        };
+        let id1 = publish_coalesced_job_with_cursor(
+            bus.as_ref(),
+            Some(&signer),
+            &batch1,
+            Some(&store),
+        )
+        .await
+        .expect("first batch publishes");
+        assert!(!id1.to_hex().is_empty());
+        assert!(store.cursor(session).delivered.contains("parent-a"));
+        assert!(store.cursor(session).delivered.contains("parent-b"));
+
+        // Later batch: first parent already delivered, sibling new — must NOT
+        // skip the whole batch (silent sibling loss hazard).
+        let batch2 = Coalesced {
+            assignee: session.into(),
+            mentions: vec![
+                InboundMention {
+                    assignee: session.into(),
+                    parent: "parent-a".into(),
+                    spec: json!({"text": "a2"}),
+                },
+                InboundMention {
+                    assignee: session.into(),
+                    parent: "parent-c".into(),
+                    spec: json!({"text": "c"}),
+                },
+            ],
+            first_arrival_ms: 1,
+        };
+        let id2 = publish_coalesced_job_with_cursor(
+            bus.as_ref(),
+            Some(&signer),
+            &batch2,
+            Some(&store),
+        )
+        .await
+        .expect("sibling batch must publish when any parent undelivered");
+        assert_ne!(id1, id2);
+        assert!(store.cursor(session).delivered.contains("parent-c"));
+
+        // All parents delivered → skip.
+        let err = publish_coalesced_job_with_cursor(
+            bus.as_ref(),
+            Some(&signer),
+            &batch2,
+            Some(&store),
+        )
+        .await
+        .expect_err("fully delivered batch skips");
+        assert!(matches!(err, CoalescePublishError::Transport(_)));
+
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// GS-062: FlushNow path (mention_outcome) uses DeliveryCursorStore via
+    /// publish_coalesced_job_with_cursor — not delivery=None.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn flushnow_path_uses_delivery_cursor() {
+        use toron_core::bus::in_process::{InProcessBus, InProcessBusConfig};
+        use toron_core::index::schema;
+        use toron_workflow::coalesce::InboundMention;
+        use toron_workflow::DeliveryCursorStore;
+
+        let db = std::env::temp_dir().join(format!("wf-fn-cur-{}.sqlite", uuid::Uuid::new_v4()));
+        let pool = schema::connect(db.to_str().unwrap())
+            .await
+            .expect("connect");
+        schema::migrate(&pool).await.expect("migrate");
+        let bus: Arc<dyn Bus> = Arc::new(
+            InProcessBus::open(pool, InProcessBusConfig::default())
+                .await
+                .expect("bus"),
+        );
+        let delivery = DeliveryCursorStore::new();
+        let signer = Keys::generate();
+        let session = "oc-fn";
+        let batch = Coalesced {
+            assignee: session.into(),
+            mentions: vec![InboundMention {
+                assignee: session.into(),
+                parent: "fn-parent-1".into(),
+                spec: json!({"i": 0}),
+            }],
+            first_arrival_ms: 0,
+        };
+        let decision = CoalesceDecision::FlushNow(batch.clone());
+        let out = mention_outcome(
+            bus.as_ref(),
+            Some(&signer),
+            decision,
+            "effect-fn-1".into(),
+            Some(&delivery),
+        )
+        .await;
+        match out {
+            ProviderOutcome::Delivered(v) => {
+                assert_eq!(v["published"], serde_json::json!(true), "{v}");
+            }
+            other => panic!("expected Delivered, got {other:?}"),
+        }
+        assert!(
+            delivery.cursor(session).delivered.contains("fn-parent-1"),
+            "FlushNow must mark via with_cursor"
+        );
+        // Second FlushNow for same parent → Ambiguous skip (transport skip msg).
+        let out2 = mention_outcome(
+            bus.as_ref(),
+            Some(&signer),
+            CoalesceDecision::FlushNow(batch),
+            "effect-fn-2".into(),
+            Some(&delivery),
+        )
+        .await;
+        assert!(
+            matches!(out2, ProviderOutcome::Ambiguous(ref m) if m.contains("already delivered")),
+            "second FlushNow must skip via cursor, got {out2:?}"
+        );
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// GS-062: concurrent with_cursor reserve — only one publish wins; the
+    /// other sees keep empty (no double-publish). Deterministic, no sleeps.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_with_cursor_no_double_publish() {
+        use toron_core::bus::in_process::{InProcessBus, InProcessBusConfig};
+        use toron_core::index::schema;
+        use toron_workflow::coalesce::InboundMention;
+        use toron_workflow::DeliveryCursorStore;
+
+        let db = std::env::temp_dir().join(format!("wf-race-{}.sqlite", uuid::Uuid::new_v4()));
+        let pool = schema::connect(db.to_str().unwrap())
+            .await
+            .expect("connect");
+        schema::migrate(&pool).await.expect("migrate");
+        let bus: Arc<dyn Bus> = Arc::new(
+            InProcessBus::open(pool, InProcessBusConfig::default())
+                .await
+                .expect("bus"),
+        );
+        let store = Arc::new(DeliveryCursorStore::new());
+        let signer = Keys::generate();
+        let session = "oc-race";
+        let batch = Coalesced {
+            assignee: session.into(),
+            mentions: vec![InboundMention {
+                assignee: session.into(),
+                parent: "race-parent".into(),
+                spec: json!({"t": "race"}),
+            }],
+            first_arrival_ms: 0,
+        };
+
+        let store_a = store.clone();
+        let store_b = store.clone();
+        let bus_a = bus.clone();
+        let bus_b = bus.clone();
+        let batch_a = batch.clone();
+        let batch_b = batch.clone();
+        let signer_a = signer.clone();
+        let signer_b = signer.clone();
+
+        let (r1, r2) = tokio::join!(
+            publish_coalesced_job_with_cursor(
+                bus_a.as_ref(),
+                Some(&signer_a),
+                &batch_a,
+                Some(store_a.as_ref()),
+            ),
+            publish_coalesced_job_with_cursor(
+                bus_b.as_ref(),
+                Some(&signer_b),
+                &batch_b,
+                Some(store_b.as_ref()),
+            ),
+        );
+        let wins = [r1.is_ok(), r2.is_ok()].into_iter().filter(|x| *x).count();
+        let skips = [r1.is_err(), r2.is_err()]
+            .into_iter()
+            .filter(|x| *x)
+            .count();
+        assert_eq!(wins, 1, "exactly one publish wins, got r1={r1:?} r2={r2:?}");
+        assert_eq!(skips, 1, "exactly one skips as already in-flight/delivered");
+        assert!(store.cursor(session).delivered.contains("race-parent"));
+        assert!(store.cursor(session).in_flight.is_empty());
+
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// GS-062 ask-user B: Clone shares Arc definition registry — soft_delete
+    /// visible to the cloned trigger-loop host (not a Vec copy).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn clone_sees_soft_delete_on_shared_registry() {
+        use toron_core::bus::in_process::{InProcessBus, InProcessBusConfig};
+        use toron_core::index::schema;
+        use toron_workflow::schema::Workflow;
+
+        let db = std::env::temp_dir().join(format!("wf-arc-defs-{}.sqlite", uuid::Uuid::new_v4()));
+        let pool = schema::connect(db.to_str().unwrap()).await.expect("connect");
+        schema::migrate(&pool).await.expect("migrate");
+        let bus: Arc<dyn Bus> = Arc::new(
+            InProcessBus::open(pool, InProcessBusConfig::default())
+                .await
+                .expect("bus"),
+        );
+        let wf: Workflow = serde_json::from_value(serde_json::json!({
+            "name": "arc-wf",
+            "steps": []
+        }))
+        .expect("minimal workflow");
+        let mut host = WorkflowHost::over_bus(bus, vec![wf], None).expect("host");
+        let cloned = host.clone();
+        assert_eq!(cloned.workflows().len(), 1);
+        let fx = host.soft_delete_workflow("arc-wf");
+        assert!(matches!(
+            fx,
+            LifecycleEffect::SoftDeleted { .. } | LifecycleEffect::AlreadyDeleted { .. }
+        ));
+        assert!(
+            cloned.workflows().is_empty(),
+            "Clone must see soft_delete via shared Arc registry, got {:?}",
+            cloned.workflows().iter().map(|w| w.name.clone()).collect::<Vec<_>>()
+        );
+        assert!(
+            matches!(
+                cloned.lifecycle().try_start("arc-wf"),
+                LifecycleEffect::StartRefused { .. }
+            ),
+            "try_start must refuse soft-deleted via shared lifecycle"
+        );
+        let _ = std::fs::remove_file(&db);
     }
 }

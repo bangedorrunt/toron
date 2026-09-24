@@ -342,10 +342,11 @@ Captain cutover of GS-061 library wedges onto live call sites (branches
 
 | Item | Status |
 |------|--------|
-| Busy-owner live `try_acquire` → fenced | **Landed** |
+| Busy-owner live `try_acquire_fenced` / `try_acquire_for_host` (SleepUntilDeadline park; Option shim e2e-only) | **Landed** |
 | Presence `presence_admit(store.is_healthy())` | **Landed** (SQLite ping; never Redis) |
-| ChannelStore leave/close convergence | **Landed** |
-| WorkflowLifecycle on WorkflowHost | **Landed** |
+| ChannelStore leave/close Propose→Commit→FireLive + **hold** + settle_authority | **Landed** |
+| ChannelStore ReAdd fence (live leave→join) | **Landed** (attempted gen from held; cross-channel safe) |
+| WorkflowLifecycle on WorkflowHost + Arc shared definitions (Clone sees soft_delete) | **Landed** |
 | DeliveryCursor on mention→43001 | **Landed** |
 | Verify-before-route tripwires | **Landed** (unchanged; kept honest) |
 | flywheel wake_liveness on `/health` | **Sibling ship** `gs-062/wake-health` — not claimed on this toron tip |

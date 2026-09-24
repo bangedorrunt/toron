@@ -199,8 +199,8 @@ impl ChannelStore {
 
     /// Join a channel (idempotent).
     ///
-    /// GS-062: if a Kick/Disable generation is held on this channel, a re-add
-    /// under a mismatched generation is fenced (Buzz #7298).
+    /// GS-062 / Buzz #7298 (ask-user A): ReAdd fences when Kick/Disable is held.
+    /// Production leave/close hold authority after FireLive; settle_authority ends it.
     pub fn join(&self, channel_id: &str, npub: &PublicKey) -> anyhow::Result<()> {
         let mut inner = self.inner.lock();
         let ch = inner
@@ -212,21 +212,35 @@ impl ChannelStore {
             anyhow::bail!("channel {channel_id} is closed — join is refused");
         }
         if let Some(held) = inner.authority.get(channel_id) {
-            let attempted = inner.authority_generation.saturating_add(1);
-            let (next, fx) = convergence_tick(
-                Some(held),
-                &ConvergenceMsg::ReAdd {
-                    generation: attempted,
-                },
-            );
-            if fx
-                .iter()
-                .any(|e| matches!(e, ConvergenceEffect::FenceReAdd { .. }))
-            {
-                if let Some(state) = next {
-                    inner.authority.insert(channel_id.to_string(), state);
+            let held_gen = match held {
+                Convergence::Pending { generation, .. }
+                | Convergence::Committed { generation, .. } => *generation,
+                Convergence::Fenced {
+                    held_generation, ..
+                } => *held_generation,
+                Convergence::Rejected { .. } => 0,
+            };
+            if !matches!(held, Convergence::Rejected { .. }) {
+                // Always ≠ held_gen so other channels' global counter bumps
+                // cannot accidentally equal `held` and skip FenceReAdd.
+                let attempted = held_gen.wrapping_add(1);
+                let (next, fx) = convergence_tick(
+                    Some(held),
+                    &ConvergenceMsg::ReAdd {
+                        generation: attempted,
+                    },
+                );
+                if fx
+                    .iter()
+                    .any(|e| matches!(e, ConvergenceEffect::FenceReAdd { .. }))
+                {
+                    if let Some(state) = next {
+                        inner.authority.insert(channel_id.to_string(), state);
+                    }
+                    anyhow::bail!(
+                        "channel {channel_id} re-add fenced under held authority generation"
+                    );
                 }
-                anyhow::bail!("channel {channel_id} re-add fenced under held authority generation");
             }
         }
         let ch = inner
@@ -292,14 +306,22 @@ impl ChannelStore {
             .get_mut(channel_id)
             .ok_or_else(|| anyhow::anyhow!("channel not found: {channel_id}"))?;
         ch.members.remove(&target);
-        // Authority critical section ends with FireLive under this lock —
-        // clear so steady-state re-join is not permanently fenced.
-        inner.authority.remove(channel_id);
+        // Ask-user A supersession (GS-062): HOLD Committed across the
+        // post-FireLive critical section so a production join hits FenceReAdd.
+        // (Authority already inserted above.) End with [`Self::settle_authority`].
         drop(inner);
         Ok(())
     }
 
-    /// Hold a convergence state so join's ReAdd fence is observable (GS-062 live tests).
+    /// End the post-FireLive authority critical section (GS-062 ask-user A).
+    /// After settle, join is no longer ReAdd-fenced by this Kick/Disable hold.
+    /// Idempotent.
+    pub fn settle_authority(&self, channel_id: &str) {
+        self.inner.lock().authority.remove(channel_id);
+    }
+
+    /// Test helper: insert a held convergence state. Production leave/close
+    /// already hold after FireLive; this remains for unit tests that skip leave.
     pub fn hold_authority_for_test(&self, channel_id: &str, state: Convergence) {
         self.inner
             .lock()
@@ -355,7 +377,7 @@ impl ChannelStore {
             .get_mut(channel_id)
             .ok_or_else(|| anyhow::anyhow!("channel not found: {channel_id}"))?;
         ch.closed = true;
-        inner.authority.remove(channel_id);
+        // Ask-user A supersession: HOLD Disable across critical section.
         drop(inner);
         Ok(())
     }
@@ -1019,14 +1041,20 @@ mod tests {
         store.join("c", &bob.public_key()).expect("join");
         store.leave("c", &bob.public_key()).expect("leave");
         assert!(!store.is_member("c", &bob.public_key()));
-        // Steady-state re-join after FireLive clears authority is allowed.
+        // Ask-user A: authority held after FireLive — production join FenceReAdd.
+        let err = store
+            .join("c", &bob.public_key())
+            .expect_err("re-join under held Kick must fence");
+        assert!(err.to_string().contains("fenced"), "got {err}");
+        store.settle_authority("c");
         store
             .join("c", &bob.public_key())
-            .expect("re-join after kick settle");
+            .expect("re-join after settle_authority");
         assert!(store.is_member("c", &bob.public_key()));
     }
 
-    /// GS-062: ReAdd under a held Kick generation is fenced at join.
+    /// GS-062: ReAdd under a held Kick generation is fenced at join
+    /// (hold_authority_for_test helper; production path covered below).
     #[test]
     fn join_honors_readd_fence_under_held_kick() {
         let store = ChannelStore::new();
@@ -1052,6 +1080,56 @@ mod tests {
             "expected fence, got {err}"
         );
         assert!(!store.is_member("c", &bob.public_key()));
+    }
+
+    /// GS-062 ask-user A: leave holds authority — production join FenceReAdd
+    /// without hold_authority_for_test.
+    #[test]
+    fn leave_holds_authority_join_fences_on_live_path() {
+        let store = ChannelStore::new();
+        let alice = keys();
+        let bob = keys();
+        store
+            .create_channel(&alice.public_key(), "c", "C", false, None)
+            .expect("create");
+        store.join("c", &bob.public_key()).expect("join");
+        store.leave("c", &bob.public_key()).expect("leave");
+        let err = store
+            .join("c", &bob.public_key())
+            .expect_err("live leave→rejoin must FenceReAdd while held");
+        assert!(err.to_string().contains("fenced"), "got {err}");
+        store.settle_authority("c");
+        store.join("c", &bob.public_key()).expect("after settle");
+    }
+
+    /// GS-062 ask-user A hazard: other channels' leave/close bump the global
+    /// authority_generation; join must still fence using held generation
+    /// (not authority_generation+1 which can skip FenceReAdd).
+    #[test]
+    fn join_fences_despite_other_channel_generation_bumps() {
+        let store = ChannelStore::new();
+        let alice = keys();
+        let bob = keys();
+        let carol = keys();
+        store
+            .create_channel(&alice.public_key(), "a", "A", false, None)
+            .expect("a");
+        store
+            .create_channel(&alice.public_key(), "b", "B", false, None)
+            .expect("b");
+        store.join("a", &bob.public_key()).expect("bob a");
+        store.join("b", &carol.public_key()).expect("carol b");
+        store.leave("a", &bob.public_key()).expect("leave a — hold Kick");
+        // Bump global authority_generation via other channel leave/close.
+        store.leave("b", &carol.public_key()).expect("leave b");
+        store
+            .create_channel(&alice.public_key(), "d", "D", false, None)
+            .expect("d");
+        store.close("d", &alice.public_key()).expect("close d bumps gen");
+        let err = store
+            .join("a", &bob.public_key())
+            .expect_err("must still FenceReAdd on a despite other-channel bumps");
+        assert!(err.to_string().contains("fenced"), "got {err}");
     }
 
     /// GS-062: two mismatched joins under held Committed both FenceReAdd
