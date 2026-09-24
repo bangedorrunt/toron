@@ -366,7 +366,12 @@ impl MentionCoalescer {
         if buf.mentions.is_empty() {
             buf.first_arrival_ms = now_ms;
         }
-        buf.last_arrival_ms = now_ms;
+        // GS-062 TRANSPORT backoff clobber: Transient requeue schedules readiness
+        // by pushing `last_arrival_ms` into the future (ready_at - subwindow). A
+        // concurrent submit must NOT collapse that schedule via `= now_ms`, or
+        // the sub-window fast path fires early under mentions-during-backoff.
+        // Preserve any scheduled-ahead readiness with max(now, existing).
+        buf.last_arrival_ms = now_ms.max(buf.last_arrival_ms);
         buf.push_dedup(mention);
 
         if buf.mentions.len() >= self.max_buffer {
@@ -481,6 +486,10 @@ impl MentionCoalescer {
             RequeueSchedule::Transient => {
                 let attempt = self.retry_attempts(assignee.as_str());
                 if attempt >= REQUEUE_MAX_ATTEMPTS {
+                    // GS-062 Exhausted poison: leaving retry_attempts at MAX
+                    // makes every later Transient Exhaust immediately. Clear so
+                    // a fresh burst (or host clear_retry) can retry again.
+                    self.retry_attempts.remove(assignee.as_str());
                     return RequeueOutcome::Exhausted;
                 }
                 let delay = transient_backoff_delay_ms(assignee.as_str(), attempt);
@@ -676,8 +685,21 @@ mod tests {
             RequeueOutcome::Exhausted
         );
         assert_eq!(c.buffered_for("oc"), 0, "Exhausted must not restore");
-        c.clear_retry("oc");
-        assert_eq!(c.retry_attempts("oc"), 0);
+        assert_eq!(
+            c.retry_attempts("oc"),
+            0,
+            "Exhausted must clear retry map (no poison for later Transient)"
+        );
+        // Fresh burst after Exhausted must be able to Transient again.
+        c.submit(m("oc", "e2", "again"), 10_000);
+        let batch = c.force_flush("oc").expect("flushed");
+        assert!(
+            matches!(
+                c.requeue(batch, 10_000, RequeueSchedule::Transient),
+                RequeueOutcome::Queued { attempt: 1, delay_ms: 0 }
+            ),
+            "post-Exhausted Transient must not poison-Exhaust"
+        );
     }
 
     /// GS-062 REQUEUE-FLUSH-READY-LOST-ON-CONCURRENT-SUBMIT: Transient schedule
@@ -707,6 +729,55 @@ mod tests {
         let parents: Vec<_> = flushed[0].mentions.iter().map(|x| x.parent.as_str()).collect();
         assert!(parents.contains(&"concurrent"), "{parents:?}");
         assert!(parents.contains(&"failed"), "{parents:?}");
+    }
+
+    /// GS-062 TRANSPORT backoff clobber: submit during Transient backoff must
+    /// NOT collapse `last_arrival_ms` and fire the sub-window early.
+    #[test]
+    fn submit_during_transient_backoff_does_not_fire_early() {
+        // Subwindow 100ms so attempt-1 Transient backoff (~250ms+) exceeds it
+        // and a clobbering submit would otherwise fire early via subwindow.
+        let mut c = MentionCoalescer::new(
+            Duration::from_millis(2_000),
+            Duration::from_millis(100),
+            64,
+        );
+        // Burn attempt 0 (immediate) so next Transient has real backoff.
+        c.submit(m("oc", "e1", "hi"), 0);
+        let batch = c.force_flush("oc").expect("flushed");
+        assert!(matches!(
+            c.requeue(batch, 1_000, RequeueSchedule::Transient),
+            RequeueOutcome::Queued { delay_ms: 0, .. }
+        ));
+        let batch = c.tick(1_000).pop().expect("immediate flush");
+        let q = c.requeue(batch, 2_000, RequeueSchedule::Transient);
+        let delay_ms = match q {
+            RequeueOutcome::Queued { delay_ms, attempt } => {
+                assert_eq!(attempt, 2);
+                assert!(
+                    delay_ms > 100,
+                    "need backoff > subwindow to expose clobber, got {delay_ms}"
+                );
+                delay_ms
+            }
+            other => panic!("expected Queued backoff, got {other:?}"),
+        };
+        // Concurrent mention during backoff — must preserve scheduled readiness.
+        c.submit(m("oc", "live", "during-backoff"), 2_100);
+        assert_eq!(c.buffered_for("oc"), 2, "merge concurrent into backoff buffer");
+        assert!(
+            c.tick(2_100 + 100).is_empty(),
+            "subwindow after concurrent submit must NOT flush before backoff ready_at"
+        );
+        assert!(
+            c.tick(2_000 + delay_ms - 1).is_empty(),
+            "must still wait for full Transient backoff"
+        );
+        let flushed = c.tick(2_000 + delay_ms);
+        assert_eq!(flushed.len(), 1, "flush only at scheduled ready_at");
+        let parents: Vec<_> = flushed[0].mentions.iter().map(|x| x.parent.as_str()).collect();
+        assert!(parents.contains(&"e1"), "{parents:?}");
+        assert!(parents.contains(&"live"), "{parents:?}");
     }
 
     /// GS-062 PARTIAL-KEEP-FULL-SPEC: retain_parents drops SkipAlreadyDelivered parents.
