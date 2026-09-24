@@ -1133,6 +1133,23 @@ mod tests {
         }
     }
 
+    /// bd-j4pe: catchup `latest` contract — the fired tick is the most-recent
+    /// MISSED minute boundary at the catchup instant: a real boundary, at or
+    /// after the first missed tick, never after "now". A fixed `t1 + 60`
+    /// expectation misreads a correct late-reboot catchup (t1 + 120) as a
+    /// burst under workspace load — count-vs-semantics, same class as bd-0lyz.
+    fn assert_catchup_latest(tick: i64, first_missed: i64, catchup_now: i64, phase: &str) {
+        assert_eq!(tick % 60, 0, "{phase}: {tick} must be a minute boundary");
+        assert!(
+            tick >= first_missed,
+            "{phase}: caught up at least to the first missed tick (got {tick}, want >= {first_missed})"
+        );
+        assert!(
+            tick <= catchup_now,
+            "{phase}: catchup fires past ticks only (got {tick}, now {catchup_now})"
+        );
+    }
+
     /// The load scenario that broke the old count assertion (bd-0lyz): a
     /// real minute boundary lands inside the observation window.
     #[test]
@@ -1153,6 +1170,31 @@ mod tests {
     #[should_panic(expected = "catchup burst")]
     fn earlier_burst_tick_fails_loud() {
         assert_no_duplicate_ticks(&[120, 60], 120, "resume");
+    }
+
+    /// bd-j4pe: a reboot that outlasts a minute must be ALLOWED — catchup
+    /// `latest` fires t1+120 and that is correct, not a burst.
+    #[test]
+    fn catchup_latest_allows_late_reboot_across_boundaries() {
+        assert_catchup_latest(1_800, 1_680, 1_810, "late reboot");
+    }
+
+    #[test]
+    #[should_panic(expected = "minute boundary")]
+    fn catchup_latest_rejects_non_boundary() {
+        assert_catchup_latest(1_700, 1_680, 1_810, "x");
+    }
+
+    #[test]
+    #[should_panic(expected = "first missed")]
+    fn catchup_latest_rejects_under_catchup() {
+        assert_catchup_latest(1_620, 1_680, 1_810, "x");
+    }
+
+    #[test]
+    #[should_panic(expected = "past ticks")]
+    fn catchup_latest_rejects_future_tick() {
+        assert_catchup_latest(1_800, 1_680, 1_740, "x");
     }
 
     /// bd-e03q RED (ADR-0035 Spec 4): the registry is queried fresh on
@@ -1301,17 +1343,21 @@ steps:
         let event2 = wait_for_event(&sink2, 60)
             .await
             .unwrap_or_else(|e| panic!("catchup event after restart: {e}"));
-        assert_eq!(
-            event2.tick, next_tick,
-            "most-recent missed tick, not a burst (got {})",
-            event2.tick
-        );
+        // bd-j4pe: assert the catchup CONTRACT (properties), not a fixed
+        // next_tick — under load the reboot can outlast a minute and
+        // catchup:latest correctly fires the later boundary.
+        assert_catchup_latest(event2.tick, next_tick, unix_now(), "post-restart catchup");
         tokio::time::sleep(Duration::from_secs(3)).await;
         let ticks: Vec<i64> = {
             let guard = sink2.lock().await;
             guard.iter().map(|e| e.tick).collect()
         };
-        assert_no_duplicate_ticks(&ticks, next_tick, "post-restart catchup");
+        assert_eq!(
+            ticks.len(),
+            1,
+            "catchup fired exactly ONE tick — no burst (ticks: {ticks:?})"
+        );
+        assert_no_duplicate_ticks(&ticks, event2.tick, "post-restart catchup");
 
         let _ = server.kill();
         let _ = server.wait();
