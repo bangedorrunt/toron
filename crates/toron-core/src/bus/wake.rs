@@ -35,6 +35,17 @@ pub const WAKE_HANDSHAKE_TIMEOUT_MS: u64 = 5_000;
 /// Default heartbeat cadence on a quiet bus (quiet-vs-deaf distinction).
 pub const WAKE_HEARTBEAT_MS: u64 = 15_000;
 
+/// Default store-delta poll cadence (bd-d41q): the pump re-reads the store
+/// this often so writes from other processes (CLI plane commands on the
+/// shared store) fan out live. Matches the pre-sidecar 1s snapshot
+/// heritage; the snapshot memo + `bus_meta` version keep quiet ticks cheap.
+pub const WAKE_POLL_MS: u64 = 1_000;
+
+/// Bound for the pump's forwarded-id set (bd-d41q): the poll re-reads the
+/// whole WAKE_KINDS history each tick, so forwarded ids are remembered to
+/// avoid refanout. 10k ids cover any sane tick at ~300B each.
+const SEEN_CAP: usize = 10_000;
+
 /// Clock abstraction: wall-clock enters only as `Msg` payload equivalent —
 /// here, as an injected `now_ms()`. Unit tests use [`ManualClock`].
 pub trait WakeClock: Send + Sync + 'static {
@@ -253,6 +264,9 @@ pub struct WakeConfig {
     pub handshake_timeout_ms: u64,
     /// Heartbeat interval in ms.
     pub heartbeat_ms: u64,
+    /// Store-delta poll interval in ms (bd-d41q): 0 disables the poll
+    /// (live fanout only — foreign store writes stay invisible).
+    pub poll_interval_ms: u64,
 }
 
 impl WakeConfig {
@@ -263,6 +277,7 @@ impl WakeConfig {
             queue_cap: WAKE_QUEUE_CAP,
             handshake_timeout_ms: WAKE_HANDSHAKE_TIMEOUT_MS,
             heartbeat_ms: WAKE_HEARTBEAT_MS,
+            poll_interval_ms: WAKE_POLL_MS,
         }
     }
 }
@@ -323,7 +338,14 @@ impl WakeServer {
         // One held trusted subscription: the daemon's single fan-out source.
         let filter = Filter::new().kinds(WAKE_KINDS.iter().map(|k| Kind::from(*k)));
         let sub = self.bus.subscribe_trusted(filter).await?;
-        let handle = WakeHandle::serve(listener, path, sub, self.config.clone(), self.clock);
+        let handle = WakeHandle::serve(
+            listener,
+            path,
+            sub,
+            self.bus.clone(),
+            self.config.clone(),
+            self.clock,
+        );
         Ok(handle)
     }
 }
@@ -357,6 +379,7 @@ impl WakeHandle {
         listener: UnixListener,
         sock_path: PathBuf,
         mut bus_sub: crate::bus::Subscription,
+        bus: Arc<dyn Bus>,
         config: WakeConfig,
         clock: Arc<dyn WakeClock>,
     ) -> Self {
@@ -365,32 +388,97 @@ impl WakeHandle {
         let mut tasks = tokio::task::JoinSet::new();
         let bus_tx = tokio::sync::broadcast::channel::<String>(config.queue_cap.max(1)).0;
         // Fan-out pump: bus → broadcast (bounded; lagging subscribers shed).
+        // bd-d41q: the held subscription only observes THIS process's bus.
+        // Writes from other processes on the shared store (CLI plane
+        // commands) never traverse it, so every poll_interval the pump
+        // re-reads the store through a short subscription and fans out
+        // ids not yet forwarded (bounded seen-set). No poll when nobody
+        // listens; 0 interval disables (live fanout only).
         {
             let bus_tx = bus_tx.clone();
+            let poll_filter = Filter::new().kinds(WAKE_KINDS.iter().map(|k| Kind::from(*k)));
+            let poll_every = std::time::Duration::from_millis(config.poll_interval_ms);
+            let poll_on = config.poll_interval_ms > 0;
             tasks.spawn(async move {
                 let mut cursor: u64 = 0;
-                while let Some(ev) = bus_sub.next().await {
-                    match ev {
-                        crate::bus::SubscriptionEvent::Event(event) => {
-                            cursor += 1;
-                            let payload =
-                                serde_json::to_value(&event).unwrap_or(serde_json::Value::Null);
-                            let frame = WakeFrame::Event(payload);
-                            if let Ok(line) = frame.encode_line() {
-                                // Lagging receivers shed at broadcast level;
-                                // per-subscriber exact counters live below.
-                                let _ = bus_tx.send(line);
+                let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+                let mut seen_order: std::collections::VecDeque<String> =
+                    std::collections::VecDeque::new();
+                let mut remember = |id: String| -> bool {
+                    if seen.contains(&id) {
+                        return false;
+                    }
+                    seen.insert(id.clone());
+                    seen_order.push_back(id);
+                    while seen_order.len() > SEEN_CAP {
+                        if let Some(old) = seen_order.pop_front() {
+                            seen.remove(&old);
+                        }
+                    }
+                    true
+                };
+                let forward = |payload: serde_json::Value| {
+                    let frame = WakeFrame::Event(payload);
+                    if let Ok(line) = frame.encode_line() {
+                        let _ = bus_tx.send(line);
+                    }
+                };
+                loop {
+                    tokio::select! {
+                        biased;
+                        ev = bus_sub.next() => {
+                            match ev {
+                                Some(crate::bus::SubscriptionEvent::Event(event)) => {
+                                    cursor += 1;
+                                    remember(event.id.to_hex());
+                                    let payload = serde_json::to_value(&event)
+                                        .unwrap_or(serde_json::Value::Null);
+                                    forward(payload);
+                                }
+                                Some(crate::bus::SubscriptionEvent::Eose) => {
+                                    let frame = WakeFrame::Eose {
+                                        cursor: format!("{cursor}"),
+                                    };
+                                    if let Ok(line) = frame.encode_line() {
+                                        let _ = bus_tx.send(line);
+                                    }
+                                }
+                                _ => break,
                             }
                         }
-                        crate::bus::SubscriptionEvent::Eose => {
-                            let frame = WakeFrame::Eose {
-                                cursor: format!("{cursor}"),
+                        _ = tokio::time::sleep(poll_every), if poll_on => {
+                            if bus_tx.receiver_count() == 0 {
+                                continue;
+                            }
+                            let polled = match bus.subscribe_trusted(poll_filter.clone()).await {
+                                Ok(mut tmp) => {
+                                    let mut fresh = Vec::new();
+                                    while let Some(x) = tmp.next().await {
+                                        match x {
+                                            crate::bus::SubscriptionEvent::Event(e) => {
+                                                fresh.push(e);
+                                            }
+                                            _ => break,
+                                        }
+                                    }
+                                    fresh
+                                }
+                                Err(e) => {
+                                    tracing::warn!("wake store poll failed: {e}");
+                                    Vec::new()
+                                }
                             };
-                            if let Ok(line) = frame.encode_line() {
-                                let _ = bus_tx.send(line);
+                            for event in polled {
+                                let id = event.id.to_hex();
+                                if !remember(id) {
+                                    continue;
+                                }
+                                cursor += 1;
+                                let payload = serde_json::to_value(&event)
+                                    .unwrap_or(serde_json::Value::Null);
+                                forward(payload);
                             }
                         }
-                        crate::bus::SubscriptionEvent::Closed(_) => break,
                     }
                 }
             });
@@ -883,5 +971,85 @@ mod wake_bus_tests {
                 .expect("test bound")
                 .expect("io");
         assert!(eof.is_none(), "dead server reads EOF, never a frame");
+    }
+
+    /// governed-by: bd-d41q — the sidecar must fan out store writes from
+    /// a FOREIGN bus instance (the CLI process's embedded mailbox on the
+    /// shared store). Two InProcessBus on one pool simulate daemon + CLI:
+    /// a kind-9 published via bus B must reach a wake.sock subscriber.
+    /// Before the fix the held subscription only observed bus A (live
+    /// fanout), so this times out on the event line.
+    #[tokio::test]
+    async fn wake_pump_fans_out_foreign_store_write() {
+        use crate::bus::in_process::{AuthPolicy, InProcessBus, InProcessBusConfig};
+        let db = std::env::temp_dir().join(format!(
+            "toron-wake-foreign-{}-{}.sqlite",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let pool = crate::index::schema::connect(db.to_str().unwrap())
+            .await
+            .expect("connect");
+        crate::index::schema::migrate(&pool).await.expect("migrate");
+        let mk_bus = || async {
+            InProcessBus::open(
+                pool.clone(),
+                InProcessBusConfig {
+                    auth: AuthPolicy::AcceptAll,
+                    allowlist: Vec::new(),
+                    channel_capacity: 64,
+                    detailed_stage_logging: false,
+                },
+            )
+            .await
+            .expect("bus")
+        };
+        let bus_a = mk_bus().await;
+        let bus_b = mk_bus().await;
+        let sock = tmp_sock("foreign");
+        let _ = std::fs::remove_file(&sock);
+        let mut cfg = WakeConfig::new(&sock);
+        cfg.poll_interval_ms = 50;
+        let _h = WakeServer::new(cfg, Arc::new(bus_a), Arc::new(SystemClock))
+            .start()
+            .await
+            .expect("bind");
+        let stream = UnixStream::connect(&sock).await.expect("connect");
+        let (r, mut w) = stream.into_split();
+        w.write_all(b"{\"subscribe\":{\"kinds\":[9]}}\n")
+            .await
+            .expect("sub");
+        let mut lines = BufReader::new(r).lines();
+        let eose = tokio::time::timeout(std::time::Duration::from_secs(2), lines.next_line())
+            .await
+            .expect("test bound")
+            .expect("io")
+            .expect("eose line");
+        assert!(eose.contains("eose"), "handshake first, {eose}");
+        // Foreign write: bus B publishes (and stores) a kind-9 that bus
+        // A's live fanout never traverses.
+        let keys = crate::keys::generate();
+        let ev = crate::nostr::event::build_event(
+            &keys,
+            crate::nostr::kinds::toron_kind(9),
+            "foreign hello",
+            vec![],
+            crate::nostr::Timestamp::now(),
+        )
+        .expect("event");
+        let id_hex = ev.id.to_hex();
+        bus_b.publish(ev).await.expect("foreign publish");
+        let seen = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let line = lines.next_line().await.expect("io").expect("line");
+                if line.contains(&id_hex) {
+                    break line;
+                }
+            }
+        })
+        .await
+        .expect("foreign kind-9 must fan out over wake.sock");
+        assert!(seen.contains("\"event\""), "event frame, {seen}");
+        let _ = std::fs::remove_file(&db);
     }
 }

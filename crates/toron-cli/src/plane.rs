@@ -1868,12 +1868,35 @@ pub async fn run_plane(mailbox: &Mailbox, command: &crate::cli::Command) -> anyh
     }
 }
 
-/// Re-export for `main.rs`: build the demo mailbox once and dispatch.
+/// Re-export for `main.rs`: resolve the one mailbox source, then dispatch.
 /// `#[tokio::main]` mirrors `run_robot` — called from sync `run()`.
+///
+/// governed-by: bd-d41q — plane commands go through the same
+/// [`MailboxSource`] selector as the robot path (no silent second store
+/// beside a live daemon). There are no plane MCP tools by design, so
+/// execution is always embedded: on a loopback daemon the durable root
+/// IS the daemon's store (writes fan out via its wake sidecar); a remote
+/// daemon owns a store this process cannot see — refuse loudly instead
+/// of shadow-writing local events the daemon never wakes on.
 #[tokio::main]
 pub async fn run_plane_command(command: &crate::cli::Command) -> anyhow::Result<()> {
-    let mailbox = toron_mcp::demo_mailbox().await?;
-    run_plane(&mailbox, command).await
+    match crate::mailbox_source::MailboxSource::resolve().await? {
+        crate::mailbox_source::MailboxSource::Embedded(mailbox) => {
+            run_plane(&mailbox, command).await
+        }
+        crate::mailbox_source::MailboxSource::Daemon(dc) => {
+            if !crate::mailbox_source::daemon_url_is_loopback(dc.endpoint()) {
+                anyhow::bail!(
+                    "plane commands need the daemon's store, but it is remote ({}): \
+                     unset TORON_MCP_URL / [mail.toron] url or run against the local daemon. \
+                     Refusing to shadow-write a local store the daemon never wakes on (bd-d41q).",
+                    dc.endpoint()
+                );
+            }
+            let mailbox = toron_mcp::demo_mailbox().await?;
+            run_plane(&mailbox, command).await
+        }
+    }
 }
 
 #[cfg(test)]

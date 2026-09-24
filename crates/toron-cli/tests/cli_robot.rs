@@ -1962,6 +1962,165 @@ fn serve_binds_wake_sock_for_consumers() {
     let _ = std::fs::remove_dir_all(&data);
 }
 
+/// governed-by: bd-d41q — plane CLI posts must reach the daemon's wake
+/// sidecar. Boots an isolated serve, publishes a kind-9 via the CLI
+/// binary (a second process on the shared store, exactly the crew path),
+/// and asserts the post fans out over wake.sock. Before the fix the pump's
+/// held subscription only observed the daemon's own bus, so this saw
+/// EOSE + heartbeats and never the post.
+#[test]
+fn channel_post_reaches_daemon_wake_sidecar() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixStream;
+
+    let tag = std::process::id();
+    let state = std::env::temp_dir().join(format!("twk-wake-state-{tag}"));
+    let data = std::env::temp_dir().join(format!("twk-wake-data-{tag}"));
+    let _ = std::fs::remove_dir_all(&state);
+    let _ = std::fs::remove_dir_all(&data);
+    std::fs::create_dir_all(&state).expect("state dir");
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .and_then(|l| l.local_addr())
+        .map(|a| a.port())
+        .expect("free port");
+    let mut child = toron()
+        .args(["serve", "--mcp-http", &format!("127.0.0.1:{port}")])
+        .env("TORON_MCP_DATA_DIR", &data)
+        .env("XDG_STATE_HOME", &state)
+        .env("RUST_LOG", "error")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn serve");
+    let mut cleanup = || {
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&state);
+        let _ = std::fs::remove_dir_all(&data);
+    };
+    let cli = |args: &[&str]| -> std::process::Output {
+        toron()
+            .env("TORON_MCP_DATA_DIR", &data)
+            .args(args)
+            .output()
+            .expect("run toron")
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "serve never listened on :{port}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    // Register + room via the CLI (second process, shared store).
+    let boot = cli(&[
+        "agent",
+        "bootstrap",
+        "--project",
+        "demo",
+        "--as",
+        "WakeAgent",
+        "--no-input",
+    ]);
+    assert!(
+        boot.status.success(),
+        "bootstrap: {}",
+        String::from_utf8_lossy(&boot.stderr)
+    );
+    let id = format!("wake-probe-{tag}");
+    let created = cli(&[
+        "channel",
+        "create",
+        &id,
+        "--name",
+        "Wake",
+        "--project",
+        "demo",
+        "--as",
+        "WakeAgent",
+        "--json",
+    ]);
+    assert!(
+        created.status.success(),
+        "create: {}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    // Subscribe FIRST (drain the handshake), THEN post: only live fanout
+    // — the store-delta poll — can deliver it. A replay-only path would
+    // never see a post published after EOSE on an open tail.
+    let sock = state.join("toron").join("wake.sock");
+    let mut tail: Option<BufReader<UnixStream>> = None;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while std::time::Instant::now() < deadline {
+        if let Ok(mut s) = UnixStream::connect(&sock) {
+            let _ = s.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+            let _ = s.set_write_timeout(Some(std::time::Duration::from_secs(5)));
+            if s.write_all(b"{\"subscribe\":{\"kinds\":[9]}}\n").is_ok() {
+                let mut reader = BufReader::new(s.try_clone().expect("clone"));
+                let mut line = String::new();
+                let mut eose = false;
+                while reader.read_line(&mut line).unwrap_or(0) > 0 {
+                    if line.contains("eose") {
+                        eose = true;
+                        break;
+                    }
+                    line.clear();
+                }
+                if eose {
+                    tail = Some(reader);
+                    break;
+                }
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    let mut reader = tail.expect("wake.sock handshake (EOSE) before post");
+    // Post AFTER the tail is open: the pump's live fanout never observes
+    // this second process, so only the store-delta poll delivers it.
+    let posted = cli(&[
+        "channel",
+        "post",
+        &id,
+        "--body",
+        "wake sidecar probe",
+        "--project",
+        "demo",
+        "--as",
+        "WakeAgent",
+        "--json",
+    ]);
+    assert!(
+        posted.status.success(),
+        "post: {}",
+        String::from_utf8_lossy(&posted.stderr)
+    );
+    let post: Value = serde_json::from_slice(&posted.stdout).expect("post emits JSON");
+    let post_id = post["event_id"]
+        .as_str()
+        .expect("post event_id")
+        .to_string();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let mut seen = false;
+    let mut line = String::new();
+    while std::time::Instant::now() < deadline && !seen {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {
+                if line.contains(&post_id) {
+                    seen = true;
+                }
+            }
+        }
+    }
+    cleanup();
+    assert!(
+        seen,
+        "daemon wake sidecar must fan out CLI-published kind-9 {post_id}"
+    );
+}
+
 /// Acquire an exclusive lease through the daemon's MCP tools (the HTTP/MCP
 /// path — the writer's view). Uses rmcp directly, mirroring am_parity_e2e.
 fn acquire_lease_via_daemon(port: u16, project: &str, agent: &str, path: &str) {

@@ -59,6 +59,7 @@ fn tool_call_timeout() -> std::time::Duration {
 #[derive(Clone)]
 pub struct DaemonClient {
     client: Arc<RunningService<RoleClient, ClientConfig>>,
+    endpoint: String,
 }
 
 impl DaemonClient {
@@ -73,7 +74,7 @@ impl DaemonClient {
             format!("{base}/mcp")
         };
         let transport = StreamableHttpClientTransport::from_config(
-            StreamableHttpClientTransportConfig::with_uri(endpoint),
+            StreamableHttpClientTransportConfig::with_uri(endpoint.clone()),
         );
         let client_info = ClientConfig::new(
             ClientCapabilities::default(),
@@ -101,7 +102,16 @@ impl DaemonClient {
         .context("daemon connect (is `toron serve --mcp-http` running?)")?;
         Ok(Self {
             client: Arc::new(client),
+            endpoint: endpoint.to_string(),
         })
+    }
+
+    /// The normalized MCP endpoint URL this client talks to
+    /// (`http://host:port/mcp`). Used by the plane path to decide whether
+    /// the daemon's store is the local durable root (loopback) or a
+    /// remote one the CLI must not shadow-write (bd-d41q).
+    pub fn endpoint(&self) -> &str {
+        &self.endpoint
     }
 
     /// Call an MCP tool by name, returning the parsed JSON payload of the
@@ -253,7 +263,21 @@ impl MailboxSource {
     }
 }
 
-/// `TORON_MCP_URL` env override.
+/// True when a daemon endpoint URL is loopback (same machine): the
+/// daemon's store IS the local durable root, so an embedded mailbox
+/// writes where the daemon reads. A non-loopback daemon owns a remote
+/// store — plane commands must refuse rather than shadow-write a local
+/// second store the daemon never sees (bd-d41q).
+pub fn daemon_url_is_loopback(url: &str) -> bool {
+    let after_scheme = url.split("://").nth(1).unwrap_or(url);
+    let host_port = after_scheme.split('/').next().unwrap_or(after_scheme);
+    let host = host_port
+        .rsplit_once(':')
+        .map(|(h, _)| h)
+        .unwrap_or(host_port)
+        .trim_matches(|c| c == '[' || c == ']');
+    matches!(host, "localhost" | "127.0.0.1" | "::1")
+}
 fn daemon_url_from_env() -> Option<String> {
     std::env::var("TORON_MCP_URL")
         .ok()
@@ -347,6 +371,19 @@ mod selector_tests {
             decide_source(None, false, None, false),
             SourceDecision::EmbeddedXdg
         );
+    }
+
+    #[test]
+    fn daemon_url_loopback_means_shared_local_store() {
+        // bd-d41q: loopback daemons share the durable root — embedded
+        // plane writes land where the daemon reads.
+        assert!(daemon_url_is_loopback("http://127.0.0.1:18080/mcp"));
+        assert!(daemon_url_is_loopback("http://localhost:18080/mcp"));
+        assert!(daemon_url_is_loopback("http://[::1]:18080/mcp"));
+        assert!(daemon_url_is_loopback("http://127.0.0.1:18080"));
+        assert!(!daemon_url_is_loopback("http://100.64.0.5:18080/mcp"));
+        assert!(!daemon_url_is_loopback("http://toron.tailnet:18080/mcp"));
+        assert!(!daemon_url_is_loopback(""));
     }
 
     #[test]
