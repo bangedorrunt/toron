@@ -173,6 +173,26 @@ impl Coalesced {
         }
         out
     }
+
+    /// GS-062 PARTIAL-KEEP-FULL-SPEC: rebuild a batch containing only mentions
+    /// whose parent is in `keep` (reserved undelivered ids). Used when the
+    /// delivery cursor skips already-delivered parents so the published
+    /// kind-43001 `merged_spec` does not re-include SkipAlreadyDelivered
+    /// parents.
+    pub fn retain_parents(&self, keep: &[String]) -> Self {
+        let keep_set: std::collections::BTreeSet<&str> =
+            keep.iter().map(String::as_str).collect();
+        Self {
+            assignee: self.assignee.clone(),
+            mentions: self
+                .mentions
+                .iter()
+                .filter(|m| keep_set.contains(m.parent.as_str()))
+                .cloned()
+                .collect(),
+            first_arrival_ms: self.first_arrival_ms,
+        }
+    }
 }
 
 /// What [`MentionCoalescer::submit`] reports back to the caller.
@@ -465,6 +485,69 @@ mod tests {
         let again = c.tick(1_000);
         assert_eq!(again.len(), 1);
         assert_eq!(again[0].parent(), "e1");
+    }
+
+    /// GS-062 REQUEUE-EVENT-STARVATION: InFlight-style requeue (flush_ready=false)
+    /// must still flush once the sub-window elapses — a timer tick (not only a
+    /// new bus event) can advance `now_ms` into flush readiness.
+    #[test]
+    fn requeue_inflight_style_flushes_after_subwindow() {
+        let mut c = MentionCoalescer::new(
+            Duration::from_millis(2_000),
+            Duration::from_millis(500),
+            64,
+        );
+        c.submit(
+            InboundMention {
+                assignee: "oc".into(),
+                parent: "p1".into(),
+                spec: serde_json::json!({"t": 1}),
+            },
+            0,
+        );
+        let batch = c.force_flush("oc").expect("flushed");
+        // InFlight path uses flush_ready=false (fresh window at now).
+        c.requeue(batch, 1_000, false);
+        assert_eq!(c.buffered_for("oc"), 1);
+        assert!(
+            c.tick(1_000).is_empty(),
+            "immediate tick must not flush (window just opened)"
+        );
+        let flushed = c.tick(1_000 + 500);
+        assert_eq!(
+            flushed.len(),
+            1,
+            "subwindow elapsed → flush without a new submit/event"
+        );
+        assert_eq!(flushed[0].parent(), "p1");
+    }
+
+    /// GS-062 PARTIAL-KEEP-FULL-SPEC: retain_parents drops SkipAlreadyDelivered parents.
+    #[test]
+    fn retain_parents_filters_merged_spec() {
+        let batch = Coalesced {
+            assignee: "oc".into(),
+            mentions: vec![
+                InboundMention {
+                    assignee: "oc".into(),
+                    parent: "already".into(),
+                    spec: serde_json::json!({"n": 1}),
+                },
+                InboundMention {
+                    assignee: "oc".into(),
+                    parent: "keep-me".into(),
+                    spec: serde_json::json!({"n": 2}),
+                },
+            ],
+            first_arrival_ms: 0,
+        };
+        let kept = batch.retain_parents(&["keep-me".into()]);
+        assert_eq!(kept.parent_ids(), vec!["keep-me".to_string()]);
+        let spec = kept.merged_spec();
+        assert_eq!(spec["count"], 1);
+        let mentions = spec["mentions"].as_array().expect("mentions");
+        assert_eq!(mentions.len(), 1);
+        assert_eq!(mentions[0]["parent"], "keep-me");
     }
 
     /// ADR-0004 verification: 20 mentions to one assignee within the window →
