@@ -7,15 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 ### Docs
-- ADR-0003 **Rev10** GS-062 live cutover: flip P0 busy-owner / P1 convergence / lifecycle / delivery-cursor to **Landed** where toron call sites prove it; presence fail-closed via SQLite `ping()` (never Redis). Flywheel wake classifier (`wake_liveness`) is sibling ship `gs-062/wake-health` — not claimed on this toron tip.
+- ADR-0003 **Rev10** GS-062 live cutover: flip P0 busy-owner / P1 leave·close FireLive / lifecycle / delivery-cursor to **Landed** where toron call sites prove it; **ReAdd fence Landed** on live leave/close hold + settle_authority; join gen from held. Presence fail-closed via SQLite `ping()` (never Redis). Flywheel wake classifier (`wake_liveness`) is sibling ship `gs-062/wake-health` — not claimed on this toron tip.
 - `docs/notes/2026-08-07-buzz-agentmail-comparison.md` — GS-062 delta (cutover landed).
 
 ### Changed
 - **P0 dispatch fence (GS-062 Landed)** (Buzz #7337/#7340): public `DispatchPool::try_acquire` routes through `try_acquire_fenced` with wall-clock `now_ms` + current generation; private `try_acquire_slots` holds semaphore/in_flight; Drop→Release; live acquire inserts busy holder.
 - **P1 presence fail-closed (GS-062 Landed)** (Buzz #7532 pattern, SQLite): ephemeral fanout uses `presence_admit(store.is_healthy())` via `BusEventStore::ping` (`SELECT 1`) — never hardcoded `true`, never Redis.
-- **P1 convergence (GS-062 Landed)** (Buzz #7298): `ChannelStore::leave`/`close` run Propose→Commit→FireLive (Kick/Disable); join honors ReAdd fence under held generation.
+- **P1 convergence (GS-062 Landed)** (Buzz #7298): `ChannelStore::leave`/`close` run Propose→Commit→FireLive (Kick/Disable) and **clear authority after FireLive** (steady-state rejoin not permanently fenced). leave/close **hold** authority after FireLive (live join FenceReAdd); `settle_authority` ends hold; join attempted gen from **held** (not global counter) so other-channel bumps cannot skip FenceReAdd — **Landed**.
 - **P1 workflow delete honesty (GS-062 Landed)** (Buzz #7735): `WorkflowHost` wires `WorkflowLifecycle` register/soft_delete/`try_start` on spawn path.
 - **P1 delivery-cursor (GS-062 Landed)** (Buzz #7620): `wire_mention_dispatch_with_cursor` + session=assignee; agent-key≠delivery proof asserted at call site.
+- **P1 workflow definition registry (GS-062 ask-user B):** `WorkflowHost.workflows` is `Arc<Mutex<Vec<Workflow>>>` shared on Clone — soft_delete_workflow and try_start / trigger-loop read ONE list (no Vec copy blind to soft_delete).
+- **P0 dispatch fenced host path (GS-062 ask-user C):** live hosts use `DispatchPool::try_acquire_fenced` / `try_acquire_for_host` and journal/park `SleepUntilDeadline`; `try_acquire` Option shim remains e2e-only (must not map fenced Err→None on live path).
 
 ### Added
 - Engine run-path journal honesty (ADR-0032 Spec 6, `bd-engine-run-path-journaling-fwlx`): an effectful host-sink leaf dispatched with no injected `EffectRunner` is now marked `EFFECT_JOURNAL_BYPASSED` (`bypassed-no-effect-runner`) on its step value instead of falling through to the compat runner unflagged, and a sink an injected runner does not cover is marked `EFFECT_JOURNAL_SINK_UNCOVERED` (`bypassed-sink-uncovered`) — two markers because they are two gaps with two different fixes. Both warn loudly with the reason. Pure and engine-control leaves pass through untouched. (Since the flip below, the engine only ever emits the first: every reason a HostSink leaf can fall through is now "no runner injected". `EFFECT_JOURNAL_SINK_UNCOVERED` remains part of the contract for HOST runners that cover only some of their sinks.)

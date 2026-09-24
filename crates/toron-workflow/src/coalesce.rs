@@ -155,6 +155,24 @@ impl Coalesced {
             .map(|m| m.parent.as_str())
             .unwrap_or("")
     }
+
+    /// All mention parent ids in this batch (arrival order, de-duped).
+    /// Delivery-cursor peek/mark must cover every id — not only [`Self::parent`] —
+    /// so a later batch whose first parent is already delivered still delivers
+    /// undelivered siblings (GS-062 multi-parent cutover).
+    pub fn parent_ids(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut seen = std::collections::BTreeSet::new();
+        for m in &self.mentions {
+            if m.parent.is_empty() {
+                continue;
+            }
+            if seen.insert(m.parent.clone()) {
+                out.push(m.parent.clone());
+            }
+        }
+        out
+    }
 }
 
 /// What [`MentionCoalescer::submit`] reports back to the caller.

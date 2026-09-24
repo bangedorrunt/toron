@@ -50,7 +50,7 @@ pub use coalesce::{
     CoalesceDecision, Coalesced, DEFAULT_MAX_BUFFER, DEFAULT_SUBWINDOW, DEFAULT_WINDOW,
     FlushOutcome, InboundMention, MentionCoalescer, subwindow_from_env, window_from_env,
 };
-pub use dispatch::{DispatchConfig, DispatchPermit, DispatchPool, QueuedJob};
+pub use dispatch::{DispatchAcquire, DispatchConfig, DispatchPermit, DispatchPool, QueuedJob};
 pub use engine::{
     Decision, GraphNodeInput, ParallelCopyInput, ProfileResolver, RunInput, SpawnSink,
     WorkflowEngine, WorkflowResolver, build_workflow_run_terminal, run_graph_node,

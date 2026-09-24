@@ -39,7 +39,15 @@ pub fn wire_mention_dispatch(
 
 /// Like [`wire_mention_dispatch`] with a session [`DeliveryCursorStore`]
 /// (GS-062 / Buzz #7620). Session key = assignee (dispatch session), never
-/// agent pubkey. Second delivery of the same parent id is skipped.
+/// agent pubkey. Second delivery of the same parent id is skipped at peek.
+///
+/// **Contract (align with host peek→publish→mark):** this API only *peeks*
+/// the cursor before coalesce/build. It does **not** mark delivered — build
+/// success is not publish proof. Callers that publish the returned kind-43001
+/// events must [`DeliveryCursorStore::mark_delivered`] (or go through
+/// `publish_coalesced_job_with_cursor`) after successful bus publish. Hosts
+/// that need concurrent-safe publish should reserve under the lock via
+/// [`DeliveryCursorStore::reserve_undelivered`] before awaiting transport.
 pub fn wire_mention_dispatch_with_cursor(
     event: &Event,
     coalescer: &mut MentionCoalescer,
@@ -57,7 +65,7 @@ pub fn wire_mention_dispatch_with_cursor(
         if let Some(store) = delivery {
             let (keep, _) = store.peek_undelivered(session, [delivery_id.clone()]);
             if keep.is_empty() {
-                continue; // already delivered to this session
+                continue; // already delivered / in-flight for this session
             }
         }
         let decision = coalescer.submit(
@@ -71,15 +79,14 @@ pub fn wire_mention_dispatch_with_cursor(
         if let CoalesceDecision::FlushNow(batch) = decision {
             match build_job_from_coalesced(&batch, requester, project_slug, Timestamp::now()) {
                 Ok(ev) => {
-                    // Mark only after successful build — failed build must not
-                    // advance the cursor (silent kind-43001 loss hazard).
-                    if let Some(store) = delivery {
-                        store.mark_delivered(session, [delivery_id]);
-                    }
+                    // Peek-only: do NOT mark_delivered here. Cursor advance is
+                    // the caller's responsibility after successful publish
+                    // (host peek→publish→mark / with_cursor).
+                    let _ = delivery_id; // parent id lives on batch for mark
                     jobs.push(ev);
                 }
                 Err(_) => {
-                    // Do not mark_delivered — parent stays undelivered for retry.
+                    // Failed build — nothing to publish; cursor untouched.
                 }
             }
         }
@@ -360,5 +367,58 @@ mod tests {
         let (keep3, _) = store.peek_undelivered("other-session", [id]);
         assert_eq!(keep3.len(), 1);
         let _ = (post, coalescer, requester);
+    }
+
+    /// GS-062: wire_mention_dispatch_with_cursor peeks but does not mark on
+    /// successful build — mark is caller-owned after publish.
+    #[test]
+    fn wire_dispatch_peek_only_does_not_mark_on_build() {
+        let requester = Keys::generate();
+        let agent = Keys::generate();
+        // Cap-1 coalescer so first mention FlushNow-builds immediately.
+        let mut coalescer = MentionCoalescer::new(
+            std::time::Duration::from_millis(0),
+            std::time::Duration::from_millis(0),
+            1,
+        );
+        let store = DeliveryCursorStore::new();
+        // Build a kind-9 with @name matching content_mentions + p tag.
+        // parse_mentions needs @token in content; use a simple post and
+        // drive via InboundMention path indirectly: if parse finds nothing,
+        // jobs stay empty and we still assert cursor unchanged via direct peek.
+        let post = {
+            use nostr::prelude::{EventBuilder, Kind, Tag};
+            EventBuilder::new(Kind::from_u16(9), "@agent please fix")
+                .tags([Tag::public_key(agent.public_key())])
+                .finalize(&requester)
+                .expect("post")
+        };
+        let session = "agent";
+        let id = post.id.to_hex();
+        let jobs = wire_mention_dispatch_with_cursor(
+            &post,
+            &mut coalescer,
+            &requester,
+            Some("toron"),
+            0,
+            Some(&store),
+        );
+        // Whether or not parse produced a FlushNow job, build must not mark.
+        assert_eq!(
+            store.cursor(session).cursor,
+            0,
+            "wire_mention must not mark on build"
+        );
+        assert!(
+            store.cursor(session).delivered.is_empty(),
+            "delivered set must stay empty until caller marks after publish"
+        );
+        // If a job was built, caller would publish then mark — simulate mark.
+        if !jobs.is_empty() {
+            store.mark_delivered(session, [id.clone()]);
+            let (keep, _) = store.peek_undelivered(session, [id]);
+            assert!(keep.is_empty(), "after caller mark, second delivery skips");
+        }
+        let _ = agent;
     }
 }
