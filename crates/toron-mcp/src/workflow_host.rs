@@ -130,6 +130,7 @@ async fn mention_outcome(
                         // Quiet Delivered{deferred} (not Ambiguous→Unknown).
                         if let Some(c) = coalescer {
                             let mut g = c.lock().unwrap_or_else(PoisonError::into_inner);
+                            let assignee = coalesced.assignee.clone();
                             match g.requeue(
                                 coalesced,
                                 now_ms(),
@@ -145,6 +146,9 @@ async fn mention_outcome(
                                     }));
                                 }
                                 RequeueOutcome::Exhausted => {
+                                    // Clear retry map (coalesce also clears on
+                                    // Exhausted; host mirror keeps map honest).
+                                    g.clear_retry(&assignee);
                                     return ProviderOutcome::ProvenFailed(format!(
                                         "dispatch acquire retry budget exhausted: {e}"
                                     ));
@@ -183,6 +187,11 @@ async fn mention_outcome(
                 }
                 Err(CoalescePublishError::AlreadyDelivered) => {
                     // Cursor proves delivered → Delivered/Settled.
+                    // Mirror timer AlreadyDelivered: clear Transient retry map.
+                    if let Some(c) = coalescer {
+                        let mut g = c.lock().unwrap_or_else(PoisonError::into_inner);
+                        g.clear_retry(&coalesced.assignee);
+                    }
                     ProviderOutcome::Delivered(serde_json::json!({
                         "ok": true,
                         "coalesced": false,
@@ -213,10 +222,13 @@ async fn mention_outcome(
                     // GS-062 FLUSHNOW-TRANSPORT-AMBIGUOUS-AFTER-REQUEUE:
                     // Transient requeue + quiet Delivered{deferred} (same as
                     // acquire Err) — NOT Ambiguous→Unknown dual-publish via
-                    // DispatchJob force-retry. Exhausted → Ambiguous once
-                    // (honest, no requeue).
+                    // DispatchJob force-retry.
+                    // Exhausted: clear_retry + ProvenFailed (same terminal
+                    // class as acquire Exhausted — no force-retry dual-publish;
+                    // captain ask-user still owns broader settlement design).
                     if let Some(c) = coalescer {
                         let mut g = c.lock().unwrap_or_else(PoisonError::into_inner);
+                        let assignee = coalesced.assignee.clone();
                         match g.requeue(
                             coalesced,
                             now_ms(),
@@ -231,9 +243,12 @@ async fn mention_outcome(
                                     "effect_key": key,
                                 }))
                             }
-                            RequeueOutcome::Exhausted => ProviderOutcome::Ambiguous(format!(
-                                "transport retry budget exhausted: {e}"
-                            )),
+                            RequeueOutcome::Exhausted => {
+                                g.clear_retry(&assignee);
+                                ProviderOutcome::ProvenFailed(format!(
+                                    "transport retry budget exhausted: {e}"
+                                ))
+                            }
                         }
                     } else {
                         ProviderOutcome::Ambiguous(e)
@@ -1773,10 +1788,13 @@ impl WorkflowHost {
                             delay_ms,
                             "coalesced burst deferred (dispatch acquire): {e} — requeue"
                         ),
-                        RequeueOutcome::Exhausted => warn!(
-                            assignee = %assignee,
-                            "coalesced burst dropped (dispatch acquire retry budget exhausted): {e}"
-                        ),
+                        RequeueOutcome::Exhausted => {
+                            c.clear_retry(&assignee);
+                            warn!(
+                                assignee = %assignee,
+                                "coalesced burst dropped (dispatch acquire retry budget exhausted): {e}"
+                            );
+                        }
                     }
                     continue;
                 }
@@ -1845,10 +1863,13 @@ impl WorkflowHost {
                             delay_ms,
                             "coalesced burst publish transport failed: {e} — requeue"
                         ),
-                        RequeueOutcome::Exhausted => warn!(
-                            assignee = %assignee,
-                            "coalesced burst dropped (transport retry budget exhausted): {e}"
-                        ),
+                        RequeueOutcome::Exhausted => {
+                            c.clear_retry(&assignee);
+                            warn!(
+                                assignee = %assignee,
+                                "coalesced burst dropped (transport retry budget exhausted): {e}"
+                            );
+                        }
                     }
                 }
             }
