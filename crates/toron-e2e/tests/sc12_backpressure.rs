@@ -31,7 +31,7 @@ fn job(i: usize) -> QueuedJob {
 #[test]
 fn sc12_burst_backpressure_bounded_and_ordered() {
     // N = 3 global concurrency — forces contention on 20 bursts.
-    let pool = DispatchPool::new(DispatchConfig { max_concurrency: 3 });
+    let pool = DispatchPool::new(DispatchConfig { max_concurrency: 3, ..DispatchConfig::default() });
 
     // 20 @mentions enqueued in order.
     for i in 0..20 {
@@ -66,7 +66,7 @@ fn sc12_burst_backpressure_bounded_and_ordered() {
     assert_eq!(ready2.job_id, "job-1", "FIFO preserved: job-1 next");
 
     // --- In-flight never exceeds N (global cap) across agents ---
-    let pool_multi = DispatchPool::new(DispatchConfig { max_concurrency: 2 });
+    let pool_multi = DispatchPool::new(DispatchConfig { max_concurrency: 2, ..DispatchConfig::default() });
     for i in 0..5 {
         pool_multi.enqueue(job(i));
     }
@@ -85,7 +85,7 @@ fn sc12_burst_backpressure_bounded_and_ordered() {
 
 #[test]
 fn sc12_ordering_preserved_across_full_burst() {
-    let pool = DispatchPool::new(DispatchConfig { max_concurrency: 1 });
+    let pool = DispatchPool::new(DispatchConfig { max_concurrency: 1, ..DispatchConfig::default() });
     // Single-agent serialization: max_concurrency=1 + one-in-flight = strict
     // FIFO dispatch order across the whole 20-burst.
     for i in 0..20 {
