@@ -4,6 +4,7 @@
 
 use std::time::Duration;
 
+use anyhow::Context;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::{Connection, SqliteConnection, SqlitePool};
 
@@ -66,11 +67,33 @@ async fn connect_with_budget(db_path: &str, busy: Duration) -> anyhow::Result<Sq
         .journal_mode(SqliteJournalMode::Wal)
         .busy_timeout(busy)
         .statement_cache_capacity(32);
-    let pool = SqlitePoolOptions::new()
-        .max_connections(5)
-        .acquire_timeout(Duration::from_secs(10))
-        .connect_with(opts)
-        .await?;
+    // bd-2y36: sqlx runs `PRAGMA journal_mode=WAL` while establishing each
+    // connection, and sqlite answers a journal-mode CHANGE with an immediate
+    // SQLITE_BUSY — the busy handler (this budget) is never consulted — so
+    // processes racing the first conversion of a shared fresh file failed
+    // instantly under workspace load (pin: establish_journal_mode_busy_beats_any_budget).
+    // Retry the establish inside the SAME bounded budget: once any holder
+    // converts the file the pragma is a no-op and the pool lands. A non-BUSY
+    // error or an expired budget fails loud immediately.
+    let deadline = std::time::Instant::now() + busy;
+    let pool = loop {
+        match SqlitePoolOptions::new()
+            .max_connections(5)
+            .acquire_timeout(Duration::from_secs(10))
+            .connect_with(opts.clone())
+            .await
+        {
+            Ok(pool) => break pool,
+            Err(e) if is_locked(&e) && std::time::Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!("establish pool at {db_path} (busy budget {busy:?})")
+                });
+            }
+        }
+    };
     // Storage-leak guard: WAL autocheckpoint + size caps. Without this an
     // idle writer can leave a multi-MB WAL that never checkpoints (the prior
     // 4 MB index.sqlite-wal that survived until reboot). 1k pages ≈ 4 MB.
@@ -88,6 +111,19 @@ async fn connect_with_budget(db_path: &str, busy: Duration) -> anyhow::Result<Sq
         let _ = sqlx::query(pragma).execute(&pool).await;
     }
     Ok(pool)
+}
+
+/// SQLITE_BUSY as sqlx surfaces it (primary code 5, or the locked messages)
+/// — the only error class worth retrying at establish; every other error
+/// fails loud on first sight.
+fn is_locked(e: &sqlx::Error) -> bool {
+    let Some(db) = e.as_database_error() else {
+        return false;
+    };
+    db.code().as_deref().is_some_and(|c| c == "5") || {
+        let m = db.message();
+        m.contains("database is locked") || m.contains("database table is locked")
+    }
 }
 
 /// Open a SINGLE SQLite connection (WAL + busy timeout). Used by the
@@ -263,6 +299,118 @@ mod tests {
             "loud SQLITE_BUSY expected, got: {msg}"
         );
         tx.commit().await.expect("release hold");
+    }
+
+    /// bd-2y36 PIN: sqlx applies `journal_mode(Wal)` while ESTABLISHING each
+    /// pool connection, and sqlite answers a journal-mode CHANGE with an
+    /// immediate SQLITE_BUSY — the busy handler (`busy_timeout`) is never
+    /// consulted, so no budget can cover it. Deterministic repro: one
+    /// connection holds a write transaction on a rollback-journal file; a
+    /// RAW pool establish (bypassing our retry layer, the exact call frame
+    /// the workspace-load failure blamed) with a 3s budget must fail in
+    /// well under a second — a budget-respecting wait would take ~3s.
+    #[tokio::test]
+    async fn establish_journal_mode_busy_beats_any_budget() {
+        let path = std::env::temp_dir().join(format!(
+            "toron-journal-race-{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+        let db = path.to_str().unwrap().to_string();
+
+        // Keep the file in rollback-journal mode with a held write txn.
+        let mut holder = SqliteConnection::connect_with(
+            &SqliteConnectOptions::new()
+                .filename(&db)
+                .create_if_missing(true)
+                .journal_mode(SqliteJournalMode::Delete),
+        )
+        .await
+        .expect("holder conn");
+        sqlx::query("CREATE TABLE t (x INTEGER)")
+            .execute(&mut holder)
+            .await
+            .expect("schema");
+        let mut tx = holder.begin().await.expect("begin");
+        sqlx::query("INSERT INTO t VALUES (1)")
+            .execute(&mut *tx)
+            .await
+            .expect("hold write");
+
+        let started = std::time::Instant::now();
+        let err = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(&db)
+                    .create_if_missing(true)
+                    .journal_mode(SqliteJournalMode::Wal)
+                    .busy_timeout(Duration::from_secs(3)),
+            )
+            .await
+            .expect_err("mode change under a held write txn must BUSY");
+        let elapsed = started.elapsed();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("locked"), "SQLITE_BUSY expected, got: {msg}");
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "BUSY must be IMMEDIATE (busy handler bypassed) — waited {elapsed:?}; a \
+             budget-respecting path would wait the full 3s"
+        );
+        tx.rollback().await.ok();
+        drop(holder);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// bd-2y36: `connect_with_budget` must out-wait an establish-time BUSY
+    /// (the workspace-load failure): retry the establish inside the same
+    /// bounded budget until the holder releases — then it lands.
+    #[tokio::test]
+    async fn connect_waits_out_establish_busy_within_budget() {
+        let path = std::env::temp_dir().join(format!(
+            "toron-establish-retry-{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+        let db = path.to_str().unwrap().to_string();
+
+        // Holder: rollback-journal file, write txn open, releases after 400ms.
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let db_holder = db.clone();
+        let releaser = tokio::spawn(async move {
+            let mut holder = SqliteConnection::connect_with(
+                &SqliteConnectOptions::new()
+                    .filename(&db_holder)
+                    .create_if_missing(true)
+                    .journal_mode(SqliteJournalMode::Delete),
+            )
+            .await
+            .expect("holder conn");
+            sqlx::query("CREATE TABLE t (x INTEGER)")
+                .execute(&mut holder)
+                .await
+                .expect("schema");
+            let mut tx = holder.begin().await.expect("begin");
+            sqlx::query("INSERT INTO t VALUES (1)")
+                .execute(&mut *tx)
+                .await
+                .expect("hold write");
+            let _ = ready_tx.send(());
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            tx.commit().await.expect("release");
+            drop(holder);
+        });
+        ready_rx.await.expect("holder ready");
+
+        let pool = connect_with_budget(&db, Duration::from_secs(30))
+            .await
+            .expect("establish retries until the holder releases (bd-2y36)");
+        let mode: String = sqlx::query_scalar("PRAGMA journal_mode")
+            .fetch_one(&pool)
+            .await
+            .expect("mode readable");
+        assert_eq!(mode, "wal", "conversion completed after the retry");
+        releaser.await.expect("releaser");
+        drop(pool);
+        let _ = std::fs::remove_file(&path);
     }
 
     async fn insert_msg(
