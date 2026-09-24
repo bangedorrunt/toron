@@ -31,6 +31,10 @@ pub use addressable::{
     AddressableKey, KeyPriority, is_addressable, is_revocation, nip01_replaceable_cmp,
     resolve_coordinate,
 };
+pub use convergence::{
+    AuthorityOp, Convergence, ConvergenceEffect, ConvergenceMsg, presence_admit,
+    tick as convergence_tick,
+};
 pub use event_store::BusEventStore;
 pub use federation::{FederationIssue, FederationMode, FederationPolicy, PowDifficulty};
 pub use filter::{
@@ -45,8 +49,9 @@ pub use scoping::{
 };
 pub use subscription::{Subscription, SubscriptionEvent, SubscriptionId};
 pub use ttl::{DEFAULT_ENVELOPE_TTL_SECS, EnvelopeTtl};
-pub use convergence::{AuthorityOp, Convergence, ConvergenceEffect, ConvergenceMsg, presence_admit, tick as convergence_tick};
-pub use verify_tripwire::{PUBLISH_STAGE_ORDER, StageTrace, assert_stage_before, publish_source_verify_before_side_effects};
+pub use verify_tripwire::{
+    PUBLISH_STAGE_ORDER, StageTrace, assert_stage_before, publish_source_verify_before_side_effects,
+};
 
 use crate::nostr::Event;
 

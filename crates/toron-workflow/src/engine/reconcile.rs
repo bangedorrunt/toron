@@ -33,9 +33,16 @@ pub struct ProviderCapability {
 /// timeouts, process loss, and unparseable responses: the effect may or may
 /// not have happened, and the journal must say `unknown` — never infer
 /// no-send from it.
+///
+/// `Deferred` is the non-Settled hand-off (GS-062 T1): burst buffered or
+/// Transient-requeued awaiting kind-43001 on the wire. Maps to
+/// [`EffectState::Accepted`] — not Settled/Delivered, not Ambiguous→Unknown
+/// force-retry dual-publish.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ProviderOutcome {
     Delivered(serde_json::Value),
+    /// Accepted into coalescer / Transient requeue; wire publish not yet proven.
+    Deferred(serde_json::Value),
     ProvenFailed(String),
     Ambiguous(String),
 }

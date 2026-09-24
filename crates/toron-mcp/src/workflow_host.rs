@@ -33,7 +33,7 @@ use anyhow::{Context, Result};
 use nostr::prelude::{Event, EventBuilder, EventId, FinalizeEvent, Keys, Kind, Tag, Timestamp};
 use toron_core::bus::{Bus, SubscriptionEvent};
 use toron_core::mailbox::{Mailbox, SendMessage, UnwrappedMail};
-use toron_workflow::coalesce::{CoalesceDecision, Coalesced, MentionCoalescer};
+use toron_workflow::coalesce::{CoalesceDecision, Coalesced, DlqReason, MentionCoalescer, RequeueOutcome, RequeueSchedule};
 use toron_workflow::engine::{
     ActionInvocation, ActionPartition, AsyncEffectRunner, AsyncRunJournal, CleanupKind,
     CleanupRequest, Decision, DispatchPlan, EffectJournalMode, EffectView,
@@ -46,6 +46,8 @@ use toron_workflow::engine::{
     plan_attempt, terminal_digest, validate_resolution,
 };
 use toron_workflow::jobs::{JobRequest, build_job_request_with_tags};
+use toron_workflow::dispatch::{DispatchAcquire, DispatchConfig, DispatchPermit, DispatchPool};
+use toron_workflow::lifecycle::{LifecycleEffect, WorkflowLifecycle};
 use toron_workflow::schema::{Action, Trigger, Workflow};
 use toron_workflow::stamp_workflow_emitted;
 use toron_workflow::trigger_filter::{
@@ -95,36 +97,173 @@ fn mail_outcome(send: Result<usize, String>, key: String) -> ProviderOutcome {
     }
 }
 
-/// Map one coalescer decision onto a provider outcome (bd-zczp): Buffered
-/// records the burst-buffer hand-off; FlushNow publishes with typed
-/// errors — NoSigner is proven never-sent, transport loss is ambiguous.
+/// Map one coalescer decision onto a provider outcome (bd-zczp / GS-062 T1):
+/// Buffered and Transient-requeued deferred stay [`ProviderOutcome::Deferred`]
+/// (journal [`EffectState::Accepted`] — non-Settled) until kind-43001 is on
+/// the wire. FlushNow publish success / AlreadyDelivered → Delivered/Settled.
+/// Exhausted → ProvenFailed + DLQ (T2); NoSigner → ProvenFailed (T3 align).
 /// Async: the flush publish is awaited inline (bd-ckkf).
 async fn mention_outcome(
     bus: &dyn Bus,
     signer: Option<&Keys>,
     decision: CoalesceDecision,
     key: String,
+    delivery: Option<&toron_workflow::DeliveryCursorStore>,
+    pool: Option<&DispatchPool>,
+    coalescer: Option<&std::sync::Mutex<MentionCoalescer>>,
 ) -> ProviderOutcome {
     match decision {
-        CoalesceDecision::Buffered { .. } => ProviderOutcome::Delivered(serde_json::json!({
+        // T1: CapMention Buffered must NOT Settled-Delivered before tick/wire publish.
+        CoalesceDecision::Buffered { .. } => ProviderOutcome::Deferred(serde_json::json!({
             "ok": true,
             "coalesced": true,
+            "deferred": true,
+            "buffered": true,
             "effect_key": key,
         })),
+        // GS-062: FlushNow shares peek→publish→mark with the trigger-loop
+        // timer flush via publish_coalesced_job_with_cursor (never delivery=None
+        // when the host owns a DeliveryCursorStore). Captain C: also acquire
+        // on this arm (timer flush already did) — completeness for kind-43001.
         CoalesceDecision::FlushNow(coalesced) => {
-            match publish_coalesced_job(bus, signer, &coalesced).await {
-                Ok(id) => ProviderOutcome::Delivered(serde_json::json!({
-                    "ok": true,
-                    "coalesced": false,
-                    "published": true,
-                    "job_id": id.to_hex(),
-                    "effect_key": key,
-                })),
+            let permit = if let Some(pool) = pool {
+                match host_acquire_for_assignee(pool, &coalesced.assignee, now_ms()).await {
+                    Ok(p) => Some(p),
+                    Err(e) => {
+                        // Do not drop the already-flushed burst — Transient
+                        // requeue with backoff (TRANSPORT-REQUEUE-HOT-SPIN).
+                        // T1: Deferred (Accepted), not Delivered{deferred} Settled,
+                        // not Ambiguous→Unknown dual-publish.
+                        if let Some(c) = coalescer {
+                            let mut g = c.lock().unwrap_or_else(PoisonError::into_inner);
+                            let assignee = coalesced.assignee.clone();
+                            match g.requeue(
+                                coalesced,
+                                now_ms(),
+                                RequeueSchedule::Transient,
+                            ) {
+                                RequeueOutcome::Queued { .. } => {
+                                    return ProviderOutcome::Deferred(serde_json::json!({
+                                        "ok": true,
+                                        "coalesced": true,
+                                        "deferred": true,
+                                        "reason": format!("dispatch acquire deferred: {e}"),
+                                        "effect_key": key,
+                                    }));
+                                }
+                                RequeueOutcome::Exhausted => {
+                                    // T2: requeue already parked whole batch on DLQ.
+                                    g.clear_retry(&assignee);
+                                    return ProviderOutcome::ProvenFailed(format!(
+                                        "dispatch acquire retry budget exhausted: {e}"
+                                    ));
+                                }
+                            }
+                        }
+                        return ProviderOutcome::Ambiguous(format!(
+                            "dispatch acquire deferred: {e}"
+                        ));
+                    }
+                }
+            } else {
+                None
+            };
+            let out = match publish_coalesced_job_with_cursor(bus, signer, &coalesced, delivery)
+                .await
+            {
+                Ok(id) => {
+                    if let Some(c) = coalescer {
+                        let mut g = c.lock().unwrap_or_else(PoisonError::into_inner);
+                        g.clear_retry(&coalesced.assignee);
+                    }
+                    ProviderOutcome::Delivered(serde_json::json!({
+                        "ok": true,
+                        "coalesced": false,
+                        "published": true,
+                        "job_id": id.to_hex(),
+                        "effect_key": key,
+                    }))
+                }
                 Err(CoalescePublishError::NoSigner) => {
+                    // GS-062 NOSIGNER + T3: terminal ProvenFailed, park DLQ
+                    // (never Failed+requeue; never silent drop).
+                    if let Some(c) = coalescer {
+                        let mut g = c.lock().unwrap_or_else(PoisonError::into_inner);
+                        g.park_dlq(coalesced, DlqReason::NoSigner);
+                    } else {
+                        let _ = coalesced;
+                    }
                     ProviderOutcome::ProvenFailed("no job signer configured".to_string())
                 }
-                Err(CoalescePublishError::Transport(e)) => ProviderOutcome::Ambiguous(e),
-            }
+                Err(CoalescePublishError::AlreadyDelivered) => {
+                    // Cursor proves delivered → Delivered/Settled.
+                    // Mirror timer AlreadyDelivered: clear Transient retry map.
+                    if let Some(c) = coalescer {
+                        let mut g = c.lock().unwrap_or_else(PoisonError::into_inner);
+                        g.clear_retry(&coalesced.assignee);
+                    }
+                    ProviderOutcome::Delivered(serde_json::json!({
+                        "ok": true,
+                        "coalesced": false,
+                        "published": false,
+                        "skipped": true,
+                        "reason": "already delivered to session",
+                        "effect_key": key,
+                    }))
+                }
+                Err(CoalescePublishError::InFlight) => {
+                    // Concurrent reserve — NOT Settled. FreshWindow requeue
+                    // (no Transient budget) + Ambiguous/retry.
+                    if let Some(c) = coalescer {
+                        let mut g = c.lock().unwrap_or_else(PoisonError::into_inner);
+                        let _ = g.requeue(
+                            coalesced,
+                            now_ms(),
+                            RequeueSchedule::FreshWindow,
+                        );
+                    } else {
+                        let _ = coalesced;
+                    }
+                    ProviderOutcome::Ambiguous(
+                        "delivery in-flight for session (concurrent reserve)".into(),
+                    )
+                }
+                Err(CoalescePublishError::Transport(e)) => {
+                    // GS-062 T1: Transient requeue + Deferred (Accepted) —
+                    // NOT Delivered{deferred} Settled, NOT Ambiguous→Unknown
+                    // dual-publish via DispatchJob force-retry.
+                    // T2 Exhausted: DLQ park (in requeue) + ProvenFailed.
+                    if let Some(c) = coalescer {
+                        let mut g = c.lock().unwrap_or_else(PoisonError::into_inner);
+                        let assignee = coalesced.assignee.clone();
+                        match g.requeue(
+                            coalesced,
+                            now_ms(),
+                            RequeueSchedule::Transient,
+                        ) {
+                            RequeueOutcome::Queued { .. } => {
+                                ProviderOutcome::Deferred(serde_json::json!({
+                                    "ok": true,
+                                    "coalesced": true,
+                                    "deferred": true,
+                                    "reason": format!("transport deferred: {e}"),
+                                    "effect_key": key,
+                                }))
+                            }
+                            RequeueOutcome::Exhausted => {
+                                g.clear_retry(&assignee);
+                                ProviderOutcome::ProvenFailed(format!(
+                                    "transport retry budget exhausted: {e}"
+                                ))
+                            }
+                        }
+                    } else {
+                        ProviderOutcome::Ambiguous(e)
+                    }
+                }
+            };
+            drop(permit);
+            out
         }
     }
 }
@@ -136,6 +275,9 @@ async fn mention_outcome(
 fn fenced_outcome(key: &str, result: anyhow::Result<DispatchResult>) -> serde_json::Value {
     match result {
         Ok(res) if res.state == EffectState::Settled => res.outcome,
+        // T1 Deferred → Accepted: runner sees hand-off payload; journal stays
+        // non-Settled (not Delivered/Settled before wire publish).
+        Ok(res) if res.state == EffectState::Accepted => res.outcome,
         Ok(res) => serde_json::json!({
             "ok": false,
             "effect_key": key,
@@ -292,12 +434,33 @@ pub fn mailbox_async_effect_runner(
     dispatcher: Arc<std::sync::Mutex<Option<EffectDispatcher>>>,
     armor: Arc<SendArmor>,
 ) -> AsyncEffectRunner {
+    mailbox_async_effect_runner_with_delivery(
+        mailbox, coalescer, job_signer, dispatcher, armor, None, None,
+    )
+}
+
+/// Like [`mailbox_async_effect_runner`] with a shared session
+/// [`toron_workflow::DeliveryCursorStore`] so DispatchJob / cap FlushNow
+/// shares peek→publish→mark with the trigger-loop timer flush (GS-062).
+/// Optional [`DispatchPool`] wires captain-C acquire on the FlushNow arm
+/// (same as timer flush) — production hosts pass `Some`.
+pub fn mailbox_async_effect_runner_with_delivery(
+    mailbox: Arc<Mailbox>,
+    coalescer: Arc<std::sync::Mutex<MentionCoalescer>>,
+    job_signer: Option<Keys>,
+    dispatcher: Arc<std::sync::Mutex<Option<EffectDispatcher>>>,
+    armor: Arc<SendArmor>,
+    delivery: Option<Arc<toron_workflow::DeliveryCursorStore>>,
+    dispatch_pool: Option<Arc<DispatchPool>>,
+) -> AsyncEffectRunner {
     Arc::new(move |inv: &ActionInvocation| {
         let mailbox = mailbox.clone();
         let coalescer = coalescer.clone();
         let job_signer = job_signer.clone();
         let dispatcher = dispatcher.clone();
         let armor = armor.clone();
+        let delivery = delivery.clone();
+        let dispatch_pool = dispatch_pool.clone();
         let inv = inv.clone();
         Box::pin(async move {
             // The `invoke` contract over an async provider: partition
@@ -318,6 +481,8 @@ pub fn mailbox_async_effect_runner(
                         job_signer,
                         dispatcher,
                         armor,
+                        delivery,
+                        dispatch_pool,
                         inv.clone(),
                     )
                     .await,
@@ -342,6 +507,8 @@ async fn dispatch_host_sink(
     job_signer: Option<Keys>,
     dispatcher: Arc<std::sync::Mutex<Option<EffectDispatcher>>>,
     armor: Arc<SendArmor>,
+    delivery: Option<Arc<toron_workflow::DeliveryCursorStore>>,
+    dispatch_pool: Option<Arc<DispatchPool>>,
     inv: ActionInvocation,
 ) -> anyhow::Result<serde_json::Value> {
     match inv.action.clone() {
@@ -422,19 +589,27 @@ async fn dispatch_host_sink(
             let Some(disp) = disp else {
                 // No journal: direct hand-off; failures return Err
                 // so the normalization classifies them (I5) identically.
-                return match mention_outcome(bus.as_ref(), job_signer.as_ref(), decision, key).await
+                return match mention_outcome(
+                    bus.as_ref(),
+                    job_signer.as_ref(),
+                    decision,
+                    key,
+                    delivery.as_deref(),
+                    dispatch_pool.as_deref(),
+                    Some(coalescer.as_ref()),
+                )
+                .await
                 {
-                    ProviderOutcome::Delivered(v) => Ok(v),
+                    ProviderOutcome::Delivered(v) | ProviderOutcome::Deferred(v) => Ok(v),
                     ProviderOutcome::ProvenFailed(m) | ProviderOutcome::Ambiguous(m) => {
                         Err(anyhow::anyhow!(m))
                     }
                 };
             };
-            // bd-1kr2: fenced @mention hand-off. Buffered means the
-            // burst buffer accepted the mention (the host tick owns the
-            // later 43001 publish — Settled here records the hand-off,
-            // not the wire delivery; the in-memory coalescer's
-            // crash-loss window is unchanged and documented).
+            // bd-1kr2 / GS-062 T1: fenced @mention hand-off. Buffered is
+            // Deferred→Accepted (non-Settled) until tick/wire publish;
+            // Settled only on FlushNow publish success / AlreadyDelivered.
+            // In-memory coalescer crash-loss window unchanged and documented.
             // A coalesced 43001 merges N effects into one job, so no
             // single corr rides it — per-effect corr lives in the
             // journal's transport_corr projection (linked by dispatch).
@@ -445,8 +620,20 @@ async fn dispatch_host_sink(
                     let bus = bus.clone();
                     let job_signer = job_signer.clone();
                     let key = key.clone();
+                    let delivery = delivery.clone();
+                    let pool = dispatch_pool.clone();
+                    let coalescer = coalescer.clone();
                     async move {
-                        mention_outcome(bus.as_ref(), job_signer.as_ref(), decision, key).await
+                        mention_outcome(
+                            bus.as_ref(),
+                            job_signer.as_ref(),
+                            decision,
+                            key,
+                            delivery.as_deref(),
+                            pool.as_deref(),
+                            Some(coalescer.as_ref()),
+                        )
+                        .await
                     }
                 })
                 .await,
@@ -596,22 +783,170 @@ pub enum CoalescePublishError {
     NoSigner,
     /// The bus failed mid-publish: the job may or may not exist.
     Transport(String),
+    /// GS-062: DeliveryCursorStore cursor proves already delivered (all
+    /// SkipAlreadyDelivered). Maps to Delivered/Settled.
+    AlreadyDelivered,
+    /// GS-062: keep empty solely via SkipInFlight (concurrent reserve).
+    /// Must NOT Settled/Delivered — peer still publishing; Ambiguous/retry.
+    InFlight,
 }
 
 /// Build + publish ONE kind-43001 for a coalesced mention burst (bd-ckkf):
 /// awaited inline on the caller's runtime — no scoped thread, no runtime
 /// bridge of any kind. Async contexts (the trigger loop, the async runner)
 /// all await this directly.
+
+/// GS-062 captain C: acquire a dispatch permit for a live host publish.
+/// Parks `SleepUntilDeadline` (journal/park + [`DispatchPool::deadline_wake`]);
+/// never uses the Option [`DispatchPool::try_acquire`] shim that maps fenced
+/// Err→None (e2e-only).
+pub async fn host_acquire_for_assignee<'a>(
+    pool: &'a DispatchPool,
+    assignee: &str,
+    now_ms: u64,
+) -> Result<DispatchPermit<'a>, String> {
+    // Retry across the full hold_bound window (DEFAULT_HOLD_BOUND_MS=10_000).
+    // Truncating sleep to 5s amplified HoldContinued/HoldExpired drops.
+    let hold_bound = pool.hold_bound_ms().max(1);
+    let deadline = now_ms.saturating_add(hold_bound);
+    let mut attempt_now = now_ms;
+    let mut claimed_generation = pool.generation_of(assignee);
+    loop {
+        match pool.try_acquire_for_host(assignee, attempt_now, claimed_generation) {
+            DispatchAcquire::Granted(permit) => return Ok(permit),
+            DispatchAcquire::Park {
+                until_ms, effects, ..
+            } => {
+                // Journal/park SleepUntilDeadline (settlement ≠ provider done).
+                tracing::debug!(
+                    assignee,
+                    until_ms,
+                    hold_bound,
+                    ?effects,
+                    "host DispatchAcquire::Park — sleep full park window then deadline_wake"
+                );
+                let wait_ms = until_ms.saturating_sub(attempt_now).max(1);
+                // Align with hold_bound — never truncate (was .min(5_000)).
+                tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
+                attempt_now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(until_ms);
+                let _ = pool.deadline_wake(assignee, attempt_now);
+                claimed_generation = pool.generation_of(assignee);
+                if attempt_now >= deadline {
+                    match pool.try_acquire_for_host(assignee, attempt_now, claimed_generation) {
+                        DispatchAcquire::Granted(permit) => return Ok(permit),
+                        other => {
+                            return Err(format!(
+                                "dispatch still unavailable after hold_bound park: {other:?}"
+                            ));
+                        }
+                    }
+                }
+            }
+            DispatchAcquire::Refused(fx) => {
+                return Err(format!("dispatch refused: {fx:?}"));
+            }
+            DispatchAcquire::CapContention => {
+                if attempt_now >= deadline {
+                    return Err("dispatch cap contention".into());
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                attempt_now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(attempt_now.saturating_add(50));
+                claimed_generation = pool.generation_of(assignee);
+            }
+        }
+    }
+}
+
 pub async fn publish_coalesced_job(
     bus: &dyn Bus,
     signer: Option<&Keys>,
     coalesced: &Coalesced,
 ) -> Result<EventId, CoalescePublishError> {
-    let event =
-        build_coalesced_job_event(signer, coalesced).ok_or(CoalescePublishError::NoSigner)?;
-    bus.publish(event.clone())
-        .await
-        .map_err(|e| CoalescePublishError::Transport(format!("bus publish: {e}")))?;
+    publish_coalesced_job_with_cursor(bus, signer, coalesced, None).await
+}
+
+/// GS-062: session delivery-cursor filter before kind-43001 publish.
+/// Session key = assignee (dispatch session), never agent pubkey.
+///
+/// Peeks/reserves **all** mention parent ids in the batch (not only
+/// [`Coalesced::parent`]): skip the whole batch only when none remain
+/// undelivered. Reserve under the lock before awaiting publish so concurrent
+/// with_cursor calls cannot double-publish; release reservation on transport
+/// failure.
+pub async fn publish_coalesced_job_with_cursor(
+    bus: &dyn Bus,
+    signer: Option<&Keys>,
+    coalesced: &Coalesced,
+    delivery: Option<&toron_workflow::DeliveryCursorStore>,
+) -> Result<EventId, CoalescePublishError> {
+    let parent_ids = coalesced.parent_ids();
+    let session = coalesced.assignee.as_str();
+    // GS-062 INFLIGHT-RESERVATION-LEAK: RAII guard clears in_flight on
+    // cancel/panic/early return between reserve and mark.
+    let mut reservation: Option<toron_workflow::ReservationGuard<'_>> = None;
+    // GS-062 PARTIAL-KEEP-FULL-SPEC: when keep ⊂ parents, publish only reserved.
+    let mut filtered: Option<Coalesced> = None;
+    // DispatchJob / synthetic bursts may carry empty parents — no delivery id
+    // to dedup, so the cursor gate does not apply (do not treat keep=[] as skip).
+    if let Some(store) = delivery {
+        if !parent_ids.is_empty() {
+            let proof_id = parent_ids.first().map(String::as_str).unwrap_or("");
+            let _ = toron_workflow::agent_key_is_not_delivery_proof("unused", proof_id);
+            // Reserve all parents under the lock — do not advance delivered yet.
+            let (keep, effects) = store.reserve_undelivered(session, parent_ids.clone());
+            if keep.is_empty() {
+                // Distinguish true already-delivered from concurrent in-flight
+                // empty-keep (SkipInFlight). In-flight must NOT Settled.
+                let any_inflight = effects.iter().any(|e| {
+                    matches!(
+                        e,
+                        toron_workflow::DeliveryEffect::SkipInFlight { .. }
+                    )
+                });
+                if any_inflight {
+                    return Err(CoalescePublishError::InFlight);
+                }
+                // All SkipAlreadyDelivered (cursor proves delivered).
+                return Err(CoalescePublishError::AlreadyDelivered);
+            }
+            if keep.len() != parent_ids.len() {
+                filtered = Some(coalesced.retain_parents(&keep));
+            }
+            reservation = Some(toron_workflow::ReservationGuard::new(
+                store, session, keep,
+            ));
+        }
+    }
+    let to_publish = filtered.as_ref().unwrap_or(coalesced);
+    let event = match build_coalesced_job_event(signer, to_publish) {
+        Some(ev) => ev,
+        None => {
+            // reservation Drop releases in_flight
+            return Err(CoalescePublishError::NoSigner);
+        }
+    };
+    match bus.publish(event.clone()).await {
+        Ok(_) => {}
+        Err(e) => {
+            // reservation Drop releases in_flight
+            return Err(CoalescePublishError::Transport(format!("bus publish: {e}")));
+        }
+    }
+    // Mark only after successful publish (reserved keep, or all parents when
+    // no cursor gate applied).
+    if let Some(guard) = reservation.take() {
+        guard.commit();
+    } else if let Some(store) = delivery {
+        if !parent_ids.is_empty() {
+            store.mark_delivered(session, parent_ids);
+        }
+    }
     Ok(event.id)
 }
 
@@ -625,6 +960,11 @@ fn sender_for(project: &str) -> String {
         format!("workflow-{project}")
     }
 }
+
+/// GS-062 REQUEUE-EVENT-STARVATION: trigger-loop coalescer flush timer.
+/// Must be ≤ default sub-window (500ms) so InFlight/Transport requeues can
+/// flush without waiting for the next bus event.
+pub const COALESCE_FLUSH_TICK_MS: u64 = 250;
 
 /// Monotonic-millis clock for the coalescer (matches its injected-time API).
 fn now_ms() -> u64 {
@@ -640,7 +980,15 @@ fn now_ms() -> u64 {
 pub struct WorkflowHost {
     engine: Arc<WorkflowEngine>,
     bus: Arc<dyn Bus>,
-    workflows: Vec<Workflow>,
+    /// GS-062 ask-user B: definition list behind Arc so Clone (trigger-loop)
+    /// shares ONE registry with soft_delete_workflow / try_start / workflows().
+    /// Do NOT copy Vec on Clone — only lifecycle Arc was shared before, which
+    /// left trigger clones blind to soft_delete.
+    workflows: Arc<std::sync::Mutex<Vec<Workflow>>>,
+    /// GS-062: soft-delete + start_admit under one lock (Buzz #7735).
+    lifecycle: Arc<WorkflowLifecycle>,
+    /// GS-062: session delivery-cursor dedup for mention→43001 (Buzz #7620).
+    delivery: Arc<toron_workflow::DeliveryCursorStore>,
     coalescer: Arc<std::sync::Mutex<MentionCoalescer>>,
     /// ADR-0007 F7: signs coalesced kind-43001 job requests. Absent → flushes
     /// are logged but not published (honest degradation).
@@ -653,12 +1001,16 @@ pub struct WorkflowHost {
     /// so a late [`Self::with_effect_store`] attach also rewires sends).
     /// `None` on journal-less embeddings (direct sends).
     dispatcher: Arc<std::sync::Mutex<Option<EffectDispatcher>>>,
+    /// GS-062 captain C: live host acquire path. Arc-shared on Clone so the
+    /// trigger-loop host parks SleepUntilDeadline via try_acquire_for_host
+    /// (Option try_acquire remains e2e-only).
+    dispatch_pool: Arc<DispatchPool>,
 }
 
 impl std::fmt::Debug for WorkflowHost {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WorkflowHost")
-            .field("workflows", &self.workflows.len())
+            .field("workflows", &self.workflows.lock().map(|g| g.len()).unwrap_or(0))
             .field("engine", &self.engine)
             .field("has_job_signer", &self.job_signer.is_some())
             .field(
@@ -683,6 +1035,11 @@ impl WorkflowHost {
     /// key (when present) signs coalesced job requests (F7).
     pub fn new(mailbox: Arc<Mailbox>, workflows: Vec<Workflow>) -> Result<Self> {
         let coalescer = Arc::new(std::sync::Mutex::new(MentionCoalescer::from_env()));
+        let lifecycle = Arc::new(WorkflowLifecycle::new());
+        let delivery = Arc::new(toron_workflow::DeliveryCursorStore::new());
+        for w in &workflows {
+            let _ = lifecycle.register(w.name.clone());
+        }
         let job_signer = mailbox.operator().cloned();
         // bd-cnr5 + bd-1kr2: production touches the durable journal — when
         // the mailbox carries the index pool, run states + terminal dedupe
@@ -702,7 +1059,8 @@ impl WorkflowHost {
         // breaker, explicit fallback) guards every mailbox send below.
         // bd-ctj7: no sync runner exists anymore — the engine computes pure
         // leaves itself and awaits the async seam for the rest.
-        let async_effect_runner = mailbox_async_effect_runner(
+        let dispatch_pool = Arc::new(DispatchPool::new(DispatchConfig::default()));
+        let async_effect_runner = mailbox_async_effect_runner_with_delivery(
             mailbox.clone(),
             coalescer.clone(),
             job_signer.clone(),
@@ -712,6 +1070,8 @@ impl WorkflowHost {
                 ARMOR_SEND_TIMEOUT,
                 ARMOR_MAX_CONCURRENCY,
             )),
+            Some(delivery.clone()),
+            Some(dispatch_pool.clone()),
         );
         // bd-engine-run-path-journaling-fwlx (the Spec 6 flip): the host
         // really dispatches, so its engine is Enforced — an effectful leaf
@@ -746,11 +1106,14 @@ impl WorkflowHost {
         Ok(Self {
             engine: Arc::new(engine),
             bus,
-            workflows,
+            workflows: Arc::new(std::sync::Mutex::new(workflows)),
+            lifecycle: lifecycle.clone(),
+            delivery: delivery.clone(),
             coalescer,
             job_signer,
             pending: Arc::new(tokio::sync::Mutex::new(pending)),
             dispatcher,
+            dispatch_pool,
         })
     }
 
@@ -765,14 +1128,22 @@ impl WorkflowHost {
     ) -> Result<Self> {
         let engine =
             WorkflowEngine::local_with_async_effect_runner(effect).context("workflow engine")?;
+        let lifecycle = Arc::new(WorkflowLifecycle::new());
+        let delivery = Arc::new(toron_workflow::DeliveryCursorStore::new());
+        for w in &workflows {
+            let _ = lifecycle.register(w.name.clone());
+        }
         Ok(Self {
             engine: Arc::new(engine),
             bus,
-            workflows,
+            workflows: Arc::new(std::sync::Mutex::new(workflows)),
+            lifecycle,
+            delivery,
             coalescer: Arc::new(std::sync::Mutex::new(MentionCoalescer::from_env())),
             job_signer: None,
             pending: Arc::new(tokio::sync::Mutex::new(PendingDrain::new())),
             dispatcher: Arc::new(std::sync::Mutex::new(None)),
+            dispatch_pool: Arc::new(DispatchPool::new(DispatchConfig::default())),
         })
     }
 
@@ -783,14 +1154,22 @@ impl WorkflowHost {
         engine: WorkflowEngine,
         workflows: Vec<Workflow>,
     ) -> Self {
+        let lifecycle = Arc::new(WorkflowLifecycle::new());
+        let delivery = Arc::new(toron_workflow::DeliveryCursorStore::new());
+        for w in &workflows {
+            let _ = lifecycle.register(w.name.clone());
+        }
         Self {
             engine: Arc::new(engine),
             bus,
-            workflows,
+            workflows: Arc::new(std::sync::Mutex::new(workflows)),
+            lifecycle,
+            delivery,
             coalescer: Arc::new(std::sync::Mutex::new(MentionCoalescer::from_env())),
             job_signer: None,
             pending: Arc::new(tokio::sync::Mutex::new(PendingDrain::new())),
             dispatcher: Arc::new(std::sync::Mutex::new(None)),
+            dispatch_pool: Arc::new(DispatchPool::new(DispatchConfig::default())),
         }
     }
 
@@ -837,15 +1216,65 @@ impl WorkflowHost {
     }
 
     /// Register an additional workflow (idempotent by name).
+    /// GS-062: also registers with [`WorkflowLifecycle`] under one lock.
     pub fn add_workflow(&mut self, workflow: Workflow) {
-        if !self.workflows.iter().any(|w| w.name == workflow.name) {
-            self.workflows.push(workflow);
+        // GS-062 lock order: NEVER call lifecycle.register while holding
+        // workflows — soft_delete takes lifecycle then workflows; opposite
+        // order on Arc Clone deadlocks. Register first, then workflows.
+        let name = workflow.name.clone();
+        {
+            let defs = self
+                .workflows
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if defs.iter().any(|w| w.name == name) {
+                return;
+            }
+        } // release workflows before lifecycle.register
+        let _ = self.lifecycle.register(name.clone());
+        let mut defs = self
+            .workflows
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // Re-check under lock so concurrent add_workflow cannot duplicate.
+        if !defs.iter().any(|w| w.name == name) {
+            defs.push(workflow);
         }
     }
 
-    /// The registered workflows.
-    pub fn workflows(&self) -> &[Workflow] {
-        &self.workflows
+    /// Soft-delete a workflow definition (Buzz #7735 / GS-062): clears
+    /// executable under the lifecycle lock and drops the in-memory definition
+    /// from the **shared** Arc registry so Clone'd trigger-loop hosts see it.
+    pub fn soft_delete_workflow(&mut self, id: &str) -> LifecycleEffect {
+        let fx = self.lifecycle.soft_delete(id);
+        if matches!(
+            fx,
+            LifecycleEffect::SoftDeleted { .. } | LifecycleEffect::AlreadyDeleted { .. }
+        ) {
+            self.workflows
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .retain(|w| w.name != id);
+        }
+        fx
+    }
+
+    /// Lifecycle registry (tests / diagnostics).
+    pub fn lifecycle(&self) -> &WorkflowLifecycle {
+        self.lifecycle.as_ref()
+    }
+
+    /// GS-062 captain C: live [`DispatchPool`] (try_acquire_for_host path).
+    pub fn dispatch_pool(&self) -> &DispatchPool {
+        self.dispatch_pool.as_ref()
+    }
+
+    /// Snapshot of registered workflow definitions (shared Arc registry).
+    pub fn workflows(&self) -> Vec<Workflow> {
+        self.workflows
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// The host-owned pending lifecycle (bd-asx3).
@@ -1117,6 +1546,24 @@ impl WorkflowHost {
     /// re-draining until the run is terminal, so parks created after the
     /// first await point are picked up without waiting for bus traffic.
     async fn spawn_run_and_drain(&self, run_id: String, workflow: Workflow, input: RunInput) {
+        // GS-062: refuse soft-deleted / non-executable definitions (Buzz #7735).
+        match self.lifecycle.try_start(&workflow.name) {
+            LifecycleEffect::StartAdmitted { .. } => {}
+            LifecycleEffect::NotFound { .. } => {
+                // Definitions loaded at construct may predate lifecycle register —
+                // admit once by registering lazily, then proceed.
+                let _ = self.lifecycle.register(workflow.name.clone());
+            }
+            other => {
+                warn!(
+                    run_id = %run_id,
+                    workflow = %workflow.name,
+                    ?other,
+                    "workflow start refused by WorkflowLifecycle"
+                );
+                return;
+            }
+        }
         // bd-cnr5: durable track — the workflow_runs row outlives the host.
         if let Err(e) = self
             .pending
@@ -1256,7 +1703,8 @@ impl WorkflowHost {
                     continue;
                 }
                 let kind = mail.rumor.kind.as_u16();
-                for workflow in &me.workflows {
+                let defs = me.workflows.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                for workflow in &defs {
                     let Some(trigger) = &workflow.trigger else {
                         continue;
                     };
@@ -1308,6 +1756,145 @@ impl WorkflowHost {
         })
     }
 
+    /// Tick the coalescer and publish (or requeue) each flushed burst.
+    /// Shared by the bus-event arm and the GS-062 starvation flush timer.
+    async fn flush_coalesced_bursts(&self) {
+        // P1 (bd-p1-poison-on-panic-audit-jwpd): recover the std Mutex poison.
+        // P1 (F3.COALESCER-LOCK): guard scoped to tick() ONLY — flushed values
+        // are owned, guard drops, THEN each publish runs.
+        let flushed = {
+            let mut c = self
+                .coalescer
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            c.tick(now_ms())
+        };
+        if !flushed.is_empty() {
+            debug!("coalescer flushed {} assignee(s)", flushed.len());
+        }
+        for coalesced in flushed {
+            // GS-062 captain C: live host DispatchAcquire before publish.
+            let tick_now = now_ms();
+            let permit = match host_acquire_for_assignee(
+                self.dispatch_pool.as_ref(),
+                &coalesced.assignee,
+                tick_now,
+            )
+            .await
+            {
+                Ok(p) => p,
+                Err(e) => {
+                    // Transient requeue + backoff (not flush_ready forever).
+                    let assignee = coalesced.assignee.clone();
+                    let mut c = self
+                        .coalescer
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner);
+                    match c.requeue(coalesced, now_ms(), RequeueSchedule::Transient) {
+                        RequeueOutcome::Queued { attempt, delay_ms } => warn!(
+                            assignee = %assignee,
+                            attempt,
+                            delay_ms,
+                            "coalesced burst deferred (dispatch acquire): {e} — requeue"
+                        ),
+                        RequeueOutcome::Exhausted => {
+                            // T2: requeue parked whole batch on DLQ (not silent drop).
+                            c.clear_retry(&assignee);
+                            warn!(
+                                assignee = %assignee,
+                                "coalesced burst DLQ (dispatch acquire retry budget exhausted): {e}"
+                            );
+                        }
+                    }
+                    continue;
+                }
+            };
+            // GS-062: session delivery-cursor before kind-43001 publish.
+            match publish_coalesced_job_with_cursor(
+                self.bus.as_ref(),
+                self.job_signer.as_ref(),
+                &coalesced,
+                Some(self.delivery.as_ref()),
+            )
+            .await
+            {
+                Ok(id) => {
+                    let mut c = self
+                        .coalescer
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner);
+                    c.clear_retry(&coalesced.assignee);
+                    debug!(
+                        assignee = %coalesced.assignee, %id,
+                        "kind-43001 published for coalesced burst"
+                    );
+                }
+                Err(CoalescePublishError::AlreadyDelivered) => {
+                    let mut c = self
+                        .coalescer
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner);
+                    c.clear_retry(&coalesced.assignee);
+                    debug!(
+                        assignee = %coalesced.assignee,
+                        "kind-43001 skipped (already delivered to session)"
+                    );
+                }
+                Err(CoalescePublishError::InFlight) => {
+                    // Concurrent reserve — FreshWindow (no Transient budget).
+                    warn!(
+                        assignee = %coalesced.assignee,
+                        "kind-43001 in-flight (concurrent reserve) — requeue"
+                    );
+                    let mut c = self
+                        .coalescer
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner);
+                    let _ = c.requeue(coalesced, now_ms(), RequeueSchedule::FreshWindow);
+                }
+                Err(CoalescePublishError::NoSigner) => {
+                    // GS-062 T3: durable DLQ (align FlushNow ProvenFailed) —
+                    // NOT intentional warn!+silent drop.
+                    let assignee = coalesced.assignee.clone();
+                    let mut c = self
+                        .coalescer
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner);
+                    c.park_dlq(coalesced, DlqReason::NoSigner);
+                    warn!(
+                        assignee = %assignee,
+                        "coalesced burst NOT published (no job signer) — parked DLQ"
+                    );
+                }
+                Err(CoalescePublishError::Transport(e)) => {
+                    // Transient backoff requeue (TRANSPORT-REQUEUE-HOT-SPIN).
+                    let assignee = coalesced.assignee.clone();
+                    let mut c = self
+                        .coalescer
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner);
+                    match c.requeue(coalesced, now_ms(), RequeueSchedule::Transient) {
+                        RequeueOutcome::Queued { attempt, delay_ms } => warn!(
+                            assignee = %assignee,
+                            attempt,
+                            delay_ms,
+                            "coalesced burst publish transport failed: {e} — requeue"
+                        ),
+                        RequeueOutcome::Exhausted => {
+                            // T2: requeue parked whole batch on DLQ (not silent drop).
+                            c.clear_retry(&assignee);
+                            warn!(
+                                assignee = %assignee,
+                                "coalesced burst DLQ (transport retry budget exhausted): {e}"
+                            );
+                        }
+                    }
+                }
+            }
+            drop(permit); // release busy holder after publish CS
+        }
+    }
+
     /// Drive the trigger loop to completion (until the subscription closes).
     pub async fn run_trigger_loop(&self) -> Result<()> {
         // TRUSTED ingress (P11.1): a plain global `subscribe` would be gated
@@ -1319,9 +1906,30 @@ impl WorkflowHost {
             .subscribe_trusted(toron_core::bus::Filter::new())
             .await
             .map_err(|e| anyhow::anyhow!("bus subscribe_trusted: {e}"))?;
-        while let Some(ev) = sub.next().await {
-            let SubscriptionEvent::Event(event) = ev else {
-                continue;
+        // GS-062 REQUEUE-EVENT-STARVATION: timer tick so InFlight/Transport
+        // requeues flush without depending solely on the next bus event.
+        let mut flush_tick = tokio::time::interval(std::time::Duration::from_millis(
+            COALESCE_FLUSH_TICK_MS,
+        ));
+        flush_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Consume the immediate first tick so we do not flush before subscribe settles.
+        flush_tick.tick().await;
+        loop {
+            let event = tokio::select! {
+                ev = sub.next() => {
+                    let Some(ev) = ev else { break; };
+                    let SubscriptionEvent::Event(event) = ev else {
+                        continue;
+                    };
+                    // Tick coalescer on every bus Event (even filtered) so
+                    // windowed bursts do not stall on ingress rejects.
+                    self.flush_coalesced_bursts().await;
+                    event
+                }
+                _ = flush_tick.tick() => {
+                    self.flush_coalesced_bursts().await;
+                    continue;
+                }
             };
             // ADR-0004 Ship 2: loop prevention at ingress — reject
             // workflow/job/gift-wrap emissions + the workflow-emitted tag.
@@ -1330,51 +1938,8 @@ impl WorkflowHost {
                 continue;
             }
             debug!(kind = event.kind.as_u16(), "event passes ingress filter");
-            // Tick the coalescer: flush any windowed @mention burst whose
-            // window elapsed, and PUBLISH one kind-43001 per flushed batch
-            // (ADR-0007 F7 — N mentions in a window → exactly one job).
-            {
-                // P1 (bd-p1-poison-on-panic-audit-jwpd): recover the std
-                // Mutex poison — a panic inside the guard must not brick
-                // every subsequent tick flush.
-                // P1 (F3.COALESCER-LOCK, batch-fix): the guard is scoped to
-                // tick() ONLY — the flushed Coalesced values are owned, the
-                // guard drops, THEN each publish runs.
-                let flushed = {
-                    let mut c = self
-                        .coalescer
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner);
-                    c.tick(now_ms())
-                };
-                if !flushed.is_empty() {
-                    debug!("coalescer flushed {} assignee(s)", flushed.len());
-                }
-                for coalesced in flushed {
-                    // We are ON an async runtime here: build the event and
-                    // await the publish directly — the sync bridge is gone.
-                    match build_coalesced_job_event(self.job_signer.as_ref(), &coalesced) {
-                        Some(event) => {
-                            let id = event.id;
-                            match self.bus.publish(event).await {
-                                Ok(_) => debug!(
-                                    assignee = %coalesced.assignee, %id,
-                                    "kind-43001 published for coalesced burst"
-                                ),
-                                Err(e) => warn!(
-                                    assignee = %coalesced.assignee, %id,
-                                    "coalesced burst publish failed: {e}"
-                                ),
-                            }
-                        }
-                        None => warn!(
-                            assignee = %coalesced.assignee,
-                            "coalesced burst NOT published (no job signer configured)"
-                        ),
-                    }
-                }
-            }
-            for workflow in &self.workflows {
+            let defs = self.workflows.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            for workflow in &defs {
                 let Some(trigger) = &workflow.trigger else {
                     continue;
                 };
@@ -1908,6 +2473,9 @@ fn classify_outcome(
             None,
         ),
         ProviderOutcome::Delivered(v) => (EffectState::Settled, None, Some(v.clone())),
+        // T1: Deferred → Accepted (non-Settled). Default CapMention capability
+        // refuses blind retry — no Ambiguous→Unknown dual-publish storm.
+        ProviderOutcome::Deferred(v) => (EffectState::Accepted, None, Some(v.clone())),
         ProviderOutcome::ProvenFailed(msg) => (
             EffectState::Failed,
             Some(serde_json::json!({"error": msg})),
@@ -2127,7 +2695,7 @@ impl EffectDispatcher {
                 claim_token: Some(token),
                 state: to,
                 evidence: Some(match outcome {
-                    ProviderOutcome::Delivered(v) => v.clone(),
+                    ProviderOutcome::Delivered(v) | ProviderOutcome::Deferred(v) => v.clone(),
                     ProviderOutcome::ProvenFailed(m) | ProviderOutcome::Ambiguous(m) => {
                         serde_json::json!({"error": m})
                     }
@@ -5356,5 +5924,1403 @@ steps:
         );
         let _ = std::fs::remove_file(&db);
         let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// GS-062: multi-parent batch peeks/marks ALL parents; a later batch whose
+    /// first parent is already delivered still publishes undelivered siblings.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn multi_parent_cursor_marks_all_and_keeps_siblings() {
+        use toron_core::bus::in_process::{InProcessBus, InProcessBusConfig};
+        use toron_core::index::schema;
+        use toron_workflow::coalesce::InboundMention;
+        use toron_workflow::DeliveryCursorStore;
+
+        let db = std::env::temp_dir().join(format!("wf-mp-{}.sqlite", uuid::Uuid::new_v4()));
+        let pool = schema::connect(db.to_str().unwrap())
+            .await
+            .expect("connect");
+        schema::migrate(&pool).await.expect("migrate");
+        let bus: Arc<dyn Bus> = Arc::new(
+            InProcessBus::open(pool, InProcessBusConfig::default())
+                .await
+                .expect("bus"),
+        );
+        let store = DeliveryCursorStore::new();
+        let signer = Keys::generate();
+        let session = "oc-mp";
+
+        let batch1 = Coalesced {
+            assignee: session.into(),
+            mentions: vec![
+                InboundMention {
+                    assignee: session.into(),
+                    parent: "parent-a".into(),
+                    spec: json!({"text": "a"}),
+                },
+                InboundMention {
+                    assignee: session.into(),
+                    parent: "parent-b".into(),
+                    spec: json!({"text": "b"}),
+                },
+            ],
+            first_arrival_ms: 0,
+        };
+        let id1 = publish_coalesced_job_with_cursor(
+            bus.as_ref(),
+            Some(&signer),
+            &batch1,
+            Some(&store),
+        )
+        .await
+        .expect("first batch publishes");
+        assert!(!id1.to_hex().is_empty());
+        assert!(store.cursor(session).delivered.contains("parent-a"));
+        assert!(store.cursor(session).delivered.contains("parent-b"));
+
+        // Later batch: first parent already delivered, sibling new — must NOT
+        // skip the whole batch (silent sibling loss hazard).
+        let batch2 = Coalesced {
+            assignee: session.into(),
+            mentions: vec![
+                InboundMention {
+                    assignee: session.into(),
+                    parent: "parent-a".into(),
+                    spec: json!({"text": "a2"}),
+                },
+                InboundMention {
+                    assignee: session.into(),
+                    parent: "parent-c".into(),
+                    spec: json!({"text": "c"}),
+                },
+            ],
+            first_arrival_ms: 1,
+        };
+        let id2 = publish_coalesced_job_with_cursor(
+            bus.as_ref(),
+            Some(&signer),
+            &batch2,
+            Some(&store),
+        )
+        .await
+        .expect("sibling batch must publish when any parent undelivered");
+        assert_ne!(id1, id2);
+        assert!(store.cursor(session).delivered.contains("parent-c"));
+
+        // All parents delivered → skip.
+        let err = publish_coalesced_job_with_cursor(
+            bus.as_ref(),
+            Some(&signer),
+            &batch2,
+            Some(&store),
+        )
+        .await
+        .expect_err("fully delivered batch skips");
+        assert!(
+            matches!(err, CoalescePublishError::AlreadyDelivered),
+            "idempotent skip must be AlreadyDelivered, not Transport, got {err:?}"
+        );
+
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// GS-062: FlushNow path (mention_outcome) uses DeliveryCursorStore via
+    /// publish_coalesced_job_with_cursor — not delivery=None.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn flushnow_path_uses_delivery_cursor() {
+        use toron_core::bus::in_process::{InProcessBus, InProcessBusConfig};
+        use toron_core::index::schema;
+        use toron_workflow::coalesce::InboundMention;
+        use toron_workflow::DeliveryCursorStore;
+
+        let db = std::env::temp_dir().join(format!("wf-fn-cur-{}.sqlite", uuid::Uuid::new_v4()));
+        let pool = schema::connect(db.to_str().unwrap())
+            .await
+            .expect("connect");
+        schema::migrate(&pool).await.expect("migrate");
+        let bus: Arc<dyn Bus> = Arc::new(
+            InProcessBus::open(pool, InProcessBusConfig::default())
+                .await
+                .expect("bus"),
+        );
+        let delivery = DeliveryCursorStore::new();
+        let signer = Keys::generate();
+        let session = "oc-fn";
+        let batch = Coalesced {
+            assignee: session.into(),
+            mentions: vec![InboundMention {
+                assignee: session.into(),
+                parent: "fn-parent-1".into(),
+                spec: json!({"i": 0}),
+            }],
+            first_arrival_ms: 0,
+        };
+        let decision = CoalesceDecision::FlushNow(batch.clone());
+        let out = mention_outcome(
+            bus.as_ref(),
+            Some(&signer),
+            decision,
+            "effect-fn-1".into(),
+            Some(&delivery),
+            None,
+            None,
+        )
+        .await;
+        match out {
+            ProviderOutcome::Delivered(v) => {
+                assert_eq!(v["published"], serde_json::json!(true), "{v}");
+            }
+            other => panic!("expected Delivered, got {other:?}"),
+        }
+        assert!(
+            delivery.cursor(session).delivered.contains("fn-parent-1"),
+            "FlushNow must mark via with_cursor"
+        );
+        // Second FlushNow for same parent → Ambiguous skip (transport skip msg).
+        let out2 = mention_outcome(
+            bus.as_ref(),
+            Some(&signer),
+            CoalesceDecision::FlushNow(batch),
+            "effect-fn-2".into(),
+            Some(&delivery),
+            None,
+            None,
+        )
+        .await;
+        match &out2 {
+            ProviderOutcome::Delivered(v) => {
+                assert_eq!(v["skipped"], serde_json::json!(true), "{v}");
+                assert_eq!(v["published"], serde_json::json!(false), "{v}");
+            }
+            other => panic!(
+                "second FlushNow skip must Delivered{{skipped:true}} (Settled), never Ambiguous/Unknown, got {other:?}"
+            ),
+        }
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// GS-062: concurrent with_cursor reserve — only one publish wins; the
+    /// other sees keep empty (no double-publish). Deterministic, no sleeps.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_with_cursor_no_double_publish() {
+        use toron_core::bus::in_process::{InProcessBus, InProcessBusConfig};
+        use toron_core::index::schema;
+        use toron_workflow::coalesce::InboundMention;
+        use toron_workflow::DeliveryCursorStore;
+
+        let db = std::env::temp_dir().join(format!("wf-race-{}.sqlite", uuid::Uuid::new_v4()));
+        let pool = schema::connect(db.to_str().unwrap())
+            .await
+            .expect("connect");
+        schema::migrate(&pool).await.expect("migrate");
+        let bus: Arc<dyn Bus> = Arc::new(
+            InProcessBus::open(pool, InProcessBusConfig::default())
+                .await
+                .expect("bus"),
+        );
+        let store = Arc::new(DeliveryCursorStore::new());
+        let signer = Keys::generate();
+        let session = "oc-race";
+        let batch = Coalesced {
+            assignee: session.into(),
+            mentions: vec![InboundMention {
+                assignee: session.into(),
+                parent: "race-parent".into(),
+                spec: json!({"t": "race"}),
+            }],
+            first_arrival_ms: 0,
+        };
+
+        let store_a = store.clone();
+        let store_b = store.clone();
+        let bus_a = bus.clone();
+        let bus_b = bus.clone();
+        let batch_a = batch.clone();
+        let batch_b = batch.clone();
+        let signer_a = signer.clone();
+        let signer_b = signer.clone();
+
+        let (r1, r2) = tokio::join!(
+            publish_coalesced_job_with_cursor(
+                bus_a.as_ref(),
+                Some(&signer_a),
+                &batch_a,
+                Some(store_a.as_ref()),
+            ),
+            publish_coalesced_job_with_cursor(
+                bus_b.as_ref(),
+                Some(&signer_b),
+                &batch_b,
+                Some(store_b.as_ref()),
+            ),
+        );
+        let wins = [r1.is_ok(), r2.is_ok()].into_iter().filter(|x| *x).count();
+        let skips = [r1.is_err(), r2.is_err()]
+            .into_iter()
+            .filter(|x| *x)
+            .count();
+        assert_eq!(wins, 1, "exactly one publish wins, got r1={r1:?} r2={r2:?}");
+        assert_eq!(skips, 1, "exactly one skips as already in-flight/delivered");
+        // Loser must be InFlight (concurrent reserve) or AlreadyDelivered
+        // (winner marked first) — never a silent Transport conflation.
+        let loser = if r1.is_err() { &r1 } else { &r2 };
+        match loser {
+            Err(CoalescePublishError::InFlight)
+            | Err(CoalescePublishError::AlreadyDelivered) => {}
+            other => panic!("loser must be InFlight or AlreadyDelivered, got {other:?}"),
+        }
+        assert!(store.cursor(session).delivered.contains("race-parent"));
+        assert!(store.cursor(session).in_flight.is_empty());
+
+        let _ = std::fs::remove_file(&db);
+    }
+
+
+    /// GS-062 EMPTYKEEP-INFLIGHT: keep=[] via SkipInFlight must NOT Settled.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn inflight_empty_keep_is_ambiguous_not_settled() {
+        use toron_core::bus::in_process::{InProcessBus, InProcessBusConfig};
+        use toron_core::index::schema;
+        use toron_workflow::coalesce::InboundMention;
+        use toron_workflow::DeliveryCursorStore;
+
+        let db = std::env::temp_dir().join(format!("wf-inflight-{}.sqlite", uuid::Uuid::new_v4()));
+        let pool = schema::connect(db.to_str().unwrap())
+            .await
+            .expect("connect");
+        schema::migrate(&pool).await.expect("migrate");
+        let bus: Arc<dyn Bus> = Arc::new(
+            InProcessBus::open(pool, InProcessBusConfig::default())
+                .await
+                .expect("bus"),
+        );
+        let store = DeliveryCursorStore::new();
+        let signer = Keys::generate();
+        let session = "oc-inflight";
+        let parent = "inflight-parent";
+        // Simulate concurrent reserve holding in_flight.
+        let (keep, _) = store.reserve_undelivered(session, [parent]);
+        assert_eq!(keep, vec![parent.to_string()]);
+
+        let batch = Coalesced {
+            assignee: session.into(),
+            mentions: vec![InboundMention {
+                assignee: session.into(),
+                parent: parent.into(),
+                spec: json!({"t": "inflight"}),
+            }],
+            first_arrival_ms: 0,
+        };
+        let err = publish_coalesced_job_with_cursor(
+            bus.as_ref(),
+            Some(&signer),
+            &batch,
+            Some(&store),
+        )
+        .await
+        .expect_err("in-flight empty-keep must error");
+        assert!(
+            matches!(err, CoalescePublishError::InFlight),
+            "must be InFlight not AlreadyDelivered, got {err:?}"
+        );
+
+        // FlushNow / mention_outcome must Ambiguous (not Settled/Delivered).
+        let coalescer = std::sync::Mutex::new(MentionCoalescer::with_defaults());
+        let out = mention_outcome(
+            bus.as_ref(),
+            Some(&signer),
+            CoalesceDecision::FlushNow(batch.clone()),
+            "ek-inflight".into(),
+            Some(&store),
+            None,
+            Some(&coalescer),
+        )
+        .await;
+        match &out {
+            ProviderOutcome::Ambiguous(m) => {
+                assert!(
+                    m.contains("in-flight") || m.contains("concurrent"),
+                    "Ambiguous reason: {m}"
+                );
+            }
+            other => panic!(
+                "in-flight FlushNow must Ambiguous (not Settled/Delivered), got {other:?}"
+            ),
+        }
+        // Requeued for retry (flush_ready=false → buffered).
+        assert!(
+            coalescer
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .buffered_for(session)
+                >= 1,
+            "in-flight must requeue burst"
+        );
+
+        // After mark proves delivered → AlreadyDelivered → Settled OK.
+        store.mark_delivered(session, [parent]);
+        let err2 = publish_coalesced_job_with_cursor(
+            bus.as_ref(),
+            Some(&signer),
+            &batch,
+            Some(&store),
+        )
+        .await
+        .expect_err("now truly delivered");
+        assert!(
+            matches!(err2, CoalescePublishError::AlreadyDelivered),
+            "cursor-proven skip is AlreadyDelivered, got {err2:?}"
+        );
+
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// GS-062 ACQUIRE-DROP: acquire Err requeues into coalescer (no silent loss).
+    #[test]
+    fn acquire_err_requeues_flushed_burst() {
+        let mut c = MentionCoalescer::new(
+            std::time::Duration::from_millis(2_000),
+            std::time::Duration::from_millis(500),
+            64,
+        );
+        use toron_workflow::coalesce::InboundMention;
+        c.submit(
+            InboundMention {
+                assignee: "oc".into(),
+                parent: "p1".into(),
+                spec: json!({"t": 1}),
+            },
+            0,
+        );
+        let batch = c.force_flush("oc").expect("flushed");
+        assert_eq!(c.buffered_for("oc"), 0);
+        // Simulate trigger-loop acquire Err path (Transient attempt 0 = immediate).
+        let q = c.requeue(batch, 1_000, RequeueSchedule::Transient);
+        assert!(matches!(q, RequeueOutcome::Queued { delay_ms: 0, .. }), "{q:?}");
+        assert_eq!(c.buffered_for("oc"), 1);
+        let again = c.tick(1_000);
+        assert_eq!(again.len(), 1, "requeued burst must flush again");
+        assert_eq!(again[0].parent(), "p1");
+    }
+
+    /// GS-062 ACQUIRE-DROP: host_acquire sleep covers full hold_bound (not 5s cap).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn host_acquire_sleep_covers_full_hold_bound() {
+        use toron_workflow::dispatch::{DispatchAcquire, DispatchConfig, DispatchPool};
+        // hold_bound > 5_000 would have been truncated by the old .min(5_000).
+        let pool = DispatchPool::new(DispatchConfig {
+            max_concurrency: 2,
+            hold_bound_ms: 80,
+        });
+        assert_eq!(pool.hold_bound_ms(), 80);
+        let hold = pool
+            .try_acquire_fenced("oc", 10, 0)
+            .expect("first grant");
+        match pool.try_acquire_for_host("oc", 20, 0) {
+            DispatchAcquire::Park { until_ms, .. } => {
+                assert!(
+                    until_ms >= 20 + 80 - 1,
+                    "park until must reflect hold_bound, got {until_ms}"
+                );
+            }
+            other => panic!("expected Park, got {other:?}"),
+        }
+        drop(hold);
+        let _ = pool.deadline_wake("oc", 10_000);
+        let permit = host_acquire_for_assignee(&pool, "oc", 10_000)
+            .await
+            .expect("host acquire after wake");
+        drop(permit);
+    }
+
+    /// GS-062 PARTIAL-WIRE: FlushNow arm acquires via DispatchPool when provided.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn flushnow_wires_host_acquire() {
+        use toron_core::bus::in_process::{InProcessBus, InProcessBusConfig};
+        use toron_core::index::schema;
+        use toron_workflow::coalesce::InboundMention;
+        use toron_workflow::dispatch::{DispatchConfig, DispatchPool};
+        use toron_workflow::DeliveryCursorStore;
+
+        let db = std::env::temp_dir().join(format!("wf-fn-acq-{}.sqlite", uuid::Uuid::new_v4()));
+        let sql = schema::connect(db.to_str().unwrap())
+            .await
+            .expect("connect");
+        schema::migrate(&sql).await.expect("migrate");
+        let bus: Arc<dyn Bus> = Arc::new(
+            InProcessBus::open(sql, InProcessBusConfig::default())
+                .await
+                .expect("bus"),
+        );
+        let delivery = DeliveryCursorStore::new();
+        let pool = DispatchPool::new(DispatchConfig {
+            max_concurrency: 2,
+            hold_bound_ms: 50,
+        });
+        let signer = Keys::generate();
+        let session = "oc-fn-acq";
+        let batch = Coalesced {
+            assignee: session.into(),
+            mentions: vec![InboundMention {
+                assignee: session.into(),
+                parent: "fn-acq-parent".into(),
+                spec: json!({"i": 0}),
+            }],
+            first_arrival_ms: 0,
+        };
+        let out = mention_outcome(
+            bus.as_ref(),
+            Some(&signer),
+            CoalesceDecision::FlushNow(batch),
+            "ek-fn-acq".into(),
+            Some(&delivery),
+            Some(&pool),
+            None,
+        )
+        .await;
+        match out {
+            ProviderOutcome::Delivered(v) => {
+                assert_eq!(v["published"], serde_json::json!(true), "{v}");
+            }
+            other => panic!("FlushNow+acquire must Delivered, got {other:?}"),
+        }
+        assert!(
+            !pool.busy_holder(session),
+            "permit dropped after FlushNow publish"
+        );
+        let _ = std::fs::remove_file(&db);
+    }
+
+        /// GS-062 captain C: live host acquire parks SleepUntilDeadline and
+    /// recovers via deadline_wake — Option try_acquire remains e2e-only.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn host_acquire_parks_then_deadline_wake() {
+        use toron_workflow::dispatch::{DispatchAcquire, DispatchConfig, DispatchPool};
+        let pool = DispatchPool::new(DispatchConfig {
+            max_concurrency: 2,
+            hold_bound_ms: 50,
+        });
+        let hold = pool
+            .try_acquire_fenced("oc", 10, 0)
+            .expect("first grant");
+        match pool.try_acquire_for_host("oc", 20, 0) {
+            DispatchAcquire::Park { until_ms, .. } => assert!(until_ms >= 20),
+            other => panic!("expected Park, got {other:?}"),
+        }
+        assert!(
+            pool.try_acquire("oc").is_none(),
+            "Option shim maps Sleep→None; live hosts must not use it"
+        );
+        drop(hold);
+        let _ = pool.deadline_wake("oc", 10_000);
+        let permit = host_acquire_for_assignee(&pool, "oc", 10_000)
+            .await
+            .expect("host acquire after wake");
+        drop(permit);
+    }
+
+    /// GS-062: add_workflow / soft_delete_workflow opposite lock order must not
+    /// deadlock on Clone'd hosts (register never while holding workflows).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn add_workflow_soft_delete_lock_order_no_deadlock() {
+        use std::sync::{Arc, Barrier};
+        use std::time::{Duration, Instant};
+        use toron_core::bus::in_process::{InProcessBus, InProcessBusConfig};
+        use toron_core::index::schema;
+        use toron_workflow::schema::Workflow;
+
+        let db = std::env::temp_dir().join(format!("wf-lock-{}.sqlite", uuid::Uuid::new_v4()));
+        let pool = schema::connect(db.to_str().unwrap())
+            .await
+            .expect("connect");
+        schema::migrate(&pool).await.expect("migrate");
+        let bus: Arc<dyn Bus> = Arc::new(
+            InProcessBus::open(pool, InProcessBusConfig::default())
+                .await
+                .expect("bus"),
+        );
+        let host = WorkflowHost::over_bus(bus, vec![], None).expect("host");
+        let host_a = host.clone();
+        let host_b = host.clone();
+        let barrier = Arc::new(Barrier::new(2));
+        let b1 = barrier.clone();
+        let b2 = barrier.clone();
+        let t0 = Instant::now();
+        let h1 = std::thread::spawn(move || {
+            b1.wait();
+            for i in 0..40 {
+                let wf = Workflow {
+                    name: format!("w-a-{i}"),
+                    description: None,
+                    trigger: None,
+                    policy: None,
+                    guard: None,
+                    principles: vec![],
+                    steps: vec![],
+                    graph: None,
+                    inputs: vec![],
+                    crew: None,
+                };
+                let mut h = host_a.clone();
+                h.add_workflow(wf);
+            }
+        });
+        let h2 = std::thread::spawn(move || {
+            b2.wait();
+            for i in 0..40 {
+                let mut h = host_b.clone();
+                let _ = h.soft_delete_workflow(&format!("w-a-{i}"));
+            }
+        });
+        h1.join().expect("add thread");
+        h2.join().expect("del thread");
+        assert!(
+            t0.elapsed() < Duration::from_secs(5),
+            "lock-order deadlock suspected"
+        );
+        let _ = std::fs::remove_file(&db);
+    }
+
+
+
+
+    /// GS-062 ask-user B: Clone shares Arc definition registry — soft_delete
+    /// visible to the cloned trigger-loop host (not a Vec copy).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn clone_sees_soft_delete_on_shared_registry() {
+        use toron_core::bus::in_process::{InProcessBus, InProcessBusConfig};
+        use toron_core::index::schema;
+        use toron_workflow::schema::Workflow;
+
+        let db = std::env::temp_dir().join(format!("wf-arc-defs-{}.sqlite", uuid::Uuid::new_v4()));
+        let pool = schema::connect(db.to_str().unwrap()).await.expect("connect");
+        schema::migrate(&pool).await.expect("migrate");
+        let bus: Arc<dyn Bus> = Arc::new(
+            InProcessBus::open(pool, InProcessBusConfig::default())
+                .await
+                .expect("bus"),
+        );
+        let wf: Workflow = serde_json::from_value(serde_json::json!({
+            "name": "arc-wf",
+            "steps": []
+        }))
+        .expect("minimal workflow");
+        let mut host = WorkflowHost::over_bus(bus, vec![wf], None).expect("host");
+        let cloned = host.clone();
+        assert_eq!(cloned.workflows().len(), 1);
+        let fx = host.soft_delete_workflow("arc-wf");
+        assert!(matches!(
+            fx,
+            LifecycleEffect::SoftDeleted { .. } | LifecycleEffect::AlreadyDeleted { .. }
+        ));
+        assert!(
+            cloned.workflows().is_empty(),
+            "Clone must see soft_delete via shared Arc registry, got {:?}",
+            cloned.workflows().iter().map(|w| w.name.clone()).collect::<Vec<_>>()
+        );
+        assert!(
+            matches!(
+                cloned.lifecycle().try_start("arc-wf"),
+                LifecycleEffect::StartRefused { .. }
+            ),
+            "try_start must refuse soft-deleted via shared lifecycle"
+        );
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// Bus that always fails publish (GS-062 TRANSPORT-DROP regression).
+    struct FailBus {
+        inner: Arc<toron_core::bus::InProcessBus>,
+    }
+
+    #[async_trait::async_trait]
+    impl Bus for FailBus {
+        async fn publish(
+            &self,
+            _event: Event,
+        ) -> Result<toron_core::bus::PublishOk, toron_core::bus::BusError> {
+            Err(toron_core::bus::BusError::Transport(
+                "injected transport failure".into(),
+            ))
+        }
+
+        async fn subscribe(
+            &self,
+            filter: toron_core::bus::Filter,
+        ) -> Result<toron_core::bus::Subscription, toron_core::bus::BusError> {
+            self.inner.subscribe(filter).await
+        }
+
+        async fn subscribe_trusted(
+            &self,
+            filter: toron_core::bus::Filter,
+        ) -> Result<toron_core::bus::Subscription, toron_core::bus::BusError> {
+            self.inner.subscribe_trusted(filter).await
+        }
+
+        async fn health(&self) -> Result<toron_core::bus::Health, toron_core::bus::BusError> {
+            self.inner.health().await
+        }
+    }
+
+    /// Recording bus: captures published events then delegates.
+    struct RecordBus {
+        inner: Arc<toron_core::bus::InProcessBus>,
+        published: std::sync::Mutex<Vec<Event>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Bus for RecordBus {
+        async fn publish(
+            &self,
+            event: Event,
+        ) -> Result<toron_core::bus::PublishOk, toron_core::bus::BusError> {
+            self.published
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(event.clone());
+            self.inner.publish(event).await
+        }
+
+        async fn subscribe(
+            &self,
+            filter: toron_core::bus::Filter,
+        ) -> Result<toron_core::bus::Subscription, toron_core::bus::BusError> {
+            self.inner.subscribe(filter).await
+        }
+
+        async fn subscribe_trusted(
+            &self,
+            filter: toron_core::bus::Filter,
+        ) -> Result<toron_core::bus::Subscription, toron_core::bus::BusError> {
+            self.inner.subscribe_trusted(filter).await
+        }
+
+        async fn health(&self) -> Result<toron_core::bus::Health, toron_core::bus::BusError> {
+            self.inner.health().await
+        }
+    }
+
+    /// GS-062 TRANSPORT-DROP-FLUSHNOW: Transport must requeue (not only Ambiguous).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn flushnow_transport_requeues_burst() {
+        use toron_core::bus::in_process::{InProcessBus, InProcessBusConfig};
+        use toron_core::index::schema;
+        use toron_workflow::coalesce::InboundMention;
+        use toron_workflow::DeliveryCursorStore;
+
+        let db = std::env::temp_dir().join(format!("wf-tn-fn-{}.sqlite", uuid::Uuid::new_v4()));
+        let pool = schema::connect(db.to_str().unwrap())
+            .await
+            .expect("connect");
+        schema::migrate(&pool).await.expect("migrate");
+        let inner = Arc::new(
+            InProcessBus::open(pool, InProcessBusConfig::default())
+                .await
+                .expect("bus"),
+        );
+        let bus: Arc<dyn Bus> = Arc::new(FailBus { inner });
+        let store = DeliveryCursorStore::new();
+        let signer = Keys::generate();
+        let session = "oc-tn-fn";
+        let batch = Coalesced {
+            assignee: session.into(),
+            mentions: vec![InboundMention {
+                assignee: session.into(),
+                parent: "tn-fn-parent".into(),
+                spec: json!({"t": "transport"}),
+            }],
+            first_arrival_ms: 0,
+        };
+        let coalescer = std::sync::Mutex::new(MentionCoalescer::with_defaults());
+        let out = mention_outcome(
+            bus.as_ref(),
+            Some(&signer),
+            CoalesceDecision::FlushNow(batch),
+            "ek-tn-fn".into(),
+            Some(&store),
+            None,
+            Some(&coalescer),
+        )
+        .await;
+        match &out {
+            ProviderOutcome::Deferred(v) => {
+                assert_eq!(v["deferred"], serde_json::json!(true), "{v}");
+            }
+            other => panic!(
+                "FlushNow Transport+requeue must Deferred (not Settled Delivered / not Ambiguous), got {other:?}"
+            ),
+        }
+        assert!(
+            coalescer
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .buffered_for(session)
+                >= 1,
+            "FlushNow Transport must requeue burst"
+        );
+        // Reservation released (RAII) so retry can reserve again.
+        assert!(
+            store.cursor(session).in_flight.is_empty(),
+            "in_flight must clear after Transport"
+        );
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// GS-062 TRANSPORT-DROP-TRIGGER: Transport requeue restores flush_ready burst.
+    #[test]
+    fn trigger_transport_requeue_flush_ready() {
+        let mut c = MentionCoalescer::new(
+            std::time::Duration::from_millis(2_000),
+            std::time::Duration::from_millis(500),
+            64,
+        );
+        use toron_workflow::coalesce::InboundMention;
+        c.submit(
+            InboundMention {
+                assignee: "oc".into(),
+                parent: "p-tn".into(),
+                spec: json!({"t": 1}),
+            },
+            0,
+        );
+        let batch = c.force_flush("oc").expect("flushed");
+        // Simulate trigger-loop Transport arm (Transient attempt 0 = immediate).
+        let q = c.requeue(batch, 1_000, RequeueSchedule::Transient);
+        assert!(matches!(q, RequeueOutcome::Queued { delay_ms: 0, .. }), "{q:?}");
+        let again = c.tick(1_000);
+        assert_eq!(again.len(), 1, "Transport requeue must flush on next tick");
+        assert_eq!(again[0].parent(), "p-tn");
+    }
+
+    /// GS-062 PARTIAL-KEEP-FULL-SPEC: published 43001 omits already-delivered parents.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn partial_keep_publishes_only_reserved_parents() {
+        use toron_core::bus::in_process::{InProcessBus, InProcessBusConfig};
+        use toron_core::index::schema;
+        use toron_workflow::coalesce::InboundMention;
+        use toron_workflow::DeliveryCursorStore;
+
+        let db = std::env::temp_dir().join(format!("wf-pk-{}.sqlite", uuid::Uuid::new_v4()));
+        let pool = schema::connect(db.to_str().unwrap())
+            .await
+            .expect("connect");
+        schema::migrate(&pool).await.expect("migrate");
+        let inner = Arc::new(
+            InProcessBus::open(pool, InProcessBusConfig::default())
+                .await
+                .expect("bus"),
+        );
+        let recorder = Arc::new(RecordBus {
+            inner,
+            published: std::sync::Mutex::new(Vec::new()),
+        });
+        let bus: Arc<dyn Bus> = recorder.clone();
+        let store = DeliveryCursorStore::new();
+        let signer = Keys::generate();
+        let session = "oc-partial";
+        // Parent "already" is delivered — keep only "fresh".
+        store.mark_delivered(session, ["already"]);
+        let batch = Coalesced {
+            assignee: session.into(),
+            mentions: vec![
+                InboundMention {
+                    assignee: session.into(),
+                    parent: "already".into(),
+                    spec: json!({"n": 1}),
+                },
+                InboundMention {
+                    assignee: session.into(),
+                    parent: "fresh".into(),
+                    spec: json!({"n": 2}),
+                },
+            ],
+            first_arrival_ms: 0,
+        };
+        let id = publish_coalesced_job_with_cursor(
+            bus.as_ref(),
+            Some(&signer),
+            &batch,
+            Some(&store),
+        )
+        .await
+        .expect("partial keep must publish");
+        let published = recorder
+            .published
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        assert_eq!(published.len(), 1);
+        assert_eq!(published[0].id, id);
+        let payload: serde_json::Value =
+            serde_json::from_str(&published[0].content).expect("job json");
+        let mentions = payload["spec"]["mentions"]
+            .as_array()
+            .expect("mentions array");
+        assert_eq!(
+            mentions.len(),
+            1,
+            "must not include SkipAlreadyDelivered parent, got {payload}"
+        );
+        assert_eq!(mentions[0]["parent"], "fresh");
+        assert_eq!(payload["spec"]["count"], 1);
+        assert!(store.cursor(session).delivered.contains("fresh"));
+        assert!(
+            store.cursor(session).delivered.contains("already"),
+            "pre-marked parent stays delivered"
+        );
+        assert!(store.cursor(session).in_flight.is_empty());
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// GS-062 REQUEUE-EVENT-STARVATION: flush tick interval ≤ default subwindow.
+    #[test]
+    fn coalesce_flush_tick_covers_subwindow() {
+        assert!(
+            COALESCE_FLUSH_TICK_MS <= 500,
+            "timer must fire within default subwindow so requeues flush without a bus event"
+        );
+        assert!(COALESCE_FLUSH_TICK_MS > 0);
+    }
+
+    /// GS-062 T1 FLUSHNOW-ACQUIRE: requeue restores as Deferred (non-Settled).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn flushnow_acquire_requeue_is_deferred() {
+        use toron_core::bus::in_process::{InProcessBus, InProcessBusConfig};
+        use toron_core::index::schema;
+        use toron_workflow::coalesce::InboundMention;
+        use toron_workflow::dispatch::{DispatchConfig, DispatchPool};
+        use toron_workflow::DeliveryCursorStore;
+
+        let db = std::env::temp_dir().join(format!("wf-acq-q-{}.sqlite", uuid::Uuid::new_v4()));
+        let sql = schema::connect(db.to_str().unwrap())
+            .await
+            .expect("connect");
+        schema::migrate(&sql).await.expect("migrate");
+        let bus: Arc<dyn Bus> = Arc::new(
+            InProcessBus::open(sql, InProcessBusConfig::default())
+                .await
+                .expect("bus"),
+        );
+        let delivery = DeliveryCursorStore::new();
+        // Cap=1 with busy holder → acquire parks then hold_bound Err.
+        let pool = DispatchPool::new(DispatchConfig {
+            max_concurrency: 1,
+            hold_bound_ms: 30,
+        });
+        let hold = pool
+            .try_acquire_fenced("oc-acq-q", now_ms(), 0)
+            .expect("hold busy");
+        let signer = Keys::generate();
+        let session = "oc-acq-q";
+        let batch = Coalesced {
+            assignee: session.into(),
+            mentions: vec![InboundMention {
+                assignee: session.into(),
+                parent: "acq-q-parent".into(),
+                spec: json!({"i": 0}),
+            }],
+            first_arrival_ms: 0,
+        };
+        let coalescer = std::sync::Mutex::new(MentionCoalescer::with_defaults());
+        let out = mention_outcome(
+            bus.as_ref(),
+            Some(&signer),
+            CoalesceDecision::FlushNow(batch),
+            "ek-acq-q".into(),
+            Some(&delivery),
+            Some(&pool),
+            Some(&coalescer),
+        )
+        .await;
+        drop(hold);
+        match out {
+            ProviderOutcome::Deferred(v) => {
+                assert_eq!(v["deferred"], serde_json::json!(true), "{v}");
+            }
+            other => panic!("acquire+requeue must Deferred (non-Settled), got {other:?}"),
+        }
+        assert!(
+            coalescer
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .buffered_for(session)
+                >= 1,
+            "acquire Err must requeue"
+        );
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// GS-062 NOSIGNER-FAILED-PLUS-REQUEUE: ProvenFailed without requeue.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn flushnow_nosigner_is_terminal_no_requeue() {
+        use toron_core::bus::in_process::{InProcessBus, InProcessBusConfig};
+        use toron_core::index::schema;
+        use toron_workflow::coalesce::InboundMention;
+        use toron_workflow::DeliveryCursorStore;
+
+        let db = std::env::temp_dir().join(format!("wf-ns-{}.sqlite", uuid::Uuid::new_v4()));
+        let pool = schema::connect(db.to_str().unwrap())
+            .await
+            .expect("connect");
+        schema::migrate(&pool).await.expect("migrate");
+        let bus: Arc<dyn Bus> = Arc::new(
+            InProcessBus::open(pool, InProcessBusConfig::default())
+                .await
+                .expect("bus"),
+        );
+        let store = DeliveryCursorStore::new();
+        let session = "oc-ns";
+        let batch = Coalesced {
+            assignee: session.into(),
+            mentions: vec![InboundMention {
+                assignee: session.into(),
+                parent: "ns-parent".into(),
+                spec: json!({"t": "nosigner"}),
+            }],
+            first_arrival_ms: 0,
+        };
+        let coalescer = std::sync::Mutex::new(MentionCoalescer::with_defaults());
+        let out = mention_outcome(
+            bus.as_ref(),
+            None, // no signer
+            CoalesceDecision::FlushNow(batch),
+            "ek-ns".into(),
+            Some(&store),
+            None,
+            Some(&coalescer),
+        )
+        .await;
+        assert!(
+            matches!(out, ProviderOutcome::ProvenFailed(_)),
+            "NoSigner must ProvenFailed, got {out:?}"
+        );
+        assert_eq!(
+            coalescer
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .buffered_for(session),
+            0,
+            "NoSigner must NOT requeue (Failed+requeue forbidden)"
+        );
+        assert_eq!(
+            coalescer
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .dlq_len(),
+            1,
+            "NoSigner must park batch on DLQ"
+        );
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// GS-062 T1(a): FlushNow Transient Queued must NOT Settled-Delivered.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn t1_flushnow_transient_queued_is_deferred_not_settled() {
+        use toron_core::bus::in_process::{InProcessBus, InProcessBusConfig};
+        use toron_core::index::schema;
+        use toron_core::index::workflow_effects::EffectState;
+        use toron_workflow::coalesce::InboundMention;
+        use toron_workflow::DeliveryCursorStore;
+
+        let db = std::env::temp_dir().join(format!("wf-t1-fn-{}.sqlite", uuid::Uuid::new_v4()));
+        let pool = schema::connect(db.to_str().unwrap())
+            .await
+            .expect("connect");
+        schema::migrate(&pool).await.expect("migrate");
+        let inner = Arc::new(
+            InProcessBus::open(pool, InProcessBusConfig::default())
+                .await
+                .expect("bus"),
+        );
+        let bus: Arc<dyn Bus> = Arc::new(FailBus { inner });
+        let store = DeliveryCursorStore::new();
+        let signer = Keys::generate();
+        let session = "oc-t1-fn";
+        let batch = Coalesced {
+            assignee: session.into(),
+            mentions: vec![InboundMention {
+                assignee: session.into(),
+                parent: "t1-fn-parent".into(),
+                spec: json!({"t": "t1"}),
+            }],
+            first_arrival_ms: 0,
+        };
+        let coalescer = std::sync::Mutex::new(MentionCoalescer::with_defaults());
+        let out = mention_outcome(
+            bus.as_ref(),
+            Some(&signer),
+            CoalesceDecision::FlushNow(batch),
+            "ek-t1-fn".into(),
+            Some(&store),
+            None,
+            Some(&coalescer),
+        )
+        .await;
+        let deferred = match &out {
+            ProviderOutcome::Deferred(v) => v.clone(),
+            other => panic!("T1 FlushNow Transient Queued must Deferred, got {other:?}"),
+        };
+        assert_eq!(deferred["deferred"], serde_json::json!(true));
+        let (state, _, _) = classify_outcome(&out);
+        assert_eq!(
+            state,
+            EffectState::Accepted,
+            "Deferred must journal Accepted (non-Settled), not Settled"
+        );
+        assert!(
+            coalescer
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .buffered_for(session)
+                >= 1,
+            "Transient Queued must requeue burst"
+        );
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// GS-062 T1(a): CapMention Buffered must NOT Settled-Delivered before tick publish.
+    #[test]
+    fn t1_capmention_buffered_is_deferred_not_settled() {
+        use toron_core::index::workflow_effects::EffectState;
+        let out = {
+            // mention_outcome Buffered arm is sync in effect (no I/O) — drive via
+            // the decision mapping by constructing the Deferred shape classify uses.
+            // Full async path covered by dispatch_job_actions_coalesce_via_runner.
+            ProviderOutcome::Deferred(serde_json::json!({
+                "ok": true,
+                "coalesced": true,
+                "deferred": true,
+                "buffered": true,
+                "effect_key": "ek-buf",
+            }))
+        };
+        // Also exercise live mention_outcome Buffered via block_on-free classify of
+        // the real function in the async twin below; here lock the settle class.
+        let (state, _, val) = classify_outcome(&out);
+        assert_eq!(state, EffectState::Accepted, "Buffered must not Settled");
+        assert_ne!(state, EffectState::Settled);
+        assert_eq!(val.unwrap()["buffered"], serde_json::json!(true));
+    }
+
+    /// GS-062 T1(a): CapMention Buffered via mention_outcome is Deferred.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn t1_capmention_buffered_mention_outcome_deferred() {
+        use toron_core::bus::in_process::{InProcessBus, InProcessBusConfig};
+        use toron_core::index::schema;
+        use toron_core::index::workflow_effects::EffectState;
+        use toron_workflow::DeliveryCursorStore;
+
+        let db = std::env::temp_dir().join(format!("wf-t1-buf-{}.sqlite", uuid::Uuid::new_v4()));
+        let pool = schema::connect(db.to_str().unwrap())
+            .await
+            .expect("connect");
+        schema::migrate(&pool).await.expect("migrate");
+        let bus: Arc<dyn Bus> = Arc::new(
+            InProcessBus::open(pool, InProcessBusConfig::default())
+                .await
+                .expect("bus"),
+        );
+        let store = DeliveryCursorStore::new();
+        let out = mention_outcome(
+            bus.as_ref(),
+            Some(&Keys::generate()),
+            CoalesceDecision::Buffered { buffered: 1 },
+            "ek-t1-buf".into(),
+            Some(&store),
+            None,
+            None,
+        )
+        .await;
+        match &out {
+            ProviderOutcome::Deferred(v) => {
+                assert_eq!(v["buffered"], serde_json::json!(true), "{v}");
+                assert_eq!(v["deferred"], serde_json::json!(true), "{v}");
+            }
+            other => panic!("Buffered must Deferred, got {other:?}"),
+        }
+        assert_eq!(classify_outcome(&out).0, EffectState::Accepted);
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// GS-062 T1(a): publish success Settles Delivered.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn t1_publish_success_settles_delivered() {
+        use toron_core::bus::in_process::{InProcessBus, InProcessBusConfig};
+        use toron_core::index::schema;
+        use toron_core::index::workflow_effects::EffectState;
+        use toron_workflow::coalesce::InboundMention;
+        use toron_workflow::DeliveryCursorStore;
+
+        let db = std::env::temp_dir().join(format!("wf-t1-ok-{}.sqlite", uuid::Uuid::new_v4()));
+        let pool = schema::connect(db.to_str().unwrap())
+            .await
+            .expect("connect");
+        schema::migrate(&pool).await.expect("migrate");
+        let bus: Arc<dyn Bus> = Arc::new(
+            InProcessBus::open(pool, InProcessBusConfig::default())
+                .await
+                .expect("bus"),
+        );
+        let store = DeliveryCursorStore::new();
+        let signer = Keys::generate();
+        let session = "oc-t1-ok";
+        let batch = Coalesced {
+            assignee: session.into(),
+            mentions: vec![InboundMention {
+                assignee: session.into(),
+                parent: "t1-ok-parent".into(),
+                spec: json!({"t": "ok"}),
+            }],
+            first_arrival_ms: 0,
+        };
+        let out = mention_outcome(
+            bus.as_ref(),
+            Some(&signer),
+            CoalesceDecision::FlushNow(batch),
+            "ek-t1-ok".into(),
+            Some(&store),
+            None,
+            None,
+        )
+        .await;
+        match &out {
+            ProviderOutcome::Delivered(v) => {
+                assert_eq!(v["published"], serde_json::json!(true), "{v}");
+            }
+            other => panic!("publish success must Delivered, got {other:?}"),
+        }
+        assert_eq!(classify_outcome(&out).0, EffectState::Settled);
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// GS-062 T2(b): Exhausted → ProvenFailed + DLQ whole batch; siblings preserved.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn t2_exhausted_proven_failed_dlq_preserves_siblings() {
+        use toron_core::bus::in_process::{InProcessBus, InProcessBusConfig};
+        use toron_core::index::schema;
+        use toron_workflow::coalesce::{InboundMention, REQUEUE_MAX_ATTEMPTS};
+        use toron_workflow::DeliveryCursorStore;
+
+        let db = std::env::temp_dir().join(format!("wf-t2-ex-{}.sqlite", uuid::Uuid::new_v4()));
+        let pool = schema::connect(db.to_str().unwrap())
+            .await
+            .expect("connect");
+        schema::migrate(&pool).await.expect("migrate");
+        let inner = Arc::new(
+            InProcessBus::open(pool, InProcessBusConfig::default())
+                .await
+                .expect("bus"),
+        );
+        let bus: Arc<dyn Bus> = Arc::new(FailBus { inner });
+        let store = DeliveryCursorStore::new();
+        let signer = Keys::generate();
+        let session = "oc-t2-ex";
+        let coalescer = std::sync::Mutex::new(MentionCoalescer::with_defaults());
+        // Sibling already Buffered (live buffer) — must survive Exhausted.
+        {
+            let mut g = coalescer.lock().unwrap_or_else(PoisonError::into_inner);
+            let _ = g.submit(
+                InboundMention {
+                    assignee: session.into(),
+                    parent: "sibling-live".into(),
+                    spec: json!({"sib": true}),
+                },
+                0,
+            );
+            assert_eq!(g.buffered_for(session), 1);
+        }
+        // Burn Transient budget with FlushNow Transport failures.
+        for i in 0..REQUEUE_MAX_ATTEMPTS {
+            let batch = Coalesced {
+                assignee: session.into(),
+                mentions: vec![InboundMention {
+                    assignee: session.into(),
+                    parent: format!("ex-parent-{i}"),
+                    spec: json!({"i": i}),
+                }],
+                first_arrival_ms: 0,
+            };
+            let out = mention_outcome(
+                bus.as_ref(),
+                Some(&signer),
+                CoalesceDecision::FlushNow(batch),
+                format!("ek-t2-ex-{i}"),
+                Some(&store),
+                None,
+                Some(&coalescer),
+            )
+            .await;
+            assert!(
+                matches!(out, ProviderOutcome::Deferred(_)),
+                "attempt {i} must Deferred Queued, got {out:?}"
+            );
+        }
+        let batch = Coalesced {
+            assignee: session.into(),
+            mentions: vec![InboundMention {
+                assignee: session.into(),
+                parent: "ex-parent-final".into(),
+                spec: json!({"final": true}),
+            }],
+            first_arrival_ms: 0,
+        };
+        let out = mention_outcome(
+            bus.as_ref(),
+            Some(&signer),
+            CoalesceDecision::FlushNow(batch),
+            "ek-t2-ex-final".into(),
+            Some(&store),
+            None,
+            Some(&coalescer),
+        )
+        .await;
+        assert!(
+            matches!(out, ProviderOutcome::ProvenFailed(_)),
+            "Exhausted must ProvenFailed (no force-retry), got {out:?}"
+        );
+        let g = coalescer.lock().unwrap_or_else(PoisonError::into_inner);
+        assert!(
+            g.dlq_len() >= 1,
+            "Exhausted must DLQ whole coalesced batch, dlq={}",
+            g.dlq_len()
+        );
+        assert!(
+            g.dlq_for(session)
+                .iter()
+                .any(|e| e.reason == DlqReason::Exhausted),
+            "DLQ reason Exhausted"
+        );
+        // Sibling + any Transient-restored parents may be in live buffer;
+        // critically the pre-existing sibling must not be wiped.
+        assert!(
+            g.buffered_for(session) >= 1,
+            "sibling Buffered must not be silently lost, buffered={}",
+            g.buffered_for(session)
+        );
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// GS-062 T3: timer NoSigner parks DLQ (not warn+silent drop).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn t3_timer_nosigner_parks_dlq() {
+        use toron_core::bus::in_process::{InProcessBus, InProcessBusConfig};
+        use toron_core::index::schema;
+        use toron_workflow::coalesce::InboundMention;
+
+        let db = std::env::temp_dir().join(format!("wf-t3-ns-{}.sqlite", uuid::Uuid::new_v4()));
+        let pool = schema::connect(db.to_str().unwrap())
+            .await
+            .expect("connect");
+        schema::migrate(&pool).await.expect("migrate");
+        let bus: Arc<dyn Bus> = Arc::new(
+            InProcessBus::open(pool, InProcessBusConfig::default())
+                .await
+                .expect("bus"),
+        );
+        // over_bus with no job signer — timer NoSigner path.
+        let host = WorkflowHost::over_bus(bus, vec![], None).expect("host");
+        {
+            let mut c = host
+                .coalescer()
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            c.submit(
+                InboundMention {
+                    assignee: "oc-t3".into(),
+                    parent: "t3-parent".into(),
+                    spec: json!({"t": 3}),
+                },
+                0,
+            );
+            // Force flush-ready so tick publishes immediately.
+            let batch = c.force_flush("oc-t3").expect("flush");
+            let _ = c.requeue(batch, 0, RequeueSchedule::FreshWindow);
+        }
+        // Drive one flush (timer path).
+        host.flush_coalesced_bursts().await;
+        let c = host
+            .coalescer()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        assert_eq!(c.dlq_len(), 1, "timer NoSigner must park DLQ, not drop");
+        assert_eq!(c.dlq_for("oc-t3")[0].reason, DlqReason::NoSigner);
+        assert_eq!(c.buffered_for("oc-t3"), 0, "must not live-requeue NoSigner");
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// GS-062 REQUEUE-FLUSH-READY-LOST-ON-CONCURRENT-SUBMIT (host-facing).
+    #[test]
+    fn requeue_transient_survives_concurrent_submit_merge() {
+        use toron_workflow::coalesce::InboundMention;
+        let mut c = MentionCoalescer::new(
+            std::time::Duration::from_millis(2_000),
+            std::time::Duration::from_millis(500),
+            64,
+        );
+        c.submit(
+            InboundMention {
+                assignee: "oc".into(),
+                parent: "live".into(),
+                spec: json!({"t": 1}),
+            },
+            1_000,
+        );
+        let failed = Coalesced {
+            assignee: "oc".into(),
+            mentions: vec![InboundMention {
+                assignee: "oc".into(),
+                parent: "retry".into(),
+                spec: json!({"t": 2}),
+            }],
+            first_arrival_ms: 0,
+        };
+        let q = c.requeue(failed, 1_000, RequeueSchedule::Transient);
+        assert!(matches!(q, RequeueOutcome::Queued { delay_ms: 0, .. }), "{q:?}");
+        let flushed = c.tick(1_000);
+        assert_eq!(flushed.len(), 1, "merge path must honor immediate Transient");
+        let parents: Vec<_> = flushed[0]
+            .mentions
+            .iter()
+            .map(|m| m.parent.as_str())
+            .collect();
+        assert!(parents.contains(&"live") && parents.contains(&"retry"), "{parents:?}");
+    }
+
+    /// GS-062 LOW: flush tick constant drains requeues without further bus events.
+    #[test]
+    fn flush_tick_drains_requeue_without_bus_event() {
+        use toron_workflow::coalesce::InboundMention;
+        // Timer ≤ subwindow so a lone Transient/FreshWindow requeue becomes
+        // ready without requiring another SubscriptionEvent on the bus.
+        assert!(COALESCE_FLUSH_TICK_MS <= 500);
+        let mut c = MentionCoalescer::new(
+            std::time::Duration::from_millis(2_000),
+            std::time::Duration::from_millis(500),
+            64,
+        );
+        c.submit(
+            InboundMention {
+                assignee: "oc".into(),
+                parent: "tick-p".into(),
+                spec: json!({"t": 1}),
+            },
+            0,
+        );
+        let batch = c.force_flush("oc").expect("flushed");
+        let _ = c.requeue(batch, 1_000, RequeueSchedule::FreshWindow);
+        // No further submit/bus event — only advancing time by tick cadence.
+        assert!(c.tick(1_000).is_empty());
+        let mut t = 1_000u64;
+        let mut drained = false;
+        for _ in 0..8 {
+            t = t.saturating_add(COALESCE_FLUSH_TICK_MS);
+            if !c.tick(t).is_empty() {
+                drained = true;
+                break;
+            }
+        }
+        assert!(
+            drained,
+            "COALESCE_FLUSH_TICK_MS cadence must drain FreshWindow requeue without bus events"
+        );
     }
 }

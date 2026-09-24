@@ -58,11 +58,7 @@ impl StageTrace {
             !self.entered[pos + 1..].iter().any(|s| {
                 matches!(
                     s.as_str(),
-                    "dedup_or_ephemeral"
-                        | "fanout"
-                        | "stamp_seen"
-                        | "watermark"
-                        | "prompt_route"
+                    "dedup_or_ephemeral" | "fanout" | "stamp_seen" | "watermark" | "prompt_route"
                 )
             })
         } else {

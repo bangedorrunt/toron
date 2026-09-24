@@ -570,6 +570,18 @@ impl BusEventStore {
         Ok(Row::get(&row, 0))
     }
 
+    /// Cheap SQLite connectivity probe (`SELECT 1`) for presence fail-closed
+    /// (GS-062 / Buzz #7532 pattern — never Redis). `Ok(())` = store reachable.
+    pub async fn ping(&self) -> anyhow::Result<()> {
+        let _: i64 = sqlx::query_scalar("SELECT 1").fetch_one(&self.pool).await?;
+        Ok(())
+    }
+
+    /// True when [`Self::ping`] succeeds.
+    pub async fn is_healthy(&self) -> bool {
+        self.ping().await.is_ok()
+    }
+
     /// Operator-grade local removal (bd-channel-close-purge-bsqb): delete the
     /// stored events with these hex ids, their tag rows, their hot-memo
     /// entries, and bump the authoritative mutation version so every
@@ -857,6 +869,14 @@ mod tests {
             Timestamp::now(),
         )
         .expect("build")
+    }
+
+    #[tokio::test]
+    async fn ping_succeeds_on_reachable_store() {
+        let (store, _pool, path) = temp_store().await;
+        store.ping().await.expect("SELECT 1 must succeed");
+        assert!(store.is_healthy().await);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[tokio::test]

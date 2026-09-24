@@ -334,3 +334,20 @@ Pointer: **ADR-0003 Revision 9** (leverage/backlog refresh — not a protocol re
 - **P1** convergence / `presence_admit` (#7298/#7532, SQLite) — library + hardcoded `presence_admit(true)` (do **not** claim fail-closed presence shipped); workflow delete honesty (#7735) / delivery-cursor (#7620) — pure modules without host call sites; wake quiet/deaf (#7546) — toron `WakeStats` only; flywheel classifier on `gs-061/wake-liveness`
 
 Do **not** invent-green LIVE features beyond what the code + tests now prove. Historical body of this note is unchanged.
+
+## GS-062 delta (2026-09-24)
+
+Captain cutover of GS-061 library wedges onto live call sites (branches
+`gs-062/live-cutover` + `gs-062/wake-health`). ADR-0003 **Rev10**.
+
+| Item | Status |
+|------|--------|
+| Busy-owner live `try_acquire_fenced` / `try_acquire_for_host` (SleepUntilDeadline park; Option shim e2e-only) | **Landed** |
+| Presence `presence_admit(store.is_healthy())` | **Landed** (SQLite ping; never Redis) |
+| ChannelStore leave/close Propose→Commit→FireLive + **hold** + settle_authority | **Landed** |
+| ChannelStore ReAdd fence (live leave→join) | **Landed** (attempted gen from held; cross-channel safe) |
+| WorkflowLifecycle on WorkflowHost + Arc shared definitions (Clone sees soft_delete) | **Landed** |
+| DeliveryCursor on mention→43001 | **Landed** |
+| Verify-before-route tripwires | **Landed** (unchanged; kept honest) |
+| flywheel wake_liveness on `/health` | **Sibling ship** `gs-062/wake-health` — not claimed on this toron tip |
+

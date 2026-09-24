@@ -65,6 +65,49 @@ impl Default for DispatchConfig {
     }
 }
 
+
+/// Host-facing result of [`DispatchPool::try_acquire_for_host`] (GS-062 C).
+/// Live dispatch must consume this (or raw [`DispatchPool::try_acquire_fenced`])
+/// — never the Option shim that drops Sleep/Fence effects.
+pub enum DispatchAcquire<'a> {
+    /// Permit granted; Drop releases busy holder + slot.
+    Granted(DispatchPermit<'a>),
+    /// Agent busy — host must journal/park until `until_ms`, then
+    /// [`DispatchPool::deadline_wake`] (settlement ≠ provider done).
+    Park {
+        agent: String,
+        until_ms: u64,
+        effects: Vec<BusyOwnerEffect>,
+    },
+    /// Fenced stale / hold expired / other non-park refusal — do not treat as
+    /// "slot free".
+    Refused(Vec<BusyOwnerEffect>),
+    /// Empty Err from fenced path: Acquired then semaphore race-loss (holder
+    /// rolled back). Retry later; no journalable busy-owner sleep.
+    CapContention,
+}
+
+impl std::fmt::Debug for DispatchAcquire<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Granted(_) => f.write_str("Granted(..)"),
+            Self::Park {
+                agent,
+                until_ms,
+                effects,
+            } => f
+                .debug_struct("Park")
+                .field("agent", agent)
+                .field("until_ms", until_ms)
+                .field("effects", effects)
+                .finish(),
+            Self::Refused(fx) => f.debug_tuple("Refused").field(fx).finish(),
+            Self::CapContention => f.write_str("CapContention"),
+        }
+    }
+}
+
+
 /// The in-process dispatch pool (A7).
 pub struct DispatchPool {
     config: DispatchConfig,
@@ -114,16 +157,33 @@ impl DispatchPool {
         pool
     }
 
-    /// Try to acquire a dispatch slot for `agent`. Returns a permit guard when
-    /// the agent has no in-flight job AND global concurrency is available.
-    /// Otherwise returns `None` (the job stays queued).
+    /// **E2e / Option shim only (GS-062 ask-user C):** maps fenced `Err`
+    /// (including `SleepUntilDeadline` / `HoldContinued` / `HoldExpired` /
+    /// `FencedStale`) → `None`. **Not** the live production path — hosts must
+    /// call [`Self::try_acquire_fenced`] or [`Self::try_acquire_for_host`] and
+    /// journal/park `SleepUntilDeadline` (settlement ≠ provider done).
+    /// sc10/sc12 one-in-flight tests may keep this thin wrapper.
     pub fn try_acquire(&self, agent: &str) -> Option<DispatchPermit<'_>> {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let claimed_generation = self.generation_of(agent);
+        match self.try_acquire_fenced(agent, now_ms, claimed_generation) {
+            Ok(permit) => Some(permit),
+            // Option API drops effects — live hosts must not use this path.
+            Err(_fx) => None,
+        }
+    }
+
+    /// Semaphore + one-in-flight slot acquire (no busy-owner holder).
+    /// Private: live path goes through [`Self::try_acquire_fenced`].
+    fn try_acquire_slots(&self, agent: &str) -> Option<DispatchPermit<'_>> {
         let mut in_flight = self.in_flight.lock();
         let count = in_flight.entry(agent.to_string()).or_insert(0);
         if *count >= 1 {
             return None; // one-in-flight-per-agent
         }
-        // Check global concurrency without blocking.
         self.semaphore.clone().try_acquire_owned().map_or_else(
             |_| None, // global cap reached
             |permit| {
@@ -131,7 +191,7 @@ impl DispatchPool {
                 Some(DispatchPermit {
                     pool: self,
                     agent: agent.to_string(),
-                    // Plain acquire does not touch BusyOwnerModel holders.
+                    // Holder generation filled by try_acquire_fenced on Acquired.
                     busy_generation: None,
                     _permit: permit,
                 })
@@ -167,6 +227,12 @@ impl DispatchPool {
         self.config.max_concurrency
     }
 
+    /// Busy-owner hold bound (ms). Host park sleeps must cover this window
+    /// (GS-062: do not truncate below hold_bound — was 5s vs DEFAULT 10s).
+    pub const fn hold_bound_ms(&self) -> u64 {
+        self.config.hold_bound_ms
+    }
+
     /// Current busy-owner generation for an agent (0 if never forked).
     pub fn generation_of(&self, agent: &str) -> u64 {
         self.busy.lock().generation_of(agent)
@@ -175,9 +241,12 @@ impl DispatchPool {
     /// Fork/rebind: advance generation so a stale worker cannot reclaim (Buzz #7340).
     pub fn fork_rebind(&self, agent: &str) -> Vec<BusyOwnerEffect> {
         let mut busy = self.busy.lock();
-        let (next, fx) = busy_tick(&busy, &BusyOwnerMsg::ForkRebind {
-            agent: agent.to_string(),
-        });
+        let (next, fx) = busy_tick(
+            &busy,
+            &BusyOwnerMsg::ForkRebind {
+                agent: agent.to_string(),
+            },
+        );
         *busy = next;
         fx
     }
@@ -213,7 +282,7 @@ impl DispatchPool {
             [BusyOwnerEffect::Acquired { generation, .. }] => {
                 let generation = *generation;
                 drop(busy);
-                match self.try_acquire(agent) {
+                match self.try_acquire_slots(agent) {
                     Some(mut permit) => {
                         // Keep holders + in_flight in lockstep on the fenced path.
                         permit.busy_generation = Some(generation);
@@ -239,6 +308,38 @@ impl DispatchPool {
         }
     }
 
+    /// GS-062 ask-user C live cutover: acquire for hosts that **must** observe
+    /// fenced effects. Never maps `SleepUntilDeadline` / `HoldContinued` /
+    /// `HoldExpired` / `FencedStale` → absence. Host journals/parks Sleep
+    /// (Resonate-style); settlement ≠ provider completion.
+    pub fn try_acquire_for_host(
+        &self,
+        agent: &str,
+        now_ms: u64,
+        claimed_generation: u64,
+    ) -> DispatchAcquire<'_> {
+        match self.try_acquire_fenced(agent, now_ms, claimed_generation) {
+            Ok(permit) => DispatchAcquire::Granted(permit),
+            Err(effects) if effects.is_empty() => DispatchAcquire::CapContention,
+            Err(effects) => {
+                let until_ms = effects.iter().find_map(|e| match e {
+                    BusyOwnerEffect::SleepUntilDeadline { until_ms, .. }
+                    | BusyOwnerEffect::HoldContinued { until_ms, .. } => Some(*until_ms),
+                    _ => None,
+                });
+                if let Some(until_ms) = until_ms {
+                    DispatchAcquire::Park {
+                        agent: agent.to_string(),
+                        until_ms,
+                        effects,
+                    }
+                } else {
+                    DispatchAcquire::Refused(effects)
+                }
+            }
+        }
+    }
+
     /// Deadline wake for a held busy-owner wait (host supplies clock).
     pub fn deadline_wake(&self, agent: &str, now_ms: u64) -> Vec<BusyOwnerEffect> {
         let mut busy = self.busy.lock();
@@ -257,7 +358,6 @@ impl DispatchPool {
     pub fn busy_holder(&self, agent: &str) -> bool {
         self.busy.lock().holders.contains_key(agent)
     }
-
 }
 
 impl std::fmt::Debug for DispatchPool {
@@ -270,12 +370,12 @@ impl std::fmt::Debug for DispatchPool {
 }
 
 /// A held dispatch permit: releasing it frees the agent's in-flight slot
-/// and, when acquired via [`DispatchPool::try_acquire_fenced`], the busy-owner holder.
+/// and the busy-owner holder (GS-062 live `try_acquire` also inserts a holder).
 pub struct DispatchPermit<'a> {
     pool: &'a DispatchPool,
     agent: String,
-    /// Generation claimed at fenced acquire. `None` for plain [`DispatchPool::try_acquire`]
-    /// (no `BusyOwnerModel` holder was inserted).
+    /// Generation claimed at acquire (live `try_acquire` and `try_acquire_fenced`).
+    /// `None` only if constructed via the private slots path without a fence wrap.
     busy_generation: Option<u64>,
     _permit: tokio::sync::OwnedSemaphorePermit,
 }
@@ -290,8 +390,7 @@ impl Drop for DispatchPermit<'_> {
             }
         }
         drop(in_flight);
-        // Generation-aware Release keeps holders in lockstep with in_flight/semaphore
-        // on the fenced path. Plain acquires leave busy_generation = None.
+        // Generation-aware Release keeps holders in lockstep with in_flight/semaphore.
         if let Some(generation) = self.busy_generation.take() {
             let mut busy = self.pool.busy.lock();
             let (next, _) = busy_tick(
@@ -351,7 +450,10 @@ mod tests {
 
     #[test]
     fn global_concurrency_bounds() {
-        let pool = DispatchPool::new(DispatchConfig { max_concurrency: 2, ..DispatchConfig::default() });
+        let pool = DispatchPool::new(DispatchConfig {
+            max_concurrency: 2,
+            ..DispatchConfig::default()
+        });
         let p1 = pool.try_acquire("a").expect("a");
         let p2 = pool.try_acquire("b").expect("b");
         // Global cap reached → third agent waits.
@@ -422,6 +524,25 @@ mod tests {
         assert_eq!(pool.queued_len(), 1);
     }
 
+    /// GS-062: live `try_acquire` is the fenced cutover — inserts a busy holder.
+    #[test]
+    fn live_try_acquire_inserts_busy_holder() {
+        let pool = DispatchPool::new(DispatchConfig {
+            max_concurrency: 2,
+            hold_bound_ms: 1_000,
+        });
+        assert!(!pool.busy_holder("a"));
+        let permit = pool.try_acquire("a").expect("live acquire");
+        assert!(
+            pool.busy_holder("a"),
+            "live try_acquire must insert BusyOwnerModel holder (not slots-only)"
+        );
+        assert_eq!(pool.in_flight_for("a"), 1);
+        drop(permit);
+        assert!(!pool.busy_holder("a"), "Drop still Releases holder");
+        assert_eq!(pool.in_flight_for("a"), 0);
+    }
+
     /// Drop of a fenced permit must emit generation-aware Release (holders + in_flight).
     #[test]
     fn fenced_permit_drop_releases_busy_holder() {
@@ -429,9 +550,7 @@ mod tests {
             max_concurrency: 2,
             hold_bound_ms: 1_000,
         });
-        let permit = pool
-            .try_acquire_fenced("a", 10, 0)
-            .expect("fenced acquire");
+        let permit = pool.try_acquire_fenced("a", 10, 0).expect("fenced acquire");
         assert!(pool.busy_holder("a"), "Acquired inserts holder");
         assert_eq!(pool.in_flight_for("a"), 1);
         drop(permit);
@@ -456,9 +575,13 @@ mod tests {
             max_concurrency: 1,
             hold_bound_ms: 1_000,
         });
-        // Occupy the only global slot via plain acquire (no busy holder).
+        // Occupy the only global slot (live try_acquire also inserts a busy holder for "other").
         let _cap = pool.try_acquire("other").expect("cap holder");
         assert_eq!(pool.in_flight_for("other"), 1);
+        assert!(
+            pool.busy_holder("other"),
+            "GS-062 live try_acquire inserts busy holder"
+        );
         assert!(!pool.busy_holder("a"));
 
         let err = match pool.try_acquire_fenced("a", 50, 0) {
@@ -479,5 +602,38 @@ mod tests {
         assert!(pool.busy_holder("a"));
         drop(ok);
         assert!(!pool.busy_holder("a"));
+    }
+
+    /// GS-062 C: live host acquire must surface SleepUntilDeadline (not None).
+    #[test]
+    fn try_acquire_for_host_parks_sleep_until_deadline() {
+        let pool = DispatchPool::new(DispatchConfig {
+            max_concurrency: 2,
+            hold_bound_ms: 1_000,
+        });
+        let _permit = pool
+            .try_acquire_fenced("a", 10, 0)
+            .expect("first fenced grant");
+        match pool.try_acquire_for_host("a", 20, 0) {
+            DispatchAcquire::Park {
+                until_ms, effects, ..
+            } => {
+                assert!(until_ms >= 20);
+                assert!(
+                    effects.iter().any(|e| matches!(
+                        e,
+                        BusyOwnerEffect::SleepUntilDeadline { .. }
+                            | BusyOwnerEffect::HoldContinued { .. }
+                    )),
+                    "expected Sleep/HoldContinued, got {effects:?}"
+                );
+            }
+            other => panic!("busy agent must Park with effects, got {other:?}"),
+        }
+        // Option shim still drops — prove why live must not use it.
+        assert!(
+            pool.try_acquire("a").is_none(),
+            "Option shim maps Sleep→None; hosts must use try_acquire_for_host"
+        );
     }
 }

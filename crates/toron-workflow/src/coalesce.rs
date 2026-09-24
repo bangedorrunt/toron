@@ -155,6 +155,44 @@ impl Coalesced {
             .map(|m| m.parent.as_str())
             .unwrap_or("")
     }
+
+    /// All mention parent ids in this batch (arrival order, de-duped).
+    /// Delivery-cursor peek/mark must cover every id — not only [`Self::parent`] —
+    /// so a later batch whose first parent is already delivered still delivers
+    /// undelivered siblings (GS-062 multi-parent cutover).
+    pub fn parent_ids(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut seen = std::collections::BTreeSet::new();
+        for m in &self.mentions {
+            if m.parent.is_empty() {
+                continue;
+            }
+            if seen.insert(m.parent.clone()) {
+                out.push(m.parent.clone());
+            }
+        }
+        out
+    }
+
+    /// GS-062 PARTIAL-KEEP-FULL-SPEC: rebuild a batch containing only mentions
+    /// whose parent is in `keep` (reserved undelivered ids). Used when the
+    /// delivery cursor skips already-delivered parents so the published
+    /// kind-43001 `merged_spec` does not re-include SkipAlreadyDelivered
+    /// parents.
+    pub fn retain_parents(&self, keep: &[String]) -> Self {
+        let keep_set: std::collections::BTreeSet<&str> =
+            keep.iter().map(String::as_str).collect();
+        Self {
+            assignee: self.assignee.clone(),
+            mentions: self
+                .mentions
+                .iter()
+                .filter(|m| keep_set.contains(m.parent.as_str()))
+                .cloned()
+                .collect(),
+            first_arrival_ms: self.first_arrival_ms,
+        }
+    }
 }
 
 /// What [`MentionCoalescer::submit`] reports back to the caller.
@@ -220,11 +258,90 @@ impl Buffer {
 /// Time is injected (`now_ms`) so the logic is deterministic in tests; the
 /// caller reads a monotonic clock (e.g. `tokio::time::Instant` since epoch, or
 /// a virtual clock in tests) and passes it in.
+/// Max Transient (Transport / acquire) requeues per assignee before the
+/// coalescer stops restoring the burst (GS-062 TRANSPORT-REQUEUE-HOT-SPIN).
+pub const REQUEUE_MAX_ATTEMPTS: u32 = 8;
+/// Base delay for Transient backoff (attempt 1+); attempt 0 stays immediate.
+pub const REQUEUE_BACKOFF_BASE_MS: u64 = 250;
+/// Cap for Transient exponential backoff.
+pub const REQUEUE_BACKOFF_CAP_MS: u64 = 8_000;
+
+/// How [`MentionCoalescer::requeue`] schedules the next flush.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequeueSchedule {
+    /// Fresh coalesce window at `now_ms` (InFlight — peer still publishing).
+    /// Does **not** burn the Transient retry budget. `flush_ready=false` OK.
+    FreshWindow,
+    /// Transport / acquire Err — exponential backoff + retry budget.
+    /// Honors readiness even when merging into a non-empty buffer
+    /// (REQUEUE-FLUSH-READY-LOST-ON-CONCURRENT-SUBMIT).
+    Transient,
+}
+
+/// Result of [`MentionCoalescer::requeue`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequeueOutcome {
+    /// Burst restored; next flush eligible after `delay_ms` from `now_ms`.
+    Queued { attempt: u32, delay_ms: u64 },
+    /// Retry budget exhausted — caller must ProvenFailed **without** force-retry
+    /// requeue. The burst is parked on the durable DLQ (not live-buffer restore,
+    /// which would hot-spin; not silent drop — GS-062 T2).
+    Exhausted,
+}
+
+/// Why a coalesced burst was parked on the durable DLQ (GS-062 T2/T3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DlqReason {
+    /// Transient Transport/acquire retry budget exhausted.
+    Exhausted,
+    /// No job signer configured (terminal; align timer with FlushNow ProvenFailed).
+    NoSigner,
+}
+
+/// One durable-failed coalesced burst (not silently dropped).
+#[derive(Debug, Clone, PartialEq)]
+pub struct DlqEntry {
+    pub reason: DlqReason,
+    pub coalesced: Coalesced,
+}
+
+/// Deterministic Transient backoff delay for `attempt` (0-indexed count
+/// **before** this requeue). Attempt 0 → immediate (0ms); then
+/// `base * 2^(n-1)` capped, plus small deterministic jitter.
+pub fn transient_backoff_delay_ms(assignee: &str, attempt: u32) -> u64 {
+    if attempt == 0 {
+        return 0;
+    }
+    let shift = (attempt - 1).min(5);
+    let base = REQUEUE_BACKOFF_BASE_MS.saturating_mul(1u64 << shift);
+    let capped = base.min(REQUEUE_BACKOFF_CAP_MS);
+    let jitter = transient_jitter_ms(assignee, attempt, capped);
+    capped.saturating_add(jitter).min(REQUEUE_BACKOFF_CAP_MS.saturating_mul(2))
+}
+
+fn transient_jitter_ms(assignee: &str, attempt: u32, delay: u64) -> u64 {
+    if delay == 0 {
+        return 0;
+    }
+    let mut h = 0u64;
+    for b in assignee.as_bytes() {
+        h = h.wrapping_mul(31).wrapping_add(u64::from(*b));
+    }
+    h = h
+        .wrapping_add(u64::from(attempt))
+        .wrapping_mul(0x9E37_79B9);
+    h % (delay / 4 + 1)
+}
+
 pub struct MentionCoalescer {
     window: Duration,
     subwindow: Duration,
     max_buffer: usize,
     buffers: std::collections::HashMap<String, Buffer>,
+    /// Per-assignee Transient requeue attempts (cleared on successful publish).
+    retry_attempts: std::collections::HashMap<String, u32>,
+    /// Durable fail park (Exhausted / NoSigner) — not silent drop (GS-062 T2/T3).
+    dlq: Vec<DlqEntry>,
 }
 
 impl MentionCoalescer {
@@ -235,6 +352,8 @@ impl MentionCoalescer {
             subwindow,
             max_buffer,
             buffers: std::collections::HashMap::new(),
+            retry_attempts: std::collections::HashMap::new(),
+            dlq: Vec::new(),
         }
     }
 
@@ -267,7 +386,12 @@ impl MentionCoalescer {
         if buf.mentions.is_empty() {
             buf.first_arrival_ms = now_ms;
         }
-        buf.last_arrival_ms = now_ms;
+        // GS-062 TRANSPORT backoff clobber: Transient requeue schedules readiness
+        // by pushing `last_arrival_ms` into the future (ready_at - subwindow). A
+        // concurrent submit must NOT collapse that schedule via `= now_ms`, or
+        // the sub-window fast path fires early under mentions-during-backoff.
+        // Preserve any scheduled-ahead readiness with max(now, existing).
+        buf.last_arrival_ms = now_ms.max(buf.last_arrival_ms);
         buf.push_dedup(mention);
 
         if buf.mentions.len() >= self.max_buffer {
@@ -349,6 +473,113 @@ impl MentionCoalescer {
             .collect()
     }
 
+    /// Clear Transient retry counter after a successful publish for `assignee`.
+    pub fn clear_retry(&mut self, assignee: &str) {
+        self.retry_attempts.remove(assignee);
+    }
+
+    /// Park a coalesced burst on the durable DLQ (timer NoSigner / host
+    /// terminal paths). Does not touch the live buffer or retry map.
+    pub fn park_dlq(&mut self, coalesced: Coalesced, reason: DlqReason) {
+        self.dlq.push(DlqEntry { reason, coalesced });
+    }
+
+    /// Number of DLQ entries (observable for tests / ops).
+    pub fn dlq_len(&self) -> usize {
+        self.dlq.len()
+    }
+
+    /// Drain the durable DLQ (oldest first).
+    pub fn take_dlq(&mut self) -> Vec<DlqEntry> {
+        std::mem::take(&mut self.dlq)
+    }
+
+    /// DLQ entries for one assignee (borrowed; tests / ops).
+    pub fn dlq_for(&self, assignee: &str) -> Vec<&DlqEntry> {
+        self.dlq
+            .iter()
+            .filter(|e| e.coalesced.assignee == assignee)
+            .collect()
+    }
+
+    /// Current Transient attempt count for `assignee` (0 if none).
+    pub fn retry_attempts(&self, assignee: &str) -> u32 {
+        self.retry_attempts.get(assignee).copied().unwrap_or(0)
+    }
+
+    /// Re-insert a previously flushed batch so it is not silently dropped
+    /// (GS-062: dispatch acquire deferred / in-flight delivery cursor /
+    /// Transport retry).
+    ///
+    /// - [`RequeueSchedule::FreshWindow`]: opens a fresh window at `now_ms`
+    ///   when the buffer was empty; leaves existing non-empty timing alone.
+    ///   Does not burn the Transient budget (InFlight path).
+    /// - [`RequeueSchedule::Transient`]: exponential backoff + retry budget.
+    ///   Schedules readiness even when merging into a non-empty buffer so a
+    ///   concurrent submit during publish await cannot erase immediate-retry
+    ///   intent (REQUEUE-FLUSH-READY-LOST-ON-CONCURRENT-SUBMIT).
+    pub fn requeue(
+        &mut self,
+        coalesced: Coalesced,
+        now_ms: u64,
+        schedule: RequeueSchedule,
+    ) -> RequeueOutcome {
+        let assignee = coalesced.assignee.clone();
+        let (delay_ms, attempt) = match schedule {
+            RequeueSchedule::FreshWindow => (None, 0u32),
+            RequeueSchedule::Transient => {
+                let attempt = self.retry_attempts(assignee.as_str());
+                if attempt >= REQUEUE_MAX_ATTEMPTS {
+                    // GS-062 Exhausted poison: leaving retry_attempts at MAX
+                    // makes every later Transient Exhaust immediately. Clear so
+                    // a fresh burst (or host clear_retry) can retry again.
+                    self.retry_attempts.remove(assignee.as_str());
+                    // T2: park whole coalesced batch on DLQ (not live restore /
+                    // hot-spin; not silent drop). Sibling Buffered mentions in
+                    // the live buffer are untouched.
+                    self.dlq.push(DlqEntry {
+                        reason: DlqReason::Exhausted,
+                        coalesced,
+                    });
+                    return RequeueOutcome::Exhausted;
+                }
+                let delay = transient_backoff_delay_ms(assignee.as_str(), attempt);
+                self.retry_attempts
+                    .insert(assignee.clone(), attempt.saturating_add(1));
+                (Some(delay), attempt.saturating_add(1))
+            }
+        };
+
+        let buf = self
+            .buffers
+            .entry(assignee)
+            .or_insert_with(|| Buffer::new(now_ms));
+        let win = self.window.as_millis() as u64;
+        let sub = self.subwindow.as_millis() as u64;
+        match delay_ms {
+            Some(delay) => {
+                // Transient: always apply schedule (empty or merge path).
+                let ready_at = now_ms.saturating_add(delay);
+                buf.first_arrival_ms = ready_at.saturating_sub(win);
+                buf.last_arrival_ms = ready_at.saturating_sub(sub);
+            }
+            None => {
+                // FreshWindow: only seed timing when buffer was empty.
+                if buf.mentions.is_empty() {
+                    buf.first_arrival_ms = now_ms;
+                    buf.last_arrival_ms = now_ms;
+                }
+            }
+        }
+        for m in coalesced.mentions {
+            let _ = buf.push_dedup(m);
+        }
+        RequeueOutcome::Queued {
+            attempt,
+            delay_ms: delay_ms.unwrap_or(0),
+        }
+    }
+
     /// Current buffer depth for an assignee (0 if none). Observable for tests.
     pub fn buffered_for(&self, assignee: &str) -> usize {
         self.buffers
@@ -400,6 +631,238 @@ mod tests {
             parent: parent.into(),
             spec: serde_json::json!({ "text": text }),
         }
+    }
+
+
+    /// GS-062: requeue restores a flushed burst (acquire-drop / in-flight retry).
+    #[test]
+    fn requeue_restores_burst_for_retry() {
+        let mut c = MentionCoalescer::new(
+            Duration::from_millis(2_000),
+            Duration::from_millis(500),
+            64,
+        );
+        c.submit(m("oc", "e1", "hi"), 0);
+        let batch = c.force_flush("oc").expect("flushed");
+        assert_eq!(c.buffered_for("oc"), 0);
+        let q = c.requeue(batch, 1_000, RequeueSchedule::Transient);
+        assert!(matches!(q, RequeueOutcome::Queued { delay_ms: 0, .. }), "{q:?}");
+        assert_eq!(c.buffered_for("oc"), 1);
+        let again = c.tick(1_000);
+        assert_eq!(again.len(), 1);
+        assert_eq!(again[0].parent(), "e1");
+    }
+
+    /// GS-062 REQUEUE-EVENT-STARVATION: InFlight-style requeue (flush_ready=false)
+    /// must still flush once the sub-window elapses — a timer tick (not only a
+    /// new bus event) can advance `now_ms` into flush readiness.
+    #[test]
+    fn requeue_inflight_style_flushes_after_subwindow() {
+        let mut c = MentionCoalescer::new(
+            Duration::from_millis(2_000),
+            Duration::from_millis(500),
+            64,
+        );
+        c.submit(
+            InboundMention {
+                assignee: "oc".into(),
+                parent: "p1".into(),
+                spec: serde_json::json!({"t": 1}),
+            },
+            0,
+        );
+        let batch = c.force_flush("oc").expect("flushed");
+        // InFlight path uses FreshWindow (no budget burn).
+        let q = c.requeue(batch, 1_000, RequeueSchedule::FreshWindow);
+        assert!(matches!(q, RequeueOutcome::Queued { .. }), "{q:?}");
+        assert_eq!(c.buffered_for("oc"), 1);
+        assert!(
+            c.tick(1_000).is_empty(),
+            "immediate tick must not flush (window just opened)"
+        );
+        let flushed = c.tick(1_000 + 500);
+        assert_eq!(
+            flushed.len(),
+            1,
+            "subwindow elapsed → flush without a new submit/event"
+        );
+        assert_eq!(flushed[0].parent(), "p1");
+    }
+
+    /// GS-062 TRANSPORT-REQUEUE-HOT-SPIN: Transient backoff grows; budget exhausts.
+    #[test]
+    fn transient_requeue_backoff_and_budget() {
+        let mut c = MentionCoalescer::new(
+            Duration::from_millis(2_000),
+            Duration::from_millis(500),
+            64,
+        );
+        // Attempt 0 → immediate.
+        c.submit(m("oc", "e1", "hi"), 0);
+        let batch = c.force_flush("oc").expect("flushed");
+        let q0 = c.requeue(batch, 1_000, RequeueSchedule::Transient);
+        assert_eq!(q0, RequeueOutcome::Queued { attempt: 1, delay_ms: 0 });
+        assert_eq!(c.tick(1_000).len(), 1);
+        let mut last_delay = 0u64;
+        for i in 1..REQUEUE_MAX_ATTEMPTS {
+            let now = 2_000 + u64::from(i) * 10;
+            c.submit(m("oc", "e1", "hi"), 0);
+            let batch = c.force_flush("oc").expect("flushed");
+            let q = c.requeue(batch, now, RequeueSchedule::Transient);
+            match q {
+                RequeueOutcome::Queued { delay_ms, attempt } => {
+                    assert_eq!(attempt, i + 1);
+                    // Base doubles until cap; jitter may wobble once capped.
+                    if last_delay < REQUEUE_BACKOFF_CAP_MS {
+                        assert!(
+                            delay_ms + 1 >= last_delay,
+                            "backoff must grow before cap: {delay_ms} << {last_delay}"
+                        );
+                    }
+                    last_delay = delay_ms;
+                    assert!(
+                        c.tick(now).is_empty(),
+                        "attempt {attempt} delay {delay_ms} must defer at now"
+                    );
+                    assert_eq!(c.tick(now + delay_ms).len(), 1, "flush after backoff");
+                }
+                RequeueOutcome::Exhausted => panic!("exhausted too early at i={i}"),
+            }
+        }
+        c.submit(m("oc", "e1", "hi"), 0);
+        let batch = c.force_flush("oc").expect("flushed");
+        assert_eq!(
+            c.requeue(batch, 9_000, RequeueSchedule::Transient),
+            RequeueOutcome::Exhausted
+        );
+        assert_eq!(c.buffered_for("oc"), 0, "Exhausted must not live-buffer restore");
+        assert_eq!(c.dlq_len(), 1, "Exhausted must park whole batch on DLQ");
+        assert_eq!(
+            c.dlq_for("oc")[0].reason,
+            DlqReason::Exhausted,
+            "DLQ reason Exhausted"
+        );
+        assert_eq!(
+            c.retry_attempts("oc"),
+            0,
+            "Exhausted must clear retry map (no poison for later Transient)"
+        );
+        // Fresh burst after Exhausted must be able to Transient again.
+        c.submit(m("oc", "e2", "again"), 10_000);
+        let batch = c.force_flush("oc").expect("flushed");
+        assert!(
+            matches!(
+                c.requeue(batch, 10_000, RequeueSchedule::Transient),
+                RequeueOutcome::Queued { attempt: 1, delay_ms: 0 }
+            ),
+            "post-Exhausted Transient must not poison-Exhaust"
+        );
+    }
+
+    /// GS-062 REQUEUE-FLUSH-READY-LOST-ON-CONCURRENT-SUBMIT: Transient schedule
+    /// survives merge into a non-empty buffer (concurrent submit during publish).
+    #[test]
+    fn requeue_transient_honors_schedule_on_nonempty_merge() {
+        let mut c = MentionCoalescer::new(
+            Duration::from_millis(2_000),
+            Duration::from_millis(500),
+            64,
+        );
+        // Simulate concurrent submit while publish was awaiting.
+        c.submit(m("oc", "concurrent", "new"), 1_000);
+        assert_eq!(c.buffered_for("oc"), 1);
+        // Previously published-then-failed burst returns with Transient/immediate.
+        let failed = Coalesced {
+            assignee: "oc".into(),
+            mentions: vec![m("oc", "failed", "retry")],
+            first_arrival_ms: 0,
+        };
+        let q = c.requeue(failed, 1_000, RequeueSchedule::Transient);
+        assert!(matches!(q, RequeueOutcome::Queued { delay_ms: 0, .. }), "{q:?}");
+        assert_eq!(c.buffered_for("oc"), 2, "merge both mentions");
+        // Must be flush-ready immediately despite non-empty buffer at requeue time.
+        let flushed = c.tick(1_000);
+        assert_eq!(flushed.len(), 1);
+        let parents: Vec<_> = flushed[0].mentions.iter().map(|x| x.parent.as_str()).collect();
+        assert!(parents.contains(&"concurrent"), "{parents:?}");
+        assert!(parents.contains(&"failed"), "{parents:?}");
+    }
+
+    /// GS-062 TRANSPORT backoff clobber: submit during Transient backoff must
+    /// NOT collapse `last_arrival_ms` and fire the sub-window early.
+    #[test]
+    fn submit_during_transient_backoff_does_not_fire_early() {
+        // Subwindow 100ms so attempt-1 Transient backoff (~250ms+) exceeds it
+        // and a clobbering submit would otherwise fire early via subwindow.
+        let mut c = MentionCoalescer::new(
+            Duration::from_millis(2_000),
+            Duration::from_millis(100),
+            64,
+        );
+        // Burn attempt 0 (immediate) so next Transient has real backoff.
+        c.submit(m("oc", "e1", "hi"), 0);
+        let batch = c.force_flush("oc").expect("flushed");
+        assert!(matches!(
+            c.requeue(batch, 1_000, RequeueSchedule::Transient),
+            RequeueOutcome::Queued { delay_ms: 0, .. }
+        ));
+        let batch = c.tick(1_000).pop().expect("immediate flush");
+        let q = c.requeue(batch, 2_000, RequeueSchedule::Transient);
+        let delay_ms = match q {
+            RequeueOutcome::Queued { delay_ms, attempt } => {
+                assert_eq!(attempt, 2);
+                assert!(
+                    delay_ms > 100,
+                    "need backoff > subwindow to expose clobber, got {delay_ms}"
+                );
+                delay_ms
+            }
+            other => panic!("expected Queued backoff, got {other:?}"),
+        };
+        // Concurrent mention during backoff — must preserve scheduled readiness.
+        c.submit(m("oc", "live", "during-backoff"), 2_100);
+        assert_eq!(c.buffered_for("oc"), 2, "merge concurrent into backoff buffer");
+        assert!(
+            c.tick(2_100 + 100).is_empty(),
+            "subwindow after concurrent submit must NOT flush before backoff ready_at"
+        );
+        assert!(
+            c.tick(2_000 + delay_ms - 1).is_empty(),
+            "must still wait for full Transient backoff"
+        );
+        let flushed = c.tick(2_000 + delay_ms);
+        assert_eq!(flushed.len(), 1, "flush only at scheduled ready_at");
+        let parents: Vec<_> = flushed[0].mentions.iter().map(|x| x.parent.as_str()).collect();
+        assert!(parents.contains(&"e1"), "{parents:?}");
+        assert!(parents.contains(&"live"), "{parents:?}");
+    }
+
+    /// GS-062 PARTIAL-KEEP-FULL-SPEC: retain_parents drops SkipAlreadyDelivered parents.
+    #[test]
+    fn retain_parents_filters_merged_spec() {
+        let batch = Coalesced {
+            assignee: "oc".into(),
+            mentions: vec![
+                InboundMention {
+                    assignee: "oc".into(),
+                    parent: "already".into(),
+                    spec: serde_json::json!({"n": 1}),
+                },
+                InboundMention {
+                    assignee: "oc".into(),
+                    parent: "keep-me".into(),
+                    spec: serde_json::json!({"n": 2}),
+                },
+            ],
+            first_arrival_ms: 0,
+        };
+        let kept = batch.retain_parents(&["keep-me".into()]);
+        assert_eq!(kept.parent_ids(), vec!["keep-me".to_string()]);
+        let spec = kept.merged_spec();
+        assert_eq!(spec["count"], 1);
+        let mentions = spec["mentions"].as_array().expect("mentions");
+        assert_eq!(mentions.len(), 1);
+        assert_eq!(mentions[0]["parent"], "keep-me");
     }
 
     /// ADR-0004 verification: 20 mentions to one assignee within the window →
