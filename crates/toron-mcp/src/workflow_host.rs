@@ -107,6 +107,8 @@ async fn mention_outcome(
     decision: CoalesceDecision,
     key: String,
     delivery: Option<&toron_workflow::DeliveryCursorStore>,
+    pool: Option<&DispatchPool>,
+    coalescer: Option<&std::sync::Mutex<MentionCoalescer>>,
 ) -> ProviderOutcome {
     match decision {
         CoalesceDecision::Buffered { .. } => ProviderOutcome::Delivered(serde_json::json!({
@@ -116,9 +118,29 @@ async fn mention_outcome(
         })),
         // GS-062: FlushNow shares peek→publish→mark with the trigger-loop
         // timer flush via publish_coalesced_job_with_cursor (never delivery=None
-        // when the host owns a DeliveryCursorStore).
+        // when the host owns a DeliveryCursorStore). Captain C: also acquire
+        // on this arm (timer flush already did) — completeness for kind-43001.
         CoalesceDecision::FlushNow(coalesced) => {
-            match publish_coalesced_job_with_cursor(bus, signer, &coalesced, delivery).await {
+            let permit = if let Some(pool) = pool {
+                match host_acquire_for_assignee(pool, &coalesced.assignee, now_ms()).await {
+                    Ok(p) => Some(p),
+                    Err(e) => {
+                        // Do not drop the already-flushed burst — requeue.
+                        if let Some(c) = coalescer {
+                            let mut g = c.lock().unwrap_or_else(PoisonError::into_inner);
+                            g.requeue(coalesced, now_ms(), true);
+                        }
+                        return ProviderOutcome::Ambiguous(format!(
+                            "dispatch acquire deferred: {e}"
+                        ));
+                    }
+                }
+            } else {
+                None
+            };
+            let out = match publish_coalesced_job_with_cursor(bus, signer, &coalesced, delivery)
+                .await
+            {
                 Ok(id) => ProviderOutcome::Delivered(serde_json::json!({
                     "ok": true,
                     "coalesced": false,
@@ -130,7 +152,7 @@ async fn mention_outcome(
                     ProviderOutcome::ProvenFailed("no job signer configured".to_string())
                 }
                 Err(CoalescePublishError::AlreadyDelivered) => {
-                    // Idempotent cursor skip → Delivered/Settled (never Ambiguous→Unknown).
+                    // Cursor proves delivered → Delivered/Settled.
                     ProviderOutcome::Delivered(serde_json::json!({
                         "ok": true,
                         "coalesced": false,
@@ -140,8 +162,20 @@ async fn mention_outcome(
                         "effect_key": key,
                     }))
                 }
+                Err(CoalescePublishError::InFlight) => {
+                    // Concurrent reserve — NOT Settled. Requeue + Ambiguous/retry.
+                    if let Some(c) = coalescer {
+                        let mut g = c.lock().unwrap_or_else(PoisonError::into_inner);
+                        g.requeue(coalesced, now_ms(), false);
+                    }
+                    ProviderOutcome::Ambiguous(
+                        "delivery in-flight for session (concurrent reserve)".into(),
+                    )
+                }
                 Err(CoalescePublishError::Transport(e)) => ProviderOutcome::Ambiguous(e),
-            }
+            };
+            drop(permit);
+            out
         }
     }
 }
@@ -310,13 +344,15 @@ pub fn mailbox_async_effect_runner(
     armor: Arc<SendArmor>,
 ) -> AsyncEffectRunner {
     mailbox_async_effect_runner_with_delivery(
-        mailbox, coalescer, job_signer, dispatcher, armor, None,
+        mailbox, coalescer, job_signer, dispatcher, armor, None, None,
     )
 }
 
 /// Like [`mailbox_async_effect_runner`] with a shared session
 /// [`toron_workflow::DeliveryCursorStore`] so DispatchJob / cap FlushNow
 /// shares peek→publish→mark with the trigger-loop timer flush (GS-062).
+/// Optional [`DispatchPool`] wires captain-C acquire on the FlushNow arm
+/// (same as timer flush) — production hosts pass `Some`.
 pub fn mailbox_async_effect_runner_with_delivery(
     mailbox: Arc<Mailbox>,
     coalescer: Arc<std::sync::Mutex<MentionCoalescer>>,
@@ -324,6 +360,7 @@ pub fn mailbox_async_effect_runner_with_delivery(
     dispatcher: Arc<std::sync::Mutex<Option<EffectDispatcher>>>,
     armor: Arc<SendArmor>,
     delivery: Option<Arc<toron_workflow::DeliveryCursorStore>>,
+    dispatch_pool: Option<Arc<DispatchPool>>,
 ) -> AsyncEffectRunner {
     Arc::new(move |inv: &ActionInvocation| {
         let mailbox = mailbox.clone();
@@ -332,6 +369,7 @@ pub fn mailbox_async_effect_runner_with_delivery(
         let dispatcher = dispatcher.clone();
         let armor = armor.clone();
         let delivery = delivery.clone();
+        let dispatch_pool = dispatch_pool.clone();
         let inv = inv.clone();
         Box::pin(async move {
             // The `invoke` contract over an async provider: partition
@@ -353,6 +391,7 @@ pub fn mailbox_async_effect_runner_with_delivery(
                         dispatcher,
                         armor,
                         delivery,
+                        dispatch_pool,
                         inv.clone(),
                     )
                     .await,
@@ -378,6 +417,7 @@ async fn dispatch_host_sink(
     dispatcher: Arc<std::sync::Mutex<Option<EffectDispatcher>>>,
     armor: Arc<SendArmor>,
     delivery: Option<Arc<toron_workflow::DeliveryCursorStore>>,
+    dispatch_pool: Option<Arc<DispatchPool>>,
     inv: ActionInvocation,
 ) -> anyhow::Result<serde_json::Value> {
     match inv.action.clone() {
@@ -464,6 +504,8 @@ async fn dispatch_host_sink(
                     decision,
                     key,
                     delivery.as_deref(),
+                    dispatch_pool.as_deref(),
+                    Some(coalescer.as_ref()),
                 )
                 .await
                 {
@@ -489,6 +531,8 @@ async fn dispatch_host_sink(
                     let job_signer = job_signer.clone();
                     let key = key.clone();
                     let delivery = delivery.clone();
+                    let pool = dispatch_pool.clone();
+                    let coalescer = coalescer.clone();
                     async move {
                         mention_outcome(
                             bus.as_ref(),
@@ -496,6 +540,8 @@ async fn dispatch_host_sink(
                             decision,
                             key,
                             delivery.as_deref(),
+                            pool.as_deref(),
+                            Some(coalescer.as_ref()),
                         )
                         .await
                     }
@@ -647,9 +693,12 @@ pub enum CoalescePublishError {
     NoSigner,
     /// The bus failed mid-publish: the job may or may not exist.
     Transport(String),
-    /// GS-062: DeliveryCursorStore determined skip (keep empty) — idempotent
-    /// already-delivered, NOT a bus failure. Maps to Delivered/Settled.
+    /// GS-062: DeliveryCursorStore cursor proves already delivered (all
+    /// SkipAlreadyDelivered). Maps to Delivered/Settled.
     AlreadyDelivered,
+    /// GS-062: keep empty solely via SkipInFlight (concurrent reserve).
+    /// Must NOT Settled/Delivered — peer still publishing; Ambiguous/retry.
+    InFlight,
 }
 
 /// Build + publish ONE kind-43001 for a coalesced mention burst (bd-ckkf):
@@ -666,36 +715,61 @@ pub async fn host_acquire_for_assignee<'a>(
     assignee: &str,
     now_ms: u64,
 ) -> Result<DispatchPermit<'a>, String> {
-    let claimed_generation = pool.generation_of(assignee);
-    match pool.try_acquire_for_host(assignee, now_ms, claimed_generation) {
-        DispatchAcquire::Granted(permit) => Ok(permit),
-        DispatchAcquire::Park {
-            until_ms, effects, ..
-        } => {
-            // Journal/park SleepUntilDeadline (settlement ≠ provider done).
-            tracing::debug!(
-                assignee,
-                until_ms,
-                ?effects,
-                "host DispatchAcquire::Park — sleep then deadline_wake"
-            );
-            let wait_ms = until_ms.saturating_sub(now_ms).max(1);
-            tokio::time::sleep(std::time::Duration::from_millis(wait_ms.min(5_000))).await;
-            let wake_now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(until_ms);
-            let _ = pool.deadline_wake(assignee, wake_now);
-            let claimed_generation = pool.generation_of(assignee);
-            match pool.try_acquire_for_host(assignee, wake_now, claimed_generation) {
-                DispatchAcquire::Granted(permit) => Ok(permit),
-                other => Err(format!(
-                    "dispatch still unavailable after deadline_wake: {other:?}"
-                )),
+    // Retry across the full hold_bound window (DEFAULT_HOLD_BOUND_MS=10_000).
+    // Truncating sleep to 5s amplified HoldContinued/HoldExpired drops.
+    let hold_bound = pool.hold_bound_ms().max(1);
+    let deadline = now_ms.saturating_add(hold_bound);
+    let mut attempt_now = now_ms;
+    let mut claimed_generation = pool.generation_of(assignee);
+    loop {
+        match pool.try_acquire_for_host(assignee, attempt_now, claimed_generation) {
+            DispatchAcquire::Granted(permit) => return Ok(permit),
+            DispatchAcquire::Park {
+                until_ms, effects, ..
+            } => {
+                // Journal/park SleepUntilDeadline (settlement ≠ provider done).
+                tracing::debug!(
+                    assignee,
+                    until_ms,
+                    hold_bound,
+                    ?effects,
+                    "host DispatchAcquire::Park — sleep full park window then deadline_wake"
+                );
+                let wait_ms = until_ms.saturating_sub(attempt_now).max(1);
+                // Align with hold_bound — never truncate (was .min(5_000)).
+                tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
+                attempt_now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(until_ms);
+                let _ = pool.deadline_wake(assignee, attempt_now);
+                claimed_generation = pool.generation_of(assignee);
+                if attempt_now >= deadline {
+                    match pool.try_acquire_for_host(assignee, attempt_now, claimed_generation) {
+                        DispatchAcquire::Granted(permit) => return Ok(permit),
+                        other => {
+                            return Err(format!(
+                                "dispatch still unavailable after hold_bound park: {other:?}"
+                            ));
+                        }
+                    }
+                }
+            }
+            DispatchAcquire::Refused(fx) => {
+                return Err(format!("dispatch refused: {fx:?}"));
+            }
+            DispatchAcquire::CapContention => {
+                if attempt_now >= deadline {
+                    return Err("dispatch cap contention".into());
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                attempt_now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(attempt_now.saturating_add(50));
+                claimed_generation = pool.generation_of(assignee);
             }
         }
-        DispatchAcquire::Refused(fx) => Err(format!("dispatch refused: {fx:?}")),
-        DispatchAcquire::CapContention => Err("dispatch cap contention".into()),
     }
 }
 
@@ -731,9 +805,20 @@ pub async fn publish_coalesced_job_with_cursor(
             let proof_id = parent_ids.first().map(String::as_str).unwrap_or("");
             let _ = toron_workflow::agent_key_is_not_delivery_proof("unused", proof_id);
             // Reserve all parents under the lock — do not advance delivered yet.
-            let (keep, _) = store.reserve_undelivered(session, parent_ids.clone());
+            let (keep, effects) = store.reserve_undelivered(session, parent_ids.clone());
             if keep.is_empty() {
-                // Idempotent skip: never Transport/Ambiguous/Unknown.
+                // Distinguish true already-delivered from concurrent in-flight
+                // empty-keep (SkipInFlight). In-flight must NOT Settled.
+                let any_inflight = effects.iter().any(|e| {
+                    matches!(
+                        e,
+                        toron_workflow::DeliveryEffect::SkipInFlight { .. }
+                    )
+                });
+                if any_inflight {
+                    return Err(CoalescePublishError::InFlight);
+                }
+                // All SkipAlreadyDelivered (cursor proves delivered).
                 return Err(CoalescePublishError::AlreadyDelivered);
             }
             reserved = keep;
@@ -874,6 +959,7 @@ impl WorkflowHost {
         // breaker, explicit fallback) guards every mailbox send below.
         // bd-ctj7: no sync runner exists anymore — the engine computes pure
         // leaves itself and awaits the async seam for the rest.
+        let dispatch_pool = Arc::new(DispatchPool::new(DispatchConfig::default()));
         let async_effect_runner = mailbox_async_effect_runner_with_delivery(
             mailbox.clone(),
             coalescer.clone(),
@@ -885,6 +971,7 @@ impl WorkflowHost {
                 ARMOR_MAX_CONCURRENCY,
             )),
             Some(delivery.clone()),
+            Some(dispatch_pool.clone()),
         );
         // bd-engine-run-path-journaling-fwlx (the Spec 6 flip): the host
         // really dispatches, so its engine is Enforced — an effectful leaf
@@ -926,7 +1013,7 @@ impl WorkflowHost {
             job_signer,
             pending: Arc::new(tokio::sync::Mutex::new(pending)),
             dispatcher,
-            dispatch_pool: Arc::new(DispatchPool::new(DispatchConfig::default())),
+            dispatch_pool,
         })
     }
 
@@ -1613,23 +1700,26 @@ impl WorkflowHost {
                 }
                 for coalesced in flushed {
                     // GS-062 captain C: live host DispatchAcquire before publish.
-                    let now_ms = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_millis() as u64)
-                        .unwrap_or(0);
+                    let tick_now = now_ms();
                     let permit = match host_acquire_for_assignee(
                         self.dispatch_pool.as_ref(),
                         &coalesced.assignee,
-                        now_ms,
+                        tick_now,
                     )
                     .await
                     {
                         Ok(p) => p,
                         Err(e) => {
+                            // Do NOT drop already-flushed burst — requeue.
                             warn!(
                                 assignee = %coalesced.assignee,
-                                "coalesced burst deferred (dispatch acquire): {e}"
+                                "coalesced burst deferred (dispatch acquire): {e} — requeue"
                             );
+                            let mut c = self
+                                .coalescer
+                                .lock()
+                                .unwrap_or_else(PoisonError::into_inner);
+                            c.requeue(coalesced, now_ms(), true);
                             continue;
                         }
                     };
@@ -1650,6 +1740,18 @@ impl WorkflowHost {
                             assignee = %coalesced.assignee,
                             "kind-43001 skipped (already delivered to session)"
                         ),
+                        Err(CoalescePublishError::InFlight) => {
+                            // Concurrent reserve — requeue, do not Settled-drop.
+                            warn!(
+                                assignee = %coalesced.assignee,
+                                "kind-43001 in-flight (concurrent reserve) — requeue"
+                            );
+                            let mut c = self
+                                .coalescer
+                                .lock()
+                                .unwrap_or_else(PoisonError::into_inner);
+                            c.requeue(coalesced, now_ms(), false);
+                        }
                         Err(CoalescePublishError::NoSigner) => warn!(
                             assignee = %coalesced.assignee,
                             "coalesced burst NOT published (no job signer configured)"
@@ -5782,6 +5884,8 @@ steps:
             decision,
             "effect-fn-1".into(),
             Some(&delivery),
+            None,
+            None,
         )
         .await;
         match out {
@@ -5801,6 +5905,8 @@ steps:
             CoalesceDecision::FlushNow(batch),
             "effect-fn-2".into(),
             Some(&delivery),
+            None,
+            None,
         )
         .await;
         match &out2 {
@@ -5877,6 +5983,14 @@ steps:
             .count();
         assert_eq!(wins, 1, "exactly one publish wins, got r1={r1:?} r2={r2:?}");
         assert_eq!(skips, 1, "exactly one skips as already in-flight/delivered");
+        // Loser must be InFlight (concurrent reserve) or AlreadyDelivered
+        // (winner marked first) — never a silent Transport conflation.
+        let loser = if r1.is_err() { &r1 } else { &r2 };
+        match loser {
+            Err(CoalescePublishError::InFlight)
+            | Err(CoalescePublishError::AlreadyDelivered) => {}
+            other => panic!("loser must be InFlight or AlreadyDelivered, got {other:?}"),
+        }
         assert!(store.cursor(session).delivered.contains("race-parent"));
         assert!(store.cursor(session).in_flight.is_empty());
 
@@ -5884,7 +5998,221 @@ steps:
     }
 
 
-    /// GS-062 captain C: live host acquire parks SleepUntilDeadline and
+    /// GS-062 EMPTYKEEP-INFLIGHT: keep=[] via SkipInFlight must NOT Settled.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn inflight_empty_keep_is_ambiguous_not_settled() {
+        use toron_core::bus::in_process::{InProcessBus, InProcessBusConfig};
+        use toron_core::index::schema;
+        use toron_workflow::coalesce::InboundMention;
+        use toron_workflow::DeliveryCursorStore;
+
+        let db = std::env::temp_dir().join(format!("wf-inflight-{}.sqlite", uuid::Uuid::new_v4()));
+        let pool = schema::connect(db.to_str().unwrap())
+            .await
+            .expect("connect");
+        schema::migrate(&pool).await.expect("migrate");
+        let bus: Arc<dyn Bus> = Arc::new(
+            InProcessBus::open(pool, InProcessBusConfig::default())
+                .await
+                .expect("bus"),
+        );
+        let store = DeliveryCursorStore::new();
+        let signer = Keys::generate();
+        let session = "oc-inflight";
+        let parent = "inflight-parent";
+        // Simulate concurrent reserve holding in_flight.
+        let (keep, _) = store.reserve_undelivered(session, [parent]);
+        assert_eq!(keep, vec![parent.to_string()]);
+
+        let batch = Coalesced {
+            assignee: session.into(),
+            mentions: vec![InboundMention {
+                assignee: session.into(),
+                parent: parent.into(),
+                spec: json!({"t": "inflight"}),
+            }],
+            first_arrival_ms: 0,
+        };
+        let err = publish_coalesced_job_with_cursor(
+            bus.as_ref(),
+            Some(&signer),
+            &batch,
+            Some(&store),
+        )
+        .await
+        .expect_err("in-flight empty-keep must error");
+        assert!(
+            matches!(err, CoalescePublishError::InFlight),
+            "must be InFlight not AlreadyDelivered, got {err:?}"
+        );
+
+        // FlushNow / mention_outcome must Ambiguous (not Settled/Delivered).
+        let coalescer = std::sync::Mutex::new(MentionCoalescer::with_defaults());
+        let out = mention_outcome(
+            bus.as_ref(),
+            Some(&signer),
+            CoalesceDecision::FlushNow(batch.clone()),
+            "ek-inflight".into(),
+            Some(&store),
+            None,
+            Some(&coalescer),
+        )
+        .await;
+        match &out {
+            ProviderOutcome::Ambiguous(m) => {
+                assert!(
+                    m.contains("in-flight") || m.contains("concurrent"),
+                    "Ambiguous reason: {m}"
+                );
+            }
+            other => panic!(
+                "in-flight FlushNow must Ambiguous (not Settled/Delivered), got {other:?}"
+            ),
+        }
+        // Requeued for retry (flush_ready=false → buffered).
+        assert!(
+            coalescer
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .buffered_for(session)
+                >= 1,
+            "in-flight must requeue burst"
+        );
+
+        // After mark proves delivered → AlreadyDelivered → Settled OK.
+        store.mark_delivered(session, [parent]);
+        let err2 = publish_coalesced_job_with_cursor(
+            bus.as_ref(),
+            Some(&signer),
+            &batch,
+            Some(&store),
+        )
+        .await
+        .expect_err("now truly delivered");
+        assert!(
+            matches!(err2, CoalescePublishError::AlreadyDelivered),
+            "cursor-proven skip is AlreadyDelivered, got {err2:?}"
+        );
+
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// GS-062 ACQUIRE-DROP: acquire Err requeues into coalescer (no silent loss).
+    #[test]
+    fn acquire_err_requeues_flushed_burst() {
+        let mut c = MentionCoalescer::new(
+            std::time::Duration::from_millis(2_000),
+            std::time::Duration::from_millis(500),
+            64,
+        );
+        use toron_workflow::coalesce::InboundMention;
+        c.submit(
+            InboundMention {
+                assignee: "oc".into(),
+                parent: "p1".into(),
+                spec: json!({"t": 1}),
+            },
+            0,
+        );
+        let batch = c.force_flush("oc").expect("flushed");
+        assert_eq!(c.buffered_for("oc"), 0);
+        // Simulate trigger-loop acquire Err path.
+        c.requeue(batch, 1_000, true);
+        assert_eq!(c.buffered_for("oc"), 1);
+        let again = c.tick(1_000);
+        assert_eq!(again.len(), 1, "requeued burst must flush again");
+        assert_eq!(again[0].parent(), "p1");
+    }
+
+    /// GS-062 ACQUIRE-DROP: host_acquire sleep covers full hold_bound (not 5s cap).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn host_acquire_sleep_covers_full_hold_bound() {
+        use toron_workflow::dispatch::{DispatchAcquire, DispatchConfig, DispatchPool};
+        // hold_bound > 5_000 would have been truncated by the old .min(5_000).
+        let pool = DispatchPool::new(DispatchConfig {
+            max_concurrency: 2,
+            hold_bound_ms: 80,
+        });
+        assert_eq!(pool.hold_bound_ms(), 80);
+        let hold = pool
+            .try_acquire_fenced("oc", 10, 0)
+            .expect("first grant");
+        match pool.try_acquire_for_host("oc", 20, 0) {
+            DispatchAcquire::Park { until_ms, .. } => {
+                assert!(
+                    until_ms >= 20 + 80 - 1,
+                    "park until must reflect hold_bound, got {until_ms}"
+                );
+            }
+            other => panic!("expected Park, got {other:?}"),
+        }
+        drop(hold);
+        let _ = pool.deadline_wake("oc", 10_000);
+        let permit = host_acquire_for_assignee(&pool, "oc", 10_000)
+            .await
+            .expect("host acquire after wake");
+        drop(permit);
+    }
+
+    /// GS-062 PARTIAL-WIRE: FlushNow arm acquires via DispatchPool when provided.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn flushnow_wires_host_acquire() {
+        use toron_core::bus::in_process::{InProcessBus, InProcessBusConfig};
+        use toron_core::index::schema;
+        use toron_workflow::coalesce::InboundMention;
+        use toron_workflow::dispatch::{DispatchConfig, DispatchPool};
+        use toron_workflow::DeliveryCursorStore;
+
+        let db = std::env::temp_dir().join(format!("wf-fn-acq-{}.sqlite", uuid::Uuid::new_v4()));
+        let sql = schema::connect(db.to_str().unwrap())
+            .await
+            .expect("connect");
+        schema::migrate(&sql).await.expect("migrate");
+        let bus: Arc<dyn Bus> = Arc::new(
+            InProcessBus::open(sql, InProcessBusConfig::default())
+                .await
+                .expect("bus"),
+        );
+        let delivery = DeliveryCursorStore::new();
+        let pool = DispatchPool::new(DispatchConfig {
+            max_concurrency: 2,
+            hold_bound_ms: 50,
+        });
+        let signer = Keys::generate();
+        let session = "oc-fn-acq";
+        let batch = Coalesced {
+            assignee: session.into(),
+            mentions: vec![InboundMention {
+                assignee: session.into(),
+                parent: "fn-acq-parent".into(),
+                spec: json!({"i": 0}),
+            }],
+            first_arrival_ms: 0,
+        };
+        let out = mention_outcome(
+            bus.as_ref(),
+            Some(&signer),
+            CoalesceDecision::FlushNow(batch),
+            "ek-fn-acq".into(),
+            Some(&delivery),
+            Some(&pool),
+            None,
+        )
+        .await;
+        match out {
+            ProviderOutcome::Delivered(v) => {
+                assert_eq!(v["published"], serde_json::json!(true), "{v}");
+            }
+            other => panic!("FlushNow+acquire must Delivered, got {other:?}"),
+        }
+        assert!(
+            !pool.busy_holder(session),
+            "permit dropped after FlushNow publish"
+        );
+        let _ = std::fs::remove_file(&db);
+    }
+
+        /// GS-062 captain C: live host acquire parks SleepUntilDeadline and
     /// recovers via deadline_wake — Option try_acquire remains e2e-only.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn host_acquire_parks_then_deadline_wake() {

@@ -227,6 +227,12 @@ impl DispatchPool {
         self.config.max_concurrency
     }
 
+    /// Busy-owner hold bound (ms). Host park sleeps must cover this window
+    /// (GS-062: do not truncate below hold_bound — was 5s vs DEFAULT 10s).
+    pub const fn hold_bound_ms(&self) -> u64 {
+        self.config.hold_bound_ms
+    }
+
     /// Current busy-owner generation for an agent (0 if never forked).
     pub fn generation_of(&self, agent: &str) -> u64 {
         self.busy.lock().generation_of(agent)

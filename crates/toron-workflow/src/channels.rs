@@ -320,6 +320,12 @@ impl ChannelStore {
         self.inner.lock().authority.remove(channel_id);
     }
 
+    /// Whether Kick/Disable authority is currently held for `channel_id`
+    /// (rebuild honesty / GS-062 create+closed settle).
+    pub fn authority_is_held(&self, channel_id: &str) -> bool {
+        self.inner.lock().authority.contains_key(channel_id)
+    }
+
     /// Test helper: insert a held convergence state. Production leave/close
     /// already hold after FireLive; this remains for unit tests that skip leave.
     pub fn hold_authority_for_test(&self, channel_id: &str, state: Convergence) {
@@ -445,9 +451,15 @@ impl ChannelStore {
                 if closed {
                     // A close inside the create event retires immediately;
                     // a non-creator close tag is an inapplicable no-op.
+                    // GS-062: CLI publish_close is Kind::GroupMetadata 39000
+                    // closed=true — production rebuild path. Settle after
+                    // close() here (same as METADATA leave/close) so replay
+                    // does not permanent-FenceReAdd. Live close() still holds
+                    // for in-process CS.
                     if self.close(&id, &ev.pubkey).is_err() {
                         return Ok(false);
                     }
+                    self.settle_authority(&id);
                 }
                 Ok(true)
             }
@@ -1117,6 +1129,60 @@ mod tests {
             .expect("join after apply_lifecycle leave must work (settled)");
         assert!(store.is_member("c", &bob.public_key()));
     }
+
+    /// GS-062: CHANNEL_CREATE|LEGACY with closed=true must settle_authority
+    /// (CLI publish_close is 39000 closed=true rebuild path).
+    #[test]
+    fn apply_lifecycle_create_closed_settles_authority() {
+        let alice = keys();
+        let bob = keys();
+        let create_closed = build_event(
+            &alice,
+            toron_kind(CHANNEL_CREATE),
+            "channel-close",
+            vec![
+                Tag::parse(["d", "c"]).expect("d"),
+                Tag::parse(["h", "c"]).expect("h"),
+                Tag::parse(["name", "C"]).expect("name"),
+                Tag::parse(["closed", "true"]).expect("closed"),
+            ],
+            Timestamp::now(),
+        )
+        .expect("create+closed");
+        let store = ChannelStore::rebuild([create_closed]).expect("rebuild");
+        assert!(store.get("c").expect("ch").closed);
+        assert!(
+            !store.authority_is_held("c"),
+            "create+closed rebuild must settle_authority (CLI 39000 closed path)"
+        );
+        // Settled — join must fail as closed, NOT as FenceReAdd from held Disable.
+        let err = store
+            .join("c", &bob.public_key())
+            .expect_err("closed refuses join");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("closed"),
+            "expected closed refuse, got {msg}"
+        );
+        assert!(
+            !msg.contains("fenced"),
+            "create+closed rebuild must settle (not FenceReAdd), got {msg}"
+        );
+        // Live close() still holds for in-process CS (unchanged).
+        let live = ChannelStore::new();
+        live
+            .create_channel(&alice.public_key(), "live", "L", false, None)
+            .expect("create");
+        live.close("live", &alice.public_key()).expect("close");
+        assert!(
+            live.authority_is_held("live"),
+            "live close() must still HOLD for in-process CS"
+        );
+        live.settle_authority("live");
+        assert!(!live.authority_is_held("live"));
+        let _ = bob;
+    }
+
 
     #[test]
     fn join_honors_readd_fence_under_held_kick() {

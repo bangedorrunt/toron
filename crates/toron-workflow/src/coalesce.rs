@@ -367,6 +367,34 @@ impl MentionCoalescer {
             .collect()
     }
 
+    /// Re-insert a previously flushed batch so it is not silently dropped
+    /// (GS-062: dispatch acquire deferred / in-flight delivery cursor).
+    ///
+    /// When `flush_ready` is true the window is backdated so the next
+    /// [`Self::tick`] / sub-window check can retry immediately; when false a
+    /// fresh window opens at `now_ms` (avoids tight requeue spin on SkipInFlight).
+    pub fn requeue(&mut self, coalesced: Coalesced, now_ms: u64, flush_ready: bool) {
+        let assignee = coalesced.assignee.clone();
+        let buf = self
+            .buffers
+            .entry(assignee)
+            .or_insert_with(|| Buffer::new(now_ms));
+        if buf.mentions.is_empty() {
+            if flush_ready {
+                let win = self.window.as_millis() as u64;
+                let sub = self.subwindow.as_millis() as u64;
+                buf.first_arrival_ms = now_ms.saturating_sub(win);
+                buf.last_arrival_ms = now_ms.saturating_sub(sub);
+            } else {
+                buf.first_arrival_ms = now_ms;
+                buf.last_arrival_ms = now_ms;
+            }
+        }
+        for m in coalesced.mentions {
+            let _ = buf.push_dedup(m);
+        }
+    }
+
     /// Current buffer depth for an assignee (0 if none). Observable for tests.
     pub fn buffered_for(&self, assignee: &str) -> usize {
         self.buffers
@@ -418,6 +446,25 @@ mod tests {
             parent: parent.into(),
             spec: serde_json::json!({ "text": text }),
         }
+    }
+
+
+    /// GS-062: requeue restores a flushed burst (acquire-drop / in-flight retry).
+    #[test]
+    fn requeue_restores_burst_for_retry() {
+        let mut c = MentionCoalescer::new(
+            Duration::from_millis(2_000),
+            Duration::from_millis(500),
+            64,
+        );
+        c.submit(m("oc", "e1", "hi"), 0);
+        let batch = c.force_flush("oc").expect("flushed");
+        assert_eq!(c.buffered_for("oc"), 0);
+        c.requeue(batch, 1_000, true);
+        assert_eq!(c.buffered_for("oc"), 1);
+        let again = c.tick(1_000);
+        assert_eq!(again.len(), 1);
+        assert_eq!(again[0].parent(), "e1");
     }
 
     /// ADR-0004 verification: 20 mentions to one assignee within the window →
