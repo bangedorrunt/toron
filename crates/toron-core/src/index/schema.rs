@@ -39,14 +39,32 @@ pub async fn normalize_created_ts_scale(pool: &SqlitePool) -> anyhow::Result<u64
     Ok(res.rows_affected())
 }
 
+/// Writer wait budget for a contended index database (bd-0lyz). WAL has
+/// one write lock; parallel test binaries, their shelled subprocesses, and
+/// a live daemon all queue on it. The old 5s budget expired under
+/// workspace-parallel CPU saturation and leaked SQLITE_BUSY out of
+/// otherwise-idempotent construction (`demo mailbox: database is
+/// locked`). 30s waits out realistic starvation; a genuine pathology
+/// still fails loud (and `.migrate.lock` bails at 300s).
+///
+/// Crate-private on purpose: no caller outside this module configures the
+/// wait, and a public const would make the budget part of toron-core's API.
+const BUSY_BUDGET: Duration = Duration::from_secs(30);
+
 /// Open a SQLite pool with WAL + busy timeout (ADR: dedicated write conn,
 /// WAL pragmas; small read pool).
 pub async fn connect(db_path: &str) -> anyhow::Result<SqlitePool> {
+    connect_with_budget(db_path, BUSY_BUDGET).await
+}
+
+/// [`connect`] with an explicit writer-wait budget (test seam for
+/// [`BUSY_BUDGET`]: narrow budgets must still fail loud).
+async fn connect_with_budget(db_path: &str, busy: Duration) -> anyhow::Result<SqlitePool> {
     let opts = SqliteConnectOptions::new()
         .filename(db_path)
         .create_if_missing(true)
         .journal_mode(SqliteJournalMode::Wal)
-        .busy_timeout(Duration::from_secs(5))
+        .busy_timeout(busy)
         .statement_cache_capacity(32);
     let pool = SqlitePoolOptions::new()
         .max_connections(5)
@@ -81,7 +99,7 @@ pub async fn connect_single(db_path: &str) -> anyhow::Result<SqliteConnection> {
         .filename(db_path)
         .create_if_missing(true)
         .journal_mode(SqliteJournalMode::Wal)
-        .busy_timeout(Duration::from_secs(5));
+        .busy_timeout(BUSY_BUDGET);
     let mut conn = SqliteConnection::connect_with(&opts).await?;
     for pragma in [
         "PRAGMA journal_size_limit = 67108864",
@@ -167,6 +185,84 @@ mod tests {
         ));
         let pool = connect(path.to_str().unwrap()).await.expect("connect");
         (pool, path)
+    }
+
+    /// bd-0lyz: a queued writer must outlive a multi-second hold of the
+    /// WAL write lock. Under workspace-parallel load (36 cli_robot tests
+    /// + subprocesses on one PID-shared dir) construction hits held locks
+    /// longer than the old 5s busy budget and SQLITE_BUSY leaked out of
+    /// `demo_mailbox` as `database is locked`. The hold below is longer
+    /// than 5s on purpose: this test is red whenever the budget can no
+    /// longer wait out realistic contention.
+    #[tokio::test]
+    async fn queued_writer_outlives_a_multi_second_hold() {
+        let path = std::env::temp_dir().join(format!("toron-busy-{}.sqlite", uuid::Uuid::new_v4()));
+        let db = path.to_str().unwrap().to_string();
+        let boot = connect(&db).await.expect("create db");
+        sqlx::query("CREATE TABLE t (x INTEGER)")
+            .execute(&boot)
+            .await
+            .expect("create table");
+        drop(boot);
+
+        // Hold the WAL write lock from a dedicated connection.
+        let mut holder = connect_single(&db).await.expect("holder conn");
+        let mut tx = holder.begin().await.expect("begin");
+        sqlx::query("INSERT INTO t VALUES (1)")
+            .execute(&mut *tx)
+            .await
+            .expect("hold write");
+
+        // A writer queues for 6s while the lock is held, then must succeed
+        // the instant the holder commits.
+        let db2 = db.clone();
+        let attempt = tokio::spawn(async move {
+            let pool = connect(&db2).await.expect("attempt pool");
+            sqlx::query("INSERT INTO t VALUES (2)").execute(&pool).await
+        });
+        tokio::time::sleep(Duration::from_millis(6000)).await;
+        tx.commit().await.expect("release hold");
+        attempt
+            .await
+            .expect("join")
+            .expect("writer waited out the hold instead of surfacing SQLITE_BUSY");
+    }
+
+    /// bd-0lyz: the budget is still a real timeout — a narrow budget
+    /// expires into a loud SQLITE_BUSY, so widening the default never
+    /// masks a genuine lock pathology.
+    #[tokio::test]
+    async fn narrow_busy_budget_fails_loud() {
+        let path =
+            std::env::temp_dir().join(format!("toron-busy-narrow-{}.sqlite", uuid::Uuid::new_v4()));
+        let db = path.to_str().unwrap().to_string();
+        let boot = connect(&db).await.expect("create db");
+        sqlx::query("CREATE TABLE t (x INTEGER)")
+            .execute(&boot)
+            .await
+            .expect("create table");
+        drop(boot);
+
+        let mut holder = connect_single(&db).await.expect("holder conn");
+        let mut tx = holder.begin().await.expect("begin");
+        sqlx::query("INSERT INTO t VALUES (1)")
+            .execute(&mut *tx)
+            .await
+            .expect("hold write");
+
+        let pool = connect_with_budget(&db, Duration::from_millis(50))
+            .await
+            .expect("budget pool");
+        let err = sqlx::query("INSERT INTO t VALUES (3)")
+            .execute(&pool)
+            .await
+            .expect_err("a narrow budget must surface the busy, not hang");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("locked") || msg.contains("busy"),
+            "loud SQLITE_BUSY expected, got: {msg}"
+        );
+        tx.commit().await.expect("release hold");
     }
 
     async fn insert_msg(

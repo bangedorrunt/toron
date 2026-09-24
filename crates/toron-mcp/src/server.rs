@@ -5,6 +5,7 @@
 
 use std::sync::Arc;
 
+use anyhow::Context;
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, ErrorData, Implementation, InitializeResult,
     ListResourceTemplatesResult, ListResourcesResult, ListToolsResult, PaginatedRequestParams,
@@ -341,14 +342,21 @@ pub async fn build_mailbox_with_opts(
                 operator_key_path.display()
             )
         })?;
-    let pool = toron_core::index::schema::connect(db.to_str().unwrap()).await?;
-    toron_core::index::schema::migrate(&pool).await?;
+    let pool = toron_core::index::schema::connect(db.to_str().unwrap())
+        .await
+        .with_context(|| format!("connect {}", db.display()))?;
+    toron_core::index::schema::migrate(&pool)
+        .await
+        .context("migrate")?;
     // ADR-0017 (toron.dev ADR-0017 D3): fold pre-existing path-slug project
     // roots into the alias table on open — legacy rows stay visible
     // read-only through every spelling of the project key.
-    toron_core::mailbox::aliases::reconcile_aliases(&pool, &data_dir).await?;
-    let bus =
-        toron_core::bus::InProcessBus::open(pool.clone(), InProcessBusConfig::default()).await?;
+    toron_core::mailbox::aliases::reconcile_aliases(&pool, &data_dir)
+        .await
+        .context("reconcile_aliases")?;
+    let bus = toron_core::bus::InProcessBus::open(pool.clone(), InProcessBusConfig::default())
+        .await
+        .context("bus event store ddl/backfill")?;
     let mut mailbox =
         toron_core::mailbox::Mailbox::new(std::sync::Arc::new(bus), data_dir, operator)
             .with_index_pool(pool);
@@ -406,14 +414,21 @@ async fn build_mailbox(
         (paths.projects_dir(), paths.index_path(), operator)
     };
 
-    let pool = toron_core::index::schema::connect(db.to_str().unwrap()).await?;
-    toron_core::index::schema::migrate(&pool).await?;
+    let pool = toron_core::index::schema::connect(db.to_str().unwrap())
+        .await
+        .with_context(|| format!("connect {}", db.display()))?;
+    toron_core::index::schema::migrate(&pool)
+        .await
+        .context("migrate")?;
     // ADR-0017 (toron.dev ADR-0017 D3): fold pre-existing path-slug project
     // roots into the alias table on open — legacy rows stay visible
     // read-only through every spelling of the project key.
-    toron_core::mailbox::aliases::reconcile_aliases(&pool, &data_dir).await?;
-    let bus =
-        toron_core::bus::InProcessBus::open(pool.clone(), InProcessBusConfig::default()).await?;
+    toron_core::mailbox::aliases::reconcile_aliases(&pool, &data_dir)
+        .await
+        .context("reconcile_aliases")?;
+    let bus = toron_core::bus::InProcessBus::open(pool.clone(), InProcessBusConfig::default())
+        .await
+        .context("bus event store ddl/backfill")?;
     let mut mailbox = Mailbox::new(Arc::new(bus), data_dir, operator).with_index_pool(pool);
     if let Some(tx) = trigger_tx {
         mailbox = mailbox.with_trigger_tx(tx);

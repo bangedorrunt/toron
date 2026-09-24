@@ -406,7 +406,8 @@ pub fn format_sock_line(ev: &SockEvent) -> String {
 /// loud connect failure → the in-process fallback the tests exercise).
 /// Parked here, not next to the static: `wake_tail_mapping_is_shared_not_copied`
 /// splits prod at the first cfg(test) attribute, which must land after the
-/// formatter wiring and before the test module's `json!` fixtures.
+/// formatter wiring and before the test module's fixture shapes (no shape
+/// tokens of any kind above this line — the gate greps raw source).
 #[cfg(test)]
 pub(crate) fn pin_wake_sock_for_tests(path: PathBuf) {
     let _ = WAKE_SOCK_TEST_PIN.set(path);
