@@ -126,6 +126,8 @@ impl DispatchPool {
                 Some(DispatchPermit {
                     pool: self,
                     agent: agent.to_string(),
+                    // Plain acquire does not touch BusyOwnerModel holders.
+                    busy_generation: None,
                     _permit: permit,
                 })
             },
@@ -197,12 +199,30 @@ impl DispatchPool {
         );
         *busy = next;
         match fx.as_slice() {
-            [BusyOwnerEffect::Acquired { .. }] => {
+            [BusyOwnerEffect::Acquired { generation, .. }] => {
+                let generation = *generation;
                 drop(busy);
-                self.try_acquire(agent).ok_or_else(|| {
-                    // Global cap lost the race — surface as empty effects; caller requeues.
-                    vec![]
-                })
+                match self.try_acquire(agent) {
+                    Some(mut permit) => {
+                        // Keep holders + in_flight in lockstep on the fenced path.
+                        permit.busy_generation = Some(generation);
+                        Ok(permit)
+                    }
+                    None => {
+                        // Global/agent cap lost the race after Acquired — roll back holder
+                        // so the agent is not stuck busy forever (dual SoT: holders vs in_flight).
+                        let mut busy = self.busy.lock();
+                        let (next, _) = busy_tick(
+                            &busy,
+                            &BusyOwnerMsg::Release {
+                                agent: agent.to_string(),
+                                claimed_generation: generation,
+                            },
+                        );
+                        *busy = next;
+                        Err(vec![])
+                    }
+                }
             }
             _ => Err(fx),
         }
@@ -222,6 +242,11 @@ impl DispatchPool {
         fx
     }
 
+    /// True when `BusyOwnerModel` still holds a slot for `agent` (fenced path SoT).
+    pub fn busy_holder(&self, agent: &str) -> bool {
+        self.busy.lock().holders.contains_key(agent)
+    }
+
 }
 
 impl std::fmt::Debug for DispatchPool {
@@ -233,10 +258,14 @@ impl std::fmt::Debug for DispatchPool {
     }
 }
 
-/// A held dispatch permit: releasing it frees the agent's in-flight slot.
+/// A held dispatch permit: releasing it frees the agent's in-flight slot
+/// and, when acquired via [`DispatchPool::try_acquire_fenced`], the busy-owner holder.
 pub struct DispatchPermit<'a> {
     pool: &'a DispatchPool,
     agent: String,
+    /// Generation claimed at fenced acquire. `None` for plain [`DispatchPool::try_acquire`]
+    /// (no `BusyOwnerModel` holder was inserted).
+    busy_generation: Option<u64>,
     _permit: tokio::sync::OwnedSemaphorePermit,
 }
 
@@ -248,6 +277,20 @@ impl Drop for DispatchPermit<'_> {
             if *count == 0 {
                 in_flight.remove(&self.agent);
             }
+        }
+        drop(in_flight);
+        // Generation-aware Release keeps holders in lockstep with in_flight/semaphore
+        // on the fenced path. Plain acquires leave busy_generation = None.
+        if let Some(generation) = self.busy_generation.take() {
+            let mut busy = self.pool.busy.lock();
+            let (next, _) = busy_tick(
+                &busy,
+                &BusyOwnerMsg::Release {
+                    agent: self.agent.clone(),
+                    claimed_generation: generation,
+                },
+            );
+            *busy = next;
         }
     }
 }
@@ -366,5 +409,64 @@ mod tests {
         // Agent a is busy → the job stays queued, not dispatched.
         assert!(pool.next_ready().is_none());
         assert_eq!(pool.queued_len(), 1);
+    }
+
+    /// Drop of a fenced permit must emit generation-aware Release (holders + in_flight).
+    #[test]
+    fn fenced_permit_drop_releases_busy_holder() {
+        let pool = DispatchPool::new(DispatchConfig {
+            max_concurrency: 2,
+            hold_bound_ms: 1_000,
+        });
+        let permit = pool
+            .try_acquire_fenced("a", 10, 0)
+            .expect("fenced acquire");
+        assert!(pool.busy_holder("a"), "Acquired inserts holder");
+        assert_eq!(pool.in_flight_for("a"), 1);
+        drop(permit);
+        assert!(
+            !pool.busy_holder("a"),
+            "Drop must Release holder — otherwise agent stays busy forever"
+        );
+        assert_eq!(pool.in_flight_for("a"), 0);
+        // Re-acquire at same generation must succeed after Release.
+        let again = pool
+            .try_acquire_fenced("a", 20, 0)
+            .expect("re-acquire after Drop Release");
+        assert!(pool.busy_holder("a"));
+        drop(again);
+        assert!(!pool.busy_holder("a"));
+    }
+
+    /// When BusyOwnerModel Acquired then try_acquire fails (global cap), roll back holder.
+    #[test]
+    fn fenced_acquire_rolls_back_holder_when_semaphore_full() {
+        let pool = DispatchPool::new(DispatchConfig {
+            max_concurrency: 1,
+            hold_bound_ms: 1_000,
+        });
+        // Occupy the only global slot via plain acquire (no busy holder).
+        let _cap = pool.try_acquire("other").expect("cap holder");
+        assert_eq!(pool.in_flight_for("other"), 1);
+        assert!(!pool.busy_holder("a"));
+
+        let err = match pool.try_acquire_fenced("a", 50, 0) {
+            Err(e) => e,
+            Ok(_) => panic!("global cap must fail second acquire"),
+        };
+        assert!(err.is_empty(), "race loss surfaces as empty effects");
+        assert!(
+            !pool.busy_holder("a"),
+            "holder must roll back when try_acquire fails after Acquired"
+        );
+        assert_eq!(pool.in_flight_for("a"), 0);
+        // After cap frees, fenced acquire works.
+        drop(_cap);
+        let ok = pool
+            .try_acquire_fenced("a", 60, 0)
+            .expect("fenced after cap free");
+        assert!(pool.busy_holder("a"));
+        drop(ok);
+        assert!(!pool.busy_holder("a"));
     }
 }
