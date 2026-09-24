@@ -283,9 +283,26 @@ pub enum RequeueSchedule {
 pub enum RequeueOutcome {
     /// Burst restored; next flush eligible after `delay_ms` from `now_ms`.
     Queued { attempt: u32, delay_ms: u64 },
-    /// Retry budget exhausted — caller must not settle Failed **and** requeue;
-    /// stop (drop) or ProvenFailed / Ambiguous **without** requeue.
+    /// Retry budget exhausted — caller must ProvenFailed **without** force-retry
+    /// requeue. The burst is parked on the durable DLQ (not live-buffer restore,
+    /// which would hot-spin; not silent drop — GS-062 T2).
     Exhausted,
+}
+
+/// Why a coalesced burst was parked on the durable DLQ (GS-062 T2/T3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DlqReason {
+    /// Transient Transport/acquire retry budget exhausted.
+    Exhausted,
+    /// No job signer configured (terminal; align timer with FlushNow ProvenFailed).
+    NoSigner,
+}
+
+/// One durable-failed coalesced burst (not silently dropped).
+#[derive(Debug, Clone, PartialEq)]
+pub struct DlqEntry {
+    pub reason: DlqReason,
+    pub coalesced: Coalesced,
 }
 
 /// Deterministic Transient backoff delay for `attempt` (0-indexed count
@@ -323,6 +340,8 @@ pub struct MentionCoalescer {
     buffers: std::collections::HashMap<String, Buffer>,
     /// Per-assignee Transient requeue attempts (cleared on successful publish).
     retry_attempts: std::collections::HashMap<String, u32>,
+    /// Durable fail park (Exhausted / NoSigner) — not silent drop (GS-062 T2/T3).
+    dlq: Vec<DlqEntry>,
 }
 
 impl MentionCoalescer {
@@ -334,6 +353,7 @@ impl MentionCoalescer {
             max_buffer,
             buffers: std::collections::HashMap::new(),
             retry_attempts: std::collections::HashMap::new(),
+            dlq: Vec::new(),
         }
     }
 
@@ -458,6 +478,30 @@ impl MentionCoalescer {
         self.retry_attempts.remove(assignee);
     }
 
+    /// Park a coalesced burst on the durable DLQ (timer NoSigner / host
+    /// terminal paths). Does not touch the live buffer or retry map.
+    pub fn park_dlq(&mut self, coalesced: Coalesced, reason: DlqReason) {
+        self.dlq.push(DlqEntry { reason, coalesced });
+    }
+
+    /// Number of DLQ entries (observable for tests / ops).
+    pub fn dlq_len(&self) -> usize {
+        self.dlq.len()
+    }
+
+    /// Drain the durable DLQ (oldest first).
+    pub fn take_dlq(&mut self) -> Vec<DlqEntry> {
+        std::mem::take(&mut self.dlq)
+    }
+
+    /// DLQ entries for one assignee (borrowed; tests / ops).
+    pub fn dlq_for(&self, assignee: &str) -> Vec<&DlqEntry> {
+        self.dlq
+            .iter()
+            .filter(|e| e.coalesced.assignee == assignee)
+            .collect()
+    }
+
     /// Current Transient attempt count for `assignee` (0 if none).
     pub fn retry_attempts(&self, assignee: &str) -> u32 {
         self.retry_attempts.get(assignee).copied().unwrap_or(0)
@@ -490,6 +534,13 @@ impl MentionCoalescer {
                     // makes every later Transient Exhaust immediately. Clear so
                     // a fresh burst (or host clear_retry) can retry again.
                     self.retry_attempts.remove(assignee.as_str());
+                    // T2: park whole coalesced batch on DLQ (not live restore /
+                    // hot-spin; not silent drop). Sibling Buffered mentions in
+                    // the live buffer are untouched.
+                    self.dlq.push(DlqEntry {
+                        reason: DlqReason::Exhausted,
+                        coalesced,
+                    });
                     return RequeueOutcome::Exhausted;
                 }
                 let delay = transient_backoff_delay_ms(assignee.as_str(), attempt);
@@ -684,7 +735,13 @@ mod tests {
             c.requeue(batch, 9_000, RequeueSchedule::Transient),
             RequeueOutcome::Exhausted
         );
-        assert_eq!(c.buffered_for("oc"), 0, "Exhausted must not restore");
+        assert_eq!(c.buffered_for("oc"), 0, "Exhausted must not live-buffer restore");
+        assert_eq!(c.dlq_len(), 1, "Exhausted must park whole batch on DLQ");
+        assert_eq!(
+            c.dlq_for("oc")[0].reason,
+            DlqReason::Exhausted,
+            "DLQ reason Exhausted"
+        );
         assert_eq!(
             c.retry_attempts("oc"),
             0,
