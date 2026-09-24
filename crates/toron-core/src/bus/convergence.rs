@@ -22,19 +22,11 @@ pub enum AuthorityOp {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Convergence {
     /// Proposed; not yet committed — no live side-effects.
-    Pending {
-        op: AuthorityOp,
-        generation: u64,
-    },
+    Pending { op: AuthorityOp, generation: u64 },
     /// Authority committed; live fanout may fire exactly once.
-    Committed {
-        op: AuthorityOp,
-        generation: u64,
-    },
+    Committed { op: AuthorityOp, generation: u64 },
     /// Store/authority could not confirm — fail closed (no fanout).
-    Rejected {
-        reason: String,
-    },
+    Rejected { reason: String },
     /// Re-add raced under held generation — fenced.
     Fenced {
         attempted_generation: u64,
@@ -79,10 +71,7 @@ pub fn tick(
             }),
             vec![],
         ),
-        (
-            Some(Convergence::Pending { op, generation }),
-            ConvergenceMsg::Commit,
-        ) => (
+        (Some(Convergence::Pending { op, generation }), ConvergenceMsg::Commit) => (
             Some(Convergence::Committed {
                 op: op.clone(),
                 generation: *generation,
@@ -101,8 +90,12 @@ pub fn tick(
             }],
         ),
         (
-            Some(Convergence::Pending { generation: held, .. })
-            | Some(Convergence::Committed { generation: held, .. }),
+            Some(Convergence::Pending {
+                generation: held, ..
+            })
+            | Some(Convergence::Committed {
+                generation: held, ..
+            }),
             ConvergenceMsg::ReAdd { generation },
         ) => {
             if generation != held {
@@ -170,13 +163,7 @@ mod tests {
         );
         assert!(fx.is_empty(), "propose must not fanout");
         let (_s, fx) = tick(s.as_ref(), &ConvergenceMsg::Commit);
-        assert_eq!(
-            fx,
-            vec![ConvergenceEffect::FireLive {
-                op,
-                generation: 1
-            }]
-        );
+        assert_eq!(fx, vec![ConvergenceEffect::FireLive { op, generation: 1 }]);
     }
 
     #[test]
@@ -184,9 +171,7 @@ mod tests {
         let (s, _) = tick(
             None,
             &ConvergenceMsg::Propose {
-                op: AuthorityOp::Disable {
-                    target: "x".into(),
-                },
+                op: AuthorityOp::Disable { target: "x".into() },
                 generation: 2,
             },
         );
@@ -209,9 +194,7 @@ mod tests {
         let (s, _) = tick(
             None,
             &ConvergenceMsg::Propose {
-                op: AuthorityOp::Revoke {
-                    target: "y".into(),
-                },
+                op: AuthorityOp::Revoke { target: "y".into() },
                 generation: 7,
             },
         );

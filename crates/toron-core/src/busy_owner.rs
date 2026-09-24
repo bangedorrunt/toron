@@ -90,24 +90,16 @@ pub enum BusyOwnerMsg {
         claimed_generation: u64,
     },
     /// Deadline wake: hold expired → host may fork (generation++) and retry.
-    DeadlineWake {
-        agent: String,
-        now_ms: u64,
-    },
+    DeadlineWake { agent: String, now_ms: u64 },
     /// Explicit fork/rebind: advance generation so stale workers cannot reclaim.
-    ForkRebind {
-        agent: String,
-    },
+    ForkRebind { agent: String },
 }
 
 /// Journaled effects — no I/O in tick.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BusyOwnerEffect {
     /// Slot acquired at this generation.
-    Acquired {
-        agent: String,
-        generation: u64,
-    },
+    Acquired { agent: String, generation: u64 },
     /// Agent busy; host should park until deadline (Resonate sleep).
     SleepUntilDeadline {
         agent: String,
@@ -115,15 +107,9 @@ pub enum BusyOwnerEffect {
         observed_generation: u64,
     },
     /// Hold still active (re-check; do not restart the bound window).
-    HoldContinued {
-        agent: String,
-        until_ms: u64,
-    },
+    HoldContinued { agent: String, until_ms: u64 },
     /// Hold bound elapsed — host may fork and retry acquire.
-    HoldExpired {
-        agent: String,
-        held_for_ms: u64,
-    },
+    HoldExpired { agent: String, held_for_ms: u64 },
     /// Stale worker fenced (claimed generation ≠ current).
     FencedStale {
         agent: String,
@@ -131,19 +117,11 @@ pub enum BusyOwnerEffect {
         current: u64,
     },
     /// Slot released.
-    Released {
-        agent: String,
-        generation: u64,
-    },
+    Released { agent: String, generation: u64 },
     /// Generation advanced (fork/rebind).
-    GenerationAdvanced {
-        agent: String,
-        generation: u64,
-    },
+    GenerationAdvanced { agent: String, generation: u64 },
     /// Release ignored (no holder / generation mismatch already fenced).
-    ReleaseIgnored {
-        agent: String,
-    },
+    ReleaseIgnored { agent: String },
 }
 
 /// Pure transition.
@@ -330,7 +308,10 @@ mod tests {
         );
         assert!(matches!(
             &fx[0],
-            BusyOwnerEffect::SleepUntilDeadline { until_ms: 1_010, .. }
+            BusyOwnerEffect::SleepUntilDeadline {
+                until_ms: 1_010,
+                ..
+            }
         ));
         let (_m, fx) = tick(
             &m,

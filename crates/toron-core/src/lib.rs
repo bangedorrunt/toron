@@ -4,8 +4,8 @@
 pub mod archive;
 pub mod backend;
 pub mod bus;
-pub mod config;
 pub mod busy_owner;
+pub mod config;
 pub mod dispatch_core;
 pub mod index;
 pub mod jsonl;
