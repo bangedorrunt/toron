@@ -197,16 +197,27 @@ impl RunStateStore {
     }
 
     /// History newest-first, optionally only rows strictly older than
-    /// `before_seq`. `limit` of 0 means unbounded — callers that walk history
-    /// should pass a real bound, because an unbounded read of a long-lived
-    /// thread is a memory bug.
+    /// `before_seq`. `before_seq` is exclusive, so a walk resumes without
+    /// re-reading its own cursor row.
+    ///
+    /// `limit` is REQUIRED and must be positive — there is deliberately no
+    /// "0 means everything" escape. An unbounded read of a long-lived thread is
+    /// a memory bug, and a default that silently means `i64::MAX` is exactly
+    /// the kind of permissive default this codebase rejects elsewhere. The
+    /// same reasoning that makes [`RunStateStore::prune_before`]'s protected
+    /// floor a required argument applies here: a bound the caller must state
+    /// beats a bound a convention provides.
     pub async fn history(
         &self,
         thread_id: &str,
         before_seq: Option<i64>,
         limit: i64,
     ) -> Result<Vec<RunStateCheckpoint>> {
-        let cap = if limit > 0 { limit } else { i64::MAX };
+        anyhow::ensure!(
+            limit > 0,
+            "run-state history needs a positive limit ({limit}); an unbounded read of a \
+             long-lived thread is a memory bug, not a convenience"
+        );
         Ok(sqlx::query_as::<_, RunStateCheckpoint>(&format!(
             "SELECT {COLUMNS} FROM run_state_checkpoints \
              WHERE thread_id = ?1 AND (?2 IS NULL OR seq < ?2) \
@@ -214,7 +225,7 @@ impl RunStateStore {
         ))
         .bind(thread_id)
         .bind(before_seq)
-        .bind(cap)
+        .bind(limit)
         .fetch_all(&self.pool)
         .await?)
     }
