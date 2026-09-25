@@ -763,7 +763,6 @@ mod tests {
             name: None,
             guard: None,
             on_error: StepOnError::Continue,
-            error_kinds: vec![],
             build_slot: false,
             action: Action::Delay { secs: 0 },
         }

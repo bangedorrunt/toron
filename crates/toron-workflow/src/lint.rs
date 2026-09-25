@@ -318,52 +318,10 @@ fn check_graph(report: &mut LintReport, graph: &Graph) {
     }
 }
 
-const ERROR_KINDS: &[&str] = &[
-    "rate_limit",
-    "timeout",
-    "blocked",
-    "auth",
-    "cancelled",
-    "unknown",
-];
-
-fn push_re2(report: &mut LintReport, name: String, kinds: &[String]) {
-    if kinds.is_empty() {
-        report.issues.push(LintIssue {
-            level: Level::Warning,
-            message: format!(
-                "R-E2: step {name:?} with on_error: fail_run missing kind classification — rate_limit/timeout retry vs blocked/auth/cancelled/unknown escalate must be distinguished (ADR-0024 Spec 1)"
-            ),
-            line: None,
-        });
-        return;
-    }
-    for k in kinds {
-        if !ERROR_KINDS.contains(&k.as_str()) {
-            report.issues.push(LintIssue {
-                level: Level::Error,
-                message: format!(
-                    "R-E2: step {name:?} unknown error_kind {k:?} (allowed: {})",
-                    ERROR_KINDS.join(", ")
-                ),
-                line: None,
-            });
-        }
-    }
-}
-
 /// ADR-0024 Spec 1 R-E lints
 fn check_re_lint(report: &mut LintReport, wf: &Workflow) {
     // Walk steps with enclosing_retry flag
     fn walk_step(step: &Step, inside_retry: bool, report: &mut LintReport) {
-        // R-E2: fail_run step without kind classification
-        if step.on_error == crate::schema::StepOnError::FailRun {
-            push_re2(
-                report,
-                step.name.clone().unwrap_or_else(|| "<unnamed>".into()),
-                &step.error_kinds,
-            );
-        }
         // R-E3: spawn + fail_run without enclosing Retry
         if matches!(step.action, Action::Spawn { .. })
             && step.on_error == crate::schema::StepOnError::FailRun
@@ -415,9 +373,6 @@ fn check_re_lint(report: &mut LintReport, wf: &Workflow) {
     }
     if let Some(graph) = &wf.graph {
         for (name, node) in &graph.nodes {
-            if node.on_error == crate::schema::StepOnError::FailRun {
-                push_re2(report, name.clone(), &node.error_kinds);
-            }
             if matches!(node.action, Action::Spawn { .. })
                 && node.on_error == crate::schema::StepOnError::FailRun
             {
@@ -1360,24 +1315,6 @@ graph:
             report.issues
         );
         let report = lint(
-            "name: r-e2\ntrigger:\n  type: webhook\nsteps:\n  - name: go\n    action: send_dm\n    to: x\n    body: y\n    on_error: fail_run\n",
-        );
-        assert!(
-            report.issues.iter().any(|i| i.level == Level::Warning
-                && i.message.contains("R-E2")
-                && i.message.to_lowercase().contains("kind")),
-            "R-E2 warning expected: {:?}",
-            report.issues
-        );
-        let report = lint(
-            "name: r-e2-ok\ntrigger:\n  type: webhook\nsteps:\n  - name: go\n    action: send_dm\n    to: x\n    body: y\n    on_error: fail_run\n    error_kinds: [timeout, rate_limit, unknown]\n",
-        );
-        assert!(
-            !report.issues.iter().any(|i| i.message.contains("R-E2")),
-            "classified fail_run must not warn R-E2: {:?}",
-            report.issues
-        );
-        let report = lint(
             "name: r-e3\ntrigger:\n  type: webhook\nsteps:\n  - name: spawn-go\n    action: spawn\n    profile: \"@housekeeper\"\n    await: true\n    on_error: fail_run\n",
         );
         assert!(
@@ -1394,6 +1331,16 @@ graph:
             !report.issues.iter().any(|i| i.message.contains("R-E3")),
             "R-E3 must not fire when wrapped in retry: {:?}",
             report.issues
+        );
+    }
+
+    #[test]
+    fn r_e2_declaration_is_not_schema() {
+        let yaml = "name: legacy-r-e2\ntrigger:\n  type: webhook\nsteps:\n  - name: go\n    action: send_dm\n    to: x\n    body: y\n    on_error: fail_run\n    error_kinds: [timeout, rate_limit]\n";
+        let err = parse_workflow(yaml).expect_err("R-E2 declaration must not parse");
+        assert!(
+            err.to_string().contains("unknown field `error_kinds`"),
+            "legacy declaration fails at the schema boundary: {err}"
         );
     }
 
