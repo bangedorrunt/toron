@@ -9,7 +9,6 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::nostr::EventId;
     use crate::nostr::{Event, Keys, Kind, Tag, Timestamp};
     use ::nostr::event::FinalizeEvent;
     use proptest::prelude::*;
@@ -22,11 +21,6 @@ mod tests {
     fn any_content() -> impl Strategy<Value = String> {
         prop::collection::vec(prop::char::range('a', 'z'), 1..64)
             .prop_map(|v| v.into_iter().collect())
-    }
-
-    /// Arbitrary hex public key string (not necessarily a valid key).
-    fn any_hex_pubkey() -> impl Strategy<Value = String> {
-        prop::collection::vec(prop::char::range('0', 'f'), 64).prop_map(|v| v.into_iter().collect())
     }
 
     /// Build an event with a fixed timestamp for a random content.
@@ -224,16 +218,6 @@ mod tests {
                 matches!(err, gift_wrap::GiftWrapError::SenderMismatch),
                 "expected SenderMismatch, got {err:?}"
             );
-        }
-    }
-
-    // EventId parses from any hex we emit (64 lowercase hex chars).
-    proptest! {
-        #[test]
-        fn event_id_hex_roundtrip(raw in any_hex_pubkey()) {
-            // Only well-formed 64-hex ids parse; others error — the point is
-            // the parse path is total on the domain we produce.
-            let _ = EventId::from_hex(&raw);
         }
     }
 }

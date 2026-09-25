@@ -442,14 +442,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn boolean_true_proceeds() {
+    async fn boolean_literal_outcome() {
+        // Literal true proceeds, literal false skips (was 2 tests).
         let out = evaluate_guard(Some("true"), &HashMap::new(), Duration::from_millis(100)).await;
         assert_eq!(out, GuardOutcome::Bool(true));
         assert!(out.proceeds());
-    }
-
-    #[tokio::test]
-    async fn boolean_false_skips() {
         let out = evaluate_guard(Some("false"), &HashMap::new(), Duration::from_millis(100)).await;
         assert_eq!(out, GuardOutcome::Bool(false));
         assert!(!out.proceeds());
@@ -469,18 +466,10 @@ mod tests {
         assert_eq!(out, GuardOutcome::Bool(true));
     }
 
-    #[tokio::test]
-    async fn str_contains_custom_fn() {
-        let v = vars(&[("trigger_text", "production is down")]);
-        let out = evaluate_guard(
-            Some("str_contains(trigger_text, \"production\")"),
-            &v,
-            Duration::from_millis(100),
-        )
-        .await;
-        assert_eq!(out, GuardOutcome::Bool(true));
-    }
-
+    /// NOTE (bd-8jgv): removed `str_contains/ends_with/len_custom_fn` — pure
+    /// replays of `all_four_fns_callable` below, which already evaluates all
+    /// four fns through the public evaluator path. `str_starts_with` stays:
+    /// it owns the only false-path assert.
     #[tokio::test]
     async fn str_starts_with_custom_fn() {
         let v = vars(&[("trigger_text", "P1 crash")]);
@@ -504,38 +493,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn str_ends_with_custom_fn() {
-        let v = vars(&[("trigger_text", "deploy.log")]);
-        assert_eq!(
-            evaluate_guard(
-                Some("str_ends_with(trigger_text, \".log\")"),
-                &v,
-                Duration::from_millis(100)
-            )
-            .await,
-            GuardOutcome::Bool(true)
-        );
-    }
-
-    #[tokio::test]
-    async fn str_len_custom_fn() {
-        let v = vars(&[("trigger_text", "hello")]);
-        assert_eq!(
-            evaluate_guard(
-                Some("str_len(trigger_text) > 3"),
-                &v,
-                Duration::from_millis(100)
-            )
-            .await,
-            GuardOutcome::Bool(true)
-        );
-    }
-
-    /// ADR-0004 verification: an adversarial guard expression that would
-    /// stack-overflow evalexpr's recursive tree builder (uncatchable SIGABRT)
-    /// is rejected by the complexity pre-scan BEFORE eval — never hung, never
-    /// crashing the process.
     #[tokio::test]
     async fn adversarial_guard_rejected_not_hung() {
         // ~20MB expression: 5000 nested str_contains calls with 2000-char

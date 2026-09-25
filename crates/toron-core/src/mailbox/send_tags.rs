@@ -432,18 +432,17 @@ mod tests {
     }
 
     #[test]
-    fn send_tags_parse_rejects_empty_corr() {
-        let tags = vec![tag("corr", "")];
-        let err = SendTags::parse(&tags).expect_err("empty corr must error");
+    fn send_tags_empty_corr_rejected_at_all_entries() {
+        // Corr authority: empty rejected at parse, constructor, and newtype
+        // (was 3 one-assert tests).
+        let err = SendTags::parse(&[tag("corr", "")]).expect_err("empty corr must error");
         assert!(err.message.contains("empty"), "{err}");
         assert_eq!(err.code, MailErrorCode::Malformed);
-    }
-
-    #[test]
-    fn send_tags_from_fields_rejects_empty_corr() {
         let err = SendTags::from_fields(Some("   ".into()), None, None, None, None, None)
             .expect_err("empty corr must error");
         assert!(err.message.contains("empty"), "{err}");
+        let err = "".parse::<Corr>().expect_err("empty corr must error");
+        assert!(err.to_string().contains("empty"), "{err}");
     }
 
     #[test]
@@ -459,11 +458,19 @@ mod tests {
     }
 
     #[test]
-    fn send_tags_parse_rejects_unknown_verdict() {
-        let tags = vec![tag("verdict", "maybe")];
-        let err = SendTags::parse(&tags).expect_err("unknown verdict must error");
-        assert!(err.message.contains("unknown verdict"), "{err}");
-        assert_eq!(err.code, MailErrorCode::Malformed);
+    fn send_tags_parse_rejects_unknown_enums() {
+        // One table for every closed-vocabulary reject (was 4 one-assert tests).
+        for (key, value) in [
+            ("verdict", "maybe"),
+            ("wake", "bogus"),
+            ("priority", "fast"),
+            ("audience", "everyone"),
+        ] {
+            let tags = vec![tag(key, value)];
+            let err = SendTags::parse(&tags).expect_err("unknown enum must error");
+            assert!(err.message.contains(&format!("unknown {key}")), "{err}");
+            assert_eq!(err.code, MailErrorCode::Malformed);
+        }
     }
 
     #[test]
@@ -483,12 +490,6 @@ mod tests {
                 .iter()
                 .any(|t| t.as_slice() == ["verdict", "deny"])
         );
-    }
-
-    #[test]
-    fn send_tags_corr_newtype_rejects_empty() {
-        let err = "".parse::<Corr>().expect_err("empty corr must error");
-        assert!(err.to_string().contains("empty"), "{err}");
     }
 
     #[test]
@@ -577,29 +578,8 @@ mod tests {
     }
 
     #[test]
-    fn send_tags_parse_rejects_unknown_wake() {
-        let tags = vec![tag("wake", "bogus")];
-        let err = SendTags::parse(&tags).expect_err("unknown wake must error");
-        assert!(err.message.contains("unknown wake"), "{err}");
-        assert_eq!(err.code, MailErrorCode::Malformed);
-    }
-
-    #[test]
-    fn send_tags_parse_rejects_unknown_priority() {
-        let tags = vec![tag("priority", "fast")];
-        let err = SendTags::parse(&tags).expect_err("unknown priority must error");
-        assert!(err.message.contains("unknown priority"), "{err}");
-    }
-
-    #[test]
-    fn send_tags_parse_rejects_unknown_audience() {
-        let tags = vec![tag("audience", "everyone")];
-        let err = SendTags::parse(&tags).expect_err("unknown audience must error");
-        assert!(err.message.contains("unknown audience"), "{err}");
-    }
-
-    #[test]
-    fn send_tags_validate_human_fanout_hard_error() {
+    fn send_tags_validate_send_guards() {
+        // Human fan-out and interrupt routing guards, one table (was 3 tests).
         let tags = SendTags {
             audience: Some(Audience::Human),
             ..Default::default()
@@ -608,10 +588,6 @@ mod tests {
             .validate_for_send(2, false)
             .expect_err("human fan-out >1 must error");
         assert!(err.message.contains("fan-out"), "{err}");
-    }
-
-    #[test]
-    fn send_tags_validate_interrupt_requires_overseer() {
         let tags = SendTags {
             priority: Some(Priority::Interrupt),
             ..Default::default()
@@ -620,10 +596,6 @@ mod tests {
             .validate_for_send(1, false)
             .expect_err("interrupt without overseer must error");
         assert!(err.message.contains("operator"), "{err}");
-    }
-
-    #[test]
-    fn send_tags_validate_interrupt_never_human() {
         let tags = SendTags {
             priority: Some(Priority::Interrupt),
             audience: Some(Audience::Human),

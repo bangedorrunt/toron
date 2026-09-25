@@ -1342,26 +1342,16 @@ graph:
         assert!(err.contains("yaml parse error"), "actionable: {err}");
     }
 
-    // ---- ADR-0024 Spec 1 R-E lints (kind_aware) ----
-
+    // ---- ADR-0024 Spec 1 R-E lints (kind_aware): one matrix test (was 5).
     #[test]
-    fn kind_aware_r_e1_retry_on_blocked_is_error() {
-        let yaml = r##"
-name: r-e1
-trigger:
-  type: webhook
-steps:
-  - name: go
-    action: retry
-    max_attempts: 3
-    step:
-      action: send_dm
-      to: x
-      body: y
-      on_error: fail_run
-"##;
-        let wf = parse_workflow(yaml).expect("parse");
-        let report = lint_workflow(&wf);
+    fn kind_aware_retry_rules_matrix() {
+        let lint = |yaml: &str| {
+            let wf = parse_workflow(yaml).expect("parse");
+            lint_workflow(&wf)
+        };
+        let report = lint(
+            "name: r-e1\ntrigger:\n  type: webhook\nsteps:\n  - name: go\n    action: retry\n    max_attempts: 3\n    step:\n      action: send_dm\n      to: x\n      body: y\n      on_error: fail_run\n",
+        );
         assert!(
             report.issues.iter().any(|i| i.level == Level::Warning
                 && i.message.contains("R-E1")
@@ -1369,23 +1359,9 @@ steps:
             "R-E1 error expected: {:?}",
             report.issues
         );
-    }
-
-    #[test]
-    fn kind_aware_r_e2_fail_run_missing_kind_warning() {
-        let yaml = r##"
-name: r-e2
-trigger:
-  type: webhook
-steps:
-  - name: go
-    action: send_dm
-    to: x
-    body: y
-    on_error: fail_run
-"##;
-        let wf = parse_workflow(yaml).expect("parse");
-        let report = lint_workflow(&wf);
+        let report = lint(
+            "name: r-e2\ntrigger:\n  type: webhook\nsteps:\n  - name: go\n    action: send_dm\n    to: x\n    body: y\n    on_error: fail_run\n",
+        );
         assert!(
             report.issues.iter().any(|i| i.level == Level::Warning
                 && i.message.contains("R-E2")
@@ -1393,46 +1369,17 @@ steps:
             "R-E2 warning expected: {:?}",
             report.issues
         );
-    }
-
-    #[test]
-    fn kind_aware_r_e2_classified_is_silent() {
-        let yaml = r##"
-name: r-e2-ok
-trigger:
-  type: webhook
-steps:
-  - name: go
-    action: send_dm
-    to: x
-    body: y
-    on_error: fail_run
-    error_kinds: [timeout, rate_limit, unknown]
-"##;
-        let wf = parse_workflow(yaml).expect("parse");
-        let report = lint_workflow(&wf);
+        let report = lint(
+            "name: r-e2-ok\ntrigger:\n  type: webhook\nsteps:\n  - name: go\n    action: send_dm\n    to: x\n    body: y\n    on_error: fail_run\n    error_kinds: [timeout, rate_limit, unknown]\n",
+        );
         assert!(
             !report.issues.iter().any(|i| i.message.contains("R-E2")),
             "classified fail_run must not warn R-E2: {:?}",
             report.issues
         );
-    }
-
-    #[test]
-    fn kind_aware_r_e3_spawn_without_retry_warning() {
-        let yaml = r##"
-name: r-e3
-trigger:
-  type: webhook
-steps:
-  - name: spawn-go
-    action: spawn
-    profile: "@housekeeper"
-    await: true
-    on_error: fail_run
-"##;
-        let wf = parse_workflow(yaml).expect("parse");
-        let report = lint_workflow(&wf);
+        let report = lint(
+            "name: r-e3\ntrigger:\n  type: webhook\nsteps:\n  - name: spawn-go\n    action: spawn\n    profile: \"@housekeeper\"\n    await: true\n    on_error: fail_run\n",
+        );
         assert!(
             report.issues.iter().any(|i| i.level == Level::Warning
                 && i.message.contains("R-E3")
@@ -1440,27 +1387,9 @@ steps:
             "R-E3 warning expected: {:?}",
             report.issues
         );
-    }
-
-    #[test]
-    fn kind_aware_r_e3_spawn_with_retry_no_warning() {
-        let yaml = r##"
-name: r-e3-ok
-trigger:
-  type: webhook
-steps:
-  - name: wrapped
-    action: retry
-    max_attempts: 3
-    step:
-      action: spawn
-      profile: "@housekeeper"
-      await: true
-      on_error: fail_run
-"##;
-        let wf = parse_workflow(yaml).expect("parse");
-        let report = lint_workflow(&wf);
-        // Wrapped spawn should NOT trigger R-E3
+        let report = lint(
+            "name: r-e3-ok\ntrigger:\n  type: webhook\nsteps:\n  - name: wrapped\n    action: retry\n    max_attempts: 3\n    step:\n      action: spawn\n      profile: \"@housekeeper\"\n      await: true\n      on_error: fail_run\n",
+        );
         assert!(
             !report.issues.iter().any(|i| i.message.contains("R-E3")),
             "R-E3 must not fire when wrapped in retry: {:?}",
