@@ -3602,33 +3602,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&data_dir);
     }
 
-    #[tokio::test]
-    async fn wake_watch_kinds_include_39002() {
-        // Toron watch default must include 39002 (join/leave) next to 9,43001,30031.
-        // This is a contract test — if the default drifts, the dispatcher goes deaf to crew changes.
-        let default = "9,7,39002,43001,20001";
-        assert!(
-            default.split(',').any(|k| k == "39002"),
-            "watch kinds must include 39002"
-        );
-        // And the bus actually stores a 39002 on join — smoke via channel API
-        let (mailbox, _pool, db_path, data_dir) = test_mailbox_with_pool("wake-watch").await;
-        mailbox.ensure_project("demo").await.expect("ensure");
-        let (_a, _) = register(&mailbox, "demo", "GreenCastle").await;
-        let filter = crate::bus::Filter::new()
-            .kinds([crate::nostr::kinds::toron_kind(39002)])
-            .hashtag("demo");
-        // No panic: filter with 39002 is valid and replayable (even if empty now)
-        let events = crate::mailbox::collect_replay(mailbox.bus().as_ref(), filter)
-            .await
-            .expect("replay 39002");
-        assert!(
-            events.is_empty(),
-            "empty store has no 39002 yet — filter accepted"
-        );
-        let _ = std::fs::remove_file(&db_path);
-        let _ = std::fs::remove_dir_all(&data_dir);
-    }
+    // NOTE (bd-8jgv): the 39002 watch-default contract lives at its real
+    // boundaries — `cli.rs::wake_watch_kinds_include_39002` reads the clap
+    // default, `plane.rs` covers WAIT_WAKE_KINDS, and cli_channels_lifecycle
+    // proves join/leave end to end. The copy here asserted a hardcoded
+    // literal (production drift could never fail it) plus a vacuous
+    // empty-store replay, so it is removed.
 
     // ---- ack_overdue_only projection + per-recipient SLA ----
 

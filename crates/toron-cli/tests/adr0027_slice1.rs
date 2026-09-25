@@ -141,51 +141,12 @@ fn adr0027_s1_toron_mail_send_rejects_unknown_wake() {
     assert!(Wake::parse("bogus").is_err());
 }
 
-#[test]
-fn adr0027_s1_toron_mail_send_rejects_unknown_priority() {
-    use toron_core::mailbox::send_tags::{Priority, SendTags};
-    use toron_core::nostr::Tag;
-    let bad = Tag::parse(["priority", "fast"]).expect("tag");
-    let err = SendTags::parse(&[bad]).expect_err("unknown priority must error");
-    assert!(err.message.contains("unknown priority"), "{err}");
-    assert!(Priority::parse("fast").is_err());
-}
-
-#[test]
-fn adr0027_s1_toron_mail_send_rejects_unknown_audience() {
-    use toron_core::mailbox::send_tags::{Audience, SendTags};
-    use toron_core::nostr::Tag;
-    let bad = Tag::parse(["audience", "everyone"]).expect("tag");
-    let err = SendTags::parse(&[bad]).expect_err("unknown audience must error");
-    assert!(err.message.contains("unknown audience"), "{err}");
-    assert!(Audience::parse("everyone").is_err());
-}
-
-#[test]
-fn adr0027_s1_toron_mail_send_human_fanout_hard_error() {
-    // audience=human to >1 recipient is a hard error (E3) — library-level check
-    use toron_core::mailbox::send_tags::{Audience, SendTags};
-    let tags = SendTags {
-        audience: Some(Audience::Human),
-        ..Default::default()
-    };
-    let err = tags
-        .validate_for_send(2, false)
-        .expect_err("human fan-out >1 must error");
-    assert!(err.message.contains("fan-out"), "{err}");
-    // also check interrupt validation
-    use toron_core::mailbox::send_tags::{Priority, Wake};
-    let tags2 = SendTags {
-        priority: Some(Priority::Interrupt),
-        audience: Some(Audience::Human),
-        ..Default::default()
-    };
-    let err2 = tags2
-        .validate_for_send(1, true)
-        .expect_err("interrupt onto human must error");
-    assert!(err2.message.contains("never onto human"), "{err2}");
-    let _ = Wake::Tasked; // keep import used
-}
+/// NOTE (bd-8jgv): removed `rejects_unknown_priority`, `rejects_unknown_audience`,
+/// and `human_fanout_hard_error` — pure library-level replays of the
+/// `send_tags` unit matrix (`send_tags_parse_rejects_unknown_enums`,
+/// `send_tags_validate_send_guards`), same `SendTags` calls, no subprocess.
+/// `rejects_unknown_wake` stays: it additionally pins the CLI `--help`
+/// vocabulary surface, a risk the unit tests cannot reach.
 
 // ── receipts store (bd-gokp) ──
 

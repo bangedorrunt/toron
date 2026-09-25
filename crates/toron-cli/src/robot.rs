@@ -2038,8 +2038,10 @@ pub(crate) fn captain_write_gate(
 mod captain_open_mode_tests {
     use super::*;
 
+    /// captain_write_gate matrix: open refuses (naming the swarm-only remedy),
+    /// force overrides, swarm routes. One test (was 3).
     #[test]
-    fn captain_open_mode_refuses_without_force() {
+    fn captain_write_gate_matrix() {
         let err = captain_write_gate(
             &toron_core::mailbox::naming::IdentityMode::Open,
             false,
@@ -2049,20 +2051,12 @@ mod captain_open_mode_tests {
         let msg = err.to_string();
         assert!(msg.contains("swarm-only"), "{msg}");
         assert!(msg.contains("identity_mode=swarm"), "{msg}");
-    }
-
-    #[test]
-    fn captain_open_mode_force_overrides() {
         captain_write_gate(
             &toron_core::mailbox::naming::IdentityMode::Open,
             true,
             "flywheel",
         )
         .expect("force overrides the open-mode refusal");
-    }
-
-    #[test]
-    fn captain_swarm_mode_writes_without_force() {
         captain_write_gate(
             &toron_core::mailbox::naming::IdentityMode::Swarm,
             false,
@@ -2150,22 +2144,17 @@ mod daemon_roster_revocation_tests {
         resolve_daemon_roster(&res, &agents(), 500)
     }
 
-    /// bd-0pjf core: force_release revocation hides the lease on the very
-    /// next guard check (pins the 7c98dcf behavior).
+    /// Revocation tombstone ordering (mirrors the embedded resolver):
+    /// `resolve_lease_state`): a revoked lease stays hidden, a lease
+    /// re-acquired after the marker is live, and a stale marker never
+    /// blankets a newer lease. One table (was 3 tests).
     #[test]
-    fn revoke_hides_lease_on_next_check() {
+    fn revoke_tombstone_ordering() {
         let roster = resolve(vec![held_lease(HOLDER, 100), force_revoke(200)]);
         assert!(
             roster.is_empty(),
             "revoked lease must not reach the guard: {roster:?}"
         );
-    }
-
-    /// bd-0pjf tombstone ordering (mirrors embedded `resolve_lease_state`,
-    /// bd-reacquire): a revocation marker covers only OLDER events — a lease
-    /// re-acquired after the force-release is live again.
-    #[test]
-    fn reacquire_after_revoke_is_live() {
         let roster = resolve(vec![
             held_lease(HOLDER, 100),
             force_revoke(200),
@@ -2173,11 +2162,6 @@ mod daemon_roster_revocation_tests {
         ]);
         assert_eq!(roster.len(), 1, "re-acquired lease is live: {roster:?}");
         assert_eq!(roster[0].pattern, "scratch-guard.txt");
-    }
-
-    /// A stale revocation never blankets a newer lease at the same path.
-    #[test]
-    fn stale_revoke_does_not_blanket_newer_lease() {
         let roster = resolve(vec![force_revoke(100), held_lease(HOLDER, 200)]);
         assert_eq!(
             roster.len(),
@@ -2219,10 +2203,12 @@ mod holder_fold_tests {
         fold_from_agents_resource(&agents)
     }
 
-    /// The fold's whole point: a name, its npub, and the daemon's `npub[..8]`
-    /// holder rendering are ONE identity.
+    /// Holder-fold spelling matrix (fail-closed throughout): name/npub/prefix
+    /// fold to one identity; unknown and ambiguous spellings stay themselves
+    /// (never a wildcard); empty spellings are never recorded. One table
+    /// (was 4 tests).
     #[test]
-    fn name_npub_and_prefix_fold_to_one_identity() {
+    fn holder_fold_spelling_matrix() {
         let fold = fold_with(&[("RoseDune", ALICE)]);
         assert_eq!(fold.resolve("RoseDune"), ALICE);
         assert_eq!(fold.resolve(ALICE), ALICE);
@@ -2231,32 +2217,14 @@ mod holder_fold_tests {
             ALICE,
             "the daemon's holder rendering must fold"
         );
-    }
-
-    /// Fail-closed: an unattributable spelling is ITSELF, never a wildcard, so
-    /// it cannot collide with a lease holder.
-    #[test]
-    fn unknown_spelling_folds_to_itself() {
-        let fold = fold_with(&[("RoseDune", ALICE)]);
         assert_eq!(fold.resolve("Ghost"), "Ghost");
         assert_ne!(fold.resolve("Ghost"), fold.resolve("RoseDune"));
-    }
-
-    /// An ambiguous prefix is not an attribution.
-    #[test]
-    fn ambiguous_prefix_stays_itself() {
         let twin = format!(
             "aaaaaaaa{}aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             &BOB[8..16]
         );
         let fold = fold_with(&[("RoseDune", ALICE), ("BlueLake", &twin)]);
         assert_eq!(fold.resolve(&ALICE[..8]), ALICE[..8]);
-    }
-
-    /// `record` refuses empty spellings: an empty name must never become a key
-    /// that matches some other empty holder.
-    #[test]
-    fn empty_spellings_are_not_recorded() {
         let mut fold = HolderFold::default();
         fold.record("", ALICE);
         fold.record("  ", ALICE);

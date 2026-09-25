@@ -327,50 +327,49 @@ mod selector_tests {
     use super::*;
 
     #[test]
-    fn decide_env_url_wins_over_everything() {
-        assert_eq!(
-            decide_source(
-                Some("http://x/mcp".to_string()),
-                true,
-                Some("http://y/mcp".to_string()),
-                true,
+    fn decide_source_precedence() {
+        // Env URL > pinned data dir > flywheel URL > loud refusal on a live
+        // default daemon > quiet embedded default. One table (was 5 tests).
+        // No URL + live default daemon refuses, never embeds silently.
+        let cases: Vec<(
+            &str,
+            (Option<String>, bool, Option<String>, bool),
+            SourceDecision,
+        )> = vec![
+            (
+                "env url wins",
+                (
+                    Some("http://x/mcp".to_string()),
+                    true,
+                    Some("http://y/mcp".to_string()),
+                    true,
+                ),
+                SourceDecision::DaemonUrl("http://x/mcp".to_string()),
             ),
-            SourceDecision::DaemonUrl("http://x/mcp".to_string())
-        );
-    }
-
-    #[test]
-    fn decide_data_dir_pin_beats_probe_and_config() {
-        assert_eq!(
-            decide_source(None, true, Some("http://y/mcp".to_string()), true,),
-            SourceDecision::EmbeddedPinned
-        );
-    }
-
-    #[test]
-    fn decide_flywheel_url_connects_loud() {
-        assert_eq!(
-            decide_source(None, false, Some("http://y/mcp".to_string()), false),
-            SourceDecision::DaemonUrl("http://y/mcp".to_string())
-        );
-    }
-
-    #[test]
-    fn decide_live_default_port_refuses_second_store() {
-        // bd-nsr7: no configured URL + live default daemon = loud refusal,
-        // never a silent embedded second store.
-        assert_eq!(
-            decide_source(None, false, None, true),
-            SourceDecision::RefuseSecondStore
-        );
-    }
-
-    #[test]
-    fn decide_quiet_defaults_embed() {
-        assert_eq!(
-            decide_source(None, false, None, false),
-            SourceDecision::EmbeddedXdg
-        );
+            (
+                "data dir pin",
+                (None, true, Some("http://y/mcp".to_string()), true),
+                SourceDecision::EmbeddedPinned,
+            ),
+            (
+                "flywheel url",
+                (None, false, Some("http://y/mcp".to_string()), false),
+                SourceDecision::DaemonUrl("http://y/mcp".to_string()),
+            ),
+            (
+                "live default refuses",
+                (None, false, None, true),
+                SourceDecision::RefuseSecondStore,
+            ),
+            (
+                "quiet embeds",
+                (None, false, None, false),
+                SourceDecision::EmbeddedXdg,
+            ),
+        ];
+        for (name, (a0, a1, a2, a3), want) in cases {
+            assert_eq!(decide_source(a0, a1, a2, a3), want, "{name}");
+        }
     }
 
     #[test]

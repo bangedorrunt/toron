@@ -77,26 +77,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn json_flag_wins_over_plain() {
+    fn output_format_and_color_precedence() {
+        // json > plain > default; no_color forces Never. One table (was 3 tests).
         let g = Globals {
             json: true,
             plain: true,
             ..Globals::default()
         };
         assert_eq!(OutputFormat::from_globals(&g), OutputFormat::Json);
-    }
-
-    #[test]
-    fn plain_flag_selects_plain() {
         let g = Globals {
             plain: true,
             ..Globals::default()
         };
         assert_eq!(OutputFormat::from_globals(&g), OutputFormat::Plain);
-    }
-
-    #[test]
-    fn no_color_flag_forces_never() {
         let g = Globals {
             no_color: true,
             ..Globals::default()

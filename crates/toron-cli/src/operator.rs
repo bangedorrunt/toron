@@ -1039,8 +1039,9 @@ mod check_resonate_tests {
     }
 
     #[test]
-    fn check_resonate_unreachable_is_not_ok() {
-        // Bind then drop so we probe a free port → ECONNREFUSED → ok:false.
+    fn check_resonate_probe_matrix() {
+        // Unreachable, non-HTTP, 5xx → ok:false; 200 → ok:true. One test
+        // (was 4) binding the same real sockets; the probe is the unit.
         let free = {
             let l = TcpListener::bind("127.0.0.1:0").expect("bind free");
             let a = l.local_addr().expect("addr");
@@ -1054,17 +1055,9 @@ mod check_resonate_tests {
             "detail must not claim a mail-only skip that does not exist: {}",
             r.detail
         );
-    }
-
-    #[test]
-    fn check_resonate_non_http_body_is_not_ok() {
         let addr = serve_once(Some(b"not-an-http-server\nerror 200\n"));
         let r = check_resonate_at(addr);
         assert!(!r.ok, "non-HTTP body must be ok:false, got: {}", r.detail);
-    }
-
-    #[test]
-    fn check_resonate_http_5xx_is_not_ok() {
         let addr = serve_once(Some(
             b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
         ));
@@ -1075,10 +1068,6 @@ mod check_resonate_tests {
             "detail should name the status: {}",
             r.detail
         );
-    }
-
-    #[test]
-    fn check_resonate_http_2xx_is_ok() {
         let addr = serve_once(Some(
             b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
         ));

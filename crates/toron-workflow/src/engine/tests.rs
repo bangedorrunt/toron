@@ -503,11 +503,12 @@ steps:
     .expect("parse continue workflow")
 }
 
-/// P0.2 (ADR-0005 Spec 0): `on_error: fail_run` on an erroring step → the
-/// run FAILS — `run_workflow` RETURNS `{status:"failed", error, failed_step}`
-/// (a durable deterministic return, NOT a panic/abort).
+/// P0.2 (ADR-0005 Spec 0) on_error policy matrix: `fail_run` fails the run
+/// (durable `{status:"failed", error, failed_step}` return, not a panic),
+/// while the default `continue` completes it (`{ok:false}` captured, later
+/// steps still run). One test (was 2).
 #[tokio::test]
-async fn on_error_fail_run_fails_the_run_durably() {
+async fn on_error_policy_matrix() {
     let engine = WorkflowEngine::local_with_async_effect_runner(Some(error_on_send_async()))
         .expect("engine");
     let input = RunInput {
@@ -529,12 +530,9 @@ async fn on_error_fail_run_fails_the_run_durably() {
     );
     let err = output["error"].as_str().expect("error string");
     assert!(err.contains("boom"), "error surfaced: {output}");
-}
-
-/// P0.2 backward compat: no `on_error` (default `continue`) on an erroring
-/// step → run completes; step output `{ok:false}`; later steps still run.
-#[tokio::test]
-async fn on_error_default_continue_completes_the_run() {
+    // P0.2 backward compat, same matrix: no `on_error` (default `continue`)
+    // on an erroring step → run completes; step output `{ok:false}`; later
+    // steps still run.
     let engine = WorkflowEngine::local_with_async_effect_runner(Some(error_on_send_async()))
         .expect("engine");
     let input = RunInput {
@@ -3035,11 +3033,11 @@ fn phases(seen: &Arc<std::sync::Mutex<Vec<RunTransition>>>) -> Vec<RunPhase> {
     seen.lock().unwrap().iter().map(|t| t.phase).collect()
 }
 
-/// The engine reports its own lifecycle: a run through an injected journal
-/// yields Started -> Running -> Succeeded, all carrying the run's id (so the
-/// run row and its effect rows agree).
+/// Run-lifecycle matrix: a journaled run reports Started -> Running ->
+/// terminal per outcome (success and failure), every row carrying the run's
+/// id; no journal injected means no lifecycle claims. One test (was 3).
 #[tokio::test]
-async fn run_lifecycle_rows_are_journaled_for_a_successful_run() {
+async fn run_lifecycle_matrix() {
     let (journal, seen) = recording_run_journal();
     let engine = WorkflowEngine::local_with_resolvers_effect_mode_and_run_journal(
         WorkflowEngine::default_resolver(),
@@ -3089,11 +3087,7 @@ steps:
         rows.iter().all(|t| !t.workflow_digest.is_empty()),
         "the digest travels with the lifecycle rows too: {rows:?}"
     );
-}
-
-/// A failed run reports the Failed terminal — never a bare stop.
-#[tokio::test]
-async fn run_lifecycle_rows_report_failure() {
+    // A failed run reports the Failed terminal — never a bare stop.
     let (journal, seen) = recording_run_journal();
     let engine = WorkflowEngine::local_with_resolvers_effect_mode_and_run_journal(
         WorkflowEngine::default_resolver(),
@@ -3117,7 +3111,6 @@ steps:
 "##,
     )
     .expect("parse lifecycle-fail workflow");
-
     let output = engine
         .invoke("wf-lifecycle-fail-1", wf, serde_json::json!({}))
         .await
@@ -3127,18 +3120,13 @@ steps:
         serde_json::json!("failed"),
         "the fixture run fails: {output}"
     );
-
     assert_eq!(
         phases(&seen),
         vec![RunPhase::Started, RunPhase::Running, RunPhase::Failed],
         "Started -> Running -> terminal Failed"
     );
-}
-
-/// No journal injected = no lifecycle claims (a journal-less embedding keeps
-/// its own lifecycle calls; the engine must not invent rows).
-#[tokio::test]
-async fn run_lifecycle_is_silent_without_a_journal() {
+    // No journal injected = no lifecycle claims (a journal-less embedding keeps
+    // its own lifecycle calls; the engine must not invent rows) — same matrix.
     let runner = lift_async(|_a: &Action| Ok(serde_json::json!({ "ok": true })));
     let engine =
         WorkflowEngine::local_with_async_effect_runner(Some(runner)).expect("journal-less engine");

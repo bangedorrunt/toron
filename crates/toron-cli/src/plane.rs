@@ -2278,30 +2278,23 @@ mod presence_env_tests {
     }
 
     #[test]
-    fn project_flag_wins_over_env() {
-        assert_eq!(
-            resolve_presence_project(
+    fn presence_project_precedence() {
+        // flag > env > blank-absent, one table (was 3 one-assert tests).
+        for (flag, env, want) in [
+            (
                 Some("flag-proj"),
-                &lookup(&env_map(&[("TORON_PROJECT", "env-proj")]))
+                vec![("TORON_PROJECT", "env-proj")],
+                Some("flag-proj"),
             ),
-            Some("flag-proj".to_string())
-        );
-    }
-
-    #[test]
-    fn project_falls_back_to_env() {
-        assert_eq!(
-            resolve_presence_project(None, &lookup(&env_map(&[("TORON_PROJECT", "env-proj")]))),
-            Some("env-proj".to_string())
-        );
-    }
-
-    #[test]
-    fn project_empty_env_is_absent() {
-        assert_eq!(
-            resolve_presence_project(None, &lookup(&env_map(&[("TORON_PROJECT", "  ")]))),
-            None
-        );
+            (None, vec![("TORON_PROJECT", "env-proj")], Some("env-proj")),
+            (None, vec![("TORON_PROJECT", "  ")], None),
+        ] {
+            assert_eq!(
+                resolve_presence_project(flag, &lookup(&env_map(&env))),
+                want.map(str::to_string),
+                "flag={flag:?} env={env:?}"
+            );
+        }
     }
 
     /// G6: quiescence returns fast once the claim set stops growing…
@@ -2342,60 +2335,41 @@ mod presence_env_tests {
     }
 
     #[test]
-    fn project_nothing_is_none() {
+    fn presence_project_and_as_precedence() {
+        // Project: nothing set is absent. Identity ladder: flag > TORON_AGENT
+        // > FLYWHEEL_MAIL_AS > AGENT_NAME > absent, one table (was 6 tests).
         assert_eq!(resolve_presence_project(None, &lookup(&env_map(&[]))), None);
-    }
-
-    #[test]
-    fn as_flag_wins_over_env() {
-        assert_eq!(
-            resolve_presence_as(
+        for (flag, env, want) in [
+            (
                 Some("FlagPin"),
-                &lookup(&env_map(&[("TORON_AGENT", "EnvPin")]))
+                vec![("TORON_AGENT", "EnvPin")],
+                Some("FlagPin"),
             ),
-            Some("FlagPin".to_string())
-        );
-    }
-
-    #[test]
-    fn as_ladder_toron_agent_first() {
-        assert_eq!(
-            resolve_presence_as(
+            (
                 None,
-                &lookup(&env_map(&[
+                vec![
                     ("TORON_AGENT", "FirstPin"),
                     ("FLYWHEEL_MAIL_AS", "SecondPin"),
                     ("AGENT_NAME", "ThirdPin"),
-                ]))
+                ],
+                Some("FirstPin"),
             ),
-            Some("FirstPin".to_string())
-        );
-    }
-
-    #[test]
-    fn as_ladder_flywheel_second() {
-        assert_eq!(
-            resolve_presence_as(
+            (
                 None,
-                &lookup(&env_map(&[
+                vec![
                     ("FLYWHEEL_MAIL_AS", "SecondPin"),
-                    ("AGENT_NAME", "ThirdPin")
-                ]))
+                    ("AGENT_NAME", "ThirdPin"),
+                ],
+                Some("SecondPin"),
             ),
-            Some("SecondPin".to_string())
-        );
-    }
-
-    #[test]
-    fn as_ladder_agent_name_third() {
-        assert_eq!(
-            resolve_presence_as(None, &lookup(&env_map(&[("AGENT_NAME", "ThirdPin")]))),
-            Some("ThirdPin".to_string())
-        );
-    }
-
-    #[test]
-    fn as_nothing_is_none() {
-        assert_eq!(resolve_presence_as(None, &lookup(&env_map(&[]))), None);
+            (None, vec![("AGENT_NAME", "ThirdPin")], Some("ThirdPin")),
+            (None, vec![], None),
+        ] {
+            assert_eq!(
+                resolve_presence_as(flag, &lookup(&env_map(&env))),
+                want.map(str::to_string),
+                "flag={flag:?} env={env:?}"
+            );
+        }
     }
 }

@@ -685,17 +685,13 @@ mod tests {
     use super::*;
     use crate::schema::parse_cron;
 
-    /// next_due finds a future tick for a valid expr; None for garbage.
+    /// next_due matrix: future tick, vixie Sunday-zero, strictly-after-from,
+    /// garbage-is-none. One test (was 4).
     #[test]
-    fn next_due_computes_future_tick() {
+    fn next_due_matrix() {
         let from = 1_700_000_000i64;
         let due = next_due("30 3 * * *", from).expect("valid expr yields a tick");
         assert!(due > from, "next tick is in the future");
-    }
-
-    /// next_due accepts the vixie Sunday-as-zero convention (0 and 7 → Sun).
-    #[test]
-    fn next_due_accepts_vixie_sunday_zero() {
         use chrono::{Datelike, Timelike};
         // Monday 2023-11-20 00:00 UTC. Sunday (0) → the Sunday after.
         let from = DateTime::parse_from_rfc3339("2023-11-20T00:00:00Z")
@@ -706,16 +702,12 @@ mod tests {
         assert_eq!(dt.weekday(), chrono::Weekday::Sun, "Sunday tick");
         assert_eq!(dt.hour(), 3);
         assert_eq!(dt.minute(), 30);
-    }
-
-    /// next_due skips ticks at-or-before `from` (strictly after).
-    #[test]
-    fn next_due_is_strictly_after_from() {
         let from = 1_700_000_000i64;
         let due = next_due("*/5 * * * *", from).expect("valid");
         assert!(due > from);
         let second = next_due("*/5 * * * *", due).expect("valid");
         assert!(second > due, "strictly increasing");
+        assert!(next_due("not a cron", 1_700_000_000).is_none());
     }
 
     /// normalize_cron accepts 5-field (prepends seconds=0 + vixie→crate dow)
@@ -724,12 +716,6 @@ mod tests {
     fn normalize_accepts_5_and_6_field() {
         assert_eq!(normalize_cron("30 3 * * 0"), "0 30 3 * * 1");
         assert_eq!(normalize_cron("0 30 3 * * 1"), "0 30 3 * * 1");
-    }
-
-    /// Unparsable expressions yield None (the loop parks, never spins).
-    #[test]
-    fn next_due_garbage_is_none() {
-        assert!(next_due("not a cron", 1_700_000_000).is_none());
     }
 
     /// bd-j32w conformance: the kernel selection agrees with the legacy
@@ -922,9 +908,10 @@ mod tests {
     }
 
     /// `due_tick(latest)`: downtime skipping several ticks fires ONLY the
-    /// most-recent due tick at-or-before now (never a burst).
+    /// `due_tick` catch-up matrix (latest vs skip, missed vs on-time).
+    /// One test (was 4).
     #[test]
-    fn due_tick_latest_catches_up_to_most_recent() {
+    fn due_tick_catchup_matrix() {
         use chrono::TimeZone;
         let base = chrono::Utc
             .with_ymd_and_hms(2023, 11, 20, 10, 0, 0)
@@ -934,43 +921,11 @@ mod tests {
         let now = base + 25 * 60;
         let caught = due_tick("*/10 * * * *", base, now, CronCatchup::Latest).unwrap();
         assert_eq!(caught, base + 20 * 60, "latest missed tick only");
-    }
-
-    /// `due_tick(latest)` on-time: the next scheduled tick in the future.
-    #[test]
-    fn due_tick_latest_on_time_is_next_tick() {
-        use chrono::TimeZone;
-        let base = chrono::Utc
-            .with_ymd_and_hms(2023, 11, 20, 10, 0, 0)
-            .unwrap()
-            .timestamp();
         let due = due_tick("*/10 * * * *", base, base + 60, CronCatchup::Latest).unwrap();
         assert_eq!(due, base + 600, "sleep to the next scheduled tick");
-    }
-
-    /// `due_tick(skip)`: missed ticks are NEVER fired — after downtime the
-    /// next tick is the first one after `now`.
-    #[test]
-    fn due_tick_skip_never_fires_missed() {
-        use chrono::TimeZone;
-        let base = chrono::Utc
-            .with_ymd_and_hms(2023, 11, 20, 10, 0, 0)
-            .unwrap()
-            .timestamp();
-        let now = base + 25 * 60;
         let due = due_tick("*/10 * * * *", base, now, CronCatchup::Skip).unwrap();
         assert!(due > now, "skips the 3 missed ticks, next is in the future");
         assert_eq!(due, base + 30 * 60);
-    }
-
-    /// `due_tick(skip)` on-time: unchanged (next scheduled tick).
-    #[test]
-    fn due_tick_skip_on_time_is_next_tick() {
-        use chrono::TimeZone;
-        let base = chrono::Utc
-            .with_ymd_and_hms(2023, 11, 20, 10, 0, 0)
-            .unwrap()
-            .timestamp();
         let due = due_tick("*/10 * * * *", base, base + 60, CronCatchup::Skip).unwrap();
         assert_eq!(due, base + 600);
     }
