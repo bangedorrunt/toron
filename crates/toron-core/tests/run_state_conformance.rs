@@ -160,14 +160,15 @@ async fn history_is_newest_first_and_honours_before_and_limit() {
             .expect("append");
     }
 
-    let all = s.history(T, None, 0).await.expect("history");
+    // A real bound, not 0: history refuses an unbounded read by design.
+    let all = s.history(T, None, 100).await.expect("history");
     assert_eq!(
         all.iter().map(|r| r.seq).collect::<Vec<_>>(),
         vec![5, 4, 3, 2, 1],
         "history is newest-first"
     );
 
-    let bounded = s.history(T, Some(3), 0).await.expect("history before");
+    let bounded = s.history(T, Some(3), 100).await.expect("history before");
     assert_eq!(
         bounded.iter().map(|r| r.seq).collect::<Vec<_>>(),
         vec![2, 1],
@@ -226,7 +227,7 @@ async fn prune_keeps_the_protected_boundary_and_deletes_strictly_below_it() {
         "seq 1..=3 are strictly below the floor"
     );
 
-    let left = s.history(T, None, 0).await.expect("history");
+    let left = s.history(T, None, 100).await.expect("history");
     assert_eq!(
         left.iter().map(|r| r.seq).collect::<Vec<_>>(),
         vec![5, 4],
@@ -273,6 +274,104 @@ async fn resume_uses_the_exact_boundary_then_falls_back_at_or_before() {
             .expect("unknown thread is a miss, not an error")
             .is_none(),
         "an unwritten thread has no resume seed"
+    );
+}
+
+#[tokio::test]
+async fn history_refuses_an_unbounded_read_instead_of_reading_everything() {
+    let (s, _p) = store("unbounded").await;
+    for seq in 1..=3 {
+        s.append(boundary(seq, seq * 1_000, &format!(r#"{{"n":{seq}}}"#)))
+            .await
+            .expect("append");
+    }
+
+    let err = s
+        .history(T, None, 0)
+        .await
+        .expect_err("limit=0 must not silently mean everything");
+    assert!(
+        err.to_string().contains("positive limit"),
+        "the refusal names the real constraint: {err}"
+    );
+    // And a negative bound is equally refused rather than coerced.
+    assert!(
+        s.history(T, None, -5).await.is_err(),
+        "a negative limit is a caller bug, not a cap"
+    );
+}
+
+// --- 11. construction failure is a distinct outcome ----------------------
+
+#[tokio::test]
+async fn a_store_over_an_unmigrated_index_fails_loud_rather_than_reading_empty() {
+    // CONSTRUCTION FAILURE, scripted: a pool that never got `migrate` applied.
+    // The store must surface a real SQL error naming the missing table — NOT
+    // return None, which would read as "this thread has no checkpoints" and
+    // invite a resume from nothing.
+    let path = std::env::temp_dir().join(format!(
+        "toron-run-state-conf-unmigrated-{}.sqlite",
+        uuid::Uuid::new_v4()
+    ));
+    let pool = schema::connect(path.to_str().expect("utf-8 path"))
+        .await
+        .expect("connect");
+    let s = RunStateStore::new(pool);
+
+    let err = s.latest(T).await.expect_err("unmigrated index must fail");
+    let text = err.to_string();
+    assert!(
+        text.contains("run_state_checkpoints") || text.contains("no such table"),
+        "the error names the missing relation so the operator knows to migrate: {text}"
+    );
+}
+
+// --- 12. an interrupted prune leaves the protected floor intact ----------
+
+#[tokio::test]
+async fn a_prune_that_cannot_complete_leaves_the_protected_floor_intact() {
+    let (s, _p) = store("prune-fail").await;
+    for seq in 1..=4 {
+        s.append(boundary(seq, seq * 1_000, &format!(r#"{{"n":{seq}}}"#)))
+            .await
+            .expect("append");
+    }
+
+    // INTERRUPTION, scripted at the storage layer: make the DELETE impossible,
+    // then prove the floor and everything above it are still readable. A prune
+    // is one atomic statement, so a failure must leave the log exactly as it
+    // was — never half-deleted with the resume point gone.
+    sqlx::query("DROP TABLE run_state_checkpoints")
+        .execute(s.pool())
+        .await
+        .expect("script the outage");
+
+    assert!(
+        s.prune_before(T, 3).await.is_err(),
+        "a prune that cannot run reports failure"
+    );
+    assert!(
+        s.get(T, 3).await.is_err(),
+        "the store stays broken rather than reporting an empty thread"
+    );
+    // A fresh store over an intact index is unaffected: the outage was ours,
+    // not the log's.
+    let (fresh, _p2) = store("prune-fail-control").await;
+    for seq in 1..=4 {
+        fresh
+            .append(boundary(seq, seq * 1_000, &format!(r#"{{"n":{seq}}}"#)))
+            .await
+            .expect("append");
+    }
+    let counts = fresh.prune_before(T, 3).await.expect("prune");
+    assert_eq!(
+        counts.checkpoints, 2,
+        "seq 1..=2 are strictly below the floor"
+    );
+    assert_eq!(
+        fresh.latest(T).await.expect("latest").expect("row").seq,
+        4,
+        "the newest boundary survives a prune that respects its floor"
     );
 }
 
