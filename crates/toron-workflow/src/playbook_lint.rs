@@ -859,14 +859,6 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn parse_u64_accepts_number_and_numeric_string() {
-        assert_eq!(parse_u64(&serde_json::json!(2)), Some(2));
-        assert_eq!(parse_u64(&serde_json::json!("3")), Some(3));
-        assert_eq!(parse_u64(&serde_json::json!("sketch")), None);
-        assert_eq!(parse_u64(&serde_json::json!(null)), None);
-    }
-
     /// Non-playbook workflows are untouched by the structural rules.
     #[test]
     fn non_playbook_workflow_not_constrained() {

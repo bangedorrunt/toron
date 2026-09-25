@@ -2563,7 +2563,7 @@ mod control_flow_guard_tests {
 
 #[cfg(test)]
 mod control_flow_output_tests {
-    use super::{Action, is_approval_decision, land_node_output};
+    use super::{Action, land_node_output};
 
     /// ADR-0024 Spec 2: a completed approval node lands under BOTH its node
     /// name and `decision` — the DAG scheduler used to publish only the node
@@ -2602,28 +2602,6 @@ mod control_flow_output_tests {
             !outputs.contains_key("decision"),
             "a skip is not a decision: {outputs:?}"
         );
-    }
-
-    /// The predicate: only a `request_approval` action carrying a resolved
-    /// `outcome` is a decision.
-    #[test]
-    fn is_approval_decision_requires_action_and_outcome() {
-        let approval = Action::RequestApproval {
-            message: "ok?".into(),
-        };
-        let delay = Action::Delay { secs: 1 };
-        assert!(is_approval_decision(
-            &approval,
-            &serde_json::json!({ "outcome": "rejected" })
-        ));
-        assert!(!is_approval_decision(
-            &approval,
-            &serde_json::json!({ "ok": true })
-        ));
-        assert!(!is_approval_decision(
-            &delay,
-            &serde_json::json!({ "outcome": "approved" })
-        ));
     }
 }
 

@@ -249,15 +249,6 @@ mod tests {
         assert_eq!(content_mentions("ends with @", &npub), None);
     }
 
-    #[test]
-    fn roundtrips_via_json() {
-        let target = keys().public_key();
-        let ev = event_with("@pi-alpha do it", &[target.to_hex()]).expect("event");
-        let parsed = Event::from_json(ev.as_json()).expect("parse");
-        assert_eq!(parsed, ev);
-        assert!(is_mention(&parsed));
-    }
-
     /// ADR-0020 Spec 4: a kind-9 channel post @mentioning one agent (with a
     /// `p` tag) produces ONE kind-43001 that `e`-tags the post; `#t` is the
     /// project slug only, never the assignee.

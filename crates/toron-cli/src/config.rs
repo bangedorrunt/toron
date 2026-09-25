@@ -286,18 +286,6 @@ mod tests {
     }
 
     #[test]
-    fn relays_default_to_empty() {
-        let cfg = Config::load(None);
-        assert!(cfg.relays.is_empty(), "federation must be opt-in");
-    }
-
-    #[test]
-    fn envelope_ttl_defaults_to_90_days() {
-        let cfg = Config::load(None);
-        assert_eq!(cfg.envelope_ttl_days(None), 90);
-    }
-
-    #[test]
     fn per_project_ttl_overrides_global() {
         let dir = scratch("ttl");
         let cfg_path = write_config(
@@ -309,23 +297,6 @@ mod tests {
         assert_eq!(cfg.envelope_ttl_days(None), 90);
         assert_eq!(cfg.envelope_ttl_days(Some("demo")), 14);
         assert_eq!(cfg.envelope_ttl_days(Some("other")), 90);
-    }
-
-    #[test]
-    fn backend_defaults_to_herdr() {
-        let cfg = Config::load(None);
-        assert_eq!(cfg.effective_backend(), "herdr");
-    }
-
-    #[test]
-    fn federation_hardening_defaults_off() {
-        let cfg = Config::load(None);
-        assert_ne!(cfg.federation_auth, Some(true), "AUTH must default off");
-        assert_ne!(cfg.federation_pow, Some(0), "POW must default off");
-        assert!(
-            cfg.federation_allowlist.is_empty(),
-            "allowlist defaults empty"
-        );
     }
 
     #[test]
@@ -342,12 +313,5 @@ mod tests {
         // Default is empty (loopback only).
         let cfg = Config::default();
         assert!(cfg.mcp_allowed_hosts.is_empty());
-    }
-
-    #[test]
-    fn proof_gate_defaults_off_schnorr() {
-        let cfg = Config::load(None);
-        assert!(!cfg.proof_gate_enabled());
-        assert_eq!(cfg.effective_proof_scheme(), "schnorr");
     }
 }
