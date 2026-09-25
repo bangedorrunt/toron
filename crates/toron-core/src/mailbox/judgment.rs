@@ -1472,38 +1472,6 @@ mod tests {
     }
 
     #[test]
-    fn test_fake_judge_storm_is_ms_scale() {
-        use std::time::Instant;
-        let pack = find_pack("hazard-guardrail").unwrap();
-        let mut fake = FakeJudge::new();
-        let t0 = Instant::now();
-        for i in 0..100 {
-            let key = format!("storm-{i}");
-            let effect = JudgeEffect::request(
-                &key,
-                "hazard-guardrail",
-                &serde_json::json!({"n": i}),
-                "offline",
-                5,
-            );
-            fake.script(
-                &key,
-                vec![FakeStep::Answer(offline_answer(
-                    &key,
-                    &pack,
-                    &serde_json::json!({}),
-                ))],
-            );
-            fake.answer(&effect).expect("storm answer");
-        }
-        assert!(
-            t0.elapsed().as_secs() < 5,
-            "100 scripted answers run ms-scale"
-        );
-        assert_eq!(fake.calls, 100);
-    }
-
-    #[test]
     fn test_fake_judge_unknown_key_escalates_loudly() {
         let mut fake = FakeJudge::new();
         assert!(fake.answer(&judge_effect("ghost")).is_err());

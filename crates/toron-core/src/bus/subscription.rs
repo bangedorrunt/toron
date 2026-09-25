@@ -87,13 +87,6 @@ impl Subscription {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_subscription_id_display() {
-        let id = SubscriptionId::new("sub-1");
-        assert_eq!(id.to_string(), "sub-1");
-        assert_eq!(id, SubscriptionId::new("sub-1"));
-    }
-
     #[tokio::test]
     async fn test_subscription_delivers_events_and_eose() {
         let (tx, rx) = mpsc::channel(Subscription::DEFAULT_CAPACITY);

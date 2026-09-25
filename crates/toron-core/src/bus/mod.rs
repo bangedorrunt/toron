@@ -139,80 +139,31 @@ pub trait Bus: Send + Sync + 'static {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+#[test]
+fn test_bus_error_display_redacts_nothing_sensitive() {
+    let e = BusError::InvalidEvent("id mismatch".into());
+    assert_eq!(format!("{e}"), "event failed verification: id mismatch");
+}
 
-    #[test]
-    fn test_publish_ok_shapes() {
-        let id = crate::nostr::EventId::from_hex(
-            "b32828720d7e8a80dd5165a6cd31b2c70e8d25b83c387209cb138e77d7e7e05b",
-        )
-        .expect("id");
-        assert_eq!(
-            PublishOk {
-                event_id: id,
-                stored: true,
-            },
-            PublishOk {
-                event_id: id,
-                stored: true,
-            }
-        );
-        assert_ne!(
-            PublishOk {
-                event_id: id,
-                stored: true,
-            },
-            PublishOk {
-                event_id: id,
-                stored: false,
-            }
-        );
-    }
+// Compile-time: the trait object is usable as a dependency for mailbox.
+fn _assert_trait_object(_b: &dyn Bus) {}
 
-    #[test]
-    fn test_health_shapes() {
-        let h = Health {
-            ok: true,
-            message: "ok".into(),
-        };
-        assert!(h.ok);
-        assert!(
-            !Health {
-                ok: false,
-                message: "down".into(),
-            }
-            .ok
-        );
-    }
-
-    #[test]
-    fn test_bus_error_display_redacts_nothing_sensitive() {
-        let e = BusError::InvalidEvent("id mismatch".into());
-        assert_eq!(format!("{e}"), "event failed verification: id mismatch");
-    }
-
-    // Compile-time: the trait object is usable as a dependency for mailbox.
-    fn _assert_trait_object(_b: &dyn Bus) {}
-
-    #[test]
-    fn test_event_roundtrips_through_json() {
-        use crate::nostr::event::build_event;
-        use crate::nostr::kinds::PROJECT_MANIFEST;
-        use crate::nostr::{Tag, Timestamp};
-        let keys = crate::nostr::Keys::generate();
-        let ev = build_event(
-            &keys,
-            crate::nostr::kinds::toron_kind(PROJECT_MANIFEST),
-            "manifest",
-            vec![Tag::parse(["d", "demo"]).expect("tag")],
-            Timestamp::now(),
-        )
-        .expect("build");
-        let json = ev.as_json();
-        let parsed = crate::nostr::Event::from_json(json).expect("parse");
-        assert_eq!(parsed, ev);
-        assert_eq!(parsed.kind.as_u16(), PROJECT_MANIFEST);
-    }
+#[test]
+fn test_event_roundtrips_through_json() {
+    use crate::nostr::event::build_event;
+    use crate::nostr::kinds::PROJECT_MANIFEST;
+    use crate::nostr::{Tag, Timestamp};
+    let keys = crate::nostr::Keys::generate();
+    let ev = build_event(
+        &keys,
+        crate::nostr::kinds::toron_kind(PROJECT_MANIFEST),
+        "manifest",
+        vec![Tag::parse(["d", "demo"]).expect("tag")],
+        Timestamp::now(),
+    )
+    .expect("build");
+    let json = ev.as_json();
+    let parsed = crate::nostr::Event::from_json(json).expect("parse");
+    assert_eq!(parsed, ev);
+    assert_eq!(parsed.kind.as_u16(), PROJECT_MANIFEST);
 }

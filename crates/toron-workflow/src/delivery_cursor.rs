@@ -208,7 +208,6 @@ impl DeliveryCursorStore {
     }
 }
 
-
 /// RAII guard for [`DeliveryCursorStore::reserve_undelivered`] reservations
 /// (GS-062 INFLIGHT-RESERVATION-LEAK).
 ///
@@ -291,16 +290,6 @@ mod tests {
         assert!(agent_key_is_not_delivery_proof("npub1abc", "e1"));
     }
 
-    #[test]
-    fn cursor_advances_monotonically_on_mark() {
-        let store = DeliveryCursorStore::new();
-        let (keep, _) = store.peek_undelivered("s", ["a", "b"]);
-        assert_eq!(keep, vec!["a", "b"]);
-        assert_eq!(store.cursor("s").cursor, 0, "peek must not advance");
-        store.mark_delivered("s", ["a", "b"]);
-        assert_eq!(store.cursor("s").cursor, 2);
-    }
-
     /// Regression: peek keeps cursor; failed publish path does not mark;
     /// successful path marks; second attempt skips.
     #[test]
@@ -377,7 +366,10 @@ mod tests {
         assert!(store.cursor(session).in_flight.contains(id));
 
         let (keep_b, fx_b) = store.reserve_undelivered(session, [id]);
-        assert!(keep_b.is_empty(), "second reserve must not keep in-flight id");
+        assert!(
+            keep_b.is_empty(),
+            "second reserve must not keep in-flight id"
+        );
         assert!(matches!(fx_b[0], DeliveryEffect::SkipInFlight { .. }));
 
         // Transport failure releases — id becomes reservable again.

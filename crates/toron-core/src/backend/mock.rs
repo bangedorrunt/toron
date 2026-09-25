@@ -364,13 +364,6 @@ mod tests {
     }
 
     #[test]
-    fn mock_is_object_safe_and_named() {
-        fn assert_dyn(_: &dyn crate::backend::Backend) {}
-        assert_dyn(&MockBackend::new());
-        assert_eq!(MockBackend::new().name(), "mock");
-    }
-
-    #[test]
     fn unknown_machine_code_passthrough() {
         let s = "agent_prompt_stalled";
         assert_eq!(

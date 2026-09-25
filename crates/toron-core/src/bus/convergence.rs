@@ -221,13 +221,7 @@ mod tests {
         );
         // Prior Pending must stay held — not collapse to Fenced (one-shot bug).
         assert!(
-            matches!(
-                s2,
-                Some(Convergence::Pending {
-                    generation: 7,
-                    ..
-                })
-            ),
+            matches!(s2, Some(Convergence::Pending { generation: 7, .. })),
             "expected Pending held, got {s2:?}"
         );
         // Second mismatched ReAdd still fences under held Pending.
@@ -241,10 +235,7 @@ mod tests {
         );
         assert!(matches!(
             s3,
-            Some(Convergence::Pending {
-                generation: 7,
-                ..
-            })
+            Some(Convergence::Pending { generation: 7, .. })
         ));
     }
 
@@ -263,10 +254,7 @@ mod tests {
         let (s, _) = tick(s.as_ref(), &ConvergenceMsg::Commit);
         assert!(matches!(
             s,
-            Some(Convergence::Committed {
-                generation: 7,
-                ..
-            })
+            Some(Convergence::Committed { generation: 7, .. })
         ));
         let (s2, fx1) = tick(s.as_ref(), &ConvergenceMsg::ReAdd { generation: 8 });
         assert_eq!(
@@ -278,10 +266,7 @@ mod tests {
         );
         assert!(matches!(
             s2,
-            Some(Convergence::Committed {
-                generation: 7,
-                ..
-            })
+            Some(Convergence::Committed { generation: 7, .. })
         ));
         let (s3, fx2) = tick(s2.as_ref(), &ConvergenceMsg::ReAdd { generation: 99 });
         assert_eq!(
@@ -293,10 +278,7 @@ mod tests {
         );
         assert!(matches!(
             s3,
-            Some(Convergence::Committed {
-                generation: 7,
-                ..
-            })
+            Some(Convergence::Committed { generation: 7, .. })
         ));
     }
 

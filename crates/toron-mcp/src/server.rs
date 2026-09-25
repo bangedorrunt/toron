@@ -518,7 +518,7 @@ pub async fn serve_stdio() -> anyhow::Result<()> {
 /// The served handler carries the 38 AM-Rust parity tools (bd-led.7.2).
 pub async fn router() -> anyhow::Result<axum::Router> {
     let (mailbox, trigger_rx) = demo_mailbox_with_trigger().await?;
-    router_with_mailbox(mailbox, trigger_rx).await
+    router_with_mailbox(mailbox, trigger_rx, &[]).await
 }
 
 /// bd-6wfv: [`router`] against an EXPLICIT data dir + operator key — no
@@ -533,12 +533,53 @@ pub async fn router_with_isolated(
     let (tx, trigger_rx) = tokio::sync::mpsc::unbounded_channel();
     let mailbox =
         build_mailbox_with_opts(Some(tx), data_dir, operator_key_path, operator_passphrase).await?;
-    router_with_mailbox(mailbox, trigger_rx).await
+    router_with_mailbox(mailbox, trigger_rx, &[]).await
+}
+
+/// Extra `Host` values the MCP-over-HTTP transport accepts, beyond the
+/// loopback defaults (`localhost`, `127.0.0.1`, `::1`).
+///
+/// Sources, merged and de-duplicated: `extra` (the caller — `toron serve`
+/// passes `mcp_allowed_hosts` from config.toml), then `TORON_MCP_ALLOWED_HOSTS`
+/// (comma-separated env, highest precedence). Each hostname is also admitted
+/// with an explicit `:443` authority since TLS-terminating proxies differ on
+/// whether they forward the port.
+pub fn resolve_allowed_hosts(extra: &[String]) -> Vec<String> {
+    let mut hosts = vec![
+        "localhost".to_string(),
+        "127.0.0.1".to_string(),
+        "::1".to_string(),
+    ];
+    let mut push = |h: &str| {
+        let h = h.trim();
+        if h.is_empty() {
+            return;
+        }
+        if !hosts.iter().any(|e| e == h) {
+            hosts.push(h.to_string());
+        }
+        if !h.contains(':') {
+            let with_port = format!("{h}:443");
+            if !hosts.iter().any(|e| e == &with_port) {
+                hosts.push(with_port);
+            }
+        }
+    };
+    for h in extra {
+        push(h);
+    }
+    if let Ok(env) = std::env::var("TORON_MCP_ALLOWED_HOSTS") {
+        for h in env.split(',') {
+            push(h);
+        }
+    }
+    hosts
 }
 
 async fn router_with_mailbox(
     mailbox: toron_core::mailbox::Mailbox,
     trigger_rx: tokio::sync::mpsc::UnboundedReceiver<toron_core::mailbox::unwrap::UnwrappedMail>,
+    extra_hosts: &[String],
 ) -> anyhow::Result<axum::Router> {
     spawn_mail_trigger_host(mailbox.clone(), trigger_rx);
     let server = ToronServer::new().with_mailbox(mailbox);
@@ -546,13 +587,17 @@ async fn router_with_mailbox(
     // (SEP-2567). The previous default (legacy true) accumulated
     // LocalSessionManager sessions for every MCP client and never expired
     // them; overnight that was part of the 16GB launchd RSS climb.
+    // Tailnet: `tailscale serve` forwards the Tailnet Host, so the rmcp
+    // DNS-rebinding guard must admit `mcp_allowed_hosts` or every proxied
+    // request 403s with "Host header is not allowed".
     let service: StreamableHttpService<ToronServer, LocalSessionManager> =
         StreamableHttpService::new(
             move || Ok(server.clone()),
             Arc::new(LocalSessionManager::default()),
             StreamableHttpServerConfig::default()
                 .with_json_response(true)
-                .with_legacy_session_mode(false),
+                .with_legacy_session_mode(false)
+                .with_allowed_hosts(resolve_allowed_hosts(extra_hosts)),
         );
     // ADR-0006 (bd-esh.5): mount the Blossom blob-serving surface at
     // `/.blossom` (BUD-01 retrieval + BUD-02 upload) over a per-daemon blob
@@ -566,8 +611,9 @@ async fn router_with_mailbox(
 }
 
 /// Serve the toron MCP server over Streamable HTTP on `bind_addr`
-/// (e.g. `127.0.0.1:8000`).
-pub async fn serve_http(bind_addr: &str) -> anyhow::Result<()> {
+/// (e.g. `127.0.0.1:8000`). `extra_hosts` admits Tailnet/proxy `Host`
+/// values (`mcp_allowed_hosts` from config.toml); loopback is always allowed.
+pub async fn serve_http(bind_addr: &str, extra_hosts: &[String]) -> anyhow::Result<()> {
     let (mailbox, trigger_rx) = demo_mailbox_with_trigger().await?;
     // bd-741i: refuse a second writer on this data dir *before* binding so
     // a flywheel sidecar `toron serve --mcp-http <other-port>` cannot open
@@ -601,7 +647,11 @@ pub async fn serve_http(bind_addr: &str) -> anyhow::Result<()> {
     // address (a healthy HttpPeer instance already returned above and keeps
     // its own sidecar); held across the serve await — drop removes the file.
     let _wake = start_wake_sidecar(&mailbox).await;
-    axum::serve(listener, router_with_mailbox(mailbox, trigger_rx).await?).await?;
+    axum::serve(
+        listener,
+        router_with_mailbox(mailbox, trigger_rx, extra_hosts).await?,
+    )
+    .await?;
     Ok(())
 }
 

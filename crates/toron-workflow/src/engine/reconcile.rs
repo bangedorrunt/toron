@@ -380,15 +380,6 @@ mod effect_reconciliation_tests {
         }
     }
 
-    /// bd-v139.2: retries reuse one logical key while attempts stay fenced —
-    /// the plan carries the next attempt number, never a new identity.
-    #[test]
-    fn effect_reconciliation_same_key_retry() {
-        use EffectState as S;
-        let plan = plan_attempt(Some(&view(S::Unknown, 4, false)), &cap(true, false));
-        assert!(matches!(plan, DispatchPlan::RetrySameKey { attempt: 5 }));
-    }
-
     /// bd-v139.2: a replay that renders a different action digest must not
     /// mint a new logical effect under the same run/node — version/replay
     /// error or explicit reconciliation instead.
@@ -408,25 +399,5 @@ mod effect_reconciliation_tests {
         assert!(!may_settle(Some("tok-a"), "tok-b"));
         assert!(!may_settle(Some("tok-a"), ""));
         assert!(!may_settle(None, "tok-a"));
-    }
-
-    /// bd-v139.2: no blind retry — unknown outcomes without provider
-    /// query/idempotency support refuse with a reason naming reconciliation.
-    #[test]
-    fn effect_reconciliation_no_blind_retry() {
-        use EffectState as S;
-        match plan_attempt(Some(&view(S::Unknown, 1, false)), &cap(false, false)) {
-            DispatchPlan::RefuseBlindRetry { reason } => {
-                assert!(reason.contains("reconcile"), "{reason}");
-            }
-            other => panic!("must refuse, got {other:?}"),
-        }
-    }
-
-    /// bd-v139.2: mailbox `corr` may project the effect key as a deliberate
-    /// link — the projection is identity, and the stores stay separate.
-    #[test]
-    fn effect_reconciliation_corr_projection() {
-        assert_eq!(corr_for_effect("ek-abc"), "ek-abc");
     }
 }

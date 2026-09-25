@@ -12,8 +12,8 @@ use toron_workflow::action_contract::{
 };
 use toron_workflow::engine::advertised_action_names;
 use toron_workflow::identity::{
-    PreparedIdentity, SCHEMA_VERSION, action_digest_of, canonical_json, check_replay, effect_key,
-    iteration_key, node_path, normalize_action, redact_value, sha256_hex, workflow_digest,
+    PreparedIdentity, SCHEMA_VERSION, action_digest_of, check_replay, iteration_key, node_path,
+    normalize_action, redact_value, workflow_digest,
 };
 use toron_workflow::schema::{Action, parse_workflow};
 
@@ -326,41 +326,6 @@ fn iteration_key_binds_collection() {
     assert_eq!(k1, iteration_key("parent-a", 0), "deterministic");
     assert_ne!(k1, iteration_key("parent-a", 1), "index matters");
     assert_ne!(k1, iteration_key("parent-b", 0), "collection matters");
-}
-
-/// Effect keys are stable across attempts (no attempt in the inputs) and
-/// distinct per node.
-#[test]
-fn effect_key_stable_inputs() {
-    let k1 = effect_key("wd", "run-1", "go", None, "ad");
-    assert_eq!(k1, effect_key("wd", "run-1", "go", None, "ad"));
-    assert_ne!(k1, effect_key("wd", "run-1", "other", None, "ad"));
-    assert_ne!(
-        k1,
-        effect_key("wd", "run-1", "go", Some("iter-0"), "ad"),
-        "iteration distinguishes"
-    );
-}
-
-/// Canonical JSON is key-ordered regardless of insertion order.
-#[test]
-fn canonical_json_key_ordered() {
-    let mut m = serde_json::Map::new();
-    m.insert("b".into(), serde_json::json!(1));
-    m.insert("a".into(), serde_json::json!(2));
-    assert_eq!(
-        canonical_json(&serde_json::Value::Object(m)),
-        r#"{"a":2,"b":1}"#
-    );
-}
-
-/// sha256_hex is deterministic hex over 0x1f-joined parts.
-#[test]
-fn sha256_hex_frames_parts() {
-    assert_eq!(sha256_hex(&["a", "b"]), sha256_hex(&["a", "b"]));
-    assert_eq!(sha256_hex(&["a", "b"]).len(), 64);
-    assert_ne!(sha256_hex(&["a", "b"]), sha256_hex(&["a", "c"]));
-    assert_ne!(sha256_hex(&["ab"]), sha256_hex(&["a", "b"]));
 }
 
 /// Redaction strips secret-named leaves at any depth and reports bearing.

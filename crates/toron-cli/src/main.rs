@@ -62,7 +62,7 @@ fn run(cli: &Cli) -> anyhow::Result<ExitCode> {
 
     let code = match command {
         Command::Serve(args) => {
-            run_serve(args, format, color)?;
+            run_serve(args, &cfg, format, color)?;
             ExitCode::SUCCESS
         }
         Command::Status => {
@@ -281,6 +281,7 @@ async fn run_bench(args: &cli::BenchArgs, format: OutputFormat) -> anyhow::Resul
 #[tokio::main]
 async fn run_serve(
     args: &cli::ServeArgs,
+    cfg: &Config,
     _format: OutputFormat,
     _color: ColorChoice,
 ) -> anyhow::Result<()> {
@@ -295,7 +296,7 @@ async fn run_serve(
         tracing::info!("toron MCP server on stdio");
         toron_mcp::serve_stdio().await
     } else if let Some(addr) = &args.mcp_http {
-        toron_mcp::serve_http(addr).await
+        toron_mcp::serve_http(addr, &cfg.mcp_allowed_hosts).await
     } else {
         anyhow::bail!("serve requires --mcp-stdio or --mcp-http <addr>")
     }

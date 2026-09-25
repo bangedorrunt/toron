@@ -39,6 +39,12 @@ envelope_ttl_days = 90
 # federation_pow = 20               # NIP-13 POW difficulty
 # federation_allowlist = ["wss://trusted-relay.example.com"]
 
+# MCP-over-HTTP Host allowlist (rmcp DNS-rebinding guard). Loopback is always
+# allowed; add Tailnet service names here when fronting with `tailscale serve`
+# (it forwards the Tailnet Host, which rmcp would otherwise 403).
+# mcp_allowed_hosts = ["toron.alpine-tilapia.ts.net"]
+# Env override (comma-separated): TORON_MCP_ALLOWED_HOSTS
+
 # --- Keyring priority (open Q #2, resolved as recommended) ---
 # Key material is unlocked in this order at process start:
 #   1. macOS Keychain

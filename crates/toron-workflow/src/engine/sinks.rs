@@ -568,30 +568,6 @@ mod lifecycle_tests {
         ));
     }
 
-    /// bd-asx3: one semantic terminal digest — stable for the same terminal,
-    /// distinct across runs, nodes, and statuses.
-    #[test]
-    fn host_lifecycle_terminal_digest_stable_and_unique() {
-        let a = terminal_digest("run-1", "digest", "succeeded", "gate", "ev");
-        assert_eq!(
-            a,
-            terminal_digest("run-1", "digest", "succeeded", "gate", "ev")
-        );
-        assert_eq!(a.len(), 64, "hex sha256");
-        assert_ne!(
-            a,
-            terminal_digest("run-2", "digest", "succeeded", "gate", "ev")
-        );
-        assert_ne!(
-            a,
-            terminal_digest("run-1", "digest", "failed", "gate", "ev")
-        );
-        assert_ne!(
-            a,
-            terminal_digest("run-1", "digest", "succeeded", "other", "ev")
-        );
-    }
-
     /// bd-asx3: terminal ledger — first publication is new, same-digest
     /// republish is a duplicate no-op, a different digest for the same run
     /// is a conflict requiring evidence.

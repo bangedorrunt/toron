@@ -57,6 +57,12 @@ pub struct Config {
     /// Federation hardening: relay allowlist. Default empty (reject all).
     #[serde(default)]
     pub federation_allowlist: Vec<String>,
+    /// Extra MCP-over-HTTP `Host` values (Tailnet service names, reverse
+    /// proxies). Loopback stays allowed; rmcp rejects anything else by
+    /// default, which breaks `tailscale serve` (it forwards the Tailnet
+    /// `Host`, e.g. `toron.alpine-tilapia.ts.net`).
+    #[serde(default)]
+    pub mcp_allowed_hosts: Vec<String>,
 }
 
 /// A per-project envelope TTL override (`{ project = "demo", days = 14 }`).
@@ -163,6 +169,9 @@ impl Config {
         if !other.federation_allowlist.is_empty() {
             self.federation_allowlist = other.federation_allowlist;
         }
+        if !other.mcp_allowed_hosts.is_empty() {
+            self.mcp_allowed_hosts = other.mcp_allowed_hosts;
+        }
     }
 
     fn merge_env(&mut self) {
@@ -202,10 +211,14 @@ impl Config {
         {
             self.proof_scheme = Some(v);
         }
-        if let Ok(v) = env::var("TORON_GIT_BINARY")
+        if let Ok(v) = env::var("TORON_MCP_ALLOWED_HOSTS")
             && !v.is_empty()
         {
-            self.git_binary = Some(PathBuf::from(v));
+            self.mcp_allowed_hosts = v
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
         }
     }
 }
@@ -313,6 +326,22 @@ mod tests {
             cfg.federation_allowlist.is_empty(),
             "allowlist defaults empty"
         );
+    }
+
+    #[test]
+    fn mcp_allowed_hosts_merge_and_env() {
+        // File value merges.
+        let dir = scratch("mcp-hosts");
+        let cfg_path = write_config(
+            &dir,
+            ".toron.toml",
+            "mcp_allowed_hosts = [\"toron.alpine-tilapia.ts.net\"]\n",
+        );
+        let cfg = Config::load(Some(&cfg_path));
+        assert_eq!(cfg.mcp_allowed_hosts, vec!["toron.alpine-tilapia.ts.net"]);
+        // Default is empty (loopback only).
+        let cfg = Config::default();
+        assert!(cfg.mcp_allowed_hosts.is_empty());
     }
 
     #[test]

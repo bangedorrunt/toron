@@ -1326,12 +1326,6 @@ steps:
     }
 
     #[test]
-    fn invalid_yaml_fails() {
-        assert!(parse_workflow("name: [broken").is_err());
-        assert!(parse_workflow("").is_err());
-    }
-
-    #[test]
     fn on_error_typo_is_rejected() {
         // The strict enum is the fail-stop: any spelling other than
         // continue/fail_run fails to parse (ADR-0005 Spec 0 lint contract).

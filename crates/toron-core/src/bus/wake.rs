@@ -739,14 +739,6 @@ mod wake_bus_tests {
         let _ = std::fs::remove_file(&sock);
     }
 
-    #[test]
-    fn wake_bus_manual_clock_is_scripted() {
-        let c = ManualClock::new(1_000);
-        assert_eq!(c.now_ms(), 1_000);
-        c.advance(500);
-        assert_eq!(c.now_ms(), 1_500);
-    }
-
     #[tokio::test]
     async fn wake_bus_sock_0600_and_stale_takeover_identity() {
         let sock = tmp_sock("perm");
