@@ -2986,7 +2986,6 @@ mod tests {
                     name: Some("rec".into()),
                     guard: None,
                     on_error: StepOnError::Continue,
-                    error_kinds: Vec::new(),
                     build_slot: false,
                     action: Action::SendMessage {
                         to: vec!["nobody".into()],
@@ -4999,7 +4998,6 @@ steps:
             name: None,
             guard: None,
             on_error: StepOnError::Continue,
-            error_kinds: vec![],
             build_slot: false,
             action: Action::Delay { secs: 0 },
         };

@@ -2425,7 +2425,6 @@ pub async fn run_graph_node(
             name: None,
             guard: None,
             on_error: crate::schema::StepOnError::Continue,
-            error_kinds: Vec::new(),
             build_slot: false,
             action: input.action,
         };
