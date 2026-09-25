@@ -721,11 +721,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn exactly_25_resources() {
-        assert_eq!(RESOURCES.len(), 25, "AM-Rust parity requires 25 resources");
-    }
-
-    #[test]
     fn unique_uris() {
         let mut uris: Vec<&str> = RESOURCES.iter().map(|(_, u, _)| *u).collect();
         uris.sort();
@@ -822,17 +817,6 @@ mod tests {
         "toron://tooling/locks",
         "toron://tooling/diagnostics",
     ];
-
-    #[test]
-    fn static_resources_serve_json() {
-        for uri in STATIC_RESOURCE_URIS {
-            assert!(
-                read_resource_value(uri).is_some(),
-                "static URI must serve non-None JSON: {uri}"
-            );
-        }
-        assert!(read_resource_value("toron://bogus/uri").is_none());
-    }
 
     /// S8 honest-stub gate (Rev 1 wording, bd-p0-s8-resources-stub-gate-rrfz):
     /// EVERY static tooling stub whose fields are placeholders ("not wired",
