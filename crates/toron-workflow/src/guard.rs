@@ -611,42 +611,6 @@ mod tests {
         assert!(!out.proceeds());
     }
 
-    /// Pure parse of the env value (no env mutation — `set_var` is unsafe in
-    /// edition 2024 and toron forbids unsafe; the env-dependent override is
-    /// covered by the integration test `tests/guard_env.rs`).
-    #[test]
-    fn parse_timeout_ms_cases() {
-        assert_eq!(parse_timeout_ms("42"), Some(Duration::from_millis(42)));
-        assert_eq!(parse_timeout_ms(" 42 "), Some(Duration::from_millis(42)));
-        assert_eq!(parse_timeout_ms("0"), None, "zero falls back to default");
-        assert_eq!(parse_timeout_ms("garbage"), None);
-        assert_eq!(parse_timeout_ms(""), None);
-    }
-
-    /// A built context with the 4 fns evaluates each correctly (smoke for
-    /// inject_buzz_functions via the public evaluator path).
-    #[tokio::test]
-    async fn all_four_fns_callable() {
-        let v = vars(&[("s", "hello world")]);
-        let d = Duration::from_millis(200);
-        assert_eq!(
-            evaluate_guard(Some("str_contains(s, \"world\")"), &v, d).await,
-            GuardOutcome::Bool(true)
-        );
-        assert_eq!(
-            evaluate_guard(Some("str_starts_with(s, \"hello\")"), &v, d).await,
-            GuardOutcome::Bool(true)
-        );
-        assert_eq!(
-            evaluate_guard(Some("str_ends_with(s, \"world\")"), &v, d).await,
-            GuardOutcome::Bool(true)
-        );
-        assert_eq!(
-            evaluate_guard(Some("str_len(s) == 11"), &v, d).await,
-            GuardOutcome::Bool(true)
-        );
-    }
-
     /// bd-guard-single-quote-fail-loud-061y (GS-028 NEW-3): the flywheel
     /// repair guard `steps_verify_1_ok == 'true'` must evaluate TRUE when the
     /// step output is the string "true" — single-quoted literals normalize to

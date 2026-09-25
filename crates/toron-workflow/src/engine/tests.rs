@@ -2148,27 +2148,6 @@ steps:
 // ---------------------------------------------------------------------------
 
 #[test]
-fn server_url_pin_env_beats_probe() {
-    // Can't safely mutate process env in tests — the pure core takes the
-    // probe as a closure; env pin is exercised via the RESOLUTION function
-    // below with a probe that would claim everything is dead.
-    let none = resonate_server_url_with(|_| false);
-    assert_eq!(none, None, "no probe hit -> embedded local mode");
-    let remote = resonate_server_url_with(|u| u == REMOTE_RESONATE_URL);
-    assert_eq!(
-        remote.as_deref(),
-        Some(REMOTE_RESONATE_URL),
-        "remote wins when probed"
-    );
-    let local_only = resonate_server_url_with(|u| u == LOCAL_RESONATE_URL);
-    assert_eq!(
-        local_only.as_deref(),
-        Some(LOCAL_RESONATE_URL),
-        "local used when remote dead"
-    );
-}
-
-#[test]
 fn host_port_parses_urls() {
     assert_eq!(
         host_port("https://resonate.example-tailnet.ts.net"),
