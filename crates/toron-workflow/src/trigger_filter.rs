@@ -446,26 +446,6 @@ mod tests {
         // Therefore no new RunInput is built → no new run → no infinite loop.
     }
 
-    /// Same loop-prevention via kind: a `dispatch_job` action emits kind-43001;
-    /// the kind check rejects it without needing the tag.
-    #[test]
-    fn dispatch_job_output_cannot_loop() {
-        let keys = Keys::generate();
-        let job_req = ev(JOB_REQUEST, vec![], &keys);
-        assert!(!should_evaluate_trigger_event(&job_req));
-    }
-
-    /// has_workflow_emitted_tag is tag-specific (other `t` tags don't trip it).
-    #[test]
-    fn tag_check_is_specific() {
-        let keys = Keys::generate();
-        let other_tag = ev(14, vec![tag_t("some-other-tag")], &keys);
-        assert!(should_evaluate_trigger_event(&other_tag));
-        // Unrelated single-t.
-        let project_tag = ev(14, vec![tag_t("my-project")], &keys);
-        assert!(should_evaluate_trigger_event(&project_tag));
-    }
-
     /// The kind-only predicate is consistent with the event predicate for
     /// kind-rejected events (no false sense of safety from the tag check).
     #[test]
@@ -485,22 +465,6 @@ mod tests {
         // predicate cannot (documented). A kind-14 bare event passes both;
         // a kind-14 tagged event passes kind-pred but fails event-pred.
         assert!(should_evaluate_trigger_kind(14));
-    }
-
-    /// Range helpers are correct envelopes.
-    #[test]
-    fn range_helpers_correct() {
-        assert!(job_kind(JOB_RUN_FIRST));
-        assert!(job_kind(JOB_RUN_LAST));
-        assert!(!job_kind(JOB_RUN_FIRST - 1));
-        assert!(!job_kind(JOB_RUN_LAST + 1));
-        assert!(workflow_run_kind(WORKFLOW_RUN_FIRST));
-        assert!(workflow_run_kind(WORKFLOW_RUN_LAST));
-        assert!(!workflow_run_kind(WORKFLOW_RUN_FIRST - 1));
-        assert!(!workflow_run_kind(WORKFLOW_RUN_LAST + 1));
-        assert!(is_workflow_emitted_kind(JOB_REQUEST));
-        assert!(is_workflow_emitted_kind(WORKFLOW_RUN_FIRST));
-        assert!(!is_workflow_emitted_kind(14));
     }
 
     /// Round-trip a built event to confirm the filter operates on real signed

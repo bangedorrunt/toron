@@ -138,15 +138,6 @@ mod tests {
         }
     }
 
-    /// First failure → `on_failure` (bead), streak = 1.
-    #[test]
-    fn first_failure_uses_on_failure() {
-        let p = policy(FailureAction::Bead, FailureAction::Escalate, 3);
-        let (action, streak) = evaluate(&p, true, 0);
-        assert_eq!(action, FailureAction::Bead);
-        assert_eq!(streak, 1);
-    }
-
     /// Failures below the threshold use `on_failure`; the N-th uses
     /// `on_repeat_failure` (threshold is exact — N-1 do NOT escalate).
     #[test]

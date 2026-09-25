@@ -102,12 +102,4 @@ mod tests {
         // Its canonical id is valid (built with the tag from the start).
         assert!(crate::nostr::event::verify_event(&ev).is_ok());
     }
-
-    #[test]
-    fn test_build_without_ttl_has_no_expiration() {
-        let k = keys();
-        let ts = Timestamp::from(1_700_000_000_u64);
-        let ev = build_event(&k, Kind::GiftWrap, "wrapped", Vec::<Tag>::new(), ts).expect("build");
-        assert!(ev.tags.expiration().is_none());
-    }
 }

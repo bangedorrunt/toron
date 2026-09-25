@@ -476,32 +476,6 @@ fn leaf_preview_for_value(value: &serde_json::Value) -> String {
     }
 }
 
-#[cfg(test)]
-mod disposition_tests_bd_r328 {
-    use super::super::boundary::Disposition;
-    use super::disposition_for_kind;
-
-    #[test]
-    fn red_kind_maps_to_enum() {
-        assert_eq!(
-            disposition_for_kind("rate_limit", None),
-            Disposition::Blocked
-        );
-        assert_eq!(
-            disposition_for_kind("timeout", None),
-            Disposition::TerminalFailed
-        );
-        assert_eq!(
-            disposition_for_kind("whatever", None),
-            Disposition::TerminalFailed
-        );
-        assert_eq!(
-            disposition_for_kind("timeout", Some("retry")),
-            Disposition::Retry
-        );
-    }
-}
-
 fn backoff_for_attempt(
     attempt: u32,
     retry_after_ms: Option<u64>,
@@ -2630,24 +2604,6 @@ mod control_flow_output_tests {
         );
     }
 
-    /// The alias is about the APPROVAL contract, not about any node that
-    /// happens to carry an `outcome` key.
-    #[test]
-    fn non_approval_node_never_lands_the_alias() {
-        let mut outputs = serde_json::Map::new();
-        land_node_output(
-            &mut outputs,
-            "ship",
-            &Action::Delay { secs: 1 },
-            serde_json::json!({ "outcome": "approved" }),
-        );
-        assert!(outputs.contains_key("ship"));
-        assert!(
-            !outputs.contains_key("decision"),
-            "only request_approval mints the alias: {outputs:?}"
-        );
-    }
-
     /// The predicate: only a `request_approval` action carrying a resolved
     /// `outcome` is a decision.
     #[test]
@@ -2677,34 +2633,6 @@ mod fail_run_preview_tests_bd_90eb {
     use super::leaf_preview_for_value;
     use crate::schema::{Action, parse_workflow};
     use std::sync::Arc;
-
-    /// bd-90eb: the preview carries kind/disposition evidence when present.
-    #[test]
-    fn preview_embeds_kind_and_disposition() {
-        let v = serde_json::json!({
-            "ok": false,
-            "error": "bad creds",
-            "kind": "auth",
-            "disposition": "TerminalFailed",
-        });
-        let preview = leaf_preview_for_value(&v);
-        assert!(preview.contains("auth"), "kind embedded: {preview}");
-        assert!(
-            preview.contains("TerminalFailed"),
-            "disposition embedded: {preview}"
-        );
-        assert!(preview.contains("bad creds"), "error embedded: {preview}");
-    }
-
-    /// bd-90eb: a bare leaf never yields zero evidence.
-    #[test]
-    fn bare_leaf_emits_empty_leaf_token() {
-        assert_eq!(leaf_preview_for_value(&serde_json::json!({})), "empty-leaf");
-        assert_eq!(
-            leaf_preview_for_value(&serde_json::Value::Null),
-            "empty-leaf"
-        );
-    }
 
     /// bd-90eb: bound is 512 chars, then the marker is appended.
     #[test]

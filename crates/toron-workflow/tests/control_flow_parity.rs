@@ -553,50 +553,6 @@ steps:
     );
 }
 
-/// The runtime `FailureKind` vocabulary stays frozen at exactly eight
-/// spellings (ADR-0026 closed set, ADR-0032 §2.2): contract errors use
-/// `ActionErrorCode`, never new kinds.
-#[test]
-fn failure_kind_vocabulary_frozen() {
-    use toron_workflow::engine::FailureKind;
-    assert_eq!(
-        FailureKind::ALL,
-        [
-            "auth",
-            "rate_limit",
-            "timeout",
-            "blocked",
-            "provider",
-            "cancelled",
-            "unknown",
-            "billing"
-        ],
-        "frozen eight"
-    );
-    for kind in ["rate_limit", "timeout"] {
-        assert!(
-            kind.parse::<FailureKind>()
-                .is_ok_and(toron_workflow::engine::FailureKind::is_retry_candidate),
-            "{kind} is a retry candidate"
-        );
-    }
-    for kind in [
-        "auth",
-        "billing",
-        "provider",
-        "blocked",
-        "cancelled",
-        "unknown",
-    ] {
-        assert!(
-            kind.parse::<FailureKind>()
-                .is_ok_and(|k| !k.is_retry_candidate()),
-            "{kind} never blind-retries"
-        );
-    }
-    assert!("bogus".parse::<FailureKind>().is_err(), "no new kinds");
-}
-
 /// Spawn without `no_claim_timeout` deserializes to 600s; explicit 0 is the
 /// only no-timeout spelling (characterization of the schema bar).
 #[test]

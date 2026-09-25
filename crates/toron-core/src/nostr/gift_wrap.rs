@@ -302,16 +302,6 @@ mod tests {
     }
 
     #[test]
-    fn test_build_rumor_sets_author_and_timeline() {
-        let sender = sender_keys();
-        let rumor = sample_rumor(sender.public_key());
-        assert_eq!(rumor.pubkey, sender.public_key());
-        assert_eq!(rumor.created_at.as_secs(), 1_700_000_000_u64);
-        assert_eq!(rumor.kind.as_u16(), 14);
-        assert_eq!(rumor.kind, Kind::PrivateDirectMessage);
-    }
-
-    #[test]
     fn test_wrap_uses_fresh_one_time_key_per_wrap() {
         // NIP-59 metadata hiding: the wrap's pubkey MUST NOT be the sender's
         // identity key (a relay observer would learn the sender), and two

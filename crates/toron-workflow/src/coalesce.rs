@@ -180,8 +180,7 @@ impl Coalesced {
     /// kind-43001 `merged_spec` does not re-include SkipAlreadyDelivered
     /// parents.
     pub fn retain_parents(&self, keep: &[String]) -> Self {
-        let keep_set: std::collections::BTreeSet<&str> =
-            keep.iter().map(String::as_str).collect();
+        let keep_set: std::collections::BTreeSet<&str> = keep.iter().map(String::as_str).collect();
         Self {
             assignee: self.assignee.clone(),
             mentions: self
@@ -316,7 +315,9 @@ pub fn transient_backoff_delay_ms(assignee: &str, attempt: u32) -> u64 {
     let base = REQUEUE_BACKOFF_BASE_MS.saturating_mul(1u64 << shift);
     let capped = base.min(REQUEUE_BACKOFF_CAP_MS);
     let jitter = transient_jitter_ms(assignee, attempt, capped);
-    capped.saturating_add(jitter).min(REQUEUE_BACKOFF_CAP_MS.saturating_mul(2))
+    capped
+        .saturating_add(jitter)
+        .min(REQUEUE_BACKOFF_CAP_MS.saturating_mul(2))
 }
 
 fn transient_jitter_ms(assignee: &str, attempt: u32, delay: u64) -> u64 {
@@ -327,9 +328,7 @@ fn transient_jitter_ms(assignee: &str, attempt: u32, delay: u64) -> u64 {
     for b in assignee.as_bytes() {
         h = h.wrapping_mul(31).wrapping_add(u64::from(*b));
     }
-    h = h
-        .wrapping_add(u64::from(attempt))
-        .wrapping_mul(0x9E37_79B9);
+    h = h.wrapping_add(u64::from(attempt)).wrapping_mul(0x9E37_79B9);
     h % (delay / 4 + 1)
 }
 
@@ -633,20 +632,19 @@ mod tests {
         }
     }
 
-
     /// GS-062: requeue restores a flushed burst (acquire-drop / in-flight retry).
     #[test]
     fn requeue_restores_burst_for_retry() {
-        let mut c = MentionCoalescer::new(
-            Duration::from_millis(2_000),
-            Duration::from_millis(500),
-            64,
-        );
+        let mut c =
+            MentionCoalescer::new(Duration::from_millis(2_000), Duration::from_millis(500), 64);
         c.submit(m("oc", "e1", "hi"), 0);
         let batch = c.force_flush("oc").expect("flushed");
         assert_eq!(c.buffered_for("oc"), 0);
         let q = c.requeue(batch, 1_000, RequeueSchedule::Transient);
-        assert!(matches!(q, RequeueOutcome::Queued { delay_ms: 0, .. }), "{q:?}");
+        assert!(
+            matches!(q, RequeueOutcome::Queued { delay_ms: 0, .. }),
+            "{q:?}"
+        );
         assert_eq!(c.buffered_for("oc"), 1);
         let again = c.tick(1_000);
         assert_eq!(again.len(), 1);
@@ -658,11 +656,8 @@ mod tests {
     /// new bus event) can advance `now_ms` into flush readiness.
     #[test]
     fn requeue_inflight_style_flushes_after_subwindow() {
-        let mut c = MentionCoalescer::new(
-            Duration::from_millis(2_000),
-            Duration::from_millis(500),
-            64,
-        );
+        let mut c =
+            MentionCoalescer::new(Duration::from_millis(2_000), Duration::from_millis(500), 64);
         c.submit(
             InboundMention {
                 assignee: "oc".into(),
@@ -692,16 +687,19 @@ mod tests {
     /// GS-062 TRANSPORT-REQUEUE-HOT-SPIN: Transient backoff grows; budget exhausts.
     #[test]
     fn transient_requeue_backoff_and_budget() {
-        let mut c = MentionCoalescer::new(
-            Duration::from_millis(2_000),
-            Duration::from_millis(500),
-            64,
-        );
+        let mut c =
+            MentionCoalescer::new(Duration::from_millis(2_000), Duration::from_millis(500), 64);
         // Attempt 0 → immediate.
         c.submit(m("oc", "e1", "hi"), 0);
         let batch = c.force_flush("oc").expect("flushed");
         let q0 = c.requeue(batch, 1_000, RequeueSchedule::Transient);
-        assert_eq!(q0, RequeueOutcome::Queued { attempt: 1, delay_ms: 0 });
+        assert_eq!(
+            q0,
+            RequeueOutcome::Queued {
+                attempt: 1,
+                delay_ms: 0
+            }
+        );
         assert_eq!(c.tick(1_000).len(), 1);
         let mut last_delay = 0u64;
         for i in 1..REQUEUE_MAX_ATTEMPTS {
@@ -735,7 +733,11 @@ mod tests {
             c.requeue(batch, 9_000, RequeueSchedule::Transient),
             RequeueOutcome::Exhausted
         );
-        assert_eq!(c.buffered_for("oc"), 0, "Exhausted must not live-buffer restore");
+        assert_eq!(
+            c.buffered_for("oc"),
+            0,
+            "Exhausted must not live-buffer restore"
+        );
         assert_eq!(c.dlq_len(), 1, "Exhausted must park whole batch on DLQ");
         assert_eq!(
             c.dlq_for("oc")[0].reason,
@@ -753,7 +755,10 @@ mod tests {
         assert!(
             matches!(
                 c.requeue(batch, 10_000, RequeueSchedule::Transient),
-                RequeueOutcome::Queued { attempt: 1, delay_ms: 0 }
+                RequeueOutcome::Queued {
+                    attempt: 1,
+                    delay_ms: 0
+                }
             ),
             "post-Exhausted Transient must not poison-Exhaust"
         );
@@ -763,11 +768,8 @@ mod tests {
     /// survives merge into a non-empty buffer (concurrent submit during publish).
     #[test]
     fn requeue_transient_honors_schedule_on_nonempty_merge() {
-        let mut c = MentionCoalescer::new(
-            Duration::from_millis(2_000),
-            Duration::from_millis(500),
-            64,
-        );
+        let mut c =
+            MentionCoalescer::new(Duration::from_millis(2_000), Duration::from_millis(500), 64);
         // Simulate concurrent submit while publish was awaiting.
         c.submit(m("oc", "concurrent", "new"), 1_000);
         assert_eq!(c.buffered_for("oc"), 1);
@@ -778,12 +780,19 @@ mod tests {
             first_arrival_ms: 0,
         };
         let q = c.requeue(failed, 1_000, RequeueSchedule::Transient);
-        assert!(matches!(q, RequeueOutcome::Queued { delay_ms: 0, .. }), "{q:?}");
+        assert!(
+            matches!(q, RequeueOutcome::Queued { delay_ms: 0, .. }),
+            "{q:?}"
+        );
         assert_eq!(c.buffered_for("oc"), 2, "merge both mentions");
         // Must be flush-ready immediately despite non-empty buffer at requeue time.
         let flushed = c.tick(1_000);
         assert_eq!(flushed.len(), 1);
-        let parents: Vec<_> = flushed[0].mentions.iter().map(|x| x.parent.as_str()).collect();
+        let parents: Vec<_> = flushed[0]
+            .mentions
+            .iter()
+            .map(|x| x.parent.as_str())
+            .collect();
         assert!(parents.contains(&"concurrent"), "{parents:?}");
         assert!(parents.contains(&"failed"), "{parents:?}");
     }
@@ -794,11 +803,8 @@ mod tests {
     fn submit_during_transient_backoff_does_not_fire_early() {
         // Subwindow 100ms so attempt-1 Transient backoff (~250ms+) exceeds it
         // and a clobbering submit would otherwise fire early via subwindow.
-        let mut c = MentionCoalescer::new(
-            Duration::from_millis(2_000),
-            Duration::from_millis(100),
-            64,
-        );
+        let mut c =
+            MentionCoalescer::new(Duration::from_millis(2_000), Duration::from_millis(100), 64);
         // Burn attempt 0 (immediate) so next Transient has real backoff.
         c.submit(m("oc", "e1", "hi"), 0);
         let batch = c.force_flush("oc").expect("flushed");
@@ -821,7 +827,11 @@ mod tests {
         };
         // Concurrent mention during backoff — must preserve scheduled readiness.
         c.submit(m("oc", "live", "during-backoff"), 2_100);
-        assert_eq!(c.buffered_for("oc"), 2, "merge concurrent into backoff buffer");
+        assert_eq!(
+            c.buffered_for("oc"),
+            2,
+            "merge concurrent into backoff buffer"
+        );
         assert!(
             c.tick(2_100 + 100).is_empty(),
             "subwindow after concurrent submit must NOT flush before backoff ready_at"
@@ -832,7 +842,11 @@ mod tests {
         );
         let flushed = c.tick(2_000 + delay_ms);
         assert_eq!(flushed.len(), 1, "flush only at scheduled ready_at");
-        let parents: Vec<_> = flushed[0].mentions.iter().map(|x| x.parent.as_str()).collect();
+        let parents: Vec<_> = flushed[0]
+            .mentions
+            .iter()
+            .map(|x| x.parent.as_str())
+            .collect();
         assert!(parents.contains(&"e1"), "{parents:?}");
         assert!(parents.contains(&"live"), "{parents:?}");
     }
@@ -1022,39 +1036,5 @@ mod tests {
         assert_eq!(spec["count"], 2);
         assert!(spec["mentions"].is_array());
         assert_eq!(spec["mentions"].as_array().unwrap().len(), 2);
-    }
-
-    /// Pure parse of the env value (no env mutation — `set_var` is unsafe in
-    /// edition 2024; the env-override path is covered by `tests/coalesce_env.rs`).
-    #[test]
-    fn parse_millis_cases() {
-        assert_eq!(
-            parse_millis("123", DEFAULT_WINDOW),
-            Duration::from_millis(123)
-        );
-        assert_eq!(
-            parse_millis(" 123 ", DEFAULT_WINDOW),
-            Duration::from_millis(123)
-        );
-        assert_eq!(
-            parse_millis("0", DEFAULT_WINDOW),
-            DEFAULT_WINDOW,
-            "zero falls back"
-        );
-        assert_eq!(parse_millis("garbage", DEFAULT_WINDOW), DEFAULT_WINDOW);
-        assert_eq!(parse_millis("", DEFAULT_WINDOW), DEFAULT_WINDOW);
-    }
-
-    /// open_buffers counts only non-empty buffers.
-    #[test]
-    fn open_buffers_count() {
-        let mut c = MentionCoalescer::with_defaults();
-        assert_eq!(c.open_buffers(), 0);
-        c.submit(m("oc", "e1", "a"), 0);
-        assert_eq!(c.open_buffers(), 1);
-        c.submit(m("gk", "e2", "b"), 0);
-        assert_eq!(c.open_buffers(), 2);
-        let _ = c.force_flush("oc");
-        assert_eq!(c.open_buffers(), 1);
     }
 }

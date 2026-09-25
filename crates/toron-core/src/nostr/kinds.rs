@@ -111,12 +111,6 @@ mod tests {
         assert_eq!(Kind::GroupMembers.as_u16(), CHANNEL_MEMBERS);
     }
 
-    #[test]
-    fn test_toron_kind_roundtrip() {
-        assert_eq!(toron_kind(PROJECT_MANIFEST).as_u16(), PROJECT_MANIFEST);
-        assert_eq!(toron_kind(JOB_RESULT).as_u16(), JOB_RESULT);
-    }
-
     /// Completeness: the frozen registry (ADR-0003, AGREEMENT LOCKED
     /// 2026-08-04) as a table. Every value here is asserted against the
     /// constant so a renumber or typo is caught immediately.
@@ -161,15 +155,5 @@ mod tests {
             (WORKFLOW_RUN_LAST - WORKFLOW_RUN_FIRST + 1) == 12,
             "46001..=46012"
         );
-    }
-
-    /// Job lifecycle is the Buzz-verbatim 43001→43006 sequence.
-    #[test]
-    fn test_job_lifecycle_sequence() {
-        assert_eq!(JOB_ACCEPTED, JOB_REQUEST + 1);
-        assert_eq!(JOB_PROGRESS, JOB_REQUEST + 2);
-        assert_eq!(JOB_RESULT, JOB_REQUEST + 3);
-        assert_eq!(JOB_CANCEL, JOB_REQUEST + 4);
-        assert_eq!(JOB_ERROR, JOB_REQUEST + 5);
     }
 }

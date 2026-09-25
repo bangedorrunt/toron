@@ -65,7 +65,6 @@ impl Default for DispatchConfig {
     }
 }
 
-
 /// Host-facing result of [`DispatchPool::try_acquire_for_host`] (GS-062 C).
 /// Live dispatch must consume this (or raw [`DispatchPool::try_acquire_fenced`])
 /// — never the Option shim that drops Sleep/Fence effects.
@@ -106,7 +105,6 @@ impl std::fmt::Debug for DispatchAcquire<'_> {
         }
     }
 }
-
 
 /// The in-process dispatch pool (A7).
 pub struct DispatchPool {

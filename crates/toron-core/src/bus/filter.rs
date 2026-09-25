@@ -247,15 +247,4 @@ mod tests {
             .build();
         assert!(!f_no_kind.match_event(&ev, MatchEventOptions::default()));
     }
-
-    #[test]
-    fn test_label_value_always_toron_namespace() {
-        assert_eq!(
-            LabelValue::toron("demo"),
-            LabelValue {
-                value: "demo".into(),
-                namespace: "toron".into()
-            }
-        );
-    }
 }

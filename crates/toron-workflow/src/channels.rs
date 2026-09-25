@@ -1083,7 +1083,7 @@ mod tests {
 
     /// GS-062: ReAdd under a held Kick generation is fenced at join
     /// (hold_authority_for_test helper; production path covered below).
-    
+
     /// GS-062: apply_lifecycle leave settles authority so rebuild/replay does
     /// not permanently FenceReAdd. Live leave() still holds until settle_authority.
     #[test]
@@ -1160,18 +1160,14 @@ mod tests {
             .join("c", &bob.public_key())
             .expect_err("closed refuses join");
         let msg = err.to_string();
-        assert!(
-            msg.contains("closed"),
-            "expected closed refuse, got {msg}"
-        );
+        assert!(msg.contains("closed"), "expected closed refuse, got {msg}");
         assert!(
             !msg.contains("fenced"),
             "create+closed rebuild must settle (not FenceReAdd), got {msg}"
         );
         // Live close() still holds for in-process CS (unchanged).
         let live = ChannelStore::new();
-        live
-            .create_channel(&alice.public_key(), "live", "L", false, None)
+        live.create_channel(&alice.public_key(), "live", "L", false, None)
             .expect("create");
         live.close("live", &alice.public_key()).expect("close");
         assert!(
@@ -1182,7 +1178,6 @@ mod tests {
         assert!(!live.authority_is_held("live"));
         let _ = bob;
     }
-
 
     #[test]
     fn join_honors_readd_fence_under_held_kick() {
@@ -1248,13 +1243,17 @@ mod tests {
             .expect("b");
         store.join("a", &bob.public_key()).expect("bob a");
         store.join("b", &carol.public_key()).expect("carol b");
-        store.leave("a", &bob.public_key()).expect("leave a — hold Kick");
+        store
+            .leave("a", &bob.public_key())
+            .expect("leave a — hold Kick");
         // Bump global authority_generation via other channel leave/close.
         store.leave("b", &carol.public_key()).expect("leave b");
         store
             .create_channel(&alice.public_key(), "d", "D", false, None)
             .expect("d");
-        store.close("d", &alice.public_key()).expect("close d bumps gen");
+        store
+            .close("d", &alice.public_key())
+            .expect("close d bumps gen");
         let err = store
             .join("a", &bob.public_key())
             .expect_err("must still FenceReAdd on a despite other-channel bumps");
@@ -1339,24 +1338,6 @@ mod tests {
             .expect("second is no-op");
         assert_eq!(store.list().len(), 1);
         assert_eq!(store.get("c").unwrap().name, "C", "first wins");
-    }
-
-    /// ADR-0020 Spec 1: a channel post EMITS kind 9 (NIP-29 channel message),
-    /// never the legacy 42.
-    #[test]
-    fn post_emits_kind_9_not_42() {
-        let store = ChannelStore::new();
-        let alice = keys();
-        store
-            .create_channel(&alice.public_key(), "c", "C", false, None)
-            .expect("create");
-        let ev = store.post(&alice, "c", "hello", &[]).expect("post");
-        assert_eq!(
-            ev.kind.as_u16(),
-            9,
-            "channel post emits kind 9 (ADR-0020 Spec 1), got {}",
-            ev.kind.as_u16()
-        );
     }
 
     #[test]

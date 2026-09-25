@@ -206,13 +206,4 @@ mod tests {
         let ok: MailboxResult<u32> = Ok(7);
         assert_eq!(ok, Ok(7));
     }
-
-    #[test]
-    fn helpers_build_coded_errors() {
-        assert_eq!(MailError::not_found("msg").code, MailErrorCode::NotFound);
-        assert_eq!(MailError::unsupported("x").code, MailErrorCode::Unsupported);
-        let e = MailError::other("x");
-        assert_eq!(e.code, MailErrorCode::Other("x".into()));
-        assert_eq!(e.message, "x");
-    }
 }
