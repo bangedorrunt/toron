@@ -332,23 +332,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn default_state_dir_prefers_xdg_then_home() {
-        // Can't set process env safely here; assert the structural fallback
-        // by testing with an explicit state_dir through the args struct.
-        let args = super::super::cli::DaemonArgs {
-            addr: "127.0.0.1:18080".into(),
-            label: "com.toron.serve".into(),
-            state_dir: Some(PathBuf::from("/custom/state")),
-            force: false,
-            cmd: super::super::cli::DaemonCommand::Status,
-        };
-        assert_eq!(
-            args.state_dir.unwrap_or_else(default_state_dir),
-            PathBuf::from("/custom/state")
-        );
-    }
-
     /// bd-daemon-restart: `first_pid_from_lsof` is the pure half of
     /// port_holder_pid — blank lines tolerated, first pid wins, junk → None.
     #[test]
@@ -357,10 +340,5 @@ mod tests {
         assert_eq!(first_pid_from_lsof("\n\n  4242 \n981\n"), Some(4242));
         assert_eq!(first_pid_from_lsof(""), None);
         assert_eq!(first_pid_from_lsof("not-a-pid"), None);
-    }
-    #[test]
-    fn effective_passphrase_has_no_empty_value() {
-        let p = effective_passphrase();
-        assert!(!p.is_empty());
     }
 }

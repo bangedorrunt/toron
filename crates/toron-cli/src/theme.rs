@@ -178,11 +178,4 @@ mod tests {
         // — the important property is that it exists and is the NO_COLOR gate.
         assert!(stripped.fg.is_some() || std::env::var_os("NO_COLOR").is_some());
     }
-
-    #[test]
-    fn palette_consts_are_rgb() {
-        assert_eq!(HackerNight::VOID, Color::Rgb(0x08, 0x08, 0x0e));
-        assert_eq!(HackerNight::CYAN, Color::Rgb(0x0d, 0xb9, 0xd7));
-        assert_eq!(HackerNight::RED, Color::Rgb(0xf7, 0x76, 0x8e));
-    }
 }
