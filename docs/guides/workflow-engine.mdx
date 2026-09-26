@@ -8,12 +8,40 @@ toron runs YAML workflows as a standalone fabric; orchestration (catalogs, cron,
 > **ADR-0032** ([workflow-engine honesty and Jido action contracts](../decisions/0032-workflow-engine-honesty-jido-contracts.md), **proposed**, not accepted) is the design target. Its fixed point is **truthful durable orchestration under at-least-once external effects, with explicit reconciliation where the outcome is uncertain**. It is not exactly-once execution, not rollback of completed side effects, and a successful `engine.run` does not mean business completion. Docs below describe **shipped** behavior; proposed gates are labeled **(proposed)**.
 
 ```bash
-toron workflow lint <file.yaml>
-toron workflow validate <file.yaml>
-toron workflow dry-run <file.yaml>
-toron workflow run <file.yaml>
-toron workflow invoke <name>
+toron workflow lint <file.yaml>        # static: schema, guards, refs, acyclicity
+toron workflow validate <file.yaml>    # alias of lint
+toron workflow dry-run <file.yaml>     # lint + show what would run
+toron workflow run <file.yaml>         # from a trigger event payload
+toron workflow invoke <name>           # on demand, with inputs
 ```
+
+```text
+$ toron workflow lint crates/toron-workflow/tests/fixtures/playbook-lint/bugfix_ok.yaml ; echo $?
+0
+
+$ toron workflow lint crates/toron-workflow/tests/fixtures/playbook-lint/bugfix_no_repro.yaml ; echo $?
+  error bug-fix workflow has no `repro` node — a fix without a reproduction fails lint (ADR-0019 Spec 6: fix-root-causes)
+toron: error: 1 blocking lint issue(s)
+1
+
+$ toron workflow dry-run crates/toron-workflow/tests/fixtures/playbook-lint/bugfix_ok.yaml
+{
+  "graph": 4,
+  "name": "bug-fix",
+  "steps": 0,
+  "trigger": null
+}
+```
+
+A clean lint prints nothing at all — the exit code is the verdict, so gate on it
+rather than on output. `dry-run` reports `graph` nodes and `steps`; a workflow
+with a graph and no linear steps is normal for the playbook shape.
+
+If it fails: a lint that stops with `error:` lines is fail-stop, so the run never
+starts — fix the named node rather than turning the rule off. `workflow run`
+without a trigger payload and `workflow invoke` without the inputs its schema
+declares both refuse instead of dispatching a half-bound run; `dry-run` is the
+cheap way to see which ref is missing before wiring a trigger.
 
 ## Durability
 
