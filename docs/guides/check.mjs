@@ -197,7 +197,13 @@ function commandLines(block) {
     let line = raw.trim();
     if (!line || line.startsWith("#") || line.startsWith("%%")) continue;
     line = line.replace(/^\$\s*/, "");
-    line = line.split(/\|\||&&|\||;/)[0].trim();
+    // Split off pipes/redirections, but a `|` inside a placeholder is part of the
+    // value, not a shell pipe: `--crews <squad|profile>` was being truncated at
+    // the pipe, which made the required `--as` that followed look missing.
+    line = line
+      .replace(/<[^>]*>/g, (m) => m.replace(/\|/g, "/"))
+      .split(/\|\||&&|\||;/)[0]
+      .trim();
     let tokens = tokenize(line);
     while (tokens.length > 0 && /^[A-Z_][A-Z0-9_]*=/.test(tokens[0])) tokens.shift();
     // Drop a trailing `# comment`. A `#` mid-token (inside a quoted value) is
