@@ -214,6 +214,14 @@ const REDUCE: ActionContract = ActionContract {
     output: OutputKind::AnyNonNull,
     supported: true,
 };
+const LOOP: ActionContract = ActionContract {
+    type_name: "loop",
+    class: ActionClass::DurableControl,
+    effect: EffectKind::NoneControl,
+    template_fields: &["max", "until"],
+    output: OutputKind::ObjectWithOk,
+    supported: true,
+};
 
 /// The contract for one action. Exhaustive over [`Action`]: a new variant
 /// without an arm is a compile error.
@@ -234,6 +242,7 @@ pub const fn contract_for(action: &Action) -> &'static ActionContract {
         Action::Spawn { .. } => &SPAWN,
         Action::Verify { .. } => &VERIFY,
         Action::Reduce { .. } => &REDUCE,
+        Action::Loop { .. } => &LOOP,
     }
 }
 
@@ -333,6 +342,16 @@ pub fn validate_action(action: &Action) -> Vec<Violation> {
         }
         Action::Spawn { profile, .. } => {
             push(&mut out, non_empty("profile", profile, "spawn"));
+        }
+        Action::Loop { max, body, .. } => {
+            push(&mut out, non_empty("max", max, "loop"));
+            if body.is_empty() {
+                out.push(violation(
+                    "body",
+                    ActionErrorCode::InvalidInput,
+                    "loop requires a non-empty body".into(),
+                ));
+            }
         }
         Action::Verify { command } => {
             push(&mut out, non_empty("command", command, "verify"));

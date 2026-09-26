@@ -443,6 +443,7 @@ pub const fn partition(action: &Action) -> ActionPartition {
         | Action::Parallel { .. }
         | Action::CallWorkflow { .. }
         | Action::Reduce { .. }
+        | Action::Loop { .. }
         | Action::Spawn { .. } => ActionPartition::EngineControl,
         Action::SendMessage { .. } | Action::SendDm { .. } => {
             ActionPartition::HostSink { sink: "mailbox" }
@@ -722,10 +723,18 @@ pub fn invoke_compat(
     }
 }
 
-/// `true` when a runner-shaped value is a failure (`ok == false`).
-/// `ok:true` with an informational `error` field does not fail the run.
+/// `true` when a runner-shaped value failed the step.
+///
+/// Two spellings are the same fact: a leaf's `{ok:false}` and a control-flow
+/// terminal `{status:failed}`. A graph scheduler that only reads one of them
+/// stores the other and reports the run successful. `ok:true` with an
+/// informational `error` field does not fail. A skip (`skipped: true`) does
+/// not fail.
 pub fn is_failure_value(value: &serde_json::Value) -> bool {
-    value.get("ok") == Some(&serde_json::Value::Bool(false))
+    if value.get("ok") == Some(&serde_json::Value::Bool(false)) {
+        return true;
+    }
+    value.get("status").and_then(serde_json::Value::as_str) == Some("failed")
 }
 
 /// Stable logical effect identity (ADR-0032 Spec 3): SHA-256 over the
@@ -828,10 +837,16 @@ mod tests {
             },
             Action::Spawn {
                 profile: "@p".into(),
+                harness: None,
                 workflow: None,
                 await_: false,
                 no_claim_timeout: 0,
                 context: Some(ContextMode::Inherit),
+            },
+            Action::Loop {
+                max: "1".into(),
+                until: None,
+                body: vec![leaf_delay()],
             },
             Action::Verify {
                 command: "true".into(),
@@ -872,7 +887,7 @@ mod tests {
     #[test]
     fn honesty_gate_partition_is_exhaustive() {
         let actions = every_action();
-        assert_eq!(actions.len(), 15, "one case per live Action variant");
+        assert_eq!(actions.len(), 16, "one case per live Action variant");
         let mut names: Vec<&str> = actions
             .iter()
             .map(crate::schema::Action::type_name)
@@ -881,7 +896,7 @@ mod tests {
         names.dedup();
         assert_eq!(
             names.len(),
-            15,
+            16,
             "type names are unique per variant: {names:?}"
         );
         for action in &actions {
@@ -1090,6 +1105,12 @@ mod tests {
             &serde_json::json!({"ok": true, "error": "note"})
         ));
         assert!(!is_failure_value(&serde_json::Value::Null));
+        assert!(is_failure_value(
+            &serde_json::json!({"status": "failed", "error": "child"})
+        ));
+        assert!(!is_failure_value(
+            &serde_json::json!({"skipped": true, "node": "gate"})
+        ));
     }
 
     /// bd-i6kc honesty gate: the advertised action lists are not a stale
@@ -1103,7 +1124,7 @@ mod tests {
             .iter()
             .map(crate::schema::Action::type_name)
             .collect();
-        assert_eq!(live.len(), 15, "one name per live Action variant");
+        assert_eq!(live.len(), 16, "one name per live Action variant");
         assert_eq!(advertised, live, "advertised names == live type names");
     }
 

@@ -364,6 +364,11 @@ fn check_re_lint(report: &mut LintReport, wf: &Workflow) {
             Action::Foreach { each, .. } | Action::Parallel { each, .. } => {
                 walk_step(each, inside_retry, report);
             }
+            Action::Loop { body, .. } => {
+                for s in body {
+                    walk_step(s, inside_retry, report);
+                }
+            }
             _ => {}
         }
     }
@@ -427,7 +432,8 @@ fn check_guard(report: &mut LintReport, guard: &str, ctx: &str) {
     // Template refs ({{trigger.x}}, {{steps.y}}) are substituted before eval;
     // the raw guard is not valid evalexpr when it references them, so lint
     // replaces template tokens with a literal before syntax-checking.
-    let substituted = substitute_templates(guard);
+    let flattened = crate::guard::normalize_guard_paths(guard);
+    let substituted = substitute_templates(&flattened);
     let parse_err = evalexpr::build_operator_tree::<evalexpr::DefaultNumericTypes>(&substituted)
         .err()
         .map(|e| e.to_string());
@@ -548,21 +554,12 @@ fn check_action(report: &mut LintReport, action: &Action) {
                 });
             }
         }
-        Action::React { message_id, emoji } => {
-            if message_id.trim().is_empty() {
-                report.issues.push(LintIssue {
-                    level: Level::Error,
-                    message: "react action requires a non-empty `message_id`".into(),
-                    line: None,
-                });
-            }
-            if emoji.trim().is_empty() {
-                report.issues.push(LintIssue {
-                    level: Level::Error,
-                    message: "react action requires a non-empty `emoji`".into(),
-                    line: None,
-                });
-            }
+        Action::React { .. } => {
+            report.issues.push(LintIssue {
+                level: Level::Error,
+                message: "react is deprecated with no wired sink; remove the step or replace it with send_message".into(),
+                line: None,
+            });
         }
         Action::DispatchJob { assignee, .. } => {
             if assignee.trim().is_empty() {
@@ -573,13 +570,33 @@ fn check_action(report: &mut LintReport, action: &Action) {
                 });
             }
         }
-        Action::CallWebhook { url, .. } => {
-            if url.trim().is_empty() {
+        Action::CallWebhook { .. } => {
+            report.issues.push(LintIssue {
+                level: Level::Error,
+                message: "call_webhook is deprecated with no wired sink and unmet SSRF contract; remove the step".into(),
+                line: None,
+            });
+        }
+        Action::Loop { max, until, body } => {
+            if max.trim().is_empty() {
                 report.issues.push(LintIssue {
                     level: Level::Error,
-                    message: "call_webhook action requires a non-empty `url`".into(),
+                    message: "loop requires a non-empty `max`".into(),
                     line: None,
                 });
+            }
+            if body.is_empty() {
+                report.issues.push(LintIssue {
+                    level: Level::Error,
+                    message: "loop requires a non-empty body".into(),
+                    line: None,
+                });
+            }
+            if let Some(guard) = until {
+                check_guard(report, guard, "loop until");
+            }
+            for step in body {
+                check_action(report, &step.action);
             }
         }
         Action::RequestApproval { message } => {

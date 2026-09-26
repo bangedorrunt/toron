@@ -234,6 +234,89 @@ pub fn normalize_single_quoted_literals(expr: &str) -> String {
     out
 }
 
+/// Flatten the guard paths authors actually write onto the names
+/// [`crate::engine::control_flow::guard_vars`] binds.
+///
+/// `steps.gate.ok`, `{{steps.verify-1.ok}}`, `inputs.mode`, and
+/// `trigger.channel` become `steps_gate_ok`, `steps_verify_1_ok`,
+/// `trigger_mode`, and `trigger_channel`. Quoted strings are left alone.
+/// A path with no dot is unchanged.
+pub fn normalize_guard_paths(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    let mut in_string = false;
+    while let Some(c) = chars.next() {
+        if c == '"' {
+            in_string = !in_string;
+            out.push(c);
+            continue;
+        }
+        if in_string {
+            out.push(c);
+            continue;
+        }
+        if c == '{' && chars.peek() == Some(&'{') {
+            chars.next();
+            let mut inner = String::new();
+            while let Some(ch) = chars.next() {
+                if ch == '}' && chars.peek() == Some(&'}') {
+                    chars.next();
+                    break;
+                }
+                inner.push(ch);
+            }
+            out.push_str(&flatten_guard_path(inner.trim()));
+            continue;
+        }
+        if c.is_ascii_alphabetic() || c == '_' {
+            let mut ident = String::new();
+            ident.push(c);
+            while let Some(ch) = chars.peek().copied() {
+                if ch.is_ascii_alphanumeric() || ch == '_' || ch == '.' || ch == '-' {
+                    ident.push(ch);
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+            if ident.contains('.') {
+                out.push_str(&flatten_guard_path(&ident));
+            } else {
+                out.push_str(&ident);
+            }
+            continue;
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// `inputs.x` and `trigger.x` both bind as `trigger_x`. `steps.a.b` binds
+/// as `steps_a_b`. Hyphens in node names fold the same way the binder does.
+fn flatten_guard_path(path: &str) -> String {
+    let path = path.trim();
+    let Some((head, rest)) = path.split_once('.') else {
+        return path.to_string();
+    };
+    let flat = rest.replace(['.', '-'], "_");
+    match head {
+        "inputs" | "trigger" => format!("trigger_{flat}"),
+        "steps" => format!("steps_{flat}"),
+        _ => path.replace(['.', '-'], "_"),
+    }
+}
+
+/// `== "true"` and `== "false"` compare equal to a boolean guard variable.
+/// Authors write both the boolean and the quoted spelling. Quoted strings
+/// that are not exactly true or false stay quoted.
+pub fn rewrite_bool_string_literals(input: &str) -> String {
+    input
+        .replace("== \"true\"", "== true")
+        .replace("== \"false\"", "== false")
+        .replace("!= \"true\"", "!= true")
+        .replace("!= \"false\"", "!= false")
+}
+
 pub async fn evaluate_guard(
     guard: Option<&str>,
     variables: &std::collections::HashMap<String, Value>,
@@ -466,10 +549,28 @@ mod tests {
         assert_eq!(out, GuardOutcome::Bool(true));
     }
 
-    /// NOTE (bd-8jgv): removed `str_contains/ends_with/len_custom_fn` — pure
-    /// replays of `all_four_fns_callable` below, which already evaluates all
-    /// four fns through the public evaluator path. `str_starts_with` stays:
-    /// it owns the only false-path assert.
+    #[test]
+    fn guard_paths_flatten_dots_templates_and_hyphens() {
+        assert_eq!(
+            normalize_guard_paths("steps.gate.ok == true"),
+            "steps_gate_ok == true"
+        );
+        assert_eq!(
+            normalize_guard_paths("inputs.mode == \"compile\""),
+            "trigger_mode == \"compile\""
+        );
+        assert_eq!(
+            normalize_guard_paths("{{steps.verify-1.ok}} == true"),
+            "steps_verify_1_ok == true"
+        );
+        assert_eq!(
+            rewrite_bool_string_literals("steps_verify_ok == \"true\""),
+            "steps_verify_ok == true"
+        );
+    }
+
+    /// NOTE (bd-8jgv): the `str_*` custom fns share one evaluator path;
+    /// `str_starts_with` below is the representative with true+false edges.
     #[tokio::test]
     async fn str_starts_with_custom_fn() {
         let v = vars(&[("trigger_text", "P1 crash")]);

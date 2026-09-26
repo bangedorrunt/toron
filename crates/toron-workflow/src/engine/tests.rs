@@ -996,6 +996,244 @@ steps:
     assert_eq!(output["go"]["retried"], true);
 }
 
+/// A fail_run leaf inside retry is still retried. The first miss must not
+/// become a run-level failure before max_attempts is spent.
+#[tokio::test]
+async fn retry_retries_a_fail_run_leaf() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    let attempts = Arc::new(AtomicU32::new(0));
+    let attempts_clone = attempts.clone();
+    let runner = lift_async(move |_a: &Action| {
+        let n = attempts_clone.fetch_add(1, Ordering::SeqCst);
+        if n < 2 {
+            Err(anyhow::anyhow!("miss"))
+        } else {
+            Ok(serde_json::json!({ "ok": true, "n": n + 1 }))
+        }
+    });
+    let engine =
+        WorkflowEngine::local_with_async_effect_runner(Some(runner)).expect("engine");
+    let wf = parse_workflow(
+        r##"
+name: retry-fail-run
+trigger:
+  type: webhook
+steps:
+  - name: go
+    action: retry
+    max_attempts: 3
+    backoff_secs: 0
+    step:
+      name: ping
+      action: send_dm
+      to: pi
+      body: ping
+      on_error: fail_run
+"##,
+    )
+    .expect("parse");
+    let output = engine
+        .run(
+            "wf-retry-fail-run",
+            RunInput {
+                run_id: None,
+                workflow: wf,
+                trigger: serde_json::json!({}),
+            },
+        )
+        .await
+        .expect("run");
+    assert_eq!(attempts.load(Ordering::SeqCst), 3, "three attempts");
+    assert_eq!(output["go"]["n"], 3, "success after retries: {output}");
+}
+
+/// `until` stops the loop. Exhaustion with on_error fail_run fails the run.
+#[tokio::test]
+async fn loop_stops_on_until_and_exhaustion_fails() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    let attempts = Arc::new(AtomicU32::new(0));
+    let attempts_clone = attempts.clone();
+    let runner = lift_async(move |_a: &Action| {
+        let n = attempts_clone.fetch_add(1, Ordering::SeqCst);
+        Ok(serde_json::json!({ "ok": n >= 1 }))
+    });
+    let engine =
+        WorkflowEngine::local_with_async_effect_runner(Some(runner)).expect("engine");
+    let wf = parse_workflow(
+        r##"
+name: loop-until
+trigger:
+  type: webhook
+steps:
+  - name: cycle
+    action: loop
+    max: 4
+    until: "steps_ping_ok == true"
+    body:
+      - name: ping
+        action: send_dm
+        to: a
+        body: x
+        on_error: continue
+"##,
+    )
+    .expect("parse");
+    let output = engine
+        .run(
+            "wf-loop-until",
+            RunInput {
+                run_id: None,
+                workflow: wf,
+                trigger: serde_json::json!({}),
+            },
+        )
+        .await
+        .expect("run");
+    assert_eq!(attempts.load(Ordering::SeqCst), 2, "stopped on the second pass");
+    assert_eq!(output["cycle"]["stopped"], "until", "{output}");
+
+    let attempts = Arc::new(AtomicU32::new(0));
+    let attempts_clone = attempts.clone();
+    let runner = lift_async(move |_a: &Action| {
+        attempts_clone.fetch_add(1, Ordering::SeqCst);
+        Ok(serde_json::json!({ "ok": false, "error": "still red" }))
+    });
+    let engine =
+        WorkflowEngine::local_with_async_effect_runner(Some(runner)).expect("engine");
+    let wf = parse_workflow(
+        r##"
+name: loop-exhaust
+trigger:
+  type: webhook
+steps:
+  - name: cycle
+    action: loop
+    max: 2
+    until: "steps_ping_ok == true"
+    on_error: fail_run
+    body:
+      - name: ping
+        action: send_dm
+        to: a
+        body: x
+        on_error: continue
+"##,
+    )
+    .expect("parse");
+    let output = engine
+        .run(
+            "wf-loop-exhaust",
+            RunInput {
+                run_id: None,
+                workflow: wf,
+                trigger: serde_json::json!({}),
+            },
+        )
+        .await
+        .expect("run returns the failure value");
+    assert_eq!(output["status"], "failed", "exhaustion fails the run: {output}");
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+}
+
+/// Hillclimb's stop bit is a field inside the attempt's reply, not the
+/// dispatch's own `ok` (that only means the attempt ran). A reply with no
+/// `improved` field is not a stop, so the loop spends the cap and then fails.
+#[tokio::test]
+async fn loop_until_reads_promoted_response_and_unbound_continues() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    let attempts = Arc::new(AtomicU32::new(0));
+    let attempts_clone = attempts.clone();
+    let runner = lift_async(move |_a: &Action| {
+        let n = attempts_clone.fetch_add(1, Ordering::SeqCst);
+        let improved = n >= 1;
+        Ok(serde_json::json!({
+            "ok": true,
+            "response": format!("{{\"improved\": {improved}}}")
+        }))
+    });
+    let engine = WorkflowEngine::local_with_async_effect_runner(Some(runner)).expect("engine");
+    let wf = parse_workflow(
+        r##"
+name: loop-improved
+trigger:
+  type: webhook
+steps:
+  - name: cycle
+    action: loop
+    max: 4
+    until: "steps_ping_improved == true"
+    on_error: fail_run
+    body:
+      - name: ping
+        action: send_dm
+        to: a
+        body: x
+        on_error: continue
+"##,
+    )
+    .expect("parse");
+    let output = engine
+        .run(
+            "wf-loop-improved",
+            RunInput {
+                run_id: None,
+                workflow: wf,
+                trigger: serde_json::json!({}),
+            },
+        )
+        .await
+        .expect("run");
+    assert_eq!(attempts.load(Ordering::SeqCst), 2, "stops when improved: {output}");
+    assert_eq!(output["cycle"]["stopped"], "until", "{output}");
+    assert_eq!(output["cycle"]["ok"], true, "{output}");
+
+    let attempts = Arc::new(AtomicU32::new(0));
+    let attempts_clone = attempts.clone();
+    let runner = lift_async(move |_a: &Action| {
+        attempts_clone.fetch_add(1, Ordering::SeqCst);
+        Ok(serde_json::json!({ "ok": true, "response": "prose, no verdict" }))
+    });
+    let engine = WorkflowEngine::local_with_async_effect_runner(Some(runner)).expect("engine");
+    let wf = parse_workflow(
+        r##"
+name: loop-unbound
+trigger:
+  type: webhook
+steps:
+  - name: cycle
+    action: loop
+    max: 2
+    until: "steps_ping_improved == true"
+    on_error: fail_run
+    body:
+      - name: ping
+        action: send_dm
+        to: a
+        body: x
+        on_error: continue
+"##,
+    )
+    .expect("parse");
+    let output = engine
+        .run(
+            "wf-loop-unbound",
+            RunInput {
+                run_id: None,
+                workflow: wf,
+                trigger: serde_json::json!({}),
+            },
+        )
+        .await
+        .expect("run");
+    assert_eq!(attempts.load(Ordering::SeqCst), 2, "missing improved spends the cap: {output}");
+    assert_eq!(output["status"], "failed", "{output}");
+    let err = output["error"].as_str().unwrap_or("");
+    assert!(
+        err.contains("exhausted"),
+        "unbound until is not an immediate guard abort: {output}"
+    );
+}
+
 /// P5.3: `branch` — guard true → `then` runs; guard false → `else` runs.
 #[tokio::test]
 async fn branch_then_else_on_guard() {
