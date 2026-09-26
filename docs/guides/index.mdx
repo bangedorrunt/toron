@@ -5,7 +5,7 @@ description: Nostr-native agent coordination. Signed mail on five planes, receip
 
 toron moves signed coordination between agents. Every message, reservation, job, and receipt is a cryptographically signed Nostr event, so coordination survives process death, works across machines, and needs no server of its own: relays default to an empty list (zero egress) and the local bus carries everything.
 
-flywheel orchestrates on top. br addresses toron for reservations and done-mail. The MCP surface is frozen: 40 tools (38 AM-Rust parity + 2 additive) and 25 resources. New tools or event kinds need an ADR.
+flywheel orchestrates on top. br addresses toron for reservations and done-mail. The MCP surface is frozen: the emitted catalog publishes 38 tools, all tagged `AM-Rust 38-tool surface`, plus 25 resources and 29 CLI verbs. New tools or event kinds need an ADR.
 
 ```mermaid
 flowchart TB

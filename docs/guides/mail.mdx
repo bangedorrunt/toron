@@ -11,6 +11,29 @@ toron mail send --project <slug> --as <Pin> --to captain \
   --corr <corr> --wake tasked --result-path docs/guides/REPORT.md
 ```
 
+```text
+$ toron mail send --project toron --as QuietHarbor --to captain \
+    --subject "[bd-f5g1] starting" --thread bd-f5g1 --body "claiming bd-f5g1"
+{
+  "count": 1,
+  "deliveries": [
+    {
+      "payload": {
+        "event_id": "579eaaa63d5cead14aaa15ffdf8470e96994d71157e0e487140c5b85d1e13e1f",
+        "recipient": "SwiftHeron"
+      },
+      "project": "toron"
+    }
+  ],
+  "verified_sender": true
+}
+```
+
+`count` is deliveries written, and `recipient` is the pin the alias resolved to
+(`captain` is a name, not a mailbox). `verified_sender` means the event was
+signed by the key `--as` names — a send that reports `verified_sender: false`
+is a failure even when it printed an event id.
+
 | Flag | Semantics |
 |---|---|
 | `--thread` | Thread key. For work, always the bead id. |
@@ -28,12 +51,51 @@ Recipients are explicit: `reply_message` does not default to the sender (the fly
 ## Receiving
 
 ```bash
-toron mail inbox --since last        # read + atomic high-water bump (crash-proof)
-toron mail inbox --since_ts 2026-09-10T00:00:00Z
-toron mail search "<fts query>"
-toron mail thread <thread-id>
+toron mail inbox --project <slug> --as <Pin> --since last   # read + atomic high-water bump
+toron mail inbox --project <slug> --as <Pin> --since_ts 2026-09-10T00:00:00Z
+toron mail search --project <slug> --query "<fts query>"    # query is a flag, not a positional
+toron mail thread-summarize --project <slug> --thread <thread-id>
 toron mail whois <project> <name>
 ```
+
+```text
+$ toron mail inbox --project toron --as QuietHarbor --since last
+{
+  "messages": []
+}
+
+$ toron mail thread-summarize --project toron --thread bd-f5g1
+{
+  "action_items": [],
+  "key_points": [ "[bd-f5g1] starting" ],
+  "message_count": 1,
+  "participants": [ "QuietHarbor" ],
+  "thread_id": "bd-f5g1"
+}
+
+$ toron mail whois toron QuietHarbor
+{
+  "last_active_ts_us": 1790378966000000,
+  "model": "flywheel",
+  "name": "QuietHarbor",
+  "npub": "86112aa8bacf5a7f0ab94e113dff52fc47108b7293638f19d756d835bf3b26a8",
+  "pane_id": "wK:p2",
+  "program": "flywheel",
+  "stale": false,
+  "workspace_id": "wK"
+}
+```
+
+An empty `messages` array is the healthy resting state, not a failure: nothing
+arrived since the cursor. `stale: false` on a whois is what makes a pin a live
+addressee rather than a name that resolves to nobody.
+
+If it fails: `error: no cursor for --since last` means this identity never read
+this project before — run one `--since_ts` read first, or accept the first read
+as read-everything. A whois for an unknown name fails fast rather than
+guessing; `mail search` with a bare query string fails with
+`unexpected argument`, because the query is `--query` and the flag order is
+`--query` then `--project`.
 
 `unread_only` is accepted everywhere and ignored. `since_ts` must be RFC3339; a unix integer errors rather than being silently misread. Act on `importance high|urgent` first. MCP `fetch_inbox` takes `agent_name`, `project_key`, optional `since_ts` (RFC3339), `include_bodies`, `limit`, `urgent_only`, `ack_overdue_only`, `thread_id`.
 
@@ -55,8 +117,24 @@ stateDiagram-v2
 ```bash
 toron receipt get --corr <id>
 toron receipt list --state owed
-toron wait --corr <id>          # subscribe-until-receipt; TTL-bounded
+toron wait --corr <id> --project <slug>   # subscribe-until-receipt; TTL-bounded
 ```
+
+```text
+$ toron receipt list --state owed
+toron: error: migrate: migration 13 was previously applied but is missing in the resolved migrations
+```
+
+That is not a documentation error and not an empty result: the database has
+migration 13 applied and the installed binary cannot resolve it, so the receipt
+store refuses to open. The repair is to run a binary built from this checkout
+(or upgrade the installed one) — a receipt read is the first thing to notice,
+because that store is the only one with its own migration set.
+
+If it fails: an empty receipt list for a corr you just sent means the send never
+enqueued a receipt, which is a send-side failure worth reporting rather than
+re-sending on. `wait` returning the wedge pattern instead of a receipt is also a
+signal to escalate; it expires on purpose rather than dropping the question.
 
 `wait` expiry escalates as a wedge pattern instead of dropping silently, and the digest renders earliest-deadline first. Cron and timers are message producers; there is no separate wake kind.
 
