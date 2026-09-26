@@ -122,14 +122,15 @@ toron wait --corr <id> --project <slug>   # subscribe-until-receipt; TTL-bounded
 
 ```text
 $ toron receipt list --state owed
-toron: error: migrate: migration 13 was previously applied but is missing in the resolved migrations
+toron: error: migrate: migration 13 is applied in <data-dir>/index.sqlite but this toron build resolves at most 12, so this binary is older than the store. Fix: rebuild or upgrade toron from the source that wrote the store (cargo install --path crates/toron-cli), or point --data-dir at a store this binary can open.
 ```
 
-That is not a documentation error and not an empty result: the database has
-migration 13 applied and the installed binary cannot resolve it, so the receipt
-store refuses to open. The repair is to run a binary built from this checkout
-(or upgrade the installed one) — a receipt read is the first thing to notice,
-because that store is the only one with its own migration set.
+That is not a documentation error and not an empty result: the store has
+migration 13 applied and this binary resolves only 12, so the receipt store
+refuses to open. The refusal names the store, the missing version, the highest
+version this build resolves, and the repair. Run a binary built from this
+checkout (or upgrade the installed one). A receipt read is the first thing to
+notice, because that store is the only one with its own migration set.
 
 If it fails: an empty receipt list for a corr you just sent means the send never
 enqueued a receipt, which is a send-side failure worth reporting rather than
