@@ -632,6 +632,9 @@ pub enum Action {
     Spawn {
         /// Profile name (`@housekeeper`) to spawn.
         profile: String,
+        /// Optional harness override for this spawn. Absent means the profile's harness.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        harness: Option<String>,
         /// Optional sub-workflow the spawned agent runs.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         workflow: Option<String>,
@@ -675,6 +678,38 @@ pub enum Action {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         init: Option<serde_json::Value>,
     },
+    /// Bounded loop. Runs `body` up to `max` times. When `until` is set, a
+    /// true guard stops the loop as success. Exhausting `max` without the
+    /// guard is `{ok:false}` so the step's `on_error` decides the run.
+    /// A `fail_run` step inside the body still aborts immediately.
+    Loop {
+        /// Positive integer, or a template that renders to one (`{{inputs.max_iterations}}`).
+        #[serde(deserialize_with = "de_loop_max")]
+        max: String,
+        /// Guard evaluated after each pass. True stops successfully.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        until: Option<String>,
+        /// The steps of one pass. Output names are stable across iterations
+        /// (the latest pass wins) so `until` can read `steps_<name>_<key>`.
+        body: Vec<Step>,
+    },
+}
+
+/// `max: 3` and `max: "{{inputs.max_iterations}}"` are both authors' spellings.
+fn de_loop_max<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum MaxSpec {
+        N(u64),
+        S(String),
+    }
+    match MaxSpec::deserialize(deserializer)? {
+        MaxSpec::N(n) => Ok(n.to_string()),
+        MaxSpec::S(s) => Ok(s),
+    }
 }
 
 /// The closed reduce-operation vocabulary (bd-3pti). Unknown spellings fail
@@ -726,6 +761,7 @@ impl Action {
             Self::Spawn { .. } => "spawn",
             Self::Verify { .. } => "verify",
             Self::Reduce { .. } => "reduce",
+            Self::Loop { .. } => "loop",
         }
     }
 }
@@ -878,13 +914,14 @@ pub const ACTION_TYPES: [&str; 7] = [
 
 /// The P5.3 control-flow action types (ADR-0005 Spec 4) added on top of the
 /// original 7.
-pub const CONTROL_FLOW_ACTION_TYPES: [&str; 6] = [
+pub const CONTROL_FLOW_ACTION_TYPES: [&str; 7] = [
     "retry",
     "branch",
     "foreach",
     "parallel",
     "call_workflow",
     "reduce",
+    "loop",
 ];
 
 /// Template-payload access for `{{trigger.<field>}}` / `{{steps.<name>}}`.

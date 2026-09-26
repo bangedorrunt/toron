@@ -5050,6 +5050,7 @@ steps:
                 "spawn",
                 Action::Spawn {
                     profile: "@p".into(),
+                    harness: None,
                     workflow: None,
                     await_: false,
                     no_claim_timeout: 0,

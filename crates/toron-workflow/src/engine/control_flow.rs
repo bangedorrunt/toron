@@ -503,6 +503,7 @@ pub(crate) fn invocation_for_leaf(
     node: &str,
     attempt: u32,
     max_attempts: u32,
+    iteration_key: Option<&str>,
 ) -> ActionInvocation {
     ActionInvocation {
         action,
@@ -510,7 +511,7 @@ pub(crate) fn invocation_for_leaf(
             run_id: run_id.to_string(),
             workflow_digest: workflow_digest.to_string(),
             node_path: node.to_string(),
-            iteration_key: None,
+            iteration_key: iteration_key.map(str::to_string),
             effect_key: None,
             attempt,
             provider_result: None,
@@ -712,6 +713,7 @@ pub(crate) fn run_step<'a>(
         workflow,
         run_id,
         workflow_digest,
+        None,
     )
 }
 
@@ -727,6 +729,7 @@ pub(crate) fn run_step_with_enclosing<'a>(
     workflow: &'a str,
     run_id: &'a str,
     workflow_digest: &'a str,
+    iteration_key: Option<&'a str>,
 ) -> std::pin::Pin<
     Box<
         dyn std::future::Future<Output = resonate_sdk::prelude::Result<serde_json::Value>>
@@ -753,7 +756,7 @@ pub(crate) fn run_step_with_enclosing<'a>(
         let mut attempt: u32 = 0;
         loop {
             attempt += 1;
-            let value = match &step.action {
+            let mut value = match &step.action {
                 Action::Delay { secs } => {
                     // bd-zbnw (ADR-0035 Spec 2.5): the lint advisory cap is
                     // now enforced — an over-cap delay sleeps the cap, says
@@ -862,6 +865,7 @@ pub(crate) fn run_step_with_enclosing<'a>(
                                 node,
                                 attempt,
                                 enclosing_retry.map(|(m, _)| m).unwrap_or(1),
+                                iteration_key,
                             );
                             dispatch_leaf_or_compat(ctx, &invocation).await
                         }
@@ -927,6 +931,7 @@ pub(crate) fn run_step_with_enclosing<'a>(
                         trigger,
                         over,
                         each,
+                        step_outputs,
                         workflow,
                         node,
                         run_id,
@@ -941,8 +946,24 @@ pub(crate) fn run_step_with_enclosing<'a>(
                     workflow: child,
                     inputs,
                 } => run_call_workflow(ctx, workflow, child, inputs, step_outputs, trigger).await?,
+                Action::Loop { max, until, body } => {
+                    run_loop(
+                        ctx,
+                        trigger,
+                        max,
+                        until.as_deref(),
+                        body,
+                        step_outputs,
+                        workflow,
+                        node,
+                        run_id,
+                        workflow_digest,
+                    )
+                    .await?
+                }
                 Action::Spawn {
                     profile,
+                    harness,
                     workflow,
                     await_,
                     no_claim_timeout,
@@ -951,6 +972,7 @@ pub(crate) fn run_step_with_enclosing<'a>(
                     run_spawn(
                         ctx,
                         profile,
+                        harness.as_deref(),
                         workflow.as_deref(),
                         *await_,
                         *no_claim_timeout,
@@ -959,14 +981,17 @@ pub(crate) fn run_step_with_enclosing<'a>(
                     .await?
                 }
             };
+            // A dispatch that answered with a JSON object (or one fenced
+            // block) publishes those fields on the step. Guards such as
+            // `steps.measure.improved` can then see `improved`.
+            promote_response_fields(&mut value);
 
             // P0.2 (ADR-0005 Spec 0 + ADR-0024 Spec 1): `on_error: fail_run`
             // converts a step failure into a RUN failure — a deterministic durable
             // RETURN, never a panic. ADR-0032 Spec 7: retry candidacy resolves
             // in the ONE coordinator (frozen FailureKind vocabulary); a
             // retryable runtime failure retries the SAME node, bounded.
-            if step.on_error == StepOnError::FailRun
-                && value.get("ok").and_then(serde_json::Value::as_bool) == Some(false)
+            if step.on_error == StepOnError::FailRun && crate::engine::is_failure_value(&value)
             {
                 let kind = value.get("kind").and_then(|v| v.as_str()).unwrap_or("");
                 if RetryCoordinator::is_retryable_value(&value) {
@@ -1048,10 +1073,15 @@ pub(crate) async fn run_retry(
     workflow_digest: &str,
 ) -> resonate_sdk::prelude::Result<serde_json::Value> {
     // Flatten nested wrappers: the outer policy wins for the whole subtree.
-    let mut target = inner;
-    while let Action::Retry { step: nested, .. } = &target.action {
-        target = nested;
+    // The inner step is run as Continue so its own fail_run does not turn
+    // the first miss into a run-level `{status:failed}` before this loop
+    // has spent `max_attempts`. The outer step's on_error still decides
+    // what exhaustion means for the run.
+    let mut owned = inner.clone();
+    while let Action::Retry { step: nested, .. } = &owned.action {
+        owned = (**nested).clone();
     }
+    owned.on_error = crate::schema::StepOnError::Continue;
     let coordinator = RetryCoordinator::from_retry_action(max_attempts, backoff_secs);
     let mut last_value: Option<serde_json::Value> = None;
     for attempt in 1..=max_attempts.max(1) {
@@ -1060,24 +1090,22 @@ pub(crate) async fn run_retry(
         let value = run_step_with_enclosing(
             ctx,
             trigger,
-            target,
+            &owned,
             &mut outputs,
             Some((max_attempts, backoff_secs)),
             workflow,
             run_id,
             workflow_digest,
+            None,
         )
         .await?;
-        let failed = value.get("ok").and_then(serde_json::Value::as_bool) == Some(false);
+        let failed = crate::engine::is_failure_value(&value);
         if !failed {
             return Ok(value);
         }
-        // If inner returned a fail_run terminal (status failed) for retryable
-        // kind, run_step_with_enclosing already retried up to bound and
-        // returned the terminal; do not loop further — escalate.
-        if value.get("status").and_then(|v| v.as_str()) == Some("failed") {
-            return Ok(value);
-        }
+        // Suspension is an Err and never reaches here. A terminal
+        // `{status:failed}` from a nested control-flow action is one
+        // attempt, not an excuse to skip the remaining attempts.
         last_value = Some(value);
         if coordinator.should_retry(attempt) && backoff_secs > 0 {
             ctx.sleep(Duration::from_secs(backoff_secs)).await?;
@@ -1108,8 +1136,21 @@ pub(crate) async fn run_retry(
 /// becomes `trigger_<key>` (the invoke path flattens caller inputs onto the
 /// trigger, so an input-gated intent is spelled `trigger_x` in guards — raw
 /// `{{inputs.*}}` templates do NOT resolve in guard position), and every
-/// recorded step output becomes `steps_<name>[_<key>]`. Strings pass through
-/// verbatim; anything else renders as JSON text.
+/// recorded step output becomes `steps_<name>[_<key>]`. Bool JSON and the
+/// strings `true`/`false` become booleans. Every other value stays text.
+/// Bool JSON and the strings `true`/`false` become evalexpr booleans so
+/// `steps_verify_ok == true` and `trigger_gate_before_implement == "true"`
+/// are the same comparison. Every other value stays text.
+fn guard_eval_value(v: &serde_json::Value) -> evalexpr::Value {
+    match v {
+        serde_json::Value::Bool(b) => evalexpr::Value::Boolean(*b),
+        serde_json::Value::String(s) if s == "true" => evalexpr::Value::Boolean(true),
+        serde_json::Value::String(s) if s == "false" => evalexpr::Value::Boolean(false),
+        serde_json::Value::String(s) => evalexpr::Value::from(s.clone()),
+        other => evalexpr::Value::from(other.to_string()),
+    }
+}
+
 pub(crate) fn guard_vars(
     trigger: &serde_json::Value,
     step_outputs: &serde_json::Map<String, serde_json::Value>,
@@ -1118,11 +1159,7 @@ pub(crate) fn guard_vars(
     if let Some(obj) = trigger.as_object() {
         for (k, v) in obj {
             let name = format!("trigger_{k}");
-            let text = match v {
-                serde_json::Value::String(s) => s.clone(),
-                other => other.to_string(),
-            };
-            vars.insert(name, evalexpr::Value::from(text));
+            vars.insert(name, guard_eval_value(v));
         }
     }
     for (step_name, output) in step_outputs {
@@ -1133,15 +1170,11 @@ pub(crate) fn guard_vars(
                     step_name.replace('-', "_"),
                     k.replace('-', "_")
                 );
-                let text = match v {
-                    serde_json::Value::String(s) => s.clone(),
-                    other => other.to_string(),
-                };
-                vars.insert(name, evalexpr::Value::from(text));
+                vars.insert(name, guard_eval_value(v));
             }
         } else {
             let name = format!("steps_{}", step_name.replace('-', "_"));
-            vars.insert(name, evalexpr::Value::from(output.to_string()));
+            vars.insert(name, guard_eval_value(output));
         }
     }
     vars
@@ -1168,8 +1201,13 @@ pub(crate) async fn evaluate_step_guard(
     let Some(g) = guard.filter(|g| !g.trim().is_empty()) else {
         return GuardVerdict::Proceed;
     };
+    // Dotted paths (`steps.gate.ok`, `inputs.mode`) and quoted bools
+    // (`== "true"`) are the spellings compose and the playbooks use.
+    // The binder stores flat names and real booleans.
+    let flattened = crate::guard::normalize_guard_paths(g);
+    let rewritten = crate::guard::rewrite_bool_string_literals(&flattened);
     let vars = guard_vars(trigger, step_outputs);
-    match crate::guard::evaluate_guard_default(Some(g), &vars).await {
+    match crate::guard::evaluate_guard_default(Some(&rewritten), &vars).await {
         crate::guard::GuardOutcome::Bool(true) => GuardVerdict::Proceed,
         crate::guard::GuardOutcome::Unset => GuardVerdict::Proceed,
         crate::guard::GuardOutcome::Bool(false) => GuardVerdict::Skip {
@@ -1301,6 +1339,17 @@ pub(crate) async fn run_foreach(
         .await?;
         collected.push(value);
     }
+    if let Some(failed) = collected.iter().find(|v| crate::engine::is_failure_value(v)) {
+        let error = failed
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("foreach item failed");
+        return Ok(serde_json::json!({
+            "ok": false,
+            "error": error,
+            "results": collected,
+        }));
+    }
     Ok(serde_json::Value::Array(collected))
 }
 
@@ -1322,14 +1371,16 @@ pub(crate) async fn run_parallel(
     trigger: &serde_json::Value,
     over: &str,
     each: &Step,
+    step_outputs: &serde_json::Map<String, serde_json::Value>,
     workflow: &str,
     node: &str,
     run_id: &str,
     workflow_digest: &str,
 ) -> resonate_sdk::prelude::Result<serde_json::Value> {
-    // Elastic N: `over: "4"` → 4 concurrent copies. Crew role (@crew.r) is
-    // resolved by the orchestrator before invoke; the engine sees a concrete N.
-    let parsed: Option<usize> = over.trim().parse().ok().filter(|n| *n > 0);
+    // Elastic N: `over: "4"`, `over: "{{inputs.n}}"`, or a number already
+    // rendered by the scheduler. `@crew.role` stays unresolved here. The
+    // orchestrator rewrites that to a count before invoke.
+    let parsed = parallel_fanout_count(over, trigger, step_outputs);
     let Some(n) = parsed else {
         return Ok(serde_json::json!({
             "ok": false,
@@ -1343,7 +1394,7 @@ pub(crate) async fn run_parallel(
         }));
     }
     let mut futures = Vec::new();
-    for _ in 0..n {
+    for i in 0..n {
         let each = each.clone();
         let trigger = trigger.clone();
         let workflow = workflow.to_string();
@@ -1356,6 +1407,11 @@ pub(crate) async fn run_parallel(
                     workflow,
                     run_id: run_id.to_string(),
                     workflow_digest: workflow_digest.to_string(),
+                    // Prior steps are visible inside each copy. The copy
+                    // index keeps effect keys distinct so N copies are N
+                    // effects, not one journal row replayed N times.
+                    prior_outputs: step_outputs.clone(),
+                    iteration_key: Some(format!("p{i}")),
                 },
             )
             .spawn()?;
@@ -1364,6 +1420,17 @@ pub(crate) async fn run_parallel(
     let mut collected = Vec::new();
     for future in futures {
         collected.push(future.await?);
+    }
+    if let Some(failed) = collected.iter().find(|v| crate::engine::is_failure_value(v)) {
+        let error = failed
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("parallel copy failed");
+        return Ok(serde_json::json!({
+            "ok": false,
+            "error": error,
+            "results": collected,
+        }));
     }
     Ok(serde_json::Value::Array(collected))
 }
@@ -1383,6 +1450,13 @@ pub struct ParallelCopyInput {
     /// Canonical workflow digest for run-scoped effect keys (bd-zczp).
     #[serde(default)]
     pub workflow_digest: String,
+    /// Outputs from steps that finished before this fan-out. Empty on
+    /// replay of a payload written before the field existed.
+    #[serde(default)]
+    pub prior_outputs: serde_json::Map<String, serde_json::Value>,
+    /// Distinguishes this copy's effect key from its siblings.
+    #[serde(default)]
+    pub iteration_key: Option<String>,
 }
 
 /// A durable child running one `parallel` copy of a step. The runner is
@@ -1392,15 +1466,17 @@ pub async fn run_parallel_copy(
     ctx: &Context,
     input: ParallelCopyInput,
 ) -> resonate_sdk::Result<serde_json::Value> {
-    let mut outputs = serde_json::Map::new();
-    let value = run_step(
+    let mut outputs = input.prior_outputs.clone();
+    let value = run_step_with_enclosing(
         ctx,
         &input.trigger,
         &input.step,
         &mut outputs,
+        None,
         &input.workflow,
         &input.run_id,
         &input.workflow_digest,
+        input.iteration_key.as_deref(),
     )
     .await?;
     Ok(value)
@@ -1809,16 +1885,16 @@ pub(crate) async fn run_call_workflow(
         }));
     }
     // ADR-0032 Spec 3: bind declared defaults exactly like direct invoke.
-    let merged = WorkflowEngine::bind_input_defaults(&child_wf.inputs, inputs);
+    // Parent inputs flow into the child. Explicit call inputs win key by
+    // key, so `workflow:bug-fix` keeps symptom/verify from the compose run
+    // and still overrides `goal` with the objective string.
+    let provided = merge_parent_inputs(trigger, inputs);
+    let merged = WorkflowEngine::bind_input_defaults(&child_wf.inputs, &provided);
     let mut trigger_map = serde_json::Map::new();
     for (k, v) in &merged {
         trigger_map.insert(k.clone(), v.clone());
     }
-    if inputs.as_object().is_some() {
-        trigger_map.insert("inputs".into(), serde_json::Value::Object(merged));
-    } else {
-        trigger_map.insert("inputs".into(), inputs.clone());
-    }
+    trigger_map.insert("inputs".into(), serde_json::Value::Object(merged.clone()));
     trigger_map.insert(
         "parent_steps".into(),
         serde_json::Value::Object(step_outputs.clone()),
@@ -1839,6 +1915,25 @@ pub(crate) async fn run_call_workflow(
     future.await
 }
 
+/// Parent `trigger.inputs` plus the call's explicit object. Explicit keys win.
+fn merge_parent_inputs(
+    trigger: &serde_json::Value,
+    explicit: &serde_json::Value,
+) -> serde_json::Value {
+    let mut merged = serde_json::Map::new();
+    if let Some(parent) = trigger.get("inputs").and_then(serde_json::Value::as_object) {
+        for (k, v) in parent {
+            merged.insert(k.clone(), v.clone());
+        }
+    }
+    if let Some(obj) = explicit.as_object() {
+        for (k, v) in obj {
+            merged.insert(k.clone(), v.clone());
+        }
+    }
+    serde_json::Value::Object(merged)
+}
+
 /// Run a `spawn` action (ADR-0005 Spec 4a).
 ///
 /// 1. Resolve `profile` via the injected `ProfileResolver` DI seam.
@@ -1854,6 +1949,7 @@ pub(crate) async fn run_call_workflow(
 pub(crate) async fn run_spawn(
     ctx: &Context,
     profile: &str,
+    harness: Option<&str>,
     workflow: Option<&str>,
     await_: bool,
     no_claim_timeout: u64,
@@ -1881,6 +1977,9 @@ pub(crate) async fn run_spawn(
         // forget, never resolve).
         "await": await_,
     });
+    if let Some(h) = harness.map(str::trim).filter(|h| !h.is_empty()) {
+        spec["harness"] = serde_json::json!(h);
+    }
     if let Some(ctx_mode) = context {
         spec["context"] =
             serde_json::to_value(ctx_mode).unwrap_or(serde_json::Value::String("inherit".into()));
@@ -1942,7 +2041,160 @@ pub(crate) fn resolve_template_ref(
                     .map(serde_json::Value::String)
             });
     }
-    serde_json::from_str(trimmed).ok()
+    if let Some(value) = serde_json::from_str::<serde_json::Value>(trimmed).ok() {
+        return Some(value);
+    }
+    // `@items` and a bare name are the compose spelling of "the list called
+    // items". JSON literals and `{{...}}` are handled above.
+    let name = trimmed.trim_start_matches('@');
+    if name.is_empty() || name == trimmed && trimmed.contains(' ') {
+        return None;
+    }
+    if let Some(v) = trigger.get("inputs").and_then(|i| i.get(name)) {
+        return Some(v.clone());
+    }
+    if let Some(v) = trigger.get(name) {
+        return Some(v.clone());
+    }
+    step_outputs.get(name).cloned()
+}
+
+/// Cap on `loop` iterations. A template that renders above this fails loud.
+pub(crate) const MAX_LOOP_ITERS: u32 = 32;
+
+/// Run a `loop` action. `until` true stops as success. A fail_run body step
+/// aborts the loop with that failure. Exhaustion is `{ok:false}` so the
+/// loop step's own on_error decides the run. A recorded stub (dry run,
+/// `{action: ...}` and no `ok`) is one preview pass, not a fake verify.
+pub(crate) async fn run_loop(
+    ctx: &Context,
+    trigger: &serde_json::Value,
+    max: &str,
+    until: Option<&str>,
+    body: &[Step],
+    step_outputs: &mut serde_json::Map<String, serde_json::Value>,
+    workflow: &str,
+    node: &str,
+    run_id: &str,
+    workflow_digest: &str,
+) -> resonate_sdk::prelude::Result<serde_json::Value> {
+    let rendered_max = resolve_template_ref(max, trigger, step_outputs)
+        .and_then(|v| match v {
+            serde_json::Value::Number(n) => n.as_u64(),
+            serde_json::Value::String(s) => s.trim().parse().ok(),
+            _ => None,
+        })
+        .or_else(|| max.trim().parse().ok());
+    let Some(max_n) = rendered_max.filter(|n| *n >= 1) else {
+        return Ok(serde_json::json!({
+            "ok": false,
+            "error": format!("workflow {workflow:?} node {node:?}: loop max {max:?} must render to a positive integer"),
+        }));
+    };
+    if max_n > u64::from(MAX_LOOP_ITERS) {
+        return Ok(serde_json::json!({
+            "ok": false,
+            "error": format!("workflow {workflow:?} node {node:?}: loop max {max_n} exceeds the cap {MAX_LOOP_ITERS}"),
+        }));
+    }
+    let max_n = max_n as u32;
+    for i in 1..=max_n {
+        let iteration = format!("i{i}");
+        if let Some(failed) = run_steps_iter(
+            ctx,
+            trigger,
+            body,
+            step_outputs,
+            workflow,
+            run_id,
+            workflow_digest,
+            Some(&iteration),
+        )
+        .await?
+        {
+            return Ok(failed);
+        }
+        let Some(until_expr) = until.filter(|g| !g.trim().is_empty()) else {
+            continue;
+        };
+        match evaluate_step_guard(Some(until_expr), trigger, step_outputs, node).await {
+            GuardVerdict::Proceed => {
+                return Ok(serde_json::json!({
+                    "ok": true,
+                    "iterations": i,
+                    "stopped": "until",
+                }));
+            }
+            GuardVerdict::Skip { .. } => {}
+            GuardVerdict::Fail { error } => {
+                if recorded_preview(step_outputs) {
+                    return Ok(serde_json::json!({
+                        "ok": true,
+                        "recorded": true,
+                        "iterations": i,
+                    }));
+                }
+                // The attempt did not publish a field the guard names.
+                // That is "not yet", so the loop spends another pass.
+                // A syntax or type error still stops on this pass.
+                if error.contains("Variable identifier is not bound to anything by context") {
+                    continue;
+                }
+                return Ok(serde_json::json!({ "ok": false, "error": error, "iterations": i }));
+            }
+        }
+    }
+    if until.is_some() {
+        return Ok(serde_json::json!({
+            "ok": false,
+            "error": format!("loop exhausted after {max_n} iterations without until"),
+            "iterations": max_n,
+        }));
+    }
+    Ok(serde_json::json!({ "ok": true, "iterations": max_n }))
+}
+
+/// A dry-run leaf is `{action: "..."}` with no verdict. That is a preview,
+/// not a passed verify and not a failed one.
+fn recorded_preview(outputs: &serde_json::Map<String, serde_json::Value>) -> bool {
+    outputs.values().any(|v| {
+        v.get("action").and_then(serde_json::Value::as_str).is_some()
+            && v.get("ok").is_none()
+            && v.get("status").is_none()
+    })
+}
+
+pub(crate) async fn run_steps_iter(
+    ctx: &Context,
+    trigger: &serde_json::Value,
+    steps: &[Step],
+    step_outputs: &mut serde_json::Map<String, serde_json::Value>,
+    workflow: &str,
+    run_id: &str,
+    workflow_digest: &str,
+    iteration: Option<&str>,
+) -> resonate_sdk::prelude::Result<Option<serde_json::Value>> {
+    for step in steps {
+        let value = run_step_with_enclosing(
+            ctx,
+            trigger,
+            step,
+            step_outputs,
+            None,
+            workflow,
+            run_id,
+            workflow_digest,
+            iteration,
+        )
+        .await?;
+        if value.get("status").and_then(serde_json::Value::as_str) == Some("failed") {
+            return Ok(Some(value));
+        }
+        if let Some(name) = &step.name {
+            step_outputs.insert(name.clone(), value);
+        }
+    }
+    Ok(None)
 }
 
 /// ADR-0032 Spec 3: runtime graph validation — the second honesty gate.
@@ -2088,6 +2340,7 @@ pub(crate) async fn run_graph(
                     GraphNodeInput {
                         action: rendered,
                         guard: node.guard.clone(),
+                        on_error: node.on_error,
                         trigger: trigger.clone(),
                         run_id: run_id.to_string(),
                         workflow_name: workflow_name.to_string(),
@@ -2138,8 +2391,7 @@ pub(crate) async fn run_graph(
                 } => RetryCoordinator::from_retry_action(*max_attempts, *backoff_secs),
                 _ => RetryCoordinator::default_policy(),
             };
-            if node.on_error == StepOnError::FailRun
-                && value.get("ok").and_then(serde_json::Value::as_bool) == Some(false)
+            if node.on_error == StepOnError::FailRun && crate::engine::is_failure_value(&value)
             {
                 let kind = value.get("kind").and_then(|v| v.as_str()).unwrap_or("");
                 if RetryCoordinator::is_retryable_value(&value) {
@@ -2182,6 +2434,7 @@ pub(crate) async fn run_graph(
                             GraphNodeInput {
                                 action: rendered,
                                 guard: node.guard.clone(),
+                                on_error: node.on_error,
                                 trigger: trigger.clone(),
                                 run_id: run_id.to_string(),
                                 workflow_name: workflow_name.to_string(),
@@ -2290,6 +2543,10 @@ pub struct GraphNodeInput {
     /// in-flight serialized inputs readable.
     #[serde(default)]
     pub guard: Option<String>,
+    /// The node's failure policy. Default Continue keeps a payload from
+    /// before this field readable. New runs pass the authored policy.
+    #[serde(default)]
+    pub on_error: crate::schema::StepOnError,
     /// The trigger payload (bd-m7ac): control-flow nodes (parallel/foreach/
     /// branch) need it to render their inner steps — the raw runner path did
     /// not. Serialized with the action so the child is self-contained.
@@ -2412,6 +2669,7 @@ pub async fn run_graph_node(
             | Action::Branch { .. }
             | Action::Retry { .. }
             | Action::CallWorkflow { .. }
+            | Action::Loop { .. }
             | Action::RequestApproval { .. }
             | Action::Delay { .. }
             | Action::Spawn { .. }
@@ -2424,7 +2682,9 @@ pub async fn run_graph_node(
         let step = Step {
             name: None,
             guard: None,
-            on_error: crate::schema::StepOnError::Continue,
+            // The node's own policy. Forcing Continue here dropped every
+            // inner `{status:failed}` on the floor and the graph finished green.
+            on_error: input.on_error,
             build_slot: false,
             action: input.action,
         };
@@ -2459,6 +2719,7 @@ pub async fn run_graph_node(
         &input.node_name,
         input.attempt,
         1,
+        None,
     );
     Ok(dispatch_leaf_or_compat(ctx, &invocation).await)
 }
@@ -2533,6 +2794,61 @@ pub fn build_workflow_run_terminal(
     )
     .map_err(|e| anyhow::anyhow!("build kind-46012 terminal: {e}"))
 }
+/// Count for `parallel over`. A bare positive integer, a template that
+/// renders to one, or a JSON number. `@crew.role` is not a count.
+pub(crate) fn parallel_fanout_count(
+    over: &str,
+    trigger: &serde_json::Value,
+    step_outputs: &serde_json::Map<String, serde_json::Value>,
+) -> Option<usize> {
+    fn positive(n: u64) -> Option<usize> {
+        usize::try_from(n).ok().filter(|n| *n > 0)
+    }
+    if let Ok(n) = over.trim().parse::<u64>() {
+        return positive(n);
+    }
+    match resolve_template_ref(over, trigger, step_outputs)? {
+        serde_json::Value::Number(n) => n.as_u64().and_then(positive),
+        serde_json::Value::String(s) => s.trim().parse::<u64>().ok().and_then(positive),
+        _ => None,
+    }
+}
+
+/// If `response` is a JSON object, or one fenced block that is, copy its
+/// fields onto the step value. Existing keys (`ok`, `error`) stay.
+fn promote_response_fields(value: &mut serde_json::Value) {
+    let Some(obj) = value.as_object_mut() else {
+        return;
+    };
+    let Some(text) = obj.get("response").and_then(serde_json::Value::as_str) else {
+        return;
+    };
+    let Some(parsed) = json_object_in_text(text) else {
+        return;
+    };
+    let extras: Vec<(String, serde_json::Value)> = parsed.into_iter().collect();
+    for (k, v) in extras {
+        obj.entry(k).or_insert(v);
+    }
+}
+
+/// The whole string, or a single ``` fence, when that text is a JSON object.
+fn json_object_in_text(text: &str) -> Option<serde_json::Map<String, serde_json::Value>> {
+    fn parse(s: &str) -> Option<serde_json::Map<String, serde_json::Value>> {
+        match serde_json::from_str::<serde_json::Value>(s.trim()) {
+            Ok(serde_json::Value::Object(map)) => Some(map),
+            _ => None,
+        }
+    }
+    if let Some(map) = parse(text) {
+        return Some(map);
+    }
+    let trimmed = text.trim();
+    let rest = trimmed.strip_prefix("```json").or_else(|| trimmed.strip_prefix("```"))?;
+    let body = rest.rsplit_once("```")?.0;
+    parse(body)
+}
+
 #[cfg(test)]
 mod control_flow_guard_tests {
     use super::guard_vars;
@@ -2554,9 +2870,36 @@ mod control_flow_guard_tests {
         );
         assert_eq!(
             vars.get("steps_grill_ok"),
-            Some(&evalexpr::Value::from("true")),
+            Some(&evalexpr::Value::Boolean(true)),
             "object outputs expand to steps_<name>_<key>"
         );
+    }
+
+    #[test]
+    fn parallel_count_reads_a_template_and_refuses_a_crew_role() {
+        let trigger = serde_json::json!({"inputs": {"n": 3}});
+        let outputs = serde_json::Map::new();
+        assert_eq!(
+            super::parallel_fanout_count("{{inputs.n}}", &trigger, &outputs),
+            Some(3)
+        );
+        assert_eq!(super::parallel_fanout_count("4", &trigger, &outputs), Some(4));
+        assert_eq!(
+            super::parallel_fanout_count("@crew.coder", &trigger, &outputs),
+            None
+        );
+    }
+
+    #[test]
+    fn response_json_promotes_fields_without_clobbering_ok() {
+        let mut value = serde_json::json!({
+            "ok": true,
+            "response": "{\"improved\": true, \"ok\": false, \"number\": 2}"
+        });
+        super::promote_response_fields(&mut value);
+        assert_eq!(value["ok"], true);
+        assert_eq!(value["improved"], true);
+        assert_eq!(value["number"], 2);
     }
 }
 

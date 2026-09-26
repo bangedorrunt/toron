@@ -751,6 +751,15 @@ fn collect_action_strings(action: &Action, out: &mut Vec<String>) {
                 out.push(t.clone());
             }
         }
+        Action::Loop { max, until, body } => {
+            out.push(max.clone());
+            if let Some(g) = until {
+                out.push(g.clone());
+            }
+            for step in body {
+                collect_step_strings(step, out);
+            }
+        }
     }
 }
 
@@ -766,6 +775,7 @@ fn step_or_nested(step: &Step) -> Box<dyn Iterator<Item = &Step> + '_> {
             v.extend(else_steps.iter());
         }
         Action::Foreach { each, .. } | Action::Parallel { each, .. } => v.push(each),
+        Action::Loop { body, .. } => v.extend(body.iter()),
         _ => {}
     }
     Box::new(v.into_iter())
