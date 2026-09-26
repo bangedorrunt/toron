@@ -148,6 +148,51 @@ pub async fn connect_single(db_path: &str) -> anyhow::Result<SqliteConnection> {
     Ok(conn)
 }
 
+/// Highest migration version this binary resolves. Compared against the
+/// store's applied set when a skew refuses the open (bd-jivw).
+fn resolved_max_version() -> i64 {
+    MIGRATOR.iter().map(|m| m.version).max().unwrap_or(0)
+}
+
+/// bd-jivw: a store can be AHEAD of the binary that opens it. The shared XDG
+/// store is written by whatever toron touched it last (dev builds and
+/// installed binaries share the root, ADR-0007 D3), so an older binary dies
+/// on sqlx's bare `VersionMissing` and every verb reads as broken. Name the
+/// skew, the store, and the fix.
+fn migration_skew_message(store: &str, missing: i64, resolved_max: i64) -> String {
+    format!(
+        "migration {missing} is applied in {store} but this toron build resolves at most \
+         {resolved_max}, so this binary is older than the store. Fix: rebuild or upgrade \
+         toron from the source that wrote the store (cargo install --path crates/toron-cli), \
+         or point --data-dir at a store this binary can open."
+    )
+}
+
+/// Same skew, different shape: the version exists on both sides with
+/// different contents (the migration file changed after it was applied).
+fn migration_content_mismatch_message(store: &str, version: i64) -> String {
+    format!(
+        "migration {version} is applied in {store} but this toron build ships different \
+         contents for it, so the store was written by a different build. Fix: rebuild or \
+         upgrade toron from the source that wrote the store, or point --data-dir at a store \
+         this binary can open."
+    )
+}
+
+/// Map sqlx's migration failures into errors that carry the store, the skew,
+/// and the fix. Every other failure keeps its own message.
+fn map_migrate_error(store: &str, e: sqlx::migrate::MigrateError) -> anyhow::Error {
+    match e {
+        sqlx::migrate::MigrateError::VersionMissing(v) => {
+            anyhow::anyhow!(migration_skew_message(store, v, resolved_max_version()))
+        }
+        sqlx::migrate::MigrateError::VersionMismatch(v) => {
+            anyhow::anyhow!(migration_content_mismatch_message(store, v))
+        }
+        other => other.into(),
+    }
+}
+
 /// Apply all embedded migrations, serialized against concurrent migrators
 /// of the SAME database file (GS-018): sqlx inserts one row per version
 /// into `_sqlx_migrations`, so two processes/threads migrating a fresh
@@ -199,11 +244,12 @@ pub async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
             }
         }
     }
+    let store_label = pool.connect_options().get_filename().display().to_string();
     let out = MIGRATOR.run(pool).await;
     if let Some(lock) = lock_path {
         let _ = std::fs::remove_file(&lock);
     }
-    out?;
+    out.map_err(|e| map_migrate_error(&store_label, e))?;
     Ok(())
 }
 
@@ -481,6 +527,69 @@ mod tests {
         .unwrap();
         assert_eq!(n, 1, "messages_fts exists");
 
+        drop(pool);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// bd-jivw: an older binary meeting a newer store must name the skew and
+    /// the fix. The repro substitutes the older binary with one fabricated
+    /// applied row (version 99) that the resolved set can never contain.
+    #[tokio::test]
+    async fn migrate_error_names_the_missing_version_and_the_fix() {
+        let (pool, path) = temp_pool("version-skew").await;
+        migrate(&pool).await.expect("baseline migrate");
+        sqlx::query(
+            "INSERT INTO _sqlx_migrations \
+             (version, description, installed_on, success, checksum, execution_time) \
+             VALUES (99, 'written by a newer toron', CURRENT_TIMESTAMP, TRUE, X'00', 0)",
+        )
+        .execute(&pool)
+        .await
+        .expect("fabricate a migration only a newer binary could have applied");
+
+        let err = migrate(&pool)
+            .await
+            .expect_err("a store ahead of the binary must refuse to open");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("99"), "must name the missing version: {msg}");
+        let resolved_max = MIGRATOR.iter().map(|m| m.version).max().unwrap_or(0);
+        assert!(
+            msg.contains(&resolved_max.to_string()),
+            "must name what this build resolves ({resolved_max}): {msg}"
+        );
+        assert!(
+            msg.contains("rebuild") || msg.contains("upgrade"),
+            "must name the fix: {msg}"
+        );
+        assert!(
+            msg.contains(path.to_str().unwrap()),
+            "must name the store: {msg}"
+        );
+        drop(pool);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// bd-jivw, second arm: a migration file edited after it was applied must
+    /// read as a content mismatch, not as sqlx's bare VersionMismatch.
+    #[tokio::test]
+    async fn migrate_error_names_a_content_mismatch() {
+        let (pool, path) = temp_pool("content-skew").await;
+        migrate(&pool).await.expect("baseline migrate");
+        sqlx::query("UPDATE _sqlx_migrations SET checksum = X'ff' WHERE version = 13")
+            .execute(&pool)
+            .await
+            .expect("alter an applied migration's checksum");
+
+        let err = migrate(&pool)
+            .await
+            .expect_err("a modified applied migration must refuse the open");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("13"), "must name the version: {msg}");
+        assert!(msg.contains("different"), "must say the contents differ: {msg}");
+        assert!(
+            msg.contains("rebuild") || msg.contains("upgrade"),
+            "must name the fix: {msg}"
+        );
         drop(pool);
         let _ = std::fs::remove_file(path);
     }
