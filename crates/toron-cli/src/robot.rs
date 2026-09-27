@@ -429,6 +429,15 @@ fn stamp_bootstrap_pane(
 pub async fn run_agent(mailbox: &Mailbox, cmd: &AgentCommand, dry_run: bool) -> anyhow::Result<()> {
     match cmd {
         AgentCommand::Bootstrap(args) => {
+            // bd-pinrule: the pin is a NAMESPACE, not a label, so the shape is
+            // enforced at the door where an operator types it. Identity is
+            // per-PROJECT, so one agent holds a different key in each project
+            // and a name two agents can pick independently WILL collide: proven
+            // live, `Buffy` is registered in two projects and resolves to two
+            // different npubs, so mail sent to that name from one project is
+            // invisible to the agent reading under the other (bd-xroute).
+            toron_core::nostr::identity::validate_agent_pin(&args.agent)
+                .map_err(anyhow::Error::msg)?;
             let profile = toron_core::nostr::identity::AgentProfile {
                 name: args.agent.clone(),
                 program: args.program.clone(),
@@ -531,6 +540,10 @@ pub async fn run_agent_daemon(
 ) -> anyhow::Result<()> {
     match cmd {
         AgentCommand::Bootstrap(args) => {
+            // bd-pinrule: same gate on the daemon arm, or the rule holds only
+            // when the CLI happens to run embedded.
+            toron_core::nostr::identity::validate_agent_pin(&args.agent)
+                .map_err(anyhow::Error::msg)?;
             // bd-toron-bootstrap-dryrun-mutates-1-we4c: the daemon arm must not
             // mutate under `--dry-run` either. The daemon holds the mailbox, so
             // the CLI cannot canonicalize the slug or read the key path without

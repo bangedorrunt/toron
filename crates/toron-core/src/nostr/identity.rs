@@ -87,6 +87,91 @@ pub fn build_profile_event(
     build_profile_event_with_roles(keys, project_slug, profile, &[], created_at)
 }
 
+/// bd-pinrule: an agent pin is CamelCase Adjective+Noun, and that is a
+/// NAMESPACE rule, not a style rule.
+///
+/// WHY IT MATTERS, measured on this host. Identity is per-PROJECT: the same pane
+/// holds a DIFFERENT key in each project it is registered in. `whois flywheel
+/// Buffy` and `whois toron.dev Buffy` return two different npubs — and `Buffy` is
+/// a single ordinary word, the kind of name two unrelated agents pick
+/// independently. A name that is distinctive AND structured (`IvoryRidge`) is
+/// what keeps two agents from colliding; a name like `Buffy` or `Agent1` cannot.
+///
+/// This is enforced at the REGISTRATION door, not at resolution: refusing to
+/// read a legacy name would orphan every agent already registered, and the
+/// misroute this prevents is a send-time problem, so a warn-at-create plus a
+/// warn-at-send is where it belongs.
+///
+/// Project SLUGS are deliberately NOT covered — `demo`, `forge` and
+/// `parity-product` are legitimate kebab-case project names, and conflating the
+/// two vocabularies is how a naming rule gets ignored.
+#[must_use]
+pub fn validate_agent_pin(name: &str) -> Result<(), String> {
+    let reject = |why: &str| {
+        Err(format!(
+            "agent pin {name:?} is not CamelCase Adjective+Noun ({why}). Pins are a \
+             NAMESPACE, not a label: identity is per-project, so the same agent \
+             holds a different key in every project, and a name two agents can \
+             pick independently WILL collide. Use e.g. IvoryRidge, EmberOtter, \
+             TealMarlin. Project slugs are unaffected and stay kebab-case."
+        ))
+    };
+    if name.is_empty() {
+        return reject("empty");
+    }
+    if name.len() < 3 {
+        return reject("too short to be two words");
+    }
+    // Alphabetic only, NOT alphanumeric: a digit makes the first "word" not a
+    // word (`Ivory2Ridge`), and `Agent1` is exactly the kind of name two agents
+    // pick independently. Each word must be Upper then lowercase(s).
+    if !name.chars().all(|c| c.is_ascii_alphabetic()) {
+        return reject("contains a non-alphabetic character — each word is Upper then lowercase");
+    }
+    // Exactly two Capitalised words. An uppercase begins a word when it is at
+    // index 0 OR follows a lowercase — my first version only counted the
+    // "follows a lowercase" case, so it scored EmberOtter as ONE word and
+    // refused the pin I use myself. The fence caught it, which is the third
+    // time this session that has paid for itself.
+    let mut words = 0usize;
+    let mut prev_lower = false;
+    for (i, c) in name.chars().enumerate() {
+        if c.is_ascii_uppercase() {
+            if i == 0 || prev_lower {
+                words += 1;
+            }
+            prev_lower = false;
+        } else {
+            prev_lower = true;
+        }
+    }
+    if !name.ends_with(char::is_alphabetic) {
+        return reject("ends mid-word");
+    }
+    // Each word is Upper then lower(s): NO two capitals may be adjacent, or the
+    // first "word" is not a capitalised word but a typo. Without this,
+    // `IVoryRidge` scores as exactly two words and is accepted.
+    let mut prev_upper = false;
+    for c in name.chars() {
+        if c.is_ascii_uppercase() {
+            if prev_upper {
+                return reject("two capitals in a row — each word is Upper then lowercase");
+            }
+            prev_upper = true;
+        } else {
+            prev_upper = false;
+        }
+    }
+    if words != 2 {
+        return reject(if words == 1 {
+            "one word only — needs Adjective AND Noun"
+        } else {
+            "more than two words"
+        });
+    }
+    Ok(())
+}
+
 /// Build a profile event that also carries `role=` tags (bd-lmcy).
 /// Roles are signed, replaceable via the same `d` tag — the latest event per
 /// `d` wins (NIP-01). Each role becomes `["role", "<name>"]`.
@@ -700,5 +785,75 @@ mod bd_xroute_tests {
                 "{from}: must say the consequence is invisibility, not loss: {w}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod bd_pinrule_tests {
+    use super::validate_agent_pin;
+
+    /// The live set. Every one of these is a real pin in use, which is the
+    /// point: the rule has to accept the names people actually chose.
+    #[test]
+    fn the_pins_in_live_use_are_accepted() {
+        for pin in [
+            "EmberOtter", "PeachRobin", "RoseCoyote", "MaroonDove", "AmberQuill",
+            "IvoryRidge", "TealMarlin", "BlueLake", "ScarletOwl",
+        ] {
+            assert!(
+                validate_agent_pin(pin).is_ok(),
+                "{pin} is a pin in live use and must be accepted: {:?}",
+                validate_agent_pin(pin)
+            );
+        }
+    }
+
+    /// `Buffy` is the live counter-example: a single ordinary word, registered
+    /// in two projects, and it resolved to TWO different npubs — the misroute
+    /// bd-xroute warns about. So the refusal has to name that shape.
+    #[test]
+    fn a_single_word_is_refused_and_the_reason_is_actionable() {
+        let e = validate_agent_pin("Buffy").expect_err("one word is not AdjNoun");
+        assert!(e.contains("Adjective"), "names the shape: {e}");
+        assert!(
+            e.contains("IvoryRidge") || e.contains("EmberOtter"),
+            "offers a conforming example, or the operator cannot act: {e}"
+        );
+    }
+
+    #[test]
+    fn the_shapes_that_collide_are_all_refused() {
+        for bad in [
+            "Agent1",      // word + digit
+            "agent",       // lowercase
+            "ivoryridge",  // lowercase joined
+            "IVoryRidge",  // two capitals in a row
+            "AB",          // shouty
+            "EmberOTTER",  // shouty tail
+            "Ivory-Ridge", // kebab
+            "Ivory_Ridge", // snake
+            "Blue",        // adjective only
+            "Ridge",       // noun only
+            "IvoryRidgeCreek", // three words
+            "",            // empty
+            "Ab",          // too short
+            "Ivory2Ridge", // digit inside
+        ] {
+            assert!(
+                validate_agent_pin(bad).is_err(),
+                "{bad:?} must be refused: a name two agents can pick independently WILL collide"
+            );
+        }
+    }
+
+    /// Project slugs are a DIFFERENT vocabulary and must be unaffected —
+    /// otherwise the rule gets ignored as obviously wrong.
+    #[test]
+    fn the_refusal_does_not_claim_to_cover_project_slugs() {
+        let e = validate_agent_pin("demo").expect_err("not a pin shape");
+        assert!(
+            e.contains("Project slugs"),
+            "must scope itself to pins so `demo`/`forge` stay legal project names: {e}"
+        );
     }
 }
