@@ -2645,6 +2645,16 @@ async fn daemon_mcp_client(
 fn strict_hatch_exits_zero_when_disabled() {
     // A repo with an unreserved staged path.
     let repo = staged_git_repo("hatch");
+    // bd-yolv: pin a mailbox root. Without it this test has NO source
+    // configured, so the selector falls through to the default-port probe — and
+    // on any machine running a real toron daemon (:18080) that probe succeeds
+    // and `RefuseSecondStore` fires, so the test fails for a reason that has
+    // nothing to do with the guard hatch it is testing. It was passing only
+    // because this machine happened to have nothing on :18080 at the time.
+    // A test that only passes on an idle machine is not a test.
+    let root = std::env::temp_dir().join(format!("toron-hatch-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("pinned root");
     let out = toron()
         .args([
             "guard",
@@ -2656,9 +2666,11 @@ fn strict_hatch_exits_zero_when_disabled() {
             "--as-agent",
             "HatchAgent",
         ])
+        .env("TORON_MCP_DATA_DIR", &root)
         .env("TORON_GUARD_STRICT", "0")
         .output()
         .expect("guard check with hatch");
+    let _ = std::fs::remove_dir_all(&root);
     assert_eq!(
         out.status.code(),
         Some(0),

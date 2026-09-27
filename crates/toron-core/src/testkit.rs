@@ -64,7 +64,6 @@ pub fn reap_orphaned_servers() -> usize {
         return 0;
     };
     let mut reaped = 0;
-    let mut survivors: Vec<String> = Vec::new();
     for line in raw.lines() {
         let mut it = line.split_whitespace();
         let (Some(pid), Some(port)) = (it.next(), it.next()) else {
@@ -82,7 +81,13 @@ pub fn reap_orphaned_servers() -> usize {
         unsafe_free_signal(pid, TERM);
         reaped += 1;
     }
-    let _ = std::fs::write(&path, survivors.join("\n"));
+    // DRAIN the ledger, explicitly. Every line still here was a spawn whose
+    // `ChildGuard` never ran `forget_spawn` — i.e. an orphan — so there is
+    // nothing to keep. This used to write a `survivors` vec that was declared
+    // and never populated, so the truncation worked by accident rather than by
+    // decision. If a future rule ever wants to KEEP a line, that is the place,
+    // and it must be a real push rather than an empty join.
+    let _ = std::fs::write(&path, "");
     if reaped > 0 {
         eprintln!(
             "toron testkit: reaped {reaped} orphaned resonate serve process(es) from a previous run"

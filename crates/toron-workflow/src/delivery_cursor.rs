@@ -73,6 +73,7 @@ impl DeliveryCursorStore {
     ///
     /// Intra-batch duplicates are reported as [`DeliveryEffect::SkipAlreadyDelivered`]
     /// (same call treats the first sighting as the sole undelivered keep).
+    #[allow(clippy::significant_drop_tightening)]
     pub fn peek_undelivered(
         &self,
         session: &str,
@@ -120,6 +121,7 @@ impl DeliveryCursorStore {
     /// the same lock so a concurrent reserve for the same session/parent cannot
     /// also keep them. Caller must [`Self::mark_delivered`] after successful
     /// publish, or [`Self::release_reservation`] on transport failure.
+    #[allow(clippy::significant_drop_tightening)]
     pub fn reserve_undelivered(
         &self,
         session: &str,
@@ -153,6 +155,7 @@ impl DeliveryCursorStore {
 
     /// Drop in-flight reservations without marking delivered (transport failure).
     /// Ids become peekable/reservable again. Idempotent for unknown ids.
+    #[allow(clippy::significant_drop_tightening)]
     pub fn release_reservation(
         &self,
         session: &str,
@@ -168,6 +171,7 @@ impl DeliveryCursorStore {
     /// Advance the session cursor for successfully published/delivered ids.
     /// Clears any in-flight reservation for those ids.
     /// Idempotent: already-delivered ids emit [`DeliveryEffect::SkipAlreadyDelivered`].
+    #[allow(clippy::significant_drop_tightening)]
     pub fn mark_delivered(
         &self,
         session: &str,
@@ -262,10 +266,7 @@ impl Drop for ReservationGuard<'_> {
 }
 
 /// Pure helper: reject agent-key-as-seen heuristic — signing key ≠ delivery.
-pub const fn agent_key_is_not_delivery_proof(
-    _agent_pubkey_hex: &str,
-    _event_id: &str,
-) -> bool {
+pub const fn agent_key_is_not_delivery_proof(_agent_pubkey_hex: &str, _event_id: &str) -> bool {
     // Intentionally always true as a documentation assertion for callers:
     // delivery membership must come from DeliveryCursorStore, never from
     // "this agent key signed the event".
