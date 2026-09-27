@@ -484,7 +484,7 @@ impl MentionCoalescer {
     }
 
     /// Number of DLQ entries (observable for tests / ops).
-    pub fn dlq_len(&self) -> usize {
+    pub const fn dlq_len(&self) -> usize {
         self.dlq.len()
     }
 

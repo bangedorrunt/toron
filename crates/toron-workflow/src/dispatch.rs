@@ -167,11 +167,8 @@ impl DispatchPool {
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
         let claimed_generation = self.generation_of(agent);
-        match self.try_acquire_fenced(agent, now_ms, claimed_generation) {
-            Ok(permit) => Some(permit),
-            // Option API drops effects — live hosts must not use this path.
-            Err(_fx) => None,
-        }
+        // Option API drops effects — live hosts must not use this path.
+        self.try_acquire_fenced(agent, now_ms, claimed_generation).ok()
     }
 
     /// Semaphore + one-in-flight slot acquire (no busy-owner holder).
@@ -574,7 +571,7 @@ mod tests {
             hold_bound_ms: 1_000,
         });
         // Occupy the only global slot (live try_acquire also inserts a busy holder for "other").
-        let _cap = pool.try_acquire("other").expect("cap holder");
+        let cap = pool.try_acquire("other").expect("cap holder");
         assert_eq!(pool.in_flight_for("other"), 1);
         assert!(
             pool.busy_holder("other"),
@@ -593,7 +590,7 @@ mod tests {
         );
         assert_eq!(pool.in_flight_for("a"), 0);
         // After cap frees, fenced acquire works.
-        drop(_cap);
+        drop(cap);
         let ok = pool
             .try_acquire_fenced("a", 60, 0)
             .expect("fenced after cap free");
