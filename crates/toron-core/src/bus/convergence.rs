@@ -150,7 +150,7 @@ pub fn tick(
 
 /// Presence/ephemeral fail-closed helper: if the authority confirm flag is
 /// false, refuse before fanout (Buzz #7532 pattern without Redis).
-pub fn presence_admit(authority_confirmed: bool) -> Result<(), &'static str> {
+pub const fn presence_admit(authority_confirmed: bool) -> Result<(), &'static str> {
     if authority_confirmed {
         Ok(())
     } else {
@@ -247,7 +247,7 @@ mod tests {
         let (s, _) = tick(
             None,
             &ConvergenceMsg::Propose {
-                op: op.clone(),
+                op,
                 generation: 7,
             },
         );
