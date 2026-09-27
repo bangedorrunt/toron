@@ -74,19 +74,39 @@ fn render_list(f: &mut Frame, area: Rect, model: &Model, focused: bool, narrow: 
         None => format!("{} — {}", model.mail.folder.title(), rows.len()),
     };
     if rows.is_empty() {
-        let text = if !model.mail.loaded {
+        // An empty pane is the moment to name the next command, with this
+        // project and pin already in it. A FAILED fetch is settled, not
+        // pending, so it shows the refusal and the command that fixes it
+        // rather than a spinner that never stops.
+        let on = model.onboarding();
+        let failed = model.mail.error.as_deref();
+        let text = if let Some(err) = failed {
+            format!(
+                "{err}\n\n  the inbox did not load. retry with r, or register this pin and reopen:
+    {}",
+                on.agent
+            )
+        } else if !model.mail.loaded {
             "loading the index…".to_string()
         } else if model.settings.agent.is_none() {
-            "no acting pin — pass --as or export TORON_AGENT, then the inbox appears".to_string()
+            format!(
+                "no acting pin, so there is no inbox to read.\n\n  register one:\n    {}\n\nthen start the console with --as (or export TORON_AGENT).",
+                on.agent
+            )
         } else if model.mail.search.is_some() {
             format!(
                 "no hits for {:?} — Esc clears the search",
                 model.input.trim()
             )
         } else {
-            "nothing in this folder".to_string()
+            format!(
+                "nothing in this folder yet.\n\n  send the first message:\n    {}\n\n  or open a room first:\n    {}",
+                on.mail, on.channel
+            )
         };
-        let style = if model.settings.agent.is_none() && model.mail.loaded {
+        let style = if failed.is_some() {
+            HackerNight::error()
+        } else if model.settings.agent.is_none() && model.mail.loaded {
             HackerNight::warning()
         } else {
             HackerNight::fg_muted()

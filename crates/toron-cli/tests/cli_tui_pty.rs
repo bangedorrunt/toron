@@ -20,8 +20,8 @@
 
 use std::io::{Read, Write};
 use std::process::{Command, Stdio};
-use std::sync::mpsc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 /// Per-test-run data dir, matching cli_tui.rs: the durable production root
 /// (`~/.local/share/toron`) holds 500+ agent keys and rebuilding it in a test
@@ -43,12 +43,18 @@ fn have_script() -> bool {
         .unwrap_or(false)
 }
 
-/// Run the console on a 45x24 PTY, send `q` once it is up, and return
-/// everything the terminal drew plus the exit code.
+/// Run the console on a 45x24 PTY, wait for `until` to appear on screen, then
+/// send `q`. Returns everything the terminal drew plus the exit code.
 ///
-/// The read is bounded: a console that does not exit is a failure with a
-/// message, not a hung test run.
-fn console_on_a_45_col_pty(program: &std::path::Path) -> (String, i32) {
+/// Waiting for CONTENT rather than a fixed sleep is the point: the console
+/// opens its store (and, in a real deployment, its keys) before the first data
+/// frame, so a guessed delay either races it or wastes seconds. Both waits are
+/// bounded, so a wedged console fails with a message instead of hanging.
+///
+/// `until` must be a needle that only the SETTLED pane draws. The header is
+/// already on screen in the first frame, so a needle it satisfies would let a
+/// stuck "loading…" pane pass this witness.
+fn console_on_a_45_col_pty(program: &std::path::Path, until: &str) -> (String, i32) {
     let scripted = format!(
         "stty cols 45 rows 24; exec '{}' tui --project tuipty --as PtyAgent --refresh-ms 250",
         program.display()
@@ -70,33 +76,55 @@ fn console_on_a_45_col_pty(program: &std::path::Path) -> (String, i32) {
         .spawn()
         .expect("spawn script(1)");
 
-    // Quit once the alternate screen is up. A newline rides along in case the
-    // pty is still in canonical mode when the bytes arrive (it is delivered
-    // with the line, then ignored as a key).
-    let mut stdin = child.stdin.take().expect("pty stdin");
-    std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(1500));
-        let _ = stdin.write_all(b"q\n");
-        let _ = stdin.flush();
-    });
-
+    let drawn = Arc::new(Mutex::new(String::new()));
     let mut stdout = child.stdout.take().expect("pty stdout");
-    let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let mut buf = String::new();
-        let _ = stdout.read_to_string(&mut buf);
-        let _ = tx.send(buf);
-    });
-
-    let drawn = match rx.recv_timeout(Duration::from_secs(30)) {
-        Ok(drawn) => drawn,
-        Err(_) => {
-            let _ = child.kill();
-            panic!("the console did not exit within 30s on a 45x24 pty (wedged narrow path)");
-        }
+    let reader = {
+        let drawn = Arc::clone(&drawn);
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 8192];
+            while let Ok(n) = stdout.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                drawn
+                    .lock()
+                    .expect("drawn buffer")
+                    .push_str(&String::from_utf8_lossy(&buf[..n]));
+            }
+        })
     };
-    let status = child.wait().expect("console exit status");
-    (drawn, status.code().unwrap_or(-1))
+
+    let shown = |needle: &str| drawn.lock().expect("drawn buffer").contains(needle);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < deadline && !shown(until) {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // `q` leaves the alternate screen; holding stdin open until now (rather
+    // than closing it) is what keeps the pty session alive to draw at all.
+    let mut stdin = child.stdin.take().expect("pty stdin");
+    let _ = stdin.write_all(b"q\n");
+    let _ = stdin.flush();
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut code = None;
+    while Instant::now() < deadline {
+        if let Some(status) = child.try_wait().expect("console exit status") {
+            code = Some(status.code().unwrap_or(-1));
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    if code.is_none() {
+        let _ = child.kill();
+        panic!(
+            "the console did not exit after `q` on a 45x24 pty (wedged narrow path). It drew:\n{}",
+            drawn.lock().expect("drawn buffer")
+        );
+    }
+    let _ = reader.join();
+    let text = drawn.lock().expect("drawn buffer").clone();
+    (text, code.unwrap_or(-1))
 }
 
 /// The console works at phone width: one pane, the compact chrome, no resize
@@ -111,7 +139,10 @@ fn the_console_runs_at_45_columns_on_a_real_terminal() {
         return;
     }
     let program = std::path::Path::new(env!("CARGO_BIN_EXE_toron"));
-    let (drawn, code) = console_on_a_45_col_pty(program);
+    // Wait for the onboarding TEXT, not the header: `--project tuipty` is only
+    // ever printed by a command the empty pane named. The header already says
+    // `tuipty/PtyAgent`, so waiting on that would pass before the pane settled.
+    let (drawn, code) = console_on_a_45_col_pty(program, "--project tuipty");
 
     assert_eq!(
         code, 0,
@@ -128,5 +159,16 @@ fn the_console_runs_at_45_columns_on_a_real_terminal() {
     assert!(
         drawn.contains("1M"),
         "the phone-width chrome compacted the tab bar:\n{drawn}"
+    );
+    // The data dir is fresh and `PtyAgent` is not registered in it, so the
+    // inbox fetch is REFUSED. The pane must still name a real, pasteable
+    // command at this width — `agent bootstrap` is the fix for exactly that
+    // refusal, and `mail send` is what a loaded-but-empty inbox names. Either
+    // one settles the pane; `loading the index…` forever is the failure this
+    // witness exists to catch.
+    assert!(
+        drawn.contains("toron agent bootstrap --project tuipty")
+            || drawn.contains("toron mail send --project tuipty"),
+        "the empty pane names the next command on a real pty:\n{drawn}"
     );
 }
