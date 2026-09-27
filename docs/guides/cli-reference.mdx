@@ -34,7 +34,17 @@ Global flags on every command: `--json` (structured reads), `--plain` (flat tabl
 | `doctor` | Deep health (`--check` exits 3); `doctor reconstruct` rebuilds SQLite from git |
 | `metrics` | Operator counters: tool calls, errors, latency |
 | `bench` | Mailbox scenarios: startup, inbox, send, search, threads |
-| `tui` | Operator dashboard; refuses non-TTY |
+| `tui` | Operator console: Mail/Channels/Agents/Dashboard/Settings tabs, vim keys; refuses non-TTY |
+
+## Operator console (`tui`)
+
+`toron tui [--refresh-ms <n>] [--project <slug>] [--as <pin>] [--tab <name>] [--folder <name>] [--all]`.
+
+Five tabs: `1` Mail, `2` Channels, `3` Agents, `4` Dashboard, `5` Settings (`--tab` also takes `inbox|channel|stats|config`). Folders are Inbox/Unread/Threads/NeedsAck/Important (`--folder` also takes `all|new|thread|ack|high`); `--all` includes closed channels on the Channels tab.
+
+Keys: `q`/Ctrl-C quit, `?` help, Tab/Shift-Tab or `1`-`5` switch tabs, `j`/`k`/arrows and `space`/PgDn move, `g`/`G` top/bottom, `h`/`l` panes, Enter open, `/` filter (Enter on Mail runs a server search), `a` ack, `m` mark read, `r` refresh, `[`/`]` refresh cadence, `-`/`+` dashboard window (6→12→24→48), `d` dense, `t` relative time, `c` closed channels.
+
+The project falls back to `$TORON_PROJECT` and the agent to `$TORON_AGENT`/`$FLYWHEEL_MAIL_AS`/`$AGENT_NAME`; without either the tab fails loud rather than guessing. It reads the one mailbox the source selector resolves and refuses a non-loopback daemon. The whole console is an Elm core (`tick(&Model, Msg) -> (Model, Vec<Effect>)`): the fold does no I/O, the host runs every effect under a bound, and Channels/Dashboard refresh on a slower cadence than Mail/Agents.
 
 ## MCP clusters (the emitted 38-tool surface)
 

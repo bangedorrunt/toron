@@ -181,7 +181,8 @@ pub enum Command {
     /// Bench a mailbox scenario (startup/inbox/send/search/threads). AM-Rust parity.
     Bench(BenchArgs),
 
-    /// Interactive operator dashboard (ratatui; standalone-daemon TUI).
+    /// Operator console (ratatui): mail, channels, agents, dashboard,
+    /// settings — live against the project's one local store.
     Tui(TuiArgs),
 
     /// Workflow (ADR-0005 Spec 5): lint/validate/run/invoke/dry-run a single
@@ -1722,9 +1723,27 @@ pub struct BenchArgs {
 
 #[derive(Debug, Args)]
 pub struct TuiArgs {
-    /// Poll/refresh interval in milliseconds.
+    /// Poll/refresh interval in milliseconds (live-tunable in the Settings tab).
     #[arg(long, default_value_t = 1000)]
     pub refresh_ms: u64,
+    /// Project slug to open. Falls back to $TORON_PROJECT; with neither the
+    /// TUI fails loud (no silent `demo` default — same rule as presence).
+    #[arg(long)]
+    pub project: Option<String>,
+    /// Acting agent pin whose inbox the Mail tab projects. Falls back to
+    /// $TORON_AGENT / $FLYWHEEL_MAIL_AS / $AGENT_NAME; without either the
+    /// Mail tab reports a missing identity instead of guessing one.
+    #[arg(long = "as")]
+    pub agent: Option<String>,
+    /// Open on this tab (mail|channels|agents|dashboard|settings).
+    #[arg(long, default_value = "mail")]
+    pub tab: String,
+    /// Open on this mail folder (inbox|threads|ack|important).
+    #[arg(long, default_value = "inbox")]
+    pub folder: String,
+    /// Include closed (retired) channels in the Channels tab.
+    #[arg(long)]
+    pub all: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -1777,6 +1796,11 @@ mod flag_conformance_tests {
             "toron doctor reconstruct",
             "toron presence publish",
             "toron presence list",
+            // `toron tui` scopes to a project like presence does: --project
+            // falls back to $TORON_PROJECT (the pane env `agent bootstrap`
+            // stamps) and the command FAILS LOUD when neither is present, so
+            // there is no silent default to route the operator at `demo`.
+            "toron tui",
         ];
         let root = Cli::command();
         walk(&root, String::new(), &waived, &mut banned, &mut bad_project);
