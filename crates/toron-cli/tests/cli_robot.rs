@@ -1855,7 +1855,66 @@ fn presence_help_lists_commands() {
 
 /// Boot a real `toron serve --mcp-http` daemon on a free port with its own
 /// data dir. Returns (child, port). The caller must kill the child.
-fn boot_daemon(data_dir: &std::path::Path) -> (std::process::Child, u16) {
+/// bd-yolv: a daemon that is RELEASED, not merely spawned.
+///
+/// This function used to return a bare `std::process::Child`. `Child` has no
+/// `Drop`, so every test that booted a daemon leaked it for the lifetime of the
+/// machine. Measured on this host after one session of running this suite: **27
+/// live `toron serve` processes holding 1,186 MB**, every one reparented to
+/// init. Four of the six call sites did `let (_daemon, port) = boot_daemon(..)`
+/// and then simply never used `daemon` again, which is the shape that hides it.
+///
+/// Note the contrast with `toron_core::testkit::ChildGuard`, which DOES have a
+/// Drop and is used for `resonate serve` in this same repo. The daemon path was
+/// just never routed through it. The leak was never the guard's fault; it was
+/// the guard not being on this path.
+struct DaemonGuard(Option<std::process::Child>);
+
+impl DaemonGuard {
+    /// Release early instead of at scope end. Idempotent.
+    fn kill(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+
+    fn pid(&self) -> u32 {
+        self.0.as_ref().map_or(0, std::process::Child::id)
+    }
+}
+
+impl Drop for DaemonGuard {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            // SIGTERM first, then reap: `toron serve` holds a sqlite store and
+            // a listening socket, and SIGKILL leaves both for the next run.
+            // The escalation is bounded, so a wedged daemon cannot hang the
+            // suite — the wait is `try_wait` in a loop, never a blocking one.
+            let pid = child.id();
+            let _ = std::process::Command::new("kill")
+                .arg("-TERM")
+                .arg(pid.to_string())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(5_000);
+            loop {
+                match child.try_wait() {
+                    Ok(Some(_)) => return,
+                    Ok(None) if std::time::Instant::now() < deadline => {
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                    }
+                    _ => break,
+                }
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+fn boot_daemon(data_dir: &std::path::Path) -> (DaemonGuard, u16) {
     // Pick a free port: bind, note it, drop the listener.
     let port = std::net::TcpListener::bind("127.0.0.1:0")
         .and_then(|l| l.local_addr())
@@ -1868,6 +1927,7 @@ fn boot_daemon(data_dir: &std::path::Path) -> (std::process::Child, u16) {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
+        .map(|c| DaemonGuard(Some(c)))
         .expect("spawn toron serve");
     // Wait for the port to accept (the daemon mounts /mcp at bind time).
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
@@ -2269,7 +2329,7 @@ fn guard_check_reads_reservations_from_daemon_when_url_set() {
     let _ = std::fs::remove_dir_all(&empty_dir);
     std::fs::create_dir_all(&empty_dir).expect("empty dir");
 
-    let (mut daemon, port) = boot_daemon(&daemon_dir);
+    let (_daemon, port) = boot_daemon(&daemon_dir);
     let url = format!("http://127.0.0.1:{port}/mcp");
     let repo = staged_git_repo("a");
 
@@ -2334,8 +2394,6 @@ fn guard_check_reads_reservations_from_daemon_when_url_set() {
         "embedded empty-dir guard must NOT see the daemon lease (control)"
     );
 
-    let _ = daemon.kill();
-    let _ = daemon.wait();
     let _ = std::fs::remove_dir_all(&daemon_dir);
     let _ = std::fs::remove_dir_all(&empty_dir);
     let _ = std::fs::remove_dir_all(&repo);
@@ -2355,7 +2413,7 @@ fn request_release_respond_transfer_via_daemon_url() {
     let _ = std::fs::remove_dir_all(&empty_dir);
     std::fs::create_dir_all(&empty_dir).expect("empty dir");
 
-    let (mut daemon, port) = boot_daemon(&daemon_dir);
+    let (_daemon, port) = boot_daemon(&daemon_dir);
     let url = format!("http://127.0.0.1:{port}/mcp");
 
     let lease_id = acquire_lease_via_daemon_returning_id(port, "demo", "HolderPin", "src/a.rs");
@@ -2456,8 +2514,6 @@ fn request_release_respond_transfer_via_daemon_url() {
         "transfer names the new holder, got {xfer_value}"
     );
 
-    let _ = daemon.kill();
-    let _ = daemon.wait();
     let _ = std::fs::remove_dir_all(&daemon_dir);
     let _ = std::fs::remove_dir_all(&empty_dir);
 }
@@ -2625,7 +2681,7 @@ fn guard_daemon_resolves_committer_to_registered_npub() {
     let _ = std::fs::remove_dir_all(&empty_dir);
     std::fs::create_dir_all(&empty_dir).expect("empty dir");
 
-    let (mut daemon, port) = boot_daemon(&daemon_dir);
+    let (_daemon, port) = boot_daemon(&daemon_dir);
     let url = format!("http://127.0.0.1:{port}/mcp");
     let repo = staged_git_repo("npub");
 
@@ -2662,8 +2718,6 @@ fn guard_daemon_resolves_committer_to_registered_npub() {
         "no blocked paths for CoralFinch (npub resolves): {value}"
     );
 
-    let _ = daemon.kill();
-    let _ = daemon.wait();
     let _ = std::fs::remove_dir_all(&daemon_dir);
     let _ = std::fs::remove_dir_all(&empty_dir);
     let _ = std::fs::remove_dir_all(&repo);
@@ -2682,7 +2736,7 @@ fn strict_hatch_exits_zero_when_held_by_other() {
     let _ = std::fs::remove_dir_all(&empty_dir);
     std::fs::create_dir_all(&empty_dir).expect("empty dir");
 
-    let (mut daemon, port) = boot_daemon(&daemon_dir);
+    let (_daemon, port) = boot_daemon(&daemon_dir);
     let url = format!("http://127.0.0.1:{port}/mcp");
     let repo = staged_git_repo("hatch-other");
 
@@ -2712,8 +2766,6 @@ fn strict_hatch_exits_zero_when_held_by_other() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    let _ = daemon.kill();
-    let _ = daemon.wait();
     let _ = std::fs::remove_dir_all(&daemon_dir);
     let _ = std::fs::remove_dir_all(&empty_dir);
     let _ = std::fs::remove_dir_all(&repo);
@@ -2732,7 +2784,7 @@ fn guard_embedded_committer_resolves_via_daemon_npub() {
     let _ = std::fs::remove_dir_all(&daemon_dir);
     let _ = std::fs::remove_dir_all(&local_dir);
 
-    let (mut daemon, port) = boot_daemon(&daemon_dir);
+    let (_daemon, port) = boot_daemon(&daemon_dir);
     let url = format!("http://127.0.0.1:{port}/mcp");
 
     // Local repo root with a DIFFERENT CoralFinch key (the witness: repo-local
@@ -2791,8 +2843,6 @@ fn guard_embedded_committer_resolves_via_daemon_npub() {
         "committer resolves to daemon npub (own lease visible): {value}"
     );
 
-    let _ = daemon.kill();
-    let _ = daemon.wait();
     let _ = std::fs::remove_dir_all(&daemon_dir);
     let _ = std::fs::remove_dir_all(&local_dir);
 }
@@ -3142,4 +3192,65 @@ fn agent_prune_absorbs_folded_slug_leftovers_through_binary() {
     let again_json: Value = serde_json::from_slice(&again.stdout).expect("re-prune JSON");
     assert_eq!(again_json["removed_count"], 0, "idempotent: {again_json}");
     assert_eq!(again_json["kept_count"], 0, "clean: {again_json}");
+}
+
+/// bd-yolv: the daemon guard releases on the PANIC path, which is the whole
+/// point. The old cleanup was two lines at the END of a test body — after the
+/// asserts — so a failing assert skipped it and the daemon survived. That is
+/// why 27 of them (1,186 MB) were live on this host: not a missing cleanup, a
+/// cleanup in the wrong place.
+///
+/// Asserted by CATCHING a panic, because that is the only way to exercise
+/// unwinding. A fence that runs the happy path cannot tell a Drop-based guard
+/// from a hand-rolled cleanup at the end of the body.
+#[test]
+fn the_daemon_guard_releases_even_when_the_test_panics() {
+    let dir = std::env::temp_dir().join(format!("toron-guard-fence-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("data dir");
+
+    // The daemon's PORT is the only thing observable from outside: `boot_daemon`
+    // passes the data dir as an ENV var, so it never appears in `ps` output.
+    // My first fence grepped the process table for the fixture's directory, and
+    // removing the Drop left it GREEN — a detector that can never fire is worse
+    // than none, because it reads as coverage. The port cannot lie.
+    let mut port = 0u16;
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let (_daemon, p) = boot_daemon(&dir);
+        port = p;
+        assert!(p > 0);
+        panic!("simulated failing assertion, which is how 27 daemons survived");
+    }));
+    assert!(
+        outcome.is_err(),
+        "the closure must have panicked, or this fence proves nothing"
+    );
+    assert!(
+        port > 0,
+        "the fixture must have booted a daemon to be worth leaking"
+    );
+
+    // `boot_daemon` already waited for the port to accept, so the daemon WAS
+    // serving; all that is left to prove is that the unwind released it. My
+    // first version asserted the OPPOSITE as a precondition — "still serving
+    // after the panic" — which is the leak, not the fix, so the fence failed
+    // when the guard worked correctly. An inverted assertion is worse than none:
+    // it makes correct code look broken.
+    let still_serving = |p: u16| {
+        std::net::TcpStream::connect_timeout(
+            &format!("127.0.0.1:{p}").parse().expect("addr"),
+            std::time::Duration::from_millis(300),
+        )
+        .is_ok()
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while still_serving(port) && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    assert!(
+        !still_serving(port),
+        "the daemon from the PANICKING fixture is STILL SERVING on :{port} after 15s, which is \
+         exactly the leak that left 27 of them (1,186 MB) on this host"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }
