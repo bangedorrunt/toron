@@ -84,14 +84,12 @@ async fn run_loop<H: TuiHost>(
     spawn_input(event_tx);
 
     let mut model = model;
-    let mut inflight = 0usize;
     let mut handles: Vec<JoinHandle<()>> = Vec::new();
 
     let (next, effects) = update::tick(&model, Msg::Init);
     model = next;
-    inflight += dispatch(&host, &tx, &mut handles, effects);
-    let (next, _) = update::tick(&model, Msg::Inflight(inflight));
-    model = next;
+    dispatch(&host, &tx, &mut handles, effects);
+    note_inflight(&mut model, live_handles(&mut handles));
 
     while !model.should_quit {
         terminal.draw(|f| view::render(f, &model))?;
@@ -101,15 +99,10 @@ async fn run_loop<H: TuiHost>(
         tokio::select! {
             maybe = rx.recv() => {
                 let Some(message) = maybe else { break };
-                if message.is_result() {
-                    inflight = inflight.saturating_sub(1);
-                }
                 let (next, effects) = update::tick(&model, message);
                 model = next;
-                inflight += dispatch(&host, &tx, &mut handles, effects);
-                let (next, _) = update::tick(&model, Msg::Inflight(inflight));
-                model = next;
-                handles.retain(|h| !h.is_finished());
+                dispatch(&host, &tx, &mut handles, effects);
+                note_inflight(&mut model, live_handles(&mut handles));
             }
             maybe = event_rx.recv() => {
                 let Some(event) = maybe else { break };
@@ -120,18 +113,15 @@ async fn run_loop<H: TuiHost>(
                 {
                     let (next, effects) = update::tick(&model, message);
                     model = next;
-                    inflight += dispatch(&host, &tx, &mut handles, effects);
-                    let (next, _) = update::tick(&model, Msg::Inflight(inflight));
-                    model = next;
+                    dispatch(&host, &tx, &mut handles, effects);
+                    note_inflight(&mut model, live_handles(&mut handles));
                 }
             }
             _ = &mut sleep => {
                 let (next, effects) = update::tick(&model, Msg::Tick { now_unix: host.now_unix() });
                 model = next;
-                inflight += dispatch(&host, &tx, &mut handles, effects);
-                let (next, _) = update::tick(&model, Msg::Inflight(inflight));
-                model = next;
-                handles.retain(|h| !h.is_finished());
+                dispatch(&host, &tx, &mut handles, effects);
+                note_inflight(&mut model, live_handles(&mut handles));
             }
         }
     }
@@ -142,22 +132,20 @@ async fn run_loop<H: TuiHost>(
     Ok(())
 }
 
-/// Spawn the effects, return how many were spawned. Every fetch is bounded by
-/// [`host::effect_timeout`] and its outcome comes back as a message — a wedged
-/// store cannot wedge the dashboard.
+/// Spawn the effects. Every fetch is bounded by [`host::effect_timeout`] and
+/// its outcome comes back as a message, so a wedged store cannot wedge the
+/// dashboard.
 fn dispatch<H: TuiHost>(
     host: &H,
     tx: &mpsc::Sender<Msg>,
     handles: &mut Vec<JoinHandle<()>>,
     effects: Vec<Effect>,
-) -> usize {
-    let mut count = 0;
+) {
     for effect in effects {
         // Quit is the runtime's own job; the fold has already set should_quit.
         if effect == Effect::Quit {
             continue;
         }
-        count += 1;
         let host = host.clone();
         let tx = tx.clone();
         handles.push(tokio::spawn(async move {
@@ -165,7 +153,23 @@ fn dispatch<H: TuiHost>(
             let _ = tx.send(message).await;
         }));
     }
-    count
+}
+
+/// Drop finished tasks and report how many effects are still owed an answer.
+///
+/// The count is DERIVED, never accumulated: a task that panics inside the host
+/// never posts a result, so an accumulator would stay above zero forever and
+/// the fold (`tick_refresh`) would refuse to dispatch again — a frozen console
+/// with no typed failure anywhere.
+pub(crate) fn live_handles(handles: &mut Vec<JoinHandle<()>>) -> usize {
+    handles.retain(|h| !h.is_finished());
+    handles.len()
+}
+
+/// Fold the derived in-flight count back into the model.
+fn note_inflight(model: &mut Model, inflight: usize) {
+    let (next, _) = update::tick(model, Msg::Inflight(inflight));
+    *model = next;
 }
 
 /// One effect, with its ceiling attached at the edge (effect law: bound every

@@ -116,7 +116,7 @@ pub fn help_lines() -> Vec<&'static str> {
         "",
         "  1..5 / Tab / Shift-Tab   tabs: mail, channels, agents, dashboard, settings",
         "",
-        "  j k / ↑ ↓                move            gg / G   top / bottom",
+        "  j k / ↑ ↓                move            g / G    top / bottom",
         "  h l / ← →                panes (l opens the reader, h backs out)",
         "  space / PgDn             page down       Enter    open",
         "  /                        filter (Enter searches the index on Mail)",
@@ -130,6 +130,7 @@ pub fn help_lines() -> Vec<&'static str> {
         "  q  quit              ?  this help",
         "",
         "  presence is live: the Agents tab re-reads the roster every tick.",
-        "  NO_COLOR=1 / TERM=dumb disables color; below 80x14 a resize card shows.",
+        "  40-79 cols (phone width): one pane at a time, h / l switches, Enter opens.",
+        "  NO_COLOR=1 / TERM=dumb disables color; below 40x12 a resize card shows.",
     ]
 }

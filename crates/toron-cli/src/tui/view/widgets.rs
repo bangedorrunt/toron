@@ -7,7 +7,7 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Paragraph, Sparkline, Wrap};
+use ratatui::widgets::{Block, ListState, Paragraph, Sparkline, Wrap};
 
 use crate::theme::HackerNight;
 
@@ -36,6 +36,18 @@ pub fn pane_block(title: &str, focused: bool) -> Block<'_> {
     } else {
         block_unfocused(title)
     }
+}
+
+/// List state for a directory cursor, clamped against the length that
+/// directory actually rendered. Each pane clamps against ITS OWN length:
+/// clamping the folder sidebar against the message count highlighted the wrong
+/// row whenever the index held fewer messages than there are folders.
+pub fn dir_state(len: usize, selected: usize) -> ListState {
+    let mut state = ListState::default();
+    if len > 0 {
+        state.select(Some(selected.min(len - 1)));
+    }
+    state
 }
 
 /// A pane with a single dim paragraph (empty state, error, hint).

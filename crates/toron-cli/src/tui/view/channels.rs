@@ -7,7 +7,7 @@
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{List, ListItem, Paragraph, Wrap};
 
 use crate::theme::HackerNight;
 
@@ -16,21 +16,21 @@ use super::{split, widgets};
 
 /// Render the channels tab for the current layout mode.
 pub fn render(f: &mut Frame, area: Rect, model: &Model, mode: LayoutMode) {
-    let panes = split(area, mode);
-    match mode {
-        LayoutMode::Stacked => match model.pane {
+    // Phone width: one pane at a time, and the room list stays reachable with
+    // `h` (it is the only way to change rooms).
+    if mode.single() {
+        return match model.pane {
             Pane::Sidebar => render_room_list(f, area, model, true),
             Pane::Reader => render_post_reader(f, area, model, true),
-            Pane::List => render_posts(f, area, model, true),
-        },
-        _ => {
-            if let Some(sb) = panes.sidebar {
-                render_room_list(f, sb, model, model.pane == Pane::Sidebar);
-            }
-            render_posts(f, panes.list, model, model.pane == Pane::List);
-            render_post_reader(f, panes.reader, model, model.pane == Pane::Reader);
-        }
+            Pane::List => render_posts(f, area, model, true, true),
+        };
     }
+    let panes = split(area, mode, true);
+    if let Some(sb) = panes.sidebar {
+        render_room_list(f, sb, model, model.pane == Pane::Sidebar);
+    }
+    render_posts(f, panes.list, model, model.pane == Pane::List, false);
+    render_post_reader(f, panes.reader, model, model.pane == Pane::Reader);
 }
 
 /// The room list.
@@ -85,11 +85,15 @@ fn render_room_list(f: &mut Frame, area: Rect, model: &Model, focused: bool) {
         .block(widgets::pane_block(title, focused))
         .highlight_style(HackerNight::selection())
         .highlight_symbol("▶ ");
-    f.render_stateful_widget(list, area, &mut cursor_state(model.channels.selected));
+    f.render_stateful_widget(
+        list,
+        area,
+        &mut widgets::dir_state(model.channels.channels.len(), model.channels.selected),
+    );
 }
 
 /// The post list of the selected room.
-fn render_posts(f: &mut Frame, area: Rect, model: &Model, focused: bool) {
+fn render_posts(f: &mut Frame, area: Rect, model: &Model, focused: bool, narrow: bool) {
     let Some(channel) = model.channels.current() else {
         f.render_widget(
             widgets::message_pane(
@@ -152,7 +156,11 @@ fn render_posts(f: &mut Frame, area: Rect, model: &Model, focused: bool) {
                     HackerNight::info(),
                 ));
             }
-            spans.push(Span::styled(format!("  {at}"), HackerNight::fg_muted()));
+            // Phone width: the stamp is the first thing to go — the body text
+            // is the point of the row.
+            if !narrow {
+                spans.push(Span::styled(format!("  {at}"), HackerNight::fg_muted()));
+            }
             ListItem::new(Line::from(spans))
         })
         .collect();
@@ -160,7 +168,11 @@ fn render_posts(f: &mut Frame, area: Rect, model: &Model, focused: bool) {
         .block(widgets::pane_block(&title, focused))
         .highlight_style(HackerNight::selection())
         .highlight_symbol("▶ ");
-    f.render_stateful_widget(list, area, &mut cursor_state(model.channels.selected_post));
+    f.render_stateful_widget(
+        list,
+        area,
+        &mut widgets::dir_state(posts.len(), model.channels.selected_post),
+    );
 }
 
 /// The full post, with the fields the list has no room for.
@@ -231,13 +243,6 @@ fn render_post_reader(f: &mut Frame, area: Rect, model: &Model, focused: bool) {
             .wrap(Wrap { trim: false }),
         area,
     );
-}
-
-/// List state for a cursor index.
-fn cursor_state(selected: usize) -> ListState {
-    let mut state = ListState::default();
-    state.select(Some(selected));
-    state
 }
 
 /// Truncate to `n` chars, ellipsis included.

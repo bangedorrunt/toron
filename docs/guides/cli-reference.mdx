@@ -44,6 +44,8 @@ Five tabs: `1` Mail, `2` Channels, `3` Agents, `4` Dashboard, `5` Settings (`--t
 
 Keys: `q`/Ctrl-C quit, `?` help, Tab/Shift-Tab or `1`-`5` switch tabs, `j`/`k`/arrows and `space`/PgDn move, `g`/`G` top/bottom, `h`/`l` panes, Enter open, `/` filter (Enter on Mail runs a server search), `a` ack, `m` mark read, `r` refresh, `[`/`]` refresh cadence, `-`/`+` dashboard window (6→12→24→48), `d` dense, `t` relative time, `c` closed channels.
 
+The layout folds with the terminal: three panes at 108+ columns, two (the sidebar beside the list and reader) from 80, and one pane at a time switched with `h`/`l` from 40, which is the shape a phone SSH client reports; below 40x12 it says so instead of drawing. Rows compact with it (one line per message, no stamp), so the subject stays readable on a phone.
+
 The project falls back to `$TORON_PROJECT` and the agent to `$TORON_AGENT`/`$FLYWHEEL_MAIL_AS`/`$AGENT_NAME`; without either the tab fails loud rather than guessing. It reads the one mailbox the source selector resolves and refuses a non-loopback daemon. The whole console is an Elm core (`tick(&Model, Msg) -> (Model, Vec<Effect>)`): the fold does no I/O, the host runs every effect under a bound, and Channels/Dashboard refresh on a slower cadence than Mail/Agents.
 
 ## MCP clusters (the emitted 38-tool surface)

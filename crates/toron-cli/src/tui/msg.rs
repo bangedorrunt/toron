@@ -87,8 +87,10 @@ pub enum Msg {
     ReceiptsLoaded(ReceiptCounts),
     /// Health lines landed.
     HealthLoaded(Vec<HealthRow>),
-    /// Effects in flight changed (the runtime owns the count; the model
-    /// displays it and uses it to avoid queueing a second wave).
+    /// Effects in flight changed. The runtime derives the count from its live
+    /// task handles rather than accumulating results (a task that panics
+    /// never answers, and an accumulator would sit above zero forever); the
+    /// fold uses it to avoid queueing a second wave.
     Inflight(usize),
     /// A fetch or write failed. Typed: the model shows it and stays usable.
     Failed {
@@ -151,27 +153,6 @@ pub enum Msg {
     ToggleRelativeTime,
     /// `c` — show/hide closed channels.
     ToggleClosedChannels,
-}
-
-impl Msg {
-    /// True for messages that answer an effect. The runtime's in-flight
-    /// accounting counts exactly these, so a slow store never queues a second
-    /// wave of reads (the fold's `tick_refresh` gate reads the count).
-    pub fn is_result(&self) -> bool {
-        matches!(
-            self,
-            Msg::InboxLoaded(_)
-                | Msg::ThreadLoaded { .. }
-                | Msg::ChannelsLoaded(_)
-                | Msg::ChannelPostsLoaded { .. }
-                | Msg::AgentsLoaded(_)
-                | Msg::SearchLoaded(_)
-                | Msg::ReceiptsLoaded(_)
-                | Msg::HealthLoaded(_)
-                | Msg::ReceiptWritten { .. }
-                | Msg::Failed { .. }
-        )
-    }
 }
 
 /// One effect the runtime executes. Data only — no closures, so a replayed

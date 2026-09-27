@@ -15,28 +15,21 @@ use super::{split, widgets};
 
 /// Render the mail tab for the current layout mode.
 pub fn render(f: &mut Frame, area: Rect, model: &Model, mode: LayoutMode) {
-    let panes = split(area, mode);
-    match mode {
-        LayoutMode::Stacked => match model.pane {
+    // Phone width: one pane at a time owns the frame (`h`/`l` and Enter move
+    // between them), and the list rows go one line.
+    if mode.single() {
+        return match model.pane {
             Pane::Sidebar => render_folders(f, area, model, true),
             Pane::Reader => render_reader(f, area, model, true),
-            Pane::List => render_list(f, area, model, true),
-        },
-        LayoutMode::Dual => {
-            if let Some(sb) = panes.sidebar {
-                render_folders(f, sb, model, model.pane == Pane::Sidebar);
-            }
-            render_list(f, panes.list, model, model.pane != Pane::Reader);
-            render_reader(f, panes.reader, model, model.pane == Pane::Reader);
-        }
-        _ => {
-            if let Some(sb) = panes.sidebar {
-                render_folders(f, sb, model, model.pane == Pane::Sidebar);
-            }
-            render_list(f, panes.list, model, model.pane == Pane::List);
-            render_reader(f, panes.reader, model, model.pane == Pane::Reader);
-        }
+            Pane::List => render_list(f, area, model, true, true),
+        };
     }
+    let panes = split(area, mode, true);
+    if let Some(sb) = panes.sidebar {
+        render_folders(f, sb, model, model.pane == Pane::Sidebar);
+    }
+    render_list(f, panes.list, model, model.pane == Pane::List, false);
+    render_reader(f, panes.reader, model, model.pane == Pane::Reader);
 }
 
 /// The folder sidebar, with per-folder counts.
@@ -70,11 +63,11 @@ fn render_folders(f: &mut Frame, area: Rect, model: &Model, focused: bool) {
         .block(widgets::pane_block("folders", focused))
         .highlight_style(HackerNight::selection())
         .highlight_symbol("▶ ");
-    f.render_stateful_widget(list, area, &mut list_state(model, folder_index(model)));
+    f.render_stateful_widget(list, area, &mut folder_state(model));
 }
 
 /// The message/thread list.
-fn render_list(f: &mut Frame, area: Rect, model: &Model, focused: bool) {
+fn render_list(f: &mut Frame, area: Rect, model: &Model, focused: bool, narrow: bool) {
     let rows = model.mail_rows();
     let title = match &model.mail.search {
         Some(hits) => format!("search — {} hit(s)", hits.len()),
@@ -112,6 +105,27 @@ fn render_list(f: &mut Frame, area: Rect, model: &Model, focused: bool) {
             } else {
                 HackerNight::fg_default()
             };
+            if narrow {
+                // Phone width: one line per message. A 10-col sender pad plus
+                // a stamp would leave the subject nothing at 45 cols.
+                let mut spans = vec![Span::styled(
+                    if row.unread { "● " } else { "  " },
+                    if row.unread {
+                        HackerNight::accent_cyan()
+                    } else {
+                        HackerNight::fg_muted()
+                    },
+                )];
+                spans.push(Span::styled(
+                    format!("{}: ", truncate(&row.from, 8)),
+                    HackerNight::accent_lav(),
+                ));
+                spans.push(Span::styled(row.subject.clone(), subject_style));
+                if row.ack_pending {
+                    spans.push(Span::styled(" ◉", HackerNight::warning()));
+                }
+                return ListItem::new(Line::from(spans));
+            }
             let mut spans = vec![
                 Span::styled(
                     format!("{:<10}", truncate(&row.from, 10)),
@@ -153,7 +167,11 @@ fn render_list(f: &mut Frame, area: Rect, model: &Model, focused: bool) {
         .block(widgets::pane_block(&title, focused))
         .highlight_style(HackerNight::selection())
         .highlight_symbol("▶ ");
-    f.render_stateful_widget(list, area, &mut list_state(model, model.mail.selected));
+    f.render_stateful_widget(
+        list,
+        area,
+        &mut widgets::dir_state(rows.len(), model.mail.selected),
+    );
 }
 
 /// The reader: the open conversation, oldest message first.
@@ -235,11 +253,11 @@ fn folder_index(model: &Model) -> usize {
         .unwrap_or(0)
 }
 
-/// List state for a clamped cursor.
-fn list_state(model: &Model, selected: usize) -> ListState {
-    let mut state = ListState::default();
-    state.select(Some(selected.min(model.cursor_len().max(1) - 1)));
-    state
+/// The sidebar's list state: the folder's index, clamped against the FOLDER
+/// count. Clamping it against the message count highlighted the wrong folder
+/// whenever the index held fewer messages than there are folders.
+pub(crate) fn folder_state(model: &Model) -> ListState {
+    widgets::dir_state(Folder::ALL.len(), folder_index(model))
 }
 
 /// Truncate a cell to `n` chars (never mid-char).
