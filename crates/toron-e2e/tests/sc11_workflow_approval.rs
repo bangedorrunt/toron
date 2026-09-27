@@ -24,7 +24,8 @@
 //! Gate: `cargo test -p toron-e2e --features p2`.
 #![cfg(feature = "p2")]
 
-use std::process::{Child, Command, Stdio};
+use toron_core::testkit::ChildGuard;
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -79,22 +80,15 @@ fn free_port() -> u16 {
 
 /// Start a persistent `resonate serve` (sqlite) child process. The child is
 /// the "server" — killing the WORKER (engine) below must not lose its state.
-fn start_resonate_server(port: u16, dir: &std::path::Path) -> Option<Child> {
-    Command::new("resonate")
-        .args([
-            "serve",
-            "--storage-type",
-            "sqlite",
-            "--server-port",
-            &port.to_string(),
-            "--server-host",
-            "127.0.0.1",
-        ])
-        .current_dir(dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()
+fn start_resonate_server(port: u16, dir: &std::path::Path) -> Option<ChildGuard> {
+    let server =
+        toron_core::testkit::ChildGuard::resonate_serve(port, dir).expect("spawn resonate serve");
+    if server.is_none() {
+        // GS-018: no `resonate` binary on this runner (herdr/resonate stack
+        // absent) — an environmental skip, not a product failure.
+        eprintln!("SKIP: no `resonate` binary (needs herdr/resonate stack)");
+    }
+    server
 }
 
 async fn wait_ready(url: &str) {
@@ -220,7 +214,6 @@ async fn sc11_approval_crash_resume() {
     assert!(output.is_object(), "run produced step outputs after resume");
 
     // Shut the server down.
-    let _ = server.kill();
-    let _ = server.wait();
+    server.kill();
     let _ = std::fs::remove_dir_all(&dir);
 }

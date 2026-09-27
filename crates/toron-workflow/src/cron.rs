@@ -952,10 +952,10 @@ mod tests {
     async fn spec_engine(
         dir: &std::path::Path,
     ) -> Option<(
-        std::process::Child,
+        toron_core::testkit::ChildGuard,
         std::sync::Arc<crate::engine::WorkflowEngine>,
     )> {
-        use std::process::{Command, Stdio};
+        use std::process::Command;
         // GS-018: no `resonate` binary on this runner (herdr/resonate stack
         // absent) — environmental skip, not a product failure.
         if !Command::new("resonate")
@@ -972,21 +972,11 @@ mod tests {
             .unwrap()
             .port();
         let url = format!("http://127.0.0.1:{port}");
-        let server = Command::new("resonate")
-            .args([
-                "serve",
-                "--storage-type",
-                "sqlite",
-                "--server-port",
-                &port.to_string(),
-                "--server-host",
-                "127.0.0.1",
-            ])
-            .current_dir(dir)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn resonate server");
+        // bd-6h9l: the guard kills and reaps at scope end, so a failing
+        // assertion or a cancelled test binary cannot orphan the server.
+        let server = toron_core::testkit::ChildGuard::resonate_serve(port, dir)
+            .expect("spawn resonate serve")
+            .expect("resonate binary present");
         for _ in 0..200 {
             if std::net::TcpStream::connect_timeout(
                 &format!("127.0.0.1:{port}").parse().expect("addr"),
@@ -1269,8 +1259,7 @@ steps:
         // (same sqlite dir) + new engine → the loop resumes and catchup
         // `latest` fires the single most-recent missed tick (never a burst).
         let next_tick = t1 + 60;
-        let _ = server.kill();
-        let _ = server.wait();
+        server.kill();
         while unix_now() < next_tick + 2 {
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
@@ -1314,7 +1303,6 @@ steps:
         );
         assert_no_duplicate_ticks(&ticks, event2.tick, "post-restart catchup");
 
-        let _ = server.kill();
-        let _ = server.wait();
+        server.kill();
     }
 }

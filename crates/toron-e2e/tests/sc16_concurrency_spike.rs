@@ -30,9 +30,9 @@
 //!
 //! Run: `cargo test -p toron-e2e --features p5 --test sc16_concurrency_spike`
 
-use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
+use toron_core::testkit::ChildGuard;
 
 use resonate_sdk::prelude::{Resonate, ResonateConfig};
 use resonate_sdk::types::Value;
@@ -90,22 +90,10 @@ fn free_port() -> u16 {
 
 /// Start a persistent `resonate serve` (sqlite) child process. The child is
 /// the "server" — killing the WORKER (engine) must not lose its state.
-fn start_resonate_server(port: u16, dir: &std::path::Path) -> Child {
-    Command::new("resonate")
-        .args([
-            "serve",
-            "--storage-type",
-            "sqlite",
-            "--server-port",
-            &port.to_string(),
-            "--server-host",
-            "127.0.0.1",
-        ])
-        .current_dir(dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn resonate server")
+fn start_resonate_server(port: u16, dir: &std::path::Path) -> ChildGuard {
+    toron_core::testkit::ChildGuard::resonate_serve(port, dir)
+        .expect("spawn resonate serve")
+        .expect("resonate binary present (GS-018: absent on hosted CI runners)")
 }
 
 async fn wait_ready(url: &str) {
@@ -318,7 +306,6 @@ async fn concurrency_spike() {
     );
 
     // Shut the server down.
-    let _ = server.kill();
-    let _ = server.wait();
+    server.kill();
     let _ = std::fs::remove_dir_all(&dir);
 }

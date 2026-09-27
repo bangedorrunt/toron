@@ -23,9 +23,10 @@
 //! and calls into it. These are FIXTURES, not assertions — the scenario
 //! files own their behavior checks.
 
-use std::process::{Child, Command, Stdio};
+use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
+use toron_core::testkit::ChildGuard;
 
 use toron_workflow::cron::{CronRegistration, CronRegistry};
 use toron_workflow::engine::{ActionInvocation, AsyncEffectRunner, ProfileResolver};
@@ -96,25 +97,10 @@ pub fn has_resonate() -> bool {
 /// Boot a persistent `resonate serve` (sqlite) in `dir`. The child is the
 /// server; dropping it must NOT lose durable state (the restart rows rely on
 /// this — the server outlives the worker).
-pub fn boot_server(port: u16, dir: &std::path::Path) -> Option<Child> {
-    if !has_resonate() {
-        return None;
-    }
-    Command::new("resonate")
-        .args([
-            "serve",
-            "--storage-type",
-            "sqlite",
-            "--server-port",
-            &port.to_string(),
-            "--server-host",
-            "127.0.0.1",
-        ])
-        .current_dir(dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()
+pub fn boot_server(port: u16, dir: &std::path::Path) -> Option<ChildGuard> {
+    // bd-6h9l: the guard kills and reaps at scope end, so a failing
+    // assertion or a cancelled test binary cannot orphan the server.
+    toron_core::testkit::ChildGuard::resonate_serve(port, dir).expect("spawn resonate serve")
 }
 
 /// Block until the server's HTTP port accepts TCP (bounded poll).

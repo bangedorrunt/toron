@@ -166,8 +166,7 @@ async fn sc24_catchup_loop_wakes_and_fires_single_tick() {
         "cron_catchup: the resumed loop wakes and fires the latest single tick (saw {ticks_b} on worker B)"
     );
 
-    let _ = server.kill();
-    let _ = server.wait();
+    server.kill();
     let _ = std::fs::remove_dir_all(&dir);
 }
 

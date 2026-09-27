@@ -17,7 +17,8 @@
 //!
 //! Run: `cargo test -p toron-e2e --features p5 --test sc21_cron_durable_loop`
 
-use std::process::{Child, Command, Stdio};
+use toron_core::testkit::ChildGuard;
+
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -47,22 +48,15 @@ fn free_port() -> u16 {
         .port()
 }
 
-fn start_resonate_server(port: u16, dir: &std::path::Path) -> Option<Child> {
-    Command::new("resonate")
-        .args([
-            "serve",
-            "--storage-type",
-            "sqlite",
-            "--server-port",
-            &port.to_string(),
-            "--server-host",
-            "127.0.0.1",
-        ])
-        .current_dir(dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()
+fn start_resonate_server(port: u16, dir: &std::path::Path) -> Option<ChildGuard> {
+    let server =
+        toron_core::testkit::ChildGuard::resonate_serve(port, dir).expect("spawn resonate serve");
+    if server.is_none() {
+        // GS-018: no `resonate` binary on this runner (herdr/resonate stack
+        // absent) — an environmental skip, not a product failure.
+        eprintln!("SKIP: no `resonate` binary (needs herdr/resonate stack)");
+    }
+    server
 }
 
 async fn wait_ready(url: &str) {
@@ -200,7 +194,6 @@ async fn sc21_cron_durable_loop_fires_and_resumes_after_restart() {
         "cron_restart: the loop resumed after the worker restart and fired a tick (saw {ticks_b} actions)"
     );
 
-    let _ = server.kill();
-    let _ = server.wait();
+    server.kill();
     let _ = std::fs::remove_dir_all(&dir);
 }
