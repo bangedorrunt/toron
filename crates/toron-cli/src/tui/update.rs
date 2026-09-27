@@ -168,6 +168,15 @@ pub fn tick(model: &Model, msg: Msg) -> (Model, Vec<Effect>) {
                     effects.extend(reader_refresh(&m));
                 }
             }
+            // A different agent opens at the top of ITS card, not wherever the
+            // last one was scrolled to.
+            (Tab::Agents, _) => {
+                let before = m.agents.selected;
+                m.move_cursor(delta);
+                if m.agents.selected != before {
+                    m.agents.scroll = 0;
+                }
+            }
             _ => m.move_cursor(delta),
         },
         Msg::GotoCursor(top) => match (m.tab, m.pane) {
@@ -396,11 +405,15 @@ fn tick_refresh(m: &Model) -> Vec<Effect> {
         }
         // Presence is the Agents tab's whole point: refresh every tick.
         Tab::Agents => vec![Effect::RefreshAgents],
+        // The dashboard DRAWS mail, channels, agents and receipts, so its slow
+        // tick fetches exactly what entering the tab fetches, from the same
+        // function: a chart or card that stopped updating at tab entry would
+        // contradict the header's spinner.
         Tab::Dashboard => {
             if !slow {
                 return Vec::new();
             }
-            vec![Effect::RefreshReceipts, Effect::RefreshHealth]
+            tab_enter_refresh(m)
         }
         Tab::Settings => Vec::new(),
     }
@@ -464,6 +477,7 @@ impl Model {
         match self.tab {
             Tab::Mail => self.mail.scroll,
             Tab::Channels => self.channels.scroll,
+            Tab::Agents => self.agents.scroll,
             _ => 0,
         }
     }
@@ -473,6 +487,7 @@ impl Model {
         match self.tab {
             Tab::Mail => self.mail.scroll = value,
             Tab::Channels => self.channels.scroll = value,
+            Tab::Agents => self.agents.scroll = value,
             _ => {}
         }
     }

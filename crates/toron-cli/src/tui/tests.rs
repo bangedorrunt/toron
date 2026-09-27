@@ -1323,6 +1323,90 @@ fn agent_filter_matches_the_task_too() {
     assert_eq!(rows[0].name, "aye");
 }
 
+/// The agent detail card scrolls, and a different agent opens at the top of
+/// ITS card (a long task line used to just clip with j/k doing nothing).
+#[test]
+fn agent_detail_scrolls_and_resets_on_a_new_agent() {
+    let three = |selected: usize, scroll: usize| super::model::AgentsState {
+        rows: vec![
+            AgentRow {
+                name: "aye".into(),
+                ..Default::default()
+            },
+            AgentRow {
+                name: "bee".into(),
+                ..Default::default()
+            },
+            AgentRow {
+                name: "cee".into(),
+                ..Default::default()
+            },
+        ],
+        selected,
+        scroll,
+        loaded: true,
+    };
+    let card = |selected: usize, scroll: usize, pane: Pane| Model {
+        tab: Tab::Agents,
+        pane,
+        agents: three(selected, scroll),
+        ..model()
+    };
+
+    let (scrolled, _) = step(&card(0, 0, Pane::Reader), Msg::MoveCursor(3));
+    assert_eq!(scrolled.agents.scroll, 3, "j scrolls the card");
+    let (top, _) = step(&scrolled, Msg::MoveCursor(-10));
+    assert_eq!(top.agents.scroll, 0, "and stops at the top");
+
+    // Scrolled card + a different agent selected = a fresh card.
+    let (moved, _) = step(
+        &Model {
+            pane: Pane::List,
+            ..scrolled.clone()
+        },
+        Msg::MoveCursor(1),
+    );
+    assert_eq!(moved.agents.selected, 1, "the list cursor moved");
+    assert_eq!(
+        moved.agents.scroll, 0,
+        "a new agent opens at the top of its card"
+    );
+}
+
+/// The dashboard refreshes everything it draws. Otherwise its chart and cards
+/// are a snapshot from the moment the operator arrived while the header claims
+/// to be live.
+#[test]
+fn dashboard_tick_refreshes_what_it_draws() {
+    let mut m = Model {
+        tab: Tab::Dashboard,
+        ..model()
+    };
+    let mut seen: Vec<Effect> = Vec::new();
+    for i in 1..=super::update::SLOW_CADENCE {
+        let (next, effects) = step(
+            &m,
+            Msg::Tick {
+                now_unix: 1_000 + i,
+            },
+        );
+        m = next;
+        seen.extend(effects);
+    }
+    for want in [
+        Effect::RefreshReceipts,
+        Effect::RefreshHealth,
+        Effect::RefreshAgents,
+        Effect::RefreshChannels,
+        Effect::RefreshInbox,
+    ] {
+        assert!(
+            seen.contains(&want),
+            "the dashboard tick must refresh {want:?}, saw {seen:?}"
+        );
+    }
+}
+
 /// A task that panics inside the host never answers, so a mount count that is
 /// only ever incremented would sit above zero forever and refuse every later
 /// refresh — a frozen console with no typed failure. The count is derived from
