@@ -46,6 +46,8 @@ Keys: `q`/Ctrl-C quit, `?` help, Tab/Shift-Tab or `1`-`5` switch tabs, `j`/`k`/a
 
 The layout folds with the terminal: three panes at 108+ columns, two (the sidebar beside the list and reader) from 80, and one pane at a time switched with `h`/`l` from 40, which is the shape a phone SSH client reports; below 40x12 it says so instead of drawing. Rows compact with it (one line per message, no stamp), so the subject stays readable on a phone.
 
+An empty pane names the next command with this project and pin already in it: Mail offers `toron mail send … --to <pin> --subject <subject> --body <body>` plus the room opener, Channels offers `toron channel create <id> --name <name> --project … --as …`, and Agents offers `toron agent bootstrap …`. An unknown pin stays a `<pin>` placeholder rather than a guess about who the operator is, and a REFUSED fetch settles the pane: it shows the error beside the command that fixes it instead of saying "loading" forever.
+
 The project falls back to `$TORON_PROJECT` and the agent to `$TORON_AGENT`/`$FLYWHEEL_MAIL_AS`/`$AGENT_NAME`; without either the tab fails loud rather than guessing. It reads the one mailbox the source selector resolves and refuses a non-loopback daemon. The whole console is an Elm core (`tick(&Model, Msg) -> (Model, Vec<Effect>)`): the fold does no I/O, the host runs every effect under a bound, and Channels/Dashboard refresh on a slower cadence than Mail/Agents.
 
 ## MCP clusters (the emitted 38-tool surface)

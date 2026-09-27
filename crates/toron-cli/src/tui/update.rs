@@ -15,7 +15,7 @@
 use super::model::{
     Folder, ListRow, MailRow, Mode, Model, OpenThread, Pane, StatusKind, Tab, thread_id_of,
 };
-use super::msg::{Effect, Msg};
+use super::msg::{Effect, Msg, Op};
 
 /// Ticks between the slow-cadence refreshes (bus replay + receipt counts).
 pub const SLOW_CADENCE: u64 = 3;
@@ -36,6 +36,7 @@ pub fn tick(model: &Model, msg: Msg) -> (Model, Vec<Effect>) {
         Msg::InboxLoaded(rows) => {
             m.mail.messages = rows;
             m.mail.loaded = true;
+            m.mail.error = None;
             m.clamp_cursor();
         }
         Msg::ThreadLoaded { thread_id, rows } => {
@@ -114,6 +115,7 @@ pub fn tick(model: &Model, msg: Msg) -> (Model, Vec<Effect>) {
         Msg::Inflight(n) => m.inflight = n,
         Msg::Failed { op, message } => {
             // Typed failure: show it and keep the last good data on screen.
+            settle_failure(&mut m, op, &message);
             m.set_status(StatusKind::Error, format!("{}: {message}", op.label()));
         }
         Msg::ReceiptWritten { corr, verb } => {
@@ -325,6 +327,25 @@ pub fn replay(model: &Model, log: &[Msg]) -> (Model, Vec<Effect>) {
         all.append(&mut effects);
     }
     (m, all)
+}
+
+/// Settle the pane an op owns, so a failed fetch is never mistaken for one
+/// still in flight. Every pane whose fetch can fail has to stop saying
+/// "loading" when the answer was a refusal — a fresh console with an
+/// unregistered pin has no inbox, and saying so is the whole point. A failure
+/// with no pane behind it (thread, search, receipt) reaches the status line
+/// only, because no pane is waiting on it.
+fn settle_failure(m: &mut Model, op: Op, message: &str) {
+    match op {
+        Op::Inbox => {
+            m.mail.error = Some(message.to_string());
+            m.mail.loaded = true;
+        }
+        Op::Channels => m.channels.loaded = true,
+        Op::Agents => m.agents.loaded = true,
+        Op::Receipts | Op::Health => m.dashboard.loaded = true,
+        Op::Thread | Op::ChannelPosts | Op::Search | Op::Receipt => {}
+    }
 }
 
 /// Startup fetches: the active tab, plus the roster (which carries presence,

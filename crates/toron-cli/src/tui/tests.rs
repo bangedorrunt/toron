@@ -982,7 +982,132 @@ async fn interpreter_slow_provider_still_lands() {
 }
 
 // ---------------------------------------------------------------------------
-// 6. the responsive ladder, rendered (not just selected)
+// 6. the empty panes (what an operator sees on a quiet project)
+// ---------------------------------------------------------------------------
+
+/// A fetch that FAILED must stop saying "loading": the pane has to name the
+/// error and the command that fixes it, or a fresh console with an
+/// unregistered pin waits forever on a load that already happened.
+#[test]
+fn a_failed_fetch_stops_saying_loading_and_names_the_fix() {
+    let (failed, _) = step(
+        &model(),
+        Msg::Failed {
+            op: Op::Inbox,
+            message: "agent PtyAgent has no local key in this project".into(),
+        },
+    );
+    assert!(
+        failed.mail.loaded,
+        "the fetch settled, so it is not loading"
+    );
+    assert_eq!(
+        failed.mail.error.as_deref(),
+        Some("agent PtyAgent has no local key in this project")
+    );
+
+    // A later success clears it (the pane is not stuck in the failure).
+    let (recovered, _) = step(
+        &failed,
+        Msg::InboxLoaded(vec![mail("m1", "t1", "bee", "hi", 10)]),
+    );
+    assert_eq!(recovered.mail.error, None);
+    assert!(recovered.mail.loaded);
+
+    // Only the pane whose op failed is settled by it.
+    assert!(!failed.channels.loaded, "another pane's fetch is still out");
+}
+
+/// The failure reaches the screen as the error plus the identity command.
+#[test]
+fn a_failed_inbox_renders_the_error_and_the_command() {
+    let (failed, _) = step(
+        &model(),
+        Msg::Failed {
+            op: Op::Inbox,
+            message: "agent PtyAgent has no local key in this project".into(),
+        },
+    );
+    let drawn = screen(&failed, 120, 30);
+    assert!(
+        drawn.contains("no local key"),
+        "the error is on screen:\n{drawn}"
+    );
+    assert!(
+        drawn.contains("toron agent bootstrap"),
+        "and so is the command that fixes it:\n{drawn}"
+    );
+    assert!(
+        !drawn.contains("loading the index"),
+        "a settled failure is not a spinner:\n{drawn}"
+    );
+}
+
+/// An empty pane names the exact commands, with THIS project and pin already
+/// in them — and an unknown pin stays a placeholder, because the console never
+/// invents a name.
+#[test]
+fn empty_panes_name_the_exact_commands() {
+    let on = model().onboarding();
+    assert!(
+        on.mail.starts_with("toron mail send ")
+            && on.mail.contains("--project demo --as TestAgent"),
+        "mail hint must be a runnable send: {}",
+        on.mail
+    );
+    assert!(
+        on.channel.starts_with("toron channel create ")
+            && on.channel.contains("--project demo --as TestAgent"),
+        "channel hint must be a runnable create: {}",
+        on.channel
+    );
+    assert!(
+        on.agent.starts_with("toron agent bootstrap ")
+            && on.agent.contains("--project demo --as TestAgent"),
+        "roster hint must be a runnable bootstrap: {}",
+        on.agent
+    );
+
+    let anonymous = SettingsState {
+        agent: None,
+        ..settings()
+    };
+    let on = Model {
+        settings: anonymous,
+        ..model()
+    }
+    .onboarding();
+    assert!(
+        on.channel.contains("--as <pin>"),
+        "no pin means a placeholder, not a guess: {}",
+        on.channel
+    );
+}
+
+/// Every hint is a REAL invocation: parsed by the same clap surface the binary
+/// uses, so a renamed flag or a new required argument fails here instead of
+/// rotting into a dead command in a pane nobody exercises.
+#[test]
+fn onboarding_commands_parse_as_real_cli_invocations() {
+    use clap::Parser;
+    let on = model().onboarding();
+    for command in [on.mail, on.channel, on.agent] {
+        let filled = command
+            .replace("<pin>", "OtherAgent")
+            .replace("<subject>", "hello")
+            .replace("<body>", "body")
+            .replace("<id>", "general")
+            .replace("<name>", "general");
+        let parts: Vec<&str> = filled.split_whitespace().collect();
+        assert_eq!(parts.first(), Some(&"toron"), "got {filled}");
+        crate::cli::Cli::try_parse_from(&parts).unwrap_or_else(|e| {
+            panic!("`{filled}` is not a real CLI invocation: {e}");
+        });
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 7. the responsive ladder, rendered (not just selected)
 // ---------------------------------------------------------------------------
 
 /// Every mode by name. The match is exhaustive on purpose: a variant nothing
@@ -1105,6 +1230,32 @@ fn phone_width_draws_one_pane_and_dual_keeps_the_folder_axis() {
 
     let tiny = screen(&m, 36, 24);
     assert!(tiny.contains("too small"), "the gate still speaks:\n{tiny}");
+}
+
+/// The empty Mail pane actually draws the commands: the strings are only worth
+/// having if they reach the screen.
+#[test]
+fn empty_mail_pane_renders_the_commands() {
+    let empty = Model {
+        mail: super::model::MailState {
+            loaded: true,
+            ..Default::default()
+        },
+        ..model()
+    };
+    let drawn = screen(&empty, 120, 30);
+    assert!(
+        drawn.contains("nothing in this folder yet"),
+        "the pane explains itself:\n{drawn}"
+    );
+    assert!(
+        drawn.contains("toron mail send"),
+        "the send command is on screen:\n{drawn}"
+    );
+    assert!(
+        drawn.contains("toron channel create"),
+        "and so is the room command:\n{drawn}"
+    );
 }
 
 /// At 45 cols the row is one line and the subject survives (a 10-col sender

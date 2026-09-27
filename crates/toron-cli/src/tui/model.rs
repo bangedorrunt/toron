@@ -346,6 +346,11 @@ pub struct MailState {
     pub search: Option<Vec<MailRow>>,
     /// The last fetch landed at least once (drives the empty-state text).
     pub loaded: bool,
+    /// The last inbox fetch failed. A failure is a settled outcome, not a
+    /// fetch still in flight: without this the list would say "loading"
+    /// forever, which is how an unregistered pin used to greet a fresh
+    /// console. Cleared by the next successful fetch.
+    pub error: Option<String>,
     /// Reader scroll offset (the view clamps it to the rendered content).
     pub scroll: usize,
 }
@@ -851,6 +856,28 @@ impl Default for Status {
 }
 
 // ---------------------------------------------------------------------------
+// Onboarding
+// ---------------------------------------------------------------------------
+
+/// The commands an empty pane names, built for THIS project and pin so the
+/// operator can paste them without editing. A placeholder stays a placeholder:
+/// an unknown pin is never guessed.
+///
+/// Every line is parsed by the real clap surface in
+/// `tests::onboarding_commands_parse_as_real_cli_invocations`, so a renamed
+/// flag or a new required argument fails the suite instead of leaving a dead
+/// command in a pane nobody exercises.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Onboarding {
+    /// Send the first message (the recipient is the operator's decision).
+    pub mail: String,
+    /// Create the first room.
+    pub channel: String,
+    /// Register this pin in the roster.
+    pub agent: String,
+}
+
+// ---------------------------------------------------------------------------
 // Model
 // ---------------------------------------------------------------------------
 
@@ -909,6 +936,30 @@ impl Model {
             inflight: 0,
             status: Status::default(),
             should_quit: false,
+        }
+    }
+
+    /// The commands a quiet console should name. Pure: project and pin come
+    /// from the seeded settings, and a missing pin stays a `<pin>` placeholder
+    /// rather than a guess about who the operator is.
+    pub fn onboarding(&self) -> Onboarding {
+        let project = match self.settings.project.trim() {
+            "" => "<project>".to_string(),
+            p => p.to_string(),
+        };
+        let pin = self
+            .settings
+            .agent
+            .clone()
+            .unwrap_or_else(|| "<pin>".to_string());
+        Onboarding {
+            mail: format!(
+                "toron mail send --project {project} --as {pin} --to <pin> --subject <subject> --body <body>"
+            ),
+            channel: format!(
+                "toron channel create <id> --name <name> --project {project} --as {pin}"
+            ),
+            agent: format!("toron agent bootstrap --project {project} --as {pin}"),
         }
     }
 

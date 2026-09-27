@@ -43,7 +43,10 @@ fn render_list(
         let text = if !model.agents.loaded {
             "loading the roster…".to_string()
         } else if model.input.trim().is_empty() {
-            "no registered agents in this project".to_string()
+            format!(
+                "no agents in this project yet.\n\n  register this session:\n    {}",
+                model.onboarding().agent
+            )
         } else {
             format!("no agent matches {:?}", model.input.trim())
         };

@@ -41,13 +41,18 @@ fn render_room_list(f: &mut Frame, area: Rect, model: &Model, focused: bool) {
         "channels"
     };
     if model.channels.channels.is_empty() {
+        // The command comes from the model, so it is the real one and carries
+        // this project and pin (the old string was hand-written prose).
         let text = if model.channels.loaded {
-            "no channels in this project yet — `toron channel create <id> --name <n> --project <p> --as <pin>`"
+            format!(
+                "no channels in this project yet.\n\n  open the first one:\n    {}",
+                model.onboarding().channel
+            )
         } else {
-            "loading channels…"
+            "loading channels…".to_string()
         };
         f.render_widget(
-            widgets::message_pane(text, title, focused, HackerNight::fg_muted()),
+            widgets::message_pane(&text, title, focused, HackerNight::fg_muted()),
             area,
         );
         return;
