@@ -59,7 +59,12 @@ fn print_json(value: &serde_json::Value) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn build_send_tags(
+/// Encode the ADR-0027 E2 assignment vocabulary into rumor tags.
+///
+/// `pub(crate)` so the operator console's send form goes through the SAME
+/// encoder as the CLI verb: a second copy is how the two surfaces end up
+/// disagreeing about what `tasked` means on the wire.
+pub(crate) fn build_send_tags(
     corr: Option<String>,
     wake: Option<String>,
     priority: Option<String>,

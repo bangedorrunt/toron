@@ -12,6 +12,7 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+use super::compose::CaretMove;
 use super::model::{Mode, Model, Pane, Tab};
 use super::msg::Msg;
 
@@ -31,7 +32,40 @@ pub fn translate(model: &Model, key: KeyEvent) -> Option<Msg> {
             _ => None,
         },
         Mode::Insert => insert_mode(key),
+        Mode::Compose => compose_mode(key),
         Mode::Normal => normal_mode(model, key),
+    }
+}
+
+/// Typing in the compose form. Every printable key goes to the focused field;
+/// the form's own verbs are `Tab` (next stop) and `Enter` (advance, insert a
+/// line, toggle, or send — the fold reads the focused stop).
+///
+/// There is no send chord on purpose: `Ctrl-S` is XOFF where flow control is
+/// still honoured and `Ctrl-Enter` is not distinguishable from `Enter` on
+/// several terminals, so a chord would be a submit key that sometimes does
+/// nothing. `Enter` on the `send` stop is always available.
+fn compose_mode(key: KeyEvent) -> Option<Msg> {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    // Ctrl-C keeps its one meaning from normal mode: leave the console now.
+    if ctrl && matches!(key.code, KeyCode::Char('c')) {
+        return Some(Msg::Quit);
+    }
+    match key.code {
+        KeyCode::Esc => Some(Msg::ComposeCancel),
+        KeyCode::Tab => Some(Msg::ComposeFocus(1)),
+        KeyCode::BackTab => Some(Msg::ComposeFocus(-1)),
+        KeyCode::Enter => Some(Msg::ComposeEnter),
+        KeyCode::Backspace => Some(Msg::ComposeBackspace),
+        KeyCode::Delete => Some(Msg::ComposeDelete),
+        KeyCode::Left => Some(Msg::ComposeMove(CaretMove::Left)),
+        KeyCode::Right => Some(Msg::ComposeMove(CaretMove::Right)),
+        KeyCode::Up => Some(Msg::ComposeMove(CaretMove::Up)),
+        KeyCode::Down => Some(Msg::ComposeMove(CaretMove::Down)),
+        KeyCode::Home => Some(Msg::ComposeMove(CaretMove::Home)),
+        KeyCode::End => Some(Msg::ComposeMove(CaretMove::End)),
+        KeyCode::Char(c) if !ctrl => Some(Msg::ComposeInsert(c)),
+        _ => None,
     }
 }
 
@@ -95,6 +129,9 @@ fn normal_mode(model: &Model, key: KeyEvent) -> Option<Msg> {
         KeyCode::Char('r') => Some(Msg::Refresh),
         KeyCode::Char('a') if model.tab == Tab::Mail => Some(Msg::AckSelected),
         KeyCode::Char('m') if model.tab == Tab::Mail => Some(Msg::ReadSelected),
+        // `c` composes everywhere; the closed-channel filter moved to `C` so
+        // the console's primary action is not tab-scoped.
+        KeyCode::Char('c') => Some(Msg::OpenCompose),
 
         KeyCode::Char('[') => Some(Msg::StepRefresh(-REFRESH_STEP_MS)),
         KeyCode::Char(']') => Some(Msg::StepRefresh(REFRESH_STEP_MS)),
@@ -104,7 +141,7 @@ fn normal_mode(model: &Model, key: KeyEvent) -> Option<Msg> {
         }
         KeyCode::Char('d') => Some(Msg::ToggleDense),
         KeyCode::Char('t') => Some(Msg::ToggleRelativeTime),
-        KeyCode::Char('c') if model.tab == Tab::Channels => Some(Msg::ToggleClosedChannels),
+        KeyCode::Char('C') if model.tab == Tab::Channels => Some(Msg::ToggleClosedChannels),
         _ => None,
     }
 }
@@ -122,12 +159,17 @@ pub fn help_lines() -> Vec<&'static str> {
         "  /                        filter (Enter searches the index on Mail)",
         "  Esc                      clear filter / back / quit",
         "",
+        "  c  compose / reply (Tab moves the form, Enter advances)",
         "  a  acknowledge selected message       m  mark read",
         "  r  refresh now                        d  dense rows",
-        "  t  relative / clock time              c  show closed channels",
+        "  t  relative / clock time              C  show closed channels",
         "  [ ]  refresh cadence                  - +  dashboard chart window",
         "",
         "  q  quit              ?  this help",
+        "",
+        "  compose: c opens the form on any tab. Tab / Shift-Tab walk To, Subject,",
+        "  Body, Wake, Importance, Ack, send. Enter advances, inserts the body's newline,",
+        "  toggles, or sends on the send stop. Esc drops the draft; Ctrl-C quits.",
         "",
         "  presence is live: the Agents tab re-reads the roster every tick.",
         "  40-79 cols (phone width): one pane at a time, h / l switches, Enter opens.",

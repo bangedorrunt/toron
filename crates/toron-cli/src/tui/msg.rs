@@ -7,6 +7,7 @@
 //! rows with wall time as a number, so the fold never awaits, never reads the
 //! clock, and never touches the network.
 
+use super::compose::{CaretMove, ComposedSend};
 use super::model::{AgentRow, ChannelRow, HealthRow, MailRow, PostRow, ReceiptCounts, Tab};
 
 /// Which fetch an error came from (one vocabulary for status-line text and
@@ -31,6 +32,8 @@ pub enum Op {
     Health,
     /// A write (ack/read receipt).
     Receipt,
+    /// Sending a composed message.
+    Send,
 }
 
 impl Op {
@@ -46,6 +49,7 @@ impl Op {
             Op::Receipts => "receipts",
             Op::Health => "health",
             Op::Receipt => "ack",
+            Op::Send => "send",
         }
     }
 }
@@ -106,6 +110,17 @@ pub enum Msg {
         /// Verb that ran (`ack` / `read`).
         verb: &'static str,
     },
+    /// A composed message landed. Carries the recipient list back so the fold
+    /// can say who was actually addressed (the doorbell's prompt hop needs a
+    /// live pane, and the operator has to know which they got).
+    MailSent {
+        /// Recipients as typed.
+        to: String,
+        /// The message id (hex) the send produced.
+        message_id: String,
+        /// Thread the send joined, when it was a reply.
+        thread: Option<String>,
+    },
 
     // --- intents (keys, decoded by `keymap`) -----------------------------
     /// Leave the alternate screen and exit.
@@ -153,6 +168,26 @@ pub enum Msg {
     ToggleRelativeTime,
     /// `c` — show/hide closed channels.
     ToggleClosedChannels,
+
+    // --- the compose form ------------------------------------------------
+    /// `c` — open the send form. The fold decides whether it is a REPLY or a
+    /// new message from what is on screen, so the key means one thing.
+    OpenCompose,
+    /// `Enter` in the form: advance, insert a newline, toggle, or send. The
+    /// fold reads the focused stop, so the meaning lives in one place.
+    ComposeEnter,
+    /// A printable key in the form.
+    ComposeInsert(char),
+    /// `Backspace` in the form.
+    ComposeBackspace,
+    /// `Delete` in the form.
+    ComposeDelete,
+    /// A caret move in the focused field.
+    ComposeMove(CaretMove),
+    /// `Tab` / `Shift-Tab` — the next / previous form stop.
+    ComposeFocus(isize),
+    /// `Esc` — leave the form (the draft is dropped; the status says so).
+    ComposeCancel,
 }
 
 /// One effect the runtime executes. Data only — no closures, so a replayed
@@ -194,6 +229,9 @@ pub enum Effect {
         /// Message id.
         message_id: String,
     },
+    /// Send one composed message. This is the mailbox's own send path, so the
+    /// metadata-only wake ring (one kind-9 per recipient) rides it for free.
+    SendMail(ComposedSend),
     /// Leave the alternate screen and exit.
     Quit,
 }

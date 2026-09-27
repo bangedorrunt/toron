@@ -178,6 +178,17 @@ pub fn sparkline(f: &mut Frame, area: Rect, title: &str, data: &[u64], left: &st
 }
 
 /// The `layout` label used in the footer (responsive feedback).
+/// Short form of an id or npub for a title or a status line (`abc12345…`).
+/// One spelling for every surface: two shorteners would disagree about where
+/// the ellipsis lands.
+pub fn short_id(s: &str) -> String {
+    if s.chars().count() <= 12 {
+        return s.to_string();
+    }
+    let head: String = s.chars().take(12).collect();
+    format!("{head}…")
+}
+
 pub fn layout_label(mode: model::LayoutMode) -> &'static str {
     match mode {
         model::LayoutMode::Tri => "3-pane",

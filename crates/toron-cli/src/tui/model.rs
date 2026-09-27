@@ -14,6 +14,8 @@
 
 use toron_core::nostr::presence::PresenceState;
 
+use super::compose::ComposeState;
+
 /// Minimum usable terminal width. The floor is a phone-width PTY — an iPhone
 /// SSH client reports ~40-50 columns — so the console keeps working there in
 /// one-pane mode instead of refusing. Below this the resize card shows (§2).
@@ -101,12 +103,14 @@ impl Tab {
 }
 
 /// Input mode. `Insert` is the in-place filter/search box; `Help` is the
-/// modal keybinding overlay (a focus trap — background keys are ignored).
+/// modal keybinding overlay; `Compose` is the send form. `Help` and `Compose`
+/// are focus traps — background keys are ignored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     Normal,
     Insert,
     Help,
+    Compose,
 }
 
 /// Which pane owns the keyboard. `Tab` moves focus forward.
@@ -910,6 +914,9 @@ pub struct Model {
     pub inflight: usize,
     /// Status line.
     pub status: Status,
+    /// The compose form, while one is open. `None` in every other mode; the
+    /// draft lives here so a failed send never loses what was typed.
+    pub compose: Option<ComposeState>,
     /// Set by the quit path; the runtime draws one last frame and exits.
     pub should_quit: bool,
 }
@@ -935,8 +942,36 @@ impl Model {
             tick: 0,
             inflight: 0,
             status: Status::default(),
+            compose: None,
             should_quit: false,
         }
+    }
+
+    /// The roster row for one recipient spelling, matched on pin or npub (or
+    /// the `role:` / alias fold is the mailbox's job, not the console's).
+    pub fn roster_row(&self, name: &str) -> Option<&AgentRow> {
+        let name = name.trim();
+        self.agents
+            .rows
+            .iter()
+            .find(|a| a.name == name || a.npub == name)
+    }
+
+    /// The first named recipient the loaded roster knows has NO live pane.
+    ///
+    /// A peer message is durable either way, but the doorbell can only PROMPT
+    /// a pane; without one the wake lands in that pin's digest. The console has
+    /// to say which it is instead of implying the recipient was notified. An
+    /// unloaded or silent roster answers `None` (we cannot know), never a guess.
+    pub fn recipient_without_a_pane(&self, to: &str) -> Option<String> {
+        for name in to.split(',').map(str::trim).filter(|n| !n.is_empty()) {
+            if let Some(row) = self.roster_row(name)
+                && row.pane_id.is_none()
+            {
+                return Some(row.name.clone());
+            }
+        }
+        None
     }
 
     /// The commands a quiet console should name. Pure: project and pin come

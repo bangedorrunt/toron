@@ -4,6 +4,7 @@
 
 pub mod agents;
 pub mod channels;
+pub mod compose;
 pub mod dashboard;
 pub mod mail;
 pub mod settings;
@@ -115,6 +116,11 @@ pub fn render(f: &mut Frame, model: &Model) {
 
     if model.mode == Mode::Help {
         render_help(f, area);
+    }
+    // The form is a modal over whatever tab is behind it; it is drawn last so
+    // it owns the frame it covers.
+    if model.mode == Mode::Compose {
+        compose::render(f, area, model);
     }
 }
 
@@ -255,30 +261,42 @@ fn render_footer(f: &mut Frame, area: Rect, model: &Model, narrow: bool) {
 /// where you are, and `?` lists the rest.
 const NARROW_HINTS: &str = "[?] help  [q] quit  [1-5] tab";
 
+/// The footer hint text as a plain string, so a test can assert the console
+/// documents its own keys. The renderer calls `hint_line` directly.
+#[cfg(test)]
+pub(crate) fn hint_line_for_test(model: &Model, narrow: bool) -> String {
+    hint_line(model, narrow)
+        .spans
+        .iter()
+        .map(|s| s.content.to_string())
+        .collect()
+}
+
 /// Context-sensitive hints: only what is actionable right now.
 fn hint_line(model: &Model, narrow: bool) -> Line<'static> {
     let text = match model.mode {
         Mode::Help => "[Esc/?/q] close help",
         Mode::Insert => "[Enter] apply  [Esc] cancel  [type] filter",
+        Mode::Compose => "[Tab] next  [Enter] advance/toggle/send  [Esc] cancel  [^C] quit",
         Mode::Normal if narrow => NARROW_HINTS,
         Mode::Normal => match (model.tab, model.pane) {
             (Tab::Mail, Pane::Reader) => {
-                "[j/k] scroll  [a] ack  [m] read  [h/Esc] back  [/] filter  [?] help  [q] quit"
+                "[j/k] scroll  [c] reply  [a] ack  [m] read  [h/Esc] back  [?] help  [q] quit"
             }
             (Tab::Mail, Pane::Sidebar) => {
                 "[j/k] folder  [l] list  [1-5] tab  [r] refresh  [?] help  [q] quit"
             }
             (Tab::Mail, Pane::List) => {
-                "[j/k] move  [Enter/l] open  [a] ack  [/] filter  [Tab] tab  [?] help  [q] quit"
+                "[j/k] move  [Enter/l] open  [c] compose  [a] ack  [/] filter  [?] help  [q] quit"
             }
             (Tab::Channels, Pane::Sidebar) => {
-                "[j/k] channel  [l] posts  [c] closed  [r] refresh  [?] help  [q] quit"
+                "[j/k] channel  [l] posts  [c] compose  [C] closed  [r] refresh  [?] help"
             }
             (Tab::Channels, _) => {
-                "[j/k] post  [Enter] open  [/] filter  [c] closed  [Tab] tab  [?] help  [q] quit"
+                "[j/k] post  [Enter] open  [c] compose  [C] closed  [/] filter  [?] help"
             }
             (Tab::Agents, _) => {
-                "[j/k] agent  [Enter] detail  [/] filter  [r] refresh  [Tab] tab  [?] help"
+                "[j/k] agent  [Enter] detail  [c] message  [/] filter  [?] help  [q] quit"
             }
             (Tab::Dashboard, _) => "[r] refresh  [-/+] window  [?] help  [1-5] tab  [q] quit",
             (Tab::Settings, _) => "[[] slower  []] faster  [d] dense  [t] time  [?] help  [q] quit",

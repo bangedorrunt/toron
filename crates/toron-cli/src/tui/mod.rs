@@ -17,6 +17,7 @@
 //! ```
 
 pub mod charts;
+pub mod compose;
 pub mod host;
 pub mod keymap;
 pub mod model;
