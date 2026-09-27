@@ -445,6 +445,9 @@ pub const fn partition(action: &Action) -> ActionPartition {
         | Action::Reduce { .. }
         | Action::Loop { .. }
         | Action::Spawn { .. } => ActionPartition::EngineControl,
+        // bd-ynef: a park is engine control, not a host sink. It calls no
+        // provider; it hands the run a wake time and journals the intent.
+        Action::Park { .. } => ActionPartition::EngineControl,
         Action::SendMessage { .. } | Action::SendDm { .. } => {
             ActionPartition::HostSink { sink: "mailbox" }
         }
