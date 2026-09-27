@@ -913,7 +913,12 @@ mod tests {
             .iter()
             .filter(|a| matches!(partition(a), ActionPartition::EngineControl))
             .count();
-        assert_eq!(control, 9, "engine-owned control actions");
+        // bd-ynef: Action::Park joined EngineControl, so this is 10, not 9.
+        // Park is engine-owned control flow: the engine hands back
+        // "park until T" and re-drives at T. names.len() is unchanged at 16
+        // because Park already existed as a variant and only its partition
+        // moved, and unsupported is unaffected (react + call_webhook).
+        assert_eq!(control, 10, "engine-owned control actions");
         let unsupported = actions
             .iter()
             .filter(|a| matches!(partition(a), ActionPartition::Unsupported { .. }))
