@@ -591,6 +591,31 @@ pub enum Action {
     RequestApproval { message: String },
     /// Wait (in-process cap 270s per Buzz; Resonate unbounded in bd-oge).
     Delay { secs: u64 },
+    /// Park the run until `until_ms` (bd-ynef, ADR-0036).
+    ///
+    /// This is the durable half of `DispatchAcquire::Park`. The busy-owner
+    /// fence can hand back "park until T" but a host previously had no way to
+    /// act on it, so flywheel's fence adoption stopped short of a durable end
+    /// state. A park is INTERRUPTION, deliberately distinct from both success
+    /// and typed failure: it is not an error, and it is not a completed step.
+    ///
+    /// The wake time is DATA on the step, not ambient. No leaf reads a clock
+    /// to decide when to resume; `until_ms` arrives here the way `LoopParams`
+    /// policy arrives serialized, so a replayed run resumes at the same T.
+    /// `until_ms` may be an author template (`{{inputs.park_until_ms}}`).
+    Park {
+        /// Absolute wake time, unix millis. Rendered, then validated.
+        until_ms: String,
+        /// Upper bound on the wait, seconds. The engine parks until
+        /// `min(until_ms, now + max_wait_secs)`, so a park can never be
+        /// unbounded. Required: a park with no cap is a hang with extra steps.
+        max_wait_secs: u64,
+        /// Why the run parked — carried into the park intent and the resume
+        /// record so an operator reading the journal sees the cause, not just
+        /// a timestamp.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
     /// Retry a sub-step with max attempts + backoff (ADR-0005 Spec 4).
     Retry {
         #[serde(default = "default_max_attempts")]
@@ -753,6 +778,7 @@ impl Action {
             Self::CallWebhook { .. } => "call_webhook",
             Self::RequestApproval { .. } => "request_approval",
             Self::Delay { .. } => "delay",
+            Self::Park { .. } => "park",
             Self::Retry { .. } => "retry",
             Self::Branch { .. } => "branch",
             Self::Foreach { .. } => "foreach",

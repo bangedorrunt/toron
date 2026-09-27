@@ -150,6 +150,21 @@ const DELAY: ActionContract = ActionContract {
     output: OutputKind::Unit,
     supported: true,
 };
+/// bd-ynef: the park step. `template_fields` names `until_ms` and `reason` so
+/// the contract linter renders them (an unrendered `{{inputs.*}}` in a wake
+/// time would resolve to garbage and park in the wrong place).
+const PARK: ActionContract = ActionContract {
+    type_name: "park",
+    class: ActionClass::DurableControl,
+    // The park itself is a control step, but it DOES journal an intent before
+    // waiting: that row is what makes the wait resumable after a crash.
+    effect: EffectKind::Parked { sink: "park_until" },
+    template_fields: &["until_ms", "reason"],
+    // Distinct from Unit: a park's value carries `parked`/`resumed` and the
+    // re-drive key, so a caller can tell a park from a completed step.
+    output: OutputKind::AnyNonNull,
+    supported: true,
+};
 const RETRY: ActionContract = ActionContract {
     type_name: "retry",
     class: ActionClass::DurableControl,
@@ -234,6 +249,7 @@ pub const fn contract_for(action: &Action) -> &'static ActionContract {
         Action::CallWebhook { .. } => &CALL_WEBHOOK,
         Action::RequestApproval { .. } => &REQUEST_APPROVAL,
         Action::Delay { .. } => &DELAY,
+        Action::Park { .. } => &PARK,
         Action::Retry { .. } => &RETRY,
         Action::Branch { .. } => &BRANCH,
         Action::Foreach { .. } => &FOREACH,
@@ -279,6 +295,33 @@ pub fn validate_action(action: &Action) -> Vec<Violation> {
         }
     };
     match action {
+        // bd-ynef: a park with no cap is an unbounded wait and a non-integer
+        // literal wake time is a silent mis-park. Both fail closed here.
+        Action::Park {
+            until_ms,
+            max_wait_secs,
+            ..
+        } => {
+            if *max_wait_secs == 0 {
+                out.push(violation(
+                    "max_wait_secs",
+                    ActionErrorCode::InvalidInput,
+                    "park requires max_wait_secs > 0 — an uncapped park is an unbounded \
+                     wait (bd-ynef)"
+                        .into(),
+                ));
+            }
+            if !until_ms.contains("{{") && until_ms.trim().parse::<u64>().is_err() {
+                out.push(violation(
+                    "until_ms",
+                    ActionErrorCode::InvalidInput,
+                    format!(
+                        "park until_ms {until_ms:?} is not an absolute unix-millis integer \
+                         (bd-ynef): the wake time is data on the step"
+                    ),
+                ));
+            }
+        }
         Action::SendMessage { to, .. } => {
             if to.iter().all(|t| t.trim().is_empty()) {
                 out.push(violation(

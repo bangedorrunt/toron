@@ -684,6 +684,16 @@ fn collect_step_strings(step: &Step, out: &mut Vec<String>) {
 
 fn collect_action_strings(action: &Action, out: &mut Vec<String>) {
     match action {
+        // bd-ynef: a park's strings can hold templates, so they are scanned
+        // like any other authored text.
+        Action::Park {
+            until_ms, reason, ..
+        } => {
+            out.push(until_ms.clone());
+            if let Some(r) = reason {
+                out.push(r.clone());
+            }
+        }
         Action::SendMessage {
             to, subject, body, ..
         } => {

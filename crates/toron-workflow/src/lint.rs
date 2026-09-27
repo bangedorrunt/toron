@@ -520,6 +520,47 @@ fn check_action(report: &mut LintReport, action: &Action) {
         return;
     }
     match action {
+        // bd-ynef: a park must be BOUNDED and must carry an absolute wake
+        // time. Linting it here means an unbounded park is caught at author
+        // time, not discovered as a multi-day sleep in production.
+        Action::Park {
+            until_ms,
+            max_wait_secs,
+            ..
+        } => {
+            if *max_wait_secs == 0 {
+                report.issues.push(LintIssue {
+                    level: Level::Error,
+                    message: "park requires max_wait_secs > 0 — a park with no cap is an \
+                              unbounded wait (bd-ynef)"
+                        .into(),
+                    line: None,
+                });
+            } else if *max_wait_secs > crate::engine::park::PARK_MAX_WAIT_SECS {
+                report.issues.push(LintIssue {
+                    level: Level::Error,
+                    message: format!(
+                        "park max_wait_secs {} exceeds the hard cap {}s — the engine will \
+                         refuse this park at run time (bd-ynef)",
+                        max_wait_secs,
+                        crate::engine::park::PARK_MAX_WAIT_SECS
+                    ),
+                    line: None,
+                });
+            }
+            // A template is legal (it may resolve to a real time); a literal
+            // that is not an integer is not, and the engine would refuse it.
+            if !until_ms.contains("{{") && until_ms.trim().parse::<u64>().is_err() {
+                report.issues.push(LintIssue {
+                    level: Level::Error,
+                    message: format!(
+                        "park until_ms {until_ms:?} is neither a unix-millis integer nor a \
+                         template — the wake time is DATA on the step, not a duration (bd-ynef)"
+                    ),
+                    line: None,
+                });
+            }
+        }
         Action::SendMessage {
             to, subject, body, ..
         } => {
