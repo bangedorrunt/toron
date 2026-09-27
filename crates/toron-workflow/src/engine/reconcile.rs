@@ -72,6 +72,10 @@ pub enum DispatchPlan {
     RefuseBlindRetry { reason: String },
     /// The row is terminal: return the stored outcome, dispatch nothing.
     DuplicateTerminal,
+    /// bd-ynef: the row is parked awaiting its wake time. Resume the SAME
+    /// logical key at T — not a retry (nothing failed) and not a new dispatch
+    /// (the intent row already exists, so DispatchNew would duplicate it).
+    ResumeParked { attempt: i64 },
 }
 
 /// Decide one attempt from the journaled view (ADR-0032 §5.3 + §7.4 crash
@@ -82,6 +86,13 @@ pub fn plan_attempt(current: Option<&EffectView>, cap: &ProviderCapability) -> D
     };
     use EffectState as S;
     match view.state {
+        // bd-ynef: a park is INTERRUPTION, so it is neither a terminal row to
+        // return nor a retry to attempt. It resumes at its wake time under the
+        // SAME re-drive key — never DispatchNew, which would double the very
+        // effect the park was waiting to protect.
+        S::Parked => DispatchPlan::ResumeParked {
+            attempt: view.attempt.max(1),
+        },
         S::Settled | S::Failed | S::Cancelled => DispatchPlan::DuplicateTerminal,
         S::Prepared => DispatchPlan::DispatchNew,
         S::ReconcilePending => DispatchPlan::RefuseBlindRetry {

@@ -168,6 +168,12 @@ pub enum EffectState {
     Unknown,
     ReconcilePending,
     Cancelled,
+    /// bd-ynef: parked until a wake time, re-driven at T under the same key.
+    /// Its own state rather than a reinterpretation of `Failed` or `Settled`:
+    /// a park is INTERRUPTION, not a typed failure and not a completed step.
+    /// Non-terminal, so a crash mid-park leaves a visible row to resume from
+    /// rather than a wait that vanished.
+    Parked,
 }
 
 impl EffectState {
@@ -181,6 +187,7 @@ impl EffectState {
             Self::Unknown => "unknown",
             Self::ReconcilePending => "reconcile_pending",
             Self::Cancelled => "cancelled",
+            Self::Parked => "parked",
         }
     }
 
@@ -194,6 +201,7 @@ impl EffectState {
             "unknown" => Ok(Self::Unknown),
             "reconcile_pending" => Ok(Self::ReconcilePending),
             "cancelled" => Ok(Self::Cancelled),
+            "parked" => Ok(Self::Parked),
             _ => Err(format!("unknown effect state {s:?}")),
         }
     }
@@ -202,6 +210,14 @@ impl EffectState {
     /// `unknown` and `reconcile_pending` are explicitly nonterminal.
     pub const fn is_terminal(self) -> bool {
         matches!(self, Self::Settled | Self::Failed | Self::Cancelled)
+    }
+
+    /// bd-ynef: a parked effect is the one non-terminal state a re-drive may
+    /// resume. It is NOT terminal (the step has not finished) and NOT a
+    /// failure (nothing went wrong), which is what keeps park, success, and
+    /// typed failure three distinct outcomes.
+    pub const fn is_resumable(self) -> bool {
+        matches!(self, Self::Parked)
     }
 }
 

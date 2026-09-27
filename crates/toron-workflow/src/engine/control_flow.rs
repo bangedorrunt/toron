@@ -631,6 +631,138 @@ async fn dispatch_leaf_async(
     }
 }
 
+/// bd-ynef: "now" for the park decision, as INJECTED DATA.
+///
+/// The SDK deliberately gives a leaf no wall clock, so the host supplies it —
+/// the same shape as `LoopParams` policy arriving serialized rather than being
+/// read from the environment inside a reducer. A host that injects nothing
+/// fails loudly rather than defaulting to 0, because `now = 0` would make every
+/// park look 56 years overdue and resume instantly.
+fn park_now_ms(ctx: &Context) -> resonate_sdk::prelude::Result<u64> {
+    let injected: Arc<Option<crate::engine::park::ParkClock>> =
+        ctx.get_dependency::<Option<crate::engine::park::ParkClock>>();
+    match injected.as_ref().and_then(|c| c.now_ms) {
+        Some(now) => Ok(now),
+        None => Err(resonate_sdk::error::Error::Application {
+            message:
+                "park: no ParkClock is injected — a park's 'now' is host-supplied data, not a \
+                 clock the leaf reads (bd-ynef). Inject ParkClock { now_ms } so a replayed run \
+                 reaches the same decision."
+                    .into(),
+        }),
+    }
+}
+
+/// bd-ynef: render a park's `until_ms` and parse it to an absolute time.
+///
+/// STRICT rendering, unlike the approval message: an unrenderable template
+/// here would silently become a garbage wake time (0, or a parse failure
+/// coerced to "now"), and a park that resumes immediately because its template
+/// did not resolve is exactly the silent-wrong-wake-time this bead exists to
+/// prevent. A literal integer needs no template resolution.
+fn render_park_until_ms(
+    until_ms: &str,
+    trigger: &serde_json::Value,
+    step_outputs: &serde_json::Map<String, serde_json::Value>,
+) -> resonate_sdk::prelude::Result<u64> {
+    let rendered = if until_ms.contains("{{") {
+        crate::engine::template::render_text(until_ms, trigger, step_outputs).map_err(|e| {
+            resonate_sdk::error::Error::Application {
+                message: format!(
+                    "park: until_ms template {until_ms:?} did not render ({e}) — a park must \
+                     carry a resolvable wake time, never a silently-defaulted one (bd-ynef)"
+                ),
+            }
+        })?
+    } else {
+        until_ms.to_string()
+    };
+    rendered
+        .trim()
+        .parse::<u64>()
+        .map_err(|_| resonate_sdk::error::Error::Application {
+            message: format!(
+                "park: until_ms {rendered:?} is not an absolute unix-millis integer (bd-ynef). \
+                 The wake time is DATA on the step, not a duration the engine computes."
+            ),
+        })
+}
+
+/// bd-ynef: journal the park intent BEFORE the provider waits.
+///
+/// Returns `Some(value)` when the journal owns the outcome: under
+/// `EffectJournalMode::Enforced` a park with no journal seam is REFUSED before
+/// any wait happens, because an unjournaled park is a wait that a crash can
+/// erase with nothing left to resume from. Under `Recording` the park proceeds
+/// and the value carries the bypass marker, so a dry arm never reads as a
+/// durable park.
+async fn journal_park_intent(
+    ctx: &Context,
+    intent: &crate::engine::park::ParkIntent,
+    workflow_digest: &str,
+    attempt: u32,
+    max_attempts: u32,
+) -> resonate_sdk::prelude::Result<Option<serde_json::Value>> {
+    let mut invocation = invocation_for_leaf(
+        Action::Park {
+            until_ms: intent.until_ms.to_string(),
+            max_wait_secs: crate::engine::park::PARK_MAX_WAIT_SECS,
+            reason: intent.reason.clone(),
+        },
+        &intent.run_id,
+        workflow_digest,
+        &intent.node,
+        attempt,
+        max_attempts,
+        None,
+    );
+    // The re-drive key IS the effect key: parking the same step to the same T
+    // twice must land on the same journal row, which is what makes the
+    // re-drive idempotent rather than a second park.
+    invocation.run.effect_key = Some(intent.key.clone());
+    let mode: Arc<EffectJournalMode> = ctx.get_dependency::<EffectJournalMode>();
+    // The option lives INSIDE the Arc (the dispatch_leaf_or_compat seam), so
+    // this lookup never panics on an embedding that injected no runner.
+    let stored: Arc<Option<EffectRunner>> = ctx.get_dependency::<Option<EffectRunner>>();
+    let Some(runner) = (*stored).clone() else {
+        if *mode == EffectJournalMode::Enforced {
+            return Err(resonate_sdk::error::Error::Application {
+                message: format!(
+                    "park REFUSED — no EffectRunner is injected (EffectJournalMode::Enforced): \
+                     the park intent must be journaled before the wait, or a crash mid-park \
+                     erases the resume point (ADR-0032 Spec 6, bd-ynef)"
+                ),
+            });
+        }
+        eprintln!(
+            "toron-workflow: park wrote NO effect-journal row ({EFFECT_JOURNAL_BYPASSED}) — \
+             a park without its intent is a wait that cannot be resumed (bd-ynef)"
+        );
+        return Ok(None);
+    };
+    let value = runner(&invocation).map_err(|e| resonate_sdk::error::Error::Application {
+        message: format!("park: journaling the intent failed: {e} (bd-ynef)"),
+    })?;
+    if value.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
+        // A refused journal insert refuses the park: the intent is the thing
+        // that makes the wait resumable.
+        return Err(resonate_sdk::error::Error::Application {
+            message: format!(
+                "park REFUSED — the journal did not accept the intent: {value}. A park whose \
+                 intent is not journaled is a wait that vanishes on crash (bd-ynef)."
+            ),
+        });
+    }
+    let mut out = serde_json::Map::new();
+    out.insert("ok".into(), serde_json::Value::Bool(true));
+    out.insert("parked".into(), serde_json::Value::Bool(true));
+    out.insert("resumed".into(), serde_json::Value::Bool(false));
+    out.insert("journaled".into(), serde_json::Value::Bool(true));
+    out.insert("redrive_key".into(), serde_json::json!(intent.key));
+    out.insert("until_ms".into(), serde_json::json!(intent.until_ms));
+    Ok(Some(serde_json::Value::Object(out)))
+}
+
 /// An effectful HostSink leaf with NO injected runner.
 ///
 /// `Enforced` REFUSES it — before any provider runs, because the provider
@@ -782,6 +914,114 @@ pub(crate) fn run_step_with_enclosing<'a>(
                         unit.insert("requested_secs".into(), serde_json::json!(requested));
                     }
                     serde_json::Value::Object(unit)
+                }
+                Action::Park {
+                    until_ms,
+                    max_wait_secs,
+                    reason,
+                } => {
+                    // bd-ynef: the durable half of DispatchAcquire::Park.
+                    //
+                    // `until_ms` is DATA on the step (it may be an author
+                    // template), never a clock read here: the wake time
+                    // arrives the way LoopParams policy arrives serialized, so
+                    // a replayed run reaches the same decision. The only
+                    // clock in this leaf is the injected `now`, used to
+                    // compare against that data.
+                    let rendered = render_park_until_ms(until_ms, trigger, step_outputs)?;
+                    // The clock is INJECTED, never read here. The SDK exposes
+                    // no wall clock to a leaf, and that is the point: the wake
+                    // time is data (on the step) and "now" is data (injected by
+                    // the host), the way LoopParams policy arrives serialized.
+                    // A leaf that read the clock itself would make a replayed
+                    // run reach a different decision.
+                    let now_ms = park_now_ms(ctx)?;
+                    let decision = crate::engine::park::plan_park(
+                        rendered,
+                        *max_wait_secs,
+                        now_ms,
+                        crate::engine::park::PARK_MAX_WAIT_SECS,
+                    );
+                    let reason = reason.as_deref().map(|r| {
+                        crate::engine::template::render_text(r, trigger, step_outputs)
+                            .unwrap_or_else(|_| r.to_string())
+                    });
+                    match &decision {
+                        // T already passed: resume NOW. Re-driving an elapsed
+                        // park must not park again, or the run re-sleeps on
+                        // every re-drive and never progresses.
+                        crate::engine::park::ParkDecision::ResumeNow { overdue_ms } => {
+                            let mut unit = serde_json::Map::new();
+                            unit.insert("ok".into(), serde_json::Value::Bool(true));
+                            unit.insert("parked".into(), serde_json::Value::Bool(false));
+                            unit.insert("resumed".into(), serde_json::Value::Bool(true));
+                            unit.insert("overdue_ms".into(), serde_json::json!(overdue_ms));
+                            serde_json::Value::Object(unit)
+                        }
+                        // Park: the intent is journaled BEFORE the wait, so a
+                        // crash mid-park leaves a visible Parked row naming the
+                        // re-drive key rather than a wait that vanished.
+                        crate::engine::park::ParkDecision::Park {
+                            until_ms,
+                            capped_to_ms,
+                        } => {
+                            let intent = crate::engine::park::park_intent(
+                                run_id,
+                                node,
+                                &decision,
+                                reason.clone(),
+                            )
+                            .expect("a Park decision yields an intent");
+                            if let Some(journal) = journal_park_intent(
+                                ctx,
+                                &intent,
+                                workflow_digest,
+                                attempt,
+                                coordinator.max_attempts,
+                            )
+                            .await?
+                            {
+                                return Ok(journal);
+                            }
+                            // The wait itself is the one bounded blocking
+                            // call, and it is bounded by max_wait_secs.
+                            let wait_ms = until_ms.saturating_sub(now_ms);
+                            ctx.sleep(Duration::from_millis(wait_ms)).await?;
+                            let mut unit = serde_json::Map::new();
+                            unit.insert("ok".into(), serde_json::Value::Bool(true));
+                            // `parked` is true and `ok` is true TOGETHER, and
+                            // that is the point: a park is not a failure and
+                            // not a completed step. It is an interruption that
+                            // resumed. Callers distinguish them by this flag,
+                            // not by guessing from ok.
+                            unit.insert("parked".into(), serde_json::Value::Bool(true));
+                            unit.insert("resumed".into(), serde_json::Value::Bool(true));
+                            unit.insert("until_ms".into(), serde_json::json!(until_ms));
+                            unit.insert("redrive_key".into(), serde_json::json!(intent.key));
+                            if let Some(c) = capped_to_ms {
+                                unit.insert("capped".into(), serde_json::Value::Bool(true));
+                                unit.insert("capped_to_ms".into(), serde_json::json!(c));
+                            }
+                            if let Some(r) = reason {
+                                unit.insert("reason".into(), serde_json::json!(r));
+                            }
+                            serde_json::Value::Object(unit)
+                        }
+                        // Refused, never silently truncated: a truncated park
+                        // resumes early and reads as a successful step.
+                        crate::engine::park::ParkDecision::RefusedTooLong {
+                            requested_secs,
+                            max_secs,
+                        } => {
+                            return Err(resonate_sdk::error::Error::Application {
+                                message: format!(
+                                    "park: requested wait {requested_secs}s exceeds the hard cap \
+                                     {max_secs}s — refused (bd-ynef). A park must be bounded; \
+                                     shorten the requested until_ms or park in steps."
+                                ),
+                            });
+                        }
+                    }
                 }
                 Action::RequestApproval { message } => {
                     // Render FIRST (the same contract as the mailbox actions):
@@ -2672,6 +2912,7 @@ pub async fn run_graph_node(
             | Action::Loop { .. }
             | Action::RequestApproval { .. }
             | Action::Delay { .. }
+            | Action::Park { .. }
             | Action::Spawn { .. }
             | Action::Verify { .. }
     );

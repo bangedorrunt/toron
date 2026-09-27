@@ -2607,6 +2607,11 @@ impl EffectDispatcher {
                     req.effect_key
                 ))));
             }
+            // bd-ynef: a parked row resumes at its wake time under the SAME
+            // key. It re-enters the normal claim path with the same attempt
+            // number, so a re-drive is a resume rather than a new dispatch —
+            // and crucially it is NOT a failure: nothing here returns Err.
+            DispatchPlan::ResumeParked { attempt } => attempt,
         };
         // Fencing identity is deterministic per (key, attempt): unique
         // across attempts without a randomness dependency (the fence
