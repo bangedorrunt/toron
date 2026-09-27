@@ -40,19 +40,42 @@ pub enum SubscriptionEvent {
     Closed(String),
 }
 
+/// Releases a subscription's bus-side registration when its owner drops.
+///
+/// The registry outlives every individual subscription, so cleanup has to
+/// ride the subscription's own scope. Relying on a later publish to notice a
+/// closed channel leaks the registration for the life of the process: an
+/// access-gated subscriber is never fanned to, so nothing ever observes the
+/// close (bd-cqo2).
+pub(crate) type ReleaseOnDrop = Box<dyn FnOnce() + Send + 'static>;
+
 /// A live subscription to the bus.
 ///
 /// Consume with [`next()`](Self::next) or `Stream::next` via
 /// [`tokio_stream`]'s `ReceiverStream` wrapper.
 pub struct Subscription {
     id: SubscriptionId,
-    rx: mpsc::Receiver<SubscriptionEvent>,
+    /// `None` once the receiver has been detached by [`into_inner`].
+    rx: Option<mpsc::Receiver<SubscriptionEvent>>,
+    /// Unregisters this id from the bus when dropped. `None` for transports
+    /// that hold no registry (relay, wake sidecar).
+    release: Option<ReleaseOnDrop>,
 }
 
 impl Subscription {
     /// Create a subscription from a channel receiver.
-    pub const fn new(id: SubscriptionId, rx: mpsc::Receiver<SubscriptionEvent>) -> Self {
-        Self { id, rx }
+    pub fn new(id: SubscriptionId, rx: mpsc::Receiver<SubscriptionEvent>) -> Self {
+        Self {
+            id,
+            rx: Some(rx),
+            release: None,
+        }
+    }
+
+    /// Attach the bus-side unregistration to run on drop.
+    pub(crate) fn with_release(mut self, release: ReleaseOnDrop) -> Self {
+        self.release = Some(release);
+        self
     }
 
     /// The subscription id.
@@ -64,12 +87,19 @@ impl Subscription {
     ///
     /// Returns `None` when the bus closed this subscription or dropped it.
     pub async fn next(&mut self) -> Option<SubscriptionEvent> {
-        self.rx.recv().await
+        self.rx.as_mut()?.recv().await
     }
 
     /// Reject a subscription that has been closed by the server.
-    pub fn into_inner(self) -> mpsc::Receiver<SubscriptionEvent> {
-        self.rx
+    ///
+    /// Hands back the raw receiver *and* keeps the bus registration alive
+    /// for as long as that receiver lives, so detaching never resurrects the
+    /// leak this type exists to prevent.
+    pub fn into_inner(mut self) -> DetachedSubscription {
+        DetachedSubscription {
+            rx: self.rx.take(),
+            release: self.release.take(),
+        }
     }
 
     /// Channel capacity used when the bus spawns a subscription.
@@ -81,6 +111,42 @@ impl Subscription {
     /// larger buffer just defers drops while bounded (1024 × ~500 B ≈ 0.5 MB
     /// per subscriber).
     pub const DEFAULT_CAPACITY: usize = 1024;
+}
+
+/// A receiver detached from its `Subscription` via
+/// [`Subscription::into_inner`].
+///
+/// Carries the bus registration with it so the unregistration still runs when
+/// the last owner of the stream goes away.
+pub struct DetachedSubscription {
+    rx: Option<mpsc::Receiver<SubscriptionEvent>>,
+    release: Option<ReleaseOnDrop>,
+}
+
+impl DetachedSubscription {
+    /// Await the next event, `None` once the bus closed the subscription.
+    pub async fn next(&mut self) -> Option<SubscriptionEvent> {
+        self.rx.as_mut()?.recv().await
+    }
+}
+
+impl Drop for Subscription {
+    fn drop(&mut self) {
+        // The scope owns cleanup, on every exit path: normal completion,
+        // an early return, or cancellation. There is no later observer that
+        // could notice the channel closed, so this is the only release point.
+        if let Some(release) = self.release.take() {
+            release();
+        }
+    }
+}
+
+impl Drop for DetachedSubscription {
+    fn drop(&mut self) {
+        if let Some(release) = self.release.take() {
+            release();
+        }
+    }
 }
 
 #[cfg(test)]

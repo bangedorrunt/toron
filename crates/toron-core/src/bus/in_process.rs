@@ -423,7 +423,18 @@ impl InProcessBus {
         });
         self.subs.write().insert(id.clone(), sub);
 
-        Ok(Subscription::new(id, rx))
+        // Unregister on the caller's scope, not on the next publish. The
+        // `Closed` arm in `fanout_to` cannot be the release path for an
+        // access-gated subscriber: `access_gate` refuses it every scoped
+        // event, so no publish ever reaches it and the entry (plus its
+        // capacity-1024 mpsc block) would pin for the life of the daemon.
+        // parking_lot locks synchronously, so this is safe from `Drop`
+        // outside a runtime context (bd-cqo2).
+        let registry = self.subs.clone();
+        let release_id = id.clone();
+        Ok(Subscription::new(id, rx).with_release(Box::new(move || {
+            registry.write().remove(&release_id);
+        })))
     }
 }
 
