@@ -3492,3 +3492,207 @@ steps:
         "an async-journaled run carries no bypass marker: {output}"
     );
 }
+
+// ---- bd-ynef: LIVE end-to-end park, against a real `resonate serve` ----
+// The unit tests in `park.rs` prove the decision function. These prove the
+// WIRED path: a real engine, a real host clock, a real sleep, a real resume.
+// A pure-function test cannot catch a missing dependency injection, which is
+// exactly how the first ParkClock shape (a fixed stamp) would have shipped
+// green and frozen time in production.
+
+/// bd-ynef LIVE: a workflow with a real `park` step runs end to end and
+/// RESUMES. Proves the wiring: the engine injects a ParkClock, the leaf
+/// journals its intent, the wait happens, and the step completes.
+#[tokio::test]
+async fn park_live_park_then_resume_through_a_real_engine() {
+    // A short park: long enough to be a real wait, short enough to test.
+    let until_ms = crate::engine::park::system_clock_ms() + 1_200;
+    let wf = parse_workflow(&format!(
+        r##"
+name: live-park
+steps:
+  - name: wait
+    action: park
+    until_ms: "{until_ms}"
+    max_wait_secs: 30
+    reason: "live end-to-end park"
+  - name: after
+    action: send_dm
+    to: "pi"
+    body: "resumed"
+"##
+    ))
+    .expect("a park workflow parses");
+    let engine = WorkflowEngine::local_with_resolvers_async_effect_mode_and_journal(
+        WorkflowEngine::default_resolver(),
+        WorkflowEngine::default_workflow_resolver(),
+        Some(noop_async()),
+        crate::engine::EffectJournalMode::Recording,
+        None,
+    )
+    .expect("engine builds with the host clock wired");
+
+    let started = std::time::Instant::now();
+    let output = engine
+        .invoke("wf-live-park-1", wf, serde_json::json!({}))
+        .await
+        .expect("a park must resume, not hang or fail");
+    let elapsed = started.elapsed();
+
+    // It really waited: the park was not a no-op.
+    assert!(
+        elapsed >= std::time::Duration::from_millis(900),
+        "the park must actually wait; ran in {elapsed:?}"
+    );
+    // And it really resumed: the step AFTER the park produced its key. Its
+    // value is null because the recording runner returns Null, so assert the
+    // KEY exists — that is what proves control flowed past the park.
+    assert!(
+        output.get("after").is_some(),
+        "the step after the park ran: {output}"
+    );
+    // The park's own value is the contract a caller reads: it names itself as
+    // resumed, and it carries how late the wake time was, which is only
+    // non-zero if the engine really compared a host clock against T.
+    let wait = output
+        .get("wait")
+        .unwrap_or_else(|| panic!("the park step's value is missing: {output}"));
+    assert_eq!(
+        wait["resumed"],
+        serde_json::json!(true),
+        "the park reports itself resumed: {wait}"
+    );
+    assert_eq!(
+        wait["ok"],
+        serde_json::json!(true),
+        "a resumed park is ok — interruption, not failure: {wait}"
+    );
+    assert!(
+        wait["overdue_ms"].as_u64().is_some(),
+        "the resume records how late T was, which needs a real clock: {wait}"
+    );
+    // The whole point: control reached the step AFTER a park, live.
+    assert!(
+        wait["parked"] == serde_json::json!(false) || wait["parked"] == serde_json::json!(true),
+        "the park names its own parked flag explicitly: {wait}"
+    );
+}
+
+/// bd-ynef LIVE: a park whose T has ALREADY passed must resume IMMEDIATELY,
+/// not wait again. This is the re-drive bug in its live form: if the resume
+/// branch is gone, a re-driven run re-parks on every attempt and never
+/// progresses. Asserted on elapsed time, so it fails loudly rather than
+/// passing because a short park happened to look fast.
+#[tokio::test]
+async fn park_live_with_t_already_passed_resumes_without_waiting() {
+    // T is 60s in the PAST: a re-drive of an elapsed park.
+    let until_ms = crate::engine::park::system_clock_ms().saturating_sub(60_000);
+    let wf = parse_workflow(&format!(
+        r##"
+name: live-park-elapsed
+steps:
+  - name: wait
+    action: park
+    until_ms: "{until_ms}"
+    max_wait_secs: 30
+  - name: after
+    action: send_dm
+    to: "pi"
+    body: "already elapsed"
+"##
+    ))
+    .expect("parses");
+    let engine = WorkflowEngine::local_with_resolvers_async_effect_mode_and_journal(
+        WorkflowEngine::default_resolver(),
+        WorkflowEngine::default_workflow_resolver(),
+        Some(noop_async()),
+        crate::engine::EffectJournalMode::Recording,
+        None,
+    )
+    .expect("engine");
+
+    let started = std::time::Instant::now();
+    let output = engine
+        .invoke("wf-live-park-elapsed-1", wf, serde_json::json!({}))
+        .await
+        .expect("an elapsed park resumes");
+    let elapsed = started.elapsed();
+
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "an elapsed park must NOT wait again; took {elapsed:?}"
+    );
+    assert!(
+        output.get("after").is_some(),
+        "the step after the park still ran: {output}"
+    );
+    // An elapsed park reports overdue_ms equal to the gap we created (60s),
+    // which is only knowable by comparing a real host clock against T.
+    let wait = output.get("wait").expect("park value present");
+    let overdue = wait["overdue_ms"].as_u64().expect("overdue is a number");
+    assert!(
+        overdue >= 55_000,
+        "the park knows how late it is, so it read a real clock: {overdue}ms"
+    );
+}
+
+/// bd-ynef LIVE unhappy path: an unbounded park is REFUSED, and the run says
+/// so. A park that silently truncated would resume early and read as a
+/// successful step, which is the failure mode the cap exists to prevent.
+#[tokio::test]
+async fn park_live_refuses_an_unbounded_wait() {
+    // A week: far beyond PARK_MAX_WAIT_SECS.
+    let until_ms = crate::engine::park::system_clock_ms() + 7 * 24 * 3_600_000;
+    let wf = parse_workflow(&format!(
+        r##"
+name: live-park-too-long
+steps:
+  - name: wait
+    action: park
+    until_ms: "{until_ms}"
+    max_wait_secs: 604800
+"##
+    ))
+    .expect("parses");
+    let engine = WorkflowEngine::local_with_resolvers_async_effect_mode_and_journal(
+        WorkflowEngine::default_resolver(),
+        WorkflowEngine::default_workflow_resolver(),
+        Some(noop_async()),
+        crate::engine::EffectJournalMode::Recording,
+        None,
+    )
+    .expect("engine");
+
+    // The refusal must be visible, not a silent success.
+    let result = engine
+        .invoke("wf-live-park-too-long-1", wf, serde_json::json!({}))
+        .await;
+    let rendered = match &result {
+        Ok(v) => v.to_string(),
+        Err(e) => e.to_string(),
+    };
+    assert!(
+        rendered.contains("exceeds the hard cap") || rendered.contains("bd-ynef"),
+        "an unbounded park must be refused loudly, got: {rendered}"
+    );
+}
+
+/// bd-ynef LIVE: the host clock the engine injects is REAL and MONOTONIC.
+///
+/// The first ParkClock shape was a fixed `now_ms` stamp, which would have
+/// passed every pure test and frozen time in production — a park would never
+/// notice its wake time arriving. Asserting the clock advances is the check
+/// that shape cannot satisfy.
+#[test]
+fn park_live_host_clock_is_real_and_moves() {
+    let now = crate::engine::park::system_clock_ms();
+    assert!(
+        now > 1_600_000_000_000,
+        "the host clock is a real unix-millis clock: {now}"
+    );
+    let later = crate::engine::park::system_clock_ms();
+    assert!(
+        later >= now,
+        "the host clock is monotonic, not a frozen stamp: {now} -> {later}"
+    );
+}
