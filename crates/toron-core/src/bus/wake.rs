@@ -46,6 +46,13 @@ pub const WAKE_POLL_MS: u64 = 1_000;
 /// avoid refanout. 10k ids cover any sane tick at ~300B each.
 const SEEN_CAP: usize = 10_000;
 
+/// Finished-subscriber detail retained for [`WakeHandle::stats`].
+///
+/// The aggregate is served from running totals, not from this window, so the
+/// cap costs no metric accuracy — it only bounds how far back the per-
+/// subscriber breakdown reaches (bd-qpm0).
+const STATS_CAP: usize = 1_024;
+
 /// Clock abstraction: wall-clock enters only as `Msg` payload equivalent —
 /// here, as an injected `now_ms()`. Unit tests use [`ManualClock`].
 pub trait WakeClock: Send + Sync + 'static {
@@ -378,8 +385,32 @@ pub struct WakeStats {
 pub struct WakeHandle {
     sock_path: PathBuf,
     tasks: tokio::task::JoinSet<()>,
-    stats: Arc<std::sync::Mutex<Vec<SubscriberStats>>>,
+    /// Bounded window of recent finished-subscriber detail (bd-qpm0).
+    recent: Arc<std::sync::Mutex<std::collections::VecDeque<SubscriberStats>>>,
+    /// Monotonic running totals. Kept separately from `recent` so the
+    /// aggregate stays exact and O(1) no matter how long the sidecar runs.
+    totals: Arc<std::sync::Mutex<Totals>>,
     live: Arc<AtomicU64>,
+}
+
+/// Running totals folded on every finished subscriber (bd-qpm0).
+#[derive(Debug, Default, Clone, Copy)]
+struct Totals {
+    finished: usize,
+    delivered: u64,
+    shed: u64,
+    heartbeats_ok: u64,
+    heartbeat_deaf: u64,
+}
+
+impl Totals {
+    const fn fold(&mut self, s: &SubscriberStats) {
+        self.finished += 1;
+        self.delivered = self.delivered.saturating_add(s.delivered);
+        self.shed = self.shed.saturating_add(s.shed);
+        self.heartbeats_ok = self.heartbeats_ok.saturating_add(s.heartbeats_ok);
+        self.heartbeat_deaf = self.heartbeat_deaf.saturating_add(s.heartbeat_deaf);
+    }
 }
 
 impl WakeHandle {
@@ -391,7 +422,8 @@ impl WakeHandle {
         config: WakeConfig,
         clock: Arc<dyn WakeClock>,
     ) -> Self {
-        let stats = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recent = Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
+        let totals = Arc::new(std::sync::Mutex::new(Totals::default()));
         let live = Arc::new(AtomicU64::new(0));
         let mut tasks = tokio::task::JoinSet::new();
         let bus_tx = tokio::sync::broadcast::channel::<String>(config.queue_cap.max(1)).0;
@@ -493,7 +525,8 @@ impl WakeHandle {
         }
         // Accept loop: one task per subscriber, each bounded.
         {
-            let stats = stats.clone();
+            let recent = recent.clone();
+            let totals = totals.clone();
             let live_accept = live.clone();
             tasks.spawn(async move {
                 loop {
@@ -501,15 +534,25 @@ impl WakeHandle {
                         break;
                     };
                     let rx = bus_tx.subscribe();
-                    let stats = stats.clone();
+                    let recent = recent.clone();
+                    let totals = totals.clone();
                     let live = live_accept.clone();
                     let clock = clock.clone();
                     let cfg = config.clone();
                     live.fetch_add(1, Ordering::SeqCst);
                     tokio::spawn(async move {
                         let st = serve_subscriber(stream, rx, cfg, clock).await;
-                        if let Ok(mut all) = stats.lock() {
-                            all.push(st);
+                        // Fold into the exact running totals first: the
+                        // aggregate must never be capped by the detail
+                        // window (bd-qpm0).
+                        if let Ok(mut t) = totals.lock() {
+                            t.fold(&st);
+                        }
+                        if let Ok(mut window) = recent.lock() {
+                            window.push_back(st);
+                            while window.len() > STATS_CAP {
+                                window.pop_front();
+                            }
                         }
                         live.fetch_sub(1, Ordering::SeqCst);
                     });
@@ -519,26 +562,37 @@ impl WakeHandle {
         Self {
             sock_path,
             tasks,
-            stats,
+            recent,
+            totals,
             live,
         }
     }
 
-    /// Snapshot of finished-subscriber stats.
+    /// Snapshot of finished-subscriber stats, most recent last.
+    ///
+    /// Bounded to the last [`STATS_CAP`] subscribers; older detail is
+    /// dropped. The aggregate in [`Self::aggregate_stats`] is unaffected and
+    /// stays exact (bd-qpm0).
     pub fn stats(&self) -> Vec<SubscriberStats> {
-        self.stats.lock().map(|s| s.clone()).unwrap_or_default()
+        self.recent
+            .lock()
+            .map(|w| w.iter().cloned().collect())
+            .unwrap_or_default()
     }
 
     /// Exported aggregate (wave 4): exact sums + live count.
+    ///
+    /// O(1) in the number of subscribers served, from running totals rather
+    /// than a scan of retained detail (bd-qpm0).
     pub fn aggregate_stats(&self) -> WakeStats {
-        let done = self.stats();
+        let t = self.totals.lock().map(|t| *t).unwrap_or_default();
         WakeStats {
-            subscribers_finished: done.len(),
+            subscribers_finished: t.finished,
             subscribers_live: self.live.load(Ordering::SeqCst) as usize,
-            delivered: done.iter().map(|s| s.delivered).sum(),
-            shed: done.iter().map(|s| s.shed).sum(),
-            heartbeats_ok: done.iter().map(|s| s.heartbeats_ok).sum(),
-            heartbeat_deaf: done.iter().map(|s| s.heartbeat_deaf).sum(),
+            delivered: t.delivered,
+            shed: t.shed,
+            heartbeats_ok: t.heartbeats_ok,
+            heartbeat_deaf: t.heartbeat_deaf,
         }
     }
 }
