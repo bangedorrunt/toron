@@ -17,14 +17,18 @@ use std::process::{Child, Command, Stdio};
 /// This is the whole point: the 72 orphans carried no parent, no port, and no
 /// test name, so the leak was undiagnosable and therefore unfixable. A leak you
 /// cannot attribute is a leak you can only clean up by hand, forever.
+/// bd-yolv: NOT keyed by the current process.
+///
+/// It was `toron-resonate-children-{pid}.ledger`, which is wrong in BOTH
+/// directions at once: a fresh process starts with an empty ledger, so nothing
+/// from a previous (killed) run is ever found — the reaper was useless — while
+/// every line in it is this process's OWN children, which `ChildGuard` already
+/// owns and releases on drop. So it was pointed at precisely the wrong set.
 fn ledger_path() -> std::path::PathBuf {
-    std::env::temp_dir().join(format!(
-        "toron-resonate-children-{}.ledger",
-        std::process::id()
-    ))
+    std::env::temp_dir().join("toron-resonate-children.ledger")
 }
 
-fn record_spawn(pid: u32, port: u16) {
+fn record_spawn_in(path: &std::path::Path, pid: u32, port: u16) {
     if pid == 0 {
         return;
     }
@@ -32,15 +36,18 @@ fn record_spawn(pid: u32, port: u16) {
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(ledger_path())
+        .open(path)
     {
         use std::io::Write;
         let _ = f.write_all(line.as_bytes());
     }
 }
 
-fn forget_spawn(pid: u32) {
-    let path = ledger_path();
+fn record_spawn(pid: u32, port: u16) {
+    record_spawn_in(&ledger_path(), pid, port);
+}
+
+fn forget_spawn_in(path: &std::path::Path, pid: u32) {
     let Ok(raw) = std::fs::read_to_string(&path) else {
         return;
     };
@@ -48,7 +55,7 @@ fn forget_spawn(pid: u32) {
         .lines()
         .filter(|l| l.split_whitespace().next() != Some(pid.to_string().as_str()))
         .collect();
-    let _ = std::fs::write(&path, kept.join("\n"));
+    let _ = std::fs::write(path, kept.join("\n"));
 }
 
 /// bd-yolv: kill anything the LAST run left behind, and only that.
@@ -58,36 +65,67 @@ fn forget_spawn(pid: u32) {
 /// unrelated process — including a real daemon. So a recorded pid is killed only
 /// when the live process at that pid is still a `resonate serve` carrying the
 /// port we recorded. Anything else is left strictly alone.
+pub fn forget_spawn(pid: u32) {
+    forget_spawn_in(&ledger_path(), pid);
+}
+
 pub fn reap_orphaned_servers() -> usize {
-    let path = ledger_path();
-    let Ok(raw) = std::fs::read_to_string(&path) else {
+    reap_orphaned_servers_in(&ledger_path())
+}
+
+fn reap_orphaned_servers_in(path: &std::path::Path) -> usize {
+    let Ok(raw) = std::fs::read_to_string(path) else {
         return 0;
     };
+    let me = std::process::id();
     let mut reaped = 0;
+    // Lines we must KEEP: our own live children, and anything still owned by a
+    // live process. Previously the ledger was drained unconditionally, which
+    // erased a SIBLING TEST's entry even when the reaper did not kill it.
+    let mut keep: Vec<&str> = Vec::new();
     for line in raw.lines() {
         let mut it = line.split_whitespace();
-        let (Some(pid), Some(port)) = (it.next(), it.next()) else {
+        let (Some(pid), Some(port), Some(owner)) = (it.next(), it.next(), it.next()) else {
             continue;
         };
-        let (Ok(pid), Ok(port)) = (pid.parse::<u32>(), port.parse::<u16>()) else {
+        let (Ok(pid), Ok(port), Ok(owner)) = (
+            pid.parse::<u32>(),
+            port.parse::<u16>(),
+            owner.parse::<u32>(),
+        ) else {
             continue;
         };
+        // bd-yolv: NEVER reap a server a LIVE process owns. Our own children are
+        // `ChildGuard`s released on drop — and a SIBLING TEST's guard is one of
+        // those, because tests in one binary run in parallel threads. Reaping
+        // them made three approval tests fail under default parallelism and
+        // pass single-threaded, which is the least diagnosable failure shape
+        // there is. This cleans up after a run that was KILLED, and a live owner
+        // is exactly the case where the line is not a leftover.
+        if owner == me {
+            keep.push(line);
+            continue;
+        }
         if !pid_alive_and_is_our_resonate(pid, port) {
-            // Not ours any more: either already gone, or the pid was recycled by
-            // something that is NOT our resonate server. Forget it either way —
-            // a stale ledger line must never accumulate.
+            // Dead, or the pid was recycled by something that is NOT our
+            // resonate server. Forget it either way — a stale ledger line must
+            // never accumulate — and do not signal it.
             continue;
         }
         unsafe_free_signal(pid, TERM);
         reaped += 1;
     }
-    // DRAIN the ledger, explicitly. Every line still here was a spawn whose
-    // `ChildGuard` never ran `forget_spawn` — i.e. an orphan — so there is
-    // nothing to keep. This used to write a `survivors` vec that was declared
-    // and never populated, so the truncation worked by accident rather than by
-    // decision. If a future rule ever wants to KEEP a line, that is the place,
-    // and it must be a real push rather than an empty join.
-    let _ = std::fs::write(&path, "");
+    // Rewrite with the survivors, not a blind truncate. The dead and reaped lines
+    // go; the lines a LIVE process still owns stay, because their `ChildGuard`
+    // has not run `forget_spawn` yet. A blind drain here is how the reaper erased
+    // a sibling test's entry even when it left the process alone.
+    if keep.is_empty() {
+        let _ = std::fs::write(path, "");
+    } else {
+        let mut out = keep.join("\n");
+        out.push('\n');
+        let _ = std::fs::write(path, out);
+    }
     if reaped > 0 {
         eprintln!(
             "toron testkit: reaped {reaped} orphaned resonate serve process(es) from a previous run"
@@ -588,6 +626,89 @@ mod bd_yolv_tests {
              KILL_GRACE={KILL_GRACE:?} does not outlast the shutdown"
         );
         assert!(!pid_is_alive(pid), "pid {pid} survived");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// bd-yolv: the reaper must not touch, signal, or FORGET a server that a
+    /// live process owns — including a SIBLING TEST's, since tests in one
+    /// binary run in parallel threads.
+    ///
+    /// Found by differential, not by reading: three approval tests failed under
+    /// default parallelism and passed with `--test-threads=1`, because each calls
+    /// `resonate_serve` (a real server) and a sibling's call reaped it. A reaper
+    /// pointed at your own children is worse than no reaper — it kills the work
+    /// instead of the litter.
+    ///
+    /// The ledger half needs NO resonate binary, so it cannot skip vacuously.
+    #[test]
+    fn a_live_owner_survives_the_reaper_and_keeps_its_ledger_line() {
+        // This fence gets its OWN ledger. The shared default is a single file by
+        // design, so two fences touching it concurrently cross-talk -- and I hit
+        // exactly that: the ledger fence passed alone and failed beside the live
+        // one. Same class as the bug it guards.
+        let mine = std::env::temp_dir().join(format!("toron-ledger-fence-{}", std::process::id()));
+        let _ = std::fs::remove_file(&mine);
+        let me = std::process::id();
+        // A line owned by THIS process, for a pid that is not a resonate server —
+        // so the identity check would reject it anyway, which is the point: the
+        // owner guard must be what saves it, and the line must remain.
+        record_spawn_in(&mine, 4242, 5555);
+        let reaped = reap_orphaned_servers_in(&mine);
+        assert_eq!(
+            reaped, 0,
+            "nothing here is a dead owner, so nothing may be reaped"
+        );
+        let after = std::fs::read_to_string(&mine).unwrap_or_default();
+        assert!(
+            after.contains("4242"),
+            "the reaper ERASED a line owned by a live process (this one): {after:?} — a blind \
+             drain loses a sibling test's record even when it leaves the process alone"
+        );
+        assert!(
+            after.contains(&me.to_string()),
+            "and the owner pid must be preserved so a later run can still tell it from a leftover"
+        );
+        forget_spawn_in(&mine, 4242);
+        let _ = std::fs::remove_file(&mine);
+    }
+
+    /// bd-yolv: and with a real binary, the live server itself survives. This half
+    /// skips where resonate is absent, so the ledger assertion above is the one
+    /// that always runs.
+    #[test]
+    fn the_reaper_never_kills_a_live_server_this_process_owns() {
+        let dir = std::env::temp_dir().join(format!("toron-sibling-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        if !resonate_installed() {
+            eprintln!("SKIP (no resonate binary): the ledger fence still ran above");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("free port")
+            .local_addr()
+            .expect("addr")
+            .port();
+        let guard = ChildGuard::resonate_serve(port, &dir)
+            .expect("spawn")
+            .expect("resonate present");
+        let pid = guard.pid().expect("pid");
+        reap_orphaned_servers();
+        let alive = std::process::Command::new("kill")
+            .arg("-0")
+            .arg(pid.to_string())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(
+            alive,
+            "the reaper killed a server OWNED BY THIS PROCESS (pid {pid}); it cleans up after a \
+             KILLED run, and a live owner means the line is not a leftover"
+        );
+        drop(guard);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
