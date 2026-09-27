@@ -37,6 +37,7 @@ use toron_workflow::coalesce::{
     CoalesceDecision, Coalesced, DlqReason, MentionCoalescer, RequeueOutcome, RequeueSchedule,
 };
 use toron_workflow::dispatch::{DispatchAcquire, DispatchConfig, DispatchPermit, DispatchPool};
+use toron_workflow::engine::ResonateChoice;
 use toron_workflow::engine::{
     ActionInvocation, ActionPartition, AsyncEffectRunner, AsyncRunJournal, CleanupKind,
     CleanupRequest, Decision, DispatchPlan, EffectJournalMode, EffectView,
@@ -1070,24 +1071,46 @@ impl WorkflowHost {
         let async_run_journal = pending
             .store()
             .map(|store| async_run_journal(store.clone()));
-        let engine = match toron_workflow::engine::resonate_server_url() {
-            Some(url) => WorkflowEngine::remote_with_resolvers_async_effect_mode_and_journal(
-                url,
-                WorkflowEngine::default_resolver(),
-                WorkflowEngine::default_workflow_resolver(),
-                Some(async_effect_runner),
-                EffectJournalMode::Enforced,
-                async_run_journal,
-            )
-            .context("workflow engine (remote resonate server)")?,
-            None => WorkflowEngine::local_with_resolvers_async_effect_mode_and_journal(
-                WorkflowEngine::default_resolver(),
-                WorkflowEngine::default_workflow_resolver(),
-                Some(async_effect_runner),
-                EffectJournalMode::Enforced,
-                async_run_journal,
-            )
-            .context("workflow engine")?,
+        let choice = toron_workflow::engine::resonate_choice();
+        // bd-yolv: a pin or a probed server is the engine the operator asked for
+        // and nothing is lost, so all three collapse into one arm. The fourth
+        // variant is spelled out because it is NOT a mode — it is a loss of
+        // capability, and the type exists so it cannot be handled by accident.
+        let engine = match &choice {
+            ResonateChoice::Pinned(url)
+            | ResonateChoice::ProbedRemote(url)
+            | ResonateChoice::ProbedLocal(url) => {
+                WorkflowEngine::remote_with_resolvers_async_effect_mode_and_journal(
+                    url.clone(),
+                    WorkflowEngine::default_resolver(),
+                    WorkflowEngine::default_workflow_resolver(),
+                    Some(async_effect_runner),
+                    EffectJournalMode::Enforced,
+                    async_run_journal,
+                )
+                .context("workflow engine (remote resonate server)")?
+            }
+            // No server answered, so the engine is EMBEDDED. The embedded runtime
+            // cannot drive a parked run's promise-creation task, so a workflow
+            // parked on `request_approval` suspends forever. This used to fall
+            // through with no output at all: the daemon was silently in a mode it
+            // could not deliver, and the only way to find out was to run
+            // `toron doctor` by hand. The daemon runs at RUST_LOG=warn, so a
+            // warn! is visible with no config change, and the sentence names what
+            // was probed, what is lost, and both fixes.
+            ResonateChoice::Embedded { .. } => {
+                if let Some(detail) = choice.degradation_detail() {
+                    tracing::warn!(target: "toron::workflow_host", "{detail}");
+                }
+                WorkflowEngine::local_with_resolvers_async_effect_mode_and_journal(
+                    WorkflowEngine::default_resolver(),
+                    WorkflowEngine::default_workflow_resolver(),
+                    Some(async_effect_runner),
+                    EffectJournalMode::Enforced,
+                    async_run_journal,
+                )
+                .context("workflow engine")?
+            }
         };
         let bus = mailbox.bus().clone();
         Ok(Self {
