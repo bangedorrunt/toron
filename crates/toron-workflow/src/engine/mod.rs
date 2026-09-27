@@ -95,10 +95,7 @@ fn cached_or_reprobe(
 ) -> ResonateChoice {
     match cached {
         Some(healthy) if !healthy.is_degraded() => healthy.clone(),
-        _ => {
-            let fresh = probe();
-            fresh
-        }
+        _ => probe(),
     }
 }
 
@@ -149,7 +146,7 @@ impl ResonateChoice {
     }
 
     /// True only for the embedded fallback — a mode that cannot park a run.
-    pub fn is_degraded(&self) -> bool {
+    pub const fn is_degraded(&self) -> bool {
         matches!(self, Self::Embedded { .. })
     }
 
