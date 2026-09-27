@@ -199,14 +199,86 @@ fn http_response_status(head: &str) -> Option<u16> {
 }
 
 fn check_resonate() -> CheckResult {
-    // GS-037 P1: probe 127.0.0.1:8001 (IPv4 — resonate binds v4; localhost
-    // may resolve ::1-first). Fail-closed unless TCP opens AND /health
-    // returns HTTP 2xx — no invent-green on any HTTP/ line, incidental 200
-    // substring, or non-HTTP junk on an open port.
-    let addr: std::net::SocketAddr = "127.0.0.1:8001"
-        .parse()
-        .expect("static resonate probe addr");
-    check_resonate_at(addr)
+    // bd-gv1k: probe the server the PROCESS will actually use, not a second
+    // hardcoded address. resolve_resonate_url is the runtime's own precedence
+    // (RESONATE_URL pin > probed remote > probed local > embedded), so asking
+    // it here is what makes the health check and the runtime agree. Reading a
+    // literal 127.0.0.1:8001 instead reported a hard FAIL for a deliberately
+    // unused local server and its "start resonate" remedy pushed operators
+    // toward the local binary — backwards.
+    //
+    // GS-037 P1 is preserved exactly: the plaintext path still fails closed
+    // unless TCP opens AND /health returns HTTP 2xx, with no invent-green on
+    // an HTTP/ line, an incidental 200 substring, or non-HTTP junk.
+    match toron_workflow::engine::resonate_server_url() {
+        Some(url) if url.starts_with("https://") => check_resonate_tls(&url),
+        Some(url) => {
+            let host = url
+                .strip_prefix("http://")
+                .unwrap_or(url.as_str())
+                .to_string();
+            let addr: std::net::SocketAddr = match host.parse() {
+                Ok(a) => a,
+                // A hostname (not host:port) needs a resolve; the resolver
+                // already proved it answers, so name it rather than guess.
+                Err(_) => {
+                    return CheckResult {
+                        name: "resonate",
+                        ok: false,
+                        detail: format!(
+                            "resolves to {url}, whose host:port this probe cannot parse — verify with `curl -fsS {url}/health`"
+                        ),
+                    }
+                }
+            };
+            let mut r = check_resonate_at(addr);
+            r.detail = format!("{} — resolves to {url}", r.detail);
+            r
+        }
+        // No candidate resolved: the runtime is in embedded mode and has no
+        // external server to be down. Reporting FAIL here would be inventing
+        // a fault, so state the mode instead.
+        None => CheckResult {
+            name: "resonate",
+            ok: true,
+            detail: "embedded mode — no external resonate server resolved (RESONATE_URL unset and no probed candidate); durable promises live in-process".to_string(),
+        },
+    }
+}
+
+/// bd-gv1k: a TLS endpoint cannot be verified by a plaintext probe.
+///
+/// Reporting FAIL would be a false red (the very defect this bead fixes) and
+/// reporting ok would be the invent-green GS-037 forbids. Say the true thing:
+/// the endpoint is named, TCP reachability is checked, and the exact command
+/// that verifies it is given. `doctor --check` still exits non-zero, so a
+/// pipeline keyed on it does not go silently green.
+fn check_resonate_tls(url: &str) -> CheckResult {
+    let Some((host, port)) = toron_workflow::engine::host_port(url) else {
+        return CheckResult {
+            name: "resonate",
+            ok: false,
+            detail: format!("cannot parse {url}"),
+        };
+    };
+    use std::net::ToSocketAddrs;
+    let reachable = (host.as_str(), port)
+        .to_socket_addrs()
+        .ok()
+        .and_then(|mut it| it.next())
+        .map(|addr| {
+            std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(2000))
+                .is_ok()
+        })
+        .unwrap_or(false);
+    CheckResult {
+        name: "resonate",
+        ok: false,
+        detail: format!(
+            "resolves to {url}; TCP {} but this probe speaks plaintext HTTP and cannot read a TLS /health — verify with `curl -fsS {url}/health`",
+            if reachable { "open" } else { "closed" }
+        ),
+    }
 }
 
 fn check_resonate_at(addr: std::net::SocketAddr) -> CheckResult {
@@ -1036,6 +1108,46 @@ mod check_resonate_tests {
         assert_eq!(http_response_status("error code 200 in payload"), None);
         assert_eq!(http_response_status("Content-Length: 200\r\n"), None);
         assert_eq!(http_response_status(""), None);
+    }
+
+    #[test]
+    fn tls_target_is_named_not_replaced_by_a_local_address() {
+        // bd-gv1k: the regression was a hardcoded 127.0.0.1:8001, so a
+        // correct deployment on a TLS remote read as "your local server is
+        // down — start resonate". The verdict must name the target the
+        // process actually resolves, and must not invent-green.
+        let r = check_resonate_tls("https://resonate.invalid");
+        assert!(
+            !r.ok,
+            "a plaintext probe cannot verify TLS — never invent-green"
+        );
+        assert!(
+            r.detail.contains("https://resonate.invalid"),
+            "the verdict must name the resolved target, got: {}",
+            r.detail
+        );
+        assert!(
+            !r.detail.contains("127.0.0.1:8001"),
+            "must not fall back to the old hardcoded address, got: {}",
+            r.detail
+        );
+        assert!(
+            r.detail
+                .contains("curl -fsS https://resonate.invalid/health"),
+            "must hand over a command that verifies it, got: {}",
+            r.detail
+        );
+    }
+
+    #[test]
+    fn an_unparseable_tls_url_fails_loud_and_names_itself() {
+        let r = check_resonate_tls("not-a-url");
+        assert!(!r.ok, "an unparseable target is not a healthy one");
+        assert!(
+            r.detail.contains("not-a-url"),
+            "must name what it could not parse, got: {}",
+            r.detail
+        );
     }
 
     #[test]
