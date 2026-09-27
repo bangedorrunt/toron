@@ -262,7 +262,10 @@ impl Drop for ReservationGuard<'_> {
 }
 
 /// Pure helper: reject agent-key-as-seen heuristic — signing key ≠ delivery.
-pub fn agent_key_is_not_delivery_proof(_agent_pubkey_hex: &str, _event_id: &str) -> bool {
+pub const fn agent_key_is_not_delivery_proof(
+    _agent_pubkey_hex: &str,
+    _event_id: &str,
+) -> bool {
     // Intentionally always true as a documentation assertion for callers:
     // delivery membership must come from DeliveryCursorStore, never from
     // "this agent key signed the event".

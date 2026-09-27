@@ -277,10 +277,7 @@ impl ChannelStore {
         };
         let (pending, propose_fx) = convergence_tick(
             None,
-            &ConvergenceMsg::Propose {
-                op: op.clone(),
-                generation,
-            },
+            &ConvergenceMsg::Propose { op, generation },
         );
         anyhow::ensure!(
             propose_fx.is_empty(),
@@ -358,10 +355,7 @@ impl ChannelStore {
         };
         let (pending, propose_fx) = convergence_tick(
             None,
-            &ConvergenceMsg::Propose {
-                op: op.clone(),
-                generation,
-            },
+            &ConvergenceMsg::Propose { op, generation },
         );
         anyhow::ensure!(propose_fx.is_empty(), "disable propose must not fanout");
         let (committed, commit_fx) = convergence_tick(pending.as_ref(), &ConvergenceMsg::Commit);
@@ -1083,7 +1077,6 @@ mod tests {
 
     /// GS-062: ReAdd under a held Kick generation is fenced at join
     /// (hold_authority_for_test helper; production path covered below).
-
     /// GS-062: apply_lifecycle leave settles authority so rebuild/replay does
     /// not permanently FenceReAdd. Live leave() still holds until settle_authority.
     #[test]
