@@ -648,6 +648,9 @@ pub struct AgentsState {
     pub rows: Vec<AgentRow>,
     /// Cursor.
     pub selected: usize,
+    /// Detail-card scroll offset (the view clamps it to the rendered card;
+    /// a long task or status line has to be readable somewhere).
+    pub scroll: usize,
     /// A fetch has landed.
     pub loaded: bool,
 }

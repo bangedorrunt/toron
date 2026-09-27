@@ -168,6 +168,7 @@ fn render_detail(f: &mut Frame, area: Rect, model: &Model, rows: &[AgentRow], fo
         Paragraph::new(lines)
             .style(HackerNight::fg_default())
             .block(widgets::pane_block("agent", focused))
+            .scroll((model.agents.scroll.min(u16::MAX as usize) as u16, 0))
             .wrap(Wrap { trim: false }),
         area,
     );
