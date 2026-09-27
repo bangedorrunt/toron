@@ -631,26 +631,20 @@ async fn dispatch_leaf_async(
     }
 }
 
-/// bd-ynef: "now" for the park decision, as INJECTED DATA.
+/// bd-ynef: "now" for the park decision, as INJECTED HOST DATA.
 ///
-/// The SDK deliberately gives a leaf no wall clock, so the host supplies it —
-/// the same shape as `LoopParams` policy arriving serialized rather than being
-/// read from the environment inside a reducer. A host that injects nothing
-/// fails loudly rather than defaulting to 0, because `now = 0` would make every
-/// park look 56 years overdue and resume instantly.
+/// The SDK deliberately gives a leaf no wall clock, so the host supplies the
+/// clock as a dependency — the same shape as `LoopParams` policy arriving
+/// serialized rather than being read from the environment inside a reducer. The
+/// leaf CALLS the host clock; it never reads one itself.
+///
+/// A host that injects nothing fails loudly. It must never default: `now = 0`
+/// would make every park look 56 years overdue and resume instantly, which is
+/// the silent-wrong-wake-time this bead exists to prevent.
 fn park_now_ms(ctx: &Context) -> resonate_sdk::prelude::Result<u64> {
-    let injected: Arc<Option<crate::engine::park::ParkClock>> =
-        ctx.get_dependency::<Option<crate::engine::park::ParkClock>>();
-    match injected.as_ref().and_then(|c| c.now_ms) {
-        Some(now) => Ok(now),
-        None => Err(resonate_sdk::error::Error::Application {
-            message:
-                "park: no ParkClock is injected — a park's 'now' is host-supplied data, not a \
-                 clock the leaf reads (bd-ynef). Inject ParkClock { now_ms } so a replayed run \
-                 reaches the same decision."
-                    .into(),
-        }),
-    }
+    let clock: Arc<crate::engine::park::ParkClock> =
+        ctx.get_dependency::<crate::engine::park::ParkClock>();
+    Ok(clock())
 }
 
 /// bd-ynef: render a park's `until_ms` and parse it to an absolute time.

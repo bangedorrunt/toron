@@ -34,18 +34,30 @@
 
 use serde::{Deserialize, Serialize};
 
-/// bd-ynef: the host-supplied clock a park leaf compares against.
+/// bd-ynef: the host-supplied clock a park leaf asks for "now".
 ///
-/// Injected as a DI dependency, never read from a system clock inside the
-/// leaf. The Resonate SDK gives a durable function no wall clock precisely so
-/// replay is deterministic; a park that read one would reach a different
-/// decision on replay than it did live. `None` means the host supplied nothing,
-/// which the leaf reports loudly rather than defaulting (defaulting to 0 would
-/// make every park look decades overdue and resume instantly).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ParkClock {
-    /// Unix millis, as the host observed them.
-    pub now_ms: Option<u64>,
+/// A FUNCTION, not a fixed value. A park compares its wake time against the
+/// present at the moment it runs, so a frozen stamp would make every re-drive
+/// reach the same decision forever — the park would never notice T arriving.
+///
+/// The leaf HOLDS this and calls it; it never reads a system clock itself, and
+/// that is the property that matters. The Resonate SDK gives a durable function
+/// no wall clock precisely so a leaf cannot take ambient time as authority. The
+/// host owns the clock, the leaf owns only the comparison.
+///
+/// Replay: `now` legitimately advances across a replay, so `plan_park` converges
+/// toward `ResumeNow` as T passes. That is the correct outcome — the decision
+/// turns on the wake time, which is stable DATA on the step, and the journal
+/// holds the committed key.
+pub type ParkClock = std::sync::Arc<dyn Fn() -> u64 + Send + Sync>;
+
+/// The engine's own host clock, in one place: unix millis. The host reads the
+/// clock; no leaf ever does.
+pub fn system_clock_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// The hard ceiling on a single park, regardless of what a step asks for.

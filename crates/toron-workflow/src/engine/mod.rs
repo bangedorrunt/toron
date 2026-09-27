@@ -671,7 +671,11 @@ impl WorkflowEngine {
             .with_dependency(sink.clone())
             .with_dependency(spawn_sink.clone())
             .with_dependency(policy_sink.clone())
-            .with_dependency(verify_sink.clone());
+            .with_dependency(verify_sink.clone())
+            // bd-ynef: the host supplies the clock a park leaf asks for. The
+            // engine is the host, so this is the one place that reads the wall
+            // clock on the park path; the leaf only calls it.
+            .with_dependency::<park::ParkClock>(std::sync::Arc::new(park::system_clock_ms));
         resonate
             .register(run_workflow)
             .map_err(|e| anyhow::anyhow!("register workflow function: {e}"))?;
@@ -914,7 +918,10 @@ impl WorkflowEngine {
             .with_dependency(sink.clone())
             .with_dependency(spawn_sink.clone())
             .with_dependency(policy_sink.clone())
-            .with_dependency(verify_sink.clone());
+            .with_dependency(verify_sink.clone())
+            // bd-ynef: same host clock on the remote/durable constructor, or a
+            // park would work locally and refuse against a real server.
+            .with_dependency::<park::ParkClock>(std::sync::Arc::new(park::system_clock_ms));
         resonate
             .register(run_workflow)
             .map_err(|e| anyhow::anyhow!("register workflow function: {e}"))?;
