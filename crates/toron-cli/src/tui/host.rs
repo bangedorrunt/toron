@@ -15,10 +15,11 @@ use std::time::Duration;
 
 use toron_core::mailbox::{
     FetchInbox, InboxMessage, ListAgentsOptions, Mailbox, ReceiptState, SearchMessage,
-    SearchMessages,
+    SearchMessages, SendMessage,
 };
 use toron_core::nostr::presence::PresenceState;
 
+use super::compose::ComposedSend;
 use super::model::{
     AgentRow, ChannelRow, HealthRow, MailRow, PostRow, ReceiptCounts, SettingsState, SourceInfo,
 };
@@ -476,6 +477,24 @@ impl TuiHost for LiveHost {
                     },
                     Err(e) => failure(Op::Receipt, e),
                 },
+                Effect::SendMail(composed) => match this.require_agent() {
+                    Ok(agent) => match composed_send(&this.project, agent, &composed) {
+                        Ok(msg) => match this.mailbox.send_message(&msg).await {
+                            Ok(result) => Msg::MailSent {
+                                to: msg.to.join(", "),
+                                message_id: result
+                                    .deliveries
+                                    .first()
+                                    .map(|d| d.payload.event_id.clone())
+                                    .unwrap_or_default(),
+                                thread: msg.thread_id.clone(),
+                            },
+                            Err(e) => failure(Op::Send, e),
+                        },
+                        Err(e) => failure(Op::Send, e),
+                    },
+                    Err(e) => failure(Op::Send, e),
+                },
                 // The runtime never asks a host to quit; it owns the loop.
                 Effect::Quit => Msg::Inflight(0),
             }
@@ -491,6 +510,45 @@ impl TuiHost for LiveHost {
     }
 }
 
+/// Turn one composed message into the mailbox's `SendMessage`.
+///
+/// The console does NOT wrap the message itself: this produces the same value
+/// the `mail` verb does and hands it to `MailSurface::send_message`, so the
+/// metadata-only kind-9 wake ring (one per attempted recipient, `mail-delivered`)
+/// is emitted by the send path rather than remembered here. A free function
+/// because the test hands this struct to a REAL mailbox and checks the ring.
+pub fn composed_send(
+    project: &str,
+    sender: &str,
+    composed: &ComposedSend,
+) -> anyhow::Result<SendMessage> {
+    // The same encoder the CLI verb uses: a second copy is how the console and
+    // the verb end up disagreeing about what `tasked` means on the wire.
+    let extra_tags = crate::robot::build_send_tags(
+        None,
+        Some(composed.wake.to_string()),
+        None,
+        None,
+        None,
+        None,
+    )?;
+    Ok(SendMessage {
+        project_slug: project.to_string(),
+        sender_name: sender.to_string(),
+        to: composed.to.clone(),
+        subject: composed.subject.clone(),
+        body_md: composed.body.clone(),
+        cc: Vec::new(),
+        bcc: Vec::new(),
+        importance: Some(composed.importance.to_string()),
+        ack_required: composed.ack,
+        thread_id: composed.thread.clone(),
+        sender_token: None,
+        overseer: false,
+        extra_tags,
+    })
+}
+
 /// Which operation an effect belongs to (the typed-failure label).
 pub fn effect_op(effect: &Effect) -> Op {
     match effect {
@@ -503,6 +561,7 @@ pub fn effect_op(effect: &Effect) -> Op {
         Effect::RefreshReceipts => Op::Receipts,
         Effect::RefreshHealth => Op::Health,
         Effect::AckMessage { .. } | Effect::ReadMessage { .. } => Op::Receipt,
+        Effect::SendMail { .. } => Op::Send,
         Effect::Quit => Op::Health,
     }
 }
@@ -741,6 +800,14 @@ pub mod fake {
                     verb: "ack",
                 }
             }
+            // The script answers with the message id a REAL send returns: the
+            // first delivery's event id, so the fold's status line and the
+            // live path say the same shape of thing.
+            Effect::SendMail(composed) => Msg::MailSent {
+                to: composed.to.join(", "),
+                message_id: "e1".into(),
+                thread: composed.thread.clone(),
+            },
             Effect::Quit => Msg::Inflight(0),
         }
     }

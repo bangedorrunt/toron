@@ -11,13 +11,15 @@ use std::time::Duration;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+use super::compose::{ComposeState, Importance};
+use super::host::composed_send;
 use super::host::fake::{FakeHost, Reply};
 use super::model::{
     AgentRow, ChannelRow, Folder, LayoutMode, MailRow, Mode, Model, Pane, PostRow, SettingsState,
-    Tab, layout_mode,
+    StatusKind, Tab, layout_mode,
 };
 use super::msg::{Effect, Msg, Op};
-use super::{bounded, keymap, update};
+use super::{bounded, compose, keymap, update};
 use toron_core::nostr::presence::PresenceState;
 
 // ---------------------------------------------------------------------------
@@ -733,14 +735,17 @@ fn keymap_normal_mode_table() {
         Some(Msg::StepRefresh(-super::keymap::REFRESH_STEP_MS))
     );
     assert_eq!(press(&m, KeyCode::Enter), Some(Msg::OpenSelection));
-    // 'c' (closed channels) is a Channels-tab key, not a global one.
-    assert_eq!(press(&m, KeyCode::Char('c')), None);
+    // 'c' composes on every tab; the closed-channel filter moved to 'C' so the
+    // console's primary action is not tab-scoped.
+    assert_eq!(press(&m, KeyCode::Char('c')), Some(Msg::OpenCompose));
+    assert_eq!(press(&m, KeyCode::Char('C')), None);
     let channels = Model {
         tab: Tab::Channels,
         ..m.clone()
     };
+    assert_eq!(press(&channels, KeyCode::Char('c')), Some(Msg::OpenCompose));
     assert_eq!(
-        press(&channels, KeyCode::Char('c')),
+        press(&channels, KeyCode::Char('C')),
         Some(Msg::ToggleClosedChannels)
     );
     // l drills in from the list, h backs out of the reader.
@@ -1584,4 +1589,701 @@ async fn a_panicked_effect_leaves_the_refresh_gate_open() {
         tokio::task::yield_now().await;
     }
     assert_eq!(super::live_handles(&mut handles), 0);
+}
+
+// ---------------------------------------------------------------------------
+// 8. the compose form (pure: fields, caret, and the one wrap function)
+// ---------------------------------------------------------------------------
+
+/// Wrapping and caret placement come from ONE function, so the property that
+/// matters is structural: for every caret offset the caret lands inside the
+/// box, and every drawn line fits it. A second wrap (letting the renderer
+/// re-wrap a line the core already wrapped) is what puts the caret on a row
+/// the text is not on, and this is where that would show.
+#[test]
+fn every_caret_offset_lands_inside_the_wrapped_box() {
+    let samples = [
+        "",
+        "one line",
+        "a very long line that will certainly need to wrap several times over",
+        "para one\n\npara three",
+        "trailing newline\n",
+        "a\nbb\nccc\ndddd\neeeee",
+        "supercalifragilisticexpialidocious_and_then_some_more_to_force_a_hard_break",
+        "  leading spaces stay put  ",
+        "unicode ✓ works, é accents, and 日本語 も",
+    ];
+    for text in samples {
+        for width in 1..=40usize {
+            let lines = compose::wrap(text, width);
+            assert!(
+                !lines.is_empty(),
+                "wrap({text:?}, {width}) must produce at least one line"
+            );
+            for line in &lines {
+                assert!(
+                    line.text.chars().count() <= width,
+                    "wrap({text:?}, {width}) drew a {}-col line: {:?}",
+                    line.text.chars().count(),
+                    line.text
+                );
+            }
+            // The offsets tile the source with no gap and no overlap, except
+            // for the single newline BETWEEN two logical lines — which no
+            // line's text contains, and which is why a caret sitting on it
+            // belongs to the end of the line before it.
+            for pair in lines.windows(2) {
+                let newline = usize::from(text.as_bytes().get(pair[0].end) == Some(&b'\n'));
+                assert_eq!(
+                    pair[1].start,
+                    pair[0].end + newline,
+                    "wrap({text:?}, {width}) left a gap at {:?}",
+                    pair[0].text
+                );
+            }
+            // Every caret offset (char boundary) resolves to a column inside
+            // the width, and never to a row past the end.
+            for at in char_boundaries(text) {
+                let (row, col) = compose::caret_pos(text, width, at);
+                assert!(
+                    row < lines.len(),
+                    "caret {at} in {text:?} at {width} cols landed on row {row} of {}",
+                    lines.len()
+                );
+                assert!(
+                    col <= width,
+                    "caret {at} in {text:?} at {width} cols landed at col {col}"
+                );
+            }
+        }
+    }
+}
+
+fn char_boundaries(text: &str) -> Vec<usize> {
+    let mut out: Vec<usize> = text.char_indices().map(|(i, _)| i).collect();
+    out.push(text.len());
+    out
+}
+
+/// A caret on a line boundary belongs to the START of the next line, the way a
+/// terminal puts it, and a caret at the end of the text stays on the last line
+/// instead of inventing a row.
+#[test]
+fn caret_row_follows_the_newline_it_sits_on() {
+    let text = "ab\ncd";
+    assert_eq!(compose::caret_pos(text, 20, 0), (0, 0));
+    assert_eq!(
+        compose::caret_pos(text, 20, 2),
+        (0, 2),
+        "before the newline"
+    );
+    assert_eq!(
+        compose::caret_pos(text, 20, 3),
+        (1, 0),
+        "the newline is consumed"
+    );
+    assert_eq!(compose::caret_pos(text, 20, 5), (1, 2), "end of the text");
+
+    // A wrapped line: the caret past the break is on row 1, column 0.
+    let wrapped = "aaaa bbbb";
+    assert_eq!(compose::caret_pos(wrapped, 5, 5), (1, 0));
+    assert_eq!(compose::caret_pos(wrapped, 5, 9), (1, 4));
+
+    // Zero width is "nothing measurable": no wrapping, and the caret math
+    // still has to answer.
+    assert_eq!(compose::wrap("anything at all", 0).len(), 1);
+    assert_eq!(compose::caret_pos("anything", 0, 4), (0, 4));
+}
+
+/// The form walks its stops, cycles the toggles, and keeps the caret inside the
+/// text of whichever stop is focused.
+#[test]
+fn compose_stops_cycle_and_the_caret_follows_the_focus() {
+    use crate::tui::compose::{CaretMove, ComposeState, Field};
+
+    let mut c = ComposeState::new();
+    assert_eq!(
+        c.field,
+        Field::To,
+        "a blank composer starts at the recipient"
+    );
+    assert_eq!(c.wake.as_str(), "tasked", "a peer message defaults to work");
+
+    c.to = "DustySparrow".into();
+    c.set_field(Field::Body);
+    assert_eq!(c.caret, 0, "an empty body parks the caret at 0");
+    c.body = "hello".into();
+    c.set_field(Field::Body);
+    assert_eq!(c.caret, 5, "focus parks the caret at the end of the text");
+
+    // Tab order walks all seven stops and wraps back to the first.
+    c.set_field(Field::To);
+    let mut seen = Vec::new();
+    for _ in 0..Field::ALL.len() {
+        seen.push(c.field);
+        c.step_field(1);
+    }
+    assert_eq!(seen, Field::ALL.to_vec());
+    assert_eq!(c.field, Field::To, "the walk wrapped");
+
+    // A toggle stop cycles its own value and nothing else.
+    c.set_field(Field::Wake);
+    c.cycle(1);
+    assert_eq!(c.wake.as_str(), "standing");
+    c.set_field(Field::Importance);
+    c.cycle(1);
+    assert_eq!(c.importance.as_str(), "high");
+    c.cycle(1);
+    assert_eq!(c.importance.as_str(), "urgent");
+    c.cycle(1);
+    assert_eq!(c.importance.as_str(), "normal", "the cycle wraps");
+    c.set_field(Field::Ack);
+    c.cycle(1);
+    assert!(c.ack);
+    // Cycling a text stop is a no-op, never an edit.
+    c.set_field(Field::To);
+    let before = c.to.clone();
+    c.cycle(1);
+    assert_eq!(c.to, before);
+
+    // Caret movement over logical lines keeps the COLUMN. "one\ntwenty\nxy"
+    // has its lines at bytes 0..3, 4..10 and 11..13.
+    c.set_field(Field::Body);
+    c.body = "one\ntwenty\nxy".into();
+    c.set_field(Field::Body);
+    assert_eq!(c.caret, 13, "the end of the text");
+    c.move_caret(CaretMove::Up);
+    assert_eq!(c.caret, 6, "column 2 of `twenty`");
+    assert_eq!(&c.body[c.caret..], "enty\nxy");
+    c.move_caret(CaretMove::Up);
+    assert_eq!(c.caret, 2, "column 2 of `one`");
+    c.move_caret(CaretMove::Up);
+    assert_eq!(c.caret, 0, "up from the first line goes to the top");
+    c.move_caret(CaretMove::Down);
+    assert_eq!(c.caret, 4, "down returns to the same column");
+    // A column past the shorter line clamps to its end.
+    c.caret = 9;
+    c.move_caret(CaretMove::Up);
+    assert_eq!(c.caret, 3, "column 5 clamped to the 3-char line");
+    // Home / End stop at the LOGICAL line, not at the whole text.
+    c.caret = 6;
+    c.move_caret(CaretMove::Home);
+    assert_eq!(c.caret, 4);
+    c.move_caret(CaretMove::End);
+    assert_eq!(
+        c.caret, 10,
+        "the newline after `twenty`, not the end of the text"
+    );
+}
+
+/// A reply is pre-addressed and in-thread, and a send refuses an incomplete
+/// form with a reason rather than wrapping a message with an empty subject.
+#[test]
+fn compose_reply_prefills_and_an_incomplete_form_refuses() {
+    use crate::tui::compose::{ComposeState, Field};
+
+    let reply = ComposeState::reply("t-9".into(), "DustySparrow".into(), "status".into());
+    assert_eq!(reply.to, "DustySparrow");
+    assert_eq!(
+        reply.subject, "status",
+        "the subject is copied, never rewritten"
+    );
+    assert_eq!(reply.thread.as_deref(), Some("t-9"));
+    assert_eq!(reply.field, Field::Body, "a reply starts in the body");
+
+    let mut c = ComposeState::new();
+    assert!(c.validate().is_err(), "an empty form cannot be sent");
+    c.to = "captain".into();
+    c.subject = " ".into();
+    assert!(
+        c.validate().unwrap_err().contains("subject"),
+        "the reason has to name what is missing"
+    );
+    c.subject = "blocked".into();
+    c.body = "need a call".into();
+    assert!(c.validate().is_ok(), "aliases are legal recipients");
+}
+
+/// Editing is char-safe: backspace and delete never split a multi-byte char,
+/// and a caret handed a non-boundary offset is snapped instead of panicking.
+#[test]
+fn compose_editing_never_splits_a_character() {
+    use crate::tui::compose::{CaretMove, ComposeState, Field};
+
+    let mut c = ComposeState::new();
+    c.set_field(Field::Subject);
+    c.insert_char('é');
+    c.insert_char('✓');
+    assert_eq!(c.subject, "é✓");
+    assert_eq!(c.caret, c.subject.len());
+    c.backspace();
+    assert_eq!(c.subject, "é");
+    c.backspace();
+    assert_eq!(c.subject, "");
+    c.backspace();
+    assert_eq!(c.subject, "", "backspace at the start is a no-op");
+
+    c.subject = "ab".into();
+    c.caret = 0;
+    c.delete_forward();
+    assert_eq!(c.subject, "b");
+    c.caret = 99;
+    c.delete_forward();
+    assert_eq!(c.subject, "b", "a caret past the end cannot panic");
+
+    // A caret in the middle of a multi-byte char snaps backwards rather than
+    // slicing it.
+    c.subject = "é".into();
+    c.caret = 1;
+    c.move_caret(CaretMove::Left);
+    assert_eq!(c.caret, 0);
+    c.caret = 1;
+    c.move_caret(CaretMove::Right);
+    assert_eq!(c.caret, 2, "snapped to the boundary then stepped");
+}
+
+// ---------------------------------------------------------------------------
+// 9. the compose form in the fold (intent in, effect out)
+// ---------------------------------------------------------------------------
+
+/// A model whose roster is loaded, so the console can address a live pin and
+/// can tell a promptable recipient from a digest-bound one.
+fn model_with_roster() -> Model {
+    let (m, _) = step(&model(), Msg::SelectTab(Tab::Agents));
+    let (m, _) = step(
+        &m,
+        Msg::AgentsLoaded(vec![
+            AgentRow {
+                name: "DustySparrow".into(),
+                npub: "aa".into(),
+                online: true,
+                state: PresenceState::Working,
+                pane_id: Some("w1:p2".into()),
+                ..Default::default()
+            },
+            AgentRow {
+                name: "QuietLark".into(),
+                npub: "bb".into(),
+                online: false,
+                ..Default::default()
+            },
+        ]),
+    );
+    m
+}
+
+/// `c` opens the form, and what it prefills comes from what is on screen: the
+/// roster row under the cursor on the Agents tab, the open conversation
+/// elsewhere. One key, one meaning, decided in the fold.
+#[test]
+fn compose_opens_on_the_selected_agent_or_the_open_conversation() {
+    use crate::tui::compose::Field;
+
+    let roster = model_with_roster();
+    let (c, _) = step(
+        &roster,
+        press(&roster, KeyCode::Char('c')).expect("c opens the form"),
+    );
+    assert_eq!(c.mode, Mode::Compose);
+    let form = c.compose.clone().expect("a form is open");
+    assert_eq!(form.to, "DustySparrow", "the selected agent is addressed");
+    assert_eq!(form.thread, None, "a fresh message, not a reply");
+    assert_eq!(form.field, Field::To);
+    assert_eq!(form.wake.as_str(), "tasked");
+
+    // A second `c` must not silently discard a draft.
+    let (again, _) = step(&c, Msg::OpenCompose);
+    assert_eq!(again.compose, c.compose, "the draft survived");
+
+    // An open conversation: `c` is a reply, pre-addressed and in-thread.
+    let (open, _) = step(
+        &model(),
+        Msg::ThreadLoaded {
+            thread_id: "t1".into(),
+            rows: vec![mail("m1", "t1", "bee", "status", 10)],
+        },
+    );
+    let (r, _) = step(&open, press(&open, KeyCode::Char('c')).expect("c replies"));
+    let form = r.compose.expect("a reply form");
+    assert_eq!(form.thread.as_deref(), Some("t1"));
+    assert_eq!(form.to, "bee");
+    assert_eq!(form.subject, "status");
+    assert_eq!(form.field, Field::Body, "a reply starts in the body");
+}
+
+/// `Enter` means advance / newline / toggle / send depending only on the
+/// focused stop, and the send stop produces the mailbox's send — refused with
+/// a reason when the form is incomplete, so no partial message leaves the
+/// console.
+#[test]
+fn enter_advances_the_form_and_only_a_complete_form_sends() {
+    use crate::tui::compose::Field;
+
+    let mut m = model_with_roster();
+    let (next, _) = step(&m, Msg::OpenCompose);
+    m = next;
+    let (next, _) = step(&m, Msg::ComposeEnter);
+    m = next;
+    assert_eq!(
+        m.compose.as_ref().expect("form").field,
+        Field::Subject,
+        "Enter on a text stop advances"
+    );
+    let (next, _) = step(&m, Msg::ComposeFocus(1)); // -> Body
+    m = next;
+    let (next, effects) = step(&m, Msg::ComposeEnter);
+    m = next;
+    assert!(effects.is_empty(), "a newline sends nothing");
+    assert_eq!(m.compose.as_ref().expect("form").body, "\n");
+
+    // Walk to the send stop and try an incomplete form.
+    let (next, _) = step(&m, Msg::ComposeFocus(4)); // Body -> Send
+    m = next;
+    assert_eq!(m.compose.as_ref().expect("form").field, Field::Send);
+    let (refused, effects) = step(&m, Msg::ComposeEnter);
+    assert!(effects.is_empty(), "an incomplete form sends nothing");
+    let draft = refused.compose.as_ref().expect("the draft is still there");
+    assert_eq!(
+        draft.to, "DustySparrow",
+        "the roster prefilled the recipient, so the refusal is about what is left"
+    );
+    assert!(
+        draft
+            .error
+            .as_deref()
+            .expect("the reason is on the form")
+            .contains("subject"),
+        "the reason names the field that is missing: {:?}",
+        draft.error
+    );
+
+    // Complete it, keeping the multi-line body.
+    let mut ready = refused;
+    {
+        let c = ready.compose.as_mut().expect("form");
+        c.to = "DustySparrow".into();
+        c.subject = "ring check".into();
+        c.body = "one\ntwo".into();
+        c.field = Field::Send;
+        c.wake = toron_core::mailbox::send_tags::Wake::Standing;
+        c.importance = crate::tui::compose::Importance::High;
+        c.ack = true;
+        c.thread = Some("t9".into());
+    }
+    let (sent, effects) = step(&ready, Msg::ComposeEnter);
+    match &effects[..] {
+        [Effect::SendMail(c)] => {
+            assert_eq!(c.to, vec!["DustySparrow"], "comma-separated in, a list out");
+            assert_eq!(c.subject, "ring check");
+            assert_eq!(c.body, "one\ntwo", "the body's newline survives");
+            assert_eq!(c.thread.as_deref(), Some("t9"));
+            assert_eq!(c.wake, "standing");
+            assert_eq!(c.importance, "high");
+            assert!(c.ack);
+        }
+        other => panic!("expected exactly one SendMail, got {other:?}"),
+    }
+    assert_eq!(
+        sent.mode,
+        Mode::Compose,
+        "the form stays open until the send lands"
+    );
+}
+
+/// A refused send keeps the draft (retyping a message is the one failure nobody
+/// forgives), and a landed one says how the recipient wakes — a digest is not
+/// a notification, so the two are never conflated.
+#[test]
+fn a_refused_send_keeps_the_draft_and_a_landed_one_says_how_it_wakes() {
+    use crate::tui::compose::Field;
+
+    let mut m = model_with_roster();
+    let (next, _) = step(&m, Msg::OpenCompose);
+    m = next;
+    {
+        let c = m.compose.as_mut().expect("form");
+        c.to = "DustySparrow".into();
+        c.subject = "s".into();
+        c.body = "b".into();
+        c.field = Field::Send;
+    }
+    let (failed, _) = step(
+        &m,
+        Msg::Failed {
+            op: Op::Send,
+            message: "store refused".into(),
+        },
+    );
+    let form = failed
+        .compose
+        .as_ref()
+        .expect("the draft survives a refused send");
+    assert_eq!(form.body, "b", "the typing is not thrown away");
+    assert_eq!(form.error.as_deref(), Some("store refused"));
+    assert!(failed.status.text.contains("store refused"));
+    assert_eq!(failed.status.kind, StatusKind::Error);
+
+    // Editing clears the stale reason.
+    let (typed, _) = step(&failed, Msg::ComposeInsert('!'));
+    assert_eq!(
+        typed.compose.expect("form").error,
+        None,
+        "a changed form has no stale refusal on it"
+    );
+
+    // A pane-less recipient is a digest, said plainly.
+    let (quiet, _) = step(
+        &m,
+        Msg::MailSent {
+            to: "QuietLark".into(),
+            message_id: "9f2c8d1e4a6b".into(),
+            thread: None,
+        },
+    );
+    assert!(quiet.compose.is_none(), "the form closed");
+    assert_eq!(quiet.mode, Mode::Normal);
+    assert!(
+        quiet.status.text.contains("no live pane"),
+        "a digest is not a prompt: {}",
+        quiet.status.text
+    );
+    assert!(quiet.status.text.contains("QuietLark"));
+
+    // A live recipient, in-thread, gets no warning and the thread is named.
+    let (live, _) = step(
+        &m,
+        Msg::MailSent {
+            to: "DustySparrow".into(),
+            message_id: "9f2c8d1e4a6b".into(),
+            thread: Some("t1".into()),
+        },
+    );
+    assert!(
+        !live.status.text.contains("no live pane"),
+        "{}",
+        live.status.text
+    );
+    assert!(live.status.text.contains("thread t1"));
+    assert_eq!(live.status.kind, StatusKind::Ok);
+}
+
+/// The compose windows: a scrolling single line and a scrolling body, both
+/// derived from the same wrap the drawing uses, so the caret is always on a
+/// drawn row and inside the box.
+#[test]
+fn compose_windows_keep_the_caret_visible() {
+    // A caret at the very end shows the last `width - 1` characters plus the
+    // caret in the final column, rather than scrolling the caret out of the box.
+    let (visible, col) = compose::single_line_window("abcdefghij", 4, 10);
+    assert_eq!(visible, "hij");
+    assert_eq!(col, 3, "the caret sits in the last column, after the text");
+    let (visible, col) = compose::single_line_window("abcdefghij", 4, 1);
+    assert_eq!(visible, "abcd", "no scroll while the start is visible");
+    assert_eq!(col, 1);
+    assert_eq!(compose::single_line_window("x", 0, 1), (String::new(), 0));
+
+    let body = "r1\nr2\nr3\nr4\nr5";
+    let v = compose::body_view(body, 20, 2, body.len());
+    assert_eq!(v.lines, vec!["r4", "r5"], "the box scrolled to the caret");
+    assert_eq!(v.caret, (1, 2));
+    assert_eq!(
+        compose::body_view(body, 20, 9, 0).lines,
+        vec!["r1", "r2", "r3", "r4", "r5"],
+        "a box with room shows everything"
+    );
+
+    for width in 1..=12usize {
+        for height in 1..=4usize {
+            for at in char_boundaries(body) {
+                let v = compose::body_view(body, width, height, at);
+                assert!(
+                    v.caret.0 < height,
+                    "caret row {} escaped a {height}-row box at {at}",
+                    v.caret.0
+                );
+                assert!(
+                    v.caret.1 <= width,
+                    "caret col {} escaped a {width}-col box at {at}",
+                    v.caret.1
+                );
+                assert!(v.lines.len() <= height);
+            }
+        }
+    }
+}
+
+/// Every stop is drawn at every size the console supports: a stop tab can
+/// reach but nothing renders is the same defect as a focusable pane nothing
+/// draws, and the phone-width frame is where that would show.
+#[test]
+fn the_form_draws_every_stop_even_at_phone_width() {
+    use crate::tui::compose::Field;
+
+    let mut m = model_with_roster();
+    let (next, _) = step(&m, Msg::OpenCompose);
+    m = next;
+    {
+        let c = m.compose.as_mut().expect("form");
+        c.to = "DustySparrow".into();
+        c.subject = "ring check".into();
+        c.body = "one\ntwo".into();
+        c.field = Field::Body;
+        c.caret = 1;
+    }
+    for (w, h) in [(120u16, 30u16), (40, 12)] {
+        let drawn = screen(&m, w, h);
+        for needle in [
+            "compose",
+            "To:",
+            "Subject:",
+            "Body",
+            "tasked",
+            "Importance",
+            "Ack",
+            "send",
+        ] {
+            assert!(
+                drawn.contains(needle),
+                "at {w}x{h} the form is missing {needle:?}:\n{drawn}"
+            );
+        }
+    }
+    let drawn = screen(&m, 120, 30);
+    assert!(
+        drawn.contains("ring check"),
+        "the subject is drawn:\n{drawn}"
+    );
+
+    // A refusal reaches the form, where the draft still is.
+    let (refused, _) = step(
+        &m,
+        Msg::Failed {
+            op: Op::Send,
+            message: "store refused".into(),
+        },
+    );
+    assert!(screen(&refused, 120, 30).contains("store refused"));
+}
+
+/// The help overlay and the footer both have to own the new key, or the console
+/// has an action nobody can find.
+#[test]
+fn the_console_documents_compose() {
+    let help = keymap::help_lines().join("\n");
+    assert!(help.contains("c  compose"), "help names the key:\n{help}");
+    assert!(help.contains("send stop"), "help explains sending:\n{help}");
+    let roster = model_with_roster();
+    let line = super::view::hint_line_for_test(&roster, false);
+    assert!(
+        line.contains("[c] message"),
+        "the Agents footer names it: {line}"
+    );
+    let form = {
+        let (m, _) = step(&roster, Msg::OpenCompose);
+        m
+    };
+    let line = super::view::hint_line_for_test(&form, false);
+    assert!(
+        line.contains("[Esc] cancel"),
+        "the form's own footer replaces the tab hints: {line}"
+    );
+}
+
+/// One message log, the same model and the same effects — including the
+/// compose log, which is the newest way to produce an effect.
+#[test]
+fn the_compose_log_is_deterministic() {
+    let log = vec![
+        Msg::OpenCompose,
+        Msg::ComposeInsert('h'),
+        Msg::ComposeInsert('i'),
+        Msg::ComposeFocus(1),
+        Msg::ComposeInsert('s'),
+        Msg::ComposeFocus(1),
+        Msg::ComposeEnter,
+        Msg::ComposeMove(crate::tui::compose::CaretMove::Left),
+    ];
+    let replay = |log: &[Msg]| {
+        let mut m = model_with_roster();
+        let mut effects = Vec::new();
+        for msg in log {
+            let (next, out) = step(&m, msg.clone());
+            m = next;
+            effects.extend(out);
+        }
+        (m, effects)
+    };
+    let (a, ea) = replay(&log);
+    let (b, eb) = replay(&log);
+    assert_eq!(a, b, "the same log folds to the same model");
+    assert_eq!(ea, eb, "and to the same effects");
+    assert!(a.compose.is_some());
+}
+
+// ---------------------------------------------------------------------------
+// 10. the send seam: the console builds the mailbox's own message
+// ---------------------------------------------------------------------------
+
+/// The console does not wrap the message itself. `composed_send` builds the same
+/// shape the `mail` verb does, with the ADR-0027 assignment vocabulary on the
+/// rumor, and hands it to `MailSurface::send_message`.
+///
+/// The RING is the core's contract and is witnessed there, not copied here:
+/// `wake_mail_delivered_is_metadata_only` (toron-core, `mailbox/messaging.rs`)
+/// asserts the kind-9 `mail-delivered` event names from/thread/importance and
+/// carries neither subject nor body. What this test witnesses is the seam the
+/// console adds: the wake and importance the FORM chose survive the shared
+/// encoder and re-parse as the typed values the mailbox acts on. A renamed
+/// variant or a second tag spelling fails here instead of on the wire.
+#[test]
+fn a_composed_send_carries_the_assignment_vocabulary_the_mailbox_parses() {
+    use toron_core::mailbox::send_tags::{SendTags, Wake};
+
+    let mut form = ComposeState::new();
+    form.to = "DustySparrow, QuietLark".into();
+    form.subject = "ring check".into();
+    form.body = "line one\nline two".into();
+    form.wake = Wake::Standing;
+    form.importance = Importance::Urgent;
+    form.ack = true;
+    form.thread = Some("t9".into());
+
+    let msg = composed_send("demo", "TestAgent", &form.to_send()).expect("encode the send");
+    assert_eq!(
+        msg.to,
+        vec!["DustySparrow", "QuietLark"],
+        "a comma-separated field reaches the mailbox as a list"
+    );
+    assert_eq!(msg.project_slug, "demo");
+    assert_eq!(msg.sender_name, "TestAgent");
+    assert_eq!(msg.subject, "ring check");
+    assert_eq!(msg.body_md, "line one\nline two", "the newline survives");
+    assert_eq!(msg.importance.as_deref(), Some("urgent"));
+    assert!(msg.ack_required);
+    assert_eq!(msg.thread_id.as_deref(), Some("t9"));
+    assert!(!msg.overseer, "the console never signs as the operator");
+
+    // The vocabulary on the rumor is the typed value the mailbox acts on.
+    let parsed = SendTags::parse(&msg.extra_tags).expect("the tags re-parse");
+    assert_eq!(
+        parsed.wake,
+        Some(Wake::Standing),
+        "the form's choice survives the encoder: {:?}",
+        msg.extra_tags
+    );
+
+    // And the message text never rides the tags: the ring the core emits reads
+    // this vocabulary, so a subject or body here would leak into an unsealed
+    // kind-9 addressed to the recipient.
+    let flat: String = msg
+        .extra_tags
+        .iter()
+        .map(|t| t.as_slice().join("="))
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        !flat.contains("ring check"),
+        "no subject on the rumor: {flat}"
+    );
+    assert!(!flat.contains("line two"), "no body on the rumor: {flat}");
 }

@@ -212,7 +212,7 @@ fn render_reader(f: &mut Frame, area: Rect, model: &Model, focused: bool) {
     lines.push(Line::from(vec![
         Span::styled(open.subject.clone(), HackerNight::fg_emphasis()),
         Span::styled(
-            format!("   thread {}", short(&open.thread_id)),
+            format!("   thread {}", widgets::short_id(&open.thread_id)),
             HackerNight::fg_muted(),
         ),
     ]));
@@ -228,7 +228,7 @@ fn render_reader(f: &mut Frame, area: Rect, model: &Model, focused: bool) {
                 format!(
                     "  {}  {}",
                     widgets::stamp(model.now_unix, msg.at, model.settings.relative_time),
-                    short(&msg.id)
+                    widgets::short_id(&msg.id)
                 ),
                 HackerNight::fg_muted(),
             ),
@@ -286,14 +286,5 @@ fn truncate(s: &str, n: usize) -> String {
         return s.to_string();
     }
     let head: String = s.chars().take(n.saturating_sub(1)).collect();
-    format!("{head}…")
-}
-
-/// Short id/npub for a title (`abc12345…`).
-fn short(s: &str) -> String {
-    if s.chars().count() <= 12 {
-        return s.to_string();
-    }
-    let head: String = s.chars().take(12).collect();
     format!("{head}…")
 }

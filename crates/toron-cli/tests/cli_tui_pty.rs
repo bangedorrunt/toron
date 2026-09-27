@@ -55,6 +55,13 @@ fn have_script() -> bool {
 /// already on screen in the first frame, so a needle it satisfies would let a
 /// stuck "loading…" pane pass this witness.
 fn console_on_a_45_col_pty(program: &std::path::Path, until: &str) -> (String, i32) {
+    console_keys(program, &[(until, "\u{71}\n")])
+}
+
+/// Drive the console through a sequence of `(wait for this, then send that)`
+/// steps, then wait for it to exit. Every wait is bounded, so a wedged console
+/// fails loudly instead of hanging the suite.
+fn console_keys(program: &std::path::Path, steps: &[(&str, &str)]) -> (String, i32) {
     let scripted = format!(
         "stty cols 45 rows 24; exec '{}' tui --project tuipty --as PtyAgent --refresh-ms 250",
         program.display()
@@ -95,16 +102,22 @@ fn console_on_a_45_col_pty(program: &std::path::Path, until: &str) -> (String, i
     };
 
     let shown = |needle: &str| drawn.lock().expect("drawn buffer").contains(needle);
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while Instant::now() < deadline && !shown(until) {
-        std::thread::sleep(Duration::from_millis(50));
-    }
-
-    // `q` leaves the alternate screen; holding stdin open until now (rather
-    // than closing it) is what keeps the pty session alive to draw at all.
+    // Hold stdin open across the whole sequence: keeping the pty session alive
+    // is what keeps the console drawing at all.
     let mut stdin = child.stdin.take().expect("pty stdin");
-    let _ = stdin.write_all(b"q\n");
-    let _ = stdin.flush();
+    for (until, keys) in steps {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline && !shown(until) {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            shown(until),
+            "the console never drew {until:?} at 45 columns. It drew:\n{}",
+            drawn.lock().expect("drawn buffer")
+        );
+        let _ = stdin.write_all(keys.as_bytes());
+        let _ = stdin.flush();
+    }
 
     let deadline = Instant::now() + Duration::from_secs(15);
     let mut code = None;
@@ -118,7 +131,8 @@ fn console_on_a_45_col_pty(program: &std::path::Path, until: &str) -> (String, i
     if code.is_none() {
         let _ = child.kill();
         panic!(
-            "the console did not exit after `q` on a 45x24 pty (wedged narrow path). It drew:\n{}",
+            "the console did not exit after the key sequence on a 45x24 pty (wedged narrow \
+             path). It drew:\n{}",
             drawn.lock().expect("drawn buffer")
         );
     }
@@ -170,5 +184,52 @@ fn the_console_runs_at_45_columns_on_a_real_terminal() {
         drawn.contains("toron agent bootstrap --project tuipty")
             || drawn.contains("toron mail send --project tuipty"),
         "the empty pane names the next command on a real pty:\n{drawn}"
+    );
+}
+
+/// The compose form on a real 45-column terminal. Everything the form does on
+/// the phone-width path is otherwise only covered by `TestBackend`, which is
+/// the geometry but not the process: this runs the real binary, opens the form
+/// with `c`, and leaves it with `Esc` (which must cancel the form, not quit —
+/// `q` would only type a `q` into the recipient field).
+#[test]
+fn the_compose_form_opens_and_cancels_at_45_columns() {
+    if !have_script() {
+        eprintln!(
+            "SKIPPED narrow-PTY compose witness: script(1) not found. The form's geometry is \
+             still covered by TestBackend in crates/toron-cli/src/tui/tests.rs; the process path \
+             is not."
+        );
+        return;
+    }
+    let program = std::path::Path::new(env!("CARGO_BIN_EXE_toron"));
+    // `Importance` is drawn by the form and by nothing else, so it is the
+    // needle that proves the form reached the screen at this width. Esc then
+    // leaves the form; `q` quits from the tab behind it.
+    let (drawn, code) = console_keys(
+        program,
+        &[
+            ("--project tuipty", "c"),
+            ("Importance", "\u{1b}"),
+            // Wait for the CANCEL to land before quitting: sending `q` in the
+            // same read as the escape would arrive as Alt-q and be typed into
+            // the field instead of quitting. Waiting also proves Esc cancelled
+            // the form rather than leaving it (where `q` would also type).
+            ("compose cancelled", "q\n"),
+        ],
+    );
+    assert_eq!(
+        code, 0,
+        "the console must exit 0 after Esc-then-q at 45 columns; it drew:\n{drawn}"
+    );
+    for needle in ["compose", "To:", "Subject:", "Body", "Importance", "send"] {
+        assert!(
+            drawn.contains(needle),
+            "the form is missing {needle:?} on a real 45-col pty:\n{drawn}"
+        );
+    }
+    assert!(
+        !drawn.contains("too small"),
+        "45 columns is a console, not a resize card:\n{drawn}"
     );
 }

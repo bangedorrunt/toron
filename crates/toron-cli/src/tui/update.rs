@@ -12,10 +12,12 @@
 //! tick with effects still in flight only advances the spinner — a slow store
 //! must never queue a second wave of reads.
 
+use super::compose::{ComposeState, Field};
 use super::model::{
     Folder, ListRow, MailRow, Mode, Model, OpenThread, Pane, StatusKind, Tab, thread_id_of,
 };
 use super::msg::{Effect, Msg, Op};
+use super::view::widgets::short_id;
 
 /// Ticks between the slow-cadence refreshes (bus replay + receipt counts).
 pub const SLOW_CADENCE: u64 = 3;
@@ -113,9 +115,44 @@ pub fn tick(model: &Model, msg: Msg) -> (Model, Vec<Effect>) {
             m.dashboard.loaded = true;
         }
         Msg::Inflight(n) => m.inflight = n,
+        Msg::MailSent {
+            to,
+            message_id,
+            thread,
+        } => {
+            m.compose = None;
+            m.mode = Mode::Normal;
+            let where_ = thread
+                .as_deref()
+                .map(|t| format!(" · thread {}", short_id(t)))
+                .unwrap_or_default();
+            // A message is durable the moment it lands, but the doorbell can
+            // only PROMPT a pane. Say which one happened instead of implying
+            // the recipient was notified.
+            match m.recipient_without_a_pane(&to) {
+                Some(pin) => m.set_status(
+                    StatusKind::Ok,
+                    format!(
+                        "sent to {to} · {}{where_} — no live pane for {pin}, so the wake waits in their digest",
+                        short_id(&message_id)
+                    ),
+                ),
+                None => m.set_status(
+                    StatusKind::Ok,
+                    format!("sent to {to} · {}{where_}", short_id(&message_id)),
+                ),
+            }
+        }
         Msg::Failed { op, message } => {
             // Typed failure: show it and keep the last good data on screen.
             settle_failure(&mut m, op, &message);
+            // A refused SEND keeps the draft: retyping a message because the
+            // store hiccuped is the one failure the operator cannot forgive.
+            if op == Op::Send
+                && let Some(c) = m.compose.as_mut()
+            {
+                c.error = Some(message.clone());
+            }
             m.set_status(StatusKind::Error, format!("{}: {message}", op.label()));
         }
         Msg::ReceiptWritten { corr, verb } => {
@@ -287,6 +324,68 @@ pub fn tick(model: &Model, msg: Msg) -> (Model, Vec<Effect>) {
             m.settings.show_closed_channels = !m.settings.show_closed_channels;
             effects.push(Effect::RefreshChannels);
         }
+
+        // --- the compose form -------------------------------------------
+        Msg::OpenCompose => {
+            if m.mode == Mode::Compose {
+                // Already open: `c` must not silently discard a draft.
+                return (m, effects);
+            }
+            m.compose = Some(open_compose(&m));
+            m.mode = Mode::Compose;
+            m.set_status(StatusKind::Info, compose_status(&m));
+        }
+        Msg::ComposeCancel => {
+            m.compose = None;
+            m.mode = Mode::Normal;
+            m.set_status(StatusKind::Info, "compose cancelled".to_string());
+        }
+        Msg::ComposeFocus(delta) => {
+            if let Some(c) = m.compose.as_mut() {
+                c.step_field(delta);
+            }
+        }
+        Msg::ComposeMove(mv) => {
+            if let Some(c) = m.compose.as_mut() {
+                c.move_caret(mv);
+            }
+        }
+        Msg::ComposeInsert(ch) => {
+            if let Some(c) = m.compose.as_mut() {
+                c.insert_char(ch);
+                // Typing clears the last refusal: the reason is stale the
+                // moment the form changes.
+                c.error = None;
+            }
+        }
+        Msg::ComposeBackspace => {
+            if let Some(c) = m.compose.as_mut() {
+                c.backspace();
+                c.error = None;
+            }
+        }
+        Msg::ComposeDelete => {
+            if let Some(c) = m.compose.as_mut() {
+                c.delete_forward();
+                c.error = None;
+            }
+        }
+        Msg::ComposeEnter => {
+            let Some(c) = m.compose.as_mut() else {
+                return (m, effects);
+            };
+            match c.field {
+                // A text stop advances; the body takes the newline, because a
+                // multi-line body with no way to insert a line is not one.
+                Field::Body => c.newline(),
+                Field::To | Field::Subject => c.step_field(1),
+                Field::Wake | Field::Importance | Field::Ack => c.cycle(1),
+                Field::Send => match c.validate() {
+                    Err(reason) => c.error = Some(reason),
+                    Ok(()) => effects.push(Effect::SendMail(c.to_send())),
+                },
+            }
+        }
     }
     (m, effects)
 }
@@ -344,7 +443,52 @@ fn settle_failure(m: &mut Model, op: Op, message: &str) {
         Op::Channels => m.channels.loaded = true,
         Op::Agents => m.agents.loaded = true,
         Op::Receipts | Op::Health => m.dashboard.loaded = true,
-        Op::Thread | Op::ChannelPosts | Op::Search | Op::Receipt => {}
+        // A refused send has no pane to settle; the draft is what it settles,
+        // and the send arm keeps it (the operator's typing is not thrown away
+        // because the store hiccuped).
+        Op::Thread | Op::ChannelPosts | Op::Search | Op::Receipt | Op::Send => {}
+    }
+}
+
+/// The form `c` opens. The fold decides reply-vs-new from what is on screen, so
+/// the key means one thing and there is no second selector.
+fn open_compose(m: &Model) -> ComposeState {
+    // On the Agents tab the roster IS the recipient picker: `c` addresses the
+    // agent under the cursor, which is how a live/online pin gets chosen
+    // without a completion widget to learn.
+    if m.tab == Tab::Agents
+        && let Some(row) = m.agents.visible_rows(&m.input).get(m.agents.selected)
+    {
+        return ComposeState {
+            to: row.name.clone(),
+            ..ComposeState::new()
+        };
+    }
+    // An open conversation is a reply: pre-addressed to the newest sender and
+    // already in-thread.
+    if let Some(open) = &m.mail.open {
+        let to = open
+            .messages
+            .last()
+            .map(|msg| msg.sender.clone())
+            .unwrap_or_default();
+        return ComposeState::reply(open.thread_id.clone(), to, open.subject.clone());
+    }
+    ComposeState::new()
+}
+
+/// One line describing the form that just opened.
+fn compose_status(m: &Model) -> String {
+    match m.compose.as_ref() {
+        Some(c) if c.thread.is_some() => format!(
+            "reply on thread {} — Tab moves, Enter advances, Esc cancels",
+            short_id(c.thread.as_deref().unwrap_or_default())
+        ),
+        Some(c) if !c.to.trim().is_empty() => format!(
+            "to {} — Tab moves, Enter advances, Esc cancels",
+            c.to.trim()
+        ),
+        _ => "new message — Tab moves, Enter advances, Esc cancels".to_string(),
     }
 }
 
