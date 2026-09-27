@@ -48,7 +48,7 @@ fn record_spawn(pid: u32, port: u16) {
 }
 
 fn forget_spawn_in(path: &std::path::Path, pid: u32) {
-    let Ok(raw) = std::fs::read_to_string(&path) else {
+    let Ok(raw) = std::fs::read_to_string(path) else {
         return;
     };
     let kept: Vec<&str> = raw
