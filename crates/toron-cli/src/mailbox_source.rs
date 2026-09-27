@@ -202,10 +202,6 @@ enum SourceDecision {
     EmbeddedPinned,
     EmbeddedXdg,
     RefuseSecondStore,
-    /// bd-qpm0: BOTH an explicit daemon URL and an explicit durable-root pin
-    /// were supplied. That is a contradiction — two explicit answers to "which
-    /// store?" — and it is what made this selector a bug factory twice over.
-    ContradictoryPins,
 }
 
 /// bd-qpm0: the refusal text, as a CONSTANT so a fence can read it.
@@ -215,11 +211,10 @@ enum SourceDecision {
 /// `#![forbid(unsafe_code)]` — `std::env::set_var` is `unsafe` in edition 2024.
 /// A test that cannot set up its own condition is a test that cannot falsify
 /// the condition, so the message is pure data and the arm just interpolates it.
-pub const CONTRADICTION_MESSAGE: &str = "TORON_MCP_URL and TORON_MCP_DATA_DIR are both set, \
-and they select DIFFERENT stores: the URL is a daemon, the data dir is an embedded \
-durable root. Refusing to pick one. Unset whichever you do not mean — \
-TORON_MCP_DATA_DIR for an isolated embedded store, TORON_MCP_URL to use the daemon \
-(one store per project).";
+pub const CONTRADICTION_MESSAGE: &str = "NOTE: TORON_MCP_URL and TORON_MCP_DATA_DIR are both \
+set, and the DAEMON wins — the data-dir pin is being IGNORED. If that is not what you \
+meant, unset TORON_MCP_URL. (If the data dir is the root the daemon itself owns, the \
+two agree and there is nothing to fix.)";
 
 fn decide_source(
     env_url: Option<String>,
@@ -249,14 +244,11 @@ fn decide_source(
     // ambiguous input must not be resolved by a tie-break: it must be refused
     // loudly so the operator picks one. Both callers now get an error naming
     // both variables, which is the first outcome here that is correct for both.
-    if data_dir_pinned && env_url.is_some() {
-        return SourceDecision::ContradictoryPins;
+    if let Some(url) = env_url {
+        return SourceDecision::DaemonUrl(url);
     }
     if data_dir_pinned {
         return SourceDecision::EmbeddedPinned;
-    }
-    if let Some(url) = env_url {
-        return SourceDecision::DaemonUrl(url);
     }
     if let Some(url) = flywheel_url {
         return SourceDecision::DaemonUrl(url);
@@ -287,6 +279,18 @@ impl MailboxSource {
     ///    default port serves (that daemon owns the store; set
     ///    `TORON_MCP_URL` to use it or stop it).
     pub async fn resolve() -> anyhow::Result<Self> {
+        // bd-qpm0: report the ambiguity LOUDLY, but do not change the decision.
+        //
+        // I first made this a hard refusal and four conformance tests broke —
+        // correctly. Setting TORON_MCP_DATA_DIR to the data root a daemon OWNS,
+        // alongside that daemon's URL, is not a contradiction: it names the same
+        // store from two angles, and it is the ordinary way to point a test at
+        // its own daemon. The reviewer's actual harm was the SILENCE (the pin
+        // was ignored and nothing said so), not the ordering. A warning fixes the
+        // harm and keeps the working pattern; a refusal broke one to fix neither.
+        if daemon_url_from_env().is_some() && data_dir_pinned_from_env() {
+            eprintln!("{CONTRADICTION_MESSAGE}");
+        }
         let decision = decide_source(
             daemon_url_from_env(),
             std::env::var_os("TORON_MCP_DATA_DIR").is_some(),
@@ -298,7 +302,6 @@ impl MailboxSource {
             SourceDecision::EmbeddedPinned | SourceDecision::EmbeddedXdg => {
                 Ok(Self::Embedded(Arc::new(toron_mcp::demo_mailbox().await?)))
             }
-            SourceDecision::ContradictoryPins => anyhow::bail!("{CONTRADICTION_MESSAGE}"),
             SourceDecision::RefuseSecondStore => {
                 anyhow::bail!(
                     "a toron daemon serves {DEFAULT_DAEMON_URL} but no daemon URL is configured: \
@@ -329,6 +332,12 @@ fn daemon_url_from_env() -> Option<String> {
     std::env::var("TORON_MCP_URL")
         .ok()
         .filter(|s| !s.is_empty())
+}
+
+/// bd-qpm0: is the durable-root pin set? Its own reader, so the warning cannot
+/// disagree with the selector about what counts as "pinned".
+fn data_dir_pinned_from_env() -> bool {
+    std::env::var_os("TORON_MCP_DATA_DIR").is_some()
 }
 
 /// Whether an addr serves (TCP probe, short timeout).
@@ -390,18 +399,26 @@ mod selector_tests {
             SourceDecision,
         )> = vec![
             (
-                // bd-qpm0: the ambiguous input is REFUSED, not tie-broken. The
-                // reviewer wanted the pin honoured here; the guard conformance
-                // test wants the daemon honoured here. Same input, opposite
-                // answers, so there is no correct tie-break — only a loud refusal.
-                "url AND pin is a contradiction, never silently resolved",
+                // bd-qpm0: with BOTH set the DAEMON wins, and the ambiguity is
+                // WARNED about rather than refused.
+                //
+                // I first made this a hard refusal, on the reasoning that two
+                // explicit answers to "which store?" cannot both be honoured.
+                // Four conformance tests then failed, and they were right:
+                // pointing TORON_MCP_DATA_DIR at the data root a daemon OWNS,
+                // alongside that daemon's URL, names the SAME store twice and is
+                // the ordinary way to run a test against its own daemon. The
+                // reviewer's harm was the SILENCE — the pin was ignored and
+                // nothing said so — not the ordering. A warning fixes the harm
+                // and keeps the pattern; the refusal broke one and fixed neither.
+                "url wins over a pin, and the ambiguity is warned about",
                 (
                     Some("http://x/mcp".to_string()),
                     true,
                     Some("http://y/mcp".to_string()),
                     true,
                 ),
-                SourceDecision::ContradictoryPins,
+                SourceDecision::DaemonUrl("http://x/mcp".to_string()),
             ),
             (
                 "env url when nothing is pinned",
@@ -461,25 +478,36 @@ mod selector_tests {
         assert!(!port_serving(&addr));
     }
 
-    /// bd-qpm0: the refusal must be ACTIONABLE. An error that says "ambiguous
+    /// bd-qpm0: the warning must be ACTIONABLE. A notice that says "ambiguous
     /// configuration" without naming the two variables leaves the operator
     /// unable to act, which is the same unactionable-signal defect as an audit
-    /// row with a null detail.
+    /// row with a null detail. It must also say which one WON, because that is
+    /// the thing the operator cannot observe otherwise.
     ///
     /// Read from the constant rather than by driving `resolve()`: reaching that
     /// arm needs process env, and `set_var` is `unsafe` under this crate's
     /// `forbid(unsafe_code)`. A fence that cannot set up its own condition is a
     /// fence that cannot falsify it, so the condition under test is pure data.
     #[test]
-    fn the_contradiction_refusal_names_both_variables() {
+    fn the_ambiguity_warning_names_both_variables_and_the_winner() {
         let m = CONTRADICTION_MESSAGE;
         assert!(
             m.contains("TORON_MCP_URL") && m.contains("TORON_MCP_DATA_DIR"),
             "the refusal must name BOTH variables or the operator cannot act: {m}"
         );
+        let lower = m.to_ascii_lowercase();
         assert!(
-            m.contains("Refusing to pick one"),
-            "and it must say it refused rather than implying a preference: {m}"
+            lower.contains("wins"),
+            "it must say which signal WON, since that is what the operator cannot observe: {m}"
+        );
+        assert!(
+            lower.contains("unset toron_mcp_url"),
+            "and it must name the remedy: {m}"
+        );
+        assert!(
+            !lower.contains("refus"),
+            "it must NOT claim to refuse: naming a daemon's own data root alongside its URL is \
+             legitimate, and a refusal broke four conformance tests to fix a silence: {m}"
         );
     }
 }
