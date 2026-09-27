@@ -14,14 +14,16 @@
 
 use toron_core::nostr::presence::PresenceState;
 
-/// Minimum usable terminal width — below this the resize card shows (§2).
-pub const MIN_W: u16 = 80;
-/// Minimum usable terminal height.
-pub const MIN_H: u16 = 14;
+/// Minimum usable terminal width. The floor is a phone-width PTY — an iPhone
+/// SSH client reports ~40-50 columns — so the console keeps working there in
+/// one-pane mode instead of refusing. Below this the resize card shows (§2).
+pub const MIN_W: u16 = 40;
+/// Minimum usable terminal height (five rows of chrome, seven of content).
+pub const MIN_H: u16 = 12;
 
 /// Width at which the reader pane gets its own column (three-pane Gmail).
 pub const TRI_PANE_W: u16 = 108;
-/// Width at which the list and reader share the frame (two-pane).
+/// Width at which the sidebar, list and reader share the frame (two-pane).
 pub const DUAL_PANE_W: u16 = 80;
 
 /// Top-level tabs. Order is the display order and the `1..5` key order.
@@ -116,10 +118,13 @@ pub enum Pane {
 }
 
 impl Pane {
-    /// Panes visible on a tab, left to right.
+    /// Panes visible on a tab, left to right. Truthful per tab: the Agents tab
+    /// draws no sidebar, so it must not offer one as a focus target (`h` would
+    /// land on a pane nothing renders).
     pub fn order(tab: Tab) -> &'static [Pane] {
         match tab {
-            Tab::Mail | Tab::Channels | Tab::Agents => &[Pane::Sidebar, Pane::List, Pane::Reader],
+            Tab::Mail | Tab::Channels => &[Pane::Sidebar, Pane::List, Pane::Reader],
+            Tab::Agents => &[Pane::List, Pane::Reader],
             _ => &[Pane::List],
         }
     }
@@ -137,14 +142,24 @@ impl Pane {
 /// Responsive breakpoint (§2 "Breakpoint modes" + "Minimum size gate").
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LayoutMode {
-    /// Three columns: sidebar, list, reader.
+    /// Three columns: sidebar, list, reader — from [`TRI_PANE_W`].
     Tri,
-    /// Two columns: list, reader (sidebar collapsed to its counts line).
+    /// Two columns: the sidebar, plus list and reader sharing the frame —
+    /// from [`DUAL_PANE_W`].
     Dual,
-    /// One column: the focused pane only.
+    /// One pane at a time, switched with `h`/`l`: phone-width terminals
+    /// ([`MIN_W`]..[`DUAL_PANE_W`] columns) where three columns cannot fit.
+    /// The rows narrow with it (one line per message, no stamp).
     Stacked,
     /// Below [`MIN_W`]×[`MIN_H`]: resize card, no data panes.
     TooSmall,
+}
+
+impl LayoutMode {
+    /// True in the one-pane (phone-width) mode: chrome and rows compact.
+    pub fn single(self) -> bool {
+        matches!(self, LayoutMode::Stacked)
+    }
 }
 
 /// Pick the layout for a frame size. Pure — the view calls it every frame.
@@ -235,6 +250,10 @@ pub struct MailRow {
     pub at: u64,
     /// Body, when the reader fetched it.
     pub body: Option<String>,
+    /// The projection carried this row's read/ack state. A search hit does
+    /// not (its result carries no corr and no read stamp), so it must say
+    /// "unknown" instead of inventing an unread dot or an owed ack.
+    pub state_known: bool,
 }
 
 impl MailRow {
@@ -246,9 +265,14 @@ impl MailRow {
         )
     }
 
-    /// Still owes an acknowledgement.
+    /// Still owes an acknowledgement. Unknown state is never owed.
     pub fn ack_pending(&self) -> bool {
-        self.ack_required && !self.acked
+        self.state_known && self.ack_required && !self.acked
+    }
+
+    /// Never opened. Unknown state is never claimed as unread.
+    pub fn unread(&self) -> bool {
+        self.state_known && !self.read
     }
 }
 
@@ -368,7 +392,7 @@ impl MailState {
                 thread: false,
                 ack_pending: m.ack_pending(),
                 important: m.important(),
-                unread: !m.read,
+                unread: m.unread(),
             })
             .collect();
         rows.sort_by(|a, b| b.at.cmp(&a.at).then_with(|| a.key.cmp(&b.key)));
@@ -421,7 +445,9 @@ pub fn thread_rows(messages: &[MailRow]) -> Vec<ListRow> {
         .map(|t| {
             let others = t.participants.len().saturating_sub(1);
             // A thread is unread when any of its messages is.
-            let unread = messages.iter().any(|m| thread_id_of(m) == t.id && !m.read);
+            let unread = messages
+                .iter()
+                .any(|m| thread_id_of(m) == t.id && m.unread());
             ListRow {
                 key: t.id.clone(),
                 thread_id: t.id,
@@ -530,8 +556,6 @@ pub struct ChannelsState {
     pub posts: Vec<PostRow>,
     /// The selected channel's id the posts belong to (guards stale reads).
     pub posts_for: Option<String>,
-    /// Reader pane shows the full post body.
-    pub reader_open: bool,
     /// A fetch has landed (drives empty-state text).
     pub loaded: bool,
     /// Reader scroll offset (the view clamps it).
@@ -624,24 +648,26 @@ pub struct AgentsState {
     pub rows: Vec<AgentRow>,
     /// Cursor.
     pub selected: usize,
-    /// Reader pane shows the agent detail card.
-    pub reader_open: bool,
     /// A fetch has landed.
     pub loaded: bool,
 }
 
 impl AgentsState {
-    /// Rows matching the local filter (pin / npub / program / task).
+    /// Rows matching the local filter (pin / npub / program / model / task).
     pub fn visible_rows(&self, filter: &str) -> Vec<AgentRow> {
         let mut rows = self.rows.clone();
         let needle = filter.trim().to_ascii_lowercase();
         if !needle.is_empty() {
+            let matches = |v: &Option<String>| {
+                v.as_deref()
+                    .is_some_and(|s| s.to_ascii_lowercase().contains(&needle))
+            };
             rows.retain(|a| {
                 a.name.to_ascii_lowercase().contains(&needle)
                     || a.npub.to_ascii_lowercase().contains(&needle)
-                    || a.program
-                        .as_deref()
-                        .is_some_and(|p| p.to_ascii_lowercase().contains(&needle))
+                    || matches(&a.program)
+                    || matches(&a.model)
+                    || matches(&a.task)
             });
         }
         rows
@@ -810,8 +836,6 @@ pub struct Status {
     pub text: String,
     /// Severity (rendered with a shape prefix, never color alone).
     pub kind: StatusKind,
-    /// `now_unix` when the message was set (the view ages it out).
-    pub at: u64,
 }
 
 impl Default for Status {
@@ -819,7 +843,6 @@ impl Default for Status {
         Self {
             text: String::new(),
             kind: StatusKind::Info,
-            at: 0,
         }
     }
 }
@@ -886,8 +909,14 @@ impl Model {
         }
     }
 
-    /// Rows the list pane currently shows (mail tab), filter applied.
+    /// Rows the list pane currently shows (mail tab). A server search IS the
+    /// filter: re-running the local predicate over its hits would hide every
+    /// hit that matched in the body (which the local pass cannot see) while
+    /// the title still counted it.
     pub fn mail_rows(&self) -> Vec<ListRow> {
+        if self.mail.search.is_some() {
+            return self.mail.rows();
+        }
         self.mail.filtered_rows(&self.input)
     }
 
@@ -982,12 +1011,12 @@ impl Model {
         self.clamp_cursor();
     }
 
-    /// Set the status line (one-liner feedback).
+    /// Set the status line (one-liner feedback). It stays until the next
+    /// action replaces it — no timer, so nothing here reads a clock.
     pub fn set_status(&mut self, kind: StatusKind, text: impl Into<String>) {
         self.status = Status {
             text: text.into(),
             kind,
-            at: self.now_unix,
         };
     }
 

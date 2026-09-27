@@ -6,37 +6,37 @@
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{List, ListItem, Paragraph, Wrap};
 
 use crate::theme::HackerNight;
 
 use super::super::model::{AgentRow, LayoutMode, Model, Pane};
 use super::{split, widgets};
 
-/// Render the agents tab for the current layout mode.
+/// Render the agents tab for the current layout mode. This tab has no sidebar
+/// of its own, so it asks `split` for the full width.
 pub fn render(f: &mut Frame, area: Rect, model: &Model, mode: LayoutMode) {
-    let panes = split(area, mode);
     let rows = model.agents.visible_rows(&model.input);
-    match mode {
-        LayoutMode::Stacked => match model.pane {
+    if mode.single() {
+        return match model.pane {
             Pane::Reader => render_detail(f, area, model, &rows, true),
-            _ => render_list(f, area, model, &rows, true),
-        },
-        _ => {
-            render_list(
-                f,
-                panes.list,
-                model,
-                &rows,
-                model.pane == Pane::List || panes.sidebar.is_none(),
-            );
-            render_detail(f, panes.reader, model, &rows, model.pane == Pane::Reader);
-        }
+            _ => render_list(f, area, model, &rows, true, true),
+        };
     }
+    let panes = split(area, mode, false);
+    render_list(f, panes.list, model, &rows, model.pane == Pane::List, false);
+    render_detail(f, panes.reader, model, &rows, model.pane == Pane::Reader);
 }
 
 /// The roster list: marker, pin, state, harness, age.
-fn render_list(f: &mut Frame, area: Rect, model: &Model, rows: &[AgentRow], focused: bool) {
+fn render_list(
+    f: &mut Frame,
+    area: Rect,
+    model: &Model,
+    rows: &[AgentRow],
+    focused: bool,
+    narrow: bool,
+) {
     let online = rows.iter().filter(|r| r.online).count();
     let title = format!("agents — {online}/{} online", rows.len());
     if rows.is_empty() {
@@ -69,22 +69,26 @@ fn render_list(f: &mut Frame, area: Rect, model: &Model, rows: &[AgentRow], focu
                 Span::styled(format!("{:<16}", truncate(&row.name, 16)), name_style),
                 Span::styled(format!("{:<9}", row.state_label()), state_style(row)),
             ];
-            let harness = match (&row.program, &row.model) {
-                (Some(p), Some(m)) => format!("{p}/{m}"),
-                (Some(p), None) | (None, Some(p)) => p.clone(),
-                (None, None) => String::new(),
-            };
-            if !harness.is_empty() {
-                spans.push(Span::styled(
-                    format!("{:<22}", truncate(&harness, 22)),
-                    HackerNight::fg_muted(),
-                ));
-            }
-            if let Some(age) = row.age_secs {
-                spans.push(Span::styled(
-                    format!("{} ago", widgets::age_of(age)),
-                    HackerNight::fg_muted(),
-                ));
+            // Phone width: pin + state are the row; the harness and the age
+            // are in the detail card (`Enter`).
+            if !narrow {
+                let harness = match (&row.program, &row.model) {
+                    (Some(p), Some(m)) => format!("{p}/{m}"),
+                    (Some(p), None) | (None, Some(p)) => p.clone(),
+                    (None, None) => String::new(),
+                };
+                if !harness.is_empty() {
+                    spans.push(Span::styled(
+                        format!("{:<22}", truncate(&harness, 22)),
+                        HackerNight::fg_muted(),
+                    ));
+                }
+                if let Some(age) = row.age_secs {
+                    spans.push(Span::styled(
+                        format!("{} ago", widgets::age_of(age)),
+                        HackerNight::fg_muted(),
+                    ));
+                }
             }
             ListItem::new(Line::from(spans))
         })
@@ -93,7 +97,11 @@ fn render_list(f: &mut Frame, area: Rect, model: &Model, rows: &[AgentRow], focu
         .block(widgets::pane_block(&title, focused))
         .highlight_style(HackerNight::selection())
         .highlight_symbol("▶ ");
-    f.render_stateful_widget(list, area, &mut cursor_state(model.agents.selected));
+    f.render_stateful_widget(
+        list,
+        area,
+        &mut widgets::dir_state(rows.len(), model.agents.selected),
+    );
 }
 
 /// The detail card for the highlighted agent.
@@ -173,12 +181,6 @@ fn state_style(row: &AgentRow) -> ratatui::style::Style {
         (true, toron_core::nostr::presence::PresenceState::Working) => HackerNight::success(),
         (true, _) => HackerNight::info(),
     }
-}
-
-fn cursor_state(selected: usize) -> ListState {
-    let mut state = ListState::default();
-    state.select(Some(selected));
-    state
 }
 
 fn truncate(s: &str, n: usize) -> String {

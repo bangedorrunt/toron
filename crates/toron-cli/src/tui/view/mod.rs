@@ -30,57 +30,55 @@ pub struct Panes {
     pub reader: Rect,
 }
 
-/// Split the body area for a layout mode. Sidebar 22 cols, list ~38% of the
-/// remainder, reader takes the rest — proportional, never absolute (§2).
-pub fn split(area: Rect, mode: LayoutMode) -> Panes {
-    match mode {
-        LayoutMode::Tri => {
-            let sidebar_w = (area.width / 5).clamp(18, 28);
-            let inner = Rect {
-                x: area.x + sidebar_w,
-                width: area.width.saturating_sub(sidebar_w),
-                ..area
-            };
-            let list_w = ((inner.width as u32 * 38 / 100) as u16)
-                .max(28)
-                .min(inner.width);
-            Panes {
-                sidebar: Some(Rect {
-                    width: sidebar_w,
-                    ..area
-                }),
-                list: Rect {
-                    width: list_w,
-                    ..inner
-                },
-                reader: Rect {
-                    x: inner.x + list_w,
-                    width: inner.width.saturating_sub(list_w),
-                    ..inner
-                },
-            }
-        }
-        LayoutMode::Dual => {
-            let list_w = ((area.width as u32 * 45 / 100) as u16)
-                .max(MIN_W / 2)
-                .min(area.width.saturating_sub(24).max(1));
-            Panes {
-                sidebar: None,
-                list: Rect {
-                    width: list_w,
-                    ..area
-                },
-                reader: Rect {
-                    x: area.x + list_w,
-                    width: area.width.saturating_sub(list_w),
-                    ..area
-                },
-            }
-        }
-        LayoutMode::Stacked | LayoutMode::TooSmall => Panes {
+/// Split the body area for a layout mode. Sidebar ~20% (clamped), list ~38%
+/// of the remainder, reader takes the rest — proportional, never absolute
+/// (§2).
+///
+/// `sidebar` is the calling tab's own answer to "do I have a folder/room
+/// column?": the Agents tab does not, so it gets the full width back instead
+/// of an empty gutter. One pane at a time (`Stacked`) gives the focused pane
+/// the whole frame — that is how a 45-column phone terminal works.
+pub fn split(area: Rect, mode: LayoutMode, sidebar: bool) -> Panes {
+    if mode.single() || mode == LayoutMode::TooSmall {
+        return Panes {
             sidebar: None,
             list: area,
             reader: area,
+        };
+    }
+    let sidebar_w = match (sidebar, mode) {
+        (false, _) => 0,
+        (true, LayoutMode::Tri) => (area.width / 5).clamp(18, 28),
+        // Two-pane widths: the sidebar is real but tight (80 cols / 6 = 13).
+        (true, _) => (area.width / 6).clamp(14, 20),
+    };
+    let inner = Rect {
+        x: area.x + sidebar_w,
+        width: area.width.saturating_sub(sidebar_w),
+        ..area
+    };
+    let list_w = match mode {
+        LayoutMode::Tri => ((inner.width as u32 * 38 / 100) as u16)
+            .max(28)
+            .min(inner.width),
+        // Two-pane: both sides stay readable (20 cols is a truncated subject).
+        _ => ((inner.width as u32 * 45 / 100) as u16)
+            .max(24)
+            .min(inner.width.saturating_sub(20).max(1)),
+    };
+    Panes {
+        sidebar: (sidebar_w > 0).then(|| Rect {
+            width: sidebar_w,
+            ..area
+        }),
+        list: Rect {
+            width: list_w,
+            ..inner
+        },
+        reader: Rect {
+            x: inner.x + list_w,
+            width: inner.width.saturating_sub(list_w),
+            ..inner
         },
     }
 }
@@ -104,8 +102,8 @@ pub fn render(f: &mut Frame, model: &Model) {
         ])
         .split(area);
 
-    render_header(f, rows[0], model);
-    render_tabs(f, rows[1], model);
+    render_header(f, rows[0], model, mode.single());
+    render_tabs(f, rows[1], model, mode.single());
     match model.tab {
         Tab::Mail => mail::render(f, rows[2], model, mode),
         Tab::Channels => channels::render(f, rows[2], model, mode),
@@ -113,7 +111,7 @@ pub fn render(f: &mut Frame, model: &Model) {
         Tab::Dashboard => dashboard::render(f, rows[2], model),
         Tab::Settings => settings::render(f, rows[2], model),
     }
-    render_footer(f, rows[3], model);
+    render_footer(f, rows[3], model, mode.single());
 
     if model.mode == Mode::Help {
         render_help(f, area);
@@ -122,7 +120,7 @@ pub fn render(f: &mut Frame, model: &Model) {
 
 /// Header: identity, store, liveness. The spinner is tick-driven, so a
 /// frozen clock is visible as a frozen spinner.
-fn render_header(f: &mut Frame, area: Rect, model: &Model) {
+fn render_header(f: &mut Frame, area: Rect, model: &Model, narrow: bool) {
     let dot = match model.status.kind {
         StatusKind::Error => Span::styled("✗", HackerNight::error()),
         StatusKind::Ok => Span::styled("✓", HackerNight::success()),
@@ -137,27 +135,50 @@ fn render_header(f: &mut Frame, area: Rect, model: &Model) {
     } else {
         format!("{} live", spinner(model.tick))
     };
-    let line = Line::from(vec![
-        Span::styled(" toron ", HackerNight::fg_emphasis()),
-        dot,
-        Span::styled(format!(" {who}"), HackerNight::fg_default()),
-        Span::styled(
-            format!("  ·  {:<18}", model.settings.source.kind),
-            HackerNight::fg_muted(),
-        ),
-        Span::styled(busy, HackerNight::accent_lav()),
-        Span::styled(format!("  ·  tick {}", model.tick), HackerNight::fg_muted()),
-    ]);
+    // Phone width: the store column and the tick counter go first — and the tab
+    // name arrives here, because the tab bar is down to one letter per tab.
+    let line = if narrow {
+        Line::from(vec![
+            Span::styled(" toron ", HackerNight::fg_emphasis()),
+            dot,
+            Span::styled(
+                format!(" {} ", model.tab.title()),
+                HackerNight::accent_cyan(),
+            ),
+            Span::styled(who, HackerNight::fg_default()),
+            Span::styled(format!(" {busy}"), HackerNight::accent_lav()),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled(" toron ", HackerNight::fg_emphasis()),
+            dot,
+            Span::styled(format!(" {who}"), HackerNight::fg_default()),
+            Span::styled(
+                format!("  ·  {:<18}", model.settings.source.kind),
+                HackerNight::fg_muted(),
+            ),
+            Span::styled(busy, HackerNight::accent_lav()),
+            Span::styled(format!("  ·  tick {}", model.tick), HackerNight::fg_muted()),
+        ])
+    };
     f.render_widget(Paragraph::new(line).style(HackerNight::header()), area);
 }
 
-/// Tab bar with per-tab counts (unread mail, rooms, live agents).
-fn render_tabs(f: &mut Frame, area: Rect, model: &Model) {
+/// Tab bar with per-tab counts (unread mail, rooms, live agents). At phone
+/// width the labels collapse to `1M 2C …` — five full titles are 60 columns.
+fn render_tabs(f: &mut Frame, area: Rect, model: &Model, narrow: bool) {
     let counts: Vec<String> = Tab::ALL
         .iter()
         .map(|tab| {
+            if narrow {
+                return format!(
+                    "{}{}",
+                    tab.index() + 1,
+                    tab.title().chars().next().unwrap_or('?')
+                );
+            }
             let n = match tab {
-                Tab::Mail => model.mail.messages.iter().filter(|m| !m.read).count(),
+                Tab::Mail => model.mail.messages.iter().filter(|m| m.unread()).count(),
                 Tab::Channels => model.channels.channels.len(),
                 Tab::Agents => model.agents.online(),
                 Tab::Dashboard | Tab::Settings => 0,
@@ -171,7 +192,7 @@ fn render_tabs(f: &mut Frame, area: Rect, model: &Model) {
         .select(model.tab.index())
         .style(HackerNight::tabs_inactive())
         .highlight_style(HackerNight::tabs_active())
-        .divider("  ");
+        .divider(if narrow { " " } else { "  " });
     f.render_widget(tabs, area);
 }
 
@@ -185,7 +206,7 @@ fn badge(n: usize) -> String {
 }
 
 /// Footer: status line + context-sensitive key hints (skill §3 tiers 1–2).
-fn render_footer(f: &mut Frame, area: Rect, model: &Model) {
+fn render_footer(f: &mut Frame, area: Rect, model: &Model, narrow: bool) {
     let frame = f.area();
     let layout = widgets::layout_label(model::layout_mode(frame.width, frame.height));
     let rows = Layout::default()
@@ -199,13 +220,17 @@ fn render_footer(f: &mut Frame, area: Rect, model: &Model) {
         StatusKind::Info => HackerNight::fg_muted(),
     };
     let status = if model.status.text.is_empty() {
-        Line::from(Span::styled(
+        // Phone width: the store detail is a paragraph, and the cadence plus
+        // the layout label are the two facts worth the line.
+        let text = if narrow {
+            format!(" {}ms  ·  {layout}", model.settings.refresh_ms)
+        } else {
             format!(
                 " refresh {}ms  ·  {layout}  ·  {}",
                 model.settings.refresh_ms, model.settings.source.detail,
-            ),
-            HackerNight::fg_muted(),
-        ))
+            )
+        };
+        Line::from(Span::styled(text, HackerNight::fg_muted()))
     } else {
         let shape = match model.status.kind {
             StatusKind::Error => "✗",
@@ -219,18 +244,23 @@ fn render_footer(f: &mut Frame, area: Rect, model: &Model) {
     };
     f.render_widget(Paragraph::new(status), rows[0]);
 
-    let hints = hint_line(model);
+    let hints = hint_line(model, narrow);
     f.render_widget(
         Paragraph::new(hints).style(HackerNight::fg_muted()),
         rows[1],
     );
 }
 
+/// Phone-width hints: the stable keys only. The focused pane's title says
+/// where you are, and `?` lists the rest.
+const NARROW_HINTS: &str = "[?] help  [q] quit  [1-5] tab";
+
 /// Context-sensitive hints: only what is actionable right now.
-fn hint_line(model: &Model) -> Line<'static> {
+fn hint_line(model: &Model, narrow: bool) -> Line<'static> {
     let text = match model.mode {
         Mode::Help => "[Esc/?/q] close help",
         Mode::Insert => "[Enter] apply  [Esc] cancel  [type] filter",
+        Mode::Normal if narrow => NARROW_HINTS,
         Mode::Normal => match (model.tab, model.pane) {
             (Tab::Mail, Pane::Reader) => {
                 "[j/k] scroll  [a] ack  [m] read  [h/Esc] back  [/] filter  [?] help  [q] quit"

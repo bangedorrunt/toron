@@ -117,6 +117,10 @@ pub fn tick(model: &Model, msg: Msg) -> (Model, Vec<Effect>) {
             m.set_status(StatusKind::Error, format!("{}: {message}", op.label()));
         }
         Msg::ReceiptWritten { corr, verb } => {
+            // The write landed on the store. Clear the badge now so the reader
+            // and the list agree immediately: the list clears on the next
+            // inbox fetch, an open thread would keep the badge forever.
+            note_receipt(&mut m, &corr, verb);
             m.set_status(StatusKind::Ok, format!("{verb}: {corr}"));
         }
 
@@ -181,8 +185,15 @@ pub fn tick(model: &Model, msg: Msg) -> (Model, Vec<Effect>) {
             _ => m.goto_cursor(if top { 0 } else { usize::MAX }),
         },
         Msg::OpenSelection => {
-            m.pane = Pane::Reader;
-            effects.extend(reader_refresh(&m));
+            // Only a tab with a reader may own the Reader pane. Installing it
+            // on the dashboard would leave a pane that tab cannot show, and
+            // Esc/h would quietly mean something else from then on.
+            if m.tab.has_reader() {
+                m.pane = Pane::Reader;
+                effects.extend(reader_refresh(&m));
+            } else {
+                m.set_status(StatusKind::Info, "nothing to open on this tab");
+            }
         }
         Msg::CloseReader => {
             m.pane = Pane::List;
@@ -267,6 +278,29 @@ pub fn tick(model: &Model, msg: Msg) -> (Model, Vec<Effect>) {
         }
     }
     (m, effects)
+}
+
+/// Record a landed receipt against the message it names, in the index and in
+/// the open thread (`ack` clears the ack badge, `read` clears the unread dot).
+fn note_receipt(m: &mut Model, message_id: &str, verb: &str) {
+    fn patch(row: &mut MailRow, message_id: &str, verb: &str) {
+        if row.id != message_id {
+            return;
+        }
+        if verb == "ack" {
+            row.acked = true;
+        } else {
+            row.read = true;
+        }
+    }
+    for row in m.mail.messages.iter_mut() {
+        patch(row, message_id, verb);
+    }
+    if let Some(open) = m.mail.open.as_mut() {
+        for row in open.messages.iter_mut() {
+            patch(row, message_id, verb);
+        }
+    }
 }
 
 /// Fold a whole log — the replay entry point the determinism test uses

@@ -531,10 +531,14 @@ fn mail_row(m: InboxMessage, acked: &std::collections::HashSet<String>) -> MailR
         read: m.read_ts_us.is_some(),
         at: micros_to_secs(m.created_ts_us),
         body,
+        state_known: true,
     }
 }
 
-/// Map one search hit.
+/// Map one search hit. The result carries no corr and no read stamp, so the
+/// read/ack state is UNKNOWN (`state_known: false`): the row shows no unread
+/// dot and no owed ack instead of inventing either. Joining the receipt store
+/// is impossible here — there is no corr on the row to join against.
 fn search_row(m: SearchMessage) -> MailRow {
     MailRow {
         id: m.id,
@@ -547,6 +551,7 @@ fn search_row(m: SearchMessage) -> MailRow {
         read: false,
         at: micros_to_secs(m.created_ts_us),
         body: m.body_md,
+        state_known: false,
     }
 }
 
@@ -689,6 +694,7 @@ pub mod fake {
                 ack_required: false,
                 acked: false,
                 read: false,
+                state_known: true,
                 at: 1_700_000_000,
                 body: None,
             }]),
@@ -703,6 +709,7 @@ pub mod fake {
                     ack_required: false,
                     acked: false,
                     read: true,
+                    state_known: true,
                     at: 1_700_000_000,
                     body: Some("body".into()),
                 }],

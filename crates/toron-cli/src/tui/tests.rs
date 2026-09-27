@@ -47,8 +47,19 @@ fn mail(id: &str, thread: &str, sender: &str, subject: &str, at: u64) -> MailRow
         ack_required: false,
         acked: false,
         read: true,
+        state_known: true,
         at,
         body: None,
+    }
+}
+
+/// A search hit: the store's projection carries no corr and no read stamp, so
+/// the row says its state is unknown rather than inventing an unread dot.
+fn search_hit(id: &str, thread: &str, sender: &str, subject: &str, at: u64) -> MailRow {
+    MailRow {
+        read: false,
+        state_known: false,
+        ..mail(id, thread, sender, subject, at)
     }
 }
 
@@ -355,8 +366,12 @@ fn local_filter_narrows_rows_and_esc_clears_search() {
         input: "alpha".into(),
         ..model()
     };
-    // Search results replace the folder list, and the filter applies to them.
-    assert!(m.mail_rows().is_empty(), "no search hit matches 'alpha'");
+    // Search results replace the folder list, and the local box must NOT
+    // re-filter them: the store matched fields the local predicate cannot see
+    // (the body), so a second pass hides hits while the title still counts
+    // them.
+    assert_eq!(m.mail_rows().len(), 1, "hits survive the search text");
+    assert_eq!(m.mail_rows()[0].key, "m3");
     let (cleared, _) = step(&m, Msg::CancelInsert);
     assert!(cleared.mail.search.is_none());
     assert!(cleared.input.is_empty());
@@ -661,8 +676,12 @@ fn model_derivations_feed_the_dashboard() {
 
 #[test]
 fn layout_breakpoints_are_pure() {
-    assert_eq!(layout_mode(79, 24), LayoutMode::TooSmall);
-    assert_eq!(layout_mode(120, 13), LayoutMode::TooSmall);
+    // 40x12 is the floor: a phone-width PTY is single-pane, not "too small".
+    assert_eq!(layout_mode(39, 24), LayoutMode::TooSmall);
+    assert_eq!(layout_mode(40, 11), LayoutMode::TooSmall);
+    assert_eq!(layout_mode(40, 12), LayoutMode::Stacked);
+    assert_eq!(layout_mode(45, 25), LayoutMode::Stacked);
+    assert_eq!(layout_mode(79, 40), LayoutMode::Stacked);
     assert_eq!(layout_mode(80, 24), LayoutMode::Dual);
     assert_eq!(layout_mode(107, 24), LayoutMode::Dual);
     assert_eq!(layout_mode(108, 24), LayoutMode::Tri);
@@ -960,4 +979,374 @@ async fn interpreter_slow_provider_still_lands() {
     let fake = FakeHost::with_reply(Reply::After(Duration::from_millis(10)));
     let msg = bounded(&fake, Effect::RefreshAgents, Duration::from_millis(500)).await;
     assert!(matches!(msg, Msg::AgentsLoaded(_)));
+}
+
+// ---------------------------------------------------------------------------
+// 6. the responsive ladder, rendered (not just selected)
+// ---------------------------------------------------------------------------
+
+/// Every mode by name. The match is exhaustive on purpose: a variant nothing
+/// can produce is dead code, and this is where that used to hide.
+fn mode_name(mode: LayoutMode) -> &'static str {
+    match mode {
+        LayoutMode::TooSmall => "too-small",
+        LayoutMode::Stacked => "single",
+        LayoutMode::Dual => "dual",
+        LayoutMode::Tri => "tri",
+    }
+}
+
+/// Every declared mode is reachable by some frame size.
+#[test]
+fn the_ladder_reaches_every_mode_it_declares() {
+    let mut seen = std::collections::BTreeSet::new();
+    for width in 20..=240u16 {
+        for height in 6..=40u16 {
+            seen.insert(mode_name(layout_mode(width, height)));
+        }
+    }
+    assert_eq!(
+        seen.into_iter().collect::<Vec<_>>(),
+        vec!["dual", "single", "too-small", "tri"],
+        "every declared mode is reachable (an uninhabited one is dead code)"
+    );
+}
+
+/// `split` tiles the frame edge to edge — no gap, no overlap — and the sidebar
+/// exists exactly when the tab asked for it.
+#[test]
+fn split_tiles_the_frame_and_honours_the_sidebar_flag() {
+    let area = ratatui::layout::Rect::new(0, 0, 80, 24);
+
+    let dual = super::view::split(area, LayoutMode::Dual, true);
+    let sidebar = dual
+        .sidebar
+        .expect("dual keeps the folder axis: a phone-width fix, not a resize");
+    assert_eq!(sidebar.x, area.x);
+    assert_eq!(sidebar.right(), dual.list.x, "no gap after the sidebar");
+    assert_eq!(dual.list.right(), dual.reader.x);
+    assert_eq!(dual.reader.right(), area.right());
+    assert!(dual.list.width >= 20 && dual.reader.width >= 20);
+
+    let tri = super::view::split(area, LayoutMode::Tri, true);
+    let sidebar = tri.sidebar.expect("tri keeps the sidebar");
+    assert_eq!(sidebar.right(), tri.list.x);
+    assert_eq!(tri.list.right(), tri.reader.x);
+    assert_eq!(tri.reader.right(), area.right());
+
+    // A tab with no sidebar of its own (Agents) gets the full width back.
+    let wide = super::view::split(area, LayoutMode::Tri, false);
+    assert!(wide.sidebar.is_none());
+    assert_eq!(wide.list.x, area.x);
+    assert_eq!(wide.reader.right(), area.right());
+
+    // One pane at a time: the list and the reader are the same rect.
+    let single = super::view::split(area, LayoutMode::Stacked, true);
+    assert!(single.sidebar.is_none());
+    assert_eq!(single.list, area);
+    assert_eq!(single.reader, area);
+}
+
+/// Render a frame to text with the test backend: no terminal, no TTY, and the
+/// only witness the responsive claims ever had.
+fn screen(model: &Model, width: u16, height: u16) -> String {
+    let backend = ratatui::backend::TestBackend::new(width, height);
+    let mut terminal = ratatui::Terminal::new(backend).expect("test backend");
+    terminal
+        .draw(|f| super::view::render(f, model))
+        .expect("draw");
+    let buffer = terminal.backend().buffer().clone();
+    let mut out = String::new();
+    for y in 0..buffer.area().height {
+        for x in 0..buffer.area().width {
+            match buffer.cell((x, y)) {
+                Some(cell) => out.push_str(cell.symbol()),
+                None => out.push(' '),
+            }
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// A phone-shaped frame (45x24, what an iPhone SSH client reports) draws ONE
+/// pane — the focused one — and `h` still reaches the others. Dual keeps the
+/// folder axis beside the list; below the floor it says so.
+#[test]
+fn phone_width_draws_one_pane_and_dual_keeps_the_folder_axis() {
+    let m = Model {
+        mail: super::model::MailState {
+            messages: vec![mail("m1", "t1", "bee", "alpha report", 10)],
+            loaded: true,
+            ..Default::default()
+        },
+        ..model()
+    };
+
+    let phone = screen(&m, 45, 24);
+    assert!(phone.contains("Inbox"), "the list pane is drawn:\n{phone}");
+    assert!(
+        !phone.contains("folders"),
+        "the panes behind it are not:\n{phone}"
+    );
+    let folders = screen(
+        &Model {
+            pane: Pane::Sidebar,
+            ..m.clone()
+        },
+        45,
+        24,
+    );
+    assert!(folders.contains("folders"), "h stays reachable:\n{folders}");
+
+    let dual = screen(&m, 90, 30);
+    assert!(dual.contains("folders"), "dual keeps the folders:\n{dual}");
+    assert!(dual.contains("reader"), "and the reader column:\n{dual}");
+
+    let tiny = screen(&m, 36, 24);
+    assert!(tiny.contains("too small"), "the gate still speaks:\n{tiny}");
+}
+
+/// At 45 cols the row is one line and the subject survives (a 10-col sender
+/// pad plus a stamp would leave the subject nothing).
+#[test]
+fn phone_rows_keep_the_subject_readable() {
+    let m = Model {
+        mail: super::model::MailState {
+            messages: vec![mail(
+                "m1",
+                "t1",
+                "bee",
+                "a subject long enough to be cut off",
+                10,
+            )],
+            loaded: true,
+            ..Default::default()
+        },
+        ..model()
+    };
+    let phone = screen(&m, 45, 24);
+    let row = phone
+        .lines()
+        .find(|l| l.contains("bee"))
+        .expect("the message row is on screen");
+    assert!(row.contains("a subject"), "the subject survives: {row:?}");
+}
+
+/// The sidebar cursor is the folder's index, clamped against the FOLDER count
+/// — not the message count, which highlighted the wrong row whenever the index
+/// held fewer messages than there are folders.
+#[test]
+fn folder_highlight_tracks_the_folder_not_the_message_count() {
+    let m = Model {
+        mail: super::model::MailState {
+            folder: Folder::Important,
+            messages: vec![
+                mail("m1", "t1", "bee", "one", 10),
+                mail("m2", "t2", "cee", "two", 20),
+            ],
+            loaded: true,
+            ..Default::default()
+        },
+        ..model()
+    };
+    assert_eq!(
+        super::view::mail::folder_state(&m).selected(),
+        Some(Folder::ALL.len() - 1),
+        "Important is the last folder whatever the index holds"
+    );
+
+    // An empty index still highlights the folder the operator chose.
+    let empty = Model {
+        mail: super::model::MailState {
+            folder: Folder::Unread,
+            loaded: true,
+            ..Default::default()
+        },
+        ..model()
+    };
+    assert_eq!(super::view::mail::folder_state(&empty).selected(), Some(1));
+}
+
+/// A search hit carries no receipt and no read stamp, so it must not claim
+/// either — the unread dot and the ack badge would both be invented.
+#[test]
+fn unknown_state_rows_do_not_claim_unread_or_acked() {
+    let m = Model {
+        mail: super::model::MailState {
+            search: Some(vec![MailRow {
+                ack_required: true,
+                ..search_hit("m9", "t9", "zed", "hit", 99)
+            }]),
+            loaded: true,
+            ..Default::default()
+        },
+        ..model()
+    };
+    let rows = m.mail_rows();
+    assert_eq!(rows.len(), 1);
+    assert!(!rows[0].unread, "a hit is not claimed unread");
+    assert!(
+        !rows[0].ack_pending,
+        "nor ack-owing: the hit has no receipt"
+    );
+}
+
+/// Typing a query and pressing Enter: the store's hits replace the list, and
+/// the local box must not narrow them again.
+#[test]
+fn server_hits_survive_a_local_pass_that_cannot_see_the_body() {
+    let typed = Model {
+        mode: Mode::Insert,
+        input: "deadline".into(),
+        ..model()
+    };
+    let (asking, effects) = step(&typed, Msg::SubmitInput);
+    assert_eq!(
+        effects,
+        vec![Effect::Search {
+            query: "deadline".into()
+        }]
+    );
+    let (hits, _) = step(
+        &asking,
+        Msg::SearchLoaded(vec![search_hit("m5", "t5", "dee", "re: plan", 30)]),
+    );
+    assert_eq!(
+        hits.mail_rows().len(),
+        1,
+        "the hit matched in the body the local pass never sees"
+    );
+}
+
+/// Enter on a tab with no reader must not install a pane that tab cannot show,
+/// or Esc/h would quietly mean something else for the rest of the session.
+#[test]
+fn open_selection_on_a_readerless_tab_keeps_focus_and_says_so() {
+    let dashboard = Model {
+        tab: Tab::Dashboard,
+        ..model()
+    };
+    let (after, effects) = step(&dashboard, Msg::OpenSelection);
+    assert_eq!(after.pane, Pane::List, "no illegal Reader focus");
+    assert!(effects.is_empty(), "nothing to fetch");
+    assert!(
+        after.status.text.contains("nothing to open"),
+        "got {:?}",
+        after.status.text
+    );
+}
+
+/// Acking from the reader clears the badge there too: the list agrees on the
+/// next inbox fetch, the reader would never.
+#[test]
+fn ack_from_the_reader_clears_the_badge() {
+    let open = MailRow {
+        ack_required: true,
+        acked: false,
+        read: false,
+        ..mail("m1", "t1", "bee", "ack me", 10)
+    };
+    let m = Model {
+        pane: Pane::Reader,
+        mail: super::model::MailState {
+            messages: vec![open.clone()],
+            loaded: true,
+            open: Some(super::model::OpenThread {
+                thread_id: "t1".into(),
+                subject: "ack me".into(),
+                messages: vec![open],
+            }),
+            ..Default::default()
+        },
+        ..model()
+    };
+    assert!(
+        m.mail.open.as_ref().expect("open").messages[0].ack_pending(),
+        "the fixture starts owing an ack"
+    );
+    let (after, _) = step(
+        &m,
+        Msg::ReceiptWritten {
+            corr: "m1".into(),
+            verb: "ack",
+        },
+    );
+    assert!(
+        !after.mail.open.as_ref().expect("open").messages[0].ack_pending(),
+        "the reader agrees with the list"
+    );
+    assert!(!after.mail.messages[0].ack_pending());
+}
+
+/// The Agents tab has no sidebar, so it must not offer one as a focus target.
+#[test]
+fn agents_tab_has_no_sidebar_pane() {
+    assert_eq!(Pane::order(Tab::Agents), &[Pane::List, Pane::Reader]);
+    let m = Model {
+        tab: Tab::Agents,
+        ..model()
+    };
+    let (left, _) = step(&m, Msg::FocusPane(-1));
+    assert_eq!(left.pane, Pane::List, "h never lands on an invisible pane");
+    let (right, _) = step(&left, Msg::FocusPane(1));
+    assert_eq!(right.pane, Pane::Reader);
+}
+
+/// The filter matches the task an agent is running, not just its name (the doc
+/// said so long before the code did).
+#[test]
+fn agent_filter_matches_the_task_too() {
+    let m = Model {
+        tab: Tab::Agents,
+        input: "review".into(),
+        agents: super::model::AgentsState {
+            rows: vec![
+                AgentRow {
+                    name: "aye".into(),
+                    task: Some("review the patch".into()),
+                    ..Default::default()
+                },
+                AgentRow {
+                    name: "bee".into(),
+                    task: Some("write the docs".into()),
+                    ..Default::default()
+                },
+            ],
+            loaded: true,
+            ..Default::default()
+        },
+        ..model()
+    };
+    let rows = m.agents.visible_rows(&m.input);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].name, "aye");
+}
+
+/// A task that panics inside the host never answers, so a mount count that is
+/// only ever incremented would sit above zero forever and refuse every later
+/// refresh — a frozen console with no typed failure. The count is derived from
+/// live handles instead.
+#[tokio::test]
+async fn a_panicked_effect_leaves_the_refresh_gate_open() {
+    let mut handles: Vec<tokio::task::JoinHandle<()>> = vec![
+        tokio::spawn(async { panic!("host exploded") }),
+        tokio::spawn(async { std::future::pending::<()>().await }),
+    ];
+    while !handles[0].is_finished() {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        super::live_handles(&mut handles),
+        1,
+        "only the hung task is still owed an answer"
+    );
+    // Cancellation is cooperative, so the handle only reports finished once
+    // the runtime has polled it — which is exactly what the derived count
+    // waits for (an accumulator would have to guess).
+    handles[0].abort();
+    while !handles[0].is_finished() {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(super::live_handles(&mut handles), 0);
 }
