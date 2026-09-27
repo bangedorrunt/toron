@@ -56,6 +56,7 @@ impl WorkflowLifecycle {
     }
 
     /// Register (or replace) a live executable definition.
+    #[allow(clippy::significant_drop_tightening)]
     pub fn register(&self, id: impl Into<String>) -> LifecycleEffect {
         let id = id.into();
         let mut g = self.inner.lock().expect("lifecycle lock");

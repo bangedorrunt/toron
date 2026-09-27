@@ -168,7 +168,8 @@ impl DispatchPool {
             .unwrap_or(0);
         let claimed_generation = self.generation_of(agent);
         // Option API drops effects — live hosts must not use this path.
-        self.try_acquire_fenced(agent, now_ms, claimed_generation).ok()
+        self.try_acquire_fenced(agent, now_ms, claimed_generation)
+            .ok()
     }
 
     /// Semaphore + one-in-flight slot acquire (no busy-owner holder).
@@ -257,6 +258,11 @@ impl DispatchPool {
     /// global/agent semaphore `try_acquire` then failed; the holder is released
     /// so holders and `in_flight` stay in lockstep. No journalable busy-owner
     /// effect remains — callers treat empty as "retry later / cap contention".
+    // clippy::option_if_let_else: the two arms are a 20-line lock-and-mutate
+    // rollback and a permit fixup. Rewriting them as map_or_else closures makes
+    // the rollback harder to read for no semantic gain, and the nursery lint
+    // fires on body size it cannot judge. Allowed with the reason.
+    #[allow(clippy::option_if_let_else)]
     pub fn try_acquire_fenced(
         &self,
         agent: &str,
