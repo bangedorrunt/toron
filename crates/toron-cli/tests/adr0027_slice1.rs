@@ -39,6 +39,11 @@ fn run_with_data_dir(args: &[&str], data_dir: &std::path::Path) -> std::process:
     let mut cmd = toron();
     cmd.env("TORON_MCP_DATA_DIR", data_dir)
         .env("TORON_DATA_DIR", data_dir)
+        // An ambient TORON_MCP_URL outranks the data-dir pin
+        // (`mailbox_source::decide_source` checks the daemon URL first), so
+        // the CLI would hit a live daemon instead of this test's store and
+        // reject the locally registered recipient (bd-5z0l).
+        .env_remove("TORON_MCP_URL")
         .args(args)
         .output()
         .expect("run toron with data dir")

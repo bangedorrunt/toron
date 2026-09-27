@@ -37,7 +37,18 @@ fn shared_data_dir() -> std::path::PathBuf {
 }
 
 fn toron() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_toron"))
+    let mut c = Command::new(env!("CARGO_BIN_EXE_toron"));
+    // These tests pin their own mailbox with TORON_MCP_DATA_DIR. An ambient
+    // TORON_MCP_URL outranks that pin — `mailbox_source::decide_source`
+    // checks the daemon URL first and returns before reading the data dir —
+    // so the shelled-out CLI would talk to a developer's live daemon and
+    // never see the keys registered into the temp dir, failing as
+    // "unknown recipient" / "has no local key". Drop it by default so the
+    // suite is hermetic on any machine with the daemon running. Tests that
+    // deliberately exercise the daemon set it per-command after this, and
+    // that later `env` wins (bd-5z0l).
+    c.env_remove("TORON_MCP_URL");
+    c
 }
 
 fn run(args: &[&str]) -> Output {
@@ -2915,6 +2926,11 @@ fn guard_commit_msg_blocks_foreign_bead_tokens() {
         c.current_dir(&repo)
             .env("TORON_MCP_DATA_DIR", &data_dir)
             .env("TORON_AGENT", "HunkAgent")
+            // The installed hooks shell out to `toron`, and an ambient
+            // TORON_MCP_URL would send them to a developer's live daemon
+            // instead of this fixture's store, so the guard would judge the
+            // wrong lease table (bd-5z0l).
+            .env_remove("TORON_MCP_URL")
             .env(
                 "PATH",
                 std::env::join_paths(
@@ -2943,6 +2959,7 @@ fn guard_commit_msg_blocks_foreign_bead_tokens() {
     // bead-hunk check may block.
     let mut acq = Command::new(env!("CARGO_BIN_EXE_toron"));
     acq.env("TORON_MCP_DATA_DIR", &data_dir)
+        .env_remove("TORON_MCP_URL")
         .args([
             "reserve",
             "acquire",
@@ -2960,6 +2977,7 @@ fn guard_commit_msg_blocks_foreign_bead_tokens() {
     // Install BOTH guard hooks into the temp repo.
     let mut inst = Command::new(env!("CARGO_BIN_EXE_toron"));
     inst.env("TORON_MCP_DATA_DIR", &data_dir)
+        .env_remove("TORON_MCP_URL")
         .args(["guard", "install", "--repo"])
         .arg(&repo)
         .args(["--project", "demo"])

@@ -84,6 +84,11 @@ fn run(data_dir: &Path, args: &[&str]) -> Output {
         .arg("--json")
         .arg("--no-input")
         .env("TORON_MCP_DATA_DIR", data_dir)
+        // An ambient TORON_MCP_URL outranks the data-dir pin
+        // (`mailbox_source::decide_source` checks the daemon URL first),
+        // so the CLI would hit a live daemon instead of this scenario's
+        // store and reject the locally registered recipient (bd-5z0l).
+        .env_remove("TORON_MCP_URL")
         .env("TORON_WAKE_SOCK", &absent)
         .output()
         .expect("spawn toron")
