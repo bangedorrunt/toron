@@ -72,8 +72,7 @@ fn noop_async() -> AsyncEffectRunner {
 /// the caller keeps the server alive for the test's duration.
 async fn remote_engine(
     async_fx: Option<AsyncEffectRunner>,
-) -> Option<(std::process::Child, WorkflowEngine)> {
-    use std::process::{Command, Stdio};
+) -> Option<(toron_core::testkit::ChildGuard, WorkflowEngine)> {
     let dir = std::env::temp_dir().join(format!("wf-rsrv-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
     let port = {
@@ -84,21 +83,12 @@ async fn remote_engine(
             .port()
     };
     let url = format!("http://127.0.0.1:{port}");
-    let server = Command::new("resonate")
-        .args([
-            "serve",
-            "--storage-type",
-            "sqlite",
-            "--server-port",
-            &port.to_string(),
-            "--server-host",
-            "127.0.0.1",
-        ])
-        .current_dir(&dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
+    // bd-6h9l: killed and reaped at scope end, so a failing assertion or a
+    // cancelled test binary cannot orphan the server. `.ok().flatten()?` keeps
+    // the original soft-skip on a spawn failure.
+    let server = toron_core::testkit::ChildGuard::resonate_serve(port, &dir)
+        .ok()
+        .flatten()?;
     for _ in 0..100 {
         if std::net::TcpStream::connect_timeout(
             &format!("127.0.0.1:{port}").parse().expect("addr"),
@@ -118,8 +108,7 @@ async fn remote_engine(
 /// Like [`remote_engine`] with a `ProfileResolver` for the `spawn` action.
 async fn remote_engine_with(
     profile_resolver: ProfileResolver,
-) -> Option<(std::process::Child, WorkflowEngine)> {
-    use std::process::{Command, Stdio};
+) -> Option<(toron_core::testkit::ChildGuard, WorkflowEngine)> {
     let dir = std::env::temp_dir().join(format!("wf-rsrv-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
     let port = {
@@ -130,21 +119,12 @@ async fn remote_engine_with(
             .port()
     };
     let url = format!("http://127.0.0.1:{port}");
-    let server = Command::new("resonate")
-        .args([
-            "serve",
-            "--storage-type",
-            "sqlite",
-            "--server-port",
-            &port.to_string(),
-            "--server-host",
-            "127.0.0.1",
-        ])
-        .current_dir(&dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
+    // bd-6h9l: killed and reaped at scope end, so a failing assertion or a
+    // cancelled test binary cannot orphan the server. `.ok().flatten()?` keeps
+    // the original soft-skip on a spawn failure.
+    let server = toron_core::testkit::ChildGuard::resonate_serve(port, &dir)
+        .ok()
+        .flatten()?;
     for _ in 0..100 {
         if std::net::TcpStream::connect_timeout(
             &format!("127.0.0.1:{port}").parse().expect("addr"),
@@ -1011,8 +991,7 @@ async fn retry_retries_a_fail_run_leaf() {
             Ok(serde_json::json!({ "ok": true, "n": n + 1 }))
         }
     });
-    let engine =
-        WorkflowEngine::local_with_async_effect_runner(Some(runner)).expect("engine");
+    let engine = WorkflowEngine::local_with_async_effect_runner(Some(runner)).expect("engine");
     let wf = parse_workflow(
         r##"
 name: retry-fail-run
@@ -1057,8 +1036,7 @@ async fn loop_stops_on_until_and_exhaustion_fails() {
         let n = attempts_clone.fetch_add(1, Ordering::SeqCst);
         Ok(serde_json::json!({ "ok": n >= 1 }))
     });
-    let engine =
-        WorkflowEngine::local_with_async_effect_runner(Some(runner)).expect("engine");
+    let engine = WorkflowEngine::local_with_async_effect_runner(Some(runner)).expect("engine");
     let wf = parse_workflow(
         r##"
 name: loop-until
@@ -1089,7 +1067,11 @@ steps:
         )
         .await
         .expect("run");
-    assert_eq!(attempts.load(Ordering::SeqCst), 2, "stopped on the second pass");
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        2,
+        "stopped on the second pass"
+    );
     assert_eq!(output["cycle"]["stopped"], "until", "{output}");
 
     let attempts = Arc::new(AtomicU32::new(0));
@@ -1098,8 +1080,7 @@ steps:
         attempts_clone.fetch_add(1, Ordering::SeqCst);
         Ok(serde_json::json!({ "ok": false, "error": "still red" }))
     });
-    let engine =
-        WorkflowEngine::local_with_async_effect_runner(Some(runner)).expect("engine");
+    let engine = WorkflowEngine::local_with_async_effect_runner(Some(runner)).expect("engine");
     let wf = parse_workflow(
         r##"
 name: loop-exhaust
@@ -1131,7 +1112,10 @@ steps:
         )
         .await
         .expect("run returns the failure value");
-    assert_eq!(output["status"], "failed", "exhaustion fails the run: {output}");
+    assert_eq!(
+        output["status"], "failed",
+        "exhaustion fails the run: {output}"
+    );
     assert_eq!(attempts.load(Ordering::SeqCst), 2);
 }
 
@@ -1183,7 +1167,11 @@ steps:
         )
         .await
         .expect("run");
-    assert_eq!(attempts.load(Ordering::SeqCst), 2, "stops when improved: {output}");
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        2,
+        "stops when improved: {output}"
+    );
     assert_eq!(output["cycle"]["stopped"], "until", "{output}");
     assert_eq!(output["cycle"]["ok"], true, "{output}");
 
@@ -1225,7 +1213,11 @@ steps:
         )
         .await
         .expect("run");
-    assert_eq!(attempts.load(Ordering::SeqCst), 2, "missing improved spends the cap: {output}");
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        2,
+        "missing improved spends the cap: {output}"
+    );
     assert_eq!(output["status"], "failed", "{output}");
     let err = output["error"].as_str().unwrap_or("");
     assert!(

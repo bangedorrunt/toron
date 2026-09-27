@@ -140,8 +140,7 @@ async fn sc23_cron_escalate_at_threshold() {
         "escalate DM carries the failure context: {escalate:?}"
     );
 
-    let _ = server.kill();
-    let _ = server.wait();
+    server.kill();
     let _ = std::fs::remove_dir_all(&dir);
 }
 

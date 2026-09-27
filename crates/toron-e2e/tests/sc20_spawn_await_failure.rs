@@ -12,7 +12,8 @@
 //!
 //! Run: `cargo test -p toron-e2e --features p5 --test sc20_spawn_await_failure`
 
-use std::process::{Child, Command, Stdio};
+use toron_core::testkit::ChildGuard;
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -51,22 +52,15 @@ fn free_port() -> u16 {
         .port()
 }
 
-fn start_resonate_server(port: u16, dir: &std::path::Path) -> Option<Child> {
-    Command::new("resonate")
-        .args([
-            "serve",
-            "--storage-type",
-            "sqlite",
-            "--server-port",
-            &port.to_string(),
-            "--server-host",
-            "127.0.0.1",
-        ])
-        .current_dir(dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()
+fn start_resonate_server(port: u16, dir: &std::path::Path) -> Option<ChildGuard> {
+    let server =
+        toron_core::testkit::ChildGuard::resonate_serve(port, dir).expect("spawn resonate serve");
+    if server.is_none() {
+        // GS-018: no `resonate` binary on this runner (herdr/resonate stack
+        // absent) — an environmental skip, not a product failure.
+        eprintln!("SKIP: no `resonate` binary (needs herdr/resonate stack)");
+    }
+    server
 }
 
 async fn wait_ready(url: &str) {
@@ -182,7 +176,6 @@ steps:
         "the job's error surfaces in the step failure: {err}"
     );
 
-    let _ = server.kill();
-    let _ = server.wait();
+    server.kill();
     let _ = std::fs::remove_dir_all(&dir);
 }

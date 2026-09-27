@@ -4154,21 +4154,11 @@ steps:
             .expect("addr")
             .port();
         let url = format!("http://127.0.0.1:{port}");
-        let mut server = std::process::Command::new("resonate")
-            .args([
-                "serve",
-                "--storage-type",
-                "sqlite",
-                "--server-port",
-                &port.to_string(),
-                "--server-host",
-                "127.0.0.1",
-            ])
-            .current_dir(&dir)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .expect("resonate serve");
+        // bd-6h9l: killed and reaped at scope end, so a failing gate or a
+        // cancelled binary cannot orphan the server.
+        let mut server = toron_core::testkit::ChildGuard::resonate_serve(port, &dir)
+            .expect("resonate serve")
+            .expect("resonate binary present");
         // Wait for the server port (up to ~10s).
         let mut ready = false;
         for _ in 0..100 {
@@ -4179,8 +4169,7 @@ steps:
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
         if !ready {
-            let _ = server.kill();
-            let _ = server.wait();
+            server.kill();
             eprintln!("SKIP: resonate serve did not come up");
             return;
         }
@@ -4254,8 +4243,7 @@ steps:
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
         assert!(done, "run resumes to Succeeded after validated resolution");
-        let _ = server.kill();
-        let _ = server.wait();
+        server.kill();
         let _ = std::fs::remove_file(&db);
     }
 

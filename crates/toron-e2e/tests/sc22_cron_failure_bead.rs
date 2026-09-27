@@ -171,7 +171,6 @@ async fn sc22_cron_failure_bead_records_triageable_bundle() {
         "on_failure: bead is the recorded action"
     );
 
-    let _ = server.kill();
-    let _ = server.wait();
+    server.kill();
     let _ = std::fs::remove_dir_all(&dir);
 }
