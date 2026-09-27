@@ -92,6 +92,12 @@ pub fn lint_file(yaml: &str) -> Result<LintReport, String> {
     lint_yaml(yaml)
 }
 
+pub use delivery_cursor::{
+    DeliveryCursor, DeliveryCursorStore, DeliveryEffect, ReservationGuard,
+    agent_key_is_not_delivery_proof,
+};
+pub use lifecycle::{LifecycleEffect, WorkflowLifecycle, WorkflowRecord};
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -106,9 +112,3 @@ mod tests {
         );
     }
 }
-
-pub use delivery_cursor::{
-    DeliveryCursor, DeliveryCursorStore, DeliveryEffect, ReservationGuard,
-    agent_key_is_not_delivery_proof,
-};
-pub use lifecycle::{LifecycleEffect, WorkflowLifecycle, WorkflowRecord};
