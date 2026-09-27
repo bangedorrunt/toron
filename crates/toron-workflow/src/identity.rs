@@ -72,6 +72,32 @@ pub fn iteration_key(parent_digest: &str, index: usize) -> String {
     sha256_hex(&[parent_digest, &index.to_string()])
 }
 
+/// bd-0s0y: the fan-out copy ordinal carried by a leaf's `iteration_key`.
+///
+/// `run_parallel` is the ONLY producer of the `p{i}` form
+/// (`engine/control_flow.rs`, the `iteration_key: Some(format!("p{i}"))` on
+/// `ParallelCopyInput`). The [`iteration_key`] fn above mints a sha256 digest
+/// for EFFECT keys and never lands in `RunContext.iteration_key`, so the two
+/// can never be confused — but that also means nothing downstream could read
+/// the copy index back out. A `parallel`/`each` fan-out over a role therefore
+/// resolved every copy to the SAME agent (`resolve_pane_entry` has no
+/// ordinal), and the busy-owner fence — one in-flight dispatch per agent —
+/// refused copies 2..N, killing the run. `ce-brainstorm`'s `diverge` is
+/// `over: "3"` over `@oracle`, so this is the first step of `goal`.
+///
+/// Strict on purpose: only `p<digits>` parses. A digest, a bare `p`, a sign,
+/// whitespace, or an index too large for `usize` is `None`, which callers read
+/// as "no ordinal" and resolve ordinal-blind (the pre-existing behavior, and
+/// the right default for a step that is not a fan-out copy). A lenient parse
+/// would let an unrelated key silently choose a pane.
+pub fn copy_ordinal(iteration_key: Option<&str>) -> Option<usize> {
+    let digits = iteration_key?.strip_prefix('p')?;
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
+}
+
 /// Field names whose string values never enter a digest or evidence
 /// projection (matched case-insensitively at any depth).
 pub const SECRET_FIELD_NAMES: &[&str] = &[
