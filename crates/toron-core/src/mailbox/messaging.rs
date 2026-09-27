@@ -1585,6 +1585,20 @@ impl Mailbox {
                             })?,
                     )
                 };
+                // bd-xroute: a NAME is project-scoped, so the same name can be
+                // a DIFFERENT key in another project. Warn BEFORE the send, not
+                // after the message is unreadable: proven live, `--to Buffy`
+                // from the flywheel project encrypted to the flywheel key while
+                // the target pane reads the toron.dev key, and the send reported
+                // `ok`. Invisible, not undelivered.
+                let binds = nident::name_across_projects(profiles.iter(), &row_name);
+                if let Some(w) = nident::ambiguous_name_warning(
+                    &row_name,
+                    &args.project_slug,
+                    &binds,
+                ) {
+                    eprintln!("{w}");
+                }
                 out.push(ResolvedRecipient {
                     name: row_name,
                     npub,
