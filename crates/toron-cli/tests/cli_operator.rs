@@ -18,7 +18,16 @@ use std::sync::{OnceLock, PoisonError};
 use serde_json::Value;
 
 fn toron() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_toron"))
+    let mut c = Command::new(env!("CARGO_BIN_EXE_toron"));
+    // These tests pin their own mailbox with TORON_MCP_DATA_DIR. An ambient
+    // TORON_MCP_URL outranks that pin — `mailbox_source::decide_source`
+    // checks the daemon URL first and returns before reading the data dir —
+    // so the shelled-out CLI would talk to a developer's live daemon and
+    // never see the keys registered into the temp dir, failing as
+    // "unknown agent name" / "has no local key". Drop it by default so the
+    // suite is hermetic on any machine with the daemon running (bd-5z0l).
+    c.env_remove("TORON_MCP_URL");
+    c
 }
 
 /// Shared per-test-run data dir so the shelled-out `toron` subprocess and the
