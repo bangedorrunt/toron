@@ -29,8 +29,14 @@ fn shared_data_dir() -> std::path::PathBuf {
     .clone()
 }
 
+/// A `toron` subprocess pinned to this test run's data dir. An ambient
+/// `TORON_MCP_URL` would otherwise select the developer's daemon — and with
+/// both selectors set the CLI now refuses outright, so the pin is the only
+/// honest environment for these cross-process assertions.
 fn toron() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_toron"))
+    let mut c = Command::new(env!("CARGO_BIN_EXE_toron"));
+    c.env_remove("TORON_MCP_URL");
+    c
 }
 
 fn run(args: &[&str]) -> Output {

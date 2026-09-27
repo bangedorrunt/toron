@@ -126,8 +126,8 @@
       "name": "bench"
     },
     {
-      "args": "--refresh-ms <REFRESH_MS>",
-      "description": "Interactive operator dashboard (ratatui; standalone-daemon TUI)",
+      "args": "--refresh-ms <REFRESH_MS>, --project <PROJECT>, --as <AGENT>, --tab <TAB>, --folder <FOLDER>, --all",
+      "description": "Operator console (ratatui): mail, channels, agents, dashboard, settings — live against the project's one local store",
       "name": "tui"
     },
     {
@@ -146,7 +146,7 @@
       "name": "role"
     }
   ],
-  "generated_at": "2026-09-22T07:19:36Z",
+  "generated_at": "2026-09-27T13:48:18Z",
   "resources": [
     {
       "description": "List projects known to toron.",

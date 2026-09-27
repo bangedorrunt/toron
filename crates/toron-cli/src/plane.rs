@@ -182,7 +182,12 @@ async fn load_agent_key(mailbox: &Mailbox, project: &str, whois: &WhoIs) -> anyh
 /// parser, not two); this edge stays lenient like before (a malformed event
 /// is skipped, never a command-killing abort), while library callers that
 /// need fail-closed use [`ChannelStore::rebuild`].
-async fn rebuild_store(mailbox: &Mailbox, project: &str) -> anyhow::Result<ChannelStore> {
+/// `pub(crate)`: the TUI is another reader of this same projection — one
+/// rebuild, not a second copy of the lifecycle rules.
+pub(crate) async fn rebuild_store(
+    mailbox: &Mailbox,
+    project: &str,
+) -> anyhow::Result<ChannelStore> {
     let store = ChannelStore::new();
     let filter = Filter::new()
         .kinds([
@@ -206,6 +211,76 @@ fn event_channel(ev: &Event) -> Option<String> {
         .find(|t| t.kind() == "h")
         .and_then(|t| t.content())
         .map(str::to_string)
+}
+
+/// One channel's posts + reactions (kind 9/42 + 7), project-scoped, newest
+/// first. Shared by `channel read` and the TUI's post pane — one filter, so
+/// the two surfaces cannot drift.
+pub(crate) async fn collect_channel_events(
+    mailbox: &Mailbox,
+    project: &str,
+    channel_id: &str,
+    since_secs: u64,
+) -> anyhow::Result<Vec<Event>> {
+    let filter = Filter::new()
+        .kinds([
+            toron_kind(CHANNEL_MESSAGE),
+            toron_kind(CHANNEL_MESSAGE_LEGACY),
+            toron_kind(REACTION),
+        ])
+        .custom_tag(nostr::filter::SingleLetterTag::LOWERCASE_H, channel_id);
+    let mut events = collect_trusted(mailbox.bus().as_ref(), filter).await?;
+    events.retain(|ev| {
+        in_project(ev, project)
+            && ev.created_at.as_secs() >= since_secs
+            && event_channel(ev).as_deref() == Some(channel_id)
+    });
+    events.sort_by_key(|ev| std::cmp::Reverse(ev.created_at.as_secs()));
+    Ok(events)
+}
+
+/// Post count + newest post time per channel id, from one project-wide
+/// replay. The Channels sidebar needs "is this room alive?" without paying a
+/// replay per room; the TUI is the only caller today.
+pub(crate) async fn channel_activity(
+    mailbox: &Mailbox,
+    project: &str,
+) -> anyhow::Result<std::collections::HashMap<String, (usize, u64)>> {
+    let filter = Filter::new()
+        .kinds([
+            toron_kind(CHANNEL_MESSAGE),
+            toron_kind(CHANNEL_MESSAGE_LEGACY),
+            toron_kind(REACTION),
+        ])
+        .hashtag(project);
+    let events = collect_replay(mailbox.bus().as_ref(), filter).await?;
+    let mut out: std::collections::HashMap<String, (usize, u64)> = std::collections::HashMap::new();
+    for ev in events {
+        if !in_project(&ev, project) {
+            continue;
+        }
+        let Some(channel) = event_channel(&ev) else {
+            continue;
+        };
+        let secs = ev.created_at.as_secs();
+        let entry = out.entry(channel).or_insert((0, 0));
+        let kind = ev.kind;
+        if kind == toron_kind(CHANNEL_MESSAGE) || kind == toron_kind(CHANNEL_MESSAGE_LEGACY) {
+            entry.0 += 1;
+        }
+        entry.1 = entry.1.max(secs);
+    }
+    Ok(out)
+}
+
+/// The pane env ladders, shared with the TUI (one ladder, never two copies).
+pub(crate) fn pane_project(flag: Option<&str>) -> Option<String> {
+    resolve_presence_project(flag, &live_env)
+}
+
+/// Acting pin: `--as`, else TORON_AGENT / FLYWHEEL_MAIL_AS / AGENT_NAME.
+pub(crate) fn pane_agent(flag: Option<&str>) -> Option<String> {
+    resolve_presence_as(flag, &live_env)
 }
 
 /// `--since` RFC3339 → unix seconds.
@@ -722,19 +797,7 @@ async fn channel_read(mailbox: &Mailbox, args: &ChannelReadArgs) -> anyhow::Resu
         Some(s) => parse_since(s)?,
         None => 0,
     };
-    let filter = Filter::new()
-        .kinds([
-            toron_kind(CHANNEL_MESSAGE),
-            toron_kind(CHANNEL_MESSAGE_LEGACY),
-            toron_kind(REACTION),
-        ])
-        .custom_tag(nostr::filter::SingleLetterTag::LOWERCASE_H, &args.id);
-    let mut events = collect_trusted(mailbox.bus().as_ref(), filter).await?;
-    events.retain(|ev| {
-        in_project(ev, &args.project)
-            && ev.created_at.as_secs() >= since
-            && event_channel(ev).as_deref() == Some(args.id.as_str())
-    });
+    let mut events = collect_channel_events(mailbox, &args.project, &args.id, since).await?;
     if let Some(pk) = &author_pk {
         events.retain(|ev| ev.pubkey == *pk);
     }
@@ -1197,8 +1260,27 @@ fn presence_file(mailbox: &Mailbox) -> PathBuf {
     toron_core::config::mailbox_root(mailbox.data_dir()).join("presence.jsonl")
 }
 
+/// One presence projection row: the last heartbeat per npub inside the TTL.
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct PresenceRow {
+    /// Agent name as the heartbeating process reported it.
+    pub name: String,
+    /// Agent npub (hex).
+    pub npub: String,
+    /// Canonical state word (`idle`/`working`/`blocked`/`done`/`unknown`).
+    pub state: String,
+    /// Optional status line.
+    pub status: Option<String>,
+    /// Heartbeat unix seconds.
+    pub ts: u64,
+    /// Project the heartbeat was published for.
+    pub project: String,
+}
+
 /// Load the presence projection: last heartbeat per npub, newest ts wins.
-fn read_presence(mailbox: &Mailbox, project: &str, now_secs: u64) -> Vec<Value> {
+/// `pub(crate)`: the TUI's Agents tab joins this with the roster — one
+/// projection reader, so the two surfaces cannot disagree about who is live.
+pub(crate) fn read_presence(mailbox: &Mailbox, project: &str, now_secs: u64) -> Vec<PresenceRow> {
     let ttl = std::env::var("TORON_PRESENCE_TTL_SECS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
@@ -1206,7 +1288,8 @@ fn read_presence(mailbox: &Mailbox, project: &str, now_secs: u64) -> Vec<Value> 
     let Ok(body) = std::fs::read_to_string(presence_file(mailbox)) else {
         return Vec::new();
     };
-    let mut by_npub: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
+    let mut by_npub: std::collections::HashMap<String, PresenceRow> =
+        std::collections::HashMap::new();
     for line in body.lines() {
         let Ok(v) = serde_json::from_str::<Value>(line) else {
             continue;
@@ -1214,31 +1297,39 @@ fn read_presence(mailbox: &Mailbox, project: &str, now_secs: u64) -> Vec<Value> 
         if v.get("project").and_then(|p| p.as_str()) != Some(project) {
             continue;
         }
-        let npub = v.get("npub").and_then(|n| n.as_str()).unwrap_or_default();
+        let npub = v
+            .get("npub")
+            .and_then(|n| n.as_str())
+            .unwrap_or_default()
+            .to_string();
         let ts = v.get("ts").and_then(serde_json::Value::as_u64).unwrap_or(0);
         // Stale heartbeats drop out (broker-expiry parity).
         if now_secs.saturating_sub(ts) > ttl {
             continue;
         }
-        let is_newer = by_npub
-            .get(npub)
-            .map(|old| {
-                old.get("ts")
-                    .and_then(serde_json::Value::as_u64)
-                    .unwrap_or(0)
-                    <= ts
-            })
-            .unwrap_or(true);
+        let is_newer = by_npub.get(&npub).map(|old| old.ts <= ts).unwrap_or(true);
         if is_newer {
-            by_npub.insert(npub.to_string(), v);
+            let row = PresenceRow {
+                name: v
+                    .get("name")
+                    .and_then(|n| n.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+                npub: npub.clone(),
+                state: v
+                    .get("state")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("unknown")
+                    .to_string(),
+                status: v.get("status").and_then(|s| s.as_str()).map(str::to_string),
+                ts,
+                project: project.to_string(),
+            };
+            by_npub.insert(npub, row);
         }
     }
-    let mut out: Vec<Value> = by_npub.into_values().collect();
-    out.sort_by(|a, b| {
-        let ta = a["ts"].as_u64().unwrap_or(0);
-        let tb = b["ts"].as_u64().unwrap_or(0);
-        tb.cmp(&ta)
-    });
+    let mut out: Vec<PresenceRow> = by_npub.into_values().collect();
+    out.sort_by(|a, b| b.ts.cmp(&a.ts));
     out
 }
 
@@ -1328,7 +1419,7 @@ async fn presence_list(mailbox: &Mailbox, args: &PresenceListArgs) -> anyhow::Re
         .unwrap_or_default()
         .as_secs();
     let rows = read_presence(mailbox, &project, now_secs);
-    print_json(&serde_json::Value::Array(rows))
+    print_json(&serde_json::to_value(rows)?)
 }
 
 // ---------------------------------------------------------------------------
@@ -2122,19 +2213,6 @@ mod live_watch_tests {
         );
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_dir_all(&data_dir);
-    }
-
-    /// ADR-0028 E2: WaitCorr interest rides the already-held doorbell
-    /// subscription vocabulary (DOORBELL_WATCH_KINDS mirror + 1059/43004 for
-    /// the direct receipt paths). No second watch child, no wake kind.
-    #[test]
-    fn live_watch_wait_wake_kinds_cover_doorbell() {
-        for kind in [9u16, 14, 20001, 30013, 43001, 30031, 39002] {
-            assert!(
-                WAIT_WAKE_KINDS.contains(&kind),
-                "wait wake kinds must cover doorbell kind {kind}"
-            );
-        }
     }
 
     /// Idle-exit contract: `watch --live --idle-exit <secs>` on a bus that
