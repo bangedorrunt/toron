@@ -343,7 +343,8 @@ pub fn ambiguous_name_warning(
     // pane may be the flywheel Buffy and never see the message. Guessing which
     // identity is "really" them is exactly the inference this warning exists to
     // replace with a fact.
-    let others: Vec<&(String, PublicKey)> = binds.iter().filter(|(p, _)| p != send_project).collect();
+    let others: Vec<&(String, PublicKey)> =
+        binds.iter().filter(|(p, _)| p != send_project).collect();
     if others.is_empty() {
         return None;
     }
@@ -673,7 +674,6 @@ mod tests {
 #[cfg(test)]
 mod bd_xroute_tests {
     use super::*;
-    use crate::nostr::SecretKey;
 
     /// Builds the profile event through the PRODUCTION builder
     /// (`build_profile_event_with_roles`), not a hand-rolled struct.
@@ -776,8 +776,9 @@ mod bd_xroute_tests {
             ("toron.dev".to_string(), npub_b),
         ];
         for from in ["flywheel", "toron.dev"] {
-            let w = ambiguous_name_warning("Buffy", from, &binds)
-                .unwrap_or_else(|| panic!("sending from {from} must warn: the name is bound elsewhere"));
+            let w = ambiguous_name_warning("Buffy", from, &binds).unwrap_or_else(|| {
+                panic!("sending from {from} must warn: the name is bound elsewhere")
+            });
             assert!(w.contains("Buffy"), "{from}: names the recipient: {w}");
             assert!(
                 w.contains("UNREADABLE"),
@@ -796,8 +797,15 @@ mod bd_pinrule_tests {
     #[test]
     fn the_pins_in_live_use_are_accepted() {
         for pin in [
-            "EmberOtter", "PeachRobin", "RoseCoyote", "MaroonDove", "AmberQuill",
-            "IvoryRidge", "TealMarlin", "BlueLake", "ScarletOwl",
+            "EmberOtter",
+            "PeachRobin",
+            "RoseCoyote",
+            "MaroonDove",
+            "AmberQuill",
+            "IvoryRidge",
+            "TealMarlin",
+            "BlueLake",
+            "ScarletOwl",
         ] {
             assert!(
                 validate_agent_pin(pin).is_ok(),
@@ -823,20 +831,20 @@ mod bd_pinrule_tests {
     #[test]
     fn the_shapes_that_collide_are_all_refused() {
         for bad in [
-            "Agent1",      // word + digit
-            "agent",       // lowercase
-            "ivoryridge",  // lowercase joined
-            "IVoryRidge",  // two capitals in a row
-            "AB",          // shouty
-            "EmberOTTER",  // shouty tail
-            "Ivory-Ridge", // kebab
-            "Ivory_Ridge", // snake
-            "Blue",        // adjective only
-            "Ridge",       // noun only
+            "Agent1",          // word + digit
+            "agent",           // lowercase
+            "ivoryridge",      // lowercase joined
+            "IVoryRidge",      // two capitals in a row
+            "AB",              // shouty
+            "EmberOTTER",      // shouty tail
+            "Ivory-Ridge",     // kebab
+            "Ivory_Ridge",     // snake
+            "Blue",            // adjective only
+            "Ridge",           // noun only
             "IvoryRidgeCreek", // three words
-            "",            // empty
-            "Ab",          // too short
-            "Ivory2Ridge", // digit inside
+            "",                // empty
+            "Ab",              // too short
+            "Ivory2Ridge",     // digit inside
         ] {
             assert!(
                 validate_agent_pin(bad).is_err(),

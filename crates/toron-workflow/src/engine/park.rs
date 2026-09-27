@@ -304,7 +304,7 @@ mod tests {
         let decision = plan_park(0, 300, NOW, PARK_MAX_WAIT_SECS);
         match decision {
             ParkDecision::ResumeNow { overdue_ms } => {
-                assert_eq!(overdue_ms, NOW, "the whole gap is reported, not wrapped")
+                assert_eq!(overdue_ms, NOW, "the whole gap is reported, not wrapped");
             }
             other => panic!("a past T must resume, got {other:?}"),
         }
