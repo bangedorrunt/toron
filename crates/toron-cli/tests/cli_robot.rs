@@ -2240,10 +2240,25 @@ fn staged_git_repo(tag: &str) -> std::path::PathBuf {
 }
 
 /// The acceptance: a lease written through the HTTP/MCP path is visible to
-/// `toron guard check` when TORON_MCP_URL is set — even when TORON_MCP_DATA_DIR
-/// points at an EMPTY dir (a second in-process demo_mailbox() would see no
-/// reservations and false-block every path as Unreserved; the daemon view
-/// sees the holder).
+/// `toron guard check` when TORON_MCP_URL is set — a second in-process
+/// demo_mailbox() would see no reservations and false-block every path as
+/// Unreserved; the daemon view sees the holder.
+///
+/// bd-qpm0: this test used to ALSO point TORON_MCP_DATA_DIR at an empty dir, to
+/// prove the daemon view wins. That is exactly the ambiguous input the selector
+/// now REFUSES, because the adversarial review wanted the opposite answer for
+/// the same input (a pin naming an empty store is the documented way to isolate,
+/// and silently ignoring it is what made the documented remedy a no-op). Two
+/// callers wanting opposite answers from one input means there is no correct
+/// tie-break, only a loud refusal.
+///
+/// So the daemon contract is tested WITHOUT the contradiction: one explicit
+/// signal, pointing at the daemon. The refusal itself is covered by
+/// `mailbox_source::selector_tests`. The property this test actually cares
+/// about — the guard consults the DAEMON's lease table rather than a local one —
+/// is still what it asserts, and it is asserted more honestly, because a test
+/// that needs an ambiguous environment to prove its point is a test that was
+/// measuring the tie-break.
 #[test]
 fn guard_check_reads_reservations_from_daemon_when_url_set() {
     let daemon_dir =
@@ -2276,7 +2291,9 @@ fn guard_check_reads_reservations_from_daemon_when_url_set() {
             "--strict",
         ])
         .env("TORON_MCP_URL", &url)
-        .env("TORON_MCP_DATA_DIR", &empty_dir)
+        // bd-qpm0: TORON_MCP_DATA_DIR deliberately NOT set. With it set, the
+        // selector refuses the contradiction (see the doc above).
+        .env_remove("TORON_MCP_DATA_DIR")
         .output()
         .expect("guard check via daemon");
     assert_eq!(
