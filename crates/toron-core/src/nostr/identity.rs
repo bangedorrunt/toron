@@ -105,7 +105,6 @@ pub fn build_profile_event(
 /// Project SLUGS are deliberately NOT covered — `demo`, `forge` and
 /// `parity-product` are legitimate kebab-case project names, and conflating the
 /// two vocabularies is how a naming rule gets ignored.
-#[must_use]
 pub fn validate_agent_pin(name: &str) -> Result<(), String> {
     let reject = |why: &str| {
         Err(format!(
