@@ -23,6 +23,7 @@ use crate::cli::{
 use crate::config::Config;
 use crate::output::{OutputFormat, render_json};
 use toron_mcp::ToJson;
+use toron_workflow::engine::ResonateChoice;
 
 /// scrypt log-n for operator keys (P3 bd-p3-argon2-kdf-dos-bound-7sbu:
 /// raised 12 -> 14 — matches toron-core OPERATOR_KEY_LOG_N; 12 was 16x
@@ -210,9 +211,17 @@ fn check_resonate() -> CheckResult {
     // GS-037 P1 is preserved exactly: the plaintext path still fails closed
     // unless TCP opens AND /health returns HTTP 2xx, with no invent-green on
     // an HTTP/ line, an incidental 200 substring, or non-HTTP junk.
-    match toron_workflow::engine::resonate_server_url() {
-        Some(url) if url.starts_with("https://") => check_resonate_tls(&url),
-        Some(url) => {
+    match &toron_workflow::engine::resonate_choice() {
+        ResonateChoice::Pinned(url)
+        | ResonateChoice::ProbedRemote(url)
+        | ResonateChoice::ProbedLocal(url)
+            if url.starts_with("https://") =>
+        {
+            check_resonate_tls(url)
+        }
+        ResonateChoice::Pinned(url)
+        | ResonateChoice::ProbedRemote(url)
+        | ResonateChoice::ProbedLocal(url) => {
             let host = url
                 .strip_prefix("http://")
                 .unwrap_or(url.as_str())
@@ -228,20 +237,31 @@ fn check_resonate() -> CheckResult {
                         detail: format!(
                             "resolves to {url}, whose host:port this probe cannot parse — verify with `curl -fsS {url}/health`"
                         ),
-                    }
+                    };
                 }
             };
             let mut r = check_resonate_at(addr);
             r.detail = format!("{} — resolves to {url}", r.detail);
             r
         }
-        // No candidate resolved: the runtime is in embedded mode and has no
-        // external server to be down. Reporting FAIL here would be inventing
-        // a fault, so state the mode instead.
-        None => CheckResult {
+        // bd-yolv: no candidate answered, so the engine is EMBEDDED.
+        //
+        // This arm used to report `ok: true`, on the reasoning that "there is
+        // no server to be down, so a FAIL invents a fault". That is backwards,
+        // and it is the same invent-green GS-037 forbids elsewhere: a run parked
+        // on an approval promise cannot be driven by the embedded runtime, so it
+        // suspends forever. The check reports on the engine's CAPABILITY, and
+        // this configuration cannot deliver it — so a pipeline keyed on
+        // `doctor --check` must not read green while a parked run hangs.
+        //
+        // The detail names the loss and both remedies, so an operator who runs
+        // embedded ON PURPOSE is not left guessing whether this is a complaint.
+        ResonateChoice::Embedded { .. } => CheckResult {
             name: "resonate",
-            ok: true,
-            detail: "embedded mode — no external resonate server resolved (RESONATE_URL unset and no probed candidate); durable promises live in-process".to_string(),
+            ok: false,
+            detail: toron_workflow::engine::resonate_choice()
+                .degradation_detail()
+                .unwrap_or_else(|| "embedded mode, no external resonate server resolved".into()),
         },
     }
 }
@@ -1148,6 +1168,40 @@ mod check_resonate_tests {
             "must name what it could not parse, got: {}",
             r.detail
         );
+    }
+
+    /// bd-yolv: an embedded engine is a RED check, and the red must carry the
+    /// loss and both remedies. The test is on the *wording contract* rather than
+    /// on a live deployment, because a machine with no resonate server is the
+    /// only way to reach the arm — and asserting "it is red" without asserting
+    /// what it SAYS would pass on a red that tells the operator nothing.
+    #[test]
+    fn an_embedded_engine_is_a_red_check_that_explains_itself() {
+        let degraded = toron_workflow::engine::ResonateChoice::Embedded {
+            probed: [
+                toron_workflow::engine::REMOTE_RESONATE_URL,
+                toron_workflow::engine::LOCAL_RESONATE_URL,
+            ],
+        };
+        let r = CheckResult {
+            name: "resonate",
+            ok: false,
+            detail: degraded
+                .degradation_detail()
+                .expect("a degraded choice carries a detail"),
+        };
+        assert!(
+            !r.ok,
+            "embedded cannot park a run, so `doctor --check` must not go green"
+        );
+        for needle in ["DEGRADED", "RESONATE_URL", "approval"] {
+            assert!(
+                r.detail.contains(needle),
+                "an unexplained red trains operators to ignore the check; {needle:?} \
+                 must be in: {}",
+                r.detail
+            );
+        }
     }
 
     #[test]

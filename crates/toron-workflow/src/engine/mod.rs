@@ -58,19 +58,52 @@ pub const LOCAL_RESONATE_URL: &str = "http://localhost:8001";
 /// Explicit pin env — beats the probe dance entirely.
 pub const RESONATE_URL_ENV: &str = "RESONATE_URL";
 
-/// Resolve the Resonate server URL once per process: `RESONATE_URL` pin >
-/// remote default (TCP-probed) > local fallback (TCP-probed) > `None`
-/// (embedded local mode). The probe budget is 2s per candidate and the result
-/// is cached — daemon startup pays it once.
-pub fn resonate_server_url() -> Option<String> {
-    static CACHE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-    CACHE
-        .get_or_init(|| resonate_server_url_with(probe_candidate))
-        .clone()
+/// Resolve the Resonate server ONCE per process: `RESONATE_URL` pin > remote
+/// default (TCP-probed) > local fallback (TCP-probed) > embedded. The probe
+/// budget is 2s per candidate and the result is cached, so daemon startup pays
+/// it once.
+///
+/// The cache is why a `RESONATE_URL` pin belongs in the launchd plist: a probe
+/// that loses the boot-time network race is not retried, it is remembered for
+/// the process lifetime. Caching is right (the answer cannot change cheaply);
+/// caching a boot-race loser forever is not, and the pin is the only thing that
+/// makes it deterministic.
+pub fn resonate_choice() -> ResonateChoice {
+    static CACHE: std::sync::OnceLock<ResonateChoice> = std::sync::OnceLock::new();
+    let choice = cached_or_reprobe(CACHE.get(), || resonate_choice_with(probe_candidate));
+    // A failed `set` means a previous degraded probe already landed; the loss is
+    // never read back, so keeping the first one costs nothing.
+    let _ = CACHE.set(choice.clone());
+    choice
+}
+
+/// The caching policy, split out so it is testable without a network.
+///
+/// The rule has one half each way. A HEALTHY answer is cached for the process
+/// lifetime: the probe costs 2s per candidate and a live server does not go
+/// away cheaply, so re-probing on every call is pure latency. A DEGRADED answer
+/// is never returned from cache, because "nothing answered" is almost always a
+/// BOOT-TIME RACE — launchd starts the daemon before the network is up — and a
+/// `OnceLock` over the loss turns a transient into a permanent silent
+/// degradation. The first call after the network is up gets the real answer with
+/// no restart, which is strictly better than pinning `RESONATE_URL` in a plist:
+/// a pin is all-or-nothing, so a remote that is genuinely down would take
+/// workflow execution from partly-working to entirely-broken.
+fn cached_or_reprobe(
+    cached: Option<&ResonateChoice>,
+    probe: impl FnOnce() -> ResonateChoice,
+) -> ResonateChoice {
+    match cached {
+        Some(healthy) if !healthy.is_degraded() => healthy.clone(),
+        _ => {
+            let fresh = probe();
+            fresh
+        }
+    }
 }
 
 /// Pure resolution core (testable with a fake probe).
-pub fn resonate_server_url_with(probe: impl Fn(&str) -> bool) -> Option<String> {
+pub fn resonate_choice_with(probe: impl Fn(&str) -> bool) -> ResonateChoice {
     resolve_resonate_url(resonate_url_pin_from_env().as_deref(), probe)
 }
 
@@ -83,19 +116,84 @@ pub fn resonate_url_pin_from_env() -> Option<String> {
         .filter(|pin| !pin.is_empty())
 }
 
+/// Where the workflow engine's Resonate server came from — and, when there is
+/// none, WHAT WAS LOST.
+///
+/// This used to be `Option<String>`, and `None` was the most consequential
+/// value in it: the caller fell back to the EMBEDDED runtime without saying so.
+/// Two things made that silence possible. The type did not distinguish "no pin
+/// given" from "nothing answered", so a caller could not tell a deliberate
+/// embedded deployment from a probe that lost a race; and the embedded runtime
+/// is not an equivalent substitute — it cannot drive a parked run's
+/// promise-creation task, so a workflow parked on `request_approval` never
+/// resumes. A green health line over that is a lie about capability.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResonateChoice {
+    /// An operator `RESONATE_URL` pin. No probe ran, so nothing degraded.
+    Pinned(String),
+    /// The default remote answered the probe.
+    ProbedRemote(String),
+    /// The remote did not answer; the local server did.
+    ProbedLocal(String),
+    /// NO server answered. The caller must fall back to the embedded runtime.
+    Embedded { probed: [&'static str; 2] },
+}
+
+impl ResonateChoice {
+    /// The server URL, or `None` exactly when the engine is embedded.
+    pub fn url(&self) -> Option<&str> {
+        match self {
+            Self::Pinned(u) | Self::ProbedRemote(u) | Self::ProbedLocal(u) => Some(u),
+            Self::Embedded { .. } => None,
+        }
+    }
+
+    /// True only for the embedded fallback — a mode that cannot park a run.
+    pub fn is_degraded(&self) -> bool {
+        matches!(self, Self::Embedded { .. })
+    }
+
+    /// The operator-facing sentence for a degraded choice, or `None` when the
+    /// engine has a real server. Pure, so the wording is fenced rather than
+    /// trusted: a degradation whose message omits the lost capability is how a
+    /// silent degradation gets shipped.
+    pub fn degradation_detail(&self) -> Option<String> {
+        let Self::Embedded { probed } = self else {
+            return None;
+        };
+        Some(format!(
+            "DEGRADED: no resonate server resolved, so the workflow engine runs \
+             EMBEDDED and in-process. Probed and unanswered: {}. Lost capability: a \
+             run parked on an approval promise cannot be driven by the embedded \
+             runtime, so it suspends forever instead of resuming. This is usually a \
+             BOOT-TIME RACE rather than an outage -- launchd starts agents before the \
+             network is up, so the same command picks a different mode depending on \
+             when it ran. Fix either way: pin {}=<server url>, or start a server on \
+             one of the probed candidates.",
+            probed.join(", "),
+            RESONATE_URL_ENV
+        ))
+    }
+}
+
 /// Pure resolution core: explicit pin > probed remote > probed local >
 /// embedded (`None`). No env, no cache, no I/O beyond the injected probe.
-pub fn resolve_resonate_url(pin: Option<&str>, probe: impl Fn(&str) -> bool) -> Option<String> {
+pub fn resolve_resonate_url(pin: Option<&str>, probe: impl Fn(&str) -> bool) -> ResonateChoice {
     if let Some(p) = pin.filter(|p| !p.trim().is_empty()) {
-        return Some(p.to_string());
+        return ResonateChoice::Pinned(p.to_string());
     }
     if probe(REMOTE_RESONATE_URL) {
-        return Some(REMOTE_RESONATE_URL.to_string());
+        return ResonateChoice::ProbedRemote(REMOTE_RESONATE_URL.to_string());
     }
     if probe(LOCAL_RESONATE_URL) {
-        return Some(LOCAL_RESONATE_URL.to_string());
+        return ResonateChoice::ProbedLocal(LOCAL_RESONATE_URL.to_string());
     }
-    None
+    // Every candidate was tried and none answered. Name them, because "no
+    // server" without the list is not actionable and cannot be told apart from
+    // a deliberate embedded deployment.
+    ResonateChoice::Embedded {
+        probed: [REMOTE_RESONATE_URL, LOCAL_RESONATE_URL],
+    }
 }
 
 /// TCP liveness probe for a resonate server URL (2s budget). Parses
@@ -1113,27 +1211,150 @@ impl WorkflowEngine {
 
 #[cfg(test)]
 mod resolve_tests_bd_r328 {
-    use super::{LOCAL_RESONATE_URL, REMOTE_RESONATE_URL, resolve_resonate_url};
+    use super::{LOCAL_RESONATE_URL, REMOTE_RESONATE_URL, ResonateChoice, resolve_resonate_url};
 
     #[test]
     fn explicit_pin_wins_without_probing() {
         assert_eq!(
             resolve_resonate_url(Some("https://pin.example"), |_| panic!("no probe on pin")),
-            Some("https://pin.example".to_string())
+            ResonateChoice::Pinned("https://pin.example".to_string())
         );
-        assert_eq!(resolve_resonate_url(Some("  "), |_| false), None);
+    }
+
+    /// A blank pin is NOT a pin. It used to yield `None`, which was
+    /// indistinguishable from "nothing answered" — the exact confusion this
+    /// type exists to remove. Now it falls through to probing and, if nothing
+    /// answers, says so as a named degradation.
+    #[test]
+    fn a_blank_pin_is_not_a_pin_and_not_a_degradation_by_itself() {
+        let c = resolve_resonate_url(Some("   "), |u| u == LOCAL_RESONATE_URL);
+        assert_eq!(
+            c,
+            ResonateChoice::ProbedLocal(LOCAL_RESONATE_URL.to_string())
+        );
     }
 
     #[test]
     fn probe_order_remote_then_local() {
         assert_eq!(
             resolve_resonate_url(None, |u| u == REMOTE_RESONATE_URL),
-            Some(REMOTE_RESONATE_URL.to_string())
+            ResonateChoice::ProbedRemote(REMOTE_RESONATE_URL.to_string())
         );
         assert_eq!(
             resolve_resonate_url(None, |u| u == LOCAL_RESONATE_URL),
-            Some(LOCAL_RESONATE_URL.to_string())
+            ResonateChoice::ProbedLocal(LOCAL_RESONATE_URL.to_string())
         );
-        assert_eq!(resolve_resonate_url(None, |_| false), None);
+    }
+
+    /// The defect this change exists for. A probe that answers nothing used to
+    /// return a bare `None`, which the caller read as "embedded, fine". The
+    /// embedded runtime cannot drive a parked run's promise-creation task, so
+    /// this is a loss of capability and must be a first-class value.
+    #[test]
+    fn nothing_answered_is_a_degradation_not_a_quiet_none() {
+        let c = resolve_resonate_url(None, |_| false);
+        assert!(
+            c.is_degraded(),
+            "an unanswered probe must be degraded, got {c:?}"
+        );
+        assert_eq!(c.url(), None, "embedded has no server URL, and must say so");
+        assert_eq!(
+            c,
+            ResonateChoice::Embedded {
+                probed: [REMOTE_RESONATE_URL, LOCAL_RESONATE_URL]
+            },
+            "the candidates must be NAMED, or 'no server' is not actionable"
+        );
+    }
+
+    /// A real server is never a degradation, whatever route reached it —
+    /// otherwise a pin (the deterministic, operator-chosen route) would be
+    /// reported as a fault and operators would learn to ignore the signal.
+    #[test]
+    fn every_mode_with_a_server_is_healthy() {
+        for c in [
+            resolve_resonate_url(Some("https://pin.example"), |_| panic!("no probe on pin")),
+            resolve_resonate_url(None, |u| u == REMOTE_RESONATE_URL),
+            resolve_resonate_url(None, |u| u == LOCAL_RESONATE_URL),
+        ] {
+            assert!(
+                !c.is_degraded(),
+                "{c:?} has a server and must not be degraded"
+            );
+            assert_eq!(c.degradation_detail(), None, "{c:?} must not warn");
+            assert!(c.url().is_some());
+        }
+    }
+
+    /// bd-yolv: a degraded answer must never be served from cache. "Nothing
+    /// answered" is nearly always a boot-time race — launchd starts the daemon
+    /// before the network is up — so a `OnceLock` over the loss converts a
+    /// transient into a permanent silent degradation. Falsified per half: a
+    /// healthy cache must not re-probe (2s per candidate is real latency), and a
+    /// degraded cache must re-probe (otherwise the first call after the network
+    /// is up still reports embedded).
+    #[test]
+    fn a_healthy_answer_is_cached_and_a_degraded_one_is_re_probed() {
+        use super::cached_or_reprobe;
+
+        let healthy = ResonateChoice::ProbedRemote(REMOTE_RESONATE_URL.to_string());
+        // Healthy cache wins, and the probe is never consulted.
+        assert_eq!(
+            cached_or_reprobe(Some(&healthy), || panic!(
+                "must not re-probe a healthy cache"
+            )),
+            healthy
+        );
+
+        // A degraded cache is IGNORED and the fresh answer is returned.
+        let degraded = ResonateChoice::Embedded {
+            probed: [REMOTE_RESONATE_URL, LOCAL_RESONATE_URL],
+        };
+        let mut probed = false;
+        let got = cached_or_reprobe(Some(&degraded), || {
+            probed = true;
+            healthy.clone()
+        });
+        assert!(
+            probed,
+            "a cached DEGRADATION must be re-probed, not served back"
+        );
+        assert_eq!(
+            got, healthy,
+            "the fresh answer must be what the caller sees"
+        );
+
+        // And a re-probe that finds nothing yet is still a degradation, not a
+        // silent healthy — a boot race does not heal on the first retry.
+        let still_bad = cached_or_reprobe(Some(&degraded), || degraded.clone());
+        assert!(still_bad.is_degraded(), "{still_bad:?}");
+    }
+
+    /// The wording is the payload, so it is fenced: a message that omits what
+    /// was lost, or the remedy, is how a silent degradation ships.
+    #[test]
+    fn the_degradation_message_names_the_loss_and_both_remedies() {
+        let d = resolve_resonate_url(None, |_| false)
+            .degradation_detail()
+            .expect("degraded choices carry a detail");
+        for needle in [
+            "DEGRADED",
+            "EMBEDDED",
+            REMOTE_RESONATE_URL,
+            LOCAL_RESONATE_URL,
+            // the capability that is actually gone
+            "approval",
+            "cannot",
+            // the deterministic fix
+            "RESONATE_URL",
+            // and the boot-race explanation, because the operator's first guess
+            // is "the server is down" and that is usually wrong
+            "BOOT-TIME",
+        ] {
+            assert!(
+                d.contains(needle),
+                "the message must name {needle:?}; got: {d}"
+            );
+        }
     }
 }
