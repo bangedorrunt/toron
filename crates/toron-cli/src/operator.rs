@@ -129,6 +129,97 @@ fn check_legacy_slug_identities(cfg: &Config) -> CheckResult {
     }
 }
 
+/// bd-0tbg W1: identities in ONE project that fold to the same words and so
+/// hold separate keys — `BrashOtter` and `brash-otter` measured live, 4 and 5
+/// reservations between them. A release or a conflict check addressed to one
+/// spelling cannot see the other's leases.
+///
+/// `ok` is FALSE here, unlike the informational slug check beside it: this is
+/// not leftover bookkeeping, it is two identities where the operator believes
+/// there is one, and every reservation under the shadowed spelling is
+/// unaddressable by the name a human would use. The reconciliation is a human
+/// decision (bd-lkjf) — which key survives cannot be inferred from the board.
+fn check_name_collisions(cfg: &Config) -> CheckResult {
+    let name = "name_collisions";
+    let Some(data_dir) = resolve_data_dir(cfg, None) else {
+        return CheckResult {
+            name,
+            ok: true,
+            detail: "no data dir — nothing to scan".into(),
+        };
+    };
+    let db_path = data_dir.join("index.sqlite");
+    if !db_path.exists() {
+        return CheckResult {
+            name,
+            ok: true,
+            detail: format!("no index at {}", db_path.display()),
+        };
+    }
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            return CheckResult {
+                name,
+                ok: false,
+                detail: format!("runtime build failed: {e}"),
+            };
+        }
+    };
+    let scanned = rt.block_on(async {
+        let pool = toron_core::index::schema::connect(db_path.to_str().unwrap()).await?;
+        let found = toron_core::mailbox::identity::name_collisions_across_projects(&pool).await?;
+        pool.close().await;
+        Ok::<_, anyhow::Error>(found)
+    });
+    match scanned {
+        Ok(found) if found.is_empty() => CheckResult {
+            name,
+            ok: true,
+            detail: "no identity holds a second key for the same name".into(),
+        },
+        Ok(found) => {
+            let rows: Vec<String> = found
+                .iter()
+                .map(|(p, g)| {
+                    let keys: Vec<String> = g
+                        .pubkeys
+                        .iter()
+                        .map(|k| k[..8.min(k.len())].to_string())
+                        .collect();
+                    format!(
+                        "{}: [{}] -> {} key(s) {}",
+                        p,
+                        g.names.join(", "),
+                        keys.len(),
+                        keys.join("/")
+                    )
+                })
+                .collect();
+            CheckResult {
+                name,
+                ok: false,
+                detail: format!(
+                    "{} project(s) hold one name across several keys: {}. Registrations that \
+                     would split a name are now refused, but these predate the check — \
+                     reconciling them is a human decision (bd-lkjf), since only you know \
+                     whether the spellings are one agent or two.",
+                    found.len(),
+                    rows.join("; ")
+                ),
+            }
+        }
+        Err(e) => CheckResult {
+            name,
+            ok: false,
+            detail: format!("scan failed: {e:#}"),
+        },
+    }
+}
+
 fn check_herdr() -> CheckResult {
     let path = toron_core::backend::herdr::default_socket_path();
     match toron_core::backend::herdr::HerdrBackend::connect(None) {
@@ -369,6 +460,7 @@ pub fn run_doctor(
         check_keys(cfg),
         check_resonate(),
         check_legacy_slug_identities(cfg),
+        check_name_collisions(cfg),
     ];
     let value = json!({ "checks": serde_json::to_value(&checks)? });
 
