@@ -489,7 +489,7 @@
             "type": "array"
           },
           "soft_conflicts": {
-            "description": "ADR-0011 Spec 4: additive soft tier (in-TTL intents).",
+            "description": "ADR-0011 Spec 4: additive soft tier — other agents' in-TTL intents AND\ntheir live shared leases. Neither blocks; both mean \"someone is here\".\nA path listed in `clear_paths` is one nobody holds or declared.",
             "items": {
               "$ref": "#/$defs/PathConflictOut"
             },

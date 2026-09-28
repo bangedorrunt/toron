@@ -151,7 +151,7 @@
       "name": "run-state"
     }
   ],
-  "generated_at": "2026-09-28T11:17:34Z",
+  "generated_at": "2026-09-28T16:35:02Z",
   "resources": [
     {
       "description": "List projects known to toron.",
@@ -2150,7 +2150,7 @@
             "type": "array"
           },
           "soft_conflicts": {
-            "description": "ADR-0011 Spec 4: additive soft tier (in-TTL intents).",
+            "description": "ADR-0011 Spec 4: additive soft tier — other agents' in-TTL intents AND\ntheir live shared leases. Neither blocks; both mean \"someone is here\".\nA path listed in `clear_paths` is one nobody holds or declared.",
             "items": {
               "$ref": "#/$defs/PathConflictOut"
             },

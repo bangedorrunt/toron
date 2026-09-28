@@ -148,6 +148,46 @@ fn entry_blocks(entry: &LeaseEntry, requester: &str, path: &str, now_us: i64) ->
         && overlaps(&entry.path_pattern, path)
 }
 
+/// bd-4dl4: a live SHARED lease by another agent, overlapping `path`.
+///
+/// NOT a blocker. A shared lease is a declaration, not a fence: it says
+/// "someone is working here", and the whole point of the shared tier is that
+/// it does not stop anyone. What it must never be is INVISIBLE - before this,
+/// a held shared lease matched no branch, so a path someone had declared was
+/// reported in `clear_paths` with nothing else set, and an operator reading
+/// `conflict_free: true` concluded nobody was there.
+///
+/// This is the same reason `entry_blocks` needs `exclusive`: the two
+/// functions answer different questions about the same overlap. One decides
+/// WHO GETS DENIED; this one decides WHO GETS NAMED.
+pub fn entry_notices(entry: &LeaseEntry, requester: &str, path: &str, now_us: i64) -> bool {
+    entry.holder != requester
+        && !entry.exclusive
+        && is_live(entry, now_us)
+        && overlaps(&entry.path_pattern, path)
+}
+
+/// Every lease in `model` that a reader must be told about for `path`,
+/// regardless of whether it blocks. Pure; the advisory twin of the blocking
+/// scan, and the reason `clear_paths` can be trusted to mean "nobody is here".
+pub fn advisory_viewers(
+    model: &KernelModel,
+    requester: &str,
+    path: &str,
+    now_us: i64,
+) -> Vec<String> {
+    let mut out: Vec<String> = model
+        .leases
+        .values()
+        .filter(|e| {
+            entry_blocks(e, requester, path, now_us) || entry_notices(e, requester, path, now_us)
+        })
+        .map(|e| e.id.clone())
+        .collect();
+    out.sort();
+    out
+}
+
 /// Pure decision: `(Model, Msg) -> (Model, Effects)`.
 pub fn tick(model: &KernelModel, msg: &KernelMsg) -> (KernelModel, Vec<KernelEffect>) {
     let mut next = model.clone();
