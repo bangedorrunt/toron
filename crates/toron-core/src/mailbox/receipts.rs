@@ -291,9 +291,23 @@ impl ReceiptStore {
     /// `receipt.pruned` for `corr` with no later stamp. A tombstoned corr
     /// must never be re-inserted — `get()` reports it as None, which is
     /// exactly what the old guard misread as "free to insert".
+    ///
+    /// bd-v51i: this used to fold the WHOLE event log — `read_since(0)` — on
+    /// every call, and `upsert` calls it up to seven times per write. The log
+    /// is unbounded, so a receipt write (owed-on-send, so every send) cost
+    /// O(total lifetime events). The comment above it excused that with
+    /// "receipts are low-volume" — but the read was the whole log, whose size
+    /// is driven by every kind toron logs, not by receipts.
+    ///
+    /// It now reads only this corr's history, served by the `events_corr`
+    /// expression index (migration 0014). It still folds through the SAME
+    /// [`Self::fold_events`], so last-write-wins in generation order is
+    /// unchanged: a prune only tombstones while it is the newest word, and a
+    /// later stamp revives the corr. Do not replace the fold with an
+    /// "is there a prune?" predicate — that gets the revive case wrong.
     async fn is_tombstoned(&self, corr: &str) -> anyhow::Result<bool> {
         let log = crate::index::event_log::EventLog::new(self.pool.clone());
-        let events = log.read_since(0).await?;
+        let events = log.read_for_corr(corr).await?;
         Ok(matches!(Self::fold_events(&events).get(corr), Some(None)))
     }
 
@@ -1307,6 +1321,142 @@ mod tests {
             .expect("third resulted no path");
         assert_eq!(r5.state, ReceiptState::Resulted);
         assert_eq!(r5.result_path.as_deref(), Some("/tmp/c.json"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ---- bd-v51i: the tombstone probe must not read the whole log ----
+
+    /// bd-v51i: `is_tombstoned` read the ENTIRE event log on every call, and
+    /// `upsert` calls it up to 7 times. This pins the replacement: the probe
+    /// reads only the target corr's receipt events.
+    ///
+    /// The load is deliberately asymmetric — 40 unrelated corrs stamped after
+    /// the target. A whole-log read returns 41+ events and must stay correct; a
+    /// corr-scoped read returns 1. Asserting the COUNT is what makes this a
+    /// performance fence rather than a re-assertion that the answer is right,
+    /// which the tests above already cover.
+    #[tokio::test]
+    async fn the_tombstone_probe_reads_only_its_own_corr() {
+        let (pool, path) = test_pool("probe-scope").await;
+        let store = ReceiptStore::new(pool.clone());
+        let r = |corr: &str, at: i64| Receipt {
+            corr: corr.into(),
+            state: ReceiptState::Owed,
+            wake: None,
+            due_at: None,
+            result_path: None,
+            updated_at: at,
+        };
+        store.upsert(&r("target", 100)).await.expect("target");
+        for i in 0..40 {
+            store
+                .upsert(&r(&format!("noise-{i}"), 200 + i))
+                .await
+                .expect("noise");
+        }
+        let log = crate::index::event_log::EventLog::new(pool);
+        let whole = log.read_since(0).await.expect("whole log");
+        assert!(
+            whole.len() >= 41,
+            "the log really does carry the noise, got {}",
+            whole.len()
+        );
+        let scoped = log.read_for_corr("target").await.expect("corr-scoped read");
+        assert_eq!(
+            scoped.len(),
+            1,
+            "a corr-scoped read must return only the target's events, got {} of {}",
+            scoped.len(),
+            whole.len()
+        );
+        assert_eq!(scoped[0].kind, ReceiptEvent::STAMPED);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// bd-v51i: the index is the whole point of the fix — without it the
+    /// corr-scoped read is still a full scan, just one that returns fewer rows.
+    /// A comment asking for an index is a hope; a test that fails when the index
+    /// is missing is a gate. This is the assertion that makes the performance
+    /// claim falsifiable instead of aspirational.
+    #[tokio::test]
+    async fn the_event_log_carries_a_corr_scoped_index() {
+        let (pool, path) = test_pool("probe-index").await;
+        let rows: Vec<String> = sqlx::query_scalar(
+            "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'events'",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("index list");
+        assert!(
+            rows.iter().any(|n| n.contains("corr")),
+            "events needs a corr-scoped index for the probe to be bounded; found {rows:?}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// bd-v51i: the fold semantics must survive the narrowing. `fold_events` is
+    /// last-write-wins in generation order, so the three verdicts are: stamped
+    /// only -> not tombstoned; pruned last -> tombstoned; pruned then re-stamped
+    /// -> not tombstoned. The third is the one a naive "does a prune exist?"
+    /// query gets wrong, which is why the read is a slice through the SAME fold
+    /// rather than a fresh predicate.
+    #[tokio::test]
+    async fn a_prune_is_only_a_tombstone_while_it_is_the_latest_word() {
+        let (pool, path) = test_pool("probe-latest").await;
+        let store = ReceiptStore::new(pool.clone());
+        let log = crate::index::event_log::EventLog::new(pool.clone());
+        let fold = |corr: &str| {
+            let log = &log;
+            let corr = corr.to_string();
+            async move {
+                let evs = log.read_for_corr(&corr).await.expect("read");
+                let seen = format!(
+                    "{:?}",
+                    evs.iter()
+                        .map(|e| (e.generation, e.kind.as_str()))
+                        .collect::<Vec<_>>()
+                );
+                (ReceiptStore::fold_events(&evs).get(&corr).cloned(), seen)
+            }
+        };
+
+        let r = |at: i64| Receipt {
+            corr: "mixed-1".into(),
+            state: ReceiptState::Owed,
+            wake: None,
+            due_at: None,
+            result_path: None,
+            updated_at: at,
+        };
+        store.upsert(&r(100)).await.expect("stamp");
+        // The fold is a tri-state: Some(Some(ev)) = live row, Some(None) =
+        // tombstoned, None = corr absent from the log entirely.
+        let (v, seen) = fold("mixed-1").await;
+        assert!(
+            matches!(v, Some(Some(_))),
+            "a stamped corr is live, not a tombstone; saw {seen}"
+        );
+
+        let pruned = store.prune_expired(10_000, 1_000).await.expect("prune");
+        assert_eq!(pruned, 1, "the row pruned");
+        let (v, seen) = fold("mixed-1").await;
+        assert!(
+            matches!(v, Some(None)),
+            "prune is now the latest word, so the corr IS tombstoned; saw {seen}"
+        );
+
+        // A raw log append re-stamps it AFTER the prune. The tombstone must stop
+        // applying, exactly as the whole-log fold would have decided.
+        let ev = ReceiptEvent::stamped(&r(20_000));
+        let payload = serde_json::to_string(&ev).unwrap_or_default();
+        log.append(&ev.event_id(), ReceiptEvent::STAMPED, &payload, 20_000)
+            .await
+            .expect("re-stamp after prune");
+        let (v, seen) = fold("mixed-1").await;
+        assert!(
+            matches!(v, Some(Some(_))),
+            "a stamp newer than the prune wins; the corr is live again; saw {seen}"
+        );
         let _ = std::fs::remove_file(&path);
     }
 }

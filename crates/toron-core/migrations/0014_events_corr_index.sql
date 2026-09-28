@@ -1,0 +1,21 @@
+-- bd-v51i: index the event log by the corr inside the payload.
+--
+-- `receipts.rs::is_tombstoned` used to call `read_since(0)`, which returns the
+-- WHOLE log, and `upsert` calls it up to seven times per write. Nothing bounded
+-- that table: no retention, and `MAX_STORED_EVENTS` bounds `bus_events`, a
+-- different table whose durable kinds are exempt besides. So the cost of every
+-- receipt write — and a receipt is written owed-on-send — grew with the
+-- lifetime of the system, with no ceiling.
+--
+-- The probe only ever needed one corr's history, so it now selects on the corr
+-- extracted from the payload. This index is what makes that selective: without
+-- it SQLite scans every row and the change buys a smaller result, not a bounded
+-- cost. There is a test (`the_event_log_carries_a_corr_scoped_index`) that fails
+-- if this index goes missing, so the performance claim stays falsifiable.
+--
+-- Expression index, not a plain column: `corr` lives inside the JSON payload and
+-- adding a column to `events` would mean rewriting the log's write path and its
+-- checksum-verified migrations for no gain. SQLite evaluates the expression once
+-- per row on write and stores the result, so the read is an index seek.
+CREATE INDEX IF NOT EXISTS events_corr
+    ON events (json_extract(payload, '$.corr'));
