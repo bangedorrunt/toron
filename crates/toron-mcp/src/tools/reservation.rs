@@ -273,8 +273,8 @@ pub struct ForceReleaseFileReservationArgs {
     pub project_key: String,
     pub agent_name: String,
     /// Path (or glob) of the stale reservation to revoke. The daemon resolves
-    /// the active lease on this path itself (bd-cumj) — the caller does NOT
-    /// need the holder's event id.
+    /// the active lease on this path itself — the caller does NOT need the
+    /// holder's event id.
     pub path: String,
     /// Optional holder name to disambiguate when multiple holders match the
     /// path. Omit to revoke the (single) matching lease.

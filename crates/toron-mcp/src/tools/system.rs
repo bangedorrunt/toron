@@ -345,10 +345,9 @@ pub struct CreateAgentIdentityArgs {
 pub struct WhoisArgs {
     pub project_key: String,
     /// The identity to look up: a REGISTERED adjective+noun pin, canonical
-    /// name, folded alias, or npub. bd-pin-public-plane-s-easy.8: `name` is
-    /// accepted as a serde alias (grok/other wrappers pass `name`); the
-    /// field stays REQUIRED (both missing fails — never defaults to $USER
-    /// or a generated pin).
+    /// name, folded alias, or npub. `name` is accepted as a serde alias
+    /// (grok/other wrappers pass `name`); the field stays REQUIRED (both
+    /// missing fails — never defaults to $USER or a generated pin).
     #[serde(alias = "name")]
     pub agent_name: String,
     pub include_recent_commits: Option<bool>,

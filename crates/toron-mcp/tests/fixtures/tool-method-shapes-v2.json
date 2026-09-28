@@ -415,7 +415,7 @@
                 "type": "string"
               },
               "reservation_ids": {
-                "description": "Kind-30031 event id of each conflicting lease (bd-dsu1) — parallel to\n`holders`, one id per holder. The operator lock board surfaces these\nfor diagnostics (force-release, request-release, replay).",
+                "description": "Kind-30031 event id of each conflicting lease — parallel to\n`holders`, one id per holder. The operator lock board surfaces these\nfor diagnostics (force-release, request-release, replay).",
                 "items": {
                   "type": "string"
                 },
@@ -430,7 +430,7 @@
             "type": "object"
           },
           "SlotHolderOut": {
-            "description": "One active build-slot lease (bd-slot-visibility-gv17).",
+            "description": "One active build-slot lease.",
             "properties": {
               "agent_name": {
                 "type": "string"
@@ -482,7 +482,7 @@
             "type": "boolean"
           },
           "slot_holders": {
-            "description": "bd-slot-visibility-gv17: ACTIVE build-slot leases held by others —\n\"is the cargo fence free?\" in the same one-call pre-write check.",
+            "description": "ACTIVE build-slot leases held by others — \"is the cargo fence free?\"\nin the same one-call pre-write check.",
             "items": {
               "$ref": "#/$defs/SlotHolderOut"
             },
@@ -530,7 +530,7 @@
       "output_schema": {
         "$defs": {
           "ReleasedGhostOut": {
-            "description": "One exclusive lease revoked because its holder pin was pruned\n(bd-gc7k: a dead pin must not own the ledger).",
+            "description": "One exclusive lease revoked because its holder pin was pruned: a dead pin\nmust not own the ledger.",
             "properties": {
               "holder": {
                 "type": "string"
@@ -804,7 +804,7 @@
             ]
           },
           "thread_id": {
-            "description": "Keep only messages in this thread (bd-harvest-thread-filter-yp9r).",
+            "description": "Keep only messages in this thread.",
             "type": [
               "string",
               "null"
@@ -854,7 +854,7 @@
                 "type": "string"
               },
               "corr": {
-                "description": "ADR-0027 E2 assignment tags projected from the rumor (never 1059);\nmirror of `ToJson for InboxMessage` wire fields\n(bd-mcp-inbox-assignment-tags-sdi1). All optional, `null` = untasked.",
+                "description": "ADR-0027 E2 assignment tags projected from the rumor (never 1059);\nmirror of `ToJson for InboxMessage` wire fields. All optional,\n`null` = untasked.",
                 "type": [
                   "string",
                   "null"
@@ -865,7 +865,7 @@
                 "type": "integer"
               },
               "duplicate_of": {
-                "description": "S5 (bd-dup-assign-collapse-ws21): the first id of the duplicate group\nthis row survives for; `null` = standalone message.",
+                "description": "The first id of the duplicate group this row survives for; `null` =\nstandalone message.",
                 "type": [
                   "string",
                   "null"
@@ -884,7 +884,7 @@
                 ]
               },
               "read_ts_us": {
-                "description": "Read receipt timestamp (i64-µs) from the `message_reads` projection;\n`null` = unread (bd-5icg).",
+                "description": "Read receipt timestamp (i64-µs) from the `message_reads` projection;\n`null` = unread.",
                 "format": "int64",
                 "type": [
                   "integer",
@@ -1011,7 +1011,7 @@
                 "type": "string"
               },
               "corr": {
-                "description": "ADR-0027 E2 assignment tags (bd-mcp-inbox-assignment-tags-sdi1);\nflattened mirror of `InboxMessageOut` tags. Optional, `null` = untasked.",
+                "description": "ADR-0027 E2 assignment tags; flattened mirror of `InboxMessageOut`\ntags. Optional, `null` = untasked.",
                 "type": [
                   "string",
                   "null"
@@ -1192,7 +1192,7 @@
                 "type": "string"
               },
               "reservation_ids": {
-                "description": "Kind-30031 event id of each conflicting lease (bd-dsu1) — parallel to\n`holders`, one id per holder. The operator lock board surfaces these\nfor diagnostics (force-release, request-release, replay).",
+                "description": "Kind-30031 event id of each conflicting lease — parallel to\n`holders`, one id per holder. The operator lock board surfaces these\nfor diagnostics (force-release, request-release, replay).",
                 "items": {
                   "type": "string"
                 },
@@ -1265,7 +1265,7 @@
             ]
           },
           "path": {
-            "description": "Path (or glob) of the stale reservation to revoke. The daemon resolves\nthe active lease on this path itself (bd-cumj) — the caller does NOT\nneed the holder's event id.",
+            "description": "Path (or glob) of the stale reservation to revoke. The daemon resolves\nthe active lease on this path itself — the caller does NOT need the\nholder's event id.",
             "type": "string"
           },
           "project_key": {
@@ -1405,7 +1405,7 @@
       "output_schema": {
         "$defs": {
           "WhoIsOut": {
-            "description": "`whois`: `{name, npub, program, model, task_description, last_active_ts_us,\nstale, pane_id, workspace_id, tab_id}`.\n\nADR-0010 F2: `stale` flags roster rows older than the prune cadence —\nnever a silent live pin.\n\nbd-u4e2: `pane_id`/`workspace_id`/`tab_id` are the LIVE herdr pane the pin\nruns in (advisory; all `None` when no herdr backend is reachable). Additive\noptionals — pre-u4e2 clients parse rows unchanged.",
+            "description": "`whois`: `{name, npub, program, model, task_description, last_active_ts_us,\nstale, pane_id, workspace_id, tab_id}`.\n\nADR-0010 F2: `stale` flags roster rows older than the prune cadence —\nnever a silent live pin.\n\n`pane_id`/`workspace_id`/`tab_id` are the LIVE herdr pane the pin runs in\n(advisory; all `None` when no herdr backend is reachable). Additive\noptionals, so a client that predates them parses rows unchanged.",
             "properties": {
               "last_active_ts_us": {
                 "format": "int64",
@@ -4001,7 +4001,7 @@
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "properties": {
           "agent_name": {
-            "description": "The identity to look up: a REGISTERED adjective+noun pin, canonical\nname, folded alias, or npub. bd-pin-public-plane-s-easy.8: `name` is\naccepted as a serde alias (grok/other wrappers pass `name`); the\nfield stays REQUIRED (both missing fails — never defaults to $USER\nor a generated pin).",
+            "description": "The identity to look up: a REGISTERED adjective+noun pin, canonical\nname, folded alias, or npub. `name` is accepted as a serde alias\n(grok/other wrappers pass `name`); the field stays REQUIRED (both\nmissing fails — never defaults to $USER or a generated pin).",
             "type": "string"
           },
           "commit_limit": {

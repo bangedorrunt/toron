@@ -10,7 +10,7 @@ Global flags on every command: `--json` (structured reads), `--plain` (flat tabl
 | `serve` | Run the daemon: `--mcp-stdio` or `--mcp-http <addr>`; no-flag serve bails |
 | `daemon` | `start\|stop\|restart\|status\|install\|uninstall` |
 | `status` | Quick health/config overview |
-| `catalog` | Emit the MCP surface catalog (38 tools, 25 resources, 29 CLI verbs); freshness-gated |
+| `catalog` | Emit the MCP surface catalog (38 tools, 25 resources, 30 CLI verbs); freshness-gated |
 | `config` | Effective configuration (flags > env > project > user > system) |
 | `mail` | `send\|inbox\|reply\|ack\|read\|search\|thread-summarize`, `whois`; flags in [mail](./mail) |
 | `channel` | Plane S rooms: `create\|join\|leave\|close\|purge\|list\|members\|post\|read` |
@@ -35,6 +35,37 @@ Global flags on every command: `--json` (structured reads), `--plain` (flat tabl
 | `metrics` | Operator counters: tool calls, errors, latency |
 | `bench` | Mailbox scenarios: startup, inbox, send, search, threads |
 | `tui` | Operator console: Mail/Channels/Agents/Dashboard/Settings tabs, vim keys; refuses non-TTY |
+| `run-state` | Checkpoint read side: `replay\|fork`, both `--thread` + `--seq`; dry, never installs |
+
+## Run-state (`run-state`)
+
+`toron run-state replay --thread <id> --seq <n>` renders one checkpoint
+boundary: the stored model plus the effect keys that boundary owned.
+
+```bash
+toron run-state replay --thread ws-1 --seq 42 --json
+```
+
+```text
+{"thread":"ws-1","seq":42,"model":{"step":42},"effect_keys":["prompt:pane-1"]}
+```
+
+`toron run-state fork --thread <id> --seq <n>` renders what a fork from that
+boundary WOULD do. It is dry by construction and there is no `--perform` flag:
+this build has no installer, so an opt-in flag would be one that lies. A plan
+reports `would_perform`, `installable` (always `false`), the inherited effect
+keys, and the refusals — led by the dispatch hazard when the boundary owned
+effects.
+
+`replay` is EXACT. A boundary that does not exist is a failure naming it, never
+the nearest row below: a reader that fell back would show a step nobody asked
+for. Seeding a live model from the log is the live host's authority call, so
+nothing here writes.
+
+**If it fails:** `no run-state index at <path>` means the host never recorded
+checkpoints (recording is opt-in), not that the read broke. A named boundary
+means that boundary is not in the log — list the thread's history rather than
+re-running against a nearby `seq`.
 
 ## Operator console (`tui`)
 

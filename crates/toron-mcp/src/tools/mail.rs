@@ -438,7 +438,7 @@ pub struct FetchInboxArgs {
     pub ack_overdue_only: Option<bool>,
     pub topic: Option<String>,
     pub mark_read: Option<bool>,
-    /// Keep only messages in this thread (bd-harvest-thread-filter-yp9r).
+    /// Keep only messages in this thread.
     pub thread_id: Option<String>,
 }
 
