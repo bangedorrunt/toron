@@ -68,7 +68,7 @@ pub fn split(area: Rect, mode: LayoutMode, sidebar: bool) -> Panes {
             .min(inner.width.saturating_sub(20).max(1)),
     };
     Panes {
-        sidebar: (sidebar_w > 0).then(|| Rect {
+        sidebar: (sidebar_w > 0).then_some(Rect {
             width: sidebar_w,
             ..area
         }),
@@ -308,7 +308,7 @@ fn hint_line(model: &Model, narrow: bool) -> Line<'static> {
 const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 /// Spinner frame for the tick counter.
-pub fn spinner(tick: u64) -> &'static str {
+pub const fn spinner(tick: u64) -> &'static str {
     FRAMES[(tick as usize) % FRAMES.len()]
 }
 

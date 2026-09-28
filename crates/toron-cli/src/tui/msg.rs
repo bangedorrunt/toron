@@ -38,7 +38,7 @@ pub enum Op {
 
 impl Op {
     /// Human label for the status line.
-    pub fn label(self) -> &'static str {
+    pub const fn label(self) -> &'static str {
         match self {
             Op::Inbox => "inbox",
             Op::Thread => "thread",

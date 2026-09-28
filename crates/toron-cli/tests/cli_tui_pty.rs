@@ -120,25 +120,31 @@ fn console_keys(program: &std::path::Path, steps: &[(&str, &str)]) -> (String, i
     }
 
     let deadline = Instant::now() + Duration::from_secs(15);
-    let mut code = None;
-    while Instant::now() < deadline {
-        if let Some(status) = child.try_wait().expect("console exit status") {
-            code = Some(status.code().unwrap_or(-1));
-            break;
+    let status = loop {
+        match child.try_wait().expect("console exit status") {
+            Some(status) => break status,
+            None => {
+                if Instant::now() >= deadline {
+                    // Still running after the key sequence. `kill` only signals, it
+                    // does NOT reap — so the reap has to be here, in the SAME branch,
+                    // or the console stays a ZOMBIE for the rest of the suite's life.
+                    // That is the same orphan class the doorbell reaper exists to
+                    // clean up in production, and a failing run must not add one.
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!(
+                        "the console did not exit after the key sequence on a 45x24 pty \
+                         (wedged narrow path). It drew:\n{}",
+                        drawn.lock().expect("drawn buffer")
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
         }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    if code.is_none() {
-        let _ = child.kill();
-        panic!(
-            "the console did not exit after the key sequence on a 45x24 pty (wedged narrow \
-             path). It drew:\n{}",
-            drawn.lock().expect("drawn buffer")
-        );
-    }
+    };
     let _ = reader.join();
     let text = drawn.lock().expect("drawn buffer").clone();
-    (text, code.unwrap_or(-1))
+    (text, status.code().unwrap_or(-1))
 }
 
 /// The console works at phone width: one pane, the compact chrome, no resize

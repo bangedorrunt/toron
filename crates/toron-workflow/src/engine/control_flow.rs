@@ -721,11 +721,11 @@ async fn journal_park_intent(
     let Some(runner) = (*stored).clone() else {
         if *mode == EffectJournalMode::Enforced {
             return Err(resonate_sdk::error::Error::Application {
-                message: format!(
+                message:
                     "park REFUSED — no EffectRunner is injected (EffectJournalMode::Enforced): \
                      the park intent must be journaled before the wait, or a crash mid-park \
                      erases the resume point (ADR-0032 Spec 6, bd-ynef)"
-                ),
+                        .to_string(),
             });
         }
         eprintln!(
@@ -1225,8 +1225,7 @@ pub(crate) fn run_step_with_enclosing<'a>(
             // RETURN, never a panic. ADR-0032 Spec 7: retry candidacy resolves
             // in the ONE coordinator (frozen FailureKind vocabulary); a
             // retryable runtime failure retries the SAME node, bounded.
-            if step.on_error == StepOnError::FailRun && crate::engine::is_failure_value(&value)
-            {
+            if step.on_error == StepOnError::FailRun && crate::engine::is_failure_value(&value) {
                 let kind = value.get("kind").and_then(|v| v.as_str()).unwrap_or("");
                 if RetryCoordinator::is_retryable_value(&value) {
                     if !coordinator.should_retry(attempt) {
@@ -1573,7 +1572,10 @@ pub(crate) async fn run_foreach(
         .await?;
         collected.push(value);
     }
-    if let Some(failed) = collected.iter().find(|v| crate::engine::is_failure_value(v)) {
+    if let Some(failed) = collected
+        .iter()
+        .find(|v| crate::engine::is_failure_value(v))
+    {
         let error = failed
             .get("error")
             .and_then(serde_json::Value::as_str)
@@ -1655,7 +1657,10 @@ pub(crate) async fn run_parallel(
     for future in futures {
         collected.push(future.await?);
     }
-    if let Some(failed) = collected.iter().find(|v| crate::engine::is_failure_value(v)) {
+    if let Some(failed) = collected
+        .iter()
+        .find(|v| crate::engine::is_failure_value(v))
+    {
         let error = failed
             .get("error")
             .and_then(serde_json::Value::as_str)
@@ -2275,7 +2280,7 @@ pub(crate) fn resolve_template_ref(
                     .map(serde_json::Value::String)
             });
     }
-    if let Some(value) = serde_json::from_str::<serde_json::Value>(trimmed).ok() {
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
         return Some(value);
     }
     // `@items` and a bare name are the compose spelling of "the list called
@@ -2300,6 +2305,10 @@ pub(crate) const MAX_LOOP_ITERS: u32 = 32;
 /// aborts the loop with that failure. Exhaustion is `{ok:false}` so the
 /// loop step's own on_error decides the run. A recorded stub (dry run,
 /// `{action: ...}` and no `ok`) is one preview pass, not a fake verify.
+// bd-x4qw: the identity quadruple (workflow/node/run_id/digest) is one concept
+// passed as four strings, matching the 7 sibling fns in this file that carry the
+// same allow. A struct on 2 of 11 signatures would be the alien, not the fix.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_loop(
     ctx: &Context,
     trigger: &serde_json::Value,
@@ -2392,12 +2401,17 @@ pub(crate) async fn run_loop(
 /// not a passed verify and not a failed one.
 fn recorded_preview(outputs: &serde_json::Map<String, serde_json::Value>) -> bool {
     outputs.values().any(|v| {
-        v.get("action").and_then(serde_json::Value::as_str).is_some()
+        v.get("action")
+            .and_then(serde_json::Value::as_str)
+            .is_some()
             && v.get("ok").is_none()
             && v.get("status").is_none()
     })
 }
 
+// bd-x4qw: same identity quadruple as run_loop, and the same deliberate
+// allow its 7 siblings carry.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_steps_iter(
     ctx: &Context,
     trigger: &serde_json::Value,
@@ -2625,8 +2639,7 @@ pub(crate) async fn run_graph(
                 } => RetryCoordinator::from_retry_action(*max_attempts, *backoff_secs),
                 _ => RetryCoordinator::default_policy(),
             };
-            if node.on_error == StepOnError::FailRun && crate::engine::is_failure_value(&value)
-            {
+            if node.on_error == StepOnError::FailRun && crate::engine::is_failure_value(&value) {
                 let kind = value.get("kind").and_then(|v| v.as_str()).unwrap_or("");
                 if RetryCoordinator::is_retryable_value(&value) {
                     let attempt = *attempts.get(&name).unwrap_or(&1);
@@ -3079,7 +3092,9 @@ fn json_object_in_text(text: &str) -> Option<serde_json::Map<String, serde_json:
         return Some(map);
     }
     let trimmed = text.trim();
-    let rest = trimmed.strip_prefix("```json").or_else(|| trimmed.strip_prefix("```"))?;
+    let rest = trimmed
+        .strip_prefix("```json")
+        .or_else(|| trimmed.strip_prefix("```"))?;
     let body = rest.rsplit_once("```")?.0;
     parse(body)
 }
@@ -3118,7 +3133,10 @@ mod control_flow_guard_tests {
             super::parallel_fanout_count("{{inputs.n}}", &trigger, &outputs),
             Some(3)
         );
-        assert_eq!(super::parallel_fanout_count("4", &trigger, &outputs), Some(4));
+        assert_eq!(
+            super::parallel_fanout_count("4", &trigger, &outputs),
+            Some(4)
+        );
         assert_eq!(
             super::parallel_fanout_count("@crew.coder", &trigger, &outputs),
             None

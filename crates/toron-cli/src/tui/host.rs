@@ -550,7 +550,7 @@ pub fn composed_send(
 }
 
 /// Which operation an effect belongs to (the typed-failure label).
-pub fn effect_op(effect: &Effect) -> Op {
+pub const fn effect_op(effect: &Effect) -> Op {
     match effect {
         Effect::RefreshInbox => Op::Inbox,
         Effect::RefreshThread { .. } => Op::Thread,
@@ -658,7 +658,7 @@ pub mod fake {
     use std::time::Duration;
 
     use super::{Msg, TuiHost, now_unix};
-    use crate::tui::model::SettingsState;
+    use crate::tui::model::{ReceiptCounts, SettingsState};
     use crate::tui::msg::{Effect, Op};
 
     /// How a scripted host answers.
@@ -792,7 +792,7 @@ pub mod fake {
                 ..Default::default()
             }]),
             Effect::Search { .. } => Msg::SearchLoaded(Vec::new()),
-            Effect::RefreshReceipts => Msg::ReceiptsLoaded(Default::default()),
+            Effect::RefreshReceipts => Msg::ReceiptsLoaded(ReceiptCounts::default()),
             Effect::RefreshHealth => Msg::HealthLoaded(Vec::new()),
             Effect::AckMessage { message_id } | Effect::ReadMessage { message_id } => {
                 Msg::ReceiptWritten {

@@ -1329,7 +1329,7 @@ pub(crate) fn read_presence(mailbox: &Mailbox, project: &str, now_secs: u64) -> 
         }
     }
     let mut out: Vec<PresenceRow> = by_npub.into_values().collect();
-    out.sort_by(|a, b| b.ts.cmp(&a.ts));
+    out.sort_by_key(|r| std::cmp::Reverse(r.ts));
     out
 }
 

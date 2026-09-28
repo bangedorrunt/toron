@@ -52,7 +52,7 @@ impl Field {
     ];
 
     /// Label rendered on the form's left edge.
-    pub fn label(self) -> &'static str {
+    pub const fn label(self) -> &'static str {
         match self {
             Field::To => "To",
             Field::Subject => "Subject",
@@ -90,7 +90,7 @@ impl Importance {
     pub const ALL: [Importance; 3] = [Importance::Normal, Importance::High, Importance::Urgent];
 
     /// Wire value.
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Importance::Normal => "normal",
             Importance::High => "high",
@@ -212,7 +212,7 @@ impl ComposeState {
     }
 
     /// Mutable access to the focused field's text, when it has any.
-    fn text_mut(&mut self) -> Option<&mut String> {
+    const fn text_mut(&mut self) -> Option<&mut String> {
         match self.field {
             Field::To => Some(&mut self.to),
             Field::Subject => Some(&mut self.subject),

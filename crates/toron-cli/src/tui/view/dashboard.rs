@@ -55,7 +55,7 @@ fn render_cards(f: &mut Frame, row1: Rect, row2: Rect, model: &Model) {
         cards1[0],
         "inbox",
         &charts_compact(model.mail.messages.len() as u64),
-        &format!("{} unread", unread),
+        &format!("{unread} unread"),
         true,
     );
     widgets::stat_card(

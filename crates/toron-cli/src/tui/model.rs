@@ -54,7 +54,7 @@ impl Tab {
     }
 
     /// Tab-bar label.
-    pub fn title(self) -> &'static str {
+    pub const fn title(self) -> &'static str {
         match self {
             Tab::Mail => "Mail",
             Tab::Channels => "Channels",
@@ -92,12 +92,12 @@ impl Tab {
     }
 
     /// True when the tab renders sidebar + list + reader.
-    pub fn has_reader(self) -> bool {
+    pub const fn has_reader(self) -> bool {
         matches!(self, Tab::Mail | Tab::Channels | Tab::Agents)
     }
 
     /// True when the tab renders a filter box (`/` opens insert mode).
-    pub fn filters(self) -> bool {
+    pub const fn filters(self) -> bool {
         matches!(self, Tab::Mail | Tab::Channels | Tab::Agents)
     }
 }
@@ -125,7 +125,7 @@ impl Pane {
     /// Panes visible on a tab, left to right. Truthful per tab: the Agents tab
     /// draws no sidebar, so it must not offer one as a focus target (`h` would
     /// land on a pane nothing renders).
-    pub fn order(tab: Tab) -> &'static [Pane] {
+    pub const fn order(tab: Tab) -> &'static [Pane] {
         match tab {
             Tab::Mail | Tab::Channels => &[Pane::Sidebar, Pane::List, Pane::Reader],
             Tab::Agents => &[Pane::List, Pane::Reader],
@@ -161,13 +161,13 @@ pub enum LayoutMode {
 
 impl LayoutMode {
     /// True in the one-pane (phone-width) mode: chrome and rows compact.
-    pub fn single(self) -> bool {
+    pub const fn single(self) -> bool {
         matches!(self, LayoutMode::Stacked)
     }
 }
 
 /// Pick the layout for a frame size. Pure — the view calls it every frame.
-pub fn layout_mode(width: u16, height: u16) -> LayoutMode {
+pub const fn layout_mode(width: u16, height: u16) -> LayoutMode {
     if width < MIN_W || height < MIN_H {
         return LayoutMode::TooSmall;
     }
@@ -181,8 +181,9 @@ pub fn layout_mode(width: u16, height: u16) -> LayoutMode {
 }
 
 /// Mail folder axis (the sidebar of the Mail tab).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Folder {
+    #[default]
     Inbox,
     Unread,
     Threads,
@@ -201,7 +202,7 @@ impl Folder {
     ];
 
     /// Sidebar label.
-    pub fn title(self) -> &'static str {
+    pub const fn title(self) -> &'static str {
         match self {
             Folder::Inbox => "Inbox",
             Folder::Unread => "Unread",
@@ -224,7 +225,7 @@ impl Folder {
     }
 
     /// `j`/`k` movement within the sidebar.
-    pub fn step(self, delta: isize) -> Folder {
+    pub const fn step(self, delta: isize) -> Folder {
         let i = (self as isize + delta).rem_euclid(Self::ALL.len() as isize);
         Self::ALL[i as usize]
     }
@@ -270,12 +271,12 @@ impl MailRow {
     }
 
     /// Still owes an acknowledgement. Unknown state is never owed.
-    pub fn ack_pending(&self) -> bool {
+    pub const fn ack_pending(&self) -> bool {
         self.state_known && self.ack_required && !self.acked
     }
 
     /// Never opened. Unknown state is never claimed as unread.
-    pub fn unread(&self) -> bool {
+    pub const fn unread(&self) -> bool {
         self.state_known && !self.read
     }
 }
@@ -359,12 +360,6 @@ pub struct MailState {
     pub scroll: usize,
 }
 
-impl Default for Folder {
-    fn default() -> Self {
-        Folder::Inbox
-    }
-}
-
 impl MailState {
     /// The rows the list pane shows, derived from the folder + filter +
     /// search state. Newest first.
@@ -428,7 +423,7 @@ pub fn thread_rows(messages: &[MailRow]) -> Vec<ListRow> {
                 if m.at >= t.at {
                     t.at = m.at;
                     if !m.subject.is_empty() {
-                        t.subject = m.subject.clone();
+                        t.subject.clone_from(&m.subject);
                     }
                 }
                 if !t.participants.contains(&m.sender) {
@@ -547,7 +542,7 @@ pub struct PostRow {
 
 impl PostRow {
     /// True for a reaction rather than a post.
-    pub fn is_reaction(&self) -> bool {
+    pub const fn is_reaction(&self) -> bool {
         self.kind == 7
     }
 }
@@ -625,19 +620,19 @@ pub struct AgentRow {
 
 impl AgentRow {
     /// `online` marker with a shape, never color alone (§4): `●` vs `○`.
-    pub fn marker(&self) -> &'static str {
+    pub const fn marker(&self) -> &'static str {
         if self.online { "●" } else { "○" }
     }
 
     /// Human presence word for the detail pane and the dashboard buckets.
-    pub fn state_label(&self) -> &'static str {
+    pub const fn state_label(&self) -> &'static str {
         presence_label(self.online, self.state)
     }
 }
 
 /// Canonical presence word: offline wins, then the five herdr-vocabulary
 /// states (never a sixth spelling — ADR-0031 A4).
-pub fn presence_label(online: bool, state: PresenceState) -> &'static str {
+pub const fn presence_label(online: bool, state: PresenceState) -> &'static str {
     if !online {
         return "offline";
     }
@@ -1025,7 +1020,7 @@ impl Model {
     }
 
     /// Cursor position for the focused pane.
-    pub fn cursor(&self) -> usize {
+    pub const fn cursor(&self) -> usize {
         match self.tab {
             Tab::Mail => self.mail.selected,
             Tab::Channels => match self.pane {
@@ -1064,7 +1059,7 @@ impl Model {
     }
 
     /// Write the focused cursor back into its owning state.
-    pub fn set_cursor(&mut self, value: usize) {
+    pub const fn set_cursor(&mut self, value: usize) {
         match self.tab {
             Tab::Mail => self.mail.selected = value,
             Tab::Channels => match self.pane {
