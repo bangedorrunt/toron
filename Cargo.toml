@@ -86,3 +86,18 @@ stable_sort_primitive = { level = "allow", priority = 1 }
 bool_to_int_with_if = { level = "allow", priority = 1 }
 many_single_char_names = { level = "allow", priority = 1 }
 unnecessary_wraps = { level = "allow", priority = 1 }
+# Wave 2e: toron-cli TUI (bd-x4qw). Same allow-not-fix mechanism as 2a-2d, for
+# two kinds whose suggested rewrite is WORSE at each site rather than merely
+# cosmetic:
+#   option_if_let_else (6, all in tui/) — every one turns a `match` whose two
+#     arms are already named into a nested `map_or_else` with two closures. In a
+#     reducer whose arms are the readable part (Ok => message, Err => Msg::Failed)
+#     that trades a flat arm list for a closure sandwich. Fixing this lint makes
+#     the Elm fold harder to read, which is the opposite of the ADR-0031 goal.
+#   type_complexity (1, a table-driven test in mailbox_source.rs) — a 3-tuple
+#     table of (label, flags, expected). Naming the tuple buys nothing.
+# Tighten one at a time later, like 2a-2d. Everything else in this wave WAS fixed
+# in source, including a real defect: cli_tui_pty.rs killed a wedged pty console
+# without reaping it, leaving a zombie for the rest of the suite.
+option_if_let_else = { level = "allow", priority = 1 }
+type_complexity = { level = "allow", priority = 1 }
