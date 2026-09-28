@@ -105,9 +105,9 @@ pub enum Command {
     #[command(subcommand)]
     Mail(MailCommand),
 
-    /// Ack-SLA scan+publish (bd-0zcr.2 G1): emit one `ack-sla-expired` wake
-    /// per overdue ack-required post and print the expired ids. CLI-only
-    /// (no new MCP tool, ADR-0020 wave 1 freeze).
+    /// Ack-SLA scan+publish: emit one `ack-sla-expired` wake per overdue
+    /// ack-required post and print the expired ids. CLI-only (no new MCP
+    /// tool, ADR-0020 wave 1 freeze).
     AckSla(AckSlaArgs),
 
     /// File reservations: acquire/conflicts/list/renew/release/release-by-reason/force-release.
@@ -198,6 +198,39 @@ pub enum Command {
     /// Role binding via 30013 role= tags + alias (ADR-0027 E4).
     #[command(subcommand)]
     Role(RoleCommand),
+
+    /// Run-state checkpoints (ADR-0035): read one boundary's model and its
+    /// pending-write set, or render what a fork from it WOULD do. Read-only
+    /// and CLI-only: nothing here seeds a live model from the log.
+    #[command(subcommand)]
+    RunState(RunStateCommand),
+}
+
+/// `toron run-state` (ADR-0035, spec S8). Read-only half of the checkpoint
+/// store: `replay` renders a boundary, `fork` renders a plan.
+///
+/// No `--project` on purpose. The checkpoint table is keyed by
+/// `(thread_id, seq)` and carries no project column, so a `--project` filter
+/// here would read as a scope it does not enforce. `thread` IS the unit.
+#[derive(Debug, Subcommand)]
+pub enum RunStateCommand {
+    /// Print one boundary's model and the effect keys it owned. Exact: a
+    /// boundary that does not exist is an error, never a nearby one.
+    Replay(RunStateBoundaryArgs),
+
+    /// Render what a fork from a boundary WOULD do. Dry by default and
+    /// refusing to install: seeding a live model is the live host's call.
+    Fork(RunStateBoundaryArgs),
+}
+
+#[derive(Debug, clap::Args)]
+pub struct RunStateBoundaryArgs {
+    /// Thread the boundaries belong to, as recorded by the recorder.
+    #[arg(long, required = true)]
+    pub thread: String,
+    /// Boundary sequence number, as recorded by the recorder.
+    #[arg(long, required = true)]
+    pub seq: i64,
 }
 
 /// toron workflow (fabric) subcommands (ADR-0005 Spec 5).
