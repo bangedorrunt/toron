@@ -135,7 +135,8 @@ fn no_tool_or_resource_description_carries_a_bead_id() {
         found.len(),
         found.into_iter().collect::<Vec<_>>().join("\n  ")
     );
-}#[test]
+}
+#[test]
 fn the_bead_id_matcher_actually_bites() {
     // A gate that cannot fail is theater, and this matcher is a hand-written
     // scanner. Prove it finds the two shapes the ledgers mint, and does not
@@ -162,5 +163,8 @@ fn the_bead_id_matcher_actually_bites() {
         Vec::<String>::new(),
         "a token that merely ends in bd- is not a bead id"
     );
-    assert_eq!(bead_ids("ADR-0027 E2 assignment tags"), Vec::<String>::new());
+    assert_eq!(
+        bead_ids("ADR-0027 E2 assignment tags"),
+        Vec::<String>::new()
+    );
 }

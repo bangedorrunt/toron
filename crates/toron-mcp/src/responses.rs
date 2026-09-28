@@ -246,7 +246,9 @@ pub struct ConflictReportOut {
     pub clear_paths: Vec<String>,
     pub checked_paths: i64,
     pub total_conflicting_reservations: i64,
-    /// ADR-0011 Spec 4: additive soft tier (in-TTL intents).
+    /// ADR-0011 Spec 4: additive soft tier — other agents' in-TTL intents AND
+    /// their live shared leases. Neither blocks; both mean "someone is here".
+    /// A path listed in `clear_paths` is one nobody holds or declared.
     pub soft_conflicts: Vec<PathConflictOut>,
     pub has_soft_conflicts: bool,
     /// ACTIVE build-slot leases held by others — "is the cargo fence free?"

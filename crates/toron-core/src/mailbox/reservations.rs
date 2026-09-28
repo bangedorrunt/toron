@@ -380,7 +380,10 @@ pub struct ConflictReport {
     pub clear_paths: Vec<String>,
     pub checked_paths: usize,
     pub total_conflicting_reservations: usize,
-    /// Soft conflicts (other agents' in-TTL intents) — ADR-0011 Spec 4.
+    /// Soft conflicts — ADR-0011 Spec 4: other agents' in-TTL intents, and
+    /// (bd-4dl4) their live SHARED leases. Neither blocks; both mean "someone
+    /// is here". A path appears in `clear_paths` only when nobody holds AND
+    /// nobody declared it.
     pub soft_conflicts: Vec<PathConflict>,
     /// True when any path has a soft conflict.
     pub has_soft_conflicts: bool,
@@ -657,6 +660,36 @@ impl Mailbox {
                 },
             );
             let (hard, hard_ids, soft, soft_ids) = Self::split_blockers(&blockers);
+
+            // bd-4dl4: a live SHARED lease by another agent blocks nobody, so
+            // the kernel above returns no blocker for it and the path would
+            // land in `clear_paths` with nothing else set — the reader
+            // concludes nobody is there when someone declared they are. Fold
+            // those holders into the ADVISORY tier: `conflict_free` stays true
+            // (a shared lease genuinely does not fence anyone, ADR-0011 Spec
+            // 4), but the path is no longer reported as bare clear, so
+            // `clear_paths` means "nobody holds or declared this".
+            //
+            // Only the shared ones are added here; the exclusive ones are
+            // already in `hard` and adding them again would double-count
+            // `total_conflicting_reservations`.
+            let mut soft = soft;
+            let mut soft_ids = soft_ids;
+            for id in reservations_core::advisory_viewers(
+                &model,
+                &agent_keys.public_key().to_hex(),
+                path,
+                now_us,
+            ) {
+                if hard_ids.contains(&id) {
+                    continue;
+                }
+                if let Some((name, ReservationStatus::Held)) = meta.get(&id) {
+                    soft.push(name.clone());
+                    soft_ids.push(id);
+                }
+            }
+
             if hard.is_empty() && soft.is_empty() {
                 report.clear_paths.push(path.clone());
             } else {
@@ -2855,6 +2888,239 @@ mod tests {
 
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// bd-4dl4: a holder who took a broad GLOB must be visible to a second
+    /// agent asking about a literal path INSIDE it. The matrix is the bead's,
+    /// unchanged, including the row that makes the diagnosis unambiguous:
+    /// asking about the IDENTICAL glob has to collide, and if it does, the
+    /// request reached the board and the defect is in the comparison; if it
+    /// does not, the request never reached the board at all.
+    ///
+    /// A false clear here is not cosmetic. The pre-commit guard blocks a
+    /// commit whose paths another agent holds, and AGENTS.md tells an agent to
+    /// read this board when blocked, so a matcher that cannot see glob-vs-
+    /// literal overlap makes the guard blind in exactly the case it exists
+    /// for. The broad claim is the NORMAL form here, because the repo's own
+    /// instructions tell agents to reserve with globs.
+    #[tokio::test]
+    async fn test_glob_holder_is_visible_to_a_literal_inside_it() {
+        const HELD: &str = "crates/*/src/*.rs";
+        const MATRIX: &[(&str, bool)] = &[
+            ("crates/doorbell-rt/src/store.rs", true),
+            ("crates/doorbell-rt/src/*.rs", true),
+            (HELD, true),
+            ("crates/other/src/x.rs", true),
+            ("docs/readme.md", false),
+        ];
+
+        let (mailbox, db_path, data_dir) = test_mailbox("glob-matrix").await;
+        register(&mailbox, "demo", "IvoryRidge").await;
+        register(&mailbox, "demo", "TealMarlin").await;
+
+        // Granted, so the broad claim really IS on the board. A test that
+        // silently asserts a conflict on an empty board would pass for the
+        // wrong reason.
+        let acq = mailbox
+            .file_reservation_paths(
+                "demo",
+                "IvoryRidge",
+                &[HELD.to_string()],
+                Some(3600),
+                true,
+                Some("bd-4dl4"),
+            )
+            .await
+            .expect("acquire");
+        assert_eq!(
+            acq.granted.len(),
+            1,
+            "the broad claim is GRANTED, so it is really on the board: {acq:?}"
+        );
+
+        let report = mailbox
+            .check_file_reservation_conflicts(
+                "demo",
+                "TealMarlin",
+                &MATRIX
+                    .iter()
+                    .map(|(p, _)| (*p).to_string())
+                    .collect::<Vec<_>>(),
+            )
+            .await
+            .expect("conflicts");
+
+        let conflicted: Vec<&str> = report.conflicts.iter().map(|c| c.path.as_str()).collect();
+        for (path, should_conflict) in MATRIX {
+            assert_eq!(
+                conflicted.contains(path),
+                *should_conflict,
+                "`{path}` should {}. conflict_free={} clear_paths={:?} conflicts={:?} \
+                 soft={:?} total={}",
+                if *should_conflict {
+                    "REPORT"
+                } else {
+                    "NOT report"
+                },
+                report.conflict_free,
+                report.clear_paths,
+                conflicted,
+                report
+                    .soft_conflicts
+                    .iter()
+                    .map(|c| c.path.as_str())
+                    .collect::<Vec<_>>(),
+                report.total_conflicting_reservations
+            );
+        }
+        // A holder is only ever NAMED, never a self-match: this check is about
+        // other agents' claims.
+        for c in &report.conflicts {
+            assert!(
+                c.holders.iter().any(|h| h == "IvoryRidge"),
+                "the holder is named on `{}`, so the board really was read: {c:?}",
+                c.path
+            );
+        }
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// bd-4dl4, the part that IS a real defect. The bead's repro omitted
+    /// `--exclusive`, which is a bare bool defaulting to false, so the lease
+    /// it took was SHARED. The matcher was never broken: the identical glob
+    /// collides correctly as soon as the lease is exclusive.
+    ///
+    /// The real bug is one layer down and worse for being quiet. A live shared
+    /// lease matched no branch of the decision, so it appeared in NEITHER tier
+    /// and the path came back in `clear_paths` with `conflict_free: true` and
+    /// `has_soft_conflicts: false`. A reader has no way to tell that from
+    /// "checked, nobody here" — which is the confident wrong answer a
+    /// coordination primitive must never produce. It must now surface in the
+    /// ADVISORY tier: still not a fence, but named.
+    #[tokio::test]
+    async fn test_a_shared_lease_is_advisory_not_invisible() {
+        let (mailbox, db_path, data_dir) = test_mailbox("shared-soft").await;
+        register(&mailbox, "demo", "IvoryRidge").await;
+        register(&mailbox, "demo", "TealMarlin").await;
+
+        // NOT --exclusive: this is the case the bead's repro actually created.
+        let acq = mailbox
+            .file_reservation_paths(
+                "demo",
+                "IvoryRidge",
+                &["crates/*/src/*.rs".to_string()],
+                Some(3600),
+                false,
+                Some("shared"),
+            )
+            .await
+            .expect("acquire shared");
+        assert_eq!(acq.granted.len(), 1);
+        assert!(
+            !acq.granted[0].exclusive,
+            "the lease really is shared, or this test proves nothing"
+        );
+
+        let report = mailbox
+            .check_file_reservation_conflicts(
+                "demo",
+                "TealMarlin",
+                &[
+                    "crates/doorbell-rt/src/store.rs".to_string(),
+                    "docs/readme.md".to_string(),
+                ],
+            )
+            .await
+            .expect("conflicts");
+
+        // Still not a fence: a shared lease must not change who gets denied.
+        assert!(
+            report.conflict_free,
+            "a shared lease does not fence anyone: {:?}",
+            report.conflicts
+        );
+        assert!(
+            report.conflicts.is_empty(),
+            "and it must not be promoted into the hard tier"
+        );
+
+        // But it must be NAMED. This is the assertion that fails before the
+        // fix, and it is the whole point: `clear_paths` claimed this path was
+        // free while another agent had declared they were working in it.
+        assert!(
+            report.has_soft_conflicts,
+            "a live shared lease is advisory, so it must surface: \
+             soft={:?} clear={:?}",
+            report.soft_conflicts, report.clear_paths
+        );
+        let soft_paths: Vec<&str> = report
+            .soft_conflicts
+            .iter()
+            .map(|c| c.path.as_str())
+            .collect();
+        assert!(
+            soft_paths.contains(&"crates/doorbell-rt/src/store.rs"),
+            "the declared path is named, with its holder: {:?}",
+            report.soft_conflicts
+        );
+        assert!(
+            !soft_paths.contains(&"docs/readme.md"),
+            "a genuinely disjoint path stays clear"
+        );
+        assert!(
+            report.clear_paths.contains(&"docs/readme.md".to_string()),
+            "and lands in clear_paths, so clear_paths now means 'nobody holds \
+             or declared it': {:?}",
+            report.clear_paths
+        );
+        assert!(
+            report.soft_conflicts[0]
+                .holders
+                .iter()
+                .any(|h| h == "IvoryRidge"),
+            "the shared holder is named, so the board really was read: {:?}",
+            report.soft_conflicts[0]
+        );
+        // Own leases are not an advisory signal against yourself.
+        let own = mailbox
+            .check_file_reservation_conflicts(
+                "demo",
+                "IvoryRidge",
+                &["crates/x/src/y.rs".to_string()],
+            )
+            .await
+            .expect("own conflicts");
+        assert!(
+            !own.has_soft_conflicts && own.clear_paths.contains(&"crates/x/src/y.rs".to_string()),
+            "your own shared lease is not a conflict with yourself: {own:?}"
+        );
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// bd-4dl4, the separating half: if the PURE matcher already says these
+    /// overlap, the board is at fault; if it does not, the matcher is. Keeping
+    /// both tests means a fix that patches the wrong one is caught here rather
+    /// than three layers up in a guard message nobody reads.
+    #[test]
+    fn test_glob_matcher_agrees_with_the_matrix() {
+        const HELD: &str = "crates/*/src/*.rs";
+        for (path, should_conflict) in [
+            ("crates/doorbell-rt/src/store.rs", true),
+            ("crates/doorbell-rt/src/*.rs", true),
+            (HELD, true),
+            ("crates/other/src/x.rs", true),
+            ("docs/readme.md", false),
+        ] {
+            assert_eq!(
+                super::overlaps(HELD, path),
+                should_conflict,
+                "the pure matcher disagrees on `{path}`"
+            );
+        }
     }
 
     /// bd-pin-public-plane-s-easy.13 unhappy path: transferring a path the
