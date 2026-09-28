@@ -48,6 +48,14 @@ fn all_variant_actions() -> Vec<Action> {
         parse_action("    action: spawn\n    profile: \"@housekeeper\"\n    await: true\n"),
         parse_action("    action: verify\n    command: \"mbx test\"\n"),
         parse_action("    action: reduce\n    over: \"{{trigger.items}}\"\n    op: count\n"),
+        // bd-x4qw: `loop` was in the advertised vocabulary (schema.rs ADVERTISED)
+        // and had a contract (action_contract.rs LOOP), but no INSTANCE here — so
+        // this test was RED on `main` before it was fixed. That is the test doing
+        // its job: an advertised action with no representative in the contract
+        // table is exactly the gap it exists to catch.
+        parse_action(
+            "    action: loop\n    max: 3\n    body:\n      - action: delay\n        secs: 1\n",
+        ),
     ]
 }
 
@@ -68,7 +76,7 @@ fn contract_covers_every_advertised_name() {
         covered, advertised,
         "contract table == advertised vocabulary"
     );
-    assert_eq!(covered.len(), 15, "closed set has 15 variants");
+    assert_eq!(covered.len(), 16, "closed set has 16 variants");
 }
 
 /// The contract table never disagrees with the engine partition: same sink,
