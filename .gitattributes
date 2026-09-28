@@ -1,0 +1,25 @@
+# Declared projections (bd-lyih).
+#
+# The commit guard's bead-hunk attribution rule requires every bd-* token
+# ADDED by the staged diff to appear in the commit message. That is right for
+# work this repository performs. It is wrong for a file a GENERATOR wrote, so
+# those are declared here and the guard stops charging this repo for bead ids
+# that belong to whoever fed the generator.
+#
+# `linguist-generated=true` is the ecosystem's existing marker for exactly
+# this, which is why it is reused rather than a toron-private format. The
+# guard evaluates it per path, last match wins, and REFUSES any pattern that
+# would also match compiled source — so this file cannot be used to switch the
+# rule off for the crates.
+#
+# Only genuinely machine-written files belong here. A hand-written file that
+# mentions a foreign bead id still owes attribution; see toron-core's
+# `mailbox::guard` tests for the negative control that proves it.
+
+# `toron catalog --json` output. Contains no bead ids (the
+# catalog_no_internal_ids gate keeps it that way) but it is rewritten wholesale
+# on every surface change, so the exemption is here to survive the next one.
+docs/catalog/toron-mcp.json linguist-generated=true
+
+# `TORON_REGEN_SHAPES=1 mbx test -p toron-mcp catalog_shapes` output.
+crates/toron-mcp/tests/fixtures/tool-method-shapes-v2.json linguist-generated=true

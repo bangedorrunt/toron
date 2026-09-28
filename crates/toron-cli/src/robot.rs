@@ -1569,6 +1569,144 @@ fn guard_record_agent(args: &crate::cli::GuardRecordArgs) -> Option<String> {
 }
 
 /// Shared tail of `guard check` (strict + legacy paths, exit codes).
+/// The guard's verdict on one commit, as DATA.
+///
+/// bd-lyih: the decision and the effect edge were fused — `finish_guard_check`
+/// printed, wrote to stderr and called `std::process::exit` inline, so the
+/// one thing that most needs proving (that a declaration the guard cannot
+/// honour actually BLOCKS, rather than degrading into a shrug) could only be
+/// reached through a live daemon, a git hook and a subprocess. The decision
+/// is pure; the edge prints and exits.
+pub struct GuardVerdict {
+    /// What the commit-msg hook parses.
+    pub report: serde_json::Value,
+    /// 0 allows the commit, 1 blocks it. The hook gates on this alone.
+    pub exit_code: i32,
+    /// Human-facing stderr lines, in the order they should be read.
+    pub notices: Vec<String>,
+}
+
+/// Pure decision core for `toron guard check`. Assumes strict mode; the
+/// operator hatch is handled by the caller, which must also print its own
+/// escape notice before exiting 0.
+pub fn guard_check_verdict(
+    repo: &std::path::Path,
+    project: &str,
+    agent: Option<&str>,
+    staged: &[String],
+    reservations: &[toron_core::mailbox::guard::Reservation],
+    resolve: &dyn Fn(&str) -> String,
+    message: Option<&str>,
+) -> GuardVerdict {
+    use toron_core::mailbox::guard::{
+        ProjectedDeclFault, StrictBlockKind, guard_check_strict_resolved,
+    };
+    let blocked = guard_check_strict_resolved(
+        agent,
+        staged,
+        reservations,
+        toron_core::mailbox::guard::SHARED_SAFE_PATHS,
+        resolve,
+    );
+    // bd-9mb8 bead-hunk attribution: bd-* tokens ADDED by the staged diff must
+    // appear in the commit message (--msg-file from the commit-msg hook).
+    // Skipped when no message was supplied.
+    let bead_blocks = message.map_or_else(Vec::new, |msg| {
+        let added = toron_core::mailbox::guard::added_lines_for_hunk_attribution(repo);
+        toron_core::mailbox::guard::bead_hunk_violations(&added, msg)
+    });
+    // bd-lyih: a repository that VENDORS prose from another repo declares
+    // those paths in .gitattributes, and the bead ids inside them belong to
+    // the SOURCE ledger. A declaration we cannot honour is NOT ignored —
+    // honouring a bad one hides real work, and ignoring a good one blocks a
+    // legitimate commit with no explanation. Both fail closed, loudly.
+    let projected_paths = toron_core::mailbox::guard::projected_paths_in(repo);
+    let projected_fault = toron_core::mailbox::guard::projected_decl_fault(repo, &projected_paths);
+
+    let mut notices: Vec<String> = Vec::new();
+    if let Some(fault) = &projected_fault {
+        notices.push(format!(
+            "toron: strict guard: projected-path declaration REFUSED — {}",
+            match fault {
+                ProjectedDeclFault::CoversBuildSource { pattern, probe } => format!(
+                    "`{pattern}` matches compiled source ({probe}); a projection may not exempt \
+                     files this repository builds. Narrow the pattern, or drop the declaration \
+                     and attribute the ids."
+                ),
+                ProjectedDeclFault::Malformed { line_no, line } => format!(
+                    ".gitattributes:{line_no} (`{line}`) has no attribute; a projected path is \
+                     declared with `{}=true`.",
+                    toron_core::mailbox::guard::PROJECTED_ATTR
+                ),
+            }
+        ));
+    }
+    if !blocked.is_empty() {
+        let summary: Vec<String> = blocked
+            .iter()
+            .map(|b| match &b.kind {
+                StrictBlockKind::HeldBy(h) => format!("{} (held by {h})", b.path),
+                StrictBlockKind::Unreserved => format!("{} (no active reservation)", b.path),
+                StrictBlockKind::Unattributed => b.path.clone(),
+            })
+            .collect();
+        notices.push(if agent.is_none() {
+            "toron: strict guard: unattributed commit blocked — set AGENT_NAME=<pin> (or \
+             TORON_AGENT / FLYWHEEL_MAIL_AS)"
+                .to_string()
+        } else {
+            format!(
+                "toron: strict guard blocked staged paths: {}",
+                summary.join(", ")
+            )
+        });
+    }
+    if !bead_blocks.is_empty() {
+        let toks: Vec<String> = bead_blocks.iter().map(|b| b.token.clone()).collect();
+        notices.push(format!(
+            "toron: strict guard: unattributed bead-tagged hunks — {toks:?} appear in the staged \
+             diff but not in the commit message; add them to the message (escapes: \
+             TORON_GUARD_STRICT=0 or --no-verify)"
+        ));
+    }
+    let report = json!({
+        "strict": true,
+        "blocked": blocked.iter().map(|b| json!({
+            "path": b.path,
+            "reason": match &b.kind {
+                StrictBlockKind::Unattributed => "unattributed",
+                StrictBlockKind::HeldBy(_) => "held-by",
+                StrictBlockKind::Unreserved => "unreserved",
+            },
+            "holder": match &b.kind {
+                StrictBlockKind::HeldBy(h) => Some(h),
+                _ => None,
+            },
+        })).collect::<Vec<_>>(),
+        "unattributed_bead_tokens": bead_blocks
+            .iter()
+            .map(|b| b.token.clone())
+            .collect::<Vec<_>>(),
+        "projected_paths": projected_paths,
+        "projected_decl_fault": projected_fault.as_ref().map(|f| match f {
+            ProjectedDeclFault::CoversBuildSource { pattern, probe, .. } => {
+                format!("covers-build-source: {pattern} matches {probe}")
+            }
+            ProjectedDeclFault::Malformed { line_no, line } => {
+                format!("malformed: .gitattributes:{line_no} `{line}`")
+            }
+        }),
+        "agent": agent,
+        "project": project,
+    });
+    let clean = blocked.is_empty() && bead_blocks.is_empty() && projected_fault.is_none();
+    GuardVerdict {
+        report,
+        exit_code: i32::from(!clean),
+        notices,
+    }
+}
+
 fn finish_guard_check(
     args: &crate::cli::GuardCheckArgs,
     agent: Option<&str>,
@@ -1610,83 +1748,32 @@ fn finish_guard_check(
         std::process::exit(0);
     }
     if strict {
-        use toron_core::mailbox::guard::{StrictBlockKind, guard_check_strict_resolved};
-        let blocked = guard_check_strict_resolved(
+        // NO `--msg-file` means the pre-commit hook, which runs before the
+        // editor opens and therefore has no message to judge. That must stay
+        // DISTINCT from an empty one: collapsing the two made pre-commit
+        // charge every bead-tagged hunk against an empty message, so any
+        // commit carrying a `bd-*` line was blocked twice over.
+        let message = args
+            .msg_file
+            .as_ref()
+            .map(|mf| std::fs::read_to_string(mf).unwrap_or_default());
+        let verdict = guard_check_verdict(
+            &args.repo,
+            &args.project,
             agent,
             staged,
             reservations,
-            toron_core::mailbox::guard::SHARED_SAFE_PATHS,
             &resolve,
+            message.as_deref(),
         );
-        // bd-9mb8 bead-hunk attribution: bd-* tokens ADDED by the staged
-        // diff must appear in the commit message (--msg-file from the
-        // commit-msg hook). Skipped when no message file was supplied.
-        let bead_blocks = args.msg_file.as_ref().map_or_else(Vec::new, |mf| {
-            let msg = std::fs::read_to_string(mf).unwrap_or_default();
-            let added = toron_core::mailbox::guard::staged_added_lines_in(
-                &args.repo,
-                toron_core::mailbox::guard::SHARED_SAFE_PATHS,
-            );
-            toron_core::mailbox::guard::bead_hunk_violations(&added, &msg)
-        });
-        if !blocked.is_empty() {
-            let summary: Vec<String> = blocked
-                .iter()
-                .map(|b| match &b.kind {
-                    StrictBlockKind::HeldBy(h) => format!("{} (held by {h})", b.path),
-                    StrictBlockKind::Unreserved => {
-                        format!("{} (no active reservation)", b.path)
-                    }
-                    StrictBlockKind::Unattributed => b.path.clone(),
-                })
-                .collect();
-            if agent.is_none() {
-                eprintln!(
-                    "toron: strict guard: unattributed commit blocked — set AGENT_NAME=<pin> (or TORON_AGENT / FLYWHEEL_MAIL_AS)"
-                );
-            } else {
-                eprintln!(
-                    "toron: strict guard blocked staged paths: {}",
-                    summary.join(", ")
-                );
-            }
+        for line in &verdict.notices {
+            eprintln!("{line}");
         }
-        if !bead_blocks.is_empty() {
-            let toks: Vec<String> = bead_blocks.iter().map(|b| b.token.clone()).collect();
-            eprintln!(
-                "toron: strict guard: unattributed bead-tagged hunks — {toks:?} appear in the staged diff but not in the commit message; add them to the message (escapes: TORON_GUARD_STRICT=0 or --no-verify)"
-            );
-        }
-        let out = json!({
-            "strict": true,
-            "blocked": blocked.iter().map(|b| json!({
-                "path": b.path,
-                "reason": match &b.kind {
-                    StrictBlockKind::Unattributed => "unattributed",
-                    StrictBlockKind::HeldBy(_) => "held-by",
-                    StrictBlockKind::Unreserved => "unreserved",
-                },
-                "holder": match &b.kind {
-                    StrictBlockKind::HeldBy(h) => Some(h),
-                    _ => None,
-                },
-            })).collect::<Vec<_>>(),
-            "unattributed_bead_tokens": bead_blocks
-                .iter()
-                .map(|b| b.token.clone())
-                .collect::<Vec<_>>(),
-            "agent": agent,
-            "project": args.project,
-        });
-        print_json(&out)?;
+        print_json(&verdict.report)?;
         // Explicit exit both ways: the demo mailbox keeps a
         // background thread alive after the tokio runtime shuts down,
         // which would HANG a pre-commit hook.
-        std::process::exit(if blocked.is_empty() && bead_blocks.is_empty() {
-            0
-        } else {
-            1
-        });
+        std::process::exit(verdict.exit_code);
     }
     // Legacy (non-strict) surface: unchanged fail-open for an unattributed
     // commit, but the same identity fold for everything attributed.
@@ -2359,5 +2446,275 @@ mod holder_fold_tests {
             1,
             "an unattributable pin must stay blocked: {foreign:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod guard_projection_tests {
+    //! bd-lyih: the declared-projection exemption as the guard REPORTS it.
+    //!
+    //! The decision is proved in `toron-core`'s `mailbox::guard` tests. What
+    //! is proved HERE is the part where it actually bites: the JSON the
+    //! commit-msg hook parses, and the exit code it gates on. A declaration
+    //! the guard cannot honour has to BLOCK, loudly — not degrade into a
+    //! shrug that looks like success.
+    //!
+    //! These drive [`guard_check_verdict`] rather than the binary, because
+    //! the binary reaches this decision through a live daemon's reservation
+    //! roster. A test that needs a daemon is a test that fails in CI for
+    //! reasons unrelated to the rule.
+
+    use super::*;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    /// A repo with one real crate (so there IS compiled source to protect), a
+    /// guide carrying a foreign bead id, and a source file carrying its own.
+    /// Built with the git CLI: toron-cli does not depend on libgit2, and this
+    /// is the index state the guard reads, not the library that reads it.
+    fn repo(attrs: &str) -> PathBuf {
+        // A per-process COUNTER, not a clock. `SystemTime::now()` is coarse
+        // enough on macOS that two test threads reading it in the same
+        // instant get the same value, so two fixtures landed in one
+        // directory and raced on `git init` — a flake that only shows up
+        // under the parallel runner.
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let root =
+            std::env::temp_dir().join(format!("toron-guard-projected-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(root.join("docs/guides")).expect("guides");
+        std::fs::create_dir_all(root.join("crates/demo/src")).expect("crate src");
+        std::fs::write(root.join("crates/demo/Cargo.toml"), "[package]\n").expect("toml");
+        std::fs::write(root.join(".gitattributes"), attrs).expect("attrs");
+        std::fs::write(
+            root.join("docs/guides/mail.md"),
+            "toron mail send --thread bd-foreign1\n",
+        )
+        .expect("guide");
+        std::fs::write(
+            root.join("crates/demo/src/lib.rs"),
+            "// governed-by: bd-source01\n",
+        )
+        .expect("src");
+        let git = |args: &[&str]| {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .output()
+                .expect("run git");
+            assert!(
+                out.status.success(),
+                "git {args:?} failed in {}: {}",
+                root.display(),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init", "-q"]);
+        git(&["add", "docs/guides/mail.md", "crates/demo/src/lib.rs"]);
+        root
+    }
+
+    const STAGED: [&str; 2] = ["docs/guides/mail.md", "crates/demo/src/lib.rs"];
+
+    /// The verdict the way the hook sees it: every staged path covered by the
+    /// committer's own lease, so the staged-path check is satisfied and the
+    /// hunk rule is the ONLY thing under test.
+    fn verdict(root: &Path, message: &str) -> GuardVerdict {
+        let staged: Vec<String> = STAGED.iter().map(|s| (*s).to_string()).collect();
+        let own = vec![toron_core::mailbox::guard::Reservation {
+            holder: "IvoryRidge".to_string(),
+            pattern: "**".to_string(),
+            exclusive: true,
+        }];
+        let resolve = |n: &str| n.to_string();
+        guard_check_verdict(
+            root,
+            "demo",
+            Some("IvoryRidge"),
+            &staged,
+            &own,
+            &resolve,
+            Some(message),
+        )
+    }
+
+    #[test]
+    fn a_declared_projection_is_reported_and_not_charged_attribution() {
+        let root = repo("docs/guides/** linguist-generated=true\n");
+        let v = verdict(&root, "docs: refresh [bd-source01]\n");
+
+        assert_eq!(
+            v.report["projected_paths"],
+            json!(["docs/guides/**"]),
+            "the declaration is surfaced, not applied silently: {}",
+            v.report
+        );
+        assert!(
+            v.report["projected_decl_fault"].is_null(),
+            "a sound declaration reports no fault: {}",
+            v.report
+        );
+        assert_eq!(
+            v.report["unattributed_bead_tokens"],
+            json!([]),
+            "the guide's foreign id is exempt and the source's is named: {}",
+            v.report
+        );
+        assert_eq!(v.exit_code, 0, "a sound declaration must not block");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn the_same_commit_without_the_declaration_is_blocked() {
+        // The negative control. Same repo, same message, same staged files —
+        // only the .gitattributes line removed. Without this the test above
+        // could be green because the guard is not scanning the guide at all.
+        let root = repo("# no declaration here\n");
+        let v = verdict(&root, "docs: refresh [bd-source01]\n");
+
+        assert_eq!(
+            v.report["unattributed_bead_tokens"],
+            json!(["bd-foreign1"]),
+            "an undeclared foreign id is still a violation: {}",
+            v.report
+        );
+        assert_eq!(v.exit_code, 1, "and it blocks");
+        assert!(
+            v.notices
+                .iter()
+                .any(|n| n.contains("bd-foreign1") && n.contains("bead-tagged")),
+            "the operator is told which token to attribute: {:?}",
+            v.notices
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_declaration_reaching_compiled_source_fails_closed() {
+        // The dangerous direction: `**` would switch the rule off for every
+        // source file in the repo. It must BLOCK and name itself.
+        let root = repo("** linguist-generated=true\n");
+        let v = verdict(&root, "docs: [bd-source01] [bd-foreign1]\n");
+
+        let fault = v.report["projected_decl_fault"]
+            .as_str()
+            .unwrap_or_else(|| panic!("a blanket declaration must be refused: {}", v.report));
+        assert!(
+            fault.starts_with("covers-build-source: ** matches "),
+            "the fault names the pattern and the source it reaches: {fault}"
+        );
+        assert_eq!(v.exit_code, 1, "an unhonourable declaration blocks");
+        assert!(
+            v.notices.iter().any(|n| n.contains("REFUSED")),
+            "and it says so on stderr: {:?}",
+            v.notices
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_malformed_declaration_line_fails_closed() {
+        let root = repo("docs/guides/**\n");
+        let v = verdict(&root, "docs: [bd-source01] [bd-foreign1]\n");
+
+        let fault = v.report["projected_decl_fault"]
+            .as_str()
+            .expect("an attribute line with no attribute is refused");
+        assert!(
+            fault.starts_with("malformed: .gitattributes:1"),
+            "the fault names the line: {fault}"
+        );
+        assert_eq!(v.exit_code, 1, "and it blocks");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// bd-lyih regression: NO message is not the same as an EMPTY message.
+    ///
+    /// `guard check` runs from TWO hooks. pre-commit passes no `--msg-file`
+    /// because it fires before the editor opens; commit-msg passes one. A
+    /// refactor that read the absent file into an empty string and passed
+    /// `Some("")` made pre-commit judge every bead-tagged hunk against an
+    /// empty message, so any commit containing a `bd-*` line was blocked at
+    /// pre-commit as well as at commit-msg — the message could not possibly
+    /// satisfy it, because pre-commit never sees one.
+    #[test]
+    fn no_message_file_skips_attribution_rather_than_emptying_it() {
+        let root = repo("# no declaration here\n");
+        let staged: Vec<String> = STAGED.iter().map(|s| (*s).to_string()).collect();
+        let own = vec![toron_core::mailbox::guard::Reservation {
+            holder: "IvoryRidge".to_string(),
+            pattern: "**".to_string(),
+            exclusive: true,
+        }];
+        let resolve = |n: &str| n.to_string();
+
+        // pre-commit's shape: no message at all.
+        let v = guard_check_verdict(
+            &root,
+            "demo",
+            Some("IvoryRidge"),
+            &staged,
+            &own,
+            &resolve,
+            None,
+        );
+        assert_eq!(
+            v.report["unattributed_bead_tokens"],
+            json!([]),
+            "with no message there is nothing to charge: {}",
+            v.report
+        );
+        assert_eq!(
+            v.exit_code, 0,
+            "pre-commit must not block on a rule it cannot evaluate: {:?}",
+            v.notices
+        );
+
+        // And the contrast: an empty MESSAGE is a real, unsatisfied message.
+        let w = guard_check_verdict(
+            &root,
+            "demo",
+            Some("IvoryRidge"),
+            &staged,
+            &own,
+            &resolve,
+            Some(""),
+        );
+        assert_eq!(
+            w.report["unattributed_bead_tokens"],
+            json!(["bd-source01", "bd-foreign1"]),
+            "an empty message attributes nothing: {}",
+            w.report
+        );
+        assert_eq!(w.exit_code, 1, "and it blocks");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_projected_path_still_needs_its_own_reservation() {
+        // The exemption is for the HUNK rule only. A projected path with no
+        // lease must still be Unreserved, or the projection is an
+        // unaudited write lane that happens to also skip attribution.
+        let root = repo("docs/guides/** linguist-generated=true\n");
+        let staged = vec!["docs/guides/mail.md".to_string()];
+        let resolve = |n: &str| n.to_string();
+        let v = guard_check_verdict(
+            &root,
+            "demo",
+            Some("IvoryRidge"),
+            &staged,
+            &[],
+            &resolve,
+            Some("docs: [bd-foreign1]\n"),
+        );
+
+        assert_eq!(
+            v.report["blocked"][0]["reason"],
+            json!("unreserved"),
+            "declared projection is not shared-safe: {}",
+            v.report
+        );
+        assert_eq!(v.exit_code, 1);
+        let _ = std::fs::remove_dir_all(root);
     }
 }
