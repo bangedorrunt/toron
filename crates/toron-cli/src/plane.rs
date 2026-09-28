@@ -1623,9 +1623,16 @@ async fn watch_once(mailbox: &Mailbox, args: &WatchArgs) -> anyhow::Result<()> {
     {
         let mut cfg = crate::wake_sock::WakeSockConfig::discover(kinds.clone());
         cfg.project = Some(args.project.clone());
+        // bd-73s8: discovery never consults TORON_MCP_DATA_DIR (ADR-0036
+        // Spec 2), so a pinned store and a live machine daemon can disagree
+        // silently. Name the socket on ATTACH: the absent arm below already
+        // names its path, and only the present one used to say nothing — which
+        // is why a foreign attach reads as a bare `watch: timeout`.
+        let sock_path = cfg.sock_path.clone();
         let tail = crate::wake_sock::WakeSockTail::new(cfg);
         match tail.connect().await {
             Ok(mut conn) => {
+                eprintln!("wake.sock attached at {}", sock_path.display());
                 let mut seen: HashSet<String> = HashSet::new();
                 let project = args.project.clone();
                 let channel = args.channel.clone();
