@@ -90,8 +90,8 @@ pub enum CleanupPaneIdentitiesOut {
     },
 }
 
-/// One exclusive lease revoked because its holder pin was pruned
-/// (bd-gc7k: a dead pin must not own the ledger).
+/// One exclusive lease revoked because its holder pin was pruned: a dead pin
+/// must not own the ledger.
 #[derive(Debug, Clone, JsonSchema)]
 pub struct ReleasedGhostOut {
     pub project_slug: String,
@@ -116,9 +116,9 @@ pub struct RegisteredAgentOut {
 /// ADR-0010 F2: `stale` flags roster rows older than the prune cadence —
 /// never a silent live pin.
 ///
-/// bd-u4e2: `pane_id`/`workspace_id`/`tab_id` are the LIVE herdr pane the pin
-/// runs in (advisory; all `None` when no herdr backend is reachable). Additive
-/// optionals — pre-u4e2 clients parse rows unchanged.
+/// `pane_id`/`workspace_id`/`tab_id` are the LIVE herdr pane the pin runs in
+/// (advisory; all `None` when no herdr backend is reachable). Additive
+/// optionals, so a client that predates them parses rows unchanged.
 #[derive(Debug, Clone, JsonSchema)]
 pub struct WhoIsOut {
     pub name: String,
@@ -180,14 +180,14 @@ pub struct InboxMessageOut {
     pub thread_id: Option<String>,
     pub created_ts_us: i64,
     /// Read receipt timestamp (i64-µs) from the `message_reads` projection;
-    /// `null` = unread (bd-5icg).
+    /// `null` = unread.
     pub read_ts_us: Option<i64>,
-    /// S5 (bd-dup-assign-collapse-ws21): the first id of the duplicate group
-    /// this row survives for; `null` = standalone message.
+    /// The first id of the duplicate group this row survives for; `null` =
+    /// standalone message.
     pub duplicate_of: Option<String>,
     /// ADR-0027 E2 assignment tags projected from the rumor (never 1059);
-    /// mirror of `ToJson for InboxMessage` wire fields
-    /// (bd-mcp-inbox-assignment-tags-sdi1). All optional, `null` = untasked.
+    /// mirror of `ToJson for InboxMessage` wire fields. All optional,
+    /// `null` = untasked.
     pub corr: Option<String>,
     pub wake: Option<String>,
     pub priority: Option<String>,
@@ -233,7 +233,7 @@ pub struct ContactLinkOut {
 pub struct PathConflictOut {
     pub path: String,
     pub holders: Vec<String>,
-    /// Kind-30031 event id of each conflicting lease (bd-dsu1) — parallel to
+    /// Kind-30031 event id of each conflicting lease — parallel to
     /// `holders`, one id per holder. The operator lock board surfaces these
     /// for diagnostics (force-release, request-release, replay).
     pub reservation_ids: Vec<String>,
@@ -249,12 +249,12 @@ pub struct ConflictReportOut {
     /// ADR-0011 Spec 4: additive soft tier (in-TTL intents).
     pub soft_conflicts: Vec<PathConflictOut>,
     pub has_soft_conflicts: bool,
-    /// bd-slot-visibility-gv17: ACTIVE build-slot leases held by others —
-    /// "is the cargo fence free?" in the same one-call pre-write check.
+    /// ACTIVE build-slot leases held by others — "is the cargo fence free?"
+    /// in the same one-call pre-write check.
     pub slot_holders: Vec<SlotHolderOut>,
 }
 
-/// One active build-slot lease (bd-slot-visibility-gv17).
+/// One active build-slot lease.
 #[derive(Debug, Clone, JsonSchema)]
 pub struct SlotHolderOut {
     pub slot: String,
@@ -342,8 +342,8 @@ pub struct ProjectInboxMessageOut {
     pub ack_required: bool,
     pub thread_id: Option<String>,
     pub created_ts_us: i64,
-    /// ADR-0027 E2 assignment tags (bd-mcp-inbox-assignment-tags-sdi1);
-    /// flattened mirror of `InboxMessageOut` tags. Optional, `null` = untasked.
+    /// ADR-0027 E2 assignment tags; flattened mirror of `InboxMessageOut`
+    /// tags. Optional, `null` = untasked.
     pub corr: Option<String>,
     pub wake: Option<String>,
     pub priority: Option<String>,

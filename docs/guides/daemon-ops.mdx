@@ -70,7 +70,7 @@ $ toron tui
 toron: error: toron tui requires a TTY (refusing to run on a pipe)
 ```
 
-The catalog is a contract, not documentation: CI's catalog freshness gate fails on drift between the emitted catalog and the docs. `catalog --output PATH` snapshots it. Read the counts off the emitted catalog rather than a guide — 38 tools / 25 resources / 29 CLI verbs is what this host emits today, and the guide index's older "40 tools" is exactly the drift the gate is for.
+The catalog is a contract, not documentation: CI's catalog freshness gate fails on drift between the emitted catalog and the docs. `catalog --output PATH` snapshots it. Read the counts off the emitted catalog rather than a guide — 38 tools / 25 resources / 30 CLI verbs is what this host emits today, and the guide index's older "40 tools" is exactly the drift the gate is for.
 
 If it fails: `bench` requires a case, and `toron bench --project <slug>` fails with `unexpected argument '--project'` because the verb takes a positional and nothing else. `tui` refusing on a pipe is correct behaviour, not a broken dashboard — it needs a real terminal for its five tabs and vim keys, so run it from a shell, not from a log-capture harness. `toron tui --project <slug> --as <pin>` selects the mailbox and identity; without either the tab fails loud rather than guessing. Flags, tabs, folders, and keymap: [CLI reference](./cli-reference). `doctor --check` exits 3 on any failure — read the `FAIL` lines, since the exit code alone does not say which subsystem is down.
 
