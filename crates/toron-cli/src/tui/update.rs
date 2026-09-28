@@ -403,11 +403,11 @@ fn note_receipt(m: &mut Model, message_id: &str, verb: &str) {
             row.read = true;
         }
     }
-    for row in m.mail.messages.iter_mut() {
+    for row in &mut m.mail.messages {
         patch(row, message_id, verb);
     }
     if let Some(open) = m.mail.open.as_mut() {
-        for row in open.messages.iter_mut() {
+        for row in &mut open.messages {
             patch(row, message_id, verb);
         }
     }
@@ -547,7 +547,7 @@ fn tick_refresh(m: &Model) -> Vec<Effect> {
     if m.inflight > 0 {
         return Vec::new();
     }
-    let slow = m.tick % SLOW_CADENCE == 0;
+    let slow = m.tick.is_multiple_of(SLOW_CADENCE);
     match m.tab {
         Tab::Mail => {
             if m.settings.agent.is_some() {
@@ -603,7 +603,7 @@ fn reader_refresh(m: &Model) -> Vec<Effect> {
 
 /// The thread the Mail reader should open: the selected row's thread.
 pub fn selected_thread(m: &Model) -> Option<String> {
-    selected_mail_row(m).map(|r| r.thread_id.clone())
+    selected_mail_row(m).map(|r| r.thread_id)
 }
 
 /// The selected mail row, from the folder list or the search hits.
@@ -638,7 +638,7 @@ impl Model {
     }
 
     /// Current reader scroll offset for the active tab.
-    pub fn reader_scroll(&self) -> usize {
+    pub const fn reader_scroll(&self) -> usize {
         match self.tab {
             Tab::Mail => self.mail.scroll,
             Tab::Channels => self.channels.scroll,
@@ -648,7 +648,7 @@ impl Model {
     }
 
     /// Write the reader scroll offset for the active tab.
-    pub fn set_reader_scroll(&mut self, value: usize) {
+    pub const fn set_reader_scroll(&mut self, value: usize) {
         match self.tab {
             Tab::Mail => self.mail.scroll = value,
             Tab::Channels => self.channels.scroll = value,

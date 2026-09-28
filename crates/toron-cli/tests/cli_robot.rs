@@ -1870,19 +1870,12 @@ fn presence_help_lists_commands() {
 /// the guard not being on this path.
 struct DaemonGuard(Option<std::process::Child>);
 
-impl DaemonGuard {
-    /// Release early instead of at scope end. Idempotent.
-    fn kill(&mut self) {
-        if let Some(mut child) = self.0.take() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-    }
-
-    fn pid(&self) -> u32 {
-        self.0.as_ref().map_or(0, std::process::Child::id)
-    }
-}
+// bd-x4qw: this impl had `kill()` (a bare SIGKILL) and `pid()`, and NOTHING
+// called either. `kill()` was worse than dead — `Drop` below releases
+// GRACEFULLY (SIGTERM, bounded escalation, then reap) because `toron serve`
+// holds a sqlite store and a listening socket, so a hard kill would strand
+// both. A `kill()` that silently bypasses the only correct release path is a
+// trap for whoever wires it up next, not a convenience. Deleted, not allowed.
 
 impl Drop for DaemonGuard {
     fn drop(&mut self) {

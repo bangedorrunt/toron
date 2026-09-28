@@ -45,7 +45,7 @@ pub fn translate(model: &Model, key: KeyEvent) -> Option<Msg> {
 /// still honoured and `Ctrl-Enter` is not distinguishable from `Enter` on
 /// several terminals, so a chord would be a submit key that sometimes does
 /// nothing. `Enter` on the `send` stop is always available.
-fn compose_mode(key: KeyEvent) -> Option<Msg> {
+const fn compose_mode(key: KeyEvent) -> Option<Msg> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     // Ctrl-C keeps its one meaning from normal mode: leave the console now.
     if ctrl && matches!(key.code, KeyCode::Char('c')) {
@@ -70,7 +70,7 @@ fn compose_mode(key: KeyEvent) -> Option<Msg> {
 }
 
 /// Typing in the filter box. Only `Esc`/`Enter` leave it.
-fn insert_mode(key: KeyEvent) -> Option<Msg> {
+const fn insert_mode(key: KeyEvent) -> Option<Msg> {
     match key.code {
         KeyCode::Esc => Some(Msg::CancelInsert),
         KeyCode::Enter => Some(Msg::SubmitInput),

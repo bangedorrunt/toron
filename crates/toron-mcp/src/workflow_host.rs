@@ -242,6 +242,11 @@ async fn mention_outcome(
                                 }
                                 RequeueOutcome::Exhausted => {
                                     g.clear_retry(&assignee);
+                                    // bd-x4qw: release the coalescer lock before
+                                    // building the outcome. Holding it across the
+                                    // rest of the block serialized every other
+                                    // publisher on the same coalescer.
+                                    drop(g);
                                     ProviderOutcome::ProvenFailed(format!(
                                         "transport retry budget exhausted: {e}"
                                     ))
@@ -491,6 +496,10 @@ pub fn mailbox_async_effect_runner_with_delivery(
 /// fenced journaling when a dispatcher is attached, direct classified sends
 /// otherwise. Every await is inline — the caller drives this future on the
 /// engine's runtime.
+// bd-x4qw: 8 config/Arc params and ONE call site. Grouping them into a struct
+// would be a plumbing refactor of a 7000-line host for zero behavioural gain, so
+// this takes the same reasoned allow control_flow.rs uses for the same shape.
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_host_sink(
     mailbox: Arc<Mailbox>,
     coalescer: Arc<std::sync::Mutex<MentionCoalescer>>,
@@ -884,29 +893,29 @@ pub async fn publish_coalesced_job_with_cursor(
     let mut filtered: Option<Coalesced> = None;
     // DispatchJob / synthetic bursts may carry empty parents — no delivery id
     // to dedup, so the cursor gate does not apply (do not treat keep=[] as skip).
-    if let Some(store) = delivery {
-        if !parent_ids.is_empty() {
-            let proof_id = parent_ids.first().map(String::as_str).unwrap_or("");
-            let _ = toron_workflow::agent_key_is_not_delivery_proof("unused", proof_id);
-            // Reserve all parents under the lock — do not advance delivered yet.
-            let (keep, effects) = store.reserve_undelivered(session, parent_ids.clone());
-            if keep.is_empty() {
-                // Distinguish true already-delivered from concurrent in-flight
-                // empty-keep (SkipInFlight). In-flight must NOT Settled.
-                let any_inflight = effects
-                    .iter()
-                    .any(|e| matches!(e, toron_workflow::DeliveryEffect::SkipInFlight { .. }));
-                if any_inflight {
-                    return Err(CoalescePublishError::InFlight);
-                }
-                // All SkipAlreadyDelivered (cursor proves delivered).
-                return Err(CoalescePublishError::AlreadyDelivered);
+    if let Some(store) = delivery
+        && !parent_ids.is_empty()
+    {
+        let proof_id = parent_ids.first().map(String::as_str).unwrap_or("");
+        let _ = toron_workflow::agent_key_is_not_delivery_proof("unused", proof_id);
+        // Reserve all parents under the lock — do not advance delivered yet.
+        let (keep, effects) = store.reserve_undelivered(session, parent_ids.clone());
+        if keep.is_empty() {
+            // Distinguish true already-delivered from concurrent in-flight
+            // empty-keep (SkipInFlight). In-flight must NOT Settled.
+            let any_inflight = effects
+                .iter()
+                .any(|e| matches!(e, toron_workflow::DeliveryEffect::SkipInFlight { .. }));
+            if any_inflight {
+                return Err(CoalescePublishError::InFlight);
             }
-            if keep.len() != parent_ids.len() {
-                filtered = Some(coalesced.retain_parents(&keep));
-            }
-            reservation = Some(toron_workflow::ReservationGuard::new(store, session, keep));
+            // All SkipAlreadyDelivered (cursor proves delivered).
+            return Err(CoalescePublishError::AlreadyDelivered);
         }
+        if keep.len() != parent_ids.len() {
+            filtered = Some(coalesced.retain_parents(&keep));
+        }
+        reservation = Some(toron_workflow::ReservationGuard::new(store, session, keep));
     }
     let to_publish = filtered.as_ref().unwrap_or(coalesced);
     let event = match build_coalesced_job_event(signer, to_publish) {
@@ -927,10 +936,10 @@ pub async fn publish_coalesced_job_with_cursor(
     // no cursor gate applied).
     if let Some(guard) = reservation.take() {
         guard.commit();
-    } else if let Some(store) = delivery {
-        if !parent_ids.is_empty() {
-            store.mark_delivered(session, parent_ids);
-        }
+    } else if let Some(store) = delivery
+        && !parent_ids.is_empty()
+    {
+        store.mark_delivered(session, parent_ids);
     }
     Ok(event.id)
 }
@@ -1117,8 +1126,10 @@ impl WorkflowHost {
             engine: Arc::new(engine),
             bus,
             workflows: Arc::new(std::sync::Mutex::new(workflows)),
-            lifecycle: lifecycle.clone(),
-            delivery: delivery.clone(),
+            // bd-x4qw: both are last-used here (lifecycle already registered
+            // inside the match arms above), so the clone was pure extra Arc traffic.
+            lifecycle,
+            delivery,
             coalescer,
             job_signer,
             pending: Arc::new(tokio::sync::Mutex::new(pending)),
@@ -1233,13 +1244,19 @@ impl WorkflowHost {
         // order on Arc Clone deadlocks. Register first, then workflows.
         let name = workflow.name.clone();
         {
-            let defs = self.workflows.lock().unwrap_or_else(|e| e.into_inner());
+            let defs = self
+                .workflows
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
             if defs.iter().any(|w| w.name == name) {
                 return;
             }
         } // release workflows before lifecycle.register
         let _ = self.lifecycle.register(name.clone());
-        let mut defs = self.workflows.lock().unwrap_or_else(|e| e.into_inner());
+        let mut defs = self
+            .workflows
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         // Re-check under lock so concurrent add_workflow cannot duplicate.
         if !defs.iter().any(|w| w.name == name) {
             defs.push(workflow);
@@ -1257,7 +1274,7 @@ impl WorkflowHost {
         ) {
             self.workflows
                 .lock()
-                .unwrap_or_else(|e| e.into_inner())
+                .unwrap_or_else(PoisonError::into_inner)
                 .retain(|w| w.name != id);
         }
         fx
@@ -1277,7 +1294,7 @@ impl WorkflowHost {
     pub fn workflows(&self) -> Vec<Workflow> {
         self.workflows
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(PoisonError::into_inner)
             .clone()
     }
 
@@ -1710,7 +1727,7 @@ impl WorkflowHost {
                 let defs = me
                     .workflows
                     .lock()
-                    .unwrap_or_else(|e| e.into_inner())
+                    .unwrap_or_else(PoisonError::into_inner)
                     .clone();
                 for workflow in &defs {
                     let Some(trigger) = &workflow.trigger else {
@@ -1814,6 +1831,9 @@ impl WorkflowHost {
                             );
                         }
                     }
+                    // bd-x4qw: the lock is dead from here to `continue`; the log
+                    // above must not hold it against the next acquire.
+                    drop(c);
                     continue;
                 }
             };
@@ -1832,6 +1852,7 @@ impl WorkflowHost {
                         .lock()
                         .unwrap_or_else(PoisonError::into_inner);
                     c.clear_retry(&coalesced.assignee);
+                    drop(c); // bd-x4qw: release before logging, not after.
                     debug!(
                         assignee = %coalesced.assignee, %id,
                         "kind-43001 published for coalesced burst"
@@ -1843,6 +1864,7 @@ impl WorkflowHost {
                         .lock()
                         .unwrap_or_else(PoisonError::into_inner);
                     c.clear_retry(&coalesced.assignee);
+                    drop(c); // bd-x4qw: release before logging, not after.
                     debug!(
                         assignee = %coalesced.assignee,
                         "kind-43001 skipped (already delivered to session)"
@@ -1859,6 +1881,7 @@ impl WorkflowHost {
                         .lock()
                         .unwrap_or_else(PoisonError::into_inner);
                     let _ = c.requeue(coalesced, now_ms(), RequeueSchedule::FreshWindow);
+                    drop(c); // bd-x4qw: nothing below reads the coalescer.
                 }
                 Err(CoalescePublishError::NoSigner) => {
                     // GS-062 T3: durable DLQ (align FlushNow ProvenFailed) —
@@ -1869,6 +1892,7 @@ impl WorkflowHost {
                         .lock()
                         .unwrap_or_else(PoisonError::into_inner);
                     c.park_dlq(coalesced, DlqReason::NoSigner);
+                    drop(c); // bd-x4qw: release before the DLQ log.
                     warn!(
                         assignee = %assignee,
                         "coalesced burst NOT published (no job signer) — parked DLQ"
@@ -1897,6 +1921,9 @@ impl WorkflowHost {
                             );
                         }
                     }
+                    // bd-x4qw: dead from here to the arm's end; the logs above
+                    // must not hold the coalescer against the next publish.
+                    drop(c);
                 }
             }
             drop(permit); // release busy holder after publish CS
@@ -1948,7 +1975,7 @@ impl WorkflowHost {
             let defs = self
                 .workflows
                 .lock()
-                .unwrap_or_else(|e| e.into_inner())
+                .unwrap_or_else(PoisonError::into_inner)
                 .clone();
             for workflow in &defs {
                 let Some(trigger) = &workflow.trigger else {
@@ -6420,10 +6447,12 @@ steps:
         );
         let host = WorkflowHost::over_bus(bus, vec![], None).expect("host");
         let host_a = host.clone();
-        let host_b = host.clone();
+        // bd-x4qw: `host` and `barrier` are dead after their second handle, so
+        // the second clone was pure Arc traffic.
+        let host_b = host;
         let barrier = Arc::new(Barrier::new(2));
         let b1 = barrier.clone();
-        let b2 = barrier.clone();
+        let b2 = barrier;
         let t0 = Instant::now();
         let h1 = std::thread::spawn(move || {
             b1.wait();
@@ -6734,6 +6763,7 @@ steps:
         assert_eq!(published[0].id, id);
         let payload: serde_json::Value =
             serde_json::from_str(&published[0].content).expect("job json");
+        drop(published); // bd-x4qw: last read above; stop holding it across the asserts.
         let mentions = payload["spec"]["mentions"]
             .as_array()
             .expect("mentions array");
@@ -6754,14 +6784,16 @@ steps:
     }
 
     /// GS-062 REQUEUE-EVENT-STARVATION: flush tick interval ≤ default subwindow.
-    #[test]
-    fn coalesce_flush_tick_covers_subwindow() {
-        assert!(
-            COALESCE_FLUSH_TICK_MS <= 500,
-            "timer must fire within default subwindow so requeues flush without a bus event"
-        );
-        assert!(COALESCE_FLUSH_TICK_MS > 0);
-    }
+    ///
+    /// bd-x4qw: this was a `#[test]` asserting on a `const`, so it was decided
+    /// at COMPILE time and could never fail at runtime. A test that cannot fail
+    /// is not a test — the invariant belongs in a const assertion, which keeps
+    /// the guarantee and stops pretending to observe it.
+    const _: () = assert!(
+        COALESCE_FLUSH_TICK_MS <= 500,
+        "timer must fire within default subwindow so requeues flush without a bus event"
+    );
+    const _: () = assert!(COALESCE_FLUSH_TICK_MS > 0);
 
     /// GS-062 T1 FLUSHNOW-ACQUIRE: requeue restores as Deferred (non-Settled).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -7109,6 +7141,7 @@ steps:
                 0,
             );
             assert_eq!(g.buffered_for(session), 1);
+            drop(g); // bd-x4qw: explicit release, not end-of-block.
         }
         // Burn Transient budget with FlushNow Transport failures.
         for i in 0..REQUEUE_MAX_ATTEMPTS {
@@ -7178,6 +7211,7 @@ steps:
             "sibling Buffered must not be silently lost, buffered={}",
             g.buffered_for(session)
         );
+        drop(g); // bd-x4qw: last read above; release before the file cleanup.
         let _ = std::fs::remove_file(&db);
     }
 
@@ -7226,6 +7260,7 @@ steps:
         assert_eq!(c.dlq_len(), 1, "timer NoSigner must park DLQ, not drop");
         assert_eq!(c.dlq_for("oc-t3")[0].reason, DlqReason::NoSigner);
         assert_eq!(c.buffered_for("oc-t3"), 0, "must not live-requeue NoSigner");
+        drop(c); // bd-x4qw: last read above; release before the file cleanup.
         let _ = std::fs::remove_file(&db);
     }
 
@@ -7283,7 +7318,8 @@ steps:
         use toron_workflow::coalesce::InboundMention;
         // Timer ≤ subwindow so a lone Transient/FreshWindow requeue becomes
         // ready without requiring another SubscriptionEvent on the bus.
-        assert!(COALESCE_FLUSH_TICK_MS <= 500);
+        // bd-x4qw: const-asserted at module scope, so a runtime assert here was
+        // a duplicate that could never fail.
         let mut c = MentionCoalescer::new(
             std::time::Duration::from_millis(2_000),
             std::time::Duration::from_millis(500),

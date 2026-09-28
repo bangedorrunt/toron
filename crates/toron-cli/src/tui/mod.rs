@@ -208,7 +208,7 @@ fn spawn_input(tx: mpsc::Sender<crossterm::event::Event>) {
                         break;
                     }
                 }
-                Ok(false) => continue,
+                Ok(false) => {}
                 Err(_) => break,
             }
         }

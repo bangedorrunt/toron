@@ -189,7 +189,7 @@ pub fn short_id(s: &str) -> String {
     format!("{head}…")
 }
 
-pub fn layout_label(mode: model::LayoutMode) -> &'static str {
+pub const fn layout_label(mode: model::LayoutMode) -> &'static str {
     match mode {
         model::LayoutMode::Tri => "3-pane",
         model::LayoutMode::Dual => "2-pane",

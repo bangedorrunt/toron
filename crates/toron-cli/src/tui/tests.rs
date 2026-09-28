@@ -314,7 +314,7 @@ fn needs_ack_and_unread_folders_filter_the_index() {
     let (ack, _) = step(
         &Model {
             pane: Pane::Sidebar,
-            ..m.clone()
+            ..m
         },
         Msg::MoveCursor(3),
     );
@@ -696,7 +696,7 @@ fn pane_focus_is_clamped_never_wrapped() {
     let (left, _) = step(
         &Model {
             pane: Pane::List,
-            ..m.clone()
+            ..m
         },
         Msg::FocusPane(-1),
     );
@@ -1518,7 +1518,7 @@ fn agent_detail_scrolls_and_resets_on_a_new_agent() {
     let (moved, _) = step(
         &Model {
             pane: Pane::List,
-            ..scrolled.clone()
+            ..scrolled
         },
         Msg::MoveCursor(1),
     );
