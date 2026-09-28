@@ -154,6 +154,20 @@ fn resolved_max_version() -> i64 {
     MIGRATOR.iter().map(|m| m.version).max().unwrap_or(0)
 }
 
+/// Stable machine marker for a store-skew refusal (bd-6as4).
+///
+/// This refusal crosses a process boundary: the doorbell shells this binary for
+/// every inbox fetch and classifies the failure so `/health` can name it. Until
+/// this token existed, the only way to tell a skew apart from an ordinary fetch
+/// failure was to match the English sentence — so reflowing the prose would
+/// silently downgrade a total outage to a generic fetch error. The token is the
+/// contract; the sentence around it is free to change.
+///
+/// Consumer: flywheel `doorbell-rt` `file_host::inbox_fail_kind`. It cannot
+/// import this constant across repos, so it matches the literal and its own
+/// test pins the spelling.
+pub const STORE_SKEW_MARKER: &str = "toron-error=store_skew";
+
 /// bd-jivw: a store can be AHEAD of the binary that opens it. The shared XDG
 /// store is written by whatever toron touched it last (dev builds and
 /// installed binaries share the root, ADR-0007 D3), so an older binary dies
@@ -162,20 +176,24 @@ fn resolved_max_version() -> i64 {
 fn migration_skew_message(store: &str, missing: i64, resolved_max: i64) -> String {
     format!(
         "migration {missing} is applied in {store} but this toron build resolves at most \
-         {resolved_max}, so this binary is older than the store. Fix: rebuild or upgrade \
-         toron from the source that wrote the store (cargo install --path crates/toron-cli), \
-         or point --data-dir at a store this binary can open."
+         {resolved_max}, so this binary is older than the store ({marker}). Fix: rebuild or \
+         upgrade toron from the source that wrote the store (cargo install --path \
+         crates/toron-cli), or point --data-dir at a store this binary can open.",
+        marker = STORE_SKEW_MARKER,
     )
 }
 
 /// Same skew, different shape: the version exists on both sides with
 /// different contents (the migration file changed after it was applied).
+/// Carries the same marker, because to a consumer the meaning is identical:
+/// this binary cannot open this store.
 fn migration_content_mismatch_message(store: &str, version: i64) -> String {
     format!(
         "migration {version} is applied in {store} but this toron build ships different \
-         contents for it, so the store was written by a different build. Fix: rebuild or \
-         upgrade toron from the source that wrote the store, or point --data-dir at a store \
-         this binary can open."
+         contents for it, so the store was written by a different build ({marker}). Fix: \
+         rebuild or upgrade toron from the source that wrote the store, or point --data-dir at \
+         a store this binary can open.",
+        marker = STORE_SKEW_MARKER,
     )
 }
 
@@ -257,6 +275,29 @@ pub async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use sqlx::Row;
+
+    /// bd-6as4: the skew refusal crosses a process boundary — the doorbell
+    /// shells this binary for every inbox fetch — so a consumer must be able
+    /// to tell it apart from an ordinary fetch failure WITHOUT matching the
+    /// English. The prose is free to change; this token is not.
+    #[test]
+    fn store_skew_messages_carry_the_machine_marker() {
+        let ahead = migration_skew_message("/tmp/store.sqlite", 14, 13);
+        assert!(
+            ahead.contains(STORE_SKEW_MARKER),
+            "the store-ahead refusal must carry the declared marker: {ahead}"
+        );
+        assert!(
+            ahead.contains("resolves at most"),
+            "the human half stays too — an operator reads this line: {ahead}"
+        );
+        let mismatch = migration_content_mismatch_message("/tmp/store.sqlite", 14);
+        assert!(
+            mismatch.contains(STORE_SKEW_MARKER),
+            "same-version-different-contents means the same thing to a consumer, \
+             so it carries the same marker: {mismatch}"
+        );
+    }
 
     /// Temp-file DB so WAL is exercisable (memory DBs ignore journal_mode).
     async fn temp_pool(tag: &str) -> (SqlitePool, std::path::PathBuf) {
@@ -585,7 +626,10 @@ mod tests {
             .expect_err("a modified applied migration must refuse the open");
         let msg = format!("{err:#}");
         assert!(msg.contains("13"), "must name the version: {msg}");
-        assert!(msg.contains("different"), "must say the contents differ: {msg}");
+        assert!(
+            msg.contains("different"),
+            "must say the contents differ: {msg}"
+        );
         assert!(
             msg.contains("rebuild") || msg.contains("upgrade"),
             "must name the fix: {msg}"
