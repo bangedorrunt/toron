@@ -648,10 +648,27 @@ pub fn bead_hunk_violations(diff: &str, message: &str) -> Vec<BeadHunkBlock> {
 }
 
 /// ADDED lines (`+`, excluding `+++` headers) of the staged diff as one
-/// text blob, skipping every file whose path is in `exclude`. Empty on any
+/// text blob, skipping every file matched by an `exclude` entry. Empty on any
 /// repository/index error — attribution is best-effort input to the check,
 /// never a crash surface.
+///
+/// `exclude` entries are GLOBS, matched with [`pattern_matches`], not literal
+/// path equality. bd-lyih: a projected-path declaration is inherently a
+/// pattern (`docs/guides/**`), and under an exact compare it silently matched
+/// nothing — the exclusion looked armed and did nothing. Every entry that
+/// existed before this was a literal, and a literal is a valid glob that
+/// matches exactly itself, so nothing that passed before stops passing.
 pub fn staged_added_lines_in(repo_path: &Path, exclude: &[&str]) -> String {
+    staged_added_lines_matching(repo_path, &|path| {
+        exclude.iter().any(|e| pattern_matches(e, path))
+    })
+}
+
+/// [`staged_added_lines_in`] with a per-path predicate, for exclusions that
+/// are not expressible as a flat pattern list (bd-lyih's last-match-wins
+/// attribute evaluation, where a `=false` line has to subtract from a broad
+/// rule that is still declared further up the same file).
+pub fn staged_added_lines_matching(repo_path: &Path, skip: &dyn Fn(&str) -> bool) -> String {
     let Ok(repo) = git2::Repository::open(repo_path) else {
         return String::new();
     };
@@ -672,7 +689,7 @@ pub fn staged_added_lines_in(repo_path: &Path, exclude: &[&str]) -> String {
             }
         }
         if line.origin() == '+'
-            && !exclude.contains(&current_path.as_str())
+            && !skip(&current_path)
             && let Ok(c) = std::str::from_utf8(line.content())
         {
             // libgit2 content excludes the origin sign; re-add '+' so the
@@ -684,6 +701,268 @@ pub fn staged_added_lines_in(repo_path: &Path, exclude: &[&str]) -> String {
         true
     });
     added
+}
+
+// ---------------------------------------------------------------------------
+// bd-lyih: DECLARED projected paths.
+//
+// The bead-hunk rule is right for work a repository performs and wrong for
+// prose it VENDORS. toron.dev projects 44 guide pages out of toron, flywheel,
+// beads and chiebukuro, and 15 of those carry example bead ids inside bash
+// fences. Those ids belong to the SOURCE ledger: naming them in the site's
+// commit message would assert work the site did not do, and the attribution
+// table is the thing the rule exists to keep true.
+//
+// So the exemption is DECLARED, per path, in the same file git already uses
+// for exactly this question. It is deliberately not a heuristic and not a
+// path-prefix guess, and it is deliberately NOT [`SHARED_SAFE_PATHS`]: a
+// projected path still needs a lease, because the exemption is about who the
+// bead id belongs to, not about who may write the file.
+//
+// The declaration is also bounded. [`projected_decl_fault`] refuses one that
+// reaches compiled source, so `**` or `crates/*/src/**` cannot be used to
+// switch the rule off wholesale and hide real work behind a projection.
+// ---------------------------------------------------------------------------
+
+/// The `.gitattributes` attribute that declares a path as projected. Chosen
+/// because it is the ecosystem's existing marker for generated content, so
+/// the declaration is readable by a human and by other tools without toron
+/// inventing a private file format.
+pub const PROJECTED_ATTR: &str = "linguist-generated";
+
+/// One parsed `.gitattributes` line.
+enum AttrLine {
+    /// The pattern declares its paths projected.
+    Declares(String),
+    /// The pattern EXPLICITLY says its paths are not projected
+    /// (`=false`, `-attr`). Kept, not discarded: it has to subtract from an
+    /// earlier broad rule, and dropping it would exempt a path the author
+    /// wrote down as hand-written.
+    Undeclares(String),
+    /// Comment, blank, or a line that never mentions the attribute.
+    DoesNot,
+    /// Not a comment or blank, and carrying no attribute at all.
+    Malformed { line_no: usize, line: String },
+}
+
+/// Parse one `.gitattributes` line. Only a LEADING `#` starts a comment, so a
+/// `#` inside a pattern is preserved.
+fn parse_gitattributes_line(line_no: usize, line: &str) -> AttrLine {
+    let t = line.trim();
+    if t.is_empty() || t.starts_with('#') {
+        return AttrLine::DoesNot;
+    }
+    // `!pattern` is git's negation form: these paths carry no attributes at
+    // all, so they are never projected whatever an earlier rule said.
+    if let Some(negated) = t.strip_prefix('!') {
+        return match negated.split_once(char::is_whitespace) {
+            Some((pattern, _)) => AttrLine::Undeclares(pattern.trim().to_string()),
+            None => AttrLine::Malformed {
+                line_no,
+                line: t.to_string(),
+            },
+        };
+    }
+    let Some((pattern, attrs)) = t.split_once(char::is_whitespace) else {
+        return AttrLine::Malformed {
+            line_no,
+            line: t.to_string(),
+        };
+    };
+    let pattern = pattern.trim();
+    if pattern.is_empty() {
+        return AttrLine::Malformed {
+            line_no,
+            line: t.to_string(),
+        };
+    }
+    // A line that never mentions our attribute says nothing about projection.
+    if !attrs.split_whitespace().any(|a| {
+        a == PROJECTED_ATTR || a.starts_with(&format!("{PROJECTED_ATTR}=")) || a == UNSET_ATTR
+    }) {
+        return AttrLine::DoesNot;
+    }
+    let set_kw = format!("{PROJECTED_ATTR}=");
+    let mut set = false;
+    for attr in attrs.split_whitespace() {
+        if attr == PROJECTED_ATTR {
+            set = true;
+        } else if let Some(v) = attr.strip_prefix(set_kw.as_str()) {
+            set = v == "true";
+        } else if attr == UNSET_ATTR {
+            set = false;
+        }
+    }
+    if set {
+        AttrLine::Declares(pattern.to_string())
+    } else {
+        AttrLine::Undeclares(pattern.to_string())
+    }
+}
+
+/// The `-attr` spelling of "unset this attribute here".
+const UNSET_ATTR: &str = "-linguist-generated";
+
+fn read_gitattributes(repo_path: &Path) -> String {
+    std::fs::read_to_string(repo_path.join(".gitattributes")).unwrap_or_default()
+}
+
+/// One ordered statement about projection, as written in the file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectionRule {
+    pub pattern: String,
+    pub projected: bool,
+}
+
+/// Every rule that mentions the attribute, in file order.
+fn projection_rules(repo_path: &Path) -> Vec<ProjectionRule> {
+    read_gitattributes(repo_path)
+        .lines()
+        .enumerate()
+        .filter_map(|(i, line)| match parse_gitattributes_line(i + 1, line) {
+            AttrLine::Declares(p) => Some(ProjectionRule {
+                pattern: p,
+                projected: true,
+            }),
+            AttrLine::Undeclares(p) => Some(ProjectionRule {
+                pattern: p,
+                projected: false,
+            }),
+            AttrLine::DoesNot | AttrLine::Malformed { .. } => None,
+        })
+        .collect()
+}
+
+/// Whether `path` is declared projected, with git's own rule: the LAST rule
+/// whose pattern matches wins. Without this, a broad `docs/** =true` followed
+/// by `docs/guides/** =false` would still exempt the guides — the author said
+/// out loud that they are hand-written and we would have exempted them anyway.
+pub fn is_projected_path(repo_path: &Path, path: &str) -> bool {
+    projection_rules(repo_path)
+        .iter()
+        .rfind(|r| pattern_matches(&r.pattern, path))
+        .is_some_and(|r| r.projected)
+}
+
+/// The patterns this repository declares projected, for display and for
+/// validating the declaration. Empty when there is no `.gitattributes` or
+/// nothing is marked, which is the common case and changes no existing
+/// behaviour.
+pub fn projected_paths_in(repo_path: &Path) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for r in projection_rules(repo_path) {
+        if r.projected && !out.contains(&r.pattern) {
+            out.push(r.pattern);
+        }
+    }
+    out
+}
+
+/// Why a projected-path declaration is not honoured. The guard REFUSES on
+/// either variant rather than degrading quietly: honouring a bad declaration
+/// hides real work, and ignoring it re-blocks a legitimate commit with no
+/// explanation, and both failures are silent if we pick one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProjectedDeclFault {
+    /// The pattern matches a file this repository COMPILES. Projected prose
+    /// cannot be compiled source; a declaration that says otherwise is being
+    /// used to exempt the very files the rule protects.
+    CoversBuildSource { pattern: String, probe: String },
+    /// A non-comment line carried no attribute and could not be read.
+    Malformed { line_no: usize, line: String },
+}
+
+/// A representative source file inside every crate this repository builds.
+/// The path need not exist — the check is pure glob matching, so this is the
+/// question "would this pattern reach a compiled file?", not "is this file
+/// staged?".
+fn build_source_probes(repo_path: &Path) -> Vec<String> {
+    const MAX_DEPTH: usize = 6;
+    fn walk(dir: &Path, rel: &str, depth: usize, out: &mut Vec<String>) {
+        if depth > MAX_DEPTH {
+            return;
+        }
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            // Build output and VCS internals cannot hold a crate root, and
+            // `target/` is enormous; skipping them keeps this a repo-scale
+            // check rather than a commit-latency one.
+            if matches!(name.as_str(), ".git" | "target" | "node_modules") {
+                continue;
+            }
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let sub = if rel.is_empty() {
+                name.clone()
+            } else {
+                format!("{rel}/{name}")
+            };
+            if path.join("Cargo.toml").is_file() && path.join("src").is_dir() {
+                out.push(format!("{sub}/src/lib.rs"));
+            }
+            walk(&path, &sub, depth + 1, out);
+        }
+    }
+    let mut out = Vec::new();
+    walk(repo_path, "", 0, &mut out);
+    out.sort();
+    out
+}
+
+/// Validate a declaration. `declared` is [`projected_paths_in`]'s output;
+/// it is passed in rather than re-derived so a caller can validate a set it
+/// built some other way.
+pub fn projected_decl_fault(repo_path: &Path, declared: &[String]) -> Option<ProjectedDeclFault> {
+    // Unreadable first. Skipping a line we cannot parse is indistinguishable
+    // from honouring it, and only one of those is safe to guess at.
+    for (i, line) in read_gitattributes(repo_path).lines().enumerate() {
+        if let AttrLine::Malformed { line_no, line } = parse_gitattributes_line(i + 1, line) {
+            return Some(ProjectedDeclFault::Malformed { line_no, line });
+        }
+    }
+    let probes = build_source_probes(repo_path);
+    declared.iter().find_map(|pattern| {
+        probes
+            .iter()
+            .find(|probe| pattern_matches(pattern, probe))
+            .map(|probe| ProjectedDeclFault::CoversBuildSource {
+                pattern: pattern.clone(),
+                probe: probe.clone(),
+            })
+    })
+}
+
+/// Everything the bead-hunk scan must not read: shared-safe bookkeeping
+/// (a foreign id there is a ledger sync, not unattributed work) plus this
+/// repository's declared projections (a foreign id there belongs to the
+/// source project's ledger).
+///
+/// This is the DISPLAY list. It cannot express a `linguist-generated=false`
+/// override, because a pattern that later gets un-set is still declared
+/// somewhere in the file. Use [`added_lines_for_hunk_attribution`] to decide,
+/// not this.
+pub fn hunk_attribution_exclusions(repo_path: &Path) -> Vec<String> {
+    let mut out: Vec<String> = SHARED_SAFE_PATHS.iter().map(|s| (*s).to_string()).collect();
+    out.extend(projected_paths_in(repo_path));
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// The added lines the bead-hunk scan should actually read. One call so the
+/// caller cannot pair a diff with the wrong list, and so the per-path
+/// `=false` override is applied where it belongs — at the file, not on a
+/// flattened pattern list where it would be lost.
+pub fn added_lines_for_hunk_attribution(repo_path: &Path) -> String {
+    staged_added_lines_matching(repo_path, &|path| {
+        SHARED_SAFE_PATHS.iter().any(|s| pattern_matches(s, path))
+            || is_projected_path(repo_path, path)
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1594,6 +1873,234 @@ mod tests {
             ".beads ledger syncs legitimately carry foreign ids and must be exempt, got: {added}"
         );
         drop(repo);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    // -----------------------------------------------------------------------
+    // bd-lyih: DECLARED projected paths.
+    //
+    // A repository that vendors prose from another repo (toron.dev projects
+    // 44 guides out of four projects) carries bead ids that belong to the
+    // SOURCE ledger. Naming them here would assert work this repo did not
+    // do, and the attribution table is the thing the rule exists to keep
+    // true. So the exemption is DECLARED, per-path, and the guard refuses a
+    // declaration that reaches compiled source.
+    // -----------------------------------------------------------------------
+
+    /// Build a repo with a real crate (so there IS hand-written source to
+    /// protect), an optional `.gitattributes`, and two staged files: one
+    /// under `docs/guides/` (the projection) and one under the crate's
+    /// `src/` (this repo's own work). Returns the repo root.
+    fn projection_repo(attrs: Option<&str>, with_crate: bool) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "toron-projected-{}-{}.git",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let repo = git2::Repository::init(&root).expect("init repo");
+        std::fs::create_dir_all(root.join("docs/guides")).expect("guides dir");
+        std::fs::create_dir_all(root.join("docs/notes")).expect("notes dir");
+        if let Some(a) = attrs {
+            std::fs::write(root.join(".gitattributes"), a).expect("write attrs");
+        }
+        let src = if with_crate {
+            std::fs::create_dir_all(root.join("crates/demo/src")).expect("crate src");
+            std::fs::write(root.join("crates/demo/Cargo.toml"), "[package]\n").expect("toml");
+            "crates/demo/src"
+        } else {
+            std::fs::create_dir_all(root.join("src")).expect("src");
+            "src"
+        };
+        std::fs::write(
+            root.join("docs/guides/mail.md"),
+            "run: toron mail send --thread bd-9z2q\n",
+        )
+        .expect("write guide");
+        std::fs::write(
+            root.join("docs/notes/local.md"),
+            "nothing attributed here\n",
+        )
+        .expect("write note");
+        std::fs::write(root.join(src).join("lib.rs"), "// governed-by: bd-4t7w\n").expect("src");
+
+        let mut index = repo.index().expect("index");
+        for p in [
+            "docs/guides/mail.md",
+            "docs/notes/local.md",
+            &format!("{src}/lib.rs"),
+        ] {
+            index.add_path(Path::new(p)).expect("add");
+        }
+        index.write().expect("write index");
+        drop(repo);
+        root
+    }
+
+    #[test]
+    fn projected_paths_reads_the_generated_declaration() {
+        let root = projection_repo(
+            Some(
+                "# a comment\n\
+                 docs/guides/** linguist-generated=true\n\
+                 docs/parity/*.json linguist-generated\n\
+                 docs/learnings/** linguist-generated=false\n\
+                 \n",
+            ),
+            true,
+        );
+        let got = projected_paths_in(&root);
+        assert_eq!(
+            got,
+            vec![
+                "docs/guides/**".to_string(),
+                "docs/parity/*.json".to_string()
+            ],
+            "only `=true` and the bare set form declare; `=false` does not"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn no_declaration_means_no_exemption() {
+        let root = projection_repo(None, true);
+        assert!(
+            projected_paths_in(&root).is_empty(),
+            "absent .gitattributes is the common case and must change nothing"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_projected_path_owes_no_attribution_but_source_still_does() {
+        let root = projection_repo(Some("docs/guides/** linguist-generated=true\n"), true);
+        let added = added_lines_for_hunk_attribution(&root);
+        let v = bead_hunk_violations(&added, "docs: refresh [bd-4t7w]");
+        assert!(
+            v.is_empty(),
+            "the guide's foreign id is exempt and the crate's is named: {v:?}"
+        );
+        assert!(
+            !added.contains("bd-9z2q"),
+            "the projected file is not even scanned: {added}"
+        );
+        assert!(
+            added.contains("bd-4t7w"),
+            "source still feeds the scan: {added}"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn without_the_declaration_the_projected_path_still_owes_attribution() {
+        // The negative control for the test above: same files, same message,
+        // only the .gitattributes line removed. If this does NOT now name
+        // bd-9z2q, the exemption proved nothing.
+        let root = projection_repo(None, true);
+        let added = added_lines_for_hunk_attribution(&root);
+        let v = bead_hunk_violations(&added, "docs: refresh [bd-4t7w]");
+        assert_eq!(
+            v.iter().map(|b| b.token.as_str()).collect::<Vec<_>>(),
+            vec!["bd-9z2q"],
+            "an undeclared foreign id is still a violation: {v:?}"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_projected_path_still_needs_its_own_reservation() {
+        // The exemption is for the HUNK rule only. The staged-path check
+        // must keep demanding a lease, or the projection becomes an
+        // unaudited write lane.
+        let root = projection_repo(Some("docs/guides/** linguist-generated=true\n"), true);
+        let staged = vec!["docs/guides/mail.md".to_string()];
+        let blocked = guard_check_strict(Some("me"), &staged, &[], SHARED_SAFE_PATHS);
+        assert_eq!(blocked.len(), 1, "declared projection is not shared-safe");
+        assert_eq!(blocked[0].kind, StrictBlockKind::Unreserved);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_declaration_reaching_compiled_source_is_refused() {
+        let root = projection_repo(Some("crates/*/src/** linguist-generated=true\n"), true);
+        let fault = projected_decl_fault(&root, &projected_paths_in(&root)).expect("refused");
+        let ProjectedDeclFault::CoversBuildSource { pattern, .. } = &fault else {
+            panic!("wrong fault: {fault:?}");
+        };
+        assert_eq!(pattern, "crates/*/src/**", "the offending pattern is named");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_bare_double_star_declaration_is_refused() {
+        // "Cannot be widened to hide real work" — `**` would exempt every
+        // source file in every crate, so the guard must refuse it outright
+        // rather than honour it.
+        let root = projection_repo(Some("** linguist-generated=true\n"), true);
+        assert!(
+            matches!(
+                projected_decl_fault(&root, &projected_paths_in(&root)),
+                Some(ProjectedDeclFault::CoversBuildSource { .. })
+            ),
+            "a blanket declaration is refused"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_docs_projection_is_accepted() {
+        let root = projection_repo(Some("docs/guides/** linguist-generated=true\n"), true);
+        assert_eq!(
+            projected_decl_fault(&root, &projected_paths_in(&root)),
+            None,
+            "a declaration that touches no crate source is fine"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_false_line_subtracts_from_a_broader_declaration() {
+        // The author wrote "these are hand-written" and the guard must
+        // believe them. Git's rule is last-match-wins, so `docs/**` followed
+        // by `docs/guides/** linguist-generated=false` leaves the guide
+        // NOT projected — a flattened pattern list cannot express this and
+        // would exempt the guide anyway.
+        let root = projection_repo(
+            Some(
+                "docs/** linguist-generated=true\n\
+                 docs/guides/** linguist-generated=false\n",
+            ),
+            true,
+        );
+        assert!(
+            is_projected_path(&root, "docs/parity/report.json"),
+            "the broad rule still projects the rest of docs"
+        );
+        assert!(
+            !is_projected_path(&root, "docs/guides/mail.md"),
+            "the explicit false wins for the guide"
+        );
+        let added = added_lines_for_hunk_attribution(&root);
+        let v = bead_hunk_violations(&added, "docs: [bd-4t7w] real work");
+        assert_eq!(
+            v.iter().map(|b| b.token.as_str()).collect::<Vec<_>>(),
+            vec!["bd-9z2q"],
+            "an un-projected guide still owes attribution: {v:?}"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_malformed_declaration_line_is_refused() {
+        // Fail closed: a line we cannot parse must not be silently skipped,
+        // because skipping it is indistinguishable from honouring it.
+        let root = projection_repo(Some("docs/guides/**\n"), true);
+        assert!(
+            matches!(
+                projected_decl_fault(&root, &projected_paths_in(&root)),
+                Some(ProjectedDeclFault::Malformed { .. })
+            ),
+            "an attribute line with no attributes is refused"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
