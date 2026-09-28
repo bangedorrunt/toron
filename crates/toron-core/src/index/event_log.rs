@@ -175,6 +175,39 @@ impl EventLog {
     }
 
     /// Count events of one kind (rebuild progress / divergence triage).
+    /// Read only the events belonging to ONE `corr`, in generation order.
+    ///
+    /// bd-v51i: [`read_since`](Self::read_since) from 0 returns the entire log,
+    /// which is unbounded and unindexed, so every call to it grew with the
+    /// system's lifetime. Callers that only care about one corr's history must
+    /// use this instead. The `json_extract` predicate is served by the
+    /// `events_corr` expression index (migration 0014) — without it this is a
+    /// scan that merely returns fewer rows, so the index is load-bearing, not
+    /// a nicety.
+    ///
+    /// Callers pass the `corr` as a bind parameter. `json_extract` returns NULL
+    /// for a non-JSON payload and NULL `= NULL` is never true, so a malformed
+    /// row is simply absent rather than an error.
+    pub async fn read_for_corr(&self, corr: &str) -> anyhow::Result<Vec<StoredEvent>> {
+        let rows: Vec<(i64, String, String, String, i64)> = sqlx::query_as(
+            "SELECT generation, event_id, kind, payload, ts_us FROM events \
+             WHERE json_extract(payload, '$.corr') = ?1 ORDER BY generation ASC",
+        )
+        .bind(corr)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(generation, event_id, kind, payload, ts_us)| StoredEvent {
+                generation,
+                event_id,
+                kind,
+                payload,
+                ts_us,
+            })
+            .collect())
+    }
+
     pub async fn count_kind(&self, kind: &str) -> anyhow::Result<i64> {
         let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM events WHERE kind = ?1")
             .bind(kind)
