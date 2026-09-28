@@ -781,11 +781,6 @@ pub enum CoalescePublishError {
     InFlight,
 }
 
-/// Build + publish ONE kind-43001 for a coalesced mention burst (bd-ckkf):
-/// awaited inline on the caller's runtime — no scoped thread, no runtime
-/// bridge of any kind. Async contexts (the trigger loop, the async runner)
-/// all await this directly.
-
 /// GS-062 captain C: acquire a dispatch permit for a live host publish.
 /// Parks `SleepUntilDeadline` (journal/park + [`DispatchPool::deadline_wake`]);
 /// never uses the Option [`DispatchPool::try_acquire`] shim that maps fenced
@@ -853,6 +848,11 @@ pub async fn host_acquire_for_assignee<'a>(
     }
 }
 
+/// Build + publish ONE kind-43001 for a coalesced mention burst (bd-ckkf):
+/// awaited inline on the caller's runtime — no scoped thread, no runtime
+/// bridge of any kind. Async contexts (the trigger loop, the async runner)
+/// all await this directly. Cursor-less shim over
+/// [`publish_coalesced_job_with_cursor`].
 pub async fn publish_coalesced_job(
     bus: &dyn Bus,
     signer: Option<&Keys>,
