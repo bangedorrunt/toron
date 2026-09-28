@@ -74,6 +74,21 @@ Child maps: [toron-core](crates/toron-core/AGENTS.md) ·
 - Flywheel Tick Law (live): doorbell dispatcher and `swarm_loop` call `workspace::tick`; slice reducers stay private. Kind-9 is the ring; assignment enters from rumor 14 / FetchInbox→InboxRows.
 - Corr authority (accepted 2026-09-03): sender mints non-empty `corr` (`SendTags::parse` rejects empty; `Corr` vs `ThreadId` newtypes, `thread_id` is never `corr` — conflation fails loud in `send_message`); toron sqlite owns `owed→acked→resulted` (monotonic upsert: never downgrades `resulted`, never drags `acked` to `owed`; `owed` on send, `owed→acked` in `send_receipt` idempotent, `resulted` only via explicit `receipt set`).
 - `MessageId` is String/hex. Never `u64` in shared request/response types.
+- A crew on a harness herdr cannot inject is MAIL-ONLY, and mail is a real
+  channel rather than a fallback (measured 2026-09-28 with `freebuff`): the
+  dispatcher reports `dispatcher=absent … no live fleet`, pane lookup returns
+  `agent_not_found`, and the doorbell has no injectable pane, while the crew's
+  inbox fetch, wake digest, and room posts all work. A cross-project send
+  addressed by npub was delivered and indexed under the RECIPIENT's project
+  slug, which is the proof. So never read an empty dispatcher as an empty
+  project — it is a statement about the dispatcher, and a spawn route taken on
+  it composes a second swarm beside a live crew. Check `toron mail inbox
+  --since <RFC3339>` (never a duration), the doorbell's `<ws>.unanswered`, and
+  `/health.injection`, where `pins > injectable` is the signature. Address such
+  an agent by npub (`toron mail whois <project> <pin>`), never by name: identity
+  is per-project, so a name sends to a key the recipient never reads while
+  reporting `ok`. An `unanswered` pin is not proof of existence — one appeared
+  in two `unanswered` lists and resolved in neither.
 - Pane mail-identity stamp: `agent bootstrap` writes the pin
   onto the pane via display-only `pane.report_metadata` (`toron:mail-identity`
   source, `toron_pin`/`toron_project`/`toron_npub` tokens) — never
