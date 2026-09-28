@@ -89,6 +89,96 @@ pub struct FoldedSlugLeftover {
     pub canonical: String,
 }
 
+/// bd-0tbg W1: the collision key two names are compared on.
+///
+/// Casefolded AND separator-stripped, so `BrashOtter`, `brash-otter` and
+/// `brash otter` all collapse to `brashotter`. Case alone is not enough: the
+/// live split was a kebab-case sibling, not a case variant, and a case-only
+/// check would have passed straight through it.
+pub fn name_collision_key(name: &str) -> String {
+    name.chars()
+        .filter(char::is_ascii_alphanumeric)
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+/// bd-0tbg: every set of identities in one project that fold to the same
+/// words, with the keys they actually hold. Read-only — this is the surface
+/// an operator uses to decide WHICH key survives (bd-lkjf), so it reports
+/// rather than merges. One entry per colliding GROUP, not per row, or a
+/// three-way split would be reported three times.
+///
+/// A free function taking a pool, like [`folded_slug_leftovers`], so `doctor`
+/// can call it without constructing a [`Mailbox`].
+pub async fn near_duplicate_identities(
+    pool: &sqlx::SqlitePool,
+    project_slug: &str,
+) -> anyhow::Result<Vec<NameCollisionGroup>> {
+    let rows: Vec<(String, String)> =
+        sqlx::query_as("SELECT name, pubkey FROM agents WHERE project_slug = ?1 ORDER BY name")
+            .bind(project_slug)
+            .fetch_all(pool)
+            .await?;
+    // BTreeMap so the grouping key is ordered and the output is stable.
+    let mut groups: std::collections::BTreeMap<String, (Vec<String>, Vec<String>)> =
+        std::collections::BTreeMap::new();
+    for (name, pubkey) in rows {
+        let e = groups
+            .entry(name_collision_key(&name))
+            .or_insert_with(|| (Vec::new(), Vec::new()));
+        e.0.push(name);
+        if !e.1.contains(&pubkey) {
+            e.1.push(pubkey);
+        }
+    }
+    Ok(groups
+        .into_iter()
+        .filter(|(_, (names, _))| names.len() > 1)
+        .map(|(collision_key, (names, pubkeys))| NameCollisionGroup {
+            collision_key,
+            names,
+            pubkeys,
+        })
+        .collect())
+}
+
+/// bd-0tbg: [`near_duplicate_identities`] across EVERY project, with the
+/// project named per group. The shape `toron doctor` consumes — the whole
+/// scan lives here so the CLI needs no SQL of its own (toron-cli has no sqlx
+/// dependency, and a health check that hand-writes queries is a health check
+/// that drifts from the schema).
+pub async fn name_collisions_across_projects(
+    pool: &sqlx::SqlitePool,
+) -> anyhow::Result<Vec<(String, NameCollisionGroup)>> {
+    let projects: Vec<String> =
+        sqlx::query_scalar("SELECT DISTINCT project_slug FROM agents ORDER BY project_slug")
+            .fetch_all(pool)
+            .await?;
+    let mut out = Vec::new();
+    for p in projects {
+        for g in near_duplicate_identities(pool, &p).await? {
+            out.push((p.clone(), g));
+        }
+    }
+    Ok(out)
+}
+
+/// bd-0tbg: a set of identities in ONE project that fold to the same words
+/// and therefore hold SEPARATE keys for one intended name. Reported, never
+/// merged — deciding which key survives needs someone who knows which agent
+/// is which (bd-lkjf), and guessing destroys a live holder either way.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct NameCollisionGroup {
+    /// The folded form both names share, so the reader can see WHY they
+    /// collided without re-deriving the rule.
+    pub collision_key: String,
+    /// Every registered spelling in the group, sorted.
+    pub names: Vec<String>,
+    /// The distinct keys they hold, sorted — one per identity, so this is
+    /// the blast radius.
+    pub pubkeys: Vec<String>,
+}
+
 /// bd-0tbg: a leftover the sweep REFUSED to absorb because that identity is
 /// still holding live file reservations.
 ///
@@ -231,6 +321,31 @@ impl Mailbox {
     ) -> anyhow::Result<RegisteredAgent> {
         let project_slug = &self.canonical_project(project_slug).await; // ADR-0017
         self.check_swarm_name(project_slug, &profile.name).await?;
+        // bd-0tbg W1: refuse a second identity for one name IN THIS PROJECT.
+        // The pin grammar is enforced in the CLI (`agent bootstrap`) and
+        // nowhere else, so the MCP surface, `create_agent_identity` and any
+        // workflow step can register a spelling the CLI refuses — which is
+        // how one project ended up with two keys for the same words. This is
+        // a COLLISION check, not a grammar check: ADR-0018's
+        // `flywheel-<project>-<role><seq>` fold grammar is kebab-case on
+        // purpose and must keep registering. Applied to the dry-run preview
+        // too, because that preview promises the SAME decision inputs.
+        if let Some((existing_name, existing_pubkey)) = self
+            .name_collision_in_project(project_slug, &profile.name)
+            .await?
+        {
+            anyhow::bail!(
+                "agent name {:?} collides with the registered identity {existing_name:?} in \
+                 project {project_slug} — they fold to the same words \
+                 ({}) but would mint a SECOND key, splitting one name across \
+                 two npubs and making reservations unaddressable by either. \
+                 Register {existing_name:?} (key {}…) instead, or give this \
+                 identity a genuinely different pin (bd-0tbg).",
+                profile.name,
+                name_collision_key(&profile.name),
+                &existing_pubkey[..8.min(existing_pubkey.len())]
+            );
+        }
         let key_path = self.agent_key_path(project_slug, &profile.name);
         if key_path.exists() {
             anyhow::bail!(
@@ -258,6 +373,35 @@ impl Mailbox {
     ///
     /// ADR-0018 (swarm mode): non-canonical names are rejected — legacy
     /// display names cannot be (re)created in a swarm project.
+    /// The existing identity in `project_slug` whose collision key equals
+    /// `name`'s, EXCLUDING `name` itself. `None` when the name is free or the
+    /// only match is the same spelling (re-registration is idempotent, not a
+    /// collision).
+    pub(crate) async fn name_collision_in_project(
+        &self,
+        project_slug: &str,
+        name: &str,
+    ) -> anyhow::Result<Option<(String, String)>> {
+        let Some(pool) = self.index_pool.as_ref() else {
+            // No pool means no `agents` table, so there is nothing recorded to
+            // collide with and nothing to defer TO — reporting Ok(None) here
+            // is "no index to check", not "checked and clean". Every
+            // production path attaches one (`build_mailbox`,
+            // toron-mcp/src/server.rs:362); this arm is reached only by
+            // pool-less test harnesses.
+            return Ok(None);
+        };
+        let key = name_collision_key(name);
+        let rows: Vec<(String, String)> =
+            sqlx::query_as("SELECT name, pubkey FROM agents WHERE project_slug = ?1")
+                .bind(project_slug)
+                .fetch_all(pool)
+                .await?;
+        Ok(rows
+            .into_iter()
+            .find(|(other, _)| other != name && name_collision_key(other) == key))
+    }
+
     pub async fn register_agent(
         &self,
         project_slug: &str,
@@ -265,6 +409,31 @@ impl Mailbox {
     ) -> anyhow::Result<RegisteredAgent> {
         let project_slug = &self.canonical_project(project_slug).await; // ADR-0017
         self.check_swarm_name(project_slug, &profile.name).await?;
+        // bd-0tbg W1: refuse a second identity for one name IN THIS PROJECT.
+        // The pin grammar is enforced in the CLI (`agent bootstrap`) and
+        // nowhere else, so the MCP surface, `create_agent_identity` and any
+        // workflow step can register a spelling the CLI refuses — which is
+        // how one project ended up with two keys for the same words. This is
+        // a COLLISION check, not a grammar check: ADR-0018's
+        // `flywheel-<project>-<role><seq>` fold grammar is kebab-case on
+        // purpose and must keep registering. Applied to the dry-run preview
+        // too, because that preview promises the SAME decision inputs.
+        if let Some((existing_name, existing_pubkey)) = self
+            .name_collision_in_project(project_slug, &profile.name)
+            .await?
+        {
+            anyhow::bail!(
+                "agent name {:?} collides with the registered identity {existing_name:?} in \
+                 project {project_slug} — they fold to the same words \
+                 ({}) but would mint a SECOND key, splitting one name across \
+                 two npubs and making reservations unaddressable by either. \
+                 Register {existing_name:?} (key {}…) instead, or give this \
+                 identity a genuinely different pin (bd-0tbg).",
+                profile.name,
+                name_collision_key(&profile.name),
+                &existing_pubkey[..8.min(existing_pubkey.len())]
+            );
+        }
         // Existing local key? (ncryptsec at agents/{name}/key.ncryptsec)
         // ADR-0017 migration: a pre-canonicalization key under an alternate
         // (path-slug) root is adopted — re-registering under the canonical
@@ -2248,6 +2417,149 @@ mod tests {
             again.held.is_empty(),
             "and nothing is held: {:?}",
             again.held
+        );
+    }
+
+    /// bd-0tbg W1: a NEW identity must not be a near-duplicate spelling of
+    /// one that already exists in the same project.
+    ///
+    /// `BrashOtter` and `brash-otter` are two keys in ONE project, holding 4
+    /// and 5 reservations. The pin rule bites in the CLI and nowhere else:
+    /// `validate_agent_pin` has exactly two call sites, both in
+    /// `toron-cli/src/robot.rs`, so the MCP surface, `create_agent_identity`
+    /// and any workflow step can register a spelling the CLI would refuse.
+    /// `check_swarm_name` does not help either — it enforces routability and
+    /// only in Swarm mode, and in Open mode any spelling registers freely.
+    ///
+    /// So the check belongs in the core, and it is a COLLISION check rather
+    /// than a grammar check: refusing kebab-case here would break ADR-0018's
+    /// `flywheel-<project>-<role><seq>` fold grammar, which is legitimate.
+    /// Two different names that fold to the same words are the defect.
+    #[tokio::test]
+    async fn registration_refuses_a_near_duplicate_spelling_in_one_project() {
+        let (mailbox, _pool, _db, _data) = test_mailbox_with_pool("0tbg-dup").await;
+        let project = "p-dup";
+        mailbox.ensure_project(project).await.expect("ensure");
+        let first = mailbox
+            .register_agent(project, &profile("BrashOtter"))
+            .await
+            .expect("first identity");
+
+        // The bead's exact pair. Same project, same words, different key.
+        let err = mailbox
+            .register_agent(project, &profile("brash-otter"))
+            .await
+            .expect_err("a second identity for one name must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("BrashOtter"),
+            "names the existing identity: {msg}"
+        );
+        assert!(
+            msg.contains("brash-otter"),
+            "names the rejected spelling: {msg}"
+        );
+        assert!(
+            msg.contains(&first.npub[..8]),
+            "and shows the key that would have been orphaned: {msg}"
+        );
+
+        // Case-only splits are the same defect, not an exemption.
+        mailbox
+            .register_agent(project, &profile("brashotter"))
+            .await
+            .expect_err("case-only duplicate is the same collision");
+    }
+
+    #[tokio::test]
+    async fn an_exact_re_registration_stays_idempotent() {
+        // The collision check must not break the ordinary re-register path,
+        // which is how ADR-0017 adopts a pre-canonicalization key. Same name
+        // is not a collision with itself.
+        let (mailbox, _pool, _db, _data) = test_mailbox_with_pool("0tbg-idem").await;
+        let project = "p-idem";
+        mailbox.ensure_project(project).await.expect("ensure");
+        let a = mailbox
+            .register_agent(project, &profile("IvoryRidge"))
+            .await
+            .expect("first");
+        assert!(a.created);
+        let b = mailbox
+            .register_agent(project, &profile("IvoryRidge"))
+            .await
+            .expect("re-register must stay idempotent");
+        assert!(!b.created, "same key, no new identity");
+        assert_eq!(a.npub, b.npub);
+    }
+
+    #[tokio::test]
+    async fn distinct_names_and_the_fold_grammar_are_untouched() {
+        // The negative control. If this fails, the check is over-broad and is
+        // rejecting identities it must leave alone — including ADR-0018's
+        // fold grammar, which is kebab-case on purpose.
+        let (mailbox, _pool, _db, _data) = test_mailbox_with_pool("0tbg-ok").await;
+        let project = "p-ok";
+        mailbox.ensure_project(project).await.expect("ensure");
+        for name in [
+            "IvoryRidge",
+            "TealMarlin",
+            "flywheel-p-ok-coder1",
+            "flywheel-p-ok-reviewer1",
+        ] {
+            mailbox
+                .register_agent(project, &profile(name))
+                .await
+                .unwrap_or_else(|e| panic!("{name} must register: {e}"));
+        }
+    }
+
+    /// bd-0tbg: refusing new splits does nothing for the ones already on the
+    /// board, and the board is where they are dangerous. A read surface is
+    /// the only way an operator learns which of their identities to
+    /// reconcile — and bd-lkjf is exactly that decision.
+    #[tokio::test]
+    async fn near_duplicate_identities_are_reported_for_the_existing_board() {
+        let (mailbox, pool, _db, _data) = test_mailbox_with_pool("0tbg-report").await;
+        let project = "p-report";
+        mailbox.ensure_project(project).await.expect("ensure");
+        for name in ["BrashOtter", "IvoryRidge"] {
+            mailbox
+                .register_agent(project, &profile(name))
+                .await
+                .expect("seed the registered identities");
+        }
+        // The colliding row is inserted directly, NOT through
+        // `register_agent` — because registration now refuses it, which is
+        // the point. This is exactly how the live board got into this state:
+        // `brash-otter` was registered before the check existed. A report
+        // surface that could only be exercised by the bug it reports would
+        // be untestable, and untestable surfaces are the ones that are wrong
+        // in production and right in the test.
+        sqlx::query(
+            "INSERT INTO agents (project_slug, name, pubkey, created_ts_us) VALUES (?1, ?2, ?3, ?4)",
+        )
+        .bind(project)
+        .bind("brash-otter")
+        .bind("93bb5e316de4c7e0a99a7e00000000000000000000000000000000000000dead")
+        .bind(1_700_000_000_000_000i64)
+        .execute(&pool)
+        .await
+        .expect("seed the legacy split directly");
+
+        let found = near_duplicate_identities(&pool, project)
+            .await
+            .expect("scan");
+        assert_eq!(
+            found.len(),
+            1,
+            "one colliding pair, not three rows: {found:?}"
+        );
+        assert_eq!(found[0].names, vec!["BrashOtter", "brash-otter"]);
+        assert_eq!(
+            found[0].pubkeys.len(),
+            2,
+            "and they really are two different keys: {:?}",
+            found[0].pubkeys
         );
     }
 
