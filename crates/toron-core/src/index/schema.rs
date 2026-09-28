@@ -176,10 +176,9 @@ pub const STORE_SKEW_MARKER: &str = "toron-error=store_skew";
 fn migration_skew_message(store: &str, missing: i64, resolved_max: i64) -> String {
     format!(
         "migration {missing} is applied in {store} but this toron build resolves at most \
-         {resolved_max}, so this binary is older than the store ({marker}). Fix: rebuild or \
-         upgrade toron from the source that wrote the store (cargo install --path \
+         {resolved_max}, so this binary is older than the store ({STORE_SKEW_MARKER}). Fix: \
+         rebuild or upgrade toron from the source that wrote the store (cargo install --path \
          crates/toron-cli), or point --data-dir at a store this binary can open.",
-        marker = STORE_SKEW_MARKER,
     )
 }
 
@@ -190,10 +189,9 @@ fn migration_skew_message(store: &str, missing: i64, resolved_max: i64) -> Strin
 fn migration_content_mismatch_message(store: &str, version: i64) -> String {
     format!(
         "migration {version} is applied in {store} but this toron build ships different \
-         contents for it, so the store was written by a different build ({marker}). Fix: \
-         rebuild or upgrade toron from the source that wrote the store, or point --data-dir at \
-         a store this binary can open.",
-        marker = STORE_SKEW_MARKER,
+         contents for it, so the store was written by a different build ({STORE_SKEW_MARKER}). \
+         Fix: rebuild or upgrade toron from the source that wrote the store, or point \
+         --data-dir at a store this binary can open.",
     )
 }
 
