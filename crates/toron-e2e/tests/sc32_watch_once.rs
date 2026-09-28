@@ -231,12 +231,21 @@ async fn sc32_watch_once_sees_cross_process_post() {
         status.success(),
         "watch --once must exit 0, stderr: {stderr}"
     );
+    // bd-73s8: a PRESENT socket must be named, not just an absent one.
+    // Discovery never consults TORON_MCP_DATA_DIR (ADR-0036 Spec 2), so
+    // attaching to a foreign daemon is possible by design; unsaid, it is
+    // indistinguishable from the in-process fallback and surfaces only as a
+    // full-budget `watch: timeout` (measured: 15.0s vs 39ms, same store, same
+    // argv, only TORON_WAKE_SOCK differing).
+    assert!(
+        stderr.contains(&format!("wake.sock attached at {}", sock.display())),
+        "the attach must name the socket it dialed, got stderr: {stderr}"
+    );
     // Read the captured stdout via a second run-free check: the child's
     // stdout was piped; try_wait may have consumed it. The event JSON was
     // printed on stdout of the child — collect it before the child dropped.
     // (The child owns stdout; we read it here through the join handle
     // produced by spawn_watch — see below.)
-    let _ = stderr;
 
     // Re-run watch --once with a fresh subprocess on the SAME store: the
     // stored kind-9 post must be replayed and matched, proving the event is
