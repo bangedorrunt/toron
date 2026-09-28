@@ -520,14 +520,28 @@ pub async fn run_agent(mailbox: &Mailbox, cmd: &AgentCommand, dry_run: bool) -> 
                 return Ok(());
             }
             let report = mailbox.prune_folded_slugs(&args.project).await?;
+            // bd-0tbg: a held row is NOT a tidy-up. It is an identity still
+            // holding reservations, and absorbing it would delete the roster
+            // row those reservations are addressed by — so it is reported in
+            // its own bucket with the paths, and the operator is told the
+            // release comes first. Silently folding it into `kept` would tell
+            // them to go register a pin, which fixes nothing.
+            let held_count = report.held.len();
             print_json(&json!({
                 "project": args.project,
                 "as": args.agent,
                 "removed": report.removed,
                 "kept": report.kept,
+                "held": report.held,
                 "removed_count": report.removed.len(),
                 "kept_count": report.kept.len(),
-                "next": if report.kept.is_empty() {
+                "held_count": held_count,
+                "next": if held_count > 0 {
+                    "HELD rows still hold file reservations — release or force-release them \
+                     (`toron reserve release-by-reason <bead>` or `toron reserve force-release`), \
+                     then re-run `toron agent prune`. Their roster rows were kept on purpose: \
+                     deleting a holder's row makes its live reservations unaddressable."
+                } else if report.kept.is_empty() {
                     "no folded-slug leftovers remain — doctor's legacy_slug_identities is clean"
                 } else {
                     "kept rows have NO registered canonical pin; register the pin, then re-run `toron agent prune`"

@@ -89,6 +89,25 @@ pub struct FoldedSlugLeftover {
     pub canonical: String,
 }
 
+/// bd-0tbg: a leftover the sweep REFUSED to absorb because that identity is
+/// still holding live file reservations.
+///
+/// Kept as its own bucket, distinct from `kept`, because the two need
+/// different operator actions and confusing them is how a holder is
+/// destroyed: a `kept` row is waiting for a pin to register, while a `held`
+/// row is mid-work and the only thing between it and an unaddressable
+/// reservation is this check.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct HeldLeftover {
+    pub project_slug: String,
+    pub slug: String,
+    pub pubkey: String,
+    pub canonical: String,
+    /// The reserved path globs this identity is still holding, so the
+    /// operator can see what the release would cost before doing it.
+    pub leases: Vec<String>,
+}
+
 /// bd-4a0u: the outcome of one `agent prune` sweep — the CLI report shape.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SlugPruneReport {
@@ -99,6 +118,12 @@ pub struct SlugPruneReport {
     /// absorbing into a void would strand the identity worse than before.
     /// `doctor` keeps naming these until the pin registers.
     pub kept: Vec<FoldedSlugLeftover>,
+    /// bd-0tbg: leftovers KEPT because the identity still holds live file
+    /// reservations. Absorbing deletes the roster row, and a reservation is
+    /// addressed BY that identity — so the sweep would make in-flight work
+    /// unaddressable and invisible to a release aimed at the surviving
+    /// spelling. Release the leases (or force-release them) and re-run.
+    pub held: Vec<HeldLeftover>,
 }
 
 /// Scan one index pool for leftover dual registrations. Empty after
@@ -374,6 +399,31 @@ impl Mailbox {
     /// Refuses to destroy a row when the canonical target has NO live
     /// registration (absorbing into a void would strand the identity worse
     /// than before — doctor names those).
+    /// bd-0tbg: the path globs `alias` is still holding under a LIVE lease,
+    /// matched on the KEY as well as the name. A lease carries both, and the
+    /// key is the authoritative one — matching on the name alone would miss a
+    /// lease held by the very identity being absorbed whenever the name
+    /// spelling drifted, which is the whole situation this check exists for.
+    /// Sorted and deduplicated: the report is read by a human deciding
+    /// whether to force-release.
+    pub async fn active_leases_for_identity(
+        &self,
+        project_slug: &str,
+        name: &str,
+        pubkey: &str,
+    ) -> anyhow::Result<Vec<String>> {
+        let mut paths: Vec<String> = self
+            .active_reservations(project_slug)
+            .await?
+            .into_iter()
+            .filter(|r| r.agent_pubkey == pubkey || (!name.is_empty() && r.agent_name == name))
+            .map(|r| r.path_pattern)
+            .collect();
+        paths.sort();
+        paths.dedup();
+        Ok(paths)
+    }
+
     pub async fn absorb_folded_slug(&self, project_slug: &str, alias: &str) -> SlugAbsorption {
         let Some(pool) = self.index_pool.as_ref() else {
             return SlugAbsorption::default();
@@ -439,9 +489,33 @@ impl Mailbox {
     /// Cross-key NIP-09 delete is forbidden, so this removes the local roster
     /// row only; the orphan's already-sealed wraps stay unreachable by
     /// construction (no surface keys off a roster row).
+    ///
+    /// bd-0tbg: and a row whose identity is still HOLDING live reservations
+    /// is returned in [`SlugPruneReport::held`], also not destroyed. This is
+    /// the check that ordering the other way round would have skipped: a
+    /// leftover whose holder is mid-work looks exactly like a leftover whose
+    /// holder is finished, and only the leases tell them apart. Deleting the
+    /// row does not release them — it makes them unaddressable.
     pub async fn prune_folded_slugs(&self, project_slug: &str) -> anyhow::Result<SlugPruneReport> {
         let mut report = SlugPruneReport::default();
         for leftover in self.folded_slug_leftovers_for(project_slug).await? {
+            let leases = self
+                .active_leases_for_identity(
+                    &leftover.project_slug,
+                    &leftover.slug,
+                    &leftover.pubkey,
+                )
+                .await?;
+            if !leases.is_empty() {
+                report.held.push(HeldLeftover {
+                    project_slug: leftover.project_slug,
+                    slug: leftover.slug,
+                    pubkey: leftover.pubkey,
+                    canonical: leftover.canonical,
+                    leases,
+                });
+                continue;
+            }
             let absorbed = self
                 .absorb_folded_slug(&leftover.project_slug, &leftover.slug)
                 .await;
@@ -2066,6 +2140,115 @@ mod tests {
             .await
             .expect("folded slug still routable");
         assert_eq!(w.npub, pin.npub, "alias resolves to the pin identity");
+    }
+
+    /// bd-0tbg: absorbing a leftover must NOT destroy a holder that is still
+    /// holding leases. `agent prune` deletes the standalone `agents` row, and
+    /// a reservation is addressed BY that identity — so deleting a row whose
+    /// holder has five live leases does not tidy the board, it makes five
+    /// in-flight reservations unaddressable by name and invisible to a
+    /// release or a release-on-bead-close aimed at the surviving spelling.
+    ///
+    /// Measured on a live host: `brash-otter` and `BrashOtter` are two keys
+    /// for one name in ONE project, and the kebab half held five
+    /// reservations. The disjointness that made it look safe was a property
+    /// of what each side happened to be editing, not a check.
+    #[tokio::test]
+    async fn prune_keeps_a_leftover_that_still_holds_leases() {
+        let (mailbox, pool, _db, _data) = test_mailbox_with_pool("0tbg-prune").await;
+        let project = "p-0tbg";
+        mailbox.ensure_project(project).await.expect("ensure");
+        let absorbable = mailbox
+            .register_agent(project, &profile("flywheel-p-0tbg-oc1"))
+            .await
+            .expect("absorbable slug");
+        let project = absorbable.project_slug.clone();
+        let pin = mailbox
+            .register_agent(&project, &profile("RealPin"))
+            .await
+            .expect("canonical pin");
+        mailbox
+            .fold_agent_name_alias_no_absorb(&project, "flywheel-p-0tbg-oc1", "RealPin")
+            .await;
+
+        // The holder is mid-work when the sweep runs.
+        mailbox
+            .file_reservation_paths(
+                &project,
+                "flywheel-p-0tbg-oc1",
+                &["src/cmd/workflow.rs".into(), "src/stages.rs".into()],
+                Some(3600),
+                true,
+                Some("bd-0tbg"),
+            )
+            .await
+            .expect("holder takes two leases");
+
+        let report = mailbox.prune_folded_slugs(&project).await.expect("prune");
+        assert!(
+            report.removed.is_empty(),
+            "a holder with live leases must not be absorbed: {:?}",
+            report.removed
+        );
+        assert_eq!(report.held.len(), 1, "it is reported as HELD, not kept");
+        assert_eq!(report.held[0].slug, "flywheel-p-0tbg-oc1");
+        assert_eq!(
+            report.held[0].leases.len(),
+            2,
+            "and the operator is told which ones: {:?}",
+            report.held[0].leases
+        );
+        assert!(
+            report.held[0]
+                .leases
+                .iter()
+                .any(|l| l == "src/cmd/workflow.rs")
+        );
+
+        // The row survives, so both leases stay addressable by their holder.
+        let rows: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM agents WHERE project_slug = ?1")
+                .bind(&project)
+                .fetch_all(&pool)
+                .await
+                .expect("roster");
+        assert!(
+            rows.iter().any(|n| n == "flywheel-p-0tbg-oc1"),
+            "the holder row must survive the sweep: {rows:?}"
+        );
+        // Name routing still folds to the canonical pin (unchanged), and the
+        // leases are still readable under the leftover's own key — which is
+        // the point of keeping the row.
+        let who = mailbox
+            .whois(&project, "flywheel-p-0tbg-oc1")
+            .await
+            .expect("alias still routable");
+        assert_eq!(who.npub, pin.npub, "the fold is untouched by the sweep");
+        let still = mailbox
+            .active_leases_for_identity(&project, "flywheel-p-0tbg-oc1", &absorbable.npub)
+            .await
+            .expect("leases still readable");
+        assert_eq!(still.len(), 2, "and both leases remain addressable");
+
+        // Release the leases; now the sweep is allowed to finish the job.
+        mailbox
+            .release_file_reservations(
+                &project,
+                "flywheel-p-0tbg-oc1",
+                &["src/cmd/workflow.rs".into(), "src/stages.rs".into()],
+            )
+            .await
+            .expect("release");
+        let again = mailbox
+            .prune_folded_slugs(&project)
+            .await
+            .expect("re-prune");
+        assert_eq!(again.removed.len(), 1, "with the work released it absorbs");
+        assert!(
+            again.held.is_empty(),
+            "and nothing is held: {:?}",
+            again.held
+        );
     }
 
     // --- ADR-0018: swarm-mode whois + registration hardening ---
