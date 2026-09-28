@@ -20,6 +20,8 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::str::FromStr;
 
+use toron_core::index::run_state::{ForkIntent, RunStateStore, plan_fork};
+
 use clap::Parser;
 
 use crate::cli::{Cli, Command};
@@ -127,6 +129,10 @@ fn run(cli: &Cli) -> anyhow::Result<ExitCode> {
         }
         Command::Role(cmd) => {
             run_role(cmd, format)?;
+            ExitCode::SUCCESS
+        }
+        Command::RunState(cmd) => {
+            run_run_state(cmd, &cfg, format)?;
             ExitCode::SUCCESS
         }
         Command::Mail(_)
@@ -447,6 +453,135 @@ fn run_config(cfg: &Config, args: &cli::ConfigArgs, format: OutputFormat) -> any
         }
     }
     Ok(())
+}
+
+/// `toron run-state replay|fork` (ADR-0035, spec S8).
+///
+/// The read half of the checkpoint store. Both arms are READS: `replay` renders
+/// one boundary, `fork` renders what a fork from it would do. Neither installs
+/// anything, and `fork` is dry by default, so this whole function is incapable
+/// of seeding a live model from the log (spec S3) — the one arm that could is
+/// the live host's, beside its own resume path.
+///
+/// The pool is opened read-only in the only sense that matters here (nothing
+/// but SELECT runs), and the store is the SAME one the recorder appends to: one
+/// index, one schema.
+fn run_run_state(
+    cmd: &cli::RunStateCommand,
+    cfg: &Config,
+    format: OutputFormat,
+) -> anyhow::Result<()> {
+    use crate::cli::RunStateCommand;
+
+    let data_dir = resolve_data_dir(cfg);
+    let db_path = data_dir.join("index.sqlite");
+    if !db_path.exists() {
+        anyhow::bail!(
+            "no run-state index at {}. Checkpoints are recorded only when the host runs \
+             with run-state logging on, so an absent index is a real answer, not a \
+             failed read.",
+            db_path.display()
+        );
+    }
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let (thread, seq) = match cmd {
+        RunStateCommand::Replay(a) | RunStateCommand::Fork(a) => (a.thread.clone(), a.seq),
+    };
+
+    let value = rt.block_on(async {
+        let pool = toron_core::index::schema::connect(db_path.to_str().unwrap()).await?;
+        let store = RunStateStore::new(pool);
+        let boundary = store.replay(&thread, seq).await?;
+        // The fork arm is dry by construction. There is no --perform flag
+        // here: an opt-in that this build cannot honour would be a flag that
+        // lies. The acknowledged `Perform` intent exists in the core for the
+        // host that owns the installer, and is reachable by naming the hazard.
+        let value = match cmd {
+            RunStateCommand::Replay(_) => serde_json::json!({
+                "thread": boundary.thread_id,
+                "seq": boundary.seq,
+                "checkpoint_id": boundary.checkpoint_id,
+                "parent_checkpoint_id": boundary.parent_checkpoint_id,
+                "msg_kind": boundary.msg_kind,
+                "created_at": boundary.created_at,
+                "model": boundary.model,
+                "effect_keys": boundary.effect_keys,
+            }),
+            RunStateCommand::Fork(_) => {
+                serde_json::json!(plan_fork(&boundary, &ForkIntent::Dry))
+            }
+        };
+        Ok::<serde_json::Value, anyhow::Error>(value)
+    })?;
+
+    match format {
+        OutputFormat::Json | OutputFormat::Plain => render_json(&value, format),
+        OutputFormat::Human => println!("{}", render_run_state_human(&value)),
+    }
+    Ok(())
+}
+
+/// Human rendering for a replay or a fork plan.
+///
+/// Kept as its own function so the JSON path and the text path cannot drift on
+/// what they claim: a boundary printed as text and the same boundary printed as
+/// JSON must say the same thing about installability.
+fn render_run_state_human(value: &serde_json::Value) -> String {
+    use std::fmt::Write as _;
+
+    let field = |k: &str| {
+        value
+            .get(k)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("-")
+            .to_string()
+    };
+    let mut out = format!(
+        "boundary  {}/{}\ncheckpoint {}\nmsg        {}",
+        field("thread"),
+        value
+            .get("seq")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(-1),
+        field("checkpoint_id"),
+        field("msg_kind"),
+    );
+    if let Some(keys) = value
+        .get("effect_keys")
+        .and_then(serde_json::Value::as_array)
+    {
+        let _ = writeln!(out, "\nowned      {} effect(s)", keys.len());
+        for k in keys {
+            let _ = writeln!(out, "           {k}");
+        }
+    }
+    if let Some(refusals) = value.get("refusals").and_then(serde_json::Value::as_array) {
+        for r in refusals {
+            if let Some(s) = r.as_str() {
+                let _ = writeln!(out, "refused    {s}");
+            }
+        }
+    }
+    if let Some(model) = value.get("model") {
+        let _ = writeln!(
+            out,
+            "model      {}",
+            serde_json::to_string(model).unwrap_or_else(|e| format!("<unrenderable: {e}>"))
+        );
+    }
+    out.trim_end().to_string()
+}
+
+/// The durable data dir this process reads. Same ladder the other one-store
+/// commands use, so `run-state` reads the same index they write.
+fn resolve_data_dir(cfg: &Config) -> PathBuf {
+    std::env::var_os("TORON_DATA_DIR")
+        .map(PathBuf::from)
+        .or_else(|| cfg.data_dir.clone())
+        .unwrap_or_else(toron_core::config::durable_data_dir)
 }
 
 #[tokio::main]

@@ -20,7 +20,7 @@
 //! Every read shares one [`COLUMNS`] projection, so a column cannot drift
 //! between `get`, `latest`, `history` and `load_for_resume`.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::SqlitePool;
@@ -255,6 +255,30 @@ impl RunStateStore {
         .await?)
     }
 
+    /// Read one boundary for a reader: the model plus its pending-write set.
+    ///
+    /// The ONE effect in the read side. A read, so it takes no clock and no
+    /// network; `created_at` comes back off the row rather than from
+    /// `SystemTime`, which is what lets a test pin it.
+    ///
+    /// EXACT, unlike [`RunStateStore::load_for_resume`]. A resume may fall back
+    /// to the boundary at-or-before the request, because the alternative is
+    /// refusing to resume over a gap; a READER that fell back would silently
+    /// show a different boundary than the one asked for, and the operator
+    /// would believe they are looking at step N. So a miss here is a typed
+    /// failure naming the boundary, never a nearby row.
+    pub async fn replay(&self, thread_id: &str, seq: i64) -> Result<RunStateReplay> {
+        let row = self.get(thread_id, seq).await?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "no run-state boundary at {thread_id}/{seq}. `replay` is exact on purpose: \
+                 falling back to a nearby boundary would show a step the caller did not \
+                 ask for. List the thread's boundaries, or use the resume seed, which is \
+                 the one read allowed to fall back at-or-before."
+            )
+        })?;
+        RunStateReplay::from_checkpoint(&row)
+    }
+
     /// Delete rows strictly older than `protect_from_seq` and return the count.
     ///
     /// `protect_from_seq` is REQUIRED, not defaulted. The store cannot know
@@ -299,4 +323,221 @@ fn short_hash(thread_id: &str) -> String {
 /// from it would silently discard the model. Fail closed.
 pub fn parse_model(row: &RunStateCheckpoint) -> Result<Value> {
     Ok(serde_json::from_str(&row.model_json)?)
+}
+
+// ---------------------------------------------------------------------------
+// Read side (bd-7n8e)
+//
+// Everything below is either a PURE value or a PURE decision over one. The
+// only effect is [`RunStateStore::replay`], a read. There is deliberately no
+// writer here: `append` above is the only way a row comes into existence, and
+// [`RunStateReplay::install`] refuses, so the read half cannot become a
+// second seeding path (spec §3).
+// ---------------------------------------------------------------------------
+
+/// One boundary, rendered for a reader: the model plus the pending-write set.
+///
+/// The pending-write set is the half a bare `model_json` cannot give you. A
+/// boundary that owned effects may have already dispatched them to a real
+/// provider, so a reader deciding whether it is safe to re-enter that boundary
+/// needs the KEYS, not just the state. `effect_keys` is empty for a boundary
+/// that owned nothing, which is a fact about the boundary rather than a
+/// missing read.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RunStateReplay {
+    pub thread_id: String,
+    pub seq: i64,
+    pub checkpoint_id: String,
+    pub parent_checkpoint_id: Option<String>,
+    /// The `Msg` variant that produced this state, as evidence. `None` means
+    /// "resume point, no message" — never a default guess.
+    pub msg_kind: Option<String>,
+    pub created_at: i64,
+    /// The fold's state at this boundary, already parsed. A payload that will
+    /// not parse is a typed failure, never an empty model.
+    pub model: Value,
+    /// Effect keys this boundary owned: the pending-write set.
+    pub effect_keys: Vec<String>,
+}
+
+impl RunStateReplay {
+    /// Build a reader view from a stored row. Pure: no clock, no I/O.
+    pub fn from_checkpoint(row: &RunStateCheckpoint) -> Result<Self> {
+        Ok(Self {
+            thread_id: row.thread_id.clone(),
+            seq: row.seq,
+            checkpoint_id: row.checkpoint_id.clone(),
+            parent_checkpoint_id: row.parent_checkpoint_id.clone(),
+            msg_kind: row.msg_kind.clone(),
+            created_at: row.created_at,
+            model: parse_model(row)
+                .with_context(|| format!("run-state boundary {}/{}", row.thread_id, row.seq))?,
+            effect_keys: parse_effect_keys(row)?,
+        })
+    }
+
+    /// Refuse to install this boundary as a live model. Always.
+    ///
+    /// Spec §3 makes the log authoritative and the model a pure function of
+    /// it, and that is a statement about which side is the RECORD. It is not a
+    /// grant to any component to SEED the live model from the log: seeding is
+    /// an authority call with exactly one legitimate owner, the live host
+    /// beside its existing resume path. A reader that grew an installer would
+    /// put a second seeding path beside it, which §3 forbids and which the
+    /// bead that owns the authority call has to make.
+    ///
+    /// This exists as a method rather than as the absence of one on purpose:
+    /// a caller who reaches for it gets the refusal AND the name of who to
+    /// ask, at the call site, instead of discovering the rule by reading a
+    /// design note.
+    pub fn install(self) -> Result<RunStateCheckpoint, InstallRefused> {
+        Err(InstallRefused {
+            thread_id: self.thread_id,
+            seq: self.seq,
+        })
+    }
+}
+
+/// A typed refusal to seed a live model from the log.
+///
+/// Not a defect and not a cancellation: the caller asked a legal question and
+/// the answer is that this component does not own the answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstallRefused {
+    pub thread_id: String,
+    pub seq: i64,
+}
+
+impl std::fmt::Display for InstallRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "refusing to seed a live model from run-state boundary {}/{}: the log is a \
+             durable projection, not a seeding source (spec S3). Seeding is the live \
+             host's authority call beside its own resume path, so a reader with an \
+             installer would be a second seeding path. Ask the run's authority owner \
+             to wire it, do not add one here.",
+            self.thread_id, self.seq
+        )
+    }
+}
+
+impl std::error::Error for InstallRefused {}
+
+/// Parse the stored pending-write set. Pure; fails closed.
+///
+/// `NULL` is a boundary that owned no effects, which is a real state and not a
+/// missing read. Malformed JSON is NOT that: it is an unreadable row, and
+/// reporting it as "owned nothing" would tell a reader it is safe to re-enter
+/// a boundary whose effects nobody can name.
+fn parse_effect_keys(row: &RunStateCheckpoint) -> Result<Vec<String>> {
+    let Some(raw) = row.effect_keys.as_deref() else {
+        return Ok(Vec::new());
+    };
+    serde_json::from_str(raw).with_context(|| {
+        format!(
+            "run-state boundary {}/{} carries an unreadable pending-write set; refusing to \
+             report it as empty, because a reader would then believe re-entering this \
+             boundary is safe when its effects cannot be named",
+            row.thread_id, row.seq
+        )
+    })
+}
+
+/// What a caller is asking a fork to do.
+///
+/// `Dry` is the default and the only variant a plain `toron run-state fork`
+/// ever builds. `Perform` is not a boolean you flip; it carries the
+/// acknowledgement, because the hazard it names is real: a fork point may
+/// ALREADY have dispatched effects to a provider, so re-entering it can
+/// duplicate work that already left the machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ForkIntent {
+    #[default]
+    Dry,
+    Perform(AcknowledgeDispatchedEffects),
+}
+
+/// The caller's acknowledgement that this boundary may already have dispatched
+/// real external effects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AcknowledgeDispatchedEffects;
+
+impl AcknowledgeDispatchedEffects {
+    /// Spelled as a call rather than a bare literal so the acknowledgement
+    /// reads in a diff as an event, not as a field someone set.
+    pub const fn accept() -> Self {
+        Self
+    }
+}
+
+/// What a fork WOULD do, rendered for a reader. Pure data.
+///
+/// `installable` is carried as a field rather than left implied so the refusal
+/// is something an operator can read in the output instead of something they
+/// have to know to go looking for in a design note.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ForkPlan {
+    pub thread_id: String,
+    pub seq: i64,
+    pub checkpoint_id: String,
+    /// Effect keys the boundary already owned. Re-entering this boundary may
+    /// replay work that already reached a provider.
+    pub inherited_effect_keys: Vec<String>,
+    /// Whether this plan would dispatch anything. True only for an
+    /// acknowledged `Perform` intent.
+    pub would_perform: bool,
+    /// Always false in this build: nothing here seeds a live model from the
+    /// log (spec §3). See [`RunStateReplay::install`].
+    pub installable: bool,
+    /// Operator-facing refusals, ordered so the blocking one reads first.
+    pub refusals: Vec<String>,
+}
+
+/// Decide a fork. PURE: same boundary + same intent ⇒ same plan.
+///
+/// Total rather than fallible — a fork is never an error, it is a report. The
+/// refusals it can carry are the answer, not a failure to produce one.
+pub fn plan_fork(boundary: &RunStateReplay, intent: &ForkIntent) -> ForkPlan {
+    let (would_perform, mut refusals) = match intent {
+        ForkIntent::Dry => (
+            false,
+            vec![
+                "dry fork: nothing is dispatched. A performing fork is an explicit \
+                 opt-in, because this boundary may already have dispatched effects."
+                    .to_string(),
+            ],
+        ),
+        ForkIntent::Perform(_) => (true, Vec::new()),
+    };
+
+    if !boundary.effect_keys.is_empty() {
+        // Prepend: it is the one that decides whether Perform is even legal.
+        refusals.insert(
+            0,
+            format!(
+                "this boundary owned {} effect(s) ({}), so re-entering it may replay work \
+                 that already reached a provider; a settled effect replays from its \
+                 recorded outcome and one left in_flight stays honestly unknown",
+                boundary.effect_keys.len(),
+                boundary.effect_keys.join(", ")
+            ),
+        );
+    }
+
+    refusals.push(
+        "no installer in this build: seeding a live model from the log is the live \
+         host's authority call, so this plan is a report and not a resume."
+            .to_string(),
+    );
+
+    ForkPlan {
+        thread_id: boundary.thread_id.clone(),
+        seq: boundary.seq,
+        checkpoint_id: boundary.checkpoint_id.clone(),
+        inherited_effect_keys: boundary.effect_keys.clone(),
+        would_perform,
+        installable: false,
+        refusals,
+    }
 }
