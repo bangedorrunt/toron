@@ -19,7 +19,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
 use crate::bus::{Bus, BusError, Filter};
-use crate::nostr::Kind;
+use crate::nostr::{Event, Kind, MatchEventOptions};
 
 /// Wake kinds held by the daemon (ADR-0036 §6 example + 1059/43004 for
 /// `wait --corr` direct-receipt parity with `WAIT_WAKE_KINDS`).
@@ -427,6 +427,7 @@ impl WakeHandle {
         let live = Arc::new(AtomicU64::new(0));
         let mut tasks = tokio::task::JoinSet::new();
         let bus_tx = tokio::sync::broadcast::channel::<String>(config.queue_cap.max(1)).0;
+        let subscriber_bus = bus.clone();
         // Fan-out pump: bus → broadcast (bounded; lagging subscribers shed).
         // bd-d41q: the held subscription only observes THIS process's bus.
         // Writes from other processes on the shared store (CLI plane
@@ -528,6 +529,7 @@ impl WakeHandle {
             let recent = recent.clone();
             let totals = totals.clone();
             let live_accept = live.clone();
+            let bus = subscriber_bus;
             tasks.spawn(async move {
                 loop {
                     let Ok((stream, _)) = listener.accept().await else {
@@ -539,9 +541,10 @@ impl WakeHandle {
                     let live = live_accept.clone();
                     let clock = clock.clone();
                     let cfg = config.clone();
+                    let bus = bus.clone();
                     live.fetch_add(1, Ordering::SeqCst);
                     tokio::spawn(async move {
-                        let st = serve_subscriber(stream, rx, cfg, clock).await;
+                        let st = serve_subscriber(stream, rx, cfg, clock, bus).await;
                         // Fold into the exact running totals first: the
                         // aggregate must never be capped by the detail
                         // window (bd-qpm0).
@@ -609,11 +612,85 @@ impl Drop for WakeHandle {
 ///
 /// Always returns the accumulated stats, even on error paths (wave 4
 /// export honesty: a dropped connection must not discard its counters).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct WakeCursor {
+    created_at: u64,
+    event_id: String,
+}
+
+impl WakeCursor {
+    const fn origin() -> Self {
+        Self {
+            created_at: 0,
+            event_id: String::new(),
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, WakeError> {
+        if value == "head" {
+            return Ok(Self::origin());
+        }
+        let (created_at, event_id) = value
+            .split_once(':')
+            .ok_or_else(|| WakeError::Codec("cursor must be <created_at>:<event_id>".into()))?;
+        let created_at = created_at
+            .parse::<u64>()
+            .map_err(|e| WakeError::Codec(format!("invalid cursor timestamp: {e}")))?;
+        if event_id.is_empty() && created_at == 0 {
+            return Ok(Self::origin());
+        }
+        if event_id.len() != 64 || !event_id.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(WakeError::Codec("invalid cursor event id".into()));
+        }
+        Ok(Self {
+            created_at,
+            event_id: event_id.to_ascii_lowercase(),
+        })
+    }
+
+    fn for_event(event: &Event) -> Self {
+        Self {
+            created_at: event.created_at.as_secs(),
+            event_id: event.id.to_hex(),
+        }
+    }
+}
+
+impl std::fmt::Display for WakeCursor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}", self.created_at, self.event_id)
+    }
+}
+
+async fn write_matching_event(
+    writer: &mut (impl tokio::io::AsyncWrite + Unpin),
+    event: &Event,
+    filter: &Filter,
+    cursor: &mut WakeCursor,
+) -> Result<bool, WakeError> {
+    if !filter.match_event(event, MatchEventOptions::default()) {
+        return Ok(false);
+    }
+    let event_cursor = WakeCursor::for_event(event);
+    if event_cursor <= *cursor {
+        return Ok(false);
+    }
+    let payload = serde_json::to_value(event).map_err(|e| WakeError::Codec(e.to_string()))?;
+    let line = WakeFrame::Event(payload).encode_line()?;
+    writer
+        .write_all(line.as_bytes())
+        .await
+        .map_err(|e| WakeError::Transport(e.to_string()))?;
+    *cursor = event_cursor;
+    Ok(true)
+}
+
 async fn serve_subscriber(
     stream: UnixStream,
     mut rx: tokio::sync::broadcast::Receiver<String>,
     config: WakeConfig,
     clock: Arc<dyn WakeClock>,
+    bus: Arc<dyn Bus>,
 ) -> SubscriberStats {
     let mut stats = SubscriberStats::default();
     let (reader, mut writer) = stream.into_split();
@@ -631,12 +708,40 @@ async fn serve_subscriber(
     let Ok(req) = WakeSubscribe::parse_line(&line) else {
         return stats;
     };
-    let _filter = req.filter();
-    let cursor = req
-        .since_cursor
-        .clone()
-        .unwrap_or_else(|| "head".to_string());
-    let eose = WakeFrame::Eose { cursor };
+    let filter = req.filter();
+    let mut cursor = match req.since_cursor.as_deref() {
+        Some(value) => match WakeCursor::parse(value) {
+            Ok(cursor) => cursor,
+            Err(_) => return stats,
+        },
+        None => WakeCursor::origin(),
+    };
+    let Ok(mut replay) = bus.subscribe_trusted(filter.clone()).await else {
+        return stats;
+    };
+    let replay_complete = loop {
+        match replay.next().await {
+            Some(crate::bus::SubscriptionEvent::Event(event)) => {
+                match write_matching_event(&mut writer, &event, &filter, &mut cursor).await {
+                    Ok(true) => stats.delivered += 1,
+                    Ok(false) => {}
+                    Err(_) => return stats,
+                }
+            }
+            Some(crate::bus::SubscriptionEvent::Eose) => break true,
+            Some(crate::bus::SubscriptionEvent::Closed(_)) | None => break false,
+        }
+    };
+    if !replay_complete {
+        return stats;
+    }
+    let eose = WakeFrame::Eose {
+        cursor: if cursor == WakeCursor::origin() {
+            "head".to_string()
+        } else {
+            cursor.to_string()
+        },
+    };
     let Ok(eose_line) = eose.encode_line() else {
         return stats;
     };
@@ -649,16 +754,21 @@ async fn serve_subscriber(
         let wait = config.heartbeat_ms;
         match tokio::time::timeout(std::time::Duration::from_millis(wait), rx.recv()).await {
             Ok(Ok(line)) => {
-                // Bounded queue honesty: broadcast lag means this subscriber
-                // is behind — shed it with an exact resync cursor.
-                match writer.write_all(line.as_bytes()).await {
-                    Ok(()) => stats.delivered += 1,
+                let Ok(WakeFrame::Event(payload)) = WakeFrame::decode_line(&line) else {
+                    continue;
+                };
+                let Ok(event) = Event::from_json(payload.to_string()) else {
+                    return stats;
+                };
+                match write_matching_event(&mut writer, &event, &filter, &mut cursor).await {
+                    Ok(true) => stats.delivered += 1,
+                    Ok(false) => {}
                     Err(_) => return stats,
                 }
             }
             Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped))) => {
                 stats.shed += skipped;
-                let resync = format!("shed-{skipped}");
+                let resync = cursor.to_string();
                 stats.resync_from = Some(resync.clone());
                 let shed = WakeFrame::Shed {
                     resync_from: resync,
@@ -713,7 +823,10 @@ mod wake_bus_tests {
             &self,
             _filter: Filter,
         ) -> Result<crate::bus::Subscription, BusError> {
-            let (_tx, rx) = tokio::sync::mpsc::channel(crate::bus::Subscription::DEFAULT_CAPACITY);
+            let (tx, rx) = tokio::sync::mpsc::channel(crate::bus::Subscription::DEFAULT_CAPACITY);
+            tx.send(crate::bus::SubscriptionEvent::Eose)
+                .await
+                .map_err(|_| BusError::Shutdown)?;
             Ok(crate::bus::Subscription::new(
                 crate::bus::SubscriptionId::new("fake"),
                 rx,
@@ -856,9 +969,118 @@ mod wake_bus_tests {
     }
 
     #[tokio::test]
+    async fn wake_bus_replays_matching_store_rows_and_resumes_after_cursor() {
+        use crate::bus::in_process::{AuthPolicy, InProcessBus, InProcessBusConfig};
+        use crate::nostr::{Keys, Timestamp};
+
+        let db = std::env::temp_dir().join(format!(
+            "toron-wake-replay-{}-{}.sqlite",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let pool = crate::index::schema::connect(db.to_str().unwrap())
+            .await
+            .expect("connect");
+        crate::index::schema::migrate(&pool).await.expect("migrate");
+        let bus = Arc::new(
+            InProcessBus::open(
+                pool,
+                InProcessBusConfig {
+                    auth: AuthPolicy::AcceptAll,
+                    allowlist: Vec::new(),
+                    channel_capacity: 64,
+                    detailed_stage_logging: false,
+                },
+            )
+            .await
+            .expect("bus"),
+        );
+        let keys = Keys::generate();
+        let mut expected = Vec::new();
+        for (kind, project, content, second) in [
+            (9, "demo", "first", 10),
+            (9, "demo", "second", 11),
+            (14, "demo", "wrong kind", 12),
+            (9, "other", "wrong project", 13),
+        ] {
+            let event = crate::nostr::event::build_event(
+                &keys,
+                Kind::from(kind),
+                content,
+                vec![crate::nostr::Tag::parse(["t", project]).expect("project tag")],
+                Timestamp::from(second),
+            )
+            .expect("event");
+            if content == "first" || content == "second" {
+                expected.push((second, event.id.to_hex()));
+            }
+            bus.publish(event).await.expect("publish historical event");
+        }
+
+        let sock = tmp_sock("replay");
+        let _ = std::fs::remove_file(&sock);
+        let mut cfg = WakeConfig::new(&sock);
+        cfg.poll_interval_ms = 0;
+        let _h = WakeServer::new(cfg, bus, Arc::new(ManualClock::new(0)))
+            .start()
+            .await
+            .expect("bind");
+
+        async fn receive_replay(sock: &Path, since_cursor: Option<&str>) -> (Vec<String>, String) {
+            use tokio::io::AsyncWriteExt;
+            let stream = UnixStream::connect(sock).await.expect("connect");
+            let (reader, mut writer) = stream.into_split();
+            let mut request = serde_json::json!({
+                "subscribe": {"kinds": [9], "project": "demo", "since_cursor": since_cursor}
+            })
+            .to_string();
+            request.push('\n');
+            writer.write_all(request.as_bytes()).await.expect("subscribe");
+            let mut lines = BufReader::new(reader).lines();
+            let mut ids = Vec::new();
+            loop {
+                let line = tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    lines.next_line(),
+                )
+                .await
+                .expect("bounded socket read")
+                .expect("read frame")
+                .expect("frame before EOSE");
+                match WakeFrame::decode_line(&line).expect("valid frame") {
+                    WakeFrame::Event(event) => {
+                        ids.push(event["id"].as_str().expect("event id").to_owned());
+                    }
+                    WakeFrame::Eose { cursor } => return (ids, cursor),
+                    other => panic!("unexpected frame during replay: {other:?}"),
+                }
+            }
+        }
+
+        let (all_ids, cursor) = receive_replay(&sock, None).await;
+        assert_eq!(
+            all_ids,
+            expected.iter().map(|(_, id)| id.clone()).collect::<Vec<_>>(),
+            "initial subscribe replays matching stored events only, in store order"
+        );
+        assert_ne!(cursor, "head", "EOSE must report a resumable event cursor");
+
+        let resume_cursor = format!("{}:{}", expected[0].0, expected[0].1);
+        let (resumed_ids, _) = receive_replay(&sock, Some(&resume_cursor)).await;
+        assert_eq!(
+            resumed_ids,
+            vec![expected[1].1.clone()],
+            "resume starts strictly after the supplied event cursor"
+        );
+        drop(_h);
+        let _ = std::fs::remove_file(&db);
+    }
+
+    #[tokio::test]
     async fn wake_bus_subscribe_eose_then_heartbeat() {
         let sock = tmp_sock("eose");
         let _ = std::fs::remove_file(&sock);
+
         let mut cfg = WakeConfig::new(&sock);
         cfg.heartbeat_ms = 50;
         let clock: Arc<dyn WakeClock> = Arc::new(ManualClock::new(1_000));
@@ -881,6 +1103,70 @@ mod wake_bus_tests {
             WakeFrame::Eose {
                 cursor: "head".to_string(),
             }
+        );
+    }
+
+    /// The cursor IS the resume contract, so both halves are pinned here at the
+    /// write boundary with the writer substituted: a redelivered event is
+    /// written ONCE (a duplicate replay/live overlap cannot double-deliver),
+    /// and the position after a write round-trips through the wire parse, so a
+    /// consumer resuming from it skips what it already has.
+    #[tokio::test]
+    async fn a_redelivered_event_is_written_once_and_the_cursor_resumes() {
+        let keys = crate::nostr::Keys::generate();
+        let at = |content: &str, second: u64| {
+            crate::nostr::event::build_event(
+                &keys,
+                Kind::from(9),
+                content,
+                vec![],
+                crate::nostr::Timestamp::from(second),
+            )
+            .expect("event")
+        };
+        let ev = at("cursor", 10);
+        let older = at("older", 9);
+        let filter = Filter::new().kinds([Kind::from(9)]);
+        let mut written: Vec<u8> = Vec::new();
+        let mut cursor = WakeCursor::origin();
+
+        assert!(
+            write_matching_event(&mut written, &ev, &filter, &mut cursor)
+                .await
+                .expect("first delivery"),
+            "a fresh event past the cursor is delivered"
+        );
+        assert!(
+            !write_matching_event(&mut written, &ev, &filter, &mut cursor)
+                .await
+                .expect("redelivery"),
+            "the SAME event again (replay/live overlap) is suppressed, not re-sent"
+        );
+        assert!(
+            !write_matching_event(&mut written, &older, &filter, &mut cursor)
+                .await
+                .expect("stale"),
+            "an event behind the cursor never re-enters the stream"
+        );
+        let text = String::from_utf8_lossy(&written).into_owned();
+        assert_eq!(
+            text.matches(&ev.id.to_hex()).count(),
+            1,
+            "one frame per event, never two: {text}"
+        );
+
+        let wire = cursor.to_string();
+        assert_eq!(
+            WakeCursor::parse(&wire).expect("a cursor we wrote must resume"),
+            cursor,
+            "the position we advertise must parse back to the same position"
+        );
+        let mut resumed = WakeCursor::parse(&wire).expect("resumable");
+        assert!(
+            !write_matching_event(&mut written, &ev, &filter, &mut resumed)
+                .await
+                .expect("already seen"),
+            "a consumer resuming from the advertised cursor does not re-receive it"
         );
     }
 
