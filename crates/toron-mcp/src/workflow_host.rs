@@ -1700,6 +1700,9 @@ impl WorkflowHost {
             if let Err(e) = me.run_trigger_loop().await {
                 warn!("workflow trigger loop exited: {e}");
             }
+            // bd-8x2o: loop end is a clean stop — persist marks set after the
+            // final tick (SIGTERM death keeps the tick-bounded window).
+            me.persist_delivery_cursors().await;
         })
     }
 
@@ -1778,6 +1781,9 @@ impl WorkflowHost {
                 }
                 me.drain_all_known().await;
             }
+            // bd-8x2o: channel closed is a clean stop — persist marks set after
+            // the final tick (SIGTERM death keeps the tick-bounded window).
+            me.persist_delivery_cursors().await;
         })
     }
 
@@ -1831,6 +1837,11 @@ impl WorkflowHost {
     /// Called by the flush tick when dirty; warn-only — persistence must
     /// never fail delivery. Crash window = marks since the last saved tick.
     async fn persist_delivery_cursors(&self) {
+        // Dirty-gated: no marks since the last save, no writes. Callers
+        // (flush tick, loop exits) invoke unconditionally.
+        if !self.delivery.take_dirty() {
+            return;
+        }
         let disp = self
             .dispatcher
             .lock()
@@ -2007,10 +2018,8 @@ impl WorkflowHost {
             drop(permit); // release busy holder after publish CS
         }
         // bd-aqvg: persist cursor marks set by this tick or the dispatch path
-        // since the last tick. Dirty-gated: no marks, no writes.
-        if self.delivery.take_dirty() {
-            self.persist_delivery_cursors().await;
-        }
+        // since the last tick (gate lives inside persist).
+        self.persist_delivery_cursors().await;
     }
 
     /// Drive the trigger loop to completion (until the subscription closes).
@@ -6162,7 +6171,8 @@ steps:
         let h1 = mk_host(&pool).await;
         h1.delivery.mark_delivered("sess", ["id-1"]);
         assert!(h1.delivery.take_dirty(), "new mark dirties");
-        h1.delivery.mark_delivered("sess", ["id-1"]);
+        // Fresh mark after the take: persist is dirty-gated since bd-8x2o.
+        h1.delivery.mark_delivered("sess-aux", ["x"]);
         h1.persist_delivery_cursors().await;
         // Host 2 on the same pool: boot load restores delivered ids.
         let h2 = mk_host(&pool).await;
@@ -6195,6 +6205,43 @@ steps:
         h3.ensure_cursors_loaded().await;
         let (keep3, _) = h3.delivery.reserve_undelivered("sess", ["id-1"]);
         assert!(keep3.is_empty(), "good rows still load past a corrupt row");
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// bd-8x2o: loop end is a clean stop — marks set after the final tick
+    /// persist instead of dying with the task. Closes the channel, awaits
+    /// the task, reloads on the same pool.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cursor_stop_persist() {
+        use toron_core::bus::in_process::{InProcessBus, InProcessBusConfig};
+        use toron_core::index::schema;
+        use toron_core::index::workflow_effects::WorkflowEffectStore;
+        let db = std::env::temp_dir().join(format!("wf-cur-stop-{}.sqlite", uuid::Uuid::new_v4()));
+        let pool = schema::connect(db.to_str().unwrap())
+            .await
+            .expect("connect");
+        schema::migrate(&pool).await.expect("migrate");
+        let bus: Arc<dyn Bus> = Arc::new(
+            InProcessBus::open(pool.clone(), InProcessBusConfig::default())
+                .await
+                .expect("bus"),
+        );
+        let h = WorkflowHost::over_bus(bus, vec![], None).expect("host");
+        h.with_effect_store(WorkflowEffectStore::new(pool.clone()))
+            .await;
+        // Marks set with no tick running: only the stop hook can save them.
+        h.delivery.mark_delivered("sess", ["stop-1"]);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let handle = h.spawn_mail_trigger_loop(rx);
+        drop(tx);
+        handle.await.expect("loop task ends on closed channel");
+        let rows = WorkflowEffectStore::new(pool)
+            .load_delivery_cursors()
+            .await
+            .expect("load");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, "sess");
+        assert!(rows[0].1.contains("stop-1"), "stop hook persisted the mark");
         let _ = std::fs::remove_file(&db);
     }
 
