@@ -883,9 +883,19 @@ impl Mailbox {
         // reverse-resolve npub→name from the agents index so the inbox is
         // human-readable without a per-message `whois`. Falls back to the hex
         // npub when no pool is attached or the sender never registered locally.
-        let mut messages = match args.limit {
-            Some(n) => messages.into_iter().take(n).collect(),
-            None => messages,
+        // bd-asbc: `limit` is a NEWEST-N window, not an oldest-N head.
+        // `order_by_rumor_time` hands us an ASCENDING list, so a `.take(n)` over
+        // it kept the OLDEST n and dropped whatever had just arrived —
+        // invisible on a short inbox, and structurally fatal for any caller
+        // polling an inbox for something new. Take the tail instead, and still
+        // return it ascending: the limit narrows the window, it never reorders
+        // it, so a caller rendering the inbox sees the same order either way.
+        let mut messages = if let Some(n) = args.limit
+            && n < messages.len()
+        {
+            messages.split_off(messages.len() - n)
+        } else {
+            messages
         };
         self.resolve_sender_names(&mut messages).await;
         Ok(messages)
@@ -2341,6 +2351,69 @@ mod tests {
             1,
             "inbox must fill after key rotation + re-register"
         );
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// bd-asbc: `limit` must be a newest-N window, not an oldest-N head.
+    ///
+    /// The list arrives from `order_by_rumor_time` in ASCENDING rumor-time
+    /// order, so a `.take(n)` over it keeps the OLDEST n and structurally
+    /// drops whatever just arrived. That is invisible on a short inbox and
+    /// silently fatal for any consumer polling an inbox for something new.
+    ///
+    /// The returned rows stay ascending: the limit narrows the window, it does
+    /// not reorder it. A caller that renders the inbox or walks it in order
+    /// must not see a different order just because it asked for fewer rows.
+    #[tokio::test]
+    async fn fetch_inbox_limit_keeps_the_newest_rows_still_ascending() {
+        let (mailbox, db_path, data_dir) = test_mailbox("limitnewest").await;
+        let (_sender, _) = register(&mailbox, "demo", "GreenCastle").await;
+        let (_recv, _npub) = register(&mailbox, "demo", "BlueLake").await;
+
+        for i in 1..=4 {
+            mailbox
+                .send_message(&SendMessage {
+                    project_slug: "demo".into(),
+                    sender_name: "GreenCastle".into(),
+                    to: vec!["BlueLake".into()],
+                    subject: format!("m{i}"),
+                    body_md: format!("body {i}"),
+                    ..Default::default()
+                })
+                .await
+                .unwrap_or_else(|e| panic!("send {i}: {e}"));
+        }
+
+        let inbox = mailbox
+            .fetch_inbox(&FetchInbox {
+                project_slug: "demo".into(),
+                agent_name: "BlueLake".into(),
+                limit: Some(2),
+                ..Default::default()
+            })
+            .await
+            .expect("inbox");
+
+        let subjects: Vec<&str> = inbox.iter().map(|m| m.subject.as_str()).collect();
+        assert_eq!(
+            subjects,
+            vec!["m3", "m4"],
+            "limit keeps the NEWEST rows, and still returns them ascending"
+        );
+
+        // No limit is still the whole inbox, unchanged.
+        let all = mailbox
+            .fetch_inbox(&FetchInbox {
+                project_slug: "demo".into(),
+                agent_name: "BlueLake".into(),
+                limit: None,
+                ..Default::default()
+            })
+            .await
+            .expect("inbox unlimited");
+        assert_eq!(all.len(), 4, "no limit returns every row");
 
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_dir_all(&data_dir);
