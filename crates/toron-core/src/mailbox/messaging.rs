@@ -1201,14 +1201,91 @@ impl Mailbox {
             {
                 continue;
             }
+            // bd-ejp4: the scan is a LOOP, so "not handled yet" is not a
+            // licence to announce the same post again on every pass. Measured:
+            // 129 distinct posts produced 98,539 wakes (~771 each) in 13 hours,
+            // which filled the bus to its 100,000-row cap and got the mail
+            // gift-wrapped out from under the readers. The bound is one wake
+            // per SLA window, not a permanent mute, so a reader who never acts
+            // is still reminded. The record is durable because the flood
+            // outlived a daemon restart, and it is keyed on the AUDIENCE
+            // because the per-recipient contract above means a new
+            // co-recipient must still be woken.
+            let wake_key = ack_sla_wake_audience_key(&audience);
+            if self
+                .ack_sla_woken_within(&post_id, &wake_key, sla * 1_000_000)
+                .await
+            {
+                continue;
+            }
             let tid = thread_id.as_deref();
             let _ = self
                 .emit_ack_sla_expired(&project_slug, &post_id, tid, &audience)
                 .await;
+            // Record the attempt BEFORE trusting the loop: a wake that was
+            // published but not recorded here is exactly the repeat this guards.
+            self.ack_sla_record_wake(&post_id, &wake_key).await;
             let _ = eid; // suppress unused in non-hex path
             emitted.push(post_id);
         }
         Ok(emitted)
+    }
+
+    /// bd-ejp4: was this exact `(post, audience)` pair announced within
+    /// `window_us`?
+    ///
+    /// The bound is a REMINDER CADENCE, not a permanent mute. A post whose
+    /// reader never acts stays genuinely overdue, so suppressing it forever
+    /// would trade a flood for a silent drop. One wake per SLA window is the
+    /// shape that keeps both properties: measured against the live flood that
+    /// is 129 posts waking hourly instead of 98,539 wakes in 13 hours.
+    ///
+    /// A read failure answers `false` (announce again) rather than swallowing
+    /// the post: an unreadable record must not silence a real overdue ack, so
+    /// the failure mode is a duplicate wake, never a dropped one.
+    async fn ack_sla_woken_within(
+        &self,
+        post_id: &str,
+        audience_key: &str,
+        window_us: i64,
+    ) -> bool {
+        let Some(pool) = self.index_pool.as_ref() else {
+            return false;
+        };
+        let now_us = crate::index::writer::Clock::now_us(&crate::index::writer::SystemClock);
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM ack_sla_wakes \
+             WHERE post_id = ?1 AND audience = ?2 AND emitted_us >= ?3",
+        )
+        .bind(post_id)
+        .bind(audience_key)
+        .bind(now_us - window_us)
+        .fetch_one(pool)
+        .await
+        .map(|n| n > 0)
+        .unwrap_or(false)
+    }
+
+    /// bd-ejp4: record that this `(post, audience)` pair was announced.
+    ///
+    /// The conflict arm REFRESHES `emitted_us` rather than doing nothing:
+    /// the bound is a cadence, so a post that becomes eligible again after its
+    /// window must push its own reminder forward or it would re-wake on every
+    /// scan from then on. Best-effort — the row is the dedupe, not the wake.
+    async fn ack_sla_record_wake(&self, post_id: &str, audience_key: &str) {
+        let Some(pool) = self.index_pool.as_ref() else {
+            return;
+        };
+        let now_us = crate::index::writer::Clock::now_us(&crate::index::writer::SystemClock);
+        let _ = sqlx::query(
+            "INSERT INTO ack_sla_wakes (post_id, audience, emitted_us) VALUES (?1, ?2, ?3) \
+             ON CONFLICT (post_id, audience) DO UPDATE SET emitted_us = excluded.emitted_us",
+        )
+        .bind(post_id)
+        .bind(audience_key)
+        .bind(now_us)
+        .execute(pool)
+        .await;
     }
 
     /// Shared ack/read path (G8).
@@ -1592,11 +1669,9 @@ impl Mailbox {
                 // the target pane reads the toron.dev key, and the send reported
                 // `ok`. Invisible, not undelivered.
                 let binds = nident::name_across_projects(profiles.iter(), &row_name);
-                if let Some(w) = nident::ambiguous_name_warning(
-                    &row_name,
-                    &args.project_slug,
-                    &binds,
-                ) {
+                if let Some(w) =
+                    nident::ambiguous_name_warning(&row_name, &args.project_slug, &binds)
+                {
                     eprintln!("{w}");
                 }
                 out.push(ResolvedRecipient {
@@ -1955,6 +2030,24 @@ fn tag_has_flag(tags: &crate::nostr::Tags, name: &str) -> bool {
 /// Cache key for a receipt: `project:agent:kind:event_id`.
 fn receipt_key(project: &str, agent: &str, id: &EventId, kind: &str) -> String {
     format!("{project}:{agent}:{kind}:{id}")
+}
+
+/// bd-ejp4: the dedupe key for an ack-sla wake — the SORTED, DEDUPED audience.
+///
+/// Sorted so recipient order never splits one audience into two keys, and
+/// hashed rather than stored raw because this is a join key, not data anyone
+/// reads. An empty audience still produces a stable key: that is the
+/// un-addressed case, and it must dedupe like any other rather than becoming an
+/// unkeyed exemption.
+fn ack_sla_wake_audience_key(audience: &[String]) -> String {
+    let mut sorted: Vec<&str> = audience.iter().map(String::as_str).collect();
+    sorted.sort_unstable();
+    sorted.dedup();
+    let joined = sorted.join(",");
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    use std::hash::{Hash, Hasher};
+    joined.hash(&mut hasher);
+    format!("{joined}#{:016x}", hasher.finish())
 }
 
 /// Verify a gift wrap unwraps to the expected rumor content (acceptance
@@ -3784,6 +3877,308 @@ mod tests {
         );
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// The end-to-end consequence of the projection sink writing an EMPTY
+    /// `to_list`: the SLA scan treats an empty audience as "cannot prove
+    /// handled", so a fully-read overdue post is re-emitted on EVERY scan,
+    /// forever. The sibling tests above hand-write `to_list` by raw INSERT,
+    /// which is a state production could never produce — this one goes through
+    /// the real send → project → scan path, so it is the link they skip.
+    #[tokio::test]
+    async fn sla_scan_silences_a_really_projected_fully_read_post() {
+        let (mailbox, _pool, db_path, data_dir) = test_mailbox_with_pool("sla-e2e").await;
+        mailbox.ensure_project("demo").await.expect("ensure");
+        // The live projection path. The sibling SLA tests omit this precisely
+        // because they INSERT rows themselves and never touch the sink.
+        mailbox.spawn_unwrap_loop();
+        let (_, _) = register(&mailbox, "demo", "GreenCastle").await;
+        let (_, bnpub) = register(&mailbox, "demo", "BlueLake").await;
+        let (_, cnpub) = register(&mailbox, "demo", "RoseDune").await;
+        let pool = mailbox.index_pool.as_ref().unwrap().clone();
+
+        // Real send: one `to` + one `cc`, ack-required, high importance.
+        mailbox
+            .send_message(&crate::mailbox::SendMessage {
+                project_slug: "demo".into(),
+                sender_name: "GreenCastle".into(),
+                to: vec!["BlueLake".into()],
+                cc: vec!["RoseDune".into()],
+                subject: "sla-e2e".into(),
+                body_md: "please ack".into(),
+                importance: Some("high".into()),
+                ack_required: true,
+                ..Default::default()
+            })
+            .await
+            .expect("send");
+
+        // Wait for the projection sink to land the row.
+        let mut row: Option<(String, String, String)> = None;
+        for _ in 0..200 {
+            row = sqlx::query_as::<_, (String, String, String)>(
+                "SELECT event_id, to_list, cc_list FROM messages WHERE subject = 'sla-e2e'",
+            )
+            .fetch_optional(&pool)
+            .await
+            .expect("select");
+            if row.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let (post_id, to_json, cc_json) = row.expect("projected row must exist");
+        let to_seen: Vec<String> = serde_json::from_str(&to_json).expect("to json");
+        let cc_seen: Vec<String> = serde_json::from_str(&cc_json).expect("cc json");
+        assert_eq!(
+            to_seen,
+            vec![bnpub.to_hex()],
+            "production projection must persist the `to` audience"
+        );
+        assert_eq!(
+            cc_seen,
+            vec![cnpub.to_hex()],
+            "production projection must persist the `cc` audience"
+        );
+
+        // Backdate past the SLA and record BOTH recipients' reads.
+        let old_us = crate::index::writer::Clock::now_us(&crate::index::writer::SystemClock)
+            - 2 * 60 * 60 * 1_000_000;
+        sqlx::query("UPDATE messages SET created_ts_us = ?1 WHERE subject = 'sla-e2e'")
+            .bind(old_us)
+            .execute(&pool)
+            .await
+            .expect("backdate");
+        for npub in [bnpub.to_hex(), cnpub.to_hex()] {
+            sqlx::query(
+                "INSERT INTO message_reads (project_slug, message_id, recipient, read_ts_us) \
+                 VALUES ('demo', ?1, ?2, ?3)",
+            )
+            .bind(&post_id)
+            .bind(npub)
+            .bind(old_us + 1)
+            .execute(&pool)
+            .await
+            .expect("read");
+        }
+
+        let emitted = mailbox
+            .check_ack_sla_expired("demo", Some(30 * 60))
+            .await
+            .expect("check");
+        assert!(
+            !emitted.contains(&post_id),
+            "a fully-read post with a REAL audience must not be re-emitted; \
+             empty to_list re-emits it on every scan forever"
+        );
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// bd-ejp4: the scan runs in a LOOP, so an overdue post that nobody has
+    /// read is genuinely overdue on every pass. Without a durable
+    /// already-woken record that means one wake per scan per post forever:
+    /// measured live at 98,539 wake events from only 129 distinct posts
+    /// (~771 each) in 13 hours, which filled the bus to its cap and got the
+    /// mail gift-wrapped out from under the readers.
+    ///
+    /// The counter shape matters: a test that only checks "the second scan
+    /// emitted nothing" would also pass if the first scan had emitted nothing
+    /// at all, so it asserts the pair explicitly.
+    #[tokio::test]
+    async fn sla_scan_wakes_an_unread_post_exactly_once() {
+        let (mailbox, _pool, db_path, data_dir) = test_mailbox_with_pool("sla-dedupe").await;
+        mailbox.ensure_project("demo").await.expect("ensure");
+        mailbox.spawn_unwrap_loop();
+        let (_, _) = register(&mailbox, "demo", "GreenCastle").await;
+        let (_, bnpub) = register(&mailbox, "demo", "BlueLake").await;
+        let pool = mailbox.index_pool.as_ref().unwrap().clone();
+
+        mailbox
+            .send_message(&crate::mailbox::SendMessage {
+                project_slug: "demo".into(),
+                sender_name: "GreenCastle".into(),
+                to: vec!["BlueLake".into()],
+                subject: "sla-dedupe".into(),
+                body_md: "please ack".into(),
+                importance: Some("high".into()),
+                ack_required: true,
+                ..Default::default()
+            })
+            .await
+            .expect("send");
+
+        let mut row: Option<String> = None;
+        for _ in 0..200 {
+            row = sqlx::query_scalar::<_, String>(
+                "SELECT event_id FROM messages WHERE subject = 'sla-dedupe'",
+            )
+            .fetch_optional(&pool)
+            .await
+            .expect("select");
+            if row.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let post_id = row.expect("projected row must exist");
+
+        // The dedupe key is derived from the projected audience, so pin that
+        // the audience really is the recipient — otherwise this test would
+        // still pass with an empty one, and would be asserting nothing about
+        // the key it is meant to exercise.
+        let to_json: String =
+            sqlx::query_scalar("SELECT to_list FROM messages WHERE event_id = ?1")
+                .bind(&post_id)
+                .fetch_one(&pool)
+                .await
+                .expect("to_list");
+        let to_seen: Vec<String> = serde_json::from_str(&to_json).expect("to json");
+        assert_eq!(
+            to_seen,
+            vec![bnpub.to_hex()],
+            "the wake dedupe key is only meaningful if the audience projected"
+        );
+
+        // Overdue, and BlueLake has NOT read it: this is the case that
+        // legitimately warrants exactly one wake.
+        let old_us = crate::index::writer::Clock::now_us(&crate::index::writer::SystemClock)
+            - 2 * 60 * 60 * 1_000_000;
+        sqlx::query("UPDATE messages SET created_ts_us = ?1 WHERE subject = 'sla-dedupe'")
+            .bind(old_us)
+            .execute(&pool)
+            .await
+            .expect("backdate");
+
+        let first = mailbox
+            .check_ack_sla_expired("demo", Some(30 * 60))
+            .await
+            .expect("first scan");
+        assert_eq!(
+            first,
+            vec![post_id.clone()],
+            "an overdue unread post with a real audience must be woken once"
+        );
+
+        // The whole defect: a second scan of the SAME state must be silent.
+        // Nothing was read, nothing was acked, nothing changed — only time.
+        let second = mailbox
+            .check_ack_sla_expired("demo", Some(30 * 60))
+            .await
+            .expect("second scan");
+        assert!(
+            !second.contains(&post_id),
+            "an already-woken post must not be re-woken on a later scan; \
+             this is the 771x flood"
+        );
+        let third = mailbox
+            .check_ack_sla_expired("demo", Some(30 * 60))
+            .await
+            .expect("third scan");
+        assert!(
+            !third.contains(&post_id),
+            "the dedupe must hold for every later scan, not just the second"
+        );
+
+        // ...but the bound is a CADENCE, not a mute. Past the window the post
+        // is still genuinely overdue, so it must be woken again. Backdating the
+        // record is the only way to observe the window without sleeping.
+        sqlx::query(
+            "UPDATE ack_sla_wakes SET emitted_us = ?1 \
+             WHERE post_id = ?2 AND audience = ?3",
+        )
+        .bind(old_us)
+        .bind(&post_id)
+        .bind(ack_sla_wake_audience_key(&[bnpub.to_hex()]))
+        .execute(&pool)
+        .await
+        .expect("backdate the wake record");
+        let after_window = mailbox
+            .check_ack_sla_expired("demo", Some(30 * 60))
+            .await
+            .expect("scan after the window");
+        assert_eq!(
+            after_window,
+            vec![post_id.clone()],
+            "a still-unread overdue post must be re-woken once its window \
+             lapses; a permanent mute would trade the flood for a silent drop"
+        );
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// bd-ejp4: the dedupe key is the AUDIENCE, not the post. The scan's own
+    /// contract is per-recipient — one reader's ack must not silence the wake
+    /// for a co-recipient who has not read it — so a changed audience has to
+    /// produce a new key and still be woken. Collapsing this to a per-post key
+    /// would silence real overdue acks.
+    #[tokio::test]
+    async fn sla_wake_dedupe_key_follows_the_audience_not_just_the_post() {
+        let a = ack_sla_wake_audience_key(&["aa".into(), "bb".into()]);
+        let b = ack_sla_wake_audience_key(&["bb".into(), "aa".into()]);
+        assert_eq!(
+            a, b,
+            "recipient order must not split one audience into two keys"
+        );
+
+        let c = ack_sla_wake_audience_key(&["aa".into(), "bb".into(), "cc".into()]);
+        assert_ne!(
+            a, c,
+            "a new co-recipient must produce a new key so they still get woken"
+        );
+
+        let dup = ack_sla_wake_audience_key(&["aa".into(), "aa".into()]);
+        assert_eq!(
+            ack_sla_wake_audience_key(&["aa".into()]),
+            dup,
+            "a repeated recipient is one address, not two"
+        );
+
+        // The un-addressed case must still dedupe rather than become an
+        // unkeyed exemption that always re-emits.
+        let empty = ack_sla_wake_audience_key(&[]);
+        assert_eq!(empty, ack_sla_wake_audience_key(&[]));
+        assert_ne!(empty, a, "an empty audience is not a named audience");
+    }
+
+    /// bd-ejp4: the record has to survive a restart. The live flood outlived
+    /// a daemon restart, so an in-process guard would have let it resume; this
+    /// pins the row to durable sqlite, which is the only place it can live.
+    #[tokio::test]
+    async fn ack_sla_wake_record_is_durable_sqlite() {
+        let path =
+            std::env::temp_dir().join(format!("ack-sla-durable-{}.sqlite", uuid::Uuid::new_v4()));
+        let pool = crate::index::schema::connect(path.to_str().unwrap())
+            .await
+            .expect("connect");
+        crate::index::schema::migrate(&pool).await.expect("migrate");
+
+        sqlx::query(
+            "INSERT INTO ack_sla_wakes (post_id, audience, emitted_us) VALUES (?1, ?2, ?3)",
+        )
+        .bind("post-1")
+        .bind("aud-1")
+        .bind(1_i64)
+        .execute(&pool)
+        .await
+        .expect("insert");
+        // Re-opening the SAME file is the restart: a fresh process reading the
+        // same durable store must still see the wake.
+        drop(pool);
+        let reopened = crate::index::schema::connect(path.to_str().unwrap())
+            .await
+            .expect("reconnect");
+        let n: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM ack_sla_wakes WHERE post_id = 'post-1' AND audience = 'aud-1'",
+        )
+        .fetch_one(&reopened)
+        .await
+        .expect("count");
+        assert_eq!(
+            n, 1,
+            "the wake record must outlive the process that wrote it"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     // ---- corr-keyed idempotent send (ADR-0028 zfnx.12) ----
