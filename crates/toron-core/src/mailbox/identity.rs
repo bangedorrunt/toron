@@ -1338,7 +1338,7 @@ impl Mailbox {
                 })
                 .and_then(ident::profile_name_from_d_tag)
                 .unwrap_or(name);
-            return self.whois_build(name.to_string(), npub, profiles).await;
+            return self.whois_build(name.to_string(), npub, profiles);
         }
 
         // bd-lmcy: role and captain aliases are authoritative in BOTH modes —
@@ -1357,7 +1357,7 @@ impl Mailbox {
             }
             let npub = npub
                 .ok_or_else(|| anyhow::anyhow!("unknown agent name: {target} (register first)"))?;
-            return self.whois_build(target, npub, profiles).await;
+            return self.whois_build(target, npub, profiles);
         }
         // ADR-0018: swarm mode resolves canonical names, folded aliases, or
         // pins ONLY; display names are non-routable profile metadata.
@@ -1381,11 +1381,11 @@ impl Mailbox {
         }
         let npub =
             npub.ok_or_else(|| anyhow::anyhow!("unknown agent name: {target} (register first)"))?;
-        self.whois_build(target, npub, profiles).await
+        self.whois_build(target, npub, profiles)
     }
 
     /// Shared tail of `whois`: profile fields + last-active provenance.
-    async fn whois_build(
+    fn whois_build(
         &self,
         name: String,
         npub: crate::nostr::PublicKey,

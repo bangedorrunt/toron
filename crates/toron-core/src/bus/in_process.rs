@@ -471,7 +471,7 @@ impl Bus for InProcessBus {
                 return Err(BusError::Publish(reason.into()));
             }
             self.stage_log(Stage::Dedup, &event, "ephemeral kind, not stored");
-            return self.fanout(event, false).await;
+            return self.fanout(event, false);
         }
 
         // 3. Dedup: store by event id (ON CONFLICT DO NOTHING). Addressable
@@ -497,7 +497,7 @@ impl Bus for InProcessBus {
             });
         }
 
-        self.fanout(event, true).await
+        self.fanout(event, true)
     }
 
     async fn subscribe(&self, filter: Filter) -> Result<Subscription, BusError> {
@@ -541,7 +541,7 @@ impl InProcessBus {
 
     /// Access-gated fanout to live subscribers (shared by stored + ephemeral
     /// publish paths).
-    async fn fanout(&self, event: Event, stored: bool) -> Result<PublishOk, BusError> {
+    fn fanout(&self, event: Event, stored: bool) -> Result<PublishOk, BusError> {
         // 4. Access-gated fanout to live subscribers.
         let subs: Vec<Arc<Subscriber>> = {
             let guard = self.subs.read();

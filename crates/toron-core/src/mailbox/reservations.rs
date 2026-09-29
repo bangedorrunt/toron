@@ -904,8 +904,7 @@ impl Mailbox {
                 "released",
             )
             .await;
-            self.record_transition(project_slug, &d, "released", &event.id)
-                .await;
+            self.record_transition(project_slug, &d, "released", &event.id);
             leases.push(ReleasedLease {
                 path: res.path_pattern.clone(),
                 mode: if res.exclusive { "exclusive" } else { "shared" }.into(),
@@ -1007,8 +1006,7 @@ impl Mailbox {
             "revoked",
         )
         .await;
-        self.record_transition(project_slug, &d, "revoked", &revoke.id)
-            .await;
+        self.record_transition(project_slug, &d, "revoked", &revoke.id);
 
         // 5. Notify previous holder via NIP-17 (heuristic summary).
         if notify_previous {
@@ -1132,8 +1130,7 @@ impl Mailbox {
                 self.bus.publish(revoke.clone()).await?;
                 self.project_lease_status(&project_slug, &agent_pubkey, &path_pattern, "revoked")
                     .await;
-                self.record_transition(&project_slug, &d, "revoked", &revoke.id)
-                    .await;
+                self.record_transition(&project_slug, &d, "revoked", &revoke.id);
                 out.push(GhostRelease {
                     project_slug: project_slug.clone(),
                     path_pattern,
@@ -1217,8 +1214,7 @@ impl Mailbox {
                 "revoked",
             )
             .await;
-            self.record_transition(project_slug, &d, "revoked", &revoke.id)
-                .await;
+            self.record_transition(project_slug, &d, "revoked", &revoke.id);
             released += 1;
 
             // Notify the previous holder via NIP-17 (the lease was revoked
@@ -1956,8 +1952,7 @@ impl Mailbox {
         self.bus.publish(release_event.clone()).await?;
         self.project_lease_status(project_slug, &holder.agent_pubkey, path, "released")
             .await;
-        self.record_transition(project_slug, &d, "released", &release_event.id)
-            .await;
+        self.record_transition(project_slug, &d, "released", &release_event.id);
 
         // 2. Re-acquire for the target, preserving exclusivity + reason,
         //    stamped strictly after the release marker. bd-adr-0028-implementation-zfnx.11: the
@@ -1990,8 +1985,7 @@ impl Mailbox {
             expires_ts_us: None,
         })
         .await;
-        self.record_transition(project_slug, &d, "acquired", &acquire_event.id)
-            .await;
+        self.record_transition(project_slug, &d, "acquired", &acquire_event.id);
 
         // 3. Verify the target actually holds the path now (the acquire
         //    resolved past the release marker — never a phantom transfer).
@@ -2397,7 +2391,7 @@ impl Mailbox {
 
     /// Append an acquire/release/revoked transition record to the Git archive
     /// (G13 history; permanent, append-only).
-    async fn record_transition(
+    fn record_transition(
         &self,
         project_slug: &str,
         d: &str,

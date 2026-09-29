@@ -471,7 +471,7 @@ impl BusPolicySource {
                     for row in rows {
                         let a: String = row.get("from_pubkey");
                         let b: String = row.get("to_pubkey");
-                        approved.insert((a.clone(), b.clone()));
+                        approved.insert((a, b));
                     }
                 }
             }
@@ -545,7 +545,7 @@ impl BusPolicySource {
                     for row in rows {
                         let a: String = row.get("from_pubkey");
                         let b: String = row.get("to_pubkey");
-                        approved.insert((a.clone(), b.clone()));
+                        approved.insert((a, b));
                     }
                 }
             }

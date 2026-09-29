@@ -296,7 +296,7 @@ fn match_impl(pat: &[char], text: &[char], pi: usize, ti: usize) -> bool {
 
 /// Parse `[abc]`, `[a-z]`, `[!abc]` at `start` (which points at `[`).
 /// Returns `(negated, end_index_after_closing_bracket)`.
-fn parse_class(pat: &[char], start: usize) -> Option<(bool, usize)> {
+const fn parse_class(pat: &[char], start: usize) -> Option<(bool, usize)> {
     let mut i = start + 1;
     if i >= pat.len() {
         return None;
@@ -898,7 +898,7 @@ fn build_source_probes(repo_path: &Path) -> Vec<String> {
                 continue;
             }
             let sub = if rel.is_empty() {
-                name.clone()
+                name
             } else {
                 format!("{rel}/{name}")
             };
