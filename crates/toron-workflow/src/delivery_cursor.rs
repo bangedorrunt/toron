@@ -17,8 +17,9 @@
 //! both keep the same id and double-publish. Release the reservation on
 //! transport failure so the id stays retryable.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::{Deserialize, Serialize};
 
@@ -44,6 +45,13 @@ pub struct DeliveryCursor {
 #[derive(Debug, Default)]
 pub struct DeliveryCursorStore {
     inner: Mutex<HashMap<SessionId, DeliveryCursor>>,
+    /// Set when any id is newly delivered; cleared by take_dirty. The host
+    /// persist tick saves only on change, never on duplicate marks.
+    dirty: AtomicBool,
+    /// Set once a persisted snapshot has been loaded (bd-aqvg). Idle by
+    /// default; hosts check-and-set around boot load. Double-loads only
+    /// re-merge (restore never shrinks), so races are harmless.
+    boot_loaded: AtomicBool,
 }
 
 /// Effect of a dedup decision.
@@ -65,6 +73,51 @@ impl DeliveryCursorStore {
     /// Empty store.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Snapshot delivered state for persistence (bd-aqvg). in_flight is
+    /// excluded: reservations unconfirmed at crash are retryable, and
+    /// restoring them as in-flight would park ids nobody owns.
+    pub fn snapshot(&self) -> BTreeMap<SessionId, DeliveryCursor> {
+        self.inner
+            .lock()
+            .expect("delivery cursor lock")
+            .iter()
+            .map(|(s, c)| {
+                (
+                    s.clone(),
+                    DeliveryCursor {
+                        delivered: c.delivered.clone(),
+                        in_flight: BTreeSet::new(),
+                        cursor: c.cursor,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// Merge a persisted snapshot (bd-aqvg): union of delivered, max cursor,
+    /// live in_flight untouched. A stale snapshot never shrinks a live store.
+    #[allow(clippy::significant_drop_tightening)]
+    pub fn restore(&self, snap: BTreeMap<SessionId, DeliveryCursor>) {
+        let mut g = self.inner.lock().expect("delivery cursor lock");
+        for (s, c) in snap {
+            let e = g.entry(s).or_default();
+            e.delivered.extend(c.delivered);
+            e.cursor = e.cursor.max(c.cursor);
+        }
+    }
+
+    /// Take the newly-delivered flag (bd-aqvg): true when any id was newly
+    /// delivered since the last take. Duplicate marks stay clean.
+    pub fn take_dirty(&self) -> bool {
+        self.dirty.swap(false, Ordering::SeqCst)
+    }
+
+    /// Claim the boot load (bd-aqvg): true when this call won the race.
+    /// Losers skip loading; a concurrent double-load would only re-merge.
+    pub fn take_boot_load(&self) -> bool {
+        !self.boot_loaded.swap(true, Ordering::SeqCst)
     }
 
     /// Report which `candidate_ids` are not yet delivered (and not in-flight)
@@ -191,6 +244,8 @@ impl DeliveryCursorStore {
             } else {
                 entry.delivered.insert(id.clone());
                 entry.cursor = entry.cursor.saturating_add(1);
+                // bd-aqvg: newly delivered = persist tick must save.
+                self.dirty.store(true, Ordering::SeqCst);
                 effects.push(DeliveryEffect::Deliver {
                     session: session.into(),
                     id,
@@ -275,6 +330,95 @@ pub const fn agent_key_is_not_delivery_proof(_agent_pubkey_hex: &str, _event_id:
 
 #[cfg(test)]
 mod tests {
+    /// bd-aqvg: snapshot feeds persistence; restore merges without shrinking.
+    /// in_flight never persists (unconfirmed at crash = retryable, not delivered).
+    #[test]
+    fn snapshot_restore_round_trip_drops_in_flight() {
+        let store = DeliveryCursorStore::new();
+        let (keep, _) = store.reserve_undelivered("s", ["a", "b"]);
+        assert_eq!(keep.len(), 2);
+        store.mark_delivered("s", ["a"]);
+        let snap = store.snapshot();
+        let cur = snap.get("s").expect("session snapshots");
+        assert!(cur.delivered.contains("a"));
+        assert!(
+            cur.in_flight.is_empty(),
+            "snapshot drops reservations by design"
+        );
+        // Memory still holds the reservation: re-reserve hits in-flight.
+        let (keep2, effects) = store.reserve_undelivered("s", ["b"]);
+        assert!(keep2.is_empty());
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, DeliveryEffect::SkipInFlight { .. })),
+            "live reservation survives snapshotting"
+        );
+        let fresh = DeliveryCursorStore::new();
+        fresh.restore(snap);
+        let back = fresh.snapshot();
+        let cur = back.get("s").expect("restored");
+        assert!(cur.delivered.contains("a"), "delivered survives restart");
+        assert!(
+            cur.in_flight.is_empty(),
+            "in-flight at crash is retryable, never restored as delivered"
+        );
+        // And the retried id is reservable again, not skipped.
+        let (keep, _) = fresh.reserve_undelivered("s", ["b"]);
+        assert_eq!(keep, vec!["b".to_string()]);
+    }
+
+    /// bd-aqvg: restore merges — union of delivered, max cursor, live
+    /// in-flight untouched. A stale snapshot must never shrink a live store.
+    #[test]
+    fn restore_merges_without_shrinking() {
+        let live = DeliveryCursorStore::new();
+        live.mark_delivered("s", ["new"]);
+        let (keep, _) = live.reserve_undelivered("s", ["flying"]);
+        assert_eq!(keep.len(), 1);
+        let mut stale = std::collections::BTreeMap::new();
+        stale.insert(
+            "s".to_string(),
+            DeliveryCursor {
+                delivered: std::iter::once("old".to_string()).collect(),
+                in_flight: BTreeSet::new(),
+                cursor: 1,
+            },
+        );
+        live.restore(stale);
+        let cur = live.snapshot().remove("s").expect("session");
+        assert!(cur.delivered.contains("new") && cur.delivered.contains("old"));
+        // Live reservations survive restore: re-reserve hits in-flight.
+        let (keep3, effects3) = live.reserve_undelivered("s", ["flying"]);
+        assert!(keep3.is_empty());
+        assert!(
+            effects3
+                .iter()
+                .any(|e| matches!(e, DeliveryEffect::SkipInFlight { .. })),
+            "live reservations survive restore"
+        );
+    }
+
+    /// bd-aqvg: dirty tracks newly delivered ids only — the persist tick
+    /// saves on change, never on duplicate marks.
+    #[test]
+    fn dirty_tracks_newly_delivered_only() {
+        let store = DeliveryCursorStore::new();
+        assert!(!store.take_dirty(), "fresh store is clean");
+        store.mark_delivered("s", ["a"]);
+        assert!(store.take_dirty(), "new id dirties");
+        assert!(!store.take_dirty(), "take clears");
+        store.mark_delivered("s", ["a"]);
+        assert!(!store.take_dirty(), "duplicate mark stays clean");
+    }
+
+    /// bd-aqvg: exactly one caller wins the boot load race.
+    #[test]
+    fn boot_load_claimed_once() {
+        let store = DeliveryCursorStore::new();
+        assert!(store.take_boot_load(), "first caller loads");
+        assert!(!store.take_boot_load(), "second caller skips");
+    }
     use super::*;
     use std::sync::Arc;
     use std::thread;

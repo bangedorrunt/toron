@@ -1783,7 +1783,85 @@ impl WorkflowHost {
 
     /// Tick the coalescer and publish (or requeue) each flushed burst.
     /// Shared by the bus-event arm and the GS-062 starvation flush timer.
+    /// Idle bound for cursor rows (bd-aqvg): whole sessions older than 90d prune.
+    /// A pruned session re-delivers on next sighting — a bounded duplicate,
+    /// chosen over unbounded table growth.
+    const CURSOR_IDLE_PRUNE_US: i64 = 90 * 24 * 3_600 * 1_000_000;
+
+    /// Load persisted cursors once (bd-aqvg). First caller wins the boot-load
+    /// race; losers skip. Merge never shrinks, so a raced double-load only
+    /// re-merges. Journal-less hosts skip silently.
+    async fn ensure_cursors_loaded(&self) {
+        if !self.delivery.take_boot_load() {
+            return;
+        }
+        let disp = self
+            .dispatcher
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        let Some(d) = disp else { return };
+        match d.store().load_delivery_cursors().await {
+            Ok(rows) => {
+                let mut snap = std::collections::BTreeMap::new();
+                for (session, json, cursor) in rows {
+                    match serde_json::from_str::<Vec<String>>(&json) {
+                        Ok(ids) => {
+                            snap.insert(
+                                session,
+                                toron_workflow::DeliveryCursor {
+                                    delivered: ids.into_iter().collect(),
+                                    in_flight: std::collections::BTreeSet::new(),
+                                    cursor: cursor.max(0) as u64,
+                                },
+                            );
+                        }
+                        Err(e) => warn!("delivery cursor row corrupt, skipping: {e}"),
+                    }
+                }
+                let n: usize = snap.values().map(|c| c.delivered.len()).sum();
+                self.delivery.restore(snap);
+                debug!("delivery cursors boot-loaded: {n} ids");
+            }
+            Err(e) => warn!("delivery cursor boot load failed: {e:#}"),
+        }
+    }
+
+    /// Save cursor snapshots (bd-aqvg): upsert every session plus idle prune.
+    /// Called by the flush tick when dirty; warn-only — persistence must
+    /// never fail delivery. Crash window = marks since the last saved tick.
+    async fn persist_delivery_cursors(&self) {
+        let disp = self
+            .dispatcher
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        let Some(d) = disp else { return };
+        let snap = self.delivery.snapshot();
+        if snap.is_empty() {
+            return;
+        }
+        let store = d.store();
+        for (session, cur) in &snap {
+            let json = serde_json::to_string(&cur.delivered).unwrap_or_else(|_| "[]".into());
+            if let Err(e) = store
+                .save_delivery_cursor(session, &json, cur.cursor as i64)
+                .await
+            {
+                warn!("delivery cursor save failed: {e:#}");
+                return;
+            }
+        }
+        let cutoff = toron_core::index::workflow_effects::now_us() - Self::CURSOR_IDLE_PRUNE_US;
+        if let Err(e) = store.prune_delivery_cursors(cutoff).await {
+            warn!("delivery cursor prune failed: {e:#}");
+        }
+    }
+
     async fn flush_coalesced_bursts(&self) {
+        // bd-aqvg: boot load once, then publish; the tick is the shared path
+        // for timer + bus arms, so every mark set anywhere persists here.
+        self.ensure_cursors_loaded().await;
         // P1 (bd-p1-poison-on-panic-audit-jwpd): recover the std Mutex poison.
         // P1 (F3.COALESCER-LOCK): guard scoped to tick() ONLY — flushed values
         // are owned, guard drops, THEN each publish runs.
@@ -1927,6 +2005,11 @@ impl WorkflowHost {
                 }
             }
             drop(permit); // release busy holder after publish CS
+        }
+        // bd-aqvg: persist cursor marks set by this tick or the dispatch path
+        // since the last tick. Dirty-gated: no marks, no writes.
+        if self.delivery.take_dirty() {
+            self.persist_delivery_cursors().await;
         }
     }
 
@@ -6038,6 +6121,80 @@ steps:
             "idempotent skip must be AlreadyDelivered, not Transport, got {err:?}"
         );
 
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// bd-aqvg: cursor persist/load round-trip through the host. Marks saved
+    /// by one host boot-load into the next (duplicates bounded to the crash
+    /// window); corrupt rows skip without failing the load; journal-less
+    /// hosts skip both silently.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cursor_persist_load_round_trip() {
+        use toron_core::bus::in_process::{InProcessBus, InProcessBusConfig};
+        use toron_core::index::schema;
+        use toron_core::index::workflow_effects::WorkflowEffectStore;
+        let db = std::env::temp_dir().join(format!("wf-cur-rt-{}.sqlite", uuid::Uuid::new_v4()));
+        let pool = schema::connect(db.to_str().unwrap())
+            .await
+            .expect("connect");
+        schema::migrate(&pool).await.expect("migrate");
+        async fn mk_host(pool: &sqlx::SqlitePool) -> WorkflowHost {
+            let bus: Arc<dyn Bus> = Arc::new(
+                InProcessBus::open(pool.clone(), InProcessBusConfig::default())
+                    .await
+                    .expect("bus"),
+            );
+            let h = WorkflowHost::over_bus(bus, vec![], None).expect("host");
+            h.with_effect_store(WorkflowEffectStore::new(pool.clone()))
+                .await;
+            h
+        }
+        // Journal-less twin skips both silently (no dispatcher, no panic).
+        let bus0: Arc<dyn Bus> = Arc::new(
+            InProcessBus::open(pool.clone(), InProcessBusConfig::default())
+                .await
+                .expect("bus"),
+        );
+        let h0 = WorkflowHost::over_bus(bus0, vec![], None).expect("host");
+        h0.ensure_cursors_loaded().await;
+        h0.persist_delivery_cursors().await;
+        // Host 1: mark + persist.
+        let h1 = mk_host(&pool).await;
+        h1.delivery.mark_delivered("sess", ["id-1"]);
+        assert!(h1.delivery.take_dirty(), "new mark dirties");
+        h1.delivery.mark_delivered("sess", ["id-1"]);
+        h1.persist_delivery_cursors().await;
+        // Host 2 on the same pool: boot load restores delivered ids.
+        let h2 = mk_host(&pool).await;
+        h2.ensure_cursors_loaded().await;
+        let (keep, _) = h2.delivery.reserve_undelivered("sess", ["id-1", "id-2"]);
+        assert_eq!(
+            keep,
+            vec!["id-2".to_string()],
+            "restart must not re-deliver id-1"
+        );
+        // Second load is a race-safe no-op.
+        h2.ensure_cursors_loaded().await;
+        // The flush tick persists dirty marks itself (hook, not just helper).
+        h1.delivery.mark_delivered("sess", ["id-2"]);
+        h1.flush_coalesced_bursts().await;
+        assert!(!h1.delivery.take_dirty(), "tick consumed the dirty flag");
+        let h4 = mk_host(&pool).await;
+        h4.ensure_cursors_loaded().await;
+        let (keep4, _) = h4.delivery.reserve_undelivered("sess", ["id-1", "id-2"]);
+        assert!(keep4.is_empty(), "tick-persisted marks survive restart");
+        // Corrupt row skips without failing the load.
+        sqlx::query(
+            "INSERT INTO delivery_cursors (session, delivered_json, cursor, updated_us) \
+             VALUES ('bad', 'not-json', 0, 0)",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed corrupt");
+        let h3 = mk_host(&pool).await;
+        h3.ensure_cursors_loaded().await;
+        let (keep3, _) = h3.delivery.reserve_undelivered("sess", ["id-1"]);
+        assert!(keep3.is_empty(), "good rows still load past a corrupt row");
         let _ = std::fs::remove_file(&db);
     }
 
