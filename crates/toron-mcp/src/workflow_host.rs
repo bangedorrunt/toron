@@ -1833,6 +1833,15 @@ impl WorkflowHost {
         }
     }
 
+    /// Persist every host's dirty cursor marks (bd-slkn): the clean-stop
+    /// counterpart to the flush-tick persist. Warn-only per host; one host's
+    /// failure never blocks the others' save.
+    pub(crate) async fn persist_hosts_cursors(hosts: &[Self]) {
+        for h in hosts {
+            h.persist_delivery_cursors().await;
+        }
+    }
+
     /// Save cursor snapshots (bd-aqvg): upsert every session plus idle prune.
     /// Called by the flush tick when dirty; warn-only — persistence must
     /// never fail delivery. Crash window = marks since the last saved tick.
@@ -6205,6 +6214,50 @@ steps:
         h3.ensure_cursors_loaded().await;
         let (keep3, _) = h3.delivery.reserve_undelivered("sess", ["id-1"]);
         assert!(keep3.is_empty(), "good rows still load past a corrupt row");
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// bd-slkn: clean-stop persist covers every host at once. Marks set with
+    /// no tick running survive through persist_hosts_cursors; hosts without
+    /// a store save nothing and fail nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn graceful_stop_persists_all_hosts() {
+        use toron_core::bus::in_process::{InProcessBus, InProcessBusConfig};
+        use toron_core::index::schema;
+        use toron_core::index::workflow_effects::WorkflowEffectStore;
+        let db = std::env::temp_dir().join(format!("wf-stop-all-{}.sqlite", uuid::Uuid::new_v4()));
+        let pool = schema::connect(db.to_str().unwrap())
+            .await
+            .expect("connect");
+        schema::migrate(&pool).await.expect("migrate");
+        async fn mk(pool: &sqlx::SqlitePool) -> WorkflowHost {
+            let bus: Arc<dyn Bus> = Arc::new(
+                InProcessBus::open(pool.clone(), InProcessBusConfig::default())
+                    .await
+                    .expect("bus"),
+            );
+            let h = WorkflowHost::over_bus(bus, vec![], None).expect("host");
+            h.with_effect_store(WorkflowEffectStore::new(pool.clone()))
+                .await;
+            h
+        }
+        let h1 = mk(&pool).await;
+        h1.delivery.mark_delivered("sess", ["stop-1"]);
+        let h2 = mk(&pool).await;
+        // Journal-less host: saves nothing, fails nothing.
+        let bus0: Arc<dyn Bus> = Arc::new(
+            InProcessBus::open(pool.clone(), InProcessBusConfig::default())
+                .await
+                .expect("bus"),
+        );
+        let h0 = WorkflowHost::over_bus(bus0, vec![], None).expect("host");
+        WorkflowHost::persist_hosts_cursors(&[h1, h0, h2]).await;
+        let rows = WorkflowEffectStore::new(pool)
+            .load_delivery_cursors()
+            .await
+            .expect("load");
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].1.contains("stop-1"), "stop persist saved the mark");
         let _ = std::fs::remove_file(&db);
     }
 

@@ -450,17 +450,26 @@ async fn build_mailbox(
 ///
 /// Embedders register workflows via [`WorkflowHost::add_workflow`]; the serve
 /// binary arms the loops so triggers are LIVE the moment a workflow exists.
+/// Shutdown signal (bd-slkn): tokio ctrl_c resolves on SIGINT, SIGTERM and
+/// SIGHUP on unix — exactly what daemon stop sends. Best-effort by design:
+/// a missed signal keeps today's SIGTERM-death behavior, never worse.
+async fn shutdown_signal() {
+    let _ = tokio::signal::ctrl_c().await;
+}
+
 fn spawn_mail_trigger_host(
     mailbox: Mailbox,
     trigger_rx: tokio::sync::mpsc::UnboundedReceiver<UnwrappedMail>,
-) {
+) -> Vec<WorkflowHost> {
     match WorkflowHost::new(Arc::new(mailbox), Vec::new()) {
         Ok(host) => {
             host.spawn_mail_trigger_loop(trigger_rx);
             host.spawn_trigger_loop();
+            vec![host]
         }
         Err(e) => {
             tracing::warn!("workflow host unavailable; message_posted triggers disabled: {e:#}");
+            Vec::new()
         }
     }
 }
@@ -504,10 +513,16 @@ pub async fn serve_stdio() -> anyhow::Result<()> {
     let _lock = crate::serve_lock::acquire(&toron_core::config::mailbox_root(mailbox.data_dir()))?;
     // Held across `running.waiting()` below: drop removes wake.sock (RAII).
     let _wake = start_wake_sidecar(&mailbox).await;
-    spawn_mail_trigger_host(mailbox.clone(), trigger_rx);
+    let hosts = spawn_mail_trigger_host(mailbox.clone(), trigger_rx);
     let server = ToronServer::new().with_mailbox(mailbox);
     let running = server.serve(rmcp::transport::stdio()).await?;
-    running.waiting().await?;
+    let res: anyhow::Result<()> = tokio::select! {
+        r = running.waiting() => r.map(|_| ()).map_err(anyhow::Error::from),
+        _ = shutdown_signal() => Ok(()),
+    };
+    // bd-slkn: clean stop persists cursor marks set after the final tick.
+    WorkflowHost::persist_hosts_cursors(&hosts).await;
+    res?;
     Ok(())
 }
 
@@ -518,7 +533,9 @@ pub async fn serve_stdio() -> anyhow::Result<()> {
 /// The served handler carries the 38 AM-Rust parity tools (bd-led.7.2).
 pub async fn router() -> anyhow::Result<axum::Router> {
     let (mailbox, trigger_rx) = demo_mailbox_with_trigger().await?;
-    router_with_mailbox(mailbox, trigger_rx, &[]).await
+    router_with_mailbox(mailbox, trigger_rx, &[])
+        .await
+        .map(|(router, _hosts)| router)
 }
 
 /// bd-6wfv: [`router`] against an EXPLICIT data dir + operator key — no
@@ -533,7 +550,9 @@ pub async fn router_with_isolated(
     let (tx, trigger_rx) = tokio::sync::mpsc::unbounded_channel();
     let mailbox =
         build_mailbox_with_opts(Some(tx), data_dir, operator_key_path, operator_passphrase).await?;
-    router_with_mailbox(mailbox, trigger_rx, &[]).await
+    router_with_mailbox(mailbox, trigger_rx, &[])
+        .await
+        .map(|(router, _hosts)| router)
 }
 
 /// Extra `Host` values the MCP-over-HTTP transport accepts, beyond the
@@ -580,8 +599,8 @@ async fn router_with_mailbox(
     mailbox: toron_core::mailbox::Mailbox,
     trigger_rx: tokio::sync::mpsc::UnboundedReceiver<toron_core::mailbox::unwrap::UnwrappedMail>,
     extra_hosts: &[String],
-) -> anyhow::Result<axum::Router> {
-    spawn_mail_trigger_host(mailbox.clone(), trigger_rx);
+) -> anyhow::Result<(axum::Router, Vec<WorkflowHost>)> {
+    let hosts = spawn_mail_trigger_host(mailbox.clone(), trigger_rx);
     let server = ToronServer::new().with_mailbox(mailbox);
     // bd-741i: legacy_session_mode=false — every request is stateless
     // (SEP-2567). The previous default (legacy true) accumulated
@@ -605,9 +624,10 @@ async fn router_with_mailbox(
     let blob_root = std::env::temp_dir().join("toron-mcp-demo").join("blobs");
     let blossom =
         crate::blob_serve::blossom_router(toron_core::archive::blob::BlobStore::new(blob_root));
-    Ok(axum::Router::new()
+    let router = axum::Router::new()
         .nest_service("/mcp", service)
-        .merge(blossom))
+        .merge(blossom);
+    Ok((router, hosts))
 }
 
 /// Serve the toron MCP server over Streamable HTTP on `bind_addr`
@@ -647,11 +667,12 @@ pub async fn serve_http(bind_addr: &str, extra_hosts: &[String]) -> anyhow::Resu
     // address (a healthy HttpPeer instance already returned above and keeps
     // its own sidecar); held across the serve await — drop removes the file.
     let _wake = start_wake_sidecar(&mailbox).await;
-    axum::serve(
-        listener,
-        router_with_mailbox(mailbox, trigger_rx, extra_hosts).await?,
-    )
-    .await?;
+    let (router, hosts) = router_with_mailbox(mailbox, trigger_rx, extra_hosts).await?;
+    axum::serve(listener, router)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
+    // bd-slkn: clean stop persists cursor marks set after the final tick.
+    WorkflowHost::persist_hosts_cursors(&hosts).await;
     Ok(())
 }
 
