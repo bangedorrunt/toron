@@ -35,20 +35,10 @@ const A: &str = "flywheel-toron-coder";
 const B: &str = "flywheel-toron-coder2";
 const C: &str = "flywheel-toron-coder3";
 
+mod common;
+
 fn toron_bin() -> PathBuf {
-    if let Ok(p) = std::env::var("CARGO_BIN_EXE_toron") {
-        return PathBuf::from(p);
-    }
-    let exe = std::env::current_exe().expect("current_exe");
-    let deps = exe.parent().expect("deps dir");
-    let debug = deps.parent().expect("debug dir");
-    let bin = debug.join("toron");
-    assert!(
-        bin.exists(),
-        "toron binary not found at {} — build toron-cli first (cargo build -p toron-cli)",
-        bin.display()
-    );
-    bin
+    common::toron_bin()
 }
 
 fn run(data_dir: &Path, args: &[&str]) -> Output {
