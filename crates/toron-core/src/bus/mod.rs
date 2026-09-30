@@ -137,6 +137,22 @@ pub trait Bus: Send + Sync + 'static {
             "this bus does not support local purge".to_string(),
         ))
     }
+
+    /// Cheap mutable-store version for poll-driven consumers, or `None` when
+    /// this backend cannot answer cheaply.
+    ///
+    /// The wake pump polls the store for writes made by OTHER processes on
+    /// the same SQLite file (bd-d41q). With no cheap signal it must mint a
+    /// fresh subscription every tick — two store scans plus a spawned task,
+    /// most of them finding nothing (bd-qpm0). A backend that tracks its own
+    /// mutations returns `Some(version)`; the pump then re-reads only when
+    /// the version moved. `Some` must be monotonic, and any write (insert,
+    /// supersede, purge, prune) must move it.
+    ///
+    /// `None` means "poll blind" — never "unchanged".
+    async fn store_version(&self) -> Option<i64> {
+        None
+    }
 }
 
 #[test]

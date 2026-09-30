@@ -38,7 +38,10 @@ pub const WAKE_HEARTBEAT_MS: u64 = 15_000;
 /// Default store-delta poll cadence (bd-d41q): the pump re-reads the store
 /// this often so writes from other processes (CLI plane commands on the
 /// shared store) fan out live. Matches the pre-sidecar 1s snapshot
-/// heritage; the snapshot memo + `bus_meta` version keep quiet ticks cheap.
+/// heritage. The re-read itself is gated on the store's `bus_meta` mutation
+/// version ([`crate::bus::Bus::store_version`]), so the cadence bounds how
+/// quickly a foreign write is noticed, not how often the store is scanned
+/// (bd-qpm0).
 pub const WAKE_POLL_MS: u64 = 1_000;
 
 /// Bound for the pump's forwarded-id set (bd-d41q): the poll re-reads the
@@ -433,7 +436,9 @@ impl WakeHandle {
         // Writes from other processes on the shared store (CLI plane
         // commands) never traverse it, so every poll_interval the pump
         // re-reads the store through a short subscription and fans out
-        // ids not yet forwarded (bounded seen-set). No poll when nobody
+        // ids not yet forwarded (bounded seen-set). bd-qpm0: that re-read
+        // is gated on the store's mutation version, so a quiet tick costs
+        // one indexed read instead of a subscription. No poll when nobody
         // listens; 0 interval disables (live fanout only).
         {
             let bus_tx = bus_tx.clone();
@@ -442,6 +447,9 @@ impl WakeHandle {
             let poll_on = config.poll_interval_ms > 0;
             tasks.spawn(async move {
                 let mut cursor: u64 = 0;
+                // Last store version we re-read at (bd-qpm0). `None` = this
+                // backend cannot answer cheaply, so every tick polls blind.
+                let mut last_store_version: Option<i64> = None;
                 let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
                 let mut seen_order: std::collections::VecDeque<String> =
                     std::collections::VecDeque::new();
@@ -491,6 +499,18 @@ impl WakeHandle {
                             if bus_tx.receiver_count() == 0 {
                                 continue;
                             }
+                            // Cheapest possible quiet tick: ask the store
+                            // whether anything moved since the last poll.
+                            // Minting the subscription below costs two store
+                            // scans plus a spawned task, so skipping it while
+                            // the version is unchanged is the whole point.
+                            let version = bus.store_version().await;
+                            if let (Some(now), Some(prev)) = (version, last_store_version)
+                                && now == prev
+                            {
+                                continue;
+                            }
+                            last_store_version = version;
                             let polled = match bus.subscribe_trusted(poll_filter.clone()).await {
                                 Ok(mut tmp) => {
                                     let mut fresh = Vec::new();
@@ -1399,5 +1419,129 @@ mod wake_bus_tests {
         .expect("foreign kind-9 must fan out over wake.sock");
         assert!(seen.contains("\"event\""), "event frame, {seen}");
         let _ = std::fs::remove_file(&db);
+    }
+
+    /// Counts every `subscribe_trusted` and answers `store_version` from an
+    /// atomic the test drives. The churn fix is only observable through the
+    /// subscribe count, so that is what this fake records.
+    struct CountingBus {
+        subscribes: AtomicU64,
+        version: std::sync::atomic::AtomicI64,
+        /// Held senders: a subscription that ends at EOSE would let the
+        /// pump's held `bus_sub` branch resolve `None` and exit the loop
+        /// before a single poll tick, which is exactly the bug this fake
+        /// would otherwise hide.
+        open: std::sync::Mutex<Vec<tokio::sync::mpsc::Sender<crate::bus::SubscriptionEvent>>>,
+    }
+
+    impl CountingBus {
+        fn new() -> Self {
+            Self {
+                subscribes: AtomicU64::new(0),
+                version: std::sync::atomic::AtomicI64::new(1),
+                open: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn subscribes(&self) -> u64 {
+            self.subscribes.load(Ordering::SeqCst)
+        }
+
+        fn bump(&self) {
+            self.version
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Bus for CountingBus {
+        async fn publish(
+            &self,
+            _event: crate::nostr::Event,
+        ) -> Result<crate::bus::PublishOk, BusError> {
+            Err(BusError::Unsupported("counting fake".to_string()))
+        }
+
+        async fn subscribe(&self, filter: Filter) -> Result<crate::bus::Subscription, BusError> {
+            self.subscribe_trusted(filter).await
+        }
+
+        async fn subscribe_trusted(
+            &self,
+            _filter: Filter,
+        ) -> Result<crate::bus::Subscription, BusError> {
+            self.subscribes.fetch_add(1, Ordering::SeqCst);
+            let (tx, rx) = tokio::sync::mpsc::channel(crate::bus::Subscription::DEFAULT_CAPACITY);
+            tx.send(crate::bus::SubscriptionEvent::Eose)
+                .await
+                .map_err(|_| BusError::Shutdown)?;
+            if let Ok(mut open) = self.open.lock() {
+                open.push(tx);
+            }
+            Ok(crate::bus::Subscription::new(
+                crate::bus::SubscriptionId::new("counting"),
+                rx,
+            ))
+        }
+
+        async fn health(&self) -> Result<crate::bus::Health, BusError> {
+            Ok(crate::bus::Health {
+                ok: true,
+                message: "counting".to_string(),
+            })
+        }
+
+        async fn store_version(&self) -> Option<i64> {
+            Some(self.version.load(std::sync::atomic::Ordering::SeqCst))
+        }
+    }
+
+    /// Churn witness (bd-qpm0): a quiet store must not cost a fresh
+    /// subscription on every poll tick. The pump must stop re-reading while
+    /// the store version is unchanged, AND a version bump must re-arm it —
+    /// the second half is what keeps the first from passing on a poll that
+    /// is merely broken.
+    #[tokio::test]
+    async fn wake_poll_skips_quiet_store_ticks_and_rearms_on_a_write() {
+        let bus = Arc::new(CountingBus::new());
+        let sock = tmp_sock("qp");
+        let _ = std::fs::remove_file(&sock);
+        let mut cfg = WakeConfig::new(&sock);
+        cfg.poll_interval_ms = 20;
+        let _h = WakeServer::new(cfg, bus.clone(), Arc::new(ManualClock::new(0)))
+            .start()
+            .await
+            .expect("bind");
+        // A live consumer is required: the pump never polls with nobody
+        // listening, which is why the churn scaled with consumers.
+        let stream = UnixStream::connect(&sock).await.expect("connect");
+        let (r, mut w) = stream.into_split();
+        w.write_all(b"{\"subscribe\":{\"kinds\":[9]}}\n")
+            .await
+            .expect("sub");
+        let mut lines = BufReader::new(r).lines();
+        let eose = tokio::time::timeout(std::time::Duration::from_secs(2), lines.next_line())
+            .await
+            .expect("test bound")
+            .expect("io")
+            .expect("eose line");
+        assert!(eose.contains("eose"), "handshake first: {eose}");
+        // Let the first tick arm the version, then measure steady state.
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        let settled = bus.subscribes();
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        let quiet_delta = bus.subscribes() - settled;
+        assert!(
+            quiet_delta <= 1,
+            "a quiet store must not re-subscribe per tick: {quiet_delta} polls in ~20 ticks"
+        );
+        // The skip must be a skip, not a dead poll.
+        bus.bump();
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert!(
+            bus.subscribes() > settled + quiet_delta,
+            "a store write must re-arm the poll"
+        );
+        let _ = std::fs::remove_file(&sock);
     }
 }

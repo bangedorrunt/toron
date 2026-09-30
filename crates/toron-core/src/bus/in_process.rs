@@ -530,6 +530,14 @@ impl Bus for InProcessBus {
             .await
             .map_err(|e| BusError::Unsupported(format!("purge failed: {e}")))
     }
+
+    /// bd-3gwy/bd-qpm0: the store's authoritative mutation counter. One
+    /// indexed `bus_meta` read answers "did anything change?" so the wake
+    /// pump can skip a full replay on quiet ticks instead of minting a
+    /// subscription per poll.
+    async fn store_version(&self) -> Option<i64> {
+        Some(self.store.current_mutations().await)
+    }
 }
 
 // Allow constructing a bus for tests without exposing internals.
