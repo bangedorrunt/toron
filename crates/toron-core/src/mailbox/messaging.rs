@@ -1682,7 +1682,15 @@ impl Mailbox {
                 if let Some(w) =
                     nident::ambiguous_name_warning(&row_name, &args.project_slug, &binds)
                 {
-                    eprintln!("{w}");
+                    // bd-j5sk: this used to be an eprintln and the send
+                    // continued, which IS the defect. A warning nobody can
+                    // act on is not a gate: the message is encrypted to the
+                    // SENDING project's key while the recipient reads under
+                    // theirs, so the send reports `ok` and nobody ever reads
+                    // it. Refuse, and name the npub — sending BY npub is
+                    // unambiguous by construction, so the fix costs the
+                    // caller nothing but the characters.
+                    anyhow::bail!("{w}\nRefusing to send: re-run with --to {npub}");
                 }
                 out.push(ResolvedRecipient {
                     name: row_name,
@@ -2079,6 +2087,43 @@ mod tests {
     use crate::mailbox::search::SearchMessages;
     use crate::nostr::identity::AgentProfile;
     use std::sync::Arc;
+
+    /// bd-j5sk: the send path must GATE on a cross-project name, not warn.
+    ///
+    /// A source tripwire, because the property is about the call SITE: the
+    /// detector in `nostr::identity` has its own tests, and those pass
+    /// whether the sender obeys them or not. The needle is spliced so a
+    /// comment cannot satisfy it — this repo has already been bitten by a
+    /// source scan that passed with the call deleted, because the adjacent
+    /// comment named the function.
+    #[test]
+    fn the_send_path_refuses_an_ambiguous_name() {
+        let src = include_str!("messaging.rs");
+        let detector = ["ambiguous_name", "_warning"].concat();
+        let warn = ["eprintln!", "(\"{w}\")"].concat();
+        let gate = ["anyhow::", "bail!"].concat();
+        let i = src.find(&detector).expect("the detector is still called");
+        // The BRANCH, not a window: from the detector call to the closing
+        // brace at the branch's own indentation. A 900-char window passed
+        // with the call replaced by an eprintln, because a LATER bail in
+        // the same function satisfied it. That is the vacuous-test trap.
+        let rest = &src[i..];
+        let close = "\n                }";
+        let end = rest
+            .find(close)
+            .expect("the ambiguous-name branch still closes");
+        let branch = &rest[..end];
+        assert!(
+            branch.contains(&gate),
+            "the ambiguous-name branch must REFUSE; a warning the caller \
+             cannot act on is the bd-j5sk defect itself"
+        );
+        assert!(
+            !branch.contains(&warn),
+            "the ambiguous-name branch must not merely eprintln: that is \
+             exactly the invisible-delivery bug"
+        );
+    }
 
     const PASSPHRASE: &str = "messaging-test-pass";
 
