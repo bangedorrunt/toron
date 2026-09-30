@@ -357,39 +357,71 @@ fn check_resonate() -> CheckResult {
     }
 }
 
-/// bd-gv1k: a TLS endpoint cannot be verified by a plaintext probe.
+/// Read `/health` over TLS with the same HTTP stack the workflow SDK uses.
 ///
-/// Reporting FAIL would be a false red (the very defect this bead fixes) and
-/// reporting ok would be the invent-green GS-037 forbids. Say the true thing:
-/// the endpoint is named, TCP reachability is checked, and the exact command
-/// that verifies it is given. `doctor --check` still exits non-zero, so a
-/// pipeline keyed on it does not go silently green.
+/// `resonate-sdk` speaks to the server through reqwest, so probing with
+/// reqwest is not a second opinion — it is the same TLS stack and trust store
+/// the runtime will use, which is exactly the property GS-037 wants. Blocking
+/// on purpose: the doctor owns a sync edge (no ambient runtime), and spinning
+/// a nested one to await a health check would be its own defect.
+fn https_health_status(url: &str) -> Result<u16, String> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(3))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let response = client
+        .get(format!("{}/health", url.trim_end_matches('/')))
+        .send()
+        .map_err(|e| e.to_string())?;
+    Ok(response.status().as_u16())
+}
+
+/// Verdict for a TLS `/health` read, given its outcome. Pure, so the GS-037
+/// fail-closed matrix is fenced rather than trusted: only a 2xx is green, and
+/// a read that failed carries its own error instead of flattening every
+/// failure into a bare "unreachable".
+fn https_health_verdict(url: &str, outcome: Result<u16, String>) -> CheckResult {
+    match outcome {
+        Ok(code) if (200..300).contains(&code) => CheckResult {
+            name: "resonate",
+            ok: true,
+            detail: format!("reachable at {url} (TLS /health returned HTTP {code})"),
+        },
+        Ok(code) => CheckResult {
+            name: "resonate",
+            ok: false,
+            detail: format!(
+                "{url} answered TLS but /health returned HTTP {code} (need 2xx) — refuse soft-ok invent-green (GS-037)"
+            ),
+        },
+        Err(e) => CheckResult {
+            name: "resonate",
+            ok: false,
+            detail: format!(
+                "cannot read {url}/health over TLS ({e}) — refuse soft-ok invent-green (GS-037); verify with `curl -fsS {url}/health`"
+            ),
+        },
+    }
+}
+
+/// bd-gv1k + the TLS read: a TLS endpoint IS verifiable, so it is verified.
+///
+/// This arm used to refuse to read and print a `curl` command instead, on the
+/// reasoning that a plaintext probe cannot speak TLS. That reasoning is fine
+/// about the mechanism and wrong about the outcome: the resolved remote is
+/// https, so the only healthy deployment read as a permanent FAIL, and the
+/// check trained operators to ignore it. The endpoint is now read over TLS
+/// (§ [`https_health_status`]); an unparseable target is still named as
+/// unparseable, and a failed read still fails closed.
 fn check_resonate_tls(url: &str) -> CheckResult {
-    let Some((host, port)) = toron_workflow::engine::host_port(url) else {
+    if toron_workflow::engine::host_port(url).is_none() {
         return CheckResult {
             name: "resonate",
             ok: false,
             detail: format!("cannot parse {url}"),
         };
-    };
-    use std::net::ToSocketAddrs;
-    let reachable = (host.as_str(), port)
-        .to_socket_addrs()
-        .ok()
-        .and_then(|mut it| it.next())
-        .map(|addr| {
-            std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(2000))
-                .is_ok()
-        })
-        .unwrap_or(false);
-    CheckResult {
-        name: "resonate",
-        ok: false,
-        detail: format!(
-            "resolves to {url}; TCP {} but this probe speaks plaintext HTTP and cannot read a TLS /health — verify with `curl -fsS {url}/health`",
-            if reachable { "open" } else { "closed" }
-        ),
     }
+    https_health_verdict(url, https_health_status(url))
 }
 
 fn check_resonate_at(addr: std::net::SocketAddr) -> CheckResult {
@@ -1222,33 +1254,64 @@ mod check_resonate_tests {
         assert_eq!(http_response_status(""), None);
     }
 
+    /// The TLS arm is a real read with a real verdict, so the whole matrix is
+    /// checked here without a TLS server: only a 2xx is green (GS-037), and
+    /// every red names what it actually saw.
+    #[test]
+    fn tls_health_verdict_matrix_never_invents_green() {
+        for code in [200u16, 204, 299] {
+            let r = https_health_verdict("https://resonate.example", Ok(code));
+            assert!(r.ok, "HTTP {code} is a healthy /health");
+        }
+        for code in [301u16, 401, 500, 503] {
+            let r = https_health_verdict("https://resonate.example", Ok(code));
+            assert!(!r.ok, "HTTP {code} must not read green");
+            assert!(
+                r.detail.contains(&code.to_string()),
+                "a red must name the code it saw, got: {}",
+                r.detail
+            );
+        }
+        let r = https_health_verdict(
+            "https://resonate.example",
+            Err("certificate verify failed".to_string()),
+        );
+        assert!(!r.ok, "a read that failed is never green");
+        assert!(
+            r.detail.contains("certificate verify failed"),
+            "a red must carry the transport error, got: {}",
+            r.detail
+        );
+    }
+
+    /// bd-gv1k: the regression was a hardcoded 127.0.0.1:8001, so a correct
+    /// deployment on a TLS remote read as "your local server is down — start
+    /// resonate". The verdict must name the target the process actually
+    /// resolves. The target here is a CLOSED local port, so the TLS read is
+    /// exercised end to end (it must fail closed, and fast) without a server.
     #[test]
     fn tls_target_is_named_not_replaced_by_a_local_address() {
-        // bd-gv1k: the regression was a hardcoded 127.0.0.1:8001, so a
-        // correct deployment on a TLS remote read as "your local server is
-        // down — start resonate". The verdict must name the target the
-        // process actually resolves, and must not invent-green.
-        let r = check_resonate_tls("https://resonate.invalid");
+        let closed = {
+            let l = TcpListener::bind("127.0.0.1:0").expect("bind free");
+            let a = l.local_addr().expect("addr");
+            drop(l);
+            a
+        };
+        let url = format!("https://127.0.0.1:{}", closed.port());
+        let r = check_resonate_tls(&url);
+        assert!(!r.ok, "a closed port is not a healthy endpoint");
         assert!(
-            !r.ok,
-            "a plaintext probe cannot verify TLS — never invent-green"
-        );
-        assert!(
-            r.detail.contains("https://resonate.invalid"),
+            r.detail.contains(&url),
             "the verdict must name the resolved target, got: {}",
             r.detail
         );
-        assert!(
-            !r.detail.contains("127.0.0.1:8001"),
-            "must not fall back to the old hardcoded address, got: {}",
-            r.detail
-        );
-        assert!(
-            r.detail
-                .contains("curl -fsS https://resonate.invalid/health"),
-            "must hand over a command that verifies it, got: {}",
-            r.detail
-        );
+        for local in ["127.0.0.1:8001", "localhost:8001"] {
+            assert!(
+                !r.detail.contains(local),
+                "must not fall back to {local}, got: {}",
+                r.detail
+            );
+        }
     }
 
     #[test]

@@ -26,6 +26,11 @@ toron-core = { path = "../toron-core" }
 toron-mcp = { path = "../toron-mcp" }
 toron-workflow = { path = "../toron-workflow" }
 nostr = { version = "0.45.3", features = ["nip44", "nip59", "os-rng"] }
+# `doctor` reads the resonate /health of the resolved server. The SDK that
+# actually talks to that server (resonate-sdk) uses reqwest, so the probe uses
+# it too — same TLS stack and trust store the runtime uses. `blocking` is the
+# only addition; the rest is already in the graph via rmcp.
+reqwest = { version = "0.13", features = ["blocking"] }
 ratatui = "0.29"
 crossterm = "0.28"
 
