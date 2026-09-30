@@ -257,23 +257,59 @@ fn check_git() -> CheckResult {
 }
 
 fn check_keys(cfg: &Config) -> CheckResult {
+    // ADR-0038: ONE resolution, the same one the daemon unit and the mailbox
+    // host use. An explicit `operator_key`/`TORON_OPERATOR_KEY` wins; otherwise
+    // the canonical config-home key. The detail names which source resolved,
+    // because the whole defect this replaces was an operator who could not tell
+    // which of two keys a process would read.
     match &cfg.operator_key {
         Some(p) if p.is_file() => CheckResult {
             name: "keys",
             ok: true,
-            detail: format!("operator key present at {}", p.display()),
+            detail: format!("operator key present at {} (configured)", p.display()),
         },
         Some(p) => CheckResult {
             name: "keys",
             ok: false,
-            detail: format!("operator key missing at {}", p.display()),
+            detail: format!("operator key missing at {} (configured)", p.display()),
         },
-        None => CheckResult {
-            name: "keys",
-            ok: false,
-            detail: "operator_key not configured (set operator_key or TORON_OPERATOR_KEY)"
-                .to_string(),
-        },
+        None => {
+            let canonical = toron_core::config::operator_key_path();
+            if canonical.is_file() {
+                return CheckResult {
+                    name: "keys",
+                    ok: true,
+                    detail: format!(
+                        "operator key present at {} (canonical default)",
+                        canonical.display()
+                    ),
+                };
+            }
+            // A legacy data-root key is a DIFFERENT identity. Reporting a bare
+            // "not configured" here would hide the exact hazard the ADR closes,
+            // so name both paths and never pick one silently.
+            let legacy = toron_core::config::legacy_operator_key_path();
+            if legacy.is_file() {
+                return CheckResult {
+                    name: "keys",
+                    ok: false,
+                    detail: format!(
+                        "no operator key at {canonical}, but a LEGACY key from the old data root \
+                         sits at {legacy} — different identities, so nothing is chosen \
+                         automatically; move the one you mean to keep (ADR-0038): \
+                         mv {legacy} {canonical}",
+                        canonical = canonical.display(),
+                        legacy = legacy.display()
+                    ),
+                };
+            }
+            CheckResult {
+                name: "keys",
+                ok: false,
+                detail: "operator_key not configured (set operator_key or TORON_OPERATOR_KEY)"
+                    .to_string(),
+            }
+        }
     }
 }
 
@@ -1061,7 +1097,13 @@ pub const fn robot_tool_name(command: &Command) -> &'static str {
 // key
 // ---------------------------------------------------------------------------
 
-/// Default key path: `~/.config/toron/<role>_nsec` (no HOME → relative).
+/// Default key path for the AGENT and ANCHOR roles:
+/// `~/.config/toron/<role>_nsec` (no HOME → relative).
+///
+/// The operator role does not come through here (ADR-0038) — it resolves via
+/// [`toron_core::config::operator_key_path`], which also honors
+/// `XDG_CONFIG_HOME`. Only the operator path is reconciled so far; the other
+/// two roles still follow HOME alone.
 fn default_key_path(role: &str) -> PathBuf {
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
@@ -1080,13 +1122,29 @@ pub fn run_key(cfg: &Config, cmd: &KeyCommand) -> anyhow::Result<()> {
 
 fn run_key_generate(cfg: &Config, args: &KeyGenerateArgs) -> anyhow::Result<()> {
     let path = args.out.clone().unwrap_or_else(|| match args.role {
+        // ADR-0038: the ONE canonical operator path — same resolution the
+        // daemon unit writes into its env and `doctor` reports against.
         crate::cli::RoleArg::Operator => cfg
             .operator_key
             .clone()
-            .unwrap_or_else(|| default_key_path("operator")),
+            .unwrap_or_else(toron_core::config::operator_key_path),
         crate::cli::RoleArg::Agent => default_key_path("agent"),
         crate::cli::RoleArg::Anchor => default_key_path("anchor"),
     });
+    // Fail closed on an existing key file. An identity is not a build artifact:
+    // overwriting one in place destroys the only copy of a secret, and there is
+    // no recovery for a key you did not back up. This is not hypothetical — it
+    // is how the operator key at the canonical path was lost on 2026-09-30,
+    // when a test that isolated HOME but not XDG_CONFIG_HOME ran `key generate`
+    // against the real config home. Refusing costs one `mv`; the alternative
+    // costs an identity.
+    if path.exists() {
+        anyhow::bail!(
+            "refusing to overwrite the existing key at {} — move or remove it first, or \
+             generate to a different path with --out",
+            path.display()
+        );
+    }
     let keys = toron_core::keys::generate();
     let password = key_password();
     toron_core::keys::write_encrypted_key(&path, &keys, &password, KEY_LOG_N)?;
@@ -1099,10 +1157,13 @@ fn run_key_generate(cfg: &Config, args: &KeyGenerateArgs) -> anyhow::Result<()> 
 fn run_key_inspect(cfg: &Config, args: &KeyInspectArgs) -> anyhow::Result<()> {
     let path = match &args.path {
         Some(p) => p.clone(),
+        // Same default as `generate`: explicit config, else the canonical
+        // operator key. Asking "what is my operator npub?" with no arguments
+        // now answers instead of erroring (ADR-0038).
         None => cfg
             .operator_key
             .clone()
-            .ok_or_else(|| anyhow::anyhow!("no key path given and operator_key not configured"))?,
+            .unwrap_or_else(toron_core::config::operator_key_path),
     };
     let password = key_password();
     // Load/decrypt failure bubbles as a runtime error (exit 1); only the

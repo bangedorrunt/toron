@@ -1,5 +1,6 @@
 // governed-by: ADR-0007
 // governed-by: ADR-0036 (daemon state dir — wake.sock discovery)
+// governed-by: ADR-0038 (canonical operator key path — config home, not data root)
 #![forbid(unsafe_code)]
 
 //! Durable data-root configuration (ADR-0007 D3 / R2).
@@ -32,7 +33,18 @@
 use std::path::PathBuf;
 
 /// Relative path of the operator key inside the data root.
+///
+/// LEGACY (ADR-0038): the data root was where the operator key used to live,
+/// and it is kept only so the guard that refuses to mint a second operator
+/// identity can NAME the old location. Nothing loads a key from here.
 pub const OPERATOR_KEY_RELATIVE: &str = "operator/operator.ncryptsec";
+/// Canonical operator key file name inside `<config home>/toron/`.
+///
+/// The key is a SECRET, so it belongs beside the passphrase (same directory,
+/// same 0600 discipline) rather than in the data root with the bus and the
+/// search index. This is also the path `toron key generate --role operator`
+/// writes and the path the docs tell an operator to export (ADR-0038).
+pub const OPERATOR_KEY_BASENAME: &str = "operator_nsec";
 /// Relative path of the per-project mailbox roots directory.
 pub const PROJECTS_RELATIVE: &str = "projects";
 /// Index pool file name at the data root (shared across projects).
@@ -88,6 +100,110 @@ pub fn resolve_data_root(env: &DataRootEnv) -> PathBuf {
 /// The durable data root from the ambient environment.
 pub fn durable_data_dir() -> PathBuf {
     resolve_data_root(&DataRootEnv::from_ambient())
+}
+
+/// Pure: the canonical operator key path from config-home components.
+///
+/// `$XDG_CONFIG_HOME/toron/operator_nsec`, then
+/// `~/.config/toron/operator_nsec`, then the bare relative name when there is
+/// no home at all. Mirrors [`resolve_data_root`]'s shape so both resolutions
+/// read the same way.
+pub fn resolve_operator_key_path(
+    xdg_config_home: Option<&std::path::Path>,
+    home: Option<&std::path::Path>,
+) -> PathBuf {
+    if let Some(dir) = xdg_config_home {
+        return dir.join("toron").join(OPERATOR_KEY_BASENAME);
+    }
+    if let Some(home) = home {
+        return home
+            .join(".config")
+            .join("toron")
+            .join(OPERATOR_KEY_BASENAME);
+    }
+    PathBuf::from(OPERATOR_KEY_BASENAME)
+}
+
+/// The canonical operator key path from the ambient environment (ADR-0038).
+///
+/// The ONE resolution for the operator key: the daemon unit, the MCP host's
+/// implicit fallback, the CLI's `key generate` default, and `doctor` all read
+/// this, so producer and consumers cannot disagree about which key is the
+/// operator identity.
+pub fn operator_key_path() -> PathBuf {
+    resolve_operator_key_path(
+        env_non_empty("XDG_CONFIG_HOME").as_deref(),
+        env_non_empty("HOME").as_deref(),
+    )
+}
+
+/// The pre-ADR-0038 operator key location (inside the data root).
+///
+/// Named so the mint guard and `doctor` can REPORT it. A key here is a
+/// different key from the canonical one — on the machine this was written for,
+/// the two resolved to different npubs — so it is never loaded implicitly and
+/// never silently replaced.
+pub fn legacy_operator_key_path() -> PathBuf {
+    durable_data_dir().join(OPERATOR_KEY_RELATIVE)
+}
+
+/// What a host should do about the operator key. Pure, so the load/mint/refuse
+/// rule is testable without a filesystem or a process environment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OperatorKeySource {
+    /// The canonical file exists — load it.
+    Load,
+    /// No key anywhere — mint one at the canonical path.
+    Mint,
+    /// No canonical key, but a LEGACY data-root key exists. Refuse: minting
+    /// would leave TWO operator identities on one machine, and operator-signed
+    /// work would verify against whichever one the reader happened to resolve.
+    RefuseLegacy,
+}
+
+/// The mint decision: only ever one operator identity per machine (ADR-0038).
+pub const fn operator_key_source(canonical_exists: bool, legacy_exists: bool) -> OperatorKeySource {
+    match (canonical_exists, legacy_exists) {
+        (true, _) => OperatorKeySource::Load,
+        (false, true) => OperatorKeySource::RefuseLegacy,
+        (false, false) => OperatorKeySource::Mint,
+    }
+}
+
+/// Load-or-mint the operator key, with BOTH paths supplied by the caller.
+///
+/// The paths are parameters rather than ambient reads for two reasons. It makes
+/// the mint/refuse rule testable without touching a real config home (a unit
+/// test that resolved ambient paths would read — or MINT into — the operator's
+/// own key), and it lets an isolated root (a test/demo data dir) keep its
+/// operator key beside its own state instead of reaching out to the real one.
+pub fn ensure_operator_key_at(
+    canonical: &std::path::Path,
+    legacy: &std::path::Path,
+    passphrase: &str,
+) -> anyhow::Result<crate::keys::Keys> {
+    match operator_key_source(canonical.is_file(), legacy.is_file()) {
+        OperatorKeySource::Load => crate::keys::load_encrypted_key(canonical, passphrase)
+            .map_err(|e| anyhow::anyhow!("operator key {}: {e}", canonical.display())),
+        OperatorKeySource::Mint => {
+            let keys = crate::keys::generate();
+            crate::keys::write_encrypted_key(canonical, &keys, passphrase, OPERATOR_KEY_LOG_N)
+                .map_err(|e| anyhow::anyhow!("write operator key {}: {e}", canonical.display()))?;
+            Ok(keys)
+        }
+        // The old default minted here, which is how a machine ends up with two
+        // operator identities. Refuse and hand over the exact move.
+        OperatorKeySource::RefuseLegacy => anyhow::bail!(
+            "refusing to mint a second operator identity: no key at {}, but a LEGACY \
+             key exists at {}. They are different keys, so operator-signed work would \
+             verify against whichever one the reader resolved. Move the one you mean to \
+             keep (ADR-0038): mv {} {}",
+            canonical.display(),
+            legacy.display(),
+            legacy.display(),
+            canonical.display()
+        ),
+    }
 }
 
 /// Ambient environment inputs to daemon **state**-dir resolution (pidfiles,
@@ -208,9 +324,15 @@ impl ToronPaths {
         self.root.join("operator")
     }
 
-    /// `operator/operator.ncryptsec`.
+    /// The canonical operator key path (ADR-0038).
+    ///
+    /// Deliberately does NOT use `self.root`: the key is a secret and lives in
+    /// the config home beside the passphrase, not in the data root. Kept as a
+    /// method so existing callers (`daemon install`, the mailbox host) do not
+    /// move, but there is exactly ONE resolution behind it — see
+    /// [`operator_key_path`].
     pub fn operator_key_path(&self) -> PathBuf {
-        self.root.join(OPERATOR_KEY_RELATIVE)
+        operator_key_path()
     }
 
     /// `projects/` — the `Mailbox` data dir (project roots hang off it).
@@ -228,22 +350,17 @@ impl ToronPaths {
         self.root.join(INDEX_SQLITE)
     }
 
-    /// Load the operator key (`operator/operator.ncryptsec`, mode 0600) or
-    /// generate + write it on first use.
+    /// Load the canonical operator key (ADR-0038), or mint it on first use.
     ///
-    /// Idempotent across processes sharing one root: the second opener loads
-    /// the SAME key instead of minting a new one — the R2 "two processes
-    /// share state" unit equivalent for the operator identity.
+    /// Idempotent across processes sharing one machine: the second opener loads
+    /// the SAME key instead of minting a new one — the R2 "two processes share
+    /// state" unit equivalent for the operator identity.
     pub fn ensure_operator_key(&self, passphrase: &str) -> anyhow::Result<crate::keys::Keys> {
-        let path = self.operator_key_path();
-        if path.is_file() {
-            return crate::keys::load_encrypted_key(&path, passphrase)
-                .map_err(|e| anyhow::anyhow!("operator key {}: {e}", path.display()));
-        }
-        let keys = crate::keys::generate();
-        crate::keys::write_encrypted_key(&path, &keys, passphrase, OPERATOR_KEY_LOG_N)
-            .map_err(|e| anyhow::anyhow!("write operator key {}: {e}", path.display()))?;
-        Ok(keys)
+        ensure_operator_key_at(
+            &operator_key_path(),
+            &legacy_operator_key_path(),
+            passphrase,
+        )
     }
 }
 
@@ -398,11 +515,21 @@ mod tests {
         let paths = ToronPaths {
             root: PathBuf::from("/root"),
         };
-        assert_eq!(paths.operator_dir(), PathBuf::from("/root/operator"));
+        // ADR-0038: the KEY is no longer under the data root (it is a secret,
+        // so it lives in the config home). This assertion used to pin
+        // `/root/operator/operator.ncryptsec`, which is exactly the derivation
+        // that let the daemon and the documented path hold two identities.
         assert_eq!(
             paths.operator_key_path(),
-            PathBuf::from("/root/operator/operator.ncryptsec")
+            operator_key_path(),
+            "delegates to the one canonical resolution"
         );
+        assert_ne!(
+            paths.operator_key_path(),
+            paths.root.join(OPERATOR_KEY_RELATIVE),
+            "the operator key must not resolve inside the data root"
+        );
+        assert_eq!(paths.operator_dir(), PathBuf::from("/root/operator"));
         assert_eq!(paths.projects_dir(), PathBuf::from("/root/projects"));
         assert_eq!(
             paths.project_dir("demo"),
@@ -424,24 +551,31 @@ mod tests {
 
     #[test]
     fn operator_key_created_0600_and_idempotent_across_openers() {
-        // Two "processes" opening the same root must see the SAME operator
-        // key (the R2 two-process sharing unit equivalent).
+        // Two "processes" opening the same canonical path must see the SAME
+        // operator key (the R2 two-process sharing unit equivalent).
+        //
+        // The paths are passed IN (ADR-0038). Resolving them here would point
+        // at the ambient config home — a test that did that would load, and on
+        // a machine without a key MINT, the operator's real identity.
         let root = scratch("opkey");
-        let paths = ToronPaths { root: root.clone() };
-        paths.ensure_layout().expect("dirs");
+        std::fs::create_dir_all(&root).expect("dirs");
+        let canonical = root.join("operator_nsec");
+        let legacy = root.join("operator.ncryptsec");
 
-        let first = paths.ensure_operator_key("toron").expect("first open");
-        let path = paths.operator_key_path();
-        assert!(path.is_file(), "key file exists");
+        let first = ensure_operator_key_at(&canonical, &legacy, "toron").expect("first open");
+        assert!(canonical.is_file(), "key file exists");
 
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(&path).expect("meta").permissions().mode();
+            let mode = std::fs::metadata(&canonical)
+                .expect("meta")
+                .permissions()
+                .mode();
             assert_eq!(mode & 0o777, 0o600, "operator key is 0600");
         }
 
-        let second = paths.ensure_operator_key("toron").expect("second open");
+        let second = ensure_operator_key_at(&canonical, &legacy, "toron").expect("second open");
         assert_eq!(
             first.public_key(),
             second.public_key(),
@@ -450,10 +584,32 @@ mod tests {
 
         // Wrong passphrase fails loudly, never silently re-mints.
         assert!(
-            paths.ensure_operator_key("wrong").is_err(),
+            ensure_operator_key_at(&canonical, &legacy, "wrong").is_err(),
             "passphrase mismatch errors"
         );
+        // A legacy-only key REFUSES: minting beside it is how a machine ends up
+        // with two operator identities that sign differently (ADR-0038).
+        let other = scratch("opkey-legacy");
+        std::fs::create_dir_all(&other).expect("dirs");
+        let canonical2 = other.join("operator_nsec");
+        let legacy2 = other.join("operator.ncryptsec");
+        std::fs::write(&legacy2, b"legacy placeholder").expect("write legacy");
+        let refused = ensure_operator_key_at(&canonical2, &legacy2, "toron");
+        assert!(
+            refused.is_err(),
+            "a legacy-only key must refuse to mint a second identity"
+        );
+        assert!(
+            !canonical2.exists(),
+            "the refusal must not leave a freshly minted canonical key behind"
+        );
+        assert!(
+            legacy2.is_file(),
+            "the legacy key is left exactly where it was — never moved or deleted"
+        );
+
         let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&other);
     }
 
     #[test]
@@ -563,5 +719,54 @@ mod tests {
             passphrase_file_candidates(Some(&PathBuf::from("/xdg")), Some(&PathBuf::from("/home")));
         assert_eq!(v[0], PathBuf::from("/xdg/toron/passphrase"));
         assert_eq!(v[1], PathBuf::from("/home/.config/toron/passphrase"));
+    }
+
+    /// ADR-0038: the operator key is a secret, so it resolves in the CONFIG
+    /// home (where the passphrase already lives) and never in the data root.
+    /// Pure (components passed in): no env mutation, no filesystem.
+    #[test]
+    fn operator_key_path_resolves_in_the_config_home_never_the_data_root() {
+        assert_eq!(
+            resolve_operator_key_path(Some(&PathBuf::from("/xdg")), Some(&PathBuf::from("/home"))),
+            PathBuf::from("/xdg/toron/operator_nsec"),
+            "XDG_CONFIG_HOME wins"
+        );
+        assert_eq!(
+            resolve_operator_key_path(None, Some(&PathBuf::from("/home"))),
+            PathBuf::from("/home/.config/toron/operator_nsec"),
+            "HOME is the fallback"
+        );
+        assert_eq!(
+            resolve_operator_key_path(None, None),
+            PathBuf::from("operator_nsec"),
+            "no home at all keeps the relative name"
+        );
+        // The whole point: the key path must not be derived from the data root
+        // (that derivation is exactly how two operator identities appeared).
+        for (xdg, home) in [
+            (Some(PathBuf::from("/xdg")), Some(PathBuf::from("/home"))),
+            (None, Some(PathBuf::from("/home"))),
+        ] {
+            let p = resolve_operator_key_path(xdg.as_deref(), home.as_deref());
+            assert!(
+                !p.to_string_lossy().contains("share/toron") && !p.ends_with(OPERATOR_KEY_RELATIVE),
+                "the canonical key must not live under the data root: {}",
+                p.display()
+            );
+        }
+    }
+
+    /// ADR-0038: one operator identity per machine. A legacy data-root key is a
+    /// different key, so the only states are load / mint / refuse.
+    #[test]
+    fn operator_key_source_never_mints_beside_a_legacy_key() {
+        assert_eq!(operator_key_source(true, true), OperatorKeySource::Load);
+        assert_eq!(operator_key_source(true, false), OperatorKeySource::Load);
+        assert_eq!(operator_key_source(false, false), OperatorKeySource::Mint);
+        assert_eq!(
+            operator_key_source(false, true),
+            OperatorKeySource::RefuseLegacy,
+            "minting here is how a machine gets two operator identities"
+        );
     }
 }

@@ -186,6 +186,13 @@ Release profile: `strip = "none"` (macOS arm64 LINKEDIT / sqlx_macros).
 - `toron serve` requires `--mcp-stdio` or `--mcp-http`. No-flag serve bails.
 - Daemon label `com.toron.serve`, HTTP `127.0.0.1:18080`. Passphrase file
   `~/.config/toron/passphrase` (0600), never in plist/env flags.
+  **Operator key is `~/.config/toron/operator_nsec` (0600), and that is the
+  ONE canonical path** (ADR-0038: `config::operator_key_path`, shared by the
+  daemon unit, the mailbox host fallback, `key generate --role operator`, and
+  `doctor`); the unit's `TORON_OPERATOR_KEY` is an explicit pin of it. A key at
+  the old data-root `operator/operator.ncryptsec` is a **different identity** —
+  the implicit mint REFUSES to mint a second one and names the `mv`, and
+  `doctor` reports a legacy-only key as a red naming both paths.
 - Daemon runs at `RUST_LOG=warn` (plist + `daemon.rs` templates). Hourly
   copy-truncate via LaunchAgent `com.toron.logrotate` (1 MiB, also rotates
   `resonate.out.log`). One `toron serve` per data dir (`serve.pid`). INFO

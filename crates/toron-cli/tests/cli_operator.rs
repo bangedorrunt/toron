@@ -181,12 +181,69 @@ fn key_inspect_missing_file_exits_1() {
     );
 }
 
+/// A generated key is an IDENTITY, not a build artifact. `key generate` must
+/// refuse to overwrite an existing file, and the refusal must leave the bytes
+/// untouched. This is the witness for a real loss: a test that isolated HOME
+/// but not XDG_CONFIG_HOME ran `key generate` against the operator's real
+/// config home and silently replaced an identity in place.
+#[test]
+fn key_generate_refuses_to_overwrite_an_existing_key() {
+    let dir = unique_dir("noclobber");
+    let key_path = dir.join("operator_nsec");
+    let args = [
+        "key",
+        "generate",
+        "--role",
+        "operator",
+        "--out",
+        key_path.to_str().unwrap(),
+        "--json",
+    ];
+    let first = run(&args);
+    assert!(
+        first.status.success(),
+        "first generate must succeed, stderr: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let before = std::fs::read(&key_path).expect("read generated key");
+
+    let second = run(&args);
+    assert_eq!(
+        second.status.code(),
+        Some(1),
+        "a second generate onto the same path must fail, stderr: {}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&second.stderr);
+    assert!(
+        stderr.contains("refusing to overwrite"),
+        "the refusal must say what it refused, got: {stderr}"
+    );
+    assert_eq!(
+        std::fs::read(&key_path).expect("re-read key"),
+        before,
+        "the existing key must be byte-identical after a refused overwrite"
+    );
+}
+
 #[test]
 fn key_generate_default_path_ok_or_clean_error() {
-    // No --out: default to operator_key or ~/.config/toron/operator_nsec.
-    // Isolate HOME so the default path lands in temp, never the real home.
+    // No --out: default to operator_key or the canonical config-home key.
+    //
+    // BOTH HOME and XDG_CONFIG_HOME are isolated. Isolating HOME alone was not
+    // enough once the operator key moved to the config home (ADR-0038): with an
+    // ambient XDG_CONFIG_HOME set, the default resolved to the operator's REAL
+    // key and this test overwrote it (2026-09-30, the loss that produced the
+    // no-clobber guard in `key generate`). `run_with_env` cannot remove a
+    // variable, so the command is built here.
     let dir = unique_dir("keydefault");
-    let out = run_with_env(&["key", "generate"], &[("HOME", dir.to_str().unwrap())]);
+    let out = toron()
+        .env("HOME", &dir)
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("TORON_OPERATOR_KEY")
+        .args(["key", "generate"])
+        .output()
+        .expect("run toron key generate");
     let code = out.status.code();
     assert!(
         code == Some(0) || code == Some(1),
@@ -237,6 +294,91 @@ fn doctor_check_exits_0_or_3_with_parseable_json() {
             "exit 3 requires at least one failed check, got {value}"
         );
     }
+}
+
+/// ADR-0038: `doctor` reports the ONE canonical operator key, resolves it from
+/// the config home, and never invents a green. Real subprocess, real files, no
+/// network — the check under test IS the resolution, so the test drives it by
+/// moving the key file between the canonical and the legacy location.
+#[test]
+fn doctor_keys_check_resolves_the_canonical_config_home_key() {
+    let _ = shared_data_dir();
+    let home = unique_dir("keypath");
+    let canonical = home.join(".config").join("toron").join("operator_nsec");
+    let legacy = home
+        .join(".local")
+        .join("share")
+        .join("toron")
+        .join("operator")
+        .join("operator.ncryptsec");
+    // Removed rather than set-empty: an empty `TORON_OPERATOR_KEY` would
+    // configure a path that is not a file, which is a different case.
+    let doctor_keys = || -> (bool, String) {
+        let out = toron()
+            .env("HOME", &home)
+            .env_remove("XDG_CONFIG_HOME")
+            .env_remove("XDG_DATA_HOME")
+            .env_remove("TORON_DATA_DIR")
+            .env_remove("TORON_OPERATOR_KEY")
+            .args(["doctor", "--json"])
+            .output()
+            .expect("run toron doctor");
+        let value = parse(&out.stdout);
+        let check = value["checks"]
+            .as_array()
+            .expect("checks array")
+            .iter()
+            .find(|c| c["name"] == serde_json::json!("keys"))
+            .expect("the keys check must be present");
+        (
+            check["ok"] == serde_json::json!(true),
+            check["detail"].as_str().unwrap_or_default().to_string(),
+        )
+    };
+
+    // 1. No key anywhere: reported as not configured, never green.
+    let (ok, detail) = doctor_keys();
+    assert!(!ok, "an absent operator key must not read green: {detail}");
+
+    // 2. The canonical config-home key: green, and the detail names it.
+    let generated = toron()
+        .env("HOME", &home)
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("TORON_OPERATOR_KEY")
+        .args(["key", "generate", "--role", "operator", "--json"])
+        .output()
+        .expect("run toron key generate");
+    assert!(
+        generated.status.success(),
+        "key generate must exit 0, stderr: {}",
+        String::from_utf8_lossy(&generated.stderr)
+    );
+    assert!(
+        canonical.is_file(),
+        "`key generate --role operator` must write the canonical config-home path {}; \
+         got JSON {} and stderr {}",
+        canonical.display(),
+        String::from_utf8_lossy(&generated.stdout),
+        String::from_utf8_lossy(&generated.stderr)
+    );
+    let (ok, detail) = doctor_keys();
+    assert!(ok, "the canonical key must read green: {detail}");
+    assert!(
+        detail.contains("operator_nsec"),
+        "the detail must name the path that resolved: {detail}"
+    );
+
+    // 3. Only a LEGACY data-root key: NOT green, and both paths are named —
+    //    reporting a bare "not configured" would hide the two identities.
+    std::fs::remove_file(&canonical).unwrap();
+    std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+    std::fs::write(&legacy, b"placeholder, never loaded").unwrap();
+    let (ok, detail) = doctor_keys();
+    assert!(!ok, "a legacy-only key must not read green: {detail}");
+    assert!(
+        detail.contains("LEGACY") && detail.contains("operator.ncryptsec"),
+        "the detail must name the legacy path it found: {detail}"
+    );
 }
 
 // ---------------------------------------------------------------------------
