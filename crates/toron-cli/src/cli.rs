@@ -1671,14 +1671,14 @@ pub struct KeyGenerateArgs {
     /// operator|agent|anchor.
     #[arg(long, value_enum, default_value_t = RoleArg::Operator)]
     pub role: RoleArg,
-    /// Output path (default: operator_key or ~/.config/toron/<role>_nsec).
+    /// Output path (default: operator_key, else the role's canonical path — ADR-0038).
     #[arg(long)]
     pub out: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
 pub struct KeyInspectArgs {
-    /// Key file path (default: operator_key).
+    /// Key file path (default: operator_key, else the canonical operator key).
     pub path: Option<PathBuf>,
 }
 

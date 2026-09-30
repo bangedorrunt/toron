@@ -6,6 +6,10 @@ description: Keys, daemon, project, and first mail in five minutes.
 ## Operator, once per host
 
 ```bash
+# ~/.config/toron/operator_nsec is the ONE canonical path (XDG_CONFIG_HOME wins
+# over HOME), so exporting it is a pin, not a requirement: `key generate`, the
+# daemon unit, the mailbox host and `doctor` all resolve the same file. The
+# export is still worth doing for a shell that runs operator-signed commands.
 export TORON_OPERATOR_KEY=$HOME/.config/toron/operator_nsec   # a PATH, not a key
 toron key generate --role operator
 toron daemon install && toron daemon start
@@ -29,11 +33,16 @@ toron doctor
 readout; a bare pid means an unmanaged instance, which `stop` refuses to touch.
 `doctor` prints one line per check and only the `FAIL` lines need action.
 
-If it fails: `FAIL keys — operator_key not configured` means the operator key was
-never exported or the path is wrong **for the daemon's environment** — the
-secret is a path in `TORON_OPERATOR_KEY`, so a typo reads as "not configured"
-rather than as a bad key. `FAIL resonate` is not toron's problem to fix: the
-workflow fabric needs `http://127.0.0.1:8001` up, and the check refuses to
+If it fails: the `keys` line names **which source resolved**, so read it before
+acting. "not configured" means no key exists at the canonical path either; a red
+naming a **LEGACY** key means an old data-root `operator/operator.ncryptsec` is
+sitting where nothing reads it — that is a *different identity*, so move the one
+you mean to keep (`mv` is spelled out in the message) rather than letting two
+exist. The secret is a path in `TORON_OPERATOR_KEY`, so a typo reads as "not
+configured" rather than as a bad key. `key generate` refuses to overwrite an
+existing key (exit 1, bytes untouched), so a re-run needs the old file moved
+first. `FAIL resonate` is not toron's problem to fix: the check reads the
+resolved server's `/health` (over TLS when the server is https) and refuses to
 invent a green (GS-037) instead of degrading silently. `doctor --check` exits 3
 when any check failed, so a wrapper can gate on the exit code alone.
 

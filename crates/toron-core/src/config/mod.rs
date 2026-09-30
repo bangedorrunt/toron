@@ -170,6 +170,29 @@ pub const fn operator_key_source(canonical_exists: bool, legacy_exists: bool) ->
     }
 }
 
+/// Set `path` to 0600 when it exists, and touch nothing else.
+///
+/// This used to re-ENCRYPT the key (load + `write_encrypted_key`) to reach the
+/// same end, which is not a chmod: `write_encrypted_key` TRUNCATES the live
+/// file, so a crash between truncate and write loses the identity, and every
+/// host boot paid two log_n=14 scrypt passes for a permission bit. It now sets
+/// the mode it claims to set.
+///
+/// Parameterized so the property that matters — the key BYTES are untouched —
+/// is testable without the ambient config home. On a platform without POSIX
+/// modes this is a no-op rather than a claim it cannot keep.
+pub fn ensure_key_mode_at(path: &std::path::Path) -> anyhow::Result<()> {
+    if !path.is_file() {
+        return Ok(());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
 /// Load-or-mint the operator key, with BOTH paths supplied by the caller.
 ///
 /// The paths are parameters rather than ambient reads for two reasons. It makes
@@ -304,19 +327,10 @@ impl ToronPaths {
         Ok(())
     }
 
-    /// Best-effort chmod 0600 of an existing operator key. No-op when the
-    /// key file is absent (generation writes 0600 already).
+    /// Best-effort chmod 0600 of an existing operator key. No-op when the key
+    /// file is absent (generation writes 0600 already).
     pub fn ensure_operator_key_mode(&self) -> anyhow::Result<()> {
-        let path = self.operator_key_path();
-        if path.is_file() {
-            crate::keys::write_encrypted_key(
-                &path,
-                &crate::keys::load_encrypted_key(&path, &operator_passphrase())?,
-                &operator_passphrase(),
-                OPERATOR_KEY_LOG_N,
-            )?;
-        }
-        Ok(())
+        ensure_key_mode_at(&self.operator_key_path())
     }
 
     /// `operator/` — holds the operator key (0600).
@@ -754,6 +768,37 @@ mod tests {
                 p.display()
             );
         }
+    }
+
+    /// The mode helper must set the mode and touch NOTHING else: the key bytes
+    /// ARE the identity. The implementation it replaced re-encrypted the file
+    /// (a truncating write) to accomplish a chmod.
+    #[cfg(unix)]
+    #[test]
+    fn ensure_key_mode_sets_0600_without_rewriting_the_key() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("keymode");
+        std::fs::create_dir_all(&dir).expect("dirs");
+        let path = dir.join("operator_nsec");
+        std::fs::write(&path, b"ciphertext bytes").expect("write");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("loosen");
+        let before = std::fs::read(&path).expect("read");
+
+        ensure_key_mode_at(&path).expect("mode");
+
+        assert_eq!(
+            std::fs::read(&path).expect("re-read"),
+            before,
+            "a chmod must not rewrite the key — the bytes are an identity"
+        );
+        assert_eq!(
+            std::fs::metadata(&path).expect("meta").permissions().mode() & 0o777,
+            0o600,
+            "the mode is the thing the function is named for"
+        );
+        // Absent file: a no-op, never an error (generation writes 0600 itself).
+        ensure_key_mode_at(&dir.join("absent")).expect("absent is a no-op");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// ADR-0038: one operator identity per machine. A legacy data-root key is a

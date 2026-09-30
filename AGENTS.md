@@ -1,8 +1,8 @@
 # toron
 
-Nostr-native agent mailbox. 40 MCP tools (38 AM-Rust parity + 2 toron additive:
-`release_file_reservations_by_reason`, `list_file_reservations`) + 25 resources
-on Schnorr identity, NIP-17 gift-wrap, NIP-29 channels. Flywheel embeds this;
+Nostr-native agent mailbox. 41 MCP tools (38 AM-Rust parity + 3 toron additive:
+`release_file_reservations_by_reason`, `list_file_reservations`, `ask_judgment`)
++ 25 resources on Schnorr identity, NIP-17 gift-wrap, NIP-29 channels. Flywheel embeds this;
 never the reverse. The committed catalog (`docs/catalog/toron-mcp.json`) is the
 38-parity subset by contract (additive excluded, `catalog_freshness` gated).
 
@@ -63,7 +63,7 @@ Child maps: [toron-core](crates/toron-core/AGENTS.md) ·
 - Edition 2024. `#![forbid(unsafe_code)]` on every crate root.
 - New/changed ADR-constrained files: `// governed-by: ADR-XXXX` at top.
 - Deps one-way: **flywheel → toron-workflow → toron-core**. Never reverse.
-- Frozen: 40 tool names (38 AM-Rust parity + 2 toron additive: `release_file_reservations_by_reason`, `list_file_reservations`), 25 resources, kind registry. No new kinds/tools without an ADR.
+- Frozen: 41 tool names (38 AM-Rust parity + 3 toron additive: `release_file_reservations_by_reason`, `list_file_reservations`, `ask_judgment` — `catalog::ADDITIVE_TOOLS` is the list), 25 resources, kind registry. No new kinds/tools without an ADR.
 - Additive discipline (proposed): additive tools/kinds allowed with ADR + catalog regen + tests + versioning; renumber and parity drift stay forbidden. 
 - CLI nouns: `channel` `job` `react` `presence` `watch`. Channel posts emit kind **9** (not 42). Channel create/close emit **39000**, join/leave emit **39002**; 40/41/42 ingest only.
 - Lease board + release-on-bead-close are CLI-reachable: `toron reserve list --project <p> [--holder <pin> --path <glob>]` and `toron reserve release-by-reason <bead> --project <p> --as <operator>`. No new MCP tool — both wrap existing operators (`list_file_reservations` / `release_file_reservations_by_reason`); `release-by-reason` is operator-signed and fails loud without an operator key.
@@ -123,12 +123,20 @@ A change is unfinished until:
 - A live effect is journaled before the provider runs. `Recording` is only for a dry arm. A live effect with no runner refuses.
 - Retry wraps one idempotent effect. Fallback stays outside the retry. The breaker stays inside the retry. The attempt timeout wraps only the call.
 
-A change that touches one of these functions closes that defect instead of copying it:
+These five effect-law defects were filed against ADR-0035's acceptance and are
+**all closed, each pinned by a witness test**. Treat them as settled behaviour,
+not as a to-do list: a change that touches one must not regress it, and the
+named witness is what fails if it does. (This section used to restate them as
+open — which sends the next agent to re-fix closed work, and hides the fifth
+item entirely. Do not write a defect list without its bead and its witness.)
 
-- `dispatch_core` `Release` decrements `used` even when that assignee is not in flight. Decrement only a slot that was held.
-- A receipt prune is a tombstone. `upsert` must see it, in the same transaction as the write, or a later owed-on-send recreates the corr.
-- `ask_judgment` runs the external call and journals afterward. Journal the attempt first. Ticking a fresh `JudgeModel` on every wake does not make the in-flight guard real.
-- `send_armor` half-open admits every caller that arrives after the state flips. One probe, then the rest stay refused until that probe settles.
+- `dispatch_core` `Release` — **CLOSED** (bd-de4k). A release with no held permit emits `DispatchEffect::ReleaseIgnored` and moves no counter, so `used == sum(in_flight)`. Witness: `double_release_ignored_preserves_sum`.
+- A receipt prune is a tombstone — **CLOSED** (bd-aku0). `upsert` refuses resurrection through `is_tombstoned`, the monotonic guard is re-checked inside the write transaction, and the tombstone probe reads ONE corr's history on the `events_corr` index (migration 0014) instead of the whole log.
+- `ask_judgment` journals before the call — **CLOSED** (bd-pgvf). A `Prepared` claim row commits before the spawn, and the `JudgeModel` is host-owned (`Mailbox::judge_model()`), so a fresh model per wake can no longer bypass the in-flight guard.
+- `send_armor` half-open admits one probe — **CLOSED** (bd-mbck). The permit is taken atomically in `call`, fast-refused in `poll_ready`, released by `ProbeGuard` when a probe is cancelled, and the clock is injected.
+- `Degraded` has a producing message — **CLOSED** (bd-5mxm). `receipts_core::ReceiptsMsg::MarkDegraded` creates the row when bookkeeping never ran, driven from `messaging.rs`.
+
+Provenance and per-defect evidence: ADR-0035's acceptance record.
 
 ## Skill Sync Contract
 
@@ -137,7 +145,7 @@ When you add/remove/rename a CLI command or MCP tool, update ALL of:
 2. The tool `#[tool(name = "...")]` in `crates/toron-mcp/src/tools/` — MCP surface (wave 1: **no new tools**; CLI-only nouns still need steps 1, 3, 4).
 3. This AGENTS.md (STRUCTURE + CONVENTIONS sections).
 4. The skill: `~/.agents/skills/toron/SKILL.md` CLI Surface + Mail tool REQUIRED args + [crew-steering](references/crew-steering.md) — single canonical copy; grok and other harnesses read the same file (grok natively scans `~/.agents/skills/`, no mirror).
-5. The tool-count constant (AGENTS.md header + SKILL.md frontmatter): 40 (38 parity + 2 additive). Only changes when an MCP tool actually changes.
+5. The tool-count constant (AGENTS.md header + SKILL.md frontmatter): 41 (38 parity + 3 additive — ground truth is `catalog::PARITY_TOOL_COUNT` + `ADDITIVE_TOOLS`). Only changes when an MCP tool actually changes.
 6. `toron catalog --json` + `mbx test catalog_freshness` when the CLI catalog grows.
 
 The skill files are the canonical agent-facing reference. A command/tool not in

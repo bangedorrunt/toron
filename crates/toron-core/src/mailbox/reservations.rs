@@ -352,7 +352,8 @@ pub struct GrantedReservation {
     pub expires_ts_us: Option<i64>,
     /// Fencing epoch (bd-adr-0028-implementation-zfnx.11). Internal
     /// plumbing only — deliberately NOT in the MCP `ToJson` wire shape, so
-    /// the 38-tool catalog stays byte-identical (no regen, count stays 40).
+    /// the 38-parity catalog stays byte-identical (no regen, and the served
+    /// count stays 41 — 38 parity + 3 additive).
     pub epoch: u64,
 }
 

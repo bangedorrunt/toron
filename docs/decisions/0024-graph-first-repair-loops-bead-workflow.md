@@ -507,10 +507,10 @@ is **not** Wave 1; ignore it until a later ADR.
 | Step | Contract item | ADR-0024 impact |
 | :--- | :--- | :--- |
 | 1 | `Command` enum (`cli.rs`) — ground truth | `flywheel/src/main.rs` gains `workflow graph/tree/status/connect/resume/fork/cancel/approvals/approve/reject`. `toron-cli` unchanged (standalone fabric). |
-| 2 | MCP `#[tool(name)]` | **No change.** 40 tools frozen (38 parity + 2 additive). All new surface is CLI. |
+| 2 | MCP `#[tool(name)]` | **No change.** The count was 40 when written (38 parity + 2 additive); it is **41** as of 2026-09-30 (38 parity + 3 — `catalog::ADDITIVE_TOOLS`). All new surface is CLI. |
 | 3 | AGENTS.md STRUCTURE + CONVENTIONS | CONVENTIONS notes graph-first + `on_error: repair` + `ErrorKind` taxonomy + "no new tools/kinds" (already stated). STRUCTURE unchanged. |
 | 4 | Skill files (toron, flywheel, br) | Drift map in §7.5.2. |
-| 5 | Tool-count constant | **Unchanged** — 40 stays 40 (no MCP tool added). |
+| 5 | Tool-count constant | **Unchanged** — 41 stays 41 (no MCP tool added; it read 40 when written). |
 | 6 | `toron catalog --json` + `catalog_freshness` | **Unchanged** — toron CLI catalog does not grow; the new surface is flywheel CLI. Flywheel's *builtin* catalog grows in Wave 1 (compose/recipe tokens), gated by `flywheel workflow lint`, not the toron catalog gate. |
 
 #### 7.5.2 Drift map — exact file × section × change

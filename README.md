@@ -271,7 +271,7 @@ Empty by default — zero implicit network egress (matches AM-Rust's local-first
 | Role | What | Where |
 |------|------|-------|
 | **Agent key** | identity + signing + NIP-44 decrypt | `agents/{name}/key.ncryptsec` (NIP-49, passphrase-encrypted, 0600). **Never leaves the toron process.** |
-| **Operator key** | privileged ops (force-release via revocation event G5, project manifests, relay admin) | `~/.config/toron/operator_nsec` (0600) or `TORON_OPERATOR_NSEC` |
+| **Operator key** | privileged ops (force-release via revocation event G5, project manifests, relay admin) | `~/.config/toron/operator_nsec` (0600, the one canonical path — ADR-0038) or `TORON_OPERATOR_KEY` (a **path**, never the secret) |
 | **Trust anchor** (optional) | proof-gate attestation signing | public npub in config; private key held by your issuing authority |
 
 - Generate on first run: `toron key generate --role operator` / agents auto-generate on `register_agent`.
