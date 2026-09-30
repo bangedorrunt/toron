@@ -1,8 +1,9 @@
 [toolchain]
 # Floating nightly, shared with siblings beads + flywheel (operator choice
 # 2026-09-06: was pinned nightly-2026-08-20 per bd-14ea, unpinned for
-# latest-nightly features). Builds and tests green with the stricter
-# pedantic+nursery clippy lints in [workspace.lints] as of the pin date;
-# re-run the gates after each toolchain bump.
+# latest-nightly features). The custom [workspace.lints] clippy posture was
+# removed 2026-09-30 (operator call): clippy runs at its defaults, so the tree
+# must stay warning-free under both `clippy` and `clippy -- -D warnings`.
+# Re-run the gates after each toolchain bump.
 channel = "nightly"
 components = ["rustfmt", "clippy"]

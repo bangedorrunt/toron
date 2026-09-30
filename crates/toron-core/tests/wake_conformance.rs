@@ -10,7 +10,7 @@
 //! is transport-agnostic: it pins the contract against InProcessBus + store
 //! replay, which the socket sidecar must satisfy when it lands.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::time::Duration;
 
 use toron_core::bus::filter::project_filter;
@@ -338,22 +338,6 @@ async fn conformance_no_new_surface() {
         assert!(
             !src.contains("TcpListener"),
             "bus/{name}: no TCP listener by default"
-        );
-    }
-}
-
-/// Deterministic script ledger: every scripted sequence above is reproducible
-/// from its index alone (seeded by construction, no RNG in the path).
-#[test]
-fn conformance_scripts_are_deterministic() {
-    let seq: Vec<String> = (0..20).map(|i| format!("flood-{i}")).collect();
-    let again: Vec<String> = (0..20).map(|i| format!("flood-{i}")).collect();
-    assert_eq!(seq, again);
-    let mut seen = HashMap::new();
-    for (i, s) in seq.iter().enumerate() {
-        assert!(
-            seen.insert(s.clone(), i).is_none(),
-            "no duplicate script step"
         );
     }
 }

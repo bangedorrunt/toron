@@ -32,6 +32,3 @@ crossterm = "0.28"
 [dev-dependencies]
 uuid = { version = "1", features = ["v4"] }
 sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio"] }
-
-[lints]
-workspace = true

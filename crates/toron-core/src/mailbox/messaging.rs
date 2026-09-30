@@ -258,15 +258,11 @@ fn filter_inbox_messages(
             }
             // ack-SLA: ack-overdue branch — the recipient's own read state
             // rides the row (`read_ts_us`), so no extra query is needed.
-            if q.ack_overdue_only
-                && !(m.ack_required
-                    && matches!(m.importance.as_str(), "high" | "urgent")
-                    && m.created_ts_us < overdue_us
-                    && m.read_ts_us.is_none())
-            {
-                return false;
-            }
-            true
+            let ack_overdue = m.ack_required
+                && matches!(m.importance.as_str(), "high" | "urgent")
+                && m.created_ts_us < overdue_us
+                && m.read_ts_us.is_none();
+            !q.ack_overdue_only || ack_overdue
         })
         .collect())
 }

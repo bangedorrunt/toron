@@ -449,7 +449,7 @@ mod tests {
             vec!["Fix flaky".to_string()],
             "ack-required"
         );
-        assert!(result.npub.len() == 64);
+        assert_eq!(result.npub.len(), 64);
 
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_dir_all(&data_dir);

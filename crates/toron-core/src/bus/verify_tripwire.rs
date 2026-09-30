@@ -53,17 +53,20 @@ impl StageTrace {
     }
 
     /// True when no side-effect stage ran after a failed verify.
+    ///
+    /// Vacuously true when no `verify_fail` was traced: with no failed
+    /// verify, nothing ran after one. `is_some_and` alone inverts that case
+    /// and reports a clean trace as a violation.
     pub fn no_side_effects_after_failed_verify(&self) -> bool {
-        if let Some(pos) = self.entered.iter().position(|s| s == "verify_fail") {
-            !self.entered[pos + 1..].iter().any(|s| {
-                matches!(
-                    s.as_str(),
-                    "dedup_or_ephemeral" | "fanout" | "stamp_seen" | "watermark" | "prompt_route"
-                )
-            })
-        } else {
-            true
-        }
+        let Some(pos) = self.entered.iter().position(|s| s == "verify_fail") else {
+            return true;
+        };
+        !self.entered[pos + 1..].iter().any(|s| {
+            matches!(
+                s.as_str(),
+                "dedup_or_ephemeral" | "fanout" | "stamp_seen" | "watermark" | "prompt_route"
+            )
+        })
     }
 }
 
@@ -135,6 +138,18 @@ mod tests {
         t.enter("verify_fail");
         t.enter("fanout");
         assert!(!t.no_side_effects_after_failed_verify());
+    }
+
+    #[test]
+    fn clean_trace_has_no_side_effects_after_a_failed_verify() {
+        let mut t = StageTrace::default();
+        t.enter("verify");
+        t.enter("dedup_or_ephemeral");
+        t.enter("fanout");
+        assert!(
+            t.no_side_effects_after_failed_verify(),
+            "a trace with no verify_fail is vacuously clean, not a violation"
+        );
     }
 
     #[test]

@@ -2391,13 +2391,7 @@ impl Mailbox {
 
     /// Append an acquire/release/revoked transition record to the Git archive
     /// (G13 history; permanent, append-only).
-    fn record_transition(
-        &self,
-        project_slug: &str,
-        d: &str,
-        status: &str,
-        event_id: &EventId,
-    ) {
+    fn record_transition(&self, project_slug: &str, d: &str, status: &str, event_id: &EventId) {
         let root = crate::mailbox::aliases::project_root(&self.data_dir, project_slug);
         if let Ok(archive) = crate::archive::git::GitArchive::open_or_init(&root) {
             let rel = std::path::Path::new(".audit").join(format!("{event_id}.{status}.json"));

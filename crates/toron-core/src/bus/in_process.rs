@@ -1373,7 +1373,7 @@ mod tests {
             1,
             "wrap envelope carries only the p tag, got {visible:?}"
         );
-        assert!(visible[0][0] == "p");
+        assert_eq!(visible[0][0], "p");
         let _ = std::fs::remove_file(&path);
     }
 

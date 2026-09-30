@@ -28,6 +28,3 @@ uuid = { version = "1", features = ["v4"] }
 # probe (a freed ephemeral port can be rebound by a concurrent test binary;
 # a socket bound WITHOUT listen refuses connections deterministically).
 socket2 = "0.6"
-
-[lints]
-workspace = true

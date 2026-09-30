@@ -1021,7 +1021,7 @@ mod wake_bus_tests {
         let _ = std::fs::remove_file(&sock);
         let mut cfg = WakeConfig::new(&sock);
         cfg.poll_interval_ms = 0;
-        let _h = WakeServer::new(cfg, bus, Arc::new(ManualClock::new(0)))
+        let h = WakeServer::new(cfg, bus, Arc::new(ManualClock::new(0)))
             .start()
             .await
             .expect("bind");
@@ -1035,18 +1035,19 @@ mod wake_bus_tests {
             })
             .to_string();
             request.push('\n');
-            writer.write_all(request.as_bytes()).await.expect("subscribe");
+            writer
+                .write_all(request.as_bytes())
+                .await
+                .expect("subscribe");
             let mut lines = BufReader::new(reader).lines();
             let mut ids = Vec::new();
             loop {
-                let line = tokio::time::timeout(
-                    std::time::Duration::from_secs(2),
-                    lines.next_line(),
-                )
-                .await
-                .expect("bounded socket read")
-                .expect("read frame")
-                .expect("frame before EOSE");
+                let line =
+                    tokio::time::timeout(std::time::Duration::from_secs(2), lines.next_line())
+                        .await
+                        .expect("bounded socket read")
+                        .expect("read frame")
+                        .expect("frame before EOSE");
                 match WakeFrame::decode_line(&line).expect("valid frame") {
                     WakeFrame::Event(event) => {
                         ids.push(event["id"].as_str().expect("event id").to_owned());
@@ -1060,7 +1061,10 @@ mod wake_bus_tests {
         let (all_ids, cursor) = receive_replay(&sock, None).await;
         assert_eq!(
             all_ids,
-            expected.iter().map(|(_, id)| id.clone()).collect::<Vec<_>>(),
+            expected
+                .iter()
+                .map(|(_, id)| id.clone())
+                .collect::<Vec<_>>(),
             "initial subscribe replays matching stored events only, in store order"
         );
         assert_ne!(cursor, "head", "EOSE must report a resumable event cursor");
@@ -1072,7 +1076,7 @@ mod wake_bus_tests {
             vec![expected[1].1.clone()],
             "resume starts strictly after the supplied event cursor"
         );
-        drop(_h);
+        drop(h);
         let _ = std::fs::remove_file(&db);
     }
 

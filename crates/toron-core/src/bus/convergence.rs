@@ -244,13 +244,7 @@ mod tests {
         let op = AuthorityOp::Kick {
             target: "bob".into(),
         };
-        let (s, _) = tick(
-            None,
-            &ConvergenceMsg::Propose {
-                op,
-                generation: 7,
-            },
-        );
+        let (s, _) = tick(None, &ConvergenceMsg::Propose { op, generation: 7 });
         let (s, _) = tick(s.as_ref(), &ConvergenceMsg::Commit);
         assert!(matches!(
             s,

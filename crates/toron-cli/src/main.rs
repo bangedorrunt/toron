@@ -104,10 +104,7 @@ fn run(cli: &Cli) -> anyhow::Result<ExitCode> {
             operator::run_backend(&cfg, cmd)?;
             ExitCode::SUCCESS
         }
-        Command::Bench(args) => {
-            run_bench(args, format)?;
-            ExitCode::SUCCESS
-        }
+        Command::Bench(args) => run_bench(args, format)?,
         Command::Tui(args) => {
             tui::run_tui(args)?;
             ExitCode::SUCCESS
