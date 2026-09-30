@@ -254,6 +254,27 @@ pub fn zero_file_match_warning(pattern: &str, matched: usize) -> Option<String> 
     ))
 }
 
+/// A `--paths` value that is a LIST in the wrong separator.
+///
+/// `--paths` is comma-separated (`value_delimiter = ','`), so a space-separated
+/// list silently becomes ONE glob containing spaces: a lease that matches
+/// nothing while reporting success (measured 2026-09-30 — twelve paths arrived
+/// as a single pattern, came back `granted`, and covered no file).
+///
+/// A warning, not a refusal: a path containing a space is legal if unusual, so
+/// this names the exact re-run rather than taking the decision away.
+pub fn whitespace_path_warning(pattern: &str) -> Option<String> {
+    if !pattern.contains(|c: char| c.is_whitespace()) {
+        return None;
+    }
+    Some(format!(
+        "reserve: warning — `--paths` is comma-separated, but `{pattern}` looks like several \
+         paths separated by spaces, so it was taken as ONE glob and will match nothing. \
+         Re-run with `{}`.",
+        pattern.split_whitespace().collect::<Vec<_>>().join(",")
+    ))
+}
+
 fn match_impl(pat: &[char], text: &[char], pi: usize, ti: usize) -> bool {
     if pi == pat.len() {
         return ti == text.len();
@@ -1300,6 +1321,40 @@ mod tests {
         assert!(
             zero_file_match_warning("src/**", 3).is_none(),
             "silent on match"
+        );
+    }
+
+    /// The wrong separator must be named at acquire time, not discovered later
+    /// as a lease that covers nothing.
+    #[test]
+    fn whitespace_path_warning_names_the_comma_form() {
+        let warn = whitespace_path_warning("a.rs b.rs c.rs").expect("warn on a space-joined list");
+        assert!(
+            warn.contains("comma-separated"),
+            "names the separator: {warn}"
+        );
+        assert!(
+            warn.contains("a.rs,b.rs,c.rs"),
+            "hands over the re-run: {warn}"
+        );
+        assert!(
+            warn.contains("match nothing"),
+            "says the consequence: {warn}"
+        );
+
+        assert!(
+            whitespace_path_warning("src/*.rs,src/**/*.rs").is_none(),
+            "a properly separated list is silent"
+        );
+        assert!(
+            whitespace_path_warning("docs/decisions/**").is_none(),
+            "an ordinary glob is silent"
+        );
+        // A trailing space is the same mistake, and the suggestion drops it.
+        let trailing = whitespace_path_warning("a.rs ").expect("warn on a trailing space");
+        assert!(
+            trailing.contains("with `a.rs`"),
+            "the re-run is one clean path: {trailing}"
         );
     }
 

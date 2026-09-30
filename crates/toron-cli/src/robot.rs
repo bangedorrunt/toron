@@ -697,7 +697,7 @@ pub async fn run_reserve(mailbox: &Mailbox, cmd: &ReserveCommand) -> anyhow::Res
         ReserveCommand::Acquire(args) => {
             warn_if_unregistered(mailbox, &args.project, &args.agent).await;
             // bd-v354: loud zero-file-match warning (stderr, warning only).
-            warn_zero_file_matches(&args.paths);
+            warn_acquire_paths(&args.paths);
             emit(
                 mailbox
                     .file_reservation_paths(
@@ -832,6 +832,18 @@ fn parse_release_decision(s: &str) -> anyhow::Result<ReleaseDecision> {
 /// repo (warning only — the lease is still granted, fail-closed unchanged).
 /// Stderr so the parity JSON on stdout stays parseable. Silent when the
 /// file list cannot be built (non-repo cwd) — never blocks an acquire.
+/// Pre-flight warnings for an acquire's `--paths`, both stderr-only so the
+/// lease behaviour is unchanged: a list that used the wrong separator (which
+/// silently becomes one useless glob), and a glob that matches no file.
+fn warn_acquire_paths(paths: &[String]) {
+    for p in paths {
+        if let Some(w) = toron_core::mailbox::guard::whitespace_path_warning(p) {
+            eprintln!("{w}");
+        }
+    }
+    warn_zero_file_matches(paths);
+}
+
 fn warn_zero_file_matches(paths: &[String]) {
     let files = repo_relative_files();
     if files.is_empty() {
@@ -894,7 +906,7 @@ pub async fn run_reserve_daemon(dc: &DaemonClient, cmd: &ReserveCommand) -> anyh
             }
             // bd-v354: client-side zero-file-match warning (cwd is the repo;
             // the daemon never sees it). Stderr, warning only.
-            warn_zero_file_matches(&args.paths);
+            warn_acquire_paths(&args.paths);
             daemon_tool(
                 dc,
                 "file_reservation_paths",

@@ -80,7 +80,7 @@ fn run(cli: &Cli) -> anyhow::Result<ExitCode> {
             ExitCode::SUCCESS
         }
         Command::Daemon(args) => {
-            daemon::run_dispatch(args)?;
+            daemon::run_dispatch(args, format)?;
             ExitCode::SUCCESS
         }
         Command::Doctor(args) => operator::run_doctor(&cfg, args, format)?,

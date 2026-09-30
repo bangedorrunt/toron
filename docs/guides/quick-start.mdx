@@ -26,6 +26,7 @@ $ toron doctor
 toron doctor
   ok   herdr — herdr socket reachable at /Users/you/.config/herdr/herdr.sock
   ok   git — git version 2.55.0
+  ok   daemon_build — build — /path/to/toron (booted 2026-09-30T11:41:39+00:00, from a build written 2026-09-30T11:41:09+00:00)
   ok   legacy_slug_identities — 6 leftover legacy registration(s): ...
 ```
 
@@ -45,6 +46,15 @@ first. `FAIL resonate` is not toron's problem to fix: the check reads the
 resolved server's `/health` (over TLS when the server is https) and refuses to
 invent a green (GS-037) instead of degrading silently. `doctor --check` exits 3
 when any check failed, so a wrapper can gate on the exit code alone.
+
+`FAIL daemon_build` is the one red you can cause yourself, and it is the only
+check that knows what the daemon is *running*. A process keeps executing the
+file it was exec'd from, so a rebuild under a live daemon leaves it serving the
+previous build: the check compares the artifact the daemon booted from against
+the file on disk now, by identity (inode and size) rather than by timestamp, so
+a `touch` deliberately does not trip it while a rebuild does. `toron daemon
+status --json` prints the same facts as data (`build.verdict`,
+`build.restart_required`, both times); `toron daemon restart` clears it.
 
 `daemon install` writes the launchd/systemd unit and a 0600 passphrase file, so the secret never lands in a plist or process env. The env var is `TORON_KEY_PASSPHRASE` (never `TORON_OPERATOR_PASSPHRASE`); resolution order is env, `TORON_KEY_PASSPHRASE_FILE`, `~/.config/toron/passphrase`, then the `toron` dev default.
 

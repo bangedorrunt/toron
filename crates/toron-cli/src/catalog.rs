@@ -122,6 +122,110 @@ mod tests {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/catalog/toron-mcp.json")
     }
 
+    /// AGENTS.md is the first thing every agent reads, so its tool counts are
+    /// part of the surface — and prose does not regenerate when the catalog
+    /// does. Three drifts shipped through green CI before this existed: a stale
+    /// total (40 for 41), a stale additive count, and a count that said three
+    /// while naming two tools. Ground truth is the constants, never the prose.
+    ///
+    /// Scoped to AGENTS.md on purpose: ADRs carry DATED historical counts
+    /// ("Live 2026-09-04: 40") which were true when written, and a gate that
+    /// reddened on recorded history would be switched off within a week.
+    #[test]
+    fn agents_doc_counts_match_the_catalog() {
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let agents = std::fs::read_to_string(repo.join("AGENTS.md")).expect("AGENTS.md");
+        let parity = toron_mcp::catalog::PARITY_TOOL_COUNT;
+        let additive = toron_mcp::catalog::ADDITIVE_TOOLS;
+        let total = parity + additive.len();
+
+        // Every "38 AM-Rust parity + N toron additive" claim in the file.
+        let mut claims = 0usize;
+        for (idx, _) in agents.match_indices("AM-Rust parity + ") {
+            let rest = &agents[idx + "AM-Rust parity + ".len()..];
+            let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+            let n: usize = digits
+                .parse()
+                .unwrap_or_else(|_| panic!("unparsable additive count after `AM-Rust parity + `"));
+            assert_eq!(
+                n,
+                additive.len(),
+                "AGENTS.md claims {n} additive tools; catalog::ADDITIVE_TOOLS has {}",
+                additive.len()
+            );
+            claims += 1;
+        }
+        assert!(
+            claims >= 2,
+            "expected the header and CONVENTIONS to state the count (found {claims})"
+        );
+
+        // Every total: "N MCP tools" / "N tool names". A phrase whose run of
+        // digits is empty ("no new MCP tools") is not a claim.
+        for marker in [" MCP tools", " tool names"] {
+            for (idx, _) in agents.match_indices(marker) {
+                let digits: String = agents[..idx]
+                    .chars()
+                    .rev()
+                    .take_while(char::is_ascii_digit)
+                    .collect();
+                if digits.is_empty() {
+                    continue;
+                }
+                let n: usize = digits
+                    .chars()
+                    .rev()
+                    .collect::<String>()
+                    .parse()
+                    .expect("digits");
+                assert_eq!(
+                    n,
+                    total,
+                    "AGENTS.md says {n}{marker}; the catalog serves {total} ({parity} parity + {})",
+                    additive.len()
+                );
+            }
+        }
+
+        // The header must NAME every additive tool: a count that says three
+        // while listing two is the drift that started this.
+        let after = agents
+            .split("toron additive:")
+            .nth(1)
+            .expect("the header names the additive tools");
+        let listed: std::collections::BTreeSet<&str> = after
+            .split(')')
+            .next()
+            .unwrap_or("")
+            .split('`')
+            .skip(1)
+            .step_by(2)
+            .collect();
+        let expected: std::collections::BTreeSet<&str> = additive.iter().copied().collect();
+        assert_eq!(
+            listed, expected,
+            "AGENTS.md's additive list and catalog::ADDITIVE_TOOLS disagree"
+        );
+    }
+
+    /// README is the stranger-facing doc, and it advertised a dead env var
+    /// (`TORON_OPERATOR_NSEC`) as the operator-key override for months while the
+    /// only variable anything reads is `TORON_OPERATOR_KEY`. ADRs may quote the
+    /// rejected name as history; the README may not offer it as an option.
+    #[test]
+    fn readme_offers_only_the_live_operator_key_env() {
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let readme = std::fs::read_to_string(repo.join("README.md")).expect("README.md");
+        assert!(
+            readme.contains("TORON_OPERATOR_KEY"),
+            "README must name the variable the code actually reads"
+        );
+        assert!(
+            !readme.contains("TORON_OPERATOR_NSEC"),
+            "README advertises a dead env var — the only override is TORON_OPERATOR_KEY"
+        );
+    }
+
     /// ADR-0002 D3 freshness gate: regenerating the committed catalog with
     /// the committed timestamp must reproduce it byte-for-byte. RED when a
     /// surface change (tool/arg/schema/resource/CLI command) lands without a

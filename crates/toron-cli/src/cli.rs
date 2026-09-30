@@ -392,7 +392,7 @@ pub enum DaemonCommand {
 pub struct DaemonArgs {
     /// MCP-over-HTTP listen address for the daemon (defaults to the
     /// flywheel `[mail.toron]` address).
-    #[arg(long, default_value = "127.0.0.1:18080")]
+    #[arg(long, default_value = crate::daemon::DEFAULT_ADDR)]
     pub addr: String,
 
     /// launchd/systemd unit label.

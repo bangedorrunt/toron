@@ -17,11 +17,17 @@
 //! `~/.config/toron/passphrase` (0600) and the unit sets
 //! `TORON_KEY_PASSPHRASE_FILE` instead of `TORON_KEY_PASSPHRASE`.
 
+use crate::output::OutputFormat;
 use crate::platform::DaemonState;
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
+use toron_core::serve_build::{self, BuildVerdict};
+
+/// The daemon's default MCP-over-HTTP address. One constant because `doctor`
+/// probes the same address the daemon binds (a second literal drifts).
+pub const DEFAULT_ADDR: &str = "127.0.0.1:18080";
 
 /// Default state dir: `$XDG_STATE_HOME/toron` else `~/.local/state/toron`.
 ///
@@ -236,23 +242,203 @@ pub fn stop(args: &super::cli::DaemonArgs) -> anyhow::Result<()> {
     crate::platform::stop_supervised(args, &pidfile)
 }
 
-/// `status`: print the detection result.
-pub fn status(args: &super::cli::DaemonArgs) -> anyhow::Result<()> {
+/// Where a booting `toron serve` leaves the record of what it runs: beside
+/// `serve.pid` in the mailbox data root. Single source for the writer's
+/// sibling reads (`daemon status`, `doctor`).
+pub fn build_record_path() -> PathBuf {
+    toron_core::config::ToronPaths::resolve()
+        .root
+        .join(serve_build::SERVE_BUILD_FILE)
+}
+
+/// Unix seconds as RFC3339 UTC. The record stores seconds, so both `daemon
+/// status` and `doctor` must render the same instant the same way.
+pub fn ts(unix: i64) -> String {
+    chrono::DateTime::from_timestamp(unix, 0)
+        .map(|t| t.to_rfc3339())
+        .unwrap_or_else(|| format!("unix:{unix}"))
+}
+
+/// `?` for an unknown pid (matches the existing daemon wording).
+fn disp(pid: Option<u32>) -> String {
+    pid.map(|p| p.to_string()).unwrap_or_else(|| "?".into())
+}
+
+fn verdict_word(v: BuildVerdict) -> &'static str {
+    match v {
+        BuildVerdict::Current => "current",
+        BuildVerdict::Replaced => "replaced",
+        BuildVerdict::NotServing => "not_serving",
+    }
+}
+
+/// One line naming the served build and, only when it is the problem, the
+/// remedy. Both times appear in the replaced case so the reader can see the
+/// gap rather than take "stale" on faith.
+pub(crate) fn build_detail(
+    snap: &serve_build::BuildSnapshot,
+    verdict: BuildVerdict,
+    serving_pid: Option<u32>,
+    on_disk_built_at: Option<i64>,
+) -> String {
+    // Times in the boot line are as the daemon saw them at boot; the replaced
+    // case additionally names what is on disk NOW, because "booted from a build
+    // written 20:29" reads as reassuring until you see the file is from 21:13.
+    match verdict {
+        BuildVerdict::Current => format!(
+            "build — {} (booted {}, from a build written {})",
+            snap.binary.display(),
+            ts(snap.started_at_unix),
+            ts(snap.built_at_unix)
+        ),
+        BuildVerdict::Replaced => format!(
+            "build — REPLACED: the daemon (pid {}, booted {}) is running a build written \
+             {}; the file on disk is a build written {} — so the daemon is not running \
+             the build you built; `toron daemon restart`",
+            snap.pid,
+            ts(snap.started_at_unix),
+            ts(snap.built_at_unix),
+            on_disk_built_at
+                .map(ts)
+                .unwrap_or_else(|| "at an unknown time".to_string())
+        ),
+        BuildVerdict::NotServing => format!(
+            "build — record is from pid {} (booted {}, from a build written {}); the \
+             address is held by {} now, so it describes an earlier boot",
+            snap.pid,
+            ts(snap.started_at_unix),
+            ts(snap.built_at_unix),
+            disp(serving_pid)
+        ),
+    }
+}
+
+/// The build half of a status report, as data. `--json` renders these same
+/// facts, never a second query.
+#[derive(Debug, serde::Serialize)]
+struct BuildFacts {
+    binary: Option<String>,
+    started_at: Option<String>,
+    binary_built_at: Option<String>,
+    verdict: Option<&'static str>,
+    restart_required: bool,
+    detail: Option<String>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct StatusReport {
+    label: String,
+    addr: String,
+    state: &'static str,
+    source: &'static str,
+    pid: Option<u32>,
+    build: BuildFacts,
+    /// The human first line, so `--json` and the human path cannot disagree.
+    #[serde(skip)]
+    headline: String,
+}
+
+fn status_report(args: &super::cli::DaemonArgs) -> StatusReport {
     let state = args.state_dir.clone().unwrap_or_else(default_state_dir);
     let pidfile = state.join("toron.pid");
-    match detect_state(&args.label, &pidfile, &args.addr) {
-        DaemonState::RunningLaunchd => println!("running (launchd {})", args.label),
-        DaemonState::RunningSystemd => println!("running (systemd {})", args.label),
-        DaemonState::RunningPidfile(pid) => println!("running (pidfile {pid})"),
-        DaemonState::RunningUnmanaged => {
-            let pid = port_holder_pid(&args.addr);
-            println!(
-                "running (unmanaged instance on {}, pid {})",
-                args.addr,
-                pid.map(|p| p.to_string()).unwrap_or_else(|| "?".into())
+    let (state_word, source, detected_pid, headline) =
+        match detect_state(&args.label, &pidfile, &args.addr) {
+            DaemonState::RunningLaunchd => (
+                "running",
+                "launchd",
+                None,
+                format!("running (launchd {})", args.label),
+            ),
+            DaemonState::RunningSystemd => (
+                "running",
+                "systemd",
+                None,
+                format!("running (systemd {})", args.label),
+            ),
+            DaemonState::RunningPidfile(pid) => (
+                "running",
+                "pidfile",
+                Some(pid),
+                format!("running (pidfile {pid})"),
+            ),
+            DaemonState::RunningUnmanaged => {
+                let pid = port_holder_pid(&args.addr);
+                (
+                    "running",
+                    "unmanaged",
+                    pid,
+                    format!(
+                        "running (unmanaged instance on {}, pid {})",
+                        args.addr,
+                        disp(pid)
+                    ),
+                )
+            }
+            DaemonState::Stopped => ("stopped", "none", None, "stopped".to_string()),
+        };
+
+    // Whoever holds the address is the only process a record can describe.
+    let serving_pid = if state_word == "running" {
+        detected_pid.or_else(|| port_holder_pid(&args.addr))
+    } else {
+        None
+    };
+
+    let build = match serve_build::read(&build_record_path()) {
+        Some(snap) => {
+            let verdict = serve_build::build_verdict(
+                &snap,
+                serving_pid,
+                serve_build::artifact_id(&snap.binary),
             );
+            BuildFacts {
+                binary: Some(snap.binary.display().to_string()),
+                started_at: Some(ts(snap.started_at_unix)),
+                binary_built_at: Some(ts(snap.built_at_unix)),
+                verdict: Some(verdict_word(verdict)),
+                restart_required: verdict.is_replaced(),
+                detail: Some(build_detail(
+                    &snap,
+                    verdict,
+                    serving_pid,
+                    serve_build::artifact_mtime_unix(&snap.binary),
+                )),
+            }
         }
-        DaemonState::Stopped => println!("stopped"),
+        None => BuildFacts {
+            binary: None,
+            started_at: None,
+            binary_built_at: None,
+            verdict: None,
+            restart_required: false,
+            detail: None,
+        },
+    };
+
+    StatusReport {
+        label: args.label.clone(),
+        addr: args.addr.clone(),
+        state: state_word,
+        source,
+        pid: serving_pid,
+        build,
+        headline,
+    }
+}
+
+/// `status`: print the detection result AND the build the daemon is serving.
+pub fn status(args: &super::cli::DaemonArgs, format: OutputFormat) -> anyhow::Result<()> {
+    let report = status_report(args);
+    match format {
+        OutputFormat::Json | OutputFormat::Plain => {
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        OutputFormat::Human => {
+            println!("{}", report.headline);
+            if let Some(detail) = &report.build.detail {
+                println!("  {detail}");
+            }
+        }
     }
     Ok(())
 }
@@ -291,10 +477,10 @@ pub fn restart(args: &super::cli::DaemonArgs) -> anyhow::Result<()> {
 }
 
 /// Dispatch a `toron daemon` subcommand.
-pub fn run_dispatch(args: &super::cli::DaemonArgs) -> anyhow::Result<()> {
+pub fn run_dispatch(args: &super::cli::DaemonArgs, format: OutputFormat) -> anyhow::Result<()> {
     use super::cli::DaemonCommand;
     match &args.cmd {
-        DaemonCommand::Status => status(args),
+        DaemonCommand::Status => status(args, format),
         DaemonCommand::Start => start(args),
         DaemonCommand::Restart => restart(args),
         DaemonCommand::Stop => stop(args),
@@ -329,6 +515,75 @@ mod tests {
         assert!(
             !addr_alive(&addr.to_string()),
             "dropped listener port is not alive"
+        );
+    }
+
+    /// Both readers render the same second the same way, or a `doctor` line
+    /// and a `status` line describe different moments.
+    #[test]
+    fn ts_renders_unix_seconds_as_rfc3339_utc() {
+        assert_eq!(ts(0), "1970-01-01T00:00:00+00:00");
+        assert_eq!(ts(86_400), "1970-01-02T00:00:00+00:00");
+        assert!(
+            ts(i64::MAX).starts_with("unix:"),
+            "seconds that cannot be rendered are named, never guessed"
+        );
+    }
+
+    /// The remedy appears ONLY for the case that has one. Telling a healthy
+    /// daemon to restart trains the reader to ignore the line, and the replaced
+    /// case must carry both times so the gap is visible rather than asserted.
+    #[test]
+    fn build_detail_names_the_remedy_only_when_the_build_was_replaced() {
+        let snap = serve_build::BuildSnapshot {
+            pid: 73527,
+            binary: PathBuf::from("/tmp/toron"),
+            started_at_unix: 1_790_766_773,
+            built_at_unix: 1_790_766_298,
+            ino: 42,
+            size: 1_048_576,
+        };
+
+        let current = build_detail(
+            &snap,
+            BuildVerdict::Current,
+            Some(73527),
+            Some(snap.built_at_unix),
+        );
+        assert!(!current.contains("REPLACED"));
+        assert!(
+            !current.contains("restart"),
+            "a healthy daemon is offered no remedy: {current}"
+        );
+
+        // The replaced line must carry BOTH the build the daemon booted from and
+        // the build now on disk: the first alone reads as fine.
+        let rebuilt_at = snap.built_at_unix + 300;
+        let replaced = build_detail(&snap, BuildVerdict::Replaced, Some(73527), Some(rebuilt_at));
+        assert!(replaced.contains("REPLACED"));
+        assert!(replaced.contains("toron daemon restart"));
+        assert!(
+            replaced.contains(&ts(snap.started_at_unix)),
+            "the boot time: {replaced}"
+        );
+        assert!(
+            replaced.contains(&ts(snap.built_at_unix)),
+            "the artifact it booted from: {replaced}"
+        );
+        assert!(
+            replaced.contains(&ts(rebuilt_at)),
+            "and the one on disk now, which is the point: {replaced}"
+        );
+
+        // An unreadable artifact time is named as unknown, never rendered as a
+        // wrong instant.
+        let unknown = build_detail(&snap, BuildVerdict::Replaced, Some(73527), None);
+        assert!(unknown.contains("unknown"), "{unknown}");
+
+        let not_serving = build_detail(&snap, BuildVerdict::NotServing, Some(999), None);
+        assert!(
+            not_serving.contains("999") && !not_serving.contains("restart"),
+            "an earlier boot is not a stale build: {not_serving}"
         );
     }
 

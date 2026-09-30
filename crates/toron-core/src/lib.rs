@@ -13,6 +13,7 @@ pub mod keys;
 pub mod mailbox;
 pub mod nostr;
 pub mod policy;
+pub mod serve_build;
 pub mod testkit;
 
 /// Client/relay pool. rust-nostr 0.45 no longer nests protocol types under

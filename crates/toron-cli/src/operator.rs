@@ -220,6 +220,43 @@ fn check_name_collisions(cfg: &Config) -> CheckResult {
     }
 }
 
+/// The daemon can be live and still not be the build on disk — a process keeps
+/// executing the file it was exec'd from after a rebuild replaces that file.
+/// That cost a full debug cycle on 2026-09-30: an hour-stale daemon rewrote the
+/// operator key on every boot while every other check read green, and nothing
+/// on the machine said which build was serving.
+///
+/// FAILS rather than advising: a daemon serving a build you did not build is a
+/// real inconsistency, and the remedy is one command. A record that names an
+/// EARLIER boot (nothing serving now, or another process holds the address) is
+/// not stale — it is just not judgeable, and is reported as ok.
+fn check_daemon_build() -> CheckResult {
+    let name = "daemon_build";
+    let Some(snap) = toron_core::serve_build::read(&crate::daemon::build_record_path()) else {
+        return CheckResult {
+            name,
+            ok: true,
+            detail: "no boot record — no toron serve has booted against this data root".into(),
+        };
+    };
+    let serving = crate::daemon::port_holder_pid(crate::daemon::DEFAULT_ADDR);
+    let verdict = toron_core::serve_build::build_verdict(
+        &snap,
+        serving,
+        toron_core::serve_build::artifact_id(&snap.binary),
+    );
+    CheckResult {
+        name,
+        ok: !verdict.is_replaced(),
+        detail: crate::daemon::build_detail(
+            &snap,
+            verdict,
+            serving,
+            toron_core::serve_build::artifact_mtime_unix(&snap.binary),
+        ),
+    }
+}
+
 fn check_herdr() -> CheckResult {
     let path = toron_core::backend::herdr::default_socket_path();
     match toron_core::backend::herdr::HerdrBackend::connect(None) {
@@ -526,6 +563,7 @@ pub fn run_doctor(
         check_herdr(),
         check_git(),
         check_keys(cfg),
+        check_daemon_build(),
         check_resonate(),
         check_legacy_slug_identities(cfg),
         check_name_collisions(cfg),
