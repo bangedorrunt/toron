@@ -54,7 +54,7 @@ Child maps: [toron-core](crates/toron-core/AGENTS.md) ·
 | Cron (distinct type) | `crates/toron-workflow/src/cron.rs` |
 | MCP tools | `crates/toron-mcp/src/tools/` |
 | Catalog surface | `crates/toron-mcp/src/catalog.rs` + `crates/toron-cli/src/catalog.rs` (`docs/catalog/`) |
-| TUI / operator console | `crates/toron-cli/src/tui/` — `model.rs`/`msg.rs`/`update.rs`/`keymap.rs` are the pure Elm core (ADR-0031 §7: `tick(&Model, Msg) -> (Model, Vec<Effect>)` is the only reducer); `host.rs` is the effect edge (live mailbox + fake); `view/` holds the tab renders; `tests.rs` holds determinism + interpreter proofs. `toron tui` reads the same one store the plane commands read (`plane_project`/`plane_agent` env ladders, bd-d41q refusal on a remote daemon) |
+| TUI / operator console | `crates/toron-cli/src/tui/` — `model.rs`/`msg.rs`/`update.rs`/`keymap.rs` are the pure Elm core (`tick(&Model, Msg) -> (Model, Vec<Effect>)` is the only reducer); `host.rs` is the effect edge (live mailbox + fake); `view/` holds the tab renders; `tests.rs` holds determinism + interpreter proofs. `toron tui` reads the same one store the plane commands read (`plane_project`/`plane_agent` env ladders, refusal on a remote daemon) |
 | CLI / daemon | `crates/toron-cli/src/{cli,daemon,main}.rs` (`agent bootstrap`: register/upsert + reserve in one call; `agent prune`: absorb the folded-slug leftovers `doctor` names) |
 | Daemon build identity | `crates/toron-core/src/serve_build.rs` (boot record + pure `build_verdict`) written by `crates/toron-mcp/src/serve_lock.rs`. A daemon keeps executing the file it was exec'd from after a rebuild replaces it, so `toron daemon status --json` names the served build and `doctor`'s **`daemon_build`** check FAILS (exit 3) when the daemon is not the build on disk. Identity is `(inode, size)` — a `touch` does NOT read as stale, a rebuild does. Measured 2026-09-30: an hour-stale daemon rewrote the operator key every boot while every other check was green |
 | ADRs | `docs/decisions/` |
@@ -105,8 +105,8 @@ Child maps: [toron-core](crates/toron-core/AGENTS.md) ·
 - TDD for new features and bug fixes. No benches in this repo.
 - Beads: bare `br` is the TUI (ratatui, since 2026-08-24) — humans run `br`, agents run `br --robot-*` with `--format json|toon` (never bare `br` in automation); `bv` is deprecated.
 - TUI theme (hacker-night, tui-design skill): single source is `toron-cli/src/theme.rs` (`HackerNight`); widget code uses semantic slots only, never hex/ANSI. `toron tui` lives in `crates/toron-cli/src/tui/`. Skill §-level layout/interaction rules live in the tui-design skill; sibling palettes mirror in `flywheel/src/output.rs` and `beads/src/tui/theme.rs`.
-- TUI is an Elm core (ADR-0031 §7): keys → `Msg` in `tui/keymap.rs`, one reducer `tui::update::tick`, effects as data (`tui::msg::Effect`) run by `tui/mod.rs` with a bounded wait, results fed back as `Msg`. No I/O in the fold, and `update.rs` owns the refresh cadence (`SLOW_CADENCE` for bus replays; a tick with effects in flight dispatches nothing). Offline/online wording comes from the presence projection, never a second store.
-- **Agent pins are CamelCase Adjective+Noun, and it is enforced.** `IvoryRidge`, `EmberOtter`, `TealMarlin` — exactly two capitalised words, letters only, no two capitals in a row. `toron agent bootstrap` REFUSES any other shape (`nostr::identity::validate_agent_pin`, bd-pinrule). **This is a namespace, not a label:** identity is per-PROJECT, so one agent holds a *different key* in every project it is registered in, and a name two agents can pick independently WILL collide. Measured 2026-09-28: `Buffy` is registered in two projects and `whois` returns two different npubs, so mail sent to that name from one project is encrypted to a key the recipient never reads while the send reports `ok` — not lost, INVISIBLE (bd-xroute). Project slugs are a *different* vocabulary and stay kebab-case; the validator refuses to claim otherwise, because a naming rule that reads as obviously wrong gets ignored. **This is a known defect with a proposed fix, not a permanent rule:** [ADR-0037](docs/decisions/0037-one-key-per-pin-project-scoped-visibility.md) moves project scope off the KEY and onto the message, making one pin one key everywhere. Until it is accepted and migrated, **address by npub** (`toron mail whois <project> <pin>`) — a bare name is only safe inside one project. Note `fetch_inbox` already filters gift wraps by pubkey alone (`messaging.rs:730-735`), so the read side needs no change and the fix is entirely registration-side.
+- TUI is an Elm core: keys → `Msg` in `tui/keymap.rs`, one reducer `tui::update::tick`, effects as data (`tui::msg::Effect`) run by `tui/mod.rs` with a bounded wait, results fed back as `Msg`. No I/O in the fold, and `update.rs` owns the refresh cadence (`SLOW_CADENCE` for bus replays; a tick with effects in flight dispatches nothing). Offline/online wording comes from the presence projection, never a second store.
+- **Agent pins are CamelCase Adjective+Noun, and it is enforced.** `IvoryRidge`, `EmberOtter`, `TealMarlin` — exactly two capitalised words, letters only, no two capitals in a row. `toron agent bootstrap` REFUSES any other shape (`nostr::identity::validate_agent_pin`). **This is a namespace, not a label:** identity is per-PROJECT, so one agent holds a *different key* in every project it is registered in, and a name two agents can pick independently WILL collide. Measured 2026-09-28: `Buffy` is registered in two projects and `whois` returns two different npubs, so mail sent to that name from one project is encrypted to a key the recipient never reads while the send reports `ok` — not lost, INVISIBLE. Project slugs are a *different* vocabulary and stay kebab-case; the validator refuses to claim otherwise, because a naming rule that reads as obviously wrong gets ignored. **This is a known defect with a proposed fix, not a permanent rule:** [the project-scoped-visibility proposal](docs/decisions/0037-one-key-per-pin-project-scoped-visibility.md) moves project scope off the KEY and onto the message, making one pin one key everywhere. Until it is accepted and migrated, **address by npub** (`toron mail whois <project> <pin>`) — a bare name is only safe inside one project. Note `fetch_inbox` already filters gift wraps by pubkey alone (`messaging.rs:730-735`), so the read side needs no change and the fix is entirely registration-side.
 - Engineering principles: `flywheel principles list`. Cite the name that changed the decision. Full leaves: `flywheel principles show <name>`.
 - Wave-2 playbook lints: `crates/toron-workflow/src/playbook_lint.rs` — feature requires `data_shape` input, bug-fix requires `repro` predecessor, prototype/arena require `n>=2` + mode rules (`build_slot: true` for compile, no repo build paths for sketch), forensics is read-only, `principles:` names validate against the 21-name registry. Entrypoints: `lint_workflow_with_principles(wf, &[&str])` (embedding passes the registry), `lint_workflow(wf)` (in-crate default).
 - `std::env::set_var` only in integration tests that omit `forbid(unsafe_code)`.
@@ -125,20 +125,20 @@ A change is unfinished until:
 - A live effect is journaled before the provider runs. `Recording` is only for a dry arm. A live effect with no runner refuses.
 - Retry wraps one idempotent effect. Fallback stays outside the retry. The breaker stays inside the retry. The attempt timeout wraps only the call.
 
-These five effect-law defects were filed against ADR-0035's acceptance and are
+These five effect-law defects were filed against the effect-law ADR's acceptance and are
 **all closed, each pinned by a witness test**. Treat them as settled behaviour,
 not as a to-do list: a change that touches one must not regress it, and the
 named witness is what fails if it does. (This section used to restate them as
 open — which sends the next agent to re-fix closed work, and hides the fifth
 item entirely. Do not write a defect list without its bead and its witness.)
 
-- `dispatch_core` `Release` — **CLOSED** (bd-de4k). A release with no held permit emits `DispatchEffect::ReleaseIgnored` and moves no counter, so `used == sum(in_flight)`. Witness: `double_release_ignored_preserves_sum`.
-- A receipt prune is a tombstone — **CLOSED** (bd-aku0). `upsert` refuses resurrection through `is_tombstoned`, the monotonic guard is re-checked inside the write transaction, and the tombstone probe reads ONE corr's history on the `events_corr` index (migration 0014) instead of the whole log.
-- `ask_judgment` journals before the call — **CLOSED** (bd-pgvf). A `Prepared` claim row commits before the spawn, and the `JudgeModel` is host-owned (`Mailbox::judge_model()`), so a fresh model per wake can no longer bypass the in-flight guard.
-- `send_armor` half-open admits one probe — **CLOSED** (bd-mbck). The permit is taken atomically in `call`, fast-refused in `poll_ready`, released by `ProbeGuard` when a probe is cancelled, and the clock is injected.
-- `Degraded` has a producing message — **CLOSED** (bd-5mxm). `receipts_core::ReceiptsMsg::MarkDegraded` creates the row when bookkeeping never ran, driven from `messaging.rs`.
+- `dispatch_core` `Release` — **CLOSED**. A release with no held permit emits `DispatchEffect::ReleaseIgnored` and moves no counter, so `used == sum(in_flight)`. Witness: `double_release_ignored_preserves_sum`.
+- A receipt prune is a tombstone — **CLOSED**. `upsert` refuses resurrection through `is_tombstoned`, the monotonic guard is re-checked inside the write transaction, and the tombstone probe reads ONE corr's history on the `events_corr` index (migration 0014) instead of the whole log.
+- `ask_judgment` journals before the call — **CLOSED**. A `Prepared` claim row commits before the spawn, and the `JudgeModel` is host-owned (`Mailbox::judge_model()`), so a fresh model per wake can no longer bypass the in-flight guard.
+- `send_armor` half-open admits one probe — **CLOSED**. The permit is taken atomically in `call`, fast-refused in `poll_ready`, released by `ProbeGuard` when a probe is cancelled, and the clock is injected.
+- `Degraded` has a producing message — **CLOSED**. `receipts_core::ReceiptsMsg::MarkDegraded` creates the row when bookkeeping never ran, driven from `messaging.rs`.
 
-Provenance and per-defect evidence: ADR-0035's acceptance record.
+Provenance and per-defect evidence: the effect-law ADR's acceptance record.
 
 ## Skill Sync Contract
 
@@ -198,7 +198,7 @@ Release profile: `strip = "none"` (macOS arm64 LINKEDIT / sqlx_macros).
 - Daemon label `com.toron.serve`, HTTP `127.0.0.1:18080`. Passphrase file
   `~/.config/toron/passphrase` (0600), never in plist/env flags.
   **Operator key is `~/.config/toron/operator_nsec` (0600), and that is the
-  ONE canonical path** (ADR-0038: `config::operator_key_path`, shared by the
+  ONE canonical path** (`config::operator_key_path`, shared by the
   daemon unit, the mailbox host fallback, `key generate --role operator`, and
   `doctor`); the unit's `TORON_OPERATOR_KEY` is an explicit pin of it. A key at
   the old data-root `operator/operator.ncryptsec` is a **different identity** —
