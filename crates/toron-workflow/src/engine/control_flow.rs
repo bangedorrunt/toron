@@ -1599,6 +1599,13 @@ pub(crate) const MAX_PARALLEL_FANOUT: usize = 32;
 /// ADR-0032 Spec 3 (I10): `over` MUST be a valid positive bounded count. A
 /// crew role (`@crew.r`) needs the orchestrator to concretize it before
 /// invoke; anything else FAILS LOUD — never coerces to 1.
+///
+/// Failure policy is **fail-after-collect** (bd-7n2a): every copy is a
+/// durable, journaled child, so aborting one on a sibling's failure would
+/// strand its effect row. All N copies run to settlement, THEN a single
+/// failure is reported as `{ok:false, error, results}` carrying every copy's
+/// output. A cancel-on-first-failure mode is deliberately NOT implemented;
+/// the siblings' settled outputs are evidence, not waste.
 // Threaded dispatch context (run identity for leaf invocations) exceeds the
 // default arity cap; see run_retry.
 #[allow(clippy::too_many_arguments)]
@@ -1653,6 +1660,9 @@ pub(crate) async fn run_parallel(
             .spawn()?;
         futures.push(future);
     }
+    // Drain every child before deciding (fail-after-collect): a copy is a
+    // journaled durable child, so a failure must not cancel its siblings —
+    // the `results` array below carries all of their settled outputs.
     let mut collected = Vec::new();
     for future in futures {
         collected.push(future.await?);

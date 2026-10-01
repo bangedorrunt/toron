@@ -189,6 +189,9 @@ const FOREACH: ActionContract = ActionContract {
     output: OutputKind::Array,
     supported: true,
 };
+/// Failure policy: **fail-after-collect** (bd-7n2a). Each copy is a durable
+/// journaled child, so a sibling's failure never cancels the others; the run
+/// reports `{ok:false, error, results}` only once all copies have settled.
 const PARALLEL: ActionContract = ActionContract {
     type_name: "parallel",
     class: ActionClass::DurableControl,

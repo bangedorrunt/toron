@@ -1396,6 +1396,83 @@ steps:
     assert_eq!(seen.lock().unwrap().len(), 3, "3 sub-runs executed");
 }
 
+/// bd-7n2a: the `parallel` failure policy is fail-after-collect. One copy
+/// failing must not cancel its siblings; the step reports `{ok:false, error,
+/// results}` only after all N copies have settled, and `results` holds one
+/// entry per copy. Pins the deliberate policy (each copy is a durable
+/// journaled child, so aborting one would strand its effect row) and would
+/// fail if a future cancel-on-first-failure shortened the fan-out.
+#[tokio::test]
+async fn parallel_partial_failure_settles_all_copies_then_reports() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex as StdMutex;
+    let seen: Arc<StdMutex<Vec<Action>>> = Arc::new(StdMutex::new(Vec::new()));
+    let seen_clone = seen.clone();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_clone = calls.clone();
+    let runner = lift_async(move |a: &Action| {
+        seen_clone.lock().unwrap().push(a.clone());
+        // Exactly one copy fails; the siblings succeed.
+        if calls_clone.fetch_add(1, Ordering::SeqCst) == 1 {
+            Ok(serde_json::json!({ "ok": false, "error": "boom" }))
+        } else {
+            Ok(serde_json::json!({ "worker": true }))
+        }
+    });
+    let engine =
+        WorkflowEngine::local_with_async_effect_runner(Some(runner.clone())).expect("engine");
+    let wf = parse_workflow(
+        r##"
+name: parallel-fail-wf
+trigger:
+  type: webhook
+steps:
+  - name: fan
+    action: parallel
+    over: "3"
+    each:
+      action: send_dm
+      to: pi
+      body: work
+"##,
+    )
+    .expect("parse parallel workflow");
+    let output = engine
+        .run(
+            "wf-parallel-fail-1",
+            RunInput {
+                run_id: None,
+                workflow: wf,
+                trigger: serde_json::json!({}),
+            },
+        )
+        .await
+        .expect("failure is a value, not an Err");
+
+    let fan = &output["fan"];
+    assert_eq!(
+        fan["ok"],
+        serde_json::json!(false),
+        "failure surfaced: {fan:?}"
+    );
+    assert_eq!(fan["error"], serde_json::json!("boom"));
+    let results = fan["results"].as_array().expect("results array");
+    assert_eq!(
+        results.len(),
+        3,
+        "fail-after-collect: every copy settled before the failure was reported"
+    );
+    assert_eq!(
+        results
+            .iter()
+            .filter(|r| crate::engine::is_failure_value(r))
+            .count(),
+        1,
+        "exactly the one failing copy: {results:?}"
+    );
+    assert_eq!(seen.lock().unwrap().len(), 3, "no sibling was cancelled");
+}
+
 /// ADR-0007 R4.1: `call_workflow` nests a durable child via WorkflowResolver.
 #[tokio::test]
 async fn call_workflow_nested_subrun_returns_child_output() {
