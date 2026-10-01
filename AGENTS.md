@@ -173,7 +173,7 @@ bash scripts/verify-gates.sh
 toron daemon status --json # which build the daemon is actually running (verdict, restart_required)
 mbx test --workspace
 mbx test catalog_freshness # catalog drift gate (toron.dev)
-toron catalog --json # emit 38-parity-tool catalog (40 served incl. additive) / 25-resource / CLI catalog
+toron catalog --json # emit 38-parity-tool catalog (41 served incl. additive) / 25-resource / CLI catalog
 mbx test -p toron-e2e --features p1 # SC-1..8
 mbx test -p toron-e2e --features p2 # needs resonate on PATH
 mbx test -p toron-e2e --features p4 # SC-18..25 (implies p5)
