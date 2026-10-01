@@ -1,6 +1,6 @@
 <!-- governed-by: ADR-0003, ADR-0032, ADR-0033 -->
 ---
-status: proposed
+status: accepted
 date: 2026-09-19
 decision-makers: Captain (bangedorrunt)
 consulted: effect-oriented skill (principles, rust.md, patterns.md); flywheel ADR-0015 §4; toron gaps audit (7 gaps)
@@ -9,7 +9,7 @@ informed: flywheel × toron maintainers
 
 # ADR-0034: Effect-oriented discipline for toron (companion to flywheel ADR-0015 §4)
 
-**Status:** Proposed (bead bd-lzo6, crew B). Acceptance is a captain word on this file.
+**Status:** Accepted 2026-09-19; all seven gaps (G1–G7) landed under bd-lzo6.
 
 **Decision in one sentence:** Land the seven audited toron effect gaps — typed
 mailbox edge, bounded archive git, atomic slot acquire, MCP error envelope,
@@ -80,9 +80,11 @@ tool names/counts (ADR-0033 owns that freeze), or the journal shape (ADR-0032).
 
 ### G5 — Shared `policy::{Timeout, RetryPolicy}` type
 
-- One `policy` module (core): `Timeout { each: Duration }`,
-  `RetryPolicy { max_attempts, base, factor, jitter, retry_if }` with
-  `retry_with_backoff(op)`; timeout-inside-retry ordering fixed once.
+- One `policy` module (core): `Timeout { deadline, poll }` (`new`,
+  `with_poll`), `RetryPolicy { max_attempts, base, factor, max_delay,
+  jitter, jitter_seed }` with pure `delay_for`/`should_retry` and the
+  `retry_sync`/`retry_async` drivers; timeout-inside-retry ordering fixed
+  once.
 - Migrate settle/dispatch/judgment-adjacent loops off hand-rolled
   `sleep`+`attempt` counters; new remote edges take `policy` as a value
   (injected, never ambient constants).
