@@ -658,6 +658,8 @@ impl UnwrapRebuildPolicy {
 }
 
 #[cfg(test)]
+mod newest_call_sites;
+#[cfg(test)]
 mod newest_tests {
     use super::NewestEvent;
     use crate::nostr::{EventBuilder, FinalizeEvent, Keys, Timestamp};

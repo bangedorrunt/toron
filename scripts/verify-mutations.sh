@@ -37,7 +37,8 @@
 #     reported a verdict about code that was not on disk. Every write and every
 #     restore touches the file.
 #   * It was killed mid-run and left a mutation applied to the tree. Restore
-#     runs from a signal trap and from a final trap.
+#     runs from a signal trap (INT/TERM/HUP) and from a final trap. HUP was
+#     missing until a `nohup ... &` run died with its mutation still applied.
 #
 # Bash 3.2 compatible: /bin/bash on a stock macOS box is 3.2 even where a newer
 # one is first on PATH, and no other script in this repo needs bash 4.
@@ -436,7 +437,11 @@ main() {
 
     load_spec "$spec"
 
-    trap on_signal INT TERM
+    # HUP too: `nohup verify-mutations.sh ... &` from a shell that then exits
+    # delivers SIGHUP, and nohup has already set it to SIG_IGN — so the INT/TERM
+    # trap never fired and a killed run left its mutation applied to the tree.
+    # Measured here: N3 was still in contacts.rs after the harness died.
+    trap on_signal INT TERM HUP
     snapshot_save
     trap on_signal EXIT
 
