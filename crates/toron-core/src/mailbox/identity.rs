@@ -16,6 +16,7 @@
 //! - Pane identity (G9): herdr backend via `agent.list` (pane_id ↔ agent name);
 //!   cleanup prunes identities whose panes are absent from `pane.list`.
 
+use super::NewestEvent;
 use std::path::PathBuf;
 
 use crate::nostr::{Keys, Timestamp};
@@ -1330,7 +1331,7 @@ impl Mailbox {
             let name = profiles
                 .iter()
                 .filter(|e| e.pubkey == npub && e.kind.as_u16() == AGENT_PROFILE)
-                .max_by_key(|e| e.created_at.as_secs())
+                .newest()
                 .and_then(|e| {
                     e.tags
                         .iter()
@@ -1395,7 +1396,7 @@ impl Mailbox {
         let profile_ev = profiles
             .iter()
             .filter(|e| e.pubkey == npub && e.kind.as_u16() == AGENT_PROFILE)
-            .max_by_key(|e| e.created_at.as_secs())
+            .newest()
             .ok_or_else(|| anyhow::anyhow!("profile event missing for {name}"))?;
         let profile = ident::parse_profile(profile_ev).unwrap_or_else(|| AgentProfile::new(&name));
         let last_active_ts_us = profile_ev.created_at.as_secs() as i64 * 1_000_000;

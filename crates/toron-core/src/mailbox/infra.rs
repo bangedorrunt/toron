@@ -11,6 +11,7 @@
 //! - `ensure_project` → idempotent project dir + kind-30010 manifest publish.
 //! - guard install/uninstall → libgit2 path; block foreign reserved paths.
 
+use super::NewestEvent;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -147,7 +148,7 @@ impl Mailbox {
     async fn find_manifest(&self, slug: &str) -> anyhow::Result<Option<crate::nostr::Event>> {
         let filter = kind_project_filter(toron_kind(PROJECT_MANIFEST), slug);
         let events = collect_replay(self.bus.as_ref(), filter).await?;
-        Ok(events.into_iter().max_by_key(|e| e.created_at.as_secs()))
+        Ok(events.iter().newest().cloned())
     }
 
     /// `install_precommit_guard`: install the toron pre-commit hook (libgit2

@@ -22,6 +22,36 @@ use crate::nostr::{Event, Keys};
 
 use crate::bus::{Bus, BusError, Filter, SubscriptionEvent};
 
+/// "Newest wins" terminator for a chain of borrowed events.
+///
+/// A Nostr timestamp is whole seconds, so two events for the same key can carry
+/// the same `created_at` — an agent renaming itself twice inside one second, or
+/// a policy flipped twice. `max_by_key` on the timestamp alone resolves that tie
+/// by iteration order, which is replay order: something the storage layer
+/// happened to yield, not a rule anyone wrote down, and two relays serving the
+/// same mailbox could then disagree about which event is current.
+///
+/// The event id breaks it. It is the sha256 of the serialized event, so it is
+/// unique per event and identical on every relay, which makes the choice
+/// deterministic without claiming more than it can: at equal timestamps there
+/// is no newer, and this does not pretend otherwise.
+///
+/// A trait rather than a free function so the four call sites keep reading as a
+/// chain and the reasoning lives here exactly once.
+pub(crate) trait NewestEvent<'a> {
+    /// The newest event, ties broken by event id. `None` for an empty chain.
+    fn newest(self) -> Option<&'a Event>;
+}
+
+impl<'a, I> NewestEvent<'a> for I
+where
+    I: IntoIterator<Item = &'a Event>,
+{
+    fn newest(self) -> Option<&'a Event> {
+        self.into_iter().max_by_key(|e| (e.created_at, e.id))
+    }
+}
+
 pub mod aliases;
 pub mod build_slots;
 pub mod contacts;
@@ -624,6 +654,92 @@ impl UnwrapRebuildPolicy {
     /// event's rebuild budget too.
     fn record_attempt(&mut self, _sig: String, now: std::time::Instant) {
         self.last_attempt_at = Some(now);
+    }
+}
+
+#[cfg(test)]
+mod newest_tests {
+    use super::NewestEvent;
+    use crate::nostr::{EventBuilder, FinalizeEvent, Keys, Timestamp};
+
+    /// Two events for one key can share a `created_at` — Nostr timestamps are
+    /// whole seconds — and picking between them by iteration order is picking by
+    /// whatever replay happened to yield. This asserts the choice is a property
+    /// of the events, not of the order they arrive in.
+    #[test]
+    fn newest_breaks_a_tie_by_event_id_not_by_position() {
+        let keys = Keys::generate();
+        let at = Timestamp::from_secs(1_700_000_000);
+        let event = |content: &str| {
+            EventBuilder::new(crate::nostr::Kind::Custom(30_023), content)
+                .custom_created_at(at)
+                .finalize(&keys)
+                .expect("sign")
+        };
+        let first = event("first");
+        let second = event("second");
+        assert_eq!(
+            first.created_at, second.created_at,
+            "precondition: a shared timestamp or this proves nothing"
+        );
+        assert_ne!(first.id, second.id, "precondition: distinct events");
+
+        let higher = if first.id > second.id {
+            &first
+        } else {
+            &second
+        };
+        // Both orders on purpose: "the last one wins" and "the higher id wins"
+        // agree on any fixture whose winner happens to come last.
+        for order in [[&first, &second], [&second, &first]] {
+            assert_eq!(
+                order.into_iter().newest().map(|e| e.id),
+                Some(higher.id),
+                "the higher event id wins a shared timestamp in either order"
+            );
+        }
+    }
+
+    /// A genuinely newer event still wins outright: the tiebreak is not a
+    /// reordering that overrides the timestamp.
+    ///
+    /// The fixture has to *guarantee* that the earlier event holds the higher
+    /// id, or this test is a coin flip — event ids are content hashes, so a
+    /// fixed pair of contents lands on either side of the comparison about half
+    /// the time, and an id-first key would then pass by luck. Searching for a
+    /// pair that does is the difference between a test and a lottery.
+    #[test]
+    fn newest_prefers_the_later_timestamp_over_any_id() {
+        let keys = Keys::generate();
+        let at = |secs: u64| Timestamp::from_secs(1_700_000_000 + secs);
+        let build = |content: &str, secs: u64| {
+            EventBuilder::new(crate::nostr::Kind::Custom(30_023), content)
+                .custom_created_at(at(secs))
+                .finalize(&keys)
+                .expect("sign")
+        };
+
+        let (early, late) = (0u64..64)
+            .map(|n| {
+                (
+                    build(&format!("early-{n}"), 0),
+                    build(&format!("late-{n}"), 1),
+                )
+            })
+            .find(|(e, l)| e.id > l.id)
+            .unwrap_or_else(|| panic!("no pair with the earlier event holding the higher id"));
+        assert_eq!(
+            [&early, &late].into_iter().newest().map(|e| e.id),
+            Some(late.id),
+            "the later timestamp wins even though the earlier event has the higher id"
+        );
+    }
+
+    /// An empty chain is `None`: no panic, and no fabricated event.
+    #[test]
+    fn newest_on_an_empty_chain_is_none() {
+        let empty: [&crate::nostr::Event; 0] = [];
+        assert_eq!(empty.into_iter().newest(), None);
     }
 }
 
