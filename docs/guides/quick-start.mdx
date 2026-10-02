@@ -44,7 +44,7 @@ configured" rather than as a bad key. `key generate` refuses to overwrite an
 existing key (exit 1, bytes untouched), so a re-run needs the old file moved
 first. `FAIL resonate` is not toron's problem to fix: the check reads the
 resolved server's `/health` (over TLS when the server is https) and refuses to
-invent a green (GS-037) instead of degrading silently. `doctor --check` exits 3
+invent a green instead of degrading silently. `doctor --check` exits 3
 when any check failed, so a wrapper can gate on the exit code alone.
 
 `FAIL daemon_build` is the one red you can cause yourself, and it is the only
@@ -97,13 +97,13 @@ substitute a pane slug or a captain-looking name for a taken pin.
 
 ```bash
 toron mail send --project <slug> --as <Pin> --to captain \
-  --subject "[bd-z2d0] starting" --body "claiming bd-z2d0" --thread bd-z2d0
+  --subject "[<bead-id>] starting" --body "claiming <bead-id>" --thread <bead-id>
 toron mail inbox --project <slug> --as <Pin> --since last
 ```
 
 ```text
 $ toron mail send --project toron --as QuietHarbor --to captain \
-    --subject "[bd-f5g1] starting" --thread bd-f5g1 --body "claiming bd-f5g1"
+    --subject "[<bead-id>] starting" --thread <bead-id> --body "claiming <bead-id>"
 {
   "count": 1,
   "deliveries": [

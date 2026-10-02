@@ -8,7 +8,7 @@ description: File leases (kind 30031), conflict semantics, transfers, the pre-co
 Reserve paths before editing. A reservation (kind 30031) has three states: `intent` (plan to edit, roughly a 5-minute TTL), `held` (the live lease; the default state of an acquisition), `released`.
 
 ```bash
-toron reserve acquire --project <slug> --as <Pin> --paths 'crates/x/src/**' --reason bd-z2d0
+toron reserve acquire --project <slug> --as <Pin> --paths 'crates/x/src/**' --reason <bead-id>
 toron reserve conflicts --project <slug> --as <Pin> --paths 'crates/x/src/**'
 toron reserve renew --project <slug> --as <Pin> --paths 'crates/x/src/**' --extend-secs 600
 toron reserve release --project <slug> --as <Pin>
@@ -16,7 +16,7 @@ toron reserve release --project <slug> --as <Pin>
 
 ```text
 $ toron reserve acquire --project toron --as QuietHarbor \
-    --paths 'docs/guides/*,docs/guides/**/*' --reason bd-f5g1
+    --paths 'docs/guides/*,docs/guides/**/*' --reason <bead-id>
 {
   "conflicts": [],
   "reservations": [
@@ -24,7 +24,7 @@ $ toron reserve acquire --project toron --as QuietHarbor \
       "expires_ts_us": 1798155045000000,
       "id": "fc70c49b609083f3ba043fb5060f445a022e6aaa6638104f1732a35f7128d08a",
       "path_pattern": "docs/guides/*",
-      "reason": "bd-f5g1" }
+      "reason": "<bead-id>" }
   ],
   "soft_conflicts": []
 }
@@ -57,7 +57,7 @@ Two board verbs close the loop when a bead closes or a lane needs to see holders
 # The active lease board the strict guard evaluates (holder, path, reason, expiry).
 toron reserve list --project <slug> [--holder <Pin>] [--path 'crates/x/src/**']
 # Release-on-bead-close: revoke every lease whose reason is the bead id.
-toron reserve release-by-reason bd-z2d0 --project <slug> --as <Pin>
+toron reserve release-by-reason <bead-id> --project <slug> --as <Pin>
 ```
 
 ```text
@@ -67,13 +67,13 @@ $ toron reserve list --project toron
   "project_key": "toron",
   "reservations": [
     { "holder": "BrashOtter", "path": "docs/notes/2026-09-26-run-state-checkpoint-design.md",
-      "reason": "bd-langgraph-b2b3-spec", "expires_ts_us": 1798151492000000 },
+      "reason": "<bead-id>", "expires_ts_us": 1798151492000000 },
     { "holder": "QuietHarbor", "path": "docs/guides/*",
-      "reason": "bd-f5g1", "expires_ts_us": 1798155045000000 }
+      "reason": "<bead-id>", "expires_ts_us": 1798155045000000 }
   ]
 }
 
-$ toron reserve release-by-reason bd-f5g1 --project toron --as QuietHarbor
+$ toron reserve release-by-reason <bead-id> --project toron --as QuietHarbor
 {
   "leases": [
     { "holder": "QuietHarbor", "mode": "shared", "path": "docs/guides/*" }

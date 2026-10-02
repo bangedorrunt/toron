@@ -7,7 +7,7 @@ The `Backend` trait abstracts process supervision. **herdr** is the default back
 
 ## Why the herdr client lives in toron-core
 
-Dependency direction is one way: flywheel depends on toron, never the reverse (ADR-0003 Decision 3A). Both flywheel (spawn and dispatch) and toron (mailbox, workflow engine) need a herdr client, so the client lives on the side everyone already reaches: `toron-core::backend::herdr`. There is exactly one `fn agent_prompt` definition and one shared socket client; flywheel's old copies were deleted. A test asserts the count stays at one.
+Dependency direction is one way: flywheel depends on toron, never the reverse. Both flywheel (spawn and dispatch) and toron (mailbox, workflow engine) need a herdr client, so the client lives on the side everyone already reaches: `toron-core::backend::herdr`. There is exactly one `fn agent_prompt` definition and one shared socket client; flywheel's old copies were deleted. A test asserts the count stays at one.
 
 ## Pane primitives (no agent lifecycle needed)
 
