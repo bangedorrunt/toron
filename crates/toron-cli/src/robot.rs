@@ -1664,6 +1664,11 @@ pub fn guard_check_verdict(
                      declared with `{}=true`.",
                     toron_core::mailbox::guard::PROJECTED_ATTR
                 ),
+                ProjectedDeclFault::AnchoredPattern { line_no, pattern } => format!(
+                    ".gitattributes:{line_no} declares the anchored pattern `{pattern}`, which \
+                     matches nothing: git anchors a leading `/`, this matcher does not. Drop the \
+                     leading slash (the pattern is already repo-relative)."
+                ),
             }
         ));
     }
@@ -1720,6 +1725,9 @@ pub fn guard_check_verdict(
             }
             ProjectedDeclFault::Malformed { line_no, line } => {
                 format!("malformed: .gitattributes:{line_no} `{line}`")
+            }
+            ProjectedDeclFault::AnchoredPattern { line_no, pattern } => {
+                format!("anchored-pattern: .gitattributes:{line_no} `{pattern}` matches nothing")
             }
         }),
         "agent": agent,

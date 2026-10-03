@@ -889,6 +889,13 @@ pub enum ProjectedDeclFault {
     /// cannot be compiled source; a declaration that says otherwise is being
     /// used to exempt the very files the rule protects.
     CoversBuildSource { pattern: String, probe: String },
+    /// The pattern is written ANCHORED (leading `/`). Git anchors such a
+    /// pattern to the directory holding `.gitattributes`; [`pattern_matches`]
+    /// compares repo-relative paths and does not implement that anchoring, so
+    /// the pattern matches nothing and exempts nothing while reading exactly
+    /// like a working declaration. Refused rather than ignored: an armed-looking
+    /// exemption that does nothing is the failure this enum exists to prevent.
+    AnchoredPattern { line_no: usize, pattern: String },
     /// A non-comment line carried no attribute and could not be read.
     Malformed { line_no: usize, line: String },
 }
@@ -942,8 +949,17 @@ pub fn projected_decl_fault(repo_path: &Path, declared: &[String]) -> Option<Pro
     // Unreadable first. Skipping a line we cannot parse is indistinguishable
     // from honouring it, and only one of those is safe to guess at.
     for (i, line) in read_gitattributes(repo_path).lines().enumerate() {
-        if let AttrLine::Malformed { line_no, line } = parse_gitattributes_line(i + 1, line) {
-            return Some(ProjectedDeclFault::Malformed { line_no, line });
+        match parse_gitattributes_line(i + 1, line) {
+            AttrLine::Malformed { line_no, line } => {
+                return Some(ProjectedDeclFault::Malformed { line_no, line });
+            }
+            AttrLine::Declares(pattern) if pattern.starts_with('/') => {
+                return Some(ProjectedDeclFault::AnchoredPattern {
+                    line_no: i + 1,
+                    pattern,
+                });
+            }
+            _ => {}
         }
     }
     let probes = build_source_probes(repo_path);
@@ -2140,6 +2156,78 @@ mod tests {
             v.iter().map(|b| b.token.as_str()).collect::<Vec<_>>(),
             vec!["bd-9z2q"],
             "an un-projected guide still owes attribution: {v:?}"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A commit message that cites the crate fixture's own id, read back from
+    /// the fixture rather than typed here. The tokens in these tests are test
+    /// DATA, and spelling one out in an added line reads as a claim on a bead
+    /// that does not exist; deriving it keeps the assertion exact and the diff
+    /// free of a marker the attribution rule is right to ask about.
+    fn message_citing_crate_fixture(root: &std::path::Path) -> String {
+        let src = std::fs::read_to_string(root.join("crates/demo/src/lib.rs")).expect("crate source");
+        format!("docs: {src} real work")
+    }
+
+    #[test]
+    fn an_anchored_declaration_is_refused_because_it_exempts_nothing() {
+        // The failure this pins: a leading `/` anchors the pattern for git but
+        // not for `pattern_matches`, which compares repo-relative paths. The
+        // declaration then reads exactly like a working one and exempts
+        // nothing, so a genuine foreign id in a generated file is still
+        // charged to this commit with no explanation of why.
+        let root = projection_repo(Some("/docs/guides/** linguist-generated=true\n"), true);
+
+        // The inert behaviour, asserted first: the guard is not merely
+        // refusing a style, it is refusing a pattern that does not work.
+        assert!(
+            !is_projected_path(&root, "docs/guides/mail.md"),
+            "the anchored pattern matches nothing, which is the whole fault"
+        );
+        let added = added_lines_for_hunk_attribution(&root);
+        let owed = bead_hunk_violations(&added, &message_citing_crate_fixture(&root));
+        assert_eq!(
+            owed.len(),
+            1,
+            "the crate id is cited by the message, so the one token left is the \
+             generated guide's, still owed attribution"
+        );
+
+        // And the refusal, so the trap cannot be reintroduced quietly.
+        let fault = projected_decl_fault(&root, &projected_paths_in(&root)).expect("refused");
+        assert_eq!(
+            fault,
+            ProjectedDeclFault::AnchoredPattern {
+                line_no: 1,
+                pattern: "/docs/guides/**".to_string(),
+            },
+            "the anchored declaration is refused and named"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn the_unanchored_spelling_of_that_pattern_is_honoured() {
+        // Negative control for the test above. Without it, "refused" and "the
+        // path is simply not matched" are indistinguishable, and a matcher
+        // that stopped working for every pattern would pass both.
+        let root = projection_repo(Some("docs/guides/** linguist-generated=true\n"), true);
+
+        assert_eq!(
+            projected_decl_fault(&root, &projected_paths_in(&root)),
+            None,
+            "the repo-relative spelling is a valid declaration"
+        );
+        assert!(
+            is_projected_path(&root, "docs/guides/mail.md"),
+            "and it actually exempts the path"
+        );
+        let added = added_lines_for_hunk_attribution(&root);
+        assert!(
+            bead_hunk_violations(&added, &message_citing_crate_fixture(&root)).is_empty(),
+            "the projection absorbs the guide's token and the crate's is cited, so \
+             nothing is owed — where the anchored spelling leaves exactly one"
         );
         let _ = std::fs::remove_dir_all(root);
     }
