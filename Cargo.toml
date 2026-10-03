@@ -14,5 +14,12 @@ members = [
 # ~8.8MB) — dyld then rejects them at load with "mis-aligned LINKEDIT string
 # pool", breaking `cargo install --release`/`--path` builds of toron.
 # Disable stripping (correctness > binary size for this project).
+# Dependency debuginfo is the dominant cost of a cold dev build and of every
+# relink, and none of it is read: a panic in a dependency still resolves to a
+# line table, which is all a backtrace needs. Full debuginfo for deps was the
+# default here because no repo set a `[profile.dev.package]` override.
+[profile.dev.package."*"]
+debug = "line-tables-only"
+
 [profile.release]
 strip = "none"
