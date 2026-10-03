@@ -1404,8 +1404,8 @@ steps:
 /// fail if a future cancel-on-first-failure shortened the fan-out.
 #[tokio::test]
 async fn parallel_partial_failure_settles_all_copies_then_reports() {
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex as StdMutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     let seen: Arc<StdMutex<Vec<Action>>> = Arc::new(StdMutex::new(Vec::new()));
     let seen_clone = seen.clone();
     let calls = Arc::new(AtomicUsize::new(0));
