@@ -12,6 +12,7 @@ mod plane;
 mod platform;
 mod robot;
 mod theme;
+mod tracker;
 mod tui;
 mod wake_sock;
 mod workflow;

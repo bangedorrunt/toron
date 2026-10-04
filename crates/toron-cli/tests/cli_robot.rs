@@ -811,6 +811,208 @@ fn reserve_list_board_and_release_by_reason() {
     let _ = std::fs::remove_dir_all(&data_dir);
 }
 
+/// bd-close-releases-leases-qkbo: `reserve list` marks a lease whose reason
+/// bead is CLOSED (tracker-backed audit) and `reserve sweep --closed-beads`
+/// releases exactly those leases — an open-bead lease stays held. Own data dir
+/// + operator key, mirroring the release-by-reason test above.
+#[test]
+fn reserve_sweep_releases_only_closed_reasons() {
+    let data_dir = std::env::temp_dir().join(format!("toron-reserve-sweep-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&data_dir);
+    std::fs::create_dir_all(&data_dir).expect("mkdir dedicated data dir");
+    let op_key = data_dir.join("operator.ncryptsec");
+    let repo = data_dir.join("repo");
+    std::fs::create_dir_all(repo.join(".beads")).expect("mkdir tracker");
+    std::fs::write(
+        repo.join(".beads/issues.jsonl"),
+        [
+            r#"{"id":"bd-sweep-closed","status":"closed","title":"done"}"#,
+            r#"{"id":"bd-sweep-open","status":"open","title":"still working"}"#,
+        ]
+        .join("\n"),
+    )
+    .expect("write tracker");
+
+    let own_run = |args: &[&str]| {
+        toron()
+            .env("TORON_MCP_DATA_DIR", &data_dir)
+            .env("TORON_OPERATOR_KEY", &op_key)
+            .args(args)
+            .output()
+            .expect("run toron on own data dir")
+    };
+    let json = |out: &std::process::Output| -> Value {
+        serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+            panic!(
+                "expected JSON, stderr: {}\nerror: {e}",
+                String::from_utf8_lossy(&out.stderr)
+            )
+        })
+    };
+
+    let keygen = own_run(&[
+        "key",
+        "generate",
+        "--role",
+        "operator",
+        "--out",
+        op_key.to_str().unwrap(),
+        "--json",
+    ]);
+    assert!(
+        keygen.status.success(),
+        "key generate: {}",
+        String::from_utf8_lossy(&keygen.stderr)
+    );
+    let boot = own_run(&[
+        "agent",
+        "bootstrap",
+        "--project",
+        "demo",
+        "--as",
+        "SweepAgent",
+        "--json",
+    ]);
+    assert!(
+        boot.status.success(),
+        "bootstrap: {}",
+        String::from_utf8_lossy(&boot.stderr)
+    );
+
+    for (path, reason) in [
+        ("src/closed/**", "bd-sweep-closed"),
+        ("src/open/**", "bd-sweep-open"),
+    ] {
+        let acq = own_run(&[
+            "reserve",
+            "acquire",
+            "--paths",
+            path,
+            "--reason",
+            reason,
+            "--exclusive",
+            "--project",
+            "demo",
+            "--as",
+            "SweepAgent",
+            "--json",
+        ]);
+        assert!(
+            acq.status.success(),
+            "acquire {path}: {}",
+            String::from_utf8_lossy(&acq.stderr)
+        );
+    }
+
+    // The audit marks ONLY the closed-reason lease as stale.
+    let listed = own_run(&[
+        "reserve",
+        "list",
+        "--project",
+        "demo",
+        "--repo",
+        repo.to_str().unwrap(),
+        "--json",
+    ]);
+    assert!(
+        listed.status.success(),
+        "list: {}",
+        String::from_utf8_lossy(&listed.stderr)
+    );
+    let board = json(&listed);
+    let rows = board["reservations"]
+        .as_array()
+        .expect("reservations array");
+    let closed_row = rows
+        .iter()
+        .find(|r| r["reason"] == "bd-sweep-closed")
+        .expect("closed-reason lease on board");
+    let open_row = rows
+        .iter()
+        .find(|r| r["reason"] == "bd-sweep-open")
+        .expect("open-reason lease on board");
+    assert_eq!(
+        closed_row["stale"],
+        Value::Bool(true),
+        "closed reason marked stale: {board}"
+    );
+    assert!(
+        open_row.get("stale").is_none(),
+        "open reason not marked: {board}"
+    );
+
+    // A bare sweep (no --closed-beads) refuses loud instead of sweeping blind.
+    let bare = own_run(&[
+        "reserve",
+        "sweep",
+        "--project",
+        "demo",
+        "--as",
+        "SweepAgent",
+        "--json",
+    ]);
+    assert!(
+        !bare.status.success(),
+        "sweep without --closed-beads must refuse"
+    );
+
+    // The sweep releases exactly the closed-reason lease.
+    let swept = own_run(&[
+        "reserve",
+        "sweep",
+        "--closed-beads",
+        "--project",
+        "demo",
+        "--as",
+        "SweepAgent",
+        "--repo",
+        repo.to_str().unwrap(),
+        "--no-notify",
+        "--json",
+    ]);
+    assert!(
+        swept.status.success(),
+        "sweep: {}",
+        String::from_utf8_lossy(&swept.stderr)
+    );
+    let report = json(&swept);
+    assert_eq!(
+        report["released"].as_u64(),
+        Some(1),
+        "one lease released: {report}"
+    );
+    assert_eq!(
+        report["stale_reasons"][0], "bd-sweep-closed",
+        "only the closed reason: {report}"
+    );
+
+    let after = json(&own_run(&[
+        "reserve",
+        "list",
+        "--project",
+        "demo",
+        "--repo",
+        repo.to_str().unwrap(),
+        "--json",
+    ]));
+    let reasons: Vec<&str> = after["reservations"]
+        .as_array()
+        .expect("reservations")
+        .iter()
+        .filter_map(|r| r["reason"].as_str())
+        .collect();
+    assert!(
+        !reasons.contains(&"bd-sweep-closed"),
+        "closed-reason lease gone: {after}"
+    );
+    assert!(
+        reasons.contains(&"bd-sweep-open"),
+        "open-reason lease untouched: {after}"
+    );
+
+    let _ = std::fs::remove_dir_all(&data_dir);
+}
+
 /// bd-pin-public-plane-s-easy.14: ONE mailbox — a lease written by one
 /// `toron` process must be visible to a SECOND `toron guard check` process
 /// (the pre-commit hook runs in its own process against the same durable

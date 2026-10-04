@@ -110,7 +110,7 @@ pub enum Command {
     /// tool, ADR-0020 wave 1 freeze).
     AckSla(AckSlaArgs),
 
-    /// File reservations: acquire/conflicts/list/renew/release/release-by-reason/force-release.
+    /// File reservations: acquire/conflicts/list/renew/release/release-by-reason/sweep/force-release.
     #[command(subcommand)]
     Reserve(ReserveCommand),
 
@@ -718,6 +718,9 @@ pub enum ReserveCommand {
     /// Release every reservation whose reason is the given bead id
     /// (release-on-bead-close; operator-signed, no staleness heuristic).
     ReleaseByReason(ReserveReleaseByReasonArgs),
+    /// Release every lease whose reason bead is CLOSED (batch of
+    /// release-by-reason; the closed set is read from the repo tracker).
+    Sweep(ReserveSweepArgs),
     /// Operator force-release of a stale reservation.
     ForceRelease(ReserveForceReleaseArgs),
     /// Ask the holder to release or defer a held reservation (ADR-0011
@@ -777,6 +780,10 @@ pub struct ReserveListArgs {
     /// Only leases whose path glob overlaps this path (symmetric fnmatch).
     #[arg(long)]
     pub path: Option<String>,
+    /// Repository root whose `.beads/issues.jsonl` backs the stale audit
+    /// (default: current directory; no tracker file = no annotation).
+    #[arg(long)]
+    pub repo: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -818,6 +825,26 @@ pub struct ReserveReleaseByReasonArgs {
     /// Operator agent performing the revocation.
     #[arg(long = "as", required = true)]
     pub agent: String,
+    /// Skip the NIP-17 notification to the previous holders (default: notify).
+    #[arg(long)]
+    pub no_notify: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct ReserveSweepArgs {
+    /// Project slug.
+    #[arg(long, required = true)]
+    pub project: String,
+    /// Operator agent signing the revocations.
+    #[arg(long = "as", required = true)]
+    pub agent: String,
+    /// Sweep leases whose reason names a CLOSED bead. Required: it is the
+    /// only sweep source (`<repo>/.beads/issues.jsonl`).
+    #[arg(long)]
+    pub closed_beads: bool,
+    /// Repository root holding `.beads/` (default: current directory).
+    #[arg(long)]
+    pub repo: Option<std::path::PathBuf>,
     /// Skip the NIP-17 notification to the previous holders (default: notify).
     #[arg(long)]
     pub no_notify: bool,

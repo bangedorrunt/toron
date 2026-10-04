@@ -36,8 +36,8 @@
       "name": "ack-sla"
     },
     {
-      "args": "acquire, conflicts, list, renew, release, release-by-reason, force-release, request-release, respond, transfer",
-      "description": "File reservations: acquire/conflicts/list/renew/release/release-by-reason/force-release",
+      "args": "acquire, conflicts, list, renew, release, release-by-reason, sweep, force-release, request-release, respond, transfer",
+      "description": "File reservations: acquire/conflicts/list/renew/release/release-by-reason/sweep/force-release",
       "name": "reserve"
     },
     {
@@ -151,7 +151,7 @@
       "name": "run-state"
     }
   ],
-  "generated_at": "2026-10-04T15:38:55Z",
+  "generated_at": "2026-10-04T16:28:40Z",
   "resources": [
     {
       "description": "List projects known to toron.",

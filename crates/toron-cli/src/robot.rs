@@ -59,6 +59,107 @@ fn print_json(value: &serde_json::Value) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// bd-close-releases-leases-qkbo: mark board rows whose reason bead is CLOSED
+/// (CLI-only additive fields; the MCP `LeaseBoardOut` shape is untouched).
+/// Best-effort: no tracker file means no annotation, never an error —
+/// `reserve list` must work in any directory.
+fn annotate_stale_rows(
+    board: &mut Value,
+    closed: &std::collections::BTreeSet<String>,
+    project: &str,
+) {
+    let Some(rows) = board.get_mut("reservations").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for row in rows {
+        let reason = row.get("reason").and_then(Value::as_str).unwrap_or("");
+        if reason.is_empty() || !closed.contains(reason) {
+            continue;
+        }
+        if let Some(obj) = row.as_object_mut() {
+            obj.insert("stale".into(), Value::Bool(true));
+            obj.insert(
+                "stale_hint".into(),
+                Value::String(format!(
+                    "reason bead is closed; sweep with: toron reserve sweep --closed-beads --project {project}"
+                )),
+            );
+        }
+    }
+}
+
+/// Resolve a sweep's repo root + closed-bead set. `--closed-beads` is required
+/// (it is the only sweep source) and a missing tracker fails loud: the flag
+/// asked for closed-bead discovery and there is nothing to discover from.
+fn sweep_closed_set(
+    args: &crate::cli::ReserveSweepArgs,
+) -> anyhow::Result<(std::path::PathBuf, std::collections::BTreeSet<String>)> {
+    if !args.closed_beads {
+        anyhow::bail!(
+            "`reserve sweep` needs --closed-beads (the only sweep source: <repo>/.beads/issues.jsonl)"
+        );
+    }
+    let repo = args
+        .repo
+        .clone()
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let issues = crate::tracker::issues_path(&repo);
+    if !issues.exists() {
+        anyhow::bail!(
+            "no tracker at {} — run from the repo root or pass --repo",
+            issues.display()
+        );
+    }
+    let closed = crate::tracker::closed_bead_ids(&repo);
+    Ok((repo, closed))
+}
+
+/// Group stale rows `(path, holder, reason)` by reason for the sweep report.
+/// Shared by the embedded and daemon arms so both report the same leases.
+fn group_stale_by_reason(
+    rows: &[(String, String, String)],
+    closed: &std::collections::BTreeSet<String>,
+) -> std::collections::BTreeMap<String, Vec<(String, String)>> {
+    let mut by_reason: std::collections::BTreeMap<String, Vec<(String, String)>> =
+        std::collections::BTreeMap::new();
+    for (path, holder, reason) in rows {
+        if reason.is_empty() || !closed.contains(reason) {
+            continue;
+        }
+        by_reason
+            .entry(reason.clone())
+            .or_default()
+            .push((path.clone(), holder.clone()));
+    }
+    by_reason
+}
+
+/// The shared sweep report shape (embedded + daemon arms).
+fn print_sweep_report(
+    project: &str,
+    repo: &std::path::Path,
+    closed_count: usize,
+    by_reason: &std::collections::BTreeMap<String, Vec<(String, String)>>,
+    released: u64,
+) -> anyhow::Result<()> {
+    let leases: Vec<Value> = by_reason
+        .iter()
+        .flat_map(|(reason, leases)| {
+            leases.iter().map(
+                move |(path, holder)| json!({"path": path, "holder": holder, "reason": reason}),
+            )
+        })
+        .collect();
+    print_json(&json!({
+        "project_key": project,
+        "repo": repo.display().to_string(),
+        "closed_beads": closed_count,
+        "stale_reasons": by_reason.keys().collect::<Vec<_>>(),
+        "released": released,
+        "leases": leases,
+    }))
+}
+
 /// Encode the ADR-0027 E2 assignment vocabulary into rumor tags.
 ///
 /// `pub(crate)` so the operator console's send form goes through the SAME
@@ -720,7 +821,7 @@ pub async fn run_reserve(mailbox: &Mailbox, cmd: &ReserveCommand) -> anyhow::Res
             let rows = mailbox
                 .list_file_reservations(&args.project, args.holder.as_deref(), args.path.as_deref())
                 .await?;
-            emit(toron_mcp::tools::reservation::LeaseBoardOut {
+            let mut board = toron_mcp::tools::reservation::LeaseBoardOut {
                 project_key: args.project.clone(),
                 count: rows.len() as i64,
                 reservations: rows
@@ -734,7 +835,14 @@ pub async fn run_reserve(mailbox: &Mailbox, cmd: &ReserveCommand) -> anyhow::Res
                         expires_ts_us: r.expires_ts_us,
                     })
                     .collect(),
-            })
+            }
+            .to_json();
+            // bd-close-releases-leases-qkbo: stale audit rides on top of the
+            // shared board (default repo = cwd).
+            let closed =
+                crate::tracker::closed_bead_ids(args.repo.as_deref().unwrap_or(Path::new(".")));
+            annotate_stale_rows(&mut board, &closed, &args.project);
+            print_json(&board)
         }
         ReserveCommand::Renew(args) => emit(
             mailbox
@@ -751,6 +859,31 @@ pub async fn run_reserve(mailbox: &Mailbox, cmd: &ReserveCommand) -> anyhow::Res
                 .release_by_reason(&args.project, &args.agent, &args.bead_id, !args.no_notify)
                 .await?,
         ),
+        ReserveCommand::Sweep(args) => {
+            let (repo, closed) = sweep_closed_set(args)?;
+            let board = mailbox
+                .list_file_reservations(&args.project, None, None)
+                .await?;
+            let rows: Vec<(String, String, String)> = board
+                .iter()
+                .map(|r| {
+                    (
+                        r.path_pattern.clone(),
+                        r.agent_name.clone(),
+                        r.reason.clone(),
+                    )
+                })
+                .collect();
+            let by_reason = group_stale_by_reason(&rows, &closed);
+            let mut released = 0u64;
+            for bead_id in by_reason.keys() {
+                let result = mailbox
+                    .release_by_reason(&args.project, &args.agent, bead_id, !args.no_notify)
+                    .await?;
+                released += result.released as u64;
+            }
+            print_sweep_report(&args.project, &repo, closed.len(), &by_reason, released)
+        }
         ReserveCommand::ForceRelease(args) => {
             mailbox
                 .force_release_file_reservation(
@@ -934,16 +1067,22 @@ pub async fn run_reserve_daemon(dc: &DaemonClient, cmd: &ReserveCommand) -> anyh
             .await
         }
         ReserveCommand::List(args) => {
-            daemon_tool(
-                dc,
-                "list_file_reservations",
-                json!({
-                    "project_key": args.project,
-                    "holder": args.holder,
-                    "path": args.path,
-                }),
-            )
-            .await
+            let mut board = dc
+                .call_tool(
+                    "list_file_reservations",
+                    json!({
+                        "project_key": args.project,
+                        "holder": args.holder,
+                        "path": args.path,
+                    }),
+                )
+                .await?;
+            // bd-close-releases-leases-qkbo: the tracked repo is the client's
+            // cwd — the daemon never sees it — so annotate here.
+            let closed =
+                crate::tracker::closed_bead_ids(args.repo.as_deref().unwrap_or(Path::new(".")));
+            annotate_stale_rows(&mut board, &closed, &args.project);
+            print_json(&board)
         }
         ReserveCommand::Renew(args) => {
             daemon_tool(
@@ -982,6 +1121,60 @@ pub async fn run_reserve_daemon(dc: &DaemonClient, cmd: &ReserveCommand) -> anyh
                 }),
             )
             .await
+        }
+        ReserveCommand::Sweep(args) => {
+            let (repo, closed) = sweep_closed_set(args)?;
+            let board = dc
+                .call_tool(
+                    "list_file_reservations",
+                    json!({
+                        "project_key": args.project,
+                        "holder": null,
+                        "path": null,
+                    }),
+                )
+                .await?;
+            let rows: Vec<(String, String, String)> = board
+                .get("reservations")
+                .and_then(Value::as_array)
+                .map(|rows| {
+                    rows.iter()
+                        .map(|row| {
+                            (
+                                row.get("path")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("")
+                                    .to_string(),
+                                row.get("holder")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("")
+                                    .to_string(),
+                                row.get("reason")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("")
+                                    .to_string(),
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let by_reason = group_stale_by_reason(&rows, &closed);
+            let mut released = 0u64;
+            for bead_id in by_reason.keys() {
+                let result = dc
+                    .call_tool(
+                        "release_file_reservations_by_reason",
+                        json!({
+                            "project_key": args.project,
+                            "agent_name": args.agent,
+                            "bead_id": bead_id,
+                            "notify_previous": !args.no_notify,
+                        }),
+                    )
+                    .await?;
+                released += result.get("released").and_then(Value::as_u64).unwrap_or(0);
+            }
+            print_sweep_report(&args.project, &repo, closed.len(), &by_reason, released)
         }
         ReserveCommand::ForceRelease(args) => {
             daemon_tool(

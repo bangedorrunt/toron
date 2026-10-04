@@ -430,6 +430,45 @@ pub struct ReleasedLease {
     pub holder: String,
 }
 
+/// The live leases a bead-close event for `bead_id` releases
+/// (bd-close-releases-leases-qkbo). Exact reason match, never a prefix:
+/// a close of `bd-1` must not release a lease reasoned `bd-10`. An empty
+/// `bead_id` releases nothing, since it would otherwise match every
+/// reasonless lease.
+///
+/// Pure decision half of release-on-close: [`Mailbox::release_by_reason`]
+/// executes the revocation, while the audit surfaces (`reserve list`'s stale
+/// marker and `reserve sweep --closed-beads`) route through this, so the
+/// sweep and any host hook can never disagree about what a close releases.
+pub fn release_on_close_event<'a>(
+    leases: &'a [Reservation],
+    bead_id: &str,
+) -> Vec<&'a Reservation> {
+    if bead_id.is_empty() {
+        return Vec::new();
+    }
+    leases
+        .iter()
+        .filter(|lease| lease.reason == bead_id)
+        .collect()
+}
+
+/// Stale-lease audit (bd-close-releases-leases-qkbo): every live lease whose
+/// reason names one of `closed_beads`. Folded from
+/// [`release_on_close_event`] over the closed set, so the stale view and the
+/// close-driven release view are one predicate by construction. The caller
+/// supplies the closed set it observed (the CLI reads a repo's
+/// `.beads/issues.jsonl`); this never reads a tracker itself.
+pub fn stale_closed_leases<'a>(
+    leases: &'a [Reservation],
+    closed_beads: &std::collections::BTreeSet<String>,
+) -> Vec<&'a Reservation> {
+    closed_beads
+        .iter()
+        .flat_map(|bead_id| release_on_close_event(leases, bead_id))
+        .collect()
+}
+
 /// Probe inputs for one kernel acquire decision (travel together).
 struct AcquireProbe {
     holder_hex: String,
@@ -5111,6 +5150,89 @@ mod tests {
 
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// A hand-built board row for the pure close-event/audit tests.
+    fn lease_with_reason(reason: &str, path: &str) -> Reservation {
+        Reservation {
+            id: format!("lease-{path}"),
+            agent_name: "BlueLake".into(),
+            agent_pubkey: "ab".repeat(32),
+            path_pattern: path.into(),
+            exclusive: true,
+            reason: reason.into(),
+            expires_ts_us: None,
+            status: ReservationStatus::Held,
+            epoch: 1,
+        }
+    }
+
+    /// bd-close-releases-leases-qkbo: a close event for one bead releases
+    /// ONLY the leases whose reason is exactly that bead — other reasons stay
+    /// on the board, a longer id with the same prefix is not a match, and an
+    /// empty id releases nothing (it would otherwise sweep every reasonless
+    /// lease). Calls are `super::`-qualified: this test's own name shadows
+    /// the imported function inside the module.
+    #[test]
+    fn release_on_close_event() {
+        let board = vec![
+            lease_with_reason("bd-1", "src/one.rs"),
+            lease_with_reason("bd-10", "src/ten.rs"),
+            lease_with_reason("bd-2", "src/two.rs"),
+            lease_with_reason("", "src/none.rs"),
+        ];
+
+        let released = super::release_on_close_event(&board, "bd-1");
+        assert_eq!(
+            released
+                .iter()
+                .map(|l| l.path_pattern.as_str())
+                .collect::<Vec<_>>(),
+            vec!["src/one.rs"],
+            "exactly the bd-1 lease"
+        );
+        assert_eq!(board.len(), 4, "the selector never mutates the board");
+
+        assert!(
+            super::release_on_close_event(&board, "").is_empty(),
+            "an empty close id releases nothing"
+        );
+        assert!(
+            super::release_on_close_event(&board, "bd-nope").is_empty(),
+            "an unknown close id releases nothing"
+        );
+        assert_eq!(
+            super::release_on_close_event(&board, "bd-10")
+                .iter()
+                .map(|l| l.reason.as_str())
+                .collect::<Vec<_>>(),
+            vec!["bd-10"],
+            "prefix sharing must not leak (bd-1 vs bd-10)"
+        );
+    }
+
+    /// The stale audit is the union of close events over the closed set, so
+    /// `reserve list`'s marker and `reserve sweep` agree with the release
+    /// predicate by construction.
+    #[test]
+    fn stale_closed_leases_folds_close_events() {
+        let board = vec![
+            lease_with_reason("bd-1", "src/a.rs"),
+            lease_with_reason("bd-2", "src/b.rs"),
+            lease_with_reason("bd-3", "src/c.rs"),
+            lease_with_reason("", "src/d.rs"),
+        ];
+        let closed: std::collections::BTreeSet<String> =
+            ["bd-1", "bd-3"].into_iter().map(String::from).collect();
+        let stale: Vec<&str> = stale_closed_leases(&board, &closed)
+            .iter()
+            .map(|l| l.path_pattern.as_str())
+            .collect();
+        assert_eq!(stale, vec!["src/a.rs", "src/c.rs"]);
+        assert!(
+            stale_closed_leases(&board, &std::collections::BTreeSet::new()).is_empty(),
+            "no closed beads, no stale leases"
+        );
     }
 
     // --- bd-adr-0028-implementation-zfnx.11: claim fencing epochs ---
