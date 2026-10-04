@@ -220,6 +220,138 @@ fn check_name_collisions(cfg: &Config) -> CheckResult {
     }
 }
 
+/// bd-u31k: pure core of the identity-divergence check — each live pane's
+/// stamped npub vs the registry's binding for that pin. Inputs are exactly
+/// what the shell gathers: pane stamps and `agents` rows (project, name,
+/// pubkey). A stamp whose (normalized project, pin) is not registered is NOT
+/// a divergence (that is `whois`'s "register first"); a stamp whose npub is
+/// not among the registry's keys for that name is the measured hazard —
+/// mail sent to the name reaches a key the pane does not read, invisibly.
+fn identity_divergence_check(
+    stamps: &[toron_core::mailbox::identity::PaneStamp],
+    roster: &[(String, String, String)],
+) -> CheckResult {
+    let name = "identity_divergence";
+    let short = |k: &str| k[..8.min(k.len())].to_string();
+    let mut rows: Vec<String> = Vec::new();
+    for stamp in stamps {
+        let slug = toron_core::mailbox::identity::stamp_project_slug(&stamp.project);
+        let registered: Vec<&str> = roster
+            .iter()
+            .filter(|(p, n, _)| p == slug && n == &stamp.pin)
+            .map(|(_, _, k)| k.as_str())
+            .collect();
+        if registered.is_empty() || registered.iter().any(|k| *k == stamp.npub) {
+            continue;
+        }
+        let keys: Vec<String> = registered.iter().map(|k| short(k)).collect();
+        rows.push(format!(
+            "pane {} stamps {} ({slug}) npub {}… but the registry binds it to {}… — \
+             re-register the pin or address it by npub",
+            stamp.pane_id,
+            stamp.pin,
+            short(&stamp.npub),
+            keys.join("/")
+        ));
+    }
+    if rows.is_empty() {
+        CheckResult {
+            name,
+            ok: true,
+            detail: format!(
+                "{} stamped pane(s) — every stamp npub matches its registered pin",
+                stamps.len()
+            ),
+        }
+    } else {
+        CheckResult {
+            name,
+            ok: false,
+            detail: format!("{} divergent pin(s): {}", rows.len(), rows.join("; ")),
+        }
+    }
+}
+
+/// bd-u31k: the shell around [`identity_divergence_check`] — stamped panes
+/// from herdr, registry rows from the index DB. herdr unreachable or no
+/// index is NOT a defect (the same advisory posture as the pane fields
+/// `whois` attaches), so those read ok with the reason named.
+fn check_identity_divergence(cfg: &Config) -> CheckResult {
+    let name = "identity_divergence";
+    let stamps = {
+        let Ok(backend) = toron_core::backend::herdr::HerdrBackend::connect(None) else {
+            return CheckResult {
+                name,
+                ok: true,
+                detail: "herdr not reachable — no live panes to compare".into(),
+            };
+        };
+        let mut client = backend.client();
+        let panes: Vec<toron_core::backend::herdr::PaneInfo> = client
+            .workspace_list()
+            .map(|wss| {
+                wss.into_iter()
+                    .flat_map(|ws| client.pane_list(Some(&ws.workspace_id)).unwrap_or_default())
+                    .collect()
+            })
+            .unwrap_or_default();
+        drop(client);
+        panes
+            .iter()
+            .filter_map(toron_core::mailbox::identity::pane_stamp)
+            .collect::<Vec<_>>()
+    };
+    if stamps.is_empty() {
+        return CheckResult {
+            name,
+            ok: true,
+            detail: "no stamped live panes to compare".into(),
+        };
+    }
+    let Some(data_dir) = resolve_data_dir(cfg, None) else {
+        return CheckResult {
+            name,
+            ok: true,
+            detail: "no data dir — nothing to compare".into(),
+        };
+    };
+    let db_path = data_dir.join("index.sqlite");
+    if !db_path.exists() {
+        return CheckResult {
+            name,
+            ok: true,
+            detail: format!("no index at {}", db_path.display()),
+        };
+    }
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            return CheckResult {
+                name,
+                ok: false,
+                detail: format!("runtime build failed: {e}"),
+            };
+        }
+    };
+    let roster = rt.block_on(async {
+        let pool = toron_core::index::schema::connect(db_path.to_str().unwrap()).await?;
+        let rows = toron_core::mailbox::identity::identity_roster(&pool).await?;
+        pool.close().await;
+        Ok::<_, anyhow::Error>(rows)
+    });
+    match roster {
+        Ok(roster) => identity_divergence_check(&stamps, &roster),
+        Err(e) => CheckResult {
+            name,
+            ok: false,
+            detail: format!("scan failed: {e:#}"),
+        },
+    }
+}
+
 /// The daemon can be live and still not be the build on disk — a process keeps
 /// executing the file it was exec'd from after a rebuild replaces that file.
 /// That cost a full debug cycle on 2026-09-30: an hour-stale daemon rewrote the
@@ -567,6 +699,7 @@ pub fn run_doctor(
         check_resonate(),
         check_legacy_slug_identities(cfg),
         check_name_collisions(cfg),
+        check_identity_divergence(cfg),
     ];
     let value = json!({ "checks": serde_json::to_value(&checks)? });
 
@@ -1725,6 +1858,67 @@ mod reconstruct_tests {
         };
         let code = run_doctor_reconstruct(&cfg, &args, OutputFormat::Json).unwrap();
         assert_eq!(code, ExitCode::from(3));
+    }
+
+    /// bd-u31k: a pane stamp whose npub differs from the registry's binding
+    /// for the same pin must FLAG (ok=false) and name the pane, both npubs,
+    /// and the one-line remediation; same-npub stamps and pins absent from
+    /// the registry stay green (registration is `whois`'s concern).
+    #[test]
+    fn doctor_flags_pin_pane_divergence() {
+        use toron_core::mailbox::identity::PaneStamp;
+        let registered = "aa".repeat(32);
+        let stamped = "bb".repeat(32);
+        let stamp = PaneStamp {
+            pane_id: "w1:p1".into(),
+            pin: "SilverPond".into(),
+            // flywheel stamps a project PATH; the roster is keyed by slug.
+            project: "/Users/x/workspace/toron".into(),
+            npub: stamped.clone(),
+        };
+        let roster = vec![(
+            "toron".to_string(),
+            "SilverPond".to_string(),
+            registered.clone(),
+        )];
+        let result = identity_divergence_check(std::slice::from_ref(&stamp), &roster);
+        assert!(
+            !result.ok,
+            "a stamped-vs-registered npub mismatch must flag"
+        );
+        assert!(
+            result.detail.contains("w1:p1"),
+            "pane named: {}",
+            result.detail
+        );
+        assert!(
+            result.detail.contains(&stamped[..8]),
+            "stamped npub named: {}",
+            result.detail
+        );
+        assert!(
+            result.detail.contains(&registered[..8]),
+            "registered npub named: {}",
+            result.detail
+        );
+        assert!(
+            result
+                .detail
+                .contains("re-register the pin or address it by npub"),
+            "one-line remediation named: {}",
+            result.detail
+        );
+        // The healing cases stay green: same npub, and a pin not registered.
+        let same = PaneStamp {
+            npub: registered.clone(),
+            ..stamp.clone()
+        };
+        assert!(identity_divergence_check(std::slice::from_ref(&same), &roster).ok);
+        let unregistered = PaneStamp {
+            pin: "NewPond".into(),
+            ..stamp
+        };
+        assert!(identity_divergence_check(std::slice::from_ref(&unregistered), &roster).ok);
     }
 
     #[test]

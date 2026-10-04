@@ -164,6 +164,20 @@ pub async fn name_collisions_across_projects(
     Ok(out)
 }
 
+/// bd-u31k: the registered identities a pane-stamp divergence check
+/// compares against — `(project_slug, name, pubkey)` for every agent row,
+/// ordered for stable output. The whole scan lives here so the CLI needs no
+/// SQL of its own (same rule as [`name_collisions_across_projects`]).
+pub async fn identity_roster(
+    pool: &sqlx::SqlitePool,
+) -> anyhow::Result<Vec<(String, String, String)>> {
+    Ok(sqlx::query_as::<_, (String, String, String)>(
+        "SELECT project_slug, name, pubkey FROM agents ORDER BY project_slug, name",
+    )
+    .fetch_all(pool)
+    .await?)
+}
+
 /// bd-0tbg: a set of identities in ONE project that fold to the same words
 /// and therefore hold SEPARATE keys for one intended name. Reported, never
 /// merged — deciding which key survives needs someone who knows which agent
@@ -273,6 +287,18 @@ pub struct WhoIs {
     /// bd-u4e2: tab owning [`Self::pane_id`] (`None` with no live pane).
     #[serde(default)]
     pub tab_id: Option<String>,
+    /// bd-u31k: the npub stamped on the pin's live herdr pane (`toron_npub`
+    /// token, written by the mail-identity stamp). `None` with no live pane,
+    /// no stamp, or a stamp that carries no npub. Advisory — never a
+    /// routing gate (additive `Option`, old wire rows stay parseable).
+    #[serde(default)]
+    pub pane_npub: Option<String>,
+    /// bd-u31k: `true` when the live pane's stamped npub differs from this
+    /// roster row's npub — mail addressed to the NAME resolves to a key the
+    /// pane does not read. Surfaced for intervention (re-register the pin or
+    /// address it by npub); never a routing gate.
+    #[serde(default)]
+    pub identity_divergent: bool,
 }
 
 /// bd-u4e2: a live pane's identity triple — where a pin's mailbox actually
@@ -282,6 +308,8 @@ pub struct PaneRef {
     pub pane_id: String,
     pub workspace_id: String,
     pub tab_id: String,
+    /// bd-u31k: the pane's stamped `toron_npub` token, when present.
+    pub npub: Option<String>,
 }
 
 /// ADR-0010 F2: roster-staleness cadence (days). Entries with no signed
@@ -1403,9 +1431,17 @@ impl Mailbox {
         let now_us = crate::index::writer::Clock::now_us(&crate::index::writer::SystemClock);
         // bd-u4e2: attach the LIVE pane when herdr can be reached (advisory).
         let pane = Self::live_pin_pane_map().remove(&name);
+        // bd-u31k: identity health — the stamp's npub vs the registry npub.
+        // A pane that stamps an npub other than this row's means mail to the
+        // name reaches a key the pane does not read (invisible, not lost).
+        let npub_hex = npub.to_hex();
+        let pane_npub = pane.as_ref().and_then(|p| p.npub.clone());
+        let identity_divergent = pane_npub
+            .as_deref()
+            .is_some_and(|pn| pn != npub_hex.as_str());
         Ok(WhoIs {
             name: name.to_string(),
-            npub: npub.to_hex(),
+            npub: npub_hex,
             program: profile.program,
             model: profile.model,
             task_description: profile.task_description,
@@ -1414,6 +1450,8 @@ impl Mailbox {
             pane_id: pane.as_ref().map(|p| p.pane_id.clone()),
             workspace_id: pane.as_ref().map(|p| p.workspace_id.clone()),
             tab_id: pane.as_ref().map(|p| p.tab_id.clone()),
+            pane_npub,
+            identity_divergent,
         })
     }
 
@@ -1453,6 +1491,8 @@ impl Mailbox {
                 pane_id: None,
                 workspace_id: None,
                 tab_id: None,
+                pane_npub: None,
+                identity_divergent: false,
             });
             if ts_us > entry.last_active_ts_us {
                 entry.npub = npub;
@@ -1483,6 +1523,11 @@ impl Mailbox {
         let mut panes = Self::live_pin_pane_map();
         for agent in &mut agents {
             if let Some(pane) = panes.remove(&agent.name) {
+                agent.identity_divergent = pane
+                    .npub
+                    .as_deref()
+                    .is_some_and(|pn| pn != agent.npub.as_str());
+                agent.pane_npub = pane.npub;
                 agent.pane_id = Some(pane.pane_id);
                 agent.workspace_id = Some(pane.workspace_id);
                 agent.tab_id = Some(pane.tab_id);
@@ -1624,6 +1669,7 @@ pub fn pin_pane_map(
                 pane_id: pane.pane_id.clone(),
                 workspace_id: pane.workspace_id.clone(),
                 tab_id: pane.tab_id.clone(),
+                npub: pane_token_npub(pane).map(str::to_string),
             });
         }
     }
@@ -1647,6 +1693,7 @@ pub fn pin_pane_map(
             pane_id: pane.pane_id.clone(),
             workspace_id: pane.workspace_id.clone(),
             tab_id: pane.tab_id.clone(),
+            npub: None,
         });
     }
     out
@@ -1659,6 +1706,54 @@ pub fn pane_token_pin(pane: &PaneInfo) -> Option<&str> {
         .get(crate::backend::herdr::TOKEN_PIN)
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
+}
+
+/// bd-u31k: the pane's stamped npub (`toron_npub` token) when present.
+pub fn pane_token_npub(pane: &PaneInfo) -> Option<&str> {
+    pane.tokens
+        .get(crate::backend::herdr::TOKEN_NPUB)
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+}
+
+/// bd-u31k: one live pane's mail-identity stamp — the pin it was bound to
+/// and the npub the stamp carries. The project token is kept as stamped:
+/// flywheel stamps a project PATH while toron bootstrap stamps a slug, so
+/// consumers normalize with [`stamp_project_slug`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaneStamp {
+    pub pane_id: String,
+    pub pin: String,
+    pub project: String,
+    pub npub: String,
+}
+
+/// bd-u31k: read a pane's full mail-identity stamp (pure). Requires BOTH
+/// `toron_pin` and `toron_npub` — a stamp without an npub cannot be
+/// divergence-checked and is skipped. The project token is optional.
+pub fn pane_stamp(pane: &PaneInfo) -> Option<PaneStamp> {
+    let pin = pane_token_pin(pane)?;
+    let npub = pane_token_npub(pane)?;
+    let project = pane
+        .tokens
+        .get(crate::backend::herdr::TOKEN_PROJECT)
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    Some(PaneStamp {
+        pane_id: pane.pane_id.clone(),
+        pin: pin.to_string(),
+        project,
+        npub: npub.to_string(),
+    })
+}
+
+/// bd-u31k: normalize a stamp's project token to the registry's slug — a
+/// path (`/Users/x/workspace/beads`, flywheel's stamp) resolves to its
+/// basename; a slug passes through. Pure.
+pub fn stamp_project_slug(project: &str) -> &str {
+    let trimmed = project.trim_end_matches(['/', '\\']);
+    trimmed.rsplit(['/', '\\']).next().unwrap_or(trimmed)
 }
 
 /// bd-0sbf: pure resolve core — token-first, `agent.list` name fallback
@@ -1960,6 +2055,37 @@ mod tests {
         .expect("test pane parses")
     }
 
+    /// bd-u31k: a pane carrying the full mail-identity stamp
+    /// (pin + project + npub), as `agent bootstrap` / flywheel write it.
+    fn test_pane_stamped(pane_id: &str, pin: &str, project: &str, npub: &str) -> PaneInfo {
+        let mut pane = test_pane(pane_id, Some(pin));
+        pane.tokens.insert(
+            crate::backend::herdr::TOKEN_PROJECT.into(),
+            serde_json::Value::String(project.into()),
+        );
+        pane.tokens.insert(
+            crate::backend::herdr::TOKEN_NPUB.into(),
+            serde_json::Value::String(npub.into()),
+        );
+        pane
+    }
+
+    /// bd-u31k: a full stamp needs BOTH routing tokens (a pin-only pane is
+    /// not divergence-checkable); a path-form project token (flywheel's
+    /// stamp) normalizes to the registry's slug.
+    #[test]
+    fn pane_stamp_reads_full_stamp_and_normalizes_project() {
+        let npub = "cc".repeat(32);
+        let pane = test_pane_stamped("w2:p1", "SlateHerder", "/Users/x/workspace/toron", &npub);
+        let stamp = pane_stamp(&pane).expect("full stamp reads");
+        assert_eq!(stamp.pane_id, "w2:p1");
+        assert_eq!(stamp.pin, "SlateHerder");
+        assert_eq!(stamp.npub, npub);
+        assert_eq!(stamp_project_slug(&stamp.project), "toron");
+        assert_eq!(stamp_project_slug("toron"), "toron");
+        assert!(pane_stamp(&test_pane("w2:p2", Some("BarePin"))).is_none());
+    }
+
     fn test_agent(pane_id: &str, name: Option<&str>) -> AgentInfo {
         serde_json::from_value(serde_json::json!({
             "agent_status": "working",
@@ -2025,6 +2151,7 @@ mod tests {
                 pane_id: "w1:p1".into(),
                 workspace_id: "w1".into(),
                 tab_id: "w1:t1".into(),
+                npub: None,
             }),
             "stamped pin maps to its own pane (workspace + tab carried)"
         );

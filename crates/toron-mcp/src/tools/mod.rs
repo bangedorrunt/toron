@@ -229,6 +229,8 @@ impl ToJson for WhoIs {
             "pane_id": self.pane_id,
             "workspace_id": self.workspace_id,
             "tab_id": self.tab_id,
+            "pane_npub": self.pane_npub,
+            "identity_divergent": self.identity_divergent,
         })
     }
 }
