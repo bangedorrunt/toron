@@ -1249,6 +1249,7 @@ pub const fn robot_tool_name(command: &Command) -> &'static str {
         Command::Reserve(ReserveCommand::RequestRelease(_)) => "reserve.request_release",
         Command::Reserve(ReserveCommand::Respond(_)) => "reserve.respond",
         Command::Reserve(ReserveCommand::Transfer(_)) => "reserve.transfer",
+        Command::Reserve(ReserveCommand::WithLease(_)) => "reserve.with_lease",
         Command::Slot(SlotCommand::Acquire(_)) => "slot.acquire",
         Command::Slot(SlotCommand::Renew(_)) => "slot.renew",
         Command::Slot(SlotCommand::Release(_)) => "slot.release",

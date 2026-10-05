@@ -781,7 +781,7 @@ pub async fn run_ack_sla_daemon(_dc: &DaemonClient, args: &AckSlaArgs) -> anyhow
 /// name-routed surface reaches it, and the guard cannot map the commit back
 /// to a pin. Warn loud, name the remedy; NEVER block (a key-file holder is
 /// legal and this is advisory).
-async fn warn_if_unregistered(mailbox: &Mailbox, project: &str, agent: &str) {
+pub(crate) async fn warn_if_unregistered(mailbox: &Mailbox, project: &str, agent: &str) {
     if mailbox.agent_registered(project, agent).await {
         return;
     }
@@ -920,6 +920,10 @@ pub async fn run_reserve(mailbox: &Mailbox, cmd: &ReserveCommand) -> anyhow::Res
                 })
                 .await?,
         ),
+        ReserveCommand::WithLease(_) => anyhow::bail!(
+            "reserve with-lease is dispatched in main before the mailbox arm (its child runs in \
+             the CLI's process); this arm is a tripwire, not a path"
+        ),
         ReserveCommand::Transfer(args) => emit(
             mailbox
                 .transfer_reservation(
@@ -992,8 +996,9 @@ fn warn_zero_file_matches(paths: &[String]) {
 
 /// Best-effort repo file list: recursive walk of the cwd, slash-joined
 /// repo-relative paths. Skips `.git` and `target`; capped so a huge tree
-/// cannot stall an acquire.
-fn repo_relative_files() -> Vec<String> {
+/// cannot stall an acquire. Public within the crate: `reserve with-lease`
+/// refuses zero-file-match globs on the same list.
+pub(crate) fn repo_relative_files() -> Vec<String> {
     const CAP: usize = 100_000;
     let mut out = Vec::new();
     let mut stack = vec![std::path::PathBuf::from(".")];
@@ -1226,6 +1231,10 @@ pub async fn run_reserve_daemon(dc: &DaemonClient, cmd: &ReserveCommand) -> anyh
             )
             .await
         }
+        ReserveCommand::WithLease(_) => anyhow::bail!(
+            "reserve with-lease is dispatched in main before the mailbox arm (its child runs in \
+             the CLI's process); this arm is a tripwire, not a path"
+        ),
         ReserveCommand::Transfer(args) => {
             daemon_tool(
                 dc,

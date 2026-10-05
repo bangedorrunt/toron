@@ -15,6 +15,7 @@ mod theme;
 mod tracker;
 mod tui;
 mod wake_sock;
+mod with_lease;
 mod workflow;
 
 use std::path::PathBuf;
@@ -132,6 +133,12 @@ fn run(cli: &Cli) -> anyhow::Result<ExitCode> {
         Command::RunState(cmd) => {
             run_run_state(cmd, &cfg, format)?;
             ExitCode::SUCCESS
+        }
+        // bd-reserve-with-lease-2lvt: dispatched BEFORE the robot arm — the
+        // child process runs in THIS process and cwd (a daemon cannot run
+        // it), and the wrapper must exit with the command's own code.
+        Command::Reserve(crate::cli::ReserveCommand::WithLease(args)) => {
+            with_lease::run_cli(args, cli.globals.dry_run)?
         }
         Command::Mail(_)
         | Command::AckSla(_)

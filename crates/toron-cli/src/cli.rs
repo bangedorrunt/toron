@@ -732,6 +732,10 @@ pub enum ReserveCommand {
     /// path, exclusive + reason preserved). Never "commit as me" — the
     /// target commits as itself. bd-pin-public-plane-s-easy.13.
     Transfer(ReserveTransferArgs),
+    /// Run one command under exclusive leases: acquire, run, ALWAYS release
+    /// (success, failure, signal); exit with the command's own code.
+    /// bd-reserve-with-lease-2lvt.
+    WithLease(ReserveWithLeaseArgs),
 }
 
 #[derive(Debug, Args)]
@@ -931,6 +935,36 @@ pub struct ReserveTransferArgs {
     /// Explicit reason override (default: preserve the held lease's reason).
     #[arg(long)]
     pub reason: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct ReserveWithLeaseArgs {
+    /// Path globs to hold for the command (comma-separated).
+    #[arg(long, value_delimiter = ',', required = true)]
+    pub paths: Vec<String>,
+    /// Project slug.
+    #[arg(long, required = true)]
+    pub project: String,
+    /// Agent holding the leases (the pin).
+    #[arg(long = "as", required = true)]
+    pub agent: String,
+    /// Lease reason (the bead id this scoped command belongs to). Required:
+    /// a reason-less scoped lease is exactly the stale-lease litter this verb
+    /// exists to end.
+    #[arg(long, required = true)]
+    pub reason: String,
+    /// Seconds to keep polling while another pin holds the paths exclusively
+    /// before refusing (0 = refuse on the first conflict).
+    #[arg(long, default_value_t = 60)]
+    pub wait_secs: u64,
+    /// Lease TTL in seconds (default envelope TTL). The wrapper still
+    /// releases when the command finishes first; a command that outlives the
+    /// TTL loses its hold and takes the sweep's staleness path.
+    #[arg(long)]
+    pub ttl_secs: Option<u64>,
+    /// The command to run while the leases are held (everything after `--`).
+    #[arg(last = true, required = true, num_args = 1.., value_name = "CMD")]
+    pub command: Vec<String>,
 }
 
 #[derive(Debug, Subcommand)]
