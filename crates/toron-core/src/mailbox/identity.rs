@@ -1335,7 +1335,39 @@ impl Mailbox {
     /// any-name resolution (AM-Rust parity).
     pub async fn whois(&self, project_slug: &str, name: &str) -> anyhow::Result<WhoIs> {
         let canonical = self.canonical_project(project_slug).await;
-        let set = self.project_read_set(&canonical).await;
+        let panes = Self::live_pin_pane_map(&canonical);
+        self.whois_inner(&canonical, name, panes).await
+    }
+
+    /// bd-zoir: `whois` with the pane world substituted — same resolution
+    /// (npub, aliases, profiles), but pane identity from `panes`/`agents`
+    /// plus flywheel spawn-registry `bindings` instead of live herdr and the
+    /// operator's state home. The live `whois` is this with the world's
+    /// data; tests drive this with fixtures (no herdr, no ambient state).
+    pub async fn whois_with_panes(
+        &self,
+        project_slug: &str,
+        name: &str,
+        panes: &[PaneInfo],
+        agents: &[AgentInfo],
+        bindings: &[SpawnRegistryBinding],
+    ) -> anyhow::Result<WhoIs> {
+        let canonical = self.canonical_project(project_slug).await;
+        let mut map = pin_pane_map(panes, agents);
+        augment_pane_map_with_registry(&mut map, panes, bindings);
+        self.whois_inner(&canonical, name, map).await
+    }
+
+    /// Shared resolution core of `whois` / `whois_with_panes`: name → npub →
+    /// profile fields + pane identity-health, with the pane map supplied by
+    /// the caller.
+    async fn whois_inner(
+        &self,
+        canonical: &str,
+        name: &str,
+        mut panes: std::collections::HashMap<String, PaneRef>,
+    ) -> anyhow::Result<WhoIs> {
+        let set = self.project_read_set(canonical).await;
         let mut npub: Option<crate::nostr::PublicKey> = None;
         let mut profiles: Vec<crate::nostr::Event> = Vec::new();
 
@@ -1367,14 +1399,15 @@ impl Mailbox {
                 })
                 .and_then(ident::profile_name_from_d_tag)
                 .unwrap_or(name);
-            return self.whois_build(name.to_string(), npub, profiles);
+            let pane = panes.remove(name);
+            return self.whois_build(name.to_string(), npub, profiles, pane);
         }
 
         // bd-lmcy: role and captain aliases are authoritative in BOTH modes —
         // check alias first even in Open, so `whois wheelhouse` folds to the
         // live pin via the alias table. Then fall back to mode-specific
         // resolution.
-        if let Some(folded) = self.agent_name_alias(&canonical, name).await {
+        if let Some(folded) = self.agent_name_alias(canonical, name).await {
             let target = folded;
             for slug in &set {
                 let filter = kind_project_filter(toron_kind(AGENT_PROFILE), slug);
@@ -1386,16 +1419,17 @@ impl Mailbox {
             }
             let npub = npub
                 .ok_or_else(|| anyhow::anyhow!("unknown agent name: {target} (register first)"))?;
-            return self.whois_build(target, npub, profiles);
+            let pane = panes.remove(&target);
+            return self.whois_build(target, npub, profiles, pane);
         }
         // ADR-0018: swarm mode resolves canonical names, folded aliases, or
         // pins ONLY; display names are non-routable profile metadata.
         // bd-pin-public-plane-s-easy.1: ONE resolver — the fold precedes the
         // shape match (a slug folded to a pin resolves as the pin, not as
         // its canonical shape — whois(slug) must hit the pin's npub).
-        let mode = self.project_identity_mode(&canonical).await;
+        let mode = self.project_identity_mode(canonical).await;
         let target: String = if mode == crate::mailbox::naming::IdentityMode::Swarm {
-            self.resolve_agent_name(&canonical, name).await?
+            self.resolve_agent_name(canonical, name).await?
         } else {
             name.to_string()
         };
@@ -1410,15 +1444,19 @@ impl Mailbox {
         }
         let npub =
             npub.ok_or_else(|| anyhow::anyhow!("unknown agent name: {target} (register first)"))?;
-        self.whois_build(target, npub, profiles)
+        let pane = panes.remove(&target);
+        self.whois_build(target, npub, profiles, pane)
     }
 
     /// Shared tail of `whois`: profile fields + last-active provenance.
+    /// bd-zoir: the pane is the caller's (the live sweep in `whois`, a
+    /// fixture in tests) — this loader never reads the world itself.
     fn whois_build(
         &self,
         name: String,
         npub: crate::nostr::PublicKey,
         profiles: Vec<crate::nostr::Event>,
+        pane: Option<PaneRef>,
     ) -> anyhow::Result<WhoIs> {
         // Profile fields + last-active provenance (latest signed profile event).
         let profile_ev = profiles
@@ -1429,8 +1467,8 @@ impl Mailbox {
         let profile = ident::parse_profile(profile_ev).unwrap_or_else(|| AgentProfile::new(&name));
         let last_active_ts_us = profile_ev.created_at.as_secs() as i64 * 1_000_000;
         let now_us = crate::index::writer::Clock::now_us(&crate::index::writer::SystemClock);
-        // bd-u4e2: attach the LIVE pane when herdr can be reached (advisory).
-        let pane = Self::live_pin_pane_map().remove(&name);
+        // bd-zoir: the pane comes from the caller's sweep — a stamp or
+        // `agent.list` binding, backstopped by the flywheel spawn registry.
         // bd-u31k: identity health — the stamp's npub vs the registry npub.
         // A pane that stamps an npub other than this row's means mail to the
         // name reaches a key the pane does not read (invisible, not lost).
@@ -1462,6 +1500,7 @@ impl Mailbox {
         project_slug: &str,
         opts: ListAgentsOptions,
     ) -> anyhow::Result<Vec<WhoIs>> {
+        let canonical = self.canonical_project(project_slug).await;
         let profiles = self.project_profiles(project_slug).await?;
         let mut by_name: std::collections::HashMap<String, WhoIs> =
             std::collections::HashMap::new();
@@ -1520,7 +1559,7 @@ impl Mailbox {
         agents.sort_by_key(|b| std::cmp::Reverse(b.last_active_ts_us));
         // bd-u4e2: attach each pin's LIVE pane when herdr can be reached
         // (advisory; an unreachable backend leaves the fields `None`).
-        let mut panes = Self::live_pin_pane_map();
+        let mut panes = Self::live_pin_pane_map(&canonical);
         for agent in &mut agents {
             if let Some(pane) = panes.remove(&agent.name) {
                 agent.identity_divergent = pane
@@ -1566,7 +1605,10 @@ impl Mailbox {
     /// pane fields instead of failing. Pane visibility is ADVISORY (the same
     /// posture as the other opportunistic `HerdrBackend::connect` callers) —
     /// a pane-less environment must never turn a roster read into an error.
-    fn live_pin_pane_map() -> std::collections::HashMap<String, PaneRef> {
+    /// bd-zoir: a pin the direct sweep misses falls back to the flywheel
+    /// spawn registry binding for `project`, so a pane re-bound under another
+    /// display pin still answers for its mail identity.
+    fn live_pin_pane_map(project: &str) -> std::collections::HashMap<String, PaneRef> {
         let Ok(backend) = HerdrBackend::connect(None) else {
             return std::collections::HashMap::new();
         };
@@ -1583,7 +1625,13 @@ impl Mailbox {
             })
             .unwrap_or_default();
         drop(client);
-        pin_pane_map(&panes, &agents)
+        let mut map = pin_pane_map(&panes, &agents);
+        augment_pane_map_with_registry(
+            &mut map,
+            &panes,
+            &spawn_registry_bindings_for_slug(project),
+        );
+        map
     }
 
     /// `resolve_pane_identity`: herdr pane_id → agent name (G9). `None` when
@@ -1754,6 +1802,147 @@ pub fn pane_stamp(pane: &PaneInfo) -> Option<PaneStamp> {
 pub fn stamp_project_slug(project: &str) -> &str {
     let trimmed = project.trim_end_matches(['/', '\\']);
     trimmed.rsplit(['/', '\\']).next().unwrap_or(trimmed)
+}
+
+/// bd-zoir: one `mail_identity` → pane binding from a flywheel spawn
+/// registry (flywheel's `SpawnEntry` row).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpawnRegistryBinding {
+    /// The registered agent-mail identity (adjective+noun pin).
+    pub pin: String,
+    /// The herdr pane id the identity was spawned into.
+    pub pane_id: String,
+}
+
+/// bd-zoir: pure — parse one spawn-registry file body (`<state>/flywheel/
+/// agents/<key>.json` or the project-local `.flywheel/agent-names.json`
+/// mirror). Only rows carrying `mail_identity` bind a pin: the herdr `name`
+/// is a pane slug (`crew-elme…-coder`), not an identity. A corrupt body
+/// reads empty — the same tolerance flywheel's own loader applies.
+pub fn spawn_registry_bindings(json: &str) -> Vec<SpawnRegistryBinding> {
+    #[derive(serde::Deserialize)]
+    struct Row {
+        pane_id: String,
+        #[serde(default)]
+        mail_identity: Option<String>,
+    }
+    serde_json::from_str::<Vec<Row>>(json)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|row| {
+            let pin = row.mail_identity.filter(|p| !p.is_empty())?;
+            Some(SpawnRegistryBinding {
+                pin,
+                pane_id: row.pane_id,
+            })
+        })
+        .collect()
+}
+
+/// bd-zoir: pure — is `stem` (a registry file name without `.json`) a key
+/// for `slug`? Flywheel's `doorbell_core::registry_key` is the bare project
+/// string, or `<base>-<8 lowercase hex>` when the project resolved to a
+/// directory. Exact suffix matching keeps a dashy sibling (`flywheel-toron`)
+/// from answering for `flywheel`.
+pub fn spawn_registry_stem_matches(stem: &str, slug: &str) -> bool {
+    if stem == slug {
+        return true;
+    }
+    let Some(hash) = stem
+        .strip_prefix(slug)
+        .and_then(|rest| rest.strip_prefix('-'))
+    else {
+        return false;
+    };
+    hash.len() == 8
+        && hash
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// bd-zoir: pure — fold spawn-registry bindings into the live pin→pane map
+/// for pins the direct sweep (stamps + `agent.list`) missed. A live binding
+/// always wins (the registry only fills gaps); a binding whose pane is not
+/// live binds nothing; the pane's stamped `toron_npub` rides along so
+/// `whois` can still compare keys.
+pub fn augment_pane_map_with_registry(
+    map: &mut std::collections::HashMap<String, PaneRef>,
+    panes: &[PaneInfo],
+    bindings: &[SpawnRegistryBinding],
+) {
+    let pane_by_id: std::collections::HashMap<&str, &PaneInfo> =
+        panes.iter().map(|p| (p.pane_id.as_str(), p)).collect();
+    for binding in bindings {
+        if binding.pin.is_empty() || map.contains_key(&binding.pin) {
+            continue;
+        }
+        let Some(pane) = pane_by_id.get(binding.pane_id.as_str()) else {
+            continue; // the bound pane is not live — nothing to attach
+        };
+        map.insert(
+            binding.pin.clone(),
+            PaneRef {
+                pane_id: pane.pane_id.clone(),
+                workspace_id: pane.workspace_id.clone(),
+                tab_id: pane.tab_id.clone(),
+                npub: pane_token_npub(pane).map(str::to_string),
+            },
+        );
+    }
+}
+
+/// bd-zoir: read pin→pane bindings for `slug` from an explicit registry dir
+/// (the hermetic seam; [`Mailbox::live_pin_pane_map`] resolves flywheel's
+/// state home and calls this). File names are read in sorted order so the
+/// result is deterministic; a missing dir, missing files, and corrupt
+/// bodies read empty — an unreachable registry must never turn a roster
+/// read into an error (the same advisory posture as the pane fields).
+pub fn spawn_registry_bindings_in(dir: &std::path::Path, slug: &str) -> Vec<SpawnRegistryBinding> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entries
+        .flatten()
+        .filter_map(|e| e.file_name().to_str().map(str::to_string))
+        .filter(|name| {
+            name.strip_suffix(".json")
+                .is_some_and(|stem| spawn_registry_stem_matches(stem, slug))
+        })
+        .collect();
+    names.sort();
+    let mut out = Vec::new();
+    for name in names {
+        if let Ok(body) = std::fs::read_to_string(dir.join(&name)) {
+            out.extend(spawn_registry_bindings(&body));
+        }
+    }
+    out
+}
+
+/// bd-zoir: flywheel's state dir — `$XDG_STATE_HOME/flywheel` >
+/// `~/.local/state/flywheel`, the same resolution flywheel's
+/// `config::state_dir()` uses (never the macOS App Support dir: live state
+/// lives under `~/.local/state`).
+fn flywheel_state_dir() -> Option<PathBuf> {
+    if let Some(xdg) = std::env::var_os("XDG_STATE_HOME").filter(|v| !v.is_empty()) {
+        return Some(PathBuf::from(xdg).join("flywheel"));
+    }
+    let home = std::env::var_os("HOME").filter(|v| !v.is_empty())?;
+    Some(
+        PathBuf::from(home)
+            .join(".local")
+            .join("state")
+            .join("flywheel"),
+    )
+}
+
+/// bd-zoir: the ambient spawn-registry read — best-effort, empty when no
+/// state home resolves.
+fn spawn_registry_bindings_for_slug(slug: &str) -> Vec<SpawnRegistryBinding> {
+    match flywheel_state_dir() {
+        Some(state) => spawn_registry_bindings_in(&state.join("agents"), slug),
+        None => Vec::new(),
+    }
 }
 
 /// bd-0sbf: pure resolve core — token-first, `agent.list` name fallback
@@ -4057,5 +4246,193 @@ mod tests {
         assert_eq!(r2.deliveries[0].payload.recipient, "RedDune");
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// bd-zoir: flywheel's registry keys are the bare slug or `<slug>-<8
+    /// lowercase hex>` (path-derived); every lookalike must miss so a dashy
+    /// sibling (`flywheel-toron`) never answers for `flywheel`.
+    #[test]
+    fn spawn_registry_stem_matches_slug_keys() {
+        assert!(spawn_registry_stem_matches(
+            "elm-effect-rs",
+            "elm-effect-rs"
+        ));
+        assert!(spawn_registry_stem_matches(
+            "elm-effect-rs-be181b5d",
+            "elm-effect-rs"
+        ));
+        assert!(spawn_registry_stem_matches("toron-fd455c8b", "toron"));
+        assert!(spawn_registry_stem_matches("toron", "toron"));
+        assert!(!spawn_registry_stem_matches(
+            "elm-effect-rs-be181b5",
+            "elm-effect-rs"
+        ));
+        assert!(!spawn_registry_stem_matches(
+            "elm-effect-rs-BE181B5D",
+            "elm-effect-rs"
+        ));
+        assert!(!spawn_registry_stem_matches(
+            "elm-effect-rs-backup",
+            "elm-effect-rs"
+        ));
+        assert!(!spawn_registry_stem_matches(
+            "elm-effect-rs-",
+            "elm-effect-rs"
+        ));
+        assert!(!spawn_registry_stem_matches("flywheel-toron", "flywheel"));
+        assert!(!spawn_registry_stem_matches(
+            "elm-effect-rsx",
+            "elm-effect-rs"
+        ));
+        assert!(!spawn_registry_stem_matches("other", "elm-effect-rs"));
+    }
+
+    /// bd-zoir: only `mail_identity` rows bind a pin (the herdr `name` is a
+    /// pane slug, not an identity); a corrupt body reads empty like
+    /// flywheel's own loader.
+    #[test]
+    fn spawn_registry_bindings_parse_mail_identity_rows() {
+        let rows = spawn_registry_bindings(
+            r#"[
+              {"pane_id": "w3S:p1", "name": "crew-elme-coder", "mail_identity": "SilverPond"},
+              {"pane_id": "w3S:p2", "name": "legacy-no-identity"},
+              {"pane_id": "w3S:p3", "name": "GoldPike", "mail_identity": "GoldPike"}
+            ]"#,
+        );
+        assert_eq!(
+            rows,
+            vec![
+                SpawnRegistryBinding {
+                    pin: "SilverPond".into(),
+                    pane_id: "w3S:p1".into(),
+                },
+                SpawnRegistryBinding {
+                    pin: "GoldPike".into(),
+                    pane_id: "w3S:p3".into(),
+                },
+            ]
+        );
+        assert!(spawn_registry_bindings("not json").is_empty());
+        assert!(spawn_registry_bindings("").is_empty());
+    }
+
+    /// bd-zoir: the measured SilverPond case — the pane is stamped with a
+    /// DIFFERENT pin, so the direct sweep has no entry for it; the registry
+    /// binding fills the pane (stamped npub included) so `whois` can compare
+    /// keys.
+    #[test]
+    fn registry_fallback_fills_missing_pin_pane() {
+        let slate = "bb".repeat(32);
+        let panes = vec![test_pane_stamped(
+            "w3S:p1",
+            "SlateHerder",
+            "/Users/x/workspace/elm-effect-rs",
+            &slate,
+        )];
+        let agents: Vec<AgentInfo> = Vec::new();
+        let mut map = pin_pane_map(&panes, &agents);
+        assert!(map.contains_key("SlateHerder"));
+        assert!(!map.contains_key("SilverPond"));
+        augment_pane_map_with_registry(
+            &mut map,
+            &panes,
+            &[SpawnRegistryBinding {
+                pin: "SilverPond".into(),
+                pane_id: "w3S:p1".into(),
+            }],
+        );
+        let pane = map
+            .get("SilverPond")
+            .expect("registry binding fills the pin");
+        assert_eq!(pane.pane_id, "w3S:p1");
+        assert_eq!(pane.workspace_id, "w1");
+        assert_eq!(pane.npub.as_deref(), Some(slate.as_str()));
+        // The stamped pin keeps its own binding.
+        assert_eq!(
+            map.get("SlateHerder").map(|p| p.pane_id.as_str()),
+            Some("w3S:p1")
+        );
+    }
+
+    /// bd-zoir: a live stamp / `agent.list` binding is authoritative — the
+    /// registry only fills gaps, and a binding whose pane is not live fills
+    /// nothing.
+    #[test]
+    fn registry_fallback_never_overrides_a_live_binding() {
+        let own = "cc".repeat(32);
+        let panes = vec![
+            test_pane_stamped("w1:p1", "QuietHeron", "/Users/x/workspace/toron", &own),
+            test_pane_stamped(
+                "w1:p2",
+                "QuietHarbor",
+                "/Users/x/workspace/toron",
+                &"dd".repeat(32),
+            ),
+        ];
+        let mut map = pin_pane_map(&panes, &[]);
+        augment_pane_map_with_registry(
+            &mut map,
+            &panes,
+            &[
+                // Stale row: the pin is live on w1:p1; the registry must not move it.
+                SpawnRegistryBinding {
+                    pin: "QuietHeron".into(),
+                    pane_id: "w1:p2".into(),
+                },
+                // Dead pane: nothing to bind.
+                SpawnRegistryBinding {
+                    pin: "GhostPin".into(),
+                    pane_id: "w9:p9".into(),
+                },
+            ],
+        );
+        assert_eq!(
+            map.get("QuietHeron").map(|p| p.pane_id.as_str()),
+            Some("w1:p1")
+        );
+        assert_eq!(
+            map.get("QuietHeron").and_then(|p| p.npub.as_deref()),
+            Some(own.as_str())
+        );
+        assert!(!map.contains_key("GhostPin"));
+    }
+
+    /// bd-zoir: the registry-dir reader selects exactly the slug's files
+    /// (bare key + path-derived key), skips meta/backup/lookalike names, and
+    /// stays best-effort on corrupt bodies and a missing dir.
+    #[test]
+    fn spawn_registry_bindings_in_reads_only_the_slug_keys() {
+        let dir = std::env::temp_dir().join(format!("toron-registry-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let write = |name: &str, body: &str| std::fs::write(dir.join(name), body).expect("write");
+        write(
+            "elm-effect-rs-be181b5d.json",
+            r#"[{"pane_id": "w3S:p1", "name": "crew-elme-coder", "mail_identity": "SilverPond"}]"#,
+        );
+        write(
+            "elm-effect-rs.json",
+            r#"[{"pane_id": "w3S:p2", "name": "EmberOtter", "mail_identity": "EmberOtter"}]"#,
+        );
+        write(
+            "elm-effect-rs-be181b5d.json.bak",
+            r#"[{"pane_id": "w0:p0", "name": "backup", "mail_identity": "BackupPin"}]"#,
+        );
+        write(
+            "elm-effect-rs-backup.json",
+            r#"[{"pane_id": "w0:p0", "name": "backup", "mail_identity": "BackupPin"}]"#,
+        );
+        write("elm-effect-rs.meta.json", r#"{"label": "x"}"#);
+        write(
+            "other-project.json",
+            r#"[{"pane_id": "w0:p0", "name": "o", "mail_identity": "OtherPin"}]"#,
+        );
+        write("elm-effect-rs-deadbeef.json", "corrupt {");
+        let rows = spawn_registry_bindings_in(&dir, "elm-effect-rs");
+        let mut pins: Vec<&str> = rows.iter().map(|r| r.pin.as_str()).collect();
+        pins.sort_unstable();
+        assert_eq!(pins, vec!["EmberOtter", "SilverPond"]);
+        // Missing dir reads empty, never an error.
+        assert!(spawn_registry_bindings_in(&dir.join("nope"), "elm-effect-rs").is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
