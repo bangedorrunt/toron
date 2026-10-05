@@ -3909,3 +3909,253 @@ fn reserve_with_lease_scoped_command_releases_on_signal() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ---------------------------------------------------------------------------
+// bd-release-dry-run-mutates-ri7o: `-n/--dry-run` must be strictly read-only
+// for every mutating reserve command. Measured bug: `reserve release -n`
+// reported `released: N` AND released for real.
+// ---------------------------------------------------------------------------
+
+/// The board row for this reason, if any (holder included).
+fn with_lease_board_row(data_dir: &std::path::Path, reason: &str) -> Option<Value> {
+    let out = with_lease_run(
+        data_dir,
+        &["reserve", "list", "--project", "demo", "--json"],
+    );
+    assert!(
+        out.status.success(),
+        "reserve list: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let board: Value = serde_json::from_slice(&out.stdout).expect("board JSON");
+    board["reservations"]
+        .as_array()
+        .and_then(|rows| rows.iter().find(|r| r["reason"] == reason))
+        .cloned()
+}
+
+/// The measured bug plus the audit the bead asks for: release (bug),
+/// acquire, transfer, sweep — a dry run must never mutate.
+#[test]
+fn release_dry_run_is_read_only() {
+    let dir = with_lease_dir("dryrun");
+    with_lease_bootstrap(&dir, "DryRidge");
+    with_lease_bootstrap(&dir, "DryMarlin");
+
+    // Release (the measured case): a real hold survives a dry-run release,
+    // and the following real release removes it.
+    let acq = with_lease_run(
+        &dir,
+        &[
+            "reserve",
+            "acquire",
+            "--project",
+            "demo",
+            "--as",
+            "DryRidge",
+            "--paths",
+            "dryrun/probe.rs",
+            "--reason",
+            "dryrun-release",
+            "--json",
+        ],
+    );
+    assert!(
+        acq.status.success(),
+        "acquire: {}",
+        String::from_utf8_lossy(&acq.stderr)
+    );
+    assert!(
+        with_lease_board_has_reason(&dir, "dryrun-release"),
+        "precondition: the hold must exist"
+    );
+    let dry = with_lease_run(
+        &dir,
+        &[
+            "reserve",
+            "release",
+            "--project",
+            "demo",
+            "--as",
+            "DryRidge",
+            "--paths",
+            "dryrun/probe.rs",
+            "-n",
+            "--json",
+        ],
+    );
+    assert!(
+        dry.status.success(),
+        "dry-run release: {}",
+        String::from_utf8_lossy(&dry.stderr)
+    );
+    let dry_json: Value =
+        serde_json::from_slice(&dry.stdout).expect("dry-run release must print JSON");
+    assert_eq!(
+        dry_json["dry_run"], true,
+        "the preview must say it is a dry run: {dry_json}"
+    );
+    assert!(
+        with_lease_board_has_reason(&dir, "dryrun-release"),
+        "a dry-run release must NOT release"
+    );
+    let real = with_lease_run(
+        &dir,
+        &[
+            "reserve",
+            "release",
+            "--project",
+            "demo",
+            "--as",
+            "DryRidge",
+            "--paths",
+            "dryrun/probe.rs",
+            "--json",
+        ],
+    );
+    assert!(
+        real.status.success(),
+        "real release: {}",
+        String::from_utf8_lossy(&real.stderr)
+    );
+    assert!(
+        !with_lease_board_has_reason(&dir, "dryrun-release"),
+        "the real release must remove the hold"
+    );
+
+    // Audit 1 — acquire: a dry run must not lease.
+    let dry_acq = with_lease_run(
+        &dir,
+        &[
+            "reserve",
+            "acquire",
+            "--project",
+            "demo",
+            "--as",
+            "DryRidge",
+            "--paths",
+            "dryrun/audit.rs",
+            "--reason",
+            "dryrun-acquire",
+            "-n",
+            "--json",
+        ],
+    );
+    assert!(
+        dry_acq.status.success(),
+        "dry-run acquire: {}",
+        String::from_utf8_lossy(&dry_acq.stderr)
+    );
+    assert!(
+        !with_lease_board_has_reason(&dir, "dryrun-acquire"),
+        "a dry-run acquire must not lease"
+    );
+
+    // Audit 2 — transfer: a dry run must not move a held lease.
+    let held = with_lease_run(
+        &dir,
+        &[
+            "reserve",
+            "acquire",
+            "--project",
+            "demo",
+            "--as",
+            "DryRidge",
+            "--paths",
+            "dryrun/xfer.rs",
+            "--reason",
+            "dryrun-transfer",
+            "--json",
+        ],
+    );
+    assert!(
+        held.status.success(),
+        "acquire for transfer: {}",
+        String::from_utf8_lossy(&held.stderr)
+    );
+    let dry_xfer = with_lease_run(
+        &dir,
+        &[
+            "reserve",
+            "transfer",
+            "--project",
+            "demo",
+            "--as",
+            "DryRidge",
+            "--to",
+            "DryMarlin",
+            "--path",
+            "dryrun/xfer.rs",
+            "-n",
+            "--json",
+        ],
+    );
+    assert!(
+        dry_xfer.status.success(),
+        "dry-run transfer: {}",
+        String::from_utf8_lossy(&dry_xfer.stderr)
+    );
+    let row = with_lease_board_row(&dir, "dryrun-transfer").expect("hold survives the dry run");
+    assert_eq!(
+        row["holder"], "DryRidge",
+        "a dry-run transfer must not move the lease: {row}"
+    );
+
+    // Audit 3 — sweep: a dry run must not release a closed-reason lease and
+    // must not need the operator key (it performs no signed mutation).
+    let repo = dir.join("tracker");
+    std::fs::create_dir_all(repo.join(".beads")).expect("mkdir tracker");
+    std::fs::write(
+        repo.join(".beads/issues.jsonl"),
+        r#"{"id":"dryrun-closed","status":"closed","title":"done"}"#,
+    )
+    .expect("write tracker");
+    let closed_hold = with_lease_run(
+        &dir,
+        &[
+            "reserve",
+            "acquire",
+            "--project",
+            "demo",
+            "--as",
+            "DryRidge",
+            "--paths",
+            "dryrun/sweep.rs",
+            "--reason",
+            "dryrun-closed",
+            "--json",
+        ],
+    );
+    assert!(
+        closed_hold.status.success(),
+        "acquire for sweep: {}",
+        String::from_utf8_lossy(&closed_hold.stderr)
+    );
+    let dry_sweep = with_lease_run(
+        &dir,
+        &[
+            "reserve",
+            "sweep",
+            "--closed-beads",
+            "--project",
+            "demo",
+            "--as",
+            "DryRidge",
+            "--repo",
+            repo.to_str().unwrap(),
+            "-n",
+            "--json",
+        ],
+    );
+    assert!(
+        dry_sweep.status.success(),
+        "dry-run sweep must succeed without an operator key: {}",
+        String::from_utf8_lossy(&dry_sweep.stderr)
+    );
+    assert!(
+        with_lease_board_has_reason(&dir, "dryrun-closed"),
+        "a dry-run sweep must NOT release the closed-reason lease"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

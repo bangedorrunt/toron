@@ -793,7 +793,140 @@ pub(crate) async fn warn_if_unregistered(mailbox: &Mailbox, project: &str, agent
     );
 }
 
-pub async fn run_reserve(mailbox: &Mailbox, cmd: &ReserveCommand) -> anyhow::Result<()> {
+/// bd-release-dry-run-mutates-ri7o: the strict dry-run gate for the whole
+/// mutating reserve surface. `Some(preview)` for every mutating command;
+/// `None` for the read-only ones (`list` / `conflicts`), which run normally
+/// under `-n`.
+///
+/// The preview calls NOTHING — mailbox and daemon both return here before the
+/// match. A preview that mutates is worse than no preview at all: measured
+/// live, `reserve release -n` reported `released: N`, released for real, and
+/// the next real release reported `released: 0`.
+fn reserve_dry_run_preview(cmd: &ReserveCommand) -> Option<Value> {
+    let (tool, args, note) = match cmd {
+        ReserveCommand::Acquire(a) => (
+            "file_reservation_paths",
+            json!({
+                "project_key": a.project,
+                "agent_name": a.agent,
+                "paths": a.paths,
+                "ttl_seconds": a.ttl_secs,
+                "exclusive": a.exclusive,
+                "reason": a.reason,
+            }),
+            "nothing was leased",
+        ),
+        ReserveCommand::Renew(a) => (
+            "renew_file_reservations",
+            json!({
+                "project_key": a.project,
+                "agent_name": a.agent,
+                "extend_seconds": a.extend_secs,
+                "paths": a.paths,
+            }),
+            "nothing was renewed",
+        ),
+        ReserveCommand::Release(a) => (
+            "release_file_reservations",
+            json!({
+                "project_key": a.project,
+                "agent_name": a.agent,
+                "paths": a.paths,
+            }),
+            "nothing was released",
+        ),
+        ReserveCommand::ReleaseByReason(a) => (
+            "release_file_reservations_by_reason",
+            json!({
+                "project_key": a.project,
+                "agent_name": a.agent,
+                "bead_id": a.bead_id,
+                "notify_previous": !a.no_notify,
+            }),
+            "nothing was released",
+        ),
+        ReserveCommand::Sweep(a) => (
+            "release_file_reservations_by_reason",
+            json!({
+                "project_key": a.project,
+                "agent_name": a.agent,
+                "repo": a.repo.as_ref().map(|p| p.display().to_string()),
+                "closed_beads": a.closed_beads,
+            }),
+            "nothing was released; the preview reads no board or tracker — run without -n \
+             to discover the closed-reason leases and release them",
+        ),
+        ReserveCommand::ForceRelease(a) => (
+            "force_release_file_reservation",
+            json!({
+                "project_key": a.project,
+                "agent_name": a.agent,
+                "path": a.path,
+                "holder": a.holder,
+                "note": a.note,
+                "notify_previous": a.notify_previous,
+            }),
+            "nothing was revoked",
+        ),
+        ReserveCommand::RequestRelease(a) => (
+            "send_message",
+            json!({
+                "project_key": a.project,
+                "sender_name": a.agent,
+                "target_agent": a.target,
+                "reservation_id": a.reservation_id,
+                "ask": a.ask,
+                "note": a.note,
+                "subject": "[request-release]",
+            }),
+            "no request was sent",
+        ),
+        ReserveCommand::Respond(a) => (
+            "reply_message",
+            json!({
+                "project_key": a.project,
+                "sender_name": a.agent,
+                "request_id": a.request_id,
+                "decision": a.decision,
+                "note": a.note,
+                "subject": "[request-release-response]",
+            }),
+            "no response was sent",
+        ),
+        ReserveCommand::Transfer(a) => (
+            "file_reservation_paths",
+            json!({
+                "project_key": a.project,
+                "agent_name": a.to,
+                "paths": [a.path.clone()],
+                "transfer_from": a.from,
+                "reason": a.reason,
+            }),
+            "nothing was transferred",
+        ),
+        // Read-only commands run normally under -n; with-lease is dispatched
+        // in `main` and owns its own dry-run (it prints the plan and leases
+        // nothing).
+        ReserveCommand::Conflicts(_) | ReserveCommand::List(_) | ReserveCommand::WithLease(_) => {
+            return None;
+        }
+    };
+    Some(json!({
+        "dry_run": true,
+        "would_call": tool,
+        "args": args,
+        "note": note,
+    }))
+}
+
+pub async fn run_reserve(
+    mailbox: &Mailbox,
+    cmd: &ReserveCommand,
+    dry_run: bool,
+) -> anyhow::Result<()> {
+    if dry_run && let Some(preview) = reserve_dry_run_preview(cmd) {
+        return print_json(&preview);
+    }
     match cmd {
         ReserveCommand::Acquire(args) => {
             warn_if_unregistered(mailbox, &args.project, &args.agent).await;
@@ -1034,7 +1167,14 @@ pub(crate) fn repo_relative_files() -> Vec<String> {
 }
 
 /// Daemon arm of `run_reserve` (bd-pin-public-plane-s-easy.14).
-pub async fn run_reserve_daemon(dc: &DaemonClient, cmd: &ReserveCommand) -> anyhow::Result<()> {
+pub async fn run_reserve_daemon(
+    dc: &DaemonClient,
+    cmd: &ReserveCommand,
+    dry_run: bool,
+) -> anyhow::Result<()> {
+    if dry_run && let Some(preview) = reserve_dry_run_preview(cmd) {
+        return print_json(&preview);
+    }
     match cmd {
         ReserveCommand::Acquire(args) => {
             // bd-zugo: same ghost-holder warning on the daemon arm — the

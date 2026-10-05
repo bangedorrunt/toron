@@ -331,7 +331,7 @@ async fn run_robot(command: &Command, dry_run: bool) -> anyhow::Result<()> {
             robot::run_mail_daemon(dc, cmd).await
         }
         (crate::mailbox_source::MailboxSource::Daemon(dc), Command::Reserve(cmd)) => {
-            robot::run_reserve_daemon(dc, cmd).await
+            robot::run_reserve_daemon(dc, cmd, dry_run).await
         }
         (crate::mailbox_source::MailboxSource::Daemon(dc), Command::Slot(cmd)) => {
             robot::run_slot_daemon(dc, cmd).await
@@ -352,7 +352,7 @@ async fn run_robot(command: &Command, dry_run: bool) -> anyhow::Result<()> {
             robot::run_mail(mb, cmd).await
         }
         (crate::mailbox_source::MailboxSource::Embedded(mb), Command::Reserve(cmd)) => {
-            robot::run_reserve(mb, cmd).await
+            robot::run_reserve(mb, cmd, dry_run).await
         }
         (crate::mailbox_source::MailboxSource::Embedded(mb), Command::Slot(cmd)) => {
             robot::run_slot(mb, cmd).await
