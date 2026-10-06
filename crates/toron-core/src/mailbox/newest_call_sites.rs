@@ -124,7 +124,7 @@ fn adversarial_arrivals(
         .iter()
         .map(|content| build_event(keys, kind, *content, tags(), at).expect("build"))
         .collect();
-    events.sort_by(|a, b| b.id.cmp(&a.id)); // DESC, so the smallest id lands last
+    events.sort_by_key(|a| std::cmp::Reverse(a.id)); // DESC, so the smallest id lands last
     events
 }
 
@@ -322,7 +322,7 @@ async fn whois_reads_the_higher_id_profile_on_a_shared_second() {
             (event, p.name, p.program)
         })
         .collect();
-    built.sort_by(|a, b| b.0.id.cmp(&a.0.id));
+    built.sort_by_key(|a| std::cmp::Reverse(a.0.id));
     let events: Vec<Event> = built.iter().map(|(e, _, _)| e.clone()).collect();
     let (winner, winner_name, winner_program) = built.first().expect("a profile");
     assert_eq!(

@@ -2166,7 +2166,8 @@ mod tests {
     /// that does not exist; deriving it keeps the assertion exact and the diff
     /// free of a marker the attribution rule is right to ask about.
     fn message_citing_crate_fixture(root: &std::path::Path) -> String {
-        let src = std::fs::read_to_string(root.join("crates/demo/src/lib.rs")).expect("crate source");
+        let src =
+            std::fs::read_to_string(root.join("crates/demo/src/lib.rs")).expect("crate source");
         format!("docs: {src} real work")
     }
 

@@ -77,6 +77,7 @@ pub mod search;
 pub mod send_tags;
 pub mod surface;
 pub mod unwrap;
+pub mod yields;
 
 pub use crate::nostr::identity::AgentProfile;
 pub use build_slots::AcquireBuildSlotResult;
