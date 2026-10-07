@@ -18,17 +18,27 @@
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
-use parking_lot::Mutex;
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 use super::error::{BackendError, BackendErrorCode};
-use super::types::{AgentStatus, BackendEvent, PaneId, PromptLanding, normalize_herdr_status};
+use super::types::{normalize_herdr_status, AgentStatus, BackendEvent, PaneId, PromptLanding};
 
 /// herdr socket protocol version this client is verified against (v22,
 /// herdr 0.9.0 — live `herdr api schema --json` reports 22).
 pub const HDR_PROTOCOL: u64 = 22;
+
+/// Default socket I/O budget when a unary call's params omit `timeout_ms`
+/// (and omit nested `wait.timeout_ms`). 30s covers short list/read RPCs
+/// without letting a wedged daemon hang the host forever.
+pub const DEFAULT_RPC_TIMEOUT_MS: u64 = 30_000;
+/// Margin added on top of the call's own `timeout_ms` (or
+/// [`DEFAULT_RPC_TIMEOUT_MS`]) so serialize/connect and the server's
+/// deadline race cleanly rather than racing the socket close.
+pub const RPC_TIMEOUT_MARGIN_MS: u64 = 5_000;
 
 /// Source id for toron mail-identity pane stamps (bd-6f57). Display-only
 /// `pane.report_metadata` — never `pane.report_agent`, which would steal
@@ -91,6 +101,11 @@ pub struct AgentInfo {
     pub revision: u64,
     #[serde(default)]
     pub state_change_seq: u64,
+    /// Monotonic finished-turn counter (herdr). Older servers omit it
+    /// (`None`). Prefer this over watching working→idle for done/hand-off:
+    /// a fast turn can start and finish entirely between two polls.
+    #[serde(default)]
+    pub completion_seq: Option<u64>,
     #[serde(default)]
     pub state_labels: serde_json::Map<String, Value>,
     pub tab_id: String,
@@ -250,6 +265,18 @@ impl Subscription {
         }
     }
 
+    /// Build one multiplexed subscription covering many panes.
+    /// Prefer a single `Client::subscribe` / `Backend::subscribe` call with
+    /// this list over one connection per pane (herdr/tuios cap streams).
+    pub fn agent_status_changed_many(
+        pane_ids: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Vec<Self> {
+        pane_ids
+            .into_iter()
+            .map(|id| Self::agent_status_changed(id.into()))
+            .collect()
+    }
+
     pub const fn with_agent_status(mut self, status: AgentStatus) -> Self {
         self.agent_status = Some(status);
         self
@@ -266,10 +293,23 @@ impl Subscription {
 
 /// Blocking JSON-RPC client over the herdr unix socket. One request per
 /// connection (except `events.subscribe`, which holds the socket open).
-#[derive(Debug, Clone)]
+///
+/// Methods take `&self`: each unary call opens a fresh `UnixStream`, so
+/// concurrent callers only share the atomic request-id counter. Do not hold
+/// a higher-level mutex across these calls.
+#[derive(Debug)]
 pub struct Client {
     socket_path: String,
-    next_id: u64,
+    next_id: AtomicU64,
+}
+
+impl Clone for Client {
+    fn clone(&self) -> Self {
+        Self {
+            socket_path: self.socket_path.clone(),
+            next_id: AtomicU64::new(self.next_id.load(Ordering::Relaxed)),
+        }
+    }
 }
 
 impl Client {
@@ -287,12 +327,19 @@ impl Client {
         })?;
         Ok(Client {
             socket_path: path,
-            next_id: 1,
+            next_id: AtomicU64::new(1),
         })
     }
 
-    fn open(&self) -> Result<UnixStream, BackendError> {
-        UnixStream::connect(&self.socket_path).map_err(|e| {
+    fn alloc_id(&self) -> String {
+        self.next_id.fetch_add(1, Ordering::Relaxed).to_string()
+    }
+
+    /// Open a fresh stream and apply read/write timeouts derived from the
+    /// call's `timeout_ms` (+ [`RPC_TIMEOUT_MARGIN_MS`]), or
+    /// [`DEFAULT_RPC_TIMEOUT_MS`] + margin when the call omits a budget.
+    fn open(&self, timeout: Duration) -> Result<UnixStream, BackendError> {
+        let stream = UnixStream::connect(&self.socket_path).map_err(|e| {
             BackendError::new(
                 BackendErrorCode::Connect,
                 format!(
@@ -300,33 +347,44 @@ impl Client {
                     self.socket_path
                 ),
             )
-        })
+        })?;
+        stream.set_read_timeout(Some(timeout)).map_err(|e| {
+            BackendError::new(
+                BackendErrorCode::Io,
+                format!("set_read_timeout on herdr socket: {e}"),
+            )
+        })?;
+        stream.set_write_timeout(Some(timeout)).map_err(|e| {
+            BackendError::new(
+                BackendErrorCode::Io,
+                format!("set_write_timeout on herdr socket: {e}"),
+            )
+        })?;
+        Ok(stream)
     }
 
     /// Send one request on a fresh connection; returns `result` or a typed
     /// error carrying the protocol machine code.
-    pub fn call_coded(&mut self, method: &str, params: Value) -> Result<Value, BackendError> {
-        let id = self.next_id.to_string();
-        self.next_id += 1;
+    pub fn call_coded(&self, method: &str, params: Value) -> Result<Value, BackendError> {
+        let id = self.alloc_id();
+        let timeout = socket_timeout_from_params(&params);
         let req = json!({ "id": id, "method": method, "params": params });
         let mut line = serde_json::to_string(&req)
             .map_err(|e| BackendError::new(BackendErrorCode::Serialize, e.to_string()))?;
         line.push('\n');
 
-        let mut reader = BufReader::new(self.open()?);
+        let mut reader = BufReader::new(self.open(timeout)?);
         reader
             .get_mut()
             .write_all(line.as_bytes())
             .and_then(|_| reader.get_mut().flush())
-            .map_err(|e| {
-                BackendError::new(BackendErrorCode::Io, format!("write to herdr socket: {e}"))
-            })?;
+            .map_err(|e| map_io_err("write to herdr socket", e))?;
 
         loop {
             let mut buf = String::new();
-            let n = reader.read_line(&mut buf).map_err(|e| {
-                BackendError::new(BackendErrorCode::Io, format!("read from herdr socket: {e}"))
-            })?;
+            let n = reader
+                .read_line(&mut buf)
+                .map_err(|e| map_io_err("read from herdr socket", e))?;
             if n == 0 {
                 return Err(BackendError::new(
                     BackendErrorCode::Io,
@@ -365,17 +423,22 @@ impl Client {
     }
 
     /// `call_coded` unwrapped into anyhow-style `Result<Value>`.
-    pub fn call(&mut self, method: &str, params: Value) -> Result<Value, BackendError> {
+    pub fn call(&self, method: &str, params: Value) -> Result<Value, BackendError> {
         self.call_coded(method, params)
     }
 
     /// Subscribe to events; returns a long-lived blocking stream.
-    pub fn subscribe(
-        &mut self,
-        subscriptions: &[Subscription],
-    ) -> Result<EventStream, BackendError> {
-        let id = self.next_id.to_string();
-        self.next_id += 1;
+    ///
+    /// Pass every pane of interest in one call (see
+    /// [`Subscription::agent_status_changed_many`]) rather than opening one
+    /// stream per pane.
+    pub fn subscribe(&self, subscriptions: &[Subscription]) -> Result<EventStream, BackendError> {
+        let id = self.alloc_id();
+        // Bound the subscribe-ack wait with the default unary budget; the
+        // long-lived stream then relies on [`EventStream`]/
+        // [`super::EventStream::set_read_timeout`] for push reads.
+        let timeout =
+            Duration::from_millis(DEFAULT_RPC_TIMEOUT_MS.saturating_add(RPC_TIMEOUT_MARGIN_MS));
         let req = json!({
             "id": id,
             "method": "events.subscribe",
@@ -387,20 +450,18 @@ impl Client {
             .map_err(|e| BackendError::new(BackendErrorCode::Serialize, e.to_string()))?;
         line.push('\n');
 
-        let mut reader = BufReader::new(self.open()?);
+        let mut reader = BufReader::new(self.open(timeout)?);
         reader
             .get_mut()
             .write_all(line.as_bytes())
             .and_then(|_| reader.get_mut().flush())
-            .map_err(|e| {
-                BackendError::new(BackendErrorCode::Io, format!("write subscription: {e}"))
-            })?;
+            .map_err(|e| map_io_err("write subscription", e))?;
 
         loop {
             let mut buf = String::new();
-            let n = reader.read_line(&mut buf).map_err(|e| {
-                BackendError::new(BackendErrorCode::Io, format!("read subscription ack: {e}"))
-            })?;
+            let n = reader
+                .read_line(&mut buf)
+                .map_err(|e| map_io_err("read subscription ack", e))?;
             if n == 0 {
                 return Err(BackendError::new(
                     BackendErrorCode::Io,
@@ -435,12 +496,12 @@ impl Client {
 
     // ---- typed helpers (flywheel-loop coverage) ----
 
-    pub fn ping(&mut self) -> Result<Value, BackendError> {
+    pub fn ping(&self) -> Result<Value, BackendError> {
         self.call("ping", json!({}))
     }
 
     pub fn workspace_create(
-        &mut self,
+        &self,
         cwd: Option<&str>,
         label: Option<&str>,
         focus: bool,
@@ -462,14 +523,14 @@ impl Client {
         Ok((ws, root))
     }
 
-    pub fn workspace_list(&mut self) -> Result<Vec<WorkspaceInfo>, BackendError> {
+    pub fn workspace_list(&self) -> Result<Vec<WorkspaceInfo>, BackendError> {
         let res = self.call("workspace.list", json!({}))?;
         serde_json::from_value(res.get("workspaces").cloned().unwrap_or(res))
             .map_err(|e| parse_err(e.to_string()))
     }
 
     pub fn workspace_close(
-        &mut self,
+        &self,
         workspace_id: &str,
         close_group: bool,
     ) -> Result<Value, BackendError> {
@@ -479,20 +540,28 @@ impl Client {
         )
     }
 
-    pub fn pane_list(&mut self, workspace_id: Option<&str>) -> Result<Vec<PaneInfo>, BackendError> {
+    pub fn pane_list(&self, workspace_id: Option<&str>) -> Result<Vec<PaneInfo>, BackendError> {
         let res = self.call("pane.list", json!({ "workspace_id": workspace_id }))?;
         serde_json::from_value(res.get("panes").cloned().unwrap_or(res))
             .map_err(|e| parse_err(e.to_string()))
     }
 
-    pub fn agent_list(&mut self) -> Result<Vec<AgentInfo>, BackendError> {
+    pub fn agent_list(&self) -> Result<Vec<AgentInfo>, BackendError> {
         let res = self.call("agent.list", json!({}))?;
         serde_json::from_value(res.get("agents").cloned().unwrap_or(res))
             .map_err(|e| parse_err(e.to_string()))
     }
 
+    /// `agent.get` — single agent; same [`AgentInfo`] shape as list/snapshot
+    /// (optional `completion_seq` on newer servers).
+    pub fn agent_get(&self, target: &str) -> Result<AgentInfo, BackendError> {
+        let res = self.call("agent.get", json!({ "target": target }))?;
+        serde_json::from_value(res.get("agent").cloned().unwrap_or(res))
+            .map_err(|e| parse_err(e.to_string()))
+    }
+
     pub fn agent_start(
-        &mut self,
+        &self,
         name: &str,
         kind: &str,
         pane_id: &str,
@@ -510,12 +579,12 @@ impl Client {
             .map_err(|e| parse_err(e.to_string()))
     }
 
-    pub fn agent_rename(&mut self, target: &str, name: &str) -> Result<Value, BackendError> {
+    pub fn agent_rename(&self, target: &str, name: &str) -> Result<Value, BackendError> {
         self.call("agent.rename", json!({ "target": target, "name": name }))
     }
 
     pub fn agent_prompt(
-        &mut self,
+        &self,
         target: &str,
         text: &str,
         wait: Option<WaitOptions>,
@@ -525,7 +594,7 @@ impl Client {
 
     /// `agent.prompt` returning the typed error for code classification.
     pub fn agent_prompt_coded(
-        &mut self,
+        &self,
         target: &str,
         text: &str,
         wait: Option<WaitOptions>,
@@ -542,7 +611,7 @@ impl Client {
     }
 
     pub fn agent_wait(
-        &mut self,
+        &self,
         target: &str,
         until: &[AgentStatus],
         timeout_ms: Option<u64>,
@@ -560,7 +629,7 @@ impl Client {
     }
 
     pub fn agent_read(
-        &mut self,
+        &self,
         target: &str,
         source: &str,
         lines: Option<u32>,
@@ -581,7 +650,7 @@ impl Client {
         Ok(text.to_string())
     }
 
-    pub fn agent_send_keys(&mut self, target: &str, keys: &[&str]) -> Result<Value, BackendError> {
+    pub fn agent_send_keys(&self, target: &str, keys: &[&str]) -> Result<Value, BackendError> {
         self.call("agent.send_keys", json!({ "target": target, "keys": keys }))
     }
 
@@ -607,7 +676,7 @@ impl Client {
     // subscribe before taking any snapshot, see bd-myab.)
 
     /// `pane.send_text` — literal text into the pane's terminal (no Enter).
-    pub fn pane_send_text(&mut self, pane_id: &str, text: &str) -> Result<Value, BackendError> {
+    pub fn pane_send_text(&self, pane_id: &str, text: &str) -> Result<Value, BackendError> {
         self.call(
             "pane.send_text",
             json!({ "pane_id": pane_id, "text": text }),
@@ -615,7 +684,7 @@ impl Client {
     }
 
     /// `pane.send_input` — key combos (modifier chords, named punctuation).
-    pub fn pane_send_input(&mut self, pane_id: &str, keys: &[&str]) -> Result<Value, BackendError> {
+    pub fn pane_send_input(&self, pane_id: &str, keys: &[&str]) -> Result<Value, BackendError> {
         self.call(
             "pane.send_input",
             json!({ "pane_id": pane_id, "keys": keys }),
@@ -625,7 +694,7 @@ impl Client {
     /// `pane.run` composite (no raw method in the protocol — v19 nor v22):
     /// send the command text, then an Enter keypress — the same shape
     /// `herdr pane run` uses.
-    pub fn pane_run(&mut self, pane_id: &str, command: &str) -> Result<Value, BackendError> {
+    pub fn pane_run(&self, pane_id: &str, command: &str) -> Result<Value, BackendError> {
         self.pane_send_text(pane_id, command)?;
         self.pane_send_input(pane_id, &["Enter"])
     }
@@ -633,7 +702,7 @@ impl Client {
     /// `pane.wait_for_output` — block until the pane's output matches
     /// `pattern` (substring or regex per `match_type`) or `timeout_ms` elapses.
     pub fn pane_wait_for_output(
-        &mut self,
+        &self,
         pane_id: &str,
         source: &str,
         match_type: &str,
@@ -657,7 +726,7 @@ impl Client {
     /// id, plus `toron_pin`/`toron_project`/`toron_npub` tokens for
     /// token-first resolve. No TTL: the stamp lives until the pane closes.
     pub fn pane_report_metadata(
-        &mut self,
+        &self,
         pane_id: &str,
         pin: &str,
         project: &str,
@@ -670,7 +739,7 @@ impl Client {
     }
 
     pub fn worktree_create(
-        &mut self,
+        &self,
         workspace_id: &str,
         branch: &str,
         base: Option<&str>,
@@ -686,15 +755,40 @@ impl Client {
         )
     }
 
-    pub fn worktree_remove(
-        &mut self,
-        workspace_id: &str,
-        force: bool,
-    ) -> Result<Value, BackendError> {
+    pub fn worktree_remove(&self, workspace_id: &str, force: bool) -> Result<Value, BackendError> {
         self.call(
             "worktree.remove",
             json!({ "workspace_id": workspace_id, "force": force }),
         )
+    }
+}
+
+/// Derive the unix-socket read/write timeout for a unary RPC from its
+/// params. Looks at top-level `timeout_ms`, then nested `wait.timeout_ms`
+/// (agent.prompt), else [`DEFAULT_RPC_TIMEOUT_MS`]. Always adds
+/// [`RPC_TIMEOUT_MARGIN_MS`].
+fn socket_timeout_from_params(params: &Value) -> Duration {
+    let call_ms = params
+        .get("timeout_ms")
+        .and_then(Value::as_u64)
+        .or_else(|| {
+            params
+                .get("wait")
+                .and_then(|w| w.get("timeout_ms"))
+                .and_then(Value::as_u64)
+        })
+        .unwrap_or(DEFAULT_RPC_TIMEOUT_MS);
+    Duration::from_millis(call_ms.saturating_add(RPC_TIMEOUT_MARGIN_MS))
+}
+
+/// Map transport errors onto typed codes. Socket deadlines surface as
+/// `TimedOut`/`WouldBlock` → [`BackendErrorCode::Timeout`].
+fn map_io_err(what: &str, e: std::io::Error) -> BackendError {
+    match e.kind() {
+        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => {
+            BackendError::timeout(format!("{what}: {e}"))
+        }
+        _ => BackendError::new(BackendErrorCode::Io, format!("{what}: {e}")),
     }
 }
 
@@ -753,12 +847,18 @@ pub struct EventStream {
 
 impl EventStream {
     /// Read one pushed event (dotted wire name + data). `Ok(None)` on close.
+    ///
+    /// Lines without an `"event"` key are skipped **except** herdr error
+    /// responses with `code: "events_lost"`: those return
+    /// [`BackendErrorCode::EventsLost`] so callers can resubscribe and
+    /// reconcile with a snapshot (not treat the stream as a quiet EOF).
     pub fn read_event(&mut self) -> Result<Option<(String, Value)>, BackendError> {
         loop {
             let mut buf = String::new();
-            let n = self.reader.read_line(&mut buf).map_err(|e| {
-                BackendError::new(BackendErrorCode::Io, format!("read herdr event: {e}"))
-            })?;
+            let n = self
+                .reader
+                .read_line(&mut buf)
+                .map_err(|e| map_io_err("read herdr event", e))?;
             if n == 0 {
                 return Ok(None);
             }
@@ -768,33 +868,48 @@ impl EventStream {
                     format!("malformed herdr event: {buf}: {e}"),
                 )
             })?;
-            let Some(event) = val.get("event").and_then(Value::as_str) else {
-                continue;
-            };
-            return Ok(Some((
-                event.to_string(),
-                val.get("data").cloned().unwrap_or(Value::Null),
-            )));
+            if let Some(event) = val.get("event").and_then(Value::as_str) {
+                return Ok(Some((
+                    event.to_string(),
+                    val.get("data").cloned().unwrap_or(Value::Null),
+                )));
+            }
+            // Subscription error responses (no "event" key). Surface
+            // events_lost as a typed signal; skip other non-event lines.
+            if let Some(err) = val.get("error") {
+                let code = err.get("code").and_then(Value::as_str).unwrap_or("");
+                if code == "events_lost" {
+                    let message = err
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("events lost; resubscribe and snapshot")
+                        .to_string();
+                    return Err(BackendError::new(BackendErrorCode::EventsLost, message));
+                }
+            }
         }
     }
 }
 
 /// Sync `Backend` over the blocking herdr client (ADR-0005 P1 unified trait).
-/// The blocking client calls run inline (they are short unix-socket reads);
-/// statefulness lives behind the `Mutex<Client>`, so `&self` is enough.
+///
+/// Each unary RPC opens a fresh `UnixStream` on the shared [`Client`], so
+/// concurrent trait calls do not serialize on a mutex — only the atomic
+/// request-id counter is shared. Long waits (`agent.wait`, prompt+wait)
+/// therefore do not head-of-line-block other callers.
 pub struct HerdrBackend {
-    client: Mutex<Client>,
+    client: Client,
 }
 
 impl HerdrBackend {
     pub fn connect(socket_path: Option<&str>) -> Result<Self, BackendError> {
         Ok(Self {
-            client: Mutex::new(Client::connect(socket_path)?),
+            client: Client::connect(socket_path)?,
         })
     }
 
-    pub fn client(&self) -> parking_lot::MutexGuard<'_, Client> {
-        self.client.lock()
+    pub fn client(&self) -> &Client {
+        &self.client
     }
 }
 
@@ -804,21 +919,16 @@ impl super::Backend for HerdrBackend {
     }
 
     fn workspace_list(&self) -> Result<Vec<WorkspaceInfo>, BackendError> {
-        self.client.lock().workspace_list()
+        self.client.workspace_list()
     }
 
     fn workspace_create(&self, label: Option<&str>) -> Result<WorkspaceInfo, BackendError> {
-        let (ws, _root) = self
-            .client
-            .lock()
-            .workspace_create(None, label, false, None)?;
+        let (ws, _root) = self.client.workspace_create(None, label, false, None)?;
         Ok(ws)
     }
 
     fn workspace_close(&self, workspace_id: &str, close_group: bool) -> Result<(), BackendError> {
-        self.client
-            .lock()
-            .workspace_close(workspace_id, close_group)?;
+        self.client.workspace_close(workspace_id, close_group)?;
         Ok(())
     }
 
@@ -828,7 +938,7 @@ impl super::Backend for HerdrBackend {
         direction: &str,
         cwd: Option<&str>,
     ) -> Result<PaneInfo, BackendError> {
-        let res = self.client.lock().call(
+        let res = self.client.call(
             "pane.split",
             json!({ "target_pane_id": parent_pane_id, "direction": direction, "cwd": cwd }),
         )?;
@@ -837,18 +947,17 @@ impl super::Backend for HerdrBackend {
     }
 
     fn pane_list(&self, workspace_id: Option<&str>) -> Result<Vec<PaneInfo>, BackendError> {
-        self.client.lock().pane_list(workspace_id)
+        self.client.pane_list(workspace_id)
     }
 
     fn pane_close(&self, pane_id: &str) -> Result<(), BackendError> {
         self.client
-            .lock()
             .call("pane.close", json!({ "pane_id": pane_id }))?;
         Ok(())
     }
 
     fn pane_run(&self, pane_id: &str, command: &str) -> Result<(), BackendError> {
-        self.client.lock().pane_run(pane_id, command)?;
+        self.client.pane_run(pane_id, command)?;
         Ok(())
     }
 
@@ -861,12 +970,12 @@ impl super::Backend for HerdrBackend {
         // H2: schema-conformant shape { pane_id, source, match } — the old
         // { mode, pattern } shape is rejected by the live daemon
         // ("missing field `source`", verified 2026-08-15).
-        let mut client = self.client.lock();
-        client.pane_wait_for_output(pane_id, "recent", "substring", needle, Some(timeout_ms))
+        self.client
+            .pane_wait_for_output(pane_id, "recent", "substring", needle, Some(timeout_ms))
     }
 
     fn agent_list(&self) -> Result<Vec<AgentInfo>, BackendError> {
-        self.client.lock().agent_list()
+        self.client.agent_list()
     }
 
     fn agent_start(
@@ -876,16 +985,14 @@ impl super::Backend for HerdrBackend {
         pane_id: &str,
         args: &[String],
     ) -> Result<AgentInfo, BackendError> {
-        self.client
-            .lock()
-            .agent_start(name, kind, pane_id, 30_000, args)
+        self.client.agent_start(name, kind, pane_id, 30_000, args)
     }
 
     fn agent_rename(&self, target: &str, new_name: Option<&str>) -> Result<(), BackendError> {
         let name = new_name.ok_or_else(|| {
             BackendError::unsupported("herdr agent_rename cannot clear a name (None)")
         })?;
-        self.client.lock().agent_rename(target, name)?;
+        self.client.agent_rename(target, name)?;
         Ok(())
     }
 
@@ -895,10 +1002,7 @@ impl super::Backend for HerdrBackend {
         text: &str,
         wait: Option<&WaitOptions>,
     ) -> Result<serde_json::Value, BackendError> {
-        let info = self
-            .client
-            .lock()
-            .agent_prompt(target, text, wait.cloned())?;
+        let info = self.client.agent_prompt(target, text, wait.cloned())?;
         let status = Some(info.agent_status.as_str().to_string());
         Ok(json!({
             "agent": info.agent.clone().unwrap_or_default(),
@@ -913,11 +1017,7 @@ impl super::Backend for HerdrBackend {
         text: &str,
         wait: Option<&WaitOptions>,
     ) -> Result<PromptLanding, BackendError> {
-        let res = {
-            self.client
-                .lock()
-                .agent_prompt_coded(target, text, wait.cloned())
-        };
+        let res = { self.client.agent_prompt_coded(target, text, wait.cloned()) };
         match res {
             Ok(info) => Ok(PromptLanding {
                 status: Some(info.agent_status),
@@ -936,7 +1036,7 @@ impl super::Backend for HerdrBackend {
         until: &[AgentStatus],
         timeout_ms: Option<u64>,
     ) -> Result<AgentInfo, BackendError> {
-        self.client.lock().agent_wait(target, until, timeout_ms)
+        self.client.agent_wait(target, until, timeout_ms)
     }
 
     fn agent_read(
@@ -945,12 +1045,12 @@ impl super::Backend for HerdrBackend {
         source: &str,
         lines: u32,
     ) -> Result<serde_json::Value, BackendError> {
-        let text = self.client.lock().agent_read(target, source, Some(lines))?;
+        let text = self.client.agent_read(target, source, Some(lines))?;
         Ok(json!({ "text": text }))
     }
 
     fn agent_send_keys(&self, target: &str, keys: &[&str]) -> Result<(), BackendError> {
-        self.client.lock().agent_send_keys(target, keys)?;
+        self.client.agent_send_keys(target, keys)?;
         Ok(())
     }
 
@@ -958,7 +1058,7 @@ impl super::Backend for HerdrBackend {
         &self,
         filters: &[Subscription],
     ) -> Result<Box<dyn super::EventStream>, BackendError> {
-        let stream = self.client.lock().subscribe(filters)?;
+        let stream = self.client.subscribe(filters)?;
         Ok(Box::new(HerdrEventStreamAdapter(stream)))
     }
 }
@@ -969,10 +1069,12 @@ struct HerdrEventStreamAdapter(EventStream);
 
 impl super::EventStream for HerdrEventStreamAdapter {
     fn read_event(&mut self) -> Result<Option<BackendEvent>, BackendError> {
-        Ok(self
-            .0
-            .read_event()?
-            .map(|(kind, data)| parse_push(&kind, &data)))
+        match self.0.read_event() {
+            Ok(Some((kind, data))) => Ok(Some(parse_push(&kind, &data))),
+            Ok(None) => Ok(None),
+            Err(e) if e.code == BackendErrorCode::EventsLost => Ok(Some(BackendEvent::EventsLost)),
+            Err(e) => Err(e),
+        }
     }
 
     /// Bounds each blocking read — without this the trait default is a
@@ -996,7 +1098,9 @@ impl super::EventStream for HerdrEventStreamAdapter {
 ///
 /// `pane.agent_status_changed` → [`BackendEvent::AgentStatusChanged`];
 /// `pane.agent_detected` → [`BackendEvent::AgentDetected`];
-/// `pane.exited` → [`BackendEvent::PaneExited`]; everything else → [`BackendEvent::Raw`].
+/// `pane.exited` → [`BackendEvent::PaneExited`];
+/// subscription `events_lost` → [`BackendEvent::EventsLost`] (via the adapter);
+/// everything else → [`BackendEvent::Raw`].
 fn parse_push(kind: &str, data: &Value) -> BackendEvent {
     // ADR-0031 S1: PaneId constructed at the adapter edge only; status
     // enters through the canonical normalizer, never .parse() in reducers.
@@ -1194,6 +1298,65 @@ mod tests {
         assert!(!agent.interactive_ready);
         assert!(!agent.launch_pending);
         assert_eq!(agent.state_change_seq, 10);
+        // Older / this fixture omit completion_seq — Option covers missing.
+        assert_eq!(agent.completion_seq, None);
+    }
+
+    #[test]
+    fn agent_info_parses_optional_completion_seq() {
+        // Done/hand-off should prefer completion_seq over working→idle.
+        let with_seq = json!({
+            "agent_status": "done",
+            "focused": false,
+            "pane_id": "w1:p1",
+            "revision": 1,
+            "state_change_seq": 3,
+            "completion_seq": 7,
+            "tab_id": "w1:t1",
+            "terminal_id": "term_x",
+            "workspace_id": "w1",
+        });
+        let agent: AgentInfo = serde_json::from_value(with_seq).expect("with seq");
+        assert_eq!(agent.completion_seq, Some(7));
+        let without = json!({
+            "agent_status": "idle",
+            "focused": false,
+            "pane_id": "w1:p1",
+            "revision": 1,
+            "tab_id": "w1:t1",
+            "terminal_id": "term_x",
+            "workspace_id": "w1",
+        });
+        let agent: AgentInfo = serde_json::from_value(without).expect("without seq");
+        assert_eq!(agent.completion_seq, None);
+    }
+
+    #[test]
+    fn socket_timeout_from_params_uses_call_budget_plus_margin() {
+        let top = json!({ "timeout_ms": 1000 });
+        assert_eq!(
+            socket_timeout_from_params(&top),
+            Duration::from_millis(1000 + RPC_TIMEOUT_MARGIN_MS)
+        );
+        let nested = json!({ "wait": { "timeout_ms": 2000, "until": ["done"] } });
+        assert_eq!(
+            socket_timeout_from_params(&nested),
+            Duration::from_millis(2000 + RPC_TIMEOUT_MARGIN_MS)
+        );
+        let absent = json!({ "target": "w1:p1" });
+        assert_eq!(
+            socket_timeout_from_params(&absent),
+            Duration::from_millis(DEFAULT_RPC_TIMEOUT_MS + RPC_TIMEOUT_MARGIN_MS)
+        );
+    }
+
+    #[test]
+    fn multiplex_subscription_covers_many_panes() {
+        let subs = Subscription::agent_status_changed_many(["w1:p1", "w1:p2"]);
+        assert_eq!(subs.len(), 2);
+        assert_eq!(subs[0].pane_id, "w1:p1");
+        assert_eq!(subs[1].pane_id, "w1:p2");
+        assert_eq!(subs[0].event, SubscriptionEventKind::PaneAgentStatusChanged);
     }
 
     #[test]
@@ -1278,7 +1441,7 @@ mod tests {
         // Protocol bump (bd-jqgh): prove the typed client parses live v22
         // responses for the methods the flywheel loop depends on. List-only
         // — no side effects.
-        let mut c = Client::connect(None).expect("connect to live herdr socket");
+        let c = Client::connect(None).expect("connect to live herdr socket");
         c.ping().expect("ping");
         let ws = c.workspace_list().expect("workspace.list");
         assert!(!ws.is_empty(), "live herdr has no workspaces");
@@ -1292,6 +1455,9 @@ mod tests {
         for a in &agents {
             assert!(!a.terminal_id.is_empty(), "agent missing terminal_id");
             assert!(!a.pane_id.is_empty());
+            // completion_seq optional — live 0.9.x servers populate it;
+            // older servers omit it (None). Prefer it over working→idle.
+            let _ = a.completion_seq;
         }
         for p in &panes {
             assert!(!p.terminal_id.is_empty(), "pane missing terminal_id");
@@ -1327,6 +1493,7 @@ mod tests {
 #[cfg(test)]
 mod pane_send_tests {
     use super::*;
+    use crate::backend::Backend;
     use std::io::{BufRead, Write};
     use std::os::unix::net::UnixListener;
 
@@ -1385,7 +1552,7 @@ mod pane_send_tests {
             )],
             json!({ "type": "ok" }),
         );
-        let mut c = Client::connect(Some(&path)).expect("connect");
+        let c = Client::connect(Some(&path)).expect("connect");
         let res = c
             .pane_send_text("w1:p1", "echo SEND_TEXT_OK")
             .expect("pane.send_text ok");
@@ -1405,7 +1572,7 @@ mod pane_send_tests {
             )],
             json!({ "type": "ok" }),
         );
-        let mut c = Client::connect(Some(&path)).expect("connect");
+        let c = Client::connect(Some(&path)).expect("connect");
         let res = c
             .pane_send_input("w1:p1", &["ctrl+h"])
             .expect("pane.send_input ok");
@@ -1434,7 +1601,7 @@ mod pane_send_tests {
             ],
             json!({ "type": "ok" }),
         );
-        let mut c = Client::connect(Some(&path)).expect("connect");
+        let c = Client::connect(Some(&path)).expect("connect");
         let res = c
             .pane_run("w1:p1", "cargo test --quiet")
             .expect("pane.run composite ok");
@@ -1466,7 +1633,7 @@ mod pane_send_tests {
             )],
             matched,
         );
-        let mut c = Client::connect(Some(&path)).expect("connect");
+        let c = Client::connect(Some(&path)).expect("connect");
         let res = c
             .pane_wait_for_output("w1:p1", "recent", "regex", "tests passed", Some(5000))
             .expect("pane.wait_for_output ok");
@@ -1514,9 +1681,250 @@ mod pane_send_tests {
             parse_code("agent_prompt_stalled"),
             BackendErrorCode::AgentPromptStalled
         );
+        assert_eq!(parse_code("events_lost"), BackendErrorCode::EventsLost);
         assert_eq!(
             parse_code("unknown_wire_code"),
             BackendErrorCode::Other("unknown_wire_code".into())
         );
+    }
+
+    /// Unary RPC socket deadlines: a server that accepts but never replies
+    /// must surface [`BackendErrorCode::Timeout`] (not hang forever).
+    #[test]
+    fn unary_rpc_times_out_when_server_silent() {
+        let path = test_sock(10);
+        let listener = UnixListener::bind(&path).expect("bind");
+        let server = std::thread::spawn(move || {
+            // Probe connection from Client::connect.
+            let (probe, _) = listener.accept().expect("probe");
+            let mut probe_line = String::new();
+            std::io::BufReader::new(probe.try_clone().expect("clone"))
+                .read_line(&mut probe_line)
+                .ok();
+            // Real request: accept, read the request, then sleep past the
+            // client deadline without writing a response.
+            let (sock, _) = listener.accept().expect("accept call");
+            let mut line = String::new();
+            // Keep `sock` owned so the connection stays open for the sleep.
+            let mut reader = std::io::BufReader::new(sock);
+            let _ = reader.read_line(&mut line);
+            // Hold open past client deadline (1ms + margin) without replying.
+            std::thread::sleep(Duration::from_millis(1 + RPC_TIMEOUT_MARGIN_MS + 500));
+            drop(reader);
+        });
+        let c = Client::connect(Some(&path)).expect("connect");
+        // Tiny timeout_ms so the test stays fast; margin still applies but
+        // we override via params — use 50ms + 5s margin would be slow.
+        // Call with timeout_ms=50; socket budget = 50 + 5000 = 5050ms.
+        // To keep the test snappy, temporarily we rely on a custom params
+        // path: use call_coded with timeout_ms small AND we accept that
+        // margin is 5s — sleep server 6s would be slow.
+        // Instead: verify map_io_err classification + open applies timeout
+        // by using a 1ms timeout and a silent server; budget = 1+5000=5001ms.
+        // Cap wall time with a shorter sleep on the assertion side by
+        // checking the error kind after ~5s. For a faster test, patch is
+        // heavy — use 1ms call timeout and sleep server forever; client
+        // should return Timeout within margin+epsilon (~5.1s). Acceptable.
+        let started = std::time::Instant::now();
+        let err = c
+            .call_coded("ping", json!({ "timeout_ms": 1 }))
+            .expect_err("silent server must error");
+        assert_eq!(
+            err.code,
+            BackendErrorCode::Timeout,
+            "expected Timeout, got {err:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(8),
+            "deadline should fire near margin, took {:?}",
+            started.elapsed()
+        );
+        server.join().expect("server");
+    }
+
+    /// `events_lost` on the subscription socket is a typed signal, not a
+    /// skipped line that becomes a quiet `Ok(None)`.
+    #[test]
+    fn events_lost_surfaces_as_typed_error_and_backend_event() {
+        let path = test_sock(11);
+        let listener = UnixListener::bind(&path).expect("bind");
+        let server = std::thread::spawn(move || {
+            let (probe, _) = listener.accept().expect("probe");
+            let mut probe_line = String::new();
+            std::io::BufReader::new(probe.try_clone().expect("clone"))
+                .read_line(&mut probe_line)
+                .ok();
+            // subscribe connection
+            let (mut sock, _) = listener.accept().expect("subscribe");
+            let mut line = String::new();
+            std::io::BufReader::new(sock.try_clone().expect("clone"))
+                .read_line(&mut line)
+                .expect("read subscribe");
+            let req: Value = serde_json::from_str(&line).expect("parse");
+            assert_eq!(req["method"].as_str(), Some("events.subscribe"));
+            // ack
+            let ack = json!({ "id": req["id"], "result": { "ok": true } });
+            let mut out = serde_json::to_string(&ack).unwrap();
+            out.push('\n');
+            sock.write_all(out.as_bytes()).expect("ack");
+            // Push an ordinary event, then events_lost error (no "event" key).
+            let push = json!({
+                "event": "pane.agent_status_changed",
+                "data": { "pane_id": "w1:p1", "agent_status": "working" }
+            });
+            let mut out = serde_json::to_string(&push).unwrap();
+            out.push('\n');
+            sock.write_all(out.as_bytes()).expect("push");
+            let lost = json!({
+                "id": req["id"],
+                "error": { "code": "events_lost", "message": "subscriber fell behind" }
+            });
+            let mut out = serde_json::to_string(&lost).unwrap();
+            out.push('\n');
+            sock.write_all(out.as_bytes()).expect("lost");
+        });
+
+        let c = Client::connect(Some(&path)).expect("connect");
+        let subs = Subscription::agent_status_changed_many(["w1:p1"]);
+        let mut stream = c.subscribe(&subs).expect("subscribe");
+        let (kind, data) = stream.read_event().expect("event").expect("some");
+        assert_eq!(kind, "pane.agent_status_changed");
+        assert_eq!(data["pane_id"], "w1:p1");
+        let err = stream.read_event().expect_err("events_lost");
+        assert_eq!(err.code, BackendErrorCode::EventsLost);
+
+        // Adapter maps the typed error onto BackendEvent::EventsLost.
+        // Rebuild a short stream that only yields events_lost after ack.
+        drop(stream);
+        server.join().expect("server");
+
+        let path2 = test_sock(12);
+        let listener = UnixListener::bind(&path2).expect("bind");
+        let server = std::thread::spawn(move || {
+            let (probe, _) = listener.accept().expect("probe");
+            let mut probe_line = String::new();
+            std::io::BufReader::new(probe.try_clone().expect("clone"))
+                .read_line(&mut probe_line)
+                .ok();
+            let (mut sock, _) = listener.accept().expect("subscribe");
+            let mut line = String::new();
+            std::io::BufReader::new(sock.try_clone().expect("clone"))
+                .read_line(&mut line)
+                .expect("read");
+            let req: Value = serde_json::from_str(&line).expect("parse");
+            let ack = json!({ "id": req["id"], "result": { "ok": true } });
+            let mut out = serde_json::to_string(&ack).unwrap();
+            out.push('\n');
+            sock.write_all(out.as_bytes()).unwrap();
+            let lost = json!({
+                "id": req["id"],
+                "error": { "code": "events_lost", "message": "behind" }
+            });
+            let mut out = serde_json::to_string(&lost).unwrap();
+            out.push('\n');
+            sock.write_all(out.as_bytes()).unwrap();
+        });
+        let backend = HerdrBackend::connect(Some(&path2)).expect("backend");
+        let mut adapted = backend
+            .subscribe(&[Subscription::agent_status_changed("w1:p1".into())])
+            .expect("subscribe");
+        let ev = adapted.read_event().expect("read").expect("some");
+        assert_eq!(ev, BackendEvent::EventsLost);
+        server.join().expect("server");
+    }
+
+    /// Long wait must not serialize a concurrent short call (no mutex across
+    /// blocking I/O). Two overlapping RPCs on one HerdrBackend.
+    #[test]
+    fn concurrent_calls_do_not_serialize_on_client_mutex() {
+        let path = test_sock(13);
+        let listener = UnixListener::bind(&path).expect("bind");
+        let server = std::thread::spawn(move || {
+            // probe
+            let (probe, _) = listener.accept().expect("probe");
+            let mut probe_line = String::new();
+            std::io::BufReader::new(probe.try_clone().expect("clone"))
+                .read_line(&mut probe_line)
+                .ok();
+            // Accept two overlapping connections. First is the slow wait;
+            // second is the fast ping — reply to ping before wait.
+            use std::sync::mpsc;
+            let (tx, rx) = mpsc::channel::<UnixStream>();
+            let acceptor = std::thread::spawn(move || {
+                for _ in 0..2 {
+                    let (sock, _) = listener.accept().expect("accept");
+                    tx.send(sock).unwrap();
+                }
+            });
+            let sock_a = rx.recv().unwrap();
+            let sock_b = rx.recv().unwrap();
+            // Read both requests
+            let mut line_a = String::new();
+            let mut line_b = String::new();
+            let mut ra = std::io::BufReader::new(sock_a.try_clone().unwrap());
+            let mut rb = std::io::BufReader::new(sock_b.try_clone().unwrap());
+            ra.read_line(&mut line_a).unwrap();
+            rb.read_line(&mut line_b).unwrap();
+            let req_a: Value = serde_json::from_str(&line_a).unwrap();
+            let req_b: Value = serde_json::from_str(&line_b).unwrap();
+            // Identify which is wait vs ping
+            let (wait_sock, wait_req, ping_sock, ping_req) = if req_a["method"] == "agent.wait" {
+                (sock_a, req_a, sock_b, req_b)
+            } else {
+                (sock_b, req_b, sock_a, req_a)
+            };
+            assert_eq!(wait_req["method"], "agent.wait");
+            assert_eq!(ping_req["method"], "ping");
+            // Reply to ping immediately; delay wait reply.
+            let mut out = serde_json::to_string(&json!({
+                "id": ping_req["id"],
+                "result": { "ok": true }
+            }))
+            .unwrap();
+            out.push('\n');
+            let mut ping_sock = ping_sock;
+            ping_sock.write_all(out.as_bytes()).unwrap();
+            std::thread::sleep(Duration::from_millis(200));
+            let agent = json!({
+                "agent_status": "done",
+                "focused": false,
+                "pane_id": "w1:p1",
+                "revision": 1,
+                "tab_id": "w1:t1",
+                "terminal_id": "term",
+                "workspace_id": "w1",
+                "completion_seq": 2,
+            });
+            let mut out = serde_json::to_string(&json!({
+                "id": wait_req["id"],
+                "result": { "agent": agent }
+            }))
+            .unwrap();
+            out.push('\n');
+            let mut wait_sock = wait_sock;
+            wait_sock.write_all(out.as_bytes()).unwrap();
+            acceptor.join().unwrap();
+        });
+
+        let backend = std::sync::Arc::new(HerdrBackend::connect(Some(&path)).expect("connect"));
+        let b2 = backend.clone();
+        let started = std::time::Instant::now();
+        let wait_handle =
+            std::thread::spawn(move || b2.agent_wait("w1:p1", &[AgentStatus::Done], Some(5_000)));
+        // Give the wait a moment to open its stream first.
+        std::thread::sleep(Duration::from_millis(50));
+        let ping_started = std::time::Instant::now();
+        backend.client().ping().expect("ping while wait in flight");
+        let ping_elapsed = ping_started.elapsed();
+        let wait_res = wait_handle.join().expect("join").expect("wait ok");
+        assert_eq!(wait_res.completion_seq, Some(2));
+        // If the mutex were held across wait, ping would wait for the 200ms
+        // delayed wait reply. With no mutex, ping returns promptly.
+        assert!(
+            ping_elapsed < Duration::from_millis(150),
+            "ping serialized behind wait: {ping_elapsed:?} (total {:?})",
+            started.elapsed()
+        );
+        server.join().expect("server");
     }
 }

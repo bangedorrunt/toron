@@ -286,7 +286,7 @@ fn check_identity_divergence(cfg: &Config) -> CheckResult {
                 detail: "herdr not reachable — no live panes to compare".into(),
             };
         };
-        let mut client = backend.client();
+        let client = backend.client();
         let panes: Vec<toron_core::backend::herdr::PaneInfo> = client
             .workspace_list()
             .map(|wss| {
@@ -295,7 +295,6 @@ fn check_identity_divergence(cfg: &Config) -> CheckResult {
                     .collect()
             })
             .unwrap_or_default();
-        drop(client);
         panes
             .iter()
             .filter_map(toron_core::mailbox::identity::pane_stamp)

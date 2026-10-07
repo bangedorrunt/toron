@@ -1612,7 +1612,7 @@ impl Mailbox {
         let Ok(backend) = HerdrBackend::connect(None) else {
             return std::collections::HashMap::new();
         };
-        let mut client = backend.client();
+        let client = backend.client();
         let Ok(agents) = client.agent_list() else {
             return std::collections::HashMap::new();
         };
@@ -1624,7 +1624,6 @@ impl Mailbox {
                     .collect()
             })
             .unwrap_or_default();
-        drop(client);
         let mut map = pin_pane_map(&panes, &agents);
         augment_pane_map_with_registry(
             &mut map,
@@ -1647,7 +1646,7 @@ impl Mailbox {
         pane_id: &str,
     ) -> anyhow::Result<Option<String>> {
         let (agents, panes) = {
-            let mut client = backend.client();
+            let client = backend.client();
             let agents = client.agent_list()?;
             let panes: Vec<PaneInfo> = client
                 .workspace_list()
@@ -1657,7 +1656,6 @@ impl Mailbox {
                         .collect()
                 })
                 .unwrap_or_default();
-            drop(client);
             (agents, panes)
         };
         Ok(resolve_pin_for_pane(&panes, &agents, pane_id))
@@ -1673,14 +1671,13 @@ impl Mailbox {
     /// retires both, so neither is ever a silent live pin.
     pub fn cleanup_pane_identities(&self, backend: &HerdrBackend) -> anyhow::Result<Vec<String>> {
         let (agents, panes) = {
-            let mut client = backend.client();
+            let client = backend.client();
             let agents = client.agent_list()?;
             let panes: Vec<PaneInfo> = client
                 .workspace_list()?
                 .into_iter()
                 .flat_map(|ws| client.pane_list(Some(&ws.workspace_id)).unwrap_or_default())
                 .collect();
-            drop(client);
             (agents, panes)
         };
         // bd-0sbf: a pin stamped on a live pane is live even when the

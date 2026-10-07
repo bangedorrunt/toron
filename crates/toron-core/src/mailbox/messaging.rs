@@ -1478,7 +1478,7 @@ impl Mailbox {
         // (b) Same herdr pane as the recipient (best-effort: no herdr
         // backend wired → the check degrades to (c) only).
         if let Ok(backend) = HerdrBackend::connect(None) {
-            let mut client = backend.client();
+            let client = backend.client();
             if let Ok(agents) = client.agent_list() {
                 let pane_of = |name: &str| {
                     agents
