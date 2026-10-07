@@ -184,3 +184,41 @@ pub fn fixture_registration(name: &str, cron: &str, enabled: bool) -> CronRegist
 pub fn next_tick(cron: &str, from_ts: i64) -> Option<i64> {
     toron_workflow::cron::next_due(cron, from_ts)
 }
+
+/// Path to the `toron` CLI binary that the CLI scenarios drive.
+///
+/// `CARGO_BIN_EXE_toron` is only set for binaries belonging to THIS package,
+/// and this package has none, so the location has to be derived from the test
+/// executable itself.
+///
+/// The previous fallback assumed cargo's `<target>/<profile>/deps/` layout and
+/// walked exactly two levels up from the test binary. Build wrappers do not
+/// honour that layout: under `mbx` a test binary lands in
+/// `<target>/<profile>/build/<pkg>/<hash>/deps/`, so the two-level walk
+/// resolved to `<target>/<profile>/build/<pkg>/<hash>/toron`, which never
+/// exists, and eight scenario tests failed on infrastructure alone.
+///
+/// Walking ancestors and taking the first directory that genuinely contains a
+/// `toron` file works under both layouts, because the test binary always sits
+/// somewhere beneath the profile directory. It also does not care how deep the
+/// wrapper nested it, so another layer cannot silently re-break this.
+///
+/// Panics naming the build command when the binary is genuinely absent, which
+/// is the one case where the test binary genuinely cannot run.
+pub fn toron_bin() -> std::path::PathBuf {
+    if let Ok(p) = std::env::var("CARGO_BIN_EXE_toron") {
+        return std::path::PathBuf::from(p);
+    }
+    let exe = std::env::current_exe().expect("current_exe");
+    for dir in exe.ancestors() {
+        let candidate = dir.join("toron");
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+    panic!(
+        "toron binary not found in any ancestor of {} — build it first \
+         (cargo build -p toron-cli)",
+        exe.display()
+    );
+}

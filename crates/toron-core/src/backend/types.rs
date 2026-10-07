@@ -146,6 +146,10 @@ pub enum BackendEvent {
     PaneExited {
         pane: PaneId,
     },
+    /// herdr closed the subscription after dropping retained events
+    /// (`events_lost`). Callers must resubscribe and reconcile with a snapshot;
+    /// do not treat this as a quiet EOF.
+    EventsLost,
     /// Unmapped push payload (forwarded verbatim, never classified).
     Raw(String),
 }

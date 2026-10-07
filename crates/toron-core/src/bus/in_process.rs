@@ -471,7 +471,7 @@ impl Bus for InProcessBus {
                 return Err(BusError::Publish(reason.into()));
             }
             self.stage_log(Stage::Dedup, &event, "ephemeral kind, not stored");
-            return self.fanout(event, false).await;
+            return self.fanout(event, false);
         }
 
         // 3. Dedup: store by event id (ON CONFLICT DO NOTHING). Addressable
@@ -497,7 +497,7 @@ impl Bus for InProcessBus {
             });
         }
 
-        self.fanout(event, true).await
+        self.fanout(event, true)
     }
 
     async fn subscribe(&self, filter: Filter) -> Result<Subscription, BusError> {
@@ -530,6 +530,14 @@ impl Bus for InProcessBus {
             .await
             .map_err(|e| BusError::Unsupported(format!("purge failed: {e}")))
     }
+
+    /// bd-3gwy/bd-qpm0: the store's authoritative mutation counter. One
+    /// indexed `bus_meta` read answers "did anything change?" so the wake
+    /// pump can skip a full replay on quiet ticks instead of minting a
+    /// subscription per poll.
+    async fn store_version(&self) -> Option<i64> {
+        Some(self.store.current_mutations().await)
+    }
 }
 
 // Allow constructing a bus for tests without exposing internals.
@@ -541,7 +549,7 @@ impl InProcessBus {
 
     /// Access-gated fanout to live subscribers (shared by stored + ephemeral
     /// publish paths).
-    async fn fanout(&self, event: Event, stored: bool) -> Result<PublishOk, BusError> {
+    fn fanout(&self, event: Event, stored: bool) -> Result<PublishOk, BusError> {
         // 4. Access-gated fanout to live subscribers.
         let subs: Vec<Arc<Subscriber>> = {
             let guard = self.subs.read();
@@ -1373,7 +1381,7 @@ mod tests {
             1,
             "wrap envelope carries only the p tag, got {visible:?}"
         );
-        assert!(visible[0][0] == "p");
+        assert_eq!(visible[0][0], "p");
         let _ = std::fs::remove_file(&path);
     }
 

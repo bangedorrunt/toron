@@ -59,6 +59,136 @@ fn print_json(value: &serde_json::Value) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// bd-reserve-yield-taqf: the yield board. CLI-only noun (no MCP tool, same
+/// discipline as `ack-sla`), so this shape is hand-built and shared by both
+/// arms — the markers plus the beads a resume must skip right now.
+fn yield_board_json(
+    project_key: &str,
+    views: Vec<toron_core::mailbox::yields::YieldView>,
+    suppressed: Vec<String>,
+) -> Value {
+    let yields: Vec<Value> = views
+        .into_iter()
+        .map(|v| {
+            json!({
+                "bead_id": v.bead_id,
+                "holder": v.holder,
+                "yielder": v.yielder,
+                "note": v.note,
+                "created_ts_us": v.created_ts_us,
+                "holder_live": v.holder_live,
+            })
+        })
+        .collect();
+    json!({
+        "project": project_key,
+        "count": yields.len(),
+        "yields": yields,
+        "suppressed": suppressed,
+    })
+}
+
+/// bd-close-releases-leases-qkbo: mark board rows whose reason bead is CLOSED
+/// (CLI-only additive fields; the MCP `LeaseBoardOut` shape is untouched).
+/// Best-effort: no tracker file means no annotation, never an error —
+/// `reserve list` must work in any directory.
+fn annotate_stale_rows(
+    board: &mut Value,
+    closed: &std::collections::BTreeSet<String>,
+    project: &str,
+) {
+    let Some(rows) = board.get_mut("reservations").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for row in rows {
+        let reason = row.get("reason").and_then(Value::as_str).unwrap_or("");
+        if reason.is_empty() || !closed.contains(reason) {
+            continue;
+        }
+        if let Some(obj) = row.as_object_mut() {
+            obj.insert("stale".into(), Value::Bool(true));
+            obj.insert(
+                "stale_hint".into(),
+                Value::String(format!(
+                    "reason bead is closed; sweep with: toron reserve sweep --closed-beads --project {project}"
+                )),
+            );
+        }
+    }
+}
+
+/// Resolve a sweep's repo root + closed-bead set. `--closed-beads` is required
+/// (it is the only sweep source) and a missing tracker fails loud: the flag
+/// asked for closed-bead discovery and there is nothing to discover from.
+fn sweep_closed_set(
+    args: &crate::cli::ReserveSweepArgs,
+) -> anyhow::Result<(std::path::PathBuf, std::collections::BTreeSet<String>)> {
+    if !args.closed_beads {
+        anyhow::bail!(
+            "`reserve sweep` needs --closed-beads (the only sweep source: <repo>/.beads/issues.jsonl)"
+        );
+    }
+    let repo = args
+        .repo
+        .clone()
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let issues = crate::tracker::issues_path(&repo);
+    if !issues.exists() {
+        anyhow::bail!(
+            "no tracker at {} — run from the repo root or pass --repo",
+            issues.display()
+        );
+    }
+    let closed = crate::tracker::closed_bead_ids(&repo);
+    Ok((repo, closed))
+}
+
+/// Group stale rows `(path, holder, reason)` by reason for the sweep report.
+/// Shared by the embedded and daemon arms so both report the same leases.
+fn group_stale_by_reason(
+    rows: &[(String, String, String)],
+    closed: &std::collections::BTreeSet<String>,
+) -> std::collections::BTreeMap<String, Vec<(String, String)>> {
+    let mut by_reason: std::collections::BTreeMap<String, Vec<(String, String)>> =
+        std::collections::BTreeMap::new();
+    for (path, holder, reason) in rows {
+        if reason.is_empty() || !closed.contains(reason) {
+            continue;
+        }
+        by_reason
+            .entry(reason.clone())
+            .or_default()
+            .push((path.clone(), holder.clone()));
+    }
+    by_reason
+}
+
+/// The shared sweep report shape (embedded + daemon arms).
+fn print_sweep_report(
+    project: &str,
+    repo: &std::path::Path,
+    closed_count: usize,
+    by_reason: &std::collections::BTreeMap<String, Vec<(String, String)>>,
+    released: u64,
+) -> anyhow::Result<()> {
+    let leases: Vec<Value> = by_reason
+        .iter()
+        .flat_map(|(reason, leases)| {
+            leases.iter().map(
+                move |(path, holder)| json!({"path": path, "holder": holder, "reason": reason}),
+            )
+        })
+        .collect();
+    print_json(&json!({
+        "project_key": project,
+        "repo": repo.display().to_string(),
+        "closed_beads": closed_count,
+        "stale_reasons": by_reason.keys().collect::<Vec<_>>(),
+        "released": released,
+        "leases": leases,
+    }))
+}
+
 /// Encode the ADR-0027 E2 assignment vocabulary into rumor tags.
 ///
 /// `pub(crate)` so the operator console's send form goes through the SAME
@@ -680,7 +810,7 @@ pub async fn run_ack_sla_daemon(_dc: &DaemonClient, args: &AckSlaArgs) -> anyhow
 /// name-routed surface reaches it, and the guard cannot map the commit back
 /// to a pin. Warn loud, name the remedy; NEVER block (a key-file holder is
 /// legal and this is advisory).
-async fn warn_if_unregistered(mailbox: &Mailbox, project: &str, agent: &str) {
+pub(crate) async fn warn_if_unregistered(mailbox: &Mailbox, project: &str, agent: &str) {
     if mailbox.agent_registered(project, agent).await {
         return;
     }
@@ -692,12 +822,159 @@ async fn warn_if_unregistered(mailbox: &Mailbox, project: &str, agent: &str) {
     );
 }
 
-pub async fn run_reserve(mailbox: &Mailbox, cmd: &ReserveCommand) -> anyhow::Result<()> {
+/// bd-release-dry-run-mutates-ri7o: the strict dry-run gate for the whole
+/// mutating reserve surface. `Some(preview)` for every mutating command;
+/// `None` for the read-only ones (`list` / `conflicts`), which run normally
+/// under `-n`.
+///
+/// The preview calls NOTHING — mailbox and daemon both return here before the
+/// match. A preview that mutates is worse than no preview at all: measured
+/// live, `reserve release -n` reported `released: N`, released for real, and
+/// the next real release reported `released: 0`.
+fn reserve_dry_run_preview(cmd: &ReserveCommand) -> Option<Value> {
+    let (tool, args, note) = match cmd {
+        ReserveCommand::Acquire(a) => (
+            "file_reservation_paths",
+            json!({
+                "project_key": a.project,
+                "agent_name": a.agent,
+                "paths": a.paths,
+                "ttl_seconds": a.ttl_secs,
+                "exclusive": a.exclusive,
+                "reason": a.reason,
+            }),
+            "nothing was leased",
+        ),
+        ReserveCommand::Renew(a) => (
+            "renew_file_reservations",
+            json!({
+                "project_key": a.project,
+                "agent_name": a.agent,
+                "extend_seconds": a.extend_secs,
+                "paths": a.paths,
+            }),
+            "nothing was renewed",
+        ),
+        ReserveCommand::Release(a) => (
+            "release_file_reservations",
+            json!({
+                "project_key": a.project,
+                "agent_name": a.agent,
+                "paths": a.paths,
+            }),
+            "nothing was released",
+        ),
+        ReserveCommand::ReleaseByReason(a) => (
+            "release_file_reservations_by_reason",
+            json!({
+                "project_key": a.project,
+                "agent_name": a.agent,
+                "bead_id": a.bead_id,
+                "notify_previous": !a.no_notify,
+            }),
+            "nothing was released",
+        ),
+        ReserveCommand::Sweep(a) => (
+            "release_file_reservations_by_reason",
+            json!({
+                "project_key": a.project,
+                "agent_name": a.agent,
+                "repo": a.repo.as_ref().map(|p| p.display().to_string()),
+                "closed_beads": a.closed_beads,
+            }),
+            "nothing was released; the preview reads no board or tracker — run without -n \
+             to discover the closed-reason leases and release them",
+        ),
+        ReserveCommand::Yield(a) => (
+            "reserve_yield",
+            json!({
+                "project_key": a.project,
+                "agent_name": a.agent,
+                "bead_id": a.bead_id,
+                "holder": a.holder,
+                "note": a.note,
+            }),
+            "nothing was yielded",
+        ),
+        ReserveCommand::ForceRelease(a) => (
+            "force_release_file_reservation",
+            json!({
+                "project_key": a.project,
+                "agent_name": a.agent,
+                "path": a.path,
+                "holder": a.holder,
+                "note": a.note,
+                "notify_previous": a.notify_previous,
+            }),
+            "nothing was revoked",
+        ),
+        ReserveCommand::RequestRelease(a) => (
+            "send_message",
+            json!({
+                "project_key": a.project,
+                "sender_name": a.agent,
+                "target_agent": a.target,
+                "reservation_id": a.reservation_id,
+                "ask": a.ask,
+                "note": a.note,
+                "subject": "[request-release]",
+            }),
+            "no request was sent",
+        ),
+        ReserveCommand::Respond(a) => (
+            "reply_message",
+            json!({
+                "project_key": a.project,
+                "sender_name": a.agent,
+                "request_id": a.request_id,
+                "decision": a.decision,
+                "note": a.note,
+                "subject": "[request-release-response]",
+            }),
+            "no response was sent",
+        ),
+        ReserveCommand::Transfer(a) => (
+            "file_reservation_paths",
+            json!({
+                "project_key": a.project,
+                "agent_name": a.to,
+                "paths": [a.path.clone()],
+                "transfer_from": a.from,
+                "reason": a.reason,
+            }),
+            "nothing was transferred",
+        ),
+        // Read-only commands run normally under -n; with-lease is dispatched
+        // in `main` and owns its own dry-run (it prints the plan and leases
+        // nothing).
+        ReserveCommand::Conflicts(_)
+        | ReserveCommand::List(_)
+        | ReserveCommand::WithLease(_)
+        | ReserveCommand::Yields(_) => {
+            return None;
+        }
+    };
+    Some(json!({
+        "dry_run": true,
+        "would_call": tool,
+        "args": args,
+        "note": note,
+    }))
+}
+
+pub async fn run_reserve(
+    mailbox: &Mailbox,
+    cmd: &ReserveCommand,
+    dry_run: bool,
+) -> anyhow::Result<()> {
+    if dry_run && let Some(preview) = reserve_dry_run_preview(cmd) {
+        return print_json(&preview);
+    }
     match cmd {
         ReserveCommand::Acquire(args) => {
             warn_if_unregistered(mailbox, &args.project, &args.agent).await;
             // bd-v354: loud zero-file-match warning (stderr, warning only).
-            warn_zero_file_matches(&args.paths);
+            warn_acquire_paths(&args.paths);
             emit(
                 mailbox
                     .file_reservation_paths(
@@ -720,7 +997,7 @@ pub async fn run_reserve(mailbox: &Mailbox, cmd: &ReserveCommand) -> anyhow::Res
             let rows = mailbox
                 .list_file_reservations(&args.project, args.holder.as_deref(), args.path.as_deref())
                 .await?;
-            emit(toron_mcp::tools::reservation::LeaseBoardOut {
+            let mut board = toron_mcp::tools::reservation::LeaseBoardOut {
                 project_key: args.project.clone(),
                 count: rows.len() as i64,
                 reservations: rows
@@ -734,7 +1011,14 @@ pub async fn run_reserve(mailbox: &Mailbox, cmd: &ReserveCommand) -> anyhow::Res
                         expires_ts_us: r.expires_ts_us,
                     })
                     .collect(),
-            })
+            }
+            .to_json();
+            // bd-close-releases-leases-qkbo: stale audit rides on top of the
+            // shared board (default repo = cwd).
+            let closed =
+                crate::tracker::closed_bead_ids(args.repo.as_deref().unwrap_or(Path::new(".")));
+            annotate_stale_rows(&mut board, &closed, &args.project);
+            print_json(&board)
         }
         ReserveCommand::Renew(args) => emit(
             mailbox
@@ -751,6 +1035,52 @@ pub async fn run_reserve(mailbox: &Mailbox, cmd: &ReserveCommand) -> anyhow::Res
                 .release_by_reason(&args.project, &args.agent, &args.bead_id, !args.no_notify)
                 .await?,
         ),
+        ReserveCommand::Sweep(args) => {
+            let (repo, closed) = sweep_closed_set(args)?;
+            let board = mailbox
+                .list_file_reservations(&args.project, None, None)
+                .await?;
+            let rows: Vec<(String, String, String)> = board
+                .iter()
+                .map(|r| {
+                    (
+                        r.path_pattern.clone(),
+                        r.agent_name.clone(),
+                        r.reason.clone(),
+                    )
+                })
+                .collect();
+            let by_reason = group_stale_by_reason(&rows, &closed);
+            let mut released = 0u64;
+            for bead_id in by_reason.keys() {
+                let result = mailbox
+                    .release_by_reason(&args.project, &args.agent, bead_id, !args.no_notify)
+                    .await?;
+                released += result.released as u64;
+            }
+            print_sweep_report(&args.project, &repo, closed.len(), &by_reason, released)
+        }
+        ReserveCommand::Yield(args) => {
+            mailbox
+                .record_reservation_yield(
+                    &args.project,
+                    &args.agent,
+                    &args.bead_id,
+                    &args.holder,
+                    args.note.as_deref().unwrap_or(""),
+                )
+                .await?;
+            print_json(&json!({
+                "ok": true,
+                "project": args.project,
+                "bead_id": args.bead_id,
+                "holder": args.holder,
+            }))
+        }
+        ReserveCommand::Yields(args) => {
+            let (views, suppressed) = mailbox.reservation_yield_board(&args.project).await?;
+            print_json(&yield_board_json(&args.project, views, suppressed))
+        }
         ReserveCommand::ForceRelease(args) => {
             mailbox
                 .force_release_file_reservation(
@@ -786,6 +1116,10 @@ pub async fn run_reserve(mailbox: &Mailbox, cmd: &ReserveCommand) -> anyhow::Res
                     note: args.note.clone(),
                 })
                 .await?,
+        ),
+        ReserveCommand::WithLease(_) => anyhow::bail!(
+            "reserve with-lease is dispatched in main before the mailbox arm (its child runs in \
+             the CLI's process); this arm is a tripwire, not a path"
         ),
         ReserveCommand::Transfer(args) => emit(
             mailbox
@@ -832,6 +1166,18 @@ fn parse_release_decision(s: &str) -> anyhow::Result<ReleaseDecision> {
 /// repo (warning only — the lease is still granted, fail-closed unchanged).
 /// Stderr so the parity JSON on stdout stays parseable. Silent when the
 /// file list cannot be built (non-repo cwd) — never blocks an acquire.
+/// Pre-flight warnings for an acquire's `--paths`, both stderr-only so the
+/// lease behaviour is unchanged: a list that used the wrong separator (which
+/// silently becomes one useless glob), and a glob that matches no file.
+fn warn_acquire_paths(paths: &[String]) {
+    for p in paths {
+        if let Some(w) = toron_core::mailbox::guard::whitespace_path_warning(p) {
+            eprintln!("{w}");
+        }
+    }
+    warn_zero_file_matches(paths);
+}
+
 fn warn_zero_file_matches(paths: &[String]) {
     let files = repo_relative_files();
     if files.is_empty() {
@@ -847,8 +1193,9 @@ fn warn_zero_file_matches(paths: &[String]) {
 
 /// Best-effort repo file list: recursive walk of the cwd, slash-joined
 /// repo-relative paths. Skips `.git` and `target`; capped so a huge tree
-/// cannot stall an acquire.
-fn repo_relative_files() -> Vec<String> {
+/// cannot stall an acquire. Public within the crate: `reserve with-lease`
+/// refuses zero-file-match globs on the same list.
+pub(crate) fn repo_relative_files() -> Vec<String> {
     const CAP: usize = 100_000;
     let mut out = Vec::new();
     let mut stack = vec![std::path::PathBuf::from(".")];
@@ -884,7 +1231,14 @@ fn repo_relative_files() -> Vec<String> {
 }
 
 /// Daemon arm of `run_reserve` (bd-pin-public-plane-s-easy.14).
-pub async fn run_reserve_daemon(dc: &DaemonClient, cmd: &ReserveCommand) -> anyhow::Result<()> {
+pub async fn run_reserve_daemon(
+    dc: &DaemonClient,
+    cmd: &ReserveCommand,
+    dry_run: bool,
+) -> anyhow::Result<()> {
+    if dry_run && let Some(preview) = reserve_dry_run_preview(cmd) {
+        return print_json(&preview);
+    }
     match cmd {
         ReserveCommand::Acquire(args) => {
             // bd-zugo: same ghost-holder warning on the daemon arm — the
@@ -894,7 +1248,7 @@ pub async fn run_reserve_daemon(dc: &DaemonClient, cmd: &ReserveCommand) -> anyh
             }
             // bd-v354: client-side zero-file-match warning (cwd is the repo;
             // the daemon never sees it). Stderr, warning only.
-            warn_zero_file_matches(&args.paths);
+            warn_acquire_paths(&args.paths);
             daemon_tool(
                 dc,
                 "file_reservation_paths",
@@ -922,16 +1276,22 @@ pub async fn run_reserve_daemon(dc: &DaemonClient, cmd: &ReserveCommand) -> anyh
             .await
         }
         ReserveCommand::List(args) => {
-            daemon_tool(
-                dc,
-                "list_file_reservations",
-                json!({
-                    "project_key": args.project,
-                    "holder": args.holder,
-                    "path": args.path,
-                }),
-            )
-            .await
+            let mut board = dc
+                .call_tool(
+                    "list_file_reservations",
+                    json!({
+                        "project_key": args.project,
+                        "holder": args.holder,
+                        "path": args.path,
+                    }),
+                )
+                .await?;
+            // bd-close-releases-leases-qkbo: the tracked repo is the client's
+            // cwd — the daemon never sees it — so annotate here.
+            let closed =
+                crate::tracker::closed_bead_ids(args.repo.as_deref().unwrap_or(Path::new(".")));
+            annotate_stale_rows(&mut board, &closed, &args.project);
+            print_json(&board)
         }
         ReserveCommand::Renew(args) => {
             daemon_tool(
@@ -970,6 +1330,71 @@ pub async fn run_reserve_daemon(dc: &DaemonClient, cmd: &ReserveCommand) -> anyh
                 }),
             )
             .await
+        }
+        ReserveCommand::Sweep(args) => {
+            let (repo, closed) = sweep_closed_set(args)?;
+            let board = dc
+                .call_tool(
+                    "list_file_reservations",
+                    json!({
+                        "project_key": args.project,
+                        "holder": null,
+                        "path": null,
+                    }),
+                )
+                .await?;
+            let rows: Vec<(String, String, String)> = board
+                .get("reservations")
+                .and_then(Value::as_array)
+                .map(|rows| {
+                    rows.iter()
+                        .map(|row| {
+                            (
+                                row.get("path")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("")
+                                    .to_string(),
+                                row.get("holder")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("")
+                                    .to_string(),
+                                row.get("reason")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("")
+                                    .to_string(),
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let by_reason = group_stale_by_reason(&rows, &closed);
+            let mut released = 0u64;
+            for bead_id in by_reason.keys() {
+                let result = dc
+                    .call_tool(
+                        "release_file_reservations_by_reason",
+                        json!({
+                            "project_key": args.project,
+                            "agent_name": args.agent,
+                            "bead_id": bead_id,
+                            "notify_previous": !args.no_notify,
+                        }),
+                    )
+                    .await?;
+                released += result.get("released").and_then(Value::as_u64).unwrap_or(0);
+            }
+            print_sweep_report(&args.project, &repo, closed.len(), &by_reason, released)
+        }
+        // bd-reserve-yield-taqf: CLI-only noun, NO daemon tool (the frozen 41
+        // stays frozen) — scan the shared durable root directly, the same
+        // pattern `ack-sla` uses. Loud on stderr so a divergence between the
+        // daemon's root and this process's root is never silent.
+        ReserveCommand::Yield(_) | ReserveCommand::Yields(_) => {
+            eprintln!(
+                "toron reserve yield/yields: no daemon tool; scanning the shared durable root directly"
+            );
+            let mb = toron_mcp::demo_mailbox().await?;
+            run_reserve(&mb, cmd, dry_run).await
         }
         ReserveCommand::ForceRelease(args) => {
             daemon_tool(
@@ -1021,6 +1446,10 @@ pub async fn run_reserve_daemon(dc: &DaemonClient, cmd: &ReserveCommand) -> anyh
             )
             .await
         }
+        ReserveCommand::WithLease(_) => anyhow::bail!(
+            "reserve with-lease is dispatched in main before the mailbox arm (its child runs in \
+             the CLI's process); this arm is a tripwire, not a path"
+        ),
         ReserveCommand::Transfer(args) => {
             daemon_tool(
                 dc,
@@ -1652,6 +2081,11 @@ pub fn guard_check_verdict(
                      declared with `{}=true`.",
                     toron_core::mailbox::guard::PROJECTED_ATTR
                 ),
+                ProjectedDeclFault::AnchoredPattern { line_no, pattern } => format!(
+                    ".gitattributes:{line_no} declares the anchored pattern `{pattern}`, which \
+                     matches nothing: git anchors a leading `/`, this matcher does not. Drop the \
+                     leading slash (the pattern is already repo-relative)."
+                ),
             }
         ));
     }
@@ -1708,6 +2142,9 @@ pub fn guard_check_verdict(
             }
             ProjectedDeclFault::Malformed { line_no, line } => {
                 format!("malformed: .gitattributes:{line_no} `{line}`")
+            }
+            ProjectedDeclFault::AnchoredPattern { line_no, pattern } => {
+                format!("anchored-pattern: .gitattributes:{line_no} `{pattern}` matches nothing")
             }
         }),
         "agent": agent,

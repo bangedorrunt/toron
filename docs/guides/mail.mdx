@@ -7,13 +7,13 @@ description: Send, inbox, threads, corr, the receipt state machine, and the tag 
 
 ```bash
 toron mail send --project <slug> --as <Pin> --to captain \
-  --subject "[bd-z2d0] done" --body "<REPORT>" --thread bd-z2d0 \
+  --subject "[<bead-id>] done" --body "<REPORT>" --thread <bead-id> \
   --corr <corr> --wake tasked --result-path docs/guides/REPORT.md
 ```
 
 ```text
 $ toron mail send --project toron --as QuietHarbor --to captain \
-    --subject "[bd-f5g1] starting" --thread bd-f5g1 --body "claiming bd-f5g1"
+    --subject "[<bead-id>] starting" --thread <bead-id> --body "claiming <bead-id>"
 {
   "count": 1,
   "deliveries": [
@@ -42,7 +42,7 @@ is a failure even when it printed an event id.
 | `--priority` | Normal or low ordering. |
 | `--audience` | Audience narrowing tag. |
 | `--result-path` | Where the deliverable landed; pairs with the file-first rule. |
-| `--verdict approve\|deny` | Closes exactly one human decision per corr (ADR-0028 E4). |
+| `--verdict approve\|deny` | Closes exactly one human decision per corr. |
 | `--importance urgent` | Outer urgency tag, visible without decrypting, injected immediately. Spend it on file-conflict blocks, unanswered request-releases, wedges. Never on status or FYI. |
 | `--resolve-bead <bead>` | Stamps the structural done-hold tag the flywheel dispatch guard matches (CLI-only; the guard matches the tag, not a subject line). |
 
@@ -64,13 +64,13 @@ $ toron mail inbox --project toron --as QuietHarbor --since last
   "messages": []
 }
 
-$ toron mail thread-summarize --project toron --thread bd-f5g1
+$ toron mail thread-summarize --project toron --thread <bead-id>
 {
   "action_items": [],
-  "key_points": [ "[bd-f5g1] starting" ],
+  "key_points": [ "[<bead-id>] starting" ],
   "message_count": 1,
   "participants": [ "QuietHarbor" ],
-  "thread_id": "bd-f5g1"
+  "thread_id": "<bead-id>"
 }
 
 $ toron mail whois toron QuietHarbor

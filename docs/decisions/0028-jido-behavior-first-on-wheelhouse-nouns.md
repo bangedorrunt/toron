@@ -54,7 +54,7 @@ What is still dishonest (the seams this ADR exists to close):
 - Tick Law honesty: every `Cmd` arm applies I/O, re-enters `Msg`/`tick`, or leaves the enum with a bead. Placeholder arms lie about the effect vocabulary.
 - Mailbox-first assignment: E2/E3/E9 live or die on tags + sqlite + bus wake, not on prompt conventions.
 - No second control plane: anything that reintroduces Branch-in-tick, Suspend-as-product, GenServer-mailbox API, or supervisor heal splits the captains and forks the bus.
-- MCP freeze: same-verb-as-CLI only; tool count stays 40 (38 parity + 2 additive) unless an agent cannot tick without the verb.
+- MCP freeze: same-verb-as-CLI only; tool count stays 41 (38 parity + 3 additive — it read 40 when written; `catalog::ADDITIVE_TOOLS` is ground truth) unless an agent cannot tick without the verb.
 - Auditability: journaled `Msg` is the trace; `why` folds tick from journal, never greps pin substring as truth.
 - Bounded everything: unbounded `pending_wait` / `open_human` / journals are future OOM/disk incidents (cf. prior bounded-retention fixes `89a90af`, `39c6402`).
 - Implementability by agents: each slice below names files, patterns, tests, and a single-line VERIFY so beads are dispatchable (non-empty single-line `verify`; P≤2 carries a `principle` citation).

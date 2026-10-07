@@ -356,7 +356,7 @@ fn match_impl(pat: &[char], text: &[char], pi: usize, ti: usize) -> bool {
     }
 }
 
-fn parse_class(pat: &[char], start: usize) -> Option<(bool, usize)> {
+const fn parse_class(pat: &[char], start: usize) -> Option<(bool, usize)> {
     let mut i = start + 1;
     if i >= pat.len() {
         return None;

@@ -846,11 +846,19 @@ impl ProjectionSink for SqliteProjectionSink {
             .get(&sender_pubkey)
             .cloned()
             .unwrap_or_else(|| sender_pubkey.clone());
+        // Addressing is read through the canonical projection helper — the
+        // same one `extract_mail` uses. Binding these columns is not cosmetic:
+        // `check_ack_sla_expired` reads `to_list` to find the audience, and an
+        // empty audience means "cannot prove handled", so a missing bind turns
+        // every overdue row into a perpetual wake emitter.
+        let (to_list, cc_list) = crate::index::projection::addressing_lists(&mail.rumor.tags);
+        let to_list = serde_json::to_string(&to_list)?;
+        let cc_list = serde_json::to_string(&cc_list)?;
         let inserted = sqlx::query(
             "INSERT INTO messages \
              (event_id, project_slug, sender, sender_pubkey, subject, body, \
-              importance, ack_required, thread_id, created_ts_us, local_seq) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
+              importance, ack_required, thread_id, to_list, cc_list, created_ts_us, local_seq) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13) \
              ON CONFLICT (event_id) DO NOTHING",
         )
         .bind(&id)
@@ -862,6 +870,8 @@ impl ProjectionSink for SqliteProjectionSink {
         .bind(importance)
         .bind(ack_required)
         .bind(thread_id)
+        .bind(to_list)
+        .bind(cc_list)
         .bind(mail.ts_us())
         .bind(local_seq as i64)
         .execute(&self.pool)
@@ -1200,6 +1210,116 @@ mod tests {
             "hello",
         );
         gift_wrap::gift_wrap(sender, &recipient.public_key(), rumor).expect("wrap")
+    }
+
+    /// The projected row must carry the rumor `p`-tag addressing. Without it
+    /// `to_list`/`cc_list` take the schema default `'[]'`, and every consumer
+    /// that reads the audience (e.g. `check_ack_sla_expired`, which treats an
+    /// empty audience as "cannot prove handled") degrades to a fixed
+    /// worst case on every scan.
+    #[tokio::test]
+    async fn sink_write_persists_p_tag_addressing() {
+        let path = std::env::temp_dir().join(format!("sink-addr-{}.sqlite", uuid::Uuid::new_v4()));
+        let pool = crate::index::schema::connect(path.to_str().unwrap())
+            .await
+            .expect("pool");
+        crate::index::schema::migrate(&pool).await.expect("migrate");
+
+        let sender = keys();
+        let to = keys();
+        let cc = keys();
+        let recipient = keys();
+
+        // Same shape `build_visible_rumor` emits: ["p", npub, "", role].
+        let rumor = build_rumor(
+            sender.public_key(),
+            Timestamp::from(1_700_000_000),
+            Kind::PrivateDirectMessage,
+            vec![
+                Tag::parse(["p", &to.public_key().to_hex(), "", "to"]).expect("p to"),
+                Tag::parse(["p", &cc.public_key().to_hex(), "", "cc"]).expect("p cc"),
+            ],
+            "addressed",
+        );
+        let rumor_id = rumor.clone().id();
+        let mail = UnwrappedMail {
+            recipient: recipient.public_key(),
+            sender: sender.public_key(),
+            rumor,
+            rumor_id,
+            wrap_event_id: rumor_id,
+            created_at: Timestamp::from(1_700_000_000),
+        };
+
+        let sink = SqliteProjectionSink::new(pool.clone());
+        assert!(sink.write(&mail, 1).await.expect("write"));
+
+        let (to_list, cc_list): (String, String) =
+            sqlx::query_as("SELECT to_list, cc_list FROM messages WHERE event_id = ?1")
+                .bind(rumor_id.to_hex())
+                .fetch_one(&pool)
+                .await
+                .expect("projected row");
+
+        let to_seen: Vec<String> = serde_json::from_str(&to_list).expect("to_list is json");
+        let cc_seen: Vec<String> = serde_json::from_str(&cc_list).expect("cc_list is json");
+        assert_eq!(
+            to_seen,
+            vec![to.public_key().to_hex()],
+            "to_list must hold the role=to recipient"
+        );
+        assert_eq!(
+            cc_seen,
+            vec![cc.public_key().to_hex()],
+            "cc_list must hold the role=cc recipient"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Addressing is the pure core, so the role mapping is pinned directly:
+    /// no role cell means `to`, an unknown role is not silently dropped, and a
+    /// rumour with no `p` tag yields empty lists (not a fabricated recipient).
+    #[test]
+    fn addressing_lists_maps_p_tag_roles() {
+        let tags_of = |specs: Vec<Vec<&str>>| {
+            specs
+                .into_iter()
+                .map(|cells| Tag::parse(cells).expect("tag"))
+                .collect::<crate::nostr::Tags>()
+        };
+
+        let a = "aa".repeat(32);
+        let b = "bb".repeat(32);
+
+        assert_eq!(
+            crate::index::projection::addressing_lists(&tags_of(vec![vec!["p", &a]])),
+            (vec![a.clone()], vec![]),
+            "role cell absent defaults to to"
+        );
+        assert_eq!(
+            crate::index::projection::addressing_lists(&tags_of(vec![vec!["p", &a, "", "cc"]])),
+            (vec![], vec![a.clone()]),
+            "role cc goes to cc_list"
+        );
+        assert_eq!(
+            crate::index::projection::addressing_lists(&tags_of(vec![vec!["p", &a, "", "bcc"]])),
+            (vec![a.clone()], vec![]),
+            "an unmodelled role stays addressable rather than vanishing"
+        );
+        assert_eq!(
+            crate::index::projection::addressing_lists(&tags_of(vec![
+                vec!["p", &a, "", "to"],
+                vec!["p", &b, "", "cc"],
+            ])),
+            (vec![a], vec![b]),
+            "both lists are populated independently"
+        );
+        assert_eq!(
+            crate::index::projection::addressing_lists(&tags_of(vec![])),
+            (vec![], vec![]),
+            "no p tag means no audience, not a guess"
+        );
     }
 
     #[test]

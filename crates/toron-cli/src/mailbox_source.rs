@@ -393,11 +393,9 @@ mod selector_tests {
         // test was written to match the code rather than the documented intent.
         // A fence that pins the bug is worse than no fence, because it reads as
         // coverage of the thing that matters.
-        let cases: Vec<(
-            &str,
-            (Option<String>, bool, Option<String>, bool),
-            SourceDecision,
-        )> = vec![
+        // (TORON_MCP_URL, data_dir_pinned, flywheel_url, flywheel_configured)
+        type EnvRow = (Option<String>, bool, Option<String>, bool);
+        let cases: Vec<(&str, EnvRow, SourceDecision)> = vec![
             (
                 // bd-qpm0: with BOTH set the DAEMON wins, and the ambiguity is
                 // WARNED about rather than refused.

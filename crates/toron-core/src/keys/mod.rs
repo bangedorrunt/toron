@@ -185,7 +185,7 @@ mod tests {
 
     #[test]
     fn test_operator_key_roundtrip_via_env_path_semantics() {
-        // TORON_OPERATOR_NSEC is a PATH, not a secret (CLI design).
+        // TORON_OPERATOR_KEY is a PATH, not a secret (CLI design).
         let keys = generate();
         let path = temp_path("operator.ncryptsec");
         write_encrypted_key(&path, &keys, "op-pass", TEST_LOG_N).expect("write");

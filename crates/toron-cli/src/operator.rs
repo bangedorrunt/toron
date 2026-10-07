@@ -220,6 +220,174 @@ fn check_name_collisions(cfg: &Config) -> CheckResult {
     }
 }
 
+/// bd-u31k: pure core of the identity-divergence check — each live pane's
+/// stamped npub vs the registry's binding for that pin. Inputs are exactly
+/// what the shell gathers: pane stamps and `agents` rows (project, name,
+/// pubkey). A stamp whose (normalized project, pin) is not registered is NOT
+/// a divergence (that is `whois`'s "register first"); a stamp whose npub is
+/// not among the registry's keys for that name is the measured hazard —
+/// mail sent to the name reaches a key the pane does not read, invisibly.
+fn identity_divergence_check(
+    stamps: &[toron_core::mailbox::identity::PaneStamp],
+    roster: &[(String, String, String)],
+) -> CheckResult {
+    let name = "identity_divergence";
+    let short = |k: &str| k[..8.min(k.len())].to_string();
+    let mut rows: Vec<String> = Vec::new();
+    for stamp in stamps {
+        let slug = toron_core::mailbox::identity::stamp_project_slug(&stamp.project);
+        let registered: Vec<&str> = roster
+            .iter()
+            .filter(|(p, n, _)| p == slug && n == &stamp.pin)
+            .map(|(_, _, k)| k.as_str())
+            .collect();
+        if registered.is_empty() || registered.iter().any(|k| *k == stamp.npub) {
+            continue;
+        }
+        let keys: Vec<String> = registered.iter().map(|k| short(k)).collect();
+        rows.push(format!(
+            "pane {} stamps {} ({slug}) npub {}… but the registry binds it to {}… — \
+             re-register the pin or address it by npub",
+            stamp.pane_id,
+            stamp.pin,
+            short(&stamp.npub),
+            keys.join("/")
+        ));
+    }
+    if rows.is_empty() {
+        CheckResult {
+            name,
+            ok: true,
+            detail: format!(
+                "{} stamped pane(s) — every stamp npub matches its registered pin",
+                stamps.len()
+            ),
+        }
+    } else {
+        CheckResult {
+            name,
+            ok: false,
+            detail: format!("{} divergent pin(s): {}", rows.len(), rows.join("; ")),
+        }
+    }
+}
+
+/// bd-u31k: the shell around [`identity_divergence_check`] — stamped panes
+/// from herdr, registry rows from the index DB. herdr unreachable or no
+/// index is NOT a defect (the same advisory posture as the pane fields
+/// `whois` attaches), so those read ok with the reason named.
+fn check_identity_divergence(cfg: &Config) -> CheckResult {
+    let name = "identity_divergence";
+    let stamps = {
+        let Ok(backend) = toron_core::backend::herdr::HerdrBackend::connect(None) else {
+            return CheckResult {
+                name,
+                ok: true,
+                detail: "herdr not reachable — no live panes to compare".into(),
+            };
+        };
+        let client = backend.client();
+        let panes: Vec<toron_core::backend::herdr::PaneInfo> = client
+            .workspace_list()
+            .map(|wss| {
+                wss.into_iter()
+                    .flat_map(|ws| client.pane_list(Some(&ws.workspace_id)).unwrap_or_default())
+                    .collect()
+            })
+            .unwrap_or_default();
+        panes
+            .iter()
+            .filter_map(toron_core::mailbox::identity::pane_stamp)
+            .collect::<Vec<_>>()
+    };
+    if stamps.is_empty() {
+        return CheckResult {
+            name,
+            ok: true,
+            detail: "no stamped live panes to compare".into(),
+        };
+    }
+    let Some(data_dir) = resolve_data_dir(cfg, None) else {
+        return CheckResult {
+            name,
+            ok: true,
+            detail: "no data dir — nothing to compare".into(),
+        };
+    };
+    let db_path = data_dir.join("index.sqlite");
+    if !db_path.exists() {
+        return CheckResult {
+            name,
+            ok: true,
+            detail: format!("no index at {}", db_path.display()),
+        };
+    }
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            return CheckResult {
+                name,
+                ok: false,
+                detail: format!("runtime build failed: {e}"),
+            };
+        }
+    };
+    let roster = rt.block_on(async {
+        let pool = toron_core::index::schema::connect(db_path.to_str().unwrap()).await?;
+        let rows = toron_core::mailbox::identity::identity_roster(&pool).await?;
+        pool.close().await;
+        Ok::<_, anyhow::Error>(rows)
+    });
+    match roster {
+        Ok(roster) => identity_divergence_check(&stamps, &roster),
+        Err(e) => CheckResult {
+            name,
+            ok: false,
+            detail: format!("scan failed: {e:#}"),
+        },
+    }
+}
+
+/// The daemon can be live and still not be the build on disk — a process keeps
+/// executing the file it was exec'd from after a rebuild replaces that file.
+/// That cost a full debug cycle on 2026-09-30: an hour-stale daemon rewrote the
+/// operator key on every boot while every other check read green, and nothing
+/// on the machine said which build was serving.
+///
+/// FAILS rather than advising: a daemon serving a build you did not build is a
+/// real inconsistency, and the remedy is one command. A record that names an
+/// EARLIER boot (nothing serving now, or another process holds the address) is
+/// not stale — it is just not judgeable, and is reported as ok.
+fn check_daemon_build() -> CheckResult {
+    let name = "daemon_build";
+    let Some(snap) = toron_core::serve_build::read(&crate::daemon::build_record_path()) else {
+        return CheckResult {
+            name,
+            ok: true,
+            detail: "no boot record — no toron serve has booted against this data root".into(),
+        };
+    };
+    let serving = crate::daemon::port_holder_pid(crate::daemon::DEFAULT_ADDR);
+    let verdict = toron_core::serve_build::build_verdict(
+        &snap,
+        serving,
+        toron_core::serve_build::artifact_id(&snap.binary),
+    );
+    CheckResult {
+        name,
+        ok: !verdict.is_replaced(),
+        detail: crate::daemon::build_detail(
+            &snap,
+            verdict,
+            serving,
+            toron_core::serve_build::artifact_mtime_unix(&snap.binary),
+        ),
+    }
+}
+
 fn check_herdr() -> CheckResult {
     let path = toron_core::backend::herdr::default_socket_path();
     match toron_core::backend::herdr::HerdrBackend::connect(None) {
@@ -257,23 +425,59 @@ fn check_git() -> CheckResult {
 }
 
 fn check_keys(cfg: &Config) -> CheckResult {
+    // ADR-0038: ONE resolution, the same one the daemon unit and the mailbox
+    // host use. An explicit `operator_key`/`TORON_OPERATOR_KEY` wins; otherwise
+    // the canonical config-home key. The detail names which source resolved,
+    // because the whole defect this replaces was an operator who could not tell
+    // which of two keys a process would read.
     match &cfg.operator_key {
         Some(p) if p.is_file() => CheckResult {
             name: "keys",
             ok: true,
-            detail: format!("operator key present at {}", p.display()),
+            detail: format!("operator key present at {} (configured)", p.display()),
         },
         Some(p) => CheckResult {
             name: "keys",
             ok: false,
-            detail: format!("operator key missing at {}", p.display()),
+            detail: format!("operator key missing at {} (configured)", p.display()),
         },
-        None => CheckResult {
-            name: "keys",
-            ok: false,
-            detail: "operator_key not configured (set operator_key or TORON_OPERATOR_KEY)"
-                .to_string(),
-        },
+        None => {
+            let canonical = toron_core::config::operator_key_path();
+            if canonical.is_file() {
+                return CheckResult {
+                    name: "keys",
+                    ok: true,
+                    detail: format!(
+                        "operator key present at {} (canonical default)",
+                        canonical.display()
+                    ),
+                };
+            }
+            // A legacy data-root key is a DIFFERENT identity. Reporting a bare
+            // "not configured" here would hide the exact hazard the ADR closes,
+            // so name both paths and never pick one silently.
+            let legacy = toron_core::config::legacy_operator_key_path();
+            if legacy.is_file() {
+                return CheckResult {
+                    name: "keys",
+                    ok: false,
+                    detail: format!(
+                        "no operator key at {canonical}, but a LEGACY key from the old data root \
+                         sits at {legacy} — different identities, so nothing is chosen \
+                         automatically; move the one you mean to keep (ADR-0038): \
+                         mv {legacy} {canonical}",
+                        canonical = canonical.display(),
+                        legacy = legacy.display()
+                    ),
+                };
+            }
+            CheckResult {
+                name: "keys",
+                ok: false,
+                detail: "operator_key not configured (set operator_key or TORON_OPERATOR_KEY)"
+                    .to_string(),
+            }
+        }
     }
 }
 
@@ -357,39 +561,71 @@ fn check_resonate() -> CheckResult {
     }
 }
 
-/// bd-gv1k: a TLS endpoint cannot be verified by a plaintext probe.
+/// Read `/health` over TLS with the same HTTP stack the workflow SDK uses.
 ///
-/// Reporting FAIL would be a false red (the very defect this bead fixes) and
-/// reporting ok would be the invent-green GS-037 forbids. Say the true thing:
-/// the endpoint is named, TCP reachability is checked, and the exact command
-/// that verifies it is given. `doctor --check` still exits non-zero, so a
-/// pipeline keyed on it does not go silently green.
+/// `resonate-sdk` speaks to the server through reqwest, so probing with
+/// reqwest is not a second opinion — it is the same TLS stack and trust store
+/// the runtime will use, which is exactly the property GS-037 wants. Blocking
+/// on purpose: the doctor owns a sync edge (no ambient runtime), and spinning
+/// a nested one to await a health check would be its own defect.
+fn https_health_status(url: &str) -> Result<u16, String> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(3))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let response = client
+        .get(format!("{}/health", url.trim_end_matches('/')))
+        .send()
+        .map_err(|e| e.to_string())?;
+    Ok(response.status().as_u16())
+}
+
+/// Verdict for a TLS `/health` read, given its outcome. Pure, so the GS-037
+/// fail-closed matrix is fenced rather than trusted: only a 2xx is green, and
+/// a read that failed carries its own error instead of flattening every
+/// failure into a bare "unreachable".
+fn https_health_verdict(url: &str, outcome: Result<u16, String>) -> CheckResult {
+    match outcome {
+        Ok(code) if (200..300).contains(&code) => CheckResult {
+            name: "resonate",
+            ok: true,
+            detail: format!("reachable at {url} (TLS /health returned HTTP {code})"),
+        },
+        Ok(code) => CheckResult {
+            name: "resonate",
+            ok: false,
+            detail: format!(
+                "{url} answered TLS but /health returned HTTP {code} (need 2xx) — refuse soft-ok invent-green (GS-037)"
+            ),
+        },
+        Err(e) => CheckResult {
+            name: "resonate",
+            ok: false,
+            detail: format!(
+                "cannot read {url}/health over TLS ({e}) — refuse soft-ok invent-green (GS-037); verify with `curl -fsS {url}/health`"
+            ),
+        },
+    }
+}
+
+/// bd-gv1k + the TLS read: a TLS endpoint IS verifiable, so it is verified.
+///
+/// This arm used to refuse to read and print a `curl` command instead, on the
+/// reasoning that a plaintext probe cannot speak TLS. That reasoning is fine
+/// about the mechanism and wrong about the outcome: the resolved remote is
+/// https, so the only healthy deployment read as a permanent FAIL, and the
+/// check trained operators to ignore it. The endpoint is now read over TLS
+/// (§ [`https_health_status`]); an unparseable target is still named as
+/// unparseable, and a failed read still fails closed.
 fn check_resonate_tls(url: &str) -> CheckResult {
-    let Some((host, port)) = toron_workflow::engine::host_port(url) else {
+    if toron_workflow::engine::host_port(url).is_none() {
         return CheckResult {
             name: "resonate",
             ok: false,
             detail: format!("cannot parse {url}"),
         };
-    };
-    use std::net::ToSocketAddrs;
-    let reachable = (host.as_str(), port)
-        .to_socket_addrs()
-        .ok()
-        .and_then(|mut it| it.next())
-        .map(|addr| {
-            std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(2000))
-                .is_ok()
-        })
-        .unwrap_or(false);
-    CheckResult {
-        name: "resonate",
-        ok: false,
-        detail: format!(
-            "resolves to {url}; TCP {} but this probe speaks plaintext HTTP and cannot read a TLS /health — verify with `curl -fsS {url}/health`",
-            if reachable { "open" } else { "closed" }
-        ),
     }
+    https_health_verdict(url, https_health_status(url))
 }
 
 fn check_resonate_at(addr: std::net::SocketAddr) -> CheckResult {
@@ -458,9 +694,11 @@ pub fn run_doctor(
         check_herdr(),
         check_git(),
         check_keys(cfg),
+        check_daemon_build(),
         check_resonate(),
         check_legacy_slug_identities(cfg),
         check_name_collisions(cfg),
+        check_identity_divergence(cfg),
     ];
     let value = json!({ "checks": serde_json::to_value(&checks)? });
 
@@ -1005,10 +1243,14 @@ pub const fn robot_tool_name(command: &Command) -> &'static str {
         Command::Reserve(ReserveCommand::Renew(_)) => "reserve.renew",
         Command::Reserve(ReserveCommand::Release(_)) => "reserve.release",
         Command::Reserve(ReserveCommand::ReleaseByReason(_)) => "reserve.release_by_reason",
+        Command::Reserve(ReserveCommand::Sweep(_)) => "reserve.sweep",
+        Command::Reserve(ReserveCommand::Yield(_)) => "reserve.yield",
+        Command::Reserve(ReserveCommand::Yields(_)) => "reserve.yields",
         Command::Reserve(ReserveCommand::ForceRelease(_)) => "reserve.force_release",
         Command::Reserve(ReserveCommand::RequestRelease(_)) => "reserve.request_release",
         Command::Reserve(ReserveCommand::Respond(_)) => "reserve.respond",
         Command::Reserve(ReserveCommand::Transfer(_)) => "reserve.transfer",
+        Command::Reserve(ReserveCommand::WithLease(_)) => "reserve.with_lease",
         Command::Slot(SlotCommand::Acquire(_)) => "slot.acquire",
         Command::Slot(SlotCommand::Renew(_)) => "slot.renew",
         Command::Slot(SlotCommand::Release(_)) => "slot.release",
@@ -1029,7 +1271,13 @@ pub const fn robot_tool_name(command: &Command) -> &'static str {
 // key
 // ---------------------------------------------------------------------------
 
-/// Default key path: `~/.config/toron/<role>_nsec` (no HOME → relative).
+/// Default key path for the AGENT and ANCHOR roles:
+/// `~/.config/toron/<role>_nsec` (no HOME → relative).
+///
+/// The operator role does not come through here (ADR-0038) — it resolves via
+/// [`toron_core::config::operator_key_path`], which also honors
+/// `XDG_CONFIG_HOME`. Only the operator path is reconciled so far; the other
+/// two roles still follow HOME alone.
 fn default_key_path(role: &str) -> PathBuf {
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
@@ -1048,13 +1296,29 @@ pub fn run_key(cfg: &Config, cmd: &KeyCommand) -> anyhow::Result<()> {
 
 fn run_key_generate(cfg: &Config, args: &KeyGenerateArgs) -> anyhow::Result<()> {
     let path = args.out.clone().unwrap_or_else(|| match args.role {
+        // ADR-0038: the ONE canonical operator path — same resolution the
+        // daemon unit writes into its env and `doctor` reports against.
         crate::cli::RoleArg::Operator => cfg
             .operator_key
             .clone()
-            .unwrap_or_else(|| default_key_path("operator")),
+            .unwrap_or_else(toron_core::config::operator_key_path),
         crate::cli::RoleArg::Agent => default_key_path("agent"),
         crate::cli::RoleArg::Anchor => default_key_path("anchor"),
     });
+    // Fail closed on an existing key file. An identity is not a build artifact:
+    // overwriting one in place destroys the only copy of a secret, and there is
+    // no recovery for a key you did not back up. This is not hypothetical — it
+    // is how the operator key at the canonical path was lost on 2026-09-30,
+    // when a test that isolated HOME but not XDG_CONFIG_HOME ran `key generate`
+    // against the real config home. Refusing costs one `mv`; the alternative
+    // costs an identity.
+    if path.exists() {
+        anyhow::bail!(
+            "refusing to overwrite the existing key at {} — move or remove it first, or \
+             generate to a different path with --out",
+            path.display()
+        );
+    }
     let keys = toron_core::keys::generate();
     let password = key_password();
     toron_core::keys::write_encrypted_key(&path, &keys, &password, KEY_LOG_N)?;
@@ -1067,10 +1331,13 @@ fn run_key_generate(cfg: &Config, args: &KeyGenerateArgs) -> anyhow::Result<()> 
 fn run_key_inspect(cfg: &Config, args: &KeyInspectArgs) -> anyhow::Result<()> {
     let path = match &args.path {
         Some(p) => p.clone(),
+        // Same default as `generate`: explicit config, else the canonical
+        // operator key. Asking "what is my operator npub?" with no arguments
+        // now answers instead of erroring (ADR-0038).
         None => cfg
             .operator_key
             .clone()
-            .ok_or_else(|| anyhow::anyhow!("no key path given and operator_key not configured"))?,
+            .unwrap_or_else(toron_core::config::operator_key_path),
     };
     let password = key_password();
     // Load/decrypt failure bubbles as a runtime error (exit 1); only the
@@ -1222,33 +1489,64 @@ mod check_resonate_tests {
         assert_eq!(http_response_status(""), None);
     }
 
+    /// The TLS arm is a real read with a real verdict, so the whole matrix is
+    /// checked here without a TLS server: only a 2xx is green (GS-037), and
+    /// every red names what it actually saw.
+    #[test]
+    fn tls_health_verdict_matrix_never_invents_green() {
+        for code in [200u16, 204, 299] {
+            let r = https_health_verdict("https://resonate.example", Ok(code));
+            assert!(r.ok, "HTTP {code} is a healthy /health");
+        }
+        for code in [301u16, 401, 500, 503] {
+            let r = https_health_verdict("https://resonate.example", Ok(code));
+            assert!(!r.ok, "HTTP {code} must not read green");
+            assert!(
+                r.detail.contains(&code.to_string()),
+                "a red must name the code it saw, got: {}",
+                r.detail
+            );
+        }
+        let r = https_health_verdict(
+            "https://resonate.example",
+            Err("certificate verify failed".to_string()),
+        );
+        assert!(!r.ok, "a read that failed is never green");
+        assert!(
+            r.detail.contains("certificate verify failed"),
+            "a red must carry the transport error, got: {}",
+            r.detail
+        );
+    }
+
+    /// bd-gv1k: the regression was a hardcoded 127.0.0.1:8001, so a correct
+    /// deployment on a TLS remote read as "your local server is down — start
+    /// resonate". The verdict must name the target the process actually
+    /// resolves. The target here is a CLOSED local port, so the TLS read is
+    /// exercised end to end (it must fail closed, and fast) without a server.
     #[test]
     fn tls_target_is_named_not_replaced_by_a_local_address() {
-        // bd-gv1k: the regression was a hardcoded 127.0.0.1:8001, so a
-        // correct deployment on a TLS remote read as "your local server is
-        // down — start resonate". The verdict must name the target the
-        // process actually resolves, and must not invent-green.
-        let r = check_resonate_tls("https://resonate.invalid");
+        let closed = {
+            let l = TcpListener::bind("127.0.0.1:0").expect("bind free");
+            let a = l.local_addr().expect("addr");
+            drop(l);
+            a
+        };
+        let url = format!("https://127.0.0.1:{}", closed.port());
+        let r = check_resonate_tls(&url);
+        assert!(!r.ok, "a closed port is not a healthy endpoint");
         assert!(
-            !r.ok,
-            "a plaintext probe cannot verify TLS — never invent-green"
-        );
-        assert!(
-            r.detail.contains("https://resonate.invalid"),
+            r.detail.contains(&url),
             "the verdict must name the resolved target, got: {}",
             r.detail
         );
-        assert!(
-            !r.detail.contains("127.0.0.1:8001"),
-            "must not fall back to the old hardcoded address, got: {}",
-            r.detail
-        );
-        assert!(
-            r.detail
-                .contains("curl -fsS https://resonate.invalid/health"),
-            "must hand over a command that verifies it, got: {}",
-            r.detail
-        );
+        for local in ["127.0.0.1:8001", "localhost:8001"] {
+            assert!(
+                !r.detail.contains(local),
+                "must not fall back to {local}, got: {}",
+                r.detail
+            );
+        }
     }
 
     #[test]
@@ -1563,6 +1861,67 @@ mod reconstruct_tests {
         };
         let code = run_doctor_reconstruct(&cfg, &args, OutputFormat::Json).unwrap();
         assert_eq!(code, ExitCode::from(3));
+    }
+
+    /// bd-u31k: a pane stamp whose npub differs from the registry's binding
+    /// for the same pin must FLAG (ok=false) and name the pane, both npubs,
+    /// and the one-line remediation; same-npub stamps and pins absent from
+    /// the registry stay green (registration is `whois`'s concern).
+    #[test]
+    fn doctor_flags_pin_pane_divergence() {
+        use toron_core::mailbox::identity::PaneStamp;
+        let registered = "aa".repeat(32);
+        let stamped = "bb".repeat(32);
+        let stamp = PaneStamp {
+            pane_id: "w1:p1".into(),
+            pin: "SilverPond".into(),
+            // flywheel stamps a project PATH; the roster is keyed by slug.
+            project: "/Users/x/workspace/toron".into(),
+            npub: stamped.clone(),
+        };
+        let roster = vec![(
+            "toron".to_string(),
+            "SilverPond".to_string(),
+            registered.clone(),
+        )];
+        let result = identity_divergence_check(std::slice::from_ref(&stamp), &roster);
+        assert!(
+            !result.ok,
+            "a stamped-vs-registered npub mismatch must flag"
+        );
+        assert!(
+            result.detail.contains("w1:p1"),
+            "pane named: {}",
+            result.detail
+        );
+        assert!(
+            result.detail.contains(&stamped[..8]),
+            "stamped npub named: {}",
+            result.detail
+        );
+        assert!(
+            result.detail.contains(&registered[..8]),
+            "registered npub named: {}",
+            result.detail
+        );
+        assert!(
+            result
+                .detail
+                .contains("re-register the pin or address it by npub"),
+            "one-line remediation named: {}",
+            result.detail
+        );
+        // The healing cases stay green: same npub, and a pin not registered.
+        let same = PaneStamp {
+            npub: registered.clone(),
+            ..stamp.clone()
+        };
+        assert!(identity_divergence_check(std::slice::from_ref(&same), &roster).ok);
+        let unregistered = PaneStamp {
+            pin: "NewPond".into(),
+            ..stamp
+        };
+        assert!(identity_divergence_check(std::slice::from_ref(&unregistered), &roster).ok);
     }
 
     #[test]

@@ -119,6 +119,11 @@ pub struct RegisteredAgentOut {
 /// `pane_id`/`workspace_id`/`tab_id` are the LIVE herdr pane the pin runs in
 /// (advisory; all `None` when no herdr backend is reachable). Additive
 /// optionals, so a client that predates them parses rows unchanged.
+///
+/// `pane_npub`/`identity_divergent` are the identity-health pair (u31k): the
+/// npub stamped on that live pane vs this row's npub. Divergent means mail
+/// addressed to the NAME reaches a key the pane does not read — re-register
+/// the pin or address it by npub. Advisory, never a routing gate.
 #[derive(Debug, Clone, JsonSchema)]
 pub struct WhoIsOut {
     pub name: String,
@@ -131,6 +136,8 @@ pub struct WhoIsOut {
     pub pane_id: Option<String>,
     pub workspace_id: Option<String>,
     pub tab_id: Option<String>,
+    pub pane_npub: Option<String>,
+    pub identity_divergent: bool,
 }
 
 /// `resolve_pane_identity`: `{agent_name, pane_id}` (name found or not) or

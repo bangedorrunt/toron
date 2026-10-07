@@ -41,6 +41,7 @@ This directory contains records of the major architectural decisions made for th
 | [0035](0035-elm-kernel-law-and-judgment-plane.md) | Elm Kernel Law and Judgment Plane Across toron, flywheel, and beads | **Accepted** (operator word 2026-09-22; research bead bd-fp4u closed, implementation epic bd-vhmn closing) |
 | [0036](0036-shared-bus-substrate.md) | Daemon Push Sidecar (Wake Bus) for Cross-Process Observation | **Accepted** (operator word 2026-09-23; serve wiring landed bd-ewsi, design bead bd-42tn + transport bead bd-un5s closed) |
 | [0037](0037-one-key-per-pin-project-scoped-visibility.md) | One Key per Pin — Project-Scoped Visibility, Not Project-Scoped Keys | **Proposed** (2026-09-29, bead bd-j5sk; the inbox already filters by pubkey alone, so the fix is registration-side; bd-j5sk stays open until accepted and migrated; the §6.1 blast-radius trade is an operator decision) |
+| [0038](0038-operator-key-lives-in-the-config-home.md) | The Operator Key Lives in the Config Home — One Resolution for Everyone | **Accepted** 2026-09-30 (operator choice; the two paths held different keys on the machine that prompted it, so `doctor` reported a red that read as unconfigured while the daemon signed with a second identity; the implicit data-root mint now refuses and names the `mv`) |
 
 Rows 0034–0036 were missing from this index when ADR-0037 was drafted; they are backfilled here. An index is the directory's only discovery surface, and ADR-0035/0036 are **accepted** — an accepted decision nobody can find is a gap, not a cosmetic one.
 

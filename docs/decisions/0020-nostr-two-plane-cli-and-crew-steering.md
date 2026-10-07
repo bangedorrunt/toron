@@ -10,7 +10,7 @@ informed: flywheel maintainers; skill owners (toron, flywheel, swarm)
 # ADR-0020: Expose the Nostr Two-Plane Surface (CLI-first) so Crews Steer Each Other
 
 **Status:** Accepted (2026-08-15). Wave 1 verified: SC-27..33 green; CLI
-`channel`/`job`/`react`/`presence`/`watch` shipped; MCP tool count stays 40 (38 AM-Rust parity + 2 toron additive — corrected 2026-09-04, GS-016; the 39 figure predates the additive pair).
+`channel`/`job`/`react`/`presence`/`watch` shipped; MCP tool count stays 41 (38 AM-Rust parity + 3 toron additive — corrected 2026-09-04, GS-016; the 39 figure predates the additive pair, and `ask_judgment` has since joined the two — 2026-09-30).
 **Amended by:** [ADR-0023](0023-nip29-group-metadata-kinds.md) (2026-08-24) —
 create/close emit **39000**, join/leave emit **39002**; 40/41 ingest-only.
 **Date:** 2026-08-15
@@ -411,7 +411,7 @@ Gate: `cargo test -p toron-e2e --features p2` plus new un-gated CLI tests that s
 | C-CAT | `toron catalog --json` lists `channel`, `job`, `react`, `presence`, `watch` under CLI. `cargo test catalog_freshness` green after regen. |
 | C-ROBOT | `--robot-capabilities` JSON includes those nouns. |
 | C-SYNC | `Command` enum variants exist. AGENTS.md STRUCTURE mentions them. Skill CLI table matches `--help`. |
-| C-NO-TOOL | `rg '#\[tool\(name'` count unchanged at acceptance (39). Live 2026-09-04: **40** (38 parity + 2 additive, GS-016). |
+| C-NO-TOOL | `rg '#\[tool\(name'` count unchanged at acceptance (39). Live 2026-09-04: **40** (38 parity + 2 additive, GS-016). Live 2026-09-30: **41** (38 parity + 3 additive — `catalog::ADDITIVE_TOOLS` is ground truth). |
 | C-NO-KIND-42-EMIT | `rg 'CHANNEL_MESSAGE = 42'` is gone or only `LEGACY`. |
 | C-DEP | `! grep -r 'use flywheel' crates/` still holds. |
 
@@ -485,7 +485,7 @@ Wave 1 is not done until every box is checked.
 - [ ] SC-28, SC-29, SC-30, SC-31, SC-32, SC-33 green.
 - [ ] SC-9 still green (plane P).
 - [ ] `--as` unknown name fails. Claim npub == `whois` npub.
-- [x] `#[tool(name` count == 39 at acceptance; **40 live** (38 parity + 2 additive since, GS-016).
+- [x] `#[tool(name` count == 39 at acceptance; **40 live** at the time (38 parity + 2 additive since, GS-016); **41** as of 2026-09-30 (+ `ask_judgment`).
 - [ ] `catalog_freshness` green after `toron catalog --json` regen.
 - [ ] `--robot-capabilities` lists the five nouns.
 - [ ] Skills: two-plane + Spec 5 recipe present. "DMs are the only model" gone.

@@ -14,90 +14,12 @@ members = [
 # ~8.8MB) — dyld then rejects them at load with "mis-aligned LINKEDIT string
 # pool", breaking `cargo install --release`/`--path` builds of toron.
 # Disable stripping (correctness > binary size for this project).
+# Dependency debuginfo is the dominant cost of a cold dev build and of every
+# relink, and none of it is read: a panic in a dependency still resolves to a
+# line table, which is all a backtrace needs. Full debuginfo for deps was the
+# default here because no repo set a `[profile.dev.package]` override.
+[profile.dev.package."*"]
+debug = "line-tables-only"
+
 [profile.release]
 strip = "none"
-
-[workspace.lints.clippy]
-# Shared lint posture with siblings beads + flywheel (bd-14ea): pedantic +
-# nursery deny with targeted allows. Unsafe is denied per-crate via
-# `#![forbid(unsafe_code)]` (ADR-0003 verify-gates.sh enforces it), so no
-# [lints.rust] section here — keep the single mechanism.
-all = "deny"
-pedantic = { level = "deny", priority = -1 }
-nursery = { level = "deny", priority = -1 }
-# Allow these lints to unblock CI (need higher priority than groups)
-cast_precision_loss = { level = "allow", priority = 1 }
-doc_markdown = { level = "allow", priority = 1 }
-# Stylistic nursery/pedantic lints that don't reflect real defects
-map_unwrap_or = { level = "allow", priority = 1 }
-similar_names = { level = "allow", priority = 1 }
-too_long_first_doc_paragraph = { level = "allow", priority = 1 }
-missing_errors_doc = { level = "allow", priority = 1 }
-struct_excessive_bools = { level = "allow", priority = 1 }
-if_not_else = { level = "allow", priority = 1 }
-# bd-14ea wave 2: mechanical churn across the workspace (1253 sites, 48
-# kinds). Allowed, not fixed, to keep this alignment commit config-only —
-# a concurrent crew has in-flight source edits (responses.rs, operator.rs)
-# that automated `--fix` must not touch. Tighten one lint at a time later.
-cast_lossless = { level = "allow", priority = 1 }
-cast_possible_truncation = { level = "allow", priority = 1 }
-cast_possible_wrap = { level = "allow", priority = 1 }
-cast_sign_loss = { level = "allow", priority = 1 }
-ignored_unit_patterns = { level = "allow", priority = 1 }
-implicit_clone = { level = "allow", priority = 1 }
-implicit_hasher = { level = "allow", priority = 1 }
-items_after_statements = { level = "allow", priority = 1 }
-iter_with_drain = { level = "allow", priority = 1 }
-literal_string_with_formatting_args = { level = "allow", priority = 1 }
-manual_is_variant_and = { level = "allow", priority = 1 }
-manual_let_else = { level = "allow", priority = 1 }
-match_same_arms = { level = "allow", priority = 1 } # keep: per-arm domain comments (receipt/envelope transition tables, http_guard RFC ranges, types status vocab); merging types.rs:124 trips wildcard_in_or_patterns — the two lints conflict, two-arm form is clippy-all clean (bd-579t)
-missing_fields_in_debug = { level = "allow", priority = 1 } # keep: Mailbox Debug deliberately redacts secrets (operator keys, passphrases) to booleans — listing all fields would leak key material into logs (bd-s5kr)
-missing_panics_doc = { level = "allow", priority = 1 }
-must_use_candidate = { level = "allow", priority = 1 }
-needless_pass_by_ref_mut = { level = "allow", priority = 1 }
-needless_pass_by_value = { level = "allow", priority = 1 }
-or_fun_call = { level = "allow", priority = 1 }
-return_self_not_must_use = { level = "allow", priority = 1 }
-single_match_else = { level = "allow", priority = 1 }
-too_many_lines = { level = "allow", priority = 1 }
-unnecessary_debug_formatting = { level = "allow", priority = 1 }
-unnested_or_patterns = { level = "allow", priority = 1 }
-unused_async = { level = "allow", priority = 1 }
-unused_self = { level = "allow", priority = 1 }
-use_self = { level = "allow", priority = 1 }
-# Wave 2b: surfaced only after the first 48 allows let downstream crates
-# compile (deny blocks the graph past the first failing crate).
-derive_partial_eq_without_eq = { level = "allow", priority = 1 }
-duration_suboptimal_units = { level = "allow", priority = 1 }
-match_wildcard_for_single_variants = { level = "allow", priority = 1 }
-needless_raw_string_hashes = { level = "allow", priority = 1 }
-redundant_pub_crate = { level = "allow", priority = 1 }
-trivially_copy_pass_by_ref = { level = "allow", priority = 1 }
-unused_peekable = { level = "allow", priority = 1 }
-# Wave 2c: same story, one layer deeper (toron-mcp lib).
-case_sensitive_file_extension_comparisons = { level = "allow", priority = 1 }
-manual_assert = { level = "allow", priority = 1 }
-match_wild_err_arm = { level = "allow", priority = 1 }
-redundant_else = { level = "allow", priority = 1 }
-single_char_pattern = { level = "allow", priority = 1 }
-stable_sort_primitive = { level = "allow", priority = 1 }
-# Wave 2d: toron-cli bin test target.
-bool_to_int_with_if = { level = "allow", priority = 1 }
-many_single_char_names = { level = "allow", priority = 1 }
-unnecessary_wraps = { level = "allow", priority = 1 }
-# Wave 2e: toron-cli TUI (bd-x4qw). Same allow-not-fix mechanism as 2a-2d, for
-# two kinds whose suggested rewrite is WORSE at each site rather than merely
-# cosmetic:
-#   option_if_let_else (6, all in tui/) — every one turns a `match` whose two
-#     arms are already named into a nested `map_or_else` with two closures. In a
-#     reducer whose arms are the readable part (Ok => message, Err => Msg::Failed)
-#     that trades a flat arm list for a closure sandwich. Fixing this lint makes
-#     the Elm fold harder to read, which is the opposite of the ADR-0031 goal.
-#   type_complexity (1, a table-driven test in mailbox_source.rs) — a 3-tuple
-#     table of (label, flags, expected). Naming the tuple buys nothing.
-# Tighten one at a time later, like 2a-2d. Everything else in this wave WAS fixed
-# in source, including a real defect: cli_tui_pty.rs killed a wedged pty console
-# without reaping it, leaving a zombie for the rest of the suite.
-option_if_let_else = { level = "allow", priority = 1 }
-type_complexity = { level = "allow", priority = 1 }

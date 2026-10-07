@@ -674,6 +674,53 @@ impl WorkflowEffectStore {
         Self { pool }
     }
 
+    /// Save one session delivery-cursor snapshot (bd-aqvg): upsert by
+    /// session. in_flight never reaches here (snapshot drops it); ids
+    /// unconfirmed at crash stay retryable instead of restored-delivered.
+    pub async fn save_delivery_cursor(
+        &self,
+        session: &str,
+        delivered_json: &str,
+        cursor: i64,
+    ) -> anyhow::Result<()> {
+        let now = now_us();
+        sqlx::query(
+            "INSERT INTO delivery_cursors (session, delivered_json, cursor, updated_us) \
+             VALUES (?, ?, ?, ?) \
+             ON CONFLICT(session) DO UPDATE SET \
+             delivered_json = excluded.delivered_json, cursor = excluded.cursor, \
+             updated_us = excluded.updated_us",
+        )
+        .bind(session)
+        .bind(delivered_json)
+        .bind(cursor)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Load all session cursors for boot restore (bd-aqvg).
+    pub async fn load_delivery_cursors(&self) -> anyhow::Result<Vec<(String, String, i64)>> {
+        let rows = sqlx::query_as::<_, (String, String, i64)>(
+            "SELECT session, delivered_json, cursor FROM delivery_cursors",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// Prune sessions idle longer than the bound (bd-aqvg): whole-session
+    /// rows only. A pruned session re-delivers on next sighting — a bounded
+    /// duplicate, chosen over unbounded table growth. Callers pass 90d in us.
+    pub async fn prune_delivery_cursors(&self, older_than_us: i64) -> anyhow::Result<u64> {
+        let r = sqlx::query("DELETE FROM delivery_cursors WHERE updated_us < ?")
+            .bind(older_than_us)
+            .execute(&self.pool)
+            .await?;
+        Ok(r.rows_affected())
+    }
+
     pub const fn pool(&self) -> &SqlitePool {
         &self.pool
     }
@@ -1823,6 +1870,58 @@ mod workflow_effect_schema_tests {
         ] {
             assert!(store.table_exists(table).await.unwrap(), "{table} exists");
         }
+        assert!(
+            store.table_exists("delivery_cursors").await.unwrap(),
+            "delivery_cursors exists (bd-aqvg)"
+        );
+    }
+
+    /// bd-aqvg: cursor snapshots round-trip through SQLite; upsert overwrites.
+    #[tokio::test]
+    async fn delivery_cursor_save_load_upserts() {
+        let (p, _dir) = pool("cursor").await;
+        let store = WorkflowEffectStore::new(p);
+        store
+            .save_delivery_cursor("s1", r#"["a","b"]"#, 2)
+            .await
+            .unwrap();
+        let rows = store.load_delivery_cursors().await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, "s1");
+        assert_eq!(rows[0].1, r#"["a","b"]"#);
+        assert_eq!(rows[0].2, 2);
+        // Upsert: same session overwrites, never duplicates.
+        store
+            .save_delivery_cursor("s1", r#"["a","b","c"]"#, 3)
+            .await
+            .unwrap();
+        let rows = store.load_delivery_cursors().await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].1, r#"["a","b","c"]"#);
+        assert_eq!(rows[0].2, 3);
+    }
+
+    /// bd-aqvg: prune drops idle sessions only; fresh rows survive. A pruned
+    /// session re-delivers on next sighting (bounded duplicate over unbounded
+    /// growth).
+    #[tokio::test]
+    async fn delivery_cursor_prune_keeps_fresh() {
+        let (p, _dir) = pool("cursor-prune").await;
+        let store = WorkflowEffectStore::new(p);
+        // Anchor the idle bound BEFORE the saves: pruning deletes strictly older.
+        let bound = now_us();
+        store.save_delivery_cursor("fresh", "[]", 0).await.unwrap();
+        // Backdate one row past any sane idle bound directly.
+        sqlx::query("UPDATE delivery_cursors SET updated_us = 1 WHERE session = 'fresh'")
+            .execute(store.pool())
+            .await
+            .unwrap();
+        store.save_delivery_cursor("live", "[]", 0).await.unwrap();
+        let dropped = store.prune_delivery_cursors(bound).await.unwrap();
+        assert_eq!(dropped, 1);
+        let rows = store.load_delivery_cursors().await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, "live");
     }
 
     /// bd-jysu: every mutation dual-writes a wfx.row event in the same

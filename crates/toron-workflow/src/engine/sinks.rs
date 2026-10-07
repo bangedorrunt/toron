@@ -82,7 +82,16 @@ pub struct VerifySink(
 impl std::fmt::Debug for VerifySink {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("VerifySink")
-            .field("has_sink", &self.0.lock().unwrap().is_some())
+            // Poison-recovering, never `.unwrap()`: a poisoned lock must not
+            // turn a diagnostic formatting path into a second panic.
+            .field(
+                "has_sink",
+                &self
+                    .0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .is_some(),
+            )
             .finish()
     }
 }

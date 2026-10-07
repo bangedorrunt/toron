@@ -198,7 +198,7 @@ mod tests {
             .collect();
         // Only the recipient p tag should be visible on the wrap.
         assert_eq!(envelope_tags.len(), 1, "got {envelope_tags:?}");
-        assert!(envelope_tags[0][0] == "p");
+        assert_eq!(envelope_tags[0][0], "p");
     }
 
     #[test]

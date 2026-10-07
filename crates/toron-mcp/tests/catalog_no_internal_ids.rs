@@ -1,8 +1,8 @@
-// governed-by: ADR-0002
+// governed-by: ADR-0003
 //! No internal ledger identifiers in the published surface (bd-catalog-extractor-public-bead-ids-x35i).
 //!
 //! toron.dev projects `docs/catalog/toron-mcp.json` byte-for-byte into its
-//! public tool pages (ADR-0002 D4). So any string in a tool description, a
+//! public tool pages (toron.dev ADR-0002 D4). So any string in a tool description, a
 //! field description, or a resource description is not an internal note — it
 //! is something a stranger reads, and it is something that ages: a bead id in
 //! a published string is a live identifier pointing at one repository's

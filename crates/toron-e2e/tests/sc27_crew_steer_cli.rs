@@ -51,20 +51,10 @@ const B: &str = "flywheel-toron-coder2";
 /// crate that owns the bin (toron-cli); this cross-package e2e crate falls back
 /// to current_exe()-relative discovery: test binary lives in
 /// `target/debug/deps/`, so the toron binary is at `target/debug/toron`.
+mod common;
+
 fn toron_bin() -> PathBuf {
-    if let Ok(p) = std::env::var("CARGO_BIN_EXE_toron") {
-        return PathBuf::from(p);
-    }
-    let exe = std::env::current_exe().expect("current_exe");
-    let deps = exe.parent().expect("deps dir");
-    let debug = deps.parent().expect("debug dir");
-    let bin = debug.join("toron");
-    assert!(
-        bin.exists(),
-        "toron binary not found at {} — build toron-cli first (cargo build -p toron-cli)",
-        bin.display()
-    );
-    bin
+    common::toron_bin()
 }
 
 /// Run one `toron` CLI command against the shared data dir with the binding

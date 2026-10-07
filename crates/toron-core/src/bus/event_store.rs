@@ -689,7 +689,10 @@ impl BusEventStore {
     }
 
     /// Authoritative mutation version from `bus_meta` (bd-3gwy).
-    async fn current_mutations(&self) -> i64 {
+    ///
+    /// Read by [`crate::bus::Bus::store_version`] so a poll-driven consumer
+    /// can tell a quiet store from a changed one in one indexed read.
+    pub(crate) async fn current_mutations(&self) -> i64 {
         sqlx::query_scalar::<_, i64>(
             "SELECT COALESCE((SELECT value FROM bus_meta WHERE key = 'mutations'), 0)",
         )
