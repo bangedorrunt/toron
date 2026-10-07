@@ -25,6 +25,8 @@ pub enum BackendErrorCode {
     /// herdr: agent.read/agent.prompt rejected because the agent is not idle
     /// (alt-screen transcript unavailable while working/blocked/unknown).
     AgentNotIdle,
+    /// herdr: subscriber fell behind retained history; resubscribe + snapshot.
+    EventsLost,
     /// Could not connect to the backend socket/daemon.
     Connect,
     /// Transport I/O failure.
@@ -45,6 +47,7 @@ impl BackendErrorCode {
             BackendErrorCode::AgentPromptStalled => "agent_prompt_stalled",
             BackendErrorCode::AgentBlocked => "agent_blocked",
             BackendErrorCode::AgentNotIdle => "agent_not_idle",
+            BackendErrorCode::EventsLost => "events_lost",
             BackendErrorCode::Connect => "connect",
             BackendErrorCode::Io => "io",
             BackendErrorCode::Malformed => "malformed",
@@ -64,6 +67,7 @@ impl FromStr for BackendErrorCode {
             "agent_prompt_stalled" => BackendErrorCode::AgentPromptStalled,
             "agent_blocked" => BackendErrorCode::AgentBlocked,
             "agent_not_idle" => BackendErrorCode::AgentNotIdle,
+            "events_lost" => BackendErrorCode::EventsLost,
             "connect" => BackendErrorCode::Connect,
             "io" => BackendErrorCode::Io,
             "malformed" => BackendErrorCode::Malformed,
@@ -149,6 +153,13 @@ mod tests {
             BackendErrorCode::AgentNotIdle => {}
             other => panic!("expected AgentNotIdle, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn events_lost_roundtrips_through_wire_string() {
+        let parsed: BackendErrorCode = "events_lost".parse().expect("mapped");
+        assert_eq!(parsed, BackendErrorCode::EventsLost);
+        assert_eq!(parsed.as_str(), "events_lost");
     }
 
     #[test]

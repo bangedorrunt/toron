@@ -489,7 +489,11 @@ Never `u64` in **shared** request/response types. Request path may already be
 - Default path: `$XDG_DATA_HOME/toron/` + `projects/<slug>/` (env
   `TORON_DATA_DIR`), **not** `/tmp/...pid...`.
 - Operator key: stable `operator/operator.ncryptsec`, mode **`0600`**, owned
-  by the operator user. Threat note: temp-per-pid random keys were accidental
+  by the operator user. **Superseded for the key's LOCATION by
+  [ADR-0038](0038-operator-key-lives-in-the-config-home.md)** (2026-09-30): the
+  key now lives in the config home (`$XDG_CONFIG_HOME/toron/operator_nsec`), and
+  this data-root path is the reported legacy one. Single identity and `0600`
+  still hold; only the directory moved. Threat note: temp-per-pid random keys were accidental
   isolation; shared root means **any leaf on the host can read the same
   mailbox state** — acceptable for single-operator local-first, document it.
 - **Hard gate:** R2.0 (F2.KDF) green before R2.2 durable root lands in
@@ -661,8 +665,8 @@ AM backend MUST remain a working fallback for captains mid-migration.
 
 ```text
 $XDG_DATA_HOME/toron/                    # TORON_DATA_DIR overrides
-  operator/
-    operator.ncryptsec                   # stable operator key
+  operator/                              # legacy key dir (ADR-0038 moved the key)
+    operator.ncryptsec                   # pre-ADR-0038 operator key location
   projects/
     <slug>/
       index.sqlite
@@ -681,7 +685,8 @@ mail = "toron"                 # agentmail
 # empty url => in-process durable at TORON_DATA_DIR / XDG default
 # url = "http://127.0.0.1:18080"  # remote daemon
 # data_dir optional; defaults to $XDG_DATA_HOME/toron
-# operator via TORON_OPERATOR_NSEC or operator/operator.ncryptsec
+# operator via TORON_OPERATOR_KEY (a path, not the secret; canonical
+# ~/.config/toron/operator_nsec per ADR-0038)
 
 [mail.agentmail]
 url = "http://127.0.0.1:8765"

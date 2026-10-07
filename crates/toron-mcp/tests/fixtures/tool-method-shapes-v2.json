@@ -1405,8 +1405,11 @@
       "output_schema": {
         "$defs": {
           "WhoIsOut": {
-            "description": "`whois`: `{name, npub, program, model, task_description, last_active_ts_us,\nstale, pane_id, workspace_id, tab_id}`.\n\nADR-0010 F2: `stale` flags roster rows older than the prune cadence —\nnever a silent live pin.\n\n`pane_id`/`workspace_id`/`tab_id` are the LIVE herdr pane the pin runs in\n(advisory; all `None` when no herdr backend is reachable). Additive\noptionals, so a client that predates them parses rows unchanged.",
+            "description": "`whois`: `{name, npub, program, model, task_description, last_active_ts_us,\nstale, pane_id, workspace_id, tab_id}`.\n\nADR-0010 F2: `stale` flags roster rows older than the prune cadence —\nnever a silent live pin.\n\n`pane_id`/`workspace_id`/`tab_id` are the LIVE herdr pane the pin runs in\n(advisory; all `None` when no herdr backend is reachable). Additive\noptionals, so a client that predates them parses rows unchanged.\n\n`pane_npub`/`identity_divergent` are the identity-health pair (u31k): the\nnpub stamped on that live pane vs this row's npub. Divergent means mail\naddressed to the NAME reaches a key the pane does not read — re-register\nthe pin or address it by npub. Advisory, never a routing gate.",
             "properties": {
+              "identity_divergent": {
+                "type": "boolean"
+              },
               "last_active_ts_us": {
                 "format": "int64",
                 "type": "integer"
@@ -1424,6 +1427,12 @@
                 "type": "string"
               },
               "pane_id": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "pane_npub": {
                 "type": [
                   "string",
                   "null"
@@ -1461,7 +1470,8 @@
               "name",
               "npub",
               "last_active_ts_us",
-              "stale"
+              "stale",
+              "identity_divergent"
             ],
             "type": "object"
           }
@@ -4030,6 +4040,9 @@
       "output_schema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "properties": {
+          "identity_divergent": {
+            "type": "boolean"
+          },
           "last_active_ts_us": {
             "format": "int64",
             "type": "integer"
@@ -4047,6 +4060,12 @@
             "type": "string"
           },
           "pane_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "pane_npub": {
             "type": [
               "string",
               "null"
@@ -4084,7 +4103,8 @@
           "name",
           "npub",
           "last_active_ts_us",
-          "stale"
+          "stale",
+          "identity_divergent"
         ],
         "type": "object"
       }

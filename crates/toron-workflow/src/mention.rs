@@ -71,7 +71,7 @@ pub fn wire_mention_dispatch_with_cursor(
         let decision = coalescer.submit(
             InboundMention {
                 assignee: m.name.clone(),
-                parent: delivery_id.clone(),
+                parent: delivery_id,
                 spec: serde_json::json!({ "text": m.content }),
             },
             now_ms,
@@ -82,7 +82,6 @@ pub fn wire_mention_dispatch_with_cursor(
                     // Peek-only: do NOT mark_delivered here. Cursor advance is
                     // the caller's responsibility after successful publish
                     // (host peek→publish→mark / with_cursor).
-                    let _ = delivery_id; // parent id lives on batch for mark
                     jobs.push(ev);
                 }
                 Err(_) => {

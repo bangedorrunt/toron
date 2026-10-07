@@ -51,8 +51,16 @@ pub(crate) type ReleaseOnDrop = Box<dyn FnOnce() + Send + 'static>;
 
 /// A live subscription to the bus.
 ///
-/// Consume with [`next()`](Self::next) or `Stream::next` via
-/// [`tokio_stream`]'s `ReceiverStream` wrapper.
+/// Consume with [`next()`](Self::next). There is no `Stream` conversion: this
+/// type has no `Stream` impl, and no accessor hands out the raw
+/// `mpsc::Receiver`, so `ReceiverStream::new(...)` cannot be built from it. An
+/// earlier version of this doc claimed otherwise and pointed at
+/// `ReceiverStream::new(sub.into_inner())`, which has not compiled since
+/// `into_inner` started returning [`DetachedSubscription`].
+///
+/// [`into_inner`](Self::into_inner) hands the live stream to another owner
+/// while carrying the bus registration with it, so detaching cannot
+/// resurrect the leak this type's `Drop` exists to prevent.
 pub struct Subscription {
     id: SubscriptionId,
     /// `None` once the receiver has been detached by [`into_inner`].

@@ -323,7 +323,7 @@ toron introduces three distinct secp256k1 key roles AM-Rust does not have:
 | Role | Holder | Purpose | Storage |
 |------|--------|---------|---------|
 | **Agent key** | each agent | identity + signing + NIP-44 decrypt | NIP-49 `ncryptsec` (passphrase-encrypted), in `agents/{name}/key.ncryptsec`; nsec **never leaves the toron process** |
-| **Operator key** | the captain / toron process | privileged ops (force-release via **revocation event** G5, project manifest publication, relay admin) | toron config (`operator_nsec`, 0600); env override `TORON_OPERATOR_NSEC` |
+| **Operator key** | the captain / toron process | privileged ops (force-release via **revocation event** G5, project manifest publication, relay admin) | toron config home (`operator_nsec`, 0600 — location per [ADR-0038](0038-operator-key-lives-in-the-config-home.md)); env override `TORON_OPERATOR_KEY` (**a path**, never the secret — ADR-0004 rejected the raw-nsec-in-env form and this table's older `TORON_OPERATOR_NSEC` name is read by nothing) |
 | **Trust anchor** (optional) | designated Nostr keypair | proof-gate attestation signing | public npub in config; private key held by the issuing authority, not toron |
 
 - `create_agent_identity` → **always** generate a fresh keypair + publish

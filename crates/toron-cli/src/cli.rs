@@ -110,7 +110,7 @@ pub enum Command {
     /// tool, ADR-0020 wave 1 freeze).
     AckSla(AckSlaArgs),
 
-    /// File reservations: acquire/conflicts/list/renew/release/release-by-reason/force-release.
+    /// File reservations: acquire/conflicts/list/renew/release/release-by-reason/sweep/force-release.
     #[command(subcommand)]
     Reserve(ReserveCommand),
 
@@ -392,7 +392,7 @@ pub enum DaemonCommand {
 pub struct DaemonArgs {
     /// MCP-over-HTTP listen address for the daemon (defaults to the
     /// flywheel `[mail.toron]` address).
-    #[arg(long, default_value = "127.0.0.1:18080")]
+    #[arg(long, default_value = crate::daemon::DEFAULT_ADDR)]
     pub addr: String,
 
     /// launchd/systemd unit label.
@@ -718,6 +718,17 @@ pub enum ReserveCommand {
     /// Release every reservation whose reason is the given bead id
     /// (release-on-bead-close; operator-signed, no staleness heuristic).
     ReleaseByReason(ReserveReleaseByReasonArgs),
+    /// Release every lease whose reason bead is CLOSED (batch of
+    /// release-by-reason; the closed set is read from the repo tracker).
+    Sweep(ReserveSweepArgs),
+    /// Record ONE structured stand-down marker for (bead, holder): "bead
+    /// <id> is being worked by <holder>, stop resuming it". Idempotent per
+    /// (bead, holder); the loop reads `reserve yields` and skips the bead
+    /// while the holder's lease is live.
+    Yield(ReserveYieldArgs),
+    /// Show the project's yield markers, each flagged with whether its holder
+    /// is live right now, plus the beads a resume must currently skip.
+    Yields(ReserveYieldsArgs),
     /// Operator force-release of a stale reservation.
     ForceRelease(ReserveForceReleaseArgs),
     /// Ask the holder to release or defer a held reservation (ADR-0011
@@ -729,6 +740,10 @@ pub enum ReserveCommand {
     /// path, exclusive + reason preserved). Never "commit as me" — the
     /// target commits as itself. bd-pin-public-plane-s-easy.13.
     Transfer(ReserveTransferArgs),
+    /// Run one command under exclusive leases: acquire, run, ALWAYS release
+    /// (success, failure, signal); exit with the command's own code.
+    /// bd-reserve-with-lease-2lvt.
+    WithLease(ReserveWithLeaseArgs),
 }
 
 #[derive(Debug, Args)]
@@ -777,6 +792,10 @@ pub struct ReserveListArgs {
     /// Only leases whose path glob overlaps this path (symmetric fnmatch).
     #[arg(long)]
     pub path: Option<String>,
+    /// Repository root whose `.beads/issues.jsonl` backs the stale audit
+    /// (default: current directory; no tracker file = no annotation).
+    #[arg(long)]
+    pub repo: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -821,6 +840,52 @@ pub struct ReserveReleaseByReasonArgs {
     /// Skip the NIP-17 notification to the previous holders (default: notify).
     #[arg(long)]
     pub no_notify: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct ReserveSweepArgs {
+    /// Project slug.
+    #[arg(long, required = true)]
+    pub project: String,
+    /// Operator agent signing the revocations.
+    #[arg(long = "as", required = true)]
+    pub agent: String,
+    /// Sweep leases whose reason names a CLOSED bead. Required: it is the
+    /// only sweep source (`<repo>/.beads/issues.jsonl`).
+    #[arg(long)]
+    pub closed_beads: bool,
+    /// Repository root holding `.beads/` (default: current directory).
+    #[arg(long)]
+    pub repo: Option<std::path::PathBuf>,
+    /// Skip the NIP-17 notification to the previous holders (default: notify).
+    #[arg(long)]
+    pub no_notify: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct ReserveYieldArgs {
+    /// Project slug.
+    #[arg(long, required = true)]
+    pub project: String,
+    /// The pin yielding the bead (the pane that was resumed and declined).
+    #[arg(long = "as", required = true)]
+    pub agent: String,
+    /// Bead id being yielded.
+    #[arg(long = "bead", required = true)]
+    pub bead_id: String,
+    /// The pin already working the bead (whose live lease keeps it suppressed).
+    #[arg(long, required = true)]
+    pub holder: String,
+    /// Why the bead is being yielded (free text, stored verbatim).
+    #[arg(long)]
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct ReserveYieldsArgs {
+    /// Project slug.
+    #[arg(long, required = true)]
+    pub project: String,
 }
 
 #[derive(Debug, Args)]
@@ -904,6 +969,36 @@ pub struct ReserveTransferArgs {
     /// Explicit reason override (default: preserve the held lease's reason).
     #[arg(long)]
     pub reason: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct ReserveWithLeaseArgs {
+    /// Path globs to hold for the command (comma-separated).
+    #[arg(long, value_delimiter = ',', required = true)]
+    pub paths: Vec<String>,
+    /// Project slug.
+    #[arg(long, required = true)]
+    pub project: String,
+    /// Agent holding the leases (the pin).
+    #[arg(long = "as", required = true)]
+    pub agent: String,
+    /// Lease reason (the bead id this scoped command belongs to). Required:
+    /// a reason-less scoped lease is exactly the stale-lease litter this verb
+    /// exists to end.
+    #[arg(long, required = true)]
+    pub reason: String,
+    /// Seconds to keep polling while another pin holds the paths exclusively
+    /// before refusing (0 = refuse on the first conflict).
+    #[arg(long, default_value_t = 60)]
+    pub wait_secs: u64,
+    /// Lease TTL in seconds (default envelope TTL). The wrapper still
+    /// releases when the command finishes first; a command that outlives the
+    /// TTL loses its hold and takes the sweep's staleness path.
+    #[arg(long)]
+    pub ttl_secs: Option<u64>,
+    /// The command to run while the leases are held (everything after `--`).
+    #[arg(last = true, required = true, num_args = 1.., value_name = "CMD")]
+    pub command: Vec<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -1671,14 +1766,14 @@ pub struct KeyGenerateArgs {
     /// operator|agent|anchor.
     #[arg(long, value_enum, default_value_t = RoleArg::Operator)]
     pub role: RoleArg,
-    /// Output path (default: operator_key or ~/.config/toron/<role>_nsec).
+    /// Output path (default: operator_key, else the role's canonical path — ADR-0038).
     #[arg(long)]
     pub out: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
 pub struct KeyInspectArgs {
-    /// Key file path (default: operator_key).
+    /// Key file path (default: operator_key, else the canonical operator key).
     pub path: Option<PathBuf>,
 }
 

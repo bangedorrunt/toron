@@ -15,6 +15,8 @@ use std::process::Command;
 pub struct ServeLock {
     path: PathBuf,
     pid: u32,
+    /// The boot record beside the pid file: which artifact this process runs.
+    record: PathBuf,
     _file: File,
 }
 
@@ -24,6 +26,7 @@ impl Drop for ServeLock {
             && s.trim() == self.pid.to_string()
         {
             let _ = fs::remove_file(&self.path);
+            toron_core::serve_build::remove(&self.record);
         }
     }
 }
@@ -69,9 +72,28 @@ pub fn acquire(data_dir: &Path) -> anyhow::Result<ServeLock> {
         .open(&path)?;
     write!(file, "{pid}")?;
     file.flush()?;
+
+    // Record the artifact we are executing. A daemon keeps running the file it
+    // was exec'd from after a rebuild replaces it, and nothing else on the host
+    // can tell you that (2026-09-30: an hour-stale daemon rewrote the operator
+    // key on every boot while `doctor` stayed green). Diagnostic only — a
+    // daemon that cannot write this must still serve.
+    let record = data_dir.join(toron_core::serve_build::SERVE_BUILD_FILE);
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(snap) =
+            toron_core::serve_build::snapshot_of(&exe, pid, toron_core::serve_build::now_unix())
+        && let Err(e) = toron_core::serve_build::record(&record, &snap)
+    {
+        eprintln!(
+            "toron: could not record the serving build ({e}) — \
+             `toron daemon status` cannot name what this process runs"
+        );
+    }
+
     Ok(ServeLock {
         path,
         pid,
+        record,
         _file: file,
     })
 }
@@ -211,6 +233,63 @@ mod tests {
         assert!(format!("{err:#}").contains("already holds"));
         child.kill().ok();
         let _ = child.wait();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The boot record is what makes `daemon status` able to name a build at
+    /// all: it must name THIS process and a real artifact, and it must go away
+    /// with the lock so a later status cannot judge an earlier boot.
+    #[test]
+    fn acquire_records_the_booting_artifact_and_drop_clears_it() {
+        let dir = std::env::temp_dir().join(format!(
+            "toron-serve-lock-record-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let record = dir.join(toron_core::serve_build::SERVE_BUILD_FILE);
+        assert!(
+            toron_core::serve_build::read(&record).is_none(),
+            "nothing to judge before a daemon boots"
+        );
+
+        let lock = acquire(&dir).expect("lock");
+        let snap =
+            toron_core::serve_build::read(&record).expect("the record names the booting build");
+        assert_eq!(snap.pid, std::process::id());
+        assert!(
+            snap.binary.is_absolute(),
+            "canonicalised so a later stat follows the same target: {}",
+            snap.binary.display()
+        );
+        assert_eq!(
+            snap.size,
+            fs::metadata(&snap.binary).expect("stat artifact").len()
+        );
+        assert!(snap.started_at_unix > 0, "the boot time is recorded");
+
+        // The identity it carries is the artifact actually on disk, so the
+        // verdict for a daemon that has not been rebuilt reads `current` —
+        // the check must not cry stale at a healthy daemon.
+        assert_eq!(
+            toron_core::serve_build::build_verdict(
+                &snap,
+                Some(snap.pid),
+                toron_core::serve_build::artifact_id(&snap.binary)
+            ),
+            toron_core::serve_build::BuildVerdict::Current
+        );
+
+        drop(lock);
+        assert!(
+            toron_core::serve_build::read(&record).is_none(),
+            "the record goes with the lock, so status cannot judge a boot that ended"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 }

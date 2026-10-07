@@ -1,5 +1,5 @@
 // governed-by: ADR-0019
-//! ADR-0019 wave-2 structural playbook lint tests (bd-w2-lints-6k6l),
+//! ADR-0019 wave-2 structural playbook lint tests,
 //! fixture-driven: each failure mode has a checked-in YAML that MUST error
 //! with the expected message; each passing control MUST stay clean.
 

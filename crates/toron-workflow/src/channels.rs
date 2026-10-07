@@ -275,10 +275,8 @@ impl ChannelStore {
         let op = AuthorityOp::Kick {
             target: target.clone(),
         };
-        let (pending, propose_fx) = convergence_tick(
-            None,
-            &ConvergenceMsg::Propose { op, generation },
-        );
+        let (pending, propose_fx) =
+            convergence_tick(None, &ConvergenceMsg::Propose { op, generation });
         anyhow::ensure!(
             propose_fx.is_empty(),
             "kick propose must not fanout before commit"
@@ -353,10 +351,8 @@ impl ChannelStore {
         let op = AuthorityOp::Disable {
             target: target.clone(),
         };
-        let (pending, propose_fx) = convergence_tick(
-            None,
-            &ConvergenceMsg::Propose { op, generation },
-        );
+        let (pending, propose_fx) =
+            convergence_tick(None, &ConvergenceMsg::Propose { op, generation });
         anyhow::ensure!(propose_fx.is_empty(), "disable propose must not fanout");
         let (committed, commit_fx) = convergence_tick(pending.as_ref(), &ConvergenceMsg::Commit);
         let fired = commit_fx.iter().any(|e| {
@@ -470,10 +466,7 @@ impl ChannelStore {
                         .filter_map(|t| t.as_slice().get(1).cloned())
                         .collect()
                 });
-                if self.replace_members(&id, members).is_err() {
-                    return Ok(false);
-                }
-                Ok(true)
+                Ok(self.replace_members(&id, members).is_ok())
             }
             CHANNEL_METADATA_LEGACY => {
                 let Some(id) = ev

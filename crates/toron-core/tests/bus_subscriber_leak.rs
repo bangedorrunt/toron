@@ -2,20 +2,29 @@
 //! Leak proof: a dropped `Subscription` must release its bus registration.
 //!
 //! `InProcessBus::subs` is the only live-subscriber registry. An entry is
-//! inserted in `subscribe_with_gate` and the ONLY removal path is
-//! `fanout_to`, which fires on `TrySendError::Closed` — i.e. it needs a
+//! inserted in `subscribe_with_gate`, and BEFORE the fix its only removal
+//! path was `fanout_to` firing on `TrySendError::Closed` — i.e. it needed a
 //! publish to reach that subscriber. But `fanout` gates delivery on
 //! `access_gate`, and a GLOBAL subscription (filter with no `#t`/`#l`, not
 //! trusted) is refused every project-scoped event. Since toron stamps `#t` on
-//! essentially every stored event, a global subscriber is never fanned to, so
-//! its closed channel is never observed and the entry is never removed.
+//! essentially every stored event, a global subscriber was never fanned to,
+//! so its closed channel was never observed and the entry was never removed.
 //!
 //! Consequence: every `collect_replay` / MCP resource read that subscribes
-//! with an unscoped filter leaks one `Arc<Subscriber>` plus its mpsc block
+//! with an unscoped filter leaked one `Arc<Subscriber>` plus its mpsc block
 //! (capacity 1024) for the life of the daemon. Observed live at ~62/sec.
 //!
-//! This test asserts the correct behavior (count returns to zero). It is
-//! expected to FAIL against the current code; that failure is the evidence.
+//! The fix (bd-cqo2) gave the subscription's own scope a `Drop` hook, so
+//! release now rides the owner's scope on every exit path — normal
+//! completion, early return, or cancellation — and no longer depends on a
+//! publish happening to notice. `fanout_to`'s `Closed` arms remain as a
+//! redundant no-op safety net for transports that register no release hook;
+//! they are not what releases these entries.
+//!
+//! These tests are a REGRESSION FENCE for that fix, and they pass. (An earlier
+//! revision of this doc claimed the file was "expected to FAIL against the
+//! current code; that failure is the evidence" — that was true only while the
+//! leak was live, and it became a lie the moment bd-cqo2 landed.)
 
 use toron_core::bus::filter::Filter;
 use toron_core::bus::in_process::InProcessBusConfig;
@@ -86,9 +95,16 @@ async fn dropped_scoped_subscription_is_released() {
     let bus = bus().await;
     let keys = toron_core::nostr::Keys::generate();
 
-    // Scoped filter => NOT global, so a matching publish reaps it via
-    // TrySendError::Closed. This is the control case that shows the removal
-    // path works when access_gate lets a publish through.
+    // Scoped filter => NOT global, so a matching publish COULD reach it. Note
+    // what this does and does not prove: `drop(sub)` runs before the publish
+    // on this thread, so the Drop hook has already unregistered the entry and
+    // the publish finds nothing to reap. This is therefore a second SHAPE of
+    // the same Drop path as the global case above, not a witness for
+    // `fanout_to`'s TrySendError::Closed arms — those need a publisher that
+    // cloned the subscriber before the drop, an interleaving the public API
+    // cannot express deterministically. Its value is that a project-scoped
+    // filter is released just as reliably as a global one, with traffic
+    // flowing in the same window.
     let scoped =
         toron_core::bus::filter::kind_project_filter(toron_kind(FILE_RESERVATION), "alpha");
     for _ in 0..10 {
@@ -102,6 +118,6 @@ async fn dropped_scoped_subscription_is_released() {
     assert_eq!(
         bus.subscriber_count(),
         0,
-        "scoped dropped subscriptions are reaped by the next matching publish"
+        "scoped dropped subscriptions are released on drop, publish or not"
     );
 }

@@ -811,6 +811,208 @@ fn reserve_list_board_and_release_by_reason() {
     let _ = std::fs::remove_dir_all(&data_dir);
 }
 
+/// bd-close-releases-leases-qkbo: `reserve list` marks a lease whose reason
+/// bead is CLOSED (tracker-backed audit) and `reserve sweep --closed-beads`
+/// releases exactly those leases — an open-bead lease stays held. Own data dir
+/// + operator key, mirroring the release-by-reason test above.
+#[test]
+fn reserve_sweep_releases_only_closed_reasons() {
+    let data_dir = std::env::temp_dir().join(format!("toron-reserve-sweep-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&data_dir);
+    std::fs::create_dir_all(&data_dir).expect("mkdir dedicated data dir");
+    let op_key = data_dir.join("operator.ncryptsec");
+    let repo = data_dir.join("repo");
+    std::fs::create_dir_all(repo.join(".beads")).expect("mkdir tracker");
+    std::fs::write(
+        repo.join(".beads/issues.jsonl"),
+        [
+            r#"{"id":"bd-sweep-closed","status":"closed","title":"done"}"#,
+            r#"{"id":"bd-sweep-open","status":"open","title":"still working"}"#,
+        ]
+        .join("\n"),
+    )
+    .expect("write tracker");
+
+    let own_run = |args: &[&str]| {
+        toron()
+            .env("TORON_MCP_DATA_DIR", &data_dir)
+            .env("TORON_OPERATOR_KEY", &op_key)
+            .args(args)
+            .output()
+            .expect("run toron on own data dir")
+    };
+    let json = |out: &std::process::Output| -> Value {
+        serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+            panic!(
+                "expected JSON, stderr: {}\nerror: {e}",
+                String::from_utf8_lossy(&out.stderr)
+            )
+        })
+    };
+
+    let keygen = own_run(&[
+        "key",
+        "generate",
+        "--role",
+        "operator",
+        "--out",
+        op_key.to_str().unwrap(),
+        "--json",
+    ]);
+    assert!(
+        keygen.status.success(),
+        "key generate: {}",
+        String::from_utf8_lossy(&keygen.stderr)
+    );
+    let boot = own_run(&[
+        "agent",
+        "bootstrap",
+        "--project",
+        "demo",
+        "--as",
+        "SweepAgent",
+        "--json",
+    ]);
+    assert!(
+        boot.status.success(),
+        "bootstrap: {}",
+        String::from_utf8_lossy(&boot.stderr)
+    );
+
+    for (path, reason) in [
+        ("src/closed/**", "bd-sweep-closed"),
+        ("src/open/**", "bd-sweep-open"),
+    ] {
+        let acq = own_run(&[
+            "reserve",
+            "acquire",
+            "--paths",
+            path,
+            "--reason",
+            reason,
+            "--exclusive",
+            "--project",
+            "demo",
+            "--as",
+            "SweepAgent",
+            "--json",
+        ]);
+        assert!(
+            acq.status.success(),
+            "acquire {path}: {}",
+            String::from_utf8_lossy(&acq.stderr)
+        );
+    }
+
+    // The audit marks ONLY the closed-reason lease as stale.
+    let listed = own_run(&[
+        "reserve",
+        "list",
+        "--project",
+        "demo",
+        "--repo",
+        repo.to_str().unwrap(),
+        "--json",
+    ]);
+    assert!(
+        listed.status.success(),
+        "list: {}",
+        String::from_utf8_lossy(&listed.stderr)
+    );
+    let board = json(&listed);
+    let rows = board["reservations"]
+        .as_array()
+        .expect("reservations array");
+    let closed_row = rows
+        .iter()
+        .find(|r| r["reason"] == "bd-sweep-closed")
+        .expect("closed-reason lease on board");
+    let open_row = rows
+        .iter()
+        .find(|r| r["reason"] == "bd-sweep-open")
+        .expect("open-reason lease on board");
+    assert_eq!(
+        closed_row["stale"],
+        Value::Bool(true),
+        "closed reason marked stale: {board}"
+    );
+    assert!(
+        open_row.get("stale").is_none(),
+        "open reason not marked: {board}"
+    );
+
+    // A bare sweep (no --closed-beads) refuses loud instead of sweeping blind.
+    let bare = own_run(&[
+        "reserve",
+        "sweep",
+        "--project",
+        "demo",
+        "--as",
+        "SweepAgent",
+        "--json",
+    ]);
+    assert!(
+        !bare.status.success(),
+        "sweep without --closed-beads must refuse"
+    );
+
+    // The sweep releases exactly the closed-reason lease.
+    let swept = own_run(&[
+        "reserve",
+        "sweep",
+        "--closed-beads",
+        "--project",
+        "demo",
+        "--as",
+        "SweepAgent",
+        "--repo",
+        repo.to_str().unwrap(),
+        "--no-notify",
+        "--json",
+    ]);
+    assert!(
+        swept.status.success(),
+        "sweep: {}",
+        String::from_utf8_lossy(&swept.stderr)
+    );
+    let report = json(&swept);
+    assert_eq!(
+        report["released"].as_u64(),
+        Some(1),
+        "one lease released: {report}"
+    );
+    assert_eq!(
+        report["stale_reasons"][0], "bd-sweep-closed",
+        "only the closed reason: {report}"
+    );
+
+    let after = json(&own_run(&[
+        "reserve",
+        "list",
+        "--project",
+        "demo",
+        "--repo",
+        repo.to_str().unwrap(),
+        "--json",
+    ]));
+    let reasons: Vec<&str> = after["reservations"]
+        .as_array()
+        .expect("reservations")
+        .iter()
+        .filter_map(|r| r["reason"].as_str())
+        .collect();
+    assert!(
+        !reasons.contains(&"bd-sweep-closed"),
+        "closed-reason lease gone: {after}"
+    );
+    assert!(
+        reasons.contains(&"bd-sweep-open"),
+        "open-reason lease untouched: {after}"
+    );
+
+    let _ = std::fs::remove_dir_all(&data_dir);
+}
+
 /// bd-pin-public-plane-s-easy.14: ONE mailbox — a lease written by one
 /// `toron` process must be visible to a SECOND `toron guard check` process
 /// (the pre-commit hook runs in its own process against the same durable
@@ -3257,5 +3459,703 @@ fn the_daemon_guard_releases_even_when_the_test_panics() {
         "the daemon from the PANICKING fixture is STILL SERVING on :{port} after 15s, which is \
          exactly the leak that left 27 of them (1,186 MB) on this host"
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// bd-reserve-with-lease-2lvt: `reserve with-lease` — one scoped command,
+// acquired before it runs and ALWAYS released after (success, failure,
+// signal). Each test pins its own data dir, mirroring the reserve list/sweep
+// tests, so parallel tests never share a lease board or a live-daemon probe.
+// ---------------------------------------------------------------------------
+
+/// Dedicated data dir per with-lease test.
+fn with_lease_dir(tag: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("toron-with-lease-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("mkdir dedicated with-lease data dir");
+    dir
+}
+
+fn with_lease_run(data_dir: &std::path::Path, args: &[&str]) -> Output {
+    toron()
+        .env("TORON_MCP_DATA_DIR", data_dir)
+        .args(args)
+        .output()
+        .expect("run toron with-lease")
+}
+
+/// The wrapper's acquire binds the resolved actor, so the pin must exist.
+fn with_lease_bootstrap(data_dir: &std::path::Path, pin: &str) {
+    let out = with_lease_run(
+        data_dir,
+        &[
+            "agent",
+            "bootstrap",
+            "--project",
+            "demo",
+            "--as",
+            pin,
+            "--json",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "bootstrap {pin}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// Does the live lease board still carry a row with this reason?
+fn with_lease_board_has_reason(data_dir: &std::path::Path, reason: &str) -> bool {
+    let out = with_lease_run(
+        data_dir,
+        &["reserve", "list", "--project", "demo", "--json"],
+    );
+    assert!(
+        out.status.success(),
+        "reserve list: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let board: Value = serde_json::from_slice(&out.stdout).expect("board JSON");
+    board["reservations"]
+        .as_array()
+        .map(|rows| rows.iter().any(|r| r["reason"] == reason))
+        .unwrap_or(false)
+}
+
+fn with_lease_wait_for(path: &std::path::Path, needle: &str, timeout: std::time::Duration) {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if let Ok(body) = std::fs::read_to_string(path)
+            && body.contains(needle)
+        {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for {needle:?} in {}",
+            path.display()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+/// The happy path: the command runs while the lease is held, exits 0, and the
+/// lease is gone afterwards (no flip litter).
+#[test]
+fn reserve_with_lease_scoped_command_runs_and_releases() {
+    let dir = with_lease_dir("run");
+    with_lease_bootstrap(&dir, "LeaseAgent");
+    let log = dir.join("ran.log");
+    let script = format!("echo ran >> '{}'", log.display());
+    let out = with_lease_run(
+        &dir,
+        &[
+            "reserve",
+            "with-lease",
+            "--project",
+            "demo",
+            "--as",
+            "LeaseAgent",
+            "--paths",
+            "src/main.rs",
+            "--reason",
+            "withlease-run",
+            "--wait-secs",
+            "30",
+            "--",
+            "sh",
+            "-c",
+            &script,
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "with-lease must exit 0, stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let body = std::fs::read_to_string(&log).expect("child command must have run");
+    assert!(body.contains("ran"), "child marker: {body:?}");
+    assert!(
+        !with_lease_board_has_reason(&dir, "withlease-run"),
+        "the lease must be released after the command succeeds"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Acceptance: a FAILING command still releases (the trap does not depend on
+/// the exit status), and the wrapper exits with the command's own code.
+#[test]
+fn reserve_with_lease_scoped_command_failing_command_still_releases() {
+    let dir = with_lease_dir("fail");
+    with_lease_bootstrap(&dir, "LeaseAgent");
+    let out = with_lease_run(
+        &dir,
+        &[
+            "reserve",
+            "with-lease",
+            "--project",
+            "demo",
+            "--as",
+            "LeaseAgent",
+            "--paths",
+            "src/cli.rs",
+            "--reason",
+            "withlease-fail",
+            "--",
+            "sh",
+            "-c",
+            "exit 7",
+        ],
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(7),
+        "the wrapper must exit with the command's code, stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !with_lease_board_has_reason(&dir, "withlease-fail"),
+        "a failing command must still release its lease"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Acceptance: a zero-file-match glob refuses BEFORE the command runs; the
+/// refusal is a distinct non-zero code (3), never the command's code.
+#[test]
+fn reserve_with_lease_scoped_command_refuses_zero_match_before_running() {
+    let dir = with_lease_dir("zero");
+    with_lease_bootstrap(&dir, "LeaseAgent");
+    let log = dir.join("must-not-run.log");
+    let script = format!("echo ran >> '{}'", log.display());
+    let out = with_lease_run(
+        &dir,
+        &[
+            "reserve",
+            "with-lease",
+            "--project",
+            "demo",
+            "--as",
+            "LeaseAgent",
+            "--paths",
+            "zz-no-such-path-*.rs",
+            "--reason",
+            "withlease-zero",
+            "--",
+            "sh",
+            "-c",
+            &script,
+        ],
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "a refused acquire must exit 3, stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !log.exists(),
+        "the command must NOT run when its lease cannot be acquired"
+    );
+    assert!(
+        !with_lease_board_has_reason(&dir, "withlease-zero"),
+        "a refused acquire must not leave a partial lease behind"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A path held exclusively by ANOTHER pin refuses (with `--wait-secs 0`), runs
+/// nothing, and — critically — never releases the peer's lease.
+#[test]
+fn reserve_with_lease_scoped_command_refuses_when_held() {
+    let dir = with_lease_dir("held");
+    with_lease_bootstrap(&dir, "LeaseOtter");
+    with_lease_bootstrap(&dir, "LeaseMarlin");
+    let held = with_lease_run(
+        &dir,
+        &[
+            "reserve",
+            "acquire",
+            "--project",
+            "demo",
+            "--as",
+            "LeaseOtter",
+            "--paths",
+            "src/robot.rs",
+            "--exclusive",
+            "--reason",
+            "withlease-hold",
+            "--json",
+        ],
+    );
+    assert!(
+        held.status.success(),
+        "peer acquire: {}",
+        String::from_utf8_lossy(&held.stderr)
+    );
+    let log = dir.join("must-not-run-2.log");
+    let script = format!("echo ran >> '{}'", log.display());
+    let out = with_lease_run(
+        &dir,
+        &[
+            "reserve",
+            "with-lease",
+            "--project",
+            "demo",
+            "--as",
+            "LeaseMarlin",
+            "--paths",
+            "src/robot.rs",
+            "--reason",
+            "withlease-blocked",
+            "--wait-secs",
+            "0",
+            "--",
+            "sh",
+            "-c",
+            &script,
+        ],
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "a hard conflict with wait disabled must exit 3, stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !log.exists(),
+        "the command must not run on a refused acquire"
+    );
+    assert!(
+        with_lease_board_has_reason(&dir, "withlease-hold"),
+        "the peer's lease must survive the refusal untouched"
+    );
+    assert!(
+        !with_lease_board_has_reason(&dir, "withlease-blocked"),
+        "the refused wrapper must not hold anything"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Acceptance: two concurrent with-lease calls on the same path SERIALIZE —
+/// the second waits out the first's hold and runs only after its release.
+/// A holds on a gate file until the test has given B ample time to attempt,
+/// so the conflict is guaranteed to be contended; the ordering assertion is
+/// backed by B's own `acquire_attempts >= 2` witness, so this test cannot
+/// pass by B simply arriving after A released.
+#[test]
+fn reserve_with_lease_scoped_command_serializes_concurrent_calls() {
+    let dir = with_lease_dir("serial");
+    with_lease_bootstrap(&dir, "LeaseOtter");
+    with_lease_bootstrap(&dir, "LeaseMarlin");
+    let log = dir.join("order.log");
+    let gate = dir.join("go");
+    // Bounded hold (max ~30s) so a panicking test can never leak a holder.
+    let script_a = format!(
+        "echo A-start >> '{}'; i=0; while [ ! -f '{}' ] && [ $i -lt 300 ]; do sleep 0.1; i=$((i+1)); done; echo A-end >> '{}'",
+        log.display(),
+        gate.display(),
+        log.display()
+    );
+    let script_b = format!("echo B-start >> '{}'", log.display());
+    let a = toron()
+        .env("TORON_MCP_DATA_DIR", &dir)
+        .args([
+            "reserve",
+            "with-lease",
+            "--project",
+            "demo",
+            "--as",
+            "LeaseOtter",
+            "--paths",
+            "src/main.rs",
+            "--reason",
+            "withlease-serial-a",
+            "--wait-secs",
+            "30",
+            "--",
+            "sh",
+            "-c",
+            &script_a,
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn with-lease A");
+    // A-start proves A holds the lease (acquire happens before the child).
+    with_lease_wait_for(&log, "A-start", std::time::Duration::from_secs(15));
+    let b = toron()
+        .env("TORON_MCP_DATA_DIR", &dir)
+        .args([
+            "reserve",
+            "with-lease",
+            "--project",
+            "demo",
+            "--as",
+            "LeaseMarlin",
+            "--paths",
+            "src/main.rs",
+            "--reason",
+            "withlease-serial-b",
+            "--wait-secs",
+            "30",
+            "--",
+            "sh",
+            "-c",
+            &script_b,
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn with-lease B");
+    // B's startup is ~a tenth of a second; 5s is 30x margin for its first
+    // acquire to hit A's hold. The `acquire_attempts` assertion below is what
+    // refuses a vacuous pass if it ever did not.
+    std::thread::sleep(std::time::Duration::from_secs(5));
+    std::fs::write(&gate, b"").expect("release A's hold");
+    let a_out = a.wait_with_output().expect("wait A");
+    let b_out = b.wait_with_output().expect("wait B");
+    assert!(
+        a_out.status.success() && b_out.status.success(),
+        "both wrappers must exit 0: A={:?} B={:?}\nA stderr: {}\nB stderr: {}",
+        a_out.status.code(),
+        b_out.status.code(),
+        String::from_utf8_lossy(&a_out.stderr),
+        String::from_utf8_lossy(&b_out.stderr)
+    );
+    let b_summary: Value = serde_json::from_slice(&b_out.stdout).unwrap_or_else(|e| {
+        panic!(
+            "B summary must be JSON, stderr: {}\nerror: {e}",
+            String::from_utf8_lossy(&b_out.stderr)
+        )
+    });
+    let attempts = b_summary["acquire_attempts"].as_u64().unwrap_or(0);
+    assert!(
+        attempts >= 2,
+        "B must have WAITED for A's hold (acquire_attempts >= 2), got {attempts} — a 1 here \
+         means the test never proved serialization. Summary: {b_summary}"
+    );
+    let order = std::fs::read_to_string(&log).expect("order log");
+    assert_eq!(
+        order, "A-start\nA-end\nB-start\n",
+        "B must run only after A released (serialize), got: {order:?}"
+    );
+    for reason in ["withlease-serial-a", "withlease-serial-b"] {
+        assert!(
+            !with_lease_board_has_reason(&dir, reason),
+            "lease {reason} must be released"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// "ALWAYS release ... signal": SIGTERM to the wrapper while its command runs
+/// kills the child, releases the lease, and exits 128+15. The test first
+/// proves the lease IS held (a non-vacuous precondition), then that the
+/// signal leaves nothing behind.
+#[test]
+fn reserve_with_lease_scoped_command_releases_on_signal() {
+    let dir = with_lease_dir("signal");
+    with_lease_bootstrap(&dir, "LeaseAgent");
+    let log = dir.join("sig.log");
+    let script = format!("echo started >> '{}'; sleep 5", log.display());
+    let wrapper = toron()
+        .env("TORON_MCP_DATA_DIR", &dir)
+        .args([
+            "reserve",
+            "with-lease",
+            "--project",
+            "demo",
+            "--as",
+            "LeaseAgent",
+            "--paths",
+            "src/robot.rs",
+            "--reason",
+            "withlease-sig",
+            "--wait-secs",
+            "30",
+            "--",
+            "sh",
+            "-c",
+            &script,
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn with-lease wrapper");
+    let pid = wrapper.id();
+    with_lease_wait_for(&log, "started", std::time::Duration::from_secs(15));
+    assert!(
+        with_lease_board_has_reason(&dir, "withlease-sig"),
+        "precondition: the lease must be HELD while the command runs"
+    );
+    let killed = std::process::Command::new("kill")
+        .args(["-TERM", &pid.to_string()])
+        .status()
+        .expect("send SIGTERM");
+    assert!(killed.success(), "kill -TERM {pid} failed");
+    let out = wrapper.wait_with_output().expect("wait wrapper");
+    assert_eq!(
+        out.status.code(),
+        Some(143),
+        "SIGTERM must exit 128+15, stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !with_lease_board_has_reason(&dir, "withlease-sig"),
+        "a signal must not leave the lease behind"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// bd-release-dry-run-mutates-ri7o: `-n/--dry-run` must be strictly read-only
+// for every mutating reserve command. Measured bug: `reserve release -n`
+// reported `released: N` AND released for real.
+// ---------------------------------------------------------------------------
+
+/// The board row for this reason, if any (holder included).
+fn with_lease_board_row(data_dir: &std::path::Path, reason: &str) -> Option<Value> {
+    let out = with_lease_run(
+        data_dir,
+        &["reserve", "list", "--project", "demo", "--json"],
+    );
+    assert!(
+        out.status.success(),
+        "reserve list: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let board: Value = serde_json::from_slice(&out.stdout).expect("board JSON");
+    board["reservations"]
+        .as_array()
+        .and_then(|rows| rows.iter().find(|r| r["reason"] == reason))
+        .cloned()
+}
+
+/// The measured bug plus the audit the bead asks for: release (bug),
+/// acquire, transfer, sweep — a dry run must never mutate.
+#[test]
+fn release_dry_run_is_read_only() {
+    let dir = with_lease_dir("dryrun");
+    with_lease_bootstrap(&dir, "DryRidge");
+    with_lease_bootstrap(&dir, "DryMarlin");
+
+    // Release (the measured case): a real hold survives a dry-run release,
+    // and the following real release removes it.
+    let acq = with_lease_run(
+        &dir,
+        &[
+            "reserve",
+            "acquire",
+            "--project",
+            "demo",
+            "--as",
+            "DryRidge",
+            "--paths",
+            "dryrun/probe.rs",
+            "--reason",
+            "dryrun-release",
+            "--json",
+        ],
+    );
+    assert!(
+        acq.status.success(),
+        "acquire: {}",
+        String::from_utf8_lossy(&acq.stderr)
+    );
+    assert!(
+        with_lease_board_has_reason(&dir, "dryrun-release"),
+        "precondition: the hold must exist"
+    );
+    let dry = with_lease_run(
+        &dir,
+        &[
+            "reserve",
+            "release",
+            "--project",
+            "demo",
+            "--as",
+            "DryRidge",
+            "--paths",
+            "dryrun/probe.rs",
+            "-n",
+            "--json",
+        ],
+    );
+    assert!(
+        dry.status.success(),
+        "dry-run release: {}",
+        String::from_utf8_lossy(&dry.stderr)
+    );
+    let dry_json: Value =
+        serde_json::from_slice(&dry.stdout).expect("dry-run release must print JSON");
+    assert_eq!(
+        dry_json["dry_run"], true,
+        "the preview must say it is a dry run: {dry_json}"
+    );
+    assert!(
+        with_lease_board_has_reason(&dir, "dryrun-release"),
+        "a dry-run release must NOT release"
+    );
+    let real = with_lease_run(
+        &dir,
+        &[
+            "reserve",
+            "release",
+            "--project",
+            "demo",
+            "--as",
+            "DryRidge",
+            "--paths",
+            "dryrun/probe.rs",
+            "--json",
+        ],
+    );
+    assert!(
+        real.status.success(),
+        "real release: {}",
+        String::from_utf8_lossy(&real.stderr)
+    );
+    assert!(
+        !with_lease_board_has_reason(&dir, "dryrun-release"),
+        "the real release must remove the hold"
+    );
+
+    // Audit 1 — acquire: a dry run must not lease.
+    let dry_acq = with_lease_run(
+        &dir,
+        &[
+            "reserve",
+            "acquire",
+            "--project",
+            "demo",
+            "--as",
+            "DryRidge",
+            "--paths",
+            "dryrun/audit.rs",
+            "--reason",
+            "dryrun-acquire",
+            "-n",
+            "--json",
+        ],
+    );
+    assert!(
+        dry_acq.status.success(),
+        "dry-run acquire: {}",
+        String::from_utf8_lossy(&dry_acq.stderr)
+    );
+    assert!(
+        !with_lease_board_has_reason(&dir, "dryrun-acquire"),
+        "a dry-run acquire must not lease"
+    );
+
+    // Audit 2 — transfer: a dry run must not move a held lease.
+    let held = with_lease_run(
+        &dir,
+        &[
+            "reserve",
+            "acquire",
+            "--project",
+            "demo",
+            "--as",
+            "DryRidge",
+            "--paths",
+            "dryrun/xfer.rs",
+            "--reason",
+            "dryrun-transfer",
+            "--json",
+        ],
+    );
+    assert!(
+        held.status.success(),
+        "acquire for transfer: {}",
+        String::from_utf8_lossy(&held.stderr)
+    );
+    let dry_xfer = with_lease_run(
+        &dir,
+        &[
+            "reserve",
+            "transfer",
+            "--project",
+            "demo",
+            "--as",
+            "DryRidge",
+            "--to",
+            "DryMarlin",
+            "--path",
+            "dryrun/xfer.rs",
+            "-n",
+            "--json",
+        ],
+    );
+    assert!(
+        dry_xfer.status.success(),
+        "dry-run transfer: {}",
+        String::from_utf8_lossy(&dry_xfer.stderr)
+    );
+    let row = with_lease_board_row(&dir, "dryrun-transfer").expect("hold survives the dry run");
+    assert_eq!(
+        row["holder"], "DryRidge",
+        "a dry-run transfer must not move the lease: {row}"
+    );
+
+    // Audit 3 — sweep: a dry run must not release a closed-reason lease and
+    // must not need the operator key (it performs no signed mutation).
+    let repo = dir.join("tracker");
+    std::fs::create_dir_all(repo.join(".beads")).expect("mkdir tracker");
+    std::fs::write(
+        repo.join(".beads/issues.jsonl"),
+        r#"{"id":"dryrun-closed","status":"closed","title":"done"}"#,
+    )
+    .expect("write tracker");
+    let closed_hold = with_lease_run(
+        &dir,
+        &[
+            "reserve",
+            "acquire",
+            "--project",
+            "demo",
+            "--as",
+            "DryRidge",
+            "--paths",
+            "dryrun/sweep.rs",
+            "--reason",
+            "dryrun-closed",
+            "--json",
+        ],
+    );
+    assert!(
+        closed_hold.status.success(),
+        "acquire for sweep: {}",
+        String::from_utf8_lossy(&closed_hold.stderr)
+    );
+    let dry_sweep = with_lease_run(
+        &dir,
+        &[
+            "reserve",
+            "sweep",
+            "--closed-beads",
+            "--project",
+            "demo",
+            "--as",
+            "DryRidge",
+            "--repo",
+            repo.to_str().unwrap(),
+            "-n",
+            "--json",
+        ],
+    );
+    assert!(
+        dry_sweep.status.success(),
+        "dry-run sweep must succeed without an operator key: {}",
+        String::from_utf8_lossy(&dry_sweep.stderr)
+    );
+    assert!(
+        with_lease_board_has_reason(&dir, "dryrun-closed"),
+        "a dry-run sweep must NOT release the closed-reason lease"
+    );
+
     let _ = std::fs::remove_dir_all(&dir);
 }

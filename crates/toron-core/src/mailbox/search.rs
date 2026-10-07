@@ -282,7 +282,7 @@ impl Mailbox {
                 let action = if subject.is_empty() {
                     "message requiring acknowledgement".to_string()
                 } else {
-                    subject.clone()
+                    subject
                 };
                 if !actions.contains(&action) {
                     actions.push(action);

@@ -260,6 +260,11 @@ fn lint_feature(report: &mut LintReport, wf: &Workflow) {
 /// node through its transitive `needs:` closure. Linear form: every step
 /// named `fix` must follow a step named `repro`. A `fix` with no repro at all
 /// -> Error (graph) / Error (linear).
+///
+/// The messages below name the principle, never the decision id: `toron
+/// workflow lint` is a published surface (docs/guides/workflow-engine.mdx
+/// quotes this output verbatim), so `ADR-0019 Spec 6` is a citation a reader
+/// has no way to resolve. The ADR stays on the `// governed-by:` line above.
 fn lint_bug_fix(report: &mut LintReport, wf: &Workflow) {
     match &wf.graph {
         Some(graph) => lint_bug_fix_graph(report, graph),
@@ -273,7 +278,7 @@ fn lint_bug_fix_graph(report: &mut LintReport, graph: &Graph) {
     if !has_repro {
         error(
             report,
-            "bug-fix workflow has no `repro` node — a fix without a reproduction fails lint (ADR-0019 Spec 6: fix-root-causes)",
+            "bug-fix workflow has no `repro` node — a fix without a reproduction fails lint (fix-root-causes)",
         );
         return;
     }
@@ -316,7 +321,7 @@ fn lint_bug_fix_steps(report: &mut LintReport, steps: &[Step]) {
     if repro_idx.is_none() {
         error(
             report,
-            "bug-fix workflow has no `repro` step — a fix without a reproduction fails lint (ADR-0019 Spec 6: fix-root-causes)",
+            "bug-fix workflow has no `repro` step — a fix without a reproduction fails lint (fix-root-causes)",
         );
         return;
     }
@@ -324,7 +329,7 @@ fn lint_bug_fix_steps(report: &mut LintReport, steps: &[Step]) {
         if step.name.as_deref() == Some("fix") && i <= repro_idx.unwrap() {
             error(
                 report,
-                "bug-fix step `fix` must follow the `repro` step (reproduce first, then fix — ADR-0019 Spec 6: fix-root-causes)",
+                "bug-fix step `fix` must follow the `repro` step (reproduce first, then fix — fix-root-causes)",
             );
         }
     }

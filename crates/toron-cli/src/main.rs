@@ -12,8 +12,10 @@ mod plane;
 mod platform;
 mod robot;
 mod theme;
+mod tracker;
 mod tui;
 mod wake_sock;
+mod with_lease;
 mod workflow;
 
 use std::path::PathBuf;
@@ -80,7 +82,7 @@ fn run(cli: &Cli) -> anyhow::Result<ExitCode> {
             ExitCode::SUCCESS
         }
         Command::Daemon(args) => {
-            daemon::run_dispatch(args)?;
+            daemon::run_dispatch(args, format)?;
             ExitCode::SUCCESS
         }
         Command::Doctor(args) => operator::run_doctor(&cfg, args, format)?,
@@ -104,10 +106,7 @@ fn run(cli: &Cli) -> anyhow::Result<ExitCode> {
             operator::run_backend(&cfg, cmd)?;
             ExitCode::SUCCESS
         }
-        Command::Bench(args) => {
-            run_bench(args, format)?;
-            ExitCode::SUCCESS
-        }
+        Command::Bench(args) => run_bench(args, format)?,
         Command::Tui(args) => {
             tui::run_tui(args)?;
             ExitCode::SUCCESS
@@ -134,6 +133,12 @@ fn run(cli: &Cli) -> anyhow::Result<ExitCode> {
         Command::RunState(cmd) => {
             run_run_state(cmd, &cfg, format)?;
             ExitCode::SUCCESS
+        }
+        // bd-reserve-with-lease-2lvt: dispatched BEFORE the robot arm — the
+        // child process runs in THIS process and cwd (a daemon cannot run
+        // it), and the wrapper must exit with the command's own code.
+        Command::Reserve(crate::cli::ReserveCommand::WithLease(args)) => {
+            with_lease::run_cli(args, cli.globals.dry_run)?
         }
         Command::Mail(_)
         | Command::AckSla(_)
@@ -326,7 +331,7 @@ async fn run_robot(command: &Command, dry_run: bool) -> anyhow::Result<()> {
             robot::run_mail_daemon(dc, cmd).await
         }
         (crate::mailbox_source::MailboxSource::Daemon(dc), Command::Reserve(cmd)) => {
-            robot::run_reserve_daemon(dc, cmd).await
+            robot::run_reserve_daemon(dc, cmd, dry_run).await
         }
         (crate::mailbox_source::MailboxSource::Daemon(dc), Command::Slot(cmd)) => {
             robot::run_slot_daemon(dc, cmd).await
@@ -347,7 +352,7 @@ async fn run_robot(command: &Command, dry_run: bool) -> anyhow::Result<()> {
             robot::run_mail(mb, cmd).await
         }
         (crate::mailbox_source::MailboxSource::Embedded(mb), Command::Reserve(cmd)) => {
-            robot::run_reserve(mb, cmd).await
+            robot::run_reserve(mb, cmd, dry_run).await
         }
         (crate::mailbox_source::MailboxSource::Embedded(mb), Command::Slot(cmd)) => {
             robot::run_slot(mb, cmd).await

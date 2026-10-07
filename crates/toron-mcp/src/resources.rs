@@ -383,6 +383,8 @@ fn whois_json(w: &toron_core::mailbox::WhoIs) -> serde_json::Value {
         "pane_id": w.pane_id,
         "workspace_id": w.workspace_id,
         "tab_id": w.tab_id,
+        "pane_npub": w.pane_npub,
+        "identity_divergent": w.identity_divergent,
     })
 }
 

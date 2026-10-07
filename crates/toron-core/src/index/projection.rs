@@ -86,30 +86,41 @@ fn tag_value<'a>(tags: &'a crate::nostr::Tags, name: &str) -> Option<&'a str> {
         .map(String::as_str)
 }
 
+/// Split a rumour's recipient `p` tags into `(to_list, cc_list)`.
+///
+/// `p` tags carry their role in cell 3: `["p", npub, relay, "to"|"cc"]` (ADR
+/// G3). An absent role cell means `to`. Roles this vocabulary does not model
+/// (e.g. `bcc`) stay in `to_list` — an address the sender did express must
+/// never silently vanish, since consumers read these lists to decide who owes
+/// an ack.
+///
+/// This is the single canonical reader of addressing. The unwrap sink and
+/// [`extract_mail`] MUST both project through it: a second copy that forgets a
+/// field is how a `messages` row ends up with an empty audience while the
+/// rumour plainly named its recipients.
+pub fn addressing_lists(tags: &crate::nostr::Tags) -> (Vec<String>, Vec<String>) {
+    let mut to_list: Vec<String> = Vec::new();
+    let mut cc_list: Vec<String> = Vec::new();
+    for tag in tags
+        .iter()
+        .filter(|t| t.as_slice().first().map(String::as_str) == Some("p"))
+    {
+        let cells = tag.as_slice();
+        let Some(npub) = cells.get(1) else { continue };
+        if cells.get(3).map(String::as_str) == Some("cc") {
+            cc_list.push(npub.clone());
+        } else {
+            to_list.push(npub.clone());
+        }
+    }
+    (to_list, cc_list)
+}
+
 /// Build a `MailItem` from an unwrapped gift. Uses ONLY rumor fields for the
 /// timeline; envelope identity is preserved for storage/audit.
 pub fn extract_mail(unwrapped: &UnwrappedGift, local_seq: i64) -> MailItem {
     let rumor = &unwrapped.rumor;
-    // `p` tags carry role in cell 3: ["p", npub, relay, "to"|"cc"] (ADR G3).
-    let p_roles: Vec<(String, String)> = rumor
-        .tags
-        .iter()
-        .filter(|t| t.as_slice().first().map(String::as_str) == Some("p"))
-        .filter_map(|t| {
-            let cells = t.as_slice();
-            let npub = cells.get(1).map(String::as_str)?.to_string();
-            let role = cells.get(3).map(String::as_str).unwrap_or("to").to_string();
-            Some((npub, role))
-        })
-        .collect();
-    let mut to_list: Vec<String> = Vec::new();
-    let mut cc_list: Vec<String> = Vec::new();
-    for (npub, role) in p_roles {
-        match role.as_str() {
-            "cc" => cc_list.push(npub),
-            _ => to_list.push(npub),
-        }
-    }
+    let (to_list, cc_list) = addressing_lists(&rumor.tags);
 
     MailItem {
         // Envelope id is filled by the caller (we don't have the wrap here).

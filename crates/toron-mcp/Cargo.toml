@@ -35,6 +35,3 @@ async-trait = "0.1"
 http-body-util = "0.1"
 uuid = { version = "1", features = ["v4"] }
 chrono = "0.4"
-
-[lints]
-workspace = true

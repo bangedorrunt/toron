@@ -26,15 +26,37 @@ use toron_core::bus::wake::{WakeConfig, WakeServer, WakeStats};
 use toron_core::bus::{Bus, InProcessBus};
 use toron_core::index::schema;
 
+/// Parse one `ps -o rss=` sample, in KB.
+///
+/// Refuses an unusable sample instead of defaulting to 0. The old
+/// `unwrap_or(0)` turned a failed measurement into "RSS grew by nothing",
+/// which made the caller's growth bound pass for the wrong reason — a
+/// silent-success stub, and this repo forbids those. If `ps` is missing or
+/// emits something unparseable, the test must go red and say so.
+fn parse_rss_kb(sample: &str) -> u64 {
+    sample
+        .trim()
+        .parse()
+        .unwrap_or_else(|_| panic!("unparseable ps rss sample: {sample:?}"))
+}
+
 fn rss_kb() -> u64 {
     let out = std::process::Command::new("ps")
         .args(["-o", "rss=", "-p", &std::process::id().to_string()])
         .output()
         .expect("ps");
-    String::from_utf8_lossy(&out.stdout)
-        .trim()
-        .parse()
-        .unwrap_or(0)
+    parse_rss_kb(&String::from_utf8_lossy(&out.stdout))
+}
+
+#[test]
+fn parse_rss_kb_reads_a_numeric_sample() {
+    assert_eq!(parse_rss_kb("  12345 \n"), 12_345);
+}
+
+#[test]
+#[should_panic(expected = "unparseable")]
+fn parse_rss_kb_refuses_an_unusable_sample() {
+    parse_rss_kb("not-a-number");
 }
 
 async fn serve_one_subscriber(sock: &std::path::Path) {
@@ -181,9 +203,18 @@ async fn serving_many_subscribers_in_sequence_does_not_retain_them_all() {
         agg.delivered
     );
 
+    // A COARSE guard, not the fence. The leak this test names retains
+    // ~64 B per subscriber, so 1500 of them is ~96 KB — two orders of
+    // magnitude under this bound, which therefore cannot catch THAT leak and
+    // must not be read as if it did. It catches a gross regression (retention
+    // going megabytes). The falsifiable fence for bd-qpm0 is the
+    // retained-count pair above: `retained < rounds` with an exact
+    // `subscribers_finished`. Both RSS samples are real or the test is red —
+    // `parse_rss_kb` refuses rather than reading a failed `ps` as 0 KB.
     let grew_kb = after.saturating_sub(before);
     assert!(
         grew_kb < 32_768,
-        "serving {rounds} subscribers grew RSS by {grew_kb} KB; retention is not bounded"
+        "serving {rounds} subscribers grew RSS by {grew_kb} KB, past the coarse \
+         32 MB guard (the retention fence itself is `retained < rounds` above)"
     );
 }

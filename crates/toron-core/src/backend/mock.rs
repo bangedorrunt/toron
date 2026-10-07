@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use parking_lot::Mutex;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 use super::error::BackendError;
 use super::herdr::{AgentInfo, PaneInfo, Subscription, WaitOptions, WorkspaceInfo};
@@ -195,6 +195,7 @@ impl super::Backend for MockBackend {
             pane_id: pane_id.into(),
             revision: 0,
             state_change_seq: 0,
+            completion_seq: None,
             state_labels: serde_json::Map::new(),
             tab_id: String::new(),
             terminal_id: String::new(),
@@ -258,6 +259,7 @@ impl super::Backend for MockBackend {
             pane_id: "pane-0".into(),
             revision: 0,
             state_change_seq: 0,
+            completion_seq: None,
             state_labels: serde_json::Map::new(),
             tab_id: String::new(),
             terminal_id: String::new(),
@@ -303,8 +305,8 @@ impl super::EventStream for MockEventStream {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::Backend;
     use crate::backend::error::BackendErrorCode;
+    use crate::backend::Backend;
 
     #[test]
     fn mock_records_prompts_and_keys() {

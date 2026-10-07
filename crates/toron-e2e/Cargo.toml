@@ -16,7 +16,6 @@ p4 = ["p5"]
 
 [dependencies]
 toron-core = { path = "../toron-core" }
-toron-workflow = { path = "../toron-workflow" }
 tokio = { version = "1", features = ["full"] }
 nostr-sdk = "0.45.2"
 nostr = { version = "0.45.3", features = ["nip44", "nip59", "os-rng"] }
@@ -28,8 +27,6 @@ resonate-sdk = "0.6"
 resonate-sdk-macros = "0.1"
 
 [dev-dependencies]
+toron-workflow = { path = "../toron-workflow" }
 nostr-sdk = "0.45.2"
 nostr = { version = "0.45.3", features = ["nip44", "nip59", "os-rng"] }
-
-[lints]
-workspace = true

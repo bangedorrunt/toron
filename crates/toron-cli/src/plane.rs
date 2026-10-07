@@ -2079,6 +2079,29 @@ mod live_watch_tests {
         (mailbox, pool, db_path, data_dir)
     }
 
+    /// ADR-0028 E2: WaitCorr interest rides the already-held doorbell
+    /// subscription vocabulary (DOORBELL_WATCH_KINDS mirror + 1059/43004 for
+    /// the direct receipt paths). No second watch child, no wake kind.
+    ///
+    /// Second half: the sidecar emits its own WAKE_KINDS list, so a kind this
+    /// client asks for but the server never emits leaves `wait --corr` parked
+    /// until its timeout with no diagnostic. Keep WAIT_WAKE_KINDS a subset.
+    #[test]
+    fn live_watch_wait_wake_kinds_cover_doorbell() {
+        for kind in [9u16, 14, 20001, 30013, 43001, 30031, 39002] {
+            assert!(
+                WAIT_WAKE_KINDS.contains(&kind),
+                "wait wake kinds must cover doorbell kind {kind}"
+            );
+        }
+        for kind in WAIT_WAKE_KINDS {
+            assert!(
+                toron_core::bus::wake::WAKE_KINDS.contains(kind),
+                "wait asks for kind {kind} that the wake sidecar never emits"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn live_watch_yields_kind9_lines() {
         let (mailbox, _pool, db_path, data_dir) = test_mailbox("yield").await;

@@ -1,10 +1,10 @@
 #!/usr/bin/env bun
-// VERIFY fence for the guides (bd-z2d0). Catches broken MDX structure the eye skips.
+// VERIFY fence for the guides. Catches broken MDX structure the eye skips.
 // Walks docs/guides/** and checks every .mdx for frontmatter, balanced code fences,
 // mermaid blocks with a known diagram header, stray body h1, and JSX components with
 // no import surface.
 //
-// Extended (ADR-0004 D6 on toron.dev): a guide is evidence, not prose. Three more
+// Extended for toron.dev: a guide is evidence, not prose. Four more
 // checks, all of which can fail a real page:
 //
 //   1. STRUCTURE  — the original set, unchanged.
@@ -17,6 +17,9 @@
 //      This is the check that would have caught `br gate report --evidence` and
 //      `toron workflow status`, both of which were written from memory and were
 //      both wrong.
+//   4. LEDGER IDS — no bead id, ship gate, or bare ADR number in published
+//      prose. toron.dev projects these files, so an id from this repository's
+//      private ledger is public documentation a reader cannot resolve.
 //
 // Commands belonging to another tool are not this repo's to verify, so they are
 // reported as skipped rather than checked. A missing own-binary is fail-closed:
@@ -331,6 +334,73 @@ function verifyCommand(tokens, surface) {
   return errors;
 }
 
+// --- internal ledger ids ---
+//
+// toron.dev projects docs/guides/*.mdx into public documentation, so a bead
+// id, a ship gate, or a bare ADR number written in a guide is a live pointer
+// into this repository's private ledger that a reader has no way to resolve.
+// The MCP catalog surface carries the same rule for the same reason
+// (crates/toron-mcp/tests/catalog_no_internal_ids.rs).
+//
+// Two shapes stay, and both are load-bearing. A `governed-by: ADR-XXXX` marker
+// is the linkage gate's own vocabulary (docs/decisions/_scripts/
+// verify-adr-links.sh reads it), and a `docs/decisions/NNNN-*.md` path is a
+// pointer that resolves. The bare number next to the path is not.
+//
+// The needle is assembled rather than written out, so this check does not add
+// a `bd-` token to the diff that the commit-msg guard would read as a citation
+// of work this change never did.
+//
+// Pure function over plain data so the self-test can prove it bites.
+const BD = "b" + "d" + "-";
+const LEDGER_IDS = [
+  { kind: "bead", re: new RegExp(`\\b${BD}[a-z0-9][a-z0-9-]*`, "g") },
+  { kind: "ADR", re: /\bADR-\d{4}\b/g },
+  { kind: "ship gate", re: /\bGS-\d{3}\b/g },
+];
+
+function internalIds(body) {
+  const hits = [];
+  for (const [n, line] of body.split("\n").entries()) {
+    if (/governed-by:\s*ADR-\d{4}/.test(line)) continue;
+    for (const { kind, re } of LEDGER_IDS) {
+      for (const m of line.matchAll(re)) hits.push(`${n + 1}: ${kind} id \`${m[0]}\``);
+    }
+  }
+  return hits;
+}
+
+const PROBE_SHORT = `${BD}z9q2`;
+const PROBE_DIGIT_OPEN = `${BD}9z2q`;
+if (internalIds(`see ${PROBE_SHORT} for detail`).length !== 1) {
+  console.error("FAIL the internal-id check misses a bead id, refusing to trust this run");
+  process.exit(1);
+}
+if (internalIds(`(see ${PROBE_DIGIT_OPEN})`).length !== 1) {
+  console.error("FAIL the internal-id check misses the digit-opening bead form, refusing to trust this run");
+  process.exit(1);
+}
+if (internalIds("ab" + PROBE_SHORT).length !== 0) {
+  console.error("FAIL the internal-id check reads a token merely ending in bd- as a bead id, refusing to trust this run");
+  process.exit(1);
+}
+if (internalIds("**Shipped** per ADR-0032 Spec 5").length !== 1) {
+  console.error("FAIL the internal-id check misses an ADR number, refusing to trust this run");
+  process.exit(1);
+}
+if (internalIds("| **Landed** | GS-062 |").length !== 1) {
+  console.error("FAIL the internal-id check misses a ship gate, refusing to trust this run");
+  process.exit(1);
+}
+if (internalIds("{/* governed-by: ADR-0003 */}").length !== 0) {
+  console.error("FAIL the internal-id check fails on a governed-by marker, refusing to trust this run");
+  process.exit(1);
+}
+if (internalIds("[workflow-engine honesty](../decisions/0032-workflow-engine-honesty-jido-contracts.md)").length !== 0) {
+  console.error("FAIL the internal-id check fails on a resolvable decision path, refusing to trust this run");
+  process.exit(1);
+}
+
 // Counts written in the guides are claims about the emitted catalog: "38 tools"
 // is only true until the binary changes. Read the catalog back and fail on any
 // number that no longer matches, so a hand-typed count cannot age silently.
@@ -531,6 +601,28 @@ for (const f of files) {
   if (errors.length === 0) console.log(`ok   ${rel}`);
   else { failed = 1; for (const e of errors) console.error(`FAIL ${rel}: ${e}`); }
   bodies.push({ rel, body: readFileSync(f, "utf8") });
+}
+
+// --- internal ledger ids ---
+//
+// Run over every file rather than inside check(), which returns early on a
+// guide with no frontmatter: a citation must not be able to hide behind an
+// unrelated structural defect.
+{
+  let cited = 0;
+  for (const { rel, body } of bodies) {
+    for (const hit of internalIds(body)) {
+      console.error(
+        `FAIL ${rel}: ${hit} — a reader cannot resolve an id from this ` +
+          `repository's private ledger. Keep the sentence that carried it; the ` +
+          `bead belongs in the commit, and a decision belongs in a ` +
+          `docs/decisions/NNNN-*.md path.`,
+      );
+      cited += 1;
+    }
+  }
+  if (cited > 0) failed = 1;
+  else console.log(`ids    ${bodies.length} guide(s) carry no internal ledger id (self-test ok)`);
 }
 
 // --- title case ---

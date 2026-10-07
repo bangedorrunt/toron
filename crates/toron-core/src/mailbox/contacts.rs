@@ -15,6 +15,7 @@
 //! Cross-project (G2): an AgentLink carries the peer npub; resolution hops
 //! through it when the peer is in another project.
 
+use super::NewestEvent;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -287,7 +288,7 @@ impl Mailbox {
                 events
                     .iter()
                     .filter(|e| e.pubkey == *agent_npub)
-                    .max_by_key(|e| e.created_at.as_secs())
+                    .newest()
                     .and_then(|e| match ContactPolicy::parse(&e.content) {
                         Ok(policy) => Some(policy),
                         // bd-05yr: corrupt historic rows skip loudly, never
@@ -471,7 +472,7 @@ impl BusPolicySource {
                     for row in rows {
                         let a: String = row.get("from_pubkey");
                         let b: String = row.get("to_pubkey");
-                        approved.insert((a.clone(), b.clone()));
+                        approved.insert((a, b));
                     }
                 }
             }
@@ -513,7 +514,7 @@ impl BusPolicySource {
                 if let Some(policy) = events
                     .iter()
                     .filter(|e| e.pubkey.to_hex() == *hex)
-                    .max_by_key(|e| e.created_at.as_secs())
+                    .newest()
                     .and_then(|e| match ContactPolicy::parse(&e.content) {
                         Ok(policy) => Some(policy),
                         Err(err) => {
@@ -545,7 +546,7 @@ impl BusPolicySource {
                     for row in rows {
                         let a: String = row.get("from_pubkey");
                         let b: String = row.get("to_pubkey");
-                        approved.insert((a.clone(), b.clone()));
+                        approved.insert((a, b));
                     }
                 }
             }

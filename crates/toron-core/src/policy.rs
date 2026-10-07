@@ -40,6 +40,11 @@ pub struct RetryPolicy {
     pub factor: f64,
     pub max_delay: Duration,
     pub jitter: bool,
+    /// Per-policy entropy for jitter, filled ONCE at construction (the
+    /// embedding's edge). `delay_for` reads it as data, never the clock, so
+    /// the delay math stays pure and reproducible; two processes with
+    /// different seeds spread their retries instead of moving in lock-step.
+    pub jitter_seed: u64,
 }
 
 impl RetryPolicy {
@@ -51,7 +56,7 @@ impl RetryPolicy {
             delay = self.max_delay;
         }
         if self.jitter {
-            delay = apply_jitter(delay, attempt);
+            delay = apply_jitter(delay, attempt, self.jitter_seed);
         }
         delay
     }
@@ -104,13 +109,14 @@ where
 }
 
 /// ±25% jitter via a cheap xorshift (no new dependency for a few lines).
-/// ponytail: deterministic per attempt-seed would also do; time-seeded
-/// spread avoids lock-step retries across processes.
-fn apply_jitter(delay: Duration, attempt: u32) -> Duration {
-    let nanos = Instant::now().elapsed().as_nanos() as u64;
+/// Pure: the only entropy is the caller-supplied `seed` (the policy's
+/// `jitter_seed`, filled once at construction), so `delay_for` never reads a
+/// clock and the same seed reproduces the same delay. Two policies with
+/// different seeds spread their retries instead of moving in lock-step.
+fn apply_jitter(delay: Duration, attempt: u32, seed: u64) -> Duration {
     let mut x = (attempt as u64)
         .wrapping_mul(0x9E37_79B9_7F4A_7C15)
-        .wrapping_add(nanos | 1);
+        .wrapping_add(seed | 1);
     x ^= x >> 12;
     x ^= x << 25;
     x ^= x >> 27;
@@ -131,6 +137,7 @@ mod tests {
             factor: 10.0,
             max_delay: Duration::from_secs(5),
             jitter: false,
+            jitter_seed: 0,
         };
         assert_eq!(p.delay_for(1), Duration::from_secs(1));
         assert_eq!(p.delay_for(3), Duration::from_secs(5), "capped");
@@ -144,6 +151,7 @@ mod tests {
             factor: 2.0,
             max_delay: Duration::from_secs(1),
             jitter: false,
+            jitter_seed: 0,
         };
         let mut calls = 0u32;
         let r = retry_sync(&p, || {
@@ -166,6 +174,7 @@ mod tests {
             factor: 2.0,
             max_delay: Duration::from_secs(1),
             jitter: false,
+            jitter_seed: 0,
         };
         let mut calls = 0u32;
         let r: Result<(), &str> = retry_sync(&p, || {
@@ -197,6 +206,7 @@ mod tests {
             factor: 1.0,
             max_delay: Duration::from_secs(10),
             jitter: true,
+            jitter_seed: 0,
         };
         for attempt in 1..=50 {
             let d = p.delay_for(attempt);
@@ -205,5 +215,34 @@ mod tests {
                 "attempt {attempt}: {d:?} in [0.75x, 1.25x]"
             );
         }
+    }
+
+    /// bd-35el: the jitter is a pure function of (delay, attempt, seed) — no
+    /// clock read. Same seed reproduces the same schedule; different seeds
+    /// diverge, which is the only reason to jitter at all.
+    #[test]
+    fn jitter_is_deterministic_per_seed() {
+        let make = |seed: u64| RetryPolicy {
+            max_attempts: 3,
+            base: Duration::from_secs(1),
+            factor: 1.0,
+            max_delay: Duration::from_secs(10),
+            jitter: true,
+            jitter_seed: seed,
+        };
+        let a = make(0xA11CE);
+        let b = make(0xA11CE);
+        for attempt in 1..=50 {
+            assert_eq!(
+                a.delay_for(attempt),
+                b.delay_for(attempt),
+                "same seed -> same delay (attempt {attempt})"
+            );
+        }
+        let c = make(0xB0B);
+        assert!(
+            (1..=50).any(|i| a.delay_for(i) != c.delay_for(i)),
+            "different seeds produce different schedules"
+        );
     }
 }
