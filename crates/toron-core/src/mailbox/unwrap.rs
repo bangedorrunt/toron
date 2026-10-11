@@ -1,4 +1,4 @@
-// governed-by: ADR-0003
+// governed-by: ADR-0003, ADR-0037
 // governed-by: ADR-0004 (OVERSEER_TAG, is_overseer_bypass, with_operator — Ship 5)
 #![forbid(unsafe_code)]
 
@@ -759,6 +759,10 @@ pub struct SqliteProjectionSink {
     /// registration stores the VERBATIM slug, so absolute and relative slugs
     /// both round-trip exactly).
     projects: std::collections::HashMap<String, String>,
+    /// npub (hex) → every project the key is registered in (ADR-0037: one
+    /// pin, one key, many projects). A rumor's `t` project tag wins when the
+    /// recipient key is registered in that project; otherwise `projects`.
+    memberships: std::collections::HashMap<String, HashSet<String>>,
     /// npub (hex) → display name. AM-parity: `messages.sender` should read as
     /// the sender's NAME, not the raw pubkey (the wrap only yields the pubkey).
     /// Populated from the `agents` table at build time; hex fallback when the
@@ -773,8 +777,41 @@ impl SqliteProjectionSink {
             pool,
             projected: Mutex::new(HashSet::new()),
             projects: std::collections::HashMap::new(),
+            memberships: std::collections::HashMap::new(),
             names: std::collections::HashMap::new(),
         }
+    }
+
+    /// Attach the npub → registered-projects map from an `agents` roster of
+    /// `(project_slug, name, pubkey)` rows (ADR-0037 §4.4).
+    pub fn with_memberships(mut self, roster: &[(String, String, String)]) -> Self {
+        for (slug, _name, npub) in roster {
+            self.memberships
+                .entry(npub.clone())
+                .or_default()
+                .insert(slug.clone());
+        }
+        self
+    }
+
+    /// The project a mail is attributed to: the rumor's `t` project tag when
+    /// the recipient key is registered there (a sender cannot file mail into
+    /// a project the recipient is not in), else the recipient key's map entry.
+    fn project_for(&self, mail: &UnwrappedMail) -> String {
+        let recipient = mail.recipient.to_hex();
+        if let Some(member_of) = self.memberships.get(&recipient) {
+            for t in mail.rumor.tags.iter() {
+                let parts = t.as_slice();
+                if parts.first().map(String::as_str) == Some("t")
+                    && let Some(slug) = parts.get(1)
+                    && slug != OVERSEER_TAG
+                    && member_of.contains(slug)
+                {
+                    return slug.clone();
+                }
+            }
+        }
+        self.projects.get(&recipient).cloned().unwrap_or_default()
     }
 
     /// Attach the recipient-npub → project-slug resolution map.
@@ -832,11 +869,7 @@ impl ProjectionSink for SqliteProjectionSink {
 
         // The wrap hides the project (metadata hiding) — resolve it via the
         // recipient key from the agents-table map built at pipeline time.
-        let project_slug = self
-            .projects
-            .get(&mail.recipient.to_hex())
-            .cloned()
-            .unwrap_or_default();
+        let project_slug = self.project_for(mail);
         // AM-parity sender naming: resolve the sender pubkey → display name
         // (hex fallback for unregistered/external senders). `sender_pubkey`
         // stays the raw hex so sender-filtered search keeps working.

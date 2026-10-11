@@ -1520,7 +1520,30 @@ mod tests {
     async fn products_link_search_and_inbox_fan_out_across_members() {
         let (surface, db_path, data_dir) = test_surface("prod").await;
         let green_npub = register_agent(&surface, "alpha", "GreenCastle").await;
-        register_agent(&surface, "beta", "GreenCastle").await;
+        // ADR-0037 W2: the pin is known in alpha, so beta REUSES its key
+        // behind a proof of possession (one pin, one key).
+        let proof = surface
+            .mailbox
+            .prove_pin_possession("alpha", "GreenCastle", "beta")
+            .await
+            .expect("prove");
+        let beta = surface
+            .mailbox
+            .register_agent_reusing(
+                "beta",
+                &AgentProfile {
+                    name: "GreenCastle".into(),
+                    program: Some("opencode".into()),
+                    model: None,
+                    persona: None,
+                    task_description: None,
+                },
+                "alpha",
+                &proof,
+            )
+            .await
+            .expect("reuse");
+        assert_eq!(beta.npub, green_npub, "one pin, one key");
 
         let info = surface
             .ensure_product("acme", "Acme")
@@ -1574,7 +1597,13 @@ mod tests {
             .inbox_product("acme", "GreenCastle", None)
             .await
             .expect("product inbox");
-        assert_eq!(inbox.len(), 2);
+        assert_eq!(
+            inbox.len(),
+            2,
+            "one key: each message once, not once per project"
+        );
+        assert!(inbox.iter().any(|h| h.project == "alpha"));
+        assert!(inbox.iter().any(|h| h.project == "beta"));
         let _ = green_npub;
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_dir_all(&data_dir);

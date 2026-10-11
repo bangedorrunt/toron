@@ -1,4 +1,4 @@
-// governed-by: ADR-0025
+// governed-by: ADR-0025, ADR-0037
 // governed-by: ADR-0003
 // governed-by: ADR-0004 (MailCommand::Overseer — Ship 5)
 
@@ -594,12 +594,16 @@ pub async fn run_agent(mailbox: &Mailbox, cmd: &AgentCommand, dry_run: bool) -> 
                     "project": plan.project_slug,
                     "key_path": plan.key_path,
                     "created": plan.created,
+                    "would_reuse_key_from": mailbox
+                        .pin_reuse_source(&args.project, &args.agent, args.key_from.as_deref())
+                        .await?,
                     "dry_run": true,
                     "would_reserve": args.paths,
                     "next": "re-run without --dry-run to register; nothing was written",
                 }))?;
                 return Ok(());
             }
+            let reused_from = reuse_pin_key(mailbox, args, &profile).await?;
             let agent = mailbox.register_agent(&args.project, &profile).await?;
             let stamped = stamp_bootstrap_pane(
                 args.pane_id.clone(),
@@ -628,6 +632,7 @@ pub async fn run_agent(mailbox: &Mailbox, cmd: &AgentCommand, dry_run: bool) -> 
                 "npub": agent.npub,
                 "key_path": agent.key_path,
                 "created": agent.created,
+                "reused_key_from": reused_from,
                 "pane_id": stamped,
                 "reservation": reservation,
                 "next": "export AGENT_NAME=<pin> (or pass --as on every call); reserve before edit — the strict guard blocks unattributed or unreserved commits",
@@ -681,6 +686,29 @@ pub async fn run_agent(mailbox: &Mailbox, cmd: &AgentCommand, dry_run: bool) -> 
     }
 }
 
+/// ADR-0037 W2: when the pin already holds a key in another project, prove
+/// possession with that key file and register it here with the SAME key.
+/// Returns the source project, or `None` when there was nothing to reuse.
+async fn reuse_pin_key(
+    mailbox: &Mailbox,
+    args: &crate::cli::AgentBootstrapArgs,
+    profile: &toron_core::nostr::identity::AgentProfile,
+) -> anyhow::Result<Option<String>> {
+    let Some(from) = mailbox
+        .pin_reuse_source(&args.project, &args.agent, args.key_from.as_deref())
+        .await?
+    else {
+        return Ok(None);
+    };
+    let proof = mailbox
+        .prove_pin_possession(&from, &args.agent, &args.project)
+        .await?;
+    mailbox
+        .register_agent_reusing(&args.project, profile, &from, &proof)
+        .await?;
+    Ok(Some(from))
+}
+
 /// Daemon arm of `run_agent`: same composition over MCP tools.
 pub async fn run_agent_daemon(
     dc: &DaemonClient,
@@ -712,6 +740,20 @@ pub async fn run_agent_daemon(
                 }))?;
                 return Ok(());
             }
+            // ADR-0037 W2: the MCP surface is frozen and refuses a second key
+            // for a known pin, so the reuse proof runs host-local against the
+            // shared durable root (the `agent prune` precedent). Afterwards the
+            // daemon registration is a plain idempotent upsert.
+            let local = toron_mcp::demo_mailbox().await?;
+            let profile = toron_core::nostr::identity::AgentProfile {
+                name: args.agent.clone(),
+                program: args.program.clone(),
+                model: args.model.clone(),
+                task_description: args.task.clone(),
+                persona: None,
+            };
+            let reused_from = reuse_pin_key(&local, args, &profile).await?;
+            drop(local);
             let registration = dc
                 .call_tool(
                     "register_agent",
@@ -758,6 +800,7 @@ pub async fn run_agent_daemon(
                 "project": args.project,
                 "registration": registration,
                 "reservation": reservation,
+                "reused_key_from": reused_from,
                 "pane_id": daemon_stamped,
                 "next": "export AGENT_NAME=<pin> (or pass --as on every call); reserve before edit — the strict guard blocks unattributed or unreserved commits",
             }))

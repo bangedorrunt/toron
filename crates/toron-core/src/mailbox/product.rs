@@ -1,4 +1,4 @@
-// governed-by: ADR-0003
+// governed-by: ADR-0003, ADR-0037
 #![forbid(unsafe_code)]
 
 //! Product bus cluster (bd-led.5.8): ensure_product, products_link,
@@ -209,6 +209,38 @@ impl Mailbox {
                 out.push((project.clone(), m));
             }
         }
+        // ADR-0037 §4.2/§4.4: one pin is one key, so every member project's
+        // inbox is the same key's inbox. Show each message once, under the
+        // project it was sent in (the index attributes it by the rumor's `t`
+        // tag); with no index row, the first member project keeps it.
+        let mut home: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        if let Some(pool) = self.index_pool.as_ref() {
+            for (_, m) in &out {
+                if let Ok(Some(slug)) = sqlx::query_scalar::<_, String>(
+                    "SELECT project_slug FROM messages WHERE event_id = ?1",
+                )
+                .bind(&m.id)
+                .fetch_optional(pool)
+                .await
+                {
+                    home.insert(m.id.clone(), slug);
+                }
+            }
+        }
+        let mut kept: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        let mut dedup: Vec<(String, crate::mailbox::InboxMessage)> = Vec::new();
+        for (project, m) in out {
+            let at_home = home.get(&m.id) == Some(&project);
+            match kept.get(&m.id) {
+                None => {
+                    kept.insert(m.id.clone(), dedup.len());
+                    dedup.push((project, m));
+                }
+                Some(&i) if at_home => dedup[i].0 = project,
+                Some(_) => {}
+            }
+        }
+        let mut out = dedup;
         out.sort_by_key(|(_, m)| std::cmp::Reverse(m.created_ts_us));
         Ok(out)
     }
