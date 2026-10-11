@@ -1,4 +1,4 @@
-// governed-by: ADR-0003
+// governed-by: ADR-0003, ADR-0037
 #![forbid(unsafe_code)]
 
 //! Identity ops — `create_agent_identity` vs `register_agent` (G1/G2).
@@ -274,94 +274,62 @@ pub fn resolve_name<'a>(
         .map(profile_npub)
 }
 
-/// Every project a NAME is registered under, with the key that project binds.
-///
-/// bd-xroute: `resolve_name` is correctly project-scoped, which means a name
-/// can be a DIFFERENT identity in every project. Proven live on 2026-09-28:
-/// `whois flywheel Buffy` -> `6778eb30...` and `whois toron.dev Buffy` ->
-/// `71998e0b...` are the SAME PANE (w1W:p1) under two per-project keys. So
-/// `mail send --to Buffy` from the flywheel project encrypts to a key the
-/// target never reads, and the send reports `ok` — the message is invisible, not
-/// merely undelivered. Address the same person by npub and it arrives.
-///
-/// This is the detector for that. It is deliberately a PURE scan over the same
-/// events `resolve_name` reads, so a caller can warn before sending rather than
-/// after the message is unreadable.
-#[must_use]
-pub fn name_across_projects<'a>(
-    profiles: impl IntoIterator<Item = &'a Event>,
-    name: &str,
-) -> Vec<(String, PublicKey)> {
-    let mut out: Vec<(String, PublicKey)> = Vec::new();
-    for ev in profiles {
-        if ev.kind.as_u16() != AGENT_PROFILE {
-            continue;
-        }
-        // The d tag is "{project}:{name}" — `profile_d_tag` /
-        // `profile_name_from_d_tag` are the ONLY authority on that shape, so
-        // this reuses them instead of re-splitting. My first version split on
-        // '/', which never matches, so it would have returned an empty list and
-        // the warning would have been silently dead. A detector that cannot fire
-        // is worse than none: it reads as coverage.
-        let Some(d) = ev
-            .tags
-            .iter()
-            .find_map(|t| (t.kind() == "d").then(|| t.content()).flatten())
-        else {
-            continue;
-        };
-        let Some((project, d_name)) = d.split_once(':') else {
-            continue;
-        };
-        if d_name != name {
-            continue;
-        }
-        let npub = profile_npub(ev);
-        let project = project.to_string();
-        if !out.iter().any(|(p, n)| *p == project && *n == npub) {
-            out.push((project, npub));
-        }
-    }
-    out
+/// ADR-0037 W3: what a pin's bindings across every project say about its key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PinKeys {
+    /// Registered nowhere.
+    Unknown,
+    /// One key, however many projects bind it (the ADR-0037 invariant).
+    One(String),
+    /// Several keys: a legacy per-project split (ADR-0037 §5) that only a
+    /// human can collapse. A bare-name send must not guess between them.
+    Split(Vec<(String, String)>),
 }
 
-/// bd-xroute: the warning text, pure so a fence can read it. The same reasoning
-/// as the toron-cli contradiction message: reaching this needs the live event
-/// set, and the interesting property — that it NAMES the alternatives — is
-/// checkable without any of that.
-pub fn ambiguous_name_warning(
-    name: &str,
-    send_project: &str,
-    binds: &[(String, PublicKey)],
-) -> Option<String> {
-    // The rule is deliberately symmetric. The sender CANNOT know which of the
-    // bound identities the target actually reads under, so a name bound
-    // anywhere other than the sending project is worth a warning in BOTH
-    // directions. An earlier version tried to be clever — "warn unless the
-    // send project is the bound one" — and its own fence proved it wrong: from
-    // toron.dev, "Buffy" resolves to the toron.dev key, yet the person at that
-    // pane may be the flywheel Buffy and never see the message. Guessing which
-    // identity is "really" them is exactly the inference this warning exists to
-    // replace with a fact.
-    let others: Vec<&(String, PublicKey)> =
-        binds.iter().filter(|(p, _)| p != send_project).collect();
-    if others.is_empty() {
-        return None;
+/// Fold `(project, pubkey_hex)` bindings of one pin into [`PinKeys`]. Pure.
+#[must_use]
+pub fn pin_keys(bindings: &[(String, String)]) -> PinKeys {
+    let mut keys: Vec<&str> = bindings.iter().map(|(_, k)| k.as_str()).collect();
+    keys.sort_unstable();
+    keys.dedup();
+    match keys.as_slice() {
+        [] => PinKeys::Unknown,
+        [one] => PinKeys::One((*one).to_string()),
+        _ => {
+            let mut b = bindings.to_vec();
+            b.sort();
+            b.dedup();
+            PinKeys::Split(b)
+        }
     }
-    let mut keys: Vec<String> = others
+}
+
+/// The refusal for a bare-name send to a split pin. It names every binding
+/// as the `pin@project` form that reaches it (ADR-0037 §4.3, W4), so the
+/// caller can pick one without guessing.
+#[must_use]
+pub fn split_pin_refusal(name: &str, bindings: &[(String, String)]) -> String {
+    let forms: Vec<String> = bindings
         .iter()
-        .map(|(p, n)| format!("{p}={}", n.to_hex()))
+        .map(|(p, k)| format!("{name}@{p} ({}…)", &k[..12.min(k.len())]))
         .collect();
-    keys.sort();
-    Some(format!(
-        "WARNING: {name:?} is bound in {} as a DIFFERENT key from the one this send uses. \
-         Mail is encrypted per project, so if the recipient reads under {}'s identity this \
-         message will be UNREADABLE to them — it is not lost in transit, it is invisible. \
-         Cross-project delivery must address the npub directly. Other bindings: {}",
-        keys.len(),
-        keys.join(", "),
-        keys.join(", ")
-    ))
+    format!(
+        "{name:?} is bound to {} different keys across projects (a legacy per-project split, \
+         ADR-0037 §5). A bare name cannot say which one the recipient reads. Address one \
+         explicitly: {} — or use the npub. Refusing to send.",
+        forms.len(),
+        forms.join(", ")
+    )
+}
+
+/// ADR-0037 W4: split `pin@project`. `None` unless both halves are
+/// non-empty and the pin half carries no further `@`. The caller decides
+/// whether the suffix names a real project; an unknown suffix is NOT a
+/// qualified address and must fall through to the literal-name path.
+#[must_use]
+pub fn split_qualified(addr: &str) -> Option<(&str, &str)> {
+    let (pin, project) = addr.rsplit_once('@')?;
+    (!pin.is_empty() && !project.is_empty() && !pin.contains('@')).then_some((pin, project))
 }
 
 /// Parse the profile content from a kind-30013 event.
@@ -706,85 +674,53 @@ mod bd_xroute_tests {
         crate::nostr::Keys::generate()
     }
 
-    /// bd-xroute: the detector finds the same NAME under two projects with two
-    /// DIFFERENT keys, which is the live Buffy case.
-    #[test]
-    fn a_name_bound_in_two_projects_is_reported_with_both_keys() {
-        let events = vec![
-            profile_event("flywheel", "Buffy", &keys()),
-            profile_event("toron.dev", "Buffy", &keys()),
-        ];
-        // The npub comes from the EVENT, which is the only authority the
-        // detector itself uses — deriving it from the builder's key struct
-        // would couple the fence to a field name this crate does not own.
-        let (npub_a, npub_b) = (profile_npub(&events[0]), profile_npub(&events[1]));
-        assert_ne!(npub_a, npub_b, "the fixture needs two distinct identities");
-        let binds = name_across_projects(&events, "Buffy");
-        assert_eq!(binds.len(), 2, "both bindings must be found: {binds:?}");
-        assert!(binds.contains(&("flywheel".to_string(), npub_a)));
-        assert!(binds.contains(&("toron.dev".to_string(), npub_b)));
+    fn b(p: &str, k: &str) -> (String, String) {
+        (p.to_string(), k.to_string())
     }
 
-    /// And the warning NAMES the other binding, because a warning that says
-    /// "ambiguous" without saying where else cannot be acted on.
+    /// ADR-0037 W3: one key across projects is ONE key, however many rows.
     #[test]
-    fn the_warning_names_the_other_project_and_key() {
-        let npub_a = profile_npub(&profile_event("flywheel", "Buffy", &keys()));
-        let npub_b = profile_npub(&profile_event("toron.dev", "Buffy", &keys()));
-        let binds = vec![
-            ("flywheel".to_string(), npub_a),
-            ("toron.dev".to_string(), npub_b),
-        ];
-        let w = ambiguous_name_warning("Buffy", "flywheel", &binds)
-            .expect("sending from flywheel to a name bound in toron.dev is ambiguous");
-        assert!(w.contains("Buffy"), "names the recipient: {w}");
-        assert!(w.contains("toron.dev"), "names the other project: {w}");
-        assert!(
-            w.contains(&npub_b.to_hex()),
-            "names the other KEY, which is what the operator must address: {w}"
-        );
-        assert!(w.contains("npub"), "says what to do instead: {w}");
-    }
-
-    /// A name bound in ONE project is not ambiguous, and the warning must stay
-    /// silent — otherwise every ordinary send prints noise nobody reads.
-    #[test]
-    fn a_single_project_binding_warns_about_nothing() {
-        let npub_a = profile_npub(&profile_event("flywheel", "PeachRobin", &keys()));
-        let binds = vec![("flywheel".to_string(), npub_a)];
+    fn a_pin_bound_in_two_projects_with_one_key_is_one_key() {
+        let k = profile_npub(&profile_event("flywheel", "Buffy", &keys())).to_hex();
         assert_eq!(
-            ambiguous_name_warning("PeachRobin", "flywheel", &binds),
-            None,
-            "an ordinary single-project recipient must not produce a warning"
+            pin_keys(&[b("flywheel", &k), b("toron.dev", &k)]),
+            PinKeys::One(k)
         );
+        assert_eq!(pin_keys(&[]), PinKeys::Unknown);
     }
 
-    /// The warning fires in BOTH directions, and that is the point.
-    ///
-    /// I first wrote the rule asymmetrically — "warn unless the sending project
-    /// is the bound one" — on the reasoning that a caller bound to toron.dev IS
-    /// that Buffy. The fixture disproved it: the same PANE (w1W:p1) holds a key
-    /// in each project, so "the caller is that Buffy" is not knowable from the
-    /// send site. Only the operator can resolve it, and the warning is what
-    /// tells them.
+    /// The live Buffy split: two keys is a Split, and the refusal names
+    /// every `pin@project` form plus the npub escape.
     #[test]
-    fn the_warning_is_symmetric_because_the_sender_cannot_who_the_target_is() {
-        let npub_a = profile_npub(&profile_event("flywheel", "Buffy", &keys()));
-        let npub_b = profile_npub(&profile_event("toron.dev", "Buffy", &keys()));
-        let binds = vec![
-            ("flywheel".to_string(), npub_a),
-            ("toron.dev".to_string(), npub_b),
-        ];
-        for from in ["flywheel", "toron.dev"] {
-            let w = ambiguous_name_warning("Buffy", from, &binds).unwrap_or_else(|| {
-                panic!("sending from {from} must warn: the name is bound elsewhere")
-            });
-            assert!(w.contains("Buffy"), "{from}: names the recipient: {w}");
-            assert!(
-                w.contains("UNREADABLE"),
-                "{from}: must say the consequence is invisibility, not loss: {w}"
-            );
-        }
+    fn a_split_pin_is_refused_with_every_qualified_form() {
+        let (ka, kb) = (keys().public_key().to_hex(), keys().public_key().to_hex());
+        let binds = vec![b("flywheel", &ka), b("toron.dev", &kb)];
+        let PinKeys::Split(split) = pin_keys(&binds) else {
+            panic!("two keys must be a split")
+        };
+        let w = split_pin_refusal("Buffy", &split);
+        assert!(
+            w.contains("Buffy@flywheel") && w.contains("Buffy@toron.dev"),
+            "{w}"
+        );
+        assert!(
+            w.contains(&ka[..12]) && w.contains(&kb[..12]),
+            "names the keys: {w}"
+        );
+        assert!(w.contains("npub") && w.contains("Refusing"), "{w}");
+    }
+
+    /// W4 parse: only `pin@project` with both halves is qualified.
+    #[test]
+    fn qualified_address_parse() {
+        assert_eq!(
+            split_qualified("Buffy@toron.dev"),
+            Some(("Buffy", "toron.dev"))
+        );
+        assert_eq!(split_qualified("Buffy"), None);
+        assert_eq!(split_qualified("@toron"), None);
+        assert_eq!(split_qualified("Buffy@"), None);
+        assert_eq!(split_qualified("a@b@c"), None);
     }
 }
 

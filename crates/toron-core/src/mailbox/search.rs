@@ -546,7 +546,8 @@ mod tests {
         let pool = mailbox.index_pool().unwrap();
 
         // Legacy spelling of "demo" + an agents row under it (same name as
-        // the modern row, written pre-canonicalization).
+        // the modern row, written pre-canonicalization). Same key: ADR-0037
+        // W2 refuses a second key for a known pin on every new write.
         sqlx::query(
             "INSERT INTO project_aliases (alias, canonical, created_ts_us) \
              VALUES ('/w/demo', 'demo', 1)",
@@ -556,7 +557,7 @@ mod tests {
         .expect("alias row");
         sqlx::query(
             "INSERT INTO agents (project_slug, name, pubkey, created_ts_us) \
-             VALUES ('/w/demo', 'PiAlpha', 'bbbb', 1)",
+             VALUES ('/w/demo', 'PiAlpha', 'aaaa', 1)",
         )
         .execute(pool)
         .await

@@ -1,4 +1,4 @@
-// governed-by: ADR-0003
+// governed-by: ADR-0003, ADR-0037
 // governed-by: ADR-0004 (SendMessage.overseer, operator signing — Ship 5)
 // governed-by: ADR-0017 (project-root canonicalization)
 #![forbid(unsafe_code)]
@@ -975,6 +975,7 @@ impl Mailbox {
         let sqlite: Arc<dyn ProjectionSink> = Arc::new(
             SqliteProjectionSink::new(pool.clone())
                 .with_projects(npub_to_project.clone())
+                .with_memberships(&roster)
                 .with_names(npub_to_name),
         );
         let git: Arc<dyn ProjectionSink> = Arc::new(ProjectGitProjectionSink::for_mailbox(
@@ -1618,7 +1619,23 @@ impl Mailbox {
                 // the raw caller string. Downstream views key on this label;
                 // storing a folded slug forked one delivery into two
                 // disjoint inbox views whose read state can never meet.
-                let (row_name, npub) = if super::naming::is_npub(name) {
+                // ADR-0037 W4: `pin@project` names one project's binding —
+                // the migration-window form for split pins. Only a suffix
+                // that names a project with registrations qualifies; any
+                // other `@` string stays a literal name and fails below.
+                let qualified = match nident::split_qualified(name) {
+                    Some((pin, proj)) if self.project_has_agents(proj).await => Some((pin, proj)),
+                    _ => None,
+                };
+                let (row_name, npub) = if let Some((pin, proj)) = qualified {
+                    let canonical = self.canonical_project(proj).await;
+                    let target = self.resolve_agent_name(&canonical, pin).await?;
+                    let key = self
+                        .pin_binding_in(&canonical, &target)
+                        .await?
+                        .ok_or_else(|| anyhow::anyhow!("unknown recipient: {target}@{canonical} (not registered in project {canonical})"))?;
+                    (target, crate::nostr::PublicKey::from_hex(&key)?)
+                } else if super::naming::is_npub(name) {
                     // ADR-0018: an npub is always a routing address (and its
                     // own canonical label).
                     (
@@ -1626,68 +1643,30 @@ impl Mailbox {
                         crate::nostr::PublicKey::from_hex(name)
                             .map_err(|_| anyhow::anyhow!("invalid npub recipient: {name}"))?,
                     )
-                } else if mode == super::naming::IdentityMode::Swarm {
-                    // ADR-0018 D1a/D3 + bd-pin-public-plane-s-easy.1:
-                    // canonical names, REGISTERED adjective+noun pins, or
-                    // folded aliases route — ONE resolver (the fold precedes
-                    // the shape match, so a slug folded to a pin resolves as
-                    // the pin). An unregistered pin fails at resolve_name
-                    // below ("register it first") — matching D1a (registered
-                    // pins are routing targets; unregistered free strings
-                    // are not).
-                    let target = self.resolve_agent_name(&args.project_slug, name).await?;
-                    let npub = nident::resolve_name(&args.project_slug, profiles.iter(), &target)
-                        .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "unknown recipient: {target} (register it in project {} first)",
-                            args.project_slug
-                        )
-                    })?;
-                    (target, npub)
                 } else {
-                    // bd-dbdi: fold the alias table in Open mode too. whois
-                    // folds aliases in every mode (bd-lmcy), so the send path
-                    // must as well — otherwise `send --to captain` fails with
-                    // "unknown recipient" while `whois captain` resolves.
-                    // The captain fold is liveness-gated at the read (dead
-                    // targets prune to absent); unfoldered names keep exact
-                    // legacy routing.
-                    let canonical = self.canonical_project(&args.project_slug).await;
-                    let target = self
-                        .agent_name_alias(&canonical, name)
-                        .await
-                        .unwrap_or_else(|| name.clone());
-                    (
-                        target.clone(),
-                        nident::resolve_name(&args.project_slug, profiles.iter(), &target)
-                            .ok_or_else(|| {
-                                anyhow::anyhow!(
-                                    "unknown recipient: {target} (register it in project {} first)",
-                                    args.project_slug
-                                )
-                            })?,
-                    )
+                    // The recipient NAME, folded in the sender's project:
+                    // ADR-0018 D1a/D3 + bd-pin-public-plane-s-easy.1 in Swarm
+                    // mode (canonical names, registered pins, folded
+                    // aliases — the fold precedes the shape match); bd-dbdi
+                    // in Open mode (the alias table folds there too, so
+                    // `send --to captain` resolves like `whois captain`).
+                    let target = if mode == super::naming::IdentityMode::Swarm {
+                        self.resolve_agent_name(&args.project_slug, name).await?
+                    } else {
+                        let canonical = self.canonical_project(&args.project_slug).await;
+                        self.agent_name_alias(&canonical, name)
+                            .await
+                            .unwrap_or_else(|| name.clone())
+                    };
+                    // ADR-0037 W3: the name resolves to a KEY, not to a
+                    // (project, name) pair. The sender's project decides the
+                    // routing (`t` tag), never who the recipient is.
+                    let local = nident::resolve_name(&args.project_slug, profiles.iter(), &target);
+                    let npub = self
+                        .resolve_pin_key(&args.project_slug, &target, local)
+                        .await?;
+                    (target, npub)
                 };
-                // bd-xroute: a NAME is project-scoped, so the same name can be
-                // a DIFFERENT key in another project. Warn BEFORE the send, not
-                // after the message is unreadable: proven live, `--to Buffy`
-                // from the flywheel project encrypted to the flywheel key while
-                // the target pane reads the toron.dev key, and the send reported
-                // `ok`. Invisible, not undelivered.
-                let binds = nident::name_across_projects(profiles.iter(), &row_name);
-                if let Some(w) =
-                    nident::ambiguous_name_warning(&row_name, &args.project_slug, &binds)
-                {
-                    // bd-j5sk: this used to be an eprintln and the send
-                    // continued, which IS the defect. A warning nobody can
-                    // act on is not a gate: the message is encrypted to the
-                    // SENDING project's key while the recipient reads under
-                    // theirs, so the send reports `ok` and nobody ever reads
-                    // it. Refuse, and name the npub — sending BY npub is
-                    // unambiguous by construction, so the fix costs the
-                    // caller nothing but the characters.
-                    anyhow::bail!("{w}\nRefusing to send: re-run with --to {npub}");
-                }
                 out.push(ResolvedRecipient {
                     name: row_name,
                     npub,
@@ -1696,6 +1675,81 @@ impl Mailbox {
             }
         }
         Ok(out)
+    }
+
+    /// ADR-0037 W3: a pin's `(project, pubkey)` bindings in every project
+    /// (the `agents` index). Empty without an index pool.
+    pub(crate) async fn pin_bindings(&self, name: &str) -> anyhow::Result<Vec<(String, String)>> {
+        let Some(pool) = self.index_pool.as_ref() else {
+            return Ok(Vec::new());
+        };
+        Ok(
+            sqlx::query_as("SELECT project_slug, pubkey FROM agents WHERE name = ?1")
+                .bind(name)
+                .fetch_all(pool)
+                .await?,
+        )
+    }
+
+    /// ADR-0037 W4: the key `name` is bound to in exactly `project_slug`.
+    pub(crate) async fn pin_binding_in(
+        &self,
+        project_slug: &str,
+        name: &str,
+    ) -> anyhow::Result<Option<String>> {
+        let Some(pool) = self.index_pool.as_ref() else {
+            return Ok(None);
+        };
+        Ok(
+            sqlx::query_scalar("SELECT pubkey FROM agents WHERE project_slug = ?1 AND name = ?2")
+                .bind(project_slug)
+                .bind(name)
+                .fetch_optional(pool)
+                .await?,
+        )
+    }
+
+    /// ADR-0037 W4: does `project` (any spelling) have registrations? Only
+    /// such a suffix makes `pin@project` a qualified address.
+    pub(crate) async fn project_has_agents(&self, project: &str) -> bool {
+        let Some(pool) = self.index_pool.as_ref() else {
+            return false;
+        };
+        let canonical = self.canonical_project(project).await;
+        sqlx::query_scalar::<_, i64>("SELECT 1 FROM agents WHERE project_slug = ?1 LIMIT 1")
+            .bind(&canonical)
+            .fetch_optional(pool)
+            .await
+            .ok()
+            .flatten()
+            .is_some()
+    }
+
+    /// ADR-0037 W3: resolve a (folded) recipient name to its ONE key across
+    /// every project. One key anywhere sends; a name registered nowhere
+    /// fails loud; a legacy split refuses and names the `pin@project`
+    /// forms. `local` is the sender project's profile binding, counted so a
+    /// pool-less mailbox still routes in-project.
+    pub(crate) async fn resolve_pin_key(
+        &self,
+        project_slug: &str,
+        target: &str,
+        local: Option<crate::nostr::PublicKey>,
+    ) -> anyhow::Result<crate::nostr::PublicKey> {
+        let mut binds = self.pin_bindings(target).await?;
+        if let Some(k) = local {
+            binds.push((self.canonical_project(project_slug).await, k.to_hex()));
+        }
+        match nident::pin_keys(&binds) {
+            nident::PinKeys::One(hex) => Ok(crate::nostr::PublicKey::from_hex(&hex)?),
+            nident::PinKeys::Unknown => Err(anyhow::anyhow!(
+                "unknown recipient: {target} (register it in project {project_slug} first)"
+            )),
+            nident::PinKeys::Split(split) => Err(anyhow::anyhow!(
+                "{}",
+                nident::split_pin_refusal(target, &split)
+            )),
+        }
     }
 
     /// Load the sender/agent's keypair from its ncryptsec file (G1).
@@ -1885,6 +1939,15 @@ fn add_message_tags(tags: &mut Vec<Tag>, args: &SendMessage) {
     // historical name; projection.rs `rumor_timestamp_us` returns it).
     let now_us = crate::index::writer::Clock::now_us(&crate::index::writer::SystemClock);
     if let Ok(t) = Tag::parse(["ts_ms", &now_us.to_string()]) {
+        tags.push(t);
+    }
+    // ADR-0037 §4.4: with one key per pin the recipient key no longer names
+    // a project, so the sending project rides INSIDE the sealed rumor (the
+    // wrap still hides it). The projection attributes the message to this
+    // project when the recipient key is registered there.
+    if !args.project_slug.is_empty()
+        && let Ok(t) = Tag::parse(["t", &args.project_slug])
+    {
         tags.push(t);
     }
     if !args.subject.is_empty()
@@ -2084,41 +2147,40 @@ mod tests {
     use crate::nostr::identity::AgentProfile;
     use std::sync::Arc;
 
-    /// bd-j5sk: the send path must GATE on a cross-project name, not warn.
+    /// bd-j5sk + ADR-0037 W3: the send path resolves a name to ONE key and
+    /// REFUSES a split pin; it never warns-and-sends.
     ///
     /// A source tripwire, because the property is about the call SITE: the
-    /// detector in `nostr::identity` has its own tests, and those pass
-    /// whether the sender obeys them or not. The needle is spliced so a
-    /// comment cannot satisfy it — this repo has already been bitten by a
-    /// source scan that passed with the call deleted, because the adjacent
-    /// comment named the function.
+    /// pure `pin_keys` / `split_pin_refusal` have their own tests, and those
+    /// pass whether the sender obeys them or not. Needles are spliced so a
+    /// comment cannot satisfy them.
     #[test]
-    fn the_send_path_refuses_an_ambiguous_name() {
-        let src = include_str!("messaging.rs");
-        let detector = ["ambiguous_name", "_warning"].concat();
-        let warn = ["eprintln!", "(\"{w}\")"].concat();
-        let gate = ["anyhow::", "bail!"].concat();
-        let i = src.find(&detector).expect("the detector is still called");
-        // The BRANCH, not a window: from the detector call to the closing
-        // brace at the branch's own indentation. A 900-char window passed
-        // with the call replaced by an eprintln, because a LATER bail in
-        // the same function satisfied it. That is the vacuous-test trap.
+    fn the_send_path_refuses_a_split_pin() {
+        // Whitespace-free so rustfmt's line breaking cannot hide the call.
+        let src: String = include_str!("messaging.rs")
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        let call = ["self.resolve_pin_key", "(&args.project_slug"].concat();
+        assert!(
+            src.contains(&call),
+            "resolve_recipients routes names through resolve_pin_key"
+        );
+        let split = ["nident::PinKeys::", "Split(split)=>"].concat();
+        let i = src.find(&split).expect("the split arm exists");
         let rest = &src[i..];
-        let close = "\n                }";
-        let end = rest
-            .find(close)
-            .expect("the ambiguous-name branch still closes");
-        let branch = &rest[..end];
+        // The arm runs to the next item's doc comment.
+        let branch = &rest[..rest.find("///").expect("the split arm closes")];
         assert!(
-            branch.contains(&gate),
-            "the ambiguous-name branch must REFUSE; a warning the caller \
-             cannot act on is the bd-j5sk defect itself"
+            branch.contains("Err("),
+            "the split arm must REFUSE: {branch}"
         );
         assert!(
-            !branch.contains(&warn),
-            "the ambiguous-name branch must not merely eprintln: that is \
-             exactly the invisible-delivery bug"
+            !branch.contains("eprintln!"),
+            "a warning is the bd-j5sk defect itself"
         );
+        let old = ["ambiguous_name", "_warning"].concat();
+        assert!(!src.contains(&old), "the warning is deleted (ADR-0037 W3)");
     }
 
     const PASSPHRASE: &str = "messaging-test-pass";

@@ -1,5 +1,5 @@
-// governed-by: ADR-0025
-// governed-by: ADR-0003
+// governed-by: ADR-0025, ADR-0037
+// governed-by: ADR-0003, ADR-0037
 // governed-by: ADR-0017 (project-root canonicalization)
 #![forbid(unsafe_code)]
 
@@ -382,6 +382,8 @@ impl Mailbox {
                 name = profile.name,
             );
         }
+        // ADR-0037 W2: a pin known in another project never gets a second key.
+        self.refuse_second_key(project_slug, &profile.name).await?;
         let result = ident::create_agent_identity(project_slug, profile, Timestamp::now())?;
         let created = self
             .persist_and_publish(project_slug, profile, result)
@@ -472,6 +474,11 @@ impl Mailbox {
             .load_agent_key(&key_path)
             .or_else(|| self.alt_agent_key(project_slug, &profile.name));
         let created = existing.is_none();
+        if created {
+            // ADR-0037 W2: minting is only for a pin no project knows yet;
+            // a known pin reuses its key through `register_agent_reusing`.
+            self.refuse_second_key(project_slug, &profile.name).await?;
+        }
         let result =
             ident::register_agent(project_slug, profile, existing.as_ref(), Timestamp::now())?;
         let mut agent = self
@@ -1076,7 +1083,7 @@ impl Mailbox {
     /// ADR-0017: writes the canonical project slug everywhere (key path,
     /// profile event tags, agents-index row), so registration state spans
     /// every spelling of the project key.
-    async fn persist_and_publish(
+    pub(crate) async fn persist_and_publish(
         &self,
         project_slug: &str,
         profile: &AgentProfile,
@@ -2957,10 +2964,15 @@ mod tests {
         raw_agent(&pool, "p", "brash-otter", KEY_A)
             .await
             .expect("same key is allowed");
-        // Same words in ANOTHER project: W2's business, not W1's.
-        raw_agent(&pool, "q", "brash-otter", KEY_B)
+        // Same words in ANOTHER project: allowed by W1. Under W2 (0020) it
+        // must REUSE the pin's key; a second key is refused there.
+        raw_agent(&pool, "q", "brash-otter", KEY_A)
             .await
-            .expect("other project is allowed");
+            .expect("other project, same key, is allowed");
+        let w2 = raw_agent(&pool, "r", "brash-otter", KEY_B)
+            .await
+            .expect_err("a second key for a known pin is refused (W2)");
+        assert!(w2.to_string().contains("agents_one_key_per_pin"), "{w2}");
         // Different words, different key.
         raw_agent(&pool, "p", "IvoryRidge", KEY_B)
             .await

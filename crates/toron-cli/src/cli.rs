@@ -1159,6 +1159,11 @@ pub struct AgentBootstrapArgs {
     /// $HERDR_PANE_ID when set). Best-effort display-only metadata.
     #[arg(long = "pane-id")]
     pub pane_id: Option<String>,
+    /// ADR-0037 W2: when the pin already holds a key in another project, the
+    /// project whose key to reuse (required only when the pin holds more than
+    /// one key). The CLI proves possession with that key file.
+    #[arg(long = "key-from")]
+    pub key_from: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]

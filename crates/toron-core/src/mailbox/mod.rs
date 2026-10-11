@@ -69,6 +69,7 @@ pub mod matrix;
 pub mod messaging;
 pub mod metrics;
 pub mod naming;
+pub mod pin_reuse;
 pub mod product;
 pub mod receipts;
 pub mod receipts_core;
@@ -536,6 +537,7 @@ impl Mailbox {
         let sqlite: Arc<dyn ProjectionSink> = Arc::new(
             SqliteProjectionSink::new(pool.clone())
                 .with_projects(npub_to_project.clone())
+                .with_memberships(&roster)
                 .with_names(npub_to_name),
         );
         // G11 (bd-p3-projection-atomicity-rtjz): the production projection
