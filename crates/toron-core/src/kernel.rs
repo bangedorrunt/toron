@@ -13,7 +13,8 @@
 //! - the loop: [`Program`], [`Update`], [`Cmd`], [`Durability`],
 //!   [`Failure`], [`Interpret`], [`Loop`], [`Producer`], [`Subscriber`],
 //!   [`Boot`], replay [`Player`] and [`Snapshot`];
-//! - the journal: [`EffectState`], [`can_transition`], [`JournalStore`],
+//! - the journal: [`EffectState`], [`can_transition`], [`JournalStore`]
+//!   (with its [`JournalRow`], [`JournalRead`], [`JournalDisposition`]),
 //!   [`plan_attempt`], [`plan_park`], [`may_settle`];
 //! - the L16 log: [`DurableLog`], [`Offset`], [`ProducerId`],
 //!   [`AppendError`] (with `StaleEpoch`), and [`durable_log_laws`] so
@@ -49,6 +50,9 @@ pub use elm_effect_journal::laws as durable_log_laws;
 pub use elm_effect_journal::plan::{
     DispatchPlan, EffectView, ParkDecision, ProviderCapability, may_settle, plan_attempt, plan_park,
 };
-pub use elm_effect_journal::store::{InMemoryStore, JournalStore};
+pub use elm_effect_journal::store::{
+    Disposition as JournalDisposition, InMemoryStore, JournalStore, Read as JournalRead,
+    Row as JournalRow,
+};
 pub use elm_effect_journal::stream::Gone;
 pub use elm_effect_journal::{EffectState, TransitionError, can_transition, transition};
