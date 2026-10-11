@@ -12,6 +12,7 @@ pub mod dispatch_core;
 pub mod envelope;
 pub mod inbox;
 pub mod index;
+pub mod journal;
 pub mod jsonl;
 pub mod kernel;
 pub mod keys;

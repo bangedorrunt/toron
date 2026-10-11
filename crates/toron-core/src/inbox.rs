@@ -25,6 +25,10 @@ use crate::delivery::{DeliveryEvent, DeliveryFsm, DeliveryState, Phase, Reject};
 use crate::envelope::{Class, Envelope, MsgId};
 use crate::kernel::{self, AppendError, DurableLog, Offset};
 
+/// The SQLite effect journal (`kernel::JournalStore`), named here beside
+/// [`ToronLog`] as the build plan lists them.
+pub use crate::journal::{JournalDb, ToronJournal};
+
 /// The stream envelopes live on.
 pub const INBOX_STREAM: &str = "inbox";
 /// The stream a sender loop's durable intents live on.

@@ -65,3 +65,15 @@ informed: flywheel x toron x beads maintainers
 ## Status log
 
 - **2026-10-11 — accepted** with the Phase 1 PR (stack-comms build).
+- **2026-10-11 — Phase 2: `ToronJournal` lands** (the §4 deviation is closed). `toron_core::journal::{JournalDb, ToronJournal}` (re-exported from `toron_core::inbox`) is a `kernel::JournalStore` over migration `0021_comms_effect_journal.sql`:
+  - `effect_journal(scope, key)` rows, plus an `effect_journal_log` change log that keeps a row snapshot per offset and trims per scope.
+  - Every operation is one `BEGIN IMMEDIATE` transaction, so offset and state commit together and racing processes serialize.
+  - The sync handle uses the `ToronLog` bridge (request/reply to a Tokio task, refused on a Tokio worker: F2).
+  - The trait's infallible signatures answer an unreachable store with "nothing changed", and `record_intent` with an `Unknown` + `Reconcile` row. `try_*` return the error.
+  - `kernel` additionally re-exports `JournalRow`, `JournalRead` and `JournalDisposition`.
+  - Tests (`tests/toron_journal.rs`):
+    - upstream's `journal_store` contract as a law suite run against both `InMemoryStore` and `ToronJournal`;
+    - a 1,500-step differential against the reference;
+    - reopen durability, scope isolation, two-process claim races (80 claims, 80 distinct generations), and the F2 refusal.
+  - Mutations caught: dropping the generation fence fails the laws and the differential; a deferred `BEGIN` fails the race.
+  - Not wired into a loop yet. Its first consumers are flywheel's effect runner and the Phase 4a supervisor claims.
