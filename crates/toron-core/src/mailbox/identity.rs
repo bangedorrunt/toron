@@ -2849,6 +2849,16 @@ mod tests {
         // surface that could only be exercised by the bug it reports would
         // be untestable, and untestable surfaces are the ones that are wrong
         // in production and right in the test.
+        //
+        // ADR-0037 W1: since migration 0018 the database refuses this row
+        // too, so the legacy board is reproduced as it was written: before
+        // the trigger existed. The trigger is restored afterwards, and the
+        // report must still see the legacy split (triggers never rewrite
+        // existing rows).
+        sqlx::raw_sql("DROP TRIGGER agents_same_name_one_key_insert")
+            .execute(&pool)
+            .await
+            .expect("emulate a pre-0018 board");
         sqlx::query(
             "INSERT INTO agents (project_slug, name, pubkey, created_ts_us) VALUES (?1, ?2, ?3, ?4)",
         )
@@ -2859,6 +2869,10 @@ mod tests {
         .execute(&pool)
         .await
         .expect("seed the legacy split directly");
+        sqlx::raw_sql(W1_MIGRATION)
+            .execute(&pool)
+            .await
+            .expect("restore the 0018 triggers");
 
         let found = near_duplicate_identities(&pool, project)
             .await
@@ -2874,6 +2888,133 @@ mod tests {
             2,
             "and they really are two different keys: {:?}",
             found[0].pubkeys
+        );
+    }
+
+    // --- ADR-0037 W1: one name -> one pubkey per project, in the database ---
+
+    const W1_MIGRATION: &str = include_str!("../../migrations/0018_agents_same_name_one_key.sql");
+    const KEY_A: &str = "aaaa000000000000000000000000000000000000000000000000000000000001";
+    const KEY_B: &str = "bbbb000000000000000000000000000000000000000000000000000000000002";
+
+    async fn raw_agent(
+        pool: &sqlx::SqlitePool,
+        project: &str,
+        name: &str,
+        key: &str,
+    ) -> sqlx::Result<()> {
+        sqlx::query(
+            "INSERT INTO agents (project_slug, name, pubkey, created_ts_us) VALUES (?1, ?2, ?3, 1)",
+        )
+        .bind(project)
+        .bind(name)
+        .bind(key)
+        .execute(pool)
+        .await
+        .map(|_| ())
+    }
+
+    /// The bd-0tbg shape is refused by the DATABASE, not only by
+    /// `register_agent`: a raw write (any surface that forgets the Rust
+    /// check) cannot give a second spelling of one name a second key.
+    #[tokio::test]
+    async fn agents_same_name_one_key() {
+        let (_mailbox, pool, _db, _data) = test_mailbox_with_pool("w1-db").await;
+        raw_agent(&pool, "p", "BrashOtter", KEY_A)
+            .await
+            .expect("first spelling");
+        for other in ["brash-otter", "brash_otter", "BRASHOTTER", "Brash.Otter"] {
+            let err = raw_agent(&pool, "p", other, KEY_B)
+                .await
+                .expect_err("a second key for the same words must be refused");
+            assert!(
+                err.to_string().contains("agents_same_name_one_key"),
+                "{other}: refusal names the constraint: {err}"
+            );
+        }
+        // Moving a row onto the colliding spelling is refused as well.
+        raw_agent(&pool, "p", "IvoryRidge", KEY_B)
+            .await
+            .expect("unrelated pin");
+        let err = sqlx::query("UPDATE agents SET name = 'brash-otter' WHERE name = 'IvoryRidge'")
+            .execute(&pool)
+            .await
+            .expect_err("rename onto another key's words is refused");
+        assert!(
+            err.to_string().contains("agents_same_name_one_key"),
+            "{err}"
+        );
+    }
+
+    /// Negative controls: the constraint must not refuse what is NOT a split.
+    #[tokio::test]
+    async fn agents_same_name_one_key_allows_non_splits() {
+        let (_mailbox, pool, _db, _data) = test_mailbox_with_pool("w1-ok").await;
+        raw_agent(&pool, "p", "BrashOtter", KEY_A)
+            .await
+            .expect("first");
+        // Same words, SAME key: an alias row, not a split.
+        raw_agent(&pool, "p", "brash-otter", KEY_A)
+            .await
+            .expect("same key is allowed");
+        // Same words in ANOTHER project: W2's business, not W1's.
+        raw_agent(&pool, "q", "brash-otter", KEY_B)
+            .await
+            .expect("other project is allowed");
+        // Different words, different key.
+        raw_agent(&pool, "p", "IvoryRidge", KEY_B)
+            .await
+            .expect("different pin is allowed");
+        // Re-keying one spelling via the registration upsert path is allowed
+        // only if no other spelling holds the old words: here `brash-otter`
+        // still holds KEY_A, so re-keying `BrashOtter` alone would split them.
+        let err = sqlx::query(
+            "UPDATE agents SET pubkey = ?1 WHERE project_slug = 'p' AND name = 'BrashOtter'",
+        )
+        .bind(KEY_B)
+        .execute(&pool)
+        .await
+        .expect_err("re-keying one spelling away from its twin is a split");
+        assert!(
+            err.to_string().contains("agents_same_name_one_key"),
+            "{err}"
+        );
+        let ok = sqlx::query(
+            "UPDATE agents SET pubkey = ?1 WHERE project_slug = 'p' AND name = 'IvoryRidge'",
+        )
+        .bind(KEY_A.replace("aaaa", "cccc"))
+        .execute(&pool)
+        .await
+        .expect("re-keying a pin with no twin is allowed");
+        assert_eq!(ok.rows_affected(), 1);
+    }
+
+    /// The registration path still works end to end with the trigger in
+    /// place: register, re-register (upsert), and the Rust check still gives
+    /// the operator-facing message before the database is reached.
+    #[tokio::test]
+    async fn registration_path_is_unchanged_under_the_w1_trigger() {
+        let (mailbox, _pool, _db, _data) = test_mailbox_with_pool("w1-reg").await;
+        mailbox.ensure_project("p").await.expect("ensure");
+        let a = mailbox
+            .register_agent("p", &profile("BrashOtter"))
+            .await
+            .expect("register");
+        let again = mailbox
+            .register_agent("p", &profile("BrashOtter"))
+            .await
+            .expect("re-register");
+        assert_eq!(
+            a.npub, again.npub,
+            "re-registration is idempotent on the key"
+        );
+        let err = mailbox
+            .register_agent("p", &profile("brash-otter"))
+            .await
+            .expect_err("second spelling refused");
+        assert!(
+            err.to_string().contains("bd-0tbg"),
+            "Rust check answers first: {err}"
         );
     }
 
