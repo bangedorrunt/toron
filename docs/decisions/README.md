@@ -40,12 +40,13 @@ This directory contains records of the major architectural decisions made for th
 | [0034](0034-effect-oriented-toron-companion.md) | Effect-oriented discipline for toron (companion to flywheel ADR-0015 §4) | **Proposed** (bead bd-lzo6, crew B; acceptance is a captain word on the file) |
 | [0035](0035-elm-kernel-law-and-judgment-plane.md) | Elm Kernel Law and Judgment Plane Across toron, flywheel, and beads | **Accepted** (operator word 2026-09-22; research bead bd-fp4u closed, implementation epic bd-vhmn closing) |
 | [0036](0036-shared-bus-substrate.md) | Daemon Push Sidecar (Wake Bus) for Cross-Process Observation | **Accepted** (operator word 2026-09-23; serve wiring landed bd-ewsi, design bead bd-42tn + transport bead bd-un5s closed) |
-| [0037](0037-one-key-per-pin-project-scoped-visibility.md) | One Key per Pin — Project-Scoped Visibility, Not Project-Scoped Keys | **Proposed** (2026-09-29, bead bd-j5sk; the inbox already filters by pubkey alone, so the fix is registration-side; bd-j5sk stays open until accepted and migrated; the §6.1 blast-radius trade is an operator decision) |
+| [0037](0037-one-key-per-pin-project-scoped-visibility.md) | One Key per Pin — Project-Scoped Visibility, Not Project-Scoped Keys | **Accepted** (captain word 2026-10-11, stack-comms build Phase 0 prerequisite; W1–W5 not yet implemented, bd-j5sk stays open until they land and the §5 migration runs) |
 | [0038](0038-operator-key-lives-in-the-config-home.md) | The Operator Key Lives in the Config Home — One Resolution for Everyone | **Accepted** 2026-09-30 (operator choice; the two paths held different keys on the machine that prompted it, so `doctor` reported a red that read as unconfigured while the daemon signed with a second identity; the implicit data-root mint now refuses and names the `mv`) |
+| [0040](0040-adopt-elm-effect-for-the-comms-kernel.md) | Adopt elm-effect-elm and elm-effect-journal for the Comms Kernel | **Accepted** (captain word 2026-10-11; amends ADR-0035 for the comms kernel only; one port `toron_core::kernel`; vendored at a hash-checked rev until elm-effect-rs has a remote) |
 
 Rows 0034–0036 were missing from this index when ADR-0037 was drafted; they are backfilled here. An index is the directory's only discovery surface, and ADR-0035/0036 are **accepted** — an accepted decision nobody can find is a gap, not a cosmetic one.
 
-Flywheel [ADR-0017](../../../flywheel/docs/decisions/0017-shared-foldcore-crate.md) (proposed 2026-09-22) places a zero-dependency `foldcore` crate in this repo at `crates/foldcore`. It is not created yet. Toron-core may depend on it. Flywheel must not become a dependency of this repo.
+Flywheel [ADR-0017](../../../flywheel/docs/decisions/0017-shared-foldcore-crate.md) (proposed 2026-09-22) would have placed a zero-dependency `foldcore` crate here. It was never created and is **rejected** (2026-10-11), superseded by elm-effect-rs ADR-0002 + [ADR-0040](0040-adopt-elm-effect-for-the-comms-kernel.md). Flywheel must not become a dependency of this repo.
 
 ## Parity catalogs
 
