@@ -24,6 +24,7 @@ negentropy = "0.5"
 hex = "0.4"
 ed25519-dalek = { version = "2.2", features = ["rand_core"] }
 sha2 = "0.10"
+schemars = "1"
 # Comms kernel (ADR-0040): elm-effect-rs Elm + journal layer, vendored at the
 # rev in vendor/elm-effect/VENDORED_FROM (hash-checked) until elm-effect-rs
 # has a remote; then `git = ..., rev = ...`. Only `kernel.rs` names these.
@@ -31,6 +32,13 @@ elm-effect = { path = "../../vendor/elm-effect/crates/elm-effect" }
 elm-effect-elm = { path = "../../vendor/elm-effect/crates/elm-effect-elm" }
 elm-effect-journal = { path = "../../vendor/elm-effect/crates/elm-effect-journal" }
 
+[features]
+# Test-only crash points for the comms outbox (TORON_FAULT=after_intent |
+# after_append aborts the process there). Never enabled in a release build;
+# the dev-dependency below turns it on for this crate's own tests only.
+fault-injection = []
+
 [dev-dependencies]
+toron-core = { path = ".", features = ["fault-injection"] }
 proptest = "1.11"
 futures-util = "0.3"

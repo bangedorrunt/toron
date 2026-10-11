@@ -3,6 +3,7 @@
 
 mod catalog;
 mod cli;
+mod comms;
 mod config;
 mod daemon;
 mod mailbox_source;
@@ -129,6 +130,9 @@ fn run(cli: &Cli) -> anyhow::Result<ExitCode> {
         Command::Role(cmd) => {
             run_role(cmd, format)?;
             ExitCode::SUCCESS
+        }
+        Command::Next(_) | Command::Ack(_) | Command::Done(_) | Command::Inbox(_) => {
+            comms::run_comms(command, format)?
         }
         Command::RunState(cmd) => {
             run_run_state(cmd, &cfg, format)?;
