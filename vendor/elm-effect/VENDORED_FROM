@@ -5,10 +5,10 @@
 # under crates/ by hand: re-vendor from a new rev and regenerate
 # MANIFEST.sha256 with the script's --regen mode.
 upstream = elm-effect-rs
-upstream_location = mikasa:~/workspace/elm-effect-rs (local-only, no remote yet)
+upstream_url = https://github.com/bangedorrunt/elm-effect-rs
 rev = 49f01a091c8844a5abd7bfa3666c610e6d87c7ef
-branch = phase0/journal-wire-epoch-fence
+branch = main (merged by bangedorrunt/elm-effect-rs#2, merge commit 6d8e95d3e69266fe8c969feb7f25741406b217d8)
 crates = elm-effect elm-effect-schema elm-effect-elm elm-effect-journal
 paths = Cargo.toml src/
-license = MIT (declared in each crate's Cargo.toml)
-replace_with = git = "<remote>", rev = "<rev>" once elm-effect-rs has a remote; then delete this directory
+license = MIT (upstream LICENSE; Effect's notice in upstream NOTICE)
+policy = stay vendored (captain 2026-10-11): the copy + MANIFEST hash check is the build input; upstream_url@rev is its provenance
