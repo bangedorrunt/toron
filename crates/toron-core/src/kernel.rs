@@ -31,9 +31,11 @@
 /// The elm-effect-rs commit the vendored crates were taken from. Must equal
 /// `rev` in `vendor/elm-effect/VENDORED_FROM` (checked by
 /// `tests/kernel_port.rs` and `scripts/verify-vendor-elm-effect.sh`).
-pub const ELM_EFFECT_REV: &str = "604688cedf6dc9ec7600f34f0efa790ad6b4ef8e";
+pub const ELM_EFFECT_REV: &str = "49f01a091c8844a5abd7bfa3666c610e6d87c7ef";
 
-pub use elm_effect::{Cause, Effect, Exit, ManagedRuntime};
+pub use elm_effect::{
+    BuiltServices, Cause, Defect, Effect, Exit, Layer, ManagedRuntime, ServiceTag, use_service,
+};
 pub use elm_effect_elm::replay::{Player, Snapshot};
 pub use elm_effect_elm::{
     Boot, Cmd, Durability, Failure, Interpret, InterpretError, Loop, Producer, Program, Subscriber,

@@ -149,9 +149,29 @@
       "args": "replay, fork",
       "description": "Run-state checkpoints (ADR-0035): read one boundary's model and its pending-write set, or render what a fork from it WOULD do. Read-only and CLI-only: nothing here seeds a live model from the log",
       "name": "run-state"
+    },
+    {
+      "args": "--project <PROJECT>, --as <WHO>, --stream <STREAM>, --peek",
+      "description": "Read your inbox past your cursor (commits cursor + Delivered in one transaction; --peek commits neither)",
+      "name": "next"
+    },
+    {
+      "args": "<msg>, <verdict>, --reason <REASON>, --project <PROJECT>, --as <WHO>",
+      "description": "Accept or refuse a delivered message (Delivered -> Acknowledged|Rejected)",
+      "name": "ack"
+    },
+    {
+      "args": "<task>, --evidence <EVIDENCE>, --project <PROJECT>, --as <WHO>",
+      "description": "Finish a task you hold, with evidence (Acknowledged -> Acted)",
+      "name": "done"
+    },
+    {
+      "args": "append, send",
+      "description": "Inbox plumbing: `append` (fixture door, one envelope straight to the log) and `send` (journal first through the outbox loop, with recovery)",
+      "name": "inbox"
     }
   ],
-  "generated_at": "2026-10-06T02:41:40Z",
+  "generated_at": "2026-10-11T09:15:21Z",
   "resources": [
     {
       "description": "List projects known to toron.",

@@ -6,7 +6,7 @@
 # MANIFEST.sha256 with the script's --regen mode.
 upstream = elm-effect-rs
 upstream_location = mikasa:~/workspace/elm-effect-rs (local-only, no remote yet)
-rev = 604688cedf6dc9ec7600f34f0efa790ad6b4ef8e
+rev = 49f01a091c8844a5abd7bfa3666c610e6d87c7ef
 branch = phase0/journal-wire-epoch-fence
 crates = elm-effect elm-effect-schema elm-effect-elm elm-effect-journal
 paths = Cargo.toml src/

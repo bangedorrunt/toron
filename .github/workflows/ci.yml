@@ -41,6 +41,30 @@ jobs:
       - name: cargo fmt --check
         run: cargo fmt --check
 
+  # ADR-0041: the Lean model of the comms log + delivery FSM. Proves P1/P2,
+  # regenerates the vectors and checks the committed copies match, so the
+  # Rust tests (tests/proto_vectors.rs) never run against stale vectors.
+  lean:
+    name: Lean proto (lake build + vector freshness)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: proto
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install elan (toolchain from proto/lean-toolchain)
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh | sh -s -- -y --default-toolchain none
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+      - name: lake build (theorems, no sorry)
+        run: |
+          lake build 2>&1 | tee build.log
+          ! grep -n "declaration uses 'sorry'" build.log
+      - name: delivery vectors are fresh
+        run: lake exe proto vectors --check vectors/delivery.jsonl
+      - name: log traces are fresh
+        run: lake exe proto log-traces --check vectors/log_traces.jsonl
+
   e2e-p1:
     name: toron-e2e P1 gate (requires herdr stack on runner)
     continue-on-error: true

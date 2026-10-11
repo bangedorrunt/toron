@@ -3,7 +3,7 @@ c985afb54b98d1a02e474a46375a017737d20b0a2404e36102166d01dcfac4eb  crates/elm-eff
 f1a2c5b085bfeae400fd19d102381051a6e714247eb416867d3e35cf82e08508  crates/elm-effect-elm/src/lints.rs
 8d985213ee7b343d081ce09eff06fa321b50068ea6c842116879a2427e2292df  crates/elm-effect-elm/src/replay.rs
 18b708e3cf396fd278112a99aed2cdbf214e880d6e6f4a2cbe885f8b68b0fdde  crates/elm-effect-journal/Cargo.toml
-6e16d59b2ccff3da8c3c8f3409bc14b07cbfe8e390f073cdf8f77661f0282e40  crates/elm-effect-journal/src/durable_log.rs
+898cc6670a4dc3974f5462241cac28f1421c92925d51c103f994172a33ff1b6b  crates/elm-effect-journal/src/durable_log.rs
 2757e9e3d28bfccd39f0c49d617bae90f9f83d501f3fc3a5ca7a1fa0c5378961  crates/elm-effect-journal/src/epoch.rs
 fabf278e99e8b59e0a5eddb39bad5eab6783e52f6f51c2c6000f6a063f76eb68  crates/elm-effect-journal/src/laws.rs
 e5bb0e39ea81d1e798295cfc7fae5d560daf7c97034f25a3f5693d9f8643b65b  crates/elm-effect-journal/src/lib.rs
