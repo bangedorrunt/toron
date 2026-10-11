@@ -1,0 +1,14 @@
+# governed-by: ADR-0040
+# Vendored elm-effect-rs crates for toron's comms kernel (toron_core::kernel).
+# Machine-checked by scripts/verify-vendor-elm-effect.sh (CI gates) and
+# crates/toron-core/tests/kernel_port.rs (cargo test). Do not edit files
+# under crates/ by hand: re-vendor from a new rev and regenerate
+# MANIFEST.sha256 with the script's --regen mode.
+upstream = elm-effect-rs
+upstream_location = mikasa:~/workspace/elm-effect-rs (local-only, no remote yet)
+rev = 604688cedf6dc9ec7600f34f0efa790ad6b4ef8e
+branch = phase0/journal-wire-epoch-fence
+crates = elm-effect elm-effect-schema elm-effect-elm elm-effect-journal
+paths = Cargo.toml src/
+license = MIT (declared in each crate's Cargo.toml)
+replace_with = git = "<remote>", rev = "<rev>" once elm-effect-rs has a remote; then delete this directory
