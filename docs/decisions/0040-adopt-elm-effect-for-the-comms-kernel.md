@@ -57,18 +57,18 @@ Only through `toron_core::kernel` (re-exports, no wrappers):
 
 ## 5. Pinning
 
-- **Now (no remote):** the four crates elm-effect-rs needs to build the two (`elm-effect`, `elm-effect-schema`, `elm-effect-elm`, `elm-effect-journal`; `Cargo.toml` + `src/` only) are vendored under `vendor/elm-effect/crates/` at `ELM_EFFECT_REV`. `vendor/elm-effect/VENDORED_FROM` names the rev; `MANIFEST.sha256` lists every byte.
-  - `scripts/verify-vendor-elm-effect.sh` (run by `scripts/verify-gates.sh`, so by CI) checks integrity against the manifest, agreement with `kernel::ELM_EFFECT_REV`, and — when an elm-effect-rs checkout holding the rev is reachable — provenance against `git archive <rev>`. `ELM_EFFECT_REQUIRE_PROVENANCE=1` makes a missing upstream a failure (use it on mikasa).
+- **Vendored, with public provenance:** the four crates elm-effect-rs needs to build the two (`elm-effect`, `elm-effect-schema`, `elm-effect-elm`, `elm-effect-journal`; `Cargo.toml` + `src/` only) are vendored under `vendor/elm-effect/crates/` at `ELM_EFFECT_REV`. `vendor/elm-effect/VENDORED_FROM` names the rev; `MANIFEST.sha256` lists every byte.
+  - `scripts/verify-vendor-elm-effect.sh` (run by `scripts/verify-gates.sh`, so by CI) checks integrity against the manifest, agreement with `kernel::ELM_EFFECT_REV`, and provenance against `git archive <rev>`: from a local elm-effect-rs checkout when one holds the rev, otherwise by fetching exactly that rev from `upstream_url` (https://github.com/bangedorrunt/elm-effect-rs, public since 2026-10-11), so CI verifies provenance too. `ELM_EFFECT_REQUIRE_PROVENANCE=1` makes an unreachable upstream a failure.
   - `tests/kernel_port.rs` repeats the integrity and pin-agreement checks inside `cargo test`, with a tampered/missing/extra negative control.
   - The vendored tree is excluded from the toron workspace (`exclude = ["vendor"]`): not linted, formatted or tested as toron code. It contains `unsafe` in the carrier; ADR-0003's `forbid(unsafe_code)` binds toron's crates, and `verify-gates.sh` still scans only `crates/`.
   - `vendor/elm-effect/**` is **not** declared `linguist-generated`: the strict commit guard refuses a projected-path declaration over compiled source, and toron-core builds these crates. A vendor bump therefore goes through the normal bead-hunk rule (upstream `bd-*` tokens added by a bump must be attributed in the commit message).
-- **Later (remote exists):** replace the path deps with `git = "<remote>", rev = "<sha>"` and delete `vendor/elm-effect/`. A floating branch stays forbidden (elm-effect-rs ADR-0002 :692); a pinned rev is not floating.
+- **Stays vendored (captain, 2026-10-11):** elm-effect-rs is public, but the vendored copy plus the manifest hash check remains the build input; `VENDORED_FROM` cites `upstream_url` + `rev`. A git dependency would add a network fetch to every toron build for no extra integrity. A floating branch stays forbidden (elm-effect-rs ADR-0002 :692).
 - **Bumps** are dedicated changes: re-vendor, `--regen` the manifest, update `ELM_EFFECT_REV`, and run the comms vector suite plus `durable_log_laws` on `ToronLog`.
 
 ## 6. Consequences
 
 - Better: one spelling of the journal states, `plan_attempt`, the L16 append rule and replay across elm-effect-rs, beads and toron; the F2 class of bug has a structural home (one interpreter, outcomes as messages, `Failure::NotAppended`).
-- Harder: toron now builds the elm-effect carrier (≈1.2 MB of source) and tracks a pre-1.0, single-maintainer, local-only framework. The vendored copy must be kept honest by the gate, and the upstream branch must land on elm-effect-rs `main` before a second bump.
+- Harder: toron now builds the elm-effect carrier (≈1.2 MB of source) and tracks a pre-1.0, single-maintainer framework. The vendored copy must be kept honest by the gate, Upstream revs must be on elm-effect-rs `main` before toron pins them.
 - Two kernel styles coexist (hand-written `*_core.rs` and `Program`) until touched cores migrate.
 
 ## 7. Verification
@@ -77,8 +77,8 @@ Only through `toron_core::kernel` (re-exports, no wrappers):
 - [x] `mbx test -p toron-core --test kernel_port --test kernel_fence` green, including both negative controls.
 - [x] `kernel::durable_log_laws::stale_epoch_is_fenced` passes through the port (`stale_epoch_is_fenced_through_the_kernel_port`).
 - [x] `bash scripts/verify-gates.sh` passes.
-- [ ] Phase 1: `ToronLog: DurableLog` passes `durable_log_laws::all`; loop-inside-Tokio test has no nested-runtime panic.
-- [ ] elm-effect-rs gains a remote; path deps become a git pin; `vendor/elm-effect/` is deleted.
+- [x] Phase 1: `ToronLog: DurableLog` passes `durable_log_laws::all`; loop-inside-Tokio test has no nested-runtime panic (toron#11).
+- [x] elm-effect-rs is public (https://github.com/bangedorrunt/elm-effect-rs); the vendored rev `49f01a0` is on its `main` (#2, merge `6d8e95d`); provenance is fetched from the public URL when no local checkout holds the rev. The copy stays vendored (§5).
 
 ## 8. Status log
 
