@@ -66,6 +66,12 @@ if ! bash scripts/verify-workspace-clean.sh; then
     fail=1
 fi
 
+# 6. Vendored elm-effect pin (ADR-0040): manifest integrity, kernel rev
+#    agreement, and provenance when an elm-effect-rs checkout is reachable.
+if ! bash scripts/verify-vendor-elm-effect.sh; then
+    fail=1
+fi
+
 if [ "$fail" -ne 0 ]; then
     echo "GATE FAILED" >&2
     exit 1

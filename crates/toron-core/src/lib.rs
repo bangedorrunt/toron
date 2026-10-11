@@ -1,4 +1,4 @@
-// governed-by: ADR-0003
+// governed-by: ADR-0003, ADR-0040
 #![forbid(unsafe_code)]
 
 pub mod archive;
@@ -9,6 +9,7 @@ pub mod config;
 pub mod dispatch_core;
 pub mod index;
 pub mod jsonl;
+pub mod kernel;
 pub mod keys;
 pub mod mailbox;
 pub mod nostr;

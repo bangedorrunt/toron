@@ -1,6 +1,6 @@
 <!-- governed-by: ADR-0003, ADR-0014, ADR-0017, ADR-0018, ADR-0033 -->
 ---
-status: proposed
+status: accepted
 date: 2026-09-29
 decision-makers: bangedorrunt
 consulted: bd-j5sk live measurement (2026-09-28) + bd-0tbg live board measurement (2026-09-29)
@@ -9,7 +9,7 @@ informed: flywheel x toron x beads maintainers
 
 # ADR-0037: One Key per Pin — Project-Scoped Visibility, Not Project-Scoped Keys
 
-**Status:** Proposed. The decision below is mine to propose, not to accept: the security trade in §6.1 is a real loosening and belongs to the operator. bd-j5sk stays open until it is accepted and the migration in §5 lands.
+**Status:** Accepted — captain word 2026-10-11 18:44 AEDT, relayed by the flywheel bot for the stack-comms build (factory task `23283d6f`), as a hard prerequisite of the comms redesign (redesign §5, §11 Phase 0). The operator accepts the §6.1 blast-radius trade. Acceptance cuts the §7.1 waves as beads; bd-j5sk stays open until W1–W4 land and the §5 migration runs. Implementation status at acceptance: W1–W5 not started (see §10).
 
 **Decision in one sentence:** An agent pin resolves to exactly ONE key across every project it is registered in, and the project becomes a property of the *message* (already carried on the rumor's `t` tag) rather than of the *key*, so `mail send --to <pin>` is deliverable in any project without the recipient ever needing an npub.
 
@@ -261,3 +261,4 @@ Reopen this ADR if any of these becomes true:
 ## 10. Status log
 
 - **2026-09-29 — proposed.** Drafted from bd-j5sk's live measurement and bd-0tbg's board measurement. Not accepted: §6.1 is an operator decision. bd-j5sk stays open.
+- **2026-10-11 — accepted.** Captain word, relayed (stack-comms build, Phase 0). Verified at acceptance on `main` (`dd643ff`): W1–W5 are **not implemented** — `ambiguous_name_warning` and `name_across_projects` are still in `nostr/identity.rs` and `mailbox/messaging.rs`; none of the §8 test names exist (`agents_same_name_one_key`, `register_reuses_a_known_pins_key`, `register_without_possession_is_refused`, `cross_project_send_is_readable_by_the_recipient`, `qualified_address_resolves_and_unknown_project_fails`, `unknown_recipient_still_fails_loud`). Sequencing in the comms build plan: W1 (same-project uniqueness) is Phase 0 tail; W2–W4 land in Phase 1 beside the envelope, and are a hard gate for Phase 2 (`send --via-inbox` addresses npubs only); the §5.2 per-identity re-key needs the operator per pin and is scheduled, not automated.

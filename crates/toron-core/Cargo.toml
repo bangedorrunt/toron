@@ -1,4 +1,4 @@
-# governed-by: ADR-0003
+# governed-by: ADR-0003, ADR-0040
 [package]
 name = "toron-core"
 version = "1.5.0"
@@ -24,6 +24,12 @@ negentropy = "0.5"
 hex = "0.4"
 ed25519-dalek = { version = "2.2", features = ["rand_core"] }
 sha2 = "0.10"
+# Comms kernel (ADR-0040): elm-effect-rs Elm + journal layer, vendored at the
+# rev in vendor/elm-effect/VENDORED_FROM (hash-checked) until elm-effect-rs
+# has a remote; then `git = ..., rev = ...`. Only `kernel.rs` names these.
+elm-effect = { path = "../../vendor/elm-effect/crates/elm-effect" }
+elm-effect-elm = { path = "../../vendor/elm-effect/crates/elm-effect-elm" }
+elm-effect-journal = { path = "../../vendor/elm-effect/crates/elm-effect-journal" }
 
 [dev-dependencies]
 proptest = "1.11"

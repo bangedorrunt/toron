@@ -1,0 +1,52 @@
+// governed-by: ADR-0040, ADR-0035
+//! The comms kernel port: the ONE module in toron that names
+//! `elm_effect`, `elm_effect_elm` or `elm_effect_journal` (ADR-0040).
+//!
+//! Everything else in toron imports the Elm loop, the effect journal and the
+//! durable-log trait from here, so an upstream API move changes this file
+//! and the thin `Program` adapters, never the protocol code. The fence is
+//! `tests/kernel_fence.rs`: any other file under `crates/` that names an
+//! elm-effect crate, and any other crate manifest that depends on one,
+//! fails the build.
+//!
+//! What is re-exported is the Elm + journal layer only (ADR-0040 §3):
+//! - the loop: [`Program`], [`Update`], [`Cmd`], [`Durability`],
+//!   [`Failure`], [`Interpret`], [`Loop`], [`Producer`], [`Subscriber`],
+//!   [`Boot`], replay [`Player`] and [`Snapshot`];
+//! - the journal: [`EffectState`], [`can_transition`], [`JournalStore`],
+//!   [`plan_attempt`], [`plan_park`], [`may_settle`];
+//! - the L16 log: [`DurableLog`], [`Offset`], [`ProducerId`],
+//!   [`AppendError`] (with `StaleEpoch`), and [`durable_log_laws`] so
+//!   toron's own log runs the upstream trait laws;
+//! - from the carrier, only what an `Interpret` impl and a host need to
+//!   name: [`Effect`], [`Exit`], [`Cause`], [`ManagedRuntime`]. Carrier
+//!   combinators (race, timeout, schedule, stm, ...) are deliberately NOT
+//!   re-exported: protocol code stays pure `std + serde` (ADR-0040 §4).
+//!
+//! `Loop` is `!Send`: host one per dedicated OS thread and pump inputs
+//! through a channel into `Loop::send`. A `DurableLog` over toron's async
+//! sqlx store answers through a request/reply channel; it never calls
+//! `block_on` inside a Tokio context (the F2 nested-runtime panic).
+
+/// The elm-effect-rs commit the vendored crates were taken from. Must equal
+/// `rev` in `vendor/elm-effect/VENDORED_FROM` (checked by
+/// `tests/kernel_port.rs` and `scripts/verify-vendor-elm-effect.sh`).
+pub const ELM_EFFECT_REV: &str = "604688cedf6dc9ec7600f34f0efa790ad6b4ef8e";
+
+pub use elm_effect::{Cause, Effect, Exit, ManagedRuntime};
+pub use elm_effect_elm::replay::{Player, Snapshot};
+pub use elm_effect_elm::{
+    Boot, Cmd, Durability, Failure, Interpret, InterpretError, Loop, Producer, Program, Subscriber,
+    Update,
+};
+pub use elm_effect_journal::durable_log::{
+    AppendError, DurableLog, MemLog, Offset, ProducerId, SCHEMA_VERSION,
+};
+pub use elm_effect_journal::epoch::{EpochLog, Fence};
+pub use elm_effect_journal::laws as durable_log_laws;
+pub use elm_effect_journal::plan::{
+    DispatchPlan, EffectView, ParkDecision, ProviderCapability, may_settle, plan_attempt, plan_park,
+};
+pub use elm_effect_journal::store::{InMemoryStore, JournalStore};
+pub use elm_effect_journal::stream::Gone;
+pub use elm_effect_journal::{EffectState, TransitionError, can_transition, transition};

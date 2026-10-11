@@ -920,6 +920,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "elm-effect"
+version = "0.1.0"
+dependencies = [
+ "thiserror 1.0.69",
+ "tokio",
+]
+
+[[package]]
+name = "elm-effect-elm"
+version = "0.1.0"
+dependencies = [
+ "elm-effect",
+ "elm-effect-journal",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "elm-effect-journal"
+version = "0.1.0"
+dependencies = [
+ "elm-effect",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "encoding_rs"
 version = "0.8.35"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3882,6 +3911,9 @@ dependencies = [
  "async-trait",
  "chrono",
  "ed25519-dalek",
+ "elm-effect",
+ "elm-effect-elm",
+ "elm-effect-journal",
  "futures-util",
  "git2",
  "hex",
