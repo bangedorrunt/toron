@@ -54,6 +54,7 @@ where
 
 pub mod aliases;
 pub mod build_slots;
+pub mod comms;
 pub mod contacts;
 pub mod envelope;
 pub mod error;

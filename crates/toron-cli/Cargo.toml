@@ -34,6 +34,11 @@ reqwest = { version = "0.13", features = ["blocking"] }
 ratatui = "0.29"
 crossterm = "0.28"
 
+[features]
+# ADR-0041 live test (c) only: `TORON_FAULT=after_intent|after_append`
+# aborts `toron inbox send` at that point. Never in a release build.
+fault-injection = ["toron-core/fault-injection"]
+
 [dev-dependencies]
 uuid = { version = "1", features = ["v4"] }
 sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio"] }

@@ -204,6 +204,108 @@ pub enum Command {
     /// and CLI-only: nothing here seeds a live model from the log.
     #[command(subcommand)]
     RunState(RunStateCommand),
+
+    // --- comms inbox (ADR-0041): CLI-only verbs over the shared durable
+    // root, behind TORON_COMMS_INBOX. No new MCP tool.
+    /// Read your inbox past your cursor (commits cursor + Delivered in one
+    /// transaction; --peek commits neither).
+    Next(NextArgs),
+
+    /// Accept or refuse a delivered message (Delivered -> Acknowledged|Rejected).
+    Ack(AckArgs),
+
+    /// Finish a task you hold, with evidence (Acknowledged -> Acted).
+    Done(DoneArgs),
+
+    /// Inbox plumbing: `append` (fixture door, one envelope straight to the
+    /// log) and `send` (journal first through the outbox loop, with recovery).
+    #[command(subcommand)]
+    Inbox(InboxCommand),
+}
+
+/// `toron next` (ADR-0041).
+#[derive(Debug, clap::Args)]
+pub struct NextArgs {
+    /// Project slug (used to resolve --as).
+    #[arg(long, required = true)]
+    pub project: String,
+    /// Reader: agent name in the project, or a 64-hex npub.
+    #[arg(long = "as", required = true)]
+    pub who: String,
+    /// Stream to read (defaults to the reader's own npub). Another npub's
+    /// stream is refused (not_recipient).
+    #[arg(long)]
+    pub stream: Option<String>,
+    /// Show without committing the cursor or Delivered.
+    #[arg(long)]
+    pub peek: bool,
+}
+
+/// `toron ack` (ADR-0041).
+#[derive(Debug, clap::Args)]
+pub struct AckArgs {
+    /// Message key `producer:epoch:seq` (from `toron next`).
+    pub msg: String,
+    /// accept | reject
+    #[arg(value_parser = ["accept", "reject"])]
+    pub verdict: String,
+    /// Reason (required for reject).
+    #[arg(long)]
+    pub reason: Option<String>,
+    /// Project slug (used to resolve --as).
+    #[arg(long, required = true)]
+    pub project: String,
+    /// Recipient: agent name or 64-hex npub.
+    #[arg(long = "as", required = true)]
+    pub who: String,
+}
+
+/// `toron done` (ADR-0041).
+#[derive(Debug, clap::Args)]
+pub struct DoneArgs {
+    /// Task id carried on the envelope.
+    pub task: String,
+    /// Evidence (repeatable): paths, commit SHAs, test output refs.
+    #[arg(long, required = true)]
+    pub evidence: Vec<String>,
+    /// Project slug (used to resolve --as).
+    #[arg(long, required = true)]
+    pub project: String,
+    /// Holder: agent name or 64-hex npub.
+    #[arg(long = "as", required = true)]
+    pub who: String,
+}
+
+/// `toron inbox` (ADR-0041).
+#[derive(Debug, Subcommand)]
+pub enum InboxCommand {
+    /// Append one envelope JSON file to the inbox log (validated; same
+    /// msg id twice replays the same offset).
+    Append(InboxAppendArgs),
+    /// Send through the outbox loop: journal the intent, then append; first
+    /// reconciles any of this sender's intents a crashed run left behind.
+    /// Without --file it only recovers.
+    Send(InboxSendArgs),
+}
+
+#[derive(Debug, clap::Args)]
+pub struct InboxSendArgs {
+    /// Envelope JSON file (`-` for stdin); omit to only recover.
+    #[arg(long)]
+    pub file: Option<String>,
+    /// Project slug (used to resolve --as).
+    #[arg(long, required = true)]
+    pub project: String,
+    /// Sender: agent name or 64-hex npub (must be the envelope's `from`).
+    #[arg(long = "as", required = true)]
+    pub who: String,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct InboxAppendArgs {
+    /// Envelope JSON file (`-` for stdin).
+    #[arg(long, required = true)]
+    pub file: String,
 }
 
 /// `toron run-state` (ADR-0035, spec S8). Read-only half of the checkpoint
