@@ -7,9 +7,10 @@
 #   2. pin agreement: toron_core::kernel::ELM_EFFECT_REV == VENDORED_FROM rev;
 #   3. provenance: when an elm-effect-rs checkout holding that rev is
 #      reachable (ELM_EFFECT_RS_DIR, default ../elm-effect-rs), the vendored
-#      bytes equal `git archive <rev>` of the same paths. Skipped (and said
-#      so) when upstream is absent, e.g. on CI until elm-effect-rs has a
-#      remote; ELM_EFFECT_REQUIRE_PROVENANCE=1 turns the skip into a failure.
+#      bytes equal `git archive <rev>` of the same paths. With no local
+#      checkout (CI), exactly that rev is fetched from VENDORED_FROM's
+#      upstream_url (public). Skipped (and said so) only when neither is
+#      reachable; ELM_EFFECT_REQUIRE_PROVENANCE=1 turns the skip into a failure.
 #
 #   --regen  rewrite MANIFEST.sha256 from the vendored files (after a
 #            deliberate re-vendor only).
@@ -58,6 +59,15 @@ else
 fi
 
 UP="${ELM_EFFECT_RS_DIR:-$ROOT/../elm-effect-rs}"
+url="$(sed -n 's/^upstream_url = //p' "$V/VENDORED_FROM")"
+if ! git -C "$UP" cat-file -e "$rev^{commit}" 2>/dev/null && [ -n "$url" ]; then
+    # No local checkout holds the rev: fetch exactly that commit from the
+    # public upstream (CI path). A fetch failure falls through to skip/fail.
+    UP="$(mktemp -d)/elm-effect-rs"
+    if git init -q "$UP" && git -C "$UP" fetch -q --depth 1 "$url" "$rev" 2>/dev/null; then
+        echo "fetched $url@${rev:0:12} for provenance"
+    fi
+fi
 if git -C "$UP" cat-file -e "$rev^{commit}" 2>/dev/null; then
     tmp="$(mktemp -d)"
     trap 'rm -rf "$tmp"' EXIT
