@@ -113,6 +113,8 @@ pub enum StrictBlockKind {
     HeldBy(String),
     /// Staged but covered by no active reservation at all.
     Unreserved,
+    /// The staged paths' packages do not build (bd-26yr).
+    BuildFailed(String),
 }
 
 /// One strict-guard violation: the offending path + why it blocked.
@@ -591,6 +593,213 @@ pub fn staged_paths(repo: &git2::Repository) -> Vec<String> {
 /// open/index errors — the guard never fails a commit on unreadable state).
 pub fn staged_paths_in(repo_path: &Path) -> Vec<String> {
     git2::Repository::open(repo_path).map_or_else(|_| Vec::new(), |repo| staged_paths(&repo))
+}
+
+// ---------------------------------------------------------------------------
+// bd-26yr build gate: a commit that does not build breaks every other agent's
+// fence, because they share one repository and one target dir. Measured on the
+// elm-effect-rs port: five separate incidents in one session, each from work
+// that was never built before it was committed, each reddening `cargo test -p
+// elm-effect` for BOTH crews.
+// ---------------------------------------------------------------------------
+
+/// Seconds a build gate pass may take before it gives up. Generous, because the
+/// point is to catch a genuinely broken tree rather than to race a cold build,
+/// but bounded, because a pre-commit hook that hangs is worse than one that
+/// passes.
+pub const BUILD_GATE_TIMEOUT_SECS: u64 = 180;
+
+/// The cargo packages the staged paths belong to, in first-seen order.
+///
+/// A path resolves by walking up to the nearest `Cargo.toml` and reading its
+/// `[package] name`, so it works for any workspace layout and for a crate that
+/// is not under `crates/`. A path with no `Cargo.toml` above it contributes
+/// nothing, so a repository that is not a Rust project gates nothing.
+pub fn cargo_packages_for_staged(repo: &Path, staged: &[String]) -> Vec<String> {
+    let mut packages: Vec<String> = Vec::new();
+    for path in staged {
+        // A Cargo.toml itself names its own package, which the same walk finds.
+        let mut cursor = repo.join(path);
+        if cursor.is_file() {
+            cursor = match cursor.parent() {
+                Some(parent) => parent.to_path_buf(),
+                None => continue,
+            };
+        }
+        let Some(name) = package_name_at_or_above(repo, &cursor) else {
+            continue;
+        };
+        if !packages.contains(&name) {
+            packages.push(name);
+        }
+    }
+    packages
+}
+
+/// The `[package] name` of the nearest `Cargo.toml` at or above `from`, staying
+/// inside `repo`.
+fn package_name_at_or_above(repo: &Path, from: &Path) -> Option<String> {
+    let mut cursor = from.to_path_buf();
+    loop {
+        let manifest = cursor.join("Cargo.toml");
+        if manifest.is_file() {
+            if let Some(name) = package_name_in_manifest(&manifest) {
+                return Some(name);
+            }
+            // A workspace manifest with no `[package]` is a container: keep
+            // walking so a member crate nested under it still resolves.
+        }
+        if cursor == repo {
+            return None;
+        }
+        cursor = cursor.parent()?.to_path_buf();
+    }
+}
+
+/// The `name = "..."` under the first `[package]` table in a manifest. A plain
+/// line scan, because the guard has no toml dependency and needs one field.
+fn package_name_in_manifest(manifest: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(manifest).ok()?;
+    let mut in_package = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            in_package = trimmed == "[package]";
+            continue;
+        }
+        if in_package {
+            if let Some(rest) = trimmed.strip_prefix("name") {
+                let rest = rest.trim_start();
+                if let Some(quoted) = rest.strip_prefix('=') {
+                    let value = quoted.trim().trim_matches('"').trim_matches('\'');
+                    if !value.is_empty() {
+                        return Some(value.to_string());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// The staged paths' packages do not build (bd-26yr). Returns one block naming
+/// the first failing package and the error line that proves it, so the message
+/// an agent reads is the one they need to act on rather than a bare exit code.
+///
+/// A repository that is not a Rust project, or one with no `cargo` on PATH,
+/// gates nothing. A build that cannot finish inside
+/// [`BUILD_GATE_TIMEOUT_SECS`] gives up rather than blocking the commit: the
+/// target-dir lock is shared, so another agent's concurrent build can hold it,
+/// and blocking on that would punish the wrong commit.
+pub fn build_gate_blocks(repo: &Path, staged: &[String]) -> Vec<StrictBlock> {
+    let packages = cargo_packages_for_staged(repo, staged);
+    if packages.is_empty() {
+        return Vec::new();
+    }
+    if which("cargo").is_none() {
+        return Vec::new();
+    }
+    let mut command = std::process::Command::new("cargo");
+    command.arg("build");
+    for package in &packages {
+        command.arg("-p").arg(package);
+    }
+    command.current_dir(repo);
+    command.env("CARGO_TERM_COLOR", "never");
+    command.env("CARGO_TERM_PROGRESS_WHEN", "never");
+    // A pre-commit hook must never read stdin: git gives it the terminal, and a
+    // cargo prompt there would hang the commit forever.
+    command.stdin(std::process::Stdio::null());
+    command.stdout(std::process::Stdio::piped());
+    command.stderr(std::process::Stdio::piped());
+
+    let Ok(mut child) = command.spawn() else {
+        return Vec::new();
+    };
+    // Read both pipes while polling, so a child that fills a pipe buffer cannot
+    // deadlock the gate against itself.
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let tx_err = tx.clone();
+    std::thread::spawn(move || {
+        if let Some(mut pipe) = stdout {
+            use std::io::Read;
+            let mut buffer = String::new();
+            let _ = pipe.read_to_string(&mut buffer);
+            let _ = tx.send(buffer);
+        }
+    });
+    std::thread::spawn(move || {
+        if let Some(mut pipe) = stderr {
+            use std::io::Read;
+            let mut buffer = String::new();
+            let _ = pipe.read_to_string(&mut buffer);
+            let _ = tx_err.send(buffer);
+        }
+    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(BUILD_GATE_TIMEOUT_SECS);
+    let mut output = String::new();
+    while std::time::Instant::now() < deadline {
+        match rx.try_recv() {
+            Ok(chunk) => output.push_str(&chunk),
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                match child.try_wait() {
+                    // Both pipes closed and the child exited: drain and stop.
+                    Ok(Some(_)) if output.contains('\0') || true => {
+                        while let Ok(chunk) = rx.try_recv() {
+                            output.push_str(&chunk);
+                        }
+                        break;
+                    }
+                    Ok(Some(_)) => break,
+                    // Still running.
+                    Ok(None) => std::thread::sleep(std::time::Duration::from_millis(50)),
+                    Err(_) => break,
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    let exited = matches!(child.try_wait(), Ok(Some(_)));
+    if !exited {
+        // Give the build a bounded grace period to exit after the deadline, then
+        // stop waiting rather than blocking the commit.
+        let _ = child.wait();
+    }
+
+    let failures = error_lines(&output);
+    if failures.is_empty() {
+        return Vec::new();
+    }
+    vec![StrictBlock {
+        path: format!("cargo build {}", packages.join(" ")),
+        kind: StrictBlockKind::BuildFailed(failures.into_iter().next().unwrap_or_default()),
+    }]
+}
+
+/// The first `error[..]`/`error:` lines of a cargo build, capped so a commit is
+/// never refused by a wall of text.
+fn error_lines(output: &str) -> Vec<String> {
+    output
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("error"))
+        .take(3)
+        .map(str::to_string)
+        .collect()
+}
+
+/// Whether `program` resolves on PATH, without pulling in a dependency for it.
+fn which(program: &str) -> Option<std::path::PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path) {
+        let candidate = dir.join(program);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------

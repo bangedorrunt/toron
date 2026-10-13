@@ -2109,6 +2109,12 @@ pub fn guard_check_verdict(
     let projected_paths = toron_core::mailbox::guard::projected_paths_in(repo);
     let projected_fault = toron_core::mailbox::guard::projected_decl_fault(repo, &projected_paths);
 
+    // bd-26yr build gate: the staged paths' packages must build. Runs LAST,
+    // because a build over a broken reservation is not the reservation's fault
+    // and the reservation message is the one the agent needs first.
+    let mut blocked = blocked;
+    blocked.extend(toron_core::mailbox::guard::build_gate_blocks(repo, staged));
+
     let mut notices: Vec<String> = Vec::new();
     if let Some(fault) = &projected_fault {
         notices.push(format!(
@@ -2139,6 +2145,9 @@ pub fn guard_check_verdict(
                 StrictBlockKind::HeldBy(h) => format!("{} (held by {h})", b.path),
                 StrictBlockKind::Unreserved => format!("{} (no active reservation)", b.path),
                 StrictBlockKind::Unattributed => b.path.clone(),
+                StrictBlockKind::BuildFailed(first) => {
+                    format!("BUILD FAILED: `{}` — {}", b.path, first)
+                }
             })
             .collect();
         notices.push(if agent.is_none() {
@@ -2165,9 +2174,10 @@ pub fn guard_check_verdict(
         "blocked": blocked.iter().map(|b| json!({
             "path": b.path,
             "reason": match &b.kind {
-                StrictBlockKind::Unattributed => "unattributed",
-                StrictBlockKind::HeldBy(_) => "held-by",
-                StrictBlockKind::Unreserved => "unreserved",
+                StrictBlockKind::Unattributed => "unattributed".to_string(),
+                StrictBlockKind::HeldBy(_) => "held-by".to_string(),
+                StrictBlockKind::Unreserved => "unreserved".to_string(),
+                StrictBlockKind::BuildFailed(first) => format!("build-failed: {first}"),
             },
             "holder": match &b.kind {
                 StrictBlockKind::HeldBy(h) => Some(h),
