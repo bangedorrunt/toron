@@ -79,6 +79,24 @@ CREATE TABLE IF NOT EXISTS bus_event_tags (
 CREATE INDEX IF NOT EXISTS bus_event_tags_kind_value ON bus_event_tags (tag_kind, tag_value);
 ";
 
+/// Arrival log (bd-wake-live-burst-loss-j86v, bd-wake-replay-cap-qk8n): one
+/// row per stored event, numbered in commit order. `AUTOINCREMENT` makes the
+/// sequence strictly monotonic and never reused, unlike `rowid`, which an
+/// addressable supersede (delete-then-insert of the newest row) can recycle.
+/// The wake socket's resume cursor is this sequence: `created_at` is protocol
+/// metadata (second resolution, randomized for gift wraps) and cannot order
+/// arrivals.
+pub const EVENT_ARRIVAL_DDL: &str = "
+CREATE TABLE IF NOT EXISTS bus_arrivals (
+    seq      INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id TEXT NOT NULL UNIQUE
+);
+";
+
+/// `bus_meta` key: the highest arrival seq the cap has evicted. A wake cursor
+/// below it may have lost rows, and is told so with an `events_lost` frame.
+pub const ARRIVALS_EVICTED_KEY: &str = "arrivals_evicted_hwm";
+
 /// bd-3gwy: entry cap for the per-filter snapshot memo. Fleet polling
 /// rotates dozens of distinct inbox filters; 64 slots keeps every active
 /// filter's matched-id list warm. Overflow evicts the oldest entry.
@@ -167,6 +185,10 @@ pub struct BusEventStore {
     parsed_rows: Arc<AtomicU64>,
     hot_hits: Arc<AtomicU64>,
     sql_scans: Arc<AtomicU64>,
+    /// Highest `bus_events.rowid` already given an arrival seq. Rows past it
+    /// were written by a binary that predates the arrival log and are healed
+    /// in on the next arrival read (see [`Self::heal_arrivals`]).
+    healed_rowid: Arc<std::sync::atomic::AtomicI64>,
 }
 
 impl BusEventStore {
@@ -175,14 +197,108 @@ impl BusEventStore {
         sqlx::raw_sql(EVENT_TABLE_DDL).execute(&pool).await?;
         sqlx::raw_sql(EVENT_TAG_TABLE_DDL).execute(&pool).await?;
         Self::backfill_tag_index(&pool).await?;
-        Ok(Self {
+        sqlx::raw_sql(EVENT_ARRIVAL_DDL).execute(&pool).await?;
+        let store = Self {
             pool,
             hot: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             snaps: Arc::new(parking_lot::Mutex::new(SnapMemos::default())),
             parsed_rows: Arc::new(AtomicU64::new(0)),
             hot_hits: Arc::new(AtomicU64::new(0)),
             sql_scans: Arc::new(AtomicU64::new(0)),
-        })
+            healed_rowid: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+        };
+        // Number every row that predates the arrival log, in arrival
+        // (rowid) order, so a resume cursor can reach all of them.
+        store.heal_arrivals().await?;
+        Ok(store)
+    }
+
+    /// Give an arrival seq to every stored event that lacks one, in rowid
+    /// order. Rows written by this binary already have one (same
+    /// transaction as the insert); this covers rows from an older binary on
+    /// the same file. Cost is proportional to rows past the last heal.
+    pub(crate) async fn heal_arrivals(&self) -> anyhow::Result<()> {
+        use std::sync::atomic::Ordering;
+        let max_rowid: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(rowid), 0) FROM bus_events")
+            .fetch_one(&self.pool)
+            .await?;
+        let healed = self.healed_rowid.load(Ordering::Acquire);
+        if max_rowid <= healed {
+            return Ok(());
+        }
+        sqlx::query(
+            "INSERT OR IGNORE INTO bus_arrivals (event_id)
+             SELECT event_id FROM bus_events WHERE rowid > ?1 ORDER BY rowid ASC",
+        )
+        .bind(healed)
+        .execute(&self.pool)
+        .await?;
+        self.healed_rowid.fetch_max(max_rowid, Ordering::AcqRel);
+        Ok(())
+    }
+
+    /// Stored events with an arrival seq strictly after `after`, oldest
+    /// first, at most `limit` rows, restricted to `kinds` (empty = all) and
+    /// to unexpired rows. Paging with the last returned seq walks the whole
+    /// history; no newest-N window applies.
+    pub async fn arrivals_after(
+        &self,
+        kinds: &[u16],
+        after: u64,
+        limit: usize,
+    ) -> anyhow::Result<Vec<(u64, Event)>> {
+        self.heal_arrivals().await?;
+        let kind_pred = if kinds.is_empty() {
+            String::new()
+        } else {
+            let ph: Vec<String> = (0..kinds.len()).map(|i| format!("?{}", i + 4)).collect();
+            format!(" AND e.kind IN ({})", ph.join(","))
+        };
+        let sql = format!(
+            "SELECT a.seq, e.raw_json FROM bus_arrivals a
+             JOIN bus_events e ON e.event_id = a.event_id
+             WHERE a.seq > ?1 AND (e.expires_at IS NULL OR e.expires_at > ?2){kind_pred}
+             ORDER BY a.seq ASC LIMIT ?3"
+        );
+        let mut q = sqlx::query_as::<_, (i64, String)>(&sql)
+            .bind(i64::try_from(after).unwrap_or(i64::MAX))
+            .bind(Timestamp::now().as_secs() as i64)
+            .bind(i64::try_from(limit).unwrap_or(i64::MAX));
+        for k in kinds {
+            q = q.bind(i64::from(*k));
+        }
+        let rows = q.fetch_all(&self.pool).await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for (seq, raw) in rows {
+            match Event::from_json(&raw) {
+                Ok(ev) => out.push((seq as u64, ev)),
+                // A row we cannot parse is still an arrival: surface it in
+                // the log rather than pretend it never came.
+                Err(e) => tracing::warn!(seq, "unparseable stored event skipped: {e}"),
+            }
+        }
+        Ok(out)
+    }
+
+    /// The arrival seq of a stored event id, if it has one.
+    pub async fn arrival_seq_of(&self, event_id: &str) -> anyhow::Result<Option<u64>> {
+        self.heal_arrivals().await?;
+        let seq: Option<i64> =
+            sqlx::query_scalar("SELECT seq FROM bus_arrivals WHERE event_id = ?1")
+                .bind(event_id.to_ascii_lowercase())
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(seq.map(|s| s as u64))
+    }
+
+    /// Highest arrival seq the cap has evicted (0 = none).
+    pub async fn arrivals_evicted_through(&self) -> anyhow::Result<u64> {
+        let v: i64 =
+            sqlx::query_scalar("SELECT COALESCE((SELECT value FROM bus_meta WHERE key = ?1), 0)")
+                .bind(ARRIVALS_EVICTED_KEY)
+                .fetch_one(&self.pool)
+                .await?;
+        Ok(v.max(0) as u64)
     }
 
     /// Memoize a freshly stored event (bd-py9o). Clears wholesale at the cap.
@@ -253,6 +369,11 @@ impl BusEventStore {
     pub async fn insert(&self, event: &Event) -> anyhow::Result<bool> {
         let expires = event.tags.expiration().map(|t| t.as_secs() as i64);
         let d_tag = crate::bus::AddressableKey::from_event(event).map(|k| k.d);
+        // One transaction: the row, its arrival seq and its tag index commit
+        // together, so a reader never sees a stored event without its place
+        // in arrival order, and seq order is commit order (the write lock is
+        // held from the first statement to commit).
+        let mut tx = self.pool.begin().await?;
         let result = sqlx::query(
             "INSERT INTO bus_events (event_id, raw_json, created_at, kind, author, d_tag, expires_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
@@ -265,12 +386,23 @@ impl BusEventStore {
         .bind(event.pubkey.to_hex())
         .bind(d_tag)
         .bind(expires)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        if result.rows_affected() == 1 {
+            // A re-insert after a delete is a new arrival: drop any stale
+            // seq so the event gets a fresh one past every live cursor.
+            sqlx::query("DELETE FROM bus_arrivals WHERE event_id = ?1")
+                .bind(event.id.to_hex())
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("INSERT INTO bus_arrivals (event_id) VALUES (?1)")
+                .bind(event.id.to_hex())
+                .execute(&mut *tx)
+                .await?;
+        }
 
         // p/e tag index (bd-replay-tag-pushdown-lurm): written unconditionally
         // so a duplicate insert still converges (ON CONFLICT DO NOTHING).
-        let mut tx = self.pool.begin().await?;
         Self::index_tag_values(&mut tx, &event.id.to_hex(), event).await?;
         tx.commit().await?;
 
@@ -638,20 +770,51 @@ impl BusEventStore {
         // kind-9 flood would otherwise evict the rooms first. If the store
         // is over cap with nothing but durable rows, it stays over cap:
         // losing the rooms is worse than breaching the bound.
-        sqlx::query(
-            "DELETE FROM bus_events WHERE event_id IN (
-                SELECT event_id FROM bus_events
+        //
+        // bd-wake-live-burst-loss-j86v: cap eviction is the one way a stored
+        // event leaves before every reader saw it. Record the highest evicted
+        // arrival seq in the SAME transaction as the delete, so a wake cursor
+        // behind it is told `events_lost` instead of silently skipping rows.
+        self.heal_arrivals().await?;
+        const VICTIMS: &str = "SELECT event_id FROM bus_events
                 WHERE kind NOT IN (?2, ?3, ?4, ?5, ?6)
                 ORDER BY rowid ASC
-                LIMIT MAX(0, (SELECT COUNT(*) FROM bus_events) - ?1)
-            )",
-        )
+                LIMIT MAX(0, (SELECT COUNT(*) FROM bus_events) - ?1)";
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(&format!(
+            "INSERT INTO bus_meta (key, value)
+             SELECT ?7, MAX(a.seq) FROM bus_arrivals a WHERE a.event_id IN ({VICTIMS})
+             AND a.seq IS NOT NULL
+             GROUP BY 1 HAVING MAX(a.seq) IS NOT NULL
+             ON CONFLICT(key) DO UPDATE SET value = MAX(value, excluded.value)"
+        ))
         .bind(MAX_STORED_EVENTS)
         .bind(DURABLE_KINDS[0])
         .bind(DURABLE_KINDS[1])
         .bind(DURABLE_KINDS[2])
         .bind(DURABLE_KINDS[3])
         .bind(DURABLE_KINDS[4])
+        .bind(ARRIVALS_EVICTED_KEY)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(&format!(
+            "DELETE FROM bus_events WHERE event_id IN ({VICTIMS})"
+        ))
+        .bind(MAX_STORED_EVENTS)
+        .bind(DURABLE_KINDS[0])
+        .bind(DURABLE_KINDS[1])
+        .bind(DURABLE_KINDS[2])
+        .bind(DURABLE_KINDS[3])
+        .bind(DURABLE_KINDS[4])
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        // Arrival rows of events no longer stored (evicted, expired,
+        // superseded, purged) can never be served again. AUTOINCREMENT keeps
+        // their numbers retired.
+        sqlx::query(
+            "DELETE FROM bus_arrivals WHERE event_id NOT IN (SELECT event_id FROM bus_events)",
+        )
         .execute(&self.pool)
         .await?;
         // Orphaned p/e tag rows of pruned events (they could never match a
@@ -2056,6 +2219,174 @@ mod tests {
             contents,
             vec!["mine 0".to_string(), "mine 1".to_string()],
             "older #t-matched rows must survive a non-pushed-predicate filter"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ---- arrival log (bd-wake-live-burst-loss-j86v, bd-wake-replay-cap-qk8n)
+
+    fn profile(keys: &Keys, d: &str, at: u64) -> Event {
+        build_event(
+            keys,
+            crate::nostr::Kind::from(crate::nostr::kinds::AGENT_PROFILE),
+            format!("profile {d} @{at}"),
+            vec![Tag::parse(["d", d]).expect("d")],
+            Timestamp::from(at),
+        )
+        .expect("build profile")
+    }
+
+    /// A supersede deletes the newest row and inserts its replacement. With
+    /// `rowid` as the cursor that replacement would reuse the deleted number
+    /// and every cursor sitting on it would skip it; the arrival seq must
+    /// move strictly forward instead.
+    #[tokio::test]
+    async fn arrival_seq_moves_forward_through_a_supersede_and_ignores_duplicates() {
+        let (store, _pool, path) = temp_store().await;
+        let keys = Keys::generate();
+        let first = profile(&keys, "me", 1_800_000_000);
+        assert!(store.insert_addressable(&first).await.expect("first"));
+        let s1 = store
+            .arrival_seq_of(&first.id.to_hex())
+            .await
+            .expect("lookup")
+            .expect("first has a seq");
+
+        let second = profile(&keys, "me", 1_800_000_001);
+        assert!(store.insert_addressable(&second).await.expect("supersede"));
+        let s2 = store
+            .arrival_seq_of(&second.id.to_hex())
+            .await
+            .expect("lookup")
+            .expect("replacement has a seq");
+        assert!(s2 > s1, "supersede got seq {s2}, not past {s1}");
+
+        // Control: a duplicate publish is not a new arrival.
+        assert!(!store.insert(&second).await.expect("dup"));
+        assert_eq!(
+            store
+                .arrival_seq_of(&second.id.to_hex())
+                .await
+                .expect("lookup"),
+            Some(s2)
+        );
+        let page = store.arrivals_after(&[], 0, 10).await.expect("page");
+        assert_eq!(
+            page.iter().map(|(s, e)| (*s, e.id)).collect::<Vec<_>>(),
+            vec![(s2, second.id)],
+            "the superseded row is gone; the live one is listed once"
+        );
+
+        // The reuse trap proper: the NEWEST arrival leaves the store
+        // (purge, then prune drops its arrival row) and a new event lands.
+        // A plain INTEGER PRIMARY KEY would hand the newcomer the retired
+        // number, and a cursor parked on it would skip the newcomer.
+        let newest = sample_event(&keys, "newest");
+        store.insert(&newest).await.expect("newest");
+        let s_newest = store
+            .arrival_seq_of(&newest.id.to_hex())
+            .await
+            .expect("lookup")
+            .expect("newest has a seq");
+        store
+            .purge_ids(&[newest.id.to_hex()])
+            .await
+            .expect("purge newest");
+        store.prune().await.expect("prune drops its arrival row");
+        let after = sample_event(&keys, "after purge");
+        store.insert(&after).await.expect("after");
+        let s_after = store
+            .arrival_seq_of(&after.id.to_hex())
+            .await
+            .expect("lookup")
+            .expect("newcomer has a seq");
+        assert!(
+            s_after > s_newest,
+            "retired seq {s_newest} was reused as {s_after}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Rows an older binary wrote (no arrival row) are numbered in rowid
+    /// order on the next read, after everything already numbered.
+    #[tokio::test]
+    async fn rows_from_an_older_binary_are_healed_into_the_arrival_log() {
+        let (store, pool, path) = temp_store().await;
+        let keys = Keys::generate();
+        let native = sample_event(&keys, "native");
+        store.insert(&native).await.expect("native insert");
+        let legacy: Vec<Event> = (0..3)
+            .map(|i| sample_event(&keys, &format!("legacy {i}")))
+            .collect();
+        for ev in &legacy {
+            sqlx::query(
+                "INSERT INTO bus_events (event_id, raw_json, created_at, kind, author, d_tag, expires_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL)",
+            )
+            .bind(ev.id.to_hex())
+            .bind(ev.as_json())
+            .bind(ev.created_at.as_secs() as i64)
+            .bind(ev.kind.as_u16() as i64)
+            .bind(ev.pubkey.to_hex())
+            .execute(&pool)
+            .await
+            .expect("legacy write");
+        }
+        let page = store.arrivals_after(&[], 0, 10).await.expect("page");
+        let got: Vec<_> = page.iter().map(|(_, e)| e.id).collect();
+        let mut want = vec![native.id];
+        want.extend(legacy.iter().map(|e| e.id));
+        assert_eq!(got, want, "native first, then legacy rows in write order");
+        let seqs: Vec<u64> = page.iter().map(|(s, _)| *s).collect();
+        assert!(seqs.windows(2).all(|w| w[0] < w[1]), "{seqs:?}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Cap eviction records the highest evicted arrival in the same
+    /// transaction as the delete; a prune that evicts nothing leaves it.
+    #[tokio::test]
+    async fn cap_eviction_records_the_highest_evicted_arrival() {
+        let (store, pool, path) = temp_store().await;
+        sqlx::query(
+            "WITH RECURSIVE cnt(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM cnt WHERE x < 100000) \
+             INSERT INTO bus_events (event_id, raw_json, created_at, kind, author, d_tag, expires_at) \
+             SELECT 'filler-' || x, '{}', 1789630000 + x, 9, 'filler-author', NULL, NULL FROM cnt",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed fillers");
+        assert_eq!(store.arrivals_evicted_through().await.expect("mark"), 0);
+        let keys = Keys::generate();
+        let a = sample_event(&keys, "a");
+        let b = sample_event(&keys, "b");
+        store.insert(&a).await.expect("a");
+        store.insert(&b).await.expect("b");
+        // Heal numbers the fillers 1..=100000 in rowid order; a and b follow.
+        let second_filler = store
+            .arrival_seq_of("filler-2")
+            .await
+            .expect("lookup")
+            .expect("healed");
+
+        store.prune().await.expect("prune");
+        assert_eq!(
+            store.arrivals_evicted_through().await.expect("mark"),
+            second_filler,
+            "the two oldest fillers were evicted"
+        );
+        assert!(
+            store
+                .arrival_seq_of(&a.id.to_hex())
+                .await
+                .expect("a")
+                .is_some()
+        );
+
+        // Control: at the cap, nothing is evicted and the mark stays.
+        store.prune().await.expect("prune again");
+        assert_eq!(
+            store.arrivals_evicted_through().await.expect("mark"),
+            second_filler
         );
         let _ = std::fs::remove_file(&path);
     }

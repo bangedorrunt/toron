@@ -149,6 +149,18 @@ pub enum WakeFrame {
         /// Cursor to replay from.
         resync_from: String,
     },
+    /// Explicit gap (bd-wake-live-burst-loss-j86v): stored events after the
+    /// subscriber's cursor were evicted before it read them, up to and
+    /// including `through`. Everything still stored is delivered after this
+    /// frame. A subscriber never loses events without one of these.
+    #[serde(rename = "events_lost")]
+    EventsLost {
+        /// The cursor the subscriber resumed from.
+        from: String,
+        /// Last cursor that may be missing (`unknown` when the resume cursor
+        /// itself is no longer known to the store).
+        through: String,
+    },
 }
 
 impl WakeFrame {
@@ -160,6 +172,7 @@ impl WakeFrame {
             Self::Eose { .. } => "eose",
             Self::Heartbeat { .. } => "heartbeat",
             Self::Shed { .. } => "shed",
+            Self::EventsLost { .. } => "events_lost",
         };
         let inner = serde_json::to_value(self).map_err(|e| WakeError::Codec(e.to_string()))?;
         let body = inner.get(tag).cloned().unwrap_or(inner);
@@ -203,6 +216,18 @@ impl WakeFrame {
                 resync_from: resync_from.to_string(),
             });
         }
+        if let Some(b) = v.get("events_lost") {
+            let field = |name: &str| {
+                b.get(name)
+                    .and_then(|c| c.as_str())
+                    .map(str::to_string)
+                    .ok_or_else(|| WakeError::Codec(format!("events_lost without {name}")))
+            };
+            return Ok(Self::EventsLost {
+                from: field("from")?,
+                through: field("through")?,
+            });
+        }
         Err(WakeError::Codec("unknown wake frame".to_string()))
     }
 }
@@ -213,7 +238,9 @@ pub struct WakeSubscribe {
     /// Kind filter (defaults to [`WAKE_KINDS`]).
     #[serde(default)]
     pub kinds: Vec<u16>,
-    /// Resume cursor (null = replay from store head, then live).
+    /// Resume cursor (null = replay everything stored, then live). The server
+    /// mints `seq:<n>` (arrival order); the older `<created_at>:<event_id>`
+    /// form is still accepted. Treat it as opaque.
     #[serde(default)]
     pub since_cursor: Option<String>,
     /// Optional project scope (`#t`).
@@ -705,6 +732,211 @@ async fn write_matching_event(
     Ok(true)
 }
 
+/// Where a subscriber resumes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Resume {
+    /// No cursor (or `head`): everything stored, then live.
+    Origin,
+    /// `seq:<n>`: strictly after arrival `n` (the cursor this server mints).
+    Seq(u64),
+    /// `<created_at>:<event_id>`: the pre-arrival-log cursor, still accepted
+    /// and placed by looking its event up in the arrival log.
+    Legacy(WakeCursor),
+}
+
+impl Resume {
+    fn parse(value: &str) -> Result<Self, WakeError> {
+        if let Some(n) = value.strip_prefix("seq:") {
+            return n
+                .parse::<u64>()
+                .map(Self::Seq)
+                .map_err(|e| WakeError::Codec(format!("invalid seq cursor: {e}")));
+        }
+        let cursor = WakeCursor::parse(value)?;
+        Ok(if cursor == WakeCursor::origin() {
+            Self::Origin
+        } else {
+            Self::Legacy(cursor)
+        })
+    }
+}
+
+/// Rows per arrival-log page.
+const ARRIVAL_PAGE: usize = 512;
+
+async fn write_frame(
+    writer: &mut (impl tokio::io::AsyncWrite + Unpin),
+    frame: &WakeFrame,
+) -> Result<(), WakeError> {
+    let line = frame.encode_line()?;
+    writer
+        .write_all(line.as_bytes())
+        .await
+        .map_err(|e| WakeError::Transport(e.to_string()))
+}
+
+/// Write every stored arrival after `*after` that matches `filter`, paging
+/// until the log is exhausted, and advance `*after` past every row read
+/// (matching or not). `floor` skips rows whose `created_at` is below it (the
+/// placement fallback for a legacy cursor the store no longer knows).
+async fn drain_arrivals(
+    writer: &mut (impl tokio::io::AsyncWrite + Unpin),
+    bus: &dyn Bus,
+    filter: &Filter,
+    kinds: &[u16],
+    after: &mut u64,
+    floor: Option<u64>,
+    stats: &mut SubscriberStats,
+) -> Result<(), WakeError> {
+    loop {
+        let page = bus
+            .arrivals_after(kinds, *after, ARRIVAL_PAGE)
+            .await?
+            .ok_or_else(|| WakeError::Transport("arrival log unavailable".to_string()))?;
+        let full = page.len() == ARRIVAL_PAGE;
+        for (seq, event) in page {
+            *after = seq;
+            if floor.is_some_and(|f| event.created_at.as_secs() < f) {
+                continue;
+            }
+            if !filter.match_event(&event, MatchEventOptions::default()) {
+                continue;
+            }
+            let payload =
+                serde_json::to_value(&event).map_err(|e| WakeError::Codec(e.to_string()))?;
+            write_frame(writer, &WakeFrame::Event(payload)).await?;
+            stats.delivered += 1;
+        }
+        if !full {
+            return Ok(());
+        }
+    }
+}
+
+/// The lossless subscriber (bd-wake-live-burst-loss-j86v,
+/// bd-wake-replay-cap-qk8n): the store is the only source of events. The
+/// fan-out broadcast is just a doorbell; on every ring (and on every
+/// heartbeat tick, as a safety net) the subscriber pages the arrival log from
+/// its own cursor. A slow reader therefore gets backpressure, never a shed,
+/// and a burst can never be reordered out of existence by the cursor. The
+/// only way to miss a stored event is cap eviction, which is announced with
+/// an `events_lost` frame.
+#[allow(clippy::too_many_arguments)]
+async fn serve_arrivals(
+    writer: &mut (impl tokio::io::AsyncWrite + Unpin),
+    mut rx: tokio::sync::broadcast::Receiver<String>,
+    filter: &Filter,
+    kinds: &[u16],
+    resume: Resume,
+    from_wire: &str,
+    config: &WakeConfig,
+    clock: &dyn WakeClock,
+    bus: &dyn Bus,
+    mut stats: SubscriberStats,
+) -> SubscriberStats {
+    use tokio::sync::broadcast::error::{RecvError, TryRecvError};
+    let (mut after, check_eviction, floor) = match resume {
+        Resume::Origin => (0, false, None),
+        Resume::Seq(n) => (n, true, None),
+        Resume::Legacy(c) => match bus.arrival_seq_of(&c.event_id).await {
+            Ok(Some(seq)) => (seq, true, None),
+            Ok(None) => {
+                // The cursor's event is no longer stored, so its place in
+                // arrival order is unknown. Say so, then replay from its
+                // second: a duplicate is recoverable, a silent skip is not.
+                let lost = WakeFrame::EventsLost {
+                    from: from_wire.to_string(),
+                    through: "unknown".to_string(),
+                };
+                if write_frame(writer, &lost).await.is_err() {
+                    return stats;
+                }
+                (0, false, Some(c.created_at))
+            }
+            Err(_) => return stats,
+        },
+    };
+    if check_eviction {
+        match bus.arrivals_evicted_through().await {
+            Ok(evicted) if evicted > after => {
+                let lost = WakeFrame::EventsLost {
+                    from: from_wire.to_string(),
+                    through: format!("seq:{evicted}"),
+                };
+                if write_frame(writer, &lost).await.is_err() {
+                    return stats;
+                }
+            }
+            Ok(_) => {}
+            Err(_) => return stats,
+        }
+    }
+    if drain_arrivals(writer, bus, filter, kinds, &mut after, floor, &mut stats)
+        .await
+        .is_err()
+    {
+        return stats;
+    }
+    let eose = WakeFrame::Eose {
+        cursor: if after == 0 {
+            "head".to_string()
+        } else {
+            format!("seq:{after}")
+        },
+    };
+    if write_frame(writer, &eose).await.is_err() {
+        return stats;
+    }
+    stats.delivered += 1;
+    let mut heartbeat_at = clock.now_ms().saturating_add(config.heartbeat_ms);
+    loop {
+        let wait = std::time::Duration::from_millis(config.heartbeat_ms);
+        match tokio::time::timeout(wait, rx.recv()).await {
+            Ok(Ok(_) | Err(RecvError::Lagged(_))) => {
+                // Coalesce queued rings: one drain covers all of them, and a
+                // lagged doorbell loses nothing because the store is the
+                // source.
+                loop {
+                    match rx.try_recv() {
+                        Ok(_) | Err(TryRecvError::Lagged(_)) => {}
+                        Err(TryRecvError::Empty) => break,
+                        Err(TryRecvError::Closed) => return stats,
+                    }
+                }
+                if drain_arrivals(writer, bus, filter, kinds, &mut after, None, &mut stats)
+                    .await
+                    .is_err()
+                {
+                    return stats;
+                }
+            }
+            Ok(Err(RecvError::Closed)) => return stats,
+            Err(_) => {
+                // Quiet tick: catch up anything a missed ring left behind,
+                // then the quiet-vs-deaf heartbeat.
+                if drain_arrivals(writer, bus, filter, kinds, &mut after, None, &mut stats)
+                    .await
+                    .is_err()
+                {
+                    return stats;
+                }
+                if clock.now_ms() >= heartbeat_at {
+                    let hb = WakeFrame::Heartbeat {
+                        ts_ms: clock.now_ms(),
+                    };
+                    if write_frame(writer, &hb).await.is_err() {
+                        stats.heartbeat_deaf += 1;
+                        return stats;
+                    }
+                    stats.heartbeats_ok += 1;
+                    stats.delivered += 1;
+                    heartbeat_at = clock.now_ms().saturating_add(config.heartbeat_ms);
+                }
+            }
+        }
+    }
+}
+
 async fn serve_subscriber(
     stream: UnixStream,
     mut rx: tokio::sync::broadcast::Receiver<String>,
@@ -729,12 +961,41 @@ async fn serve_subscriber(
         return stats;
     };
     let filter = req.filter();
-    let mut cursor = match req.since_cursor.as_deref() {
-        Some(value) => match WakeCursor::parse(value) {
-            Ok(cursor) => cursor,
+    let resume = match req.since_cursor.as_deref() {
+        Some(value) => match Resume::parse(value) {
+            Ok(resume) => resume,
             Err(_) => return stats,
         },
-        None => WakeCursor::origin(),
+        None => Resume::Origin,
+    };
+    // bd-wake-live-burst-loss-j86v / bd-wake-replay-cap-qk8n: a backend with
+    // an arrival log serves the lossless store-tail path. The legacy path
+    // below stays only for backends without one (relay buses, test fakes).
+    if matches!(
+        bus.arrivals_after(&req.kinds, u64::MAX, 0).await,
+        Ok(Some(_))
+    ) {
+        let from_wire = req.since_cursor.clone().unwrap_or_default();
+        return serve_arrivals(
+            &mut writer,
+            rx,
+            &filter,
+            &req.kinds,
+            resume,
+            &from_wire,
+            &config,
+            clock.as_ref(),
+            bus.as_ref(),
+            stats,
+        )
+        .await;
+    }
+    let mut cursor = match resume {
+        Resume::Origin => WakeCursor::origin(),
+        Resume::Legacy(cursor) => cursor,
+        // A `seq:` cursor names an arrival; without an arrival log it cannot
+        // be placed, so refuse rather than guess.
+        Resume::Seq(_) => return stats,
     };
     let Ok(mut replay) = bus.subscribe_trusted(filter.clone()).await else {
         return stats;
