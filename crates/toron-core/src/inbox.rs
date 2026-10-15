@@ -34,13 +34,32 @@ pub const INBOX_STREAM: &str = "inbox";
 /// The stream a sender loop's durable intents live on.
 pub const JOURNAL_STREAM: &str = "journal";
 
-/// `TORON_COMMS_INBOX`: the Phase 1 flag (ADR-0041). Off by default; the
-/// verbs refuse while it is off.
+/// The comms flag (ADR-0041), decided from the `TORON_COMMS_INBOX` value and
+/// the `[comms] inbox_log` config key (bd-652a). Pure, so the whole table is
+/// testable.
+///
+/// * The env var wins whenever it is set to anything but the empty string:
+///   `1|true|on` is on, `0|false|off` is off, and any other value is off
+///   (fail closed; a typo never turns the log on).
+/// * Unset or empty, the config key decides.
+/// * Neither: off.
+pub fn resolve_enabled(env: Option<&str>, config: Option<bool>) -> bool {
+    match env {
+        Some("1" | "true" | "on") => true,
+        Some("") | None => config.unwrap_or(false),
+        Some(_) => false,
+    }
+}
+
+/// The flag from the environment alone (no config in hand). Off by default;
+/// the verbs refuse while it is off.
 pub fn enabled() -> bool {
-    matches!(
-        std::env::var("TORON_COMMS_INBOX").as_deref(),
-        Ok("1" | "true" | "on")
-    )
+    enabled_with(None)
+}
+
+/// The flag with the loaded `[comms] inbox_log` value (`None` = key absent).
+pub fn enabled_with(config: Option<bool>) -> bool {
+    resolve_enabled(std::env::var("TORON_COMMS_INBOX").ok().as_deref(), config)
 }
 
 /// Failures of the inbox verbs.
@@ -65,7 +84,7 @@ pub enum InboxError {
     )]
     PayloadConflict { msg_key: String },
     /// The flag is off.
-    #[error("comms inbox is off: set TORON_COMMS_INBOX=1")]
+    #[error("comms inbox is off: set TORON_COMMS_INBOX=1 or `[comms] inbox_log = true`")]
     Disabled,
     /// Store failure.
     #[error("store: {0}")]

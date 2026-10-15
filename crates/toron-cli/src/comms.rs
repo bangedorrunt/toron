@@ -1,6 +1,6 @@
 // governed-by: ADR-0041
 //! `toron next | ack | done | inbox append | send | task` (ADR-0041): CLI-only comms
-//! verbs over the shared durable root, behind `TORON_COMMS_INBOX`.
+//! verbs over the shared durable root, behind `TORON_COMMS_INBOX` or `[comms] inbox_log`.
 //!
 //! Exit codes: 0 ok, 2 flag off / usage, 3 refused by the delivery FSM or
 //! the envelope rules (the refusal JSON is printed on stdout).
@@ -15,13 +15,17 @@ use crate::cli::{Command, InboxCommand};
 use crate::output::{OutputFormat, render_json};
 
 #[tokio::main]
-pub async fn run_comms(command: &Command, format: OutputFormat) -> anyhow::Result<ExitCode> {
-    if !toron_core::inbox::enabled() {
+pub async fn run_comms(
+    command: &Command,
+    format: OutputFormat,
+    cfg: &crate::config::Config,
+) -> anyhow::Result<ExitCode> {
+    if !toron_core::inbox::enabled_with(cfg.comms_inbox_log()) {
         eprintln!("toron: error: {}", InboxError::Disabled);
         return Ok(ExitCode::from(2));
     }
     let mailbox = toron_mcp::demo_mailbox().await?;
-    let store = mailbox.inbox_store()?;
+    let store = mailbox.inbox_store_with(cfg.comms_inbox_log())?;
     let out = match command {
         Command::Next(a) => {
             let reader = mailbox.comms_npub(&a.project, &a.who).await?;

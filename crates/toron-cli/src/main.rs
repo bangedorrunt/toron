@@ -132,7 +132,7 @@ fn run(cli: &Cli) -> anyhow::Result<ExitCode> {
             ExitCode::SUCCESS
         }
         Command::Next(_) | Command::Ack(_) | Command::Done(_) | Command::Inbox(_) => {
-            comms::run_comms(command, format)?
+            comms::run_comms(command, format, &cfg)?
         }
         Command::RunState(cmd) => {
             run_run_state(cmd, &cfg, format)?;

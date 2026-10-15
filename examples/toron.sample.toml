@@ -39,6 +39,11 @@ envelope_ttl_days = 90
 # federation_pow = 20               # NIP-13 POW difficulty
 # federation_allowlist = ["wss://trusted-relay.example.com"]
 
+# Comms inbox log (ADR-0041). Default off. TORON_COMMS_INBOX overrides it:
+# 1|true|on forces it on, 0|false|off forces it off, any other value is off.
+# [comms]
+# inbox_log = true
+
 # --- Keyring priority (open Q #2, resolved as recommended) ---
 # Key material is unlocked in this order at process start:
 #   1. macOS Keychain
