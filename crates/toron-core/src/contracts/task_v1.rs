@@ -31,8 +31,8 @@ impl TaskV1 {
     /// A task must name a unit of work and carry a non-empty title/brief.
     pub fn validate(&self, env: &Envelope) -> Result<(), Reject> {
         if env.task.is_none() {
-            return Err(Reject::BadEnvelope(
-                "task@1 needs envelope.task (the TaskId)".into(),
+            return Err(Reject::bad_envelope(
+                "task@1 needs envelope.task (the TaskId)",
             ));
         }
         if self.title.trim().is_empty() || self.brief.trim().is_empty() {
