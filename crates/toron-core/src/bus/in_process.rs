@@ -538,6 +538,33 @@ impl Bus for InProcessBus {
     async fn store_version(&self) -> Option<i64> {
         Some(self.store.current_mutations().await)
     }
+
+    async fn arrivals_after(
+        &self,
+        kinds: &[u16],
+        after: u64,
+        limit: usize,
+    ) -> Result<Option<Vec<(u64, Event)>>, BusError> {
+        self.store
+            .arrivals_after(kinds, after, limit)
+            .await
+            .map(Some)
+            .map_err(|e| BusError::Subscription(format!("arrival read failure: {e}")))
+    }
+
+    async fn arrival_seq_of(&self, event_id: &str) -> Result<Option<u64>, BusError> {
+        self.store
+            .arrival_seq_of(event_id)
+            .await
+            .map_err(|e| BusError::Subscription(format!("arrival lookup failure: {e}")))
+    }
+
+    async fn arrivals_evicted_through(&self) -> Result<u64, BusError> {
+        self.store
+            .arrivals_evicted_through()
+            .await
+            .map_err(|e| BusError::Subscription(format!("eviction mark read failure: {e}")))
+    }
 }
 
 // Allow constructing a bus for tests without exposing internals.
