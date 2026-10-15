@@ -9,13 +9,19 @@
 
 use super::Mailbox;
 use crate::envelope::is_npub_hex;
-use crate::inbox::{InboxError, InboxStore, enabled};
+use crate::inbox::{InboxError, InboxStore, enabled_with};
 
 impl Mailbox {
     /// The comms inbox store over the index pool. Refuses while the
-    /// `TORON_COMMS_INBOX` flag is off.
+    /// `TORON_COMMS_INBOX` flag is off (environment alone).
     pub fn inbox_store(&self) -> anyhow::Result<InboxStore> {
-        if !enabled() {
+        self.inbox_store_with(None)
+    }
+
+    /// As [`Self::inbox_store`], with the loaded `[comms] inbox_log` value
+    /// (`None` = key absent). The environment variable still wins when set.
+    pub fn inbox_store_with(&self, inbox_log: Option<bool>) -> anyhow::Result<InboxStore> {
+        if !enabled_with(inbox_log) {
             return Err(InboxError::Disabled.into());
         }
         let pool = self

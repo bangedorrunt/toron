@@ -63,6 +63,17 @@ pub struct Config {
     /// `Host`, e.g. `toron.alpine-tilapia.ts.net`).
     #[serde(default)]
     pub mcp_allowed_hosts: Vec<String>,
+    /// `[comms]` table (ADR-0041).
+    pub comms: Option<CommsConfig>,
+}
+
+/// The `[comms]` table. Unknown keys are refused, like the top level.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CommsConfig {
+    /// Turn the per-recipient inbox log and its verbs (`next`, `ack`, `done`,
+    /// `inbox ...`) on. `TORON_COMMS_INBOX` overrides it when set. Default off.
+    pub inbox_log: Option<bool>,
 }
 
 /// A per-project envelope TTL override (`{ project = "demo", days = 14 }`).
@@ -95,6 +106,12 @@ impl Config {
             return pt.days;
         }
         self.envelope_ttl_days.unwrap_or(DEFAULT_ENVELOPE_TTL_DAYS)
+    }
+
+    /// The `[comms] inbox_log` value (`None` = key absent), for
+    /// `toron_core::inbox::enabled_with`.
+    pub fn comms_inbox_log(&self) -> Option<bool> {
+        self.comms.as_ref().and_then(|c| c.inbox_log)
     }
 
     /// Effective backend (defaults to `herdr`).
@@ -171,6 +188,15 @@ impl Config {
         }
         if !other.mcp_allowed_hosts.is_empty() {
             self.mcp_allowed_hosts = other.mcp_allowed_hosts;
+        }
+        // Key by key, so a project file that sets nothing in `[comms]` does
+        // not erase what the user file set.
+        if let Some(c) = other.comms
+            && c.inbox_log.is_some()
+        {
+            self.comms
+                .get_or_insert_with(CommsConfig::default)
+                .inbox_log = c.inbox_log;
         }
     }
 
@@ -313,5 +339,45 @@ mod tests {
         // Default is empty (loopback only).
         let cfg = Config::default();
         assert!(cfg.mcp_allowed_hosts.is_empty());
+    }
+
+    #[test]
+    fn comms_inbox_log_parses_and_defaults_to_absent() {
+        let dir = scratch("comms");
+        let on = write_config(&dir, "on.toml", "[comms]\ninbox_log = true\n");
+        assert_eq!(Config::load(Some(&on)).comms_inbox_log(), Some(true));
+        let off = write_config(&dir, "off.toml", "[comms]\ninbox_log = false\n");
+        assert_eq!(Config::load(Some(&off)).comms_inbox_log(), Some(false));
+        // CONTROL: a config with no `[comms]` leaves the key absent.
+        let none = write_config(&dir, "none.toml", "backend = \"herdr\"\n");
+        assert_eq!(Config::load(Some(&none)).comms_inbox_log(), None);
+    }
+
+    #[test]
+    fn an_unknown_comms_key_is_refused_like_any_other() {
+        let err = toml::from_str::<Config>("[comms]\ninbox_logg = true\n").unwrap_err();
+        assert!(err.to_string().contains("inbox_logg"), "{err}");
+    }
+
+    #[test]
+    fn comms_merges_key_by_key_so_a_silent_layer_does_not_erase_it() {
+        let mut cfg = Config::default();
+        cfg.merge(toml::from_str("[comms]\ninbox_log = true\n").unwrap());
+        // A later layer that sets other things, or an empty `[comms]`, keeps it.
+        cfg.merge(toml::from_str("backend = \"tmux\"\n").unwrap());
+        cfg.merge(toml::from_str("[comms]\n").unwrap());
+        assert_eq!(cfg.comms_inbox_log(), Some(true));
+        // A later layer that sets it wins.
+        cfg.merge(toml::from_str("[comms]\ninbox_log = false\n").unwrap());
+        assert_eq!(cfg.comms_inbox_log(), Some(false));
+    }
+
+    #[test]
+    fn the_sample_config_documents_the_comms_table() {
+        let sample = include_str!("../../../examples/toron.sample.toml");
+        let uncommented =
+            sample.replace("# [comms]\n# inbox_log = true", "[comms]\ninbox_log = true");
+        let cfg: Config = toml::from_str(&uncommented).expect("sample parses once enabled");
+        assert_eq!(cfg.comms_inbox_log(), Some(true));
     }
 }
