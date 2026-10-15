@@ -290,6 +290,22 @@ pub enum InboxCommand {
     /// Every envelope of a task you sent or received, oldest first, with
     /// its delivery phase (read-only).
     Task(InboxTaskArgs),
+    /// One stored envelope by its `producer:epoch:seq` key, even after its
+    /// epoch has been fenced (read-only).
+    Msg(InboxMsgArgs),
+}
+
+#[derive(Debug, clap::Args)]
+pub struct InboxMsgArgs {
+    /// Message key `producer:epoch:seq`.
+    pub key: String,
+    /// Project slug (used to resolve --as).
+    #[arg(long, required = true)]
+    pub project: String,
+    /// Viewer: agent name or 64-hex npub. Only a message it sent or
+    /// received is shown.
+    #[arg(long = "as", required = true)]
+    pub who: String,
 }
 
 #[derive(Debug, clap::Args)]
