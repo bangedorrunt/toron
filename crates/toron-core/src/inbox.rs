@@ -552,7 +552,7 @@ impl InboxStore {
             let offset = r.get::<i64, _>(0) as u64;
             let msg_key: String = r.get(1);
             let envelope: Envelope = serde_json::from_str(&r.get::<String, _>(2))
-                .map_err(|e| Reject::BadEnvelope(format!("stored payload: {e}")))?;
+                .map_err(|e| Reject::bad_envelope(format!("stored payload: {e}")))?;
             let state = read_delivery(&mut tx, &msg_key, stream).await?;
             let state = match state {
                 Some((s, _)) if !peek && s.phase == Phase::Sent => {
@@ -704,9 +704,9 @@ impl InboxStore {
             let msg_key: String = r.get(0);
             let recipient: String = r.get(1);
             let state: DeliveryState = serde_json::from_str(&r.get::<String, _>(2))
-                .map_err(|e| Reject::BadEnvelope(format!("stored delivery: {e}")))?;
+                .map_err(|e| Reject::bad_envelope(format!("stored delivery: {e}")))?;
             let envelope: Envelope = serde_json::from_str(&r.get::<String, _>(4))
-                .map_err(|e| Reject::BadEnvelope(format!("stored payload: {e}")))?;
+                .map_err(|e| Reject::bad_envelope(format!("stored payload: {e}")))?;
             if envelope.from != viewer && recipient != viewer {
                 continue;
             }
@@ -747,7 +747,7 @@ impl InboxStore {
         };
         let recipient: String = row.get(2);
         let envelope: Envelope = serde_json::from_str(&row.get::<String, _>(3))
-            .map_err(|e| Reject::BadEnvelope(format!("stored payload: {e}")))?;
+            .map_err(|e| Reject::bad_envelope(format!("stored payload: {e}")))?;
         if envelope.from != viewer && recipient != viewer {
             return Ok(None);
         }
