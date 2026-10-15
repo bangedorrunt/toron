@@ -218,7 +218,8 @@ pub enum Command {
     Done(DoneArgs),
 
     /// Inbox plumbing: `append` (fixture door, one envelope straight to the
-    /// log) and `send` (journal first through the outbox loop, with recovery).
+    /// log), `send` (journal first through the outbox loop, with recovery) and
+    /// `task` (every envelope of a task you sent or received).
     #[command(subcommand)]
     Inbox(InboxCommand),
 }
