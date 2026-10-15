@@ -145,6 +145,28 @@ pub const BY_TASK_SQL: &str = "SELECT d.msg_key, d.recipient, d.state_json, l.lo
      WHERE d.task_id = ?1 \
      ORDER BY l.log_offset, d.recipient";
 
+/// One stored envelope, as [`InboxStore::read_triple`] reports it.
+#[derive(Clone, Debug, Serialize)]
+pub struct StoredEnvelope {
+    /// `producer:epoch:seq`.
+    pub msg_key: String,
+    /// Log offset.
+    pub offset: u64,
+    /// The recipient stream this row was appended for (an npub or group).
+    pub recipient: String,
+    /// True when a newer epoch of this producer exists (appended or claimed),
+    /// so nothing more can be appended at this envelope's epoch. The row is
+    /// still stored and still readable.
+    pub fenced: bool,
+    /// The envelope exactly as stored.
+    pub envelope: Envelope,
+}
+
+/// The triple read (bd-read-by-producer-seq-uozq): one probe of the
+/// `UNIQUE (producer, epoch, seq)` index. Exported so a test can pin its plan.
+pub const BY_TRIPLE_SQL: &str = "SELECT msg_key, log_offset, recipient, payload \
+     FROM inbox_log WHERE producer = ?1 AND epoch = ?2 AND seq = ?3 AND stream = 'inbox'";
+
 /// One message handed to its reader by [`InboxStore::next`].
 #[derive(Clone, Debug, Serialize)]
 pub struct InboxItem {
@@ -699,6 +721,47 @@ impl InboxStore {
             });
         }
         Ok(out)
+    }
+
+    /// The envelope stored under `msg` (`producer:epoch:seq`), whether or not
+    /// its epoch has since been fenced (bd-read-by-producer-seq-uozq). A
+    /// sender that must check what a recovered or replayed triple actually
+    /// says (a claimed epoch fences every older one, so a re-append of the
+    /// old triple is refused as `StaleEpoch` before content is compared) reads
+    /// it here instead. `viewer` sees the envelope only if it sent it or it was
+    /// appended for it; anyone else gets `None`, the same answer as for an
+    /// unknown triple. Read-only.
+    pub async fn read_triple(
+        &self,
+        msg: &MsgId,
+        viewer: &str,
+    ) -> Result<Option<StoredEnvelope>, InboxError> {
+        let Some(row) = sqlx::query(BY_TRIPLE_SQL)
+            .bind(&msg.producer)
+            .bind(msg.epoch as i64)
+            .bind(msg.seq as i64)
+            .fetch_optional(&self.pool)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let recipient: String = row.get(2);
+        let envelope: Envelope = serde_json::from_str(&row.get::<String, _>(3))
+            .map_err(|e| Reject::BadEnvelope(format!("stored payload: {e}")))?;
+        if envelope.from != viewer && recipient != viewer {
+            return Ok(None);
+        }
+        let fenced = self
+            .producer_epoch(&msg.producer)
+            .await?
+            .is_some_and(|current| current > msg.epoch);
+        Ok(Some(StoredEnvelope {
+            msg_key: row.get(0),
+            offset: row.get::<i64, _>(1) as u64,
+            recipient,
+            fenced,
+            envelope,
+        }))
     }
 
     /// Current delivery state.

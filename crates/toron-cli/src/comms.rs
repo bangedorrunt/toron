@@ -98,6 +98,19 @@ pub async fn run_comms(
                 json!({"task": a.task, "viewer": viewer, "count": messages.len(), "messages": messages})
             })
         }
+        Command::Inbox(InboxCommand::Msg(a)) => {
+            let Some(msg) = toron_core::envelope::MsgId::parse_key(&a.key) else {
+                render_json(
+                    &json!({"refused": "bad_key", "error": "key must be producer:epoch:seq"}),
+                    format,
+                );
+                return Ok(ExitCode::from(3));
+            };
+            let viewer = mailbox.comms_npub(&a.project, &a.who).await?;
+            store.read_triple(&msg, &viewer).await.map(|found| {
+                json!({"key": a.key, "viewer": viewer, "found": found.is_some(), "message": found})
+            })
+        }
         _ => unreachable!("run_comms only handles the comms verbs"),
     };
     match out {
