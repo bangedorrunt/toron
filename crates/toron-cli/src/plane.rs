@@ -48,8 +48,9 @@ use toron_workflow::channels::{
 };
 use toron_workflow::coalesce::MentionCoalescer;
 use toron_workflow::jobs::{
-    JobError, JobRequest, JobResult, JobState, build_job_cancel, build_job_claim, build_job_error,
-    build_job_progress, build_job_result, first_claimer, job_parent, job_state,
+    ClaimArrivals, JobError, JobRequest, JobResult, JobState, build_job_cancel, build_job_claim,
+    build_job_error, build_job_progress, build_job_result, first_claimer, first_claimer_by_arrival,
+    job_parent, job_state, job_state_by_arrival,
 };
 use toron_workflow::mention::{build_job_from_coalesced, wire_mention_dispatch};
 
@@ -968,9 +969,39 @@ const fn state_name(state: &JobState) -> &'static str {
     }
 }
 
+/// A job's state, with the claimer resolved by arrival order when the store
+/// keeps an arrival log (the same rule `job claim` used to answer its caller).
+fn job_state_for(job: EventId, events: &[Event], arrivals: Option<&ClaimArrivals>) -> JobState {
+    match arrivals {
+        Some(a) => job_state_by_arrival(job, events, a),
+        None => job_state(job, events),
+    }
+}
+
+/// Arrival seq of every claim (43002) in `events`: the store's commit order,
+/// which is what decides a claim race. `None` when this backend keeps no
+/// arrival log (the caller falls back to the created_at rule). A claim the
+/// log has evicted is simply absent from the map (it is the oldest).
+async fn claim_arrivals(bus: &dyn Bus, events: &[Event]) -> anyhow::Result<Option<ClaimArrivals>> {
+    let mut out = ClaimArrivals::new();
+    let mut missing = false;
+    for ev in events.iter().filter(|ev| ev.kind.as_u16() == 43002) {
+        match bus.arrival_seq_of(&ev.id.to_hex()).await? {
+            Some(seq) => {
+                out.insert(ev.id, seq);
+            }
+            None => missing = true,
+        }
+    }
+    if missing && bus.arrivals_evicted_through().await? == 0 {
+        return Ok(None);
+    }
+    Ok(Some(out))
+}
+
 /// One job row for list/show.
-fn job_row(job: &Event, events: &[Event]) -> Value {
-    let state = job_state(job.id, events);
+fn job_row(job: &Event, events: &[Event], arrivals: Option<&ClaimArrivals>) -> Value {
+    let state = job_state_for(job.id, events, arrivals);
     let claimer = match &state {
         JobState::Claimed(c) | JobState::InProgress(c) => Some(c.clone()),
         _ => None,
@@ -1003,13 +1034,14 @@ async fn job_list(mailbox: &Mailbox, args: &JobListArgs) -> anyhow::Result<()> {
         })?;
     }
     let events = collect_jobs(mailbox, &args.project).await?;
+    let arrivals = claim_arrivals(mailbox.bus().as_ref(), &events).await?;
     let requests: Vec<&Event> = events
         .iter()
         .filter(|ev| ev.kind.as_u16() == 43001)
         .collect();
     let mut rows: Vec<Value> = Vec::new();
     for job in requests {
-        let state = job_state(job.id, &events);
+        let state = job_state_for(job.id, &events, arrivals.as_ref());
         // --state filter.
         let state_pass = match (args.state, &state) {
             (None, _) => true,
@@ -1036,7 +1068,7 @@ async fn job_list(mailbox: &Mailbox, args: &JobListArgs) -> anyhow::Result<()> {
                 continue;
             }
         }
-        rows.push(job_row(job, &events));
+        rows.push(job_row(job, &events, arrivals.as_ref()));
     }
     // Newest first.
     rows.sort_by(|a, b| {
@@ -1050,7 +1082,8 @@ async fn job_list(mailbox: &Mailbox, args: &JobListArgs) -> anyhow::Result<()> {
 async fn job_show(mailbox: &Mailbox, args: &JobShowArgs) -> anyhow::Result<()> {
     let job = find_request(mailbox, &args.project, &args.job_id).await?;
     let events = collect_jobs(mailbox, &args.project).await?;
-    print_json(&job_row(&job, &events))
+    let arrivals = claim_arrivals(mailbox.bus().as_ref(), &events).await?;
+    print_json(&job_row(&job, &events, arrivals.as_ref()))
 }
 
 /// Wait until an observed count stops growing (quiescence = convergence
@@ -1083,6 +1116,53 @@ where
     }
 }
 
+/// Who won the claim race for `job`, as seen right after this process
+/// published its own claim.
+///
+/// The winner is the claim with the lowest arrival seq in the store (SC-28):
+/// the seq is assigned inside the insert transaction, so a claim published
+/// before ours is visible to us and ours is visible to a later claimer. Every
+/// process therefore computes the same answer from its own publish, with no
+/// waiting for a peer. Waiting for the claim set to go quiet (the previous
+/// rule) let a peer that started a moment late find the set stable, decide on
+/// its own claim alone, and then lose the later `(created_at, id)` comparison
+/// to a lower id: two winners (bd-sc28-two-winners-flake-9b60).
+///
+/// A backend with no arrival log (a remote bus) cannot give that order; it
+/// keeps the bounded quiescence wait and the `(created_at, id)` rule.
+async fn resolve_claim_winner(
+    mailbox: &Mailbox,
+    project: &str,
+    job: EventId,
+) -> anyhow::Result<Option<String>> {
+    let claims_of = |events: &[Event]| -> Vec<Event> {
+        events
+            .iter()
+            .filter(|ev| ev.kind.as_u16() == 43002 && job_parent(ev) == Some(job))
+            .cloned()
+            .collect()
+    };
+    let claims = claims_of(&collect_jobs(mailbox, project).await?);
+    if let Some(arrivals) = claim_arrivals(mailbox.bus().as_ref(), &claims).await? {
+        return Ok(first_claimer_by_arrival(job, &claims, &arrivals));
+    }
+    // No arrival log: converge by watching the stored claim set go quiet.
+    let quiesce = toron_core::policy::Timeout::new(Duration::from_secs(2))
+        .with_poll(Duration::from_millis(50));
+    wait_claim_quiescent(quiesce, || {
+        let project = project.to_string();
+        async move {
+            collect_jobs(mailbox, &project)
+                .await
+                .map(|events| claims_of(&events).len())
+                .unwrap_or(0)
+        }
+    })
+    .await;
+    let claims = claims_of(&collect_jobs(mailbox, project).await?);
+    Ok(first_claimer(job, &claims))
+}
+
 /// Claim a job: publish a 43002 signed by `--as`, then resolve the winner
 /// from the stored 43002 stream. First claimer wins; a second claimer gets
 /// `won: false` and exits 1 (never a silent success).
@@ -1095,38 +1175,7 @@ async fn job_claim(mailbox: &Mailbox, args: &JobClaimArgs) -> anyhow::Result<()>
     let claim = build_job_claim(&keys, job, Timestamp::now())?;
     mailbox.bus().publish(claim.clone()).await?;
 
-    // Cross-process convergence (SC-28, G6): another process may be
-    // claiming the same job at nearly the same moment. Watch the stored
-    // claim set until it stops growing (quiescence), bounded by Timeout —
-    // BOTH processes then compute the winner over the SAME claim set:
-    // exactly one `won: true`, the other exit 1. Never a fixed blind sleep.
-    let quiesce = toron_core::policy::Timeout::new(Duration::from_secs(2))
-        .with_poll(Duration::from_millis(50));
-    wait_claim_quiescent(quiesce, || {
-        let mb = mailbox;
-        let project = args.project.clone();
-        async move {
-            collect_jobs(mb, &project)
-                .await
-                .map(|events| {
-                    events
-                        .iter()
-                        .filter(|ev| ev.kind.as_u16() == 43002 && job_parent(ev) == Some(job))
-                        .count()
-                })
-                .unwrap_or(0)
-        }
-    })
-    .await;
-
-    // Winner = first observed 43002 (store order; deterministic tie-break).
-    let events = collect_jobs(mailbox, &args.project).await?;
-    let claims: Vec<Event> = events
-        .iter()
-        .filter(|ev| ev.kind.as_u16() == 43002 && job_parent(ev) == Some(job))
-        .cloned()
-        .collect();
-    let winner = first_claimer(job, &claims);
+    let winner = resolve_claim_winner(mailbox, &args.project, job).await?;
     let won = winner.as_deref() == Some(keys.public_key().to_hex().as_str());
 
     print_json(&serde_json::json!({
@@ -2362,6 +2411,93 @@ mod live_watch_tests {
         .await
         .expect("no hang without a live walker")
         .expect("wait ok from sqlite fast path");
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// SC-28 (bd-sc28-two-winners-flake-9b60): the claim race is decided by
+    /// the store's commit order, not by the claimers' clocks or ids. The
+    /// first claim to land carries the LATER created_at, so the old
+    /// `(created_at, id)` rule hands the win to the claim that landed second:
+    /// the first claimer had already been told it won, so both would win.
+    #[tokio::test]
+    async fn claim_winner_is_first_to_land_not_lowest_clock() {
+        let (mailbox, _pool, db_path, data_dir) = test_mailbox("claim-order").await;
+        let job = EventId::from_hex(&"b3".repeat(32)).expect("job id");
+        let first = toron_core::keys::generate();
+        let second = toron_core::keys::generate();
+        let now = Timestamp::now().as_secs();
+        let lands_first = build_job_claim(&first, job, Timestamp::from(now + 100)).expect("claim");
+        let lands_second = build_job_claim(&second, job, Timestamp::from(now)).expect("claim");
+
+        mailbox
+            .bus()
+            .publish(lands_first.clone())
+            .await
+            .expect("publish");
+        let seen_alone = resolve_claim_winner(&mailbox, "demo", job)
+            .await
+            .expect("winner");
+        assert_eq!(
+            seen_alone,
+            Some(first.public_key().to_hex()),
+            "a lone claim wins at once, with no peer to wait for"
+        );
+
+        mailbox
+            .bus()
+            .publish(lands_second.clone())
+            .await
+            .expect("publish");
+        let seen_after = resolve_claim_winner(&mailbox, "demo", job)
+            .await
+            .expect("winner");
+        assert_eq!(
+            seen_after,
+            Some(first.public_key().to_hex()),
+            "a later claim never overtakes the one that landed first"
+        );
+        // Control: the created_at rule alone would have picked the other one,
+        // so the assertion above can only pass through arrival order.
+        assert_eq!(
+            first_claimer(job, &[lands_first, lands_second]),
+            Some(second.public_key().to_hex())
+        );
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// A claim for another job, or a second claim by the winner, never
+    /// changes who won.
+    #[tokio::test]
+    async fn claim_winner_ignores_other_jobs_and_repeat_claims() {
+        let (mailbox, _pool, db_path, data_dir) = test_mailbox("claim-scope").await;
+        let job = EventId::from_hex(&"c4".repeat(32)).expect("job id");
+        let other = EventId::from_hex(&"d5".repeat(32)).expect("job id");
+        let winner = toron_core::keys::generate();
+        let rival = toron_core::keys::generate();
+        let now = Timestamp::now().as_secs();
+        for ev in [
+            build_job_claim(&rival, other, Timestamp::from(now)).expect("claim"),
+            build_job_claim(&winner, job, Timestamp::from(now + 9)).expect("claim"),
+            build_job_claim(&rival, job, Timestamp::from(now)).expect("claim"),
+            build_job_claim(&winner, job, Timestamp::from(now + 10)).expect("claim"),
+        ] {
+            mailbox.bus().publish(ev).await.expect("publish");
+        }
+        assert_eq!(
+            resolve_claim_winner(&mailbox, "demo", job)
+                .await
+                .expect("winner"),
+            Some(winner.public_key().to_hex())
+        );
+        assert_eq!(
+            resolve_claim_winner(&mailbox, "demo", other)
+                .await
+                .expect("winner"),
+            Some(rival.public_key().to_hex()),
+            "the other job keeps its own first claimer"
+        );
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_dir_all(&data_dir);
     }

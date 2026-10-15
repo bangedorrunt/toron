@@ -14,6 +14,8 @@
 //! agents claim on different relays simultaneously) are a P2.2 problem when
 //! RelayBus lands; this module documents that boundary.
 
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
 use nostr::prelude::{Event, EventId, Keys, Kind, Tag, Timestamp};
@@ -195,16 +197,42 @@ pub fn job_parent(event: &Event) -> Option<EventId> {
         .and_then(|s| EventId::from_hex(s).ok())
 }
 
-/// Resolve the claiming agent for a job: the author of the FIRST observed
-/// kind-43002 referencing the job (InProcessBus total order → deterministic).
+/// Resolve the claiming agent for a job from the claims alone: the earliest
+/// kind-43002 by `(created_at, id)`.
 ///
-/// Returns `None` when no claim is present. A subsequent 43002 by another
-/// agent is ignored (first-claimer wins); the function returns the first.
+/// This is only a **fallback** for backends that keep no arrival log. A
+/// claim's `created_at` is the claimer's own clock at whole-second
+/// resolution, so two claims in one second are ordered by their random ids,
+/// not by who got there first: a claimer that was already told it won can be
+/// overtaken by a later claim with a lower id (bd-sc28-two-winners-flake-9b60).
+/// Where the store has an arrival log use [`first_claimer_by_arrival`].
 pub fn first_claimer(job: EventId, claims: &[Event]) -> Option<String> {
     claims
         .iter()
         .filter(|e| e.kind == toron_kind(JOB_ACCEPTED) && job_parent(e) == Some(job))
         .min_by_key(|e| (e.created_at.as_secs(), e.id.to_hex()))
+        .map(|e| e.pubkey.to_hex())
+}
+
+/// Arrival seq (the store's commit order) of each claim event.
+pub type ClaimArrivals = HashMap<EventId, u64>;
+
+/// Resolve the claiming agent for a job by the store's commit order: the
+/// claim with the lowest arrival seq wins, whatever clock or id it carries.
+/// The seq is assigned inside the insert transaction, so every process on the
+/// store agrees on it the moment the claim is published: a claimer can decide
+/// on its own publish, with no waiting for a peer. A claim with no entry was
+/// evicted from the arrival log, so it is older than every claim that has
+/// one (rank 0); ties fall to the event id.
+pub fn first_claimer_by_arrival(
+    job: EventId,
+    claims: &[Event],
+    arrivals: &ClaimArrivals,
+) -> Option<String> {
+    claims
+        .iter()
+        .filter(|e| e.kind == toron_kind(JOB_ACCEPTED) && job_parent(e) == Some(job))
+        .min_by_key(|e| (arrivals.get(&e.id).copied().unwrap_or(0), e.id.to_hex()))
         .map(|e| e.pubkey.to_hex())
 }
 
@@ -222,6 +250,17 @@ pub enum JobState {
 /// Compute a job's state from the events referencing it. The lifecycle is:
 /// request → (claim → progress*) → result|cancel|error. Terminal states win.
 pub fn job_state(job: EventId, events: &[Event]) -> JobState {
+    job_state_inner(job, events, None)
+}
+
+/// [`job_state`] with the claimer resolved by the store's arrival order
+/// ([`first_claimer_by_arrival`]), so `job list`/`show` name the same winner
+/// that `job claim` told its caller.
+pub fn job_state_by_arrival(job: EventId, events: &[Event], arrivals: &ClaimArrivals) -> JobState {
+    job_state_inner(job, events, Some(arrivals))
+}
+
+fn job_state_inner(job: EventId, events: &[Event], arrivals: Option<&ClaimArrivals>) -> JobState {
     let job_events: Vec<&Event> = events
         .iter()
         .filter(|e| job_parent(e) == Some(job))
@@ -250,7 +289,11 @@ pub fn job_state(job: EventId, events: &[Event]) -> JobState {
 
     // Non-terminal: claim (and optional progress) drive the state.
     let job_events_owned: Vec<Event> = job_events.iter().map(|e| (*e).clone()).collect();
-    first_claimer(job, &job_events_owned).map_or(JobState::Open, |claimer| {
+    let claimer = match arrivals {
+        Some(a) => first_claimer_by_arrival(job, &job_events_owned, a),
+        None => first_claimer(job, &job_events_owned),
+    };
+    claimer.map_or(JobState::Open, |claimer| {
         let has_progress = job_events.iter().any(|e| e.kind.as_u16() == JOB_PROGRESS);
         if has_progress {
             JobState::InProgress(claimer)
@@ -368,6 +411,45 @@ mod tests {
             first_claimer(job, &[claim_a, claim_b]),
             Some(a.public_key().to_hex())
         );
+    }
+
+    #[test]
+    fn claim_first_arrival_wins_whatever_the_clock_or_id() {
+        let job =
+            EventId::from_hex("b32828720d7e8a80dd5165a6cd31b2c70e8d25b83c387209cb138e77d7e7e05b")
+                .expect("job id");
+        let a = keys();
+        let b = keys();
+        // B's clock is EARLIER and (one of the two orders) its id is lower, so
+        // the created_at rule picks B; but A arrived first.
+        let claim_a = build_job_claim(&a, job, Timestamp::from(TS + 5)).expect("claim a");
+        let claim_b = build_job_claim(&b, job, Timestamp::from(TS)).expect("claim b");
+        assert_eq!(
+            first_claimer(job, &[claim_a.clone(), claim_b.clone()]),
+            Some(b.public_key().to_hex()),
+            "control: the clock rule overtakes the claimer that arrived first"
+        );
+        let arrivals: ClaimArrivals = [(claim_a.id, 7), (claim_b.id, 8)].into_iter().collect();
+        for order in [
+            [claim_a.clone(), claim_b.clone()],
+            [claim_b.clone(), claim_a.clone()],
+        ] {
+            assert_eq!(
+                first_claimer_by_arrival(job, &order, &arrivals),
+                Some(a.public_key().to_hex()),
+                "the lower arrival seq wins in any slice order"
+            );
+        }
+        // An evicted claim (no entry) is older than every logged one.
+        let only_b: ClaimArrivals = [(claim_b.id, 8)].into_iter().collect();
+        assert_eq!(
+            first_claimer_by_arrival(job, &[claim_b.clone(), claim_a.clone()], &only_b),
+            Some(a.public_key().to_hex()),
+            "a claim missing from the arrival log is the oldest"
+        );
+        // job_state reports the same winner.
+        let state = job_state_by_arrival(job, &[claim_b, claim_a], &arrivals);
+        assert_eq!(state, JobState::Claimed(a.public_key().to_hex()));
     }
 
     #[test]

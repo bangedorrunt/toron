@@ -240,7 +240,7 @@ Already specified. This ADR makes it reachable.
 1. Member posts kind 9. Body contains `@Name`. Tags include `p`=that agent's npub (required; no `p` → no dispatch).
 2. Mention coalescer (already shipped) batches bursts per assignee → one stamped 43001.
 3. 43001 `e`-tags the kind-9 event. `assignee` tag = canonical name. `#t` = project slug only.
-4. Assignee `toron job claim` publishes 43002 signed by **their** registered key. First observed 43002 wins (`first_claimer`).
+4. Assignee `toron job claim` publishes 43002 signed by **their** registered key. First observed 43002 wins (`first_claimer`). *Amended (bd-sc28-two-winners-flake-9b60):* "first observed" is the store's arrival order (the `bus_arrivals` seq, assigned inside the insert transaction), not the claimers' `created_at`, which is a whole-second clock followed by a random id. `job claim` decides from its own publish with no wait, and `job list`/`show` name the same winner (`first_claimer_by_arrival`, `job_state_by_arrival`). The `(created_at, id)` rule (`first_claimer`) remains only for a backend with no arrival log, with the bounded quiescence wait.
 5. Winner `toron job progress` (optional 43003), then `result` (43004) or `error` (43006).
 6. Channel members see the result because `job show` reads the bus and, when the parent is kind 9, `channel read` shows a system line or the result event is `e`-tagged into the channel. **Wave 1 minimum:** `toron job show` is enough. Posting a kind-9 "done" summary is the claimer's job (skill recipe), not magic.
 
