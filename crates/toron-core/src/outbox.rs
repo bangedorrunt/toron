@@ -323,7 +323,7 @@ pub fn journal_producer(npub: &str) -> String {
 /// What one [`send_and_recover`] run did, per msg key.
 #[derive(Clone, Debug, Serialize)]
 pub struct SendReport {
-    /// The sender's journal epoch for this run (previous + 1).
+    /// The sender's journal epoch for this run (claimed from the log).
     pub journal_epoch: u64,
     /// Intents a crashed earlier run left unappended, and how each settled.
     pub recovered: BTreeMap<String, SendState>,
@@ -345,7 +345,19 @@ pub async fn send_and_recover(
 ) -> Result<SendReport, crate::inbox::InboxError> {
     use crate::inbox::{INBOX_STREAM, JOURNAL_STREAM};
     let producer = journal_producer(&sender);
-    let journal_epoch = store.producer_epoch(&producer).await?.map_or(0, |e| e + 1);
+    // Claimed, not computed: `producer_epoch + 1` was a read-then-add that
+    // two runs of one sender could win together, and that a run which
+    // journaled nothing never recorded (bd-journal-claim-epoch-4blu). The
+    // claim is one transaction; it also fences this sender's older journal
+    // epochs, so a zombie run cannot journal behind this one.
+    let holder = format!(
+        "send_and_recover:{}:{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos())
+    );
+    let journal_epoch = store.claim_epoch(&producer, &holder).await?.epoch;
     let handle = tokio::runtime::Handle::current();
     let journal = ToronLog::spawn(store.clone(), JOURNAL_STREAM, &handle);
     let inbox = ToronLog::spawn(store, INBOX_STREAM, &handle);
