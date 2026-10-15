@@ -93,6 +93,42 @@ fn delivery_fsm_is_pure() {
 }
 
 #[test]
+fn wake_decision_is_pure() {
+    let src = include_str!("../src/wake.rs");
+    let body: Vec<&str> = src
+        .split("#[cfg(test)]")
+        .next()
+        .unwrap_or("")
+        .lines()
+        .collect();
+    assert!(body.len() > 100, "the wake module is the real one");
+    let bad = offenders(&body);
+    assert!(
+        bad.is_empty(),
+        "impure tokens in the wake decision:\n{}",
+        bad.join("\n")
+    );
+}
+
+#[test]
+fn inbox_program_fold_is_pure() {
+    let src = include_str!("../src/inbox_program.rs");
+    let body: Vec<&str> = src
+        .split("#[cfg(test)]")
+        .next()
+        .unwrap_or("")
+        .lines()
+        .collect();
+    assert!(body.len() > 200, "the inbox program is the real one");
+    let bad = offenders(&body);
+    assert!(
+        bad.is_empty(),
+        "impure tokens in the inbox program:\n{}",
+        bad.join("\n")
+    );
+}
+
+#[test]
 fn the_purity_check_bites() {
     // Negative control: the interpreter is impure by design and must trip it.
     let src = include_str!("../src/outbox.rs");
