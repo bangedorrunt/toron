@@ -218,7 +218,8 @@ pub enum Command {
     Done(DoneArgs),
 
     /// Inbox plumbing: `append` (fixture door, one envelope straight to the
-    /// log) and `send` (journal first through the outbox loop, with recovery).
+    /// log), `send` (journal first through the outbox loop, with recovery) and
+    /// `task` (every envelope of a task you sent or received).
     #[command(subcommand)]
     Inbox(InboxCommand),
 }
@@ -286,6 +287,22 @@ pub enum InboxCommand {
     /// reconciles any of this sender's intents a crashed run left behind.
     /// Without --file it only recovers.
     Send(InboxSendArgs),
+    /// Every envelope of a task you sent or received, oldest first, with
+    /// its delivery phase (read-only).
+    Task(InboxTaskArgs),
+}
+
+#[derive(Debug, clap::Args)]
+pub struct InboxTaskArgs {
+    /// Task id carried on the envelope.
+    pub task: String,
+    /// Project slug (used to resolve --as).
+    #[arg(long, required = true)]
+    pub project: String,
+    /// Viewer: agent name or 64-hex npub. Only messages it sent or
+    /// received are shown.
+    #[arg(long = "as", required = true)]
+    pub who: String,
 }
 
 #[derive(Debug, clap::Args)]

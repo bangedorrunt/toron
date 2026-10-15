@@ -94,6 +94,38 @@ pub struct EpochClaim {
     pub previous: Option<u64>,
 }
 
+/// One envelope of a task, as [`InboxStore::by_task`] reports it.
+#[derive(Clone, Debug, Serialize)]
+pub struct TaskMessage {
+    /// `producer:epoch:seq`.
+    pub msg_key: String,
+    /// Log offset.
+    pub offset: u64,
+    /// The recipient this delivery row is for (an npub or group stream).
+    pub recipient: String,
+    /// Delivery phase now.
+    pub phase: Phase,
+    /// Current assignment generation.
+    pub generation: u32,
+    /// Who holds the claim, once acknowledged.
+    pub holder: Option<String>,
+    /// The envelope.
+    pub envelope: Envelope,
+}
+
+/// The task lookup (bd-n24w). Both tables are reached by index: the delivery
+/// rows by `inbox_delivery_by_task`, the log rows by `inbox_log_by_msg_key`.
+/// `CROSS JOIN` pins the order: the task's few delivery rows drive, and each
+/// reaches its log row by key. Left to itself the planner starts from the
+/// log's `stream` index and walks the whole inbox; the unary `+` keeps
+/// `stream` a plain filter so `msg_key` is the only index in play. Exported so
+/// a test can pin the query plan.
+pub const BY_TASK_SQL: &str = "SELECT d.msg_key, d.recipient, d.state_json, l.log_offset, l.payload \
+     FROM inbox_delivery d \
+     CROSS JOIN inbox_log l ON l.msg_key = d.msg_key AND +l.stream = 'inbox' \
+     WHERE d.task_id = ?1 \
+     ORDER BY l.log_offset, d.recipient";
+
 /// One message handed to its reader by [`InboxStore::next`].
 #[derive(Clone, Debug, Serialize)]
 pub struct InboxItem {
@@ -609,6 +641,45 @@ impl InboxStore {
             )
             .await?;
         Ok((msg_key, next))
+    }
+
+    /// Every envelope of `task_id` that `viewer` may see, oldest first, with
+    /// its delivery state (bd-n24w): the way for a sender to find a task's
+    /// whole conversation (assignment, replies, receipts) without walking
+    /// each recipient's log. `viewer` sees a message only if it sent it or
+    /// is its recipient, as everywhere else in the inbox; anyone else gets
+    /// an empty list, the same answer as for an unknown task id.
+    pub async fn by_task(
+        &self,
+        task_id: &str,
+        viewer: &str,
+    ) -> Result<Vec<TaskMessage>, InboxError> {
+        let rows = sqlx::query(BY_TASK_SQL)
+            .bind(task_id)
+            .fetch_all(&self.pool)
+            .await?;
+        let mut out = Vec::new();
+        for r in rows {
+            let msg_key: String = r.get(0);
+            let recipient: String = r.get(1);
+            let state: DeliveryState = serde_json::from_str(&r.get::<String, _>(2))
+                .map_err(|e| Reject::BadEnvelope(format!("stored delivery: {e}")))?;
+            let envelope: Envelope = serde_json::from_str(&r.get::<String, _>(4))
+                .map_err(|e| Reject::BadEnvelope(format!("stored payload: {e}")))?;
+            if envelope.from != viewer && recipient != viewer {
+                continue;
+            }
+            out.push(TaskMessage {
+                msg_key,
+                offset: r.get::<i64, _>(3) as u64,
+                recipient,
+                phase: state.phase,
+                generation: state.generation,
+                holder: state.holder,
+                envelope,
+            });
+        }
+        Ok(out)
     }
 
     /// Current delivery state.
