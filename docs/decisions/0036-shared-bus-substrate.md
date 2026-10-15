@@ -121,13 +121,20 @@ Chosen option: **Option A**, because the socket already has a proven pattern (he
 3. Heartbeat every N seconds of quiet (watchbeat cadence); client-side quiet-vs-deaf uses the same rule as today.
 4. Presence (20001) frames are sourced from the existing file projection, marked `{"projected": true}` — no fake liveness.
 
+**Amendment 2026-10-11 (no silent loss; bd-wake-live-burst-loss-j86v, bd-wake-replay-cap-qk8n).** flywheel's live run lost about 46% of a same-second burst with no frame, and a resume more than 1000 rows behind replayed only the newest 1000. Two causes: the cursor was `(created_at seconds, event id)`, which is not arrival order, so live events that sorted below their predecessor were suppressed as overlap; and replay went through a newest-1000 store window. Fixed as follows:
+
+- The store keeps an arrival log (`bus_arrivals`, `AUTOINCREMENT` seq written in the insert's transaction, so seq order is commit order and a number is never reused). The server mints `seq:<n>` cursors. The older `<created_at>:<event_id>` cursor is still accepted and placed by looking its event up. Cursors stay opaque to clients.
+- A subscriber is served from the store: replay and live delivery both page the arrival log from the subscriber's own cursor until it is exhausted. The fan-out broadcast is only a doorbell, so a slow reader gets backpressure, not a shed.
+- New frame `{"events_lost": {"from": "<cursor>", "through": "<cursor>|unknown"}}`. It is sent before replay when cap eviction removed arrivals after the subscriber's cursor (`through` = the highest evicted seq), or when a legacy cursor's event is no longer stored (`through` = `unknown`; replay then restarts from that cursor's second, preferring duplicates to a skip). A subscriber never misses a stored event without this frame.
+- Backends without an arrival log (relay buses) keep the previous path.
+
 ---
 
 ## 7. Spec 2 — socket surface
 
 1. Path: `$XDG_STATE_HOME/toron/wake.sock` (daemon data dir), mode 0600, single-writer lease reused from the `serve.pid` pattern (stale-socket takeover with identity check, never blind delete).
 2. One `subscribe_trusted(WAKE_KINDS)` held by the daemon; fan-out loop per subscriber with bounded queue (default 1024, structure mirrors `subscription.rs:75-83` capacity).
-3. Slow consumer: shed with `shed` frame + cursor; client replays via store, resubscribes. Shed counts exported (today's `note_full_drop` honesty, extended across the socket).
+3. Slow consumer: shed with `shed` frame + cursor; client replays via store, resubscribes. Shed counts exported (today's `note_full_drop` honesty, extended across the socket). *(Amended 2026-10-11: on the arrival-log path a slow consumer is backpressured and never shed; `shed` remains only on the legacy path. See the §6 amendment.)*
 4. UDS only by default. TCP loopback (`127.0.0.1`, opt-in flag, allowlisted) only for layouts without shared filesystem — never on by default.
 5. `serve` without the sidecar flag still works (embedded consumers keep today's paths); the flag is per-daemon, consumers degrade to poll with a loud reason when the socket is absent (fail-closed visibility, never silent deafness).
 

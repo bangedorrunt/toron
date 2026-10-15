@@ -153,6 +153,35 @@ pub trait Bus: Send + Sync + 'static {
     async fn store_version(&self) -> Option<i64> {
         None
     }
+
+    /// Stored events in ARRIVAL order strictly after arrival seq `after`, at
+    /// most `limit`, restricted to `kinds` (empty = all). `Ok(None)` means
+    /// this backend keeps no arrival log, and a consumer must fall back to
+    /// [`Self::subscribe_trusted`] (bd-wake-replay-cap-qk8n).
+    ///
+    /// Paging with the last returned seq walks the whole stored history:
+    /// there is no newest-N window, and seq order is commit order.
+    async fn arrivals_after(
+        &self,
+        kinds: &[u16],
+        after: u64,
+        limit: usize,
+    ) -> Result<Option<Vec<(u64, Event)>>, BusError> {
+        let _ = (kinds, after, limit);
+        Ok(None)
+    }
+
+    /// Arrival seq of a stored event id (`None` when unknown or unsupported).
+    async fn arrival_seq_of(&self, event_id: &str) -> Result<Option<u64>, BusError> {
+        let _ = event_id;
+        Ok(None)
+    }
+
+    /// Highest arrival seq the store has evicted before every reader could
+    /// see it (0 = none, or unsupported).
+    async fn arrivals_evicted_through(&self) -> Result<u64, BusError> {
+        Ok(0)
+    }
 }
 
 #[test]
