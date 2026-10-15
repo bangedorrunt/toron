@@ -136,3 +136,24 @@ fn a_malformed_key_is_refused_with_exit_3() {
     );
     assert_eq!(json(&o)["refused"], "bad_key");
 }
+
+/// bd-reject-badenvelope-panic-bhls: a file that is not an envelope is a
+/// typed refusal with exit 3, not a panic (exit 101).
+#[test]
+fn append_of_a_non_envelope_is_refused_with_exit_3_not_a_panic() {
+    let d = scratch("notenv");
+    let f = d.join("bad.json");
+    std::fs::write(&f, r#"{"not":"an envelope"}"#).unwrap();
+    let o = toron(&d, &["inbox", "append", "--file", f.to_str().unwrap()]);
+    assert_eq!(
+        o.status.code(),
+        Some(3),
+        "stdout {} stderr {}",
+        String::from_utf8_lossy(&o.stdout),
+        String::from_utf8_lossy(&o.stderr)
+    );
+    let v = json(&o);
+    assert_eq!(v["refused"]["reject"], "bad_envelope");
+    assert!(v["refused"]["why"].as_str().unwrap().len() > 3);
+    assert!(!String::from_utf8_lossy(&o.stderr).contains("panicked"));
+}

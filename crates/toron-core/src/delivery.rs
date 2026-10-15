@@ -231,8 +231,17 @@ pub enum Reject {
     #[error("body is not a valid {contract}: {error}")]
     BadBody { contract: String, error: String },
     /// Malformed envelope.
-    #[error("bad envelope: {0}")]
-    BadEnvelope(String),
+    ///
+    /// A struct variant, not a newtype: `Reject` is internally tagged
+    /// (`tag = "reject"`) and serde cannot serialize a tagged newtype that
+    /// holds a string, so a newtype here made every CLI refusal path panic
+    /// (bd-reject-badenvelope-panic-bhls). Build it with
+    /// [`Reject::bad_envelope`].
+    #[error("bad envelope: {why}")]
+    BadEnvelope {
+        /// What was wrong.
+        why: String,
+    },
     /// An address is not an npub (names are never addresses).
     #[error("{field} is not an npub (64 lowercase hex): {value:?}")]
     BadAddress { field: &'static str, value: String },
@@ -266,6 +275,13 @@ pub enum Reject {
     /// No such edge.
     #[error("no transition from {phase:?} on {event}")]
     IllegalTransition { phase: Phase, event: &'static str },
+}
+
+impl Reject {
+    /// A malformed envelope, with the reason.
+    pub fn bad_envelope(why: impl Into<String>) -> Self {
+        Self::BadEnvelope { why: why.into() }
+    }
 }
 
 /// The pure transition function.

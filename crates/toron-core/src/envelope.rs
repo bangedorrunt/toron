@@ -230,7 +230,7 @@ impl Envelope {
             _ => {}
         }
         if self.context.0.trim().is_empty() {
-            return Err(Reject::BadEnvelope("context is empty".into()));
+            return Err(Reject::bad_envelope("context is empty"));
         }
         contracts::check(self)?;
         Ok(())
@@ -238,7 +238,7 @@ impl Envelope {
 
     /// Parse and validate one envelope from JSON.
     pub fn from_json(s: &str) -> Result<Self, Reject> {
-        let env: Self = serde_json::from_str(s).map_err(|e| Reject::BadEnvelope(e.to_string()))?;
+        let env: Self = serde_json::from_str(s).map_err(|e| Reject::bad_envelope(e.to_string()))?;
         env.validate()?;
         Ok(env)
     }
