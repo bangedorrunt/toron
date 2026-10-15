@@ -1,0 +1,9 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 1bc69b1275dde4ebf833853492277d8c232d1ecc6ef0d3819a407a023bf079ce # shrinks to msgs = [Bound { recipient: "bbbb", pane_id: "w1:bbbb", herdr_session: "s1", generation: 1, verified: true, verified_by: "test" }, Invalidate(EventsLost), Head { recipient: "bbbb", head: 1, urgency: Urgent }, Pane { recipient: "bbbb", state: Idle }, Tick { now_ms: 0 }, Hint { recipient: "bbbb", now_ms: 10000 }, Hint { recipient: "bbbb", now_ms: 30000 }], readers = true
+cc ad2443e70ec9ff20b0aa7ff7b35b0447d1d8dc92015479fb0ff1bc0cfae8e398 # shrinks to msgs = [Head { recipient: "aaaa", head: 21, urgency: Normal }, Invalidate(EventsLost), Head { recipient: "aaaa", head: 0, urgency: Urgent }, Cursor { recipient: "aaaa", cursor: 20 }, Pane { recipient: "aaaa", state: Idle }, Bound { recipient: "aaaa", pane_id: "w1:aaaa", herdr_session: "s1", generation: 1, verified: true, verified_by: "test" }, Hint { recipient: "aaaa", now_ms: 0 }, Cursor { recipient: "aaaa", cursor: 20 }]
+cc 642dc34b67c76921febc900c7fb99859e976fbbe67675e553360fdd5109d4818 # shrinks to msgs = [Head { recipient: "aaaa", head: 1, urgency: Normal }], readers = false
