@@ -166,12 +166,12 @@
       "name": "done"
     },
     {
-      "args": "append, send, task",
+      "args": "append, send, task, msg",
       "description": "Inbox plumbing: `append` (fixture door, one envelope straight to the log), `send` (journal first through the outbox loop, with recovery) and `task` (every envelope of a task you sent or received)",
       "name": "inbox"
     }
   ],
-  "generated_at": "2026-10-15T17:29:41Z",
+  "generated_at": "2026-10-15T20:14:10Z",
   "resources": [
     {
       "description": "List projects known to toron.",
