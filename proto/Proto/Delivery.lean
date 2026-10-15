@@ -169,4 +169,30 @@ theorem rework_needs_a_verdict (s s' : State) (e : Event) (h : step s e = .ok s'
   · split at h <;> (repeat' split at h) <;> (first | cases h | (injection h with h; subst h)) <;>
       simp_all
 
+/-! ## P4: Delivered implies the cursor covers the offset and the reader is the recipient -/
+
+/-- P4. A `read` moves a sent delivery to delivered only when the reader is
+the recipient and its cursor is at or past the delivery's offset. -/
+theorem delivered_needs_cursor_and_recipient (s s' : State) (reader : String) (cursor : Nat)
+    (hs : s.phase = .sent) (h : step s (.read reader cursor) = .ok s') :
+    reader = s.recipient ∧ ∃ off, s.offset = some off ∧ off ≤ cursor ∧ s'.phase = .delivered := by
+  have hn : s.isTerminal = false := by
+    simp [State.isTerminal, hs, Phase.rank, successTerminal]
+    cases s.cls <;> simp
+  unfold step at h
+  simp only [hn, hs] at h
+  simp at h
+  by_cases h1 : reader = s.recipient
+  · simp [h1] at h
+    cases ho : s.offset with
+    | none => simp [ho] at h
+    | some off =>
+      simp [ho] at h
+      by_cases h2 : cursor < off
+      · simp [h2] at h
+      · simp [h2] at h
+        subst h
+        exact ⟨h1, off, rfl, by omega, rfl⟩
+  · simp [h1] at h
+
 end Proto

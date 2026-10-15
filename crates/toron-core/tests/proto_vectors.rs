@@ -9,6 +9,7 @@ use toron_core::delivery::{DeliveryEvent, DeliveryFsm, DeliveryState};
 use toron_core::inbox::{InboxStore, JOURNAL_STREAM};
 use toron_core::index::schema;
 use toron_core::kernel::{AppendError, durable_log_laws};
+use toron_core::wake::{RingDecision, RingInput, should_ring};
 
 fn vectors(name: &str) -> String {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -98,4 +99,34 @@ async fn log_traces_from_lean_pass_on_the_real_store() {
         n += 1;
     }
     assert_eq!(n, 125);
+}
+
+#[test]
+fn wake_vectors_from_lean_pass_in_rust() {
+    let mut n = 0;
+    for (i, line) in vectors("wake.jsonl").lines().enumerate() {
+        let v: serde_json::Value = serde_json::from_str(line).unwrap();
+        let input: RingInput = serde_json::from_value(v["input"].clone()).unwrap();
+        let want: RingDecision = serde_json::from_value(v["expect"].clone()).unwrap();
+        assert_eq!(should_ring(&input), want, "vector {i}: {line}");
+        n += 1;
+    }
+    assert_eq!(
+        n, 4536,
+        "the committed vector count changed; regenerate deliberately"
+    );
+}
+
+/// Negative control: a corrupted expectation is caught by the same replay.
+#[test]
+fn a_wrong_wake_vector_is_caught() {
+    let line = vectors("wake.jsonl")
+        .lines()
+        .find(|l| l.contains("\"decision\":\"ring\""))
+        .unwrap()
+        .to_string();
+    let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+    let input: RingInput = serde_json::from_value(v["input"].clone()).unwrap();
+    let wrong = RingDecision::Escalate { wm: input.head };
+    assert_ne!(should_ring(&input), wrong);
 }

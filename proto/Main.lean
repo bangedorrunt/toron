@@ -100,6 +100,49 @@ def traceLine (ts : List Triple) : String := Id.run do
 def allTraces : List String :=
   triples.flatMap fun a => triples.flatMap fun b => triples.map fun c => traceLine [a, b, c]
 
+/-! Wake vectors: a grid over the inputs of `shouldRing` (head 5; cursor
+caught up or behind; binding good, unverified or stale; every pane state;
+last ring never / for an older / for this watermark; last ring recent or
+long ago; ring counts around both budgets; both urgencies). Golden table. -/
+
+def paneName : PaneState → String
+  | .idle => "idle" | .done => "done" | .working => "working"
+  | .blocked => "blocked" | .unknown => "unknown" | .gone => "gone"
+
+def urgencyName : Urgency → String
+  | .normal => "normal" | .urgent => "urgent"
+
+def ringInputJson (i : RingInput) : String :=
+  "{\"head\":" ++ toString i.head ++ ",\"cursor\":" ++ toString i.cursor ++
+  ",\"binding_verified\":" ++ toString i.bindingVerified ++
+  ",\"binding_gen\":" ++ toString i.bindingGen ++ ",\"current_gen\":" ++ toString i.currentGen ++
+  ",\"pane_state\":" ++ jstr (paneName i.pane) ++ ",\"last_ring_wm\":" ++ joptN i.lastRingWm ++
+  ",\"last_ring_at_ms\":" ++ joptN i.lastRingAt ++ ",\"rings_since_advance\":" ++ toString i.rings ++
+  ",\"now_ms\":" ++ toString i.now ++ ",\"urgency\":" ++ jstr (urgencyName i.urgency) ++ "}"
+
+def decisionJson : Decision → String
+  | .nothingUnread => "{\"decision\":\"nothing_unread\"}"
+  | .unbound => "{\"decision\":\"unbound\"}"
+  | .busy => "{\"decision\":\"busy\"}"
+  | .hold u => "{\"decision\":\"hold\",\"until_ms\":" ++ toString u ++ "}"
+  | .ring w => "{\"decision\":\"ring\",\"wm\":" ++ toString w ++ "}"
+  | .escalate w => "{\"decision\":\"escalate\",\"wm\":" ++ toString w ++ "}"
+
+def wakeInputs : List RingInput := Id.run do
+  let mut out := []
+  for cursor in [5, 4] do
+    for (verified, bgen) in [(true, 2), (false, 2), (true, 1)] do
+      for pane in [PaneState.idle, .done, .working, .blocked, .unknown, .gone] do
+        for lastWm in [none, some 4, some 5] do
+          for lastAt in [none, some 999000, some 0] do
+            for rings in [0, 1, 2, 3, 4, 5, 6] do
+              for u in [Urgency.normal, .urgent] do
+                out := out ++ [RingInput.mk 5 cursor verified bgen 2 pane lastWm lastAt rings 1000000 u]
+  return out
+
+def allWakeVectors : List String := wakeInputs.map fun i =>
+  "{\"input\":" ++ ringInputJson i ++ ",\"expect\":" ++ decisionJson (shouldRing i) ++ "}"
+
 def checkFile (file : String) (lines : List String) (what : String) : IO UInt32 := do
   let committed ← IO.FS.readFile file
   let fresh := String.intercalate "\n" lines ++ "\n"
@@ -120,6 +163,10 @@ def main (args : List String) : IO UInt32 := do
     for l in allVectors do IO.println l
     return 0
   | ["vectors", "--check", file] => checkFile file allVectors "delivery vectors"
+  | ["wake-vectors"] =>
+    for l in allWakeVectors do IO.println l
+    return 0
+  | ["wake-vectors", "--check", file] => checkFile file allWakeVectors "wake vectors"
   | _ =>
-    IO.eprintln "usage: proto (vectors | log-traces) [--check FILE]"
+    IO.eprintln "usage: proto (vectors | log-traces | wake-vectors) [--check FILE]"
     return 2
