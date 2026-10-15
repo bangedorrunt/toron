@@ -1,5 +1,5 @@
 // governed-by: ADR-0041
-//! `toron next | ack | done | inbox append` (ADR-0041): CLI-only comms
+//! `toron next | ack | done | inbox append | send | task` (ADR-0041): CLI-only comms
 //! verbs over the shared durable root, behind `TORON_COMMS_INBOX`.
 //!
 //! Exit codes: 0 ok, 2 flag off / usage, 3 refused by the delivery FSM or
@@ -87,6 +87,12 @@ pub async fn run_comms(command: &Command, format: OutputFormat) -> anyhow::Resul
             toron_core::outbox::send_and_recover(store, sender, sends)
                 .await
                 .map(|r| serde_json::to_value(r).unwrap_or_default())
+        }
+        Command::Inbox(InboxCommand::Task(a)) => {
+            let viewer = mailbox.comms_npub(&a.project, &a.who).await?;
+            store.by_task(&a.task, &viewer).await.map(|messages| {
+                json!({"task": a.task, "viewer": viewer, "count": messages.len(), "messages": messages})
+            })
         }
         _ => unreachable!("run_comms only handles the comms verbs"),
     };

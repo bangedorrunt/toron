@@ -286,6 +286,22 @@ pub enum InboxCommand {
     /// reconciles any of this sender's intents a crashed run left behind.
     /// Without --file it only recovers.
     Send(InboxSendArgs),
+    /// Every envelope of a task you sent or received, oldest first, with
+    /// its delivery phase (read-only).
+    Task(InboxTaskArgs),
+}
+
+#[derive(Debug, clap::Args)]
+pub struct InboxTaskArgs {
+    /// Task id carried on the envelope.
+    pub task: String,
+    /// Project slug (used to resolve --as).
+    #[arg(long, required = true)]
+    pub project: String,
+    /// Viewer: agent name or 64-hex npub. Only messages it sent or
+    /// received are shown.
+    #[arg(long = "as", required = true)]
+    pub who: String,
 }
 
 #[derive(Debug, clap::Args)]
