@@ -81,6 +81,19 @@ pub struct Appended {
     pub replay: bool,
 }
 
+/// A producer epoch handed out by [`InboxStore::claim_epoch`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct EpochClaim {
+    /// The producer the epoch belongs to.
+    pub producer: String,
+    /// The claimed epoch: strictly above every epoch ever claimed or
+    /// appended for this producer. The claimant's first seq is 0.
+    pub epoch: u64,
+    /// The highest epoch the log knew for this producer before the claim
+    /// (`None` = a new producer). Everything at or below it is now fenced.
+    pub previous: Option<u64>,
+}
+
 /// One message handed to its reader by [`InboxStore::next`].
 #[derive(Clone, Debug, Serialize)]
 pub struct InboxItem {
@@ -256,7 +269,17 @@ impl InboxStore {
                 .fetch_optional(&mut *tx)
                 .await
                 .map_err(unavailable)?;
-        if let Some((current, _)) = state
+        // The fence is the higher of the producer's last appended epoch and
+        // its highest claimed epoch (bd-epoch-claim-z5m5): a claim fences
+        // every older incarnation before the new one has appended anything.
+        let claimed: Option<i64> =
+            sqlx::query_scalar("SELECT epoch FROM inbox_epoch_claim WHERE producer = ?1")
+                .bind(&producer)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(unavailable)?;
+        let fence = state.map(|(e, _)| e).max(claimed);
+        if let Some(current) = fence
             && epoch < current as u64
         {
             return Err(AppendError::StaleEpoch {
@@ -604,15 +627,69 @@ impl InboxStore {
             })
     }
 
-    /// A producer's current epoch (`None` = never appended). A restarted
-    /// sender journals under `epoch + 1`, which fences its old self.
+    /// A producer's current epoch: the higher of its last appended epoch and
+    /// its highest claimed one (`None` = never appended or claimed). A
+    /// restarted sender journals under `epoch + 1`, which fences its old self.
     pub async fn producer_epoch(&self, producer: &str) -> Result<Option<u64>, sqlx::Error> {
-        let e: Option<i64> =
-            sqlx::query_scalar("SELECT epoch FROM inbox_producer_state WHERE producer = ?1")
-                .bind(producer)
-                .fetch_optional(&self.pool)
-                .await?;
+        let e: Option<i64> = sqlx::query_scalar(
+            "SELECT MAX(epoch) FROM (
+                 SELECT epoch FROM inbox_producer_state WHERE producer = ?1
+                 UNION ALL
+                 SELECT epoch FROM inbox_epoch_claim WHERE producer = ?1
+             )",
+        )
+        .bind(producer)
+        .fetch_one(&self.pool)
+        .await?;
         Ok(e.map(|e| e as u64))
+    }
+
+    /// Atomically claim the next epoch for `producer` (bd-epoch-claim-z5m5).
+    ///
+    /// One `BEGIN IMMEDIATE` transaction reads the highest epoch the log
+    /// knows (appended or already claimed) and records the next one for
+    /// `holder`, so two callers, in one process or many, never receive the
+    /// same epoch. The first claim for a producer is epoch 0. A claimed epoch
+    /// fences every lower one at once ([`AppendError::StaleEpoch`]); the
+    /// claimant then appends from seq 0. An epoch whose holder never appends
+    /// is simply skipped: epochs are unique and increasing, not contiguous in
+    /// the log.
+    pub async fn claim_epoch(
+        &self,
+        producer: &str,
+        holder: &str,
+    ) -> Result<EpochClaim, sqlx::Error> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let previous: Option<i64> = sqlx::query_scalar(
+            "SELECT MAX(epoch) FROM (
+                 SELECT epoch FROM inbox_producer_state WHERE producer = ?1
+                 UNION ALL
+                 SELECT epoch FROM inbox_epoch_claim WHERE producer = ?1
+             )",
+        )
+        .bind(producer)
+        .fetch_one(&mut *tx)
+        .await?;
+        let epoch = previous.map_or(0, |p| p + 1);
+        sqlx::query(
+            "INSERT INTO inbox_epoch_claim (producer, epoch, holder, claimed_ts_us) \
+             VALUES (?1, ?2, ?3, ?4) \
+             ON CONFLICT (producer) DO UPDATE SET \
+                 epoch = excluded.epoch, holder = excluded.holder, \
+                 claimed_ts_us = excluded.claimed_ts_us",
+        )
+        .bind(producer)
+        .bind(epoch)
+        .bind(holder)
+        .bind(now_us())
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(EpochClaim {
+            producer: producer.to_string(),
+            epoch: epoch as u64,
+            previous: previous.map(|p| p as u64),
+        })
     }
 
     /// Head offset of the reader's inbox (0 = empty): `head > cursor` is the
