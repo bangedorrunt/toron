@@ -55,6 +55,15 @@ pub enum InboxError {
     /// No delivery for that message and recipient.
     #[error("no delivery {msg_key} for {recipient}")]
     NoSuchDelivery { msg_key: String, recipient: String },
+    /// The triple is already in the log with a DIFFERENT payload. A replay
+    /// carries the same bytes it carried the first time; anything else is a
+    /// producer that reused a (producer, epoch, seq) for new content, and
+    /// answering "replay" would silently drop that content
+    /// (bd-envelope-conflict-3d7u).
+    #[error(
+        "payload conflict on {msg_key}: the log already holds different content under this producer triple"
+    )]
+    PayloadConflict { msg_key: String },
     /// The flag is off.
     #[error("comms inbox is off: set TORON_COMMS_INBOX=1")]
     Disabled,
@@ -147,6 +156,20 @@ pub fn l16_json(env: &Envelope) -> String {
     .to_string()
 }
 
+/// Why an append failed inside the store: the kernel's own refusals, plus
+/// the one verdict the vendored [`AppendError`] has no variant for.
+#[derive(Debug)]
+enum Refusal {
+    Log(AppendError),
+    PayloadConflict { msg_key: String },
+}
+
+impl From<AppendError> for Refusal {
+    fn from(e: AppendError) -> Self {
+        Self::Log(e)
+    }
+}
+
 fn unavailable(e: impl std::fmt::Display) -> AppendError {
     AppendError::Unavailable(e.to_string())
 }
@@ -171,7 +194,24 @@ impl InboxStore {
     /// L16 append of one wire envelope onto `stream`. On the inbox stream
     /// the payload must be a valid [`Envelope`] whose `msg` equals the
     /// producer triple. Fence before dedupe, as in the kernel's laws.
+    ///
+    /// A triple already in the log is a replay only when its payload is the
+    /// same. A different payload under the same triple is refused. Through
+    /// this kernel-facing entry the refusal is `NotAnEnvelope` naming the
+    /// conflict (the vendored enum is closed); [`Self::append_envelope`]
+    /// returns the typed [`InboxError::PayloadConflict`].
     pub async fn append_json(&self, stream: &str, json: &str) -> Result<Appended, AppendError> {
+        self.append_checked(stream, json)
+            .await
+            .map_err(|r| match r {
+                Refusal::Log(e) => e,
+                Refusal::PayloadConflict { msg_key } => AppendError::NotAnEnvelope(format!(
+                    "payload conflict on {msg_key}: the log already holds different content under this producer triple"
+                )),
+            })
+    }
+
+    async fn append_checked(&self, stream: &str, json: &str) -> Result<Appended, Refusal> {
         let (producer, epoch, seq, payload) = parse_l16(json)?;
         let (recipient, msg_key, delivery) = if stream == INBOX_STREAM {
             let env: Envelope = serde_json::from_value(payload.clone())
@@ -187,7 +227,8 @@ impl InboxStore {
             {
                 return Err(AppendError::NotAnEnvelope(
                     "envelope msg differs from the producer triple".into(),
-                ));
+                )
+                .into());
             }
             let stream_key = env.to.stream();
             let d = DeliveryState::intent(env.class, stream_key.clone(), env.generation);
@@ -222,10 +263,11 @@ impl InboxStore {
                 producer,
                 sent: epoch,
                 current: current as u64,
-            });
+            }
+            .into());
         }
-        let existing: Option<i64> = sqlx::query_scalar(
-            "SELECT log_offset FROM inbox_log WHERE producer = ?1 AND epoch = ?2 AND seq = ?3",
+        let existing: Option<(i64, String)> = sqlx::query_as(
+            "SELECT log_offset, payload FROM inbox_log WHERE producer = ?1 AND epoch = ?2 AND seq = ?3",
         )
         .bind(&producer)
         .bind(epoch as i64)
@@ -233,7 +275,13 @@ impl InboxStore {
         .fetch_optional(&mut *tx)
         .await
         .map_err(unavailable)?;
-        if let Some(offset) = existing {
+        if let Some((offset, stored)) = existing {
+            // Same triple: a replay only if it is the same content.
+            let same = serde_json::from_str::<serde_json::Value>(&stored)
+                .is_ok_and(|stored| stored == payload);
+            if !same {
+                return Err(Refusal::PayloadConflict { msg_key });
+            }
             return Ok(Appended {
                 offset: offset as u64,
                 replay: true,
@@ -245,7 +293,7 @@ impl InboxStore {
         };
         let expected = last.map_or(0, |l| l + 1);
         if seq != expected {
-            return Err(AppendError::SeqGap { got: seq, last });
+            return Err(AppendError::SeqGap { got: seq, last }.into());
         }
         let now = now_us();
         let offset: i64 = sqlx::query_scalar(
@@ -293,10 +341,17 @@ impl InboxStore {
     }
 
     /// Validate and append one envelope to the inbox (the `mail.append`
-    /// provider). Idempotent on `msg`.
+    /// provider). Idempotent on `msg` for the same content; a different payload
+    /// under an existing `msg` is [`InboxError::PayloadConflict`].
     pub async fn append_envelope(&self, env: &Envelope) -> Result<Appended, InboxError> {
         env.validate()?;
-        Ok(self.append_json(INBOX_STREAM, &l16_json(env)).await?)
+        match self.append_checked(INBOX_STREAM, &l16_json(env)).await {
+            Ok(appended) => Ok(appended),
+            Err(Refusal::Log(e)) => Err(e.into()),
+            Err(Refusal::PayloadConflict { msg_key }) => {
+                Err(InboxError::PayloadConflict { msg_key })
+            }
+        }
     }
 
     /// Reconcile query: the offset holding `msg`, if the log has it.
