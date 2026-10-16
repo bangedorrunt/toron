@@ -14,6 +14,7 @@ pub mod envelope;
 pub mod inbox;
 pub mod inbox_program;
 pub mod index;
+pub mod job_kinds;
 pub mod journal;
 pub mod jsonl;
 pub mod kernel;

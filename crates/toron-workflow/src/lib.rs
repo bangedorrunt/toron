@@ -65,7 +65,7 @@ pub use guard::{
 pub use jobs::{
     JobError, JobRequest, JobResult, JobState, build_and_serialize, build_job_cancel,
     build_job_claim, build_job_error, build_job_progress, build_job_request, build_job_result,
-    first_claimer, job_parent, job_request_json, job_state,
+    first_claimer, job_parent, job_request_json, job_state, kind_for_step,
 };
 pub use lint::{
     Level, LintIssue, LintReport, lint_workflow, lint_workflow_with_principles, lint_yaml,
