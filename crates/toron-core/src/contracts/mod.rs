@@ -5,13 +5,26 @@
 //! [`Reject::UnsupportedContract`], never parsed loosely.
 
 pub mod notify_v1;
+pub mod role_v1;
 pub mod task_v1;
+pub mod verdict_v1;
 
 use crate::delivery::Reject;
 use crate::envelope::{Class, Envelope};
 
 /// Every contract this build understands, as `(name, major, class)`.
-pub const KNOWN: &[(&str, u32, Class)] = &[("task", 1, Class::Task), ("notify", 1, Class::Notify)];
+///
+/// The two Control-class entries are the Phase 4.1 minimum: `role@1` (the role
+/// fact the authority checks read) and `verdict@1` (provisional shape, owned
+/// by 4.3). `steer`, `cancel`, `approval` are named in the authority table
+/// but are not contracts yet; an envelope naming one is
+/// [`Reject::UnsupportedContract`] until the phase that adds it.
+pub const KNOWN: &[(&str, u32, Class)] = &[
+    ("task", 1, Class::Task),
+    ("notify", 1, Class::Notify),
+    ("role", 1, Class::Control),
+    ("verdict", 1, Class::Control),
+];
 
 /// A parsed, typed body.
 #[derive(Clone, Debug, PartialEq)]
@@ -20,6 +33,10 @@ pub enum Body {
     Task(task_v1::TaskV1),
     /// `notify@1`.
     Notify(notify_v1::NotifyV1),
+    /// `role@1` (Control).
+    Role(role_v1::RoleV1),
+    /// `verdict@1` (Control, provisional).
+    Verdict(verdict_v1::VerdictV1),
 }
 
 /// Check the envelope's contract: known, consistent with its class, and the
@@ -50,11 +67,15 @@ pub fn parse(env: &Envelope) -> Result<Body, Reject> {
     let body = match c.name.as_str() {
         "task" => Body::Task(serde_json::from_value(env.body.clone()).map_err(bad)?),
         "notify" => Body::Notify(serde_json::from_value(env.body.clone()).map_err(bad)?),
+        "role" => Body::Role(serde_json::from_value(env.body.clone()).map_err(bad)?),
+        "verdict" => Body::Verdict(serde_json::from_value(env.body.clone()).map_err(bad)?),
         _ => unreachable!("KNOWN and this match list the same names"),
     };
     match &body {
         Body::Task(t) => t.validate(env)?,
         Body::Notify(n) => n.validate()?,
+        Body::Role(r) => r.validate(env)?,
+        Body::Verdict(v) => v.validate(env)?,
     }
     Ok(body)
 }
