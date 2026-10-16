@@ -76,6 +76,14 @@ fn every_reject() -> Vec<Reject> {
         Reject::NotYet {
             what: "supervisor".into(),
         },
+        Reject::SteerPending {
+            id: "prod:0:1".into(),
+            op: "redirect".into(),
+        },
+        Reject::StaleSupEpoch {
+            sent: 1,
+            current: 2,
+        },
     ];
     for r in &all {
         match r {
@@ -96,7 +104,9 @@ fn every_reject() -> Vec<Reject> {
             | Reject::Terminal { .. }
             | Reject::IllegalTransition { .. }
             | Reject::Unauthorized { .. }
-            | Reject::NotYet { .. } => {}
+            | Reject::NotYet { .. }
+            | Reject::SteerPending { .. }
+            | Reject::StaleSupEpoch { .. } => {}
         }
     }
     all
@@ -195,5 +205,53 @@ fn not_yet_carries_what_on_the_wire() {
         }
         .to_string(),
         "not yet: supervisor"
+    );
+}
+
+/// Phase 4a.2: a crew verb blocked on an unacked steer names the steer and its op.
+#[test]
+fn steer_pending_carries_the_steer_id_and_op_on_the_wire() {
+    let v = serde_json::to_value(Reject::SteerPending {
+        id: "prod:0:1".into(),
+        op: "redirect".into(),
+    })
+    .unwrap();
+    assert_eq!(
+        v,
+        serde_json::json!({
+            "reject": "steer_pending",
+            "id": "prod:0:1",
+            "op": "redirect"
+        })
+    );
+    assert_eq!(
+        Reject::SteerPending {
+            id: "prod:0:1".into(),
+            op: "pause".into()
+        }
+        .to_string(),
+        "steer prod:0:1 (pause) is unacked"
+    );
+}
+
+/// Phase 4a.3: a lead epoch that is not the one on record.
+#[test]
+fn stale_sup_epoch_carries_sent_and_current_on_the_wire() {
+    let v = serde_json::to_value(Reject::StaleSupEpoch {
+        sent: 1,
+        current: 4,
+    })
+    .unwrap();
+    assert_eq!(
+        v,
+        serde_json::json!({"reject": "stale_sup_epoch", "sent": 1, "current": 4})
+    );
+    assert_eq!(
+        Reject::StaleSupEpoch {
+            sent: 1,
+            current: 4
+        }
+        .to_string(),
+        "stale sup_epoch 1, current 4"
     );
 }
