@@ -7,11 +7,14 @@
 pub mod approval_v1;
 pub mod cancel_v1;
 pub mod context_v1;
+pub mod escalate_v1;
+pub mod goal_v1;
 pub mod not_ready_v1;
 pub mod notify_v1;
 pub mod reply_v1;
 pub mod request_v1;
 pub mod role_v1;
+pub mod steer_v1;
 pub mod task_v1;
 pub mod verdict_v1;
 
@@ -21,9 +24,9 @@ use crate::envelope::{Class, Envelope};
 /// Every contract this build understands, as `(name, major, class)`.
 ///
 /// Control-class entries: `role@1` and `verdict@1` (Phase 4.1), `context@1`
-/// (Phase 4.2), `cancel@1` and `approval@1` (Phase 4.3). `steer`, `goal`, and
-/// `escalate` stay unnamed until Phase 4a; an envelope naming one is
-/// [`Reject::UnsupportedContract`].
+/// (Phase 4.2), `cancel@1` and `approval@1` (Phase 4.3), `goal@1`,
+/// `escalate@1`, and `steer@1` (Phase 4a). An envelope naming anything else
+/// is [`Reject::UnsupportedContract`].
 /// `not_ready@1` is [`Class::Receipt`] (the class exists; a receipt, not a control).
 pub const KNOWN: &[(&str, u32, Class)] = &[
     ("task", 1, Class::Task),
@@ -35,6 +38,9 @@ pub const KNOWN: &[(&str, u32, Class)] = &[
     ("reply", 1, Class::Reply),
     ("cancel", 1, Class::Control),
     ("approval", 1, Class::Control),
+    ("goal", 1, Class::Control),
+    ("escalate", 1, Class::Control),
+    ("steer", 1, Class::Control),
     // not_ready@1 is Class::Receipt, not Control.
     ("not_ready", 1, Class::Receipt),
 ];
@@ -60,6 +66,12 @@ pub enum Body {
     Cancel(cancel_v1::CancelV1),
     /// `approval@1` (Control). `env.task` is the run id.
     Approval(approval_v1::ApprovalV1),
+    /// `goal@1` (Control).
+    Goal(goal_v1::GoalV1),
+    /// `escalate@1` (Control).
+    Escalate(escalate_v1::EscalateV1),
+    /// `steer@1` (Control). `env.task` is the task; `env.generation` is its gen.
+    Steer(steer_v1::SteerV1),
     /// `not_ready@1` (Receipt).
     NotReady(not_ready_v1::NotReadyV1),
 }
@@ -99,6 +111,9 @@ pub fn parse(env: &Envelope) -> Result<Body, Reject> {
         "reply" => Body::Reply(serde_json::from_value(env.body.clone()).map_err(bad)?),
         "cancel" => Body::Cancel(serde_json::from_value(env.body.clone()).map_err(bad)?),
         "approval" => Body::Approval(serde_json::from_value(env.body.clone()).map_err(bad)?),
+        "goal" => Body::Goal(serde_json::from_value(env.body.clone()).map_err(bad)?),
+        "escalate" => Body::Escalate(serde_json::from_value(env.body.clone()).map_err(bad)?),
+        "steer" => Body::Steer(serde_json::from_value(env.body.clone()).map_err(bad)?),
         "not_ready" => Body::NotReady(serde_json::from_value(env.body.clone()).map_err(bad)?),
         _ => unreachable!("KNOWN and this match list the same names"),
     };
@@ -112,6 +127,9 @@ pub fn parse(env: &Envelope) -> Result<Body, Reject> {
         Body::Reply(r) => r.validate(env)?,
         Body::Cancel(c) => c.validate(env)?,
         Body::Approval(a) => a.validate(env)?,
+        Body::Goal(g) => g.validate()?,
+        Body::Escalate(e) => e.validate()?,
+        Body::Steer(s) => s.validate(env)?,
         Body::NotReady(n) => n.validate(env)?,
     }
     Ok(body)
