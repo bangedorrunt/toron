@@ -297,6 +297,15 @@ pub enum Reject {
         contract: String,
         expected: Vec<String>,
     },
+    /// The act names a topology this build stores but does not project yet
+    /// (supervisor, until Phase 4a). Not a swarm send.
+    ///
+    /// A struct variant (the enum is internally tagged).
+    #[error("not yet: {what}")]
+    NotYet {
+        /// What is not projected (`supervisor`).
+        what: String,
+    },
 }
 
 fn role_label(role: &Option<Role>) -> String {

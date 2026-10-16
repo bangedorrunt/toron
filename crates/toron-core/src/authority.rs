@@ -33,6 +33,8 @@ use crate::envelope::{Class, ContractId};
 
 /// Contract name of the role fact.
 pub const ROLE_CONTRACT: &str = "role";
+/// Contract name of the topology fact (`context@1`).
+pub const CONTEXT_CONTRACT: &str = "context";
 /// Contract name of a verifier's verdict.
 pub const VERDICT_CONTRACT: &str = "verdict";
 /// The one non-envelope verb the table names (`toron done`).
@@ -185,6 +187,9 @@ pub const STANDARD: &[Grant] = &[
     only(Role::Supervisor, Class::Control, "escalate"),
     only(Role::Supervisor, Class::Control, VERDICT_CONTRACT),
     only(Role::Supervisor, Class::Control, ROLE_CONTRACT),
+    // context@1: the topology fact. Captain already has every Control via
+    // the wildcard; a supervisor may set it too (Phase 4.2).
+    only(Role::Supervisor, Class::Control, CONTEXT_CONTRACT),
     // crew: reply, request to a peer, notify. No task, no control.
     any(Role::Crew, Class::Notify),
     any(Role::Crew, Class::Request),
@@ -246,6 +251,12 @@ pub const SPEC: &[(Role, Class, &str, bool)] = &[
     (Role::Supervisor, Class::Control, "cancel", true),
     (Role::Supervisor, Class::Control, "verdict", true),
     (Role::Supervisor, Class::Control, "role", true),
+    (Role::Supervisor, Class::Control, "context", true),
+    (Role::Crew, Class::Control, "context", false),
+    (Role::Peer, Class::Control, "context", false),
+    (Role::LoopSelf, Class::Control, "context", false),
+    (Role::Verifier, Class::Control, "context", false),
+    (Role::Captain, Class::Control, "context", true),
     (Role::Supervisor, Class::Notify, "notify", true),
     (Role::Supervisor, Class::Control, "approval", false),
     (Role::Verifier, Class::Control, "verdict", true),
@@ -494,6 +505,29 @@ impl Authority {
             Class::Control,
             format!("{ROLE_CONTRACT}@1"),
             expected,
+        ))
+    }
+
+    /// May `issuer` append a `context@1` fact? The operator, or a captain or
+    /// supervisor of the context. Anyone else, no. The first fact has no
+    /// captain yet, so only the operator can sign it (Phase 4.2).
+    pub const fn may_set_context(issuer: Standing) -> bool {
+        matches!(
+            issuer,
+            Standing::Operator | Standing::Holds(Role::Captain | Role::Supervisor)
+        )
+    }
+
+    /// [`Self::may_set_context`] as a typed refusal. `expected` names who can.
+    pub fn check_set_context(issuer: Standing) -> Result<(), Reject> {
+        if Self::may_set_context(issuer) {
+            return Ok(());
+        }
+        Err(unauthorized(
+            issuer.acts_as(),
+            Class::Control,
+            format!("{CONTEXT_CONTRACT}@1"),
+            vec!["operator".into(), "captain".into(), "supervisor".into()],
         ))
     }
 }

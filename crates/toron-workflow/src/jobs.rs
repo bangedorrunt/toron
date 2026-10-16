@@ -20,10 +20,27 @@ use serde::{Deserialize, Serialize};
 
 use nostr::prelude::{Event, EventId, Keys, Kind, Tag, Timestamp};
 
+use toron_core::job_kinds::{self, Lifecycle};
 use toron_core::nostr::event::build_event;
 use toron_core::nostr::kinds::{
     JOB_ACCEPTED, JOB_CANCEL, JOB_ERROR, JOB_PROGRESS, JOB_REQUEST, JOB_RESULT, toron_kind,
 };
+
+/// Kind for a step name a job producer already uses.
+/// `None` when the name is not a lifecycle step. The 43001–43006 builders
+/// below are unchanged; call this when a producer wants the mapped kind.
+pub fn kind_for_step(step: &str) -> Option<u32> {
+    let life = match step {
+        "dispatch_job" | "request" | "task" | "sent" => Lifecycle::Sent,
+        "claim" | "ack" => Lifecycle::Claim,
+        "progress" => Lifecycle::Progress,
+        "result" | "done" => Lifecycle::Done,
+        "cancel" => Lifecycle::Cancel,
+        "error" | "reject" | "failed" => Lifecycle::Failed,
+        _ => return None,
+    };
+    Some(job_kinds::to_kind(life))
+}
 
 /// A job request payload (kind-43001 `content`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -373,6 +390,24 @@ mod tests {
 
     fn keys() -> Keys {
         Keys::generate()
+    }
+
+    #[test]
+    fn kind_for_step_maps_lifecycle_names() {
+        assert_eq!(kind_for_step("dispatch_job"), Some(u32::from(JOB_REQUEST)));
+        assert_eq!(kind_for_step("request"), Some(43001));
+        assert_eq!(kind_for_step("task"), Some(43001));
+        assert_eq!(kind_for_step("sent"), Some(43001));
+        assert_eq!(kind_for_step("claim"), Some(43002));
+        assert_eq!(kind_for_step("ack"), Some(43002));
+        assert_eq!(kind_for_step("progress"), Some(43003));
+        assert_eq!(kind_for_step("result"), Some(43004));
+        assert_eq!(kind_for_step("done"), Some(43004));
+        assert_eq!(kind_for_step("cancel"), Some(43005));
+        assert_eq!(kind_for_step("error"), Some(43006));
+        assert_eq!(kind_for_step("reject"), Some(43006));
+        assert_eq!(kind_for_step("failed"), Some(43006));
+        assert_eq!(kind_for_step("steer"), None);
     }
 
     #[test]

@@ -587,7 +587,18 @@ fn control_contracts_in_known_all_have_an_authority_row() {
         "{control:?}"
     );
     let a = Authority::standard();
+    // approval@1 is captain-only in SPEC (supervisor false, captain true).
+    // Do not grant it wider so this check stays green.
+    const CAPTAIN_ONLY: &[&str] = &["approval"];
     for name in control {
+        if CAPTAIN_ONLY.contains(&name) {
+            assert!(a.allows(Role::Captain, Class::Control, name), "{name}");
+            assert!(
+                !a.allows(Role::Supervisor, Class::Control, name),
+                "{name} must stay captain-only"
+            );
+            continue;
+        }
         // Someone below the captain must be able to send it; a Control
         // contract only the captain's wildcard reaches is unclassified.
         assert!(
