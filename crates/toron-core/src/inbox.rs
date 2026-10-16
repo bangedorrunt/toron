@@ -667,6 +667,14 @@ impl InboxStore {
                 ..AppendFacts::none()
             });
         }
+        if env.class == Class::Control
+            && (env.contract.name == "goal" || env.contract.name == "escalate")
+        {
+            // Same exemption as steer: a supervisor context stores the fact.
+            // There is no projection table; the log row is the record.
+            // `check_send` above still refuses a crew `goal`.
+            return Ok(AppendFacts::none());
+        }
         // A supervisor context is stored, not projected. Do not run the send
         // as a swarm. Role and context facts above are the governance log.
         if current_context.is_some_and(|c| c.topology == Topology::Supervisor) {

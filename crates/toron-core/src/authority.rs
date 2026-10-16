@@ -190,10 +190,12 @@ pub const STANDARD: &[Grant] = &[
     // context@1: the topology fact. Captain already has every Control via
     // the wildcard; a supervisor may set it too (Phase 4.2).
     only(Role::Supervisor, Class::Control, CONTEXT_CONTRACT),
-    // crew: reply, request to a peer, notify. No task, no control.
+    // crew: reply, request to a peer, notify. No task. The one control
+    // they may send is an upward handoff (`escalate@1`).
     any(Role::Crew, Class::Notify),
     any(Role::Crew, Class::Request),
     any(Role::Crew, Class::Reply),
+    only(Role::Crew, Class::Control, "escalate"),
     // peer: request, reply, notify.
     any(Role::Peer, Class::Notify),
     any(Role::Peer, Class::Request),
@@ -233,6 +235,8 @@ pub const SPEC: &[(Role, Class, &str, bool)] = &[
     (Role::Crew, Class::Control, "verdict", false),
     (Role::Crew, Class::Control, "approval", false),
     (Role::Crew, Class::Control, "steer", false),
+    (Role::Crew, Class::Control, "escalate", true),
+    (Role::Crew, Class::Control, "goal", false),
     (Role::Crew, Class::Control, "cancel", false),
     (Role::Crew, Class::Control, "role", false),
     (Role::Crew, Class::Request, "request", true),

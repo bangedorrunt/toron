@@ -365,6 +365,7 @@ async fn the_authority_table_is_enforced_at_append() {
                 "notify/*".into(),
                 "request/*".into(),
                 "reply/*".into(),
+                "control/escalate".into(),
                 "done".into()
             ],
         }

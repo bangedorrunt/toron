@@ -447,3 +447,103 @@ async fn a_lower_sup_epoch_steer_writes_nothing_and_the_current_one_is_stored() 
         "the current epoch's steer is stored for the recipient"
     );
 }
+
+/// A supervisor context refuses ordinary sends (`NotYet`) and still stores
+/// `goal@1` and a crew `escalate@1`. A crew `goal` stays unauthorized.
+#[tokio::test]
+async fn goal_and_escalate_land_in_a_supervisor_context() {
+    let (s, mut q) = swarm("sup-facts").await;
+    let m = q.msg(OP);
+    put(
+        &s,
+        &mut q,
+        ContextV1 {
+            topology: Topology::Supervisor,
+            generation: 1,
+        }
+        .into_envelope(m, ContextId(CTX.into()), OP),
+    )
+    .await;
+
+    let m = q.msg(CAP);
+    let task = task_env(m);
+    let err = s.append_envelope(&task).await.unwrap_err();
+    assert!(
+        matches!(err, InboxError::Reject(Reject::NotYet { .. })),
+        "a task in a supervisor context is still NotYet: {err:?}"
+    );
+    assert!(s.lookup(&task.msg).await.unwrap().is_none());
+
+    let m = q.msg(CAP);
+    let goal = Envelope {
+        v: 1,
+        from: m.producer.clone(),
+        msg: m,
+        to: Recipient::Npub(CREW.into()),
+        class: Class::Control,
+        contract: ContractId::new("goal", 1),
+        context: ContextId(CTX.into()),
+        task: None,
+        generation: 0,
+        causation: None,
+        deadline_ts_us: None,
+        lease_ms: None,
+        body: serde_json::json!({
+            "objective": "land the facts",
+            "acceptance": ["stored"],
+            "constraints": []
+        }),
+    };
+    put(&s, &mut q, goal.clone()).await;
+    assert!(s.lookup(&goal.msg).await.unwrap().is_some());
+
+    let m = q.msg(CREW);
+    let crew_goal = Envelope {
+        v: 1,
+        from: m.producer.clone(),
+        msg: m,
+        to: Recipient::Npub(CAP.into()),
+        class: Class::Control,
+        contract: ContractId::new("goal", 1),
+        context: ContextId(CTX.into()),
+        task: None,
+        generation: 0,
+        causation: None,
+        deadline_ts_us: None,
+        lease_ms: None,
+        body: serde_json::json!({
+            "objective": "crew must not set this",
+            "acceptance": [],
+            "constraints": []
+        }),
+    };
+    let err = s.append_envelope(&crew_goal).await.unwrap_err();
+    assert!(
+        matches!(err, InboxError::Reject(Reject::Unauthorized { .. })),
+        "{err:?}"
+    );
+    assert!(s.lookup(&crew_goal.msg).await.unwrap().is_none());
+
+    let m = q.msg(CREW);
+    let up = Envelope {
+        v: 1,
+        from: m.producer.clone(),
+        msg: m.clone(),
+        to: Recipient::Npub(CAP.into()),
+        class: Class::Control,
+        contract: ContractId::new("escalate", 1),
+        context: ContextId(CTX.into()),
+        task: None,
+        generation: 0,
+        causation: None,
+        deadline_ts_us: None,
+        lease_ms: None,
+        body: serde_json::json!({
+            "context": "the crew is stuck",
+            "reason": "no path",
+            "evidence": []
+        }),
+    };
+    put(&s, &mut q, up.clone()).await;
+    assert!(s.lookup(&up.msg).await.unwrap().is_some());
+}
