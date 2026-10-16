@@ -1,12 +1,9 @@
 // governed-by: ADR-0041
 //! `verdict@1`: a verifier's verdict on a task (redesign §6.1; Phase 4.1).
 //!
-//! PROVISIONAL SHAPE. Phase 4.1 needs a Control-class contract that the
-//! authority table can refuse a crew for, so this lands the minimum: the task
-//! and `gen` ride on the envelope (`task`, `gen`), the body is the outcome.
-//! Phase 4.3 owns the final shape and the effect (wiring the verdict into the
-//! delivery state machine's `Verdict` event); until then an appended verdict
-//! is a log fact only and moves no task.
+//! The wire shape is fixed: `task` and `gen` ride on the envelope, the body is
+//! `{pass, evidence_refs}`. Phase 4.3 did not change it. An appended verdict
+//! is a log fact only and moves no task until a later phase wires the effect.
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
