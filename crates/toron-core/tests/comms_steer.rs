@@ -368,3 +368,82 @@ async fn progress_and_done_wait_until_the_steer_is_acked() {
     );
     assert_eq!(touched_at(&s, &key).await, touched);
 }
+
+fn lead_env(m: MsgId, holder: &str, epoch: u64) -> Envelope {
+    Envelope {
+        v: 1,
+        from: m.producer.clone(),
+        msg: m,
+        to: Recipient::Npub(holder.into()),
+        class: Class::Control,
+        contract: ContractId::new("lead", 1),
+        context: ContextId(CTX.into()),
+        task: None,
+        generation: 0,
+        causation: None,
+        deadline_ts_us: None,
+        lease_ms: None,
+        body: serde_json::json!({"holder": holder, "sup_epoch": epoch}),
+    }
+}
+
+fn at_epoch(mut env: Envelope, epoch: u64) -> Envelope {
+    env.body["sup_epoch"] = serde_json::json!(epoch);
+    env
+}
+
+#[tokio::test]
+async fn a_lower_sup_epoch_steer_writes_nothing_and_the_current_one_is_stored() {
+    let (s, mut q) = swarm("epoch").await;
+    // The first lead is operator-signed. A captain cannot open the lease.
+    let m = q.msg(CAP);
+    let early = lead_env(m.clone(), CAP, 1);
+    let err = s.append_envelope(&early).await.unwrap_err();
+    assert!(
+        matches!(err, InboxError::Reject(Reject::Unauthorized { .. })),
+        "{err:?}"
+    );
+    assert!(s.lookup(&early.msg).await.unwrap().is_none());
+
+    let op = q.msg(OP);
+    put(&s, &mut q, lead_env(op, CAP, 1)).await;
+    // The captain may raise it. Epoch 2 is current; epoch 1 is now stale.
+    put(&s, &mut q, lead_env(m, CAP, 2)).await;
+    let current: i64 = sqlx::query_scalar("SELECT sup_epoch FROM inbox_lead WHERE context = ?1")
+        .bind(CTX)
+        .fetch_one(s.pool())
+        .await
+        .unwrap();
+    assert_eq!(current, 2);
+
+    let low_m = q.msg(CAP);
+    let low = at_epoch(steer_env(low_m.clone(), "pause", None), 1);
+    let err = s.append_envelope(&low).await.unwrap_err();
+    assert!(
+        matches!(
+            err,
+            InboxError::Reject(Reject::StaleSupEpoch {
+                sent: 1,
+                current: 2
+            })
+        ),
+        "{err:?}"
+    );
+    assert!(s.lookup(&low.msg).await.unwrap().is_none());
+    let unseen = s.next(CREW, None, true).await.unwrap();
+    assert!(
+        unseen.items.iter().all(|i| i.envelope.msg != low.msg),
+        "the lower epoch is not in the recipient log"
+    );
+    assert_eq!(steer_rows(&s).await, 0);
+
+    let high = at_epoch(steer_env(low_m, "pause", None), 2);
+    put(&s, &mut q, high.clone()).await;
+    assert!(s.lookup(&high.msg).await.unwrap().is_some());
+    assert_eq!(steer_rows(&s).await, 1);
+    let seen = s.next(CREW, None, true).await.unwrap();
+    assert!(
+        seen.items.iter().any(|i| i.envelope.msg == high.msg),
+        "the current epoch's steer is stored for the recipient"
+    );
+}

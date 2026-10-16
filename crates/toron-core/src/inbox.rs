@@ -24,7 +24,9 @@ use sqlx::{Row as _, SqliteConnection, SqlitePool};
 use crate::authority::{
     Authority, CONTEXT_CONTRACT, ROLE_CONTRACT, Relation, Role, Standing, VERDICT_CONTRACT,
 };
-use crate::contracts::{self, Body, context_v1::ContextV1, role_v1::RoleV1, steer_v1::SteerV1};
+use crate::contracts::{
+    self, Body, context_v1::ContextV1, lead_v1::LeadV1, role_v1::RoleV1, steer_v1::SteerV1,
+};
 use crate::delivery::{DeliveryEvent, DeliveryFsm, DeliveryState, Phase, Reject};
 use crate::envelope::{Class, Envelope, MsgId};
 use crate::kernel::{self, AppendError, DurableLog, Offset};
@@ -518,6 +520,9 @@ impl InboxStore {
                 .await
                 .map_err(unavailable)?;
         }
+        if let (Some(lead), Some(env)) = (&facts.lead, &envelope) {
+            write_lead(&mut tx, env, lead).await.map_err(unavailable)?;
+        }
         tx.commit().await.map_err(unavailable)?;
         Ok(Appended {
             offset: offset as u64,
@@ -619,10 +624,41 @@ impl InboxStore {
                 ..AppendFacts::none()
             });
         }
+        if env.class == Class::Control && env.contract.name == "lead" {
+            let Body::Lead(fact) = contracts::parse(env)? else {
+                unreachable!("lead@1 parses as a lead body");
+            };
+            let current = lead_epoch(conn, context).await.map_err(unavailable)?;
+            Authority::check_set_lead(standing, current.is_some())?;
+            if let Some(cur) = current
+                && fact.sup_epoch <= cur
+            {
+                return Err(Reject::StaleSupEpoch {
+                    sent: fact.sup_epoch,
+                    current: cur,
+                }
+                .into());
+            }
+            return Ok(AppendFacts {
+                lead: Some(fact),
+                ..AppendFacts::none()
+            });
+        }
         if env.class == Class::Control && env.contract.name == "steer" {
             let Body::Steer(steer) = contracts::parse(env)? else {
                 unreachable!("steer@1 parses as a steer body");
             };
+            // No lead row: do not invent an epoch. A row fences the steer to
+            // that epoch exactly; a lower or higher one writes nothing.
+            if let Some(cur) = lead_epoch(conn, context).await.map_err(unavailable)?
+                && steer.sup_epoch != cur
+            {
+                return Err(Reject::StaleSupEpoch {
+                    sent: steer.sup_epoch,
+                    current: cur,
+                }
+                .into());
+            }
             // A steer is the control fact itself, not a swarm send. Return
             // before the supervisor-topology refusal, the same way a role
             // fact does, so it is stored rather than answered `NotYet`.
@@ -1178,6 +1214,7 @@ struct AppendFacts {
     role: Option<RoleV1>,
     context: Option<ContextV1>,
     steer: Option<SteerV1>,
+    lead: Option<LeadV1>,
 }
 
 impl AppendFacts {
@@ -1186,8 +1223,45 @@ impl AppendFacts {
             role: None,
             context: None,
             steer: None,
+            lead: None,
         }
     }
+}
+
+/// The lead epoch on record for `context`, if a lead fact has been stored.
+async fn lead_epoch(
+    conn: &mut SqliteConnection,
+    context: &str,
+) -> Result<Option<u64>, sqlx::Error> {
+    let epoch: Option<i64> =
+        sqlx::query_scalar("SELECT sup_epoch FROM inbox_lead WHERE context = ?1")
+            .bind(context)
+            .fetch_optional(&mut *conn)
+            .await?;
+    Ok(epoch.map(|e| e as u64))
+}
+
+/// Project an accepted lead fact. The caller already fenced `sup_epoch`.
+async fn write_lead(
+    conn: &mut SqliteConnection,
+    env: &Envelope,
+    fact: &LeadV1,
+) -> Result<(), sqlx::Error> {
+    let epoch =
+        i64::try_from(fact.sup_epoch).map_err(|e| sqlx::Error::Decode(e.to_string().into()))?;
+    sqlx::query(
+        "INSERT INTO inbox_lead (context, holder, sup_epoch, msg_key) \
+         VALUES (?1, ?2, ?3, ?4) \
+         ON CONFLICT (context) DO UPDATE SET holder = excluded.holder, \
+         sup_epoch = excluded.sup_epoch, msg_key = excluded.msg_key",
+    )
+    .bind(&env.context.0)
+    .bind(&fact.holder)
+    .bind(epoch)
+    .bind(env.msg.key())
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
 }
 
 /// The envelope stored under `msg_key`, if the row is one. A bad payload is

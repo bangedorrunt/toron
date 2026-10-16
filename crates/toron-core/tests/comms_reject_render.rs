@@ -80,6 +80,10 @@ fn every_reject() -> Vec<Reject> {
             id: "prod:0:1".into(),
             op: "redirect".into(),
         },
+        Reject::StaleSupEpoch {
+            sent: 1,
+            current: 2,
+        },
     ];
     for r in &all {
         match r {
@@ -101,7 +105,8 @@ fn every_reject() -> Vec<Reject> {
             | Reject::IllegalTransition { .. }
             | Reject::Unauthorized { .. }
             | Reject::NotYet { .. }
-            | Reject::SteerPending { .. } => {}
+            | Reject::SteerPending { .. }
+            | Reject::StaleSupEpoch { .. } => {}
         }
     }
     all
@@ -226,5 +231,27 @@ fn steer_pending_carries_the_steer_id_and_op_on_the_wire() {
         }
         .to_string(),
         "steer prod:0:1 (pause) is unacked"
+    );
+}
+
+/// Phase 4a.3: a lead epoch that is not the one on record.
+#[test]
+fn stale_sup_epoch_carries_sent_and_current_on_the_wire() {
+    let v = serde_json::to_value(Reject::StaleSupEpoch {
+        sent: 1,
+        current: 4,
+    })
+    .unwrap();
+    assert_eq!(
+        v,
+        serde_json::json!({"reject": "stale_sup_epoch", "sent": 1, "current": 4})
+    );
+    assert_eq!(
+        Reject::StaleSupEpoch {
+            sent: 1,
+            current: 4
+        }
+        .to_string(),
+        "stale sup_epoch 1, current 4"
     );
 }

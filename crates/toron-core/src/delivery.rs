@@ -318,6 +318,18 @@ pub enum Reject {
         /// The steer op that is waiting.
         op: String,
     },
+    /// A lead fact, or a steer naming a lead epoch, that is not strictly
+    /// newer than the epoch on record (Phase 4a.3). No lead row: this is not
+    /// raised, and the steer is not given an invented epoch.
+    ///
+    /// A struct variant (the enum is internally tagged).
+    #[error("stale sup_epoch {sent}, current {current}")]
+    StaleSupEpoch {
+        /// The epoch the sender named.
+        sent: u64,
+        /// The epoch on record.
+        current: u64,
+    },
 }
 
 fn role_label(role: &Option<Role>) -> String {

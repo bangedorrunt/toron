@@ -518,6 +518,34 @@ impl Authority {
         )
     }
 
+    /// May `issuer` append a `lead@1` fact? The first fact of a context is
+    /// operator-signed. Once one exists, the operator or the captain may
+    /// raise it. A supervisor's control grant does not include `lead`.
+    pub const fn may_set_lead(issuer: Standing, has_lead: bool) -> bool {
+        if !has_lead {
+            return matches!(issuer, Standing::Operator);
+        }
+        matches!(issuer, Standing::Operator | Standing::Holds(Role::Captain))
+    }
+
+    /// [`Self::may_set_lead`] as a typed refusal.
+    pub fn check_set_lead(issuer: Standing, has_lead: bool) -> Result<(), Reject> {
+        if Self::may_set_lead(issuer, has_lead) {
+            return Ok(());
+        }
+        let expected = if has_lead {
+            vec!["operator".into(), "captain".into()]
+        } else {
+            vec!["operator".into()]
+        };
+        Err(unauthorized(
+            issuer.acts_as(),
+            Class::Control,
+            "lead@1",
+            expected,
+        ))
+    }
+
     /// [`Self::may_set_context`] as a typed refusal. `expected` names who can.
     pub fn check_set_context(issuer: Standing) -> Result<(), Reject> {
         if Self::may_set_context(issuer) {

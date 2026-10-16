@@ -9,6 +9,7 @@ pub mod cancel_v1;
 pub mod context_v1;
 pub mod escalate_v1;
 pub mod goal_v1;
+pub mod lead_v1;
 pub mod not_ready_v1;
 pub mod notify_v1;
 pub mod reply_v1;
@@ -25,7 +26,7 @@ use crate::envelope::{Class, Envelope};
 ///
 /// Control-class entries: `role@1` and `verdict@1` (Phase 4.1), `context@1`
 /// (Phase 4.2), `cancel@1` and `approval@1` (Phase 4.3), `goal@1`,
-/// `escalate@1`, and `steer@1` (Phase 4a). An envelope naming anything else
+/// `escalate@1`, `steer@1`, and `lead@1` (Phase 4a). An envelope naming anything else
 /// is [`Reject::UnsupportedContract`].
 /// `not_ready@1` is [`Class::Receipt`] (the class exists; a receipt, not a control).
 pub const KNOWN: &[(&str, u32, Class)] = &[
@@ -41,6 +42,7 @@ pub const KNOWN: &[(&str, u32, Class)] = &[
     ("goal", 1, Class::Control),
     ("escalate", 1, Class::Control),
     ("steer", 1, Class::Control),
+    ("lead", 1, Class::Control),
     // not_ready@1 is Class::Receipt, not Control.
     ("not_ready", 1, Class::Receipt),
 ];
@@ -72,6 +74,8 @@ pub enum Body {
     Escalate(escalate_v1::EscalateV1),
     /// `steer@1` (Control). `env.task` is the task; `env.generation` is its gen.
     Steer(steer_v1::SteerV1),
+    /// `lead@1` (Control). The holder and the epoch steers must name.
+    Lead(lead_v1::LeadV1),
     /// `not_ready@1` (Receipt).
     NotReady(not_ready_v1::NotReadyV1),
 }
@@ -114,6 +118,7 @@ pub fn parse(env: &Envelope) -> Result<Body, Reject> {
         "goal" => Body::Goal(serde_json::from_value(env.body.clone()).map_err(bad)?),
         "escalate" => Body::Escalate(serde_json::from_value(env.body.clone()).map_err(bad)?),
         "steer" => Body::Steer(serde_json::from_value(env.body.clone()).map_err(bad)?),
+        "lead" => Body::Lead(serde_json::from_value(env.body.clone()).map_err(bad)?),
         "not_ready" => Body::NotReady(serde_json::from_value(env.body.clone()).map_err(bad)?),
         _ => unreachable!("KNOWN and this match list the same names"),
     };
@@ -130,6 +135,7 @@ pub fn parse(env: &Envelope) -> Result<Body, Reject> {
         Body::Goal(g) => g.validate()?,
         Body::Escalate(e) => e.validate()?,
         Body::Steer(s) => s.validate(env)?,
+        Body::Lead(l) => l.validate()?,
         Body::NotReady(n) => n.validate(env)?,
     }
     Ok(body)
