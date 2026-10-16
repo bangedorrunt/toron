@@ -202,6 +202,21 @@ pub struct NextBatch {
     pub items: Vec<InboxItem>,
 }
 
+/// True when a peeked batch holds an urgent steer. Only `steer@1` whose
+/// `priority` field is the string `urgent` counts. Notice text is not read.
+pub fn urgent_pending(items: &[InboxItem]) -> bool {
+    items.iter().any(|it| {
+        it.envelope.contract.name == "steer"
+            && it.envelope.contract.major == 1
+            && it
+                .envelope
+                .body
+                .get("priority")
+                .and_then(serde_json::Value::as_str)
+                == Some("urgent")
+    })
+}
+
 fn now_us() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

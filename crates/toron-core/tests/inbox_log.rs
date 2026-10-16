@@ -52,6 +52,31 @@ fn task(from: &str, to: &str, epoch: u64, seq: u64) -> Envelope {
     }
 }
 
+#[test]
+fn urgent_pending_reads_the_steer_priority_field() {
+    use toron_core::delivery::Phase;
+    use toron_core::inbox::{InboxItem, urgent_pending};
+
+    let mut steer = task("a", "b", 0, 1);
+    steer.class = Class::Control;
+    steer.contract = ContractId::new("steer", 1);
+    steer.body = serde_json::json!({"op": "cancel", "priority": "urgent"});
+    let item = |env: Envelope| InboxItem {
+        offset: 1,
+        msg_key: "k".into(),
+        envelope: env,
+        phase: Phase::Sent,
+        allowed_now: Vec::new(),
+    };
+    assert!(urgent_pending(&[item(steer.clone())]));
+    steer.body = serde_json::json!({"priority": "normal", "text": "priority: urgent"});
+    assert!(!urgent_pending(&[item(steer.clone())]));
+    let mut note = task("a", "b", 0, 2);
+    note.contract = ContractId::new("notify", 1);
+    note.body = serde_json::json!({"text": "urgent"});
+    assert!(!urgent_pending(&[item(note)]));
+}
+
 // --- L16 on the real store ---------------------------------------------
 
 /// Every upstream DurableLog law holds for ToronLog through the kernel port,
