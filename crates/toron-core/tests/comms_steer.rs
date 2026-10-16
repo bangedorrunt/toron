@@ -415,6 +415,10 @@ async fn a_lower_sup_epoch_steer_writes_nothing_and_the_current_one_is_stored() 
         .await
         .unwrap();
     assert_eq!(current, 2);
+    let row = s.lead_of(CTX).await.unwrap().expect("the lead row");
+    assert_eq!(row.sup_epoch, current as u64);
+    assert_eq!(row.holder, CAP);
+    assert!(s.lead_of("no-such-context").await.unwrap().is_none());
 
     let low_m = q.msg(CAP);
     let low = at_epoch(steer_env(low_m.clone(), "pause", None), 1);
