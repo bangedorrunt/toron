@@ -287,6 +287,15 @@ fn unavailable(e: impl std::fmt::Display) -> AppendError {
     AppendError::Unavailable(e.to_string())
 }
 
+/// The current `lead@1` row for one context.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LeadRow {
+    /// Who holds the lease (the fact's `holder`, not checked as an npub).
+    pub holder: String,
+    /// The epoch a steer must name while this row is current.
+    pub sup_epoch: u64,
+}
+
 /// Async SQLite-backed inbox store (the index pool).
 #[derive(Clone, Debug)]
 pub struct InboxStore {
@@ -712,6 +721,23 @@ impl InboxStore {
     pub async fn context_of(&self, context: &str) -> Result<Option<ContextFact>, sqlx::Error> {
         let mut conn = self.pool.acquire().await?;
         context_row(&mut conn, context).await
+    }
+
+    /// The current lead row for `context`, if a `lead@1` fact has been stored.
+    /// This is the epoch authority. Callers append a strictly higher
+    /// `sup_epoch`; they do not invent one beside this row.
+    pub async fn lead_of(&self, context: &str) -> Result<Option<LeadRow>, sqlx::Error> {
+        let row = sqlx::query("SELECT holder, sup_epoch FROM inbox_lead WHERE context = ?1")
+            .bind(context)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|r| {
+            let epoch: i64 = r.get(1);
+            LeadRow {
+                holder: r.get(0),
+                sup_epoch: epoch as u64,
+            }
+        }))
     }
 
     /// The current role fact for `npub` in `context`, if any.
