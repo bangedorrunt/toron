@@ -15,6 +15,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::authority::Role;
 use crate::envelope::Class;
 
 /// Where one delivery is (redesign §3.1 states and exits).
@@ -275,6 +276,34 @@ pub enum Reject {
     /// No such edge.
     #[error("no transition from {phase:?} on {event}")]
     IllegalTransition { phase: Phase, event: &'static str },
+    /// The sender's role does not allow this act in this context
+    /// (redesign §6.1, Phase 4.1). `role` is the sender's role there (`None`:
+    /// a governed context and the sender holds no role fact). `contract` is
+    /// `name@major`, or the verb name `done` for the one non-envelope verb.
+    /// `expected` is what the role may send instead, as `class/contract`
+    /// (`class/*` = any contract of the class) and `done`; for a refused role
+    /// fact it is the roles the issuer could grant (`role@1:<role>`), or
+    /// `operator`.
+    ///
+    /// A struct variant (the enum is internally tagged).
+    #[error(
+        "{} may not send {contract} ({class:?}); allowed: [{}]",
+        role_label(.role),
+        .expected.join(", ")
+    )]
+    Unauthorized {
+        role: Option<Role>,
+        class: Class,
+        contract: String,
+        expected: Vec<String>,
+    },
+}
+
+fn role_label(role: &Option<Role>) -> String {
+    role.map_or_else(
+        || "a sender with no role here".to_string(),
+        |r| format!("role {r}"),
+    )
 }
 
 impl Reject {

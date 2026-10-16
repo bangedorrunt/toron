@@ -102,6 +102,30 @@ pub enum Class {
     Receipt,
 }
 
+impl Class {
+    /// Every class, in a fixed order (tables and tests).
+    pub const ALL: [Self; 6] = [
+        Self::Notify,
+        Self::Request,
+        Self::Reply,
+        Self::Task,
+        Self::Control,
+        Self::Receipt,
+    ];
+
+    /// The wire spelling (`snake_case`), as serde writes it.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Notify => "notify",
+            Self::Request => "request",
+            Self::Reply => "reply",
+            Self::Task => "task",
+            Self::Control => "control",
+            Self::Receipt => "receipt",
+        }
+    }
+}
+
 /// A contract name and major, written `name@major` (e.g. `task@1`).
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
