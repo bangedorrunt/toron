@@ -14,6 +14,7 @@ pub mod envelope;
 pub mod inbox;
 pub mod inbox_program;
 pub mod index;
+pub mod job_kinds;
 pub mod journal;
 pub mod jsonl;
 pub mod kernel;
@@ -24,6 +25,7 @@ pub mod outbox;
 pub mod policy;
 pub mod serve_build;
 pub mod testkit;
+pub mod topology;
 pub mod wake;
 
 /// Client/relay pool. rust-nostr 0.45 no longer nests protocol types under

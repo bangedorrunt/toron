@@ -21,11 +21,14 @@ use std::time::Duration;
 use serde::Serialize;
 use sqlx::{Row as _, SqliteConnection, SqlitePool};
 
-use crate::authority::{Authority, ROLE_CONTRACT, Relation, Role, Standing, VERDICT_CONTRACT};
-use crate::contracts::{self, Body, role_v1::RoleV1};
+use crate::authority::{
+    Authority, CONTEXT_CONTRACT, ROLE_CONTRACT, Relation, Role, Standing, VERDICT_CONTRACT,
+};
+use crate::contracts::{self, Body, context_v1::ContextV1, role_v1::RoleV1};
 use crate::delivery::{DeliveryEvent, DeliveryFsm, DeliveryState, Phase, Reject};
 use crate::envelope::{Class, Envelope, MsgId};
 use crate::kernel::{self, AppendError, DurableLog, Offset};
+use crate::topology::{self, Topology};
 
 /// The SQLite effect journal (`kernel::JournalStore`), named here beside
 /// [`ToronLog`] as the build plan lists them.
@@ -445,9 +448,9 @@ impl InboxStore {
         // Authority (Phase 4.1): after the fence and the replay answer, before
         // anything is written. A replay of a message already in the log was
         // authorised when it landed and stays idempotent.
-        let role_fact = match &envelope {
+        let facts = match &envelope {
             Some(env) => self.authorize_in(&mut tx, env).await?,
-            None => None,
+            None => AppendFacts::none(),
         };
         let last = match state {
             Some((current, last)) if current as u64 == epoch => Some(last as u64),
@@ -495,8 +498,13 @@ impl InboxStore {
                 .await
                 .map_err(unavailable)?;
         }
-        if let (Some(role), Some(env)) = (&role_fact, &envelope) {
+        if let (Some(role), Some(env)) = (&facts.role, &envelope) {
             write_role(&mut tx, env, role, now)
+                .await
+                .map_err(unavailable)?;
+        }
+        if let (Some(context), Some(env)) = (&facts.context, &envelope) {
+            write_context(&mut tx, env, context)
                 .await
                 .map_err(unavailable)?;
         }
@@ -533,12 +541,12 @@ impl InboxStore {
 
     /// The authority check of one envelope inside the caller's connection
     /// (the append's transaction, or a plain connection for the dry run).
-    /// Returns the role fact to project when the envelope is a `role@1`.
+    /// Returns the role or context fact to project, when the envelope is one.
     async fn authorize_in(
         &self,
         conn: &mut SqliteConnection,
         env: &Envelope,
-    ) -> Result<Option<RoleV1>, Refusal> {
+    ) -> Result<AppendFacts, Refusal> {
         let context = env.context.0.as_str();
         let governed = context_is_governed(conn, context)
             .await
@@ -554,31 +562,62 @@ impl InboxStore {
         };
         self.authority
             .check_send(standing, governed, env.class, &env.contract, relation)?;
-        if env.class != Class::Control || env.contract.name != ROLE_CONTRACT {
-            return Ok(None);
+        let current_context = context_row(conn, context).await.map_err(unavailable)?;
+        if env.class == Class::Control && env.contract.name == ROLE_CONTRACT {
+            let Body::Role(role) = contracts::parse(env)? else {
+                unreachable!("role@1 parses as a role body");
+            };
+            let current = role_row(conn, context, &role.npub)
+                .await
+                .map_err(unavailable)?;
+            Authority::check_grant(
+                standing,
+                current.as_ref().map(|c| c.role),
+                role.role,
+                governed,
+            )?;
+            if let Some(cur) = &current
+                && role.generation <= cur.generation
+            {
+                return Err(Reject::StaleGen {
+                    sent: role.generation,
+                    current: cur.generation,
+                }
+                .into());
+            }
+            return Ok(AppendFacts {
+                role: Some(role),
+                context: None,
+            });
         }
-        let Body::Role(role) = contracts::parse(env)? else {
-            unreachable!("role@1 parses as a role body");
-        };
-        let current = role_row(conn, context, &role.npub)
-            .await
-            .map_err(unavailable)?;
-        Authority::check_grant(
-            standing,
-            current.as_ref().map(|c| c.role),
-            role.role,
-            governed,
-        )?;
-        if let Some(cur) = &current
-            && role.generation <= cur.generation
-        {
-            return Err(Reject::StaleGen {
-                sent: role.generation,
-                current: cur.generation,
+        if env.class == Class::Control && env.contract.name == CONTEXT_CONTRACT {
+            let Body::Context(fact) = contracts::parse(env)? else {
+                unreachable!("context@1 parses as a context body");
+            };
+            Authority::check_set_context(standing)?;
+            if let Some(cur) = &current_context
+                && fact.generation <= cur.generation
+            {
+                return Err(Reject::StaleGen {
+                    sent: fact.generation,
+                    current: cur.generation,
+                }
+                .into());
+            }
+            return Ok(AppendFacts {
+                role: None,
+                context: Some(fact),
+            });
+        }
+        // A supervisor context is stored, not projected. Do not run the send
+        // as a swarm. Role and context facts above are the governance log.
+        if current_context.is_some_and(|c| c.topology == Topology::Supervisor) {
+            return Err(Reject::NotYet {
+                what: "supervisor".into(),
             }
             .into());
         }
-        Ok(Some(role))
+        Ok(AppendFacts::none())
     }
 
     /// Who `npub` is in `context`: the operator, a role holder, or unroled.
@@ -601,6 +640,12 @@ impl InboxStore {
     pub async fn standing(&self, context: &str, npub: &str) -> Result<Standing, sqlx::Error> {
         let mut conn = self.pool.acquire().await?;
         self.standing_in(&mut conn, context, npub).await
+    }
+
+    /// The current topology fact for `context`, if any.
+    pub async fn context_of(&self, context: &str) -> Result<Option<ContextFact>, sqlx::Error> {
+        let mut conn = self.pool.acquire().await?;
+        context_row(&mut conn, context).await
     }
 
     /// The current role fact for `npub` in `context`, if any.
@@ -750,9 +795,16 @@ impl InboxStore {
                     });
                 }
             };
+            let topology = context_row(&mut tx, &envelope.context.0)
+                .await?
+                .map(|c| c.topology);
+            let role = role_row(&mut tx, &envelope.context.0, reader)
+                .await?
+                .map(|r| r.role);
             items.push(InboxItem {
                 offset,
-                allowed_now: allowed_now(&state, &msg_key, &envelope),
+                // Both facts, or today's phase table. No fact: project is not called.
+                allowed_now: allowed_now_for(&state, &msg_key, &envelope, topology, role),
                 msg_key,
                 envelope,
                 phase: state.phase,
@@ -1057,6 +1109,82 @@ impl InboxStore {
     }
 }
 
+/// Facts an accepted append projects into a side table. Both empty for an
+/// ordinary send.
+struct AppendFacts {
+    role: Option<RoleV1>,
+    context: Option<ContextV1>,
+}
+
+impl AppendFacts {
+    fn none() -> Self {
+        Self {
+            role: None,
+            context: None,
+        }
+    }
+}
+
+/// One current topology fact (the `inbox_context` projection of a `context@1`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ContextFact {
+    /// The context.
+    pub context: String,
+    /// Its choreography.
+    pub topology: Topology,
+    /// The fence of this fact (wire name `gen`).
+    #[serde(rename = "gen")]
+    pub generation: u32,
+    /// The log message that carried the fact (`producer:epoch:seq`).
+    pub msg_key: String,
+}
+
+fn context_fact_of(r: &sqlx::sqlite::SqliteRow) -> Result<ContextFact, sqlx::Error> {
+    let topology: String = r.get(1);
+    Ok(ContextFact {
+        context: r.get(0),
+        topology: Topology::parse(&topology).ok_or_else(|| {
+            sqlx::Error::Decode(
+                format!("inbox_context holds an unknown topology {topology:?}").into(),
+            )
+        })?,
+        generation: r.get::<i64, _>(2) as u32,
+        msg_key: r.get(3),
+    })
+}
+
+async fn context_row(
+    conn: &mut SqliteConnection,
+    context: &str,
+) -> Result<Option<ContextFact>, sqlx::Error> {
+    let row =
+        sqlx::query("SELECT context, topology, gen, msg_key FROM inbox_context WHERE context = ?1")
+            .bind(context)
+            .fetch_optional(conn)
+            .await?;
+    row.as_ref().map(context_fact_of).transpose()
+}
+
+async fn write_context(
+    conn: &mut SqliteConnection,
+    env: &Envelope,
+    fact: &ContextV1,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO inbox_context (context, topology, gen, msg_key) \
+         VALUES (?1, ?2, ?3, ?4) \
+         ON CONFLICT (context) DO UPDATE SET topology = excluded.topology, \
+         gen = excluded.gen, msg_key = excluded.msg_key",
+    )
+    .bind(&env.context.0)
+    .bind(fact.topology.as_str())
+    .bind(i64::from(fact.generation))
+    .bind(env.msg.key())
+    .execute(conn)
+    .await?;
+    Ok(())
+}
+
 /// One current role fact (the `inbox_role` projection of a `role@1`).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct RoleFact {
@@ -1228,6 +1356,32 @@ pub fn allowed_now(s: &DeliveryState, msg_key: &str, env: &Envelope) -> Vec<Stri
         }
         (Phase::Sent, _) => vec![format!("toron next   (marks {msg_key} delivered)")],
         _ => Vec::new(),
+    }
+}
+
+/// [`allowed_now`] once a context has a topology fact and the viewer holds a role.
+///
+/// Either fact missing: today's phase table, and [`topology::project`] is not
+/// called (a flag-off reader never reaches `next`, and a flag-on context with
+/// no topology fact stays on the phase table). Both present: the projection.
+/// Supervisor projects to nothing here, not to the swarm verb list; the typed
+/// refusal of a send is [`Reject::NotYet`].
+pub fn allowed_now_for(
+    s: &DeliveryState,
+    msg_key: &str,
+    env: &Envelope,
+    topology: Option<Topology>,
+    role: Option<Role>,
+) -> Vec<String> {
+    let (Some(topology), Some(role)) = (topology, role) else {
+        return allowed_now(s, msg_key, env);
+    };
+    let Ok(global) = topology::global_of(topology) else {
+        return Vec::new();
+    };
+    match topology::project(global, role, 0) {
+        Ok(now) => now.verbs,
+        Err(_) => Vec::new(),
     }
 }
 
