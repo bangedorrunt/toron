@@ -28,8 +28,19 @@ pub async fn run_comms(
     let store = mailbox.inbox_store_with(cfg.comms_inbox_log())?;
     let out = match command {
         Command::Next(a) => {
+            if a.urgent && !a.peek {
+                eprintln!("toron: error: --urgent requires --peek");
+                return Ok(ExitCode::from(2));
+            }
             let reader = mailbox.comms_npub(&a.project, &a.who).await?;
             match store.next(&reader, a.stream.as_deref(), a.peek).await {
+                Ok(b) if a.urgent => {
+                    if toron_core::inbox::urgent_pending(&b.items) {
+                        println!("urgent");
+                        return Ok(ExitCode::SUCCESS);
+                    }
+                    return Ok(ExitCode::from(1));
+                }
                 Ok(b) if format == OutputFormat::Human => {
                     print_next_human(&b, a.peek);
                     return Ok(ExitCode::SUCCESS);

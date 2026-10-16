@@ -240,6 +240,11 @@ pub struct NextArgs {
     /// Show without committing the cursor or Delivered.
     #[arg(long)]
     pub peek: bool,
+    /// With `--peek`, exit 0 and print `urgent` when a `steer@1` priority
+    /// field is `urgent`. Exit 1 when none are pending. The body is not
+    /// printed. Without `--peek` this flag is a usage error.
+    #[arg(long)]
+    pub urgent: bool,
 }
 
 /// `toron ack` (ADR-0041).
