@@ -129,6 +129,24 @@ fn inbox_program_fold_is_pure() {
 }
 
 #[test]
+fn authority_table_is_pure() {
+    let src = include_str!("../src/authority.rs");
+    let body: Vec<&str> = src
+        .split("#[cfg(test)]")
+        .next()
+        .unwrap_or("")
+        .lines()
+        .collect();
+    assert!(body.len() > 150, "the authority module is the real one");
+    let bad = offenders(&body);
+    assert!(
+        bad.is_empty(),
+        "impure tokens in the authority table:\n{}",
+        bad.join("\n")
+    );
+}
+
+#[test]
 fn the_purity_check_bites() {
     // Negative control: the interpreter is impure by design and must trip it.
     let src = include_str!("../src/outbox.rs");

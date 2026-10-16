@@ -2,6 +2,7 @@
 #![forbid(unsafe_code)]
 
 pub mod archive;
+pub mod authority;
 pub mod backend;
 pub mod bus;
 pub mod busy_owner;
