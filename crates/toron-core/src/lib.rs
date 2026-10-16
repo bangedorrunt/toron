@@ -24,6 +24,7 @@ pub mod outbox;
 pub mod policy;
 pub mod serve_build;
 pub mod testkit;
+pub mod topology;
 pub mod wake;
 
 /// Client/relay pool. rust-nostr 0.45 no longer nests protocol types under

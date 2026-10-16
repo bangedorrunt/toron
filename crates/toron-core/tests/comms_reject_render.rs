@@ -73,6 +73,9 @@ fn every_reject() -> Vec<Reject> {
             contract: "task@1".into(),
             expected: vec![],
         },
+        Reject::NotYet {
+            what: "supervisor".into(),
+        },
     ];
     for r in &all {
         match r {
@@ -92,7 +95,8 @@ fn every_reject() -> Vec<Reject> {
             | Reject::NotApplicable { .. }
             | Reject::Terminal { .. }
             | Reject::IllegalTransition { .. }
-            | Reject::Unauthorized { .. } => {}
+            | Reject::Unauthorized { .. }
+            | Reject::NotYet { .. } => {}
         }
     }
     all
@@ -170,5 +174,26 @@ fn unauthorized_carries_role_class_contract_and_the_expected_set_on_the_wire() {
         }
         .to_string(),
         "a sender with no role here may not send task@1 (Task); allowed: []"
+    );
+}
+
+/// Phase 4.2: supervisor is stored and refused, not run as a swarm.
+/// No new CLI verb surfaces this; `inbox append` already prints any `Reject`.
+#[test]
+fn not_yet_carries_what_on_the_wire() {
+    let v = serde_json::to_value(Reject::NotYet {
+        what: "supervisor".into(),
+    })
+    .unwrap();
+    assert_eq!(
+        v,
+        serde_json::json!({"reject": "not_yet", "what": "supervisor"})
+    );
+    assert_eq!(
+        Reject::NotYet {
+            what: "supervisor".into()
+        }
+        .to_string(),
+        "not yet: supervisor"
     );
 }
