@@ -190,10 +190,12 @@ pub const STANDARD: &[Grant] = &[
     // context@1: the topology fact. Captain already has every Control via
     // the wildcard; a supervisor may set it too (Phase 4.2).
     only(Role::Supervisor, Class::Control, CONTEXT_CONTRACT),
-    // crew: reply, request to a peer, notify. No task, no control.
+    // crew: reply, request to a peer, notify. No task. The one control
+    // they may send is an upward handoff (`escalate@1`).
     any(Role::Crew, Class::Notify),
     any(Role::Crew, Class::Request),
     any(Role::Crew, Class::Reply),
+    only(Role::Crew, Class::Control, "escalate"),
     // peer: request, reply, notify.
     any(Role::Peer, Class::Notify),
     any(Role::Peer, Class::Request),
@@ -233,6 +235,8 @@ pub const SPEC: &[(Role, Class, &str, bool)] = &[
     (Role::Crew, Class::Control, "verdict", false),
     (Role::Crew, Class::Control, "approval", false),
     (Role::Crew, Class::Control, "steer", false),
+    (Role::Crew, Class::Control, "escalate", true),
+    (Role::Crew, Class::Control, "goal", false),
     (Role::Crew, Class::Control, "cancel", false),
     (Role::Crew, Class::Control, "role", false),
     (Role::Crew, Class::Request, "request", true),
@@ -516,6 +520,34 @@ impl Authority {
             issuer,
             Standing::Operator | Standing::Holds(Role::Captain | Role::Supervisor)
         )
+    }
+
+    /// May `issuer` append a `lead@1` fact? The first fact of a context is
+    /// operator-signed. Once one exists, the operator or the captain may
+    /// raise it. A supervisor's control grant does not include `lead`.
+    pub const fn may_set_lead(issuer: Standing, has_lead: bool) -> bool {
+        if !has_lead {
+            return matches!(issuer, Standing::Operator);
+        }
+        matches!(issuer, Standing::Operator | Standing::Holds(Role::Captain))
+    }
+
+    /// [`Self::may_set_lead`] as a typed refusal.
+    pub fn check_set_lead(issuer: Standing, has_lead: bool) -> Result<(), Reject> {
+        if Self::may_set_lead(issuer, has_lead) {
+            return Ok(());
+        }
+        let expected = if has_lead {
+            vec!["operator".into(), "captain".into()]
+        } else {
+            vec!["operator".into()]
+        };
+        Err(unauthorized(
+            issuer.acts_as(),
+            Class::Control,
+            "lead@1",
+            expected,
+        ))
     }
 
     /// [`Self::may_set_context`] as a typed refusal. `expected` names who can.

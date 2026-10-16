@@ -365,6 +365,7 @@ async fn the_authority_table_is_enforced_at_append() {
                 "notify/*".into(),
                 "request/*".into(),
                 "reply/*".into(),
+                "control/escalate".into(),
                 "done".into()
             ],
         }
@@ -587,9 +588,9 @@ fn control_contracts_in_known_all_have_an_authority_row() {
         "{control:?}"
     );
     let a = Authority::standard();
-    // approval@1 is captain-only in SPEC (supervisor false, captain true).
-    // Do not grant it wider so this check stays green.
-    const CAPTAIN_ONLY: &[&str] = &["approval"];
+    // approval@1 and lead@1 are captain-only in the table (plus the operator,
+    // who is not a role here). Do not grant either wider so this check stays green.
+    const CAPTAIN_ONLY: &[&str] = &["approval", "lead"];
     for name in control {
         if CAPTAIN_ONLY.contains(&name) {
             assert!(a.allows(Role::Captain, Class::Control, name), "{name}");

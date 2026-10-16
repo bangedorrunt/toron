@@ -306,6 +306,30 @@ pub enum Reject {
         /// What is not projected (`supervisor`).
         what: String,
     },
+    /// A crew verb on a task whose steer is still `pending` (Phase 4a.2).
+    /// `id` is that steer message's key; `op` is its `redirect|pause|resume|cancel`.
+    /// The steer itself, and an ack of it, are not this refusal.
+    ///
+    /// A struct variant (the enum is internally tagged).
+    #[error("steer {id} ({op}) is unacked")]
+    SteerPending {
+        /// The pending steer message (`producer:epoch:seq`).
+        id: String,
+        /// The steer op that is waiting.
+        op: String,
+    },
+    /// A lead fact, or a steer naming a lead epoch, that is not strictly
+    /// newer than the epoch on record (Phase 4a.3). No lead row: this is not
+    /// raised, and the steer is not given an invented epoch.
+    ///
+    /// A struct variant (the enum is internally tagged).
+    #[error("stale sup_epoch {sent}, current {current}")]
+    StaleSupEpoch {
+        /// The epoch the sender named.
+        sent: u64,
+        /// The epoch on record.
+        current: u64,
+    },
 }
 
 fn role_label(role: &Option<Role>) -> String {
