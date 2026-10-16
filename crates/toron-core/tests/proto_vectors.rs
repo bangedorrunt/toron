@@ -117,6 +117,62 @@ fn wake_vectors_from_lean_pass_in_rust() {
     );
 }
 
+/// Lean `project` replayed through `global_of` then `project`. Supervisor is
+/// `NotYet` from `global_of` (the walk is not run). Not a delivery step:
+/// `DeliveryFsm` has no roles.
+#[test]
+fn choreo_vectors_from_lean_pass_in_rust() {
+    let mut n = 0;
+    for (i, line) in vectors("choreo.jsonl").lines().enumerate() {
+        let v: serde_json::Value = serde_json::from_str(line).unwrap();
+        let topo = toron_core::topology::Topology::parse(v["topology"].as_str().unwrap())
+            .unwrap_or_else(|| panic!("vector {i}: bad topology: {line}"));
+        let role = toron_core::authority::Role::parse(v["role"].as_str().unwrap())
+            .unwrap_or_else(|| panic!("vector {i}: bad role: {line}"));
+        let state = v["state"].as_u64().unwrap() as u32;
+        let got = toron_core::topology::global_of(topo)
+            .and_then(|g| toron_core::topology::project(g, role, state));
+        match got {
+            Ok(allowed) => {
+                let want: Vec<String> = serde_json::from_value(v["verbs"].clone())
+                    .unwrap_or_else(|_| panic!("vector {i}: expected verbs: {line}"));
+                assert!(v.get("error").is_none(), "vector {i}: {line}");
+                assert_eq!(allowed.verbs, want, "vector {i}: {line}");
+            }
+            Err(toron_core::topology::ProjectError::NotYet { what }) => {
+                assert_eq!(what, "supervisor", "vector {i}: {line}");
+                assert_eq!(v["error"].as_str(), Some("not_yet"), "vector {i}: {line}");
+                assert!(v.get("verbs").is_none(), "vector {i}: {line}");
+                assert_eq!(topo, toron_core::topology::Topology::Supervisor);
+            }
+        }
+        n += 1;
+    }
+    assert_eq!(
+        n, 120,
+        "the committed vector count changed; regenerate deliberately"
+    );
+}
+
+/// Negative control: a corrupted verb list fails the same replay.
+#[test]
+fn a_wrong_choreo_vector_is_caught() {
+    let line = vectors("choreo.jsonl")
+        .lines()
+        .find(|l| l.contains("\"verbs\":[\"done\",\"progress\",\"reject\"]"))
+        .unwrap()
+        .replace("\"done\"", "\"task\"");
+    let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+    let topo = toron_core::topology::Topology::parse(v["topology"].as_str().unwrap()).unwrap();
+    let role = toron_core::authority::Role::parse(v["role"].as_str().unwrap()).unwrap();
+    let state = v["state"].as_u64().unwrap() as u32;
+    let got = toron_core::topology::global_of(topo)
+        .and_then(|g| toron_core::topology::project(g, role, state))
+        .unwrap();
+    let want: Vec<String> = serde_json::from_value(v["verbs"].clone()).unwrap();
+    assert_ne!(got.verbs, want);
+}
+
 /// Negative control: a corrupted expectation is caught by the same replay.
 #[test]
 fn a_wrong_wake_vector_is_caught() {

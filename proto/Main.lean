@@ -143,6 +143,22 @@ def wakeInputs : List RingInput := Id.run do
 def allWakeVectors : List String := wakeInputs.map fun i =>
   "{\"input\":" ++ ringInputJson i ++ ",\"expect\":" ++ decisionJson (shouldRing i) ++ "}"
 
+/-! Choreography vectors: one line per cell of `allCells` (state 0 through one
+past the last branch, plus supervisor `not_yet`). Verbs are sorted. -/
+
+def verbsJson (vs : List String) : String :=
+  "[" ++ String.intercalate "," (vs.map jstr) ++ "]"
+
+def choreoLine (t : Topology) (r : Role) (s : Nat) : String :=
+  let head := "{\"topology\":" ++ jstr t.wire ++ ",\"role\":" ++ jstr r.wire ++
+    ",\"state\":" ++ toString s
+  match project t r s with
+  | .verbs vs => head ++ ",\"verbs\":" ++ verbsJson vs ++ "}"
+  | .notYet => head ++ ",\"error\":\"not_yet\"}"
+
+def allChoreo : List String :=
+  allCells.map fun c => choreoLine c.1 c.2.1 c.2.2
+
 def checkFile (file : String) (lines : List String) (what : String) : IO UInt32 := do
   let committed ← IO.FS.readFile file
   let fresh := String.intercalate "\n" lines ++ "\n"
@@ -167,6 +183,10 @@ def main (args : List String) : IO UInt32 := do
     for l in allWakeVectors do IO.println l
     return 0
   | ["wake-vectors", "--check", file] => checkFile file allWakeVectors "wake vectors"
+  | ["choreo-vectors"] =>
+    for l in allChoreo do IO.println l
+    return 0
+  | ["choreo-vectors", "--check", file] => checkFile file allChoreo "choreo vectors"
   | _ =>
-    IO.eprintln "usage: proto (vectors | log-traces | wake-vectors) [--check FILE]"
+    IO.eprintln "usage: proto (vectors | log-traces | wake-vectors | choreo-vectors) [--check FILE]"
     return 2

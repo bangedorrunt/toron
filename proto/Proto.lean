@@ -1,3 +1,9 @@
 import Proto.Delivery
 import Proto.Log
 import Proto.Wake
+import Proto.Fencing
+import Proto.Choreo
+import Proto.Choreo.Swarm
+import Proto.Choreo.Loop
+import Proto.Choreo.Open
+import Proto.Choreo.Sound
