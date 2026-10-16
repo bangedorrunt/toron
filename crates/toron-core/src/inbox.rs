@@ -24,7 +24,7 @@ use sqlx::{Row as _, SqliteConnection, SqlitePool};
 use crate::authority::{
     Authority, CONTEXT_CONTRACT, ROLE_CONTRACT, Relation, Role, Standing, VERDICT_CONTRACT,
 };
-use crate::contracts::{self, Body, context_v1::ContextV1, role_v1::RoleV1};
+use crate::contracts::{self, Body, context_v1::ContextV1, role_v1::RoleV1, steer_v1::SteerV1};
 use crate::delivery::{DeliveryEvent, DeliveryFsm, DeliveryState, Phase, Reject};
 use crate::envelope::{Class, Envelope, MsgId};
 use crate::kernel::{self, AppendError, DurableLog, Offset};
@@ -508,6 +508,16 @@ impl InboxStore {
                 .await
                 .map_err(unavailable)?;
         }
+        if let (Some(steer), Some(env)) = (&facts.steer, &envelope) {
+            write_steer(&mut tx, env, steer)
+                .await
+                .map_err(unavailable)?;
+            // Redirect fences the task's current gen; cancel ends it. Pause
+            // and resume record the steer and leave the gen alone.
+            apply_steer(&mut tx, env, steer, now)
+                .await
+                .map_err(unavailable)?;
+        }
         tx.commit().await.map_err(unavailable)?;
         Ok(Appended {
             offset: offset as u64,
@@ -587,7 +597,7 @@ impl InboxStore {
             }
             return Ok(AppendFacts {
                 role: Some(role),
-                context: None,
+                ..AppendFacts::none()
             });
         }
         if env.class == Class::Control && env.contract.name == CONTEXT_CONTRACT {
@@ -605,8 +615,20 @@ impl InboxStore {
                 .into());
             }
             return Ok(AppendFacts {
-                role: None,
                 context: Some(fact),
+                ..AppendFacts::none()
+            });
+        }
+        if env.class == Class::Control && env.contract.name == "steer" {
+            let Body::Steer(steer) = contracts::parse(env)? else {
+                unreachable!("steer@1 parses as a steer body");
+            };
+            // A steer is the control fact itself, not a swarm send. Return
+            // before the supervisor-topology refusal, the same way a role
+            // fact does, so it is stored rather than answered `NotYet`.
+            return Ok(AppendFacts {
+                steer: Some(steer),
+                ..AppendFacts::none()
             });
         }
         // A supervisor context is stored, not projected. Do not run the send
@@ -883,8 +905,12 @@ impl InboxStore {
         task_id: &str,
         evidence: &[String],
     ) -> Result<(String, DeliveryState), InboxError> {
+        // The task row, not a later steer/control that names the same task id.
+        // A steer is class Control; `done` fences the Task delivery.
         let key: Option<String> = sqlx::query_scalar(
-            "SELECT msg_key FROM inbox_delivery WHERE task_id = ?1 AND recipient = ?2 ORDER BY updated_ts_us DESC LIMIT 1",
+            "SELECT msg_key FROM inbox_delivery WHERE task_id = ?1 AND recipient = ?2 \
+             AND json_extract(state_json, '$.class') = 'task' \
+             ORDER BY updated_ts_us DESC LIMIT 1",
         )
         .bind(task_id)
         .bind(reader)
@@ -898,6 +924,13 @@ impl InboxStore {
         };
         self.authorize_done(reader, &msg_key).await?;
         let s = self.delivery(&msg_key, reader).await?;
+        // The gen the crew was assigned is the task envelope's, which a
+        // redirect does not rewrite. The delivery gen moves. Passing the
+        // assignment gen is what makes the old one `StaleGen` after a bump;
+        // with no steer the two are equal, so `done` is unchanged.
+        let generation = assignment_gen(&self.pool, &msg_key)
+            .await?
+            .unwrap_or(s.generation);
         let ev = serde_json::json!({ "evidence": evidence });
         let next = self
             .step(
@@ -905,7 +938,7 @@ impl InboxStore {
                 reader,
                 &DeliveryEvent::Done {
                     by: reader.into(),
-                    generation: s.generation,
+                    generation,
                 },
                 Some(&ev),
             )
@@ -1114,6 +1147,7 @@ impl InboxStore {
 struct AppendFacts {
     role: Option<RoleV1>,
     context: Option<ContextV1>,
+    steer: Option<SteerV1>,
 }
 
 impl AppendFacts {
@@ -1121,8 +1155,96 @@ impl AppendFacts {
         Self {
             role: None,
             context: None,
+            steer: None,
         }
     }
+}
+
+/// The generation on the task envelope (the gen the assignee was given).
+/// `None` when the row is not an envelope; the caller keeps the delivery gen.
+async fn assignment_gen(pool: &SqlitePool, msg_key: &str) -> Result<Option<u32>, sqlx::Error> {
+    let payload: Option<String> = sqlx::query_scalar(
+        "SELECT payload FROM inbox_log WHERE msg_key = ?1 AND stream = 'inbox' LIMIT 1",
+    )
+    .bind(msg_key)
+    .fetch_optional(pool)
+    .await?;
+    let Some(payload) = payload else {
+        return Ok(None);
+    };
+    let Ok(env) = serde_json::from_str::<Envelope>(&payload) else {
+        return Ok(None);
+    };
+    Ok(Some(env.generation))
+}
+
+/// Project an accepted steer and retire the previous pending one for this task.
+async fn write_steer(
+    conn: &mut SqliteConnection,
+    env: &Envelope,
+    steer: &SteerV1,
+) -> Result<(), sqlx::Error> {
+    let Some(task) = &env.task else {
+        return Ok(());
+    };
+    let epoch =
+        i64::try_from(steer.sup_epoch).map_err(|e| sqlx::Error::Decode(e.to_string().into()))?;
+    sqlx::query(
+        "UPDATE inbox_steer SET state = 'superseded' \
+         WHERE context = ?1 AND task = ?2 AND state = 'pending'",
+    )
+    .bind(&env.context.0)
+    .bind(&task.0)
+    .execute(&mut *conn)
+    .await?;
+    sqlx::query(
+        "INSERT INTO inbox_steer \
+         (msg_key, context, task, gen, op, priority, sup_epoch, state) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending')",
+    )
+    .bind(env.msg.key())
+    .bind(&env.context.0)
+    .bind(&task.0)
+    .bind(i64::from(env.generation))
+    .bind(&steer.op)
+    .bind(&steer.priority)
+    .bind(epoch)
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
+/// Redirect bumps the task delivery's gen in place (the phase stays, so a
+/// later `done` at the old gen is `StaleGen` rather than terminal).
+/// Cancel moves it to `Cancelled`. Pause and resume do neither.
+async fn apply_steer(
+    conn: &mut SqliteConnection,
+    env: &Envelope,
+    steer: &SteerV1,
+    now: i64,
+) -> Result<(), sqlx::Error> {
+    let Some(task) = &env.task else {
+        return Ok(());
+    };
+    let rows = sqlx::query("SELECT msg_key, state_json FROM inbox_delivery WHERE task_id = ?1")
+        .bind(&task.0)
+        .fetch_all(&mut *conn)
+        .await?;
+    for row in rows {
+        let key: String = row.get(0);
+        let mut state: DeliveryState = serde_json::from_str(&row.get::<String, _>(1))
+            .map_err(|e| sqlx::Error::Decode(e.to_string().into()))?;
+        if state.class != Class::Task || state.is_terminal() {
+            continue;
+        }
+        match steer.op.as_str() {
+            "redirect" => state.generation = state.generation.saturating_add(1),
+            "cancel" => state.phase = Phase::Cancelled,
+            _ => continue,
+        }
+        write_delivery(conn, &key, &state, Some(&task.0), None, now).await?;
+    }
+    Ok(())
 }
 
 /// One current topology fact (the `inbox_context` projection of a `context@1`).
