@@ -19,8 +19,10 @@
 use std::time::Duration;
 
 use serde::Serialize;
-use sqlx::{Row as _, SqlitePool};
+use sqlx::{Row as _, SqliteConnection, SqlitePool};
 
+use crate::authority::{Authority, ROLE_CONTRACT, Relation, Role, Standing, VERDICT_CONTRACT};
+use crate::contracts::{self, Body, role_v1::RoleV1};
 use crate::delivery::{DeliveryEvent, DeliveryFsm, DeliveryState, Phase, Reject};
 use crate::envelope::{Class, Envelope, MsgId};
 use crate::kernel::{self, AppendError, DurableLog, Offset};
@@ -247,12 +249,32 @@ pub fn l16_json(env: &Envelope) -> String {
 #[derive(Debug)]
 enum Refusal {
     Log(AppendError),
-    PayloadConflict { msg_key: String },
+    PayloadConflict {
+        msg_key: String,
+    },
+    /// A typed refusal of the envelope (authority, role fence).
+    Reject(Reject),
 }
 
 impl From<AppendError> for Refusal {
     fn from(e: AppendError) -> Self {
         Self::Log(e)
+    }
+}
+
+impl From<Reject> for Refusal {
+    fn from(r: Reject) -> Self {
+        Self::Reject(r)
+    }
+}
+
+impl From<Refusal> for InboxError {
+    fn from(r: Refusal) -> Self {
+        match r {
+            Refusal::Log(e) => e.into(),
+            Refusal::PayloadConflict { msg_key } => Self::PayloadConflict { msg_key },
+            Refusal::Reject(r) => r.into(),
+        }
     }
 }
 
@@ -264,12 +286,44 @@ fn unavailable(e: impl std::fmt::Display) -> AppendError {
 #[derive(Clone, Debug)]
 pub struct InboxStore {
     pool: SqlitePool,
+    /// The operator key's npub (64 lowercase hex), when this store knows it.
+    /// The operator acts with captain authority and alone starts a context.
+    operator: Option<String>,
+    authority: Authority,
 }
 
 impl InboxStore {
-    /// Wrap a migrated index pool.
+    /// Wrap a migrated index pool. The store enforces [`Authority::standard`]
+    /// and knows no operator: open it through `Mailbox::inbox_store*`, or add
+    /// [`Self::with_operator`], to let the operator key start contexts and act
+    /// in governed ones.
     pub fn new(pool: SqlitePool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            operator: None,
+            authority: Authority::standard(),
+        }
+    }
+
+    /// The operator key's npub (64 lowercase hex). Without it nobody can
+    /// append a context's first role fact, so no context can become governed
+    /// through this store.
+    #[must_use]
+    pub fn with_operator(mut self, npub: impl Into<String>) -> Self {
+        self.operator = Some(npub.into());
+        self
+    }
+
+    /// Replace the authority table (tests and negative controls only).
+    #[must_use]
+    pub fn with_authority(mut self, authority: Authority) -> Self {
+        self.authority = authority;
+        self
+    }
+
+    /// The operator npub this store was given.
+    pub fn operator(&self) -> Option<&str> {
+        self.operator.as_deref()
     }
 
     /// The pool.
@@ -294,12 +348,15 @@ impl InboxStore {
                 Refusal::PayloadConflict { msg_key } => AppendError::NotAnEnvelope(format!(
                     "payload conflict on {msg_key}: the log already holds different content under this producer triple"
                 )),
+                // The vendored enum is closed: through the kernel entry a typed
+                // refusal is its text. `append_envelope` returns it typed.
+                Refusal::Reject(r) => AppendError::NotAnEnvelope(r.to_string()),
             })
     }
 
     async fn append_checked(&self, stream: &str, json: &str) -> Result<Appended, Refusal> {
         let (producer, epoch, seq, payload) = parse_l16(json)?;
-        let (recipient, msg_key, delivery) = if stream == INBOX_STREAM {
+        let (recipient, msg_key, delivery, envelope) = if stream == INBOX_STREAM {
             let env: Envelope = serde_json::from_value(payload.clone())
                 .map_err(|e| AppendError::NotAnEnvelope(format!("inbox payload: {e}")))?;
             env.validate()
@@ -318,7 +375,8 @@ impl InboxStore {
             }
             let stream_key = env.to.stream();
             let d = DeliveryState::intent(env.class, stream_key.clone(), env.generation);
-            (stream_key, env.msg.key(), Some((d, env.task.map(|t| t.0))))
+            let task_id = env.task.clone().map(|t| t.0);
+            (stream_key, env.msg.key(), Some((d, task_id)), Some(env))
         } else {
             (
                 String::new(),
@@ -328,6 +386,7 @@ impl InboxStore {
                     seq,
                 }
                 .key(),
+                None,
                 None,
             )
         };
@@ -383,6 +442,13 @@ impl InboxStore {
                 replay: true,
             });
         }
+        // Authority (Phase 4.1): after the fence and the replay answer, before
+        // anything is written. A replay of a message already in the log was
+        // authorised when it landed and stays idempotent.
+        let role_fact = match &envelope {
+            Some(env) => self.authorize_in(&mut tx, env).await?,
+            None => None,
+        };
         let last = match state {
             Some((current, last)) if current as u64 == epoch => Some(last as u64),
             _ => None,
@@ -429,6 +495,11 @@ impl InboxStore {
                 .await
                 .map_err(unavailable)?;
         }
+        if let (Some(role), Some(env)) = (&role_fact, &envelope) {
+            write_role(&mut tx, env, role, now)
+                .await
+                .map_err(unavailable)?;
+        }
         tx.commit().await.map_err(unavailable)?;
         Ok(Appended {
             offset: offset as u64,
@@ -441,13 +512,118 @@ impl InboxStore {
     /// under an existing `msg` is [`InboxError::PayloadConflict`].
     pub async fn append_envelope(&self, env: &Envelope) -> Result<Appended, InboxError> {
         env.validate()?;
-        match self.append_checked(INBOX_STREAM, &l16_json(env)).await {
-            Ok(appended) => Ok(appended),
-            Err(Refusal::Log(e)) => Err(e.into()),
-            Err(Refusal::PayloadConflict { msg_key }) => {
-                Err(InboxError::PayloadConflict { msg_key })
-            }
+        self.append_checked(INBOX_STREAM, &l16_json(env))
+            .await
+            .map_err(InboxError::from)
+    }
+
+    /// Would [`Self::append_envelope`] pass the authority check for `env`
+    /// right now? A dry run for senders (flywheel's pre-flight): it reads the
+    /// role facts and writes nothing. It does not look at the epoch, the seq
+    /// or the replay state, which the append decides. A role fact is also
+    /// checked against its fence (`gen`).
+    pub async fn authorize(&self, env: &Envelope) -> Result<(), InboxError> {
+        env.validate()?;
+        let mut conn = self.pool.acquire().await?;
+        self.authorize_in(&mut conn, env)
+            .await
+            .map(|_| ())
+            .map_err(InboxError::from)
+    }
+
+    /// The authority check of one envelope inside the caller's connection
+    /// (the append's transaction, or a plain connection for the dry run).
+    /// Returns the role fact to project when the envelope is a `role@1`.
+    async fn authorize_in(
+        &self,
+        conn: &mut SqliteConnection,
+        env: &Envelope,
+    ) -> Result<Option<RoleV1>, Refusal> {
+        let context = env.context.0.as_str();
+        let governed = context_is_governed(conn, context)
+            .await
+            .map_err(unavailable)?;
+        let standing = self
+            .standing_in(conn, context, &env.from)
+            .await
+            .map_err(unavailable)?;
+        let relation = if env.class == Class::Control && env.contract.name == VERDICT_CONTRACT {
+            own_task_in(conn, env).await.map_err(unavailable)?
+        } else {
+            Relation::Other
+        };
+        self.authority
+            .check_send(standing, governed, env.class, &env.contract, relation)?;
+        if env.class != Class::Control || env.contract.name != ROLE_CONTRACT {
+            return Ok(None);
         }
+        let Body::Role(role) = contracts::parse(env)? else {
+            unreachable!("role@1 parses as a role body");
+        };
+        let current = role_row(conn, context, &role.npub)
+            .await
+            .map_err(unavailable)?;
+        Authority::check_grant(
+            standing,
+            current.as_ref().map(|c| c.role),
+            role.role,
+            governed,
+        )?;
+        if let Some(cur) = &current
+            && role.generation <= cur.generation
+        {
+            return Err(Reject::StaleGen {
+                sent: role.generation,
+                current: cur.generation,
+            }
+            .into());
+        }
+        Ok(Some(role))
+    }
+
+    /// Who `npub` is in `context`: the operator, a role holder, or unroled.
+    async fn standing_in(
+        &self,
+        conn: &mut SqliteConnection,
+        context: &str,
+        npub: &str,
+    ) -> Result<Standing, sqlx::Error> {
+        if self.operator.as_deref() == Some(npub) {
+            return Ok(Standing::Operator);
+        }
+        Ok(match role_row(conn, context, npub).await? {
+            Some(fact) => Standing::Holds(fact.role),
+            None => Standing::Unroled,
+        })
+    }
+
+    /// Who `npub` is in `context` (operator, role holder, or unroled).
+    pub async fn standing(&self, context: &str, npub: &str) -> Result<Standing, sqlx::Error> {
+        let mut conn = self.pool.acquire().await?;
+        self.standing_in(&mut conn, context, npub).await
+    }
+
+    /// The current role fact for `npub` in `context`, if any.
+    pub async fn role_of(
+        &self,
+        context: &str,
+        npub: &str,
+    ) -> Result<Option<RoleFact>, sqlx::Error> {
+        let mut conn = self.pool.acquire().await?;
+        role_row(&mut conn, context, npub).await
+    }
+
+    /// Every current role fact of `context`, ordered by npub. Empty = the
+    /// context is ungoverned.
+    pub async fn roles(&self, context: &str) -> Result<Vec<RoleFact>, sqlx::Error> {
+        let rows = sqlx::query(
+            "SELECT context, npub, role, gen, msg_key, issuer FROM inbox_role \
+             WHERE context = ?1 ORDER BY npub",
+        )
+        .bind(context)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(role_fact_of).collect()
     }
 
     /// Reconcile query: the offset holding `msg`, if the log has it.
@@ -668,6 +844,7 @@ impl InboxStore {
                 recipient: reader.into(),
             });
         };
+        self.authorize_done(reader, &msg_key).await?;
         let s = self.delivery(&msg_key, reader).await?;
         let ev = serde_json::json!({ "evidence": evidence });
         let next = self
@@ -682,6 +859,27 @@ impl InboxStore {
             )
             .await?;
         Ok((msg_key, next))
+    }
+
+    /// `done` is the one non-envelope verb the authority table names: a
+    /// verifier or a peer may not run it in a governed context.
+    async fn authorize_done(&self, reader: &str, msg_key: &str) -> Result<(), InboxError> {
+        let payload: Option<String> = sqlx::query_scalar(
+            "SELECT payload FROM inbox_log WHERE msg_key = ?1 AND stream = 'inbox' LIMIT 1",
+        )
+        .bind(msg_key)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(payload) = payload else {
+            return Ok(());
+        };
+        let env: Envelope = serde_json::from_str(&payload)
+            .map_err(|e| Reject::bad_envelope(format!("stored payload: {e}")))?;
+        let mut conn = self.pool.acquire().await?;
+        let governed = context_is_governed(&mut conn, &env.context.0).await?;
+        let standing = self.standing_in(&mut conn, &env.context.0, reader).await?;
+        self.authority.check_done(standing, governed)?;
+        Ok(())
     }
 
     /// Every envelope of `task_id` that `viewer` may see, oldest first, with
@@ -857,6 +1055,115 @@ impl InboxStore {
         .await?;
         Ok(h.map_or(0, |h| h as u64))
     }
+}
+
+/// One current role fact (the `inbox_role` projection of a `role@1`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct RoleFact {
+    /// The context the role holds in.
+    pub context: String,
+    /// The agent.
+    pub npub: String,
+    /// Its role.
+    pub role: Role,
+    /// The fence of this fact (wire name `gen`).
+    #[serde(rename = "gen")]
+    pub generation: u32,
+    /// The log message that carried the fact (`producer:epoch:seq`).
+    pub msg_key: String,
+    /// Who issued it (an npub).
+    pub issuer: String,
+}
+
+fn role_fact_of(r: &sqlx::sqlite::SqliteRow) -> Result<RoleFact, sqlx::Error> {
+    let role: String = r.get(2);
+    Ok(RoleFact {
+        context: r.get(0),
+        npub: r.get(1),
+        role: Role::parse(&role).ok_or_else(|| {
+            sqlx::Error::Decode(format!("inbox_role holds an unknown role {role:?}").into())
+        })?,
+        generation: r.get::<i64, _>(3) as u32,
+        msg_key: r.get(4),
+        issuer: r.get(5),
+    })
+}
+
+async fn role_row(
+    conn: &mut SqliteConnection,
+    context: &str,
+    npub: &str,
+) -> Result<Option<RoleFact>, sqlx::Error> {
+    let row = sqlx::query(
+        "SELECT context, npub, role, gen, msg_key, issuer FROM inbox_role \
+         WHERE context = ?1 AND npub = ?2",
+    )
+    .bind(context)
+    .bind(npub)
+    .fetch_optional(conn)
+    .await?;
+    row.as_ref().map(role_fact_of).transpose()
+}
+
+/// A context is governed once it holds any role fact.
+async fn context_is_governed(
+    conn: &mut SqliteConnection,
+    context: &str,
+) -> Result<bool, sqlx::Error> {
+    let any: Option<i64> =
+        sqlx::query_scalar("SELECT 1 FROM inbox_role WHERE context = ?1 LIMIT 1")
+            .bind(context)
+            .fetch_optional(conn)
+            .await?;
+    Ok(any.is_some())
+}
+
+/// Did `env.from` send a `task` envelope for `env.task`? (The supervisor's
+/// "not a verdict on its own task" rule reads this.)
+async fn own_task_in(conn: &mut SqliteConnection, env: &Envelope) -> Result<Relation, sqlx::Error> {
+    let Some(task) = &env.task else {
+        return Ok(Relation::Other);
+    };
+    let own: Option<i64> = sqlx::query_scalar(
+        "SELECT 1 FROM inbox_delivery d \
+         JOIN inbox_log l ON l.msg_key = d.msg_key AND l.stream = 'inbox' \
+         WHERE d.task_id = ?1 AND l.producer = ?2 \
+         AND json_extract(d.state_json, '$.class') = 'task' LIMIT 1",
+    )
+    .bind(&task.0)
+    .bind(&env.from)
+    .fetch_optional(conn)
+    .await?;
+    Ok(if own.is_some() {
+        Relation::OwnTask
+    } else {
+        Relation::Other
+    })
+}
+
+/// Project an accepted role fact (inside the append's transaction).
+async fn write_role(
+    conn: &mut SqliteConnection,
+    env: &Envelope,
+    role: &RoleV1,
+    now: i64,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO inbox_role (context, npub, role, gen, msg_key, issuer, set_ts_us) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+         ON CONFLICT (context, npub) DO UPDATE SET role = excluded.role, gen = excluded.gen, \
+         msg_key = excluded.msg_key, issuer = excluded.issuer, set_ts_us = excluded.set_ts_us",
+    )
+    .bind(&env.context.0)
+    .bind(&role.npub)
+    .bind(role.role.as_str())
+    .bind(i64::from(role.generation))
+    .bind(env.msg.key())
+    .bind(&env.from)
+    .bind(now)
+    .execute(conn)
+    .await?;
+    Ok(())
 }
 
 async fn read_delivery(

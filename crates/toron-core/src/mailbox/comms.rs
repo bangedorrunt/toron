@@ -28,7 +28,13 @@ impl Mailbox {
             .index_pool()
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("comms inbox requires the index pool (no --index)"))?;
-        Ok(InboxStore::new(pool))
+        let store = InboxStore::new(pool);
+        // The operator key is the one identity that may start a context and
+        // acts with captain authority (Phase 4.1, `authority.rs`).
+        Ok(match self.operator() {
+            Some(keys) => store.with_operator(keys.public_key().to_hex()),
+            None => store,
+        })
     }
 
     /// Resolve `--as` to a hex npub: 64 lowercase hex passes through, any

@@ -5,6 +5,7 @@
 //! and the CLI's `json!({"refused": r})` unwrapped it, so `toron inbox
 //! append` on a non-envelope panicked instead of refusing with exit 3.
 
+use toron_core::authority::Role;
 use toron_core::delivery::{Phase, Reject};
 use toron_core::envelope::Class;
 
@@ -60,6 +61,18 @@ fn every_reject() -> Vec<Reject> {
             phase: Phase::Sent,
             event: "done",
         },
+        Reject::Unauthorized {
+            role: Some(Role::Crew),
+            class: Class::Control,
+            contract: "verdict@1".into(),
+            expected: vec!["notify/*".into(), "done".into()],
+        },
+        Reject::Unauthorized {
+            role: None,
+            class: Class::Task,
+            contract: "task@1".into(),
+            expected: vec![],
+        },
     ];
     for r in &all {
         match r {
@@ -78,7 +91,8 @@ fn every_reject() -> Vec<Reject> {
             | Reject::SelfVerdict { .. }
             | Reject::NotApplicable { .. }
             | Reject::Terminal { .. }
-            | Reject::IllegalTransition { .. } => {}
+            | Reject::IllegalTransition { .. }
+            | Reject::Unauthorized { .. } => {}
         }
     }
     all
@@ -103,5 +117,58 @@ fn bad_envelope_carries_its_reason_on_the_wire() {
         Reject::bad_envelope("x").to_string(),
         "bad envelope: x",
         "the human message is unchanged"
+    );
+}
+
+/// Phase 4.1: the wire shape flywheel matches on. The tag is `unauthorized`;
+/// `role` is the snake_case role, or null when the sender holds none;
+/// `expected` is the verb set to use instead.
+#[test]
+fn unauthorized_carries_role_class_contract_and_the_expected_set_on_the_wire() {
+    let v = serde_json::to_value(Reject::Unauthorized {
+        role: Some(Role::LoopSelf),
+        class: Class::Control,
+        contract: "role@1".into(),
+        expected: vec!["task/*".into(), "control/tick".into()],
+    })
+    .unwrap();
+    assert_eq!(
+        v,
+        serde_json::json!({
+            "reject": "unauthorized",
+            "role": "loop_self",
+            "class": "control",
+            "contract": "role@1",
+            "expected": ["task/*", "control/tick"],
+        })
+    );
+    let none = serde_json::to_value(Reject::Unauthorized {
+        role: None,
+        class: Class::Task,
+        contract: "task@1".into(),
+        expected: vec![],
+    })
+    .unwrap();
+    assert!(none["role"].is_null(), "{none}");
+    let human = Reject::Unauthorized {
+        role: Some(Role::Crew),
+        class: Class::Control,
+        contract: "verdict@1".into(),
+        expected: vec!["notify/*".into(), "done".into()],
+    }
+    .to_string();
+    assert_eq!(
+        human,
+        "role crew may not send verdict@1 (Control); allowed: [notify/*, done]"
+    );
+    assert_eq!(
+        Reject::Unauthorized {
+            role: None,
+            class: Class::Task,
+            contract: "task@1".into(),
+            expected: vec![]
+        }
+        .to_string(),
+        "a sender with no role here may not send task@1 (Task); allowed: []"
     );
 }
