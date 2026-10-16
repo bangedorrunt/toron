@@ -823,10 +823,21 @@ impl InboxStore {
             let role = role_row(&mut tx, &envelope.context.0, reader)
                 .await?
                 .map(|r| r.role);
+            // Both facts, or today's phase table. No fact: project is not called.
+            let mut allowed_now = allowed_now_for(&state, &msg_key, &envelope, topology, role);
+            // The head item only. `next` already refused a reader who is not
+            // the recipient, so this is their own stream. No pending steer:
+            // `allowed_now_for` is left as it was.
+            if items.is_empty()
+                && let Some(task) = &envelope.task
+                && let Some((steer_key, _)) =
+                    pending_steer(&mut tx, &envelope.context.0, &task.0).await?
+            {
+                allowed_now = steer_pending_verbs(&steer_key);
+            }
             items.push(InboxItem {
                 offset,
-                // Both facts, or today's phase table. No fact: project is not called.
-                allowed_now: allowed_now_for(&state, &msg_key, &envelope, topology, role),
+                allowed_now,
                 msg_key,
                 envelope,
                 phase: state.phase,
@@ -869,7 +880,26 @@ impl InboxStore {
                 recipient: recipient.into(),
             });
         };
+        let env = load_env(&mut tx, msg_key).await?;
+        if let Some(env) = &env
+            && let Some(reject) = steer_blocks(&mut tx, msg_key, env, event).await?
+        {
+            return Err(reject.into());
+        }
         let next = DeliveryFsm::step(&s, event)?;
+        // Accepting the steer message is what clears `pending`. A reject
+        // leaves it pending: the crew has not taken the new instruction.
+        if let Some(env) = &env
+            && env.contract.name == "steer"
+            && matches!(event, DeliveryEvent::Accept { .. })
+        {
+            sqlx::query(
+                "UPDATE inbox_steer SET state = 'acked' WHERE msg_key = ?1 AND state = 'pending'",
+            )
+            .bind(msg_key)
+            .execute(&mut *tx)
+            .await?;
+        }
         write_delivery(&mut tx, msg_key, &next, None, evidence, now_us()).await?;
         tx.commit().await?;
         Ok(next)
@@ -1158,6 +1188,80 @@ impl AppendFacts {
             steer: None,
         }
     }
+}
+
+/// The envelope stored under `msg_key`, if the row is one. A bad payload is
+/// `None`: the steer gate then does not fire, and today's transition stands.
+async fn load_env(
+    conn: &mut SqliteConnection,
+    msg_key: &str,
+) -> Result<Option<Envelope>, sqlx::Error> {
+    let payload: Option<String> = sqlx::query_scalar(
+        "SELECT payload FROM inbox_log WHERE msg_key = ?1 AND stream = 'inbox' LIMIT 1",
+    )
+    .bind(msg_key)
+    .fetch_optional(&mut *conn)
+    .await?;
+    let Some(payload) = payload else {
+        return Ok(None);
+    };
+    Ok(serde_json::from_str(&payload).ok())
+}
+
+/// The pending steer for `(context, task)`, if one is waiting: `(msg_key, op)`.
+async fn pending_steer(
+    conn: &mut SqliteConnection,
+    context: &str,
+    task: &str,
+) -> Result<Option<(String, String)>, sqlx::Error> {
+    let row = sqlx::query(
+        "SELECT msg_key, op FROM inbox_steer \
+         WHERE context = ?1 AND task = ?2 AND state = 'pending' \
+         ORDER BY rowid DESC LIMIT 1",
+    )
+    .bind(context)
+    .bind(task)
+    .fetch_optional(&mut *conn)
+    .await?;
+    Ok(row.map(|r| (r.get(0), r.get(1))))
+}
+
+/// Crew `done` / `progress` / a non-steer ack write nothing while a steer on
+/// this task is `pending`. The steer message, and an ack of it, are allowed.
+async fn steer_blocks(
+    conn: &mut SqliteConnection,
+    msg_key: &str,
+    env: &Envelope,
+    event: &DeliveryEvent,
+) -> Result<Option<Reject>, sqlx::Error> {
+    let crew_verb = matches!(
+        event,
+        DeliveryEvent::Done { .. }
+            | DeliveryEvent::Progress { .. }
+            | DeliveryEvent::Accept { .. }
+            | DeliveryEvent::Refuse { .. }
+    );
+    if !crew_verb {
+        return Ok(None);
+    }
+    if env.contract.name == "steer"
+        && matches!(
+            event,
+            DeliveryEvent::Accept { .. } | DeliveryEvent::Refuse { .. }
+        )
+    {
+        return Ok(None);
+    }
+    let Some(task) = &env.task else {
+        return Ok(None);
+    };
+    let Some((id, op)) = pending_steer(conn, &env.context.0, &task.0).await? else {
+        return Ok(None);
+    };
+    if id == msg_key {
+        return Ok(None);
+    }
+    Ok(Some(Reject::SteerPending { id, op }))
 }
 
 /// The generation on the task envelope (the gen the assignee was given).
@@ -1460,6 +1564,15 @@ async fn write_delivery(
     .execute(conn)
     .await?;
     Ok(())
+}
+
+/// The two ack lines a reader is limited to while a steer on this task is
+/// still `pending`. `msg_key` is the steer message, not the task.
+pub fn steer_pending_verbs(msg_key: &str) -> Vec<String> {
+    vec![
+        format!("toron ack {msg_key} accept"),
+        format!("toron ack {msg_key} reject --reason <why>"),
+    ]
 }
 
 /// The verbs a reader may run on a delivery now (the projection the CLI

@@ -8,11 +8,13 @@
 use std::collections::BTreeMap;
 
 use toron_core::authority::Role;
+use toron_core::contracts::context_v1::ContextV1;
 use toron_core::contracts::role_v1::RoleV1;
-use toron_core::delivery::{Phase, Reject};
+use toron_core::delivery::{DeliveryEvent, Phase, Reject};
 use toron_core::envelope::{Class, ContextId, ContractId, Envelope, MsgId, Recipient, TaskId};
-use toron_core::inbox::{InboxError, InboxStore};
+use toron_core::inbox::{InboxError, InboxStore, steer_pending_verbs};
 use toron_core::index::schema;
+use toron_core::topology::Topology;
 
 const OP: &str = "0000000000000000000000000000000000000000000000000000000000000001";
 const CAP: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc01";
@@ -149,6 +151,20 @@ async fn steer_rows(s: &InboxStore) -> i64 {
         .unwrap()
 }
 
+/// Deliver the steer `claimed` left unread and accept it. That is the ack
+/// that clears `pending`; until it lands, crew verbs are `SteerPending`.
+async fn ack_steer(s: &InboxStore) -> String {
+    let batch = s.next(CREW, None, false).await.unwrap();
+    let item = batch
+        .items
+        .iter()
+        .find(|i| i.envelope.contract.name == "steer")
+        .expect("the steer was delivered");
+    let key = item.msg_key.clone();
+    s.ack(CREW, &key, true, None).await.unwrap();
+    key
+}
+
 async fn touched_at(s: &InboxStore, msg_key: &str) -> i64 {
     sqlx::query_scalar(
         "SELECT updated_ts_us FROM inbox_delivery WHERE msg_key = ?1 AND recipient = ?2",
@@ -219,6 +235,9 @@ async fn captain_redirect_then_done_at_the_old_gen_writes_nothing() {
     let d = s.delivery(&key, CREW).await.unwrap();
     assert_eq!(d.generation, 2, "redirect bumps the task gen");
     assert_eq!(d.phase, Phase::Acknowledged);
+    // The pending gate (4a.2) refuses done until this ack. After it, the
+    // old gen is still stale and the done still writes nothing.
+    ack_steer(&s).await;
     let touched = touched_at(&s, &key).await;
     let err = s.done(CREW, TASK, &["evidence".into()]).await.unwrap_err();
     assert!(
@@ -250,7 +269,102 @@ async fn pause_does_not_make_the_old_gen_stale() {
     let d = s.delivery(&key, CREW).await.unwrap();
     assert_eq!(d.generation, 1, "pause does not bump gen");
     assert_eq!(d.phase, Phase::Acknowledged);
+    ack_steer(&s).await;
     let (_k, done) = s.done(CREW, TASK, &["evidence".into()]).await.unwrap();
     assert_eq!(done.phase, Phase::Acted);
     assert_eq!(done.generation, 1);
+}
+
+fn is_steer_pending(err: &InboxError) -> bool {
+    matches!(
+        err,
+        InboxError::Reject(Reject::SteerPending { op, .. }) if op == "redirect"
+    )
+}
+
+#[test]
+fn steer_pending_verbs_are_the_two_ack_lines() {
+    assert_eq!(
+        steer_pending_verbs("p:0:1"),
+        vec![
+            "toron ack p:0:1 accept".to_string(),
+            "toron ack p:0:1 reject --reason <why>".to_string(),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn progress_and_done_wait_until_the_steer_is_acked() {
+    let (s, mut q) = swarm("pending").await;
+    let key = claimed(&s, &mut q).await;
+    let m = q.msg(CAP);
+    let steer = steer_env(m, "redirect", Some(serde_json::json!({"goal": "retarget"})));
+    let steer_key = steer.msg.key();
+    put(&s, &mut q, steer).await;
+
+    let d = s.delivery(&key, CREW).await.unwrap();
+    let touched = touched_at(&s, &key).await;
+    let progress = s
+        .step(
+            &key,
+            CREW,
+            &DeliveryEvent::Progress {
+                by: CREW.into(),
+                generation: d.generation,
+            },
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(is_steer_pending(&progress), "{progress:?}");
+    // A non-steer ack of the task is the same refusal, ahead of the FSM.
+    let ack = s.ack(CREW, &key, true, None).await.unwrap_err();
+    assert!(is_steer_pending(&ack), "{ack:?}");
+    let done = s.done(CREW, TASK, &["evidence".into()]).await.unwrap_err();
+    assert!(is_steer_pending(&done), "{done:?}");
+    assert_eq!(touched_at(&s, &key).await, touched);
+    assert_eq!(
+        s.delivery(&key, CREW).await.unwrap().phase,
+        Phase::Acknowledged
+    );
+
+    // A swarm fact would project crew verbs ("done") over the ack lines.
+    // The head item's pending steer replaces that with the two ack lines.
+    let m = q.msg(OP);
+    put(
+        &s,
+        &mut q,
+        ContextV1 {
+            topology: Topology::Swarm,
+            generation: 1,
+        }
+        .into_envelope(m, ContextId(CTX.into()), OP),
+    )
+    .await;
+    let batch = s.next(CREW, None, false).await.unwrap();
+    assert_eq!(
+        batch.items.len(),
+        1,
+        "only the unread steer is in this batch"
+    );
+    assert_eq!(batch.items[0].msg_key, steer_key);
+    assert_eq!(
+        batch.items[0].allowed_now,
+        steer_pending_verbs(&steer_key),
+        "pending steer on the head item, not the phase table and not the projection"
+    );
+
+    s.ack(CREW, &steer_key, true, None).await.unwrap();
+    let after = s.done(CREW, TASK, &["evidence".into()]).await.unwrap_err();
+    assert!(
+        matches!(
+            after,
+            InboxError::Reject(Reject::StaleGen {
+                sent: 1,
+                current: 2
+            })
+        ),
+        "acked redirect is no longer SteerPending: {after:?}"
+    );
+    assert_eq!(touched_at(&s, &key).await, touched);
 }
