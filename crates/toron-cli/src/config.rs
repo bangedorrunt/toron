@@ -72,7 +72,8 @@ pub struct Config {
 #[serde(deny_unknown_fields)]
 pub struct CommsConfig {
     /// Turn the per-recipient inbox log and its verbs (`next`, `ack`, `done`,
-    /// `inbox ...`) on. `TORON_COMMS_INBOX` overrides it when set. Default off.
+    /// `inbox ...`) on. Absent means on. `TORON_COMMS_INBOX` overrides it
+    /// when set. `inbox_log = false` opts out.
     pub inbox_log: Option<bool>,
 }
 

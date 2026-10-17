@@ -49,17 +49,17 @@ pub const JOURNAL_STREAM: &str = "journal";
 ///   `1|true|on` is on, `0|false|off` is off, and any other value is off
 ///   (fail closed; a typo never turns the log on).
 /// * Unset or empty, the config key decides.
-/// * Neither: off.
+/// * Neither: on. `inbox_log = false` or `TORON_COMMS_INBOX=0` opts out.
 pub fn resolve_enabled(env: Option<&str>, config: Option<bool>) -> bool {
     match env {
         Some("1" | "true" | "on") => true,
-        Some("") | None => config.unwrap_or(false),
+        Some("") | None => config.unwrap_or(true),
         Some(_) => false,
     }
 }
 
-/// The flag from the environment alone (no config in hand). Off by default;
-/// the verbs refuse while it is off.
+/// The flag from the environment alone (no config in hand). On unless
+/// `TORON_COMMS_INBOX` is `0`, `false`, `off`, or any other set value.
 pub fn enabled() -> bool {
     enabled_with(None)
 }
@@ -91,7 +91,9 @@ pub enum InboxError {
     )]
     PayloadConflict { msg_key: String },
     /// The flag is off.
-    #[error("comms inbox is off: set TORON_COMMS_INBOX=1 or `[comms] inbox_log = true`")]
+    #[error(
+        "comms inbox is off: TORON_COMMS_INBOX=0 or `[comms] inbox_log = false` (default is on)"
+    )]
     Disabled,
     /// Store failure.
     #[error("store: {0}")]
