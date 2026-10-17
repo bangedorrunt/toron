@@ -47,11 +47,11 @@ fn an_unrecognised_env_value_fails_closed() {
 
 // --- negative controls: the pre-existing behaviour, unchanged ---------------
 
-/// CONTROL: nothing set anywhere is off.
+/// CONTROL: nothing set anywhere is on. An explicit false config still opts out.
 #[test]
-fn control_default_is_off() {
-    assert!(!resolve_enabled(None, None));
-    assert!(!resolve_enabled(Some(""), None));
+fn control_default_is_on() {
+    assert!(resolve_enabled(None, None));
+    assert!(resolve_enabled(Some(""), None));
 }
 
 /// CONTROL: `inbox_log = false` is off, and the env var alone still turns it

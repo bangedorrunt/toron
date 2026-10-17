@@ -68,17 +68,16 @@ fn env_off_overrides_inbox_log_true() {
 
 // --- negative controls ------------------------------------------------------
 
-/// CONTROL: no config and no env var is the old behaviour, and the refusal now
-/// names the config key too.
+/// CONTROL: no config and no env var opens the gate. The off switches are
+/// `TORON_COMMS_INBOX=0` and `inbox_log = false`.
 #[test]
-fn control_nothing_set_is_refused_and_names_both_switches() {
+fn control_nothing_set_opens_the_gate() {
     let d = scratch("none");
     let o = run(&d, None, None);
-    assert!(refused_as_off(&o));
-    let err = String::from_utf8_lossy(&o.stderr);
     assert!(
-        err.contains("TORON_COMMS_INBOX") && err.contains("inbox_log"),
-        "{err}"
+        !refused_as_off(&o),
+        "default must be on: {}",
+        String::from_utf8_lossy(&o.stderr)
     );
 }
 
