@@ -293,8 +293,8 @@ fn what_the_role_allows_still_goes_through() {
     assert_eq!(json(&o)["replay"], false);
 }
 
-/// The same refused sequence with the comms flag off or unset is today's
-/// behaviour: every verb exits 2 naming the flag, and nothing is evaluated.
+/// Opt-out values still refuse before any evaluation. Unset and empty are
+/// on (the default), so they are not in this list.
 #[test]
 fn with_the_flag_off_the_same_sequence_is_unchanged() {
     let (dir, key, op) = rig("flagoff");
@@ -308,12 +308,12 @@ fn with_the_flag_off_the_same_sequence_is_unchanged() {
         Some("t-1"),
         serde_json::json!({"title": "t", "brief": "b"}),
     );
-    for flag in [None, Some("0"), Some("off"), Some("")] {
+    for flag in [Some("0"), Some("off"), Some("false"), Some("nope")] {
         for (name, env) in [("a.json", &boot), ("b.json", &t)] {
             let o = append(&dir, &key, flag, name, env);
             assert_eq!(o.status.code(), Some(2), "flag {flag:?}");
             assert!(
-                String::from_utf8_lossy(&o.stderr).contains("TORON_COMMS_INBOX"),
+                String::from_utf8_lossy(&o.stderr).contains("comms inbox is off"),
                 "{}",
                 String::from_utf8_lossy(&o.stderr)
             );
@@ -322,5 +322,20 @@ fn with_the_flag_off_the_same_sequence_is_unchanged() {
                 "nothing is rendered while the flag is off"
             );
         }
+    }
+}
+
+/// CONTROL: nothing set, and an empty env value, open the gate. A role fact lands.
+#[test]
+fn with_nothing_set_the_gate_is_open() {
+    for (tag, flag) in [("unset", None), ("empty", Some(""))] {
+        let (dir, key, op) = rig(tag);
+        let boot = role_fact(&op, 0, CAP, Role::Captain);
+        let o = append(&dir, &key, flag, "a.json", &boot);
+        assert!(
+            o.status.success(),
+            "flag {flag:?}: {}",
+            String::from_utf8_lossy(&o.stderr)
+        );
     }
 }

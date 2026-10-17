@@ -12,8 +12,8 @@ use crate::envelope::is_npub_hex;
 use crate::inbox::{InboxError, InboxStore, enabled_with};
 
 impl Mailbox {
-    /// The comms inbox store over the index pool. Refuses while the
-    /// `TORON_COMMS_INBOX` flag is off (environment alone).
+    /// The comms inbox store over the index pool. On when the env is unset.
+    /// Refuses on `TORON_COMMS_INBOX=0` (environment alone; no config key).
     pub fn inbox_store(&self) -> anyhow::Result<InboxStore> {
         self.inbox_store_with(None)
     }
