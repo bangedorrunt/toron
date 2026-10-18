@@ -471,7 +471,12 @@ mod effect_reconciliation_tests {
             S::Parked,
         ];
         // No intent row yet: both dispatch fresh under every capability.
-        for cap in [cap(false, false), cap(false, true), cap(true, false), cap(true, true)] {
+        for cap in [
+            cap(false, false),
+            cap(false, true),
+            cap(true, false),
+            cap(true, true),
+        ] {
             let fw_cap = fw::ProviderCapability {
                 supports_idempotency_key: cap.supports_idempotency_key,
                 supports_reconcile_query: cap.supports_reconcile_query,
@@ -486,8 +491,12 @@ mod effect_reconciliation_tests {
         for state in states {
             for lease_live in [false, true] {
                 for attempt in [0, 1, 3] {
-                    for cap in [cap(false, false), cap(false, true), cap(true, false), cap(true, true)]
-                    {
+                    for cap in [
+                        cap(false, false),
+                        cap(false, true),
+                        cap(true, false),
+                        cap(true, true),
+                    ] {
                         let fw_cap = fw::ProviderCapability {
                             supports_idempotency_key: cap.supports_idempotency_key,
                             supports_reconcile_query: cap.supports_reconcile_query,

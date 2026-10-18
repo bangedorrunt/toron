@@ -236,8 +236,8 @@ pub fn host_port(url: &str) -> Option<(String, u16)> {
 // (lib.rs + toron-mcp/cli/e2e import via `engine::*` — zero external edits).
 pub use boundary::{
     ActionErrorCode, ActionFailure, ActionInvocation, ActionOutcome, ActionPartition, ActionStage,
-    DEPRECATED_ACTION_TYPES, Disposition, ENGINE_ACTION_TYPES, EffectSettlement, EffectState,
-    EvidenceRef, ExecutionPolicy, FailureKind, MAX_EVIDENCE_DETAIL, ProviderErrorClass, RunContext,
+    DEPRECATED_ACTION_TYPES, Disposition, ENGINE_ACTION_TYPES, EffectSettlement, EvidenceRef,
+    ExecutionPolicy, FailureKind, MAX_EVIDENCE_DETAIL, ProviderErrorClass, RunContext,
     advertised_action_names, classify_provider_error_msg, derive_effect_key,
     failure_for_control_misdispatch, failure_for_provider_error, failure_for_unsupported, invoke,
     invoke_compat, is_failure_value, normalize_dispatch_result, partition,

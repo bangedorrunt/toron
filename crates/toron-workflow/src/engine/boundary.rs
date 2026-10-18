@@ -46,6 +46,7 @@
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use toron_core::index::workflow_effects::EffectState;
 
 use crate::schema::Action;
 
@@ -71,38 +72,6 @@ impl ActionStage {
             Self::Output => "output",
             Self::Effect => "effect",
             Self::Park => "park",
-        }
-    }
-}
-
-/// Lifecycle state of one logical external effect (ADR-0032 Spec 1).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum EffectState {
-    None,
-    Prepared,
-    InFlight,
-    Accepted,
-    Settled,
-    Failed,
-    Unknown,
-    ReconcilePending,
-    Cancelled,
-}
-
-impl EffectState {
-    /// Canonical wire spelling.
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::None => "none",
-            Self::Prepared => "prepared",
-            Self::InFlight => "in_flight",
-            Self::Accepted => "accepted",
-            Self::Settled => "settled",
-            Self::Failed => "failed",
-            Self::Unknown => "unknown",
-            Self::ReconcilePending => "reconcile_pending",
-            Self::Cancelled => "cancelled",
         }
     }
 }
@@ -316,7 +285,11 @@ pub struct ActionFailure {
     pub retryable: bool,
     pub resumable: bool,
     pub disposition: Disposition,
-    pub effect_state: EffectState,
+    /// The journaled state when the failure names a row; `None` when the
+    /// failure precedes any row (unsupported action, misdispatch, missing
+    /// sink). The core enum plus `Option` for "no row" — no second
+    /// spelling of the state table.
+    pub effect_state: Option<EffectState>,
     pub evidence: EvidenceRef,
 }
 
@@ -337,7 +310,7 @@ impl ActionFailure {
             "stage": self.stage.as_str(),
             "kind": self.kind.map(FailureKind::as_str),
             "retryable": self.retryable,
-            "effect_state": self.effect_state.as_str(),
+            "effect_state": self.effect_state.map(EffectState::as_str).unwrap_or("none"),
             "disposition": self.disposition.as_str(),
             "evidence": self.evidence,
         })
@@ -479,7 +452,7 @@ pub fn failure_for_unsupported(action: &Action) -> ActionFailure {
         retryable: false,
         resumable: false,
         disposition: Disposition::TerminalFailed,
-        effect_state: EffectState::None,
+        effect_state: None,
         evidence: EvidenceRef::default(),
     }
 }
@@ -500,7 +473,7 @@ pub fn failure_for_control_misdispatch(action: &Action) -> ActionFailure {
         retryable: false,
         resumable: false,
         disposition: Disposition::TerminalFailed,
-        effect_state: EffectState::None,
+        effect_state: None,
         evidence: EvidenceRef::default(),
     }
 }
@@ -519,7 +492,7 @@ pub fn failure_for_missing_sink(action: &Action, sink: &'static str) -> ActionFa
         retryable: false,
         resumable: false,
         disposition: Disposition::Blocked,
-        effect_state: EffectState::None,
+        effect_state: None,
         evidence: EvidenceRef::default(),
     }
 }
@@ -538,7 +511,7 @@ pub fn failure_for_invalid_output(type_name: &'static str, evidence: EvidenceRef
         retryable: false,
         resumable: false,
         disposition: Disposition::TerminalFailed,
-        effect_state: EffectState::Failed,
+        effect_state: Some(EffectState::Failed),
         evidence,
     }
 }
@@ -616,7 +589,7 @@ pub fn failure_for_provider_error(message: String, evidence: EvidenceRef) -> Act
             retryable: kind.is_retry_candidate(),
             resumable: false,
             disposition: Disposition::Reconcile,
-            effect_state: EffectState::Unknown,
+            effect_state: Some(EffectState::Unknown),
             evidence,
         };
     }
@@ -628,7 +601,7 @@ pub fn failure_for_provider_error(message: String, evidence: EvidenceRef) -> Act
         retryable: false,
         resumable: false,
         disposition: Disposition::TerminalFailed,
-        effect_state: EffectState::Failed,
+        effect_state: Some(EffectState::Failed),
         evidence,
     }
 }
@@ -940,7 +913,7 @@ mod tests {
         assert!(!called.get(), "dispatch must not run for control actions");
         assert_eq!(err.code, ActionErrorCode::ControlActionMisdispatch);
         assert_eq!(err.stage, ActionStage::Execute);
-        assert_eq!(err.effect_state, EffectState::None);
+        assert_eq!(err.effect_state, None);
         assert!(!err.retryable);
         let v = err.to_value();
         assert_eq!(v["ok"], serde_json::json!(false));
@@ -1020,7 +993,7 @@ mod tests {
         assert_eq!(err.code, ActionErrorCode::ProviderError);
         assert_eq!(err.stage, ActionStage::Effect);
         // bd-zczp: timeout is ambiguous — Unknown + Reconcile, not Failed.
-        assert_eq!(err.effect_state, EffectState::Unknown);
+        assert_eq!(err.effect_state, Some(EffectState::Unknown));
         assert_eq!(err.disposition, Disposition::Reconcile);
         assert_eq!(err.kind, Some(FailureKind::Timeout));
         assert!(
@@ -1087,7 +1060,7 @@ mod tests {
             retryable: false,
             resumable: false,
             disposition: Disposition::TerminalFailed,
-            effect_state: EffectState::Unknown,
+            effect_state: Some(EffectState::Unknown),
             evidence: EvidenceRef::with_detail("y".repeat(10_000)),
         };
         let v = err.to_value();
@@ -1163,7 +1136,7 @@ mod tests {
         let err =
             invoke(&inv, |_| Err(anyhow::anyhow!("relay timeout"))).expect_err("must surface");
         assert_eq!(err.code, ActionErrorCode::ProviderError);
-        assert_eq!(err.effect_state, EffectState::Unknown);
+        assert_eq!(err.effect_state, Some(EffectState::Unknown));
         assert_eq!(err.disposition, Disposition::Reconcile);
         assert_eq!(err.kind, Some(FailureKind::Timeout));
         let v = err.to_value();
@@ -1183,7 +1156,7 @@ mod tests {
             Err(anyhow::anyhow!("transport: connection reset by peer"))
         })
         .expect_err("must surface");
-        assert_eq!(err.effect_state, EffectState::Unknown);
+        assert_eq!(err.effect_state, Some(EffectState::Unknown));
         assert_eq!(err.disposition, Disposition::Reconcile);
     }
 
@@ -1198,7 +1171,7 @@ mod tests {
         });
         let err = invoke(&inv, |_| Err(anyhow::anyhow!("unknown agent: nobody")))
             .expect_err("must surface");
-        assert_eq!(err.effect_state, EffectState::Failed);
+        assert_eq!(err.effect_state, Some(EffectState::Failed));
         assert_eq!(err.disposition, Disposition::TerminalFailed);
         assert!(!err.retryable);
     }
