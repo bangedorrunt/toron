@@ -27,7 +27,13 @@ use crate::nostr::identity::{self as ident, AgentProfile, IdentityResult};
 use crate::nostr::kinds::{AGENT_PROFILE, toron_kind};
 
 use super::Mailbox;
-use super::collect_replay;
+use super::{AltKeyMemo, collect_replay};
+
+/// How long an alternate-root MISS stays memoized before it is walked again.
+/// Bounded so a key registered by another process (a CLI while the daemon
+/// runs) becomes visible without a restart; this process's own registrations
+/// clear the memo outright.
+const ALT_KEY_MISS_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Result of register/create: the agent's identity + where its key lives.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -1098,6 +1104,8 @@ impl Mailbox {
                 self.agent_passphrase(),
                 crate::keys::DEFAULT_LOG_N,
             )?;
+            // A new key can make a memoized alternate-root miss resolvable.
+            self.forget_alt_key_paths();
         }
         let ok = self.bus.publish(result.event.clone()).await?;
         if !ok.stored {
@@ -1190,7 +1198,77 @@ impl Mailbox {
     /// deeper path-slug roots (`<data>/Users/.../workspace` holding `agents/`
     /// while `<data>/Users/.../workspace/toron` is the real project). A
     /// non-descending walk would shadow the nested root.
+    ///
+    /// The winning PATH is memoized per `(project_slug, name)`
+    /// (`alt_key_paths`), because this walk is the steady-state case, not the
+    /// rare one: the fleet's keys live under legacy roots
+    /// (`<data>/projects/flywheel/...`), so every `fetch_inbox` missed the
+    /// canonical path and re-walked the whole data dir — 4,065 directories
+    /// and 828 key files, five polls a second, 27% of a daemon core.
+    ///
+    /// The path is memoized rather than the key so a key file deleted under
+    /// the process still reads as absent: a hit re-reads and re-checks the
+    /// file, and drops the entry when it is gone. Misses carry a TTL
+    /// ([`ALT_KEY_MISS_TTL`]) so a key registered by ANOTHER process (a CLI
+    /// while the daemon runs) becomes visible without a restart; this
+    /// process's own writes clear the whole memo
+    /// ([`Self::forget_alt_key_paths`]).
     pub(crate) fn alt_agent_key(&self, project_slug: &str, name: &str) -> Option<Keys> {
+        let memo_key = (project_slug.to_string(), name.to_string());
+        let cached = self
+            .alt_key_paths
+            .lock()
+            .get(&memo_key)
+            .map(|m| m.path.clone());
+        match cached {
+            Some(Some(path)) => {
+                if let Some(keys) = self.load_agent_key(&path) {
+                    return Some(keys);
+                }
+                // Deleted (or unreadable) since the walk: forget and re-walk.
+                self.alt_key_paths.lock().remove(&memo_key);
+            }
+            Some(None) => {
+                let memo = self.alt_key_paths.lock();
+                let live = memo
+                    .get(&memo_key)
+                    .and_then(|m| m.miss_until)
+                    .is_some_and(|until| std::time::Instant::now() < until);
+                drop(memo);
+                if live {
+                    return None;
+                }
+                self.alt_key_paths.lock().remove(&memo_key);
+            }
+            None => {}
+        }
+        let found = self.walk_alt_agent_key(project_slug, name);
+        {
+            const ALT_KEY_MEMO_CAP: usize = 4096;
+            let mut memo = self.alt_key_paths.lock();
+            if memo.len() >= ALT_KEY_MEMO_CAP {
+                memo.clear();
+            }
+            memo.insert(
+                memo_key,
+                AltKeyMemo {
+                    path: found.clone(),
+                    miss_until: found
+                        .is_none()
+                        .then(|| std::time::Instant::now() + ALT_KEY_MISS_TTL),
+                },
+            );
+        }
+        found.and_then(|path| self.load_agent_key(&path))
+    }
+
+    /// The whole-`data_dir` walk behind [`Self::alt_agent_key`]: every root
+    /// whose basename matches `project_slug`'s, sorted, first holdable key
+    /// wins. Split out so the memo wraps a pure search and the walk itself
+    /// stays the one place the candidate order is decided.
+    fn walk_alt_agent_key(&self, project_slug: &str, name: &str) -> Option<PathBuf> {
+        self.alt_key_walks
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let want = std::path::Path::new(project_slug)
             .file_name()?
             .to_str()?
@@ -1236,8 +1314,8 @@ impl Mailbox {
                 .join("agents")
                 .join(name)
                 .join("key.ncryptsec");
-            if let Some(k) = self.load_agent_key(&legacy) {
-                return Some(k);
+            if self.load_agent_key(&legacy).is_some() {
+                return Some(legacy);
             }
         }
         None
@@ -3566,6 +3644,105 @@ mod tests {
         assert!(
             err.to_string().contains("has no local key in project demo"),
             "original error shape: {err}"
+        );
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// Move an agent's key off its canonical root into a legacy root — the
+    /// pre-ADR-0017 layout the live data dir still holds 828 key files of
+    /// (`<data>/projects/<slug>/agents/<name>/key.ncryptsec`). Only then can
+    /// resolution come from the walk at all.
+    fn move_key_to_legacy_root(data_dir: &std::path::Path, slug: &str, name: &str) {
+        let canonical = data_dir
+            .join(slug)
+            .join("agents")
+            .join(name)
+            .join("key.ncryptsec");
+        let legacy_dir = data_dir
+            .join("projects")
+            .join(slug)
+            .join("agents")
+            .join(name);
+        std::fs::create_dir_all(&legacy_dir).expect("legacy root");
+        std::fs::rename(canonical, legacy_dir.join("key.ncryptsec")).expect("move key");
+    }
+
+    /// The alternate-root walk is memoized per (project, name): the fleet's
+    /// keys live under legacy roots, so the steady state is a MISS on the
+    /// canonical path and a whole-data-dir walk on every `fetch_inbox`
+    /// (measured 2026-10-18: 4,065 directories, 828 key files, five polls a
+    /// second, 27% of a daemon core). The walk must happen once, and the
+    /// second resolve must produce the SAME key from the memoized path.
+    #[tokio::test]
+    async fn alt_agent_key_walks_once_per_project_and_name() {
+        let (mailbox, db_path, data_dir) = test_mailbox("alt-walk-once").await;
+        let agent = mailbox
+            .register_agent("demo", &profile("DustyWren"))
+            .await
+            .expect("register");
+        move_key_to_legacy_root(&data_dir, "demo", "DustyWren");
+
+        let before = mailbox.alt_key_walks();
+        let first = mailbox
+            .agent_keys_for("demo", "DustyWren")
+            .expect("first resolve through the walk");
+        assert_eq!(first.public_key().to_hex(), agent.npub, "the legacy key");
+        assert_eq!(
+            mailbox.alt_key_walks(),
+            before + 1,
+            "the miss on the canonical path walks once"
+        );
+
+        let second = mailbox
+            .agent_keys_for("demo", "DustyWren")
+            .expect("second resolve");
+        assert_eq!(second.public_key().to_hex(), agent.npub, "same key");
+        assert_eq!(
+            mailbox.alt_key_walks(),
+            before + 1,
+            "the second resolve reuses the memoized path, it does not re-walk"
+        );
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// A miss is memoized for its TTL (so an unresolved name does not walk per
+    /// poll) and a registration in THIS process clears the memo — the next
+    /// lookup must walk again rather than answer from a stale miss.
+    #[tokio::test]
+    async fn alt_agent_key_miss_is_memoized_and_registration_clears_it() {
+        let (mailbox, db_path, data_dir) = test_mailbox("alt-walk-miss").await;
+        let before = mailbox.alt_key_walks();
+        assert!(
+            mailbox.agent_keys_for("demo", "GhostPin").is_err(),
+            "no key anywhere for this name"
+        );
+        let after_miss = mailbox.alt_key_walks();
+        assert_eq!(after_miss, before + 1, "the miss walks");
+        assert!(
+            mailbox.agent_keys_for("demo", "GhostPin").is_err(),
+            "still no key"
+        );
+        assert_eq!(
+            mailbox.alt_key_walks(),
+            after_miss,
+            "a second miss inside the TTL does not walk again"
+        );
+
+        mailbox
+            .register_agent("demo", &profile("QuietLark"))
+            .await
+            .expect("register");
+        assert!(
+            mailbox.agent_keys_for("demo", "GhostPin").is_err(),
+            "the new key is not this name's"
+        );
+        assert_eq!(
+            mailbox.alt_key_walks(),
+            after_miss + 2,
+            "the registration itself walked for its own name, and the write \
+             cleared the memo so the next miss walks again"
         );
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_dir_all(&data_dir);
