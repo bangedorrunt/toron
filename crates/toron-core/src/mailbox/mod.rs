@@ -165,6 +165,27 @@ pub struct Mailbox {
     unwrap_cache_hits: Arc<AtomicU64>,
     /// Test/metrics observable: cold decrypts in [`Self::cached_unwrap`].
     unwrap_cache_misses: Arc<AtomicU64>,
+    /// bd-ben9: where the alternate-root key walk last found a key for
+    /// `(project, name)`. The walk is a whole-`data_dir` scan (4,065 dirs, 828
+    /// key files on the live store) and the fleet's keys live under legacy
+    /// roots, so every `fetch_inbox` re-walked it — five polls a second held
+    /// the daemon at 27% CPU. The PATH is memoized, not the key: a deleted
+    /// key file still reads as absent, exactly as the uncached walk did.
+    alt_key_paths: Arc<parking_lot::Mutex<HashMap<(String, String), AltKeyMemo>>>,
+    /// Test/metrics observable: alternate-root walks performed.
+    alt_key_walks: Arc<AtomicU64>,
+}
+
+/// A memoized alternate-root resolution (see `Mailbox::alt_key_paths`).
+pub(crate) struct AltKeyMemo {
+    /// The winning key path, or `None` for a miss (no alternate root holds a
+    /// key for this name).
+    pub(crate) path: Option<PathBuf>,
+    /// When a MISS may be re-walked: a key registered by another process
+    /// (a CLI while the daemon runs) must become visible without a restart.
+    /// Hits never expire — they are re-read from disk on every use, so a
+    /// deleted key file drops the entry instead of answering stale.
+    pub(crate) miss_until: Option<std::time::Instant>,
 }
 
 /// A decrypted agent key plus the exact ncryptsec content it was derived
@@ -214,6 +235,8 @@ impl Mailbox {
             )),
             unwrap_cache_hits: Arc::new(AtomicU64::new(0)),
             unwrap_cache_misses: Arc::new(AtomicU64::new(0)),
+            alt_key_paths: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            alt_key_walks: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -273,6 +296,22 @@ impl Mailbox {
     pub fn unwrap_cache_misses(&self) -> u64 {
         self.unwrap_cache_misses
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Alternate-root key walks since process start (test observable; see
+    /// `in_process.rs` for the same cfg-gated measurement shape).
+    #[cfg(test)]
+    pub(crate) fn alt_key_walks(&self) -> u64 {
+        self.alt_key_walks
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Forget every memoized alternate-root resolution. Called when this
+    /// process WRITES a key: a new registration can make a memoized miss
+    /// resolvable, and the next lookup must walk instead of answering from a
+    /// stale miss.
+    pub(crate) fn forget_alt_key_paths(&self) {
+        self.alt_key_paths.lock().clear();
     }
 
     /// Attach a post-unwrap trigger notify channel (ADR-0007 R3).
