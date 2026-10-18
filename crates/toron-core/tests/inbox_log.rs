@@ -100,6 +100,43 @@ fn toron_log_satisfies_every_durable_log_law() {
     }
 }
 
+/// `compact_before` drops records below a known offset and refuses
+/// hand-built ones, through the same bridge as append/read.
+#[test]
+fn compact_before_drops_below_a_known_offset_only() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let s = rt.block_on(store("compact"));
+    let log = ToronLog::spawn(s, JOURNAL_STREAM, rt.handle());
+    std::thread::spawn(move || {
+        let o0 = log
+            .append_json(&kernel::durable_log_laws::envelope("w", 0, 0, "{}"))
+            .unwrap();
+        let o1 = log
+            .append_json(&kernel::durable_log_laws::envelope("w", 0, 1, "{}"))
+            .unwrap();
+        log.append_json(&kernel::durable_log_laws::envelope("w", 0, 2, "{}"))
+            .unwrap();
+        assert!(matches!(
+            log.compact_before(&kernel::Offset::Start),
+            Err(AppendError::UnknownOffset)
+        ));
+        assert!(matches!(
+            log.compact_before(&kernel::Offset::At("00000000000000000999".into())),
+            Err(AppendError::UnknownOffset)
+        ));
+        assert_eq!(log.compact_before(&o1).unwrap(), 1);
+        let rest = log.read_from(&kernel::Offset::Start).unwrap();
+        assert_eq!(rest.len(), 2);
+        assert_eq!(rest[0].0, o1);
+        // The dropped offset is gone: reading from it is now unknown.
+        assert!(matches!(log.read_from(&o0), Err(AppendError::UnknownOffset)));
+        // Idempotent: compacting at the same offset drops nothing.
+        assert_eq!(log.compact_before(&o1).unwrap(), 0);
+    })
+    .join()
+    .unwrap();
+}
+
 #[tokio::test]
 async fn same_msg_id_twice_is_one_row_with_the_same_offset() {
     let s = store("dup").await;
@@ -252,6 +289,7 @@ fn boot(journal: ToronLog, inbox: ToronLog, epoch: u64) -> Loop<Outbox, OutboxRu
             seq: 0,
         },
     )
+    .expect("boot journals init on a fresh log")
 }
 
 /// F2 regression guard: the outbox loop runs inside a Tokio-hosted process
@@ -267,7 +305,7 @@ async fn loop_hosted_under_tokio_has_no_nested_runtime_panic() {
     let state = tokio::task::spawn_blocking(move || {
         std::thread::spawn(move || {
             let mut app = boot(journal, inbox, 0);
-            app.send(OutboxMsg::Send(e));
+            app.send(OutboxMsg::Send(e)).expect("loop send");
             app.model().sends.get(&key).cloned()
         })
         .join()
@@ -278,10 +316,29 @@ async fn loop_hosted_under_tokio_has_no_nested_runtime_panic() {
     assert!(matches!(state, Some(SendState::Settled(_))), "{state:?}");
     assert_eq!(s.read_stream(INBOX_STREAM, None).await.unwrap().len(), 1);
     assert_eq!(
-        s.read_stream(JOURNAL_STREAM, None).await.unwrap().len(),
-        1,
-        "intent journaled"
+        journal_kinds(&s).await,
+        ["msg", "intent", "msg"],
+        "one send journals its message, its append intent, and the reply"
     );
+}
+
+/// The journal record kinds on JOURNAL_STREAM, oldest first. The framework
+/// journals inbound messages (`msg`) as well as durable intents (`intent`),
+/// so one send leaves `["msg", "intent", "msg"]`, not one row.
+async fn journal_kinds(s: &InboxStore) -> Vec<String> {
+    s.read_stream(JOURNAL_STREAM, None)
+        .await
+        .unwrap()
+        .iter()
+        .map(|(_, p)| {
+            serde_json::from_str::<serde_json::Value>(p)
+                .ok()
+                .and_then(|v| {
+                    v.get("kind").and_then(|k| k.as_str()).map(str::to_string)
+                })
+                .unwrap_or_else(|| "?".into())
+        })
+        .collect()
 }
 
 /// Negative control: called ON a Tokio worker, the bridge refuses with a
@@ -307,7 +364,7 @@ fn crash_child() {
     let inbox = ToronLog::spawn(s, INBOX_STREAM, rt.handle());
     std::thread::spawn(move || {
         let mut app = boot(journal, inbox, 0);
-        app.send(OutboxMsg::Send(task(A, B, 0, 0)));
+        app.send(OutboxMsg::Send(task(A, B, 0, 0))).expect("loop send");
     })
     .join()
     .unwrap();
@@ -325,7 +382,10 @@ fn crash_at(point: &str) -> (std::path::PathBuf, std::process::ExitStatus) {
     (db, status)
 }
 
-fn recover_and_count(db: &std::path::Path) -> (usize, Vec<Option<SendState>>) {
+/// Reconcile `db` as a restarted sender and count the inbox rows. Every
+/// restart takes a NEW journal epoch: the loop journals inbound messages,
+/// so replaying the same epoch would collide with its own earlier records.
+fn recover_and_count(db: &std::path::Path, epoch: u64) -> (usize, Vec<Option<SendState>>) {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let s = rt.block_on(store_at(db));
     let journal = ToronLog::spawn(s.clone(), JOURNAL_STREAM, rt.handle());
@@ -333,10 +393,10 @@ fn recover_and_count(db: &std::path::Path) -> (usize, Vec<Option<SendState>>) {
     let states = std::thread::spawn(move || {
         let intents = outbox::recover(&journal).unwrap();
         // A restarted sender is a NEW epoch of its journal producer.
-        let mut app = boot(journal, inbox, 1);
+        let mut app = boot(journal, inbox, epoch);
         let keys: Vec<String> = intents.iter().map(|e| e.msg.key()).collect();
         for e in intents {
-            app.send(OutboxMsg::Recover(e));
+            app.send(OutboxMsg::Recover(e)).expect("loop send");
         }
         keys.iter()
             .map(|k| app.model().sends.get(k).cloned())
@@ -362,11 +422,9 @@ fn crash_between_intent_and_append_reconciles_to_exactly_one_row() {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let s = rt.block_on(store_at(&db));
     assert_eq!(
-        rt.block_on(s.read_stream(JOURNAL_STREAM, None))
-            .unwrap()
-            .len(),
-        1,
-        "intent journaled"
+        rt.block_on(journal_kinds(&s)),
+        ["msg", "intent"],
+        "the send message and its append intent journaled, nothing else"
     );
     assert_eq!(
         rt.block_on(s.read_stream(INBOX_STREAM, None))
@@ -376,13 +434,13 @@ fn crash_between_intent_and_append_reconciles_to_exactly_one_row() {
         "append never ran"
     );
     drop(rt);
-    let (rows, states) = recover_and_count(&db);
+    let (rows, states) = recover_and_count(&db, 1);
     assert_eq!(rows, 1);
     assert!(
         matches!(states.as_slice(), [Some(SendState::Settled(_))]),
         "{states:?}"
     );
-    let (rows_again, _) = recover_and_count(&db);
+    let (rows_again, _) = recover_and_count(&db, 2);
     assert_eq!(rows_again, 1, "a second recovery appends nothing");
 }
 
@@ -392,7 +450,7 @@ fn crash_between_intent_and_append_reconciles_to_exactly_one_row() {
 fn crash_after_append_reconciles_without_a_second_row() {
     let (db, status) = crash_at("after_append");
     assert!(!status.success(), "{status:?}");
-    let (rows, states) = recover_and_count(&db);
+    let (rows, states) = recover_and_count(&db, 1);
     assert_eq!(rows, 1);
     assert!(
         matches!(states.as_slice(), [Some(SendState::Settled(_))]),
@@ -415,7 +473,7 @@ fn unreachable_inbox_parks_unknown_and_never_spins() {
     let key = e.msg.key();
     let state = std::thread::spawn(move || {
         let mut app = boot(journal, inbox, 0);
-        app.send(OutboxMsg::Send(e));
+        app.send(OutboxMsg::Send(e)).expect("loop send");
         app.model().sends.get(&key).cloned()
     })
     .join()

@@ -82,19 +82,28 @@ fn intent_before_provider_same_key_on_retry(db: &dyn JournalStore) {
 
 fn claim_sets_owner_lease_generation_atomically(db: &dyn JournalStore) {
     db.record_intent("job-1", 3);
-    let row = db.claim("job-1", "worker-a", 9999).unwrap();
+    // Fresh row: generation 0, no owner.
+    let row = db.claim("job-1", "worker-a", 9999, 0, 0).unwrap();
     assert_eq!(row.owner.as_deref(), Some("worker-a"));
     assert_eq!(row.lease_deadline, Some(9999));
     assert_eq!(row.generation, 1);
-    let row = db.claim("job-1", "worker-b", 10000).unwrap();
+    // A stale generation claims nothing.
+    assert!(db.claim("job-1", "worker-a", 9999, 0, 0).is_none());
+    // A live lease under another owner is never stolen ...
+    assert!(db.claim("job-1", "worker-b", 10000, 0, 1).is_none());
+    // ... but the same owner may renew, and anyone may reclaim after expiry
+    // (deadline <= now_ms releases the lease).
+    let row = db.claim("job-1", "worker-a", 10000, 0, 1).unwrap();
     assert_eq!(row.generation, 2);
+    let row = db.claim("job-1", "worker-b", 20000, 10000, 2).unwrap();
     assert_eq!(row.owner.as_deref(), Some("worker-b"));
-    assert!(db.claim("never-recorded", "w", 1).is_none());
+    assert_eq!(row.generation, 3);
+    assert!(db.claim("never-recorded", "w", 1, 0, 0).is_none());
 }
 
 fn settle_carries_generation_stale_settles_nothing(db: &dyn JournalStore) {
     db.record_intent("job-1", 3);
-    db.claim("job-1", "worker-a", 9999);
+    db.claim("job-1", "worker-a", 9999, 0, 0);
     assert!(db.settle("job-1", 0, EffectState::InFlight).is_none());
     assert_eq!(db.get("job-1").unwrap().state, EffectState::Prepared);
     let row = db.settle("job-1", 1, EffectState::InFlight).unwrap();
@@ -108,17 +117,19 @@ fn settle_to(db: &dyn JournalStore, key: &str, to: EffectState) -> Option<Journa
 
 fn terminal_states_never_move(db: &dyn JournalStore) {
     db.record_intent("job-1", 3);
-    db.claim("job-1", "w", 1);
+    db.claim("job-1", "w", 1, 0, 0);
     settle_to(db, "job-1", EffectState::InFlight).unwrap();
     settle_to(db, "job-1", EffectState::Settled).unwrap();
     assert!(settle_to(db, "job-1", EffectState::Failed).is_none());
     assert!(settle_to(db, "job-1", EffectState::Cancelled).is_none());
     assert_eq!(db.get("job-1").unwrap().state, EffectState::Settled);
+    // Terminal rows never move, not even by claim (generation matches here).
+    assert!(db.claim("job-1", "w", 1, 0, 1).is_none());
 }
 
 fn unknown_has_no_default_exit(db: &dyn JournalStore) {
     db.record_intent("job-1", 3);
-    db.claim("job-1", "w", 1);
+    db.claim("job-1", "w", 1, 0, 0);
     settle_to(db, "job-1", EffectState::InFlight).unwrap();
     settle_to(db, "job-1", EffectState::Unknown).unwrap();
     assert!(settle_to(db, "job-1", EffectState::Accepted).is_none());
@@ -129,7 +140,7 @@ fn unknown_has_no_default_exit(db: &dyn JournalStore) {
 
 fn accepted_is_its_own_state(db: &dyn JournalStore) {
     db.record_intent("job-1", 3);
-    db.claim("job-1", "w", 1);
+    db.claim("job-1", "w", 1, 0, 0);
     settle_to(db, "job-1", EffectState::InFlight).unwrap();
     let row = settle_to(db, "job-1", EffectState::Accepted).unwrap();
     assert_eq!(row.state, EffectState::Accepted);
@@ -164,7 +175,7 @@ fn offset_and_state_commit_together(db: &dyn JournalStore) {
 fn offsets_move_only_forward(db: &dyn JournalStore) {
     db.record_intent("a", 3);
     let first = db.get("a").unwrap().offset;
-    db.claim("a", "w", 1);
+    db.claim("a", "w", 1, 0, 0);
     let second = db.get("a").unwrap().offset;
     assert!(second > first);
     // A refused settle commits nothing: the offset does not move.
@@ -308,7 +319,18 @@ fn random_operation_sequences_match_the_reference() {
                 }
                 1 => {
                     let d = rng.next(100) as i64;
-                    (reference.claim(&key, "w", d), toron.claim(&key, "w", d))
+                    // Mostly the current generation, sometimes a stale one,
+                    // like the settle arm below: both sides must agree.
+                    let g = reference.get(&key).map_or(0, |r| r.generation);
+                    let g = if rng.next(4) == 0 {
+                        g.saturating_sub(1)
+                    } else {
+                        g
+                    };
+                    (
+                        reference.claim(&key, "w", d, step as i64, g),
+                        toron.claim(&key, "w", d, step as i64, g),
+                    )
                 }
                 2 => {
                     // Mostly the current generation, sometimes a stale one.
@@ -352,7 +374,7 @@ fn rows_survive_a_reopen_and_scopes_are_isolated() {
         db.keep = true;
         let j = db.journal("loop-a", 8);
         j.record_intent("mail.append:x", 3);
-        let row = j.claim("mail.append:x", "loop-a", 42).unwrap();
+        let row = j.claim("mail.append:x", "loop-a", 42, 0, 0).unwrap();
         assert!(
             db.journal("loop-b", 8).get("mail.append:x").is_none(),
             "scope b sees nothing of a"
@@ -379,16 +401,23 @@ fn racing_claims_from_two_processes_never_share_a_generation() {
     let ja = a.journal("race", 1000);
     let jb = b.journal("race", 1000);
     ja.record_intent("job", 3);
-    let h1 = std::thread::spawn(move || {
-        (0..40)
-            .map(|_| ja.claim("job", "a", 1).unwrap().generation)
-            .collect::<Vec<_>>()
-    });
-    let h2 = std::thread::spawn(move || {
-        (0..40)
-            .map(|_| jb.claim("job", "b", 1).unwrap().generation)
-            .collect::<Vec<_>>()
-    });
+    // now_ms = MAX retires the lease fence (deadline 1 is always expired),
+    // so this measures exactly the generation fence: every success bumps
+    // the generation by one, and a stale read retries instead of sharing.
+    let race = |j: ToronJournal, owner: &'static str| {
+        std::thread::spawn(move || {
+            let mut gens = Vec::with_capacity(40);
+            while gens.len() < 40 {
+                let g = j.get("job").unwrap().generation;
+                if let Some(row) = j.claim("job", owner, 1, i64::MAX, g) {
+                    gens.push(row.generation);
+                }
+            }
+            gens
+        })
+    };
+    let h1 = race(ja, "a");
+    let h2 = race(jb, "b");
     let mut all: Vec<u64> = h1
         .join()
         .unwrap()

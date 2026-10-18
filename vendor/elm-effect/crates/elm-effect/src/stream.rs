@@ -10,8 +10,8 @@
 //! Sharing is [`Arc`] over [`Mutex`]-guarded factories, so only `Send` is
 //! ever required: requirement tags (which are not `Sync`) stream fine.
 
-use std::convert::Infallible;
 use std::collections::VecDeque;
+use std::convert::Infallible;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -238,6 +238,30 @@ impl<A: Send + 'static, E: Send + 'static, R: crate::effect::Requirement> Stream
         })
     }
 
+    /// `Stream.scanEffect` at the pin: the running fold with an effectful
+    /// step. The step reads and updates one accumulator, so it rides
+    /// `map_effect` with a bound of one: one child at a time is what keeps the
+    /// fold sequential, and the state lives in the closure rather than in a
+    /// second pull node.
+    pub fn scan_effect<S, F>(self, init: S, f: F) -> Stream<S, E, R>
+    where
+        S: Clone + Send + 'static,
+        F: Fn(S, A) -> Effect<S, E, R> + Send + Sync + 'static,
+    {
+        let (state, step) = (Arc::new(Mutex::new(init)), Arc::new(f));
+        self.map_effect(
+            move |a: A, _ctx: &crate::Ctx| {
+                let (state, step) = (Arc::clone(&state), Arc::clone(&step));
+                let acc = state.lock().unwrap().clone();
+                step(acc, a).map(move |next| {
+                    *state.lock().unwrap() = next.clone();
+                    next
+                })
+            },
+            1,
+        )
+    }
+
     /// `Stream.mapAccumArray` at the pin: thread state across chunks, emitting
     /// zero or more values per chunk. The mapping runs once per chunk.
     pub fn map_accum_array<S, B, F>(self, init: S, f: F) -> Stream<B, E, R>
@@ -352,6 +376,61 @@ impl<A: Send + 'static, E: Send + 'static, R: crate::effect::Requirement> Stream
                     Err(cause) => return Effect::fail_cause(cause),
                 }
             }
+        })
+    }
+
+    /// `Stream.onStart` at the pin: run `f` once when collection begins, before
+    /// the upstream is pulled. The elements are untouched.
+    ///
+    /// The pin's signature widens the error channel (`E | E2`); this port takes
+    /// an infallible closure instead, which is exactly what the pin's rows
+    /// exercise (`Effect.sync`), and avoids the widening problem that blocked
+    /// `takeUntilEffect`. An effectful `onStart` would need that machinery.
+    ///
+    /// The `Option`-take is what makes it once-only: the pump is `FnMut`, so it
+    /// runs again on every pull, and `take` consumes `F` on the first call. A
+    /// later call finds the slot empty and delegates straight to the upstream,
+    /// which is the pin's semantics (the callback is not re-run).
+    pub fn on_start<F>(self, f: F) -> Self
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        let (pull, exec) = (self.pull, Arc::clone(&self.exec));
+        let pending = Arc::new(Mutex::new(Some(f)));
+        Self::derive(exec, move || {
+            let (pull, pending) = (Arc::clone(&pull), Arc::clone(&pending));
+            if let Some(f) = pending.lock().unwrap().take() {
+                f();
+            }
+            call(&pull)
+        })
+    }
+
+    /// `Stream.onEnd` at the pin: run `f` once when the upstream is exhausted,
+    /// after its last chunk has been emitted.
+    ///
+    /// Same infallible-closure contract as [`Stream::on_start`], and for the
+    /// same reason: both pin rows use `Effect.sync`.
+    ///
+    /// `f` is consumed when the pull returns `None`, so the upstream ending is
+    /// what triggers it and a re-pull after the end does not re-run it.
+    pub fn on_end<F>(self, f: F) -> Self
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        let (pull, exec) = (self.pull, Arc::clone(&self.exec));
+        let finished = Arc::new(Mutex::new(Some(f)));
+        Self::derive(exec, move || {
+            let (pull, finished) = (Arc::clone(&pull), Arc::clone(&finished));
+            call(&pull).map(move |chunk| {
+                if chunk.is_none() {
+                    // The upstream ended, so this is the last pull.
+                    if let Some(f) = finished.lock().unwrap().take() {
+                        f();
+                    }
+                }
+                chunk
+            })
         })
     }
 
@@ -836,11 +915,7 @@ where
 /// positive value floors. The pin keeps these as two functions because a
 /// chunk size and an element count have different empty behavior.
 pub fn normalize(n: f64) -> usize {
-    if n > 0.0 {
-        n.floor() as usize
-    } else {
-        0
-    }
+    if n > 0.0 { n.floor() as usize } else { 0 }
 }
 
 pub fn normalize_non_empty(n: f64) -> usize {
@@ -902,6 +977,186 @@ where
     })
 }
 
+/// State for the byte limit pump.
+struct LimitBytes<E, R>
+where
+    E: Send + 'static,
+    R: crate::effect::Requirement,
+{
+    seen: i128,
+    fallback: Option<Box<dyn FnOnce() -> Stream<Vec<u8>, E, R> + Send>>,
+    switching: bool,
+}
+
+fn limit_bytes_pump<E, R>(
+    pull: Pull<Vec<u8>, E, R>,
+    state: Arc<Mutex<LimitBytes<E, R>>>,
+    cap: i128,
+) -> Effect<Option<Vec<Vec<u8>>>, E, R>
+where
+    E: Send + 'static,
+    R: crate::effect::Requirement,
+{
+    let mut guard = state.lock().unwrap();
+    if guard.switching {
+        // Already past the limit: every pull delegates to the fallback.
+        // It is built once, on the first pull that needs it.
+        let Some(build) = guard.fallback.take() else {
+            return Effect::succeed(None);
+        };
+        drop(guard);
+        let fallback = build();
+        return call(&Arc::clone(&fallback.pull));
+    }
+    match call(&pull).run_sync() {
+        Ok(None) => Effect::succeed(None),
+        Ok(Some(items)) => {
+            let mut out: Vec<Vec<u8>> = Vec::with_capacity(items.len());
+            for chunk in items {
+                let would_be = guard.seen + chunk.len() as i128;
+                if would_be > cap {
+                    // Drop this chunk and everything after it, and switch.
+                    guard.switching = true;
+                    break;
+                }
+                guard.seen = would_be;
+                out.push(chunk);
+            }
+            if !guard.switching {
+                return if out.is_empty() {
+                    Effect::succeed(None)
+                } else {
+                    Effect::succeed(Some(out))
+                };
+            }
+            // The crossing chunk is dropped and the fallback replaces the rest
+            // of the stream, so its first chunk is emitted in the SAME pull
+            // after the passing prefix. Taking the fallback here means it is
+            // built exactly once, and later pulls end rather than rebuild it.
+            let Some(build) = guard.fallback.take() else {
+                return Effect::succeed(None);
+            };
+            drop(guard);
+            let fallback = build();
+            match call(&Arc::clone(&fallback.pull)).run_sync() {
+                Ok(Some(mut rest)) => {
+                    out.append(&mut rest);
+                    if out.is_empty() {
+                        Effect::succeed(None)
+                    } else {
+                        Effect::succeed(Some(out))
+                    }
+                }
+                Ok(None) => Effect::succeed(None),
+                Err(cause) => Effect::fail_cause(cause),
+            }
+        }
+        Err(cause) => Effect::fail_cause(cause),
+    }
+}
+
+/// `Stream.callback` at the pin: a stream fed by a mailbox the registration
+/// writes into.
+///
+/// The registration runs eagerly, before the first pull. That covers the
+/// pin's rows whose producer only offers and then signals end, failure, or
+/// dies, none of which need the producer to run concurrently with the drain.
+/// It does NOT cover the pin's backpressure and finalizer rows, whose
+/// producer must block on a full mailbox while the consumer drains and whose
+/// cleanup must fire on a fiber interrupt; both need a forked producer, which
+/// this port's `from_pull`-based streams do not have.
+impl<A: Send + 'static, E: Send + 'static> Stream<A, E, ()> {
+    pub fn callback<F>(register: F) -> Self
+    where
+        F: FnOnce(&mut Mailbox<A, E>),
+    {
+        let mut mailbox = Mailbox::new();
+        register(&mut mailbox);
+        let (items, terminator) = mailbox.into_parts();
+        let chunk = items.len().max(1);
+        match terminator {
+            // No signal means the registration offered items and returned
+            // without ending. The pin's stream is then unterminated and only a
+            // bound such as `take` ends it. This port has no non-terminating
+            // primitive, so an unsignalled mailbox ends instead: the two differ
+            // in general (a `take` larger than the offers would block on the
+            // pin and return what was offered here), which is a deliberate
+            // divergence recorded rather than papered over. The row's own
+            // case offers exactly as many as it takes, so both agree there.
+            None | Some(Terminator::End) => crate::stream::from_iter(items.into_iter(), chunk),
+            Some(Terminator::Fail(error)) => {
+                let source = crate::stream::from_iter(items.into_iter(), chunk);
+                source.concat(Self::fail(error))
+            }
+            Some(Terminator::Die(defect)) => {
+                let source = crate::stream::from_iter(items.into_iter(), chunk);
+                source.concat(Self::die(defect))
+            }
+        }
+    }
+}
+
+/// The writer's side of [`Stream::callback`].
+///
+/// Items accumulate in order and the terminator records how the stream ends.
+/// A registration that neither signals nor returns leaves the terminator unset,
+/// which is the pin's "registration raised" case.
+pub struct Mailbox<A, E> {
+    items: Vec<A>,
+    terminator: Option<Terminator<E>>,
+}
+
+/// How a mailbox closes.
+pub enum Terminator<E> {
+    /// Clean end of stream.
+    End,
+    /// A typed failure in the error channel.
+    Fail(E),
+    /// A defect, which is what a registration that raises becomes.
+    Die(Defect),
+}
+
+impl<A, E> Mailbox<A, E> {
+    /// An empty mailbox.
+    pub fn new() -> Self {
+        Self {
+            items: Vec::new(),
+            terminator: None,
+        }
+    }
+
+    /// Offer one item.
+    pub fn offer(&mut self, item: A) {
+        self.items.push(item);
+    }
+    /// Offer many, in order.
+    pub fn offer_all(&mut self, items: impl IntoIterator<Item = A>) {
+        self.items.extend(items);
+    }
+
+    /// `Queue.endUnsafe`: end the stream cleanly.
+    pub fn end(&mut self) {
+        if self.terminator.is_none() {
+            self.terminator = Some(Terminator::End);
+        }
+    }
+
+    /// `Queue.failCauseUnsafe`: end the stream with a typed failure.
+    pub fn fail(&mut self, error: E) {
+        self.terminator = Some(Terminator::Fail(error));
+    }
+
+    /// End the stream with a defect, which is the pin's registration
+    /// raising: the exit is `die`, not a typed failure in the error channel.
+    pub fn die(&mut self, defect: Defect) {
+        self.terminator = Some(Terminator::Die(defect));
+    }
+
+    fn into_parts(self) -> (Vec<A>, Option<Terminator<E>>) {
+        (self.items, self.terminator)
+    }
+}
+
 /// `Stream.mkArrayBuffer` at the pin: concatenate the byte chunks into one
 /// buffer.
 ///
@@ -914,6 +1169,33 @@ impl<E: Send + 'static> Stream<Vec<u8>, E, ()> {
         self.run_fold(Vec::new(), |mut acc, chunk| {
             acc.extend_from_slice(&chunk);
             acc
+        })
+    }
+
+    /// `Stream.limitBytes` at the pin: pass byte chunks through while the
+    /// running total stays within `limit`, and once a chunk would cross it,
+    /// drop that chunk and replace the rest of the stream with
+    /// `on_limit_reached`.
+    ///
+    /// The boundary is inclusive: a total equal to the limit still passes,
+    /// which is what the pin's comparison against the accumulated size means.
+    /// The fallback is a `LazyArg`, so constructing it is observable and a
+    /// caller can tell "never reached" from "reached", which two of the three
+    /// rows assert.
+    pub fn limit_bytes<F>(self, limit: i128, on_limit_reached: F) -> Self
+    where
+        F: FnOnce() -> Self + Send + 'static,
+    {
+        let (pull, exec) = (self.pull, Arc::clone(&self.exec));
+        let state = Arc::new(Mutex::new(LimitBytes {
+            seen: 0,
+            fallback: Some(Box::new(on_limit_reached)),
+            switching: false,
+        }));
+        let (p, s) = (Arc::clone(&pull), Arc::clone(&state));
+        Self::derive(exec, move || {
+            let (pull, state) = (Arc::clone(&p), Arc::clone(&s));
+            limit_bytes_pump(pull, state, limit)
         })
     }
 }
@@ -1122,7 +1404,6 @@ enum ChildDone<B, E> {
     Failed(Cause<E>),
 }
 
-
 impl<A, B, E, R, F> crate::effect::ErasedStep<Option<Vec<B>>, E> for MapEffect<A, B, E, R, F>
 where
     A: Send + 'static,
@@ -1161,15 +1442,21 @@ where
             }
         }
         let mut results: Vec<Option<B>> = (0..total).map(|_| None).collect();
+        let mut spawned = bound;
         let mut finished = 0;
         let mut failure: Option<Cause<E>> = None;
-        while finished < total {
+        // Wait for the children that actually started. A failure stops the
+        // pending queue from starting (their results are discarded anyway), so
+        // waiting for `total` here would block forever on a recv that can
+        // never arrive.
+        while finished < spawned {
             match rx.recv().expect("a child always answers") {
                 ChildDone::Ok(index, b) => {
                     if failure.is_none() {
                         results[index] = Some(b);
                         if let Some((next, item)) = pending.next() {
                             spawn_child(&rt, &tx, &self.f, scope, &self.exec, batch, next, item);
+                            spawned += 1;
                         }
                     }
                     finished += 1;
@@ -1305,7 +1592,9 @@ struct CatchState<A: Send + 'static, E: Send + 'static, R: crate::effect::Requir
     handler: std::sync::Arc<Mutex<Option<Box<dyn FnOnce(E) -> Stream<A, E, R> + Send>>>>,
 }
 
-impl<A: Send + 'static, E: Send + 'static, R: crate::effect::Requirement> Clone for CatchState<A, E, R> {
+impl<A: Send + 'static, E: Send + 'static, R: crate::effect::Requirement> Clone
+    for CatchState<A, E, R>
+{
     fn clone(&self) -> Self {
         Self {
             substitute: Arc::clone(&self.substitute),
@@ -1327,7 +1616,14 @@ where
     E: Send + 'static,
     R: crate::effect::Requirement,
 {
-    let delegate = { state.substitute.lock().unwrap().as_ref().map(Stream::clone_of_pull) };
+    let delegate = {
+        state
+            .substitute
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(Stream::clone_of_pull)
+    };
     if let Some(sub) = delegate {
         return call(&sub);
     }
@@ -1415,8 +1711,8 @@ impl<A: Send + 'static, E: Send + 'static, R: crate::effect::Requirement> Stream
                 // Fail reason is re-raised verbatim.
                 if cause.failures().is_empty() {
                     // defects() yields Vec<&Defect>, so first() is Option<&&Defect>
-                // and copied() one level short: clone once to own it.
-                if let Some(defect) = cause.defects().first().map(|d| (*d).clone()) {
+                    // and copied() one level short: clone once to own it.
+                    if let Some(defect) = cause.defects().first().map(|d| (*d).clone()) {
                         let arm = handler.lock().unwrap().take();
                         if let Some(arm) = arm {
                             let replacement = arm(defect);
@@ -1555,8 +1851,7 @@ impl<A: Send + 'static, E: Clone + Send + 'static, R: crate::effect::Requirement
             if let Some(sub) = delegate {
                 return call(&sub);
             }
-            let (extractor, handler, sub) =
-                (Arc::clone(&ex0), Arc::clone(&h0), Arc::clone(&sub0));
+            let (extractor, handler, sub) = (Arc::clone(&ex0), Arc::clone(&h0), Arc::clone(&sub0));
             call(&pull0).catch_cause(move |cause| {
                 let Some(extract) = extractor.lock().unwrap().take() else {
                     return Effect::fail_cause(cause);

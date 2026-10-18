@@ -73,14 +73,14 @@ pub enum SendState {
 }
 
 /// The fold's model: one entry per msg key. BTreeMap, never HashMap.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OutboxModel {
     /// Send state per `msg_key`.
     pub sends: BTreeMap<String, SendState>,
 }
 
 /// Inputs.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum OutboxMsg {
     /// Send one envelope.
     Send(Envelope),
@@ -378,14 +378,14 @@ pub async fn send_and_recover(
                     epoch: journal_epoch,
                     seq: 0,
                 },
-            );
+            )?;
             let rkeys: Vec<String> = pending.iter().map(|e| e.msg.key()).collect();
             for e in pending {
-                app.send(OutboxMsg::Recover(e));
+                app.send(OutboxMsg::Recover(e))?;
             }
             let skeys: Vec<String> = sends.iter().map(|e| e.msg.key()).collect();
             for e in sends {
-                app.send(OutboxMsg::Send(e));
+                app.send(OutboxMsg::Send(e))?;
             }
             let state = |k: &String| {
                 app.model()

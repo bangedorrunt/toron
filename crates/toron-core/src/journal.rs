@@ -273,21 +273,38 @@ impl JournalDb {
         row.ok_or_else(|| sqlx::Error::RowNotFound)
     }
 
-    /// Claim: owner + deadline + generation + 1, atomically.
+    /// Claim: owner + deadline + generation + 1, atomically. Fenced by the
+    /// framework's [`kernel::may_claim`](crate::kernel::may_claim) rule:
+    /// terminal rows never move, a stale `expected_generation` claims
+    /// nothing, and a live lease under another owner is never stolen.
     pub async fn claim(
         &self,
         key: &str,
         owner: &str,
         lease_deadline: i64,
+        now_ms: i64,
+        expected_generation: u64,
     ) -> Result<Option<JournalRow>, sqlx::Error> {
         let owner = owner.to_string();
         self.transact(key, move |cur| match cur {
             None => Step::Keep(None),
             Some(mut r) => {
-                r.owner = Some(owner);
-                r.lease_deadline = Some(lease_deadline);
-                r.generation += 1;
-                Step::Commit(r)
+                if !crate::kernel::may_claim(
+                    r.state,
+                    r.owner.as_deref(),
+                    r.lease_deadline,
+                    &owner,
+                    now_ms,
+                    expected_generation,
+                    r.generation,
+                ) {
+                    Step::Keep(None)
+                } else {
+                    r.owner = Some(owner);
+                    r.lease_deadline = Some(lease_deadline);
+                    r.generation += 1;
+                    Step::Commit(r)
+                }
             }
         })
         .await
@@ -447,9 +464,14 @@ impl ToronJournal {
         key: &str,
         owner: &str,
         lease_deadline: i64,
+        now_ms: i64,
+        expected_generation: u64,
     ) -> Result<Option<JournalRow>, JournalError> {
         let (key, owner) = (key.to_string(), owner.to_string());
-        self.call(move |db| async move { db.claim(&key, &owner, lease_deadline).await })
+        self.call(move |db| async move {
+            db.claim(&key, &owner, lease_deadline, now_ms, expected_generation)
+                .await
+        })
     }
 
     /// [`JournalStore::settle`], with the error.
@@ -504,8 +526,15 @@ impl JournalStore for ToronJournal {
             })
     }
 
-    fn claim(&self, key: &str, owner: &str, lease_deadline: i64) -> Option<JournalRow> {
-        self.try_claim(key, owner, lease_deadline)
+    fn claim(
+        &self,
+        key: &str,
+        owner: &str,
+        lease_deadline: i64,
+        now_ms: i64,
+        expected_generation: u64,
+    ) -> Option<JournalRow> {
+        self.try_claim(key, owner, lease_deadline, now_ms, expected_generation)
             .unwrap_or_else(|e| {
                 unreachable_store("claim", &e);
                 None
