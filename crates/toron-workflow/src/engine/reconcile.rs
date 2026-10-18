@@ -115,13 +115,10 @@ pub fn plan_attempt(current: Option<&EffectView>, cap: &ProviderCapability) -> D
 
 /// Settlement needs the current fencing token: the presented token must
 /// equal the live owner exactly. Empty tokens never settle; an unclaimed
-/// row settles for nobody.
-pub fn may_settle(current_token: Option<&str>, presented: &str) -> bool {
-    match (current_token, presented) {
-        (Some(current), p) if !p.is_empty() => current == p,
-        _ => false,
-    }
-}
+/// row settles for nobody. The kernel's fence, re-exported (bd-g31f):
+/// verified identical on all four empty-token corners, so the local copy
+/// is deleted rather than kept agreeing by test.
+pub use toron_core::kernel::may_settle;
 
 /// A replay that renders a different action digest must not mint a new
 /// logical effect under the same run/node: version/replay error (or
