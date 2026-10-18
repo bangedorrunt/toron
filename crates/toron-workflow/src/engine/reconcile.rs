@@ -17,17 +17,10 @@
 
 use toron_core::index::workflow_effects::EffectState;
 
-/// What the embedding's provider promises (declared per action/provider,
-/// never inferred from one call's outcome).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ProviderCapability {
-    /// The provider honors the stable effect key for dedupe (safe same-key
-    /// re-dispatch after uncertainty).
-    pub supports_idempotency_key: bool,
-    /// The provider answers "what happened to this key?" (query before any
-    /// retry after uncertainty).
-    pub supports_reconcile_query: bool,
-}
+/// The plan types are the kernel's (bd-6yjq): one spelling beside the
+/// framework, not a local copy. Policy (`plan_attempt`, `may_settle`,
+/// `capability_for_action_type`) stays here, pinned by the parity table.
+pub use toron_core::kernel::{DispatchPlan, EffectView, ProviderCapability};
 
 /// One provider invocation's classified result. `Ambiguous` covers
 /// timeouts, process loss, and unparseable responses: the effect may or may
@@ -48,34 +41,30 @@ pub enum ProviderOutcome {
 }
 
 /// The journaled facts one dispatch decision needs (no I/O to build).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EffectView {
-    pub state: EffectState,
-    pub attempt: i64,
-    /// True when another owner may still hold the dispatch lease.
-    pub lease_live: bool,
+/// Core rows map into the kernel view with [`effect_view`]; the view
+/// embeds the kernel state spelling.
+pub fn effect_view(state: EffectState, attempt: i64, lease_live: bool) -> EffectView {
+    EffectView {
+        state: kernel_state(state),
+        attempt,
+        lease_live,
+    }
 }
 
-/// What the dispatcher may do next.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DispatchPlan {
-    /// No intent or a fresh intent: commit intent, then dispatch attempt 1.
-    DispatchNew,
-    /// Uncertainty with an idempotent provider: re-dispatch the SAME
-    /// logical key as this next attempt number.
-    RetrySameKey { attempt: i64 },
-    /// Uncertainty with a queryable provider: ask what happened before any
-    /// dispatch. Never a second dispatch first.
-    ReconcileFirst { reason: String },
-    /// No safe move exists (live owner elsewhere, reconciler owns the row,
-    /// or no provider contract): do not dispatch, say why.
-    RefuseBlindRetry { reason: String },
-    /// The row is terminal: return the stored outcome, dispatch nothing.
-    DuplicateTerminal,
-    /// bd-ynef: the row is parked awaiting its wake time. Resume the SAME
-    /// logical key at T — not a retry (nothing failed) and not a new dispatch
-    /// (the intent row already exists, so DispatchNew would duplicate it).
-    ResumeParked { attempt: i64 },
+/// Core journaled state to kernel state, variant for variant (bd-6yjq).
+fn kernel_state(state: EffectState) -> toron_core::kernel::EffectState {
+    use toron_core::kernel::EffectState as K;
+    match state {
+        EffectState::Prepared => K::Prepared,
+        EffectState::InFlight => K::InFlight,
+        EffectState::Accepted => K::Accepted,
+        EffectState::Settled => K::Settled,
+        EffectState::Failed => K::Failed,
+        EffectState::Unknown => K::Unknown,
+        EffectState::ReconcilePending => K::ReconcilePending,
+        EffectState::Cancelled => K::Cancelled,
+        EffectState::Parked => K::Parked,
+    }
 }
 
 /// Decide one attempt from the journaled view (ADR-0032 §5.3 + §7.4 crash
@@ -84,7 +73,7 @@ pub fn plan_attempt(current: Option<&EffectView>, cap: &ProviderCapability) -> D
     let Some(view) = current else {
         return DispatchPlan::DispatchNew;
     };
-    use EffectState as S;
+    use toron_core::kernel::EffectState as S;
     match view.state {
         // bd-ynef: a park is INTERRUPTION, so it is neither a terminal row to
         // return nor a retry to attempt. It resumes at its wake time under the
@@ -304,11 +293,7 @@ mod effect_reconciliation_tests {
     }
 
     fn view(state: EffectState, attempt: i64, lease_live: bool) -> EffectView {
-        EffectView {
-            state,
-            attempt,
-            lease_live,
-        }
+        effect_view(state, attempt, lease_live)
     }
 
     /// bd-v139.2: the ADR §7.4 crash matrix as a decision table — every
@@ -412,18 +397,16 @@ mod effect_reconciliation_tests {
         assert!(!may_settle(None, "tok-a"));
     }
 
-    /// bd-b123: the framework's `plan_attempt` and toron's must agree on
-    /// every vector. Reason strings are deliberately NOT compared (each
-    /// side words its own refusal); the plan shape is the contract:
-    /// Prepared dispatches, ReconcilePending refuses, query beats
-    /// idempotency, ResumeParked takes attempt.max(1), RetrySameKey takes
-    /// attempt + 1. A mismatch is a bug in the newer copy.
+    /// The framework's `plan_attempt` and toron's must agree on every
+    /// vector — over the SAME shared view value now that the plan types
+    /// are the kernel's. Reason strings are deliberately NOT compared (each side words its own refusal); the plan shape is
+    /// the contract. A mismatch is a bug in the newer copy.
     #[test]
     fn plan_attempt_parity() {
         use EffectState as S;
         use toron_core::kernel as fw;
 
-        fn shape_local(p: &DispatchPlan) -> String {
+        fn shape(p: &DispatchPlan) -> String {
             match p {
                 DispatchPlan::DispatchNew => "new".into(),
                 DispatchPlan::RetrySameKey { attempt } => format!("retry:{attempt}"),
@@ -431,31 +414,6 @@ mod effect_reconciliation_tests {
                 DispatchPlan::RefuseBlindRetry { .. } => "refuse".into(),
                 DispatchPlan::DuplicateTerminal => "terminal".into(),
                 DispatchPlan::ResumeParked { attempt } => format!("park:{attempt}"),
-            }
-        }
-
-        fn shape_fw(p: &fw::DispatchPlan) -> String {
-            match p {
-                fw::DispatchPlan::DispatchNew => "new".into(),
-                fw::DispatchPlan::RetrySameKey { attempt } => format!("retry:{attempt}"),
-                fw::DispatchPlan::ReconcileFirst { .. } => "reconcile".into(),
-                fw::DispatchPlan::RefuseBlindRetry { .. } => "refuse".into(),
-                fw::DispatchPlan::DuplicateTerminal => "terminal".into(),
-                fw::DispatchPlan::ResumeParked { attempt } => format!("park:{attempt}"),
-            }
-        }
-
-        fn state_fw(s: EffectState) -> fw::EffectState {
-            match s {
-                S::Prepared => fw::EffectState::Prepared,
-                S::InFlight => fw::EffectState::InFlight,
-                S::Accepted => fw::EffectState::Accepted,
-                S::Settled => fw::EffectState::Settled,
-                S::Failed => fw::EffectState::Failed,
-                S::Unknown => fw::EffectState::Unknown,
-                S::ReconcilePending => fw::EffectState::ReconcilePending,
-                S::Cancelled => fw::EffectState::Cancelled,
-                S::Parked => fw::EffectState::Parked,
             }
         }
 
@@ -477,13 +435,9 @@ mod effect_reconciliation_tests {
             cap(true, false),
             cap(true, true),
         ] {
-            let fw_cap = fw::ProviderCapability {
-                supports_idempotency_key: cap.supports_idempotency_key,
-                supports_reconcile_query: cap.supports_reconcile_query,
-            };
             assert_eq!(
-                shape_local(&plan_attempt(None, &cap)),
-                shape_fw(&fw::plan_attempt(None, &fw_cap)),
+                shape(&plan_attempt(None, &cap)),
+                shape(&fw::plan_attempt(None, &cap)),
                 "no-intent row must dispatch fresh"
             );
         }
@@ -497,20 +451,12 @@ mod effect_reconciliation_tests {
                         cap(true, false),
                         cap(true, true),
                     ] {
-                        let fw_cap = fw::ProviderCapability {
-                            supports_idempotency_key: cap.supports_idempotency_key,
-                            supports_reconcile_query: cap.supports_reconcile_query,
-                        };
-                        let local = plan_attempt(Some(&view(state, attempt, lease_live)), &cap);
-                        let fw_view = fw::EffectView {
-                            state: state_fw(state),
-                            attempt,
-                            lease_live,
-                        };
-                        let other = fw::plan_attempt(Some(&fw_view), &fw_cap);
+                        let v = view(state, attempt, lease_live);
+                        let local = plan_attempt(Some(&v), &cap);
+                        let other = fw::plan_attempt(Some(&v), &cap);
                         assert_eq!(
-                            shape_local(&local),
-                            shape_fw(&other),
+                            shape(&local),
+                            shape(&other),
                             "state={state:?} lease={lease_live} attempt={attempt} cap={cap:?}"
                         );
                         vectors += 1;
