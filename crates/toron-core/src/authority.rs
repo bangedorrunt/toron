@@ -615,14 +615,29 @@ mod tests {
         assert!(d.iter().any(|l| l.contains("verifier done")));
     }
 
+    /// A refusal carries the role's WHOLE allow-list, not the slice for the
+    /// attempted class, so the same set answers a Task refusal and a Control
+    /// refusal. Crew holds exactly one control verb, `escalate@1`, the upward
+    /// handoff, which is why `control/escalate` sits beside the three
+    /// any-class verbs. Phase 4a added that grant; this test has to move with
+    /// it or it reds the suite against a promise the table keeps.
     #[test]
     fn crew_cannot_task_verdict_or_approve() {
-        for name in ["task", "verdict", "approval"] {
-            let class = if name == "task" {
-                Class::Task
-            } else {
-                Class::Control
-            };
+        let allow_list: Vec<String> = [
+            "notify/*",
+            "request/*",
+            "reply/*",
+            "control/escalate",
+            "done",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        for (name, class) in [
+            ("task", Class::Task),
+            ("verdict", Class::Control),
+            ("approval", Class::Control),
+        ] {
             let r = send(Role::Crew, class, name).unwrap_err();
             let Reject::Unauthorized {
                 role,
@@ -636,8 +651,19 @@ mod tests {
             assert_eq!(role, Some(Role::Crew));
             assert_eq!(got, class);
             assert_eq!(contract, format!("{name}@1"));
-            assert_eq!(expected, ["notify/*", "request/*", "reply/*", "done"]);
+            assert_eq!(expected, allow_list);
+            // Same invariant the own-task verdict test pins: a refusal never
+            // offers back the verb it just refused.
+            let leaked = match class {
+                Class::Task => expected.contains(&"task/*".to_string()),
+                _ => expected.iter().any(|e| e == &format!("control/{name}")),
+            };
+            assert!(!leaked, "the attempted verb is offered back: {expected:?}");
         }
+        // The other half of the contract: the one control verb crew DOES
+        // hold. Without it a crew cannot report upward, and the captain push
+        // (escalate mail) rides this grant.
+        assert!(send(Role::Crew, Class::Control, "escalate").is_ok());
     }
 
     #[test]
