@@ -12,7 +12,9 @@
 //! A park is INTERRUPTION. It is not success (the step did not run) and it is
 //! not a typed failure (nothing went wrong). Modelling it as either loses the
 //! information a resume needs, so [`ParkDecision`] has its own arm and
-//! [`super::boundary::EffectState::Parked`] exists as its own state: mapping a
+//! `Parked` exists as its own state in the durable journal enum
+//! (`toron_core::index::workflow_effects::EffectState::Parked`, resumable,
+//! non-terminal): mapping a
 //! park onto `Failed` would make the run's `on_error` fire, and mapping it onto
 //! `Settled` would claim the step completed.
 //!
