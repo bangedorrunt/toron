@@ -35,7 +35,8 @@
 pub const ELM_EFFECT_REV: &str = "49f01a091c8844a5abd7bfa3666c610e6d87c7ef";
 
 pub use elm_effect::{
-    BuiltServices, Cause, Defect, Effect, Exit, Layer, ManagedRuntime, ServiceTag, use_service,
+    BreakerConfig, BuiltServices, Cause, Defect, Duration, Effect, Exit, Layer, ManagedRuntime,
+    ServiceTag, use_service,
 };
 pub use elm_effect_elm::replay::{Player, Snapshot};
 pub use elm_effect_elm::{
