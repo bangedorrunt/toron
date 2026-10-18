@@ -2470,14 +2470,68 @@ impl PendingDrain {
                 ctx.run_id.clone(),
                 ctx.project.clone(),
                 ctx.workflow.clone(),
-                node,
+                node.clone(),
                 None,
                 id.clone(),
                 *generation,
                 ctx.kind,
             );
-            self.known.insert(id);
-            if self.registry.observe(entry.clone()) {
+            let observed = self.registry.observe(entry.clone());
+            // Wave-3 (bd-o21n): persist the observed park — the Parked
+            // effect row plus its pending resume row. The host owns the
+            // store; the leaf only side-channeled the promise id, so this
+            // drain is the one place with all three key parts. A failed
+            // write warns and retries next drain (the id stays out of
+            // `known`); the entry still publishes, so a store outage
+            // parks visibly instead of sticking the run silent.
+            // Re-processing is idempotent on both keys. The effect key
+            // names the promise (host-side scheme); the leaf-side scheme
+            // names the wake time — both unique per wait, both resume by
+            // re-drive rather than re-dispatch.
+            if let Some(store) = self.store.clone() {
+                let kind = match ctx.kind {
+                    ParkKind::Approval => PendingKind::Approval,
+                    ParkKind::Spawn => PendingKind::Spawn,
+                };
+                let effect_key = format!("park:{}:{}:{}", ctx.run_id, node, id);
+                let digest = store
+                    .get_run(&ctx.run_id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|r| r.workflow_digest);
+                let write = match digest {
+                    Some(workflow_digest) => store
+                        .park_effect(NewPark {
+                            effect_key,
+                            run_id: ctx.run_id.clone(),
+                            promise_id: id.clone(),
+                            park_generation: *generation as i64,
+                            project: ctx.project.clone(),
+                            workflow: ctx.workflow.clone(),
+                            workflow_digest,
+                            node_path: node.clone(),
+                            kind,
+                            until_ms: entry.deadline_secs.map(|s| s.saturating_mul(1000)),
+                            reason: entry.question.clone(),
+                        })
+                        .await
+                        .map(|_| ())
+                        .map_err(|e| e.to_string()),
+                    None => Err(format!("no run row for {}", ctx.run_id)),
+                };
+                match write {
+                    Ok(()) => {
+                        self.known.insert(id);
+                    }
+                    Err(e) => {
+                        warn!(run_id = %ctx.run_id, promise_id = %id, "park persist failed, retrying next drain: {e}");
+                    }
+                }
+            } else {
+                self.known.insert(id);
+            }
+            if observed {
                 out.push(entry);
             }
         }
@@ -2565,8 +2619,8 @@ impl PendingDrain {
 // ---------------------------------------------------------------------------
 
 use toron_core::index::workflow_effects::{
-    ClaimAttempt, EffectState, NewAttempt, NewEffect, NewRun, RunStatus, WorkflowEffect,
-    WorkflowEffectStore, now_us,
+    ClaimAttempt, EffectState, NewAttempt, NewEffect, NewPark, NewRun, PendingKind, RunStatus,
+    WorkflowEffect, WorkflowEffectStore, now_us,
 };
 
 /// One effect dispatch request: identity inputs plus the provider's
@@ -4100,6 +4154,85 @@ steps:
         assert_eq!(drain.run_state("run-1"), RunState::Suspended);
         let again = drain.drain(&engine, &ctx).await;
         assert!(again.is_empty(), "re-drain is idempotent");
+    }
+
+    /// bd-o21n: the HITL round-trip through the drain — a sink-observed
+    /// promise persists as a `Parked` effect row plus its pending resume
+    /// row; re-driving the row plans `ResumeParked`, never `Failed`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn hitl_promise_persists_parked_and_resumes() {
+        use toron_core::index::schema;
+        use toron_core::index::workflow_effects::NewRun;
+
+        let db = std::env::temp_dir().join(format!("wf-hitl-{}.sqlite", uuid::Uuid::new_v4()));
+        let pool = schema::connect(db.to_str().unwrap())
+            .await
+            .expect("connect");
+        schema::migrate(&pool).await.expect("migrate");
+        let store = WorkflowEffectStore::new(pool);
+        store
+            .create_run(NewRun {
+                run_id: "run-hitl".into(),
+                project: None,
+                workflow: "ship".into(),
+                workflow_digest: "dig".into(),
+            })
+            .await
+            .expect("run row for the digest lookup");
+
+        let engine = WorkflowEngine::local().expect("local engine");
+        engine
+            .approval_sink()
+            .lock()
+            .await
+            .push("promise-hitl-1".to_string());
+        let mut drain = PendingDrain::new().with_store(store.clone());
+        let ctx = ParkCtx {
+            run_id: "run-hitl".into(),
+            workflow: "ship".into(),
+            project: None,
+            kind: ParkKind::Approval,
+            candidates: vec!["gate".into()],
+        };
+        let fresh = drain.drain(&engine, &ctx).await;
+        assert_eq!(fresh.len(), 1, "the observed park publishes");
+        // Parked effect row under the host-side re-drive key.
+        let row = store
+            .get_effect("park:run-hitl:gate:promise-hitl-1")
+            .await
+            .expect("query")
+            .expect("parked row");
+        assert_eq!(row.state, EffectState::Parked);
+        assert!(row.state.is_resumable());
+        // Pending resume row under the same triple.
+        let pending = store.list_pending("run-hitl").await.expect("list");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].promise_id, "promise-hitl-1");
+        assert_eq!(
+            pending[0].effect_key.as_deref(),
+            Some("park:run-hitl:gate:promise-hitl-1")
+        );
+        // Re-drive plans resume, never failure.
+        let view = EffectView {
+            state: row.state,
+            attempt: row.attempt,
+            lease_live: false,
+        };
+        let cap = ProviderCapability {
+            supports_idempotency_key: true,
+            supports_reconcile_query: false,
+        };
+        assert!(
+            matches!(
+                plan_attempt(Some(&view), &cap),
+                DispatchPlan::ResumeParked { .. }
+            ),
+            "a Parked row resumes"
+        );
+        // Second drain: idempotent, no duplicate rows.
+        assert!(drain.drain(&engine, &ctx).await.is_empty());
+        assert_eq!(store.list_pending("run-hitl").await.expect("list").len(), 1);
+        let _ = std::fs::remove_file(&db);
     }
 
     /// bd-asx3 RED: restart recovery — a fresh drain over the same live

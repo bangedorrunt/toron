@@ -509,7 +509,12 @@ pub struct NewPark {
     pub workflow: String,
     pub workflow_digest: String,
     pub node_path: String,
-    pub until_ms: u64,
+    /// What the wait is for (approval answer, spawn completion, time).
+    /// The host knows this; the leaf-side intent does not.
+    pub kind: PendingKind,
+    /// The effective wake time when the parker knows T; `None` when the
+    /// host indexes a promise whose T lives in the leaf.
+    pub until_ms: Option<u64>,
     pub reason: Option<String>,
 }
 
@@ -945,7 +950,11 @@ impl WorkflowEffectStore {
         .bind(&park.project)
         .bind(&park.workflow_digest)
         .bind(&park.node_path)
-        .bind(park.until_ms.to_string())
+        .bind(
+            park.until_ms
+                .map(|t| t.to_string())
+                .unwrap_or_else(|| "unknown".into()),
+        )
         .bind(&reason)
         .bind(now)
         .bind(now)
@@ -979,7 +988,7 @@ impl WorkflowEffectStore {
             "INSERT INTO workflow_pending \
              (run_id, promise_id, park_generation, project, workflow, node_path, effect_key, \
               kind, pending_payload, deadline, publication_state, created_at, updated_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'park', ?8, ?9, 'noted', ?10, ?11) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'noted', ?11, ?12) \
              ON CONFLICT (run_id, promise_id, park_generation) DO NOTHING",
         )
         .bind(&park.run_id)
@@ -989,8 +998,9 @@ impl WorkflowEffectStore {
         .bind(&park.workflow)
         .bind(&park.node_path)
         .bind(&park.effect_key)
+        .bind(park.kind.as_str())
         .bind(&pending_payload)
-        .bind((park.until_ms / 1000) as i64)
+        .bind(park.until_ms.map(|t| (t / 1000) as i64))
         .bind(now)
         .bind(now)
         .execute(&mut *tx)
@@ -2387,7 +2397,8 @@ mod workflow_effect_schema_tests {
             workflow: "ship".into(),
             workflow_digest: "dig".into(),
             node_path: "n1".into(),
-            until_ms: 2000,
+            kind: PendingKind::Park,
+            until_ms: Some(2000),
             reason: Some("busy owner".into()),
         };
         let out = store.park_effect(park.clone()).await.unwrap();
@@ -2406,6 +2417,26 @@ mod workflow_effect_schema_tests {
         let again = store.park_effect(park).await.unwrap();
         assert!(!again.created);
         assert_eq!(store.list_pending("run-9").await.unwrap().len(), 1);
+        // A host-side promise park carries no T (the leaf waits; the host
+        // indexes the promise): digest reads "unknown", deadline is null.
+        let host_park = NewPark {
+            effect_key: "park:run-9:n2:prom-1".into(),
+            run_id: "run-9".into(),
+            promise_id: "prom-1".into(),
+            park_generation: 1,
+            project: None,
+            workflow: "ship".into(),
+            workflow_digest: "dig".into(),
+            node_path: "n2".into(),
+            kind: PendingKind::Approval,
+            until_ms: None,
+            reason: None,
+        };
+        let hosted = store.park_effect(host_park).await.unwrap();
+        assert!(hosted.created);
+        assert_eq!(hosted.effect.action_digest, "unknown");
+        let rows = store.list_pending("run-9").await.unwrap();
+        assert_eq!(rows.len(), 2);
         // No edge into or out of Parked through the transition table, on
         // any state — the row arrives by insert and leaves by resume.
         for state in [
