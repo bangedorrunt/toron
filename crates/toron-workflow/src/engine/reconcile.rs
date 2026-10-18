@@ -411,4 +411,105 @@ mod effect_reconciliation_tests {
         assert!(!may_settle(Some("tok-a"), ""));
         assert!(!may_settle(None, "tok-a"));
     }
+
+    /// bd-b123: the framework's `plan_attempt` and toron's must agree on
+    /// every vector. Reason strings are deliberately NOT compared (each
+    /// side words its own refusal); the plan shape is the contract:
+    /// Prepared dispatches, ReconcilePending refuses, query beats
+    /// idempotency, ResumeParked takes attempt.max(1), RetrySameKey takes
+    /// attempt + 1. A mismatch is a bug in the newer copy.
+    #[test]
+    fn plan_attempt_parity() {
+        use EffectState as S;
+        use toron_core::kernel as fw;
+
+        fn shape_local(p: &DispatchPlan) -> String {
+            match p {
+                DispatchPlan::DispatchNew => "new".into(),
+                DispatchPlan::RetrySameKey { attempt } => format!("retry:{attempt}"),
+                DispatchPlan::ReconcileFirst { .. } => "reconcile".into(),
+                DispatchPlan::RefuseBlindRetry { .. } => "refuse".into(),
+                DispatchPlan::DuplicateTerminal => "terminal".into(),
+                DispatchPlan::ResumeParked { attempt } => format!("park:{attempt}"),
+            }
+        }
+
+        fn shape_fw(p: &fw::DispatchPlan) -> String {
+            match p {
+                fw::DispatchPlan::DispatchNew => "new".into(),
+                fw::DispatchPlan::RetrySameKey { attempt } => format!("retry:{attempt}"),
+                fw::DispatchPlan::ReconcileFirst { .. } => "reconcile".into(),
+                fw::DispatchPlan::RefuseBlindRetry { .. } => "refuse".into(),
+                fw::DispatchPlan::DuplicateTerminal => "terminal".into(),
+                fw::DispatchPlan::ResumeParked { attempt } => format!("park:{attempt}"),
+            }
+        }
+
+        fn state_fw(s: EffectState) -> fw::EffectState {
+            match s {
+                S::Prepared => fw::EffectState::Prepared,
+                S::InFlight => fw::EffectState::InFlight,
+                S::Accepted => fw::EffectState::Accepted,
+                S::Settled => fw::EffectState::Settled,
+                S::Failed => fw::EffectState::Failed,
+                S::Unknown => fw::EffectState::Unknown,
+                S::ReconcilePending => fw::EffectState::ReconcilePending,
+                S::Cancelled => fw::EffectState::Cancelled,
+                S::Parked => fw::EffectState::Parked,
+            }
+        }
+
+        let states = [
+            S::Prepared,
+            S::InFlight,
+            S::Accepted,
+            S::Settled,
+            S::Failed,
+            S::Unknown,
+            S::ReconcilePending,
+            S::Cancelled,
+            S::Parked,
+        ];
+        // No intent row yet: both dispatch fresh under every capability.
+        for cap in [cap(false, false), cap(false, true), cap(true, false), cap(true, true)] {
+            let fw_cap = fw::ProviderCapability {
+                supports_idempotency_key: cap.supports_idempotency_key,
+                supports_reconcile_query: cap.supports_reconcile_query,
+            };
+            assert_eq!(
+                shape_local(&plan_attempt(None, &cap)),
+                shape_fw(&fw::plan_attempt(None, &fw_cap)),
+                "no-intent row must dispatch fresh"
+            );
+        }
+        let mut vectors = 0;
+        for state in states {
+            for lease_live in [false, true] {
+                for attempt in [0, 1, 3] {
+                    for cap in [cap(false, false), cap(false, true), cap(true, false), cap(true, true)]
+                    {
+                        let fw_cap = fw::ProviderCapability {
+                            supports_idempotency_key: cap.supports_idempotency_key,
+                            supports_reconcile_query: cap.supports_reconcile_query,
+                        };
+                        let local = plan_attempt(Some(&view(state, attempt, lease_live)), &cap);
+                        let fw_view = fw::EffectView {
+                            state: state_fw(state),
+                            attempt,
+                            lease_live,
+                        };
+                        let other = fw::plan_attempt(Some(&fw_view), &fw_cap);
+                        assert_eq!(
+                            shape_local(&local),
+                            shape_fw(&other),
+                            "state={state:?} lease={lease_live} attempt={attempt} cap={cap:?}"
+                        );
+                        vectors += 1;
+                    }
+                }
+            }
+        }
+        // Negative control: the table actually ran every vector.
+        assert_eq!(vectors, 9 * 2 * 3 * 4);
+    }
 }
