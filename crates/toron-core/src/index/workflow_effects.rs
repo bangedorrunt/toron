@@ -360,6 +360,9 @@ impl PublicationState {
 pub enum PendingKind {
     Approval,
     Spawn,
+    /// A time-wait park (`park_until`): resumes at its wake time under the
+    /// same re-drive key. Neither an approval nor a spawn.
+    Park,
 }
 
 impl PendingKind {
@@ -367,6 +370,7 @@ impl PendingKind {
         match self {
             Self::Approval => "approval",
             Self::Spawn => "spawn",
+            Self::Park => "park",
         }
     }
 
@@ -374,6 +378,7 @@ impl PendingKind {
         match s {
             "approval" => Ok(Self::Approval),
             "spawn" => Ok(Self::Spawn),
+            "park" => Ok(Self::Park),
             _ => Err(format!("unknown pending kind {s:?}")),
         }
     }
@@ -486,6 +491,26 @@ pub struct WorkflowRun {
     pub current_node: Option<String>,
     pub failed_node: Option<String>,
     pub terminal_digest: Option<String>,
+}
+
+/// A park to persist: one `Parked` effect row plus its pending resume row.
+///
+/// `workflow` is the pending table's workflow label; `workflow_digest` is
+/// the effect row's digest. They differ the way they do on the two tables.
+#[derive(Debug, Clone)]
+pub struct NewPark {
+    /// The re-drive key (`park:{run_id}:{node}:{until_ms}`): parking the
+    /// same step to the same T twice lands on the same row.
+    pub effect_key: String,
+    pub run_id: String,
+    pub promise_id: String,
+    pub park_generation: i64,
+    pub project: Option<String>,
+    pub workflow: String,
+    pub workflow_digest: String,
+    pub node_path: String,
+    pub until_ms: u64,
+    pub reason: Option<String>,
 }
 
 /// A parked pending entry to upsert.
@@ -881,6 +906,105 @@ impl WorkflowEffectStore {
             now,
         )
         .await?;
+        tx.commit().await?;
+        Ok(PrepareOutcome {
+            created,
+            effect: row,
+        })
+    }
+
+    /// Persist a park: the `Parked` effect row and its `workflow_pending
+    /// resume row, atomically. The effect row is INSERTED, never
+    /// transitioned: `can_transition` has no edge into `Parked` on either
+    /// side of the kernel port (framework law), so `transition_effect`
+    /// can never write this row. A second park under the same effect key
+    /// attaches to the existing row (`created: false`), which is what
+    /// makes re-parking idempotent rather than a duplicate wait.
+    pub async fn park_effect(&self, park: NewPark) -> anyhow::Result<PrepareOutcome> {
+        let now = now_us();
+        let reason = park
+            .reason
+            .clone()
+            .map(|r| bound_evidence(&serde_json::json!(r)));
+        let pending_payload = bound_evidence(&serde_json::json!({
+            "until_ms": park.until_ms,
+            "reason": park.reason,
+            "effect_key": park.effect_key,
+        }));
+        let mut tx = self.pool.begin().await?;
+        let res = sqlx::query(
+            "INSERT INTO workflow_effects \
+             (effect_key, run_id, project, workflow_digest, node_path, iteration_key, \
+              action_type, action_digest, redacted_action, state, attempt, \
+              retention_until, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, NULL, 'park', ?6, ?7, 'parked', 1, NULL, ?8, ?9) \
+             ON CONFLICT (effect_key) DO NOTHING",
+        )
+        .bind(&park.effect_key)
+        .bind(&park.run_id)
+        .bind(&park.project)
+        .bind(&park.workflow_digest)
+        .bind(&park.node_path)
+        .bind(park.until_ms.to_string())
+        .bind(&reason)
+        .bind(now)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+        let created = res.rows_affected() > 0;
+        let row = sqlx::query(
+            "SELECT effect_key, run_id, project, workflow_digest, node_path, iteration_key, \
+                    action_type, action_digest, redacted_action, state, attempt, attempt_id, \
+                    claim_token, lease_expires_at, transport_corr, external_id, outcome_json, \
+                    failure_json, reconcile_after, retention_until \
+             FROM workflow_effects WHERE effect_key = ?1",
+        )
+        .bind(&park.effect_key)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("effect vanished after park"))?;
+        let row = self.map_effect(&row)?;
+        let row_json = serde_json::to_value(&row)?;
+        log_wfx_event_in_tx(
+            &mut tx,
+            "workflow_effects",
+            &park.effect_key,
+            &row_json,
+            now,
+        )
+        .await?;
+        // The resume index commits with the effect row: a crash between
+        // them would leave a Parked row no supervisor lists.
+        let presid = sqlx::query(
+            "INSERT INTO workflow_pending \
+             (run_id, promise_id, park_generation, project, workflow, node_path, effect_key, \
+              kind, pending_payload, deadline, publication_state, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'park', ?8, ?9, 'noted', ?10, ?11) \
+             ON CONFLICT (run_id, promise_id, park_generation) DO NOTHING",
+        )
+        .bind(&park.run_id)
+        .bind(&park.promise_id)
+        .bind(park.park_generation)
+        .bind(&park.project)
+        .bind(&park.workflow)
+        .bind(&park.node_path)
+        .bind(&park.effect_key)
+        .bind(&pending_payload)
+        .bind((park.until_ms / 1000) as i64)
+        .bind(now)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+        if presid.rows_affected() > 0 {
+            self.log_pending_row_in_tx(
+                &mut tx,
+                &park.run_id,
+                &park.promise_id,
+                park.park_generation,
+                now,
+            )
+            .await?;
+        }
         tx.commit().await?;
         Ok(PrepareOutcome {
             created,
@@ -2241,6 +2365,69 @@ mod workflow_effect_schema_tests {
         assert_eq!(store.list_pending("run-1").await.unwrap().len(), 2);
         store.delete_pending("run-1", "p-1", 1).await.unwrap();
         assert_eq!(store.list_pending("run-1").await.unwrap().len(), 1);
+    }
+
+    /// bd-lm27: a park persists as a `Parked` effect row plus its pending
+    /// resume row, keyed `(run_id, promise_id, park_generation)`. The row
+    /// is INSERTED, never transitioned: `can_transition` has no edge into
+    /// `Parked` in either direction, and a re-park under the same key
+    /// attaches to the existing row. A `Parked` row is resumable, never a
+    /// failure — the re-drive plan (`ResumeParked`) is proven at the plan
+    /// table, this test proves the row it reads.
+    #[tokio::test]
+    async fn workflow_effect_schema_park_persists_and_redrives() {
+        let (p, _dir) = pool("park").await;
+        let store = WorkflowEffectStore::new(p);
+        let park = NewPark {
+            effect_key: "park:run-9:n1:2000".into(),
+            run_id: "run-9".into(),
+            promise_id: "p-9".into(),
+            park_generation: 0,
+            project: None,
+            workflow: "ship".into(),
+            workflow_digest: "dig".into(),
+            node_path: "n1".into(),
+            until_ms: 2000,
+            reason: Some("busy owner".into()),
+        };
+        let out = store.park_effect(park.clone()).await.unwrap();
+        assert!(out.created, "first park inserts");
+        assert_eq!(out.effect.state, EffectState::Parked);
+        assert!(out.effect.state.is_resumable());
+        assert!(!out.effect.state.is_terminal());
+        assert_ne!(out.effect.state, EffectState::Failed);
+        // The resume index lists it under the same key triple.
+        let pending = store.list_pending("run-9").await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].park_generation, 0);
+        assert_eq!(pending[0].kind, PendingKind::Park);
+        assert_eq!(pending[0].effect_key.as_deref(), Some("park:run-9:n1:2000"));
+        // Re-parking the same key is idempotent, not a duplicate wait.
+        let again = store.park_effect(park).await.unwrap();
+        assert!(!again.created);
+        assert_eq!(store.list_pending("run-9").await.unwrap().len(), 1);
+        // No edge into or out of Parked through the transition table, on
+        // any state — the row arrives by insert and leaves by resume.
+        for state in [
+            EffectState::Prepared,
+            EffectState::InFlight,
+            EffectState::Accepted,
+            EffectState::Settled,
+            EffectState::Failed,
+            EffectState::Unknown,
+            EffectState::ReconcilePending,
+            EffectState::Cancelled,
+            EffectState::Parked,
+        ] {
+            assert!(
+                !can_transition(state, EffectState::Parked),
+                "{state:?} must not transition into Parked"
+            );
+            assert!(
+                !can_transition(EffectState::Parked, state),
+                "Parked must not transition into {state:?} (not even itself)"
+            );
+        }
     }
 
     /// bd-v139.1: `unknown` and `reconcile_pending` are first-class states —
