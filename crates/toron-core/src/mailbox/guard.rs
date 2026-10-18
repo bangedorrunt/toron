@@ -641,13 +641,14 @@ pub fn cargo_packages_for_staged(repo: &Path, staged: &[String]) -> Vec<String> 
 fn package_name_at_or_above(repo: &Path, from: &Path) -> Option<String> {
     let mut cursor = from.to_path_buf();
     loop {
+        // A manifest with no `[package]` is a workspace container: the chain
+        // falls through and the walk keeps going, so a member crate nested
+        // under it still resolves.
         let manifest = cursor.join("Cargo.toml");
-        if manifest.is_file() {
-            if let Some(name) = package_name_in_manifest(&manifest) {
-                return Some(name);
-            }
-            // A workspace manifest with no `[package]` is a container: keep
-            // walking so a member crate nested under it still resolves.
+        if manifest.is_file()
+            && let Some(name) = package_name_in_manifest(&manifest)
+        {
+            return Some(name);
         }
         if cursor == repo {
             return None;
@@ -667,14 +668,12 @@ fn package_name_in_manifest(manifest: &Path) -> Option<String> {
             in_package = trimmed == "[package]";
             continue;
         }
-        if in_package {
-            if let Some(rest) = trimmed.strip_prefix("name") {
-                let rest = rest.trim_start();
-                if let Some(quoted) = rest.strip_prefix('=') {
-                    let value = quoted.trim().trim_matches('"').trim_matches('\'');
-                    if !value.is_empty() {
-                        return Some(value.to_string());
-                    }
+        if in_package && let Some(rest) = trimmed.strip_prefix("name") {
+            let rest = rest.trim_start();
+            if let Some(quoted) = rest.strip_prefix('=') {
+                let value = quoted.trim().trim_matches('"').trim_matches('\'');
+                if !value.is_empty() {
+                    return Some(value.to_string());
                 }
             }
         }
@@ -738,7 +737,8 @@ pub fn build_gate_blocks(repo: &Path, staged: &[String]) -> Vec<StrictBlock> {
             let _ = tx_err.send(buffer);
         }
     });
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(BUILD_GATE_TIMEOUT_SECS);
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_secs(BUILD_GATE_TIMEOUT_SECS);
     let mut output = String::new();
     while std::time::Instant::now() < deadline {
         match rx.try_recv() {
@@ -2741,6 +2741,62 @@ mod tests {
             "user's post-commit survives uninstall"
         );
         drop(repo);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// bd-26yr shipped the build gate's package resolution with no test; bd-38zo
+    /// folded its two nested ifs into let-chains, so pin the behavior the fold
+    /// had to preserve. A manifest with no `[package]` is a workspace
+    /// container, not a dead end: the walk keeps climbing past it, so a file
+    /// under a nested container still resolves to the enclosing package. A
+    /// walk that stops at the container reports no package and the gate then
+    /// silently stops gating that commit.
+    #[test]
+    fn package_walk_climbs_past_a_container_manifest() {
+        let root = std::env::temp_dir().join(format!(
+            "toron-guard-packages-{}-{}.git",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(root.join("crates/alpha/src")).expect("create tree");
+        std::fs::create_dir_all(root.join("tools")).expect("create tools");
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"enclosing\"\nversion = \"0.1.0\"\n",
+        )
+        .expect("root manifest");
+        std::fs::write(root.join("tools/Cargo.toml"), "[workspace]\nmembers = []\n")
+            .expect("container manifest");
+        std::fs::write(root.join("tools/note.md"), "x\n").expect("container file");
+        std::fs::write(
+            root.join("crates/alpha/Cargo.toml"),
+            "[package]\nname = \"alpha\"\nversion = \"0.1.0\"\n",
+        )
+        .expect("member manifest");
+        std::fs::write(root.join("crates/alpha/src/lib.rs"), "\n").expect("member file");
+
+        // The nearest manifest wins, even one nested well below the root.
+        assert_eq!(
+            cargo_packages_for_staged(&root, &["crates/alpha/src/lib.rs".to_string()]),
+            vec!["alpha"]
+        );
+        // A `[workspace]`-only manifest does not stop the climb.
+        assert_eq!(
+            cargo_packages_for_staged(&root, &["tools/note.md".to_string()]),
+            vec!["enclosing"]
+        );
+        // Two staged files in one package name it once.
+        assert_eq!(
+            cargo_packages_for_staged(
+                &root,
+                &[
+                    "crates/alpha/src/lib.rs".to_string(),
+                    "crates/alpha/Cargo.toml".to_string(),
+                ]
+            ),
+            vec!["alpha"]
+        );
+
         let _ = std::fs::remove_dir_all(root);
     }
 }
