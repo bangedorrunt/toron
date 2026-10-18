@@ -827,6 +827,43 @@ impl InboxStore {
             .collect())
     }
 
+    /// Drop every payload on `stream` below `before`, returning how many
+    /// were dropped. Mirrors the framework's `compact_before`: `before`
+    /// must be a known offset of this stream (hand-built offsets are
+    /// `UnknownOffset`), and the caller must hold a snapshot covering the
+    /// dropped records. Uses a bounded `log_offset <` range delete.
+    pub async fn compact_stream(
+        &self,
+        stream: &str,
+        before: u64,
+    ) -> Result<usize, AppendError> {
+        let known: Option<i64> = sqlx::query_scalar(
+            "SELECT log_offset FROM inbox_log WHERE stream = ?1 AND log_offset = ?2",
+        )
+        .bind(stream)
+        .bind(before as i64)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(unavailable)?;
+        if known.is_none() {
+            return Err(AppendError::UnknownOffset);
+        }
+        let r = sqlx::query("SELECT COUNT(*) FROM inbox_log WHERE stream = ?1 AND log_offset < ?2")
+            .bind(stream)
+            .bind(before as i64)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(unavailable)?;
+        let n = r.get::<i64, _>(0) as usize;
+        sqlx::query("DELETE FROM inbox_log WHERE stream = ?1 AND log_offset < ?2")
+            .bind(stream)
+            .bind(before as i64)
+            .execute(&self.pool)
+            .await
+            .map_err(unavailable)?;
+        Ok(n)
+    }
+
     /// The reader's committed cursor on `stream` (0 = nothing read).
     pub async fn cursor(&self, reader: &str, stream: &str) -> Result<u64, sqlx::Error> {
         let c: Option<i64> = sqlx::query_scalar(
@@ -1762,6 +1799,10 @@ enum Req {
         msg: MsgId,
         reply: std::sync::mpsc::Sender<Result<Option<u64>, AppendError>>,
     },
+    Compact {
+        before: u64,
+        reply: std::sync::mpsc::Sender<Result<usize, AppendError>>,
+    },
 }
 
 /// How long a bridge call waits for the store before answering
@@ -1805,6 +1846,9 @@ impl ToronLog {
                     }
                     Req::Lookup { msg, reply } => {
                         let _ = reply.send(store.lookup(&msg).await.map_err(unavailable));
+                    }
+                    Req::Compact { before, reply } => {
+                        let _ = reply.send(store.compact_stream(&task_stream, before).await);
                     }
                 }
             }
@@ -1854,5 +1898,16 @@ impl DurableLog for ToronLog {
             Offset::At(raw) => Some(raw.parse::<u64>().map_err(|_| AppendError::UnknownOffset)?),
         };
         self.call(|reply| Req::Read { after, reply })
+    }
+
+    fn compact_before(&self, before: &Offset) -> Result<usize, AppendError> {
+        let Offset::At(raw) = before else {
+            return Err(AppendError::UnknownOffset);
+        };
+        let limit = raw.parse::<u64>().map_err(|_| AppendError::UnknownOffset)?;
+        self.call(|reply| Req::Compact {
+            before: limit,
+            reply,
+        })
     }
 }

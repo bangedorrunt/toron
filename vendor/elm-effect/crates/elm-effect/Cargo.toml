@@ -1,6 +1,6 @@
 [package]
 name = "elm-effect"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "MIT"
 publish = false
@@ -25,6 +25,18 @@ required-features = ["stm"]
 [[test]]
 name = "schema_facade"
 required-features = ["schema"]
+
+# TxHashSet's set algebra is behind the stm feature, so its integration test
+# is too: without the gate cargo tries to build it feature-off, where
+# `TxHashSet` and `atomically` are not exported, and the whole crate's test
+# build fails.
+[[test]]
+name = "tx_hash_set_algebra"
+required-features = ["stm"]
+
+[[test]]
+name = "tx_priority_queue"
+required-features = ["stm"]
 
 [dependencies]
 elm-effect-schema = { path = "../elm-effect-schema", optional = true }

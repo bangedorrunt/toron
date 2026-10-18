@@ -18,6 +18,14 @@ pub trait Lookup {
     /// unless the source preserves them).
     fn get(&self, path: &[String]) -> Option<String>;
 
+    /// Value at `path` with the failure channel a source can carry
+    /// (`SourceError`): `Ok(None)` is absence, `Err` is a source failure
+    /// that a fallback chain must propagate rather than skip. The default
+    /// is the infallible shape every value source has.
+    fn try_get(&self, path: &[String]) -> Result<Option<String>, String> {
+        Ok(self.get(path))
+    }
+
     /// Ordered transform pipeline over this source (pipe order: each
     /// step sees the previous step's path).
     fn chain(&self) -> Chain<'_>
@@ -198,7 +206,10 @@ impl Provider {
 
     /// Fall through to `other` on absence.
     pub fn or_else<'a>(&'a self, other: &'a dyn Lookup) -> Fallback<'a> {
-        Fallback { first: self, second: other }
+        Fallback {
+            first: self,
+            second: other,
+        }
     }
 
     /// Transform every lookup path before delegating (`mapInput`).
@@ -253,7 +264,10 @@ impl Nested<'_> {
     pub fn nested(&self, outer: &str) -> Nested<'_> {
         let mut prefix: Vec<String> = outer.split('.').map(str::to_string).collect();
         prefix.extend(self.prefix.iter().cloned());
-        Nested { inner: self.inner, prefix }
+        Nested {
+            inner: self.inner,
+            prefix,
+        }
     }
 }
 
@@ -281,6 +295,40 @@ impl Lookup for Nested<'_> {
 impl Lookup for Fallback<'_> {
     fn get(&self, path: &[String]) -> Option<String> {
         self.first.get(path).or_else(|| self.second.get(path))
+    }
+
+    fn try_get(&self, path: &[String]) -> Result<Option<String>, String> {
+        // Absence falls through; a FAILED source poisons the chain, so the
+        // fallback is never consulted — the pin's `SourceError` rule.
+        match self.first.try_get(path)? {
+            Some(hit) => Ok(Some(hit)),
+            None => self.second.try_get(path),
+        }
+    }
+}
+
+/// A source that fails every lookup with a `SourceError`-shaped message
+/// (`ConfigProvider.make(() => Effect.fail(...))`): the port's failure
+/// channel for providers, which `Fallback` propagates instead of skipping.
+pub struct Failing {
+    message: String,
+}
+
+impl Failing {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl Lookup for Failing {
+    fn get(&self, _path: &[String]) -> Option<String> {
+        None
+    }
+
+    fn try_get(&self, _path: &[String]) -> Result<Option<String>, String> {
+        Err(self.message.clone())
     }
 }
 
@@ -427,6 +475,14 @@ impl EnvProvider {
         }
     }
 
+    /// Build from pairs keeping empty values (`preserveEmptyStrings`).
+    pub fn from_env_map_preserving(pairs: impl IntoIterator<Item = (String, String)>) -> Self {
+        Self {
+            values: pairs.into_iter().collect(),
+            preserve_empty: true,
+        }
+    }
+
     /// Top-level key segments, splitting names on `_` (structure
     /// listing: `B_C` surfaces as `B`).
     pub fn root_keys(&self) -> Vec<String> {
@@ -476,24 +532,18 @@ impl EnvProvider {
                 continue;
             }
             let value = v.trim();
-            let decoded = if let Some(inner) = value
-                .strip_prefix('"')
-                .and_then(|s| s.strip_suffix('"'))
-            {
-                unescape_double(inner)
-            } else if let Some(inner) = value
-                .strip_prefix('\'')
-                .and_then(|s| s.strip_suffix('\''))
-                .or_else(|| {
-                    value
-                        .strip_prefix('`')
-                        .and_then(|s| s.strip_suffix('`'))
-                })
-            {
-                inner.to_string()
-            } else {
-                strip_inline_comment(value).trim().to_string()
-            };
+            let decoded =
+                if let Some(inner) = value.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
+                    unescape_double(inner)
+                } else if let Some(inner) = value
+                    .strip_prefix('\'')
+                    .and_then(|s| s.strip_suffix('\''))
+                    .or_else(|| value.strip_prefix('`').and_then(|s| s.strip_suffix('`')))
+                {
+                    inner.to_string()
+                } else {
+                    strip_inline_comment(value).trim().to_string()
+                };
             let decoded = if expand {
                 expand_refs(&decoded, &values)
             } else {
@@ -512,7 +562,6 @@ impl EnvProvider {
     pub fn from_dotenv_file(path: &str) -> Result<Self, std::io::Error> {
         std::fs::read_to_string(path).map(|text| Self::from_dotenv(&text))
     }
-
 
     /// Look up by joining segments with `_` (inherent alias of
     /// [`Lookup::get`]).
@@ -578,8 +627,7 @@ fn expand_refs(s: &str, values: &BTreeMap<String, String>) -> String {
         // Unbraced `$NAME`: unknown names expand to empty (missing at
         // lookup unless preserved); a bare `$` stays literal.
         let mut end = i + 1;
-        while end < chars.len() && (chars[end].is_alphanumeric() || chars[end] == '_')
-        {
+        while end < chars.len() && (chars[end].is_alphanumeric() || chars[end] == '_') {
             end += 1;
         }
         let name: String = chars[i + 1..end].iter().collect();

@@ -32,7 +32,7 @@
 /// The elm-effect-rs commit the vendored crates were taken from. Must equal
 /// `rev` in `vendor/elm-effect/VENDORED_FROM` (checked by
 /// `tests/kernel_port.rs` and `scripts/verify-vendor-elm-effect.sh`).
-pub const ELM_EFFECT_REV: &str = "49f01a091c8844a5abd7bfa3666c610e6d87c7ef";
+pub const ELM_EFFECT_REV: &str = "00bac791672c1c0856020a800307c6502043c1f6";
 
 pub use elm_effect::{
     BreakerConfig, BuiltServices, Cause, Defect, Duration, Effect, Exit, Layer, ManagedRuntime,
@@ -49,7 +49,8 @@ pub use elm_effect_journal::durable_log::{
 pub use elm_effect_journal::epoch::{EpochLog, Fence};
 pub use elm_effect_journal::laws as durable_log_laws;
 pub use elm_effect_journal::plan::{
-    DispatchPlan, EffectView, ParkDecision, ProviderCapability, may_settle, plan_attempt, plan_park,
+    DispatchPlan, EffectView, ParkDecision, ProviderCapability, may_claim, may_settle, plan_attempt,
+    plan_park,
 };
 pub use elm_effect_journal::store::{
     Disposition as JournalDisposition, InMemoryStore, JournalStore, Read as JournalRead,
