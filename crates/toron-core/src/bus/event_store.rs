@@ -97,6 +97,21 @@ CREATE TABLE IF NOT EXISTS bus_arrivals (
 /// below it may have lost rows, and is told so with an `events_lost` frame.
 pub const ARRIVALS_EVICTED_KEY: &str = "arrivals_evicted_hwm";
 
+/// bd-cgyh: how many store mutations may pass between ANALYZE passes. The bus
+/// turns over completely (the cap evicts while arrivals land), so statistics
+/// written once stop describing the store and the poll's plan is what pays.
+const STATS_MUTATIONS_PER_ANALYZE: i64 = 10_000;
+
+/// `bus_meta` key: the `mutations` value the last ANALYZE of the bus tables ran
+/// at. Absent = this store has never refreshed its planner statistics.
+const STATS_ANALYZED_AT_KEY: &str = "stats_analyzed_at";
+
+/// A recorded `bus_events` row count this many times away from the live one
+/// means the statistics describe an older, smaller store. The live index was
+/// 10x under (9,630 recorded, 100,000 held), so the factor is deliberately
+/// loose: the point is to catch drift, not to re-analyze on every open.
+const STATS_DRIFT_FACTOR: i64 = 2;
+
 /// bd-3gwy: entry cap for the per-filter snapshot memo. Fleet polling
 /// rotates dozens of distinct inbox filters; 64 slots keeps every active
 /// filter's matched-id list warm. Overflow evicts the oldest entry.
@@ -210,6 +225,16 @@ impl BusEventStore {
         // Number every row that predates the arrival log, in arrival
         // (rowid) order, so a resume cursor can reach all of them.
         store.heal_arrivals().await?;
+        // bd-cgyh: an open is the one moment a drifted store is guaranteed to
+        // be seen after it may have run unwatched (a daemon restart), and the
+        // check is one count plus one stat read. Loud on failure, never a
+        // refused boot: a store that cannot analyze is not a store to die on.
+        if store.planner_stats_are_stale().await? {
+            let mutations = store.current_mutations().await;
+            if let Err(e) = store.analyze_bus_tables(mutations).await {
+                tracing::warn!("bus planner stats refresh at open failed: {e}");
+            }
+        }
         Ok(store)
     }
 
@@ -248,18 +273,7 @@ impl BusEventStore {
         limit: usize,
     ) -> anyhow::Result<Vec<(u64, Event)>> {
         self.heal_arrivals().await?;
-        let kind_pred = if kinds.is_empty() {
-            String::new()
-        } else {
-            let ph: Vec<String> = (0..kinds.len()).map(|i| format!("?{}", i + 4)).collect();
-            format!(" AND e.kind IN ({})", ph.join(","))
-        };
-        let sql = format!(
-            "SELECT a.seq, e.raw_json FROM bus_arrivals a
-             JOIN bus_events e ON e.event_id = a.event_id
-             WHERE a.seq > ?1 AND (e.expires_at IS NULL OR e.expires_at > ?2){kind_pred}
-             ORDER BY a.seq ASC LIMIT ?3"
-        );
+        let sql = Self::arrivals_after_sql(kinds.len());
         let mut q = sqlx::query_as::<_, (i64, String)>(&sql)
             .bind(i64::try_from(after).unwrap_or(i64::MAX))
             .bind(Timestamp::now().as_secs() as i64)
@@ -278,6 +292,26 @@ impl BusEventStore {
             }
         }
         Ok(out)
+    }
+
+    /// The poll's SQL (bd-cgyh). One source for the store and for the plan
+    /// witness that pins it: the arrival cursor IS the order, so the shape here
+    /// is what keeps the seq-ordered walk (and its early stop at the LIMIT)
+    /// available — a witness against a copy of the string would drift from the
+    /// query the daemon actually runs.
+    fn arrivals_after_sql(n_kinds: usize) -> String {
+        let kind_pred = if n_kinds == 0 {
+            String::new()
+        } else {
+            let ph: Vec<String> = (0..n_kinds).map(|i| format!("?{}", i + 4)).collect();
+            format!(" AND e.kind IN ({})", ph.join(","))
+        };
+        format!(
+            "SELECT a.seq, e.raw_json FROM bus_arrivals a
+             JOIN bus_events e ON e.event_id = a.event_id
+             WHERE a.seq > ?1 AND (e.expires_at IS NULL OR e.expires_at > ?2){kind_pred}
+             ORDER BY a.seq ASC LIMIT ?3"
+        )
     }
 
     /// The arrival seq of a stored event id, if it has one.
@@ -702,6 +736,95 @@ impl BusEventStore {
         Ok(Row::get(&row, 0))
     }
 
+    /// Refresh the planner's picture of the bus when it has drifted (bd-cgyh).
+    ///
+    /// The bus DDL is `CREATE TABLE IF NOT EXISTS` and nothing re-runs ANALYZE
+    /// as the store turns over, so `sqlite_stat1` can end up describing a much
+    /// smaller, older store. Measured 2026-10-18 on the live 297 MB index: the
+    /// stats said 9,630 rows while the store held 100,000, and the poll's plan
+    /// became `MULTI-INDEX OR (bus_events_expires)` + `TEMP B-TREE FOR ORDER
+    /// BY` — every call materialised ~99k rows (1.0-3.4 s of CPU each, daemon
+    /// pinned at 400%) instead of walking `bus_arrivals.seq` and stopping at
+    /// the LIMIT. Fresh stats restore the walk (ms).
+    ///
+    /// Rate-limited on purpose: ANALYZE of the two bus tables is ~46 ms on that
+    /// store, so it rides turnover every [`STATS_MUTATIONS_PER_ANALYZE`]
+    /// mutations, never the poll.
+    pub async fn refresh_planner_stats_if_stale(&self) -> anyhow::Result<bool> {
+        let mutations = self.current_mutations().await;
+        let due = match self.stats_analyzed_at().await? {
+            None => true,
+            Some(at) => mutations.saturating_sub(at) >= STATS_MUTATIONS_PER_ANALYZE,
+        };
+        if !due {
+            return Ok(false);
+        }
+        self.analyze_bus_tables(mutations).await?;
+        Ok(true)
+    }
+
+    /// ANALYZE exactly the two tables the poll joins — never the whole store:
+    /// `messages` and the FTS indexes belong to other readers, and analyzing
+    /// them costs seconds for nothing here. The marker is written last, so a
+    /// crash mid-analyze simply re-runs next tick.
+    async fn analyze_bus_tables(&self, mutations: i64) -> anyhow::Result<()> {
+        sqlx::raw_sql("ANALYZE bus_events; ANALYZE bus_arrivals;")
+            .execute(&self.pool)
+            .await?;
+        sqlx::query(
+            "INSERT INTO bus_meta (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        )
+        .bind(STATS_ANALYZED_AT_KEY)
+        .bind(mutations)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// The `mutations` value the last ANALYZE recorded (`None` = never).
+    async fn stats_analyzed_at(&self) -> anyhow::Result<Option<i64>> {
+        let v: Option<i64> = sqlx::query_scalar("SELECT value FROM bus_meta WHERE key = ?1")
+            .bind(STATS_ANALYZED_AT_KEY)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(v)
+    }
+
+    /// True when `sqlite_stat1` cannot be trusted about `bus_events`: no
+    /// recorded row count at all, or one the live count has outgrown by
+    /// [`STATS_DRIFT_FACTOR`]. This is the open-time plausibility check — a
+    /// restart is when a store that drifted while nothing looked is first seen.
+    /// Cost is one index-only count plus one `sqlite_stat1` read (~2 ms on the
+    /// live store), and a missing `sqlite_stat1` is itself the stale answer.
+    async fn planner_stats_are_stale(&self) -> anyhow::Result<bool> {
+        let live = self.count().await?;
+        Ok(match self.recorded_stat_rows().await {
+            None => true,
+            Some(recorded) => {
+                live > 0
+                    && (recorded * STATS_DRIFT_FACTOR < live
+                        || recorded > live * STATS_DRIFT_FACTOR)
+            }
+        })
+    }
+
+    /// The `bus_events` row count `sqlite_stat1` describes, or `None` when the
+    /// table has never been analyzed. Every stat row carries the table's row
+    /// count as its first number, and there may be no `idx IS NULL` row at all:
+    /// ANALYZE wrote none on the live store or in the hermetic witness, so the
+    /// first number of ANY row is the one to read (a predicate on the null-index
+    /// row reports "never analyzed" forever and re-analyzes on every open).
+    async fn recorded_stat_rows(&self) -> Option<i64> {
+        sqlx::query_scalar(
+            "SELECT MAX(CAST(substr(stat, 1, instr(stat, ' ') - 1) AS INTEGER))
+             FROM sqlite_stat1 WHERE tbl = 'bus_events'",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .ok()
+    }
+
     /// Cheap SQLite connectivity probe (`SELECT 1`) for presence fail-closed
     /// (GS-062 / Buzz #7532 pattern — never Redis). `Ok(())` = store reachable.
     pub async fn ping(&self) -> anyhow::Result<()> {
@@ -753,6 +876,12 @@ impl BusEventStore {
 
     /// Prune expired envelopes + the oldest beyond the cap. Best-effort.
     pub async fn prune(&self) -> anyhow::Result<()> {
+        // bd-cgyh: prune is the store's own periodic tick, so the planner's
+        // picture is refreshed here rather than on the poll path. It declines
+        // on two small reads when the mutation count has not moved far.
+        if let Err(e) = self.refresh_planner_stats_if_stale().await {
+            tracing::warn!("bus planner stats refresh failed: {e}");
+        }
         sqlx::query("DELETE FROM bus_events WHERE expires_at IS NOT NULL AND expires_at <= ?1")
             .bind(Timestamp::now().as_secs() as i64)
             .execute(&self.pool)
@@ -1042,6 +1171,163 @@ mod tests {
         let (store, _pool, path) = temp_store().await;
         store.ping().await.expect("SELECT 1 must succeed");
         assert!(store.is_healthy().await);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The poll's plan as the planner would run the store's own SQL (bd-cgyh).
+    /// Built from [`BusEventStore::arrivals_after_sql`] so it cannot drift from
+    /// the query the daemon runs; the binds are inlined because SQLite chooses
+    /// a plan at prepare time, before it sees the values.
+    async fn poll_plan(pool: &sqlx::SqlitePool) -> String {
+        let mut sql = BusEventStore::arrivals_after_sql(7);
+        // ?1 cursor, ?2 now, ?3 limit, then one kind per ?4..
+        let binds = [
+            "1", "0", "512", "9", "14", "1", "30010", "30013", "30023", "30031",
+        ];
+        for (i, lit) in binds.iter().enumerate() {
+            sql = sql.replace(&format!("?{}", i + 1), lit);
+        }
+        let rows = sqlx::query(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .fetch_all(pool)
+            .await
+            .expect("plan");
+        rows.iter()
+            .map(|r| Row::get::<String, _>(r, 3))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// bd-cgyh: the planner's picture of the bus must follow the store.
+    ///
+    /// Measured on the live 297 MB index on 2026-10-18: `sqlite_stat1` still
+    /// described 9,630 rows while the store held 100,000, so the poll planned
+    /// `MULTI-INDEX OR (bus_events_expires)` + `TEMP B-TREE FOR ORDER BY` and
+    /// spent 1.0-3.4 s per call materialising the whole bus. After the refresh
+    /// the same statement walks `bus_arrivals.seq` and stops at the LIMIT:
+    /// 1.63 s → 0.32 ms on a copy of that store.
+    ///
+    /// That exact plan choice is not reproducible hermetically (it needs the
+    /// live data distribution), so the proof here is the statistics rewrite,
+    /// which is what the fix does. `PRAGMA optimize` is NOT enough and the test
+    /// pins why: on the live copy it analyzed `bus_arrivals` (no stats at all)
+    /// and left `bus_events` at 9,630, so the poll kept sorting. Both tables
+    /// are analyzed on purpose.
+    ///
+    /// The plan check is a guard, not the proof: the store's own SQL with the
+    /// real filter shape must still give the planner the option of walking
+    /// arrivals. It is asserted with the store's SQL text (so it cannot drift
+    /// from the query the daemon runs) and literals (a parameterized
+    /// statement is a different plan, and the daemon's parameterized plan on
+    /// the live store was measured separately: stale MULTI-INDEX OR + sort,
+    /// healed seq walk).
+    #[tokio::test]
+    async fn planner_stats_follow_the_store_and_the_poll_never_sorts_the_bus() {
+        let (store, pool, path) = temp_store().await;
+        // Seed both tables directly: the witness is about the planner's
+        // statistics, and thousands of signed events would only slow it down.
+        // 20k is the size where a healed planner walks arrivals at a LIMIT.
+        sqlx::raw_sql(
+            "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM c WHERE n < 20000)
+             INSERT INTO bus_events (event_id, raw_json, created_at, kind, author, expires_at)
+             SELECT 'e'||n, '{}', n,
+                    CASE WHEN n%500=0 THEN 30031 WHEN n%20=0 THEN 30010
+                         WHEN n%7=0 THEN 14 ELSE 9 END,
+                    'a', NULL FROM c;
+             INSERT INTO bus_arrivals (event_id) SELECT event_id FROM bus_events;",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed");
+        sqlx::raw_sql("ANALYZE;")
+            .execute(&pool)
+            .await
+            .expect("analyze");
+        // Poison the statistics the way turnover does: index rows describing
+        // an older, smaller store, and no `bus_arrivals` row at all — the live
+        // shape, verbatim.
+        sqlx::raw_sql(
+            "DELETE FROM sqlite_stat1;
+             INSERT INTO sqlite_stat1 (tbl, idx, stat) VALUES ('bus_events','bus_events_expires','9630 11');
+             INSERT INTO sqlite_stat1 (tbl, idx, stat) VALUES ('bus_events','bus_events_kind_created','9630 741 2 1');
+             INSERT INTO sqlite_stat1 (tbl, idx, stat) VALUES ('bus_events','bus_events_addressable','9630 741 4 3');
+             INSERT INTO sqlite_stat1 (tbl, idx, stat) VALUES ('bus_events','bus_events_kind','9630 741');
+             INSERT INTO sqlite_stat1 (tbl, idx, stat) VALUES ('bus_events','bus_events_created_at','9630 2');
+             INSERT INTO sqlite_stat1 (tbl, idx, stat) VALUES ('bus_events','sqlite_autoindex_bus_events_1','9630 1');",
+        )
+        .execute(&pool)
+        .await
+        .expect("poison");
+
+        // Premise: the store's own check reads that as drifted (9,630 vs
+        // 20,000). Without this the rewrite below could pass for the wrong
+        // reason, e.g. by analyzing on every open.
+        assert!(
+            store
+                .planner_stats_are_stale()
+                .await
+                .expect("staleness check"),
+            "poisoned statistics must read as stale"
+        );
+
+        // Opening the store is when a drifted store is first seen (a daemon
+        // restart): the plausibility check heals it. Before the fix the
+        // recorded 9,630 was never questioned and the poll kept its plan.
+        let reopened = BusEventStore::new(pool.clone()).await.expect("reopen");
+        let recorded: Option<i64> = sqlx::query_scalar(
+            "SELECT MAX(CAST(substr(stat, 1, instr(stat, ' ') - 1) AS INTEGER))
+             FROM sqlite_stat1 WHERE tbl = 'bus_events'",
+        )
+        .fetch_optional(&pool)
+        .await
+        .expect("stat1");
+        assert_eq!(
+            recorded,
+            Some(20_000),
+            "the refresh records the live row count"
+        );
+        let arrivals_stats: Option<i64> =
+            sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_stat1 WHERE tbl = 'bus_arrivals'")
+                .fetch_optional(&pool)
+                .await
+                .expect("stat1");
+        assert_eq!(
+            arrivals_stats,
+            Some(1),
+            "bus_arrivals is analyzed too: PRAGMA optimize alone left it writable but the poll unplanned"
+        );
+        // The widened filter the daemon's subscriber runs (seven kinds): a
+        // two-kind filter legitimately sorts a small bus, which is neither the
+        // live shape nor the pathology.
+        let healed = poll_plan(&pool).await;
+        assert!(
+            healed.contains("SEARCH a USING INTEGER PRIMARY KEY")
+                && !healed.contains("TEMP B-TREE"),
+            "the poll walks arrivals in seq order and stops at the LIMIT: {healed}"
+        );
+
+        // The urgent path is rate-limited: right after a refresh there is
+        // nothing due, and turnover is what makes it due again.
+        assert!(
+            !reopened
+                .refresh_planner_stats_if_stale()
+                .await
+                .expect("refresh"),
+            "not due right after a refresh"
+        );
+        sqlx::raw_sql(
+            "INSERT INTO bus_meta (key, value) VALUES ('mutations', 100000)
+             ON CONFLICT(key) DO UPDATE SET value = value + 100000",
+        )
+        .execute(&pool)
+        .await
+        .expect("advance turnover");
+        assert!(
+            reopened
+                .refresh_planner_stats_if_stale()
+                .await
+                .expect("refresh"),
+            "turnover makes the refresh due"
+        );
         let _ = std::fs::remove_file(&path);
     }
 
