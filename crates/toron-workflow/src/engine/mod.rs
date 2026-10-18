@@ -32,6 +32,7 @@
 
 mod boundary;
 mod control_flow;
+pub mod framework;
 pub mod park;
 mod reconcile;
 mod sinks;
@@ -256,7 +257,7 @@ pub use reconcile::{
     CleanupKind, CleanupRequest, DispatchPlan, EffectView, FORCED_CLEANUP_CAPABILITY,
     ProviderCapability, ProviderOutcome, ReplayMismatch, RetentionPolicy, UnknownReport,
     capability_for_action_type, check_replay, cleanup_effect_key, corr_for_effect,
-    describe_unknown, may_settle, plan_attempt,
+    describe_unknown, effect_view, may_settle, plan_attempt,
 };
 pub use sinks::{
     ApprovalSink, MAX_PENDING_QUESTION, ParkKind, PendingEntry, PendingRegistry, Resolution,

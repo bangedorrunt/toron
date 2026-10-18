@@ -366,7 +366,7 @@ mod tests {
     #[test]
     fn park_redrive_resumes_rather_than_dispatching_again() {
         use crate::engine::reconcile::{
-            DispatchPlan, EffectView, ProviderCapability, plan_attempt,
+            DispatchPlan, ProviderCapability, effect_view, plan_attempt,
         };
         use toron_core::index::workflow_effects::EffectState;
 
@@ -374,11 +374,7 @@ mod tests {
             supports_idempotency_key: true,
             supports_reconcile_query: false,
         };
-        let parked = EffectView {
-            state: EffectState::Parked,
-            attempt: 1,
-            lease_live: false,
-        };
+        let parked = effect_view(EffectState::Parked, 1, false);
         assert_eq!(
             plan_attempt(Some(&parked), &cap),
             DispatchPlan::ResumeParked { attempt: 1 },
@@ -386,11 +382,7 @@ mod tests {
         );
         // A settled row is still terminal and still a duplicate — the park
         // path did not weaken the existing terminal handling.
-        let settled = EffectView {
-            state: EffectState::Settled,
-            attempt: 1,
-            lease_live: false,
-        };
+        let settled = effect_view(EffectState::Settled, 1, false);
         assert_eq!(
             plan_attempt(Some(&settled), &cap),
             DispatchPlan::DuplicateTerminal

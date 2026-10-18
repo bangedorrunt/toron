@@ -40,14 +40,14 @@ use toron_workflow::dispatch::{DispatchAcquire, DispatchConfig, DispatchPermit, 
 use toron_workflow::engine::ResonateChoice;
 use toron_workflow::engine::{
     ActionInvocation, ActionPartition, AsyncEffectRunner, AsyncRunJournal, CleanupKind,
-    CleanupRequest, Decision, DispatchPlan, EffectJournalMode, EffectView,
-    FORCED_CLEANUP_CAPABILITY, ParkKind, PendingEntry, PendingRegistry, ProviderCapability,
-    ProviderErrorClass, ProviderOutcome, Resolution, ResolutionMismatch, ResolutionVerdict,
-    RunInput, RunPhase, RunTransition, TerminalLedger, TerminalNote, TerminalRecord, UnknownReport,
-    WorkflowEngine, attribute_parks, capability_for_action_type, classify_provider_error_msg,
-    cleanup_effect_key, corr_for_effect, derive_effect_key, describe_unknown,
-    failure_for_control_misdispatch, failure_for_unsupported, normalize_dispatch_result,
-    plan_attempt, terminal_digest, validate_resolution,
+    CleanupRequest, Decision, DispatchPlan, EffectJournalMode, FORCED_CLEANUP_CAPABILITY, ParkKind,
+    PendingEntry, PendingRegistry, ProviderCapability, ProviderErrorClass, ProviderOutcome,
+    Resolution, ResolutionMismatch, ResolutionVerdict, RunInput, RunPhase, RunTransition,
+    TerminalLedger, TerminalNote, TerminalRecord, UnknownReport, WorkflowEngine, attribute_parks,
+    capability_for_action_type, classify_provider_error_msg, cleanup_effect_key, corr_for_effect,
+    derive_effect_key, describe_unknown, effect_view, failure_for_control_misdispatch,
+    failure_for_unsupported, normalize_dispatch_result, plan_attempt, terminal_digest,
+    validate_resolution,
 };
 use toron_workflow::jobs::{JobRequest, build_job_request_with_tags};
 use toron_workflow::lifecycle::{LifecycleEffect, WorkflowLifecycle};
@@ -2795,11 +2795,7 @@ impl EffectDispatcher {
         // by an unexpired lease. A token with no lease (classified outcome)
         // still fences at claim time but does not block planning.
         let lease_live = matches!(row.lease_expires_at, Some(expires) if expires > now);
-        let view = EffectView {
-            state: row.state,
-            attempt: row.attempt,
-            lease_live,
-        };
+        let view = effect_view(row.state, row.attempt, lease_live);
         let attempt_no = match plan_attempt(Some(&view), &req.capability) {
             DispatchPlan::DispatchNew => row.attempt,
             DispatchPlan::RetrySameKey { attempt } => attempt,
@@ -2966,11 +2962,7 @@ impl EffectDispatcher {
                 Some(r) if !r.state.is_terminal() => {
                     let now = now_us();
                     let lease_live = matches!(r.lease_expires_at, Some(e) if e > now);
-                    let view = EffectView {
-                        state: r.state,
-                        attempt: r.attempt,
-                        lease_live,
-                    };
+                    let view = effect_view(r.state, r.attempt, lease_live);
                     matches!(
                         plan_attempt(Some(&view), &capability),
                         DispatchPlan::RefuseBlindRetry { .. } | DispatchPlan::ReconcileFirst { .. }
@@ -4213,11 +4205,7 @@ steps:
             Some("park:run-hitl:gate:promise-hitl-1")
         );
         // Re-drive plans resume, never failure.
-        let view = EffectView {
-            state: row.state,
-            attempt: row.attempt,
-            lease_live: false,
-        };
+        let view = effect_view(row.state, row.attempt, false);
         let cap = ProviderCapability {
             supports_idempotency_key: true,
             supports_reconcile_query: false,
