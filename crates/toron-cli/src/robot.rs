@@ -1652,17 +1652,6 @@ pub async fn run_contact_daemon(dc: &DaemonClient, cmd: &ContactCommand) -> anyh
             match &args.pin {
                 Some(pin) => {
                     captain_write_gate(&mode, args.force, &args.project)?;
-                    if args.force {
-                        eprintln!(
-                            "{}",
-                            json!({
-                                "audit": "captain fold written in open identity mode",
-                                "project": args.project,
-                                "pin": pin,
-                                "routes": false,
-                            })
-                        );
-                    }
                     let out = dc
                         .call_tool(
                             "whois",
@@ -2624,20 +2613,32 @@ fn fold_from_daemon_leases(res: &serde_json::Value, agents: &serde_json::Value) 
     fold
 }
 
-/// bd-lsgm: the captain fold routes only in swarm identity mode. An open-mode
-/// write is refused unless explicitly forced (the call site audits it to
-/// stderr) — otherwise `contact captain` silently writes a fold that can
-/// never route (ADR-0018).
+/// bd-ow6c: the captain fold routes in BOTH identity modes.
+///
+/// The old gate refused an open-mode write with "where the fold can never
+/// route" — FALSE. The alias table is authoritative in Open mode too
+/// (ADR-0018 D1a: ONE resolver), the read path applied no such gate, and
+/// `toron mail whois flywheel captain` resolved in the open-mode flywheel
+/// project while this gate refused to let that fold be written. The pin is
+/// validated against the daemon's whois tool on the write path, so the fold
+/// routes.
+///
+/// What the gate still does: an open-mode write is AUDITED (the `--force`
+/// flag asks for the record), because a captain fold is an operational
+/// pointer an operator should be able to see was set.
 pub(crate) fn captain_write_gate(
     mode: &toron_core::mailbox::naming::IdentityMode,
     force: bool,
     project: &str,
 ) -> anyhow::Result<()> {
-    if matches!(mode, toron_core::mailbox::naming::IdentityMode::Open) && !force {
-        anyhow::bail!(
-            "captain fold is swarm-only (ADR-0018): project {project} runs identity_mode=open, \
-             where the fold can never route — flip via ensure_project identity_mode=swarm, or \
-             address the pin directly; --force overrides (audited)"
+    if matches!(mode, toron_core::mailbox::naming::IdentityMode::Open) && force {
+        eprintln!(
+            "{}",
+            serde_json::json!({
+                "audit": "captain fold written in open identity mode",
+                "project": project,
+                "routes": true,
+            })
         );
     }
     Ok(())
@@ -2647,25 +2648,26 @@ pub(crate) fn captain_write_gate(
 mod captain_open_mode_tests {
     use super::*;
 
-    /// captain_write_gate matrix: open refuses (naming the swarm-only remedy),
-    /// force overrides, swarm routes. One test (was 3).
+    /// bd-ow6c: the captain fold routes in BOTH identity modes, so an
+    /// open-mode write is NOT refused. The old matrix pinned the opposite
+    /// ("open refuses: swarm-only"), which was false: the alias table is
+    /// authoritative in Open mode, the read path applied no such gate, and
+    /// `toron mail whois flywheel captain` resolved in the open-mode flywheel
+    /// project while this gate refused to let that fold be written.
     #[test]
-    fn captain_write_gate_matrix() {
-        let err = captain_write_gate(
+    fn captain_write_gate_does_not_refuse_a_fold_that_routes() {
+        captain_write_gate(
             &toron_core::mailbox::naming::IdentityMode::Open,
             false,
             "flywheel",
         )
-        .expect_err("open mode must refuse the fold write");
-        let msg = err.to_string();
-        assert!(msg.contains("swarm-only"), "{msg}");
-        assert!(msg.contains("identity_mode=swarm"), "{msg}");
+        .expect("an open-mode captain fold routes; it is not refused");
         captain_write_gate(
             &toron_core::mailbox::naming::IdentityMode::Open,
             true,
             "flywheel",
         )
-        .expect("force overrides the open-mode refusal");
+        .expect("force only asks for the audit");
         captain_write_gate(
             &toron_core::mailbox::naming::IdentityMode::Swarm,
             false,
@@ -2674,8 +2676,8 @@ mod captain_open_mode_tests {
         .expect("swarm mode routes without force");
     }
 
-    /// The reader defaults a fresh (migrated) index DB to Open — the mode the
-    /// gate refuses by default.
+    /// The reader defaults a fresh (migrated) index DB to Open — the mode a
+    /// captain fold is written in by default.
     #[tokio::test]
     async fn captain_open_mode_reader_defaults_open() {
         let dir = std::env::temp_dir().join(format!("bd-lsgm-{}", std::process::id()));

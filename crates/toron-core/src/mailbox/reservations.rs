@@ -1885,7 +1885,8 @@ impl Mailbox {
             })
     }
 
-    /// Best-effort pubkey → agent-name map from kind-30013 profiles.
+    /// Best-effort pubkey → agent-name map from kind-30013 profiles, with the
+    /// durable roster filling the gaps.
     async fn agent_name_map(
         &self,
         project_slug: &str,
@@ -1895,17 +1896,28 @@ impl Mailbox {
         let Ok(events) = collect_replay(self.bus.as_ref(), filter).await else {
             return std::collections::HashMap::new();
         };
-        events
+        let mut names: std::collections::HashMap<String, String> = events
             .iter()
-            .map(|e| {
-                (
-                    e.pubkey.to_hex(),
-                    crate::nostr::identity::parse_profile(e)
-                        .map(|p| p.name)
-                        .unwrap_or_default(),
-                )
+            .filter_map(|e| {
+                let name = crate::nostr::identity::parse_profile(e)
+                    .map(|p| p.name)
+                    .unwrap_or_default();
+                if name.is_empty() {
+                    None
+                } else {
+                    Some((e.pubkey.to_hex(), name))
+                }
             })
-            .collect()
+            .collect();
+        // bd-ow6c: the roster fills what the live profiles do not cover. The
+        // fallback used to be the first 8 chars of the pubkey — a string no
+        // agent name equals — so a lane that compared the lease holder with
+        // its own pin treated its OWN lease as a peer's and starved on the
+        // bead it held.
+        for (pubkey, name) in self.roster_names_by_pubkey(project_slug).await {
+            names.entry(pubkey).or_insert(name);
+        }
+        names
     }
 
     /// Best-effort: fill `agent_name` from kind-30013 profiles.
@@ -2684,6 +2696,81 @@ mod tests {
             persona: None,
             task_description: None,
         }
+    }
+
+    /// bd-ow6c: the lease holder's name must be the PIN, never an `npub[..8]`
+    /// prefix. A prefix is a string no agent name equals, so a lane that
+    /// compares the lease holder with its own pin treated its OWN lease as a
+    /// peer's and starved on the bead it held. The durable roster names the
+    /// pin even when the live profile event does not reach the project.
+    #[tokio::test]
+    async fn lease_holder_resolves_to_the_canonical_pin_not_a_pubkey_prefix() {
+        let (mailbox, db_path, data_dir) = test_mailbox("holder-canonical").await;
+        mailbox
+            .ensure_project("demo")
+            .await
+            .expect("ensure project");
+        let pubkey = "93bb5e316de4c7e0a99a7e00000000000000000000000000000000000000dead";
+        let pool = mailbox.index_pool.as_ref().expect("pool").clone();
+        sqlx::query(
+            "INSERT INTO agents (project_slug, name, pubkey, created_ts_us) \
+             VALUES (?1, ?2, ?3, ?4)",
+        )
+        .bind("demo")
+        .bind("RoseDune")
+        .bind(pubkey)
+        .bind(1_700_000_000_000_000i64)
+        .execute(&pool)
+        .await
+        .expect("seed the roster");
+        let names = mailbox.agent_name_map("demo").await;
+        assert_eq!(
+            names.get(pubkey).map(String::as_str),
+            Some("RoseDune"),
+            "the roster resolves the holder to the pin, not an npub prefix"
+        );
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// bd-ow6c: ONE project key on both halves of the yield join. The marker
+    /// table was written and read RAW while the lease board was canonicalized,
+    /// so a marker written under a path-form spelling was invisible to the
+    /// join — and the loop resumed a bead a live peer held.
+    #[tokio::test]
+    async fn yield_markers_join_the_lease_board_under_one_canonical_project_key() {
+        let (mailbox, db_path, data_dir) = test_mailbox("yield-canonical").await;
+        mailbox
+            .ensure_project("demo")
+            .await
+            .expect("ensure project");
+        let pool = mailbox.index_pool.as_ref().expect("pool").clone();
+        sqlx::query(
+            "INSERT INTO project_aliases (alias, canonical, created_ts_us) \
+             VALUES (?1, ?2, ?3)",
+        )
+        .bind("/w/demo")
+        .bind("demo")
+        .bind(1_i64)
+        .execute(&pool)
+        .await
+        .expect("seed the alias");
+        mailbox
+            .record_reservation_yield("/w/demo", "Yielder", "yield-bead-1", "Holder", "note")
+            .await
+            .expect("record the yield");
+        let (views, _) = mailbox
+            .reservation_yield_board("demo")
+            .await
+            .expect("the yield board");
+        assert_eq!(
+            views.len(),
+            1,
+            "the marker joins the canonical board: {views:?}"
+        );
+        assert_eq!(views[0].bead_id, "yield-bead-1");
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
     }
 
     async fn register(mailbox: &Mailbox, project: &str, name: &str) -> PublicKey {

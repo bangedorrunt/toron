@@ -1578,6 +1578,33 @@ impl Mailbox {
         })
     }
 
+    /// The durable roster: pubkey → registered name (the pin), for one
+    /// project.
+    ///
+    /// bd-ow6c: the kind-30013 profile is the LIVE publication; this table
+    /// is what registration wrote. A holder whose profile event is missing,
+    /// or published under another project spelling, is still named here —
+    /// so the fallback resolves to the pin instead of an `npub[..8]`
+    /// prefix, which is a string no agent name can equal.
+    pub async fn roster_names_by_pubkey(
+        &self,
+        project_slug: &str,
+    ) -> std::collections::HashMap<String, String> {
+        let Some(pool) = self.index_pool.as_ref() else {
+            return std::collections::HashMap::new();
+        };
+        let canonical = self.canonical_project(project_slug).await;
+        sqlx::query_as::<_, (String, String)>(
+            "SELECT pubkey, name FROM agents WHERE project_slug = ?1",
+        )
+        .bind(&canonical)
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .collect()
+    }
+
     /// `list_agents`: project's agents with npub + last-active. Deduplicates by
     /// name (latest profile wins) and filters by `active_within_days`.
     pub async fn list_agents(
