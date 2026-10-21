@@ -1,0 +1,21 @@
+-- bd-4v1a: the ack-SLA reminder obligation is the CONVERSATION, and it has a
+-- budget.
+--
+-- `post_id` becomes `scope_id`: the scan's dedupe key is the thread the post
+-- belongs to (the post id when it has no thread), so a supervisor that
+-- re-posts one request every two minutes produces ONE reminder per SLA
+-- window instead of one per post. Measured live on 2026-10-21: 714 posts in
+-- one thread, 714 reminders per window, and 95,077 of the bus's 100,000 rows
+-- were this one reminder plane.
+--
+-- `wakes` counts the reminders the obligation has been given. A post nobody
+-- acks stays overdue forever, so an unbounded reminder re-nags forever; the
+-- budget is the terminal state. After the budget is spent the obligation is
+-- not nagged again -- it stays visible instead (the reader's inbox, and
+-- `toron ack-sla`'s `muted` list).
+--
+-- The rename keeps the primary key: one row per (scope, audience), which is
+-- the reminder's contract -- one reader's ack must not silence the reminder
+-- for a co-recipient who has not read it.
+ALTER TABLE ack_sla_wakes RENAME COLUMN post_id TO scope_id;
+ALTER TABLE ack_sla_wakes ADD COLUMN wakes INTEGER NOT NULL DEFAULT 0;

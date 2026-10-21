@@ -26,6 +26,10 @@ pub const AGENT_PROFILE: u16 = 30013;
 pub const CONTACT_POLICY: u16 = 30014;
 /// File reservation (addressable, `d`=project:path-glob). NIP-40 `expiration`.
 pub const FILE_RESERVATION: u16 = 30031;
+/// Ack-SLA reminder (regular, replaceable). ADR-0042: the "you have not acked
+/// this" reminder is a WAKE, not a chat message, so it gets its own kind
+/// instead of riding the kind-9 room plane.
+pub const ACK_SLA_WAKE: u16 = 30015;
 /// Build slot (addressable, `d`=project:slot). NIP-40 `expiration`.
 pub const BUILD_SLOT: u16 = 30032;
 /// Presence / working-state (ephemeral, not stored).
@@ -77,6 +81,7 @@ mod tests {
         assert_eq!(REGISTRATION_ATTESTATION, 30012);
         assert_eq!(AGENT_PROFILE, 30013);
         assert_eq!(CONTACT_POLICY, 30014);
+        assert_eq!(ACK_SLA_WAKE, 30015);
         assert_eq!(FILE_RESERVATION, 30031);
         assert_eq!(BUILD_SLOT, 30032);
         assert_eq!(PRESENCE, 20001);
@@ -122,6 +127,7 @@ mod tests {
             (REGISTRATION_ATTESTATION, "registration attestation"),
             (AGENT_PROFILE, "agent profile"),
             (CONTACT_POLICY, "contact policy"),
+            (ACK_SLA_WAKE, "ack-sla wake"),
             (FILE_RESERVATION, "file reservation"),
             (BUILD_SLOT, "build slot"),
             (PRESENCE, "presence"),
@@ -135,7 +141,7 @@ mod tests {
             (WORKFLOW_RUN_LAST, "workflow run last"),
         ];
         // Every ADR frozen value is present.
-        assert_eq!(table.len(), 16, "frozen registry has 16 toron constants");
+        assert_eq!(table.len(), 17, "frozen registry has 17 toron constants");
         for (value, _name) in table {
             assert_eq!(toron_kind(*value).as_u16(), *value);
         }
