@@ -31,7 +31,7 @@ Living tracker of what toron **steals / adapts / rejects** from [block/buzz](htt
 | verify-before-route | Verify id+sig before prompt route `#7010` | Ingress stage order + forge tripwires | **Landed** | Boundary discipline; no double-validate in pure core |
 | soft_delete / WorkflowLifecycle | Workflow deletion honesty `#7735` | Soft-delete clears executable under one lock; host gates `try_start` | **Landed** | Settlement ≠ business done |
 | Arc workflow defs | Shared definition list | `Arc` shared registry so Clone sees soft_delete | **Landed** | No Vec-copy blind to delete |
-| SleepUntilDeadline journal/park | Deadline wake of held ACP | Journaled park effect on fenced busy-owner | **Landed** | Effect settlement ≠ provider done |
+| SleepUntilDeadline journal/park | Deadline wake of held ACP | In-process deadline wait + `pool.deadline_wake` on the fenced busy-owner | **Adapted** | NO journaled park effect: the busy-owner park writes no `Parked` row and no journal row, so a crash leaves nothing to resume from. Effect settlement ≠ provider done |
 | wake_liveness Quiet/Live/Deaf/NeverStamped | WS recovery telemetry `#7546` | Classifier on host `/health` and doorbell `:18980` (flywheel serve / doorbell plane) | **Landed** | Split stamps: `.event` / `.hb`. Never `max(event,hb)` into `last_event_ms` |
 | F worst-of across alive hosted | — | Aggregate pipe = worst class; `wake.workspace` = worst winner | **Landed** | Deaf+Live → pipe=Deaf, workspace=ws-deaf |
 | ADV-5 try_send / stamp-after-Ok / Died | Capacity-paced recovery | `try_send`; stamp only after Ok; Full → Died + `blocking_send` | **Landed** | No silent drop under Full |
