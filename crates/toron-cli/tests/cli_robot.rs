@@ -2287,7 +2287,6 @@ fn channel_post_reaches_daemon_wake_sidecar() {
         "demo",
         "--as",
         "WakeAgent",
-        "--no-input",
     ]);
     assert!(
         boot.status.success(),
