@@ -32,7 +32,7 @@
 
 mod boundary;
 mod control_flow;
-pub mod framework;
+pub mod elm;
 pub mod park;
 mod reconcile;
 mod sinks;
