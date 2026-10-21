@@ -151,7 +151,7 @@
       "name": "run-state"
     },
     {
-      "args": "--project <PROJECT>, --as <WHO>, --stream <STREAM>, --peek",
+      "args": "--project <PROJECT>, --as <WHO>, --stream <STREAM>, --peek, --urgent",
       "description": "Read your inbox past your cursor (commits cursor + Delivered in one transaction; --peek commits neither)",
       "name": "next"
     },
@@ -171,7 +171,7 @@
       "name": "inbox"
     }
   ],
-  "generated_at": "2026-10-15T20:14:10Z",
+  "generated_at": "2026-10-21T22:58:17Z",
   "resources": [
     {
       "description": "List projects known to toron.",

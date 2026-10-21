@@ -342,16 +342,35 @@ mod tests {
         assert!(cfg.mcp_allowed_hosts.is_empty());
     }
 
+    /// bd-10zs: `Config::load` merges the SYSTEM, USER and PROJECT layers
+    /// before the file it is given, so it reads the operator's real
+    /// ~/.config/toron/config.toml. This test asserted about the MERGED
+    /// result while intending to assert about the FILE it just wrote, so on
+    /// any machine whose own config sets `[comms] inbox_log` the CONTROL case
+    /// saw the ambient value and failed - a test that fails on the wrong day
+    /// and gets misread as a regression.
+    ///
+    /// The fix is to read the file's own parse. `Config::load` still gets its
+    /// own coverage elsewhere (the merge ladder is tested through
+    /// `comms_merges_key_by_key_so_a_silent_layer_does_not_erase_it`).
     #[test]
     fn comms_inbox_log_parses_and_defaults_to_absent() {
         let dir = scratch("comms");
         let on = write_config(&dir, "on.toml", "[comms]\ninbox_log = true\n");
-        assert_eq!(Config::load(Some(&on)).comms_inbox_log(), Some(true));
+        assert_eq!(file_comms_inbox_log(&on), Some(true));
         let off = write_config(&dir, "off.toml", "[comms]\ninbox_log = false\n");
-        assert_eq!(Config::load(Some(&off)).comms_inbox_log(), Some(false));
+        assert_eq!(file_comms_inbox_log(&off), Some(false));
         // CONTROL: a config with no `[comms]` leaves the key absent.
         let none = write_config(&dir, "none.toml", "backend = \"herdr\"\n");
-        assert_eq!(Config::load(Some(&none)).comms_inbox_log(), None);
+        assert_eq!(file_comms_inbox_log(&none), None);
+    }
+
+    /// The `[comms] inbox_log` value of ONE file, with no other layer in
+    /// play (bd-10zs).
+    fn file_comms_inbox_log(path: &Path) -> Option<bool> {
+        let raw = std::fs::read_to_string(path).expect("read the config file");
+        let cfg: Config = toml::from_str(&raw).expect("the config file parses");
+        cfg.comms_inbox_log()
     }
 
     #[test]
