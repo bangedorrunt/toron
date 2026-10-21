@@ -208,6 +208,65 @@ impl EventLog {
             .collect())
     }
 
+    /// The events of the given kinds, in generation order.
+    ///
+    /// bd-uc8m: a fold that only cares about one family of events must not
+    /// materialize the whole log. Served by the `events_kind` index
+    /// (migration 0029).
+    pub async fn read_kinds(&self, kinds: &[&str]) -> anyhow::Result<Vec<StoredEvent>> {
+        if kinds.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::new();
+        for kind in kinds {
+            let rows: Vec<(i64, String, String, String, i64)> = sqlx::query_as(
+                "SELECT generation, event_id, kind, payload, ts_us FROM events \
+                 WHERE kind = ?1 ORDER BY generation ASC",
+            )
+            .bind(kind)
+            .fetch_all(&self.pool)
+            .await?;
+            out.extend(
+                rows.into_iter()
+                    .map(|(generation, event_id, kind, payload, ts_us)| StoredEvent {
+                        generation,
+                        event_id,
+                        kind,
+                        payload,
+                        ts_us,
+                    }),
+            );
+        }
+        out.sort_by_key(|e| e.generation);
+        Ok(out)
+    }
+
+    /// The workflow-effect projection's events for ONE key.
+    ///
+    /// bd-uc8m: the single-row read on the dispatch hot path must not fold
+    /// the whole log. Served by the `events_wfx_key` expression index
+    /// (migration 0029) — without it this is a scan that merely returns fewer
+    /// rows, so the index is load-bearing, not a nicety.
+    pub async fn read_for_wfx_key(&self, key: &str) -> anyhow::Result<Vec<StoredEvent>> {
+        let rows: Vec<(i64, String, String, String, i64)> = sqlx::query_as(
+            "SELECT generation, event_id, kind, payload, ts_us FROM events \
+             WHERE json_extract(payload, '$.key') = ?1 ORDER BY generation ASC",
+        )
+        .bind(key)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(generation, event_id, kind, payload, ts_us)| StoredEvent {
+                generation,
+                event_id,
+                kind,
+                payload,
+                ts_us,
+            })
+            .collect())
+    }
+
     pub async fn count_kind(&self, kind: &str) -> anyhow::Result<i64> {
         let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM events WHERE kind = ?1")
             .bind(kind)
@@ -232,6 +291,58 @@ mod tests {
             .expect("connect");
         schema::migrate(&pool).await.expect("migrate");
         (EventLog::new(pool), path)
+    }
+
+    /// bd-uc8m: the hot-path fold reads ONE key. The scoped read is what
+    /// keeps the dispatch path off a full-log scan, so it must return that
+    /// key's events and nothing else.
+    #[tokio::test]
+    async fn the_scoped_fold_reads_one_key_not_the_whole_log() {
+        let (log, _p) = log("scoped-key").await;
+        log.append(
+            "wfx:workflow_effects:ek-1",
+            "wfx.row",
+            r#"{"table":"workflow_effects","key":"ek-1","row":{"effect_key":"ek-1"},"ts_us":1}"#,
+            10,
+        )
+        .await
+        .expect("append ek-1");
+        log.append(
+            "wfx:workflow_effects:ek-2",
+            "wfx.row",
+            r#"{"table":"workflow_effects","key":"ek-2","row":{"effect_key":"ek-2"},"ts_us":2}"#,
+            11,
+        )
+        .await
+        .expect("append ek-2");
+        log.append(
+            "receipt:corr-1",
+            "receipt.stamped",
+            r#"{"corr":"corr-1","state":"owed"}"#,
+            12,
+        )
+        .await
+        .expect("append a receipt event");
+
+        let scoped = log.read_for_wfx_key("ek-1").await.expect("scoped read");
+        assert_eq!(
+            scoped.len(),
+            1,
+            "the scoped fold sees one key's events: {scoped:?}"
+        );
+        assert!(
+            scoped[0].payload.contains("ek-1"),
+            "and it is that key's event"
+        );
+        let kinds = log
+            .read_kinds(&["receipt.stamped"])
+            .await
+            .expect("kind read");
+        assert_eq!(
+            kinds.len(),
+            1,
+            "the kind-scoped fold sees one family: {kinds:?}"
+        );
     }
 
     #[tokio::test]

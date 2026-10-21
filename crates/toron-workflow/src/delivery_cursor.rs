@@ -81,7 +81,7 @@ impl DeliveryCursorStore {
     pub fn snapshot(&self) -> BTreeMap<SessionId, DeliveryCursor> {
         self.inner
             .lock()
-            .expect("delivery cursor lock")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .iter()
             .map(|(s, c)| {
                 (
@@ -100,7 +100,10 @@ impl DeliveryCursorStore {
     /// live in_flight untouched. A stale snapshot never shrinks a live store.
     #[allow(clippy::significant_drop_tightening)]
     pub fn restore(&self, snap: BTreeMap<SessionId, DeliveryCursor>) {
-        let mut g = self.inner.lock().expect("delivery cursor lock");
+        let mut g = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         for (s, c) in snap {
             let e = g.entry(s).or_default();
             e.delivered.extend(c.delivered);
@@ -132,7 +135,10 @@ impl DeliveryCursorStore {
         session: &str,
         candidate_ids: impl IntoIterator<Item = impl Into<String>>,
     ) -> (Vec<DeliveryId>, Vec<DeliveryEffect>) {
-        let mut g = self.inner.lock().expect("delivery cursor lock");
+        let mut g = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let entry = g.entry(session.to_string()).or_default();
         let mut keep = Vec::new();
         let mut seen_batch = BTreeSet::new();
@@ -180,7 +186,10 @@ impl DeliveryCursorStore {
         session: &str,
         candidate_ids: impl IntoIterator<Item = impl Into<String>>,
     ) -> (Vec<DeliveryId>, Vec<DeliveryEffect>) {
-        let mut g = self.inner.lock().expect("delivery cursor lock");
+        let mut g = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let entry = g.entry(session.to_string()).or_default();
         let mut keep = Vec::new();
         let mut seen_batch = BTreeSet::new();
@@ -214,7 +223,10 @@ impl DeliveryCursorStore {
         session: &str,
         ids: impl IntoIterator<Item = impl Into<String>>,
     ) {
-        let mut g = self.inner.lock().expect("delivery cursor lock");
+        let mut g = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let entry = g.entry(session.to_string()).or_default();
         for id in ids {
             entry.in_flight.remove(id.into().as_str());
@@ -230,7 +242,10 @@ impl DeliveryCursorStore {
         session: &str,
         ids: impl IntoIterator<Item = impl Into<String>>,
     ) -> Vec<DeliveryEffect> {
-        let mut g = self.inner.lock().expect("delivery cursor lock");
+        let mut g = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let entry = g.entry(session.to_string()).or_default();
         let mut effects = Vec::new();
         for id in ids {
@@ -260,7 +275,7 @@ impl DeliveryCursorStore {
     pub fn cursor(&self, session: &str) -> DeliveryCursor {
         self.inner
             .lock()
-            .expect("delivery cursor lock")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(session)
             .cloned()
             .unwrap_or_default()
@@ -333,6 +348,24 @@ mod tests {
     /// bd-aqvg: snapshot feeds persistence; restore merges without shrinking.
     /// in_flight never persists (unconfirmed at crash = retryable, not delivered).
     #[test]
+    /// bd-uc8m: a panic while the cursor's lock is held poisons it. The
+    /// cursor recovers the guard instead of panicking on every later call,
+    /// so one panic in a critical section cannot take the session down.
+    #[test]
+    fn delivery_cursor_survives_a_poisoned_lock() {
+        let store = DeliveryCursorStore::new();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = store.inner.lock().unwrap();
+            panic!("panic inside the cursor's critical section");
+        }));
+        // The lock is poisoned now; the cursor must still answer.
+        let cur = store.cursor("s");
+        assert!(
+            cur.delivered.is_empty(),
+            "the cursor still answers after a poisoned lock"
+        );
+    }
+
     fn snapshot_restore_round_trip_drops_in_flight() {
         let store = DeliveryCursorStore::new();
         let (keep, _) = store.reserve_undelivered("s", ["a", "b"]);
