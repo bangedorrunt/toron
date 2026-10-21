@@ -48,7 +48,6 @@ fn run(data_dir: &Path, args: &[&str]) -> Output {
     Command::new(toron_bin())
         .args(args)
         .arg("--json")
-        .arg("--no-input")
         .env("TORON_MCP_DATA_DIR", data_dir)
         // An ambient TORON_MCP_URL outranks the data-dir pin
         // (`mailbox_source::decide_source` checks the daemon URL first),
@@ -89,7 +88,6 @@ fn spawn_watch(
             timeout_ms,
         ])
         .arg("--json")
-        .arg("--no-input")
         .env("TORON_MCP_DATA_DIR", data_dir)
         .env("TORON_WAKE_SOCK", wake_sock)
         .stdout(Stdio::piped())

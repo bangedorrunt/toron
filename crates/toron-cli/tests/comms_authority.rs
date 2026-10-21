@@ -204,9 +204,20 @@ fn a_crew_task_is_refused_with_the_expected_set_and_exit_3() {
     assert_eq!(v["refused"]["role"], "crew");
     assert_eq!(v["refused"]["class"], "task");
     assert_eq!(v["refused"]["contract"], "task@1");
+    // A refusal carries the role's WHOLE allow-list, not the slice for the
+    // attempted class (bd-5cyi). Crew holds one control verb,
+    // `escalate@1` - the upward handoff, added in Phase 4a - so the set
+    // names it. The in-crate table test moved with the grant (bd-ocpn);
+    // this CLI-level expectation has to move with it.
     assert_eq!(
         v["refused"]["expected"],
-        serde_json::json!(["notify/*", "request/*", "reply/*", "done"])
+        serde_json::json!([
+            "notify/*",
+            "request/*",
+            "reply/*",
+            "control/escalate",
+            "done"
+        ])
     );
     assert!(
         v["error"]
