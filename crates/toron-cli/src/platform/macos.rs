@@ -242,6 +242,13 @@ pub fn plist_xml(
 	</dict>
 	<key>ThrottleInterval</key>
 	<integer>5</integer>
+	<!-- bd-ojw3: launchd's default soft maxfiles for a job is 256, and the
+	     daemon holds one fd per wake subscriber. The daemon died of EMFILE
+	     ("accept error: Too many open files") with 264 fds, which stopped it
+	     accepting connections at all - the MCP endpoint went unreachable and
+	     every commit was blocked behind it. -->
+	<key>LimitMaxFiles</key>
+	<integer>4096</integer>
 	<key>StandardOutPath</key>
 	<string>{}</string>
 	<key>StandardErrorPath</key>
@@ -343,6 +350,14 @@ mod tests {
         assert!(xml.contains("<string>--mcp-http</string>"), "http flag");
         assert!(xml.contains("<string>127.0.0.1:18080</string>"), "addr");
         assert!(xml.contains("<key>KeepAlive</key>"), "autostart semantics");
+        // bd-ojw3: launchd's default soft maxfiles for a job is 256 and the
+        // daemon holds one fd per wake subscriber, so it died of EMFILE and
+        // stopped accepting connections. The unit must raise the budget.
+        assert!(
+            xml.contains("<key>LimitMaxFiles</key>"),
+            "the unit must raise the fd budget: launchd's default is 256 and the daemon \
+             holds one fd per subscriber"
+        );
         assert!(
             xml.contains("<key>SuccessfulExit</key>\n\t\t<false/>"),
             "bd-serve-double-spawn-oqe6: respawn on failure only — a clean \

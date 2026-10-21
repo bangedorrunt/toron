@@ -31,6 +31,14 @@ pub const WAKE_QUEUE_CAP: usize = 1024;
 /// Default handshake timeout (a subscriber that never sends its subscribe
 /// line is dropped, never parked).
 pub const WAKE_HANDSHAKE_TIMEOUT_MS: u64 = 5_000;
+/// bd-ojw3: how long a single frame write may take before the subscriber is
+/// declared dead.
+///
+/// The write was unbounded, so a subscriber that stopped reading left the
+/// daemon's write blocked forever and its fd held for the life of the daemon:
+/// one stalled peer became a daemon-wide EMFILE outage. A write that cannot
+/// finish is a failure, and a failure is the signal that releases the fd.
+pub const WAKE_WRITE_TIMEOUT_MS: u64 = 5_000;
 
 /// Default heartbeat cadence on a quiet bus (quiet-vs-deaf distinction).
 pub const WAKE_HEARTBEAT_MS: u64 = 15_000;
@@ -308,6 +316,9 @@ pub struct WakeConfig {
     /// Store-delta poll interval in ms (bd-d41q): 0 disables the poll
     /// (live fanout only — foreign store writes stay invisible).
     pub poll_interval_ms: u64,
+    /// How long a single frame write may take before the subscriber is
+    /// declared dead (bd-ojw3).
+    pub write_timeout_ms: u64,
 }
 
 impl WakeConfig {
@@ -319,6 +330,7 @@ impl WakeConfig {
             handshake_timeout_ms: WAKE_HANDSHAKE_TIMEOUT_MS,
             heartbeat_ms: WAKE_HEARTBEAT_MS,
             poll_interval_ms: WAKE_POLL_MS,
+            write_timeout_ms: WAKE_WRITE_TIMEOUT_MS,
         }
     }
 }
@@ -714,6 +726,7 @@ async fn write_matching_event(
     event: &Event,
     filter: &Filter,
     cursor: &mut WakeCursor,
+    write_timeout_ms: u64,
 ) -> Result<bool, WakeError> {
     if !filter.match_event(event, MatchEventOptions::default()) {
         return Ok(false);
@@ -724,10 +737,15 @@ async fn write_matching_event(
     }
     let payload = serde_json::to_value(event).map_err(|e| WakeError::Codec(e.to_string()))?;
     let line = WakeFrame::Event(payload).encode_line()?;
-    writer
-        .write_all(line.as_bytes())
-        .await
-        .map_err(|e| WakeError::Transport(e.to_string()))?;
+    // bd-ojw3: bounded like every other frame write - an unbounded write to a
+    // peer that stopped reading held its fd for the life of the daemon.
+    tokio::time::timeout(
+        std::time::Duration::from_millis(write_timeout_ms),
+        writer.write_all(line.as_bytes()),
+    )
+    .await
+    .map_err(|_| WakeError::Transport(format!("write timed out after {write_timeout_ms}ms")))?
+    .map_err(|e| WakeError::Transport(e.to_string()))?;
     *cursor = event_cursor;
     Ok(true)
 }
@@ -768,11 +786,32 @@ async fn write_frame(
     writer: &mut (impl tokio::io::AsyncWrite + Unpin),
     frame: &WakeFrame,
 ) -> Result<(), WakeError> {
+    write_frame_within(writer, frame, WAKE_WRITE_TIMEOUT_MS).await
+}
+
+/// [`write_frame`] with an explicit bound on how long the write may take.
+///
+/// bd-ojw3: the write was unbounded. The daemon dropped the subscriber's READ
+/// half after the handshake, so it could not see the peer's EOF; the only
+/// signal that a subscriber was gone was a failed write. An unbounded write
+/// meant a peer that stopped reading left the write blocked forever and its fd
+/// held for the life of the daemon - one stalled peer became a daemon-wide
+/// EMFILE outage. A write that cannot finish inside the bound is a DEAD
+/// subscriber: the write fails, the subscriber returns, and its fd is
+/// released.
+async fn write_frame_within(
+    writer: &mut (impl tokio::io::AsyncWrite + Unpin),
+    frame: &WakeFrame,
+    timeout_ms: u64,
+) -> Result<(), WakeError> {
     let line = frame.encode_line()?;
-    writer
-        .write_all(line.as_bytes())
-        .await
-        .map_err(|e| WakeError::Transport(e.to_string()))
+    tokio::time::timeout(
+        std::time::Duration::from_millis(timeout_ms),
+        writer.write_all(line.as_bytes()),
+    )
+    .await
+    .map_err(|_| WakeError::Transport(format!("write timed out after {timeout_ms}ms")))?
+    .map_err(|e| WakeError::Transport(e.to_string()))
 }
 
 /// Write every stored arrival after `*after` that matches `filter`, paging
@@ -787,6 +826,7 @@ async fn drain_arrivals(
     after: &mut u64,
     floor: Option<u64>,
     stats: &mut SubscriberStats,
+    write_timeout_ms: u64,
 ) -> Result<(), WakeError> {
     loop {
         let page = bus
@@ -804,7 +844,7 @@ async fn drain_arrivals(
             }
             let payload =
                 serde_json::to_value(&event).map_err(|e| WakeError::Codec(e.to_string()))?;
-            write_frame(writer, &WakeFrame::Event(payload)).await?;
+            write_frame_within(writer, &WakeFrame::Event(payload), write_timeout_ms).await?;
             stats.delivered += 1;
         }
         if !full {
@@ -848,7 +888,10 @@ async fn serve_arrivals(
                     from: from_wire.to_string(),
                     through: "unknown".to_string(),
                 };
-                if write_frame(writer, &lost).await.is_err() {
+                if write_frame_within(writer, &lost, config.write_timeout_ms)
+                    .await
+                    .is_err()
+                {
                     return stats;
                 }
                 (0, false, Some(c.created_at))
@@ -863,7 +906,10 @@ async fn serve_arrivals(
                     from: from_wire.to_string(),
                     through: format!("seq:{evicted}"),
                 };
-                if write_frame(writer, &lost).await.is_err() {
+                if write_frame_within(writer, &lost, config.write_timeout_ms)
+                    .await
+                    .is_err()
+                {
                     return stats;
                 }
             }
@@ -871,7 +917,16 @@ async fn serve_arrivals(
             Err(_) => return stats,
         }
     }
-    if drain_arrivals(writer, bus, filter, kinds, &mut after, floor, &mut stats)
+    if drain_arrivals(
+        writer,
+        bus,
+        filter,
+        kinds,
+        &mut after,
+        floor,
+        &mut stats,
+        config.write_timeout_ms,
+    )
         .await
         .is_err()
     {
@@ -884,7 +939,10 @@ async fn serve_arrivals(
             format!("seq:{after}")
         },
     };
-    if write_frame(writer, &eose).await.is_err() {
+    if write_frame_within(writer, &eose, config.write_timeout_ms)
+        .await
+        .is_err()
+    {
         return stats;
     }
     stats.delivered += 1;
@@ -903,9 +961,18 @@ async fn serve_arrivals(
                         Err(TryRecvError::Closed) => return stats,
                     }
                 }
-                if drain_arrivals(writer, bus, filter, kinds, &mut after, None, &mut stats)
-                    .await
-                    .is_err()
+                if drain_arrivals(
+                    writer,
+                    bus,
+                    filter,
+                    kinds,
+                    &mut after,
+                    None,
+                    &mut stats,
+                    config.write_timeout_ms,
+                )
+                .await
+                .is_err()
                 {
                     return stats;
                 }
@@ -914,9 +981,18 @@ async fn serve_arrivals(
             Err(_) => {
                 // Quiet tick: catch up anything a missed ring left behind,
                 // then the quiet-vs-deaf heartbeat.
-                if drain_arrivals(writer, bus, filter, kinds, &mut after, None, &mut stats)
-                    .await
-                    .is_err()
+                if drain_arrivals(
+                    writer,
+                    bus,
+                    filter,
+                    kinds,
+                    &mut after,
+                    None,
+                    &mut stats,
+                    config.write_timeout_ms,
+                )
+                .await
+                .is_err()
                 {
                     return stats;
                 }
@@ -924,7 +1000,10 @@ async fn serve_arrivals(
                     let hb = WakeFrame::Heartbeat {
                         ts_ms: clock.now_ms(),
                     };
-                    if write_frame(writer, &hb).await.is_err() {
+                    if write_frame_within(writer, &hb, config.write_timeout_ms)
+                        .await
+                        .is_err()
+                    {
                         stats.heartbeat_deaf += 1;
                         return stats;
                     }
@@ -1003,7 +1082,15 @@ async fn serve_subscriber(
     let replay_complete = loop {
         match replay.next().await {
             Some(crate::bus::SubscriptionEvent::Event(event)) => {
-                match write_matching_event(&mut writer, &event, &filter, &mut cursor).await {
+                match write_matching_event(
+                    &mut writer,
+                    &event,
+                    &filter,
+                    &mut cursor,
+                    config.write_timeout_ms,
+                )
+                .await
+                {
                     Ok(true) => stats.delivered += 1,
                     Ok(false) => {}
                     Err(_) => return stats,
@@ -1041,7 +1128,15 @@ async fn serve_subscriber(
                 let Ok(event) = Event::from_json(payload.to_string()) else {
                     return stats;
                 };
-                match write_matching_event(&mut writer, &event, &filter, &mut cursor).await {
+                match write_matching_event(
+                    &mut writer,
+                    &event,
+                    &filter,
+                    &mut cursor,
+                    config.write_timeout_ms,
+                )
+                .await
+                {
                     Ok(true) => stats.delivered += 1,
                     Ok(false) => {}
                     Err(_) => return stats,
@@ -1123,6 +1218,197 @@ mod wake_bus_tests {
 
     fn test_bus() -> Arc<dyn Bus> {
         Arc::new(FakeBus)
+    }
+
+    /// bd-ojw3: a write that cannot finish is a DEAD subscriber.
+    ///
+    /// The write was unbounded, so a peer that stopped reading left the
+    /// daemon's write blocked forever and its fd held for the life of the
+    /// daemon - one stalled peer became a daemon-wide EMFILE outage (the
+    /// daemon died at 264 fds against launchd's 256 cap). The write is now
+    /// bounded: a write that cannot complete inside the bound FAILS, and the
+    /// subscriber is dropped, so its fd goes back.
+    ///
+    /// A writer that never completes stands in for a peer whose socket buffer
+    /// is full: the write cannot finish, so only the bound can end it.
+    #[tokio::test]
+    async fn a_write_that_cannot_finish_fails_instead_of_blocking_forever() {
+        struct NeverCompletes;
+        impl tokio::io::AsyncWrite for NeverCompletes {
+            fn poll_write(
+                self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+                _: &[u8],
+            ) -> std::task::Poll<std::io::Result<usize>> {
+                std::task::Poll::Pending
+            }
+            fn poll_flush(
+                self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Pending
+            }
+            fn poll_shutdown(
+                self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Pending
+            }
+        }
+        let mut writer = NeverCompletes;
+        let frame = WakeFrame::Heartbeat { ts_ms: 0 };
+        let started = std::time::Instant::now();
+        let result =
+            write_frame_within(&mut writer, &frame, 60).await;
+        assert!(
+            result.is_err(),
+            "a write that cannot finish must fail, not block forever: the blocked write held \
+             the subscriber's fd for the life of the daemon"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "the bound must end the write promptly, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// bd-ojw3: a subscriber that stops reading must be DROPPED, so its fd
+    /// goes back.
+    ///
+    /// The daemon dropped the subscriber's read half after the handshake, so
+    /// it could not see the peer's EOF; the only signal that a subscriber was
+    /// gone was a failed write. The write was UNBOUNDED, so a peer that
+    /// stopped reading left the write blocked forever and the fd held for the
+    /// life of the daemon - one stalled peer became a daemon-wide EMFILE
+    /// outage (measured: the daemon died at 264 fds against launchd's 256
+    /// cap).
+    ///
+    /// The write is now bounded: a write that cannot finish inside the bound
+    /// is a DEAD subscriber, the write fails, the subscriber returns, and the
+    /// live count drops.
+    #[tokio::test]
+    async fn a_stalled_subscriber_is_dropped_and_its_fd_released() {
+        /// A bus whose subscription carries whatever the test publishes, so
+        /// the server really writes frames to the subscriber.
+        struct FloodBus {
+            tx: tokio::sync::broadcast::Sender<crate::bus::SubscriptionEvent>,
+        }
+        #[async_trait::async_trait]
+        impl Bus for FloodBus {
+            async fn publish(
+                &self,
+                _event: crate::nostr::Event,
+            ) -> Result<crate::bus::PublishOk, BusError> {
+                Err(BusError::Unsupported("flood".to_string()))
+            }
+            async fn subscribe(&self, filter: Filter) -> Result<crate::bus::Subscription, BusError> {
+                self.subscribe_trusted(filter).await
+            }
+            async fn subscribe_trusted(
+                &self,
+                _filter: Filter,
+            ) -> Result<crate::bus::Subscription, BusError> {
+                let (tx, rx) =
+                    tokio::sync::mpsc::channel(crate::bus::Subscription::DEFAULT_CAPACITY);
+                let mut events = self.tx.subscribe();
+                tokio::spawn(async move {
+                    while let Ok(ev) = events.recv().await {
+                        if tx.send(ev).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+                Ok(crate::bus::Subscription::new(
+                    crate::bus::SubscriptionId::new("flood"),
+                    rx,
+                ))
+            }
+            async fn health(&self) -> Result<crate::bus::Health, BusError> {
+                Ok(crate::bus::Health {
+                    ok: true,
+                    message: "flood".to_string(),
+                })
+            }
+        }
+
+        let (tx, _rx) = tokio::sync::broadcast::channel(16);
+        let sock = tmp_sock("stalled");
+        let _ = std::fs::remove_file(&sock);
+        let mut cfg = WakeConfig::new(&sock);
+        cfg.poll_interval_ms = 0;
+        cfg.heartbeat_ms = 20;
+        cfg.write_timeout_ms = 100;
+        let bus: Arc<dyn Bus> = Arc::new(FloodBus { tx: tx.clone() });
+        let h = WakeServer::new(cfg, bus, Arc::new(ManualClock::new(0)))
+            .start()
+            .await
+            .expect("bind");
+
+        // A client that reads NOTHING: its socket buffer fills and every
+        // write to it blocks.
+        let client = {
+            use tokio::io::AsyncWriteExt;
+            let mut stream = UnixStream::connect(&sock).await.expect("connect");
+            let request = serde_json::json!({
+                "subscribe": {"kinds": [9], "project": "demo"}
+            })
+            .to_string();
+            stream
+                .write_all(format!("{request}\n").as_bytes())
+                .await
+                .expect("subscribe");
+            stream
+        };
+        // Hold the client OPEN (so its socket is not closed and the server
+        // sees no EOF) but never read from it.
+        let _keep_open = client;
+
+        // The server sees the subscriber live...
+        let live = async {
+            for _ in 0..100 {
+                if h.aggregate_stats().subscribers_live > 0 {
+                    return true;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            false
+        }
+        .await;
+        assert!(live, "the subscriber should register as live");
+
+        // ...and then it must be RELEASED. A frame far larger than the
+        // socket buffer cannot be written to a peer that never reads, so the
+        // bounded write fails and the subscriber is dropped.
+        let keys = crate::nostr::Keys::generate();
+        let big = "x".repeat(512 * 1024);
+        let event = crate::nostr::event::build_event(
+            &keys,
+            Kind::from(9),
+            &big,
+            // The subscriber's filter names the project, so the event must
+            // carry the tag or the filter drops it and nothing is written.
+            vec![crate::nostr::Tag::parse(["t", "demo"]).expect("project tag")],
+            crate::nostr::Timestamp::from(1),
+        )
+        .expect("event");
+        let _ = tx.send(crate::bus::SubscriptionEvent::Event(event));
+
+        let released = async {
+            for _ in 0..200 {
+                if h.aggregate_stats().subscribers_live == 0 {
+                    return true;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            false
+        }
+        .await;
+        assert!(
+            released,
+            "a subscriber that cannot be written to must be dropped: its fd is held otherwise, \
+             and one stalled peer is enough to exhaust the daemon's budget"
+        );
+        let _ = std::fs::remove_file(&sock);
     }
 
     fn tmp_sock(name: &str) -> PathBuf {
@@ -1416,19 +1702,19 @@ mod wake_bus_tests {
         let mut cursor = WakeCursor::origin();
 
         assert!(
-            write_matching_event(&mut written, &ev, &filter, &mut cursor)
+            write_matching_event(&mut written, &ev, &filter, &mut cursor, WAKE_WRITE_TIMEOUT_MS)
                 .await
                 .expect("first delivery"),
             "a fresh event past the cursor is delivered"
         );
         assert!(
-            !write_matching_event(&mut written, &ev, &filter, &mut cursor)
+            !write_matching_event(&mut written, &ev, &filter, &mut cursor, WAKE_WRITE_TIMEOUT_MS)
                 .await
                 .expect("redelivery"),
             "the SAME event again (replay/live overlap) is suppressed, not re-sent"
         );
         assert!(
-            !write_matching_event(&mut written, &older, &filter, &mut cursor)
+            !write_matching_event(&mut written, &older, &filter, &mut cursor, WAKE_WRITE_TIMEOUT_MS)
                 .await
                 .expect("stale"),
             "an event behind the cursor never re-enters the stream"
@@ -1448,7 +1734,7 @@ mod wake_bus_tests {
         );
         let mut resumed = WakeCursor::parse(&wire).expect("resumable");
         assert!(
-            !write_matching_event(&mut written, &ev, &filter, &mut resumed)
+            !write_matching_event(&mut written, &ev, &filter, &mut resumed, WAKE_WRITE_TIMEOUT_MS)
                 .await
                 .expect("already seen"),
             "a consumer resuming from the advertised cursor does not re-receive it"
