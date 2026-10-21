@@ -177,6 +177,22 @@ pub const DUP_COLLAPSE_WINDOW_US: i64 = 3_600_000_000;
 /// No per-call SLA arg on the inbox path (schema freeze — one meaning).
 pub const ACK_SLA_DEFAULT_SECS: i64 = 30 * 60;
 
+/// bd-4v1a: how many reminders ONE obligation gets before it is terminally
+/// muted. A post nobody acks stays overdue forever, so an unbounded reminder
+/// re-nags forever — measured live, 95,077 of the bus's 100,000 rows were
+/// this one reminder plane. After the budget is spent the obligation is not
+/// nagged again; it stays visible instead (the reader's inbox, the
+/// `ack_sla_wakes.wakes` counter, `toron ack-sla`'s `muted` list).
+pub const ACK_SLA_WAKE_BUDGET: i64 = 3;
+
+/// bd-4v1a: how many reminders ONE scan may publish. One scan cannot flood
+/// the bus.
+pub const ACK_SLA_SCAN_MAX_EMIT: usize = 500;
+
+/// bd-4v1a: the scan deadline. The doorbell kills `toron ack-sla` at 15s, so
+/// a scan that outruns that never reports anything at all.
+pub const ACK_SLA_SCAN_DEADLINE_MS: u64 = 10_000;
+
 /// `fetch_inbox` options.
 #[derive(Debug, Clone, Default)]
 pub struct FetchInbox {
@@ -1063,10 +1079,19 @@ impl Mailbox {
     /// bd-i1o3.2: Ack SLA expiry (extends bd-mail-ack-sla-tracking-k0j).
     /// When an `importance=high|urgent` + `ack_required` message has no ack
     /// past the SLA (default 30 min), emit a metadata-only wake naming
-    /// `post+thread+audience` onto the same bus the job wake uses (no new
-    /// Nostr kind — kind 9 + `toron-kind=ack-sla-expired`). Reuses the
-    /// existing `messages` + receipts tracking structures; never builds a
-    /// second tracker. Direct path stays cheap (one wake per expiry, not a poll).
+    /// `post+thread+audience` onto the bus (kind `ACK_SLA_WAKE` +
+    /// `toron-kind=ack-sla-expired`). Reuses the existing `messages` +
+    /// receipts tracking structures; never builds a second tracker. Direct
+    /// path stays cheap (one wake per expiry, not a poll).
+    ///
+    /// bd-4v1a: the reminder rides `ACK_SLA_WAKE` (30015), NOT the kind-9
+    /// ROOM plane. A reminder is a wake, not a chat message: on the room
+    /// plane every reminder competed with real crew posts for the bus's
+    /// capped rows (measured live: 95,077 of 100,000 rows were this one
+    /// reminder) and the doorbell forwarded every one of them into its
+    /// single-serial wake brain, which dropped 1,879 real wake lines. The
+    /// doorbell still sees the obligation — through `toron ack-sla`'s
+    /// `expired` list, which is what its own scan reads.
     pub async fn emit_ack_sla_expired(
         &self,
         project_slug: &str,
@@ -1075,25 +1100,43 @@ impl Mailbox {
         audience: &[String],
     ) -> anyhow::Result<()> {
         let project_slug = self.canonical_project(project_slug).await;
-        // Use operator key if available, else any agent key in project as signer
-        // (wake must be signed; choose operator for truthfulness, fallback to
-        // first agent's key).
-        let signer = if let Some(op) = self.operator().cloned() {
-            op
-        } else {
-            let agents = self
-                .list_agents(&project_slug, ListAgentsOptions::default())
-                .await
-                .unwrap_or_default();
-            let mut found: Option<Keys> = None;
-            for a in agents {
-                if let Ok(k) = self.agent_keys_for(&project_slug, &a.name) {
-                    found = Some(k);
-                    break;
-                }
+        let signer = self.ack_sla_signer(&project_slug).await?;
+        self.emit_ack_sla_expired_signed(&signer, &project_slug, post_id, thread_id, audience)
+            .await
+    }
+
+    /// The signer for an ack-SLA reminder: the operator key when there is
+    /// one, else the first agent key in the project (the reminder must be
+    /// signed; the operator is the truthful signer).
+    ///
+    /// bd-4v1a: resolved ONCE per scan. Resolving it per candidate re-read
+    /// and re-decrypted the key file thousands of times, and that was the
+    /// two-minute scan the doorbell killed at its 15s timeout.
+    async fn ack_sla_signer(&self, project_slug: &str) -> anyhow::Result<Keys> {
+        if let Some(op) = self.operator().cloned() {
+            return Ok(op);
+        }
+        let agents = self
+            .list_agents(project_slug, ListAgentsOptions::default())
+            .await
+            .unwrap_or_default();
+        for a in agents {
+            if let Ok(k) = self.agent_keys_for(project_slug, &a.name) {
+                return Ok(k);
             }
-            found.ok_or_else(|| anyhow::anyhow!("no signer for ack-sla wake"))?
-        };
+        }
+        Err(anyhow::anyhow!("no signer for ack-sla wake"))
+    }
+
+    /// The signed reminder itself.
+    async fn emit_ack_sla_expired_signed(
+        &self,
+        signer: &Keys,
+        project_slug: &str,
+        post_id: &str,
+        thread_id: Option<&str>,
+        audience: &[String],
+    ) -> anyhow::Result<()> {
         let tid = thread_id.unwrap_or(post_id);
         let aud = if audience.is_empty() {
             "unknown".to_string()
@@ -1103,7 +1146,7 @@ impl Mailbox {
         let content =
             format!("[doorbell] ack-sla-expired post {post_id} thread {tid} audience {aud}");
         let mut tags = vec![
-            Tag::parse(["t", &project_slug]).expect("t"),
+            Tag::parse(["t", project_slug]).expect("t"),
             Tag::parse(["h", tid]).expect("h"),
             Tag::parse(["toron-kind", "ack-sla-expired"]).expect("toron-kind"),
             Tag::parse(["post", post_id]).expect("post"),
@@ -1123,7 +1166,13 @@ impl Mailbox {
                 tags.push(t);
             }
         }
-        if let Ok(ev) = build_event(&signer, toron_kind(9), content, tags, Timestamp::now()) {
+        if let Ok(ev) = build_event(
+            signer,
+            toron_kind(crate::nostr::kinds::ACK_SLA_WAKE),
+            content,
+            tags,
+            Timestamp::now(),
+        ) {
             let _ = self.bus.publish(ev).await;
         }
         Ok(())
@@ -1138,6 +1187,42 @@ impl Mailbox {
         project_slug: &str,
         sla_secs: Option<u64>,
     ) -> anyhow::Result<Vec<String>> {
+        self.check_ack_sla_expired_within(
+            project_slug,
+            sla_secs,
+            std::time::Instant::now() + std::time::Duration::from_millis(ACK_SLA_SCAN_DEADLINE_MS),
+            ACK_SLA_SCAN_MAX_EMIT,
+        )
+        .await
+    }
+
+    /// The scan, with its bounds exposed: `deadline` stops the scan and
+    /// `max_emit` caps how many reminders one scan publishes.
+    ///
+    /// bd-4v1a — the obligation is the CONVERSATION and the scan is bounded:
+    /// - **Scope.** The dedupe key is `(scope, audience)`, where the scope is
+    ///   the post's thread (the post id when it has no thread). A supervisor
+    ///   that re-posts one request every two minutes produced 714 posts in
+    ///   one thread and 714 reminders per window (measured live: 95,077 of
+    ///   the bus's 100,000 rows were this one reminder plane). The audience
+    ///   stays part of the key: one reader's ack must not silence the
+    ///   reminder for a co-recipient who has not read it.
+    /// - **Terminal posts.** A tombstoned post (`deleted = 1`) is unreadable
+    ///   and an un-addressed post (`to_list = '[]'`) has no reader: neither
+    ///   can ever be acked, so neither is ever reminded.
+    /// - **Budget.** `ACK_SLA_WAKE_BUDGET` reminders per obligation, then the
+    ///   obligation is terminally muted: the nag stops, the obligation does
+    ///   not (it stays in the reader's inbox, and the counter that muted it
+    ///   is durable in `ack_sla_wakes.wakes`).
+    /// - **Bounds.** `deadline` stops the scan, `max_emit` caps what one scan
+    ///   publishes, and the signer is resolved once for the whole scan.
+    async fn check_ack_sla_expired_within(
+        &self,
+        project_slug: &str,
+        sla_secs: Option<u64>,
+        deadline: std::time::Instant,
+        max_emit: usize,
+    ) -> anyhow::Result<Vec<String>> {
         let project_slug = self.canonical_project(project_slug).await;
         let sla = sla_secs.map(|s| s as i64).unwrap_or(ACK_SLA_DEFAULT_SECS);
         let cutoff_us = crate::index::writer::Clock::now_us(&crate::index::writer::SystemClock)
@@ -1145,26 +1230,36 @@ impl Mailbox {
         let Some(pool) = self.index_pool.as_ref() else {
             return Ok(Vec::new());
         };
+        // Oldest obligation first: the publication cap then drops the least
+        // overdue work, not the oldest.
         let rows: Vec<(String, Option<String>, String)> = sqlx::query_as(
             "SELECT event_id, thread_id, to_list FROM messages \
              WHERE project_slug = ?1 AND ack_required = 1 \
              AND importance IN ('high','urgent') \
-             AND created_ts_us < ?2",
+             AND deleted = 0 \
+             AND to_list <> '[]' \
+             AND created_ts_us < ?2 \
+             ORDER BY created_ts_us ASC",
         )
         .bind(&project_slug)
         .bind(cutoff_us)
         .fetch_all(pool)
         .await
         .unwrap_or_default();
+        let now_us = crate::index::writer::Clock::now_us(&crate::index::writer::SystemClock);
+        let window_us = sla * 1_000_000;
         let mut emitted = Vec::new();
+        // One signer for the whole scan, and one reminder record read per
+        // OBLIGATION (not per post).
+        let mut signer: Option<Keys> = None;
+        let mut scope_state: HashMap<(String, String), (i64, i64)> = HashMap::new();
         for (post_id, thread_id, to_list_json) in rows {
-            let eid = EventId::from_hex(&post_id).unwrap_or_else(|_| {
-                // non-hex post ids (free-form) — skip receipt check, just emit
-                EventId::from_hex(
-                    "0000000000000000000000000000000000000000000000000000000000000000",
-                )
-                .unwrap()
-            });
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            if emitted.len() >= max_emit {
+                break;
+            }
             // SLA truth is sqlite (message_reads / receipts store), never the
             // process-local wrap_idempotency HashMap. ack-SLA: ack state is
             // per (message, recipient) — one reader's receipt must not
@@ -1208,87 +1303,88 @@ impl Mailbox {
             {
                 continue;
             }
-            // bd-ejp4: the scan is a LOOP, so "not handled yet" is not a
-            // licence to announce the same post again on every pass. Measured:
-            // 129 distinct posts produced 98,539 wakes (~771 each) in 13 hours,
-            // which filled the bus to its 100,000-row cap and got the mail
-            // gift-wrapped out from under the readers. The bound is one wake
-            // per SLA window, not a permanent mute, so a reader who never acts
-            // is still reminded. The record is durable because the flood
-            // outlived a daemon restart, and it is keyed on the AUDIENCE
-            // because the per-recipient contract above means a new
-            // co-recipient must still be woken.
+            // bd-4v1a: the obligation is the CONVERSATION the post belongs to,
+            // so a thread that re-posts one request every two minutes owes ONE
+            // reminder, not one per post.
+            let scope_id = ack_sla_scope_id(thread_id.as_deref(), &post_id);
             let wake_key = ack_sla_wake_audience_key(&audience);
-            if self
-                .ack_sla_woken_within(&post_id, &wake_key, sla * 1_000_000)
-                .await
-            {
+            let scope_key = (scope_id.clone(), wake_key.clone());
+            let (wakes, emitted_us) = match scope_state.get(&scope_key) {
+                Some(state) => *state,
+                None => {
+                    let state = self.ack_sla_scope_state(&scope_id, &wake_key).await;
+                    scope_state.insert(scope_key.clone(), state);
+                    state
+                }
+            };
+            if wakes >= ACK_SLA_WAKE_BUDGET {
+                // Terminally muted: the obligation stays visible (the reader's
+                // inbox, the durable counter), the nag stops. A permanent mute
+                // alone would trade the flood for a silent drop, so the
+                // record keeps the counter that muted it.
                 continue;
             }
-            let tid = thread_id.as_deref();
-            let _ = self
-                .emit_ack_sla_expired(&project_slug, &post_id, tid, &audience)
-                .await;
+            if emitted_us >= now_us - window_us {
+                // Inside the reminder window: remind once per SLA window, not
+                // on every pass.
+                continue;
+            }
+            if signer.is_none() {
+                signer = self.ack_sla_signer(&project_slug).await.ok();
+            }
+            if let Some(s) = signer.as_ref() {
+                let tid = thread_id.as_deref();
+                let _ = self
+                    .emit_ack_sla_expired_signed(s, &project_slug, &post_id, tid, &audience)
+                    .await;
+            }
             // Record the attempt BEFORE trusting the loop: a wake that was
             // published but not recorded here is exactly the repeat this guards.
-            self.ack_sla_record_wake(&post_id, &wake_key).await;
-            let _ = eid; // suppress unused in non-hex path
+            self.ack_sla_record_wake(&scope_id, &wake_key).await;
+            scope_state.insert(scope_key, (wakes + 1, now_us));
             emitted.push(post_id);
         }
         Ok(emitted)
     }
 
-    /// bd-ejp4: was this exact `(post, audience)` pair announced within
-    /// `window_us`?
+    /// bd-4v1a: the durable reminder state of one obligation — how many
+    /// reminders it has been given (`wakes`) and when the last one went out
+    /// (`emitted_us`).
     ///
-    /// The bound is a REMINDER CADENCE, not a permanent mute. A post whose
-    /// reader never acts stays genuinely overdue, so suppressing it forever
-    /// would trade a flood for a silent drop. One wake per SLA window is the
-    /// shape that keeps both properties: measured against the live flood that
-    /// is 129 posts waking hourly instead of 98,539 wakes in 13 hours.
-    ///
-    /// A read failure answers `false` (announce again) rather than swallowing
+    /// A read failure answers `(0, 0)` (announce again) rather than swallowing
     /// the post: an unreadable record must not silence a real overdue ack, so
-    /// the failure mode is a duplicate wake, never a dropped one.
-    async fn ack_sla_woken_within(
-        &self,
-        post_id: &str,
-        audience_key: &str,
-        window_us: i64,
-    ) -> bool {
+    /// the failure mode is a duplicate reminder, never a dropped one.
+    async fn ack_sla_scope_state(&self, scope_id: &str, audience_key: &str) -> (i64, i64) {
         let Some(pool) = self.index_pool.as_ref() else {
-            return false;
+            return (0, 0);
         };
-        let now_us = crate::index::writer::Clock::now_us(&crate::index::writer::SystemClock);
-        sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM ack_sla_wakes \
-             WHERE post_id = ?1 AND audience = ?2 AND emitted_us >= ?3",
+        sqlx::query_as::<_, (i64, i64)>(
+            "SELECT wakes, emitted_us FROM ack_sla_wakes WHERE scope_id = ?1 AND audience = ?2",
         )
-        .bind(post_id)
+        .bind(scope_id)
         .bind(audience_key)
-        .bind(now_us - window_us)
-        .fetch_one(pool)
+        .fetch_optional(pool)
         .await
-        .map(|n| n > 0)
-        .unwrap_or(false)
+        .ok()
+        .flatten()
+        .unwrap_or((0, 0))
     }
 
-    /// bd-ejp4: record that this `(post, audience)` pair was announced.
-    ///
-    /// The conflict arm REFRESHES `emitted_us` rather than doing nothing:
-    /// the bound is a cadence, so a post that becomes eligible again after its
-    /// window must push its own reminder forward or it would re-wake on every
-    /// scan from then on. Best-effort — the row is the dedupe, not the wake.
-    async fn ack_sla_record_wake(&self, post_id: &str, audience_key: &str) {
+    /// bd-4v1a: record that one obligation was reminded. `wakes` counts the
+    /// reminders it has been given, and only ever goes up: the budget is the
+    /// terminal state.
+    async fn ack_sla_record_wake(&self, scope_id: &str, audience_key: &str) {
         let Some(pool) = self.index_pool.as_ref() else {
             return;
         };
         let now_us = crate::index::writer::Clock::now_us(&crate::index::writer::SystemClock);
         let _ = sqlx::query(
-            "INSERT INTO ack_sla_wakes (post_id, audience, emitted_us) VALUES (?1, ?2, ?3) \
-             ON CONFLICT (post_id, audience) DO UPDATE SET emitted_us = excluded.emitted_us",
+            "INSERT INTO ack_sla_wakes (scope_id, audience, emitted_us, wakes) \
+             VALUES (?1, ?2, ?3, 1) \
+             ON CONFLICT (scope_id, audience) DO UPDATE SET \
+             emitted_us = excluded.emitted_us, wakes = wakes + 1",
         )
-        .bind(post_id)
+        .bind(scope_id)
         .bind(audience_key)
         .bind(now_us)
         .execute(pool)
@@ -2125,6 +2221,17 @@ fn ack_sla_wake_audience_key(audience: &[String]) -> String {
     use std::hash::{Hash, Hasher};
     joined.hash(&mut hasher);
     format!("{joined}#{:016x}", hasher.finish())
+}
+
+/// bd-4v1a: the reminder obligation of a post is the CONVERSATION it belongs
+/// to. A thread that re-posts one request every two minutes is ONE
+/// obligation, not 714 (measured live: 714 posts in one thread, 714
+/// reminders per SLA window). A post with no thread is its own obligation.
+fn ack_sla_scope_id(thread_id: Option<&str>, post_id: &str) -> String {
+    match thread_id {
+        Some(t) if !t.is_empty() => t.to_string(),
+        _ => post_id.to_string(),
+    }
 }
 
 /// Verify a gift wrap unwraps to the expected rumor content (acceptance
@@ -3854,7 +3961,9 @@ mod tests {
             "overdue post emitted"
         );
         let filter = crate::bus::Filter::new()
-            .kinds([crate::nostr::kinds::toron_kind(9)])
+            .kinds([crate::nostr::kinds::toron_kind(
+                crate::nostr::kinds::ACK_SLA_WAKE,
+            )])
             .hashtag("demo");
         let events = crate::mailbox::collect_replay(mailbox.bus().as_ref(), filter)
             .await
@@ -4259,9 +4368,11 @@ mod tests {
         // ...but the bound is a CADENCE, not a mute. Past the window the post
         // is still genuinely overdue, so it must be woken again. Backdating the
         // record is the only way to observe the window without sleeping.
+        // bd-4v1a: the record is keyed by the reminder's SCOPE — this post has
+        // no thread, so its scope IS its id.
         sqlx::query(
             "UPDATE ack_sla_wakes SET emitted_us = ?1 \
-             WHERE post_id = ?2 AND audience = ?3",
+             WHERE scope_id = ?2 AND audience = ?3",
         )
         .bind(old_us)
         .bind(&post_id)
@@ -4330,7 +4441,7 @@ mod tests {
         crate::index::schema::migrate(&pool).await.expect("migrate");
 
         sqlx::query(
-            "INSERT INTO ack_sla_wakes (post_id, audience, emitted_us) VALUES (?1, ?2, ?3)",
+            "INSERT INTO ack_sla_wakes (scope_id, audience, emitted_us) VALUES (?1, ?2, ?3)",
         )
         .bind("post-1")
         .bind("aud-1")
@@ -4345,7 +4456,7 @@ mod tests {
             .await
             .expect("reconnect");
         let n: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM ack_sla_wakes WHERE post_id = 'post-1' AND audience = 'aud-1'",
+            "SELECT COUNT(*) FROM ack_sla_wakes WHERE scope_id = 'post-1' AND audience = 'aud-1'",
         )
         .fetch_one(&reopened)
         .await
@@ -4355,6 +4466,334 @@ mod tests {
             "the wake record must outlive the process that wrote it"
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    // ---- bd-4v1a: the reminder is scoped, budgeted and bounded ----
+
+    /// An overdue ack-required post, inserted straight into the projection
+    /// (the scan reads `messages`, not the wire).
+    async fn insert_overdue_post(
+        pool: &sqlx::SqlitePool,
+        event_id: &str,
+        thread_id: Option<&str>,
+        to_list: &str,
+        age_secs: i64,
+    ) {
+        let old_us = crate::index::writer::Clock::now_us(&crate::index::writer::SystemClock)
+            - age_secs * 1_000_000;
+        sqlx::query(
+            "INSERT INTO messages (event_id, project_slug, sender, sender_pubkey, subject, body, \
+             importance, ack_required, thread_id, to_list, cc_list, created_ts_us, local_seq) \
+             VALUES (?1, 'demo', 'GreenCastle', 'aaaa', 'subject', 'body', 'high', 1, ?2, ?3, '[]', ?4, 1)",
+        )
+        .bind(event_id)
+        .bind(thread_id)
+        .bind(to_list)
+        .bind(old_us)
+        .execute(pool)
+        .await
+        .expect("insert overdue post");
+    }
+
+    /// The reminders on the bus (kind 30015).
+    async fn published_ack_sla_wakes(mailbox: &Mailbox) -> Vec<Event> {
+        let filter = crate::bus::Filter::new()
+            .kinds([crate::nostr::kinds::toron_kind(
+                crate::nostr::kinds::ACK_SLA_WAKE,
+            )])
+            .hashtag("demo");
+        let events = crate::mailbox::collect_replay(mailbox.bus().as_ref(), filter)
+            .await
+            .expect("replay");
+        events
+            .into_iter()
+            .filter(|e| {
+                e.tags
+                    .iter()
+                    .any(|t| t.as_slice() == ["toron-kind", "ack-sla-expired"])
+            })
+            .collect()
+    }
+
+    /// bd-4v1a: the reminder is a WAKE, not a room post. On the kind-9 room
+    /// plane every reminder competed with real crew posts for the bus's
+    /// capped rows (measured live: 95,077 of 100,000 rows were this one
+    /// reminder) and the doorbell's wake brain forwarded every one of them,
+    /// dropping 1,879 real wake lines.
+    #[tokio::test]
+    async fn ack_sla_wake_rides_its_own_kind_not_the_room_plane() {
+        let (mailbox, pool, db_path, data_dir) = test_mailbox_with_pool("wake-kind").await;
+        mailbox.ensure_project("demo").await.expect("ensure");
+        let (_gc, _) = register(&mailbox, "demo", "GreenCastle").await;
+        let (_bl, _) = register(&mailbox, "demo", "BlueLake").await;
+        insert_overdue_post(
+            &pool,
+            "post-kind",
+            Some("thread-kind"),
+            "[\"BlueLake\"]",
+            7200,
+        )
+        .await;
+
+        mailbox
+            .check_ack_sla_expired("demo", Some(30 * 60))
+            .await
+            .expect("scan");
+
+        assert_eq!(
+            published_ack_sla_wakes(&mailbox).await.len(),
+            1,
+            "the reminder is published on ACK_SLA_WAKE"
+        );
+        let room = crate::bus::Filter::new()
+            .kinds([crate::nostr::kinds::toron_kind(
+                crate::nostr::kinds::CHANNEL_MESSAGE,
+            )])
+            .hashtag("demo");
+        let room_events = crate::mailbox::collect_replay(mailbox.bus().as_ref(), room)
+            .await
+            .expect("replay");
+        assert!(
+            !room_events.iter().any(|e| e
+                .tags
+                .iter()
+                .any(|t| t.as_slice() == ["toron-kind", "ack-sla-expired"])),
+            "the reminder must not ride the kind-9 room plane"
+        );
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// bd-4v1a: a tombstoned post is unreadable, so it can never be acked —
+    /// re-waking it is a nag with no possible answer.
+    #[tokio::test]
+    async fn ack_sla_tombstoned_post_is_never_reminded() {
+        let (mailbox, pool, db_path, data_dir) = test_mailbox_with_pool("wake-tombstone").await;
+        mailbox.ensure_project("demo").await.expect("ensure");
+        let (_gc, _) = register(&mailbox, "demo", "GreenCastle").await;
+        let (_bl, _) = register(&mailbox, "demo", "BlueLake").await;
+        insert_overdue_post(
+            &pool,
+            "post-dead",
+            Some("thread-dead"),
+            "[\"BlueLake\"]",
+            7200,
+        )
+        .await;
+        sqlx::query("UPDATE messages SET deleted = 1 WHERE event_id = 'post-dead'")
+            .execute(&pool)
+            .await
+            .expect("tombstone the post");
+
+        let emitted = mailbox
+            .check_ack_sla_expired("demo", Some(30 * 60))
+            .await
+            .expect("scan");
+
+        assert!(
+            emitted.is_empty(),
+            "a tombstoned post is never reminded: {emitted:?}"
+        );
+        assert!(
+            published_ack_sla_wakes(&mailbox).await.is_empty(),
+            "a tombstoned post publishes no reminder"
+        );
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// bd-4v1a: an un-addressed post has no reader, so the reminder can never
+    /// reach anyone who could act on it.
+    #[tokio::test]
+    async fn ack_sla_unaddressed_post_is_never_reminded() {
+        let (mailbox, pool, db_path, data_dir) = test_mailbox_with_pool("wake-unaddressed").await;
+        mailbox.ensure_project("demo").await.expect("ensure");
+        let (_gc, _) = register(&mailbox, "demo", "GreenCastle").await;
+        insert_overdue_post(&pool, "post-noaddr", Some("thread-noaddr"), "[]", 7200).await;
+
+        let emitted = mailbox
+            .check_ack_sla_expired("demo", Some(30 * 60))
+            .await
+            .expect("scan");
+
+        assert!(
+            emitted.is_empty(),
+            "an un-addressed post is never reminded: {emitted:?}"
+        );
+        assert!(
+            published_ack_sla_wakes(&mailbox).await.is_empty(),
+            "an un-addressed post publishes no reminder"
+        );
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// bd-4v1a: the obligation is the CONVERSATION. A supervisor that
+    /// re-posts one request every two minutes produced 714 posts in one
+    /// thread and 714 reminders per window; one conversation owes one
+    /// reminder.
+    #[tokio::test]
+    async fn ack_sla_one_conversation_owes_one_reminder_per_window() {
+        let (mailbox, pool, db_path, data_dir) = test_mailbox_with_pool("wake-conversation").await;
+        mailbox.ensure_project("demo").await.expect("ensure");
+        let (_gc, _) = register(&mailbox, "demo", "GreenCastle").await;
+        let (_bl, _) = register(&mailbox, "demo", "BlueLake").await;
+        for i in 0..5 {
+            insert_overdue_post(
+                &pool,
+                &format!("post-conv-{i}"),
+                Some("thread-conv"),
+                "[\"BlueLake\"]",
+                7200 + i,
+            )
+            .await;
+        }
+
+        let emitted = mailbox
+            .check_ack_sla_expired("demo", Some(30 * 60))
+            .await
+            .expect("scan");
+
+        assert_eq!(
+            published_ack_sla_wakes(&mailbox).await.len(),
+            1,
+            "one conversation owes one reminder per window"
+        );
+        assert_eq!(emitted.len(), 1, "one obligation is reported: {emitted:?}");
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// bd-4v1a: an unbounded reminder re-nags a post nobody acks forever
+    /// (95,077 of the bus's 100,000 rows were one reminder plane). The budget
+    /// is the terminal state.
+    #[tokio::test]
+    async fn ack_sla_reminder_budget_mutes_the_obligation() {
+        let (mailbox, pool, db_path, data_dir) = test_mailbox_with_pool("wake-budget").await;
+        mailbox.ensure_project("demo").await.expect("ensure");
+        let (_gc, _) = register(&mailbox, "demo", "GreenCastle").await;
+        let (_bl, _) = register(&mailbox, "demo", "BlueLake").await;
+        insert_overdue_post(
+            &pool,
+            "post-budget",
+            Some("thread-budget"),
+            "[\"BlueLake\"]",
+            7200,
+        )
+        .await;
+
+        for i in 0..ACK_SLA_WAKE_BUDGET {
+            let emitted = mailbox
+                .check_ack_sla_expired("demo", Some(30 * 60))
+                .await
+                .expect("scan");
+            assert_eq!(emitted.len(), 1, "reminder {i} is owed: {emitted:?}");
+            // Let the reminder window lapse so the next scan is a NEW reminder.
+            sqlx::query("UPDATE ack_sla_wakes SET emitted_us = emitted_us - ?1")
+                .bind(2 * 60 * 60 * 1_000_000_i64)
+                .execute(&pool)
+                .await
+                .expect("backdate the reminder");
+        }
+
+        let emitted = mailbox
+            .check_ack_sla_expired("demo", Some(30 * 60))
+            .await
+            .expect("scan");
+        assert!(
+            emitted.is_empty(),
+            "the budget mutes the obligation: {emitted:?}"
+        );
+        // The counter is the terminal state, and it is durable.
+        let wakes: i64 =
+            sqlx::query_scalar("SELECT wakes FROM ack_sla_wakes WHERE scope_id = 'thread-budget'")
+                .fetch_one(&pool)
+                .await
+                .expect("budget counter");
+        assert_eq!(
+            wakes, ACK_SLA_WAKE_BUDGET,
+            "the budget is spent and the spend is recorded"
+        );
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// bd-4v1a: one scan cannot run forever. The doorbell kills `toron
+    /// ack-sla` at 15s, so a scan that outruns that reports nothing at all.
+    #[tokio::test]
+    async fn ack_sla_scan_deadline_stops_the_scan() {
+        let (mailbox, pool, db_path, data_dir) = test_mailbox_with_pool("wake-deadline").await;
+        mailbox.ensure_project("demo").await.expect("ensure");
+        let (_gc, _) = register(&mailbox, "demo", "GreenCastle").await;
+        let (_bl, _) = register(&mailbox, "demo", "BlueLake").await;
+        insert_overdue_post(
+            &pool,
+            "post-late",
+            Some("thread-late"),
+            "[\"BlueLake\"]",
+            7200,
+        )
+        .await;
+
+        let emitted = mailbox
+            .check_ack_sla_expired_within(
+                "demo",
+                Some(30 * 60),
+                std::time::Instant::now() - std::time::Duration::from_secs(1),
+                ACK_SLA_SCAN_MAX_EMIT,
+            )
+            .await
+            .expect("scan");
+
+        assert!(
+            emitted.is_empty(),
+            "an expired deadline stops the scan: {emitted:?}"
+        );
+        assert!(
+            published_ack_sla_wakes(&mailbox).await.is_empty(),
+            "a stopped scan publishes nothing"
+        );
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// bd-4v1a: one scan cannot flood the bus.
+    #[tokio::test]
+    async fn ack_sla_scan_publication_cap_bounds_one_scan() {
+        let (mailbox, pool, db_path, data_dir) = test_mailbox_with_pool("wake-cap").await;
+        mailbox.ensure_project("demo").await.expect("ensure");
+        let (_gc, _) = register(&mailbox, "demo", "GreenCastle").await;
+        let (_bl, _) = register(&mailbox, "demo", "BlueLake").await;
+        for i in 0..3 {
+            let thread = format!("thread-cap-{i}");
+            insert_overdue_post(
+                &pool,
+                &format!("post-cap-{i}"),
+                Some(&thread),
+                "[\"BlueLake\"]",
+                7200 + i,
+            )
+            .await;
+        }
+
+        let emitted = mailbox
+            .check_ack_sla_expired_within(
+                "demo",
+                Some(30 * 60),
+                std::time::Instant::now() + std::time::Duration::from_secs(60),
+                1,
+            )
+            .await
+            .expect("scan");
+
+        assert_eq!(
+            emitted.len(),
+            1,
+            "one scan publishes at most its cap: {emitted:?}"
+        );
+        assert_eq!(published_ack_sla_wakes(&mailbox).await.len(), 1);
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
     }
 
     // ---- corr-keyed idempotent send (ADR-0028 zfnx.12) ----
