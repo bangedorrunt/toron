@@ -123,22 +123,13 @@ pub use toron_core::kernel::may_settle;
 /// A replay that renders a different action digest must not mint a new
 /// logical effect under the same run/node: version/replay error (or
 /// explicit reconciliation) instead.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReplayMismatch {
-    pub expected: String,
-    pub got: String,
-}
-
-pub fn check_replay(prepared_digest: &str, redigest: &str) -> Result<(), ReplayMismatch> {
-    if prepared_digest == redigest {
-        Ok(())
-    } else {
-        Err(ReplayMismatch {
-            expected: prepared_digest.to_string(),
-            got: redigest.to_string(),
-        })
-    }
-}
+///
+/// bd-vt9y: the predicate lives in the journal store, because that is where
+/// the production prepare path runs it — a re-render that changed the digest
+/// for the same logical node now refuses instead of minting a second key.
+/// This is a re-export, so the guard the engine exercises is the guard that
+/// refuses.
+pub use toron_core::index::workflow_effects::{ReplayMismatch, check_replay};
 
 /// Mailbox `corr` projection for a workflow-originated effect: deliberately
 /// identical to the effect key so reconciliation can join through the
@@ -281,6 +272,76 @@ impl Default for RetentionPolicy {
 mod effect_reconciliation_tests {
     use super::*;
     use toron_core::index::workflow_effects::EffectState;
+
+    /// bd-vt9y: ADR-0032 I8a (replay identity) — once an effect reaches
+    /// `prepared`, its identity and key are fixed for that logical node. A
+    /// re-drive that re-renders the node differently must REFUSE, not mint a
+    /// second effect key: the second key made the external effect fire
+    /// twice, and the guard that should have stopped it
+    /// ([`check_replay`]) had no production caller at all.
+    ///
+    /// This drives the PRODUCTION prepare path (the journal store the MCP
+    /// host dispatches through), not the predicate in isolation.
+    #[tokio::test]
+    async fn replay_refuses_a_changed_rerender_in_the_production_prepare_path() {
+        use toron_core::index::schema;
+        use toron_core::index::workflow_effects::{NewEffect, WorkflowEffectStore};
+
+        let dir = std::env::temp_dir().join(format!("toron-replay-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let db = dir.join("wfx.sqlite");
+        let pool = schema::connect(db.to_str().unwrap())
+            .await
+            .expect("connect");
+        schema::migrate(&pool).await.expect("migrate");
+        let store = WorkflowEffectStore::new(pool);
+
+        let node = |key: &str, digest: &str| NewEffect {
+            effect_key: key.into(),
+            run_id: "run-1".into(),
+            project: Some("demo".into()),
+            workflow_digest: "wf-digest".into(),
+            node_path: "gate".into(),
+            iteration_key: None,
+            action_type: "send_message".into(),
+            action_digest: digest.into(),
+            redacted_action: None,
+            retention_until: None,
+        };
+
+        let first = store
+            .prepare_effect(node("ek-1", "digest-a"))
+            .await
+            .expect("the first prepare creates the row");
+        assert!(first.created, "the first prepare creates the row");
+
+        // The SAME render attaches: idempotent, never a second effect.
+        let again = store
+            .prepare_effect(node("ek-1", "digest-a"))
+            .await
+            .expect("the same render attaches");
+        assert!(!again.created, "the same render is idempotent");
+
+        // A CHANGED render for the same logical node must REFUSE.
+        let err = store
+            .prepare_effect(node("ek-2", "digest-b"))
+            .await
+            .expect_err("a changed re-render must refuse, not mint a second key");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("digest-a") && msg.contains("digest-b"),
+            "the refusal names both digests: {msg}"
+        );
+        assert!(
+            store.get_effect("ek-2").await.expect("read").is_none(),
+            "the refused prepare left no second row"
+        );
+        assert!(
+            store.get_effect("ek-1").await.expect("read").is_some(),
+            "the prepared row survives the refusal"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn cap(idempotent: bool, query: bool) -> ProviderCapability {
         ProviderCapability {

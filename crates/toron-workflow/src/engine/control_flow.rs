@@ -305,6 +305,7 @@ pub(crate) async fn run_steps(
             workflow,
             run_id,
             workflow_digest,
+            None,
         )
         .await?;
         // fail_run short-circuit: the failed outcome IS the run's result.
@@ -823,6 +824,7 @@ pub(crate) fn run_step<'a>(
     workflow: &'a str,
     run_id: &'a str,
     workflow_digest: &'a str,
+    iteration_key: Option<&'a str>,
 ) -> std::pin::Pin<
     Box<
         dyn std::future::Future<Output = resonate_sdk::prelude::Result<serde_json::Value>>
@@ -839,7 +841,7 @@ pub(crate) fn run_step<'a>(
         workflow,
         run_id,
         workflow_digest,
-        None,
+        iteration_key,
     )
 }
 
@@ -1549,7 +1551,13 @@ pub(crate) async fn run_foreach(
         }));
     };
     let mut collected = Vec::new();
-    for item in list {
+    // bd-vt9y: every item is its own LOGICAL node, so it carries its own
+    // iteration identity — the same shape the loop uses (`i{i}`) and the
+    // parallel fan-out uses (`p{i}`). Without it the items shared one
+    // (run, node) identity and the journal's replay guard could not tell a
+    // new item from a re-render of the node.
+    let collection_digest = crate::identity::action_digest_of(&serde_json::to_value(&list)?);
+    for (index, item) in list.iter().enumerate() {
         // Each iteration sees the current item as `{{item}}` (ADR-0007 F4):
         // inject it into the iteration's trigger copy so the template
         // renderer can resolve it.
@@ -1560,6 +1568,7 @@ pub(crate) async fn run_foreach(
         iter_trigger["item"] = item.clone();
         // Iterations resolve against the enclosing scope plus the item.
         let mut item_outputs = step_outputs.clone();
+        let iteration = crate::identity::iteration_key(&collection_digest, index);
         let value = run_step(
             ctx,
             &iter_trigger,
@@ -1568,6 +1577,7 @@ pub(crate) async fn run_foreach(
             workflow,
             run_id,
             workflow_digest,
+            Some(&iteration),
         )
         .await?;
         collected.push(value);
@@ -2954,6 +2964,7 @@ pub async fn run_graph_node(
             &input.workflow_name,
             &input.run_id,
             &input.workflow_digest,
+            None,
         )
         .await;
     }

@@ -77,8 +77,9 @@ pub fn iteration_key(parent_digest: &str, index: usize) -> String {
 /// `run_parallel` is the ONLY producer of the `p{i}` form
 /// (`engine/control_flow.rs`, the `iteration_key: Some(format!("p{i}"))` on
 /// `ParallelCopyInput`). The [`iteration_key`] fn above mints a sha256 digest
-/// for EFFECT keys and never lands in `RunContext.iteration_key`, so the two
-/// can never be confused — but that also means nothing downstream could read
+/// for EFFECT keys — the `foreach` items carry it, so a changed collection
+/// cannot reuse an old item's key — and it is not a copy ordinal, so the two
+/// can never be confused. But that also means nothing downstream could read
 /// the copy index back out. A `parallel`/`each` fan-out over a role therefore
 /// resolved every copy to the SAME agent (`resolve_pane_entry` has no
 /// ordinal), and the busy-owner fence — one in-flight dispatch per agent —
@@ -219,15 +220,19 @@ pub struct PreparedIdentity {
 /// equal the prepared digest. A mismatch is a version/replay error — the
 /// caller enters explicit reconciliation, never mints a new logical effect
 /// silently.
+///
+/// bd-vt9y: the comparison is the journal store's ONE replay predicate — the
+/// one the production prepare path runs — so this contract check and the
+/// refusal can never drift apart.
 pub fn check_replay(prepared: &PreparedIdentity, redigest: &str) -> Result<(), String> {
-    if prepared.action_digest == redigest {
-        Ok(())
-    } else {
-        Err(format!(
-            "node {:?}: re-render digest {redigest} != prepared {}; reconcile explicitly, do not mint a new effect",
-            prepared.node_path, prepared.action_digest
-        ))
-    }
+    toron_core::index::workflow_effects::check_replay(&prepared.action_digest, redigest).map_err(
+        |m| {
+            format!(
+                "node {:?}: re-render digest {redigest} != prepared {}; reconcile explicitly, do not mint a new effect",
+                prepared.node_path, m.expected
+            )
+        },
+    )
 }
 
 /// Stable effect keys derive through the engine boundary's
