@@ -3628,8 +3628,16 @@ steps:
 // green and frozen time in production.
 
 /// bd-ynef LIVE: a workflow with a real `park` step runs end to end and
-/// RESUMES. Proves the wiring: the engine injects a ParkClock, the leaf
-/// journals its intent, the wait happens, and the step completes.
+/// RESUMES. Proves the wiring: the engine injects a ParkClock, the wait
+/// happens against the host clock, and the step completes.
+///
+/// bd-oz5d: this test drives the WAIT path, so it runs with NO journal seam
+/// (Recording). The journal branch has its own test
+/// (`park_journals_through_the_async_runner_the_host_injects`) and the refusal
+/// branch has one too
+/// (`park_without_any_runner_refuses_under_enforced_journal_mode`). Before the
+/// fix this was the only live park test and it could only ever reach the
+/// bypass branch.
 #[tokio::test]
 async fn park_live_park_then_resume_through_a_real_engine() {
     // A short park: long enough to be a real wait, short enough to test.
@@ -3653,7 +3661,7 @@ steps:
     let engine = WorkflowEngine::local_with_resolvers_async_effect_mode_and_journal(
         WorkflowEngine::default_resolver(),
         WorkflowEngine::default_workflow_resolver(),
-        Some(noop_async()),
+        None,
         crate::engine::EffectJournalMode::Recording,
         None,
     )
@@ -3702,6 +3710,110 @@ steps:
     assert!(
         wait["parked"] == serde_json::json!(false) || wait["parked"] == serde_json::json!(true),
         "the park names its own parked flag explicitly: {wait}"
+    );
+}
+
+/// bd-oz5d: the park path must read the runner the host ACTUALLY injects.
+/// The production host builds its engine with `local_with_async_effect_runner`
+/// and never injects the sync runner, so a park path that read only the sync
+/// dependency could never run: every `action: park` step in toron-mcp was
+/// refused with "no EffectRunner is injected" while a runner WAS present.
+///
+/// This is the journal branch, which no test reached before: the only live
+/// park test ran in Recording mode and took the bypass.
+#[tokio::test]
+async fn park_journals_through_the_async_runner_the_host_injects() {
+    use std::sync::Mutex as StdMutex;
+    let seen: Arc<StdMutex<Vec<Action>>> = Arc::new(StdMutex::new(Vec::new()));
+    let seen_c = seen.clone();
+    let afx: AsyncEffectRunner = Arc::new(move |inv: &ActionInvocation| {
+        seen_c.lock().unwrap().push(inv.action.clone());
+        Box::pin(async move { Ok(serde_json::json!({ "ok": true, "journaled": true })) })
+            as std::pin::Pin<
+                Box<dyn std::future::Future<Output = anyhow::Result<serde_json::Value>> + Send>,
+            >
+    });
+    let engine = WorkflowEngine::local_with_resolvers_async_effect_mode_and_journal(
+        WorkflowEngine::default_resolver(),
+        WorkflowEngine::default_workflow_resolver(),
+        Some(afx),
+        crate::engine::EffectJournalMode::Enforced,
+        None,
+    )
+    .expect("engine with the host's async runner");
+    let until_ms = crate::engine::park::system_clock_ms() + 60_000;
+    let wf = parse_workflow(&format!(
+        r##"
+name: park-async-journal
+steps:
+  - name: wait
+    action: park
+    until_ms: "{until_ms}"
+    max_wait_secs: 30
+"##
+    ))
+    .expect("a park workflow parses");
+    let output = engine
+        .invoke("wf-park-async-1", wf, serde_json::json!({}))
+        .await
+        .expect("the park runs through the host's runner");
+    let actions = seen.lock().unwrap().clone();
+    assert_eq!(actions.len(), 1, "the async runner carried the park intent");
+    assert_eq!(
+        actions[0].type_name(),
+        "park",
+        "the intent the host receives is the park itself"
+    );
+    let wait = output
+        .get("wait")
+        .unwrap_or_else(|| panic!("the park step's value is missing: {output}"));
+    assert_eq!(
+        wait["journaled"],
+        serde_json::json!(true),
+        "the park is journaled through the runner: {wait}"
+    );
+    assert_eq!(
+        wait["resumed"],
+        serde_json::json!(false),
+        "the journal owns the outcome; the host resumes the run: {wait}"
+    );
+}
+
+/// bd-oz5d: the enforced branch must REFUSE loudly when there is genuinely no
+/// runner — an unjournaled park is a wait a crash can erase. This branch had
+/// no test at all: the only live park test ran in Recording mode and took the
+/// bypass, so it could never see the enforced failure.
+#[tokio::test]
+async fn park_without_any_runner_refuses_under_enforced_journal_mode() {
+    let engine = WorkflowEngine::local_with_resolvers_async_effect_mode_and_journal(
+        WorkflowEngine::default_resolver(),
+        WorkflowEngine::default_workflow_resolver(),
+        None,
+        crate::engine::EffectJournalMode::Enforced,
+        None,
+    )
+    .expect("engine");
+    let until_ms = crate::engine::park::system_clock_ms() + 60_000;
+    let wf = parse_workflow(&format!(
+        r##"
+name: park-no-runner
+steps:
+  - name: wait
+    action: park
+    until_ms: "{until_ms}"
+    max_wait_secs: 30
+"##
+    ))
+    .expect("a park workflow parses");
+    let err = engine
+        .invoke("wf-park-no-runner-1", wf, serde_json::json!({}))
+        .await
+        .expect_err("a park with no journal seam is refused under Enforced");
+    let msg = format!("{err:#}");
+    assert!(msg.contains("park REFUSED"), "the refusal is loud: {msg}");
+    assert!(
+        msg.contains("Enforced"),
+        "the refusal names the mode that demands it: {msg}"
     );
 }
 

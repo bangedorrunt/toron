@@ -683,6 +683,34 @@ fn render_park_until_ms(
         })
 }
 
+/// bd-oz5d: run the park intent through the runner the host ACTUALLY injects.
+///
+/// The production host builds its engine with `local_with_async_effect_runner`
+/// and never injects the sync runner, so a park path that read only the sync
+/// dependency could never run: every `action: park` step in toron-mcp was
+/// refused with "no EffectRunner is injected" while a runner WAS present. The
+/// async seam wins (the dispatch seam prefers it too); the sync seam stays for
+/// an embedding that injects it.
+///
+/// `None` means NO runner at all — the caller refuses that loudly.
+async fn journal_park_via_runner(
+    ctx: &Context,
+    invocation: &ActionInvocation,
+) -> Option<anyhow::Result<serde_json::Value>> {
+    // The option lives INSIDE the Arc (the dispatch_leaf_or_compat seam), so
+    // these lookups never panic on an embedding that injected no runner.
+    let async_stored: Arc<Option<AsyncEffectRunner>> =
+        ctx.get_dependency::<Option<AsyncEffectRunner>>();
+    let stored: Arc<Option<EffectRunner>> = ctx.get_dependency::<Option<EffectRunner>>();
+    if let Some(afx) = (*async_stored).clone() {
+        return Some(afx(invocation).await);
+    }
+    if let Some(fx) = (*stored).clone() {
+        return Some(fx(invocation));
+    }
+    None
+}
+
 /// bd-ynef: journal the park intent BEFORE the provider waits.
 ///
 /// Returns `Some(value)` when the journal owns the outcome: under
@@ -716,14 +744,14 @@ async fn journal_park_intent(
     // re-drive idempotent rather than a second park.
     invocation.run.effect_key = Some(intent.key.clone());
     let mode: Arc<EffectJournalMode> = ctx.get_dependency::<EffectJournalMode>();
-    // The option lives INSIDE the Arc (the dispatch_leaf_or_compat seam), so
-    // this lookup never panics on an embedding that injected no runner.
-    let stored: Arc<Option<EffectRunner>> = ctx.get_dependency::<Option<EffectRunner>>();
-    let Some(runner) = (*stored).clone() else {
+    // bd-oz5d: the runner the host injects is the ASYNC one, so the park
+    // reaches for it first; the sync seam stays for an embedding that injects
+    // it. With NO runner at all the refusal below is the honest answer.
+    let Some(result) = journal_park_via_runner(ctx, &invocation).await else {
         if *mode == EffectJournalMode::Enforced {
             return Err(resonate_sdk::error::Error::Application {
                 message:
-                    "park REFUSED — no EffectRunner is injected (EffectJournalMode::Enforced): \
+                    "park REFUSED — no journal runner is injected (EffectJournalMode::Enforced): \
                      the park intent must be journaled before the wait, or a crash mid-park \
                      erases the resume point (ADR-0032 Spec 6, bd-ynef)"
                         .to_string(),
@@ -735,7 +763,7 @@ async fn journal_park_intent(
         );
         return Ok(None);
     };
-    let value = runner(&invocation).map_err(|e| resonate_sdk::error::Error::Application {
+    let value = result.map_err(|e| resonate_sdk::error::Error::Application {
         message: format!("park: journaling the intent failed: {e} (bd-ynef)"),
     })?;
     if value.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
