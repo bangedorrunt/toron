@@ -1294,6 +1294,64 @@ steps:
     assert!(matches!(last, Some(Action::SendDm { body, .. }) if body == "no"));
 }
 
+/// bd-vt9y: every `foreach` item is its own LOGICAL node, so it carries its
+/// own iteration identity. Without it the items shared one (run, node)
+/// identity, and the journal's replay guard could not tell a new item from
+/// a re-render of the node — the guard would have refused the second item
+/// as a changed replay render.
+#[tokio::test]
+async fn foreach_items_carry_distinct_iteration_identity_for_the_replay_guard() {
+    use std::sync::Mutex as StdMutex;
+    let seen: Arc<StdMutex<Vec<Option<String>>>> = Arc::new(StdMutex::new(Vec::new()));
+    let seen_clone = seen.clone();
+    let runner: AsyncEffectRunner = Arc::new(move |inv: &ActionInvocation| {
+        seen_clone
+            .lock()
+            .unwrap()
+            .push(inv.run.iteration_key.clone());
+        Box::pin(async move { Ok(serde_json::json!({ "ran": true })) })
+            as std::pin::Pin<
+                Box<dyn std::future::Future<Output = anyhow::Result<serde_json::Value>> + Send>,
+            >
+    });
+    let engine = WorkflowEngine::local_with_async_effect_runner(Some(runner)).expect("engine");
+    let wf = parse_workflow(
+        r##"
+name: foreach-identity
+trigger:
+  type: webhook
+steps:
+  - name: iterate
+    action: foreach
+    over: '["a","b","c"]'
+    each:
+      action: send_dm
+      to: pi
+      body: "{{item}}"
+"##,
+    )
+    .expect("parse foreach workflow");
+    engine
+        .run(
+            "wf-foreach-identity-1",
+            RunInput {
+                run_id: None,
+                workflow: wf,
+                trigger: serde_json::json!({}),
+            },
+        )
+        .await
+        .expect("foreach run completes");
+    let keys = seen.lock().unwrap().clone();
+    assert_eq!(keys.len(), 3, "one leaf per item");
+    for key in &keys {
+        assert!(key.is_some(), "every item carries an iteration identity");
+    }
+    assert_ne!(keys[0], keys[1], "the items are distinct logical nodes");
+    assert_ne!(keys[1], keys[2], "the items are distinct logical nodes");
+    assert_ne!(keys[0], keys[2], "the items are distinct logical nodes");
+}
+
 /// P5.3 + ADR-0007 F4: `foreach` — iterate over a list; collect sub-run
 /// outputs. Each iteration injects the current item as `{{item}}`, so the
 /// sub-action's rendered body is the element itself (a/b/c), not a

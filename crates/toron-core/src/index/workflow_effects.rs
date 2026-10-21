@@ -48,6 +48,35 @@ pub fn now_us() -> i64 {
     crate::index::writer::Clock::now_us(&crate::index::writer::SystemClock)
 }
 
+/// A replay that re-rendered a logical node differently (ADR-0032 I8a).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplayMismatch {
+    /// The digest the node was prepared with.
+    pub expected: String,
+    /// The digest the re-render produced.
+    pub got: String,
+}
+
+/// The replay guard (ADR-0032 I8a, "a changed replay render cannot silently
+/// mint a new effect key").
+///
+/// Once an effect reaches `prepared`, its normalized action identity and
+/// effect key are fixed for that logical node: a retry or a recovery that
+/// re-renders the node differently is a version/replay error, and the
+/// caller reconciles it explicitly. This is the ONE predicate — the
+/// production prepare path calls it, and the engine's `check_replay`
+/// re-exports it, so the guard that runs is the guard that is tested.
+pub fn check_replay(prepared_digest: &str, redigest: &str) -> Result<(), ReplayMismatch> {
+    if prepared_digest == redigest {
+        Ok(())
+    } else {
+        Err(ReplayMismatch {
+            expected: prepared_digest.to_string(),
+            got: redigest.to_string(),
+        })
+    }
+}
+
 /// Per-process event distinguisher: two mutations of one key in one µs
 /// still land distinct log rows (never a silent dedup loss).
 static WFX_EVENT_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -863,6 +892,15 @@ impl WorkflowEffectStore {
     /// Prepare one logical-effect intent. Idempotent on `effect_key`: a
     /// duplicate prepare returns the existing row with `created: false` and
     /// never starts a second logical effect.
+    ///
+    /// bd-vt9y (ADR-0032 I8a): the key is FIXED for a logical node once the
+    /// node is prepared. The key is derived from the rendered action, so a
+    /// re-drive that re-renders the node differently used to mint a SECOND
+    /// key — and the external effect fired twice. The prepare path now
+    /// refuses that: the same key with a different digest, or a different
+    /// key for the same logical node, is a replay that reconciles
+    /// explicitly. The refusal rolls the transaction back, so the journal
+    /// keeps exactly one row per logical node.
     pub async fn prepare_effect(&self, effect: NewEffect) -> anyhow::Result<PrepareOutcome> {
         let now = now_us();
         let redacted = effect.redacted_action.map(|v| bound_evidence(&v));
@@ -890,6 +928,39 @@ impl WorkflowEffectStore {
         .execute(&mut *tx)
         .await?;
         let created = res.rows_affected() > 0;
+        // bd-vt9y: the same KEY with a different digest is a replay too (the
+        // pre-minted-key path), and so is a DIFFERENT key for the same
+        // logical node (the render-derived-key path — the break path this
+        // bead is about). Both refuse; the transaction rolls back, so no
+        // second row is left behind.
+        //
+        // The rows a node also OWNS but that are not the node's effect — the
+        // park placeholder and the cleanup attempts — are skipped: they have
+        // their own identity, and their digests are not the node's digest.
+        let prepared_digests: Vec<String> = sqlx::query_scalar(
+            "SELECT action_digest FROM workflow_effects \
+             WHERE run_id = ?1 AND node_path = ?2 AND COALESCE(iteration_key, '') = ?3 \
+             AND effect_key <> ?4 \
+             AND action_type <> 'park' AND action_type NOT LIKE 'cleanup:%'",
+        )
+        .bind(&effect.run_id)
+        .bind(&effect.node_path)
+        .bind(effect.iteration_key.as_deref().unwrap_or(""))
+        .bind(&effect.effect_key)
+        .fetch_all(&mut *tx)
+        .await?;
+        for prepared in &prepared_digests {
+            check_replay(prepared, &effect.action_digest).map_err(|m| {
+                anyhow::anyhow!(
+                    "replay mismatch for run {} node {}: prepared action digest {} != \
+                     re-rendered {}; reconcile explicitly, do not mint a new effect key",
+                    effect.run_id,
+                    effect.node_path,
+                    m.expected,
+                    m.got
+                )
+            })?;
+        }
         let row = sqlx::query(
             "SELECT effect_key, run_id, project, workflow_digest, node_path, iteration_key, \
                     action_type, action_digest, redacted_action, state, attempt, attempt_id, \
@@ -902,6 +973,22 @@ impl WorkflowEffectStore {
         .await?
         .ok_or_else(|| anyhow::anyhow!("effect vanished after prepare"))?;
         let row = self.map_effect(&row)?;
+        // The same KEY with a different digest is a replay too: the node's
+        // prepared identity is fixed, so the stored digest is the truth and a
+        // changed render reconciles explicitly. A prepare that declares NO
+        // digest (the cleanup path renders no action) is not compared.
+        if !effect.action_digest.is_empty() {
+            check_replay(&row.action_digest, &effect.action_digest).map_err(|m| {
+                anyhow::anyhow!(
+                    "replay mismatch for run {} node {}: prepared action digest {} != \
+                     re-rendered {}; reconcile explicitly, do not mint a new effect key",
+                    effect.run_id,
+                    effect.node_path,
+                    m.expected,
+                    m.got
+                )
+            })?;
+        }
         let payload = serde_json::to_value(&row)?;
         log_wfx_event_in_tx(
             &mut tx,
