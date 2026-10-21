@@ -1123,8 +1123,19 @@ impl WorkflowEffectStore {
     /// of rows). A per-table index if this ever serves a hot path.
     pub async fn fold_projected(&self) -> anyhow::Result<WfxFold> {
         let log = crate::index::event_log::EventLog::new(self.pool.clone());
+        Ok(Self::fold_wfx_events(
+            &log.read_kinds(&["wfx.row", "wfx.tombstone"]).await?,
+        ))
+    }
+
+    /// The projection fold over a SET of events (pure): last-write-wins per
+    /// (table, key), tombstones applied.
+    ///
+    /// bd-uc8m: the fold is split out of the reader so the single-row hot
+    /// path can fold ONE key's events instead of the whole log.
+    fn fold_wfx_events(events: &[crate::index::event_log::StoredEvent]) -> WfxFold {
         let mut fold = WfxFold::default();
-        for event in log.read_since(0).await? {
+        for event in events {
             if event.kind != "wfx.row" && event.kind != "wfx.tombstone" {
                 continue;
             }
@@ -1163,7 +1174,7 @@ impl WorkflowEffectStore {
         // effect is absent from the fold (matches prune semantics exactly).
         fold.attempts
             .retain(|_, (a, _)| fold.effects.contains_key(&a.effect_key));
-        Ok(fold)
+        fold
     }
 
     /// Table-only row restores (rebuild path: no events, no policy).
@@ -1345,13 +1356,16 @@ impl WorkflowEffectStore {
     }
     /// Load one effect by key — served from the event projection
     /// (wave-4 reader switch). The table stays dual-written as the tripwire.
+    ///
+    /// bd-uc8m: this is on the dispatch hot path (`claim_attempt`,
+    /// `settle_with_fence`), and it used to fold the WHOLE event log for one
+    /// row — a scan that grows with the system's lifetime, on a table that is
+    /// never pruned. The scoped read is served by the `events_wfx_key`
+    /// expression index (migration 0029).
     pub async fn get_effect(&self, effect_key: &str) -> anyhow::Result<Option<WorkflowEffect>> {
-        Ok(self
-            .fold_projected()
-            .await?
-            .effects
-            .remove(effect_key)
-            .map(|(row, _)| row))
+        let log = crate::index::event_log::EventLog::new(self.pool.clone());
+        let mut fold = Self::fold_wfx_events(&log.read_for_wfx_key(effect_key).await?);
+        Ok(fold.effects.remove(effect_key).map(|(row, _)| row))
     }
 
     fn map_run(&self, r: &sqlx::sqlite::SqliteRow) -> anyhow::Result<WorkflowRun> {

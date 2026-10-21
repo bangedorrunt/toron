@@ -474,9 +474,19 @@ impl ReceiptStore {
     /// rows). Per-corr index if this ever serves a hot path.
     async fn fold_projected(&self) -> anyhow::Result<BTreeMap<String, Receipt>> {
         let log = crate::index::event_log::EventLog::new(self.pool.clone());
-        let events = log.read_since(0).await?;
+        // bd-uc8m: only the receipts' own events, not the whole log.
+        let events = log
+            .read_kinds(&["receipt.stamped", "receipt.pruned"])
+            .await?;
+        Ok(Self::receipts_from_events(&events))
+    }
+
+    /// The receipt rows a set of events describes (last-write-wins per corr).
+    fn receipts_from_events(
+        events: &[crate::index::event_log::StoredEvent],
+    ) -> BTreeMap<String, Receipt> {
         let mut out = BTreeMap::new();
-        for (corr, slot) in Self::fold_events(&events) {
+        for (corr, slot) in Self::fold_events(events) {
             let Some(ev) = slot else { continue };
             let Ok(state) = ReceiptState::parse(&ev.state) else {
                 continue;
@@ -500,13 +510,19 @@ impl ReceiptStore {
                 },
             );
         }
-        Ok(out)
+        out
     }
 
     /// Get one receipt by corr — served from the event projection (wave-4
     /// reader switch). The table stays dual-written as the tripwire.
+    ///
+    /// bd-uc8m: this used to fold the WHOLE log for one receipt. The
+    /// corr-scoped read is served by the `events_corr` expression index
+    /// (migration 0014).
     pub async fn get(&self, corr: &str) -> anyhow::Result<Option<Receipt>> {
-        Ok(self.fold_projected().await?.remove(corr))
+        let log = crate::index::event_log::EventLog::new(self.pool.clone());
+        let events = log.read_for_corr(corr).await?;
+        Ok(Self::receipts_from_events(&events).remove(corr))
     }
 
     /// List receipts, optionally filtered by state — from the projection.

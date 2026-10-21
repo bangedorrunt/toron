@@ -55,10 +55,6 @@ pub struct Globals {
     #[arg(short = 'n', long, global = true)]
     pub dry_run: bool,
 
-    /// Never prompt; fail with instruction if input is needed.
-    #[arg(long, global = true)]
-    pub no_input: bool,
-
     /// Override config file.
     #[arg(long, global = true)]
     pub config: Option<PathBuf>,
