@@ -143,7 +143,7 @@ The v3 design documents are target designs and explicitly say code remains canon
 - **I6 — Mailbox receipts stay mailbox receipts:** `owed → acked → resulted` describes message lifecycle only; it is linkable to, but cannot replace, workflow-effect state.
 - **I7 — Settlement is not business completion:** a successful action result, a terminal workflow event, and external business completion are separate claims.
 - **I8 — One retry coordinator:** retries, backoff, deadlines, and effect-safety checks are selected by one engine/host policy path. `ActionRunner` never retries on its own.
-- **I8a — Replay identity:** once an effect reaches `prepared`, its normalized action identity and effect key are fixed for that logical node; retry/recovery cannot re-render a different logical effect under the same run/node.
+- **I8a — Replay identity:** once an effect reaches `prepared`, its normalized action identity and effect key are fixed for that logical node; retry/recovery cannot re-render a different logical effect under the same run/node. **Implemented**: the journal store's prepare path refuses a changed re-render for the same logical node — ONE replay predicate, owned by the store and re-exported by the engine — and the prepare transaction rolls back, so the journal keeps exactly one row per logical node.
 - **I9 — Guard parity:** top-level, graph, branch, retry-nested, foreach-nested, and called-workflow steps use the same guard/ref resolver.
 - **I10 — No implicit fallback:** unresolved templates, non-list foreach input, invalid parallel counts, missing output, missing sink, and graph stalls are errors, never `0`, `[]`, `1`, else-branch, or `Ok(Null)`.
 - **I11 — Park lifecycle:** every parked promise has a structured pending record, a published pending event, a validated resolution path, and a terminal/reconciliation path.
@@ -756,7 +756,7 @@ The following cases are mandatory. The expected result is deliberately conservat
 
 - `settled` and `failed` effect rows do not trigger duplicate dispatch after replay;
 - an expired/stale claim cannot overwrite a newer attempt;
-- a changed replay render cannot silently mint a new effect key;
+- a changed replay render cannot silently mint a new effect key (enforced: the journal store's prepare path refuses a changed digest for the same logical node and rolls the prepare back, so no second row is left behind);
 - terminal row CAS and repeated kind-46012 publication produce one semantic terminal;
 - retention/compaction bounds prevent effect, pending, and run evidence from growing without limit.
 
