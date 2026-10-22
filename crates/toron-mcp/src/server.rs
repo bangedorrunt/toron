@@ -299,7 +299,21 @@ async fn start_wake_sidecar(mailbox: &Mailbox) -> Option<toron_core::bus::wake::
         _ => toron_core::config::state_dir().join("wake.sock"),
     };
     let server = WakeServer::new(
-        WakeConfig::new(&sock),
+        {
+            let mut config = WakeConfig::new(&sock);
+            // bd-j2vo: the concurrent-subscriber cap is the daemon's fd
+            // budget guard. An operator whose fleet needs more subscribers
+            // raises it here; the default keeps the wake plane well under
+            // launchd's default soft fd limit.
+            if let Some(cap) = std::env::var("TORON_WAKE_MAX_SUBSCRIBERS")
+                .ok()
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                && cap > 0
+            {
+                config.max_subscribers = cap;
+            }
+            config
+        },
         mailbox.bus().clone(),
         Arc::new(SystemClock),
     );
