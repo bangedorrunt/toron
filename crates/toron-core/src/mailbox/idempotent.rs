@@ -11,10 +11,18 @@
 //! publish and the receipt upsert — or an executor-level retry of Publish —
 //! returns the existing event id instead of emitting a second rumor.
 //!
-//! Residual risk (documented, accepted in the bead): a crash between the
-//! claim insert and the publish leaves a claim row for a rumor that never
-//! hit the bus; retries within the TTL suppress instead of resending. The
-//! TTL (24h) bounds the suppression; a resend with a fresh corr recovers.
+//! bd-ff23: the claim row IS the durable command. It carries the rumor's
+//! `created_at` (part of the event id, so a retry rebuilds the SAME event)
+//! and whether the publish COMPLETED (`published`). A claim whose publish
+//! never finished is re-published on the next retry — the mail is not lost —
+//! and a claim whose publish finished replays its deliveries without
+//! publishing again. The rumor's id is the command's identity: the key IS
+//! the event id.
+//!
+//! Rows written before this change carry no `rumor_created_at`; the retry
+//! cannot rebuild their event, so they keep the old suppress behaviour
+//! (bounded by the TTL).
+//!
 //! Demo mode (no index pool) skips dedupe entirely.
 
 use sha2::Digest;
@@ -51,6 +59,14 @@ pub enum SendClaim {
         event_id: String,
         /// JSON array of `[recipient, event_id]` pairs.
         deliveries_json: String,
+        /// The prior attempt's publish completed. `false` means the crash
+        /// happened between the claim and the publish: the mail never left,
+        /// so the caller re-publishes it (bd-ff23).
+        published: bool,
+        /// The rumor's `created_at` (unix seconds) of the prior attempt.
+        /// `None` on a row written before bd-ff23 — the caller cannot
+        /// rebuild that event, so it keeps the old suppress behaviour.
+        rumor_created_at: Option<i64>,
     },
 }
 
@@ -74,6 +90,10 @@ impl IdempotentSendStore {
     /// Atomic convergence: INSERT OR IGNORE decides the winner; losers read
     /// the winner's row. An expired row is refreshed in place and treated
     /// as new.
+    ///
+    /// `rumor_created_at` is the rumor's `created_at` (unix seconds): it is
+    /// part of the event id, so a retry that re-publishes an unfinished
+    /// claim rebuilds the SAME event (bd-ff23).
     #[allow(clippy::too_many_arguments)]
     pub async fn claim_or_duplicate(
         &self,
@@ -83,6 +103,7 @@ impl IdempotentSendStore {
         sender: &str,
         corr: &str,
         deliveries_json: &str,
+        rumor_created_at: i64,
         now_ms: i64,
     ) -> anyhow::Result<SendClaim> {
         if key.trim().is_empty() {
@@ -90,8 +111,9 @@ impl IdempotentSendStore {
         }
         let inserted = sqlx::query(
             "INSERT INTO idempotent_sends \
-             (send_key, event_id, project_slug, sender_name, corr, recipients_json, created_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+             (send_key, event_id, project_slug, sender_name, corr, recipients_json, created_at, \
+              rumor_created_at, published) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0) \
              ON CONFLICT(send_key) DO NOTHING",
         )
         .bind(key)
@@ -101,30 +123,33 @@ impl IdempotentSendStore {
         .bind(corr)
         .bind(deliveries_json)
         .bind(now_ms)
+        .bind(rumor_created_at)
         .execute(&self.pool)
         .await?;
         if inserted.rows_affected() == 1 {
             return Ok(SendClaim::New);
         }
-        let row: Option<(String, String, i64)> = sqlx::query_as(
-            "SELECT event_id, recipients_json, created_at FROM idempotent_sends \
-             WHERE send_key = ?1",
+        let row: Option<(String, String, i64, i64, Option<i64>)> = sqlx::query_as(
+            "SELECT event_id, recipients_json, created_at, published, rumor_created_at \
+             FROM idempotent_sends WHERE send_key = ?1",
         )
         .bind(key)
         .fetch_optional(&self.pool)
         .await?;
         match row {
-            Some((stored_id, stored_deliveries, created_at)) => {
+            Some((stored_id, stored_deliveries, created_at, published, rumor_ts)) => {
                 if now_ms - created_at > IDEMPOTENT_SEND_TTL_MS {
                     sqlx::query(
                         "UPDATE idempotent_sends \
-                         SET event_id = ?2, recipients_json = ?3, created_at = ?4 \
+                         SET event_id = ?2, recipients_json = ?3, created_at = ?4, \
+                             rumor_created_at = ?5, published = 0 \
                          WHERE send_key = ?1",
                     )
                     .bind(key)
                     .bind(event_id)
                     .bind(deliveries_json)
                     .bind(now_ms)
+                    .bind(rumor_created_at)
                     .execute(&self.pool)
                     .await?;
                     Ok(SendClaim::New)
@@ -132,12 +157,38 @@ impl IdempotentSendStore {
                     Ok(SendClaim::Duplicate {
                         event_id: stored_id,
                         deliveries_json: stored_deliveries,
+                        published: published != 0,
+                        rumor_created_at: rumor_ts,
                     })
                 }
             }
             // Lost race against a concurrent delete (prune): reclaim.
             None => Ok(SendClaim::New),
         }
+    }
+
+    /// The publish completed: the command is SETTLED. `event_id` and
+    /// `deliveries_json` are re-stated because a re-published claim may
+    /// carry a rebuilt event (the recipients changed between attempts).
+    /// Best-effort: a failure here leaves the claim unpublished, and the
+    /// next retry re-publishes the SAME event — never a second event.
+    pub async fn mark_published(
+        &self,
+        key: &str,
+        event_id: &str,
+        deliveries_json: &str,
+    ) -> anyhow::Result<()> {
+        sqlx::query(
+            "UPDATE idempotent_sends \
+             SET published = 1, event_id = ?2, recipients_json = ?3 \
+             WHERE send_key = ?1",
+        )
+        .bind(key)
+        .bind(event_id)
+        .bind(deliveries_json)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     /// Delete claims older than the TTL. Best-effort bounded retention —
@@ -207,17 +258,70 @@ mod tests {
         let now = 1_700_000_000_000_000;
         let key = send_key("demo", "GreenCastle", "C-1", "s", "b");
         let first = store
-            .claim_or_duplicate(&key, "ev-1", "demo", "GreenCastle", "C-1", "[]", now)
+            .claim_or_duplicate(
+                &key,
+                "ev-1",
+                "demo",
+                "GreenCastle",
+                "C-1",
+                "[]",
+                1_700_000_000,
+                now,
+            )
             .await
             .expect("claim");
         assert_eq!(first, SendClaim::New);
         let second = store
-            .claim_or_duplicate(&key, "ev-2", "demo", "GreenCastle", "C-1", "[]", now + 1)
+            .claim_or_duplicate(
+                &key,
+                "ev-2",
+                "demo",
+                "GreenCastle",
+                "C-1",
+                "[]",
+                1_700_000_001,
+                now + 1,
+            )
             .await
             .expect("reclaim");
         match second {
-            SendClaim::Duplicate { event_id, .. } => assert_eq!(event_id, "ev-1"),
+            SendClaim::Duplicate {
+                event_id,
+                published,
+                rumor_created_at,
+                ..
+            } => {
+                assert_eq!(event_id, "ev-1");
+                assert!(!published, "a claim whose publish never finished");
+                assert_eq!(
+                    rumor_created_at,
+                    Some(1_700_000_000),
+                    "the rumor's timestamp rides the claim: a retry rebuilds the same event"
+                );
+            }
             SendClaim::New => panic!("second claim must be a duplicate"),
+        }
+        // The publish completes → the claim is settled.
+        store
+            .mark_published(&key, "ev-1", "[]")
+            .await
+            .expect("mark published");
+        let third = store
+            .claim_or_duplicate(
+                &key,
+                "ev-3",
+                "demo",
+                "GreenCastle",
+                "C-1",
+                "[]",
+                1_700_000_002,
+                now + 2,
+            )
+            .await
+            .expect("reclaim");
+        match third {
+            SendClaim::Duplicate { published, .. } => assert!(published, "settled claim"),
+            SendClaim::New => panic!("third claim must be a duplicate"),
         }
         let _ = std::fs::remove_file(&path);
     }

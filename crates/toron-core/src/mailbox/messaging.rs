@@ -406,12 +406,10 @@ impl Mailbox {
                 .await?
         };
 
-        let mut visible = build_visible_rumor(&sender_keys.public_key(), &args, &resolved);
-        // Canonical id = the RUMOR id (G7 / D1), the SAME id the projection
-        // shows in inbox/search rows — never the transport-internal wrap id.
-        // Send → inbox → ack/summarize round-trips must work on one id world
-        // (ADR-0007 D8.2 per-backend usability).
-        let visible_id = visible.id().to_hex();
+        // ONE timestamp for the whole send (bd-ff23): the rumor's
+        // `created_at` is part of the event id, so a retry that re-publishes
+        // an unfinished claim must reuse it to land the SAME event id.
+        let rumor_ts = Timestamp::now().as_secs();
 
         // Build every rumor up front (visible for to/cc, one variant per
         // bcc) so the idempotent-send claim below records the complete
@@ -419,23 +417,23 @@ impl Mailbox {
         // precomputed once per owned rumor (bd-kkid): `id()` takes `&mut`
         // (internal cache), so computing it here — where the rumor is
         // already owned — saves one full event clone per recipient later.
-        let mut pending: Vec<(ResolvedRecipient, UnsignedEvent, String)> = Vec::new();
-        for r in resolved.iter().filter(|r| r.role != RecipientRole::Bcc) {
-            let mut rumor = visible.clone();
-            let id_hex = rumor.id().to_hex();
-            pending.push((r.clone(), rumor, id_hex));
-        }
-        for r in resolved.iter().filter(|r| r.role == RecipientRole::Bcc) {
-            let mut variant = build_bcc_rumor(&sender_keys.public_key(), &args, &resolved, r);
-            let id_hex = variant.id().to_hex();
-            pending.push((r.clone(), variant, id_hex));
-        }
+        let (mut pending, mut visible_id) =
+            build_pending_rumors(&sender_keys, &args, &resolved, rumor_ts);
 
         // ADR-0028 zfnx.12: corr-keyed idempotent send. Same
         // (project, sender, corr) within TTL returns the existing event id
         // instead of emitting. Claim BEFORE publish: a crash between
         // publish and receipt-upsert (or a Publish retry) converges on the
         // first rumor. No corr, or no index pool (demo mode): send as usual.
+        //
+        // bd-ff23: the claim row is the durable command — it carries the
+        // rumor's timestamp and whether the publish COMPLETED. A claim whose
+        // publish never finished is re-published below (the same event id,
+        // rebuilt from the stored timestamp): the mail is not lost. A claim
+        // whose publish finished replays its deliveries and publishes
+        // nothing.
+        let mut replay: Option<Vec<Delivery>> = None;
+        let mut claim: Option<(String, String)> = None;
         if let Some(corr) = parsed_tags.corr.clone() {
             use crate::mailbox::idempotent::{SendClaim, send_key};
             if let Ok(store) = self.idempotent_store() {
@@ -454,6 +452,7 @@ impl Mailbox {
                     &args.subject,
                     &args.body_md,
                 );
+                claim = Some((key.clone(), intended_json.clone()));
                 match store
                     .claim_or_duplicate(
                         &key,
@@ -462,6 +461,7 @@ impl Mailbox {
                         &args.sender_name,
                         corr.as_str(),
                         &intended_json,
+                        rumor_ts as i64,
                         now_ms,
                     )
                     .await
@@ -469,27 +469,49 @@ impl Mailbox {
                     Ok(SendClaim::Duplicate {
                         event_id: _,
                         deliveries_json,
+                        published,
+                        rumor_created_at,
                     }) => {
-                        // Retry/crash-resume: replay the FIRST send's
-                        // deliveries, publish nothing, ring nothing.
-                        let stored: Vec<(String, String)> =
-                            serde_json::from_str(&deliveries_json).unwrap_or_default();
-                        let deliveries = stored
-                            .into_iter()
-                            .map(|(recipient, event_id)| Delivery {
-                                project: args.project_slug.clone(),
-                                payload: DeliveryPayload {
-                                    recipient,
-                                    event_id,
-                                },
-                            })
-                            .collect::<Vec<_>>();
-                        let count = deliveries.len();
-                        return Ok(SendResult {
-                            count,
-                            deliveries,
-                            verified_sender: true,
-                        });
+                        match rumor_created_at {
+                            // The prior attempt never completed the publish:
+                            // rebuild the SAME event from the stored
+                            // timestamp and send it now. The mail is not
+                            // lost, and the recipient still sees one message
+                            // (the event id is the same, and the projection
+                            // dedupes on it).
+                            Some(ts) if !published => {
+                                let (rebuilt, rebuilt_visible) =
+                                    build_pending_rumors(&sender_keys, &args, &resolved, ts as u64);
+                                pending = rebuilt;
+                                visible_id = rebuilt_visible;
+                                claim = Some((key.clone(), {
+                                    let intended: Vec<(String, String)> = pending
+                                        .iter()
+                                        .map(|(r, _, id_hex)| (r.name.clone(), id_hex.clone()))
+                                        .collect();
+                                    serde_json::to_string(&intended).unwrap_or_else(|_| "[]".into())
+                                }));
+                            }
+                            // Published, or a claim written before bd-ff23
+                            // (no stored timestamp, so the event cannot be
+                            // rebuilt): replay the FIRST send's deliveries,
+                            // publish nothing, ring nothing.
+                            _ => {
+                                let stored: Vec<(String, String)> =
+                                    serde_json::from_str(&deliveries_json).unwrap_or_default();
+                                let deliveries = stored
+                                    .into_iter()
+                                    .map(|(recipient, event_id)| Delivery {
+                                        project: args.project_slug.clone(),
+                                        payload: DeliveryPayload {
+                                            recipient,
+                                            event_id,
+                                        },
+                                    })
+                                    .collect::<Vec<_>>();
+                                replay = Some(deliveries);
+                            }
+                        }
                     }
                     Ok(SendClaim::New) => {
                         // Opportunistic bounded retention (best-effort,
@@ -510,6 +532,16 @@ impl Mailbox {
             }
         }
 
+        if let Some(deliveries) = replay {
+            let count = deliveries.len();
+            return Ok(SendResult {
+                count,
+                deliveries,
+                verified_sender: true,
+            });
+        }
+
+        let pending_len = pending.len();
         let mut deliveries: Vec<Delivery> = Vec::new();
 
         // to+cc+bcc: one gift wrap per recipient from the prebuilt rumors.
@@ -556,6 +588,20 @@ impl Mailbox {
                     );
                 }
             }
+        }
+
+        // bd-ff23: the publish completed → the durable command is SETTLED.
+        // A claim left unpublished (a crash, or a partial publish) is
+        // re-published on the next retry — the same event id, so the
+        // recipient still sees one message.
+        if deliveries.len() == pending_len
+            && let Some((key, intended_json)) = claim.as_ref()
+            && let Ok(store) = self.idempotent_store()
+            && let Err(e) = store.mark_published(key, &visible_id, intended_json).await
+        {
+            eprintln!(
+                "toron: send claim not marked published (a retry re-publishes the same event): {e}"
+            );
         }
 
         // ADR-0010 D8.2: the message enqueued (≥1 confirmed delivery) but the
@@ -1964,10 +2010,43 @@ impl Mailbox {
 /// Tag construction is infallible for toron-controlled inputs; any failure
 /// here is a programming error surfaced via `expect` on a known-static tag
 /// shape (kept narrow — only the recipient `p` tag, which is npub-derived).
+/// Build every rumor for one send: the visible rumor (to/cc) plus one
+/// variant per bcc, each with its own event id.
+///
+/// `created_at` is the rumor's timestamp (unix seconds) — part of the event
+/// id, so a retry that re-publishes an unfinished claim rebuilds the SAME
+/// event id from the stored timestamp (bd-ff23). One send, one timestamp.
+fn build_pending_rumors(
+    sender_keys: &Keys,
+    args: &SendMessage,
+    resolved: &[ResolvedRecipient],
+    created_at: u64,
+) -> (Vec<(ResolvedRecipient, UnsignedEvent, String)>, String) {
+    let mut visible = build_visible_rumor(&sender_keys.public_key(), args, resolved, created_at);
+    // Canonical id = the RUMOR id (G7 / D1), the SAME id the projection
+    // shows in inbox/search rows — never the transport-internal wrap id.
+    // Send → inbox → ack/summarize round-trips must work on one id world
+    // (ADR-0007 D8.2 per-backend usability).
+    let visible_id = visible.id().to_hex();
+    let mut pending: Vec<(ResolvedRecipient, UnsignedEvent, String)> = Vec::new();
+    for r in resolved.iter().filter(|r| r.role != RecipientRole::Bcc) {
+        let mut rumor = visible.clone();
+        let id_hex = rumor.id().to_hex();
+        pending.push((r.clone(), rumor, id_hex));
+    }
+    for r in resolved.iter().filter(|r| r.role == RecipientRole::Bcc) {
+        let mut variant = build_bcc_rumor(&sender_keys.public_key(), args, resolved, r, created_at);
+        let id_hex = variant.id().to_hex();
+        pending.push((r.clone(), variant, id_hex));
+    }
+    (pending, visible_id)
+}
+
 fn build_visible_rumor(
     author: &PublicKey,
     args: &SendMessage,
     resolved: &[ResolvedRecipient],
+    created_at: u64,
 ) -> UnsignedEvent {
     let mut tags: Vec<Tag> = Vec::new();
     for r in resolved.iter().filter(|r| r.role != RecipientRole::Bcc) {
@@ -1982,7 +2061,7 @@ fn build_visible_rumor(
     add_message_tags(&mut tags, args);
     gift_wrap::build_rumor(
         *author,
-        Timestamp::now(),
+        Timestamp::from_secs(created_at),
         crate::nostr::Kind::PrivateDirectMessage,
         tags,
         args.body_md.clone(),
@@ -1995,6 +2074,7 @@ fn build_bcc_rumor(
     args: &SendMessage,
     resolved: &[ResolvedRecipient],
     bcc: &ResolvedRecipient,
+    created_at: u64,
 ) -> UnsignedEvent {
     let mut tags: Vec<Tag> = Vec::new();
     // to + cc, plus the single bcc — role "bcc" on its own p tag.
@@ -2011,7 +2091,7 @@ fn build_bcc_rumor(
     add_message_tags(&mut tags, args);
     gift_wrap::build_rumor(
         *author,
-        Timestamp::now(),
+        Timestamp::from_secs(created_at),
         crate::nostr::Kind::PrivateDirectMessage,
         tags,
         args.body_md.clone(),
@@ -4838,6 +4918,75 @@ mod tests {
             wraps_to(&mailbox, &rnpub, 10).await.len(),
             1,
             "no second rumor on retry"
+        );
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// bd-ff23: the send is a durable command keyed by its event id. A crash
+    /// between the claim and the publish must NOT lose the mail: the claim
+    /// row carries the rumor's timestamp (so the retry rebuilds the SAME
+    /// event id) and whether the publish completed. An unpublished claim is
+    /// re-published; a published one is replayed without publishing again.
+    #[tokio::test]
+    async fn idempotent_send_retry_after_crash_before_publish_still_sends() {
+        let (mailbox, _pool, db_path, data_dir) = test_mailbox_with_pool("idem-crash").await;
+        let (_s, _) = register(&mailbox, "demo", "GreenCastle").await;
+        let (_r, rnpub) = register(&mailbox, "demo", "BlueLake").await;
+        // The crash: the claim exists (the send claimed the key) but the
+        // publish never happened. Seed the claim the way the send does.
+        let store = mailbox.idempotent_store().expect("store");
+        let key = crate::mailbox::idempotent::send_key(
+            "demo",
+            "GreenCastle",
+            "C-CRASH",
+            "question",
+            "do the thing",
+        );
+        let now_ms = crate::index::writer::Clock::now_us(&crate::index::writer::SystemClock) / 1000;
+        let claim = store
+            .claim_or_duplicate(
+                &key,
+                "seeded-id",
+                "demo",
+                "GreenCastle",
+                "C-CRASH",
+                "[]",
+                1_700_000_000,
+                now_ms,
+            )
+            .await
+            .expect("claim");
+        assert_eq!(claim, crate::mailbox::idempotent::SendClaim::New);
+
+        // The retry must publish, not suppress.
+        let retry = mailbox
+            .send_message(&idempotent_send_args("C-CRASH"))
+            .await
+            .expect("retry");
+        assert_eq!(
+            retry.count, 1,
+            "a crash before the publish must not lose the mail"
+        );
+        assert_eq!(
+            wraps_to(&mailbox, &rnpub, 10).await.len(),
+            1,
+            "one rumor after the retry"
+        );
+
+        // The next retry converges on the same event and publishes nothing.
+        let again = mailbox
+            .send_message(&idempotent_send_args("C-CRASH"))
+            .await
+            .expect("retry 2");
+        assert_eq!(
+            again.deliveries[0].payload.event_id, retry.deliveries[0].payload.event_id,
+            "the retry converges on one event id"
+        );
+        assert_eq!(
+            wraps_to(&mailbox, &rnpub, 10).await.len(),
+            1,
+            "no second rumor"
         );
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_dir_all(&data_dir);
