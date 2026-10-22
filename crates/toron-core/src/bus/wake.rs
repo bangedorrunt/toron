@@ -38,7 +38,7 @@ pub const WAKE_HANDSHAKE_TIMEOUT_MS: u64 = 5_000;
 /// daemon's write blocked forever and its fd held for the life of the daemon:
 /// one stalled peer became a daemon-wide EMFILE outage. A write that cannot
 /// finish is a failure, and a failure is the signal that releases the fd.
-pub const WAKE_WRITE_TIMEOUT_MS: u64 = 5_000;
+pub const WAKE_WRITE_TIMEOUT_MS: u64 = 60_000;
 
 /// Default heartbeat cadence on a quiet bus (quiet-vs-deaf distinction).
 pub const WAKE_HEARTBEAT_MS: u64 = 15_000;
@@ -739,11 +739,13 @@ async fn write_matching_event(
     let line = WakeFrame::Event(payload).encode_line()?;
     // bd-ojw3: bounded like every other frame write - an unbounded write to a
     // peer that stopped reading held its fd for the life of the daemon.
-    let _ = write_timeout_ms;
-    writer
-        .write_all(line.as_bytes())
-        .await
-        .map_err(|e| WakeError::Transport(e.to_string()))?;
+    tokio::time::timeout(
+        std::time::Duration::from_millis(write_timeout_ms),
+        writer.write_all(line.as_bytes()),
+    )
+    .await
+    .map_err(|_| WakeError::Transport(format!("write timed out after {write_timeout_ms}ms")))?
+    .map_err(|e| WakeError::Transport(e.to_string()))?;
     *cursor = event_cursor;
     Ok(true)
 }
@@ -803,11 +805,13 @@ async fn write_frame_within(
     timeout_ms: u64,
 ) -> Result<(), WakeError> {
     let line = frame.encode_line()?;
-    let _ = timeout_ms;
-    writer
-        .write_all(line.as_bytes())
-        .await
-        .map_err(|e| WakeError::Transport(e.to_string()))
+    tokio::time::timeout(
+        std::time::Duration::from_millis(timeout_ms),
+        writer.write_all(line.as_bytes()),
+    )
+    .await
+    .map_err(|_| WakeError::Transport(format!("write timed out after {timeout_ms}ms")))?
+    .map_err(|e| WakeError::Transport(e.to_string()))
 }
 
 /// Write every stored arrival after `*after` that matches `filter`, paging
@@ -869,7 +873,6 @@ async fn serve_arrivals(
     clock: &dyn WakeClock,
     bus: &dyn Bus,
     mut stats: SubscriberStats,
-    mut eof: tokio::sync::oneshot::Receiver<()>,
 ) -> SubscriberStats {
     use tokio::sync::broadcast::error::{RecvError, TryRecvError};
     let (mut after, check_eviction, floor) = match resume {
@@ -946,14 +949,7 @@ async fn serve_arrivals(
     let mut heartbeat_at = clock.now_ms().saturating_add(config.heartbeat_ms);
     loop {
         let wait = std::time::Duration::from_millis(config.heartbeat_ms);
-        // bd-ojw3: the peer's EOF ends the subscriber NOW - its fd goes back
-        // instead of being held until a write happens to fail.
-        let received = tokio::select! {
-            biased;
-            _ = &mut eof => return stats,
-            r = tokio::time::timeout(wait, rx.recv()) => r,
-        };
-        match received {
+        match tokio::time::timeout(wait, rx.recv()).await {
             Ok(Ok(_) | Err(RecvError::Lagged(_))) => {
                 // Coalesce queued rings: one drain covers all of them, and a
                 // lagged doorbell loses nothing because the store is the
@@ -1043,23 +1039,6 @@ async fn serve_subscriber(
     let Ok(req) = WakeSubscribe::parse_line(&line) else {
         return stats;
     };
-    // bd-ojw3: watch the READ half for the peer's EOF.
-    //
-    // The daemon dropped this half after the handshake, so a subscriber that
-    // went away was only noticed when a WRITE failed - and a peer that closes
-    // without reading never fails a write, so its fd was held for the life of
-    // the daemon. Measured on the live daemon: 78 held connections, and it
-    // died of EMFILE at launchd's 256 fd cap, which stopped it accepting
-    // connections at all.
-    //
-    // The WRITE stays unbounded on purpose: a slow-but-alive reader must
-    // still receive its whole burst, with no shed and no loss. EOF is the
-    // signal that the peer is gone; a timeout would kill a healthy reader.
-    let (eof_tx, mut eof_rx) = tokio::sync::oneshot::channel();
-    tokio::spawn(async move {
-        while let Ok(Some(_)) = lines.next_line().await {}
-        let _ = eof_tx.send(());
-    });
     let filter = req.filter();
     let resume = match req.since_cursor.as_deref() {
         Some(value) => match Resume::parse(value) {
@@ -1087,7 +1066,6 @@ async fn serve_subscriber(
             clock.as_ref(),
             bus.as_ref(),
             stats,
-            eof_rx,
         )
         .await;
     }
@@ -1142,13 +1120,7 @@ async fn serve_subscriber(
     let mut heartbeat_at = clock.now_ms().saturating_add(config.heartbeat_ms);
     loop {
         let wait = config.heartbeat_ms;
-        // bd-ojw3: the peer's EOF ends the subscriber NOW.
-        let received = tokio::select! {
-            biased;
-            _ = &mut eof_rx => return stats,
-            r = tokio::time::timeout(std::time::Duration::from_millis(wait), rx.recv()) => r,
-        };
-        match received {
+        match tokio::time::timeout(std::time::Duration::from_millis(wait), rx.recv()).await {
             Ok(Ok(line)) => {
                 let Ok(WakeFrame::Event(payload)) = WakeFrame::decode_line(&line) else {
                     continue;
@@ -1248,35 +1220,126 @@ mod wake_bus_tests {
         Arc::new(FakeBus)
     }
 
-    /// bd-ojw3: a subscriber whose peer CLOSES must be released PROMPTLY, so
-    /// its fd goes back.
+    /// bd-ojw3: a write that cannot finish is a DEAD subscriber.
     ///
     /// The daemon dropped the subscriber's read half after the handshake, so
-    /// it could not see the peer's EOF; the only signal that a subscriber was
-    /// gone was a FAILED WRITE, and a peer that closes without reading never
-    /// fails a write. So the fd was held for the life of the daemon -
-    /// measured on the live daemon: 78 held connections, and it died of EMFILE
-    /// at launchd's 256 fd cap, which stopped it accepting connections at all.
+    /// it could not see the peer's EOF - and EOF cannot be used anyway: a
+    /// client that half-closes after subscribing (`toron watch --once`) is
+    /// alive, not gone. The only sound signal that a subscriber is gone is a
+    /// write that cannot complete, so the write is BOUNDED: past the bound the
+    /// subscriber is declared dead, the write fails, and its fd is released.
     ///
-    /// The read half is now watched: the peer's EOF ends the subscriber at
-    /// once, well before the next heartbeat write could notice it.
+    /// The bound is a minute on purpose: a slow-but-alive reader must still
+    /// receive a burst larger than every internal queue, with no shed and no
+    /// loss (the lossless suite allows 30s for that burst). A tighter bound
+    /// killed a healthy reader; an unbounded one held the fd forever.
     #[tokio::test]
-    async fn a_subscriber_whose_peer_closed_is_released_at_once() {
-        let sock = tmp_sock("eof");
+    async fn a_write_that_cannot_finish_fails_instead_of_blocking_forever() {
+        struct NeverCompletes;
+        impl tokio::io::AsyncWrite for NeverCompletes {
+            fn poll_write(
+                self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+                _: &[u8],
+            ) -> std::task::Poll<std::io::Result<usize>> {
+                std::task::Poll::Pending
+            }
+            fn poll_flush(
+                self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Pending
+            }
+            fn poll_shutdown(
+                self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Pending
+            }
+        }
+        let mut writer = NeverCompletes;
+        let frame = WakeFrame::Heartbeat { ts_ms: 0 };
+        let started = std::time::Instant::now();
+        let result = write_frame_within(&mut writer, &frame, 60).await;
+        assert!(
+            result.is_err(),
+            "a write that cannot finish must fail, not block forever: the blocked write held \
+             the subscriber's fd for the life of the daemon"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "the bound must end the write promptly, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// bd-ojw3: a subscriber that stops reading must be DROPPED, so its fd
+    /// goes back.
+    ///
+    /// Measured on the live daemon: 78 held connections, and it died of EMFILE
+    /// at launchd's 256 fd cap - which stopped it accepting connections at all,
+    /// so the MCP endpoint went unreachable and every commit was blocked
+    /// behind it.
+    #[tokio::test]
+    async fn a_stalled_subscriber_is_dropped_and_its_fd_released() {
+        /// A bus whose subscription carries whatever the test publishes, so
+        /// the server really writes frames to the subscriber.
+        struct FloodBus {
+            tx: tokio::sync::broadcast::Sender<crate::bus::SubscriptionEvent>,
+        }
+        #[async_trait::async_trait]
+        impl Bus for FloodBus {
+            async fn publish(
+                &self,
+                _event: crate::nostr::Event,
+            ) -> Result<crate::bus::PublishOk, BusError> {
+                Err(BusError::Unsupported("flood".to_string()))
+            }
+            async fn subscribe(&self, filter: Filter) -> Result<crate::bus::Subscription, BusError> {
+                self.subscribe_trusted(filter).await
+            }
+            async fn subscribe_trusted(
+                &self,
+                _filter: Filter,
+            ) -> Result<crate::bus::Subscription, BusError> {
+                let (tx, rx) =
+                    tokio::sync::mpsc::channel(crate::bus::Subscription::DEFAULT_CAPACITY);
+                let mut events = self.tx.subscribe();
+                tokio::spawn(async move {
+                    while let Ok(ev) = events.recv().await {
+                        if tx.send(ev).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+                Ok(crate::bus::Subscription::new(
+                    crate::bus::SubscriptionId::new("flood"),
+                    rx,
+                ))
+            }
+            async fn health(&self) -> Result<crate::bus::Health, BusError> {
+                Ok(crate::bus::Health {
+                    ok: true,
+                    message: "flood".to_string(),
+                })
+            }
+        }
+
+        let (tx, _rx) = tokio::sync::broadcast::channel(16);
+        let sock = tmp_sock("stalled");
         let _ = std::fs::remove_file(&sock);
         let mut cfg = WakeConfig::new(&sock);
         cfg.poll_interval_ms = 0;
-        // A heartbeat far beyond the test's patience: the release must come
-        // from the EOF watch, NOT from a write that happens to fail.
-        cfg.heartbeat_ms = 60_000;
-        let h = WakeServer::new(cfg, test_bus(), Arc::new(ManualClock::new(0)))
+        cfg.heartbeat_ms = 20;
+        cfg.write_timeout_ms = 100;
+        let bus: Arc<dyn Bus> = Arc::new(FloodBus { tx: tx.clone() });
+        let h = WakeServer::new(cfg, bus, Arc::new(ManualClock::new(0)))
             .start()
             .await
             .expect("bind");
 
-        // The client subscribes and STAYS OPEN until the server has served
-        // it, so the only thing that can end the subscriber afterwards is the
-        // peer closing.
+        // A client that reads NOTHING: its socket buffer fills and every
+        // write to it blocks.
         let client = {
             use tokio::io::AsyncWriteExt;
             let mut stream = UnixStream::connect(&sock).await.expect("connect");
@@ -1290,9 +1353,11 @@ mod wake_bus_tests {
                 .expect("subscribe");
             stream
         };
+        // Hold the client OPEN (so its socket is not closed) but never read
+        // from it.
+        let _keep_open = client;
 
-        // Wait for the server to serve it (live), then close the peer.
-        let served = async {
+        let live = async {
             for _ in 0..100 {
                 if h.aggregate_stats().subscribers_live > 0 {
                     return true;
@@ -1302,15 +1367,26 @@ mod wake_bus_tests {
             false
         }
         .await;
-        assert!(served, "the subscriber should be served");
-        drop(client);
+        assert!(live, "the subscriber should register as live");
 
-        // The subscriber is served, then the peer closes.
+        // A frame far larger than the socket buffer cannot be written to a
+        // peer that never reads, so the bounded write fails and the subscriber
+        // is dropped.
+        let keys = crate::nostr::Keys::generate();
+        let big = "x".repeat(512 * 1024);
+        let event = crate::nostr::event::build_event(
+            &keys,
+            Kind::from(9),
+            &big,
+            vec![crate::nostr::Tag::parse(["t", "demo"]).expect("project tag")],
+            crate::nostr::Timestamp::from(1),
+        )
+        .expect("event");
+        let _ = tx.send(crate::bus::SubscriptionEvent::Event(event));
+
         let released = async {
-            for _ in 0..100 {
-                if h.aggregate_stats().subscribers_live == 0
-                    && h.aggregate_stats().subscribers_finished > 0
-                {
+            for _ in 0..200 {
+                if h.aggregate_stats().subscribers_live == 0 {
                     return true;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -1320,8 +1396,8 @@ mod wake_bus_tests {
         .await;
         assert!(
             released,
-            "a subscriber whose peer closed must be released at once: its fd is held otherwise, \
-             and enough of them exhaust the daemon's budget"
+            "a subscriber that cannot be written to must be dropped: its fd is held otherwise, \
+             and one stalled peer is enough to exhaust the daemon's budget"
         );
         let _ = std::fs::remove_file(&sock);
     }
