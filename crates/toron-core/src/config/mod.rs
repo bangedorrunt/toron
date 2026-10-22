@@ -30,7 +30,7 @@
 //! may still use per-invocation dirs (`TORON_DEMO=1` / `TORON_MCP_DATA_DIR`)
 //! for isolation.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Relative path of the operator key inside the data root.
 ///
@@ -62,6 +62,8 @@ pub struct DataRootEnv {
     pub toron_data_dir: Option<PathBuf>,
     pub xdg_data_home: Option<PathBuf>,
     pub home: Option<PathBuf>,
+    /// bd-fize: this process is a cargo TEST binary.
+    pub test_process: bool,
 }
 
 impl DataRootEnv {
@@ -71,8 +73,40 @@ impl DataRootEnv {
             toron_data_dir: env_non_empty("TORON_DATA_DIR"),
             xdg_data_home: env_non_empty("XDG_DATA_HOME"),
             home: env_non_empty("HOME"),
+            test_process: is_test_process(),
         }
     }
+}
+
+/// True when this process is a cargo TEST binary.
+///
+/// bd-fize: cargo names a test binary `<crate>-<hash>`; the production binary
+/// has no hash suffix. That is the only in-process signal a test has, and it
+/// is what keeps a test out of the operator's live store: a test that
+/// registers an agent without pinning a data dir would otherwise write a
+/// PERMANENT identity — a name that can be addressed, a pubkey that can
+/// receive mail — into the operator's index, where it stays forever.
+pub fn is_test_process() -> bool {
+    let Some(exe) = std::env::current_exe().ok() else {
+        return false;
+    };
+    let Some(stem) = exe.file_stem().and_then(|s| s.to_str()) else {
+        return false;
+    };
+    let Some((_, suffix)) = stem.rsplit_once('-') else {
+        return false;
+    };
+    suffix.len() >= 8 && suffix.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// The data root a TEST process uses when nothing pins one.
+///
+/// A temp dir under the OS temp root, named per process so two test binaries
+/// never share a store. The point is only that it is NOT the operator's live
+/// root: a test that must exercise the real index pins it explicitly
+/// (`TORON_DATA_DIR` / `XDG_DATA_HOME`) and restores what it wrote.
+fn test_data_root() -> PathBuf {
+    std::env::temp_dir().join(format!("toron-test-root-{}", std::process::id()))
 }
 
 fn env_non_empty(name: &str) -> Option<PathBuf> {
@@ -84,12 +118,20 @@ fn env_non_empty(name: &str) -> Option<PathBuf> {
 /// Resolve the durable data root (ADR-0007 D3): `TORON_DATA_DIR` >
 /// `$XDG_DATA_HOME/toron` > `~/.local/share/toron`. Last resort is a
 /// relative `toron-data` dir — still never a per-pid temp root.
+///
+/// bd-fize: a TEST process never resolves the operator's live root. The
+/// fallback order is unchanged for production (an explicit pin always wins),
+/// but a test that forgets to pin a data dir gets a temp root instead of
+/// writing permanent identities into the operator's index.
 pub fn resolve_data_root(env: &DataRootEnv) -> PathBuf {
     if let Some(dir) = &env.toron_data_dir {
         return dir.clone();
     }
     if let Some(xdg) = &env.xdg_data_home {
         return xdg.join("toron");
+    }
+    if env.test_process {
+        return test_data_root();
     }
     if let Some(home) = &env.home {
         return home.join(".local").join("share").join("toron");
@@ -486,6 +528,7 @@ mod tests {
             toron_data_dir: Some(PathBuf::from("/env/root")),
             xdg_data_home: Some(PathBuf::from("/xdg")),
             home: Some(PathBuf::from("/home")),
+            test_process: true,
         };
         assert_eq!(resolve_data_root(&env), PathBuf::from("/env/root"));
     }
@@ -496,6 +539,7 @@ mod tests {
             toron_data_dir: None,
             xdg_data_home: Some(PathBuf::from("/xdg")),
             home: Some(PathBuf::from("/home")),
+            test_process: false,
         };
         assert_eq!(resolve_data_root(&env), PathBuf::from("/xdg/toron"));
     }
@@ -506,10 +550,69 @@ mod tests {
             toron_data_dir: None,
             xdg_data_home: None,
             home: Some(PathBuf::from("/home/alice")),
+            test_process: false,
         };
         assert_eq!(
             resolve_data_root(&env),
             PathBuf::from("/home/alice/.local/share/toron")
+        );
+    }
+
+    /// bd-fize: a test process must never resolve the operator's live root.
+    ///
+    /// A test that registers an agent without pinning a data dir used to
+    /// write a PERMANENT identity into the operator's index — a name that can
+    /// be addressed, a pubkey that can receive mail, issued by a test. The
+    /// home fallback is the operator's root, so the test process takes a
+    /// temp root instead.
+    #[test]
+    fn a_test_process_never_resolves_the_operators_live_root() {
+        let env = DataRootEnv {
+            toron_data_dir: None,
+            xdg_data_home: None,
+            home: Some(PathBuf::from("/home/alice")),
+            test_process: true,
+        };
+        let root = resolve_data_root(&env);
+        assert_ne!(
+            root,
+            PathBuf::from("/home/alice/.local/share/toron"),
+            "a test process must not land on the operator's live root"
+        );
+        assert!(
+            root.starts_with(std::env::temp_dir()),
+            "the test root is a temp dir: {root:?}"
+        );
+    }
+
+    /// bd-fize: an EXPLICIT pin still wins in a test process — a test that
+    /// must exercise the real index says so, and restores what it wrote.
+    #[test]
+    fn an_explicit_pin_still_wins_in_a_test_process() {
+        let env = DataRootEnv {
+            toron_data_dir: Some(PathBuf::from("/env/root")),
+            xdg_data_home: None,
+            home: Some(PathBuf::from("/home/alice")),
+            test_process: true,
+        };
+        assert_eq!(resolve_data_root(&env), PathBuf::from("/env/root"));
+        let env = DataRootEnv {
+            toron_data_dir: None,
+            xdg_data_home: Some(PathBuf::from("/xdg")),
+            home: Some(PathBuf::from("/home/alice")),
+            test_process: true,
+        };
+        assert_eq!(resolve_data_root(&env), PathBuf::from("/xdg/toron"));
+    }
+
+    /// bd-fize: the guard is the DIRECTORY cargo builds test binaries into,
+    /// and this process IS one — so the guard is live, not theoretical.
+    #[test]
+    fn this_process_is_recognised_as_a_test_binary() {
+        assert!(
+            is_test_process(),
+            "a unit-test binary lives under <target>/<profile>/deps/ — the guard \
+             depends on it"
         );
     }
 
@@ -815,3 +918,4 @@ mod tests {
         );
     }
 }
+
