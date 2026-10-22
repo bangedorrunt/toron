@@ -102,6 +102,17 @@ pub const ARRIVALS_EVICTED_KEY: &str = "arrivals_evicted_hwm";
 /// written once stop describing the store and the poll's plan is what pays.
 const STATS_MUTATIONS_PER_ANALYZE: i64 = 10_000;
 
+/// `bus_meta` key: the highest `bus_events.rowid` already given an arrival
+/// seq (bd-dtua).
+///
+/// The marker is DURABLE because the work it guards is not: the arrival log
+/// persists, so a daemon that restarts must not re-insert every event into it.
+/// In memory the marker started at 0 on every open, so each restart ran a
+/// 100,000-row INSERT - and with 230 live subscribers every one of them
+/// triggered it before the in-memory marker advanced, so the pool was buried
+/// under 230 copies of the same insert while the MCP endpoint timed out.
+pub const ARRIVALS_HEALED_ROWID_KEY: &str = "arrivals_healed_rowid";
+
 /// `bus_meta` key: the `mutations` value the last ANALYZE of the bus tables ran
 /// at. Absent = this store has never refreshed its planner statistics.
 const STATS_ANALYZED_AT_KEY: &str = "stats_analyzed_at";
@@ -204,6 +215,15 @@ pub struct BusEventStore {
     /// were written by a binary that predates the arrival log and are healed
     /// in on the next arrival read (see [`Self::heal_arrivals`]).
     healed_rowid: Arc<std::sync::atomic::AtomicI64>,
+    /// bd-dtua: how many times this store RAN the arrival insert. The insert
+    /// is OR IGNORE, so a re-insert changes no row and only the counter
+    /// shows the work was done again.
+    heal_inserts: Arc<AtomicU64>,
+    /// bd-dtua: the heal runs ONCE at a time. Every subscriber drains the
+    /// arrival log, and every drain heals it first, so without this lock a
+    /// fleet of subscribers all read the same marker and all run the same
+    /// insert before the marker advances.
+    heal_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl BusEventStore {
@@ -221,7 +241,18 @@ impl BusEventStore {
             hot_hits: Arc::new(AtomicU64::new(0)),
             sql_scans: Arc::new(AtomicU64::new(0)),
             healed_rowid: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+            heal_lock: Arc::new(tokio::sync::Mutex::new(())),
+            heal_inserts: Arc::new(AtomicU64::new(0)),
         };
+        // bd-dtua: the arrival log persists, so the marker does too. Seeding
+        // it from the store is what stops a restart from re-inserting every
+        // event (100,000 rows on the live bus) - and with a fleet of
+        // subscribers each triggering the heal, that insert buried the pool
+        // and the daemon stopped answering.
+        let durable = store.durable_healed_rowid().await;
+        store
+            .healed_rowid
+            .store(durable, std::sync::atomic::Ordering::Release);
         // Number every row that predates the arrival log, in arrival
         // (rowid) order, so a resume cursor can reach all of them.
         store.heal_arrivals().await?;
@@ -244,6 +275,13 @@ impl BusEventStore {
     /// the same file. Cost is proportional to rows past the last heal.
     pub(crate) async fn heal_arrivals(&self) -> anyhow::Result<()> {
         use std::sync::atomic::Ordering;
+        // bd-dtua: one heal at a time. The drain is called by every
+        // subscriber, and each drain heals the log first, so without this
+        // lock a fleet of subscribers reads the same marker and all runs the
+        // same insert before the marker advances - 230 copies of a 100,000-row
+        // insert, with the pool buried under them while the MCP endpoint
+        // times out.
+        let _guard = self.heal_lock.lock().await;
         let max_rowid: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(rowid), 0) FROM bus_events")
             .fetch_one(&self.pool)
             .await?;
@@ -258,8 +296,37 @@ impl BusEventStore {
         .bind(healed)
         .execute(&self.pool)
         .await?;
+        self.heal_inserts.fetch_add(1, Ordering::AcqRel);
         self.healed_rowid.fetch_max(max_rowid, Ordering::AcqRel);
+        // The marker is durable: the arrival log persists, so the next open
+        // must not insert the same rows again.
+        self.persist_healed_rowid(max_rowid).await?;
         Ok(())
+    }
+
+    /// The durable heal marker (bd-dtua): the highest `bus_events.rowid` the
+    /// arrival log already covers.
+    async fn persist_healed_rowid(&self, rowid: i64) -> anyhow::Result<()> {
+        sqlx::query(
+            "INSERT INTO bus_meta (key, value) VALUES (?1, ?2)
+             ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+        )
+        .bind(ARRIVALS_HEALED_ROWID_KEY)
+        .bind(rowid)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// The durable heal marker as the store reads it at open (bd-dtua).
+    async fn durable_healed_rowid(&self) -> i64 {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COALESCE((SELECT value FROM bus_meta WHERE key = ?1), 0)",
+        )
+        .bind(ARRIVALS_HEALED_ROWID_KEY)
+        .fetch_one(&self.pool)
+        .await
+        .unwrap_or(0)
     }
 
     /// Stored events with an arrival seq strictly after `after`, oldest
@@ -1171,6 +1238,98 @@ mod tests {
         let (store, _pool, path) = temp_store().await;
         store.ping().await.expect("SELECT 1 must succeed");
         assert!(store.is_healthy().await);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// bd-dtua: the heal is DURABLE and runs ONCE.
+    ///
+    /// The arrival log persists, so a restart must not re-insert every event
+    /// into it: on the live bus that was a 100,000-row INSERT per restart,
+    /// and because every subscriber's drain heals first, a fleet of
+    /// subscribers each ran that insert before the in-memory marker
+    /// advanced. The pool was buried under the copies and the daemon stopped
+    /// answering (every MCP request timed out, so the pre-commit guard could
+    /// not reach it and every commit was blocked).
+    #[tokio::test]
+    async fn the_heal_marker_survives_a_restart_and_the_heal_runs_once() {
+        let (store, pool, path) = temp_store().await;
+        let keys = Keys::generate();
+        for i in 0..50 {
+            store
+                .insert(&sample_event(&keys, &format!("e{i}")))
+                .await
+                .expect("insert");
+        }
+        store.heal_arrivals().await.expect("heal");
+        let arrivals: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM bus_arrivals")
+            .fetch_one(&pool)
+            .await
+            .expect("count");
+        assert!(arrivals > 0, "the events are in the arrival log");
+        let marker: i64 = sqlx::query_scalar(
+            "SELECT value FROM bus_meta WHERE key = ?1",
+        )
+        .bind(ARRIVALS_HEALED_ROWID_KEY)
+        .fetch_one(&pool)
+        .await
+        .expect("the marker is durable");
+        assert!(marker > 0, "the marker is written to the store, not only to memory");
+
+        // A restart: the marker comes back from the store, so the heal does
+        // not insert the same rows again. The marker is the witness - the
+        // insert is OR IGNORE, so a re-insert changes no row and only the
+        // marker shows that the work was done again.
+        let reopened = BusEventStore::new(pool.clone()).await.expect("reopen");
+        assert_eq!(
+            reopened.heal_inserts.load(std::sync::atomic::Ordering::Acquire),
+            0,
+            "a restart must take the heal marker from the store, so the insert does not run \
+             again: the insert is OR IGNORE, so a re-insert changes no row and only this \
+             counter shows the work was done again"
+        );
+        let before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM bus_arrivals")
+            .fetch_one(&pool)
+            .await
+            .expect("count");
+        let healed_again = reopened.heal_arrivals().await.expect("heal");
+        let after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM bus_arrivals")
+            .fetch_one(&pool)
+            .await
+            .expect("count");
+        assert_eq!(
+            before, after,
+            "a restart must not re-insert the events into the arrival log"
+        );
+        let _ = healed_again;
+
+        // Concurrent drains: the heal runs once, not once per caller.
+        for i in 50..80 {
+            store
+                .insert(&sample_event(&keys, &format!("e{i}")))
+                .await
+                .expect("insert");
+        }
+        let mut tasks = Vec::new();
+        for _ in 0..8 {
+            let pool = pool.clone();
+            tasks.push(tokio::spawn(async move {
+                let s = BusEventStore::new(pool).await.expect("store");
+                s.arrivals_after(&[], 0, 512).await.map(|r| r.len())
+            }));
+        }
+        for t in tasks {
+            t.await.expect("join").expect("drain");
+        }
+        let distinct: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM bus_arrivals",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("count");
+        assert!(
+            distinct <= 80,
+            "concurrent drains must not duplicate arrivals: {distinct}"
+        );
         let _ = std::fs::remove_file(&path);
     }
 
