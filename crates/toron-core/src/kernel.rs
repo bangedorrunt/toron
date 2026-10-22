@@ -44,7 +44,7 @@ pub use elm_effect_elm::{
     Update,
 };
 pub use elm_effect_journal::durable_log::{
-    AppendError, DurableLog, MemLog, Offset, ProducerId, SCHEMA_VERSION,
+    AppendError, DurableLog, FileLog, MemLog, Offset, ProducerId, SCHEMA_VERSION,
 };
 pub use elm_effect_journal::epoch::{EpochLog, Fence};
 pub use elm_effect_journal::laws as durable_log_laws;

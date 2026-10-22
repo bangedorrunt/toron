@@ -2272,6 +2272,68 @@ mod workflow_effect_schema_tests {
         assert_eq!(applied2, applied);
     }
 
+    /// The store's fence settles exactly when the framework predicate says
+    /// it may: the live token settles, a wrong or empty token refuses, and
+    /// nothing settles twice. Claim is generation-scoped in the caller; the
+    /// token equality here is the same rule `may_settle` states.
+    #[tokio::test]
+    async fn settle_with_fence_agrees_with_may_settle() {
+        use crate::kernel::may_settle;
+
+        let (p, _dir) = pool("fence").await;
+        let store = WorkflowEffectStore::new(p);
+        store
+            .create_run(NewRun {
+                run_id: "run-1".into(),
+                project: Some("demo".into()),
+                workflow: "wf".into(),
+                workflow_digest: "d".into(),
+            })
+            .await
+            .unwrap();
+        store.prepare_effect(effect("ek-1", "run-1")).await.unwrap();
+        assert!(store
+            .claim_attempt(
+                "ek-1",
+                ClaimAttempt {
+                    attempt: 1,
+                    attempt_id: "att-1".into(),
+                    claim_token: "tok-a".into(),
+                    lease_expires_at: i64::MAX,
+                    expected_claim_token: None,
+                },
+            )
+            .await
+            .unwrap());
+        let row = store.get_effect("ek-1").await.unwrap().unwrap();
+        let live = row.claim_token.clone();
+
+        // Wrong and empty tokens refuse on both sides.
+        assert!(!may_settle(live.as_deref(), "tok-b"));
+        assert!(!store
+            .settle_with_fence("ek-1", "tok-b", EffectState::Settled, None, None)
+            .await
+            .unwrap());
+        assert!(!may_settle(live.as_deref(), ""));
+        assert!(!store
+            .settle_with_fence("ek-1", "", EffectState::Settled, None, None)
+            .await
+            .unwrap());
+
+        // The live token settles on both sides, exactly once.
+        assert!(may_settle(live.as_deref(), "tok-a"));
+        assert!(store
+            .settle_with_fence("ek-1", "tok-a", EffectState::Settled, None, None)
+            .await
+            .unwrap());
+        let row = store.get_effect("ek-1").await.unwrap().unwrap();
+        assert_eq!(row.state, EffectState::Settled);
+        assert!(!store
+            .settle_with_fence("ek-1", "tok-a", EffectState::Settled, None, None)
+            .await
+            .unwrap());
+    }
+
     /// Wipe all five workflow tables (rebuild-test helper).
     async fn wipe_workflow_tables(pool: &sqlx::SqlitePool) {
         for table in [
