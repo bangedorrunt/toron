@@ -683,6 +683,23 @@ pub async fn run_agent(mailbox: &Mailbox, cmd: &AgentCommand, dry_run: bool) -> 
                 },
             }))
         }
+        AgentCommand::Rename(args) => {
+            // A rename MOVES an identity; it never mints a second key for the
+            // same words (bd-0tbg). The npub is unchanged, so anything the
+            // identity received stays reachable — only the name it answers to
+            // changes.
+            let report = mailbox
+                .rename_agent(&args.project, &args.old_name, &args.new_name)
+                .await?;
+            print_json(&json!({
+                "project": report.project_slug,
+                "renamed": { "from": report.old_name, "to": report.new_name },
+                "npub": report.pubkey,
+                "leases_repointed": report.leases_repointed,
+                "next": "the npub is unchanged — mail sent to the old name is no longer \
+                          routable, and the old name's leases now answer to the new one",
+            }))
+        }
     }
 }
 
@@ -813,6 +830,17 @@ pub async fn run_agent_daemon(
             // cross-process read is exact.
             eprintln!(
                 "toron agent prune: no daemon tool; sweeping the shared durable root directly"
+            );
+            let mb = toron_mcp::demo_mailbox().await?;
+            run_agent(&mb, cmd, dry_run).await
+        }
+        AgentCommand::Rename(_) => {
+            // A rename MOVES an identity: its key directory, its roster row,
+            // its kind-30013 profile and its live leases. Like the prune, it
+            // runs against the shared durable XDG root the daemon itself
+            // uses — the same store, never a second one.
+            eprintln!(
+                "toron agent rename: no daemon tool; renaming in the shared durable root directly"
             );
             let mb = toron_mcp::demo_mailbox().await?;
             run_agent(&mb, cmd, dry_run).await
