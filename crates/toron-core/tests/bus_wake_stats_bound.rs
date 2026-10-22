@@ -116,6 +116,14 @@ async fn boot() -> (
     // Short heartbeat so a dropped connection is reaped promptly.
     let mut cfg = WakeConfig::new(sock.clone());
     cfg.heartbeat_ms = 50;
+    // bd-j2vo: this file fences the RETENTION window, not the subscriber cap.
+    // A subscriber's slot is held until the daemon's next write fails (one
+    // heartbeat), so serving thousands in a tight loop keeps hundreds live
+    // at once — over the production cap of 128, where the daemon REFUSES a
+    // subscriber instead of holding its fd. The cap has its own fence
+    // (crates/toron-core/tests/wake_fd_budget.rs); here it must not
+    // interfere with what is being measured.
+    cfg.max_subscribers = 4_096;
     let h = WakeServer::new(
         cfg,
         bus.clone(),

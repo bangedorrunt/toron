@@ -108,32 +108,14 @@ pub(crate) fn uninstall_supervised(args: &DaemonArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// launchd start: kickstart, else install (idempotent) then kickstart.
+/// launchd start: install (write the plist + bootstrap) then start.
+///
+/// bd-j2vo: `kickstart` restarts the LOADED job, so a plist edited on disk
+/// (the fd budget) never reached the running job — only a re-bootstrap
+/// re-reads it. Installing first makes the plist the source of truth, and
+/// the install's own kickstart starts the job.
 pub(crate) fn start_supervised(args: &DaemonArgs, _pidfile: &Path) -> anyhow::Result<()> {
-    let label = args.label.clone();
-    let uid = current_uid();
-    let out = Command::new("launchctl")
-        .args(["kickstart", "-k", &format!("gui/{uid}/{label}")])
-        .output();
-    if let Ok(o) = out
-        && o.status.success()
-    {
-        println!("started {label} (launchd)");
-        return Ok(());
-    }
-    // Not loaded yet — install (idempotent) then kickstart.
-    crate::daemon::install(args)?;
-    let out = Command::new("launchctl")
-        .args(["kickstart", "-k", &format!("gui/{uid}/{label}")])
-        .output()?;
-    if !out.status.success() {
-        anyhow::bail!(
-            "launchctl kickstart failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
-    println!("started {label} (launchd)");
-    Ok(())
+    crate::daemon::install(args)
 }
 
 /// launchd stop: bootout (+ port grace), pidfile kill, unmanaged/force
@@ -242,13 +224,26 @@ pub fn plist_xml(
 	</dict>
 	<key>ThrottleInterval</key>
 	<integer>5</integer>
-	<!-- bd-ojw3: launchd's default soft maxfiles for a job is 256, and the
-	     daemon holds one fd per wake subscriber. The daemon died of EMFILE
-	     ("accept error: Too many open files") with 264 fds, which stopped it
-	     accepting connections at all - the MCP endpoint went unreachable and
-	     every commit was blocked behind it. -->
-	<key>LimitMaxFiles</key>
-	<integer>4096</integer>
+	<!-- bd-j2vo: launchd's default soft maxfiles for a job is 256,
+	     and the daemon holds one fd per wake subscriber. The daemon died of
+	     EMFILE ("accept error: Too many open files") with 264 fds, which
+	     stopped it accepting connections at all - the MCP endpoint went
+	     unreachable and every commit was blocked behind it.
+
+	     The key is SoftResourceLimits/HardResourceLimits -> NumberOfFiles:
+	     launchd has no "LimitMaxFiles" key (that is systemd's name), so the
+	     old plist declared a budget launchd silently ignored and the job ran
+	     with the domain's 256. -->
+	<key>SoftResourceLimits</key>
+	<dict>
+		<key>NumberOfFiles</key>
+		<integer>4096</integer>
+	</dict>
+	<key>HardResourceLimits</key>
+	<dict>
+		<key>NumberOfFiles</key>
+		<integer>4096</integer>
+	</dict>
 	<key>StandardOutPath</key>
 	<string>{}</string>
 	<key>StandardErrorPath</key>
@@ -350,13 +345,25 @@ mod tests {
         assert!(xml.contains("<string>--mcp-http</string>"), "http flag");
         assert!(xml.contains("<string>127.0.0.1:18080</string>"), "addr");
         assert!(xml.contains("<key>KeepAlive</key>"), "autostart semantics");
-        // bd-ojw3: launchd's default soft maxfiles for a job is 256 and the
-        // daemon holds one fd per wake subscriber, so it died of EMFILE and
-        // stopped accepting connections. The unit must raise the budget.
+        // bd-j2vo: launchd's default soft maxfiles for a job is 256
+        // and the daemon holds one fd per subscriber, so it died of EMFILE and
+        // stopped accepting connections. The unit must raise the budget — and
+        // it must use launchd's own key (SoftResourceLimits ->
+        // NumberOfFiles), because launchd ignores "LimitMaxFiles" and the
+        // job then ran with the domain's 256.
         assert!(
-            xml.contains("<key>LimitMaxFiles</key>"),
-            "the unit must raise the fd budget: launchd's default is 256 and the daemon \
-             holds one fd per subscriber"
+            xml.contains("<key>SoftResourceLimits</key>")
+                && xml.contains("<key>HardResourceLimits</key>")
+                && xml.contains("<key>NumberOfFiles</key>")
+                && xml.contains("<integer>4096</integer>"),
+            "the unit must raise the fd budget with launchd's own key: launchd's \
+             default is 256, the daemon holds one fd per subscriber, and \
+             'LimitMaxFiles' is systemd's name — launchd ignores it"
+        );
+        assert!(
+            !xml.contains("<key>LimitMaxFiles</key>"),
+            "launchd has no LimitMaxFiles key — it is silently ignored, which is \
+             how the job ran at 256 while the plist claimed 4096"
         );
         assert!(
             xml.contains("<key>SuccessfulExit</key>\n\t\t<false/>"),

@@ -41,7 +41,25 @@ pub const WAKE_HANDSHAKE_TIMEOUT_MS: u64 = 5_000;
 pub const WAKE_WRITE_TIMEOUT_MS: u64 = 60_000;
 
 /// Default heartbeat cadence on a quiet bus (quiet-vs-deaf distinction).
+///
+/// bd-j2vo: this is ALSO the reclaim timer. The daemon learns that a
+/// subscriber is gone from a FAILED WRITE, and the heartbeat is the write
+/// that happens whether or not the bus is busy — so a dead subscriber's fd is
+/// released within one heartbeat interval of its death. It used to be
+/// written only on a quiet tick, so on a busy bus the ring arm won every
+/// round, the heartbeat never fired, and a dead subscriber's fd was held for
+/// the life of the daemon.
 pub const WAKE_HEARTBEAT_MS: u64 = 15_000;
+
+/// Cap on CONCURRENT wake subscribers (bd-j2vo).
+///
+/// The daemon holds one fd per subscriber and launchd's DEFAULT soft fd limit
+/// is 256 — so an unbounded subscriber count is what wedged the daemon
+/// (EMFILE: the accept loop spins, the MCP plane stops accepting, and the
+/// commit guard's roster read fails with the mail plane). At 128 subscribers
+/// plus the daemon's own ~40 fds the wake plane stays well under that
+/// default limit, so it can never be what takes the daemon down.
+pub const WAKE_MAX_SUBSCRIBERS: usize = 128;
 
 /// Default store-delta poll cadence (bd-d41q): the pump re-reads the store
 /// this often so writes from other processes (CLI plane commands on the
@@ -319,6 +337,9 @@ pub struct WakeConfig {
     /// How long a single frame write may take before the subscriber is
     /// declared dead (bd-ojw3).
     pub write_timeout_ms: u64,
+    /// Cap on CONCURRENT subscribers (bd-j2vo). Over the cap a subscriber is
+    /// REFUSED (counted + logged), never the daemon.
+    pub max_subscribers: usize,
 }
 
 impl WakeConfig {
@@ -331,6 +352,7 @@ impl WakeConfig {
             heartbeat_ms: WAKE_HEARTBEAT_MS,
             poll_interval_ms: WAKE_POLL_MS,
             write_timeout_ms: WAKE_WRITE_TIMEOUT_MS,
+            max_subscribers: WAKE_MAX_SUBSCRIBERS,
         }
     }
 }
@@ -420,6 +442,12 @@ pub struct WakeStats {
     pub heartbeats_ok: u64,
     /// Sum of heartbeat write failures (deaf watchers).
     pub heartbeat_deaf: u64,
+    /// Subscribers refused because the concurrent cap was reached (bd-j2vo).
+    /// The daemon kept serving; only the subscriber was refused.
+    pub refused: u64,
+    /// Accept-loop errors (bd-j2vo). The loop survives them — the wake plane
+    /// must not die with the daemon's fd budget.
+    pub accept_errors: u64,
 }
 
 /// RAII serving handle: dropping removes the socket file and aborts tasks.
@@ -433,6 +461,10 @@ pub struct WakeHandle {
     /// aggregate stays exact and O(1) no matter how long the sidecar runs.
     totals: Arc<std::sync::Mutex<Totals>>,
     live: Arc<AtomicU64>,
+    /// Subscribers refused over the concurrent cap (bd-j2vo).
+    refused: Arc<AtomicU64>,
+    /// Accept-loop errors survived (bd-j2vo).
+    accept_errors: Arc<AtomicU64>,
 }
 
 /// Running totals folded on every finished subscriber (bd-qpm0).
@@ -467,6 +499,8 @@ impl WakeHandle {
         let recent = Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
         let totals = Arc::new(std::sync::Mutex::new(Totals::default()));
         let live = Arc::new(AtomicU64::new(0));
+        let refused = Arc::new(AtomicU64::new(0));
+        let accept_errors = Arc::new(AtomicU64::new(0));
         let mut tasks = tokio::task::JoinSet::new();
         let bus_tx = tokio::sync::broadcast::channel::<String>(config.queue_cap.max(1)).0;
         let subscriber_bus = bus.clone();
@@ -588,12 +622,43 @@ impl WakeHandle {
             let recent = recent.clone();
             let totals = totals.clone();
             let live_accept = live.clone();
+            let refused_accept = refused.clone();
+            let accept_errors_accept = accept_errors.clone();
+            let max_subscribers = config.max_subscribers;
             let bus = subscriber_bus;
             tasks.spawn(async move {
                 loop {
-                    let Ok((stream, _)) = listener.accept().await else {
-                        break;
+                    let (stream, _) = match listener.accept().await {
+                        Ok(pair) => pair,
+                        Err(e) => {
+                            // bd-j2vo: an accept error (EMFILE above all) must
+                            // NOT end the wake plane. The daemon's control
+                            // plane has to keep answering, so count it, back
+                            // off a beat, and keep serving. The old `break`
+                            // killed the wake plane on the first error.
+                            accept_errors_accept.fetch_add(1, Ordering::SeqCst);
+                            tracing::warn!(
+                                error = %e,
+                                "wake accept failed — the wake plane keeps serving (bd-j2vo)"
+                            );
+                            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                            continue;
+                        }
                     };
+                    if live_accept.load(Ordering::SeqCst) as usize >= max_subscribers {
+                        // bd-j2vo: refuse the SUBSCRIBER, never the daemon.
+                        // One fd per subscriber is what exhausted the fd
+                        // budget; over the cap the new subscriber is dropped
+                        // (counted + logged) and the daemon keeps serving.
+                        let n = refused_accept.fetch_add(1, Ordering::SeqCst) + 1;
+                        tracing::warn!(
+                            cap = max_subscribers,
+                            refused = n,
+                            "wake subscriber refused — concurrent subscriber cap reached (bd-j2vo)"
+                        );
+                        drop(stream);
+                        continue;
+                    }
                     let rx = bus_tx.subscribe();
                     let recent = recent.clone();
                     let totals = totals.clone();
@@ -627,6 +692,8 @@ impl WakeHandle {
             recent,
             totals,
             live,
+            refused,
+            accept_errors,
         }
     }
 
@@ -655,6 +722,8 @@ impl WakeHandle {
             shed: t.shed,
             heartbeats_ok: t.heartbeats_ok,
             heartbeat_deaf: t.heartbeat_deaf,
+            refused: self.refused.load(Ordering::SeqCst),
+            accept_errors: self.accept_errors.load(Ordering::SeqCst),
         }
     }
 }
@@ -979,8 +1048,7 @@ async fn serve_arrivals(
             }
             Ok(Err(RecvError::Closed)) => return stats,
             Err(_) => {
-                // Quiet tick: catch up anything a missed ring left behind,
-                // then the quiet-vs-deaf heartbeat.
+                // Quiet tick: catch up anything a missed ring left behind.
                 if drain_arrivals(
                     writer,
                     bus,
@@ -996,22 +1064,28 @@ async fn serve_arrivals(
                 {
                     return stats;
                 }
-                if clock.now_ms() >= heartbeat_at {
-                    let hb = WakeFrame::Heartbeat {
-                        ts_ms: clock.now_ms(),
-                    };
-                    if write_frame_within(writer, &hb, config.write_timeout_ms)
-                        .await
-                        .is_err()
-                    {
-                        stats.heartbeat_deaf += 1;
-                        return stats;
-                    }
-                    stats.heartbeats_ok += 1;
-                    stats.delivered += 1;
-                    heartbeat_at = clock.now_ms().saturating_add(config.heartbeat_ms);
-                }
             }
+        }
+        // bd-j2vo: the heartbeat is the RECLAIM SIGNAL — the only write a
+        // dead peer can fail — so it must NOT be conditional on a quiet tick.
+        // On a busy bus the ring arm won every round, the heartbeat never
+        // fired, and a dead subscriber's fd was held for the life of the
+        // daemon. Written on its own cadence, the fd is released within one
+        // heartbeat interval of the peer's death.
+        if clock.now_ms() >= heartbeat_at {
+            let hb = WakeFrame::Heartbeat {
+                ts_ms: clock.now_ms(),
+            };
+            if write_frame_within(writer, &hb, config.write_timeout_ms)
+                .await
+                .is_err()
+            {
+                stats.heartbeat_deaf += 1;
+                return stats;
+            }
+            stats.heartbeats_ok += 1;
+            stats.delivered += 1;
+            heartbeat_at = clock.now_ms().saturating_add(config.heartbeat_ms);
         }
     }
 }
@@ -1156,24 +1230,26 @@ async fn serve_subscriber(
             }
             Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => return stats,
             Err(_) => {
-                // Heartbeat tick (bounded wait expiry, not a poll of truth).
-                if clock.now_ms() >= heartbeat_at {
-                    let hb = WakeFrame::Heartbeat {
-                        ts_ms: clock.now_ms(),
-                    };
-                    if writer
-                        .write_all(hb.encode_line().unwrap_or_default().as_bytes())
-                        .await
-                        .is_err()
-                    {
-                        stats.heartbeat_deaf += 1;
-                        return stats;
-                    }
-                    stats.heartbeats_ok += 1;
-                    stats.delivered += 1;
-                    heartbeat_at = clock.now_ms().saturating_add(config.heartbeat_ms);
-                }
+                // Bounded wait expiry (not a poll of truth).
             }
+        }
+        // bd-j2vo: the heartbeat is the reclaim signal, so it is written on
+        // its own cadence — not only when the bus happens to be quiet.
+        if clock.now_ms() >= heartbeat_at {
+            let hb = WakeFrame::Heartbeat {
+                ts_ms: clock.now_ms(),
+            };
+            if writer
+                .write_all(hb.encode_line().unwrap_or_default().as_bytes())
+                .await
+                .is_err()
+            {
+                stats.heartbeat_deaf += 1;
+                return stats;
+            }
+            stats.heartbeats_ok += 1;
+            stats.delivered += 1;
+            heartbeat_at = clock.now_ms().saturating_add(config.heartbeat_ms);
         }
     }
 }
