@@ -219,6 +219,21 @@ pub struct HeldLeftover {
     pub leases: Vec<String>,
 }
 
+/// What a rename did ([`MailboxService::rename_agent`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AgentRenameReport {
+    /// The project the identity lives in.
+    pub project_slug: String,
+    /// The name it had.
+    pub old_name: String,
+    /// The name it has now.
+    pub new_name: String,
+    /// The npub — UNCHANGED by a rename: the key IS the identity.
+    pub pubkey: String,
+    /// The live leases repointed to the new name.
+    pub leases_repointed: usize,
+}
+
 /// bd-4a0u: the outcome of one `agent prune` sweep — the CLI report shape.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SlugPruneReport {
@@ -737,6 +752,153 @@ impl Mailbox {
             }
         }
         Ok(report)
+    }
+
+    /// Rename an identity IN PLACE: the SAME key, the SAME npub, a new name.
+    ///
+    /// A pin is immutable (ADR-0018), but a NAME the pin convention forbids (a
+    /// hyphenated slug) makes an identity unroutable: `resolve_agent_name`
+    /// refuses a free string, so mail addressed to it bounces and a lease held
+    /// under it is unaddressable by anyone reading the board.
+    ///
+    /// The rename is deliberately NOT a second registration. Minting a second
+    /// key for the same words splits one name across two npubs and makes
+    /// reservations unaddressable by either (bd-0tbg). So: move the key
+    /// directory, register under the new name with the SAME key (so the npub
+    /// is unchanged and the kind-30013 profile is re-published with the new
+    /// name), drop the old roster row, and repoint the live leases so the
+    /// board follows the identity.
+    pub async fn rename_agent(
+        &self,
+        project_slug: &str,
+        old_name: &str,
+        new_name: &str,
+    ) -> anyhow::Result<AgentRenameReport> {
+        let canonical = self.canonical_project(project_slug).await;
+        if old_name == new_name {
+            anyhow::bail!("{old_name} already has that name in project {canonical}");
+        }
+        // The new name must be a name this project can ROUTE: the same
+        // grammar gate a registration passes. A rename that lands on an
+        // unroutable name would move the problem, not fix it.
+        self.check_swarm_name(&canonical, new_name).await?;
+        let pool = self
+            .index_pool
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("no index pool attached — cannot rename an identity"))?;
+        let row: Option<(String, Option<String>, Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT pubkey, program, model, task_description FROM agents \
+             WHERE project_slug = ?1 AND name = ?2",
+        )
+        .bind(&canonical)
+        .bind(old_name)
+        .fetch_optional(pool)
+        .await?;
+        let Some((pubkey, program, model, task_description)) = row else {
+            anyhow::bail!(
+                "no identity named {old_name} in project {canonical} — there is nothing to rename"
+            );
+        };
+        // The key, from wherever it lives (the canonical path or a legacy root).
+        let old_key_path = self.agent_key_path(&canonical, old_name);
+        let existing = self
+            .load_agent_key(&old_key_path)
+            .or_else(|| self.alt_agent_key(&canonical, old_name));
+        let Some(existing) = existing else {
+            anyhow::bail!(
+                "{old_name} has no local key in project {canonical} — its roster row cannot be \
+                 renamed into a routable identity"
+            );
+        };
+        // The new name must be free: a second identity under it splits the name.
+        // Two checks, because they catch different collisions: an EXACT name
+        // already registered, and a name that FOLDS to the same words (a
+        // second spelling of one pin is one identity, not two).
+        let taken: Option<String> = sqlx::query_scalar(
+            "SELECT name FROM agents WHERE project_slug = ?1 AND name = ?2",
+        )
+        .bind(&canonical)
+        .bind(new_name)
+        .fetch_optional(pool)
+        .await?;
+        if let Some(taken_name) = taken {
+            anyhow::bail!(
+                "{new_name} is already registered as {taken_name} in project {canonical} — pick a \
+                 name that is free"
+            );
+        }
+        if let Some((taken_name, _)) = self
+            .name_collision_in_project(&canonical, new_name)
+            .await?
+        {
+            anyhow::bail!(
+                "{new_name} collides with the registered identity {taken_name} in project \
+                 {canonical} — they fold to the same words but would be two identities for one \
+                 name (bd-0tbg); pick a name that is free"
+            );
+        }
+        // Move the key directory so the new name's path holds the SAME key.
+        let new_key_path = self.agent_key_path(&canonical, new_name);
+        if new_key_path.exists() {
+            anyhow::bail!(
+                "{new_name} already has a key at {} — refusing to overwrite it",
+                new_key_path.display()
+            );
+        }
+        let (Some(old_dir), Some(new_dir)) = (old_key_path.parent(), new_key_path.parent()) else {
+            anyhow::bail!("cannot resolve the key directories for {old_name}");
+        };
+        if old_dir.exists() {
+            if let Some(parent) = new_dir.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::rename(old_dir, new_dir)?;
+        }
+        self.forget_alt_key_paths();
+        // Register under the new name with the SAME key: the npub is unchanged
+        // and the kind-30013 profile is re-published with the new name.
+        let profile = AgentProfile {
+            name: new_name.to_string(),
+            program,
+            model,
+            task_description,
+            persona: None,
+        };
+        let result =
+            ident::register_agent(&canonical, &profile, Some(&existing), Timestamp::now())?;
+        self.persist_and_publish(&canonical, &profile, result).await?;
+        // One name, one identity: the old roster row goes with the old name.
+        sqlx::query("DELETE FROM agents WHERE project_slug = ?1 AND name = ?2")
+            .bind(&canonical)
+            .bind(old_name)
+            .execute(pool)
+            .await?;
+        // The leases follow the identity, so the board keeps addressing it.
+        let leases_repointed = sqlx::query(
+            "UPDATE file_reservations SET agent_name = ?1 \
+             WHERE project_slug = ?2 AND agent_name = ?3 AND status = 'active'",
+        )
+        .bind(new_name)
+        .bind(&canonical)
+        .bind(old_name)
+        .execute(pool)
+        .await?;
+        let leases_repointed: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM file_reservations \
+             WHERE project_slug = ?1 AND agent_name = ?2 AND status = 'active'",
+        )
+        .bind(&canonical)
+        .bind(new_name)
+        .fetch_one(pool)
+        .await?;
+        let leases_repointed = leases_repointed as usize;
+        Ok(AgentRenameReport {
+            project_slug: canonical,
+            old_name: old_name.to_string(),
+            new_name: new_name.to_string(),
+            pubkey,
+            leases_repointed,
+        })
     }
 
     /// bd-captain-alias-0g8a: point the project's routable `captain` alias
@@ -2662,6 +2824,77 @@ mod tests {
     /// bd-4a0u: `agent prune` absorbs the leftover rows doctor names, KEEPS
     /// (and reports) a row whose canonical target is unregistered rather than
     /// destroying it, and is idempotent on re-run.
+    /// A rename MOVES an identity: the same key, the same npub, a new name.
+    ///
+    /// The npub is the point. A rename that minted a second key would split
+    /// one identity across two npubs (bd-0tbg) and make everything the
+    /// identity received unreachable under the name it now answers to.
+    #[tokio::test]
+    async fn a_rename_keeps_the_npub_and_moves_the_key() {
+        let (mailbox, pool, _db, data) = test_mailbox_with_pool("rename-in-place").await;
+        let project = "p-rename";
+        mailbox.ensure_project(project).await.expect("ensure");
+        // A slug name — the shape the pin convention forbids and the one
+        // that left an identity unroutable.
+        let before = mailbox
+            .register_agent(project, &profile("quiet-slug"))
+            .await
+            .expect("register the slug");
+        let npub_before = before.npub.clone();
+        let old_key = mailbox
+            .agent_key_path(&before.project_slug, "quiet-slug")
+            .clone();
+
+        let report = mailbox
+            .rename_agent(project, "quiet-slug", "QuietCedar")
+            .await
+            .expect("rename");
+
+        // The npub did NOT move: the key IS the identity.
+        assert_eq!(report.pubkey, npub_before, "a rename must not mint a second key");
+        assert_eq!(report.new_name, "QuietCedar");
+        // The key lives under the new name now.
+        let new_key = mailbox.agent_key_path(&before.project_slug, "QuietCedar");
+        assert!(new_key.exists(), "the key must move to the new name");
+        assert!(!old_key.exists(), "the old name must not keep a key");
+        // One name, one identity: the old roster row is gone.
+        let rows: Vec<String> = sqlx::query_scalar(
+            "SELECT name FROM agents WHERE project_slug = ?1 AND pubkey = ?2",
+        )
+        .bind(&before.project_slug)
+        .bind(&npub_before)
+        .fetch_all(&pool)
+        .await
+        .expect("rows");
+        assert_eq!(rows, vec!["QuietCedar".to_string()], "one name, one identity");
+        let _ = data;
+    }
+
+    /// A rename must refuse a name that is already taken: two identities under
+    /// one name split the name across two npubs (bd-0tbg).
+    #[tokio::test]
+    async fn a_rename_refuses_a_name_that_is_taken() {
+        let (mailbox, _pool, _db, _data) = test_mailbox_with_pool("rename-taken").await;
+        let project = "p-rename-taken";
+        mailbox.ensure_project(project).await.expect("ensure");
+        mailbox
+            .register_agent(project, &profile("QuietCedar"))
+            .await
+            .expect("register the taken name");
+        mailbox
+            .register_agent(project, &profile("quiet-slug"))
+            .await
+            .expect("register the slug");
+        let err = mailbox
+            .rename_agent(project, "quiet-slug", "QuietCedar")
+            .await
+            .expect_err("a taken name must refuse");
+        assert!(
+            err.to_string().contains("already registered"),
+            "the refusal must say what it refused, got: {err}"
+        );
+    }
+
     #[tokio::test]
     async fn prune_absorbs_leftovers_and_keeps_stranded_ones() {
         let (mailbox, pool, _db, _data) = test_mailbox_with_pool("4a0u-prune").await;

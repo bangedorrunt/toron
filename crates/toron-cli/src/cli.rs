@@ -1147,6 +1147,23 @@ pub enum AgentCommand {
     /// pin is registered (the second inbox stops existing). Idempotent; a row
     /// whose canonical target is unregistered is KEPT and reported.
     Prune(AgentPruneArgs),
+    /// Rename an identity IN PLACE — the same key, the same npub, a new name.
+    /// A name the pin convention forbids (a hyphenated slug) is unroutable:
+    /// mail addressed to it bounces and its leases are unaddressable. This
+    /// moves the identity onto a registered adjective+noun pin without
+    /// minting a second key for the same words.
+    Rename(AgentRenameArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct AgentRenameArgs {
+    /// Project slug.
+    #[arg(long, required = true)]
+    pub project: String,
+    /// The name to rename (the identity's CURRENT name).
+    pub old_name: String,
+    /// The new name: a registered adjective+noun pin.
+    pub new_name: String,
 }
 
 #[derive(Debug, Args)]
