@@ -59,6 +59,16 @@ Child maps: [toron-core](crates/toron-core/AGENTS.md) ·
 | Daemon build identity | `crates/toron-core/src/serve_build.rs` (boot record + pure `build_verdict`) written by `crates/toron-mcp/src/serve_lock.rs`. A daemon keeps executing the file it was exec'd from after a rebuild replaces it, so `toron daemon status --json` names the served build and `doctor`'s **`daemon_build`** check FAILS (exit 3) when the daemon is not the build on disk. Identity is `(inode, size)` — a `touch` does NOT read as stale, a rebuild does. Measured 2026-09-30: an hour-stale daemon rewrote the operator key every boot while every other check was green |
 | ADRs | `docs/decisions/` |
 
+## The proof for a change
+
+**A green suite over a dirty tree is NOT a green tree.** The proof for a change
+is a CLEAN EXPORT of the commit: `git archive HEAD` into a scratch dir and
+build THERE. A commit that declares a module must ship the file that declares
+it - the `pub mod framework;` that shipped without `framework.rs` is why this
+repo could not be rebuilt for four days. And nothing your build needs may stay
+uncommitted: `git add` only the paths you edited, never `git add -A`, because
+this working tree carries other lanes' in-flight work.
+
 ## CONVENTIONS
 
 - Edition 2024. `#![forbid(unsafe_code)]` on every crate root.
