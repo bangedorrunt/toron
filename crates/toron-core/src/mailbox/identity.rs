@@ -3130,6 +3130,65 @@ mod tests {
             .expect_err("case-only duplicate is the same collision");
     }
 
+    /// bd-rtkx: an identity registered under a path-form project key is
+    /// reachable from the SHORT key — the path key IS the same project.
+    ///
+    /// The legacy shape: the roster row and the profile event carry the path
+    /// form, and the alias table never got a row for it. A read that expands
+    /// only over the alias table cannot see the identity, so a lookup by the
+    /// short key reports "no such agent" while the agent plainly exists.
+    #[tokio::test]
+    async fn an_identity_under_a_path_form_key_is_reachable_from_the_short_key() {
+        let (mailbox, pool, _db, _data) = test_mailbox_with_pool("rtkx").await;
+        let path_project = "/Users/bangedorrunt/workspace/toron";
+        let keys = crate::keys::generate();
+        let event = crate::nostr::event::build_event(
+            &keys,
+            crate::nostr::kinds::toron_kind(crate::nostr::kinds::AGENT_PROFILE),
+            "profile",
+            vec![
+                crate::nostr::Tag::parse(["d", "DustySparrow"]).expect("d tag"),
+                crate::nostr::Tag::parse(["t", path_project]).expect("t tag"),
+            ],
+            crate::nostr::Timestamp::from(1_800_000_000),
+        )
+        .expect("profile event");
+        mailbox
+            .bus()
+            .publish(event)
+            .await
+            .expect("publish the legacy path-form profile");
+        sqlx::query(
+            "INSERT INTO agents (project_slug, name, pubkey, created_ts_us) \
+             VALUES (?1, ?2, ?3, 1)",
+        )
+        .bind(path_project)
+        .bind("DustySparrow")
+        .bind(keys.public_key().to_hex())
+        .execute(&pool)
+        .await
+        .expect("legacy path-form roster row");
+
+        // The short key finds it.
+        let profiles = mailbox
+            .project_profiles("toron")
+            .await
+            .expect("profiles over the short key");
+        assert!(
+            profiles.iter().any(|e| e.pubkey == keys.public_key()),
+            "the short key must reach the identity registered under the path key"
+        );
+        // And the path key reaches the same identity (one project).
+        let via_path = mailbox
+            .project_profiles(path_project)
+            .await
+            .expect("profiles over the path key");
+        assert!(
+            via_path.iter().any(|e| e.pubkey == keys.public_key()),
+            "the path key reaches it too"
+        );
+    }
+
     #[tokio::test]
     async fn an_exact_re_registration_stays_idempotent() {
         // The collision check must not break the ordinary re-register path,
