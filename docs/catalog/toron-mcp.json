@@ -56,7 +56,7 @@
       "name": "guard"
     },
     {
-      "args": "bootstrap, prune",
+      "args": "bootstrap, prune, rename",
       "description": "Agent identity: one-step session bootstrap (register/upsert + reserve)",
       "name": "agent"
     },
@@ -171,7 +171,7 @@
       "name": "inbox"
     }
   ],
-  "generated_at": "2026-10-21T22:58:17Z",
+  "generated_at": "2026-10-23T08:47:44Z",
   "resources": [
     {
       "description": "List projects known to toron.",
