@@ -67,7 +67,9 @@ fn console_keys(program: &std::path::Path, steps: &[(&str, &str)]) -> (String, i
         program.display()
     );
     // macOS script: [file [command ...]]; util-linux: -c <command> [file].
+    // script(1) runs the toron binary, so it runs under the harness.
     let mut command = Command::new("script");
+    toron_core::testkit::apply_test_env(&mut command);
     if cfg!(target_os = "macos") {
         command.args(["-q", "/dev/null", "sh", "-c", &scripted]);
     } else {
@@ -158,6 +160,8 @@ fn the_console_runs_at_45_columns_on_a_real_terminal() {
         );
         return;
     }
+    // spawn-harness: run through script(1), which console_keys builds under
+    // `apply_test_env`.
     let program = std::path::Path::new(env!("CARGO_BIN_EXE_toron"));
     // Wait for the onboarding TEXT, not the header: `--project tuipty` is only
     // ever printed by a command the empty pane named. The header already says
@@ -208,6 +212,8 @@ fn the_compose_form_opens_and_cancels_at_45_columns() {
         );
         return;
     }
+    // spawn-harness: run through script(1), which console_keys builds under
+    // `apply_test_env`.
     let program = std::path::Path::new(env!("CARGO_BIN_EXE_toron"));
     // `Importance` is drawn by the form and by nothing else, so it is the
     // needle that proves the form reached the screen at this width. Esc then

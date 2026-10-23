@@ -8,7 +8,7 @@
 //! throwaway directory per test, and the operator key is generated into it.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::Output;
 
 use toron_core::authority::Role;
 use toron_core::contracts::role_v1::RoleV1;
@@ -36,9 +36,8 @@ fn scratch(tag: &str) -> PathBuf {
 /// `toron` with a cleared environment. `flag` = the value of
 /// `TORON_COMMS_INBOX` (None = unset).
 fn toron_with(dir: &Path, op_key: Option<&Path>, flag: Option<&str>, args: &[&str]) -> Output {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_toron"));
-    cmd.env_clear()
-        .env("HOME", dir)
+    let mut cmd = toron_core::testkit::toron_command_clean(env!("CARGO_BIN_EXE_toron"));
+    cmd.env("HOME", dir)
         .env("XDG_DATA_HOME", dir.join("xdg-data"))
         .env("XDG_STATE_HOME", dir.join("xdg-state"))
         .env("XDG_CONFIG_HOME", dir.join("xdg-config"))

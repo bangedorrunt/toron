@@ -18,7 +18,7 @@ use std::sync::{OnceLock, PoisonError};
 use serde_json::Value;
 
 fn toron() -> Command {
-    let mut c = Command::new(env!("CARGO_BIN_EXE_toron"));
+    let mut c = toron_core::testkit::toron_command(env!("CARGO_BIN_EXE_toron"));
     // These tests pin their own mailbox with TORON_MCP_DATA_DIR. An ambient
     // TORON_MCP_URL outranks that pin — `mailbox_source::decide_source`
     // checks the daemon URL first and returns before reading the data dir —

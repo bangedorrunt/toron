@@ -22,7 +22,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 fn toron() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_toron"))
+    toron_core::testkit::toron_command(env!("CARGO_BIN_EXE_toron"))
 }
 
 fn toron_root() -> PathBuf {

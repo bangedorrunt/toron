@@ -55,6 +55,21 @@ pub const INDEX_SQLITE: &str = "index.sqlite";
 /// log_n=12 keys keep working).
 pub const OPERATOR_KEY_LOG_N: u8 = 14;
 
+/// The environment marker a test harness sets on every `toron` it spawns.
+///
+/// Its value is the harness's sandbox directory. A process that carries it is
+/// under test: it never resolves the operator's data root, config home or
+/// state home from an inherited `HOME` / `XDG_*`, and anything it does not
+/// have an explicit pin for goes under the marker's directory instead.
+///
+/// The marker is explicit because nothing else is reliable. The spawned child
+/// is called `toron`, exactly like the installed binary, and where a build
+/// tool puts it is the build tool's business (`mbx` puts it where no cargo
+/// marker file sits above it). On 2026-10-24 such a child, run with the
+/// operator's `HOME` and `XDG_DATA_HOME`, migrated the live store to a schema
+/// no installed binary knew. `toron_core::testkit::toron_command` sets it.
+pub const UNDER_TEST_ENV: &str = "TORON_UNDER_TEST";
+
 /// Ambient environment inputs to data-root resolution. Pure struct so
 /// resolution is unit-testable without mutating the process-global env.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -62,8 +77,54 @@ pub struct DataRootEnv {
     pub toron_data_dir: Option<PathBuf>,
     pub xdg_data_home: Option<PathBuf>,
     pub home: Option<PathBuf>,
-    /// bd-fize: this process is a cargo TEST binary.
-    pub test_process: bool,
+    /// `Some` when this process is under test and must never land on the
+    /// operator's live root. `None` for a production process.
+    pub sandbox: Option<Sandbox>,
+}
+
+/// A process under test, and where its sandbox is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Sandbox {
+    pub kind: SandboxKind,
+    /// The OS temp root. An implicit root (from `XDG_*` or `HOME`) under it,
+    /// or under `/tmp`, is a fixture a test built, and is honoured. Any other
+    /// implicit root is taken to be the operator's and is refused.
+    pub temp_dir: PathBuf,
+    /// The sandbox directory: the data root when nothing pins one, and the
+    /// parent of the sandboxed home (`<root>/home`).
+    pub root: PathBuf,
+}
+
+/// How a process knows it is under test. See [`Sandbox`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SandboxKind {
+    /// It carries [`UNDER_TEST_ENV`], set by the harness that spawned it.
+    Marker,
+    /// It is a test binary itself: `cfg(test)`, or a cargo test executable
+    /// (`<crate>-<hash>`, bd-fize), which covers integration tests in-process.
+    TestBinary,
+}
+
+impl Sandbox {
+    /// The sandboxed home: what `HOME` means for a process under test whose
+    /// inherited `HOME` is not scratch.
+    pub fn home(&self) -> PathBuf {
+        self.root.join("home")
+    }
+
+    /// True when `root` is scratch space a test built: under the OS temp root
+    /// or `/tmp`, with no `..` that could climb back out.
+    pub fn is_scratch(&self, root: &Path) -> bool {
+        if root
+            .components()
+            .any(|c| c == std::path::Component::ParentDir)
+        {
+            return false;
+        }
+        (!self.temp_dir.as_os_str().is_empty() && root.starts_with(&self.temp_dir))
+            || root.starts_with("/tmp")
+            || root.starts_with("/private/tmp")
+    }
 }
 
 impl DataRootEnv {
@@ -73,9 +134,93 @@ impl DataRootEnv {
             toron_data_dir: env_non_empty("TORON_DATA_DIR"),
             xdg_data_home: env_non_empty("XDG_DATA_HOME"),
             home: env_non_empty("HOME"),
-            test_process: is_test_process(),
+            sandbox: ambient_sandbox(),
         }
     }
+}
+
+/// Pure: is a process with this marker value (and this test-binary verdict)
+/// under test, and where is its sandbox? `pid` names the per-process sandbox
+/// used when the marker gives no usable directory.
+pub fn sandbox_for(
+    marker: Option<&Path>,
+    test_binary: bool,
+    temp_dir: &Path,
+    pid: u32,
+) -> Option<Sandbox> {
+    let per_process = temp_dir.join(format!("toron-test-root-{pid}"));
+    if let Some(marker) = marker {
+        let mut sandbox = Sandbox {
+            kind: SandboxKind::Marker,
+            temp_dir: temp_dir.to_path_buf(),
+            root: per_process,
+        };
+        // The marker names the harness's directory. Anything that is not
+        // scratch (a relative value, `1`, or a real home) is not trusted as a
+        // root: the process is still under test, in its own sandbox.
+        if marker.is_absolute() && sandbox.is_scratch(marker) {
+            sandbox.root = marker.to_path_buf();
+        }
+        return Some(sandbox);
+    }
+    test_binary.then(|| Sandbox {
+        kind: SandboxKind::TestBinary,
+        temp_dir: temp_dir.to_path_buf(),
+        root: per_process,
+    })
+}
+
+/// This process's sandbox, or `None` in production.
+pub fn ambient_sandbox() -> Option<Sandbox> {
+    sandbox_for(
+        env_non_empty(UNDER_TEST_ENV).as_deref(),
+        cfg!(test) || is_test_process(),
+        &std::env::temp_dir(),
+        std::process::id(),
+    )
+}
+
+/// Pure: what a home-shaped variable (`HOME`, `XDG_CONFIG_HOME`,
+/// `XDG_DATA_HOME`, `XDG_STATE_HOME`, `XDG_CACHE_HOME`) means for a process.
+///
+/// In production it is the value. Under test, a scratch value is honoured (a
+/// test's fixture home) and anything else is mapped into the sandboxed home,
+/// so that every path derived from it (the operator key, the passphrase, the
+/// state dir and wake.sock, the flywheel config, launchd / systemd unit dirs)
+/// lands in the sandbox. An unset variable stays unset.
+pub fn resolve_home_var(
+    name: &str,
+    value: Option<PathBuf>,
+    sandbox: Option<&Sandbox>,
+) -> Option<PathBuf> {
+    let value = value?;
+    let Some(sandbox) = sandbox else {
+        return Some(value);
+    };
+    if sandbox.is_scratch(&value) {
+        return Some(value);
+    }
+    let home = sandbox.home();
+    Some(match name {
+        "XDG_CONFIG_HOME" => home.join(".config"),
+        "XDG_DATA_HOME" => home.join(".local").join("share"),
+        "XDG_STATE_HOME" => home.join(".local").join("state"),
+        "XDG_CACHE_HOME" => home.join(".cache"),
+        _ => home,
+    })
+}
+
+/// A home-shaped variable from the ambient environment, sandboxed under test.
+/// See [`resolve_home_var`]. Every read of `HOME` / `XDG_*` in the workspace
+/// goes through here.
+pub fn home_env(name: &str) -> Option<PathBuf> {
+    resolve_home_var(name, env_non_empty(name), ambient_sandbox().as_ref())
+}
+
+/// The sandboxed home when this process is under test, else `None`. For the
+/// callers whose fallback (with the variable unset) is a fixed real path.
+pub fn sandbox_home() -> Option<PathBuf> {
+    ambient_sandbox().map(|s| s.home())
 }
 
 /// True when this process is a cargo TEST binary.
@@ -86,6 +231,9 @@ impl DataRootEnv {
 /// registers an agent without pinning a data dir would otherwise write a
 /// PERMANENT identity — a name that can be addressed, a pubkey that can
 /// receive mail — into the operator's index, where it stays forever.
+///
+/// It says nothing about a `toron` a test SPAWNS: that one is named `toron`.
+/// The spawned child is under test only through [`UNDER_TEST_ENV`].
 pub fn is_test_process() -> bool {
     let Some(exe) = std::env::current_exe().ok() else {
         return false;
@@ -99,16 +247,6 @@ pub fn is_test_process() -> bool {
     suffix.len() >= 8 && suffix.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-/// The data root a TEST process uses when nothing pins one.
-///
-/// A temp dir under the OS temp root, named per process so two test binaries
-/// never share a store. The point is only that it is NOT the operator's live
-/// root: a test that must exercise the real index pins it explicitly
-/// (`TORON_DATA_DIR` / `XDG_DATA_HOME`) and restores what it wrote.
-fn test_data_root() -> PathBuf {
-    std::env::temp_dir().join(format!("toron-test-root-{}", std::process::id()))
-}
-
 fn env_non_empty(name: &str) -> Option<PathBuf> {
     std::env::var_os(name)
         .filter(|v| !v.is_empty())
@@ -119,29 +257,55 @@ fn env_non_empty(name: &str) -> Option<PathBuf> {
 /// `$XDG_DATA_HOME/toron` > `~/.local/share/toron`. Last resort is a
 /// relative `toron-data` dir — still never a per-pid temp root.
 ///
-/// bd-fize: a TEST process never resolves the operator's live root. The
-/// fallback order is unchanged for production (an explicit pin always wins),
-/// but a test that forgets to pin a data dir gets a temp root instead of
-/// writing permanent identities into the operator's index.
+/// A process under test never resolves the operator's live root. Only
+/// `TORON_DATA_DIR` is an explicit pin. `XDG_DATA_HOME` and `HOME` are
+/// ambient: an operator's shell exports them, and every child inherits them.
+/// So a process under test honours them only when they point into scratch
+/// space (see [`Sandbox::is_scratch`]), which is how a test builds a fixture
+/// home. Anywhere else it gets its sandbox root instead.
 pub fn resolve_data_root(env: &DataRootEnv) -> PathBuf {
     if let Some(dir) = &env.toron_data_dir {
         return dir.clone();
     }
-    if let Some(xdg) = &env.xdg_data_home {
-        return xdg.join("toron");
+    let implicit = env
+        .xdg_data_home
+        .as_ref()
+        .map(|xdg| xdg.join("toron"))
+        .or_else(|| {
+            env.home
+                .as_ref()
+                .map(|home| home.join(".local").join("share").join("toron"))
+        });
+    match &env.sandbox {
+        None => implicit.unwrap_or_else(|| PathBuf::from("toron-data")),
+        Some(sandbox) => match implicit {
+            Some(root) if sandbox.is_scratch(&root) => root,
+            _ => sandbox.root.clone(),
+        },
     }
-    if env.test_process {
-        return test_data_root();
-    }
-    if let Some(home) = &env.home {
-        return home.join(".local").join("share").join("toron");
-    }
-    PathBuf::from("toron-data")
 }
 
 /// The durable data root from the ambient environment.
+///
+/// A spawned process under test that is sent to its sandbox says so on
+/// stderr, once: its harness should have pinned `TORON_DATA_DIR`.
 pub fn durable_data_dir() -> PathBuf {
-    resolve_data_root(&DataRootEnv::from_ambient())
+    let env = DataRootEnv::from_ambient();
+    let root = resolve_data_root(&env);
+    if let Some(sandbox) = &env.sandbox
+        && sandbox.kind == SandboxKind::Marker
+        && root == sandbox.root
+    {
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| {
+            eprintln!(
+                "toron: under test ({UNDER_TEST_ENV} is set) with no TORON_DATA_DIR, so it \
+                 never opens the operator's data root; using {}.",
+                root.display()
+            );
+        });
+    }
+    root
 }
 
 /// Pure: the canonical operator key path from config-home components.
@@ -174,8 +338,8 @@ pub fn resolve_operator_key_path(
 /// operator identity.
 pub fn operator_key_path() -> PathBuf {
     resolve_operator_key_path(
-        env_non_empty("XDG_CONFIG_HOME").as_deref(),
-        env_non_empty("HOME").as_deref(),
+        home_env("XDG_CONFIG_HOME").as_deref(),
+        home_env("HOME").as_deref(),
     )
 }
 
@@ -284,8 +448,8 @@ impl StateDirEnv {
     /// Snapshot the ambient environment.
     pub fn from_ambient() -> Self {
         Self {
-            xdg_state_home: env_non_empty("XDG_STATE_HOME"),
-            home: env_non_empty("HOME"),
+            xdg_state_home: home_env("XDG_STATE_HOME"),
+            home: home_env("HOME"),
         }
     }
 }
@@ -439,8 +603,8 @@ pub fn operator_passphrase() -> String {
             .map(std::path::PathBuf::from)
             .as_deref(),
         &passphrase_file_candidates(
-            env_non_empty("XDG_CONFIG_HOME").as_deref(),
-            env_non_empty("HOME").as_deref(),
+            home_env("XDG_CONFIG_HOME").as_deref(),
+            home_env("HOME").as_deref(),
         ),
     )
 }
@@ -522,13 +686,24 @@ mod tests {
         std::env::temp_dir().join(format!("toron-r2-{name}-{}-{n}", std::process::id()))
     }
 
+    fn sandbox(kind: SandboxKind) -> Option<Sandbox> {
+        let temp_dir = std::env::temp_dir();
+        Some(Sandbox {
+            kind,
+            root: temp_dir.join("toron-test-root-4242"),
+            temp_dir,
+        })
+    }
+
+    const KINDS: [SandboxKind; 2] = [SandboxKind::Marker, SandboxKind::TestBinary];
+
     #[test]
     fn env_override_beats_xdg() {
         let env = DataRootEnv {
             toron_data_dir: Some(PathBuf::from("/env/root")),
             xdg_data_home: Some(PathBuf::from("/xdg")),
             home: Some(PathBuf::from("/home")),
-            test_process: true,
+            sandbox: sandbox(SandboxKind::TestBinary),
         };
         assert_eq!(resolve_data_root(&env), PathBuf::from("/env/root"));
     }
@@ -539,7 +714,7 @@ mod tests {
             toron_data_dir: None,
             xdg_data_home: Some(PathBuf::from("/xdg")),
             home: Some(PathBuf::from("/home")),
-            test_process: false,
+            sandbox: None,
         };
         assert_eq!(resolve_data_root(&env), PathBuf::from("/xdg/toron"));
     }
@@ -550,7 +725,7 @@ mod tests {
             toron_data_dir: None,
             xdg_data_home: None,
             home: Some(PathBuf::from("/home/alice")),
-            test_process: false,
+            sandbox: None,
         };
         assert_eq!(
             resolve_data_root(&env),
@@ -571,7 +746,7 @@ mod tests {
             toron_data_dir: None,
             xdg_data_home: None,
             home: Some(PathBuf::from("/home/alice")),
-            test_process: true,
+            sandbox: sandbox(SandboxKind::TestBinary),
         };
         let root = resolve_data_root(&env);
         assert_ne!(
@@ -585,24 +760,207 @@ mod tests {
         );
     }
 
-    /// bd-fize: an EXPLICIT pin still wins in a test process — a test that
-    /// must exercise the real index says so, and restores what it wrote.
+    /// The 2026-10-24 store-skew incident, as a table. The operator's shell
+    /// exports `XDG_DATA_HOME=$HOME/.local/share`, so the inherited value is
+    /// the LIVE root. bd-fize honoured it before its own test check, and the
+    /// spawned `toron` was not a test binary at all. Under test, both kinds
+    /// refuse it and refuse the HOME fallback.
     #[test]
-    fn an_explicit_pin_still_wins_in_a_test_process() {
-        let env = DataRootEnv {
-            toron_data_dir: Some(PathBuf::from("/env/root")),
-            xdg_data_home: None,
-            home: Some(PathBuf::from("/home/alice")),
-            test_process: true,
-        };
-        assert_eq!(resolve_data_root(&env), PathBuf::from("/env/root"));
-        let env = DataRootEnv {
-            toron_data_dir: None,
-            xdg_data_home: Some(PathBuf::from("/xdg")),
-            home: Some(PathBuf::from("/home/alice")),
-            test_process: true,
-        };
-        assert_eq!(resolve_data_root(&env), PathBuf::from("/xdg/toron"));
+    fn an_ambient_xdg_data_home_is_not_a_pin_under_test() {
+        for kind in KINDS {
+            let sb = sandbox(kind);
+            let expected = sb.as_ref().unwrap().root.clone();
+            for (xdg, home) in [
+                (Some("/home/alice/.local/share"), Some("/home/alice")),
+                (None, Some("/home/alice")),
+                (Some("/xdg"), None),
+                (None, None),
+            ] {
+                let env = DataRootEnv {
+                    toron_data_dir: None,
+                    xdg_data_home: xdg.map(PathBuf::from),
+                    home: home.map(PathBuf::from),
+                    sandbox: sb.clone(),
+                };
+                assert_eq!(
+                    resolve_data_root(&env),
+                    expected,
+                    "{kind:?} with XDG_DATA_HOME={xdg:?} HOME={home:?} must take its sandbox"
+                );
+            }
+        }
+    }
+
+    /// A fixture home is still honoured. Tests build one under the temp root
+    /// (or `/tmp`) and point `XDG_DATA_HOME` or `HOME` at it, often so that two
+    /// processes share it. A `..` that climbs out is not scratch.
+    #[test]
+    fn a_scratch_fixture_root_is_honoured_under_test() {
+        let tmp = std::env::temp_dir();
+        for kind in KINDS {
+            let sb = sandbox(kind);
+            let fixture = tmp.join("toron-fixture-home");
+            let env = DataRootEnv {
+                toron_data_dir: None,
+                xdg_data_home: Some(fixture.join("xdg")),
+                home: Some(PathBuf::from("/home/alice")),
+                sandbox: sb.clone(),
+            };
+            assert_eq!(resolve_data_root(&env), fixture.join("xdg").join("toron"));
+            let env = DataRootEnv {
+                toron_data_dir: None,
+                xdg_data_home: None,
+                home: Some(fixture.clone()),
+                sandbox: sb.clone(),
+            };
+            assert_eq!(
+                resolve_data_root(&env),
+                fixture.join(".local").join("share").join("toron")
+            );
+            let env = DataRootEnv {
+                toron_data_dir: None,
+                xdg_data_home: Some(PathBuf::from("/tmp/ih/fixture")),
+                home: None,
+                sandbox: sb.clone(),
+            };
+            assert_eq!(
+                resolve_data_root(&env),
+                PathBuf::from("/tmp/ih/fixture/toron")
+            );
+            let env = DataRootEnv {
+                toron_data_dir: None,
+                xdg_data_home: Some(PathBuf::from("/tmp/../home/alice/.local/share")),
+                home: None,
+                sandbox: sb.clone(),
+            };
+            assert_eq!(resolve_data_root(&env), sb.unwrap().root);
+        }
+    }
+
+    /// bd-fize: an EXPLICIT pin still wins under test. A test that must
+    /// exercise a real index says so with `TORON_DATA_DIR`, and restores what
+    /// it wrote.
+    #[test]
+    fn an_explicit_pin_still_wins_under_test() {
+        for kind in KINDS {
+            let env = DataRootEnv {
+                toron_data_dir: Some(PathBuf::from("/env/root")),
+                xdg_data_home: Some(PathBuf::from("/home/alice/.local/share")),
+                home: Some(PathBuf::from("/home/alice")),
+                sandbox: sandbox(kind),
+            };
+            assert_eq!(resolve_data_root(&env), PathBuf::from("/env/root"));
+        }
+    }
+
+    /// Under test is decided by the marker (or by being a test binary), never
+    /// by where the executable sits. A marker naming scratch is the sandbox;
+    /// any other marker value still means "under test", in a per-process
+    /// sandbox, because a marker is not a licence to pick the operator's dir.
+    #[test]
+    fn the_marker_decides_under_test_and_names_the_sandbox() {
+        let tmp = std::env::temp_dir();
+        let per_process = tmp.join("toron-test-root-77");
+        let harness = tmp.join("toron-test-root-12");
+        let sb = sandbox_for(Some(&harness), false, &tmp, 77).expect("marker = under test");
+        assert_eq!(sb.kind, SandboxKind::Marker);
+        assert_eq!(sb.root, harness, "a scratch marker names the sandbox");
+        for value in ["1", "/home/alice/.local/share/toron", "/tmp/../home/alice"] {
+            let sb = sandbox_for(Some(Path::new(value)), false, &tmp, 77)
+                .expect("any marker value = under test");
+            assert_eq!(sb.kind, SandboxKind::Marker);
+            assert_eq!(sb.root, per_process, "marker {value:?} is not a root");
+        }
+        let sb = sandbox_for(None, true, &tmp, 77).expect("a test binary is under test");
+        assert_eq!(sb.kind, SandboxKind::TestBinary);
+        assert_eq!(sb.root, per_process);
+        assert_eq!(
+            sandbox_for(None, false, &tmp, 77),
+            None,
+            "no marker and not a test binary: production"
+        );
+    }
+
+    /// The config, state and cache homes are sandboxed like the data root: an
+    /// inherited operator `HOME` / `XDG_*` maps into the sandboxed home, a
+    /// scratch fixture is honoured, an unset variable stays unset, and
+    /// production is untouched.
+    #[test]
+    fn home_shaped_variables_map_into_the_sandboxed_home_under_test() {
+        let tmp = std::env::temp_dir();
+        let sb = sandbox(SandboxKind::Marker).unwrap();
+        let home = sb.home();
+        for (name, value, expected) in [
+            ("HOME", "/home/alice", home.clone()),
+            (
+                "XDG_CONFIG_HOME",
+                "/home/alice/.config",
+                home.join(".config"),
+            ),
+            (
+                "XDG_DATA_HOME",
+                "/home/alice/.local/share",
+                home.join(".local").join("share"),
+            ),
+            (
+                "XDG_STATE_HOME",
+                "/home/alice/.local/state",
+                home.join(".local").join("state"),
+            ),
+            ("XDG_CACHE_HOME", "/home/alice/.cache", home.join(".cache")),
+        ] {
+            assert_eq!(
+                resolve_home_var(name, Some(PathBuf::from(value)), Some(&sb)),
+                Some(expected),
+                "{name}={value} under test"
+            );
+            assert_eq!(
+                resolve_home_var(name, Some(PathBuf::from(value)), None),
+                Some(PathBuf::from(value)),
+                "{name}={value} in production"
+            );
+            assert_eq!(resolve_home_var(name, None, Some(&sb)), None);
+        }
+        let fixture = tmp.join("toron-fixture-config");
+        assert_eq!(
+            resolve_home_var("XDG_CONFIG_HOME", Some(fixture.clone()), Some(&sb)),
+            Some(fixture)
+        );
+    }
+
+    /// In this very process (a test binary, whatever HOME the runner gave it),
+    /// every ambient home-derived path is the sandbox's or a scratch fixture:
+    /// the operator key, the passphrase files, the state dir (wake.sock), and
+    /// flywheel's git-facts journal. Never the operator's.
+    #[test]
+    fn this_test_binarys_config_and_state_paths_are_sandboxed() {
+        let sb = ambient_sandbox().expect("a test binary is under test");
+        assert_eq!(sb.kind, SandboxKind::TestBinary);
+        assert_eq!(
+            sb.root,
+            std::env::temp_dir().join(format!("toron-test-root-{}", std::process::id()))
+        );
+        let mut paths = vec![
+            ("operator key", operator_key_path()),
+            ("state dir", state_dir()),
+            (
+                "git-facts journal",
+                crate::mailbox::guard::git_fact_journal_path(),
+            ),
+        ];
+        for candidate in passphrase_file_candidates(
+            home_env("XDG_CONFIG_HOME").as_deref(),
+            home_env("HOME").as_deref(),
+        ) {
+            paths.push(("passphrase", candidate));
+        }
+        for (what, path) in paths {
+            assert!(
+                sb.is_scratch(&path),
+                "the {what} must be in the sandbox or a scratch fixture, got {}",
+                path.display()
+            );
+        }
     }
 
     /// bd-fize: the guard is the DIRECTORY cargo builds test binaries into,
@@ -918,4 +1276,3 @@ mod tests {
         );
     }
 }
-

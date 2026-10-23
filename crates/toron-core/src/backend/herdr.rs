@@ -76,8 +76,8 @@ pub fn resolve_socket_path(
 pub fn default_socket_path() -> PathBuf {
     resolve_socket_path(
         std::env::var("HERDR_SOCKET_PATH").ok(),
-        std::env::var("XDG_CONFIG_HOME").ok(),
-        std::env::var("HOME").ok(),
+        crate::config::home_env("XDG_CONFIG_HOME").map(|p| p.to_string_lossy().into_owned()),
+        crate::config::home_env("HOME").map(|p| p.to_string_lossy().into_owned()),
     )
 }
 

@@ -1279,9 +1279,7 @@ pub const fn robot_tool_name(command: &Command) -> &'static str {
 /// `XDG_CONFIG_HOME`. Only the operator path is reconciled so far; the other
 /// two roles still follow HOME alone.
 fn default_key_path(role: &str) -> PathBuf {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_default();
+    let home = toron_core::config::home_env("HOME").unwrap_or_default();
     home.join(".config")
         .join("toron")
         .join(format!("{role}_nsec"))

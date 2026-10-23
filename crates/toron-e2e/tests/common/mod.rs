@@ -206,6 +206,8 @@ pub fn next_tick(cron: &str, from_ts: i64) -> Option<i64> {
 /// Panics naming the build command when the binary is genuinely absent, which
 /// is the one case where the test binary genuinely cannot run.
 pub fn toron_bin() -> std::path::PathBuf {
+    // spawn-harness: locates the binary only; every spawn wraps it in
+    // `toron_core::testkit::toron_command`.
     if let Ok(p) = std::env::var("CARGO_BIN_EXE_toron") {
         return std::path::PathBuf::from(p);
     }

@@ -15,7 +15,7 @@ use std::sync::OnceLock;
 use serde_json::Value;
 
 fn toron() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_toron"))
+    toron_core::testkit::toron_command(env!("CARGO_BIN_EXE_toron"))
 }
 
 /// Shared per-test-run data dir so the shelled-out `toron` subprocess never
