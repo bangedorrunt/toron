@@ -62,8 +62,54 @@ pub struct DataRootEnv {
     pub toron_data_dir: Option<PathBuf>,
     pub xdg_data_home: Option<PathBuf>,
     pub home: Option<PathBuf>,
-    /// bd-fize: this process is a cargo TEST binary.
-    pub test_process: bool,
+    /// `Some` when this process must never land on the operator's live root:
+    /// a cargo test binary (bd-fize), or a `toron` built inside a cargo target
+    /// dir, which is what a test spawns. `None` for an installed binary.
+    pub sandbox: Option<Sandbox>,
+}
+
+/// Why a process is kept off the operator's live root, and where it goes
+/// instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Sandbox {
+    pub kind: SandboxKind,
+    /// The OS temp root. An implicit root (from `XDG_DATA_HOME` or `HOME`)
+    /// under it, or under `/tmp`, is a fixture a test built, and is honoured.
+    /// Any other implicit root is taken to be the operator's and is refused.
+    pub temp_dir: PathBuf,
+    /// Names the sandbox: this pid for a test binary, the PARENT pid for a dev
+    /// build, so a test and the `toron` it spawns share one sandbox.
+    pub key: u32,
+}
+
+/// See [`Sandbox`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SandboxKind {
+    /// A cargo test binary (`<crate>-<hash>`).
+    TestBinary,
+    /// A binary whose executable sits inside a cargo target dir.
+    DevBuild,
+}
+
+impl Sandbox {
+    /// The sandbox data root.
+    pub fn root(&self) -> PathBuf {
+        self.temp_dir.join(format!("toron-test-root-{}", self.key))
+    }
+
+    /// True when `root` is scratch space a test built: under the OS temp root
+    /// or `/tmp`, with no `..` that could climb back out.
+    pub fn is_scratch(&self, root: &Path) -> bool {
+        if root
+            .components()
+            .any(|c| c == std::path::Component::ParentDir)
+        {
+            return false;
+        }
+        (!self.temp_dir.as_os_str().is_empty() && root.starts_with(&self.temp_dir))
+            || root.starts_with("/tmp")
+            || root.starts_with("/private/tmp")
+    }
 }
 
 impl DataRootEnv {
@@ -73,9 +119,39 @@ impl DataRootEnv {
             toron_data_dir: env_non_empty("TORON_DATA_DIR"),
             xdg_data_home: env_non_empty("XDG_DATA_HOME"),
             home: env_non_empty("HOME"),
-            test_process: is_test_process(),
+            sandbox: ambient_sandbox(),
         }
     }
+}
+
+fn ambient_sandbox() -> Option<Sandbox> {
+    let temp_dir = std::env::temp_dir();
+    if is_test_process() {
+        return Some(Sandbox {
+            kind: SandboxKind::TestBinary,
+            temp_dir,
+            key: std::process::id(),
+        });
+    }
+    let exe = std::env::current_exe().ok()?;
+    if is_dev_build_at(&exe) {
+        return Some(Sandbox {
+            kind: SandboxKind::DevBuild,
+            temp_dir,
+            key: parent_pid(),
+        });
+    }
+    None
+}
+
+#[cfg(unix)]
+fn parent_pid() -> u32 {
+    std::os::unix::process::parent_id()
+}
+
+#[cfg(not(unix))]
+fn parent_pid() -> u32 {
+    std::process::id()
 }
 
 /// True when this process is a cargo TEST binary.
@@ -99,14 +175,19 @@ pub fn is_test_process() -> bool {
     suffix.len() >= 8 && suffix.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-/// The data root a TEST process uses when nothing pins one.
+/// True when `exe` sits inside a cargo target dir: an ancestor holds the
+/// `CACHEDIR.TAG` cargo writes at every target root.
 ///
-/// A temp dir under the OS temp root, named per process so two test binaries
-/// never share a store. The point is only that it is NOT the operator's live
-/// root: a test that must exercise the real index pins it explicitly
-/// (`TORON_DATA_DIR` / `XDG_DATA_HOME`) and restores what it wrote.
-fn test_data_root() -> PathBuf {
-    std::env::temp_dir().join(format!("toron-test-root-{}", std::process::id()))
+/// This is the signal a test-name check cannot give. The `toron` a test
+/// spawns is named `toron`, exactly like the installed binary, so bd-fize let
+/// it through; on 2026-10-24 one such child, run with the operator's HOME and
+/// `XDG_DATA_HOME`, migrated the live store to a schema no installed binary
+/// knew. An installed binary (`cargo install` copies it to `~/.cargo/bin`)
+/// has no such ancestor.
+pub fn is_dev_build_at(exe: &Path) -> bool {
+    exe.ancestors()
+        .skip(1)
+        .any(|dir| dir.join("CACHEDIR.TAG").is_file())
 }
 
 fn env_non_empty(name: &str) -> Option<PathBuf> {
@@ -119,29 +200,58 @@ fn env_non_empty(name: &str) -> Option<PathBuf> {
 /// `$XDG_DATA_HOME/toron` > `~/.local/share/toron`. Last resort is a
 /// relative `toron-data` dir — still never a per-pid temp root.
 ///
-/// bd-fize: a TEST process never resolves the operator's live root. The
-/// fallback order is unchanged for production (an explicit pin always wins),
-/// but a test that forgets to pin a data dir gets a temp root instead of
-/// writing permanent identities into the operator's index.
+/// A sandboxed process (a test binary, or a dev build such as the `toron` a
+/// test spawns) never resolves the operator's live root. Only `TORON_DATA_DIR`
+/// is an explicit pin. `XDG_DATA_HOME` and `HOME` are ambient: an operator's
+/// shell exports them, and every child inherits them. So a sandboxed process
+/// honours them only when they point into scratch space (see
+/// [`Sandbox::is_scratch`]), which is how a test builds a fixture home.
+/// Anywhere else it gets its sandbox root instead.
 pub fn resolve_data_root(env: &DataRootEnv) -> PathBuf {
     if let Some(dir) = &env.toron_data_dir {
         return dir.clone();
     }
-    if let Some(xdg) = &env.xdg_data_home {
-        return xdg.join("toron");
+    let implicit = env
+        .xdg_data_home
+        .as_ref()
+        .map(|xdg| xdg.join("toron"))
+        .or_else(|| {
+            env.home
+                .as_ref()
+                .map(|home| home.join(".local").join("share").join("toron"))
+        });
+    match &env.sandbox {
+        None => implicit.unwrap_or_else(|| PathBuf::from("toron-data")),
+        Some(sandbox) => match implicit {
+            Some(root) if sandbox.is_scratch(&root) => root,
+            _ => sandbox.root(),
+        },
     }
-    if env.test_process {
-        return test_data_root();
-    }
-    if let Some(home) = &env.home {
-        return home.join(".local").join("share").join("toron");
-    }
-    PathBuf::from("toron-data")
 }
 
 /// The durable data root from the ambient environment.
+///
+/// A dev build sent to its sandbox says so on stderr, once: an operator who
+/// runs `target/debug/toron` by hand must not mistake the sandbox for their
+/// store.
 pub fn durable_data_dir() -> PathBuf {
-    resolve_data_root(&DataRootEnv::from_ambient())
+    let env = DataRootEnv::from_ambient();
+    let root = resolve_data_root(&env);
+    if let Some(sandbox) = &env.sandbox
+        && sandbox.kind == SandboxKind::DevBuild
+        && root == sandbox.root()
+    {
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| {
+            eprintln!(
+                "toron: this is a dev build (its executable sits in a cargo target dir), so \
+                 it never opens the operator's data root; using {}. Set TORON_DATA_DIR to \
+                 choose a root explicitly.",
+                root.display()
+            );
+        });
+    }
+    root
 }
 
 /// Pure: the canonical operator key path from config-home components.
@@ -522,13 +632,21 @@ mod tests {
         std::env::temp_dir().join(format!("toron-r2-{name}-{}-{n}", std::process::id()))
     }
 
+    fn sandbox(kind: SandboxKind) -> Option<Sandbox> {
+        Some(Sandbox {
+            kind,
+            temp_dir: std::env::temp_dir(),
+            key: 4242,
+        })
+    }
+
     #[test]
     fn env_override_beats_xdg() {
         let env = DataRootEnv {
             toron_data_dir: Some(PathBuf::from("/env/root")),
             xdg_data_home: Some(PathBuf::from("/xdg")),
             home: Some(PathBuf::from("/home")),
-            test_process: true,
+            sandbox: sandbox(SandboxKind::TestBinary),
         };
         assert_eq!(resolve_data_root(&env), PathBuf::from("/env/root"));
     }
@@ -539,7 +657,7 @@ mod tests {
             toron_data_dir: None,
             xdg_data_home: Some(PathBuf::from("/xdg")),
             home: Some(PathBuf::from("/home")),
-            test_process: false,
+            sandbox: None,
         };
         assert_eq!(resolve_data_root(&env), PathBuf::from("/xdg/toron"));
     }
@@ -550,7 +668,7 @@ mod tests {
             toron_data_dir: None,
             xdg_data_home: None,
             home: Some(PathBuf::from("/home/alice")),
-            test_process: false,
+            sandbox: None,
         };
         assert_eq!(
             resolve_data_root(&env),
@@ -571,7 +689,7 @@ mod tests {
             toron_data_dir: None,
             xdg_data_home: None,
             home: Some(PathBuf::from("/home/alice")),
-            test_process: true,
+            sandbox: sandbox(SandboxKind::TestBinary),
         };
         let root = resolve_data_root(&env);
         assert_ne!(
@@ -585,24 +703,141 @@ mod tests {
         );
     }
 
-    /// bd-fize: an EXPLICIT pin still wins in a test process — a test that
-    /// must exercise the real index says so, and restores what it wrote.
+    /// The 2026-10-24 store-skew incident, as a table. The operator's shell
+    /// exports `XDG_DATA_HOME=$HOME/.local/share`, so the inherited value is
+    /// the LIVE root. bd-fize honoured it before its own test check, and the
+    /// spawned `toron` was not a test binary at all. Both sandbox kinds must
+    /// refuse it, and both must refuse the HOME fallback.
     #[test]
-    fn an_explicit_pin_still_wins_in_a_test_process() {
-        let env = DataRootEnv {
-            toron_data_dir: Some(PathBuf::from("/env/root")),
-            xdg_data_home: None,
-            home: Some(PathBuf::from("/home/alice")),
-            test_process: true,
-        };
-        assert_eq!(resolve_data_root(&env), PathBuf::from("/env/root"));
-        let env = DataRootEnv {
-            toron_data_dir: None,
-            xdg_data_home: Some(PathBuf::from("/xdg")),
-            home: Some(PathBuf::from("/home/alice")),
-            test_process: true,
-        };
-        assert_eq!(resolve_data_root(&env), PathBuf::from("/xdg/toron"));
+    fn an_ambient_xdg_data_home_is_not_a_pin_for_a_sandboxed_process() {
+        for kind in [SandboxKind::TestBinary, SandboxKind::DevBuild] {
+            let sb = sandbox(kind);
+            let expected = sb.as_ref().unwrap().root();
+            for (xdg, home) in [
+                (Some("/home/alice/.local/share"), Some("/home/alice")),
+                (None, Some("/home/alice")),
+                (Some("/xdg"), None),
+                (None, None),
+            ] {
+                let env = DataRootEnv {
+                    toron_data_dir: None,
+                    xdg_data_home: xdg.map(PathBuf::from),
+                    home: home.map(PathBuf::from),
+                    sandbox: sb.clone(),
+                };
+                assert_eq!(
+                    resolve_data_root(&env),
+                    expected,
+                    "{kind:?} with XDG_DATA_HOME={xdg:?} HOME={home:?} must take its sandbox"
+                );
+            }
+        }
+    }
+
+    /// A fixture home is still honoured. Tests build one under the temp root
+    /// (or `/tmp`) and point `XDG_DATA_HOME` or `HOME` at it, often so that two
+    /// processes share it. A `..` that climbs out is not scratch.
+    #[test]
+    fn a_scratch_fixture_root_is_honoured_in_a_sandbox() {
+        let tmp = std::env::temp_dir();
+        for kind in [SandboxKind::TestBinary, SandboxKind::DevBuild] {
+            let sb = sandbox(kind);
+            let fixture = tmp.join("toron-fixture-home");
+            let env = DataRootEnv {
+                toron_data_dir: None,
+                xdg_data_home: Some(fixture.join("xdg")),
+                home: Some(PathBuf::from("/home/alice")),
+                sandbox: sb.clone(),
+            };
+            assert_eq!(resolve_data_root(&env), fixture.join("xdg").join("toron"));
+            let env = DataRootEnv {
+                toron_data_dir: None,
+                xdg_data_home: None,
+                home: Some(fixture.clone()),
+                sandbox: sb.clone(),
+            };
+            assert_eq!(
+                resolve_data_root(&env),
+                fixture.join(".local").join("share").join("toron")
+            );
+            let env = DataRootEnv {
+                toron_data_dir: None,
+                xdg_data_home: Some(PathBuf::from("/tmp/ih/fixture")),
+                home: None,
+                sandbox: sb.clone(),
+            };
+            assert_eq!(
+                resolve_data_root(&env),
+                PathBuf::from("/tmp/ih/fixture/toron")
+            );
+            let env = DataRootEnv {
+                toron_data_dir: None,
+                xdg_data_home: Some(PathBuf::from("/tmp/../home/alice/.local/share")),
+                home: None,
+                sandbox: sb.clone(),
+            };
+            assert_eq!(resolve_data_root(&env), sb.unwrap().root());
+        }
+    }
+
+    /// bd-fize: an EXPLICIT pin still wins in a sandbox. A test that must
+    /// exercise a real index says so with `TORON_DATA_DIR`, and restores what
+    /// it wrote.
+    #[test]
+    fn an_explicit_pin_still_wins_in_a_sandbox() {
+        for kind in [SandboxKind::TestBinary, SandboxKind::DevBuild] {
+            let env = DataRootEnv {
+                toron_data_dir: Some(PathBuf::from("/env/root")),
+                xdg_data_home: Some(PathBuf::from("/home/alice/.local/share")),
+                home: Some(PathBuf::from("/home/alice")),
+                sandbox: sandbox(kind),
+            };
+            assert_eq!(resolve_data_root(&env), PathBuf::from("/env/root"));
+        }
+    }
+
+    /// A dev build is recognised by the target dir it sits in, not by its
+    /// name: the spawned binary is called `toron`, exactly like the installed
+    /// one.
+    #[test]
+    fn a_binary_inside_a_cargo_target_dir_is_a_dev_build() {
+        let target = scratch("target");
+        let exe_dir = target.join("debug");
+        std::fs::create_dir_all(&exe_dir).unwrap();
+        let exe = exe_dir.join("toron");
+        assert!(
+            !is_dev_build_at(&exe),
+            "no CACHEDIR.TAG yet: an installed-style path is not a dev build"
+        );
+        std::fs::write(
+            target.join("CACHEDIR.TAG"),
+            b"Signature: 8a477f597d28d172789f06886806bc55",
+        )
+        .unwrap();
+        assert!(
+            is_dev_build_at(&exe),
+            "a binary under a target root is a dev build"
+        );
+        assert!(
+            is_dev_build_at(&exe_dir.join("build").join("x").join("out").join("toron")),
+            "however deep the wrapper nests it"
+        );
+        let _ = std::fs::remove_dir_all(&target);
+    }
+
+    /// The dev-build sandbox is the PARENT's, so a test and the `toron` it
+    /// spawns share one store, and the test can find what the child wrote.
+    #[test]
+    fn this_test_binary_is_sandboxed_under_its_own_pid() {
+        let sb = DataRootEnv::from_ambient()
+            .sandbox
+            .expect("a test binary is sandboxed");
+        assert_eq!(sb.kind, SandboxKind::TestBinary);
+        assert_eq!(sb.key, std::process::id());
+        assert_eq!(
+            sb.root(),
+            std::env::temp_dir().join(format!("toron-test-root-{}", std::process::id()))
+        );
     }
 
     /// bd-fize: the guard is the DIRECTORY cargo builds test binaries into,
@@ -918,4 +1153,3 @@ mod tests {
         );
     }
 }
-
