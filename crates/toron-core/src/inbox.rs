@@ -193,8 +193,9 @@ macro_rules! unread_from {
 }
 
 /// The urgency rule as SQL over the stored envelope: [`urgency_of`] says
-/// `Urgent`. Written exactly as the partial index `inbox_log_urgent`
-/// (migration 0031) declares it, so the planner can use that index; a test
+/// `Urgent`. Written exactly as the additive partial index `inbox_log_urgent`
+/// (`index::schema::ADDITIVE_INDEXES`) declares it, so the planner can use
+/// that index; a test
 /// holds the two texts equal and holds this predicate to [`urgency_of`] on a
 /// table of cases. The read still confirms each row with [`urgency_of`].
 macro_rules! urgent_where {
@@ -213,8 +214,8 @@ pub const UNREAD_SQL: &str = concat!(unread_from!(), " ORDER BY log_offset");
 /// plan.
 pub const UNREAD_HEAD_SQL: &str = concat!(unread_from!(), " ORDER BY log_offset LIMIT 1");
 
-/// The urgency predicate as text, for the test that holds it to migration
-/// 0031 and to [`urgency_of`].
+/// The urgency predicate as text, for the test that holds it to the
+/// additive index `inbox_log_urgent` and to [`urgency_of`].
 pub const URGENT_WHERE: &str = urgent_where!();
 
 /// The oldest unread urgent row: [`UNREAD_SQL`] narrowed by [`URGENT_WHERE`].
@@ -1401,7 +1402,10 @@ impl InboxStore {
     /// partial index `inbox_log_urgent` answers it in one seek, whatever
     /// number of normal rows is ahead; the row is then confirmed by
     /// [`urgency_of`], the one rule, so a disagreement reads as `None` and
-    /// never invents an urgent wake. Same host-reader terms as
+    /// never invents an urgent wake. The index is additive, never needed for
+    /// correctness: without it (a store an older binary created and no newer
+    /// one has opened) the same query answers from `inbox_log_by_recipient`,
+    /// walking the unread rows. Same host-reader terms as
     /// [`Self::unread_head`]: read-only, no recipient check, metadata only, no
     /// producer / epoch / seq / `claim_epoch` filter (enforced at append).
     pub async fn pending_urgent(

@@ -12,7 +12,9 @@
 # integration suite must go red: the after-offset filter (in the shared point
 # read, and in the query `next` shares), oldest-first order, the steer-priority
 # urgency rule, pending_urgent ignoring urgency (in SQL, or by reading the FIFO
-# head), and the partial index drifting from the query's predicate.
+# head), the partial index drifting from the query's predicate, and the
+# index losing its additive status (recording a version an older binary
+# checks) or not being applied.
 #
 # Not run, because they cannot go red:
 # - dropping `LIMIT 1` gives the same rows, since `fetch_optional` takes the
@@ -27,7 +29,8 @@ CARGO_ARGS=(-p toron-core --test comms_unread_head)
 TEST_FILTER=(--quiet)
 
 INBOX=crates/toron-core/src/inbox.rs
-IDX=crates/toron-core/migrations/0031_comms_inbox_urgent_index.sql
+IDX=crates/toron-core/schema/additive/inbox_log_urgent.sql
+SCHEMA=crates/toron-core/src/index/schema.rs
 
 mutation "H1  the point read ignores after_offset" \
     file=$INBOX \
@@ -70,3 +73,15 @@ mutation "U3  the partial index drifts from the query predicate" \
     expect=the_sql_urgency_predicate_is_urgency_of_and_the_index \
     find="'\$.body.priority') = 'urgent';" \
     replace="'\$.body.priority') = 'URGENT';"
+
+mutation "V1  the additive index records a version again (old binaries locked out)" \
+    file=$SCHEMA \
+    expect=a_store_with_the_urgent_index_opens_on_the_pre_index_path \
+    find='        sqlx::query(ix.ddl)' \
+    replace='        sqlx::query("INSERT OR IGNORE INTO _sqlx_migrations (version, description, success, checksum, execution_time) VALUES (31, '"'"'additive'"'"', 1, x'"'"'00'"'"', 0)").execute(pool).await?; sqlx::query(ix.ddl)'
+
+mutation "V2  migrate never applies the additive index" \
+    file=$SCHEMA \
+    expect=pending_urgent_is_one_partial_index_seek_at_100k_rows_front_and_back \
+    find='        out = ensure_additive(pool).await;' \
+    replace='        out = Ok(());'

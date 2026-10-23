@@ -14,7 +14,78 @@ pub const FTS5_TOKENIZER: &str = "porter unicode61 remove_diacritics 2";
 pub const FTS5_PREFIX: &str = "2 3";
 
 /// Embedded migrations, relative to toron-core CARGO_MANIFEST_DIR.
+///
+/// These are VERSIONED: each applied one is a `_sqlx_migrations` row, and a
+/// binary that does not ship a version the store has applied refuses to open
+/// it (`toron-error=store_skew`). So the highest applied version is the
+/// minimum binary version of the store. A change an older binary can live
+/// with does not belong here; see [`ADDITIVE_INDEXES`].
 pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
+
+/// A schema change an older binary can live with: an index SQLite maintains
+/// on every insert, whoever inserts, and that no read needs for correctness.
+/// Applied by [`migrate`] after [`MIGRATOR`], idempotently (`CREATE INDEX IF
+/// NOT EXISTS`), and recorded nowhere, so it raises no version an older binary
+/// checks: the store's minimum binary version stays the highest migration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AdditiveIndex {
+    /// The index name, as `sqlite_master` lists it.
+    pub name: &'static str,
+    /// The idempotent `CREATE INDEX IF NOT EXISTS` statement.
+    pub ddl: &'static str,
+}
+
+/// Every additive index, in apply order.
+pub static ADDITIVE_INDEXES: &[AdditiveIndex] = &[AdditiveIndex {
+    name: "inbox_log_urgent",
+    ddl: include_str!("../../schema/additive/inbox_log_urgent.sql"),
+}];
+
+/// A store's version, in its two parts: what an opening binary must ship,
+/// and what is informational only.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoreVersion {
+    /// Highest applied versioned migration: an opening binary must resolve
+    /// it, or it refuses with `toron-error=store_skew`.
+    pub min_binary: i64,
+    /// The [`ADDITIVE_INDEXES`] present, by name. Informational: no binary
+    /// checks it, and a store without them is correct, only slower.
+    pub additive: Vec<&'static str>,
+}
+
+/// Read a store's [`StoreVersion`].
+pub async fn store_version(pool: &SqlitePool) -> anyhow::Result<StoreVersion> {
+    let min_binary: Option<i64> =
+        sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations WHERE success")
+            .fetch_one(pool)
+            .await?;
+    let mut additive = Vec::new();
+    for ix in ADDITIVE_INDEXES {
+        let present: Option<String> =
+            sqlx::query_scalar("SELECT name FROM sqlite_master WHERE type = 'index' AND name = ?1")
+                .bind(ix.name)
+                .fetch_optional(pool)
+                .await?;
+        if present.is_some() {
+            additive.push(ix.name);
+        }
+    }
+    Ok(StoreVersion {
+        min_binary: min_binary.unwrap_or(0),
+        additive,
+    })
+}
+
+/// Apply every [`ADDITIVE_INDEXES`] entry. Idempotent; records no version.
+async fn ensure_additive(pool: &SqlitePool) -> anyhow::Result<()> {
+    for ix in ADDITIVE_INDEXES {
+        sqlx::query(ix.ddl)
+            .execute(pool)
+            .await
+            .with_context(|| format!("additive index {}", ix.name))?;
+    }
+    Ok(())
+}
 
 /// The `created_ts_us` unit contract (S3 / bd-ts-unit-audit-pmn5): every
 /// `*_ts_us` column is int-microseconds (ADR G7). Values below 1e12 µs
@@ -261,12 +332,17 @@ pub async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
         }
     }
     let store_label = pool.connect_options().get_filename().display().to_string();
-    let out = MIGRATOR.run(pool).await;
+    let mut out = MIGRATOR
+        .run(pool)
+        .await
+        .map_err(|e| map_migrate_error(&store_label, e));
+    if out.is_ok() {
+        out = ensure_additive(pool).await;
+    }
     if let Some(lock) = lock_path {
         let _ = std::fs::remove_file(&lock);
     }
-    out.map_err(|e| map_migrate_error(&store_label, e))?;
-    Ok(())
+    out
 }
 
 #[cfg(test)]

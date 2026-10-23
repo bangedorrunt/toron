@@ -9,7 +9,7 @@
 //!
 //! `InboxStore::pending_urgent` is the oldest unread urgent row: `Some`
 //! exactly when `next --peek --urgent` says urgent. Its SQL predicate is held
-//! to `urgency_of` and to migration 0031's partial index, and the 100k test
+//! to `urgency_of` and to the additive partial index, and the 100k test
 //! puts the urgent steer at the front and at the back of the backlog.
 
 use std::num::NonZeroU64;
@@ -439,10 +439,14 @@ fn squash(s: &str) -> String {
 async fn the_sql_urgency_predicate_is_urgency_of_and_the_index() {
     // The partial index declares the same predicate the query uses, so the
     // planner can match them.
-    let migration = include_str!("../migrations/0031_comms_inbox_urgent_index.sql");
+    let ix = schema::ADDITIVE_INDEXES
+        .iter()
+        .find(|ix| ix.name == "inbox_log_urgent")
+        .expect("the urgent index is additive");
+    let migration = ix.ddl;
     assert!(
         squash(migration).contains(&format!("WHERE {};", squash(URGENT_WHERE))),
-        "migration 0031 and URGENT_WHERE drifted"
+        "the additive index and URGENT_WHERE drifted"
     );
     assert!(squash(PENDING_URGENT_SQL).contains(&squash(URGENT_WHERE)));
     // And the predicate is urgency_of, case by case.
@@ -593,4 +597,131 @@ async fn pending_urgent_is_one_partial_index_seek_at_100k_rows_front_and_back() 
             urgent.offset, plan[0]
         );
     }
+}
+
+/// The highest versioned migration on main 5cdd555, before the urgent index.
+/// A pre-index binary resolves exactly this.
+const PRE_INDEX_MAX_MIGRATION: i64 = 30;
+
+#[tokio::test]
+async fn a_store_with_the_urgent_index_opens_on_the_pre_index_path() {
+    // A store opened by this build: migrated, and the additive index applied.
+    let path =
+        std::env::temp_dir().join(format!("toron-head-compat-{}.sqlite", uuid::Uuid::new_v4()));
+    let db = path.to_str().unwrap().to_string();
+    let pool = schema::connect(&db).await.unwrap();
+    schema::migrate(&pool).await.unwrap();
+    let v = schema::store_version(&pool).await.unwrap();
+    assert_eq!(
+        v,
+        schema::StoreVersion {
+            min_binary: PRE_INDEX_MAX_MIGRATION,
+            additive: vec!["inbox_log_urgent"],
+        },
+        "the index raises no version a binary checks"
+    );
+    let s = InboxStore::new(pool).with_operator(OP);
+    s.append_envelope(&lead()).await.unwrap();
+    s.append_envelope(&notify(OP, 1, CREW, "before"))
+        .await
+        .unwrap();
+    drop(s);
+
+    // The pre-index open path: the versioned migrations alone, as 5cdd555's
+    // `schema::migrate` runs them, with no additive step. It resolves the
+    // same versions and opens the store with no skew.
+    let max = schema::MIGRATOR.iter().map(|m| m.version).max();
+    assert_eq!(max, Some(PRE_INDEX_MAX_MIGRATION));
+    let old = schema::connect(&db).await.unwrap();
+    schema::MIGRATOR
+        .run(&old)
+        .await
+        .expect("a pre-index binary opens the store: no store_skew");
+
+    // It writes and reads as before. Its insert lands in the index too:
+    // SQLite maintains a partial index on every insert.
+    let s = InboxStore::new(old).with_operator(OP);
+    let st = s.append_envelope(&steer(0, CREW, "urgent")).await.unwrap();
+    let b = s.next(CREW, None, true).await.unwrap();
+    assert_eq!(b.items.len(), 2);
+    assert_eq!(b.items[1].offset, st.offset);
+    assert_eq!(
+        plan_of(&s, PENDING_URGENT_SQL).await[0],
+        "SEARCH inbox_log USING INDEX inbox_log_urgent (stream=? AND recipient=? AND log_offset>?)"
+    );
+    let p = s.pending_urgent(CREW, 0).await.unwrap().unwrap();
+    assert_eq!(
+        p.offset.get(),
+        st.offset,
+        "the old binary's write is in the index"
+    );
+
+    // And this build reopens it: still no version raised, index still there.
+    schema::migrate(s.pool()).await.unwrap();
+    assert_eq!(
+        schema::store_version(s.pool()).await.unwrap().min_binary,
+        PRE_INDEX_MAX_MIGRATION
+    );
+}
+
+#[tokio::test]
+async fn pending_urgent_is_correct_without_the_index() {
+    let s = store("noindex").await;
+    sqlx::query("DROP INDEX inbox_log_urgent")
+        .execute(s.pool())
+        .await
+        .unwrap();
+    assert!(
+        schema::store_version(s.pool())
+            .await
+            .unwrap()
+            .additive
+            .is_empty()
+    );
+    // The planner falls back to the recipient index: slower, same answers.
+    let plan = plan_of(&s, PENDING_URGENT_SQL).await;
+    assert!(
+        plan[0].contains("USING INDEX inbox_log_by_recipient"),
+        "{plan:?}"
+    );
+
+    assert_eq!(s.pending_urgent(CREW, 0).await.unwrap(), None);
+    s.append_envelope(&lead()).await.unwrap();
+    s.append_envelope(&notify(OP, 1, CREW, "priority: urgent"))
+        .await
+        .unwrap();
+    s.append_envelope(&steer(0, CREW, "normal")).await.unwrap();
+    assert_eq!(
+        s.pending_urgent(CREW, 0).await.unwrap(),
+        None,
+        "only normal rows"
+    );
+    s.append_envelope(&steer(1, OTHER, "urgent")).await.unwrap();
+    let st = s.append_envelope(&steer(2, CREW, "urgent")).await.unwrap();
+    let p = s
+        .pending_urgent(CREW, 0)
+        .await
+        .unwrap()
+        .expect("behind the notify");
+    assert_eq!(p.offset.get(), st.offset);
+    let (c, first, any) = next_urgent(&s, CREW).await;
+    assert_eq!((Some(p), true), (first, any));
+    let read = s.next(CREW, None, false).await.unwrap();
+    s.ack(CREW, &read.items[2].msg_key, true, None)
+        .await
+        .unwrap();
+    let cursor = s.cursor(CREW, CREW).await.unwrap();
+    assert!(cursor > c);
+    assert_eq!(
+        s.pending_urgent(CREW, cursor).await.unwrap(),
+        None,
+        "read and acked"
+    );
+
+    // The next open by this build puts the index back.
+    schema::migrate(s.pool()).await.unwrap();
+    assert_eq!(
+        schema::store_version(s.pool()).await.unwrap().additive,
+        vec!["inbox_log_urgent"]
+    );
 }
