@@ -550,6 +550,48 @@ impl Authority {
         ))
     }
 
+    /// May `from` (whose standing is `sender`) append a steer naming
+    /// `sup_epoch`, given the context's `lead@1` row `lead` as
+    /// `(holder, sup_epoch)`? (F7, stack review 2026-10-23.)
+    ///
+    /// * No lead row: only the operator key steers; anyone else is
+    ///   [`Reject::NoLead`]. There is no epoch to fence, so none is invented.
+    /// * A lead row: only its holder at its epoch. The epoch is checked
+    ///   before the holder, so a stale steer is [`Reject::StaleSupEpoch`]
+    ///   whoever sent it, and only a sender that names the current epoch
+    ///   learns it is [`Reject::NotLeadHolder`]. The operator is not exempt
+    ///   once a lead exists: it hands the lease on with `lead@1` instead.
+    pub fn check_steer(
+        lead: Option<(&str, u64)>,
+        from: &str,
+        sender: Standing,
+        sup_epoch: u64,
+        context: &str,
+    ) -> Result<(), Reject> {
+        let Some((holder, current)) = lead else {
+            if matches!(sender, Standing::Operator) {
+                return Ok(());
+            }
+            return Err(Reject::NoLead {
+                context: context.to_string(),
+            });
+        };
+        if sup_epoch != current {
+            return Err(Reject::StaleSupEpoch {
+                sent: sup_epoch,
+                current,
+            });
+        }
+        if from != holder {
+            return Err(Reject::NotLeadHolder {
+                actor: from.to_string(),
+                holder: holder.to_string(),
+                sup_epoch: current,
+            });
+        }
+        Ok(())
+    }
+
     /// [`Self::may_set_context`] as a typed refusal. `expected` names who can.
     pub fn check_set_context(issuer: Standing) -> Result<(), Reject> {
         if Self::may_set_context(issuer) {
@@ -877,5 +919,53 @@ mod tests {
         }
         assert_eq!(Role::parse("Captain"), None);
         assert_eq!(Role::parse("operator"), None);
+    }
+
+    /// F7: the steer fence as a pure table. No lead: the operator only. A
+    /// lead: the epoch is fenced before the holder, and only the holder at
+    /// the current epoch passes, operator or not.
+    #[test]
+    fn the_steer_fence_binds_the_sender_to_the_lead_holder() {
+        let op = Standing::Operator;
+        let cap = Standing::Holds(Role::Captain);
+        let lead = Some(("holder", 3));
+        // No lead row.
+        for epoch in [0, 3] {
+            assert_eq!(Authority::check_steer(None, "op", op, epoch, "ctx"), Ok(()));
+        }
+        for who in [cap, Standing::Holds(Role::Supervisor), Standing::Unroled] {
+            assert_eq!(
+                Authority::check_steer(None, "holder", who, 3, "ctx"),
+                Err(Reject::NoLead {
+                    context: "ctx".into()
+                }),
+                "{who:?}"
+            );
+        }
+        // A lead row.
+        assert_eq!(
+            Authority::check_steer(lead, "holder", cap, 3, "ctx"),
+            Ok(())
+        );
+        assert_eq!(Authority::check_steer(lead, "holder", op, 3, "ctx"), Ok(()));
+        for who in [cap, op] {
+            assert_eq!(
+                Authority::check_steer(lead, "other", who, 3, "ctx"),
+                Err(Reject::NotLeadHolder {
+                    actor: "other".into(),
+                    holder: "holder".into(),
+                    sup_epoch: 3,
+                })
+            );
+        }
+        for sent in [0, 2, 4] {
+            for from in ["holder", "other"] {
+                assert_eq!(
+                    Authority::check_steer(lead, from, cap, sent, "ctx"),
+                    Err(Reject::StaleSupEpoch { sent, current: 3 }),
+                    "{from} at {sent}"
+                );
+            }
+        }
     }
 }

@@ -84,6 +84,14 @@ fn every_reject() -> Vec<Reject> {
             sent: 1,
             current: 2,
         },
+        Reject::NoLead {
+            context: "ctx".into(),
+        },
+        Reject::NotLeadHolder {
+            actor: "a".into(),
+            holder: "b".into(),
+            sup_epoch: 2,
+        },
     ];
     for r in &all {
         match r {
@@ -106,7 +114,9 @@ fn every_reject() -> Vec<Reject> {
             | Reject::Unauthorized { .. }
             | Reject::NotYet { .. }
             | Reject::SteerPending { .. }
-            | Reject::StaleSupEpoch { .. } => {}
+            | Reject::StaleSupEpoch { .. }
+            | Reject::NoLead { .. }
+            | Reject::NotLeadHolder { .. } => {}
         }
     }
     all
@@ -254,4 +264,41 @@ fn stale_sup_epoch_carries_sent_and_current_on_the_wire() {
         .to_string(),
         "stale sup_epoch 1, current 4"
     );
+}
+
+/// F7: a non-operator steer with no lead row names the context.
+#[test]
+fn no_lead_carries_the_context_on_the_wire() {
+    let r = Reject::NoLead {
+        context: "ctx-a".into(),
+    };
+    assert_eq!(
+        serde_json::to_value(&r).unwrap(),
+        serde_json::json!({"reject": "no_lead", "context": "ctx-a"})
+    );
+    assert_eq!(
+        r.to_string(),
+        "no lead in context ctx-a: only the operator may steer"
+    );
+}
+
+/// F7: a steer from a key that is not the lead holder names both keys and
+/// the epoch.
+#[test]
+fn not_lead_holder_carries_actor_holder_and_epoch_on_the_wire() {
+    let r = Reject::NotLeadHolder {
+        actor: "a".into(),
+        holder: "b".into(),
+        sup_epoch: 4,
+    };
+    assert_eq!(
+        serde_json::to_value(&r).unwrap(),
+        serde_json::json!({
+            "reject": "not_lead_holder",
+            "actor": "a",
+            "holder": "b",
+            "sup_epoch": 4
+        })
+    );
+    assert_eq!(r.to_string(), "a is not the lead holder b at sup_epoch 4");
 }

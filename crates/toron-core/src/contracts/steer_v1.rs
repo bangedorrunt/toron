@@ -36,7 +36,9 @@ pub struct SteerV1 {
     /// When the recipient should have acked, microseconds, if the sender set one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ack_by: Option<u64>,
-    /// The lead epoch this steer speaks for. Fenced once a lead fact exists.
+    /// The lead epoch this steer speaks for. Must equal the `lead@1` row's
+    /// epoch, and `from` must be that row's holder. With no row only the
+    /// operator may steer, at any epoch.
     pub sup_epoch: u64,
 }
 
