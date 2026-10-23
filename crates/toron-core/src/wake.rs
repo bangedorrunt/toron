@@ -57,16 +57,18 @@ pub const BACKOFF_URGENT_BASE_MS: u64 = 5_000;
 /// Urgent backoff ceiling.
 pub const BACKOFF_URGENT_CAP_MS: u64 = 60_000;
 
-/// How urgent the unread mail is. Urgent = a `Control` envelope with
-/// `priority=urgent`. The class is the host's reading of the log; this
-/// function only takes the result.
+/// How urgent the unread mail is. Urgent = a `steer@1` (Control) whose body
+/// says `priority = "urgent"` ([`crate::inbox::urgent_pending`] reads it off
+/// the log). `cancel@1` carries no `priority` and a notice (`notify@1`,
+/// `escalate@1`) is never urgent, whatever its text. The class is the host's
+/// reading of the log; this function only takes the result.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Urgency {
     /// Ordinary mail.
     #[default]
     Normal,
-    /// Steers and cancels.
+    /// An unread urgent steer.
     Urgent,
 }
 
