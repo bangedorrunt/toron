@@ -21,6 +21,7 @@ pub mod kernel;
 pub mod keys;
 pub mod mailbox;
 pub mod nostr;
+pub mod osc7501;
 pub mod outbox;
 pub mod policy;
 pub mod serve_build;
