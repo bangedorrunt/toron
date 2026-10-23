@@ -32,7 +32,7 @@ use toron_core::nostr::identity::AgentProfile;
 /// `TORON_MCP_URL` outranks that pin (`mailbox_source::decide_source`), which
 /// would send these assertions at a developer's live daemon instead.
 fn toron() -> Command {
-    let mut c = Command::new(env!("CARGO_BIN_EXE_toron"));
+    let mut c = toron_core::testkit::toron_command(env!("CARGO_BIN_EXE_toron"));
     c.env_remove("TORON_MCP_URL");
     c
 }

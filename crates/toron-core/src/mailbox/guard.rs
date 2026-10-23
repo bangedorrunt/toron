@@ -1221,8 +1221,11 @@ pub fn added_lines_for_hunk_attribution(repo_path: &Path) -> String {
 /// fallback `/Users/bangedorrunt/.local/state/flywheel/journals/git-facts.jsonl`
 /// named in bd-jhes (which is `$XDG_STATE_HOME` default on this host).
 pub fn git_fact_journal_path() -> std::path::PathBuf {
-    let xdg = std::env::var_os("XDG_STATE_HOME").filter(|v| !v.is_empty());
-    git_fact_journal_path_with_xdg(xdg.as_deref().map(std::path::Path::new))
+    // Under test the hard-coded fallback below is the operator's real journal,
+    // so an unset XDG_STATE_HOME means the sandboxed home's state dir instead.
+    let xdg = crate::config::home_env("XDG_STATE_HOME")
+        .or_else(|| crate::config::sandbox_home().map(|home| home.join(".local").join("state")));
+    git_fact_journal_path_with_xdg(xdg.as_deref())
 }
 
 fn git_fact_journal_path_with_xdg(xdg: Option<&Path>) -> std::path::PathBuf {

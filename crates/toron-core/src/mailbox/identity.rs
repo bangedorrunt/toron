@@ -2195,16 +2195,11 @@ pub fn spawn_registry_bindings_in(dir: &std::path::Path, slug: &str) -> Vec<Spaw
 /// `config::state_dir()` uses (never the macOS App Support dir: live state
 /// lives under `~/.local/state`).
 fn flywheel_state_dir() -> Option<PathBuf> {
-    if let Some(xdg) = std::env::var_os("XDG_STATE_HOME").filter(|v| !v.is_empty()) {
-        return Some(PathBuf::from(xdg).join("flywheel"));
+    if let Some(xdg) = crate::config::home_env("XDG_STATE_HOME") {
+        return Some(xdg.join("flywheel"));
     }
-    let home = std::env::var_os("HOME").filter(|v| !v.is_empty())?;
-    Some(
-        PathBuf::from(home)
-            .join(".local")
-            .join("state")
-            .join("flywheel"),
-    )
+    let home = crate::config::home_env("HOME")?;
+    Some(home.join(".local").join("state").join("flywheel"))
 }
 
 /// bd-zoir: the ambient spawn-registry read — best-effort, empty when no

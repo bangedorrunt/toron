@@ -321,9 +321,9 @@ fn install_logrotate_agent(dir: &Path, uid: &str) -> anyhow::Result<()> {
 }
 
 fn home_launch_agents() -> anyhow::Result<PathBuf> {
-    let home = std::env::var("HOME")
-        .map_err(|_| anyhow::anyhow!("HOME unset; cannot locate LaunchAgents"))?;
-    Ok(PathBuf::from(home).join("Library").join("LaunchAgents"))
+    let home = toron_core::config::home_env("HOME")
+        .ok_or_else(|| anyhow::anyhow!("HOME unset; cannot locate LaunchAgents"))?;
+    Ok(home.join("Library").join("LaunchAgents"))
 }
 
 #[cfg(test)]

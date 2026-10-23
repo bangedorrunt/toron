@@ -341,6 +341,80 @@ pub fn pid_alive(pid: u32) -> bool {
         .unwrap_or(false)
 }
 
+// ---------------------------------------------------------------------------
+// The spawn harness: every `toron` a test runs is built here.
+// ---------------------------------------------------------------------------
+
+/// This test process's sandbox: the directory its own in-process code already
+/// uses when it is under test (`$TMPDIR/toron-test-root-<pid>`, or the
+/// directory its own harness marker names).
+///
+/// A spawned child gets the SAME directory, so a test and the `toron` it runs
+/// agree on the data root, the config home and the state home (`wake.sock`)
+/// by construction instead of by inheriting the operator's.
+pub fn harness_root() -> std::path::PathBuf {
+    crate::config::ambient_sandbox()
+        .map(|sandbox| sandbox.root)
+        .unwrap_or_else(|| {
+            std::env::temp_dir().join(format!("toron-test-root-{}", std::process::id()))
+        })
+}
+
+/// Put `cmd` under test: the marker ([`crate::config::UNDER_TEST_ENV`]), an
+/// explicit `TORON_DATA_DIR`, and a config home and state home, all inside
+/// [`harness_root`]. `TORON_MCP_URL` is dropped so no ambient daemon is used.
+///
+/// Apply it to every command that runs `toron`, directly or through a hook
+/// (a `git commit` in a repo with toron's hooks installed runs `toron`). A
+/// test that needs a different root sets its own variable AFTER this call;
+/// the later `env` wins, and the marker still keeps the child off the
+/// operator's home for everything it does not pin.
+pub fn apply_test_env(cmd: &mut Command) -> &mut Command {
+    sandbox_env(cmd).env_remove("TORON_MCP_URL")
+}
+
+/// The sandbox half of [`apply_test_env`], without touching `TORON_MCP_URL`
+/// (an `env_clear`ed command has nothing to remove, and a recorded removal
+/// still shows up in `Command::get_envs`).
+fn sandbox_env(cmd: &mut Command) -> &mut Command {
+    let root = harness_root();
+    let home = root.join("home");
+    for dir in [
+        root.clone(),
+        home.join(".config"),
+        home.join(".local").join("state"),
+    ] {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    cmd.env(crate::config::UNDER_TEST_ENV, &root)
+        .env("TORON_DATA_DIR", &root)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("XDG_STATE_HOME", home.join(".local").join("state"))
+}
+
+/// A `toron` command under test (see [`apply_test_env`]). The ONE way a test
+/// spawns the binary: `tests/spawn_harness.rs` in toron-cli fails the build
+/// for any spawn site that bypasses it.
+pub fn toron_command(bin: impl AsRef<std::ffi::OsStr>) -> Command {
+    let mut cmd = Command::new(bin);
+    apply_test_env(&mut cmd);
+    cmd
+}
+
+/// [`toron_command`] with the environment cleared first. Only `PATH` and
+/// `TMPDIR` are kept (the child must agree with this process on the temp root).
+pub fn toron_command_clean(bin: impl AsRef<std::ffi::OsStr>) -> Command {
+    let mut cmd = Command::new(bin);
+    cmd.env_clear();
+    for keep in ["PATH", "TMPDIR"] {
+        if let Some(value) = std::env::var_os(keep) {
+            cmd.env(keep, value);
+        }
+    }
+    sandbox_env(&mut cmd);
+    cmd
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

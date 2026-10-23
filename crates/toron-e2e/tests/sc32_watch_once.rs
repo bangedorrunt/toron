@@ -16,7 +16,7 @@
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Child, Output, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -45,7 +45,7 @@ fn run(data_dir: &Path, args: &[&str]) -> Output {
     // test dir's stored post — foreign-socket starvation, not the ADR path.
     let absent = std::env::temp_dir().join(format!("toron-e2e-absent-{}.sock", std::process::id()));
     let _ = std::fs::remove_file(&absent);
-    Command::new(toron_bin())
+    toron_core::testkit::toron_command(toron_bin())
         .args(args)
         .arg("--json")
         .env("TORON_MCP_DATA_DIR", data_dir)
@@ -72,7 +72,7 @@ fn spawn_watch(
     timeout_ms: &str,
     wake_sock: &Path,
 ) -> (Child, std::thread::JoinHandle<String>) {
-    let mut child = Command::new(toron_bin())
+    let mut child = toron_core::testkit::toron_command(toron_bin())
         .args([
             "watch",
             "--project",

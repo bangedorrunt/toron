@@ -11,7 +11,7 @@
 
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::Output;
 
 use toron_core::envelope::{Class, ContextId, ContractId, Envelope, MsgId, Recipient, TaskId};
 use toron_core::inbox::{HeadRow, InboxStore};
@@ -35,9 +35,8 @@ fn scratch(tag: &str) -> PathBuf {
 }
 
 fn toron(dir: &Path, key: Option<&Path>, args: &[&str]) -> Output {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_toron"));
-    cmd.env_clear()
-        .env("HOME", dir)
+    let mut cmd = toron_core::testkit::toron_command_clean(env!("CARGO_BIN_EXE_toron"));
+    cmd.env("HOME", dir)
         .env("XDG_DATA_HOME", dir.join("xdg-data"))
         .env("XDG_STATE_HOME", dir.join("xdg-state"))
         .env("XDG_CONFIG_HOME", dir.join("xdg-config"))

@@ -222,7 +222,10 @@ async fn sc_fw_flywheel_binary_live() {
     assert_eq!(defs, 1, "single agent_prompt after bd-o8j.2: {hits}");
 
     // Live: the flywheel binary's embedded mailbox health check.
-    let out = std::process::Command::new("flywheel")
+    // flywheel embeds toron-core: under the harness its mailbox is the
+    // sandbox (an explicit TORON_DATA_DIR any toron-core honours), never the
+    // operator's store.
+    let out = toron_core::testkit::apply_test_env(&mut std::process::Command::new("flywheel"))
         .args(["toron", "status"])
         .output()
         .expect("flywheel toron status");

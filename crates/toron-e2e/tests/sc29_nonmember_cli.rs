@@ -15,7 +15,7 @@
 //! Un-gated (ADR-0020 §6.2).
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::Output;
 use std::sync::Arc;
 
 use serde_json::Value;
@@ -37,7 +37,7 @@ fn toron_bin() -> PathBuf {
 }
 
 fn run(data_dir: &Path, args: &[&str]) -> Output {
-    Command::new(toron_bin())
+    toron_core::testkit::toron_command(toron_bin())
         .args(args)
         .arg("--json")
         .env("TORON_MCP_DATA_DIR", data_dir)
