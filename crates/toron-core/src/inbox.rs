@@ -674,17 +674,18 @@ impl InboxStore {
             let Body::Steer(steer) = contracts::parse(env)? else {
                 unreachable!("steer@1 parses as a steer body");
             };
-            // No lead row: do not invent an epoch. A row fences the steer to
-            // that epoch exactly; a lower or higher one writes nothing.
-            if let Some(cur) = lead_epoch(conn, context).await.map_err(unavailable)?
-                && steer.sup_epoch != cur
-            {
-                return Err(Reject::StaleSupEpoch {
-                    sent: steer.sup_epoch,
-                    current: cur,
-                }
-                .into());
-            }
+            // F7: with a lead row, only its holder at its epoch steers; a
+            // lower or higher epoch, or another key at the right one, writes
+            // nothing. With no row, only the operator steers (`NoLead` for
+            // anyone else), and no epoch or holder is invented.
+            let lead = lead_row(conn, context).await.map_err(unavailable)?;
+            Authority::check_steer(
+                lead.as_ref().map(|l| (l.holder.as_str(), l.sup_epoch)),
+                &env.from,
+                standing,
+                steer.sup_epoch,
+                context,
+            )?;
             // A steer is the control fact itself, not a swarm send. Return
             // before the supervisor-topology refusal, the same way a role
             // fact does, so it is stored rather than answered `NotYet`.
@@ -1327,6 +1328,25 @@ async fn lead_epoch(
             .fetch_optional(&mut *conn)
             .await?;
     Ok(epoch.map(|e| e as u64))
+}
+
+/// The `lead@1` row on record for `context` (holder and epoch), if any. The
+/// steer fence reads both in the append's transaction.
+async fn lead_row(
+    conn: &mut SqliteConnection,
+    context: &str,
+) -> Result<Option<LeadRow>, sqlx::Error> {
+    let row = sqlx::query("SELECT holder, sup_epoch FROM inbox_lead WHERE context = ?1")
+        .bind(context)
+        .fetch_optional(&mut *conn)
+        .await?;
+    Ok(row.map(|r| {
+        let epoch: i64 = r.get(1);
+        LeadRow {
+            holder: r.get(0),
+            sup_epoch: epoch as u64,
+        }
+    }))
 }
 
 /// Project an accepted lead fact. The caller already fenced `sup_epoch`.

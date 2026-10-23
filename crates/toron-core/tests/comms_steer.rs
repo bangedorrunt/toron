@@ -127,6 +127,14 @@ async fn swarm(tag: &str) -> (InboxStore, Seqs) {
     (s, q)
 }
 
+/// The operator opens the lead lease for the captain at epoch 1, the epoch
+/// `steer_env` names. A steer needs the lead holder (F7): with no row, only
+/// an operator steer is stored.
+async fn led(s: &InboxStore, q: &mut Seqs) {
+    let m = q.msg(OP);
+    put(s, q, lead_env(m, CAP, 1)).await;
+}
+
 /// Append the task, let the crew read it, and accept it. Returns the task key.
 async fn claimed(s: &InboxStore, q: &mut Seqs) -> String {
     let m = q.msg(CAP);
@@ -223,6 +231,7 @@ async fn crew_steer_is_refused_and_writes_no_row() {
 #[tokio::test]
 async fn captain_redirect_then_done_at_the_old_gen_writes_nothing() {
     let (s, mut q) = swarm("redirect").await;
+    led(&s, &mut q).await;
     let key = claimed(&s, &mut q).await;
     let m = q.msg(CAP);
     put(
@@ -263,6 +272,7 @@ async fn captain_redirect_then_done_at_the_old_gen_writes_nothing() {
 #[tokio::test]
 async fn pause_does_not_make_the_old_gen_stale() {
     let (s, mut q) = swarm("pause").await;
+    led(&s, &mut q).await;
     let key = claimed(&s, &mut q).await;
     let m = q.msg(CAP);
     put(&s, &mut q, steer_env(m, "pause", None)).await;
@@ -296,6 +306,7 @@ fn steer_pending_verbs_are_the_two_ack_lines() {
 #[tokio::test]
 async fn progress_and_done_wait_until_the_steer_is_acked() {
     let (s, mut q) = swarm("pending").await;
+    led(&s, &mut q).await;
     let key = claimed(&s, &mut q).await;
     let m = q.msg(CAP);
     let steer = steer_env(m, "redirect", Some(serde_json::json!({"goal": "retarget"})));
@@ -550,4 +561,124 @@ async fn goal_and_escalate_land_in_a_supervisor_context() {
     };
     put(&s, &mut q, up.clone()).await;
     assert!(s.lookup(&up.msg).await.unwrap().is_some());
+}
+
+/// F7 (stack review 2026-10-23): with a lead row the fence binds the sender
+/// to the lead holder at the current epoch; with none, only the operator
+/// steers. Every refusal writes nothing.
+async fn refused_and_absent(s: &InboxStore, env: &Envelope) -> Reject {
+    let err = s.append_envelope(env).await.unwrap_err();
+    assert!(
+        s.lookup(&env.msg).await.unwrap().is_none(),
+        "a refused steer leaves no log row"
+    );
+    match err {
+        InboxError::Reject(r) => r,
+        other => panic!("not a typed refusal: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn with_no_lead_row_only_the_operator_steers() {
+    let (s, mut q) = swarm("nolead").await;
+    let key = claimed(&s, &mut q).await;
+    // The captain and the supervisor may steer by role, and name the epoch a
+    // lead would carry. No lead@1 row exists, so neither holds the lead.
+    for who in [CAP, SUP] {
+        let env = steer_env(q.msg(who), "pause", None);
+        let r = refused_and_absent(&s, &env).await;
+        assert_eq!(
+            r,
+            Reject::NoLead {
+                context: CTX.into()
+            },
+            "{who}"
+        );
+    }
+    assert_eq!(steer_rows(&s).await, 0);
+    // The operator key steers with no lead: stored, projected, delivered.
+    let op = steer_env(q.msg(OP), "pause", None);
+    put(&s, &mut q, op.clone()).await;
+    assert!(s.lookup(&op.msg).await.unwrap().is_some());
+    assert_eq!(steer_rows(&s).await, 1);
+    let seen = s.next(CREW, None, true).await.unwrap();
+    assert!(seen.items.iter().any(|i| i.envelope.msg == op.msg));
+    let d = s.delivery(&key, CREW).await.unwrap();
+    assert_eq!(d.generation, 1, "pause does not fence the task");
+}
+
+#[tokio::test]
+async fn a_non_holder_at_the_current_epoch_is_refused() {
+    let (s, mut q) = swarm("nonholder").await;
+    led(&s, &mut q).await;
+    let key = claimed(&s, &mut q).await;
+    // SUP may steer by role and names the current epoch, but CAP holds it.
+    let env = steer_env(
+        q.msg(SUP),
+        "redirect",
+        Some(serde_json::json!({"goal": "hijack"})),
+    );
+    let r = refused_and_absent(&s, &env).await;
+    assert_eq!(
+        r,
+        Reject::NotLeadHolder {
+            actor: SUP.into(),
+            holder: CAP.into(),
+            sup_epoch: 1,
+        }
+    );
+    // The operator is not the holder either.
+    let op = steer_env(q.msg(OP), "cancel", None);
+    let r = refused_and_absent(&s, &op).await;
+    assert!(
+        matches!(&r, Reject::NotLeadHolder { actor, .. } if actor == OP),
+        "{r:?}"
+    );
+    assert_eq!(steer_rows(&s).await, 0);
+    let d = s.delivery(&key, CREW).await.unwrap();
+    assert_eq!(d.generation, 1, "the refused redirect did not bump the gen");
+}
+
+#[tokio::test]
+async fn the_holder_at_the_current_epoch_is_accepted_and_a_stale_one_is_not() {
+    let (s, mut q) = swarm("holder").await;
+    led(&s, &mut q).await;
+    let key = claimed(&s, &mut q).await;
+    // The captain raises the lease to epoch 2 and stays the holder.
+    let m = q.msg(CAP);
+    put(&s, &mut q, lead_env(m, CAP, 2)).await;
+
+    // Stale: the holder itself at the old epoch is still StaleSupEpoch, and
+    // so is a non-holder (the epoch is checked first).
+    let stale = at_epoch(steer_env(q.msg(CAP), "pause", None), 1);
+    let r = refused_and_absent(&s, &stale).await;
+    assert_eq!(
+        r,
+        Reject::StaleSupEpoch {
+            sent: 1,
+            current: 2
+        }
+    );
+    let stale_sup = at_epoch(steer_env(q.msg(SUP), "pause", None), 1);
+    let r = refused_and_absent(&s, &stale_sup).await;
+    assert!(matches!(r, Reject::StaleSupEpoch { .. }), "{r:?}");
+    assert_eq!(steer_rows(&s).await, 0);
+
+    // Holder at the current epoch: stored, projected, delivered.
+    let ok = at_epoch(steer_env(q.msg(CAP), "pause", None), 2);
+    put(&s, &mut q, ok.clone()).await;
+    assert!(s.lookup(&ok.msg).await.unwrap().is_some());
+    assert_eq!(steer_rows(&s).await, 1);
+    let batch = s.next(CREW, None, true).await.unwrap();
+    assert!(batch.items.iter().any(|i| i.envelope.msg == ok.msg));
+    assert_eq!(s.delivery(&key, CREW).await.unwrap().generation, 1);
+
+    // The dry run (`authorize`) answers the same fence.
+    let dry = steer_env(q.msg(SUP), "pause", None);
+    let dry = at_epoch(dry, 2);
+    let err = s.authorize(&dry).await.unwrap_err();
+    assert!(
+        matches!(err, InboxError::Reject(Reject::NotLeadHolder { .. })),
+        "{err:?}"
+    );
 }

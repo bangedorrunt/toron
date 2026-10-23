@@ -350,3 +350,108 @@ fn with_nothing_set_the_gate_is_open() {
         );
     }
 }
+
+/// Exit 3 with the typed refusal `tag`, never a panic.
+fn refused_as(o: &Output, tag: &str) -> serde_json::Value {
+    assert_eq!(
+        o.status.code(),
+        Some(3),
+        "stdout {} stderr {}",
+        String::from_utf8_lossy(&o.stdout),
+        String::from_utf8_lossy(&o.stderr)
+    );
+    assert!(!String::from_utf8_lossy(&o.stderr).contains("panicked"));
+    let v = json(o);
+    assert_eq!(v["refused"]["reject"], tag, "{v}");
+    v
+}
+
+fn steer_at(from: &str, seq: u64, sup_epoch: u64) -> Envelope {
+    shaped(
+        from,
+        seq,
+        CREW,
+        Class::Control,
+        "steer",
+        Some("t-1"),
+        serde_json::json!({"op": "pause", "priority": "urgent", "sup_epoch": sup_epoch}),
+    )
+}
+
+/// F7 through the real binary: `no_lead` and `not_lead_holder` are typed
+/// exit-3 refusals; the operator with no lead, and the holder at the current
+/// epoch, still land.
+#[test]
+fn a_steer_is_fenced_to_the_lead_holder_with_exit_3() {
+    let (dir, key, op) = rig("steerfence");
+    let seed = [
+        ("r0.json", role_fact(&op, 0, CAP, Role::Captain)),
+        ("r1.json", role_fact(CAP, 0, CREW, Role::Crew)),
+    ];
+    for (name, env) in seed {
+        let o = append(&dir, &key, Some("1"), name, &env);
+        assert!(
+            o.status.success(),
+            "seed {name}: {}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+    }
+
+    // No lead@1 row: the captain may steer by role, and is still refused;
+    // only the operator key steers with no lead.
+    let v = refused_as(
+        &append(&dir, &key, Some("1"), "s0.json", &steer_at(CAP, 1, 1)),
+        "no_lead",
+    );
+    assert_eq!(v["refused"]["context"], CTX);
+    assert!(
+        v["error"].as_str().unwrap().contains("no lead in context"),
+        "{v}"
+    );
+
+    let o = append(&dir, &key, Some("1"), "s0op.json", &steer_at(&op, 1, 0));
+    assert!(
+        o.status.success(),
+        "operator steer with no lead: {}",
+        String::from_utf8_lossy(&o.stdout)
+    );
+    assert_eq!(json(&o)["replay"], false);
+
+    // The operator opens the lease for the captain at epoch 1.
+    let lead = shaped(
+        &op,
+        2,
+        CAP,
+        Class::Control,
+        "lead",
+        None,
+        serde_json::json!({"holder": CAP, "sup_epoch": 1}),
+    );
+    let o = append(&dir, &key, Some("1"), "lead.json", &lead);
+    assert!(
+        o.status.success(),
+        "lead: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+
+    // The operator at the current epoch is not the holder.
+    let v = refused_as(
+        &append(&dir, &key, Some("1"), "s1.json", &steer_at(&op, 3, 1)),
+        "not_lead_holder",
+    );
+    assert_eq!(v["refused"]["actor"], op.as_str());
+    assert_eq!(v["refused"]["holder"], CAP);
+    assert_eq!(v["refused"]["sup_epoch"], 1);
+
+    // Stale epoch from the holder.
+    let v = refused_as(
+        &append(&dir, &key, Some("1"), "s2.json", &steer_at(CAP, 1, 0)),
+        "stale_sup_epoch",
+    );
+    assert_eq!(v["refused"]["current"], 1);
+
+    // The holder at the current epoch lands.
+    let o = append(&dir, &key, Some("1"), "s3.json", &steer_at(CAP, 1, 1));
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stdout));
+    assert_eq!(json(&o)["replay"], false);
+}
