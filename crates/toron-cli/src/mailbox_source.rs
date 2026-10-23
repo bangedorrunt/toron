@@ -363,11 +363,8 @@ fn default_port_serving() -> bool {
 
 /// flywheel `[mail.toron] url` (best-effort: `~/.config/flywheel/config.toml`).
 fn flywheel_toron_url() -> Option<String> {
-    let home = std::env::var_os("HOME")?;
-    let path = std::path::Path::new(&home)
-        .join(".config")
-        .join("flywheel")
-        .join("config.toml");
+    let home = toron_core::config::home_env("HOME")?;
+    let path = home.join(".config").join("flywheel").join("config.toml");
     let raw = std::fs::read_to_string(path).ok()?;
     let value: toml::Value = toml::from_str(&raw).ok()?;
     value

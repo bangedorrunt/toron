@@ -42,11 +42,8 @@ pub fn default_state_dir() -> PathBuf {
 /// The daemon passphrase file: first config-home candidate.
 pub fn passphrase_file() -> PathBuf {
     let candidates = toron_core::config::passphrase_file_candidates(
-        std::env::var("XDG_CONFIG_HOME")
-            .ok()
-            .map(PathBuf::from)
-            .as_deref(),
-        std::env::var("HOME").ok().map(PathBuf::from).as_deref(),
+        toron_core::config::home_env("XDG_CONFIG_HOME").as_deref(),
+        toron_core::config::home_env("HOME").as_deref(),
     );
     candidates
         .into_iter()

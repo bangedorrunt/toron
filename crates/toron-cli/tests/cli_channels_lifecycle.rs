@@ -34,7 +34,7 @@ fn shared_data_dir() -> std::path::PathBuf {
 /// both selectors set the CLI now refuses outright, so the pin is the only
 /// honest environment for these cross-process assertions.
 fn toron() -> Command {
-    let mut c = Command::new(env!("CARGO_BIN_EXE_toron"));
+    let mut c = toron_core::testkit::toron_command(env!("CARGO_BIN_EXE_toron"));
     c.env_remove("TORON_MCP_URL");
     c
 }

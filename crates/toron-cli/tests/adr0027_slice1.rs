@@ -28,7 +28,7 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn toron() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_toron"))
+    toron_core::testkit::toron_command(env!("CARGO_BIN_EXE_toron"))
 }
 
 fn run(args: &[&str]) -> std::process::Output {

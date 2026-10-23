@@ -151,17 +151,12 @@ pub fn systemd_unit(
 }
 
 fn home_systemd_user() -> anyhow::Result<PathBuf> {
-    if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME")
-        && !xdg.is_empty()
-    {
-        return Ok(PathBuf::from(xdg).join("systemd").join("user"));
+    if let Some(xdg) = toron_core::config::home_env("XDG_CONFIG_HOME") {
+        return Ok(xdg.join("systemd").join("user"));
     }
-    let home = std::env::var("HOME")
-        .map_err(|_| anyhow::anyhow!("HOME unset; cannot locate systemd user units"))?;
-    Ok(PathBuf::from(home)
-        .join(".config")
-        .join("systemd")
-        .join("user"))
+    let home = toron_core::config::home_env("HOME")
+        .ok_or_else(|| anyhow::anyhow!("HOME unset; cannot locate systemd user units"))?;
+    Ok(home.join(".config").join("systemd").join("user"))
 }
 
 #[cfg(test)]

@@ -59,7 +59,7 @@ async fn seeded_root() -> PathBuf {
 }
 
 fn toron(root: &PathBuf) -> Command {
-    let mut c = Command::new(env!("CARGO_BIN_EXE_toron"));
+    let mut c = toron_core::testkit::toron_command(env!("CARGO_BIN_EXE_toron"));
     c.env_remove("TORON_MCP_URL").env("TORON_DATA_DIR", root);
     c
 }

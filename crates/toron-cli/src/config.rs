@@ -255,14 +255,11 @@ fn system_config_path() -> PathBuf {
 }
 
 fn user_config_path() -> PathBuf {
-    if let Some(xdg) = env::var_os("XDG_CONFIG_HOME") {
-        return PathBuf::from(xdg).join("toron").join("config.toml");
+    if let Some(xdg) = toron_core::config::home_env("XDG_CONFIG_HOME") {
+        return xdg.join("toron").join("config.toml");
     }
-    if let Some(home) = env::var_os("HOME") {
-        return PathBuf::from(home)
-            .join(".config")
-            .join("toron")
-            .join("config.toml");
+    if let Some(home) = toron_core::config::home_env("HOME") {
+        return home.join(".config").join("toron").join("config.toml");
     }
     PathBuf::from(".toron.toml")
 }

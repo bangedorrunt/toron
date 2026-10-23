@@ -37,7 +37,7 @@ fn shared_data_dir() -> std::path::PathBuf {
 }
 
 fn toron() -> Command {
-    let mut c = Command::new(env!("CARGO_BIN_EXE_toron"));
+    let mut c = toron_core::testkit::toron_command(env!("CARGO_BIN_EXE_toron"));
     // These tests pin their own mailbox with TORON_MCP_DATA_DIR. An ambient
     // TORON_MCP_URL outranks that pin — `mailbox_source::decide_source`
     // checks the daemon URL first and returns before reading the data dir —
@@ -2115,7 +2115,7 @@ fn boot_daemon(data_dir: &std::path::Path) -> (DaemonGuard, u16) {
         .and_then(|l| l.local_addr())
         .map(|a| a.port())
         .expect("free port");
-    let child = Command::new(env!("CARGO_BIN_EXE_toron"))
+    let child = toron_core::testkit::toron_command(env!("CARGO_BIN_EXE_toron"))
         .args(["serve", "--mcp-http", &format!("127.0.0.1:{port}")])
         .env("TORON_MCP_DATA_DIR", data_dir)
         .env("RUST_LOG", "error")
@@ -3190,12 +3190,16 @@ fn guard_commit_msg_blocks_foreign_bead_tokens() {
     let _ = std::fs::remove_dir_all(&repo);
     std::fs::create_dir_all(repo.join("src")).expect("src dir");
 
+    // spawn-harness: PATH only, for the installed hooks; every git command
+    // that can reach them is built by `with_env` under `apply_test_env`.
     let bin_dir = std::path::Path::new(env!("CARGO_BIN_EXE_toron"))
         .parent()
         .expect("bin dir")
         .to_path_buf();
     let path_var = std::env::var("PATH").unwrap_or_default();
     let with_env = |c: &mut Command| {
+        // The hooks run `toron`, so git runs under the harness too.
+        toron_core::testkit::apply_test_env(c);
         c.current_dir(&repo)
             .env("TORON_MCP_DATA_DIR", &data_dir)
             .env("TORON_AGENT", "HunkAgent")
@@ -3230,7 +3234,7 @@ fn guard_commit_msg_blocks_foreign_bead_tokens() {
     assert!(git(&["config", "user.name", "toron-ci"]).status.success());
     // Lease covers the file so the pre-commit sweep passes; only the
     // bead-hunk check may block.
-    let mut acq = Command::new(env!("CARGO_BIN_EXE_toron"));
+    let mut acq = toron_core::testkit::toron_command(env!("CARGO_BIN_EXE_toron"));
     acq.env("TORON_MCP_DATA_DIR", &data_dir)
         .env_remove("TORON_MCP_URL")
         .args([
@@ -3248,7 +3252,7 @@ fn guard_commit_msg_blocks_foreign_bead_tokens() {
         .output()
         .expect("acquire lease");
     // Install BOTH guard hooks into the temp repo.
-    let mut inst = Command::new(env!("CARGO_BIN_EXE_toron"));
+    let mut inst = toron_core::testkit::toron_command(env!("CARGO_BIN_EXE_toron"));
     inst.env("TORON_MCP_DATA_DIR", &data_dir)
         .env_remove("TORON_MCP_URL")
         .args(["guard", "install", "--repo"])

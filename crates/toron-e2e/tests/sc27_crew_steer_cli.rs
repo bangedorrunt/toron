@@ -31,7 +31,7 @@
 //! Un-gated (ADR-0020 §6.2: "new un-gated CLI tests").
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::Output;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -69,7 +69,7 @@ fn run(data_dir: &Path, args: &[&str]) -> Output {
     // path the test actually asserts (was green pre-sidecar, red after).
     let absent = std::env::temp_dir().join(format!("toron-e2e-absent-{}.sock", std::process::id()));
     let _ = std::fs::remove_file(&absent);
-    Command::new(toron_bin())
+    toron_core::testkit::toron_command(toron_bin())
         .args(args)
         .arg("--json")
         .env("TORON_MCP_DATA_DIR", data_dir)
