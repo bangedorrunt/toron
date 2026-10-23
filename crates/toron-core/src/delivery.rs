@@ -319,8 +319,8 @@ pub enum Reject {
         op: String,
     },
     /// A lead fact, or a steer naming a lead epoch, that is not strictly
-    /// newer than the epoch on record (Phase 4a.3). No lead row: this is not
-    /// raised, and the steer is not given an invented epoch.
+    /// newer than the epoch on record (Phase 4a.3). A lead fact with no row
+    /// is not this refusal; a steer with no row is [`Reject::NoLead`].
     ///
     /// A struct variant (the enum is internally tagged).
     #[error("stale sup_epoch {sent}, current {current}")]
@@ -329,6 +329,29 @@ pub enum Reject {
         sent: u64,
         /// The epoch on record.
         current: u64,
+    },
+    /// A steer from a key other than the operator in a context with no
+    /// `lead@1` row (F7, stack review 2026-10-23). Nobody holds the lead, so
+    /// only the operator may steer: the fence is closed to everyone else.
+    ///
+    /// A struct variant (the enum is internally tagged).
+    #[error("no lead in context {context}: only the operator may steer")]
+    NoLead {
+        /// The context the steer named.
+        context: String,
+    },
+    /// A steer at the current `sup_epoch` from a key that is not the lead
+    /// holder on record (F7). Reading the epoch is not holding the lead.
+    ///
+    /// A struct variant (the enum is internally tagged).
+    #[error("{actor} is not the lead holder {holder} at sup_epoch {sup_epoch}")]
+    NotLeadHolder {
+        /// Who sent the steer (`env.from`).
+        actor: String,
+        /// The holder the `lead@1` row names.
+        holder: String,
+        /// The current epoch on record.
+        sup_epoch: u64,
     },
 }
 
