@@ -28,9 +28,10 @@ use crate::contracts::{
     self, Body, context_v1::ContextV1, lead_v1::LeadV1, role_v1::RoleV1, steer_v1::SteerV1,
 };
 use crate::delivery::{DeliveryEvent, DeliveryFsm, DeliveryState, Phase, Reject};
-use crate::envelope::{Class, Envelope, MsgId};
+use crate::envelope::{Class, ContractId, Envelope, MsgId};
 use crate::kernel::{self, AppendError, DurableLog, Offset};
 use crate::topology::{self, Topology};
+use crate::wake::Urgency;
 
 /// The SQLite effect journal (`kernel::JournalStore`), named here beside
 /// [`ToronLog`] as the build plan lists them.
@@ -176,6 +177,57 @@ pub struct StoredEnvelope {
 pub const BY_TRIPLE_SQL: &str = "SELECT msg_key, log_offset, recipient, payload \
      FROM inbox_log WHERE producer = ?1 AND epoch = ?2 AND seq = ?3 AND stream = 'inbox'";
 
+/// The unread read, written once: rows for one recipient on the inbox stream,
+/// past an offset, oldest first. [`InboxStore::next`] runs it whole and
+/// [`InboxStore::unread_head`] runs it with `LIMIT 1`, so the head is by
+/// construction the first item `next` would serve. The
+/// `inbox_log_by_recipient (stream, recipient, log_offset)` index answers both.
+macro_rules! unread_sql {
+    () => {
+        "SELECT log_offset, msg_key, payload FROM inbox_log \
+         WHERE stream = ?1 AND recipient = ?2 AND log_offset > ?3 ORDER BY log_offset"
+    };
+}
+
+/// `?1` stream, `?2` recipient, `?3` the offset to read past.
+pub const UNREAD_SQL: &str = unread_sql!();
+
+/// [`UNREAD_SQL`] as a point read: one index seek, one row. Exported so a test
+/// can pin its plan.
+pub const UNREAD_HEAD_SQL: &str = concat!(unread_sql!(), " LIMIT 1");
+
+/// The recipient's oldest unread message, as [`InboxStore::unread_head`]
+/// reports it: what a wake decision needs and nothing it does not. No body, no
+/// payload. The urgency is derived from the body at read, by [`urgency_of`],
+/// the same rule [`urgent_pending`] applies to a peeked batch.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct HeadRow {
+    /// Log offset. The log's first offset is 1, so a head is never 0.
+    pub offset: std::num::NonZeroU64,
+    /// `producer:epoch:seq`.
+    pub msg_key: String,
+    /// Body contract (`steer@1`, `notify@1`, `escalate@1`, …).
+    pub contract: ContractId,
+    /// Message class.
+    pub class: Class,
+    /// `Urgent` only for `steer@1` with `priority = "urgent"`.
+    pub urgency: Urgency,
+}
+
+/// Urgency of one envelope. Only a `steer@1` body whose `priority` field is
+/// the string `urgent` is urgent. Every other contract, including a notice
+/// whose text says "urgent", is normal; the text is not read.
+pub fn urgency_of(env: &Envelope) -> Urgency {
+    let urgent = env.contract.name == "steer"
+        && env.contract.major == 1
+        && env.body.get("priority").and_then(serde_json::Value::as_str) == Some("urgent");
+    if urgent {
+        Urgency::Urgent
+    } else {
+        Urgency::Normal
+    }
+}
+
 /// One message handed to its reader by [`InboxStore::next`].
 #[derive(Clone, Debug, Serialize)]
 pub struct InboxItem {
@@ -207,16 +259,9 @@ pub struct NextBatch {
 /// True when a peeked batch holds an urgent steer. Only `steer@1` whose
 /// `priority` field is the string `urgent` counts. Notice text is not read.
 pub fn urgent_pending(items: &[InboxItem]) -> bool {
-    items.iter().any(|it| {
-        it.envelope.contract.name == "steer"
-            && it.envelope.contract.major == 1
-            && it
-                .envelope
-                .body
-                .get("priority")
-                .and_then(serde_json::Value::as_str)
-                == Some("urgent")
-    })
+    items
+        .iter()
+        .any(|it| urgency_of(&it.envelope) == Urgency::Urgent)
 }
 
 fn now_us() -> i64 {
@@ -904,15 +949,12 @@ impl InboxStore {
         .fetch_optional(&mut *tx)
         .await?
         .unwrap_or(0);
-        let rows = sqlx::query(
-            "SELECT log_offset, msg_key, payload FROM inbox_log \
-             WHERE stream = ?1 AND recipient = ?2 AND log_offset > ?3 ORDER BY log_offset",
-        )
-        .bind(INBOX_STREAM)
-        .bind(stream)
-        .bind(before)
-        .fetch_all(&mut *tx)
-        .await?;
+        let rows = sqlx::query(UNREAD_SQL)
+            .bind(INBOX_STREAM)
+            .bind(stream)
+            .bind(before)
+            .fetch_all(&mut *tx)
+            .await?;
         let after = rows.last().map_or(before, |r| r.get::<i64, _>(0));
         let now = now_us();
         let mut items = Vec::with_capacity(rows.len());
@@ -1294,6 +1336,40 @@ impl InboxStore {
         .fetch_one(&self.pool)
         .await?;
         Ok(h.map_or(0, |h| h as u64))
+    }
+
+    /// The recipient's oldest unread message past `after` (pass the reader's
+    /// cursor), or `None` when nothing past it is unread. This is the first
+    /// item `toron next` would serve: the same query ([`UNREAD_SQL`]) with
+    /// `LIMIT 1`, so one index seek and one row however long the stream is.
+    /// Read-only: no transaction, no cursor move, no delivery fact.
+    pub async fn unread_head(
+        &self,
+        recipient: &str,
+        after: u64,
+    ) -> Result<Option<HeadRow>, InboxError> {
+        let Some(row) = sqlx::query(UNREAD_HEAD_SQL)
+            .bind(INBOX_STREAM)
+            .bind(recipient)
+            .bind(after as i64)
+            .fetch_optional(&self.pool)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let offset = row.get::<i64, _>(0) as u64;
+        let offset = std::num::NonZeroU64::new(offset).ok_or_else(|| {
+            Reject::bad_envelope("stored row at log offset 0 (the log starts at 1)")
+        })?;
+        let envelope: Envelope = serde_json::from_str(&row.get::<String, _>(2))
+            .map_err(|e| Reject::bad_envelope(format!("stored payload: {e}")))?;
+        Ok(Some(HeadRow {
+            offset,
+            msg_key: row.get(1),
+            urgency: urgency_of(&envelope),
+            contract: envelope.contract,
+            class: envelope.class,
+        }))
     }
 }
 
