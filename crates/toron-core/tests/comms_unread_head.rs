@@ -6,13 +6,19 @@
 //! offset; the parity test holds that as the log and the cursor move. The
 //! plan test pins the index seek, and the 100k test shows the read stays one
 //! row while the unread backlog and the other recipients' rows grow.
+//!
+//! `InboxStore::pending_urgent` is the oldest unread urgent row: `Some`
+//! exactly when `next --peek --urgent` says urgent. Its SQL predicate is held
+//! to `urgency_of` and to migration 0031's partial index, and the 100k test
+//! puts the urgent steer at the front and at the back of the backlog.
 
 use std::num::NonZeroU64;
 use std::time::Instant;
 
 use toron_core::envelope::{Class, ContextId, ContractId, Envelope, MsgId, Recipient, TaskId};
 use toron_core::inbox::{
-    HeadRow, INBOX_STREAM, InboxStore, UNREAD_HEAD_SQL, UNREAD_SQL, urgency_of,
+    HeadRow, INBOX_STREAM, InboxStore, PENDING_URGENT_SQL, UNREAD_HEAD_SQL, UNREAD_SQL,
+    URGENT_WHERE, urgency_of, urgent_pending,
 };
 use toron_core::index::schema;
 use toron_core::wake::Urgency;
@@ -113,6 +119,24 @@ async fn next_head(s: &InboxStore, reader: &str) -> (u64, Option<HeadRow>) {
         urgency: urgency_of(&it.envelope),
     });
     (b.cursor_before, head)
+}
+
+/// What `next --peek --urgent` decides (`urgent_pending`), and the first
+/// urgent item of the same batch, in `HeadRow` terms.
+async fn next_urgent(s: &InboxStore, reader: &str) -> (u64, Option<HeadRow>, bool) {
+    let b = s.next(reader, None, true).await.unwrap();
+    let first = b
+        .items
+        .iter()
+        .find(|it| urgency_of(&it.envelope) == Urgency::Urgent)
+        .map(|it| HeadRow {
+            offset: NonZeroU64::new(it.offset).unwrap(),
+            msg_key: it.msg_key.clone(),
+            contract: it.envelope.contract.clone(),
+            class: it.envelope.class,
+            urgency: Urgency::Urgent,
+        });
+    (b.cursor_before, first, urgent_pending(&b.items))
 }
 
 #[tokio::test]
@@ -238,6 +262,10 @@ async fn the_head_is_the_first_item_next_serves_as_the_log_and_cursor_move() {
             served,
             "round {round}: the head is what next would serve"
         );
+        let (cursor, urgent, any) = next_urgent(&s, CREW).await;
+        let pending = s.pending_urgent(CREW, cursor).await.unwrap();
+        assert_eq!(pending, urgent, "round {round}: the first urgent item");
+        assert_eq!(pending.is_some(), any, "round {round}: --peek --urgent");
         // Every third round the crew reads, so the cursor moves.
         if round % 3 == 2 {
             s.next(CREW, None, false).await.unwrap();
@@ -330,4 +358,239 @@ async fn the_head_read_is_one_index_seek_at_100k_rows() {
          the full unread read {} rows in {all_us} us",
         all.len()
     );
+}
+
+#[tokio::test]
+async fn an_older_notify_ahead_of_an_urgent_steer_is_pending_urgent() {
+    let s = store("pu-behind").await;
+    s.append_envelope(&lead()).await.unwrap();
+    let n = s
+        .append_envelope(&notify(OP, 1, CREW, "older"))
+        .await
+        .unwrap();
+    s.append_envelope(&steer(0, CREW, "normal")).await.unwrap();
+    s.append_envelope(&steer(1, OTHER, "urgent")).await.unwrap();
+    let st = s.append_envelope(&steer(2, CREW, "urgent")).await.unwrap();
+    s.append_envelope(&notify(OP, 2, CREW, "newer"))
+        .await
+        .unwrap();
+    // FIFO head is the notify; the pending urgent row is the steer behind it,
+    // not the other recipient's.
+    assert_eq!(
+        s.unread_head(CREW, 0).await.unwrap().unwrap().offset.get(),
+        n.offset
+    );
+    let p = s
+        .pending_urgent(CREW, 0)
+        .await
+        .unwrap()
+        .expect("an urgent steer is pending");
+    assert_eq!(p.offset.get(), st.offset);
+    assert_eq!(p.contract, ContractId::new("steer", 1));
+    assert_eq!(p.class, Class::Control);
+    assert_eq!(p.urgency, Urgency::Urgent);
+    // Past it, nothing urgent is pending.
+    assert_eq!(s.pending_urgent(CREW, st.offset).await.unwrap(), None);
+}
+
+#[tokio::test]
+async fn only_notifies_and_normal_steers_are_not_pending_urgent() {
+    let s = store("pu-none").await;
+    assert_eq!(s.pending_urgent(CREW, 0).await.unwrap(), None);
+    s.append_envelope(&lead()).await.unwrap();
+    s.append_envelope(&notify(OP, 1, CREW, "priority: urgent"))
+        .await
+        .unwrap();
+    s.append_envelope(&steer(0, CREW, "normal")).await.unwrap();
+    s.append_envelope(&notify(OP, 2, CREW, "URGENT"))
+        .await
+        .unwrap();
+    assert_eq!(s.pending_urgent(CREW, 0).await.unwrap(), None);
+    let (_, _, any) = next_urgent(&s, CREW).await;
+    assert!(!any, "--peek --urgent agrees");
+}
+
+#[tokio::test]
+async fn a_read_and_acked_urgent_steer_is_not_pending() {
+    let s = store("pu-acked").await;
+    s.append_envelope(&lead()).await.unwrap();
+    s.append_envelope(&steer(0, CREW, "urgent")).await.unwrap();
+    assert!(s.pending_urgent(CREW, 0).await.unwrap().is_some());
+    let read = s.next(CREW, None, false).await.unwrap();
+    s.ack(CREW, &read.items[0].msg_key, true, None)
+        .await
+        .expect("crew accepts");
+    let cursor = s.cursor(CREW, CREW).await.unwrap();
+    assert_eq!(s.pending_urgent(CREW, cursor).await.unwrap(), None);
+    let (c, _, any) = next_urgent(&s, CREW).await;
+    assert_eq!(c, cursor);
+    assert!(!any);
+    // A later normal steer does not revive it.
+    s.append_envelope(&steer(1, CREW, "normal")).await.unwrap();
+    assert_eq!(s.pending_urgent(CREW, cursor).await.unwrap(), None);
+}
+
+/// One whitespace-normalised spelling, for comparing SQL texts.
+fn squash(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+#[tokio::test]
+async fn the_sql_urgency_predicate_is_urgency_of_and_the_index() {
+    // The partial index declares the same predicate the query uses, so the
+    // planner can match them.
+    let migration = include_str!("../migrations/0031_comms_inbox_urgent_index.sql");
+    assert!(
+        squash(migration).contains(&format!("WHERE {};", squash(URGENT_WHERE))),
+        "migration 0031 and URGENT_WHERE drifted"
+    );
+    assert!(squash(PENDING_URGENT_SQL).contains(&squash(URGENT_WHERE)));
+    // And the predicate is urgency_of, case by case.
+    let s = store("pred").await;
+    let cases = [
+        ("steer", 1, serde_json::json!({"priority": "urgent"})),
+        ("steer", 1, serde_json::json!({"priority": "normal"})),
+        ("steer", 1, serde_json::json!({})),
+        ("steer", 1, serde_json::json!({"priority": true})),
+        ("steer", 1, serde_json::json!({"priority": "URGENT"})),
+        ("steer", 2, serde_json::json!({"priority": "urgent"})),
+        (
+            "notify",
+            1,
+            serde_json::json!({"priority": "urgent", "text": "urgent"}),
+        ),
+        ("cancel", 1, serde_json::json!({"priority": "urgent"})),
+        ("escalate", 1, serde_json::json!({"priority": "urgent"})),
+    ];
+    for (name, major, body) in cases {
+        let mut e = notify(OP, 0, CREW, "x");
+        e.contract = ContractId::new(name, major);
+        e.body = body.clone();
+        let sql = format!("SELECT ({URGENT_WHERE}) IS 1 FROM (SELECT ?1 AS payload)");
+        let in_sql: bool = sqlx::query_scalar(&sql)
+            .bind(serde_json::to_string(&e).unwrap())
+            .fetch_one(s.pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            in_sql,
+            urgency_of(&e) == Urgency::Urgent,
+            "{name}@{major} {body}"
+        );
+    }
+}
+
+/// `rows` bulk rows for CREW and OTHER (half each), copying the payload at
+/// `template`: a fixture shortcut, not append.
+async fn bulk(s: &InboxStore, template: u64, rows: u32, tag: &str) {
+    sqlx::query(
+        "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < ?4) \
+         INSERT INTO inbox_log (stream, recipient, producer, epoch, seq, msg_key, payload, appended_ts_us) \
+         SELECT 'inbox', CASE WHEN i % 2 = 0 THEN ?1 ELSE ?2 END, ?5, 0, i, ?5 || ':0:' || i, \
+                (SELECT payload FROM inbox_log WHERE log_offset = ?3), 0 FROM n",
+    )
+    .bind(CREW)
+    .bind(OTHER)
+    .bind(template as i64)
+    .bind(i64::from(rows))
+    .bind(tag)
+    .execute(s.pool())
+    .await
+    .unwrap();
+}
+
+async fn plan_of(s: &InboxStore, sql: &str) -> Vec<String> {
+    sqlx::query(&format!("EXPLAIN QUERY PLAN {sql}"))
+        .bind(INBOX_STREAM)
+        .bind(CREW)
+        .bind(0i64)
+        .fetch_all(s.pool())
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| sqlx::Row::get::<String, _>(r, 3))
+        .collect()
+}
+
+/// Mean microseconds of `pending_urgent(CREW, 0)` over `runs`, and its answer.
+async fn time_pending(s: &InboxStore, runs: u32) -> (u128, Option<HeadRow>) {
+    let t = Instant::now();
+    let mut h = None;
+    for _ in 0..runs {
+        h = s.pending_urgent(CREW, 0).await.unwrap();
+    }
+    (t.elapsed().as_micros() / u128::from(runs), h)
+}
+
+/// What answering the same question by reading the unread set costs: every
+/// unread row, each payload parsed and judged by `urgency_of`.
+async fn time_scan(s: &InboxStore) -> (u128, usize) {
+    let t = Instant::now();
+    let rows = sqlx::query(UNREAD_SQL)
+        .bind(INBOX_STREAM)
+        .bind(CREW)
+        .bind(0i64)
+        .fetch_all(s.pool())
+        .await
+        .unwrap();
+    let n = rows.len();
+    let _first = rows.iter().find(|r| {
+        let e: Envelope = serde_json::from_str(&sqlx::Row::get::<String, _>(*r, 2)).unwrap();
+        urgency_of(&e) == Urgency::Urgent
+    });
+    (t.elapsed().as_micros(), n)
+}
+
+#[tokio::test]
+async fn pending_urgent_is_one_partial_index_seek_at_100k_rows_front_and_back() {
+    for at_front in [true, false] {
+        let where_ = if at_front { "front" } else { "back" };
+        let s = store(&format!("pu-100k-{where_}")).await;
+        s.append_envelope(&lead()).await.unwrap();
+        let template = s
+            .append_envelope(&notify(OP, 1, CREW, "normal"))
+            .await
+            .unwrap()
+            .offset;
+        let urgent = if at_front {
+            let u = s.append_envelope(&steer(0, CREW, "urgent")).await.unwrap();
+            bulk(&s, template, 100_000, "bulk").await;
+            u
+        } else {
+            bulk(&s, template, 100_000, "bulk").await;
+            s.append_envelope(&steer(0, CREW, "urgent")).await.unwrap()
+        };
+
+        let plan = plan_of(&s, PENDING_URGENT_SQL).await;
+        assert_eq!(plan.len(), 1, "{where_}: {plan:?}");
+        assert!(
+            plan[0].starts_with("SEARCH inbox_log USING INDEX inbox_log_urgent")
+                && plan[0].contains("log_offset>?"),
+            "{where_}: {plan:?}"
+        );
+        assert!(
+            !plan
+                .iter()
+                .any(|p| p.contains("TEMP B-TREE") || p.starts_with("SCAN"))
+        );
+
+        let runs = 200;
+        let (us, h) = time_pending(&s, runs).await;
+        let h = h.expect("the urgent steer is pending");
+        assert_eq!(h.offset.get(), urgent.offset, "{where_}");
+        assert_eq!(h.urgency, Urgency::Urgent);
+        let (scan_us, scanned) = time_scan(&s).await;
+        let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM inbox_log")
+            .fetch_one(s.pool())
+            .await
+            .unwrap();
+        assert!(total > 100_000);
+        println!(
+            "bench pending_urgent, urgent steer at the {where_} (offset {}): {total} rows in the log, {scanned} \
+             unread for the reader; pending_urgent 1 row in {us} us (mean of {runs}); \
+             reading the unread set and judging each row: {scanned} rows in {scan_us} us; \
+             plan: {}",
+            urgent.offset, plan[0]
+        );
+    }
 }

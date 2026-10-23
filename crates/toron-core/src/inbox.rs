@@ -178,28 +178,63 @@ pub const BY_TRIPLE_SQL: &str = "SELECT msg_key, log_offset, recipient, payload 
      FROM inbox_log WHERE producer = ?1 AND epoch = ?2 AND seq = ?3 AND stream = 'inbox'";
 
 /// The unread read, written once: rows for one recipient on the inbox stream,
-/// past an offset, oldest first. [`InboxStore::next`] runs it whole and
-/// [`InboxStore::unread_head`] runs it with `LIMIT 1`, so the head is by
-/// construction the first item `next` would serve. The
-/// `inbox_log_by_recipient (stream, recipient, log_offset)` index answers both.
-macro_rules! unread_sql {
+/// past an offset. [`InboxStore::next`] runs it whole, oldest first;
+/// [`InboxStore::unread_head`] and [`InboxStore::pending_urgent`] run it with
+/// `LIMIT 1`, so a head is by construction an item `next` would serve.
+///
+/// No producer / epoch / seq / `claim_epoch` filter, and none is missing:
+/// those rules are enforced at append (gaps and stale epochs never land), and
+/// a row of a since-fenced epoch is still stored and still served by `next`.
+macro_rules! unread_from {
     () => {
         "SELECT log_offset, msg_key, payload FROM inbox_log \
-         WHERE stream = ?1 AND recipient = ?2 AND log_offset > ?3 ORDER BY log_offset"
+         WHERE stream = ?1 AND recipient = ?2 AND log_offset > ?3"
+    };
+}
+
+/// The urgency rule as SQL over the stored envelope: [`urgency_of`] says
+/// `Urgent`. Written exactly as the partial index `inbox_log_urgent`
+/// (migration 0031) declares it, so the planner can use that index; a test
+/// holds the two texts equal and holds this predicate to [`urgency_of`] on a
+/// table of cases. The read still confirms each row with [`urgency_of`].
+macro_rules! urgent_where {
+    () => {
+        "json_extract(payload, '$.contract.name') = 'steer' \
+         AND json_extract(payload, '$.contract.major') = 1 \
+         AND json_extract(payload, '$.body.priority') = 'urgent'"
     };
 }
 
 /// `?1` stream, `?2` recipient, `?3` the offset to read past.
-pub const UNREAD_SQL: &str = unread_sql!();
+pub const UNREAD_SQL: &str = concat!(unread_from!(), " ORDER BY log_offset");
 
-/// [`UNREAD_SQL`] as a point read: one index seek, one row. Exported so a test
-/// can pin its plan.
-pub const UNREAD_HEAD_SQL: &str = concat!(unread_sql!(), " LIMIT 1");
+/// [`UNREAD_SQL`] as a point read: one seek of `inbox_log_by_recipient
+/// (stream, recipient, log_offset)`, one row. Exported so a test can pin its
+/// plan.
+pub const UNREAD_HEAD_SQL: &str = concat!(unread_from!(), " ORDER BY log_offset LIMIT 1");
 
-/// The recipient's oldest unread message, as [`InboxStore::unread_head`]
-/// reports it: what a wake decision needs and nothing it does not. No body, no
-/// payload. The urgency is derived from the body at read, by [`urgency_of`],
-/// the same rule [`urgent_pending`] applies to a peeked batch.
+/// The urgency predicate as text, for the test that holds it to migration
+/// 0031 and to [`urgency_of`].
+pub const URGENT_WHERE: &str = urgent_where!();
+
+/// The oldest unread urgent row: [`UNREAD_SQL`] narrowed by [`URGENT_WHERE`].
+/// One seek of the partial index `inbox_log_urgent`, however many normal rows
+/// are ahead of it. Exported so a test can pin its plan.
+pub const PENDING_URGENT_SQL: &str = concat!(
+    unread_from!(),
+    " AND ",
+    urgent_where!(),
+    " ORDER BY log_offset LIMIT 1"
+);
+
+/// One unread row, as [`InboxStore::unread_head`] and
+/// [`InboxStore::pending_urgent`] report it: what a wake decision needs and
+/// nothing it does not. Metadata only: no body, no payload. Those readers do
+/// not check that the caller is the recipient (a host reads for its panes), so
+/// they must never return content; anything that returns a payload goes
+/// through [`InboxStore::next`], which refuses a reader who is not the
+/// recipient. The urgency is derived from the body at read, by
+/// [`urgency_of`], the same rule [`urgent_pending`] applies to a peeked batch.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct HeadRow {
     /// Log offset. The log's first offset is 1, so a head is never 0.
@@ -1339,16 +1374,56 @@ impl InboxStore {
     }
 
     /// The recipient's oldest unread message past `after` (pass the reader's
-    /// cursor), or `None` when nothing past it is unread. This is the first
-    /// item `toron next` would serve: the same query ([`UNREAD_SQL`]) with
-    /// `LIMIT 1`, so one index seek and one row however long the stream is.
-    /// Read-only: no transaction, no cursor move, no delivery fact.
+    /// cursor, `cursor(npub, npub)`), or `None` when nothing past it is
+    /// unread. FIFO: the first item `toron next` would serve, from the same
+    /// query ([`UNREAD_HEAD_SQL`] is [`UNREAD_SQL`] with `LIMIT 1`), so one
+    /// index seek and one row however long the stream is.
+    ///
+    /// A host reader: read-only (no transaction, no cursor move, no delivery
+    /// fact) and, unlike `next`, no recipient check, because it returns
+    /// metadata only ([`HeadRow`]: no body, no payload). No producer / epoch /
+    /// seq / `claim_epoch` filter, the same as `next`: those are enforced at
+    /// append.
     pub async fn unread_head(
         &self,
         recipient: &str,
         after: u64,
     ) -> Result<Option<HeadRow>, InboxError> {
-        let Some(row) = sqlx::query(UNREAD_HEAD_SQL)
+        self.point_read(UNREAD_HEAD_SQL, recipient, after).await
+    }
+
+    /// The recipient's oldest unread `Urgent` message past `after`, or `None`
+    /// when none is pending: `Some` exactly when `toron next --peek --urgent`
+    /// prints `urgent`, and then the first such item it would serve. A row
+    /// behind the cursor (read, and acked or not) is not pending.
+    ///
+    /// [`PENDING_URGENT_SQL`] narrows by the urgency rule in SQL so the
+    /// partial index `inbox_log_urgent` answers it in one seek, whatever
+    /// number of normal rows is ahead; the row is then confirmed by
+    /// [`urgency_of`], the one rule, so a disagreement reads as `None` and
+    /// never invents an urgent wake. Same host-reader terms as
+    /// [`Self::unread_head`]: read-only, no recipient check, metadata only, no
+    /// producer / epoch / seq / `claim_epoch` filter (enforced at append).
+    pub async fn pending_urgent(
+        &self,
+        recipient: &str,
+        after: u64,
+    ) -> Result<Option<HeadRow>, InboxError> {
+        Ok(self
+            .point_read(PENDING_URGENT_SQL, recipient, after)
+            .await?
+            .filter(|h| h.urgency == Urgency::Urgent))
+    }
+
+    /// One row of an unread query (`?1` stream, `?2` recipient, `?3` after)
+    /// as a [`HeadRow`]. The payload is parsed here and dropped here.
+    async fn point_read(
+        &self,
+        sql: &'static str,
+        recipient: &str,
+        after: u64,
+    ) -> Result<Option<HeadRow>, InboxError> {
+        let Some(row) = sqlx::query(sql)
             .bind(INBOX_STREAM)
             .bind(recipient)
             .bind(after as i64)
