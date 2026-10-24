@@ -1381,7 +1381,7 @@ impl Mailbox {
         let memo_key = (project_slug.to_string(), name.to_string());
         let cached = self
             .alt_key_paths
-            .lock()
+            .pin()
             .get(&memo_key)
             .map(|m| m.path.clone());
         match cached {
@@ -1390,10 +1390,10 @@ impl Mailbox {
                     return Some(keys);
                 }
                 // Deleted (or unreadable) since the walk: forget and re-walk.
-                self.alt_key_paths.lock().remove(&memo_key);
+                self.alt_key_paths.pin().remove(&memo_key);
             }
             Some(None) => {
-                let memo = self.alt_key_paths.lock();
+                let memo = self.alt_key_paths.pin();
                 let live = memo
                     .get(&memo_key)
                     .and_then(|m| m.miss_until)
@@ -1402,14 +1402,14 @@ impl Mailbox {
                 if live {
                     return None;
                 }
-                self.alt_key_paths.lock().remove(&memo_key);
+                self.alt_key_paths.pin().remove(&memo_key);
             }
             None => {}
         }
         let found = self.walk_alt_agent_key(project_slug, name);
         {
             const ALT_KEY_MEMO_CAP: usize = 4096;
-            let mut memo = self.alt_key_paths.lock();
+            let memo = self.alt_key_paths.pin();
             if memo.len() >= ALT_KEY_MEMO_CAP {
                 memo.clear();
             }

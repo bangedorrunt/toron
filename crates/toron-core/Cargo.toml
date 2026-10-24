@@ -10,6 +10,10 @@ sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio", "macros", "migr
 git2 = { version = "0.19", features = ["vendored-libgit2"] }
 tokio-tungstenite = "0.24"
 parking_lot = "0.12"
+# Read-mostly key caches (key_cache, alt_key_paths) are lock-free reads:
+# their critical sections are one hash lookup, and readers used to queue
+# behind the poller. NOT for values mutated in place.
+papaya = "0.2.5"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 chrono = "0.4"

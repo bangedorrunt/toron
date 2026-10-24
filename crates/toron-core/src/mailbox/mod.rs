@@ -140,7 +140,7 @@ pub struct Mailbox {
     /// on the same data dir must NOT re-pay the N-key KDF — the bench loop and
     /// CLI-per-invocation mailbox builds reuse the unlocked keys of every
     /// earlier instance in the process.
-    key_cache: Arc<parking_lot::Mutex<HashMap<PathBuf, CachedAgentKey>>>,
+    key_cache: Arc<papaya::HashMap<PathBuf, CachedAgentKey>>,
 
     /// Total argon2 KDF invocations this process has performed (test
     /// observable; the many-keys gate asserts the warm-rebuild bound).
@@ -171,7 +171,7 @@ pub struct Mailbox {
     /// roots, so every `fetch_inbox` re-walked it — five polls a second held
     /// the daemon at 27% CPU. The PATH is memoized, not the key: a deleted
     /// key file still reads as absent, exactly as the uncached walk did.
-    alt_key_paths: Arc<parking_lot::Mutex<HashMap<(String, String), AltKeyMemo>>>,
+    alt_key_paths: Arc<papaya::HashMap<(String, String), AltKeyMemo>>,
     /// Test/metrics observable: alternate-root walks performed.
     alt_key_walks: Arc<AtomicU64>,
 }
@@ -199,8 +199,7 @@ struct CachedAgentKey {
 /// pass per unique (path, content) ever unlocked in this process, across all
 /// mailbox instances. Prevents per-instance cold rebuilds (bench loops, CLI
 /// per-invocation mailboxes) from re-paying N × ~1s KDF.
-static AGENT_KEY_CACHE: OnceLock<Arc<parking_lot::Mutex<HashMap<PathBuf, CachedAgentKey>>>> =
-    OnceLock::new();
+static AGENT_KEY_CACHE: OnceLock<Arc<papaya::HashMap<PathBuf, CachedAgentKey>>> = OnceLock::new();
 
 impl std::fmt::Debug for Mailbox {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -225,7 +224,7 @@ impl Mailbox {
             wrap_idempotency: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             index_pool: None,
             key_cache: AGENT_KEY_CACHE
-                .get_or_init(|| Arc::new(parking_lot::Mutex::new(HashMap::new())))
+                .get_or_init(|| Arc::new(papaya::HashMap::new()))
                 .clone(),
             kdf_loads: Arc::new(AtomicU64::new(0)),
             trigger_tx: None,
@@ -235,7 +234,7 @@ impl Mailbox {
             )),
             unwrap_cache_hits: Arc::new(AtomicU64::new(0)),
             unwrap_cache_misses: Arc::new(AtomicU64::new(0)),
-            alt_key_paths: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            alt_key_paths: Arc::new(papaya::HashMap::new()),
             alt_key_walks: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -311,7 +310,7 @@ impl Mailbox {
     /// resolvable, and the next lookup must walk instead of answering from a
     /// stale miss.
     pub(crate) fn forget_alt_key_paths(&self) {
-        self.alt_key_paths.lock().clear();
+        self.alt_key_paths.pin().clear();
     }
 
     /// Attach a post-unwrap trigger notify channel (ADR-0007 R3).
@@ -385,14 +384,18 @@ impl Mailbox {
     /// unchanged keys within this process.
     fn cached_load_agent_key(&self, path: &std::path::Path) -> Option<Keys> {
         let content = std::fs::read_to_string(path).ok()?;
-        if let Some(cached) = self.key_cache.lock().get(path)
-            && cached.content == content
+        // Pin scoped: the ~1s argon2 below must never hold a guard.
         {
-            return Some(cached.keys.clone());
+            let cache = self.key_cache.pin();
+            if let Some(cached) = cache.get(path)
+                && cached.content == content
+            {
+                return Some(cached.keys.clone());
+            }
         }
         let keys = crate::keys::decrypt(&content, self.agent_passphrase()).ok()?;
         self.kdf_loads.fetch_add(1, Ordering::Relaxed);
-        self.key_cache.lock().insert(
+        self.key_cache.pin().insert(
             path.to_path_buf(),
             CachedAgentKey {
                 content,
