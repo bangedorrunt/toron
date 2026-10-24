@@ -8,8 +8,8 @@ use toron_core::delivery::{Phase, Reject};
 use toron_core::envelope::{Class, ContextId, ContractId, Envelope, MsgId, Recipient, TaskId};
 use toron_core::inbox::{INBOX_STREAM, InboxError, InboxStore, JOURNAL_STREAM, ToronLog};
 use toron_core::index::schema;
-use toron_core::kernel::{self, AppendError, Boot, DurableLog, Loop, Producer};
-use toron_core::outbox::{self, Outbox, OutboxMsg, OutboxRun, SendState};
+use toron_core::kernel::{self, AppendError, Boot, DurableLog, Failure, Loop, Producer, Program};
+use toron_core::outbox::{self, MAX_RECONCILE, Outbox, OutboxModel, OutboxMsg, OutboxRun, SendState};
 
 const A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
@@ -98,6 +98,22 @@ fn toron_log_satisfies_every_durable_log_law() {
     for (name, r) in results {
         assert!(r.is_ok(), "law {name} failed on ToronLog: {r:?}");
     }
+}
+
+/// An unknown journal outcome is parked, never mapped to a refusal or a
+/// blind retry: the fold emits no command and the send stays Unknown.
+#[test]
+fn an_unknown_journal_outcome_parks_without_a_command() {
+    let msg = Outbox::failure(&Failure::Unknown(AppendError::Unavailable(
+        "lost acknowledgement".into(),
+    )));
+    assert!(matches!(msg, OutboxMsg::JournalUnknown(_)));
+    let update = Outbox::update(&OutboxModel::default(), &msg);
+    assert!(update.commands.is_empty(), "{:?}", update.commands);
+    assert!(matches!(
+        update.model.sends.values().next(),
+        Some(SendState::Unknown(MAX_RECONCILE))
+    ));
 }
 
 /// The closure laws each close their log, so they run on fresh logs rather
