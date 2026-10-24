@@ -331,13 +331,23 @@ impl JournalDb {
         .await
     }
 
-    /// Note one provider attempt; exhaustion dead-letters the row.
-    pub async fn attempt(&self, key: &str) -> Result<Option<JournalRow>, sqlx::Error> {
+    /// Note one provider attempt for the holder of `generation`; a stale
+    /// generation, or a terminal row, notes nothing. Fenced like `settle`
+    /// (elm-effect 0.4.0), so a zombie that lost its lease cannot spend the
+    /// live holder's attempt budget and dead-letter its row.
+    pub async fn attempt(
+        &self,
+        key: &str,
+        generation: u64,
+    ) -> Result<Option<JournalRow>, sqlx::Error> {
         self.transact(key, |cur| match cur {
             None => Step::Keep(None),
             Some(mut r) => {
+                if r.generation != generation || r.state.is_terminal() {
+                    return Step::Keep(None);
+                }
                 r.attempts += 1;
-                if r.attempts > r.max_attempts && !r.state.is_terminal() {
+                if r.attempts > r.max_attempts {
                     r.state = EffectState::Failed;
                     r.disposition = Some(JournalDisposition::TerminalFailed);
                 }
@@ -423,17 +433,17 @@ impl ToronJournal {
         Self { tx }
     }
 
+    /// Block on the store task. elm-effect 0.4.0 runs every loop command on
+    /// a blocking fiber (`spawn_blocking`), so this wait is legal from an
+    /// `Interpret` even when the loop itself is hosted on Tokio. It never
+    /// calls `block_on`, so there is no nested-runtime panic; call it from a
+    /// blocking fiber or a plain thread, never straight from an async task.
     fn call<T, F, Fut>(&self, f: F) -> Result<T, JournalError>
     where
         T: Send + 'static,
         F: FnOnce(JournalDb) -> Fut + Send + 'static,
         Fut: Future<Output = Result<T, sqlx::Error>> + Send + 'static,
     {
-        if tokio::runtime::Handle::try_current().is_ok() {
-            return Err(JournalError::Unavailable(
-                "ToronJournal called on a Tokio runtime thread: host the loop on a dedicated OS thread (F2)".into(),
-            ));
-        }
         let (reply, rx) = std::sync::mpsc::channel();
         let job: Job = Box::new(move |db| {
             Box::pin(async move {
@@ -486,9 +496,13 @@ impl ToronJournal {
     }
 
     /// [`JournalStore::attempt`], with the error.
-    pub fn try_attempt(&self, key: &str) -> Result<Option<JournalRow>, JournalError> {
+    pub fn try_attempt(
+        &self,
+        key: &str,
+        generation: u64,
+    ) -> Result<Option<JournalRow>, JournalError> {
         let key = key.to_string();
-        self.call(move |db| async move { db.attempt(&key).await })
+        self.call(move |db| async move { db.attempt(&key, generation).await })
     }
 
     /// [`JournalStore::read`], with the error.
@@ -548,8 +562,8 @@ impl JournalStore for ToronJournal {
         })
     }
 
-    fn attempt(&self, key: &str) -> Option<JournalRow> {
-        self.try_attempt(key).unwrap_or_else(|e| {
+    fn attempt(&self, key: &str, generation: u64) -> Option<JournalRow> {
+        self.try_attempt(key, generation).unwrap_or_else(|e| {
             unreachable_store("attempt", &e);
             None
         })

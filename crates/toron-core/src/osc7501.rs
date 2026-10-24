@@ -198,10 +198,10 @@ pub fn parse_report(raw: &str) -> Option<Report> {
         return None;
     }
     let state = state?;
-    if let Some(ref ident) = id {
-        if !id_ok(ident) {
-            return None;
-        }
+    if let Some(ref ident) = id
+        && !id_ok(ident)
+    {
+        return None;
     }
     let kind = if state == ProgramState::Blocked { kind } else { None };
     let progress = if matches!(state, ProgramState::Working | ProgramState::Blocked) {

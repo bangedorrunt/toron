@@ -844,6 +844,9 @@ fn without_journal_seam(
     value
 }
 
+// The wrapper mirrors `run_step_with_enclosing`'s threaded dispatch context
+// (run identity + iteration key) for callers that have no enclosing step.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_step<'a>(
     ctx: &'a Context,
     trigger: &'a serde_json::Value,
@@ -1584,7 +1587,7 @@ pub(crate) async fn run_foreach(
     // parallel fan-out uses (`p{i}`). Without it the items shared one
     // (run, node) identity and the journal's replay guard could not tell a
     // new item from a re-render of the node.
-    let collection_digest = crate::identity::action_digest_of(&serde_json::to_value(&list)?);
+    let collection_digest = crate::identity::action_digest_of(&serde_json::to_value(list)?);
     for (index, item) in list.iter().enumerate() {
         // Each iteration sees the current item as `{{item}}` (ADR-0007 F4):
         // inject it into the iteration's trigger copy so the template

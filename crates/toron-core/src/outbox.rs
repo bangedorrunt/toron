@@ -96,6 +96,9 @@ pub enum OutboxMsg {
     Refused { key: String, why: String },
     /// The journal refused the intent (e.g. stale epoch): nothing ran.
     NotJournaled(String),
+    /// The journal's append outcome is unknown: the intent may have landed.
+    /// Parked, never retried blind; a host re-feeds `Recover` to reconcile.
+    JournalUnknown(String),
 }
 
 /// Commands.
@@ -196,12 +199,22 @@ impl Program for Outbox {
                 );
                 Update::quiet(next)
             }
+            OutboxMsg::JournalUnknown(why) => {
+                next.sends.insert(
+                    format!("<journal unknown> {why}"),
+                    SendState::Unknown(MAX_RECONCILE),
+                );
+                Update::quiet(next)
+            }
         }
     }
 
     fn failure(failure: &Failure<String>) -> OutboxMsg {
         match failure {
             Failure::NotAppended(e) => OutboxMsg::NotJournaled(e.to_string()),
+            // A lost acknowledgement is not a refusal: the append may have
+            // landed. Park it so recovery reconciles instead of retrying.
+            Failure::Unknown(e) => OutboxMsg::JournalUnknown(e.to_string()),
             other => OutboxMsg::NotJournaled(format!("{other:?}")),
         }
     }

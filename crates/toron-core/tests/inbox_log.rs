@@ -100,6 +100,21 @@ fn toron_log_satisfies_every_durable_log_law() {
     }
 }
 
+/// The closure laws each close their log, so they run on fresh logs rather
+/// than in `all`. This is the 0.4.0 explicit-close contract on ToronLog.
+#[test]
+fn toron_log_satisfies_every_closure_law() {
+    for (name, law) in kernel::durable_log_laws::closing() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let s = rt.block_on(store(name));
+        let log = ToronLog::spawn(s, JOURNAL_STREAM, rt.handle());
+        std::thread::spawn(move || law(&log))
+            .join()
+            .unwrap()
+            .unwrap_or_else(|e| panic!("closure law {name} failed on ToronLog: {e}"));
+    }
+}
+
 /// `compact_before` drops records below a known offset and refuses
 /// hand-built ones, through the same bridge as append/read.
 #[test]
@@ -341,14 +356,15 @@ async fn journal_kinds(s: &InboxStore) -> Vec<String> {
         .collect()
 }
 
-/// Negative control: called ON a Tokio worker, the bridge refuses with a
-/// typed `Unavailable` instead of blocking or panicking.
+/// A direct call from a Tokio worker answers instead of refusing: the bridge
+/// is a plain bounded wait, so no runtime is nested. The loop itself never
+/// needs this path; it calls from a blocking fiber (elm-effect 0.4.0).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn bridge_on_a_tokio_worker_refuses_instead_of_panicking() {
+async fn bridge_on_a_tokio_worker_answers_without_nesting_a_runtime() {
     let s = store("worker").await;
     let log = ToronLog::spawn(s, JOURNAL_STREAM, &tokio::runtime::Handle::current());
     let r = log.append_json(&kernel::durable_log_laws::envelope("w", 0, 0, "{}"));
-    assert!(matches!(r, Err(AppendError::Unavailable(_))), "{r:?}");
+    assert!(r.is_ok(), "{r:?}");
 }
 
 /// The child half of the crash test: journal the intent, then abort at the

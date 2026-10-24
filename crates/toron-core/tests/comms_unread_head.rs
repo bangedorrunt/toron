@@ -616,7 +616,7 @@ async fn a_store_with_the_urgent_index_opens_on_the_pre_index_path() {
         v,
         schema::StoreVersion {
             min_binary: PRE_INDEX_MAX_MIGRATION,
-            additive: vec!["inbox_log_urgent"],
+            additive: vec!["inbox_log_urgent", "inbox_stream_close"],
         },
         "the index raises no version a binary checks"
     );
@@ -671,12 +671,10 @@ async fn pending_urgent_is_correct_without_the_index() {
         .execute(s.pool())
         .await
         .unwrap();
-    assert!(
-        schema::store_version(s.pool())
-            .await
-            .unwrap()
-            .additive
-            .is_empty()
+    assert_eq!(
+        schema::store_version(s.pool()).await.unwrap().additive,
+        vec!["inbox_stream_close"],
+        "the dropped index is gone; the additive table is still there"
     );
     // The planner falls back to the recipient index: slower, same answers.
     let plan = plan_of(&s, PENDING_URGENT_SQL).await;
@@ -722,6 +720,6 @@ async fn pending_urgent_is_correct_without_the_index() {
     schema::migrate(s.pool()).await.unwrap();
     assert_eq!(
         schema::store_version(s.pool()).await.unwrap().additive,
-        vec!["inbox_log_urgent"]
+        vec!["inbox_log_urgent", "inbox_stream_close"]
     );
 }

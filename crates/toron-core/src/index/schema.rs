@@ -41,6 +41,23 @@ pub static ADDITIVE_INDEXES: &[AdditiveIndex] = &[AdditiveIndex {
     ddl: include_str!("../../schema/additive/inbox_log_urgent.sql"),
 }];
 
+/// An additive TABLE: a new table no older binary reads, so its absence is
+/// correct and its presence changes nothing it sees. Applied like an
+/// [`AdditiveIndex`], and reported in the same informational list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AdditiveTable {
+    /// The table name, as `sqlite_master` lists it.
+    pub name: &'static str,
+    /// The idempotent `CREATE TABLE IF NOT EXISTS` statement.
+    pub ddl: &'static str,
+}
+
+/// Every additive table, in apply order.
+pub static ADDITIVE_TABLES: &[AdditiveTable] = &[AdditiveTable {
+    name: "inbox_stream_close",
+    ddl: include_str!("../../schema/additive/inbox_stream_close.sql"),
+}];
+
 /// A store's version, in its two parts: what an opening binary must ship,
 /// and what is informational only.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -48,8 +65,9 @@ pub struct StoreVersion {
     /// Highest applied versioned migration: an opening binary must resolve
     /// it, or it refuses with `toron-error=store_skew`.
     pub min_binary: i64,
-    /// The [`ADDITIVE_INDEXES`] present, by name. Informational: no binary
-    /// checks it, and a store without them is correct, only slower.
+    /// The [`ADDITIVE_INDEXES`] and [`ADDITIVE_TABLES`] present, by name.
+    /// Informational: no binary checks it, and a store without them is
+    /// correct (only slower, or missing a feature it never asks for).
     pub additive: Vec<&'static str>,
 }
 
@@ -70,19 +88,36 @@ pub async fn store_version(pool: &SqlitePool) -> anyhow::Result<StoreVersion> {
             additive.push(ix.name);
         }
     }
+    for table in ADDITIVE_TABLES {
+        let present: Option<String> =
+            sqlx::query_scalar("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?1")
+                .bind(table.name)
+                .fetch_optional(pool)
+                .await?;
+        if present.is_some() {
+            additive.push(table.name);
+        }
+    }
     Ok(StoreVersion {
         min_binary: min_binary.unwrap_or(0),
         additive,
     })
 }
 
-/// Apply every [`ADDITIVE_INDEXES`] entry. Idempotent; records no version.
+/// Apply every [`ADDITIVE_INDEXES`] and [`ADDITIVE_TABLES`] entry.
+/// Idempotent; records no version.
 async fn ensure_additive(pool: &SqlitePool) -> anyhow::Result<()> {
     for ix in ADDITIVE_INDEXES {
         sqlx::query(ix.ddl)
             .execute(pool)
             .await
             .with_context(|| format!("additive index {}", ix.name))?;
+    }
+    for table in ADDITIVE_TABLES {
+        sqlx::query(table.ddl)
+            .execute(pool)
+            .await
+            .with_context(|| format!("additive table {}", table.name))?;
     }
     Ok(())
 }

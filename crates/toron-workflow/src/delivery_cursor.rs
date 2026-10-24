@@ -345,9 +345,6 @@ pub const fn agent_key_is_not_delivery_proof(_agent_pubkey_hex: &str, _event_id:
 
 #[cfg(test)]
 mod tests {
-    /// bd-aqvg: snapshot feeds persistence; restore merges without shrinking.
-    /// in_flight never persists (unconfirmed at crash = retryable, not delivered).
-    #[test]
     /// bd-uc8m: a panic while the cursor's lock is held poisons it. The
     /// cursor recovers the guard instead of panicking on every later call,
     /// so one panic in a critical section cannot take the session down.
@@ -366,6 +363,9 @@ mod tests {
         );
     }
 
+    /// Snapshot feeds persistence; restore merges without shrinking.
+    /// in_flight never persists (unconfirmed at crash = retryable, not delivered).
+    #[test]
     fn snapshot_restore_round_trip_drops_in_flight() {
         let store = DeliveryCursorStore::new();
         let (keep, _) = store.reserve_undelivered("s", ["a", "b"]);

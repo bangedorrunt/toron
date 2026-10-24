@@ -29,7 +29,7 @@ use crate::contracts::{
 };
 use crate::delivery::{DeliveryEvent, DeliveryFsm, DeliveryState, Phase, Reject};
 use crate::envelope::{Class, ContractId, Envelope, MsgId};
-use crate::kernel::{self, AppendError, DurableLog, Offset};
+use crate::kernel::{self, AppendError, DurableLog, Offset, Status};
 use crate::topology::{self, Topology};
 use crate::wake::Urgency;
 
@@ -385,6 +385,25 @@ fn unavailable(e: impl std::fmt::Display) -> AppendError {
     AppendError::Unavailable(e.to_string())
 }
 
+/// Seal `stream` inside the caller's transaction. Idempotent.
+async fn mark_closed(
+    conn: &mut sqlx::SqliteConnection,
+    stream: &str,
+    now: i64,
+    closed_by: Option<&str>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO inbox_stream_close (stream, closed_by, closed_ts_us) \
+         VALUES (?1, ?2, ?3) ON CONFLICT (stream) DO NOTHING",
+    )
+    .bind(stream)
+    .bind(closed_by)
+    .bind(now)
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
 /// The current `lead@1` row for one context.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LeadRow {
@@ -453,7 +472,7 @@ impl InboxStore {
     /// conflict (the vendored enum is closed); [`Self::append_envelope`]
     /// returns the typed [`InboxError::PayloadConflict`].
     pub async fn append_json(&self, stream: &str, json: &str) -> Result<Appended, AppendError> {
-        self.append_checked(stream, json)
+        self.append_checked(stream, json, false)
             .await
             .map_err(|r| match r {
                 Refusal::Log(e) => e,
@@ -466,7 +485,51 @@ impl InboxStore {
             })
     }
 
-    async fn append_checked(&self, stream: &str, json: &str) -> Result<Appended, Refusal> {
+    /// Append one envelope and close `stream` in the same transaction: a
+    /// crash leaves both the final record and the close marker, or neither.
+    /// Retrying the exact closing triple returns its original offset.
+    pub async fn append_json_and_close(
+        &self,
+        stream: &str,
+        json: &str,
+    ) -> Result<Appended, AppendError> {
+        self.append_checked(stream, json, true)
+            .await
+            .map_err(|r| match r {
+                Refusal::Log(e) => e,
+                Refusal::PayloadConflict { msg_key } => AppendError::NotAnEnvelope(format!(
+                    "payload conflict on {msg_key}: the log already holds different content under this producer triple"
+                )),
+                Refusal::Reject(r) => AppendError::NotAnEnvelope(r.to_string()),
+            })
+    }
+
+    /// True once `stream` was closed. Closure is monotonic.
+    pub async fn stream_closed(&self, stream: &str) -> Result<bool, AppendError> {
+        let closed: Option<i64> =
+            sqlx::query_scalar("SELECT 1 FROM inbox_stream_close WHERE stream = ?1")
+                .bind(stream)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(unavailable)?;
+        Ok(closed.is_some())
+    }
+
+    /// Close `stream`: idempotent, durable, monotonic. Records already
+    /// written stay readable; only new appends are refused.
+    pub async fn close_stream(&self, stream: &str) -> Result<(), AppendError> {
+        let mut conn = self.pool.acquire().await.map_err(unavailable)?;
+        mark_closed(&mut conn, stream, now_us(), None)
+            .await
+            .map_err(unavailable)
+    }
+
+    async fn append_checked(
+        &self,
+        stream: &str,
+        json: &str,
+        close: bool,
+    ) -> Result<Appended, Refusal> {
         let (producer, epoch, seq, payload) = parse_l16(json)?;
         let (recipient, msg_key, delivery, envelope) = if stream == INBOX_STREAM {
             let env: Envelope = serde_json::from_value(payload.clone())
@@ -507,6 +570,14 @@ impl InboxStore {
             .begin_with("BEGIN IMMEDIATE")
             .await
             .map_err(unavailable)?;
+        // Outer None = open; Some(None) = bare close; Some(Some(key)) = sealed
+        // by that append, whose own retry still answers.
+        let closed_by: Option<Option<String>> =
+            sqlx::query_scalar("SELECT closed_by FROM inbox_stream_close WHERE stream = ?1")
+                .bind(stream)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(unavailable)?;
         let state: Option<(i64, i64)> =
             sqlx::query_as("SELECT epoch, last_seq FROM inbox_producer_state WHERE producer = ?1")
                 .bind(&producer)
@@ -549,10 +620,30 @@ impl InboxStore {
             if !same {
                 return Err(Refusal::PayloadConflict { msg_key });
             }
+            // A closed stream dedupes only the append that closed it; any
+            // earlier triple is refused like a new append.
+            if let Some(closed_by) = &closed_by
+                && closed_by.as_deref() != Some(msg_key.as_str())
+            {
+                return Err(AppendError::Closed.into());
+            }
+            // The exact closing triple stays answerable after the close; a
+            // replay is not a new append, so it may still seal the stream.
+            if close {
+                mark_closed(&mut tx, stream, now_us(), Some(&msg_key))
+                    .await
+                    .map_err(unavailable)?;
+            }
+            tx.commit().await.map_err(unavailable)?;
             return Ok(Appended {
                 offset: offset as u64,
                 replay: true,
             });
+        }
+        // A closed stream refuses every new append. Checked after the replay
+        // answer, so retrying the closing triple still returns its offset.
+        if closed_by.is_some() {
+            return Err(AppendError::Closed.into());
         }
         // Authority (Phase 4.1): after the fence and the replay answer, before
         // anything is written. A replay of a message already in the log was
@@ -630,6 +721,11 @@ impl InboxStore {
         if let (Some(lead), Some(env)) = (&facts.lead, &envelope) {
             write_lead(&mut tx, env, lead).await.map_err(unavailable)?;
         }
+        if close {
+            mark_closed(&mut tx, stream, now, Some(&msg_key))
+                .await
+                .map_err(unavailable)?;
+        }
         tx.commit().await.map_err(unavailable)?;
         Ok(Appended {
             offset: offset as u64,
@@ -642,7 +738,7 @@ impl InboxStore {
     /// under an existing `msg` is [`InboxError::PayloadConflict`].
     pub async fn append_envelope(&self, env: &Envelope) -> Result<Appended, InboxError> {
         env.validate()?;
-        self.append_checked(INBOX_STREAM, &l16_json(env))
+        self.append_checked(INBOX_STREAM, &l16_json(env), false)
             .await
             .map_err(InboxError::from)
     }
@@ -1978,6 +2074,16 @@ enum Req {
         before: u64,
         reply: std::sync::mpsc::Sender<Result<usize, AppendError>>,
     },
+    Close {
+        reply: std::sync::mpsc::Sender<Result<(), AppendError>>,
+    },
+    AppendAndClose {
+        json: String,
+        reply: std::sync::mpsc::Sender<Result<Offset, AppendError>>,
+    },
+    Status {
+        reply: std::sync::mpsc::Sender<Result<bool, AppendError>>,
+    },
 }
 
 /// How long a bridge call waits for the store before answering
@@ -2025,6 +2131,19 @@ impl ToronLog {
                     Req::Compact { before, reply } => {
                         let _ = reply.send(store.compact_stream(&task_stream, before).await);
                     }
+                    Req::Close { reply } => {
+                        let _ = reply.send(store.close_stream(&task_stream).await);
+                    }
+                    Req::AppendAndClose { json, reply } => {
+                        let r = store
+                            .append_json_and_close(&task_stream, &json)
+                            .await
+                            .map(|a| mint(a.offset));
+                        let _ = reply.send(r);
+                    }
+                    Req::Status { reply } => {
+                        let _ = reply.send(store.stream_closed(&task_stream).await);
+                    }
                 }
             }
         });
@@ -2042,15 +2161,15 @@ impl ToronLog {
         self.call(|reply| Req::Lookup { msg, reply })
     }
 
+    /// Block on the store task. elm-effect 0.4.0 runs every loop command on
+    /// a blocking fiber (`spawn_blocking`), so this wait is legal from an
+    /// `Interpret` even when the loop itself is hosted on Tokio. It never
+    /// calls `block_on`, so there is no nested-runtime panic; call it from a
+    /// blocking fiber or a plain thread, never straight from an async task.
     fn call<T>(
         &self,
         make: impl FnOnce(std::sync::mpsc::Sender<Result<T, AppendError>>) -> Req,
     ) -> Result<T, AppendError> {
-        if tokio::runtime::Handle::try_current().is_ok() {
-            return Err(AppendError::Unavailable(
-                "ToronLog called on a Tokio runtime thread: host the loop on a dedicated OS thread (F2)".into(),
-            ));
-        }
         let (reply, rx) = std::sync::mpsc::channel();
         self.tx
             .send(make(reply))
@@ -2084,5 +2203,27 @@ impl DurableLog for ToronLog {
             before: limit,
             reply,
         })
+    }
+
+    fn close(&self) -> Result<(), AppendError> {
+        self.call(|reply| Req::Close { reply })
+    }
+
+    fn append_json_and_close(&self, envelope: &str) -> Result<Offset, AppendError> {
+        let json = envelope.to_string();
+        self.call(|reply| Req::AppendAndClose { json, reply })
+    }
+
+    fn status(&self) -> Status {
+        // An unanswered status is not EOF: report open (UpToDate) rather than
+        // hide readable records behind a close the store never confirmed.
+        match self.call(|reply| Req::Status { reply }) {
+            Ok(true) => Status::Closed,
+            Ok(false) => Status::UpToDate,
+            Err(e) => {
+                tracing::warn!("ToronLog status: {e}; answering UpToDate");
+                Status::UpToDate
+            }
+        }
     }
 }

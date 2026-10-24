@@ -786,7 +786,8 @@ impl Mailbox {
             .index_pool
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("no index pool attached — cannot rename an identity"))?;
-        let row: Option<(String, Option<String>, Option<String>, Option<String>)> = sqlx::query_as(
+        type RenameRow = (String, Option<String>, Option<String>, Option<String>);
+        let row: Option<RenameRow> = sqlx::query_as(
             "SELECT pubkey, program, model, task_description FROM agents \
              WHERE project_slug = ?1 AND name = ?2",
         )
@@ -874,7 +875,8 @@ impl Mailbox {
             .execute(pool)
             .await?;
         // The leases follow the identity, so the board keeps addressing it.
-        let leases_repointed = sqlx::query(
+        // The count below is the report; this statement only moves the rows.
+        let _ = sqlx::query(
             "UPDATE file_reservations SET agent_name = ?1 \
              WHERE project_slug = ?2 AND agent_name = ?3 AND status = 'active'",
         )

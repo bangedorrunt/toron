@@ -1291,7 +1291,7 @@ mod tests {
             .fetch_one(&pool)
             .await
             .expect("count");
-        let healed_again = reopened.heal_arrivals().await.expect("heal");
+        reopened.heal_arrivals().await.expect("heal");
         let after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM bus_arrivals")
             .fetch_one(&pool)
             .await
@@ -1300,7 +1300,6 @@ mod tests {
             before, after,
             "a restart must not re-insert the events into the arrival log"
         );
-        let _ = healed_again;
 
         // Concurrent drains: the heal runs once, not once per caller.
         for i in 50..80 {

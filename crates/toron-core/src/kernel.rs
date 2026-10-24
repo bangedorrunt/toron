@@ -16,9 +16,9 @@
 //! - the journal: [`EffectState`], [`can_transition`], [`JournalStore`]
 //!   (with its [`JournalRow`], [`JournalRead`], [`JournalDisposition`]),
 //!   [`plan_attempt`], [`plan_park`], [`may_settle`];
-//! - the L16 log: [`DurableLog`], [`Offset`], [`ProducerId`],
-//!   [`AppendError`] (with `StaleEpoch`), and [`durable_log_laws`] so
-//!   toron's own log runs the upstream trait laws;
+//! - the L16 log: [`DurableLog`], [`Offset`], [`AppendError`] (with
+//!   `StaleEpoch`), and [`durable_log_laws`] so toron's own log runs the
+//!   upstream trait laws;
 //! - from the carrier, only what an `Interpret` impl and a host need to
 //!   name: [`Effect`], [`Exit`], [`Cause`], [`ManagedRuntime`]. Carrier
 //!   combinators (race, timeout, schedule, stm, ...) are deliberately NOT
@@ -28,11 +28,6 @@
 //! through a channel into `Loop::send`. A `DurableLog` over toron's async
 //! sqlx store answers through a request/reply channel; it never calls
 //! `block_on` inside a Tokio context (the F2 nested-runtime panic).
-
-/// The elm-effect-rs commit the vendored crates were taken from. Must equal
-/// `rev` in `vendor/elm-effect/VENDORED_FROM` (checked by
-/// `tests/kernel_port.rs` and `scripts/verify-vendor-elm-effect.sh`).
-pub const ELM_EFFECT_REV: &str = "00bac791672c1c0856020a800307c6502043c1f6";
 
 pub use elm_effect::{
     BreakerConfig, BuiltServices, Cause, ClockImpl, Defect, Duration, Effect, Executor, Exit, Layer,
@@ -45,9 +40,8 @@ pub use elm_effect_elm::{
     Update,
 };
 pub use elm_effect_journal::durable_log::{
-    AppendError, DurableLog, FileLog, MemLog, Offset, ProducerId, SCHEMA_VERSION,
+    AppendError, DurableLog, FileLog, MemLog, Offset, Page, SCHEMA_VERSION, Status,
 };
-pub use elm_effect_journal::epoch::{EpochLog, Fence};
 pub use elm_effect_journal::laws as durable_log_laws;
 pub use elm_effect_journal::plan::{
     DispatchPlan, EffectView, ParkDecision, ProviderCapability, may_claim, may_settle, plan_attempt,
@@ -57,5 +51,4 @@ pub use elm_effect_journal::store::{
     Disposition as JournalDisposition, InMemoryStore, JournalStore, Read as JournalRead,
     Row as JournalRow,
 };
-pub use elm_effect_journal::stream::Gone;
 pub use elm_effect_journal::{EffectState, TransitionError, can_transition, transition};

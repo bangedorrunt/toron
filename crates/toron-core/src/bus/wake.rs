@@ -851,14 +851,7 @@ impl Resume {
 /// Rows per arrival-log page.
 const ARRIVAL_PAGE: usize = 512;
 
-async fn write_frame(
-    writer: &mut (impl tokio::io::AsyncWrite + Unpin),
-    frame: &WakeFrame,
-) -> Result<(), WakeError> {
-    write_frame_within(writer, frame, WAKE_WRITE_TIMEOUT_MS).await
-}
-
-/// [`write_frame`] with an explicit bound on how long the write may take.
+/// Write one frame with an explicit bound on how long the write may take.
 ///
 /// bd-ojw3: the write was unbounded. The daemon dropped the subscriber's READ
 /// half after the handshake, so it could not see the peer's EOF; the only
@@ -883,37 +876,44 @@ async fn write_frame_within(
     .map_err(|e| WakeError::Transport(e.to_string()))
 }
 
-/// Write every stored arrival after `*after` that matches `filter`, paging
+/// What one drain reads, and how long a frame write may take.
+struct DrainPlan<'a> {
+    bus: &'a dyn Bus,
+    filter: &'a Filter,
+    kinds: &'a [u16],
+    /// Skip rows whose `created_at` is below this (the placement fallback for
+    /// a legacy cursor the store no longer knows).
+    floor: Option<u64>,
+    write_timeout_ms: u64,
+}
+
+/// Write every stored arrival after `*after` that matches the plan, paging
 /// until the log is exhausted, and advance `*after` past every row read
-/// (matching or not). `floor` skips rows whose `created_at` is below it (the
-/// placement fallback for a legacy cursor the store no longer knows).
+/// (matching or not).
 async fn drain_arrivals(
     writer: &mut (impl tokio::io::AsyncWrite + Unpin),
-    bus: &dyn Bus,
-    filter: &Filter,
-    kinds: &[u16],
+    plan: &DrainPlan<'_>,
     after: &mut u64,
-    floor: Option<u64>,
     stats: &mut SubscriberStats,
-    write_timeout_ms: u64,
 ) -> Result<(), WakeError> {
     loop {
-        let page = bus
-            .arrivals_after(kinds, *after, ARRIVAL_PAGE)
+        let page = plan
+            .bus
+            .arrivals_after(plan.kinds, *after, ARRIVAL_PAGE)
             .await?
             .ok_or_else(|| WakeError::Transport("arrival log unavailable".to_string()))?;
         let full = page.len() == ARRIVAL_PAGE;
         for (seq, event) in page {
             *after = seq;
-            if floor.is_some_and(|f| event.created_at.as_secs() < f) {
+            if plan.floor.is_some_and(|f| event.created_at.as_secs() < f) {
                 continue;
             }
-            if !filter.match_event(&event, MatchEventOptions::default()) {
+            if !plan.filter.match_event(&event, MatchEventOptions::default()) {
                 continue;
             }
             let payload =
                 serde_json::to_value(&event).map_err(|e| WakeError::Codec(e.to_string()))?;
-            write_frame_within(writer, &WakeFrame::Event(payload), write_timeout_ms).await?;
+            write_frame_within(writer, &WakeFrame::Event(payload), plan.write_timeout_ms).await?;
             stats.delivered += 1;
         }
         if !full {
@@ -986,21 +986,23 @@ async fn serve_arrivals(
             Err(_) => return stats,
         }
     }
-    if drain_arrivals(
-        writer,
+    let plan = DrainPlan {
         bus,
         filter,
         kinds,
-        &mut after,
         floor,
-        &mut stats,
-        config.write_timeout_ms,
-    )
+        write_timeout_ms: config.write_timeout_ms,
+    };
+    if drain_arrivals(writer, &plan, &mut after, &mut stats)
         .await
         .is_err()
     {
         return stats;
     }
+    let live_plan = DrainPlan {
+        floor: None,
+        ..plan
+    };
     let eose = WakeFrame::Eose {
         cursor: if after == 0 {
             "head".to_string()
@@ -1030,18 +1032,9 @@ async fn serve_arrivals(
                         Err(TryRecvError::Closed) => return stats,
                     }
                 }
-                if drain_arrivals(
-                    writer,
-                    bus,
-                    filter,
-                    kinds,
-                    &mut after,
-                    None,
-                    &mut stats,
-                    config.write_timeout_ms,
-                )
-                .await
-                .is_err()
+                if drain_arrivals(writer, &live_plan, &mut after, &mut stats)
+                    .await
+                    .is_err()
                 {
                     return stats;
                 }
@@ -1049,18 +1042,9 @@ async fn serve_arrivals(
             Ok(Err(RecvError::Closed)) => return stats,
             Err(_) => {
                 // Quiet tick: catch up anything a missed ring left behind.
-                if drain_arrivals(
-                    writer,
-                    bus,
-                    filter,
-                    kinds,
-                    &mut after,
-                    None,
-                    &mut stats,
-                    config.write_timeout_ms,
-                )
-                .await
-                .is_err()
+                if drain_arrivals(writer, &live_plan, &mut after, &mut stats)
+                    .await
+                    .is_err()
                 {
                     return stats;
                 }

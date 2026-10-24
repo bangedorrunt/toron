@@ -12,7 +12,7 @@
 //!    generation, and the F2 guard (never block a Tokio worker).
 
 use toron_core::index::schema;
-use toron_core::journal::{JournalDb, JournalError, ToronJournal};
+use toron_core::journal::{JournalDb, ToronJournal};
 use toron_core::kernel::{
     EffectState, InMemoryStore, JournalDisposition, JournalRead, JournalRow, JournalStore,
 };
@@ -149,11 +149,23 @@ fn accepted_is_its_own_state(db: &dyn JournalStore) {
 
 fn exhausted_attempts_dead_letter(db: &dyn JournalStore) {
     db.record_intent("job-1", 1);
-    assert_eq!(db.attempt("job-1").unwrap().state, EffectState::Prepared);
-    let row = db.attempt("job-1").unwrap();
+    assert_eq!(
+        db.attempt("job-1", 0).unwrap().state,
+        EffectState::Prepared
+    );
+    let row = db.attempt("job-1", 0).unwrap();
     assert_eq!(row.state, EffectState::Failed);
     assert_eq!(row.disposition, Some(JournalDisposition::TerminalFailed));
-    assert!(db.attempt("never-recorded").is_none());
+    assert!(db.attempt("never-recorded", 0).is_none());
+}
+
+fn stale_generation_spends_no_attempts(db: &dyn JournalStore) {
+    db.record_intent("job-1", 3);
+    db.claim("job-1", "worker-a", 9999, 0, 0);
+    // Generation 1 holds the lease; generation 0 is the zombie that lost it.
+    assert!(db.attempt("job-1", 0).is_none());
+    assert_eq!(db.get("job-1").unwrap().attempts, 0);
+    assert_eq!(db.attempt("job-1", 1).unwrap().attempts, 1);
 }
 
 fn offset_and_state_commit_together(db: &dyn JournalStore) {
@@ -219,6 +231,10 @@ const LAWS: &[(&str, Law)] = &[
     (
         "exhausted_attempts_dead_letter",
         exhausted_attempts_dead_letter,
+    ),
+    (
+        "stale_generation_spends_no_attempts",
+        stale_generation_spends_no_attempts,
     ),
     (
         "offset_and_state_commit_together",
@@ -343,7 +359,17 @@ fn random_operation_sequences_match_the_reference() {
                     let to = STATES[rng.next(9) as usize];
                     (reference.settle(&key, g, to), toron.settle(&key, g, to))
                 }
-                3 => (reference.attempt(&key), toron.attempt(&key)),
+                3 => {
+                    // Mostly the current generation, sometimes a stale one:
+                    // both fences must agree.
+                    let g = reference.get(&key).map_or(0, |r| r.generation);
+                    let g = if rng.next(4) == 0 {
+                        g.saturating_sub(1)
+                    } else {
+                        g
+                    };
+                    (reference.attempt(&key, g), toron.attempt(&key, g))
+                }
                 _ => (reference.get(&key), toron.get(&key)),
             };
             assert_eq!(shape(&a), shape(&b), "seed {seed} step {step} key {key}");
@@ -433,33 +459,30 @@ fn racing_claims_from_two_processes_never_share_a_generation() {
 }
 
 #[test]
-fn a_tokio_worker_is_refused_not_blocked() {
+fn a_blocking_fiber_call_completes_without_nesting_a_runtime() {
+    // elm-effect 0.4.0 runs every loop command on a blocking fiber
+    // (`spawn_blocking`), so a call from that context must answer: the wait
+    // is plain `recv_timeout`, never `block_on`. This is the production
+    // shape, not a direct call from an async task.
     let db = Db::new("f2");
     let j = db.journal("f2", 8);
     let j2 = j.clone();
-    let err = db
+    let row = db
         .rt
         .block_on(async move {
-            tokio::spawn(async move { j2.try_record_intent("k", 1) })
-                .await
-                .unwrap()
+            tokio::task::spawn_blocking(move || j2.try_record_intent("k", 1)).await
         })
-        .expect_err("refused on a runtime thread");
-    assert!(
-        matches!(err, JournalError::Unavailable(ref m) if m.contains("F2")),
-        "{err}"
-    );
-    // Through the trait the answer is honest: outcome unknown, reconcile.
+        .unwrap()
+        .expect("answers from a blocking fiber");
+    assert_eq!(row.state, EffectState::Prepared);
+    // Through the trait the answer is the same row, not a lossy sentinel.
     let j3 = j.clone();
-    let row = db.rt.block_on(async move {
-        tokio::spawn(async move { j3.record_intent("k", 1) })
-            .await
-            .unwrap()
-    });
-    assert_eq!(
-        (row.state, row.disposition),
-        (EffectState::Unknown, Some(JournalDisposition::Reconcile))
-    );
-    // And nothing was written.
-    assert!(j.get("k").is_none());
+    let row = db
+        .rt
+        .block_on(async move {
+            tokio::task::spawn_blocking(move || j3.record_intent("k", 1)).await
+        })
+        .unwrap();
+    assert_eq!((row.state, row.disposition), (EffectState::Prepared, None));
+    assert!(j.get("k").is_some());
 }
