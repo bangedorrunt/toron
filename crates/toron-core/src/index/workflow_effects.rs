@@ -2292,46 +2292,56 @@ mod workflow_effect_schema_tests {
             .await
             .unwrap();
         store.prepare_effect(effect("ek-1", "run-1")).await.unwrap();
-        assert!(store
-            .claim_attempt(
-                "ek-1",
-                ClaimAttempt {
-                    attempt: 1,
-                    attempt_id: "att-1".into(),
-                    claim_token: "tok-a".into(),
-                    lease_expires_at: i64::MAX,
-                    expected_claim_token: None,
-                },
-            )
-            .await
-            .unwrap());
+        assert!(
+            store
+                .claim_attempt(
+                    "ek-1",
+                    ClaimAttempt {
+                        attempt: 1,
+                        attempt_id: "att-1".into(),
+                        claim_token: "tok-a".into(),
+                        lease_expires_at: i64::MAX,
+                        expected_claim_token: None,
+                    },
+                )
+                .await
+                .unwrap()
+        );
         let row = store.get_effect("ek-1").await.unwrap().unwrap();
         let live = row.claim_token.clone();
 
         // Wrong and empty tokens refuse on both sides.
         assert!(!may_settle(live.as_deref(), "tok-b"));
-        assert!(!store
-            .settle_with_fence("ek-1", "tok-b", EffectState::Settled, None, None)
-            .await
-            .unwrap());
+        assert!(
+            !store
+                .settle_with_fence("ek-1", "tok-b", EffectState::Settled, None, None)
+                .await
+                .unwrap()
+        );
         assert!(!may_settle(live.as_deref(), ""));
-        assert!(!store
-            .settle_with_fence("ek-1", "", EffectState::Settled, None, None)
-            .await
-            .unwrap());
+        assert!(
+            !store
+                .settle_with_fence("ek-1", "", EffectState::Settled, None, None)
+                .await
+                .unwrap()
+        );
 
         // The live token settles on both sides, exactly once.
         assert!(may_settle(live.as_deref(), "tok-a"));
-        assert!(store
-            .settle_with_fence("ek-1", "tok-a", EffectState::Settled, None, None)
-            .await
-            .unwrap());
+        assert!(
+            store
+                .settle_with_fence("ek-1", "tok-a", EffectState::Settled, None, None)
+                .await
+                .unwrap()
+        );
         let row = store.get_effect("ek-1").await.unwrap().unwrap();
         assert_eq!(row.state, EffectState::Settled);
-        assert!(!store
-            .settle_with_fence("ek-1", "tok-a", EffectState::Settled, None, None)
-            .await
-            .unwrap());
+        assert!(
+            !store
+                .settle_with_fence("ek-1", "tok-a", EffectState::Settled, None, None)
+                .await
+                .unwrap()
+        );
     }
 
     /// Wipe all five workflow tables (rebuild-test helper).

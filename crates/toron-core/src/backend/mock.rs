@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use parking_lot::Mutex;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use super::error::BackendError;
 use super::herdr::{AgentInfo, PaneInfo, Subscription, WaitOptions, WorkspaceInfo};
@@ -305,8 +305,8 @@ impl super::EventStream for MockEventStream {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::error::BackendErrorCode;
     use crate::backend::Backend;
+    use crate::backend::error::BackendErrorCode;
 
     #[test]
     fn mock_records_prompts_and_keys() {

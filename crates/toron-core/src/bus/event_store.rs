@@ -1266,14 +1266,15 @@ mod tests {
             .await
             .expect("count");
         assert!(arrivals > 0, "the events are in the arrival log");
-        let marker: i64 = sqlx::query_scalar(
-            "SELECT value FROM bus_meta WHERE key = ?1",
-        )
-        .bind(ARRIVALS_HEALED_ROWID_KEY)
-        .fetch_one(&pool)
-        .await
-        .expect("the marker is durable");
-        assert!(marker > 0, "the marker is written to the store, not only to memory");
+        let marker: i64 = sqlx::query_scalar("SELECT value FROM bus_meta WHERE key = ?1")
+            .bind(ARRIVALS_HEALED_ROWID_KEY)
+            .fetch_one(&pool)
+            .await
+            .expect("the marker is durable");
+        assert!(
+            marker > 0,
+            "the marker is written to the store, not only to memory"
+        );
 
         // A restart: the marker comes back from the store, so the heal does
         // not insert the same rows again. The marker is the witness - the
@@ -1281,7 +1282,9 @@ mod tests {
         // marker shows that the work was done again.
         let reopened = BusEventStore::new(pool.clone()).await.expect("reopen");
         assert_eq!(
-            reopened.heal_inserts.load(std::sync::atomic::Ordering::Acquire),
+            reopened
+                .heal_inserts
+                .load(std::sync::atomic::Ordering::Acquire),
             0,
             "a restart must take the heal marker from the store, so the insert does not run \
              again: the insert is OR IGNORE, so a re-insert changes no row and only this \
@@ -1319,12 +1322,10 @@ mod tests {
         for t in tasks {
             t.await.expect("join").expect("drain");
         }
-        let distinct: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM bus_arrivals",
-        )
-        .fetch_one(&pool)
-        .await
-        .expect("count");
+        let distinct: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM bus_arrivals")
+            .fetch_one(&pool)
+            .await
+            .expect("count");
         assert!(
             distinct <= 80,
             "concurrent drains must not duplicate arrivals: {distinct}"

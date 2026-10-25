@@ -815,23 +815,19 @@ impl Mailbox {
         // Two checks, because they catch different collisions: an EXACT name
         // already registered, and a name that FOLDS to the same words (a
         // second spelling of one pin is one identity, not two).
-        let taken: Option<String> = sqlx::query_scalar(
-            "SELECT name FROM agents WHERE project_slug = ?1 AND name = ?2",
-        )
-        .bind(&canonical)
-        .bind(new_name)
-        .fetch_optional(pool)
-        .await?;
+        let taken: Option<String> =
+            sqlx::query_scalar("SELECT name FROM agents WHERE project_slug = ?1 AND name = ?2")
+                .bind(&canonical)
+                .bind(new_name)
+                .fetch_optional(pool)
+                .await?;
         if let Some(taken_name) = taken {
             anyhow::bail!(
                 "{new_name} is already registered as {taken_name} in project {canonical} — pick a \
                  name that is free"
             );
         }
-        if let Some((taken_name, _)) = self
-            .name_collision_in_project(&canonical, new_name)
-            .await?
-        {
+        if let Some((taken_name, _)) = self.name_collision_in_project(&canonical, new_name).await? {
             anyhow::bail!(
                 "{new_name} collides with the registered identity {taken_name} in project \
                  {canonical} — they fold to the same words but would be two identities for one \
@@ -867,7 +863,8 @@ impl Mailbox {
         };
         let result =
             ident::register_agent(&canonical, &profile, Some(&existing), Timestamp::now())?;
-        self.persist_and_publish(&canonical, &profile, result).await?;
+        self.persist_and_publish(&canonical, &profile, result)
+            .await?;
         // One name, one identity: the old roster row goes with the old name.
         sqlx::query("DELETE FROM agents WHERE project_slug = ?1 AND name = ?2")
             .bind(&canonical)
@@ -2848,22 +2845,28 @@ mod tests {
             .expect("rename");
 
         // The npub did NOT move: the key IS the identity.
-        assert_eq!(report.pubkey, npub_before, "a rename must not mint a second key");
+        assert_eq!(
+            report.pubkey, npub_before,
+            "a rename must not mint a second key"
+        );
         assert_eq!(report.new_name, "QuietCedar");
         // The key lives under the new name now.
         let new_key = mailbox.agent_key_path(&before.project_slug, "QuietCedar");
         assert!(new_key.exists(), "the key must move to the new name");
         assert!(!old_key.exists(), "the old name must not keep a key");
         // One name, one identity: the old roster row is gone.
-        let rows: Vec<String> = sqlx::query_scalar(
-            "SELECT name FROM agents WHERE project_slug = ?1 AND pubkey = ?2",
-        )
-        .bind(&before.project_slug)
-        .bind(&npub_before)
-        .fetch_all(&pool)
-        .await
-        .expect("rows");
-        assert_eq!(rows, vec!["QuietCedar".to_string()], "one name, one identity");
+        let rows: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM agents WHERE project_slug = ?1 AND pubkey = ?2")
+                .bind(&before.project_slug)
+                .bind(&npub_before)
+                .fetch_all(&pool)
+                .await
+                .expect("rows");
+        assert_eq!(
+            rows,
+            vec!["QuietCedar".to_string()],
+            "one name, one identity"
+        );
         let _ = data;
     }
 

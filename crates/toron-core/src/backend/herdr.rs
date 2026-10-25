@@ -22,10 +22,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use super::error::{BackendError, BackendErrorCode};
-use super::types::{normalize_herdr_status, AgentStatus, BackendEvent, PaneId, PromptLanding};
+use super::types::{AgentStatus, BackendEvent, PaneId, PromptLanding, normalize_herdr_status};
 
 /// herdr socket protocol version this client is verified against (v22,
 /// herdr 0.9.0 — live `herdr api schema --json` reports 22).

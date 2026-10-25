@@ -30,8 +30,8 @@
 //! `block_on` inside a Tokio context (the F2 nested-runtime panic).
 
 pub use elm_effect::{
-    BreakerConfig, BuiltServices, Cause, ClockImpl, Defect, Duration, Effect, Executor, Exit, Layer,
-    ManagedRuntime, Remote, RemoteError, RemotePolicy, Runtime, ServiceTag, SleepOutcome,
+    BreakerConfig, BuiltServices, Cause, ClockImpl, Defect, Duration, Effect, Executor, Exit,
+    Layer, ManagedRuntime, Remote, RemoteError, RemotePolicy, Runtime, ServiceTag, SleepOutcome,
     SystemClock, TestClock, TokioExecutor, use_service,
 };
 pub use elm_effect_elm::replay::{Player, Snapshot};
@@ -44,8 +44,8 @@ pub use elm_effect_journal::durable_log::{
 };
 pub use elm_effect_journal::laws as durable_log_laws;
 pub use elm_effect_journal::plan::{
-    DispatchPlan, EffectView, ParkDecision, ProviderCapability, may_claim, may_settle, plan_attempt,
-    plan_park,
+    DispatchPlan, EffectView, ParkDecision, ProviderCapability, may_claim, may_settle,
+    plan_attempt, plan_park,
 };
 pub use elm_effect_journal::store::{
     Disposition as JournalDisposition, InMemoryStore, JournalStore, Read as JournalRead,

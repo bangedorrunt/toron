@@ -27,16 +27,14 @@ pub fn framework_ceiling_secs() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::park::PARK_MAX_WAIT_SECS;
-    use super::super::reconcile::{
-        DispatchPlan, EffectView, ProviderCapability, plan_attempt,
-    };
+    use super::super::reconcile::effect_view;
+    use super::super::reconcile::{DispatchPlan, EffectView, ProviderCapability, plan_attempt};
+    use super::*;
     use toron_core::index::workflow_effects::EffectState as CoreState;
     use toron_core::index::workflow_effects::can_transition as core_can_transition;
     use toron_core::kernel::EffectState as FrameworkState;
     use toron_core::kernel::can_transition as framework_can_transition;
-    use super::super::reconcile::effect_view;
 
     /// Core journaled state spelling, via the engine's own mapping (no second
     /// mapping table beside `reconcile::effect_view`).

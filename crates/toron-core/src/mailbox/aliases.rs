@@ -479,7 +479,9 @@ mod tests {
         .await
         .expect("legacy path-form roster row");
 
-        let inserted = reconcile_aliases(&pool, &data_dir).await.expect("reconcile");
+        let inserted = reconcile_aliases(&pool, &data_dir)
+            .await
+            .expect("reconcile");
         assert_eq!(inserted, 2, "both spellings of the path form fold");
 
         for alias in [

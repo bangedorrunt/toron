@@ -47,8 +47,10 @@ impl Fixture {
     async fn new(name: &str) -> Self {
         let tag = format!("{}-{}-{}", name, std::process::id(), uuid::Uuid::new_v4());
         let db = std::env::temp_dir().join(format!("toron-wake-fd-{tag}.sqlite"));
-        let sock = std::env::temp_dir()
-            .join(format!("twf-{}.sock", &uuid::Uuid::new_v4().simple().to_string()[..12]));
+        let sock = std::env::temp_dir().join(format!(
+            "twf-{}.sock",
+            &uuid::Uuid::new_v4().simple().to_string()[..12]
+        ));
         let pool = schema::connect(db.to_str().expect("utf8 db path"))
             .await
             .expect("connect");
@@ -88,7 +90,6 @@ impl Fixture {
                 .expect("bind wake.sock"),
         );
     }
-
 }
 
 impl Drop for Fixture {
@@ -145,7 +146,9 @@ async fn the_cap_refuses_a_subscriber_and_the_plane_keeps_serving() {
 
     // One subscriber inside the cap is served.
     let mut first = subscribe(&fx, &[9]).await;
-    let eose = read_frame(&mut first).await.expect("the served subscriber gets a frame");
+    let eose = read_frame(&mut first)
+        .await
+        .expect("the served subscriber gets a frame");
     assert!(eose.contains("eose"), "expected eose, got {eose:?}");
     assert!(
         wait_live(h, 1).await,
@@ -174,7 +177,9 @@ async fn the_cap_refuses_a_subscriber_and_the_plane_keeps_serving() {
     drop(first);
     assert!(wait_live(h, 0).await, "the first subscriber left");
     let mut third = subscribe(&fx, &[9]).await;
-    let eose = read_frame(&mut third).await.expect("the plane still serves");
+    let eose = read_frame(&mut third)
+        .await
+        .expect("the plane still serves");
     assert!(eose.contains("eose"), "expected eose, got {eose:?}");
 }
 
@@ -189,7 +194,9 @@ async fn a_dead_subscriber_is_reclaimed_while_the_bus_rings() {
     let h = fx.handle.as_ref().expect("handle");
 
     let mut reader = subscribe(&fx, &[30031]).await;
-    let eose = read_frame(&mut reader).await.expect("the subscriber gets a frame");
+    let eose = read_frame(&mut reader)
+        .await
+        .expect("the subscriber gets a frame");
     assert!(eose.contains("eose"), "expected eose, got {eose:?}");
     assert!(wait_live(h, 1).await, "the subscriber is live");
 

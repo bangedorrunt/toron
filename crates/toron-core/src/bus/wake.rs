@@ -908,7 +908,10 @@ async fn drain_arrivals(
             if plan.floor.is_some_and(|f| event.created_at.as_secs() < f) {
                 continue;
             }
-            if !plan.filter.match_event(&event, MatchEventOptions::default()) {
+            if !plan
+                .filter
+                .match_event(&event, MatchEventOptions::default())
+            {
                 continue;
             }
             let payload =
@@ -1355,7 +1358,10 @@ mod wake_bus_tests {
             ) -> Result<crate::bus::PublishOk, BusError> {
                 Err(BusError::Unsupported("flood".to_string()))
             }
-            async fn subscribe(&self, filter: Filter) -> Result<crate::bus::Subscription, BusError> {
+            async fn subscribe(
+                &self,
+                filter: Filter,
+            ) -> Result<crate::bus::Subscription, BusError> {
                 self.subscribe_trusted(filter).await
             }
             async fn subscribe_trusted(
@@ -1753,21 +1759,39 @@ mod wake_bus_tests {
         let mut cursor = WakeCursor::origin();
 
         assert!(
-            write_matching_event(&mut written, &ev, &filter, &mut cursor, WAKE_WRITE_TIMEOUT_MS)
-                .await
-                .expect("first delivery"),
+            write_matching_event(
+                &mut written,
+                &ev,
+                &filter,
+                &mut cursor,
+                WAKE_WRITE_TIMEOUT_MS
+            )
+            .await
+            .expect("first delivery"),
             "a fresh event past the cursor is delivered"
         );
         assert!(
-            !write_matching_event(&mut written, &ev, &filter, &mut cursor, WAKE_WRITE_TIMEOUT_MS)
-                .await
-                .expect("redelivery"),
+            !write_matching_event(
+                &mut written,
+                &ev,
+                &filter,
+                &mut cursor,
+                WAKE_WRITE_TIMEOUT_MS
+            )
+            .await
+            .expect("redelivery"),
             "the SAME event again (replay/live overlap) is suppressed, not re-sent"
         );
         assert!(
-            !write_matching_event(&mut written, &older, &filter, &mut cursor, WAKE_WRITE_TIMEOUT_MS)
-                .await
-                .expect("stale"),
+            !write_matching_event(
+                &mut written,
+                &older,
+                &filter,
+                &mut cursor,
+                WAKE_WRITE_TIMEOUT_MS
+            )
+            .await
+            .expect("stale"),
             "an event behind the cursor never re-enters the stream"
         );
         let text = String::from_utf8_lossy(&written).into_owned();
@@ -1785,9 +1809,15 @@ mod wake_bus_tests {
         );
         let mut resumed = WakeCursor::parse(&wire).expect("resumable");
         assert!(
-            !write_matching_event(&mut written, &ev, &filter, &mut resumed, WAKE_WRITE_TIMEOUT_MS)
-                .await
-                .expect("already seen"),
+            !write_matching_event(
+                &mut written,
+                &ev,
+                &filter,
+                &mut resumed,
+                WAKE_WRITE_TIMEOUT_MS
+            )
+            .await
+            .expect("already seen"),
             "a consumer resuming from the advertised cursor does not re-receive it"
         );
     }

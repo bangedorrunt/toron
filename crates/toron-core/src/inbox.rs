@@ -1010,11 +1010,7 @@ impl InboxStore {
     /// must be a known offset of this stream (hand-built offsets are
     /// `UnknownOffset`), and the caller must hold a snapshot covering the
     /// dropped records. Uses a bounded `log_offset <` range delete.
-    pub async fn compact_stream(
-        &self,
-        stream: &str,
-        before: u64,
-    ) -> Result<usize, AppendError> {
+    pub async fn compact_stream(&self, stream: &str, before: u64) -> Result<usize, AppendError> {
         let known: Option<i64> = sqlx::query_scalar(
             "SELECT log_offset FROM inbox_log WHERE stream = ?1 AND log_offset = ?2",
         )

@@ -1736,10 +1736,9 @@ impl Mailbox {
             .collect();
         let names = self.agent_name_map(project_slug).await;
         for i in &mut intents {
-            i.agent_name = names
-                .get(&i.agent_pubkey)
-                .cloned()
-                .unwrap_or_else(|| i.agent_pubkey.chars().take(8).collect());
+            // Roster miss stays empty: never invent a pubkey prefix (bd-ow6c —
+            // an invented name later compared as a peer pin).
+            i.agent_name = names.get(&i.agent_pubkey).cloned().unwrap_or_default();
         }
         Ok(intents)
     }
@@ -1766,10 +1765,9 @@ impl Mailbox {
                 ReservationStatus::Intent => EntryState::Intent,
                 _ => continue,
             };
-            let name = names
-                .get(&l.agent_pubkey)
-                .cloned()
-                .unwrap_or_else(|| l.agent_pubkey.chars().take(8).collect());
+            // Roster miss stays empty: never invent a pubkey prefix (bd-ow6c —
+            // an invented name later compared as a peer pin).
+            let name = names.get(&l.agent_pubkey).cloned().unwrap_or_default();
             meta.insert(l.id.clone(), (name, l.status));
             model.leases.insert(
                 l.id.clone(),
@@ -1920,14 +1918,16 @@ impl Mailbox {
         names
     }
 
-    /// Best-effort: fill `agent_name` from kind-30013 profiles.
+    /// Best-effort: fill `agent_name` from kind-30013 profiles. A roster
+    /// miss leaves the name EMPTY — never an invented pubkey prefix, which
+    /// later compared as a peer pin and made a lane starve on its own lease.
     async fn fill_agent_names(&self, project_slug: &str, reservations: &mut [Reservation]) {
         let name_by_pubkey = self.agent_name_map(project_slug).await;
         for r in reservations.iter_mut() {
             if let Some(name) = name_by_pubkey.get(&r.agent_pubkey) {
                 r.agent_name = name.clone();
             } else {
-                r.agent_name = r.agent_pubkey.chars().take(8).collect();
+                r.agent_name = String::new();
             }
         }
     }
@@ -2728,6 +2728,101 @@ mod tests {
             names.get(pubkey).map(String::as_str),
             Some("RoseDune"),
             "the roster resolves the holder to the pin, not an npub prefix"
+        );
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// bd-ow6c: a roster miss leaves the holder name EMPTY — never an 8-char
+    /// pubkey prefix. The old fallback invented a string that later compared
+    /// as a peer pin, so a lane treated its OWN lease as a peer's and
+    /// starved on the bead it held. Empty names no lane's pin.
+    #[tokio::test]
+    async fn roster_miss_leaves_holder_name_empty_never_a_peer_pin() {
+        let (mailbox, db_path, data_dir) = test_mailbox("holder-empty").await;
+        mailbox
+            .ensure_project("demo")
+            .await
+            .expect("ensure project");
+        // Keys with NO profile and NO roster row: both name sources miss.
+        let ghost = crate::keys::generate();
+        publish_raw_stale_lease(&mailbox, &ghost, "demo", "ghost-lane.md").await;
+        let held = mailbox.active_reservations("demo").await.expect("active");
+        let lease = held
+            .iter()
+            .find(|r| r.path_pattern == "ghost-lane.md")
+            .expect("ghost lease is held");
+        assert!(
+            lease.agent_name.is_empty(),
+            "roster miss leaves the name empty, no invented prefix: {:?}",
+            lease.agent_name
+        );
+        assert_ne!(
+            lease.agent_name, "CobaltVireo",
+            "a missing name must never compare as a peer pin"
+        );
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// bd-ow6c: a roster miss leaves an intent holder name EMPTY — the same
+    /// invented-prefix fallback `fill_agent_names` already lost. Empty never
+    /// compares as a peer pin.
+    #[tokio::test]
+    async fn roster_miss_leaves_intent_holder_name_empty() {
+        let (mailbox, db_path, data_dir) = test_mailbox("intent-empty").await;
+        mailbox
+            .ensure_project("demo")
+            .await
+            .expect("ensure project");
+        // Keys with NO profile and NO roster row: both name sources miss.
+        let ghost = crate::keys::generate();
+        publish_raw_intent(&mailbox, &ghost, "demo", "ghost-plan.md").await;
+        let intents = mailbox.active_intents("demo").await.expect("intents");
+        let intent = intents
+            .iter()
+            .find(|i| i.path_pattern == "ghost-plan.md")
+            .expect("ghost intent is boarded");
+        assert!(
+            intent.agent_name.is_empty(),
+            "roster miss leaves the name empty, no invented prefix: {:?}",
+            intent.agent_name
+        );
+        assert_ne!(
+            intent.agent_name, "CobaltVireo",
+            "a missing name must never compare as a peer pin"
+        );
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// bd-ow6c: a roster miss leaves the kernel blocker name EMPTY — the same
+    /// invented-prefix fallback `fill_agent_names` already lost. The conflict
+    /// report carries the empty holder; empty never compares as a peer pin.
+    #[tokio::test]
+    async fn roster_miss_leaves_conflict_holder_name_empty() {
+        let (mailbox, db_path, data_dir) = test_mailbox("blocker-empty").await;
+        register(&mailbox, "demo", "RoseDune").await;
+        // Keys with NO profile and NO roster row: both name sources miss.
+        let ghost = crate::keys::generate();
+        publish_raw_stale_lease(&mailbox, &ghost, "demo", "ghost-hold.md").await;
+        let report = mailbox
+            .check_file_reservation_conflicts("demo", "RoseDune", &["ghost-hold.md".into()])
+            .await
+            .expect("conflicts");
+        assert!(
+            !report.conflict_free,
+            "the ghost lease holds the path: {report:?}"
+        );
+        let holders: Vec<&str> = report
+            .conflicts
+            .iter()
+            .flat_map(|c| c.holders.iter().map(String::as_str))
+            .collect();
+        assert_eq!(
+            holders,
+            vec![""],
+            "roster miss stays empty, no invented prefix: {holders:?}"
         );
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_dir_all(&data_dir);
@@ -5344,6 +5439,31 @@ mod tests {
         )
         .expect("raw lease");
         mailbox.bus.publish(lease).await.expect("publish");
+    }
+
+    /// Publish a raw `status:intent` 30031 for keys with NO profile on the
+    /// bus — the intent-board half of the roster-miss case: neither the live
+    /// profiles nor the roster can name the holder.
+    async fn publish_raw_intent(mailbox: &Mailbox, holder: &Keys, project: &str, path: &str) {
+        use crate::nostr::event::build_event;
+        let d = format!("{project}:{path}");
+        let tags = with_project_scoping(
+            toron_kind(FILE_RESERVATION),
+            vec![
+                Tag::parse(["d", &d]).expect("d"),
+                Tag::parse(["status", "intent"]).expect("status"),
+            ],
+            Some(project),
+        );
+        let intent = build_event(
+            holder,
+            toron_kind(FILE_RESERVATION),
+            r#"{"status":"intent","exclusive":true,"reason":""}"#,
+            tags,
+            Timestamp::now(),
+        )
+        .expect("raw intent");
+        mailbox.bus.publish(intent).await.expect("publish");
     }
 
     /// Order 1 — hostile reclaim: bus-stale A holds (epoch 0), operator

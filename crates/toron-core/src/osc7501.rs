@@ -126,7 +126,8 @@ impl Board {
                 self.records.clear();
             } else {
                 let prefix = format!("{id}/");
-                self.records.retain(|k, _| k != &id && !k.starts_with(&prefix));
+                self.records
+                    .retain(|k, _| k != &id && !k.starts_with(&prefix));
             }
             return;
         }
@@ -203,7 +204,11 @@ pub fn parse_report(raw: &str) -> Option<Report> {
     {
         return None;
     }
-    let kind = if state == ProgramState::Blocked { kind } else { None };
+    let kind = if state == ProgramState::Blocked {
+        kind
+    } else {
+        None
+    };
     let progress = if matches!(state, ProgramState::Working | ProgramState::Blocked) {
         progress
     } else {
@@ -259,9 +264,9 @@ fn parse_kind(value: &str) -> Option<BlockKind> {
 }
 
 fn value_ok(value: &str) -> bool {
-    value
-        .bytes()
-        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b',' | b'+' | b'/' | b'=' | b'-'))
+    value.bytes().all(|b| {
+        b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b',' | b'+' | b'/' | b'=' | b'-')
+    })
 }
 
 fn app_ok(value: &str) -> bool {

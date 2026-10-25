@@ -149,10 +149,7 @@ fn accepted_is_its_own_state(db: &dyn JournalStore) {
 
 fn exhausted_attempts_dead_letter(db: &dyn JournalStore) {
     db.record_intent("job-1", 1);
-    assert_eq!(
-        db.attempt("job-1", 0).unwrap().state,
-        EffectState::Prepared
-    );
+    assert_eq!(db.attempt("job-1", 0).unwrap().state, EffectState::Prepared);
     let row = db.attempt("job-1", 0).unwrap();
     assert_eq!(row.state, EffectState::Failed);
     assert_eq!(row.disposition, Some(JournalDisposition::TerminalFailed));
@@ -469,9 +466,9 @@ fn a_blocking_fiber_call_completes_without_nesting_a_runtime() {
     let j2 = j.clone();
     let row = db
         .rt
-        .block_on(async move {
-            tokio::task::spawn_blocking(move || j2.try_record_intent("k", 1)).await
-        })
+        .block_on(
+            async move { tokio::task::spawn_blocking(move || j2.try_record_intent("k", 1)).await },
+        )
         .unwrap()
         .expect("answers from a blocking fiber");
     assert_eq!(row.state, EffectState::Prepared);
@@ -479,9 +476,9 @@ fn a_blocking_fiber_call_completes_without_nesting_a_runtime() {
     let j3 = j.clone();
     let row = db
         .rt
-        .block_on(async move {
-            tokio::task::spawn_blocking(move || j3.record_intent("k", 1)).await
-        })
+        .block_on(
+            async move { tokio::task::spawn_blocking(move || j3.record_intent("k", 1)).await },
+        )
         .unwrap();
     assert_eq!((row.state, row.disposition), (EffectState::Prepared, None));
     assert!(j.get("k").is_some());

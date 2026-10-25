@@ -14,38 +14,51 @@ use serde::{Deserialize, Serialize};
 use crate::authority::Role;
 
 /// Which choreography a context runs (redesign §6.2).
-#[derive(
-    Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
-)]
+///
+/// Open and swarm are the modes. The wire word `loop` reads as [`Open`]:
+/// a loop is work plus one verify check, not a third mode. Writers emit
+/// `open`. Old rows that still say `loop` load as open.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Topology {
     /// Captain, crews, one verifier. [`G_SWARM`].
     Swarm,
     /// Declared here, projected in Phase 4a. Not a swarm.
     Supervisor,
-    /// A loop-self folding its own log. [`G_LOOP`].
-    Loop,
-    /// Peers, no supervisor. [`G_OPEN`].
+    /// One agent, or peers with no captain. [`G_OPEN`].
     Open,
 }
 
+impl<'de> Deserialize<'de> for Topology {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let word = String::deserialize(deserializer)?;
+        Self::parse(&word).ok_or_else(|| {
+            serde::de::Error::unknown_variant(&word, &["swarm", "supervisor", "open", "loop"])
+        })
+    }
+}
+
 impl Topology {
-    /// Every topology, in a fixed order.
-    pub const ALL: [Self; 4] = [Self::Swarm, Self::Supervisor, Self::Loop, Self::Open];
+    /// Every mode, in a fixed order. `loop` is not a member.
+    pub const ALL: [Self; 3] = [Self::Swarm, Self::Supervisor, Self::Open];
 
     /// The wire spelling (`snake_case`), as serde writes it.
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Swarm => "swarm",
             Self::Supervisor => "supervisor",
-            Self::Loop => "loop",
             Self::Open => "open",
         }
     }
 
-    /// Parse the wire spelling.
+    /// Parse the wire spelling. `loop` is open.
     pub fn parse(s: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|t| t.as_str() == s)
+        match s {
+            "swarm" => Some(Self::Swarm),
+            "supervisor" => Some(Self::Supervisor),
+            "open" | "loop" => Some(Self::Open),
+            _ => None,
+        }
     }
 }
 
@@ -209,7 +222,6 @@ pub struct AllowedNow {
 pub fn global_of(topology: Topology) -> Result<&'static Global, ProjectError> {
     match topology {
         Topology::Swarm => Ok(&G_SWARM),
-        Topology::Loop => Ok(&G_LOOP),
         Topology::Open => Ok(&G_OPEN),
         Topology::Supervisor => Err(ProjectError::NotYet {
             what: "supervisor".into(),
@@ -350,12 +362,20 @@ mod tests {
             );
         }
         let fact = ContextV1 {
-            topology: Topology::Loop,
+            topology: Topology::Open,
             generation: 3,
         };
         let v = serde_json::to_value(&fact).unwrap();
-        assert_eq!(v["topology"], "loop");
+        assert_eq!(v["topology"], "open");
         assert_eq!(v["gen"], 3);
+        assert_eq!(
+            serde_json::from_value::<ContextV1>(serde_json::json!({"topology": "loop", "gen": 3}))
+                .unwrap()
+                .topology,
+            Topology::Open,
+            "a stored loop fact is open"
+        );
+        assert_eq!(Topology::parse("loop"), Some(Topology::Open));
         assert!(v.get("generation").is_none());
         assert!(
             serde_json::from_value::<ContextV1>(serde_json::json!({"topology": "join", "gen": 1}))

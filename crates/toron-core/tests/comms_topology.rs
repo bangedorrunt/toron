@@ -211,10 +211,10 @@ async fn a_stranger_cannot_start_a_topology_and_a_captain_can_move_it() {
     let m = q.msg(OP);
     put(&s, &mut q, role_fact(m, CAP, Role::Captain, 0)).await;
     let m = q.msg(CAP);
-    put(&s, &mut q, context_fact(m, CAP, Topology::Loop, 1)).await;
+    put(&s, &mut q, context_fact(m, CAP, Topology::Open, 1)).await;
     assert_eq!(
         s.context_of(CTX).await.unwrap().unwrap().topology,
-        Topology::Loop
+        Topology::Open
     );
 }
 

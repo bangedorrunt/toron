@@ -9,7 +9,9 @@ use toron_core::envelope::{Class, ContextId, ContractId, Envelope, MsgId, Recipi
 use toron_core::inbox::{INBOX_STREAM, InboxError, InboxStore, JOURNAL_STREAM, ToronLog};
 use toron_core::index::schema;
 use toron_core::kernel::{self, AppendError, Boot, DurableLog, Failure, Loop, Producer, Program};
-use toron_core::outbox::{self, MAX_RECONCILE, Outbox, OutboxModel, OutboxMsg, OutboxRun, SendState};
+use toron_core::outbox::{
+    self, MAX_RECONCILE, Outbox, OutboxModel, OutboxMsg, OutboxRun, SendState,
+};
 
 const A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
@@ -160,7 +162,10 @@ fn compact_before_drops_below_a_known_offset_only() {
         assert_eq!(rest.len(), 2);
         assert_eq!(rest[0].0, o1);
         // The dropped offset is gone: reading from it is now unknown.
-        assert!(matches!(log.read_from(&o0), Err(AppendError::UnknownOffset)));
+        assert!(matches!(
+            log.read_from(&o0),
+            Err(AppendError::UnknownOffset)
+        ));
         // Idempotent: compacting at the same offset drops nothing.
         assert_eq!(log.compact_before(&o1).unwrap(), 0);
     })
@@ -364,9 +369,7 @@ async fn journal_kinds(s: &InboxStore) -> Vec<String> {
         .map(|(_, p)| {
             serde_json::from_str::<serde_json::Value>(p)
                 .ok()
-                .and_then(|v| {
-                    v.get("kind").and_then(|k| k.as_str()).map(str::to_string)
-                })
+                .and_then(|v| v.get("kind").and_then(|k| k.as_str()).map(str::to_string))
                 .unwrap_or_else(|| "?".into())
         })
         .collect()
@@ -396,7 +399,8 @@ fn crash_child() {
     let inbox = ToronLog::spawn(s, INBOX_STREAM, rt.handle());
     std::thread::spawn(move || {
         let mut app = boot(journal, inbox, 0);
-        app.send(OutboxMsg::Send(task(A, B, 0, 0))).expect("loop send");
+        app.send(OutboxMsg::Send(task(A, B, 0, 0)))
+            .expect("loop send");
     })
     .join()
     .unwrap();
