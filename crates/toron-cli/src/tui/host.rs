@@ -155,9 +155,9 @@ impl LiveHost {
 
     /// The acting pin, or a typed error naming the fix.
     fn require_agent(&self) -> anyhow::Result<&str> {
-        self.agent.as_deref().ok_or_else(|| {
-            anyhow::anyhow!("no acting pin — pass --as or export TORON_AGENT / FLYWHEEL_MAIL_AS")
-        })
+        self.agent
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("no acting pin — pass --as or export AGENT_NAME"))
     }
 
     /// Acked corrs, from the durable receipt store (one list per inbox page).
@@ -389,7 +389,7 @@ impl LiveHost {
                         format!("{pin} ({})", short_npub(npub))
                     }
                     (Some(pin), None) => format!("{pin} (not registered in this project)"),
-                    (None, _) => "none — pass --as or export TORON_AGENT".into(),
+                    (None, _) => "none — pass --as or export AGENT_NAME".into(),
                 },
                 ok: self.agent.is_some(),
             },

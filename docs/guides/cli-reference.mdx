@@ -81,7 +81,7 @@ The layout folds with the terminal: three panes at 108+ columns, two (the sideba
 
 An empty pane names the next command with this project and pin already in it: Mail offers `toron mail send … --to <pin> --subject <subject> --body <body>` plus the room opener, Channels offers `toron channel create <id> --name <name> --project … --as …`, and Agents offers `toron agent bootstrap …`. An unknown pin stays a `<pin>` placeholder rather than a guess about who the operator is, and a REFUSED fetch settles the pane: it shows the error beside the command that fixes it instead of saying "loading" forever.
 
-The project falls back to `$TORON_PROJECT` and the agent to `$TORON_AGENT`/`$FLYWHEEL_MAIL_AS`/`$AGENT_NAME`; without either the tab fails loud rather than guessing. It reads the one mailbox the source selector resolves and refuses a non-loopback daemon. The whole console is an Elm core (`tick(&Model, Msg) -> (Model, Vec<Effect>)`): the fold does no I/O, the host runs every effect under a bound, and Channels/Dashboard refresh on a slower cadence than Mail/Agents.
+The project falls back to `$TORON_PROJECT` and the agent to `$AGENT_NAME`. `--as` wins over that env. Without either, the tab fails loud rather than guessing. It reads the one mailbox the source selector resolves and refuses a non-loopback daemon. The whole console is an Elm core (`tick(&Model, Msg) -> (Model, Vec<Effect>)`): the fold does no I/O, the host runs every effect under a bound, and Channels/Dashboard refresh on a slower cadence than Mail/Agents.
 
 ## MCP clusters (the emitted 38-tool surface)
 

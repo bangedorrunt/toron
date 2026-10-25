@@ -3202,7 +3202,7 @@ fn guard_commit_msg_blocks_foreign_bead_tokens() {
         toron_core::testkit::apply_test_env(c);
         c.current_dir(&repo)
             .env("TORON_MCP_DATA_DIR", &data_dir)
-            .env("TORON_AGENT", "HunkAgent")
+            .env("AGENT_NAME", "HunkAgent")
             // The installed hooks shell out to `toron`, and an ambient
             // TORON_MCP_URL would send them to a developer's live daemon
             // instead of this fixture's store, so the guard would judge the

@@ -48,7 +48,7 @@ pub fn render(f: &mut Frame, area: Rect, model: &Model) {
             .as_deref()
             .map(crate::tui::host::short_npub)
             .as_deref()
-            .unwrap_or("pass --as or export TORON_AGENT to read an inbox"),
+            .unwrap_or("pass --as or export AGENT_NAME to read an inbox"),
         model.settings.agent.is_some(),
     );
     widgets::stat_card(
@@ -167,7 +167,7 @@ fn render_source(f: &mut Frame, area: Rect, model: &Model) {
     lines.push(Line::from(vec![
         Span::styled("change     ", HackerNight::fg_muted()),
         Span::styled(
-            "--project / --as at launch, or $TORON_PROJECT / $TORON_AGENT",
+            "--project / --as at launch, or $TORON_PROJECT / $AGENT_NAME",
             HackerNight::fg_default(),
         ),
     ]));

@@ -1378,8 +1378,8 @@ pub enum GuardCommand {
     Uninstall(GuardRepoArgs),
     /// Check a commit's staged paths against active reservations. Exit 1
     /// (blocked) when a staged path is exclusively reserved by ANOTHER agent;
-    /// exit 0 (allow) otherwise. Attribution: --as, else TORON_AGENT, else
-    /// FLYWHEEL_MAIL_AS; an unattributed commit fails open (exit 0).
+    /// exit 0 (allow) otherwise. Attribution: --as, else AGENT_NAME; an
+    /// unattributed commit fails open (exit 0).
     ///
     /// `--strict` (bd-2dox sweep-guard): every staged path must be covered by
     /// the committer's OWN active reservation or the shared-safe bookkeeping
@@ -1412,7 +1412,7 @@ pub struct GuardCheckArgs {
     /// Project slug whose reservations are evaluated.
     #[arg(long, required = true)]
     pub project: String,
-    /// Committing agent name (overrides TORON_AGENT / FLYWHEEL_MAIL_AS).
+    /// Committing agent name (overrides AGENT_NAME).
     #[arg(long)]
     pub as_agent: Option<String>,
     /// Strict sweep-guard (bd-2dox): staged paths must be covered by the
@@ -1436,7 +1436,7 @@ pub struct GuardRecordArgs {
     /// Project slug (kept for symmetry with `guard check`; unused today).
     #[arg(long, required = true)]
     pub project: String,
-    /// Committing agent name (overrides TORON_AGENT / FLYWHEEL_MAIL_AS).
+    /// Committing agent name (overrides AGENT_NAME).
     #[arg(long)]
     pub as_agent: Option<String>,
     /// Override journal path (hermetic tests only; default is
@@ -1801,7 +1801,7 @@ pub struct PresencePublishArgs {
     #[arg(long)]
     pub project: Option<String>,
     /// Publishing agent's canonical name (ADR-0018; when absent, defaults
-    /// from the TORON_AGENT, FLYWHEEL_MAIL_AS, or AGENT_NAME env vars).
+    /// from AGENT_NAME).
     #[arg(long = "as")]
     pub as_name: Option<String>,
 }
@@ -2017,8 +2017,8 @@ pub struct TuiArgs {
     #[arg(long)]
     pub project: Option<String>,
     /// Acting agent pin whose inbox the Mail tab projects. Falls back to
-    /// $TORON_AGENT / $FLYWHEEL_MAIL_AS / $AGENT_NAME; without either the
-    /// Mail tab reports a missing identity instead of guessing one.
+    /// $AGENT_NAME; without either the Mail tab reports a missing identity
+    /// instead of guessing one.
     #[arg(long = "as")]
     pub agent: Option<String>,
     /// Open on this tab (mail|channels|agents|dashboard|settings).

@@ -2052,23 +2052,18 @@ fn fold_from_agents_resource(agents: &serde_json::Value) -> HolderFold {
 }
 
 /// Resolve the committing agent from `--as` / env (shared embedded+daemon).
+fn pin_from_flag_or_agent_name(flag: Option<String>) -> Option<String> {
+    flag.or_else(|| std::env::var("AGENT_NAME").ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 fn guard_agent(args: &crate::cli::GuardCheckArgs) -> Option<String> {
-    args.as_agent
-        .clone()
-        .or_else(|| std::env::var("TORON_AGENT").ok())
-        .or_else(|| std::env::var("FLYWHEEL_MAIL_AS").ok())
-        // bd-2dox: AGENT_NAME is the mcp-agent-mail convention the
-        // chain-runner plugin enforces; the strict guard's fail-closed
-        // message points at it, so it must resolve here too.
-        .or_else(|| std::env::var("AGENT_NAME").ok())
+    pin_from_flag_or_agent_name(args.as_agent.clone())
 }
 
 fn guard_record_agent(args: &crate::cli::GuardRecordArgs) -> Option<String> {
-    args.as_agent
-        .clone()
-        .or_else(|| std::env::var("TORON_AGENT").ok())
-        .or_else(|| std::env::var("FLYWHEEL_MAIL_AS").ok())
-        .or_else(|| std::env::var("AGENT_NAME").ok())
+    pin_from_flag_or_agent_name(args.as_agent.clone())
 }
 
 /// Shared tail of `guard check` (strict + legacy paths, exit codes).
@@ -2168,8 +2163,7 @@ pub fn guard_check_verdict(
             })
             .collect();
         notices.push(if agent.is_none() {
-            "toron: strict guard: unattributed commit blocked — set AGENT_NAME=<pin> (or \
-             TORON_AGENT / FLYWHEEL_MAIL_AS)"
+            "toron: strict guard: unattributed commit blocked — set AGENT_NAME=<pin> or pass --as"
                 .to_string()
         } else {
             format!(

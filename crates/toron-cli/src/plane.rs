@@ -279,7 +279,7 @@ pub(crate) fn pane_project(flag: Option<&str>) -> Option<String> {
     resolve_presence_project(flag, &live_env)
 }
 
-/// Acting pin: `--as`, else TORON_AGENT / FLYWHEEL_MAIL_AS / AGENT_NAME.
+/// Acting pin: `--as`, else AGENT_NAME.
 pub(crate) fn pane_agent(flag: Option<&str>) -> Option<String> {
     resolve_presence_as(flag, &live_env)
 }
@@ -1393,13 +1393,9 @@ fn resolve_presence_project(
     nonblank(flag.map(str::to_string)).or_else(|| nonblank(env("TORON_PROJECT")))
 }
 
-/// bd-1wwc: --as ladder — explicit flag, then TORON_AGENT, FLYWHEEL_MAIL_AS,
-/// AGENT_NAME (the guard_agent order in robot.rs, reused not reinvented).
+/// `--as`, else `AGENT_NAME`. The same two rungs as `guard_agent`.
 fn resolve_presence_as(flag: Option<&str>, env: &dyn Fn(&str) -> Option<String>) -> Option<String> {
-    nonblank(flag.map(str::to_string))
-        .or_else(|| nonblank(env("TORON_AGENT")))
-        .or_else(|| nonblank(env("FLYWHEEL_MAIL_AS")))
-        .or_else(|| nonblank(env("AGENT_NAME")))
+    nonblank(flag.map(str::to_string)).or_else(|| nonblank(env("AGENT_NAME")))
 }
 
 fn nonblank(s: Option<String>) -> Option<String> {
@@ -1419,7 +1415,7 @@ async fn presence_publish(mailbox: &Mailbox, args: &PresencePublishArgs) -> anyh
             )
         })?;
     let as_name = resolve_presence_as(args.as_name.as_deref(), &live_env).ok_or_else(|| {
-        anyhow::anyhow!("pass --as or export TORON_AGENT / FLYWHEEL_MAIL_AS / AGENT_NAME (no pin in flags or pane env)")
+        anyhow::anyhow!("pass --as or export AGENT_NAME (no pin in flags or pane env)")
     })?;
     let keys = resolve_agent(mailbox, &project, &as_name).await?;
     let now = Timestamp::now();
@@ -2580,33 +2576,30 @@ mod presence_env_tests {
 
     #[test]
     fn presence_project_and_as_precedence() {
-        // Project: nothing set is absent. Identity ladder: flag > TORON_AGENT
-        // > FLYWHEEL_MAIL_AS > AGENT_NAME > absent, one table (was 6 tests).
+        // Project: nothing set is absent. Identity: flag, else AGENT_NAME.
+        // TORON_AGENT and FLYWHEEL_MAIL_AS do not supply a pin.
         assert_eq!(resolve_presence_project(None, &lookup(&env_map(&[]))), None);
         for (flag, env, want) in [
             (
                 Some("FlagPin"),
-                vec![("TORON_AGENT", "EnvPin")],
+                vec![("AGENT_NAME", "EnvPin")],
                 Some("FlagPin"),
             ),
             (
                 None,
                 vec![
-                    ("TORON_AGENT", "FirstPin"),
-                    ("FLYWHEEL_MAIL_AS", "SecondPin"),
-                    ("AGENT_NAME", "ThirdPin"),
+                    ("TORON_AGENT", "OldPin"),
+                    ("FLYWHEEL_MAIL_AS", "MailPin"),
+                    ("AGENT_NAME", "AgentPin"),
                 ],
-                Some("FirstPin"),
+                Some("AgentPin"),
             ),
             (
                 None,
-                vec![
-                    ("FLYWHEEL_MAIL_AS", "SecondPin"),
-                    ("AGENT_NAME", "ThirdPin"),
-                ],
-                Some("SecondPin"),
+                vec![("TORON_AGENT", "OldPin"), ("FLYWHEEL_MAIL_AS", "MailPin")],
+                None,
             ),
-            (None, vec![("AGENT_NAME", "ThirdPin")], Some("ThirdPin")),
+            (None, vec![("AGENT_NAME", "AgentPin")], Some("AgentPin")),
             (None, vec![], None),
         ] {
             assert_eq!(

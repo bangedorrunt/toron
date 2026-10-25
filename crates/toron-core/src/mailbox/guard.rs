@@ -36,7 +36,7 @@ pub struct Reservation {
 ///   reservation whose pattern matches it (symmetric fnmatch).
 ///
 /// `agent` is `Option` for the CLI path: an unattributed commit (no agent
-/// resolvable from `--as` / `TORON_AGENT` / `FLYWHEEL_MAIL_AS`) cannot be
+/// resolvable from `--as` / `AGENT_NAME`) cannot be
 /// told apart from the holder, so it FAILS OPEN (empty result) — the guard
 /// only blocks when attribution is available. This keeps human/operator
 /// commits (which carry no agent env) unblocked.
@@ -413,8 +413,7 @@ pub fn install_precommit_guard(repo_path: &Path, project: &str) -> anyhow::Resul
          # installed by toron — governed-by: ADR-0003\n\
          # Strict staged-paths sweep-guard (bd-2dox): a commit may only stage\n\
          # paths covered by the committer's OWN active reservation (or the\n\
-         # .beads bookkeeping files). Attribution: set AGENT_NAME=<pin>\n\
-         # (or TORON_AGENT / FLYWHEEL_MAIL_AS).\n\
+         # .beads bookkeeping files). Attribution: set AGENT_NAME=<pin>.\n\
          # Session escape hatch: TORON_GUARD_STRICT=0 <commit> (logged).\n\
          # One mailbox (bd-pin-public-plane-s-easy.14): guard check reads the\n\
          # reservation roster from the toron daemon when TORON_MCP_URL is set\n\
@@ -486,7 +485,7 @@ pub fn install_precommit_guard(repo_path: &Path, project: &str) -> anyhow::Resul
              # GitFact producer (bd-jhes): on a SUCCESSFUL commit appends one\n\
              # JSONL line {{type:\"git_fact\", repo, sha, subject, bead_id, pin}}\n\
              # to the flywheel fact journal (best-effort, NEVER blocks commit).\n\
-             # Attribution: AGENT_NAME / TORON_AGENT / FLYWHEEL_MAIL_AS.\n\
+             # Attribution: AGENT_NAME=<pin>.\n\
              {export}\
              if command -v toron >/dev/null 2>&1; then\n\
              \ttoron guard record --repo \"$PWD\" --project {project} || true\n\

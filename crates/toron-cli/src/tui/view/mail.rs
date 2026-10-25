@@ -90,7 +90,7 @@ fn render_list(f: &mut Frame, area: Rect, model: &Model, focused: bool, narrow: 
             "loading the index…".to_string()
         } else if model.settings.agent.is_none() {
             format!(
-                "no acting pin, so there is no inbox to read.\n\n  register one:\n    {}\n\nthen start the console with --as (or export TORON_AGENT).",
+                "no acting pin, so there is no inbox to read.\n\n  register one:\n    {}\n\nthen start the console with --as (or export AGENT_NAME).",
                 on.agent
             )
         } else if model.mail.search.is_some() {
