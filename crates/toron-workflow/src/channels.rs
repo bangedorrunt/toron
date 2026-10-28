@@ -106,6 +106,8 @@ pub struct ChannelEvent {
 #[derive(Debug, Clone, Default)]
 pub struct ChannelStore {
     inner: Arc<Mutex<ChannelStoreInner>>,
+    /// ADR-0019 D8 loop guard, per-store (never process-global).
+    loop_tracker: toron_core::mailbox::surface::LoopTracker,
 }
 
 #[derive(Debug, Default)]
@@ -569,6 +571,36 @@ impl ChannelStore {
     ) -> anyhow::Result<Event> {
         let author_pk = author.public_key();
         self.require_member(channel_id, &author_pk)?;
+        // ADR-0019 D8 (bd-q6vx): per-(author,channel) loop + group refuse at
+        // the store boundary, before any event is produced. Refuse writes nothing.
+        if toron_core::mailbox::surface::is_group_target(channel_id) {
+            anyhow::bail!(toron_core::mailbox::surface::group_refused_msg(channel_id));
+        }
+        {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0);
+            let key = toron_core::mailbox::surface::loop_key_channel(
+                &author_pk.to_hex(),
+                channel_id,
+            );
+            let history = self.loop_tracker.history(&key);
+            if !toron_core::mailbox::surface::loop_ok(
+                &history,
+                now_ms,
+                toron_core::mailbox::surface::Exempt::None,
+            ) {
+                anyhow::bail!(toron_core::mailbox::surface::loop_refused_msg(
+                    format!("{} -> #{} burst", author_pk.to_hex(), channel_id).as_str()
+                ));
+            }
+            let _ = self.loop_tracker.check_and_record(
+                &key,
+                now_ms,
+                toron_core::mailbox::surface::Exempt::None,
+            );
+        }
         // Spec 2: kind-9 for >20 lines without a path is rejected (must be file-first)
         if content.lines().count() > 20
             && !content.contains("path:")

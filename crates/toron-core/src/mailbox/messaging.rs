@@ -312,6 +312,18 @@ impl Mailbox {
         // of the project sends under the ONE canonical root.
         let mut args = args.clone();
         args.project_slug = self.canonical_project(&args.project_slug).await;
+        // ADR-0019 D8 (bd-q6vx): group fan-out refuses at the same layer as
+        // the loop, before resolve (a group name must not reach key lookup).
+        for raw in args
+            .to
+            .iter()
+            .chain(args.cc.iter())
+            .chain(args.bcc.iter())
+        {
+            if super::surface::is_group_target(raw) {
+                return Err(anyhow::anyhow!(super::surface::group_refused_msg(raw)));
+            }
+        }
         // G3: resolve ALL recipients pre-wrap; unknown aborts the whole send.
         let resolved = self.resolve_recipients(&args).await?;
         if resolved.is_empty() {
@@ -349,6 +361,33 @@ impl Mailbox {
         // `Utc::now()` reads are banned — the method is the host, the
         // `Clock` trait is the seam (tests inject `FakeClock` at the edge).
         let now_ms = crate::index::writer::Clock::now_us(&crate::index::writer::SystemClock) / 1000;
+        // ADR-0019 D8 (bd-q6vx): per-(from,to) loop, before the first write
+        // (receipt upsert below). Refuse writes nothing. Operator overseer is
+        // exempt by ARGUMENT, never env/TTY.
+        {
+            let exempt = if args.overseer {
+                super::surface::Exempt::Operator
+            } else {
+                super::surface::Exempt::None
+            };
+            for r in resolved.iter() {
+                let key =
+                    super::surface::loop_key_mail(&args.sender_name, &r.name);
+                let history = self.loop_tracker.history(&key);
+                if !super::surface::loop_ok(&history, now_ms, exempt) {
+                    return Err(anyhow::anyhow!(super::surface::loop_refused_msg(
+                        format!("{} -> {} burst", args.sender_name, r.name).as_str()
+                    )));
+                }
+            }
+            for r in resolved.iter() {
+                let key =
+                    super::surface::loop_key_mail(&args.sender_name, &r.name);
+                let _ = self
+                    .loop_tracker
+                    .check_and_record(&key, now_ms, exempt);
+            }
+        }
         let mut receipt_bookkeeping_failed = false;
         if let Some(corr) = parsed_tags.corr.clone() {
             match self.receipt_store() {

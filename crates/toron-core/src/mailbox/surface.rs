@@ -26,6 +26,98 @@ use super::unwrap::ContactPolicy;
 use crate::index::slots::BuildSlot;
 use crate::nostr::identity::AgentProfile;
 
+/// ADR-0019 D8 loop guard (Lane B, bd-q6vx): the ONE export toron owns.
+/// Flywheel calls this; no second copy anywhere (grep `fn loop_ok` = 1 hit).
+/// Effect-oriented: pure predicate, clock + history in, bool out. The caller
+/// supplies history + now; this fn never reads env/TTY/time.
+/// Window `(now_ms - LOOP_WINDOW_MS, now_ms]`, allow while count < LOOP_MAX.
+// shortcut: in-process HashMap tracker (not at-most-once across processes;
+// under-refusal under concurrency is the accepted residual — document, don't promise).
+// Upgrade to a durable claim table when cross-process bursts need exactness.
+pub const LOOP_WINDOW_MS: i64 = 600_000;
+pub const LOOP_MAX: usize = 12;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Exempt {
+    None,
+    Operator,
+}
+
+pub fn loop_ok(sent_at_ms: &[i64], now_ms: i64, exempt: Exempt) -> bool {
+    if exempt == Exempt::Operator {
+        return true;
+    }
+    let lo = now_ms - LOOP_WINDOW_MS;
+    sent_at_ms
+        .iter()
+        .filter(|t| **t > lo && **t <= now_ms)
+        .count()
+        < LOOP_MAX
+}
+
+/// Group addresses refuse at the same layer as the loop (`*`, `repo:`,
+/// and `pin/*` fan-out — never p2p). The bare `captain` alias is NOT a
+/// group: it resolves to the one bound captain through the normal alias
+/// path (refusing it would break captain delivery).
+pub fn is_group_target(target: &str) -> bool {
+    target == "*" || target.starts_with("repo:") || target.contains('/')
+}
+
+/// Per-owner loop tracker (ADR-0019 D8). The guard counts sends per key
+/// inside ONE owner (a `Mailbox`, a `ChannelStore`) — never process-global,
+/// so parallel tests and separate stores cannot trip each other's windows.
+/// Production holds one mailbox per process, so the live semantics are the
+/// same single cap the contract specifies.
+#[derive(Debug, Clone, Default)]
+pub struct LoopTracker {
+    inner: std::sync::Arc<parking_lot::Mutex<std::collections::HashMap<String, Vec<i64>>>>,
+}
+
+impl LoopTracker {
+    /// History for one key (read-only; the guard reads before it writes).
+    pub fn history(&self, key: &str) -> Vec<i64> {
+        self.inner.lock().get(key).cloned().unwrap_or_default()
+    }
+
+    /// Check + record one send. False = refuse, record nothing, caller
+    /// writes nothing. True = record `now_ms` under `key` and allow.
+    /// Operator exempt skips both.
+    pub fn check_and_record(&self, key: &str, now_ms: i64, exempt: Exempt) -> bool {
+        if exempt == Exempt::Operator {
+            return true;
+        }
+        let mut guard = self.inner.lock();
+        let entry = guard.entry(key.to_string()).or_default();
+        let lo = now_ms - LOOP_WINDOW_MS;
+        entry.retain(|t| *t > lo && *t <= now_ms);
+        if entry.len() >= LOOP_MAX {
+            return false;
+        }
+        entry.push(now_ms);
+        true
+    }
+}
+
+pub fn loop_key_mail(from_pin: &str, to_pin: &str) -> String {
+    format!("mail:{from_pin}\0{to_pin}")
+}
+
+pub fn loop_key_channel(from_id: &str, channel_id: &str) -> String {
+    format!("chan:{from_id}\0{channel_id}")
+}
+
+pub fn loop_key_job(from_id: &str, job_id: &str) -> String {
+    format!("job:{from_id}\0{job_id}")
+}
+
+pub fn loop_refused_msg(reason: &str) -> String {
+    format!("policy_denied loop_refused: {reason}")
+}
+
+pub fn group_refused_msg(target: &str) -> String {
+    format!("policy_denied loop_refused group_refused: group address {target}")
+}
+
 /// `send` request. `thread_id` opens a message INSIDE an existing thread
 /// (flywheel's debate/plan-review patterns seed a thread via send); replies
 /// use [`ReplyMail`].
@@ -1900,5 +1992,112 @@ mod tests {
         assert_eq!(err.code(), &MailErrorCode::Unsupported);
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// ADR-0019 D8: the guard lives on the send path, not beside it.
+    /// Twelve sends inside 600s land; the thirteenth is refused with the
+    /// stable `loop_refused` code and writes nothing. Deleting the
+    /// `loop_ok` call in `send_message` turns the refusal into a thirteenth
+    /// delivery and this test red.
+    #[tokio::test]
+    async fn send_burst_past_twelve_is_refused() {
+        let (surface, db_path, data_dir) = test_surface("burst").await;
+        // Unique pins: no other test's sends share this guard key, so the
+        // thirteen sends below are exactly the window under test.
+        let _ = register_agent(&surface, "demo", "BurstSender").await;
+        let _ = register_agent(&surface, "demo", "BurstReceiver").await;
+        for i in 0..12 {
+            surface
+                .send(&SendMail {
+                    project: "demo".into(),
+                    sender: "BurstSender".into(),
+                    to: vec!["BurstReceiver".into()],
+                    subject: format!("burst {i}"),
+                    body_md: "burst".into(),
+                    ..Default::default()
+                })
+                .await
+                .unwrap_or_else(|e| panic!("burst send {i} lands: {e:?}"));
+        }
+        let refused = surface
+            .send(&SendMail {
+                project: "demo".into(),
+                sender: "BurstSender".into(),
+                to: vec!["BurstReceiver".into()],
+                subject: "burst 12".into(),
+                body_md: "burst".into(),
+                ..Default::default()
+            })
+            .await
+            .expect_err("13th send inside the window is refused");
+        let msg = format!("{refused:?}");
+        assert!(
+            msg.contains("loop_refused"),
+            "refusal carries the stable code: {msg}"
+        );
+        assert_eq!(
+            refused.code(),
+            &MailErrorCode::PolicyDenied,
+            "refusal is a typed policy denial"
+        );
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    // ADR-0019 D8 (bd-q6vx): loop-guard unit tests. Pure predicate, clock as
+    // argument — advance fake time past the window edge, no wall time.
+    const T1: i64 = 1_793_174_000_000;
+
+    #[test]
+    fn loop_ok_allows_eleven_denies_twelve() {
+        let eleven: Vec<i64> = (0..11).map(|i| T1 - i * 1_000).collect();
+        assert!(loop_ok(&eleven, T1, Exempt::None));
+        let mut twelve = eleven.clone();
+        twelve.push(T1 - 12_000);
+        assert!(!loop_ok(&twelve, T1, Exempt::None));
+    }
+
+    #[test]
+    fn loop_ok_oldest_stamp_aging_out_reopens() {
+        // Oldest stamp exactly on the window edge is excluded (`> lo`).
+        let mut stamps: Vec<i64> = (0..11).map(|i| T1 - i * 1_000).collect();
+        stamps.push(T1 - LOOP_WINDOW_MS);
+        assert!(loop_ok(&stamps, T1, Exempt::None));
+        // One ms inside the window closes it again.
+        stamps[11] += 1;
+        assert!(!loop_ok(&stamps, T1, Exempt::None));
+    }
+
+    #[test]
+    fn loop_ok_operator_exempt_is_an_argument() {
+        let twelve: Vec<i64> = (0..12).map(|i| T1 - i * 1_000).collect();
+        assert!(!loop_ok(&twelve, T1, Exempt::None));
+        assert!(loop_ok(&twelve, T1, Exempt::Operator));
+    }
+
+    #[test]
+    fn loop_check_and_record_refuses_without_recording() {
+        let tracker = LoopTracker::default();
+        let key = "test:record-capability";
+        for _ in 0..LOOP_MAX {
+            assert!(tracker.check_and_record(key, T1, Exempt::None));
+        }
+        assert!(!tracker.check_and_record(key, T1, Exempt::None));
+        assert_eq!(tracker.history(key).len(), LOOP_MAX);
+        assert!(loop_ok(&tracker.history(key), T1 + LOOP_WINDOW_MS + 1, Exempt::None));
+    }
+
+    #[test]
+    fn loop_group_targets_refuse() {
+        for g in ["*", "repo:flywheel", "pin/abc", "chan/general"] {
+            assert!(is_group_target(g), "{g}");
+        }
+        // The bare captain alias resolves to the one bound captain through
+        // the normal alias path — refusing it would break captain delivery.
+        for p in ["MistyCreek", "grok-1", "captain", ""] {
+            assert!(!is_group_target(p), "{p}");
+        }
+        assert!(loop_refused_msg("a -> b burst").contains("loop_refused"));
+        assert!(group_refused_msg("*").contains("loop_refused"));
     }
 }

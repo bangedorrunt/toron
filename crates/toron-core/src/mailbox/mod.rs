@@ -130,6 +130,9 @@ pub struct Mailbox {
     /// NIP-17 wrap idempotency only (event-id keys). Not SLA truth —
     /// assignment receipts live in `receipts` sqlite (ADR-0027 E2).
     wrap_idempotency: Arc<parking_lot::Mutex<HashMap<String, i64>>>,
+    /// ADR-0019 D8 loop guard, per-mailbox (never process-global, so tests
+    /// and separate stores cannot trip each other's windows).
+    loop_tracker: crate::mailbox::surface::LoopTracker,
     index_pool: Option<sqlx::SqlitePool>,
     /// R2.0 (C2 / F2.KDF): decrypted agent keys cached by file CONTENT, so an
     /// unwrap-pipeline rebuild re-runs the argon2 KDF ONLY for key files that
@@ -222,6 +225,7 @@ impl Mailbox {
             operator,
             agent_passphrase: None,
             wrap_idempotency: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            loop_tracker: crate::mailbox::surface::LoopTracker::default(),
             index_pool: None,
             key_cache: AGENT_KEY_CACHE
                 .get_or_init(|| Arc::new(papaya::HashMap::new()))
