@@ -34,8 +34,8 @@ mutation "D4  done is not enforced at all" \
 mutation "G5  the role-fact grant check is skipped at append" \
     file=$INBOX \
     expect=a_role_fact_from_a_non_operator_without_the_rank_is_refused \
-    find=$'        Authority::check_grant(\n            standing,\n            current.as_ref().map(|c| c.role),\n            role.role,\n            governed,\n        )?;' \
-    replace='        let _ = (standing, &current, governed);'
+    find=$'            Authority::check_grant(\n                standing,\n                current.as_ref().map(|c| c.role),\n                role.role,\n                governed,\n            )?;' \
+    replace='            let _ = (standing, &current, governed);'
 
 mutation "G6  the gen fence admits an equal gen" \
     file=$INBOX \
@@ -63,20 +63,20 @@ mutation "E1  append does not call the authority check" \
     file=$INBOX \
     expect=the_authority_table_is_enforced_at_append \
     find='            Some(env) => self.authorize_in(&mut tx, env).await?,' \
-    replace='            Some(_) => None,'
+    replace='            Some(_) => AppendFacts::none(),'
 
 mutation "E2  a role fact is checked but never projected" \
     file=$INBOX \
     expect=the_first_role_fact_is_the_operators_captain \
-    find='        if let (Some(role), Some(env)) = (&role_fact, &envelope) {' \
-    replace='        if let (Some(role), Some(env)) = (&role_fact.as_ref().filter(|_| false), &envelope) {'
+    find='        if let (Some(role), Some(env)) = (&facts.role, &envelope) {' \
+    replace='        if let (Some(role), Some(env)) = (facts.role.as_ref().filter(|_| false), &envelope) {'
 
 
 mutation "E3  crew may task (table row, seen through the append)" \
     file=$AUTH \
     expect=the_authority_table_is_enforced_at_append \
-    find=$'    any(Role::Crew, Class::Reply),\n    // peer' \
-    replace=$'    any(Role::Crew, Class::Reply),\n    any(Role::Crew, Class::Task),\n    // peer'
+    find=$'    any(Role::Crew, Class::Reply),\n    only(Role::Crew, Class::Control, "escalate"),' \
+    replace=$'    any(Role::Crew, Class::Reply),\n    any(Role::Crew, Class::Task),\n    only(Role::Crew, Class::Control, "escalate"),'
 
 mutation "E4  a crew may not done (table, seen through `done`)" \
     file=$AUTH \

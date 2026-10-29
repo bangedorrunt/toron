@@ -23,20 +23,20 @@ AUTH=crates/toron-core/src/authority.rs
 mutation "A1  crew may task" \
     file=$AUTH \
     expect=crew_cannot_task_verdict_or_approve \
-    find=$'    any(Role::Crew, Class::Reply),\n    // peer' \
-    replace=$'    any(Role::Crew, Class::Reply),\n    any(Role::Crew, Class::Task),\n    // peer'
+    find=$'    any(Role::Crew, Class::Reply),\n    only(Role::Crew, Class::Control, "escalate"),' \
+    replace=$'    any(Role::Crew, Class::Reply),\n    any(Role::Crew, Class::Task),\n    only(Role::Crew, Class::Control, "escalate"),'
 
 mutation "A2  crew may verdict" \
     file=$AUTH \
     expect=crew_cannot_task_verdict_or_approve \
-    find=$'    any(Role::Crew, Class::Reply),\n    // peer' \
-    replace=$'    any(Role::Crew, Class::Reply),\n    only(Role::Crew, Class::Control, VERDICT_CONTRACT),\n    // peer'
+    find=$'    any(Role::Crew, Class::Reply),\n    only(Role::Crew, Class::Control, "escalate"),' \
+    replace=$'    any(Role::Crew, Class::Reply),\n    only(Role::Crew, Class::Control, VERDICT_CONTRACT),\n    only(Role::Crew, Class::Control, "escalate"),'
 
 mutation "A3  crew may issue any control (approval, steer, ...)" \
     file=$AUTH \
     expect=crew_cannot_task_verdict_or_approve \
-    find=$'    any(Role::Crew, Class::Reply),\n    // peer' \
-    replace=$'    any(Role::Crew, Class::Reply),\n    any(Role::Crew, Class::Control),\n    // peer'
+    find=$'    any(Role::Crew, Class::Reply),\n    only(Role::Crew, Class::Control, "escalate"),' \
+    replace=$'    any(Role::Crew, Class::Reply),\n    any(Role::Crew, Class::Control),\n    only(Role::Crew, Class::Control, "escalate"),'
 
 mutation "A4  peer may task" \
     file=$AUTH \
