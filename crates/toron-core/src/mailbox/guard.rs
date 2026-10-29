@@ -616,7 +616,20 @@ pub const BUILD_GATE_TIMEOUT_SECS: u64 = 180;
 /// nothing, so a repository that is not a Rust project gates nothing.
 pub fn cargo_packages_for_staged(repo: &Path, staged: &[String]) -> Vec<String> {
     let mut packages: Vec<String> = Vec::new();
+    let excluded = workspace_excludes(repo);
     for path in staged {
+        // bd-g70r: a path vendored from another project (workspace `exclude`,
+        // ADR-0040 §5) names a package cargo's `-p` can never resolve, so it
+        // gates nothing instead of deriving a bogus spec. A literal entry is
+        // a dir prefix (`vendor` covers `vendor/…`); a glob entry keeps the
+        // [`pattern_matches`] rule.
+        if excluded.iter().any(|e| {
+            pattern_matches(e, path)
+                || (!e.chars().any(|c| c == '*' || c == '?' || c == '[')
+                    && (path == e || path.starts_with(&format!("{e}/"))))
+        }) {
+            continue;
+        }
         // A Cargo.toml itself names its own package, which the same walk finds.
         let mut cursor = repo.join(path);
         if cursor.is_file() {
@@ -633,6 +646,57 @@ pub fn cargo_packages_for_staged(repo: &Path, staged: &[String]) -> Vec<String> 
         }
     }
     packages
+}
+
+/// The `exclude` dirs of the repo root's `[workspace]` table (bd-g70r), as
+/// staged-path spellings. No manifest or no `[workspace]` table means no
+/// exclusions. Entries are matched with [`pattern_matches`], the same glob
+/// rule as the hunk exclusion. A plain line scan like
+/// [`package_name_in_manifest`]: the guard has no toml dependency and needs
+/// one field.
+fn workspace_excludes(repo: &Path) -> Vec<String> {
+    let text = std::fs::read_to_string(repo.join("Cargo.toml")).unwrap_or_default();
+    let mut in_workspace = false;
+    let mut collecting = false;
+    let mut out: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            // An unterminated list never leaks into the next table.
+            if collecting {
+                break;
+            }
+            in_workspace = trimmed == "[workspace]";
+            continue;
+        }
+        if !in_workspace {
+            continue;
+        }
+        let mut rest = if collecting {
+            trimmed
+        } else {
+            let Some(after) = trimmed
+                .strip_prefix("exclude")
+                .map(str::trim_start)
+                .and_then(|r| r.strip_prefix('='))
+            else {
+                continue;
+            };
+            collecting = true;
+            after
+        };
+        while let Some(start) = rest.find('"') {
+            let tail = &rest[start + 1..];
+            let Some(end) = tail.find('"') else { break };
+            out.push(tail[..end].to_string());
+            rest = &tail[end + 1..];
+        }
+        if rest.contains(']') {
+            // The list closed (single- or multi-line); one key per manifest.
+            break;
+        }
+    }
+    out
 }
 
 /// The `[package] name` of the nearest `Cargo.toml` at or above `from`, staying
@@ -2797,6 +2861,56 @@ mod tests {
                 ]
             ),
             vec!["alpha"]
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// bd-g70r: a staged path under a workspace-`exclude`d dir names a
+    /// package cargo's `-p` can never resolve (vendored crates per ADR-0040
+    /// §5 are path dependencies, not members), so the gate skips it instead
+    /// of deriving a bogus spec. RED before the skip, green after.
+    #[test]
+    fn package_walk_skips_workspace_excluded_vendor_paths() {
+        let root = std::env::temp_dir().join(format!(
+            "toron-guard-excluded-{}-{}.git",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(root.join("crates/real/src")).expect("create tree");
+        std::fs::create_dir_all(root.join("vendor/vendored-lib/src")).expect("create tree");
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/real\"]\nexclude = [\"vendor\"]\n",
+        )
+        .expect("root manifest");
+        std::fs::write(
+            root.join("vendor/vendored-lib/Cargo.toml"),
+            "[package]\nname = \"elm-effect-schema\"\nversion = \"0.1.0\"\n",
+        )
+        .expect("vendored manifest");
+        std::fs::write(
+            root.join("crates/real/Cargo.toml"),
+            "[package]\nname = \"real\"\nversion = \"0.1.0\"\n",
+        )
+        .expect("member manifest");
+
+        // A vendored path alone gates nothing instead of naming an
+        // unresolvable `-p elm-effect-schema`.
+        assert_eq!(
+            cargo_packages_for_staged(&root, &["vendor/vendored-lib/src/lib.rs".to_string()]),
+            Vec::<String>::new()
+        );
+        // Mixed staging still gates the member.
+        assert_eq!(
+            cargo_packages_for_staged(
+                &root,
+                &[
+                    "vendor/vendored-lib/src/lib.rs".to_string(),
+                    "crates/real/src/lib.rs".to_string(),
+                ]
+            ),
+            vec!["real"]
         );
 
         let _ = std::fs::remove_dir_all(root);

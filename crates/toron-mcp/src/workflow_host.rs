@@ -4427,10 +4427,20 @@ steps:
             .port();
         let url = format!("http://127.0.0.1:{port}");
         // bd-6h9l: killed and reaped at scope end, so a failing gate or a
-        // cancelled binary cannot orphan the server.
-        let mut server = toron_core::testkit::ChildGuard::resonate_serve(port, &dir)
+        // cancelled binary cannot orphan the server. bd-parked-run-flake-2st2:
+        // no binary on the runner is a SKIP, not a failure — the
+        // `.expect("resonate binary present")` read a missing binary as a
+        // broken lifecycle, which is why docs-only CI failed while local
+        // runs (with resonate installed) passed.
+        let mut server = match toron_core::testkit::ChildGuard::resonate_serve(port, &dir)
             .expect("resonate serve")
-            .expect("resonate binary present");
+        {
+            Some(server) => server,
+            None => {
+                eprintln!("SKIP: resonate binary not present");
+                return;
+            }
+        };
         // Wait for the server port (up to ~10s).
         let mut ready = false;
         for _ in 0..100 {
