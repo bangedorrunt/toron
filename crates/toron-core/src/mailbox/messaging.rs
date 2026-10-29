@@ -314,12 +314,7 @@ impl Mailbox {
         args.project_slug = self.canonical_project(&args.project_slug).await;
         // ADR-0019 D8 (bd-q6vx): group fan-out refuses at the same layer as
         // the loop, before resolve (a group name must not reach key lookup).
-        for raw in args
-            .to
-            .iter()
-            .chain(args.cc.iter())
-            .chain(args.bcc.iter())
-        {
+        for raw in args.to.iter().chain(args.cc.iter()).chain(args.bcc.iter()) {
             if super::surface::is_group_target(raw) {
                 return Err(anyhow::anyhow!(super::surface::group_refused_msg(raw)));
             }
@@ -371,8 +366,7 @@ impl Mailbox {
                 super::surface::Exempt::None
             };
             for r in resolved.iter() {
-                let key =
-                    super::surface::loop_key_mail(&args.sender_name, &r.name);
+                let key = super::surface::loop_key_mail(&args.sender_name, &r.name);
                 let history = self.loop_tracker.history(&key);
                 if !super::surface::loop_ok(&history, now_ms, exempt) {
                     return Err(anyhow::anyhow!(super::surface::loop_refused_msg(
@@ -381,11 +375,8 @@ impl Mailbox {
                 }
             }
             for r in resolved.iter() {
-                let key =
-                    super::surface::loop_key_mail(&args.sender_name, &r.name);
-                let _ = self
-                    .loop_tracker
-                    .check_and_record(&key, now_ms, exempt);
+                let key = super::surface::loop_key_mail(&args.sender_name, &r.name);
+                let _ = self.loop_tracker.check_and_record(&key, now_ms, exempt);
             }
         }
         let mut receipt_bookkeeping_failed = false;

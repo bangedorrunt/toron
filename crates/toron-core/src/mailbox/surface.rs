@@ -2084,7 +2084,11 @@ mod tests {
         }
         assert!(!tracker.check_and_record(key, T1, Exempt::None));
         assert_eq!(tracker.history(key).len(), LOOP_MAX);
-        assert!(loop_ok(&tracker.history(key), T1 + LOOP_WINDOW_MS + 1, Exempt::None));
+        assert!(loop_ok(
+            &tracker.history(key),
+            T1 + LOOP_WINDOW_MS + 1,
+            Exempt::None
+        ));
     }
 
     #[test]

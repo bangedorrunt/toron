@@ -581,10 +581,8 @@ impl ChannelStore {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as i64)
                 .unwrap_or(0);
-            let key = toron_core::mailbox::surface::loop_key_channel(
-                &author_pk.to_hex(),
-                channel_id,
-            );
+            let key =
+                toron_core::mailbox::surface::loop_key_channel(&author_pk.to_hex(), channel_id);
             let history = self.loop_tracker.history(&key);
             if !toron_core::mailbox::surface::loop_ok(
                 &history,
