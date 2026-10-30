@@ -1137,7 +1137,11 @@ impl WorkflowEngine {
             trigger.insert("inputs".into(), inputs.clone());
         }
         let input = RunInput {
-            run_id: None,
+            // bd-uv5l: `invoke` KNOWS its run id — dropping it
+            // made every run journal as "unknown", so the second run's
+            // node-path replay check compared two DIFFERENT runs and refused
+            // `reduce`/`decompose` with a digest mismatch.
+            run_id: Some(run_id.to_string()),
             workflow,
             trigger: serde_json::Value::Object(trigger),
         };

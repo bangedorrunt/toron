@@ -1602,6 +1602,74 @@ steps:
     assert_eq!(seen.lock().unwrap().len(), 1, "child action executed once");
 }
 
+/// bd-uv5l: a nested `call_workflow` child must journal
+/// under its OWN execution id. `run_call_workflow` passed `run_id: None`, so
+/// every child run journaled as "unknown"; the effect journal compares
+/// prepared digests by (run_id, node_path), so a second run's `reduce` /
+/// `decompose` collided with the first run's rows and was refused as a replay
+/// mismatch. Two parent runs must therefore yield two DISTINCT child ids.
+#[tokio::test]
+async fn nested_call_workflow_journals_its_own_run_id() {
+    let (journal, seen) = recording_run_journal();
+    let child = parse_workflow(
+        r##"
+name: triage
+trigger:
+  type: webhook
+steps:
+  - name: wait
+    action: delay
+    secs: 0
+"##,
+    )
+    .expect("child");
+    let resolver: WorkflowResolver = {
+        let child = child.clone();
+        Arc::new(move |name: &str| (name == "triage").then(|| child.clone()))
+    };
+    let engine = WorkflowEngine::local_with_resolvers_effect_mode_and_run_journal(
+        Arc::new(|_: &str| None),
+        resolver,
+        None,
+        EffectJournalMode::Recording,
+        Some(journal),
+    )
+    .expect("engine with journal");
+    let parent = parse_workflow(
+        r##"
+name: caller
+trigger:
+  type: webhook
+steps:
+  - name: sub
+    action: call_workflow
+    workflow: triage
+"##,
+    )
+    .expect("parent");
+    for run in ["parent-a", "parent-b"] {
+        engine
+            .invoke(run, parent.clone(), serde_json::json!({}))
+            .await
+            .expect("child run completes");
+    }
+    let rows = seen.lock().unwrap().clone();
+    assert!(
+        rows.iter().all(|t| t.run_id != "unknown"),
+        "no run journals as unknown: {rows:?}"
+    );
+    let child_ids: std::collections::BTreeSet<String> = rows
+        .iter()
+        .filter(|t| t.workflow == "triage" && t.phase == RunPhase::Started)
+        .map(|t| t.run_id.clone())
+        .collect();
+    assert_eq!(
+        child_ids.len(),
+        2,
+        "one child execution id per parent run: {rows:?}"
+    );
+}
+
 #[test]
 fn workflow_lineage_guard_is_bounded_and_cycle_safe() {
     let root = serde_json::json!({});

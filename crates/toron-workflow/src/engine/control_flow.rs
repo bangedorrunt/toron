@@ -196,7 +196,12 @@ pub async fn run_workflow(
     let run_id = input
         .run_id
         .clone()
-        .unwrap_or_else(|| "unknown".to_string());
+        // bd-uv5l: a nested `call_workflow` child is
+        // spawned with `run_id: None`. Falling back to "unknown" made every
+        // child run share one journal identity, so two runs' `reduce` /
+        // `decompose` rows collided and the second was refused as a replay
+        // mismatch. The execution id is always present and unique per child.
+        .unwrap_or_else(|| ctx.info().id().to_string());
     let workflow_name = workflow.name.clone();
     if let Err(error) = validate_workflow_lineage(&input.trigger, &workflow_name) {
         return Ok(serde_json::json!({
