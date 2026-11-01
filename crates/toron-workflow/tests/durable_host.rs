@@ -2,45 +2,22 @@
 //! The durable driver against a real engine store and journal: restart resume,
 //! park/wake across a restart, approval, unsupported shapes, and phase guards.
 //!
-//! The state seam is in-memory here on purpose: `WorkflowStateStore` has its
-//! own SQLite round-trip test, and this file proves the driver's recovery rule
-//! (model first, engine second) without re-testing the bridge.
+//! Both durable halves are the production ones: the engine store and journal
+//! over SQLite, and `SyncWorkflowState` for the model. A "restart" here is a
+//! dropped engine and a fresh one over the same database, so the recovery rule
+//! (model first, engine second) is proven against what ships.
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
 
 use serde_json::json;
 use toron_core::index::durable_engine::ToronEngineStore;
-use toron_core::index::durable_workflow::RunState;
+use toron_core::index::durable_workflow::SyncWorkflowState;
 use toron_core::index::schema::{connect, migrate};
 use toron_core::journal::{JournalDb, ToronJournal};
 use toron_core::kernel::{DurableEngine, EngineMsg, OurEngine, RunPhase as EnginePhase};
 use toron_workflow::engine::durable::{RunEffect, RunModel, RunPhase};
 use toron_workflow::engine::durable_host::{DurableRun, HostError};
 use toron_workflow::schema::{Action, Graph, Step, StepOnError, Workflow};
-
-/// In-memory `RunState` shared across the "process restarts" in each test.
-#[derive(Clone, Default)]
-struct MemState(Arc<Mutex<BTreeMap<String, String>>>);
-
-impl RunState for MemState {
-    fn load(&self, run_id: &str) -> anyhow::Result<Option<String>> {
-        Ok(self.0.lock().expect("state lock").get(run_id).cloned())
-    }
-
-    fn save(&self, run_id: &str, state_json: &str) -> anyhow::Result<()> {
-        self.0
-            .lock()
-            .expect("state lock")
-            .insert(run_id.to_string(), state_json.to_string());
-        Ok(())
-    }
-
-    fn delete(&self, run_id: &str) -> anyhow::Result<()> {
-        self.0.lock().expect("state lock").remove(run_id);
-        Ok(())
-    }
-}
 
 fn workflow(steps: Vec<Step>) -> Workflow {
     Workflow {
@@ -91,7 +68,7 @@ async fn restart_resumes_at_the_unsettled_step() {
         .await
         .expect("connect");
     migrate(&pool).await.expect("migrate");
-    let state = MemState::default();
+    let state = SyncWorkflowState::spawn(pool.clone(), &tokio::runtime::Handle::current());
 
     // First process: start, settle step 1, hand back step 2, then die.
     let phase_one = {
@@ -195,7 +172,7 @@ async fn delay_park_survives_restart_and_rewakes() {
         .await
         .expect("connect");
     migrate(&pool).await.expect("migrate");
-    let state = MemState::default();
+    let state = SyncWorkflowState::spawn(pool.clone(), &tokio::runtime::Handle::current());
     let park_workflow = || workflow(vec![step(Action::Delay { secs: 5 })]);
 
     let until_ms = {
@@ -276,7 +253,7 @@ async fn approval_parks_with_a_watchdog_and_lands_the_decision() {
         .await
         .expect("connect");
     migrate(&pool).await.expect("migrate");
-    let state = MemState::default();
+    let state = SyncWorkflowState::spawn(pool.clone(), &tokio::runtime::Handle::current());
     let handle = tokio::runtime::Handle::current();
 
     tokio::task::spawn_blocking(move || -> Result<(), HostError> {
@@ -325,7 +302,7 @@ async fn unsupported_shapes_stay_on_the_old_engine() {
         .await
         .expect("connect");
     migrate(&pool).await.expect("migrate");
-    let state = MemState::default();
+    let state = SyncWorkflowState::spawn(pool.clone(), &tokio::runtime::Handle::current());
     let handle = tokio::runtime::Handle::current();
 
     let graph_pool = pool.clone();
@@ -376,7 +353,14 @@ async fn unsupported_shapes_stay_on_the_old_engine() {
 
     // Refused before any engine or state row exists, so the host can hand the
     // workflow to the old engine without cleaning up after this one.
-    assert!(state.0.lock().expect("state lock").is_empty());
+    let state_store = toron_core::index::durable_workflow::WorkflowStateStore::new(pool.clone());
+    assert!(
+        state_store
+            .load("run-graph")
+            .await
+            .expect("state")
+            .is_none()
+    );
     let engine = OurEngine::with_journal(
         ToronEngineStore::spawn(pool.clone(), &handle),
         ToronJournal::spawn(JournalDb::new(pool, "unsupported", 64), &handle),
@@ -392,7 +376,7 @@ async fn out_of_phase_transitions_are_typed_errors() {
         .await
         .expect("connect");
     migrate(&pool).await.expect("migrate");
-    let state = MemState::default();
+    let state = SyncWorkflowState::spawn(pool.clone(), &tokio::runtime::Handle::current());
     let handle = tokio::runtime::Handle::current();
 
     tokio::task::spawn_blocking(move || -> Result<(), HostError> {
