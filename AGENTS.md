@@ -112,7 +112,7 @@ effect-law ADR acceptance record.
 2. Temp `HOME` + temp XDG; set explicit `TORON_DATA_DIR` / config dir for
    mailbox tests (mbx builds may lack `CACHEDIR.TAG`).
 3. Spare ports only — never live **`:18080`** / **`:18980`**, never the live
-   store `~/.local/share/toron/`, never a live hc/herdr session or
+   store `~/.local/share/toron/`, never a live hc session or
    `~/.config/herdr-core`. Never rewrite the operator passphrase/nsec.
 4. Never print `operator_nsec` contents.
 
