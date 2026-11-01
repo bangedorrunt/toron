@@ -2,7 +2,7 @@
 #![forbid(unsafe_code)]
 
 // bd-led.6.1: `Backend` trait — supervisor abstraction for agent panes.
-// hc is the only multiplexer backend (ADR-0003 G9 retired tmux).
+// hc is the only multiplexer backend (ADR-0044 retired tmux and the herdr TUI).
 //
 // ---------------------------------------------------------------------------
 // bd-p1-design-gn0 — P1.1 Unified Backend trait design record (ADR-0005 P1).

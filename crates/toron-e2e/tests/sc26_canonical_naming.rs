@@ -7,7 +7,7 @@
 //! amended by bd-pin-public-plane-s-easy.4 for D1a):
 //! - ADR-0018 D1a: the **pin** (adjective+noun, e.g. `BlueRidge`) is the
 //!   public, routable identity. The D1 slug (`flywheel-<slug>-<role><seq>`)
-//!   is the internal herdr handle — a fold alias of the pin, never a second
+//!   is the internal terminal name — a fold alias of the pin, never a second
 //!   registered identity.
 //! - swarm project: whois + send by registered pin, folded slug, or npub
 //!   work; anything else fails with errors naming the grammar; registering a
@@ -341,7 +341,7 @@ async fn sc26_slug_folds_to_pin_same_npub_no_second_key() {
     mailbox.set_identity_mode("toron", "swarm").await;
 
     // Fold is slug → pin (ADR-0018 D1a: the pin is the routable mail
-    // identity; the slug is the herdr handle and a fold alias — never a
+    // identity; the slug is the terminal name and a fold alias — never a
     // second identity).
     mailbox
         .fold_agent_name_alias("toron", "flywheel-toron-coder", "BlueRidge")

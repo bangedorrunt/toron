@@ -287,7 +287,7 @@ fn test_profile_resolver() -> ProfileResolver {
         if name == "@housekeeper" {
             Some(serde_json::json!({
                 "npub": "npub1housekeeper",
-                "spec": { "harness": "pi", "model": "opencode-go/deepseek-v4-flash", "backend": "herdr" },
+                "spec": { "harness": "pi", "model": "opencode-go/deepseek-v4-flash", "backend": "hc" },
             }))
         } else {
             None

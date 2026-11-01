@@ -1901,7 +1901,7 @@ impl Mailbox {
         map
     }
 
-    /// `resolve_pane_identity`: herdr pane_id → agent name (G9). `None` when
+    /// `resolve_pane_identity`: hc terminal id → agent name. `None` when
     /// the pane has no agent mapping.
     ///
     /// bd-0sbf: token-first — a `toron:mail-identity` pane stamp
@@ -1923,8 +1923,8 @@ impl Mailbox {
     }
 
     /// `cleanup_pane_identities`: prune identities whose panes are absent from
-    /// herdr's pane list. Returns the pruned agent names (G9). toron holds no
-    /// per-pane identity files (live herdr mapping), so "prune" = report the
+    /// hc's pane list. Returns the pruned agent names. toron holds no
+    /// per-pane identity files (hc labels are the mapping), so "prune" = report the
     /// stale names for the projection to drop.
     ///
     /// ADR-0010 F2: pane-dead rows retire on this sweep alongside time-dead

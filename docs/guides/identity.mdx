@@ -78,9 +78,11 @@ $ toron mail whois toron captain
 
 Read the pane fields, not `stale`, when asking whether anyone will read the mail:
 all four pane fields `null` means the alias resolves to a pin with no live pane,
-no dispatcher and no presence heartbeat. This host's `flywheel arrive` reports it
-in as many words and names the rebind (`toron contact captain --project <slug>
---pin <pin>`, or `--clear` to vacate for parent-death semantics).
+no dispatcher and no presence heartbeat. On hc `tab_id` is always empty — there
+are no tabs, so `pane_id`/`workspace_id` carry the answer. This host's
+`flywheel arrive` reports it in as many words and names the rebind
+(`toron contact captain --project <slug> --pin <pin>`, or `--clear` to vacate
+for parent-death semantics).
 
 AM-Rust rejects non adjective+noun names; toron is more permissive, but other stacks are not: stay adjective+noun.
 

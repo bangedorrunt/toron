@@ -180,7 +180,7 @@ impl ToolServer {
         )
     }
 
-    /// `resolve_pane_identity`: herdr pane_id → agent name (G9).
+    /// `resolve_pane_identity`: hc terminal id → agent name (ADR-0044).
     #[tool(
         name = "resolve_pane_identity",
         description = "Resolve a pane/terminal id to the agent name (G9).",
@@ -199,16 +199,16 @@ impl ToolServer {
                 Err(e) => ToolOutput::err(e),
             },
             Err(e) => ToolOutput::ok(json!({
-                "note": format!("pane identity requires a herdr backend; not wired: {e}"),
+                "note": format!("pane identity requires an hc backend; not wired: {e}"),
                 "pane_id": pane_id,
             })),
         }
     }
 
-    /// `cleanup_pane_identities`: prune identities whose herdr panes are gone.
+    /// `cleanup_pane_identities`: prune identities whose hc panes are gone.
     #[tool(
         name = "cleanup_pane_identities",
-        description = "Prune identities whose herdr panes are absent from the live pane list.",
+        description = "Prune identities whose hc panes are absent from the live pane list.",
         output_schema = rmcp::handler::server::tool::schema_for_output::<crate::responses::CleanupWrapper>(),
         annotations(title = "Cleanup pane identities", destructive_hint = true)
     )]
@@ -251,7 +251,7 @@ impl ToolServer {
                 }
             }
             Err(e) => ToolOutput::ok(json!({
-                "note": format!("pane cleanup requires a herdr backend; not wired: {e}"),
+                "note": format!("pane cleanup requires an hc backend; not wired: {e}"),
             })),
         }
     }

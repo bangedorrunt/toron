@@ -1,8 +1,8 @@
 //! OSC 7501, the program status protocol.
 //!
 //! A program writes one report on its pty. The terminal stores a record.
-//! Herdr and Rex both speak this, so a pin with no herdr agent row can
-//! still be working, blocked, or failed. The bytes are the spec at
+//! hc (herdr-core) and Rex both speak this, so a pin whose harness exposes
+//! no agent row can still be working, blocked, or failed. The bytes are the spec at
 //! <https://www.superlogical.com/rex/docs/build/program-status>.
 //!
 //! Herdr's / hc's finished-and-seen `idle` is not OSC `idle` (at rest,

@@ -17,8 +17,8 @@
 //!    push (<50ms, no polling).
 //! 3. **Direct dispatch**: the flywheel loop's "dispatch" is a direct
 //!    toron_core call (no HTTP) — exercised via the mailbox methods.
-//! 4. **Single herdr client**: `fn agent_prompt` has exactly ONE definition
-//!    in toron-core (the canonical herdr client) — asserted statically. The
+//! 4. **Single hc client**: `fn agent_prompt` has exactly ONE definition
+//!    in toron-core (the canonical hc client) — asserted statically. The
 //!    flywheel-side assertion (their old herdr.rs/mail.rs removed by bd-o8j.2)
 //!    is an `#[ignore]`d sub-case that also boots the real flywheel binary.
 #![cfg(feature = "p1")]
@@ -165,7 +165,7 @@ async fn sc_fw_one_process_peer_mail_via_bus() {
 }
 
 /// SC-FW static invariant: exactly ONE `fn agent_prompt` definition in
-/// toron-core (the canonical herdr client). The flywheel-side duplicate
+/// toron-core (the canonical hc client). The flywheel-side duplicate
 /// definitions are removed by bd-o8j.2; this asserts the toron-core side.
 #[test]
 fn sc_fw_single_agent_prompt_definition_in_core() {
@@ -193,8 +193,8 @@ fn sc_fw_single_agent_prompt_definition_in_core() {
 }
 
 /// SC-FW live flywheel sub-case (RESOLVED 2026-08-09, bd-p5-sc-fw-integrated-
-/// resolution-8m5d): bd-o8j.2 landed (flywheel MailBackend deleted; toron-core
-/// herdr.rs is the single client) and the test PASSES on machines with the
+/// resolution-8m5d): bd-o8j.2 landed (flywheel MailBackend deleted; toron-core's
+/// hc client is the single client) and the test PASSES on machines with the
 /// flywheel binary + checkout. Kept `#[ignore]`d: it boots a DIFFERENT repo's
 /// binary (`flywheel toron status`) and rg's `~/workspace/flywheel/src` — a
 /// cross-repo e2e, flywheel CI scope per captain decision 3 (toron only).

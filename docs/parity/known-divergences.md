@@ -192,7 +192,7 @@ flywheel's local `MailBackend` trait is DELETED; both backends implement
 - **`MailItem.sender` accepts both `sender` (toron) and `from` (agent-mail)** via a
   serde alias — one typed row shape for both backends.
 - **Pane write/clear are `Unsupported` on toron** (no per-pane identity files; live
-  herdr mapping, G9); agent-mail writes/clears the identity files it serves.
+  hc terminal labels, ADR-0044); agent-mail writes/clears the identity files it serves.
 - **AM message ids are decimal strings** on the typed surface (`MessageId("42")`);
   a non-decimal id on the AM edge is a parse ERROR (se2.2), never `unwrap_or(0)`.
 - The `renew_file_reservations`/`release_file_reservations` `file_reservation_ids`

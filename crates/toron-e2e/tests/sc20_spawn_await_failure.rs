@@ -36,7 +36,7 @@ fn housekeeper_resolver() -> ProfileResolver {
         if name == "@housekeeper" {
             Some(serde_json::json!({
                 "npub": "npub1housekeeper",
-                "spec": { "harness": "pi", "model": "claude-sonnet-4", "backend": "herdr" },
+                "spec": { "harness": "pi", "model": "claude-sonnet-4", "backend": "hc" },
             }))
         } else {
             None

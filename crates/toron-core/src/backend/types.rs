@@ -319,7 +319,8 @@ pub struct PaneInfo {
     pub tokens: serde_json::Map<String, Value>,
 }
 
-/// herdr agent-session reference (`agent_session` on AgentInfo/PaneInfo).
+/// Agent-session reference (`agent_session` on AgentInfo/PaneInfo). Rex
+/// reports one; hc 0.1.16 reports none, so the field stays `None` there.
 #[derive(Debug, Clone, Deserialize)]
 #[allow(dead_code)]
 pub struct AgentSessionInfo {
@@ -329,7 +330,7 @@ pub struct AgentSessionInfo {
     pub value: String,
 }
 
-/// herdr agent-session reference kind (`id` | `path`).
+/// Agent-session reference kind (`id` | `path`).
 #[derive(Debug, Clone, Deserialize)]
 #[allow(dead_code)]
 #[serde(rename_all = "lowercase")]

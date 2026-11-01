@@ -15,16 +15,17 @@ pub enum BackendErrorCode {
     Unsupported,
     /// Operation timed out waiting for the backend.
     Timeout,
-    /// herdr: agent prompt stalled (no response within SLA).
+    /// The prompt landed but the program never went working in the start
+    /// window (hc `started: false`; the old herdr SLA gate).
     AgentPromptStalled,
-    /// herdr: agent prompt rejected because the agent is waiting at an
-    /// approval/question dialog — nothing was sent (protocol v20, herdr
-    /// 0.8.2: `agent.prompt` fails fast instead of typing into the dialog).
+    /// A blocked program owns the pane (an approval/question dialog):
+    /// nothing was sent. hc refuses `terminal.send` to a `blocked` program
+    /// unless forced.
     AgentBlocked,
-    /// herdr: agent.read/agent.prompt rejected because the agent is not idle
-    /// (alt-screen transcript unavailable while working/blocked/unknown).
+    /// A status precondition rejected the call (`status_mismatch`). hc reads
+    /// never raise it; kept for backends that gate reads on idle.
     AgentNotIdle,
-    /// herdr: subscriber fell behind retained history; resubscribe + snapshot.
+    /// Subscriber fell behind retained history; resubscribe + snapshot.
     EventsLost,
     /// Could not connect to the backend socket/daemon.
     Connect,

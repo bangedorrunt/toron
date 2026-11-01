@@ -636,7 +636,7 @@ pub trait MailSurface: Send + Sync {
         project: &str,
         pane_id: &str,
     ) -> Result<Option<String>, MailError>;
-    /// Prune identities whose panes are absent from herdr's live pane list;
+    /// Prune identities whose panes are absent from hc's live pane list;
     /// returns the pruned agent names.
     async fn cleanup_pane_identities(&self, project: &str) -> Result<Vec<String>, MailError>;
     /// Write the per-pane identity file (agent-mail server layout). toron
