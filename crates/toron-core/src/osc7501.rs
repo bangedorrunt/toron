@@ -5,10 +5,10 @@
 //! still be working, blocked, or failed. The bytes are the spec at
 //! <https://www.superlogical.com/rex/docs/build/program-status>.
 //!
-//! Herdr's `AgentStatus::Idle` means finished and already seen. OSC `idle`
-//! means the program is at rest waiting for the next instruction. Those
-//! are not the same fact, so this module does not import OSC `idle` as
-//! herdr idle, and it does not import OSC `error` as herdr `done`.
+//! Herdr's / hc's finished-and-seen `idle` is not OSC `idle` (at rest,
+//! waiting for the next instruction). This module does not import OSC
+//! `idle` as finished-and-seen idle, and it does not import OSC `error`
+//! as `done`. Fold boards with [`fold`] and a [`FoldPolicy`].
 
 use std::collections::BTreeMap;
 
@@ -132,6 +132,129 @@ impl Board {
             return;
         }
         self.records.insert(id, report);
+    }
+
+    /// Build a board from an hc `Terminal.status` root plus `Terminal.records`.
+    /// Pure: no I/O. Unknown/absent states are skipped. `error` is kept on
+    /// the board so [`fold`] can map it to [`AgentStatus::Unknown`].
+    pub fn insert_hc(&mut self, id: &str, view: &HcStatusView<'_>) {
+        if let Some(report) = report_from_hc(view, if id.is_empty() { None } else { Some(id) }) {
+            self.records.insert(id.to_string(), report);
+        }
+    }
+
+    /// Every stored report, root first then ids in sorted order.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &Report)> {
+        self.records.iter().map(|(k, v)| (k.as_str(), v))
+    }
+}
+
+/// Borrowed view of one hc Status object (root or record). Callers pass
+/// wire fields without allocating a Report until the board accepts them.
+#[derive(Clone, Copy, Debug)]
+pub struct HcStatusView<'a> {
+    pub state: &'a str,
+    pub kind: Option<&'a str>,
+    pub progress: Option<u8>,
+    pub app: Option<&'a str>,
+    pub title: Option<&'a str>,
+    pub msg: Option<&'a str>,
+}
+
+fn report_from_hc(view: &HcStatusView<'_>, id: Option<&str>) -> Option<Report> {
+    let state = parse_state(view.state)?;
+    if state == ProgramState::Clear {
+        return None;
+    }
+    let kind = if state == ProgramState::Blocked {
+        view.kind.and_then(parse_kind)
+    } else {
+        None
+    };
+    let progress = if matches!(state, ProgramState::Working | ProgramState::Blocked) {
+        view.progress.filter(|n| *n <= 100)
+    } else {
+        None
+    };
+    Some(Report {
+        state,
+        id: id.filter(|s| !s.is_empty()).map(str::to_string),
+        kind,
+        progress,
+        app: view.app.filter(|s| app_ok(s)).map(str::to_string),
+        title: view.title.map(str::to_string),
+        msg: view.msg.map(str::to_string),
+    })
+}
+
+/// How [`fold`] picks one [`AgentStatus`] from a board of OSC records.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum FoldPolicy {
+    /// Blocked beats working beats done beats idle. OSC `error` → Unknown.
+    /// Default for toron/flywheel wake urgency.
+    #[default]
+    Attention,
+    /// The root record speaks for the whole terminal. Children never override
+    /// a present root. Matches flywheel `rex_map` root-wins. With no root,
+    /// falls back to Attention over the remaining records.
+    RootWins,
+}
+
+/// Fold one terminal's OSC board into a single [`AgentStatus`]. Pure: no I/O,
+/// no clock, no heartbeat. OSC `error` never becomes `done` or `idle`
+/// (module fence); it maps to [`AgentStatus::Unknown`].
+pub fn fold(board: &Board, policy: FoldPolicy) -> AgentStatus {
+    match policy {
+        FoldPolicy::RootWins => {
+            if let Some(root) = board.get("") {
+                return status_of(root.state);
+            }
+            fold_attention(board)
+        }
+        FoldPolicy::Attention => fold_attention(board),
+    }
+}
+
+fn fold_attention(board: &Board) -> AgentStatus {
+    if board.is_empty() {
+        return AgentStatus::Unknown;
+    }
+    let mut saw_working = false;
+    let mut saw_done = false;
+    let mut saw_idle = false;
+    let mut saw_error = false;
+    for (_id, report) in board.iter() {
+        match report.state {
+            ProgramState::Blocked => return AgentStatus::Blocked,
+            ProgramState::Working => saw_working = true,
+            ProgramState::Done => saw_done = true,
+            ProgramState::Idle => saw_idle = true,
+            ProgramState::Error => saw_error = true,
+            ProgramState::Clear => {}
+        }
+    }
+    if saw_working {
+        return AgentStatus::Working;
+    }
+    if saw_done {
+        return AgentStatus::Done;
+    }
+    if saw_idle {
+        return AgentStatus::Idle;
+    }
+    if saw_error {
+        return AgentStatus::Unknown;
+    }
+    AgentStatus::Unknown
+}
+
+fn status_of(state: ProgramState) -> AgentStatus {
+    match state {
+        ProgramState::Idle => AgentStatus::Idle,
+        ProgramState::Working => AgentStatus::Working,
+        ProgramState::Blocked => AgentStatus::Blocked,
+        ProgramState::Done => AgentStatus::Done,
+        ProgramState::Error | ProgramState::Clear => AgentStatus::Unknown,
     }
 }
 
@@ -400,6 +523,68 @@ mod tests {
         board.apply(&osc("state=clear:id=eu-west"));
         assert!(board.get("eu-west").is_none());
         assert_eq!(board.get("").unwrap().state, ProgramState::Working);
+    }
+
+    #[test]
+    fn attention_prefers_blocked_child_over_working_root() {
+        let mut board = Board::default();
+        board.apply(&osc("state=working:app=deploy"));
+        board.apply(&osc("state=blocked:id=eu-west:kind=permission"));
+        assert_eq!(fold(&board, FoldPolicy::Attention), AgentStatus::Blocked);
+        assert_eq!(fold(&board, FoldPolicy::RootWins), AgentStatus::Working);
+    }
+
+    #[test]
+    fn attention_maps_error_to_unknown_never_done() {
+        let mut board = Board::default();
+        board.apply(&osc("state=error:app=freebuff"));
+        assert_eq!(fold(&board, FoldPolicy::Attention), AgentStatus::Unknown);
+        assert_eq!(fold(&board, FoldPolicy::RootWins), AgentStatus::Unknown);
+    }
+
+    #[test]
+    fn attention_orders_working_over_done_over_idle() {
+        let mut board = Board::default();
+        board.apply(&osc("state=idle"));
+        board.apply(&osc("state=done:id=a"));
+        assert_eq!(fold(&board, FoldPolicy::Attention), AgentStatus::Done);
+        board.apply(&osc("state=working:id=b"));
+        assert_eq!(fold(&board, FoldPolicy::Attention), AgentStatus::Working);
+    }
+
+    #[test]
+    fn empty_board_is_unknown() {
+        assert_eq!(fold(&Board::default(), FoldPolicy::Attention), AgentStatus::Unknown);
+        assert_eq!(fold(&Board::default(), FoldPolicy::RootWins), AgentStatus::Unknown);
+    }
+
+    #[test]
+    fn hc_status_view_builds_the_same_board() {
+        let mut board = Board::default();
+        board.insert_hc(
+            "",
+            &HcStatusView {
+                state: "working",
+                kind: None,
+                progress: Some(40),
+                app: Some("deploy"),
+                title: None,
+                msg: None,
+            },
+        );
+        board.insert_hc(
+            "child",
+            &HcStatusView {
+                state: "blocked",
+                kind: Some("question"),
+                progress: None,
+                app: None,
+                title: None,
+                msg: None,
+            },
+        );
+        assert_eq!(fold(&board, FoldPolicy::Attention), AgentStatus::Blocked);
+        assert_eq!(fold(&board, FoldPolicy::RootWins), AgentStatus::Working);
     }
 
     #[test]
