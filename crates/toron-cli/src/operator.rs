@@ -1480,6 +1480,7 @@ mod backend_selection_tests {
     }
 }
 
+#[cfg(test)]
 mod check_resonate_tests {
     //! GS-037: doctor resonate must not invent-green on soft-ok health.
     use super::*;
