@@ -2250,7 +2250,12 @@ mod tests {
         );
         assert!(hc.is_file(), "hc binary missing at {}", hc.display());
 
-        let dir = tempfile::tempdir().expect("tmpdir");
+        // Keep the socket path under the macOS sun_path limit (~104 bytes):
+        // the system tempdir is long, /tmp/thcXXXX is not.
+        let dir = tempfile::Builder::new()
+            .prefix("thc")
+            .tempdir_in("/tmp")
+            .expect("tmpdir");
         let home = dir.path().join("home");
         let config = dir.path().join("config");
         let data = dir.path().join("data");
@@ -2562,6 +2567,45 @@ mod event_decode_tests {
             s.decode_line(&line).expect("decode"),
             Some(BackendEvent::Raw(_))
         ));
+    }
+
+    /// Live witness: the real daemon's push shape decodes to a status event.
+    /// Ignored by default; run with `-- --ignored` on a host with hc.
+    #[test]
+    #[ignore = "live hc daemon: needs ~/.local/bin/hc and the default session"]
+    fn live_events_decode_a_status_report() {
+        let mut client = Client::connect(None).expect("live hc");
+        let (_, mut stream) = client.subscribe_terminals(None).expect("subscribe");
+        let script = "printf '\\033]7501;state=blocked:kind=question:app=probe\\033\\\\'; sleep 5";
+        let term = client
+            .terminal_run(
+                &["sh".into(), "-c".into(), script.into()],
+                Some("toron-event-probe"),
+                None,
+            )
+            .expect("run probe");
+        stream
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .expect("timeout");
+        let want = prefix_id(&term.address);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut saw = false;
+        while std::time::Instant::now() < deadline {
+            match stream.read_event() {
+                Ok(Some(BackendEvent::AgentStatusChanged { pane, status, .. }))
+                    if pane.as_str() == want && status == AgentStatus::Blocked =>
+                {
+                    saw = true;
+                    break;
+                }
+                Ok(_) => {}
+                Err(e) if e.code() == &BackendErrorCode::Timeout => {}
+                Err(e) => panic!("live event read: {e}"),
+            }
+        }
+        let _ = client.terminal_kill(&term.address);
+        let _ = client.terminal_rm(&term.address);
+        assert!(saw, "live status event for {want} was not decoded");
     }
 
     #[test]
