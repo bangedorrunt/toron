@@ -27,6 +27,21 @@
 //!
 //! Connect probes `hello` / method list and returns a typed error when a
 //! required method is missing. Unknown JSON fields are ignored.
+//!
+//! # Mail identity (labels-only)
+//!
+//! hc has no `pane.report_metadata`. Mail identity rides on a **stable,
+//! unique terminal `name`** (and optional `toron_*` labels). Rules:
+//! - A pin / display name may address a terminal only when that name is
+//!   present and unique among the live terminals considered.
+//! - A missing name never invents an address from argv or cwd: mail falls
+//!   back to the opaque [`ID_PREFIX`] id (`hc:t7`), or refuses the name
+//!   lookup.
+//! - A **duplicate** name among live terminals is refused for name-based
+//!   mail — never resolved to an arbitrary match. Callers must use
+//!   `hc:<address>` or rename until unique.
+//!
+//! [`mail_pane_id_for_name`] encodes that policy as a pure function.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::io::{BufRead, BufReader, Write};
@@ -87,6 +102,79 @@ pub fn prefix_id(address: &str) -> String {
     } else {
         format!("{ID_PREFIX}{address}")
     }
+}
+
+/// Why a name-based mail lookup could not address a terminal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MailNameError {
+    /// No live terminal carries this name (and it is not an `hc:` id).
+    Missing,
+    /// Two or more live terminals share the name — never pick one.
+    Duplicate { count: usize },
+}
+
+/// Resolve a mail target to a pane id under the labels-only hc rule.
+///
+/// `named` is `(optional_terminal_name, bare_or_prefixed_address)` for each
+/// live terminal. Policy:
+/// - If `query` is already an `hc:` id (or bare address matching one row),
+///   return that unique id — ids never collide.
+/// - If `query` matches exactly one non-empty terminal name, return that
+///   terminal's prefixed id.
+/// - If it matches zero names → [`MailNameError::Missing`].
+/// - If it matches two or more → [`MailNameError::Duplicate`] (refuse;
+///   never return an arbitrary pane).
+pub fn mail_pane_id_for_name(
+    named: &[(Option<&str>, &str)],
+    query: &str,
+) -> Result<String, MailNameError> {
+    let q = query.trim();
+    if q.is_empty() {
+        return Err(MailNameError::Missing);
+    }
+
+    // Prefer an explicit id query (`hc:t7` or bare address equal to a row).
+    let want_addr = strip_id_prefix(q);
+    let id_query = q.starts_with(ID_PREFIX)
+        || named
+            .iter()
+            .any(|(_, addr)| strip_id_prefix(addr) == q);
+    if id_query {
+        let mut hits = named
+            .iter()
+            .filter(|(_, addr)| strip_id_prefix(addr) == want_addr)
+            .map(|(_, addr)| prefix_id(addr));
+        return match (hits.next(), hits.next()) {
+            (Some(id), None) => Ok(id),
+            (Some(_), Some(_)) => Err(MailNameError::Duplicate { count: 2 }),
+            (None, _) => Err(MailNameError::Missing),
+        };
+    }
+
+    let hits: Vec<String> = named
+        .iter()
+        .filter_map(|(name, addr)| {
+            let name = name.filter(|n| !n.is_empty())?;
+            (name == q).then(|| prefix_id(addr))
+        })
+        .collect();
+    match hits.len() {
+        0 => Err(MailNameError::Missing),
+        1 => Ok(hits.into_iter().next().expect("len 1")),
+        n => Err(MailNameError::Duplicate { count: n }),
+    }
+}
+
+/// Display name for mail maps: keep the terminal name only when it is
+/// non-empty and unique in `all_names`. Otherwise `None` so callers fall
+/// back to the `hc:` id and never publish a colliding name.
+pub fn unique_mail_name<'a>(name: Option<&'a str>, all_names: &[Option<&str>]) -> Option<&'a str> {
+    let name = name.filter(|n| !n.is_empty())?;
+    let count = all_names
+        .iter()
+        .filter(|n| n.as_deref() == Some(name))
+        .count();
+    (count == 1).then_some(name)
 }
 
 /// Resolve the hc socket path (pure — testable).
@@ -200,17 +288,25 @@ impl Terminal {
     }
 
     fn to_agent_info(&self, policy: FoldPolicy) -> AgentInfo {
+        self.to_agent_info_with_mail_name(policy, self.name.clone())
+    }
+
+    fn to_agent_info_with_mail_name(
+        &self,
+        policy: FoldPolicy,
+        mail_name: Option<String>,
+    ) -> AgentInfo {
         let id = prefix_id(&self.address);
         AgentInfo {
-            agent: self.name.clone().or_else(|| self.argv.first().cloned()),
+            agent: mail_name.clone().or_else(|| self.argv.first().cloned()),
             agent_status: self.agent_status(policy),
             cwd: self.cwd.clone(),
-            display_agent: self.name.clone(),
+            display_agent: mail_name.clone(),
             focused: false,
             foreground_cwd: self.cwd.clone(),
             interactive_ready: self.reported,
             launch_pending: false,
-            name: self.name.clone(),
+            name: mail_name,
             pane_id: id.clone(),
             revision: 0,
             state_change_seq: 0,
@@ -223,7 +319,16 @@ impl Terminal {
         }
     }
 
+    #[allow(dead_code)]
     fn to_pane_info(&self, policy: FoldPolicy) -> PaneInfo {
+        self.to_pane_info_with_mail_name(policy, self.name.clone())
+    }
+
+    fn to_pane_info_with_mail_name(
+        &self,
+        policy: FoldPolicy,
+        mail_name: Option<String>,
+    ) -> PaneInfo {
         let id = prefix_id(&self.address);
         let mut tokens = serde_json::Map::new();
         for (k, v) in &self.labels {
@@ -237,17 +342,17 @@ impl Terminal {
             focused: false,
             agent_status: self.agent_status(policy),
             revision: 0,
-            title: self.name.clone(),
+            title: mail_name.clone(),
             cwd: self.cwd.clone(),
-            agent: self.name.clone().or_else(|| self.argv.first().cloned()),
+            agent: mail_name.clone().or_else(|| self.argv.first().cloned()),
             agent_session: None,
-            display_agent: self.name.clone(),
+            display_agent: mail_name.clone(),
             foreground_cwd: self.cwd.clone(),
-            label: self.name.clone(),
+            label: mail_name.clone(),
             scroll: None,
             state_labels: serde_json::Map::new(),
-            terminal_title: self.name.clone(),
-            terminal_title_stripped: self.name.clone(),
+            terminal_title: mail_name.clone(),
+            terminal_title_stripped: mail_name,
             tokens,
         }
     }
@@ -579,11 +684,32 @@ impl Client {
         )
     }
 
+    /// hc has no `pane.report_metadata` (labels-only mail identity). Callers
+    /// such as CLI bootstrap stamp must treat this as unsupported and skip —
+    /// never invent a stamp from argv/cwd.
+    pub fn pane_report_metadata(
+        &self,
+        _pane_id: &str,
+        _pin: &str,
+        _project: &str,
+        _npub: &str,
+    ) -> Result<Value, BackendError> {
+        Err(BackendError::unsupported(
+            "hc has no pane.report_metadata; mail identity is labels-only",
+        ))
+    }
+
     pub fn agent_list(&self) -> Result<Vec<AgentInfo>, BackendError> {
-        Ok(self
-            .terminal_list(false)?
+        let terminals = self.terminal_list(false)?;
+        let names: Vec<Option<String>> = terminals.iter().map(|t| t.name.clone()).collect();
+        let name_refs: Vec<Option<&str>> = names.iter().map(|n| n.as_deref()).collect();
+        Ok(terminals
             .into_iter()
-            .map(|t| t.to_agent_info(self.fold_policy))
+            .enumerate()
+            .map(|(i, t)| {
+                let mail_name = unique_mail_name(name_refs[i], &name_refs).map(str::to_string);
+                t.to_agent_info_with_mail_name(self.fold_policy, mail_name)
+            })
             .collect())
     }
 
@@ -594,10 +720,16 @@ impl Client {
     }
 
     pub fn pane_list(&self) -> Result<Vec<PaneInfo>, BackendError> {
-        Ok(self
-            .terminal_list(false)?
+        let terminals = self.terminal_list(false)?;
+        let names: Vec<Option<String>> = terminals.iter().map(|t| t.name.clone()).collect();
+        let name_refs: Vec<Option<&str>> = names.iter().map(|n| n.as_deref()).collect();
+        Ok(terminals
             .into_iter()
-            .map(|t| t.to_pane_info(self.fold_policy))
+            .enumerate()
+            .map(|(i, t)| {
+                let mail_name = unique_mail_name(name_refs[i], &name_refs).map(str::to_string);
+                t.to_pane_info_with_mail_name(self.fold_policy, mail_name)
+            })
             .collect())
     }
 
@@ -790,10 +922,8 @@ fn terminal_event_from_value(val: &Value, policy: FoldPolicy) -> Option<BackendE
     // Prefer an embedded terminal object.
     let term_val = if val.get("address").is_some() {
         val.clone()
-    } else if let Some(t) = val.get("terminal") {
-        t.clone()
     } else {
-        return None;
+        val.get("terminal")?.clone()
     };
     let term: Terminal = serde_json::from_value(term_val).ok()?;
     let status = term.agent_status(policy);
@@ -1255,6 +1385,45 @@ mod tests {
     }
 
     #[test]
+    fn mail_name_unique_resolves_and_duplicate_is_refused() {
+        let named = [
+            (Some("review"), "t1"),
+            (Some("fix"), "t2"),
+            (None, "t3"),
+        ];
+        assert_eq!(
+            mail_pane_id_for_name(&named, "review").unwrap(),
+            "hc:t1"
+        );
+        assert_eq!(
+            mail_pane_id_for_name(&named, "hc:t3").unwrap(),
+            "hc:t3"
+        );
+        assert_eq!(
+            mail_pane_id_for_name(&named, "missing"),
+            Err(MailNameError::Missing)
+        );
+        // Unnamed terminal is not reachable by a made-up name; id still works.
+        assert_eq!(
+            mail_pane_id_for_name(&named, "t3").unwrap(),
+            "hc:t3"
+        );
+
+        let dup = [(Some("twin"), "t1"), (Some("twin"), "t2"), (None, "t3")];
+        assert_eq!(
+            mail_pane_id_for_name(&dup, "twin"),
+            Err(MailNameError::Duplicate { count: 2 })
+        );
+        // Id path still unique under a duplicate-name set.
+        assert_eq!(mail_pane_id_for_name(&dup, "hc:t2").unwrap(), "hc:t2");
+
+        let names = [Some("twin"), Some("twin"), None];
+        assert_eq!(unique_mail_name(Some("twin"), &names), None);
+        assert_eq!(unique_mail_name(None, &names), None);
+        assert_eq!(unique_mail_name(Some("solo"), &[Some("solo"), None]), Some("solo"));
+    }
+
+    #[test]
     fn id_prefix_round_trip() {
         assert_eq!(strip_id_prefix("hc:t7"), "t7");
         assert_eq!(strip_id_prefix("t7"), "t7");
@@ -1276,23 +1445,20 @@ mod tests {
         );
         assert!(hc.is_file(), "hc binary missing at {}", hc.display());
 
-        // macOS sun_path is short (~104 bytes). Keep session + state under /tmp.
-        let session = format!("t{}", std::process::id() % 100_000);
-        let root = PathBuf::from(format!("/tmp/hcl{session}"));
-        let _ = std::fs::remove_dir_all(&root);
-        let home = root.join("h");
-        let config = root.join("c");
-        let data = root.join("d");
-        let state = root.join("s");
-        let cache = root.join("k");
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let home = dir.path().join("home");
+        let config = dir.path().join("config");
+        let data = dir.path().join("data");
+        let state = dir.path().join("state");
+        let cache = dir.path().join("cache");
         for p in [&home, &config, &data, &state, &cache] {
             std::fs::create_dir_all(p).unwrap();
         }
+        let session = format!("toron-hc-live-{}", std::process::id());
         let sock = state
             .join("herdr-core")
             .join(&session)
             .join(format!("{session}.sock"));
-        let _root_cleanup = root.clone();
 
         let log_dir = PathBuf::from(std::env::var_os("HC_LIVE_LOG_DIR").unwrap_or_else(|| {
             "/Users/bangedorrunt/workspace/stack-comms/logs/hc-backend".into()
@@ -1429,7 +1595,6 @@ mod tests {
         );
         let _ = writeln!(log, "transcript_path={}", transcript.display());
         eprintln!("live hc transcript: {}", transcript.display());
-        let _ = std::fs::remove_dir_all(&_root_cleanup);
     }
 
 }
