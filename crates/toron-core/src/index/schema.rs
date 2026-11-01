@@ -53,10 +53,16 @@ pub struct AdditiveTable {
 }
 
 /// Every additive table, in apply order.
-pub static ADDITIVE_TABLES: &[AdditiveTable] = &[AdditiveTable {
-    name: "inbox_stream_close",
-    ddl: include_str!("../../schema/additive/inbox_stream_close.sql"),
-}];
+pub static ADDITIVE_TABLES: &[AdditiveTable] = &[
+    AdditiveTable {
+        name: "inbox_stream_close",
+        ddl: include_str!("../../schema/additive/inbox_stream_close.sql"),
+    },
+    AdditiveTable {
+        name: "durable_engine_runs",
+        ddl: include_str!("../../schema/additive/durable_engine.sql"),
+    },
+];
 
 /// A store's version, in its two parts: what an opening binary must ship,
 /// and what is informational only.

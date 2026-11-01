@@ -29,10 +29,11 @@ hex = "0.4"
 ed25519-dalek = { version = "2.2", features = ["rand_core"] }
 sha2 = "0.10"
 schemars = "1"
-# Comms kernel (ADR-0040): elm-effect-rs Elm + journal layer, tracked live from
+# Comms kernel (ADR-0040): elm-effect-rs Elm + journal + durable engine layer, tracked live from
 # the sibling workspace (same shape as chiebukuro and beads; no vendored copy).
 # Only `kernel.rs` names these.
 elm-effect = { path = "../../../elm-effect-rs/crates/elm-effect" }
+elm-effect-durable = { path = "../../../elm-effect-rs/crates/elm-effect-durable" }
 elm-effect-elm = { path = "../../../elm-effect-rs/crates/elm-effect-elm" }
 elm-effect-journal = { path = "../../../elm-effect-rs/crates/elm-effect-journal" }
 

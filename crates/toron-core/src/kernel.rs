@@ -9,13 +9,18 @@
 //! elm-effect crate, and any other crate manifest that depends on one,
 //! fails the build.
 //!
-//! What is re-exported is the Elm + journal layer only (ADR-0040 §3):
+//! What is re-exported is the Elm + journal + durable-engine layer
+//! (ADR-0040 §3, ADR-0005):
 //! - the loop: [`Program`], [`Update`], [`Cmd`], [`Durability`],
 //!   [`Failure`], [`Interpret`], [`Loop`], [`Producer`], [`Subscriber`],
 //!   [`Boot`], replay [`Player`] and [`Snapshot`];
 //! - the journal: [`EffectState`], [`can_transition`], [`JournalStore`]
-//!   (with its [`JournalRow`], [`JournalRead`], [`JournalDisposition`]),
-//!   [`plan_attempt`], [`plan_park`], [`may_settle`];
+//!   (with its [`JournalRow`], [`JournalRead`], [`JournalDisposition`],
+//!   [`JournalError`]), [`plan_attempt`], [`plan_park`], [`may_settle`];
+//! - the durable engine: [`DurableEngine`], [`OurEngine`], [`EngineStorage`],
+//!   [`RunRow`], [`ParkedRow`], [`RunPhase`], [`StartOutcome`],
+//!   [`ParkOutcome`], [`EngineMsg`], [`StorageError`], [`CronSchedule`],
+//!   [`fire_key`], [`due_wakes`];
 //! - the L16 log: [`DurableLog`], [`Offset`], [`AppendError`] (with
 //!   `StaleEpoch`), and [`durable_log_laws`] so toron's own log runs the
 //!   upstream trait laws;
@@ -34,6 +39,10 @@ pub use elm_effect::{
     Layer, ManagedRuntime, Remote, RemoteError, RemotePolicy, Runtime, ServiceTag, SleepOutcome,
     SystemClock, TestClock, TokioExecutor, use_service,
 };
+pub use elm_effect_durable::{
+    CronSchedule, DurableEngine, EngineError, EngineMsg, EngineStorage, OurEngine, ParkOutcome,
+    ParkedRow, RunPhase, RunRow, StartOutcome, StorageError, WakeIntent, due_wakes, fire_key,
+};
 pub use elm_effect_elm::replay::{Player, Snapshot};
 pub use elm_effect_elm::{
     Boot, Cmd, Durability, Failure, Interpret, InterpretError, Loop, Producer, Program, Subscriber,
@@ -48,7 +57,7 @@ pub use elm_effect_journal::plan::{
     plan_attempt, plan_park,
 };
 pub use elm_effect_journal::store::{
-    Disposition as JournalDisposition, InMemoryStore, JournalStore, Read as JournalRead,
-    Row as JournalRow,
+    Disposition as JournalDisposition, InMemoryStore, JournalError, JournalStore,
+    Read as JournalRead, Row as JournalRow,
 };
 pub use elm_effect_journal::{EffectState, TransitionError, can_transition, transition};

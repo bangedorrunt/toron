@@ -19,10 +19,9 @@
 //! a [`ToronJournal`] handle talks to a task on a Tokio runtime through a
 //! request/reply channel. Call it from the loop's own OS thread; on a
 //! Tokio worker it refuses instead of blocking (the F2 nested-runtime
-//! guard). The `try_*` methods return the error; the trait methods, whose
-//! signatures cannot, answer an unreachable store with "nothing changed"
-//! (`None`), and `record_intent` with an `Unknown` row marked `Reconcile`:
-//! the honest answer when the write's outcome is not known.
+//! guard). The `try_*` methods and the [`JournalStore`] trait methods both
+//! return [`JournalError`]: a bridge or store failure is typed and visible,
+//! never a fake `None` or an invented `Unknown` row.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -32,7 +31,8 @@ use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 
 use crate::kernel::{
-    EffectState, JournalDisposition, JournalRead, JournalRow, JournalStore, can_transition,
+    EffectState, JournalDisposition, JournalError as KernelJournalError, JournalRead, JournalRow,
+    JournalStore, can_transition,
 };
 
 /// How long a bridge call waits for the store.
@@ -517,27 +517,26 @@ impl ToronJournal {
     }
 }
 
-fn unreachable_store(op: &str, e: &JournalError) {
-    tracing::warn!("ToronJournal {op}: {e}; answering 'nothing changed'");
+/// Map the bridge's error to the framework journal error.
+///
+/// `Store(sqlx::Error)` is a host I/O/decoding failure; it is reported as
+/// `Unavailable` because the bridge cannot prove a retry would be unsafe.
+/// The caller sees the original text, never a silent `None` or `Unknown` row.
+fn kernel_journal_error(error: JournalError) -> KernelJournalError {
+    match error {
+        JournalError::Store(error) => KernelJournalError::Unavailable(error.to_string()),
+        JournalError::Unavailable(message) => KernelJournalError::Unavailable(message),
+    }
 }
 
 impl JournalStore for ToronJournal {
-    fn record_intent(&self, key: &str, max_attempts: u32) -> JournalRow {
+    fn record_intent(
+        &self,
+        key: &str,
+        max_attempts: u32,
+    ) -> Result<JournalRow, KernelJournalError> {
         self.try_record_intent(key, max_attempts)
-            .unwrap_or_else(|e| {
-                unreachable_store("record_intent", &e);
-                JournalRow {
-                    key: key.to_string(),
-                    state: EffectState::Unknown,
-                    owner: None,
-                    lease_deadline: None,
-                    generation: 0,
-                    offset: -1,
-                    disposition: Some(JournalDisposition::Reconcile),
-                    attempts: 0,
-                    max_attempts,
-                }
-            })
+            .map_err(kernel_journal_error)
     }
 
     fn claim(
@@ -547,39 +546,52 @@ impl JournalStore for ToronJournal {
         lease_deadline: i64,
         now_ms: i64,
         expected_generation: u64,
-    ) -> Option<JournalRow> {
+    ) -> Result<Option<JournalRow>, KernelJournalError> {
         self.try_claim(key, owner, lease_deadline, now_ms, expected_generation)
-            .unwrap_or_else(|e| {
-                unreachable_store("claim", &e);
-                None
-            })
+            .map_err(kernel_journal_error)
     }
 
-    fn settle(&self, key: &str, generation: u64, to: EffectState) -> Option<JournalRow> {
-        self.try_settle(key, generation, to).unwrap_or_else(|e| {
-            unreachable_store("settle", &e);
-            None
-        })
+    fn settle(
+        &self,
+        key: &str,
+        generation: u64,
+        to: EffectState,
+    ) -> Result<Option<JournalRow>, KernelJournalError> {
+        self.try_settle(key, generation, to)
+            .map_err(kernel_journal_error)
     }
 
-    fn attempt(&self, key: &str, generation: u64) -> Option<JournalRow> {
-        self.try_attempt(key, generation).unwrap_or_else(|e| {
-            unreachable_store("attempt", &e);
-            None
-        })
+    fn attempt(
+        &self,
+        key: &str,
+        generation: u64,
+    ) -> Result<Option<JournalRow>, KernelJournalError> {
+        self.try_attempt(key, generation)
+            .map_err(kernel_journal_error)
     }
 
-    fn read(&self, offset: i64) -> Option<JournalRead> {
-        self.try_read(offset).unwrap_or_else(|e| {
-            unreachable_store("read", &e);
-            None
-        })
+    fn read(&self, offset: i64) -> Result<Option<JournalRead>, KernelJournalError> {
+        self.try_read(offset).map_err(kernel_journal_error)
     }
 
-    fn get(&self, key: &str) -> Option<JournalRow> {
-        self.try_get(key).unwrap_or_else(|e| {
-            unreachable_store("get", &e);
-            None
-        })
+    fn get(&self, key: &str) -> Result<Option<JournalRow>, KernelJournalError> {
+        self.try_get(key).map_err(kernel_journal_error)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bridge_errors_map_to_framework_journal_errors() {
+        let unavailable = kernel_journal_error(JournalError::Unavailable("gone".into()));
+        assert!(matches!(
+            unavailable,
+            KernelJournalError::Unavailable(ref message) if message == "gone"
+        ));
+
+        let store = kernel_journal_error(JournalError::Store(sqlx::Error::RowNotFound));
+        assert!(matches!(store, KernelJournalError::Unavailable(_)));
     }
 }

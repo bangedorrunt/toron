@@ -1,6 +1,7 @@
 // governed-by: ADR-0003
 #![forbid(unsafe_code)]
 
+pub mod durable_engine;
 pub mod event_log;
 pub mod projection;
 pub mod rebuild;
