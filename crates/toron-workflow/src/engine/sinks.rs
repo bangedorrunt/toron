@@ -187,6 +187,12 @@ pub struct PendingEntry {
     pub evidence_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deadline_secs: Option<u64>,
+    /// Full approval evidence (the graph `build_approval_payload`: nodes
+    /// completed/failed/pending, artifacts, ledger path, blast radius,
+    /// timeout, evidence hash). `None` on the linear path, whose kind-46011
+    /// body stays exactly as it was.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload: Option<serde_json::Value>,
 }
 
 impl PendingEntry {
@@ -216,6 +222,7 @@ impl PendingEntry {
             artifacts: Vec::new(),
             evidence_hash: None,
             deadline_secs: None,
+            payload: None,
         }
     }
 
@@ -350,6 +357,12 @@ impl ResolutionVerdict {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Resolution {
     pub run_id: String,
+    /// Node the decision belongs to. Absent on the linear path (one park per
+    /// run); a graph wave can park several approvals at once, so the host keys
+    /// its registry by `(run_id, node)` and falls back to the single run entry
+    /// when this is absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project: Option<String>,
     pub promise_id: String,
@@ -529,6 +542,7 @@ mod lifecycle_tests {
         let entry = approval_entry();
         let ok = Resolution {
             run_id: "run-1".into(),
+            node: None,
             project: None,
             promise_id: "promise-1".into(),
             generation: 1,
@@ -542,6 +556,7 @@ mod lifecycle_tests {
         ));
         let wrong_run = Resolution {
             run_id: "run-2".into(),
+            node: None,
             ..ok.clone()
         };
         assert!(matches!(

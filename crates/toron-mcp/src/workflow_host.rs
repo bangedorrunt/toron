@@ -1021,7 +1021,7 @@ pub struct WorkflowHost {
     /// bd-host-cut-pqkg: approvals parked on the durable path by run id.
     /// The model has no Resonate promise id, so the run id is the
     /// correlation key; `PendingDrain` never sees these entries.
-    durable_parks: Arc<std::sync::Mutex<HashMap<String, DurablePark>>>,
+    durable_parks: Arc<std::sync::Mutex<HashMap<(String, String), DurablePark>>>,
     /// bd-host-cut-pqkg: durable runs currently driving in this process.
     /// The restart sweep skips these so a run is never double-driven (a
     /// second driver feeding `step_ok` for the same step would hit
@@ -1029,10 +1029,32 @@ pub struct WorkflowHost {
     durable_active: Arc<std::sync::Mutex<HashSet<String>>>,
 }
 
+/// Find the durable park a resolution names.
+///
+/// Graph parks are keyed by `(run_id, node)` because one wave can park several
+/// approvals at once. The linear path has one park per run and its resolution
+/// carries no node, so an absent node falls back to that single entry — never to
+/// one of several.
+fn find_durable_park(
+    parks: &HashMap<(String, String), DurablePark>,
+    run_id: &str,
+    node: Option<&str>,
+) -> Option<DurablePark> {
+    if let Some(node) = node {
+        return parks.get(&(run_id.to_string(), node.to_string())).cloned();
+    }
+    let mut hits = parks
+        .iter()
+        .filter(|((rid, _), _)| rid == run_id)
+        .map(|(_, park)| park.clone());
+    let first = hits.next()?;
+    hits.next().is_none().then_some(first)
+}
+
 /// One approval parked on the durable path (bd-host-cut-pqkg).
 #[derive(Clone, Debug)]
 struct DurablePark {
-    /// Step awaiting the decision.
+    /// Step or graph node awaiting the decision.
     node: String,
     /// Park generation (always 1 in this slice: the model parks one
     /// approval at a time and the entry is removed on approve).
@@ -1445,7 +1467,7 @@ impl WorkflowHost {
         if let Some(project) = &entry.project {
             tags.push(Tag::parse(["t", project]).map_err(|e| anyhow::anyhow!("t tag: {e}"))?);
         }
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "run_id": entry.run_id,
             "workflow": entry.workflow,
             "node": entry.node_path,
@@ -1456,6 +1478,11 @@ impl WorkflowHost {
             "evidence_hash": entry.evidence_hash,
             "deadline_secs": entry.deadline_secs,
         });
+        // Graph parks carry the full evidence payload; the linear body stays
+        // byte-identical because the key is only inserted when present.
+        if let (Some(payload), Some(obj)) = (&entry.payload, body.as_object_mut()) {
+            obj.insert("payload".into(), payload.clone());
+        }
         let event = EventBuilder::new(Kind::from_u16(46011), body.to_string())
             .tags(tags)
             .finalize(signer)
@@ -1548,12 +1575,25 @@ impl WorkflowHost {
             .job_signer
             .as_ref()
             .context("no signer: cannot publish kind-46012 terminal")?;
-        let outcome = serde_json::json!({
-            "status": status,
-            "run_id": run_id,
-            "failed_step": node,
-            "evidence": evidence,
-        });
+        // bd-terminal-shape-tbik: kind-46012 carries the run OUTCOME, never a
+        // wrapper around it. The durable settle path passes the outcome as
+        // JSON (the graph outputs map on success, the enriched bundle on
+        // failure); a bare string is legacy and becomes a minimal object.
+        let mut outcome: serde_json::Value = serde_json::from_str(evidence)
+            .ok()
+            .filter(serde_json::Value::is_object)
+            .unwrap_or_else(|| serde_json::json!({ "evidence": evidence }));
+        if let Some(obj) = outcome.as_object_mut() {
+            obj.entry("status")
+                .or_insert_with(|| serde_json::json!(status));
+            obj.entry("run_id")
+                .or_insert_with(|| serde_json::json!(run_id));
+            // The old success body has no failed_step at all.
+            if status == "failed" && !node.is_empty() {
+                obj.entry("failed_step")
+                    .or_insert_with(|| serde_json::json!(node));
+            }
+        }
         let event = toron_workflow::engine::build_workflow_run_terminal(signer, run_id, &outcome)
             .map_err(|e| anyhow::anyhow!("build 46012: {e}"))?;
         self.bus
@@ -1603,6 +1643,11 @@ impl WorkflowHost {
         });
         Some(Resolution {
             run_id: body.get("run_id")?.as_str()?.to_string(),
+            node: body
+                .get("node")
+                .and_then(|n| n.as_str())
+                .filter(|n| !n.is_empty())
+                .map(str::to_string),
             project,
             promise_id: body.get("promise_id")?.as_str()?.to_string(),
             generation: body.get("generation")?.as_u64()?,
@@ -1621,12 +1666,13 @@ impl WorkflowHost {
     pub async fn resolve_parked(&self, res: Resolution) -> Result<PendingEntry> {
         // bd-host-cut-pqkg: durable parks carry no promise id; the run id is
         // the correlation key and the decision lands through the state store.
-        let park = self
-            .durable_parks
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(&res.run_id)
-            .cloned();
+        let park = {
+            let parks = self
+                .durable_parks
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            find_durable_park(&parks, &res.run_id, res.node.as_deref())
+        };
         if let Some(park) = park {
             return self.resolve_durable_park(res, park).await;
         }
@@ -1960,7 +2006,8 @@ impl WorkflowHost {
                     .durable_parks
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
-                    .contains_key(&run_id);
+                    .keys()
+                    .any(|(rid, _)| rid == &run_id);
             if live {
                 continue;
             }
@@ -2136,6 +2183,7 @@ impl WorkflowHost {
                             &workflow_digest,
                             step,
                             message,
+                            None,
                         )
                         .await;
                         return;
@@ -2356,8 +2404,31 @@ impl WorkflowHost {
                     }
                 }
             }
+            // Every approval in the wave is registered and published — a
+            // second same-wave approval must be operator-visible and
+            // resolvable, not swallowed by the first. The engine park is
+            // already one per transition (DurableGraphRun::engine_verb).
+            let mut parked_for_human = false;
             for effect in parks {
                 match effect {
+                    GraphEffect::AwaitApproval { node, payload } => {
+                        let message = payload
+                            .get("message")
+                            .and_then(|m| m.as_str())
+                            .unwrap_or("approval required")
+                            .to_string();
+                        self.park_durable_approval(
+                            &run_id,
+                            &workflow,
+                            &trigger,
+                            &workflow_digest,
+                            node,
+                            message,
+                            Some(payload),
+                        )
+                        .await;
+                        parked_for_human = true;
+                    }
                     GraphEffect::ParkUntil {
                         node: _,
                         until_ms,
@@ -2379,25 +2450,11 @@ impl WorkflowHost {
                         run = back;
                         follow.append(&mut eff);
                     }
-                    GraphEffect::AwaitApproval { node, payload } => {
-                        let message = payload
-                            .get("message")
-                            .and_then(|m| m.as_str())
-                            .unwrap_or("approval required")
-                            .to_string();
-                        self.park_durable_approval(
-                            &run_id,
-                            &workflow,
-                            &trigger,
-                            &workflow_digest,
-                            node,
-                            message,
-                        )
-                        .await;
-                        return;
-                    }
                     _ => unreachable!("only parks reach this loop"),
                 }
+            }
+            if parked_for_human {
+                return;
             }
             effects = follow;
         }
@@ -2485,6 +2542,7 @@ impl WorkflowHost {
     /// resolution path, publish kind-46011 with the run id as the
     /// correlation key, and track `Suspended`. A missing signer warns and
     /// keeps the park recorded, like the old path's retained entries.
+    #[allow(clippy::too_many_arguments)]
     async fn park_durable_approval(
         &self,
         run_id: &str,
@@ -2493,6 +2551,7 @@ impl WorkflowHost {
         workflow_digest: &str,
         step: String,
         message: String,
+        payload: Option<serde_json::Value>,
     ) {
         let park = DurablePark {
             node: step.clone(),
@@ -2504,7 +2563,7 @@ impl WorkflowHost {
         self.durable_parks
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .insert(run_id.to_string(), park);
+            .insert((run_id.to_string(), step.clone()), park);
         let mut entry = PendingEntry::new(
             run_id,
             None,
@@ -2515,6 +2574,7 @@ impl WorkflowHost {
             1,
             ParkKind::Approval,
         );
+        entry.payload = payload;
         entry.question = Some(message.chars().take(500).collect());
         if let Err(e) = self.publish_approval_pending(&entry).await {
             warn!(run_id = %run_id, "durable approval publication failed (park retained): {e:#}");
@@ -2589,11 +2649,12 @@ impl WorkflowHost {
                 anyhow::bail!("spawn verdict on a durable approval park: {}", res.run_id);
             }
         };
-        // Take the entry so a duplicate resolution finds nothing to settle.
+        // Take THIS node's entry so a duplicate resolution finds nothing to
+        // settle while a sibling approval stays parked.
         self.durable_parks
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .remove(&res.run_id);
+            .remove(&(res.run_id.clone(), park.node.clone()));
         let pool = self.pending.lock().await.store().map(|s| s.pool().clone());
         let Some(pool) = pool else {
             anyhow::bail!("durable resolve lost its store for run {}", res.run_id);
@@ -5314,6 +5375,7 @@ steps:
         assert_eq!(drain.drain(&engine, &ctx).await.len(), 1);
         let stale = Resolution {
             run_id: "run-1".into(),
+            node: None,
             project: None,
             promise_id: "promise-1".into(),
             generation: 0,
@@ -5329,6 +5391,7 @@ steps:
         );
         let unknown = Resolution {
             run_id: "run-1".into(),
+            node: None,
             project: None,
             promise_id: "promise-nope".into(),
             generation: 1,
@@ -5448,6 +5511,289 @@ steps:
         let _ = std::fs::remove_file(&db);
     }
 
+    /// bd-graph-approval-host-dcqq: one wave can park several approvals, so
+    /// every `AwaitingApproval` effect is registered under `(run, node)` and
+    /// published — with its evidence payload — instead of the first one
+    /// swallowing the rest.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn durable_graph_multi_approval_parks_publish_per_node() {
+        use toron_core::bus::in_process::{InProcessBus, InProcessBusConfig};
+        use toron_core::index::schema;
+        use toron_workflow::schema::Workflow;
+
+        let db = std::env::temp_dir().join(format!("wf-graph-{}.sqlite", uuid::Uuid::new_v4()));
+        let pool = schema::connect(db.to_str().unwrap())
+            .await
+            .expect("connect");
+        schema::migrate(&pool).await.expect("migrate");
+        let bus: Arc<dyn Bus> = Arc::new(
+            InProcessBus::open(pool, InProcessBusConfig::default())
+                .await
+                .expect("bus"),
+        );
+        let host = WorkflowHost::over_bus(bus.clone(), vec![], None)
+            .expect("host")
+            .with_job_signer(Some(Keys::generate()));
+        let wf = Workflow {
+            name: "graph-approvals".into(),
+            description: None,
+            trigger: None,
+            policy: None,
+            guard: None,
+            principles: vec![],
+            steps: vec![],
+            graph: None,
+            inputs: vec![],
+            crew: None,
+        };
+        let mut sub = bus
+            .subscribe_trusted(toron_core::bus::Filter::new())
+            .await
+            .expect("subscribe");
+
+        for node in ["aa", "zz"] {
+            let payload = serde_json::json!({
+                "run_id": "run-graph-2",
+                "workflow": "graph-approvals",
+                "suspended_at": { "node": node, "wave": 1 },
+                "message": format!("approve {node}?"),
+                "evidence_hash": format!("hash-{node}"),
+            });
+            host.park_durable_approval(
+                "run-graph-2",
+                &wf,
+                &serde_json::json!({}),
+                "digest-2",
+                node.to_string(),
+                format!("approve {node}?"),
+                Some(payload),
+            )
+            .await;
+        }
+
+        {
+            let parks = host.durable_parks.lock().unwrap();
+            assert_eq!(parks.len(), 2, "two nodes, two parks: {parks:?}");
+            assert!(parks.contains_key(&("run-graph-2".to_string(), "aa".to_string())));
+            assert!(parks.contains_key(&("run-graph-2".to_string(), "zz".to_string())));
+        }
+
+        let mut nodes = Vec::new();
+        for _ in 0..20 {
+            if nodes.len() == 2 {
+                break;
+            }
+            let Ok(got) = tokio::time::timeout(std::time::Duration::from_secs(5), sub.next()).await
+            else {
+                break;
+            };
+            let Some(toron_core::bus::SubscriptionEvent::Event(ev)) = got else {
+                continue;
+            };
+            if ev.kind.as_u16() == 46011 {
+                let body: serde_json::Value =
+                    serde_json::from_str(&ev.content).expect("46011 json");
+                let node = body["node"].as_str().expect("node key").to_string();
+                assert_eq!(
+                    body["payload"]["suspended_at"]["node"],
+                    serde_json::json!(node),
+                    "the graph evidence rides the event: {body}"
+                );
+                nodes.push(node);
+            }
+        }
+        nodes.sort();
+        assert_eq!(
+            nodes,
+            ["aa", "zz"],
+            "one pending event per node, distinct node keys"
+        );
+    }
+
+    /// The resolution lookup never cross-resolves: a named node finds its own
+    /// park, an absent node falls back to the single run entry only, and the
+    /// removal of one park leaves the sibling resolvable.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn durable_graph_park_lookup_is_per_node_and_never_ambiguous() {
+        use toron_core::bus::in_process::{InProcessBus, InProcessBusConfig};
+        use toron_core::index::schema;
+        use toron_workflow::schema::Workflow;
+
+        let db =
+            std::env::temp_dir().join(format!("wf-graph-lookup-{}.sqlite", uuid::Uuid::new_v4()));
+        let pool = schema::connect(db.to_str().unwrap())
+            .await
+            .expect("connect");
+        schema::migrate(&pool).await.expect("migrate");
+        let bus: Arc<dyn Bus> = Arc::new(
+            InProcessBus::open(pool, InProcessBusConfig::default())
+                .await
+                .expect("bus"),
+        );
+        let host = WorkflowHost::over_bus(bus, vec![], None).expect("host");
+        let wf = Workflow {
+            name: "graph-lookup".into(),
+            description: None,
+            trigger: None,
+            policy: None,
+            guard: None,
+            principles: vec![],
+            steps: vec![],
+            graph: None,
+            inputs: vec![],
+            crew: None,
+        };
+        for node in ["aa", "zz"] {
+            host.park_durable_approval(
+                "run-lookup",
+                &wf,
+                &serde_json::json!({}),
+                "digest-3",
+                node.to_string(),
+                format!("approve {node}?"),
+                None,
+            )
+            .await;
+        }
+
+        {
+            let parks = host.durable_parks.lock().unwrap();
+            assert_eq!(
+                find_durable_park(&parks, "run-lookup", Some("zz"))
+                    .expect("named node")
+                    .node,
+                "zz"
+            );
+            assert!(
+                find_durable_park(&parks, "run-lookup", None).is_none(),
+                "two parks + no node is ambiguous: never pick one"
+            );
+        }
+        // Resolving one node removes only that node's park.
+        host.durable_parks
+            .lock()
+            .unwrap()
+            .remove(&("run-lookup".to_string(), "aa".to_string()));
+        {
+            let parks = host.durable_parks.lock().unwrap();
+            assert_eq!(parks.len(), 1, "the sibling stays parked");
+            assert_eq!(
+                find_durable_park(&parks, "run-lookup", Some("zz"))
+                    .expect("sibling resolvable")
+                    .node,
+                "zz"
+            );
+            assert_eq!(
+                find_durable_park(&parks, "run-lookup", None)
+                    .expect("the linear-style fallback still works for one park")
+                    .node,
+                "zz"
+            );
+        }
+    }
+
+    /// bd-terminal-shape-tbik: kind-46012 carries the run OUTCOME. A success
+    /// publishes the outputs map (no `failed_step`); a failure publishes the
+    /// enriched bundle at top level, not a wrapper around it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn durable_terminal_event_carries_the_outcome_not_a_wrapper() {
+        use toron_core::bus::in_process::{InProcessBus, InProcessBusConfig};
+        use toron_core::index::schema;
+
+        let db = std::env::temp_dir().join(format!("wf-term-{}.sqlite", uuid::Uuid::new_v4()));
+        let pool = schema::connect(db.to_str().unwrap())
+            .await
+            .expect("connect");
+        schema::migrate(&pool).await.expect("migrate");
+        let bus: Arc<dyn Bus> = Arc::new(
+            InProcessBus::open(pool, InProcessBusConfig::default())
+                .await
+                .expect("bus"),
+        );
+        let host = WorkflowHost::over_bus(bus.clone(), vec![], None)
+            .expect("host")
+            .with_job_signer(Some(Keys::generate()));
+        let mut sub = bus
+            .subscribe_trusted(toron_core::bus::Filter::new())
+            .await
+            .expect("subscribe");
+
+        // Success: the graph outputs map, no failed_step.
+        host.publish_terminal(
+            "run-term-ok",
+            "digest-ok",
+            "succeeded",
+            "",
+            "{\"aa\":{\"ok\":true},\"zz\":{\"ok\":true}}",
+        )
+        .await
+        .expect("publish success");
+        // Failure: the enriched bundle, parsed and passed through.
+        host.publish_terminal(
+            "run-term-bad",
+            "digest-bad",
+            "failed",
+            "flaky",
+            "{\"status\":\"failed\",\"error\":\"boom\",\"failed_step\":\"flaky\",\"kind\":\"timeout\",\"attempts\":3}",
+        )
+        .await
+        .expect("publish failure");
+
+        let mut outputs = Vec::new();
+        for _ in 0..20 {
+            if outputs.len() == 2 {
+                break;
+            }
+            let Ok(got) = tokio::time::timeout(std::time::Duration::from_secs(5), sub.next()).await
+            else {
+                break;
+            };
+            let Some(toron_core::bus::SubscriptionEvent::Event(ev)) = got else {
+                continue;
+            };
+            if ev.kind.as_u16() == 46012 {
+                let body: serde_json::Value =
+                    serde_json::from_str(&ev.content).expect("46012 json");
+                outputs.push(body);
+            }
+        }
+        assert_eq!(outputs.len(), 2, "one terminal per run: {outputs:?}");
+
+        let ok = outputs
+            .iter()
+            .find(|b| b["run_id"] == serde_json::json!("run-term-ok"))
+            .expect("success terminal");
+        assert_eq!(ok["status"], serde_json::json!("succeeded"));
+        assert_eq!(
+            ok["output"],
+            serde_json::json!({
+                "aa": {"ok": true},
+                "zz": {"ok": true},
+                "status": "succeeded",
+                "run_id": "run-term-ok",
+            }),
+            "the outputs map plus the identity keys, nothing else"
+        );
+        assert!(
+            ok["output"].get("failed_step").is_none(),
+            "old success carries no failed_step: {ok}"
+        );
+
+        let bad = outputs
+            .iter()
+            .find(|b| b["run_id"] == serde_json::json!("run-term-bad"))
+            .expect("failure terminal");
+        assert_eq!(bad["status"], serde_json::json!("failed"));
+        assert_eq!(bad["output"]["status"], serde_json::json!("failed"));
+        assert_eq!(bad["output"]["error"], serde_json::json!("boom"));
+        assert_eq!(bad["output"]["failed_step"], serde_json::json!("flaky"));
+        assert_eq!(bad["output"]["attempts"], serde_json::json!(3));
+        assert!(
+            bad["output"].get("evidence").is_none(),
+            "the bundle is not re-wrapped: {bad}"
+        );
+    }
+
     /// bd-asx3 e2e: a real parked run is SUSPENDED (never failed), drains
     /// into the registry independently of the run await, and resumes to
     /// Succeeded through the validated host resolution path.
@@ -5547,6 +5893,7 @@ steps:
         // Operator approves through the validated host path.
         let res = toron_workflow::engine::Resolution {
             run_id: "run-e2e-1".into(),
+            node: None,
             project: None,
             promise_id: entries[0].promise_id.clone(),
             generation: 1,
@@ -8986,7 +9333,7 @@ steps:
         let host = WorkflowHost::over_bus(bus, vec![], None).expect("host");
         host.with_effect_store(recon_store("host-cut").await).await;
         host.durable_parks.lock().unwrap().insert(
-            "run-cut-9".to_string(),
+            ("run-cut-9".to_string(), "approve-it".to_string()),
             DurablePark {
                 node: "approve-it".into(),
                 generation: 1,
@@ -9008,6 +9355,7 @@ steps:
         );
         let bad_promise = Resolution {
             run_id: "run-cut-9".into(),
+            node: None,
             project: None,
             promise_id: "promise-xyz".into(),
             generation: 1,
@@ -9020,6 +9368,7 @@ steps:
         );
         let bad_generation = Resolution {
             run_id: "run-cut-9".into(),
+            node: None,
             project: None,
             promise_id: "run-cut-9".into(),
             generation: 7,
@@ -9031,7 +9380,12 @@ steps:
             "a stale generation must not settle a durable park"
         );
         // Both rejections leave the park recorded for the real resolution.
-        assert!(host.durable_parks.lock().unwrap().contains_key("run-cut-9"));
+        assert!(
+            host.durable_parks
+                .lock()
+                .unwrap()
+                .contains_key(&("run-cut-9".to_string(), "approve-it".to_string()))
+        );
     }
 
     /// bd-host-cut-pqkg: the host-level restart witness — one linear workflow
@@ -9199,7 +9553,8 @@ steps:
                 .durable_parks
                 .lock()
                 .unwrap()
-                .contains_key("run-cut-9")
+                .keys()
+                .any(|(rid, _)| rid == "run-cut-9")
             {
                 break;
             }
@@ -9212,6 +9567,7 @@ steps:
         // A resolution through the store settles the run end to end.
         let res = Resolution {
             run_id: "run-cut-9".into(),
+            node: None,
             project: None,
             promise_id: "run-cut-9".into(),
             generation: 1,
@@ -9334,7 +9690,8 @@ steps:
                 .durable_parks
                 .lock()
                 .unwrap()
-                .contains_key("run-cut-replay"),
+                .keys()
+                .any(|(rid, _)| rid == "run-cut-replay"),
             "host1 parked on the approval"
         );
         drop(host1);
@@ -9358,7 +9715,8 @@ steps:
             .durable_parks
             .lock()
             .unwrap()
-            .contains_key("run-cut-replay")
+            .keys()
+            .any(|(rid, _)| rid == "run-cut-replay")
         {
             assert!(
                 tokio::time::Instant::now() < deadline,
@@ -9375,6 +9733,7 @@ steps:
         host2
             .resolve_parked(Resolution {
                 run_id: "run-cut-replay".into(),
+                node: None,
                 project: None,
                 promise_id: "run-cut-replay".into(),
                 generation: 1,
