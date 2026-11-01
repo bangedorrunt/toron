@@ -188,14 +188,14 @@ Live-server SKIP guards: **24 early-`return` points across 12 files**. Only
 "Green" means the named test passes, not that a suite skips.
 
 1. **Wire the linear durable host.** Files: `crates/toron-workflow/src/engine/durable_host.rs`
-   (391 lines, **uncommitted**), `crates/toron-core/src/index/durable_workflow.rs`
-   (`WorkflowStateStore` + `RunState`/`SyncWorkflowState`, **uncommitted**),
-   `crates/toron-workflow/src/engine/durable.rs` (pure fold). It exists and has
-   5 witnesses (`tests/durable_host.rs`: restart-at-unsettled-step, delay
-   re-wake, approval watchdog, unsupported shapes, typed phase errors) — but its
-   only callers are `engine/mod.rs:36` and that test. Witness for this step:
-   `crates/toron-workflow/tests/durable_host.rs` green **and** a production
-   caller (step 5).
+   (landed `7d9a9e7`), `crates/toron-core/src/index/durable_workflow.rs`
+   (`WorkflowStateStore` + `RunState`/`SyncWorkflowState`, landed `7d9a9e7`),
+   `crates/toron-workflow/src/engine/durable.rs` (pure fold). It has 5
+   witnesses (`tests/durable_host.rs`: restart-at-unsettled-step, delay
+   re-wake, approval watchdog, unsupported shapes, typed phase errors), and
+   since `06270f3` every one of them runs on the production seam —
+   `SyncWorkflowState`, `ToronEngineStore`, and `ToronJournal` over one SQLite
+   pool. Still missing: a production caller (step 5).
 2. **Extend the model to graphs.** `durable.rs:347-349` refuses every workflow
    with `graph.is_some()`, and `tests/durable_host.rs:322` pins that refusal.
    Witness: SC-17 rewritten. Cannot delete Resonate before this; `graph:` is
@@ -214,6 +214,22 @@ Live-server SKIP guards: **24 early-`return` points across 12 files**. Only
 5. **Cut the run path over.** Files: `workflow_host.rs:1083-1160`,
    `toron-cli/src/workflow.rs:74-142`. Witness: SC-11 rewritten;
    `host_lifecycle_parked_run_suspends_and_resolves`; all 3 `park_live_*`.
+   The cut is three contained moves, in this order:
+   - **(a) One leaf policy.** `engine/leaf.rs` holds `LeafSeams` (async runner,
+     sync runner, verify sink, journal mode) + `dispatch_leaf`. The Resonate
+     path builds it with `LeafSeams::from_context`; the durable path builds it
+     from the host's injected seams. One implementation, no copy.
+   - **(b) The host loop.** `toron-mcp` owns it: `DurableRun::open` → dispatch
+     each `ExecuteStep` through `dispatch_leaf` → `step_ok`/`step_failed` →
+     run the engine verb on `ParkUntil`/`AwaitComplete`. The model decides the
+     shape; `unsupported_reason` sends graphs and control-flow actions to the
+     existing `WorkflowEngine::run` before any row exists.
+   - **(c) The handles.** One pool, three handles: `ToronEngineStore`,
+     `ToronJournal` (required — a fresh in-memory journal cannot settle a
+     terminal edge after a restart), `SyncWorkflowState`. The host builds them
+     once and passes them per run.
+   Witness for the cut: a graph workflow still runs on the old path **and** a
+   linear one completes after a daemon restart with no repeated settled step.
 6. **Delete server selection and the doctor check.** Files: `engine/mod.rs:52-238`,
    `operator.rs:500-681,701`, `toron-cli/tests/*`. **Decide first** what `doctor`
    reports for parked-run capability; deleting the check removes the only
