@@ -407,3 +407,44 @@ async fn out_of_phase_transitions_are_typed_errors() {
     .expect("join")
     .expect("phase guards");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_park_already_behind_now_resumes_in_the_same_step() {
+    let path = unique_db("zero-delay");
+    let pool = connect(path.to_str().expect("path"))
+        .await
+        .expect("connect");
+    migrate(&pool).await.expect("migrate");
+    let state = SyncWorkflowState::spawn(pool.clone(), &tokio::runtime::Handle::current());
+    let handle = tokio::runtime::Handle::current();
+
+    tokio::task::spawn_blocking(move || -> Result<(), HostError> {
+        let engine = OurEngine::with_journal(
+            ToronEngineStore::spawn(pool.clone(), &handle),
+            ToronJournal::spawn(JournalDb::new(pool, "zero-delay", 64), &handle),
+        );
+        let (run, effects) = DurableRun::open(
+            engine,
+            state,
+            "run-zero",
+            workflow(vec![step(Action::Delay { secs: 0 })]),
+            json!({}),
+            5_000,
+        )?;
+        // The run must not stay parked on a deadline the engine refuses to
+        // schedule: the same call completes it.
+        assert!(
+            matches!(effects.last(), Some(RunEffect::Complete { .. })),
+            "a zero delay finishes immediately: {effects:?}"
+        );
+        assert_eq!(run.model().phase, RunPhase::Succeeded);
+        assert_eq!(
+            run.engine().query("run-zero").expect("query").phase,
+            EnginePhase::Settled
+        );
+        Ok(())
+    })
+    .await
+    .expect("join")
+    .expect("zero delay");
+}

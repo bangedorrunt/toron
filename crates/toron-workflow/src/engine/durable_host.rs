@@ -301,12 +301,24 @@ impl<S: EngineStorage, J: JournalStore, R: RunState> DurableRun<S, J, R> {
     }
 
     /// One pure transition: persist, then drive the engine.
+    ///
+    /// A park whose deadline is already past resumes in the same step. Without
+    /// this, `delay: 0` (or any park rendered behind `now`) would persist a
+    /// `Parked` model that the engine never schedules, and nothing would ever
+    /// wake it.
     fn apply(&mut self, msg: RunMsg, now_ms: u64) -> Result<Vec<RunEffect>, HostError> {
         let (next, effects) = advance(&self.model, &msg);
         self.persist(&next)?;
         self.model = next;
         for effect in &effects {
             self.engine_verb(effect, now_ms)?;
+        }
+        if let ModelPhase::Parked { until_ms, .. } = self.model.phase
+            && until_ms <= now_ms
+        {
+            let mut all = effects;
+            all.extend(self.apply(RunMsg::Woke { now_ms }, now_ms)?);
+            return Ok(all);
         }
         Ok(effects)
     }
