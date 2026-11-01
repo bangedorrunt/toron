@@ -876,7 +876,13 @@ impl Client {
         // own kill is issued.
         targets.reverse();
         for pane in targets {
-            self.terminal_kill(&pane)?;
+            match self.terminal_kill(&pane) {
+                Ok(_) => {}
+                // A `--rm` child (or one killed with its parent) is already
+                // gone; closing the rest of the tree is still the job.
+                Err(e) if e.code() == &BackendErrorCode::Other("not_found".into()) => continue,
+                Err(e) => return Err(e),
+            }
             let _ = self.terminal_rm(&pane);
         }
         Ok(())
