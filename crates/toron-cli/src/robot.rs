@@ -538,7 +538,7 @@ fn stamp_bootstrap_pane(
     if npub.is_empty() {
         return None;
     }
-    match toron_core::backend::herdr::HerdrBackend::connect(None) {
+    match toron_core::backend::hc::HcBackend::connect(None) {
         Ok(backend) => {
             let stamped = backend
                 .client()

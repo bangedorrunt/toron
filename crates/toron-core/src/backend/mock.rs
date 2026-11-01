@@ -10,7 +10,7 @@ use parking_lot::Mutex;
 use serde_json::{Value, json};
 
 use super::error::BackendError;
-use super::herdr::{AgentInfo, PaneInfo, Subscription, WaitOptions, WorkspaceInfo};
+use super::types::{AgentInfo, PaneInfo, Subscription, WaitOptions, WorkspaceInfo};
 use super::types::{AgentStatus, BackendEvent, PaneId, PromptLanding, SpawnOptions};
 
 #[derive(Debug, Clone)]

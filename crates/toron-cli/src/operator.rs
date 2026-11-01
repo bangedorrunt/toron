@@ -279,22 +279,16 @@ fn identity_divergence_check(
 fn check_identity_divergence(cfg: &Config) -> CheckResult {
     let name = "identity_divergence";
     let stamps = {
-        let Ok(backend) = toron_core::backend::herdr::HerdrBackend::connect(None) else {
+        let Ok(backend) = toron_core::backend::hc::HcBackend::connect(None) else {
             return CheckResult {
                 name,
                 ok: true,
-                detail: "herdr not reachable — no live panes to compare".into(),
+                detail: "hc not reachable — no live panes to compare".into(),
             };
         };
         let client = backend.client();
-        let panes: Vec<toron_core::backend::herdr::PaneInfo> = client
-            .workspace_list()
-            .map(|wss| {
-                wss.into_iter()
-                    .flat_map(|ws| client.pane_list(Some(&ws.workspace_id)).unwrap_or_default())
-                    .collect()
-            })
-            .unwrap_or_default();
+        let panes: Vec<toron_core::backend::PaneInfo> =
+            client.pane_list().unwrap_or_default();
         panes
             .iter()
             .filter_map(toron_core::mailbox::identity::pane_stamp)
@@ -389,17 +383,17 @@ fn check_daemon_build() -> CheckResult {
 }
 
 fn check_herdr() -> CheckResult {
-    let path = toron_core::backend::herdr::default_socket_path();
-    match toron_core::backend::herdr::HerdrBackend::connect(None) {
+    let path = toron_core::backend::hc::resolve_socket_path(None, std::env::var("HC_SOCKET_PATH").ok().as_deref(), std::env::var_os("XDG_STATE_HOME").map(std::path::PathBuf::from).as_deref(), std::env::var_os("HOME").map(std::path::PathBuf::from).as_deref(), std::env::var("HC_SESSION").ok().as_deref());
+    match toron_core::backend::hc::HcBackend::connect(None) {
         Ok(_) => CheckResult {
-            name: "herdr",
+            name: "hc",
             ok: true,
-            detail: format!("herdr socket reachable at {}", path.display()),
+            detail: format!("hc socket reachable at {}", path.display()),
         },
         Err(e) => CheckResult {
-            name: "herdr",
+            name: "hc",
             ok: false,
-            detail: format!("herdr not present ({}): {e}", path.display()),
+            detail: format!("hc not present ({}): {e}", path.display()),
         },
     }
 }
@@ -1426,9 +1420,9 @@ pub fn run_relay(cfg: &Config, cmd: &RelayCommand) -> anyhow::Result<()> {
 pub fn run_backend(cfg: &Config, cmd: &BackendCommand) -> anyhow::Result<()> {
     match cmd {
         BackendCommand::List => {
-            let herdr = toron_core::backend::herdr::HerdrBackend::connect(None).is_ok();
+            let herdr = toron_core::backend::hc::HcBackend::connect(None).is_ok();
             print_json(&json!([
-                { "name": "herdr", "available": herdr },
+                { "name": "hc", "available": herdr },
                 { "name": "tmux", "available": false },
             ]))
         }

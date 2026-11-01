@@ -43,6 +43,7 @@ elm-effect-journal = { path = "../../../elm-effect-rs/crates/elm-effect-journal"
 fault-injection = []
 
 [dev-dependencies]
+tempfile = "3"
 toron-core = { path = ".", features = ["fault-injection"] }
 proptest = "1.11"
 futures-util = "0.3"

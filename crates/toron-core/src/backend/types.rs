@@ -9,6 +9,7 @@ use std::fmt;
 use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 
 use super::error::BackendError;
 
@@ -233,4 +234,237 @@ mod backend_types_s1 {
         assert_eq!(json, "\"w1:p1\"");
         assert_eq!(serde_json::from_str::<PaneId>(&json).expect("parses"), a);
     }
+}
+
+
+
+
+/// Source id for toron mail-identity pane stamps (bd-6f57). Display-only
+/// metadata — never steals lifecycle authority from the multiplexer.
+pub const MAIL_IDENTITY_SOURCE: &str = "toron:mail-identity";
+/// Token keys for the mail-identity stamp (ASCII alnum/`_`/`-`, ≤32 chars).
+pub const TOKEN_PIN: &str = "toron_pin";
+pub const TOKEN_PROJECT: &str = "toron_project";
+pub const TOKEN_NPUB: &str = "toron_npub";
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct AgentInfo {
+    pub agent: Option<String>,
+    pub agent_status: AgentStatus,
+    pub cwd: Option<String>,
+    pub display_agent: Option<String>,
+    pub focused: bool,
+    pub foreground_cwd: Option<String>,
+    #[serde(default)]
+    pub interactive_ready: bool,
+    #[serde(default)]
+    pub launch_pending: bool,
+    pub name: Option<String>,
+    pub pane_id: String,
+    pub revision: u64,
+    #[serde(default)]
+    pub state_change_seq: u64,
+    /// Monotonic finished-turn counter (herdr). Older servers omit it
+    /// (`None`). Prefer this over watching working→idle for done/hand-off:
+    /// a fast turn can start and finish entirely between two polls.
+    #[serde(default)]
+    pub completion_seq: Option<u64>,
+    #[serde(default)]
+    pub state_labels: serde_json::Map<String, Value>,
+    pub tab_id: String,
+    pub terminal_id: String,
+    pub terminal_title: Option<String>,
+    pub workspace_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct WorkspaceInfo {
+    pub workspace_id: String,
+    pub number: u64,
+    pub label: String,
+    pub focused: bool,
+    pub pane_count: u64,
+    pub tab_count: u64,
+    pub active_tab_id: String,
+    pub agent_status: AgentStatus,
+    #[serde(default)]
+    pub cwd: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct PaneInfo {
+    pub pane_id: String,
+    pub terminal_id: String,
+    pub workspace_id: String,
+    pub tab_id: String,
+    pub focused: bool,
+    pub agent_status: AgentStatus,
+    pub revision: u64,
+    pub title: Option<String>,
+    pub cwd: Option<String>,
+    pub agent: Option<String>,
+    pub agent_session: Option<AgentSessionInfo>,
+    pub display_agent: Option<String>,
+    pub foreground_cwd: Option<String>,
+    pub label: Option<String>,
+    pub scroll: Option<PaneScrollInfo>,
+    #[serde(default)]
+    pub state_labels: serde_json::Map<String, Value>,
+    pub terminal_title: Option<String>,
+    pub terminal_title_stripped: Option<String>,
+    #[serde(default)]
+    pub tokens: serde_json::Map<String, Value>,
+}
+
+/// herdr agent-session reference (`agent_session` on AgentInfo/PaneInfo).
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct AgentSessionInfo {
+    pub source: String,
+    pub agent: String,
+    pub kind: AgentSessionRefKind,
+    pub value: String,
+}
+
+/// herdr agent-session reference kind (`id` | `path`).
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentSessionRefKind {
+    Id,
+    Path,
+}
+
+/// herdr pane scroll state (`scroll` on PaneInfo).
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct PaneScrollInfo {
+    pub offset_from_bottom: u64,
+    pub max_offset_from_bottom: u64,
+    pub viewport_rows: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct WorktreeInfo {
+    pub path: String,
+    pub is_bare: bool,
+    pub is_detached: bool,
+    pub is_prunable: bool,
+    pub is_linked_worktree: bool,
+    pub label: String,
+    pub branch: Option<String>,
+    pub open_workspace_id: Option<String>,
+}
+
+/// Wait options for `agent.prompt` / `agent.wait`.
+#[derive(Debug, Clone)]
+pub struct WaitOptions {
+    pub timeout_ms: Option<u64>,
+    pub until: Vec<AgentStatus>,
+}
+
+/// Result of a `pane.wait_for_output` wait.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaneWaitResult {
+    pub pane_id: String,
+    pub matched_line: Option<String>,
+    pub read: String,
+}
+
+/// Classification of a confirmed `agent.prompt` outcome.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SendVerdict {
+    Landed(Option<AgentStatus>),
+    Stalled,
+    TimedOut,
+    Coded(String),
+}
+
+/// Map a herdr error code + observed status to a verdict. Classifies on the
+/// protocol code, never message strings. `agent_blocked` (protocol v22:
+/// herdr refused to send — agent at an approval/question dialog) stays
+/// [`SendVerdict::Coded`]: no text was delivered, so callers must NOT
+/// respawn-on-stalled or blind-retry; the blocked-agent escalation paths
+/// (flywheel loop tiers) own recovery from state polls.
+pub fn classify_send_result(code: Option<&str>, status: Option<AgentStatus>) -> SendVerdict {
+    match code {
+        Some("agent_prompt_stalled") => SendVerdict::Stalled,
+        Some("timeout") => SendVerdict::TimedOut,
+        Some(other) => SendVerdict::Coded(other.to_string()),
+        None => SendVerdict::Landed(status),
+    }
+}
+
+/// Subscription event kinds accepted by `events.subscribe`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubscriptionEventKind {
+    PaneAgentStatusChanged,
+}
+
+impl SubscriptionEventKind {
+    pub const fn as_wire_str(self) -> &'static str {
+        match self {
+            SubscriptionEventKind::PaneAgentStatusChanged => "pane.agent_status_changed",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Subscription {
+    pub event: SubscriptionEventKind,
+    pub pane_id: String,
+    pub agent_status: Option<AgentStatus>,
+}
+
+impl Subscription {
+    pub const fn agent_status_changed(pane_id: String) -> Self {
+        Subscription {
+            event: SubscriptionEventKind::PaneAgentStatusChanged,
+            pane_id,
+            agent_status: None,
+        }
+    }
+
+    /// Build one multiplexed subscription covering many panes.
+    /// Prefer a single `Client::subscribe` / `Backend::subscribe` call with
+    /// this list over one connection per pane (herdr/tuios cap streams).
+    pub fn agent_status_changed_many(
+        pane_ids: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Vec<Self> {
+        pane_ids
+            .into_iter()
+            .map(|id| Self::agent_status_changed(id.into()))
+            .collect()
+    }
+
+    pub const fn with_agent_status(mut self, status: AgentStatus) -> Self {
+        self.agent_status = Some(status);
+        self
+    }
+
+    pub fn to_value(&self) -> Value {
+        json!({
+            "type": self.event.as_wire_str(),
+            "pane_id": self.pane_id,
+            "agent_status": self.agent_status.map(|s| s.as_str()),
+        })
+    }
+}
+
+
+pub fn report_metadata_params(pane_id: &str, pin: &str, project: &str, npub: &str) -> Value {
+    json!({
+        "pane_id": pane_id,
+        "source": MAIL_IDENTITY_SOURCE,
+        "display_agent": pin,
+        "tokens": {
+            TOKEN_PIN: pin,
+            TOKEN_PROJECT: project,
+            TOKEN_NPUB: npub,
+        },
+    })
 }

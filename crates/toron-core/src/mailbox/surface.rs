@@ -1117,7 +1117,7 @@ impl MailSurface for ToronMailSurface {
         _project: &str,
         pane_id: &str,
     ) -> Result<Option<String>, MailError> {
-        let backend = crate::backend::herdr::HerdrBackend::connect(None)
+        let backend = crate::backend::hc::HcBackend::connect(None)
             .map_err(|e| anyhow::anyhow!("herdr backend unavailable: {e}"))
             .map_mail_error()?;
         self.mailbox
@@ -1126,7 +1126,7 @@ impl MailSurface for ToronMailSurface {
     }
 
     async fn cleanup_pane_identities(&self, _project: &str) -> Result<Vec<String>, MailError> {
-        let backend = crate::backend::herdr::HerdrBackend::connect(None)
+        let backend = crate::backend::hc::HcBackend::connect(None)
             .map_err(|e| anyhow::anyhow!("herdr backend unavailable: {e}"))
             .map_mail_error()?;
         self.mailbox
