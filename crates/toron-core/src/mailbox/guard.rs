@@ -780,7 +780,12 @@ fn package_name_in_manifest(manifest: &Path) -> Option<String> {
 /// target-dir lock is shared, so another agent's concurrent build can hold it,
 /// and blocking on that would punish the wrong commit.
 pub fn build_gate_blocks(repo: &Path, staged: &[String]) -> Vec<StrictBlock> {
-    build_gate_blocks_timed(repo, staged, std::time::Duration::from_secs(BUILD_GATE_TIMEOUT_SECS), None)
+    build_gate_blocks_timed(
+        repo,
+        staged,
+        std::time::Duration::from_secs(BUILD_GATE_TIMEOUT_SECS),
+        None,
+    )
 }
 
 /// Same as [`build_gate_blocks`], with an explicit deadline (tests inject a

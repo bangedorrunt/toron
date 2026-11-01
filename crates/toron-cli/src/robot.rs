@@ -10,10 +10,12 @@
 //! prints `result.to_json()` through the SAME [`toron_mcp::ToJson`] impl.
 //! Byte-identical JSON to the MCP tool.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use anyhow::Context;
 use serde_json::{Value, json};
+use toron_core::backend::types::{TOKEN_NPUB, TOKEN_PIN, TOKEN_PROJECT};
 use toron_core::mailbox::{
     ContactPolicy, FetchInbox, Mailbox, ReleaseAsk, ReleaseDecision, ReleaseResponse,
     RequestContact, RequestRelease, RespondContact, SearchMessages, SendMessage,
@@ -522,35 +524,37 @@ pub async fn run_mail_daemon(dc: &DaemonClient, cmd: &MailCommand) -> anyhow::Re
 }
 
 /// Pane mail-identity stamp shared by both bootstrap arms (bd-6f57 direct,
-/// bd-8xwk daemon): display-only `pane.report_metadata` (pin -> pane).
-/// Best-effort — never fails bootstrap: herdr may be down or the pane flag
-/// absent (detached/CI). Explicit `--pane-id` wins, else `$HERDR_PANE_ID`
-/// injected by herdr into managed panes. Returns the stamped pane id.
+/// bd-8xwk daemon): labels-only `terminal.label` (pin -> pane).
+/// Best-effort — never fails bootstrap: hc may be down or the terminal flag
+/// absent (detached/CI). Explicit `--pane-id` wins, else `$HC_TERMINAL_ID`
+/// injected by hc into managed panes. Returns the stamped terminal address.
 fn stamp_bootstrap_pane(
     pane_flag: Option<String>,
     pin: &str,
     project: &str,
     npub: &str,
 ) -> Option<String> {
-    let pane_id = pane_flag
-        .or_else(|| std::env::var("HERDR_PANE_ID").ok())
+    let terminal = pane_flag
+        .or_else(|| std::env::var("HC_TERMINAL_ID").ok())
         .filter(|p| !p.is_empty())?;
     if npub.is_empty() {
         return None;
     }
+    let labels = BTreeMap::from([
+        (TOKEN_PIN.to_string(), pin.to_string()),
+        (TOKEN_PROJECT.to_string(), project.to_string()),
+        (TOKEN_NPUB.to_string(), npub.to_string()),
+    ]);
     match toron_core::backend::hc::HcBackend::connect(None) {
-        Ok(backend) => {
-            let stamped = backend
-                .client()
-                .pane_report_metadata(&pane_id, pin, project, npub);
-            match stamped {
-                Ok(_) => Some(pane_id),
-                Err(e) => {
-                    eprintln!("toron: pane stamp skipped ({e})");
-                    None
-                }
+        Ok(backend) => match backend.client().terminal_label(&terminal, &labels) {
+            // Prefixed form (`hc:tN`): matches every other toron pane_id
+            // field (whois / list_agents / PaneInfo.pane_id).
+            Ok(labelled) => Some(toron_core::backend::hc::prefix_id(&labelled.address)),
+            Err(e) => {
+                eprintln!("toron: pane stamp skipped ({e})");
+                None
             }
-        }
+        },
         Err(e) => {
             eprintln!("toron: pane stamp skipped ({e})");
             None

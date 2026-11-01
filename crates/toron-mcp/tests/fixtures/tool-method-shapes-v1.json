@@ -3032,7 +3032,7 @@
       }
     },
     "resolve_pane_identity": {
-      "description": "Resolve a herdr pane_id to the agent name (G9).",
+      "description": "Resolve a pane/terminal id to the agent name (G9).",
       "input_schema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "properties": {

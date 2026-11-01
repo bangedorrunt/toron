@@ -23,7 +23,7 @@
 //! A binding that is unverified, stale (generation behind the model's) or
 //! whose pane is gone is never typed into: the fold asks the host to
 //! `Reverify` it each tick and, if that persists for the ring budget,
-//! escalates with cause `unbound`. An `EventsLost` or `HerdrRestarted`
+//! escalates with cause `unbound`. An `EventsLost` or `PlaneRestarted`
 //! input bumps the generation, which stales every binding at once and so
 //! forces a full re-evaluation before any ring.
 //!
@@ -46,8 +46,9 @@ use crate::wake::{PaneState, RingDecision, RingInput, Urgency, should_ring, wake
 pub struct Binding {
     /// herdr pane id the wake line is typed into.
     pub pane_id: String,
-    /// herdr session the pane belongs to.
-    pub herdr_session: String,
+    /// plane session the pane belongs to.
+    #[serde(alias = "herdr_session")]
+    pub plane_session: String,
     /// The generation this binding was verified at.
     #[serde(rename = "gen")]
     pub generation: u64,
@@ -119,8 +120,9 @@ pub struct InboxModel {
 pub enum Invalidate {
     /// The herdr event stream shed frames: the model may have missed state.
     EventsLost,
-    /// herdr restarted: pane ids are not the ones we verified.
-    HerdrRestarted,
+    /// hc restarted: pane ids are not the ones we verified.
+    #[serde(alias = "herdr_restarted", alias = "HerdrRestarted")]
+    PlaneRestarted,
 }
 
 /// Inputs: durable facts from the log and the host, plus time.
@@ -150,8 +152,9 @@ pub enum InboxMsg {
         recipient: String,
         /// herdr pane id.
         pane_id: String,
-        /// herdr session.
-        herdr_session: String,
+        /// plane session.
+        #[serde(alias = "herdr_session")]
+        plane_session: String,
         /// Generation the verification ran at.
         #[serde(rename = "gen")]
         generation: u64,
@@ -215,8 +218,9 @@ pub enum InboxCmd {
         recipient: String,
         /// herdr pane id.
         pane_id: String,
-        /// herdr session.
-        herdr_session: String,
+        /// plane session.
+        #[serde(alias = "herdr_session")]
+        plane_session: String,
         /// The binding generation to check before typing.
         binding_gen: u64,
         /// The watermark the line names.
@@ -364,7 +368,7 @@ fn evaluate(
                 cmds.push(InboxCmd::Ring {
                     recipient: recipient.to_string(),
                     pane_id: b.pane_id.clone(),
-                    herdr_session: b.herdr_session.clone(),
+                    plane_session: b.plane_session.clone(),
                     binding_gen: b.generation,
                     wm,
                     line: wake_line(wm),
@@ -421,7 +425,7 @@ impl Program for InboxProgram {
             InboxMsg::Bound {
                 recipient,
                 pane_id,
-                herdr_session,
+                plane_session,
                 generation,
                 verified,
                 verified_by,
@@ -439,7 +443,7 @@ impl Program for InboxProgram {
                 }
                 r.binding = Some(Binding {
                     pane_id: pane_id.clone(),
-                    herdr_session: herdr_session.clone(),
+                    plane_session: plane_session.clone(),
                     generation: *generation,
                     verified: *verified,
                     verified_by: verified_by.clone(),

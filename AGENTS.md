@@ -4,7 +4,7 @@ Nostr-native agent mailbox. One `toron` binary (daemon + MCP + robot CLI).
 Flywheel embeds this; never the reverse. Deps one-way:
 **flywheel → toron-workflow → toron-core**. Never reverse.
 
-MCP surface: **41 tools** (38 AM-Rust parity + 3 additive:
+MCP surface: **41 tools** (38 AM-Rust parity + 3 toron additive:
 `release_file_reservations_by_reason`, `list_file_reservations`,
 `ask_judgment`) and **25 resources**. The committed catalog
 (`docs/catalog/toron-mcp.json`) is the 38-parity subset by contract.
@@ -73,7 +73,8 @@ never `git add -A`.
 
 - Edition 2024. `#![forbid(unsafe_code)]` on every crate root.
 - New/changed ADR-constrained files: `// governed-by: ADR-XXXX` at top.
-- Frozen: 41 tool names, 25 resources, kind registry. No new kinds/tools
+- Frozen: 41 tool names (38 AM-Rust parity + 3 additive), 25 resources,
+  kind registry. No new kinds/tools
   without an ADR. Additive tools need ADR + catalog regen + tests.
 - CLI nouns: `channel` `job` `react` `presence` `watch`. Channel posts = kind
   **9**. Flag vocabulary: acting agent is always `--as`; project-scoped

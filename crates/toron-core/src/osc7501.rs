@@ -82,10 +82,10 @@ impl Report {
         }
     }
 
-    /// The herdr status this report may update. `None` means "do not
-    /// touch the herdr status": OSC idle is not finished-and-seen, and
+    /// The hc status this report may update. `None` means "do not
+    /// touch the hc status": OSC idle is not finished-and-seen, and
     /// OSC error must not count as done.
-    pub fn herdr_status(&self) -> Option<AgentStatus> {
+    pub fn osc_status(&self) -> Option<AgentStatus> {
         match self.state {
             ProgramState::Working => Some(AgentStatus::Working),
             ProgramState::Blocked => Some(AgentStatus::Blocked),
@@ -498,19 +498,19 @@ mod tests {
             Some("Apply 3 to add, 1 to change, 0 to destroy?")
         );
         assert_eq!(report.fold_hint(), FoldHint::NeedsUser);
-        assert_eq!(report.herdr_status(), Some(AgentStatus::Blocked));
+        assert_eq!(report.osc_status(), Some(AgentStatus::Blocked));
     }
 
     #[test]
     fn error_is_not_done_and_idle_is_not_herdr_idle() {
         let err = parse_report(&osc("state=error:app=freebuff")).unwrap();
         assert_eq!(err.fold_hint(), FoldHint::Failed);
-        assert_eq!(err.herdr_status(), None);
+        assert_eq!(err.osc_status(), None);
         let idle = parse_report(&osc("state=idle:app=claude-code")).unwrap();
         assert_eq!(idle.fold_hint(), FoldHint::AtPrompt);
-        assert_eq!(idle.herdr_status(), None);
+        assert_eq!(idle.osc_status(), None);
         let done = parse_report(&osc("state=done")).unwrap();
-        assert_eq!(done.herdr_status(), Some(AgentStatus::Done));
+        assert_eq!(done.osc_status(), Some(AgentStatus::Done));
     }
 
     #[test]
@@ -554,8 +554,14 @@ mod tests {
 
     #[test]
     fn empty_board_is_unknown() {
-        assert_eq!(fold(&Board::default(), FoldPolicy::Attention), AgentStatus::Unknown);
-        assert_eq!(fold(&Board::default(), FoldPolicy::RootWins), AgentStatus::Unknown);
+        assert_eq!(
+            fold(&Board::default(), FoldPolicy::Attention),
+            AgentStatus::Unknown
+        );
+        assert_eq!(
+            fold(&Board::default(), FoldPolicy::RootWins),
+            AgentStatus::Unknown
+        );
     }
 
     #[test]

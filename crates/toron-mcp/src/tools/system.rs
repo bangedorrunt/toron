@@ -183,7 +183,7 @@ impl ToolServer {
     /// `resolve_pane_identity`: herdr pane_id → agent name (G9).
     #[tool(
         name = "resolve_pane_identity",
-        description = "Resolve a herdr pane_id to the agent name (G9).",
+        description = "Resolve a pane/terminal id to the agent name (G9).",
         output_schema = rmcp::handler::server::tool::schema_for_output::<crate::responses::ResolvePaneWrapper>(),
         annotations(title = "Resolve pane identity", read_only_hint = true)
     )]

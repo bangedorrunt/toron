@@ -1118,7 +1118,7 @@ impl MailSurface for ToronMailSurface {
         pane_id: &str,
     ) -> Result<Option<String>, MailError> {
         let backend = crate::backend::hc::HcBackend::connect(None)
-            .map_err(|e| anyhow::anyhow!("herdr backend unavailable: {e}"))
+            .map_err(|e| anyhow::anyhow!("hc backend unavailable: {e}"))
             .map_mail_error()?;
         self.mailbox
             .resolve_pane_identity(&backend, pane_id)
@@ -1127,7 +1127,7 @@ impl MailSurface for ToronMailSurface {
 
     async fn cleanup_pane_identities(&self, _project: &str) -> Result<Vec<String>, MailError> {
         let backend = crate::backend::hc::HcBackend::connect(None)
-            .map_err(|e| anyhow::anyhow!("herdr backend unavailable: {e}"))
+            .map_err(|e| anyhow::anyhow!("hc backend unavailable: {e}"))
             .map_mail_error()?;
         self.mailbox
             .cleanup_pane_identities(&backend)
@@ -1141,13 +1141,13 @@ impl MailSurface for ToronMailSurface {
         _agent: &str,
     ) -> Result<(), MailError> {
         Err(MailError::unsupported(
-            "write_pane_identity: toron holds no per-pane identity files (live herdr mapping; G9)",
+            "write_pane_identity: toron holds no per-pane identity files (live hc mapping; G9)",
         ))
     }
 
     async fn clear_pane_identity(&self, _project: &str, _pane_id: &str) -> Result<(), MailError> {
         Err(MailError::unsupported(
-            "clear_pane_identity: toron holds no per-pane identity files (live herdr mapping; G9)",
+            "clear_pane_identity: toron holds no per-pane identity files (live hc mapping; G9)",
         ))
     }
 }

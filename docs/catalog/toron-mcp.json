@@ -92,7 +92,7 @@
     },
     {
       "args": "reconstruct",
-      "description": "Deep health checks (herdr/git/keys/resonate). --check exits 3 on any failure",
+      "description": "Deep health checks (hc/git/keys/resonate). --check exits 3 on any failure",
       "name": "doctor"
     },
     {
@@ -171,7 +171,7 @@
       "name": "inbox"
     }
   ],
-  "generated_at": "2026-10-23T08:47:44Z",
+  "generated_at": "2026-11-01T06:23:31Z",
   "resources": [
     {
       "description": "List projects known to toron.",
@@ -638,7 +638,7 @@
       "parity": "AM-Rust 38-tool surface"
     },
     {
-      "description": "Resolve a herdr pane_id to the agent name (G9).",
+      "description": "Resolve a pane/terminal id to the agent name (G9).",
       "example": {
         "pane_id": null,
         "project_key": "<string>"

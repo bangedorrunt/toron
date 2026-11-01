@@ -29,7 +29,7 @@ pub const DEFAULT_ENVELOPE_TTL_DAYS: u64 = 90;
 pub struct Config {
     /// Data directory (SQLite index + Git archive root).
     pub data_dir: Option<PathBuf>,
-    /// Default backend (`herdr` | `tmux`). Defaults to `herdr`.
+    /// Default backend (`hc` | `tmux`). Defaults to `hc`.
     pub backend: Option<String>,
     /// Operator key path (ncryptsec; 0600; never the secret itself).
     pub operator_key: Option<PathBuf>,
@@ -115,9 +115,12 @@ impl Config {
         self.comms.as_ref().and_then(|c| c.inbox_log)
     }
 
-    /// Effective backend (defaults to `herdr`).
+    /// Effective backend (defaults to `hc`).
+    ///
+    /// Unknown values are NOT defaulted: `run_backend` fails naming
+    /// `hc|tmux` (clean break, no `herdr` alias).
     pub fn effective_backend(&self) -> &str {
-        self.backend.as_deref().unwrap_or("herdr")
+        self.backend.as_deref().unwrap_or("hc")
     }
 
     /// Effective proof scheme (defaults to `schnorr`).
@@ -295,18 +298,23 @@ mod tests {
     #[test]
     fn project_config_overrides_system_defaults() {
         let dir = scratch("project");
-        let cfg_path = write_config(&dir, ".toron.toml", "backend = \"herdr\"\n");
+        let cfg_path = write_config(&dir, ".toron.toml", "backend = \"hc\"\n");
         let cfg = Config::load(Some(&cfg_path));
-        assert_eq!(cfg.backend.as_deref(), Some("herdr"));
+        assert_eq!(cfg.backend.as_deref(), Some("hc"));
+    }
+
+    #[test]
+    fn default_backend_is_hc() {
+        assert_eq!(Config::default().effective_backend(), "hc");
     }
 
     #[test]
     fn explicit_config_flag_beats_project_and_defaults() {
         let dir = scratch("flag");
         let _project = write_config(&dir, ".toron.toml", "backend = \"tmux\"\n");
-        let flag = write_config(&dir, "override.toml", "backend = \"herdr\"\n");
+        let flag = write_config(&dir, "override.toml", "backend = \"hc\"\n");
         let cfg = Config::load(Some(&flag));
-        assert_eq!(cfg.backend.as_deref(), Some("herdr"));
+        assert_eq!(cfg.backend.as_deref(), Some("hc"));
     }
 
     #[test]
@@ -358,7 +366,7 @@ mod tests {
         let off = write_config(&dir, "off.toml", "[comms]\ninbox_log = false\n");
         assert_eq!(file_comms_inbox_log(&off), Some(false));
         // CONTROL: a config with no `[comms]` leaves the key absent.
-        let none = write_config(&dir, "none.toml", "backend = \"herdr\"\n");
+        let none = write_config(&dir, "none.toml", "backend = \"hc\"\n");
         assert_eq!(file_comms_inbox_log(&none), None);
     }
 

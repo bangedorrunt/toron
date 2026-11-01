@@ -3,7 +3,7 @@
 // Wire contract mirrors herdr protocol v20 (AgentStatus lowercase JSON).
 // ADR-0031 S1: PaneId is opaque (adapters construct via new(), cores only
 // compare/clone/as_str); raw backend status strings enter only through
-// normalize_herdr_status(), never FromStr/.parse() in reducers.
+// normalize_agent_status(), never FromStr/.parse() in reducers.
 
 use std::fmt;
 use std::str::FromStr;
@@ -101,9 +101,12 @@ impl FromStr for AgentStatus {
     /// Lenient by design (ADR-0031 S1): unknown dialect strings map to
     /// `Unknown`, never `Err`. `Unknown` never proves completion, so a new
     /// backend word fails safe. Reducers should still prefer
-    /// [`normalize_herdr_status`] as the single named importer.
+    /// [`normalize_agent_status`] as the single named importer.
+    ///
+    /// Agents read [`AgentStatus::as_str`] for display; reducers call
+    /// [`normalize_agent_status`] for input.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(normalize_herdr_status(s))
+        Ok(normalize_agent_status(s))
     }
 }
 
@@ -116,7 +119,7 @@ impl FromStr for AgentStatus {
 ///
 /// `blocked` is an await-signal, not do-not-disturb; `done` is finished +
 /// unseen, `idle` finished + seen (herdr seen-split, ADR-0031 A2).
-pub fn normalize_herdr_status(raw: &str) -> AgentStatus {
+pub fn normalize_agent_status(raw: &str) -> AgentStatus {
     match raw {
         "idle" => AgentStatus::Idle,
         "working" => AgentStatus::Working,
@@ -184,11 +187,11 @@ mod backend_types_s1 {
 
     #[test]
     fn canonical_five_normalize() {
-        assert_eq!(normalize_herdr_status("working"), AgentStatus::Working);
-        assert_eq!(normalize_herdr_status("blocked"), AgentStatus::Blocked);
-        assert_eq!(normalize_herdr_status("done"), AgentStatus::Done);
-        assert_eq!(normalize_herdr_status("idle"), AgentStatus::Idle);
-        assert_eq!(normalize_herdr_status("unknown"), AgentStatus::Unknown);
+        assert_eq!(normalize_agent_status("working"), AgentStatus::Working);
+        assert_eq!(normalize_agent_status("blocked"), AgentStatus::Blocked);
+        assert_eq!(normalize_agent_status("done"), AgentStatus::Done);
+        assert_eq!(normalize_agent_status("idle"), AgentStatus::Idle);
+        assert_eq!(normalize_agent_status("unknown"), AgentStatus::Unknown);
     }
 
     #[test]
@@ -196,7 +199,7 @@ mod backend_types_s1 {
         // Empty, future-dialect, wrong-case: all fail safe to Unknown.
         for raw in ["", "IDDLE", "Idle", "superlogical:busy", "w1:p1", "done "] {
             assert_eq!(
-                normalize_herdr_status(raw),
+                normalize_agent_status(raw),
                 AgentStatus::Unknown,
                 "raw {raw:?} must not classify as completion"
             );
@@ -235,9 +238,6 @@ mod backend_types_s1 {
         assert_eq!(serde_json::from_str::<PaneId>(&json).expect("parses"), a);
     }
 }
-
-
-
 
 /// Source id for toron mail-identity pane stamps (bd-6f57). Display-only
 /// metadata — never steals lifecycle authority from the multiplexer.
@@ -454,7 +454,6 @@ impl Subscription {
         })
     }
 }
-
 
 pub fn report_metadata_params(pane_id: &str, pin: &str, project: &str, npub: &str) -> Value {
     json!({

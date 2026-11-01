@@ -90,11 +90,11 @@ pub mod types;
 pub mod wait;
 
 pub use error::{BackendError, BackendErrorCode};
+pub use hc::{Client as HcClient, HcBackend, ID_PREFIX};
 pub use types::{
     AgentInfo, AgentStatus, BackendEvent, PaneId, PaneInfo, PromptLanding, SpawnOptions,
-    Subscription, WaitOptions, WorkspaceInfo, normalize_herdr_status,
+    Subscription, WaitOptions, WorkspaceInfo, normalize_agent_status,
 };
-pub use hc::{HcBackend, Client as HcClient, ID_PREFIX};
 pub use wait::{ACTIVITY_GATE_MS, PromptHost, PromptTarget, WaitOutcome, prompt_wait};
 
 use std::time::Duration;
@@ -223,10 +223,7 @@ pub trait Backend: Send + Sync {
     }
 
     // ---- events ----
-    fn subscribe(
-        &self,
-        _filters: &[Subscription],
-    ) -> Result<Box<dyn EventStream>, BackendError> {
+    fn subscribe(&self, _filters: &[Subscription]) -> Result<Box<dyn EventStream>, BackendError> {
         Err(unsupported(self.name(), "subscribe"))
     }
 }

@@ -70,16 +70,16 @@ fn status_human_is_not_json() {
 
 #[test]
 fn env_config_overrides_project_file() {
-    // TORON_BACKEND=herdr must win over a project .toron.toml saying tmux.
+    // TORON_BACKEND=hc must win over a project .toron.toml saying tmux.
     let mut cmd = toron();
     cmd.current_dir("tests")
-        .env("TORON_BACKEND", "herdr")
+        .env("TORON_BACKEND", "hc")
         .args(["status", "--json"]);
     let out = cmd.output().expect("run toron with env");
     assert!(out.status.success());
     let value: serde_json::Value =
         serde_json::from_slice(&out.stdout).expect("status --json must parse");
-    assert_eq!(value["backend"], serde_json::json!("herdr"));
+    assert_eq!(value["backend"], serde_json::json!("hc"));
 }
 
 #[test]
@@ -94,7 +94,7 @@ fn config_show_emits_effective_defaults() {
         "zero egress by default"
     );
     assert_eq!(value["envelope_ttl_days"], serde_json::json!(90));
-    assert_eq!(value["backend"], serde_json::json!("herdr"));
+    assert_eq!(value["backend"], serde_json::json!("hc"));
     assert_eq!(value["federation_auth"], serde_json::json!(false));
     assert_eq!(value["proof_scheme"], serde_json::json!("schnorr"));
 }

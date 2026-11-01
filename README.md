@@ -15,7 +15,7 @@ with no orchestrator in the hot path.
    │                                                                         │
    │   Mailbox (38 tools, 25 resources) ──▶ Nostr events ──▶ Bus            │
    │   Workflow engine (Resonate) ──▶ triggers/actions │                      │
-   │   Backend trait ──▶ herdr (default) / tmux (hold)  ▼                      │
+   │   Backend trait ──▶ hc (default) / tmux (hold)  ▼                      │
    │                                      InProcessBus (tokio broadcast+SQLite)│
    │   toron-mcp server ◀── MCP (stdio/HTTP) ── agents    │ (opt. RelayBus→relay)│
    └───────────▲──────────────────────────────│──────────────────────────────┘
@@ -52,7 +52,7 @@ raises the ceiling with Nostr:
 | Footprint | one process | Postgres + Redis + relay | **one embedded process** |
 
 toron = AM-Rust's tool surface + Nostr's trust/privacy/federation + Resonate's
-durability + flywheel's herdr swarm orchestration.
+durability + flywheel's hc swarm orchestration.
 
 ---
 
@@ -117,7 +117,7 @@ human-auditable archive; two-source disaster recovery (Git + relay replay).
   intent TTL + must-convert; request-release negotiation + escalation. The
   atomic conflict-check floor is NEVER removed.
 - **Ephemeral presence** — agents broadcast working-state (`20001`) on the bus;
-  real-time, uniform, not herdr-polling.
+  real-time, uniform, not poll-based.
 - **Persona packs** — versioned system-prompt/persona on the agent profile →
   reproducible, swappable behavior.
 
@@ -129,7 +129,7 @@ visibility + the channel-as-PR UX. Kind numbers reserved.
 
 ### Backend abstraction
 
-- **herdr** (default) — JSON-RPC over Unix socket; spawn/prompt/wait/read/
+- **hc** (default) — OpenRPC over a Unix socket plus OSC 7501 program status; spawn/prompt/wait/read/
   send_keys/events. Shared client with [`flywheel`](../flywheel).
 - **tmux** (on hold) — same `Backend` trait; tmux IPC control.
 
@@ -177,7 +177,7 @@ visibility + the channel-as-PR UX. Kind numbers reserved.
 ```
 
 flywheel's daily loop (P1→P8) becomes a toron-workflow: it watches @mentions +
-`br` beads, dispatches jobs, monitors herdr
+`br` beads, dispatches jobs, monitors hc
 agent states, and respawns on context exhaustion — all as bus events.
 
 ### Reactive collaboration (how agents react)
@@ -206,7 +206,7 @@ CI gate: P1 green tags v1; P2 green tags Phase 2.
 ### Prerequisites
 
 - Rust (stable), Cargo.
-- A running **herdr** server (`herdr.sock`) for the default backend. `flywheel deps` checks it.
+- A running **hc** server (socket under `herdr-core/`) for the default backend. `flywheel deps` checks it.
 - (Optional) a **Resonate** server for durable workflows (Phase 2).
 
 ### Build
@@ -330,7 +330,7 @@ directly; the search layer never calls the archive; etc.
 
 - **Phase 1 (v1)** — AM-Rust parity + integrated mode + core kind vocabulary.
   Ships the 38 tools + 25 resources, in-process bus, Git+SQLite projection (dual-sink,
-  git-first per G11), herdr backend,
+  git-first per G11), hc backend,
   flywheel embedding.
 - **Phase 2** (ordered: workflow+@mention → channels → persona/presence) —
   `toron-workflow` (Resonate) + @mention dispatch + job lifecycle (`43001`→`43002`→`43003`→`43004`),
@@ -382,7 +382,7 @@ Version bumps derive from commit types: `feat` → minor, `fix`/`perf` → patch
 - Prior art (Nostr-native hive-mind): [`block/buzz`](https://github.com/block/buzz)
 - Nostr protocol: [nostr.how](https://nostr.how/en/the-protocol) · [NIPs](https://github.com/nostr-protocol/nips) (01/09/17/25/29/40/44/49/50/59)
 - Rust SDK: [`rust-nostr/nostr`](https://github.com/rust-nostr/nostr) (= `nostrdevkit/nostr`)
-- Backend: [herdr](https://herdr.dev/docs/preview/) · consumer: [`flywheel`](../flywheel)
+- Backend: [hc](https://herdr.dev/core/) · consumer: [`flywheel`](../flywheel)
 - Durability: [Resonate](https://resonatehq.io)
 
 ## License

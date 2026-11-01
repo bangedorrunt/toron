@@ -43,7 +43,7 @@
 //!
 //! [`mail_pane_id_for_name`] encodes that policy as a pure function.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -57,8 +57,8 @@ use crate::osc7501::{Board, FoldPolicy, HcStatusView, fold};
 
 use super::error::{BackendError, BackendErrorCode};
 use super::types::{
-    AgentInfo, AgentStatus, BackendEvent, PaneId, PaneInfo, PromptLanding, Subscription,
-    WaitOptions, normalize_herdr_status,
+    AgentInfo, AgentStatus, BackendEvent, PaneId, PaneInfo, PromptLanding, Subscription, TOKEN_PIN,
+    WaitOptions, WorkspaceInfo, normalize_agent_status,
 };
 use super::{Backend, EventStream};
 
@@ -85,9 +85,52 @@ const REQUIRED_METHODS: &[&str] = &[
     "terminal.read",
     "terminal.kill",
     "terminal.rm",
+    "terminal.label",
     "events.subscribe",
     "rpc.discover",
 ];
+
+/// POSIX shell-quote one word: bare when every byte is shell-safe,
+/// single-quoted otherwise. Keeps a typed launch line one line.
+fn shell_quote(word: &str) -> String {
+    let safe = !word.is_empty()
+        && word.bytes().all(|b| {
+            b.is_ascii_alphanumeric()
+                || matches!(
+                    b,
+                    b'_' | b'-' | b'.' | b'/' | b',' | b':' | b'=' | b'+' | b'@'
+                )
+        });
+    if safe {
+        return word.to_string();
+    }
+    format!("'{}'", word.replace('\'', "'\\''"))
+}
+
+/// Join words into one shell line, quoting only what needs it.
+fn shell_join(words: &[String]) -> String {
+    words
+        .iter()
+        .map(|w| shell_quote(w))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Env forwarded when this process creates a shell terminal: connection
+/// facts (which hc to talk to), never identity. `AGENT_NAME` is
+/// deliberately NOT inherited — the pane is for a new agent, and stamping
+/// the creator's pin onto it would mislabel every later lookup.
+fn spawn_env() -> Option<BTreeMap<String, String>> {
+    let mut env = BTreeMap::new();
+    for key in ["HC_SOCKET_PATH", "HC_SESSION"] {
+        if let Ok(v) = std::env::var(key)
+            && !v.is_empty()
+        {
+            env.insert(key.to_string(), v);
+        }
+    }
+    (!env.is_empty()).then_some(env)
+}
 
 /// Strip [`ID_PREFIX`] when present; otherwise return `id` unchanged
 /// (already a bare hc address).
@@ -135,10 +178,8 @@ pub fn mail_pane_id_for_name(
 
     // Prefer an explicit id query (`hc:t7` or bare address equal to a row).
     let want_addr = strip_id_prefix(q);
-    let id_query = q.starts_with(ID_PREFIX)
-        || named
-            .iter()
-            .any(|(_, addr)| strip_id_prefix(addr) == q);
+    let id_query =
+        q.starts_with(ID_PREFIX) || named.iter().any(|(_, addr)| strip_id_prefix(addr) == q);
     if id_query {
         let mut hits = named
             .iter()
@@ -163,6 +204,41 @@ pub fn mail_pane_id_for_name(
         1 => Ok(hits.into_iter().next().expect("len 1")),
         n => Err(MailNameError::Duplicate { count: n }),
     }
+}
+
+/// Walk `address` to its root ancestor through the parent map (flywheel
+/// maps a workspace to a root shell terminal and filters agents by
+/// `workspace_id`). Unknown or missing parents stop the walk — the
+/// terminal is its own root. Bounded by map size, so cycles break.
+fn root_address(
+    parents: &BTreeMap<String, String>,
+    known: &BTreeSet<String>,
+    address: &str,
+) -> String {
+    // A root is not a map key (it has no parent), so the walk stops on an
+    // unknown parent — not on a missing key. Bounded by the terminal count,
+    // so a parent cycle breaks instead of looping.
+    let mut addr = address.to_string();
+    for _ in 0..known.len().saturating_add(1) {
+        match parents.get(&addr) {
+            Some(p) if known.contains(p) => addr = p.clone(),
+            _ => break,
+        }
+    }
+    addr
+}
+
+/// Parent map for one `terminal.list` snapshot: bare address -> bare
+/// parent address.
+fn parent_map(terminals: &[Terminal]) -> BTreeMap<String, String> {
+    terminals
+        .iter()
+        .filter_map(|t| {
+            t.parent
+                .as_deref()
+                .map(|p| (t.address.clone(), strip_id_prefix(p).to_string()))
+        })
+        .collect()
 }
 
 /// Display name for mail maps: keep the terminal name only when it is
@@ -566,10 +642,7 @@ impl Client {
             json!({ "generation": HC_GENERATION, "framed": false }),
         )?;
         serde_json::from_value(result).map_err(|e| {
-            BackendError::new(
-                BackendErrorCode::Malformed,
-                format!("hello result: {e}"),
-            )
+            BackendError::new(BackendErrorCode::Malformed, format!("hello result: {e}"))
         })
     }
 
@@ -580,10 +653,7 @@ impl Client {
             .cloned()
             .unwrap_or(Value::Array(vec![]));
         serde_json::from_value(terminals).map_err(|e| {
-            BackendError::new(
-                BackendErrorCode::Malformed,
-                format!("terminal.list: {e}"),
-            )
+            BackendError::new(BackendErrorCode::Malformed, format!("terminal.list: {e}"))
         })
     }
 
@@ -603,6 +673,20 @@ impl Client {
         name: Option<&str>,
         cwd: Option<&str>,
     ) -> Result<Terminal, BackendError> {
+        self.terminal_run_with_env(argv, name, cwd, None, None)
+    }
+
+    /// Run a terminal, optionally under a parent and with extra env.
+    /// Empty `argv` runs that machine's own shell. Env carries connection
+    /// facts (`HC_SOCKET_PATH`/`HC_SESSION`); identity rides on labels.
+    pub fn terminal_run_with_env(
+        &self,
+        argv: &[String],
+        name: Option<&str>,
+        cwd: Option<&str>,
+        parent: Option<&str>,
+        env: Option<&BTreeMap<String, String>>,
+    ) -> Result<Terminal, BackendError> {
         let mut params = json!({ "argv": argv });
         if let Some(name) = name {
             params["name"] = json!(name);
@@ -610,6 +694,16 @@ impl Client {
         if let Some(cwd) = cwd {
             params["cwd"] = json!(cwd);
         }
+        if let Some(parent) = parent {
+            params["parent"] = json!(strip_id_prefix(parent));
+        }
+        if let Some(env) = env {
+            params["env"] = json!(env);
+        }
+        // Flywheel panes are independent peers, never a process group:
+        // hc kills a child when its parent program ends unless told not
+        // to, so shell roots/children leave the default lifecycle.
+        params["no_parent"] = json!(true);
         // Background by default so the RPC returns the terminal object.
         params["wait"] = json!(false);
         let result = self.call_coded("terminal.run", params)?;
@@ -628,9 +722,10 @@ impl Client {
             "terminal": strip_id_prefix(terminal),
             "text": text,
         });
+        // Schema: `wait` is BOOL, `timeout` is SECONDS (number).
         if let Some(ms) = wait_ms {
-            params["wait"] = json!({ "timeout_ms": ms });
-            params["timeout_ms"] = json!(ms);
+            params["wait"] = json!(true);
+            params["timeout"] = json!(ms as f64 / 1000.0);
         }
         self.call_coded("terminal.send", params)
     }
@@ -651,8 +746,27 @@ impl Client {
         timeout_ms: Option<u64>,
     ) -> Result<Value, BackendError> {
         let mut params = json!({ "terminal": strip_id_prefix(terminal) });
+        // Schema: `timeout` is SECONDS (number).
         if let Some(ms) = timeout_ms {
-            params["timeout_ms"] = json!(ms);
+            params["timeout"] = json!(ms as f64 / 1000.0);
+        }
+        self.call_coded("terminal.wait", params)
+    }
+
+    /// Wait until post-call output contains `output` (plain text), or the
+    /// terminal blocks, errors, or exits (`terminal.wait` `output` needle).
+    pub fn terminal_wait_output(
+        &self,
+        terminal: &str,
+        output: &str,
+        timeout_ms: Option<u64>,
+    ) -> Result<Value, BackendError> {
+        let mut params = json!({
+            "terminal": strip_id_prefix(terminal),
+            "output": output,
+        });
+        if let Some(ms) = timeout_ms {
+            params["timeout"] = json!(ms as f64 / 1000.0);
         }
         self.call_coded("terminal.wait", params)
     }
@@ -684,23 +798,33 @@ impl Client {
         )
     }
 
-    /// hc has no `pane.report_metadata` (labels-only mail identity). Callers
-    /// such as CLI bootstrap stamp must treat this as unsupported and skip —
-    /// never invent a stamp from argv/cwd.
-    pub fn pane_report_metadata(
+    /// Set labels on a terminal and return the updated Terminal
+    /// (mail-identity stamp: `toron_pin` / `toron_project` / `toron_npub`).
+    pub fn terminal_label(
         &self,
-        _pane_id: &str,
-        _pin: &str,
-        _project: &str,
-        _npub: &str,
-    ) -> Result<Value, BackendError> {
-        Err(BackendError::unsupported(
-            "hc has no pane.report_metadata; mail identity is labels-only",
-        ))
+        terminal: &str,
+        labels: &BTreeMap<String, String>,
+    ) -> Result<Terminal, BackendError> {
+        let result = self.call_coded(
+            "terminal.label",
+            json!({
+                "terminal": strip_id_prefix(terminal),
+                "labels": labels,
+            }),
+        )?;
+        serde_json::from_value(result).map_err(|e| {
+            BackendError::new(BackendErrorCode::Malformed, format!("terminal.label: {e}"))
+        })
     }
 
     pub fn agent_list(&self) -> Result<Vec<AgentInfo>, BackendError> {
         let terminals = self.terminal_list(false)?;
+        // Flywheel maps a workspace to a root shell terminal and filters
+        // agents by `workspace_id`: every terminal carries its root
+        // ancestor's prefixed address (a terminal with no parent is its
+        // own root).
+        let parents = parent_map(&terminals);
+        let known: BTreeSet<String> = terminals.iter().map(|t| t.address.clone()).collect();
         let names: Vec<Option<String>> = terminals.iter().map(|t| t.name.clone()).collect();
         let name_refs: Vec<Option<&str>> = names.iter().map(|n| n.as_deref()).collect();
         Ok(terminals
@@ -708,29 +832,39 @@ impl Client {
             .enumerate()
             .map(|(i, t)| {
                 let mail_name = unique_mail_name(name_refs[i], &name_refs).map(str::to_string);
-                t.to_agent_info_with_mail_name(self.fold_policy, mail_name)
+                let mut info = t.to_agent_info_with_mail_name(self.fold_policy, mail_name);
+                info.workspace_id = prefix_id(&root_address(&parents, &known, &t.address));
+                info
             })
             .collect())
     }
 
     pub fn agent_get(&self, target: &str) -> Result<AgentInfo, BackendError> {
-        Ok(self
-            .terminal_get(target)?
-            .to_agent_info(self.fold_policy))
+        Ok(self.terminal_get(target)?.to_agent_info(self.fold_policy))
     }
 
     pub fn pane_list(&self) -> Result<Vec<PaneInfo>, BackendError> {
-        let terminals = self.terminal_list(false)?;
+        Ok(self.pane_rows(self.terminal_list(false)?))
+    }
+
+    /// Build pane rows from one `terminal.list` snapshot: unique mail
+    /// names plus each terminal's root-ancestor workspace id.
+    fn pane_rows(&self, terminals: Vec<Terminal>) -> Vec<PaneInfo> {
+        let parents = parent_map(&terminals);
+        let known: BTreeSet<String> = terminals.iter().map(|t| t.address.clone()).collect();
         let names: Vec<Option<String>> = terminals.iter().map(|t| t.name.clone()).collect();
         let name_refs: Vec<Option<&str>> = names.iter().map(|n| n.as_deref()).collect();
-        Ok(terminals
+        terminals
             .into_iter()
             .enumerate()
             .map(|(i, t)| {
                 let mail_name = unique_mail_name(name_refs[i], &name_refs).map(str::to_string);
-                t.to_pane_info_with_mail_name(self.fold_policy, mail_name)
+                let ws = prefix_id(&root_address(&parents, &known, &t.address));
+                let mut info = t.to_pane_info_with_mail_name(self.fold_policy, mail_name);
+                info.workspace_id = ws;
+                info
             })
-            .collect())
+            .collect()
     }
 
     /// Subscribe; returns snapshot terminals as status events, then a
@@ -819,15 +953,12 @@ impl Client {
 }
 
 fn socket_timeout_from_params(params: &Value) -> Duration {
+    // Schema `timeout` is SECONDS (number); size the socket deadline from
+    // it so the socket loses the race cleanly above the server's check-in.
     let ms = params
-        .get("timeout_ms")
-        .and_then(Value::as_u64)
-        .or_else(|| {
-            params
-                .get("wait")
-                .and_then(|w| w.get("timeout_ms"))
-                .and_then(Value::as_u64)
-        })
+        .get("timeout")
+        .and_then(Value::as_f64)
+        .map(|s| (s * 1000.0) as u64)
         .unwrap_or(DEFAULT_RPC_TIMEOUT_MS);
     Duration::from_millis(ms.saturating_add(RPC_TIMEOUT_MARGIN_MS))
 }
@@ -856,11 +987,13 @@ fn map_wire_error(err: &Value) -> BackendError {
 }
 
 fn parse_code(code: &str) -> BackendErrorCode {
+    // Classify on the hc `kind`, never message text. `blocked` and
+    // `status_mismatch` are load-bearing: flywheel's send ladder branches
+    // on AgentBlocked / AgentNotIdle. Everything else stays opaque.
     match code {
         "timeout" => BackendErrorCode::Timeout,
-        "unsupported_generation" | "missing_method" => {
-            BackendErrorCode::Other(code.to_string())
-        }
+        "blocked" => BackendErrorCode::AgentBlocked,
+        "status_mismatch" => BackendErrorCode::AgentNotIdle,
         other => BackendErrorCode::Other(other.to_string()),
     }
 }
@@ -970,11 +1103,93 @@ impl Backend for HcBackend {
         "hc"
     }
 
-    fn pane_list(&self, _workspace_id: Option<&str>) -> Result<Vec<PaneInfo>, BackendError> {
+    fn workspace_list(&self) -> Result<Vec<WorkspaceInfo>, BackendError> {
+        // hc has no workspaces: always empty, so callers proceed to
+        // `workspace_create` (which runs a shell and names it by address).
+        Ok(vec![])
+    }
+
+    fn workspace_create(&self, label: Option<&str>) -> Result<WorkspaceInfo, BackendError> {
+        // A workspace IS a shell terminal here: empty argv runs that
+        // machine's own shell, and the workspace id is its prefixed
+        // address — the same form `agent_list`/`pane_list` report as
+        // `workspace_id`, so the two can never disagree.
+        let term =
+            self.client
+                .terminal_run_with_env(&[], None, None, None, spawn_env().as_ref())?;
+        let workspace_id = prefix_id(&term.address);
+        Ok(WorkspaceInfo {
+            workspace_id: workspace_id.clone(),
+            number: 0,
+            label: label.unwrap_or(workspace_id.as_str()).to_string(),
+            focused: false,
+            pane_count: 1,
+            tab_count: 0,
+            active_tab_id: String::new(),
+            agent_status: term.agent_status(self.client.fold_policy),
+            cwd: term.cwd.clone(),
+        })
+    }
+
+    fn pane_split(
+        &self,
+        parent_pane_id: &str,
+        _direction: &str,
+        cwd: Option<&str>,
+    ) -> Result<PaneInfo, BackendError> {
+        // hc has no splits or directions: a shell child of the parent
+        // terminal (independent peer lifecycle via `no_parent`).
+        Ok(self
+            .client
+            .terminal_run_with_env(&[], None, cwd, Some(parent_pane_id), spawn_env().as_ref())?
+            .to_pane_info(self.client.fold_policy))
+    }
+
+    fn pane_list(&self, workspace_id: Option<&str>) -> Result<Vec<PaneInfo>, BackendError> {
+        // hc has no hierarchy: a workspace id IS a root terminal address,
+        // and the workspace is the root PLUS its descendants (flywheel's
+        // `cmd_recover` lists the workspace to decide which registered
+        // panes still exist — root-only would report every child gone).
+        if let Some(ws) = workspace_id {
+            let want = strip_id_prefix(ws);
+            let hits: Vec<PaneInfo> = self
+                .client
+                .pane_rows(self.client.terminal_list(false)?)
+                .into_iter()
+                .filter(|p| strip_id_prefix(&p.workspace_id) == want)
+                .collect();
+            if !hits.is_empty() {
+                return Ok(hits);
+            }
+            // Unknown address: let `terminal.get` surface the
+            // authoritative error.
+            return Ok(vec![
+                self.client
+                    .terminal_get(ws)?
+                    .to_pane_info(self.client.fold_policy),
+            ]);
+        }
         self.client.pane_list()
     }
 
+    fn pane_run(&self, pane_id: &str, command: &str) -> Result<(), BackendError> {
+        // `terminal.send` pastes then submits with Enter (schema).
+        let _ = self.client.terminal_send(pane_id, command, None)?;
+        Ok(())
+    }
+
+    fn pane_wait_output(
+        &self,
+        pane_id: &str,
+        needle: &str,
+        timeout_ms: u64,
+    ) -> Result<Value, BackendError> {
+        self.client
+            .terminal_wait_output(pane_id, needle, Some(timeout_ms))
+    }
+
     fn pane_close(&self, pane_id: &str) -> Result<(), BackendError> {
+        // keep: kill the program, then remove the finished terminal.
         let _ = self.client.terminal_kill(pane_id)?;
         let _ = self.client.terminal_rm(pane_id);
         Ok(())
@@ -986,29 +1201,33 @@ impl Backend for HcBackend {
 
     fn agent_start(
         &self,
-        name: &str,
+        _name: &str,
         kind: &str,
-        _pane_id: &str,
+        pane_id: &str,
         args: &[String],
     ) -> Result<AgentInfo, BackendError> {
-        let mut argv = Vec::with_capacity(1 + args.len());
-        argv.push(kind.to_string());
-        argv.extend(args.iter().cloned());
-        Ok(self
-            .client
-            .terminal_run(&argv, Some(name), None)?
-            .to_agent_info(self.client.fold_policy))
+        // hc has no pane hierarchy: the pane already exists (flywheel
+        // split a shell and waited for its prompt), so TYPE the launch
+        // line into it — never `terminal.run` a second terminal.
+        let mut words = Vec::with_capacity(1 + args.len());
+        words.push(kind.to_string());
+        words.extend(args.iter().cloned());
+        let line = shell_join(&words);
+        self.client.terminal_send(pane_id, &line, None)?;
+        self.client.agent_get(pane_id)
     }
 
     fn agent_rename(&self, target: &str, new_name: Option<&str>) -> Result<(), BackendError> {
         let Some(name) = new_name else {
             return Ok(());
         };
+        // Mail routing reads `toron_pin` (`pane_token_pin`), so a rename
+        // must move the pin label — `name` stays for display.
         self.client.call_coded(
             "terminal.label",
             json!({
                 "terminal": strip_id_prefix(target),
-                "labels": { "name": name },
+                "labels": { "name": name, TOKEN_PIN: name },
             }),
         )?;
         Ok(())
@@ -1035,11 +1254,8 @@ impl Backend for HcBackend {
                 let status = val
                     .get("status")
                     .and_then(Value::as_str)
-                    .map(normalize_herdr_status);
-                Ok(PromptLanding {
-                    status,
-                    code: None,
-                })
+                    .map(normalize_agent_status);
+                Ok(PromptLanding { status, code: None })
             }
             Err(err) => Ok(PromptLanding {
                 status: None,
@@ -1067,33 +1283,93 @@ impl Backend for HcBackend {
         Ok(())
     }
 
-    fn subscribe(
-        &self,
-        filters: &[Subscription],
-    ) -> Result<Box<dyn EventStream>, BackendError> {
-        let terminal = filters.first().map(|f| strip_id_prefix(&f.pane_id));
-        let (snapshot, stream) = self.client.subscribe_terminals(terminal)?;
+    fn subscribe(&self, filters: &[Subscription]) -> Result<Box<dyn EventStream>, BackendError> {
+        // hc `events.subscribe` takes ONE terminal (or none = all), but the
+        // trait carries one filter per pane: subscribe to everything, then
+        // filter both the snapshot and the live stream to the requested
+        // set. Empty filters = all (no filtering).
+        let wanted: Option<BTreeSet<String>> = (!filters.is_empty()).then(|| {
+            filters
+                .iter()
+                .map(|f| strip_id_prefix(&f.pane_id).to_string())
+                .collect()
+        });
+        let (snapshot, stream) = self.client.subscribe_terminals(None)?;
         // Emit snapshot as status-changed events before returning the live stream.
+        let pending: VecDeque<BackendEvent> = snapshot
+            .into_iter()
+            .filter(|t| {
+                wanted
+                    .as_ref()
+                    .is_none_or(|set| set.contains(strip_id_prefix(&t.address)))
+            })
+            .map(|t| {
+                let status = t.agent_status(self.client.fold_policy);
+                BackendEvent::AgentStatusChanged {
+                    pane: PaneId::new(prefix_id(&t.address)),
+                    agent: t.name.clone(),
+                    status,
+                }
+            })
+            .collect();
         Ok(Box::new(SnapshotThenStream {
-            pending: snapshot
-                .into_iter()
-                .map(|t| {
-                    let status = t.agent_status(self.client.fold_policy);
-                    BackendEvent::AgentStatusChanged {
-                        pane: PaneId::new(prefix_id(&t.address)),
-                        agent: t.name.clone(),
-                        status,
-                    }
-                })
-                .collect(),
-            inner: stream,
+            pending,
+            inner: FilteredStream {
+                inner: Box::new(stream),
+                wanted,
+            },
         }))
+    }
+}
+
+/// The pane an event belongs to, if it is pane-scoped. `EventsLost` and
+/// `Raw` are stream-level: they always pass the filter.
+fn event_pane(ev: &BackendEvent) -> Option<&str> {
+    match ev {
+        BackendEvent::AgentStatusChanged { pane, .. } => Some(pane.as_str()),
+        BackendEvent::AgentDetected { pane, .. } => Some(pane.as_str()),
+        BackendEvent::PaneExited { pane } => Some(pane.as_str()),
+        BackendEvent::EventsLost | BackendEvent::Raw(_) => None,
+    }
+}
+
+/// Drops pane-scoped events outside the subscribed set (`None` = all).
+/// hc subscribes per-connection, so one connection fans out to many panes
+/// and the filter restores per-pane routing.
+struct FilteredStream {
+    inner: Box<dyn EventStream>,
+    wanted: Option<BTreeSet<String>>,
+}
+
+impl EventStream for FilteredStream {
+    fn read_event(&mut self) -> Result<Option<BackendEvent>, BackendError> {
+        loop {
+            match self.inner.read_event()? {
+                None => return Ok(None),
+                Some(ev) => {
+                    let keep = match event_pane(&ev) {
+                        None => true,
+                        Some(pane) => self
+                            .wanted
+                            .as_ref()
+                            .is_none_or(|set| set.contains(strip_id_prefix(pane))),
+                    };
+                    if keep {
+                        return Ok(Some(ev));
+                    }
+                }
+            }
+        }
+    }
+
+    fn set_read_timeout(&mut self, timeout: Option<Duration>) -> Result<(), BackendError> {
+        self.inner.set_read_timeout(timeout)
     }
 }
 
 struct SnapshotThenStream {
     pending: VecDeque<BackendEvent>,
-    inner: HcEventStream,
+    inner: FilteredStream,
 }
 
 impl EventStream for SnapshotThenStream {
@@ -1122,22 +1398,40 @@ mod tests {
         _dir: tempfile::TempDir,
         _methods: Arc<Mutex<Vec<String>>>,
         _terminals: Arc<Mutex<Vec<Value>>>,
+        requests: Arc<Mutex<Vec<(String, Value)>>>,
     }
 
     impl FakeHc {
+        /// Requests the fake received, in order (method + params).
+        fn requests(&self) -> Vec<(String, Value)> {
+            self.requests.lock().expect("lock").clone()
+        }
+
+        /// Params of every call to one method, in order.
+        fn requests_for(&self, method: &str) -> Vec<Value> {
+            self.requests()
+                .into_iter()
+                .filter(|(m, _)| m == method)
+                .map(|(_, p)| p)
+                .collect()
+        }
+
         fn spawn(methods: Vec<String>, terminals: Vec<Value>) -> Self {
             let dir = tempfile::tempdir().expect("tmpdir");
             let socket = dir.path().join("test.sock");
             let methods = Arc::new(Mutex::new(methods));
             let terminals = Arc::new(Mutex::new(terminals));
+            let requests = Arc::new(Mutex::new(Vec::new()));
             let listener = UnixListener::bind(&socket).expect("bind");
             let methods_c = Arc::clone(&methods);
             let terminals_c = Arc::clone(&terminals);
+            let requests_c = Arc::clone(&requests);
             thread::spawn(move || {
                 while let Ok((stream, _)) = listener.accept() {
                     let methods = Arc::clone(&methods_c);
                     let terminals = Arc::clone(&terminals_c);
-                    thread::spawn(move || serve_conn(stream, methods, terminals));
+                    let requests = Arc::clone(&requests_c);
+                    thread::spawn(move || serve_conn(stream, methods, terminals, requests));
                 }
             });
             // Give the listener a tick.
@@ -1147,6 +1441,7 @@ mod tests {
                 _dir: dir,
                 _methods: methods,
                 _terminals: terminals,
+                requests,
             }
         }
     }
@@ -1155,6 +1450,7 @@ mod tests {
         stream: UnixStream,
         methods: Arc<Mutex<Vec<String>>>,
         terminals: Arc<Mutex<Vec<Value>>>,
+        requests: Arc<Mutex<Vec<(String, Value)>>>,
     ) {
         let mut reader = BufReader::new(stream.try_clone().expect("clone"));
         let mut writer = stream;
@@ -1169,7 +1465,12 @@ mod tests {
             };
             let id = req.get("id").cloned().unwrap_or(json!(null));
             let method = req.get("method").and_then(Value::as_str).unwrap_or("");
-            let result = match method {
+            let method = method.to_string();
+            requests.lock().expect("lock").push((
+                method.clone(),
+                req.get("params").cloned().unwrap_or(Value::Null),
+            ));
+            let result = match method.as_str() {
                 "hello" => {
                     let m = methods.lock().expect("lock").clone();
                     json!({
@@ -1200,7 +1501,16 @@ mod tests {
                         .unwrap_or(json!({"address": term}))
                 }
                 "terminal.send" | "terminal.keys" | "terminal.read" | "terminal.wait"
-                | "terminal.rm" | "terminal.label" => json!({ "ok": true, "turn": 1 }),
+                | "terminal.rm" => json!({ "ok": true, "turn": 1 }),
+                "terminal.label" => {
+                    // Echo the labels back as a Terminal (schema result).
+                    let term = req
+                        .pointer("/params/terminal")
+                        .and_then(Value::as_str)
+                        .unwrap_or("t1");
+                    let labels = req.pointer("/params/labels").cloned().unwrap_or(json!({}));
+                    json!({ "address": term, "labels": labels })
+                }
                 "terminal.kill" => {
                     let term = req
                         .pointer("/params/terminal")
@@ -1302,8 +1612,14 @@ mod tests {
         let fake = FakeHc::spawn(full_methods(), vec![sample_terminal()]);
         let client = Client::connect(Some(fake.socket.to_str().unwrap())).expect("connect");
         let term = client.terminal_get("t7").expect("get");
-        assert_eq!(term.agent_status(FoldPolicy::Attention), AgentStatus::Blocked);
-        assert_eq!(term.agent_status(FoldPolicy::RootWins), AgentStatus::Working);
+        assert_eq!(
+            term.agent_status(FoldPolicy::Attention),
+            AgentStatus::Blocked
+        );
+        assert_eq!(
+            term.agent_status(FoldPolicy::RootWins),
+            AgentStatus::Working
+        );
         let info = client.agent_get("hc:t7").expect("agent");
         assert_eq!(info.pane_id, "hc:t7");
         assert_eq!(info.agent_status, AgentStatus::Blocked);
@@ -1376,38 +1692,115 @@ mod tests {
         }
     }
 
+    /// In-memory [`EventStream`] for filter tests: replays a fixed queue.
+    struct StubStream {
+        events: VecDeque<BackendEvent>,
+    }
+
+    impl EventStream for StubStream {
+        fn read_event(&mut self) -> Result<Option<BackendEvent>, BackendError> {
+            Ok(self.events.pop_front())
+        }
+    }
+
+    fn changed(pane: &str) -> BackendEvent {
+        BackendEvent::AgentStatusChanged {
+            pane: PaneId::new(pane.to_string()),
+            agent: None,
+            status: AgentStatus::Working,
+        }
+    }
+
     #[test]
-    fn workspace_methods_are_unsupported() {
+    fn subscribe_filters_snapshot_and_stream_to_the_requested_panes() {
+        // One connection fans out to every terminal; the filter restores
+        // per-pane routing on both the snapshot and the live stream.
+        let mut stream = FilteredStream {
+            inner: Box::new(StubStream {
+                events: VecDeque::from([
+                    changed("hc:t1"),
+                    changed("hc:t2"),
+                    BackendEvent::PaneExited {
+                        pane: PaneId::new("hc:t2".to_string()),
+                    },
+                    BackendEvent::EventsLost,
+                    BackendEvent::Raw("noise".into()),
+                ]),
+            }),
+            wanted: Some(BTreeSet::from(["t1".to_string()])),
+        };
+        let mut got = Vec::new();
+        while let Some(ev) = stream.read_event().expect("read") {
+            got.push(ev);
+        }
+        assert_eq!(
+            got,
+            [
+                changed("hc:t1"),
+                BackendEvent::EventsLost,
+                BackendEvent::Raw("noise".into())
+            ]
+        );
+        // No filter (empty trait filters) passes everything.
+        let mut stream = FilteredStream {
+            inner: Box::new(StubStream {
+                events: VecDeque::from([changed("hc:t2")]),
+            }),
+            wanted: None,
+        };
+        assert_eq!(stream.read_event().expect("read"), Some(changed("hc:t2")));
+    }
+
+    #[test]
+    fn backend_subscribe_emits_only_the_subscribed_pane_snapshot() {
+        let other = json!({ "address": "t8", "status": { "state": "working" } });
+        let fake = FakeHc::spawn(full_methods(), vec![sample_terminal(), other]);
+        let backend = HcBackend::connect(Some(fake.socket.to_str().unwrap())).expect("backend");
+        let mut stream = backend
+            .subscribe(&[Subscription::agent_status_changed("hc:t7".into())])
+            .expect("sub");
+        // hc takes no per-pane filter: one unscoped subscribe upstream...
+        let subs = fake.requests_for("events.subscribe");
+        assert_eq!(subs.len(), 1);
+        assert!(subs[0].get("terminal").is_none());
+        // ...and the snapshot carries only the requested pane.
+        let ev = stream.read_event().expect("ev").expect("some");
+        match ev {
+            BackendEvent::AgentStatusChanged { pane, status, .. } => {
+                assert_eq!(pane.as_str(), "hc:t7");
+                assert_eq!(status, AgentStatus::Blocked);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        // Nothing else pending: the t8 snapshot row was filtered out.
+        stream
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .expect("timeout");
+        let err = stream.read_event().expect_err("no more events");
+        assert_eq!(err.code(), &BackendErrorCode::Timeout);
+    }
+
+    #[test]
+    fn workspace_list_is_empty_and_create_names_a_shell_by_its_address() {
+        // hc has no workspaces: the list is always empty (so callers
+        // proceed to create), and create runs a shell named by address.
         let fake = FakeHc::spawn(full_methods(), vec![]);
         let backend = HcBackend::connect(Some(fake.socket.to_str().unwrap())).expect("backend");
-        let err = backend.workspace_list().expect_err("unsupported");
-        assert_eq!(err.code(), &BackendErrorCode::Unsupported);
+        let list = backend.workspace_list().expect("list");
+        assert!(list.is_empty());
     }
 
     #[test]
     fn mail_name_unique_resolves_and_duplicate_is_refused() {
-        let named = [
-            (Some("review"), "t1"),
-            (Some("fix"), "t2"),
-            (None, "t3"),
-        ];
-        assert_eq!(
-            mail_pane_id_for_name(&named, "review").unwrap(),
-            "hc:t1"
-        );
-        assert_eq!(
-            mail_pane_id_for_name(&named, "hc:t3").unwrap(),
-            "hc:t3"
-        );
+        let named = [(Some("review"), "t1"), (Some("fix"), "t2"), (None, "t3")];
+        assert_eq!(mail_pane_id_for_name(&named, "review").unwrap(), "hc:t1");
+        assert_eq!(mail_pane_id_for_name(&named, "hc:t3").unwrap(), "hc:t3");
         assert_eq!(
             mail_pane_id_for_name(&named, "missing"),
             Err(MailNameError::Missing)
         );
         // Unnamed terminal is not reachable by a made-up name; id still works.
-        assert_eq!(
-            mail_pane_id_for_name(&named, "t3").unwrap(),
-            "hc:t3"
-        );
+        assert_eq!(mail_pane_id_for_name(&named, "t3").unwrap(), "hc:t3");
 
         let dup = [(Some("twin"), "t1"), (Some("twin"), "t2"), (None, "t3")];
         assert_eq!(
@@ -1420,7 +1813,10 @@ mod tests {
         let names = [Some("twin"), Some("twin"), None];
         assert_eq!(unique_mail_name(Some("twin"), &names), None);
         assert_eq!(unique_mail_name(None, &names), None);
-        assert_eq!(unique_mail_name(Some("solo"), &[Some("solo"), None]), Some("solo"));
+        assert_eq!(
+            unique_mail_name(Some("solo"), &[Some("solo"), None]),
+            Some("solo")
+        );
     }
 
     #[test]
@@ -1429,6 +1825,222 @@ mod tests {
         assert_eq!(strip_id_prefix("t7"), "t7");
         assert_eq!(prefix_id("t7"), "hc:t7");
         assert_eq!(prefix_id("hc:t7"), "hc:t7");
+    }
+
+    #[test]
+    fn shell_quote_leaves_safe_words_bare_and_quotes_the_rest() {
+        assert_eq!(shell_quote("pi"), "pi");
+        assert_eq!(shell_quote("--project"), "--project");
+        assert_eq!(shell_quote("a b"), "'a b'");
+        assert_eq!(shell_quote("it's"), "'it'\\''s'");
+        assert_eq!(
+            shell_join(&["pi".into(), "--as".into(), "a b".into()]),
+            "pi --as 'a b'"
+        );
+    }
+
+    #[test]
+    fn send_and_wait_use_schema_params() {
+        // Fixture `hc-schema-0.1.16.json` is authoritative: `terminal.send`
+        // takes `wait` BOOL + `timeout` SECONDS; `terminal.wait` takes
+        // `timeout` SECONDS (never `timeout_ms`, never `wait:{...}`).
+        let fake = FakeHc::spawn(full_methods(), vec![sample_terminal()]);
+        let client = Client::connect(Some(fake.socket.to_str().unwrap())).expect("connect");
+        client.terminal_send("t7", "hi", Some(2000)).expect("send");
+        client.terminal_wait("t7", Some(3000)).expect("wait");
+        client
+            .terminal_wait_output("t7", "needle", Some(1500))
+            .expect("wait-output");
+        let sends = fake.requests_for("terminal.send");
+        assert_eq!(sends.len(), 1);
+        assert_eq!(sends[0]["terminal"], "t7");
+        assert_eq!(sends[0]["wait"], true);
+        assert_eq!(sends[0]["timeout"], 2.0);
+        assert!(sends[0].get("timeout_ms").is_none());
+        let waits = fake.requests_for("terminal.wait");
+        assert_eq!(waits.len(), 2);
+        assert_eq!(waits[0]["timeout"], 3.0);
+        assert!(waits[0].get("timeout_ms").is_none());
+        assert!(waits[0].get("output").is_none());
+        assert_eq!(waits[1]["output"], "needle");
+        assert_eq!(waits[1]["timeout"], 1.5);
+    }
+
+    #[test]
+    fn agent_start_types_the_launch_line_into_the_given_pane() {
+        // No pane hierarchy: the pane exists (flywheel split a shell and
+        // waited for its prompt), so the launch types INTO it — a second
+        // `terminal.run` would orphan the agent from its pane env.
+        let fake = FakeHc::spawn(full_methods(), vec![sample_terminal()]);
+        let backend = HcBackend::connect(Some(fake.socket.to_str().unwrap())).expect("backend");
+        let info = backend
+            .agent_start(
+                "DustySparrow",
+                "pi",
+                "hc:t7",
+                &["--as".into(), "a b".into()],
+            )
+            .expect("start");
+        assert!(fake.requests_for("terminal.run").is_empty());
+        let sends = fake.requests_for("terminal.send");
+        assert_eq!(sends.len(), 1);
+        assert_eq!(sends[0]["terminal"], "t7");
+        assert_eq!(sends[0]["text"], "pi --as 'a b'");
+        assert_eq!(info.pane_id, "hc:t7");
+    }
+
+    #[test]
+    fn terminal_label_carries_the_three_mail_identity_keys() {
+        let fake = FakeHc::spawn(full_methods(), vec![sample_terminal()]);
+        let client = Client::connect(Some(fake.socket.to_str().unwrap())).expect("connect");
+        let mut labels = BTreeMap::new();
+        labels.insert(
+            crate::backend::types::TOKEN_PIN.to_string(),
+            "DustySparrow".to_string(),
+        );
+        labels.insert(
+            crate::backend::types::TOKEN_PROJECT.to_string(),
+            "demo".to_string(),
+        );
+        labels.insert(
+            crate::backend::types::TOKEN_NPUB.to_string(),
+            "npub1x".to_string(),
+        );
+        let term = client.terminal_label("hc:t7", &labels).expect("label");
+        let reqs = fake.requests_for("terminal.label");
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0]["terminal"], "t7");
+        assert_eq!(reqs[0]["labels"]["toron_pin"], "DustySparrow");
+        assert_eq!(reqs[0]["labels"]["toron_project"], "demo");
+        assert_eq!(reqs[0]["labels"]["toron_npub"], "npub1x");
+        assert_eq!(term.address, "t7");
+        assert_eq!(
+            term.labels.get("toron_pin").map(String::as_str),
+            Some("DustySparrow")
+        );
+    }
+
+    #[test]
+    fn rename_sets_toron_pin_and_a_stamped_pane_resolves() {
+        // Mail routing reads `toron_pin`, so a rename must move the pin
+        // label (`name` stays for display).
+        let fake = FakeHc::spawn(full_methods(), vec![sample_terminal()]);
+        let backend = HcBackend::connect(Some(fake.socket.to_str().unwrap())).expect("backend");
+        backend
+            .agent_rename("hc:t7", Some("DustySparrow"))
+            .expect("rename");
+        let reqs = fake.requests_for("terminal.label");
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0]["labels"]["toron_pin"], "DustySparrow");
+        assert_eq!(reqs[0]["labels"]["name"], "DustySparrow");
+        // A pane carrying the `toron_pin` label resolves through
+        // `pane_token_pin` (the `resolve_pin_for_pane` token-first path).
+        let term: Terminal = serde_json::from_value(json!({
+            "address": "t7",
+            "labels": { "toron_pin": "DustySparrow" },
+        }))
+        .expect("terminal");
+        let pane = term.to_pane_info(FoldPolicy::Attention);
+        assert_eq!(
+            crate::mailbox::identity::pane_token_pin(&pane),
+            Some("DustySparrow")
+        );
+    }
+
+    #[test]
+    fn workspace_create_runs_a_shell_named_by_its_address() {
+        let fake = FakeHc::spawn(full_methods(), vec![]);
+        let backend = HcBackend::connect(Some(fake.socket.to_str().unwrap())).expect("backend");
+        let ws = backend.workspace_create(Some("squad")).expect("create");
+        let runs = fake.requests_for("terminal.run");
+        assert_eq!(runs.len(), 1);
+        // Empty argv: that machine's own shell. Independent peers, so no
+        // default parent lifecycle (`no_parent`).
+        assert_eq!(runs[0]["argv"], json!([]));
+        assert_eq!(runs[0]["no_parent"], true);
+        assert_eq!(ws.workspace_id, "hc:t9");
+        assert_eq!(ws.label, "squad");
+        // pane_split runs a shell child of the parent terminal.
+        let pane = backend
+            .pane_split("hc:t9", "right", Some("/tmp"))
+            .expect("split");
+        let runs = fake.requests_for("terminal.run");
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[1]["parent"], "t9");
+        assert_eq!(runs[1]["cwd"], "/tmp");
+        assert_eq!(runs[1]["no_parent"], true);
+        assert_eq!(pane.pane_id, "hc:t9");
+    }
+
+    #[test]
+    fn every_terminal_carries_its_root_ancestor_workspace_id() {
+        // Flywheel maps a workspace to a root shell terminal and filters by
+        // `workspace_id`: root -> child -> grandchild all carry the root.
+        let chain = vec![
+            json!({ "address": "t1" }),
+            json!({ "address": "t2", "parent": "t1" }),
+            json!({ "address": "t3", "parent": "t2" }),
+        ];
+        let fake = FakeHc::spawn(full_methods(), chain);
+        let client = Client::connect(Some(fake.socket.to_str().unwrap())).expect("connect");
+        for info in client.agent_list().expect("agents") {
+            assert_eq!(info.workspace_id, "hc:t1", "{info:?}");
+        }
+        for pane in client.pane_list().expect("panes") {
+            assert_eq!(pane.workspace_id, "hc:t1", "{pane:?}");
+        }
+        // A terminal with no parent is its own root.
+        let solo = vec![json!({ "address": "t9" })];
+        let fake = FakeHc::spawn(full_methods(), solo);
+        let client = Client::connect(Some(fake.socket.to_str().unwrap())).expect("connect");
+        let panes = client.pane_list().expect("panes");
+        assert_eq!(panes.len(), 1);
+        assert_eq!(panes[0].workspace_id, "hc:t9");
+    }
+
+    #[test]
+    fn pane_list_scoped_returns_the_root_plus_its_descendants() {
+        // A workspace is the root terminal PLUS its descendants:
+        // `cmd_recover` lists the workspace to decide which registered
+        // panes still exist, so root-only would respawn every child.
+        let chain = vec![
+            json!({ "address": "t1" }),
+            json!({ "address": "t2", "parent": "t1" }),
+            json!({ "address": "t3", "parent": "t2" }),
+        ];
+        let fake = FakeHc::spawn(full_methods(), chain);
+        let backend = HcBackend::connect(Some(fake.socket.to_str().unwrap())).expect("backend");
+        let panes = backend.pane_list(Some("hc:t1")).expect("list");
+        assert_eq!(panes.len(), 3);
+        let mut ids: Vec<&str> = panes.iter().map(|p| p.pane_id.as_str()).collect();
+        ids.sort();
+        assert_eq!(ids, ["hc:t1", "hc:t2", "hc:t3"]);
+        for pane in &panes {
+            assert_eq!(pane.workspace_id, "hc:t1");
+        }
+    }
+
+    #[test]
+    fn pane_list_scoped_returns_that_terminal_and_run_types() {
+        let fake = FakeHc::spawn(full_methods(), vec![sample_terminal()]);
+        let backend = HcBackend::connect(Some(fake.socket.to_str().unwrap())).expect("backend");
+        // A workspace id IS a terminal address (no hierarchy).
+        let panes = backend.pane_list(Some("hc:t7")).expect("list");
+        assert_eq!(panes.len(), 1);
+        assert_eq!(panes[0].pane_id, "hc:t7");
+        assert_eq!(
+            crate::mailbox::identity::pane_token_pin(&panes[0]),
+            Some("DustySparrow")
+        );
+        backend.pane_run("hc:t7", "echo hi").expect("run");
+        let sends = fake.requests_for("terminal.send");
+        assert_eq!(sends.len(), 1);
+        assert_eq!(sends[0]["text"], "echo hi");
+        let _ = backend
+            .pane_wait_output("hc:t7", "done", 1000)
+            .expect("wait");
+        let waits = fake.requests_for("terminal.wait");
+        assert_eq!(waits[0]["output"], "done");
     }
 
     /// Throwaway live hc server. Never touches ~/.config/herdr-core or the
@@ -1441,7 +2053,8 @@ mod tests {
         use std::thread;
 
         let hc = PathBuf::from(
-            std::env::var_os("HC_BIN").unwrap_or_else(|| "/Users/bangedorrunt/.local/bin/hc".into()),
+            std::env::var_os("HC_BIN")
+                .unwrap_or_else(|| "/Users/bangedorrunt/.local/bin/hc".into()),
         );
         assert!(hc.is_file(), "hc binary missing at {}", hc.display());
 
@@ -1460,9 +2073,10 @@ mod tests {
             .join(&session)
             .join(format!("{session}.sock"));
 
-        let log_dir = PathBuf::from(std::env::var_os("HC_LIVE_LOG_DIR").unwrap_or_else(|| {
-            "/Users/bangedorrunt/workspace/stack-comms/logs/hc-backend".into()
-        }));
+        let log_dir =
+            PathBuf::from(std::env::var_os("HC_LIVE_LOG_DIR").unwrap_or_else(|| {
+                "/Users/bangedorrunt/workspace/stack-comms/logs/hc-backend".into()
+            }));
         let _ = std::fs::create_dir_all(&log_dir);
         let transcript = log_dir.join(format!("live-hc-{session}.log"));
         let mut log = std::fs::File::create(&transcript).expect("transcript");
@@ -1480,7 +2094,13 @@ mod tests {
                 .env_remove("HERDR_SOCKET_PATH");
         };
 
-        let stop_server = |hc: &Path, home: &Path, config: &Path, data: &Path, state: &Path, cache: &Path, session: &str| {
+        let stop_server = |hc: &Path,
+                           home: &Path,
+                           config: &Path,
+                           data: &Path,
+                           state: &Path,
+                           cache: &Path,
+                           session: &str| {
             let mut stop = Command::new(hc);
             stop.env("HOME", home)
                 .env("XDG_CONFIG_HOME", config)
@@ -1494,7 +2114,10 @@ mod tests {
 
         let mut start = Command::new(&hc);
         apply_env(&mut start);
-        let out = start.args(["server", "start", "--json"]).output().expect("start");
+        let out = start
+            .args(["server", "start", "--json"])
+            .output()
+            .expect("start");
         let _ = writeln!(log, "start_status={}", out.status);
         let _ = writeln!(log, "start_stdout={}", String::from_utf8_lossy(&out.stdout));
         let _ = writeln!(log, "start_stderr={}", String::from_utf8_lossy(&out.stderr));
@@ -1505,12 +2128,22 @@ mod tests {
         let mut run = Command::new(&hc);
         apply_env(&mut run);
         let run_out = run
-            .args(["run", "--bg", "--name", "osc-live", "--", "sh", "-c", script])
+            .args([
+                "run", "--bg", "--name", "osc-live", "--", "sh", "-c", script,
+            ])
             .output()
             .expect("hc run");
         let _ = writeln!(log, "run_status={}", run_out.status);
-        let _ = writeln!(log, "run_stdout={}", String::from_utf8_lossy(&run_out.stdout));
-        let _ = writeln!(log, "run_stderr={}", String::from_utf8_lossy(&run_out.stderr));
+        let _ = writeln!(
+            log,
+            "run_stdout={}",
+            String::from_utf8_lossy(&run_out.stdout)
+        );
+        let _ = writeln!(
+            log,
+            "run_stderr={}",
+            String::from_utf8_lossy(&run_out.stderr)
+        );
         if !run_out.status.success() {
             stop_server(&hc, &home, &config, &data, &state, &cache, &session);
             panic!("hc run failed; see {}", transcript.display());
@@ -1596,5 +2229,4 @@ mod tests {
         let _ = writeln!(log, "transcript_path={}", transcript.display());
         eprintln!("live hc transcript: {}", transcript.display());
     }
-
 }

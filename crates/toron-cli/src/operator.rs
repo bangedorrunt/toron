@@ -273,7 +273,7 @@ fn identity_divergence_check(
 }
 
 /// bd-u31k: the shell around [`identity_divergence_check`] — stamped panes
-/// from herdr, registry rows from the index DB. herdr unreachable or no
+/// from hc, registry rows from the index DB. hc unreachable or no
 /// index is NOT a defect (the same advisory posture as the pane fields
 /// `whois` attaches), so those read ok with the reason named.
 fn check_identity_divergence(cfg: &Config) -> CheckResult {
@@ -287,8 +287,7 @@ fn check_identity_divergence(cfg: &Config) -> CheckResult {
             };
         };
         let client = backend.client();
-        let panes: Vec<toron_core::backend::PaneInfo> =
-            client.pane_list().unwrap_or_default();
+        let panes: Vec<toron_core::backend::PaneInfo> = client.pane_list().unwrap_or_default();
         panes
             .iter()
             .filter_map(toron_core::mailbox::identity::pane_stamp)
@@ -382,8 +381,18 @@ fn check_daemon_build() -> CheckResult {
     }
 }
 
-fn check_herdr() -> CheckResult {
-    let path = toron_core::backend::hc::resolve_socket_path(None, std::env::var("HC_SOCKET_PATH").ok().as_deref(), std::env::var_os("XDG_STATE_HOME").map(std::path::PathBuf::from).as_deref(), std::env::var_os("HOME").map(std::path::PathBuf::from).as_deref(), std::env::var("HC_SESSION").ok().as_deref());
+fn check_hc() -> CheckResult {
+    let path = toron_core::backend::hc::resolve_socket_path(
+        None,
+        std::env::var("HC_SOCKET_PATH").ok().as_deref(),
+        std::env::var_os("XDG_STATE_HOME")
+            .map(std::path::PathBuf::from)
+            .as_deref(),
+        std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .as_deref(),
+        std::env::var("HC_SESSION").ok().as_deref(),
+    );
     match toron_core::backend::hc::HcBackend::connect(None) {
         Ok(_) => CheckResult {
             name: "hc",
@@ -685,7 +694,7 @@ pub fn run_doctor(
         return run_doctor_reconstruct(cfg, rargs, format);
     }
     let checks = vec![
-        check_herdr(),
+        check_hc(),
         check_git(),
         check_keys(cfg),
         check_daemon_build(),
@@ -1418,11 +1427,17 @@ pub fn run_relay(cfg: &Config, cmd: &RelayCommand) -> anyhow::Result<()> {
 // ---------------------------------------------------------------------------
 
 pub fn run_backend(cfg: &Config, cmd: &BackendCommand) -> anyhow::Result<()> {
+    // Clean break: no `herdr` alias. The typed `BackendArg` can only be
+    // `hc|tmux`, but config/env is a free string, so validate here.
+    let effective = cfg.effective_backend();
+    if effective != "hc" && effective != "tmux" {
+        anyhow::bail!("unknown backend {effective:?} (want hc|tmux)");
+    }
     match cmd {
         BackendCommand::List => {
-            let herdr = toron_core::backend::hc::HcBackend::connect(None).is_ok();
+            let hc = toron_core::backend::hc::HcBackend::connect(None).is_ok();
             print_json(&json!([
-                { "name": "hc", "available": herdr },
+                { "name": "hc", "available": hc },
                 { "name": "tmux", "available": false },
             ]))
         }
@@ -1436,6 +1451,35 @@ pub fn run_backend(cfg: &Config, cmd: &BackendCommand) -> anyhow::Result<()> {
 }
 
 #[cfg(test)]
+mod backend_selection_tests {
+    //! Backend selection is a clean break: `hc|tmux`, no `herdr` alias.
+    use super::*;
+
+    fn cfg_with(backend: &str) -> Config {
+        Config {
+            backend: Some(backend.into()),
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn legacy_herdr_backend_is_refused_naming_hc_or_tmux() {
+        // `Config::load` does NOT normalize — the free-string config value
+        // reaches `run_backend`, which fails naming the valid pair.
+        let err = run_backend(&cfg_with("herdr"), &BackendCommand::Status)
+            .expect_err("legacy herdr must be refused");
+        assert!(err.to_string().contains("hc|tmux"), "{err}");
+    }
+
+    #[test]
+    fn hc_and_tmux_pass_backend_validation() {
+        for backend in ["hc", "tmux"] {
+            run_backend(&cfg_with(backend), &BackendCommand::Status)
+                .expect("hc|tmux must validate");
+        }
+    }
+}
+
 mod check_resonate_tests {
     //! GS-037: doctor resonate must not invent-green on soft-ok health.
     use super::*;

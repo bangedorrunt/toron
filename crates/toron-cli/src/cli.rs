@@ -152,7 +152,7 @@ pub enum Command {
     Wait(WaitArgs),
 
     // --- operator surface (bd-led.8.2): daemon-persona commands.
-    /// Deep health checks (herdr/git/keys/resonate). --check exits 3 on any failure.
+    /// Deep health checks (hc/git/keys/resonate). --check exits 3 on any failure.
     Doctor(DoctorArgs),
 
     /// In-process operator counters (tool calls, errors, latency).
@@ -1206,8 +1206,8 @@ pub struct AgentBootstrapArgs {
     /// Task description for the 30013 profile (optional).
     #[arg(long)]
     pub task: Option<String>,
-    /// Herdr pane id to stamp with the mail identity (optional; defaults to
-    /// $HERDR_PANE_ID when set). Best-effort display-only metadata.
+    /// Hc terminal to stamp with the mail identity (optional; defaults to
+    /// $HC_TERMINAL_ID when set). Best-effort display-only metadata.
     #[arg(long = "pane-id")]
     pub pane_id: Option<String>,
     /// ADR-0037 W2: when the pin already holds a key in another project, the
@@ -1780,7 +1780,7 @@ pub enum PresenceCommand {
     List(PresenceListArgs),
 }
 
-/// Presence state selector (herdr vocabulary: idle|working|blocked|done).
+/// Presence state selector (hc vocabulary: idle|working|blocked|done).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum PresenceStateArg {
     Idle,
@@ -1967,17 +1967,17 @@ pub struct RelayUrlArg {
     pub url: String,
 }
 
-/// Backend selector (herdr | tmux).
+/// Backend selector (hc | tmux).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum BackendArg {
-    Herdr,
+    Hc,
     Tmux,
 }
 
 impl BackendArg {
     pub const fn as_str(&self) -> &'static str {
         match self {
-            BackendArg::Herdr => "herdr",
+            BackendArg::Hc => "hc",
             BackendArg::Tmux => "tmux",
         }
     }
@@ -1985,7 +1985,7 @@ impl BackendArg {
 
 #[derive(Debug, Subcommand)]
 pub enum BackendCommand {
-    /// Probe backend availability (herdr socket connect; tmux held).
+    /// Probe backend availability (hc socket connect; tmux held).
     List,
     /// Print the effective backend from config.
     Status,
@@ -1995,7 +1995,7 @@ pub enum BackendCommand {
 
 #[derive(Debug, Args)]
 pub struct BackendDefaultArgs {
-    /// herdr|tmux.
+    /// hc|tmux.
     #[arg(value_enum)]
     pub backend: BackendArg,
 }

@@ -2475,10 +2475,7 @@ mod tests {
     fn test_pane(pane_id: &str, pin_token: Option<&str>) -> PaneInfo {
         let mut tokens = serde_json::Map::new();
         if let Some(pin) = pin_token {
-            tokens.insert(
-                TOKEN_PIN.into(),
-                serde_json::Value::String(pin.into()),
-            );
+            tokens.insert(TOKEN_PIN.into(), serde_json::Value::String(pin.into()));
         }
         serde_json::from_value(serde_json::json!({
             "pane_id": pane_id,
@@ -2501,10 +2498,8 @@ mod tests {
             TOKEN_PROJECT.into(),
             serde_json::Value::String(project.into()),
         );
-        pane.tokens.insert(
-            TOKEN_NPUB.into(),
-            serde_json::Value::String(npub.into()),
-        );
+        pane.tokens
+            .insert(TOKEN_NPUB.into(), serde_json::Value::String(npub.into()));
         pane
     }
 

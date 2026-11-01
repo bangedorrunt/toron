@@ -44,7 +44,7 @@ fn bound(r: &str, generation: u64, verified: bool) -> InboxMsg {
     InboxMsg::Bound {
         recipient: r.into(),
         pane_id: format!("w1:{r}"),
-        herdr_session: "s1".into(),
+        plane_session: "s1".into(),
         generation,
         verified,
         verified_by: "test".into(),
@@ -328,7 +328,7 @@ fn a_deaf_recipient_is_not_rung_again_until_a_new_pane_binds() {
             InboxMsg::Bound {
                 recipient: A.into(),
                 pane_id: "w2:new".into(),
-                herdr_session: "s1".into(),
+                plane_session: "s1".into(),
                 generation: 1,
                 verified: true,
                 verified_by: "test".into(),
@@ -341,11 +341,11 @@ fn a_deaf_recipient_is_not_rung_again_until_a_new_pane_binds() {
 }
 
 #[test]
-fn a_herdr_restart_stales_bindings_without_counting_lost_events() {
+fn a_plane_restart_stales_bindings_without_counting_lost_events() {
     let (m, _) = fold(&ready(A), &[head(A, 5), tick(0)]);
     let (m, c) = fold(
         &m,
-        &[InboxMsg::Invalidate(Invalidate::HerdrRestarted), tick(FAR)],
+        &[InboxMsg::Invalidate(Invalidate::PlaneRestarted), tick(FAR)],
     );
     assert_eq!(rings(&c), 0);
     assert_eq!(m.events_lost, 0);
@@ -468,7 +468,7 @@ fn a_flood_of_hints_through_a_tiny_channel_loses_nothing() {
 fn the_model_round_trips_and_the_binding_wire_name_is_gen() {
     let b = Binding {
         pane_id: "w1:p".into(),
-        herdr_session: "s".into(),
+        plane_session: "s".into(),
         generation: 3,
         verified: true,
         verified_by: "env".into(),
@@ -476,6 +476,38 @@ fn the_model_round_trips_and_the_binding_wire_name_is_gen() {
     let v = serde_json::to_value(&b).unwrap();
     assert_eq!(v["gen"], 3);
     assert_eq!(serde_json::from_value::<Binding>(v).unwrap(), b);
+}
+
+#[test]
+fn old_records_with_herdr_names_still_read() {
+    // The `herdr_session` -> `plane_session` / `HerdrRestarted` ->
+    // `PlaneRestarted` rename keeps wire compat through serde aliases:
+    // a journal written before the rename deserializes into the new
+    // model unchanged.
+    let b: Binding = serde_json::from_str(
+        r#"{"pane_id":"w1:p","herdr_session":"s","gen":3,"verified":true,"verified_by":"env"}"#,
+    )
+    .unwrap();
+    assert_eq!(b.plane_session, "s");
+    assert_eq!(b.generation, 3);
+    let bound: InboxMsg = serde_json::from_str(
+        r#"{"msg":"bound","recipient":"a","pane_id":"w1:a","herdr_session":"s1","gen":0,"verified":true,"verified_by":"t"}"#,
+    )
+    .unwrap();
+    match bound {
+        InboxMsg::Bound { plane_session, .. } => assert_eq!(plane_session, "s1"),
+        other => panic!("unexpected {other:?}"),
+    }
+    // Old wire name is snake_case (`rename_all`); the Rust-case alias is
+    // belt-and-braces for records written by other producers. The old
+    // envelope is derived from the live one so the test tracks the real
+    // journal shape, not a hand-written guess.
+    let live = serde_json::to_string(&InboxMsg::Invalidate(Invalidate::PlaneRestarted)).unwrap();
+    assert!(live.contains("plane_restarted"), "{live}");
+    for old in ["herdr_restarted", "HerdrRestarted"] {
+        let back: InboxMsg = serde_json::from_str(&live.replace("plane_restarted", old)).unwrap();
+        assert_eq!(back, InboxMsg::Invalidate(Invalidate::PlaneRestarted));
+    }
 }
 
 // ---- properties -----------------------------------------------------
@@ -504,7 +536,7 @@ fn arb_msg() -> impl Strategy<Value = InboxMsg> {
             .prop_map(|(recipient, state)| InboxMsg::Pane { recipient, state }),
         prop_oneof![
             Just(InboxMsg::Invalidate(Invalidate::EventsLost)),
-            Just(InboxMsg::Invalidate(Invalidate::HerdrRestarted))
+            Just(InboxMsg::Invalidate(Invalidate::PlaneRestarted))
         ],
         (who.clone(), 0u64..5_000_000)
             .prop_map(|(recipient, now_ms)| InboxMsg::Hint { recipient, now_ms }),

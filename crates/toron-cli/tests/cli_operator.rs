@@ -549,7 +549,7 @@ fn relay_add_returns_proposed_list() {
 }
 
 #[test]
-fn backend_list_is_json_array_with_herdr() {
+fn backend_list_is_json_array_with_hc() {
     let out = run(&["backend", "list", "--json"]);
     assert!(
         out.status.success(),
@@ -559,8 +559,8 @@ fn backend_list_is_json_array_with_herdr() {
     let value = parse(&out.stdout);
     let arr = value.as_array().expect("backend list must be an array");
     assert!(
-        arr.iter().any(|b| b["name"] == serde_json::json!("herdr")),
-        "array must include herdr, got {value}"
+        arr.iter().any(|b| b["name"] == serde_json::json!("hc")),
+        "array must include hc, got {value}"
     );
     assert!(
         arr.iter().any(|b| {
@@ -575,5 +575,5 @@ fn backend_status_reports_effective() {
     let out = run(&["backend", "status", "--json"]);
     assert!(out.status.success());
     let value = parse(&out.stdout);
-    assert_eq!(value["backend"], serde_json::json!("herdr"));
+    assert_eq!(value["backend"], serde_json::json!("hc"));
 }

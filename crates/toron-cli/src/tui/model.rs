@@ -630,7 +630,7 @@ impl AgentRow {
     }
 }
 
-/// Canonical presence word: offline wins, then the five herdr-vocabulary
+/// Canonical presence word: offline wins, then the five hc-vocabulary
 /// states (never a sixth spelling — ADR-0031 A4).
 pub const fn presence_label(online: bool, state: PresenceState) -> &'static str {
     if !online {
