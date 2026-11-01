@@ -8,9 +8,6 @@ members = [
     "crates/toron-e2e",
     "crates/toron-workflow",
 ]
-# Vendored upstream crates (ADR-0040) are path dependencies, not members:
-# they are not linted, formatted or tested as toron code.
-exclude = ["vendor"]
 
 # cargo 1.9x defaults release to strip="debuginfo". On macOS arm64 that strip
 # corrupts the LINKEDIT segment of large proc-macro dylibs (sqlx_macros is
