@@ -381,7 +381,7 @@ impl RetryCoordinator {
 
     /// Policy from an enclosing retry context (`run_step_with_enclosing`),
     /// or the default when there is none.
-    fn from_enclosing(enclosing: Option<(u32, u64)>) -> Self {
+    pub(crate) fn from_enclosing(enclosing: Option<(u32, u64)>) -> Self {
         match enclosing {
             Some((max, backoff)) => Self::from_retry_action(max, backoff),
             None => Self::default_policy(),
@@ -802,7 +802,7 @@ pub(crate) fn run_step_with_enclosing<'a>(
         let mut attempt: u32 = 0;
         loop {
             attempt += 1;
-            let mut value = match &step.action {
+            let value = match &step.action {
                 Action::Delay { secs } => {
                     // bd-zbnw (ADR-0035 Spec 2.5): the lint advisory cap is
                     // now enforced — an over-cap delay sleeps the cap, says
@@ -1135,71 +1135,97 @@ pub(crate) fn run_step_with_enclosing<'a>(
                     .await?
                 }
             };
-            // A dispatch that answered with a JSON object (or one fenced
-            // block) publishes those fields on the step. Guards such as
-            // `steps.measure.improved` can then see `improved`.
-            promote_response_fields(&mut value);
-
-            // P0.2 (ADR-0005 Spec 0 + ADR-0024 Spec 1): `on_error: fail_run`
-            // converts a step failure into a RUN failure — a deterministic durable
-            // RETURN, never a panic. ADR-0032 Spec 7: retry candidacy resolves
-            // in the ONE coordinator (frozen FailureKind vocabulary); a
-            // retryable runtime failure retries the SAME node, bounded.
-            if step.on_error == StepOnError::FailRun && crate::engine::is_failure_value(&value) {
-                let kind = value.get("kind").and_then(|v| v.as_str()).unwrap_or("");
-                if RetryCoordinator::is_retryable_value(&value) {
-                    if !coordinator.should_retry(attempt) {
-                        let error = value
-                            .get("error")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("step failed")
-                            .to_string();
-                        let disposition = disposition_for_kind(
-                            kind,
-                            value.get("disposition").and_then(|v| v.as_str()),
-                        );
-                        return Ok(serde_json::json!({
-                            "status": "failed",
-                            "error": error,
-                            "failed_step": step.name.clone().unwrap_or_else(|| "<unnamed>".into()),
-                            "kind": kind,
-                            "disposition": disposition,
-                            "leaf_preview": leaf_preview_for_value(&value),
-                            "attempts": attempt,
-                        }));
-                    }
-                    let retry_after_ms = value
-                        .get("retry_after_ms")
-                        .and_then(serde_json::Value::as_u64);
-                    ctx.sleep(coordinator.backoff(attempt, retry_after_ms))
-                        .await?;
+            match classify_step_outcome(step, value, attempt, &coordinator) {
+                StepOutcome::Done(value) => return Ok(value),
+                StepOutcome::Retry { backoff } => {
+                    ctx.sleep(backoff).await?;
                     continue;
                 }
-                let error = value
-                    .get("error")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("step failed")
-                    .to_string();
-                let mut failed = serde_json::json!({
-                    "status": "failed",
-                    "error": error,
-                    "failed_step": step.name.clone().unwrap_or_else(|| "<unnamed>".into()),
-                });
-                if let Some(k) = value.get("kind") {
-                    failed["kind"] = k.clone();
-                }
-                if let Some(d) = value.get("disposition") {
-                    failed["disposition"] = d.clone();
-                } else if !kind.is_empty() {
-                    failed["disposition"] = serde_json::json!(disposition_for_kind(kind, None));
-                }
-                failed["leaf_preview"] = serde_json::json!(leaf_preview_for_value(&value));
-                return Ok(failed);
             }
-            return Ok(value);
         }
         // unreachable — loop always returns
     })
+}
+
+/// What the shared host-step policy says to do with one attempt's value.
+pub(crate) enum StepOutcome {
+    /// Terminal: this is the step's result.
+    Done(serde_json::Value),
+    /// The same logical node retries after `backoff`.
+    Retry { backoff: Duration },
+}
+
+/// The ONE host-step outcome policy (bd-linear-step-6j0y).
+///
+/// A dispatch that answered with a JSON object (or one fenced block) publishes
+/// those fields on the step, so guards such as `steps.measure.improved` can see
+/// `improved`. Then (P0.2, ADR-0005 Spec 0 + ADR-0024 Spec 1) `on_error:
+/// fail_run` converts a step failure into a RUN failure — a deterministic
+/// durable RETURN, never a panic. ADR-0032 Spec 7: retry candidacy resolves in
+/// the ONE coordinator (frozen `FailureKind` vocabulary); a retryable runtime
+/// failure retries the SAME node, bounded.
+///
+/// The Context engine and the linear host both call this, so the fail_run
+/// shape has one author. The caller owns the sleep between attempts, because
+/// that is the one substrate-specific effect (`ctx.sleep` vs `tokio::sleep`).
+pub(crate) fn classify_step_outcome(
+    step: &Step,
+    mut value: serde_json::Value,
+    attempt: u32,
+    coordinator: &RetryCoordinator,
+) -> StepOutcome {
+    promote_response_fields(&mut value);
+
+    if step.on_error != StepOnError::FailRun || !crate::engine::is_failure_value(&value) {
+        return StepOutcome::Done(value);
+    }
+    let kind = value.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+    if RetryCoordinator::is_retryable_value(&value) {
+        if !coordinator.should_retry(attempt) {
+            let error = value
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("step failed")
+                .to_string();
+            let disposition =
+                disposition_for_kind(kind, value.get("disposition").and_then(|v| v.as_str()));
+            return StepOutcome::Done(serde_json::json!({
+                "status": "failed",
+                "error": error,
+                "failed_step": step.name.clone().unwrap_or_else(|| "<unnamed>".into()),
+                "kind": kind,
+                "disposition": disposition,
+                "leaf_preview": leaf_preview_for_value(&value),
+                "attempts": attempt,
+            }));
+        }
+        let retry_after_ms = value
+            .get("retry_after_ms")
+            .and_then(serde_json::Value::as_u64);
+        return StepOutcome::Retry {
+            backoff: coordinator.backoff(attempt, retry_after_ms),
+        };
+    }
+    let error = value
+        .get("error")
+        .and_then(|v| v.as_str())
+        .unwrap_or("step failed")
+        .to_string();
+    let mut failed = serde_json::json!({
+        "status": "failed",
+        "error": error,
+        "failed_step": step.name.clone().unwrap_or_else(|| "<unnamed>".into()),
+    });
+    if let Some(k) = value.get("kind") {
+        failed["kind"] = k.clone();
+    }
+    if let Some(d) = value.get("disposition") {
+        failed["disposition"] = d.clone();
+    } else if !kind.is_empty() {
+        failed["disposition"] = serde_json::json!(disposition_for_kind(kind, None));
+    }
+    failed["leaf_preview"] = serde_json::json!(leaf_preview_for_value(&value));
+    StepOutcome::Done(failed)
 }
 
 /// Run a `retry` action: attempt the inner step up to `max_attempts` times,

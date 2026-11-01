@@ -36,6 +36,7 @@ pub mod durable;
 pub mod durable_host;
 pub mod elm;
 pub mod leaf;
+pub mod linear_step;
 pub mod park;
 mod reconcile;
 mod sinks;

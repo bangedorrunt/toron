@@ -1,0 +1,291 @@
+// governed-by: ADR-0032
+#![forbid(unsafe_code)]
+
+//! One linear step, no Resonate Context (bd-linear-step-6j0y).
+//!
+//! The durable host runs a single HostSink step outside the workflow engine's
+//! Context, so everything the engine would read from a `Context` arrives here
+//! as data or as an explicit [`LeafSeams`]. The step POLICY is not re-authored:
+//! the guard evaluator, the strict renderer, the retry coordinator, the
+//! invocation builder, the leaf dispatcher, and the outcome classifier are the
+//! same functions the Context path calls, so a linear step and a workflow step
+//! reach the same verdict on the same inputs.
+//!
+//! What is genuinely different is the substrate, not the policy:
+//! - the backoff sleep is `tokio::time::sleep` (there is no durable clock to
+//!   suspend on outside a run), and
+//! - an engine-owned control action (delay, park, approval, branch, retry,
+//!   foreach, parallel, reduce, call_workflow, loop, spawn) is REFUSED through
+//!   the boundary's own fail-closed answer instead of being sequenced. A linear
+//!   host has no scheduler, so quietly sequencing one would be the lie.
+
+use super::control_flow::{
+    GuardVerdict, RetryCoordinator, StepOutcome, classify_step_outcome, evaluate_step_guard,
+    invocation_for_leaf, skipped_value,
+};
+use super::leaf::{LeafSeams, dispatch_leaf};
+use super::template::{RenderContext, render_action};
+use super::{ActionPartition, invoke_compat, partition};
+
+use crate::schema::Step;
+
+/// One step for a host with no `Context`.
+///
+/// `index` is the host's own step position: the policy deliberately derives
+/// its node path from `step.name` exactly as the Context path does, so
+/// `node_path` and `failed_step` read the same on both substrates.
+pub struct LinearStep<'a> {
+    pub run_id: &'a str,
+    pub workflow: &'a str,
+    pub workflow_digest: &'a str,
+    pub step: &'a Step,
+    pub index: usize,
+    pub trigger: &'a serde_json::Value,
+    pub outputs: &'a mut serde_json::Map<String, serde_json::Value>,
+}
+
+/// Run one linear step to a value.
+///
+/// Returns the step's value, never a `Result`: the engine's contract is that a
+/// failure is a VALUE (`{ok:false,…}` / the `status: failed` fail_run shape),
+/// so a linear host reads the same field the workflow engine writes.
+pub async fn run_linear_step(input: LinearStep<'_>, seams: &LeafSeams) -> serde_json::Value {
+    let LinearStep {
+        run_id,
+        workflow,
+        workflow_digest,
+        step,
+        index: _,
+        trigger,
+        outputs,
+    } = input;
+
+    let node = step.name.as_deref().unwrap_or("<unnamed>");
+    match evaluate_step_guard(step.guard.as_deref(), trigger, outputs, node).await {
+        GuardVerdict::Proceed => {}
+        GuardVerdict::Skip { reason } => return skipped_value(node, reason),
+        GuardVerdict::Fail { error } => {
+            return serde_json::json!({ "ok": false, "error": error });
+        }
+    }
+
+    // No enclosing `Retry` action exists outside a run: the coordinator's
+    // default policy (3 attempts, exponential backoff) applies.
+    let coordinator = RetryCoordinator::from_enclosing(None);
+    let mut attempt: u32 = 0;
+    loop {
+        attempt += 1;
+        // Render FIRST, like the engine's leaf arm: a runner must see rendered
+        // values, and a render failure is a per-step error with
+        // workflow/node/field/ref attribution, never a run failure.
+        let render_ctx = RenderContext::new(workflow, node);
+        let value = match render_action(&step.action, trigger, outputs, &render_ctx) {
+            Ok(action) => {
+                let invocation = invocation_for_leaf(
+                    action,
+                    run_id,
+                    workflow_digest,
+                    node,
+                    attempt,
+                    // Parity with the Context path: no enclosing `Retry`
+                    // action means a per-step policy of one attempt.
+                    1,
+                    None,
+                );
+                match partition(&invocation.action) {
+                    ActionPartition::HostSink { sink } => {
+                        dispatch_leaf(seams, &invocation, sink).await
+                    }
+                    // Engine control and unsupported actions get the
+                    // boundary's own fail-closed value: a linear host does not
+                    // sequence, so it must refuse rather than pretend.
+                    _ => invoke_compat(&invocation.action, |_| None),
+                }
+            }
+            Err(e) => serde_json::json!({ "ok": false, "error": format!("render: {e}") }),
+        };
+        match classify_step_outcome(step, value, attempt, &coordinator) {
+            StepOutcome::Done(value) => return value,
+            StepOutcome::Retry { backoff } => tokio::time::sleep(backoff).await,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use super::*;
+
+    use crate::engine::{ActionInvocation, RunContext};
+    use crate::schema::{Action, StepOnError};
+
+    fn send_dm(body: &str) -> Step {
+        Step {
+            name: Some("notify".into()),
+            guard: None,
+            on_error: StepOnError::Continue,
+            build_slot: false,
+            action: Action::SendDm {
+                to: "pi".into(),
+                body: body.into(),
+                project: None,
+            },
+        }
+    }
+
+    /// The runner sees a RENDERED action and a fully-populated invocation: this
+    /// is the surface the durable host hands its journal.
+    #[tokio::test]
+    async fn dispatches_a_rendered_action_with_the_invocation_shape() {
+        let step = send_dm("{{trigger.payload}}");
+        let trigger = serde_json::json!({ "payload": "rendered-body" });
+        let mut outputs = serde_json::Map::new();
+
+        let seen: Arc<Mutex<Option<(String, RunContext, u32)>>> = Arc::new(Mutex::new(None));
+        let slot = Arc::clone(&seen);
+        let seams = LeafSeams {
+            async_runner: Some(Arc::new(move |inv: &ActionInvocation| {
+                let slot = Arc::clone(&slot);
+                let body = match &inv.action {
+                    Action::SendDm { body, .. } => body.clone(),
+                    other => panic!("runner saw {}", other.type_name()),
+                };
+                let run = inv.run.clone();
+                let max_attempts = inv.execution.max_attempts;
+                Box::pin(async move {
+                    *slot.lock().expect("slot") = Some((body, run, max_attempts));
+                    Ok(serde_json::json!({ "ok": true }))
+                })
+            })),
+            ..LeafSeams::default()
+        };
+
+        let value = run_linear_step(
+            LinearStep {
+                run_id: "run-7",
+                workflow: "linear-wf",
+                workflow_digest: "digest-7",
+                step: &step,
+                index: 0,
+                trigger: &trigger,
+                outputs: &mut outputs,
+            },
+            &seams,
+        )
+        .await;
+
+        assert_eq!(value["ok"], serde_json::json!(true), "{value}");
+        let (body, run, max_attempts) = seen
+            .lock()
+            .expect("slot")
+            .clone()
+            .expect("the runner saw one invocation");
+        assert_eq!(body, "rendered-body", "the runner sees rendered values");
+        assert_eq!(run.run_id, "run-7");
+        assert_eq!(run.workflow_digest, "digest-7");
+        assert_eq!(run.node_path, "notify");
+        assert_eq!(run.attempt, 1);
+        assert_eq!(
+            run.effect_key, None,
+            "effect identity is the journal runner's to derive, as on the Context path"
+        );
+        assert_eq!(max_attempts, 1);
+    }
+
+    /// A false guard skips the step WITHOUT dispatching anything.
+    #[tokio::test]
+    async fn a_false_guard_skips_without_dispatching() {
+        let mut step = send_dm("hi");
+        step.guard = Some("false".into());
+        let trigger = serde_json::json!({});
+        let mut outputs = serde_json::Map::new();
+
+        let calls = Arc::new(AtomicU32::new(0));
+        let counter = Arc::clone(&calls);
+        let seams = LeafSeams {
+            async_runner: Some(Arc::new(move |_: &ActionInvocation| {
+                let counter = Arc::clone(&counter);
+                Box::pin(async move {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    Ok(serde_json::json!({ "ok": true }))
+                })
+            })),
+            ..LeafSeams::default()
+        };
+
+        let value = run_linear_step(
+            LinearStep {
+                run_id: "run-8",
+                workflow: "linear-wf",
+                workflow_digest: "digest-8",
+                step: &step,
+                index: 0,
+                trigger: &trigger,
+                outputs: &mut outputs,
+            },
+            &seams,
+        )
+        .await;
+
+        assert_eq!(value["skipped"], serde_json::json!(true), "{value}");
+        assert_eq!(value["node"], serde_json::json!("notify"), "{value}");
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "a skip dispatches nothing");
+    }
+
+    /// `on_error: fail_run` on a retryable failure exhausts the default three
+    /// attempts and reports them — the same shape the engine returns.
+    #[tokio::test]
+    async fn fail_run_exhausts_the_default_attempts_and_reports_them() {
+        let mut step = send_dm("hi");
+        step.on_error = StepOnError::FailRun;
+        let trigger = serde_json::json!({});
+        let mut outputs = serde_json::Map::new();
+
+        let calls = Arc::new(AtomicU32::new(0));
+        let counter = Arc::clone(&calls);
+        let seams = LeafSeams {
+            async_runner: Some(Arc::new(move |_: &ActionInvocation| {
+                let counter = Arc::clone(&counter);
+                Box::pin(async move {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    // `retry_after_ms: 0` keeps the exponential backoff at zero
+                    // so the test exercises the bound, not the wall clock.
+                    Ok(serde_json::json!({
+                        "ok": false,
+                        "error": "provider down",
+                        "kind": "timeout",
+                        "retry_after_ms": 0,
+                    }))
+                })
+            })),
+            ..LeafSeams::default()
+        };
+
+        let value = run_linear_step(
+            LinearStep {
+                run_id: "run-9",
+                workflow: "linear-wf",
+                workflow_digest: "digest-9",
+                step: &step,
+                index: 0,
+                trigger: &trigger,
+                outputs: &mut outputs,
+            },
+            &seams,
+        )
+        .await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 3, "the default cap is 3");
+        assert_eq!(value["status"], serde_json::json!("failed"), "{value}");
+        assert_eq!(value["attempts"], serde_json::json!(3), "{value}");
+        assert_eq!(value["failed_step"], serde_json::json!("notify"), "{value}");
+        assert_eq!(value["kind"], serde_json::json!("timeout"), "{value}");
+        assert_eq!(
+            value["error"],
+            serde_json::json!("provider down"),
+            "{value}"
+        );
+    }
+}
