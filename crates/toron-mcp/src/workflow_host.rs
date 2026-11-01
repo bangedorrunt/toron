@@ -44,10 +44,11 @@ use toron_workflow::coalesce::{
 };
 use toron_workflow::dispatch::{DispatchAcquire, DispatchConfig, DispatchPermit, DispatchPool};
 use toron_workflow::engine::ResonateChoice;
-use toron_workflow::engine::durable::{RunEffect, RunModel, RunPhase as ModelPhase, unsupported_reason};
+use toron_workflow::engine::durable::{
+    RunEffect, RunModel, RunPhase as ModelPhase, unsupported_reason,
+};
 use toron_workflow::engine::durable_host::{DurableRun, HostError};
 use toron_workflow::engine::is_failure_value;
-use toron_workflow::identity::workflow_digest;
 use toron_workflow::engine::leaf::LeafSeams;
 use toron_workflow::engine::linear_step::{LinearStep, run_linear_step};
 use toron_workflow::engine::{
@@ -61,6 +62,7 @@ use toron_workflow::engine::{
     failure_for_unsupported, normalize_dispatch_result, plan_attempt, terminal_digest,
     validate_resolution,
 };
+use toron_workflow::identity::workflow_digest;
 use toron_workflow::jobs::{JobRequest, build_job_request_with_tags};
 use toron_workflow::lifecycle::{LifecycleEffect, WorkflowLifecycle};
 use toron_workflow::schema::{Action, Trigger, Workflow};
@@ -1846,8 +1848,15 @@ impl WorkflowHost {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .insert(run_id.clone());
-        self.drive_durable_effects(run, effects, run_id.clone(), workflow, trigger, workflow_digest)
-            .await;
+        self.drive_durable_effects(
+            run,
+            effects,
+            run_id.clone(),
+            workflow,
+            trigger,
+            workflow_digest,
+        )
+        .await;
         self.durable_active
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -1878,13 +1887,7 @@ impl WorkflowHost {
     /// parked on an approval are skipped. No store, or an unreadable table,
     /// is a quiet no-op.
     pub async fn sweep_durable_runs(&self) {
-        let pool = match self
-            .pending
-            .lock()
-            .await
-            .store()
-            .map(|s| s.pool().clone())
-        {
+        let pool = match self.pending.lock().await.store().map(|s| s.pool().clone()) {
             Some(pool) => pool,
             None => return,
         };
@@ -1912,10 +1915,8 @@ impl WorkflowHost {
             if model.is_terminal() {
                 let state_for_delete = state.clone();
                 let rid = run_id.clone();
-                if let Err(e) = tokio::task::spawn_blocking(move || {
-                    state_for_delete.delete(&rid)
-                })
-                .await
+                if let Err(e) =
+                    tokio::task::spawn_blocking(move || state_for_delete.delete(&rid)).await
                 {
                     warn!(run_id = %run_id, "durable sweep: delete task failed: {e}");
                 }
@@ -1954,19 +1955,18 @@ impl WorkflowHost {
         journal: ToronJournal,
         state: SyncWorkflowState,
     ) {
-        let listed: Option<(Workflow, serde_json::Value)> =
-            match tokio::task::spawn_blocking({
-                let state = state.clone();
-                let rid = run_id.clone();
-                move || state.load(&rid)
-            })
-            .await
-            {
-                Ok(Ok(Some(json))) => serde_json::from_str::<RunModel>(&json)
-                    .ok()
-                    .map(|m| (m.workflow, m.trigger)),
-                _ => None,
-            };
+        let listed: Option<(Workflow, serde_json::Value)> = match tokio::task::spawn_blocking({
+            let state = state.clone();
+            let rid = run_id.clone();
+            move || state.load(&rid)
+        })
+        .await
+        {
+            Ok(Ok(Some(json))) => serde_json::from_str::<RunModel>(&json)
+                .ok()
+                .map(|m| (m.workflow, m.trigger)),
+            _ => None,
+        };
         let Some((workflow, trigger)) = listed else {
             warn!(run_id = %run_id, "durable sweep: model vanished between list and open; skipping");
             return;
@@ -8695,9 +8695,10 @@ steps:
         use toron_core::index::schema;
         use toron_workflow::schema::{Action, Step, StepOnError, Workflow};
 
-        let db =
-            std::env::temp_dir().join(format!("wf-cut-sweep-{}.sqlite", uuid::Uuid::new_v4()));
-        let pool = schema::connect(db.to_str().unwrap()).await.expect("connect");
+        let db = std::env::temp_dir().join(format!("wf-cut-sweep-{}.sqlite", uuid::Uuid::new_v4()));
+        let pool = schema::connect(db.to_str().unwrap())
+            .await
+            .expect("connect");
         schema::migrate(&pool).await.expect("migrate");
         let approval_workflow = Workflow {
             name: "linear-cut-approval".into(),
@@ -8729,9 +8730,9 @@ steps:
         let host1 =
             WorkflowHost::over_bus(bus1, vec![approval_workflow.clone()], None).expect("host1");
         host1
-            .with_effect_store(toron_core::index::workflow_effects::WorkflowEffectStore::new(
-                pool.clone(),
-            ))
+            .with_effect_store(
+                toron_core::index::workflow_effects::WorkflowEffectStore::new(pool.clone()),
+            )
             .await;
         let input = RunInput {
             workflow: approval_workflow.clone(),
@@ -8742,7 +8743,12 @@ steps:
             .run_durable_loop("run-cut-9".to_string(), approval_workflow.clone(), input)
             .await;
         assert_eq!(
-            host1.pending.lock().await.run_state_durable("run-cut-9").await,
+            host1
+                .pending
+                .lock()
+                .await
+                .run_state_durable("run-cut-9")
+                .await,
             RunState::Suspended,
             "host1 parks the approval"
         );
@@ -8756,14 +8762,22 @@ steps:
         );
         let host2 = WorkflowHost::over_bus(bus2, vec![], None).expect("host2");
         host2
-            .with_effect_store(toron_core::index::workflow_effects::WorkflowEffectStore::new(
-                pool.clone(),
-            ))
+            .with_effect_store(
+                toron_core::index::workflow_effects::WorkflowEffectStore::new(pool.clone()),
+            )
             .await;
-        host2.sweep_durable_runs().await;
+        // The daemon arms THIS function, so the test drives the spawned
+        // first pass, not the inner sweep: one immediate pass then the
+        // interval (1h here, so the rest of the test sees only the first).
+        let _sweep = host2.spawn_durable_sweep(std::time::Duration::from_secs(3600));
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
-            if host2.durable_parks.lock().unwrap().contains_key("run-cut-9") {
+            if host2
+                .durable_parks
+                .lock()
+                .unwrap()
+                .contains_key("run-cut-9")
+            {
                 break;
             }
             assert!(
@@ -8782,7 +8796,184 @@ steps:
             note: "yes".into(),
         };
         host2.resolve_parked(res).await.expect("durable resolve");
-        let state = host2.pending.lock().await.run_state_durable("run-cut-9").await;
-        assert_eq!(state, RunState::Succeeded, "resolution settles the swept run");
+        let state = host2
+            .pending
+            .lock()
+            .await
+            .run_state_durable("run-cut-9")
+            .await;
+        assert_eq!(
+            state,
+            RunState::Succeeded,
+            "resolution settles the swept run"
+        );
+    }
+
+    /// bd-host-cut-pqkg: the cut witness. A step settled before the restart
+    /// must not run again after it — the model resumes at the parked step,
+    /// not the beginning. Counts dispatches on each host's runner so a
+    /// replayed settled step is visible, not inferred.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restart_does_not_replay_a_settled_step() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use toron_core::bus::in_process::{InProcessBus, InProcessBusConfig};
+        use toron_core::index::schema;
+        use toron_workflow::schema::{Action, Step, StepOnError, Workflow};
+
+        fn counting_runner(count: Arc<AtomicUsize>) -> AsyncEffectRunner {
+            Arc::new(move |_inv: &ActionInvocation| {
+                count.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async move { Ok(serde_json::json!({ "ok": true })) })
+                    as std::pin::Pin<
+                        Box<
+                            dyn std::future::Future<Output = anyhow::Result<serde_json::Value>>
+                                + Send,
+                        >,
+                    >
+            })
+        }
+
+        let db =
+            std::env::temp_dir().join(format!("wf-cut-replay-{}.sqlite", uuid::Uuid::new_v4()));
+        let pool = schema::connect(db.to_str().unwrap())
+            .await
+            .expect("connect");
+        schema::migrate(&pool).await.expect("migrate");
+        let workflow = Workflow {
+            name: "linear-cut-replay".into(),
+            description: None,
+            trigger: None,
+            policy: None,
+            guard: None,
+            principles: vec![],
+            steps: vec![
+                Step {
+                    name: Some("settled-before-restart".into()),
+                    guard: None,
+                    on_error: StepOnError::Continue,
+                    build_slot: false,
+                    action: Action::SendMessage {
+                        to: vec!["nobody".into()],
+                        subject: "once".into(),
+                        body: "settled".into(),
+                        project: Some("demo".into()),
+                    },
+                },
+                Step {
+                    name: Some("approve-it".into()),
+                    guard: None,
+                    on_error: StepOnError::Continue,
+                    build_slot: false,
+                    action: Action::RequestApproval {
+                        message: "ship it?".into(),
+                    },
+                },
+            ],
+            graph: None,
+            inputs: vec![],
+            crew: None,
+        };
+        let before = Arc::new(AtomicUsize::new(0));
+        let bus1: Arc<dyn Bus> = Arc::new(
+            InProcessBus::open(pool.clone(), InProcessBusConfig::default())
+                .await
+                .expect("bus1"),
+        );
+        let host1 = WorkflowHost::over_bus(
+            bus1,
+            vec![workflow.clone()],
+            Some(counting_runner(before.clone())),
+        )
+        .expect("host1");
+        host1
+            .with_effect_store(
+                toron_core::index::workflow_effects::WorkflowEffectStore::new(pool.clone()),
+            )
+            .await;
+        host1
+            .run_durable_loop(
+                "run-cut-replay".to_string(),
+                workflow.clone(),
+                RunInput {
+                    workflow: workflow.clone(),
+                    trigger: serde_json::json!({}),
+                    run_id: Some("run-cut-replay".to_string()),
+                },
+            )
+            .await;
+        assert_eq!(
+            before.load(Ordering::SeqCst),
+            1,
+            "step 0 ran once before the park"
+        );
+        assert!(
+            host1
+                .durable_parks
+                .lock()
+                .unwrap()
+                .contains_key("run-cut-replay"),
+            "host1 parked on the approval"
+        );
+        drop(host1);
+
+        let after = Arc::new(AtomicUsize::new(0));
+        let bus2: Arc<dyn Bus> = Arc::new(
+            InProcessBus::open(pool.clone(), InProcessBusConfig::default())
+                .await
+                .expect("bus2"),
+        );
+        let host2 = WorkflowHost::over_bus(bus2, vec![], Some(counting_runner(after.clone())))
+            .expect("host2");
+        host2
+            .with_effect_store(
+                toron_core::index::workflow_effects::WorkflowEffectStore::new(pool.clone()),
+            )
+            .await;
+        let _sweep = host2.spawn_durable_sweep(std::time::Duration::from_secs(3600));
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !host2
+            .durable_parks
+            .lock()
+            .unwrap()
+            .contains_key("run-cut-replay")
+        {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "sweep must re-park the restarted run"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            after.load(Ordering::SeqCst),
+            0,
+            "the settled step must not be re-dispatched after restart"
+        );
+
+        host2
+            .resolve_parked(Resolution {
+                run_id: "run-cut-replay".into(),
+                project: None,
+                promise_id: "run-cut-replay".into(),
+                generation: 1,
+                verdict: ResolutionVerdict::Approved,
+                note: "yes".into(),
+            })
+            .await
+            .expect("durable resolve");
+        assert_eq!(
+            host2
+                .pending
+                .lock()
+                .await
+                .run_state_durable("run-cut-replay")
+                .await,
+            RunState::Succeeded
+        );
+        assert_eq!(
+            after.load(Ordering::SeqCst),
+            0,
+            "settling the rest of the run replays no settled step"
+        );
+        let _ = std::fs::remove_file(db);
     }
 }

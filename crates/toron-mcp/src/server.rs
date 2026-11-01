@@ -479,6 +479,12 @@ fn spawn_mail_trigger_host(
         Ok(host) => {
             host.spawn_mail_trigger_loop(trigger_rx);
             host.spawn_trigger_loop();
+            // bd-host-cut-pqkg: approvals resolve on the bus, and a daemon
+            // restart re-opens persisted non-terminal models. Both loops were
+            // defined but never armed, so a parked durable run would have
+            // stayed parked forever.
+            host.spawn_resolution_loop();
+            host.spawn_durable_sweep(std::time::Duration::from_secs(30));
             vec![host]
         }
         Err(e) => {
