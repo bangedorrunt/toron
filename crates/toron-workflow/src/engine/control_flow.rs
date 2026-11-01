@@ -18,6 +18,7 @@ use resonate_sdk::prelude::Context;
 
 use crate::schema::{Action, Graph, Step, StepOnError};
 
+use super::leaf::{LeafSeams, dispatch_leaf};
 use super::template::{RenderContext, render_action, render_action_lenient, render_text};
 use super::{
     ActionInvocation, ActionPartition, ApprovalSink, AsyncEffectRunner, AsyncRunJournal, Decision,
@@ -554,27 +555,15 @@ pub const EFFECT_JOURNAL_SINK_UNCOVERED: &str = "bypassed-sink-uncovered";
 /// Dispatch one rendered leaf action through the effect surface (bd-zczp,
 /// bd-engine-run-path-journaling-fwlx).
 ///
-/// ONE function owns the whole contract, because a half-applied contract is
-/// exactly how a bypass gets re-introduced:
+/// Pure / engine-control / unsupported leaves compute in the boundary with no
+/// runner at all (bd-ctj7: the sync compat path is deleted — there is no runner
+/// to misdispatch through, the boundary rejects on its own). An effectful
+/// HostSink leaf hands the whole policy to [`LeafSeams`] + [`dispatch_leaf`],
+/// which own it as ONE implementation so the linear durable host can dispatch
+/// the same leaves with no `Context` (bd-leaf-seams-9rwi).
 ///
-/// - a pure / engine-control / unsupported leaf computes in the boundary
-///   with no runner at all (bd-ctj7: the sync compat path is deleted — there
-///   is no runner to misdispatch through, the boundary rejects on its own);
-/// - an effectful HostSink leaf (mailbox · job · verify) goes through the
-///   context-bearing async runner when one is injected, else the sync
-///   [`EffectRunner`];
-/// - `verify` is a HostSink too, so its embedding-owned `VerifySink` executes
-///   FIRST and its result rides [`RunContext::provider_result`]: the sink stays
-///   the executor (ADR-0024 Spec 2), the journal settles AROUND an effect that
-///   already happened, and the command never runs twice;
-/// - with NO injected runner, [`EffectJournalMode`] decides — see
-///   [`without_journal_seam`].
-///
-/// Returns the leaf's value, never an `Option`: a refusal is a value, so no
-/// caller can mistake "refused" for "not my concern" and re-dispatch it.
-///
-/// Async: every branch that touches a runner is awaited inline — the one
-/// async boundary in the leaf path (bd-ckkf, ADR-0035 Spec 2.2).
+/// Async: the one async boundary in the leaf path stays awaited inline
+/// (bd-ckkf, ADR-0035 Spec 2.2).
 async fn dispatch_leaf_or_compat(
     ctx: &Context,
     invocation: &ActionInvocation,
@@ -582,59 +571,10 @@ async fn dispatch_leaf_or_compat(
     let ActionPartition::HostSink { sink } = partition(&invocation.action) else {
         return invoke_compat(&invocation.action, |_| None);
     };
-    // bd-ckkf: the async seam wins for HostSink leaves — awaited inline,
-    // never thread-hop bridged. Absent = the legacy sync surface below.
-    let async_stored: Arc<Option<AsyncEffectRunner>> =
-        ctx.get_dependency::<Option<AsyncEffectRunner>>();
-    if let Some(afx) = (*async_stored).clone() {
-        return dispatch_leaf_async(ctx, &afx, invocation).await;
-    }
-    let stored: Arc<Option<EffectRunner>> = ctx.get_dependency::<Option<EffectRunner>>();
-    let Some(fx) = (*stored).clone() else {
-        return without_journal_seam(ctx, invocation, sink);
-    }; // Only `verify` needs a second, carrier-bearing invocation (the clone is
-    // avoided on the common path: an effectful leaf dispatches on every run).
-    let outcome = match &invocation.action {
-        Action::Verify { command } => {
-            let sink: Arc<crate::engine::VerifySink> =
-                ctx.get_dependency::<crate::engine::VerifySink>();
-            let mut journaled = invocation.clone();
-            journaled.run.provider_result = Some(sink.project(command));
-            fx(&journaled)
-        }
-        _ => fx(invocation),
-    };
-    match outcome {
-        Ok(value) => value,
-        Err(e) => serde_json::json!({ "ok": false, "error": e.to_string() }),
-    }
-}
-
-/// The async twin of the sync effect branch above (bd-ckkf): the same
-/// verify-first carrier rule, but the runner is awaited inline instead of
-/// bridged. Runner-shaped values throughout (`{ok:false,…}` failures, never
-/// bare `Err`), so the engine's failure predicate keeps working.
-async fn dispatch_leaf_async(
-    ctx: &Context,
-    afx: &AsyncEffectRunner,
-    invocation: &ActionInvocation,
-) -> serde_json::Value {
-    // Only `verify` needs a second, carrier-bearing invocation (the clone is
-    // avoided on the common path: an effectful leaf dispatches on every run).
-    let outcome = match &invocation.action {
-        Action::Verify { command } => {
-            let sink: Arc<crate::engine::VerifySink> =
-                ctx.get_dependency::<crate::engine::VerifySink>();
-            let mut journaled = invocation.clone();
-            journaled.run.provider_result = Some(sink.project(command));
-            afx(&journaled).await
-        }
-        _ => afx(invocation).await,
-    };
-    match outcome {
-        Ok(value) => value,
-        Err(e) => serde_json::json!({ "ok": false, "error": e.to_string() }),
-    }
+    // Seams are read only past the partition, so a pure leaf never touches the
+    // dependency map — the same reach as when this policy lived inline here.
+    let seams = LeafSeams::from_context(ctx);
+    dispatch_leaf(&seams, invocation, sink).await
 }
 
 /// bd-ynef: "now" for the park decision, as INJECTED HOST DATA.
@@ -789,64 +729,6 @@ async fn journal_park_intent(
     out.insert("redrive_key".into(), serde_json::json!(intent.key));
     out.insert("until_ms".into(), serde_json::json!(intent.until_ms));
     Ok(Some(serde_json::Value::Object(out)))
-}
-
-/// An effectful HostSink leaf with NO injected runner.
-///
-/// `Enforced` REFUSES it — before any provider runs, because the provider
-/// performs the very external effect the journal exists to cover.
-/// `Recording` records the refusal visibly (bd-ctj7: Recording never
-/// performs — the old compat-runner execution is deleted): the leaf's value
-/// carries [`EFFECT_JOURNAL_BYPASSED`], so a dry arm reads as unperformed,
-/// never as success.
-fn without_journal_seam(
-    ctx: &Context,
-    invocation: &ActionInvocation,
-    sink: &'static str,
-) -> serde_json::Value {
-    let mode: Arc<EffectJournalMode> = ctx.get_dependency::<EffectJournalMode>();
-    if *mode == EffectJournalMode::Enforced {
-        eprintln!(
-            "toron-workflow: effectful '{sink}' action '{}' REFUSED — no EffectRunner is \
-             injected (EffectJournalMode::Enforced): an external effect is never performed \
-             without its journal (ADR-0032 Spec 6, bd-engine-run-path-journaling-fwlx)",
-            invocation.action.type_name()
-        );
-        return serde_json::json!({
-            "ok": false,
-            "error": format!(
-                "effectful '{sink}' action '{}' refused: no EffectRunner injected \
-                 (EffectJournalMode::Enforced, ADR-0032 Spec 6) — build the engine with a \
-                 journaling runner or drop to Recording for dry arms",
-                invocation.action.type_name()
-            ),
-            "kind": "effect_journal_unavailable",
-        });
-    }
-    eprintln!(
-        "toron-workflow: effectful '{sink}' action '{}' wrote NO effect-journal row \
-         ({EFFECT_JOURNAL_BYPASSED}) — ADR-0032 Spec 6 forbids a silent bypass; inject an \
-         EffectRunner covering this sink",
-        invocation.action.type_name()
-    );
-    let mut value = match &invocation.action {
-        // `Recording` records instead of performs (bd-ctj7): the verify
-        // sink still projects (it already executed), every other HostSink
-        // leaf reports its missing sink — nothing performs here, ever.
-        Action::Verify { command } => {
-            let sink: Arc<crate::engine::VerifySink> =
-                ctx.get_dependency::<crate::engine::VerifySink>();
-            sink.project(command)
-        }
-        _ => invoke_compat(&invocation.action, |_| None),
-    };
-    if let Some(obj) = value.as_object_mut() {
-        obj.insert(
-            "effect_journal".into(),
-            serde_json::json!(EFFECT_JOURNAL_BYPASSED),
-        );
-    }
-    value
 }
 
 // The wrapper mirrors `run_step_with_enclosing`'s threaded dispatch context

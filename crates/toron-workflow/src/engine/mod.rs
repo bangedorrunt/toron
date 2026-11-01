@@ -35,6 +35,7 @@ mod control_flow;
 pub mod durable;
 pub mod durable_host;
 pub mod elm;
+pub mod leaf;
 pub mod park;
 mod reconcile;
 mod sinks;
