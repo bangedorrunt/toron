@@ -32,6 +32,7 @@
 
 mod boundary;
 mod control_flow;
+pub mod durable;
 pub mod elm;
 pub mod park;
 mod reconcile;

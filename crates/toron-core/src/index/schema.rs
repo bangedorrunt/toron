@@ -62,6 +62,10 @@ pub static ADDITIVE_TABLES: &[AdditiveTable] = &[
         name: "durable_engine_runs",
         ddl: include_str!("../../schema/additive/durable_engine.sql"),
     },
+    AdditiveTable {
+        name: "durable_workflow_runs",
+        ddl: include_str!("../../schema/additive/durable_workflow.sql"),
+    },
 ];
 
 /// A store's version, in its two parts: what an opening binary must ship,
