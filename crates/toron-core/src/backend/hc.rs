@@ -857,6 +857,31 @@ impl Client {
         )
     }
 
+    /// Close a workspace. hc has no workspace object: a workspace is a root
+    /// shell terminal plus its descendants. Flywheel creates every child
+    /// `outlive_parent`, so the root's death does not end the tree — kill and
+    /// remove each pane instead. A workspace with no panes is a no-op.
+    pub fn close_workspace(&self, workspace_id: &str) -> Result<(), BackendError> {
+        let want = strip_id_prefix(workspace_id);
+        // `all`: a root shell that already exited still owns its outliving
+        // children, and its finished record should be dropped with them.
+        let panes = self.pane_rows(self.terminal_list(true)?);
+        let mut targets: Vec<String> = panes
+            .into_iter()
+            .filter(|p| strip_id_prefix(&p.workspace_id) == want)
+            .map(|p| p.pane_id)
+            .collect();
+        // Children before parents: hc ids increase with creation, so reverse
+        // order is deepest-first and a `--rm` child cannot vanish before its
+        // own kill is issued.
+        targets.reverse();
+        for pane in targets {
+            self.terminal_kill(&pane)?;
+            let _ = self.terminal_rm(&pane);
+        }
+        Ok(())
+    }
+
     /// Set labels on a terminal and return the updated Terminal
     /// (mail-identity stamp: `toron_pin` / `toron_project` / `toron_npub`).
     pub fn terminal_label(
@@ -1284,6 +1309,10 @@ impl Backend for HcBackend {
         Ok(vec![])
     }
 
+    fn workspace_close(&self, workspace_id: &str, _close_group: bool) -> Result<(), BackendError> {
+        self.client.close_workspace(workspace_id)
+    }
+
     fn workspace_create(&self, label: Option<&str>) -> Result<WorkspaceInfo, BackendError> {
         // A workspace IS a shell terminal here: empty argv runs that
         // machine's own shell, and the workspace id is its prefixed
@@ -1313,7 +1342,8 @@ impl Backend for HcBackend {
         cwd: Option<&str>,
     ) -> Result<PaneInfo, BackendError> {
         // hc has no splits or directions: a shell child of the parent
-        // terminal (independent peer lifecycle via `no_parent`).
+        // terminal. The trait carries no lifecycle flag, so it ends with its
+        // parent; flywheel's own split adds `outlive_parent` for crew peers.
         Ok(self
             .client
             .terminal_run_with_env(&[], None, cwd, Some(parent_pane_id), spawn_env().as_ref())?
@@ -2191,6 +2221,39 @@ mod tests {
     }
 
     #[test]
+    fn workspace_close_kills_the_root_and_its_descendants() {
+        // Every flywheel child is `outlive_parent`, so killing the root does
+        // not end the tree: close must kill each pane and drop its record.
+        let chain = vec![
+            json!({ "address": "t1" }),
+            json!({ "address": "t2", "parent": "t1" }),
+            json!({ "address": "t3", "parent": "t2" }),
+        ];
+        let fake = FakeHc::spawn(full_methods(), chain);
+        let backend = HcBackend::connect(Some(fake.socket.to_str().unwrap())).expect("backend");
+        backend.workspace_close("hc:t1", true).expect("close");
+        let lists = fake.requests_for("terminal.list");
+        assert_eq!(lists[0]["all"], true, "close must see finished roots too");
+        let kills = fake.requests_for("terminal.kill");
+        let killed: Vec<&str> = kills
+            .iter()
+            .filter_map(|k| k["terminal"].as_str())
+            .collect();
+        // Deepest first, so a parent's death cannot take a child's record
+        // before the child's own kill is issued.
+        assert_eq!(killed, ["t3", "t2", "t1"], "{kills:?}");
+        assert_eq!(fake.requests_for("terminal.rm").len(), 3, "records removed");
+
+        // Nothing live in that workspace: already closed, not an error.
+        let empty = FakeHc::spawn(full_methods(), vec![]);
+        let backend = HcBackend::connect(Some(empty.socket.to_str().unwrap())).expect("backend");
+        backend
+            .workspace_close("hc:t1", false)
+            .expect("no-op close");
+        assert!(empty.requests_for("terminal.kill").is_empty());
+    }
+
+    #[test]
     fn pane_list_scoped_returns_the_root_plus_its_descendants() {
         // A workspace is the root terminal PLUS its descendants:
         // `cmd_recover` lists the workspace to decide which registered
@@ -2574,7 +2637,7 @@ mod event_decode_tests {
     #[test]
     #[ignore = "live hc daemon: needs ~/.local/bin/hc and the default session"]
     fn live_events_decode_a_status_report() {
-        let mut client = Client::connect(None).expect("live hc");
+        let client = Client::connect(None).expect("live hc");
         let (_, mut stream) = client.subscribe_terminals(None).expect("subscribe");
         let script = "printf '\\033]7501;state=blocked:kind=question:app=probe\\033\\\\'; sleep 5";
         let term = client

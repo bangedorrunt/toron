@@ -32,7 +32,9 @@ hc has no workspace/tab/pane hierarchy. A terminal is the unit:
 
 The `Backend` trait maps the old workspace/pane surface onto that:
 `workspace_create` runs a shell and names the workspace by its address,
-`pane_list(Some(ws))` is the root plus its descendants (walk `parent`), and
+`pane_list(Some(ws))` is the root plus its descendants (walk `parent`),
+`workspace_close` kills and removes every pane in that tree (children are
+created `outlive_parent`, so killing the root alone would leave them), and
 `agent_start` types the launch line into the existing pane rather than
 creating a second terminal.
 
