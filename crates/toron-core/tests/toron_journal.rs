@@ -17,6 +17,46 @@ use toron_core::kernel::{
     EffectState, InMemoryStore, JournalDisposition, JournalRead, JournalRow, JournalStore,
 };
 
+/// Test-only unwrap layer over the now-fallible trait. Production callers
+/// must handle `JournalError`; the law suite keeps its original assertions,
+/// and the `ToronJournal` error mapping has its own unit test.
+trait JournalOk: JournalStore {
+    fn record_intent_ok(&self, key: &str, max_attempts: u32) -> JournalRow {
+        self.record_intent(key, max_attempts)
+            .expect("record_intent")
+    }
+
+    fn claim_ok(
+        &self,
+        key: &str,
+        owner: &str,
+        lease_deadline: i64,
+        now_ms: i64,
+        expected_generation: u64,
+    ) -> Option<JournalRow> {
+        self.claim(key, owner, lease_deadline, now_ms, expected_generation)
+            .expect("claim")
+    }
+
+    fn settle_ok(&self, key: &str, generation: u64, to: EffectState) -> Option<JournalRow> {
+        self.settle(key, generation, to).expect("settle")
+    }
+
+    fn attempt_ok(&self, key: &str, generation: u64) -> Option<JournalRow> {
+        self.attempt(key, generation).expect("attempt")
+    }
+
+    fn read_ok(&self, offset: i64) -> Option<JournalRead> {
+        self.read(offset).expect("read")
+    }
+
+    fn get_ok(&self, key: &str) -> Option<JournalRow> {
+        self.get(key).expect("get")
+    }
+}
+
+impl<T: JournalStore + ?Sized> JournalOk for T {}
+
 struct Db {
     rt: tokio::runtime::Runtime,
     pool: sqlx::SqlitePool,
@@ -74,62 +114,62 @@ impl Drop for Db {
 // --- 1. the upstream contract, as a law suite over any JournalStore -------
 
 fn intent_before_provider_same_key_on_retry(db: &dyn JournalStore) {
-    let first = db.record_intent("job-1", 3);
+    let first = db.record_intent_ok("job-1", 3);
     assert_eq!(first.state, EffectState::Prepared);
     assert_eq!(first.generation, 0);
-    assert_eq!(first, db.record_intent("job-1", 3));
+    assert_eq!(first, db.record_intent_ok("job-1", 3));
 }
 
 fn claim_sets_owner_lease_generation_atomically(db: &dyn JournalStore) {
-    db.record_intent("job-1", 3);
+    db.record_intent_ok("job-1", 3);
     // Fresh row: generation 0, no owner.
-    let row = db.claim("job-1", "worker-a", 9999, 0, 0).unwrap();
+    let row = db.claim_ok("job-1", "worker-a", 9999, 0, 0).unwrap();
     assert_eq!(row.owner.as_deref(), Some("worker-a"));
     assert_eq!(row.lease_deadline, Some(9999));
     assert_eq!(row.generation, 1);
     // A stale generation claims nothing.
-    assert!(db.claim("job-1", "worker-a", 9999, 0, 0).is_none());
+    assert!(db.claim_ok("job-1", "worker-a", 9999, 0, 0).is_none());
     // A live lease under another owner is never stolen ...
-    assert!(db.claim("job-1", "worker-b", 10000, 0, 1).is_none());
+    assert!(db.claim_ok("job-1", "worker-b", 10000, 0, 1).is_none());
     // ... but the same owner may renew, and anyone may reclaim after expiry
     // (deadline <= now_ms releases the lease).
-    let row = db.claim("job-1", "worker-a", 10000, 0, 1).unwrap();
+    let row = db.claim_ok("job-1", "worker-a", 10000, 0, 1).unwrap();
     assert_eq!(row.generation, 2);
-    let row = db.claim("job-1", "worker-b", 20000, 10000, 2).unwrap();
+    let row = db.claim_ok("job-1", "worker-b", 20000, 10000, 2).unwrap();
     assert_eq!(row.owner.as_deref(), Some("worker-b"));
     assert_eq!(row.generation, 3);
-    assert!(db.claim("never-recorded", "w", 1, 0, 0).is_none());
+    assert!(db.claim_ok("never-recorded", "w", 1, 0, 0).is_none());
 }
 
 fn settle_carries_generation_stale_settles_nothing(db: &dyn JournalStore) {
-    db.record_intent("job-1", 3);
-    db.claim("job-1", "worker-a", 9999, 0, 0);
-    assert!(db.settle("job-1", 0, EffectState::InFlight).is_none());
-    assert_eq!(db.get("job-1").unwrap().state, EffectState::Prepared);
-    let row = db.settle("job-1", 1, EffectState::InFlight).unwrap();
+    db.record_intent_ok("job-1", 3);
+    db.claim_ok("job-1", "worker-a", 9999, 0, 0);
+    assert!(db.settle_ok("job-1", 0, EffectState::InFlight).is_none());
+    assert_eq!(db.get_ok("job-1").unwrap().state, EffectState::Prepared);
+    let row = db.settle_ok("job-1", 1, EffectState::InFlight).unwrap();
     assert_eq!(row.state, EffectState::InFlight);
 }
 
 fn settle_to(db: &dyn JournalStore, key: &str, to: EffectState) -> Option<JournalRow> {
-    let g = db.get(key).unwrap().generation;
-    db.settle(key, g, to)
+    let g = db.get_ok(key).unwrap().generation;
+    db.settle_ok(key, g, to)
 }
 
 fn terminal_states_never_move(db: &dyn JournalStore) {
-    db.record_intent("job-1", 3);
-    db.claim("job-1", "w", 1, 0, 0);
+    db.record_intent_ok("job-1", 3);
+    db.claim_ok("job-1", "w", 1, 0, 0);
     settle_to(db, "job-1", EffectState::InFlight).unwrap();
     settle_to(db, "job-1", EffectState::Settled).unwrap();
     assert!(settle_to(db, "job-1", EffectState::Failed).is_none());
     assert!(settle_to(db, "job-1", EffectState::Cancelled).is_none());
-    assert_eq!(db.get("job-1").unwrap().state, EffectState::Settled);
+    assert_eq!(db.get_ok("job-1").unwrap().state, EffectState::Settled);
     // Terminal rows never move, not even by claim (generation matches here).
-    assert!(db.claim("job-1", "w", 1, 0, 1).is_none());
+    assert!(db.claim_ok("job-1", "w", 1, 0, 1).is_none());
 }
 
 fn unknown_has_no_default_exit(db: &dyn JournalStore) {
-    db.record_intent("job-1", 3);
-    db.claim("job-1", "w", 1, 0, 0);
+    db.record_intent_ok("job-1", 3);
+    db.claim_ok("job-1", "w", 1, 0, 0);
     settle_to(db, "job-1", EffectState::InFlight).unwrap();
     settle_to(db, "job-1", EffectState::Unknown).unwrap();
     assert!(settle_to(db, "job-1", EffectState::Accepted).is_none());
@@ -139,8 +179,8 @@ fn unknown_has_no_default_exit(db: &dyn JournalStore) {
 }
 
 fn accepted_is_its_own_state(db: &dyn JournalStore) {
-    db.record_intent("job-1", 3);
-    db.claim("job-1", "w", 1, 0, 0);
+    db.record_intent_ok("job-1", 3);
+    db.claim_ok("job-1", "w", 1, 0, 0);
     settle_to(db, "job-1", EffectState::InFlight).unwrap();
     let row = settle_to(db, "job-1", EffectState::Accepted).unwrap();
     assert_eq!(row.state, EffectState::Accepted);
@@ -148,30 +188,33 @@ fn accepted_is_its_own_state(db: &dyn JournalStore) {
 }
 
 fn exhausted_attempts_dead_letter(db: &dyn JournalStore) {
-    db.record_intent("job-1", 1);
-    assert_eq!(db.attempt("job-1", 0).unwrap().state, EffectState::Prepared);
-    let row = db.attempt("job-1", 0).unwrap();
+    db.record_intent_ok("job-1", 1);
+    assert_eq!(
+        db.attempt_ok("job-1", 0).unwrap().state,
+        EffectState::Prepared
+    );
+    let row = db.attempt_ok("job-1", 0).unwrap();
     assert_eq!(row.state, EffectState::Failed);
     assert_eq!(row.disposition, Some(JournalDisposition::TerminalFailed));
-    assert!(db.attempt("never-recorded", 0).is_none());
+    assert!(db.attempt_ok("never-recorded", 0).is_none());
 }
 
 fn stale_generation_spends_no_attempts(db: &dyn JournalStore) {
-    db.record_intent("job-1", 3);
-    db.claim("job-1", "worker-a", 9999, 0, 0);
+    db.record_intent_ok("job-1", 3);
+    db.claim_ok("job-1", "worker-a", 9999, 0, 0);
     // Generation 1 holds the lease; generation 0 is the zombie that lost it.
-    assert!(db.attempt("job-1", 0).is_none());
-    assert_eq!(db.get("job-1").unwrap().attempts, 0);
-    assert_eq!(db.attempt("job-1", 1).unwrap().attempts, 1);
+    assert!(db.attempt_ok("job-1", 0).is_none());
+    assert_eq!(db.get_ok("job-1").unwrap().attempts, 0);
+    assert_eq!(db.attempt_ok("job-1", 1).unwrap().attempts, 1);
 }
 
 fn offset_and_state_commit_together(db: &dyn JournalStore) {
-    db.record_intent("a", 3);
-    db.record_intent("b", 3);
-    let ra = db.get("a").unwrap();
-    let rb = db.get("b").unwrap();
+    db.record_intent_ok("a", 3);
+    db.record_intent_ok("b", 3);
+    let ra = db.get_ok("a").unwrap();
+    let rb = db.get_ok("b").unwrap();
     assert!(rb.offset > ra.offset);
-    match db.read(rb.offset).unwrap() {
+    match db.read_ok(rb.offset).unwrap() {
         JournalRead::Entry { offset, row } => {
             assert_eq!(offset, rb.offset);
             assert_eq!(row.key, "b");
@@ -182,27 +225,27 @@ fn offset_and_state_commit_together(db: &dyn JournalStore) {
 }
 
 fn offsets_move_only_forward(db: &dyn JournalStore) {
-    db.record_intent("a", 3);
-    let first = db.get("a").unwrap().offset;
-    db.claim("a", "w", 1, 0, 0);
-    let second = db.get("a").unwrap().offset;
+    db.record_intent_ok("a", 3);
+    let first = db.get_ok("a").unwrap().offset;
+    db.claim_ok("a", "w", 1, 0, 0);
+    let second = db.get_ok("a").unwrap().offset;
     assert!(second > first);
     // A refused settle commits nothing: the offset does not move.
-    assert!(db.settle("a", 0, EffectState::InFlight).is_none());
-    assert_eq!(db.get("a").unwrap().offset, second);
+    assert!(db.settle_ok("a", 0, EffectState::InFlight).is_none());
+    assert_eq!(db.get_ok("a").unwrap().offset, second);
 }
 
 /// Needs a store built with retention 2.
 fn old_offset_returns_gone_with_first_replayable(db: &dyn JournalStore) {
-    db.record_intent("a", 3);
-    let oldest = db.get("a").unwrap().offset;
-    db.record_intent("b", 3);
-    db.record_intent("c", 3);
-    match db.read(oldest).unwrap() {
+    db.record_intent_ok("a", 3);
+    let oldest = db.get_ok("a").unwrap().offset;
+    db.record_intent_ok("b", 3);
+    db.record_intent_ok("c", 3);
+    match db.read_ok(oldest).unwrap() {
         JournalRead::Gone { first_replayable } => assert!(first_replayable > oldest),
         JournalRead::Entry { .. } => panic!("expected gone"),
     }
-    match db.read(-1).unwrap() {
+    match db.read_ok(-1).unwrap() {
         JournalRead::Entry { row, .. } => assert_eq!(row.key, "c"),
         JournalRead::Gone { .. } => panic!("latest is never gone"),
     }
@@ -326,53 +369,56 @@ fn random_operation_sequences_match_the_reference() {
                 0 => {
                     let m = rng.next(3) as u32;
                     (
-                        Some(reference.record_intent(&key, m)),
-                        Some(toron.record_intent(&key, m)),
+                        Some(reference.record_intent_ok(&key, m)),
+                        Some(toron.record_intent_ok(&key, m)),
                     )
                 }
                 1 => {
                     let d = rng.next(100) as i64;
                     // Mostly the current generation, sometimes a stale one,
                     // like the settle arm below: both sides must agree.
-                    let g = reference.get(&key).map_or(0, |r| r.generation);
+                    let g = reference.get_ok(&key).map_or(0, |r| r.generation);
                     let g = if rng.next(4) == 0 {
                         g.saturating_sub(1)
                     } else {
                         g
                     };
                     (
-                        reference.claim(&key, "w", d, step as i64, g),
-                        toron.claim(&key, "w", d, step as i64, g),
+                        reference.claim_ok(&key, "w", d, step as i64, g),
+                        toron.claim_ok(&key, "w", d, step as i64, g),
                     )
                 }
                 2 => {
                     // Mostly the current generation, sometimes a stale one.
-                    let g = reference.get(&key).map_or(0, |r| r.generation);
+                    let g = reference.get_ok(&key).map_or(0, |r| r.generation);
                     let g = if rng.next(4) == 0 {
                         g.saturating_sub(1)
                     } else {
                         g
                     };
                     let to = STATES[rng.next(9) as usize];
-                    (reference.settle(&key, g, to), toron.settle(&key, g, to))
+                    (
+                        reference.settle_ok(&key, g, to),
+                        toron.settle_ok(&key, g, to),
+                    )
                 }
                 3 => {
                     // Mostly the current generation, sometimes a stale one:
                     // both fences must agree.
-                    let g = reference.get(&key).map_or(0, |r| r.generation);
+                    let g = reference.get_ok(&key).map_or(0, |r| r.generation);
                     let g = if rng.next(4) == 0 {
                         g.saturating_sub(1)
                     } else {
                         g
                     };
-                    (reference.attempt(&key, g), toron.attempt(&key, g))
+                    (reference.attempt_ok(&key, g), toron.attempt_ok(&key, g))
                 }
-                _ => (reference.get(&key), toron.get(&key)),
+                _ => (reference.get_ok(&key), toron.get_ok(&key)),
             };
             assert_eq!(shape(&a), shape(&b), "seed {seed} step {step} key {key}");
             assert_eq!(
-                shape(&reference.get(&key)),
-                shape(&toron.get(&key)),
+                shape(&reference.get_ok(&key)),
+                shape(&toron.get_ok(&key)),
                 "seed {seed} step {step}"
             );
             if a.is_some() {
@@ -396,23 +442,23 @@ fn rows_survive_a_reopen_and_scopes_are_isolated() {
         let mut db = Db::at(path.clone());
         db.keep = true;
         let j = db.journal("loop-a", 8);
-        j.record_intent("mail.append:x", 3);
-        let row = j.claim("mail.append:x", "loop-a", 42, 0, 0).unwrap();
+        j.record_intent_ok("mail.append:x", 3);
+        let row = j.claim_ok("mail.append:x", "loop-a", 42, 0, 0).unwrap();
         assert!(
-            db.journal("loop-b", 8).get("mail.append:x").is_none(),
+            db.journal("loop-b", 8).get_ok("mail.append:x").is_none(),
             "scope b sees nothing of a"
         );
         (row.offset, row.generation)
     };
     let db = Db::at(path);
     let j = db.journal("loop-a", 8);
-    let row = j.get("mail.append:x").expect("survives the reopen");
+    let row = j.get_ok("mail.append:x").expect("survives the reopen");
     assert_eq!(
         (row.offset, row.generation, row.owner.as_deref()),
         (offset, generation, Some("loop-a"))
     );
     // Idempotent after the reopen, too.
-    assert_eq!(j.record_intent("mail.append:x", 3), row);
+    assert_eq!(j.record_intent_ok("mail.append:x", 3), row);
 }
 
 #[test]
@@ -423,7 +469,7 @@ fn racing_claims_from_two_processes_never_share_a_generation() {
     b.keep = true;
     let ja = a.journal("race", 1000);
     let jb = b.journal("race", 1000);
-    ja.record_intent("job", 3);
+    ja.record_intent_ok("job", 3);
     // now_ms = MAX retires the lease fence (deadline 1 is always expired),
     // so this measures exactly the generation fence: every success bumps
     // the generation by one, and a stale read retries instead of sharing.
@@ -431,8 +477,8 @@ fn racing_claims_from_two_processes_never_share_a_generation() {
         std::thread::spawn(move || {
             let mut gens = Vec::with_capacity(40);
             while gens.len() < 40 {
-                let g = j.get("job").unwrap().generation;
-                if let Some(row) = j.claim("job", owner, 1, i64::MAX, g) {
+                let g = j.get_ok("job").unwrap().generation;
+                if let Some(row) = j.claim_ok("job", owner, 1, i64::MAX, g) {
                     gens.push(row.generation);
                 }
             }
@@ -477,9 +523,9 @@ fn a_blocking_fiber_call_completes_without_nesting_a_runtime() {
     let row = db
         .rt
         .block_on(
-            async move { tokio::task::spawn_blocking(move || j3.record_intent("k", 1)).await },
+            async move { tokio::task::spawn_blocking(move || j3.record_intent_ok("k", 1)).await },
         )
         .unwrap();
     assert_eq!((row.state, row.disposition), (EffectState::Prepared, None));
-    assert!(j.get("k").is_some());
+    assert!(j.get_ok("k").is_some());
 }

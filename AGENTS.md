@@ -42,6 +42,7 @@ One root `AGENTS.md` only — no per-crate copies.
 | Multiplexer backends | `crates/toron-core/src/backend/` (`hc` OpenRPC client; flywheel selects the plane) |
 | Workflow engine | `crates/toron-workflow/src/{schema,engine}/` — guide `docs/guides/workflow-engine.mdx` |
 | Effect journal / run-state | core index migrations + `RunStateStore`; CLI `toron run-state …` |
+| Durable engine store | `crates/toron-core/src/index/durable_engine.rs` (`EngineStorage` over additive `durable_engine_*` tables; sync bridge like `journal.rs`; `commit_run`/`commit_park` are one transaction each). Kernel re-export: `toron_core::kernel` |
 | Cron (distinct type) | `crates/toron-workflow/src/cron.rs` |
 | MCP tools / resources | `crates/toron-mcp/src/{tools,resources}.rs` |
 | TUI (Elm core) | `crates/toron-cli/src/tui/` — pure `tick`; theme `theme.rs` |

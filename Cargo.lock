@@ -928,6 +928,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "elm-effect-durable"
+version = "0.4.0"
+dependencies = [
+ "elm-effect",
+ "elm-effect-journal",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "elm-effect-elm"
 version = "0.4.0"
 dependencies = [
@@ -3932,6 +3941,7 @@ dependencies = [
  "chrono",
  "ed25519-dalek",
  "elm-effect",
+ "elm-effect-durable",
  "elm-effect-elm",
  "elm-effect-journal",
  "futures-util",
