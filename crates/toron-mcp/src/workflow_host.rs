@@ -37,7 +37,7 @@ use toron_core::index::durable_engine::ToronEngineStore;
 use toron_core::index::durable_workflow::RunState as DurableModelState;
 use toron_core::index::durable_workflow::SyncWorkflowState;
 use toron_core::journal::{JournalDb, ToronJournal};
-use toron_core::kernel::OurEngine;
+use toron_core::kernel::{OurEngine, RunPhase as EnginePhase};
 use toron_core::mailbox::{Mailbox, SendMessage, UnwrappedMail};
 use toron_workflow::coalesce::{
     CoalesceDecision, Coalesced, DlqReason, MentionCoalescer, RequeueOutcome, RequeueSchedule,
@@ -1815,13 +1815,23 @@ impl WorkflowHost {
                 return;
             }
             Ok(Err(e)) => {
-                warn!(run_id = %run_id, "durable open failed: {e}; marking the run failed");
-                self.fail_durable(&run_id).await;
+                // Only an unrepairable open settles the run: a corrupt model
+                // cannot resume, and a terminal engine row is already an
+                // outcome. A store/engine error is transient — the model is
+                // still resumable, so the sweep retries it.
+                match &e {
+                    HostError::Corrupt(_) | HostError::Finished { .. } => {
+                        warn!(run_id = %run_id, "durable open failed: {e}; settling the run");
+                        self.settle_open_failure(&run_id, &e).await;
+                    }
+                    _ => {
+                        warn!(run_id = %run_id, "durable open failed: {e}; leaving the model resumable for the sweep");
+                    }
+                }
                 return;
             }
             Err(e) => {
-                warn!(run_id = %run_id, "durable open task failed: {e}; marking the run failed");
-                self.fail_durable(&run_id).await;
+                warn!(run_id = %run_id, "durable open task failed: {e}; leaving the model resumable for the sweep");
                 return;
             }
         };
@@ -2138,25 +2148,40 @@ impl WorkflowHost {
         match tokio::task::spawn_blocking(|| verb(run)).await {
             Ok(Ok(pair)) => Some(pair),
             Ok(Err(e)) => {
-                warn!(run_id = %run_id, "durable verb failed: {e}; marking the run failed");
-                self.fail_durable(run_id).await;
+                // The model was persisted before the verb ran, so a failed
+                // verb leaves a resumable phase, not a lost run. Do not write
+                // Failed over an outcome the sweep can still repair.
+                warn!(run_id = %run_id, "durable verb failed: {e}; leaving the model resumable for the sweep");
                 None
             }
             Err(e) => {
-                warn!(run_id = %run_id, "durable verb task failed: {e}; marking the run failed");
-                self.fail_durable(run_id).await;
+                warn!(run_id = %run_id, "durable verb task failed: {e}; leaving the model resumable for the sweep");
                 None
             }
         }
     }
 
-    /// Mark one durable run failed, durably (bd-host-cut-pqkg).
-    async fn fail_durable(&self, run_id: &str) {
+    /// Settle an open that cannot resume (bd-host-cut-verb-fail-vdhb):
+    /// a corrupt model is unreadable, and a terminal engine row already has
+    /// an outcome. Never used for a transient store/engine error.
+    async fn settle_open_failure(&self, run_id: &str, err: &HostError) {
+        let state = match err {
+            HostError::Finished { phase } => match phase {
+                EnginePhase::Settled => RunState::Succeeded,
+                EnginePhase::Failed => RunState::Failed,
+                EnginePhase::Cancelled => RunState::Cancelled,
+                EnginePhase::Running | EnginePhase::Parked | EnginePhase::Unknown => {
+                    RunState::Unknown
+                }
+            },
+            HostError::Corrupt(_) => RunState::Failed,
+            _ => return,
+        };
         if let Err(e) = self
             .pending
             .lock()
             .await
-            .set_run_state_durable(run_id, RunState::Failed)
+            .set_run_state_durable(run_id, state)
             .await
         {
             warn!(run_id = %run_id, "durable run state failed: {e:#}");
@@ -8973,6 +8998,81 @@ steps:
             after.load(Ordering::SeqCst),
             0,
             "settling the rest of the run replays no settled step"
+        );
+        let _ = std::fs::remove_file(db);
+    }
+
+    /// bd-host-cut-verb-fail-vdhb: a corrupt model cannot resume, so its open
+    /// settles the run once instead of leaving the sweep to retry a row that
+    /// can never parse.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn corrupt_durable_model_settles_failed_instead_of_retrying() {
+        use toron_core::bus::in_process::{InProcessBus, InProcessBusConfig};
+        use toron_core::index::durable_workflow::WorkflowStateStore;
+        use toron_core::index::schema;
+        use toron_workflow::schema::{Action, Step, StepOnError, Workflow};
+
+        let db =
+            std::env::temp_dir().join(format!("wf-cut-corrupt-{}.sqlite", uuid::Uuid::new_v4()));
+        let pool = schema::connect(db.to_str().unwrap())
+            .await
+            .expect("connect");
+        schema::migrate(&pool).await.expect("migrate");
+        WorkflowStateStore::new(pool.clone())
+            .save("run-corrupt", "{ this is not a run model")
+            .await
+            .expect("save corrupt row");
+        let bus: Arc<dyn Bus> = Arc::new(
+            InProcessBus::open(pool.clone(), InProcessBusConfig::default())
+                .await
+                .expect("bus"),
+        );
+        let host = WorkflowHost::over_bus(bus, vec![], None).expect("host");
+        host.with_effect_store(
+            toron_core::index::workflow_effects::WorkflowEffectStore::new(pool.clone()),
+        )
+        .await;
+        let workflow = Workflow {
+            name: "corrupt-cut".into(),
+            description: None,
+            trigger: None,
+            policy: None,
+            guard: None,
+            principles: vec![],
+            steps: vec![Step {
+                name: Some("never-runs".into()),
+                guard: None,
+                on_error: StepOnError::Continue,
+                build_slot: false,
+                action: Action::SendMessage {
+                    to: vec!["nobody".into()],
+                    subject: "corrupt".into(),
+                    body: "never".into(),
+                    project: None,
+                },
+            }],
+            graph: None,
+            inputs: vec![],
+            crew: None,
+        };
+        host.run_durable_loop(
+            "run-corrupt".to_string(),
+            workflow.clone(),
+            RunInput {
+                workflow,
+                trigger: serde_json::json!({}),
+                run_id: Some("run-corrupt".to_string()),
+            },
+        )
+        .await;
+        assert_eq!(
+            host.pending
+                .lock()
+                .await
+                .run_state_durable("run-corrupt")
+                .await,
+            RunState::Failed,
+            "a corrupt model settles once; the sweep must not retry it forever"
         );
         let _ = std::fs::remove_file(db);
     }
