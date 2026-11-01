@@ -2314,7 +2314,9 @@ impl WorkflowHost {
     /// a `spawn_key`.
     pub fn parse_spawn_resolution(event: &Event) -> Option<SpawnResolution> {
         let kind = event.kind.as_u16();
-        if !(46012..=46999).contains(&kind) {
+        // The job lifecycle (toron-workflow::jobs): 43004 result / 43006 error
+        // are the terminals a spawn consumer publishes.
+        if kind != 43004 && kind != 43006 {
             return None;
         }
         let body: serde_json::Value = serde_json::from_str(&event.content).ok()?;
@@ -6043,7 +6045,7 @@ steps:
         // A completion correlates by spawn_key, not by a promise id.
         let keys = Keys::generate();
         let event = EventBuilder::new(
-            Kind::from_u16(46012),
+            Kind::from_u16(43004),
             serde_json::json!({
                 "spawn_key": "run-spawn:spawn_it:1",
                 "ok": true,
