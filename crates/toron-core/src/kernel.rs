@@ -20,7 +20,8 @@
 //! - the durable engine: [`DurableEngine`], [`OurEngine`], [`EngineStorage`],
 //!   [`MemStorage`], [`RunRow`], [`ParkedRow`], [`RunPhase`], [`StartOutcome`],
 //!   [`ParkOutcome`], [`EngineMsg`], [`StorageError`], [`CronSchedule`],
-//!   [`CronError`], [`fire_key`], [`due_wakes`];
+//!   [`CronError`], [`fire_key`], [`due_wakes`], and [`end_run`] with its
+//!   [`RunEnd`];
 //! - the L16 log: [`DurableLog`], [`Offset`], [`AppendError`] (with
 //!   `StaleEpoch`), and [`durable_log_laws`] so toron's own log runs the
 //!   upstream trait laws;
@@ -62,3 +63,40 @@ pub use elm_effect_journal::store::{
     Read as JournalRead, Row as JournalRow,
 };
 pub use elm_effect_journal::{EffectState, TransitionError, can_transition, transition};
+
+/// Terminal settlement for a run whose lifecycle the host owns.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RunEnd {
+    /// The run finished its work.
+    Succeeded,
+    /// The run failed.
+    Failed,
+}
+
+/// Settle one run's journal row and project the terminal phase onto its run
+/// row.
+///
+/// The host calls this once per terminal transition. A stale generation is a
+/// typed refusal, never a silent success: the caller's model and the engine's
+/// fence disagree, and retrying with the same generation cannot fix that.
+///
+/// # Errors
+///
+/// Returns [`EngineError`] when the store or journal refuses the settlement.
+pub fn end_run<S: EngineStorage, J: JournalStore>(
+    engine: &mut OurEngine<S, J>,
+    key: &str,
+    end: RunEnd,
+) -> Result<(), EngineError> {
+    let status = engine.query(key)?;
+    let to = match end {
+        RunEnd::Succeeded => EffectState::Settled,
+        RunEnd::Failed => EffectState::Failed,
+    };
+    match engine.settle(key, status.generation, to)? {
+        Some(_) => Ok(()),
+        None => Err(EngineError::Journal(JournalError::Rejected(format!(
+            "stale generation settling {key} as {end:?}"
+        )))),
+    }
+}

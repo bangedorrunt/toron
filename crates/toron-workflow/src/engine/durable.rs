@@ -22,6 +22,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::schema::{Action, Step, StepOnError, Workflow};
 
+use super::boundary::{ActionPartition, partition};
+
 /// Where one run is in the linear model.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "phase")]
@@ -195,14 +197,8 @@ pub fn advance(model: &RunModel, msg: &RunMsg) -> (RunModel, Vec<RunEffect>) {
             if next.phase != RunPhase::Ready {
                 return (next, Vec::new());
             }
-            if next.workflow.graph.is_some() {
-                return (
-                    next,
-                    vec![RunEffect::Unsupported {
-                        reason: "graph workflows stay on the Resonate engine until the graph model lands"
-                            .into(),
-                    }],
-                );
+            if let Some(reason) = unsupported_reason(&next.workflow) {
+                return (next, vec![RunEffect::Unsupported { reason }]);
             }
             next.phase = RunPhase::Running;
             let effects = next_effects(&mut next, *now_ms);
@@ -316,13 +312,84 @@ fn next_effects(model: &mut RunModel, now_ms: u64) -> Vec<RunEffect> {
                 message: message.clone(),
             }]
         }
-        _ => {
-            model.phase = RunPhase::Running;
-            vec![RunEffect::ExecuteStep {
-                index: model.step_index,
-                step: Box::new(step),
-            }]
+        action => {
+            if matches!(partition(action), ActionPartition::HostSink { .. }) {
+                model.phase = RunPhase::Running;
+                return vec![RunEffect::ExecuteStep {
+                    index: model.step_index,
+                    step: Box::new(step),
+                }];
+            }
+            // Unreachable through `advance(RunMsg::Start)`, which refuses the
+            // shape first. Kept so a direct caller cannot mistake a control
+            // action for a host step.
+            let error = format!(
+                "step '{name}' uses '{}', which the linear model cannot sequence",
+                action.type_name()
+            );
+            model.phase = RunPhase::Failed {
+                error: error.clone(),
+            };
+            vec![RunEffect::Fail { step: name, error }]
         }
+    }
+}
+
+/// `None` when the linear model can sequence this workflow end to end.
+///
+/// The engine partitions every action; the linear model sequences exactly the
+/// host-sink actions plus `delay` and `request_approval`. Everything else is a
+/// shape the host keeps on the old engine, so it is refused before a run row
+/// or a state row exists.
+pub fn unsupported_reason(workflow: &Workflow) -> Option<String> {
+    if workflow.graph.is_some() {
+        return Some("graph workflows stay on the old engine until the graph model lands".into());
+    }
+    for (index, step) in workflow.steps.iter().enumerate() {
+        if !is_linear(&step.action) {
+            return Some(format!(
+                "step '{}' uses '{}', which the linear model cannot sequence yet",
+                step_name(step, index),
+                step.action.type_name()
+            ));
+        }
+    }
+    None
+}
+
+fn is_linear(action: &Action) -> bool {
+    matches!(
+        action,
+        Action::Delay { .. } | Action::RequestApproval { .. }
+    ) || matches!(partition(action), ActionPartition::HostSink { .. })
+}
+
+/// Effects a restored run must re-issue.
+///
+/// Terminal runs re-issue nothing: the model already holds the outcome, and a
+/// terminal engine verb is not idempotent in the way a park is. A `Running`
+/// model re-issues its current step, which is why the host's step executor must
+/// stay idempotent per effect key.
+pub fn resume_effects(model: &RunModel) -> Vec<RunEffect> {
+    match &model.phase {
+        RunPhase::Ready | RunPhase::Succeeded | RunPhase::Failed { .. } | RunPhase::Cancelled => {
+            Vec::new()
+        }
+        RunPhase::Parked { until_ms, reason } => vec![RunEffect::ParkUntil {
+            until_ms: *until_ms,
+            reason: *reason,
+        }],
+        RunPhase::AwaitingApproval { step, message } => vec![RunEffect::AwaitApproval {
+            step: step.clone(),
+            message: message.clone(),
+        }],
+        RunPhase::Running => match model.workflow.steps.get(model.step_index) {
+            Some(step) => vec![RunEffect::ExecuteStep {
+                index: model.step_index,
+                step: Box::new(step.clone()),
+            }],
+            None => Vec::new(),
+        },
     }
 }
 
