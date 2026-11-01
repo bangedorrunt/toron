@@ -1,6 +1,6 @@
 <!-- governed-by: ADR-0003, ADR-0005, ADR-0012, ADR-0032, ADR-0040 -->
 ---
-status: proposed
+status: accepted
 date: 2026-11-01
 decision-makers: bangedorrunt
 consulted: elm-effect-rs ADR-0005 (durable-engine port and OurEngine); elm-effect-rs ADR-0002 (carrier law); docs/durable-engine/resonate-removal-inventory.md
@@ -9,9 +9,11 @@ informed: flywheel, beads, chiebukuro maintainers
 
 # ADR-0043: Replace Resonate with the in-house durable engine
 
-**Status:** Proposed — awaiting the captain's word (ADR-0001 keeps `accepted` for
-operator sign-off). The implementation below lands behind the existing default;
-the default flips only when this record is accepted.
+**Status:** Accepted — captain word 2026-11-01 ("accept the adr, keep cranking
+away"), relayed to the captain session as the acceptance of this record. The
+in-house engine becomes the substrate as each cutover step lands with its
+witness; Resonate is removed in the recorded order, never ahead of its
+replacement.
 
 **Decision in one sentence:** toron's workflow execution substrate is the in-house
 durable engine — `OurEngine` plus the pure run model and its `DurableRun` host
@@ -114,6 +116,12 @@ still calls `Resonate::run`, and `control_flow.rs` still suspends through
 - **Rollback** is: keep the old server running, redeploy the previous build,
   and replay any run id created after the flip. Nothing in the new path deletes
   a Resonate row.
+
+## Decision log
+
+- **2026-11-01 — accepted.** Captain word; the linear driver, cron host loop,
+  and the removal inventory were already green before acceptance. The default
+  run path flips on the host-loop cut (inventory step 5), not on this record.
 
 ## Alternatives considered
 
