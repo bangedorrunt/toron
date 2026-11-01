@@ -36,9 +36,12 @@ use toron_core::kernel::{
 use super::control_flow::validate_workflow_lineage;
 use super::durable::{
     GraphEffect, GraphModel, GraphMsg, GraphPhase, NodeState, RunEffect, RunModel, RunMsg,
-    RunPhase as ModelPhase, advance, advance_graph, graph_unsupported_reason, resume_effects,
+    RunPhase as ModelPhase, advance_graph, advance_with, graph_unsupported_reason, resume_effects,
     resume_graph_effects, unsupported_reason,
 };
+use super::spawn::{SpawnSeams, SpawnSpec, prepare_spawn, spawn_key};
+
+use crate::schema::Action;
 
 /// How long an approval parks before the wake loop re-drives it.
 ///
@@ -120,6 +123,11 @@ pub struct DurableRun<S: EngineStorage, J: JournalStore, R: RunState> {
     model: RunModel,
     engine: OurEngine<S, J>,
     state: R,
+    /// One entry per workflow step: the prepared spawn spec, when the step is
+    /// an `Action::Spawn`. Built by [`Self::prepare_spawns`]; empty means no
+    /// resolver was injected, and a spawn step lands the old unknown-profile
+    /// value.
+    spawns: Vec<Option<SpawnSpec>>,
 }
 
 impl<S: EngineStorage, J: JournalStore, R: RunState> DurableRun<S, J, R> {
@@ -136,12 +144,38 @@ impl<S: EngineStorage, J: JournalStore, R: RunState> DurableRun<S, J, R> {
     /// Returns [`HostError`] when the shape is unsupported, the store fails, or
     /// the engine refuses the start.
     pub fn open(
+        engine: OurEngine<S, J>,
+        state: R,
+        run_id: impl Into<String>,
+        workflow: crate::schema::Workflow,
+        trigger: serde_json::Value,
+        now_ms: u64,
+    ) -> Result<(Self, Vec<RunEffect>), HostError> {
+        Self::open_with_seams(
+            engine,
+            state,
+            run_id,
+            workflow,
+            trigger,
+            now_ms,
+            &SpawnSeams::default(),
+        )
+    }
+
+    /// [`Self::open`] with the spawn seams the workflow's `spawn` steps need.
+    ///
+    /// The specs are prepared BEFORE the first transition, because a run whose
+    /// first step spawns must park on a spec that already exists (the
+    /// model-first rule).
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_with_seams(
         mut engine: OurEngine<S, J>,
         state: R,
         run_id: impl Into<String>,
         workflow: crate::schema::Workflow,
         trigger: serde_json::Value,
         now_ms: u64,
+        spawn_seams: &SpawnSeams,
     ) -> Result<(Self, Vec<RunEffect>), HostError> {
         let run_id = run_id.into();
         if let Some(json) = state.load(&run_id).map_err(state_error)? {
@@ -151,6 +185,7 @@ impl<S: EngineStorage, J: JournalStore, R: RunState> DurableRun<S, J, R> {
                 model,
                 engine,
                 state,
+                spawns: Vec::new(),
             };
             return run.resume(now_ms).map(|effects| (run, effects));
         }
@@ -178,7 +213,9 @@ impl<S: EngineStorage, J: JournalStore, R: RunState> DurableRun<S, J, R> {
             model: RunModel::new(run_id, workflow, trigger),
             engine,
             state,
+            spawns: Vec::new(),
         };
+        run.prepare_spawns(spawn_seams);
         let model = run.model.clone();
         run.persist(&model)?;
         let effects = run.apply(RunMsg::Start { now_ms }, now_ms)?;
@@ -199,6 +236,122 @@ impl<S: EngineStorage, J: JournalStore, R: RunState> DurableRun<S, J, R> {
     /// Mutable engine, for the wake drain.
     pub fn engine_mut(&mut self) -> &mut OurEngine<S, J> {
         &mut self.engine
+    }
+
+    /// Prepare the spawn spec for every `spawn` step of this workflow.
+    ///
+    /// Profile resolution is the one impure part of a spec, so it happens here
+    /// (the host boundary) and the fold receives data. A step whose profile the
+    /// resolver does not know keeps `None` and lands the old unknown-profile
+    /// value, never a run failure.
+    pub fn prepare_spawns(&mut self, seams: &SpawnSeams) {
+        self.spawns = (0..self.model.workflow.steps.len())
+            .map(|index| {
+                let step = &self.model.workflow.steps[index];
+                let Action::Spawn {
+                    profile,
+                    harness,
+                    workflow,
+                    await_,
+                    no_claim_timeout,
+                    context,
+                } = &step.action
+                else {
+                    return None;
+                };
+                prepare_spawn(
+                    seams,
+                    super::spawn::SpawnInput {
+                        run_id: self.model.run_id.clone(),
+                        node: step
+                            .name
+                            .clone()
+                            .unwrap_or_else(|| format!("step_{}", index + 1)),
+                        attempt: 1,
+                        profile: profile.clone(),
+                        harness: harness.clone(),
+                        workflow_ref: workflow.clone(),
+                        await_: *await_,
+                        no_claim_timeout: *no_claim_timeout,
+                        context: *context,
+                        project: None,
+                        generation: 1,
+                    },
+                )
+                .ok()
+            })
+            .collect();
+    }
+
+    /// The prepared spec for one step, when it is a spawn.
+    pub fn spawn_spec(&self, index: usize) -> Option<&SpawnSpec> {
+        self.spawns.get(index).and_then(Option::as_ref)
+    }
+
+    /// The current spawn-await node, when the run is parked on one.
+    pub fn awaiting_spawn(&self) -> Option<(&str, &SpawnSpec)> {
+        match &self.model.phase {
+            ModelPhase::AwaitingSpawn { node, spec, .. } => Some((node.as_str(), spec)),
+            _ => None,
+        }
+    }
+
+    /// A spawned job settled.
+    ///
+    /// # Errors
+    ///
+    /// [`HostError::WrongPhase`] unless that node is awaiting a spawn.
+    pub fn spawn_settled(
+        &mut self,
+        node: &str,
+        value: serde_json::Value,
+        now_ms: u64,
+    ) -> Result<Vec<RunEffect>, HostError> {
+        self.require_awaiting_spawn(node, "spawn_settled")?;
+        self.apply(
+            RunMsg::SpawnSettled {
+                node: node.to_string(),
+                value,
+                now_ms,
+            },
+            now_ms,
+        )
+    }
+
+    /// A spawned job failed.
+    ///
+    /// # Errors
+    ///
+    /// [`HostError::WrongPhase`] unless that node is awaiting a spawn.
+    pub fn spawn_failed(
+        &mut self,
+        node: &str,
+        error: impl Into<String>,
+        now_ms: u64,
+    ) -> Result<Vec<RunEffect>, HostError> {
+        self.require_awaiting_spawn(node, "spawn_failed")?;
+        self.apply(
+            RunMsg::SpawnFailed {
+                node: node.to_string(),
+                error: error.into(),
+                now_ms,
+            },
+            now_ms,
+        )
+    }
+
+    /// The correlation key of the parked spawn, for host bookkeeping.
+    pub fn awaiting_spawn_key(&self) -> Option<String> {
+        self.awaiting_spawn()
+            .map(|(_, spec)| spawn_key(&spec.run_id, &spec.node, 1))
+    }
+
+    fn require_awaiting_spawn(&self, node: &str, verb: &str) -> Result<(), HostError> {
+        if matches!(&self.model.phase, ModelPhase::AwaitingSpawn { node: awaiting, .. } if awaiting == node)
+        {
+            return Ok(());
+        }
+        Err(self.wrong_phase(verb))
     }
 
     /// The current step finished.
@@ -271,6 +424,18 @@ impl<S: EngineStorage, J: JournalStore, R: RunState> DurableRun<S, J, R> {
                     return self.apply(RunMsg::Woke { now_ms }, now_ms);
                 }
             }
+            ModelPhase::AwaitingSpawn {
+                deadline_ms: Some(deadline),
+                ..
+            } => {
+                self.park(deadline, 0, now_ms)?;
+                if deadline <= now_ms {
+                    return self.apply(RunMsg::Woke { now_ms }, now_ms);
+                }
+            }
+            ModelPhase::AwaitingSpawn {
+                deadline_ms: None, ..
+            } => {}
             ModelPhase::AwaitingApproval { .. } => {
                 self.park(
                     now_ms.saturating_add(APPROVAL_WAIT_MS),
@@ -290,15 +455,27 @@ impl<S: EngineStorage, J: JournalStore, R: RunState> DurableRun<S, J, R> {
     /// `Parked` model that the engine never schedules, and nothing would ever
     /// wake it.
     fn apply(&mut self, msg: RunMsg, now_ms: u64) -> Result<Vec<RunEffect>, HostError> {
-        let (next, effects) = advance(&self.model, &msg);
+        let (next, effects) = advance_with(&self.model, &msg, &self.spawns);
         self.persist(&next)?;
         self.model = next;
         for effect in &effects {
             self.engine_verb(effect, now_ms)?;
         }
+        let spawn_due = match self.model.phase {
+            ModelPhase::AwaitingSpawn {
+                deadline_ms: Some(deadline),
+                ..
+            } => deadline <= now_ms,
+            _ => false,
+        };
         if let ModelPhase::Parked { until_ms, .. } = self.model.phase
             && until_ms <= now_ms
         {
+            let mut all = effects;
+            all.extend(self.apply(RunMsg::Woke { now_ms }, now_ms)?);
+            return Ok(all);
+        }
+        if spawn_due {
             let mut all = effects;
             all.extend(self.apply(RunMsg::Woke { now_ms }, now_ms)?);
             return Ok(all);
@@ -309,7 +486,12 @@ impl<S: EngineStorage, J: JournalStore, R: RunState> DurableRun<S, J, R> {
     fn engine_verb(&mut self, effect: &RunEffect, now_ms: u64) -> Result<(), HostError> {
         let key = self.model.run_id.clone();
         match effect {
-            RunEffect::ExecuteStep { .. } | RunEffect::Unsupported { .. } => Ok(()),
+            // A spawn is published by the embedding, not by the engine: the
+            // durable model owns the park, the host owns the job event.
+            RunEffect::ExecuteStep { .. }
+            | RunEffect::Unsupported { .. }
+            | RunEffect::StartSpawn { .. }
+            | RunEffect::SpawnDetached { .. } => Ok(()),
             RunEffect::ParkUntil { until_ms, .. } => self.park(*until_ms, 0, now_ms),
             RunEffect::AwaitApproval { .. } => self.park(
                 now_ms.saturating_add(APPROVAL_WAIT_MS),
@@ -359,6 +541,7 @@ fn phase_name(phase: &ModelPhase) -> &'static str {
         ModelPhase::Ready => "ready",
         ModelPhase::Running => "running",
         ModelPhase::Parked { .. } => "parked",
+        ModelPhase::AwaitingSpawn { .. } => "awaiting_spawn",
         ModelPhase::AwaitingApproval { .. } => "awaiting_approval",
         ModelPhase::Succeeded => "succeeded",
         ModelPhase::Failed { .. } => "failed",

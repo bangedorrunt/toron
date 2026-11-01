@@ -28,10 +28,14 @@ use super::control_flow::{
     is_approval_decision, leaf_preview_for_value, validate_graph_runtime,
 };
 
+use super::spawn::{SpawnSpec, unknown_profile_error};
 use super::template::render_action_lenient;
 
 /// Where one run is in the linear model.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+// The phase carries the spawn spec by value: that record IS the persisted park,
+// and boxing it would make the restart path indirect for no gain.
+#[allow(clippy::large_enum_variant)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "phase")]
 pub enum RunPhase {
     /// Created, not started.
@@ -44,6 +48,18 @@ pub enum RunPhase {
         until_ms: u64,
         /// Why the run parked.
         reason: ParkReason,
+    },
+    /// Waiting for a spawned job to settle (bd-spawn-park-toron-vwu3).
+    ///
+    /// The spec is stored, not recomputed, so a restart republishes the same
+    /// `spawn_key` and the consumer's claim makes a second start impossible.
+    AwaitingSpawn {
+        /// Step name.
+        node: String,
+        /// The self-contained spawn spec.
+        spec: SpawnSpec,
+        /// Absolute claim deadline, when the step set one.
+        deadline_ms: Option<u64>,
     },
     /// Waiting for a human decision on `step`.
     AwaitingApproval {
@@ -71,6 +87,8 @@ pub enum ParkReason {
     Delay,
     /// `park` action.
     Park,
+    /// A spawn-await claim deadline (bd-spawn-park-toron-vwu3).
+    Spawn,
 }
 
 /// The persisted linear run state.
@@ -115,6 +133,24 @@ pub enum RunMsg {
         /// Host time, unix millis.
         now_ms: u64,
     },
+    /// A spawned job settled.
+    SpawnSettled {
+        /// Step name.
+        node: String,
+        /// The child's terminal value.
+        value: serde_json::Value,
+        /// Host time, unix millis.
+        now_ms: u64,
+    },
+    /// A spawned job failed.
+    SpawnFailed {
+        /// Step name.
+        node: String,
+        /// Failure text.
+        error: String,
+        /// Host time, unix millis.
+        now_ms: u64,
+    },
     /// An approval decision arrived.
     Approval {
         /// Decision value.
@@ -142,6 +178,20 @@ pub enum RunEffect {
         until_ms: u64,
         /// Why.
         reason: ParkReason,
+    },
+    /// Publish a spawn-await job; the run parks until it settles.
+    StartSpawn {
+        /// Step name.
+        node: String,
+        /// The self-contained spec the consumer reads.
+        spec: SpawnSpec,
+    },
+    /// Publish a fire-and-forget spawn; the run does not park.
+    SpawnDetached {
+        /// Step name.
+        node: String,
+        /// The self-contained spec the consumer reads.
+        spec: SpawnSpec,
     },
     /// Wait for an approval decision.
     AwaitApproval {
@@ -195,17 +245,32 @@ impl RunModel {
 
 /// Pure transition: one model in, new model + effects out.
 pub fn advance(model: &RunModel, msg: &RunMsg) -> (RunModel, Vec<RunEffect>) {
+    advance_with(model, msg, &[])
+}
+
+/// Pure transition with the spawn specs the driver prepared for this
+/// workflow's spawn steps, indexed by step.
+///
+/// Profile resolution is the one impure part of building a [`SpawnSpec`], so it
+/// happens in the host ([`super::spawn::prepare_spawn`]) and arrives here as
+/// data: the fold stays pure and total, and a spawn step whose spec is absent
+/// lands the old unknown-profile value instead of parking.
+pub fn advance_with(
+    model: &RunModel,
+    msg: &RunMsg,
+    spawns: &[Option<SpawnSpec>],
+) -> (RunModel, Vec<RunEffect>) {
     let mut next = model.clone();
     match msg {
         RunMsg::Start { now_ms } => {
             if next.phase != RunPhase::Ready {
                 return (next, Vec::new());
             }
-            if let Some(reason) = unsupported_reason(&next.workflow) {
+            if let Some(reason) = model_shape_refusal(&next.workflow) {
                 return (next, vec![RunEffect::Unsupported { reason }]);
             }
             next.phase = RunPhase::Running;
-            let effects = next_effects(&mut next, *now_ms);
+            let effects = next_effects(&mut next, *now_ms, spawns);
             (next, effects)
         }
         RunMsg::StepDone { value, now_ms } => {
@@ -237,10 +302,47 @@ pub fn advance(model: &RunModel, msg: &RunMsg) -> (RunModel, Vec<RunEffect>) {
             next.outputs.insert(name, value.clone());
             next.step_index += 1;
             next.phase = RunPhase::Running;
-            let effects = next_effects(&mut next, *now_ms);
+            let effects = next_effects(&mut next, *now_ms, spawns);
             (next, effects)
         }
         RunMsg::Woke { now_ms } => {
+            // A spawn-await deadline is the one park whose wake can FAIL the
+            // node, so it is handled before the delay arm.
+            if let RunPhase::AwaitingSpawn {
+                node,
+                spec,
+                deadline_ms,
+            } = next.phase.clone()
+            {
+                let Some(deadline) = deadline_ms else {
+                    return (next, Vec::new());
+                };
+                if deadline > *now_ms {
+                    return (
+                        next,
+                        vec![RunEffect::ParkUntil {
+                            until_ms: deadline,
+                            reason: ParkReason::Spawn,
+                        }],
+                    );
+                }
+                let step = next.workflow.steps.get(next.step_index);
+                let error = format!("spawn-await {}: timed out after {}s", spec.spawn_key, {
+                    step.map_or(0, |s| match &s.action {
+                        Action::Spawn {
+                            no_claim_timeout, ..
+                        } => *no_claim_timeout,
+                        _ => 0,
+                    })
+                });
+                return settle_spawn(
+                    &mut next,
+                    &node,
+                    serde_json::json!({"ok": false, "error": error}),
+                    *now_ms,
+                    spawns,
+                );
+            }
             if !matches!(next.phase, RunPhase::Parked { .. }) {
                 return (next, Vec::new());
             }
@@ -252,8 +354,46 @@ pub fn advance(model: &RunModel, msg: &RunMsg) -> (RunModel, Vec<RunEffect>) {
                 .insert(name, serde_json::json!({"ok": true, "waited": true}));
             next.step_index += 1;
             next.phase = RunPhase::Running;
-            let effects = next_effects(&mut next, *now_ms);
+            let effects = next_effects(&mut next, *now_ms, spawns);
             (next, effects)
+        }
+        RunMsg::SpawnSettled {
+            node,
+            value,
+            now_ms,
+        } => {
+            let RunPhase::AwaitingSpawn {
+                node: awaiting,
+                spec,
+                ..
+            } = next.phase.clone()
+            else {
+                return (next, Vec::new());
+            };
+            if &awaiting != node {
+                // A settlement for another node/key is stale.
+                return (next, Vec::new());
+            }
+            let landed = serde_json::json!({
+                "ok": true,
+                "spawn_key": spec.spawn_key,
+                "result": value,
+            });
+            settle_spawn(&mut next, node, landed, *now_ms, spawns)
+        }
+        RunMsg::SpawnFailed {
+            node,
+            error,
+            now_ms,
+        } => {
+            let RunPhase::AwaitingSpawn { node: awaiting, .. } = next.phase.clone() else {
+                return (next, Vec::new());
+            };
+            if &awaiting != node {
+                return (next, Vec::new());
+            }
+            let landed = serde_json::json!({ "ok": false, "error": error });
+            settle_spawn(&mut next, node, landed, *now_ms, spawns)
         }
         RunMsg::Approval { decision, now_ms } => {
             if !matches!(next.phase, RunPhase::AwaitingApproval { .. }) {
@@ -266,7 +406,7 @@ pub fn advance(model: &RunModel, msg: &RunMsg) -> (RunModel, Vec<RunEffect>) {
             next.outputs.insert(name, decision.clone());
             next.step_index += 1;
             next.phase = RunPhase::Running;
-            let effects = next_effects(&mut next, *now_ms);
+            let effects = next_effects(&mut next, *now_ms, spawns);
             (next, effects)
         }
         RunMsg::Cancel => {
@@ -276,7 +416,7 @@ pub fn advance(model: &RunModel, msg: &RunMsg) -> (RunModel, Vec<RunEffect>) {
     }
 }
 
-fn next_effects(model: &mut RunModel, now_ms: u64) -> Vec<RunEffect> {
+fn next_effects(model: &mut RunModel, now_ms: u64, spawns: &[Option<SpawnSpec>]) -> Vec<RunEffect> {
     if model.step_index >= model.workflow.steps.len() {
         model.phase = RunPhase::Succeeded;
         return vec![RunEffect::Complete {
@@ -306,6 +446,60 @@ fn next_effects(model: &mut RunModel, now_ms: u64) -> Vec<RunEffect> {
                 step: name,
                 message: message.clone(),
             }]
+        }
+        Action::Spawn {
+            profile,
+            harness: _,
+            workflow: _,
+            await_,
+            no_claim_timeout: _,
+            context: _,
+        } => {
+            let name = step_name(&step, model.step_index);
+            let Some(spec) = spawns.get(model.step_index).and_then(Option::as_ref) else {
+                // Design (f): a profile that cannot be prepared is a step
+                // VALUE, never a run failure.
+                let error = unknown_profile_error(profile);
+                model.outputs.insert(
+                    name.clone(),
+                    serde_json::json!({ "ok": false, "error": error }),
+                );
+                model.step_index += 1;
+                model.phase = RunPhase::Running;
+                return next_effects(model, now_ms, spawns);
+            };
+            if !*await_ {
+                // Fire-and-forget: the job is published, the run does not park.
+                model.outputs.insert(
+                    name.clone(),
+                    serde_json::json!({ "ok": true, "spawned": true }),
+                );
+                model.step_index += 1;
+                model.phase = RunPhase::Running;
+                let mut effects = vec![RunEffect::SpawnDetached {
+                    node: name,
+                    spec: spec.clone(),
+                }];
+                effects.extend(next_effects(model, now_ms, spawns));
+                return effects;
+            }
+            let deadline_ms = spec.deadline_ms(now_ms);
+            model.phase = RunPhase::AwaitingSpawn {
+                node: name.clone(),
+                spec: spec.clone(),
+                deadline_ms,
+            };
+            let mut effects = vec![RunEffect::StartSpawn {
+                node: name,
+                spec: spec.clone(),
+            }];
+            if let Some(deadline_ms) = deadline_ms {
+                effects.push(RunEffect::ParkUntil {
+                    until_ms: deadline_ms,
+                    reason: ParkReason::Spawn,
+                });
+            }
+            effects
         }
         action => {
             if matches!(partition(action), ActionPartition::HostSink { .. }) {
@@ -363,6 +557,71 @@ fn is_linear(action: &Action) -> bool {
     ) || matches!(partition(action), ActionPartition::HostSink { .. })
 }
 
+/// What the MODEL can sequence, which is a superset of what the router admits.
+///
+/// `spawn` has fold arms as of bd-spawn-park-toron-vwu3, but the router still
+/// withholds it until the flywheel pane consumer reads the spec (separate flip
+/// bead). `Start` therefore asks this, not [`unsupported_reason`]: a shape the
+/// model can sequence must not answer `Unsupported` merely because the cutover
+/// has not flipped.
+fn model_shape_refusal(workflow: &Workflow) -> Option<String> {
+    if workflow.graph.is_some() {
+        return graph_unsupported_reason(workflow);
+    }
+    for (index, step) in workflow.steps.iter().enumerate() {
+        if !is_model_linear(&step.action) {
+            return Some(format!(
+                "step '{}' uses '{}', which the linear model cannot sequence yet",
+                step_name(step, index),
+                step.action.type_name()
+            ));
+        }
+    }
+    None
+}
+
+fn is_model_linear(action: &Action) -> bool {
+    matches!(action, Action::Spawn { .. }) || is_linear(action)
+}
+
+/// Land one spawn settlement and continue.
+///
+/// `on_error: fail_run` on a failed settlement ends the run with the same
+/// enriched bundle the other steps produce; anything else lands the value and
+/// advances.
+fn settle_spawn(
+    model: &mut RunModel,
+    node: &str,
+    value: serde_json::Value,
+    now_ms: u64,
+    spawns: &[Option<SpawnSpec>],
+) -> (RunModel, Vec<RunEffect>) {
+    let step = model.workflow.steps.get(model.step_index).cloned();
+    let name = step
+        .as_ref()
+        .map_or_else(|| node.to_string(), |s| step_name(s, model.step_index));
+    if step
+        .as_ref()
+        .is_some_and(|s| s.on_error == StepOnError::FailRun)
+        && is_failure_value(&value)
+    {
+        let output = fail_run_value(&name, &value, None);
+        model.phase = RunPhase::Failed {
+            error: output
+                .get("error")
+                .and_then(|e| e.as_str())
+                .unwrap_or("step failed")
+                .to_string(),
+        };
+        return (model.clone(), vec![RunEffect::Fail { step: name, output }]);
+    }
+    model.outputs.insert(name, value);
+    model.step_index += 1;
+    model.phase = RunPhase::Running;
+    let effects = next_effects(model, now_ms, spawns);
+    (model.clone(), effects)
+}
+
 /// Effects a restored run must re-issue.
 ///
 /// Terminal runs re-issue nothing: the model already holds the outcome, and a
@@ -377,6 +636,10 @@ pub fn resume_effects(model: &RunModel) -> Vec<RunEffect> {
         RunPhase::Parked { until_ms, reason } => vec![RunEffect::ParkUntil {
             until_ms: *until_ms,
             reason: *reason,
+        }],
+        RunPhase::AwaitingSpawn { node, spec, .. } => vec![RunEffect::StartSpawn {
+            node: node.clone(),
+            spec: spec.clone(),
         }],
         RunPhase::AwaitingApproval { step, message } => vec![RunEffect::AwaitApproval {
             step: step.clone(),

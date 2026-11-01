@@ -40,6 +40,7 @@ pub mod linear_step;
 pub mod park;
 mod reconcile;
 mod sinks;
+pub mod spawn;
 mod template;
 #[cfg(test)]
 mod tests;

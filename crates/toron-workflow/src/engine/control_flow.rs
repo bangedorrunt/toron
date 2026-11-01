@@ -1128,6 +1128,9 @@ pub(crate) fn run_step_with_enclosing<'a>(
                 } => {
                     run_spawn(
                         ctx,
+                        run_id,
+                        node,
+                        attempt,
                         profile,
                         harness.as_deref(),
                         workflow.as_deref(),
@@ -2163,8 +2166,12 @@ fn merge_parent_inputs(
 ///
 /// 0.6 semantics: awaiting a pending promise returns `Err(Error::Suspended)`,
 /// which must PROPAGATE so the runtime parks the run.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_spawn(
     ctx: &Context,
+    run_id: &str,
+    node: &str,
+    attempt: u32,
     profile: &str,
     harness: Option<&str>,
     workflow: Option<&str>,
@@ -2172,35 +2179,37 @@ pub(crate) async fn run_spawn(
     no_claim_timeout: u64,
     context: Option<crate::schema::ContextMode>,
 ) -> resonate_sdk::prelude::Result<serde_json::Value> {
-    // 1. Resolve the profile (DI seam).
-    let resolver = ctx.get_dependency::<ProfileResolver>();
-    let resolved = match (resolver)(profile) {
-        Some(v) => v,
-        None => {
-            return Ok(serde_json::json!({
-                "ok": false,
-                "error": format!("spawn: unknown profile {profile:?} (ProfileResolver returned None)"),
-            }));
+    // 1. Resolve the profile and build the spec through the ONE seam
+    // (bd-spawn-park-toron-vwu3): the durable model builds the same spec, so
+    // the payload a consumer reads has one author.
+    let seams = crate::engine::spawn::SpawnSeams {
+        resolver: Some((*ctx.get_dependency::<ProfileResolver>()).clone()),
+    };
+    let prepared = match crate::engine::spawn::prepare_spawn(
+        &seams,
+        crate::engine::spawn::SpawnInput {
+            run_id: run_id.to_string(),
+            node: node.to_string(),
+            attempt,
+            profile: profile.to_string(),
+            harness: harness.map(str::to_string),
+            workflow_ref: workflow.map(str::to_string),
+            await_,
+            no_claim_timeout,
+            context,
+            project: None,
+            generation: 1,
+        },
+    ) {
+        Ok(spec) => spec,
+        Err(e) => {
+            return Ok(serde_json::json!({ "ok": false, "error": e.message }));
         }
     };
 
-    // 2. Create the promise — the job's binding key.
-    let mut spec = serde_json::json!({
-        "profile": profile,
-        "workflow": workflow,
-        "resolved": resolved,
-        // bd-omwg: the embedding's drainer must know whether the run parks on
-        // this job (resolve on completion) or fired it detached (fire-and-
-        // forget, never resolve).
-        "await": await_,
-    });
-    if let Some(h) = harness.map(str::trim).filter(|h| !h.is_empty()) {
-        spec["harness"] = serde_json::json!(h);
-    }
-    if let Some(ctx_mode) = context {
-        spec["context"] =
-            serde_json::to_value(ctx_mode).unwrap_or(serde_json::Value::String("inherit".into()));
-    }
+    // 2. Create the promise — the job's binding key. The legacy payload is
+    // reproduced byte for byte: the old drainer still reads these keys.
+    let spec = prepared.legacy_payload();
     let task = ctx.promise::<serde_json::Value>().data(&spec)?;
     let task = if await_ && no_claim_timeout > 0 {
         task.timeout(Duration::from_secs(no_claim_timeout))

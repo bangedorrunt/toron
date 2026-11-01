@@ -6,9 +6,11 @@ use std::collections::BTreeMap;
 
 use serde_json::json;
 use toron_workflow::engine::durable::{
-    GraphEffect, GraphModel, GraphMsg, GraphPhase, NodeParkReason, NodeState, RunEffect, RunModel,
-    RunMsg, RunPhase, advance, advance_graph, graph_unsupported_reason,
+    GraphEffect, GraphModel, GraphMsg, GraphPhase, NodeParkReason, NodeState, ParkReason,
+    RunEffect, RunModel, RunMsg, RunPhase, advance, advance_graph, advance_with,
+    graph_unsupported_reason, resume_effects, unsupported_reason,
 };
+use toron_workflow::engine::spawn::SpawnSpec;
 use toron_workflow::schema::{Action, Graph, GraphNode, Step, StepOnError, Workflow};
 
 fn workflow(steps: Vec<Step>) -> Workflow {
@@ -648,4 +650,216 @@ fn linear_bare_failure_is_enriched_on_fail_run() {
         json!("{\"error\":\"render: no such ref\",\"ok\":false}")
     );
     assert!(output.get("attempts").is_none(), "{output}");
+}
+
+// ---------------------------------------------------------------------------
+// Durable spawn park (bd-spawn-park-toron-vwu3)
+// ---------------------------------------------------------------------------
+
+fn spawn_step(await_: bool, no_claim_timeout: u64) -> Step {
+    Step {
+        name: Some("spawn_it".into()),
+        guard: None,
+        on_error: StepOnError::Continue,
+        build_slot: false,
+        action: Action::Spawn {
+            profile: "coder".into(),
+            harness: None,
+            workflow: None,
+            await_,
+            no_claim_timeout,
+            context: None,
+        },
+    }
+}
+
+fn spawn_spec(run_id: &str, node: &str, await_: bool, timeout: u64) -> SpawnSpec {
+    SpawnSpec {
+        spawn_key: format!("{run_id}:{node}:1"),
+        run_id: run_id.into(),
+        node: node.into(),
+        workflow: "test".into(),
+        project: None,
+        generation: 1,
+        profile: "coder".into(),
+        resolved: json!({"agent": "coder"}),
+        harness: None,
+        workflow_ref: None,
+        await_,
+        no_claim_timeout: timeout,
+        context: None,
+    }
+}
+
+/// An awaited spawn parks on `AwaitingSpawn` and settles into
+/// `{ok:true, spawn_key, result}`; the spec rides both the phase and the
+/// effect so a restart republishes the same key.
+#[test]
+fn spawn_awaits_then_settles() {
+    let model = model(vec![spawn_step(true, 30)]);
+    let spec = spawn_spec("run-1", "spawn_it", true, 30);
+    let (model, effects) = advance_with(
+        &model,
+        &RunMsg::Start { now_ms: 1_000 },
+        &[Some(spec.clone())],
+    );
+
+    let [
+        RunEffect::StartSpawn {
+            node,
+            spec: carried,
+        },
+        RunEffect::ParkUntil { until_ms, reason },
+    ] = effects.as_slice()
+    else {
+        panic!("an awaited spawn parks: {effects:?}");
+    };
+    assert_eq!(node, "spawn_it");
+    assert_eq!(carried.spawn_key, "run-1:spawn_it:1");
+    assert_eq!(*until_ms, 1_000 + 30_000, "the claim deadline is a park");
+    assert_eq!(*reason, ParkReason::Spawn);
+    assert!(matches!(
+        &model.phase,
+        RunPhase::AwaitingSpawn {
+            deadline_ms: Some(_),
+            ..
+        }
+    ));
+
+    let (model, effects) = advance_with(
+        &model,
+        &RunMsg::SpawnSettled {
+            node: "spawn_it".into(),
+            value: json!({"pane": "p1"}),
+            now_ms: 2_000,
+        },
+        &[],
+    );
+    assert_eq!(model.phase, RunPhase::Succeeded);
+    assert_eq!(
+        model.outputs["spawn_it"],
+        json!({"ok": true, "spawn_key": "run-1:spawn_it:1", "result": {"pane": "p1"}})
+    );
+    assert!(matches!(effects.as_slice(), [RunEffect::Complete { .. }]));
+}
+
+/// A settled event for another node is stale and changes nothing.
+#[test]
+fn duplicate_spawn_completion_is_ignored() {
+    let model = model(vec![spawn_step(true, 0)]);
+    let spec = spawn_spec("run-1", "spawn_it", true, 0);
+    let (model, _) = advance_with(&model, &RunMsg::Start { now_ms: 1_000 }, &[Some(spec)]);
+    let (model, _) = advance_with(
+        &model,
+        &RunMsg::SpawnSettled {
+            node: "spawn_it".into(),
+            value: json!({"pane": "p1"}),
+            now_ms: 2_000,
+        },
+        &[],
+    );
+    let before = model.clone();
+    let (model, effects) = advance_with(
+        &model,
+        &RunMsg::SpawnSettled {
+            node: "spawn_it".into(),
+            value: json!({"pane": "p2"}),
+            now_ms: 3_000,
+        },
+        &[],
+    );
+    assert!(effects.is_empty(), "a second settlement emits nothing");
+    assert_eq!(model.outputs, before.outputs, "the first settlement stands");
+}
+
+/// No completion by the deadline fails the node with the old timeout text.
+#[test]
+fn spawn_timeout_fails_the_node() {
+    let mut step = spawn_step(true, 5);
+    step.on_error = StepOnError::Continue;
+    let model = model(vec![step]);
+    let spec = spawn_spec("run-1", "spawn_it", true, 5);
+    let (model, _) = advance_with(&model, &RunMsg::Start { now_ms: 1_000 }, &[Some(spec)]);
+
+    let (model, effects) = advance_with(&model, &RunMsg::Woke { now_ms: 6_000 }, &[]);
+    assert_eq!(model.phase, RunPhase::Succeeded);
+    assert_eq!(
+        model.outputs["spawn_it"],
+        json!({"ok": false, "error": "spawn-await run-1:spawn_it:1: timed out after 5s"}),
+        "the old error text, keyed by spawn_key"
+    );
+    assert!(matches!(effects.as_slice(), [RunEffect::Complete { .. }]));
+}
+
+/// `await: false` publishes the job and lands immediately — no park.
+#[test]
+fn detached_spawn_does_not_park() {
+    let model = model(vec![spawn_step(false, 0)]);
+    let spec = spawn_spec("run-1", "spawn_it", false, 0);
+    let (model, effects) = advance_with(&model, &RunMsg::Start { now_ms: 1_000 }, &[Some(spec)]);
+
+    let [
+        RunEffect::SpawnDetached { node, .. },
+        RunEffect::Complete { .. },
+    ] = effects.as_slice()
+    else {
+        panic!("a detached spawn fires and completes: {effects:?}");
+    };
+    assert_eq!(node, "spawn_it");
+    assert_eq!(
+        model.outputs["spawn_it"],
+        json!({"ok": true, "spawned": true})
+    );
+    assert_eq!(model.phase, RunPhase::Succeeded, "no phase change");
+}
+
+/// A profile the resolver cannot build a spec for is a step VALUE, never a
+/// run failure — and the run continues.
+#[test]
+fn unknown_profile_lands_a_value() {
+    let model = model(vec![spawn_step(true, 30)]);
+    let (model, effects) = advance_with(&model, &RunMsg::Start { now_ms: 1_000 }, &[]);
+
+    assert!(
+        matches!(effects.as_slice(), [RunEffect::Complete { .. }]),
+        "no park for an unbuildable spec: {effects:?}"
+    );
+    assert_eq!(model.phase, RunPhase::Succeeded);
+    assert_eq!(
+        model.outputs["spawn_it"]["error"],
+        json!("spawn: unknown profile \"coder\" (ProfileResolver returned None)")
+    );
+}
+
+/// The cutover line: `spawn` stays refused, so a spawn workflow never reaches
+/// this model and leaves no durable row.
+#[test]
+fn spawn_is_still_refused_by_the_router() {
+    let workflow = workflow(vec![spawn_step(false, 0)]);
+    let reason = unsupported_reason(&workflow).expect("spawn stays on the old engine");
+    assert!(reason.contains("spawn"), "{reason}");
+}
+
+/// A restart re-issues the SAME `StartSpawn` (same `spawn_key`), which is what
+/// makes the consumer's claim — not a stored promise — the exactly-once gate.
+#[test]
+fn spawn_restart_reissues_the_same_key() {
+    let model = model(vec![spawn_step(true, 30)]);
+    let spec = spawn_spec("run-1", "spawn_it", true, 30);
+    let (model, _) = advance_with(&model, &RunMsg::Start { now_ms: 1_000 }, &[Some(spec)]);
+
+    let resumed = resume_effects(&model);
+    let [RunEffect::StartSpawn { node, spec }] = resumed.as_slice() else {
+        panic!("a restart re-issues exactly one start: {resumed:?}");
+    };
+    assert_eq!(node, "spawn_it");
+    assert_eq!(spec.spawn_key, "run-1:spawn_it:1");
+
+    // And the stored phase carries the same spec, so the republish is
+    // byte-identical across processes.
+    let stored = match &model.phase {
+        RunPhase::AwaitingSpawn { spec, .. } => spec.clone(),
+        other => panic!("still awaiting: {other:?}"),
+    };
+    assert_eq!(stored, spec.clone());
 }

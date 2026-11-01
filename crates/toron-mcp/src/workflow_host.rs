@@ -52,6 +52,7 @@ use toron_workflow::engine::leaf::LeafSeams;
 use toron_workflow::engine::linear_step::{
     GraphNodeStep, LinearStep, run_graph_node_step, run_linear_step,
 };
+use toron_workflow::engine::spawn::SpawnSpec;
 use toron_workflow::engine::{
     ActionInvocation, ActionPartition, AsyncEffectRunner, AsyncRunJournal, CleanupKind,
     CleanupRequest, Decision, DispatchPlan, EffectJournalMode, FORCED_CLEANUP_CAPABILITY, ParkKind,
@@ -1022,6 +1023,10 @@ pub struct WorkflowHost {
     /// The model has no Resonate promise id, so the run id is the
     /// correlation key; `PendingDrain` never sees these entries.
     durable_parks: Arc<std::sync::Mutex<HashMap<(String, String), DurablePark>>>,
+    /// bd-spawn-park-toron-vwu3: live spawn parks, keyed by `spawn_key`.
+    /// Empty until the spawn cutover lands (the action is still refused), but
+    /// the registry is the map that replaces the old SpawnSink.
+    durable_spawns: Arc<std::sync::Mutex<HashMap<String, DurableSpawn>>>,
     /// bd-host-cut-pqkg: durable runs currently driving in this process.
     /// The restart sweep skips these so a run is never double-driven (a
     /// second driver feeding `step_ok` for the same step would hit
@@ -1049,6 +1054,25 @@ fn find_durable_park(
         .map(|(_, park)| park.clone());
     let first = hits.next()?;
     hits.next().is_none().then_some(first)
+}
+
+/// One spawn parked on the durable path (bd-spawn-park-toron-vwu3): the run id
+/// and node the settled job belongs to.
+#[derive(Clone, Debug)]
+struct DurableSpawn {
+    run_id: String,
+    node: String,
+}
+
+/// A spawn completion read from the bus.
+#[derive(Clone, Debug)]
+pub struct SpawnResolution {
+    /// The correlation key the job was published with.
+    pub spawn_key: String,
+    /// `true` when the child finished, `false` when it failed.
+    pub settled: bool,
+    /// The child's value / failure text.
+    pub value: serde_json::Value,
 }
 
 /// One approval parked on the durable path (bd-host-cut-pqkg).
@@ -1267,6 +1291,7 @@ impl WorkflowHost {
             dispatch_pool,
             seams,
             durable_parks,
+            durable_spawns: Arc::new(std::sync::Mutex::new(HashMap::new())),
             durable_active,
         })
     }
@@ -1311,6 +1336,7 @@ impl WorkflowHost {
             dispatch_pool: Arc::new(DispatchPool::new(DispatchConfig::default())),
             seams,
             durable_parks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            durable_spawns: Arc::new(std::sync::Mutex::new(HashMap::new())),
             durable_active: Arc::new(std::sync::Mutex::new(HashSet::new())),
         })
     }
@@ -1341,6 +1367,7 @@ impl WorkflowHost {
             // bd-host-cut-pqkg: inert without a store (the router never selects it).
             seams: LeafSeams::default(),
             durable_parks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            durable_spawns: Arc::new(std::sync::Mutex::new(HashMap::new())),
             durable_active: Arc::new(std::sync::Mutex::new(HashSet::new())),
         }
     }
@@ -2188,6 +2215,37 @@ impl WorkflowHost {
                         .await;
                         return;
                     }
+                    RunEffect::StartSpawn { node, spec } => {
+                        // The model already persisted `AwaitingSpawn` (model
+                        // first); publish the job and let the completion
+                        // settle the park by spawn_key.
+                        self.durable_spawns
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .insert(
+                                spec.spawn_key.clone(),
+                                DurableSpawn {
+                                    run_id: run_id.clone(),
+                                    node,
+                                },
+                            );
+                        if let Err(e) = self.publish_durable_spawn(&spec).await {
+                            warn!(run_id = %run_id, "durable spawn publication failed (park retained): {e:#}");
+                        }
+                        let _ = self
+                            .pending
+                            .lock()
+                            .await
+                            .set_run_state_durable(&run_id, RunState::Suspended)
+                            .await;
+                        return;
+                    }
+                    RunEffect::SpawnDetached { spec, .. } => {
+                        if let Err(e) = self.publish_durable_spawn(&spec).await {
+                            warn!(run_id = %run_id, "durable detached spawn publication failed: {e:#}");
+                        }
+                        continue;
+                    }
                     RunEffect::Complete { output } => {
                         self.settle_durable(&run_id, "succeeded", "", &output.to_string())
                             .await;
@@ -2222,6 +2280,121 @@ impl WorkflowHost {
             }
             effects = follow;
         }
+    }
+
+    /// Publish one durable spawn job (bd-spawn-park-toron-vwu3): the WHOLE
+    /// spec rides the kind-43001 `spec`, because the consumer no longer reads a
+    /// vendor promise.
+    pub async fn publish_durable_spawn(&self, spec: &SpawnSpec) -> Result<EventId> {
+        let signer = self
+            .job_signer
+            .as_ref()
+            .context("no signer: cannot publish kind-43001 spawn")?;
+        let payload = JobRequest {
+            title: format!("spawn {}/{}", spec.run_id, spec.node),
+            spec: serde_json::to_value(spec)
+                .map_err(|e| anyhow::anyhow!("encode spawn spec: {e}"))?,
+            assignee: None,
+        };
+        let mut tags = Vec::new();
+        if let Some(project) = &spec.project {
+            tags.push(Tag::parse(["t", project]).map_err(|e| anyhow::anyhow!("t tag: {e}"))?);
+        }
+        let event = build_job_request_with_tags(signer, None, &payload, Timestamp::now(), tags)
+            .map_err(|e| anyhow::anyhow!("build 43001: {e}"))?;
+        let id = event.id;
+        self.bus
+            .publish(event)
+            .await
+            .map_err(|e| anyhow::anyhow!("publish 43001: {e}"))?;
+        Ok(id)
+    }
+
+    /// Parse a durable spawn completion: a job-terminal event whose body names
+    /// a `spawn_key`.
+    pub fn parse_spawn_resolution(event: &Event) -> Option<SpawnResolution> {
+        let kind = event.kind.as_u16();
+        if !(46012..=46999).contains(&kind) {
+            return None;
+        }
+        let body: serde_json::Value = serde_json::from_str(&event.content).ok()?;
+        let spawn_key = body.get("spawn_key")?.as_str()?.to_string();
+        let settled = body.get("ok").and_then(|v| v.as_bool()).unwrap_or(true);
+        Some(SpawnResolution {
+            spawn_key,
+            settled,
+            value: body.get("result").cloned().unwrap_or(body),
+        })
+    }
+
+    /// Settle one durable spawn park through the state store.
+    pub async fn resolve_durable_spawn(&self, res: SpawnResolution) -> Result<()> {
+        let Some(spawn) = self
+            .durable_spawns
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&res.spawn_key)
+            .cloned()
+        else {
+            anyhow::bail!("unknown spawn_key {}", res.spawn_key);
+        };
+        self.durable_spawns
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&res.spawn_key);
+        let pool = self.pending.lock().await.store().map(|s| s.pool().clone());
+        let Some(pool) = pool else {
+            anyhow::bail!("durable spawn lost its store for {}", res.spawn_key);
+        };
+        let (engine_store, journal, state) = host_handles(pool);
+        let rid = spawn.run_id.clone();
+        let node = spawn.node.clone();
+        let workflow = self
+            .workflows
+            .lock()
+            .map(|g| g.first().cloned())
+            .ok()
+            .flatten();
+        let settled = tokio::task::spawn_blocking(move || {
+            let engine = OurEngine::with_journal(engine_store, journal);
+            let (mut run, _) = DurableRun::open(
+                engine,
+                state,
+                rid.clone(),
+                workflow.unwrap_or_else(|| Workflow {
+                    name: String::new(),
+                    description: None,
+                    trigger: None,
+                    policy: None,
+                    guard: None,
+                    steps: vec![],
+                    graph: None,
+                    inputs: vec![],
+                    crew: None,
+                    principles: vec![],
+                }),
+                serde_json::json!({}),
+                durable_now_ms(),
+            )?;
+            if res.settled {
+                run.spawn_settled(&node, res.value, durable_now_ms())
+                    .map(|effects| (run, effects))
+            } else {
+                let error = res
+                    .value
+                    .get("error")
+                    .and_then(|e| e.as_str())
+                    .unwrap_or("spawn failed")
+                    .to_string();
+                run.spawn_failed(&node, error, durable_now_ms())
+                    .map(|effects| (run, effects))
+            }
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("durable spawn task failed: {e}"))?;
+        let (_run, _effects) =
+            settled.map_err(|e: HostError| anyhow::anyhow!("durable spawn failed: {e}"))?;
+        Ok(())
     }
 
     /// Drive one graph workflow on the durable host (bd-durable-graph-impl-r2x1).
@@ -5792,6 +5965,98 @@ steps:
             bad["output"].get("evidence").is_none(),
             "the bundle is not re-wrapped: {bad}"
         );
+    }
+
+    /// bd-spawn-park-toron-vwu3: the durable spawn is a self-contained job — the
+    /// whole spec rides kind-43001 (`spawn_key`, profile, resolved, harness,
+    /// await, timeout, context), and a completion is correlated by that key.
+    /// `Action::Spawn` is still refused, so this is capability, not cutover.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn durable_spawn_publishes_the_whole_spec_and_correlates_by_key() {
+        use toron_core::bus::in_process::{InProcessBus, InProcessBusConfig};
+        use toron_core::index::schema;
+        use toron_workflow::engine::spawn::SpawnSpec;
+
+        let db = std::env::temp_dir().join(format!("wf-spawn-{}.sqlite", uuid::Uuid::new_v4()));
+        let pool = schema::connect(db.to_str().unwrap())
+            .await
+            .expect("connect");
+        schema::migrate(&pool).await.expect("migrate");
+        let bus: Arc<dyn Bus> = Arc::new(
+            InProcessBus::open(pool, InProcessBusConfig::default())
+                .await
+                .expect("bus"),
+        );
+        let host = WorkflowHost::over_bus(bus.clone(), vec![], None)
+            .expect("host")
+            .with_job_signer(Some(Keys::generate()));
+        let mut sub = bus
+            .subscribe_trusted(toron_core::bus::Filter::new())
+            .await
+            .expect("subscribe");
+
+        let spec = SpawnSpec {
+            spawn_key: "run-spawn:spawn_it:1".into(),
+            run_id: "run-spawn".into(),
+            node: "spawn_it".into(),
+            workflow: "spawn-wf".into(),
+            project: None,
+            generation: 1,
+            profile: "coder".into(),
+            resolved: serde_json::json!({"agent": "coder"}),
+            harness: Some("opencode".into()),
+            workflow_ref: None,
+            await_: true,
+            no_claim_timeout: 600,
+            context: None,
+        };
+        host.publish_durable_spawn(&spec)
+            .await
+            .expect("publish spawn");
+
+        let mut body = None;
+        for _ in 0..20 {
+            let Ok(got) = tokio::time::timeout(std::time::Duration::from_secs(5), sub.next()).await
+            else {
+                break;
+            };
+            let Some(toron_core::bus::SubscriptionEvent::Event(ev)) = got else {
+                continue;
+            };
+            if ev.kind.as_u16() == 43001 {
+                body = Some(serde_json::from_str::<serde_json::Value>(&ev.content).expect("json"));
+                break;
+            }
+        }
+        let body = body.expect("a 43001 spawn job");
+        let carried = &body["spec"];
+        assert_eq!(
+            carried["spawn_key"],
+            serde_json::json!("run-spawn:spawn_it:1")
+        );
+        assert_eq!(carried["profile"], serde_json::json!("coder"));
+        assert_eq!(carried["resolved"], serde_json::json!({"agent": "coder"}));
+        assert_eq!(carried["harness"], serde_json::json!("opencode"));
+        assert_eq!(carried["await"], serde_json::json!(true));
+        assert_eq!(carried["no_claim_timeout"], serde_json::json!(600));
+
+        // A completion correlates by spawn_key, not by a promise id.
+        let keys = Keys::generate();
+        let event = EventBuilder::new(
+            Kind::from_u16(46012),
+            serde_json::json!({
+                "spawn_key": "run-spawn:spawn_it:1",
+                "ok": true,
+                "result": {"pane": "p1"},
+            })
+            .to_string(),
+        )
+        .finalize(&keys)
+        .expect("sign");
+        let parsed = WorkflowHost::parse_spawn_resolution(&event).expect("a spawn completion");
+        assert_eq!(parsed.spawn_key, "run-spawn:spawn_it:1");
+        assert!(parsed.settled);
+        assert_eq!(parsed.value["pane"], serde_json::json!("p1"));
     }
 
     /// bd-asx3 e2e: a real parked run is SUSPENDED (never failed), drains
