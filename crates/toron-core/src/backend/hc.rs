@@ -70,6 +70,8 @@ pub const HC_GENERATION: u32 = 1;
 
 /// Default unary RPC budget when params omit a timeout.
 pub const DEFAULT_RPC_TIMEOUT_MS: u64 = 30_000;
+/// hc's documented default wait (config `wait_timeout`, else 180 s).
+const DEFAULT_WAIT_MS: u64 = 180_000;
 /// Margin above the call budget so the socket deadline loses the race cleanly.
 pub const RPC_TIMEOUT_MARGIN_MS: u64 = 5_000;
 
@@ -253,6 +255,24 @@ pub fn unique_mail_name<'a>(name: Option<&'a str>, all_names: &[Option<&str>]) -
     (count == 1).then_some(name)
 }
 
+/// Per-terminal mail identity for one snapshot: a unique `toron_pin` label
+/// wins (the labels-only stamp), else a unique terminal name, else `None` so
+/// the caller falls back to the `hc:` id and never publishes a collision.
+fn mail_names(terminals: &[Terminal]) -> Vec<Option<String>> {
+    let pins: Vec<Option<&str>> = terminals
+        .iter()
+        .map(|t| t.labels.get(TOKEN_PIN).map(String::as_str))
+        .collect();
+    let names: Vec<Option<&str>> = terminals.iter().map(|t| t.name.as_deref()).collect();
+    (0..terminals.len())
+        .map(|i| {
+            unique_mail_name(pins[i], &pins)
+                .or_else(|| unique_mail_name(names[i], &names))
+                .map(str::to_string)
+        })
+        .collect()
+}
+
 /// Resolve the hc socket path (pure — testable).
 pub fn resolve_socket_path(
     explicit: Option<&str>,
@@ -363,10 +383,6 @@ impl Terminal {
         fold(&board, policy)
     }
 
-    fn to_agent_info(&self, policy: FoldPolicy) -> AgentInfo {
-        self.to_agent_info_with_mail_name(policy, self.name.clone())
-    }
-
     fn to_agent_info_with_mail_name(
         &self,
         policy: FoldPolicy,
@@ -466,6 +482,11 @@ impl Capabilities {
     }
 }
 
+/// Stable per-client caller id. hc uses `(caller, terminal)` to remember the
+/// turn a send started, so a bare wait from the same caller waits for that
+/// turn instead of returning at once while the agent is still idle.
+static CALLER_SEQ: AtomicU64 = AtomicU64::new(1);
+
 /// Blocking JSON-RPC client over the hc unix socket.
 #[derive(Debug)]
 pub struct Client {
@@ -473,6 +494,7 @@ pub struct Client {
     next_id: AtomicU64,
     caps: Capabilities,
     fold_policy: FoldPolicy,
+    caller: String,
 }
 
 impl Clone for Client {
@@ -482,6 +504,7 @@ impl Clone for Client {
             next_id: AtomicU64::new(self.next_id.load(Ordering::Relaxed)),
             caps: self.caps.clone(),
             fold_policy: self.fold_policy,
+            caller: self.caller.clone(),
         }
     }
 }
@@ -509,6 +532,11 @@ impl Client {
                 features: Vec::new(),
             },
             fold_policy,
+            caller: format!(
+                "toron-{}-{}",
+                std::process::id(),
+                CALLER_SEQ.fetch_add(1, Ordering::Relaxed)
+            ),
         };
         let hello = client.hello()?;
         for method in REQUIRED_METHODS {
@@ -712,22 +740,47 @@ impl Client {
         })
     }
 
+    /// Send without waiting for the turn.
     pub fn terminal_send(
         &self,
         terminal: &str,
         text: &str,
         wait_ms: Option<u64>,
     ) -> Result<Value, BackendError> {
-        let mut params = json!({
-            "terminal": strip_id_prefix(terminal),
-            "text": text,
-        });
-        // Schema: `wait` is BOOL, `timeout` is SECONDS (number).
-        if let Some(ms) = wait_ms {
-            params["wait"] = json!(true);
-            params["timeout"] = json!(ms as f64 / 1000.0);
+        match wait_ms {
+            Some(ms) => self.terminal_send_wait(terminal, text, Some(ms)),
+            None => self.call_coded(
+                "terminal.send",
+                json!({
+                    "terminal": strip_id_prefix(terminal),
+                    "text": text,
+                    // Ties a later bare wait to this send's turn. Not an hc
+                    // terminal address, so hc does not tag the text.
+                    "caller": self.caller,
+                }),
+            ),
         }
-        self.call_coded("terminal.send", params)
+    }
+
+    /// Send, then wait for the turn it started. `timeout_ms: None` means the
+    /// hc default (180 s), sent explicitly so the socket deadline covers it.
+    pub fn terminal_send_wait(
+        &self,
+        terminal: &str,
+        text: &str,
+        timeout_ms: Option<u64>,
+    ) -> Result<Value, BackendError> {
+        let secs = timeout_ms.unwrap_or(DEFAULT_WAIT_MS) as f64 / 1000.0;
+        self.call_coded(
+            "terminal.send",
+            json!({
+                "terminal": strip_id_prefix(terminal),
+                "text": text,
+                "caller": self.caller,
+                "wait": true,
+                "timeout": secs,
+            }),
+        )
     }
 
     pub fn terminal_keys(&self, terminal: &str, keys: &[&str]) -> Result<Value, BackendError> {
@@ -745,12 +798,17 @@ impl Client {
         terminal: &str,
         timeout_ms: Option<u64>,
     ) -> Result<Value, BackendError> {
-        let mut params = json!({ "terminal": strip_id_prefix(terminal) });
-        // Schema: `timeout` is SECONDS (number).
-        if let Some(ms) = timeout_ms {
-            params["timeout"] = json!(ms as f64 / 1000.0);
-        }
-        self.call_coded("terminal.wait", params)
+        // Send the default explicitly: the server would wait 180 s, and the
+        // socket deadline must cover it, not the 30 s RPC default.
+        let secs = timeout_ms.unwrap_or(DEFAULT_WAIT_MS) as f64 / 1000.0;
+        self.call_coded(
+            "terminal.wait",
+            json!({
+                "terminal": strip_id_prefix(terminal),
+                "caller": self.caller,
+                "timeout": secs,
+            }),
+        )
     }
 
     /// Wait until post-call output contains `output` (plain text), or the
@@ -761,14 +819,15 @@ impl Client {
         output: &str,
         timeout_ms: Option<u64>,
     ) -> Result<Value, BackendError> {
-        let mut params = json!({
-            "terminal": strip_id_prefix(terminal),
-            "output": output,
-        });
-        if let Some(ms) = timeout_ms {
-            params["timeout"] = json!(ms as f64 / 1000.0);
-        }
-        self.call_coded("terminal.wait", params)
+        let secs = timeout_ms.unwrap_or(DEFAULT_WAIT_MS) as f64 / 1000.0;
+        self.call_coded(
+            "terminal.wait",
+            json!({
+                "terminal": strip_id_prefix(terminal),
+                "output": output,
+                "timeout": secs,
+            }),
+        )
     }
 
     pub fn terminal_read(&self, terminal: &str, lines: u32) -> Result<Value, BackendError> {
@@ -825,14 +884,13 @@ impl Client {
         // own root).
         let parents = parent_map(&terminals);
         let known: BTreeSet<String> = terminals.iter().map(|t| t.address.clone()).collect();
-        let names: Vec<Option<String>> = terminals.iter().map(|t| t.name.clone()).collect();
-        let name_refs: Vec<Option<&str>> = names.iter().map(|n| n.as_deref()).collect();
+        let mail_names = mail_names(&terminals);
         Ok(terminals
             .into_iter()
             .enumerate()
             .map(|(i, t)| {
-                let mail_name = unique_mail_name(name_refs[i], &name_refs).map(str::to_string);
-                let mut info = t.to_agent_info_with_mail_name(self.fold_policy, mail_name);
+                let mut info =
+                    t.to_agent_info_with_mail_name(self.fold_policy, mail_names[i].clone());
                 info.workspace_id = prefix_id(&root_address(&parents, &known, &t.address));
                 info
             })
@@ -840,7 +898,14 @@ impl Client {
     }
 
     pub fn agent_get(&self, target: &str) -> Result<AgentInfo, BackendError> {
-        Ok(self.terminal_get(target)?.to_agent_info(self.fold_policy))
+        let term = self.terminal_get(target)?;
+        // A stamped pin is the identity; the terminal name is the fallback.
+        let mail_name = term
+            .labels
+            .get(TOKEN_PIN)
+            .cloned()
+            .or_else(|| term.name.clone());
+        Ok(term.to_agent_info_with_mail_name(self.fold_policy, mail_name))
     }
 
     pub fn pane_list(&self) -> Result<Vec<PaneInfo>, BackendError> {
@@ -852,15 +917,14 @@ impl Client {
     fn pane_rows(&self, terminals: Vec<Terminal>) -> Vec<PaneInfo> {
         let parents = parent_map(&terminals);
         let known: BTreeSet<String> = terminals.iter().map(|t| t.address.clone()).collect();
-        let names: Vec<Option<String>> = terminals.iter().map(|t| t.name.clone()).collect();
-        let name_refs: Vec<Option<&str>> = names.iter().map(|n| n.as_deref()).collect();
+        let mail_names = mail_names(&terminals);
         terminals
             .into_iter()
             .enumerate()
             .map(|(i, t)| {
-                let mail_name = unique_mail_name(name_refs[i], &name_refs).map(str::to_string);
                 let ws = prefix_id(&root_address(&parents, &known, &t.address));
-                let mut info = t.to_pane_info_with_mail_name(self.fold_policy, mail_name);
+                let mut info =
+                    t.to_pane_info_with_mail_name(self.fold_policy, mail_names[i].clone());
                 info.workspace_id = ws;
                 info
             })
@@ -947,6 +1011,7 @@ impl Client {
             HcEventStream {
                 reader,
                 fold_policy: self.fold_policy,
+                pending: VecDeque::new(),
             },
         ))
     }
@@ -998,49 +1063,93 @@ fn parse_code(code: &str) -> BackendErrorCode {
     }
 }
 
+/// Map one hc `SendResult` onto the coded landing the old prompt path used.
+/// `started: false` means the text went in but the program did not go
+/// `working` within hc's start window — the old `agent_prompt_stalled`.
+fn landing_from_send(val: &Value) -> PromptLanding {
+    let status = val
+        .get("status")
+        .and_then(Value::as_str)
+        .map(normalize_agent_status);
+    let code = (val.get("started").and_then(Value::as_bool) == Some(false))
+        .then(|| "agent_prompt_stalled".to_string());
+    PromptLanding { status, code }
+}
+
 /// Long-lived hc event stream (plain mode: notifications after subscribe).
 pub struct HcEventStream {
     reader: BufReader<UnixStream>,
     fold_policy: FoldPolicy,
+    /// A `missed` notification carries a fresh snapshot; its terminal records
+    /// are queued here so the consumer sees the gap notice first, then the
+    /// current status of every terminal the snapshot named.
+    pending: VecDeque<BackendEvent>,
 }
 
 impl HcEventStream {
-    fn decode_line(&self, line: &str) -> Result<Option<BackendEvent>, BackendError> {
+    fn decode_line(&mut self, line: &str) -> Result<Option<BackendEvent>, BackendError> {
         let val: Value = serde_json::from_str(line.trim()).map_err(|e| {
             BackendError::new(
                 BackendErrorCode::Malformed,
                 format!("hc event: {line}: {e}"),
             )
         })?;
-        // Notifications: { method, params } or { result: Terminal } variants.
-        if let Some(method) = val.get("method").and_then(Value::as_str) {
-            if method.contains("missed") {
-                return Ok(Some(BackendEvent::EventsLost));
-            }
-            let params = val.get("params").cloned().unwrap_or(Value::Null);
-            if let Some(event) = terminal_event_from_value(&params, self.fold_policy) {
+        let Some(method) = val.get("method").and_then(Value::as_str) else {
+            // Some servers deliver the record as the notification body.
+            if let Some(event) = terminal_event_from_value(&val, self.fold_policy) {
                 return Ok(Some(event));
             }
             return Ok(Some(BackendEvent::Raw(line.to_string())));
+        };
+        let params = val.get("params").cloned().unwrap_or(Value::Null);
+        match method {
+            // A subscriber that fell behind gets the gap notice plus a fresh
+            // snapshot: queue the snapshot's status rows, then report the gap.
+            // Socket order is preserved, so later events are newer than it.
+            "missed" => {
+                if let Some(terminals) = params.get("terminals").and_then(Value::as_array) {
+                    for record in terminals {
+                        let Ok(term) = serde_json::from_value::<Terminal>(record.clone()) else {
+                            continue;
+                        };
+                        self.pending
+                            .push_back(status_event(&term, self.fold_policy));
+                    }
+                }
+                Ok(Some(BackendEvent::EventsLost))
+            }
+            // `event` is the one push shape: type + terminal address + data.
+            "event" => Ok(Some(event_from_params(&params, self.fold_policy))),
+            "heartbeat" => Ok(Some(BackendEvent::Raw(line.to_string()))),
+            _ => {
+                if let Some(event) = terminal_event_from_value(&params, self.fold_policy) {
+                    return Ok(Some(event));
+                }
+                Ok(Some(BackendEvent::Raw(line.to_string())))
+            }
         }
-        if let Some(event) = terminal_event_from_value(&val, self.fold_policy) {
-            return Ok(Some(event));
-        }
-        Ok(Some(BackendEvent::Raw(line.to_string())))
     }
 }
 
 impl EventStream for HcEventStream {
     fn read_event(&mut self) -> Result<Option<BackendEvent>, BackendError> {
-        let mut buf = String::new();
-        let n = self
-            .reader
-            .read_line(&mut buf)
-            .map_err(|e| map_io_err("read hc event", e))?;
-        if n == 0 {
-            return Ok(None);
+        if let Some(event) = self.pending.pop_front() {
+            return Ok(Some(event));
         }
-        self.decode_line(&buf)
+        loop {
+            let mut buf = String::new();
+            let n = self
+                .reader
+                .read_line(&mut buf)
+                .map_err(|e| map_io_err("read hc event", e))?;
+            if n == 0 {
+                return Ok(None);
+            }
+            let event = self.decode_line(&buf)?;
+            if event.is_some() {
+                return Ok(event);
+            }
+        }
     }
 
     fn set_read_timeout(&mut self, timeout: Option<Duration>) -> Result<(), BackendError> {
@@ -1048,6 +1157,81 @@ impl EventStream for HcEventStream {
             .get_mut()
             .set_read_timeout(timeout)
             .map_err(|e| BackendError::new(BackendErrorCode::Io, e.to_string()))
+    }
+}
+
+/// One `event` notification: `{"type": …, "terminal": "t7", "data": {…}}`.
+fn event_from_params(params: &Value, policy: FoldPolicy) -> BackendEvent {
+    let event_type = params.get("type").and_then(Value::as_str).unwrap_or("");
+    let data = params.get("data").cloned().unwrap_or(Value::Null);
+    let pane = params
+        .get("terminal")
+        .and_then(Value::as_str)
+        .or_else(|| data.get("address").and_then(Value::as_str))
+        .map(|a| PaneId::new(prefix_id(a)));
+    match event_type {
+        "status" => match pane {
+            Some(pane) => BackendEvent::AgentStatusChanged {
+                pane,
+                agent: None,
+                status: fold_status_data(&data, policy),
+            },
+            None => BackendEvent::Raw(params.to_string()),
+        },
+        // A turn ended: the status word it ended at is the completion signal.
+        "turn" => match pane {
+            Some(pane) => BackendEvent::AgentStatusChanged {
+                pane,
+                agent: None,
+                status: data
+                    .get("state")
+                    .and_then(Value::as_str)
+                    .map(normalize_agent_status)
+                    .unwrap_or(AgentStatus::Unknown),
+            },
+            None => BackendEvent::Raw(params.to_string()),
+        },
+        "finished" | "lost" | "removed" => match pane {
+            Some(pane) => BackendEvent::PaneExited { pane },
+            None => BackendEvent::Raw(params.to_string()),
+        },
+        "created" | "restarted" => match serde_json::from_value::<Terminal>(data) {
+            Ok(term) => status_event(&term, policy),
+            Err(_) => BackendEvent::Raw(params.to_string()),
+        },
+        // labels/title/size/foreground/keep/doc do not change the status fold.
+        _ => BackendEvent::Raw(params.to_string()),
+    }
+}
+
+/// Fold the `status` event's root + child records through the same policy the
+/// snapshot uses. A null root with no records is `Unknown`, never `Idle`.
+fn fold_status_data(data: &Value, policy: FoldPolicy) -> AgentStatus {
+    let mut board = Board::default();
+    if let Some(root) = data.get("status").filter(|v| !v.is_null())
+        && let Ok(status) = serde_json::from_value::<HcStatus>(root.clone())
+    {
+        board.insert_hc("", &status.view());
+    }
+    if let Some(records) = data.get("records").and_then(Value::as_object) {
+        for (id, record) in records {
+            if let Ok(status) = serde_json::from_value::<HcStatus>(record.clone()) {
+                board.insert_hc(id, &status.view());
+            }
+        }
+    }
+    fold(&board, policy)
+}
+
+fn status_event(term: &Terminal, policy: FoldPolicy) -> BackendEvent {
+    let pane = PaneId::new(prefix_id(&term.address));
+    if term.state.as_deref() == Some("finished") {
+        return BackendEvent::PaneExited { pane };
+    }
+    BackendEvent::AgentStatusChanged {
+        pane,
+        agent: term.name.clone(),
+        status: term.agent_status(policy),
     }
 }
 
@@ -1059,16 +1243,7 @@ fn terminal_event_from_value(val: &Value, policy: FoldPolicy) -> Option<BackendE
         val.get("terminal")?.clone()
     };
     let term: Terminal = serde_json::from_value(term_val).ok()?;
-    let status = term.agent_status(policy);
-    let pane = PaneId::new(prefix_id(&term.address));
-    if term.state.as_deref() == Some("finished") {
-        return Some(BackendEvent::PaneExited { pane });
-    }
-    Some(BackendEvent::AgentStatusChanged {
-        pane,
-        agent: term.name.clone(),
-        status,
-    })
+    Some(status_event(&term, policy))
 }
 
 /// Sync [`Backend`] over hc OpenRPC.
@@ -1239,8 +1414,11 @@ impl Backend for HcBackend {
         text: &str,
         wait: Option<&WaitOptions>,
     ) -> Result<Value, BackendError> {
-        let wait_ms = wait.and_then(|w| w.timeout_ms);
-        self.client.terminal_send(target, text, wait_ms)
+        match wait {
+            // A wait with no explicit timeout still waits, at hc's default.
+            Some(w) => self.client.terminal_send_wait(target, text, w.timeout_ms),
+            None => self.client.terminal_send(target, text, None),
+        }
     }
 
     fn prompt_coded(
@@ -1250,13 +1428,7 @@ impl Backend for HcBackend {
         wait: Option<&WaitOptions>,
     ) -> Result<PromptLanding, BackendError> {
         match self.prompt(target, text, wait) {
-            Ok(val) => {
-                let status = val
-                    .get("status")
-                    .and_then(Value::as_str)
-                    .map(normalize_agent_status);
-                Ok(PromptLanding { status, code: None })
-            }
+            Ok(val) => Ok(landing_from_send(&val)),
             Err(err) => Ok(PromptLanding {
                 status: None,
                 code: Some(err.code().as_str().to_string()),
@@ -1840,6 +2012,26 @@ mod tests {
     }
 
     #[test]
+    fn a_unique_toron_pin_label_is_the_mail_name() {
+        // A shell pane is unnamed; the mail stamp is the identity. A unique
+        // terminal name is the fallback when no pin was stamped.
+        let fake = FakeHc::spawn(
+            full_methods(),
+            vec![
+                json!({"address": "t7", "name": "lane", "labels": {"toron_pin": "DustySparrow"}}),
+                json!({"address": "t8", "name": "review"}),
+            ],
+        );
+        let client = Client::connect(Some(fake.socket.to_str().unwrap())).expect("connect");
+        let agents = client.agent_list().expect("agents");
+        assert_eq!(agents[0].name.as_deref(), Some("DustySparrow"));
+        assert_eq!(agents[1].name.as_deref(), Some("review"));
+        let panes = client.pane_list().expect("panes");
+        assert_eq!(panes[0].display_agent.as_deref(), Some("DustySparrow"));
+        assert_eq!(panes[1].display_agent.as_deref(), Some("review"));
+    }
+
+    #[test]
     fn send_and_wait_use_schema_params() {
         // Fixture `hc-schema-0.1.16.json` is authoritative: `terminal.send`
         // takes `wait` BOOL + `timeout` SECONDS; `terminal.wait` takes
@@ -2228,5 +2420,163 @@ mod tests {
         );
         let _ = writeln!(log, "transcript_path={}", transcript.display());
         eprintln!("live hc transcript: {}", transcript.display());
+    }
+}
+
+/// The live push shape is `{"method":"event","params":{"type":…,"terminal":…,
+/// "data":…}}`; a `missed` notification carries `{"seq":…,"terminals":[…]}`.
+/// These decode tests pin that shape against the 0.1.16 source.
+#[cfg(test)]
+mod event_decode_tests {
+    use super::*;
+    use std::os::unix::net::UnixStream;
+
+    fn stream(policy: FoldPolicy) -> HcEventStream {
+        let (reader, _peer) = UnixStream::pair().expect("socketpair");
+        HcEventStream {
+            reader: BufReader::new(reader),
+            fold_policy: policy,
+            pending: VecDeque::new(),
+        }
+    }
+
+    fn decode(stream: &mut HcEventStream, params: Value) -> BackendEvent {
+        let line = json!({"jsonrpc": "2.0", "method": "event", "params": params}).to_string();
+        stream.decode_line(&line).expect("decode").expect("event")
+    }
+
+    #[test]
+    fn status_event_folds_root_and_records() {
+        let mut s = stream(FoldPolicy::Attention);
+        let event = decode(
+            &mut s,
+            json!({
+                "type": "status",
+                "terminal": "t7",
+                "data": {
+                    "status": {"state": "working"},
+                    "records": {"child": {"state": "blocked", "kind": "permission"}},
+                    "reported": true
+                },
+                "seq": 3
+            }),
+        );
+        match event {
+            BackendEvent::AgentStatusChanged { pane, status, .. } => {
+                assert_eq!(pane.as_str(), "hc:t7");
+                assert_eq!(status, AgentStatus::Blocked);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_cleared_status_is_unknown_not_idle() {
+        let mut s = stream(FoldPolicy::Attention);
+        let event = decode(
+            &mut s,
+            json!({"type": "status", "terminal": "t7", "data": {"status": null, "records": {}}}),
+        );
+        match event {
+            BackendEvent::AgentStatusChanged { status, .. } => {
+                assert_eq!(status, AgentStatus::Unknown);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn turn_event_uses_the_end_state() {
+        let mut s = stream(FoldPolicy::Attention);
+        let event = decode(
+            &mut s,
+            json!({"type": "turn", "terminal": "t7", "data": {"turn": 4, "state": "idle"}}),
+        );
+        match event {
+            BackendEvent::AgentStatusChanged { pane, status, .. } => {
+                assert_eq!(pane.as_str(), "hc:t7");
+                assert_eq!(status, AgentStatus::Idle);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn finished_event_is_a_pane_exit() {
+        let mut s = stream(FoldPolicy::Attention);
+        let event = decode(
+            &mut s,
+            json!({"type": "finished", "terminal": "t7", "data": {"exit_code": 0}}),
+        );
+        assert!(matches!(event, BackendEvent::PaneExited { pane } if pane.as_str() == "hc:t7"));
+    }
+
+    #[test]
+    fn missed_snapshot_is_queued_after_the_gap_notice() {
+        let mut s = stream(FoldPolicy::Attention);
+        let line = json!({
+            "jsonrpc": "2.0",
+            "method": "missed",
+            "params": {
+                "seq": 9,
+                "terminals": [
+                    {"address": "t7", "status": {"state": "working"}, "state": "live"},
+                    {"address": "t8", "status": {"state": "blocked"}, "state": "live"},
+                    {"address": "t9", "state": "finished"}
+                ]
+            }
+        })
+        .to_string();
+        assert!(matches!(
+            s.decode_line(&line).expect("decode"),
+            Some(BackendEvent::EventsLost)
+        ));
+        let first = s.pending.pop_front().expect("first snapshot row");
+        assert!(matches!(
+            first,
+            BackendEvent::AgentStatusChanged { ref pane, status: AgentStatus::Working, .. }
+                if pane.as_str() == "hc:t7"
+        ));
+        let second = s.pending.pop_front().expect("second snapshot row");
+        assert!(matches!(
+            second,
+            BackendEvent::AgentStatusChanged { ref pane, status: AgentStatus::Blocked, .. }
+                if pane.as_str() == "hc:t8"
+        ));
+        let third = s.pending.pop_front().expect("finished row");
+        assert!(matches!(third, BackendEvent::PaneExited { ref pane } if pane.as_str() == "hc:t9"));
+        assert!(s.pending.is_empty());
+    }
+
+    #[test]
+    fn labels_and_heartbeat_do_not_change_the_fold() {
+        let mut s = stream(FoldPolicy::Attention);
+        let labels = decode(
+            &mut s,
+            json!({"type": "labels", "terminal": "t7", "data": {"labels": {"toron_pin": "X"}}}),
+        );
+        assert!(matches!(labels, BackendEvent::Raw(_)));
+        let line =
+            json!({"jsonrpc": "2.0", "method": "heartbeat", "params": {"seq": 4}}).to_string();
+        assert!(matches!(
+            s.decode_line(&line).expect("decode"),
+            Some(BackendEvent::Raw(_))
+        ));
+    }
+
+    #[test]
+    fn a_send_that_did_not_start_is_stalled() {
+        let landing = landing_from_send(&json!({"status": "idle", "turn": 1, "started": false}));
+        assert_eq!(landing.status, Some(AgentStatus::Idle));
+        assert_eq!(landing.code.as_deref(), Some("agent_prompt_stalled"));
+
+        let landed = landing_from_send(&json!({"status": "working", "turn": 2, "started": true}));
+        assert_eq!(landed.status, Some(AgentStatus::Working));
+        assert_eq!(landed.code, None);
+
+        // A program that never reports status says nothing about starting.
+        let silent = landing_from_send(&json!({"status": null, "turn": 1, "started": null}));
+        assert_eq!(silent.status, None);
+        assert_eq!(silent.code, None);
     }
 }

@@ -9,7 +9,7 @@
 # Data directory (SQLite index + Git archive root).
 # data_dir = "~/.local/share/toron"
 
-# Default backend: hc (default) | tmux (on hold).
+# Default backend: hc (the only multiplexer).
 backend = "hc"
 
 # Operator key path (NIP-49 ncryptsec, 0600). Never the secret itself.

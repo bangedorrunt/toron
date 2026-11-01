@@ -11,8 +11,7 @@ use serde::{Deserialize, Serialize};
 /// onto these; unknown codes pass through as [`BackendErrorCode::Other`].
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum BackendErrorCode {
-    /// Operation is unsupported on this backend (e.g. TmuxBackend before
-    /// un-held; ADR-0003 G9).
+    /// Operation is unsupported on this backend.
     Unsupported,
     /// Operation timed out waiting for the backend.
     Timeout,

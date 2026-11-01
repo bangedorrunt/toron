@@ -70,7 +70,7 @@ fn status_human_is_not_json() {
 
 #[test]
 fn env_config_overrides_project_file() {
-    // TORON_BACKEND=hc must win over a project .toron.toml saying tmux.
+    // TORON_BACKEND=hc must win over a project .toron.toml saying bogus.
     let mut cmd = toron();
     cmd.current_dir("tests")
         .env("TORON_BACKEND", "hc")

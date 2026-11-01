@@ -558,15 +558,11 @@ fn backend_list_is_json_array_with_hc() {
     );
     let value = parse(&out.stdout);
     let arr = value.as_array().expect("backend list must be an array");
+    assert_eq!(arr.len(), 1, "hc is the only backend, got {value}");
+    assert_eq!(arr[0]["name"], serde_json::json!("hc"), "got {value}");
     assert!(
-        arr.iter().any(|b| b["name"] == serde_json::json!("hc")),
-        "array must include hc, got {value}"
-    );
-    assert!(
-        arr.iter().any(|b| {
-            b["name"] == serde_json::json!("tmux") && b["available"] == serde_json::json!(false)
-        }),
-        "tmux must be reported unavailable, got {value}"
+        arr[0]["available"].is_boolean(),
+        "availability is probed, got {value}"
     );
 }
 

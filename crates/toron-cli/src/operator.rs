@@ -1428,17 +1428,16 @@ pub fn run_relay(cfg: &Config, cmd: &RelayCommand) -> anyhow::Result<()> {
 
 pub fn run_backend(cfg: &Config, cmd: &BackendCommand) -> anyhow::Result<()> {
     // Clean break: no `herdr` alias. The typed `BackendArg` can only be
-    // `hc|tmux`, but config/env is a free string, so validate here.
+    // `hc` is the only backend; config/env is a free string, so validate here.
     let effective = cfg.effective_backend();
-    if effective != "hc" && effective != "tmux" {
-        anyhow::bail!("unknown backend {effective:?} (want hc|tmux)");
+    if effective != "hc" {
+        anyhow::bail!("unknown backend {effective:?} (want hc)");
     }
     match cmd {
         BackendCommand::List => {
             let hc = toron_core::backend::hc::HcBackend::connect(None).is_ok();
             print_json(&json!([
                 { "name": "hc", "available": hc },
-                { "name": "tmux", "available": false },
             ]))
         }
         BackendCommand::Status => print_json(&json!({ "backend": cfg.effective_backend() })),
@@ -1452,7 +1451,7 @@ pub fn run_backend(cfg: &Config, cmd: &BackendCommand) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod backend_selection_tests {
-    //! Backend selection is a clean break: `hc|tmux`, no `herdr` alias.
+    //! Backend selection is a clean break: `hc`, no legacy alias.
     use super::*;
 
     fn cfg_with(backend: &str) -> Config {
@@ -1463,20 +1462,17 @@ mod backend_selection_tests {
     }
 
     #[test]
-    fn legacy_herdr_backend_is_refused_naming_hc_or_tmux() {
+    fn legacy_backend_is_refused_naming_hc() {
         // `Config::load` does NOT normalize — the free-string config value
-        // reaches `run_backend`, which fails naming the valid pair.
+        // reaches `run_backend`, which fails naming the valid backend.
         let err = run_backend(&cfg_with("herdr"), &BackendCommand::Status)
             .expect_err("legacy herdr must be refused");
-        assert!(err.to_string().contains("hc|tmux"), "{err}");
+        assert!(err.to_string().contains("want hc"), "{err}");
     }
 
     #[test]
-    fn hc_and_tmux_pass_backend_validation() {
-        for backend in ["hc", "tmux"] {
-            run_backend(&cfg_with(backend), &BackendCommand::Status)
-                .expect("hc|tmux must validate");
-        }
+    fn hc_passes_backend_validation() {
+        run_backend(&cfg_with("hc"), &BackendCommand::Status).expect("hc must validate");
     }
 }
 

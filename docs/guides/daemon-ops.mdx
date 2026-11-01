@@ -8,7 +8,7 @@ description: Lifecycle, service units, health checks, crash reconstruction, fede
 ```bash
 toron daemon status                    # managed vs unmanaged
 flywheel deps                          # every dependency in one readout
-flywheel preflight                     # herdr socket, operator key, toron mail, orders
+flywheel preflight                     # hc socket, operator key, toron mail, orders
 ```
 
 ```text
@@ -18,7 +18,7 @@ running (launchd com.toron.serve)
 $ flywheel deps
 br: idle
 bv: idle
-herdr: idle
+hc: idle
 resonate server: idle
 mail (toron): idle
 config: /Users/you/.config/flywheel/config.toml
@@ -41,7 +41,7 @@ Default bind `127.0.0.1:18080`, label `com.toron.serve`. macOS runs launchd (`~/
 ## Health
 
 ```bash
-toron doctor [--check]     # herdr, git, keys, resonate; exit 3 on any failure with --check
+toron doctor [--check]     # hc, git, keys, resonate; exit 3 on any failure with --check
 toron status --json        # quick health/config overview
 toron metrics              # in-process operator counters: tool calls, errors, latency
 toron catalog --json       # the tool / resource / CLI contract
@@ -100,7 +100,7 @@ If it fails: a relay that accepts an event and drops it looks identical to a hea
 ```text
 $ toron config
 toron config (effective)
-  backend: "herdr"
+  backend: "hc"
   data_dir: null
   envelope_ttl_days: 90
   federation_allowlist: []

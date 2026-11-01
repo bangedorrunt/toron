@@ -15,7 +15,7 @@ with no orchestrator in the hot path.
    │                                                                         │
    │   Mailbox (38 tools, 25 resources) ──▶ Nostr events ──▶ Bus            │
    │   Workflow engine (Resonate) ──▶ triggers/actions │                      │
-   │   Backend trait ──▶ hc (default) / tmux (hold)  ▼                      │
+   │   Backend trait ──▶ hc                                                  ▼ │
    │                                      InProcessBus (tokio broadcast+SQLite)│
    │   toron-mcp server ◀── MCP (stdio/HTTP) ── agents    │ (opt. RelayBus→relay)│
    └───────────▲──────────────────────────────│──────────────────────────────┘
@@ -131,7 +131,6 @@ visibility + the channel-as-PR UX. Kind numbers reserved.
 
 - **hc** (default) — OpenRPC over a Unix socket plus OSC 7501 program status; spawn/prompt/wait/read/
   send_keys/events. Shared client with [`flywheel`](../flywheel).
-- **tmux** (on hold) — same `Backend` trait; tmux IPC control.
 
 ---
 

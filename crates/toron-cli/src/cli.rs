@@ -1967,25 +1967,23 @@ pub struct RelayUrlArg {
     pub url: String,
 }
 
-/// Backend selector (hc | tmux).
+/// Backend selector (hc).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum BackendArg {
     Hc,
-    Tmux,
 }
 
 impl BackendArg {
     pub const fn as_str(&self) -> &'static str {
         match self {
             BackendArg::Hc => "hc",
-            BackendArg::Tmux => "tmux",
         }
     }
 }
 
 #[derive(Debug, Subcommand)]
 pub enum BackendCommand {
-    /// Probe backend availability (hc socket connect; tmux held).
+    /// Probe backend availability (hc socket connect).
     List,
     /// Print the effective backend from config.
     Status,
@@ -1995,7 +1993,7 @@ pub enum BackendCommand {
 
 #[derive(Debug, Args)]
 pub struct BackendDefaultArgs {
-    /// hc|tmux.
+    /// hc.
     #[arg(value_enum)]
     pub backend: BackendArg,
 }

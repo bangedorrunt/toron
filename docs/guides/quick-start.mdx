@@ -24,7 +24,7 @@ running (launchd com.toron.serve)
 
 $ toron doctor
 toron doctor
-  ok   herdr — herdr socket reachable at /Users/you/.config/herdr/herdr.sock
+  ok   hc — hc socket reachable at /Users/you/.local/state/herdr-core/default/default.sock
   ok   git — git version 2.55.0
   ok   daemon_build — build — /path/to/toron (booted 2026-09-30T11:41:39+00:00, from a build written 2026-09-30T11:41:09+00:00)
   ok   legacy_slug_identities — 6 leftover legacy registration(s): ...
@@ -136,7 +136,7 @@ toron doctor --check    # exit 3 on any failure
 ```text
 $ toron status --json
 {
-  "backend": "herdr",
+  "backend": "hc",
   "data_dir": null,
   "envelope_ttl_days": 90,
   "operator_key": null,

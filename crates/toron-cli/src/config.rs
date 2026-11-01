@@ -29,7 +29,7 @@ pub const DEFAULT_ENVELOPE_TTL_DAYS: u64 = 90;
 pub struct Config {
     /// Data directory (SQLite index + Git archive root).
     pub data_dir: Option<PathBuf>,
-    /// Default backend (`hc` | `tmux`). Defaults to `hc`.
+    /// Default backend (`hc`). Defaults to `hc`.
     pub backend: Option<String>,
     /// Operator key path (ncryptsec; 0600; never the secret itself).
     pub operator_key: Option<PathBuf>,
@@ -118,7 +118,7 @@ impl Config {
     /// Effective backend (defaults to `hc`).
     ///
     /// Unknown values are NOT defaulted: `run_backend` fails naming
-    /// `hc|tmux` (clean break, no `herdr` alias).
+    /// `hc` (clean break, no legacy alias).
     pub fn effective_backend(&self) -> &str {
         self.backend.as_deref().unwrap_or("hc")
     }
@@ -311,7 +311,7 @@ mod tests {
     #[test]
     fn explicit_config_flag_beats_project_and_defaults() {
         let dir = scratch("flag");
-        let _project = write_config(&dir, ".toron.toml", "backend = \"tmux\"\n");
+        let _project = write_config(&dir, ".toron.toml", "backend = \"bogus\"\n");
         let flag = write_config(&dir, "override.toml", "backend = \"hc\"\n");
         let cfg = Config::load(Some(&flag));
         assert_eq!(cfg.backend.as_deref(), Some("hc"));
@@ -389,7 +389,7 @@ mod tests {
         let mut cfg = Config::default();
         cfg.merge(toml::from_str("[comms]\ninbox_log = true\n").unwrap());
         // A later layer that sets other things, or an empty `[comms]`, keeps it.
-        cfg.merge(toml::from_str("backend = \"tmux\"\n").unwrap());
+        cfg.merge(toml::from_str("backend = \"hc\"\n").unwrap());
         cfg.merge(toml::from_str("[comms]\n").unwrap());
         assert_eq!(cfg.comms_inbox_log(), Some(true));
         // A later layer that sets it wins.

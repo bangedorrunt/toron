@@ -111,4 +111,4 @@ A drift gate reads the emitted catalog against these docs, so a count that moves
 in the binary fails the gate instead of aging quietly here.
 | Build slots (3) | `acquire_build_slot`, `renew_build_slot`, `release_build_slot` |
 
-Onboarding sequence: `ensure_project` -> `register_agent` (upsert) -> `file_reservation_paths` (if editing), or one `macro_start_session`. Pane identity helpers: `resolve_pane_identity` maps a herdr `pane_id` to the agent name; `cleanup_pane_identities` prunes identities whose panes are gone. Send receipts carry the rumor id, which is the same id ack and summarize take.
+Onboarding sequence: `ensure_project` -> `register_agent` (upsert) -> `file_reservation_paths` (if editing), or one `macro_start_session`. Pane identity helpers: `resolve_pane_identity` maps a pane/terminal id to the agent name; `cleanup_pane_identities` prunes identities whose panes are gone. Send receipts carry the rumor id, which is the same id ack and summarize take.

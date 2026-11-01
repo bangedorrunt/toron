@@ -2,8 +2,7 @@
 #![forbid(unsafe_code)]
 
 // bd-led.6.1: `Backend` trait — supervisor abstraction for agent panes.
-// herdr is the default backend (ported in bd-led.6.2); tmux returns
-// Unsupported until un-held (ADR-0003 G9).
+// hc is the only multiplexer backend (ADR-0003 G9 retired tmux).
 //
 // ---------------------------------------------------------------------------
 // bd-p1-design-gn0 — P1.1 Unified Backend trait design record (ADR-0005 P1).
@@ -71,8 +70,7 @@
 //
 // ## Migration shape (implemented by bd-p1-unify-y9j)
 //   - toron-core: rewrite `Backend` below to the sync, `&self`, dyn-capable,
-//     Unsupported-open surface above; rework HerdrBackend/MockBackend/Tmux
-//     impls to sync.
+//     Unsupported-open surface above; rework HcBackend/MockBackend impls to sync.
 //   - flywheel: delete local `MultiplexerBackend`/`MailBackend` definitions
 //     (keep re-export shim if back-compat needs it); HerdrBackend/AgentMail
 //     impls move onto the unified trait; ~20 call sites `&mut dyn` → `&dyn`.
@@ -85,7 +83,6 @@
 pub mod error;
 pub mod hc;
 pub mod mock;
-pub mod tmux;
 pub mod types;
 pub mod wait;
 
@@ -131,7 +128,7 @@ pub trait EventStream: Send {
 ///   code — ADR-0003). flywheel's local `BackendError{Unsupported, Other}`
 ///   was deleted; pattern-matches migrate to `err.code()`.
 pub trait Backend: Send + Sync {
-    /// Stable backend identifier ("herdr" | "superlogical" | "tmux" | ...).
+    /// Stable backend identifier ("hc" | "superlogical" | ...).
     fn name(&self) -> &'static str;
 
     // ---- workspace ----
