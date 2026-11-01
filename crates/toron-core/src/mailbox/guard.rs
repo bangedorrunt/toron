@@ -608,6 +608,32 @@ pub fn staged_paths_in(repo_path: &Path) -> Vec<String> {
 /// passes.
 pub const BUILD_GATE_TIMEOUT_SECS: u64 = 180;
 
+/// Whether a staged path can change a Rust build (pure).
+///
+/// Markdown, docs, and other non-build files under a crate directory used to
+/// climb to a `Cargo.toml` and gate the package anyway. A stage made only of
+/// those paths must gate nothing.
+pub fn path_can_affect_rust_build(path: &str) -> bool {
+    let path = path.replace('\\', "/");
+    let file = path.rsplit('/').next().unwrap_or(path.as_str());
+    if file.ends_with(".rs") || file == "build.rs" {
+        return true;
+    }
+    if file == "Cargo.toml" || file == "Cargo.lock" {
+        return true;
+    }
+    // `.cargo/config.toml` and friends reshape the build.
+    if path.split('/').any(|seg| seg == ".cargo") {
+        return true;
+    }
+    false
+}
+
+/// True when at least one staged path can affect a Rust build (pure).
+pub fn staged_affects_rust_build(staged: &[String]) -> bool {
+    staged.iter().any(|p| path_can_affect_rust_build(p))
+}
+
 /// The cargo packages the staged paths belong to, in first-seen order.
 ///
 /// A path resolves by walking up to the nearest `Cargo.toml` and reading its
@@ -754,14 +780,40 @@ fn package_name_in_manifest(manifest: &Path) -> Option<String> {
 /// target-dir lock is shared, so another agent's concurrent build can hold it,
 /// and blocking on that would punish the wrong commit.
 pub fn build_gate_blocks(repo: &Path, staged: &[String]) -> Vec<StrictBlock> {
-    let packages = cargo_packages_for_staged(repo, staged);
+    build_gate_blocks_timed(repo, staged, std::time::Duration::from_secs(BUILD_GATE_TIMEOUT_SECS), None)
+}
+
+/// Same as [`build_gate_blocks`], with an explicit deadline (tests inject a
+/// short one so a sleeping fake cargo proves kill+reap without waiting the
+/// production timeout). `build_tool` overrides PATH resolution when set
+/// (tests pass a fake cargo without mutating process env — this crate
+/// `#![forbid(unsafe_code)]`).
+pub fn build_gate_blocks_timed(
+    repo: &Path,
+    staged: &[String],
+    timeout: std::time::Duration,
+    build_tool: Option<std::path::PathBuf>,
+) -> Vec<StrictBlock> {
+    if !staged_affects_rust_build(staged) {
+        return Vec::new();
+    }
+    let Some(bin) = build_tool.or_else(resolve_build_tool) else {
+        return Vec::new();
+    };
+    // Only build-affecting paths contribute package names (md under a crate
+    // must not drag that crate into the gate).
+    let build_paths: Vec<String> = staged
+        .iter()
+        .filter(|p| path_can_affect_rust_build(p))
+        .cloned()
+        .collect();
+    let packages = cargo_packages_for_staged(repo, &build_paths);
     if packages.is_empty() {
         return Vec::new();
     }
-    if which("cargo").is_none() {
-        return Vec::new();
-    }
-    let mut command = std::process::Command::new("cargo");
+    let mut command = std::process::Command::new(&bin);
+    // mbx and cargo both take `build -p …` as the first args. Preferring mbx
+    // avoids the bare-`cargo` misparse under the mbx shim (flywheel AGENTS).
     command.arg("build");
     for package in &packages {
         command.arg("-p").arg(package);
@@ -769,17 +821,19 @@ pub fn build_gate_blocks(repo: &Path, staged: &[String]) -> Vec<StrictBlock> {
     command.current_dir(repo);
     command.env("CARGO_TERM_COLOR", "never");
     command.env("CARGO_TERM_PROGRESS_WHEN", "never");
-    // A pre-commit hook must never read stdin: git gives it the terminal, and a
-    // cargo prompt there would hang the commit forever.
     command.stdin(std::process::Stdio::null());
     command.stdout(std::process::Stdio::piped());
     command.stderr(std::process::Stdio::piped());
+    // Own process group so a timed-out kill reaps grandchildren (fake cargo → sleep).
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
 
     let Ok(mut child) = command.spawn() else {
         return Vec::new();
     };
-    // Read both pipes while polling, so a child that fills a pipe buffer cannot
-    // deadlock the gate against itself.
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
     let (tx, rx) = std::sync::mpsc::channel();
@@ -800,35 +854,48 @@ pub fn build_gate_blocks(repo: &Path, staged: &[String]) -> Vec<StrictBlock> {
             let _ = tx_err.send(buffer);
         }
     });
-    let deadline =
-        std::time::Instant::now() + std::time::Duration::from_secs(BUILD_GATE_TIMEOUT_SECS);
+    let deadline = std::time::Instant::now() + timeout;
     let mut output = String::new();
-    while std::time::Instant::now() < deadline {
+    let mut timed_out = false;
+    loop {
         match rx.try_recv() {
             Ok(chunk) => output.push_str(&chunk),
-            Err(std::sync::mpsc::TryRecvError::Empty) => {
-                match child.try_wait() {
-                    // Both pipes closed and the child exited: drain and stop.
-                    Ok(Some(_)) if output.contains('\0') || true => {
-                        while let Ok(chunk) = rx.try_recv() {
-                            output.push_str(&chunk);
-                        }
+            Err(std::sync::mpsc::TryRecvError::Empty) => match child.try_wait() {
+                Ok(Some(_)) => {
+                    while let Ok(chunk) = rx.try_recv() {
+                        output.push_str(&chunk);
+                    }
+                    break;
+                }
+                Ok(None) => {
+                    if std::time::Instant::now() >= deadline {
+                        timed_out = true;
                         break;
                     }
-                    Ok(Some(_)) => break,
-                    // Still running.
-                    Ok(None) => std::thread::sleep(std::time::Duration::from_millis(50)),
-                    Err(_) => break,
+                    std::thread::sleep(std::time::Duration::from_millis(50));
                 }
-            }
+                Err(_) => break,
+            },
             Err(_) => break,
         }
     }
-    let exited = matches!(child.try_wait(), Ok(Some(_)));
-    if !exited {
-        // Give the build a bounded grace period to exit after the deadline, then
-        // stop waiting rather than blocking the commit.
+    if timed_out {
+        // Kill the process group, then reap — never an unbounded wait after the deadline.
+        #[cfg(unix)]
+        {
+            let pgid = child.id();
+            let _ = std::process::Command::new("/bin/kill")
+                .args(["-KILL", &format!("-{pgid}")])
+                .status();
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = child.kill();
+        }
         let _ = child.wait();
+    } else if !matches!(child.try_wait(), Ok(Some(_))) {
+        // Exited between try_wait and here: reap without blocking long.
+        let _ = child.try_wait();
     }
 
     let failures = error_lines(&output);
@@ -839,6 +906,12 @@ pub fn build_gate_blocks(repo: &Path, staged: &[String]) -> Vec<StrictBlock> {
         path: format!("cargo build {}", packages.join(" ")),
         kind: StrictBlockKind::BuildFailed(failures.into_iter().next().unwrap_or_default()),
     }]
+}
+
+/// Prefer `mbx` when present (repo convention: bare `cargo` misparses under
+/// the mbx shim), else `cargo`.
+fn resolve_build_tool() -> Option<std::path::PathBuf> {
+    which("mbx").or_else(|| which("cargo"))
 }
 
 /// The first `error[..]`/`error:` lines of a cargo build, capped so a commit is
@@ -2913,6 +2986,106 @@ mod tests {
             vec!["real"]
         );
 
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn non_build_staged_paths_alone_gate_nothing() {
+        assert!(!path_can_affect_rust_build("README.md"));
+        assert!(!path_can_affect_rust_build("docs/guides/x.mdx"));
+        assert!(!path_can_affect_rust_build("AGENTS.md"));
+        assert!(!path_can_affect_rust_build("crates/toron-core/README.md"));
+        assert!(path_can_affect_rust_build("crates/toron-core/src/lib.rs"));
+        assert!(path_can_affect_rust_build("crates/toron-core/Cargo.toml"));
+        assert!(path_can_affect_rust_build("Cargo.lock"));
+        assert!(path_can_affect_rust_build(".cargo/config.toml"));
+        assert!(!staged_affects_rust_build(&[
+            "README.md".into(),
+            "docs/a.md".into()
+        ]));
+        assert!(staged_affects_rust_build(&[
+            "README.md".into(),
+            "src/lib.rs".into()
+        ]));
+
+        let root = std::env::temp_dir().join(format!(
+            "toron-guard-md-{}-{}.git",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(root.join("crates/alpha/src")).expect("tree");
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"enclosing\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("crates/alpha/Cargo.toml"),
+            "[package]\nname = \"alpha\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("crates/alpha/README.md"), "x\n").unwrap();
+        // Pure filter: md alone never reaches cargo, even when a package walk
+        // would have named `alpha` / `enclosing`.
+        assert!(build_gate_blocks(&root, &["crates/alpha/README.md".into()]).is_empty());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn build_gate_kills_a_sleeping_cargo_at_deadline() {
+        let root = std::env::temp_dir().join(format!(
+            "toron-guard-sleep-{}-{}.git",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"sleeper\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("src/lib.rs"), "\n").unwrap();
+        let shim_dir = root.join("shim");
+        std::fs::create_dir_all(&shim_dir).unwrap();
+        let cargo_shim = shim_dir.join("cargo");
+        // Fake cargo: ignore args, sleep long. Marker string for pgrep.
+        std::fs::write(
+            &cargo_shim,
+            "#!/bin/sh\necho sleeping-fake-cargo\nsleep 600\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&cargo_shim).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&cargo_shim, perms).unwrap();
+        }
+
+        let started = std::time::Instant::now();
+        let _ = build_gate_blocks_timed(
+            &root,
+            &["src/lib.rs".into()],
+            std::time::Duration::from_millis(400),
+            Some(cargo_shim.clone()),
+        );
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(3),
+            "guard returned in {:?}, expected near the 400ms deadline",
+            elapsed
+        );
+        // Grace for reaping; then no leftover from this shim's marker.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let out = std::process::Command::new("pgrep")
+            .args(["-f", "sleeping-fake-cargo"])
+            .output()
+            .expect("pgrep");
+        assert!(
+            out.stdout.is_empty(),
+            "fake cargo child still alive: {}",
+            String::from_utf8_lossy(&out.stdout)
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 }
