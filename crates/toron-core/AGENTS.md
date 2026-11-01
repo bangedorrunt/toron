@@ -17,6 +17,8 @@ Mailbox fabric: signed events on a `Bus`, projected to SQLite + Git archive.
 | RelayBus | `src/bus/relay_bus.rs` |
 | Project `#t` scoping | `src/bus/scoping.rs` |
 | Git archive | `src/archive/git.rs` |
+| Effect journal | `src/journal.rs` (fallible `JournalStore` over SQLite; sync bridge) |
+| Durable engine store | `src/index/durable_engine.rs` (fallible `EngineStorage`; additive `durable_engine_*` tables) |
 | Projection / FTS | `src/index/` |
 | Keys (ncryptsec) | `src/keys/` |
 
