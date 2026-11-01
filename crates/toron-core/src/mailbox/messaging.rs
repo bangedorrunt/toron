@@ -39,7 +39,7 @@ use crate::nostr::kinds::toron_kind;
 use crate::nostr::{Event, EventId, Keys, PublicKey, Tag, Timestamp};
 use sqlx::Row;
 
-use crate::backend::herdr::HerdrBackend;
+use crate::backend::hc::HcBackend;
 use crate::bus::filter::ToronFilter;
 use crate::bus::scoping::is_metadata_hiding_kind;
 use crate::mailbox::identity::ListAgentsOptions;
@@ -1650,7 +1650,7 @@ impl Mailbox {
 
         // (b) Same herdr pane as the recipient (best-effort: no herdr
         // backend wired → the check degrades to (c) only).
-        if let Ok(backend) = HerdrBackend::connect(None) {
+        if let Ok(backend) = HcBackend::connect(None) {
             let client = backend.client();
             if let Ok(agents) = client.agent_list() {
                 let pane_of = |name: &str| {

@@ -16,7 +16,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use toron_core::backend::herdr::{AgentInfo, PaneInfo};
+use toron_core::backend::{AgentInfo, PaneInfo};
 use toron_core::bus::in_process::{InProcessBus, InProcessBusConfig};
 use toron_core::index::schema;
 use toron_core::mailbox::Mailbox;

@@ -83,7 +83,7 @@
 // ---------------------------------------------------------------------------
 
 pub mod error;
-pub mod herdr;
+pub mod hc;
 pub mod mock;
 pub mod tmux;
 pub mod types;
@@ -91,8 +91,10 @@ pub mod wait;
 
 pub use error::{BackendError, BackendErrorCode};
 pub use types::{
-    AgentStatus, BackendEvent, PaneId, PromptLanding, SpawnOptions, normalize_herdr_status,
+    AgentInfo, AgentStatus, BackendEvent, PaneId, PaneInfo, PromptLanding, SpawnOptions,
+    Subscription, WaitOptions, WorkspaceInfo, normalize_herdr_status,
 };
+pub use hc::{HcBackend, Client as HcClient, ID_PREFIX};
 pub use wait::{ACTIVITY_GATE_MS, PromptHost, PromptTarget, WaitOutcome, prompt_wait};
 
 use std::time::Duration;
@@ -133,10 +135,10 @@ pub trait Backend: Send + Sync {
     fn name(&self) -> &'static str;
 
     // ---- workspace ----
-    fn workspace_list(&self) -> Result<Vec<herdr::WorkspaceInfo>, BackendError> {
+    fn workspace_list(&self) -> Result<Vec<WorkspaceInfo>, BackendError> {
         Err(unsupported(self.name(), "workspace_list"))
     }
-    fn workspace_create(&self, _label: Option<&str>) -> Result<herdr::WorkspaceInfo, BackendError> {
+    fn workspace_create(&self, _label: Option<&str>) -> Result<WorkspaceInfo, BackendError> {
         Err(unsupported(self.name(), "workspace_create"))
     }
     fn workspace_close(&self, _workspace_id: &str, _close_group: bool) -> Result<(), BackendError> {
@@ -149,10 +151,10 @@ pub trait Backend: Send + Sync {
         _parent_pane_id: &str,
         _direction: &str,
         _cwd: Option<&str>,
-    ) -> Result<herdr::PaneInfo, BackendError> {
+    ) -> Result<PaneInfo, BackendError> {
         Err(unsupported(self.name(), "pane_split"))
     }
-    fn pane_list(&self, _workspace_id: Option<&str>) -> Result<Vec<herdr::PaneInfo>, BackendError> {
+    fn pane_list(&self, _workspace_id: Option<&str>) -> Result<Vec<PaneInfo>, BackendError> {
         Err(unsupported(self.name(), "pane_list"))
     }
     fn pane_close(&self, _pane_id: &str) -> Result<(), BackendError> {
@@ -171,7 +173,7 @@ pub trait Backend: Send + Sync {
     }
 
     // ---- agent ----
-    fn agent_list(&self) -> Result<Vec<herdr::AgentInfo>, BackendError> {
+    fn agent_list(&self) -> Result<Vec<AgentInfo>, BackendError> {
         Err(unsupported(self.name(), "agent_list"))
     }
     fn agent_start(
@@ -180,7 +182,7 @@ pub trait Backend: Send + Sync {
         _kind: &str,
         _pane_id: &str,
         _args: &[String],
-    ) -> Result<herdr::AgentInfo, BackendError> {
+    ) -> Result<AgentInfo, BackendError> {
         Err(unsupported(self.name(), "agent_start"))
     }
     fn agent_rename(&self, _target: &str, _new_name: Option<&str>) -> Result<(), BackendError> {
@@ -190,7 +192,7 @@ pub trait Backend: Send + Sync {
         &self,
         _target: &str,
         _text: &str,
-        _wait: Option<&herdr::WaitOptions>,
+        _wait: Option<&WaitOptions>,
     ) -> Result<Value, BackendError> {
         Err(unsupported(self.name(), "prompt"))
     }
@@ -201,7 +203,7 @@ pub trait Backend: Send + Sync {
         &self,
         _target: &str,
         _text: &str,
-        _wait: Option<&herdr::WaitOptions>,
+        _wait: Option<&WaitOptions>,
     ) -> Result<PromptLanding, BackendError> {
         Err(unsupported(self.name(), "prompt_coded"))
     }
@@ -210,7 +212,7 @@ pub trait Backend: Send + Sync {
         _target: &str,
         _until: &[AgentStatus],
         _timeout_ms: Option<u64>,
-    ) -> Result<herdr::AgentInfo, BackendError> {
+    ) -> Result<AgentInfo, BackendError> {
         Err(unsupported(self.name(), "agent_wait"))
     }
     fn agent_read(&self, _target: &str, _source: &str, _lines: u32) -> Result<Value, BackendError> {
@@ -223,7 +225,7 @@ pub trait Backend: Send + Sync {
     // ---- events ----
     fn subscribe(
         &self,
-        _filters: &[herdr::Subscription],
+        _filters: &[Subscription],
     ) -> Result<Box<dyn EventStream>, BackendError> {
         Err(unsupported(self.name(), "subscribe"))
     }

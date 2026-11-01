@@ -21,7 +21,8 @@ use std::path::PathBuf;
 
 use crate::nostr::{Keys, Timestamp};
 
-use crate::backend::herdr::{AgentInfo, HerdrBackend, PaneInfo};
+use crate::backend::hc::HcBackend;
+use crate::backend::types::{AgentInfo, PaneInfo, TOKEN_NPUB, TOKEN_PIN, TOKEN_PROJECT};
 use crate::bus::filter::kind_project_filter;
 use crate::nostr::identity::{self as ident, AgentProfile, IdentityResult};
 use crate::nostr::kinds::{AGENT_PROFILE, toron_kind};
@@ -1876,27 +1877,21 @@ impl Mailbox {
     /// bd-u4e2: best-effort live pin → pane map for `whois`/`list_agents`.
     /// No herdr backend reachable → empty map, so those reads report `None`
     /// pane fields instead of failing. Pane visibility is ADVISORY (the same
-    /// posture as the other opportunistic `HerdrBackend::connect` callers) —
+    /// posture as the other opportunistic `HcBackend::connect` callers) —
     /// a pane-less environment must never turn a roster read into an error.
     /// bd-zoir: a pin the direct sweep misses falls back to the flywheel
     /// spawn registry binding for `project`, so a pane re-bound under another
     /// display pin still answers for its mail identity.
     fn live_pin_pane_map(project: &str) -> std::collections::HashMap<String, PaneRef> {
-        let Ok(backend) = HerdrBackend::connect(None) else {
+        let Ok(backend) = HcBackend::connect(None) else {
             return std::collections::HashMap::new();
         };
         let client = backend.client();
         let Ok(agents) = client.agent_list() else {
             return std::collections::HashMap::new();
         };
-        let panes: Vec<PaneInfo> = client
-            .workspace_list()
-            .map(|wss| {
-                wss.into_iter()
-                    .flat_map(|ws| client.pane_list(Some(&ws.workspace_id)).unwrap_or_default())
-                    .collect()
-            })
-            .unwrap_or_default();
+        // hc has no workspaces: terminals are the panes.
+        let panes: Vec<PaneInfo> = client.pane_list().unwrap_or_default();
         let mut map = pin_pane_map(&panes, &agents);
         augment_pane_map_with_registry(
             &mut map,
@@ -1915,20 +1910,13 @@ impl Mailbox {
     /// previous occupant's pin.
     pub fn resolve_pane_identity(
         &self,
-        backend: &HerdrBackend,
+        backend: &HcBackend,
         pane_id: &str,
     ) -> anyhow::Result<Option<String>> {
         let (agents, panes) = {
             let client = backend.client();
             let agents = client.agent_list()?;
-            let panes: Vec<PaneInfo> = client
-                .workspace_list()
-                .map(|wss| {
-                    wss.into_iter()
-                        .flat_map(|ws| client.pane_list(Some(&ws.workspace_id)).unwrap_or_default())
-                        .collect()
-                })
-                .unwrap_or_default();
+            let panes: Vec<PaneInfo> = client.pane_list().unwrap_or_default();
             (agents, panes)
         };
         Ok(resolve_pin_for_pane(&panes, &agents, pane_id))
@@ -1942,15 +1930,11 @@ impl Mailbox {
     /// ADR-0010 F2: pane-dead rows retire on this sweep alongside time-dead
     /// rows (`WhoIs::stale` past [`ROSTER_STALE_AFTER_DAYS`]) — one sweep
     /// retires both, so neither is ever a silent live pin.
-    pub fn cleanup_pane_identities(&self, backend: &HerdrBackend) -> anyhow::Result<Vec<String>> {
+    pub fn cleanup_pane_identities(&self, backend: &HcBackend) -> anyhow::Result<Vec<String>> {
         let (agents, panes) = {
             let client = backend.client();
             let agents = client.agent_list()?;
-            let panes: Vec<PaneInfo> = client
-                .workspace_list()?
-                .into_iter()
-                .flat_map(|ws| client.pane_list(Some(&ws.workspace_id)).unwrap_or_default())
-                .collect();
+            let panes: Vec<PaneInfo> = client.pane_list().unwrap_or_default();
             (agents, panes)
         };
         // bd-0sbf: a pin stamped on a live pane is live even when the
@@ -2021,7 +2005,7 @@ pub fn pin_pane_map(
 /// Returns the stamped pin when the `toron_pin` token is present.
 pub fn pane_token_pin(pane: &PaneInfo) -> Option<&str> {
     pane.tokens
-        .get(crate::backend::herdr::TOKEN_PIN)
+        .get(TOKEN_PIN)
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
 }
@@ -2029,7 +2013,7 @@ pub fn pane_token_pin(pane: &PaneInfo) -> Option<&str> {
 /// bd-u31k: the pane's stamped npub (`toron_npub` token) when present.
 pub fn pane_token_npub(pane: &PaneInfo) -> Option<&str> {
     pane.tokens
-        .get(crate::backend::herdr::TOKEN_NPUB)
+        .get(TOKEN_NPUB)
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
 }
@@ -2054,7 +2038,7 @@ pub fn pane_stamp(pane: &PaneInfo) -> Option<PaneStamp> {
     let npub = pane_token_npub(pane)?;
     let project = pane
         .tokens
-        .get(crate::backend::herdr::TOKEN_PROJECT)
+        .get(TOKEN_PROJECT)
         .and_then(|v| v.as_str())
         .unwrap_or_default()
         .to_string();
@@ -2492,7 +2476,7 @@ mod tests {
         let mut tokens = serde_json::Map::new();
         if let Some(pin) = pin_token {
             tokens.insert(
-                crate::backend::herdr::TOKEN_PIN.into(),
+                TOKEN_PIN.into(),
                 serde_json::Value::String(pin.into()),
             );
         }
@@ -2514,11 +2498,11 @@ mod tests {
     fn test_pane_stamped(pane_id: &str, pin: &str, project: &str, npub: &str) -> PaneInfo {
         let mut pane = test_pane(pane_id, Some(pin));
         pane.tokens.insert(
-            crate::backend::herdr::TOKEN_PROJECT.into(),
+            TOKEN_PROJECT.into(),
             serde_json::Value::String(project.into()),
         );
         pane.tokens.insert(
-            crate::backend::herdr::TOKEN_NPUB.into(),
+            TOKEN_NPUB.into(),
             serde_json::Value::String(npub.into()),
         );
         pane

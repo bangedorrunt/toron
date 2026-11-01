@@ -18,7 +18,7 @@ use rmcp::{tool, tool_router};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use toron_core::backend::herdr::HerdrBackend;
+use toron_core::backend::hc::HcBackend;
 use toron_core::mailbox::ListAgentsOptions;
 use toron_core::nostr::identity::AgentProfile;
 
@@ -192,7 +192,7 @@ impl ToolServer {
         Parameters(args): Parameters<ResolvePaneIdentityArgs>,
     ) -> ToolOutput {
         let pane_id = args.pane_id.clone().unwrap_or_default();
-        match HerdrBackend::connect(None) {
+        match HcBackend::connect(None) {
             Ok(backend) => match self.mailbox.resolve_pane_identity(&backend, &pane_id) {
                 Ok(Some(name)) => ToolOutput::ok(json!({ "agent_name": name, "pane_id": pane_id })),
                 Ok(None) => ToolOutput::ok(json!({ "agent_name": null, "pane_id": pane_id })),
@@ -216,7 +216,7 @@ impl ToolServer {
         &self,
         Parameters(_args): Parameters<CleanupPaneIdentitiesArgs>,
     ) -> ToolOutput {
-        match HerdrBackend::connect(None) {
+        match HcBackend::connect(None) {
             Ok(backend) => {
                 // bd-gc7k: prune dead pins AND release their exclusive
                 // leases in the same call — a dead pin must not own the
