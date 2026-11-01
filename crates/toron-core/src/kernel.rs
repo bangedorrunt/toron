@@ -18,9 +18,9 @@
 //!   (with its [`JournalRow`], [`JournalRead`], [`JournalDisposition`],
 //!   [`JournalError`]), [`plan_attempt`], [`plan_park`], [`may_settle`];
 //! - the durable engine: [`DurableEngine`], [`OurEngine`], [`EngineStorage`],
-//!   [`RunRow`], [`ParkedRow`], [`RunPhase`], [`StartOutcome`],
+//!   [`MemStorage`], [`RunRow`], [`ParkedRow`], [`RunPhase`], [`StartOutcome`],
 //!   [`ParkOutcome`], [`EngineMsg`], [`StorageError`], [`CronSchedule`],
-//!   [`fire_key`], [`due_wakes`];
+//!   [`CronError`], [`fire_key`], [`due_wakes`];
 //! - the L16 log: [`DurableLog`], [`Offset`], [`AppendError`] (with
 //!   `StaleEpoch`), and [`durable_log_laws`] so toron's own log runs the
 //!   upstream trait laws;
@@ -40,8 +40,9 @@ pub use elm_effect::{
     SystemClock, TestClock, TokioExecutor, use_service,
 };
 pub use elm_effect_durable::{
-    CronSchedule, DurableEngine, EngineError, EngineMsg, EngineStorage, OurEngine, ParkOutcome,
-    ParkedRow, RunPhase, RunRow, StartOutcome, StorageError, WakeIntent, due_wakes, fire_key,
+    CronError, CronSchedule, DurableEngine, EngineError, EngineMsg, EngineStorage, MemStorage,
+    OurEngine, ParkOutcome, ParkedRow, RunPhase, RunRow, StartOutcome, StorageError, WakeIntent,
+    due_wakes, fire_key,
 };
 pub use elm_effect_elm::replay::{Player, Snapshot};
 pub use elm_effect_elm::{

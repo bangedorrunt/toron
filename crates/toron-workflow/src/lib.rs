@@ -11,13 +11,15 @@
 //!   field requirements, the Buzz 100ms guard timeout + 270s delay-cap
 //!   patterns).
 //!
-//! Resonate durability (the Buzz WF-08 crash-resume fix) is wired by bd-oge;
-//! this crate is deliberately engine-free.
+//! Resonate durability (the Buzz WF-08 crash-resume fix) is wired by bd-oge.
+//! The cron host loop and the kernel port reach the framework through
+//! `toron_core::kernel`; this crate never names an elm-effect crate directly.
 
 pub mod channels;
 pub mod coalesce;
 pub mod cron;
 pub mod cron_core;
+pub mod cron_elm;
 pub mod cron_failure;
 pub mod delivery_cursor;
 pub mod dispatch;
@@ -42,6 +44,7 @@ pub use cron::{
     CronManager, CronRegistration, CronRegistry, CronSpecRegistration, CronSpecRegistry,
     latest_due_at_or_before, next_due,
 };
+pub use cron_elm::{CronFire, ElmCron};
 pub use cron_failure::{
     FailureBundle, PolicyEvent, PolicySink, evaluate, failure_details, is_failed,
 };
