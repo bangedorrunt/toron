@@ -195,7 +195,7 @@ Live-server SKIP guards: **24 early-`return` points across 12 files**. Only
    re-wake, approval watchdog, unsupported shapes, typed phase errors), and
    since `06270f3` every one of them runs on the production seam —
    `SyncWorkflowState`, `ToronEngineStore`, and `ToronJournal` over one SQLite
-   pool. Still missing: a production caller (step 5).
+   pool. The production caller landed in step 5.
 2. **Extend the model to graphs.** `durable.rs:347-349` refuses every workflow
    with `graph.is_some()`, and `tests/durable_host.rs:322` pins that refusal.
    Witness: SC-17 rewritten. Cannot delete Resonate before this; `graph:` is
@@ -204,16 +204,29 @@ Live-server SKIP guards: **24 early-`return` points across 12 files**. Only
    `tests/cron_elm.rs`. Must exist first: a production cadence driver in
    flywheel calling `ElmCron::tick`. **Missing today**: `ElmCron` has exactly
    one caller, its own test; `CronManager` has zero production callers in this
-   workspace.
+   workspace. The cross-repo cut is designed in
+   `docs/durable-engine/flywheel-resonate-port.md` §(a); implementation bead
+   `bd-flywheel-cron-elm-cn7p`.
 4. **Port the out-of-repo consumer.** `../flywheel/Cargo.toml:40` keeps
-   `resonate-sdk = "0.6.0"` and `:50` links `toron-workflow`; 242 lines across
-   `flywheel/src/{main,doorbell,durable}.rs` use it. Nothing in toron can be
-   deleted while that builds — `WorkflowEngine::remote_*`, `run_workflow`,
-   `resolve_approval`, `resolve_spawn`, `CronManager` are all public API it
-   calls.
+   `resonate-sdk = "0.6.0"` and links `toron-workflow`; the live surfaces are
+   `swarm_loop` + ~30 function leaves, the doorbell supervisor schedule, cron
+   ticks through `CronManager`, spawn-promise reads, and the server
+   health/probe/config paths. Nothing in toron can be deleted while that
+   builds — `WorkflowEngine::remote_*`, `run_workflow`, `resolve_approval`,
+   `resolve_spawn`, `CronManager` are all public API it calls. Per-surface
+   design: `docs/durable-engine/flywheel-resonate-port.md` (captain-reviewed
+   2026-11-02). Ordered implementation: epic `bd-off-resonate-qg2b`; health
+   deletion is LAST, not first; spawn-await is required before the dependency
+   can leave (`bd-spawn-durable-park-nncl`).
 5. **Cut the run path over.** Files: `workflow_host.rs:1083-1160`,
    `toron-cli/src/workflow.rs:74-142`. Witness: SC-11 rewritten;
    `host_lifecycle_parked_run_suspends_and_resolves`; all 3 `park_live_*`.
+   **Landed 2026-11-01/02** (`2164a6bc`, `f4595ff8`, `d895150`): the router
+   sends linear workflows to `DurableRun`, and the daemon arms the resolution
+   loop and the 30s restart sweep. Witnesses: `durable_sweep_resumes_a_parked_run_after_restart`,
+   `restart_does_not_replay_a_settled_step`, `corrupt_durable_model_settles_failed_instead_of_retrying`.
+   Graphs, spawn, and control-flow actions still refuse before any row and
+   run on the old path.
    The cut is three contained moves, in this order:
    - **(a) One leaf policy.** `engine/leaf.rs` holds `LeafSeams` (async runner,
      sync runner, verify sink, journal mode) + `dispatch_leaf`. The Resonate
@@ -266,11 +279,16 @@ Live-server SKIP guards: **24 early-`return` points across 12 files**. Only
    Then `README.md`, `CHANGELOG.md`, `AGENTS.md:147`,
    `docs/guides/*.mdx`, `docs/catalog/toron-mcp.json` (regenerate),
    `workflows/docker-upgrade.yaml:50-54,73`.
-10. **Delete the corpses.** `tests/foundation_test.rs`, `tests/recovery_test.rs`, local `resonate.db*` — nothing depends on them.
+10. **Delete the corpses.** `tests/foundation_test.rs`, `tests/recovery_test.rs`
+    deleted 2026-11-02 (`bd-resonate-corpses-l96j`); the untracked local
+    `resonate.db` stays as operator data and is not a repo file.
 
-**Cannot remove yet:** graph workflows (step 2), the run-path cutover that
-makes the host the real engine (step 5), cron cadence (step 3), and the
-flywheel build (step 4). Steps 1–5 are the replacement path, not cleanup.
+**Cannot remove yet:** graph workflows (step 2, implementation
+`bd-durable-graph-impl-r2x1`), cron cadence (step 3, `bd-flywheel-cron-elm-cn7p`),
+the flywheel build (step 4, epic `bd-off-resonate-qg2b`), and the spawn park
+(step 4, `bd-spawn-durable-park-nncl`). The run-path cutover (step 5) landed;
+the host is the real engine for linear workflows. Steps 6–9 stay gated on the
+four above.
 
 ## 8. Where code disagrees with "the in-house engine replaces Resonate"
 
