@@ -23,6 +23,7 @@
 //!
 //! governed-by: ADR-0004 ships 1/2/4/5, ADR-0005 Spec 2
 
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, PoisonError};
 
 use crate::send_armor::{
@@ -32,12 +33,23 @@ use crate::send_armor::{
 use anyhow::{Context, Result};
 use nostr::prelude::{Event, EventBuilder, EventId, FinalizeEvent, Keys, Kind, Tag, Timestamp};
 use toron_core::bus::{Bus, SubscriptionEvent};
+use toron_core::index::durable_engine::ToronEngineStore;
+use toron_core::index::durable_workflow::RunState as DurableModelState;
+use toron_core::index::durable_workflow::SyncWorkflowState;
+use toron_core::journal::{JournalDb, ToronJournal};
+use toron_core::kernel::OurEngine;
 use toron_core::mailbox::{Mailbox, SendMessage, UnwrappedMail};
 use toron_workflow::coalesce::{
     CoalesceDecision, Coalesced, DlqReason, MentionCoalescer, RequeueOutcome, RequeueSchedule,
 };
 use toron_workflow::dispatch::{DispatchAcquire, DispatchConfig, DispatchPermit, DispatchPool};
 use toron_workflow::engine::ResonateChoice;
+use toron_workflow::engine::durable::{RunEffect, RunModel, RunPhase as ModelPhase, unsupported_reason};
+use toron_workflow::engine::durable_host::{DurableRun, HostError};
+use toron_workflow::engine::is_failure_value;
+use toron_workflow::identity::workflow_digest;
+use toron_workflow::engine::leaf::LeafSeams;
+use toron_workflow::engine::linear_step::{LinearStep, run_linear_step};
 use toron_workflow::engine::{
     ActionInvocation, ActionPartition, AsyncEffectRunner, AsyncRunJournal, CleanupKind,
     CleanupRequest, Decision, DispatchPlan, EffectJournalMode, FORCED_CLEANUP_CAPABILITY, ParkKind,
@@ -999,6 +1011,74 @@ pub struct WorkflowHost {
     /// trigger-loop host parks SleepUntilDeadline via try_acquire_for_host
     /// (Option try_acquire remains e2e-only).
     dispatch_pool: Arc<DispatchPool>,
+    /// bd-host-cut-pqkg: context-free leaf seams for the durable run path.
+    /// Cloned from the engine's own seams at construction, so the durable
+    /// arm dispatches through the same runner the old path would have used.
+    seams: LeafSeams,
+    /// bd-host-cut-pqkg: approvals parked on the durable path by run id.
+    /// The model has no Resonate promise id, so the run id is the
+    /// correlation key; `PendingDrain` never sees these entries.
+    durable_parks: Arc<std::sync::Mutex<HashMap<String, DurablePark>>>,
+    /// bd-host-cut-pqkg: durable runs currently driving in this process.
+    /// The restart sweep skips these so a run is never double-driven (a
+    /// second driver feeding `step_ok` for the same step would hit
+    /// `WrongPhase` and fail the run).
+    durable_active: Arc<std::sync::Mutex<HashSet<String>>>,
+}
+
+/// One approval parked on the durable path (bd-host-cut-pqkg).
+#[derive(Clone, Debug)]
+struct DurablePark {
+    /// Step awaiting the decision.
+    node: String,
+    /// Park generation (always 1 in this slice: the model parks one
+    /// approval at a time and the entry is removed on approve).
+    generation: u64,
+    /// Workflow + trigger ride along for the post-approval continuation.
+    workflow: Workflow,
+    /// Trigger payload for the continuation drive.
+    trigger: serde_json::Value,
+    /// Effect identity for the continuation's steps (same helper the old
+    /// path uses: `toron_workflow::identity::workflow_digest`).
+    workflow_digest: String,
+}
+
+/// The host's concrete durable driver (bd-host-cut-pqkg): one SQLite pool,
+/// three channel-bridged handles. Every verb is sync and must run in
+/// `spawn_blocking`, never on an async worker.
+type HostDurableRun = DurableRun<ToronEngineStore, ToronJournal, SyncWorkflowState>;
+
+/// Route one workflow to the durable host or the old engine (bd-host-cut-pqkg).
+/// `Ok` means the durable path owns it; `Err(reason)` names why it stays on
+/// `WorkflowEngine::run`. Pure: no row exists at this point either way.
+pub fn durable_route(workflow: &Workflow, has_store: bool) -> Result<(), String> {
+    if !has_store {
+        return Err("no durable store attached".into());
+    }
+    if let Some(reason) = unsupported_reason(workflow) {
+        return Err(reason);
+    }
+    Ok(())
+}
+
+/// Build the three host handles for one pool (bd-host-cut-pqkg). Call from
+/// async context: `spawn` needs the runtime handle. The handles are
+/// sync-over-channels; every verb on them runs in `spawn_blocking`.
+fn host_handles(pool: sqlx::SqlitePool) -> (ToronEngineStore, ToronJournal, SyncWorkflowState) {
+    let handle = tokio::runtime::Handle::current();
+    (
+        ToronEngineStore::spawn(pool.clone(), &handle),
+        ToronJournal::spawn(JournalDb::new(pool.clone(), "host", 64), &handle),
+        SyncWorkflowState::spawn(pool, &handle),
+    )
+}
+
+/// Host time, unix millis, for the durable driver verbs.
+fn durable_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0)
 }
 
 impl std::fmt::Debug for WorkflowHost {
@@ -1081,6 +1161,8 @@ impl WorkflowHost {
             .store()
             .map(|store| async_run_journal(store.clone()));
         let choice = toron_workflow::engine::resonate_choice();
+        // bd-host-cut-pqkg: the durable arm reuses the engine's own runner.
+        let seams_runner = async_effect_runner.clone();
         // bd-yolv: a pin or a probed server is the engine the operator asked for
         // and nothing is lost, so all three collapse into one arm. The fourth
         // variant is spelled out because it is NOT a mode — it is a loss of
@@ -1122,6 +1204,15 @@ impl WorkflowHost {
             }
         };
         let bus = mailbox.bus().clone();
+        // bd-host-cut-pqkg: context-free seams over the same runner + sink.
+        let seams = LeafSeams {
+            async_runner: Some(seams_runner),
+            sync_runner: None,
+            verify_sink: engine.verify_sink().clone(),
+            journal_mode: EffectJournalMode::Enforced,
+        };
+        let durable_parks = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let durable_active = Arc::new(std::sync::Mutex::new(HashSet::new()));
         Ok(Self {
             engine: Arc::new(engine),
             bus,
@@ -1135,6 +1226,9 @@ impl WorkflowHost {
             pending: Arc::new(tokio::sync::Mutex::new(pending)),
             dispatcher,
             dispatch_pool,
+            seams,
+            durable_parks,
+            durable_active,
         })
     }
 
@@ -1147,8 +1241,19 @@ impl WorkflowHost {
         workflows: Vec<Workflow>,
         effect: Option<AsyncEffectRunner>,
     ) -> Result<Self> {
-        let engine =
-            WorkflowEngine::local_with_async_effect_runner(effect).context("workflow engine")?;
+        let engine = WorkflowEngine::local_with_async_effect_runner(effect.clone())
+            .context("workflow engine")?;
+        // bd-host-cut-pqkg: journal-less embeddings run Recording, like the arm above.
+        let seams = LeafSeams {
+            journal_mode: if effect.is_some() {
+                EffectJournalMode::Enforced
+            } else {
+                EffectJournalMode::Recording
+            },
+            async_runner: effect,
+            sync_runner: None,
+            verify_sink: engine.verify_sink().clone(),
+        };
         let lifecycle = Arc::new(WorkflowLifecycle::new());
         let delivery = Arc::new(toron_workflow::DeliveryCursorStore::new());
         for w in &workflows {
@@ -1165,6 +1270,9 @@ impl WorkflowHost {
             pending: Arc::new(tokio::sync::Mutex::new(PendingDrain::new())),
             dispatcher: Arc::new(std::sync::Mutex::new(None)),
             dispatch_pool: Arc::new(DispatchPool::new(DispatchConfig::default())),
+            seams,
+            durable_parks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            durable_active: Arc::new(std::sync::Mutex::new(HashSet::new())),
         })
     }
 
@@ -1191,6 +1299,10 @@ impl WorkflowHost {
             pending: Arc::new(tokio::sync::Mutex::new(PendingDrain::new())),
             dispatcher: Arc::new(std::sync::Mutex::new(None)),
             dispatch_pool: Arc::new(DispatchPool::new(DispatchConfig::default())),
+            // bd-host-cut-pqkg: inert without a store (the router never selects it).
+            seams: LeafSeams::default(),
+            durable_parks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            durable_active: Arc::new(std::sync::Mutex::new(HashSet::new())),
         }
     }
 
@@ -1490,6 +1602,17 @@ impl WorkflowHost {
     /// then resolve or reject the exact promise. Mismatches are recorded in
     /// the drain and returned as errors — they never touch a promise.
     pub async fn resolve_parked(&self, res: Resolution) -> Result<PendingEntry> {
+        // bd-host-cut-pqkg: durable parks carry no promise id; the run id is
+        // the correlation key and the decision lands through the state store.
+        let park = self
+            .durable_parks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&res.run_id)
+            .cloned();
+        if let Some(park) = park {
+            return self.resolve_durable_park(res, park).await;
+        }
         let entry = self
             .pending
             .lock()
@@ -1595,6 +1718,23 @@ impl WorkflowHost {
         {
             warn!(run_id = %run_id, "durable run track failed (memory still tracked): {e:#}");
         }
+        // bd-host-cut-pqkg: linear workflows run on the durable host; the
+        // router refuses before any engine or model row exists.
+        let has_store = self.pending.lock().await.store().is_some();
+        if durable_route(&workflow, has_store).is_ok() {
+            let me = self.clone();
+            tokio::spawn(async move {
+                me.run_durable_loop(run_id, workflow, input).await;
+            });
+            return;
+        }
+        self.spawn_legacy_run(run_id, workflow, input).await;
+    }
+
+    /// The old engine path (bd-host-cut-pqkg): `WorkflowEngine::run` plus the
+    /// sink drain + follower, unchanged. Graphs, spawn, and control-flow
+    /// actions stay here until their model lands.
+    async fn spawn_legacy_run(&self, run_id: String, workflow: Workflow, input: RunInput) {
         let me = self.clone();
         let rid = run_id.clone();
         tokio::spawn(async move {
@@ -1641,6 +1781,546 @@ impl WorkflowHost {
                 me.publish_fresh(&fresh).await;
             }
         });
+    }
+
+    /// Drive one linear workflow on the durable host (bd-host-cut-pqkg):
+    /// open the driver (resume when the model exists), then run the effect
+    /// loop. Every `DurableRun` verb runs in `spawn_blocking` — the handles
+    /// are sync-over-channels and must never run on an async worker.
+    async fn run_durable_loop(&self, run_id: String, workflow: Workflow, input: RunInput) {
+        let pool = match self.pending.lock().await.store().map(|s| s.pool().clone()) {
+            Some(pool) => pool,
+            None => {
+                warn!(run_id = %run_id, "durable route lost its store; falling back to the old engine");
+                self.spawn_legacy_run(run_id, workflow, input).await;
+                return;
+            }
+        };
+        let (engine_store, journal, state) = host_handles(pool);
+        let wf = workflow.clone();
+        let rid = run_id.clone();
+        let trig = input.trigger.clone();
+        let opened = tokio::task::spawn_blocking(move || {
+            let engine = OurEngine::with_journal(engine_store, journal);
+            DurableRun::open(engine, state, rid, wf, trig, durable_now_ms())
+        })
+        .await;
+        let (run, effects) = match opened {
+            Ok(Ok(pair)) => pair,
+            Ok(Err(HostError::Unsupported(reason))) => {
+                warn!(run_id = %run_id, "durable open refused ({reason}); falling back to the old engine");
+                self.spawn_legacy_run(run_id, workflow, input).await;
+                return;
+            }
+            Ok(Err(e)) => {
+                warn!(run_id = %run_id, "durable open failed: {e}; marking the run failed");
+                self.fail_durable(&run_id).await;
+                return;
+            }
+            Err(e) => {
+                warn!(run_id = %run_id, "durable open task failed: {e}; marking the run failed");
+                self.fail_durable(&run_id).await;
+                return;
+            }
+        };
+        // bd-host-cut-pqkg: the same digest helper the old path uses
+        // (`control_flow` feeds it into every invocation), computed once per
+        // run so every step's effect key is stable across restarts.
+        let digest = workflow_digest(&workflow);
+        self.drive_tracked(run, effects, run_id, workflow, input.trigger, digest)
+            .await;
+    }
+
+    /// Drive to park-or-terminal with the run in the active set, so the
+    /// restart sweep never double-drives it (bd-host-cut-pqkg).
+    async fn drive_tracked(
+        &self,
+        run: HostDurableRun,
+        effects: Vec<RunEffect>,
+        run_id: String,
+        workflow: Workflow,
+        trigger: serde_json::Value,
+        workflow_digest: String,
+    ) {
+        self.durable_active
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(run_id.clone());
+        self.drive_durable_effects(run, effects, run_id.clone(), workflow, trigger, workflow_digest)
+            .await;
+        self.durable_active
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&run_id);
+    }
+
+    /// Spawn the durable restart sweep (bd-host-cut-pqkg): one pass now,
+    /// then the same path on `interval`. The old engine got resume from the
+    /// server; the durable path gets it from here — without this, a daemon
+    /// restart would drop every parked timer and the cut would regress.
+    pub fn spawn_durable_sweep(
+        &self,
+        interval: std::time::Duration,
+    ) -> tokio::task::JoinHandle<()> {
+        let me = self.clone();
+        tokio::spawn(async move {
+            me.sweep_durable_runs().await;
+            loop {
+                tokio::time::sleep(interval).await;
+                me.sweep_durable_runs().await;
+            }
+        })
+    }
+
+    /// Re-open every persisted non-terminal durable model and drive it
+    /// (bd-host-cut-pqkg). Terminal models are deleted; unparsable rows are
+    /// left alone (never destroy evidence); runs already driving here or
+    /// parked on an approval are skipped. No store, or an unreadable table,
+    /// is a quiet no-op.
+    pub async fn sweep_durable_runs(&self) {
+        let pool = match self
+            .pending
+            .lock()
+            .await
+            .store()
+            .map(|s| s.pool().clone())
+        {
+            Some(pool) => pool,
+            None => return,
+        };
+        let (engine_store, journal, state) = host_handles(pool);
+        let state_for_list = state.clone();
+        let rows = match tokio::task::spawn_blocking(move || state_for_list.list()).await {
+            Ok(Ok(rows)) => rows,
+            Ok(Err(e)) => {
+                warn!("durable sweep: state list failed: {e:#}");
+                return;
+            }
+            Err(e) => {
+                warn!("durable sweep: list task failed: {e}");
+                return;
+            }
+        };
+        for (run_id, json) in rows {
+            let model: RunModel = match serde_json::from_str(&json) {
+                Ok(model) => model,
+                Err(e) => {
+                    warn!(run_id = %run_id, "durable sweep: unparsable model, leaving the row: {e}");
+                    continue;
+                }
+            };
+            if model.is_terminal() {
+                let state_for_delete = state.clone();
+                let rid = run_id.clone();
+                if let Err(e) = tokio::task::spawn_blocking(move || {
+                    state_for_delete.delete(&rid)
+                })
+                .await
+                {
+                    warn!(run_id = %run_id, "durable sweep: delete task failed: {e}");
+                }
+                continue;
+            }
+            let live = self
+                .durable_active
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .contains(&run_id)
+                || self
+                    .durable_parks
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .contains_key(&run_id);
+            if live {
+                continue;
+            }
+            let me = self.clone();
+            let (es, j, st) = (engine_store.clone(), journal.clone(), state.clone());
+            tokio::spawn(async move {
+                me.drive_swept_run(run_id, es, j, st).await;
+            });
+        }
+    }
+
+    /// Re-open one swept run by id and drive it (bd-host-cut-pqkg). The
+    /// persisted model wins, so the passed workflow/trigger only matter for
+    /// a row lost between list and open — and those come from the model we
+    /// just parsed, never a guess. Workflow, trigger, and digest for the
+    /// drive all come from the reopened model.
+    async fn drive_swept_run(
+        &self,
+        run_id: String,
+        engine_store: ToronEngineStore,
+        journal: ToronJournal,
+        state: SyncWorkflowState,
+    ) {
+        let listed: Option<(Workflow, serde_json::Value)> =
+            match tokio::task::spawn_blocking({
+                let state = state.clone();
+                let rid = run_id.clone();
+                move || state.load(&rid)
+            })
+            .await
+            {
+                Ok(Ok(Some(json))) => serde_json::from_str::<RunModel>(&json)
+                    .ok()
+                    .map(|m| (m.workflow, m.trigger)),
+                _ => None,
+            };
+        let Some((workflow, trigger)) = listed else {
+            warn!(run_id = %run_id, "durable sweep: model vanished between list and open; skipping");
+            return;
+        };
+        let rid = run_id.clone();
+        let opened = tokio::task::spawn_blocking(move || {
+            let engine = OurEngine::with_journal(engine_store, journal);
+            DurableRun::open(engine, state, rid, workflow, trigger, durable_now_ms())
+        })
+        .await;
+        match opened {
+            Ok(Ok((run, effects))) => {
+                if run.model().is_terminal() {
+                    return;
+                }
+                let digest = workflow_digest(&run.model().workflow);
+                let workflow = run.model().workflow.clone();
+                let trigger = run.model().trigger.clone();
+                self.drive_tracked(run, effects, run_id, workflow, trigger, digest)
+                    .await;
+            }
+            Ok(Err(e)) => {
+                warn!(run_id = %run_id, "durable sweep: reopen failed: {e}");
+            }
+            Err(e) => {
+                warn!(run_id = %run_id, "durable sweep: reopen task failed: {e}");
+            }
+        }
+    }
+
+    /// The effect loop for one durable run (bd-host-cut-pqkg). `ExecuteStep`
+    /// goes through `run_linear_step` with the host seams and feeds back as
+    /// `step_ok` / `step_failed` (classified by `is_failure_value`, the same
+    /// predicate the Context path uses); `ParkUntil` sleeps to the deadline
+    /// and re-drives with `woke`; `AwaitApproval` publishes and parks;
+    /// terminal effects settle the run. Returns only on park or terminal.
+    async fn drive_durable_effects(
+        &self,
+        mut run: HostDurableRun,
+        mut effects: Vec<RunEffect>,
+        run_id: String,
+        workflow: Workflow,
+        trigger: serde_json::Value,
+        workflow_digest: String,
+    ) {
+        let mut outputs: serde_json::Map<String, serde_json::Value> =
+            run.model().outputs.clone().into_iter().collect();
+        loop {
+            if effects.is_empty() {
+                warn!(run_id = %run_id, "durable drive ran out of effects while non-terminal; stopping");
+                return;
+            }
+            let mut follow: Vec<RunEffect> = Vec::new();
+            for effect in std::mem::take(&mut effects) {
+                match effect {
+                    RunEffect::ExecuteStep { index, step } => {
+                        let value = run_linear_step(
+                            LinearStep {
+                                run_id: &run_id,
+                                workflow: &workflow.name,
+                                workflow_digest: &workflow_digest,
+                                step: &step,
+                                index,
+                                trigger: &trigger,
+                                outputs: &mut outputs,
+                            },
+                            &self.seams,
+                        )
+                        .await;
+                        let failed = is_failure_value(&value);
+                        let then = move |mut run: HostDurableRun| {
+                            if failed {
+                                let error = value
+                                    .get("error")
+                                    .and_then(|e| e.as_str())
+                                    .map(str::to_string)
+                                    .unwrap_or_else(|| value.to_string());
+                                run.step_failed(error, durable_now_ms())
+                                    .map(|eff| (run, eff))
+                            } else {
+                                run.step_ok(value, durable_now_ms()).map(|eff| (run, eff))
+                            }
+                        };
+                        let Some((back, mut eff)) = self.drive_verb(&run_id, run, then).await
+                        else {
+                            return;
+                        };
+                        run = back;
+                        outputs = run.model().outputs.clone().into_iter().collect();
+                        follow.append(&mut eff);
+                    }
+                    RunEffect::ParkUntil { until_ms, .. } => {
+                        // A park whose deadline already passed re-wakes inside
+                        // the same `apply` that emitted it, so the model is
+                        // already Running and this effect is stale: skip it
+                        // instead of calling `woke` out of phase.
+                        if !matches!(run.model().phase, ModelPhase::Parked { .. }) {
+                            continue;
+                        }
+                        let now = durable_now_ms();
+                        if until_ms > now {
+                            tokio::time::sleep(std::time::Duration::from_millis(until_ms - now))
+                                .await;
+                        }
+                        let Some((back, mut eff)) = self
+                            .drive_verb(&run_id, run, |mut run: HostDurableRun| {
+                                run.woke(durable_now_ms()).map(|eff| (run, eff))
+                            })
+                            .await
+                        else {
+                            return;
+                        };
+                        run = back;
+                        follow.append(&mut eff);
+                    }
+                    RunEffect::AwaitApproval { step, message } => {
+                        self.park_durable_approval(
+                            &run_id,
+                            &workflow,
+                            &trigger,
+                            &workflow_digest,
+                            step,
+                            message,
+                        )
+                        .await;
+                        return;
+                    }
+                    RunEffect::Complete { output } => {
+                        self.settle_durable(&run_id, "succeeded", "", &output.to_string())
+                            .await;
+                        return;
+                    }
+                    RunEffect::Fail { step, error } => {
+                        self.settle_durable(&run_id, "failed", &step, &error).await;
+                        return;
+                    }
+                    RunEffect::Cancelled => {
+                        self.settle_durable(&run_id, "cancelled", "", "cancelled")
+                            .await;
+                        return;
+                    }
+                    RunEffect::Unsupported { reason } => {
+                        warn!(run_id = %run_id, "durable drive hit unsupported ({reason}); falling back to the old engine");
+                        let input = RunInput {
+                            workflow: workflow.clone(),
+                            trigger: trigger.clone(),
+                            run_id: Some(run_id.clone()),
+                        };
+                        self.spawn_legacy_run(run_id, workflow, input).await;
+                        return;
+                    }
+                }
+            }
+            effects = follow;
+        }
+    }
+
+    /// Run one sync driver verb in `spawn_blocking` and hand the driver back
+    /// (bd-host-cut-pqkg). On any failure the run is marked failed and `None`
+    /// is returned, so the caller stops the loop.
+    async fn drive_verb(
+        &self,
+        run_id: &str,
+        run: HostDurableRun,
+        verb: impl FnOnce(HostDurableRun) -> Result<(HostDurableRun, Vec<RunEffect>), HostError>
+        + Send
+        + 'static,
+    ) -> Option<(HostDurableRun, Vec<RunEffect>)> {
+        match tokio::task::spawn_blocking(|| verb(run)).await {
+            Ok(Ok(pair)) => Some(pair),
+            Ok(Err(e)) => {
+                warn!(run_id = %run_id, "durable verb failed: {e}; marking the run failed");
+                self.fail_durable(run_id).await;
+                None
+            }
+            Err(e) => {
+                warn!(run_id = %run_id, "durable verb task failed: {e}; marking the run failed");
+                self.fail_durable(run_id).await;
+                None
+            }
+        }
+    }
+
+    /// Mark one durable run failed, durably (bd-host-cut-pqkg).
+    async fn fail_durable(&self, run_id: &str) {
+        if let Err(e) = self
+            .pending
+            .lock()
+            .await
+            .set_run_state_durable(run_id, RunState::Failed)
+            .await
+        {
+            warn!(run_id = %run_id, "durable run state failed: {e:#}");
+        }
+    }
+
+    /// Park one durable approval (bd-host-cut-pqkg): record the park for the
+    /// resolution path, publish kind-46011 with the run id as the
+    /// correlation key, and track `Suspended`. A missing signer warns and
+    /// keeps the park recorded, like the old path's retained entries.
+    async fn park_durable_approval(
+        &self,
+        run_id: &str,
+        workflow: &Workflow,
+        trigger: &serde_json::Value,
+        workflow_digest: &str,
+        step: String,
+        message: String,
+    ) {
+        let park = DurablePark {
+            node: step.clone(),
+            generation: 1,
+            workflow: workflow.clone(),
+            trigger: trigger.clone(),
+            workflow_digest: workflow_digest.to_string(),
+        };
+        self.durable_parks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(run_id.to_string(), park);
+        let mut entry = PendingEntry::new(
+            run_id,
+            None,
+            workflow.name.clone(),
+            step,
+            None,
+            run_id,
+            1,
+            ParkKind::Approval,
+        );
+        entry.question = Some(message.chars().take(500).collect());
+        if let Err(e) = self.publish_approval_pending(&entry).await {
+            warn!(run_id = %run_id, "durable approval publication failed (park retained): {e:#}");
+        }
+        if let Err(e) = self
+            .pending
+            .lock()
+            .await
+            .set_run_state_durable(run_id, RunState::Suspended)
+            .await
+        {
+            warn!(run_id = %run_id, "durable run state failed: {e:#}");
+        }
+    }
+
+    /// Settle one durable terminal effect (bd-host-cut-pqkg): the kind-46012
+    /// semantic terminal plus the durable run state. A failed publication
+    /// still settles the state, so the run never hangs silent.
+    async fn settle_durable(&self, run_id: &str, status: &str, node: &str, evidence: &str) {
+        match self
+            .publish_terminal(run_id, "", status, node, evidence)
+            .await
+        {
+            Ok(_) => {}
+            Err(e) => {
+                warn!(run_id = %run_id, "durable terminal publication failed: {e:#}");
+                let state = RunState::parse_status(status).unwrap_or(RunState::Unknown);
+                if let Err(e2) = self
+                    .pending
+                    .lock()
+                    .await
+                    .set_run_state_durable(run_id, state)
+                    .await
+                {
+                    warn!(run_id = %run_id, "durable run state failed: {e2:#}");
+                }
+            }
+        }
+    }
+
+    /// Settle one durable-parked approval (bd-host-cut-pqkg): validate the
+    /// run/generation correlation, approve through the state store, and keep
+    /// driving the run. The returned entry is built from the park (promise
+    /// id = run id) for the caller's logging shape.
+    async fn resolve_durable_park(
+        &self,
+        res: Resolution,
+        park: DurablePark,
+    ) -> Result<PendingEntry> {
+        if res.promise_id != res.run_id {
+            anyhow::bail!(
+                "durable resolution correlation mismatch: promise {} != run {}",
+                res.promise_id,
+                res.run_id
+            );
+        }
+        if res.generation != park.generation {
+            anyhow::bail!(
+                "durable resolution generation mismatch: got {}, want {}",
+                res.generation,
+                park.generation
+            );
+        }
+        let decision = match res.verdict {
+            ResolutionVerdict::Approved => {
+                serde_json::json!({"approved": true, "note": res.note.clone()})
+            }
+            ResolutionVerdict::Rejected => {
+                serde_json::json!({"approved": false, "note": res.note.clone()})
+            }
+            ResolutionVerdict::SpawnCompleted => {
+                anyhow::bail!("spawn verdict on a durable approval park: {}", res.run_id);
+            }
+        };
+        // Take the entry so a duplicate resolution finds nothing to settle.
+        self.durable_parks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&res.run_id);
+        let pool = self.pending.lock().await.store().map(|s| s.pool().clone());
+        let Some(pool) = pool else {
+            anyhow::bail!("durable resolve lost its store for run {}", res.run_id);
+        };
+        let (engine_store, journal, state) = host_handles(pool);
+        let rid = res.run_id.clone();
+        let workflow = park.workflow.clone();
+        let trigger = park.trigger.clone();
+        let approved = tokio::task::spawn_blocking(move || {
+            let engine = OurEngine::with_journal(engine_store, journal);
+            let (mut run, _) = DurableRun::open(
+                engine,
+                state,
+                rid.clone(),
+                workflow.clone(),
+                trigger,
+                durable_now_ms(),
+            )?;
+            run.approve(decision, durable_now_ms())
+                .map(|effects| (run, effects))
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("durable approve task failed: {e}"))?;
+        let (run, effects) =
+            approved.map_err(|e: HostError| anyhow::anyhow!("durable approve failed: {e}"))?;
+        let entry = PendingEntry::new(
+            res.run_id.clone(),
+            res.project.clone(),
+            park.workflow.name.clone(),
+            park.node.clone(),
+            None,
+            res.run_id.clone(),
+            park.generation,
+            ParkKind::Approval,
+        );
+        self.drive_tracked(
+            run,
+            effects,
+            res.run_id,
+            park.workflow.clone(),
+            park.trigger.clone(),
+            park.workflow_digest.clone(),
+        )
+        .await;
+        Ok(entry)
     }
 
     /// Drain one run's fresh parks and publish their pending events.
@@ -7738,5 +8418,371 @@ steps:
             drained,
             "COALESCE_FLUSH_TICK_MS cadence must drain FreshWindow requeue without bus events"
         );
+    }
+
+    /// bd-host-cut-pqkg: the router admits linear workflows and refuses the
+    /// rest before any row exists. Pure function, no I/O.
+    mod durable_route_tests {
+        use super::*;
+        use toron_workflow::schema::{Graph, GraphNode, Step, StepOnError};
+
+        fn linear_step() -> Step {
+            Step {
+                name: Some("notify".into()),
+                guard: None,
+                on_error: StepOnError::Continue,
+                build_slot: false,
+                action: Action::SendMessage {
+                    to: vec!["nobody".into()],
+                    subject: "cut".into(),
+                    body: "hello".into(),
+                    project: Some("demo".into()),
+                },
+            }
+        }
+
+        fn linear_workflow() -> Workflow {
+            Workflow {
+                name: "linear-cut".into(),
+                description: None,
+                trigger: None,
+                policy: None,
+                guard: None,
+                principles: vec![],
+                steps: vec![linear_step()],
+                graph: None,
+                inputs: vec![],
+                crew: None,
+            }
+        }
+
+        #[test]
+        fn admits_a_linear_workflow_with_a_store() {
+            assert!(durable_route(&linear_workflow(), true).is_ok());
+        }
+
+        #[test]
+        fn refuses_everything_without_a_store() {
+            let err = durable_route(&linear_workflow(), false).expect_err("no store");
+            assert!(err.contains("no durable store"), "{err}");
+        }
+
+        #[test]
+        fn refuses_a_graph_workflow() {
+            let mut wf = linear_workflow();
+            wf.graph = Some(Graph {
+                nodes: [(
+                    "node-a".to_string(),
+                    GraphNode {
+                        action: Action::SendMessage {
+                            to: vec!["nobody".into()],
+                            subject: "cut".into(),
+                            body: "hello".into(),
+                            project: None,
+                        },
+                        needs: vec![],
+                        guard: None,
+                        on_error: StepOnError::Continue,
+                        build_slot: false,
+                    },
+                )]
+                .into_iter()
+                .collect(),
+            });
+            let err = durable_route(&wf, true).expect_err("graph stays old");
+            assert!(err.contains("graph"), "{err}");
+        }
+
+        #[test]
+        fn refuses_a_spawn_step() {
+            let mut wf = linear_workflow();
+            wf.steps[0].action = Action::Spawn {
+                profile: "@housekeeper".into(),
+                harness: None,
+                workflow: None,
+                await_: true,
+                no_claim_timeout: 600,
+                context: None,
+            };
+            let err = durable_route(&wf, true).expect_err("spawn stays old");
+            assert!(err.contains("spawn"), "{err}");
+        }
+
+        #[test]
+        fn durable_pending_carries_run_id_and_never_parses_as_resolution() {
+            // The park publishes run id as the correlation key with no
+            // verdict, so the resolution parser must ignore it.
+            let entry = PendingEntry::new(
+                "run-cut-9",
+                None,
+                "linear-cut".to_string(),
+                "approve-it".to_string(),
+                None,
+                "run-cut-9",
+                1,
+                ParkKind::Approval,
+            );
+            assert_eq!(entry.promise_id, "run-cut-9");
+            let body = serde_json::json!({
+                "run_id": entry.run_id,
+                "workflow": entry.workflow,
+                "node": entry.node_path,
+                "promise_id": entry.promise_id,
+                "generation": entry.generation,
+                "kind": entry.kind.as_str(),
+            });
+            let keys = Keys::generate();
+            let event = EventBuilder::new(Kind::from_u16(46011), body.to_string())
+                .finalize(&keys)
+                .expect("sign");
+            assert!(
+                WorkflowHost::parse_approval_resolution(&event).is_none(),
+                "a pending without verdict is not a resolution"
+            );
+        }
+    }
+
+    /// bd-host-cut-pqkg: durable resolutions validate before touching the
+    /// state store; mismatches bail without settling anything.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn durable_resolve_rejects_mismatches_before_the_store() {
+        use toron_core::bus::in_process::{InProcessBus, InProcessBusConfig};
+        use toron_core::index::schema;
+        use toron_workflow::schema::Workflow;
+
+        let db = std::env::temp_dir().join(format!("wf-cut-{}.sqlite", uuid::Uuid::new_v4()));
+        let pool = schema::connect(db.to_str().unwrap())
+            .await
+            .expect("connect");
+        schema::migrate(&pool).await.expect("migrate");
+        let bus: Arc<dyn Bus> = Arc::new(
+            InProcessBus::open(pool.clone(), InProcessBusConfig::default())
+                .await
+                .expect("bus"),
+        );
+        let host = WorkflowHost::over_bus(bus, vec![], None).expect("host");
+        host.with_effect_store(recon_store("host-cut").await).await;
+        host.durable_parks.lock().unwrap().insert(
+            "run-cut-9".to_string(),
+            DurablePark {
+                node: "approve-it".into(),
+                generation: 1,
+                workflow_digest: "digest-9".into(),
+                workflow: Workflow {
+                    name: "linear-cut".into(),
+                    description: None,
+                    trigger: None,
+                    policy: None,
+                    guard: None,
+                    principles: vec![],
+                    steps: vec![],
+                    graph: None,
+                    inputs: vec![],
+                    crew: None,
+                },
+                trigger: serde_json::json!({}),
+            },
+        );
+        let bad_promise = Resolution {
+            run_id: "run-cut-9".into(),
+            project: None,
+            promise_id: "promise-xyz".into(),
+            generation: 1,
+            verdict: ResolutionVerdict::Approved,
+            note: String::new(),
+        };
+        assert!(
+            host.resolve_parked(bad_promise).await.is_err(),
+            "promise id != run id must not settle a durable park"
+        );
+        let bad_generation = Resolution {
+            run_id: "run-cut-9".into(),
+            project: None,
+            promise_id: "run-cut-9".into(),
+            generation: 7,
+            verdict: ResolutionVerdict::Approved,
+            note: String::new(),
+        };
+        assert!(
+            host.resolve_parked(bad_generation).await.is_err(),
+            "a stale generation must not settle a durable park"
+        );
+        // Both rejections leave the park recorded for the real resolution.
+        assert!(host.durable_parks.lock().unwrap().contains_key("run-cut-9"));
+    }
+
+    /// bd-host-cut-pqkg: the host-level restart witness — one linear workflow
+    /// completes on the durable path with no Resonate server anywhere.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn durable_loop_completes_a_linear_workflow() {
+        use toron_core::bus::in_process::{InProcessBus, InProcessBusConfig};
+        use toron_core::index::schema;
+        use toron_workflow::schema::{Action, Step, StepOnError, Workflow};
+
+        let db = std::env::temp_dir().join(format!("wf-cut-run-{}.sqlite", uuid::Uuid::new_v4()));
+        let pool = schema::connect(db.to_str().unwrap())
+            .await
+            .expect("connect");
+        schema::migrate(&pool).await.expect("migrate");
+        let bus: Arc<dyn Bus> = Arc::new(
+            InProcessBus::open(pool.clone(), InProcessBusConfig::default())
+                .await
+                .expect("bus"),
+        );
+        let seen_digest: Arc<std::sync::Mutex<Option<String>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let digest_slot = seen_digest.clone();
+        let afx: AsyncEffectRunner = Arc::new(move |inv: &ActionInvocation| {
+            *digest_slot.lock().unwrap() = Some(inv.run.workflow_digest.clone());
+            Box::pin(async move { Ok(serde_json::json!({ "ok": true })) })
+                as std::pin::Pin<
+                    Box<dyn std::future::Future<Output = anyhow::Result<serde_json::Value>> + Send>,
+                >
+        });
+        let workflow = Workflow {
+            name: "linear-cut-run".into(),
+            description: None,
+            trigger: None,
+            policy: None,
+            guard: None,
+            principles: vec![],
+            steps: vec![Step {
+                name: Some("notify".into()),
+                guard: None,
+                on_error: StepOnError::Continue,
+                build_slot: false,
+                action: Action::SendMessage {
+                    to: vec!["nobody".into()],
+                    subject: "cut".into(),
+                    body: "hello".into(),
+                    project: Some("demo".into()),
+                },
+            }],
+            graph: None,
+            inputs: vec![],
+            crew: None,
+        };
+        let host = WorkflowHost::over_bus(bus, vec![workflow.clone()], Some(afx)).expect("host");
+        host.with_effect_store(recon_store("host-cut-run").await)
+            .await;
+        let input = RunInput {
+            workflow: workflow.clone(),
+            trigger: serde_json::json!({}),
+            run_id: Some("run-cut-1".to_string()),
+        };
+        host.run_durable_loop("run-cut-1".to_string(), workflow.clone(), input)
+            .await;
+        let state = host
+            .pending
+            .lock()
+            .await
+            .run_state_durable("run-cut-1")
+            .await;
+        assert_eq!(state, RunState::Succeeded, "linear run completes durable");
+        assert_eq!(
+            seen_digest.lock().unwrap().as_deref(),
+            Some(workflow_digest(&workflow).as_str()),
+            "the runner sees the identity digest, never an empty string"
+        );
+    }
+
+    /// bd-host-cut-pqkg: the restart witness — host1 parks an approval and
+    /// dies; host2's sweep re-opens the persisted model and re-drives it to
+    /// a fresh park; a resolution then settles the run through the store.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn durable_sweep_resumes_a_parked_run_after_restart() {
+        use toron_core::bus::in_process::{InProcessBus, InProcessBusConfig};
+        use toron_core::index::schema;
+        use toron_workflow::schema::{Action, Step, StepOnError, Workflow};
+
+        let db =
+            std::env::temp_dir().join(format!("wf-cut-sweep-{}.sqlite", uuid::Uuid::new_v4()));
+        let pool = schema::connect(db.to_str().unwrap()).await.expect("connect");
+        schema::migrate(&pool).await.expect("migrate");
+        let approval_workflow = Workflow {
+            name: "linear-cut-approval".into(),
+            description: None,
+            trigger: None,
+            policy: None,
+            guard: None,
+            principles: vec![],
+            steps: vec![Step {
+                name: Some("approve-it".into()),
+                guard: None,
+                on_error: StepOnError::Continue,
+                build_slot: false,
+                action: Action::RequestApproval {
+                    message: "ship it?".into(),
+                },
+            }],
+            graph: None,
+            inputs: vec![],
+            crew: None,
+        };
+        // Host1: no signer, so the approval parks (publication warns, the
+        // park is retained, state goes Suspended) — then the host dies.
+        let bus1: Arc<dyn Bus> = Arc::new(
+            InProcessBus::open(pool.clone(), InProcessBusConfig::default())
+                .await
+                .expect("bus"),
+        );
+        let host1 =
+            WorkflowHost::over_bus(bus1, vec![approval_workflow.clone()], None).expect("host1");
+        host1
+            .with_effect_store(toron_core::index::workflow_effects::WorkflowEffectStore::new(
+                pool.clone(),
+            ))
+            .await;
+        let input = RunInput {
+            workflow: approval_workflow.clone(),
+            trigger: serde_json::json!({}),
+            run_id: Some("run-cut-9".to_string()),
+        };
+        host1
+            .run_durable_loop("run-cut-9".to_string(), approval_workflow.clone(), input)
+            .await;
+        assert_eq!(
+            host1.pending.lock().await.run_state_durable("run-cut-9").await,
+            RunState::Suspended,
+            "host1 parks the approval"
+        );
+        drop(host1);
+        // Host2 (the restart): the sweep re-opens the persisted model and
+        // re-drives it to a fresh park on this host.
+        let bus2: Arc<dyn Bus> = Arc::new(
+            InProcessBus::open(pool.clone(), InProcessBusConfig::default())
+                .await
+                .expect("bus"),
+        );
+        let host2 = WorkflowHost::over_bus(bus2, vec![], None).expect("host2");
+        host2
+            .with_effect_store(toron_core::index::workflow_effects::WorkflowEffectStore::new(
+                pool.clone(),
+            ))
+            .await;
+        host2.sweep_durable_runs().await;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if host2.durable_parks.lock().unwrap().contains_key("run-cut-9") {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "sweep must re-park the restarted run"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        // A resolution through the store settles the run end to end.
+        let res = Resolution {
+            run_id: "run-cut-9".into(),
+            project: None,
+            promise_id: "run-cut-9".into(),
+            generation: 1,
+            verdict: ResolutionVerdict::Approved,
+            note: "yes".into(),
+        };
+        host2.resolve_parked(res).await.expect("durable resolve");
+        let state = host2.pending.lock().await.run_state_durable("run-cut-9").await;
+        assert_eq!(state, RunState::Succeeded, "resolution settles the swept run");
     }
 }
