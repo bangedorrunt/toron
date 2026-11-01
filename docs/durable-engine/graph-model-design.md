@@ -292,3 +292,29 @@ host publish that payload instead of a bare message. The linear slice's
 - `Attempt` on the effect key must be the scheduler attempt, not the leaf
   attempt, so a retry after restart reuses the same effect identity.
 - Refusal must leave no state row and no engine row; assert both.
+
+## Captain addendum — 2026-11-02 (failure carrier)
+
+The linear cut has a parity hole the graph model must not inherit:
+`run_linear_step` returns the full `classify_step_outcome` value, but the
+host calls `step_failed(error)`, and the fold stores `{ok:false,error}` for
+`continue` and emits `Fail{step,error}` for `fail_run`. That drops `kind`,
+`disposition`, `leaf_preview`, `retryable`, and `attempts`.
+
+Required while adding graphs:
+
+- One carrier for a finished node's value (for example `StepDone { value }`);
+  the **fold** applies `is_failure_value` + `on_error`. `continue` lands the
+  full value; `fail_run` emits `RunEffect::Fail { step, output: Value }`
+  carrying the enriched bundle. `step_failed(error)` is retired rather than
+  extended.
+- The host settles the terminal from that output, not from a bare error.
+- Witnesses: a `continue` failure keeps `kind` + `leaf_preview` in outputs; a
+  `fail_run` retry exhaustion keeps `attempts`; a restart after a `continue`
+  failure resumes with the bundle intact.
+
+Also: `RunEffect::Unsupported` at drive time must **not** start the legacy
+run with the same id. The router refused unsupported shapes before any row;
+if this branch is ever reached, the durable model already exists and the
+sweep would drive it again — a double run. Log it as an invariant violation
+and stop; do not spawn the old engine.
