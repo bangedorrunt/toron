@@ -230,6 +230,20 @@ Live-server SKIP guards: **24 early-`return` points across 12 files**. Only
      once and passes them per run.
    Witness for the cut: a graph workflow still runs on the old path **and** a
    linear one completes after a daemon restart with no repeated settled step.
+   The daemon cut has three side-channels that are easy to miss, because the
+   old engine owned them and the model does not:
+   - **Publishing an approval.** `RunEffect::AwaitApproval` must publish the
+     kind-46011 event itself. The run id is the correlation key (it replaces
+     the Resonate promise id), so an operator resolving an older event must
+     still find the run.
+   - **Resolving an approval.** `resolve_approval`/`reject_approval` become
+     `DurableRun::approve` through the state store, not
+     `Resonate::promises.resolve`. A resolution that arrives before the park
+     is durable must wait for the model, not error.
+   - **The park drain.** `PendingDrain` reads the engine's approval sink
+     today; the durable path feeds it from `RunEffect::AwaitApproval`.
+     Spawn parks are untouched: the model refuses `spawn`, so `SpawnSink`
+     stays on the old path with the workflow.
 6. **Delete server selection and the doctor check.** Files: `engine/mod.rs:52-238`,
    `operator.rs:500-681,701`, `toron-cli/tests/*`. **Decide first** what `doctor`
    reports for parked-run capability; deleting the check removes the only
