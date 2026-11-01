@@ -123,3 +123,38 @@ async fn sync_handle_round_trips_and_deletes() {
     drop(pool);
     let _ = std::fs::remove_file(path);
 }
+
+#[tokio::test]
+async fn list_returns_every_model_newest_first() {
+    let path = unique_db("list");
+    let pool = connect(path.to_str().expect("path"))
+        .await
+        .expect("connect");
+    migrate(&pool).await.expect("migrate");
+    let store = WorkflowStateStore::new(pool.clone());
+
+    store
+        .save("run-a", r#"{"phase":"running"}"#)
+        .await
+        .expect("a");
+    store
+        .save("run-b", r#"{"phase":"parked"}"#)
+        .await
+        .expect("b");
+
+    let rows = store.list().await.expect("list");
+    assert_eq!(rows.len(), 2, "every persisted model: {rows:?}");
+    assert_eq!(rows[0].0, "run-b", "newest first: {rows:?}");
+
+    // The restart sweep reads the same list through the sync handle.
+    let handle = SyncWorkflowState::spawn(pool.clone(), &tokio::runtime::Handle::current());
+    let via_handle = tokio::task::spawn_blocking(move || handle.list())
+        .await
+        .expect("join")
+        .expect("list");
+    assert_eq!(via_handle.len(), 2);
+
+    drop(store);
+    drop(pool);
+    let _ = std::fs::remove_file(path);
+}

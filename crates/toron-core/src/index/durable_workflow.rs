@@ -68,6 +68,24 @@ impl WorkflowStateStore {
         Ok(())
     }
 
+    /// Every persisted model, most recently updated first.
+    ///
+    /// The model is the only thing that knows whether a run is terminal, so the
+    /// store returns all of them and the host parses. A restart sweep uses this
+    /// to re-open the runs a previous process left parked or running.
+    ///
+    /// # Errors
+    ///
+    /// Returns the SQL error when the store cannot be read.
+    pub async fn list(&self) -> anyhow::Result<Vec<(String, String)>> {
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT run_id, state_json FROM durable_workflow_runs ORDER BY updated_at DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
     /// Delete one run's state (terminal cleanup).
     ///
     /// # Errors
@@ -105,6 +123,16 @@ pub trait RunState: Send + Sync {
     ///
     /// Returns the store or bridge error when the state cannot be deleted.
     fn delete(&self, run_id: &str) -> anyhow::Result<()>;
+
+    /// Every persisted model as `(run_id, state_json)`, most recent first.
+    ///
+    /// Required, not defaulted: a default empty list would silently disable
+    /// the restart sweep, and a parked run would never be re-opened.
+    ///
+    /// # Errors
+    ///
+    /// Returns the store or bridge error when the states cannot be read.
+    fn list(&self) -> anyhow::Result<Vec<(String, String)>>;
 }
 
 /// Synchronous handle over `WorkflowStateStore`, same request/reply bridge as
@@ -173,6 +201,13 @@ impl RunState for SyncWorkflowState {
         self.call(run_id, move |pool| async move {
             let store = WorkflowStateStore::new(pool);
             store.delete(&id).await
+        })
+    }
+
+    fn list(&self) -> anyhow::Result<Vec<(String, String)>> {
+        self.call("list", move |pool| async move {
+            let store = WorkflowStateStore::new(pool);
+            store.list().await
         })
     }
 }
