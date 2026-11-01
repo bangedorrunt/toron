@@ -33,9 +33,11 @@ use toron_core::kernel::{
     RunPhase as EnginePhase, StartOutcome, end_run,
 };
 
+use super::control_flow::validate_workflow_lineage;
 use super::durable::{
-    RunEffect, RunModel, RunMsg, RunPhase as ModelPhase, advance, resume_effects,
-    unsupported_reason,
+    GraphEffect, GraphModel, GraphMsg, GraphPhase, NodeState, RunEffect, RunModel, RunMsg,
+    RunPhase as ModelPhase, advance, advance_graph, graph_unsupported_reason, resume_effects,
+    resume_graph_effects, unsupported_reason,
 };
 
 /// How long an approval parks before the wake loop re-drives it.
@@ -199,41 +201,22 @@ impl<S: EngineStorage, J: JournalStore, R: RunState> DurableRun<S, J, R> {
         &mut self.engine
     }
 
-    /// The current step succeeded.
+    /// The current step finished.
+    ///
+    /// One verb, one value: `on_error: continue` lands it whole (kind,
+    /// disposition, leaf_preview intact); `on_error: fail_run` emits the
+    /// enriched `{status:failed,…}` bundle for the host to settle from.
     ///
     /// # Errors
     ///
     /// [`HostError::WrongPhase`] unless the model is running.
-    pub fn step_ok(
+    pub fn step_done(
         &mut self,
-        output: serde_json::Value,
+        value: serde_json::Value,
         now_ms: u64,
     ) -> Result<Vec<RunEffect>, HostError> {
-        self.require_running("step_ok")?;
-        self.apply(RunMsg::StepSucceeded { output, now_ms }, now_ms)
-    }
-
-    /// The current step failed.
-    ///
-    /// `on_error: continue` records the failure and advances; `on_error:
-    /// fail_run` ends the run.
-    ///
-    /// # Errors
-    ///
-    /// [`HostError::WrongPhase`] unless the model is running.
-    pub fn step_failed(
-        &mut self,
-        error: impl Into<String>,
-        now_ms: u64,
-    ) -> Result<Vec<RunEffect>, HostError> {
-        self.require_running("step_failed")?;
-        self.apply(
-            RunMsg::StepFailed {
-                error: error.into(),
-                now_ms,
-            },
-            now_ms,
-        )
+        self.require_running("step_done")?;
+        self.apply(RunMsg::StepDone { value, now_ms }, now_ms)
     }
 
     /// A parked delay or park woke.
@@ -344,26 +327,17 @@ impl<S: EngineStorage, J: JournalStore, R: RunState> DurableRun<S, J, R> {
     }
 
     fn park(&mut self, until_ms: u64, max_wait_secs: u64, now_ms: u64) -> Result<(), HostError> {
-        let key = self.model.run_id.clone();
-        match self
-            .engine
-            .park_until(&key, until_ms, max_wait_secs, now_ms, None)?
-        {
-            ParkOutcome::Wait { .. } | ParkOutcome::ResumeNow { .. } => Ok(()),
-            ParkOutcome::RefusedOverCeiling {
-                asked_secs,
-                ceiling_secs,
-            } => Err(HostError::ParkRefused {
-                asked_secs,
-                ceiling_secs,
-            }),
-        }
+        park_engine(
+            &mut self.engine,
+            &self.model.run_id,
+            until_ms,
+            max_wait_secs,
+            now_ms,
+        )
     }
 
     fn persist(&self, model: &RunModel) -> Result<(), HostError> {
-        let json = serde_json::to_string(model)
-            .map_err(|e| HostError::Corrupt(format!("encode {}: {e}", model.run_id)))?;
-        self.state.save(&model.run_id, &json).map_err(state_error)
+        persist_run_state(&self.state, &model.run_id, model)
     }
 
     fn require_running(&self, verb: &str) -> Result<(), HostError> {
@@ -394,4 +368,331 @@ fn phase_name(phase: &ModelPhase) -> &'static str {
 
 fn state_error(e: anyhow::Error) -> HostError {
     HostError::State(format!("{e:#}"))
+}
+
+// ---------------------------------------------------------------------------
+// Graph driver (bd-durable-graph-impl-r2x1)
+// ---------------------------------------------------------------------------
+
+/// One driven graph run: model + engine row + state seam.
+///
+/// Same recovery rule as [`DurableRun`], and the two share it through
+/// [`persist_run_state`] and [`park_engine`]: persist the model first, then
+/// drive the engine verb. A graph row and a linear row never share a run id, so
+/// the two drivers never race for one engine key.
+pub struct DurableGraphRun<S: EngineStorage, J: JournalStore, R: RunState> {
+    model: GraphModel,
+    engine: OurEngine<S, J>,
+    state: R,
+}
+
+impl<S: EngineStorage, J: JournalStore, R: RunState> DurableGraphRun<S, J, R> {
+    /// Open, resume, or start one graph run.
+    ///
+    /// A persisted model wins: the run resumes from it and the workflow and
+    /// trigger arguments are ignored. Otherwise the shape and the lineage are
+    /// checked first — a refused graph returns [`HostError::Unsupported`] before
+    /// any engine or state row exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HostError`] when the shape is unsupported, the store fails, or
+    /// the engine refuses the start.
+    pub fn open(
+        mut engine: OurEngine<S, J>,
+        state: R,
+        run_id: impl Into<String>,
+        workflow: crate::schema::Workflow,
+        trigger: serde_json::Value,
+        now_ms: u64,
+    ) -> Result<(Self, Vec<GraphEffect>), HostError> {
+        let run_id = run_id.into();
+        if let Some(json) = state.load(&run_id).map_err(state_error)? {
+            let model: GraphModel = serde_json::from_str(&json)
+                .map_err(|e| HostError::Corrupt(format!("{}: {e}", run_id)))?;
+            let mut run = Self {
+                model,
+                engine,
+                state,
+            };
+            return run.resume(now_ms).map(|effects| (run, effects));
+        }
+
+        // Captain review Q3: a validation the old path performs must not
+        // disappear because the workflow took the new path.
+        validate_workflow_lineage(&trigger, &workflow.name).map_err(HostError::Unsupported)?;
+        if let Some(reason) = graph_unsupported_reason(&workflow) {
+            return Err(HostError::Unsupported(reason));
+        }
+
+        match engine.start(&run_id, now_ms)? {
+            StartOutcome::Started { .. } => {}
+            StartOutcome::Already { status } if status.phase.is_terminal() => {
+                return Err(HostError::Finished {
+                    phase: status.phase,
+                });
+            }
+            StartOutcome::Already { status } if status.phase == EnginePhase::Parked => {
+                engine.wake(&run_id, now_ms)?;
+            }
+            StartOutcome::Already { .. } => {}
+        }
+
+        let mut run = Self {
+            model: GraphModel::new(run_id, workflow, trigger),
+            engine,
+            state,
+        };
+        let model = run.model.clone();
+        persist_run_state(&run.state, &model.run_id, &model)?;
+        let effects = run.apply(GraphMsg::Start { now_ms }, now_ms)?;
+        Ok((run, effects))
+    }
+
+    /// The current model.
+    pub const fn model(&self) -> &GraphModel {
+        &self.model
+    }
+
+    /// The engine, for host verbs the driver does not own.
+    pub const fn engine(&self) -> &OurEngine<S, J> {
+        &self.engine
+    }
+
+    /// Mutable engine, for the wake drain.
+    pub const fn engine_mut(&mut self) -> &mut OurEngine<S, J> {
+        &mut self.engine
+    }
+
+    /// One node finished.
+    ///
+    /// One verb, one value: the fold applies `is_failure_value` + `on_error`,
+    /// so a `continue` failure lands whole and a `fail_run` refusal produces
+    /// the enriched bundle.
+    ///
+    /// # Errors
+    ///
+    /// [`HostError::WrongPhase`] unless that node is executing.
+    pub fn node_done(
+        &mut self,
+        node: &str,
+        value: serde_json::Value,
+        now_ms: u64,
+    ) -> Result<Vec<GraphEffect>, HostError> {
+        self.require_executing(node, "node_done")?;
+        self.apply(
+            GraphMsg::NodeDone {
+                node: node.to_string(),
+                value,
+                now_ms,
+            },
+            now_ms,
+        )
+    }
+
+    /// A park (delay or retry backoff) is due.
+    ///
+    /// # Errors
+    ///
+    /// [`HostError::WrongPhase`] unless the run is running.
+    pub fn woke(&mut self, now_ms: u64) -> Result<Vec<GraphEffect>, HostError> {
+        if self.model.phase != GraphPhase::Running {
+            return Err(self.wrong_phase("woke"));
+        }
+        self.apply(GraphMsg::Woke { now_ms }, now_ms)
+    }
+
+    /// An operator decision arrived for one node.
+    ///
+    /// # Errors
+    ///
+    /// [`HostError::WrongPhase`] unless that node awaits an approval.
+    pub fn approve(
+        &mut self,
+        node: &str,
+        decision: serde_json::Value,
+        now_ms: u64,
+    ) -> Result<Vec<GraphEffect>, HostError> {
+        if !matches!(
+            self.model.node_state.get(node),
+            Some(NodeState::AwaitingApproval { .. })
+        ) {
+            return Err(self.wrong_phase("approve"));
+        }
+        self.apply(
+            GraphMsg::Approval {
+                node: node.to_string(),
+                decision,
+                now_ms,
+            },
+            now_ms,
+        )
+    }
+
+    /// Terminal cancel.
+    ///
+    /// # Errors
+    ///
+    /// [`HostError::WrongPhase`] when the run is already terminal.
+    pub fn cancel(&mut self, now_ms: u64) -> Result<Vec<GraphEffect>, HostError> {
+        if self.model.is_terminal() {
+            return Err(self.wrong_phase("cancel"));
+        }
+        self.apply(GraphMsg::Cancel, now_ms)
+    }
+
+    /// Re-drive a restored run: re-park what the model says is parked (earliest
+    /// deadline wins — the engine holds one wake per run), re-arm the approval
+    /// watchdog, then re-issue the effects the model still owes.
+    fn resume(&mut self, now_ms: u64) -> Result<Vec<GraphEffect>, HostError> {
+        let effects = resume_graph_effects(&self.model);
+        let Some((until_ms, max_wait_secs)) = park_deadline(&self.model, now_ms) else {
+            return Ok(effects);
+        };
+        self.park(until_ms, max_wait_secs, now_ms)?;
+        if until_ms <= now_ms {
+            return self.apply(GraphMsg::Woke { now_ms }, now_ms);
+        }
+        Ok(effects)
+    }
+
+    /// One pure transition: persist, then drive the engine.
+    fn apply(&mut self, msg: GraphMsg, now_ms: u64) -> Result<Vec<GraphEffect>, HostError> {
+        let (next, effects) = advance_graph(&self.model, &msg);
+        persist_run_state(&self.state, &next.run_id, &next)?;
+        self.model = next;
+        self.engine_verb(&effects, now_ms)?;
+        self.settle_past_park(now_ms, effects)
+    }
+
+    /// A park whose deadline is already past wakes in the same call: a
+    /// `delay: 0` (or a backoff of zero) would otherwise persist a `Parked`
+    /// node the engine never schedules, and nothing would ever wake it.
+    fn settle_past_park(
+        &mut self,
+        now_ms: u64,
+        effects: Vec<GraphEffect>,
+    ) -> Result<Vec<GraphEffect>, HostError> {
+        let due = self.model.node_state.values().any(
+            |state| matches!(state, NodeState::Parked { until_ms, .. } if *until_ms <= now_ms),
+        );
+        if !due {
+            return Ok(effects);
+        }
+        let mut all = effects;
+        all.extend(self.apply(GraphMsg::Woke { now_ms }, now_ms)?);
+        Ok(all)
+    }
+
+    fn engine_verb(&mut self, effects: &[GraphEffect], now_ms: u64) -> Result<(), HostError> {
+        let key = self.model.run_id.clone();
+        // ONE park per transition. `park_until` holds a single wake per run and
+        // a second call OVERWRITES the first (last wins, not min), so a wave
+        // with a 5s delay plus an approval must park at the 5s deadline — the
+        // model's own in-flight deadlines decide it, not the effect order.
+        if let Some((until_ms, max_wait_secs)) = park_deadline(&self.model, now_ms) {
+            self.park(until_ms, max_wait_secs, now_ms)?;
+        }
+        // Terminal verbs only; every park-shaped effect is the park above.
+        for effect in effects {
+            match effect {
+                GraphEffect::ExecuteNode { .. }
+                | GraphEffect::Unsupported { .. }
+                | GraphEffect::ParkUntil { .. }
+                | GraphEffect::AwaitApproval { .. } => {}
+                GraphEffect::Complete { .. } => {
+                    end_run(&mut self.engine, &key, RunEnd::Succeeded).map_err(HostError::from)?;
+                }
+                GraphEffect::Fail { .. } => {
+                    end_run(&mut self.engine, &key, RunEnd::Failed).map_err(HostError::from)?;
+                }
+                GraphEffect::Cancelled => {
+                    self.engine.cancel(&key, now_ms).map_err(HostError::from)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn park(&mut self, until_ms: u64, max_wait_secs: u64, now_ms: u64) -> Result<(), HostError> {
+        let key = self.model.run_id.clone();
+        park_engine(&mut self.engine, &key, until_ms, max_wait_secs, now_ms)
+    }
+
+    fn require_executing(&self, node: &str, verb: &str) -> Result<(), HostError> {
+        if matches!(
+            self.model.node_state.get(node),
+            Some(NodeState::Executing { .. })
+        ) {
+            return Ok(());
+        }
+        Err(self.wrong_phase(verb))
+    }
+
+    fn wrong_phase(&self, verb: &str) -> HostError {
+        HostError::WrongPhase {
+            actual: format!("{} during {verb}", graph_phase_name(&self.model.phase)),
+        }
+    }
+}
+
+const fn graph_phase_name(phase: &GraphPhase) -> &'static str {
+    match phase {
+        GraphPhase::Ready => "ready",
+        GraphPhase::Running => "running",
+        GraphPhase::Succeeded => "succeeded",
+        GraphPhase::Failed { .. } => "failed",
+        GraphPhase::Cancelled => "cancelled",
+    }
+}
+
+/// The one persist step both drivers use: model first, engine second.
+fn persist_run_state<R: RunState, M: serde::Serialize>(
+    state: &R,
+    run_id: &str,
+    model: &M,
+) -> Result<(), HostError> {
+    let json = serde_json::to_string(model)
+        .map_err(|e| HostError::Corrupt(format!("encode {run_id}: {e}")))?;
+    state.save(run_id, &json).map_err(state_error)
+}
+
+/// The single wake this model owes the engine: the EARLIEST deadline across
+/// every in-flight parked or awaiting node, with that node's own ceiling.
+///
+/// One park per run is an engine invariant (`park_until` overwrites), so the
+/// deadline is derived from the model's state rather than from how many park
+/// effects a transition happened to emit.
+fn park_deadline(model: &GraphModel, now_ms: u64) -> Option<(u64, u64)> {
+    model
+        .node_state
+        .values()
+        .filter_map(|state| match state {
+            NodeState::Parked { until_ms, .. } => Some((*until_ms, 0)),
+            NodeState::AwaitingApproval { .. } => {
+                Some((now_ms.saturating_add(APPROVAL_WAIT_MS), APPROVAL_WAIT_SECS))
+            }
+            _ => None,
+        })
+        .min_by_key(|(until_ms, _)| *until_ms)
+}
+
+/// The one park verb both drivers use.
+fn park_engine<S: EngineStorage, J: JournalStore>(
+    engine: &mut OurEngine<S, J>,
+    key: &str,
+    until_ms: u64,
+    max_wait_secs: u64,
+    now_ms: u64,
+) -> Result<(), HostError> {
+    match engine.park_until(key, until_ms, max_wait_secs, now_ms, None)? {
+        ParkOutcome::Wait { .. } | ParkOutcome::ResumeNow { .. } => Ok(()),
+        ParkOutcome::RefusedOverCeiling {
+            asked_secs,
+            ceiling_secs,
+        } => Err(HostError::ParkRefused {
+            asked_secs,
+            ceiling_secs,
+        }),
+    }
 }

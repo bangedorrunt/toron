@@ -124,7 +124,7 @@ pub(crate) fn compute_evidence_hash(
 }
 
 /// Spec 3: build the full approval promise data
-fn build_approval_payload(
+pub(crate) fn build_approval_payload(
     run_id: &str,
     workflow_name: &str,
     node_name: &str,
@@ -389,14 +389,14 @@ impl RetryCoordinator {
     }
 
     /// Whether another attempt is allowed after `attempt` (1-based) failed.
-    fn should_retry(&self, attempt: u32) -> bool {
+    pub(crate) fn should_retry(&self, attempt: u32) -> bool {
         attempt < self.max_attempts.max(1)
     }
 
     /// Retry candidacy for a step value: `rate_limit`/`timeout` (the frozen
     /// [`FailureKind`] vocabulary) are candidates; everything else escalates.
     /// Unknown kind strings are never retryable.
-    fn is_retryable_value(value: &serde_json::Value) -> bool {
+    pub(crate) fn is_retryable_value(value: &serde_json::Value) -> bool {
         value
             .get("kind")
             .and_then(|v| v.as_str())
@@ -406,7 +406,7 @@ impl RetryCoordinator {
 
     /// Backoff before the next attempt: provider `retry_after_ms` wins, then
     /// the enclosing fixed backoff, else exponential.
-    fn backoff(&self, attempt: u32, retry_after_ms: Option<u64>) -> Duration {
+    pub(crate) fn backoff(&self, attempt: u32, retry_after_ms: Option<u64>) -> Duration {
         backoff_for_attempt(attempt, retry_after_ms, self.fixed_backoff_secs)
     }
 }
@@ -433,7 +433,10 @@ fn parse_disposition(s: &str) -> Option<super::boundary::Disposition> {
 /// normalizes to `Blocked` (the legacy string spelling had exactly one
 /// producer — this fn — and zero readers, so the spelling is unified,
 /// not migrated).
-fn disposition_for_kind(kind: &str, existing: Option<&str>) -> super::boundary::Disposition {
+pub(crate) fn disposition_for_kind(
+    kind: &str,
+    existing: Option<&str>,
+) -> super::boundary::Disposition {
     use super::boundary::Disposition as D;
     if let Some(d) = existing.and_then(parse_disposition) {
         return d;
@@ -450,7 +453,7 @@ fn disposition_for_kind(kind: &str, existing: Option<&str>) -> super::boundary::
 /// marker appended past the bound, bare leaves emit the fixed `empty-leaf`
 /// token so terminal artifacts never again carry zero evidence. Pure
 /// value-render; kept out of the async dispatch.
-fn leaf_preview_for_value(value: &serde_json::Value) -> String {
+pub(crate) fn leaf_preview_for_value(value: &serde_json::Value) -> String {
     const BOUND: usize = 512;
     const MARKER: &str = "\u{2026}(truncated)";
     const EMPTY: &str = "empty-leaf";
@@ -1155,6 +1158,44 @@ pub(crate) enum StepOutcome {
     Retry { backoff: Duration },
 }
 
+/// The `{status:failed,…}` bundle the on_error policy returns for one failure
+/// value.
+///
+/// `attempts` is written only when the caller knows the count — the
+/// retry-exhausted path carries it, the non-retryable path never wrote it. This
+/// is the ONE builder: the workflow engine, the linear fold, and the graph fold
+/// all reach the same value from the same inputs.
+pub(crate) fn fail_run_value(
+    step: &str,
+    value: &serde_json::Value,
+    attempts: Option<u32>,
+) -> serde_json::Value {
+    let kind = value.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+    let error = value
+        .get("error")
+        .and_then(|v| v.as_str())
+        .unwrap_or("step failed")
+        .to_string();
+    let mut failed = serde_json::json!({
+        "status": "failed",
+        "error": error,
+        "failed_step": step,
+    });
+    if let Some(k) = value.get("kind") {
+        failed["kind"] = k.clone();
+    }
+    if let Some(d) = value.get("disposition") {
+        failed["disposition"] = d.clone();
+    } else if !kind.is_empty() {
+        failed["disposition"] = serde_json::json!(disposition_for_kind(kind, None));
+    }
+    failed["leaf_preview"] = serde_json::json!(leaf_preview_for_value(value));
+    if let Some(attempts) = attempts {
+        failed["attempts"] = serde_json::json!(attempts);
+    }
+    failed
+}
+
 /// The ONE host-step outcome policy (bd-linear-step-6j0y).
 ///
 /// A dispatch that answered with a JSON object (or one fenced block) publishes
@@ -1179,25 +1220,13 @@ pub(crate) fn classify_step_outcome(
     if step.on_error != StepOnError::FailRun || !crate::engine::is_failure_value(&value) {
         return StepOutcome::Done(value);
     }
-    let kind = value.get("kind").and_then(|v| v.as_str()).unwrap_or("");
     if RetryCoordinator::is_retryable_value(&value) {
         if !coordinator.should_retry(attempt) {
-            let error = value
-                .get("error")
-                .and_then(|v| v.as_str())
-                .unwrap_or("step failed")
-                .to_string();
-            let disposition =
-                disposition_for_kind(kind, value.get("disposition").and_then(|v| v.as_str()));
-            return StepOutcome::Done(serde_json::json!({
-                "status": "failed",
-                "error": error,
-                "failed_step": step.name.clone().unwrap_or_else(|| "<unnamed>".into()),
-                "kind": kind,
-                "disposition": disposition,
-                "leaf_preview": leaf_preview_for_value(&value),
-                "attempts": attempt,
-            }));
+            return StepOutcome::Done(fail_run_value(
+                &step.name.clone().unwrap_or_else(|| "<unnamed>".into()),
+                &value,
+                Some(attempt),
+            ));
         }
         let retry_after_ms = value
             .get("retry_after_ms")
@@ -1206,26 +1235,11 @@ pub(crate) fn classify_step_outcome(
             backoff: coordinator.backoff(attempt, retry_after_ms),
         };
     }
-    let error = value
-        .get("error")
-        .and_then(|v| v.as_str())
-        .unwrap_or("step failed")
-        .to_string();
-    let mut failed = serde_json::json!({
-        "status": "failed",
-        "error": error,
-        "failed_step": step.name.clone().unwrap_or_else(|| "<unnamed>".into()),
-    });
-    if let Some(k) = value.get("kind") {
-        failed["kind"] = k.clone();
-    }
-    if let Some(d) = value.get("disposition") {
-        failed["disposition"] = d.clone();
-    } else if !kind.is_empty() {
-        failed["disposition"] = serde_json::json!(disposition_for_kind(kind, None));
-    }
-    failed["leaf_preview"] = serde_json::json!(leaf_preview_for_value(&value));
-    StepOutcome::Done(failed)
+    StepOutcome::Done(fail_run_value(
+        &step.name.clone().unwrap_or_else(|| "<unnamed>".into()),
+        &value,
+        None,
+    ))
 }
 
 /// Run a `retry` action: attempt the inner step up to `max_attempts` times,
@@ -2031,7 +2045,7 @@ pub(crate) fn lineage_for_trigger(
     Ok(lineage)
 }
 
-fn validate_workflow_lineage(
+pub(crate) fn validate_workflow_lineage(
     trigger: &serde_json::Value,
     workflow: &str,
 ) -> std::result::Result<(), String> {
@@ -2735,7 +2749,7 @@ fn land_node_output(
 /// when the value actually carries a [`Decision`] payload (`outcome`) — a
 /// guard skip (`skipped`), a refusal, or a failure is NOT a decision and must
 /// never be aliased as one.
-fn is_approval_decision(action: &Action, value: &serde_json::Value) -> bool {
+pub(crate) fn is_approval_decision(action: &Action, value: &serde_json::Value) -> bool {
     matches!(action, Action::RequestApproval { .. })
         && value
             .get("outcome")

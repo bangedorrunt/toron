@@ -45,12 +45,13 @@ use toron_workflow::coalesce::{
 use toron_workflow::dispatch::{DispatchAcquire, DispatchConfig, DispatchPermit, DispatchPool};
 use toron_workflow::engine::ResonateChoice;
 use toron_workflow::engine::durable::{
-    RunEffect, RunModel, RunPhase as ModelPhase, unsupported_reason,
+    GraphEffect, GraphModel, RunEffect, RunModel, RunPhase as ModelPhase, unsupported_reason,
 };
-use toron_workflow::engine::durable_host::{DurableRun, HostError};
-use toron_workflow::engine::is_failure_value;
+use toron_workflow::engine::durable_host::{DurableGraphRun, DurableRun, HostError};
 use toron_workflow::engine::leaf::LeafSeams;
-use toron_workflow::engine::linear_step::{LinearStep, run_linear_step};
+use toron_workflow::engine::linear_step::{
+    GraphNodeStep, LinearStep, run_graph_node_step, run_linear_step,
+};
 use toron_workflow::engine::{
     ActionInvocation, ActionPartition, AsyncEffectRunner, AsyncRunJournal, CleanupKind,
     CleanupRequest, Decision, DispatchPlan, EffectJournalMode, FORCED_CLEANUP_CAPABILITY, ParkKind,
@@ -70,7 +71,7 @@ use toron_workflow::stamp_workflow_emitted;
 use toron_workflow::trigger_filter::{
     matches_trigger, should_evaluate_trigger_event, trigger_payload, trigger_run_id,
 };
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 
 /// Map one mailbox send error onto a provider outcome (bd-zczp):
 /// ambiguous transport outcomes become Ambiguous (I5 — a timeout is not
@@ -1050,6 +1051,20 @@ struct DurablePark {
 /// `spawn_blocking`, never on an async worker.
 type HostDurableRun = DurableRun<ToronEngineStore, ToronJournal, SyncWorkflowState>;
 
+/// The host's concrete durable graph driver (bd-durable-graph-impl-r2x1).
+type HostDurableGraphRun = DurableGraphRun<ToronEngineStore, ToronJournal, SyncWorkflowState>;
+
+/// A persisted durable row is one model or the other; the workflow tells them
+/// apart on open, and the shape is stored with the model.
+fn model_head(json: &str) -> Option<(Workflow, serde_json::Value)> {
+    if let Ok(model) = serde_json::from_str::<RunModel>(json) {
+        return Some((model.workflow, model.trigger));
+    }
+    serde_json::from_str::<GraphModel>(json)
+        .ok()
+        .map(|model| (model.workflow, model.trigger))
+}
+
 /// Route one workflow to the durable host or the old engine (bd-host-cut-pqkg).
 /// `Ok` means the durable path owns it; `Err(reason)` names why it stays on
 /// `WorkflowEngine::run`. Pure: no row exists at this point either way.
@@ -1798,6 +1813,10 @@ impl WorkflowHost {
                 return;
             }
         };
+        if workflow.graph.is_some() {
+            self.run_durable_graph_loop(run_id, workflow, input).await;
+            return;
+        }
         let (engine_store, journal, state) = host_handles(pool);
         let wf = workflow.clone();
         let rid = run_id.clone();
@@ -1972,9 +1991,7 @@ impl WorkflowHost {
         })
         .await
         {
-            Ok(Ok(Some(json))) => serde_json::from_str::<RunModel>(&json)
-                .ok()
-                .map(|m| (m.workflow, m.trigger)),
+            Ok(Ok(Some(json))) => model_head(&json),
             _ => None,
         };
         let Some((workflow, trigger)) = listed else {
@@ -1982,6 +1999,33 @@ impl WorkflowHost {
             return;
         };
         let rid = run_id.clone();
+        let graph = workflow.graph.is_some();
+        if graph {
+            let opened = tokio::task::spawn_blocking(move || {
+                let engine = OurEngine::with_journal(engine_store, journal);
+                DurableGraphRun::open(engine, state, rid, workflow, trigger, durable_now_ms())
+            })
+            .await;
+            match opened {
+                Ok(Ok((run, effects))) => {
+                    if run.model().is_terminal() {
+                        return;
+                    }
+                    let digest = workflow_digest(&run.model().workflow);
+                    let workflow = run.model().workflow.clone();
+                    let trigger = run.model().trigger.clone();
+                    self.drive_graph_tracked(run, effects, run_id, workflow, trigger, digest)
+                        .await;
+                }
+                Ok(Err(e)) => {
+                    warn!(run_id = %run_id, "durable sweep: graph reopen failed: {e}");
+                }
+                Err(e) => {
+                    warn!(run_id = %run_id, "durable sweep: graph reopen task failed: {e}");
+                }
+            }
+            return;
+        }
         let opened = tokio::task::spawn_blocking(move || {
             let engine = OurEngine::with_journal(engine_store, journal);
             DurableRun::open(engine, state, rid, workflow, trigger, durable_now_ms())
@@ -2046,19 +2090,11 @@ impl WorkflowHost {
                             &self.seams,
                         )
                         .await;
-                        let failed = is_failure_value(&value);
+                        // One carrier: the fold applies is_failure_value +
+                        // on_error, so a `continue` failure keeps its full
+                        // value (Captain addendum, failure carrier).
                         let then = move |mut run: HostDurableRun| {
-                            if failed {
-                                let error = value
-                                    .get("error")
-                                    .and_then(|e| e.as_str())
-                                    .map(str::to_string)
-                                    .unwrap_or_else(|| value.to_string());
-                                run.step_failed(error, durable_now_ms())
-                                    .map(|eff| (run, eff))
-                            } else {
-                                run.step_ok(value, durable_now_ms()).map(|eff| (run, eff))
-                            }
+                            run.step_done(value, durable_now_ms()).map(|eff| (run, eff))
                         };
                         let Some((back, mut eff)) = self.drive_verb(&run_id, run, then).await
                         else {
@@ -2109,8 +2145,11 @@ impl WorkflowHost {
                             .await;
                         return;
                     }
-                    RunEffect::Fail { step, error } => {
-                        self.settle_durable(&run_id, "failed", &step, &error).await;
+                    RunEffect::Fail { step, output } => {
+                        // The addendum's carrier: the settle evidence is the
+                        // whole enriched bundle, not a bare error string.
+                        self.settle_durable(&run_id, "failed", &step, &output.to_string())
+                            .await;
                         return;
                     }
                     RunEffect::Cancelled => {
@@ -2119,18 +2158,272 @@ impl WorkflowHost {
                         return;
                     }
                     RunEffect::Unsupported { reason } => {
-                        warn!(run_id = %run_id, "durable drive hit unsupported ({reason}); falling back to the old engine");
-                        let input = RunInput {
-                            workflow: workflow.clone(),
-                            trigger: trigger.clone(),
-                            run_id: Some(run_id.clone()),
-                        };
-                        self.spawn_legacy_run(run_id, workflow, input).await;
+                        // The router refused unsupported shapes BEFORE any row,
+                        // so reaching here means the durable model already
+                        // exists. Starting the old engine on the same id would
+                        // give the sweep a second run to drive: an invariant
+                        // violation, not a fallback.
+                        error!(
+                            run_id = %run_id,
+                            "INVARIANT VIOLATION: durable drive reached Unsupported ({reason}) \
+                             after the model existed; stopping instead of double-running"
+                        );
                         return;
                     }
                 }
             }
             effects = follow;
+        }
+    }
+
+    /// Drive one graph workflow on the durable host (bd-durable-graph-impl-r2x1).
+    /// Same shape as [`Self::run_durable_loop`]: open (resume when the model
+    /// exists), then run the effect loop.
+    async fn run_durable_graph_loop(&self, run_id: String, workflow: Workflow, input: RunInput) {
+        let pool = match self.pending.lock().await.store().map(|s| s.pool().clone()) {
+            Some(pool) => pool,
+            None => {
+                warn!(run_id = %run_id, "durable graph route lost its store; falling back to the old engine");
+                self.spawn_legacy_run(run_id, workflow, input).await;
+                return;
+            }
+        };
+        let (engine_store, journal, state) = host_handles(pool);
+        let wf = workflow.clone();
+        let rid = run_id.clone();
+        let trig = input.trigger.clone();
+        let opened = tokio::task::spawn_blocking(move || {
+            let engine = OurEngine::with_journal(engine_store, journal);
+            DurableGraphRun::open(engine, state, rid, wf, trig, durable_now_ms())
+        })
+        .await;
+        let (run, effects) = match opened {
+            Ok(Ok(pair)) => pair,
+            Ok(Err(HostError::Unsupported(reason))) => {
+                warn!(run_id = %run_id, "durable graph open refused ({reason}); falling back to the old engine");
+                self.spawn_legacy_run(run_id, workflow, input).await;
+                return;
+            }
+            Ok(Err(e)) => {
+                match &e {
+                    HostError::Corrupt(_) | HostError::Finished { .. } => {
+                        warn!(run_id = %run_id, "durable graph open failed: {e}; settling the run");
+                        self.settle_open_failure(&run_id, &e).await;
+                    }
+                    _ => {
+                        warn!(run_id = %run_id, "durable graph open failed: {e}; leaving the model resumable for the sweep");
+                    }
+                }
+                return;
+            }
+            Err(e) => {
+                warn!(run_id = %run_id, "durable graph open task failed: {e}; leaving the model resumable for the sweep");
+                return;
+            }
+        };
+        let digest = workflow_digest(&workflow);
+        self.drive_graph_tracked(run, effects, run_id, workflow, input.trigger, digest)
+            .await;
+    }
+
+    /// Drive to park-or-terminal with the graph run in the active set.
+    async fn drive_graph_tracked(
+        &self,
+        run: HostDurableGraphRun,
+        effects: Vec<GraphEffect>,
+        run_id: String,
+        workflow: Workflow,
+        trigger: serde_json::Value,
+        workflow_digest: String,
+    ) {
+        self.durable_active
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(run_id.clone());
+        self.drive_graph_effects(
+            run,
+            effects,
+            run_id.clone(),
+            workflow,
+            trigger,
+            workflow_digest,
+        )
+        .await;
+        self.durable_active
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&run_id);
+    }
+
+    /// The effect loop for one durable graph run: per-node `ExecuteNode`
+    /// through the single-shot executor, `ParkUntil` slept to its deadline then
+    /// re-driven with `woke`, `AwaitApproval` published and parked.
+    async fn drive_graph_effects(
+        &self,
+        mut run: HostDurableGraphRun,
+        mut effects: Vec<GraphEffect>,
+        run_id: String,
+        workflow: Workflow,
+        trigger: serde_json::Value,
+        workflow_digest: String,
+    ) {
+        loop {
+            if effects.is_empty() {
+                if run.model().is_terminal() {
+                    return;
+                }
+                debug!(run_id = %run_id, "durable graph drive stopped at a park; the sweep resumes it");
+                return;
+            }
+            let mut follow: Vec<GraphEffect> = Vec::new();
+            let mut parks: Vec<GraphEffect> = Vec::new();
+            // Nodes first, then parks: a wave's leaves must not be delayed
+            // behind a sibling's delay deadline.
+            for effect in std::mem::take(&mut effects) {
+                match effect {
+                    GraphEffect::ExecuteNode {
+                        node,
+                        wave: _,
+                        attempt,
+                        inputs,
+                    } => {
+                        let Some(node_def) = workflow
+                            .graph
+                            .as_ref()
+                            .and_then(|g| g.nodes.get(&node))
+                            .cloned()
+                        else {
+                            error!(
+                                run_id = %run_id,
+                                "INVARIANT VIOLATION: graph effect names unknown node {node}"
+                            );
+                            return;
+                        };
+                        let snapshot: serde_json::Map<String, serde_json::Value> =
+                            inputs.into_iter().collect();
+                        let value = run_graph_node_step(
+                            GraphNodeStep {
+                                run_id: &run_id,
+                                workflow: &workflow.name,
+                                workflow_digest: &workflow_digest,
+                                node_name: &node,
+                                node: &node_def,
+                                attempt,
+                                trigger: &trigger,
+                                inputs: &snapshot,
+                            },
+                            &self.seams,
+                        )
+                        .await;
+                        let then = move |mut run: HostDurableGraphRun| {
+                            run.node_done(&node, value, durable_now_ms())
+                                .map(|eff| (run, eff))
+                        };
+                        let Some((back, mut eff)) = self.drive_graph_verb(&run_id, run, then).await
+                        else {
+                            return;
+                        };
+                        run = back;
+                        follow.append(&mut eff);
+                    }
+                    other @ (GraphEffect::ParkUntil { .. } | GraphEffect::AwaitApproval { .. }) => {
+                        parks.push(other)
+                    }
+                    GraphEffect::Complete { output } => {
+                        self.settle_durable(&run_id, "succeeded", "", &output.to_string())
+                            .await;
+                        return;
+                    }
+                    GraphEffect::Fail { fail } => {
+                        let bundle = fail.to_value();
+                        let node = fail.node.clone();
+                        self.settle_durable(&run_id, "failed", &node, &bundle.to_string())
+                            .await;
+                        return;
+                    }
+                    GraphEffect::Cancelled => {
+                        self.settle_durable(&run_id, "cancelled", "", "cancelled")
+                            .await;
+                        return;
+                    }
+                    GraphEffect::Unsupported { reason } => {
+                        error!(
+                            run_id = %run_id,
+                            "INVARIANT VIOLATION: durable graph drive reached Unsupported \
+                             ({reason}) after the model existed; stopping instead of double-running"
+                        );
+                        return;
+                    }
+                }
+            }
+            for effect in parks {
+                match effect {
+                    GraphEffect::ParkUntil {
+                        node: _,
+                        until_ms,
+                        reason: _,
+                    } => {
+                        let now = durable_now_ms();
+                        if until_ms > now {
+                            tokio::time::sleep(std::time::Duration::from_millis(until_ms - now))
+                                .await;
+                        }
+                        let Some((back, mut eff)) = self
+                            .drive_graph_verb(&run_id, run, |mut run: HostDurableGraphRun| {
+                                run.woke(durable_now_ms()).map(|eff| (run, eff))
+                            })
+                            .await
+                        else {
+                            return;
+                        };
+                        run = back;
+                        follow.append(&mut eff);
+                    }
+                    GraphEffect::AwaitApproval { node, payload } => {
+                        let message = payload
+                            .get("message")
+                            .and_then(|m| m.as_str())
+                            .unwrap_or("approval required")
+                            .to_string();
+                        self.park_durable_approval(
+                            &run_id,
+                            &workflow,
+                            &trigger,
+                            &workflow_digest,
+                            node,
+                            message,
+                        )
+                        .await;
+                        return;
+                    }
+                    _ => unreachable!("only parks reach this loop"),
+                }
+            }
+            effects = follow;
+        }
+    }
+
+    /// Run one sync graph verb in `spawn_blocking` and hand the driver back.
+    async fn drive_graph_verb(
+        &self,
+        run_id: &str,
+        run: HostDurableGraphRun,
+        verb: impl FnOnce(
+            HostDurableGraphRun,
+        ) -> Result<(HostDurableGraphRun, Vec<GraphEffect>), HostError>
+        + Send
+        + 'static,
+    ) -> Option<(HostDurableGraphRun, Vec<GraphEffect>)> {
+        match tokio::task::spawn_blocking(|| verb(run)).await {
+            Ok(Ok(pair)) => Some(pair),
+            Ok(Err(e)) => {
+                warn!(run_id = %run_id, "durable graph verb failed: {e}; leaving the model resumable for the sweep");
+                None
+            }
+            Err(e) => {
+                warn!(run_id = %run_id, "durable graph verb task failed: {e}; leaving the model resumable for the sweep");
+                None
+            }
         }
     }
 
@@ -2309,6 +2602,48 @@ impl WorkflowHost {
         let rid = res.run_id.clone();
         let workflow = park.workflow.clone();
         let trigger = park.trigger.clone();
+        if workflow.graph.is_some() {
+            // A graph run lands the decision on ONE node; the model owns the
+            // alias and the next wave.
+            let node = park.node.clone();
+            let approved = tokio::task::spawn_blocking(move || {
+                let engine = OurEngine::with_journal(engine_store, journal);
+                let (mut run, _) = DurableGraphRun::open(
+                    engine,
+                    state,
+                    rid.clone(),
+                    workflow.clone(),
+                    trigger,
+                    durable_now_ms(),
+                )?;
+                run.approve(&node, decision, durable_now_ms())
+                    .map(|effects| (run, effects))
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("durable graph approve task failed: {e}"))?;
+            let (run, effects) = approved
+                .map_err(|e: HostError| anyhow::anyhow!("durable graph approve failed: {e}"))?;
+            let entry = PendingEntry::new(
+                res.run_id.clone(),
+                res.project.clone(),
+                park.workflow.name.clone(),
+                park.node.clone(),
+                None,
+                res.run_id.clone(),
+                park.generation,
+                ParkKind::Approval,
+            );
+            self.drive_graph_tracked(
+                run,
+                effects,
+                res.run_id,
+                park.workflow.clone(),
+                park.trigger.clone(),
+                park.workflow_digest.clone(),
+            )
+            .await;
+            return Ok(entry);
+        }
         let approved = tokio::task::spawn_blocking(move || {
             let engine = OurEngine::with_journal(engine_store, journal);
             let (mut run, _) = DurableRun::open(
@@ -8492,30 +8827,93 @@ steps:
             assert!(err.contains("no durable store"), "{err}");
         }
 
-        #[test]
-        fn refuses_a_graph_workflow() {
+        fn graph_node(action: Action, needs: &[&str]) -> GraphNode {
+            GraphNode {
+                action,
+                needs: needs.iter().map(|n| (*n).to_string()).collect(),
+                guard: None,
+                on_error: StepOnError::Continue,
+                build_slot: false,
+            }
+        }
+
+        fn graph_workflow(nodes: [(&str, GraphNode); 2]) -> Workflow {
             let mut wf = linear_workflow();
             wf.graph = Some(Graph {
-                nodes: [(
-                    "node-a".to_string(),
-                    GraphNode {
-                        action: Action::SendMessage {
-                            to: vec!["nobody".into()],
-                            subject: "cut".into(),
-                            body: "hello".into(),
-                            project: None,
-                        },
-                        needs: vec![],
-                        guard: None,
-                        on_error: StepOnError::Continue,
-                        build_slot: false,
-                    },
-                )]
-                .into_iter()
-                .collect(),
+                nodes: nodes
+                    .into_iter()
+                    .map(|(name, node)| (name.to_string(), node))
+                    .collect(),
             });
-            let err = durable_route(&wf, true).expect_err("graph stays old");
-            assert!(err.contains("graph"), "{err}");
+            wf
+        }
+
+        fn durable_leaf(subject: &str) -> Action {
+            Action::SendMessage {
+                to: vec!["nobody".into()],
+                subject: subject.into(),
+                body: "hello".into(),
+                project: None,
+            }
+        }
+
+        /// bd-durable-graph-impl-r2x1: a graph whose every node is a HostSink
+        /// leaf, `delay`, or `request_approval` is admitted to the durable
+        /// driver.
+        #[test]
+        fn admits_a_durable_graph() {
+            let wf = graph_workflow([
+                ("first", graph_node(durable_leaf("cut"), &[])),
+                (
+                    "approve",
+                    graph_node(
+                        Action::RequestApproval {
+                            message: "ship?".into(),
+                        },
+                        &["first"],
+                    ),
+                ),
+            ]);
+            assert!(durable_route(&wf, true).is_ok());
+        }
+
+        /// Whole-graph refusal: ONE control-flow node keeps the whole graph on
+        /// the old engine. A half-run graph is worse than a clean route.
+        #[test]
+        fn refuses_a_graph_with_a_control_flow_node() {
+            let wf = graph_workflow([
+                ("fine", graph_node(durable_leaf("cut"), &[])),
+                (
+                    "fan",
+                    graph_node(
+                        Action::Parallel {
+                            over: "{{trigger.items}}".into(),
+                            each: Box::new(Step {
+                                name: None,
+                                guard: None,
+                                on_error: StepOnError::Continue,
+                                build_slot: false,
+                                action: durable_leaf("copy"),
+                            }),
+                        },
+                        &["fine"],
+                    ),
+                ),
+            ]);
+            let err = durable_route(&wf, true).expect_err("a parallel node refuses the graph");
+            assert!(err.contains("parallel"), "{err}");
+        }
+
+        /// Static refusal: a cyclic graph never gets a durable row — the old
+        /// engine fails it with the same `{status:failed}` value.
+        #[test]
+        fn refuses_a_cyclic_graph() {
+            let wf = graph_workflow([
+                ("a", graph_node(durable_leaf("a"), &["b"])),
+                ("b", graph_node(durable_leaf("b"), &["a"])),
+            ]);
+            let err = durable_route(&wf, true).expect_err("cycles refuse");
+            assert!(err.contains("cycle"), "{err}");
         }
 
         #[test]

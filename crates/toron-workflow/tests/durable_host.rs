@@ -15,9 +15,12 @@ use toron_core::index::durable_workflow::SyncWorkflowState;
 use toron_core::index::schema::{connect, migrate};
 use toron_core::journal::{JournalDb, ToronJournal};
 use toron_core::kernel::{DurableEngine, EngineMsg, OurEngine, RunPhase as EnginePhase};
-use toron_workflow::engine::durable::{RunEffect, RunModel, RunPhase};
-use toron_workflow::engine::durable_host::{DurableRun, HostError};
-use toron_workflow::schema::{Action, Graph, Step, StepOnError, Workflow};
+use toron_workflow::engine::ActionInvocation;
+use toron_workflow::engine::durable::{GraphEffect, GraphPhase, RunEffect, RunModel, RunPhase};
+use toron_workflow::engine::durable_host::{DurableGraphRun, DurableRun, HostError};
+use toron_workflow::engine::leaf::LeafSeams;
+use toron_workflow::engine::linear_step::{GraphNodeStep, run_graph_node_step};
+use toron_workflow::schema::{Action, Graph, GraphNode, Step, StepOnError, Workflow};
 
 fn workflow(steps: Vec<Step>) -> Workflow {
     Workflow {
@@ -95,7 +98,7 @@ async fn restart_resumes_at_the_unsettled_step() {
                 ),
                 "first effect runs step 1: {effects:?}"
             );
-            let effects = run.step_ok(json!({"stdout": "one"}), 1_000)?;
+            let effects = run.step_done(json!({"stdout": "one"}), 1_000)?;
             assert!(
                 matches!(
                     effects.as_slice(),
@@ -144,7 +147,7 @@ async fn restart_resumes_at_the_unsettled_step() {
                 ),
                 "only step 2 re-issues: {effects:?}"
             );
-            let effects = run.step_ok(json!({"stdout": "two"}), 2_000)?;
+            let effects = run.step_done(json!({"stdout": "two"}), 2_000)?;
             assert!(matches!(effects.as_slice(), [RunEffect::Complete { .. }]));
             assert_eq!(run.model().phase, RunPhase::Succeeded);
             assert_eq!(
@@ -395,7 +398,7 @@ async fn out_of_phase_transitions_are_typed_errors() {
             0,
         )?;
         assert!(matches!(
-            run.step_ok(json!({}), 0),
+            run.step_done(json!({}), 0),
             Err(HostError::WrongPhase { .. })
         ));
         assert!(matches!(run.woke(0), Err(HostError::WrongPhase { .. })));
@@ -447,4 +450,510 @@ async fn a_park_already_behind_now_resumes_in_the_same_step() {
     .await
     .expect("join")
     .expect("zero delay");
+}
+
+// ---------------------------------------------------------------------------
+// Graph driver (bd-durable-graph-impl-r2x1)
+// ---------------------------------------------------------------------------
+
+type HostGraphRun = DurableGraphRun<ToronEngineStore, ToronJournal, SyncWorkflowState>;
+
+fn graph_workflow(nodes: &[(&str, Action, &[&str])]) -> Workflow {
+    let mut map = BTreeMap::new();
+    for (name, action, needs) in nodes {
+        map.insert(
+            (*name).to_string(),
+            GraphNode {
+                action: action.clone(),
+                needs: needs.iter().map(|n| (*n).to_string()).collect(),
+                guard: None,
+                on_error: StepOnError::Continue,
+                build_slot: false,
+            },
+        );
+    }
+    let mut wf = workflow(Vec::new());
+    wf.graph = Some(Graph { nodes: map });
+    wf
+}
+
+fn diamond() -> Workflow {
+    graph_workflow(&[
+        (
+            "scout",
+            Action::Verify {
+                command: "scout".into(),
+            },
+            &[],
+        ),
+        (
+            "plan",
+            Action::Verify {
+                command: "plan".into(),
+            },
+            &["scout"],
+        ),
+        (
+            "fix_a",
+            Action::Verify {
+                command: "fix_a".into(),
+            },
+            &["plan"],
+        ),
+        (
+            "fix_b",
+            Action::Verify {
+                command: "fix_b".into(),
+            },
+            &["plan"],
+        ),
+        (
+            "ship",
+            Action::Verify {
+                command: "ship".into(),
+            },
+            &["fix_a", "fix_b"],
+        ),
+    ])
+}
+
+/// Seams with no Context anywhere: the graph host's own substrate. Every leaf
+/// answers `{ok:true, node:<command>}`.
+fn recording_seams() -> LeafSeams {
+    LeafSeams {
+        async_runner: Some(std::sync::Arc::new(|inv: &ActionInvocation| {
+            let name = match &inv.action {
+                Action::Verify { command } => command.clone(),
+                other => other.type_name().to_string(),
+            };
+            Box::pin(async move { Ok(json!({ "ok": true, "node": name })) })
+        })),
+        ..LeafSeams::default()
+    }
+}
+
+/// Feed one success back through the driver.
+async fn node_ok(
+    run: HostGraphRun,
+    node: &str,
+    value: serde_json::Value,
+) -> (HostGraphRun, Vec<GraphEffect>) {
+    let node = node.to_string();
+    tokio::task::spawn_blocking(move || {
+        let mut run = run;
+        let effects = run.node_done(&node, value, 2_000)?;
+        Ok::<_, HostError>((run, effects))
+    })
+    .await
+    .expect("join")
+    .expect("node_done")
+}
+
+/// Driver-level diamond through the real single-shot executor: every node
+/// dispatches once, in wave order, and the terminal is the `run_graph` outputs
+/// map.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn graph_diamond_runs_each_node_once_on_the_driver() {
+    let path = unique_db("graph-diamond");
+    let pool = connect(path.to_str().expect("path"))
+        .await
+        .expect("connect");
+    migrate(&pool).await.expect("migrate");
+    let state = SyncWorkflowState::spawn(pool.clone(), &tokio::runtime::Handle::current());
+    let seams = recording_seams();
+    let wf = diamond();
+
+    let (mut run, mut effects) = {
+        let pool = pool.clone();
+        let state = state.clone();
+        let handle = tokio::runtime::Handle::current();
+        let wf = wf.clone();
+        tokio::task::spawn_blocking(move || {
+            let engine = OurEngine::with_journal(
+                ToronEngineStore::spawn(pool.clone(), &handle),
+                ToronJournal::spawn(JournalDb::new(pool, "graph", 64), &handle),
+            );
+            DurableGraphRun::open(
+                engine,
+                state,
+                "run-graph-diamond",
+                wf,
+                json!({"source": "test"}),
+                1_000,
+            )
+        })
+        .await
+        .expect("join")
+        .expect("open")
+    };
+
+    let mut dispatched: Vec<String> = Vec::new();
+    let mut terminal = None;
+    while terminal.is_none() {
+        let mut batch = Vec::new();
+        for effect in std::mem::take(&mut effects) {
+            match effect {
+                GraphEffect::ExecuteNode { node, inputs, .. } => batch.push((node, inputs)),
+                GraphEffect::Complete { output } => terminal = Some(output),
+                GraphEffect::Fail { fail } => panic!("unexpected failure: {fail:?}"),
+                other => panic!("unexpected effect: {other:?}"),
+            }
+        }
+        for (node, inputs) in batch {
+            let node_def = wf
+                .graph
+                .as_ref()
+                .and_then(|g| g.nodes.get(&node))
+                .expect("node")
+                .clone();
+            let snapshot: serde_json::Map<String, serde_json::Value> = inputs.into_iter().collect();
+            let value = run_graph_node_step(
+                GraphNodeStep {
+                    run_id: "run-graph-diamond",
+                    workflow: &wf.name,
+                    workflow_digest: "digest",
+                    node_name: &node,
+                    node: &node_def,
+                    attempt: 1,
+                    trigger: &json!({}),
+                    inputs: &snapshot,
+                },
+                &seams,
+            )
+            .await;
+            dispatched.push(node.clone());
+            let (back, more) = node_ok(run, &node, value).await;
+            run = back;
+            effects = more;
+        }
+    }
+
+    assert_eq!(
+        dispatched,
+        ["scout", "plan", "fix_a", "fix_b", "ship"],
+        "each node exactly once, wave by wave"
+    );
+    let output = terminal.expect("terminal");
+    for name in ["scout", "plan", "fix_a", "fix_b", "ship"] {
+        assert_eq!(output[name]["node"], json!(name), "output under {name}");
+    }
+    assert_eq!(run.model().phase, GraphPhase::Succeeded);
+    assert_eq!(
+        run.engine()
+            .query("run-graph-diamond")
+            .expect("query")
+            .phase,
+        EnginePhase::Settled
+    );
+}
+
+/// A restart after wave 1 settles re-issues only the unsettled node.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn graph_restart_between_waves_runs_no_settled_node_twice() {
+    let path = unique_db("graph-restart");
+    let pool = connect(path.to_str().expect("path"))
+        .await
+        .expect("connect");
+    migrate(&pool).await.expect("migrate");
+    let state = SyncWorkflowState::spawn(pool.clone(), &tokio::runtime::Handle::current());
+    let wf = diamond();
+
+    let open = {
+        let pool = pool.clone();
+        let state = state.clone();
+        let handle = tokio::runtime::Handle::current();
+        let wf = wf.clone();
+        move || {
+            let engine = OurEngine::with_journal(
+                ToronEngineStore::spawn(pool.clone(), &handle),
+                ToronJournal::spawn(JournalDb::new(pool.clone(), "graph", 64), &handle),
+            );
+            DurableGraphRun::open(
+                engine,
+                state.clone(),
+                "run-graph-restart",
+                wf.clone(),
+                json!({"source": "test"}),
+                1_000,
+            )
+        }
+    };
+
+    let (run, effects) = tokio::task::spawn_blocking(open.clone())
+        .await
+        .expect("join")
+        .expect("open");
+    let [GraphEffect::ExecuteNode { node, .. }] = effects.as_slice() else {
+        panic!("wave 1 dispatches one node: {effects:?}");
+    };
+    assert_eq!(node, "scout");
+    let (run, effects) = node_ok(run, "scout", json!({"ok": true, "node": "scout"})).await;
+    let [GraphEffect::ExecuteNode { node, .. }] = effects.as_slice() else {
+        panic!("wave 2 dispatches plan: {effects:?}");
+    };
+    assert_eq!(node, "plan");
+
+    // Drop the driver mid-wave: `plan` was issued but never settled.
+    drop(run);
+
+    let (run, effects) = tokio::task::spawn_blocking(open)
+        .await
+        .expect("join")
+        .expect("reopen");
+    assert_eq!(
+        run.model().outputs["scout"]["node"],
+        json!("scout"),
+        "the settled node kept its output"
+    );
+    let resumed: Vec<&str> = effects
+        .iter()
+        .filter_map(|e| match e {
+            GraphEffect::ExecuteNode { node, .. } => Some(node.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(resumed, ["plan"], "only the unsettled node re-issues");
+}
+
+/// Whole-graph refusal leaves no state row and no engine row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn graph_refused_shape_leaves_no_row() {
+    let path = unique_db("graph-refused");
+    let pool = connect(path.to_str().expect("path"))
+        .await
+        .expect("connect");
+    migrate(&pool).await.expect("migrate");
+    let state = SyncWorkflowState::spawn(pool.clone(), &tokio::runtime::Handle::current());
+    let handle = tokio::runtime::Handle::current();
+
+    for (run_id, action, label) in [
+        (
+            "run-graph-parallel",
+            Action::Parallel {
+                over: "{{trigger.items}}".into(),
+                each: Box::new(step(Action::Verify {
+                    command: "x".into(),
+                })),
+            },
+            "parallel",
+        ),
+        (
+            "run-graph-spawn",
+            Action::Spawn {
+                profile: "coder".into(),
+                harness: None,
+                workflow: None,
+                await_: false,
+                no_claim_timeout: 600,
+                context: None,
+            },
+            "spawn",
+        ),
+    ] {
+        let mut wf = graph_workflow(&[(
+            "fine",
+            Action::Verify {
+                command: "fine".into(),
+            },
+            &[],
+        )]);
+        if let Some(graph) = wf.graph.as_mut() {
+            graph.nodes.insert(
+                "bad".to_string(),
+                GraphNode {
+                    action,
+                    needs: vec!["fine".into()],
+                    guard: None,
+                    on_error: StepOnError::Continue,
+                    build_slot: false,
+                },
+            );
+        }
+        let pool = pool.clone();
+        let state = state.clone();
+        let handle = handle.clone();
+        let rid = run_id.to_string();
+        let refused = tokio::task::spawn_blocking(move || {
+            let engine = OurEngine::with_journal(
+                ToronEngineStore::spawn(pool.clone(), &handle),
+                ToronJournal::spawn(JournalDb::new(pool, "graph", 64), &handle),
+            );
+            DurableGraphRun::open(engine, state, rid, wf, json!({}), 0)
+        })
+        .await
+        .expect("join");
+        let Err(err) = refused else {
+            panic!("{run_id}: a {label} node must refuse the whole graph");
+        };
+        let HostError::Unsupported(reason) = err else {
+            panic!("{run_id}: wrong refusal: {err:?}");
+        };
+        assert!(reason.contains(label), "{run_id}: {reason}");
+    }
+
+    let state_store = toron_core::index::durable_workflow::WorkflowStateStore::new(pool.clone());
+    for run_id in ["run-graph-parallel", "run-graph-spawn"] {
+        assert!(
+            state_store.load(run_id).await.expect("state").is_none(),
+            "{run_id} left no state row"
+        );
+    }
+    let engine = OurEngine::with_journal(
+        ToronEngineStore::spawn(pool.clone(), &handle),
+        ToronJournal::spawn(JournalDb::new(pool.clone(), "graph", 64), &handle),
+    );
+    assert!(engine.query("run-graph-parallel").is_err());
+    assert!(engine.query("run-graph-spawn").is_err());
+}
+
+/// Captain review fix 1: one wave holding a short delay AND an approval parks
+/// the engine once, at the EARLIEST deadline. `park_until` overwrites, so a
+/// per-effect park would leave the run waking in a day.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn graph_delay_and_approval_park_at_the_earliest_deadline() {
+    let path = unique_db("graph-park-one");
+    let pool = connect(path.to_str().expect("path"))
+        .await
+        .expect("connect");
+    migrate(&pool).await.expect("migrate");
+    let state = SyncWorkflowState::spawn(pool.clone(), &tokio::runtime::Handle::current());
+    let wf = graph_workflow(&[
+        ("quick", Action::Delay { secs: 5 }, &[]),
+        (
+            "gate",
+            Action::RequestApproval {
+                message: "ship?".into(),
+            },
+            &[],
+        ),
+    ]);
+    let handle = tokio::runtime::Handle::current();
+
+    let (run, effects) = tokio::task::spawn_blocking(move || {
+        let engine = OurEngine::with_journal(
+            ToronEngineStore::spawn(pool.clone(), &handle),
+            ToronJournal::spawn(JournalDb::new(pool.clone(), "graph", 64), &handle),
+        );
+        DurableGraphRun::open(engine, state, "run-graph-park", wf, json!({}), 1_000)
+    })
+    .await
+    .expect("join")
+    .expect("open");
+
+    assert_eq!(effects.len(), 2, "a delay and an approval: {effects:?}");
+    assert_eq!(
+        run.engine()
+            .query("run-graph-park")
+            .expect("query")
+            .until_ms,
+        Some(6_000),
+        "the 5s delay wins over the 1-day approval watchdog"
+    );
+}
+
+/// Captain review fix 2: a run that already failed ignores late node results,
+/// so a sibling's success can never land an output or re-schedule a wave over
+/// the failure.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn graph_late_node_done_after_a_terminal_is_ignored() {
+    let path = unique_db("graph-terminal-guard");
+    let pool = connect(path.to_str().expect("path"))
+        .await
+        .expect("connect");
+    migrate(&pool).await.expect("migrate");
+    let state = SyncWorkflowState::spawn(pool.clone(), &tokio::runtime::Handle::current());
+    let mut wf = graph_workflow(&[
+        (
+            "aa",
+            Action::Verify {
+                command: "aa".into(),
+            },
+            &[],
+        ),
+        (
+            "zz",
+            Action::Verify {
+                command: "zz".into(),
+            },
+            &[],
+        ),
+    ]);
+    if let Some(graph) = wf.graph.as_mut() {
+        for node in graph.nodes.values_mut() {
+            node.on_error = StepOnError::FailRun;
+        }
+    }
+    let handle = tokio::runtime::Handle::current();
+
+    let (run, effects) = tokio::task::spawn_blocking(move || {
+        let engine = OurEngine::with_journal(
+            ToronEngineStore::spawn(pool.clone(), &handle),
+            ToronJournal::spawn(JournalDb::new(pool.clone(), "graph", 64), &handle),
+        );
+        DurableGraphRun::open(engine, state, "run-graph-guard", wf, json!({}), 1_000)
+    })
+    .await
+    .expect("join")
+    .expect("open");
+    assert_eq!(effects.len(), 2, "both nodes of wave 1 are dispatched");
+
+    // A non-retryable failure fails the whole run while `zz` is still out.
+    let (run, effects) = {
+        let mut run = run;
+        tokio::task::spawn_blocking(move || {
+            let effects = run.node_done(
+                "aa",
+                json!({"ok": false, "error": "boom", "kind": "invalid_output"}),
+                2_000,
+            )?;
+            Ok::<_, HostError>((run, effects))
+        })
+        .await
+        .expect("join")
+        .expect("node_done")
+    };
+    assert!(matches!(effects.as_slice(), [GraphEffect::Fail { .. }]));
+    assert_eq!(
+        run.model().phase,
+        GraphPhase::Failed {
+            error: "boom".into()
+        }
+    );
+
+    // The late sibling result changes nothing.
+    let (run, effects) = {
+        let mut run = run;
+        tokio::task::spawn_blocking(move || {
+            let effects = run.node_done("zz", json!({"ok": true, "node": "zz"}), 3_000)?;
+            Ok::<_, HostError>((run, effects))
+        })
+        .await
+        .expect("join")
+        .expect("late node_done")
+    };
+    assert!(
+        effects.is_empty(),
+        "a terminal run emits nothing: {effects:?}"
+    );
+    assert_eq!(
+        run.model().phase,
+        GraphPhase::Failed {
+            error: "boom".into()
+        },
+        "the failure stands"
+    );
+    assert!(
+        !run.model().outputs.contains_key("zz"),
+        "a late success never lands an output: {:?}",
+        run.model().outputs
+    );
+    assert!(
+        !run.model().outputs.contains_key("aa"),
+        "a failed node lands nothing either: {:?}",
+        run.model().outputs
+    );
+    assert_eq!(
+        run.engine().query("run-graph-guard").expect("query").phase,
+        EnginePhase::Failed
+    );
 }

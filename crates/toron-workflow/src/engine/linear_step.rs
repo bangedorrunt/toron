@@ -111,6 +111,78 @@ pub async fn run_linear_step(input: LinearStep<'_>, seams: &LeafSeams) -> serde_
     }
 }
 
+/// One graph node, single-shot, with no `Context`.
+///
+/// Deliberately NOT [`run_linear_step`]: a graph leaf gets exactly ONE dispatch
+/// plus scheduler-level retry, while the linear step owns an inner retry loop.
+/// Reusing the looping variant here would multiply executions up to 9×.
+pub struct GraphNodeStep<'a> {
+    /// Run / journal / engine key.
+    pub run_id: &'a str,
+    /// Workflow name (render attribution + node path scope).
+    pub workflow: &'a str,
+    /// Canonical workflow digest for run-scoped effect keys.
+    pub workflow_digest: &'a str,
+    /// Node name (the graph map key; the render/node path).
+    pub node_name: &'a str,
+    /// The node definition.
+    pub node: &'a crate::schema::GraphNode,
+    /// Scheduler-level attempt (1-based).
+    pub attempt: u32,
+    /// Trigger payload.
+    pub trigger: &'a serde_json::Value,
+    /// The spawn-time outputs snapshot this node renders against.
+    pub inputs: &'a serde_json::Map<String, serde_json::Value>,
+}
+
+/// Run one graph node to a value.
+///
+/// Same order as the Context path's leaf arm — guard, strict render, one
+/// invocation, partition, one dispatch — so a node reaches the same verdict on
+/// either substrate.
+pub async fn run_graph_node_step(input: GraphNodeStep<'_>, seams: &LeafSeams) -> serde_json::Value {
+    match evaluate_step_guard(
+        input.node.guard.as_deref(),
+        input.trigger,
+        input.inputs,
+        input.node_name,
+    )
+    .await
+    {
+        GuardVerdict::Proceed => {}
+        GuardVerdict::Skip { reason } => return skipped_value(input.node_name, reason),
+        GuardVerdict::Fail { error } => {
+            return serde_json::json!({ "ok": false, "error": error });
+        }
+    }
+
+    // The planning render in the fold is LENIENT; this one is strict, so an
+    // unresolvable ref fails HERE with workflow/node/field/ref attribution
+    // rather than reaching a runner as a verbatim placeholder.
+    let render_ctx = RenderContext::new(input.workflow, input.node_name);
+    let action = match render_action(&input.node.action, input.trigger, input.inputs, &render_ctx) {
+        Ok(action) => action,
+        Err(e) => {
+            return serde_json::json!({ "ok": false, "error": format!("render: {e}") });
+        }
+    };
+    let invocation = invocation_for_leaf(
+        action,
+        input.run_id,
+        input.workflow_digest,
+        input.node_name,
+        input.attempt,
+        1,
+        None,
+    );
+    match partition(&invocation.action) {
+        ActionPartition::HostSink { sink } => dispatch_leaf(seams, &invocation, sink).await,
+        // The graph model refuses these before any row; reaching one here is a
+        // routing bug, so answer with the boundary's own fail-closed value.
+        _ => invoke_compat(&invocation.action, |_| None),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
