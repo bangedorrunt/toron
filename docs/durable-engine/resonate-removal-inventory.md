@@ -226,7 +226,10 @@ Live-server SKIP guards: **24 early-`return` points across 12 files**. Only
    loop and the 30s restart sweep. Witnesses: `durable_sweep_resumes_a_parked_run_after_restart`,
    `restart_does_not_replay_a_settled_step`, `corrupt_durable_model_settles_failed_instead_of_retrying`.
    Graphs, spawn, and control-flow actions still refuse before any row and
-   run on the old path.
+   run on the old path. The standalone `toron-cli/src/workflow.rs` runner is
+   **not** ported yet: it still builds `WorkflowEngine` and is deferred until
+   the graph model lands (its preflight already refuses approvals/spawn/control
+   flow, so only the headless leaf/delay path needs the driver).
    The cut is three contained moves, in this order:
    - **(a) One leaf policy.** `engine/leaf.rs` holds `LeafSeams` (async runner,
      sync runner, verify sink, journal mode) + `dispatch_leaf`. The Resonate
