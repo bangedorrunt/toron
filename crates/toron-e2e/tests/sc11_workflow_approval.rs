@@ -109,7 +109,7 @@ async fn sc11_approval_crash_resume() {
     let (run, effects) = open_run(&pool, "sc11-deploy", workflow.clone(), trigger.clone())
         .await
         .expect("open");
-    let [RunEffect::ExecuteStep { index, step }] = effects.as_slice() else {
+    let [RunEffect::ExecuteStep { index, step, .. }] = effects.as_slice() else {
         panic!("first effect executes prep: {effects:?}");
     };
     assert_eq!(*index, 0);
@@ -172,7 +172,7 @@ async fn sc11_approval_crash_resume() {
         let mut done = None;
         for effect in std::mem::take(&mut effects) {
             match effect {
-                RunEffect::ExecuteStep { index, step } => {
+                RunEffect::ExecuteStep { index, step, .. } => {
                     let mut outputs: serde_json::Map<String, serde_json::Value> =
                         run.model().outputs.clone().into_iter().collect();
                     let value = durable::run_step(

@@ -130,7 +130,7 @@ async fn drive_reaction_workflow(
         let mut done = false;
         for effect in std::mem::take(&mut effects) {
             match effect {
-                RunEffect::ExecuteStep { index, step } => {
+                RunEffect::ExecuteStep { index, step, .. } => {
                     let mut outputs: serde_json::Map<String, serde_json::Value> =
                         run.model().outputs.clone().into_iter().collect();
                     let value = common::durable::run_step(

@@ -97,6 +97,7 @@ pub async fn run_step(
 ) -> serde_json::Value {
     toron_workflow::engine::linear_step::run_linear_step(
         LinearStep {
+            iteration: None,
             run_id,
             workflow: workflow_name,
             workflow_digest,

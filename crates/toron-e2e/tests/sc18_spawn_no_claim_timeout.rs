@@ -129,9 +129,9 @@ steps:
         let mut run = run;
         run.woke(deadline_ms).map(|eff| (run, eff))
     })
-            .await
-            .expect("woke task")
-            .unwrap_or_else(|e| panic!("woke at deadline failed: {e}"));
+    .await
+    .expect("woke task")
+    .unwrap_or_else(|e| panic!("woke at deadline failed: {e}"));
     let _ = effects;
     drop(run);
 
