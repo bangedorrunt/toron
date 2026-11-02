@@ -268,13 +268,13 @@ pub fn plist_xml(
     )
 }
 
-/// Hourly copy-truncate of toron + resonate logs (bd-741i).
+/// Hourly copy-truncate of the toron serve logs (bd-741i).
 ///
-/// Weekly rotation left `resonate.out.log` at 1.3GB (`RUST_LOG=info` doorbell
+/// Weekly rotation left the serve logs at 1.3GB (`RUST_LOG=info` doorbell
 /// poll-fail storm). Hourly + 1 MiB threshold caps both daemons. Pure —
 /// golden-tested.
 pub fn logrotate_plist_xml() -> String {
-    let script = r#"for f in "$HOME/.local/state/toron/serve.out.log" "$HOME/.local/state/toron/serve.err.log" "$HOME/.local/state/flywheel/resonate.out.log" "$HOME/.local/state/flywheel/resonate.err.log"; do [ -f "$f" ] || continue; sz=$(stat -f%z "$f" 2>/dev/null || stat -c%s "$f"); if [ "$sz" -gt 1048576 ]; then cp "$f" "$f.1" && : > "$f"; fi; done"#;
+    let script = r#"for f in "$HOME/.local/state/toron/serve.out.log" "$HOME/.local/state/toron/serve.err.log"; do [ -f "$f" ] || continue; sz=$(stat -f%z "$f" 2>/dev/null || stat -c%s "$f"); if [ "$sz" -gt 1048576 ]; then cp "$f" "$f.1" && : > "$f"; fi; done"#;
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -387,7 +387,7 @@ mod tests {
     }
 
     #[test]
-    fn logrotate_plist_is_hourly_and_covers_resonate() {
+    fn logrotate_plist_is_hourly_and_covers_serve_logs() {
         let xml = logrotate_plist_xml();
         assert!(xml.contains("<string>com.toron.logrotate</string>"));
         assert!(
@@ -395,7 +395,6 @@ mod tests {
             "hourly, not weekly calendar"
         );
         assert!(!xml.contains("StartCalendarInterval"));
-        assert!(xml.contains("resonate.out.log"), "bd-741i: resonate log");
         assert!(xml.contains("serve.out.log"));
         assert!(xml.contains("1048576"), "1 MiB copy-truncate threshold");
     }

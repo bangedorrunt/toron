@@ -8,7 +8,7 @@
 
 //! Shared fixtures for the scenario test harness (bd-i84w: the Resonate
 //! server harness is retired — `boot_server` / `wait_ready` / `free_port` /
-//! `has_resonate` are gone with it; scenarios drive `DurableRun` /
+//! vendor helpers are gone with it; scenarios drive `DurableRun` /
 //! `DurableGraphRun` over temp sqlite pools via [`durable`]).
 //!
 //! Usage: each scenario file does `#[path = "common/mod.rs"] mod common;`

@@ -2067,7 +2067,7 @@ fn presence_help_lists_commands() {
 /// and then simply never used `daemon` again, which is the shape that hides it.
 ///
 /// Note the contrast with `toron_core::testkit::ChildGuard`, which DOES have a
-/// Drop and is used for `resonate serve` in this same repo. The daemon path was
+/// Drop and was used by the retired vendor server. The daemon path was
 /// just never routed through it. The leak was never the guard's fault; it was
 /// the guard not being on this path.
 struct DaemonGuard(Option<std::process::Child>);

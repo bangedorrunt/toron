@@ -7,14 +7,6 @@
 //! plus the `toron`-binary spawn harness live here — `toron-core` is the
 //! only crate every test harness depends on.
 //!
-//! bd-8w26: the Resonate server half is retired (spawn ledger, orphan
-//! reaper, identity check, `resonate_serve`, `resonate_installed`). The one
-//! exception is `ChildGuard::resonate_serve`, kept as a shrinking shim:
-//! toron-workflow (`engine/tests.rs`, `cron.rs`) and toron-mcp test callers
-//! owned by other crews still use it, and their files are out of scope for
-//! this slice. The deletion sweep removes the shim with those callers.
-
-use std::path::Path;
 use std::process::{Child, Command, Stdio};
 
 /// bd-yolv: SIGTERM, sent by number because `std` exposes no portable
@@ -31,8 +23,8 @@ fn unsafe_free_signal(pid: u32, sig: i32) {
     let _ = std::process::Command::new("kill")
         .arg(format!("-{sig}"))
         .arg(pid.to_string())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .status();
 }
 #[cfg(not(unix))]
@@ -70,37 +62,6 @@ impl ChildGuard {
     /// Take ownership of a spawned child's lifetime.
     pub fn spawn(cmd: &mut Command) -> std::io::Result<Self> {
         Ok(Self(Some(cmd.spawn()?)))
-    }
-
-    /// Shrinking shim (bd-8w26): spawn `resonate serve` (sqlite in `dir`,
-    /// loopback only) as a guarded child. Returns `None` when the `resonate`
-    /// binary is absent. The spawn ledger and orphan reaper are gone with the
-    /// vendor harness; remaining callers (toron-workflow / toron-mcp tests
-    /// owned by other crews) go away in the deletion sweep, taking this shim
-    /// with them. Do NOT add new callers.
-    pub fn resonate_serve(port: u16, dir: &Path) -> std::io::Result<Option<Self>> {
-        if Command::new("resonate")
-            .arg("--version")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-        {
-            let mut cmd = Command::new("resonate");
-            cmd.args([
-                "serve",
-                "--storage-type",
-                "sqlite",
-                "--server-port",
-                &port.to_string(),
-                "--server-host",
-                "127.0.0.1",
-            ])
-            .current_dir(dir)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-            return Ok(Some(Self::spawn(&mut cmd)?));
-        }
-        Ok(None)
     }
 
     /// The child's pid, for a caller that must report or probe it.

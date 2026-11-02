@@ -134,3 +134,27 @@ still calls `Resonate::run`, and `control_flow.rs` still suspends through
 - **Delete Resonate in one change.** Rejected by the inventory: the run path,
   the testkit harness, 24 live-server guards, and an out-of-repo caller would
   move at once with no witness between them.
+
+## Completion addendum — 2026-11-02
+
+The replacement is complete. Every shape toron ships is on the durable
+models: linear leaves, delay, approval, graphs, branch (linear plan),
+parallel/foreach/retry/call_workflow (graph fan-out and child runs), spawn
+(launcher seam + durable claims), and the bounded loop (persisted counter).
+`park` and the deprecated `reduce`/`react`/`call_webhook` refuse whole before
+any row by contract. The loop, cron, and status paths in flywheel read local
+rows and the engine store; no vendor process is started or probed.
+
+The public `WorkflowEngine` remains as the embedding door, now implemented by
+`engine/drive.rs` as a thin driver over `DurableRun`/`DurableGraphRun`: the
+constructors keep the injected seams, `run`/`invoke` drive to terminal, and
+approvals/spawns register one-shot waiters resolved by the existing drainers
+using the run id / spawn key. The vendor schedulers, `CronManager`, the remote
+engine selection, the testkit server harness, and the `resonate-sdk`
+dependency are deleted. A `{status:"failed",…}` terminal is still a VALUE,
+not an `Err`.
+
+Accepted witnesses: toron-workflow lib/durable suites; toron-mcp durable and
+the ported host lifecycle; the seven e2e scenarios with no server; flywheel
+cron/loop/spawn/crew filters; clippy `-D warnings`; and the live stack check
+recorded in the removal inventory.

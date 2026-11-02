@@ -58,14 +58,39 @@ struct CheckResult {
 /// second identity beside the pin; mail sealed to its npub is unreachable).
 /// Informational (ok stays true): doctor NAMES the rows, cleanup is the
 /// fold path's job (`fold_agent_name_alias` absorbs idempotently).
-fn check_resonate() -> CheckResult {
+fn check_engine_store(cfg: &Config) -> CheckResult {
     // ADR-0043: workflow execution is the in-process durable engine
-    // (`OurEngine` + the pure run models). There is no vendor server to
-    // probe, so the health line reports the capability the host has.
+    // (`OurEngine` + the pure run models). Probe the store the host uses:
+    // a missing or unwritable index is the honest failure, not a vendor
+    // server that no longer exists.
+    let Some(dir) = resolve_data_dir(cfg, None) else {
+        return CheckResult {
+            name: "engine_store",
+            ok: true,
+            detail: "no data dir yet — the store is created on first run".into(),
+        };
+    };
+    let db = dir.join("index.sqlite");
+    if !db.exists() {
+        return CheckResult {
+            name: "engine_store",
+            ok: true,
+            detail: format!("no index yet at {} — created on first run", db.display()),
+        };
+    }
+    let writable = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&db)
+        .is_ok();
     CheckResult {
-        name: "resonate",
-        ok: true,
-        detail: "in-process durable engine (ADR-0043): no vendor server; runs persist in the host's SQLite store".into(),
+        name: "engine_store",
+        ok: writable,
+        detail: format!(
+            "in-process durable engine (ADR-0043): {} {}",
+            db.display(),
+            if writable { "writable" } else { "NOT writable" }
+        ),
     }
 }
 
@@ -510,7 +535,7 @@ pub fn run_doctor(
         check_git(),
         check_keys(cfg),
         check_daemon_build(),
-        check_resonate(),
+        check_engine_store(cfg),
         check_legacy_slug_identities(cfg),
         check_name_collisions(cfg),
         check_identity_divergence(cfg),

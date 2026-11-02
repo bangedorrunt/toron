@@ -6082,45 +6082,7 @@ steps:
         use toron_core::index::schema;
         use toron_workflow::engine::ResolutionVerdict;
 
-        // Real `resonate serve` (same requirement as the engine WF-08 tests).
-        let dir = std::env::temp_dir().join(format!("wf-life-rsrv-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).expect("tmpdir");
-        let port = std::net::TcpListener::bind("127.0.0.1:0")
-            .expect("port")
-            .local_addr()
-            .expect("addr")
-            .port();
-        let url = format!("http://127.0.0.1:{port}");
-        // bd-6h9l: killed and reaped at scope end, so a failing gate or a
-        // cancelled binary cannot orphan the server. bd-parked-run-flake-2st2:
-        // no binary on the runner is a SKIP, not a failure — the
-        // `.expect("resonate binary present")` read a missing binary as a
-        // broken lifecycle, which is why docs-only CI failed while local
-        // runs (with resonate installed) passed.
-        let mut server = match toron_core::testkit::ChildGuard::resonate_serve(port, &dir)
-            .expect("resonate serve")
-        {
-            Some(server) => server,
-            None => {
-                eprintln!("SKIP: resonate binary not present");
-                return;
-            }
-        };
-        // Wait for the server port (up to ~10s).
-        let mut ready = false;
-        for _ in 0..100 {
-            if std::net::TcpStream::connect(format!("127.0.0.1:{port}")).is_ok() {
-                ready = true;
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        }
-        if !ready {
-            server.kill();
-            eprintln!("SKIP: resonate serve did not come up");
-            return;
-        }
-
+        // No server: the engine is the in-process durable façade.
         let db = std::env::temp_dir().join(format!("wf-lifee2e-{}.sqlite", uuid::Uuid::new_v4()));
         let pool = schema::connect(db.to_str().unwrap())
             .await
@@ -6131,7 +6093,7 @@ steps:
                 .await
                 .expect("bus"),
         );
-        let engine = WorkflowEngine::remote(&url).expect("remote engine");
+        let engine = WorkflowEngine::local().expect("engine");
         let host = WorkflowHost::over_bus_with_engine(bus, engine, vec![])
             .with_job_signer(Some(Keys::generate()));
 
@@ -6191,7 +6153,6 @@ steps:
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
         assert!(done, "run resumes to Succeeded after validated resolution");
-        server.kill();
         let _ = std::fs::remove_file(&db);
     }
 

@@ -297,14 +297,23 @@ gone** (`406dd6d9`), and **durable branch in the linear plan** (`9d0329d5`;
 `climb`/`cycle` rewrites and parallel/foreach/retry/call_workflow are the
 open control-flow queue).
 
-**Cannot remove yet:** the legacy engine still owns the control-flow shapes
-(branch/retry/parallel/foreach/loop/call_workflow/park). Flywheel's builtins
-and crew composition use them (parallel ~18x, call_workflow ~22x, retry ~6x,
-branch ~4x), so `toron-workflow` keeps `resonate-sdk` until those models land.
-Design: `bd-control-flow-design-0jmd` (deliverable
-`docs/durable-engine/control-flow-design.md`). After that: port flywheel's
-`crew`/`phase_chain`/`coalition`/`smart_cron` call sites, then the step 6–9
-deletion (toron's old engine, `CronManager`, testkit, deps, prose).
+**Removed (ADR-0043 endgame, 2026-11-02).** Every shape shipped is on the
+durable models: leaves/delay/approval, graphs, branch, parallel, foreach,
+retry, call_workflow, spawn, and the bounded loop (`park` and the deprecated
+`reduce`/`react`/`call_webhook` refuse whole by contract). `WorkflowEngine` is
+now a thin in-process driver over `DurableRun`/`DurableGraphRun`
+(`engine/drive.rs`): constructors store the injected seams, `run`/`invoke`
+drive to terminal, approvals/spawns register one-shot waiters and the
+existing drainers resolve them by run id / spawn key. The vendor schedulers
+(`run_workflow`, `run_step`/`run_graph`/`run_parallel`/`run_branch`/`run_retry`/
+`run_foreach`/`run_loop`/`run_call_workflow`), `CronManager`, and
+`resonate-sdk` are deleted; `toron-workflow`, `toron-cli`, and `toron-e2e`
+have no vendor dependency; `cargo tree -p toron-workflow` has none. The e2e
+workflow scenarios drive the durable host with no server
+(`c5d98e72`, `6bc2f6b`), testkit's vendor half is gone (`c62a9dc7`), and
+flywheel's config, daemon autostart, engine-GC command, and pane URL probe are
+deleted. The deals, the run id, and the terminal shapes are unchanged; a
+`{status:"failed",…}` terminal stays a VALUE.
 
 ## 8. Where code disagrees with "the in-house engine replaces Resonate"
 

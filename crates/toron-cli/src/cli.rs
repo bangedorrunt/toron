@@ -152,7 +152,7 @@ pub enum Command {
     Wait(WaitArgs),
 
     // --- operator surface (bd-led.8.2): daemon-persona commands.
-    /// Deep health checks (hc/git/keys/resonate). --check exits 3 on any failure.
+    /// Deep health checks (hc/git/keys/engine store). --check exits 3 on any failure.
     Doctor(DoctorArgs),
 
     /// In-process operator counters (tool calls, errors, latency).
