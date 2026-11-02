@@ -162,3 +162,63 @@ store: the claim is durable on the bus, not in a vendor process.
   the event.
 - In-flight promises at the flip are drained/resolved once through the old
   server, then the port lands (same operational rule as ADR-0043).
+
+## Captain addendum — 2026-11-02 (the transport is not the bus)
+
+The implementation landed the model and the consumer functions, then stopped at
+the cutover. Checking the live wiring before flipping the router found the
+design's transport assumption is false:
+
+- `InProcessBus` is tokio channels over a SQLite event store. It fans out
+  **in-process only**; a second process cannot subscribe to the host's bus.
+- The durable `WorkflowHost` lives in the toron MCP server process. The pane
+  launcher (`pane::launch_spawn_job`) lives in the flywheel process.
+- Flywheel's live drainer still drains `engine.spawn_sink()` (the old promise
+  sink). `consume_spawn_job` / `spawn_spec_from_job` are `#[allow(dead_code)]`
+  and called by tests only.
+- `SpawnClaims` is an in-memory `HashMap`, so a restarted host would re-emit
+  `StartSpawn` and launch a second pane for the same `spawn_key`.
+
+So "publish 43001, let the consumer claim, settle from 43004" cannot be the
+transport across that process boundary, and the claim cannot be the
+exactly-once gate while it is memory-only.
+
+**Decision**
+
+1. `WorkflowHost` gains an optional `SpawnLauncher` seam — the same shape as
+   `LeafSeams`: `Arc<dyn Fn(SpawnSpec) -> BoxFuture<Result<Value>> + Send + Sync>`.
+   On `RunEffect::StartSpawn` the linear effect loop awaits the launcher and
+   feeds the outcome back through `spawn_settled` / `spawn_failed`, exactly like
+   a step outcome. The park phase is still persisted first.
+2. The 43001 publish stays as operator evidence, and the 43004/43006 terminal
+   stays as the job record, but the host does not wait for them. A host with no
+   consumer still settles.
+3. Admission is capability-based, not shape-based. `unsupported_reason` becomes
+   shape-only (spawn is a shape the model can sequence); `durable_route` takes a
+   `spawn_capable` flag and refuses a spawn workflow when the caller has no
+   launcher (cron and the bare server pass false). `open_with_seams` does the
+   same check for direct callers. A refused spawn still leaves no row.
+4. Exactly-once is durable and flywheel-side: claims keyed by `spawn_key` in the
+   existing atomic `.flywheel` state file, taken before the pane starts. A
+   restarted host re-emits `StartSpawn`, the consumer finds the claim, and
+   adopts the running job instead of launching a second pane. The in-memory
+   `SpawnClaims` remains the unit-test double.
+5. The deadline still fails the node with the old timeout text when a launch
+   outlives it.
+
+**Why not a server-side consumer:** the server has no pane backend, and teaching
+toron-mcp to shell into flywheel would move the launch policy out of the one
+process that owns profiles, panes, and workspace identity. The seam keeps the
+cut in the process that already owns spawn.
+
+**Witnesses for the flip**
+
+1. A spawn step on a host with a launcher launches once, settles the full value,
+   and completes; kind-43001 is still published.
+2. A spawn body on a host without a launcher (`durable_route(..., false)`) is
+   refused before any state or engine row.
+3. Kill the host after the claim but before the terminal; the restarted host
+   re-emits `StartSpawn`, the durable claim adopts, and the consumer starts no
+   second child.
+4. A launcher that never resolves fails the node at the park deadline with the
+   same error text as the old promise timeout.

@@ -286,12 +286,16 @@ Live-server SKIP guards: **24 early-`return` points across 12 files**. Only
     deleted 2026-11-02 (`bd-resonate-corpses-l96j`); the untracked local
     `resonate.db` stays as operator data and is not a repo file.
 
-**Cannot remove yet:** graph workflows (step 2, implementation
-`bd-durable-graph-impl-r2x1`), cron cadence (step 3, `bd-flywheel-cron-elm-cn7p`),
-the flywheel build (step 4, epic `bd-off-resonate-qg2b`), and the spawn park
-(step 4, `bd-spawn-durable-park-nncl`). The run-path cutover (step 5) landed;
-the host is the real engine for linear workflows. Steps 6–9 stay gated on the
-four above.
+**Cannot remove yet:** the spawn cutover (step 4). The park model, the job
+spec, and the consumer functions landed, but the design's transport assumption
+was false: the bus is process-local, and the host runs in the toron MCP server
+while the pane launcher runs in flywheel. The Captain addendum in
+`docs/durable-engine/spawn-park-design.md` moves the launch to an in-process
+`SpawnLauncher` seam with durable `spawn_key` claims; implementation is
+`bd-spawn-launcher-flip-d8mv`. Graphs (`bd-durable-graph-impl-r2x1`, landed
+`860134db`), cron cadence (`bd-flywheel-cron-elm-cn7p`, landed `5ff72300`), and
+the swarm loop (`bd-flywheel-loop-substrate-ftpm`, landed `182cad35`) are done.
+Steps 6–9 stay gated on spawn.
 
 ## 8. Where code disagrees with "the in-house engine replaces Resonate"
 
