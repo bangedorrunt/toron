@@ -3,182 +3,19 @@
 
 //! Test-support shared by the workspace's harnesses.
 //!
-//! One type lives here because three crates spawn the same external server in
-//! their tests: `toron-e2e` (via `tests/common`), `toron-workflow` (the cron
-//! `spec_engine` fixture and `engine/tests.rs`), and `toron-mcp` (the live
-//! engine gate). `toron-core` is the only crate all three depend on.
+//! Generic child management (`ChildGuard` scope/drop/kill, pid aliveness)
+//! plus the `toron`-binary spawn harness live here — `toron-core` is the
+//! only crate every test harness depends on.
+//!
+//! bd-8w26: the Resonate server half is retired (spawn ledger, orphan
+//! reaper, identity check, `resonate_serve`, `resonate_installed`). The one
+//! exception is `ChildGuard::resonate_serve`, kept as a shrinking shim:
+//! toron-workflow (`engine/tests.rs`, `cron.rs`) and toron-mcp test callers
+//! owned by other crews still use it, and their files are out of scope for
+//! this slice. The deletion sweep removes the shim with those callers.
 
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
-
-/// bd-yolv: the spawn ledger. One JSON-ish line per live child, so a run that
-/// is killed before `Drop` still leaves evidence of what it leaked.
-///
-/// This is the whole point: the 72 orphans carried no parent, no port, and no
-/// test name, so the leak was undiagnosable and therefore unfixable. A leak you
-/// cannot attribute is a leak you can only clean up by hand, forever.
-/// bd-yolv: NOT keyed by the current process.
-///
-/// It was `toron-resonate-children-{pid}.ledger`, which is wrong in BOTH
-/// directions at once: a fresh process starts with an empty ledger, so nothing
-/// from a previous (killed) run is ever found — the reaper was useless — while
-/// every line in it is this process's OWN children, which `ChildGuard` already
-/// owns and releases on drop. So it was pointed at precisely the wrong set.
-fn ledger_path() -> std::path::PathBuf {
-    std::env::temp_dir().join("toron-resonate-children.ledger")
-}
-
-fn record_spawn_in(path: &std::path::Path, pid: u32, port: u16) {
-    if pid == 0 {
-        return;
-    }
-    let line = format!("{pid} {port} {}\n", std::process::id());
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-    {
-        use std::io::Write;
-        let _ = f.write_all(line.as_bytes());
-    }
-}
-
-fn record_spawn(pid: u32, port: u16) {
-    record_spawn_in(&ledger_path(), pid, port);
-}
-
-fn forget_spawn_in(path: &std::path::Path, pid: u32) {
-    let Ok(raw) = std::fs::read_to_string(path) else {
-        return;
-    };
-    let kept: Vec<&str> = raw
-        .lines()
-        .filter(|l| l.split_whitespace().next() != Some(pid.to_string().as_str()))
-        .collect();
-    let _ = std::fs::write(path, kept.join("\n"));
-}
-
-/// bd-yolv: kill anything the LAST run left behind, and only that.
-///
-/// The identity check is the safety property and it is not optional: a pid is
-/// recycled by the OS, so killing a bare recorded pid could one day take out an
-/// unrelated process — including a real daemon. So a recorded pid is killed only
-/// when the live process at that pid is still a `resonate serve` carrying the
-/// port we recorded. Anything else is left strictly alone.
-pub fn forget_spawn(pid: u32) {
-    forget_spawn_in(&ledger_path(), pid);
-}
-
-pub fn reap_orphaned_servers() -> usize {
-    reap_orphaned_servers_in(&ledger_path())
-}
-
-fn reap_orphaned_servers_in(path: &std::path::Path) -> usize {
-    let Ok(raw) = std::fs::read_to_string(path) else {
-        return 0;
-    };
-    let me = std::process::id();
-    let mut reaped = 0;
-    // Lines we must KEEP: our own live children, and anything still owned by a
-    // live process. Previously the ledger was drained unconditionally, which
-    // erased a SIBLING TEST's entry even when the reaper did not kill it.
-    let mut keep: Vec<&str> = Vec::new();
-    for line in raw.lines() {
-        let mut it = line.split_whitespace();
-        let (Some(pid), Some(port), Some(owner)) = (it.next(), it.next(), it.next()) else {
-            continue;
-        };
-        let (Ok(pid), Ok(port), Ok(owner)) = (
-            pid.parse::<u32>(),
-            port.parse::<u16>(),
-            owner.parse::<u32>(),
-        ) else {
-            continue;
-        };
-        // bd-yolv: NEVER reap a server a LIVE process owns. Our own children are
-        // `ChildGuard`s released on drop — and a SIBLING TEST's guard is one of
-        // those, because tests in one binary run in parallel threads. Reaping
-        // them made three approval tests fail under default parallelism and
-        // pass single-threaded, which is the least diagnosable failure shape
-        // there is. This cleans up after a run that was KILLED, and a live owner
-        // is exactly the case where the line is not a leftover.
-        if owner == me {
-            keep.push(line);
-            continue;
-        }
-        if !pid_alive_and_is_our_resonate(pid, port) {
-            // Dead, or the pid was recycled by something that is NOT our
-            // resonate server. Forget it either way — a stale ledger line must
-            // never accumulate — and do not signal it.
-            continue;
-        }
-        unsafe_free_signal(pid, TERM);
-        reaped += 1;
-    }
-    // Rewrite with the survivors, not a blind truncate. The dead and reaped lines
-    // go; the lines a LIVE process still owns stay, because their `ChildGuard`
-    // has not run `forget_spawn` yet. A blind drain here is how the reaper erased
-    // a sibling test's entry even when it left the process alone.
-    if keep.is_empty() {
-        let _ = std::fs::write(path, "");
-    } else {
-        let mut out = keep.join("\n");
-        out.push('\n');
-        let _ = std::fs::write(path, out);
-    }
-    if reaped > 0 {
-        eprintln!(
-            "toron testkit: reaped {reaped} orphaned resonate serve process(es) from a previous run"
-        );
-    }
-    reaped
-}
-
-/// Is the live process at `pid` still our `resonate serve` on `port`?
-///
-/// Two independent facts, because either alone can lie: the command line proves
-/// it is the right PROGRAM, and the recorded port proves it is the right
-/// INSTANCE. A recycled pid running something else fails the first; a different
-/// resonate on another port fails the second.
-fn pid_alive_and_is_our_resonate(pid: u32, port: u16) -> bool {
-    let Ok(out) = std::process::Command::new("ps")
-        .args(["-p", &pid.to_string(), "-o", "command="])
-        .output()
-    else {
-        return false;
-    };
-    if !out.status.success() {
-        return false;
-    }
-    identity_matches(&String::from_utf8_lossy(&out.stdout), port)
-}
-
-/// The pure identity core, split out so a fence can falsify it.
-///
-/// bd-yolv: my first version of the fence used a `sleep` stand-in, and it
-/// passed whether or not this function checked the PORT — because `sleep`
-/// already fails the program check, so the port check was never exercised. A
-/// green fence that cannot go red is worse than none, since it reads as
-/// coverage. Taking the cmdline as a parameter makes the port half testable
-/// with a plain string.
-#[must_use]
-pub fn identity_matches(cmdline: &str, port: u16) -> bool {
-    if !cmdline.contains("resonate") {
-        return false;
-    }
-    // The port must match as a WHOLE TOKEN. My first version used
-    // `contains(&format!("--server-port {port}"))`, and my own fence caught it:
-    // "--server-port 5555" contains "--server-port 55", so a recorded port 55
-    // would have matched — and killed — a server on 5555. A substring check on
-    // a number is a substring check on the wrong thing.
-    let want = format!("--server-port {port}");
-    cmdline
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .windows(2)
-        .any(|w| w[0] == "--server-port" && w[1] == port.to_string())
-        || cmdline.split_whitespace().any(|t| t == want)
-}
 
 /// bd-yolv: SIGTERM, sent by number because `std` exposes no portable
 /// `kill(2)` wrapper and this crate is `#![forbid(unsafe_code)]` — the whole
@@ -206,11 +43,8 @@ const TERM: i32 = 15;
 
 /// How long a child gets to exit on SIGTERM before SIGKILL.
 ///
-/// bd-yolv: this MUST exceed the server's own graceful-shutdown window or the
-/// SIGTERM is theatre. `resonate serve` ships `--server-shutdown-timeout` with a
-/// **10s** default, so a 2s grace would have SIGKILLed the server mid-shutdown —
-/// the exact outcome the SIGTERM was added to avoid, just slower to arrive. 12s
-/// clears the default with margin.
+/// bd-yolv: this MUST exceed a slow child's own drain window or the SIGTERM
+/// is theatre. 12s clears slow shutdowns with margin.
 ///
 /// The wait itself is not a cost: the loop returns the moment the child exits,
 /// so a well-behaved child still costs ~0ms. Only a WEDGED child pays the full
@@ -219,20 +53,16 @@ const KILL_GRACE: std::time::Duration = std::time::Duration::from_millis(12_000)
 
 /// A spawned child process that is killed and reaped when its scope ends.
 ///
-/// `std::process::Child` has no `Drop`. A harness that spawns a server and
+/// `std::process::Child` has no `Drop`. A harness that spawns a child and
 /// releases it with a trailing `kill()` therefore leaks the process on every
 /// path that skips that statement — a failing assertion, a panic, or a test
-/// binary cancelled mid-run. The orphan is reparented to init, keeps its
-/// sqlite file and its port, and nothing ever reaps it: 54 survivors holding
-/// 738 MB were measured on one host, every one of them `ppid=1`.
+/// binary cancelled mid-run. The orphan is reparented to init and nothing
+/// ever reaps it.
 ///
 /// Making the scope own the child releases it on the normal path, the panic
 /// path, and cancellation alike. `Child::kill` sends SIGKILL, which a child
 /// cannot ignore, and the following `wait` reaps the zombie — so a release is
 /// final rather than best-effort, and a test can assert on it.
-///
-/// Durable state is unaffected: the servers keep it on disk, so killing the
-/// process at scope end loses nothing a restart row depends on.
 #[derive(Debug)]
 pub struct ChildGuard(Option<Child>);
 
@@ -242,38 +72,35 @@ impl ChildGuard {
         Ok(Self(Some(cmd.spawn()?)))
     }
 
-    /// Spawn `resonate serve` (sqlite in `dir`, loopback only) as a guarded
-    /// child. Returns `None` when the `resonate` binary is absent, which is an
-    /// environmental skip on a runner without the stack, never a product
-    /// failure.
-    ///
-    /// bd-yolv: this is also where a PREVIOUS run's orphans get reaped. 72
-    /// `resonate serve` processes (948 MB, every one `ppid=1`) were measured on
-    /// one host. `ChildGuard` is correct — it has a real `Drop` — so the orphans
-    /// came from a run that was killed before `Drop` could run, and a
-    /// reparented process leaves no record of what it was. So this one records
-    /// what it spawns, and the next run cleans up after the last one.
+    /// Shrinking shim (bd-8w26): spawn `resonate serve` (sqlite in `dir`,
+    /// loopback only) as a guarded child. Returns `None` when the `resonate`
+    /// binary is absent. The spawn ledger and orphan reaper are gone with the
+    /// vendor harness; remaining callers (toron-workflow / toron-mcp tests
+    /// owned by other crews) go away in the deletion sweep, taking this shim
+    /// with them. Do NOT add new callers.
     pub fn resonate_serve(port: u16, dir: &Path) -> std::io::Result<Option<Self>> {
-        if !resonate_installed() {
-            return Ok(None);
+        if Command::new("resonate")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+        {
+            let mut cmd = Command::new("resonate");
+            cmd.args([
+                "serve",
+                "--storage-type",
+                "sqlite",
+                "--server-port",
+                &port.to_string(),
+                "--server-host",
+                "127.0.0.1",
+            ])
+            .current_dir(dir)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+            return Ok(Some(Self::spawn(&mut cmd)?));
         }
-        reap_orphaned_servers();
-        let mut cmd = Command::new("resonate");
-        cmd.args([
-            "serve",
-            "--storage-type",
-            "sqlite",
-            "--server-port",
-            &port.to_string(),
-            "--server-host",
-            "127.0.0.1",
-        ])
-        .current_dir(dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-        let guard = Self::spawn(&mut cmd)?;
-        record_spawn(guard.pid().unwrap_or(0), port);
-        Ok(Some(guard))
+        Ok(None)
     }
 
     /// The child's pid, for a caller that must report or probe it.
@@ -283,12 +110,11 @@ impl ChildGuard {
 
     /// Release the child now instead of at scope end. Idempotent.
     ///
-    /// bd-yolv: SIGTERM first, SIGKILL only as the backstop. `resonate serve`
-    /// ships `--server-shutdown-timeout` (default 10s), so it has a real
-    /// graceful-shutdown path — and `Child::kill()` is SIGKILL, which skips all
-    /// of it. A killed server leaves its sqlite file mid-write and never runs
-    /// whatever cleanup it does on the way out. The escalation is BOUNDED, so a
-    /// server wedged in shutdown cannot hang a test past [`KILL_GRACE`].
+    /// bd-yolv: SIGTERM first, SIGKILL only as the backstop. `Child::kill()`
+    /// is SIGKILL, which skips any graceful-shutdown path the child has — a
+    /// killed child leaves its files mid-write and never runs cleanup. The
+    /// escalation is BOUNDED, so a child wedged in shutdown cannot hang a
+    /// test past [`KILL_GRACE`].
     pub fn kill(&mut self) {
         if let Some(mut child) = self.0.take() {
             // SAFETY of the wait: `try_wait` in a bounded loop never blocks, so
@@ -308,7 +134,6 @@ impl ChildGuard {
             }
             let _ = child.kill();
             let _ = child.wait();
-            forget_spawn(pid);
         }
     }
 }
@@ -317,15 +142,6 @@ impl Drop for ChildGuard {
     fn drop(&mut self) {
         self.kill();
     }
-}
-
-/// Whether the `resonate` binary is on PATH and runnable.
-pub fn resonate_installed() -> bool {
-    Command::new("resonate")
-        .arg("--version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
 }
 
 /// Whether a pid names a process this host still knows about.
@@ -419,8 +235,7 @@ pub fn toron_command_clean(bin: impl AsRef<std::ffi::OsStr>) -> Command {
 mod tests {
     use super::*;
 
-    /// A scoped long-lived child, used as a stand-in for the resonate server
-    /// so the fence does not need the binary.
+    /// A scoped long-lived child, used as a release-assertion stand-in.
     fn sleeper() -> ChildGuard {
         let mut cmd = Command::new("sh");
         cmd.args(["-c", "sleep 300"]);
@@ -477,133 +292,8 @@ mod tests {
 mod bd_yolv_tests {
     use super::*;
 
-    /// bd-yolv: a recorded pid is killed ONLY when the live process at that
-    /// pid is still our `resonate serve` on the port we recorded.
-    ///
-    /// This is the safety property of the whole reaper, and it is the reason a
-    /// bare "kill the recorded pid" would be unacceptable: pids are RECYCLED, so
-    /// a ledger line read after the original died can name an unrelated process.
-    /// One that happens to be a real daemon. A recycled pid running something
-    /// else must fail the program check; a different resonate on another port
-    /// must fail the instance check.
-    #[test]
-    fn the_reaper_refuses_a_pid_that_is_not_our_resonate() {
-        // This very process is alive, is not resonate, and answers on no port.
-        let me = std::process::id();
-        assert!(
-            !pid_alive_and_is_our_resonate(me, 1),
-            "the reaper would signal a live non-resonate process ({me})"
-        );
-        // A pid that cannot exist fails closed rather than defaulting to "kill".
-        assert!(
-            !pid_alive_and_is_our_resonate(u32::MAX, 1),
-            "an impossible pid must fail closed"
-        );
-    }
-
-    /// The port is the instance identity. A real `resonate serve` pid paired
-    /// with the WRONG port is a different instance and must be left alone —
-    /// otherwise the reaper could kill a live server a concurrent test is using.
-    #[test]
-    fn the_reaper_checks_the_instance_not_just_the_program() {
-        // `sleep` stands in for any long-lived process: alive, wrong program.
-        let mut child = Command::new("sleep")
-            .arg("30")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn stand-in");
-        let pid = child.id();
-        assert!(
-            !pid_alive_and_is_our_resonate(pid, 1),
-            "pid {pid} is not resonate"
-        );
-        let _ = child.kill();
-        let _ = child.wait();
-    }
-
-    /// bd-yolv: a ledger line for a dead child must be FORGOTTEN, not kept.
-    /// A registry that only grows is the same unbounded-artifact defect as the
-    /// journal and audit files: it would accumulate one line per test run
-    /// forever, and a stale line is a future false positive.
-    #[test]
-    fn a_released_child_is_forgotten_and_a_dead_one_leaves_no_line() {
-        let _ = std::fs::remove_file(ledger_path());
-        record_spawn(4242, 5555);
-        assert!(
-            std::fs::read_to_string(ledger_path())
-                .unwrap()
-                .contains("4242")
-        );
-        forget_spawn(4242);
-        let after = std::fs::read_to_string(ledger_path()).unwrap_or_default();
-        assert!(
-            !after.contains("4242"),
-            "a released child must leave no line: {after:?}"
-        );
-        let _ = std::fs::remove_file(ledger_path());
-    }
-
-    /// Reaping must be a no-op, not a crash, when there is no ledger at all —
-    /// which is the state of every host that has never leaked.
-    #[test]
-    fn reaping_with_no_ledger_is_a_clean_no_op() {
-        let _ = std::fs::remove_file(ledger_path());
-        assert_eq!(
-            reap_orphaned_servers(),
-            0,
-            "nothing recorded, nothing to reap"
-        );
-    }
-
-    /// The recorded pid of 0 is meaningless and must never be signalled.
-    #[test]
-    fn a_zero_pid_is_never_recorded() {
-        let _ = std::fs::remove_file(ledger_path());
-        record_spawn(0, 1);
-        assert!(
-            !std::fs::read_to_string(ledger_path())
-                .unwrap_or_default()
-                .contains("0 1"),
-            "pid 0 names the process group, not a child; recording it would be a footgun"
-        );
-    }
-
-    /// bd-yolv: the port half of the identity check, which the `sleep`
-    /// stand-in could never reach. A live `resonate serve` on a DIFFERENT port
-    /// is a different instance — most likely a concurrent test's server — and
-    /// killing it would break a test that is passing.
-    #[test]
-    fn the_port_half_of_the_identity_check_is_falsifiable() {
-        let ours =
-            "resonate serve --storage-type sqlite --server-port 5555 --server-host 127.0.0.1";
-        let other =
-            "resonate serve --storage-type sqlite --server-port 6666 --server-host 127.0.0.1";
-        assert!(identity_matches(ours, 5555), "our own instance must match");
-        assert!(
-            !identity_matches(other, 5555),
-            "a resonate on another port is a DIFFERENT instance; the reaper must leave it alone"
-        );
-        assert!(!identity_matches(ours, 6666), "and the check is symmetric");
-        assert!(
-            !identity_matches("/usr/bin/sleep 30", 5555),
-            "wrong program"
-        );
-        assert!(
-            !identity_matches("", 5555),
-            "an unreadable cmdline fails closed"
-        );
-        // The port must match as a WHOLE number: a recorded 555 must not be
-        // satisfied by a server on 5555, which is a different instance.
-        assert!(
-            !identity_matches("resonate serve --server-port 5555", 55),
-            "a port prefix must not satisfy the check: 55 is not 5555"
-        );
-    }
-
-    /// bd-yolv: the release is SIGTERM first, so the server's own
-    /// `--server-shutdown-timeout` path actually runs. `Child::kill()` is
-    /// SIGKILL and skips all of it, leaving the sqlite file mid-write.
+    /// bd-yolv: the release is SIGTERM first, so a child's own shutdown path
+    /// actually runs. `Child::kill()` is SIGKILL and skips all of it.
     ///
     /// Observed, not asserted: a shell child traps SIGTERM and records that it
     /// arrived. A SIGKILL-only release leaves no such record, because the
@@ -654,11 +344,9 @@ mod bd_yolv_tests {
     }
 
     /// bd-yolv: the GRACE has to outlast a slow shutdown, and that is a number
-    /// worth verifying rather than arguing.
-    ///
-    /// `resonate serve` drains for `--server-shutdown-timeout` (10s default), so
-    /// a grace below that SIGKILLs the server mid-drain — the exact outcome the
-    /// SIGTERM exists to prevent. The stand-in here traps SIGTERM and then takes
+    /// worth verifying rather than arguing. A grace below a child's drain
+    /// window SIGKILLs it mid-drain — the exact outcome the SIGTERM exists
+    /// to prevent. The stand-in here traps SIGTERM and then takes
     /// `SLOW_SHUTDOWN` to finish, so a too-short grace kills it before it can
     /// record that it shut down cleanly.
     #[cfg(unix)]
@@ -667,13 +355,12 @@ mod bd_yolv_tests {
         const SLOW_SHUTDOWN: u64 = 2;
         assert!(
             KILL_GRACE > std::time::Duration::from_secs(SLOW_SHUTDOWN),
-            "grace {KILL_GRACE:?} is shorter than a {SLOW_SHUTDOWN}s shutdown, so a server \
+            "grace {KILL_GRACE:?} is shorter than a {SLOW_SHUTDOWN}s shutdown, so a child \
              that needs its full drain window is SIGKILLed mid-shutdown"
         );
         assert!(
             KILL_GRACE >= std::time::Duration::from_secs(10),
-            "resonate's own --server-shutdown-timeout defaults to 10s; a grace under that \
-             makes the SIGTERM pointless"
+            "a grace under 10s makes the SIGTERM pointless against slow drains"
         );
 
         let dir = std::env::temp_dir().join(format!("toron-slow-{}", std::process::id()));
@@ -700,89 +387,6 @@ mod bd_yolv_tests {
              KILL_GRACE={KILL_GRACE:?} does not outlast the shutdown"
         );
         assert!(!pid_is_alive(pid), "pid {pid} survived");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// bd-yolv: the reaper must not touch, signal, or FORGET a server that a
-    /// live process owns — including a SIBLING TEST's, since tests in one
-    /// binary run in parallel threads.
-    ///
-    /// Found by differential, not by reading: three approval tests failed under
-    /// default parallelism and passed with `--test-threads=1`, because each calls
-    /// `resonate_serve` (a real server) and a sibling's call reaped it. A reaper
-    /// pointed at your own children is worse than no reaper — it kills the work
-    /// instead of the litter.
-    ///
-    /// The ledger half needs NO resonate binary, so it cannot skip vacuously.
-    #[test]
-    fn a_live_owner_survives_the_reaper_and_keeps_its_ledger_line() {
-        // This fence gets its OWN ledger. The shared default is a single file by
-        // design, so two fences touching it concurrently cross-talk -- and I hit
-        // exactly that: the ledger fence passed alone and failed beside the live
-        // one. Same class as the bug it guards.
-        let mine = std::env::temp_dir().join(format!("toron-ledger-fence-{}", std::process::id()));
-        let _ = std::fs::remove_file(&mine);
-        let me = std::process::id();
-        // A line owned by THIS process, for a pid that is not a resonate server —
-        // so the identity check would reject it anyway, which is the point: the
-        // owner guard must be what saves it, and the line must remain.
-        record_spawn_in(&mine, 4242, 5555);
-        let reaped = reap_orphaned_servers_in(&mine);
-        assert_eq!(
-            reaped, 0,
-            "nothing here is a dead owner, so nothing may be reaped"
-        );
-        let after = std::fs::read_to_string(&mine).unwrap_or_default();
-        assert!(
-            after.contains("4242"),
-            "the reaper ERASED a line owned by a live process (this one): {after:?} — a blind \
-             drain loses a sibling test's record even when it leaves the process alone"
-        );
-        assert!(
-            after.contains(&me.to_string()),
-            "and the owner pid must be preserved so a later run can still tell it from a leftover"
-        );
-        forget_spawn_in(&mine, 4242);
-        let _ = std::fs::remove_file(&mine);
-    }
-
-    /// bd-yolv: and with a real binary, the live server itself survives. This half
-    /// skips where resonate is absent, so the ledger assertion above is the one
-    /// that always runs.
-    #[test]
-    fn the_reaper_never_kills_a_live_server_this_process_owns() {
-        let dir = std::env::temp_dir().join(format!("toron-sibling-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("dir");
-        if !resonate_installed() {
-            eprintln!("SKIP (no resonate binary): the ledger fence still ran above");
-            let _ = std::fs::remove_dir_all(&dir);
-            return;
-        }
-        let port = std::net::TcpListener::bind("127.0.0.1:0")
-            .expect("free port")
-            .local_addr()
-            .expect("addr")
-            .port();
-        let guard = ChildGuard::resonate_serve(port, &dir)
-            .expect("spawn")
-            .expect("resonate present");
-        let pid = guard.pid().expect("pid");
-        reap_orphaned_servers();
-        let alive = std::process::Command::new("kill")
-            .arg("-0")
-            .arg(pid.to_string())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        assert!(
-            alive,
-            "the reaper killed a server OWNED BY THIS PROCESS (pid {pid}); it cleans up after a \
-             KILLED run, and a live owner means the line is not a leftover"
-        );
-        drop(guard);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
