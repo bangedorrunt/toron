@@ -2,110 +2,46 @@
 // `spawn_await_failure`)
 #![forbid(unsafe_code)]
 
-//! SC-20 — `spawn` + `await: true` FAILS on the job's error event (Behavior
-//! Test Matrix row `spawn_await_failure`, ADR-0005 Spec 4a).
+//! SC-20 — `spawn` + `await: true` FAILS on the job's error (Behavior Test
+//! Matrix row `spawn_await_failure`, ADR-0005 Spec 4a).
 //!
-//! A spawn-await failure is NOT a decision: kind-43006 (job error) → the bus
-//! subscriber rejects the promise (`reject_spawn`) → the step FAILS → Spec 0
-//! propagates the failure (unlike `request_approval`, where rejection is a
-//! DECISION and the run continues).
+//! A spawn-await failure is NOT a decision: the mock launcher returns an
+//! error, the host feeds `spawn_failed`, and the fold lands
+//! `{ok:false, error}` under the step — Spec 0 propagates the failure
+//! (unlike `request_approval`, where rejection is a DECISION and the run
+//! continues). No server, no promise sink, no bus subscriber.
 //!
-//! Run: `cargo test -p toron-e2e --features p5 --test sc20_spawn_await_failure`
+//! Run: `cargo test -p toron-e2e --test sc20_spawn_await_failure`
 
-use toron_core::testkit::ChildGuard;
+#[path = "common/mod.rs"]
+mod common;
 
 use std::sync::Arc;
-use std::time::Duration;
 
-use toron_workflow::engine::{
-    AsyncEffectRunner, ProfileResolver, RunInput, WorkflowEngine, run_workflow,
-};
+use common::durable;
+use toron_core::kernel::OurEngine;
+use toron_workflow::engine::durable::{RunEffect, RunPhase};
+use toron_workflow::engine::durable_host::DurableRun;
+use toron_workflow::engine::spawn::{SpawnLauncher, SpawnSeams};
 use toron_workflow::schema::parse_workflow;
 
-fn noop_runner() -> AsyncEffectRunner {
-    Arc::new(|_: &toron_workflow::engine::ActionInvocation| {
-        Box::pin(async move { Ok(serde_json::Value::Null) })
+/// A launcher whose child FAILS (the job agent reports the error).
+fn failing_launcher() -> SpawnLauncher {
+    Arc::new(|_spec| {
+        Box::pin(async move {
+            Err(anyhow::anyhow!(
+                "docker-upgrade failed: health-gate timeout"
+            ))
+        })
             as std::pin::Pin<
                 Box<dyn std::future::Future<Output = anyhow::Result<serde_json::Value>> + Send>,
             >
     })
 }
 
-fn housekeeper_resolver() -> ProfileResolver {
-    Arc::new(|name: &str| {
-        if name == "@housekeeper" {
-            Some(serde_json::json!({
-                "npub": "npub1housekeeper",
-                "spec": { "harness": "pi", "model": "claude-sonnet-4", "backend": "hc" },
-            }))
-        } else {
-            None
-        }
-    })
-}
-
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .expect("bind")
-        .local_addr()
-        .expect("addr")
-        .port()
-}
-
-fn start_resonate_server(port: u16, dir: &std::path::Path) -> Option<ChildGuard> {
-    let server =
-        toron_core::testkit::ChildGuard::resonate_serve(port, dir).expect("spawn resonate serve");
-    if server.is_none() {
-        // GS-018: no `resonate` binary on this runner (herdr/resonate stack
-        // absent) — an environmental skip, not a product failure.
-        eprintln!("SKIP: no `resonate` binary (needs herdr/resonate stack)");
-    }
-    server
-}
-
-async fn wait_ready(url: &str) {
-    for _ in 0..100 {
-        let url = url.to_string();
-        if tokio::task::spawn_blocking(move || {
-            std::net::TcpStream::connect_timeout(
-                &url.replace("http://", "").parse().expect("addr"),
-                Duration::from_millis(200),
-            )
-            .is_ok()
-        })
-        .await
-        .unwrap_or(false)
-        {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    panic!("resonate server at {url} never became ready");
-}
-
 #[tokio::test]
 async fn sc20_spawn_await_fails_on_job_error() {
-    let dir = std::env::temp_dir().join(format!("toron-sc20-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let port = free_port();
-    let server_url = format!("http://127.0.0.1:{port}");
-    let Some(mut server) = start_resonate_server(port, &dir) else {
-        // GS-018: no `resonate` binary on this runner (herdr/resonate stack
-        // absent) — environmental skip, not a product failure. Real proof
-        // runs where the stack exists.
-        eprintln!("SKIP: no `resonate` binary (needs herdr/resonate stack; runs on dev machines)");
-        return;
-    };
-    wait_ready(&server_url).await;
-
-    // 1. Engine runs the workflow; the `spawn` step parks on the job promise.
-    let engine = WorkflowEngine::remote_with_resolvers_and_async_effect(
-        &server_url,
-        housekeeper_resolver(),
-        WorkflowEngine::default_workflow_resolver(),
-        Some(noop_runner()),
-    )
-    .expect("engine");
+    let (pool, db) = durable::test_pool("sc20").await;
     let wf = parse_workflow(
         r##"
 name: spawn-failure
@@ -121,61 +57,77 @@ steps:
 "##,
     )
     .expect("parse");
-    let input = RunInput {
-        run_id: Some("sc-test-run".into()),
-        workflow: wf,
-        trigger: serde_json::json!({}),
-    };
-    let handle = engine
-        .resonate()
-        .run("sc20-spawn-failure", run_workflow, input.clone())
-        .spawn()
-        .await
-        .expect("spawn run");
-
-    // 2. Capture the parked promise id from the spawn sink.
-    let promise_id = {
-        let mut got = None;
-        for _ in 0..200 {
-            tokio::time::sleep(Duration::from_millis(25)).await;
-            let mut sink = engine.spawn_sink().lock().await;
-            if let Some(id) = sink.pop() {
-                got = Some(id);
-                break;
-            }
-        }
-        got.expect("run parked on a spawn-await promise (kind-43001 pending)")
+    let trigger = serde_json::json!({});
+    let seams = SpawnSeams {
+        resolver: Some(common::housekeeper_resolver()),
+        launcher: Some(failing_launcher()),
     };
 
+    // 1. Open with seams: the spawn step prepares and parks (StartSpawn).
+    let (engine_store, journal, state) = durable::handles(&pool);
+    let (wf_open, trig_open) = (wf.clone(), trigger.clone());
+    let (run, effects) = tokio::task::spawn_blocking(move || {
+        let engine = OurEngine::with_journal(engine_store, journal);
+        DurableRun::open_with_seams(
+            engine,
+            state,
+            "sc20-spawn-failure",
+            wf_open,
+            trig_open,
+            durable::now_ms(),
+            &seams,
+        )
+    })
+    .await
+    .expect("open task")
+    .expect("open with launcher");
+    let [RunEffect::StartSpawn { node, spec }, ..] = effects.as_slice() else {
+        panic!("spawn step parks with StartSpawn: {effects:?}");
+    };
+    assert_eq!(node, "build");
     assert!(
-        !handle.done().await.expect("done"),
-        "run must be SUSPENDED (parked on the spawn-await), not done, before the error"
+        matches!(run.model().phase, RunPhase::AwaitingSpawn { .. }),
+        "run is genuinely SUSPENDED (not done) before the error"
     );
 
-    // 3. The job agent FAILS: kind-43006 arrives → the bus subscriber calls
-    //    reject_spawn (the 43006 side of the binding).
-    engine
-        .reject_spawn(&promise_id, "docker-upgrade failed: health-gate timeout")
+    // 2. The job agent FAILS: await the launcher (an error, not a decision)
+    //    and feed it through `spawn_failed`.
+    let error = failing_launcher()(spec.clone())
         .await
-        .expect("job error (kind-43006) rejects the spawn promise");
+        .expect_err("mock launcher fails");
+    let node = node.clone();
+    let (run, effects) = tokio::task::spawn_blocking(move || {
+        let mut run = run;
+        run.spawn_failed(&node, format!("{error:#}"), durable::now_ms())
+            .map(|eff| (run, eff))
+    })
+    .await
+    .expect("fail task")
+    .unwrap_or_else(|e| panic!("spawn_failed failed: {e}"));
+    let _ = effects;
+    drop(run);
 
-    // 4. The parked run resumes from its checkpoint: the step FAILED (not a
-    //    decision) — Spec 0 propagates the failure. The step output carries
-    //    ok:false with the job's error.
-    let output = handle
-        .result()
+    // 3. The parked run settled: the step FAILED (not a decision) — Spec 0
+    //    propagates the failure. The step output carries ok:false with the
+    //    job's error.
+    let state_store = toron_core::index::durable_workflow::WorkflowStateStore::new(pool.clone());
+    let json = state_store
+        .load("sc20-spawn-failure")
         .await
-        .expect("run completes after the job error (step failed, not hung)");
+        .expect("state read")
+        .expect("model row exists");
+    let model: serde_json::Value = serde_json::from_str(&json).expect("model parses");
     assert_eq!(
-        output["build"]["ok"], false,
-        "spawn-await failure fails the step, NOT a decision: {output}"
+        model["outputs"]["build"]["ok"], false,
+        "spawn-await failure fails the step, NOT a decision: {model}"
     );
-    let err = output["build"]["error"].as_str().unwrap_or_default();
+    let err = model["outputs"]["build"]["error"]
+        .as_str()
+        .unwrap_or_default();
     assert!(
         err.contains("health-gate timeout"),
         "the job's error surfaces in the step failure: {err}"
     );
 
-    server.kill();
-    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_file(&db);
 }

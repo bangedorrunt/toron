@@ -31,9 +31,11 @@ use std::time::Duration;
 use serde_json::Value;
 use sqlx::SqlitePool;
 use toron_core::index::schema;
+use toron_core::kernel::OurEngine;
 use toron_core::mailbox::Mailbox;
 use toron_core::nostr::identity::AgentProfile;
-use toron_workflow::engine::{RunInput, WorkflowEngine};
+use toron_workflow::engine::durable::RunEffect;
+use toron_workflow::engine::durable_host::DurableRun;
 use toron_workflow::schema::{Workflow, parse_workflow};
 use toron_workflow::stamp_workflow_emitted;
 
@@ -95,6 +97,77 @@ async fn setup(data_dir: &Path, project: &str, names: &[&str]) -> SqlitePool {
     pool
 }
 
+/// Drive one reaction workflow to terminal on the durable host (bd-i84w).
+async fn drive_reaction_workflow(
+    pool: &SqlitePool,
+    workflow: &Workflow,
+    trigger: serde_json::Value,
+    seams: &toron_workflow::engine::leaf::LeafSeams,
+) {
+    let run_id = format!("sc30-{}", uuid::Uuid::new_v4());
+    let digest = common::durable::digest(workflow);
+    let (engine_store, journal, state) = common::durable::handles(pool);
+    let (wf, trig_for_open) = (workflow.clone(), trigger.clone());
+    let (mut run, mut effects) = tokio::task::spawn_blocking(move || {
+        let engine = OurEngine::with_journal(engine_store, journal);
+        DurableRun::open(
+            engine,
+            state,
+            run_id,
+            wf,
+            trig_for_open,
+            common::durable::now_ms(),
+        )
+    })
+    .await
+    .expect("open task")
+    .expect("open reaction run");
+    loop {
+        if effects.is_empty() {
+            panic!("reaction drive ran out of effects while non-terminal");
+        }
+        let mut follow = Vec::new();
+        let mut done = false;
+        for effect in std::mem::take(&mut effects) {
+            match effect {
+                RunEffect::ExecuteStep { index, step } => {
+                    let mut outputs: serde_json::Map<String, serde_json::Value> =
+                        run.model().outputs.clone().into_iter().collect();
+                    let value = common::durable::run_step(
+                        "sc30-react",
+                        &workflow.name,
+                        &digest,
+                        &step,
+                        index,
+                        &trigger,
+                        &mut outputs,
+                        seams,
+                    )
+                    .await;
+                    let (back, mut eff) = tokio::task::spawn_blocking(move || {
+                        run.step_done(value, common::durable::now_ms())
+                            .map(|eff| (run, eff))
+                    })
+                    .await
+                    .expect("step feed task")
+                    .unwrap_or_else(|e| panic!("step feed failed: {e}"));
+                    run = back;
+                    follow.append(&mut eff);
+                }
+                RunEffect::Complete { .. } => {
+                    done = true;
+                    break;
+                }
+                other => panic!("unexpected reaction effect: {other:?}"),
+            }
+        }
+        if done {
+            break;
+        }
+        effects = follow;
+    }
+}
+
 /// Poll the shared bus store for kind-7 reactions matching the trigger, and
 /// run the workflow once per UNIQUE (target, emoji, author) — the idempotent
 /// trigger filter. Returns how many workflow actions fired.
@@ -130,8 +203,9 @@ async fn drain_reactions(
         if !seen.insert(format!("key|{key}")) {
             continue; // identical react → idempotent filter, no double-fire
         }
-        // Fire the reaction workflow (stamped async runner).
-        let engine = WorkflowEngine::local_with_async_effect_runner(Some(Arc::new(
+        // Fire the reaction workflow on the durable host (stamped async
+        // runner, temp-pool stores): open → one step → terminal. No server.
+        let seams = common::durable::seams(Arc::new(
             |inv: &toron_workflow::engine::ActionInvocation| {
                 let _ = stamp_workflow_emitted(vec![]);
                 let _ = &inv.action;
@@ -143,24 +217,14 @@ async fn drain_reactions(
                         >,
                     >
             },
-        )))
-        .expect("engine");
+        ));
         let payload = serde_json::json!({
             "kind": 7,
             "id": id,
             "pubkey": author,
             "content": emoji,
         });
-        let _ = engine
-            .run(
-                &format!("sc30-{id}"),
-                RunInput {
-                    run_id: Some("sc-test-run".into()),
-                    workflow: workflow.clone(),
-                    trigger: payload,
-                },
-            )
-            .await;
+        drive_reaction_workflow(pool, workflow, payload, &seams).await;
         fired.fetch_add(1, Ordering::SeqCst);
     }
 }

@@ -23,8 +23,6 @@ uuid = { version = "1", features = ["v4"] }
 anyhow = "1"
 sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio"] }
 serde_json = "1"
-resonate-sdk = "0.6"
-resonate-sdk-macros = "0.1"
 
 [dev-dependencies]
 toron-workflow = { path = "../toron-workflow" }

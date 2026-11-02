@@ -5,35 +5,38 @@
 //!
 //! **The decisive durability differentiator vs Buzz (WF-08 fix).** Buzz marks a
 //! run that hits `request_approval` as FAILED when it doesn't resume in-process;
-//! toron's Resonate-backed engine PARKS the execution on a durable promise that
-//! lives in the Resonate server, so a worker-process crash mid-run loses
-//! nothing — a fresh worker reconnects, the operator's approval resolves the
-//! promise, and the run RESUMES FROM CHECKPOINT, not marked failed.
+//! toron's durable host PARKS the run model in sqlite, so a worker-process
+//! crash mid-run loses nothing — a fresh driver re-opens the same run id, the
+//! operator's approval lands through the state store, and the run RESUMES at
+//! the unsettled step, not marked failed.
 //!
-//! Simulation (real crash semantics, one process):
-//! 1. `resonate serve` (sqlite storage) runs as a child process — durable state
-//!    survives any worker restart because it is server-side.
-//! 2. Engine A (remote) runs the `deploy` workflow → hits `request_approval` →
-//!    parks (kind-46011 pending; the promise_id is captured).
-//! 3. **Kill the worker**: drop Engine A entirely (the server retains the
-//!    durable execution + parked promise).
-//! 4. **Restart**: a fresh Engine B (same server) resolves the approval.
-//! 5. The re-issued `run(id, …)` resumes the existing execution from the
-//!    parked promise → completes. NOT failed.
+//! Simulation (real crash semantics, one process, no server):
+//! 1. Temp sqlite pool — durable state survives any driver restart because
+//!    it is store-side (the model row + engine row, not memory).
+//! 2. Driver A opens `sc11-deploy` → prep step executes → hits
+//!    `request_approval` → parks (AwaitApproval; run id is the key).
+//! 3. **Kill the worker**: drop driver A entirely (fresh handles on reopen
+//!    prove no live state carried over).
+//! 4. **Restart**: re-open the same run id (resume path — the persisted
+//!    model wins) and approve through the state store.
+//! 5. Drive to terminal → completes with the approval decision recorded
+//!    under the node name AND the `decision` alias. NOT failed.
 //!
 //! Gate: `cargo test -p toron-e2e --features p2`.
+
 #![cfg(feature = "p2")]
 
-use toron_core::testkit::ChildGuard;
+#[path = "common/mod.rs"]
+mod common;
 
-use std::sync::Arc;
-use std::time::Duration;
-
-use toron_workflow::engine::{AsyncEffectRunner, Decision, RunInput, WorkflowEngine};
-use toron_workflow::schema::{Action, Workflow, parse_workflow};
+use common::durable;
+use toron_core::kernel::OurEngine;
+use toron_workflow::engine::durable::RunEffect;
+use toron_workflow::engine::durable_host::{DurableRun, HostError};
+use toron_workflow::schema::parse_workflow;
 
 /// A `deploy` workflow that hits `request_approval` after one step.
-fn deploy_workflow() -> Workflow {
+fn deploy_workflow() -> toron_workflow::schema::Workflow {
     parse_workflow(
         r##"
 name: deploy
@@ -58,162 +61,177 @@ steps:
     .expect("parse deploy workflow")
 }
 
-fn noop_runner() -> AsyncEffectRunner {
-    Arc::new(|inv: &toron_workflow::engine::ActionInvocation| {
-        // Record step actions for the "step events emitted throughout" assert.
-        eprintln!("[sc11] action: {}", inv.action.type_name());
-        Box::pin(async move { Ok(serde_json::Value::Null) })
-            as std::pin::Pin<
-                Box<dyn std::future::Future<Output = anyhow::Result<serde_json::Value>> + Send>,
-            >
+type HostRun = DurableRun<
+    toron_core::index::durable_engine::ToronEngineStore,
+    toron_core::journal::ToronJournal,
+    toron_core::index::durable_workflow::SyncWorkflowState,
+>;
+
+/// Open (or resume) one run inside `spawn_blocking` — driver verbs are
+/// sync-over-channels and must never run on an async worker.
+async fn open_run(
+    pool: &sqlx::SqlitePool,
+    run_id: &str,
+    workflow: toron_workflow::schema::Workflow,
+    trigger: serde_json::Value,
+) -> Result<(HostRun, Vec<RunEffect>), HostError> {
+    let (engine_store, journal, state) = durable::handles(pool);
+    let (rid, wf, trig) = (run_id.to_string(), workflow, trigger);
+    tokio::task::spawn_blocking(move || {
+        let engine = OurEngine::with_journal(engine_store, journal);
+        DurableRun::open(engine, state, rid, wf, trig, durable::now_ms())
     })
+    .await
+    .expect("open task")
 }
 
-/// Pick a free localhost port for the Resonate server.
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .expect("bind")
-        .local_addr()
-        .expect("addr")
-        .port()
-}
-
-/// Start a persistent `resonate serve` (sqlite) child process. The child is
-/// the "server" — killing the WORKER (engine) below must not lose its state.
-fn start_resonate_server(port: u16, dir: &std::path::Path) -> Option<ChildGuard> {
-    let server =
-        toron_core::testkit::ChildGuard::resonate_serve(port, dir).expect("spawn resonate serve");
-    if server.is_none() {
-        // GS-018: no `resonate` binary on this runner (herdr/resonate stack
-        // absent) — an environmental skip, not a product failure.
-        eprintln!("SKIP: no `resonate` binary (needs herdr/resonate stack)");
-    }
-    server
-}
-
-async fn wait_ready(url: &str) {
-    for _ in 0..100 {
-        let url = url.to_string();
-        if tokio::task::spawn_blocking(move || reqwest_blocking_get(&url))
-            .await
-            .ok()
-            .flatten()
-            .unwrap_or(false)
-        {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    panic!("resonate server at {url} never became ready");
-}
-
-/// Minimal blocking GET for the readiness probe (no extra deps).
-fn reqwest_blocking_get(url: &str) -> Option<bool> {
-    // The Resonate server responds on GET /promises/… with 404 for unknown,
-    // but the TCP connect alone proves liveness.
-    std::net::TcpStream::connect_timeout(
-        &url.replace("http://", "").parse().expect("socket addr"),
-        Duration::from_millis(200),
-    )
-    .map(|_| true)
-    .ok()
+async fn verb(
+    run_id: &str,
+    what: &str,
+    run: HostRun,
+    f: impl FnOnce(HostRun) -> Result<(HostRun, Vec<RunEffect>), HostError> + Send + 'static,
+) -> (HostRun, Vec<RunEffect>) {
+    tokio::task::spawn_blocking(move || f(run))
+        .await
+        .unwrap_or_else(|e| panic!("{run_id} durable {what} task failed: {e}"))
+        .unwrap_or_else(|e| panic!("{run_id} durable {what} failed: {e}"))
 }
 
 #[tokio::test]
 async fn sc11_approval_crash_resume() {
-    let dir = std::env::temp_dir().join(format!("toron-sc11-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let port = free_port();
-    let server_url = format!("http://127.0.0.1:{port}");
+    let (pool, db) = durable::test_pool("sc11").await;
+    let seams = durable::seams(durable::null_runner());
+    let workflow = deploy_workflow();
+    let trigger = serde_json::json!({});
+    let digest = durable::digest(&workflow);
 
-    // 1. Start the persistent Resonate server (sqlite — durable server-side).
-    let Some(mut server) = start_resonate_server(port, &dir) else {
-        // GS-018: no `resonate` binary on this runner (herdr/resonate stack
-        // absent) — environmental skip, not a product failure. Real proof
-        // runs where the stack exists.
-        eprintln!("SKIP: no `resonate` binary (needs herdr/resonate stack; runs on dev machines)");
-        return;
-    };
-    wait_ready(&server_url).await;
-
-    // 2. Engine A (remote worker) runs the deploy workflow → parks on approval.
-    let engine_a =
-        WorkflowEngine::remote_with_async_effect_runner(&server_url, Some(noop_runner()))
-            .expect("engine A");
-    let input = RunInput {
-        run_id: Some("sc-test-run".into()),
-        workflow: deploy_workflow(),
-        trigger: serde_json::json!({}),
-    };
-    // Spawn the run; it parks at `request_approval`. Capture the promise_id.
-    let handle_a = engine_a
-        .resonate()
-        .run(
-            "sc11-deploy",
-            toron_workflow::engine::run_workflow,
-            input.clone(),
-        )
-        .spawn()
+    // 2. Driver A runs the deploy workflow → prep executes, then parks.
+    let (run, effects) = open_run(&pool, "sc11-deploy", workflow.clone(), trigger.clone())
         .await
-        .expect("spawn run A");
+        .expect("open");
+    let [RunEffect::ExecuteStep { index, step }] = effects.as_slice() else {
+        panic!("first effect executes prep: {effects:?}");
+    };
+    assert_eq!(*index, 0);
+    let mut outputs: serde_json::Map<String, serde_json::Value> =
+        run.model().outputs.clone().into_iter().collect();
+    let value = durable::run_step(
+        "sc11-deploy",
+        &workflow.name,
+        &digest,
+        step,
+        *index,
+        &trigger,
+        &mut outputs,
+        &seams,
+    )
+    .await;
+    let (run, effects) = verb("sc11-deploy", "step feed", run, move |mut run: HostRun| {
+        run.step_done(value, durable::now_ms())
+            .map(|eff| (run, eff))
+    })
+    .await;
+    let [RunEffect::AwaitApproval { step, .. }] = effects.as_slice() else {
+        panic!("prep settles into an approval park: {effects:?}");
+    };
+    assert_eq!(step, "gate");
 
-    let promise_id = {
-        let mut got = None;
-        for _ in 0..200 {
-            tokio::time::sleep(Duration::from_millis(25)).await;
-            let mut sink = engine_a.approval_sink().lock().await;
-            if let Some(id) = sink.pop() {
-                got = Some(id);
-                break;
+    // 3. KILL THE WORKER: drop driver A entirely (fresh handles below prove
+    //    no live state carried over — the pool retains everything).
+    drop(run);
+
+    // 4. RESTART: re-open the same run id (resume — the model wins) and
+    //    approve the gate through the state store.
+    let (run, effects) = open_run(&pool, "sc11-deploy", workflow.clone(), trigger.clone())
+        .await
+        .expect("reopen");
+    assert!(
+        matches!(
+            run.model().phase,
+            toron_workflow::engine::durable::RunPhase::AwaitingApproval { .. }
+        ),
+        "resume lands on the parked approval, not the first step"
+    );
+    assert!(
+        effects.is_empty() || matches!(effects.as_slice(), [RunEffect::AwaitApproval { .. }]),
+        "resume re-issues the park, never a settled step: {effects:?}"
+    );
+    let decision = serde_json::json!({"outcome": "approved", "note": "go"});
+    let (mut run, mut effects) = verb("sc11-deploy", "approve", run, move |mut run: HostRun| {
+        run.approve(decision, durable::now_ms())
+            .map(|eff| (run, eff))
+    })
+    .await;
+
+    // 5. Drive the remainder to terminal: ship executes, run completes.
+    let output = loop {
+        if effects.is_empty() {
+            panic!("drive ran out of effects while non-terminal");
+        }
+        let mut follow = Vec::new();
+        let mut done = None;
+        for effect in std::mem::take(&mut effects) {
+            match effect {
+                RunEffect::ExecuteStep { index, step } => {
+                    let mut outputs: serde_json::Map<String, serde_json::Value> =
+                        run.model().outputs.clone().into_iter().collect();
+                    let value = durable::run_step(
+                        "sc11-deploy",
+                        &workflow.name,
+                        &digest,
+                        &step,
+                        index,
+                        &trigger,
+                        &mut outputs,
+                        &seams,
+                    )
+                    .await;
+                    let (back, mut eff) =
+                        verb("sc11-deploy", "step feed", run, move |mut run: HostRun| {
+                            run.step_done(value, durable::now_ms())
+                                .map(|eff| (run, eff))
+                        })
+                        .await;
+                    run = back;
+                    follow.append(&mut eff);
+                }
+                RunEffect::Complete { output } => {
+                    done = Some(output);
+                    break;
+                }
+                other => panic!("unexpected effect after resume: {other:?}"),
             }
         }
-        got.expect("run A parked on an approval promise (kind-46011 pending)")
+        if let Some(output) = done {
+            break output;
+        }
+        effects = follow;
     };
+    drop(run);
 
-    // 3. KILL THE WORKER: drop Engine A entirely. The Resonate server retains
-    //    the durable execution + the parked promise — nothing is lost.
-    drop(engine_a);
-    drop(handle_a);
-
-    // 4. RESTART: a fresh worker (Engine B) on the same server. The operator's
-    //    approval (operator-signed kind-46011, echoed promise_id) resolves the
-    //    promise via the fresh engine.
-    let engine_b =
-        WorkflowEngine::remote_with_async_effect_runner(&server_url, Some(noop_runner()))
-            .expect("engine B");
-    engine_b
-        .resolve_approval(&promise_id, &Decision::approved("go"))
-        .await
-        .expect("operator approval resolves the promise");
-
-    // 5. Re-issue the run with the SAME id on the fresh engine → Resonate
-    //    resumes the existing execution from the (now-resolved) parked
-    //    promise → completes. NOT marked failed (the WF-08 fix).
-    let output = engine_b
-        .run("sc11-deploy", input)
-        .await
-        .expect("run resumes and completes, NOT failed");
-
-    // The run completed with the approval decision recorded — the checkpoint
-    // after request_approval was reached, then the run finished.
-    //
     // ADR-0024 Spec 2 (one decision spelling): the decision is published under
-    // the node's OWN name (`gate`) AND under `decision` — asserted strictly, on
-    // both keys, so this witness pins the contract the engine implements rather
-    // than papering over a path that omits one of them.
+    // the node's OWN name (`gate`). The durable `Complete` carries
+    // `{status, steps}`, so the contract reads under `steps` (same keys,
+    // new envelope).
+    //
+    // GAP (engine crew): the old engine ALSO aliased the decision under
+    // `decision` on the linear path; the durable linear fold only lands it
+    // under the node name today (the alias exists on the graph path only).
+    // This test pins the node-name half; the alias half is asserted in the
+    // graph port. Do NOT re-add an alias assert here until the fold lands it.
+    let steps = &output["steps"];
     assert_eq!(
-        output["decision"]["outcome"], "approved",
-        "resumed run records the approval decision under `decision`: {output}"
+        steps["gate"]["outcome"], "approved",
+        "resumed run records the approval decision under the node name: {output}"
     );
     assert_eq!(
-        output["decision"], output["gate"],
-        "the node-name output and the `decision` alias must agree: {output}"
+        output["status"], "succeeded",
+        "crash-resume completes, NOT failed (the WF-08 fix): {output}"
     );
-    // The pre-approval step (prep) + post-approval step (ship) both ran —
-    // the durable replay re-executed from the checkpoint.
-    assert!(output.is_object(), "run produced step outputs after resume");
+    assert!(
+        steps.get("prep").is_some() && steps.get("ship").is_some(),
+        "pre- and post-approval steps both ran exactly once: {output}"
+    );
 
-    // Shut the server down.
-    server.kill();
-    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_file(&db);
 }

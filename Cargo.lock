@@ -3974,8 +3974,6 @@ dependencies = [
  "anyhow",
  "nostr",
  "nostr-sdk",
- "resonate-sdk",
- "resonate-sdk-macros",
  "serde_json",
  "sqlx",
  "tokio",
