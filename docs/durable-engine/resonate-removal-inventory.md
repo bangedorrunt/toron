@@ -225,8 +225,9 @@ Live-server SKIP guards: **24 early-`return` points across 12 files**. Only
    sends linear workflows to `DurableRun`, and the daemon arms the resolution
    loop and the 30s restart sweep. Witnesses: `durable_sweep_resumes_a_parked_run_after_restart`,
    `restart_does_not_replay_a_settled_step`, `corrupt_durable_model_settles_failed_instead_of_retrying`.
-   Graphs, spawn, and control-flow actions still refuse before any row and
-   run on the old path. The standalone `toron-cli/src/workflow.rs` runner is
+   Graphs and spawn have since landed; the remaining control-flow actions
+   still refuse before any row and run on the old path. The standalone
+   `toron-cli/src/workflow.rs` runner is
    **not** ported yet: it still builds `WorkflowEngine` and is deferred until
    the graph model lands (its preflight already refuses approvals/spawn/control
    flow, so only the headless leaf/delay path needs the driver).
@@ -258,8 +259,8 @@ Live-server SKIP guards: **24 early-`return` points across 12 files**. Only
      is durable must wait for the model, not error.
    - **The park drain.** `PendingDrain` reads the engine's approval sink
      today; the durable path feeds it from `RunEffect::AwaitApproval`.
-     Spawn parks are untouched: the model refuses `spawn`, so `SpawnSink`
-     stays on the old path with the workflow.
+     Spawn parks no longer use `SpawnSink`: the launcher seam settles them
+     in-process (bd-spawn-launcher-flip-d8mv).
 6. **Delete server selection and the doctor check.** Files: `engine/mod.rs:52-238`,
    `operator.rs:500-681,701`, `toron-cli/tests/*`. **Decide first** what `doctor`
    reports for parked-run capability; deleting the check removes the only
@@ -291,8 +292,10 @@ parks + real terminal output (`ff76a76a`), the spawn park (`738c6693`), cron on
 `ElmCron` (`5ff72300`), the swarm loop off the substrate (`182cad35`), the
 launcher-seam spawn flip (`285cb536` + flywheel `23ecb7bb`; admission is
 capability-based, `durable_route(..., spawn_capable)`), loop status/doctor on
-local rows (`957b4c56`), and **flywheel's direct `resonate-sdk` dependency is
-gone** (`406dd6d9`).
+local rows (`957b4c56`), **flywheel's direct `resonate-sdk` dependency is
+gone** (`406dd6d9`), and **durable branch in the linear plan** (`9d0329d5`;
+`climb`/`cycle` rewrites and parallel/foreach/retry/call_workflow are the
+open control-flow queue).
 
 **Cannot remove yet:** the legacy engine still owns the control-flow shapes
 (branch/retry/parallel/foreach/loop/call_workflow/park). Flywheel's builtins
