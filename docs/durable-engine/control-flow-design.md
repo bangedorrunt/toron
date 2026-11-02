@@ -317,3 +317,83 @@ mid-flight and assert single execution on resume.
 7. `call_webhook` / `dispatch_job` / `send_dm` inside branch arms: those
    actions need their own port beads before the two toron workflows can
    move; who owns that order?
+
+## Captain review — 2026-11-02
+
+Approved with one architecture correction and the open questions answered.
+
+**Correction — the lowering target is not uniform**
+
+The draft lowers branch/parallel/foreach onto the graph. That breaks the two
+toron workflows, which spawn BEFORE they branch: a graph cannot admit a spawn
+node today, so lowering them to a graph would refuse the workflow for the
+wrong reason and leave `housekeeper-diagnose` on the vendor path.
+
+Approved split:
+
+- **branch** lowers into the **linear** model. A branch is a choice, not a
+  fan-out: expand the arms into the linear step plan at open, evaluate the
+  pure guard when the branch marker is reached, and run only the chosen
+  group. Spawn-before-branch keeps working because nothing leaves the linear
+  model. The chosen arm's steps are ordinary linear steps (no second
+  scheduler).
+- **parallel / foreach / retry / call_workflow** lower onto the **graph**
+  model, whose wave scheduler already is the fan-out/join engine.
+- A workflow that mixes a graph-lowered shape with `spawn` or with a linear
+  branch is refused WHOLE, with a named follow-up bead if a shipped workflow
+  ever needs the mix. The audit says none do: the crew compositions use
+  parallel + call_workflow (no spawn), the toron workflows use spawn + branch
+  (no parallel).
+- Do not add graph spawn/child-run nodes in this epic. If a real workflow
+  later needs them, that is a separate bead with its own witnesses; the
+  refusal above is the honest interim.
+
+**Answers**
+
+1. **call_workflow recursion:** audit the 22 before implementation; recursive
+   callees refuse (as drafted). Child runs stay the model even if all 22 are
+   acyclic — inline expansion would erase the callee's identity, evidence, and
+   blast radius, and the 22 include dynamically named children. No inline
+   optimization in this epic.
+2. **foreach list source:** trigger, inputs, AND upstream `outputs` are all
+   pure (the fold owns the map). The boundary is "no host I/O", not
+   "trigger-only". A list that needs a host read refuses.
+3. **loop:** the two shipped uses are flywheel builtins `climb`
+   (`max: {{inputs.max_iters}}`) and `cycle` (`max: {{inputs.max_iterations}}`),
+   both `until:` loops over `dispatch_job`. Rewrite each as a bounded guarded
+   SEQUENCE of that many repetitions (the max is a small integer default,
+   10 and 3), with each repetition guarded by the negated `until`. `loop`
+   stays refused permanently; the rewrites land in the loop bead.
+4. **guard purity:** the accepted grammar is exactly the template comparisons
+   the guard evaluator already resolves from trigger/inputs/outputs
+   (`{{ref}} <op> <literal>`, boolean combinations). Anything that reaches the
+   host — shell, env, clock, files — refuses before any row. Name the checker
+   in the branch bead and reuse it, never a second parser.
+5. **retry surface:** reuse the existing `Action::Retry { step, max_attempts,
+   backoff_secs }` fields read at schedule time. No schema migration and no
+   new policy field; a retry wrapper around a graph-lowered shape is itself a
+   refusal until that shape lands.
+6. **partial-wave join:** the join MUST NOT fire on a partial wave. Witness:
+   one copy settled, one pending, restart — the join effect is absent until
+   the pending copy settles, and no settled copy is re-dispatched.
+7. **actions inside arms:** `dispatch_job` and `send_dm` are HostSink leaves
+   and already sequencable, so `housekeeper-diagnose` is unblocked by branch
+   alone. `agent-reach-upgrade`'s fail-closed arm uses `call_webhook`, which
+   is Unsupported by contract — rewrite that arm to `send_dm` +
+   `on_error: fail_run`, do not port `call_webhook`. The branch bead owns that
+   workflow rewrite.
+
+**Implementation order (confirmed)**
+
+1. Branch (linear lowering) + the `agent-reach-upgrade` rewrite; housekeeper's
+   guard shape becomes durable.
+2. Parallel (graph fan-out + join), with the partial-wave join witness.
+3. Foreach on the same path.
+4. Retry policy on graph nodes.
+5. call_workflow child-run + join, after the recursion audit.
+6. Loop rewrites (`climb`, `cycle`); loop stays refused.
+
+Each bead inherits the uniform rules above: refusal before any row,
+model-first persistence, full failure carrier, restart-only-pending, and the
+whole-workflow rule. No shape ships with a partial-wave or double-dispatch
+hole.
