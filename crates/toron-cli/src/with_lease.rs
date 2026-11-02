@@ -216,6 +216,44 @@ async fn run(args: &ReserveWithLeaseArgs, dry_run: bool) -> anyhow::Result<u8> {
         }
     };
 
+    // Heartbeat: renew every half-TTL while the child runs. The TTL is now
+    // the reservation default (180 s), so without this a five-minute test run
+    // would silently lose its hold halfway through — the exact stale/phantom
+    // split this verb exists to prevent. A crashed wrapper stops renewing and
+    // the lease ages out in one TTL; a finished one releases in `release`.
+    let ttl = args
+        .ttl_secs
+        .unwrap_or(toron_core::mailbox::reservations::DEFAULT_RESERVATION_TTL_SECS);
+    // Half a TTL, renewed every half TTL: `renew` ADDS to the current expiry,
+    // so renewing by a full TTL would ratchet the lease to 2x the runtime and
+    // a crashed wrapper would hold its paths that much longer. Half-TTL keeps
+    // the expiry pinned near `now + ttl` for the whole run.
+    let extend = (ttl / 2).max(5);
+    let heartbeat = {
+        let project = args.project.clone();
+        let agent = args.agent.clone();
+        let paths = args.paths.clone();
+        let period = Duration::from_secs(extend);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(period).await;
+                match LeaseStore::resolve().await {
+                    Ok(store) => {
+                        if let Err(e) = store.renew(&project, &agent, &paths, extend).await {
+                            eprintln!(
+                                "toron reserve with-lease: heartbeat renew failed (the lease \
+                                 will expire within {ttl}s): {e:#}"
+                            );
+                        }
+                    }
+                    Err(e) => eprintln!(
+                        "toron reserve with-lease: heartbeat cannot reach the mailbox: {e:#}"
+                    ),
+                }
+            }
+        })
+    };
+
     let mut command = tokio::process::Command::new(&args.command[0]);
     command.args(&args.command[1..]);
     let mut child = match command.spawn() {
@@ -239,6 +277,7 @@ async fn run(args: &ReserveWithLeaseArgs, dry_run: bool) -> anyhow::Result<u8> {
     };
 
     let (code, signal) = wait_child(&mut signals, &mut child).await;
+    heartbeat.abort();
 
     // ALWAYS release — the one invariant. A release failure cannot pass as
     // success: it is printed loud and carried in the summary.
@@ -432,6 +471,38 @@ impl LeaseStore {
                         "ttl_seconds": args.ttl_secs,
                         "exclusive": true,
                         "reason": args.reason,
+                    }),
+                )
+                .await
+            }
+        }
+    }
+
+    /// Extend this agent's leases. The heartbeat path: a scoped command can
+    /// outlive the TTL, so the wrapper renews every half-TTL while it runs.
+    async fn renew(
+        &self,
+        project: &str,
+        agent: &str,
+        paths: &[String],
+        extend_secs: u64,
+    ) -> anyhow::Result<Value> {
+        match self {
+            Self::Embedded(mb) => Ok(mb
+                .renew_file_reservations(project, agent, paths, extend_secs)
+                .await?
+                .to_json()),
+            Self::Daemon(dc) => {
+                dc.call_tool(
+                    "renew_file_reservations",
+                    json!({
+                        "project_key": project,
+                        "agent_name": agent,
+                        "paths": paths,
+                        // The daemon tool's key is `extend_seconds`
+                        // (RenewFileReservationsArgs); `extend_secs` would leave
+                        // the arg at 0 and renew nothing.
+                        "extend_seconds": extend_secs,
                     }),
                 )
                 .await

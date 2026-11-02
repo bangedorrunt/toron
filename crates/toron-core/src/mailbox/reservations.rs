@@ -71,6 +71,16 @@ pub const INTENT_TTL_SECS: u64 = 5 * 60;
 /// Request-release escalation tier (ADR-0011 Spec 6): a request unanswered
 /// within this window escalates to a captain DM (kind-14, importance high).
 pub const REQUEST_RELEASE_TIER_WINDOW_SECS: u64 = 15 * 60;
+/// Default TTL for a HELD file lease (bd-lease-ttl-180s).
+///
+/// This was the envelope TTL (`DEFAULT_ENVELOPE_TTL_SECS`, 90 days) — an
+/// event-retention number used as a work-claim number. A crashed agent then
+/// blocked its paths for a quarter, and every cleanup was manual
+/// (`force-release`). A lease is a heartbeat, not a deed: 180 s is longer
+/// than an LLM turn plus a tool call, and `with-lease` renews every half-TTL
+/// while its command runs, so a live worker never loses a hold. A dead one
+/// frees the path inside three minutes.
+pub const DEFAULT_RESERVATION_TTL_SECS: u64 = 3 * 60;
 
 /// bd-lease-liveness-bo0g: session-liveness oracle for lease holders.
 /// Input = the holder's pubkey hex; output = true when that holder's
@@ -508,7 +518,7 @@ impl Mailbox {
             // per path. Granted publishes below; Denied maps to hard/soft.
             let now_us = Self::kernel_now_us();
             let (model, meta) = self.kernel_model_for(project_slug).await;
-            let ttl_us = ttl_secs.unwrap_or(crate::bus::DEFAULT_ENVELOPE_TTL_SECS);
+            let ttl_us = ttl_secs.unwrap_or(DEFAULT_RESERVATION_TTL_SECS);
             let blockers = Self::kernel_blockers_for(
                 &model,
                 &meta,
@@ -550,7 +560,7 @@ impl Mailbox {
             let mut tags =
                 with_project_scoping(toron_kind(FILE_RESERVATION), base, Some(project_slug));
             let ttl = EnvelopeTtl {
-                secs: Some(ttl_secs.unwrap_or(crate::bus::DEFAULT_ENVELOPE_TTL_SECS)),
+                secs: Some(ttl_secs.unwrap_or(DEFAULT_RESERVATION_TTL_SECS)),
             };
             let created = Timestamp::now();
             if let Some(exp) = ttl.expiration_tag(created) {
@@ -5117,6 +5127,36 @@ mod tests {
         assert!(rep.conflicts.is_empty(), "{:?}", rep.conflicts);
 
         let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// A lease taken with no explicit TTL must expire on the HEARTBEAT clock,
+    /// not the 90-day envelope clock: a crashed holder frees its paths in one
+    /// reservation TTL, and `with-lease` renews while it runs.
+    #[tokio::test]
+    async fn test_default_lease_ttl_is_the_reservation_heartbeat_not_the_envelope() {
+        let (mailbox, _db, data_dir) = test_mailbox("locks-default-ttl").await;
+        register(&mailbox, "demo", "BlueLake").await;
+        let before = Timestamp::now().as_secs() as i64;
+        mailbox
+            .file_reservation_paths("demo", "BlueLake", &["src/a.rs".into()], None, true, Some("bd-ttl"))
+            .await
+            .expect("acquire with the default TTL");
+        let row = mailbox
+            .active_reservations("demo")
+            .await
+            .expect("board")
+            .into_iter()
+            .find(|r| r.path_pattern == "src/a.rs")
+            .expect("the lease is on the board");
+        let expires_secs = row.expires_ts_us.expect("default TTL stamps an expiry") / 1_000_000;
+        let window = expires_secs - before;
+        assert!(
+            (DEFAULT_RESERVATION_TTL_SECS as i64 - 5..=DEFAULT_RESERVATION_TTL_SECS as i64 + 5)
+                .contains(&window),
+            "default TTL must be {}s, saw {window}s",
+            DEFAULT_RESERVATION_TTL_SECS
+        );
         let _ = std::fs::remove_dir_all(&data_dir);
     }
 

@@ -893,7 +893,7 @@ pub struct ReserveAcquireArgs {
     /// Agent acquiring the leases.
     #[arg(long = "as", required = true)]
     pub agent: String,
-    /// Lease TTL in seconds (default envelope TTL).
+    /// Lease TTL in seconds (default 180; a hold is a heartbeat, not a deed).
     #[arg(long)]
     pub ttl_secs: Option<u64>,
     /// Exclusive leases block other agents.
@@ -945,8 +945,9 @@ pub struct ReserveRenewArgs {
     /// Agent holding the leases.
     #[arg(long = "as", required = true)]
     pub agent: String,
-    /// Seconds to extend each lease's TTL.
-    #[arg(long, required = true)]
+    /// Seconds to extend each lease's TTL (default: the reservation TTL,
+    /// 180 s). A heartbeat call is therefore `reserve renew --project P --as X`.
+    #[arg(long, default_value_t = toron_core::mailbox::reservations::DEFAULT_RESERVATION_TTL_SECS)]
     pub extend_secs: u64,
 }
 
@@ -1127,9 +1128,9 @@ pub struct ReserveWithLeaseArgs {
     /// before refusing (0 = refuse on the first conflict).
     #[arg(long, default_value_t = 60)]
     pub wait_secs: u64,
-    /// Lease TTL in seconds (default envelope TTL). The wrapper still
-    /// releases when the command finishes first; a command that outlives the
-    /// TTL loses its hold and takes the sweep's staleness path.
+    /// Lease TTL in seconds (default 180). The wrapper renews every half-TTL
+    /// while the command runs and always releases after it, so the TTL bounds
+    /// a CRASH, never a long command.
     #[arg(long)]
     pub ttl_secs: Option<u64>,
     /// The command to run while the leases are held (everything after `--`).
@@ -1194,7 +1195,7 @@ pub struct AgentBootstrapArgs {
     /// Exclusive leases block other agents.
     #[arg(long)]
     pub exclusive: bool,
-    /// Lease TTL in seconds (default envelope TTL).
+    /// Lease TTL in seconds (default 180; a hold is a heartbeat, not a deed).
     #[arg(long)]
     pub ttl_secs: Option<u64>,
     /// Harness/program for the 30013 profile (optional).
@@ -1238,7 +1239,7 @@ pub struct SlotAcquireArgs {
     /// Agent acquiring the slot.
     #[arg(long = "as", required = true)]
     pub agent: String,
-    /// Lease TTL in seconds (default envelope TTL).
+    /// Lease TTL in seconds (default 180; a hold is a heartbeat, not a deed).
     #[arg(long)]
     pub ttl_secs: Option<u64>,
     /// Exclusive lease (serializes against any holder).
