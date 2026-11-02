@@ -133,6 +133,9 @@ pub struct GraphNodeStep<'a> {
     pub trigger: &'a serde_json::Value,
     /// The spawn-time outputs snapshot this node renders against.
     pub inputs: &'a serde_json::Map<String, serde_json::Value>,
+    /// The foreach item this copy renders as `{{item}}`, when it is one
+    /// (bd-durable-foreach-jpgx).
+    pub item: Option<&'a serde_json::Value>,
 }
 
 /// Run one graph node to a value.
@@ -141,9 +144,22 @@ pub struct GraphNodeStep<'a> {
 /// invocation, partition, one dispatch — so a node reaches the same verdict on
 /// either substrate.
 pub async fn run_graph_node_step(input: GraphNodeStep<'_>, seams: &LeafSeams) -> serde_json::Value {
+    // A foreach copy renders against the enclosing trigger plus its item,
+    // exactly like `run_foreach`'s per-iteration trigger copy.
+    let mut iter_trigger;
+    let trigger = match input.item {
+        Some(item) => {
+            iter_trigger = input.trigger.clone();
+            if let Some(obj) = iter_trigger.as_object_mut() {
+                obj.insert("item".into(), item.clone());
+            }
+            &iter_trigger
+        }
+        None => input.trigger,
+    };
     match evaluate_step_guard(
         input.node.guard.as_deref(),
-        input.trigger,
+        trigger,
         input.inputs,
         input.node_name,
     )
@@ -160,7 +176,7 @@ pub async fn run_graph_node_step(input: GraphNodeStep<'_>, seams: &LeafSeams) ->
     // unresolvable ref fails HERE with workflow/node/field/ref attribution
     // rather than reaching a runner as a verbatim placeholder.
     let render_ctx = RenderContext::new(input.workflow, input.node_name);
-    let action = match render_action(&input.node.action, input.trigger, input.inputs, &render_ctx) {
+    let action = match render_action(&input.node.action, trigger, input.inputs, &render_ctx) {
         Ok(action) => action,
         Err(e) => {
             return serde_json::json!({ "ok": false, "error": format!("render: {e}") });
@@ -209,6 +225,60 @@ mod tests {
 
     /// The runner sees a RENDERED action and a fully-populated invocation: this
     /// is the surface the durable host hands its journal.
+    /// bd-durable-foreach-jpgx: a foreach copy renders `{{item}}` from its
+    /// per-copy item, exactly like `run_foreach`'s iteration trigger.
+    #[tokio::test]
+    async fn graph_node_renders_the_foreach_item() {
+        let step = send_dm("item={{item.name}}");
+        let node = crate::schema::GraphNode {
+            action: step.action.clone(),
+            needs: Vec::new(),
+            guard: None,
+            on_error: StepOnError::Continue,
+            build_slot: false,
+        };
+        let trigger = serde_json::json!({ "source": "test" });
+        let inputs = serde_json::Map::new();
+        let seen: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let slot = Arc::clone(&seen);
+        let seams = LeafSeams {
+            async_runner: Some(Arc::new(move |inv: &ActionInvocation| {
+                let slot = Arc::clone(&slot);
+                let body = match &inv.action {
+                    Action::SendDm { body, .. } => body.clone(),
+                    other => panic!("runner saw {}", other.type_name()),
+                };
+                Box::pin(async move {
+                    *slot.lock().expect("slot") = Some(body);
+                    Ok(serde_json::json!({ "ok": true, "sent": true }))
+                })
+            })),
+            ..LeafSeams::default()
+        };
+        let item = serde_json::json!({ "name": "alpha" });
+        let value = run_graph_node_step(
+            GraphNodeStep {
+                run_id: "run-foreach",
+                workflow: "foreach-wf",
+                workflow_digest: "digest",
+                node_name: "fan:0",
+                node: &node,
+                attempt: 1,
+                trigger: &trigger,
+                inputs: &inputs,
+                item: Some(&item),
+            },
+            &seams,
+        )
+        .await;
+        assert_eq!(value["ok"], serde_json::json!(true));
+        assert_eq!(
+            seen.lock().expect("seen").as_deref(),
+            Some("item=alpha"),
+            "the copy saw its own item"
+        );
+    }
+
     #[tokio::test]
     async fn dispatches_a_rendered_action_with_the_invocation_shape() {
         let step = send_dm("{{trigger.payload}}");

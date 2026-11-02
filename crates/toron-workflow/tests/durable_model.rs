@@ -1539,9 +1539,9 @@ fn parallel_refuses_mixes_and_unsequencable_copies() {
     ]);
     assert!(needs_graph_model(&mixed));
     let reason = unsupported_reason(&mixed).expect("the mix refuses");
-    assert!(reason.contains("mixes parallel"), "{reason}");
+    assert!(reason.contains("mixes fan-out"), "{reason}");
     let reason = durable_graph(&mixed, &json!({})).expect_err("lowering refuses the mix");
-    assert!(reason.contains("mixes parallel"), "{reason}");
+    assert!(reason.contains("mixes fan-out"), "{reason}");
 
     // Mix: branch + parallel (the linear branch is the same refusal).
     let mixed = workflow(vec![
@@ -1559,7 +1559,7 @@ fn parallel_refuses_mixes_and_unsequencable_copies() {
         ),
     ]);
     let reason = durable_graph(&mixed, &json!({})).expect_err("branch + parallel refuses");
-    assert!(reason.contains("mixes parallel"), "{reason}");
+    assert!(reason.contains("mixes fan-out"), "{reason}");
 
     // Unsequencable copy action.
     let bad = workflow(vec![parallel(
@@ -1598,4 +1598,241 @@ fn parallel_refuses_mixes_and_unsequencable_copies() {
         durable_graph(&unresolvable, &json!({"inputs": {"n": 2}})).is_ok(),
         "a trigger-carried count resolves at open"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Foreach on the shared fan-out path (bd-durable-foreach-jpgx)
+// ---------------------------------------------------------------------------
+
+fn foreach_step(name: &str, over: &str, each: Step, on_error: StepOnError) -> Step {
+    Step {
+        name: Some(name.into()),
+        guard: None,
+        on_error,
+        build_slot: false,
+        action: Action::Foreach {
+            over: over.into(),
+            each: Box::new(each),
+        },
+    }
+}
+
+fn foreach_workflow(
+    over: &str,
+    item_on_error: StepOnError,
+    join_on_error: StepOnError,
+) -> Workflow {
+    workflow(vec![
+        foreach_step(
+            "fan",
+            over,
+            named("copy", dm("copy"), item_on_error),
+            join_on_error,
+        ),
+        named("after", dm("after"), StepOnError::Continue),
+    ])
+}
+
+fn with_items() -> serde_json::Value {
+    json!({"inputs": {"items": ["a", "b", "c"]}})
+}
+
+fn dispatched_items(effects: &[GraphEffect]) -> Vec<Option<serde_json::Value>> {
+    effects
+        .iter()
+        .filter_map(|e| match e {
+            GraphEffect::ExecuteNode { item, .. } => Some(item.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The list expands into one named node per item, all in one wave, each
+/// carrying its item.
+#[test]
+fn foreach_expands_list_to_named_nodes() {
+    let model = lowered_model(
+        "run-foreach",
+        foreach_workflow(
+            "{{inputs.items}}",
+            StepOnError::Continue,
+            StepOnError::Continue,
+        ),
+        with_items(),
+    );
+    assert!(
+        needs_graph_model(&model.workflow),
+        "a foreach body routes to the graph model"
+    );
+    let (model, effects) = advance_graph(&model, &GraphMsg::Start { now_ms: 1_000 });
+    assert_eq!(executed(&effects), ["fan:0", "fan:1", "fan:2"]);
+    assert_eq!(
+        dispatched_items(&effects),
+        [Some(json!("a")), Some(json!("b")), Some(json!("c"))]
+    );
+    assert!(
+        effects
+            .iter()
+            .all(|e| matches!(e, GraphEffect::ExecuteNode { wave: 1, .. })),
+        "one wave: {effects:?}"
+    );
+    assert_eq!(model.items["fan:1"], json!("b"));
+
+    let (model, effects) = settle_copies(
+        &model,
+        &["fan:0", "fan:1", "fan:2"],
+        json!({"ok": true}),
+        2_000,
+    );
+    assert_eq!(
+        executed(&effects),
+        ["after"],
+        "the join waits for every item"
+    );
+    assert_eq!(
+        model.outputs["fan"],
+        json!([{"ok": true}, {"ok": true}, {"ok": true}])
+    );
+}
+
+/// A restart keeps the settled items and the per-copy item data; only the
+/// pending copies re-issue.
+#[test]
+fn foreach_restart_keeps_settled_items() {
+    let model = lowered_model(
+        "run-foreach-restart",
+        foreach_workflow(
+            "{{inputs.items}}",
+            StepOnError::Continue,
+            StepOnError::Continue,
+        ),
+        with_items(),
+    );
+    let (model, _) = advance_graph(&model, &GraphMsg::Start { now_ms: 1_000 });
+    let (model, _) = settle_copies(&model, &["fan:0"], json!({"ok": true, "i": 0}), 2_000);
+
+    let restored: GraphModel =
+        serde_json::from_str(&serde_json::to_string(&model).expect("serialize")).expect("restore");
+    let effects = resume_graph_effects(&restored);
+    assert_eq!(executed(&effects), ["fan:1", "fan:2"]);
+    assert_eq!(
+        dispatched_items(&effects),
+        [Some(json!("b")), Some(json!("c"))],
+        "the item data survives the restart"
+    );
+    assert_eq!(restored.outputs["fan:0"], json!({"ok": true, "i": 0}));
+    assert_eq!(restored.items["fan:2"], json!("c"));
+}
+
+/// An item failure applies the copy's `on_error`; the join's `fail_run` turns
+/// the collected envelope into a failed run.
+#[test]
+fn foreach_item_failure_applies_on_error() {
+    let bundle = json!({"ok": false, "kind": "timeout", "error": "item timed out"});
+    let model = lowered_model(
+        "run-foreach-fail",
+        foreach_workflow(
+            "{{inputs.items}}",
+            StepOnError::Continue,
+            StepOnError::Continue,
+        ),
+        with_items(),
+    );
+    let (model, _) = advance_graph(&model, &GraphMsg::Start { now_ms: 1_000 });
+    let (model, _) = settle_copies(&model, &["fan:0"], bundle.clone(), 2_000);
+    let (model, effects) = settle_copies(&model, &["fan:1", "fan:2"], json!({"ok": true}), 3_000);
+    assert_eq!(
+        executed(&effects),
+        ["after"],
+        "continue keeps the run going"
+    );
+    let collected = &model.outputs["fan"];
+    assert_eq!(collected["ok"], json!(false));
+    assert_eq!(collected["error"], json!("item timed out"));
+    assert_eq!(collected["results"][0], bundle);
+
+    // The join's fail_run fails the run with the item's kind.
+    let model = lowered_model(
+        "run-foreach-fail-run",
+        foreach_workflow(
+            "{{inputs.items}}",
+            StepOnError::Continue,
+            StepOnError::FailRun,
+        ),
+        with_items(),
+    );
+    let (model, _) = advance_graph(&model, &GraphMsg::Start { now_ms: 1_000 });
+    let (model, _) = settle_copies(&model, &["fan:0"], bundle, 2_000);
+    let (model, effects) = settle_copies(&model, &["fan:1", "fan:2"], json!({"ok": true}), 3_000);
+    let [GraphEffect::Fail { fail }] = effects.as_slice() else {
+        panic!("the join's fail_run fails the run: {effects:?}");
+    };
+    assert_eq!(fail.node, "fan");
+    assert_eq!(fail.kind, "timeout");
+    assert!(matches!(model.phase, GraphPhase::Failed { .. }));
+}
+
+/// A list that cannot be materialized refuses whole before any row: a
+/// non-list source, a missing open-resolvable value, and an iterator that
+/// names a step which is not upstream.
+#[test]
+fn foreach_unmaterializable_iterator_refuses_without_row() {
+    // Literal, but not a list.
+    let wf = foreach_workflow("42", StepOnError::Continue, StepOnError::Continue);
+    let reason = durable_graph(&wf, &json!({})).expect_err("a number is not a list");
+    assert!(reason.contains("must resolve to a list"), "{reason}");
+
+    // A trigger value that is not a list.
+    let wf = foreach_workflow("{{inputs.n}}", StepOnError::Continue, StepOnError::Continue);
+    let reason =
+        durable_graph(&wf, &json!({"inputs": {"n": 3}})).expect_err("a count is not a list");
+    assert!(reason.contains("must resolve to a list"), "{reason}");
+
+    // A trigger ref that does not resolve at open.
+    let reason = durable_graph(&wf, &json!({})).expect_err("missing list");
+    assert!(reason.contains("does not resolve at open"), "{reason}");
+
+    // A non-template, non-JSON spelling.
+    let wf = foreach_workflow("not a list", StepOnError::Continue, StepOnError::Continue);
+    let reason = durable_graph(&wf, &json!({})).expect_err("not a ref");
+    assert!(reason.contains("must be a JSON list"), "{reason}");
+
+    // Upstream output: allowed only for an EARLIER step.
+    let upstream = workflow(vec![
+        named("plan", dm("plan"), StepOnError::Continue),
+        foreach_step(
+            "fan",
+            "{{steps.plan.items}}",
+            named("copy", dm("copy"), StepOnError::Continue),
+            StepOnError::Continue,
+        ),
+    ]);
+    assert!(
+        durable_graph(&upstream, &json!({})).is_ok(),
+        "an upstream list is materialized by the fold"
+    );
+    let forward = workflow(vec![
+        foreach_step(
+            "fan",
+            "{{steps.later.items}}",
+            named("copy", dm("copy"), StepOnError::Continue),
+            StepOnError::Continue,
+        ),
+        named("later", dm("later"), StepOnError::Continue),
+    ]);
+    let reason = durable_graph(&forward, &json!({})).expect_err("not earlier");
+    assert!(reason.contains("not an earlier step"), "{reason}");
+
+    // The mix with spawn refuses whole (same rule as parallel).
+    let mixed = workflow(vec![
+        named("spawn_it", spawn_action(true, 600), StepOnError::Continue),
+        foreach_step(
+            "fan",
+            "{{inputs.items}}",
+            named("copy", dm("copy"), StepOnError::Continue),
+            StepOnError::Continue,
+        ),
+    ]);
+    let reason = durable_graph(&mixed, &json!({})).expect_err("the mix refuses");
+    assert!(reason.contains("mixes fan-out with 'spawn'"), "{reason}");
 }

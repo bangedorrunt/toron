@@ -622,6 +622,7 @@ async fn graph_diamond_runs_each_node_once_on_the_driver() {
                     attempt: 1,
                     trigger: &json!({}),
                     inputs: &snapshot,
+                    item: None,
                 },
                 &seams,
             )
@@ -1544,7 +1545,7 @@ async fn parallel_refusals_leave_no_row() {
         ),
     ]);
     let cases = [
-        ("run-parallel-mixed", mixed, "mixes parallel"),
+        ("run-parallel-mixed", mixed, "mixes fan-out"),
         (
             "run-parallel-count",
             fanout_workflow("{{inputs.n}}"),
@@ -1587,4 +1588,209 @@ async fn parallel_refusals_leave_no_row() {
     );
     assert!(engine.query("run-parallel-mixed").is_err());
     assert!(engine.query("run-parallel-count").is_err());
+}
+
+// ---------------------------------------------------------------------------
+// Foreach on the shared fan-out path (bd-durable-foreach-jpgx)
+// ---------------------------------------------------------------------------
+
+fn foreach_step(name: &str, over: &str, each: Step, on_error: StepOnError) -> Step {
+    Step {
+        name: Some(name.into()),
+        guard: None,
+        on_error,
+        build_slot: false,
+        action: Action::Foreach {
+            over: over.into(),
+            each: Box::new(each),
+        },
+    }
+}
+
+fn foreach_workflow(over: &str) -> Workflow {
+    workflow(vec![
+        foreach_step(
+            "fan",
+            over,
+            Step {
+                name: Some("copy".into()),
+                guard: None,
+                on_error: StepOnError::Continue,
+                build_slot: false,
+                action: dm("copy"),
+            },
+            StepOnError::Continue,
+        ),
+        named("after", dm("after"), StepOnError::Continue),
+    ])
+}
+
+fn item_carrying(effects: &[GraphEffect]) -> Vec<(String, Option<serde_json::Value>)> {
+    effects
+        .iter()
+        .filter_map(|e| match e {
+            GraphEffect::ExecuteNode { node, item, .. } => Some((node.clone(), item.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Through the store: the list expands, a restart keeps the settled item and
+/// its per-copy data, and only the pending item re-issues.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn foreach_restart_keeps_settled_items() {
+    let path = unique_db("foreach-restart");
+    let pool = connect(path.to_str().expect("path"))
+        .await
+        .expect("connect");
+    migrate(&pool).await.expect("migrate");
+    let handle = tokio::runtime::Handle::current();
+    let trigger = json!({"inputs": {"items": ["a", "b"]}});
+
+    let phase_one = {
+        let pool = pool.clone();
+        let state = SyncWorkflowState::spawn(pool.clone(), &handle);
+        let handle = handle.clone();
+        let trigger = trigger.clone();
+        tokio::task::spawn_blocking(move || -> Result<GraphModel, HostError> {
+            let engine = OurEngine::with_journal(
+                ToronEngineStore::spawn(pool.clone(), &handle),
+                ToronJournal::spawn(JournalDb::new(pool, "foreach", 64), &handle),
+            );
+            let (mut run, effects) = DurableGraphRun::open(
+                engine,
+                state,
+                "run-foreach",
+                foreach_workflow("{{inputs.items}}"),
+                trigger,
+                1_000,
+            )?;
+            assert_eq!(
+                item_carrying(&effects),
+                [
+                    ("fan:0".to_string(), Some(json!("a"))),
+                    ("fan:1".to_string(), Some(json!("b"))),
+                ]
+            );
+            let effects = run.node_done("fan:0", json!({"ok": true, "i": 0}), 2_000)?;
+            assert!(effects.is_empty(), "still mid-wave: {effects:?}");
+            Ok(run.model().clone())
+        })
+        .await
+        .expect("join")
+        .expect("phase one")
+    };
+    assert_eq!(phase_one.outputs["fan:0"], json!({"ok": true, "i": 0}));
+    assert_eq!(phase_one.items["fan:1"], json!("b"));
+
+    let (mut run, effects) = {
+        let pool = pool.clone();
+        let state = SyncWorkflowState::spawn(pool.clone(), &handle);
+        let handle = handle.clone();
+        tokio::task::spawn_blocking(move || {
+            let engine = OurEngine::with_journal(
+                ToronEngineStore::spawn(pool.clone(), &handle),
+                ToronJournal::spawn(JournalDb::new(pool, "foreach", 64), &handle),
+            );
+            DurableGraphRun::open(
+                engine,
+                state,
+                "run-foreach",
+                foreach_workflow("{{inputs.items}}"),
+                json!({}),
+                3_000,
+            )
+        })
+        .await
+        .expect("join")
+        .expect("reopen")
+    };
+    assert_eq!(
+        item_carrying(&effects),
+        [("fan:1".to_string(), Some(json!("b")))],
+        "only the pending item re-issues, with its item"
+    );
+
+    let effects = run
+        .node_done("fan:1", json!({"ok": true, "i": 1}), 4_000)
+        .expect("settle the last item");
+    assert_eq!(executed_nodes(&effects), ["after"]);
+    assert_eq!(
+        run.model().outputs["fan"],
+        json!([{"ok": true, "i": 0}, {"ok": true, "i": 1}])
+    );
+    let effects = run
+        .node_done("after", json!({"ok": true, "sent": true}), 5_000)
+        .expect("settle the last step");
+    let [GraphEffect::Complete { output }] = effects.as_slice() else {
+        panic!("the run completes: {effects:?}");
+    };
+    assert_eq!(
+        output["fan"],
+        json!([{"ok": true, "i": 0}, {"ok": true, "i": 1}])
+    );
+    assert_eq!(run.model().phase, GraphPhase::Succeeded);
+}
+
+/// A list that cannot be materialized refuses whole: no state row, no engine
+/// row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn foreach_unmaterializable_iterator_refuses_without_row() {
+    let path = unique_db("foreach-refused");
+    let pool = connect(path.to_str().expect("path"))
+        .await
+        .expect("connect");
+    migrate(&pool).await.expect("migrate");
+    let handle = tokio::runtime::Handle::current();
+
+    let cases = [
+        (
+            "run-foreach-number",
+            foreach_workflow("42"),
+            json!({}),
+            "must resolve to a list",
+        ),
+        (
+            "run-foreach-missing",
+            foreach_workflow("{{inputs.items}}"),
+            json!({}),
+            "does not resolve at open",
+        ),
+    ];
+    for (run_id, wf, trigger, label) in cases {
+        let pool = pool.clone();
+        let state = SyncWorkflowState::spawn(pool.clone(), &handle);
+        let handle = handle.clone();
+        let rid = run_id.to_string();
+        let refused = tokio::task::spawn_blocking(move || {
+            let engine = OurEngine::with_journal(
+                ToronEngineStore::spawn(pool.clone(), &handle),
+                ToronJournal::spawn(JournalDb::new(pool, "foreach", 64), &handle),
+            );
+            DurableGraphRun::open(engine, state, rid, wf, trigger, 0)
+        })
+        .await
+        .expect("join");
+        let Err(err) = refused else {
+            panic!("{run_id}: must refuse");
+        };
+        let HostError::Unsupported(reason) = err else {
+            panic!("{run_id}: wrong refusal: {err:?}");
+        };
+        assert!(reason.contains(label), "{run_id}: {reason}");
+    }
+
+    let store = toron_core::index::durable_workflow::WorkflowStateStore::new(pool.clone());
+    for run_id in ["run-foreach-number", "run-foreach-missing"] {
+        assert!(
+            store.load(run_id).await.expect("state").is_none(),
+            "{run_id} left no state row"
+        );
+    }
+    let engine = OurEngine::with_journal(
+        ToronEngineStore::spawn(pool.clone(), &handle),
+        ToronJournal::spawn(JournalDb::new(pool, "foreach", 64), &handle),
+    );
+    assert!(engine.query("run-foreach-number").is_err());
+    assert!(engine.query("run-foreach-missing").is_err());
 }

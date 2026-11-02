@@ -28,7 +28,7 @@ use super::branch::{PureGuard, check_pure_guard, evaluate_pure_guard};
 use super::control_flow::{
     MAX_PARALLEL_FANOUT, RetryCoordinator, build_approval_payload, disposition_for_kind,
     fail_run_value, is_approval_decision, leaf_preview_for_value, parallel_fanout_count,
-    validate_graph_runtime,
+    resolve_template_ref, validate_graph_runtime,
 };
 
 use super::spawn::{SpawnSpec, unknown_profile_error};
@@ -1035,6 +1035,12 @@ pub struct GraphModel {
     pub node_wave: BTreeMap<String, usize>,
     /// Landed outputs.
     pub outputs: BTreeMap<String, serde_json::Value>,
+    /// Per-copy foreach items, keyed by copy node name
+    /// (bd-durable-foreach-jpgx). The item is what `{{item}}` resolves to
+    /// inside that copy; it is run data, so it lives on the model rather than
+    /// in the authored workflow.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub items: BTreeMap<String, serde_json::Value>,
     /// Current phase.
     pub phase: GraphPhase,
 }
@@ -1137,6 +1143,8 @@ pub enum GraphEffect {
         attempt: u32,
         /// The spawn-time outputs snapshot the node renders against.
         inputs: BTreeMap<String, serde_json::Value>,
+        /// The foreach item this copy renders as `{{item}}`, when it is one.
+        item: Option<serde_json::Value>,
     },
     /// Park the run until the earliest node deadline.
     ParkUntil {
@@ -1190,6 +1198,7 @@ impl GraphModel {
             node_state,
             node_wave: BTreeMap::new(),
             outputs: BTreeMap::new(),
+            items: BTreeMap::new(),
             phase: GraphPhase::Ready,
         }
     }
@@ -1409,11 +1418,13 @@ pub fn advance_graph(model: &GraphModel, msg: &GraphMsg) -> (GraphModel, Vec<Gra
                                 inputs: inputs.clone(),
                             },
                         );
+                        let item = next.items.get(&node).cloned();
                         effects.push(GraphEffect::ExecuteNode {
                             node,
                             wave,
                             attempt,
                             inputs,
+                            item,
                         });
                     }
                 }
@@ -1469,6 +1480,7 @@ pub fn resume_graph_effects(model: &GraphModel) -> Vec<GraphEffect> {
                 wave: *wave,
                 attempt: *attempt,
                 inputs: inputs.clone(),
+                item: model.items.get(node).cloned(),
             }),
             NodeState::Parked {
                 until_ms, reason, ..
@@ -1496,10 +1508,12 @@ fn schedule(model: &mut GraphModel, now_ms: u64) -> Vec<GraphEffect> {
     if model.is_terminal() || model.is_in_flight() {
         return Vec::new();
     }
-    let Some(graph) = model.workflow.graph.clone() else {
-        return Vec::new();
-    };
     loop {
+        // Refresh per wave: a foreach expansion writes new nodes into the
+        // model's graph, so the next round must see them.
+        let Some(graph) = model.workflow.graph.clone() else {
+            return Vec::new();
+        };
         if model.all_settled() {
             model.phase = GraphPhase::Succeeded;
             return vec![GraphEffect::Complete {
@@ -1548,6 +1562,128 @@ fn schedule(model: &mut GraphModel, now_ms: u64) -> Vec<GraphEffect> {
                     attempts: None,
                 },
             }];
+        }
+
+        // bd-durable-foreach-jpgx: a ready `foreach` marker expands into one
+        // node per item BEFORE the wave dispatches. The list is read here, in
+        // the fold, from trigger + outputs — the same pure inputs the rest of
+        // the scheduler uses. The expansion is persisted with the model, so a
+        // restart resumes the same copies.
+        let mut expanded = false;
+        {
+            let mut expanded_graph = graph.clone();
+            for name in &ready {
+                let Some(node) = expanded_graph.nodes.get(name).cloned() else {
+                    continue;
+                };
+                let Action::Foreach { over, each } = &node.action else {
+                    continue;
+                };
+                if is_fanout_join(&expanded_graph, name, &node) {
+                    continue;
+                }
+                let over = over.clone();
+                let each = (**each).clone();
+                let needs = node.needs.clone();
+                let snapshot_map = outputs_map(&model.outputs);
+                let materialized = resolve_template_ref(&over, &model.trigger, &snapshot_map);
+                let items = match materialized {
+                    Some(serde_json::Value::Array(items)) => items,
+                    other => {
+                        let error = match other {
+                            Some(_) => format!(
+                                "workflow {:?} node {name:?}: foreach `over` {over:?} must be a list",
+                                model.workflow.name
+                            ),
+                            None => format!(
+                                "workflow {:?} node {name:?}: foreach `over` {over:?} does not resolve to a value",
+                                model.workflow.name
+                            ),
+                        };
+                        let value = serde_json::json!({ "ok": false, "error": error });
+                        if node.on_error == StepOnError::FailRun {
+                            let output = fail_run_value(name, &value, None);
+                            let error = output
+                                .get("error")
+                                .and_then(|e| e.as_str())
+                                .unwrap_or("foreach failed")
+                                .to_string();
+                            model.phase = GraphPhase::Failed {
+                                error: error.clone(),
+                            };
+                            return vec![GraphEffect::Fail {
+                                fail: GraphFail {
+                                    node: name.clone(),
+                                    error,
+                                    kind: String::new(),
+                                    disposition: String::new(),
+                                    leaf_preview: output
+                                        .get("leaf_preview")
+                                        .cloned()
+                                        .unwrap_or(serde_json::Value::Null),
+                                    attempts: None,
+                                },
+                            }];
+                        }
+                        model.outputs.insert(name.clone(), value);
+                        model.node_state.insert(name.clone(), NodeState::Settled);
+                        expanded = true;
+                        continue;
+                    }
+                };
+                if items.is_empty() {
+                    // `run_foreach` over an empty list is an empty collection.
+                    model
+                        .outputs
+                        .insert(name.clone(), serde_json::Value::Array(Vec::new()));
+                    model.node_state.insert(name.clone(), NodeState::Settled);
+                    expanded = true;
+                    continue;
+                }
+                let copies: Vec<String> = (0..items.len()).map(|i| format!("{name}:{i}")).collect();
+                for (i, item) in items.into_iter().enumerate() {
+                    let copy = copies[i].clone();
+                    if expanded_graph.nodes.contains_key(&copy) {
+                        // Lowering refuses this; a hand-edited model fails
+                        // closed instead of overwriting a node.
+                        let error = format!("foreach copy '{copy}' already exists");
+                        model.phase = GraphPhase::Failed {
+                            error: error.clone(),
+                        };
+                        return vec![GraphEffect::Fail {
+                            fail: GraphFail {
+                                node: copy,
+                                error,
+                                kind: String::new(),
+                                disposition: String::new(),
+                                leaf_preview: serde_json::Value::Null,
+                                attempts: None,
+                            },
+                        }];
+                    }
+                    expanded_graph.nodes.insert(
+                        copy.clone(),
+                        GraphNode {
+                            action: each.action.clone(),
+                            needs: needs.clone(),
+                            guard: each.guard.clone(),
+                            on_error: each.on_error,
+                            build_slot: each.build_slot,
+                        },
+                    );
+                    model.node_state.insert(copy.clone(), NodeState::Pending);
+                    model.items.insert(copy, item);
+                }
+                // The marker becomes the join over its copies.
+                if let Some(join) = expanded_graph.nodes.get_mut(name) {
+                    join.needs = copies;
+                }
+                expanded = true;
+            }
+            if expanded {
+                model.workflow.graph = Some(expanded_graph);
+                continue;
+            }
         }
 
         model.wave += 1;
@@ -1637,11 +1773,12 @@ fn schedule(model: &mut GraphModel, now_ms: u64) -> Vec<GraphEffect> {
                     });
                     dispatched += 1;
                 }
-                // bd-durable-parallel-53um: the join marker of a lowered
-                // fan-out. Its `needs` are its copies, and the graph schedules
-                // only when nothing is in flight, so every copy is settled and
-                // the value is a pure fold — no effect, no second scheduler.
-                Action::Parallel { .. } => {
+                // bd-durable-parallel-53um / bd-durable-foreach-jpgx: the
+                // join marker of a fan-out. Its `needs` are its copies, and
+                // the graph schedules only when nothing is in flight, so every
+                // copy is settled and the value is a pure fold — no effect, no
+                // second scheduler.
+                _ if is_fanout_join(&graph, name, node) => {
                     let values: Vec<serde_json::Value> = node
                         .needs
                         .iter()
@@ -1705,6 +1842,7 @@ fn schedule(model: &mut GraphModel, now_ms: u64) -> Vec<GraphEffect> {
                         wave,
                         attempt: 1,
                         inputs: snapshot.clone(),
+                        item: model.items.get(name).cloned(),
                     });
                     dispatched += 1;
                 }
@@ -1811,32 +1949,75 @@ fn outputs_map(
         .collect()
 }
 
-/// True when the authored steps contain a `parallel` fan-out.
-pub fn has_parallel_steps(workflow: &Workflow) -> bool {
-    workflow
-        .steps
-        .iter()
-        .any(|step| matches!(step.action, Action::Parallel { .. }))
+/// True when the authored steps contain a fan-out (`parallel` or `foreach`).
+pub fn has_fanout_steps(workflow: &Workflow) -> bool {
+    workflow.steps.iter().any(|step| {
+        matches!(
+            step.action,
+            Action::Parallel { .. } | Action::Foreach { .. }
+        )
+    })
 }
 
 /// True when the workflow must run on the graph model: an authored graph, or a
 /// `steps:` sequence lowered into copy nodes + a collect join
-/// (bd-durable-parallel-53um).
+/// (bd-durable-parallel-53um, bd-durable-foreach-jpgx).
 pub fn needs_graph_model(workflow: &Workflow) -> bool {
-    workflow.graph.is_some() || has_parallel_steps(workflow)
+    workflow.graph.is_some() || has_fanout_steps(workflow)
 }
 
-/// Static refusal for a `steps:` workflow that needs the parallel lowering.
+/// The `over` form a foreach accepts: a JSON literal or a
+/// `{{trigger|inputs|steps}}` reference. Anything else cannot be materialized
+/// from the fold's pure inputs, so it refuses before any row.
+fn foreach_over_refusal(over: &str) -> Option<String> {
+    let trimmed = over.trim();
+    if serde_json::from_str::<serde_json::Value>(trimmed).is_ok() {
+        return None;
+    }
+    let Some(inner) = trimmed
+        .strip_prefix("{{")
+        .and_then(|rest| rest.strip_suffix("}}"))
+    else {
+        return Some(format!(
+            "foreach `over` {over:?} must be a JSON list or a {{trigger|inputs|steps}} reference"
+        ));
+    };
+    let root = inner.trim().split('.').next().unwrap_or_default();
+    matches!(root, "trigger" | "inputs" | "steps" | "item")
+        .then_some(())
+        .map_or_else(
+            || {
+                Some(format!(
+                    "foreach `over` {over:?} must read trigger, inputs, or upstream outputs — not {root:?}"
+                ))
+            },
+            |()| None,
+        )
+}
+
+/// The `{{steps.<node>…}}` root a foreach read names, when it names one.
+fn foreach_over_steps_root(over: &str) -> Option<&str> {
+    let inner = over.trim().strip_prefix("{{")?.strip_suffix("}}")?.trim();
+    inner.strip_prefix("steps.")?.split('.').next()
+}
+
+/// Static refusal for a `steps:` workflow that needs the fan-out lowering.
 ///
 /// Whole-workflow, never partial: the mix refusal keeps a spawn/branch
-/// sequence linear (a graph cannot admit either), every copy must be a leaf
-/// the graph can sequence, and the count must be a literal or a template ref
-/// resolved at open.
-fn lowered_parallel_refusal(workflow: &Workflow) -> Option<String> {
+/// sequence linear (a graph cannot admit either), every copy/item must be a
+/// leaf the graph can sequence, the fan-out must not carry a whole-step guard
+/// (the lowering cannot skip the fan-out as one), and a foreach iterator must
+/// name an EARLIER step when it reads upstream outputs.
+fn lowered_fanout_refusal(workflow: &Workflow) -> Option<String> {
     for (index, step) in workflow.steps.iter().enumerate() {
         let name = step_name(step, index);
         match &step.action {
             Action::Parallel { over, each } => {
+                if step.guard.is_some() {
+                    return Some(format!(
+                        "step '{name}' is a fan-out with a step guard; the durable lowering cannot skip the whole fan-out yet — move the guard into the copies or split the workflow"
+                    ));
+                }
                 let literal = over.trim().parse::<u64>().is_ok();
                 let template = over.trim().starts_with("{{") && over.trim().ends_with("}}");
                 if !literal && !template {
@@ -1851,17 +2032,41 @@ fn lowered_parallel_refusal(workflow: &Workflow) -> Option<String> {
                     ));
                 }
             }
+            Action::Foreach { over, each } => {
+                if step.guard.is_some() {
+                    return Some(format!(
+                        "step '{name}' is a fan-out with a step guard; the durable lowering cannot skip the whole fan-out yet — move the guard into the items or split the workflow"
+                    ));
+                }
+                if let Some(reason) = foreach_over_refusal(over) {
+                    return Some(format!("step '{name}': {reason}"));
+                }
+                if let Some(upstream) = foreach_over_steps_root(over) {
+                    let earlier = (0..index).any(|i| step_name(&workflow.steps[i], i) == upstream);
+                    if !earlier {
+                        return Some(format!(
+                            "step '{name}' foreach `over` {over:?} names '{upstream}', which is not an earlier step"
+                        ));
+                    }
+                }
+                if !is_graph_sequencable(&each.action) {
+                    return Some(format!(
+                        "step '{name}' foreach item uses '{}', which the graph model cannot sequence",
+                        each.action.type_name()
+                    ));
+                }
+            }
             // Captain review: a graph-lowered shape mixed with spawn or a
             // linear branch refuses WHOLE rather than half-running.
             Action::Spawn { .. } | Action::Branch { .. } => {
                 return Some(format!(
-                    "workflow mixes parallel with '{}' at step '{name}': the parallel lowering is graph-shaped and the durable graph admits neither; split the workflow",
+                    "workflow mixes fan-out with '{}' at step '{name}': the fan-out lowering is graph-shaped and the durable graph admits neither; split the workflow",
                     step.action.type_name()
                 ));
             }
             action if !is_linear(action) => {
                 return Some(format!(
-                    "step '{name}' uses '{}', which the parallel lowering cannot sequence",
+                    "step '{name}' uses '{}', which the fan-out lowering cannot sequence",
                     action.type_name()
                 ));
             }
@@ -1872,12 +2077,13 @@ fn lowered_parallel_refusal(workflow: &Workflow) -> Option<String> {
 }
 
 /// The graph this workflow runs on: an authored graph, or a `steps:` sequence
-/// lowered into one wave of copy nodes `{node}:{i}` plus a collect join named
-/// after the authored step (bd-durable-parallel-53um).
+/// lowered into fan-out nodes + a collect join named after the authored step
+/// (bd-durable-parallel-53um, bd-durable-foreach-jpgx).
 ///
-/// Pure: the copy count is read from the trigger at open (literal or
-/// `{{inputs.*}}`), never from a host. A count that needs a prior step's
-/// output refuses — that is the foreach slice's surface, not this one.
+/// `parallel` expands at open (its count is a literal or a trigger value).
+/// `foreach` lowers to a MARKER and expands in the fold when it is ready,
+/// because its list may read an upstream output that does not exist at open;
+/// the fold owns the outputs map, so the expansion stays pure.
 pub fn durable_graph(
     workflow: &Workflow,
     trigger: &serde_json::Value,
@@ -1885,69 +2091,138 @@ pub fn durable_graph(
     if let Some(graph) = &workflow.graph {
         return Ok(Some(graph.clone()));
     }
-    if !has_parallel_steps(workflow) {
+    if !has_fanout_steps(workflow) {
         return Ok(None);
     }
-    if let Some(reason) = lowered_parallel_refusal(workflow) {
+    if let Some(reason) = lowered_fanout_refusal(workflow) {
         return Err(reason);
     }
     let mut nodes: BTreeMap<String, GraphNode> = BTreeMap::new();
+    let mut foreach_names: Vec<String> = Vec::new();
     let mut prev: Option<String> = None;
     for (index, step) in workflow.steps.iter().enumerate() {
         let name = step_name(step, index);
-        if let Action::Parallel { over, each } = &step.action {
-            let count = parallel_fanout_count(over, trigger, &serde_json::Map::new())
-                .ok_or_else(|| {
-                    format!(
-                        "step '{name}' parallel `over` {over:?} must resolve to a positive count at open"
-                    )
-                })?;
-            if count > MAX_PARALLEL_FANOUT {
-                return Err(format!(
-                    "step '{name}' parallel fan-out {count} exceeds the bounded cap {MAX_PARALLEL_FANOUT}"
-                ));
-            }
-            let copies: Vec<String> = (0..count).map(|i| format!("{name}:{i}")).collect();
-            for copy in &copies {
-                let node = GraphNode {
-                    action: each.action.clone(),
-                    needs: prev.iter().cloned().collect(),
-                    guard: each.guard.clone(),
-                    on_error: each.on_error,
-                    build_slot: each.build_slot,
-                };
-                if nodes.insert(copy.clone(), node).is_some() {
+        match &step.action {
+            Action::Parallel { over, each } => {
+                let count = parallel_fanout_count(over, trigger, &serde_json::Map::new())
+                    .ok_or_else(|| {
+                        format!(
+                            "step '{name}' parallel `over` {over:?} must resolve to a positive count at open"
+                        )
+                    })?;
+                if count > MAX_PARALLEL_FANOUT {
                     return Err(format!(
-                        "parallel copy name '{copy}' collides with an authored step"
+                        "step '{name}' parallel fan-out {count} exceeds the bounded cap {MAX_PARALLEL_FANOUT}"
                     ));
                 }
+                let copies: Vec<String> = (0..count).map(|i| format!("{name}:{i}")).collect();
+                for copy in &copies {
+                    let node = GraphNode {
+                        action: each.action.clone(),
+                        needs: prev.iter().cloned().collect(),
+                        guard: each.guard.clone(),
+                        on_error: each.on_error,
+                        build_slot: each.build_slot,
+                    };
+                    if nodes.insert(copy.clone(), node).is_some() {
+                        return Err(format!(
+                            "parallel copy name '{copy}' collides with an authored step"
+                        ));
+                    }
+                }
+                let join = GraphNode {
+                    action: step.action.clone(),
+                    needs: copies,
+                    guard: None,
+                    on_error: step.on_error,
+                    build_slot: false,
+                };
+                if nodes.insert(name.clone(), join).is_some() {
+                    return Err(format!("step name '{name}' is not unique"));
+                }
+                prev = Some(name);
             }
-            let join = GraphNode {
-                action: step.action.clone(),
-                needs: copies,
-                guard: None,
-                on_error: step.on_error,
-                build_slot: false,
-            };
-            if nodes.insert(name.clone(), join).is_some() {
-                return Err(format!("step name '{name}' is not unique"));
+            Action::Foreach { over, each: _ } => {
+                // Validate what can be known at open: a literal or
+                // trigger/inputs list must already BE a list. A `steps.*` read
+                // is materialized by the fold, which owns the outputs map.
+                let at_open = resolve_template_ref(over, trigger, &serde_json::Map::new());
+                match (at_open, foreach_over_steps_root(over)) {
+                    (Some(serde_json::Value::Array(_)), _) => {}
+                    (Some(_), _) => {
+                        return Err(format!(
+                            "step '{name}' foreach `over` {over:?} must resolve to a list"
+                        ));
+                    }
+                    (None, Some(_)) => {}
+                    (None, None) => {
+                        return Err(format!(
+                            "step '{name}' foreach `over` {over:?} does not resolve at open"
+                        ));
+                    }
+                }
+                let marker = GraphNode {
+                    action: step.action.clone(),
+                    needs: prev.iter().cloned().collect(),
+                    guard: None,
+                    on_error: step.on_error,
+                    build_slot: false,
+                };
+                if nodes.insert(name.clone(), marker).is_some() {
+                    return Err(format!("step name '{name}' is not unique"));
+                }
+                foreach_names.push(name.clone());
+                prev = Some(name);
             }
-            prev = Some(name);
-            continue;
+            action => {
+                let node = GraphNode {
+                    action: action.clone(),
+                    needs: prev.iter().cloned().collect(),
+                    guard: step.guard.clone(),
+                    on_error: step.on_error,
+                    build_slot: step.build_slot,
+                };
+                if nodes.insert(name.clone(), node).is_some() {
+                    return Err(format!("step name '{name}' is not unique"));
+                }
+                prev = Some(name);
+            }
         }
-        let node = GraphNode {
-            action: step.action.clone(),
-            needs: prev.iter().cloned().collect(),
-            guard: step.guard.clone(),
-            on_error: step.on_error,
-            build_slot: step.build_slot,
-        };
-        if nodes.insert(name.clone(), node).is_some() {
-            return Err(format!("step name '{name}' is not unique"));
+    }
+    // A foreach expands into `{name}:{i}` at schedule time; an authored node
+    // with that shape would be overwritten, so refuse it now.
+    for fanout in &foreach_names {
+        let prefix = format!("{fanout}:");
+        for name in nodes.keys() {
+            let collides = name
+                .strip_prefix(&prefix)
+                .is_some_and(|index| index.parse::<usize>().is_ok());
+            if collides {
+                return Err(format!(
+                    "authored node '{name}' collides with a foreach copy of '{fanout}'"
+                ));
+            }
         }
-        prev = Some(name);
     }
     Ok(Some(Graph { nodes }))
+}
+
+/// True when `node` is a fan-out JOIN: its `needs` are exactly its own copies.
+fn is_fanout_join(graph: &Graph, name: &str, node: &GraphNode) -> bool {
+    if !matches!(
+        node.action,
+        Action::Parallel { .. } | Action::Foreach { .. }
+    ) {
+        return false;
+    }
+    !node.needs.is_empty()
+        && node.needs.iter().all(|need| {
+            let copy = need
+                .strip_prefix(name)
+                .and_then(|rest| rest.strip_prefix(':'))
+                .is_some_and(|index| index.parse::<usize>().is_ok());
+            copy && graph.nodes.contains_key(need)
+        })
 }
 
 /// `None` when the graph model can sequence this graph end to end.
@@ -1960,8 +2235,8 @@ pub fn durable_graph(
 /// than a clean route.
 pub fn graph_unsupported_reason(workflow: &Workflow) -> Option<String> {
     let Some(graph) = &workflow.graph else {
-        if has_parallel_steps(workflow) {
-            return lowered_parallel_refusal(workflow);
+        if has_fanout_steps(workflow) {
+            return lowered_fanout_refusal(workflow);
         }
         return Some("not a graph workflow".into());
     };
@@ -1969,6 +2244,20 @@ pub fn graph_unsupported_reason(workflow: &Workflow) -> Option<String> {
         return Some(error);
     }
     for (name, node) in &graph.nodes {
+        if let Action::Foreach { over, each } = &node.action {
+            // A foreach fan-out marker or its expanded join. The `over` shape
+            // is refused before a row; the list itself is read in the fold.
+            if let Some(reason) = foreach_over_refusal(over) {
+                return Some(format!("graph node '{name}': {reason}"));
+            }
+            if !is_graph_sequencable(&each.action) {
+                return Some(format!(
+                    "graph node '{name}' foreach item uses '{}', which the graph model cannot sequence",
+                    each.action.type_name()
+                ));
+            }
+            continue;
+        }
         if let Action::Parallel { each, .. } = &node.action {
             // The join marker of a lowered fan-out: collect its copies.
             if node.needs.is_empty() {

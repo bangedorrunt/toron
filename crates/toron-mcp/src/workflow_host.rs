@@ -2532,8 +2532,16 @@ impl WorkflowHost {
                         wave: _,
                         attempt,
                         inputs,
+                        item,
                     } => {
-                        let Some(node_def) = workflow
+                        // bd-durable-foreach-jpgx: the model's workflow is the
+                        // lowered/expanded one (a `steps:` fan-out gains nodes
+                        // at open, a foreach gains them when it is ready), so
+                        // the definition must come from the MODEL, not the
+                        // authored workflow this loop was started with.
+                        let Some(node_def) = run
+                            .model()
+                            .workflow
                             .graph
                             .as_ref()
                             .and_then(|g| g.nodes.get(&node))
@@ -2550,13 +2558,14 @@ impl WorkflowHost {
                         let value = run_graph_node_step(
                             GraphNodeStep {
                                 run_id: &run_id,
-                                workflow: &workflow.name,
+                                workflow: &run.model().workflow.name,
                                 workflow_digest: &workflow_digest,
                                 node_name: &node,
                                 node: &node_def,
                                 attempt,
                                 trigger: &trigger,
                                 inputs: &snapshot,
+                                item: item.as_ref(),
                             },
                             &self.seams,
                         )
@@ -9503,24 +9512,58 @@ steps:
             let wf = graph_workflow([
                 ("fine", graph_node(durable_leaf("cut"), &[])),
                 (
-                    "each",
+                    "call",
                     graph_node(
-                        Action::Foreach {
-                            over: "{{trigger.items}}".into(),
-                            each: Box::new(Step {
-                                name: None,
-                                guard: None,
-                                on_error: StepOnError::Continue,
-                                build_slot: false,
-                                action: durable_leaf("copy"),
-                            }),
+                        Action::CallWorkflow {
+                            workflow: "child".into(),
+                            inputs: serde_json::json!({}),
                         },
                         &["fine"],
                     ),
                 ),
             ]);
-            let err = durable_route(&wf, true, false).expect_err("foreach refuses the graph");
-            assert!(err.contains("foreach"), "{err}");
+            let err = durable_route(&wf, true, false).expect_err("call_workflow refuses");
+            assert!(err.contains("call_workflow"), "{err}");
+        }
+
+        /// bd-durable-foreach-jpgx: a `steps:` foreach shares the fan-out
+        /// path, so the router admits it to the graph driver; an item the
+        /// graph cannot sequence refuses whole.
+        #[test]
+        fn a_foreach_steps_workflow_routes_to_the_graph() {
+            let mut wf = linear_workflow();
+            wf.steps = vec![
+                Step {
+                    name: Some("fan".into()),
+                    guard: None,
+                    on_error: StepOnError::Continue,
+                    build_slot: false,
+                    action: Action::Foreach {
+                        over: "{{inputs.items}}".into(),
+                        each: Box::new(linear_step()),
+                    },
+                },
+                linear_step(),
+            ];
+            assert!(durable_route(&wf, true, false).is_ok());
+
+            let mut bad = wf.clone();
+            bad.steps[0].action = Action::Foreach {
+                over: "{{inputs.items}}".into(),
+                each: Box::new(Step {
+                    name: None,
+                    guard: None,
+                    on_error: StepOnError::Continue,
+                    build_slot: false,
+                    action: Action::CallWebhook {
+                        url: "http://127.0.0.1:9/x".into(),
+                        method: None,
+                        body: None,
+                    },
+                }),
+            };
+            let err = durable_route(&bad, true, false).expect_err("unsequencable item");
+            assert!(err.contains("call_webhook"), "{err}");
         }
 
         /// bd-durable-parallel-53um: a `steps:` fan-out is lowered onto the
@@ -9563,7 +9606,7 @@ steps:
                 },
             );
             let err = durable_route(&mixed, true, true).expect_err("the mix refuses");
-            assert!(err.contains("mixes parallel"), "{err}");
+            assert!(err.contains("mixes fan-out"), "{err}");
         }
 
         /// Static refusal: a cyclic graph never gets a durable row — the old
