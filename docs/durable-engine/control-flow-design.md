@@ -230,7 +230,15 @@ child).
 `call_workflow_recursive_callee_refuses_without_row`,
 `call_workflow_unresolvable_ref_refuses_without_row`.
 
-## loop — rewrite, do not model (deferred sketch only)
+## loop — bounded model (review correction, see the review's item 3)
+
+**Review correction (2026-11-02):** the two shipped loops take their bound from
+an input (`max: "{{inputs.max_iters}}"`, `max: "{{inputs.max_iterations}}"`) and
+their stop from the LAST iteration's reply (`until: "steps_iteration_improved
+== true"` / `steps_verify_ok == true`). A fixed unroll silently changes both
+semantics (the input becomes a lie) and would still need a per-iteration
+condition. The sketch below is therefore APPROVED as the smallest honest model;
+the rewrite alternative is withdrawn.
 
 `loop` needs iteration state (counter + condition + back-edge) and a
 termination argument — the only shape here that is neither a graph nor a
@@ -243,9 +251,9 @@ explicit max-iteration bound (unbounded loops never admit), restart resumes
 at the counter with iteration-keyed effect keys, max-iterations trips
 `Fail` with the bundle. That sketch is not approved surface in this slice.
 
-**Witnesses (only if the sketch is ever built):**
-`loop_bounded_terminates`, `loop_restart_resumes_at_counter`,
-`loop_max_iterations_fails_with_bundle`, `loop_unbounded_refuses_without_row`.
+**Witnesses:** `loop_until_true_after_n_iterations`,
+`loop_restart_resumes_at_counter`, `loop_max_iterations_fails_with_bundle`,
+`loop_unbounded_refuses_without_row`, `loop_body_failure_applies_on_error`.
 
 ## park — stays refused (no model)
 
@@ -358,12 +366,14 @@ Approved split:
 2. **foreach list source:** trigger, inputs, AND upstream `outputs` are all
    pure (the fold owns the map). The boundary is "no host I/O", not
    "trigger-only". A list that needs a host read refuses.
-3. **loop:** the two shipped uses are flywheel builtins `climb`
+3. **loop:** the two shipped uses are flywheel builtins `hillclimb`
    (`max: {{inputs.max_iters}}`) and `cycle` (`max: {{inputs.max_iterations}}`),
-   both `until:` loops over `dispatch_job`. Rewrite each as a bounded guarded
-   SEQUENCE of that many repetitions (the max is a small integer default,
-   10 and 3), with each repetition guarded by the negated `until`. `loop`
-   stays refused permanently; the rewrites land in the loop bead.
+   both `until:` loops over `dispatch_job`/`verify`. They are dynamic in BOTH
+   the bound (an input) and the stop (the last iteration's reply), so a fixed
+   unroll is a semantic change, not a port. Build the bounded loop model from
+   the sketch in the loop section (persisted counter, pure `until` over
+   outputs, explicit max, restart at the counter); `loop` stays refused until
+   that model lands. `park` still stays refused permanently.
 4. **guard purity:** the accepted grammar is exactly the template comparisons
    the guard evaluator already resolves from trigger/inputs/outputs
    (`{{ref}} <op> <literal>`, boolean combinations). Anything that reaches the
