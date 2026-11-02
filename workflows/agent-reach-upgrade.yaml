@@ -38,7 +38,10 @@ steps:
         action: send_dm
         to: housekeeper
         body: "agent-reach-upgrade FAILED — verify step did not pass"
+      # Fail the run closed from a supported action: a non-zero verify plus
+      # `on_error: fail_run` (call_webhook is Unsupported by contract — no
+      # webhook sink is wired — so it is not ported; bd-durable-branch-hhgc).
       - name: fail-closed
-        action: call_webhook
-        url: "http://127.0.0.1:9/none"
+        action: verify
+        command: "false"
         on_error: fail_run

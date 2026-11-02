@@ -329,30 +329,33 @@ async fn unsupported_shapes_stay_on_the_old_engine() {
     .expect("join");
     assert!(matches!(graph, HostError::Unsupported(_)), "{graph:?}");
 
-    let branch_pool = pool.clone();
-    let branch_state = state.clone();
-    let branch_handle = handle.clone();
-    let branch = tokio::task::spawn_blocking(move || {
+    // `branch` is linear as of bd-durable-branch-hhgc; `parallel` still is not.
+    let parallel_pool = pool.clone();
+    let parallel_state = state.clone();
+    let parallel_handle = handle.clone();
+    let parallel = tokio::task::spawn_blocking(move || {
         let engine = OurEngine::with_journal(
-            ToronEngineStore::spawn(branch_pool.clone(), &branch_handle),
+            ToronEngineStore::spawn(parallel_pool.clone(), &parallel_handle),
             ToronJournal::spawn(
-                JournalDb::new(branch_pool, "unsupported", 64),
-                &branch_handle,
+                JournalDb::new(parallel_pool, "unsupported", 64),
+                &parallel_handle,
             ),
         );
-        let shaped = workflow(vec![step(Action::Branch {
-            if_guard: "true".into(),
-            then: vec![verify("one")],
-            else_steps: Vec::new(),
+        let shaped = workflow(vec![step(Action::Parallel {
+            over: "2".into(),
+            each: Box::new(verify("one")),
         })]);
-        match DurableRun::open(engine, branch_state, "run-branch", shaped, json!({}), 0) {
-            Ok(_) => panic!("branches are not linear"),
+        match DurableRun::open(engine, parallel_state, "run-parallel", shaped, json!({}), 0) {
+            Ok(_) => panic!("parallel is not linear"),
             Err(e) => e,
         }
     })
     .await
     .expect("join");
-    assert!(matches!(branch, HostError::Unsupported(_)), "{branch:?}");
+    assert!(
+        matches!(parallel, HostError::Unsupported(_)),
+        "{parallel:?}"
+    );
 
     // Refused before any engine or state row exists, so the host can hand the
     // workflow to the old engine without cleaning up after this one.
@@ -369,7 +372,7 @@ async fn unsupported_shapes_stay_on_the_old_engine() {
         ToronJournal::spawn(JournalDb::new(pool, "unsupported", 64), &handle),
     );
     assert!(engine.query("run-graph").is_err());
-    assert!(engine.query("run-branch").is_err());
+    assert!(engine.query("run-parallel").is_err());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1150,4 +1153,223 @@ async fn spawn_park_reemits_the_same_key_after_restart() {
             "result": {"pane": "w1:p9"},
         })
     );
+}
+
+// ---------------------------------------------------------------------------
+// Branch in the linear plan (bd-durable-branch-hhgc)
+// ---------------------------------------------------------------------------
+
+fn dm(tag: &str) -> Action {
+    Action::SendDm {
+        to: "housekeeper".into(),
+        body: format!("arm:{tag}"),
+        project: None,
+    }
+}
+
+fn named(name: &str, action: Action, on_error: StepOnError) -> Step {
+    Step {
+        name: Some(name.into()),
+        guard: None,
+        on_error,
+        build_slot: false,
+        action,
+    }
+}
+
+fn branch(guard: &str, then: Vec<Step>, else_steps: Vec<Step>, on_error: StepOnError) -> Step {
+    Step {
+        name: Some("choose".into()),
+        guard: None,
+        on_error,
+        build_slot: false,
+        action: Action::Branch {
+            if_guard: guard.into(),
+            then,
+            else_steps,
+        },
+    }
+}
+
+fn branch_workflow(guard: &str) -> Workflow {
+    workflow(vec![branch(
+        guard,
+        vec![
+            named("yes", dm("yes"), StepOnError::Continue),
+            named("yes-2", dm("yes-2"), StepOnError::Continue),
+        ],
+        vec![named("no", dm("no"), StepOnError::Continue)],
+        StepOnError::Continue,
+    )])
+}
+
+/// A restart mid-arm resumes the SAME arm from the store: the marker is not
+/// re-evaluated, and the unselected arm never dispatches.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn branch_restart_resumes_the_same_arm() {
+    let path = unique_db("branch-restart");
+    let pool = connect(path.to_str().expect("path"))
+        .await
+        .expect("connect");
+    migrate(&pool).await.expect("migrate");
+    let handle = tokio::runtime::Handle::current();
+    let trigger = json!({"gate": true});
+
+    let phase_one = {
+        let pool = pool.clone();
+        let state = SyncWorkflowState::spawn(pool.clone(), &handle);
+        let handle = handle.clone();
+        let trigger = trigger.clone();
+        tokio::task::spawn_blocking(move || -> Result<RunModel, HostError> {
+            let engine = OurEngine::with_journal(
+                ToronEngineStore::spawn(pool.clone(), &handle),
+                ToronJournal::spawn(JournalDb::new(pool, "branch", 64), &handle),
+            );
+            let (mut run, effects) = DurableRun::open_with_seams(
+                engine,
+                state,
+                "run-branch",
+                branch_workflow("{{trigger.gate}} == true"),
+                trigger,
+                1_000,
+                &spawn_seams(false),
+            )?;
+            assert!(
+                matches!(effects.as_slice(), [RunEffect::ExecuteStep { .. }]),
+                "the then arm's first step runs: {effects:?}"
+            );
+            let effects = run.step_done(json!({"ok": true}), 2_000)?;
+            let [RunEffect::ExecuteStep { step, .. }] = effects.as_slice() else {
+                panic!("the then arm's second step is next: {effects:?}");
+            };
+            assert_eq!(step.name.as_deref(), Some("yes-2"));
+            Ok(run.model().clone())
+        })
+        .await
+        .expect("join")
+        .expect("phase one")
+    };
+    assert_eq!(
+        phase_one.outputs.get("choose"),
+        None,
+        "the branch value lands only when the arm ends"
+    );
+    assert!(!phase_one.outputs.contains_key("no"));
+
+    // The restart: a fresh engine and state handle over the same database.
+    let (run, effects) = {
+        let pool = pool.clone();
+        let state = SyncWorkflowState::spawn(pool.clone(), &handle);
+        let handle = handle.clone();
+        tokio::task::spawn_blocking(move || {
+            let engine = OurEngine::with_journal(
+                ToronEngineStore::spawn(pool.clone(), &handle),
+                ToronJournal::spawn(JournalDb::new(pool, "branch", 64), &handle),
+            );
+            DurableRun::open_with_seams(
+                engine,
+                state,
+                "run-branch",
+                branch_workflow("{{trigger.gate}} == true"),
+                json!({"gate": false}),
+                3_000,
+                &spawn_seams(false),
+            )
+        })
+        .await
+        .expect("join")
+        .expect("reopen")
+    };
+    let [RunEffect::ExecuteStep { step, .. }] = effects.as_slice() else {
+        panic!("resume re-issues the same arm step: {effects:?}");
+    };
+    assert_eq!(
+        step.name.as_deref(),
+        Some("yes-2"),
+        "the persisted arm cursor wins, never the marker"
+    );
+
+    let (mut run, effects) = (run, effects);
+    let _ = effects;
+    let effects = run.step_done(json!({"ok": true}), 4_000).expect("settle");
+    assert!(matches!(effects.as_slice(), [RunEffect::Complete { .. }]));
+    assert_eq!(run.model().outputs["choose"], json!({"branch": "then"}));
+    assert!(run.model().outputs.contains_key("yes"));
+    assert!(run.model().outputs.contains_key("yes-2"));
+    assert!(
+        !run.model().outputs.contains_key("no"),
+        "the unselected arm never dispatched: {:?}",
+        run.model().outputs
+    );
+}
+
+/// Impure guards and nested control flow refuse the WHOLE workflow before any
+/// state or engine row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn branch_refusals_leave_no_row() {
+    let path = unique_db("branch-refused");
+    let pool = connect(path.to_str().expect("path"))
+        .await
+        .expect("connect");
+    migrate(&pool).await.expect("migrate");
+    let handle = tokio::runtime::Handle::current();
+
+    let nested = workflow(vec![branch(
+        "{{trigger.gate}} == true",
+        vec![step(Action::Delay { secs: 1 })],
+        vec![],
+        StepOnError::Continue,
+    )]);
+    let cases = [
+        (
+            "run-branch-impure",
+            branch_workflow("1 + 1 == 2"),
+            "not pure",
+        ),
+        ("run-branch-nested", nested, "inside an arm"),
+    ];
+    for (run_id, wf, label) in cases {
+        let pool = pool.clone();
+        let state = SyncWorkflowState::spawn(pool.clone(), &handle);
+        let handle = handle.clone();
+        let rid = run_id.to_string();
+        let refused = tokio::task::spawn_blocking(move || {
+            let engine = OurEngine::with_journal(
+                ToronEngineStore::spawn(pool.clone(), &handle),
+                ToronJournal::spawn(JournalDb::new(pool, "branch", 64), &handle),
+            );
+            DurableRun::open_with_seams(
+                engine,
+                state,
+                rid,
+                wf,
+                json!({"gate": true}),
+                0,
+                &spawn_seams(false),
+            )
+        })
+        .await
+        .expect("join");
+        let Err(err) = refused else {
+            panic!("{run_id}: must refuse");
+        };
+        let HostError::Unsupported(reason) = err else {
+            panic!("{run_id}: wrong refusal: {err:?}");
+        };
+        assert!(reason.contains(label), "{run_id}: {reason}");
+    }
+
+    let store = toron_core::index::durable_workflow::WorkflowStateStore::new(pool.clone());
+    for run_id in ["run-branch-impure", "run-branch-nested"] {
+        assert!(
+            store.load(run_id).await.expect("state").is_none(),
+            "{run_id} left no state row"
+        );
+    }
+    let engine = OurEngine::with_journal(
+        ToronEngineStore::spawn(pool.clone(), &handle),
+        ToronJournal::spawn(JournalDb::new(pool, "branch", 64), &handle),
+    );
+    assert!(engine.query("run-branch-impure").is_err());
+    assert!(engine.query("run-branch-nested").is_err());
 }

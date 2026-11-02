@@ -31,6 +31,7 @@
 //! (move-only split of the former single-file engine — no behavior change).
 
 mod boundary;
+pub mod branch;
 mod control_flow;
 pub mod durable;
 pub mod durable_host;

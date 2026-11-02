@@ -36,8 +36,8 @@ use toron_core::kernel::{
 use super::control_flow::validate_workflow_lineage;
 use super::durable::{
     GraphEffect, GraphModel, GraphMsg, GraphPhase, NodeState, RunEffect, RunModel, RunMsg,
-    RunPhase as ModelPhase, advance_graph, advance_with, graph_unsupported_reason, resume_effects,
-    resume_graph_effects, unsupported_reason,
+    RunPhase as ModelPhase, advance_graph, advance_with, graph_unsupported_reason, next_effects,
+    resume_effects, resume_graph_effects, unsupported_reason,
 };
 use super::spawn::{SpawnSeams, SpawnSpec, prepare_spawn, spawn_key, spawn_launcher_refusal};
 
@@ -179,8 +179,11 @@ impl<S: EngineStorage, J: JournalStore, R: RunState> DurableRun<S, J, R> {
     ) -> Result<(Self, Vec<RunEffect>), HostError> {
         let run_id = run_id.into();
         if let Some(json) = state.load(&run_id).map_err(state_error)? {
-            let model: RunModel = serde_json::from_str(&json)
+            let mut model: RunModel = serde_json::from_str(&json)
                 .map_err(|e| HostError::Corrupt(format!("{}: {e}", run_id)))?;
+            // A model written before the branch slice has no plan; compiling
+            // is deterministic, so a restart lands on the same entries.
+            model.recompile_plan();
             let mut run = Self {
                 model,
                 engine,
@@ -456,6 +459,16 @@ impl<S: EngineStorage, J: JournalStore, R: RunState> DurableRun<S, J, R> {
                     APPROVAL_WAIT_SECS,
                     now_ms,
                 )?;
+            }
+            // A cursor on a branch marker / arm end: consume the pure markers
+            // (guard included) and persist the advance, so the returned
+            // `ExecuteStep` names the entry the model now holds.
+            ModelPhase::Running if self.model.plan.step_at(self.model.step_index).is_none() => {
+                let mut next = self.model.clone();
+                let effects = next_effects(&mut next, now_ms, &self.spawns);
+                self.persist(&next)?;
+                self.model = next;
+                return Ok(effects);
             }
             _ => {}
         }

@@ -11,10 +11,11 @@
 //! (RunModel, RunMsg) -> (RunModel, Vec<RunEffect>)
 //! ```
 //!
-//! `Delay` parks, `RequestApproval` awaits a decision, every other action is
-//! an `ExecuteStep` the host runs through the existing boundary. Graph
-//! workflows return [`RunEffect::Unsupported`] so the host keeps them on the
-//! old engine until their turn. No clock, no I/O.
+//! `Delay` parks, `RequestApproval` awaits a decision, `Branch` chooses an arm
+//! at its marker from the pure guard, every other action is an `ExecuteStep`
+//! the host runs through the existing boundary. Graph workflows return
+//! [`RunEffect::Unsupported`] so the host keeps them on the old engine until
+//! their turn. No clock, no I/O.
 
 use std::collections::BTreeMap;
 
@@ -23,6 +24,7 @@ use serde::{Deserialize, Serialize};
 use crate::schema::{Action, Step, StepOnError, Workflow};
 
 use super::boundary::{ActionPartition, is_failure_value, partition};
+use super::branch::{PureGuard, check_pure_guard, evaluate_pure_guard};
 use super::control_flow::{
     RetryCoordinator, build_approval_payload, disposition_for_kind, fail_run_value,
     is_approval_decision, leaf_preview_for_value, validate_graph_runtime,
@@ -91,6 +93,143 @@ pub enum ParkReason {
     Spawn,
 }
 
+/// Which arm a [`PlanEntry::ArmEnd`] closes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BranchSide {
+    /// The `then` arm.
+    Then,
+    /// The `else` arm.
+    Else,
+}
+
+impl BranchSide {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Then => "then",
+            Self::Else => "else",
+        }
+    }
+}
+
+/// One entry in the compiled linear plan (bd-durable-branch-hhgc).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PlanEntry {
+    /// An ordinary linear step. `authored` is its position in the authored
+    /// step list (top level, or its branch arm), so default step names and
+    /// spawn-spec positions keep their authored identity.
+    Step {
+        /// Authored position.
+        authored: usize,
+        /// The authored step (boxed: `Step` is far larger than a marker).
+        step: Box<Step>,
+    },
+    /// A branch marker: `then_len` entries follow, then the then arm's
+    /// [`PlanEntry::ArmEnd`], then `else_len` entries and the else arm's
+    /// `ArmEnd`.
+    Branch {
+        /// Authored position of the branch step.
+        authored: usize,
+        /// The normalized pure guard.
+        guard: String,
+        /// Entries in the `then` arm.
+        then_len: usize,
+        /// Entries in the `else` arm.
+        else_len: usize,
+    },
+    /// The end of a chosen arm: land the branch step's value and jump past
+    /// the whole branch. Static, so a restart re-derives the same jump.
+    ArmEnd {
+        /// The branch step's output name.
+        branch: String,
+        /// Which arm ended.
+        side: BranchSide,
+        /// Entry position after the whole branch.
+        after: usize,
+    },
+}
+
+/// The compiled linear plan: authored steps expanded into a flat entry list
+/// with branch markers and static arm ends.
+///
+/// `serde(default)` keeps a model written before the branch slice readable:
+/// [`RunPlan::compile`] fills it deterministically at open.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct RunPlan {
+    /// Entries in execution order.
+    pub entries: Vec<PlanEntry>,
+}
+
+impl RunPlan {
+    /// Compile the authored steps into entries. Deterministic: no clock, no
+    /// environment, no run state.
+    pub fn compile(workflow: &Workflow) -> Self {
+        let mut entries: Vec<PlanEntry> = Vec::new();
+        for (index, step) in workflow.steps.iter().enumerate() {
+            let Action::Branch {
+                if_guard,
+                then,
+                else_steps,
+            } = &step.action
+            else {
+                entries.push(PlanEntry::Step {
+                    authored: index,
+                    step: Box::new(step.clone()),
+                });
+                continue;
+            };
+            let branch = step_name(step, index);
+            entries.push(PlanEntry::Branch {
+                authored: index,
+                guard: if_guard.clone(),
+                then_len: then.len(),
+                else_len: else_steps.len(),
+            });
+            let mut ends: Vec<usize> = Vec::new();
+            for (arm_index, arm_step) in then.iter().enumerate() {
+                entries.push(PlanEntry::Step {
+                    authored: arm_index,
+                    step: Box::new(arm_step.clone()),
+                });
+            }
+            ends.push(entries.len());
+            entries.push(PlanEntry::ArmEnd {
+                branch: branch.clone(),
+                side: BranchSide::Then,
+                after: 0,
+            });
+            for (arm_index, arm_step) in else_steps.iter().enumerate() {
+                entries.push(PlanEntry::Step {
+                    authored: arm_index,
+                    step: Box::new(arm_step.clone()),
+                });
+            }
+            ends.push(entries.len());
+            entries.push(PlanEntry::ArmEnd {
+                branch: branch.clone(),
+                side: BranchSide::Else,
+                after: 0,
+            });
+            let after = entries.len();
+            for end in ends {
+                if let PlanEntry::ArmEnd { after: slot, .. } = &mut entries[end] {
+                    *slot = after;
+                }
+            }
+        }
+        Self { entries }
+    }
+
+    /// The compiled current step, when the cursor is on one.
+    pub fn step_at(&self, index: usize) -> Option<(usize, &Step)> {
+        match self.entries.get(index) {
+            Some(PlanEntry::Step { authored, step }) => Some((*authored, step.as_ref())),
+            _ => None,
+        }
+    }
+}
+
 /// The persisted linear run state.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RunModel {
@@ -98,9 +237,12 @@ pub struct RunModel {
     pub run_id: String,
     /// Workflow definition (stored so a restart has the same steps).
     pub workflow: Workflow,
+    /// The compiled linear plan (bd-durable-branch-hhgc).
+    #[serde(default)]
+    pub plan: RunPlan,
     /// Trigger payload.
     pub trigger: serde_json::Value,
-    /// Next step to execute.
+    /// Next plan entry to execute.
     pub step_index: usize,
     /// Outputs by step name.
     pub outputs: BTreeMap<String, serde_json::Value>,
@@ -224,13 +366,23 @@ pub enum RunEffect {
 impl RunModel {
     /// New model at `Ready`.
     pub fn new(run_id: impl Into<String>, workflow: Workflow, trigger: serde_json::Value) -> Self {
+        let plan = RunPlan::compile(&workflow);
         Self {
             run_id: run_id.into(),
             workflow,
+            plan,
             trigger,
             step_index: 0,
             outputs: BTreeMap::new(),
             phase: RunPhase::Ready,
+        }
+    }
+
+    /// Fill a deserialized model's plan when it predates the branch slice.
+    /// Deterministic, so a restart compiles the same entries.
+    pub fn recompile_plan(&mut self) {
+        if self.plan.entries.is_empty() && !self.workflow.steps.is_empty() {
+            self.plan = RunPlan::compile(&self.workflow);
         }
     }
 
@@ -277,10 +429,14 @@ pub fn advance_with(
             if next.phase != RunPhase::Running {
                 return (next, Vec::new());
             }
-            let Some(step) = next.workflow.steps.get(next.step_index) else {
+            let Some((authored, step)) = next
+                .plan
+                .step_at(next.step_index)
+                .map(|(authored, step)| (authored, step.clone()))
+            else {
                 return (next, Vec::new());
             };
-            let name = step_name(step, next.step_index);
+            let name = step_name(&step, authored);
             if step.on_error == StepOnError::FailRun && is_failure_value(value) {
                 // The executor's fail_run arm already returns the enriched
                 // bundle; a guard/render refusal does not, so build it here with
@@ -326,15 +482,19 @@ pub fn advance_with(
                         }],
                     );
                 }
-                let step = next.workflow.steps.get(next.step_index);
-                let error = format!("spawn-await {}: timed out after {}s", spec.spawn_key, {
-                    step.map_or(0, |s| match &s.action {
-                        Action::Spawn {
-                            no_claim_timeout, ..
-                        } => *no_claim_timeout,
-                        _ => 0,
-                    })
-                });
+                let timeout =
+                    next.plan
+                        .step_at(next.step_index)
+                        .map_or(0, |(_, s)| match &s.action {
+                            Action::Spawn {
+                                no_claim_timeout, ..
+                            } => *no_claim_timeout,
+                            _ => 0,
+                        });
+                let error = format!(
+                    "spawn-await {}: timed out after {}s",
+                    spec.spawn_key, timeout
+                );
                 return settle_spawn(
                     &mut next,
                     &node,
@@ -346,10 +506,14 @@ pub fn advance_with(
             if !matches!(next.phase, RunPhase::Parked { .. }) {
                 return (next, Vec::new());
             }
-            let Some(step) = next.workflow.steps.get(next.step_index) else {
+            let Some((authored, step)) = next
+                .plan
+                .step_at(next.step_index)
+                .map(|(authored, step)| (authored, step.clone()))
+            else {
                 return (next, Vec::new());
             };
-            let name = step_name(step, next.step_index);
+            let name = step_name(&step, authored);
             next.outputs
                 .insert(name, serde_json::json!({"ok": true, "waited": true}));
             next.step_index += 1;
@@ -399,10 +563,14 @@ pub fn advance_with(
             if !matches!(next.phase, RunPhase::AwaitingApproval { .. }) {
                 return (next, Vec::new());
             }
-            let Some(step) = next.workflow.steps.get(next.step_index) else {
+            let Some((authored, step)) = next
+                .plan
+                .step_at(next.step_index)
+                .map(|(authored, step)| (authored, step.clone()))
+            else {
                 return (next, Vec::new());
             };
-            let name = step_name(step, next.step_index);
+            let name = step_name(&step, authored);
             next.outputs.insert(name, decision.clone());
             next.step_index += 1;
             next.phase = RunPhase::Running;
@@ -416,15 +584,98 @@ pub fn advance_with(
     }
 }
 
-fn next_effects(model: &mut RunModel, now_ms: u64, spawns: &[Option<SpawnSpec>]) -> Vec<RunEffect> {
-    if model.step_index >= model.workflow.steps.len() {
-        model.phase = RunPhase::Succeeded;
-        return vec![RunEffect::Complete {
-            output: serde_json::json!({"status": "succeeded", "steps": model.outputs}),
-        }];
+pub(crate) fn next_effects(
+    model: &mut RunModel,
+    now_ms: u64,
+    spawns: &[Option<SpawnSpec>],
+) -> Vec<RunEffect> {
+    loop {
+        let Some(entry) = model.plan.entries.get(model.step_index).cloned() else {
+            model.phase = RunPhase::Succeeded;
+            return vec![RunEffect::Complete {
+                output: serde_json::json!({"status": "succeeded", "steps": model.outputs}),
+            }];
+        };
+        match entry {
+            PlanEntry::Step { authored, step } => {
+                return step_effects(model, authored, *step, now_ms, spawns);
+            }
+            PlanEntry::Branch {
+                authored,
+                guard,
+                then_len,
+                else_len,
+            } => {
+                let name = model.workflow.steps.get(authored).map_or_else(
+                    || format!("step_{}", authored + 1),
+                    |s| step_name(s, authored),
+                );
+                match evaluate_pure_guard(&guard, &model.trigger, &model.outputs) {
+                    PureGuard::True => {
+                        // Enter the then arm; its ArmEnd also handles an
+                        // empty arm, so the two cases share one layout.
+                        model.step_index += 1;
+                        model.phase = RunPhase::Running;
+                    }
+                    PureGuard::False => {
+                        // Skip the then entries and their ArmEnd.
+                        model.step_index += then_len + 2;
+                        model.phase = RunPhase::Running;
+                    }
+                    PureGuard::Error(error) => {
+                        let value = serde_json::json!({"ok": false, "error": error});
+                        let fail_run = model
+                            .workflow
+                            .steps
+                            .get(authored)
+                            .is_some_and(|s| s.on_error == StepOnError::FailRun);
+                        model.outputs.insert(name.clone(), value.clone());
+                        if fail_run {
+                            let output = fail_run_value(&name, &value, None);
+                            model.phase = RunPhase::Failed {
+                                error: output
+                                    .get("error")
+                                    .and_then(|e| e.as_str())
+                                    .unwrap_or("branch guard failed")
+                                    .to_string(),
+                            };
+                            return vec![RunEffect::Fail { step: name, output }];
+                        }
+                        // `on_error: continue`: land the failure value and
+                        // skip both arms, exactly like a failed leaf.
+                        model.step_index += then_len + else_len + 3;
+                        model.phase = RunPhase::Running;
+                    }
+                }
+            }
+            PlanEntry::ArmEnd {
+                branch,
+                side,
+                after,
+            } => {
+                model
+                    .outputs
+                    .insert(branch, serde_json::json!({"branch": side.as_str()}));
+                model.step_index = after;
+                model.phase = RunPhase::Running;
+            }
+        }
     }
-    let step = model.workflow.steps[model.step_index].clone();
-    let name = step_name(&step, model.step_index);
+}
+
+/// Effects for one authored linear step.
+///
+/// `authored` is the step's authored position (top level, or its branch arm),
+/// so names and spawn-spec positions do not move when a branch expands above
+/// them.
+fn step_effects(
+    model: &mut RunModel,
+    authored: usize,
+    step: Step,
+    now_ms: u64,
+    spawns: &[Option<SpawnSpec>],
+) -> Vec<RunEffect> {
+    let name = step_name(&step, authored);
     match &step.action {
         Action::Delay { secs } => {
             let until_ms = now_ms.saturating_add(secs.saturating_mul(1_000));
@@ -455,8 +706,7 @@ fn next_effects(model: &mut RunModel, now_ms: u64, spawns: &[Option<SpawnSpec>])
             no_claim_timeout: _,
             context: _,
         } => {
-            let name = step_name(&step, model.step_index);
-            let Some(spec) = spawns.get(model.step_index).and_then(Option::as_ref) else {
+            let Some(spec) = spawns.get(authored).and_then(Option::as_ref) else {
                 // Design (f): a profile that cannot be prepared is a step
                 // VALUE, never a run failure.
                 let error = unknown_profile_error(profile);
@@ -505,7 +755,7 @@ fn next_effects(model: &mut RunModel, now_ms: u64, spawns: &[Option<SpawnSpec>])
             if matches!(partition(action), ActionPartition::HostSink { .. }) {
                 model.phase = RunPhase::Running;
                 return vec![RunEffect::ExecuteStep {
-                    index: model.step_index,
+                    index: authored,
                     step: Box::new(step),
                 }];
             }
@@ -530,10 +780,11 @@ fn next_effects(model: &mut RunModel, now_ms: u64, spawns: &[Option<SpawnSpec>])
 /// `None` when the durable models can sequence this workflow end to end.
 ///
 /// The engine partitions every action. A `steps:` workflow is sequenced by the
-/// linear model (host-sink actions plus `delay`, `request_approval`, and
-/// `spawn`); a `graph:` workflow by the graph model under
-/// [`graph_unsupported_reason`]. Everything else is a shape the host keeps on
-/// the old engine, so it is refused before a run row or a state row exists.
+/// linear model (host-sink actions plus `delay`, `request_approval`, `spawn`,
+/// and a pure-guard `branch` whose arms are host-sink leaves); a `graph:`
+/// workflow by the graph model under [`graph_unsupported_reason`]. Everything
+/// else is a shape the host keeps on the old engine, so it is refused before a
+/// run row or a state row exists.
 ///
 /// This is SHAPE only (bd-spawn-launcher-flip-d8mv). Admission of a spawn is
 /// capability-based and lives with the host that must perform it: a host
@@ -544,12 +795,44 @@ pub fn unsupported_reason(workflow: &Workflow) -> Option<String> {
         return graph_unsupported_reason(workflow);
     }
     for (index, step) in workflow.steps.iter().enumerate() {
-        if !is_linear(&step.action) {
-            return Some(format!(
-                "step '{}' uses '{}', which the linear model cannot sequence yet",
-                step_name(step, index),
-                step.action.type_name()
-            ));
+        match &step.action {
+            // bd-durable-branch-hhgc: a branch is a choice inside the linear
+            // plan. Its guard must be decidable from trigger + outputs (the
+            // fold has no host), and its arms must be plain host-sink leaves
+            // — nested control flow is a later shape, not a silent sub-run.
+            Action::Branch {
+                if_guard,
+                then,
+                else_steps,
+            } => {
+                if let Err(reason) = check_pure_guard(if_guard) {
+                    return Some(format!(
+                        "step '{}' branch guard is not pure: {reason}",
+                        step_name(step, index)
+                    ));
+                }
+                for arm_step in then.iter().chain(else_steps.iter()) {
+                    if !matches!(
+                        partition(&arm_step.action),
+                        ActionPartition::HostSink { .. }
+                    ) {
+                        return Some(format!(
+                            "step '{}' branch arm step '{}' uses '{}', which the linear model cannot sequence inside an arm",
+                            step_name(step, index),
+                            arm_step.name.as_deref().unwrap_or("<unnamed>"),
+                            arm_step.action.type_name()
+                        ));
+                    }
+                }
+            }
+            action if !is_linear(action) => {
+                return Some(format!(
+                    "step '{}' uses '{}', which the linear model cannot sequence yet",
+                    step_name(step, index),
+                    action.type_name()
+                ));
+            }
+            _ => {}
         }
     }
     None
@@ -574,13 +857,16 @@ fn settle_spawn(
     now_ms: u64,
     spawns: &[Option<SpawnSpec>],
 ) -> (RunModel, Vec<RunEffect>) {
-    let step = model.workflow.steps.get(model.step_index).cloned();
+    let step = model
+        .plan
+        .step_at(model.step_index)
+        .map(|(authored, step)| (authored, step.clone()));
     let name = step
         .as_ref()
-        .map_or_else(|| node.to_string(), |s| step_name(s, model.step_index));
+        .map_or_else(|| node.to_string(), |(authored, s)| step_name(s, *authored));
     if step
         .as_ref()
-        .is_some_and(|s| s.on_error == StepOnError::FailRun)
+        .is_some_and(|(_, s)| s.on_error == StepOnError::FailRun)
         && is_failure_value(&value)
     {
         let output = fail_run_value(&name, &value, None);
@@ -623,11 +909,14 @@ pub fn resume_effects(model: &RunModel) -> Vec<RunEffect> {
             step: step.clone(),
             message: message.clone(),
         }],
-        RunPhase::Running => match model.workflow.steps.get(model.step_index) {
-            Some(step) => vec![RunEffect::ExecuteStep {
-                index: model.step_index,
+        RunPhase::Running => match model.plan.step_at(model.step_index) {
+            Some((authored, step)) => vec![RunEffect::ExecuteStep {
+                index: authored,
                 step: Box::new(step.clone()),
             }],
+            // A marker is consumed by the next transition; `resume` advances
+            // one before it asks for effects, so this is unreachable for a
+            // model the fold wrote.
             None => Vec::new(),
         },
     }

@@ -9533,6 +9533,61 @@ steps:
             assert!(err.contains("cycle"), "{err}");
         }
 
+        /// bd-durable-branch-hhgc: a pure-guard branch over host-sink leaves
+        /// is one linear workflow, and spawn-before-branch (the shipped
+        /// housekeeper shape) is admitted once a launcher is present.
+        #[test]
+        fn a_pure_branch_is_linear() {
+            let mut wf = linear_workflow();
+            wf.steps = vec![
+                Step {
+                    name: Some("spawn_it".into()),
+                    guard: None,
+                    on_error: StepOnError::Continue,
+                    build_slot: false,
+                    action: Action::Spawn {
+                        profile: "coder".into(),
+                        harness: None,
+                        workflow: None,
+                        await_: true,
+                        no_claim_timeout: 600,
+                        context: None,
+                    },
+                },
+                Step {
+                    name: Some("choose".into()),
+                    guard: None,
+                    on_error: StepOnError::Continue,
+                    build_slot: false,
+                    action: Action::Branch {
+                        if_guard: "{{trigger.gate}} == true".into(),
+                        then: vec![linear_step()],
+                        else_steps: vec![linear_step()],
+                    },
+                },
+            ];
+            let err = durable_route(&wf, true, false).expect_err("no launcher");
+            assert!(err.contains("launcher"), "{err}");
+            assert!(
+                durable_route(&wf, true, true).is_ok(),
+                "spawn-before-branch is one linear shape"
+            );
+        }
+
+        /// Only the pure comparison grammar admits a branch; anything that
+        /// needs the host refuses before any row.
+        #[test]
+        fn an_impure_branch_refuses() {
+            let mut wf = linear_workflow();
+            wf.steps[0].action = Action::Branch {
+                if_guard: "len(\"x\") > 0".into(),
+                then: vec![linear_step()],
+                else_steps: vec![],
+            };
+            let err = durable_route(&wf, true, false).expect_err("impure guard");
+            assert!(err.contains("not pure"), "{err}");
+        }
+
         /// bd-spawn-launcher-flip-d8mv: admission is capability-based. A host
         /// with no launcher refuses a spawn workflow BEFORE any row; the same
         /// workflow routes once a launcher is installed.

@@ -870,3 +870,409 @@ fn spawn_restart_reissues_the_same_key() {
     };
     assert_eq!(stored, spec.clone());
 }
+
+// ---------------------------------------------------------------------------
+// Branch in the linear plan (bd-durable-branch-hhgc)
+// ---------------------------------------------------------------------------
+
+fn dm(tag: &str) -> Action {
+    Action::SendDm {
+        to: "housekeeper".into(),
+        body: format!("arm:{tag}"),
+        project: None,
+    }
+}
+
+fn named(name: &str, action: Action, on_error: StepOnError) -> Step {
+    Step {
+        name: Some(name.into()),
+        guard: None,
+        on_error,
+        build_slot: false,
+        action,
+    }
+}
+
+fn branch(guard: &str, then: Vec<Step>, else_steps: Vec<Step>, on_error: StepOnError) -> Step {
+    Step {
+        name: Some("choose".into()),
+        guard: None,
+        on_error,
+        build_slot: false,
+        action: Action::Branch {
+            if_guard: guard.into(),
+            then,
+            else_steps,
+        },
+    }
+}
+
+fn branch_workflow(on_error: StepOnError) -> Workflow {
+    workflow(vec![branch(
+        "{{trigger.gate}} == true",
+        vec![
+            named("yes", dm("yes"), StepOnError::Continue),
+            named("yes-2", dm("yes-2"), StepOnError::Continue),
+        ],
+        vec![named("no", dm("no"), StepOnError::Continue)],
+        on_error,
+    )])
+}
+
+fn started(workflow: Workflow, trigger: serde_json::Value) -> (RunModel, Vec<RunEffect>) {
+    let model = RunModel::new("run-branch", workflow, trigger);
+    advance(&model, &RunMsg::Start { now_ms: 1_000 })
+}
+
+/// The chosen arm runs and the other one never dispatches.
+#[test]
+fn branch_true_arm_runs_false_skips() {
+    for (gate, taken, skipped, side) in [
+        (json!({"gate": true}), "yes", "no", "then"),
+        (json!({"gate": false}), "no", "yes", "else"),
+    ] {
+        let (model, effects) = started(branch_workflow(StepOnError::Continue), gate);
+        let [RunEffect::ExecuteStep { step, .. }] = effects.as_slice() else {
+            panic!("the chosen arm's first step runs: {effects:?}");
+        };
+        assert_eq!(step.name.as_deref(), Some(taken));
+        // Drive the chosen arm to completion (the then arm has two steps).
+        let (model, effects) = {
+            let (mut model, mut effects) = (model, effects);
+            for tick in 0..4 {
+                match effects.as_slice() {
+                    [RunEffect::ExecuteStep { .. }] => {
+                        let (next, follow) = advance(
+                            &model,
+                            &RunMsg::StepDone {
+                                value: json!({"ok": true}),
+                                now_ms: 2_000 + tick,
+                            },
+                        );
+                        model = next;
+                        effects = follow;
+                    }
+                    _ => break,
+                }
+            }
+            (model, effects)
+        };
+        assert!(
+            matches!(effects.as_slice(), [RunEffect::Complete { .. }]),
+            "the run completes after the chosen arm: {effects:?}"
+        );
+        assert!(model.outputs.contains_key(taken), "{:?}", model.outputs);
+        assert!(
+            !model.outputs.contains_key(skipped),
+            "the unselected arm never dispatched: {:?}",
+            model.outputs
+        );
+        assert_eq!(model.outputs["choose"], json!({"branch": side}));
+    }
+}
+
+/// A restart mid-arm resumes the SAME arm: the marker is not re-evaluated.
+#[test]
+fn branch_restart_never_flips_arm() {
+    let (model, effects) = started(
+        branch_workflow(StepOnError::Continue),
+        json!({"gate": true}),
+    );
+    assert!(matches!(
+        effects.as_slice(),
+        [RunEffect::ExecuteStep { .. }]
+    ));
+    let (model, effects) = advance(
+        &model,
+        &RunMsg::StepDone {
+            value: json!({"ok": true}),
+            now_ms: 2_000,
+        },
+    );
+    let [RunEffect::ExecuteStep { step, .. }] = effects.as_slice() else {
+        panic!("the then arm's second step is next: {effects:?}");
+    };
+    assert_eq!(step.name.as_deref(), Some("yes-2"));
+
+    // The restart: the persisted model carries the arm cursor, not the choice.
+    let json_text = serde_json::to_string(&model).expect("serialize");
+    let restored: RunModel = serde_json::from_str(&json_text).expect("restore");
+    let effects = resume_effects(&restored);
+    let [RunEffect::ExecuteStep { step, .. }] = effects.as_slice() else {
+        panic!("resume re-issues the same arm step: {effects:?}");
+    };
+    assert_eq!(step.name.as_deref(), Some("yes-2"), "never the else arm");
+
+    let (restored, effects) = advance(
+        &restored,
+        &RunMsg::StepDone {
+            value: json!({"ok": true}),
+            now_ms: 3_000,
+        },
+    );
+    assert!(matches!(effects.as_slice(), [RunEffect::Complete { .. }]));
+    assert_eq!(restored.outputs["choose"], json!({"branch": "then"}));
+    assert!(restored.outputs.contains_key("yes"));
+    assert!(restored.outputs.contains_key("yes-2"));
+    assert!(!restored.outputs.contains_key("no"));
+}
+
+/// An undecidable guard is a step FAILURE, never a silent `else`: `continue`
+/// lands the value and skips both arms; `fail_run` emits the enriched bundle.
+#[test]
+fn branch_guard_error_applies_on_error() {
+    let broken = || branch_workflow_with_guard("{{steps.missing.value}} == 1");
+
+    let (model, effects) = started(broken(), json!({}));
+    assert!(
+        matches!(effects.as_slice(), [RunEffect::Complete { .. }]),
+        "on_error: continue skips both arms: {effects:?}"
+    );
+    let landed = &model.outputs["choose"];
+    assert_eq!(landed["ok"], json!(false));
+    assert!(
+        landed["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("unknown reference")),
+        "{landed}"
+    );
+    assert!(!model.outputs.contains_key("yes"));
+    assert!(!model.outputs.contains_key("no"));
+
+    let mut wf = broken();
+    wf.steps[0].on_error = StepOnError::FailRun;
+    let model = RunModel::new("run-branch-fail", wf, json!({}));
+    let (model, effects) = advance(&model, &RunMsg::Start { now_ms: 1_000 });
+    let [RunEffect::Fail { step, output }] = effects.as_slice() else {
+        panic!("fail_run emits the bundle: {effects:?}");
+    };
+    assert_eq!(step, "choose");
+    assert_eq!(output["status"], json!("failed"));
+    assert_eq!(output["failed_step"], json!("choose"));
+    assert!(matches!(model.phase, RunPhase::Failed { .. }));
+}
+
+fn branch_workflow_with_guard(guard: &str) -> Workflow {
+    workflow(vec![branch(
+        guard,
+        vec![named("yes", dm("yes"), StepOnError::Continue)],
+        vec![named("no", dm("no"), StepOnError::Continue)],
+        StepOnError::Continue,
+    )])
+}
+
+/// Spawn BEFORE a branch keeps the linear model: the spawn park settles, the
+/// marker picks the arm, and the whole run stays in one plan.
+#[test]
+fn spawn_before_branch_stays_linear() {
+    let wf = workflow(vec![
+        named("spawn_it", spawn_action(true, 600), StepOnError::Continue),
+        branch_workflow_with_guard("{{trigger.gate}} == true")
+            .steps
+            .remove(0),
+    ]);
+    assert!(
+        unsupported_reason(&wf).is_none(),
+        "spawn-before-branch is one linear shape"
+    );
+    let model = RunModel::new("run-spawn-branch", wf, json!({"gate": true}));
+    let spec = spawn_spec("run-spawn-branch", "spawn_it", true, 600);
+    let (model, effects) = advance_with(&model, &RunMsg::Start { now_ms: 1_000 }, &[Some(spec)]);
+    let [
+        RunEffect::StartSpawn { node, .. },
+        RunEffect::ParkUntil { .. },
+    ] = effects.as_slice()
+    else {
+        panic!("the spawn parks before the branch: {effects:?}");
+    };
+    assert_eq!(node, "spawn_it");
+
+    let (model, effects) = advance_with(
+        &model,
+        &RunMsg::SpawnSettled {
+            node: "spawn_it".into(),
+            value: json!({"patch": "p1"}),
+            now_ms: 2_000,
+        },
+        &[],
+    );
+    let [RunEffect::ExecuteStep { step, .. }] = effects.as_slice() else {
+        panic!("the branch picks the then arm after the spawn: {effects:?}");
+    };
+    assert_eq!(step.name.as_deref(), Some("yes"));
+    assert_eq!(model.phase, RunPhase::Running);
+}
+
+fn spawn_action(await_: bool, no_claim_timeout: u64) -> Action {
+    Action::Spawn {
+        profile: "coder".into(),
+        harness: None,
+        workflow: None,
+        await_,
+        no_claim_timeout,
+        context: None,
+    }
+}
+
+/// Only the pure comparison grammar is admitted; anything else — a function
+/// call, arithmetic, a nested control-flow or spawn step in an arm — refuses
+/// the whole workflow.
+#[test]
+fn branch_refuses_impure_guards_and_unsupported_arms() {
+    for guard in [
+        "len(\"x\") > 0",
+        "1 + 1 == 2",
+        "shell(\"rm -rf /\") == 0",
+        "{{trigger.gate}} == true ? true : false",
+    ] {
+        let wf = branch_workflow_with_guard(guard);
+        let reason = unsupported_reason(&wf).expect("an impure guard refuses");
+        assert!(reason.contains("not pure"), "{guard}: {reason}");
+    }
+
+    // A nested control-flow step in an arm refuses whole.
+    let wf = workflow(vec![branch(
+        "{{trigger.gate}} == true",
+        vec![step(Action::Delay { secs: 1 }, StepOnError::Continue)],
+        vec![],
+        StepOnError::Continue,
+    )]);
+    let reason = unsupported_reason(&wf).expect("nested control flow refuses");
+    assert!(reason.contains("inside an arm"), "{reason}");
+
+    // A spawn inside an arm has no prepared spec, so it refuses rather than
+    // landing the unknown-profile value at drive time.
+    let wf = workflow(vec![branch(
+        "{{trigger.gate}} == true",
+        vec![step(spawn_action(true, 600), StepOnError::Continue)],
+        vec![],
+        StepOnError::Continue,
+    )]);
+    let reason = unsupported_reason(&wf).expect("spawn in an arm refuses");
+    assert!(reason.contains("inside an arm"), "{reason}");
+}
+
+/// The two shipped toron workflows that spawn BEFORE they branch are one
+/// linear shape each (bd-durable-branch-hhgc): the spawn keeps the model
+/// linear, the branch is a pure-guard choice, and every arm step is a
+/// host-sink leaf.
+#[test]
+fn shipped_spawn_then_branch_workflows_are_linear() {
+    for (name, yaml) in [
+        (
+            "housekeeper-diagnose",
+            include_str!("../../../workflows/housekeeper-diagnose.yaml"),
+        ),
+        (
+            "agent-reach-upgrade",
+            include_str!("../../../workflows/agent-reach-upgrade.yaml"),
+        ),
+    ] {
+        let wf = toron_workflow::schema::parse_workflow(yaml).expect("parse workflow");
+        assert_eq!(wf.name, name);
+        assert!(
+            matches!(wf.steps[0].action, Action::Spawn { .. }),
+            "{name}: spawn first keeps spawn-before-branch"
+        );
+        assert!(
+            matches!(wf.steps[1].action, Action::Branch { .. }),
+            "{name}: the branch follows the spawn"
+        );
+        assert!(
+            unsupported_reason(&wf).is_none(),
+            "{name}: refused: {:?}",
+            unsupported_reason(&wf)
+        );
+    }
+}
+
+/// The shipped `agent-reach-upgrade` fail-closed arm reaches a FAILED run, not
+/// a green one: the successful `send_dm` is not the last step, and the
+/// deterministic `verify: "false"` with `on_error: fail_run` emits the
+/// failure bundle (bd-durable-branch-hhgc, replacing the unportable
+/// `call_webhook`).
+#[test]
+fn shipped_agent_reach_else_arm_fails_closed() {
+    let parse = || {
+        toron_workflow::schema::parse_workflow(include_str!(
+            "../../../workflows/agent-reach-upgrade.yaml"
+        ))
+        .expect("parse agent-reach-upgrade")
+    };
+
+    // verified = false → else arm → notify-fail succeeds → fail-closed fails.
+    let model = RunModel::new("run-reach", parse(), json!({}));
+    let spec = spawn_spec("run-reach", "upgrade", true, 600);
+    let (model, effects) = advance_with(&model, &RunMsg::Start { now_ms: 0 }, &[Some(spec)]);
+    assert!(matches!(
+        effects.as_slice(),
+        [RunEffect::StartSpawn { .. }, ..]
+    ));
+    let (model, effects) = advance_with(
+        &model,
+        &RunMsg::SpawnSettled {
+            node: "upgrade".into(),
+            value: json!({"verified": false}),
+            now_ms: 1_000,
+        },
+        &[],
+    );
+    let [RunEffect::ExecuteStep { step, .. }] = effects.as_slice() else {
+        panic!("the else arm's notification runs: {effects:?}");
+    };
+    assert_eq!(step.name.as_deref(), Some("notify-fail"));
+
+    let (model, effects) = advance(
+        &model,
+        &RunMsg::StepDone {
+            value: json!({"ok": true}),
+            now_ms: 2_000,
+        },
+    );
+    let [RunEffect::ExecuteStep { step, .. }] = effects.as_slice() else {
+        panic!("a second else-arm step must follow, or the run goes green: {effects:?}");
+    };
+    assert_eq!(step.name.as_deref(), Some("fail-closed"));
+
+    let (model, effects) = advance(
+        &model,
+        &RunMsg::StepDone {
+            value: json!({"ok": false, "error": "exit status 1"}),
+            now_ms: 3_000,
+        },
+    );
+    let [RunEffect::Fail { step, output }] = effects.as_slice() else {
+        panic!("the else arm fails the run: {effects:?}");
+    };
+    assert_eq!(step, "fail-closed");
+    assert_eq!(output["status"], json!("failed"));
+    assert_eq!(output["failed_step"], json!("fail-closed"));
+    assert!(matches!(model.phase, RunPhase::Failed { .. }));
+
+    // verified = true → then arm → notify-ok → green.
+    let model = RunModel::new("run-reach-ok", parse(), json!({}));
+    let spec = spawn_spec("run-reach-ok", "upgrade", true, 600);
+    let (model, _) = advance_with(&model, &RunMsg::Start { now_ms: 0 }, &[Some(spec)]);
+    let (model, effects) = advance_with(
+        &model,
+        &RunMsg::SpawnSettled {
+            node: "upgrade".into(),
+            value: json!({"verified": true}),
+            now_ms: 1_000,
+        },
+        &[],
+    );
+    let [RunEffect::ExecuteStep { step, .. }] = effects.as_slice() else {
+        panic!("the then arm runs: {effects:?}");
+    };
+    assert_eq!(step.name.as_deref(), Some("notify-ok"));
+    let (model, effects) = advance(
+        &model,
+        &RunMsg::StepDone {
+            value: json!({"ok": true}),
+            now_ms: 2_000,
+        },
+    );
+    assert!(matches!(effects.as_slice(), [RunEffect::Complete { .. }]));
+    assert_eq!(model.phase, RunPhase::Succeeded);
+}
