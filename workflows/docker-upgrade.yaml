@@ -39,35 +39,31 @@ steps:
     no_claim_timeout: 600
     on_error: fail_run
   # The saga's five health-gates, probed on their host ports (docker-stack
-  # compose). Each probe is a call_webhook with on_error: fail_run — a dead
-  # service errors the step and FAILS the run (Spec 0), so `on_failure: bead`
-  # fires with the failing step in the bundle.
+  # compose). Each probe is a shell `verify` with on_error: fail_run — a dead
+  # service exits non-zero and FAILS the run (Spec 0), so `on_failure: bead`
+  # fires with the failing step in the bundle. `call_webhook` is unsupported
+  # by contract; the engine-store gate replaces the old vendor /health probe.
   - name: gate-aiostreams
-    action: call_webhook
-    url: "http://127.0.0.1:3000/health"
-    method: GET
+    action: verify
+    command: "curl -fsS --max-time 5 http://127.0.0.1:3000/health >/dev/null"
     on_error: fail_run
-  - name: gate-resonate
-    action: call_webhook
-    url: "http://127.0.0.1:8001/health"
-    method: GET
+  - name: gate-engine-store
+    action: verify
+    command: "flywheel deps >/dev/null"
     on_error: fail_run
   - name: gate-honcho
-    action: call_webhook
-    url: "http://127.0.0.1:8010/health"
-    method: POST
+    action: verify
+    command: "curl -fsS --max-time 5 -X POST http://127.0.0.1:8010/health >/dev/null"
     on_error: fail_run
   - name: gate-pihole
-    action: call_webhook
-    url: "http://127.0.0.1:80/admin"
-    method: GET
+    action: verify
+    command: "curl -fsS --max-time 5 http://127.0.0.1:80/admin >/dev/null"
     on_error: fail_run
   - name: gate-dnscrypt
-    action: call_webhook
-    url: "http://127.0.0.1:5053/"
-    method: GET
+    action: verify
+    command: "curl -fsS --max-time 5 http://127.0.0.1:5053/ >/dev/null"
     on_error: fail_run
   - name: notify-ok
     action: send_dm
     to: housekeeper
-    body: "docker-upgrade OK — all 5 health gates passed (aiostreams/resonate/honcho/pihole/dnscrypt)"
+    body: "docker-upgrade OK — all 5 health gates passed (aiostreams/engine-store/honcho/pihole/dnscrypt)"
