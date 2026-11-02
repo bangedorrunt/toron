@@ -7,7 +7,7 @@
 //!
 //! Buzz-adapted automation: triggers fire on bus events, actions publish
 //! events back. `{{trigger}}` / `{{steps}}` template syntax + evalexpr guards
-//! (evaluated with a 100ms timeout — the Buzz pattern). Resonate durability is
+//! (evaluated with a 100ms timeout — the Buzz pattern). Durable execution is
 //! wired in bd-oge; this crate owns the schema + lint.
 
 use std::collections::BTreeMap;
@@ -160,7 +160,7 @@ pub struct InputDecl {
 
 /// A workflow DAG (`graph:` — ADR-0005 Spec 4b). Edges are derived from each
 /// node's `needs:` (a node runs when ALL its `needs` have produced output);
-/// independent nodes run concurrently within the one Resonate run.
+/// independent nodes run concurrently within the one durable run.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Graph {
     /// node name → node definition.
@@ -589,7 +589,7 @@ pub enum Action {
     },
     /// Request a human approval (suspends the run — WF-08 fix is bd-oge).
     RequestApproval { message: String },
-    /// Wait (in-process cap 270s per Buzz; Resonate unbounded in bd-oge).
+    /// Wait (in-process cap 270s per Buzz; the durable engine has no such cap).
     Delay { secs: u64 },
     /// Park the run until `until_ms` (bd-ynef, ADR-0036).
     ///
