@@ -27,8 +27,8 @@ use super::boundary::{ActionPartition, is_failure_value, partition};
 use super::branch::{PureGuard, check_pure_guard, evaluate_pure_guard};
 use super::control_flow::{
     MAX_PARALLEL_FANOUT, RetryCoordinator, build_approval_payload, disposition_for_kind,
-    fail_run_value, is_approval_decision, leaf_preview_for_value, parallel_fanout_count,
-    resolve_template_ref, validate_graph_runtime,
+    durable_child_trigger, fail_run_value, is_approval_decision, leaf_preview_for_value,
+    parallel_fanout_count, resolve_template_ref, validate_graph_runtime,
 };
 
 use super::spawn::{SpawnSpec, unknown_profile_error};
@@ -978,6 +978,21 @@ pub enum NodeState {
         /// What the wake means.
         reason: NodeParkReason,
     },
+    /// Waiting on a `call_workflow` child run (bd-durable-call-workflow-mg6y).
+    /// The trigger and id are stored, so a resume RE-ATTACHES to the same child
+    /// instead of opening a second one.
+    AwaitingChild {
+        /// Wave the node was scheduled in.
+        wave: usize,
+        /// Scheduler-level attempt (1-based; the child id embeds it).
+        attempt: u32,
+        /// `{parent_run_id}:{node}:{attempt}`.
+        child_run_id: String,
+        /// The callee workflow name (rendered).
+        workflow: String,
+        /// The exact trigger the child opens with.
+        trigger: serde_json::Value,
+    },
     /// Waiting on an operator decision. The payload is stored, not recomputed,
     /// so a resume republishes byte-identical evidence.
     AwaitingApproval {
@@ -997,7 +1012,10 @@ impl NodeState {
     pub const fn is_in_flight(&self) -> bool {
         matches!(
             self,
-            Self::Executing { .. } | Self::Parked { .. } | Self::AwaitingApproval { .. }
+            Self::Executing { .. }
+                | Self::Parked { .. }
+                | Self::AwaitingApproval { .. }
+                | Self::AwaitingChild { .. }
         )
     }
 }
@@ -1073,6 +1091,24 @@ pub enum GraphMsg {
     },
     /// A park (delay or retry backoff) is due.
     Woke {
+        /// Host time, unix millis.
+        now_ms: u64,
+    },
+    /// A `call_workflow` child finished successfully.
+    ChildSucceeded {
+        /// Parent node name.
+        node: String,
+        /// The child's terminal value.
+        output: serde_json::Value,
+        /// Host time, unix millis.
+        now_ms: u64,
+    },
+    /// A `call_workflow` child finished with a failure value (the full bundle).
+    ChildFailed {
+        /// Parent node name.
+        node: String,
+        /// The child's terminal failure value.
+        output: serde_json::Value,
         /// Host time, unix millis.
         now_ms: u64,
     },
@@ -1165,6 +1201,24 @@ pub enum GraphEffect {
         node: String,
         /// The exact promise data the host publishes.
         payload: serde_json::Value,
+    },
+    /// Open (or re-attach to) one `call_workflow` child run.
+    ChildRun {
+        /// Parent node name.
+        node: String,
+        /// `{parent_run_id}:{node}:{attempt}`.
+        child_run_id: String,
+        /// The callee workflow name.
+        workflow: String,
+        /// The child trigger.
+        trigger: serde_json::Value,
+    },
+    /// The child reached a terminal state (the join point).
+    ChildJoin {
+        /// Parent node name.
+        node: String,
+        /// The child run that finished.
+        child_run_id: String,
     },
     /// Terminal success: the outputs map (the `run_graph` shape).
     Complete {
@@ -1465,6 +1519,102 @@ pub fn advance_graph(model: &GraphModel, msg: &GraphMsg) -> (GraphModel, Vec<Gra
             effects.extend(schedule(&mut next, *now_ms));
             (next, effects)
         }
+        GraphMsg::ChildSucceeded {
+            node,
+            output,
+            now_ms,
+        } => {
+            if next.is_terminal() {
+                return (next, Vec::new());
+            }
+            let Some(NodeState::AwaitingChild { child_run_id, .. }) =
+                next.node_state.get(node).cloned()
+            else {
+                return (next, Vec::new());
+            };
+            next.outputs.insert(node.clone(), output.clone());
+            next.node_state.insert(node.clone(), NodeState::Settled);
+            let mut effects = vec![GraphEffect::ChildJoin {
+                node: node.clone(),
+                child_run_id,
+            }];
+            effects.extend(schedule(&mut next, *now_ms));
+            (next, effects)
+        }
+        GraphMsg::ChildFailed {
+            node,
+            output,
+            now_ms,
+        } => {
+            if next.is_terminal() {
+                return (next, Vec::new());
+            }
+            let Some(NodeState::AwaitingChild { child_run_id, .. }) =
+                next.node_state.get(node).cloned()
+            else {
+                return (next, Vec::new());
+            };
+            let on_error = next
+                .workflow
+                .graph
+                .as_ref()
+                .and_then(|g| g.nodes.get(node))
+                .map(|n| n.on_error);
+            let kind = output
+                .get("kind")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if on_error != Some(StepOnError::FailRun) {
+                // `continue`: land the child's FULL failure bundle.
+                next.outputs.insert(node.clone(), output.clone());
+                next.node_state.insert(node.clone(), NodeState::Settled);
+                let mut effects = vec![GraphEffect::ChildJoin {
+                    node: node.clone(),
+                    child_run_id,
+                }];
+                effects.extend(schedule(&mut next, *now_ms));
+                return (next, effects);
+            }
+            let bundle = if output.get("status").and_then(|v| v.as_str()) == Some("failed") {
+                output.clone()
+            } else {
+                fail_run_value(node, output, None)
+            };
+            let disposition = if kind.is_empty() {
+                String::new()
+            } else {
+                disposition_for_kind(&kind, None).as_str().to_string()
+            };
+            let fail = GraphFail {
+                node: node.clone(),
+                error: bundle
+                    .get("error")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("child failed")
+                    .to_string(),
+                kind,
+                disposition,
+                leaf_preview: bundle
+                    .get("leaf_preview")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+                attempts: None,
+            };
+            next.phase = GraphPhase::Failed {
+                error: fail.error.clone(),
+            };
+            (
+                next,
+                vec![
+                    GraphEffect::ChildJoin {
+                        node: node.clone(),
+                        child_run_id,
+                    },
+                    GraphEffect::Fail { fail },
+                ],
+            )
+        }
         GraphMsg::Approval {
             node,
             decision,
@@ -1525,6 +1675,17 @@ pub fn resume_graph_effects(model: &GraphModel) -> Vec<GraphEffect> {
                     payload: payload.clone(),
                 })
             }
+            NodeState::AwaitingChild {
+                child_run_id,
+                workflow,
+                trigger,
+                ..
+            } => effects.push(GraphEffect::ChildRun {
+                node: node.clone(),
+                child_run_id: child_run_id.clone(),
+                workflow: workflow.clone(),
+                trigger: trigger.clone(),
+            }),
         }
     }
     effects
@@ -1858,6 +2019,118 @@ fn schedule(model: &mut GraphModel, now_ms: u64) -> Vec<GraphEffect> {
                     model.node_state.insert(name.clone(), NodeState::Settled);
                     continue;
                 }
+                // bd-durable-call-workflow-mg6y: a child call opens a child run
+                // and parks the node on it. The child reference and trigger are
+                // read HERE, from the fold's definition + trigger + outputs.
+                Action::CallWorkflow { .. } => {
+                    let rendered = match render_action_lenient(
+                        &node.action,
+                        &model.trigger,
+                        &snapshot_map,
+                    ) {
+                        Ok(action) => action,
+                        Err(error) => {
+                            let value = serde_json::json!({ "ok": false, "error": format!("render: {error}") });
+                            if node.on_error == StepOnError::FailRun {
+                                let output = fail_run_value(name, &value, None);
+                                let error = output
+                                    .get("error")
+                                    .and_then(|e| e.as_str())
+                                    .unwrap_or("child call refused")
+                                    .to_string();
+                                model.phase = GraphPhase::Failed {
+                                    error: error.clone(),
+                                };
+                                effects.push(GraphEffect::Fail {
+                                    fail: GraphFail {
+                                        node: name.clone(),
+                                        error,
+                                        kind: String::new(),
+                                        disposition: String::new(),
+                                        leaf_preview: output
+                                            .get("leaf_preview")
+                                            .cloned()
+                                            .unwrap_or(serde_json::Value::Null),
+                                        attempts: None,
+                                    },
+                                });
+                                return effects;
+                            }
+                            model.outputs.insert(name.clone(), value);
+                            model.node_wave.insert(name.clone(), wave);
+                            model.node_state.insert(name.clone(), NodeState::Settled);
+                            continue;
+                        }
+                    };
+                    let Action::CallWorkflow {
+                        workflow: callee,
+                        inputs,
+                    } = rendered
+                    else {
+                        // Cannot happen: the arm matched the same action.
+                        continue;
+                    };
+                    let child_run_id = format!("{}:{}:{}", model.run_id, name, 1);
+                    match durable_child_trigger(
+                        &model.workflow.name,
+                        &model.trigger,
+                        &callee,
+                        &inputs,
+                        &snapshot_map,
+                    ) {
+                        Ok(trigger) => {
+                            model.node_state.insert(
+                                name.clone(),
+                                NodeState::AwaitingChild {
+                                    wave,
+                                    attempt: 1,
+                                    child_run_id: child_run_id.clone(),
+                                    workflow: callee.clone(),
+                                    trigger: trigger.clone(),
+                                },
+                            );
+                            effects.push(GraphEffect::ChildRun {
+                                node: name.clone(),
+                                child_run_id,
+                                workflow: callee,
+                                trigger,
+                            });
+                            dispatched += 1;
+                        }
+                        Err(error) => {
+                            // Defensive: static refusals happen at open.
+                            let value = serde_json::json!({ "ok": false, "error": error });
+                            if node.on_error == StepOnError::FailRun {
+                                let output = fail_run_value(name, &value, None);
+                                let error = output
+                                    .get("error")
+                                    .and_then(|e| e.as_str())
+                                    .unwrap_or("child call refused")
+                                    .to_string();
+                                model.phase = GraphPhase::Failed {
+                                    error: error.clone(),
+                                };
+                                effects.push(GraphEffect::Fail {
+                                    fail: GraphFail {
+                                        node: name.clone(),
+                                        error,
+                                        kind: String::new(),
+                                        disposition: String::new(),
+                                        leaf_preview: output
+                                            .get("leaf_preview")
+                                            .cloned()
+                                            .unwrap_or(serde_json::Value::Null),
+                                        attempts: None,
+                                    },
+                                });
+                                return effects;
+                            }
+                            model.outputs.insert(name.clone(), value);
+                            model.node_wave.insert(name.clone(), wave);
+                            model.node_state.insert(name.clone(), NodeState::Settled);
+                        }
+                    }
+                }
                 // A `retry:` policy is a per-node wrapper: dispatch the node
                 // (the executor unwraps to the inner step) and let the
                 // scheduler own the attempts (bd-durable-retry-policy-rrck).
@@ -2010,6 +2283,14 @@ pub fn has_fanout_steps(workflow: &Workflow) -> bool {
     })
 }
 
+/// True when the authored steps contain a `call_workflow` child call.
+pub fn has_call_workflow_steps(workflow: &Workflow) -> bool {
+    workflow
+        .steps
+        .iter()
+        .any(|step| matches!(step.action, Action::CallWorkflow { .. }))
+}
+
 /// True when the authored steps contain a `retry:` policy wrapper.
 pub fn has_retry_steps(workflow: &Workflow) -> bool {
     workflow
@@ -2023,7 +2304,10 @@ pub fn has_retry_steps(workflow: &Workflow) -> bool {
 /// (bd-durable-parallel-53um, bd-durable-foreach-jpgx,
 /// bd-durable-retry-policy-rrck).
 pub fn needs_graph_model(workflow: &Workflow) -> bool {
-    workflow.graph.is_some() || has_fanout_steps(workflow) || has_retry_steps(workflow)
+    workflow.graph.is_some()
+        || has_fanout_steps(workflow)
+        || has_retry_steps(workflow)
+        || has_call_workflow_steps(workflow)
 }
 
 /// Why a `retry:` wrapper cannot be sequenced as a per-node policy, if it
@@ -2040,6 +2324,12 @@ fn retry_policy_refusal(inner: &Step, max_attempts: u32) -> Option<String> {
     }
     if matches!(inner.action, Action::Retry { .. }) {
         return Some("nested retry wrappers are not sequenced; set the outer policy".to_string());
+    }
+    if matches!(inner.action, Action::CallWorkflow { .. }) {
+        return Some(
+            "a retry wrapper around a child run is not sequenced; put the policy inside the callee"
+                .to_string(),
+        );
     }
     if !is_graph_sequencable(&inner.action) {
         return Some(format!(
@@ -2149,6 +2439,9 @@ fn lowered_shape_refusal(workflow: &Workflow) -> Option<String> {
                     ));
                 }
             }
+            // A child call is native to the graph model; the callee itself is
+            // validated at open (bd-durable-call-workflow-mg6y).
+            Action::CallWorkflow { .. } => {}
             // Captain review: a graph-lowered shape mixed with spawn or a
             // linear branch refuses WHOLE rather than half-running.
             Action::Spawn { .. } | Action::Branch { .. } => {
@@ -2184,7 +2477,10 @@ pub fn durable_graph(
     if let Some(graph) = &workflow.graph {
         return Ok(Some(graph.clone()));
     }
-    if !has_fanout_steps(workflow) && !has_retry_steps(workflow) {
+    if !has_fanout_steps(workflow)
+        && !has_retry_steps(workflow)
+        && !has_call_workflow_steps(workflow)
+    {
         return Ok(None);
     }
     if let Some(reason) = lowered_shape_refusal(workflow) {
@@ -2328,7 +2624,10 @@ fn is_fanout_join(graph: &Graph, name: &str, node: &GraphNode) -> bool {
 /// than a clean route.
 pub fn graph_unsupported_reason(workflow: &Workflow) -> Option<String> {
     let Some(graph) = &workflow.graph else {
-        if has_fanout_steps(workflow) || has_retry_steps(workflow) {
+        if has_fanout_steps(workflow)
+            || has_retry_steps(workflow)
+            || has_call_workflow_steps(workflow)
+        {
             return lowered_shape_refusal(workflow);
         }
         return Some("not a graph workflow".into());
@@ -2405,6 +2704,9 @@ fn is_graph_sequencable(action: &Action) -> bool {
         Action::Retry {
             max_attempts, step, ..
         } => retry_policy_refusal(step, *max_attempts).is_none(),
+        // A child call: the callee is validated at open with the host's
+        // workflow resolver (bd-durable-call-workflow-mg6y).
+        Action::CallWorkflow { .. } => true,
         Action::Delay { .. } | Action::RequestApproval { .. } => true,
         _ => matches!(partition(action), ActionPartition::HostSink { .. }),
     }

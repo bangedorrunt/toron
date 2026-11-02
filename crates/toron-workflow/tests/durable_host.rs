@@ -19,7 +19,7 @@ use toron_workflow::engine::ActionInvocation;
 use toron_workflow::engine::durable::{
     GraphEffect, GraphModel, GraphPhase, NodeParkReason, NodeState, RunEffect, RunModel, RunPhase,
 };
-use toron_workflow::engine::durable_host::{DurableGraphRun, DurableRun, HostError};
+use toron_workflow::engine::durable_host::{ChildSeams, DurableGraphRun, DurableRun, HostError};
 use toron_workflow::engine::leaf::LeafSeams;
 use toron_workflow::engine::linear_step::{GraphNodeStep, run_graph_node_step};
 use toron_workflow::schema::{Action, Graph, GraphNode, Step, StepOnError, Workflow};
@@ -1992,4 +1992,510 @@ async fn retry_unparseable_policy_refuses_without_row() {
     );
     assert!(engine.query("run-retry-zero").is_err());
     assert!(engine.query("run-retry-cap").is_err());
+}
+
+// ---------------------------------------------------------------------------
+// call_workflow as a child run (bd-durable-call-workflow-mg6y)
+// ---------------------------------------------------------------------------
+
+fn named_workflow(name: &str, steps: Vec<Step>) -> Workflow {
+    let mut wf = workflow(steps);
+    wf.name = name.into();
+    wf
+}
+
+fn callee_workflow() -> Workflow {
+    named_workflow(
+        "child",
+        vec![step(Action::SendDm {
+            to: "pi".into(),
+            body: "child runs".into(),
+            project: None,
+        })],
+    )
+}
+
+fn calling_workflow(name: &str, callee: &str, on_error: StepOnError) -> Workflow {
+    named_workflow(
+        name,
+        vec![Step {
+            name: Some("call".into()),
+            guard: None,
+            on_error,
+            build_slot: false,
+            action: Action::CallWorkflow {
+                workflow: callee.into(),
+                inputs: json!({"goal": "ship"}),
+            },
+        }],
+    )
+}
+
+fn child_seams(child: Workflow) -> ChildSeams {
+    ChildSeams {
+        resolver: Some(std::sync::Arc::new(move |name: &str| {
+            (name == "child").then(|| child.clone())
+        })),
+    }
+}
+
+/// The child runs exactly once and its terminal joins the parent node.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn call_workflow_child_runs_once_and_joins() {
+    let path = unique_db("child-join");
+    let pool = connect(path.to_str().expect("path"))
+        .await
+        .expect("connect");
+    migrate(&pool).await.expect("migrate");
+    let handle = tokio::runtime::Handle::current();
+    let seams = child_seams(callee_workflow());
+
+    let (mut parent, child_id, child_trigger) = {
+        let pool = pool.clone();
+        let state = SyncWorkflowState::spawn(pool.clone(), &handle);
+        let handle = handle.clone();
+        let seams = seams.clone();
+        tokio::task::spawn_blocking(move || {
+            let engine = OurEngine::with_journal(
+                ToronEngineStore::spawn(pool.clone(), &handle),
+                ToronJournal::spawn(JournalDb::new(pool, "child", 64), &handle),
+            );
+            let (parent, effects) = DurableGraphRun::open_with_children(
+                engine,
+                state,
+                "run-parent",
+                calling_workflow("parent", "child", StepOnError::Continue),
+                json!({}),
+                0,
+                &seams,
+            )
+            .expect("parent opens");
+            let [
+                GraphEffect::ChildRun {
+                    child_run_id,
+                    trigger,
+                    ..
+                },
+            ] = effects.as_slice()
+            else {
+                panic!("the call opens one child: {effects:?}");
+            };
+            (parent, child_run_id.clone(), trigger.clone())
+        })
+        .await
+        .expect("join")
+    };
+    assert_eq!(child_id, "run-parent:call:1");
+
+    // Open the child idempotently and drive it to its terminal.
+    let child_output = {
+        let pool = pool.clone();
+        let state = SyncWorkflowState::spawn(pool.clone(), &handle);
+        let handle = handle.clone();
+        tokio::task::spawn_blocking(move || {
+            let engine = OurEngine::with_journal(
+                ToronEngineStore::spawn(pool.clone(), &handle),
+                ToronJournal::spawn(JournalDb::new(pool, "child", 64), &handle),
+            );
+            let (mut child, effects) = DurableRun::open(
+                engine,
+                state,
+                "run-parent:call:1",
+                callee_workflow(),
+                child_trigger,
+                1,
+            )
+            .expect("child opens");
+            let [RunEffect::ExecuteStep { .. }] = effects.as_slice() else {
+                panic!("the child dispatches one step: {effects:?}");
+            };
+            let effects = child
+                .step_done(json!({"ok": true, "done": 1}), 2)
+                .expect("child settles");
+            let [RunEffect::Complete { output }] = effects.as_slice() else {
+                panic!("the child completes: {effects:?}");
+            };
+            output.clone()
+        })
+        .await
+        .expect("join")
+    };
+
+    let effects = parent
+        .child_succeeded("call", child_output.clone(), 3)
+        .expect("the terminal joins");
+    let [
+        GraphEffect::ChildJoin { node, .. },
+        GraphEffect::Complete { .. },
+    ] = effects.as_slice()
+    else {
+        panic!("join then complete: {effects:?}");
+    };
+    assert_eq!(node, "call");
+    assert_eq!(parent.model().outputs["call"], child_output);
+    assert_eq!(parent.model().phase, GraphPhase::Succeeded);
+
+    // Re-opening the completed child re-attaches: no effects, no second run.
+    let reused = {
+        let pool = pool.clone();
+        let state = SyncWorkflowState::spawn(pool.clone(), &handle);
+        let handle = handle.clone();
+        tokio::task::spawn_blocking(move || {
+            let engine = OurEngine::with_journal(
+                ToronEngineStore::spawn(pool.clone(), &handle),
+                ToronJournal::spawn(JournalDb::new(pool, "child", 64), &handle),
+            );
+            DurableRun::open(
+                engine,
+                state,
+                "run-parent:call:1",
+                callee_workflow(),
+                json!({}),
+                4,
+            )
+        })
+        .await
+        .expect("join")
+        .expect("reopen")
+    };
+    assert!(
+        reused.1.is_empty(),
+        "a terminal child emits nothing: {:?}",
+        reused.1
+    );
+    assert_eq!(reused.0.model().phase, RunPhase::Succeeded);
+}
+
+/// A restarted parent re-attaches to the SAME child id and a completed child
+/// is reused, never re-opened as a second run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn call_workflow_restart_reuses_completed_child() {
+    let path = unique_db("child-restart");
+    let pool = connect(path.to_str().expect("path"))
+        .await
+        .expect("connect");
+    migrate(&pool).await.expect("migrate");
+    let handle = tokio::runtime::Handle::current();
+    let seams = child_seams(callee_workflow());
+
+    // Phase one: parent emits the child, the child completes, the parent dies
+    // before the terminal reaches it.
+    let (child_id, child_trigger) = {
+        let pool = pool.clone();
+        let state = SyncWorkflowState::spawn(pool.clone(), &handle);
+        let handle = handle.clone();
+        let seams = seams.clone();
+        tokio::task::spawn_blocking(move || {
+            let engine = OurEngine::with_journal(
+                ToronEngineStore::spawn(pool.clone(), &handle),
+                ToronJournal::spawn(JournalDb::new(pool, "child", 64), &handle),
+            );
+            let (_parent, effects) = DurableGraphRun::open_with_children(
+                engine,
+                state,
+                "run-parent",
+                calling_workflow("parent", "child", StepOnError::Continue),
+                json!({}),
+                0,
+                &seams,
+            )
+            .expect("parent opens");
+            let [
+                GraphEffect::ChildRun {
+                    child_run_id,
+                    trigger,
+                    ..
+                },
+            ] = effects.as_slice()
+            else {
+                panic!("one child: {effects:?}");
+            };
+            (child_run_id.clone(), trigger.clone())
+        })
+        .await
+        .expect("join")
+    };
+    {
+        let pool = pool.clone();
+        let state = SyncWorkflowState::spawn(pool.clone(), &handle);
+        let handle = handle.clone();
+        tokio::task::spawn_blocking(move || {
+            let engine = OurEngine::with_journal(
+                ToronEngineStore::spawn(pool.clone(), &handle),
+                ToronJournal::spawn(JournalDb::new(pool, "child", 64), &handle),
+            );
+            let (mut child, _) = DurableRun::open(
+                engine,
+                state,
+                "run-parent:call:1",
+                callee_workflow(),
+                child_trigger,
+                1,
+            )
+            .expect("child opens");
+            child
+                .step_done(json!({"ok": true, "done": 1}), 2)
+                .expect("child settles");
+        })
+        .await
+        .expect("join");
+    }
+
+    // Phase two: the parent resumes and re-attaches to the same child id.
+    let (mut parent, effects) = {
+        let pool = pool.clone();
+        let state = SyncWorkflowState::spawn(pool.clone(), &handle);
+        let handle = handle.clone();
+        let seams = seams.clone();
+        tokio::task::spawn_blocking(move || {
+            let engine = OurEngine::with_journal(
+                ToronEngineStore::spawn(pool.clone(), &handle),
+                ToronJournal::spawn(JournalDb::new(pool, "child", 64), &handle),
+            );
+            DurableGraphRun::open_with_children(
+                engine,
+                state,
+                "run-parent",
+                calling_workflow("parent", "child", StepOnError::Continue),
+                json!({}),
+                10,
+                &seams,
+            )
+        })
+        .await
+        .expect("join")
+        .expect("reopen")
+    };
+    let [
+        GraphEffect::ChildRun {
+            child_run_id: resumed_id,
+            ..
+        },
+    ] = effects.as_slice()
+    else {
+        panic!("the restarted parent re-attaches: {effects:?}");
+    };
+    assert_eq!(*resumed_id, child_id, "the same child, never a second one");
+
+    // Re-attaching to the completed child yields no effects.
+    let reused = {
+        let pool = pool.clone();
+        let state = SyncWorkflowState::spawn(pool.clone(), &handle);
+        let handle = handle.clone();
+        tokio::task::spawn_blocking(move || {
+            let engine = OurEngine::with_journal(
+                ToronEngineStore::spawn(pool.clone(), &handle),
+                ToronJournal::spawn(JournalDb::new(pool, "child", 64), &handle),
+            );
+            DurableRun::open(
+                engine,
+                state,
+                "run-parent:call:1",
+                callee_workflow(),
+                json!({}),
+                11,
+            )
+        })
+        .await
+        .expect("join")
+        .expect("reopen")
+    };
+    assert!(reused.1.is_empty(), "a completed child is reused");
+    let child_output = json!({"status": "succeeded", "steps": reused.0.model().outputs});
+
+    let effects = parent
+        .child_succeeded("call", child_output.clone(), 12)
+        .expect("join");
+    assert!(
+        matches!(
+            effects.as_slice(),
+            [GraphEffect::ChildJoin { .. }, GraphEffect::Complete { .. }]
+        ),
+        "{effects:?}"
+    );
+    assert_eq!(parent.model().outputs["call"], child_output);
+}
+
+/// A failed child's FULL bundle reaches the parent node's `on_error`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn call_workflow_child_failure_carries_bundle_to_parent_on_error() {
+    let path = unique_db("child-fail");
+    let pool = connect(path.to_str().expect("path"))
+        .await
+        .expect("connect");
+    migrate(&pool).await.expect("migrate");
+    let handle = tokio::runtime::Handle::current();
+    let bundle = json!({
+        "ok": false,
+        "kind": "terminal",
+        "error": "child exploded",
+        "leaf_preview": "{\"ok\":false}",
+    });
+
+    for (run_id, on_error, expected_fail) in [
+        ("run-call-continue", StepOnError::Continue, false),
+        ("run-call-fail", StepOnError::FailRun, true),
+    ] {
+        let seams = child_seams(callee_workflow());
+        let (mut parent, _) = {
+            let pool = pool.clone();
+            let state = SyncWorkflowState::spawn(pool.clone(), &handle);
+            let handle = handle.clone();
+            let seams = seams.clone();
+            let run_id = run_id.to_string();
+            tokio::task::spawn_blocking(move || {
+                let engine = OurEngine::with_journal(
+                    ToronEngineStore::spawn(pool.clone(), &handle),
+                    ToronJournal::spawn(JournalDb::new(pool, "child", 64), &handle),
+                );
+                DurableGraphRun::open_with_children(
+                    engine,
+                    state,
+                    run_id,
+                    calling_workflow("parent", "child", on_error),
+                    json!({}),
+                    0,
+                    &seams,
+                )
+            })
+            .await
+            .expect("join")
+            .expect("parent opens")
+        };
+        let effects = parent
+            .child_failed("call", bundle.clone(), 2)
+            .expect("terminal");
+        if expected_fail {
+            let [GraphEffect::ChildJoin { .. }, GraphEffect::Fail { fail }] = effects.as_slice()
+            else {
+                panic!("{run_id}: fail_run fails: {effects:?}");
+            };
+            assert_eq!(fail.node, "call");
+            assert_eq!(fail.kind, "terminal");
+            assert_eq!(fail.error, "child exploded");
+        } else {
+            let [GraphEffect::ChildJoin { .. }, GraphEffect::Complete { .. }] = effects.as_slice()
+            else {
+                panic!("{run_id}: continue completes: {effects:?}");
+            };
+            assert_eq!(parent.model().outputs["call"], bundle);
+        }
+    }
+}
+
+/// §Recursive, unknown, unsequencable, and resolver-less callees refuse the
+/// parent before any state or engine row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn call_workflow_refusals_leave_no_row() {
+    let path = unique_db("child-refused");
+    let pool = connect(path.to_str().expect("path"))
+        .await
+        .expect("connect");
+    migrate(&pool).await.expect("migrate");
+    let handle = tokio::runtime::Handle::current();
+
+    let self_call = calling_workflow("self", "self", StepOnError::Continue);
+    let cyclic_b = calling_workflow("b", "a", StepOnError::Continue);
+    let cyclic_a = calling_workflow("a", "b", StepOnError::Continue);
+    let unsequencable_child = named_workflow(
+        "child",
+        vec![step(Action::CallWebhook {
+            url: "http://127.0.0.1:9/x".into(),
+            method: None,
+            body: None,
+        })],
+    );
+
+    let cases: Vec<(&str, Workflow, ChildSeams, &str)> = vec![
+        (
+            "run-recursive-self",
+            self_call.clone(),
+            ChildSeams {
+                resolver: Some(std::sync::Arc::new(move |name: &str| {
+                    (name == "self").then(|| self_call.clone())
+                })),
+            },
+            "recursive",
+        ),
+        (
+            "run-recursive-cycle",
+            cyclic_a.clone(),
+            ChildSeams {
+                resolver: Some(std::sync::Arc::new(move |name: &str| match name {
+                    "a" => Some(cyclic_a.clone()),
+                    "b" => Some(cyclic_b.clone()),
+                    _ => None,
+                })),
+            },
+            "recursive",
+        ),
+        (
+            "run-unknown",
+            calling_workflow("parent", "ghost", StepOnError::Continue),
+            child_seams(callee_workflow()),
+            "unknown workflow",
+        ),
+        (
+            "run-unsequencable",
+            calling_workflow("parent", "child", StepOnError::Continue),
+            child_seams(unsequencable_child),
+            "cannot run on the durable models",
+        ),
+        (
+            "run-no-resolver",
+            calling_workflow("parent", "child", StepOnError::Continue),
+            ChildSeams::default(),
+            "needs a workflow resolver",
+        ),
+    ];
+
+    for (run_id, wf, seams, label) in cases {
+        let pool = pool.clone();
+        let state = SyncWorkflowState::spawn(pool.clone(), &handle);
+        let handle = handle.clone();
+        let rid = run_id.to_string();
+        let refused = tokio::task::spawn_blocking(move || {
+            let engine = OurEngine::with_journal(
+                ToronEngineStore::spawn(pool.clone(), &handle),
+                ToronJournal::spawn(JournalDb::new(pool, "child", 64), &handle),
+            );
+            DurableGraphRun::open_with_children(engine, state, rid, wf, json!({}), 0, &seams)
+        })
+        .await
+        .expect("join");
+        let Err(err) = refused else {
+            panic!("{run_id}: must refuse");
+        };
+        let HostError::Unsupported(reason) = err else {
+            panic!("{run_id}: wrong refusal: {err:?}");
+        };
+        assert!(reason.contains(label), "{run_id}: {reason}");
+    }
+
+    let store = toron_core::index::durable_workflow::WorkflowStateStore::new(pool.clone());
+    for run_id in [
+        "run-recursive-self",
+        "run-recursive-cycle",
+        "run-unknown",
+        "run-unsequencable",
+        "run-no-resolver",
+    ] {
+        assert!(
+            store.load(run_id).await.expect("state").is_none(),
+            "{run_id} left no state row"
+        );
+    }
+    let engine = OurEngine::with_journal(
+        ToronEngineStore::spawn(pool.clone(), &handle),
+        ToronJournal::spawn(JournalDb::new(pool, "child", 64), &handle),
+    );
+    for run_id in [
+        "run-recursive-self",
+        "run-recursive-cycle",
+        "run-unknown",
+        "run-unsequencable",
+        "run-no-resolver",
+    ] {
+        assert!(engine.query(run_id).is_err(), "{run_id} left an engine row");
+    }
 }

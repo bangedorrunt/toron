@@ -2085,3 +2085,144 @@ fn retry_unparseable_policy_refuses_without_row() {
         "{reason}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// call_workflow as a child run (bd-durable-call-workflow-mg6y)
+// ---------------------------------------------------------------------------
+
+fn call_step(name: &str, callee: &str, inputs: serde_json::Value, on_error: StepOnError) -> Step {
+    Step {
+        name: Some(name.into()),
+        guard: None,
+        on_error,
+        build_slot: false,
+        action: Action::CallWorkflow {
+            workflow: callee.into(),
+            inputs,
+        },
+    }
+}
+
+fn call_workflow_model(on_error: StepOnError) -> GraphModel {
+    lowered_model(
+        "run-call",
+        workflow(vec![call_step(
+            "call",
+            "child",
+            json!({"goal": "{{inputs.objective}}"}),
+            on_error,
+        )]),
+        json!({"inputs": {"objective": "ship it"}}),
+    )
+}
+
+/// The call node awaits a child run whose id and trigger are deterministic;
+/// a resume re-emits the same `ChildRun` (re-attach), and the child's terminal
+/// joins exactly once.
+#[test]
+fn call_workflow_node_awaits_child() {
+    let model = call_workflow_model(StepOnError::Continue);
+    assert!(
+        needs_graph_model(&model.workflow),
+        "a child call is graph-native"
+    );
+    let (model, effects) = advance_graph(&model, &GraphMsg::Start { now_ms: 1_000 });
+    let [
+        GraphEffect::ChildRun {
+            node,
+            child_run_id,
+            workflow: callee,
+            trigger,
+        },
+    ] = effects.as_slice()
+    else {
+        panic!("the call opens a child run: {effects:?}");
+    };
+    assert_eq!(node, "call");
+    assert_eq!(child_run_id, "run-call:call:1");
+    assert_eq!(callee, "child");
+    assert_eq!(trigger["inputs"]["goal"], json!("ship it"));
+
+    // A resume re-attaches to the same child instead of opening a second one.
+    let restored: GraphModel =
+        serde_json::from_str(&serde_json::to_string(&model).expect("serialize")).expect("restore");
+    let resumed = resume_graph_effects(&restored);
+    let [
+        GraphEffect::ChildRun {
+            child_run_id: resumed_id,
+            trigger: resumed_trigger,
+            ..
+        },
+    ] = resumed.as_slice()
+    else {
+        panic!("resume re-emits the child run: {resumed:?}");
+    };
+    assert_eq!(*resumed_id, "run-call:call:1");
+    assert_eq!(resumed_trigger["inputs"]["goal"], json!("ship it"));
+
+    let output = json!({"ok": true, "patched": "yes"});
+    let (model, effects) = advance_graph(
+        &restored,
+        &GraphMsg::ChildSucceeded {
+            node: "call".into(),
+            output: output.clone(),
+            now_ms: 2_000,
+        },
+    );
+    let [
+        GraphEffect::ChildJoin { node, child_run_id },
+        GraphEffect::Complete { .. },
+    ] = effects.as_slice()
+    else {
+        panic!("the child terminal joins then completes: {effects:?}");
+    };
+    assert_eq!(node, "call");
+    assert_eq!(child_run_id, "run-call:call:1");
+    assert_eq!(model.outputs["call"], output);
+    assert_eq!(model.phase, GraphPhase::Succeeded);
+}
+
+/// A failed child carries its FULL bundle to the parent node's `on_error`:
+/// `continue` lands it and the run proceeds; `fail_run` fails the run with the
+/// bundle's kind.
+#[test]
+fn call_workflow_child_failure_carries_bundle_to_parent_on_error() {
+    let bundle = json!({
+        "ok": false,
+        "kind": "terminal",
+        "error": "child exploded",
+        "leaf_preview": "{\"ok\":false}",
+    });
+    let model = call_workflow_model(StepOnError::Continue);
+    let (model, _) = advance_graph(&model, &GraphMsg::Start { now_ms: 1_000 });
+    let (model, effects) = advance_graph(
+        &model,
+        &GraphMsg::ChildFailed {
+            node: "call".into(),
+            output: bundle.clone(),
+            now_ms: 2_000,
+        },
+    );
+    let [GraphEffect::ChildJoin { .. }, GraphEffect::Complete { .. }] = effects.as_slice() else {
+        panic!("continue joins and completes: {effects:?}");
+    };
+    assert_eq!(model.outputs["call"], bundle, "the full bundle lands");
+
+    let model = call_workflow_model(StepOnError::FailRun);
+    let (model, _) = advance_graph(&model, &GraphMsg::Start { now_ms: 1_000 });
+    let (model, effects) = advance_graph(
+        &model,
+        &GraphMsg::ChildFailed {
+            node: "call".into(),
+            output: bundle,
+            now_ms: 2_000,
+        },
+    );
+    let [GraphEffect::ChildJoin { .. }, GraphEffect::Fail { fail }] = effects.as_slice() else {
+        panic!("fail_run fails the run: {effects:?}");
+    };
+    assert_eq!(fail.node, "call");
+    assert_eq!(fail.kind, "terminal");
+    assert_eq!(fail.error, "child exploded");
+    assert!(matches!(model.phase, GraphPhase::Failed { .. }));
+}

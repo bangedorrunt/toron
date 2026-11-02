@@ -2135,6 +2135,59 @@ pub(crate) async fn run_call_workflow(
     future.await
 }
 
+/// The trigger a durable `call_workflow` child receives
+/// (bd-durable-call-workflow-mg6y).
+///
+/// The fold builds it (no host read): parent inputs merged with the call's
+/// explicit inputs, the parent's outputs as `parent_steps`, and the lineage
+/// envelope the child's own admission checks. Refusals are returned as
+/// `Err`, so a static call can refuse the parent before any row.
+pub(crate) fn durable_child_trigger(
+    parent_workflow: &str,
+    parent_trigger: &serde_json::Value,
+    child_name: &str,
+    inputs: &serde_json::Value,
+    parent_outputs: &serde_json::Map<String, serde_json::Value>,
+) -> std::result::Result<serde_json::Value, String> {
+    let lineage = lineage_for_trigger(parent_trigger, parent_workflow)?;
+    if lineage.chain.iter().any(|name| name == child_name) {
+        return Err(format!(
+            "recursive workflow call refused: {parent_workflow:?} -> {child_name:?}; call chain: {:?}",
+            lineage.chain
+        ));
+    }
+    if lineage.chain.len() >= MAX_WORKFLOW_DEPTH {
+        return Err(format!(
+            "workflow child {child_name:?} refused: nesting depth bound {MAX_WORKFLOW_DEPTH} reached"
+        ));
+    }
+    if lineage.remaining_children == 0 {
+        return Err(format!(
+            "workflow child {child_name:?} refused: child budget exhausted (bound {MAX_WORKFLOW_CHILDREN})"
+        ));
+    }
+    let merged = merge_parent_inputs(parent_trigger, inputs);
+    let mut trigger_map = serde_json::Map::new();
+    if let Some(obj) = merged.as_object() {
+        for (k, v) in obj {
+            trigger_map.insert(k.clone(), v.clone());
+        }
+    }
+    trigger_map.insert("inputs".into(), merged);
+    trigger_map.insert(
+        "parent_steps".into(),
+        serde_json::Value::Object(parent_outputs.clone()),
+    );
+    let mut child_lineage = lineage;
+    child_lineage.chain.push(child_name.to_string());
+    child_lineage.remaining_children -= 1;
+    trigger_map.insert(
+        WORKFLOW_LINEAGE_KEY.into(),
+        serde_json::to_value(child_lineage).map_err(|e| format!("workflow lineage: {e}"))?,
+    );
+    Ok(serde_json::Value::Object(trigger_map))
+}
+
 /// Parent `trigger.inputs` plus the call's explicit object. Explicit keys win.
 fn merge_parent_inputs(
     trigger: &serde_json::Value,

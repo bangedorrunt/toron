@@ -41,6 +41,9 @@ use super::durable::{
 };
 use super::spawn::{SpawnSeams, SpawnSpec, prepare_spawn, spawn_key, spawn_launcher_refusal};
 
+use crate::engine::WorkflowResolver;
+use crate::schema::Workflow;
+
 use crate::schema::Action;
 
 /// How long an approval parks before the wake loop re-drives it.
@@ -590,6 +593,18 @@ fn state_error(e: anyhow::Error) -> HostError {
 // Graph driver (bd-durable-graph-impl-r2x1)
 // ---------------------------------------------------------------------------
 
+/// The capabilities a `call_workflow` graph needs (bd-durable-call-workflow-mg6y).
+///
+/// The fold names the callee; only the host can resolve a name to a definition
+/// and prove the call graph acyclic. Without a resolver the parent refuses
+/// BEFORE any row, so it falls back to the old engine instead of parking on a
+/// child nobody can open.
+#[derive(Clone, Default)]
+pub struct ChildSeams {
+    /// Workflow name -> definition.
+    pub resolver: Option<WorkflowResolver>,
+}
+
 /// One driven graph run: model + engine row + state seam.
 ///
 /// Same recovery rule as [`DurableRun`], and the two share it through
@@ -600,6 +615,83 @@ pub struct DurableGraphRun<S: EngineStorage, J: JournalStore, R: RunState> {
     model: GraphModel,
     engine: OurEngine<S, J>,
     state: R,
+}
+
+/// Static `call_workflow` targets of one workflow (top-level steps or graph
+/// nodes). A templated name is dynamic and resolves only in the fold at
+/// schedule time, so it is not validated here.
+fn static_child_calls(workflow: &Workflow) -> Vec<String> {
+    fn push(out: &mut Vec<String>, action: &crate::schema::Action) {
+        if let crate::schema::Action::CallWorkflow { workflow: name, .. } = action
+            && !name.contains("{{")
+        {
+            out.push(name.clone());
+        }
+    }
+    let mut out = Vec::new();
+    for step in &workflow.steps {
+        push(&mut out, &step.action);
+    }
+    if let Some(graph) = &workflow.graph {
+        for node in graph.nodes.values() {
+            push(&mut out, &node.action);
+        }
+    }
+    out
+}
+
+/// Validate the STATIC child graph before any row: every callee must resolve,
+/// no call chain may repeat a name, and every callee must be a shape the
+/// durable models can sequence (bd-durable-call-workflow-mg6y).
+fn validate_children(workflow: &Workflow, seams: &ChildSeams) -> Result<(), String> {
+    let calls = static_child_calls(workflow);
+    if calls.is_empty() {
+        return Ok(());
+    }
+    let Some(resolver) = &seams.resolver else {
+        return Err(
+            "call_workflow needs a workflow resolver on this host (no child run can be opened)"
+                .to_string(),
+        );
+    };
+    let mut chain = vec![workflow.name.clone()];
+    validate_child_calls(&calls, resolver, &mut chain)
+}
+
+fn validate_child_calls(
+    calls: &[String],
+    resolver: &WorkflowResolver,
+    chain: &mut Vec<String>,
+) -> Result<(), String> {
+    if chain.len() >= super::control_flow::MAX_WORKFLOW_DEPTH {
+        return Err(format!(
+            "workflow nesting depth {} reaches the bound {}",
+            chain.len(),
+            super::control_flow::MAX_WORKFLOW_DEPTH
+        ));
+    }
+    for callee in calls {
+        if chain.iter().any(|name| name == callee) {
+            return Err(format!(
+                "recursive workflow call refused: call chain {chain:?} -> {callee:?}"
+            ));
+        }
+        let Some(child) = resolver(callee) else {
+            return Err(format!("unknown workflow: {callee}"));
+        };
+        if let Some(reason) = unsupported_reason(&child) {
+            return Err(format!(
+                "callee {callee:?} cannot run on the durable models: {reason}"
+            ));
+        }
+        chain.push(callee.clone());
+        let nested = static_child_calls(&child);
+        if !nested.is_empty() {
+            validate_child_calls(&nested, resolver, chain)?;
+        }
+        chain.pop();
+    }
+    Ok(())
 }
 
 impl<S: EngineStorage, J: JournalStore, R: RunState> DurableGraphRun<S, J, R> {
@@ -615,12 +707,37 @@ impl<S: EngineStorage, J: JournalStore, R: RunState> DurableGraphRun<S, J, R> {
     /// Returns [`HostError`] when the shape is unsupported, the store fails, or
     /// the engine refuses the start.
     pub fn open(
+        engine: OurEngine<S, J>,
+        state: R,
+        run_id: impl Into<String>,
+        workflow: crate::schema::Workflow,
+        trigger: serde_json::Value,
+        now_ms: u64,
+    ) -> Result<(Self, Vec<GraphEffect>), HostError> {
+        Self::open_with_children(
+            engine,
+            state,
+            run_id,
+            workflow,
+            trigger,
+            now_ms,
+            &ChildSeams::default(),
+        )
+    }
+
+    /// [`Self::open`] with the workflow resolver a `call_workflow` graph needs.
+    ///
+    /// Static callees are resolved and walked transitively here, so a recursive,
+    /// unknown, or unsequencable callee refuses the parent before any row.
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_with_children(
         mut engine: OurEngine<S, J>,
         state: R,
         run_id: impl Into<String>,
         workflow: crate::schema::Workflow,
         trigger: serde_json::Value,
         now_ms: u64,
+        children: &ChildSeams,
     ) -> Result<(Self, Vec<GraphEffect>), HostError> {
         let run_id = run_id.into();
         if let Some(json) = state.load(&run_id).map_err(state_error)? {
@@ -652,6 +769,10 @@ impl<S: EngineStorage, J: JournalStore, R: RunState> DurableGraphRun<S, J, R> {
         if let Some(reason) = graph_unsupported_reason(&workflow) {
             return Err(HostError::Unsupported(reason));
         }
+        // The child graph is validated here: recursion, unknown callees, and
+        // callees the durable models cannot sequence refuse the parent before
+        // any row (bd-durable-call-workflow-mg6y).
+        validate_children(&workflow, children).map_err(HostError::Unsupported)?;
 
         match engine.start(&run_id, now_ms)? {
             StartOutcome::Started { .. } => {}
@@ -716,6 +837,61 @@ impl<S: EngineStorage, J: JournalStore, R: RunState> DurableGraphRun<S, J, R> {
             },
             now_ms,
         )
+    }
+
+    /// A `call_workflow` child finished successfully
+    /// (bd-durable-call-workflow-mg6y).
+    ///
+    /// # Errors
+    ///
+    /// [`HostError::WrongPhase`] unless that node awaits a child.
+    pub fn child_succeeded(
+        &mut self,
+        node: &str,
+        output: serde_json::Value,
+        now_ms: u64,
+    ) -> Result<Vec<GraphEffect>, HostError> {
+        self.require_awaiting_child(node, "child_succeeded")?;
+        self.apply(
+            GraphMsg::ChildSucceeded {
+                node: node.to_string(),
+                output,
+                now_ms,
+            },
+            now_ms,
+        )
+    }
+
+    /// A `call_workflow` child reached a failure value (the full bundle).
+    ///
+    /// # Errors
+    ///
+    /// [`HostError::WrongPhase`] unless that node awaits a child.
+    pub fn child_failed(
+        &mut self,
+        node: &str,
+        output: serde_json::Value,
+        now_ms: u64,
+    ) -> Result<Vec<GraphEffect>, HostError> {
+        self.require_awaiting_child(node, "child_failed")?;
+        self.apply(
+            GraphMsg::ChildFailed {
+                node: node.to_string(),
+                output,
+                now_ms,
+            },
+            now_ms,
+        )
+    }
+
+    fn require_awaiting_child(&self, node: &str, verb: &str) -> Result<(), HostError> {
+        if matches!(
+            self.model.node_state.get(node),
+            Some(NodeState::AwaitingChild { .. })
+        ) {
+            return Ok(());
+        }
+        Err(self.wrong_phase(verb))
     }
 
     /// A park (delay or retry backoff) is due.
@@ -827,7 +1003,11 @@ impl<S: EngineStorage, J: JournalStore, R: RunState> DurableGraphRun<S, J, R> {
                 GraphEffect::ExecuteNode { .. }
                 | GraphEffect::Unsupported { .. }
                 | GraphEffect::ParkUntil { .. }
-                | GraphEffect::AwaitApproval { .. } => {}
+                | GraphEffect::AwaitApproval { .. }
+                // The embedding owns the child run; the engine has no verb for
+                // opening or joining one (bd-durable-call-workflow-mg6y).
+                | GraphEffect::ChildRun { .. }
+                | GraphEffect::ChildJoin { .. } => {}
                 GraphEffect::Complete { .. } => {
                     end_run(&mut self.engine, &key, RunEnd::Succeeded).map_err(HostError::from)?;
                 }

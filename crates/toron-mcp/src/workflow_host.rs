@@ -2584,6 +2584,26 @@ impl WorkflowHost {
                     other @ (GraphEffect::ParkUntil { .. } | GraphEffect::AwaitApproval { .. }) => {
                         parks.push(other)
                     }
+                    // bd-durable-call-workflow-mg6y: this host opens graph runs
+                    // WITHOUT a child resolver (the callee registry seam lands
+                    // with the child coordinator), so the open refuses a
+                    // `call_workflow` graph and it stays on the old engine.
+                    // Reaching these is a routing bug, not a fallback.
+                    GraphEffect::ChildJoin { node, child_run_id } => {
+                        debug!(
+                            run_id = %run_id,
+                            %node, %child_run_id,
+                            "durable graph child join (no-op: the model already landed it)"
+                        );
+                    }
+                    GraphEffect::ChildRun { node, .. } => {
+                        error!(
+                            run_id = %run_id,
+                            %node,
+                            "INVARIANT VIOLATION: durable graph opened a child run without a child resolver; stopping"
+                        );
+                        return;
+                    }
                     GraphEffect::Complete { output } => {
                         self.settle_durable(&run_id, "succeeded", "", &output.to_string())
                             .await;
@@ -9512,18 +9532,41 @@ steps:
             let wf = graph_workflow([
                 ("fine", graph_node(durable_leaf("cut"), &[])),
                 (
-                    "call",
+                    "spin",
                     graph_node(
-                        Action::CallWorkflow {
-                            workflow: "child".into(),
-                            inputs: serde_json::json!({}),
+                        // `loop` stays refused permanently (design, item 3):
+                        // it is rewritten as a bounded guarded sequence.
+                        Action::Loop {
+                            max: "3".into(),
+                            until: None,
+                            body: vec![linear_step()],
                         },
                         &["fine"],
                     ),
                 ),
             ]);
-            let err = durable_route(&wf, true, false).expect_err("call_workflow refuses");
-            assert!(err.contains("call_workflow"), "{err}");
+            let err = durable_route(&wf, true, false).expect_err("loop refuses");
+            assert!(err.contains("loop"), "{err}");
+        }
+
+        /// bd-durable-call-workflow-mg6y: a `steps:` child call is native to
+        /// the graph model, so the shape router admits it; the host's open
+        /// refuses without a child resolver and the run falls back to the old
+        /// engine.
+        #[test]
+        fn a_call_workflow_steps_workflow_routes_to_the_graph() {
+            let mut wf = linear_workflow();
+            wf.steps = vec![Step {
+                name: Some("call".into()),
+                guard: None,
+                on_error: StepOnError::Continue,
+                build_slot: false,
+                action: Action::CallWorkflow {
+                    workflow: "child".into(),
+                    inputs: serde_json::json!({"goal": "g"}),
+                },
+            }];
+            assert!(durable_route(&wf, true, false).is_ok());
         }
 
         /// bd-durable-retry-policy-rrck: a `steps:` retry policy runs on the
