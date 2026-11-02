@@ -39,7 +39,7 @@ use super::durable::{
     RunPhase as ModelPhase, advance_graph, advance_with, graph_unsupported_reason, resume_effects,
     resume_graph_effects, unsupported_reason,
 };
-use super::spawn::{SpawnSeams, SpawnSpec, prepare_spawn, spawn_key};
+use super::spawn::{SpawnSeams, SpawnSpec, prepare_spawn, spawn_key, spawn_launcher_refusal};
 
 use crate::schema::Action;
 
@@ -191,6 +191,14 @@ impl<S: EngineStorage, J: JournalStore, R: RunState> DurableRun<S, J, R> {
         }
 
         if let Some(reason) = unsupported_reason(&workflow) {
+            return Err(HostError::Unsupported(reason));
+        }
+        // Capability, not shape (bd-spawn-launcher-flip-d8mv): a direct caller
+        // that never installed a launcher must be refused here too, or the run
+        // would park on a launch nothing can perform.
+        if let Some(reason) = spawn_launcher_refusal(&workflow)
+            && spawn_seams.launcher.is_none()
+        {
             return Err(HostError::Unsupported(reason));
         }
 
@@ -378,7 +386,13 @@ impl<S: EngineStorage, J: JournalStore, R: RunState> DurableRun<S, J, R> {
     ///
     /// [`HostError::WrongPhase`] unless the model is parked.
     pub fn woke(&mut self, now_ms: u64) -> Result<Vec<RunEffect>, HostError> {
-        if !matches!(self.model.phase, ModelPhase::Parked { .. }) {
+        // A spawn-await has its own park deadline arm in the fold: waking it is
+        // how a launcher that outlives the deadline fails the node with the
+        // canonical text (bd-spawn-launcher-flip-d8mv).
+        if !matches!(
+            self.model.phase,
+            ModelPhase::Parked { .. } | ModelPhase::AwaitingSpawn { .. }
+        ) {
             return Err(self.wrong_phase("woke"));
         }
         self.apply(RunMsg::Woke { now_ms }, now_ms)

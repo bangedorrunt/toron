@@ -957,3 +957,197 @@ async fn graph_late_node_done_after_a_terminal_is_ignored() {
         EnginePhase::Failed
     );
 }
+
+// ---------------------------------------------------------------------------
+// Spawn admission and the launch seam (bd-spawn-launcher-flip-d8mv)
+// ---------------------------------------------------------------------------
+
+fn spawn_action(await_: bool, no_claim_timeout: u64) -> Action {
+    Action::Spawn {
+        profile: "coder".into(),
+        harness: None,
+        workflow: None,
+        await_,
+        no_claim_timeout,
+        context: None,
+    }
+}
+
+fn spawn_workflow(await_: bool, no_claim_timeout: u64) -> Workflow {
+    workflow(vec![Step {
+        name: Some("spawn_it".into()),
+        guard: None,
+        on_error: StepOnError::Continue,
+        build_slot: false,
+        action: spawn_action(await_, no_claim_timeout),
+    }])
+}
+
+/// The seams a host with (or without) a launcher supplies. `DurableRun` never
+/// calls the launcher; it only decides admission.
+fn spawn_seams(launcher: bool) -> toron_workflow::engine::spawn::SpawnSeams {
+    let launcher: Option<toron_workflow::engine::spawn::SpawnLauncher> = launcher.then(|| {
+        std::sync::Arc::new(
+            |spec: toron_workflow::engine::spawn::SpawnSpec| -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = anyhow::Result<serde_json::Value>> + Send>,
+            > {
+                Box::pin(async move { Ok(json!({"pane": "w1:p9", "spawn_key": spec.spawn_key})) })
+            },
+        ) as toron_workflow::engine::spawn::SpawnLauncher
+    });
+    toron_workflow::engine::spawn::SpawnSeams {
+        resolver: Some(std::sync::Arc::new(|name: &str| {
+            (name == "coder").then(|| json!({"agent": "coder"}))
+        })),
+        launcher,
+    }
+}
+
+/// A direct caller with no launcher is refused BEFORE any state or engine row,
+/// not parked on a launch nothing can perform.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn spawn_without_a_launcher_is_refused_before_any_row() {
+    let path = unique_db("spawn-no-launcher");
+    let pool = connect(path.to_str().expect("path"))
+        .await
+        .expect("connect");
+    migrate(&pool).await.expect("migrate");
+    let state = SyncWorkflowState::spawn(pool.clone(), &tokio::runtime::Handle::current());
+    let handle = tokio::runtime::Handle::current();
+
+    let refused = {
+        let pool = pool.clone();
+        let handle = handle.clone();
+        tokio::task::spawn_blocking(move || {
+            let engine = OurEngine::with_journal(
+                ToronEngineStore::spawn(pool.clone(), &handle),
+                ToronJournal::spawn(JournalDb::new(pool, "spawn", 64), &handle),
+            );
+            DurableRun::open_with_seams(
+                engine,
+                state,
+                "run-spawn-refused",
+                spawn_workflow(true, 30),
+                json!({}),
+                1_000,
+                &spawn_seams(false),
+            )
+        })
+        .await
+        .expect("join")
+    };
+    let Err(err) = refused else {
+        panic!("a host with no launcher must refuse a spawn");
+    };
+    let HostError::Unsupported(reason) = err else {
+        panic!("wrong refusal: {err:?}");
+    };
+    assert!(reason.contains("launcher"), "{reason}");
+
+    let store = toron_core::index::durable_workflow::WorkflowStateStore::new(pool.clone());
+    assert!(
+        store
+            .load("run-spawn-refused")
+            .await
+            .expect("state")
+            .is_none(),
+        "no state row"
+    );
+    let engine = OurEngine::with_journal(
+        ToronEngineStore::spawn(pool.clone(), &handle),
+        ToronJournal::spawn(JournalDb::new(pool, "spawn", 64), &handle),
+    );
+    assert!(engine.query("run-spawn-refused").is_err(), "no engine row");
+}
+
+/// The toron half of the restart witness: the persisted `AwaitingSpawn` model
+/// re-emits `StartSpawn` with the SAME `spawn_key`, so a consumer's durable
+/// claim can adopt instead of starting a second child.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn spawn_park_reemits_the_same_key_after_restart() {
+    let path = unique_db("spawn-restart");
+    let pool = connect(path.to_str().expect("path"))
+        .await
+        .expect("connect");
+    migrate(&pool).await.expect("migrate");
+    let state = SyncWorkflowState::spawn(pool.clone(), &tokio::runtime::Handle::current());
+    let handle = tokio::runtime::Handle::current();
+
+    let first = {
+        let pool = pool.clone();
+        let handle = handle.clone();
+        tokio::task::spawn_blocking(move || {
+            let engine = OurEngine::with_journal(
+                ToronEngineStore::spawn(pool.clone(), &handle),
+                ToronJournal::spawn(JournalDb::new(pool, "spawn", 64), &handle),
+            );
+            DurableRun::open_with_seams(
+                engine,
+                state,
+                "run-spawn-restart",
+                spawn_workflow(true, 600),
+                json!({}),
+                1_000,
+                &spawn_seams(true),
+            )
+        })
+        .await
+        .expect("join")
+        .expect("first open")
+    };
+    let keys: Vec<String> = first
+        .1
+        .iter()
+        .filter_map(|e| match e {
+            RunEffect::StartSpawn { spec, .. } => Some(spec.spawn_key.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(keys, ["run-spawn-restart:spawn_it:1"]);
+    drop(first);
+
+    // A fresh engine + state handle over the same database: the restart.
+    let (mut run, effects) = {
+        let pool = pool.clone();
+        let state = SyncWorkflowState::spawn(pool.clone(), &handle);
+        let handle = handle.clone();
+        tokio::task::spawn_blocking(move || {
+            let engine = OurEngine::with_journal(
+                ToronEngineStore::spawn(pool.clone(), &handle),
+                ToronJournal::spawn(JournalDb::new(pool, "spawn", 64), &handle),
+            );
+            DurableRun::open_with_seams(
+                engine,
+                state,
+                "run-spawn-restart",
+                spawn_workflow(true, 600),
+                json!({}),
+                2_000,
+                &spawn_seams(true),
+            )
+        })
+        .await
+        .expect("join")
+        .expect("reopen")
+    };
+    let [RunEffect::StartSpawn { spec, .. }] = effects.as_slice() else {
+        panic!("the resumed run re-emits exactly one StartSpawn: {effects:?}");
+    };
+    assert_eq!(
+        spec.spawn_key, "run-spawn-restart:spawn_it:1",
+        "the same key, so the consumer's claim can adopt"
+    );
+
+    let effects = run
+        .spawn_settled("spawn_it", json!({"pane": "w1:p9"}), 3_000)
+        .expect("settle");
+    assert!(matches!(effects.as_slice(), [RunEffect::Complete { .. }]));
+    assert_eq!(
+        run.model().outputs["spawn_it"],
+        json!({
+            "ok": true,
+            "spawn_key": "run-spawn-restart:spawn_it:1",
+            "result": {"pane": "w1:p9"},
+        })
+    );
+}

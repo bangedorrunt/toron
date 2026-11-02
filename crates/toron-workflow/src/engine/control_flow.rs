@@ -2184,6 +2184,9 @@ pub(crate) async fn run_spawn(
     // the payload a consumer reads has one author.
     let seams = crate::engine::spawn::SpawnSeams {
         resolver: Some((*ctx.get_dependency::<ProfileResolver>()).clone()),
+        // The old engine owns the launch itself; the seam is the durable
+        // host's (bd-spawn-launcher-flip-d8mv).
+        launcher: None,
     };
     let prepared = match crate::engine::spawn::prepare_spawn(
         &seams,

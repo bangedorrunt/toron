@@ -52,7 +52,7 @@ use toron_workflow::engine::leaf::LeafSeams;
 use toron_workflow::engine::linear_step::{
     GraphNodeStep, LinearStep, run_graph_node_step, run_linear_step,
 };
-use toron_workflow::engine::spawn::SpawnSpec;
+use toron_workflow::engine::spawn::{SpawnLauncher, SpawnSeams, SpawnSpec, spawn_launcher_refusal};
 use toron_workflow::engine::{
     ActionInvocation, ActionPartition, AsyncEffectRunner, AsyncRunJournal, CleanupKind,
     CleanupRequest, Decision, DispatchPlan, EffectJournalMode, FORCED_CLEANUP_CAPABILITY, ParkKind,
@@ -1023,10 +1023,11 @@ pub struct WorkflowHost {
     /// The model has no Resonate promise id, so the run id is the
     /// correlation key; `PendingDrain` never sees these entries.
     durable_parks: Arc<std::sync::Mutex<HashMap<(String, String), DurablePark>>>,
-    /// bd-spawn-park-toron-vwu3: live spawn parks, keyed by `spawn_key`.
-    /// Empty until the spawn cutover lands (the action is still refused), but
-    /// the registry is the map that replaces the old SpawnSink.
-    durable_spawns: Arc<std::sync::Mutex<HashMap<String, DurableSpawn>>>,
+    /// bd-spawn-launcher-flip-d8mv: the spawn capability — the profile
+    /// resolver that builds the spec plus the launcher that starts the child.
+    /// Empty on a host that cannot spawn (cron, the bare server), which is
+    /// exactly what makes the router refuse a spawn workflow before any row.
+    spawn_seams: SpawnSeams,
     /// bd-host-cut-pqkg: durable runs currently driving in this process.
     /// The restart sweep skips these so a run is never double-driven (a
     /// second driver feeding `step_ok` for the same step would hit
@@ -1056,25 +1057,6 @@ fn find_durable_park(
     hits.next().is_none().then_some(first)
 }
 
-/// One spawn parked on the durable path (bd-spawn-park-toron-vwu3): the run id
-/// and node the settled job belongs to.
-#[derive(Clone, Debug)]
-struct DurableSpawn {
-    run_id: String,
-    node: String,
-}
-
-/// A spawn completion read from the bus.
-#[derive(Clone, Debug)]
-pub struct SpawnResolution {
-    /// The correlation key the job was published with.
-    pub spawn_key: String,
-    /// `true` when the child finished, `false` when it failed.
-    pub settled: bool,
-    /// The child's value / failure text.
-    pub value: serde_json::Value,
-}
-
 /// One approval parked on the durable path (bd-host-cut-pqkg).
 #[derive(Clone, Debug)]
 struct DurablePark {
@@ -1100,6 +1082,11 @@ type HostDurableRun = DurableRun<ToronEngineStore, ToronJournal, SyncWorkflowSta
 /// The host's concrete durable graph driver (bd-durable-graph-impl-r2x1).
 type HostDurableGraphRun = DurableGraphRun<ToronEngineStore, ToronJournal, SyncWorkflowState>;
 
+/// One spawn settlement fed back through the driver verb
+/// (bd-spawn-launcher-flip-d8mv): settled, failed, or timed out.
+type SpawnSettleStep =
+    Box<dyn FnOnce(HostDurableRun) -> Result<(HostDurableRun, Vec<RunEffect>), HostError> + Send>;
+
 /// A persisted durable row is one model or the other; the workflow tells them
 /// apart on open, and the shape is stored with the model.
 fn model_head(json: &str) -> Option<(Workflow, serde_json::Value)> {
@@ -1114,11 +1101,24 @@ fn model_head(json: &str) -> Option<(Workflow, serde_json::Value)> {
 /// Route one workflow to the durable host or the old engine (bd-host-cut-pqkg).
 /// `Ok` means the durable path owns it; `Err(reason)` names why it stays on
 /// `WorkflowEngine::run`. Pure: no row exists at this point either way.
-pub fn durable_route(workflow: &Workflow, has_store: bool) -> Result<(), String> {
+///
+/// `spawn_capable` is the caller's CAPABILITY, not the workflow's shape: a
+/// spawn workflow is admitted only when this host can actually launch the
+/// child (bd-spawn-launcher-flip-d8mv).
+pub fn durable_route(
+    workflow: &Workflow,
+    has_store: bool,
+    spawn_capable: bool,
+) -> Result<(), String> {
     if !has_store {
         return Err("no durable store attached".into());
     }
     if let Some(reason) = unsupported_reason(workflow) {
+        return Err(reason);
+    }
+    // Capability, not shape: a spawn workflow on a host with no launcher
+    // would park on a launch nobody can perform.
+    if !spawn_capable && let Some(reason) = spawn_launcher_refusal(workflow) {
         return Err(reason);
     }
     Ok(())
@@ -1134,6 +1134,49 @@ fn host_handles(pool: sqlx::SqlitePool) -> (ToronEngineStore, ToronJournal, Sync
         ToronJournal::spawn(JournalDb::new(pool.clone(), "host", 64), &handle),
         SyncWorkflowState::spawn(pool, &handle),
     )
+}
+
+/// One launch attempt's outcome, bounded by the model's park deadline.
+enum SpawnLaunch {
+    /// The launcher returned the child's receipt.
+    Settled(serde_json::Value),
+    /// The launcher failed (no child, or the child failed).
+    Failed(String),
+    /// The deadline passed first; the fold's `Woke` owns the timeout text.
+    TimedOut,
+}
+
+/// Await the host's launcher, bounded by the spawn's park deadline.
+///
+/// No deadline (`no_claim_timeout: 0`) means an unbounded await, the same rule
+/// the replaced promise had. A deadline already in the past never launches:
+/// the model would have failed the node on resume, so launching would start a
+/// child for a run that has no use for it.
+async fn await_spawn_launch(
+    launcher: &SpawnLauncher,
+    spec: &SpawnSpec,
+    deadline_ms: Option<u64>,
+) -> SpawnLaunch {
+    let Some(deadline) = deadline_ms else {
+        return match launcher(spec.clone()).await {
+            Ok(value) => SpawnLaunch::Settled(value),
+            Err(e) => SpawnLaunch::Failed(format!("{e:#}")),
+        };
+    };
+    let now = durable_now_ms();
+    if deadline <= now {
+        return SpawnLaunch::TimedOut;
+    }
+    match tokio::time::timeout(
+        std::time::Duration::from_millis(deadline - now),
+        launcher(spec.clone()),
+    )
+    .await
+    {
+        Ok(Ok(value)) => SpawnLaunch::Settled(value),
+        Ok(Err(e)) => SpawnLaunch::Failed(format!("{e:#}")),
+        Err(_) => SpawnLaunch::TimedOut,
+    }
 }
 
 /// Host time, unix millis, for the durable driver verbs.
@@ -1291,7 +1334,7 @@ impl WorkflowHost {
             dispatch_pool,
             seams,
             durable_parks,
-            durable_spawns: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            spawn_seams: SpawnSeams::default(),
             durable_active,
         })
     }
@@ -1336,7 +1379,7 @@ impl WorkflowHost {
             dispatch_pool: Arc::new(DispatchPool::new(DispatchConfig::default())),
             seams,
             durable_parks: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            durable_spawns: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            spawn_seams: SpawnSeams::default(),
             durable_active: Arc::new(std::sync::Mutex::new(HashSet::new())),
         })
     }
@@ -1367,7 +1410,7 @@ impl WorkflowHost {
             // bd-host-cut-pqkg: inert without a store (the router never selects it).
             seams: LeafSeams::default(),
             durable_parks: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            durable_spawns: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            spawn_seams: SpawnSeams::default(),
             durable_active: Arc::new(std::sync::Mutex::new(HashSet::new())),
         }
     }
@@ -1377,6 +1420,20 @@ impl WorkflowHost {
     pub fn with_job_signer(mut self, keys: Option<Keys>) -> Self {
         self.job_signer = keys;
         self
+    }
+
+    /// Install the spawn capability (bd-spawn-launcher-flip-d8mv): the
+    /// resolver that builds the spec and the launcher that starts the child.
+    /// Without a launcher the host admits no `spawn` workflow at all; without
+    /// a resolver every spawn would land `unknown profile`.
+    pub fn with_spawn_seams(mut self, seams: SpawnSeams) -> Self {
+        self.spawn_seams = seams;
+        self
+    }
+
+    /// True when this host can actually perform a spawn.
+    fn spawn_capable(&self) -> bool {
+        self.spawn_seams.launcher.is_some()
     }
 
     /// Attach the durable effect journal (bd-cnr5 + bd-1kr2): run states +
@@ -1811,7 +1868,7 @@ impl WorkflowHost {
         // bd-host-cut-pqkg: linear workflows run on the durable host; the
         // router refuses before any engine or model row exists.
         let has_store = self.pending.lock().await.store().is_some();
-        if durable_route(&workflow, has_store).is_ok() {
+        if durable_route(&workflow, has_store, self.spawn_capable()).is_ok() {
             let me = self.clone();
             tokio::spawn(async move {
                 me.run_durable_loop(run_id, workflow, input).await;
@@ -1894,9 +1951,18 @@ impl WorkflowHost {
         let wf = workflow.clone();
         let rid = run_id.clone();
         let trig = input.trigger.clone();
+        let spawn_seams = self.spawn_seams.clone();
         let opened = tokio::task::spawn_blocking(move || {
             let engine = OurEngine::with_journal(engine_store, journal);
-            DurableRun::open(engine, state, rid, wf, trig, durable_now_ms())
+            DurableRun::open_with_seams(
+                engine,
+                state,
+                rid,
+                wf,
+                trig,
+                durable_now_ms(),
+                &spawn_seams,
+            )
         })
         .await;
         let (run, effects) = match opened {
@@ -2217,32 +2283,75 @@ impl WorkflowHost {
                     }
                     RunEffect::StartSpawn { node, spec } => {
                         // The model already persisted `AwaitingSpawn` (model
-                        // first); publish the job and let the completion
-                        // settle the park by spawn_key.
-                        self.durable_spawns
-                            .lock()
-                            .unwrap_or_else(PoisonError::into_inner)
-                            .insert(
-                                spec.spawn_key.clone(),
-                                DurableSpawn {
-                                    run_id: run_id.clone(),
-                                    node,
-                                },
-                            );
+                        // first). kind-43001 is EVIDENCE; the launch itself
+                        // goes through the host's own seam, because the
+                        // embedded bus never reaches the process that owns the
+                        // pane (Captain addendum, 2026-11-02).
                         if let Err(e) = self.publish_durable_spawn(&spec).await {
-                            warn!(run_id = %run_id, "durable spawn publication failed (park retained): {e:#}");
+                            warn!(run_id = %run_id, "durable spawn publication failed (launch continues): {e:#}");
                         }
-                        let _ = self
-                            .pending
-                            .lock()
-                            .await
-                            .set_run_state_durable(&run_id, RunState::Suspended)
-                            .await;
-                        return;
+                        let Some(launcher) = self.spawn_seams.launcher.clone() else {
+                            // The router and `open_with_seams` both refuse this
+                            // shape without a launcher; reaching here means the
+                            // host changed under a live run.
+                            error!(
+                                run_id = %run_id,
+                                "INVARIANT VIOLATION: durable StartSpawn with no launcher; stopping"
+                            );
+                            return;
+                        };
+                        let deadline = match run.model().phase {
+                            ModelPhase::AwaitingSpawn { deadline_ms, .. } => deadline_ms,
+                            _ => None,
+                        };
+                        let then: SpawnSettleStep =
+                            match await_spawn_launch(&launcher, &spec, deadline).await {
+                                SpawnLaunch::Settled(value) => {
+                                    let node = node.clone();
+                                    Box::new(move |mut run| {
+                                        run.spawn_settled(&node, value, durable_now_ms())
+                                            .map(|eff| (run, eff))
+                                    })
+                                }
+                                SpawnLaunch::Failed(error) => {
+                                    let node = node.clone();
+                                    Box::new(move |mut run| {
+                                        run.spawn_failed(&node, error, durable_now_ms())
+                                            .map(|eff| (run, eff))
+                                    })
+                                }
+                                // The fold owns the canonical timeout text.
+                                // The fold owns the canonical timeout text. The
+                                // wake is stamped at the deadline so clock
+                                // granularity cannot put it just under and re-park.
+                                SpawnLaunch::TimedOut => {
+                                    let now = durable_now_ms().max(deadline.unwrap_or(0));
+                                    Box::new(move |mut run| run.woke(now).map(|eff| (run, eff)))
+                                }
+                            };
+                        let Some((back, mut eff)) = self.drive_verb(&run_id, run, then).await
+                        else {
+                            return;
+                        };
+                        run = back;
+                        outputs = run.model().outputs.clone().into_iter().collect();
+                        follow.append(&mut eff);
                     }
                     RunEffect::SpawnDetached { spec, .. } => {
                         if let Err(e) = self.publish_durable_spawn(&spec).await {
                             warn!(run_id = %run_id, "durable detached spawn publication failed: {e:#}");
+                        }
+                        // `await: false` means the run does not wait for the
+                        // JOB; the child must still start before the run moves
+                        // past this effect, so the launch is awaited.
+                        if let Some(launcher) = self.spawn_seams.launcher.clone() {
+                            match launcher(spec.clone()).await {
+                                Ok(_) => debug!(run_id = %run_id, "detached spawn launched"),
+                                Err(e) => warn!(
+                                    run_id = %run_id,
+                                    "detached spawn launch failed (the run does not wait by contract): {e:#}"
+                                ),
+                            }
                         }
                         continue;
                     }
@@ -2308,95 +2417,6 @@ impl WorkflowHost {
             .await
             .map_err(|e| anyhow::anyhow!("publish 43001: {e}"))?;
         Ok(id)
-    }
-
-    /// Parse a durable spawn completion: a job-terminal event whose body names
-    /// a `spawn_key`.
-    pub fn parse_spawn_resolution(event: &Event) -> Option<SpawnResolution> {
-        let kind = event.kind.as_u16();
-        // The job lifecycle (toron-workflow::jobs): 43004 result / 43006 error
-        // are the terminals a spawn consumer publishes.
-        if kind != 43004 && kind != 43006 {
-            return None;
-        }
-        let body: serde_json::Value = serde_json::from_str(&event.content).ok()?;
-        let spawn_key = body.get("spawn_key")?.as_str()?.to_string();
-        let settled = body.get("ok").and_then(|v| v.as_bool()).unwrap_or(true);
-        Some(SpawnResolution {
-            spawn_key,
-            settled,
-            value: body.get("result").cloned().unwrap_or(body),
-        })
-    }
-
-    /// Settle one durable spawn park through the state store.
-    pub async fn resolve_durable_spawn(&self, res: SpawnResolution) -> Result<()> {
-        let Some(spawn) = self
-            .durable_spawns
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(&res.spawn_key)
-            .cloned()
-        else {
-            anyhow::bail!("unknown spawn_key {}", res.spawn_key);
-        };
-        self.durable_spawns
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .remove(&res.spawn_key);
-        let pool = self.pending.lock().await.store().map(|s| s.pool().clone());
-        let Some(pool) = pool else {
-            anyhow::bail!("durable spawn lost its store for {}", res.spawn_key);
-        };
-        let (engine_store, journal, state) = host_handles(pool);
-        let rid = spawn.run_id.clone();
-        let node = spawn.node.clone();
-        let workflow = self
-            .workflows
-            .lock()
-            .map(|g| g.first().cloned())
-            .ok()
-            .flatten();
-        let settled = tokio::task::spawn_blocking(move || {
-            let engine = OurEngine::with_journal(engine_store, journal);
-            let (mut run, _) = DurableRun::open(
-                engine,
-                state,
-                rid.clone(),
-                workflow.unwrap_or_else(|| Workflow {
-                    name: String::new(),
-                    description: None,
-                    trigger: None,
-                    policy: None,
-                    guard: None,
-                    steps: vec![],
-                    graph: None,
-                    inputs: vec![],
-                    crew: None,
-                    principles: vec![],
-                }),
-                serde_json::json!({}),
-                durable_now_ms(),
-            )?;
-            if res.settled {
-                run.spawn_settled(&node, res.value, durable_now_ms())
-                    .map(|effects| (run, effects))
-            } else {
-                let error = res
-                    .value
-                    .get("error")
-                    .and_then(|e| e.as_str())
-                    .unwrap_or("spawn failed")
-                    .to_string();
-                run.spawn_failed(&node, error, durable_now_ms())
-                    .map(|effects| (run, effects))
-            }
-        })
-        .await
-        .map_err(|e| anyhow::anyhow!("durable spawn task failed: {e}"))?;
-        let (_run, _effects) =
-            settled.map_err(|e: HostError| anyhow::anyhow!("durable spawn failed: {e}"))?;
-        Ok(())
     }
 
     /// Drive one graph workflow on the durable host (bd-durable-graph-impl-r2x1).
@@ -5969,12 +5989,12 @@ steps:
         );
     }
 
-    /// bd-spawn-park-toron-vwu3: the durable spawn is a self-contained job — the
-    /// whole spec rides kind-43001 (`spawn_key`, profile, resolved, harness,
-    /// await, timeout, context), and a completion is correlated by that key.
-    /// `Action::Spawn` is still refused, so this is capability, not cutover.
+    /// bd-spawn-park-toron-vwu3 / bd-spawn-launcher-flip-d8mv: the durable
+    /// spawn is a self-contained job — the whole spec rides kind-43001
+    /// (`spawn_key`, profile, resolved, harness, await, timeout, context). The
+    /// job is EVIDENCE; the launcher seam settles the run.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn durable_spawn_publishes_the_whole_spec_and_correlates_by_key() {
+    async fn durable_spawn_publishes_the_whole_spec() {
         use toron_core::bus::in_process::{InProcessBus, InProcessBusConfig};
         use toron_core::index::schema;
         use toron_workflow::engine::spawn::SpawnSpec;
@@ -6041,24 +6061,6 @@ steps:
         assert_eq!(carried["harness"], serde_json::json!("opencode"));
         assert_eq!(carried["await"], serde_json::json!(true));
         assert_eq!(carried["no_claim_timeout"], serde_json::json!(600));
-
-        // A completion correlates by spawn_key, not by a promise id.
-        let keys = Keys::generate();
-        let event = EventBuilder::new(
-            Kind::from_u16(43004),
-            serde_json::json!({
-                "spawn_key": "run-spawn:spawn_it:1",
-                "ok": true,
-                "result": {"pane": "p1"},
-            })
-            .to_string(),
-        )
-        .finalize(&keys)
-        .expect("sign");
-        let parsed = WorkflowHost::parse_spawn_resolution(&event).expect("a spawn completion");
-        assert_eq!(parsed.spawn_key, "run-spawn:spawn_it:1");
-        assert!(parsed.settled);
-        assert_eq!(parsed.value["pane"], serde_json::json!("p1"));
     }
 
     /// bd-asx3 e2e: a real parked run is SUSPENDED (never failed), drains
@@ -9432,12 +9434,12 @@ steps:
 
         #[test]
         fn admits_a_linear_workflow_with_a_store() {
-            assert!(durable_route(&linear_workflow(), true).is_ok());
+            assert!(durable_route(&linear_workflow(), true, false).is_ok());
         }
 
         #[test]
         fn refuses_everything_without_a_store() {
-            let err = durable_route(&linear_workflow(), false).expect_err("no store");
+            let err = durable_route(&linear_workflow(), false, false).expect_err("no store");
             assert!(err.contains("no durable store"), "{err}");
         }
 
@@ -9488,7 +9490,7 @@ steps:
                     ),
                 ),
             ]);
-            assert!(durable_route(&wf, true).is_ok());
+            assert!(durable_route(&wf, true, false).is_ok());
         }
 
         /// Whole-graph refusal: ONE control-flow node keeps the whole graph on
@@ -9514,7 +9516,8 @@ steps:
                     ),
                 ),
             ]);
-            let err = durable_route(&wf, true).expect_err("a parallel node refuses the graph");
+            let err =
+                durable_route(&wf, true, false).expect_err("a parallel node refuses the graph");
             assert!(err.contains("parallel"), "{err}");
         }
 
@@ -9526,12 +9529,15 @@ steps:
                 ("a", graph_node(durable_leaf("a"), &["b"])),
                 ("b", graph_node(durable_leaf("b"), &["a"])),
             ]);
-            let err = durable_route(&wf, true).expect_err("cycles refuse");
+            let err = durable_route(&wf, true, false).expect_err("cycles refuse");
             assert!(err.contains("cycle"), "{err}");
         }
 
+        /// bd-spawn-launcher-flip-d8mv: admission is capability-based. A host
+        /// with no launcher refuses a spawn workflow BEFORE any row; the same
+        /// workflow routes once a launcher is installed.
         #[test]
-        fn refuses_a_spawn_step() {
+        fn a_spawn_step_needs_a_launcher() {
             let mut wf = linear_workflow();
             wf.steps[0].action = Action::Spawn {
                 profile: "@housekeeper".into(),
@@ -9541,8 +9547,9 @@ steps:
                 no_claim_timeout: 600,
                 context: None,
             };
-            let err = durable_route(&wf, true).expect_err("spawn stays old");
-            assert!(err.contains("spawn"), "{err}");
+            let err = durable_route(&wf, true, false).expect_err("no launcher");
+            assert!(err.contains("launcher"), "{err}");
+            assert!(durable_route(&wf, true, true).is_ok());
         }
 
         #[test]
@@ -9727,6 +9734,226 @@ steps:
             seen_digest.lock().unwrap().as_deref(),
             Some(workflow_digest(&workflow).as_str()),
             "the runner sees the identity digest, never an empty string"
+        );
+    }
+
+    /// bd-spawn-launcher-flip-d8mv witness 1: a spawn step on a host WITH a
+    /// launcher launches exactly once, settles the full value, and completes —
+    /// and kind-43001 is still published as operator evidence.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn durable_spawn_launches_once_settles_and_completes() {
+        use toron_core::bus::in_process::{InProcessBus, InProcessBusConfig};
+        use toron_core::index::schema;
+        use toron_core::index::workflow_effects::WorkflowEffectStore;
+        use toron_workflow::schema::{Action, Step, StepOnError, Workflow};
+
+        let db = std::env::temp_dir().join(format!("wf-spawn-run-{}.sqlite", uuid::Uuid::new_v4()));
+        let pool = schema::connect(db.to_str().unwrap())
+            .await
+            .expect("connect");
+        schema::migrate(&pool).await.expect("migrate");
+        let bus: Arc<dyn Bus> = Arc::new(
+            InProcessBus::open(pool.clone(), InProcessBusConfig::default())
+                .await
+                .expect("bus"),
+        );
+        let mut sub = bus
+            .subscribe_trusted(toron_core::bus::Filter::new())
+            .await
+            .expect("subscribe");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = calls.clone();
+        let launcher: SpawnLauncher = Arc::new(move |spec: SpawnSpec| {
+            let seen = seen.clone();
+            Box::pin(async move {
+                seen.fetch_add(1, Ordering::SeqCst);
+                Ok(json!({"pane": "w1:p9", "spawn_key": spec.spawn_key}))
+            })
+        });
+        let workflow = Workflow {
+            name: "spawn-cut".into(),
+            description: None,
+            trigger: None,
+            policy: None,
+            guard: None,
+            principles: vec![],
+            steps: vec![Step {
+                name: Some("spawn_it".into()),
+                guard: None,
+                on_error: StepOnError::Continue,
+                build_slot: false,
+                action: Action::Spawn {
+                    profile: "coder".into(),
+                    harness: None,
+                    workflow: None,
+                    await_: true,
+                    no_claim_timeout: 600,
+                    context: None,
+                },
+            }],
+            graph: None,
+            inputs: vec![],
+            crew: None,
+        };
+        let host = WorkflowHost::over_bus(bus, vec![workflow.clone()], None)
+            .expect("host")
+            .with_job_signer(Some(Keys::generate()))
+            .with_spawn_seams(SpawnSeams {
+                resolver: Some(Arc::new(|name: &str| {
+                    (name == "coder").then(|| json!({"agent": "coder"}))
+                })),
+                launcher: Some(launcher),
+            });
+        host.with_effect_store(WorkflowEffectStore::new(pool.clone()))
+            .await;
+        let input = RunInput {
+            workflow: workflow.clone(),
+            trigger: json!({}),
+            run_id: Some("run-spawn-1".to_string()),
+        };
+        host.run_durable_loop("run-spawn-1".to_string(), workflow.clone(), input)
+            .await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "exactly one launch");
+        assert_eq!(
+            host.pending
+                .lock()
+                .await
+                .run_state_durable("run-spawn-1")
+                .await,
+            RunState::Succeeded,
+            "the run completes"
+        );
+        let raw: String =
+            sqlx::query_scalar("SELECT state_json FROM durable_workflow_runs WHERE run_id = ?1")
+                .bind("run-spawn-1")
+                .fetch_one(&pool)
+                .await
+                .expect("model row");
+        let model: serde_json::Value = serde_json::from_str(&raw).expect("model json");
+        assert_eq!(
+            model["outputs"]["spawn_it"],
+            json!({
+                "ok": true,
+                "spawn_key": "run-spawn-1:spawn_it:1",
+                "result": {"pane": "w1:p9", "spawn_key": "run-spawn-1:spawn_it:1"},
+            }),
+            "the full launcher value settled the step"
+        );
+
+        // The 43001 job is evidence, not transport.
+        let mut carried = None;
+        for _ in 0..20 {
+            let Ok(got) = tokio::time::timeout(std::time::Duration::from_secs(5), sub.next()).await
+            else {
+                break;
+            };
+            let Some(toron_core::bus::SubscriptionEvent::Event(ev)) = got else {
+                continue;
+            };
+            if ev.kind.as_u16() == 43001 {
+                let body: serde_json::Value = serde_json::from_str(&ev.content).expect("job json");
+                carried = Some(body);
+                break;
+            }
+        }
+        let body = carried.expect("a 43001 spawn job");
+        assert_eq!(body["spec"]["spawn_key"], json!("run-spawn-1:spawn_it:1"));
+        assert_eq!(body["spec"]["profile"], json!("coder"));
+    }
+
+    /// bd-spawn-launcher-flip-d8mv witness 4: a launcher that never resolves
+    /// fails the node at the park deadline with the OLD timeout text.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn durable_spawn_launcher_timeout_keeps_the_old_error_text() {
+        use toron_core::bus::in_process::{InProcessBus, InProcessBusConfig};
+        use toron_core::index::schema;
+        use toron_core::index::workflow_effects::WorkflowEffectStore;
+        use toron_workflow::schema::{Action, Step, StepOnError, Workflow};
+
+        let db =
+            std::env::temp_dir().join(format!("wf-spawn-timeout-{}.sqlite", uuid::Uuid::new_v4()));
+        let pool = schema::connect(db.to_str().unwrap())
+            .await
+            .expect("connect");
+        schema::migrate(&pool).await.expect("migrate");
+        let bus: Arc<dyn Bus> = Arc::new(
+            InProcessBus::open(pool.clone(), InProcessBusConfig::default())
+                .await
+                .expect("bus"),
+        );
+        let launcher: SpawnLauncher = Arc::new(|_spec: SpawnSpec| {
+            Box::pin(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                Ok(json!({"pane": "never"}))
+            })
+        });
+        let workflow = Workflow {
+            name: "spawn-timeout".into(),
+            description: None,
+            trigger: None,
+            policy: None,
+            guard: None,
+            principles: vec![],
+            steps: vec![Step {
+                name: Some("spawn_it".into()),
+                guard: None,
+                on_error: StepOnError::Continue,
+                build_slot: false,
+                action: Action::Spawn {
+                    profile: "coder".into(),
+                    harness: None,
+                    workflow: None,
+                    await_: true,
+                    no_claim_timeout: 1,
+                    context: None,
+                },
+            }],
+            graph: None,
+            inputs: vec![],
+            crew: None,
+        };
+        let host = WorkflowHost::over_bus(bus, vec![workflow.clone()], None)
+            .expect("host")
+            .with_spawn_seams(SpawnSeams {
+                resolver: Some(Arc::new(|name: &str| {
+                    (name == "coder").then(|| json!({"agent": "coder"}))
+                })),
+                launcher: Some(launcher),
+            });
+        host.with_effect_store(WorkflowEffectStore::new(pool.clone()))
+            .await;
+        let input = RunInput {
+            workflow: workflow.clone(),
+            trigger: json!({}),
+            run_id: Some("run-spawn-t".to_string()),
+        };
+        host.run_durable_loop("run-spawn-t".to_string(), workflow.clone(), input)
+            .await;
+
+        let raw: String =
+            sqlx::query_scalar("SELECT state_json FROM durable_workflow_runs WHERE run_id = ?1")
+                .bind("run-spawn-t")
+                .fetch_one(&pool)
+                .await
+                .expect("model row");
+        let model: serde_json::Value = serde_json::from_str(&raw).expect("model json");
+        assert_eq!(
+            model["outputs"]["spawn_it"],
+            json!({
+                "ok": false,
+                "error": "spawn-await run-spawn-t:spawn_it:1: timed out after 1s",
+            }),
+            "the old promise-timeout text, keyed by spawn_key"
+        );
+        assert_eq!(
+            host.pending
+                .lock()
+                .await
+                .run_state_durable("run-spawn-t")
+                .await,
+            RunState::Succeeded,
+            "on_error: continue lands the value and the run completes"
         );
     }
 

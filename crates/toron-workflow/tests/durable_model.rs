@@ -10,7 +10,7 @@ use toron_workflow::engine::durable::{
     RunEffect, RunModel, RunMsg, RunPhase, advance, advance_graph, advance_with,
     graph_unsupported_reason, resume_effects, unsupported_reason,
 };
-use toron_workflow::engine::spawn::SpawnSpec;
+use toron_workflow::engine::spawn::{SpawnSpec, spawn_launcher_refusal};
 use toron_workflow::schema::{Action, Graph, GraphNode, Step, StepOnError, Workflow};
 
 fn workflow(steps: Vec<Step>) -> Workflow {
@@ -831,13 +831,20 @@ fn unknown_profile_lands_a_value() {
     );
 }
 
-/// The cutover line: `spawn` stays refused, so a spawn workflow never reaches
-/// this model and leaves no durable row.
+/// The cutover (bd-spawn-launcher-flip-d8mv): `spawn` is a SHAPE the linear
+/// model sequences, so the shape router admits it. Capability lives with the
+/// host that must perform the launch, not with the fold.
 #[test]
-fn spawn_is_still_refused_by_the_router() {
-    let workflow = workflow(vec![spawn_step(false, 0)]);
-    let reason = unsupported_reason(&workflow).expect("spawn stays on the old engine");
-    assert!(reason.contains("spawn"), "{reason}");
+fn spawn_is_admitted_by_shape_and_needs_a_launcher() {
+    let workflow = workflow(vec![spawn_step(true, 30)]);
+    assert!(
+        unsupported_reason(&workflow).is_none(),
+        "shape admits spawn"
+    );
+    assert!(
+        spawn_launcher_refusal(&workflow).is_some(),
+        "a host with no launcher still refuses it"
+    );
 }
 
 /// A restart re-issues the SAME `StartSpawn` (same `spawn_key`), which is what

@@ -266,7 +266,7 @@ pub fn advance_with(
             if next.phase != RunPhase::Ready {
                 return (next, Vec::new());
             }
-            if let Some(reason) = model_shape_refusal(&next.workflow) {
+            if let Some(reason) = unsupported_reason(&next.workflow) {
                 return (next, vec![RunEffect::Unsupported { reason }]);
             }
             next.phase = RunPhase::Running;
@@ -530,10 +530,15 @@ fn next_effects(model: &mut RunModel, now_ms: u64, spawns: &[Option<SpawnSpec>])
 /// `None` when the durable models can sequence this workflow end to end.
 ///
 /// The engine partitions every action. A `steps:` workflow is sequenced by the
-/// linear model (host-sink actions plus `delay` and `request_approval`); a
-/// `graph:` workflow by the graph model under [`graph_unsupported_reason`].
-/// Everything else is a shape the host keeps on the old engine, so it is
-/// refused before a run row or a state row exists.
+/// linear model (host-sink actions plus `delay`, `request_approval`, and
+/// `spawn`); a `graph:` workflow by the graph model under
+/// [`graph_unsupported_reason`]. Everything else is a shape the host keeps on
+/// the old engine, so it is refused before a run row or a state row exists.
+///
+/// This is SHAPE only (bd-spawn-launcher-flip-d8mv). Admission of a spawn is
+/// capability-based and lives with the host that must perform it: a host
+/// without a `SpawnLauncher` refuses the workflow through
+/// [`super::spawn::spawn_launcher_refusal`] before this model is opened.
 pub fn unsupported_reason(workflow: &Workflow) -> Option<String> {
     if workflow.graph.is_some() {
         return graph_unsupported_reason(workflow);
@@ -553,35 +558,8 @@ pub fn unsupported_reason(workflow: &Workflow) -> Option<String> {
 fn is_linear(action: &Action) -> bool {
     matches!(
         action,
-        Action::Delay { .. } | Action::RequestApproval { .. }
+        Action::Delay { .. } | Action::RequestApproval { .. } | Action::Spawn { .. }
     ) || matches!(partition(action), ActionPartition::HostSink { .. })
-}
-
-/// What the MODEL can sequence, which is a superset of what the router admits.
-///
-/// `spawn` has fold arms as of bd-spawn-park-toron-vwu3, but the router still
-/// withholds it until the flywheel pane consumer reads the spec (separate flip
-/// bead). `Start` therefore asks this, not [`unsupported_reason`]: a shape the
-/// model can sequence must not answer `Unsupported` merely because the cutover
-/// has not flipped.
-fn model_shape_refusal(workflow: &Workflow) -> Option<String> {
-    if workflow.graph.is_some() {
-        return graph_unsupported_reason(workflow);
-    }
-    for (index, step) in workflow.steps.iter().enumerate() {
-        if !is_model_linear(&step.action) {
-            return Some(format!(
-                "step '{}' uses '{}', which the linear model cannot sequence yet",
-                step_name(step, index),
-                step.action.type_name()
-            ));
-        }
-    }
-    None
-}
-
-fn is_model_linear(action: &Action) -> bool {
-    matches!(action, Action::Spawn { .. }) || is_linear(action)
 }
 
 /// Land one spawn settlement and continue.

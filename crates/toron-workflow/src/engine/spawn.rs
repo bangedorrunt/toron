@@ -9,14 +9,18 @@
 //! `run_spawn` and the durable model both call it, so the payload a consumer
 //! reads has one author.
 //!
-//! `Action::Spawn` stays REFUSED by
-//! [`crate::engine::durable::unsupported_reason`] until the flywheel pane
-//! consumer lands (separate flip bead): this slice adds the capability, it does
-//! not cut the action over.
+//! The linear model sequences `Action::Spawn`; ADMISSION is capability-based
+//! (bd-spawn-launcher-flip-d8mv): a host without a [`SpawnLauncher`] refuses
+//! the workflow before any row, so a run can never park on a launch nobody
+//! can perform.
+
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use crate::schema::ContextMode;
+use crate::schema::{Action, ContextMode, Workflow};
 
 use super::ProfileResolver;
 
@@ -90,11 +94,44 @@ pub struct SpawnInput {
     pub generation: u64,
 }
 
+/// Starts one child and resolves with its receipt (bd-spawn-launcher-flip-d8mv).
+///
+/// The host awaits this on `RunEffect::StartSpawn` and feeds the outcome back
+/// as `SpawnSettled` / `SpawnFailed` — the same shape [`super::AsyncEffectRunner`]
+/// has for leaves. The launcher owns the process that can actually start a
+/// child (flywheel's pane plane); the model never calls it.
+pub type SpawnLauncher = Arc<
+    dyn Fn(SpawnSpec) -> Pin<Box<dyn Future<Output = anyhow::Result<serde_json::Value>> + Send>>
+        + Send
+        + Sync,
+>;
+
 /// The host capabilities the seam needs.
 #[derive(Clone, Default)]
 pub struct SpawnSeams {
     /// Profile name → resolved profile. `None` = unknown profile.
     pub resolver: Option<ProfileResolver>,
+    /// Starts the child. `None` = this host cannot perform a spawn, which is
+    /// what makes the router refuse a spawn workflow.
+    pub launcher: Option<SpawnLauncher>,
+}
+
+/// Why a spawn workflow cannot run on this host: no launcher.
+///
+/// One spelling for the router ([`super::durable_host`]) and the host's
+/// `durable_route`, so the refusal text cannot drift.
+pub fn launcher_refusal() -> String {
+    "spawn needs a launcher: this host cannot start a child pane".into()
+}
+
+/// `Some(reason)` when `workflow` has a spawn step and the host has no
+/// launcher. Graph nodes cannot spawn, so only `steps:` is scanned.
+pub fn spawn_launcher_refusal(workflow: &Workflow) -> Option<String> {
+    workflow
+        .steps
+        .iter()
+        .any(|step| matches!(step.action, Action::Spawn { .. }))
+        .then(launcher_refusal)
 }
 
 /// Why a spawn could not be prepared. The run lands it as a step VALUE, never
@@ -160,8 +197,8 @@ pub fn prepare_spawn(seams: &SpawnSeams, input: SpawnInput) -> Result<SpawnSpec,
 impl SpawnSpec {
     /// The promise payload the old path published, reproduced byte for byte.
     ///
-    /// The old engine still owns `spawn` until the flip; it must read the same
-    /// keys it always did.
+    /// Pre-flip runs and the old engine read this shape; it must keep the
+    /// keys they always did.
     pub fn legacy_payload(&self) -> serde_json::Value {
         let mut spec = serde_json::json!({
             "profile": self.profile,
