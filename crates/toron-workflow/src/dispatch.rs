@@ -13,7 +13,7 @@
 //!   queue is a single-writer cache over those rows and a restart rebuilds
 //!   it via [`DispatchPool::rebuild_from_jobs`], resuming the cursor.
 //!
-//! This is the in-process dispatcher; the Resonate-backed durable runner
+//! This is the in-process dispatcher; the durable runner
 //! (bd-oge) layers crash-survivable execution on top.
 
 use std::collections::{HashMap, VecDeque};
@@ -251,7 +251,7 @@ impl DispatchPool {
     ///
     /// When the agent is busy, returns `Err(effects)` containing
     /// `SleepUntilDeadline` / `HoldContinued` / `HoldExpired` / `FencedStale`
-    /// — the host journals Sleep (Resonate park); settlement ≠ provider done.
+    /// — the host journals Sleep (engine park); settlement ≠ provider done.
     ///
     /// `Err([])` (empty vec) means **race-loss after rollback**: the busy-owner
     /// model had already emitted `Acquired` and inserted a holder, but the
@@ -312,7 +312,7 @@ impl DispatchPool {
     /// GS-062 ask-user C live cutover: acquire for hosts that **must** observe
     /// fenced effects. Never maps `SleepUntilDeadline` / `HoldContinued` /
     /// `HoldExpired` / `FencedStale` → absence. Host journals/parks Sleep
-    /// (Resonate-style); settlement ≠ provider completion.
+    /// (journal-style); settlement ≠ provider completion.
     pub fn try_acquire_for_host(
         &self,
         agent: &str,

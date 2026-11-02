@@ -3,8 +3,7 @@
 
 //! Host-driven cron scheduler over the framework cron kernel and `OurEngine`.
 //!
-//! `cron.rs` still owns the Resonate durable-sleep manager. This is the
-//! replacement path: the host calls [`ElmCron::tick`] at its cadence, the
+//! The host calls [`ElmCron::tick`] at its cadence, the
 //! latest due tick becomes one idempotent `OurEngine::start` under
 //! `fire_key(name, tick_ms)`, and the host runs the tick body. Registration,
 //! pause/resume, `Skip` catch-up, and the body stay with the host.

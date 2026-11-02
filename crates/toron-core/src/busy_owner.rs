@@ -4,7 +4,7 @@
 //! Busy-owner hold bound + generation fence + deadline wake (pure core).
 //!
 //! Maps Buzz ACP busy-owner patterns onto toron dispatch **without** porting
-//! ACP/stdio. Effects are data; the host (DispatchPool / Resonate park)
+//! ACP/stdio. Effects are data; the host (DispatchPool / engine park)
 //! performs SleepUntilDeadline. Journal settlement ≠ provider completion
 //! (ADR-0032).
 //!
@@ -100,7 +100,7 @@ pub enum BusyOwnerMsg {
 pub enum BusyOwnerEffect {
     /// Slot acquired at this generation.
     Acquired { agent: String, generation: u64 },
-    /// Agent busy; host should park until deadline (Resonate sleep).
+    /// Agent busy; host should park until deadline (engine park).
     SleepUntilDeadline {
         agent: String,
         until_ms: u64,

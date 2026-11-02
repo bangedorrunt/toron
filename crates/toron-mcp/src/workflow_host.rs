@@ -1020,7 +1020,7 @@ pub struct WorkflowHost {
     /// arm dispatches through the same runner the old path would have used.
     seams: LeafSeams,
     /// bd-host-cut-pqkg: approvals parked on the durable path by run id.
-    /// The model has no Resonate promise id, so the run id is the
+    /// The model has no vendor promise id, so the run id is the
     /// correlation key; `PendingDrain` never sees these entries.
     durable_parks: Arc<std::sync::Mutex<HashMap<(String, String), DurablePark>>>,
     /// bd-spawn-launcher-flip-d8mv: the spawn capability — the profile
@@ -1359,7 +1359,7 @@ impl WorkflowHost {
     }
 
     /// Construct over an explicit bus AND engine (bd-asx3 lifecycle tests:
-    /// a remote Resonate engine is required for real promise parks).
+    /// a remote engine is required for real promise parks).
     pub fn over_bus_with_engine(
         bus: Arc<dyn Bus>,
         engine: WorkflowEngine,
@@ -9844,7 +9844,7 @@ steps:
     }
 
     /// bd-host-cut-pqkg: the host-level restart witness — one linear workflow
-    /// completes on the durable path with no Resonate server anywhere.
+    /// completes on the durable path with no vendor server anywhere.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn durable_loop_completes_a_linear_workflow() {
         use toron_core::bus::in_process::{InProcessBus, InProcessBusConfig};

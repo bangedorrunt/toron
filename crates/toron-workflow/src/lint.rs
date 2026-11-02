@@ -15,7 +15,7 @@ use crate::schema::{Action, CronSpec, CronSpecPolicy, Graph, Step, Trigger, Work
 /// evaluator's constant) — the lint advisory must never drift from it.
 pub const GUARD_TIMEOUT_MS: u64 = crate::guard::DEFAULT_TIMEOUT_MS;
 
-/// The in-process `delay` action cap (Buzz: 270s; Resonate unbounded later).
+/// The in-process `delay` action cap (Buzz: 270s; the durable engine has no such cap).
 pub const DELAY_CAP_SECS: u64 = 270;
 
 /// A lint diagnostic.
@@ -654,7 +654,7 @@ fn check_action(report: &mut LintReport, action: &Action) {
                 report.issues.push(LintIssue {
                     level: Level::Warning,
                     message: format!(
-                        "delay {secs}s exceeds the in-process cap {DELAY_CAP_SECS}s — Resonate (bd-oge) lifts this"
+                        "delay {secs}s exceeds the in-process cap {DELAY_CAP_SECS}s — the durable engine has no such cap"
                     ),
                     line: None,
                 });

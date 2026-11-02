@@ -3,9 +3,9 @@
 
 //! Pure linear run model for the durable workflow cutover.
 //!
-//! The Resonate `run_workflow` function cannot be replaced by a compatible
-//! async `Context`: our engine schedules runs, it does not replay a function
-//! body. This module is the explicit model the ADR calls for:
+//! The old vendor function cannot be replaced by a compatible async
+//! `Context`: our engine schedules runs, it does not replay a function body.
+//! This module is the explicit model the ADR calls for:
 //!
 //! ```text
 //! (RunModel, RunMsg) -> (RunModel, Vec<RunEffect>)

@@ -43,9 +43,9 @@ use serde::{Deserialize, Serialize};
 /// reach the same decision forever — the park would never notice T arriving.
 ///
 /// The leaf HOLDS this and calls it; it never reads a system clock itself, and
-/// that is the property that matters. The Resonate SDK gives a durable function
-/// no wall clock precisely so a leaf cannot take ambient time as authority. The
-/// host owns the clock, the leaf owns only the comparison.
+/// that is the property that matters. A durable leaf gets no wall clock
+/// precisely so it cannot take ambient time as authority. The host owns the
+/// clock, the leaf owns only the comparison.
 ///
 /// Replay: `now` legitimately advances across a replay, so `plan_park` converges
 /// toward `ResumeNow` as T passes. That is the correct outcome — the decision

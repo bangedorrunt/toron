@@ -9,7 +9,7 @@ edition = "2024"
 p1 = []
 # Phase-2 gate: SC-9..SC-13
 p2 = []
-# P5 gate: ADR-0005 Resonate concurrency + replay-determinism spike (SC-16)
+# P5 gate: ADR-0005 durable concurrency + replay-determinism spike (SC-16)
 p5 = []
 # P4 gate: ADR-0005 smart-cron behavior rows (SC-18..SC-25) + shared fixtures
 p4 = ["p5"]

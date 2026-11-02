@@ -106,7 +106,7 @@ pub struct RunInput {
     pub workflow: crate::schema::Workflow,
     /// The trigger payload (available to `{{trigger.*}}` templates).
     pub trigger: serde_json::Value,
-    /// The Resonate run id (for evidence-bearing approvals, Spec 3).
+    /// The durable run id (for evidence-bearing approvals, Spec 3).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_id: Option<String>,
 }

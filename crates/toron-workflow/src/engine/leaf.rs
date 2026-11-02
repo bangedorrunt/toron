@@ -3,7 +3,7 @@
 
 //! Context-free effect-leaf policy (bd-leaf-seams-9rwi).
 //!
-//! The linear durable host dispatches effect leaves with no Resonate
+//! The linear durable host dispatches effect leaves with no vendor
 //! [`Context`] to read dependencies from, so the policy the workflow engine
 //! applies to a HostSink leaf lives here as plain data: [`LeafSeams`] carries
 //! the two runners, the verify sink, and the journal mode; [`dispatch_leaf`] is
@@ -31,7 +31,7 @@ use super::{
 };
 
 /// The four host-owned seams the effect-leaf policy depends on, lifted out of
-/// the Resonate dependency map so a host with no `Context` can supply them.
+/// the engine dependency map so a host with no `Context` can supply them.
 ///
 /// `verify_sink` is concrete rather than `Option`: [`VerifySink`] already holds
 /// an optional inner closure, and `Default` (nothing installed) makes `project`

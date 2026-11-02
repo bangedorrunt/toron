@@ -12,7 +12,7 @@
 //! past and `now` covering several due ticks, the catch-up selects the
 //! LATEST one, and it is the same tick `next_due` would produce from the
 //! previous tick (a single deterministic target — no burst). The
-//! manager-level wake path (old assertion 2, Resonate durable-sleep loop)
+//! manager-level wake path (old assertion 2, vendor durable-sleep loop)
 //! is retired with the vendor loop; its durable replacement is owned by
 //! `cron_elm` tick tests (`Latest` policy) and the flywheel cron host.
 //!

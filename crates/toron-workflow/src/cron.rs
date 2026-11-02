@@ -1,50 +1,22 @@
 // governed-by: ADR-0005 (P4.3 — cron manager, Spec 3 scheduler durability)
 #![forbid(unsafe_code)]
 
-//! The Resonate durable-sleep cron manager (ADR-0005 Spec 3).
+//! Cron specs and pure tick timing.
 //!
-//! The scheduler is NOT a wall-clock assumption: each registered cron runs as
-//! a **Resonate durable function** that loops `ctx.sleep(until next tick)`
-//! then fires the owning workflow as a durable child run. Restart survival +
-//! no double-fire fall out of Resonate's deterministic replay: the child
-//! promise ids derive from the loop's context sequence, so a crash mid-run
-//! replays to the same ticks and the server dedups (no duplicate runs).
-//!
-//! Missed-tick policy = **`latest`**: on wake after downtime, the loop jumps
-//! `last_fired` to the most-recent due tick at-or-before `now` and fires that
-//! ONE — never a burst of every missed tick.
-//!
-//! **Replay determinism (bd-25g7.2):** the loop's per-iteration decisions are
-//! recorded as durable promises, so a restart mid-sleep resumes EXACTLY where
-//! the original execution left off:
-//! - The catch-up decision (which tick to fire) runs as the durable
-//!   [`decide_tick`] child — replay returns the RECORDED decision, never a
-//!   re-derived wall-clock one (a phantom policy event / early-fire would
-//!   otherwise follow a reboot).
-//! - The tick body + failure-policy side effects run as the durable
-//!   [`run_cron_tick`] child — replay resolves the recorded child, so the
-//!   policy event is pushed exactly once per real tick.
-//! - Every iteration makes the SAME terminal-op calls in the same order
-//!   (decide → sleep → tick; the sleep is issued even for a zero-duration
-//!   catch-up so the call pattern cannot diverge across replay).
-//!
-//! toron never imports flywheel (ADR-0003 Decision 3A). The registry is
-//! injected via [`CronRegistry`] (DI seam, same idiom as the engine's
-//! `ActionRunner`);
-//! flywheel's `crons.toml` (its own catalog half, `flywheel::cron`) is
-//! bridged by the embedding. The cron-expression parser here accepts the spec
-//! 5-field form (`"30 3 * * 0"`).
-
-use std::sync::Arc;
-
+//! This module owns the cron DATA and arithmetic: `CronSpec` parsing, the
+//! 5-field next-tick (`due_tick`), catch-up policy, and the tick body
+//! (`spec_tick_workflow`) the host runs on the durable engine. It is not a
+//! scheduler: the host drives ticks (`ElmCron` in `cron_elm.rs`) and persists
+//! the checkpoint; the engine owns the run. There is no wall-clock sleep and
+//! no vendor replay here — `due_tick` is a pure function of the expression and
+//! two timestamps.
 use chrono::DateTime;
-use serde::{Deserialize, Serialize};
 
-use crate::schema::{CronCatchup, CronPolicy, CronScope, CronSpec, CronSpecPolicy, Workflow};
+use crate::schema::{CronCatchup, CronPolicy, CronSpec, CronSpecPolicy, Workflow};
 
-/// One registered cron the manager drives (Spec 3). The embedding resolves
-/// the workflow template + owner profile; the manager only needs the plan.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// One registered cron the host drives (Spec 3). The embedding resolves
+/// the workflow template + owner profile; the host only needs the plan.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CronRegistration {
     /// Unique cron name (the durable run id prefix).
     pub name: String,
@@ -56,7 +28,7 @@ pub struct CronRegistration {
     pub owner: String,
     /// Signing scope: host = operator identity, project = scoped agent.
     #[serde(default)]
-    pub scope: CronScope,
+    pub scope: crate::schema::CronScope,
     /// Paused crons are skipped (entry preserved; nothing fires).
     #[serde(default = "default_enabled")]
     pub enabled: bool,
@@ -66,37 +38,7 @@ const fn default_enabled() -> bool {
     true
 }
 
-/// Registry access (DI seam): the embedding supplies the current cron set.
-/// Returns the enabled registrations to drive.
-/// The registry query seam (bd-e03q, ADR-0035 Spec 4): a closure over the
-/// spec source (YAML files, DB rows), NOT a snapshot. The manager calls it
-/// on every start, so the registry is a live projection — edited specs take
-/// effect at the next start with no cache to invalidate and nothing to
-/// rebuild. Closures own no state; staleness is impossible by construction.
-pub type CronRegistry = Arc<dyn Fn() -> Vec<CronRegistration> + Send + Sync>;
 
-/// One ADR-0012 spec-driven cron the manager drives (P12.2, bd-25g7.2): the
-/// schedule + owner + policy + steps body come from the [`CronSpec`] itself —
-/// the spec IS the registration. Runs under the `cron-spec:{name}` run-id
-/// namespace (no collision with legacy `cron:{name}` loops).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CronSpecRegistration {
-    /// The cron definition (its `name` is the identity + run-id suffix).
-    pub spec: CronSpec,
-    /// Paused crons are skipped (entry preserved; nothing fires).
-    #[serde(default = "default_enabled")]
-    pub enabled: bool,
-    /// Test/embedding hook: the loop's initial `last_fired` (unix seconds).
-    /// Default = the loop's birth time (first tick is the next genuinely
-    /// future one). Deterministic — stored in the loop input, replayed
-    /// verbatim on resume.
-    #[serde(default)]
-    pub start_ts: Option<i64>,
-}
-
-/// Registry access for spec-driven crons (ADR-0012 DI seam, mirrors
-/// [`CronRegistry`]).
-pub type CronSpecRegistry = Arc<dyn Fn() -> Vec<CronSpecRegistration> + Send + Sync>;
 
 /// The tick body for a spec-driven loop: a [`Workflow`] built from the
 /// CronSpec's steps/graph/policy — the SAME shape the shared engine runs
@@ -530,16 +472,4 @@ mod tests {
         assert_eq!(due, base + 600);
     }
 
-    /// The spec registration round-trips; `enabled`/`start_ts` default.
-    #[test]
-    fn cron_spec_registration_roundtrip() {
-        let reg: CronSpecRegistration =
-            serde_yaml::from_str("spec:\n  name: w\n  schedule: '* * * * *'\n  owner: o\n")
-                .expect("reg");
-        assert!(reg.enabled, "enabled defaults true");
-        assert!(reg.start_ts.is_none());
-        let out = serde_yaml::to_string(&reg).expect("serialize");
-        assert!(!out.contains("cron-spec"));
-        assert!(out.contains("name: w"));
-    }
 }

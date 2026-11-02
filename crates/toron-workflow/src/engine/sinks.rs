@@ -4,7 +4,7 @@
 
 //! DI sink newtypes (F21.ENGINE-SPLIT move from the former single-file
 //! engine): approval/spawn promise-id side-channels. Distinct newtypes (not
-//! `type` aliases) so the Resonate dependency map keys each by a unique
+//! `type` aliases) so the host dependency map keys each by a unique
 //! `TypeId`.
 
 use std::sync::Arc;
@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 /// a run parks on `request_approval`, its promise_id is pushed here so the
 /// embedding can publish the kind-46011 pending event.
 ///
-/// Distinct newtype (not a `type` alias): the Resonate dependency map keys by
+/// Distinct newtype (not a `type` alias): the host dependency map keys by
 /// `TypeId` of the value type, so two `Arc<Mutex<Vec<String>>>` aliases would
 /// collide and `get_dependency` would resolve both sinks to the LAST
 /// registered — a real 0.6-migration regression (a1fe947). The newtype gives
@@ -36,7 +36,7 @@ impl std::ops::Deref for ApprovalSink {
 /// the kind-43001 job carrying it in the `spec`.
 ///
 /// Distinct newtype — see [`ApprovalSink`] for why (TypeId collision in the
-/// Resonate dependency map).
+/// host dependency map).
 #[derive(Clone, Default)]
 pub struct SpawnSink(Arc<tokio::sync::Mutex<Vec<String>>>);
 

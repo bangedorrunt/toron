@@ -63,7 +63,7 @@ pub struct PolicyEvent {
     pub output: Option<serde_json::Value>,
 }
 
-/// Side-channel for policy decisions (distinct newtype — the Resonate
+/// Side-channel for policy decisions (distinct newtype — the host
 /// dependency map keys by `TypeId`, so this must NOT be a bare
 /// `Arc<Mutex<Vec<…>>>` alias, or it collides with the other sinks).
 #[derive(Clone, Default)]

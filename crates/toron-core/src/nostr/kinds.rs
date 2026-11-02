@@ -60,9 +60,9 @@ pub const JOB_RESULT: u16 = 43004;
 pub const JOB_CANCEL: u16 = 43005;
 /// Job error (regular; `e`=job). Failed-with-error terminal state.
 pub const JOB_ERROR: u16 = 43006;
-/// Workflow run/step/approval (regular/replaceable; `d`=run-id). Resonate-backed.
+/// Workflow run/step/approval (regular/replaceable; `d`=run-id). Durable-engine-backed.
 pub const WORKFLOW_RUN_FIRST: u16 = 46001;
-/// Workflow run/step/approval (regular/replaceable; `d`=run-id). Resonate-backed.
+/// Workflow run/step/approval (regular/replaceable; `d`=run-id). Durable-engine-backed.
 pub const WORKFLOW_RUN_LAST: u16 = 46012;
 
 /// Convert a toron kind number to a `Kind`.

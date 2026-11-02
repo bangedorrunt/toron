@@ -1,7 +1,7 @@
 // governed-by: ADR-0032
 #![forbid(unsafe_code)]
 
-//! One linear step, no Resonate Context (bd-linear-step-6j0y).
+//! One linear step, no vendor Context (bd-linear-step-6j0y).
 //!
 //! The durable host runs a single HostSink step outside the workflow engine's
 //! Context, so everything the engine would read from a `Context` arrives here

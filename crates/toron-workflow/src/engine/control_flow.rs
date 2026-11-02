@@ -578,7 +578,7 @@ pub(crate) const MAX_PARALLEL_FANOUT: usize = 32;
 /// Bounded reduce cap (bd-3pti): inputs longer than this fail loud instead
 /// Reserved trigger key carrying the durable workflow lineage envelope.
 /// The envelope is deliberately part of `trigger`, rather than `Context`, so
-/// Resonate serializes it with the child input and replay sees the same guard.
+/// it serializes with the child input and a resumed run sees the same guard.
 const WORKFLOW_LINEAGE_KEY: &str = "__flywheel_workflow_lineage";
 /// Maximum call depth, including the root workflow.
 pub const MAX_WORKFLOW_DEPTH: usize = 8;

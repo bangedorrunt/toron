@@ -6,7 +6,7 @@
 // the lint firing on a test-support module is noise, not dead code.
 #![allow(dead_code)]
 
-//! Shared fixtures for the scenario test harness (bd-i84w: the Resonate
+//! Shared fixtures for the scenario test harness (bd-i84w: the vendor
 //! server harness is retired — `boot_server` / `wait_ready` / `free_port` /
 //! vendor helpers are gone with it; scenarios drive `DurableRun` /
 //! `DurableGraphRun` over temp sqlite pools via [`durable`]).
