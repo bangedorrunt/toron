@@ -928,6 +928,39 @@ fn started(workflow: Workflow, trigger: serde_json::Value) -> (RunModel, Vec<Run
     advance(&model, &RunMsg::Start { now_ms: 1_000 })
 }
 
+/// A pure reduce inside the chosen arm folds and completes; the other arm
+/// never dispatches (bd-branch-reduce-5tpe).
+#[test]
+fn branch_arm_runs_a_pure_reduce() {
+    let reduce = Step {
+        name: Some("fold".into()),
+        guard: None,
+        on_error: StepOnError::Continue,
+        build_slot: false,
+        action: Action::Reduce {
+            over: "[1, 2, 3]".into(),
+            op: toron_workflow::schema::ReduceOp::Sum,
+            key: None,
+            template: None,
+            separator: None,
+            init: None,
+        },
+    };
+    let wf = workflow(vec![branch(
+        "{{trigger.gate}} == true",
+        vec![reduce],
+        vec![named("no", dm("no"), StepOnError::Continue)],
+        StepOnError::Continue,
+    )]);
+    let (model, effects) = started(wf, json!({ "gate": true }));
+    assert!(
+        matches!(effects.as_slice(), [RunEffect::Complete { .. }]),
+        "the pure fold runs in the fold and completes: {effects:?}"
+    );
+    assert_eq!(model.outputs["fold"], json!(6), "the arm reduce folds");
+    assert!(!model.outputs.contains_key("no"), "else arm never ran");
+}
+
 /// The chosen arm runs and the other one never dispatches.
 #[test]
 fn branch_true_arm_runs_false_skips() {

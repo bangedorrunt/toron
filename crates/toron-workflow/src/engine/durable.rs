@@ -1118,7 +1118,7 @@ pub fn unsupported_reason(workflow: &Workflow) -> Option<String> {
                     let sequencable = matches!(
                         partition(&arm_step.action),
                         ActionPartition::HostSink { .. }
-                    ) || matches!(arm_step.action, Action::Spawn { .. });
+                    ) || matches!(arm_step.action, Action::Spawn { .. } | Action::Reduce { .. });
                     if !sequencable {
                         return Some(format!(
                             "step '{}' branch arm step '{}' uses '{}', which the linear model cannot sequence inside an arm",
