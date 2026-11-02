@@ -161,6 +161,9 @@ where
             anyhow::bail!("run {run_id} stopped");
         }
         if effects.is_empty() {
+            if run.model().is_terminal() {
+                return Ok(linear_terminal_value(run.model()));
+            }
             anyhow::bail!("run {run_id}: durable drive ran out of effects while non-terminal");
         }
         let mut follow = Vec::new();
@@ -500,6 +503,22 @@ where
 }
 
 /// The terminal value of an already-finished graph model.
+fn linear_terminal_value(model: &super::durable::RunModel) -> Value {
+    match &model.phase {
+        super::durable::RunPhase::Succeeded => json!({
+            "status": "succeeded",
+            "steps": model.outputs,
+        }),
+        super::durable::RunPhase::Failed { error } => json!({
+            "status": "failed",
+            "error": error,
+            "failed_step": "<workflow>",
+        }),
+        super::durable::RunPhase::Cancelled => json!({"status": "cancelled"}),
+        _ => Value::Null,
+    }
+}
+
 fn terminal_value(model: &GraphModel) -> Value {
     match &model.phase {
         super::durable::GraphPhase::Succeeded => Value::Object(

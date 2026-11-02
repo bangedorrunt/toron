@@ -251,6 +251,10 @@ pub struct WorkflowEngine {
     /// SQLite store the embedding already owns. `None` = the in-memory kernel
     /// (a local engine: process-lifetime runs, no cross-process resume).
     store: Option<toron_core::index::workflow_effects::WorkflowEffectStore>,
+    /// The local engine's model seam. Shared for the engine's lifetime so a
+    /// redelivered run id resumes its recorded terminal instead of starting
+    /// over (steer chain redelivery contract).
+    mem_state: drive::MemRunState,
     approvals: drive::Waiters,
     spawns: drive::Waiters,
     /// The spec behind each announced spawn key, so an embedding's drainer can
@@ -570,6 +574,7 @@ impl WorkflowEngine {
             policy_sink: crate::cron_failure::PolicySink::new(),
             verify_sink: VerifySink::default(),
             store: None,
+            mem_state: drive::MemRunState::default(),
             approvals: drive::Waiters::default(),
             spawns: drive::Waiters::default(),
             spawn_specs: std::sync::Arc::new(std::sync::Mutex::new(
@@ -748,7 +753,7 @@ impl WorkflowEngine {
                 }
                 None => {
                     let engine = toron_core::kernel::OurEngine::new();
-                    let state = drive::MemRunState::default();
+                    let state = self.mem_state.clone();
                     let opened = tokio::task::spawn_blocking(move || {
                         crate::engine::durable_host::DurableGraphRun::open_with_children(
                             engine,
@@ -805,7 +810,7 @@ impl WorkflowEngine {
                 }
                 None => {
                     let engine = toron_core::kernel::OurEngine::new();
-                    let state = drive::MemRunState::default();
+                    let state = self.mem_state.clone();
                     let opened = tokio::task::spawn_blocking(move || {
                         crate::engine::durable_host::DurableRun::open_with_seams(
                             engine,
