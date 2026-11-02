@@ -678,7 +678,11 @@ async fn pending_urgent_is_correct_without_the_index() {
         .unwrap();
     assert_eq!(
         schema::store_version(s.pool()).await.unwrap().additive,
-        vec!["inbox_stream_close", "durable_engine_runs", "durable_workflow_runs"],
+        vec![
+            "inbox_stream_close",
+            "durable_engine_runs",
+            "durable_workflow_runs"
+        ],
         "the dropped index is gone; the additive table is still there"
     );
     // The planner falls back to the recipient index: slower, same answers.

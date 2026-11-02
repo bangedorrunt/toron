@@ -15,8 +15,8 @@
 
 use serde_json::{Map, Value, json};
 
-use crate::schema::{Action, ReduceOp};
 use crate::engine::template::{RenderContext, render_action, render_scalar};
+use crate::schema::{Action, ReduceOp};
 
 /// The bounded fold size (bd-3pti).
 pub const MAX_REDUCE_ITEMS: usize = 1024;
@@ -33,8 +33,10 @@ pub fn evaluate(
         return fail("reduce: not a reduce action");
     }
     // Strict render first: an unresolvable ref fails here with attribution.
-    let render_outputs: Map<String, Value> =
-        outputs.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    let render_outputs: Map<String, Value> = outputs
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
     // `{{item}}` is deferred context: render the action with the join
     // template removed, then restore it for the per-item pass.
     let mut to_render = action.clone();
@@ -82,7 +84,7 @@ pub fn evaluate(
             let start = match init {
                 Some(Value::Number(n)) => n.as_u64().unwrap_or(0),
                 Some(other) => {
-                    return fail(format!("reduce count: init must be a number, got {other}"))
+                    return fail(format!("reduce count: init must be a number, got {other}"));
                 }
                 None => 0,
             };
@@ -102,7 +104,7 @@ pub fn evaluate(
             let mut total = match init {
                 Some(Value::Number(n)) => n.as_f64().unwrap_or(0.0),
                 Some(other) => {
-                    return fail(format!("reduce sum: init must be a number, got {other}"))
+                    return fail(format!("reduce sum: init must be a number, got {other}"));
                 }
                 None => 0.0,
             };
@@ -112,9 +114,7 @@ pub fn evaluate(
                     Err(e) => return fail(e),
                 };
                 let Some(n) = value.as_f64() else {
-                    return fail(format!(
-                        "reduce sum: item {index} is not a number: {value}"
-                    ));
+                    return fail(format!("reduce sum: item {index} is not a number: {value}"));
                 };
                 total += n;
             }
@@ -132,7 +132,7 @@ pub fn evaluate(
             let mut out = match init {
                 Some(Value::String(s)) => s.clone(),
                 Some(other) => {
-                    return fail(format!("reduce join: init must be a string, got {other}"))
+                    return fail(format!("reduce join: init must be a string, got {other}"));
                 }
                 None => String::new(),
             };
@@ -160,7 +160,11 @@ fn fold_bool(
 ) -> Value {
     let start = match init {
         Some(Value::Bool(b)) => *b,
-        Some(other) => return fail(format!("reduce all/any: init must be a boolean, got {other}")),
+        Some(other) => {
+            return fail(format!(
+                "reduce all/any: init must be a boolean, got {other}"
+            ));
+        }
         None => empty,
     };
     let mut acc = start;
@@ -175,7 +179,11 @@ fn fold_bool(
 }
 
 /// A missing key is a refusal, not `null`: the caller must know the row.
-fn operand_checked<'a>(item: &'a Value, key: Option<&str>, index: usize) -> Result<&'a Value, String> {
+fn operand_checked<'a>(
+    item: &'a Value,
+    key: Option<&str>,
+    index: usize,
+) -> Result<&'a Value, String> {
     let Some(key) = key else { return Ok(item) };
     let mut cur = item;
     for part in key.split('.') {
