@@ -211,6 +211,21 @@ pub async fn run_graph_node_step(input: GraphNodeStep<'_>, seams: &LeafSeams) ->
         action => action,
     };
 
+    if let Action::Reduce { .. } = node_action {
+        let outputs: std::collections::BTreeMap<String, serde_json::Value> = input
+            .inputs
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        return crate::engine::reduce::evaluate(
+            node_action,
+            trigger,
+            &outputs,
+            input.workflow,
+            input.node_name,
+        );
+    }
+
     // The planning render in the fold is LENIENT; this one is strict, so an
     // unresolvable ref fails HERE with workflow/node/field/ref attribution
     // rather than reaching a runner as a verbatim placeholder.

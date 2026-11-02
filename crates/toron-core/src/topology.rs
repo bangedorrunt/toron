@@ -27,6 +27,8 @@ pub enum Topology {
     Supervisor,
     /// One agent, or peers with no captain. [`G_OPEN`].
     Open,
+    /// A loop acting on itself. [`G_LOOP`].
+    Loop,
 }
 
 impl<'de> Deserialize<'de> for Topology {
@@ -39,8 +41,8 @@ impl<'de> Deserialize<'de> for Topology {
 }
 
 impl Topology {
-    /// Every mode, in a fixed order. `loop` is not a member.
-    pub const ALL: [Self; 3] = [Self::Swarm, Self::Supervisor, Self::Open];
+    /// Every mode, in a fixed order.
+    pub const ALL: [Self; 4] = [Self::Swarm, Self::Supervisor, Self::Open, Self::Loop];
 
     /// The wire spelling (`snake_case`), as serde writes it.
     pub const fn as_str(self) -> &'static str {
@@ -48,6 +50,7 @@ impl Topology {
             Self::Swarm => "swarm",
             Self::Supervisor => "supervisor",
             Self::Open => "open",
+            Self::Loop => "loop",
         }
     }
 
@@ -56,7 +59,8 @@ impl Topology {
         match s {
             "swarm" => Some(Self::Swarm),
             "supervisor" => Some(Self::Supervisor),
-            "open" | "loop" => Some(Self::Open),
+            "open" => Some(Self::Open),
+            "loop" => Some(Self::Loop),
             _ => None,
         }
     }
@@ -223,6 +227,7 @@ pub fn global_of(topology: Topology) -> Result<&'static Global, ProjectError> {
     match topology {
         Topology::Swarm => Ok(&G_SWARM),
         Topology::Open => Ok(&G_OPEN),
+        Topology::Loop => Ok(&G_LOOP),
         Topology::Supervisor => Err(ProjectError::NotYet {
             what: "supervisor".into(),
         }),

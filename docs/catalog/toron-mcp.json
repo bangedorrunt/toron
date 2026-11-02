@@ -92,7 +92,7 @@
     },
     {
       "args": "reconstruct",
-      "description": "Deep health checks (hc/git/keys/resonate). --check exits 3 on any failure",
+      "description": "Deep health checks (hc/git/keys/engine store). --check exits 3 on any failure",
       "name": "doctor"
     },
     {
@@ -171,7 +171,7 @@
       "name": "inbox"
     }
   ],
-  "generated_at": "2026-11-01T06:23:31Z",
+  "generated_at": "2026-11-02T07:13:31Z",
   "resources": [
     {
       "description": "List projects known to toron.",
@@ -690,7 +690,7 @@
       "parity": "AM-Rust 38-tool surface"
     },
     {
-      "description": "Prune identities whose herdr panes are absent from the live pane list.",
+      "description": "Prune identities whose hc panes are absent from the live pane list.",
       "example": {
         "project_key": null
       },

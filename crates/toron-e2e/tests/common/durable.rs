@@ -85,6 +85,8 @@ pub fn null_runner() -> AsyncEffectRunner {
 
 /// One linear step through the leaf boundary (guard → strict render →
 /// single dispatch via `run_linear_step`).
+// Mirrors the engine step input; a test helper, not an API.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_step(
     run_id: &str,
     workflow_name: &str,

@@ -26,6 +26,7 @@ pub mod elm;
 pub mod leaf;
 pub mod linear_step;
 pub mod park;
+mod reduce;
 mod reconcile;
 mod sinks;
 pub mod spawn;
@@ -696,6 +697,17 @@ impl WorkflowEngine {
         trigger: serde_json::Value,
     ) -> anyhow::Result<serde_json::Value> {
         let at = drive::now_ms();
+        // A child trigger carries `inputs`; bind the callee's declared defaults
+        // exactly like `invoke` does (a provided value always wins).
+        let mut trigger = trigger;
+        if let Some(inputs) = trigger.get("inputs").and_then(serde_json::Value::as_object).cloned()
+        {
+            let merged = Self::bind_input_defaults(
+                &workflow.inputs,
+                &serde_json::Value::Object(inputs),
+            );
+            trigger["inputs"] = serde_json::Value::Object(merged);
+        }
         let active = crate::identity::workflow_digest(&workflow);
         let rid = run_id.to_string();
         let seams = self.drive_seams();
@@ -724,9 +736,15 @@ impl WorkflowEngine {
                         )
                     })
                     .await
-                    .map_err(|e| anyhow::anyhow!("graph open task: {e}"))?
-                    .map_err(|e| anyhow::anyhow!("graph open: {e}"))?;
-                    drive::drive_graph(opened.0, opened.1, &seams).await
+                    .map_err(|e| anyhow::anyhow!("graph open task: {e}"))?;
+                    let (run, effects) = match opened {
+                        Ok(pair) => pair,
+                        Err(crate::engine::durable_host::HostError::Unsupported(reason)) => {
+                            return Ok(crate::engine::durable::refusal_value(&reason, "<graph>"));
+                        }
+                        Err(e) => return Err(anyhow::anyhow!("graph open: {e}")),
+                    };
+                    drive::drive_graph(run, effects, &seams).await
                 }
                 None => {
                     let engine = toron_core::kernel::OurEngine::new();
@@ -743,9 +761,15 @@ impl WorkflowEngine {
                         )
                     })
                     .await
-                    .map_err(|e| anyhow::anyhow!("graph open task: {e}"))?
-                    .map_err(|e| anyhow::anyhow!("graph open: {e}"))?;
-                    drive::drive_graph(opened.0, opened.1, &seams).await
+                    .map_err(|e| anyhow::anyhow!("graph open task: {e}"))?;
+                    let (run, effects) = match opened {
+                        Ok(pair) => pair,
+                        Err(crate::engine::durable_host::HostError::Unsupported(reason)) => {
+                            return Ok(crate::engine::durable::refusal_value(&reason, "<graph>"));
+                        }
+                        Err(e) => return Err(anyhow::anyhow!("graph open: {e}")),
+                    };
+                    drive::drive_graph(run, effects, &seams).await
                 }
             }
         } else {
@@ -769,9 +793,15 @@ impl WorkflowEngine {
                         )
                     })
                     .await
-                    .map_err(|e| anyhow::anyhow!("run open task: {e}"))?
-                    .map_err(|e| anyhow::anyhow!("run open: {e}"))?;
-                    drive::drive_linear(opened.0, opened.1, &seams).await
+                    .map_err(|e| anyhow::anyhow!("run open task: {e}"))?;
+                    let (run, effects) = match opened {
+                        Ok(pair) => pair,
+                        Err(crate::engine::durable_host::HostError::Unsupported(reason)) => {
+                            return Ok(crate::engine::durable::refusal_value(&reason, "<workflow>"));
+                        }
+                        Err(e) => return Err(anyhow::anyhow!("run open: {e}")),
+                    };
+                    drive::drive_linear(run, effects, &seams).await
                 }
                 None => {
                     let engine = toron_core::kernel::OurEngine::new();
@@ -788,9 +818,15 @@ impl WorkflowEngine {
                         )
                     })
                     .await
-                    .map_err(|e| anyhow::anyhow!("run open task: {e}"))?
-                    .map_err(|e| anyhow::anyhow!("run open: {e}"))?;
-                    drive::drive_linear(opened.0, opened.1, &seams).await
+                    .map_err(|e| anyhow::anyhow!("run open task: {e}"))?;
+                    let (run, effects) = match opened {
+                        Ok(pair) => pair,
+                        Err(crate::engine::durable_host::HostError::Unsupported(reason)) => {
+                            return Ok(crate::engine::durable::refusal_value(&reason, "<workflow>"));
+                        }
+                        Err(e) => return Err(anyhow::anyhow!("run open: {e}")),
+                    };
+                    drive::drive_linear(run, effects, &seams).await
                 }
             }
         }

@@ -514,7 +514,7 @@
       }
     },
     "cleanup_pane_identities": {
-      "description": "Prune identities whose herdr panes are absent from the live pane list.",
+      "description": "Prune identities whose hc panes are absent from the live pane list.",
       "input_schema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "properties": {

@@ -65,11 +65,11 @@ steps:
         .await
         .expect("run returns");
     assert_eq!(
-        output["loop"]["ok"], false,
-        "non-list foreach must fail, not return []: {output}"
+        output["status"], "failed",
+        "non-list foreach refuses the whole run, not a silent []: {output}"
     );
     assert!(
-        output["loop"]["error"]
+        output["error"]
             .as_str()
             .unwrap_or_default()
             .to_lowercase()
@@ -112,8 +112,8 @@ steps:
         .await
         .expect("run returns");
     assert_eq!(
-        output["fan"]["ok"], false,
-        "invalid parallel count must fail, not run 1 copy: {output}"
+        output["status"], "failed",
+        "invalid parallel count refuses the whole run, not 1 copy: {output}"
     );
 }
 
@@ -151,8 +151,8 @@ steps:
         .await
         .expect("run returns");
     assert_eq!(
-        output["fan"]["ok"], false,
-        "zero parallel count must fail: {output}"
+        output["status"], "failed",
+        "zero parallel count refuses the whole run: {output}"
     );
 }
 
@@ -423,14 +423,24 @@ steps:
         )
         .await
         .expect("run returns");
+    // The durable model refuses nested retry wrappers outright: the outer
+    // policy is the only coordinator, so attempts cannot multiply. The old
+    // engine ran the pair and pinned the count; the refusal is stronger.
     assert_eq!(
-        output["go"]["ok"], false,
-        "exhausted retry stays failed: {output}"
+        output["status"], "failed",
+        "nested retry wrappers refuse the run: {output}"
+    );
+    assert!(
+        output["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("nested retry"),
+        "names the nested-retry rule: {output}"
     );
     assert_eq!(
         calls.load(Ordering::SeqCst),
-        2,
-        "one coordinator: outer policy of 2, not 2x2=4"
+        0,
+        "nothing dispatches: the shape never opens"
     );
 }
 

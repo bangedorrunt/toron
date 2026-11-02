@@ -668,6 +668,32 @@ pub(crate) fn next_effects(
         };
         match entry {
             PlanEntry::Step { authored, step } => {
+                // A reduce is PURE: the fold computes it, no host effect.
+                if let Action::Reduce { .. } = &step.action {
+                    let name = step_name(step.as_ref(), authored);
+                    let value = crate::engine::reduce::evaluate(
+                        &step.action,
+                        &model.trigger,
+                        &model.outputs,
+                        &model.workflow.name,
+                        &name,
+                    );
+                    model.outputs.insert(name.clone(), value.clone());
+                    if step.on_error == StepOnError::FailRun && is_failure_value(&value) {
+                        let output = fail_run_value(&name, &value, None);
+                        model.phase = RunPhase::Failed {
+                            error: output
+                                .get("error")
+                                .and_then(|e| e.as_str())
+                                .unwrap_or("reduce failed")
+                                .to_string(),
+                        };
+                        return vec![RunEffect::Fail { step: name, output }];
+                    }
+                    model.step_index += 1;
+                    model.phase = RunPhase::Running;
+                    continue;
+                }
                 let iteration = current_iteration(model);
                 return step_effects(model, authored, *step, iteration, now_ms, spawns);
             }
@@ -1056,6 +1082,17 @@ fn step_effects(
 /// capability-based and lives with the host that must perform it: a host
 /// without a `SpawnLauncher` refuses the workflow through
 /// [`super::spawn::spawn_launcher_refusal`] before this model is opened.
+/// The public engine's value shape for a shape refusal: the old engine
+/// returned a `{status:failed,…}` VALUE, never an `Err`, so callers keep
+/// reading failures from the output.
+pub fn refusal_value(reason: &str, failed_step: &str) -> serde_json::Value {
+    serde_json::json!({
+        "status": "failed",
+        "error": reason,
+        "failed_step": failed_step,
+    })
+}
+
 pub fn unsupported_reason(workflow: &Workflow) -> Option<String> {
     if needs_graph_model(workflow) {
         return graph_unsupported_reason(workflow);
@@ -1146,7 +1183,10 @@ pub fn unsupported_reason(workflow: &Workflow) -> Option<String> {
 fn is_linear(action: &Action) -> bool {
     matches!(
         action,
-        Action::Delay { .. } | Action::RequestApproval { .. } | Action::Spawn { .. }
+        Action::Delay { .. }
+            | Action::RequestApproval { .. }
+            | Action::Spawn { .. }
+            | Action::Reduce { .. }
     ) || matches!(partition(action), ActionPartition::HostSink { .. })
 }
 
@@ -2436,6 +2476,28 @@ fn schedule(model: &mut GraphModel, now_ms: u64) -> Vec<GraphEffect> {
                         }
                     }
                 }
+                // A reduce is PURE, but it still goes through the single-shot
+                // node executor (strict render at execution time). The
+                // executor computes the fold; the scheduler settles it like
+                // any node.
+                Action::Reduce { .. } => {
+                    model.node_state.insert(
+                        name.clone(),
+                        NodeState::Executing {
+                            wave,
+                            attempt: 1,
+                            inputs: snapshot.clone(),
+                        },
+                    );
+                    effects.push(GraphEffect::ExecuteNode {
+                        node: name.clone(),
+                        wave,
+                        attempt: 1,
+                        inputs: snapshot.clone(),
+                        item: model.items.get(name).cloned(),
+                    });
+                    dispatched += 1;
+                }
                 // A `retry:` policy is a per-node wrapper: dispatch the node
                 // (the executor unwraps to the inner step) and let the
                 // scheduler own the attempts (bd-durable-retry-policy-rrck).
@@ -3012,7 +3074,7 @@ fn is_graph_sequencable(action: &Action) -> bool {
         // A child call: the callee is validated at open with the host's
         // workflow resolver (bd-durable-call-workflow-mg6y).
         Action::CallWorkflow { .. } => true,
-        Action::Delay { .. } | Action::RequestApproval { .. } => true,
+        Action::Delay { .. } | Action::RequestApproval { .. } | Action::Reduce { .. } => true,
         _ => matches!(partition(action), ActionPartition::HostSink { .. }),
     }
 }
