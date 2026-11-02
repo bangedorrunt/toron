@@ -214,15 +214,17 @@ async fn sc11_approval_crash_resume() {
     // `{status, steps}`, so the contract reads under `steps` (same keys,
     // new envelope).
     //
-    // GAP (engine crew): the old engine ALSO aliased the decision under
-    // `decision` on the linear path; the durable linear fold only lands it
-    // under the node name today (the alias exists on the graph path only).
-    // This test pins the node-name half; the alias half is asserted in the
-    // graph port. Do NOT re-add an alias assert here until the fold lands it.
+    // ADR-0024 Spec 2: the decision is published under the node name AND the
+    // canonical `decision` alias (parity with the old linear path; the fold
+    // landed the alias with bd-approval-alias).
     let steps = &output["steps"];
     assert_eq!(
         steps["gate"]["outcome"], "approved",
         "resumed run records the approval decision under the node name: {output}"
+    );
+    assert_eq!(
+        steps["decision"]["outcome"], "approved",
+        "the canonical decision alias resolves on the linear path: {output}"
     );
     assert_eq!(
         output["status"], "succeeded",

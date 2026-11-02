@@ -120,6 +120,9 @@ fn approval_awaits_then_lands_decision() {
     assert_eq!(model.phase, RunPhase::Succeeded);
     assert!(matches!(effects.as_slice(), [RunEffect::Complete { .. }]));
     assert_eq!(model.outputs["step_1"]["outcome"], json!("approved"));
+    // Parity with the old linear Context path: the canonical alias is
+    // published alongside the node name, so either template ref resolves.
+    assert_eq!(model.outputs["decision"]["outcome"], json!("approved"));
 }
 
 #[test]

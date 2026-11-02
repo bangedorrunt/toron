@@ -638,6 +638,10 @@ pub fn advance_with(
             };
             let name = step_name(&step, authored);
             next.outputs.insert(name, decision.clone());
+            // Parity with the old linear Context path (control_flow.rs:995):
+            // the decision is published under the node name AND the canonical
+            // `decision` alias, so template refs written either way resolve.
+            next.outputs.insert("decision".into(), decision.clone());
             next.step_index += 1;
             next.phase = RunPhase::Running;
             let effects = next_effects(&mut next, *now_ms, spawns);
