@@ -2679,6 +2679,12 @@ mod tests {
 
     const PASSPHRASE: &str = "reservation-test-pass";
 
+    /// bd-lease-liveness-oracle-ro8i: the liveness seam is process-global,
+    /// so every test that installs the oracle holds this across the whole
+    /// test — parallel cargo test threads must never interleave two live
+    /// sets (cheap: two holders, held only by the oracle tests below).
+    static ORACLE_SEAM_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     async fn test_mailbox(tag: &str) -> (Mailbox, std::path::PathBuf, std::path::PathBuf) {
         let db_path =
             std::env::temp_dir().join(format!("toron-res-{tag}-{}.sqlite", uuid::Uuid::new_v4()));
@@ -3445,6 +3451,7 @@ mod tests {
     /// (expired = clear), so every pre-existing behavior is preserved.
     #[tokio::test]
     async fn expired_lease_blocks_iff_holder_session_live() {
+        let _seam = ORACLE_SEAM_LOCK.lock().await;
         let (mailbox, db_path, data_dir) = test_mailbox("liveness").await;
         let holder = register(&mailbox, "demo", "BlueLake").await;
         let peer = register(&mailbox, "demo", "RoseDune").await;
@@ -3563,6 +3570,7 @@ mod tests {
     #[tokio::test]
     async fn expired_mirror_blocks_iff_holder_in_liveness_map() {
         use crate::mailbox::lease_liveness::read_activity_snapshot;
+        let _seam = ORACLE_SEAM_LOCK.lock().await;
         let (mailbox, db_path, data_dir) = test_mailbox("oracle-ro8i").await;
         let holder = register(&mailbox, "demo", "BlueLake").await;
         register(&mailbox, "demo", "RoseDune").await;
@@ -3591,7 +3599,9 @@ mod tests {
         .execute(&pool)
         .await
         .expect("cursor");
-        let map = read_activity_snapshot(&pool, DEFAULT_RESERVATION_TTL_SECS, now_us).await;
+        let map = read_activity_snapshot(&pool, DEFAULT_RESERVATION_TTL_SECS, now_us)
+            .await
+            .expect("snapshot");
         assert!(map.contains_key(&holder_hex), "snapshot vouches: {map:?}");
         install_lease_liveness_checker(std::sync::Arc::new(move |pubkey_hex| {
             pubkey_hex == holder_hex

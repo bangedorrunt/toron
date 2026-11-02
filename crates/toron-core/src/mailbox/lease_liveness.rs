@@ -61,13 +61,18 @@ pub fn live_set_from_cursors(
 /// One refresh against the store: the newest inbox poll per roster pubkey,
 /// bounded to polls inside the TTL window (stale rows never leave SQLite).
 /// `now_us` is passed in (host clock at the tick edge), never read here.
+///
+/// Returns `None` when the read fails — a transient SQLite error is a
+/// value, never a silent empty map (an error read as empty would free an
+/// expired lease held by a LIVE agent for one refresh: the exact race the
+/// oracle exists to prevent). The refresher keeps the previous map.
 pub async fn read_activity_snapshot(
     pool: &sqlx::SqlitePool,
     ttl_secs: u64,
     now_us: i64,
-) -> ActivityMap {
+) -> Option<ActivityMap> {
     let cutoff_us = now_us.saturating_sub(ttl_secs as i64 * 1_000_000);
-    let rows: Vec<(String, i64)> = sqlx::query_as(
+    let rows: Vec<(String, i64)> = match sqlx::query_as(
         "SELECT a.pubkey, MAX(c.last_seen_us) \
          FROM inbox_cursors c \
          JOIN agents a \
@@ -78,8 +83,34 @@ pub async fn read_activity_snapshot(
     .bind(cutoff_us)
     .fetch_all(pool)
     .await
-    .unwrap_or_default();
-    live_set_from_cursors(rows, cutoff_us)
+    {
+        Ok(rows) => {
+            SNAPSHOT_FAILED.store(false, std::sync::atomic::Ordering::Relaxed);
+            rows
+        }
+        Err(e) => {
+            // Log once per outage, not once per 15 s tick: the first
+            // failure is the signal, the rest is a stuck counter.
+            if !SNAPSHOT_FAILED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                tracing::warn!(
+                    error = %e,
+                    "lease-liveness snapshot failed; keeping the previous live set"
+                );
+            }
+            return None;
+        }
+    };
+    Some(live_set_from_cursors(rows, cutoff_us))
+}
+
+/// Set while the last snapshot failed (log-once latch for the warn above).
+static SNAPSHOT_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The keep-previous decision, pure: a failed read (`None`) never clears
+/// the live set — the refresher holds what it had until SQLite answers.
+/// Tested without a database.
+pub fn apply_snapshot(prev: ActivityMap, next: Option<ActivityMap>) -> ActivityMap {
+    next.unwrap_or(prev)
 }
 
 /// Daemon guard: installs the membership oracle and refreshes it until
@@ -103,9 +134,13 @@ impl LeaseLivenessGuard {
         let live: Arc<RwLock<ActivityMap>> = Arc::new(RwLock::new(ActivityMap::new()));
         // Initial load before the predicate goes live: an immediate serve
         // must vouch holders polled before boot, not after the first tick.
+        // A failed first read keeps the empty set (nothing to keep yet) —
+        // the predicate then vouches nobody until SQLite answers, which is
+        // fail-closed toward expiry, never toward a phantom live set.
         let now_us = host_now_us();
+        let first = read_activity_snapshot(&pool, ttl_secs, now_us).await;
         *live.write().unwrap_or_else(|e| e.into_inner()) =
-            read_activity_snapshot(&pool, ttl_secs, now_us).await;
+            apply_snapshot(ActivityMap::new(), first);
         let refreshed = Arc::clone(&live);
         install_lease_liveness_checker(Arc::new(move |pubkey_hex: &str| {
             refreshed
@@ -121,7 +156,9 @@ impl LeaseLivenessGuard {
                 let now_us = host_now_us();
                 let snap = read_activity_snapshot(&pool, ttl_secs, now_us).await;
                 if let Ok(mut m) = live.write() {
-                    *m = snap;
+                    // A failed read keeps the previous map: an error is
+                    // never published as an empty live set.
+                    *m = apply_snapshot(std::mem::take(&mut *m), snap);
                 }
             }
         });
@@ -184,6 +221,35 @@ mod tests {
         assert!(live_set_from_cursors(Vec::new(), 0).is_empty());
     }
 
+    /// The keep-previous decision, pure: a failed read keeps the live set,
+    /// a good read replaces it — no database, no clock.
+    #[test]
+    fn apply_snapshot_keeps_previous_map_on_failed_read() {
+        let prev: ActivityMap = [("live".to_string(), 9_000)].into_iter().collect();
+        let kept = apply_snapshot(prev.clone(), None);
+        assert_eq!(kept, prev, "an error never publishes an empty live set");
+        let next: ActivityMap = [("new".to_string(), 1_000)].into_iter().collect();
+        assert_eq!(apply_snapshot(prev, Some(next.clone())), next);
+        assert!(apply_snapshot(ActivityMap::new(), None).is_empty());
+    }
+
+    /// A dead store reads as failure (`None`), never as an empty live set.
+    #[tokio::test]
+    async fn snapshot_on_closed_pool_returns_none_not_empty() {
+        let db =
+            std::env::temp_dir().join(format!("toron-live-closed-{}.sqlite", uuid::Uuid::new_v4()));
+        let pool = crate::index::schema::connect(db.to_str().unwrap())
+            .await
+            .expect("connect");
+        pool.close().await;
+        assert!(
+            read_activity_snapshot(&pool, 180, 1_790_000_000_000_000)
+                .await
+                .is_none(),
+            "a transient store error must not vouch-nobody as a map"
+        );
+        let _ = std::fs::remove_file(&db);
+    }
     /// The snapshot reads the cursor→roster join and bounds itself to the
     /// TTL window: a quiet holder is absent, never vouched stale.
     #[tokio::test]
@@ -224,7 +290,9 @@ mod tests {
             .await
             .expect("cursor");
         }
-        let map = read_activity_snapshot(&pool, 180, now_us).await;
+        let map = read_activity_snapshot(&pool, 180, now_us)
+            .await
+            .expect("snapshot");
         assert_eq!(map.get("aa"), Some(&fresh_us));
         assert!(!map.contains_key("bb"), "quiet holder absent: {map:?}");
         assert_eq!(map.len(), 1, "ghost names never vouch: {map:?}");
