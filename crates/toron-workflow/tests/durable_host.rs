@@ -2499,3 +2499,249 @@ async fn call_workflow_refusals_leave_no_row() {
         assert!(engine.query(run_id).is_err(), "{run_id} left an engine row");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Bounded loop in the linear plan (bd-loop-rewrites-fap8)
+// ---------------------------------------------------------------------------
+
+fn loop_step(
+    name: &str,
+    max: &str,
+    until: Option<&str>,
+    body: Vec<Step>,
+    on_error: StepOnError,
+) -> Step {
+    Step {
+        name: Some(name.into()),
+        guard: None,
+        on_error,
+        build_slot: false,
+        action: Action::Loop {
+            max: max.into(),
+            until: until.map(str::to_string),
+            body,
+        },
+    }
+}
+
+fn loop_workflow(max: &str, until: Option<&str>, on_error: StepOnError) -> Workflow {
+    workflow(vec![loop_step(
+        "spin",
+        max,
+        until,
+        vec![named("check", dm("check"), StepOnError::Continue)],
+        on_error,
+    )])
+}
+
+/// Through the store: the persisted counter resumes the loop at the same
+/// pass, and the iteration key is the same on the re-issued effect.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn loop_restart_resumes_at_counter() {
+    let path = unique_db("loop-restart");
+    let pool = connect(path.to_str().expect("path"))
+        .await
+        .expect("connect");
+    migrate(&pool).await.expect("migrate");
+    let handle = tokio::runtime::Handle::current();
+
+    let phase_one = {
+        let pool = pool.clone();
+        let state = SyncWorkflowState::spawn(pool.clone(), &handle);
+        let handle = handle.clone();
+        tokio::task::spawn_blocking(move || -> Result<RunModel, HostError> {
+            let engine = OurEngine::with_journal(
+                ToronEngineStore::spawn(pool.clone(), &handle),
+                ToronJournal::spawn(JournalDb::new(pool, "loop", 64), &handle),
+            );
+            let (mut run, effects) = DurableRun::open(
+                engine,
+                state,
+                "run-loop",
+                loop_workflow("5", Some("steps_check_ok == true"), StepOnError::Continue),
+                json!({}),
+                1_000,
+            )?;
+            assert!(matches!(
+                effects.as_slice(),
+                [RunEffect::ExecuteStep {
+                    iteration: Some(1),
+                    ..
+                }]
+            ));
+            let effects = run.step_done(json!({"ok": false}), 2_000)?;
+            assert!(matches!(
+                effects.as_slice(),
+                [RunEffect::ExecuteStep {
+                    iteration: Some(2),
+                    ..
+                }]
+            ));
+            Ok(run.model().clone())
+        })
+        .await
+        .expect("join")
+        .expect("phase one")
+    };
+    assert_eq!(phase_one.loops["spin"].iteration, 2);
+
+    let (mut run, effects) = {
+        let pool = pool.clone();
+        let state = SyncWorkflowState::spawn(pool.clone(), &handle);
+        let handle = handle.clone();
+        tokio::task::spawn_blocking(move || {
+            let engine = OurEngine::with_journal(
+                ToronEngineStore::spawn(pool.clone(), &handle),
+                ToronJournal::spawn(JournalDb::new(pool, "loop", 64), &handle),
+            );
+            DurableRun::open(
+                engine,
+                state,
+                "run-loop",
+                loop_workflow("5", Some("steps_check_ok == true"), StepOnError::Continue),
+                json!({}),
+                3_000,
+            )
+        })
+        .await
+        .expect("join")
+        .expect("reopen")
+    };
+    let [
+        RunEffect::ExecuteStep {
+            iteration: Some(2),
+            step,
+            ..
+        },
+    ] = effects.as_slice()
+    else {
+        panic!("resume re-issues pass 2: {effects:?}");
+    };
+    assert_eq!(step.name.as_deref(), Some("check"));
+
+    let effects = run.step_done(json!({"ok": true}), 4_000).expect("settle");
+    assert!(matches!(effects.as_slice(), [RunEffect::Complete { .. }]));
+    assert_eq!(
+        run.model().outputs["spin"],
+        json!({"ok": true, "iterations": 2, "stopped": "until"})
+    );
+}
+
+/// An unbounded loop, an over-cap bound, an upstream-output bound, an impure
+/// `until`, and an unsequencable body all refuse before any state or engine
+/// row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn loop_unbounded_refuses_without_row() {
+    let path = unique_db("loop-refused");
+    let pool = connect(path.to_str().expect("path"))
+        .await
+        .expect("connect");
+    migrate(&pool).await.expect("migrate");
+    let handle = tokio::runtime::Handle::current();
+
+    let cases: Vec<(&str, Workflow, serde_json::Value, &str)> = vec![
+        (
+            "run-loop-missing",
+            loop_workflow("{{inputs.n}}", None, StepOnError::Continue),
+            json!({}),
+            "must render to a positive integer",
+        ),
+        (
+            "run-loop-zero",
+            loop_workflow("0", None, StepOnError::Continue),
+            json!({}),
+            "must render to a positive integer",
+        ),
+        (
+            "run-loop-cap",
+            loop_workflow("33", None, StepOnError::Continue),
+            json!({}),
+            "exceeds the bounded cap",
+        ),
+        (
+            "run-loop-output-bound",
+            loop_workflow("{{steps.plan.n}}", None, StepOnError::Continue),
+            json!({}),
+            "upstream output",
+        ),
+        (
+            "run-loop-impure",
+            loop_workflow("3", Some("len(\"x\") > 0"), StepOnError::Continue),
+            json!({}),
+            "until` is not pure",
+        ),
+        (
+            "run-loop-body",
+            loop_workflow("3", None, StepOnError::Continue),
+            json!({}),
+            "inside a loop",
+        ),
+    ];
+    for (run_id, wf, trigger, label) in cases {
+        // The body case needs an unsequencable body step; rebuild it here.
+        let wf = if run_id == "run-loop-body" {
+            workflow(vec![loop_step(
+                "spin",
+                "3",
+                None,
+                vec![step(Action::CallWebhook {
+                    url: "http://127.0.0.1:9/x".into(),
+                    method: None,
+                    body: None,
+                })],
+                StepOnError::Continue,
+            )])
+        } else {
+            wf
+        };
+        let pool = pool.clone();
+        let state = SyncWorkflowState::spawn(pool.clone(), &handle);
+        let handle = handle.clone();
+        let rid = run_id.to_string();
+        let refused = tokio::task::spawn_blocking(move || {
+            let engine = OurEngine::with_journal(
+                ToronEngineStore::spawn(pool.clone(), &handle),
+                ToronJournal::spawn(JournalDb::new(pool, "loop", 64), &handle),
+            );
+            DurableRun::open(engine, state, rid, wf, trigger, 0)
+        })
+        .await
+        .expect("join");
+        let Err(err) = refused else {
+            panic!("{run_id}: must refuse");
+        };
+        let HostError::Unsupported(reason) = err else {
+            panic!("{run_id}: wrong refusal: {err:?}");
+        };
+        assert!(reason.contains(label), "{run_id}: {reason}");
+    }
+
+    let store = toron_core::index::durable_workflow::WorkflowStateStore::new(pool.clone());
+    for run_id in [
+        "run-loop-missing",
+        "run-loop-zero",
+        "run-loop-cap",
+        "run-loop-output-bound",
+        "run-loop-impure",
+        "run-loop-body",
+    ] {
+        assert!(
+            store.load(run_id).await.expect("state").is_none(),
+            "{run_id} left no state row"
+        );
+    }
+    let engine = OurEngine::with_journal(
+        ToronEngineStore::spawn(pool.clone(), &handle),
+        ToronJournal::spawn(JournalDb::new(pool, "loop", 64), &handle),
+    );
+    for run_id in [
+        "run-loop-missing",
+        "run-loop-zero",
+        "run-loop-cap",
+        "run-loop-output-bound",
+        "run-loop-impure",
+        "run-loop-body",
+    ] {
+        assert!(engine.query(run_id).is_err(), "{run_id} left an engine row");
+    }
+}

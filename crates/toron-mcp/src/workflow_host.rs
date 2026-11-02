@@ -2219,7 +2219,11 @@ impl WorkflowHost {
             let mut follow: Vec<RunEffect> = Vec::new();
             for effect in std::mem::take(&mut effects) {
                 match effect {
-                    RunEffect::ExecuteStep { index, step } => {
+                    RunEffect::ExecuteStep {
+                        index,
+                        step,
+                        iteration,
+                    } => {
                         let value = run_linear_step(
                             LinearStep {
                                 run_id: &run_id,
@@ -2229,6 +2233,7 @@ impl WorkflowHost {
                                 index,
                                 trigger: &trigger,
                                 outputs: &mut outputs,
+                                iteration,
                             },
                             &self.seams,
                         )
@@ -9547,6 +9552,34 @@ steps:
             ]);
             let err = durable_route(&wf, true, false).expect_err("loop refuses");
             assert!(err.contains("loop"), "{err}");
+        }
+
+        /// bd-loop-rewrites-fap8: a bounded `steps:` loop is a linear-plan
+        /// entry, so the router admits it; an unbounded bound refuses.
+        #[test]
+        fn a_bounded_loop_is_linear() {
+            let mut wf = linear_workflow();
+            wf.steps = vec![Step {
+                name: Some("spin".into()),
+                guard: None,
+                on_error: StepOnError::Continue,
+                build_slot: false,
+                action: Action::Loop {
+                    max: "{{inputs.max_iters}}".into(),
+                    until: Some("steps_notify_ok == true".into()),
+                    body: vec![linear_step()],
+                },
+            }];
+            assert!(durable_route(&wf, true, false).is_ok());
+
+            let mut unbounded = wf.clone();
+            unbounded.steps[0].action = Action::Loop {
+                max: "{{steps.plan.n}}".into(),
+                until: None,
+                body: vec![linear_step()],
+            };
+            let err = durable_route(&unbounded, true, false).expect_err("output bound");
+            assert!(err.contains("upstream output"), "{err}");
         }
 
         /// bd-durable-call-workflow-mg6y: a `steps:` child call is native to

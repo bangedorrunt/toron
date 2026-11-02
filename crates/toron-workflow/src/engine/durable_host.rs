@@ -37,7 +37,8 @@ use super::control_flow::validate_workflow_lineage;
 use super::durable::{
     GraphEffect, GraphModel, GraphMsg, GraphPhase, NodeState, RunEffect, RunModel, RunMsg,
     RunPhase as ModelPhase, advance_graph, advance_with, durable_graph, graph_unsupported_reason,
-    needs_graph_model, next_effects, resume_effects, resume_graph_effects, unsupported_reason,
+    needs_graph_model, next_effects, resolve_loop_max, resume_effects, resume_graph_effects,
+    unsupported_reason,
 };
 use super::spawn::{SpawnSeams, SpawnSpec, prepare_spawn, spawn_key, spawn_launcher_refusal};
 
@@ -212,6 +213,15 @@ impl<S: EngineStorage, J: JournalStore, R: RunState> DurableRun<S, J, R> {
             && spawn_seams.launcher.is_none()
         {
             return Err(HostError::Unsupported(reason));
+        }
+        // bd-loop-rewrites-fap8: resolve every loop bound from the trigger
+        // before any engine or state row. An unbounded loop refuses here; the
+        // fold performs the same pure read at the marker.
+        for step in &workflow.steps {
+            if let crate::schema::Action::Loop { max, .. } = &step.action {
+                resolve_loop_max(max, &trigger, &serde_json::Map::new())
+                    .map_err(HostError::Unsupported)?;
+            }
         }
 
         match engine.start(&run_id, now_ms)? {

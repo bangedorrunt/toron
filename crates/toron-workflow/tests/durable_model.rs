@@ -2226,3 +2226,274 @@ fn call_workflow_child_failure_carries_bundle_to_parent_on_error() {
     assert_eq!(fail.error, "child exploded");
     assert!(matches!(model.phase, GraphPhase::Failed { .. }));
 }
+
+// ---------------------------------------------------------------------------
+// Bounded loop in the linear plan (bd-loop-rewrites-fap8)
+// ---------------------------------------------------------------------------
+
+fn loop_step(
+    name: &str,
+    max: &str,
+    until: Option<&str>,
+    body: Vec<Step>,
+    on_error: StepOnError,
+) -> Step {
+    Step {
+        name: Some(name.into()),
+        guard: None,
+        on_error,
+        build_slot: false,
+        action: Action::Loop {
+            max: max.into(),
+            until: until.map(str::to_string),
+            body,
+        },
+    }
+}
+
+fn loop_workflow(max: &str, until: Option<&str>, on_error: StepOnError) -> Workflow {
+    workflow(vec![loop_step(
+        "spin",
+        max,
+        until,
+        vec![named("check", dm("check"), StepOnError::Continue)],
+        on_error,
+    )])
+}
+
+fn loop_model(max: &str, until: Option<&str>, on_error: StepOnError) -> RunModel {
+    RunModel::new(
+        "run-loop",
+        loop_workflow(max, until, on_error),
+        serde_json::json!({}),
+    )
+}
+
+/// The `until` guard is evaluated over the outputs after each body pass; the
+/// loop stops on the first true and reports the pass count.
+#[test]
+fn loop_until_true_after_n_iterations() {
+    let model = loop_model("5", Some("steps_check_ok == true"), StepOnError::Continue);
+    assert!(
+        unsupported_reason(&model.workflow).is_none(),
+        "bounded loop admits"
+    );
+    let (model, effects) = advance(&model, &RunMsg::Start { now_ms: 1_000 });
+    let [
+        RunEffect::ExecuteStep {
+            step,
+            iteration: Some(1),
+            ..
+        },
+    ] = effects.as_slice()
+    else {
+        panic!("pass 1 runs the body: {effects:?}");
+    };
+    assert_eq!(step.name.as_deref(), Some("check"));
+
+    let (model, effects) = advance(
+        &model,
+        &RunMsg::StepDone {
+            value: json!({"ok": false}),
+            now_ms: 2_000,
+        },
+    );
+    let [
+        RunEffect::ExecuteStep {
+            iteration: Some(2), ..
+        },
+    ] = effects.as_slice()
+    else {
+        panic!("pass 2 runs the body: {effects:?}");
+    };
+    assert_eq!(model.loops["spin"].iteration, 2);
+
+    let (model, effects) = advance(
+        &model,
+        &RunMsg::StepDone {
+            value: json!({"ok": true}),
+            now_ms: 3_000,
+        },
+    );
+    assert!(matches!(effects.as_slice(), [RunEffect::Complete { .. }]));
+    assert_eq!(
+        model.outputs["spin"],
+        json!({"ok": true, "iterations": 2, "stopped": "until"})
+    );
+    assert_eq!(model.phase, RunPhase::Succeeded);
+}
+
+/// The counter persists: a restart resumes at the same pass with the same
+/// iteration key, never replaying the settled body pass.
+#[test]
+fn loop_restart_resumes_at_counter() {
+    let model = loop_model("5", Some("steps_check_ok == true"), StepOnError::Continue);
+    let (model, _) = advance(&model, &RunMsg::Start { now_ms: 1_000 });
+    let (model, effects) = advance(
+        &model,
+        &RunMsg::StepDone {
+            value: json!({"ok": false}),
+            now_ms: 2_000,
+        },
+    );
+    assert!(matches!(
+        effects.as_slice(),
+        [RunEffect::ExecuteStep {
+            iteration: Some(2),
+            ..
+        }]
+    ));
+
+    let restored: RunModel =
+        serde_json::from_str(&serde_json::to_string(&model).expect("serialize")).expect("restore");
+    assert_eq!(restored.loops["spin"].iteration, 2, "the counter persists");
+    let effects = resume_effects(&restored);
+    let [
+        RunEffect::ExecuteStep {
+            step,
+            iteration: Some(2),
+            ..
+        },
+    ] = effects.as_slice()
+    else {
+        panic!("resume re-issues pass 2: {effects:?}");
+    };
+    assert_eq!(step.name.as_deref(), Some("check"));
+
+    let (restored, effects) = advance(
+        &restored,
+        &RunMsg::StepDone {
+            value: json!({"ok": true}),
+            now_ms: 3_000,
+        },
+    );
+    assert!(matches!(effects.as_slice(), [RunEffect::Complete { .. }]));
+    assert_eq!(
+        restored.outputs["spin"],
+        json!({"ok": true, "iterations": 2, "stopped": "until"})
+    );
+}
+
+/// Exhaustion applies the loop step's `on_error` with the full bundle.
+#[test]
+fn loop_max_iterations_fails_with_bundle() {
+    let model = loop_model("2", Some("steps_check_ok == true"), StepOnError::FailRun);
+    let (model, _) = advance(&model, &RunMsg::Start { now_ms: 1_000 });
+    let (model, _) = advance(
+        &model,
+        &RunMsg::StepDone {
+            value: json!({"ok": false}),
+            now_ms: 2_000,
+        },
+    );
+    let (model, effects) = advance(
+        &model,
+        &RunMsg::StepDone {
+            value: json!({"ok": false}),
+            now_ms: 3_000,
+        },
+    );
+    let [RunEffect::Fail { step, output }] = effects.as_slice() else {
+        panic!("exhaustion fails the run: {effects:?}");
+    };
+    assert_eq!(step, "spin");
+    assert_eq!(output["status"], json!("failed"));
+    assert_eq!(output["failed_step"], json!("spin"));
+    assert_eq!(output["iterations"], json!(2));
+    assert!(
+        output["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("exhausted after 2 iterations")),
+        "{output}"
+    );
+    assert!(matches!(model.phase, RunPhase::Failed { .. }));
+
+    // `continue` lands the exhaustion value and the run proceeds.
+    let model = loop_model("2", Some("steps_check_ok == true"), StepOnError::Continue);
+    let (model, _) = advance(&model, &RunMsg::Start { now_ms: 1_000 });
+    let (model, _) = advance(
+        &model,
+        &RunMsg::StepDone {
+            value: json!({"ok": false}),
+            now_ms: 2_000,
+        },
+    );
+    let (model, effects) = advance(
+        &model,
+        &RunMsg::StepDone {
+            value: json!({"ok": false}),
+            now_ms: 3_000,
+        },
+    );
+    assert!(matches!(effects.as_slice(), [RunEffect::Complete { .. }]));
+    assert_eq!(model.outputs["spin"]["ok"], json!(false));
+    assert_eq!(model.outputs["spin"]["iterations"], json!(2));
+    assert_eq!(model.phase, RunPhase::Succeeded);
+}
+
+/// A failing body step follows its own carrier: `continue` keeps looping,
+/// `fail_run` fails the run with that step's bundle.
+#[test]
+fn loop_body_failure_applies_on_error() {
+    // A `continue` body failure lands and the loop keeps its own policy.
+    let model = RunModel::new(
+        "run-loop-body",
+        workflow(vec![loop_step(
+            "spin",
+            "3",
+            None,
+            vec![named("check", dm("check"), StepOnError::Continue)],
+            StepOnError::Continue,
+        )]),
+        serde_json::json!({}),
+    );
+    let (model, _) = advance(&model, &RunMsg::Start { now_ms: 1_000 });
+    let (model, effects) = advance(
+        &model,
+        &RunMsg::StepDone {
+            value: json!({"ok": false, "error": "flaky"}),
+            now_ms: 2_000,
+        },
+    );
+    assert!(
+        matches!(
+            effects.as_slice(),
+            [RunEffect::ExecuteStep {
+                iteration: Some(2),
+                ..
+            }]
+        ),
+        "a continue body failure does not stop the loop: {effects:?}"
+    );
+    assert_eq!(
+        model.outputs["check"],
+        json!({"ok": false, "error": "flaky"})
+    );
+
+    // A `fail_run` body failure ends the run at the body step.
+    let model = RunModel::new(
+        "run-loop-body-fail",
+        workflow(vec![loop_step(
+            "spin",
+            "3",
+            None,
+            vec![named("check", dm("check"), StepOnError::FailRun)],
+            StepOnError::Continue,
+        )]),
+        serde_json::json!({}),
+    );
+    let (model, _) = advance(&model, &RunMsg::Start { now_ms: 1_000 });
+    let (model, effects) = advance(
+        &model,
+        &RunMsg::StepDone {
+            value: json!({"ok": false, "kind": "terminal", "error": "broke"}),
+            now_ms: 2_000,
+        },
+    );
+    let [RunEffect::Fail { step, output }] = effects.as_slice() else {
+        panic!("the body's fail_run ends the run: {effects:?}");
+    };
+    assert_eq!(step, "check");
+    assert_eq!(output["error"], json!("broke"));
+    assert!(matches!(model.phase, RunPhase::Failed { .. }));
+}

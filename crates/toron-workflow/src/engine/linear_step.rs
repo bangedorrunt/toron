@@ -42,6 +42,10 @@ pub struct LinearStep<'a> {
     pub index: usize,
     pub trigger: &'a serde_json::Value,
     pub outputs: &'a mut serde_json::Map<String, serde_json::Value>,
+    /// The bounded-loop pass this step belongs to, when it is a loop body step
+    /// (bd-loop-rewrites-fap8). Rides the invocation's iteration key so each
+    /// pass is a distinct effect.
+    pub iteration: Option<u32>,
 }
 
 /// Run one linear step to a value.
@@ -58,6 +62,7 @@ pub async fn run_linear_step(input: LinearStep<'_>, seams: &LeafSeams) -> serde_
         index: _,
         trigger,
         outputs,
+        iteration,
     } = input;
 
     let node = step.name.as_deref().unwrap_or("<unnamed>");
@@ -81,6 +86,7 @@ pub async fn run_linear_step(input: LinearStep<'_>, seams: &LeafSeams) -> serde_
         let render_ctx = RenderContext::new(workflow, node);
         let value = match render_action(&step.action, trigger, outputs, &render_ctx) {
             Ok(action) => {
+                let iteration_key = iteration.map(|i| format!("i{i}"));
                 let invocation = invocation_for_leaf(
                     action,
                     run_id,
@@ -90,7 +96,7 @@ pub async fn run_linear_step(input: LinearStep<'_>, seams: &LeafSeams) -> serde_
                     // Parity with the Context path: no enclosing `Retry`
                     // action means a per-step policy of one attempt.
                     1,
-                    None,
+                    iteration_key.as_deref(),
                 );
                 match partition(&invocation.action) {
                     ActionPartition::HostSink { sink } => {
@@ -403,6 +409,7 @@ mod tests {
                 index: 0,
                 trigger: &trigger,
                 outputs: &mut outputs,
+                iteration: None,
             },
             &seams,
         )
@@ -456,6 +463,7 @@ mod tests {
                 index: 0,
                 trigger: &trigger,
                 outputs: &mut outputs,
+                iteration: None,
             },
             &seams,
         )
@@ -504,6 +512,7 @@ mod tests {
                 index: 0,
                 trigger: &trigger,
                 outputs: &mut outputs,
+                iteration: None,
             },
             &seams,
         )

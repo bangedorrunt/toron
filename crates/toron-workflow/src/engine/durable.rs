@@ -26,9 +26,9 @@ use crate::schema::{Action, Graph, GraphNode, Step, StepOnError, Workflow};
 use super::boundary::{ActionPartition, is_failure_value, partition};
 use super::branch::{PureGuard, check_pure_guard, evaluate_pure_guard};
 use super::control_flow::{
-    MAX_PARALLEL_FANOUT, RetryCoordinator, build_approval_payload, disposition_for_kind,
-    durable_child_trigger, fail_run_value, is_approval_decision, leaf_preview_for_value,
-    parallel_fanout_count, resolve_template_ref, validate_graph_runtime,
+    MAX_LOOP_ITERS, MAX_PARALLEL_FANOUT, RetryCoordinator, build_approval_payload,
+    disposition_for_kind, durable_child_trigger, fail_run_value, is_approval_decision,
+    leaf_preview_for_value, parallel_fanout_count, resolve_template_ref, validate_graph_runtime,
 };
 
 use super::spawn::{SpawnSpec, unknown_profile_error};
@@ -94,6 +94,18 @@ pub enum ParkReason {
     Spawn,
 }
 
+/// One bounded loop's progress (bd-loop-rewrites-fap8).
+///
+/// Persisted with the model, so a restart resumes at the same iteration
+/// instead of replaying or resetting the loop.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoopProgress {
+    /// The iteration about to run / just ran (1-based).
+    pub iteration: u32,
+    /// The resolved bound (1..=MAX_LOOP_ITERS).
+    pub max: u32,
+}
+
 /// Which arm a [`PlanEntry::ArmEnd`] closes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -139,6 +151,26 @@ pub enum PlanEntry {
         /// Entries in the `else` arm.
         else_len: usize,
     },
+    /// A bounded loop marker (bd-loop-rewrites-fap8): `body_len` entries
+    /// follow, then the [`PlanEntry::LoopEnd`].
+    Loop {
+        /// Authored position of the loop step.
+        authored: usize,
+        /// Entries in one body pass.
+        body_len: usize,
+        /// Entry after the whole loop (used when the bound cannot resolve).
+        after: usize,
+    },
+    /// The end of a loop body: bump the counter, evaluate `until` over the
+    /// outputs, and jump back or exit.
+    LoopEnd {
+        /// Authored position of the loop step.
+        authored: usize,
+        /// First body entry.
+        body_start: usize,
+        /// Entry after the whole loop.
+        after: usize,
+    },
     /// The end of a chosen arm: land the branch step's value and jump past
     /// the whole branch. Static, so a restart re-derives the same jump.
     ArmEnd {
@@ -168,55 +200,80 @@ impl RunPlan {
     pub fn compile(workflow: &Workflow) -> Self {
         let mut entries: Vec<PlanEntry> = Vec::new();
         for (index, step) in workflow.steps.iter().enumerate() {
-            let Action::Branch {
-                if_guard,
-                then,
-                else_steps,
-            } = &step.action
-            else {
-                entries.push(PlanEntry::Step {
+            match &step.action {
+                // bd-loop-rewrites-fap8: a bounded loop expands into a marker,
+                // its body entries, and a static end that jumps back or out.
+                Action::Loop { body, .. } => {
+                    let marker = entries.len();
+                    entries.push(PlanEntry::Loop {
+                        authored: index,
+                        body_len: body.len(),
+                        after: 0,
+                    });
+                    for (arm_index, arm_step) in body.iter().enumerate() {
+                        entries.push(PlanEntry::Step {
+                            authored: arm_index,
+                            step: Box::new(arm_step.clone()),
+                        });
+                    }
+                    let after = entries.len() + 1;
+                    entries.push(PlanEntry::LoopEnd {
+                        authored: index,
+                        body_start: marker + 1,
+                        after,
+                    });
+                    if let PlanEntry::Loop { after: slot, .. } = &mut entries[marker] {
+                        *slot = after;
+                    }
+                }
+                Action::Branch {
+                    if_guard,
+                    then,
+                    else_steps,
+                } => {
+                    let branch = step_name(step, index);
+                    entries.push(PlanEntry::Branch {
+                        authored: index,
+                        guard: if_guard.clone(),
+                        then_len: then.len(),
+                        else_len: else_steps.len(),
+                    });
+                    let mut ends: Vec<usize> = Vec::new();
+                    for (arm_index, arm_step) in then.iter().enumerate() {
+                        entries.push(PlanEntry::Step {
+                            authored: arm_index,
+                            step: Box::new(arm_step.clone()),
+                        });
+                    }
+                    ends.push(entries.len());
+                    entries.push(PlanEntry::ArmEnd {
+                        branch: branch.clone(),
+                        side: BranchSide::Then,
+                        after: 0,
+                    });
+                    for (arm_index, arm_step) in else_steps.iter().enumerate() {
+                        entries.push(PlanEntry::Step {
+                            authored: arm_index,
+                            step: Box::new(arm_step.clone()),
+                        });
+                    }
+                    ends.push(entries.len());
+                    entries.push(PlanEntry::ArmEnd {
+                        branch: branch.clone(),
+                        side: BranchSide::Else,
+                        after: 0,
+                    });
+                    let after = entries.len();
+                    for end in ends {
+                        if let PlanEntry::ArmEnd { after: slot, .. } = &mut entries[end] {
+                            *slot = after;
+                        }
+                    }
+                }
+                _ => entries.push(PlanEntry::Step {
                     authored: index,
                     step: Box::new(step.clone()),
-                });
-                continue;
-            };
-            let branch = step_name(step, index);
-            entries.push(PlanEntry::Branch {
-                authored: index,
-                guard: if_guard.clone(),
-                then_len: then.len(),
-                else_len: else_steps.len(),
-            });
-            let mut ends: Vec<usize> = Vec::new();
-            for (arm_index, arm_step) in then.iter().enumerate() {
-                entries.push(PlanEntry::Step {
-                    authored: arm_index,
-                    step: Box::new(arm_step.clone()),
-                });
-            }
-            ends.push(entries.len());
-            entries.push(PlanEntry::ArmEnd {
-                branch: branch.clone(),
-                side: BranchSide::Then,
-                after: 0,
-            });
-            for (arm_index, arm_step) in else_steps.iter().enumerate() {
-                entries.push(PlanEntry::Step {
-                    authored: arm_index,
-                    step: Box::new(arm_step.clone()),
-                });
-            }
-            ends.push(entries.len());
-            entries.push(PlanEntry::ArmEnd {
-                branch: branch.clone(),
-                side: BranchSide::Else,
-                after: 0,
-            });
-            let after = entries.len();
-            for end in ends {
-                if let PlanEntry::ArmEnd { after: slot, .. } = &mut entries[end] {
-                    *slot = after;
-                }
+                }),
             }
         }
         Self { entries }
@@ -247,6 +304,9 @@ pub struct RunModel {
     pub step_index: usize,
     /// Outputs by step name.
     pub outputs: BTreeMap<String, serde_json::Value>,
+    /// Bounded-loop progress by authored loop name (bd-loop-rewrites-fap8).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub loops: BTreeMap<String, LoopProgress>,
     /// Current phase.
     pub phase: RunPhase,
 }
@@ -310,10 +370,14 @@ pub enum RunMsg {
 pub enum RunEffect {
     /// Execute one step through the existing boundary.
     ExecuteStep {
-        /// Step index.
+        /// Step index (authored position).
         index: usize,
         /// The step.
         step: Box<Step>,
+        /// The loop iteration this pass belongs to, when the step is a loop
+        /// body step. Rides the invocation's iteration key, so N passes are N
+        /// effects (bd-loop-rewrites-fap8).
+        iteration: Option<u32>,
     },
     /// Park the run until this absolute time.
     ParkUntil {
@@ -375,6 +439,7 @@ impl RunModel {
             trigger,
             step_index: 0,
             outputs: BTreeMap::new(),
+            loops: BTreeMap::new(),
             phase: RunPhase::Ready,
         }
     }
@@ -599,7 +664,146 @@ pub(crate) fn next_effects(
         };
         match entry {
             PlanEntry::Step { authored, step } => {
-                return step_effects(model, authored, *step, now_ms, spawns);
+                let iteration = current_iteration(model);
+                return step_effects(model, authored, *step, iteration, now_ms, spawns);
+            }
+            PlanEntry::Loop {
+                authored,
+                body_len: _,
+                after,
+            } => {
+                let name = plan_step_name(model, authored);
+                let step = model.workflow.steps.get(authored).cloned();
+                let Some(Action::Loop { max, .. }) = step.as_ref().map(|s| s.action.clone()) else {
+                    continue;
+                };
+                match resolve_loop_max(&max, &model.trigger, &outputs_map(&model.outputs)) {
+                    Ok(max_n) => {
+                        model.loops.insert(
+                            name,
+                            LoopProgress {
+                                iteration: 1,
+                                max: max_n,
+                            },
+                        );
+                        model.step_index += 1;
+                        model.phase = RunPhase::Running;
+                    }
+                    Err(error) => {
+                        // Defensive: admission resolved the bound before any
+                        // row, so this only fires on a corrupted definition.
+                        let value = serde_json::json!({ "ok": false, "error": error });
+                        let fail_run = step
+                            .as_ref()
+                            .is_some_and(|s| s.on_error == StepOnError::FailRun);
+                        model.outputs.insert(name.clone(), value.clone());
+                        if fail_run {
+                            let output = fail_run_value(&name, &value, None);
+                            model.phase = RunPhase::Failed {
+                                error: output
+                                    .get("error")
+                                    .and_then(|e| e.as_str())
+                                    .unwrap_or("loop bound refused")
+                                    .to_string(),
+                            };
+                            return vec![RunEffect::Fail { step: name, output }];
+                        }
+                        model.step_index = after;
+                        model.phase = RunPhase::Running;
+                    }
+                }
+            }
+            PlanEntry::LoopEnd {
+                authored,
+                body_start,
+                after,
+            } => {
+                let name = plan_step_name(model, authored);
+                let step = model.workflow.steps.get(authored).cloned();
+                let (until, fail_run) = match step.as_ref().map(|s| &s.action) {
+                    Some(Action::Loop { until, .. }) => (
+                        until.clone().filter(|g| !g.trim().is_empty()),
+                        step.as_ref()
+                            .is_some_and(|s| s.on_error == StepOnError::FailRun),
+                    ),
+                    _ => (None, false),
+                };
+                let progress = model.loops.get(&name).copied().unwrap_or(LoopProgress {
+                    iteration: 1,
+                    max: 1,
+                });
+                let verdict = until
+                    .as_deref()
+                    .map(|guard| evaluate_pure_guard(guard, &model.trigger, &model.outputs));
+                let exited = match verdict {
+                    // `until` true stops the loop with the pass count.
+                    Some(PureGuard::True) => Some(serde_json::json!({
+                        "ok": true,
+                        "iterations": progress.iteration,
+                        "stopped": "until",
+                    })),
+                    // A guard that cannot be decided is a loop failure, never
+                    // a silent extra pass.
+                    Some(PureGuard::Error(error)) => Some(serde_json::json!({
+                        "ok": false,
+                        "error": error,
+                        "iterations": progress.iteration,
+                    })),
+                    Some(PureGuard::False) => None,
+                    // No `until`: the bound alone ends the loop.
+                    None => None,
+                };
+                let exited = exited.or_else(|| {
+                    if progress.iteration < progress.max {
+                        return None;
+                    }
+                    Some(if until.is_some() {
+                        serde_json::json!({
+                            "ok": false,
+                            "error": format!(
+                                "loop exhausted after {} iterations without until",
+                                progress.max
+                            ),
+                            "iterations": progress.max,
+                        })
+                    } else {
+                        serde_json::json!({ "ok": true, "iterations": progress.max })
+                    })
+                });
+                match exited {
+                    Some(value) => {
+                        let failed = is_failure_value(&value);
+                        model.outputs.insert(name.clone(), value.clone());
+                        if failed && fail_run {
+                            let mut output = fail_run_value(&name, &value, None);
+                            // The exhaustion bundle keeps its pass count.
+                            if let Some(iterations) = value.get("iterations") {
+                                output["iterations"] = iterations.clone();
+                            }
+                            model.phase = RunPhase::Failed {
+                                error: output
+                                    .get("error")
+                                    .and_then(|e| e.as_str())
+                                    .unwrap_or("loop failed")
+                                    .to_string(),
+                            };
+                            return vec![RunEffect::Fail { step: name, output }];
+                        }
+                        model.step_index = after;
+                        model.phase = RunPhase::Running;
+                    }
+                    None => {
+                        model.loops.insert(
+                            name,
+                            LoopProgress {
+                                iteration: progress.iteration + 1,
+                                max: progress.max,
+                            },
+                        );
+                        model.step_index = body_start;
+                        model.phase = RunPhase::Running;
+                    }
+                }
             }
             PlanEntry::Branch {
                 authored,
@@ -664,6 +868,59 @@ pub(crate) fn next_effects(
     }
 }
 
+/// The authored name of a plan entry's step.
+fn plan_step_name(model: &RunModel, authored: usize) -> String {
+    model.workflow.steps.get(authored).map_or_else(
+        || format!("step_{}", authored + 1),
+        |s| step_name(s, authored),
+    )
+}
+
+/// The loop pass the cursor is in, when it is inside a loop body.
+fn current_iteration(model: &RunModel) -> Option<u32> {
+    for (pos, entry) in model.plan.entries.iter().enumerate() {
+        let PlanEntry::Loop {
+            authored, body_len, ..
+        } = entry
+        else {
+            continue;
+        };
+        if model.step_index > pos && model.step_index <= pos + body_len {
+            let name = plan_step_name(model, *authored);
+            return model.loops.get(&name).map(|progress| progress.iteration);
+        }
+    }
+    None
+}
+
+/// Resolve a loop bound from the fold's pure inputs (trigger + outputs).
+///
+/// Admission runs this against the trigger before any row, so an unbounded or
+/// non-trigger-resolvable loop refuses the workflow; the drive-time call is the
+/// same read.
+pub(crate) fn resolve_loop_max(
+    max: &str,
+    trigger: &serde_json::Value,
+    outputs: &serde_json::Map<String, serde_json::Value>,
+) -> Result<u32, String> {
+    let rendered = resolve_template_ref(max, trigger, outputs)
+        .and_then(|value| match value {
+            serde_json::Value::Number(n) => n.as_u64(),
+            serde_json::Value::String(s) => s.trim().parse().ok(),
+            _ => None,
+        })
+        .or_else(|| max.trim().parse().ok());
+    let bound = rendered
+        .filter(|n| *n >= 1)
+        .ok_or_else(|| format!("loop max {max:?} must render to a positive integer"))?;
+    if bound > u64::from(MAX_LOOP_ITERS) {
+        return Err(format!(
+            "loop max {bound} exceeds the bounded cap {MAX_LOOP_ITERS}"
+        ));
+    }
+    Ok(bound as u32)
+}
+
 /// Effects for one authored linear step.
 ///
 /// `authored` is the step's authored position (top level, or its branch arm),
@@ -673,6 +930,7 @@ fn step_effects(
     model: &mut RunModel,
     authored: usize,
     step: Step,
+    iteration: Option<u32>,
     now_ms: u64,
     spawns: &[Option<SpawnSpec>],
 ) -> Vec<RunEffect> {
@@ -758,6 +1016,7 @@ fn step_effects(
                 return vec![RunEffect::ExecuteStep {
                     index: authored,
                     step: Box::new(step),
+                    iteration,
                 }];
             }
             // Unreachable through `advance(RunMsg::Start)`, which refuses the
@@ -822,6 +1081,44 @@ pub fn unsupported_reason(workflow: &Workflow) -> Option<String> {
                             step_name(step, index),
                             arm_step.name.as_deref().unwrap_or("<unnamed>"),
                             arm_step.action.type_name()
+                        ));
+                    }
+                }
+            }
+            // bd-loop-rewrites-fap8: a bounded loop is a linear-plan entry.
+            Action::Loop { max, until, body } => {
+                let literal = max.trim().parse::<u64>().is_ok();
+                let template = max.trim().starts_with("{{") && max.trim().ends_with("}}");
+                if !literal && !template {
+                    return Some(format!(
+                        "step '{}' loop `max` {max:?} must be a positive integer or a trigger/inputs template",
+                        step_name(step, index)
+                    ));
+                }
+                if max.contains("{{steps.") {
+                    return Some(format!(
+                        "step '{}' loop `max` reads an upstream output, which is not resolvable before the loop starts",
+                        step_name(step, index)
+                    ));
+                }
+                if let Some(guard) = until
+                    && let Err(reason) = check_pure_guard(guard)
+                {
+                    return Some(format!(
+                        "step '{}' loop `until` is not pure: {reason}",
+                        step_name(step, index)
+                    ));
+                }
+                for body_step in body {
+                    if !matches!(
+                        partition(&body_step.action),
+                        ActionPartition::HostSink { .. }
+                    ) {
+                        return Some(format!(
+                            "step '{}' loop body step '{}' uses '{}', which the linear model cannot sequence inside a loop",
+                            step_name(step, index),
+                            body_step.name.as_deref().unwrap_or("<unnamed>"),
+                            body_step.action.type_name()
                         ));
                     }
                 }
@@ -914,6 +1211,7 @@ pub fn resume_effects(model: &RunModel) -> Vec<RunEffect> {
             Some((authored, step)) => vec![RunEffect::ExecuteStep {
                 index: authored,
                 step: Box::new(step.clone()),
+                iteration: current_iteration(model),
             }],
             // A marker is consumed by the next transition; `resume` advances
             // one before it asks for effects, so this is unreachable for a
