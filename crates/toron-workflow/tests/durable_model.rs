@@ -7,8 +7,9 @@ use std::collections::BTreeMap;
 use serde_json::json;
 use toron_workflow::engine::durable::{
     GraphEffect, GraphModel, GraphMsg, GraphPhase, NodeParkReason, NodeState, ParkReason,
-    RunEffect, RunModel, RunMsg, RunPhase, advance, advance_graph, advance_with,
-    graph_unsupported_reason, resume_effects, unsupported_reason,
+    RunEffect, RunModel, RunMsg, RunPhase, advance, advance_graph, advance_with, durable_graph,
+    graph_unsupported_reason, needs_graph_model, resume_effects, resume_graph_effects,
+    unsupported_reason,
 };
 use toron_workflow::engine::spawn::{SpawnSpec, spawn_launcher_refusal};
 use toron_workflow::schema::{Action, Graph, GraphNode, Step, StepOnError, Workflow};
@@ -1275,4 +1276,326 @@ fn shipped_agent_reach_else_arm_fails_closed() {
     );
     assert!(matches!(effects.as_slice(), [RunEffect::Complete { .. }]));
     assert_eq!(model.phase, RunPhase::Succeeded);
+}
+
+// ---------------------------------------------------------------------------
+// Parallel fan-out lowered onto the graph (bd-durable-parallel-53um)
+// ---------------------------------------------------------------------------
+
+fn parallel(name: &str, over: &str, each: Step, on_error: StepOnError) -> Step {
+    Step {
+        name: Some(name.into()),
+        guard: None,
+        on_error,
+        build_slot: false,
+        action: Action::Parallel {
+            over: over.into(),
+            each: Box::new(each),
+        },
+    }
+}
+
+fn fanout_workflow(over: &str, copy_on_error: StepOnError, join_on_error: StepOnError) -> Workflow {
+    workflow(vec![
+        parallel(
+            "fan",
+            over,
+            named("copy", dm("copy"), copy_on_error),
+            join_on_error,
+        ),
+        named("after", dm("after"), StepOnError::Continue),
+    ])
+}
+
+/// The lowered graph model the driver opens: `durable_graph` then `new` with
+/// the graph set, exactly as `DurableGraphRun::open` does.
+fn lowered_model(run_id: &str, workflow: Workflow, trigger: serde_json::Value) -> GraphModel {
+    let graph = durable_graph(&workflow, &trigger)
+        .expect("lower")
+        .expect("a graph workflow");
+    let mut lowered = workflow;
+    lowered.graph = Some(graph);
+    GraphModel::new(run_id, lowered, trigger)
+}
+
+/// Settle the named copies in order, returning the last transition's model and
+/// effects.
+fn settle_copies(
+    model: &GraphModel,
+    copies: &[&str],
+    value: serde_json::Value,
+    now_ms: u64,
+) -> (GraphModel, Vec<GraphEffect>) {
+    let mut model = model.clone();
+    let mut effects = Vec::new();
+    for (index, copy) in copies.iter().enumerate() {
+        let (next, follow) = advance_graph(
+            &model,
+            &GraphMsg::NodeDone {
+                node: (*copy).into(),
+                value: value.clone(),
+                now_ms: now_ms + index as u64,
+            },
+        );
+        model = next;
+        effects = follow;
+    }
+    (model, effects)
+}
+
+/// Three copies dispatch in ONE wave, each exactly once, then the join collects
+/// and the next step runs once.
+#[test]
+fn parallel_fanout_runs_each_copy_once() {
+    let model = lowered_model(
+        "run-par",
+        fanout_workflow("3", StepOnError::Continue, StepOnError::Continue),
+        json!({}),
+    );
+    assert_eq!(model.phase, GraphPhase::Ready);
+    let (model, effects) = advance_graph(&model, &GraphMsg::Start { now_ms: 1_000 });
+    assert_eq!(executed(&effects), ["fan:0", "fan:1", "fan:2"]);
+    assert!(
+        effects.iter().all(|e| matches!(
+            e,
+            GraphEffect::ExecuteNode {
+                wave: 1,
+                attempt: 1,
+                ..
+            }
+        )),
+        "one wave, first attempt: {effects:?}"
+    );
+
+    // The first two settlements are still mid-wave: no join, no next step.
+    let (model, effects) = settle_copies(&model, &["fan:0", "fan:1"], json!({"ok": true}), 2_000);
+    assert!(
+        effects.is_empty(),
+        "a partial wave emits nothing: {effects:?}"
+    );
+    assert!(
+        !model.outputs.contains_key("fan"),
+        "no join on a partial wave"
+    );
+
+    let (model, effects) = settle_copies(&model, &["fan:2"], json!({"ok": true}), 3_000);
+    assert_eq!(
+        executed(&effects),
+        ["after"],
+        "the join settles inline and the next step dispatches: {effects:?}"
+    );
+    assert_eq!(
+        model.outputs["fan"],
+        json!([{"ok": true}, {"ok": true}, {"ok": true}]),
+        "outputs={:?}",
+        model.outputs
+    );
+    assert_eq!(model.node_state["fan"], NodeState::Settled);
+
+    let (model, effects) = advance_graph(
+        &model,
+        &GraphMsg::NodeDone {
+            node: "after".into(),
+            value: json!({"ok": true, "sent": true}),
+            now_ms: 4_000,
+        },
+    );
+    let [GraphEffect::Complete { output }] = effects.as_slice() else {
+        panic!("the run completes: {effects:?}");
+    };
+    assert_eq!(
+        output["fan"],
+        json!([{"ok": true}, {"ok": true}, {"ok": true}])
+    );
+    assert_eq!(output["after"], json!({"ok": true, "sent": true}));
+    assert_eq!(model.phase, GraphPhase::Succeeded);
+}
+
+/// A restart re-issues only the copies still executing; settled copies never
+/// re-dispatch.
+#[test]
+fn parallel_restart_reruns_only_pending_copies() {
+    let model = lowered_model(
+        "run-par-restart",
+        fanout_workflow("3", StepOnError::Continue, StepOnError::Continue),
+        json!({}),
+    );
+    let (model, _) = advance_graph(&model, &GraphMsg::Start { now_ms: 1_000 });
+    let (model, _) = settle_copies(&model, &["fan:0"], json!({"ok": true, "copy": 0}), 2_000);
+
+    let json_text = serde_json::to_string(&model).expect("serialize");
+    let restored: GraphModel = serde_json::from_str(&json_text).expect("restore");
+    let effects = resume_graph_effects(&restored);
+    assert_eq!(
+        executed(&effects),
+        ["fan:1", "fan:2"],
+        "only the pending copies re-issue"
+    );
+    assert!(
+        !executed(&effects).contains(&"fan:0"),
+        "the settled copy is never re-dispatched"
+    );
+    assert_eq!(restored.outputs["fan:0"], json!({"ok": true, "copy": 0}));
+}
+
+/// The join waits for a partial wave across a restart: no join effect and no
+/// re-dispatch until the last copy settles, then it collects in authored order.
+#[test]
+fn parallel_join_waits_on_a_partial_wave() {
+    let model = lowered_model(
+        "run-par-wait",
+        fanout_workflow("2", StepOnError::Continue, StepOnError::Continue),
+        json!({}),
+    );
+    let (model, _) = advance_graph(&model, &GraphMsg::Start { now_ms: 1_000 });
+    let (model, _) = settle_copies(&model, &["fan:0"], json!({"ok": true, "copy": 0}), 2_000);
+
+    let restored: GraphModel =
+        serde_json::from_str(&serde_json::to_string(&model).expect("serialize")).expect("restore");
+    let effects = resume_graph_effects(&restored);
+    assert_eq!(executed(&effects), ["fan:1"]);
+
+    // A wake while a copy is in flight must not fire the join.
+    let (restored, effects) = advance_graph(&restored, &GraphMsg::Woke { now_ms: 3_000 });
+    assert!(
+        effects.is_empty(),
+        "no join effect on a partial wave: {effects:?}"
+    );
+    assert!(!restored.outputs.contains_key("fan"));
+
+    let (restored, effects) =
+        settle_copies(&restored, &["fan:1"], json!({"ok": true, "copy": 1}), 4_000);
+    assert_eq!(executed(&effects), ["after"]);
+    assert_eq!(
+        restored.outputs["fan"],
+        json!([{"ok": true, "copy": 0}, {"ok": true, "copy": 1}]),
+        "authored order, settled values only"
+    );
+    assert!(!restored.outputs.contains_key("fan:0:dup"));
+}
+
+/// A `continue` copy failure lands its FULL value in the collected envelope;
+/// the join step's `fail_run` then fails the run with the bundle.
+#[test]
+fn parallel_copy_failure_continue_lands_bundle() {
+    let model = lowered_model(
+        "run-par-fail",
+        fanout_workflow("2", StepOnError::Continue, StepOnError::Continue),
+        json!({}),
+    );
+    let (model, _) = advance_graph(&model, &GraphMsg::Start { now_ms: 1_000 });
+    let bundle = json!({
+        "ok": false,
+        "kind": "timeout",
+        "error": "copy timed out",
+        "retryable": true,
+    });
+    let (model, _) = settle_copies(&model, &["fan:0"], bundle.clone(), 2_000);
+    let (model, effects) = settle_copies(&model, &["fan:1"], json!({"ok": true}), 3_000);
+    assert_eq!(
+        executed(&effects),
+        ["after"],
+        "continue keeps the run going"
+    );
+    let collected = &model.outputs["fan"];
+    assert_eq!(collected["ok"], json!(false));
+    assert_eq!(collected["error"], json!("copy timed out"));
+    assert_eq!(
+        collected["results"][0], bundle,
+        "the full failure bundle rides the results"
+    );
+
+    // The same collected value with `fail_run` on the join fails the run.
+    let model = lowered_model(
+        "run-par-fail-run",
+        fanout_workflow("2", StepOnError::Continue, StepOnError::FailRun),
+        json!({}),
+    );
+    let (model, _) = advance_graph(&model, &GraphMsg::Start { now_ms: 1_000 });
+    let (model, _) = settle_copies(&model, &["fan:0"], bundle.clone(), 2_000);
+    let (model, effects) = settle_copies(&model, &["fan:1"], json!({"ok": true}), 3_000);
+    let [GraphEffect::Fail { fail }] = effects.as_slice() else {
+        panic!("the join's fail_run fails the run: {effects:?}");
+    };
+    assert_eq!(fail.node, "fan");
+    assert_eq!(fail.error, "copy timed out");
+    assert_eq!(fail.kind, "timeout");
+    assert!(matches!(model.phase, GraphPhase::Failed { .. }));
+}
+
+/// Whole-workflow refusals: the mix with spawn/branch, an unsequencable copy,
+/// and a count that does not resolve at open.
+#[test]
+fn parallel_refuses_mixes_and_unsequencable_copies() {
+    // Mix: spawn + parallel.
+    let mixed = workflow(vec![
+        named("spawn_it", spawn_action(true, 600), StepOnError::Continue),
+        parallel(
+            "fan",
+            "2",
+            named("copy", dm("copy"), StepOnError::Continue),
+            StepOnError::Continue,
+        ),
+    ]);
+    assert!(needs_graph_model(&mixed));
+    let reason = unsupported_reason(&mixed).expect("the mix refuses");
+    assert!(reason.contains("mixes parallel"), "{reason}");
+    let reason = durable_graph(&mixed, &json!({})).expect_err("lowering refuses the mix");
+    assert!(reason.contains("mixes parallel"), "{reason}");
+
+    // Mix: branch + parallel (the linear branch is the same refusal).
+    let mixed = workflow(vec![
+        branch(
+            "{{trigger.gate}} == true",
+            vec![named("yes", dm("yes"), StepOnError::Continue)],
+            vec![],
+            StepOnError::Continue,
+        ),
+        parallel(
+            "fan",
+            "2",
+            named("copy", dm("copy"), StepOnError::Continue),
+            StepOnError::Continue,
+        ),
+    ]);
+    let reason = durable_graph(&mixed, &json!({})).expect_err("branch + parallel refuses");
+    assert!(reason.contains("mixes parallel"), "{reason}");
+
+    // Unsequencable copy action.
+    let bad = workflow(vec![parallel(
+        "fan",
+        "2",
+        step(
+            Action::CallWebhook {
+                url: "http://127.0.0.1:9/x".into(),
+                method: None,
+                body: None,
+            },
+            StepOnError::Continue,
+        ),
+        StepOnError::Continue,
+    )]);
+    let reason = unsupported_reason(&bad).expect("call_webhook copy refuses");
+    assert!(reason.contains("call_webhook"), "{reason}");
+
+    // A count that cannot resolve at open.
+    let unresolvable = workflow(vec![parallel(
+        "fan",
+        "{{inputs.n}}",
+        named("copy", dm("copy"), StepOnError::Continue),
+        StepOnError::Continue,
+    )]);
+    assert!(
+        unsupported_reason(&unresolvable).is_none(),
+        "the shape route admits it; the count resolves at open"
+    );
+    let reason = durable_graph(&unresolvable, &json!({})).expect_err("no count at open");
+    assert!(
+        reason.contains("must resolve to a positive count"),
+        "{reason}"
+    );
+    assert!(
+        durable_graph(&unresolvable, &json!({"inputs": {"n": 2}})).is_ok(),
+        "a trigger-carried count resolves at open"
+    );
 }

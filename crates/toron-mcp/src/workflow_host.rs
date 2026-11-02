@@ -45,7 +45,8 @@ use toron_workflow::coalesce::{
 use toron_workflow::dispatch::{DispatchAcquire, DispatchConfig, DispatchPermit, DispatchPool};
 use toron_workflow::engine::ResonateChoice;
 use toron_workflow::engine::durable::{
-    GraphEffect, GraphModel, RunEffect, RunModel, RunPhase as ModelPhase, unsupported_reason,
+    GraphEffect, GraphModel, RunEffect, RunModel, RunPhase as ModelPhase, needs_graph_model,
+    unsupported_reason,
 };
 use toron_workflow::engine::durable_host::{DurableGraphRun, DurableRun, HostError};
 use toron_workflow::engine::leaf::LeafSeams;
@@ -1943,7 +1944,9 @@ impl WorkflowHost {
                 return;
             }
         };
-        if workflow.graph.is_some() {
+        // bd-durable-parallel-53um: a `steps:` fan-out runs on the graph model
+        // too — the lowering happens at open, this is only the routing.
+        if needs_graph_model(&workflow) {
             self.run_durable_graph_loop(run_id, workflow, input).await;
             return;
         }
@@ -9500,9 +9503,9 @@ steps:
             let wf = graph_workflow([
                 ("fine", graph_node(durable_leaf("cut"), &[])),
                 (
-                    "fan",
+                    "each",
                     graph_node(
-                        Action::Parallel {
+                        Action::Foreach {
                             over: "{{trigger.items}}".into(),
                             each: Box::new(Step {
                                 name: None,
@@ -9516,9 +9519,51 @@ steps:
                     ),
                 ),
             ]);
-            let err =
-                durable_route(&wf, true, false).expect_err("a parallel node refuses the graph");
-            assert!(err.contains("parallel"), "{err}");
+            let err = durable_route(&wf, true, false).expect_err("foreach refuses the graph");
+            assert!(err.contains("foreach"), "{err}");
+        }
+
+        /// bd-durable-parallel-53um: a `steps:` fan-out is lowered onto the
+        /// graph, so the router admits it; the spawn/branch mix refuses whole.
+        #[test]
+        fn a_parallel_steps_workflow_routes_to_the_graph() {
+            let mut wf = linear_workflow();
+            wf.steps = vec![
+                Step {
+                    name: Some("fan".into()),
+                    guard: None,
+                    on_error: StepOnError::Continue,
+                    build_slot: false,
+                    action: Action::Parallel {
+                        over: "3".into(),
+                        each: Box::new(linear_step()),
+                    },
+                },
+                linear_step(),
+            ];
+            assert!(durable_route(&wf, true, false).is_ok());
+
+            // The mix refusal: spawn + parallel is neither shape.
+            let mut mixed = wf.clone();
+            mixed.steps.insert(
+                0,
+                Step {
+                    name: Some("spawn_it".into()),
+                    guard: None,
+                    on_error: StepOnError::Continue,
+                    build_slot: false,
+                    action: Action::Spawn {
+                        profile: "coder".into(),
+                        harness: None,
+                        workflow: None,
+                        await_: true,
+                        no_claim_timeout: 600,
+                        context: None,
+                    },
+                },
+            );
+            let err = durable_route(&mixed, true, true).expect_err("the mix refuses");
+            assert!(err.contains("mixes parallel"), "{err}");
         }
 
         /// Static refusal: a cyclic graph never gets a durable row — the old

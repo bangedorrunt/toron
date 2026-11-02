@@ -16,7 +16,9 @@ use toron_core::index::schema::{connect, migrate};
 use toron_core::journal::{JournalDb, ToronJournal};
 use toron_core::kernel::{DurableEngine, EngineMsg, OurEngine, RunPhase as EnginePhase};
 use toron_workflow::engine::ActionInvocation;
-use toron_workflow::engine::durable::{GraphEffect, GraphPhase, RunEffect, RunModel, RunPhase};
+use toron_workflow::engine::durable::{
+    GraphEffect, GraphModel, GraphPhase, RunEffect, RunModel, RunPhase,
+};
 use toron_workflow::engine::durable_host::{DurableGraphRun, DurableRun, HostError};
 use toron_workflow::engine::leaf::LeafSeams;
 use toron_workflow::engine::linear_step::{GraphNodeStep, run_graph_node_step};
@@ -1372,4 +1374,217 @@ async fn branch_refusals_leave_no_row() {
     );
     assert!(engine.query("run-branch-impure").is_err());
     assert!(engine.query("run-branch-nested").is_err());
+}
+
+// ---------------------------------------------------------------------------
+// Parallel fan-out lowered onto the graph (bd-durable-parallel-53um)
+// ---------------------------------------------------------------------------
+
+fn parallel_step(name: &str, over: &str, each: Step, on_error: StepOnError) -> Step {
+    Step {
+        name: Some(name.into()),
+        guard: None,
+        on_error,
+        build_slot: false,
+        action: Action::Parallel {
+            over: over.into(),
+            each: Box::new(each),
+        },
+    }
+}
+
+fn fanout_workflow(over: &str) -> Workflow {
+    workflow(vec![
+        parallel_step(
+            "fan",
+            over,
+            Step {
+                name: Some("copy".into()),
+                guard: None,
+                on_error: StepOnError::Continue,
+                build_slot: false,
+                action: dm("copy"),
+            },
+            StepOnError::Continue,
+        ),
+        named("after", dm("after"), StepOnError::Continue),
+    ])
+}
+
+fn executed_nodes(effects: &[GraphEffect]) -> Vec<&str> {
+    effects
+        .iter()
+        .filter_map(|e| match e {
+            GraphEffect::ExecuteNode { node, .. } => Some(node.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A restart mid-wave re-emits only the pending copy, then the join collects
+/// and the next step runs — through the store, not just the fold.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn parallel_restart_reruns_only_pending_copies() {
+    let path = unique_db("parallel-restart");
+    let pool = connect(path.to_str().expect("path"))
+        .await
+        .expect("connect");
+    migrate(&pool).await.expect("migrate");
+    let handle = tokio::runtime::Handle::current();
+
+    let phase_one = {
+        let pool = pool.clone();
+        let state = SyncWorkflowState::spawn(pool.clone(), &handle);
+        let handle = handle.clone();
+        tokio::task::spawn_blocking(move || -> Result<GraphModel, HostError> {
+            let engine = OurEngine::with_journal(
+                ToronEngineStore::spawn(pool.clone(), &handle),
+                ToronJournal::spawn(JournalDb::new(pool, "parallel", 64), &handle),
+            );
+            let (mut run, effects) = DurableGraphRun::open(
+                engine,
+                state,
+                "run-parallel",
+                fanout_workflow("2"),
+                json!({}),
+                1_000,
+            )?;
+            assert_eq!(executed_nodes(&effects), ["fan:0", "fan:1"]);
+            let effects = run.node_done("fan:0", json!({"ok": true, "copy": 0}), 2_000)?;
+            assert!(effects.is_empty(), "still mid-wave: {effects:?}");
+            Ok(run.model().clone())
+        })
+        .await
+        .expect("join")
+        .expect("phase one")
+    };
+    assert_eq!(phase_one.outputs["fan:0"], json!({"ok": true, "copy": 0}));
+    assert!(
+        !phase_one.outputs.contains_key("fan"),
+        "no join on a partial wave"
+    );
+
+    let (mut run, effects) = {
+        let pool = pool.clone();
+        let state = SyncWorkflowState::spawn(pool.clone(), &handle);
+        let handle = handle.clone();
+        tokio::task::spawn_blocking(move || {
+            let engine = OurEngine::with_journal(
+                ToronEngineStore::spawn(pool.clone(), &handle),
+                ToronJournal::spawn(JournalDb::new(pool, "parallel", 64), &handle),
+            );
+            DurableGraphRun::open(
+                engine,
+                state,
+                "run-parallel",
+                fanout_workflow("2"),
+                json!({}),
+                3_000,
+            )
+        })
+        .await
+        .expect("join")
+        .expect("reopen")
+    };
+    assert_eq!(
+        executed_nodes(&effects),
+        ["fan:1"],
+        "only the pending copy re-issues"
+    );
+
+    let effects = run
+        .node_done("fan:1", json!({"ok": true, "copy": 1}), 4_000)
+        .expect("settle the last copy");
+    assert_eq!(
+        executed_nodes(&effects),
+        ["after"],
+        "the join settles inline and the next step dispatches"
+    );
+    assert_eq!(
+        run.model().outputs["fan"],
+        json!([{"ok": true, "copy": 0}, {"ok": true, "copy": 1}])
+    );
+    let effects = run
+        .node_done("after", json!({"ok": true, "sent": true}), 5_000)
+        .expect("settle the last step");
+    let [GraphEffect::Complete { output }] = effects.as_slice() else {
+        panic!("the run completes: {effects:?}");
+    };
+    assert_eq!(
+        output["fan"],
+        json!([{"ok": true, "copy": 0}, {"ok": true, "copy": 1}])
+    );
+    assert_eq!(run.model().phase, GraphPhase::Succeeded);
+}
+
+/// Whole-workflow refusals leave no state and no engine row: the spawn/branch
+/// mix and a count that does not resolve at open.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn parallel_refusals_leave_no_row() {
+    let path = unique_db("parallel-refused");
+    let pool = connect(path.to_str().expect("path"))
+        .await
+        .expect("connect");
+    migrate(&pool).await.expect("migrate");
+    let handle = tokio::runtime::Handle::current();
+
+    let mixed = workflow(vec![
+        named("spawn_it", spawn_action(true, 600), StepOnError::Continue),
+        parallel_step(
+            "fan",
+            "2",
+            Step {
+                name: Some("copy".into()),
+                guard: None,
+                on_error: StepOnError::Continue,
+                build_slot: false,
+                action: dm("copy"),
+            },
+            StepOnError::Continue,
+        ),
+    ]);
+    let cases = [
+        ("run-parallel-mixed", mixed, "mixes parallel"),
+        (
+            "run-parallel-count",
+            fanout_workflow("{{inputs.n}}"),
+            "must resolve to a positive count",
+        ),
+    ];
+    for (run_id, wf, label) in cases {
+        let pool = pool.clone();
+        let state = SyncWorkflowState::spawn(pool.clone(), &handle);
+        let handle = handle.clone();
+        let rid = run_id.to_string();
+        let refused = tokio::task::spawn_blocking(move || {
+            let engine = OurEngine::with_journal(
+                ToronEngineStore::spawn(pool.clone(), &handle),
+                ToronJournal::spawn(JournalDb::new(pool, "parallel", 64), &handle),
+            );
+            DurableGraphRun::open(engine, state, rid, wf, json!({}), 0)
+        })
+        .await
+        .expect("join");
+        let Err(err) = refused else {
+            panic!("{run_id}: must refuse");
+        };
+        let HostError::Unsupported(reason) = err else {
+            panic!("{run_id}: wrong refusal: {err:?}");
+        };
+        assert!(reason.contains(label), "{run_id}: {reason}");
+    }
+
+    let store = toron_core::index::durable_workflow::WorkflowStateStore::new(pool.clone());
+    for run_id in ["run-parallel-mixed", "run-parallel-count"] {
+        assert!(
+            store.load(run_id).await.expect("state").is_none(),
+            "{run_id} left no state row"
+        );
+    }
+    let engine = OurEngine::with_journal(
+        ToronEngineStore::spawn(pool.clone(), &handle),
+        ToronJournal::spawn(JournalDb::new(pool, "parallel", 64), &handle),
+    );
+    assert!(engine.query("run-parallel-mixed").is_err());
+    assert!(engine.query("run-parallel-count").is_err());
 }

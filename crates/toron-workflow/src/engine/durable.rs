@@ -21,13 +21,14 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::schema::{Action, Step, StepOnError, Workflow};
+use crate::schema::{Action, Graph, GraphNode, Step, StepOnError, Workflow};
 
 use super::boundary::{ActionPartition, is_failure_value, partition};
 use super::branch::{PureGuard, check_pure_guard, evaluate_pure_guard};
 use super::control_flow::{
-    RetryCoordinator, build_approval_payload, disposition_for_kind, fail_run_value,
-    is_approval_decision, leaf_preview_for_value, validate_graph_runtime,
+    MAX_PARALLEL_FANOUT, RetryCoordinator, build_approval_payload, disposition_for_kind,
+    fail_run_value, is_approval_decision, leaf_preview_for_value, parallel_fanout_count,
+    validate_graph_runtime,
 };
 
 use super::spawn::{SpawnSpec, unknown_profile_error};
@@ -791,7 +792,7 @@ fn step_effects(
 /// without a `SpawnLauncher` refuses the workflow through
 /// [`super::spawn::spawn_launcher_refusal`] before this model is opened.
 pub fn unsupported_reason(workflow: &Workflow) -> Option<String> {
-    if workflow.graph.is_some() {
+    if needs_graph_model(workflow) {
         return graph_unsupported_reason(workflow);
     }
     for (index, step) in workflow.steps.iter().enumerate() {
@@ -1636,6 +1637,60 @@ fn schedule(model: &mut GraphModel, now_ms: u64) -> Vec<GraphEffect> {
                     });
                     dispatched += 1;
                 }
+                // bd-durable-parallel-53um: the join marker of a lowered
+                // fan-out. Its `needs` are its copies, and the graph schedules
+                // only when nothing is in flight, so every copy is settled and
+                // the value is a pure fold — no effect, no second scheduler.
+                Action::Parallel { .. } => {
+                    let values: Vec<serde_json::Value> = node
+                        .needs
+                        .iter()
+                        .filter_map(|copy| model.outputs.get(copy).cloned())
+                        .collect();
+                    let value = collect_parallel(values.clone());
+                    if node.on_error == StepOnError::FailRun && is_failure_value(&value) {
+                        // The bundle keeps the failed copy's kind/disposition,
+                        // exactly like the per-node failure carrier.
+                        let kind = values
+                            .iter()
+                            .find(|v| is_failure_value(v))
+                            .and_then(|v| v.get("kind"))
+                            .and_then(|k| k.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let output = fail_run_value(name, &value, None);
+                        let error = output
+                            .get("error")
+                            .and_then(|e| e.as_str())
+                            .unwrap_or("parallel copy failed")
+                            .to_string();
+                        model.phase = GraphPhase::Failed {
+                            error: error.clone(),
+                        };
+                        effects.push(GraphEffect::Fail {
+                            fail: GraphFail {
+                                node: name.clone(),
+                                error,
+                                disposition: if kind.is_empty() {
+                                    String::new()
+                                } else {
+                                    disposition_for_kind(&kind, None).as_str().to_string()
+                                },
+                                kind,
+                                leaf_preview: output
+                                    .get("leaf_preview")
+                                    .cloned()
+                                    .unwrap_or(serde_json::Value::Null),
+                                attempts: None,
+                            },
+                        });
+                        return effects;
+                    }
+                    model.outputs.insert(name.clone(), value);
+                    model.node_wave.insert(name.clone(), wave);
+                    model.node_state.insert(name.clone(), NodeState::Settled);
+                    continue;
+                }
                 action if matches!(partition(action), ActionPartition::HostSink { .. }) => {
                     model.node_state.insert(
                         name.clone(),
@@ -1729,6 +1784,24 @@ fn recompute_alias(model: &mut GraphModel) {
     }
 }
 
+/// The value of a lowered parallel join, matching `run_parallel`: the copy
+/// values in authored order, or the fail-after-collect envelope when any copy
+/// is a failure value (the join step's `on_error` then decides).
+fn collect_parallel(values: Vec<serde_json::Value>) -> serde_json::Value {
+    if let Some(failed) = values.iter().find(|v| is_failure_value(v)) {
+        let error = failed
+            .get("error")
+            .and_then(|e| e.as_str())
+            .unwrap_or("parallel copy failed");
+        return serde_json::json!({
+            "ok": false,
+            "error": error,
+            "results": values,
+        });
+    }
+    serde_json::Value::Array(values)
+}
+
 fn outputs_map(
     outputs: &BTreeMap<String, serde_json::Value>,
 ) -> serde_json::Map<String, serde_json::Value> {
@@ -1738,20 +1811,190 @@ fn outputs_map(
         .collect()
 }
 
+/// True when the authored steps contain a `parallel` fan-out.
+pub fn has_parallel_steps(workflow: &Workflow) -> bool {
+    workflow
+        .steps
+        .iter()
+        .any(|step| matches!(step.action, Action::Parallel { .. }))
+}
+
+/// True when the workflow must run on the graph model: an authored graph, or a
+/// `steps:` sequence lowered into copy nodes + a collect join
+/// (bd-durable-parallel-53um).
+pub fn needs_graph_model(workflow: &Workflow) -> bool {
+    workflow.graph.is_some() || has_parallel_steps(workflow)
+}
+
+/// Static refusal for a `steps:` workflow that needs the parallel lowering.
+///
+/// Whole-workflow, never partial: the mix refusal keeps a spawn/branch
+/// sequence linear (a graph cannot admit either), every copy must be a leaf
+/// the graph can sequence, and the count must be a literal or a template ref
+/// resolved at open.
+fn lowered_parallel_refusal(workflow: &Workflow) -> Option<String> {
+    for (index, step) in workflow.steps.iter().enumerate() {
+        let name = step_name(step, index);
+        match &step.action {
+            Action::Parallel { over, each } => {
+                let literal = over.trim().parse::<u64>().is_ok();
+                let template = over.trim().starts_with("{{") && over.trim().ends_with("}}");
+                if !literal && !template {
+                    return Some(format!(
+                        "step '{name}' parallel `over` {over:?} must be a positive count or a template ref"
+                    ));
+                }
+                if !is_graph_sequencable(&each.action) {
+                    return Some(format!(
+                        "step '{name}' parallel copy uses '{}', which the graph model cannot sequence",
+                        each.action.type_name()
+                    ));
+                }
+            }
+            // Captain review: a graph-lowered shape mixed with spawn or a
+            // linear branch refuses WHOLE rather than half-running.
+            Action::Spawn { .. } | Action::Branch { .. } => {
+                return Some(format!(
+                    "workflow mixes parallel with '{}' at step '{name}': the parallel lowering is graph-shaped and the durable graph admits neither; split the workflow",
+                    step.action.type_name()
+                ));
+            }
+            action if !is_linear(action) => {
+                return Some(format!(
+                    "step '{name}' uses '{}', which the parallel lowering cannot sequence",
+                    action.type_name()
+                ));
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The graph this workflow runs on: an authored graph, or a `steps:` sequence
+/// lowered into one wave of copy nodes `{node}:{i}` plus a collect join named
+/// after the authored step (bd-durable-parallel-53um).
+///
+/// Pure: the copy count is read from the trigger at open (literal or
+/// `{{inputs.*}}`), never from a host. A count that needs a prior step's
+/// output refuses — that is the foreach slice's surface, not this one.
+pub fn durable_graph(
+    workflow: &Workflow,
+    trigger: &serde_json::Value,
+) -> Result<Option<Graph>, String> {
+    if let Some(graph) = &workflow.graph {
+        return Ok(Some(graph.clone()));
+    }
+    if !has_parallel_steps(workflow) {
+        return Ok(None);
+    }
+    if let Some(reason) = lowered_parallel_refusal(workflow) {
+        return Err(reason);
+    }
+    let mut nodes: BTreeMap<String, GraphNode> = BTreeMap::new();
+    let mut prev: Option<String> = None;
+    for (index, step) in workflow.steps.iter().enumerate() {
+        let name = step_name(step, index);
+        if let Action::Parallel { over, each } = &step.action {
+            let count = parallel_fanout_count(over, trigger, &serde_json::Map::new())
+                .ok_or_else(|| {
+                    format!(
+                        "step '{name}' parallel `over` {over:?} must resolve to a positive count at open"
+                    )
+                })?;
+            if count > MAX_PARALLEL_FANOUT {
+                return Err(format!(
+                    "step '{name}' parallel fan-out {count} exceeds the bounded cap {MAX_PARALLEL_FANOUT}"
+                ));
+            }
+            let copies: Vec<String> = (0..count).map(|i| format!("{name}:{i}")).collect();
+            for copy in &copies {
+                let node = GraphNode {
+                    action: each.action.clone(),
+                    needs: prev.iter().cloned().collect(),
+                    guard: each.guard.clone(),
+                    on_error: each.on_error,
+                    build_slot: each.build_slot,
+                };
+                if nodes.insert(copy.clone(), node).is_some() {
+                    return Err(format!(
+                        "parallel copy name '{copy}' collides with an authored step"
+                    ));
+                }
+            }
+            let join = GraphNode {
+                action: step.action.clone(),
+                needs: copies,
+                guard: None,
+                on_error: step.on_error,
+                build_slot: false,
+            };
+            if nodes.insert(name.clone(), join).is_some() {
+                return Err(format!("step name '{name}' is not unique"));
+            }
+            prev = Some(name);
+            continue;
+        }
+        let node = GraphNode {
+            action: step.action.clone(),
+            needs: prev.iter().cloned().collect(),
+            guard: step.guard.clone(),
+            on_error: step.on_error,
+            build_slot: step.build_slot,
+        };
+        if nodes.insert(name.clone(), node).is_some() {
+            return Err(format!("step name '{name}' is not unique"));
+        }
+        prev = Some(name);
+    }
+    Ok(Some(Graph { nodes }))
+}
+
 /// `None` when the graph model can sequence this graph end to end.
 ///
 /// Whole-graph refusal, never partial: a graph is admitted only when every node
-/// is a HostSink leaf, `delay`, or `request_approval`. An empty, cyclic, or
-/// unknown-need graph is refused too — the old engine fails those identically,
-/// and a durable row recording a doomed run is worse than a clean route.
+/// is a HostSink leaf, `delay`, `request_approval`, or the JOIN MARKER of a
+/// lowered parallel fan-out (a `parallel` node whose `needs` are its copies).
+/// An empty, cyclic, or unknown-need graph is refused too — the old engine
+/// fails those identically, and a durable row recording a doomed run is worse
+/// than a clean route.
 pub fn graph_unsupported_reason(workflow: &Workflow) -> Option<String> {
     let Some(graph) = &workflow.graph else {
+        if has_parallel_steps(workflow) {
+            return lowered_parallel_refusal(workflow);
+        }
         return Some("not a graph workflow".into());
     };
     if let Err(error) = validate_graph_runtime(graph) {
         return Some(error);
     }
     for (name, node) in &graph.nodes {
+        if let Action::Parallel { each, .. } = &node.action {
+            // The join marker of a lowered fan-out: collect its copies.
+            if node.needs.is_empty() {
+                return Some(format!(
+                    "graph node '{name}' is a parallel join with no copies in `needs`"
+                ));
+            }
+            for need in &node.needs {
+                let copy_index = need
+                    .strip_prefix(name.as_str())
+                    .and_then(|rest| rest.strip_prefix(':'))
+                    .and_then(|i| i.parse::<usize>().ok());
+                if copy_index.is_none() {
+                    return Some(format!(
+                        "graph node '{name}' is a parallel join; need '{need}' is not one of its copies '{name}:<i>'"
+                    ));
+                }
+            }
+            if !is_graph_sequencable(&each.action) {
+                return Some(format!(
+                    "graph node '{name}' parallel copy uses '{}', which the graph model cannot sequence",
+                    each.action.type_name()
+                ));
+            }
+            continue;
+        }
         if !is_graph_sequencable(&node.action) {
             return Some(format!(
                 "graph node '{name}' uses '{}', which the graph model cannot sequence",

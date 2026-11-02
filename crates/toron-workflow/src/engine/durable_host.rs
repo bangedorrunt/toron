@@ -36,8 +36,8 @@ use toron_core::kernel::{
 use super::control_flow::validate_workflow_lineage;
 use super::durable::{
     GraphEffect, GraphModel, GraphMsg, GraphPhase, NodeState, RunEffect, RunModel, RunMsg,
-    RunPhase as ModelPhase, advance_graph, advance_with, graph_unsupported_reason, next_effects,
-    resume_effects, resume_graph_effects, unsupported_reason,
+    RunPhase as ModelPhase, advance_graph, advance_with, durable_graph, graph_unsupported_reason,
+    needs_graph_model, next_effects, resume_effects, resume_graph_effects, unsupported_reason,
 };
 use super::spawn::{SpawnSeams, SpawnSpec, prepare_spawn, spawn_key, spawn_launcher_refusal};
 
@@ -193,6 +193,12 @@ impl<S: EngineStorage, J: JournalStore, R: RunState> DurableRun<S, J, R> {
             return run.resume(now_ms).map(|effects| (run, effects));
         }
 
+        // This driver sequences the linear plan only. A graph-lowered shape
+        // (`parallel`) belongs to the graph driver; flattening it here would
+        // be a second scheduler (bd-durable-parallel-53um).
+        if needs_graph_model(&workflow) {
+            return Err(HostError::Unsupported("not a linear workflow".into()));
+        }
         if let Some(reason) = unsupported_reason(&workflow) {
             return Err(HostError::Unsupported(reason));
         }
@@ -631,6 +637,18 @@ impl<S: EngineStorage, J: JournalStore, R: RunState> DurableGraphRun<S, J, R> {
         // Captain review Q3: a validation the old path performs must not
         // disappear because the workflow took the new path.
         validate_workflow_lineage(&trigger, &workflow.name).map_err(HostError::Unsupported)?;
+        // bd-durable-parallel-53um: a `steps:` fan-out is lowered into copy
+        // nodes + a collect join. The lanes are pure and resolved here, so a
+        // refusal still happens before any engine or state row.
+        let workflow = match durable_graph(&workflow, &trigger) {
+            Ok(Some(graph)) => {
+                let mut lowered = workflow;
+                lowered.graph = Some(graph);
+                lowered
+            }
+            Ok(None) => return Err(HostError::Unsupported("not a graph workflow".into())),
+            Err(reason) => return Err(HostError::Unsupported(reason)),
+        };
         if let Some(reason) = graph_unsupported_reason(&workflow) {
             return Err(HostError::Unsupported(reason));
         }
