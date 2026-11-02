@@ -286,16 +286,22 @@ Live-server SKIP guards: **24 early-`return` points across 12 files**. Only
     deleted 2026-11-02 (`bd-resonate-corpses-l96j`); the untracked local
     `resonate.db` stays as operator data and is not a repo file.
 
-**Cannot remove yet:** the spawn cutover (step 4). The park model, the job
-spec, and the consumer functions landed, but the design's transport assumption
-was false: the bus is process-local, and the host runs in the toron MCP server
-while the pane launcher runs in flywheel. The Captain addendum in
-`docs/durable-engine/spawn-park-design.md` moves the launch to an in-process
-`SpawnLauncher` seam with durable `spawn_key` claims; implementation is
-`bd-spawn-launcher-flip-d8mv`. Graphs (`bd-durable-graph-impl-r2x1`, landed
-`860134db`), cron cadence (`bd-flywheel-cron-elm-cn7p`, landed `5ff72300`), and
-the swarm loop (`bd-flywheel-loop-substrate-ftpm`, landed `182cad35`) are done.
-Steps 6–9 stay gated on spawn.
+**Landed since this plan was written:** graphs (`860134db`), multi-approval
+parks + real terminal output (`ff76a76a`), the spawn park (`738c6693`), cron on
+`ElmCron` (`5ff72300`), the swarm loop off the substrate (`182cad35`), the
+launcher-seam spawn flip (`285cb536` + flywheel `23ecb7bb`; admission is
+capability-based, `durable_route(..., spawn_capable)`), loop status/doctor on
+local rows (`957b4c56`), and **flywheel's direct `resonate-sdk` dependency is
+gone** (`406dd6d9`).
+
+**Cannot remove yet:** the legacy engine still owns the control-flow shapes
+(branch/retry/parallel/foreach/loop/call_workflow/park). Flywheel's builtins
+and crew composition use them (parallel ~18x, call_workflow ~22x, retry ~6x,
+branch ~4x), so `toron-workflow` keeps `resonate-sdk` until those models land.
+Design: `bd-control-flow-design-0jmd` (deliverable
+`docs/durable-engine/control-flow-design.md`). After that: port flywheel's
+`crew`/`phase_chain`/`coalition`/`smart_cron` call sites, then the step 6–9
+deletion (toron's old engine, `CronManager`, testkit, deps, prose).
 
 ## 8. Where code disagrees with "the in-house engine replaces Resonate"
 
