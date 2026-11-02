@@ -106,7 +106,11 @@ pub type CronSpecRegistry = Arc<dyn Fn() -> Vec<CronSpecRegistration> + Send + S
 /// the loop fires.
 pub fn spec_tick_workflow(spec: &CronSpec) -> Workflow {
     Workflow {
-        name: spec.name.clone(),
+        // The tick body is a WRAPPER around the spec, not the spec's name:
+        // a cron may `call_workflow` a catalog workflow with the same name,
+        // and the recursion guard compares names. `-tick` keeps the two
+        // distinct without changing the cron's identity or run id.
+        name: format!("{}-tick", spec.name),
         description: spec.description.clone(),
         trigger: None,
         policy: spec.policy.as_ref().map(spec_policy_to_cron_policy),
@@ -471,7 +475,7 @@ mod tests {
         )
         .expect("spec");
         let wf = spec_tick_workflow(&spec);
-        assert_eq!(wf.name, "w");
+        assert_eq!(wf.name, "w-tick");
         assert!(
             wf.trigger.is_none(),
             "no workflow trigger — the loop owns the schedule"
