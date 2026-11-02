@@ -275,9 +275,11 @@ impl<S: EngineStorage, J: JournalStore, R: RunState> DurableRun<S, J, R> {
     /// resolver does not know keeps `None` and lands the old unknown-profile
     /// value, never a run failure.
     pub fn prepare_spawns(&mut self, seams: &SpawnSeams) {
-        self.spawns = (0..self.model.workflow.steps.len())
+        // Plan-entry aligned: a `spawn` inside a branch arm gets a spec too,
+        // so the arm is a normal linear step (bd-engine-facade-74nw).
+        self.spawns = (0..self.model.plan.entries.len())
             .map(|index| {
-                let step = &self.model.workflow.steps[index];
+                let (authored, step) = self.model.plan.step_at(index)?;
                 let Action::Spawn {
                     profile,
                     harness,
@@ -296,7 +298,7 @@ impl<S: EngineStorage, J: JournalStore, R: RunState> DurableRun<S, J, R> {
                         node: step
                             .name
                             .clone()
-                            .unwrap_or_else(|| format!("step_{}", index + 1)),
+                            .unwrap_or_else(|| format!("step_{}", authored + 1)),
                         attempt: 1,
                         profile: profile.clone(),
                         harness: harness.clone(),

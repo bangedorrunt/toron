@@ -1144,15 +1144,22 @@ fn branch_refuses_impure_guards_and_unsupported_arms() {
     let reason = unsupported_reason(&wf).expect("nested control flow refuses");
     assert!(reason.contains("inside an arm"), "{reason}");
 
-    // A spawn inside an arm has no prepared spec, so it refuses rather than
-    // landing the unknown-profile value at drive time.
+    // An unsequencable action in an arm refuses whole. (A `spawn` IS
+    // sequenced now: its spec is prepared on the plan entries.)
     let wf = workflow(vec![branch(
         "{{trigger.gate}} == true",
-        vec![step(spawn_action(true, 600), StepOnError::Continue)],
+        vec![step(
+            Action::CallWebhook {
+                url: "http://127.0.0.1:9/x".into(),
+                method: None,
+                body: None,
+            },
+            StepOnError::Continue,
+        )],
         vec![],
         StepOnError::Continue,
     )]);
-    let reason = unsupported_reason(&wf).expect("spawn in an arm refuses");
+    let reason = unsupported_reason(&wf).expect("an unsequencable arm refuses");
     assert!(reason.contains("inside an arm"), "{reason}");
 }
 

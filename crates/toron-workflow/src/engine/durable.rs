@@ -969,7 +969,9 @@ fn step_effects(
             no_claim_timeout: _,
             context: _,
         } => {
-            let Some(spec) = spawns.get(authored).and_then(Option::as_ref) else {
+            // The spec table is plan-entry aligned, so an arm spawn resolves
+            // from its entry position (bd-engine-facade-74nw).
+            let Some(spec) = spawns.get(model.step_index).and_then(Option::as_ref) else {
                 // Design (f): a profile that cannot be prepared is a step
                 // VALUE, never a run failure.
                 let error = unknown_profile_error(profile);
@@ -1076,10 +1078,11 @@ pub fn unsupported_reason(workflow: &Workflow) -> Option<String> {
                     ));
                 }
                 for arm_step in then.iter().chain(else_steps.iter()) {
-                    if !matches!(
+                    let sequencable = matches!(
                         partition(&arm_step.action),
                         ActionPartition::HostSink { .. }
-                    ) {
+                    ) || matches!(arm_step.action, Action::Spawn { .. });
+                    if !sequencable {
                         return Some(format!(
                             "step '{}' branch arm step '{}' uses '{}', which the linear model cannot sequence inside an arm",
                             step_name(step, index),

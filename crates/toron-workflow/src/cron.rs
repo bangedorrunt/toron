@@ -37,17 +37,10 @@
 
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
 use chrono::DateTime;
 use serde::{Deserialize, Serialize};
 
-use crate::cron_failure::{
-    PolicyEvent, PolicySink, evaluate as evaluate_policy, failure_details, is_failed,
-};
-use crate::engine::{RunInput, run_workflow};
-use crate::schema::{
-    CronCatchup, CronPolicy, CronScope, CronSpec, CronSpecPolicy, FailureAction, Workflow,
-};
+use crate::schema::{CronCatchup, CronPolicy, CronScope, CronSpec, CronSpecPolicy, Workflow};
 
 /// One registered cron the manager drives (Spec 3). The embedding resolves
 /// the workflow template + owner profile; the manager only needs the plan.
@@ -105,206 +98,6 @@ pub struct CronSpecRegistration {
 /// [`CronRegistry`]).
 pub type CronSpecRegistry = Arc<dyn Fn() -> Vec<CronSpecRegistration> + Send + Sync>;
 
-/// Input to the durable cron loop (serialized; replayed on resume).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct CronLoopInput {
-    name: String,
-    cron: String,
-    /// The tick body: the bound workflow (legacy) or the spec-derived
-    /// workflow (ADR-0012 — `spec_tick_workflow`). The loop itself is
-    /// schedule-only; the body runs via the shared engine.
-    workflow: Workflow,
-    owner: String,
-    scope: CronScope,
-    /// Effective missed-tick policy (spec mode; legacy = `Latest` — the
-    /// pre-ADR-0012 behavior).
-    #[serde(default)]
-    catchup: CronCatchup,
-    /// Failure-bundle run-id prefix (`cron` / `cron-spec` — matches the
-    /// loop's run-id namespace).
-    #[serde(default = "default_run_prefix")]
-    run_prefix: String,
-    /// The loop's initial `last_fired` (see [`CronSpecRegistration::start_ts`]).
-    #[serde(default)]
-    start_ts: Option<i64>,
-}
-
-fn default_run_prefix() -> String {
-    "cron".to_string()
-}
-
-/// Input to the durable catch-up decision ([`decide_tick`]).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct DecideInput {
-    cron: String,
-    last_fired: i64,
-    now: i64,
-    catchup: CronCatchup,
-}
-
-/// The edge's bounded candidate set for one decision (bd-j32w): the
-/// latest due tick (if any) plus the next ticks from `now` and from
-/// `last_fired` — O(1) schedule reads, no gap enumeration. Shared by the
-/// durable child and the conformance battery below.
-fn decide_candidates(cron: &str, last_fired: i64, now: i64) -> Vec<i64> {
-    let mut candidates = Vec::new();
-    for t in [
-        latest_due_at_or_before(cron, last_fired, now),
-        next_due(cron, now),
-        next_due(cron, last_fired),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        if !candidates.contains(&t) {
-            candidates.push(t);
-        }
-    }
-    candidates
-}
-
-/// The durable catch-up decision: which tick to fire next, under the
-/// effective catch-up policy. Run as a child of the loop so the decision is
-/// RECORDED — a replay returns the original decision instead of re-deriving
-/// one from the (changed) wall clock after a restart.
-///
-/// bd-j32w: the edge materializes a bounded candidate set with the existing
-/// schedule fns (latest-due + next-from-now + next-from-last, all O(1)
-/// calls); the kernel owns the SELECTION, so there is exactly one
-/// implementation. Shapes unchanged (`Option<i64>`, fire-or-park), so
-/// recorded histories replay verbatim.
-#[resonate_sdk::function]
-async fn decide_tick(
-    _ctx: &resonate_sdk::prelude::Context,
-    input: DecideInput,
-) -> resonate_sdk::Result<Option<i64>> {
-    use crate::cron_core::{Catchup, next_future, select_fireable};
-    let candidates = decide_candidates(&input.cron, input.last_fired, input.now);
-    if candidates.is_empty() {
-        // Unparsable expression (all three schedule reads failed) — park
-        // exactly as before (the loop sleeps long, never spins).
-        return Ok(None);
-    }
-    let catchup = match input.catchup {
-        CronCatchup::Latest => Catchup::Latest,
-        CronCatchup::Skip => Catchup::Skip,
-    };
-    match select_fireable(catchup, Some(input.last_fired), input.now, &candidates) {
-        Some(tick) => Ok(Some(tick)),
-        // Nothing fireable: sleep target = earliest future tick (the loop
-        // sleeps to it, preserving decide→sleep→fire). Present whenever
-        // the schedule parses (see analysis on the bead).
-        None => Ok(next_future(Some(input.last_fired), input.now, &candidates)),
-    }
-}
-
-/// Input to the durable tick body ([`run_cron_tick`]).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct CronTickInput {
-    name: String,
-    cron: String,
-    /// The tick body workflow (bound or spec-derived) run through the shared
-    /// engine. Its `policy` drives the failure-policy side effects.
-    workflow: Workflow,
-    owner: String,
-    scope: CronScope,
-    /// The SCHEDULED tick this run fires for (the run's identity).
-    tick: i64,
-    /// Failure-bundle run-id prefix (`cron` / `cron-spec`).
-    run_prefix: String,
-    /// The consecutive-failure streak entering this tick (Spec 3 repeat
-    /// policy; the loop carries it across ticks via the recorded result).
-    consecutive: u32,
-}
-
-/// The tick child's recorded result (replayed verbatim on resume).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct CronTickResult {
-    /// The tick that fired (advances the loop's `last_fired`).
-    tick: i64,
-    /// The consecutive-failure streak AFTER this tick (Spec 3).
-    consecutive: u32,
-    /// The tick body's output (the policy event rides along with it).
-    output: serde_json::Value,
-}
-
-/// The durable tick body: runs the tick workflow through the SHARED engine
-/// and applies the failure-policy side effects (PolicySink push). A child of
-/// the loop — replay resolves the recorded child, so the workflow runs and
-/// the policy event is pushed exactly once per real tick (never re-played
-/// into a phantom event after a restart).
-#[resonate_sdk::function]
-async fn run_cron_tick(
-    ctx: &resonate_sdk::prelude::Context,
-    input: CronTickInput,
-) -> resonate_sdk::Result<CronTickResult> {
-    let trigger = serde_json::json!({
-        "type": "schedule",
-        "cron": input.cron,
-        "tick": input.tick,
-        "owner": input.owner,
-        "scope": format!("{:?}", input.scope).to_lowercase(),
-    });
-    // A failed tick must NOT kill the scheduler: the child's output (or
-    // error) is recorded; the loop moves on to the next tick. Failure
-    // policy (bead/escalate) is applied via the policy sink below.
-    let tick_output: serde_json::Value = match ctx
-        .run(
-            run_workflow,
-            RunInput {
-                workflow: input.workflow.clone(),
-                trigger,
-                run_id: None,
-            },
-        )
-        .await
-    {
-        Ok(out) => out,
-        Err(_e) => serde_json::json!({
-            "status": "failed",
-            "error": format!("cron tick {} run errored", input.tick),
-        }),
-    };
-
-    // Spec 3 failure policy: on a failed tick, record the decision on the
-    // policy sink for the embedding to execute (br create / escalate DM).
-    // Log-only when no policy is declared.
-    let mut consecutive = input.consecutive;
-    if let Some(policy) = &input.workflow.policy {
-        let failed = is_failed(&tick_output);
-        let (action, next) = evaluate_policy(policy, failed, consecutive);
-        consecutive = next;
-        let (error, failed_step) = failure_details(&tick_output);
-        ctx.get_dependency::<PolicySink>()
-            .lock()
-            .await
-            .push(PolicyEvent {
-                cron: input.name.clone(),
-                tick: input.tick,
-                action,
-                bundle: crate::cron_failure::FailureBundle {
-                    run_id: format!("{}:{}:{}", input.run_prefix, input.name, input.tick),
-                    workflow: input.workflow.name.clone(),
-                    owner: input.owner.clone(),
-                    error,
-                    failed_step,
-                    consecutive,
-                },
-                // bd-m7ac: the full tick output (the oracle step's
-                // synthesis for weekly-review) rides along so the
-                // embedding can perform success side-effects.
-                output: Some(tick_output.clone()),
-            });
-        let _ = FailureAction::Log; // actions are the embedding's to perform
-    }
-
-    Ok(CronTickResult {
-        tick: input.tick,
-        consecutive,
-        output: tick_output,
-    })
-}
-
 /// The tick body for a spec-driven loop: a [`Workflow`] built from the
 /// CronSpec's steps/graph/policy — the SAME shape the shared engine runs
 /// (one engine, two input types; `call_workflow` composes workflows).
@@ -337,161 +130,6 @@ const fn spec_policy_to_cron_policy(p: &CronSpecPolicy) -> CronPolicy {
         max_retries: p.max_retries,
         no_claim_timeout: p.no_claim_timeout,
     }
-}
-
-/// The effective missed-tick policy for a spec (default `Latest`).
-fn spec_catchup(spec: &CronSpec) -> CronCatchup {
-    spec.policy
-        .as_ref()
-        .map(|p| p.catchup)
-        .unwrap_or(CronCatchup::Latest)
-}
-
-/// The next tick to FIRE under the effective catch-up policy (pure):
-/// - `Latest` (ADR-0005 Spec 3): the most-recent due tick at-or-before `now`
-///   strictly after `last_fired` — after downtime, ONE tick (never a burst);
-///   on-time, the next scheduled tick in the future.
-/// - `Skip` (ADR-0012): never fire a missed tick — the first due tick
-///   strictly after `last_fired` when it is still in the future, otherwise
-///   the first tick after `now` (downtime ticks are dropped).
-///
-/// `None` for an unparsable expression (the loop parks, never spins).
-///
-/// Legacy oracle for the kernel conformance tests below: production calls
-/// go through `cron_core`, tests pin this math. Only referenced under
-/// `cfg(test)`, hence the allow.
-#[allow(dead_code)]
-fn due_tick(cron: &str, last_fired: i64, now: i64, catchup: CronCatchup) -> Option<i64> {
-    match catchup {
-        CronCatchup::Latest => {
-            latest_due_at_or_before(cron, last_fired, now).or_else(|| next_due(cron, last_fired))
-        }
-        CronCatchup::Skip => {
-            let due = next_due(cron, last_fired)?;
-            if due <= now {
-                next_due(cron, now)
-            } else {
-                Some(due)
-            }
-        }
-    }
-}
-
-/// The durable cron loop function: sleep until the next due tick, fire the
-/// tick body as a durable child, repeat. Registered on the engine's Resonate
-/// runtime by [`CronManager`]. ONE loop, TWO input shapes (legacy
-/// workflow-binding + ADR-0012 CronSpec) — the shared engine runs both.
-///
-/// Determinism contract (Spec 3 + bd-25g7.2):
-/// - The loop runs under the run id `cron:{name}` / `cron-spec:{name}` — a
-///   restart re-invoking that id resumes the same durable function (no
-///   duplicate loop).
-/// - Every iteration makes the SAME terminal-op calls in the SAME order:
-///   `ctx.run(decide_tick)` → `ctx.sleep(...)` → `ctx.run(run_cron_tick)`.
-///   Replay resolves each call at its recorded promise position, so a
-///   restart mid-sleep resumes at the recorded timer, the recorded decision,
-///   and the recorded tick result — never a re-derived wall-clock one.
-/// - The catch-up decision (which tick to fire) is a RECORDED child result:
-///   on wake after downtime, replay returns the ORIGINAL decision (the
-///   most-recent due tick at-or-before the original wake), so the loop fires
-///   exactly ONE tick — never a burst of every missed tick.
-/// - The tick body + policy side effects live in the [`run_cron_tick`] child:
-///   replay resolves the recorded child, so the workflow runs and the policy
-///   event is pushed exactly once per real tick (no phantom events on
-///   resume).
-#[resonate_sdk::function]
-async fn cron_loop(
-    ctx: &resonate_sdk::prelude::Context,
-    input: CronLoopInput,
-) -> resonate_sdk::prelude::Result<serde_json::Value> {
-    // The last tick we fired (unix seconds). Starts at the loop's birth time
-    // (or the input's `start_ts` hook), so the first tick is the next
-    // genuinely-future one (a naive 0 would catch up through every tick
-    // since epoch). Local + durable: replay re-derives it from the recorded
-    // tick results, so missed ticks are skipped — never replayed as a burst.
-    let mut last_fired: i64 = input.start_ts.unwrap_or_else(unix_now);
-
-    // Consecutive-failure streak (Spec 3 repeat policy). Durable local:
-    // replay re-derives it from the recorded tick results, so a crash
-    // mid-run never double-counts.
-    let mut consecutive: u32 = 0;
-
-    loop {
-        let now = unix_now();
-
-        // The next tick to FIRE under the effective catch-up policy — a
-        // RECORDED decision (replay returns the original). An unparsable
-        // expression → park forever (durable sleep is unbounded — a bad
-        // expr must not spin).
-        let due = ctx
-            .run(
-                decide_tick,
-                DecideInput {
-                    cron: input.cron.clone(),
-                    last_fired,
-                    now,
-                    catchup: input.catchup,
-                },
-            )
-            .await?;
-        let Some(due) = due else {
-            ctx.sleep(std::time::Duration::from_secs(86_400)).await?;
-            continue;
-        };
-
-        // Durable sleep until the tick. Issued EVERY iteration (even a
-        // zero-duration catch-up fire) so the terminal-op call pattern is
-        // identical across replay — an existing timer record wins on resume
-        // (idempotent create), so the ORIGINAL timer governs.
-        let secs = (due - now).max(0) as u64;
-        ctx.sleep(std::time::Duration::from_secs(secs)).await?;
-
-        // Fire the tick body (workflow run + policy side effects) as a
-        // durable child. On replay the RECORDED child resolves — the tick is
-        // never re-executed and its policy event never re-pushed.
-        let result = match ctx
-            .run(
-                run_cron_tick,
-                CronTickInput {
-                    name: input.name.clone(),
-                    cron: input.cron.clone(),
-                    workflow: input.workflow.clone(),
-                    owner: input.owner.clone(),
-                    scope: input.scope,
-                    tick: due,
-                    run_prefix: input.run_prefix.clone(),
-                    consecutive,
-                },
-            )
-            .await
-        {
-            Ok(r) => r,
-            // Function-level failure (a rejected promise — only reachable via
-            // a panic inside the tick child). Keep the scheduler alive and
-            // advance past the tick; the failure bundle is lost (the policy
-            // side effect lives in the child's first execution only).
-            Err(_e) => CronTickResult {
-                tick: due,
-                consecutive,
-                output: serde_json::json!({
-                    "status": "failed",
-                    "error": format!("cron tick {due} function errored"),
-                }),
-            },
-        };
-
-        // Advance the durable checkpoint (replay resumes here next).
-        last_fired = result.tick;
-        consecutive = result.consecutive;
-    }
-}
-
-/// Unix timestamp (seconds).
-fn unix_now() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
 }
 
 /// Next due tick (unix seconds) for a cron expression strictly after
@@ -577,113 +215,71 @@ fn dow_ordinal(d: &str) -> String {
         .map_or_else(|_| d.to_string(), |n| ((n % 7) + 1).to_string())
 }
 
-/// Drives the durable-sleep cron loops over a registry (Spec 3).
-///
-/// The manager is deliberately thin: it registers the durable [`cron_loop`]
-/// function on the engine's Resonate runtime once, then for each enabled
-/// registration starts a run `cron:{name}` (legacy) / `cron-spec:{name}`
-/// (ADR-0012 CronSpec). The loop itself owns the durable sleep, catch-up, and
-/// deterministic child ids — this type is the embedding's control surface.
-pub struct CronManager {
-    engine: Arc<crate::engine::WorkflowEngine>,
-    registry: CronRegistry,
-    spec_registry: Option<CronSpecRegistry>,
+/// The edge's bounded candidate set for one decision (bd-j32w): the
+/// latest due tick (if any) plus the next ticks from `now` and from
+/// `last_fired` — O(1) schedule reads, no gap enumeration. Shared by the
+/// durable child and the conformance battery below.
+#[cfg(test)]
+fn decide_candidates(cron: &str, last_fired: i64, now: i64) -> Vec<i64> {
+    let mut candidates = Vec::new();
+    for t in [
+        latest_due_at_or_before(cron, last_fired, now),
+        next_due(cron, now),
+        next_due(cron, last_fired),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if !candidates.contains(&t) {
+            candidates.push(t);
+        }
+    }
+    candidates
 }
 
-impl CronManager {
-    /// Construct over the engine + registry. Registers the durable loop
-    /// function (idempotent; re-registration is a no-op in Resonate).
-    pub fn new(engine: Arc<crate::engine::WorkflowEngine>, registry: CronRegistry) -> Result<Self> {
-        Self::with_spec_registry(engine, registry, None)
-    }
+/// The effective missed-tick policy for a spec (default `Latest`).
+#[cfg(test)]
+fn spec_catchup(spec: &CronSpec) -> CronCatchup {
+    spec.policy
+        .as_ref()
+        .map(|p| p.catchup)
+        .unwrap_or(CronCatchup::Latest)
+}
 
-    /// Like [`Self::new`] with an ADR-0012 spec registry: the manager also
-    /// drives `CronSpec`-based loops (`cron-spec:{name}` run ids, no
-    /// collision with the legacy `cron:{name}` namespace).
-    pub fn with_spec_registry(
-        engine: Arc<crate::engine::WorkflowEngine>,
-        registry: CronRegistry,
-        spec_registry: Option<CronSpecRegistry>,
-    ) -> Result<Self> {
-        engine
-            .resonate()
-            .register(cron_loop)
-            .context("register cron_loop durable function")?;
-        engine
-            .resonate()
-            .register(decide_tick)
-            .context("register decide_tick durable function")?;
-        engine
-            .resonate()
-            .register(run_cron_tick)
-            .context("register run_cron_tick durable function")?;
-        Ok(Self {
-            engine,
-            registry,
-            spec_registry,
-        })
-    }
-
-    /// Start (or resume) the durable loop for every enabled registration —
-    /// legacy AND spec-driven (when a spec registry is wired).
-    ///
-    /// Idempotent: re-invoking `cron:{name}` / `cron-spec:{name}` resumes the
-    /// SAME durable function — safe to call on every flywheel boot (restart
-    /// survival).
-    pub async fn start(&self) -> Result<()> {
-        for reg in (self.registry)().into_iter().filter(|r| r.enabled) {
-            let input = CronLoopInput {
-                name: reg.name,
-                cron: reg.cron,
-                workflow: reg.workflow,
-                owner: reg.owner,
-                scope: reg.scope,
-                catchup: CronCatchup::Latest,
-                run_prefix: "cron".to_string(),
-                start_ts: None,
-            };
-            let run_id = format!("cron:{}", input.name);
-            // Fire-and-forget: the loop's result is irrelevant; the durable
-            // function owns the repeating behavior. Errors (bad expr, etc.)
-            // are surfaced via the run's terminal event.
-            let _ = self
-                .engine
-                .resonate()
-                .run(&run_id, cron_loop, input)
-                .spawn()
-                .await;
+/// The next tick to FIRE under the effective catch-up policy (pure):
+/// - `Latest` (ADR-0005 Spec 3): the most-recent due tick at-or-before `now`
+///   strictly after `last_fired` — after downtime, ONE tick (never a burst);
+///   on-time, the next scheduled tick in the future.
+/// - `Skip` (ADR-0012): never fire a missed tick — the first due tick
+///   strictly after `last_fired` when it is still in the future, otherwise
+///   the first tick after `now` (downtime ticks are dropped).
+///
+/// `None` for an unparsable expression (the loop parks, never spins).
+///
+/// Legacy oracle for the kernel conformance tests below: production calls
+/// go through `cron_core`, tests pin this math. Only referenced under
+/// `cfg(test)`, hence the allow.
+#[allow(dead_code)]
+fn due_tick(cron: &str, last_fired: i64, now: i64, catchup: CronCatchup) -> Option<i64> {
+    match catchup {
+        CronCatchup::Latest => {
+            latest_due_at_or_before(cron, last_fired, now).or_else(|| next_due(cron, last_fired))
         }
-        if let Some(specs) = &self.spec_registry {
-            for reg in specs().into_iter().filter(|r| r.enabled) {
-                let spec = reg.spec;
-                let name = spec.name.clone();
-                let input = CronLoopInput {
-                    name: name.clone(),
-                    cron: spec.schedule.clone(),
-                    workflow: spec_tick_workflow(&spec),
-                    owner: spec.owner.clone(),
-                    scope: spec.scope,
-                    catchup: spec_catchup(&spec),
-                    run_prefix: "cron-spec".to_string(),
-                    start_ts: reg.start_ts,
-                };
-                let run_id = format!("cron-spec:{name}");
-                let _ = self
-                    .engine
-                    .resonate()
-                    .run(&run_id, cron_loop, input)
-                    .spawn()
-                    .await;
+        CronCatchup::Skip => {
+            let due = next_due(cron, last_fired)?;
+            if due <= now {
+                next_due(cron, now)
+            } else {
+                Some(due)
             }
         }
-        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::parse_cron;
+    use crate::schema::{FailureAction, parse_cron};
 
     /// next_due matrix: future tick, vixie Sunday-zero, strictly-after-from,
     /// garbage-is-none. One test (was 4).
@@ -941,368 +537,5 @@ mod tests {
         let out = serde_yaml::to_string(&reg).expect("serialize");
         assert!(!out.contains("cron-spec"));
         assert!(out.contains("name: w"));
-    }
-
-    // ---- live: real resonate server + remote engine (the P12.2 gate) ----
-
-    /// Boot a real `resonate serve` (sqlite storage in `dir`) + a remote
-    /// engine whose `call_workflow` resolves tiny child workflows. Returns
-    /// (server, engine); the caller keeps the server alive for the test's
-    /// duration.
-    async fn spec_engine(
-        dir: &std::path::Path,
-    ) -> Option<(
-        toron_core::testkit::ChildGuard,
-        std::sync::Arc<crate::engine::WorkflowEngine>,
-    )> {
-        use std::process::Command;
-        // GS-018: no `resonate` binary on this runner (herdr/resonate stack
-        // absent) — environmental skip, not a product failure.
-        if !Command::new("resonate")
-            .arg("--version")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-        {
-            return None;
-        }
-        let port = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
-        let url = format!("http://127.0.0.1:{port}");
-        // bd-6h9l: the guard kills and reaps at scope end, so a failing
-        // assertion or a cancelled test binary cannot orphan the server.
-        let server = toron_core::testkit::ChildGuard::resonate_serve(port, dir)
-            .expect("spawn resonate serve")
-            .expect("resonate binary present");
-        for _ in 0..200 {
-            if std::net::TcpStream::connect_timeout(
-                &format!("127.0.0.1:{port}").parse().expect("addr"),
-                std::time::Duration::from_millis(100),
-            )
-            .is_ok()
-            {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-        let afx: crate::engine::AsyncEffectRunner =
-            std::sync::Arc::new(|inv: &crate::engine::ActionInvocation| {
-                let value = serde_json::json!({ "ran": inv.action.type_name() });
-                Box::pin(async move { Ok(value) })
-                    as std::pin::Pin<
-                        Box<
-                            dyn std::future::Future<Output = anyhow::Result<serde_json::Value>>
-                                + Send,
-                        >,
-                    >
-            });
-        let workflow_resolver: crate::engine::WorkflowResolver = Arc::new(|name: &str| {
-            let yaml =
-                format!("name: {name}\nsteps:\n  - action: send_dm\n    to: t\n    body: ok\n");
-            crate::schema::parse_workflow(&yaml).ok()
-        });
-        let engine =
-            crate::engine::WorkflowEngine::remote_with_resolvers_async_effect_mode_and_journal(
-                url,
-                Arc::new(|_name: &str| None),
-                workflow_resolver,
-                Some(afx),
-                crate::engine::EffectJournalMode::Recording,
-                None,
-            )
-            .expect("engine");
-        Some((server, std::sync::Arc::new(engine)))
-    }
-
-    /// bd-a6e5: a timeout returns the sink state (count + ticks) instead of a
-    /// bare `None`, so a load-starved miss self-names instead of panicking
-    /// message-free. Deadline uses `>=` so a 0s bound times out deterministically.
-    async fn wait_for_event(sink: &PolicySink, timeout_secs: u64) -> Result<PolicyEvent, String> {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
-        loop {
-            {
-                let guard = sink.lock().await;
-                if let Some(e) = guard.first() {
-                    return Ok(e.clone());
-                }
-            }
-            if std::time::Instant::now() >= deadline {
-                let ticks: Vec<i64> = sink.lock().await.iter().map(|e| e.tick).collect();
-                return Err(format!(
-                    "no event after {timeout_secs}s; sink holds {} event(s), ticks={ticks:?}",
-                    ticks.len()
-                ));
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        }
-    }
-
-    /// bd-a6e5: a timeout must NAME the sink state. The one miss in 21
-    /// isolated runs (33.56s, matching the old 30s bound under post-suspend
-    /// load) panicked with no diagnostic at all.
-    #[tokio::test]
-    async fn wait_for_event_timeout_names_the_sink_state() {
-        let sink = PolicySink::new();
-        let err = wait_for_event(&sink, 0)
-            .await
-            .expect_err("an empty sink must time out");
-        assert!(err.contains("no event after 0s"), "{err}");
-        assert!(err.contains("sink holds 0 event(s)"), "{err}");
-    }
-
-    /// bd-0lyz: resume/catchup dedup is about tick IDENTITY, not a raw
-    /// event count. The old `count == 1` misread a legitimate later minute
-    /// boundary that landed inside the observation window while the suite
-    /// ran under workspace-parallel load as a duplicate. A re-fired tick,
-    /// any tick predating the caught-up one (a catchup burst), or any
-    /// repeated tick still fails here.
-    fn assert_no_duplicate_ticks(ticks: &[i64], first: i64, phase: &str) {
-        assert!(!ticks.is_empty(), "{phase}: no tick recorded");
-        assert_eq!(
-            ticks[0], first,
-            "{phase}: first event must be the caught-up tick (ticks: {ticks:?})"
-        );
-        let mut seen = std::collections::BTreeSet::new();
-        for t in ticks {
-            assert!(
-                seen.insert(*t),
-                "{phase}: tick {t} fired twice (ticks: {ticks:?})"
-            );
-            assert!(
-                *t >= first,
-                "{phase}: tick {t} predates the caught-up {first} — catchup burst? (ticks: {ticks:?})"
-            );
-        }
-    }
-
-    /// bd-j4pe: catchup `latest` contract — the fired tick is the most-recent
-    /// MISSED minute boundary at the catchup instant: a real boundary, at or
-    /// after the first missed tick, never after "now". A fixed `t1 + 60`
-    /// expectation misreads a correct late-reboot catchup (t1 + 120) as a
-    /// burst under workspace load — count-vs-semantics, same class as bd-0lyz.
-    fn assert_catchup_latest(tick: i64, first_missed: i64, catchup_now: i64, phase: &str) {
-        assert_eq!(tick % 60, 0, "{phase}: {tick} must be a minute boundary");
-        assert!(
-            tick >= first_missed,
-            "{phase}: caught up at least to the first missed tick (got {tick}, want >= {first_missed})"
-        );
-        assert!(
-            tick <= catchup_now,
-            "{phase}: catchup fires past ticks only (got {tick}, now {catchup_now})"
-        );
-    }
-
-    /// The load scenario that broke the old count assertion (bd-0lyz): a
-    /// real minute boundary lands inside the observation window.
-    #[test]
-    fn later_boundary_is_not_a_duplicate() {
-        assert_no_duplicate_ticks(&[120], 120, "resume");
-        assert_no_duplicate_ticks(&[120, 180], 120, "resume");
-    }
-
-    /// A resume re-firing the caught-up tick still fails loud.
-    #[test]
-    #[should_panic(expected = "fired twice")]
-    fn re_fired_tick_fails_loud() {
-        assert_no_duplicate_ticks(&[120, 120], 120, "resume");
-    }
-
-    /// An earlier missed tick surfacing (catchup burst) still fails loud.
-    #[test]
-    #[should_panic(expected = "catchup burst")]
-    fn earlier_burst_tick_fails_loud() {
-        assert_no_duplicate_ticks(&[120, 60], 120, "resume");
-    }
-
-    /// bd-j4pe: a reboot that outlasts a minute must be ALLOWED — catchup
-    /// `latest` fires t1+120 and that is correct, not a burst.
-    #[test]
-    fn catchup_latest_allows_late_reboot_across_boundaries() {
-        assert_catchup_latest(1_800, 1_680, 1_810, "late reboot");
-    }
-
-    #[test]
-    #[should_panic(expected = "minute boundary")]
-    fn catchup_latest_rejects_non_boundary() {
-        assert_catchup_latest(1_700, 1_680, 1_810, "x");
-    }
-
-    #[test]
-    #[should_panic(expected = "first missed")]
-    fn catchup_latest_rejects_under_catchup() {
-        assert_catchup_latest(1_620, 1_680, 1_810, "x");
-    }
-
-    #[test]
-    #[should_panic(expected = "past ticks")]
-    fn catchup_latest_rejects_future_tick() {
-        assert_catchup_latest(1_800, 1_680, 1_740, "x");
-    }
-
-    /// bd-e03q RED (ADR-0035 Spec 4): the registry is queried fresh on
-    /// every start — no snapshot is cached, so edited specs take effect at
-    /// the next start with nothing to invalidate.
-    #[tokio::test]
-    async fn registry_is_queried_fresh_on_every_start() {
-        let calls = std::sync::Arc::new(std::sync::Mutex::new(0usize));
-        let calls2 = calls.clone();
-        let registry: CronRegistry = std::sync::Arc::new(move || {
-            *calls2.lock().unwrap() += 1;
-            Vec::new()
-        });
-        let engine = std::sync::Arc::new(
-            crate::engine::WorkflowEngine::local_with_async_effect_runner(Some(
-                std::sync::Arc::new(|inv: &crate::engine::ActionInvocation| {
-                    let value = serde_json::json!({ "ran": inv.action.type_name() });
-                    Box::pin(async move { Ok(value) })
-                        as std::pin::Pin<
-                            Box<
-                                dyn std::future::Future<Output = anyhow::Result<serde_json::Value>>
-                                    + Send,
-                            >,
-                        >
-                }),
-            ))
-            .expect("local engine"),
-        );
-        let manager = CronManager::new(engine, registry).expect("manager");
-        manager.start().await.expect("first start");
-        manager.start().await.expect("second start");
-        assert_eq!(
-            *calls.lock().unwrap(),
-            2,
-            "one live query per start, never a cached snapshot"
-        );
-    }
-
-    /// The P12.2 gate: a CronSpec runs as a Resonate durable function —
-    /// schedule via ctx.sleep, body via the SHARED engine (`call_workflow`
-    /// children execute), catchup `latest` on wake after downtime, and
-    /// resume-dedup (re-starting the loop never double-fires a tick).
-    #[tokio::test]
-    async fn cron_spec_loop_fires_tick_with_catchup_and_resume_dedup() {
-        use std::time::Duration;
-        let dir = std::env::temp_dir().join(format!("cron-spec-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let Some((mut server, engine)) = spec_engine(&dir).await else {
-            eprintln!(
-                "SKIP: no `resonate` binary (needs herdr/resonate stack; runs on dev machines)"
-            );
-            return;
-        };
-
-        let spec = parse_cron(
-            r##"
-name: weekly-upgrade
-schedule: "* * * * *"
-owner: housekeeper
-scope: host
-policy:
-  on_success: log
-  max_retries: 0
-  no_claim_timeout: 600
-  catchup: latest
-steps:
-  - { name: probe,  action: call_workflow, workflow: health-check }
-  - { name: upgrade, action: call_workflow, workflow: docker-upgrade }
-  - { name: verify, action: call_workflow, workflow: health-check }
-"##,
-        )
-        .expect("spec parses");
-        let start_ts = unix_now() - 90;
-
-        let spec1 = spec.clone();
-        let spec_registry: CronSpecRegistry = Arc::new(move || {
-            vec![CronSpecRegistration {
-                spec: spec1.clone(),
-                enabled: true,
-                start_ts: Some(start_ts),
-            }]
-        });
-        let empty: CronRegistry = Arc::new(Vec::new);
-        let manager = CronManager::with_spec_registry(engine.clone(), empty, Some(spec_registry))
-            .expect("manager");
-        let sink = engine.policy_sink().clone();
-
-        // Start → the loop catches up to the most-recent due tick (inside the
-        // 90s downtime window) and runs the body through the shared engine.
-        manager.start().await.expect("start");
-        let event = wait_for_event(&sink, 60)
-            .await
-            .unwrap_or_else(|e| panic!("first tick event: {e}"));
-        let t1 = event.tick;
-        assert!(
-            t1 <= unix_now() && t1 >= start_ts,
-            "catchup latest fires the most-recent due tick in the window (t1={t1}, start={start_ts})"
-        );
-        let out = event.output.as_ref().expect("tick output rides along");
-        assert!(
-            out.get("probe").is_some()
-                && out.get("upgrade").is_some()
-                && out.get("verify").is_some(),
-            "call_workflow body executed via the shared engine: {out:?}"
-        );
-
-        // Re-start (same run id) → resume, NO duplicate dispatch for the tick.
-        manager.start().await.expect("resume");
-        tokio::time::sleep(Duration::from_secs(3)).await;
-        let ticks: Vec<i64> = {
-            let guard = sink.lock().await;
-            guard.iter().map(|e| e.tick).collect()
-        };
-        assert_no_duplicate_ticks(&ticks, t1, "resume");
-
-        // Downtime: kill the server, wait past the NEXT tick boundary, reboot
-        // (same sqlite dir) + new engine → the loop resumes and catchup
-        // `latest` fires the single most-recent missed tick (never a burst).
-        let next_tick = t1 + 60;
-        server.kill();
-        while unix_now() < next_tick + 2 {
-            tokio::time::sleep(Duration::from_millis(500)).await;
-        }
-        let Some((server2, engine2)) = spec_engine(&dir).await else {
-            eprintln!(
-                "SKIP: no `resonate` binary (needs herdr/resonate stack; runs on dev machines)"
-            );
-            return;
-        };
-        server = server2;
-        let spec2 = spec.clone();
-        let spec_registry2: CronSpecRegistry = Arc::new(move || {
-            vec![CronSpecRegistration {
-                spec: spec2.clone(),
-                enabled: true,
-                start_ts: Some(start_ts),
-            }]
-        });
-        let empty2: CronRegistry = Arc::new(Vec::new);
-        let manager2 =
-            CronManager::with_spec_registry(engine2.clone(), empty2, Some(spec_registry2))
-                .expect("manager2");
-        manager2.start().await.expect("resume after restart");
-        let sink2 = engine2.policy_sink().clone();
-        let event2 = wait_for_event(&sink2, 60)
-            .await
-            .unwrap_or_else(|e| panic!("catchup event after restart: {e}"));
-        // bd-j4pe: assert the catchup CONTRACT (properties), not a fixed
-        // next_tick — under load the reboot can outlast a minute and
-        // catchup:latest correctly fires the later boundary.
-        assert_catchup_latest(event2.tick, next_tick, unix_now(), "post-restart catchup");
-        tokio::time::sleep(Duration::from_secs(3)).await;
-        let ticks: Vec<i64> = {
-            let guard = sink2.lock().await;
-            guard.iter().map(|e| e.tick).collect()
-        };
-        assert_eq!(
-            ticks.len(),
-            1,
-            "catchup fired exactly ONE tick — no burst (ticks: {ticks:?})"
-        );
-        assert_no_duplicate_ticks(&ticks, event2.tick, "post-restart catchup");
-
-        server.kill();
     }
 }

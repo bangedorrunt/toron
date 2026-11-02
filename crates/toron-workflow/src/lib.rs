@@ -41,7 +41,7 @@ pub use channels::{
     CHANNEL_MESSAGE_LEGACY, CHANNEL_METADATA_LEGACY, Channel, ChannelEvent, ChannelStore, REACTION,
 };
 pub use cron::{
-    CronManager, CronRegistration, CronRegistry, CronSpecRegistration, CronSpecRegistry,
+    CronRegistration, CronRegistry, CronSpecRegistration, CronSpecRegistry,
     latest_due_at_or_before, next_due,
 };
 pub use cron_elm::{CronFire, ElmCron};
@@ -57,9 +57,8 @@ pub use coalesce::{
 };
 pub use dispatch::{DispatchAcquire, DispatchConfig, DispatchPermit, DispatchPool, QueuedJob};
 pub use engine::{
-    Decision, GraphNodeInput, ParallelCopyInput, ProfileResolver, RunInput, SpawnSink,
-    WorkflowEngine, WorkflowResolver, build_workflow_run_terminal, run_graph_node,
-    run_parallel_copy, run_workflow, stamp_workflow_emitted,
+    Decision, ProfileResolver, RunInput, SpawnSink, WorkflowEngine, WorkflowResolver,
+    build_workflow_run_terminal, stamp_workflow_emitted,
 };
 pub use guard::{
     DEFAULT_TIMEOUT_MS, GuardOutcome, evaluate_guard, evaluate_guard_default,

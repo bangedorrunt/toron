@@ -23,8 +23,6 @@
 //!   fail-closed, `Recording` marks the value with
 //!   [`EFFECT_JOURNAL_BYPASSED`] and performs nothing (ADR-0032 Spec 6).
 
-use resonate_sdk::prelude::Context;
-
 use crate::schema::Action;
 
 use super::{
@@ -50,21 +48,7 @@ pub struct LeafSeams {
     pub journal_mode: EffectJournalMode,
 }
 
-impl LeafSeams {
-    /// Read the seams from the engine's dependency map — the existing path.
-    ///
-    /// Panics when a seam the engine always injects is absent (the SDK's
-    /// `get_dependency` contract), except the two runners, which the engine
-    /// deliberately injects as `Option`.
-    pub fn from_context(ctx: &Context) -> Self {
-        Self {
-            async_runner: (*ctx.get_dependency::<Option<AsyncEffectRunner>>()).clone(),
-            sync_runner: (*ctx.get_dependency::<Option<EffectRunner>>()).clone(),
-            verify_sink: (*ctx.get_dependency::<VerifySink>()).clone(),
-            journal_mode: *ctx.get_dependency::<EffectJournalMode>(),
-        }
-    }
-}
+impl LeafSeams {}
 
 /// Dispatch one HostSink leaf against an explicit seam set.
 ///
