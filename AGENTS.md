@@ -144,7 +144,7 @@ mbx test --workspace
 mbx test catalog_freshness
 PATH="$PWD/target/debug:$PATH" toron catalog --json
 mbx test -p toron-e2e --features p1   # SC-1..8
-mbx test -p toron-e2e --features p2   # needs resonate on PATH
+mbx test -p toron-e2e --features p2   # no server needed; durable runs over local sqlite
 mbx test -p toron-e2e --features p4   # SC-18..25
 mbx clippy --workspace --all-targets -- -D warnings
 mbx fmt --check

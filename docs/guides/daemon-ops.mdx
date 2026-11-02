@@ -19,7 +19,7 @@ $ flywheel deps
 br: idle
 bv: idle
 hc: idle
-resonate server: idle
+engine store: idle
 mail (toron): idle
 config: /Users/you/.config/flywheel/config.toml
 ```
@@ -41,7 +41,7 @@ Default bind `127.0.0.1:18080`, label `com.toron.serve`. macOS runs launchd (`~/
 ## Health
 
 ```bash
-toron doctor [--check]     # hc, git, keys, resonate; exit 3 on any failure with --check
+toron doctor [--check]     # hc, git, keys, engine store; exit 3 on any failure with --check
 toron status --json        # quick health/config overview
 toron metrics              # in-process operator counters: tool calls, errors, latency
 toron catalog --json       # the tool / resource / CLI contract

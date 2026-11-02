@@ -42,10 +42,10 @@ you mean to keep (`mv` is spelled out in the message) rather than letting two
 exist. The secret is a path in `TORON_OPERATOR_KEY`, so a typo reads as "not
 configured" rather than as a bad key. `key generate` refuses to overwrite an
 existing key (exit 1, bytes untouched), so a re-run needs the old file moved
-first. `FAIL resonate` is not toron's problem to fix: the check reads the
-resolved server's `/health` (over TLS when the server is https) and refuses to
-invent a green instead of degrading silently. `doctor --check` exits 3
-when any check failed, so a wrapper can gate on the exit code alone.
+first. `FAIL engine store` is a local problem to fix: the check opens the
+engine-store sqlite, parks a scratch run, and drains its wake — a missing or
+unwritable store reads as DOWN, never as silent success. `doctor --check`
+exits 3 when any check failed, so a wrapper can gate on the exit code alone.
 
 `FAIL daemon_build` is the one red you can cause yourself, and it is the only
 check that knows what the daemon is *running*. A process keeps executing the

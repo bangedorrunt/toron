@@ -14,7 +14,7 @@ with no orchestrator in the hot path.
    ┌─────────────────── toron-core (embedded in flywheel) ───────────────────┐
    │                                                                         │
    │   Mailbox (38 tools, 25 resources) ──▶ Nostr events ──▶ Bus            │
-   │   Workflow engine (Resonate) ──▶ triggers/actions │                      │
+   │   Workflow engine (in-house durable) ──▶ triggers/actions │               │
    │   Backend trait ──▶ hc                                                  ▼ │
    │                                      InProcessBus (tokio broadcast+SQLite)│
    │   toron-mcp server ◀── MCP (stdio/HTTP) ── agents    │ (opt. RelayBus→relay)│
@@ -47,12 +47,12 @@ raises the ceiling with Nostr:
 | Identity | self-asserted names | Schnorr npub | **Schnorr npub** |
 | Mail privacy | plaintext SQLite | plaintext relay (membership-gated) | **NIP-17 E2E gift-wrap** |
 | Delivery | poll inbox | relay push | **bus push (sub-50ms)** |
-| Automation | none | YAML workflow (in-process, approval can't resume) | **Resonate-backed workflow (crash-survivable)** |
+| Automation | none | YAML workflow (in-process, approval can't resume) | **Durable workflow (crash-survivable, no server)** |
 | Federation | impossible | single owned relay | **opt-in multi-relay** |
 | Footprint | one process | Postgres + Redis + relay | **one embedded process** |
 
-toron = AM-Rust's tool surface + Nostr's trust/privacy/federation + Resonate's
-durability + flywheel's hc swarm orchestration.
+toron = AM-Rust's tool surface + Nostr's trust/privacy/federation + in-house
+durable execution + flywheel's hc swarm orchestration.
 
 ---
 
@@ -92,7 +92,7 @@ human-auditable archive; two-source disaster recovery (Git + relay replay).
 - **Channels (NIP-29)** — collaboration rooms; membership is the only access
   gate. A project is a channel; sub-channels for sub-topics. Sits alongside
   private DMs (you get both).
-- **`toron-workflow` (Resonate-backed)** — channel/project-scoped YAML
+- **`toron-workflow` (durable, in-process)** — channel/project-scoped YAML
   automation. Triggers on bus events (`message_posted`, `reaction_added`,
   `reservation_acquired/_released`, `agent_state_changed`, `schedule`,
   `webhook`); actions publish events (`send_message`, `send_dm`, `react`,
@@ -106,7 +106,7 @@ human-auditable archive; two-source disaster recovery (Git + relay replay).
 - **Standalone cron (ADR-0012)** — a FIRST-CLASS scheduled primitive DISTINCT
   from workflow (not "a workflow with a schedule trigger"). A `CronSpec`
   (schedule + owner + scope + policy + a steps body composing workflows via
-  `call_workflow`) runs on the SHARED engine as a Resonate `ctx.sleep`
+  `call_workflow`) runs on the SHARED engine as an in-house durable park
   durable-sleep function (`CronManager` + `run_cron_tick`, `catchup: latest`
   on wake). One engine, two input types (workflow YAML + cron YAML). The
   flywheel CLI drives user-dir cron YAMLs (`cron lint/run/list/...`).
@@ -168,7 +168,7 @@ visibility + the channel-as-PR UX. Kind numbers reserved.
              Agent claims (43002), works, posts result (43004) — peer-to-peer.
 
 5. AUTOMATE  A YAML workflow triggers on any bus event (e.g. reaction_added,
-             reservation_released) → runs Resonate-durable steps → publishes
+             reservation_released) → runs durable steps → publishes
              events back. Approval gates suspend + resume across crashes.
 
 6. AUDIT     Every transition lands in the Git archive (human-readable) AND on
@@ -183,7 +183,7 @@ agent states, and respawns on context exhaustion — all as bus events.
 
 Three event-driven patterns, no orchestrator polling: **(1) subscription-push**
 — an agent holds a bus subscription and reacts to mail/`@mention`/reactions;
-**(2) workflow-as-reaction** — a bus event triggers a Resonate-durable workflow
+**(2) workflow-as-reaction** — a bus event triggers a durable workflow
 (`reservation_released` → `dispatch_job`, `reaction_added` → notify, …);
 **(3) cascade/handoff** — one agent's completion auto-starts the next.
 
@@ -206,7 +206,6 @@ CI gate: P1 green tags v1; P2 green tags Phase 2.
 
 - Rust (stable), Cargo.
 - A running **hc** server (socket under `herdr-core/`) for the default backend. `flywheel deps` checks it.
-- (Optional) a **Resonate** server for durable workflows (Phase 2).
 
 ### Build
 
@@ -238,9 +237,8 @@ toron --robot-status --json                  # robot CLI parity
 The daemon lifecycle is managed by `toron daemon` (ADR-0009): launchd on
 macOS, systemd user units on Linux, pidfile+spawn fallback elsewhere. The
 passphrase lives in `~/.config/toron/passphrase` (0600) — unit files never
-carry the secret. The workflow engine defaults to the remote Resonate server
-(`https://resonate.example-tailnet.ts.net`), falls back to
-`http://localhost:8001`, then embedded local mode; pin with `RESONATE_URL`.
+carry the secret. The workflow engine is in-process over the local sqlite
+engine store — no server to run, pin, or probe.
 
 Agents connect to toron's MCP endpoint and collaborate peer-to-peer.
 
@@ -312,7 +310,7 @@ toron/                           # Cargo workspace (governed-by ADR-0003)
 │   ├── toron-core/              # lib: nostr, bus, index, archive, mailbox, backend, keys
 │   ├── toron-mcp/               # lib: MCP server (stdio+HTTP/axum), 38 tools + 25 resources
 │   ├── toron-cli/               # bin: daemon + CLI (robot mode, metrics; TUI Phase 2)
-│   ├── toron-workflow/          # Phase 2: Resonate-backed YAML automation
+│   ├── toron-workflow/          # Phase 2: durable YAML automation (in-house engine)
 │   └── toron-e2e/              # scenario suite (SC-1..SC-25, feature-gated gates)
 ├── examples/
 ├── tests/                       # AM-Rust conformance + integration
@@ -332,7 +330,7 @@ directly; the search layer never calls the archive; etc.
   git-first per G11), hc backend,
   flywheel embedding.
 - **Phase 2** (ordered: workflow+@mention → channels → persona/presence) —
-  `toron-workflow` (Resonate) + @mention dispatch + job lifecycle (`43001`→`43002`→`43003`→`43004`),
+  `toron-workflow` (in-house durable engine) + @mention dispatch + job lifecycle (`43001`→`43002`→`43003`→`43004`),
   then NIP-29 channels, then ephemeral presence + persona packs, then TUI.
 - **Phase 3** — Forge (agent code-collab as signed events).
 
@@ -382,7 +380,7 @@ Version bumps derive from commit types: `feat` → minor, `fix`/`perf` → patch
 - Nostr protocol: [nostr.how](https://nostr.how/en/the-protocol) · [NIPs](https://github.com/nostr-protocol/nips) (01/09/17/25/29/40/44/49/50/59)
 - Rust SDK: [`rust-nostr/nostr`](https://github.com/rust-nostr/nostr) (= `nostrdevkit/nostr`)
 - Backend: [hc](https://herdr.dev/core/) · consumer: [`flywheel`](../flywheel)
-- Durability: [Resonate](https://resonatehq.io)
+- Durability: in-house engine ([ADR-0043](docs/decisions/0043-replace-resonate-with-the-in-house-durable-engine.md))
 
 ## License
 
