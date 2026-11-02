@@ -533,6 +533,14 @@ pub async fn serve_stdio() -> anyhow::Result<()> {
     let _lock = crate::serve_lock::acquire(&toron_core::config::mailbox_root(mailbox.data_dir()))?;
     // Held across `running.waiting()` below: drop removes wake.sock (RAII).
     let _wake = start_wake_sidecar(&mailbox).await;
+    // bd-lease-liveness-oracle-ro8i: the daemon vouches holders that polled
+    // recently (inbox_cursors join), so an expired lease held by a LIVE
+    // agent still blocks. Held across the serve: drop aborts the 15 s
+    // refresh task and clears the oracle (shutdown hygiene).
+    let _liveness = toron_core::mailbox::lease_liveness::install_for_daemon_default_ttl(
+        mailbox.index_pool(),
+    )
+    .await;
     let hosts = spawn_mail_trigger_host(mailbox.clone(), trigger_rx);
     let server = ToronServer::new().with_mailbox(mailbox);
     let running = server.serve(rmcp::transport::stdio()).await?;
@@ -687,6 +695,12 @@ pub async fn serve_http(bind_addr: &str, extra_hosts: &[String]) -> anyhow::Resu
     // address (a healthy HttpPeer instance already returned above and keeps
     // its own sidecar); held across the serve await — drop removes the file.
     let _wake = start_wake_sidecar(&mailbox).await;
+    // bd-lease-liveness-oracle-ro8i: see serve_stdio — same oracle, same
+    // guard lifetime (drop aborts the refresh and clears the checker).
+    let _liveness = toron_core::mailbox::lease_liveness::install_for_daemon_default_ttl(
+        mailbox.index_pool(),
+    )
+    .await;
     let (router, hosts) = router_with_mailbox(mailbox, trigger_rx, extra_hosts).await?;
     axum::serve(listener, router)
         .with_graceful_shutdown(shutdown_signal())

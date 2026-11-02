@@ -3555,6 +3555,75 @@ mod tests {
         let _ = peer;
     }
 
+    /// bd-lease-liveness-oracle-ro8i: the daemon's oracle vouches holders
+    /// from the inbox-cursor join — an expired MIRROR lease (no bus event,
+    /// so no sleeps and no TTL waits) still blocks while its holder polled
+    /// recently, and clears the moment the holder goes quiet. No oracle →
+    /// pure NIP-40 (expired = clear). All clocks injected, zero sleeps.
+    #[tokio::test]
+    async fn expired_mirror_blocks_iff_holder_in_liveness_map() {
+        use crate::mailbox::lease_liveness::read_activity_snapshot;
+        let (mailbox, db_path, data_dir) = test_mailbox("oracle-ro8i").await;
+        let holder = register(&mailbox, "demo", "BlueLake").await;
+        register(&mailbox, "demo", "RoseDune").await;
+        let holder_hex = holder.to_hex();
+        let pool = mailbox.index_pool().expect("pool").clone();
+        let now_us = Timestamp::now().as_secs() as i64 * 1_000_000;
+        // Expired mirror row with NO bus event: the resurrection path only.
+        sqlx::query(
+            "INSERT INTO file_reservations (project_slug, agent_name, agent_pubkey, \
+             path_pattern, exclusive, reason, status, expires_ts_us, created_ts_us) \
+             VALUES ('demo', 'BlueLake', ?1, 'src/oracle.rs', 1, 'bd-lease-liveness-oracle-ro8i', \
+             'active', ?2, ?3)",
+        )
+        .bind(&holder_hex)
+        .bind(now_us - 60_000_000)
+        .bind(now_us - 3_600_000_000)
+        .execute(&pool)
+        .await
+        .expect("mirror row");
+        // BlueLake polled just now — the snapshot vouches exactly it.
+        sqlx::query(
+            "INSERT INTO inbox_cursors (project_slug, agent_name, plane, last_seen_us) \
+             VALUES ('demo', 'BlueLake', 'P', ?1)",
+        )
+        .bind(now_us)
+        .execute(&pool)
+        .await
+        .expect("cursor");
+        let map = read_activity_snapshot(&pool, DEFAULT_RESERVATION_TTL_SECS, now_us).await;
+        assert!(map.contains_key(&holder_hex), "snapshot vouches: {map:?}");
+        install_lease_liveness_checker(std::sync::Arc::new(move |pubkey_hex| {
+            pubkey_hex == holder_hex
+        }));
+        let report = mailbox
+            .check_file_reservation_conflicts("demo", "RoseDune", &["src/oracle.rs".into()])
+            .await
+            .expect("conflict check");
+        let hit = report
+            .conflicts
+            .iter()
+            .find(|c| c.path == "src/oracle.rs")
+            .expect("live holder keeps the expired lease blocking");
+        assert!(
+            hit.holders.iter().any(|h| h == "BlueLake"),
+            "peer named as holder: {hit:?}"
+        );
+        // Holder gone quiet (empty map) → expiry frees the path again.
+        install_lease_liveness_checker(std::sync::Arc::new(|_| false));
+        let report = mailbox
+            .check_file_reservation_conflicts("demo", "RoseDune", &["src/oracle.rs".into()])
+            .await
+            .expect("conflict check");
+        assert!(
+            report.conflict_free && report.clear_paths.contains(&"src/oracle.rs".to_string()),
+            "quiet holder stops blocking at expiry: {report:?}"
+        );
+        clear_lease_liveness_checker();
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
     /// bd-slot-visibility-gv17: the pre-write collision check must expose
     /// ACTIVE build-slot holders — an agent about to run the VERIFY fence
     /// discovers a held cargo slot in ONE call. Own slots are excluded
