@@ -9526,6 +9526,34 @@ steps:
             assert!(err.contains("call_workflow"), "{err}");
         }
 
+        /// bd-durable-retry-policy-rrck: a `steps:` retry policy runs on the
+        /// graph driver; an unparseable policy refuses before any row.
+        #[test]
+        fn a_retry_steps_workflow_routes_to_the_graph() {
+            let mut wf = linear_workflow();
+            wf.steps = vec![Step {
+                name: Some("flaky".into()),
+                guard: None,
+                on_error: StepOnError::FailRun,
+                build_slot: false,
+                action: Action::Retry {
+                    max_attempts: 3,
+                    backoff_secs: 0,
+                    step: Box::new(linear_step()),
+                },
+            }];
+            assert!(durable_route(&wf, true, false).is_ok());
+
+            let mut bad = wf.clone();
+            bad.steps[0].action = Action::Retry {
+                max_attempts: 0,
+                backoff_secs: 0,
+                step: Box::new(linear_step()),
+            };
+            let err = durable_route(&bad, true, false).expect_err("zero attempts");
+            assert!(err.contains("at least 1"), "{err}");
+        }
+
         /// bd-durable-foreach-jpgx: a `steps:` foreach shares the fan-out
         /// path, so the router admits it to the graph driver; an item the
         /// graph cannot sequence refuses whole.
@@ -9606,7 +9634,7 @@ steps:
                 },
             );
             let err = durable_route(&mixed, true, true).expect_err("the mix refuses");
-            assert!(err.contains("mixes fan-out"), "{err}");
+            assert!(err.contains("mixes graph-lowered steps"), "{err}");
         }
 
         /// Static refusal: a cyclic graph never gets a durable row — the old

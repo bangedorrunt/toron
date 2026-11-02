@@ -1539,9 +1539,9 @@ fn parallel_refuses_mixes_and_unsequencable_copies() {
     ]);
     assert!(needs_graph_model(&mixed));
     let reason = unsupported_reason(&mixed).expect("the mix refuses");
-    assert!(reason.contains("mixes fan-out"), "{reason}");
+    assert!(reason.contains("mixes graph-lowered steps"), "{reason}");
     let reason = durable_graph(&mixed, &json!({})).expect_err("lowering refuses the mix");
-    assert!(reason.contains("mixes fan-out"), "{reason}");
+    assert!(reason.contains("mixes graph-lowered steps"), "{reason}");
 
     // Mix: branch + parallel (the linear branch is the same refusal).
     let mixed = workflow(vec![
@@ -1559,7 +1559,7 @@ fn parallel_refuses_mixes_and_unsequencable_copies() {
         ),
     ]);
     let reason = durable_graph(&mixed, &json!({})).expect_err("branch + parallel refuses");
-    assert!(reason.contains("mixes fan-out"), "{reason}");
+    assert!(reason.contains("mixes graph-lowered steps"), "{reason}");
 
     // Unsequencable copy action.
     let bad = workflow(vec![parallel(
@@ -1834,5 +1834,254 @@ fn foreach_unmaterializable_iterator_refuses_without_row() {
         ),
     ]);
     let reason = durable_graph(&mixed, &json!({})).expect_err("the mix refuses");
-    assert!(reason.contains("mixes fan-out with 'spawn'"), "{reason}");
+    assert!(
+        reason.contains("mixes graph-lowered steps with 'spawn'"),
+        "{reason}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Retry policy on graph nodes (bd-durable-retry-policy-rrck)
+// ---------------------------------------------------------------------------
+
+fn retry_step(
+    name: &str,
+    inner: Step,
+    max_attempts: u32,
+    backoff_secs: u64,
+    on_error: StepOnError,
+) -> Step {
+    Step {
+        name: Some(name.into()),
+        guard: None,
+        on_error,
+        build_slot: false,
+        action: Action::Retry {
+            max_attempts,
+            backoff_secs,
+            step: Box::new(inner),
+        },
+    }
+}
+
+fn retry_workflow(max_attempts: u32, on_error: StepOnError) -> Workflow {
+    workflow(vec![retry_step(
+        "flaky",
+        named("call", dm("call"), StepOnError::Continue),
+        max_attempts,
+        0,
+        on_error,
+    )])
+}
+
+/// A `retry:` policy retries ANY failure until `max_attempts`, then the
+/// wrapper's `on_error` fails the run with the attempt count.
+#[test]
+fn retry_policy_exhaustion_reports_attempts() {
+    let model = lowered_model(
+        "run-retry",
+        retry_workflow(2, StepOnError::FailRun),
+        json!({}),
+    );
+    assert!(
+        needs_graph_model(&model.workflow),
+        "retry runs on the graph"
+    );
+    let (model, effects) = advance_graph(&model, &GraphMsg::Start { now_ms: 1_000 });
+    let [
+        GraphEffect::ExecuteNode {
+            node, attempt: 1, ..
+        },
+    ] = effects.as_slice()
+    else {
+        panic!("attempt 1 dispatches: {effects:?}");
+    };
+    assert_eq!(node, "flaky");
+
+    let failure = json!({"ok": false, "kind": "rate_limit", "error": "slow down"});
+    let (model, effects) = advance_graph(
+        &model,
+        &GraphMsg::NodeDone {
+            node: "flaky".into(),
+            value: failure.clone(),
+            now_ms: 2_000,
+        },
+    );
+    let [
+        GraphEffect::ParkUntil {
+            reason: NodeParkReason::Retry,
+            until_ms,
+            ..
+        },
+    ] = effects.as_slice()
+    else {
+        panic!("a failed attempt parks for retry: {effects:?}");
+    };
+    let until = *until_ms;
+
+    let (model, effects) = advance_graph(&model, &GraphMsg::Woke { now_ms: until });
+    let [
+        GraphEffect::ExecuteNode {
+            node, attempt: 2, ..
+        },
+    ] = effects.as_slice()
+    else {
+        panic!("attempt 2 re-dispatches: {effects:?}");
+    };
+    assert_eq!(node, "flaky");
+
+    let (model, effects) = advance_graph(
+        &model,
+        &GraphMsg::NodeDone {
+            node: "flaky".into(),
+            value: failure,
+            now_ms: until + 1_000,
+        },
+    );
+    let [GraphEffect::Fail { fail }] = effects.as_slice() else {
+        panic!("exhaustion fails the run: {effects:?}");
+    };
+    assert_eq!(fail.node, "flaky");
+    assert_eq!(fail.kind, "rate_limit");
+    assert_eq!(fail.attempts, Some(2), "the outer attempt count");
+    assert!(matches!(model.phase, GraphPhase::Failed { .. }));
+}
+
+/// The attempt and the backoff park survive a restart: resume re-issues the
+/// park (never a second dispatch of the same attempt), and the wake re-emits
+/// `ExecuteNode` with the SAME attempt identity.
+#[test]
+fn retry_backoff_park_is_restart_safe() {
+    let model = lowered_model(
+        "run-retry-restart",
+        retry_workflow(3, StepOnError::FailRun),
+        json!({}),
+    );
+    let (model, _) = advance_graph(&model, &GraphMsg::Start { now_ms: 1_000 });
+    let (model, effects) = advance_graph(
+        &model,
+        &GraphMsg::NodeDone {
+            node: "flaky".into(),
+            value: json!({"ok": false, "kind": "timeout", "error": "late"}),
+            now_ms: 2_000,
+        },
+    );
+    let [
+        GraphEffect::ParkUntil {
+            reason: NodeParkReason::Retry,
+            until_ms,
+            ..
+        },
+    ] = effects.as_slice()
+    else {
+        panic!("attempt 1 parks: {effects:?}");
+    };
+    assert!(matches!(
+        model.node_state["flaky"],
+        NodeState::Parked { attempt: 2, .. }
+    ));
+
+    let restored: GraphModel =
+        serde_json::from_str(&serde_json::to_string(&model).expect("serialize")).expect("restore");
+    let effects = resume_graph_effects(&restored);
+    let [
+        GraphEffect::ParkUntil {
+            reason: NodeParkReason::Retry,
+            until_ms: resumed_until,
+            ..
+        },
+    ] = effects.as_slice()
+    else {
+        panic!("resume re-issues the park, not a dispatch: {effects:?}");
+    };
+    assert_eq!(*resumed_until, *until_ms);
+
+    let (restored, effects) = advance_graph(&restored, &GraphMsg::Woke { now_ms: *until_ms });
+    let [
+        GraphEffect::ExecuteNode {
+            node,
+            attempt: 2,
+            inputs,
+            ..
+        },
+    ] = effects.as_slice()
+    else {
+        panic!("the wake re-dispatches attempt 2: {effects:?}");
+    };
+    assert_eq!(node, "flaky");
+    assert!(inputs.is_empty(), "the first-step snapshot is unchanged");
+
+    // A success on the last attempt completes the run.
+    let (restored, effects) = advance_graph(
+        &restored,
+        &GraphMsg::NodeDone {
+            node: "flaky".into(),
+            value: json!({"ok": true, "done": true}),
+            now_ms: *until_ms + 1_000,
+        },
+    );
+    assert!(matches!(effects.as_slice(), [GraphEffect::Complete { .. }]));
+    assert_eq!(restored.outputs["flaky"], json!({"ok": true, "done": true}));
+}
+
+/// An unparseable policy refuses whole: zero attempts, over the cap, a nested
+/// wrapper, a wrapper around a graph-lowered shape, and the spawn mix.
+#[test]
+fn retry_unparseable_policy_refuses_without_row() {
+    for (max_attempts, label) in [(0u32, "at least 1"), (11u32, "exceeds the bounded cap")] {
+        let wf = retry_workflow(max_attempts, StepOnError::Continue);
+        let reason = durable_graph(&wf, &json!({})).expect_err("bad policy");
+        assert!(reason.contains(label), "{max_attempts}: {reason}");
+        assert!(unsupported_reason(&wf).is_some(), "{max_attempts}");
+    }
+
+    // Nested retry.
+    let nested = workflow(vec![retry_step(
+        "outer",
+        retry_step(
+            "inner",
+            named("call", dm("call"), StepOnError::Continue),
+            2,
+            0,
+            StepOnError::Continue,
+        ),
+        2,
+        0,
+        StepOnError::Continue,
+    )]);
+    let reason = durable_graph(&nested, &json!({})).expect_err("nested");
+    assert!(reason.contains("nested retry"), "{reason}");
+
+    // A wrapper around a graph-lowered shape.
+    let around_parallel = workflow(vec![retry_step(
+        "outer",
+        parallel(
+            "fan",
+            "2",
+            named("copy", dm("copy"), StepOnError::Continue),
+            StepOnError::Continue,
+        ),
+        2,
+        0,
+        StepOnError::Continue,
+    )]);
+    let reason = durable_graph(&around_parallel, &json!({})).expect_err("fan-out wrap");
+    assert!(reason.contains("retry wraps 'parallel'"), "{reason}");
+
+    // The spawn mix refuses whole.
+    let mixed = workflow(vec![
+        named("spawn_it", spawn_action(true, 600), StepOnError::Continue),
+        retry_step(
+            "flaky",
+            named("call", dm("call"), StepOnError::Continue),
+            2,
+            0,
+            StepOnError::Continue,
+        ),
+    ]);
+    let reason = durable_graph(&mixed, &json!({})).expect_err("mix");
+    assert!(
+        reason.contains("mixes graph-lowered steps with 'spawn'"),
+        "{reason}"
+    );
 }

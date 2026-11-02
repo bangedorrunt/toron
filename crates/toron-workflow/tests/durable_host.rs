@@ -17,7 +17,7 @@ use toron_core::journal::{JournalDb, ToronJournal};
 use toron_core::kernel::{DurableEngine, EngineMsg, OurEngine, RunPhase as EnginePhase};
 use toron_workflow::engine::ActionInvocation;
 use toron_workflow::engine::durable::{
-    GraphEffect, GraphModel, GraphPhase, RunEffect, RunModel, RunPhase,
+    GraphEffect, GraphModel, GraphPhase, NodeParkReason, NodeState, RunEffect, RunModel, RunPhase,
 };
 use toron_workflow::engine::durable_host::{DurableGraphRun, DurableRun, HostError};
 use toron_workflow::engine::leaf::LeafSeams;
@@ -1545,7 +1545,7 @@ async fn parallel_refusals_leave_no_row() {
         ),
     ]);
     let cases = [
-        ("run-parallel-mixed", mixed, "mixes fan-out"),
+        ("run-parallel-mixed", mixed, "mixes graph-lowered steps"),
         (
             "run-parallel-count",
             fanout_workflow("{{inputs.n}}"),
@@ -1793,4 +1793,203 @@ async fn foreach_unmaterializable_iterator_refuses_without_row() {
     );
     assert!(engine.query("run-foreach-number").is_err());
     assert!(engine.query("run-foreach-missing").is_err());
+}
+
+// ---------------------------------------------------------------------------
+// Retry policy on graph nodes (bd-durable-retry-policy-rrck)
+// ---------------------------------------------------------------------------
+
+fn retry_step(name: &str, inner: Step, max_attempts: u32, on_error: StepOnError) -> Step {
+    Step {
+        name: Some(name.into()),
+        guard: None,
+        on_error,
+        build_slot: false,
+        action: Action::Retry {
+            max_attempts,
+            backoff_secs: 0,
+            step: Box::new(inner),
+        },
+    }
+}
+
+fn retry_workflow(max_attempts: u32) -> Workflow {
+    workflow(vec![retry_step(
+        "flaky",
+        Step {
+            name: Some("call".into()),
+            guard: None,
+            on_error: StepOnError::Continue,
+            build_slot: false,
+            action: dm("call"),
+        },
+        max_attempts,
+        StepOnError::FailRun,
+    )])
+}
+
+/// Through the store: the backoff park and the attempt survive a restart, and
+/// the wake re-dispatches the SAME attempt identity.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retry_backoff_park_is_restart_safe() {
+    let path = unique_db("retry-restart");
+    let pool = connect(path.to_str().expect("path"))
+        .await
+        .expect("connect");
+    migrate(&pool).await.expect("migrate");
+    let handle = tokio::runtime::Handle::current();
+
+    let (parked, until_ms) = {
+        let pool = pool.clone();
+        let state = SyncWorkflowState::spawn(pool.clone(), &handle);
+        let handle = handle.clone();
+        tokio::task::spawn_blocking(move || -> Result<(GraphModel, u64), HostError> {
+            let engine = OurEngine::with_journal(
+                ToronEngineStore::spawn(pool.clone(), &handle),
+                ToronJournal::spawn(JournalDb::new(pool, "retry", 64), &handle),
+            );
+            let (mut run, effects) = DurableGraphRun::open(
+                engine,
+                state,
+                "run-retry",
+                retry_workflow(3),
+                json!({}),
+                1_000,
+            )?;
+            assert_eq!(executed_nodes(&effects), ["flaky"]);
+            let effects = run.node_done(
+                "flaky",
+                json!({"ok": false, "kind": "timeout", "error": "late"}),
+                2_000,
+            )?;
+            let [
+                GraphEffect::ParkUntil {
+                    reason: NodeParkReason::Retry,
+                    until_ms,
+                    ..
+                },
+            ] = effects.as_slice()
+            else {
+                panic!("attempt 1 parks: {effects:?}");
+            };
+            Ok((run.model().clone(), *until_ms))
+        })
+        .await
+        .expect("join")
+        .expect("phase one")
+    };
+    assert!(matches!(
+        parked.node_state["flaky"],
+        NodeState::Parked { attempt: 2, .. }
+    ));
+
+    let (mut run, effects) = {
+        let pool = pool.clone();
+        let state = SyncWorkflowState::spawn(pool.clone(), &handle);
+        let handle = handle.clone();
+        tokio::task::spawn_blocking(move || {
+            let engine = OurEngine::with_journal(
+                ToronEngineStore::spawn(pool.clone(), &handle),
+                ToronJournal::spawn(JournalDb::new(pool, "retry", 64), &handle),
+            );
+            // Reopen BEFORE the backoff deadline, so the run is still parked.
+            DurableGraphRun::open(
+                engine,
+                state,
+                "run-retry",
+                retry_workflow(3),
+                json!({}),
+                2_500,
+            )
+        })
+        .await
+        .expect("join")
+        .expect("reopen")
+    };
+    let [
+        GraphEffect::ParkUntil {
+            reason: NodeParkReason::Retry,
+            until_ms: resumed_until,
+            ..
+        },
+    ] = effects.as_slice()
+    else {
+        panic!("resume re-issues the park, not a dispatch: {effects:?}");
+    };
+    assert_eq!(*resumed_until, until_ms);
+
+    let effects = run.woke(until_ms).expect("wake");
+    let [
+        GraphEffect::ExecuteNode {
+            node, attempt: 2, ..
+        },
+    ] = effects.as_slice()
+    else {
+        panic!("the wake re-dispatches attempt 2: {effects:?}");
+    };
+    assert_eq!(node, "flaky");
+
+    let effects = run
+        .node_done("flaky", json!({"ok": true, "done": true}), until_ms + 1_000)
+        .expect("settle");
+    assert!(matches!(effects.as_slice(), [GraphEffect::Complete { .. }]));
+    assert_eq!(run.model().phase, GraphPhase::Succeeded);
+}
+
+/// An unparseable policy refuses whole: no state row, no engine row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retry_unparseable_policy_refuses_without_row() {
+    let path = unique_db("retry-refused");
+    let pool = connect(path.to_str().expect("path"))
+        .await
+        .expect("connect");
+    migrate(&pool).await.expect("migrate");
+    let handle = tokio::runtime::Handle::current();
+
+    for (run_id, max_attempts, label) in [
+        ("run-retry-zero", 0u32, "at least 1"),
+        ("run-retry-cap", 11u32, "exceeds the bounded cap"),
+    ] {
+        let pool = pool.clone();
+        let state = SyncWorkflowState::spawn(pool.clone(), &handle);
+        let handle = handle.clone();
+        let rid = run_id.to_string();
+        let refused = tokio::task::spawn_blocking(move || {
+            let engine = OurEngine::with_journal(
+                ToronEngineStore::spawn(pool.clone(), &handle),
+                ToronJournal::spawn(JournalDb::new(pool, "retry", 64), &handle),
+            );
+            DurableGraphRun::open(
+                engine,
+                state,
+                rid,
+                retry_workflow(max_attempts),
+                json!({}),
+                0,
+            )
+        })
+        .await
+        .expect("join");
+        let Err(err) = refused else {
+            panic!("{run_id}: must refuse");
+        };
+        let HostError::Unsupported(reason) = err else {
+            panic!("{run_id}: wrong refusal: {err:?}");
+        };
+        assert!(reason.contains(label), "{run_id}: {reason}");
+    }
+
+    let store = toron_core::index::durable_workflow::WorkflowStateStore::new(pool.clone());
+    for run_id in ["run-retry-zero", "run-retry-cap"] {
+        assert!(
+            store.load(run_id).await.expect("state").is_none(),
+            "{run_id} left no state row"
+        );
+    }
+    let engine = OurEngine::with_journal(
+        ToronEngineStore::spawn(pool.clone(), &handle),
+        ToronJournal::spawn(JournalDb::new(pool, "retry", 64), &handle),
+    );
+    assert!(engine.query("run-retry-zero").is_err());
+    assert!(engine.query("run-retry-cap").is_err());
 }

@@ -27,7 +27,7 @@ use super::leaf::{LeafSeams, dispatch_leaf};
 use super::template::{RenderContext, render_action};
 use super::{ActionPartition, invoke_compat, partition};
 
-use crate::schema::Step;
+use crate::schema::{Action, Step, StepOnError};
 
 /// One step for a host with no `Context`.
 ///
@@ -172,11 +172,44 @@ pub async fn run_graph_node_step(input: GraphNodeStep<'_>, seams: &LeafSeams) ->
         }
     }
 
+    // A `retry:` wrapper is a POLICY, not an action: this call is ONE attempt
+    // of the inner step, and the scheduler owns the attempts
+    // (bd-durable-retry-policy-rrck). The wrapper's guard already ran above;
+    // the inner step's own guard runs per attempt and its failure is a VALUE
+    // (Continue) so the wrapper's `on_error` decides exhaustion.
+    let mut inner;
+    let node_action = match &input.node.action {
+        Action::Retry { step, .. } => {
+            let mut flat: &Step = step;
+            while let Action::Retry { step: nested, .. } = &flat.action {
+                flat = nested;
+            }
+            inner = flat.clone();
+            inner.on_error = StepOnError::Continue;
+            match evaluate_step_guard(
+                inner.guard.as_deref(),
+                trigger,
+                input.inputs,
+                input.node_name,
+            )
+            .await
+            {
+                GuardVerdict::Proceed => {}
+                GuardVerdict::Skip { reason } => return skipped_value(input.node_name, reason),
+                GuardVerdict::Fail { error } => {
+                    return serde_json::json!({ "ok": false, "error": error });
+                }
+            }
+            &inner.action
+        }
+        action => action,
+    };
+
     // The planning render in the fold is LENIENT; this one is strict, so an
     // unresolvable ref fails HERE with workflow/node/field/ref attribution
     // rather than reaching a runner as a verbatim placeholder.
     let render_ctx = RenderContext::new(input.workflow, input.node_name);
-    let action = match render_action(&input.node.action, trigger, input.inputs, &render_ctx) {
+    let action = match render_action(node_action, trigger, input.inputs, &render_ctx) {
         Ok(action) => action,
         Err(e) => {
             return serde_json::json!({ "ok": false, "error": format!("render: {e}") });
@@ -225,6 +258,63 @@ mod tests {
 
     /// The runner sees a RENDERED action and a fully-populated invocation: this
     /// is the surface the durable host hands its journal.
+    /// bd-durable-retry-policy-rrck: a `retry:` graph node runs ONE attempt of
+    /// the inner step (the scheduler owns attempts), not a refusal.
+    #[tokio::test]
+    async fn graph_node_unwraps_a_retry_policy() {
+        let inner = send_dm("retry-body");
+        let node = crate::schema::GraphNode {
+            action: Action::Retry {
+                max_attempts: 3,
+                backoff_secs: 0,
+                step: Box::new(inner),
+            },
+            needs: Vec::new(),
+            guard: None,
+            on_error: StepOnError::FailRun,
+            build_slot: false,
+        };
+        let trigger = serde_json::json!({});
+        let inputs = serde_json::Map::new();
+        let seen: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let slot = Arc::clone(&seen);
+        let seams = LeafSeams {
+            async_runner: Some(Arc::new(move |inv: &ActionInvocation| {
+                let slot = Arc::clone(&slot);
+                let body = match &inv.action {
+                    Action::SendDm { body, .. } => body.clone(),
+                    other => panic!("runner saw {}", other.type_name()),
+                };
+                Box::pin(async move {
+                    *slot.lock().expect("slot") = Some(body);
+                    Ok(serde_json::json!({ "ok": true }))
+                })
+            })),
+            ..LeafSeams::default()
+        };
+        let value = run_graph_node_step(
+            GraphNodeStep {
+                run_id: "run-retry",
+                workflow: "retry-wf",
+                workflow_digest: "digest",
+                node_name: "flaky",
+                node: &node,
+                attempt: 2,
+                trigger: &trigger,
+                inputs: &inputs,
+                item: None,
+            },
+            &seams,
+        )
+        .await;
+        assert_eq!(value["ok"], serde_json::json!(true));
+        assert_eq!(
+            seen.lock().expect("seen").as_deref(),
+            Some("retry-body"),
+            "the inner step ran, not a boundary refusal"
+        );
+    }
+
     /// bd-durable-foreach-jpgx: a foreach copy renders `{{item}}` from its
     /// per-copy item, exactly like `run_foreach`'s iteration trigger.
     #[tokio::test]

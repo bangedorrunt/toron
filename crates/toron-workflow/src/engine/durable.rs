@@ -933,6 +933,10 @@ fn step_name(step: &Step, index: usize) -> String {
 // Graph run model (bd-durable-graph-impl-r2x1)
 // ---------------------------------------------------------------------------
 
+/// The largest `retry:` policy the scheduler will honor
+/// (bd-durable-retry-policy-rrck). A typo cannot park a run for days.
+pub const MAX_RETRY_ATTEMPTS: u32 = 10;
+
 /// Why a node parked.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1271,27 +1275,37 @@ pub fn advance_graph(model: &GraphModel, msg: &GraphMsg) -> (GraphModel, Vec<Gra
             else {
                 return (next, Vec::new());
             };
-            let on_error = next
+            let node_def = next
                 .workflow
                 .graph
                 .as_ref()
                 .and_then(|g| g.nodes.get(node))
-                .map(|n| n.on_error);
-            if on_error != Some(StepOnError::FailRun) || !is_failure_value(value) {
-                next.outputs.insert(node.clone(), value.clone());
-                next.node_state.insert(node.clone(), NodeState::Settled);
-                let effects = schedule(&mut next, *now_ms);
-                return (next, effects);
-            }
-            let kind = value
-                .get("kind")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            // Graphs admit no `retry:` node action, so the scheduler policy is
-            // always the default coordinator (3 attempts, exponential backoff).
-            let coordinator = RetryCoordinator::from_enclosing(None);
-            if RetryCoordinator::is_retryable_value(value) {
+                .cloned();
+            let on_error = node_def.as_ref().map(|n| n.on_error);
+            // A `retry:` node carries its own policy; a plain node falls back
+            // to the scheduler default (3 attempts, exponential backoff).
+            // bd-durable-retry-policy-rrck.
+            let retry_policy = node_def.as_ref().and_then(|n| match &n.action {
+                Action::Retry {
+                    max_attempts,
+                    backoff_secs,
+                    ..
+                } => Some((*max_attempts, *backoff_secs)),
+                _ => None,
+            });
+            let failed = is_failure_value(value);
+            // A policy node retries ANY failure; a plain node keeps the
+            // scheduler's rule (retryable kinds only, and only on fail_run).
+            let retrying = failed
+                && match retry_policy {
+                    Some(_) => true,
+                    None => {
+                        on_error == Some(StepOnError::FailRun)
+                            && RetryCoordinator::is_retryable_value(value)
+                    }
+                };
+            if retrying {
+                let coordinator = RetryCoordinator::from_enclosing(retry_policy);
                 if coordinator.should_retry(attempt) {
                     let retry_after_ms = value
                         .get("retry_after_ms")
@@ -1317,6 +1331,22 @@ pub fn advance_graph(model: &GraphModel, msg: &GraphMsg) -> (GraphModel, Vec<Gra
                         }],
                     );
                 }
+            }
+            // Land unless this is a failure the node's `on_error` fails on.
+            if !failed || on_error != Some(StepOnError::FailRun) {
+                next.outputs.insert(node.clone(), value.clone());
+                next.node_state.insert(node.clone(), NodeState::Settled);
+                let effects = schedule(&mut next, *now_ms);
+                return (next, effects);
+            }
+            let kind = value
+                .get("kind")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if retrying {
+                // Exhausted a retry path: the bundle reports the attempt
+                // count (bd-durable-retry-policy-rrck).
                 let disposition =
                     disposition_for_kind(&kind, value.get("disposition").and_then(|v| v.as_str()));
                 let fail = GraphFail {
@@ -1828,6 +1858,27 @@ fn schedule(model: &mut GraphModel, now_ms: u64) -> Vec<GraphEffect> {
                     model.node_state.insert(name.clone(), NodeState::Settled);
                     continue;
                 }
+                // A `retry:` policy is a per-node wrapper: dispatch the node
+                // (the executor unwraps to the inner step) and let the
+                // scheduler own the attempts (bd-durable-retry-policy-rrck).
+                Action::Retry { .. } => {
+                    model.node_state.insert(
+                        name.clone(),
+                        NodeState::Executing {
+                            wave,
+                            attempt: 1,
+                            inputs: snapshot.clone(),
+                        },
+                    );
+                    effects.push(GraphEffect::ExecuteNode {
+                        node: name.clone(),
+                        wave,
+                        attempt: 1,
+                        inputs: snapshot.clone(),
+                        item: None,
+                    });
+                    dispatched += 1;
+                }
                 action if matches!(partition(action), ActionPartition::HostSink { .. }) => {
                     model.node_state.insert(
                         name.clone(),
@@ -1959,11 +2010,44 @@ pub fn has_fanout_steps(workflow: &Workflow) -> bool {
     })
 }
 
-/// True when the workflow must run on the graph model: an authored graph, or a
-/// `steps:` sequence lowered into copy nodes + a collect join
-/// (bd-durable-parallel-53um, bd-durable-foreach-jpgx).
+/// True when the authored steps contain a `retry:` policy wrapper.
+pub fn has_retry_steps(workflow: &Workflow) -> bool {
+    workflow
+        .steps
+        .iter()
+        .any(|step| matches!(step.action, Action::Retry { .. }))
+}
+
+/// True when the workflow must run on the graph model: an authored graph, a
+/// `steps:` fan-out, or a `steps:` retry policy
+/// (bd-durable-parallel-53um, bd-durable-foreach-jpgx,
+/// bd-durable-retry-policy-rrck).
 pub fn needs_graph_model(workflow: &Workflow) -> bool {
-    workflow.graph.is_some() || has_fanout_steps(workflow)
+    workflow.graph.is_some() || has_fanout_steps(workflow) || has_retry_steps(workflow)
+}
+
+/// Why a `retry:` wrapper cannot be sequenced as a per-node policy, if it
+/// cannot. An unparseable policy refuses before any row rather than silently
+/// degrading to the scheduler default.
+fn retry_policy_refusal(inner: &Step, max_attempts: u32) -> Option<String> {
+    if max_attempts == 0 {
+        return Some("retry `max_attempts` must be at least 1".to_string());
+    }
+    if max_attempts > MAX_RETRY_ATTEMPTS {
+        return Some(format!(
+            "retry `max_attempts` {max_attempts} exceeds the bounded cap {MAX_RETRY_ATTEMPTS}"
+        ));
+    }
+    if matches!(inner.action, Action::Retry { .. }) {
+        return Some("nested retry wrappers are not sequenced; set the outer policy".to_string());
+    }
+    if !is_graph_sequencable(&inner.action) {
+        return Some(format!(
+            "retry wraps '{}', which the graph model cannot sequence as a single node",
+            inner.action.type_name()
+        ));
+    }
+    None
 }
 
 /// The `over` form a foreach accepts: a JSON literal or a
@@ -2008,10 +2092,19 @@ fn foreach_over_steps_root(over: &str) -> Option<&str> {
 /// leaf the graph can sequence, the fan-out must not carry a whole-step guard
 /// (the lowering cannot skip the fan-out as one), and a foreach iterator must
 /// name an EARLIER step when it reads upstream outputs.
-fn lowered_fanout_refusal(workflow: &Workflow) -> Option<String> {
+fn lowered_shape_refusal(workflow: &Workflow) -> Option<String> {
     for (index, step) in workflow.steps.iter().enumerate() {
         let name = step_name(step, index);
         match &step.action {
+            Action::Retry {
+                max_attempts,
+                backoff_secs: _,
+                step: inner,
+            } => {
+                if let Some(reason) = retry_policy_refusal(inner, *max_attempts) {
+                    return Some(format!("step '{name}': {reason}"));
+                }
+            }
             Action::Parallel { over, each } => {
                 if step.guard.is_some() {
                     return Some(format!(
@@ -2060,13 +2153,13 @@ fn lowered_fanout_refusal(workflow: &Workflow) -> Option<String> {
             // linear branch refuses WHOLE rather than half-running.
             Action::Spawn { .. } | Action::Branch { .. } => {
                 return Some(format!(
-                    "workflow mixes fan-out with '{}' at step '{name}': the fan-out lowering is graph-shaped and the durable graph admits neither; split the workflow",
+                    "workflow mixes graph-lowered steps with '{}' at step '{name}': the durable graph admits neither; split the workflow",
                     step.action.type_name()
                 ));
             }
             action if !is_linear(action) => {
                 return Some(format!(
-                    "step '{name}' uses '{}', which the fan-out lowering cannot sequence",
+                    "step '{name}' uses '{}', which the graph lowering cannot sequence",
                     action.type_name()
                 ));
             }
@@ -2091,10 +2184,10 @@ pub fn durable_graph(
     if let Some(graph) = &workflow.graph {
         return Ok(Some(graph.clone()));
     }
-    if !has_fanout_steps(workflow) {
+    if !has_fanout_steps(workflow) && !has_retry_steps(workflow) {
         return Ok(None);
     }
-    if let Some(reason) = lowered_fanout_refusal(workflow) {
+    if let Some(reason) = lowered_shape_refusal(workflow) {
         return Err(reason);
     }
     let mut nodes: BTreeMap<String, GraphNode> = BTreeMap::new();
@@ -2235,8 +2328,8 @@ fn is_fanout_join(graph: &Graph, name: &str, node: &GraphNode) -> bool {
 /// than a clean route.
 pub fn graph_unsupported_reason(workflow: &Workflow) -> Option<String> {
     let Some(graph) = &workflow.graph else {
-        if has_fanout_steps(workflow) {
-            return lowered_fanout_refusal(workflow);
+        if has_fanout_steps(workflow) || has_retry_steps(workflow) {
+            return lowered_shape_refusal(workflow);
         }
         return Some("not a graph workflow".into());
     };
@@ -2244,6 +2337,17 @@ pub fn graph_unsupported_reason(workflow: &Workflow) -> Option<String> {
         return Some(error);
     }
     for (name, node) in &graph.nodes {
+        if let Action::Retry {
+            max_attempts,
+            step: inner,
+            ..
+        } = &node.action
+        {
+            if let Some(reason) = retry_policy_refusal(inner, *max_attempts) {
+                return Some(format!("graph node '{name}': {reason}"));
+            }
+            continue;
+        }
         if let Action::Foreach { over, each } = &node.action {
             // A foreach fan-out marker or its expanded join. The `over` shape
             // is refused before a row; the list itself is read in the fold.
@@ -2295,8 +2399,13 @@ pub fn graph_unsupported_reason(workflow: &Workflow) -> Option<String> {
 }
 
 fn is_graph_sequencable(action: &Action) -> bool {
-    matches!(
-        action,
-        Action::Delay { .. } | Action::RequestApproval { .. }
-    ) || matches!(partition(action), ActionPartition::HostSink { .. })
+    match action {
+        // A retry wrapper IS the node: the scheduler owns its attempts, the
+        // executor unwraps to the inner step (bd-durable-retry-policy-rrck).
+        Action::Retry {
+            max_attempts, step, ..
+        } => retry_policy_refusal(step, *max_attempts).is_none(),
+        Action::Delay { .. } | Action::RequestApproval { .. } => true,
+        _ => matches!(partition(action), ActionPartition::HostSink { .. }),
+    }
 }
