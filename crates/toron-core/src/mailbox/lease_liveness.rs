@@ -30,10 +30,15 @@ use super::reservations::{
     DEFAULT_RESERVATION_TTL_SECS, clear_lease_liveness_checker, install_lease_liveness_checker,
 };
 
-/// How often the daemon refreshes the live set. 15 s against a 180 s TTL:
-/// a holder that goes quiet frees its paths at most one refresh late, and
-/// a holder that polls stays vouched with 12x headroom.
-pub const REFRESH_SECS: u64 = 15;
+/// How often the daemon refreshes the live set: 5 s against the 180 s TTL.
+/// The bound is load-bearing, not aesthetic: the acceptance is a +7 s
+/// check past a 4 s TTL, so the worst-case lag (one interval) must sit
+/// under the check horizon — 15 s made the +7 s naming phase-luck (shown
+/// live: clear at +7 s, hard block at +25 s on the same lease). The query
+/// is one indexed aggregate over a per-agent table, so the shorter
+/// cadence costs nothing measurable; a holder that goes quiet still frees
+/// its paths within one interval past the TTL window.
+pub const REFRESH_SECS: u64 = 5;
 
 /// Pubkey hex → last-seen micros. Only currently-live pubkeys are present;
 /// the refresher applies the TTL cutoff, so the predicate is membership.

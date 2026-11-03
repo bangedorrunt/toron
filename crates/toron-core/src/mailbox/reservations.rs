@@ -2704,6 +2704,52 @@ mod tests {
         (mailbox, db_path, data_dir)
     }
 
+    /// Two mailboxes over ONE store: separate bus instances (own subscriber
+    /// sets, own open-time state) and separate keyring dirs, same SQLite
+    /// pool — the daemon/CLI split in miniature. Both buses open BEFORE
+    /// anything is published, so a check that only saw open-time state
+    /// would miss.
+    #[allow(clippy::type_complexity)]
+    async fn two_mailboxes_one_store(
+        tag: &str,
+    ) -> (
+        Mailbox,
+        Mailbox,
+        sqlx::SqlitePool,
+        std::path::PathBuf,
+        std::path::PathBuf,
+        std::path::PathBuf,
+    ) {
+        let db_path =
+            std::env::temp_dir().join(format!("toron-res-{tag}-{}.sqlite", uuid::Uuid::new_v4()));
+        let pool = schema::connect(db_path.to_str().unwrap())
+            .await
+            .expect("connect");
+        schema::migrate(&pool).await.expect("migrate");
+        let bus_a = InProcessBus::open(pool.clone(), InProcessBusConfig::default())
+            .await
+            .expect("bus a");
+        let bus_b = InProcessBus::open(pool.clone(), InProcessBusConfig::default())
+            .await
+            .expect("bus b");
+        let dir_a =
+            std::env::temp_dir().join(format!("toron-res-data-{tag}-a-{}", uuid::Uuid::new_v4()));
+        let dir_b =
+            std::env::temp_dir().join(format!("toron-res-data-{tag}-b-{}", uuid::Uuid::new_v4()));
+        let operator = crate::keys::generate();
+        let mba = Mailbox::new(Arc::new(bus_a), dir_a.clone(), Some(operator))
+            .with_agent_passphrase(PASSPHRASE)
+            .with_index_pool(pool.clone());
+        let mbb = Mailbox::new(
+            Arc::new(bus_b),
+            dir_b.clone(),
+            Some(crate::keys::generate()),
+        )
+        .with_agent_passphrase(PASSPHRASE)
+        .with_index_pool(pool.clone());
+        (mba, mbb, pool, db_path, dir_a, dir_b)
+    }
+
     fn profile(name: &str) -> AgentProfile {
         AgentProfile {
             name: name.into(),
@@ -3632,6 +3678,81 @@ mod tests {
         clear_lease_liveness_checker();
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// Captain probe: a LIVE lease published through one mailbox is visible
+    /// to a check through a SECOND mailbox sharing only the store
+    /// (different bus instance, different keyring dir — the daemon/CLI
+    /// split in miniature). Exclusive → hard block naming the holder.
+    #[tokio::test]
+    async fn live_exclusive_lease_visible_across_bus_instances() {
+        let (mba, mbb, _pool, db_path, dir_a, dir_b) = two_mailboxes_one_store("xbus-hard").await;
+        register(&mba, "demo", "BlueLake").await;
+        register(&mbb, "demo", "RoseDune").await;
+        mba.file_reservation_paths(
+            "demo",
+            "BlueLake",
+            &["src/live.rs".into()],
+            Some(3600),
+            true,
+            Some("xbus"),
+        )
+        .await
+        .expect("acquire on A");
+        // Published on A after B opened: B reads the shared store, not a
+        // stale open-time snapshot.
+        let report = mbb
+            .check_file_reservation_conflicts("demo", "RoseDune", &["src/live.rs".into()])
+            .await
+            .expect("check on B");
+        assert!(
+            !report.conflict_free,
+            "live exclusive lease hard-blocks: {report:?}"
+        );
+        let hit = report
+            .conflicts
+            .iter()
+            .find(|c| c.path == "src/live.rs")
+            .expect("named");
+        assert!(hit.holders.iter().any(|h| h == "BlueLake"), "{hit:?}");
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&dir_a);
+        let _ = std::fs::remove_dir_all(&dir_b);
+    }
+
+    /// Same rig, shared tier: a LIVE shared lease is ADVISED, never a hard
+    /// block (ADR-0011 Spec 4 / bd-4dl4). `conflict_free` stays true AND the
+    /// holder is named in `soft_conflicts` — that combination is the
+    /// contract, so a future change flips it only deliberately.
+    #[tokio::test]
+    async fn live_shared_lease_advises_across_bus_instances() {
+        let (mba, mbb, _pool, db_path, dir_a, dir_b) = two_mailboxes_one_store("xbus-soft").await;
+        register(&mba, "demo", "BlueLake").await;
+        register(&mbb, "demo", "RoseDune").await;
+        mba.file_reservation_paths(
+            "demo",
+            "BlueLake",
+            &["src/shared.rs".into()],
+            Some(3600),
+            false,
+            Some("xbus"),
+        )
+        .await
+        .expect("acquire on A");
+        let report = mbb
+            .check_file_reservation_conflicts("demo", "RoseDune", &["src/shared.rs".into()])
+            .await
+            .expect("check on B");
+        assert!(report.conflict_free, "shared never hard-blocks: {report:?}");
+        let hit = report
+            .soft_conflicts
+            .iter()
+            .find(|c| c.path == "src/shared.rs")
+            .expect("named in soft tier");
+        assert!(hit.holders.iter().any(|h| h == "BlueLake"), "{hit:?}");
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&dir_a);
+        let _ = std::fs::remove_dir_all(&dir_b);
     }
 
     /// bd-slot-visibility-gv17: the pre-write collision check must expose
