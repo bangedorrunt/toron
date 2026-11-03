@@ -236,14 +236,19 @@ fn fold_attention(board: &Board) -> AgentStatus {
     if saw_working {
         return AgentStatus::Working;
     }
+    // bd-xgea: a failed record must never be masked by a finished sibling.
+    // `error` says the program stopped with a failure; it has the same
+    // lifetime as `done` in the protocol, so "a child finished" cannot turn
+    // it into Done. Failure outranks success for attention, and maps to
+    // Unknown (never Done, never Idle).
+    if saw_error {
+        return AgentStatus::Unknown;
+    }
     if saw_done {
         return AgentStatus::Done;
     }
     if saw_idle {
         return AgentStatus::Idle;
-    }
-    if saw_error {
-        return AgentStatus::Unknown;
     }
     AgentStatus::Unknown
 }
@@ -540,6 +545,34 @@ mod tests {
         board.apply(&osc("state=error:app=freebuff"));
         assert_eq!(fold(&board, FoldPolicy::Attention), AgentStatus::Unknown);
         assert_eq!(fold(&board, FoldPolicy::RootWins), AgentStatus::Unknown);
+    }
+
+    /// bd-xgea: `error` is not masked by a `done` sibling, in either
+    /// direction. A failed root with a finished child is still a failure,
+    /// and a failed child is not hidden by a finished root.
+    #[test]
+    fn attention_error_is_not_masked_by_a_done_sibling() {
+        let mut root_failed = Board::default();
+        root_failed.apply(&osc("state=error:app=freebuff"));
+        root_failed.apply(&osc("state=done:id=child"));
+        assert_eq!(
+            fold(&root_failed, FoldPolicy::Attention),
+            AgentStatus::Unknown,
+            "a done child must not turn a failed root into Done"
+        );
+
+        let mut child_failed = Board::default();
+        child_failed.apply(&osc("state=done:app=deploy"));
+        child_failed.apply(&osc("state=error:id=worker"));
+        assert_eq!(
+            fold(&child_failed, FoldPolicy::Attention),
+            AgentStatus::Unknown,
+            "a failed child must not be hidden by a done root"
+        );
+
+        // Working still outranks a failure: the terminal is still busy.
+        child_failed.apply(&osc("state=working:id=live"));
+        assert_eq!(fold(&child_failed, FoldPolicy::Attention), AgentStatus::Working);
     }
 
     #[test]
