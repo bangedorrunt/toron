@@ -607,6 +607,12 @@ impl Mailbox {
                 epoch,
             });
         }
+        // bd-liveness-any-command-mc34: acquiring proves the holder is
+        // alive (a manual holder may never read mail). Best-effort at the
+        // effect edge — after the grant, never failing the acquire.
+        let now_us = super::lease_liveness::host_now_us();
+        self.record_inbox_poll(project_slug, agent_name, now_us)
+            .await;
         Ok(result)
     }
 
@@ -905,6 +911,13 @@ impl Mailbox {
             });
             result.renewed += 1;
         }
+        // bd-liveness-any-command-mc34: renewing proves the holder is alive
+        // — this is the with-lease heartbeat's own signal, so a working
+        // holder that never reads mail stays vouched. Best-effort at the
+        // effect edge, never failing the renew.
+        let now_us = super::lease_liveness::host_now_us();
+        self.record_inbox_poll(project_slug, agent_name, now_us)
+            .await;
         Ok(result)
     }
 
@@ -3755,10 +3768,96 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir_b);
     }
 
-    /// bd-slot-visibility-gv17: the pre-write collision check must expose
+    /// bd-liveness-any-command-mc34: any authenticated command proves
+    /// liveness — a holder that only acquires/renews/sends, never reading
+    /// mail, stays in the activity snapshot. And the stamp can never fail
+    /// the command: with the cursor table dropped, renew still succeeds.
+    /// Zero inbox reads anywhere in this test (except none at all).
+    #[tokio::test]
+    async fn any_authenticated_command_stamps_liveness_without_inbox_reads() {
+        use crate::mailbox::lease_liveness::read_activity_snapshot;
+        use crate::mailbox::messaging::SendMessage;
+        let (mailbox, db_path, data_dir) = test_mailbox("any-cmd").await;
+        let holder = register(&mailbox, "demo", "BlueLake").await;
+        register(&mailbox, "demo", "RoseDune").await;
+        let holder_hex = holder.to_hex();
+        let pool = mailbox.index_pool().expect("pool").clone();
+        let poll_of = || async {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT last_poll_us FROM inbox_cursors \
+                 WHERE project_slug = 'demo' AND agent_name = 'BlueLake' AND plane = 'P'",
+            )
+            .fetch_one(&pool)
+            .await
+        };
+
+        // Acquire alone stamps.
+        mailbox
+            .file_reservation_paths(
+                "demo",
+                "BlueLake",
+                &["src/any.rs".into()],
+                Some(3600),
+                true,
+                Some("mc34"),
+            )
+            .await
+            .expect("acquire");
+        assert!(poll_of().await.expect("acquire stamps") > 0);
+
+        // Renew alone re-stamps: wipe the row, renew, read it back.
+        sqlx::query("DELETE FROM inbox_cursors")
+            .execute(&pool)
+            .await
+            .expect("wipe");
+        mailbox
+            .renew_file_reservations("demo", "BlueLake", &["src/any.rs".into()], 60)
+            .await
+            .expect("renew");
+        let now_us = Timestamp::now().as_secs() as i64 * 1_000_000;
+        let map = read_activity_snapshot(&pool, DEFAULT_RESERVATION_TTL_SECS, now_us)
+            .await
+            .expect("snapshot");
+        assert!(
+            map.contains_key(&holder_hex),
+            "a holder that only renews stays vouched: {map:?}"
+        );
+
+        // Send alone stamps too.
+        sqlx::query("DELETE FROM inbox_cursors")
+            .execute(&pool)
+            .await
+            .expect("wipe");
+        mailbox
+            .send_message(&SendMessage {
+                project_slug: "demo".into(),
+                sender_name: "BlueLake".into(),
+                to: vec!["RoseDune".into()],
+                subject: "s".into(),
+                body_md: "b".into(),
+                ..Default::default()
+            })
+            .await
+            .expect("send");
+        assert!(poll_of().await.expect("send stamps") > 0);
+
+        // The stamp can never fail the command: cursor table gone entirely,
+        // renew still succeeds (best-effort is `()`, not `Result`).
+        sqlx::query("DROP TABLE inbox_cursors")
+            .execute(&pool)
+            .await
+            .expect("drop");
+        mailbox
+            .renew_file_reservations("demo", "BlueLake", &["src/any.rs".into()], 60)
+            .await
+            .expect("stamp failure never fails renew");
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
     /// ACTIVE build-slot holders — an agent about to run the VERIFY fence
     /// discovers a held cargo slot in ONE call. Own slots are excluded
     /// (own never conflicts); a released slot disappears from the report.
+    /// bd-slot-visibility-gv17: the pre-write collision check must expose
     #[tokio::test]
     async fn conflict_check_exposes_active_slot_holders() {
         let (mailbox, db_path, data_dir) = test_mailbox("slot-visibility").await;

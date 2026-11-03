@@ -198,9 +198,10 @@ pub async fn install_for_daemon_default_ttl(
     install_for_daemon(pool, DEFAULT_RESERVATION_TTL_SECS).await
 }
 
-/// Host clock micros. Called ONLY at the refresh-tick edge and passed down;
-/// the predicate and the fold never read the clock (substitution in tests).
-fn host_now_us() -> i64 {
+/// Host clock micros. Called ONLY at an effect edge by the command that
+/// records activity; the value travels as an argument from there (the
+/// predicate and the fold never read the clock — substitution in tests).
+pub fn host_now_us() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_micros() as i64)

@@ -38,7 +38,8 @@ pub async fn run_comms(
                 // bd-oracle-dead-source-72az: a `next` read proves liveness
                 // too (the comms store never passes through `fetch_inbox`,
                 // so it records here, on every success path).
-                mailbox.record_inbox_poll(&a.project, &a.who).await;
+                let now_us = toron_core::mailbox::lease_liveness::host_now_us();
+                mailbox.record_inbox_poll(&a.project, &a.who, now_us).await;
             }
             match batch {
                 Ok(b) if a.urgent => {

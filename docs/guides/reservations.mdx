@@ -7,6 +7,8 @@ description: File leases (kind 30031), conflict semantics, transfers, the pre-co
 
 Reserve paths before editing. A reservation (kind 30031) has three states: `intent` (plan to edit, roughly a 5-minute TTL), `held` (the live lease; the default state of an acquisition), `released`.
 
+Liveness oracle: held leases expire 180 s after grant; `reserve with-lease` renews every half-TTL while the command runs. Every authenticated command (inbox read — empty inbox counts — acquire, renew, send) stamps the holder's liveness, so an expired lease held by a live agent still blocks; with no oracle installed, expiry clears (pure NIP-40).
+
 ```bash
 toron reserve acquire --project <slug> --as <Pin> --paths 'crates/x/src/**' --reason <bead-id>
 toron reserve conflicts --project <slug> --as <Pin> --paths 'crates/x/src/**'

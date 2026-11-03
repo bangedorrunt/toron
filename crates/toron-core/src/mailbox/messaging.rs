@@ -724,6 +724,13 @@ impl Mailbox {
             }
         }
 
+        // bd-liveness-any-command-mc34: sending proves the sender is alive
+        // (a holder that only sends never reads mail). Best-effort at the
+        // effect edge — after delivery, never failing the send.
+        let now_us = super::lease_liveness::host_now_us();
+        self.record_inbox_poll(&args.project_slug, &args.sender_name, now_us)
+            .await;
+
         Ok(SendResult {
             count: deliveries.len(),
             deliveries,
@@ -769,23 +776,21 @@ impl Mailbox {
         Ok(row.unwrap_or(0))
     }
 
-    /// bd-oracle-dead-source-72az: a successful inbox read proves the
-    /// reader's process is alive, so `fetch_inbox` (the one choke point
-    /// behind CLI `mail inbox` and the MCP `fetch_inbox` tool) and
-    /// `toron next` timestamp the reader with the host clock at the read
-    /// edge — including empty inboxes, where the delivery high-water never
-    /// advances. Best-effort by design: a liveness timestamp must never
-    /// break a read. Writes `last_poll_us`, never `last_seen_us`: the
-    /// delivery cursor is rumor-time, and wall-clock would skip
+    /// bd-oracle-dead-source-72az / bd-liveness-any-command-mc34: a
+    /// successful authenticated command proves the actor's process is
+    /// alive, so `fetch_inbox` (the one choke point behind CLI `mail
+    /// inbox` and the MCP `fetch_inbox` tool), `toron next`, acquire,
+    /// renew, and send timestamp the actor with the host clock passed in
+    /// at the read/effect edge — including empty inboxes, where the
+    /// delivery high-water never advances. Best-effort by design (returns
+    /// `()`, never `Result`): a liveness timestamp must never break the
+    /// command it annotates. Writes `last_poll_us`, never `last_seen_us`:
+    /// the delivery cursor is rumor-time, and wall-clock would skip
     /// late-arriving messages with older rumor timestamps.
-    pub async fn record_inbox_poll(&self, project: &str, agent: &str) {
+    pub async fn record_inbox_poll(&self, project: &str, agent: &str, now_us: i64) {
         let Some(pool) = self.index_pool.as_ref() else {
             return;
         };
-        let now_us = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_micros() as i64)
-            .unwrap_or(0);
         let _ = sqlx::query(
             "INSERT INTO inbox_cursors (project_slug, agent_name, plane, last_seen_us, last_poll_us) \
              VALUES (?1, ?2, 'P', 0, ?3) \
@@ -998,7 +1003,10 @@ impl Mailbox {
         // (a poll proves liveness even with an empty inbox, where the
         // delivery bump above is a no-op). Covers CLI `mail inbox` and the
         // MCP fetch in one choke point; `toron next` records separately.
-        self.record_inbox_poll(&args.project_slug, &args.agent_name)
+        // The stamp carries the edge clock: a poll proves liveness even
+        // with an empty inbox, where the delivery bump above is a no-op.
+        let now_us = super::lease_liveness::host_now_us();
+        self.record_inbox_poll(&args.project_slug, &args.agent_name, now_us)
             .await;
 
         // Parity: AM `fetch_inbox` names the sender (the display name, not the
