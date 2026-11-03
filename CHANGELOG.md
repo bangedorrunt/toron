@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.6.1] — 2026-11-03
+
+### Fixed
+- **A failed OSC 7501 record is never masked by a finished sibling (`bd-xgea`).** `fold_attention` ranked `done` above `error`, so a root `state=error` with a `done` child classified `Done` and a pane read the failure as finished. Per the program-status protocol `error` is "failed and stopped" with the same lifetime as `done`: failure now outranks success for attention and maps to `Unknown` (never `Done`, never `Idle`), in both directions (failed root / done child and done root / failed child). `working` still outranks a failure (the terminal is busy).
+- **The retired `loop` topology is `open` again (`bd-topology-loop-alias-qkdl`).** A restore commit re-added the `Loop` variant while the wire contract (0fe5b85c) says a stored `loop` loads as `open` and writers emit `open`; the roundtrip and the stored-fact assertion could never both pass. The variant is out of `ALL`/`as_str`/`global_of` and `parse(open|loop) = Open`; `G_LOOP` and its projection test stay — the choreography exists, the mode does not.
+
 ## [1.6.0] — 2026-11-03
 ### Docs
 - ADR-0003 **Rev10** GS-062 live cutover: flip P0 busy-owner / P1 leave·close FireLive / lifecycle / delivery-cursor to **Landed** where toron call sites prove it; **ReAdd fence Landed** on live leave/close hold + settle_authority; join gen from held. Presence fail-closed via SQLite `ping()` (never Redis). Flywheel wake classifier (`wake_liveness`) is sibling ship `gs-062/wake-health` — not claimed on this toron tip.
