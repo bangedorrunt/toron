@@ -48,16 +48,17 @@ pub async fn run_cli(args: &ReserveWithLeaseArgs, dry_run: bool) -> anyhow::Resu
 }
 
 async fn run(args: &ReserveWithLeaseArgs, dry_run: bool) -> anyhow::Result<u8> {
+    let paths = crate::robot::normalize_reserve_paths(&args.paths);
     // Preflight BEFORE anything is leased: a glob that matches zero files
     // would hold nothing while reporting success.
-    for p in &args.paths {
+    for p in &paths {
         if let Some(w) = guard::whitespace_path_warning(p) {
             eprintln!("{w}");
         }
     }
     let files = crate::robot::repo_relative_files();
     if !files.is_empty() {
-        for p in &args.paths {
+        for p in &paths {
             if let Some(refusal) = zero_match_refusal(p, &files, is_bare_dir(p)) {
                 eprintln!("toron reserve with-lease: refused — {refusal}");
                 print_json(&json!({
@@ -65,7 +66,7 @@ async fn run(args: &ReserveWithLeaseArgs, dry_run: bool) -> anyhow::Result<u8> {
                     "refused": true,
                     "project": args.project,
                     "as": args.agent,
-                    "paths": args.paths,
+                    "paths": paths,
                     "reason": args.reason,
                     "refusal": refusal,
                     "exit_code": REFUSED,
@@ -80,7 +81,7 @@ async fn run(args: &ReserveWithLeaseArgs, dry_run: bool) -> anyhow::Result<u8> {
             "dry_run": true,
             "project": args.project,
             "as": args.agent,
-            "paths": args.paths,
+            "paths": paths,
             "reason": args.reason,
             "wait_secs": args.wait_secs,
             "ttl_secs": args.ttl_secs,
@@ -111,8 +112,7 @@ async fn run(args: &ReserveWithLeaseArgs, dry_run: bool) -> anyhow::Result<u8> {
     let started = std::time::Instant::now();
     let deadline = started + Duration::from_secs(args.wait_secs);
     let refusal: Option<Refusal> = loop {
-        let missing: Vec<String> = args
-            .paths
+        let missing: Vec<String> = paths
             .iter()
             .filter(|p| !held.contains(*p))
             .cloned()
@@ -125,7 +125,7 @@ async fn run(args: &ReserveWithLeaseArgs, dry_run: bool) -> anyhow::Result<u8> {
         for path in granted_paths(&acquired) {
             held.insert(path);
         }
-        if held.len() == args.paths.len() {
+        if held.len() == paths.len() {
             break None;
         }
         let hard = blocked_paths(&acquired, "conflicts");

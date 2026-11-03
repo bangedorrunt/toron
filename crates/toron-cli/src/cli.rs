@@ -885,7 +885,7 @@ pub enum ReserveCommand {
 #[derive(Debug, Args)]
 pub struct ReserveAcquireArgs {
     /// Path globs to reserve (comma-separated; e.g. 'src/**').
-    #[arg(long, value_delimiter = ',', required = true)]
+    #[arg(long, value_delimiter = ',', num_args = 1.., required = true)]
     pub paths: Vec<String>,
     /// Project slug.
     #[arg(long, required = true)]
@@ -907,7 +907,7 @@ pub struct ReserveAcquireArgs {
 #[derive(Debug, Args)]
 pub struct ReserveConflictsArgs {
     /// Path globs to check (comma-separated).
-    #[arg(long, value_delimiter = ',', required = true)]
+    #[arg(long, value_delimiter = ',', num_args = 1.., required = true)]
     pub paths: Vec<String>,
     /// Project slug.
     #[arg(long, required = true)]
@@ -937,7 +937,7 @@ pub struct ReserveListArgs {
 #[derive(Debug, Args)]
 pub struct ReserveRenewArgs {
     /// Path globs to renew (comma-separated; empty = renew all of the agent's).
-    #[arg(long, value_delimiter = ',')]
+    #[arg(long, value_delimiter = ',', num_args = 1..)]
     pub paths: Vec<String>,
     /// Project slug.
     #[arg(long, required = true)]
@@ -954,7 +954,7 @@ pub struct ReserveRenewArgs {
 #[derive(Debug, Args)]
 pub struct ReserveReleaseArgs {
     /// Path globs to release (comma-separated; empty = release all of the agent's).
-    #[arg(long, value_delimiter = ',')]
+    #[arg(long, value_delimiter = ',', num_args = 1..)]
     pub paths: Vec<String>,
     /// Project slug.
     #[arg(long, required = true)]
@@ -1111,7 +1111,7 @@ pub struct ReserveTransferArgs {
 #[derive(Debug, Args)]
 pub struct ReserveWithLeaseArgs {
     /// Path globs to hold for the command (comma-separated).
-    #[arg(long, value_delimiter = ',', required = true)]
+    #[arg(long, value_delimiter = ',', num_args = 1.., required = true)]
     pub paths: Vec<String>,
     /// Project slug.
     #[arg(long, required = true)]

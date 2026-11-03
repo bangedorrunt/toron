@@ -878,6 +878,30 @@ pub async fn run_ack_sla_daemon(_dc: &DaemonClient, args: &AckSlaArgs) -> anyhow
     run_ack_sla(&mb, args).await
 }
 
+/// Normalizes path globs: trims whitespace, and if a token contains spaces
+/// but does not match an actual file on disk, splits it by whitespace.
+pub(crate) fn normalize_reserve_paths(paths: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    for p in paths {
+        let trimmed = p.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.contains(|c: char| c.is_whitespace()) && !std::path::Path::new(trimmed).exists()
+        {
+            for sub in trimmed.split_whitespace() {
+                let sub_trimmed = sub.trim_matches(|c: char| c == ',' || c.is_whitespace());
+                if !sub_trimmed.is_empty() {
+                    out.push(sub_trimmed.to_string());
+                }
+            }
+        } else {
+            out.push(trimmed.to_string());
+        }
+    }
+    out
+}
+
 /// bd-zugo / F13: a lease binds the resolved actor, but the ROSTER is what
 /// `whois` and the strict commit guard attribute through. When the acting
 /// name has no durable registration (`agents` row) in the project, the lease
@@ -888,6 +912,19 @@ pub async fn run_ack_sla_daemon(_dc: &DaemonClient, args: &AckSlaArgs) -> anyhow
 pub(crate) async fn warn_if_unregistered(mailbox: &Mailbox, project: &str, agent: &str) {
     if mailbox.agent_registered(project, agent).await {
         return;
+    }
+    // Attempt auto-reuse of pin identity if it exists in another project (ADR-0037 W2)
+    if let Ok(Some(from)) = mailbox.pin_reuse_source(project, agent, None).await
+        && let Ok(proof) = mailbox.prove_pin_possession(&from, agent, project).await
+    {
+        let profile = toron_core::nostr::identity::AgentProfile::new(agent);
+        if mailbox
+            .register_agent_reusing(project, &profile, &from, &proof)
+            .await
+            .is_ok()
+        {
+            return;
+        }
     }
     eprintln!(
         "toron reserve: warning — `{agent}` has no registered identity in project `{project}`. \
@@ -913,7 +950,7 @@ fn reserve_dry_run_preview(cmd: &ReserveCommand) -> Option<Value> {
             json!({
                 "project_key": a.project,
                 "agent_name": a.agent,
-                "paths": a.paths,
+                "paths": normalize_reserve_paths(&a.paths),
                 "ttl_seconds": a.ttl_secs,
                 "exclusive": a.exclusive,
                 "reason": a.reason,
@@ -926,7 +963,7 @@ fn reserve_dry_run_preview(cmd: &ReserveCommand) -> Option<Value> {
                 "project_key": a.project,
                 "agent_name": a.agent,
                 "extend_seconds": a.extend_secs,
-                "paths": a.paths,
+                "paths": normalize_reserve_paths(&a.paths),
             }),
             "nothing was renewed",
         ),
@@ -935,7 +972,7 @@ fn reserve_dry_run_preview(cmd: &ReserveCommand) -> Option<Value> {
             json!({
                 "project_key": a.project,
                 "agent_name": a.agent,
-                "paths": a.paths,
+                "paths": normalize_reserve_paths(&a.paths),
             }),
             "nothing was released",
         ),
@@ -1047,15 +1084,16 @@ pub async fn run_reserve(
     }
     match cmd {
         ReserveCommand::Acquire(args) => {
+            let paths = normalize_reserve_paths(&args.paths);
             warn_if_unregistered(mailbox, &args.project, &args.agent).await;
             // bd-v354: loud zero-file-match warning (stderr, warning only).
-            warn_acquire_paths(&args.paths);
+            warn_acquire_paths(&paths);
             emit(
                 mailbox
                     .file_reservation_paths(
                         &args.project,
                         &args.agent,
-                        &args.paths,
+                        &paths,
                         args.ttl_secs,
                         args.exclusive,
                         args.reason.as_deref(),
@@ -1063,11 +1101,14 @@ pub async fn run_reserve(
                     .await?,
             )
         }
-        ReserveCommand::Conflicts(args) => emit(
-            mailbox
-                .check_file_reservation_conflicts(&args.project, &args.agent, &args.paths)
-                .await?,
-        ),
+        ReserveCommand::Conflicts(args) => {
+            let paths = normalize_reserve_paths(&args.paths);
+            emit(
+                mailbox
+                    .check_file_reservation_conflicts(&args.project, &args.agent, &paths)
+                    .await?,
+            )
+        }
         ReserveCommand::List(args) => {
             let rows = mailbox
                 .list_file_reservations(&args.project, args.holder.as_deref(), args.path.as_deref())
@@ -1095,16 +1136,22 @@ pub async fn run_reserve(
             annotate_stale_rows(&mut board, &closed, &args.project);
             print_json(&board)
         }
-        ReserveCommand::Renew(args) => emit(
-            mailbox
-                .renew_file_reservations(&args.project, &args.agent, &args.paths, args.extend_secs)
-                .await?,
-        ),
-        ReserveCommand::Release(args) => emit(
-            mailbox
-                .release_file_reservations(&args.project, &args.agent, &args.paths)
-                .await?,
-        ),
+        ReserveCommand::Renew(args) => {
+            let paths = normalize_reserve_paths(&args.paths);
+            emit(
+                mailbox
+                    .renew_file_reservations(&args.project, &args.agent, &paths, args.extend_secs)
+                    .await?,
+            )
+        }
+        ReserveCommand::Release(args) => {
+            let paths = normalize_reserve_paths(&args.paths);
+            emit(
+                mailbox
+                    .release_file_reservations(&args.project, &args.agent, &paths)
+                    .await?,
+            )
+        }
         ReserveCommand::ReleaseByReason(args) => emit(
             mailbox
                 .release_by_reason(&args.project, &args.agent, &args.bead_id, !args.no_notify)
@@ -1316,6 +1363,7 @@ pub async fn run_reserve_daemon(
     }
     match cmd {
         ReserveCommand::Acquire(args) => {
+            let paths = normalize_reserve_paths(&args.paths);
             // bd-zugo: same ghost-holder warning on the daemon arm — the
             // shared durable root is readable from here (`demo_mailbox`).
             if let Ok(mb) = toron_mcp::demo_mailbox().await {
@@ -1323,14 +1371,14 @@ pub async fn run_reserve_daemon(
             }
             // bd-v354: client-side zero-file-match warning (cwd is the repo;
             // the daemon never sees it). Stderr, warning only.
-            warn_acquire_paths(&args.paths);
+            warn_acquire_paths(&paths);
             daemon_tool(
                 dc,
                 "file_reservation_paths",
                 json!({
                     "project_key": args.project,
                     "agent_name": args.agent,
-                    "paths": args.paths,
+                    "paths": paths,
                     "ttl_seconds": args.ttl_secs,
                     "exclusive": args.exclusive,
                     "reason": args.reason,
@@ -1339,13 +1387,14 @@ pub async fn run_reserve_daemon(
             .await
         }
         ReserveCommand::Conflicts(args) => {
+            let paths = normalize_reserve_paths(&args.paths);
             daemon_tool(
                 dc,
                 "check_file_reservation_conflicts",
                 json!({
                     "project_key": args.project,
                     "agent_name": args.agent,
-                    "paths": args.paths,
+                    "paths": paths,
                 }),
             )
             .await
@@ -1369,6 +1418,7 @@ pub async fn run_reserve_daemon(
             print_json(&board)
         }
         ReserveCommand::Renew(args) => {
+            let paths = normalize_reserve_paths(&args.paths);
             daemon_tool(
                 dc,
                 "renew_file_reservations",
@@ -1376,19 +1426,20 @@ pub async fn run_reserve_daemon(
                     "project_key": args.project,
                     "agent_name": args.agent,
                     "extend_seconds": args.extend_secs,
-                    "paths": args.paths,
+                    "paths": paths,
                 }),
             )
             .await
         }
         ReserveCommand::Release(args) => {
+            let paths = normalize_reserve_paths(&args.paths);
             daemon_tool(
                 dc,
                 "release_file_reservations",
                 json!({
                     "project_key": args.project,
                     "agent_name": args.agent,
-                    "paths": args.paths,
+                    "paths": paths,
                 }),
             )
             .await
@@ -3248,5 +3299,26 @@ mod guard_projection_tests {
         );
         assert_eq!(v.exit_code, 1);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn test_normalize_reserve_paths_splits_whitespace_and_trims() {
+        let input = vec![
+            "  src/lib.rs  ".to_string(),
+            "crates/a.rs crates/b.rs".to_string(),
+            "".to_string(),
+            "crates/c.rs, crates/d.rs".to_string(),
+        ];
+        let normalized = normalize_reserve_paths(&input);
+        assert_eq!(
+            normalized,
+            vec![
+                "src/lib.rs",
+                "crates/a.rs",
+                "crates/b.rs",
+                "crates/c.rs",
+                "crates/d.rs"
+            ]
+        );
     }
 }

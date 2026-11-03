@@ -4164,3 +4164,74 @@ fn release_dry_run_is_read_only() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn reserve_acquire_normalizes_space_separated_paths_and_auto_reuses_pin() {
+    let dir =
+        std::env::temp_dir().join(format!("toron-reserve-spaces-reuse-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // 1. First, register ReusedPin in proj_a so it has a known key and roster entry.
+    let boot = with_lease_run(
+        &dir,
+        &[
+            "agent",
+            "bootstrap",
+            "--project",
+            "proj_a",
+            "--as",
+            "ReusedPin",
+            "--paths",
+            "crates/foo.rs",
+            "--json",
+        ],
+    );
+    assert!(
+        boot.status.success(),
+        "bootstrap in proj_a: {}",
+        String::from_utf8_lossy(&boot.stderr)
+    );
+
+    // 2. Now acquire in proj_b WITHOUT prior bootstrap in proj_b,
+    // and using space-separated paths in --paths:
+    let acq_b = with_lease_run(
+        &dir,
+        &[
+            "reserve",
+            "acquire",
+            "--project",
+            "proj_b",
+            "--as",
+            "ReusedPin",
+            "--paths",
+            "crates/foo.rs crates/bar.rs",
+            "--reason",
+            "test-reuse-and-spaces",
+            "--json",
+        ],
+    );
+    assert!(
+        acq_b.status.success(),
+        "acquire in proj_b: {}",
+        String::from_utf8_lossy(&acq_b.stderr)
+    );
+    let stderr_b = String::from_utf8_lossy(&acq_b.stderr);
+    assert!(
+        !stderr_b.contains("has no registered identity in project `proj_b`"),
+        "must not warn as unregistered since key is auto-reused: {stderr_b}"
+    );
+
+    let acq_json: Value = serde_json::from_slice(&acq_b.stdout).expect("acquire JSON");
+    let granted = acq_json["granted"].as_array().expect("granted array");
+    let patterns: Vec<&str> = granted
+        .iter()
+        .map(|g| g["path_pattern"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        patterns,
+        vec!["crates/foo.rs", "crates/bar.rs"],
+        "both paths granted separately after normalization"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

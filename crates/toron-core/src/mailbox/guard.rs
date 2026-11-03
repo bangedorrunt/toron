@@ -269,6 +269,9 @@ pub fn whitespace_path_warning(pattern: &str) -> Option<String> {
     if !pattern.contains(|c: char| c.is_whitespace()) {
         return None;
     }
+    if std::path::Path::new(pattern).exists() {
+        return None;
+    }
     Some(format!(
         "reserve: warning — `--paths` is comma-separated, but `{pattern}` looks like several \
          paths separated by spaces, so it was taken as ONE glob and will match nothing. \
