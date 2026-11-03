@@ -67,51 +67,7 @@ fn kernel_state(state: EffectState) -> toron_core::kernel::EffectState {
     }
 }
 
-/// Decide one attempt from the journaled view (ADR-0032 §5.3 + §7.4 crash
-/// matrix). `None` (no intent row yet) dispatches fresh. Pure and total.
-pub fn plan_attempt(current: Option<&EffectView>, cap: &ProviderCapability) -> DispatchPlan {
-    let Some(view) = current else {
-        return DispatchPlan::DispatchNew;
-    };
-    use toron_core::kernel::EffectState as S;
-    match view.state {
-        // bd-ynef: a park is INTERRUPTION, so it is neither a terminal row to
-        // return nor a retry to attempt. It resumes at its wake time under the
-        // SAME re-drive key — never DispatchNew, which would double the very
-        // effect the park was waiting to protect.
-        S::Parked => DispatchPlan::ResumeParked {
-            attempt: view.attempt.max(1),
-        },
-        S::Settled | S::Failed | S::Cancelled => DispatchPlan::DuplicateTerminal,
-        S::Prepared => DispatchPlan::DispatchNew,
-        S::ReconcilePending => DispatchPlan::RefuseBlindRetry {
-            reason: "reconciliation owns this effect; the dispatcher waits for its verdict".into(),
-        },
-        S::InFlight | S::Accepted | S::Unknown => {
-            if view.lease_live {
-                DispatchPlan::RefuseBlindRetry {
-                    reason: "dispatch lease is live under another owner; a second dispatch would fork the effect"
-                        .into(),
-                }
-            } else if cap.supports_reconcile_query {
-                DispatchPlan::ReconcileFirst {
-                    reason:
-                        "outcome uncertain after an expired lease; the provider answers key queries"
-                            .into(),
-                }
-            } else if cap.supports_idempotency_key {
-                DispatchPlan::RetrySameKey {
-                    attempt: view.attempt + 1,
-                }
-            } else {
-                DispatchPlan::RefuseBlindRetry {
-                    reason: "outcome uncertain and the provider offers no query or idempotency contract; reconcile by operator evidence"
-                        .into(),
-                }
-            }
-        }
-    }
-}
+pub use toron_core::kernel::plan_attempt;
 
 /// Settlement needs the current fencing token: the presented token must
 /// equal the live owner exactly. Empty tokens never settle; an unclaimed

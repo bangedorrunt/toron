@@ -15,7 +15,7 @@
 use std::collections::BTreeMap;
 
 use toron_core::kernel::{
-    CronError, CronSchedule, DurableEngine, EngineError, EngineStorage, InMemoryStore,
+    CronError, CronPolicy, CronSchedule, DurableEngine, EngineError, EngineStorage, InMemoryStore,
     JournalStore, MemStorage, OurEngine, StartOutcome, fire_key,
 };
 
@@ -25,6 +25,7 @@ struct CronEntry {
     schedule: CronSchedule,
     last_fired_ms: u64,
     enabled: bool,
+    policy: CronPolicy,
 }
 
 /// One firing the host must turn into a tick body.
@@ -81,6 +82,22 @@ impl<S: EngineStorage, J: JournalStore> ElmCron<S, J> {
         expression: &str,
         last_fired_ms: u64,
     ) -> Result<(), CronError> {
+        self.add_with_policy(name, expression, last_fired_ms, CronPolicy::Latest)
+    }
+
+    /// Register or replace a schedule with an explicit catch-up policy.
+    /// `add` delegates with [`CronPolicy::Latest`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CronError`] when the expression does not parse.
+    pub fn add_with_policy(
+        &mut self,
+        name: &str,
+        expression: &str,
+        last_fired_ms: u64,
+        policy: CronPolicy,
+    ) -> Result<(), CronError> {
         let schedule = CronSchedule::parse(expression)?;
         let enabled = self.entries.get(name).is_none_or(|entry| entry.enabled);
         self.entries.insert(
@@ -90,6 +107,7 @@ impl<S: EngineStorage, J: JournalStore> ElmCron<S, J> {
                 schedule,
                 last_fired_ms,
                 enabled,
+                policy,
             },
         );
         Ok(())
@@ -143,10 +161,32 @@ impl<S: EngineStorage, J: JournalStore> ElmCron<S, J> {
             if !entry.enabled {
                 continue;
             }
-            let Some(tick_ms) = entry
-                .schedule
-                .latest_at_or_before_ms(entry.last_fired_ms, now_ms)
-            else {
+            let tick_ms = match entry.policy {
+                CronPolicy::Latest => entry
+                    .schedule
+                    .latest_at_or_before_ms(entry.last_fired_ms, now_ms),
+                CronPolicy::Skip { grace_ms } => {
+                    match entry.schedule.plan_skip_tick(
+                        &entry.name,
+                        grace_ms,
+                        Some(entry.last_fired_ms),
+                        now_ms,
+                    ) {
+                        Some((_, tick)) => Some(tick),
+                        None => {
+                            if entry
+                                .schedule
+                                .latest_at_or_before_ms(entry.last_fired_ms, now_ms)
+                                .is_some()
+                            {
+                                entry.last_fired_ms = now_ms;
+                            }
+                            continue;
+                        }
+                    }
+                }
+            };
+            let Some(tick_ms) = tick_ms else {
                 continue;
             };
             let key = fire_key(&entry.name, tick_ms);

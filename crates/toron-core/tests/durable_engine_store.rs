@@ -10,7 +10,8 @@ use toron_core::index::durable_engine::ToronEngineStore;
 use toron_core::index::schema::{connect, migrate};
 use toron_core::journal::{JournalDb, ToronJournal};
 use toron_core::kernel::{
-    DurableEngine, EngineMsg, OurEngine, ParkOutcome, RunPhase, StartOutcome,
+    DurableEngine, EngineMsg, OurEngine, ParkOutcome, RunPhase, StartOutcome, engine_laws,
+    storage_laws,
 };
 
 fn unique_dir(tag: &str) -> std::path::PathBuf {
@@ -95,6 +96,45 @@ fn engine_store_round_trips_start_park_restart_and_wake() {
 
     drop(recovered);
     drop(pool);
+    drop(rt);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn kernel_laws_hold_over_toron_store_and_journal() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let dir = unique_dir("laws");
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let setup = |file: &str, scope: &str| {
+        let db = dir.join(file);
+        let pool = rt
+            .block_on(async {
+                let pool = connect(db.to_str().expect("path")).await?;
+                migrate(&pool).await?;
+                anyhow::Ok(pool)
+            })
+            .expect("sqlite pool + migrations");
+        let journal = ToronJournal::spawn(JournalDb::new(pool.clone(), scope, 64), rt.handle());
+        let store = ToronEngineStore::spawn(pool.clone(), rt.handle());
+        (pool, journal, store)
+    };
+    let (pool_s, _journal_s, mut store_s) = setup("storage-laws.sqlite", "laws-storage");
+    for (name, result) in storage_laws(&mut store_s) {
+        assert!(result.is_ok(), "storage law {name} failed: {result:?}");
+    }
+    drop(store_s);
+    drop(pool_s);
+    let (pool_e, journal_e, store_e) = setup("engine-laws.sqlite", "laws-engine");
+    let mut engine = OurEngine::with_journal(store_e, journal_e);
+    for (name, result) in engine_laws(&mut engine) {
+        assert!(result.is_ok(), "engine law {name} failed: {result:?}");
+    }
+    drop(engine);
+    drop(pool_e);
     drop(rt);
     let _ = std::fs::remove_dir_all(dir);
 }

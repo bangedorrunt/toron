@@ -32,7 +32,7 @@ use sqlx::SqlitePool;
 
 use crate::kernel::{
     EffectState, JournalDisposition, JournalError as KernelJournalError, JournalRead, JournalRow,
-    JournalStore, can_transition,
+    JournalStore,
 };
 
 /// How long a bridge call waits for the store.
@@ -54,18 +54,7 @@ fn disposition_str(d: JournalDisposition) -> &'static str {
 }
 
 fn parse_disposition(s: &str) -> Option<JournalDisposition> {
-    use JournalDisposition as D;
-    [
-        D::Continue,
-        D::Retry,
-        D::Reroute,
-        D::Blocked,
-        D::TerminalFailed,
-        D::Cancelled,
-        D::Reconcile,
-    ]
-    .into_iter()
-    .find(|d| d.as_str() == s)
+    s.parse::<JournalDisposition>().ok()
 }
 
 /// The row as stored in the change log (snapshot at that offset).
@@ -319,9 +308,8 @@ impl JournalDb {
     ) -> Result<Option<JournalRow>, sqlx::Error> {
         self.transact(key, move |cur| match cur {
             Some(mut r)
-                if r.generation == generation
-                    && !r.state.is_terminal()
-                    && can_transition(r.state, to) =>
+                if crate::kernel::check_settle(Some((r.state, r.generation)), generation, to)
+                    .is_ok() =>
             {
                 r.state = to;
                 Step::Commit(r)

@@ -41,9 +41,11 @@ pub use elm_effect::{
     SystemClock, TestClock, TokioExecutor, use_service,
 };
 pub use elm_effect_durable::{
-    CronError, CronSchedule, DurableEngine, EngineError, EngineMsg, EngineStorage, MemStorage,
-    OurEngine, ParkOutcome, ParkedRow, RunPhase, RunRow, StartOutcome, StorageError, WakeIntent,
-    due_wakes, fire_key,
+    ClaimOutcome, CronError, CronFire, CronPolicy, CronSchedule, DurableEngine, EngineError,
+    EngineMsg, EngineStorage, JoinOutcome, MemStorage, OurEngine, ParkOutcome, ParkedRow,
+    ParseRunPhaseError, RunPhase, RunRow, RunStatus, SettleOutcome, StartOptions, StartOutcome,
+    StorageError, WakeIntent, WakeOutcome, child_key, due_wakes, engine_laws, fire_key,
+    plan_cron_tick, plan_join, step_key, storage_laws,
 };
 pub use elm_effect_elm::replay::{Player, Snapshot};
 pub use elm_effect_elm::{
@@ -54,9 +56,14 @@ pub use elm_effect_journal::durable_log::{
     AppendError, DurableLog, FileLog, MemLog, Offset, Page, SCHEMA_VERSION, Status,
 };
 pub use elm_effect_journal::laws as durable_log_laws;
+pub use elm_effect_journal::laws::journal_store_all;
 pub use elm_effect_journal::plan::{
-    DispatchPlan, EffectView, ParkDecision, ProviderCapability, may_claim, may_settle,
-    plan_attempt, plan_park,
+    ClaimRejection, DispatchPlan, EffectView, ParkDecision, ProviderCapability, ReplayMismatch,
+    SettleRejection, check_claim, check_replay, check_settle, may_claim, may_settle, plan_attempt,
+    plan_park,
+};
+pub use elm_effect_journal::saga::{
+    SagaPlan, SagaStep, SagaStepStatus, compensate_key, plan_saga_rollback,
 };
 pub use elm_effect_journal::store::{
     Disposition as JournalDisposition, InMemoryStore, JournalError, JournalStore,
@@ -93,10 +100,10 @@ pub fn end_run<S: EngineStorage, J: JournalStore>(
         RunEnd::Succeeded => EffectState::Settled,
         RunEnd::Failed => EffectState::Failed,
     };
-    match engine.settle(key, status.generation, to)? {
-        Some(_) => Ok(()),
-        None => Err(EngineError::Journal(JournalError::Rejected(format!(
-            "stale generation settling {key} as {end:?}"
+    match engine.settle_checked(key, status.generation, to)? {
+        SettleOutcome::Settled(_) => Ok(()),
+        SettleOutcome::Rejected(r) => Err(EngineError::Journal(JournalError::Rejected(format!(
+            "stale generation settling {key} as {end:?}: {r}"
         )))),
     }
 }

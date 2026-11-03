@@ -97,7 +97,7 @@ impl EngineStorage for ToronEngineStore {
             upsert_run(
                 &mut tx,
                 &row.key,
-                phase_str(row.phase),
+                row.phase.as_str(),
                 generation,
                 until,
                 row.attempt,
@@ -211,7 +211,7 @@ impl EngineStorage for ToronEngineStore {
                 .map(i64::try_from)
                 .transpose()
                 .map_err(|_| StorageError::Corrupt("until_ms exceeds i64".into()))?;
-            let phase = phase_str(run.phase);
+            let phase = run.phase.as_str();
             let now = crate::index::workflow_effects::now_us();
             let mut tx = pool.begin().await.map_err(storage_error)?;
             upsert_run(
@@ -247,7 +247,7 @@ impl EngineStorage for ToronEngineStore {
                 .map_err(|_| StorageError::Corrupt("until_ms exceeds i64".into()))?;
             let park_generation = i64::try_from(park.park_generation)
                 .map_err(|_| StorageError::Corrupt("park_generation exceeds i64".into()))?;
-            let phase = phase_str(run.phase);
+            let phase = run.phase.as_str();
             let now = crate::index::workflow_effects::now_us();
             let mut tx = pool.begin().await.map_err(storage_error)?;
             sqlx::query("DELETE FROM durable_engine_parks WHERE run_key = ?1")
@@ -311,38 +311,15 @@ async fn upsert_run(
     Ok(())
 }
 
-fn phase_str(phase: RunPhase) -> &'static str {
-    match phase {
-        RunPhase::Running => "running",
-        RunPhase::Parked => "parked",
-        RunPhase::Cancelled => "cancelled",
-        RunPhase::Settled => "settled",
-        RunPhase::Failed => "failed",
-        RunPhase::Unknown => "unknown",
-    }
-}
-
-fn parse_phase(value: &str) -> Result<RunPhase, StorageError> {
-    match value {
-        "running" => Ok(RunPhase::Running),
-        "parked" => Ok(RunPhase::Parked),
-        "cancelled" => Ok(RunPhase::Cancelled),
-        "settled" => Ok(RunPhase::Settled),
-        "failed" => Ok(RunPhase::Failed),
-        "unknown" => Ok(RunPhase::Unknown),
-        other => Err(StorageError::Corrupt(format!(
-            "unknown run phase {other:?}"
-        ))),
-    }
-}
-
 fn run_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<RunRow, StorageError> {
     let phase: String = row.try_get("phase").map_err(storage_error)?;
     let generation: i64 = row.try_get("generation").map_err(storage_error)?;
     let until: Option<i64> = row.try_get("until_ms").map_err(storage_error)?;
     Ok(RunRow {
         key: row.try_get("run_key").map_err(storage_error)?,
-        phase: parse_phase(&phase)?,
+        phase: phase
+            .parse::<RunPhase>()
+            .map_err(|_| StorageError::Corrupt(format!("unknown run phase {phase:?}")))?,
         generation: u64::try_from(generation)
             .map_err(|_| StorageError::Corrupt("negative generation".into()))?,
         until_ms: until
