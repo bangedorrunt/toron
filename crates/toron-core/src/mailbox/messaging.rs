@@ -769,6 +769,35 @@ impl Mailbox {
         Ok(row.unwrap_or(0))
     }
 
+    /// bd-oracle-dead-source-72az: a successful inbox read proves the
+    /// reader's process is alive, so `fetch_inbox` (the one choke point
+    /// behind CLI `mail inbox` and the MCP `fetch_inbox` tool) and
+    /// `toron next` timestamp the reader with the host clock at the read
+    /// edge — including empty inboxes, where the delivery high-water never
+    /// advances. Best-effort by design: a liveness timestamp must never
+    /// break a read. Writes `last_poll_us`, never `last_seen_us`: the
+    /// delivery cursor is rumor-time, and wall-clock would skip
+    /// late-arriving messages with older rumor timestamps.
+    pub async fn record_inbox_poll(&self, project: &str, agent: &str) {
+        let Some(pool) = self.index_pool.as_ref() else {
+            return;
+        };
+        let now_us = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_micros() as i64)
+            .unwrap_or(0);
+        let _ = sqlx::query(
+            "INSERT INTO inbox_cursors (project_slug, agent_name, plane, last_seen_us, last_poll_us) \
+             VALUES (?1, ?2, 'P', 0, ?3) \
+             ON CONFLICT(project_slug, agent_name, plane) \
+             DO UPDATE SET last_poll_us = MAX(last_poll_us, excluded.last_poll_us)",
+        )
+        .bind(project)
+        .bind(agent)
+        .bind(now_us)
+        .execute(pool)
+        .await;
+    }
     /// bd-since-cursor-70cf: bump the cursor to the newest VISIBLE message
     /// ts — one atomic UPSERT with MAX, so concurrent readers never rewind
     /// the high-water and a crash mid-poll never skips messages.
@@ -965,6 +994,12 @@ impl Mailbox {
             )
             .await?;
         }
+        // bd-oracle-dead-source-72az: EVERY read timestamps the reader
+        // (a poll proves liveness even with an empty inbox, where the
+        // delivery bump above is a no-op). Covers CLI `mail inbox` and the
+        // MCP fetch in one choke point; `toron next` records separately.
+        self.record_inbox_poll(&args.project_slug, &args.agent_name)
+            .await;
 
         // Parity: AM `fetch_inbox` names the sender (the display name, not the
         // raw pubkey). toron's gift-wrap unwrap yields only the sender npub;
@@ -5368,6 +5403,40 @@ mod tests {
             .expect("search");
         assert_eq!(found.len(), 1, "re-fetch is dedup-safe");
 
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+        drop(pool);
+    }
+
+    /// bd-oracle-dead-source-72az: a `fetch_inbox` read timestamps the
+    /// reader's poll column even with an empty inbox — and leaves the
+    /// `--since last` delivery cursor untouched (wall-clock must never
+    /// masquerade as rumor-time high-water).
+    #[tokio::test]
+    async fn fetch_inbox_records_poll_without_moving_delivery_cursor() {
+        let (mailbox, pool, db_path, data_dir) = test_mailbox_with_pool("poll-stamp").await;
+        register(&mailbox, "demo", "BlueLake").await;
+        let before = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_micros() as i64)
+            .unwrap_or(0);
+        mailbox
+            .fetch_inbox(&FetchInbox {
+                project_slug: "demo".into(),
+                agent_name: "BlueLake".into(),
+                ..Default::default()
+            })
+            .await
+            .expect("empty inbox still reads");
+        let row: (i64, i64) = sqlx::query_as(
+            "SELECT last_seen_us, last_poll_us FROM inbox_cursors \
+             WHERE project_slug = 'demo' AND agent_name = 'BlueLake' AND plane = 'P'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("poll row");
+        assert!(row.1 >= before, "poll stamped at the read: {row:?}");
+        assert_eq!(row.0, 0, "delivery cursor untouched by a poll: {row:?}");
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_dir_all(&data_dir);
         drop(pool);

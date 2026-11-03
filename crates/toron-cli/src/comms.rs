@@ -33,7 +33,14 @@ pub async fn run_comms(
                 return Ok(ExitCode::from(2));
             }
             let reader = mailbox.comms_npub(&a.project, &a.who).await?;
-            match store.next(&reader, a.stream.as_deref(), a.peek).await {
+            let batch = store.next(&reader, a.stream.as_deref(), a.peek).await;
+            if batch.is_ok() {
+                // bd-oracle-dead-source-72az: a `next` read proves liveness
+                // too (the comms store never passes through `fetch_inbox`,
+                // so it records here, on every success path).
+                mailbox.record_inbox_poll(&a.project, &a.who).await;
+            }
+            match batch {
                 Ok(b) if a.urgent => {
                     if toron_core::inbox::urgent_pending(&b.items) {
                         println!("urgent");

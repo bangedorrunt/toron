@@ -62,6 +62,11 @@ pub fn live_set_from_cursors(
 /// bounded to polls inside the TTL window (stale rows never leave SQLite).
 /// `now_us` is passed in (host clock at the tick edge), never read here.
 ///
+/// Reads the liveliest of the delivery cursor and the poll stamp:
+/// `last_seen_us` advances only when messages exist, `last_poll_us` on
+/// every read (bd-oracle-dead-source-72az — an empty inbox still proves
+/// the reader is alive).
+///
 /// Returns `None` when the read fails — a transient SQLite error is a
 /// value, never a silent empty map (an error read as empty would free an
 /// expired lease held by a LIVE agent for one refresh: the exact race the
@@ -73,11 +78,11 @@ pub async fn read_activity_snapshot(
 ) -> Option<ActivityMap> {
     let cutoff_us = now_us.saturating_sub(ttl_secs as i64 * 1_000_000);
     let rows: Vec<(String, i64)> = match sqlx::query_as(
-        "SELECT a.pubkey, MAX(c.last_seen_us) \
+        "SELECT a.pubkey, MAX(MAX(c.last_seen_us, c.last_poll_us)) \
          FROM inbox_cursors c \
          JOIN agents a \
            ON a.project_slug = c.project_slug AND a.name = c.agent_name \
-         WHERE c.last_seen_us > ?1 \
+         WHERE MAX(c.last_seen_us, c.last_poll_us) > ?1 \
          GROUP BY a.pubkey",
     )
     .bind(cutoff_us)
@@ -262,7 +267,7 @@ mod tests {
         let now_us: i64 = 1_790_000_000_000_000;
         let fresh_us = now_us - 10_000_000;
         let stale_us = now_us - 10_000 * 1_000_000;
-        for (name, pubkey) in [("LivePin", "aa"), ("QuietPin", "bb")] {
+        for (name, pubkey) in [("LivePin", "aa"), ("QuietPin", "bb"), ("PollPin", "cc")] {
             sqlx::query(
                 "INSERT INTO agents (project_slug, name, pubkey, created_ts_us) \
                  VALUES ('demo', ?1, ?2, ?3)",
@@ -274,6 +279,16 @@ mod tests {
             .await
             .expect("agent");
         }
+        // A reader whose inbox is empty: stale delivery cursor, fresh poll.
+        sqlx::query(
+            "INSERT INTO inbox_cursors (project_slug, agent_name, plane, last_seen_us, last_poll_us) \
+             VALUES ('demo', 'PollPin', 'P', ?1, ?2)",
+        )
+        .bind(stale_us)
+        .bind(fresh_us)
+        .execute(&pool)
+        .await
+        .expect("poll cursor");
         // A cursor for an unregistered name joins to nothing (never vouched).
         for (name, seen) in [
             ("LivePin", fresh_us),
@@ -295,7 +310,12 @@ mod tests {
             .expect("snapshot");
         assert_eq!(map.get("aa"), Some(&fresh_us));
         assert!(!map.contains_key("bb"), "quiet holder absent: {map:?}");
-        assert_eq!(map.len(), 1, "ghost names never vouch: {map:?}");
+        assert_eq!(
+            map.get("cc"),
+            Some(&fresh_us),
+            "a poll vouches with an empty inbox (stale cursor, fresh poll): {map:?}"
+        );
+        assert_eq!(map.len(), 2, "ghost names never vouch: {map:?}");
         let _ = std::fs::remove_file(&db);
     }
 }
