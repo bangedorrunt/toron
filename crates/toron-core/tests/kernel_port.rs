@@ -89,3 +89,28 @@ fn mail_append_capability_reconciles_and_never_refuses_blind() {
         DispatchPlan::RefuseBlindRetry { .. }
     ));
 }
+
+#[test]
+fn parity_laws_hold_through_kernel_port() {
+    let make_engine = || {
+        kernel::OurEngine::with_journal(kernel::MemStorage::new(), kernel::InMemoryStore::new(64))
+    };
+    for (name, outcome) in kernel::heartbeat_laws(&mut make_engine()) {
+        assert!(outcome.is_ok(), "heartbeat law {name}: {outcome:?}");
+    }
+    for (name, outcome) in kernel::retry_laws(&mut make_engine()) {
+        assert!(outcome.is_ok(), "retry law {name}: {outcome:?}");
+    }
+    for (name, outcome) in kernel::signal_laws(&mut make_engine()) {
+        assert!(outcome.is_ok(), "signal law {name}: {outcome:?}");
+    }
+    for (name, outcome) in kernel::cancel_tree_laws(&mut make_engine()) {
+        assert!(outcome.is_ok(), "cancel tree law {name}: {outcome:?}");
+    }
+    for (name, outcome) in kernel::lineage_laws(&mut make_engine()) {
+        assert!(outcome.is_ok(), "lineage law {name}: {outcome:?}");
+    }
+    for (name, outcome) in kernel::guard_laws(&mut make_engine()) {
+        assert!(outcome.is_ok(), "guard law {name}: {outcome:?}");
+    }
+}
