@@ -12,7 +12,7 @@
 //! One `Model`, one `Msg` union, one [`tick`]: `tick(&Model, &Msg) ->
 //! (Model, Vec<Effect>)`. Wall-clock never read in core: timers arrive as
 //! [`CronMsg::Tick`] payloads (`now_secs` + precomputed `candidates`);
-//! Resonate durable-sleep stays the interpreter of [`CronEffect::SleepUntil`]
+//! the host's durable sleep stays the interpreter of [`CronEffect::SleepUntil`]
 //! and [`CronEffect::Park`].
 //!
 //! ## Edge contract (the sensor side, in `cron.rs`)
@@ -145,7 +145,7 @@ pub enum CronMsg {
 /// Intents the core journals; the host executes. No I/O in [`tick`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CronEffect {
-    /// Sleep until this wall time (interpreter: Resonate durable sleep).
+    /// Sleep until this wall time (interpreter: the host's durable sleep).
     SleepUntil { at_secs: i64 },
     /// Execute this tick now (interpreter: durable child).
     FireTick { tick: i64 },

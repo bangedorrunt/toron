@@ -3,7 +3,7 @@
 #
 # Replaces the systemd docker-auto-upgrade timer (Sun 03:30). Passes the SAME
 # health-gates as the bash saga: after the upgrade, probes aiostreams /
-# resonate / honcho / pihole / dnscrypt-proxy on their host ports. A dead
+# the in-house engine store / honcho / pihole / dnscrypt-proxy. A dead
 # service (any probe fails) FAILS the run -> on_failure: bead -> the defined
 # fixer (housekeeper-diagnose) reads the bundle and proposes a patch.
 # Declarative + replayable via the unified engine.
