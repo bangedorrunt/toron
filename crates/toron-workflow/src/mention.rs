@@ -75,14 +75,11 @@ pub fn wire_mention_dispatch_with_cursor(
             },
             now_ms,
         );
-        if let CoalesceDecision::FlushNow(batch) = decision {
-            match build_job_from_coalesced(&batch, requester, project_slug, Timestamp::now()) {
-                Ok(ev) => {
-                    jobs.push(ev);
-                }
-                Err(_) => {
-                }
-            }
+        if let CoalesceDecision::FlushNow(batch) = decision
+            && let Ok(ev) =
+                build_job_from_coalesced(&batch, requester, project_slug, Timestamp::now())
+        {
+            jobs.push(ev);
         }
     }
     jobs

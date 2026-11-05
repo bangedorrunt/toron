@@ -613,15 +613,7 @@ async fn channel_post(mailbox: &Mailbox, args: &ChannelPostArgs) -> anyhow::Resu
         }
     };
     for (i, chunk) in bodies.iter().enumerate() {
-        post_one(
-            mailbox,
-            &store,
-            &keys,
-            args,
-            chunk,
-            i == 0,
-        )
-        .await?;
+        post_one(mailbox, &store, &keys, args, chunk, i == 0).await?;
     }
     if bodies.len() > 1 {
         eprintln!(
@@ -644,8 +636,6 @@ async fn post_one(
     with_mentions: bool,
 ) -> anyhow::Result<()> {
     let mut mention_pks: Vec<PublicKey> = Vec::new();
-    if !with_mentions {
-    }
     for name in args.mention.iter().filter(|_| with_mentions) {
         let whois = mailbox
             .whois(&args.project, name)

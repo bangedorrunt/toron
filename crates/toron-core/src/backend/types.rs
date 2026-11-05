@@ -237,7 +237,6 @@ pub const TOKEN_PROJECT: &str = "toron_project";
 pub const TOKEN_NPUB: &str = "toron_npub";
 
 #[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
 pub struct AgentInfo {
     pub agent: Option<String>,
     pub agent_status: AgentStatus,
@@ -268,7 +267,6 @@ pub struct AgentInfo {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
 pub struct WorkspaceInfo {
     pub workspace_id: String,
     pub number: u64,
@@ -283,7 +281,6 @@ pub struct WorkspaceInfo {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
 pub struct PaneInfo {
     pub pane_id: String,
     pub terminal_id: String,
@@ -311,7 +308,6 @@ pub struct PaneInfo {
 /// Agent-session reference (`agent_session` on AgentInfo/PaneInfo). Rex
 /// reports one; hc (tested 0.1.18) reports none, so the field stays `None` there.
 #[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
 pub struct AgentSessionInfo {
     pub source: String,
     pub agent: String,
@@ -321,7 +317,6 @@ pub struct AgentSessionInfo {
 
 /// Agent-session reference kind (`id` | `path`).
 #[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
 #[serde(rename_all = "lowercase")]
 pub enum AgentSessionRefKind {
     Id,
@@ -330,7 +325,6 @@ pub enum AgentSessionRefKind {
 
 /// herdr pane scroll state (`scroll` on PaneInfo).
 #[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
 pub struct PaneScrollInfo {
     pub offset_from_bottom: u64,
     pub max_offset_from_bottom: u64,
@@ -338,7 +332,6 @@ pub struct PaneScrollInfo {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
 pub struct WorktreeInfo {
     pub path: String,
     pub is_bare: bool,

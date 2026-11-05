@@ -6,12 +6,10 @@
 //!
 //! governed-by: ADR-0002
 
-#![allow(dead_code)]
-
-use serde_json::Value;
 use crate::backend::AgentStatus;
 use crate::backend::{PaneInfo, WorkspaceInfo};
 use crate::osc7501::{Board, parse_report};
+use serde_json::Value;
 
 /// A Rex session is an hc workspace; the session id is the workspace id.
 /// Its agent status is `Unknown`: a session with no records proves nothing.

@@ -210,10 +210,10 @@ impl RelayBus {
                         return;
                     }
                 };
-                if let Some(item) = item {
-                    if tx.send(item).await.is_err() {
-                        return;
-                    }
+                if let Some(item) = item
+                    && tx.send(item).await.is_err()
+                {
+                    return;
                 }
             }
         });

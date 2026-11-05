@@ -1942,20 +1942,20 @@ fn add_message_tags(tags: &mut Vec<Tag>, args: &SendMessage) {
     {
         tags.push(t);
     }
-    if args.overseer {
-        if let Ok(t) = Tag::parse(["t", OVERSEER_TAG]) {
-            tags.push(t);
-        }
+    if args.overseer
+        && let Ok(t) = Tag::parse(["t", OVERSEER_TAG])
+    {
+        tags.push(t);
     }
     tags.extend(args.extra_tags.iter().cloned());
     if let Some(thread) = &args.thread_id {
         if let Ok(t) = Tag::parse(["thread", thread]) {
             tags.push(t);
         }
-        if let Ok(root) = EventId::from_hex(thread) {
-            if let Ok(t) = Tag::parse(["e", &root.to_hex(), "", "root"]) {
-                tags.push(t);
-            }
+        if let Ok(root) = EventId::from_hex(thread)
+            && let Ok(t) = Tag::parse(["e", &root.to_hex(), "", "root"])
+        {
+            tags.push(t);
         }
     }
 }

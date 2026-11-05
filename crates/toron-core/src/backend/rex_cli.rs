@@ -9,15 +9,13 @@
 //! and a spawn or JSON failure. A hang is not a rex failure.
 
 use std::io::BufRead;
-#[cfg(test)]
-use std::path::Path;
 use std::path::PathBuf;
 use std::process::Output;
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
-use serde_json::Value;
 use crate::backend::{BackendError, BackendErrorCode, BackendEvent};
+use serde_json::Value;
 
 use crate::proc::{ProcError, run_bounded};
 
@@ -570,37 +568,6 @@ fn api_cache() -> &'static Mutex<Option<String>> {
     API_LIST_CACHE.get_or_init(|| Mutex::new(None))
 }
 
-#[cfg(test)]
-pub(crate) fn reset_api_cache() {
-    if let Some(cache) = API_LIST_CACHE.get() {
-        *cache.lock().unwrap_or_else(|e| e.into_inner()) = None;
-    }
-}
-
-/// `rex do -e <lua> [--args <json>]`: one-shot Lua, result as JSON.
-///
-/// The script must be handler- and timer-free (see
-/// `integrations/rex/session-snapshot.lua`): `rex.on`/`rex.every` keep
-/// `rex do` running past the call bound, which the edge reports as
-/// `Interrupted`, never as a result. `--json` makes the return value
-/// machine-readable; an empty stdout is `BadOutput`, never `Null`.
-#[cfg_attr(not(test), allow(dead_code))]
-pub fn do_args(session: Option<&str>, script: &str, args_json: Option<&str>) -> Vec<String> {
-    let mut args = vec!["do".into()];
-    if let Some(session) = session.filter(|s| !s.is_empty()) {
-        args.push("-s".into());
-        args.push(session.into());
-    }
-    args.push("-e".into());
-    args.push(script.into());
-    if let Some(payload) = args_json.filter(|s| !s.is_empty()) {
-        args.push("--args".into());
-        args.push(payload.into());
-    }
-    args.push("--json".into());
-    args
-}
-
 /// `rex ls --json` is either `{"sessions":[...]}` or a bare array.
 pub fn parse_sessions(value: &Value) -> Result<Vec<RexSession>, RexFail> {
     let rows = match value {
@@ -780,12 +747,12 @@ fn bound_label(waited: Duration) -> String {
 
 /// Pure status fold. It does not read the environment or spawn rex.
 ///
-/// This is a module inside `rex_cli.rs` because `src/backend/rex_map.rs` and
-/// `src/backend/mod.rs` are exclusively leased by PurpleGorge for bd-i328.
+/// The status fold lives inside `rex_cli.rs` so the CLI edge owns parsing and
+/// folding together; there is no second copy of this module.
 pub mod rex_map {
-    use serde_json::Value;
     use crate::backend::{AgentStatus, BackendEvent, PaneId};
     use crate::osc7501::{Board, ProgramState, parse_report};
+    use serde_json::Value;
 
     use crate::backend::rex::fold_status;
 
@@ -1055,5 +1022,4 @@ pub mod rex_map {
         }
         serde_json::json!({ "records": [record] })
     }
-
 }

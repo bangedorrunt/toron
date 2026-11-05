@@ -8,7 +8,6 @@ edition = "2024"
 tokio = { version = "1", features = ["full"] }
 sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio", "macros", "migrate"] }
 git2 = { version = "0.19", features = ["vendored-libgit2"] }
-tokio-tungstenite = "0.24"
 parking_lot = "0.12"
 # Read-mostly key caches (key_cache, alt_key_paths) are lock-free reads:
 # their critical sections are one hash lookup, and readers used to queue
@@ -44,6 +43,7 @@ elm-effect-journal = { path = "../../../elm-effect-rs/crates/elm-effect-journal"
 fault-injection = []
 
 [dev-dependencies]
+tokio-tungstenite = "0.24"
 tempfile = "3"
 toron-core = { path = ".", features = ["fault-injection"] }
 proptest = "1.11"

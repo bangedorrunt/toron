@@ -432,7 +432,6 @@ impl Terminal {
         }
     }
 
-    #[allow(dead_code)]
     fn to_pane_info(&self, policy: FoldPolicy) -> PaneInfo {
         self.to_pane_info_with_mail_name(policy, self.name.clone())
     }
@@ -1002,7 +1001,12 @@ impl Client {
     }
 
     /// Write a file (atomic swap).
-    pub fn file_write(&self, path: &str, data: &str, on: Option<&str>) -> Result<Value, BackendError> {
+    pub fn file_write(
+        &self,
+        path: &str,
+        data: &str,
+        on: Option<&str>,
+    ) -> Result<Value, BackendError> {
         let mut params = json!({ "path": path, "data": data });
         if let Some(m) = on {
             params["on"] = json!(m);

@@ -6,8 +6,9 @@
 //! and the status fold live in `rex_cli` (the fold is `rex_cli::rex_map`).
 //! This file only chooses the rex command. It never calls hc.
 //!
-//! `src/backend/mod.rs` and `src/backend/rex_map.rs` are exclusively leased
-//! by PurpleGorge for bd-i328, so this module declares `rex_cli` itself.
+//! The CLI layer is `crate::backend::rex_cli` — one module and one `RexFail`
+//! type. Declaring the file here with `#[path]` compiled it twice and gave the
+//! adapter a distinct type universe from the crate's public one.
 //!
 //! `subscribe`, `agent_wait`, and `agent_send_keys` stay on the trait
 //! default, which names the method. A prompt's `wait` is not polled: that
@@ -25,8 +26,7 @@ use crate::backend::{AgentInfo, PaneInfo, Subscription, WaitOptions, WorkspaceIn
 use crate::backend::{AgentStatus, BackendError, BackendErrorCode, EventStream, PromptLanding};
 use serde_json::{Value, json};
 
-#[path = "rex_cli.rs"]
-pub mod rex_cli;
+use crate::backend::rex_cli;
 
 use crate::backend::Backend as MultiplexerBackend;
 use rex_cli::rex_map::{
@@ -832,9 +832,7 @@ mod pane_identity_tests {
         let one: BTreeSet<String> = ["s1".to_string()].into_iter().collect();
         assert_eq!(single_session(&one).expect("one session"), "s1");
         let two: BTreeSet<String> = ["s1".to_string(), "s2".to_string()].into_iter().collect();
-        let err = single_session(&two)
-            .err()
-            .expect("two sessions must refuse");
+        let err = single_session(&two).expect_err("two sessions must refuse");
         match err {
             RexFail::Rejected { message } => assert!(
                 message.contains("subscribe one session at a time"),
@@ -849,9 +847,7 @@ mod pane_identity_tests {
     #[test]
     fn a_narrow_workspace_close_is_refused_not_widened() {
         assert!(workspace_close_scope(true).is_ok());
-        let err = workspace_close_scope(false)
-            .err()
-            .expect("close_group=false must refuse");
+        let err = workspace_close_scope(false).expect_err("close_group=false must refuse");
         assert!(err.to_string().contains("close_group=false"), "{err}");
     }
 

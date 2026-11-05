@@ -3401,10 +3401,10 @@ impl PendingDrain {
     /// Current tracked state with durable fallback (bd-cnr5): memory
     /// first, then the `workflow_runs` row (restart recovery).
     pub async fn run_state_durable(&self, run_id: &str) -> RunState {
-        if let Some(state) = self.runs.get(run_id).copied() {
-            if state != RunState::Running || self.store.is_none() {
-                return state;
-            }
+        if let Some(state) = self.runs.get(run_id).copied()
+            && (state != RunState::Running || self.store.is_none())
+        {
+            return state;
         }
         if let Some(store) = self.store.as_ref()
             && let Ok(Some(row)) = store.get_run(run_id).await
