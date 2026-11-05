@@ -11,7 +11,7 @@ pub mod types;
 pub mod wait;
 
 pub use error::{BackendError, BackendErrorCode};
-pub use hc::{Client as HcClient, HcBackend, ID_PREFIX};
+pub use hc::{Client as HcClient, HC_GENERATION, HcBackend, ID_PREFIX, MIN_HC_VERSION, TESTED_HC_VERSION};
 pub use types::{
     AgentInfo, AgentStatus, BackendEvent, PaneId, PaneInfo, PromptLanding, SpawnOptions,
     Subscription, WaitOptions, WorkspaceInfo, normalize_agent_status,

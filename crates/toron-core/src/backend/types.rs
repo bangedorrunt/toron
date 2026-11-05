@@ -309,7 +309,7 @@ pub struct PaneInfo {
 }
 
 /// Agent-session reference (`agent_session` on AgentInfo/PaneInfo). Rex
-/// reports one; hc 0.1.16 reports none, so the field stays `None` there.
+/// reports one; hc (tested 0.1.18) reports none, so the field stays `None` there.
 #[derive(Debug, Clone, Deserialize)]
 #[allow(dead_code)]
 pub struct AgentSessionInfo {

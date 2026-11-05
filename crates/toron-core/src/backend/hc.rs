@@ -68,6 +68,16 @@ pub const ID_PREFIX: &str = "hc:";
 /// Protocol generation this client speaks (hc OpenRPC `hello.generation`).
 pub const HC_GENERATION: u32 = 1;
 
+/// Minimum hc patch version this client is tested against. Connect fails
+/// (typed `hc_too_old`) when the server reports an older version, so an
+/// upgrade gap surfaces at connect time instead of as `Malformed` later.
+/// Bump together with the tested-max note below.
+pub const MIN_HC_VERSION: &str = "0.1.16";
+/// Highest hc version exercised by the test suite. Newer servers still
+/// connect (additive-only), but emit a one-time stderr note so drift is
+/// visible without bricking production.
+pub const TESTED_HC_VERSION: &str = "0.1.18";
+
 /// Default unary RPC budget when params omit a timeout.
 pub const DEFAULT_RPC_TIMEOUT_MS: u64 = 30_000;
 /// hc's documented default wait (config `wait_timeout`, else 180 s).
@@ -132,6 +142,21 @@ fn spawn_env() -> Option<BTreeMap<String, String>> {
         }
     }
     (!env.is_empty()).then_some(env)
+}
+
+/// Compare two `X.Y.Z` (or `X.Y`) version strings. Returns true when
+/// `have` >= `want`. Non-numeric suffixes are ignored (e.g. "0.1.18-rc1"
+/// compares as 0.1.18).
+pub fn version_at_least(have: &str, want: &str) -> bool {
+    let parse = |s: &str| -> (u64, u64, u64) {
+        let core = s.split('-').next().unwrap_or(s);
+        let mut parts = core.split('.');
+        let a = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+        let b = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+        let c = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+        (a, b, c)
+    };
+    parse(have) >= parse(want)
 }
 
 /// Strip [`ID_PREFIX`] when present; otherwise return `id` unchanged
@@ -555,6 +580,27 @@ impl Client {
                 ),
             ));
         }
+        // Version floor: refuse older servers with a typed, actionable code.
+        if !version_at_least(&hello.version, MIN_HC_VERSION) {
+            return Err(BackendError::new(
+                BackendErrorCode::Other("hc_too_old".into()),
+                format!(
+                    "hc {} is below the supported minimum {MIN_HC_VERSION}",
+                    hello.version
+                ),
+            ));
+        }
+        if !version_at_least(&hello.version, TESTED_HC_VERSION) {
+            // Newer than tested: additive-only, but make drift visible.
+            static NOTED: std::sync::Once = std::sync::Once::new();
+            NOTED.call_once(|| {
+                eprintln!(
+                    "toron/hc: server {} is newer than tested {TESTED_HC_VERSION}; \
+                     additive changes only — verify before relying on new features",
+                    hello.version
+                );
+            });
+        }
         client.caps = Capabilities {
             generation: hello.generation,
             version: hello.version,
@@ -843,6 +889,168 @@ impl Client {
             "terminal.rm",
             json!({ "terminal": strip_id_prefix(terminal) }),
         )
+    }
+
+    /// Keep a live terminal across loss: replace its program with a shell
+    /// instead of dropping it. Exit with a code / explicit kill stay final.
+    pub fn terminal_keep(&self, terminal: &str, keep: bool) -> Result<Value, BackendError> {
+        self.call_coded(
+            "terminal.keep",
+            json!({ "terminal": strip_id_prefix(terminal), "keep": keep }),
+        )
+    }
+
+    /// Press the stop key (esc if it reports status, else ctrl+c) and report
+    /// what was observed. Never escalates.
+    pub fn terminal_interrupt(
+        &self,
+        terminal: &str,
+        timeout_ms: Option<u64>,
+    ) -> Result<Value, BackendError> {
+        let mut params = json!({ "terminal": strip_id_prefix(terminal) });
+        if let Some(ms) = timeout_ms {
+            params["timeout"] = json!(ms as f64 / 1000.0);
+        }
+        self.call_coded("terminal.interrupt", params)
+    }
+
+    /// Write bytes to a file beside a live terminal, on its machine.
+    pub fn terminal_put(
+        &self,
+        terminal: &str,
+        name: &str,
+        data: &str,
+    ) -> Result<Value, BackendError> {
+        self.call_coded(
+            "terminal.put",
+            json!({ "terminal": strip_id_prefix(terminal), "name": name, "data": data }),
+        )
+    }
+
+    /// Open a raw (framed) stream to a live terminal. Requires framed mode.
+    pub fn terminal_attach(&self, terminal: &str) -> Result<Value, BackendError> {
+        self.call_coded(
+            "terminal.attach",
+            json!({ "terminal": strip_id_prefix(terminal) }),
+        )
+    }
+
+    /// List templates by name and description.
+    pub fn templates_list(&self) -> Result<Value, BackendError> {
+        self.call_coded("templates.list", json!({}))
+    }
+
+    /// This core's identity, version, pid, uptime and terminal counts.
+    pub fn server_status(&self) -> Result<Value, BackendError> {
+        self.call_coded("server.status", json!({}))
+    }
+
+    /// Stop the core (kept terminals stay pending, get shells on next start).
+    pub fn server_stop(&self) -> Result<Value, BackendError> {
+        self.call_coded("server.stop", json!({}))
+    }
+
+    /// Planned restart: screens saved, programs keep running, next core adopts.
+    pub fn server_restart(&self) -> Result<Value, BackendError> {
+        self.call_coded("server.restart", json!({}))
+    }
+
+    /// Run one program on a machine without a terminal; returns exit code + output.
+    pub fn machine_exec(
+        &self,
+        argv: &[String],
+        line: Option<&str>,
+        on: Option<&str>,
+        cwd: Option<&str>,
+        timeout_ms: Option<u64>,
+    ) -> Result<Value, BackendError> {
+        let mut params = json!({ "argv": argv });
+        if let Some(l) = line {
+            params["line"] = json!(l);
+        }
+        if let Some(m) = on {
+            params["on"] = json!(m);
+        }
+        if let Some(c) = cwd {
+            params["cwd"] = json!(c);
+        }
+        if let Some(ms) = timeout_ms {
+            params["timeout"] = json!(ms as f64 / 1000.0);
+        }
+        self.call_coded("machine.exec", params)
+    }
+
+    /// Read a text file here or on a machine.
+    pub fn file_read(
+        &self,
+        path: &str,
+        on: Option<&str>,
+        offset: Option<u64>,
+        limit: Option<u64>,
+    ) -> Result<Value, BackendError> {
+        let mut params = json!({ "path": path });
+        if let Some(m) = on {
+            params["on"] = json!(m);
+        }
+        if let Some(o) = offset {
+            params["offset"] = json!(o);
+        }
+        if let Some(l) = limit {
+            params["limit"] = json!(l);
+        }
+        self.call_coded("file.read", params)
+    }
+
+    /// Write a file (atomic swap).
+    pub fn file_write(&self, path: &str, data: &str, on: Option<&str>) -> Result<Value, BackendError> {
+        let mut params = json!({ "path": path, "data": data });
+        if let Some(m) = on {
+            params["on"] = json!(m);
+        }
+        self.call_coded("file.write", params)
+    }
+
+    /// Read an opaque JSON document + version.
+    pub fn doc_get(&self, name: &str, on: Option<&str>) -> Result<Value, BackendError> {
+        let mut params = json!({ "name": name });
+        if let Some(m) = on {
+            params["on"] = json!(m);
+        }
+        self.call_coded("doc.get", params)
+    }
+
+    /// Write an opaque JSON document if version still matches.
+    pub fn doc_set(
+        &self,
+        name: &str,
+        value: Value,
+        version: u64,
+        on: Option<&str>,
+    ) -> Result<Value, BackendError> {
+        let mut params = json!({ "name": name, "value": value, "version": version });
+        if let Some(m) = on {
+            params["on"] = json!(m);
+        }
+        self.call_coded("doc.set", params)
+    }
+
+    /// Machines added here.
+    pub fn machine_list(&self) -> Result<Value, BackendError> {
+        self.call_coded("machine.list", json!({}))
+    }
+
+    /// Add another machine over ssh/command.
+    pub fn machine_add(
+        &self,
+        name: &str,
+        target: &str,
+        via: Option<&str>,
+    ) -> Result<Value, BackendError> {
+        let mut params = json!({ "name": name, "target": target });
+        if let Some(v) = via {
+            params["via"] = json!(v);
+        }
+        self.call_coded("machine.add", params)
     }
 
     /// Close a workspace. hc has no workspace object: a workspace is a root
