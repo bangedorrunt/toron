@@ -24,6 +24,7 @@ pub mod nostr;
 pub mod osc7501;
 pub mod outbox;
 pub mod policy;
+pub mod proc;
 pub mod serve_build;
 pub mod testkit;
 pub mod topology;
